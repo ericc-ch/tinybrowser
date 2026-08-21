@@ -2,9 +2,9 @@ We are building the smallest headless browser for AI agents. Engine stops at DOM
 
 ## Vision
 
-- Single binary, no cheating: no sidecar processes. Sub-1MB is the aspirational goal. Shrink as we simplify; measure size at milestones.
+- Single binary, no cheating: no sidecar processes. Sub-5MB stripped x86_64 binary is the goal. Measure size at milestones.
 - Stealth by default, no opt-out.
-- CDP is the agent boundary: full Chromium surface; no-op stub domains stay for Puppeteer/Playwright compatibility. No bespoke SDK, no C ABI (see `CONTEXT.md` Boundary B).
+- CDP is the agent boundary: full Chromium surface; no-op stub domains stay for Puppeteer/Playwright compatibility. No bespoke SDK, no C ABI.
 - Embeddable = spawn-and-drive binary, or the `tinybrowser-lib` crate as thin in-process wrapper. Keep the wrapper as-is; it costs zero binary size.
 - CLI: `serve` and `fetch` are load-bearing (e2e gate drives `fetch`).
 
@@ -27,6 +27,5 @@ A change is done when:
 
 ## Further Reading
 
-- `CONTEXT.md`
-- `docs/adr/`
-- `.scratch/`
+- `docs/size-budget.md` — binary size measurements and decisions
+- `docs/webidl.md` — DOM API surface verification strategy
