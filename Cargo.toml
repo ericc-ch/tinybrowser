@@ -1,0 +1,74 @@
+[workspace]
+members = [
+    "crates/browser",
+    "crates/dom",
+    "crates/js",
+    "crates/net",
+]
+
+[package]
+name = "tinybrowser"
+version = "0.1.0"
+edition = "2024"
+
+[lints]
+workspace = true
+
+[dependencies]
+browser = { workspace = true }
+dom = { workspace = true }
+js = { workspace = true }
+net = { workspace = true }
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+
+[workspace.dependencies]
+browser = { path = "crates/browser" }
+dom = { path = "crates/dom" }
+js = { path = "crates/js" }
+net = { path = "crates/net" }
+
+# ─── Lints ────────────────────────────────────────────────────────────────────
+# Strict (not strict-strict): `all` is error, `pedantic`/`cargo` are warnings.
+# No `nursery` (experimental). No `allow` list — fix code instead of silencing.
+# `restriction` lints are denied individually (blanket is banned by clippy).
+[workspace.lints.rust]
+unsafe_code = "deny"
+warnings = { level = "deny", priority = -1 }
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+cargo = { level = "deny", priority = -1 }
+# Private single-binary repo, never published to crates.io; the metadata
+# requirements (readme/keywords/categories/license) don't apply.
+cargo_common_metadata = { level = "allow", priority = 1 }
+
+# restriction — explicit, no blanket
+todo = "deny"
+unimplemented = "deny"
+get_unwrap = "deny"
+panic_in_result_fn = "deny"
+unchecked_time_subtraction = "deny"
+let_underscore_future = "deny"
+unused_result_ok = "deny"
+await_holding_lock = "deny"
+await_holding_refcell_ref = "deny"
+large_futures = "deny"
+undocumented_unsafe_blocks = "deny"
+multiple_unsafe_ops_per_block = "deny"
+unnecessary_safety_comment = "deny"
+mem_forget = "deny"
+not_unsafe_ptr_arg_deref = "deny"
+ptr_as_ptr = "deny"
+ref_as_ptr = "deny"
+transmute_ptr_to_ptr = "deny"
+cast_ptr_alignment = "deny"
+lossy_float_literal = "deny"
+implicit_saturating_sub = "deny"
+dbg_macro = "deny"
+rc_mutex = "deny"
+redundant_clone = "deny"
+needless_collect = "deny"

@@ -1,0 +1,12 @@
+[package]
+name = "browser"
+version.workspace = true
+edition.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+dom = { workspace = true }
+js = { workspace = true }
+net = { workspace = true }

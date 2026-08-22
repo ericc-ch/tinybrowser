@@ -1,0 +1,10 @@
+[package]
+name = "js"
+version.workspace = true
+edition.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+dom = { workspace = true }
