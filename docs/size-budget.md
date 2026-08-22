@@ -6,24 +6,24 @@ Reproduce with `sizeprobe/` in this repo — each dependency is really exercised
 
 ## Measured marginal costs
 
-| Component | default `release` | tuned¹ |
-|---|---|---|
-| baseline (empty main) | 345 KB | 290 KB |
-| html5gum 0.8 (tokenizer only) | +388 KB | +272 KB |
-| **html5ever 0.39 + tree builder** (rcdom sink) | +941 KB | +840 KB |
-| selectors 0.26 + cssparser (on top of html5ever) | +115 KB | +75 KB |
-| ureq 3 + native-tls (dyn libssl.so.3) | +753 KB | +482 KB |
-| rquickjs 0.12 (quickjs-ng, eval + limits) | +1247 KB | +776 KB |
+| Component                                        | default `release` | tuned¹  |
+| ------------------------------------------------ | ----------------- | ------- |
+| baseline (empty main)                            | 345 KB            | 290 KB  |
+| html5gum 0.8 (tokenizer only)                    | +388 KB           | +272 KB |
+| **html5ever 0.39 + tree builder** (rcdom sink)   | +941 KB           | +840 KB |
+| selectors 0.26 + cssparser (on top of html5ever) | +115 KB           | +75 KB  |
+| ureq 3 + native-tls (dyn libssl.so.3)            | +753 KB           | +482 KB |
+| rquickjs 0.12 (quickjs-ng, eval + limits)        | +1247 KB          | +776 KB |
 
 ¹ `opt-level = "z"`, `lto = "fat"`, `codegen-units = 1`, stripped
 
 ## Stack totals (tuned profile)
 
-| Stack | Total | Headroom to 5 MB |
-|---|---|---|
-| ureq(native-tls) + quickjs-ng + **html5ever** ← chosen | **2.26 MB** | ~2.74 MB |
-| same but html5gum instead | 1.73 MB | ~3.27 MB |
-| any of the above on default `release` | 2.7–3.3 MB | — |
+| Stack                                                  | Total       | Headroom to 5 MB |
+| ------------------------------------------------------ | ----------- | ---------------- |
+| ureq(native-tls) + quickjs-ng + **html5ever** ← chosen | **2.26 MB** | ~2.74 MB         |
+| same but html5gum instead                              | 1.73 MB     | ~3.27 MB         |
+| any of the above on default `release`                  | 2.7–3.3 MB  | —                |
 
 ## Decisions
 
@@ -32,7 +32,7 @@ Reproduce with `sizeprobe/` in this repo — each dependency is really exercised
 - **native-tls, dynamically linked**: TLS lives in system `libssl.so.3`; we ship only glue (~482 KB tuned). Static rustls would add ~+2.0 MB — rejected. Consequence: target machine needs OpenSSL 3 installed (near-universal on Linux).
 - **panic = unwind kept**: abort saves only ~39 KB but kills `catch_unwind`, which every JS-exposed op needs so a Rust panic degrades to a JS error instead of unwinding through QuickJS's C frame.
 - **selectors later is cheap**: querySelector support costs only ~75 KB when we get to it.
-- **Old servo stack (html5ever + selectors + cssparser as the *core*) was never the problem** — the old repo's total was bloat elsewhere. The parser swap alone does not hit 5MB; discipline at every milestone does.
+- **Old servo stack (html5ever + selectors + cssparser as the _core_) was never the problem** — the old repo's total was bloat elsewhere. The parser swap alone does not hit 5MB; discipline at every milestone does.
 
 ## Watchlist (what can still blow the budget)
 
