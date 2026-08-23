@@ -19,7 +19,7 @@ Answer:
 
 **Mutation methods:** `create_element`, `create_text`, `append`, `insert_before`, `detach` (unlinks, subtree stays alive — detached-but-alive is needed by JS semantics), `reparent_children`, `set_text`. Plus doctype/PI creation as demanded by the TreeSink consumer.
 
-**Error strategy:** `AttachError { StaleNode, CycleForbidden }` from mutation calls; maps later to JS `NotFoundError` / `HierarchyRequestError`. No panics on bad input.
+**Error strategy:** `DomError { StaleNode, CycleForbidden, IllegalTarget }` from mutation calls; maps later to JS `NotFoundError` / `HierarchyRequestError`. No panics on bad input. *(Renamed from `AttachError` + third variant added during implementation.)*
 
 **Deferred by design:** eager subtree reclamation (dead subtrees recycle slots; explicit reclamation revisited with GC work), selectors (separate decision), events.
 

@@ -30,7 +30,7 @@ Recursively freeing a subtree's slots so every handle into it goes stale.
 _Avoid_: drop, delete
 
 **TreeSink adapter**:
-Thin layer above dom that translates html5ever's tree-construction instructions into Dom mutations; owns the parser dependency so dom stays dependency-free.
+Thin layer above dom that translates html5ever's tree-construction instructions into Dom mutations; owns the parser dependency, keeping dom free of parser crates (dom itself carries only markup5ever for names).
 _Avoid_: parser glue, binding layer
 
 **QualName**:

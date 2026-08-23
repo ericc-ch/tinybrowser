@@ -1,6 +1,8 @@
 //! The arena: flat slot array, generational handles, tree mutations.
 
+use std::cell::Cell;
 use std::fmt;
+use std::marker::PhantomData;
 
 use crate::children::Children;
 use crate::id::NodeId;
@@ -65,11 +67,20 @@ impl<'a> NodeRef<'a> {
 /// are harmless — lookups report absence — which is what will let the `QuickJS`
 /// binding layer hold handles across garbage-collection cycles without
 /// borrowing anything.
+///
+/// [`Send`] but deliberately not [`Sync`]: a `Dom` may be handed between
+/// workers, but two threads can never touch one simultaneously (one worker
+/// per page; see the dom-layer wayfinding tickets). The marker field below is
+/// what suppresses the otherwise-auto-derived `Sync`.
 #[derive(Debug)]
 pub struct Dom {
     slots: Vec<Slot>,
     free: Vec<u32>,
     document: NodeId,
+    /// `Cell<()>` is `Send` + `!Sync`; `PhantomData` makes `Dom` inherit
+    /// exactly that split. Deleting this field would silently re-derive
+    /// `Sync` — which is the point: that deletion has to be a conscious act.
+    _share_forbidden: PhantomData<Cell<()>>,
 }
 
 impl Default for Dom {
@@ -94,6 +105,7 @@ impl Dom {
             }],
             free: Vec::new(),
             document: NodeId::new(0, 0),
+            _share_forbidden: PhantomData,
         }
     }
 
@@ -126,15 +138,15 @@ impl Dom {
         self.live_slot(id)?.node.as_ref()?.parent
     }
 
-    /// The children of `id` in document order.
+    /// The children of `id` in document order, or `None` for a stale handle.
     ///
-    /// A stale handle yields an empty iteration rather than an error; pair
-    /// with [`Dom::contains`] when absence versus death matters.
-    pub fn children(&self, id: NodeId) -> std::slice::Iter<'_, NodeId> {
+    /// Unlike the other reads this cannot quietly report "no children" for a
+    /// destroyed node — childless and dead are different answers.
+    #[must_use]
+    pub fn children(&self, id: NodeId) -> Option<std::slice::Iter<'_, NodeId>> {
         self.live_slot(id)
             .and_then(|slot| slot.node.as_ref())
             .map(|node| node.children.iter())
-            .unwrap_or_default()
     }
 
     /// Creates an element node, unattached until something appends it.
@@ -201,6 +213,11 @@ impl Dom {
     /// - [`DomError::CycleForbidden`] if `child` is an ancestor of `parent`.
     pub fn append(&mut self, parent: NodeId, child: NodeId) -> Result<(), DomError> {
         self.ensure_alive(parent, child)?;
+        if child == self.document {
+            // The root must never gain a parent — that is how a document
+            // gets orphaned from itself. (Maps to HierarchyRequestError.)
+            return Err(DomError::IllegalTarget);
+        }
         if self.would_cycle(child, parent) {
             return Err(DomError::CycleForbidden);
         }
@@ -303,6 +320,11 @@ impl Dom {
         self.ensure_alive(from, to)?;
         if from == to {
             return Ok(());
+        }
+        if from == self.document {
+            // Draining the root would strand the entire document inside an
+            // arbitrary detached subtree. (Maps to HierarchyRequestError.)
+            return Err(DomError::IllegalTarget);
         }
         if self.would_cycle(from, to) {
             return Err(DomError::CycleForbidden);

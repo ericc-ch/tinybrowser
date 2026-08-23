@@ -18,7 +18,7 @@ fn fresh_document_has_root_and_nothing_else() {
     let d = Dom::new();
     let doc = d.document();
     assert!(d.contains(doc));
-    assert_eq!(d.children(doc).count(), 0);
+    assert_eq!(d.children(doc).unwrap().count(), 0);
     assert_eq!(d.parent(doc), None);
 }
 
@@ -32,11 +32,14 @@ fn append_builds_chain_in_order() {
     d.append(doc, p).unwrap();
     d.append(p, text).unwrap();
 
-    let top: Vec<_> = d.children(doc).copied().collect();
+    let top: Vec<_> = d.children(doc).unwrap().copied().collect();
     assert_eq!(top, vec![p]);
     assert_eq!(d.parent(p), Some(doc));
     assert_eq!(d.parent(text), Some(p));
-    assert_eq!(d.children(p).copied().collect::<Vec<_>>(), vec![text]);
+    assert_eq!(
+        d.children(p).unwrap().copied().collect::<Vec<_>>(),
+        vec![text]
+    );
 }
 
 #[test]
@@ -49,7 +52,7 @@ fn append_moves_already_attached_nodes() {
     d.append(a, b).unwrap();
     d.append(doc, b).unwrap(); // moves b from under a to under doc
 
-    assert_eq!(d.children(a).count(), 0);
+    assert_eq!(d.children(a).unwrap().count(), 0);
     assert_eq!(d.parent(b), Some(doc));
 }
 
@@ -78,7 +81,10 @@ fn insert_before_positions_exactly() {
     d.append(doc, c).unwrap();
     d.insert_before(c, b).unwrap();
 
-    assert_eq!(d.children(doc).copied().collect::<Vec<_>>(), vec![a, b, c]);
+    assert_eq!(
+        d.children(doc).unwrap().copied().collect::<Vec<_>>(),
+        vec![a, b, c]
+    );
 }
 
 #[test]
@@ -93,7 +99,10 @@ fn insert_before_head_and_document_are_handled() {
 
     d.append(doc, x).unwrap();
     d.insert_before(x, y).unwrap();
-    assert_eq!(d.children(doc).copied().collect::<Vec<_>>(), vec![y, x]);
+    assert_eq!(
+        d.children(doc).unwrap().copied().collect::<Vec<_>>(),
+        vec![y, x]
+    );
 }
 
 #[test]
@@ -111,7 +120,7 @@ fn detach_unlinks_but_keeps_subtree_alive() {
     assert!(d.contains(parent));
     assert!(d.contains(item)); // subtree survives intact
     assert_eq!(d.parent(item), Some(parent));
-    assert_eq!(d.children(doc).count(), 0);
+    assert_eq!(d.children(doc).unwrap().count(), 0);
 
     // idempotent
     d.detach(parent).unwrap();
@@ -138,8 +147,8 @@ fn reparent_children_moves_everything_in_order() {
 
     d.reparent_children(from, to).unwrap();
 
-    assert_eq!(d.children(from).count(), 0);
-    assert_eq!(d.children(to).copied().collect::<Vec<_>>(), kids);
+    assert_eq!(d.children(from).unwrap().count(), 0);
+    assert_eq!(d.children(to).unwrap().copied().collect::<Vec<_>>(), kids);
     assert!(kids.iter().all(|&k| d.parent(k) == Some(to)));
 }
 
@@ -173,7 +182,7 @@ fn destroy_recycles_slots_and_stales_every_handle_inside() {
     assert!(!d.contains(child)); // whole subtree went stale together
     assert!(d.get(parent).is_none());
     assert_eq!(d.parent(child), None);
-    assert_eq!(d.children(doc).count(), 0);
+    assert_eq!(d.children(doc).unwrap().count(), 0);
     assert_eq!(d.destroy(parent), Err(DomError::StaleNode));
 }
 
@@ -293,8 +302,14 @@ fn insert_before_edge_cases_are_refused_correctly() {
     assert_eq!(d.insert_before(inner, outer), Err(DomError::CycleForbidden));
 
     // state unchanged by all refusals
-    assert_eq!(d.children(doc).copied().collect::<Vec<_>>(), vec![outer]);
-    assert_eq!(d.children(outer).copied().collect::<Vec<_>>(), vec![inner]);
+    assert_eq!(
+        d.children(doc).unwrap().copied().collect::<Vec<_>>(),
+        vec![outer]
+    );
+    assert_eq!(
+        d.children(outer).unwrap().copied().collect::<Vec<_>>(),
+        vec![inner]
+    );
 }
 
 #[test]
@@ -310,7 +325,10 @@ fn reparent_children_to_itself_is_a_clean_noop() {
 
     d.reparent_children(parent, parent).unwrap();
 
-    assert_eq!(d.children(parent).copied().collect::<Vec<_>>(), vec![a, b]);
+    assert_eq!(
+        d.children(parent).unwrap().copied().collect::<Vec<_>>(),
+        vec![a, b]
+    );
     assert_eq!(d.parent(a), Some(parent));
 }
 
@@ -335,6 +353,49 @@ fn every_mutation_rejects_stale_handles() {
 }
 
 #[test]
+fn the_document_root_cannot_gain_a_parent_or_be_drained() {
+    let mut d = Dom::new();
+    let doc = d.document();
+    let stray = d.create_element(qn("stray"), Vec::new());
+    let body = d.create_element(qn("body"), Vec::new());
+    d.append(doc, body).unwrap();
+
+    // the root must never gain a parent (orphaned document)
+    assert_eq!(d.append(stray, doc), Err(DomError::IllegalTarget));
+
+    // nor may its content drain into an arbitrary detached subtree
+    assert_eq!(
+        d.reparent_children(doc, stray),
+        Err(DomError::IllegalTarget)
+    );
+
+    // refusals left state untouched
+    assert_eq!(d.parent(doc), None);
+    assert_eq!(
+        d.children(doc).unwrap().copied().collect::<Vec<_>>(),
+        vec![body]
+    );
+}
+
+#[test]
+fn stale_children_read_reports_none_not_childless() {
+    let mut d = Dom::new();
+    let ghost = d.create_element(qn("ghost"), Vec::new());
+    d.destroy(ghost).unwrap();
+    assert!(d.children(ghost).is_none());
+}
+
+#[test]
+fn dom_is_send() {
+    fn assert_send<T: Send>() {}
+    assert_send::<Dom>();
+    // `!Sync` is enforced structurally by `_share_forbidden: PhantomData<Cell<()>>`
+    // (Cell<()> is !Sync by definition). Stable Rust cannot assert negative
+    // bounds in tests; deleting that field is the only way this guarantee can
+    // rot, and the field's own doc comment says exactly that.
+}
+
+#[test]
 fn wide_children_lists_behave_like_any_list() {
     let mut d = Dom::new();
     let doc = d.document();
@@ -346,11 +407,14 @@ fn wide_children_lists_behave_like_any_list() {
     for &k in &kids {
         d.append(wide, k).unwrap();
     }
-    assert_eq!(d.children(wide).copied().collect::<Vec<_>>(), kids);
+    assert_eq!(d.children(wide).unwrap().copied().collect::<Vec<_>>(), kids);
 
     // removals from the middle keep order stable
     let middle = kids[25];
     d.destroy(middle).unwrap();
     let expected: Vec<_> = kids.iter().copied().filter(|&k| k != middle).collect();
-    assert_eq!(d.children(wide).copied().collect::<Vec<_>>(), expected);
+    assert_eq!(
+        d.children(wide).unwrap().copied().collect::<Vec<_>>(),
+        expected
+    );
 }
