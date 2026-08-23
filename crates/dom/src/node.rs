@@ -11,6 +11,16 @@ use crate::id::NodeId;
 
 pub use markup5ever::{LocalName, Namespace, Prefix, QualName};
 
+/// The HTML namespace URL.
+///
+/// `markup5ever`'s `ns!(html)` wraps this same string; exposed as a plain
+/// function so callers never touch macro machinery. Selector matching and
+/// the future `TreeSink` adapter both key off it.
+#[must_use]
+pub fn html_namespace() -> Namespace {
+    Namespace::from("http://www.w3.org/1999/xhtml")
+}
+
 /// One attribute: a qualified name and its value.
 ///
 /// Deliberately *not* `markup5ever::Attribute` — that one stores its value as

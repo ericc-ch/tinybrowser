@@ -35,8 +35,11 @@ impl fmt::Display for DomError {
 impl std::error::Error for DomError {}
 
 /// One cell of the arena: current contents plus how many times it changed hands.
+///
+/// Crate-visible only so selector matching can take a node's storage address
+/// as a stable identity token (see [`Dom::cache_identity`]).
 #[derive(Debug)]
-struct Slot {
+pub(crate) struct Slot {
     generation: u32,
     node: Option<Node>,
 }
@@ -147,6 +150,17 @@ impl Dom {
         self.live_slot(id)
             .and_then(|slot| slot.node.as_ref())
             .map(|node| node.children.iter())
+    }
+
+    /// A stable identity token for `id`, for selector-engine caches.
+    ///
+    /// One live node owns exactly one slot, and matching runs under a shared
+    /// borrow that freezes the arena — so the slot's address is unique per
+    /// node and stable for the whole query. Detached nodes keep their slots,
+    /// so identity survives detachment too.
+    #[must_use]
+    pub(crate) fn cache_identity(&self, id: NodeId) -> &Slot {
+        &self.slots[id.index()]
     }
 
     /// Creates an element node, unattached until something appends it.
@@ -345,6 +359,33 @@ impl Dom {
         for id in moved {
             if let Some(node) = self.node_mut(id) {
                 node.parent = Some(to);
+            }
+        }
+        Ok(())
+    }
+
+    /// Adds each attribute that `id` does not already carry, matched by
+    /// qualified name.
+    ///
+    /// The adapter's `add_attrs_if_missing` landing pad: html5ever merges
+    /// attributes from repeated start-tag tokens through this call.
+    ///
+    /// # Errors
+    ///
+    /// - [`DomError::StaleNode`] if `id` is stale.
+    /// - [`DomError::IllegalTarget`] if `id` is not an element.
+    pub fn add_attrs_if_missing(
+        &mut self,
+        id: NodeId,
+        attrs: Vec<Attribute>,
+    ) -> Result<(), DomError> {
+        let node = self.node_mut(id).ok_or(DomError::StaleNode)?;
+        let NodeKind::Element { attributes, .. } = &mut node.kind else {
+            return Err(DomError::IllegalTarget);
+        };
+        for attr in attrs {
+            if !attributes.iter().any(|existing| existing.name == attr.name) {
+                attributes.push(attr);
             }
         }
         Ok(())

@@ -22,7 +22,9 @@ mod arena;
 mod children;
 mod id;
 mod node;
+mod select;
 
 pub use arena::{Dom, DomError, NodeRef};
 pub use id::NodeId;
-pub use node::{Attribute, LocalName, Namespace, NodeKind, Prefix, QualName};
+pub use node::{Attribute, LocalName, Namespace, NodeKind, Prefix, QualName, html_namespace};
+pub use select::SelectError;

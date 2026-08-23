@@ -242,6 +242,50 @@ fn set_data_targets_only_its_kind() {
 }
 
 #[test]
+fn add_attrs_if_missing_merges_without_duplicating() {
+    let mut d = Dom::new();
+    let el = d.create_element(
+        qn("input"),
+        vec![Attribute {
+            name: qn("type"),
+            value: "text".into(),
+        }],
+    );
+    d.append(d.document(), el).unwrap();
+
+    d.add_attrs_if_missing(
+        el,
+        vec![
+            Attribute {
+                name: qn("type"),
+                value: "checkbox".into(),
+            },
+            Attribute {
+                name: qn("name"),
+                value: "q".into(),
+            },
+        ],
+    )
+    .unwrap();
+
+    match d.get(el).map(|n| n.kind()) {
+        Some(NodeKind::Element { attributes, .. }) => {
+            assert_eq!(attributes.len(), 2, "existing name wins, new one lands");
+            assert_eq!(attributes[0].value, "text");
+            assert_eq!(attributes[1].name, qn("name"));
+        }
+        other => panic!("expected element kind, got {other:?}"),
+    }
+
+    // only elements take attributes
+    let text = d.create_text("t");
+    assert_eq!(
+        d.add_attrs_if_missing(text, Vec::new()),
+        Err(DomError::IllegalTarget)
+    );
+}
+
+#[test]
 fn doctype_carries_its_ids() {
     let mut d = Dom::new();
     let dt = d.create_doctype(
