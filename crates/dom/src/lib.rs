@@ -1,3 +1,28 @@
-//! HTML parsing (`html5ever`) into an arena-backed DOM tree, plus selectors.
+//! Document storage for tinybrowser: a generational-arena DOM tree.
 //!
-//! Sync and pure: no tokio, no I/O. Depends on nothing.
+//! One dependency, by charter ([ADR 0003](../../docs/adr/0003-parser-adapter-lives-above-dom.md)):
+//! `markup5ever` for interned name types only. This crate is representation
+//! plus mutation commands; the html5ever adapter lives above it, and nothing
+//! here knows how bytes become nodes.
+//!
+//! Everything crosses boundaries as [`NodeId`] handles. A handle outliving
+//! its node is harmless — lookups report absence, never a different node —
+//! which is what will let the `QuickJS` binding layer hold handles across GC
+//! cycles without borrowing anything.
+//!
+//! # Seam map
+//!
+//! ```text
+//! browser (or glue crate):  html5ever TreeSink → Dom mutations
+//! js:                       QuickJS wrappers ↔ NodeId handles
+//! dom:                      slots, generations, children lists
+//! ```
+
+mod arena;
+mod children;
+mod id;
+mod node;
+
+pub use arena::{Dom, DomError, NodeRef};
+pub use id::NodeId;
+pub use node::{Attribute, LocalName, Namespace, NodeKind, Prefix, QualName};
