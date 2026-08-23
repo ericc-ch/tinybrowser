@@ -1,8 +1,8 @@
 # Size Budget
 
-Goal: **sub-5MB stripped x86_64 binary** (AGENTS.md Vision). Measured 2026-08-21, rustc 1.98.0, Linux.
+Goal: **sub-5MB stripped x86_64 binary** (AGENTS.md Vision). Measured 2026-08-21 and 2026-08-23, rustc 1.98.0, Linux.
 
-Reproduce with `sizeprobe/` in this repo — each dependency is really exercised (tokenize, dial, JS eval), not just imported. Marginal = binary delta vs an empty-`main` build of the same profile.
+Reproduce each dependency row with a probe binary that really exercises it (tokenize, dial, JS eval, parse+query) — the dom-v1 probe lives at `.scratch/dom-layer/sizeprobe/` (with its empty-main baseline in `../sizebaseline/`; the page fed to it is fetched, not committed). Marginal = binary delta vs an empty-`main` build of the same profile.
 
 ## Measured marginal costs
 
@@ -17,6 +17,20 @@ Reproduce with `sizeprobe/` in this repo — each dependency is really exercised
 
 ¹ `opt-level = "z"`, `lto = "fat"`, `codegen-units = 1`, stripped
 
+## Milestone: dom v1 measured (2026-08-23)
+
+Probe parses a real Wikipedia page (405 KB HTML → 4,051 live elements) through
+a throwaway TreeSink over our arena, then runs selector queries of every common
+shape (`a[href]`, descendant lists, id/class, attribute ops, `:nth-child`, comma
+lists) and prints the hit counts.
+
+| Component                                            | default `release` | tuned¹  |
+| ---------------------------------------------------- | ----------------- | ------- |
+| baseline (empty main, re-measured)                   | 448 KB            | 287 KB  |
+| **dom v1**: arena + selectors + cssparser + html5ever + markup5ever, via throwaway TreeSink | +1272 KB | **+932 KB** |
+
+Against the pre-measurement estimate for the same stack (+941 KB +115 KB = +1056 KB release / +840 KB +75 KB = +915 KB tuned): tuned landed within ~2% (+17 KB); release ran +216 KB over — the probe also carries dom's own storage/search code plus query execution the estimates never included. Accepted: no regression to justify.
+
 ## Stack totals (tuned profile)
 
 | Stack                                                  | Total       | Headroom to 5 MB |
@@ -24,6 +38,7 @@ Reproduce with `sizeprobe/` in this repo — each dependency is really exercised
 | ureq(native-tls) + quickjs-ng + **html5ever** ← chosen | **2.26 MB** | ~2.74 MB         |
 | same but html5gum instead                              | 1.73 MB     | ~3.27 MB         |
 | any of the above on default `release`                  | 2.7–3.3 MB  | —                |
+| chosen + **dom v1** (2026-08-23, components re-summed) | **~2.42 MB**| ~2.58 MB         |
 
 ## Decisions
 
@@ -31,7 +46,7 @@ Reproduce with `sizeprobe/` in this repo — each dependency is really exercised
 - **Tuned profile from day one**: default release costs +400–850KB for nothing. The flags are set once in the root Cargo.toml.
 - **native-tls, dynamically linked**: TLS lives in system `libssl.so.3`; we ship only glue (~482 KB tuned). Static rustls would add ~+2.0 MB — rejected. Consequence: target machine needs OpenSSL 3 installed (near-universal on Linux).
 - **panic = unwind kept**: abort saves only ~39 KB but kills `catch_unwind`, which every JS-exposed op needs so a Rust panic degrades to a JS error instead of unwinding through QuickJS's C frame.
-- **selectors later is cheap**: querySelector support costs only ~75 KB when we get to it.
+- **selectors later is cheap** — confirmed at the dom-v1 checkpoint: the whole dom layer (arena + selector engine + parser stack) measured +932 KB tuned, within ~2% of the html5ever+selectors estimates it subsumes (see Milestone section).
 - **Old servo stack (html5ever + selectors + cssparser as the _core_) was never the problem** — the old repo's total was bloat elsewhere. The parser swap alone does not hit 5MB; discipline at every milestone does.
 
 ## Watchlist (what can still blow the budget)

@@ -39,3 +39,7 @@ _Avoid_: tag name (only the local part)
 
 **Fan-in point**:
 The `browser` crate — the only place allowed to depend on several layers at once (ADR 0001).
+
+**Scope**:
+The live node a selector query is rooted at; candidates are its descendants in document order, and the scope itself is never one of its own results — while matching still sees real ancestors above it.
+_Avoid_: root (means the document's root element), context

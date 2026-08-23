@@ -42,3 +42,11 @@ Notes:
 - Repo rules apply unchanged: no `unsafe`, no lint escapes, breaking changes fine pre-consumer.
 - Size context lives in `docs/size-budget.md` (stack choice, tuned-profile totals, ~2.7 MB headroom after this layer).
 - Exact signatures may flex while the adapter and first consumers get written; the standing contracts are ticket-in/ticket-out handles, `Option`/`Result` on staleness, slice-op bulk moves.
+
+Closure (2026-08-23): core storage and selectors are both landed — v1 is
+complete. Two consumer-driven additions beyond the original method list:
+`Dom::add_attrs_if_missing` (the TreeSink contract needs it) and the
+selector trio on `Dom`. Entry points live on `Dom`, not `NodeRef` (see
+ticket 05's final amendment). The html5lib suite belongs to the adapter
+milestone: ADR 0003 keeps parsing above dom, so parse correctness cannot be
+tested from inside this crate. dom v1 measured +932 KB tuned (ticket 08).

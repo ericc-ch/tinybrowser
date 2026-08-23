@@ -2,7 +2,9 @@
 
 Date: 2026-08-23
 Status: Accepted (amends the `dom` charter row of ADR 0001;
-decision 2 amended same day — see Amended below)
+decision 2 amended same day — see Amended below; decision-consequence
+"exactly one dependency" amended 2026-08-23 when selectors shipped —
+see second Amended section)
 
 ## Context
 
@@ -37,6 +39,19 @@ parser ecosystem — versus a purity rule whose only content was the dependency
 count. The parser boundary (decision 1) is unchanged and remains the point of
 the ADR.
 
+### Amended 2026-08-23 (selector dependencies)
+
+The consequence line "dom's manifest carries exactly one dependency" was
+written while selectors were still deferred (ticket 05, first amendment).
+When selector matching shipped as part of dom v1 — per ADR 0001's charter
+row and the dom-layer spec, which always placed it *inside* `dom` — the
+manifest grew by the Servo selector stack (`selectors`, its exact-version
+partner `cssparser`, plus `precomputed-hash` for the trait dom's name
+wrappers must implement). Decision 1 is untouched: no parsing dependency
+entered the crate. The enforced boundary reads "no parser above, names from
+pinned markup5ever", not a dependency count; the size cost of the stack is
+measured in `docs/size-budget.md`'s milestone section.
+
 ## Rejected alternatives
 
 - **`parse_html` inside `dom`**: couples the storage layer to a parser forever
@@ -50,9 +65,10 @@ the ADR.
 
 ## Consequences
 
-- `dom`'s manifest carries exactly one dependency; "no parsing dependency"
-  is the enforced boundary, not "no dependencies".
+- `dom`'s manifest carries the pinned name types plus the selector stack;
+  "no parsing dependency" is the enforced boundary, not a dependency count
+  (see second Amended section).
 - The adapter needs no name conversion; attribute values still convert
   (`StrTendril` → `String`) because dom defines its own `Attribute`.
 - Binary size will include markup5ever's tables at the milestone probe;
-  accepted against the ~2.7 MB headroom recorded in `docs/size-budget.md`.
+  accepted against the headroom recorded in `docs/size-budget.md`.
