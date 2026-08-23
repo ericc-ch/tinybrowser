@@ -6,6 +6,16 @@ members = [
     "crates/net",
 ]
 
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+
+[workspace.dependencies]
+browser = { path = "crates/browser" }
+dom = { path = "crates/dom" }
+js = { path = "crates/js" }
+net = { path = "crates/net" }
+
 [package]
 name = "tinybrowser"
 version = "0.1.0"
@@ -19,16 +29,6 @@ browser = { workspace = true }
 dom = { workspace = true }
 js = { workspace = true }
 net = { workspace = true }
-
-[workspace.package]
-version = "0.1.0"
-edition = "2024"
-
-[workspace.dependencies]
-browser = { path = "crates/browser" }
-dom = { path = "crates/dom" }
-js = { path = "crates/js" }
-net = { path = "crates/net" }
 
 # ─── Lints ────────────────────────────────────────────────────────────────────
 # Strict (not strict-strict): `all` is error, `pedantic`/`cargo` are warnings.
