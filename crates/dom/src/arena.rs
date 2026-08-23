@@ -190,6 +190,11 @@ impl Dom {
     /// first, mirroring DOM `appendChild`. Appending a node into itself or its
     /// own subtree is refused.
     ///
+    /// # Panics
+    ///
+    /// Only on an internal invariant defect (a verified-live node missing its
+    /// child list) — never on user input; input failures return errors.
+    ///
     /// # Errors
     ///
     /// - [`DomError::StaleNode`] if either handle is stale.
@@ -201,7 +206,12 @@ impl Dom {
         }
         self.unlink_from_current_parent(child);
 
-        let list = self.children_mut(parent).ok_or(DomError::StaleNode)?;
+        // Defect guards, not input errors: liveness was checked above, so
+        // `None` here means the parent-pointer/child-list duality is broken.
+        // Panicking beats reporting a lying "stale node" to callers.
+        let list = self
+            .children_mut(parent)
+            .expect("verified-live parent has no child list");
         list.push(child);
         if let Some(node) = self.node_mut(child) {
             node.parent = Some(parent);
@@ -212,6 +222,11 @@ impl Dom {
     /// Inserts `node` immediately before `sibling` under sibling's parent.
     ///
     /// Moving semantics, like [`Dom::append`].
+    ///
+    /// # Panics
+    ///
+    /// Only on an internal invariant defect (a live sibling missing from its
+    /// own parent's list) — never on user input.
     ///
     /// # Errors
     ///
@@ -230,8 +245,16 @@ impl Dom {
         }
         self.unlink_from_current_parent(node);
 
-        let list = self.children_mut(parent).ok_or(DomError::StaleNode)?;
-        let position = list.position_of(sibling).ok_or(DomError::StaleNode)?;
+        // Defect guards, not input errors: `parent` and `sibling` were both
+        // verified live above, so a miss here means the parent-pointer/
+        // child-list duality is broken. Panicking beats reporting a lying
+        // "stale node" to callers.
+        let list = self
+            .children_mut(parent)
+            .expect("verified-live parent has no child list");
+        let position = list
+            .position_of(sibling)
+            .expect("live sibling missing from its own parent's list");
         list.insert(position, node);
         if let Some(attached) = self.node_mut(node) {
             attached.parent = Some(parent);
@@ -249,7 +272,7 @@ impl Dom {
     /// - [`DomError::StaleNode`] if `id` is stale.
     /// - [`DomError::IllegalTarget`] for the document root.
     pub fn detach(&mut self, id: NodeId) -> Result<(), DomError> {
-        self.ensure_alive1(id)?;
+        self.require_live(id)?;
         if id == self.document {
             return Err(DomError::IllegalTarget);
         }
@@ -266,6 +289,11 @@ impl Dom {
     /// adoption agency: order is preserved and each moved child's parent
     /// pointer is updated.
     ///
+    /// # Panics
+    ///
+    /// Only on an internal invariant defect (a verified-live node missing its
+    /// child list) — never on user input.
+    ///
     /// # Errors
     ///
     /// - [`DomError::StaleNode`] if either handle is stale.
@@ -279,11 +307,16 @@ impl Dom {
         if self.would_cycle(from, to) {
             return Err(DomError::CycleForbidden);
         }
+        // Defect guards, not input errors: both handles were verified live
+        // above, so a miss here means the parent-pointer/child-list duality
+        // is broken. Panicking beats reporting a lying "stale node".
         let moved = self
             .children_mut(from)
             .map(Children::take_all)
-            .ok_or(DomError::StaleNode)?;
-        let list = self.children_mut(to).ok_or(DomError::StaleNode)?;
+            .expect("verified-live `from` has no child list");
+        let list = self
+            .children_mut(to)
+            .expect("verified-live `to` has no child list");
         for id in &moved {
             list.push(*id);
         }
@@ -339,7 +372,7 @@ impl Dom {
     /// - [`DomError::StaleNode`] if `id` is stale.
     /// - [`DomError::IllegalTarget`] for the document root.
     pub fn destroy(&mut self, id: NodeId) -> Result<(), DomError> {
-        self.ensure_alive1(id)?;
+        self.require_live(id)?;
         if id == self.document {
             return Err(DomError::IllegalTarget);
         }
@@ -352,7 +385,9 @@ impl Dom {
             if let Some(node) = slot.node.take() {
                 pending.extend(node.children.iter().copied());
             }
-            slot.generation = slot.generation.wrapping_add(1);
+            // No generation tick here: emptiness is what makes the handle
+            // dead (`live_slot` requires `node.is_some()`), and the single
+            // tick happens at reallocation in `alloc`.
             self.free.push(current.slot);
         }
         Ok(())
@@ -385,7 +420,8 @@ impl Dom {
         }
     }
 
-    fn ensure_alive1(&self, a: NodeId) -> Result<(), DomError> {
+    /// Single-handle variant of [`Dom::ensure_alive`].
+    fn require_live(&self, a: NodeId) -> Result<(), DomError> {
         if self.contains(a) {
             Ok(())
         } else {
@@ -434,9 +470,10 @@ impl Dom {
     ///
     /// # Panics
     ///
-    /// Only past `u32::MAX` slots; see [`Dom::create_element`]. The bound is
-    /// what makes `Children`'s empty-cell sentinel sound, so it is enforced
-    /// with a loud, documented stop rather than silent wraparound.
+    /// Only when the arena would need slot index `u32::MAX` or beyond —
+    /// hundreds of GB of RAM, not a reachable runtime condition. Slot
+    /// `u32::MAX` itself is refused because it is `Children`'s empty-cell
+    /// sentinel; see that type for the full soundness argument.
     fn alloc(&mut self, kind: NodeKind) -> NodeId {
         let node = Node {
             parent: None,
@@ -446,6 +483,7 @@ impl Dom {
         if let Some(slot) = self.free.pop() {
             // Lossless widening cast (u32 → usize); no From impl exists for it.
             let index = slot as usize;
+            // The single generation tick per change of hands happens here.
             let generation = self.slots[index].generation.wrapping_add(1);
             self.slots[index] = Slot {
                 generation,
@@ -453,7 +491,19 @@ impl Dom {
             };
             return NodeId::new(slot, generation);
         }
-        let slot = u32::try_from(self.slots.len()).expect("arena exhausted: >u32::MAX nodes");
+        // Slot u32::MAX is refused outright: it is the empty-cell sentinel in
+        // `Children`, and issuing it would make that sentinel aliasable. The
+        // bound therefore sits one below the type's ceiling; reaching it
+        // requires >4 billion live nodes (hundreds of GB of arena alone), so
+        // exhausting it is an impossible runtime condition rather than an
+        // error to handle. Generations wrap after 2^32 recycles of one slot;
+        // that residual ABA window is accepted by design — exploiting it
+        // needs billions of death/reuse cycles on a single slot while some
+        // outside handle to that slot still exists.
+        let slot = u32::try_from(self.slots.len())
+            .ok()
+            .filter(|slot| *slot != u32::MAX)
+            .expect("arena exhausted: >u32::MAX slots requires hundreds of GB of RAM");
         self.slots.push(Slot {
             generation: 0,
             node: Some(node),

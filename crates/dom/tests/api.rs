@@ -189,7 +189,8 @@ fn recycled_slots_never_impersonate_dead_nodes() {
     d.destroy(button).unwrap();
     let span = d.create_element(qn("span"), Vec::new());
 
-    // slot was recycled (fresh creation pops the free list), generation ticked
+    // fresh creation takes back the freed slot number under a new
+    // generation; only the behavior below is public, not the slot identity
     assert!(!d.contains(button), "old handle must not name the new node");
     assert!(d.contains(span));
     assert_eq!(d.parent(span), None); // created unattached
@@ -274,6 +275,63 @@ fn elements_carry_names_and_attributes() {
         }
         other => panic!("expected element kind, got {other:?}"),
     }
+}
+
+#[test]
+fn insert_before_edge_cases_are_refused_correctly() {
+    let mut d = Dom::new();
+    let doc = d.document();
+    let outer = d.create_element(qn("outer"), Vec::new());
+    let inner = d.create_element(qn("inner"), Vec::new());
+    d.append(doc, outer).unwrap();
+    d.append(outer, inner).unwrap();
+
+    // inserting a node before itself is meaningless, not a reorder
+    assert_eq!(d.insert_before(inner, inner), Err(DomError::IllegalTarget));
+
+    // moving `outer` to before its own descendant would tear the subtree
+    assert_eq!(d.insert_before(inner, outer), Err(DomError::CycleForbidden));
+
+    // state unchanged by all refusals
+    assert_eq!(d.children(doc).copied().collect::<Vec<_>>(), vec![outer]);
+    assert_eq!(d.children(outer).copied().collect::<Vec<_>>(), vec![inner]);
+}
+
+#[test]
+fn reparent_children_to_itself_is_a_clean_noop() {
+    let mut d = Dom::new();
+    let doc = d.document();
+    let parent = d.create_element(qn("p"), Vec::new());
+    let a = d.create_element(qn("a"), Vec::new());
+    let b = d.create_element(qn("b"), Vec::new());
+    d.append(doc, parent).unwrap();
+    d.append(parent, a).unwrap();
+    d.append(parent, b).unwrap();
+
+    d.reparent_children(parent, parent).unwrap();
+
+    assert_eq!(d.children(parent).copied().collect::<Vec<_>>(), vec![a, b]);
+    assert_eq!(d.parent(a), Some(parent));
+}
+
+#[test]
+fn every_mutation_rejects_stale_handles() {
+    let mut d = Dom::new();
+    let doc = d.document();
+    let live = d.create_element(qn("live"), Vec::new());
+    let ghost = d.create_text("ghost");
+    let sibling = d.create_element(qn("s"), Vec::new());
+    d.append(doc, live).unwrap();
+    d.append(live, sibling).unwrap();
+    d.destroy(ghost).unwrap();
+
+    assert_eq!(d.insert_before(sibling, ghost), Err(DomError::StaleNode));
+    assert_eq!(d.insert_before(ghost, live), Err(DomError::StaleNode));
+    assert_eq!(d.detach(ghost), Err(DomError::StaleNode));
+    assert_eq!(d.destroy(ghost), Err(DomError::StaleNode));
+    assert_eq!(d.reparent_children(ghost, doc), Err(DomError::StaleNode));
+    assert_eq!(d.reparent_children(doc, ghost), Err(DomError::StaleNode));
+    assert_eq!(d.set_comment(ghost, "boo"), Err(DomError::StaleNode));
 }
 
 #[test]

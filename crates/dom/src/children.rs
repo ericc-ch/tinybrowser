@@ -29,17 +29,13 @@ impl Children {
 
     /// Sentinel filling unused inline cells.
     ///
-    /// Sound as a "no node" marker because arena slot allocation refuses
-    /// `u32::MAX` (see `Arena::alloc`), so no real handle can ever equal it:
-    /// the sentinel's slot index is unallocatable, hence unreachable by any
-    /// generation value.
+    /// Sound as a "no node" marker because arena allocation refuses to ever
+    /// issue slot index `u32::MAX` (see `Dom::alloc`: the fresh-slot path
+    /// filters it out before the documented, unreachable-by-RAM `expect`).
+    /// Since no real handle can carry that slot number, no generation value
+    /// can make a live handle equal this one.
     const fn empty_cell() -> NodeId {
         NodeId::new(u32::MAX, u32::MAX)
-    }
-
-    #[cfg(test)]
-    fn is_empty_cell(id: NodeId) -> bool {
-        id == Self::empty_cell()
     }
 
     /// The live entries as a contiguous slice, padding hidden.
@@ -75,7 +71,11 @@ impl Children {
         *self = Self::Heap(buffer);
     }
 
-    /// Inserts at `index`, which must be `<= len`.
+    /// Inserts at `index`, shifting the entries after it right.
+    ///
+    /// Inserting at `len` appends, and a full inline list grows through
+    /// [`Children::push`]'s spill path — this method itself never overflows
+    /// the inline array.
     ///
     /// # Panics
     ///
@@ -83,9 +83,18 @@ impl Children {
     /// in this same list, so out-of-range means caller-side bookkeeping broke;
     /// failing loudly beats shifting the corruption downstream.
     pub(crate) fn insert(&mut self, index: usize, id: NodeId) {
+        let len = self.as_slice().len();
+        assert!(index <= len, "children insert out of range");
+        if index == len {
+            // Appending through the dedicated path: for a full inline list
+            // this performs the one-way spill conversion.
+            self.push(id);
+            return;
+        }
         match self {
             Self::Inline { len, ids } => {
-                assert!(index <= usize::from(*len), "children insert out of range");
+                // index < len <= INLINE_CAP holds here, so every array access
+                // below is in bounds.
                 ids.copy_within(index..usize::from(*len), index + 1);
                 ids[index] = id;
                 *len += 1;
@@ -119,8 +128,15 @@ impl Children {
     }
 
     /// Drains all entries into an owned vector, leaving this list empty.
+    ///
+    /// Representation is preserved: an emptied spilled list stays spilled, so
+    /// churny reparent cycles cannot thrash between heap and inline storage.
     pub(crate) fn take_all(&mut self) -> Vec<NodeId> {
-        let taken = std::mem::replace(self, Self::new());
+        let replacement = match self {
+            Self::Heap(_) => Self::Heap(Vec::new()),
+            Self::Inline { .. } => Self::new(),
+        };
+        let taken = std::mem::replace(self, replacement);
         match taken {
             Self::Inline { len, ids } => ids[..usize::from(len)].to_vec(),
             Self::Heap(ids) => ids,
@@ -192,15 +208,32 @@ mod tests {
     }
 
     #[test]
-    fn take_all_resets_to_empty_inline() {
-        let mut children = Children::new();
-        for n in 0..6 {
-            children.push(handle(n));
+    fn take_all_resets_inline_and_preserves_spilled() {
+        // Inline lists reset to empty inline...
+        let mut inline = Children::new();
+        for n in 0..3 {
+            inline.push(handle(n));
         }
-        let drained = children.take_all();
+        let drained = inline.take_all();
+        assert_eq!(drained.len(), 3);
+        assert!(matches!(inline, Children::Inline { len: 0, .. }));
+        assert!(inline.as_slice().is_empty());
+
+        // ...while spilled lists stay spilled, honoring the never-returns-
+        // inline guarantee under churn.
+        let mut spilled = Children::new();
+        for n in 0..6 {
+            spilled.push(handle(n));
+        }
+        let drained = spilled.take_all();
         assert_eq!(drained.len(), 6);
-        assert!(matches!(children, Children::Inline { len: 0, .. }));
-        assert!(children.as_slice().is_empty());
+        assert!(matches!(spilled, Children::Heap(_)));
+        assert_eq!(spilled.as_slice().len(), 0);
+        spilled.push(handle(99));
+        assert!(
+            matches!(spilled, Children::Heap(_)),
+            "refilling a drained spilled list must not re-spill from scratch"
+        );
     }
 
     #[test]
@@ -208,9 +241,8 @@ mod tests {
         let mut children = Children::new();
         children.push(handle(7));
         assert_eq!(children.position_of(handle(7)), Some(0));
-        // the padding sentinel and any foreign handle are never found
-        assert_eq!(children.position_of(Children::empty_cell()), None);
+        // padding cells beyond `len` never surface through lookups
         assert_eq!(children.position_of(NodeId::new(u32::MAX, u32::MAX)), None);
-        assert!(!Children::is_empty_cell(handle(0)));
+        assert_eq!(children.position_of(handle(0)), None);
     }
 }
