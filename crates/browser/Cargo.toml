@@ -10,3 +10,7 @@ workspace = true
 dom = { workspace = true }
 js = { workspace = true }
 net = { workspace = true }
+# Exactly html5ever 0.39's own markup5ever — same pin as dom's charter, so
+# parser QualNames flow into dom as one type, no conversion layer.
+markup5ever = "=0.39.0"
+html5ever = "=0.39.0"

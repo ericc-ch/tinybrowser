@@ -283,6 +283,14 @@ fn add_attrs_if_missing_merges_without_duplicating() {
         d.add_attrs_if_missing(text, Vec::new()),
         Err(DomError::IllegalTarget)
     );
+
+    // stale handles are refused like every other mutation
+    let ghost = d.create_element(qn("gone"), Vec::new());
+    d.destroy(ghost).unwrap();
+    assert_eq!(
+        d.add_attrs_if_missing(ghost, Vec::new()),
+        Err(DomError::StaleNode)
+    );
 }
 
 #[test]
@@ -457,8 +465,20 @@ fn wide_children_lists_behave_like_any_list() {
     let middle = kids[25];
     d.destroy(middle).unwrap();
     let expected: Vec<_> = kids.iter().copied().filter(|&k| k != middle).collect();
-    assert_eq!(
-        d.children(wide).unwrap().copied().collect::<Vec<_>>(),
+    assert_eq!(d.children(wide).unwrap().copied().collect::<Vec<_>>(),
         expected
     );
+}
+
+#[test]
+fn fragments_are_detached_containers() {
+    let mut d = Dom::new();
+    let f = d.create_fragment();
+    let t = d.create_text("hi");
+    d.append(f, t).unwrap();
+
+    assert!(matches!(d.get(f).map(|n| n.kind()), Some(NodeKind::Fragment)));
+    // outside the main tree: no parent, but fully live and usable
+    assert_eq!(d.parent(f), None);
+    assert_eq!(d.children(f).unwrap().copied().collect::<Vec<_>>(), vec![t]);
 }

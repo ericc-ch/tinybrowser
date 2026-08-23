@@ -20,7 +20,7 @@ Implementation decisions:
 - **Parser placement**: no `parse_html` in `dom`. The `html5ever::TreeSink` implementation lives above (in `browser` or a thin glue crate); `dom` depends on `markup5ever = "=0.39.0"` for interned name types — later joined by the Servo selector stack, still never a parsing dependency (see ADR 0002).
 - **Selectors in v1**: Servo `selectors` + `cssparser` (~75 KB measured marginal) wired to the arena through newtypes over the interned name atoms; search entry points on `Dom` only — a `NodeRef` is a pure borrowed view with no arena back-pointer (see tickets/05's completion amendment).
 - **Threading contract**: `Send`, never `Sync`. The split is enforced structurally — a `_share_forbidden: PhantomData<Cell<()>>` field suppresses auto-derived `Sync`; deleting it is a conscious act. Hand-off between workers legal; simultaneous access compiler-forbidden; zero locks anywhere.
-- **Node kinds**: `Document | Doctype | Element | Text | Comment`.
+- **Node kinds**: `Document | Doctype | Element | Fragment | Text | Comment`.
 
 Testing decisions:
 

@@ -48,6 +48,10 @@ pub enum NodeKind {
         name: QualName,
         attributes: Vec<Attribute>,
     },
+    /// A document fragment: a container outside the main tree. Serves as the
+    /// contents root of `<template>` elements today, and as the context root
+    /// for fragment parsing (`innerHTML`) later.
+    Fragment,
     /// Character data; adjacent runs are *not* merged by dom itself.
     Text { data: String },
     /// An HTML comment.

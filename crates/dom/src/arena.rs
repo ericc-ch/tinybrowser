@@ -210,6 +210,19 @@ impl Dom {
         })
     }
 
+    /// Creates an empty document fragment, unattached like every fresh node.
+    ///
+    /// Fragments are containers outside the main tree — the contents root of
+    /// `<template>` elements (the parser associates them via its own map) and,
+    /// later, the context node for `innerHTML`-style fragment parsing.
+    ///
+    /// # Panics
+    ///
+    /// See [`Dom::create_element`]: unreachable except beyond `u32::MAX` nodes.
+    pub fn create_fragment(&mut self) -> NodeId {
+        self.alloc(NodeKind::Fragment)
+    }
+
     /// Appends `child` as the last child of `parent`.
     ///
     /// Moving semantics: a `child` already attached elsewhere is detached
