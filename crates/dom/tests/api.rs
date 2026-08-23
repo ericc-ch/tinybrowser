@@ -477,7 +477,10 @@ fn fragments_are_detached_containers() {
     let t = d.create_text("hi");
     d.append(f, t).unwrap();
 
-    assert!(matches!(d.get(f).map(|n| n.kind()), Some(NodeKind::Fragment)));
+    assert!(matches!(
+        d.get(f).map(|n| n.kind()),
+        Some(NodeKind::Fragment)
+    ));
     // outside the main tree: no parent, but fully live and usable
     assert_eq!(d.parent(f), None);
     assert_eq!(d.children(f).unwrap().copied().collect::<Vec<_>>(), vec![t]);

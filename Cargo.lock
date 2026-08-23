@@ -17,6 +17,7 @@ dependencies = [
  "js",
  "markup5ever",
  "net",
+ "tendril",
 ]
 
 [[package]]

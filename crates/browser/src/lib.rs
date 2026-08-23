@@ -3,3 +3,331 @@
 //! The single fan-in point over `dom`, `net`, and `js`. Injects the HTTP
 //! adapter into the JS runtime. Everything above it goes through here; when
 //! CDP arrives it will depend on this crate alone.
+//!
+//! This crate also hosts the html5ever [`TreeSink`] adapter (per
+//! docs/adr/0002-dom-layer-architecture.md): the parser narrates tree
+//! construction, and [`Sink`] translates each instruction into `Dom`
+//! mutations. Storage stays parser-free in `dom`; parsing stays storage-free
+//! here.
+
+use std::borrow::Cow;
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
+
+use dom::{Attribute as DomAttribute, Dom, NodeId as Handle, NodeKind, QualName};
+use html5ever::tree_builder::{ElementFlags, NodeOrText, QuirksMode, TreeSink};
+use markup5ever::interface::tree_builder::ElemName;
+use tendril::{StrTendril, TendrilSink};
+
+/// The result of parsing one document.
+#[derive(Debug)]
+pub struct Parsed {
+    /// The parsed tree, rooted at [`Dom::document`].
+    pub dom: Dom,
+    /// Compatibility mode selected by the doctype (or its absence).
+    pub quirks_mode: QuirksMode,
+    /// How many spec parse errors the tokenizer/tree builder reported.
+    pub parse_errors: u32,
+}
+
+/// Parses a full HTML document into a fresh [`Dom`].
+///
+/// Broken markup is recovered exactly the way the HTML spec — and therefore
+/// every browser — mandates; that recovery is html5ever's job, not ours.
+#[must_use]
+pub fn parse_html(input: &str) -> Parsed {
+    let sink = Sink::new();
+    html5ever::parse_document(sink, html5ever::ParseOpts::default()).one(input)
+}
+
+// ── the sink ────────────────────────────────────────────────────────────────
+
+struct Sink {
+    // `TreeSink` 0.39 hands out `&self`, while every `Dom` mutation needs
+    // `&mut self` — hence interior mutability at this one boundary. Sound
+    // because the driver is single-threaded and never reenters the sink in
+    // the middle of another call: borrows are short, sequential, and cannot
+    // overlap. If one ever did overlap, that is an adapter bug and the
+    // `RefCell` panics loudly rather than corrupting the tree.
+    dom: RefCell<Dom>,
+    quirks_mode: Cell<QuirksMode>,
+    parse_errors: Cell<u32>,
+    /// `<template>` element → its contents fragment. Contents live *outside*
+    /// the child list per spec, so a side map keeps them out of `children()`.
+    template_contents: RefCell<HashMap<Handle, Handle>>,
+}
+
+impl Sink {
+    fn new() -> Self {
+        Self {
+            dom: RefCell::new(Dom::new()),
+            quirks_mode: Cell::new(QuirksMode::NoQuirks),
+            parse_errors: Cell::new(0),
+            template_contents: RefCell::new(HashMap::new()),
+        }
+    }
+
+    fn append_text(&self, parent: Handle, text: &str) {
+        // Spec rule: adjacent character data merges into one text node. Dom
+        // deliberately never merges on its own, so the adapter looks at the
+        // last child first.
+        let last = self
+            .dom
+            .borrow()
+            .children(parent)
+            .and_then(|mut kids| kids.next_back().copied());
+        if let Some(last) = last
+            && matches!(
+                self.dom.borrow().get(last).map(|n| n.kind()),
+                Some(NodeKind::Text { .. })
+            )
+        {
+            let mut merged = match self.dom.borrow().get(last).map(|n| n.kind()) {
+                Some(NodeKind::Text { data }) => data.clone(),
+                _ => unreachable!("checked Text two lines above"),
+            };
+            merged.push_str(text);
+            self.dom
+                .borrow_mut()
+                .set_text(last, merged)
+                .expect("live text node stays live within one sink call");
+            return;
+        }
+        let fresh = self.dom.borrow_mut().create_text(text);
+        self.dom
+            .borrow_mut()
+            .append(parent, fresh)
+            .expect("builder appends into a parent that can take children");
+    }
+}
+
+/// Owned element-name view satisfying the sink's GAT. `Ref::deref` loans are
+/// statement-scoped, so instead of smuggling a guard out we clone the two
+/// interned atoms (each one machine word) per query.
+#[derive(Debug)]
+struct OwnedElemName {
+    ns: markup5ever::Namespace,
+    local: markup5ever::LocalName,
+}
+
+impl ElemName for OwnedElemName {
+    fn ns(&self) -> &markup5ever::Namespace {
+        &self.ns
+    }
+
+    fn local_name(&self) -> &markup5ever::LocalName {
+        &self.local
+    }
+}
+
+impl TreeSink for Sink {
+    type Handle = Handle;
+    type Output = Parsed;
+    type ElemName<'a>
+        = OwnedElemName
+    where
+        Self: 'a;
+
+    fn finish(self) -> Self::Output {
+        Parsed {
+            dom: self.dom.into_inner(),
+            quirks_mode: self.quirks_mode.get(),
+            parse_errors: self.parse_errors.get(),
+        }
+    }
+
+    fn parse_error(&self, _msg: Cow<'static, str>) {
+        self.parse_errors.set(self.parse_errors.get() + 1);
+    }
+
+    fn get_document(&self) -> Self::Handle {
+        self.dom.borrow().document()
+    }
+
+    fn elem_name<'a>(&'a self, target: &'a Self::Handle) -> Self::ElemName<'a> {
+        match self.dom.borrow().get(*target).map(|node| node.kind()) {
+            Some(NodeKind::Element { name, .. }) => OwnedElemName {
+                ns: name.ns.clone(),
+                local: name.local.clone(),
+            },
+            _ => panic!("elem_name called on a non-element or dead handle"),
+        }
+    }
+
+    fn create_element(
+        &self,
+        name: QualName,
+        attrs: Vec<markup5ever::Attribute>,
+        flags: ElementFlags,
+    ) -> Self::Handle {
+        let converted: Vec<DomAttribute> = attrs
+            .into_iter()
+            .map(|attr| DomAttribute {
+                name: attr.name,
+                value: attr.value.to_string(),
+            })
+            .collect();
+        let element = self.dom.borrow_mut().create_element(name, converted);
+        if flags.template {
+            let contents = self.dom.borrow_mut().create_fragment();
+            self.template_contents
+                .borrow_mut()
+                .insert(element, contents);
+        }
+        element
+    }
+
+    fn create_comment(&self, text: StrTendril) -> Self::Handle {
+        self.dom.borrow_mut().create_comment(text.to_string())
+    }
+
+    /// Per the HTML spec, processing instructions become comments whose data
+    /// is `target + ' ' + data`.
+    fn create_pi(&self, target: StrTendril, data: StrTendril) -> Self::Handle {
+        let combined = format!("{target} {data}");
+        self.dom.borrow_mut().create_comment(combined)
+    }
+
+    fn append(&self, parent: &Self::Handle, child: NodeOrText<Self::Handle>) {
+        match child {
+            NodeOrText::AppendNode(node) => {
+                self.dom
+                    .borrow_mut()
+                    .append(*parent, node)
+                    .expect("builder appends a parentless live node");
+            }
+            NodeOrText::AppendText(ref text) => self.append_text(*parent, text),
+        }
+    }
+
+    fn append_based_on_parent_node(
+        &self,
+        element: &Self::Handle,
+        prev_element: &Self::Handle,
+        child: NodeOrText<Self::Handle>,
+    ) {
+        if self.dom.borrow().parent(*element).is_some() {
+            self.append_before_sibling(element, child);
+        } else {
+            self.append(prev_element, child);
+        }
+    }
+
+    fn append_doctype_to_document(
+        &self,
+        name: StrTendril,
+        public_id: StrTendril,
+        system_id: StrTendril,
+    ) {
+        let doc = self.get_document();
+        let doctype = self.dom.borrow_mut().create_doctype(
+            name.to_string(),
+            public_id.to_string(),
+            system_id.to_string(),
+        );
+        self.dom
+            .borrow_mut()
+            .append(doc, doctype)
+            .expect("document accepts its own doctype");
+    }
+
+    fn get_template_contents(&self, target: &Self::Handle) -> Self::Handle {
+        *self
+            .template_contents
+            .borrow()
+            .get(target)
+            .unwrap_or_else(|| panic!("template contents requested for a non-template"))
+    }
+
+    fn same_node(&self, x: &Self::Handle, y: &Self::Handle) -> bool {
+        x == y
+    }
+
+    fn set_quirks_mode(&self, mode: QuirksMode) {
+        self.quirks_mode.set(mode);
+    }
+
+    fn append_before_sibling(&self, sibling: &Self::Handle, new_node: NodeOrText<Self::Handle>) {
+        match new_node {
+            NodeOrText::AppendNode(node) => {
+                self.dom
+                    .borrow_mut()
+                    .insert_before(*sibling, node)
+                    .expect("builder inserts beside a live parented sibling");
+            }
+            NodeOrText::AppendText(ref text) => {
+                // Merge into the previous sibling when that is text; the
+                // builder promises `sibling` itself is not a text node.
+                let parent = self
+                    .dom
+                    .borrow()
+                    .parent(*sibling)
+                    .expect("sibling has a parent per builder promise");
+                let position = self
+                    .dom
+                    .borrow()
+                    .children(parent)
+                    .and_then(|mut kids| kids.position(|&kid| kid == *sibling))
+                    .expect("parented sibling sits in its parent's list");
+                let prev = (position > 0).then(|| {
+                    self.dom
+                        .borrow()
+                        .children(parent)
+                        .and_then(|mut kids| kids.nth(position - 1))
+                        .copied()
+                        .expect("position-1 exists")
+                });
+                if let Some(prev) = prev
+                    && matches!(
+                        self.dom.borrow().get(prev).map(|n| n.kind()),
+                        Some(NodeKind::Text { .. })
+                    )
+                {
+                    let mut merged = match self.dom.borrow().get(prev).map(|n| n.kind()) {
+                        Some(NodeKind::Text { data }) => data.clone(),
+                        _ => unreachable!("checked Text three lines above"),
+                    };
+                    merged.push_str(text);
+                    self.dom
+                        .borrow_mut()
+                        .set_text(prev, merged)
+                        .expect("live text node stays live within one sink call");
+                    return;
+                }
+                let fresh = self.dom.borrow_mut().create_text(text.clone());
+                self.dom
+                    .borrow_mut()
+                    .insert_before(*sibling, fresh)
+                    .expect("builder inserts before a live parented sibling");
+            }
+        }
+    }
+
+    fn add_attrs_if_missing(&self, target: &Self::Handle, attrs: Vec<markup5ever::Attribute>) {
+        let converted: Vec<DomAttribute> = attrs
+            .into_iter()
+            .map(|attr| DomAttribute {
+                name: attr.name,
+                value: attr.value.to_string(),
+            })
+            .collect();
+        self.dom
+            .borrow_mut()
+            .add_attrs_if_missing(*target, converted)
+            .expect("builder adds attributes to a live element");
+    }
+
+    fn remove_from_parent(&self, target: &Self::Handle) {
+        self.dom
+            .borrow_mut()
+            .detach(*target)
+            .expect("builder detaches non-root elements only");
+    }
+
+    fn reparent_children(&self, node: &Self::Handle, new_parent: &Self::Handle) {
+        self.dom
+            .borrow_mut()
+            .reparent_children(*node, *new_parent)
+            .expect("builder reparents between live, cycle-free nodes");
+    }
+}
