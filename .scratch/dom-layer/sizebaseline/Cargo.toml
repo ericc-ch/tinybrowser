@@ -1,0 +1,13 @@
+[package]
+name = "sizebaseline"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+
+[profile.tiny]
+inherits = "release"
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+strip = true
