@@ -1,7 +1,8 @@
 //! Document storage for tinybrowser: a generational-arena DOM tree.
 //!
-//! One dependency, by charter ([ADR 0003](../../docs/adr/0003-parser-adapter-lives-above-dom.md)):
-//! `markup5ever` for interned name types only. This crate is representation
+//! Dependencies by charter ([ADR 0002](../../docs/adr/0002-dom-layer-architecture.md)):
+//! pinned `markup5ever` name types plus the Servo selector stack — never a
+//! parsing dependency. This crate is representation
 //! plus mutation commands; the html5ever adapter lives above it, and nothing
 //! here knows how bytes become nodes.
 //!

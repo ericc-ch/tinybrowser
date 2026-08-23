@@ -10,7 +10,7 @@ _Avoid_: pointer, reference, node ref
 One cell of dom's flat node array; holds at most one node and that slot's generation counter.
 
 **Generation**:
-Counter bumped every time a slot changes contents, so recycled slots cannot impersonate dead nodes.
+Counter bumped when a freed slot is reallocated, so recycled slots cannot impersonate dead nodes.
 _Avoid_: version, epoch
 
 **Stale handle**:

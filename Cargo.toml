@@ -47,7 +47,7 @@ cargo = { level = "deny", priority = -1 }
 cargo_common_metadata = { level = "allow", priority = 1 }
 # The servo selector stack (cssparser + selectors: phf 0.11, syn 2) and the
 # html5ever name stack (web_atoms via markup5ever =0.39.0: phf 0.13) are each
-# pinned by recorded decisions (docs/adr/0003, docs/size-budget.md). Their
+# pinned by recorded decisions (docs/adr/0002, docs/size-budget.md). Their
 # transitive overlap cannot be deduped without breaking a pin; measured, not
 # guessed, at every size checkpoint.
 multiple_crate_versions = { level = "allow", priority = 1 }
