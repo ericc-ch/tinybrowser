@@ -395,6 +395,45 @@ fn matches_rejects_non_element_nodes() {
 }
 
 #[test]
+fn nth_child_of_indexes_the_matching_subset() {
+    let mut d = Dom::new();
+    let doc = d.document();
+    let ul = d.create_element(qn("ul"), Vec::new());
+    d.append(doc, ul).unwrap();
+
+    // ul > li.a, li.b, p.x, li.x, li.a  (positions 1-5)
+    let a1 = d.create_element(qn("li"), vec![attr("class", "a")]);
+    let b2 = d.create_element(qn("li"), vec![attr("class", "b")]);
+    let px = d.create_element(qn("p"), vec![attr("class", "x")]);
+    let lx = d.create_element(qn("li"), vec![attr("class", "x")]);
+    let a5 = d.create_element(qn("li"), vec![attr("class", "a")]);
+    for id in [a1, b2, px, lx, a5] {
+        d.append(ul, id).unwrap();
+    }
+
+    // `of S` renumbers within the matching subset: the two `.x` elements sit
+    // at overall positions 3 and 4, so the *second* one is li.x, not b2.
+    assert_eq!(
+        d.select_first(ul, ":nth-child(2 of .x)", QuirksMode::NoQuirks).unwrap(),
+        Some(lx)
+    );
+    assert_eq!(
+        d.select_first(ul, "li:nth-child(1 of li.a)", QuirksMode::NoQuirks).unwrap(),
+        Some(a1)
+    );
+    assert_eq!(
+        d.select_first(ul, "li:nth-child(2 of li.a)", QuirksMode::NoQuirks).unwrap(),
+        Some(a5)
+    );
+
+    // plain nth-child still counts every element sibling
+    assert_eq!(
+        d.select_first(ul, ":nth-child(3)", QuirksMode::NoQuirks).unwrap(),
+        Some(px)
+    );
+}
+
+#[test]
 fn link_pseudo_class_matches_html_links_under_either_spelling() {
     let mut d = Dom::new();
     let doc = d.document();
