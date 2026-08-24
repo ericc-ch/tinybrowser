@@ -67,40 +67,56 @@ impl Sink {
         }
     }
 
-    fn append_text(&self, parent: Handle, text: &str) {
-        // Spec rule: adjacent character data merges into one text node. Dom
-        // deliberately never merges on its own, so the adapter looks at the
-        // last child first.
-        let last = self
-            .dom
-            .borrow()
-            .children(parent)
-            .and_then(|mut kids| kids.next_back().copied());
-        if let Some(last) = last
-            && matches!(
-                self.dom.borrow().get(last).map(|n| n.kind()),
-                Some(NodeKind::Text { .. })
-            )
-        {
-            let mut merged = match self.dom.borrow().get(last).map(|n| n.kind()) {
-                Some(NodeKind::Text { data }) => data.clone(),
-                _ => unreachable!("checked Text two lines above"),
+    /// Places character data under `parent`, coalescing with the neighbor
+    /// when that is text: the spec's adjacent-character rule has exactly one
+    /// home here. The append path (`before == None`) checks the last child;
+    /// the insert path checks `before`'s previous sibling.
+    fn insert_text(&self, parent: Handle, before: Option<Handle>, text: &str) {
+        let merged = self.neighbor_before(parent, before).and_then(|handle| {
+            match self.dom.borrow().get(handle).map(|node| node.kind()) {
+                Some(NodeKind::Text { data }) => {
+                    let mut merged = data.clone();
+                    merged.push_str(text);
+                    Some((handle, merged))
+                }
+                _ => None,
+            }
+        });
+        let Some((handle, merged)) = merged else {
+            let fresh = self.dom.borrow_mut().create_text(text);
+            let placed = match before {
+                None => self.dom.borrow_mut().append(parent, fresh),
+                Some(sibling) => self.dom.borrow_mut().insert_before(sibling, fresh),
             };
-            merged.push_str(text);
-            self.dom
-                .borrow_mut()
-                .set_text(last, merged)
-                .expect("live text node stays live within one sink call");
+            placed.expect("builder places text beside a live parented anchor");
             return;
-        }
-        let fresh = self.dom.borrow_mut().create_text(text);
+        };
         self.dom
             .borrow_mut()
-            .append(parent, fresh)
-            .expect("builder appends into a parent that can take children");
+            .set_text(handle, merged)
+            .expect("live text node stays live within one sink call");
+    }
+
+    /// The node positioned to absorb new character data: `before`'s previous
+    /// sibling, or the current last child on the append path.
+    fn neighbor_before(&self, parent: Handle, before: Option<Handle>) -> Option<Handle> {
+        let dom = self.dom.borrow();
+        let position = match before {
+            None => {
+                return dom
+                    .children(parent)
+                    .and_then(|mut kids| kids.next_back().copied());
+            }
+            Some(sibling) => dom
+                .children(parent)
+                .and_then(|mut kids| kids.position(|&kid| kid == sibling))
+                .expect("parented sibling sits inside its parent's child list"),
+        };
+        dom.children(parent)
+            .and_then(|mut kids| kids.nth(position.checked_sub(1)?))
+            .copied()
     }
 }
-
 /// Owned element-name view satisfying the sink's GAT. `Ref::deref` loans are
 /// statement-scoped, so instead of smuggling a guard out we clone the two
 /// interned atoms (each one machine word) per query.
@@ -196,7 +212,7 @@ impl TreeSink for Sink {
                     .append(*parent, node)
                     .expect("builder appends a parentless live node");
             }
-            NodeOrText::AppendText(ref text) => self.append_text(*parent, text),
+            NodeOrText::AppendText(ref text) => self.insert_text(*parent, None, text),
         }
     }
 
@@ -263,42 +279,7 @@ impl TreeSink for Sink {
                     .borrow()
                     .parent(*sibling)
                     .expect("sibling has a parent per builder promise");
-                let position = self
-                    .dom
-                    .borrow()
-                    .children(parent)
-                    .and_then(|mut kids| kids.position(|&kid| kid == *sibling))
-                    .expect("parented sibling sits in its parent's list");
-                let prev = (position > 0).then(|| {
-                    self.dom
-                        .borrow()
-                        .children(parent)
-                        .and_then(|mut kids| kids.nth(position - 1))
-                        .copied()
-                        .expect("position-1 exists")
-                });
-                if let Some(prev) = prev
-                    && matches!(
-                        self.dom.borrow().get(prev).map(|n| n.kind()),
-                        Some(NodeKind::Text { .. })
-                    )
-                {
-                    let mut merged = match self.dom.borrow().get(prev).map(|n| n.kind()) {
-                        Some(NodeKind::Text { data }) => data.clone(),
-                        _ => unreachable!("checked Text three lines above"),
-                    };
-                    merged.push_str(text);
-                    self.dom
-                        .borrow_mut()
-                        .set_text(prev, merged)
-                        .expect("live text node stays live within one sink call");
-                    return;
-                }
-                let fresh = self.dom.borrow_mut().create_text(text.clone());
-                self.dom
-                    .borrow_mut()
-                    .insert_before(*sibling, fresh)
-                    .expect("builder inserts before a live parented sibling");
+                self.insert_text(parent, Some(*sibling), text);
             }
         }
     }
