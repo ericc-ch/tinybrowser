@@ -395,6 +395,61 @@ fn matches_rejects_non_element_nodes() {
 }
 
 #[test]
+fn link_pseudo_class_matches_html_links_under_either_spelling() {
+    let mut d = Dom::new();
+    let doc = d.document();
+
+    let anchor = d.create_element(qn("a"), vec![attr("href", "https://example.net")]);
+    let bare_anchor = d.create_element(qn("a"), Vec::new());
+    let shouty = d.create_element(
+        QualName::new(None, html_namespace(), LocalName::from("AREA")),
+        vec![attr("href", "#top")],
+    );
+    let link_el = d.create_element(qn("link"), vec![attr("href", "/style.css")]);
+    // href on a non-link element does not make it :link
+    let div_href = d.create_element(qn("div"), vec![attr("href", "/not-a-link")]);
+    for id in [anchor, bare_anchor, shouty, link_el, div_href] {
+        d.append(doc, id).unwrap();
+    }
+
+    let hits = d.select_all(doc, ":link", QuirksMode::NoQuirks).unwrap();
+    assert_eq!(hits, vec![anchor, shouty, link_el]);
+
+    // CSS keywords are case-insensitive
+    assert_eq!(
+        d.select_all(doc, ":LINK", QuirksMode::NoQuirks).unwrap(),
+        hits,
+        "keyword spelling changed the result"
+    );
+}
+
+#[test]
+fn user_state_pseudo_classes_parse_but_never_match() {
+    let page = build();
+
+    for selector in [":hover", ":active", ":focus", ":visited"] {
+        assert_eq!(
+            page.d.select_all(page.d.document(), selector, QuirksMode::NoQuirks).unwrap(),
+            Vec::new(),
+            "{selector} matched a static headless tree"
+        );
+    }
+    assert!(
+        !page.d.matches(page.span, "a:hover", QuirksMode::NoQuirks).unwrap(),
+        "compound with a state pseudo must not leak through"
+    );
+}
+
+#[test]
+fn unknown_state_pseudo_classes_still_refuse() {
+    let page = build();
+    assert!(matches!(
+        page.d.select_all(page.d.document(), ":frobnicate", QuirksMode::NoQuirks),
+        Err(SelectError::Syntax(_))
+    ));
+}
+
+#[test]
 fn quirks_mode_flips_class_and_id_case_rules() {
     let page = build();
 
@@ -414,7 +469,7 @@ fn quirks_mode_flips_class_and_id_case_rules() {
 #[test]
 fn bad_selectors_are_syntax_errors_with_readable_messages() {
     let page = build();
-    for selector in ["", "  ", "div >", "..x", "p::before", ":hover"] {
+    for selector in ["", "  ", "div >", "..x", "p::before", ":frobnicate"] {
         let error = page
             .d
             .select_all(page.d.document(), selector, QuirksMode::NoQuirks)

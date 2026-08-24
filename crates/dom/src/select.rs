@@ -5,6 +5,12 @@
 //! `querySelectorAll` semantics, minus pseudo-elements (they never create
 //! nodes, so a query naming one is a syntax error, as in browsers).
 //!
+//! State pseudo-classes parse like browsers' and evaluate against what a
+//! static headless tree can truthfully know: `:link` matches HTML link
+//! elements carrying an `href`; `:hover`, `:active`, `:focus`, and
+//! `:visited` match nothing (no input devices, no browsing history); any
+//! other pseudo-class is refused, also as in browsers.
+//!
 //! Selector *names* are newtypes over the same interned atoms elements carry
 //! ([`crate::QualName`]), so a compiled selector compares names without ever
 //! materializing strings.
@@ -178,26 +184,68 @@ impl PrecomputedHash for AttrValue {
     }
 }
 
-/// Never constructed: pseudo-classes (`:hover`) have no state to match in a
-/// headless tree, and the parser rejects them before one could exist.
-#[derive(Clone, Debug, Eq, PartialEq)]
-enum PseudoClass {}
+/// State pseudo-classes: parsed like browsers, matched against what a
+/// static headless tree can truthfully know.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PseudoClass {
+    /// `:link` — an HTML link element (`a`/`area`/`link`) with an `href`.
+    Link,
+    /// `:visited` — never matches; browsing history does not exist here.
+    Visited,
+    /// `:hover` — never matches; there is no pointer.
+    Hover,
+    /// `:active` — never matches; nothing is being clicked.
+    Active,
+    /// `:focus` — never matches until a focus owner can exist (js layer).
+    Focus,
+}
+
+impl PseudoClass {
+    /// Parses one pseudo-class keyword (CSS keywords are case-insensitive).
+    fn from_keyword(name: &str) -> Option<Self> {
+        let candidate = |expected: &str| name.eq_ignore_ascii_case(expected);
+        if candidate("link") {
+            Some(Self::Link)
+        } else if candidate("visited") {
+            Some(Self::Visited)
+        } else if candidate("hover") {
+            Some(Self::Hover)
+        } else if candidate("active") {
+            Some(Self::Active)
+        } else if candidate("focus") {
+            Some(Self::Focus)
+        } else {
+            None
+        }
+    }
+
+    /// The canonical lowercase keyword, for CSS serialization.
+    fn keyword(self) -> &'static str {
+        match self {
+            Self::Link => "link",
+            Self::Visited => "visited",
+            Self::Hover => "hover",
+            Self::Active => "active",
+            Self::Focus => "focus",
+        }
+    }
+}
 
 impl NonTSPseudoClassTrait for PseudoClass {
     type Impl = Selectors;
 
     fn is_active_or_hover(&self) -> bool {
-        match *self {}
+        matches!(self, Self::Hover | Self::Active)
     }
 
     fn is_user_action_state(&self) -> bool {
-        match *self {}
+        matches!(self, Self::Hover | Self::Active | Self::Focus)
     }
 }
 
 impl ToCss for PseudoClass {
-    fn to_css<W: fmt::Write>(&self, _dest: &mut W) -> fmt::Result {
-        match *self {}
+    fn to_css<W: fmt::Write>(&self, dest: &mut W) -> fmt::Result {
+        write!(dest, ":{}", self.keyword())
     }
 }
 
@@ -254,6 +302,21 @@ impl<'i> SelectorParser<'i> for SelectorLanguage {
 
     fn parse_has(&self) -> bool {
         true
+    }
+
+    /// State pseudo-classes with statically knowable truth; anything else is
+    /// refused exactly as browsers refuse unknown pseudo-classes.
+    fn parse_non_ts_pseudo_class(
+        &self,
+        location: cssparser::SourceLocation,
+        name: cssparser::CowRcStr<'i>,
+    ) -> Result<PseudoClass, cssparser::ParseError<'i, Self::Error>> {
+        match PseudoClass::from_keyword(&name) {
+            Some(class) => Ok(class),
+            None => Err(location.new_custom_error(
+                SelectorParseErrorKind::UnsupportedPseudoClassOrElement(name),
+            )),
+        }
     }
 }
 
@@ -536,7 +599,14 @@ impl Element for DomElement<'_> {
         pc: &PseudoClass,
         _context: &mut MatchingContext<Selectors>,
     ) -> bool {
-        match *pc {}
+        match pc {
+            PseudoClass::Link => self.is_link(),
+            // No pointer, no keyboard focus owner, no browsing history: the
+            // user-action states are truthful vacuous misses — exactly what
+            // a fresh static page answers in a real browser.
+            PseudoClass::Hover | PseudoClass::Active | PseudoClass::Focus
+            | PseudoClass::Visited => false,
+        }
     }
 
     fn match_pseudo_element(
@@ -551,11 +621,15 @@ impl Element for DomElement<'_> {
         // No invalidation machinery exists here: queries are one-shot reads.
     }
 
+    /// `:link` — an HTML link element carrying an `href`.
+    ///
+    /// Local names compare under this element's case regime (ASCII-
+    /// insensitive for HTML-in-HTML), like every other name check here;
+    /// hand-built `<A HREF="…">` counts exactly like tokenized output.
     fn is_link(&self) -> bool {
-        let named = self
-            .qual_name()
-            .is_some_and(|name| matches!(&*name.local, "a" | "area" | "link"));
-        self.is_html_in_html_document() && named && self.attr_value("href").is_some()
+        self.is_html_in_html_document()
+            && ["a", "area", "link"].iter().any(|name| self.has_local_name(name))
+            && self.attr_value("href").is_some()
     }
 
     fn is_html_slot_element(&self) -> bool {
