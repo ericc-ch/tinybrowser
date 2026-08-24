@@ -11,3 +11,9 @@ Answer:
 **Unit tests** for everything the suite doesn't see: arena mechanics (stale `NodeId` → clean miss, generation ticks on slot reuse), inline→heap children spill behavior and never-spill-back, bulk moves (`reparent_children`), selector matching against known trees.
 
 Not adopted now: full web-platform-tests corpus (needs harness machinery that belongs to later layers).
+
+---
+
+*Amended 2026-08-23, at adapter close:* the suite runs against
+`browser::parse_html` (ADR 0003). The unit and public-API halves are landed
+(52 green across the workspace); html5lib vendoring is the remaining work.

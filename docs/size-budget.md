@@ -2,7 +2,11 @@
 
 Goal: **sub-5MB stripped x86_64 binary** (AGENTS.md Vision). Measured 2026-08-21 and 2026-08-23, rustc 1.98.0, Linux.
 
-Reproduce each dependency row with a probe binary that really exercises it (tokenize, dial, JS eval, parse+query) — the dom-v1 probe lives at `.scratch/dom-layer/sizeprobe/` (with its empty-main baseline in `../sizebaseline/`; the page fed to it is fetched, not committed). Marginal = binary delta vs an empty-`main` build of the same profile.
+Reproduce each dependency row with a probe binary that really exercises it
+(tokenize, dial, JS eval, parse+query). Marginal = binary delta vs an
+empty-`main` build of the same profile. Probes are throwaway; each
+checkpoint records its marginal here. Future parse+query checkpoints drive
+the real adapter (`browser::parse_html`).
 
 ## Measured marginal costs
 
@@ -19,17 +23,17 @@ Reproduce each dependency row with a probe binary that really exercises it (toke
 
 ## Milestone: dom v1 measured (2026-08-23)
 
-Probe parses a real Wikipedia page (405 KB HTML → 4,051 live elements) through
-a throwaway TreeSink over our arena, then runs selector queries of every common
-shape (`a[href]`, descendant lists, id/class, attribute ops, `:nth-child`, comma
-lists) and prints the hit counts.
+A real Wikipedia page (405 KB HTML → 4,051 live elements) went through the
+dom stack, then selector queries of every common shape (`a[href]`,
+descendant lists, id/class, attribute ops, `:nth-child`, comma lists) ran
+against the result.
 
 | Component                                            | default `release` | tuned¹  |
 | ---------------------------------------------------- | ----------------- | ------- |
 | baseline (empty main, re-measured)                   | 448 KB            | 287 KB  |
-| **dom v1**: arena + selectors + cssparser + html5ever + markup5ever, via throwaway TreeSink | +1272 KB | **+932 KB** |
+| **dom v1**: arena + selectors + cssparser + html5ever + markup5ever | +1272 KB | **+932 KB** |
 
-Against the pre-measurement estimate for the same stack (+941 KB +115 KB = +1056 KB release / +840 KB +75 KB = +915 KB tuned): tuned landed within ~2% (+17 KB); release ran +216 KB over — the probe also carries dom's own storage/search code plus query execution the estimates never included. Accepted: no regression to justify.
+Against the pre-measurement estimate for the same stack (+941 KB +115 KB = +1056 KB release / +840 KB +75 KB = +915 KB tuned): tuned landed within ~2% (+17 KB); release ran +216 KB over — the delta carries dom's own storage/search code plus query execution, which the estimates omitted. Accepted: no regression to justify.
 
 ## Stack totals (tuned profile)
 

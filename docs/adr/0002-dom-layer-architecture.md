@@ -72,6 +72,10 @@ before they were allowed to stand.
 - The `html5ever::TreeSink` implementation lives above: in `browser`, or a
   thin glue crate if `browser` should stay lean (~200 lines expected).
 
+*Resolved 2026-08-23:* hosted in `browser` as `parse_html`;
+[ADR 0003](0003-treesink-adapter-in-browser.md) records the placement and
+the boundary mechanics.
+
 ### Name types: pinned markup5ever re-export
 
 - `dom` depends on exactly `markup5ever = "=0.39.0"` — name types only
@@ -86,7 +90,8 @@ before they were allowed to stand.
 *Amended 2026-08-23 (selector dependencies):* the "exactly one dependency"
 consequence was written while selectors were still deferred. When selector
 matching shipped as part of dom v1 — always placed *inside* `dom` by ADR
-0001's charter row and the dom-layer spec — the manifest grew by the Servo
+0001's charter row and the dom-layer milestone record (`map.md`) — the
+manifest grew by the Servo
 selector stack (`selectors`, its exact-version partner `cssparser`, plus
 `precomputed-hash` for the trait dom's name wrappers must implement).
 The parser-placement decision above is untouched: no parsing dependency

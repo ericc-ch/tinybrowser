@@ -47,6 +47,13 @@ main → browser → {dom, net, js}
 | `browser` | dom, net, js | PageActor, navigation lifecycle; THE fan-in point |
 | root `tinybrowser` | all four | embedder lib target + `serve`/`fetch` bins |
 
+*Amended 2026-08-23 (`dom` and `browser` rows):* [ADR 0002](0002-dom-layer-architecture.md)
+moved parsing out of the `dom` row — that crate is representation plus
+selectors, Send-never-Sync, with name types from pinned markup5ever and no
+parser dependency — and the TreeSink adapter landed in the `browser` row as
+`browser::parse_html` ([ADR 0003](0003-treesink-adapter-in-browser.md)).
+The edges themselves are unchanged.
+
 Rules:
 
 1. Dependencies go downward only; `browser` is the single fan-in point.
