@@ -12,7 +12,7 @@
 
 use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use dom::{Attribute as DomAttribute, Dom, NodeId as Handle, NodeKind, QualName};
 use html5ever::tree_builder::{ElementFlags, NodeOrText, QuirksMode, TreeSink};
@@ -28,16 +28,38 @@ pub struct Parsed {
     pub quirks_mode: QuirksMode,
     /// How many spec parse errors the tokenizer/tree builder reported.
     pub parse_errors: u32,
+    /// `<template>` element → its contents fragment. Contents live *outside*
+    /// the child list per spec ([ADR 0003](../../docs/adr/0003-treesink-adapter-in-browser.md)),
+    /// so this map is the only way to reach them — exactly like the
+    /// `template.content` DOM property.
+    pub template_contents: HashMap<Handle, Handle>,
 }
 
-/// Parses a full HTML document into a fresh [`Dom`].
+/// Parses a full HTML document into a fresh [`Dom`] with the scripting flag
+/// enabled (the browser default).
 ///
 /// Broken markup is recovered exactly the way the HTML spec — and therefore
 /// every browser — mandates; that recovery is html5ever's job, not ours.
 #[must_use]
 pub fn parse_html(input: &str) -> Parsed {
+    parse_html_with_scripting(input, true)
+}
+
+/// Parses a full HTML document with the tree builder's
+/// [scripting flag](https://html.spec.whatwg.org/multipage/parsing.html#scripting-flag)
+/// set explicitly. The flag changes how `<noscript>` contents are parsed and
+/// feeds form-control behavior; conformance suites run both settings.
+#[must_use]
+pub fn parse_html_with_scripting(input: &str, scripting_enabled: bool) -> Parsed {
+    let opts = html5ever::ParseOpts {
+        tree_builder: html5ever::tree_builder::TreeBuilderOpts {
+            scripting_enabled,
+            ..html5ever::tree_builder::TreeBuilderOpts::default()
+        },
+        ..html5ever::ParseOpts::default()
+    };
     let sink = Sink::new();
-    html5ever::parse_document(sink, html5ever::ParseOpts::default()).one(input)
+    html5ever::parse_document(sink, opts).one(input)
 }
 
 // ── the sink ────────────────────────────────────────────────────────────────
@@ -55,6 +77,14 @@ struct Sink {
     /// `<template>` element → its contents fragment. Contents live *outside*
     /// the child list per spec, so a side map keeps them out of `children()`.
     template_contents: RefCell<HashMap<Handle, Handle>>,
+    /// Elements the tree builder flagged as
+    /// [HTML integration points](https://html.spec.whatwg.org/multipage/parsing.html#html-integration-point)
+    /// — `MathML` `annotation-xml` whose `encoding` makes HTML content parse
+    /// inside it. The builder asks back through
+    /// [`TreeSink::is_mathml_annotation_xml_integration_point`] while deciding
+    /// whether foreign-content tokens break out; the default answer (`false`)
+    /// mis-nests every child of such elements.
+    integration_points: RefCell<HashSet<Handle>>,
 }
 
 impl Sink {
@@ -64,6 +94,7 @@ impl Sink {
             quirks_mode: Cell::new(QuirksMode::NoQuirks),
             parse_errors: Cell::new(0),
             template_contents: RefCell::new(HashMap::new()),
+            integration_points: RefCell::new(HashSet::new()),
         }
     }
 
@@ -149,6 +180,7 @@ impl TreeSink for Sink {
             dom: self.dom.into_inner(),
             quirks_mode: self.quirks_mode.get(),
             parse_errors: self.parse_errors.get(),
+            template_contents: self.template_contents.into_inner(),
         }
     }
 
@@ -189,6 +221,9 @@ impl TreeSink for Sink {
             self.template_contents
                 .borrow_mut()
                 .insert(element, contents);
+        }
+        if flags.mathml_annotation_xml_integration_point {
+            self.integration_points.borrow_mut().insert(element);
         }
         element
     }
@@ -253,6 +288,15 @@ impl TreeSink for Sink {
             .borrow()
             .get(target)
             .unwrap_or_else(|| panic!("template contents requested for a non-template"))
+    }
+
+    /// Answers the builder's integration-point question from the flag it
+    /// handed us at [`Sink::create_element`] time — per the
+    /// [HTML integration point](https://html.spec.whatwg.org/multipage/parsing.html#html-integration-point)
+    /// definition, an `annotation-xml` with `encoding="text/html"` (ASCII
+    /// case-insensitive) or `"application/xhtml+xml"`.
+    fn is_mathml_annotation_xml_integration_point(&self, target: &Self::Handle) -> bool {
+        self.integration_points.borrow().contains(target)
     }
 
     fn same_node(&self, x: &Self::Handle, y: &Self::Handle) -> bool {
