@@ -177,6 +177,9 @@ impl ToCss for AttrValue {
 }
 
 impl PrecomputedHash for AttrValue {
+    // DJB2 (Daniel J. Bernstein): seed 5381, wrap-multiply by 33, add byte —
+    // the same constant recipe markup5ever's atoms use, so both sides of a
+    // comparison hash alike.
     fn precomputed_hash(&self) -> u32 {
         self.0.bytes().fold(5381_u32, |hash, byte| {
             hash.wrapping_mul(33).wrapping_add(u32::from(byte))

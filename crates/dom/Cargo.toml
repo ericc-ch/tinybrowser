@@ -9,5 +9,5 @@ workspace = true
 [dependencies]
 markup5ever = "=0.39.0"
 selectors = "0.26"
-cssparser = "0.34"
+cssparser = "=0.34.0"
 precomputed-hash = "0.1"
