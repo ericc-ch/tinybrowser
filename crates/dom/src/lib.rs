@@ -20,7 +20,6 @@
 //! ```
 
 mod arena;
-mod children;
 mod id;
 mod node;
 mod select;

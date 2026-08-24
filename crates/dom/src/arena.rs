@@ -4,7 +4,6 @@ use std::cell::Cell;
 use std::fmt;
 use std::marker::PhantomData;
 
-use crate::children::Children;
 use crate::id::NodeId;
 use crate::node::{Attribute, Node, NodeKind, QualName};
 
@@ -98,7 +97,7 @@ impl Dom {
     pub fn new() -> Self {
         let root = Node {
             parent: None,
-            children: Children::new(),
+            children: Vec::new(),
             kind: NodeKind::Document,
         };
         Self {
@@ -168,8 +167,7 @@ impl Dom {
     /// # Panics
     ///
     /// Only if the arena exceeds `u32::MAX` slots — terabytes of RAM, not a
-    /// reachable runtime condition; the bound guards the internal sentinel
-    /// scheme (see `Children`).
+    /// reachable runtime condition; the bound guards the handle width.
     pub fn create_element(&mut self, name: QualName, attributes: Vec<Attribute>) -> NodeId {
         self.alloc(NodeKind::Element { name, attributes })
     }
@@ -297,7 +295,8 @@ impl Dom {
             .children_mut(parent)
             .expect("verified-live parent has no child list");
         let position = list
-            .position_of(sibling)
+            .iter()
+            .position(|&entry| entry == sibling)
             .expect("live sibling missing from its own parent's list");
         list.insert(position, node);
         if let Some(attached) = self.node_mut(node) {
@@ -361,7 +360,7 @@ impl Dom {
         // is broken. Panicking beats reporting a lying "stale node".
         let moved = self
             .children_mut(from)
-            .map(Children::take_all)
+            .map(std::mem::take)
             .expect("verified-live `from` has no child list");
         let list = self
             .children_mut(to)
@@ -484,7 +483,7 @@ impl Dom {
             .and_then(|slot| slot.node.as_mut())
     }
 
-    fn children_mut(&mut self, id: NodeId) -> Option<&mut Children> {
+    fn children_mut(&mut self, id: NodeId) -> Option<&mut Vec<NodeId>> {
         self.node_mut(id).map(|node| &mut node.children)
     }
 
@@ -520,9 +519,9 @@ impl Dom {
     fn unlink_from_current_parent(&mut self, id: NodeId) {
         if let Some(old_parent) = self.parent(id)
             && let Some(list) = self.children_mut(old_parent)
-            && let Some(position) = list.position_of(id)
+            && let Some(position) = list.iter().position(|&entry| entry == id)
         {
-            list.remove_at(position);
+            list.remove(position);
         }
     }
 
@@ -546,14 +545,13 @@ impl Dom {
     ///
     /// # Panics
     ///
-    /// Only when the arena would need slot index `u32::MAX` or beyond —
-    /// hundreds of GB of RAM, not a reachable runtime condition. Slot
-    /// `u32::MAX` itself is refused because it is `Children`'s empty-cell
-    /// sentinel; see that type for the full soundness argument.
+    /// Only when the arena would need more than `u32::MAX` slots — hundreds
+    /// of GB of RAM, not a reachable runtime condition; the bound guards the
+    /// handle width (`NodeId.slot` is a `u32`).
     fn alloc(&mut self, kind: NodeKind) -> NodeId {
         let node = Node {
             parent: None,
-            children: Children::new(),
+            children: Vec::new(),
             kind,
         };
         if let Some(slot) = self.free.pop() {
@@ -567,18 +565,13 @@ impl Dom {
             };
             return NodeId::new(slot, generation);
         }
-        // Slot u32::MAX is refused outright: it is the empty-cell sentinel in
-        // `Children`, and issuing it would make that sentinel aliasable. The
-        // bound therefore sits one below the type's ceiling; reaching it
-        // requires >4 billion live nodes (hundreds of GB of arena alone), so
-        // exhausting it is an impossible runtime condition rather than an
-        // error to handle. Generations wrap after 2^32 recycles of one slot;
-        // that residual ABA window is accepted by design — exploiting it
-        // needs billions of death/reuse cycles on a single slot while some
-        // outside handle to that slot still exists.
+        // The bound is the `u32` handle width itself; exhausting it requires
+        // >4 billion slots (hundreds of GB of arena), an impossible runtime
+        // condition rather than an error to handle. Generations wrap after
+        // 2^32 recycles of one slot; that residual ABA window is accepted by
+        // design — exploiting it needs billions of death/reuse cycles on a
+        // single slot while some outside handle to that slot still exists.
         let slot = u32::try_from(self.slots.len())
-            .ok()
-            .filter(|slot| *slot != u32::MAX)
             .expect("arena exhausted: >u32::MAX slots requires hundreds of GB of RAM");
         self.slots.push(Slot {
             generation: 0,

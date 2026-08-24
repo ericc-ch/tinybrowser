@@ -471,6 +471,30 @@ fn wide_children_lists_behave_like_any_list() {
 }
 
 #[test]
+fn insert_into_wide_list_lands_exactly() {
+    let mut d = Dom::new();
+    let doc = d.document();
+    let wide = d.create_element(qn("wide"), Vec::new());
+    d.append(doc, wide).unwrap();
+
+    // deep into heap-backed territory: inserts at every edge of a long list
+    let kids: Vec<_> = (0..10).map(|_| d.create_element(qn("span"), Vec::new())).collect();
+    for &k in &kids {
+        d.append(wide, k).unwrap();
+    }
+
+    let head = d.create_element(qn("h"), Vec::new());
+    d.insert_before(kids[0], head).unwrap();
+    let middle = d.create_element(qn("m"), Vec::new());
+    d.insert_before(kids[5], middle).unwrap();
+    let tail = d.create_element(qn("t"), Vec::new());
+    d.append(wide, tail).unwrap();
+
+    let expected: Vec<_> = [vec![head], kids[..5].to_vec(), vec![middle], kids[5..].to_vec(), vec![tail]].concat();
+    assert_eq!(d.children(wide).unwrap().copied().collect::<Vec<_>>(), expected);
+}
+
+#[test]
 fn fragments_are_detached_containers() {
     let mut d = Dom::new();
     let f = d.create_fragment();

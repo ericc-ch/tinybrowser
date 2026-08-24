@@ -6,7 +6,6 @@
 //! names straight through with no conversion, and element names are interned
 //! rather than copied per node.
 
-use crate::children::Children;
 use crate::id::NodeId;
 
 pub use markup5ever::{LocalName, Namespace, Prefix, QualName};
@@ -65,6 +64,6 @@ pub enum NodeKind {
 #[derive(Debug)]
 pub(crate) struct Node {
     pub(crate) parent: Option<NodeId>,
-    pub(crate) children: Children,
+    pub(crate) children: Vec<NodeId>,
     pub(crate) kind: NodeKind,
 }

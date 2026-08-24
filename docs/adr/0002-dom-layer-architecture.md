@@ -53,6 +53,19 @@ before they were allowed to stand.
   would be safe-by-invariant today, but a future invariant break would fail
   silently; generations turn that failure class into a loud miss.
 
+*Reversed 2026-08-24 (single children representation):* the inline/heap split
+shipped one real out-of-bounds panic before it ever shipped a measured win —
+`insert` into a full inline array overran its own storage, reachable from
+ordinary parser output such as foster-parented table text (audit:
+[.scratch/dom-layer/findings-code-review-2026-08-24.md](../../.scratch/dom-layer/findings-code-review-2026-08-24.md)).
+The arithmetic never favored the enum either: the inline variant costs 40
+in-record bytes versus 24 for a bare `Vec<NodeId>`, so "compaction" made every
+record fatter. Children are now a plain `Vec<NodeId>`; with them go the
+spill-once/thrash machinery, the `u32::MAX` empty-cell sentinel, and the
+`Spill` glossary term. Allocator traffic for small lists rises; binary-size
+impact is expected ≈0 (no dependency change) — verify at the next milestone
+probe.
+
 ### Threading: Send, never Sync
 
 - `Dom` is handed between workers (future CDP answer path) and never shared.

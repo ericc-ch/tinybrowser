@@ -8,6 +8,7 @@ layers (`net`, `js`) get their own wayfinding sessions from here.
 
 Notes:
 
+- **Open defects from the 2026-08-24 audit**: [findings-code-review-2026-08-24.md](./findings-code-review-2026-08-24.md) — one confirmed panic (`Children::insert` at full inline capacity, reachable from `parse_html`), plus policy and API findings. Fix before the html5lib suite work: the suite will hit C1 constantly.
 - Repo rules in AGENTS.md: no `unsafe`, no lint silencing, breaking changes fine when design is wrong, sub-5MB binary measured at milestones.
 - Stack decided (docs/size-budget.md): html5ever 0.39 tree builder plus the Servo selector stack, measured together at dom v1 close — +932 KB tuned, ~2.58 MB headroom of 5 MB.
 - WebIDL verification strategy lives in docs/webidl.md; CI-side, independent of dom design.

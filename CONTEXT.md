@@ -17,10 +17,6 @@ _Avoid_: version, epoch
 A NodeId whose node was destroyed; every lookup reports absence instead of returning some other node.
 _Avoid_: dangling reference
 
-**Spill**:
-The one-way move of a node's children list from inline storage (up to four IDs inside the record) to a heap buffer once exceeded.
-_Avoid_: promotion, overflow
-
 **Detach**:
 Unlinking a subtree from its parent while keeping every node alive.
 _Avoid_: remove (ambiguous with destroy)
