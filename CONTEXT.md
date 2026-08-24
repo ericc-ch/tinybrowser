@@ -51,3 +51,7 @@ _Avoid_: append checks, validation scattered per method
 **Element state**:
 A pseudo-class truth (`:disabled`, `:lang(en)`, …) answered by `state.rs` against static markup — fully when markup determines it, otherwise as a documented static subset; states whose context cannot exist in a headless tree (pointer, focus, history) parse but match nothing.
 _Avoid_: pseudo-class handling (that word covers parsing too)
+
+**HTML integration point**:
+A foreign-content element where HTML parsing resumes instead of breaking out: SVG `foreignObject`/`desc`/`title` (unconditional), plus MathML `annotation-xml` when its `encoding` says HTML — that last one is answered by our TreeSink from a flag recorded at element creation (`browser`'s `integration_points`), per [html.spec.whatwg.org §13.2.6.6](https://html.spec.whatwg.org/multipage/parsing.html#html-integration-point).
+_Avoid_: integration element, breakout point

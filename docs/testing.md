@@ -4,17 +4,18 @@ Two tiers, ordered by what they catch: parse correctness against the
 spec-mandated tree, then unit/public-API tests for everything the suite
 cannot see.
 
-## Parse correctness: html5lib tree-construction suite — **open**
+## Parse correctness: html5lib tree-construction suite — **landed 2026-08-25**
 
-Vendor the suite (~5k cases, shipped as data files in html5ever's repo) and
-run every case through `browser::parse_html`
-([ADR 0003](adr/0003-treesink-adapter-in-browser.md)), asserting the
-spec-mandated tree. This is the same bar production engines use and covers
-exactly the misnesting/foster-parenting/adoption-agency traps hand-written
-fixtures miss.
-
-This is the standing open item from the dom-layer milestone; the unit tier
-below is landed around it.
+Vendored as a pinned submodule (`third_party/html5lib-tests`, decisions and
+acceptances in
+[ADR 0005](adr/0005-html5lib-tree-construction-suite.md)); the harness at
+`crates/browser/tests/html5lib.rs` runs every full-document case through the
+public API under both scripting-flag settings and diffs byte-exactly against
+the spec-mandated tree: **3165 cases green**; fragment-context cases (192)
+defer until fragment parsing exists, upstream's `<selectedcontent>` gap is a
+documented divergence. This was the standing open item from the dom-layer
+milestone; it covers exactly the misnesting/foster-parenting/adoption-agency
+traps hand-written fixtures miss.
 
 ## Unit and public-API tests — landed
 
@@ -28,7 +29,7 @@ below is landed around it.
 - Mutation storms auditing bidirectional link invariants at every step.
 - Integration suites go through the public API only — no arena internals.
 
-Verified at audit close: 72 tests green across the workspace, clippy pedantic
+Verified at audit close: 73 tests green across the workspace, clippy pedantic
 `-D warnings` clean, rustfmt clean.
 
 ## Explicitly deferred
