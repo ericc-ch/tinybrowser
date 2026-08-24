@@ -55,6 +55,10 @@ Against the pre-measurement estimate for the same stack (+941 KB +115 KB = +1056
 
 ## Watchlist (what can still blow the budget)
 
+- Children-representation collapse (inline/heap split → plain `Vec<NodeId>`,
+  2026-08-24, per ADR 0002): expected ≈0 binary impact — no dependency change;
+  confirm at the next parse+query probe.
+
 - DOM→JS binding glue: hundreds of rquickjs classes add up; keep dispatch tables data-driven.
 - CDP server: tokio-tungstenite-style async stack is expensive; prefer a lean HTTP+WebSocket impl on `std::net`.
 - A11y walker (accname computation, role mapping): budget ~100–200 KB, fine, but measure.

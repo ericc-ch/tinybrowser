@@ -39,32 +39,17 @@ before they were allowed to stand.
   handles. One site owns the policy; arithmetic wraps (`wrapping_add`), and
   the residual ABA window (billions of recycles of one slot while an outside
   handle persists) is documented as accepted by design.
-- Slot allocation **refuses `u32::MAX` outright**: that value is the empty-cell
-  sentinel inside `Children`'s inline array, and issuing it would make the
-  sentinel aliasable. The refusal is enforced in `alloc`, not merely claimed —
-  review caught the original version issuing the sentinel slot.
-- Each node embeds its children as ordered IDs: up to four inline
-  (`Inline { len: u8, ids: [NodeId; 4] }`), spilling once to
-  `Heap(Vec<NodeId>)` past that, **never back** — bulk drains preserve spilled
-  representation so churny pages cannot thrash. Depth never spills; width only.
+- Slots are addressed by `u32`; allocation past `u32::MAX` slots is a defect
+  (`expect`) — hundreds of GB of RAM away, an impossible runtime condition
+  rather than an error to handle.
+- Each node embeds its children as ordered IDs in a plain `Vec<NodeId>` —
+  one representation, no compaction machinery (the inline/heap experiment is
+  recorded under Rejected alternatives).
 - Parent stored as `Option<NodeId>`; every mutation keeps the parent-pointer
   half and the child-list half in agreement, defect-panicking if they diverge.
 - Links carry full generational handles, not bare slot indices. Bare indices
   would be safe-by-invariant today, but a future invariant break would fail
   silently; generations turn that failure class into a loud miss.
-
-*Reversed 2026-08-24 (single children representation):* the inline/heap split
-shipped one real out-of-bounds panic before it ever shipped a measured win —
-`insert` into a full inline array overran its own storage, reachable from
-ordinary parser output such as foster-parented table text (audit:
-[.scratch/dom-layer/findings-code-review-2026-08-24.md](../../.scratch/dom-layer/findings-code-review-2026-08-24.md)).
-The arithmetic never favored the enum either: the inline variant costs 40
-in-record bytes versus 24 for a bare `Vec<NodeId>`, so "compaction" made every
-record fatter. Children are now a plain `Vec<NodeId>`; with them go the
-spill-once/thrash machinery, the `u32::MAX` empty-cell sentinel, and the
-`Spill` glossary term. Allocator traffic for small lists rises; binary-size
-impact is expected ≈0 (no dependency change) — verify at the next milestone
-probe.
 
 ### Threading: Send, never Sync
 
@@ -103,7 +88,7 @@ the boundary mechanics.
 *Amended 2026-08-23 (selector dependencies):* the "exactly one dependency"
 consequence was written while selectors were still deferred. When selector
 matching shipped as part of dom v1 — always placed *inside* `dom` by ADR
-0001's charter row and the dom-layer milestone record (`map.md`) — the
+0001's charter row — the
 manifest grew by the Servo
 selector stack (`selectors`, its exact-version partner `cssparser`, plus
 `precomputed-hash` for the trait dom's name wrappers must implement).
@@ -119,6 +104,16 @@ not a dependency count; the stack's size cost is measured in
   and near-parity perf at our scale, but adoption-agency/foster-parenting moves
   become multi-node pointer rewiring whose mistakes corrupt silently. Lost on
   bug-risk asymmetry.
+- **Inline/heap children split** *(tried 2026-08-23, reversed 2026-08-24)*:
+  four inline `NodeId`s spilling once to heap compacted small fan-out but cost
+  40 in-record bytes versus 24 for a bare `Vec<NodeId>` — "compaction" made
+  every record fatter — and shipped one real out-of-bounds panic before any
+  measured win: `insert` into a full inline array overran its own storage,
+  reachable from ordinary foster-parented table text. Children reverted to a
+  plain `Vec<NodeId>`; with the split went the spill-once/thrash machinery and
+  the `u32::MAX` empty-cell sentinel. Allocator traffic for small lists rises;
+  binary-size impact expected ≈0 (no dependency change), to be confirmed at
+  the next milestone probe.
 - **`Rc<RefCell>` object graph**: borrow-conflict panics scale with JS
   reentrancy; cycles leak; identity maps poorly onto QuickJS GC.
 - **bumpalo `&'arena` refs**: individual nodes can never be freed on a live
@@ -151,13 +146,14 @@ not a dependency count; the stack's size cost is measured in
 
 ## Consequences
 
-- Records run ~80 bytes versus ~48 for link-based layouts; accepted — no
-  layout pass exists to squeeze them, RAM delta is trivial next to QuickJS
-  heaps, and traversal gets children IDs for free in the same cache lines.
+- Records carry their child lists by value, so they stay larger than
+  link-based layouts; accepted — no layout pass exists to squeeze them, RAM
+  delta is trivial next to QuickJS heaps, and traversal gets children IDs for
+  free in the same cache lines.
 - Single-child splice is O(siblings) memmove of handles — irrelevant at real
   fan-out; bulk moves stay ordered-list operations.
 - Swapping any of this later is contained: everything travels through
-  `NodeId`s, inline width (4) is a constant in one module.
+  `NodeId`s and the whole representation lives in one module.
 - `dom`'s manifest carries the pinned name types plus the Servo selector
   stack; "no parsing dependency" is the enforced boundary, not a dependency
   count. The adapter needs no name conversion; attribute values still convert
