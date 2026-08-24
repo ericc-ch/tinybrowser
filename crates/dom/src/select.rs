@@ -18,8 +18,8 @@ use selectors::{
     Element, OpaqueElement,
     attr::{AttrSelectorOperation, NamespaceConstraint},
     context::{
-        MatchingContext, MatchingForInvalidation, MatchingMode, NeedsSelectorFlags, QuirksMode,
-        SelectorCaches,
+        MatchingContext, MatchingForInvalidation, MatchingMode, NeedsSelectorFlags,
+        QuirksMode as EngineQuirksMode, SelectorCaches,
     },
     matching::matches_selector_list,
     parser::{
@@ -31,6 +31,33 @@ use selectors::{
 use crate::arena::Dom;
 use crate::id::NodeId;
 use crate::node::{Attribute, NodeKind};
+
+/// The document-compatibility mode a query runs under — what html5ever's
+/// tree builder reports and parsed pages carry.
+///
+/// It changes exactly one matching behavior here: in full quirks mode,
+/// class and id selector values compare ASCII-case-insensitively (the
+/// WHATWG id/class quirk). Standards and limited-quirks modes stay exact.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QuirksMode {
+    /// Standards mode: full CSS case rules.
+    NoQuirks,
+    /// Limited quirks: same selector rules as standards mode.
+    LimitedQuirks,
+    /// Full quirks: legacy case-insensitive class/id matching.
+    Quirks,
+}
+
+impl QuirksMode {
+    /// The engine's spelling of this mode.
+    fn engine(self) -> EngineQuirksMode {
+        match self {
+            QuirksMode::NoQuirks => EngineQuirksMode::NoQuirks,
+            QuirksMode::LimitedQuirks => EngineQuirksMode::LimitedQuirks,
+            QuirksMode::Quirks => EngineQuirksMode::Quirks,
+        }
+    }
+}
 
 /// Why a selector search failed.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -651,6 +678,7 @@ impl Dom {
         list: &SelectorList<Selectors>,
         scope: NodeId,
         limit: Option<usize>,
+        quirks_mode: QuirksMode,
     ) -> Vec<NodeId> {
         let mut caches = SelectorCaches::default();
         // One context (and its caches) serves the whole scan; matching is a
@@ -659,7 +687,7 @@ impl Dom {
             MatchingMode::Normal,
             None,
             &mut caches,
-            QuirksMode::NoQuirks,
+            quirks_mode.engine(),
             NeedsSelectorFlags::No,
             MatchingForInvalidation::No,
         );
@@ -687,12 +715,17 @@ impl Dom {
     ///
     /// - [`SelectError::StaleNode`] if `scope` names a destroyed node.
     /// - [`SelectError::Syntax`] if `selectors` does not parse.
-    pub fn select_all(&self, scope: NodeId, selectors: &str) -> Result<Vec<NodeId>, SelectError> {
+    pub fn select_all(
+        &self,
+        scope: NodeId,
+        selectors: &str,
+        quirks_mode: QuirksMode,
+    ) -> Result<Vec<NodeId>, SelectError> {
         let list = Self::compile(selectors)?;
         if !self.contains(scope) {
             return Err(SelectError::StaleNode);
         }
-        Ok(self.find_matches(&list, scope, None))
+        Ok(self.find_matches(&list, scope, None, quirks_mode))
     }
 
     /// The first matching descendant of `scope` in document order —
@@ -705,12 +738,16 @@ impl Dom {
         &self,
         scope: NodeId,
         selectors: &str,
+        quirks_mode: QuirksMode,
     ) -> Result<Option<NodeId>, SelectError> {
         let list = Self::compile(selectors)?;
         if !self.contains(scope) {
             return Err(SelectError::StaleNode);
         }
-        Ok(self.find_matches(&list, scope, Some(1)).into_iter().next())
+        Ok(self
+            .find_matches(&list, scope, Some(1), quirks_mode)
+            .into_iter()
+            .next())
     }
 
     /// Whether one element matches the selector list — `Element.matches`
@@ -722,7 +759,12 @@ impl Dom {
     /// - [`SelectError::StaleNode`] if `element` names a destroyed node.
     /// - [`SelectError::NotAnElement`] if `element` names a non-element node.
     /// - [`SelectError::Syntax`] if `selectors` does not parse.
-    pub fn matches(&self, element: NodeId, selectors: &str) -> Result<bool, SelectError> {
+    pub fn matches(
+        &self,
+        element: NodeId,
+        selectors: &str,
+        quirks_mode: QuirksMode,
+    ) -> Result<bool, SelectError> {
         let list = Self::compile(selectors)?;
         let Some(view) = DomElement::new(self, element) else {
             return Err(if self.contains(element) {
@@ -736,7 +778,7 @@ impl Dom {
             MatchingMode::Normal,
             None,
             &mut caches,
-            QuirksMode::NoQuirks,
+            quirks_mode.engine(),
             NeedsSelectorFlags::No,
             MatchingForInvalidation::No,
         );
