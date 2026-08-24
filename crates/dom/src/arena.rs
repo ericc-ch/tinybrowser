@@ -536,11 +536,22 @@ impl Dom {
         false
     }
 
+    /// Removes `id` from whichever list currently holds it.
+    ///
+    /// Defect policy, like every other structural site in this module: `id`
+    /// was verified live, so a `Some` parent must own a list and that list
+    /// must name `id`. Parent-pointer/child-list divergence is arena
+    /// corruption — panicking beats silently producing a node with two
+    /// parents (or none), which later mutations would compound.
     fn unlink_from_current_parent(&mut self, id: NodeId) {
-        if let Some(old_parent) = self.parent(id)
-            && let Some(list) = self.children_mut(old_parent)
-            && let Some(position) = list.iter().position(|&entry| entry == id)
-        {
+        if let Some(old_parent) = self.parent(id) {
+            let list = self
+                .children_mut(old_parent)
+                .expect("live parent has no child list");
+            let position = list
+                .iter()
+                .position(|&entry| entry == id)
+                .expect("child missing from the very list its parent pointer names");
             list.remove(position);
         }
     }

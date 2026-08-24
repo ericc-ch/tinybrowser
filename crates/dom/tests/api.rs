@@ -3,7 +3,7 @@
 //! These tests go through `Dom`'s methods only — no private internals — so
 //! they double as executable documentation of the boundary contract.
 
-use dom::{Attribute, Dom, DomError, LocalName, Namespace, NodeKind, QualName};
+use dom::{Attribute, Dom, DomError, LocalName, Namespace, NodeId, NodeKind, QualName};
 
 /// The HTML namespace URL; `markup5ever`'s `ns!` macro wraps this same string.
 const HTML_NS: &str = "http://www.w3.org/1999/xhtml";
@@ -492,6 +492,119 @@ fn insert_into_wide_list_lands_exactly() {
 
     let expected: Vec<_> = [vec![head], kids[..5].to_vec(), vec![middle], kids[5..].to_vec(), vec![tail]].concat();
     assert_eq!(d.children(wide).unwrap().copied().collect::<Vec<_>>(), expected);
+}
+
+/// xorshift64* — tiny, deterministic, good enough to scatter op choices.
+fn storm_roll(state: &mut u64, n: u64) -> u64 {
+    *state ^= *state << 13;
+    *state ^= *state >> 7;
+    *state ^= *state << 17;
+    state.wrapping_mul(0x2545_F491_4F6C_DD1D) % n.max(1)
+}
+
+/// One uniformly chosen live handle, or `None` when nothing is left alive.
+fn storm_pick(d: &Dom, tracked: &[NodeId], state: &mut u64) -> Option<NodeId> {
+    let alive: Vec<NodeId> = tracked.iter().copied().filter(|&id| d.contains(id)).collect();
+    let count = u64::try_from(alive.len()).unwrap_or(u64::MAX);
+    let picked = usize::try_from(storm_roll(state, count)).unwrap_or(0);
+    alive.into_iter().nth(picked)
+}
+
+/// Deterministic mutation storm: thousands of random structural ops with a
+/// bidirectional-link audit after every step.
+///
+/// This is the property-style guard for the parent-pointer/child-list
+/// duality — the exact invariant class whose silent breakage a one-node-
+/// two-parents corruption would need (see `unlink_from_current_parent`'s
+/// defect policy). Seeded xorshift, so any failure reproduces exactly; no
+/// property-testing dependency, per the repo's dependency diet.
+#[test]
+fn mutation_storm_keeps_parent_links_bidirectional() {
+    use std::collections::HashSet;
+
+    let mut d = Dom::new();
+    let document = d.document();
+    let mut tracked = vec![document];
+    for _ in 0..8 {
+        tracked.push(d.create_element(qn("host"), Vec::new()));
+    }
+    let mut state = 0x2545_F491_4F6C_DD1D_u64;
+
+    for _ in 0..1500 {
+        match storm_roll(&mut state, 8) {
+            0 => {
+                tracked.push(d.create_element(qn("e"), Vec::new()));
+            }
+            1 => {
+                tracked.push(d.create_text("t"));
+            }
+            2 | 3 => {
+                if let (Some(parent), Some(child)) =
+                    (storm_pick(&d, &tracked, &mut state), storm_pick(&d, &tracked, &mut state))
+                {
+                    let _ = d.append(parent, child); // cycle refusals expected
+                }
+            }
+            4 => {
+                if let (Some(sibling), Some(node)) =
+                    (storm_pick(&d, &tracked, &mut state), storm_pick(&d, &tracked, &mut state))
+                {
+                    let _ = d.insert_before(sibling, node);
+                }
+            }
+            5 => {
+                if let Some(id) = storm_pick(&d, &tracked, &mut state)
+                    && id != document
+                {
+                    let _ = d.detach(id);
+                }
+            }
+            6 => {
+                if let (Some(from), Some(to)) =
+                    (storm_pick(&d, &tracked, &mut state), storm_pick(&d, &tracked, &mut state))
+                {
+                    let _ = d.reparent_children(from, to);
+                }
+            }
+            _ => {
+                if let Some(id) = storm_pick(&d, &tracked, &mut state)
+                    && id != document
+                {
+                    let _ = d.destroy(id); // stales the subtree; contains() filters below
+                }
+            }
+        }
+
+        // Audit: every live node's two link directions agree, and no parent
+        // chain ever loops.
+        for &id in &tracked {
+            if !d.contains(id) {
+                continue;
+            }
+            if let Some(parent) = d.parent(id) {
+                assert!(
+                    d.contains(parent)
+                        && d.children(parent).unwrap().any(|&kid| kid == id),
+                    "node {id:?} names parent {parent:?} but is absent from its list"
+                );
+            }
+            if let Some(kids) = d.children(id) {
+                for kid in kids {
+                    assert_eq!(
+                        d.parent(*kid),
+                        Some(id),
+                        "child {kid:?} is listed under {id:?} but disowns it"
+                    );
+                }
+            }
+            let mut cursor = Some(id);
+            let mut seen = HashSet::new();
+            while let Some(step) = cursor {
+                assert!(seen.insert(step), "parent chain from {id:?} cycles at {step:?}");
+                cursor = d.parent(step);
+            }
+        }
+    }
 }
 
 #[test]
