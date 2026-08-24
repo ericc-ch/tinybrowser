@@ -10,15 +10,26 @@ use crate::node::{Attribute, Node, NodeKind, QualName};
 /// Why a mutation was refused.
 ///
 /// Stale handles and structural mistakes surface as values, never as panics,
-/// so future JS bindings can map them straight onto DOM exceptions.
+/// so future JS bindings can map them straight onto DOM exceptions — one
+/// variant per exception class, not per call site.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DomError {
     /// A handle named a node that no longer exists.
     StaleNode,
     /// The move would place a node inside its own subtree.
     CycleForbidden,
-    /// The operation does not apply to that kind or position of node.
-    IllegalTarget,
+    /// The document root may not gain a parent, be detached, drained, or
+    /// destroyed. (Maps to `HierarchyRequestError`.)
+    ProtectedNode,
+    /// The operation does not apply to that kind of node (setting text data
+    /// on an element, attributes on a text node). (Maps to a type error at
+    /// the binding layer.)
+    WrongNodeType,
+    /// An insert was requested beside a node with no parent to sit under.
+    /// (Maps to `NotFoundError`.)
+    NoParent,
+    /// A node was asked to be inserted before itself.
+    SelfInsert,
 }
 
 impl fmt::Display for DomError {
@@ -26,7 +37,10 @@ impl fmt::Display for DomError {
         match self {
             Self::StaleNode => f.write_str("stale node handle"),
             Self::CycleForbidden => f.write_str("operation would create a cycle"),
-            Self::IllegalTarget => f.write_str("operation not valid for this node"),
+            Self::ProtectedNode => f.write_str("document root is protected"),
+            Self::WrongNodeType => f.write_str("operation not valid for this node kind"),
+            Self::NoParent => f.write_str("target has no parent to insert beside"),
+            Self::SelfInsert => f.write_str("cannot insert a node before itself"),
         }
     }
 }
@@ -235,13 +249,14 @@ impl Dom {
     /// # Errors
     ///
     /// - [`DomError::StaleNode`] if either handle is stale.
+    /// - [`DomError::ProtectedNode`] if `child` is the document root.
     /// - [`DomError::CycleForbidden`] if `child` is an ancestor of `parent`.
     pub fn append(&mut self, parent: NodeId, child: NodeId) -> Result<(), DomError> {
         self.ensure_alive(parent, child)?;
         if child == self.document {
             // The root must never gain a parent — that is how a document
             // gets orphaned from itself. (Maps to HierarchyRequestError.)
-            return Err(DomError::IllegalTarget);
+            return Err(DomError::ProtectedNode);
         }
         if self.would_cycle(child, parent) {
             return Err(DomError::CycleForbidden);
@@ -273,15 +288,19 @@ impl Dom {
     /// # Errors
     ///
     /// - [`DomError::StaleNode`] if either handle is stale.
-    /// - [`DomError::IllegalTarget`] if `sibling` has no parent to insert
-    ///   beside, or `sibling == node`.
+    /// - [`DomError::NoParent`] if `sibling` has no parent to insert beside.
+    /// - [`DomError::SelfInsert`] if `sibling == node`.
+    /// - [`DomError::ProtectedNode`] if `sibling` is the document root.
     /// - [`DomError::CycleForbidden`] if `node` is an ancestor of the parent.
     pub fn insert_before(&mut self, sibling: NodeId, node: NodeId) -> Result<(), DomError> {
         self.ensure_alive(sibling, node)?;
-        if sibling == node || sibling == self.document {
-            return Err(DomError::IllegalTarget);
+        if sibling == node {
+            return Err(DomError::SelfInsert);
         }
-        let parent = self.parent(sibling).ok_or(DomError::IllegalTarget)?;
+        if sibling == self.document {
+            return Err(DomError::ProtectedNode);
+        }
+        let parent = self.parent(sibling).ok_or(DomError::NoParent)?;
         if self.would_cycle(node, parent) {
             return Err(DomError::CycleForbidden);
         }
@@ -313,11 +332,11 @@ impl Dom {
     /// # Errors
     ///
     /// - [`DomError::StaleNode`] if `id` is stale.
-    /// - [`DomError::IllegalTarget`] for the document root.
+    /// - [`DomError::ProtectedNode`] for the document root.
     pub fn detach(&mut self, id: NodeId) -> Result<(), DomError> {
         self.require_live(id)?;
         if id == self.document {
-            return Err(DomError::IllegalTarget);
+            return Err(DomError::ProtectedNode);
         }
         self.unlink_from_current_parent(id);
         if let Some(node) = self.node_mut(id) {
@@ -340,8 +359,9 @@ impl Dom {
     /// # Errors
     ///
     /// - [`DomError::StaleNode`] if either handle is stale.
-    /// - [`DomError::CycleForbidden`] if `to` sits inside `from`'s subtree
-    ///   (the move could then never complete).
+    /// - [`DomError::ProtectedNode`] if `from` is the document root (the
+    ///   move could then never complete without stranding the document).
+    /// - [`DomError::CycleForbidden`] if `to` sits inside `from`'s subtree.
     pub fn reparent_children(&mut self, from: NodeId, to: NodeId) -> Result<(), DomError> {
         self.ensure_alive(from, to)?;
         if from == to {
@@ -350,7 +370,7 @@ impl Dom {
         if from == self.document {
             // Draining the root would strand the entire document inside an
             // arbitrary detached subtree. (Maps to HierarchyRequestError.)
-            return Err(DomError::IllegalTarget);
+            return Err(DomError::ProtectedNode);
         }
         if self.would_cycle(from, to) {
             return Err(DomError::CycleForbidden);
@@ -385,7 +405,7 @@ impl Dom {
     /// # Errors
     ///
     /// - [`DomError::StaleNode`] if `id` is stale.
-    /// - [`DomError::IllegalTarget`] if `id` is not an element.
+    /// - [`DomError::WrongNodeType`] if `id` is not an element.
     pub fn add_attrs_if_missing(
         &mut self,
         id: NodeId,
@@ -393,7 +413,7 @@ impl Dom {
     ) -> Result<(), DomError> {
         let node = self.node_mut(id).ok_or(DomError::StaleNode)?;
         let NodeKind::Element { attributes, .. } = &mut node.kind else {
-            return Err(DomError::IllegalTarget);
+            return Err(DomError::WrongNodeType);
         };
         for attr in attrs {
             if !attributes.iter().any(|existing| existing.name == attr.name) {
@@ -408,7 +428,7 @@ impl Dom {
     /// # Errors
     ///
     /// - [`DomError::StaleNode`] if `id` is stale.
-    /// - [`DomError::IllegalTarget`] if `id` is not a text node.
+    /// - [`DomError::WrongNodeType`] if `id` is not a text node.
     pub fn set_text(&mut self, id: NodeId, data: impl Into<String>) -> Result<(), DomError> {
         self.set_data(
             id,
@@ -425,7 +445,7 @@ impl Dom {
     /// # Errors
     ///
     /// - [`DomError::StaleNode`] if `id` is stale.
-    /// - [`DomError::IllegalTarget`] if `id` is not a comment node.
+    /// - [`DomError::WrongNodeType`] if `id` is not a comment node.
     pub fn set_comment(&mut self, id: NodeId, data: impl Into<String>) -> Result<(), DomError> {
         self.set_data(
             id,
@@ -445,11 +465,11 @@ impl Dom {
     /// # Errors
     ///
     /// - [`DomError::StaleNode`] if `id` is stale.
-    /// - [`DomError::IllegalTarget`] for the document root.
+    /// - [`DomError::ProtectedNode`] for the document root.
     pub fn destroy(&mut self, id: NodeId) -> Result<(), DomError> {
         self.require_live(id)?;
         if id == self.document {
-            return Err(DomError::IllegalTarget);
+            return Err(DomError::ProtectedNode);
         }
         self.unlink_from_current_parent(id);
 
@@ -537,7 +557,7 @@ impl Dom {
                 *field = data;
                 Ok(())
             }
-            None => Err(DomError::IllegalTarget),
+            None => Err(DomError::WrongNodeType),
         }
     }
 

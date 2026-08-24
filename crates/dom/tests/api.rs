@@ -95,7 +95,7 @@ fn insert_before_head_and_document_are_handled() {
     let y = d.create_element(qn("y"), Vec::new());
 
     // inserting before the document root is not a thing
-    assert_eq!(d.insert_before(doc, x), Err(DomError::IllegalTarget));
+    assert_eq!(d.insert_before(doc, x), Err(DomError::ProtectedNode));
 
     d.append(doc, x).unwrap();
     d.insert_before(x, y).unwrap();
@@ -126,7 +126,7 @@ fn detach_unlinks_but_keeps_subtree_alive() {
     d.detach(parent).unwrap();
 
     // but the document root itself cannot be detached
-    assert_eq!(d.detach(doc), Err(DomError::IllegalTarget));
+    assert_eq!(d.detach(doc), Err(DomError::ProtectedNode));
 }
 
 #[test]
@@ -232,8 +232,8 @@ fn set_data_targets_only_its_kind() {
     d.set_comment(comment, "annotated").unwrap();
 
     let element = d.create_element(qn("b"), Vec::new());
-    assert_eq!(d.set_text(element, "nope"), Err(DomError::IllegalTarget));
-    assert_eq!(d.set_comment(element, "nope"), Err(DomError::IllegalTarget));
+    assert_eq!(d.set_text(element, "nope"), Err(DomError::WrongNodeType));
+    assert_eq!(d.set_comment(element, "nope"), Err(DomError::WrongNodeType));
 
     match d.get(comment).map(|n| n.kind()) {
         Some(NodeKind::Comment { data }) => assert_eq!(data, "annotated"),
@@ -281,7 +281,7 @@ fn add_attrs_if_missing_merges_without_duplicating() {
     let text = d.create_text("t");
     assert_eq!(
         d.add_attrs_if_missing(text, Vec::new()),
-        Err(DomError::IllegalTarget)
+        Err(DomError::WrongNodeType)
     );
 
     // stale handles are refused like every other mutation
@@ -348,7 +348,7 @@ fn insert_before_edge_cases_are_refused_correctly() {
     d.append(outer, inner).unwrap();
 
     // inserting a node before itself is meaningless, not a reorder
-    assert_eq!(d.insert_before(inner, inner), Err(DomError::IllegalTarget));
+    assert_eq!(d.insert_before(inner, inner), Err(DomError::SelfInsert));
 
     // moving `outer` to before its own descendant would tear the subtree
     assert_eq!(d.insert_before(inner, outer), Err(DomError::CycleForbidden));
@@ -413,12 +413,12 @@ fn the_document_root_cannot_gain_a_parent_or_be_drained() {
     d.append(doc, body).unwrap();
 
     // the root must never gain a parent (orphaned document)
-    assert_eq!(d.append(stray, doc), Err(DomError::IllegalTarget));
+    assert_eq!(d.append(stray, doc), Err(DomError::ProtectedNode));
 
     // nor may its content drain into an arbitrary detached subtree
     assert_eq!(
         d.reparent_children(doc, stray),
-        Err(DomError::IllegalTarget)
+        Err(DomError::ProtectedNode)
     );
 
     // refusals left state untouched
