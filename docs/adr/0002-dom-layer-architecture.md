@@ -140,6 +140,14 @@ not a dependency count; the stack's size cost is measured in
   purity rule lost to interning-for-free.
 - **Unpinned markup5ever**: any drift from html5ever 0.39's copy forks
   `QualName` into two incompatible types.
+- **Type-level container/leaf split of `Node`** *(rejected 2026-08-24, spec
+  conformance pass)*: splitting children-carrying kinds (Document, Element,
+  Fragment) from leaves (Text, Comment, Doctype) into distinct types would
+  let the compiler prove no leaf ever gains a child list. Lost to churn:
+  every arena callsite, the selector walk, and the TreeSink adapter would
+  restructure for a guarantee the pre-insert validity gate already provides
+  at the API level (leaves refuse children; `children()` answers an empty
+  list, mirroring DOM `childNodes` being always-a-list).
 
 ## Consequences
 

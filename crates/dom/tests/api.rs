@@ -13,6 +13,14 @@ fn qn(local: &str) -> QualName {
     QualName::new(None, Namespace::from(HTML_NS), LocalName::from(local))
 }
 
+/// No-namespace attribute with the given local name and value.
+fn attr(name: &str, value: &str) -> Attribute {
+    Attribute {
+        name: qn(name),
+        value: value.to_string(),
+    }
+}
+
 #[test]
 fn fresh_document_has_root_and_nothing_else() {
     let d = Dom::new();
@@ -74,15 +82,17 @@ fn appending_into_own_subtree_is_refused() {
 fn insert_before_positions_exactly() {
     let mut d = Dom::new();
     let doc = d.document();
+    let list = d.create_element(qn("ul"), Vec::new());
+    d.append(doc, list).unwrap();
     let mk = |d: &mut Dom| d.create_element(qn("li"), Vec::new());
     let (a, b, c) = (mk(&mut d), mk(&mut d), mk(&mut d));
 
-    d.append(doc, a).unwrap();
-    d.append(doc, c).unwrap();
+    d.append(list, a).unwrap();
+    d.append(list, c).unwrap();
     d.insert_before(c, b).unwrap();
 
     assert_eq!(
-        d.children(doc).unwrap().copied().collect::<Vec<_>>(),
+        d.children(list).unwrap().copied().collect::<Vec<_>>(),
         vec![a, b, c]
     );
 }
@@ -94,14 +104,21 @@ fn insert_before_head_and_document_are_handled() {
     let x = d.create_element(qn("x"), Vec::new());
     let y = d.create_element(qn("y"), Vec::new());
 
-    // inserting before the document root is not a thing
-    assert_eq!(d.insert_before(doc, x), Err(DomError::ProtectedNode));
+    // The document node has no parent, so there is nothing to insert beside
+    // it — the spec's NotFoundError path (pre-insert: parent null).
+    assert_eq!(d.insert_before(doc, x), Err(DomError::NoParent));
 
     d.append(doc, x).unwrap();
-    d.insert_before(x, y).unwrap();
+    // A document holds at most one element child, so a second element is
+    // refused even via insert_before — the old silent two-root tree (M4).
+    assert_eq!(d.insert_before(x, y), Err(DomError::HierarchyRequest));
+
+    // Comments, however, are welcome beside the document element.
+    let note = d.create_comment("prolog");
+    d.insert_before(x, note).unwrap();
     assert_eq!(
         d.children(doc).unwrap().copied().collect::<Vec<_>>(),
-        vec![y, x]
+        vec![note, x]
     );
 }
 
@@ -126,17 +143,19 @@ fn detach_unlinks_but_keeps_subtree_alive() {
     d.detach(parent).unwrap();
 
     // but the document root itself cannot be detached
-    assert_eq!(d.detach(doc), Err(DomError::ProtectedNode));
+    assert_eq!(d.detach(doc), Err(DomError::HierarchyRequest));
 }
 
 #[test]
 fn reparent_children_moves_everything_in_order() {
     let mut d = Dom::new();
     let doc = d.document();
+    let body = d.create_element(qn("body"), Vec::new());
+    d.append(doc, body).unwrap();
     let from = d.create_element(qn("from"), Vec::new());
     let to = d.create_element(qn("to"), Vec::new());
-    d.append(doc, from).unwrap();
-    d.append(doc, to).unwrap();
+    d.append(body, from).unwrap();
+    d.append(body, to).unwrap();
 
     let kids: Vec<_> = (0..6)
         .map(|_| d.create_element(qn("span"), Vec::new()))
@@ -347,8 +366,14 @@ fn insert_before_edge_cases_are_refused_correctly() {
     d.append(doc, outer).unwrap();
     d.append(outer, inner).unwrap();
 
-    // inserting a node before itself is meaningless, not a reorder
-    assert_eq!(d.insert_before(inner, inner), Err(DomError::SelfInsert));
+    // inserting a node beside itself is a spec-sanctioned no-op
+    // (https://dom.spec.whatwg.org/#concept-node-ensure-pre-insert-validity),
+    // not a reorder and not an error
+    d.insert_before(inner, inner).unwrap();
+    assert_eq!(
+        d.children(outer).unwrap().copied().collect::<Vec<_>>(),
+        vec![inner]
+    );
 
     // moving `outer` to before its own descendant would tear the subtree
     assert_eq!(d.insert_before(inner, outer), Err(DomError::CycleForbidden));
@@ -413,12 +438,12 @@ fn the_document_root_cannot_gain_a_parent_or_be_drained() {
     d.append(doc, body).unwrap();
 
     // the root must never gain a parent (orphaned document)
-    assert_eq!(d.append(stray, doc), Err(DomError::ProtectedNode));
+    assert_eq!(d.append(stray, doc), Err(DomError::HierarchyRequest));
 
     // nor may its content drain into an arbitrary detached subtree
     assert_eq!(
         d.reparent_children(doc, stray),
-        Err(DomError::ProtectedNode)
+        Err(DomError::HierarchyRequest)
     );
 
     // refusals left state untouched
@@ -465,7 +490,8 @@ fn wide_children_lists_behave_like_any_list() {
     let middle = kids[25];
     d.destroy(middle).unwrap();
     let expected: Vec<_> = kids.iter().copied().filter(|&k| k != middle).collect();
-    assert_eq!(d.children(wide).unwrap().copied().collect::<Vec<_>>(),
+    assert_eq!(
+        d.children(wide).unwrap().copied().collect::<Vec<_>>(),
         expected
     );
 }
@@ -478,7 +504,9 @@ fn insert_into_wide_list_lands_exactly() {
     d.append(doc, wide).unwrap();
 
     // deep into heap-backed territory: inserts at every edge of a long list
-    let kids: Vec<_> = (0..10).map(|_| d.create_element(qn("span"), Vec::new())).collect();
+    let kids: Vec<_> = (0..10)
+        .map(|_| d.create_element(qn("span"), Vec::new()))
+        .collect();
     for &k in &kids {
         d.append(wide, k).unwrap();
     }
@@ -490,8 +518,18 @@ fn insert_into_wide_list_lands_exactly() {
     let tail = d.create_element(qn("t"), Vec::new());
     d.append(wide, tail).unwrap();
 
-    let expected: Vec<_> = [vec![head], kids[..5].to_vec(), vec![middle], kids[5..].to_vec(), vec![tail]].concat();
-    assert_eq!(d.children(wide).unwrap().copied().collect::<Vec<_>>(), expected);
+    let expected: Vec<_> = [
+        vec![head],
+        kids[..5].to_vec(),
+        vec![middle],
+        kids[5..].to_vec(),
+        vec![tail],
+    ]
+    .concat();
+    assert_eq!(
+        d.children(wide).unwrap().copied().collect::<Vec<_>>(),
+        expected
+    );
 }
 
 /// xorshift64* — tiny, deterministic, good enough to scatter op choices.
@@ -504,7 +542,11 @@ fn storm_roll(state: &mut u64, n: u64) -> u64 {
 
 /// One uniformly chosen live handle, or `None` when nothing is left alive.
 fn storm_pick(d: &Dom, tracked: &[NodeId], state: &mut u64) -> Option<NodeId> {
-    let alive: Vec<NodeId> = tracked.iter().copied().filter(|&id| d.contains(id)).collect();
+    let alive: Vec<NodeId> = tracked
+        .iter()
+        .copied()
+        .filter(|&id| d.contains(id))
+        .collect();
     let count = u64::try_from(alive.len()).unwrap_or(u64::MAX);
     let picked = usize::try_from(storm_roll(state, count)).unwrap_or(0);
     alive.into_iter().nth(picked)
@@ -539,16 +581,18 @@ fn mutation_storm_keeps_parent_links_bidirectional() {
                 tracked.push(d.create_text("t"));
             }
             2 | 3 => {
-                if let (Some(parent), Some(child)) =
-                    (storm_pick(&d, &tracked, &mut state), storm_pick(&d, &tracked, &mut state))
-                {
+                if let (Some(parent), Some(child)) = (
+                    storm_pick(&d, &tracked, &mut state),
+                    storm_pick(&d, &tracked, &mut state),
+                ) {
                     let _ = d.append(parent, child); // cycle refusals expected
                 }
             }
             4 => {
-                if let (Some(sibling), Some(node)) =
-                    (storm_pick(&d, &tracked, &mut state), storm_pick(&d, &tracked, &mut state))
-                {
+                if let (Some(sibling), Some(node)) = (
+                    storm_pick(&d, &tracked, &mut state),
+                    storm_pick(&d, &tracked, &mut state),
+                ) {
                     let _ = d.insert_before(sibling, node);
                 }
             }
@@ -560,9 +604,10 @@ fn mutation_storm_keeps_parent_links_bidirectional() {
                 }
             }
             6 => {
-                if let (Some(from), Some(to)) =
-                    (storm_pick(&d, &tracked, &mut state), storm_pick(&d, &tracked, &mut state))
-                {
+                if let (Some(from), Some(to)) = (
+                    storm_pick(&d, &tracked, &mut state),
+                    storm_pick(&d, &tracked, &mut state),
+                ) {
                     let _ = d.reparent_children(from, to);
                 }
             }
@@ -583,8 +628,7 @@ fn mutation_storm_keeps_parent_links_bidirectional() {
             }
             if let Some(parent) = d.parent(id) {
                 assert!(
-                    d.contains(parent)
-                        && d.children(parent).unwrap().any(|&kid| kid == id),
+                    d.contains(parent) && d.children(parent).unwrap().any(|&kid| kid == id),
                     "node {id:?} names parent {parent:?} but is absent from its list"
                 );
             }
@@ -600,7 +644,10 @@ fn mutation_storm_keeps_parent_links_bidirectional() {
             let mut cursor = Some(id);
             let mut seen = HashSet::new();
             while let Some(step) = cursor {
-                assert!(seen.insert(step), "parent chain from {id:?} cycles at {step:?}");
+                assert!(
+                    seen.insert(step),
+                    "parent chain from {id:?} cycles at {step:?}"
+                );
                 cursor = d.parent(step);
             }
         }
@@ -621,4 +668,230 @@ fn fragments_are_detached_containers() {
     // outside the main tree: no parent, but fully live and usable
     assert_eq!(d.parent(f), None);
     assert_eq!(d.children(f).unwrap().copied().collect::<Vec<_>>(), vec![t]);
+}
+
+// ── content model: the pre-insert gate (WHATWG ensure pre-insert validity) ──
+
+/// A document holds at most one element child — the spec throws
+/// `HierarchyRequestError` for a second root
+/// (<https://dom.spec.whatwg.org/#concept-node-ensure-pre-insert-validity>).
+/// Before the gate this silently produced two roots, both of
+/// which matched `:root` (audit finding M4).
+#[test]
+fn documents_take_at_most_one_element_child() {
+    let mut d = Dom::new();
+    let doc = d.document();
+    let html = d.create_element(qn("html"), Vec::new());
+    d.append(doc, html).unwrap();
+
+    let html2 = d.create_element(qn("html"), Vec::new());
+    assert_eq!(d.append(doc, html2), Err(DomError::HierarchyRequest));
+    // ...and the refusal is total: still exactly one element child.
+    assert_eq!(d.children(doc).unwrap().count(), 1);
+}
+
+/// Doctype rules from the same gate: at most one, only in a document,
+/// always before the document element.
+#[test]
+fn doctype_placement_follows_the_content_model() {
+    let mut d = Dom::new();
+    let doc = d.document();
+    let div = d.create_element(qn("div"), Vec::new());
+    d.append(doc, div).unwrap();
+    let dt = d.create_doctype("html", "", "");
+
+    // nowhere but a document
+    assert_eq!(d.append(div, dt), Err(DomError::HierarchyRequest));
+
+    // after the document element is too late
+    let late = d.create_doctype("html", "", "");
+    assert_eq!(d.append(doc, late), Err(DomError::HierarchyRequest));
+
+    // ahead of the document element is exactly right
+    let early = d.create_doctype("html", "", "");
+    d.insert_before(div, early).unwrap();
+    assert_eq!(
+        d.children(doc).unwrap().copied().collect::<Vec<_>>(),
+        vec![early, div]
+    );
+
+    // a second doctype is refused even when well placed
+    let second = d.create_doctype("html", "", "");
+    assert_eq!(d.append(doc, second), Err(DomError::HierarchyRequest));
+
+    // ...and an element may not leap ahead of the standing doctype either:
+    // the doctype must precede the document element, from both directions.
+    let another_div = d.create_element(qn("div"), Vec::new());
+    assert_eq!(
+        d.insert_before(early, another_div),
+        Err(DomError::HierarchyRequest)
+    );
+    assert_eq!(
+        d.children(doc).unwrap().copied().collect::<Vec<_>>(),
+        vec![early, div]
+    );
+}
+/// Leaves are not parents: character data and doctypes refuse children with
+/// `HierarchyRequestError` (the gate's container-kind rule). This was audit
+/// finding M5 — the old code accepted the append and document-order matching
+/// then walked the fake subtree.
+#[test]
+fn leaves_refuse_children_and_answer_empty_child_lists() {
+    let mut d = Dom::new();
+    let doc = d.document();
+    let text = d.create_text("t");
+    let comment = d.create_comment("c");
+    let span = d.create_element(qn("span"), Vec::new());
+
+    assert_eq!(d.append(text, span), Err(DomError::HierarchyRequest));
+    assert_eq!(d.append(comment, span), Err(DomError::HierarchyRequest));
+    let dt = d.create_doctype("html", "", "");
+    assert_eq!(d.append(dt, span), Err(DomError::HierarchyRequest));
+    // bulk moves are gated on container-ness too
+    let host = d.create_element(qn("div"), Vec::new());
+    d.append(doc, host).unwrap();
+    assert_eq!(
+        d.reparent_children(host, text),
+        Err(DomError::HierarchyRequest)
+    );
+    assert_eq!(
+        d.reparent_children(text, host),
+        Err(DomError::HierarchyRequest)
+    );
+
+    // childNodes semantics: every live node answers a list; leaves answer
+    // an empty one, never None (that answer belongs to stale handles).
+    assert_eq!(d.children(text).unwrap().count(), 0);
+    assert_eq!(d.children(comment).unwrap().count(), 0);
+}
+
+/// Documents hold no character data (content-model step for Document).
+#[test]
+fn documents_refuse_character_data() {
+    let mut d = Dom::new();
+    let doc = d.document();
+    let t = d.create_text("stray");
+    assert_eq!(d.append(doc, t), Err(DomError::HierarchyRequest));
+}
+
+/// The bulk move answers to the document content model like every other
+/// path into a document. Before this gate, `reparent_children` was a
+/// one-call escape hatch around M4: it fabricated multi-root documents and
+/// character data under Document (subagent review R3-2). A run is validated
+/// as a *whole*, because per-child checks cannot see the pair — `[a, b]`
+/// into an empty document passes child-by-child and fails as a batch.
+///
+/// Doctypes need no bulk-run test: gated insertion keeps them directly
+/// under the root, and draining the root is refused, so no doctype can
+/// ever appear inside a moved run.
+#[test]
+fn reparent_children_into_a_document_honors_the_content_model() {
+    let mut d = Dom::new();
+    let doc = d.document();
+
+    // A second element cannot land while one stands.
+    let html = d.create_element(qn("html"), Vec::new());
+    d.append(doc, html).unwrap();
+    let run = d.create_element(qn("div"), Vec::new());
+    let stray = d.create_element(qn("span"), Vec::new());
+    d.append(run, stray).unwrap();
+    assert_eq!(
+        d.reparent_children(run, doc),
+        Err(DomError::HierarchyRequest)
+    );
+    assert_eq!(
+        d.children(run).unwrap().copied().collect::<Vec<_>>(),
+        vec![stray],
+        "refusal left the source run intact"
+    );
+
+    // Two elements into an *empty* document: each alone would pass, the
+    // pair may not.
+    d.detach(html).unwrap();
+    assert_eq!(d.children(doc).unwrap().count(), 0);
+    let pair_host = d.create_element(qn("pair-host"), Vec::new());
+    let a = d.create_element(qn("a"), Vec::new());
+    let b = d.create_element(qn("b"), Vec::new());
+    d.append(pair_host, a).unwrap();
+    d.append(pair_host, b).unwrap();
+    assert_eq!(
+        d.reparent_children(pair_host, doc),
+        Err(DomError::HierarchyRequest)
+    );
+    assert_eq!(d.children(doc).unwrap().count(), 0);
+
+    // Character data in the run is refused too, even beside nothing.
+    let text_host = d.create_element(qn("text-host"), Vec::new());
+    let words = d.create_text("stray");
+    d.append(text_host, words).unwrap();
+    assert_eq!(
+        d.reparent_children(text_host, doc),
+        Err(DomError::HierarchyRequest)
+    );
+
+    // A single element remains exactly as legal as through append.
+    let solo_host = d.create_element(qn("solo-host"), Vec::new());
+    let main = d.create_element(qn("main"), Vec::new());
+    d.append(solo_host, main).unwrap();
+    d.reparent_children(solo_host, doc).unwrap();
+    assert_eq!(
+        d.children(doc).unwrap().copied().collect::<Vec<_>>(),
+        vec![main]
+    );
+    assert_eq!(d.parent(main), Some(doc));
+
+    // Comments ride along fine, before or after the document element.
+    let note_host = d.create_element(qn("note-host"), Vec::new());
+    let note = d.create_comment("epilog");
+    d.append(note_host, note).unwrap();
+    d.reparent_children(note_host, doc).unwrap();
+    assert_eq!(
+        d.children(doc).unwrap().copied().collect::<Vec<_>>(),
+        vec![main, note]
+    );
+}
+
+/// Fragments stay insertable as ordinary children in this tree. Note the
+/// deliberate divergence: a live DOM never *nests* a `DocumentFragment` —
+/// its insertion algorithms splice the fragment's children into the parent
+/// instead. dom nests until the js layer needs splicing; the fragment
+/// clause of the document content model (>1 element child or any Text
+/// child makes a fragment uninsertable) belongs to that same splice work
+/// and rides with it — recorded as open finding L14.
+#[test]
+fn fragments_remain_legal_children() {
+    let mut d = Dom::new();
+    let doc = d.document();
+    let frag = d.create_fragment();
+    let item = d.create_element(qn("b"), Vec::new());
+    d.append(frag, item).unwrap();
+    let host = d.create_element(qn("section"), Vec::new());
+    d.append(doc, host).unwrap();
+
+    d.append(host, frag).unwrap();
+    assert_eq!(d.parent(frag), Some(host));
+}
+
+/// Attribute names are unique per DOM (`NamedNodeMap` keyed by qualified
+/// name); hand-built duplicates collapse first-wins, matching how repeated
+/// start tags merge (audit finding L10).
+#[test]
+fn duplicate_attributes_dedupe_first_wins() {
+    let mut d = Dom::new();
+    let el = d.create_element(
+        qn("i"),
+        vec![
+            attr("id", "first"),
+            attr("class", "keep"),
+            attr("id", "second"),
+        ],
+    );
+    match d.get(el).map(|view| view.kind()) {
+        Some(NodeKind::Element { attributes, .. }) => {
+            assert_eq!(attributes.len(), 2);
+            assert_eq!(attributes[0].value, "first");
+            assert_eq!(attributes[1].value, "keep");
+        }
+        other => panic!("expected element, got {other:?}"),
+    }
 }

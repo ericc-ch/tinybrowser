@@ -43,3 +43,11 @@ The `browser` crate — the only place allowed to depend on several layers at on
 **Scope**:
 The live node a selector query is rooted at; candidates are its descendants in document order, and the scope itself is never one of its own results — while matching still sees real ancestors above it.
 _Avoid_: root (means the document's root element), context
+
+**Pre-insert validity**:
+The one gate every dom insertion walks (`append`, `insert_before`), mirroring WHATWG's ensure-pre-insert algorithm by rule (anchors, not step numbers): container-kind parents only, document content model (one element child, doctype first), cycle refusal. Bulk moves (`reparent_children`) into a document answer to the same model over the resulting sequence. Refusals are `DomError::HierarchyRequest` / `CycleForbidden`.
+_Avoid_: append checks, validation scattered per method
+
+**Element state**:
+A pseudo-class truth (`:disabled`, `:lang(en)`, …) answered by `state.rs` against static markup — fully when markup determines it, otherwise as a documented static subset; states whose context cannot exist in a headless tree (pointer, focus, history) parse but match nothing.
+_Avoid_: pseudo-class handling (that word covers parsing too)

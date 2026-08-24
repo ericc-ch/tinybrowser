@@ -16,11 +16,17 @@ use crate::node::{Attribute, Node, NodeKind, QualName};
 pub enum DomError {
     /// A handle named a node that no longer exists.
     StaleNode,
-    /// The move would place a node inside its own subtree.
+    /// The move would place a node inside its own subtree. Browsers report
+    /// this as `HierarchyRequestError` too, and the future js binding layer
+    /// must fold it into that same exception — kept distinct because
+    /// callers can only produce it deliberately.
     CycleForbidden,
-    /// The document root may not gain a parent, be detached, drained, or
-    /// destroyed. (Maps to `HierarchyRequestError`.)
-    ProtectedNode,
+    /// The tree's hierarchy or content model forbids the operation:
+    /// a document gaining a second root or a misplaced doctype, character
+    /// data under a document, a leaf node asked to parent children, the
+    /// document root asked to gain a parent. (Maps to
+    /// `HierarchyRequestError`; see [`Dom::ensure_pre_insert_validity`].)
+    HierarchyRequest,
     /// The operation does not apply to that kind of node (setting text data
     /// on an element, attributes on a text node). (Maps to a type error at
     /// the binding layer.)
@@ -28,8 +34,6 @@ pub enum DomError {
     /// An insert was requested beside a node with no parent to sit under.
     /// (Maps to `NotFoundError`.)
     NoParent,
-    /// A node was asked to be inserted before itself.
-    SelfInsert,
 }
 
 impl fmt::Display for DomError {
@@ -37,10 +41,11 @@ impl fmt::Display for DomError {
         match self {
             Self::StaleNode => f.write_str("stale node handle"),
             Self::CycleForbidden => f.write_str("operation would create a cycle"),
-            Self::ProtectedNode => f.write_str("document root is protected"),
+            Self::HierarchyRequest => {
+                f.write_str("hierarchy or content model forbids this operation")
+            }
             Self::WrongNodeType => f.write_str("operation not valid for this node kind"),
             Self::NoParent => f.write_str("target has no parent to insert beside"),
-            Self::SelfInsert => f.write_str("cannot insert a node before itself"),
         }
     }
 }
@@ -156,8 +161,10 @@ impl Dom {
 
     /// The children of `id` in document order, or `None` for a stale handle.
     ///
-    /// Unlike the other reads this cannot quietly report "no children" for a
-    /// destroyed node — childless and dead are different answers.
+    /// Mirrors DOM `childNodes`: every live node answers a list — leaves
+    /// (text, comment, doctype) answer an empty one because the mutation
+    /// gate below refuses to give them children. Childless and dead remain
+    /// different answers; only staleness is `None`.
     #[must_use]
     pub fn children(&self, id: NodeId) -> Option<std::slice::Iter<'_, NodeId>> {
         self.live_slot(id)
@@ -178,12 +185,29 @@ impl Dom {
 
     /// Creates an element node, unattached until something appends it.
     ///
+    /// Attribute names are unique in the DOM — `NamedNodeMap` is keyed by
+    /// qualified name (<https://dom.spec.whatwg.org/#concept-attribute> —
+    /// "an attribute list is essentially a map of names to attributes") —
+    /// so later duplicates are dropped and the first occurrence wins,
+    /// matching the merge rule the parser drives through
+    /// [`Dom::add_attrs_if_missing`]. Hand-built callers get the same
+    /// normalization instead of an unrepresentable state.
+    ///
     /// # Panics
     ///
     /// Only if the arena exceeds `u32::MAX` slots — terabytes of RAM, not a
     /// reachable runtime condition; the bound guards the handle width.
     pub fn create_element(&mut self, name: QualName, attributes: Vec<Attribute>) -> NodeId {
-        self.alloc(NodeKind::Element { name, attributes })
+        let mut unique: Vec<Attribute> = Vec::with_capacity(attributes.len());
+        for attribute in attributes {
+            if !unique.iter().any(|kept| kept.name == attribute.name) {
+                unique.push(attribute);
+            }
+        }
+        self.alloc(NodeKind::Element {
+            name,
+            attributes: unique,
+        })
     }
 
     /// Creates a text node holding `data`.
@@ -238,8 +262,7 @@ impl Dom {
     /// Appends `child` as the last child of `parent`.
     ///
     /// Moving semantics: a `child` already attached elsewhere is detached
-    /// first, mirroring DOM `appendChild`. Appending a node into itself or its
-    /// own subtree is refused.
+    /// first, mirroring DOM `appendChild`.
     ///
     /// # Panics
     ///
@@ -249,18 +272,19 @@ impl Dom {
     /// # Errors
     ///
     /// - [`DomError::StaleNode`] if either handle is stale.
-    /// - [`DomError::ProtectedNode`] if `child` is the document root.
+    /// - [`DomError::HierarchyRequest`] if the content model forbids it:
+    ///   `child` is the document root, `parent` is a leaf kind, a document
+    ///   would gain a second element child or a misplaced doctype, or a
+    ///   doctype is placed outside a document.
     /// - [`DomError::CycleForbidden`] if `child` is an ancestor of `parent`.
     pub fn append(&mut self, parent: NodeId, child: NodeId) -> Result<(), DomError> {
         self.ensure_alive(parent, child)?;
         if child == self.document {
             // The root must never gain a parent — that is how a document
             // gets orphaned from itself. (Maps to HierarchyRequestError.)
-            return Err(DomError::ProtectedNode);
+            return Err(DomError::HierarchyRequest);
         }
-        if self.would_cycle(child, parent) {
-            return Err(DomError::CycleForbidden);
-        }
+        self.ensure_pre_insert_validity(parent, child, None)?;
         self.unlink_from_current_parent(child);
 
         // Defect guards, not input errors: liveness was checked above, so
@@ -278,7 +302,10 @@ impl Dom {
 
     /// Inserts `node` immediately before `sibling` under sibling's parent.
     ///
-    /// Moving semantics, like [`Dom::append`].
+    /// Moving semantics, like [`Dom::append`]. Inserting a node beside
+    /// itself is a legal stay-put no-op — WHATWG DOM's *ensure pre-insert
+    /// validity* returns without doing anything in that case — not an
+    /// error.
     ///
     /// # Panics
     ///
@@ -288,22 +315,23 @@ impl Dom {
     /// # Errors
     ///
     /// - [`DomError::StaleNode`] if either handle is stale.
-    /// - [`DomError::NoParent`] if `sibling` has no parent to insert beside.
-    /// - [`DomError::SelfInsert`] if `sibling == node`.
-    /// - [`DomError::ProtectedNode`] if `sibling` is the document root.
-    /// - [`DomError::CycleForbidden`] if `node` is an ancestor of the parent.
+    /// - [`DomError::NoParent`] if `sibling` has no parent to insert beside
+    ///   (`NotFoundError`, including the detached-sibling case).
+    /// - [`DomError::HierarchyRequest`] / [`DomError::CycleForbidden`] as
+    ///   from [`Dom::ensure_pre_insert_validity`].
     pub fn insert_before(&mut self, sibling: NodeId, node: NodeId) -> Result<(), DomError> {
         self.ensure_alive(sibling, node)?;
-        if sibling == node {
-            return Err(DomError::SelfInsert);
-        }
-        if sibling == self.document {
-            return Err(DomError::ProtectedNode);
-        }
+        // The reference child must sit under some parent to be inserted
+        // beside; a detached one has none — the outer pre-insert
+        // algorithm's parent-null refusal (`NotFoundError`).
         let parent = self.parent(sibling).ok_or(DomError::NoParent)?;
-        if self.would_cycle(node, parent) {
-            return Err(DomError::CycleForbidden);
+        // Node-beside-itself means "stay put": the gate would reject this
+        // as a cycle (a node contains itself), but the spec's answer is a
+        // silent return, so it short-circuits before validation.
+        if sibling == node {
+            return Ok(());
         }
+        self.ensure_pre_insert_validity(parent, node, Some(sibling))?;
         self.unlink_from_current_parent(node);
 
         // Defect guards, not input errors: `parent` and `sibling` were both
@@ -324,6 +352,88 @@ impl Dom {
         Ok(())
     }
 
+    /// WHATWG DOM's *ensure pre-insert validity* — the one gate every
+    /// insertion path walks (`append`, `insert_before`), mirroring
+    /// <https://dom.spec.whatwg.org/#concept-node-ensure-pre-insert-validity>.
+    /// Engine reference: Firefox's `EnsureAllowedAsChild` in
+    /// `dom/base/nsINode.cpp` (mozilla-firefox/firefox).
+    ///
+    /// Comments map each refusal to its rule in the spec's current wording
+    /// (the algorithm has been restructured before; anchors, not step
+    /// numbers, are what stay true). Refusals here are always
+    /// [`DomError::HierarchyRequest`] or [`DomError::CycleForbidden`]; the
+    /// document content model itself is encoded exactly once, in
+    /// [`Dom::ensure_document_content_model`].
+    fn ensure_pre_insert_validity(
+        &self,
+        parent: NodeId,
+        node: NodeId,
+        reference: Option<NodeId>,
+    ) -> Result<(), DomError> {
+        // The container-kind rule: only Document, DocumentFragment, and
+        // Element nodes accept children. Character data and doctypes are
+        // leaves — a leaf with a child list is exactly the corruption
+        // document-order matching once walked into (audit finding M5).
+        //
+        // Kind reads stay borrowed: this gate runs per insertion on the
+        // parse hot path, so cloning kinds (and their attribute lists) just
+        // to match on the variant is pure waste.
+        if !matches!(
+            self.get(parent).map(|view| view.kind()),
+            Some(NodeKind::Document | NodeKind::Element { .. } | NodeKind::Fragment)
+        ) {
+            return Err(DomError::HierarchyRequest);
+        }
+        // Reference-child membership (the reference belongs to `parent`) is
+        // enforced by construction: the only caller that passes `Some`
+        // derives `parent` from that same handle's own parent pointer.
+        //
+        // Cycle rule: `node` must not be an inclusive ancestor of `parent`;
+        // inserting a subtree into itself would tear the arena's acyclicity.
+        if self.would_cycle(node, parent) {
+            return Err(DomError::CycleForbidden);
+        }
+        // Node-beside-itself ("then return") is short-circuited by
+        // `insert_before` before calling this gate: the spec's answer there
+        // is *do nothing*, which a validation-only function cannot express.
+        //
+        // Content-model rules. Outside a document, a doctype is never
+        // welcome and everything else slides in unchecked.
+        if !matches!(
+            self.get(parent).map(|view| view.kind()),
+            Some(NodeKind::Document)
+        ) {
+            if matches!(
+                self.get(node).map(|view| view.kind()),
+                Some(NodeKind::Doctype { .. })
+            ) {
+                return Err(DomError::HierarchyRequest);
+            }
+            return Ok(());
+        }
+        // Inside a document: splice `node` into the standing children at its
+        // insertion point and hand the whole resulting sequence to the
+        // content model — the same single encoding the bulk-move path
+        // answers to, where positional flag-scanning would duplicate the
+        // invariant (and per-child checks cannot see a violating pair like
+        // `[html, main]`).
+        let mut sequence: Vec<NodeId> = Vec::new();
+        let mut inserted = false;
+        if let Some(kids) = self.children(parent) {
+            for existing in kids {
+                if !inserted && Some(*existing) == reference {
+                    sequence.push(node);
+                    inserted = true;
+                }
+                sequence.push(*existing);
+            }
+        }
+        if !inserted {
+            sequence.push(node);
+        }
+        self.ensure_document_content_model(&sequence)
+    }
+
     /// Unlinks `id` from its parent, keeping the whole subtree alive.
     ///
     /// Idempotent: detaching an already-detached node succeeds. The document
@@ -332,11 +442,11 @@ impl Dom {
     /// # Errors
     ///
     /// - [`DomError::StaleNode`] if `id` is stale.
-    /// - [`DomError::ProtectedNode`] for the document root.
+    /// - [`DomError::HierarchyRequest`] for the document root.
     pub fn detach(&mut self, id: NodeId) -> Result<(), DomError> {
         self.require_live(id)?;
         if id == self.document {
-            return Err(DomError::ProtectedNode);
+            return Err(DomError::HierarchyRequest);
         }
         self.unlink_from_current_parent(id);
         if let Some(node) = self.node_mut(id) {
@@ -349,7 +459,19 @@ impl Dom {
     ///
     /// This is the bulk-move primitive behind foster parenting and the
     /// adoption agency: order is preserved and each moved child's parent
-    /// pointer is updated.
+    /// pointer is updated. Endpoints must be container kinds, and draining
+    /// the document root is refused. For non-document destinations the
+    /// shape of the moved run stays unvalidated — the html5ever tree
+    /// builder's trusted internal flows (ADR 0003) never emit
+    /// content-model violations, and gated insertion paths make smuggling
+    /// impossible (a doctype can only ever sit directly under the root,
+    /// so none can appear in a moved run). When `to` **is** the document,
+    /// though, the full document content model applies to the *resulting*
+    /// sequence — see [`Dom::ensure_document_content_model`]. Validating
+    /// the moved children one-by-one would not be enough: a bulk move is
+    /// one operation, and `[html, main]` into an empty document passes
+    /// per-child while violating the model as a pair (subagent review
+    /// R3-2).
     ///
     /// # Panics
     ///
@@ -359,21 +481,48 @@ impl Dom {
     /// # Errors
     ///
     /// - [`DomError::StaleNode`] if either handle is stale.
-    /// - [`DomError::ProtectedNode`] if `from` is the document root (the
-    ///   move could then never complete without stranding the document).
+    /// - [`DomError::HierarchyRequest`] if `from` is the document root (the
+    ///   move could then never complete without stranding the document),
+    ///   if either endpoint is not a container kind, or if landing the run
+    ///   in a document would break its content model.
     /// - [`DomError::CycleForbidden`] if `to` sits inside `from`'s subtree.
     pub fn reparent_children(&mut self, from: NodeId, to: NodeId) -> Result<(), DomError> {
         self.ensure_alive(from, to)?;
         if from == to {
             return Ok(());
         }
+        // Both endpoints accept children, or the move would strand nodes
+        // under leaves (finding M5's corruption shape, bulk edition).
+        for endpoint in [from, to] {
+            if !matches!(
+                self.get(endpoint).map(|view| view.kind()),
+                Some(NodeKind::Document | NodeKind::Element { .. } | NodeKind::Fragment)
+            ) {
+                return Err(DomError::HierarchyRequest);
+            }
+        }
         if from == self.document {
             // Draining the root would strand the entire document inside an
             // arbitrary detached subtree. (Maps to HierarchyRequestError.)
-            return Err(DomError::ProtectedNode);
+            return Err(DomError::HierarchyRequest);
         }
         if self.would_cycle(from, to) {
             return Err(DomError::CycleForbidden);
+        }
+        if matches!(
+            self.get(to).map(|view| view.kind()),
+            Some(NodeKind::Document)
+        ) {
+            // The model sees the whole *resulting sequence*: the document's
+            // standing children followed by the moved run.
+            let mut sequence: Vec<NodeId> = Vec::new();
+            if let Some(kids) = self.children(to) {
+                sequence.extend(kids.copied());
+            }
+            if let Some(kids) = self.children(from) {
+                sequence.extend(kids.copied());
+            }
+            self.ensure_document_content_model(&sequence)?;
         }
         // Defect guards, not input errors: both handles were verified live
         // above, so a miss here means the parent-pointer/child-list duality
@@ -391,6 +540,44 @@ impl Dom {
         for id in moved {
             if let Some(node) = self.node_mut(id) {
                 node.parent = Some(to);
+            }
+        }
+        Ok(())
+    }
+
+    /// The document content model over one candidate child sequence. No
+    /// character data anywhere, at most one element child, at most one
+    /// doctype placed strictly ahead of that element; comments may sit
+    /// anywhere, and fragments stay opaque containers (the L14 splice
+    /// divergence). Deliberately the *only* encoding of the model:
+    /// incremental insertions arrive as their resulting sequence from
+    /// [`Dom::ensure_pre_insert_validity`], bulk moves as the document's
+    /// standing children followed by the moved run — where per-child checks
+    /// cannot see a violating pair like `[html, main]` (subagent review
+    /// R3-2).
+    fn ensure_document_content_model(&self, sequence: &[NodeId]) -> Result<(), DomError> {
+        let mut element_seen = false;
+        let mut doctype_seen = false;
+        for &id in sequence {
+            match self.get(id).map(|view| view.kind()) {
+                Some(NodeKind::Element { .. }) => {
+                    // A second document element is refused wherever it
+                    // would land.
+                    if element_seen {
+                        return Err(DomError::HierarchyRequest);
+                    }
+                    element_seen = true;
+                }
+                Some(NodeKind::Doctype { .. }) => {
+                    // One doctype, and only ahead of the document element.
+                    if doctype_seen || element_seen {
+                        return Err(DomError::HierarchyRequest);
+                    }
+                    doctype_seen = true;
+                }
+                // Documents hold no character data.
+                Some(NodeKind::Text { .. }) => return Err(DomError::HierarchyRequest),
+                _ => {}
             }
         }
         Ok(())
@@ -465,11 +652,11 @@ impl Dom {
     /// # Errors
     ///
     /// - [`DomError::StaleNode`] if `id` is stale.
-    /// - [`DomError::ProtectedNode`] for the document root.
+    /// - [`DomError::HierarchyRequest`] for the document root.
     pub fn destroy(&mut self, id: NodeId) -> Result<(), DomError> {
         self.require_live(id)?;
         if id == self.document {
-            return Err(DomError::ProtectedNode);
+            return Err(DomError::HierarchyRequest);
         }
         self.unlink_from_current_parent(id);
 

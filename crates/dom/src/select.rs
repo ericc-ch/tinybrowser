@@ -2,14 +2,25 @@
 //!
 //! Search takes a CSS selector string, compiles it against our name types,
 //! and walks descendants in document order — `querySelector` /
-//! `querySelectorAll` semantics, minus pseudo-elements (they never create
-//! nodes, so a query naming one is a syntax error, as in browsers).
+//! `querySelectorAll` semantics, minus boxes: known pseudo-elements parse
+//! like browsers' and match nothing (`qSA("p::before")` returns an empty
+//! list in every browser — MDN, "querySelectorAll"); unknown ones are
+//! refused, also as browsers refuse them.
 //!
-//! State pseudo-classes parse like browsers' and evaluate against what a
-//! static headless tree can truthfully know: `:link` matches HTML link
-//! elements carrying an `href`; `:hover`, `:active`, `:focus`, and
-//! `:visited` match nothing (no input devices, no browsing history); any
-//! other pseudo-class is refused, also as in browsers.
+//! State pseudo-classes are defined here, not by the engine: `selectors`
+//! owns selector *grammar* and tree-structural states (`:nth-child`,
+//! `:empty`, …) and delegates named states to the embedder through two
+//! parse hooks whose results come back to
+//! [`Element::match_non_ts_pseudo_class`]. Our answers live in
+//! [`crate::state`] under one truth policy: a state matches when static
+//! markup determines it, misses vacuously when its context cannot exist in
+//! a headless tree (`:hover`, `:visited`, …), and anything outside both
+//! categories is refused at parse time, exactly as browsers refuse unknown
+//! names. A few states browsers *do* know (`:valid`/`:invalid`,
+//! `:open`/`:modal`, `:popover-open`) belong to neither bucket yet — they
+//! measure models this tree does not have (constraint validation, dialog
+//! state) and stay refused until those models exist; the audit trail lists
+//! them rather than silently answering.
 //!
 //! Selector *names* are newtypes over the same interned atoms elements carry
 //! ([`crate::QualName`]), so a compiled selector compares names without ever
@@ -18,7 +29,7 @@
 use std::borrow::Borrow;
 use std::fmt;
 
-use cssparser::{Parser as CssParser, ParserInput, ToCss};
+use cssparser::{BasicParseErrorKind, Parser as CssParser, ParserInput, ToCss, Token};
 use precomputed_hash::PrecomputedHash;
 use selectors::{
     Element, OpaqueElement,
@@ -37,6 +48,7 @@ use selectors::{
 use crate::arena::Dom;
 use crate::id::NodeId;
 use crate::node::{Attribute, NodeKind};
+use crate::state;
 
 /// The document-compatibility mode a query runs under — what html5ever's
 /// tree builder reports and parsed pages carry.
@@ -187,49 +199,217 @@ impl PrecomputedHash for AttrValue {
     }
 }
 
-/// State pseudo-classes: parsed like browsers, matched against what a
-/// static headless tree can truthfully know.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Named element states, parsed from selector text and answered against the
+/// tree by [`crate::state`]. Grouped by defining spec section; the vacuous
+/// set is explicit so "matches nothing" reads as a decision, not an omission.
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum PseudoClass {
-    /// `:link` — an HTML link element (`a`/`area`/`link`) with an `href`.
+    // Hyperlinks (Selectors 4 §:link/:any-link; SVG2 for svg <a>).
+    /// `:link` / `:any-link` — a hyperlink: `a`/`area`/`link` with `href`.
+    AnyLink,
+    /// `:link` — same hyperlink rule as [`PseudoClass::AnyLink`]; history
+    /// would only split them for `:visited`, which never matches here.
     Link,
-    /// `:visited` — never matches; browsing history does not exist here.
+    // Form-control UI states (HTML §pseudo-classes).
+    Enabled,
+    Disabled,
+    Checked,
+    Required,
+    Optional,
+    ReadOnly,
+    ReadWrite,
+    PlaceholderShown,
+    /// `:default` — static subset: default checkedness/selectedness true
+    /// (`checked` checkbox/radio inputs, `selected` options); see
+    /// [`crate::state::is_default`] for the deferred clause.
+    Default,
+    /// `:indeterminate` — static subset: a `progress` without a value
+    /// attribute; radio groups await the forms model.
+    Indeterminate,
+    /// `:defined` — true except for valid-but-unregistered custom-element
+    /// names (HTML names containing `-`, minus the reserved set).
+    Defined,
+    // Inherited document-language states (Selectors 4).
+    /// `:lang(range…)` — nearest inherited `lang`, matched against each
+    /// comma-separated range under RFC 4647 extended filtering.
+    Lang(Vec<Box<str>>),
+    /// `:dir(direction)` — nearest inherited `dir`, `ltr` default.
+    Dir(Box<str>),
+    // Vacuous states: real truth needs runtime context a headless tree
+    // cannot have. They parse (browsers never throw on these) and match
+    // nothing, exactly what a fresh page answers in a live browser.
+    /// `:visited` — no browsing history exists.
     Visited,
-    /// `:hover` — never matches; there is no pointer.
+    /// `:hover` — there is no pointer.
     Hover,
-    /// `:active` — never matches; nothing is being clicked.
+    /// `:active` — nothing is being pressed.
     Active,
-    /// `:focus` — never matches until a focus owner can exist (js layer).
+    /// `:focus` — no focus owner until the js layer can hold one.
     Focus,
+    /// `:focus-within` — no focus owner to be inside of.
+    FocusWithin,
+    /// `:focus-visible` — no focus heuristics without input events.
+    FocusVisible,
+    /// `:target` — no URL fragment is in play during a query.
+    Target,
+    /// `:in-range` / `:out-of-range` — need a live value and min/max model;
+    /// statically knowable only once numbers are parsed out of values, so
+    /// deferred whole (subagent review R3-10).
+    InRange,
+    OutOfRange,
+    /// `:autofill` — autofill is a live UA activity, not markup.
+    Autofill,
 }
 
 impl PseudoClass {
-    /// Parses one pseudo-class keyword (CSS keywords are case-insensitive).
+    /// Parses one non-functional pseudo-class keyword (CSS keywords are
+    /// case-insensitive). Functional ones (`:lang()`, `:dir()`) arrive
+    /// through the parser's functional hook below.
     fn from_keyword(name: &str) -> Option<Self> {
-        let candidate = |expected: &str| name.eq_ignore_ascii_case(expected);
-        if candidate("link") {
-            Some(Self::Link)
-        } else if candidate("visited") {
-            Some(Self::Visited)
-        } else if candidate("hover") {
-            Some(Self::Hover)
-        } else if candidate("active") {
-            Some(Self::Active)
-        } else if candidate("focus") {
-            Some(Self::Focus)
+        const KEYWORDS: &[(&str, PseudoClass)] = &[
+            ("any-link", PseudoClass::AnyLink),
+            ("link", PseudoClass::Link),
+            ("enabled", PseudoClass::Enabled),
+            ("disabled", PseudoClass::Disabled),
+            ("checked", PseudoClass::Checked),
+            ("required", PseudoClass::Required),
+            ("optional", PseudoClass::Optional),
+            ("read-only", PseudoClass::ReadOnly),
+            ("read-write", PseudoClass::ReadWrite),
+            ("placeholder-shown", PseudoClass::PlaceholderShown),
+            ("defined", PseudoClass::Defined),
+            ("visited", PseudoClass::Visited),
+            ("hover", PseudoClass::Hover),
+            ("active", PseudoClass::Active),
+            ("focus", PseudoClass::Focus),
+            ("focus-within", PseudoClass::FocusWithin),
+            ("focus-visible", PseudoClass::FocusVisible),
+            ("target", PseudoClass::Target),
+            ("indeterminate", PseudoClass::Indeterminate),
+            ("default", PseudoClass::Default),
+            ("in-range", PseudoClass::InRange),
+            ("out-of-range", PseudoClass::OutOfRange),
+            ("autofill", PseudoClass::Autofill),
+        ];
+        KEYWORDS
+            .iter()
+            .find(|(keyword, _)| name.eq_ignore_ascii_case(keyword))
+            .map(|(_, class)| class.clone())
+    }
+
+    /// Parses one functional pseudo-class argument out of an already-opened
+    /// argument block (`(` consumed by the engine, closing delimiter
+    /// invisible to us — the nested parser reports end-of-input there).
+    ///
+    /// Whitespace and comments inside the block are insignificant:
+    /// `:lang( en )` parses like `:lang(en)` (Selectors 4 §whitespace).
+    fn parse_functional<'i>(
+        name: &str,
+        input: &mut CssParser<'i, '_>,
+    ) -> Result<Self, cssparser::ParseError<'i, ParseFail>> {
+        // One bare argument: an identifier, a quoted string, or a lone `*`
+        // wildcard (compound wildcards like `*-Cyrl` must be quoted — CSS
+        // lexes an unquoted `*` as its own token, so the pieces would
+        // arrive separately). Anything else is grammar misuse.
+        let take_argument =
+            |input: &mut CssParser<'i, '_>| -> Result<String, cssparser::ParseError<'i, ParseFail>> {
+                input.skip_whitespace();
+                let token = input.next()?.clone();
+                match token {
+                    Token::Ident(ref value) | Token::QuotedString(ref value) => {
+                        Ok(value.to_string())
+                    }
+                    Token::Delim('*') => Ok("*".into()),
+                    unexpected => Err(input
+                        .new_basic_error(BasicParseErrorKind::UnexpectedToken(unexpected))
+                        .into()),
+                }
+            };
+        if name.eq_ignore_ascii_case("lang") {
+            // Comma-separated range list — Selectors 4's own example is
+            // `E:lang(sr, "*-Cyrl")`. Each range must be non-empty; empty
+            // ranges match nothing under extended filtering, so accepting
+            // them would only manufacture silent dead selectors.
+            let mut ranges = Vec::new();
+            loop {
+                let range = take_argument(input)?;
+                if range.is_empty() {
+                    return Err(input.new_custom_error(
+                        SelectorParseErrorKind::UnsupportedPseudoClassOrElement(
+                            ":lang(\"\")".into(),
+                        ),
+                    ));
+                }
+                ranges.push(range.into());
+                input.skip_whitespace();
+                match input.next() {
+                    // Clean end of the argument block: list complete.
+                    Err(_) => break,
+                    // A comma means another range follows.
+                    Ok(&Token::Comma) => {}
+                    // Anything else is junk after a complete range.
+                    Ok(unexpected) => {
+                        let unexpected = unexpected.clone();
+                        return Err(input
+                            .new_basic_error(BasicParseErrorKind::UnexpectedToken(unexpected))
+                            .into());
+                    }
+                }
+            }
+            Ok(Self::Lang(ranges))
+        } else if name.eq_ignore_ascii_case("dir") {
+            let value = take_argument(input)?;
+            // Engines refuse any other direction outright (`:dir(up)` →
+            // SyntaxError in Chrome and Firefox alike); values that merely
+            // fail to *match* (like `auto`) are not parse errors at all.
+            // This refusal mirrors engine behavior, not §dir-pseudo's
+            // grammar, which would accept-and-never-match.
+            if value.eq_ignore_ascii_case("ltr") || value.eq_ignore_ascii_case("rtl") {
+                Ok(Self::Dir(value.to_ascii_lowercase().into()))
+            } else {
+                Err(input.new_custom_error(
+                    SelectorParseErrorKind::UnsupportedPseudoClassOrElement(
+                        format!(":dir({value})").into(),
+                    ),
+                ))
+            }
         } else {
-            None
+            Err(
+                input.new_custom_error(SelectorParseErrorKind::UnsupportedPseudoClassOrElement(
+                    name.into(),
+                )),
+            )
         }
     }
 
     /// The canonical lowercase keyword, for CSS serialization.
-    fn keyword(self) -> &'static str {
+    fn keyword(&self) -> std::borrow::Cow<'static, str> {
         match self {
-            Self::Link => "link",
-            Self::Visited => "visited",
-            Self::Hover => "hover",
-            Self::Active => "active",
-            Self::Focus => "focus",
+            Self::AnyLink => "any-link".into(),
+            Self::Link => "link".into(),
+            Self::Enabled => "enabled".into(),
+            Self::Disabled => "disabled".into(),
+            Self::Checked => "checked".into(),
+            Self::Required => "required".into(),
+            Self::Optional => "optional".into(),
+            Self::ReadOnly => "read-only".into(),
+            Self::ReadWrite => "read-write".into(),
+            Self::PlaceholderShown => "placeholder-shown".into(),
+            Self::Defined => "defined".into(),
+            Self::Lang(ranges) => format!("lang({})", ranges.join(",")).into(),
+            Self::Dir(direction) => format!("dir({direction})").into(),
+            Self::Visited => "visited".into(),
+            Self::Hover => "hover".into(),
+            Self::Active => "active".into(),
+            Self::Focus => "focus".into(),
+            Self::FocusWithin => "focus-within".into(),
+            Self::FocusVisible => "focus-visible".into(),
+            Self::Target => "target".into(),
+            Self::Indeterminate => "indeterminate".into(),
+            Self::Default => "default".into(),
+            Self::InRange => "in-range".into(),
+            Self::OutOfRange => "out-of-range".into(),
+            Self::Autofill => "autofill".into(),
         }
     }
 }
@@ -242,7 +422,10 @@ impl NonTSPseudoClassTrait for PseudoClass {
     }
 
     fn is_user_action_state(&self) -> bool {
-        matches!(self, Self::Hover | Self::Active | Self::Focus)
+        matches!(
+            self,
+            Self::Hover | Self::Active | Self::Focus | Self::FocusWithin | Self::FocusVisible
+        )
     }
 }
 
@@ -252,18 +435,64 @@ impl ToCss for PseudoClass {
     }
 }
 
-/// Never constructed: pseudo-elements (`::before`) generate no nodes here,
-/// so querying for them is refused at parse time, like browsers do.
-#[derive(Clone, Debug, Eq, PartialEq)]
-enum PseudoElement {}
+/// Known pseudo-elements parse like browsers' and match nothing: real
+/// `querySelectorAll("p::before")` returns an empty list, never throws
+/// (MDN: "If the specified selectors include a CSS pseudo-element, the
+/// returned list is always empty"). dom creates no boxes — no layout, no
+/// generated content — so every variant refuses to match. Unknown names are
+/// still refused at parse time, exactly as browsers refuse them.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PseudoElement {
+    Before,
+    After,
+    FirstLine,
+    FirstLetter,
+    Selection,
+    Placeholder,
+    Marker,
+    Backdrop,
+}
+
+impl PseudoElement {
+    /// Parses one known pseudo-element name (case-insensitive per CSS).
+    fn from_keyword(name: &str) -> Option<Self> {
+        const KEYWORDS: &[(&str, PseudoElement)] = &[
+            ("before", PseudoElement::Before),
+            ("after", PseudoElement::After),
+            ("first-line", PseudoElement::FirstLine),
+            ("first-letter", PseudoElement::FirstLetter),
+            ("selection", PseudoElement::Selection),
+            ("placeholder", PseudoElement::Placeholder),
+            ("marker", PseudoElement::Marker),
+            ("backdrop", PseudoElement::Backdrop),
+        ];
+        KEYWORDS
+            .iter()
+            .find(|(keyword, _)| name.eq_ignore_ascii_case(keyword))
+            .map(|(_, element)| *element)
+    }
+
+    fn keyword(self) -> &'static str {
+        match self {
+            Self::Before => "before",
+            Self::After => "after",
+            Self::FirstLine => "first-line",
+            Self::FirstLetter => "first-letter",
+            Self::Selection => "selection",
+            Self::Placeholder => "placeholder",
+            Self::Marker => "marker",
+            Self::Backdrop => "backdrop",
+        }
+    }
+}
 
 impl PseudoElementTrait for PseudoElement {
     type Impl = Selectors;
 }
 
 impl ToCss for PseudoElement {
-    fn to_css<W: fmt::Write>(&self, _dest: &mut W) -> fmt::Result {
-        match *self {}
+    fn to_css<W: fmt::Write>(&self, dest: &mut W) -> fmt::Result {
+        write!(dest, "::{}", self.keyword())
     }
 }
 
@@ -307,6 +536,20 @@ impl<'i> SelectorParser<'i> for SelectorLanguage {
         true
     }
 
+    /// Known pseudo-elements parse and match nothing; unknown names are
+    /// refused exactly as browsers refuse them.
+    fn parse_pseudo_element(
+        &self,
+        location: cssparser::SourceLocation,
+        name: cssparser::CowRcStr<'i>,
+    ) -> Result<PseudoElement, cssparser::ParseError<'i, Self::Error>> {
+        PseudoElement::from_keyword(&name).ok_or_else(|| {
+            location.new_custom_error(SelectorParseErrorKind::UnsupportedPseudoClassOrElement(
+                name,
+            ))
+        })
+    }
+
     /// State pseudo-classes with statically knowable truth; anything else is
     /// refused exactly as browsers refuse unknown pseudo-classes.
     fn parse_non_ts_pseudo_class(
@@ -321,6 +564,17 @@ impl<'i> SelectorParser<'i> for SelectorLanguage {
             )),
         }
     }
+
+    /// Functional state pseudo-classes: `:lang(range)` and `:dir(direction)`
+    /// take an argument the engine hands us inside an already-opened block.
+    fn parse_non_ts_functional_pseudo_class<'t>(
+        &self,
+        name: cssparser::CowRcStr<'i>,
+        input: &mut CssParser<'i, 't>,
+        _after_part: bool,
+    ) -> Result<PseudoClass, cssparser::ParseError<'i, Self::Error>> {
+        PseudoClass::parse_functional(&name, input)
+    }
 }
 
 /// The class of a selector-parse failure — stable enough for programmatic
@@ -332,8 +586,8 @@ pub enum ParseFailKind {
     EmptySelector,
     /// A combinator with nothing on its right-hand side (`div >`).
     DanglingCombinator,
-    /// An unknown pseudo-class, or any pseudo-element (dom creates no nodes
-    /// for those).
+    /// An unknown pseudo-class or pseudo-element name (known
+    /// pseudo-elements parse and match nothing, like browsers).
     UnsupportedPseudo,
     /// An identifier appeared where only a selector may (`..x`).
     UnexpectedIdent,
@@ -401,8 +655,11 @@ impl From<SelectorParseErrorKind<'_>> for ParseFail {
                 ParseFailKind::MisplacedFeature,
                 "pseudo-elements may not appear inside :is()/:where()".into(),
             ),
+            // The engine's internal-state error is a defect indicator, not
+            // user grammar misuse — bucketing it as MisplacedFeature would
+            // mislead the future DOMException mapper (audit finding L12).
             K::InvalidState => (
-                ParseFailKind::MisplacedFeature,
+                ParseFailKind::MalformedInput,
                 "internal selector-parser state error".into(),
             ),
             K::UnexpectedTokenInAttributeSelector(_)
@@ -482,35 +739,20 @@ impl<'a> DomElement<'a> {
         }
     }
 
-    /// First attribute whose name equals `local` under the element's case
-    /// regime: exact for non-HTML, ASCII-insensitive for HTML-in-HTML, so
-    /// hand-built mixed-case attributes behave like tokenized ones.
-    ///
-    /// Only no-namespace attributes are considered; that is where the
-    /// engine's `class`, `id`, and unqualified `[attr]` selectors live.
+    /// First no-namespace attribute named `local`, under the element's case
+    /// regime. Delegates to [`crate::state::attr_value`] — the one home of
+    /// that policy, so `[href]` and `:link` can never drift apart again
+    /// (subagent review R3-6).
     fn attr_value(&self, local: &str) -> Option<&'a str> {
-        let html = self.is_html_in_html_document();
-        self.attributes()
-            .iter()
-            .find(|attribute| {
-                let stored = attribute.name.local.as_ref();
-                let named = if html {
-                    stored.eq_ignore_ascii_case(local)
-                } else {
-                    stored == local
-                };
-                attribute.name.ns.is_empty() && named
-            })
-            .map(|attribute| attribute.value.as_str())
+        state::attr_value(self.dom, self.id, local)
     }
 
-    /// Whether this element's namespace is HTML inside an HTML document.
+    /// Whether this element lives in the HTML namespace.
     ///
     /// This is the engine's switch for case handling: when true it asks us
     /// about lowercased tag/attribute names, which is what the tree stores.
     fn is_html_in_html_document(&self) -> bool {
-        self.qual_name()
-            .is_some_and(|name| name.ns == crate::node::html_namespace())
+        state::is_html(self.dom, self.id)
     }
 }
 
@@ -599,17 +841,11 @@ impl Element for DomElement<'_> {
 
     /// The engine pre-selects which spelling to ask about (lowercased for
     /// HTML in HTML documents), but hand-built trees are not obliged to hold
-    /// lowercased names the way a tokenized one does — so when we declared
-    /// HTML-in-HTML, comparison is case-insensitive in both directions.
+    /// lowercased names the way a tokenized one does — so comparison routes
+    /// through the shared case-regime policy, insensitive in both
+    /// directions when we declared HTML-in-HTML.
     fn has_local_name(&self, local_name: &str) -> bool {
-        self.qual_name().is_some_and(|name| {
-            let stored = name.local.as_ref();
-            if self.is_html_in_html_document() {
-                stored.eq_ignore_ascii_case(local_name)
-            } else {
-                stored == local_name
-            }
-        })
+        state::local_is(self.dom, self.id, &[local_name])
     }
 
     fn has_namespace(&self, ns: &str) -> bool {
@@ -664,13 +900,41 @@ impl Element for DomElement<'_> {
         pc: &PseudoClass,
         _context: &mut MatchingContext<Selectors>,
     ) -> bool {
+        // Named states are answered by crate::state under its truth
+        // policy; this match is only the routing table.
         match pc {
-            PseudoClass::Link => self.is_link(),
-            // No pointer, no keyboard focus owner, no browsing history: the
-            // user-action states are truthful vacuous misses — exactly what
-            // a fresh static page answers in a real browser.
-            PseudoClass::Hover | PseudoClass::Active | PseudoClass::Focus
-            | PseudoClass::Visited => false,
+            PseudoClass::AnyLink | PseudoClass::Link => state::is_hyperlink(self.dom, self.id),
+            PseudoClass::Enabled => state::is_enabled(self.dom, self.id),
+            PseudoClass::Disabled => state::is_disabled(self.dom, self.id),
+            PseudoClass::Checked => state::is_checked(self.dom, self.id),
+            PseudoClass::Required => state::is_required(self.dom, self.id),
+            PseudoClass::Optional => state::is_optional(self.dom, self.id),
+            PseudoClass::ReadOnly => state::is_read_only(self.dom, self.id),
+            PseudoClass::ReadWrite => state::is_read_write(self.dom, self.id),
+            PseudoClass::PlaceholderShown => state::is_placeholder_shown(self.dom, self.id),
+            PseudoClass::Defined => state::is_defined(self.dom, self.id),
+            PseudoClass::Lang(ranges) => state::lang_matches(self.dom, self.id, ranges),
+            PseudoClass::Dir(direction) => state::direction_is(self.dom, self.id, direction),
+            // Static subsets of states whose full semantics need runtime
+            // context; see crate::state for exactly which clause each
+            // covers and which stays deferred.
+            PseudoClass::Indeterminate => state::is_indeterminate(self.dom, self.id),
+            PseudoClass::Default => state::is_default(self.dom, self.id),
+            // Vacuous set: the context these describe (browsing history,
+            // URL fragment during a query, numeric range validation,
+            // autofill activity) does not exist in a headless tree. A
+            // fresh page in a real browser answers the same way — no
+            // matches.
+            PseudoClass::Visited
+            | PseudoClass::Hover
+            | PseudoClass::Active
+            | PseudoClass::Focus
+            | PseudoClass::FocusWithin
+            | PseudoClass::FocusVisible
+            | PseudoClass::Target
+            | PseudoClass::InRange
+            | PseudoClass::OutOfRange
+            | PseudoClass::Autofill => false,
         }
     }
 
@@ -679,22 +943,20 @@ impl Element for DomElement<'_> {
         pe: &PseudoElement,
         _context: &mut MatchingContext<Selectors>,
     ) -> bool {
-        match *pe {}
+        // Known pseudo-elements parse like browsers' and never match: no
+        // layout, no boxes, no generated content exists in this tree.
+        let _ = pe;
+        false
     }
 
     fn apply_selector_flags(&self, _flags: selectors::matching::ElementSelectorFlags) {
         // No invalidation machinery exists here: queries are one-shot reads.
     }
 
-    /// `:link` — an HTML link element carrying an `href`.
-    ///
-    /// Local names compare under this element's case regime (ASCII-
-    /// insensitive for HTML-in-HTML), like every other name check here;
-    /// hand-built `<A HREF="…">` counts exactly like tokenized output.
+    /// `:link` / `:any-link` — a hyperlink in any namespace carrying an
+    /// `href` (see `crate::state::is_hyperlink` for the spec citations).
     fn is_link(&self) -> bool {
-        self.is_html_in_html_document()
-            && ["a", "area", "link"].iter().any(|name| self.has_local_name(name))
-            && self.attr_value("href").is_some()
+        state::is_hyperlink(self.dom, self.id)
     }
 
     fn is_html_slot_element(&self) -> bool {
@@ -806,20 +1068,19 @@ impl Dom {
     fn compile(selectors: &str) -> Result<SelectorList<Selectors>, SelectError> {
         let mut input = ParserInput::new(selectors);
         let mut parser = CssParser::new(&mut input);
-        SelectorList::parse(&SelectorLanguage, &mut parser, ParseRelative::No)
-            .map_err(|error| {
-                // Engine-classified failures carry their kind; token-level
-                // junk keeps the CSS lexer's own wording under
-                // [`ParseFailKind::MalformedInput`].
-                let fail = match error.kind {
-                    cssparser::ParseErrorKind::Custom(fail) => fail,
-                    cssparser::ParseErrorKind::Basic(basic) => ParseFail {
-                        kind: ParseFailKind::MalformedInput,
-                        message: basic.to_string().into(),
-                    },
-                };
-                SelectError::Syntax(fail)
-            })
+        SelectorList::parse(&SelectorLanguage, &mut parser, ParseRelative::No).map_err(|error| {
+            // Engine-classified failures carry their kind; token-level
+            // junk keeps the CSS lexer's own wording under
+            // [`ParseFailKind::MalformedInput`].
+            let fail = match error.kind {
+                cssparser::ParseErrorKind::Custom(fail) => fail,
+                cssparser::ParseErrorKind::Basic(basic) => ParseFail {
+                    kind: ParseFailKind::MalformedInput,
+                    message: basic.to_string().into(),
+                },
+            };
+            SelectError::Syntax(fail)
+        })
     }
 
     /// Shared scan behind [`Dom::select_all`] and [`Dom::select_first`]:

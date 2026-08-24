@@ -1,85 +1,117 @@
 # Code-review findings — dom crate audit, 2026-08-24
 
-Full-crate review (source, tests, ADR conformance, consumer usage). Verified:
-`cargo test -p dom` green (52 workspace), clippy pedantic+cargo clean, plus
-black-box reproductions built against the tree.
+Full-crate review history: pass 1 (morning) found C1/M1–M3/L1–L6; the
+architecture+fix commits through `1453ec8` closed them; pass 2 (afternoon)
+verified those closures and added M4–M5/L7–L13; the spec-conformance round
+(working tree, 2026-08-24 evening) fixed everything in this file. Verified
+at close: workspace green (65 tests), clippy pedantic `-D warnings` clean,
+rustfmt clean. Black-box probes live at `/tmp/opencode/dom-probe`.
 
-**Status after the 2026-08-24 architecture + fix pass** (commits 158f2a6,
-59502b4, a7df5b1, then 400436b…1453ec8): **every finding is resolved**
-except the generation-wrap ABA note in Test gaps, which is a documented
-design acceptance rather than a defect. C1 and L2 closed in the morning
-architecture pass; M1–M3, L1, L3–L6 and the executable test gaps closed in
-the afternoon pass.
+**Pass 4 (2026-08-25, in-session diff review of the conformance round):**
+two fidelity holes survived pass 3 because every R3-3/R3-4 fixture kept
+options as direct children of `select`. Both probed black-box, both fixed:
 
-## C1 — ✅ RESOLVED BY DESIGN: children lists collapsed to `Vec<NodeId>`
+- **P4-1 ✅ `:checked` default-selectedness flattens `optgroup`s now.**
+  `<optgroup>`-wrapped options were invisible to the first-option scan —
+  a lone wrapped option answered unchecked, and an explicit pick inside a
+  group let its bare sibling default-check instead. The list of options is
+  every descendant option in tree order (`state::collect_descendant_options`).
+  Pinned by `checked_defaults_apply_without_selected_attributes`.
+- **P4-2 ✅ disabled-optgroup inheritance implemented** (§4.10.11: an
+  option is disabled when its direct parent `optgroup` is). Pinned by
+  `fieldset_and_select_disability_inherits`.
 
-Was: confirmed panic at `children.rs:98` (`copy_within` out of bounds when
-`len == INLINE_CAP == 4`, `index < len`), reachable from
-`browser::parse_html` on ordinary foster-parenting markup such as
-`<div><span>1</span><span>2</span><span>3</span><table>x</table></div>`.
+Structural follow-ups from the same pass: the document content model is now
+encoded exactly once — `ensure_pre_insert_validity` splices the node into
+the standing children at its insertion point and delegates the resulting
+sequence to `ensure_document_content_model`, replacing the parallel
+positional flag-scan; and the gate no longer clones `NodeKind`s (and their
+attribute lists) on every insertion.
 
-Resolution: commit 158f2a6 deleted the dual representation entirely (ADR
-0002 amended in place; `Spill` glossary term retired). Wide-list insert
-coverage now lives in `api.rs::insert_into_wide_list_lands_exactly`. The
-minimal spill-on-full hot-fix was considered and deliberately skipped — the
-structural fix supersedes it.
+Verified after pass 4: workspace green (72 tests), clippy pedantic
+`-D warnings` clean, rustfmt clean.
 
-## Medium
+**Open items after the conformance round — all documented design
+acceptances, none defects:**
 
-- **✅ M1 — RESOLVED (commit 400436b): `unlink_from_current_parent` follows
-  the defect policy.** Divergence between the parent pointer and the child
-  list now panics like every other structural site; guarded by a
-  deterministic 1500-op mutation storm auditing bidirectional links after
-  every step (`mutation_storm_keeps_parent_links_bidirectional`).
+- **L14 — Fragment insertion nests, DOM splices.** Appending a fragment to
+  a live parent keeps the fragment node itself as the child; live-DOM
+  insertion replaces it with its contents. No current caller depends on
+  either semantics (template contents travel through the sink's side map);
+  implement splicing with the js layer's real `appendChild`, where the
+  content model must be checked per spliced child.
+- **Generation-wrap ABA**: accepted by design (2^32 recycles per slot);
+  one-recycle staleness pinned by `recycled_slots_never_impersonate_dead_nodes`.
+- **`:lang()` inheritance reads only the literal `lang` attribute**;
+  `xml:lang` and `Content-Language` defaults land with net.
+- **Disabled-fieldset inheritance ignores the first-legend exemption**
+  (option/optgroup only); revisit if form support deepens.
+- **`:scope` resolves against the document element** under document-level
+  queries (matching `document.qSA(':scope')` in browsers); element-base
+  scoping needs the query-context wiring planned for js.
 
-- **✅ M2 — RESOLVED (commit c01734c): quirks mode plumbed through.**
-  `select_all` / `select_first` / `matches` take `dom::QuirksMode`
-  (mirroring html5ever's three modes); full quirks applies the engine's
-  WHATWG id/class case quirk, pinned by test. The js layer maps
-  `Parsed.quirks_mode` when it lands.
+## Closed — architecture & structure
 
-- **✅ M3 — RESOLVED (commit 33fa6ec): state pseudo-classes parse and match
-  truthfully.** `:link` matches HTML `a`/`area`/`link` with an `href`;
-  `:hover`/`:active`/`:focus`/`:visited` parse but match nothing (no input,
-  focus owner, or history in a headless tree); unknown pseudo-classes still
-  refuse, as browsers do.
+- **C1 ✅ children lists collapsed to `Vec<NodeId>`** (158f2a6): the
+  confirmed panic died with the dual representation.
+- **M1 ✅ unlink defect policy** (400436b): divergence panics; guarded by
+  the deterministic mutation storm auditing bidirectional links each step.
+- **M4 ✅ Document content model enforced**: second element child refused;
+  doctype limited to documents, unique, ahead of the document element from
+  both directions. Three pre-existing tests were silently building illegal
+  two-root documents and were rewritten onto legal trees — independent
+  confirmation the gate works.
+- **M5 ✅ leaves refuse children**: Text/Comment/Doctype parents are
+  `HierarchyRequest`; bulk `reparent_children` gates both endpoints on
+  container kinds too; `children()` on a leaf answers an empty list
+  (`childNodes` is always a list).
+- **L10 ✅ duplicate attributes dedupe first-wins** in `create_element`.
+- **L11 ✅ insert-before-self is a spec no-op** (`SelfInsert` deleted).
+- All structural rules live in one place: `Dom::ensure_pre_insert_validity`,
+  mirroring WHATWG *ensure pre-insert validity* step-for-step.
 
-## Low
+## Closed — errors
 
-- **✅ L1 — RESOLVED with M3 (commit 33fa6ec).** `is_link` is live code again
-  (it backs `:link`) and its exact-match local-name check was replaced by
-  the element's case regime.
-- **✅ L2 — RESOLVED (commit a7df5b1): `IllegalTarget` split into**
-  `ProtectedNode` / `WrongNodeType` / `NoParent` / `SelfInsert`, keeping
-  `StaleNode` + `CycleForbidden`; exact DOMException labels pinned when js
-  lands.
-- **✅ L3 — RESOLVED (commit 2dc44d2):** `SelectError::Syntax` carries
-  structured `ParseFail { kind, message }`.
-- **✅ L4 — RESOLVED with L3 (commit 2dc44d2):** the single-variant enum gave
-  way to `ParseFailKind` — eight honest discriminants from empty-selector to
-  malformed-input.
-- **✅ L5 — RESOLVED (commit 870cea4): manifest reconciled toward ADR 0002** —
-  `cssparser = "=0.34.0"` exact, matching its "exact-version partner" role;
-  `selectors` stays caret (the ADR never pinned it).
-- **✅ L6 — RESOLVED (commit 870cea4):** the 5381/×33 fold names itself DJB2.
+- **L2 ✅ `IllegalTarget` split** into exception-shaped variants (a7df5b1).
+- **L3/L4 ✅ structured parse failures** (2dc44d2): `SelectError::Syntax`
+  carries `ParseFail { kind, message }` over eight `ParseFailKind`
+  discriminants; the engine-kind match has no wildcard arm.
+- **L12 ✅ `InvalidState` bucketed `MalformedInput`**, no longer misread as
+  user grammar misuse.
+- **Taxonomy renamed**: `ProtectedNode` → `HierarchyRequest` (one variant
+  per exception class, as the enum doc always claimed).
 
-## Test gaps
+## Closed — selector fidelity
 
-- **✅ Property-style coverage (commit 400436b):** the deterministic mutation
-  storm audits parent-pointer/child-list duality every step without a
-  property-testing dependency. (The original textbook candidate — model-
-  testing `Children` against `Vec` — died with the collapse: there is no
-  dual representation left to model.)
-- **✅ `:nth-child(… of S)` (commit 1453ec8):** subset renumbering pinned
-  against overall-position baselines.
-- **⏳ Generation-wrap ABA:** accepted by design, untestable at 2^32 recycles
-  per slot; the one-recycle staleness mechanism is already pinned by
-  `recycled_slots_never_impersonate_dead_nodes`. Documented refusal, not an
-  oversight.
+- **M2 ✅ quirks mode plumbed** (c01734c) across all three modes, quirk
+  pinned by test.
+- **M3/L7 ✅ state pseudo-classes match truthfully**: attribute-derived UI
+  states (`:enabled/:disabled/:checked/:required/:optional/:read-only/
+  :read-write/:placeholder-shown/:default/:indeterminate`),
+  `:any-link` ≡ `:link`,
+  `:defined` (true except unregistered hyphenated custom-element names),
+  functional `:lang(ranges…)`/`:dir(direction)` via the
+  engine's functional-parse hook with ancestor inheritance; `:lang()`
+  takes comma-separated range lists matched under RFC 4647 extended
+  filtering. Context-only states (`:hover`, `:visited`, `:focus*`,
+  `:target`, `:in-range/-out-of-range`, `:autofill`) parse and miss
+  vacuously. Predicates live in `crates/dom/src/state.rs`, grouped per
+  spec section with citations; deferred clauses are named where they sit
+  (default submit buttons, radio groups, numeric ranges).
+- **L8 ✅ known pseudo-elements parse and match nothing** — empty results
+  like every browser; unknown names still refuse.
+- **L9 ✅ `:link`/`:any-link` match hyperlinks in any namespace** (SVG
+  `<a href>` included).
+
+## Closed — hygiene
+
+- **L5 ✅ cssparser pinned `=0.34.0`** per ADR 0002 (870cea4).
+- **L6 ✅ DJB2 named** in-place (870cea4).
+- **L13 ✅ rustfmt clean**; the ~56 hunks introduced by pass 2 are gone.
 
 ## What held up
 
-Generational scheme sound end to end (single tick at realloc verified);
-sentinel-slot refusal implemented, not just claimed; structural `!Sync`
-marker; exhaustive parse-error rendering; public-API-only integration suites;
-stale-handle semantics proven, not asserted.
+Generational scheme end to end; sentinel-slot refusal; structural `!Sync`;
+exhaustive parse-error rendering; public-API-only integration suites;
+quirks plumbing; storm guard; `nth-child(of S)` subset semantics; complex
+`:not()`, relative `:has()`, whitespace `:empty`, fragment queries.

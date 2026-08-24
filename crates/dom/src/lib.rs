@@ -23,6 +23,7 @@ mod arena;
 mod id;
 mod node;
 mod select;
+mod state;
 
 pub use arena::{Dom, DomError, NodeRef};
 pub use id::NodeId;
