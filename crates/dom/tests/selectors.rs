@@ -5,8 +5,8 @@
 //! the `TreeSink` adapter exists.
 
 use dom::{
-    Attribute, Dom, LocalName, Namespace, NodeId, QualName, QuirksMode, SelectError,
-    html_namespace,
+    Attribute, Dom, LocalName, Namespace, NodeId, ParseFailKind, QualName, QuirksMode,
+    SelectError, html_namespace,
 };
 
 /// Qualified element name in the HTML namespace, no prefix.
@@ -475,15 +475,51 @@ fn bad_selectors_are_syntax_errors_with_readable_messages() {
             .select_all(page.d.document(), selector, QuirksMode::NoQuirks)
             .expect_err(selector);
         match error {
-            SelectError::Syntax(message) => {
+            SelectError::Syntax(fail) => {
                 assert!(
-                    !message.is_empty(),
+                    !fail.to_string().is_empty(),
                     "{selector:?} produced an empty message"
                 );
             }
             other => panic!("{selector:?}: expected syntax error, got {other:?}"),
         }
     }
+}
+
+#[test]
+fn syntax_errors_carry_a_machine_readable_class() {
+    let page = build();
+    let class_of = |selector: &str| {
+        match page
+            .d
+            .select_all(page.d.document(), selector, QuirksMode::NoQuirks)
+        {
+            Err(SelectError::Syntax(fail)) => fail.kind(),
+            other => panic!("{selector:?}: expected syntax error, got {other:?}"),
+        }
+    };
+
+    assert_eq!(class_of(""), ParseFailKind::EmptySelector);
+    assert_eq!(class_of("div >"), ParseFailKind::DanglingCombinator);
+    assert_eq!(class_of(":frobnicate"), ParseFailKind::UnsupportedPseudo);
+    assert_eq!(class_of("p::before"), ParseFailKind::UnsupportedPseudo);
+    assert_eq!(
+        class_of("svg|circle"),
+        ParseFailKind::UnknownNamespacePrefix
+    );
+
+    // the class travels with the text, not instead of it
+    let Err(SelectError::Syntax(fail)) = page
+        .d
+        .select_all(page.d.document(), ":frobnicate", QuirksMode::NoQuirks)
+    else {
+        unreachable!("expected a syntax error for :frobnicate");
+    };
+    assert_eq!(
+        fail.to_string(),
+        "unsupported pseudo-class or element `frobnicate`",
+        "message drifted from its class"
+    );
 }
 
 #[test]

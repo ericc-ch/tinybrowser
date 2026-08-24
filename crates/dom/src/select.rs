@@ -73,7 +73,7 @@ pub enum SelectError {
     /// [`Dom::matches`] was handed a handle that does not name an element.
     NotAnElement,
     /// The selector string did not parse.
-    Syntax(String),
+    Syntax(ParseFail),
 }
 
 impl fmt::Display for SelectError {
@@ -290,7 +290,7 @@ struct SelectorLanguage;
 
 impl<'i> SelectorParser<'i> for SelectorLanguage {
     type Impl = Selectors;
-    type Error = ParseFail<'i>;
+    type Error = ParseFail;
 
     fn parse_is_and_where(&self) -> bool {
         true
@@ -320,67 +320,129 @@ impl<'i> SelectorParser<'i> for SelectorLanguage {
     }
 }
 
-/// Readable rendering of the engine's parse errors.
-///
-/// `selectors` ships no `Display` for [`SelectorParseErrorKind`]; this exists
-/// so [`SelectError::Syntax`] carries something worth showing a user.
-#[derive(Clone, Debug, PartialEq)]
-enum ParseFail<'i> {
-    Kind(SelectorParseErrorKind<'i>),
+/// The class of a selector-parse failure — stable enough for programmatic
+/// handling (`DOMException` mapping at the future js layer) without parsing
+/// text back.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ParseFailKind {
+    /// Nothing usable was given (`""`, whitespace).
+    EmptySelector,
+    /// A combinator with nothing on its right-hand side (`div >`).
+    DanglingCombinator,
+    /// An unknown pseudo-class, or any pseudo-element (dom creates no nodes
+    /// for those).
+    UnsupportedPseudo,
+    /// An identifier appeared where only a selector may (`..x`).
+    UnexpectedIdent,
+    /// A namespace prefix with no mapping (`svg|circle` — none exist here).
+    UnknownNamespacePrefix,
+    /// Malformed pieces inside an attribute selector (`[href=]`).
+    BadAttributeSelector,
+    /// A feature used where the grammar forbids it: compounds inside
+    /// compounds, pseudo-elements inside `:is()`.
+    MisplacedFeature,
+    /// Token-level junk rejected by the CSS lexer itself.
+    MalformedInput,
 }
 
-impl<'i> From<SelectorParseErrorKind<'i>> for ParseFail<'i> {
-    fn from(kind: SelectorParseErrorKind<'i>) -> Self {
-        Self::Kind(kind)
+/// Why a selector string did not parse: one of the [`ParseFailKind`] classes
+/// plus the human-readable rendering of that specific failure.
+///
+/// `selectors` ships no `Display` for its error kinds; [`SelectError::Syntax`]
+/// surfaces this type's text instead. The message stays stable per class —
+/// only the offending name varies.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ParseFail {
+    kind: ParseFailKind,
+    message: Box<str>,
+}
+
+impl ParseFail {
+    /// The class of failure, independent of wording or position.
+    #[must_use]
+    pub fn kind(&self) -> ParseFailKind {
+        self.kind
     }
 }
 
-impl fmt::Display for ParseFail<'_> {
+impl fmt::Display for ParseFail {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let ParseFail::Kind(kind) = self;
-        let why = match kind {
-            SelectorParseErrorKind::NoQualifiedNameInAttributeSelector(_) => {
-                "attribute selector needs a qualified name"
-            }
-            SelectorParseErrorKind::EmptySelector => "empty selector",
-            SelectorParseErrorKind::DanglingCombinator => "combinator with nothing on its right",
-            SelectorParseErrorKind::NonCompoundSelector => {
-                "only compound selectors may appear inside this compound"
-            }
-            SelectorParseErrorKind::NonPseudoElementAfterSlotted
-            | SelectorParseErrorKind::InvalidPseudoElementAfterSlotted => {
-                "::slotted() must be followed by a pseudo-element"
-            }
-            SelectorParseErrorKind::InvalidPseudoElementInsideWhere => {
-                "pseudo-elements may not appear inside :is()/:where()"
-            }
-            SelectorParseErrorKind::InvalidState => "internal selector-parser state error",
-            SelectorParseErrorKind::UnexpectedTokenInAttributeSelector(_)
-            | SelectorParseErrorKind::BadValueInAttr(_)
-            | SelectorParseErrorKind::InvalidQualNameInAttr(_) => {
-                "unexpected token in attribute selector"
-            }
-            SelectorParseErrorKind::PseudoElementExpectedColon(_)
-            | SelectorParseErrorKind::PseudoElementExpectedIdent(_)
-            | SelectorParseErrorKind::NoIdentForPseudo(_) => "malformed pseudo-element",
-            SelectorParseErrorKind::UnsupportedPseudoClassOrElement(name) => {
-                return write!(f, "unsupported pseudo-class or element `{name}`");
-            }
-            SelectorParseErrorKind::UnexpectedIdent(name) => {
-                return write!(f, "unexpected identifier `{name}`");
-            }
-            SelectorParseErrorKind::ExpectedNamespace(name) => {
-                return write!(f, "unknown namespace prefix `{name}`");
-            }
-            SelectorParseErrorKind::ExpectedBarInAttr(_) => {
-                "expected `|` separating namespace from attribute"
-            }
-            SelectorParseErrorKind::ExplicitNamespaceUnexpectedToken(_) => {
-                "unexpected token after namespace separator"
-            }
-            SelectorParseErrorKind::ClassNeedsIdent(_) => "class selector needs an identifier",
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for ParseFail {}
+
+impl From<SelectorParseErrorKind<'_>> for ParseFail {
+    fn from(kind: SelectorParseErrorKind<'_>) -> Self {
+        use SelectorParseErrorKind as K;
+        let (kind, message): (ParseFailKind, String) = match kind {
+            K::NoQualifiedNameInAttributeSelector(_) => (
+                ParseFailKind::BadAttributeSelector,
+                "attribute selector needs a qualified name".into(),
+            ),
+            K::EmptySelector => (ParseFailKind::EmptySelector, "empty selector".into()),
+            K::DanglingCombinator => (
+                ParseFailKind::DanglingCombinator,
+                "combinator with nothing on its right".into(),
+            ),
+            K::NonCompoundSelector => (
+                ParseFailKind::MisplacedFeature,
+                "only compound selectors may appear inside this compound".into(),
+            ),
+            K::NonPseudoElementAfterSlotted | K::InvalidPseudoElementAfterSlotted => (
+                ParseFailKind::MisplacedFeature,
+                "::slotted() must be followed by a pseudo-element".into(),
+            ),
+            K::InvalidPseudoElementInsideWhere => (
+                ParseFailKind::MisplacedFeature,
+                "pseudo-elements may not appear inside :is()/:where()".into(),
+            ),
+            K::InvalidState => (
+                ParseFailKind::MisplacedFeature,
+                "internal selector-parser state error".into(),
+            ),
+            K::UnexpectedTokenInAttributeSelector(_)
+            | K::BadValueInAttr(_)
+            | K::InvalidQualNameInAttr(_) => (
+                ParseFailKind::BadAttributeSelector,
+                "unexpected token in attribute selector".into(),
+            ),
+            K::PseudoElementExpectedColon(_)
+            | K::PseudoElementExpectedIdent(_)
+            | K::NoIdentForPseudo(_) => (
+                ParseFailKind::MisplacedFeature,
+                "malformed pseudo-element".into(),
+            ),
+            K::UnsupportedPseudoClassOrElement(name) => (
+                ParseFailKind::UnsupportedPseudo,
+                format!("unsupported pseudo-class or element `{name}`"),
+            ),
+            K::UnexpectedIdent(name) => (
+                ParseFailKind::UnexpectedIdent,
+                format!("unexpected identifier `{name}`"),
+            ),
+            K::ExpectedNamespace(name) => (
+                ParseFailKind::UnknownNamespacePrefix,
+                format!("unknown namespace prefix `{name}`"),
+            ),
+            K::ExpectedBarInAttr(_) => (
+                ParseFailKind::BadAttributeSelector,
+                "expected `|` separating namespace from attribute".into(),
+            ),
+            K::ExplicitNamespaceUnexpectedToken(_) => (
+                ParseFailKind::BadAttributeSelector,
+                "unexpected token after namespace separator".into(),
+            ),
+            K::ClassNeedsIdent(_) => (
+                ParseFailKind::MisplacedFeature,
+                "class selector needs an identifier".into(),
+            ),
         };
-        f.write_str(why)
+        Self {
+            kind,
+            message: message.into(),
+        }
     }
 }
 
@@ -742,7 +804,19 @@ impl Dom {
         let mut input = ParserInput::new(selectors);
         let mut parser = CssParser::new(&mut input);
         SelectorList::parse(&SelectorLanguage, &mut parser, ParseRelative::No)
-            .map_err(|error| SelectError::Syntax(error.to_string()))
+            .map_err(|error| {
+                // Engine-classified failures carry their kind; token-level
+                // junk keeps the CSS lexer's own wording under
+                // [`ParseFailKind::MalformedInput`].
+                let fail = match error.kind {
+                    cssparser::ParseErrorKind::Custom(fail) => fail,
+                    cssparser::ParseErrorKind::Basic(basic) => ParseFail {
+                        kind: ParseFailKind::MalformedInput,
+                        message: basic.to_string().into(),
+                    },
+                };
+                SelectError::Syntax(fail)
+            })
     }
 
     /// Shared scan behind [`Dom::select_all`] and [`Dom::select_first`]:
