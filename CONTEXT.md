@@ -17,6 +17,10 @@ _Avoid_: version, epoch
 A NodeId whose node was destroyed; every lookup reports absence instead of returning some other node.
 _Avoid_: dangling reference
 
+**Quirks mode**:
+The document-compatibility mode html5ever reports for a parsed page (NoQuirks / LimitedQuirks / Quirks); dom's selector queries take it because full quirks makes class/id matching ASCII-case-insensitive.
+_Avoid_: compatibility mode, IE mode
+
 **Detach**:
 Unlinking a subtree from its parent while keeping every node alive.
 _Avoid_: remove (ambiguous with destroy)
