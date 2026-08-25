@@ -33,7 +33,7 @@ against the result.
 | baseline (empty main, re-measured)                   | 448 KB            | 287 KB  |
 | **dom v1**: arena + selectors + cssparser + html5ever + markup5ever | +1272 KB | **+932 KB** |
 
-Against the pre-measurement estimate for the same stack (+941 KB +115 KB = +1056 KB release / +840 KB +75 KB = +915 KB tuned): tuned landed within ~2% (+17 KB); release ran +216 KB over — the delta carries dom's own storage/search code plus query execution, which the estimates omitted. Accepted: no regression to justify.
+Against the pre-measurement estimate for the same stack (+941 KB +115 KB = +1056 KB release / +840 KB +75 KB = +915 KB tuned): tuned landed within ~2% (+17 KB); release ran +216 KB over; the delta carries dom's own storage/search code plus query execution, which the estimates omitted. Accepted: no regression to justify.
 
 ## Stack totals (tuned profile)
 
@@ -41,22 +41,22 @@ Against the pre-measurement estimate for the same stack (+941 KB +115 KB = +1056
 | ------------------------------------------------------ | ----------- | ---------------- |
 | ureq(native-tls) + quickjs-ng + **html5ever** ← chosen | **2.26 MB** | ~2.74 MB         |
 | same but html5gum instead                              | 1.73 MB     | ~3.27 MB         |
-| any of the above on default `release`                  | 2.7–3.3 MB  | —                |
+| any of the above on default `release`                  | 2.7–3.3 MB  | n/a              |
 | chosen + **dom v1** (2026-08-23, components re-summed) | **~2.42 MB**| ~2.58 MB         |
 
 ## Decisions
 
 - **html5ever over html5gum** (+~570 KB): buys the complete HTML5 tree-construction algorithm (insertion modes, foster parenting, adoption agency). html5gum is tokenizer-only; hand-rolling tree construction is weeks of fiddly spec work. Maturity wins under a 5MB budget.
 - **Tuned profile from day one**: default release costs +400–850KB for nothing. The flags are set once in the root Cargo.toml.
-- **native-tls, dynamically linked**: TLS lives in system `libssl.so.3`; we ship only glue (~482 KB tuned). Static rustls would add ~+2.0 MB — rejected. Consequence: target machine needs OpenSSL 3 installed (near-universal on Linux).
+- **native-tls, dynamically linked**: TLS lives in system `libssl.so.3`; we ship only glue (~482 KB tuned). Static rustls would add ~+2.0 MB: rejected. Consequence: target machine needs OpenSSL 3 installed (near-universal on Linux).
 - **panic = unwind kept**: abort saves only ~39 KB but kills `catch_unwind`, which every JS-exposed op needs so a Rust panic degrades to a JS error instead of unwinding through QuickJS's C frame.
-- **selectors later is cheap** — confirmed at the dom-v1 checkpoint: the whole dom layer (arena + selector engine + parser stack) measured +932 KB tuned, within ~2% of the html5ever+selectors estimates it subsumes (see Milestone section).
-- **Old servo stack (html5ever + selectors + cssparser as the _core_) was never the problem** — the old repo's total was bloat elsewhere. The parser swap alone does not hit 5MB; discipline at every milestone does.
+- **selectors later is cheap**, confirmed at the dom-v1 checkpoint: the whole dom layer (arena + selector engine + parser stack) measured +932 KB tuned, within ~2% of the html5ever+selectors estimates it subsumes (see Milestone section).
+- **Old servo stack (html5ever + selectors + cssparser as the _core_) was never the problem**: the old repo's total was bloat elsewhere. The parser swap alone does not hit 5MB; discipline at every milestone does.
 
 ## Watchlist (what can still blow the budget)
 
 - Children-representation collapse (inline/heap split → plain `Vec<NodeId>`,
-  2026-08-24, per ADR 0002): expected ≈0 binary impact — no dependency change;
+  2026-08-24, per ADR 0002): expected ≈0 binary impact (no dependency change);
   confirm at the next parse+query probe.
 
 - DOM→JS binding glue: hundreds of rquickjs classes add up; keep dispatch tables data-driven.

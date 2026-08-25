@@ -1,4 +1,4 @@
-//! `tinybrowser` — the smallest headless browser for AI agents.
+//! `tinybrowser`: the smallest headless browser for AI agents.
 //!
 //! Single binary, no sidecar processes; engine stops at DOM + JS.
 //! The embeddable surface lives here; CDP will arrive as its own crate.

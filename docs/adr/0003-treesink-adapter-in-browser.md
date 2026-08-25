@@ -12,7 +12,7 @@ ADR left unresolved:
 
 - Which crate hosts the sink (~330 lines including the public seam).
 - `TreeSink` 0.39 hands out `&self`, while every `Dom` mutation takes
-  `&mut self` — some interior mutability is unavoidable, in a workspace
+  `&mut self`; some interior mutability is unavoidable, in a workspace
   where `unsafe` is denied and ADR 0002 rejected `Rc<RefCell>` for the
   representation outright.
 - html5ever delivers adjacent text as separate `NodeOrText::AppendText`
@@ -60,7 +60,7 @@ ordinary children, so `children()` never lies about what traversal sees.
 - **Merging text inside `dom`**: taxes every caller's append path to serve
   one consumer's chunked input style.
 - **`UnsafeCell` with an invariant claim**: buys nothing over `RefCell`
-  here — no borrow needs to survive a call — and would spend the repo's
+  here (no borrow needs to survive a call) and would spend the repo's
   zero-`unsafe` budget on a non-problem.
 - **Template contents as ordinary children**: makes `children()` spec-wrong
   for exactly the elements whose contents scripts poke at.

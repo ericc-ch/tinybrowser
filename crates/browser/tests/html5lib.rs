@@ -10,7 +10,7 @@
 //! adoption agency, template contents).
 //!
 //! Gate policy (ADR 0005): a failing case either becomes a fix or a written
-//! acceptance before this milestone closes — no silent ignores.
+//! acceptance before this milestone closes: no silent ignores.
 
 // Test-crate roots resolve `mod` against `tests/`, so the helpers live in
 // their own directory next to this file, pinned explicitly.

@@ -4,7 +4,7 @@ Two tiers, ordered by what they catch: parse correctness against the
 spec-mandated tree, then unit/public-API tests for everything the suite
 cannot see.
 
-## Parse correctness: html5lib tree-construction suite — **landed 2026-08-25**
+## Parse correctness: html5lib tree-construction suite (**landed 2026-08-25**)
 
 Vendored as a pinned submodule (`third_party/html5lib-tests`, decisions and
 acceptances in
@@ -17,7 +17,7 @@ documented divergence. This was the standing open item from the dom-layer
 milestone; it covers exactly the misnesting/foster-parenting/adoption-agency
 traps hand-written fixtures miss.
 
-## Unit and public-API tests — landed
+## Unit and public-API tests (landed)
 
 - Arena mechanics: stale `NodeId` → clean miss, generation ticks on slot
   reuse, recycled slots never impersonate dead nodes.
@@ -27,7 +27,7 @@ traps hand-written fixtures miss.
   suites (`:checked`/`:disabled` inheritance, `:lang()` ranges, quirks-mode
   case regimes).
 - Mutation storms auditing bidirectional link invariants at every step.
-- Integration suites go through the public API only — no arena internals.
+- Integration suites go through the public API only: no arena internals.
 
 Verified at audit close: 73 tests green across the workspace, clippy pedantic
 `-D warnings` clean, rustfmt clean.

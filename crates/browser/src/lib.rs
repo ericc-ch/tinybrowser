@@ -30,7 +30,7 @@ pub struct Parsed {
     pub parse_errors: u32,
     /// `<template>` element → its contents fragment. Contents live *outside*
     /// the child list per spec ([ADR 0003](../../docs/adr/0003-treesink-adapter-in-browser.md)),
-    /// so this map is the only way to reach them — exactly like the
+    /// so this map is the only way to reach them, exactly like the
     /// `template.content` DOM property.
     pub template_contents: HashMap<Handle, Handle>,
 }
@@ -38,8 +38,8 @@ pub struct Parsed {
 /// Parses a full HTML document into a fresh [`Dom`] with the scripting flag
 /// enabled (the browser default).
 ///
-/// Broken markup is recovered exactly the way the HTML spec — and therefore
-/// every browser — mandates; that recovery is html5ever's job, not ours.
+/// Broken markup is recovered exactly the way the HTML spec, and therefore
+/// every browser, mandates; that recovery is html5ever's job, not ours.
 #[must_use]
 pub fn parse_html(input: &str) -> Parsed {
     parse_html_with_scripting(input, true)
@@ -66,7 +66,7 @@ pub fn parse_html_with_scripting(input: &str, scripting_enabled: bool) -> Parsed
 
 struct Sink {
     // `TreeSink` 0.39 hands out `&self`, while every `Dom` mutation needs
-    // `&mut self` — hence interior mutability at this one boundary. Sound
+    // `&mut self`; hence interior mutability at this one boundary. Sound
     // because the driver is single-threaded and never reenters the sink in
     // the middle of another call: borrows are short, sequential, and cannot
     // overlap. If one ever did overlap, that is an adapter bug and the
@@ -78,8 +78,8 @@ struct Sink {
     /// the child list per spec, so a side map keeps them out of `children()`.
     template_contents: RefCell<HashMap<Handle, Handle>>,
     /// Elements the tree builder flagged as
-    /// [HTML integration points](https://html.spec.whatwg.org/multipage/parsing.html#html-integration-point)
-    /// — `MathML` `annotation-xml` whose `encoding` makes HTML content parse
+    /// [HTML integration points](https://html.spec.whatwg.org/multipage/parsing.html#html-integration-point):
+    /// `MathML` `annotation-xml` whose `encoding` makes HTML content parse
     /// inside it. The builder asks back through
     /// [`TreeSink::is_mathml_annotation_xml_integration_point`] while deciding
     /// whether foreign-content tokens break out; the default answer (`false`)
@@ -291,7 +291,7 @@ impl TreeSink for Sink {
     }
 
     /// Answers the builder's integration-point question from the flag it
-    /// handed us at [`Sink::create_element`] time — per the
+    /// handed us at [`Sink::create_element`] time, per the
     /// [HTML integration point](https://html.spec.whatwg.org/multipage/parsing.html#html-integration-point)
     /// definition, an `annotation-xml` with `encoding="text/html"` (ASCII
     /// case-insensitive) or `"application/xhtml+xml"`.

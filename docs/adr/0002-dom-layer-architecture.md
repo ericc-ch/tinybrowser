@@ -4,7 +4,7 @@ Date: 2026-08-23
 Status: Accepted. Consolidates what were briefly three same-day records: the
 representation ADR, the parser-placement ADR (including its name-type and
 selector-dependency amendments), and the threading ticket. Reflects the
-post-review mechanics — two hostile review rounds tightened several claims
+post-review mechanics: two hostile review rounds tightened several claims
 before they were allowed to stand.
 
 ## Context
@@ -18,8 +18,8 @@ before they were allowed to stand.
 - QuickJS bindings are ahead: wrapper objects need small copyable handles
   whose death is detectable, not references fighting a foreign GC.
 - html5ever drives construction through `TreeSink` instructions (placement
-  decided below), running HTML5 algorithms — foster parenting, the adoption
-  agency — that move whole child runs between parents constantly.
+  decided below), running HTML5 algorithms (foster parenting, the adoption
+  agency) that move whole child runs between parents constantly.
 - The identity hazard: nodes die, slots get recycled, and an old label must
   never resolve to a stranger ("button handle suddenly names a span").
 - ADR 0001's charter row for `dom` was ambiguous about whether html5ever is a
@@ -30,19 +30,19 @@ before they were allowed to stand.
 ### Representation: generational arena
 
 - All nodes live in one flat `Vec<Slot>`; `Slot { generation: u32, node:
-  Option<Node> }`. Public handle: `NodeId { slot: u32, generation: u32 }` —
+  Option<Node> }`. Public handle: `NodeId { slot: u32, generation: u32 }`,
   `Copy`, comparable, hashable; the only value crossing crate boundaries.
 - Stale handles resolve via `Option`/`Result`, never panics. Reads distinguish
   childless (`Some(empty)`) from dead (`None`) where it matters.
 - Generations tick **exactly once per change of hands, at reallocation** in
-  `alloc`. Destruction empties a cell without ticking — emptiness alone kills
+  `alloc`. Destruction empties a cell without ticking; emptiness alone kills
   handles. One site owns the policy; arithmetic wraps (`wrapping_add`), and
   the residual ABA window (billions of recycles of one slot while an outside
   handle persists) is documented as accepted by design.
 - Slots are addressed by `u32`; allocation past `u32::MAX` slots is a defect
-  (`expect`) — hundreds of GB of RAM away, an impossible runtime condition
+  (`expect`): hundreds of GB of RAM away, an impossible runtime condition
   rather than an error to handle.
-- Each node embeds its children as ordered IDs in a plain `Vec<NodeId>` —
+- Each node embeds its children as ordered IDs in a plain `Vec<NodeId>`:
   one representation, no compaction machinery (the inline/heap experiment is
   recorded under Rejected alternatives).
 - Parent stored as `Option<NodeId>`; every mutation keeps the parent-pointer
@@ -57,7 +57,7 @@ before they were allowed to stand.
 - Suppression of auto-derived `Sync` is **structural**: a
   `_share_forbidden: PhantomData<Cell<()>>` field (`Cell<()>` is `Send` +
   `!Sync`). Derived silence was tried implicitly and review proved `Sync`
-  slipped through — hence an explicit marker whose deletion must be conscious.
+  slipped through, hence an explicit marker whose deletion must be conscious.
 - Zero locks anywhere. Rationale: one worker per page (parse → JS → report,
   sequential); QuickJS runtimes are single-threaded anyway; shared access buys
   nothing today and would tax every operation forever.
@@ -76,19 +76,19 @@ the boundary mechanics.
 
 ### Name types: pinned markup5ever re-export
 
-- `dom` depends on exactly `markup5ever = "=0.39.0"` — name types only
+- `dom` depends on exactly `markup5ever = "=0.39.0"`: name types only
   (`QualName`, `Namespace`, `LocalName`, `Prefix`), re-exported through dom's
   public API so consumers never touch markup5ever directly.
 - Pinning matches html5ever 0.39 exactly, so adapter code passes parser names
-  straight through as one type — no conversion layer, no duplicate `QualName`;
+  straight through as one type: no conversion layer, no duplicate `QualName`;
   element names are interned rather than copied per node.
 - `Attribute` remains dom's own type (`String` value, deliberately not
   `StrTendril`) so the tokenizer's buffer type leaks nowhere.
 
 *Amended 2026-08-23 (selector dependencies):* the "exactly one dependency"
 consequence was written while selectors were still deferred. When selector
-matching shipped as part of dom v1 — always placed *inside* `dom` by ADR
-0001's charter row — the
+matching shipped as part of dom v1 (always placed *inside* `dom` by ADR
+0001's charter row) the
 manifest grew by the Servo
 selector stack (`selectors`, its exact-version partner `cssparser`, plus
 `precomputed-hash` for the trait dom's name wrappers must implement).
@@ -106,8 +106,8 @@ not a dependency count; the stack's size cost is measured in
   bug-risk asymmetry.
 - **Inline/heap children split** *(tried 2026-08-23, reversed 2026-08-24)*:
   four inline `NodeId`s spilling once to heap compacted small fan-out but cost
-  40 in-record bytes versus 24 for a bare `Vec<NodeId>` — "compaction" made
-  every record fatter — and shipped one real out-of-bounds panic before any
+  40 in-record bytes versus 24 for a bare `Vec<NodeId>` ("compaction" made
+  every record fatter) and shipped one real out-of-bounds panic before any
   measured win: `insert` into a full inline array overran its own storage,
   reachable from ordinary foster-parented table text. Children reverted to a
   plain `Vec<NodeId>`; with the split went the spill-once/thrash machinery and
@@ -147,10 +147,10 @@ not a dependency count; the stack's size cost is measured in
 ## Consequences
 
 - Records carry their child lists by value, so they stay larger than
-  link-based layouts; accepted — no layout pass exists to squeeze them, RAM
+  link-based layouts; accepted: no layout pass exists to squeeze them, RAM
   delta is trivial next to QuickJS heaps, and traversal gets children IDs for
   free in the same cache lines.
-- Single-child splice is O(siblings) memmove of handles — irrelevant at real
+- Single-child splice is O(siblings) memmove of handles, irrelevant at real
   fan-out; bulk moves stay ordered-list operations.
 - Swapping any of this later is contained: everything travels through
   `NodeId`s and the whole representation lives in one module.

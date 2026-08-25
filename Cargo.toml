@@ -32,7 +32,7 @@ net = { workspace = true }
 
 # ─── Lints ────────────────────────────────────────────────────────────────────
 # Strict (not strict-strict): `all` is error, `pedantic`/`cargo` are warnings.
-# No `nursery` (experimental). No `allow` list — fix code instead of silencing.
+# No `nursery` (experimental). No `allow` list: fix code instead of silencing.
 # `restriction` lints are denied individually (blanket is banned by clippy).
 [workspace.lints.rust]
 unsafe_code = "deny"
@@ -52,7 +52,7 @@ cargo_common_metadata = { level = "allow", priority = 1 }
 # guessed, at every size checkpoint.
 multiple_crate_versions = { level = "allow", priority = 1 }
 
-# restriction — explicit, no blanket
+# restriction: explicit, no blanket
 todo = "deny"
 unimplemented = "deny"
 get_unwrap = "deny"

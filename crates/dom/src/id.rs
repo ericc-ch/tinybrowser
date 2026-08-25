@@ -5,7 +5,7 @@
 /// A `NodeId` is two integers: which slot of the arena to look in, and which
 /// generation of that slot the handle was issued for. When a node is destroyed
 /// its slot is recycled and the slot's generation ticks, so any handle issued
-/// earlier stops matching — every lookup then reports "gone" instead of
+/// earlier stops matching; every lookup then reports "gone" instead of
 /// returning some other node.
 ///
 /// Copy it freely, store it anywhere, hand it to JavaScript later. The only

@@ -1,7 +1,7 @@
 //! Node data kinds and attributes.
 //!
 //! Name types (`QualName`, `Namespace`, `LocalName`, `Prefix`) are
-//! `markup5ever`'s — re-exported here so callers never touch that crate
+//! `markup5ever`'s, re-exported here so callers never touch that crate
 //! directly. Sharing them means the future `TreeSink` adapter passes parser
 //! names straight through with no conversion, and element names are interned
 //! rather than copied per node.
@@ -22,7 +22,7 @@ pub fn html_namespace() -> Namespace {
 
 /// One attribute: a qualified name and its value.
 ///
-/// Deliberately *not* `markup5ever::Attribute` — that one stores its value as
+/// Deliberately *not* `markup5ever::Attribute`: that one stores its value as
 /// a `StrTendril`, which would leak the tokenizer's buffer type into every
 /// consumer of the tree. The adapter converts at the boundary.
 #[derive(Clone, Debug, PartialEq, Eq)]

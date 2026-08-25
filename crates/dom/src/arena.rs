@@ -10,7 +10,7 @@ use crate::node::{Attribute, Node, NodeKind, QualName};
 /// Why a mutation was refused.
 ///
 /// Stale handles and structural mistakes surface as values, never as panics,
-/// so future JS bindings can map them straight onto DOM exceptions — one
+/// so future JS bindings can map them straight onto DOM exceptions: one
 /// variant per exception class, not per call site.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DomError {
@@ -18,7 +18,7 @@ pub enum DomError {
     StaleNode,
     /// The move would place a node inside its own subtree. Browsers report
     /// this as `HierarchyRequestError` too, and the future js binding layer
-    /// must fold it into that same exception — kept distinct because
+    /// must fold it into that same exception, kept distinct because
     /// callers can only produce it deliberately.
     CycleForbidden,
     /// The tree's hierarchy or content model forbids the operation:
@@ -85,7 +85,7 @@ impl<'a> NodeRef<'a> {
 /// A document: every node lives inside one flat slot array.
 ///
 /// All access goes through [`NodeId`] handles. Handles outliving their node
-/// are harmless — lookups report absence — which is what will let the `QuickJS`
+/// are harmless (lookups report absence), which is what will let the `QuickJS`
 /// binding layer hold handles across garbage-collection cycles without
 /// borrowing anything.
 ///
@@ -100,7 +100,7 @@ pub struct Dom {
     document: NodeId,
     /// `Cell<()>` is `Send` + `!Sync`; `PhantomData` makes `Dom` inherit
     /// exactly that split. Deleting this field would silently re-derive
-    /// `Sync` — which is the point: that deletion has to be a conscious act.
+    /// `Sync`, which is the point: that deletion has to be a conscious act.
     _share_forbidden: PhantomData<Cell<()>>,
 }
 
@@ -139,7 +139,7 @@ impl Dom {
     /// Whether `id` names a currently live node.
     ///
     /// A destroyed node's handle fails here even though a different node may
-    /// later occupy the same slot — that is the whole point of generations.
+    /// later occupy the same slot; that is the whole point of generations.
     #[must_use]
     pub fn contains(&self, id: NodeId) -> bool {
         self.live_slot(id).is_some()
@@ -161,7 +161,7 @@ impl Dom {
 
     /// The children of `id` in document order, or `None` for a stale handle.
     ///
-    /// Mirrors DOM `childNodes`: every live node answers a list — leaves
+    /// Mirrors DOM `childNodes`: every live node answers a list; leaves
     /// (text, comment, doctype) answer an empty one because the mutation
     /// gate below refuses to give them children. Childless and dead remain
     /// different answers; only staleness is `None`.
@@ -175,7 +175,7 @@ impl Dom {
     /// A stable identity token for `id`, for selector-engine caches.
     ///
     /// One live node owns exactly one slot, and matching runs under a shared
-    /// borrow that freezes the arena — so the slot's address is unique per
+    /// borrow that freezes the arena, so the slot's address is unique per
     /// node and stable for the whole query. Detached nodes keep their slots,
     /// so identity survives detachment too.
     #[must_use]
@@ -185,9 +185,9 @@ impl Dom {
 
     /// Creates an element node, unattached until something appends it.
     ///
-    /// Attribute names are unique in the DOM — `NamedNodeMap` is keyed by
-    /// qualified name (<https://dom.spec.whatwg.org/#concept-attribute> —
-    /// "an attribute list is essentially a map of names to attributes") —
+    /// Attribute names are unique in the DOM: `NamedNodeMap` is keyed by
+    /// qualified name (<https://dom.spec.whatwg.org/#concept-attribute>,
+    /// "an attribute list is essentially a map of names to attributes"),
     /// so later duplicates are dropped and the first occurrence wins,
     /// matching the merge rule the parser drives through
     /// [`Dom::add_attrs_if_missing`]. Hand-built callers get the same
@@ -195,7 +195,7 @@ impl Dom {
     ///
     /// # Panics
     ///
-    /// Only if the arena exceeds `u32::MAX` slots — terabytes of RAM, not a
+    /// Only if the arena exceeds `u32::MAX` slots: terabytes of RAM, not a
     /// reachable runtime condition; the bound guards the handle width.
     pub fn create_element(&mut self, name: QualName, attributes: Vec<Attribute>) -> NodeId {
         let mut unique: Vec<Attribute> = Vec::with_capacity(attributes.len());
@@ -248,7 +248,7 @@ impl Dom {
 
     /// Creates an empty document fragment, unattached like every fresh node.
     ///
-    /// Fragments are containers outside the main tree — the contents root of
+    /// Fragments are containers outside the main tree: the contents root of
     /// `<template>` elements (the parser associates them via its own map) and,
     /// later, the context node for `innerHTML`-style fragment parsing.
     ///
@@ -267,7 +267,7 @@ impl Dom {
     /// # Panics
     ///
     /// Only on an internal invariant defect (a verified-live node missing its
-    /// child list) — never on user input; input failures return errors.
+    /// child list), never on user input; input failures return errors.
     ///
     /// # Errors
     ///
@@ -280,7 +280,7 @@ impl Dom {
     pub fn append(&mut self, parent: NodeId, child: NodeId) -> Result<(), DomError> {
         self.ensure_alive(parent, child)?;
         if child == self.document {
-            // The root must never gain a parent — that is how a document
+            // The root must never gain a parent; that is how a document
             // gets orphaned from itself. (Maps to HierarchyRequestError.)
             return Err(DomError::HierarchyRequest);
         }
@@ -303,14 +303,14 @@ impl Dom {
     /// Inserts `node` immediately before `sibling` under sibling's parent.
     ///
     /// Moving semantics, like [`Dom::append`]. Inserting a node beside
-    /// itself is a legal stay-put no-op — WHATWG DOM's *ensure pre-insert
-    /// validity* returns without doing anything in that case — not an
+    /// itself is a legal stay-put no-op (WHATWG DOM's *ensure pre-insert
+    /// validity* returns without doing anything in that case), not an
     /// error.
     ///
     /// # Panics
     ///
     /// Only on an internal invariant defect (a live sibling missing from its
-    /// own parent's list) — never on user input.
+    /// own parent's list), never on user input.
     ///
     /// # Errors
     ///
@@ -322,7 +322,7 @@ impl Dom {
     pub fn insert_before(&mut self, sibling: NodeId, node: NodeId) -> Result<(), DomError> {
         self.ensure_alive(sibling, node)?;
         // The reference child must sit under some parent to be inserted
-        // beside; a detached one has none — the outer pre-insert
+        // beside; a detached one has none: the outer pre-insert
         // algorithm's parent-null refusal (`NotFoundError`).
         let parent = self.parent(sibling).ok_or(DomError::NoParent)?;
         // Node-beside-itself means "stay put": the gate would reject this
@@ -352,7 +352,7 @@ impl Dom {
         Ok(())
     }
 
-    /// WHATWG DOM's *ensure pre-insert validity* — the one gate every
+    /// WHATWG DOM's *ensure pre-insert validity*: the one gate every
     /// insertion path walks (`append`, `insert_before`), mirroring
     /// <https://dom.spec.whatwg.org/#concept-node-ensure-pre-insert-validity>.
     /// Engine reference: Firefox's `EnsureAllowedAsChild` in
@@ -372,7 +372,7 @@ impl Dom {
     ) -> Result<(), DomError> {
         // The container-kind rule: only Document, DocumentFragment, and
         // Element nodes accept children. Character data and doctypes are
-        // leaves — a leaf with a child list is exactly the corruption
+        // leaves; a leaf with a child list is exactly the corruption
         // document-order matching once walked into (audit finding M5).
         //
         // Kind reads stay borrowed: this gate runs per insertion on the
@@ -413,7 +413,7 @@ impl Dom {
         }
         // Inside a document: splice `node` into the standing children at its
         // insertion point and hand the whole resulting sequence to the
-        // content model — the same single encoding the bulk-move path
+        // content model: the same single encoding the bulk-move path
         // answers to, where positional flag-scanning would duplicate the
         // invariant (and per-child checks cannot see a violating pair like
         // `[html, main]`).
@@ -461,13 +461,13 @@ impl Dom {
     /// adoption agency: order is preserved and each moved child's parent
     /// pointer is updated. Endpoints must be container kinds, and draining
     /// the document root is refused. For non-document destinations the
-    /// shape of the moved run stays unvalidated — the html5ever tree
+    /// shape of the moved run stays unvalidated: the html5ever tree
     /// builder's trusted internal flows (ADR 0003) never emit
     /// content-model violations, and gated insertion paths make smuggling
     /// impossible (a doctype can only ever sit directly under the root,
     /// so none can appear in a moved run). When `to` **is** the document,
     /// though, the full document content model applies to the *resulting*
-    /// sequence — see [`Dom::ensure_document_content_model`]. Validating
+    /// sequence; see [`Dom::ensure_document_content_model`]. Validating
     /// the moved children one-by-one would not be enough: a bulk move is
     /// one operation, and `[html, main]` into an empty document passes
     /// per-child while violating the model as a pair (subagent review
@@ -476,7 +476,7 @@ impl Dom {
     /// # Panics
     ///
     /// Only on an internal invariant defect (a verified-live node missing its
-    /// child list) — never on user input.
+    /// child list), never on user input.
     ///
     /// # Errors
     ///
@@ -552,7 +552,7 @@ impl Dom {
     /// divergence). Deliberately the *only* encoding of the model:
     /// incremental insertions arrive as their resulting sequence from
     /// [`Dom::ensure_pre_insert_validity`], bulk moves as the document's
-    /// standing children followed by the moved run — where per-child checks
+    /// standing children followed by the moved run, where per-child checks
     /// cannot see a violating pair like `[html, main]` (subagent review
     /// R3-2).
     fn ensure_document_content_model(&self, sequence: &[NodeId]) -> Result<(), DomError> {
@@ -728,7 +728,7 @@ impl Dom {
     /// Defect policy, like every other structural site in this module: `id`
     /// was verified live, so a `Some` parent must own a list and that list
     /// must name `id`. Parent-pointer/child-list divergence is arena
-    /// corruption — panicking beats silently producing a node with two
+    /// corruption; panicking beats silently producing a node with two
     /// parents (or none), which later mutations would compound.
     fn unlink_from_current_parent(&mut self, id: NodeId) {
         if let Some(old_parent) = self.parent(id) {
@@ -763,7 +763,7 @@ impl Dom {
     ///
     /// # Panics
     ///
-    /// Only when the arena would need more than `u32::MAX` slots — hundreds
+    /// Only when the arena would need more than `u32::MAX` slots: hundreds
     /// of GB of RAM, not a reachable runtime condition; the bound guards the
     /// handle width (`NodeId.slot` is a `u32`).
     fn alloc(&mut self, kind: NodeKind) -> NodeId {
@@ -787,7 +787,7 @@ impl Dom {
         // >4 billion slots (hundreds of GB of arena), an impossible runtime
         // condition rather than an error to handle. Generations wrap after
         // 2^32 recycles of one slot; that residual ABA window is accepted by
-        // design — exploiting it needs billions of death/reuse cycles on a
+        // design. Exploiting it needs billions of death/reuse cycles on a
         // single slot while some outside handle to that slot still exists.
         let slot = u32::try_from(self.slots.len())
             .expect("arena exhausted: >u32::MAX slots requires hundreds of GB of RAM");

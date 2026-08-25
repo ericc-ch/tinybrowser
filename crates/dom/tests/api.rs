@@ -1,6 +1,6 @@
 //! Public-API behavior of the dom layer.
 //!
-//! These tests go through `Dom`'s methods only — no private internals — so
+//! These tests go through `Dom`'s methods only (no private internals), so
 //! they double as executable documentation of the boundary contract.
 
 use dom::{Attribute, Dom, DomError, LocalName, Namespace, NodeId, NodeKind, QualName};
@@ -105,12 +105,12 @@ fn insert_before_head_and_document_are_handled() {
     let y = d.create_element(qn("y"), Vec::new());
 
     // The document node has no parent, so there is nothing to insert beside
-    // it — the spec's NotFoundError path (pre-insert: parent null).
+    // it: the spec's NotFoundError path (pre-insert: parent null).
     assert_eq!(d.insert_before(doc, x), Err(DomError::NoParent));
 
     d.append(doc, x).unwrap();
     // A document holds at most one element child, so a second element is
-    // refused even via insert_before — the old silent two-root tree (M4).
+    // refused even via insert_before: the old silent two-root tree (M4).
     assert_eq!(d.insert_before(x, y), Err(DomError::HierarchyRequest));
 
     // Comments, however, are welcome beside the document element.
@@ -207,7 +207,7 @@ fn destroy_recycles_slots_and_stales_every_handle_inside() {
 
 #[test]
 fn recycled_slots_never_impersonate_dead_nodes() {
-    // The button/span scenario from wayfinding: create, destroy, reuse —
+    // The button/span scenario from wayfinding: create, destroy, reuse;
     // the old handle must miss even though the slot number matches.
     let mut d = Dom::new();
     let doc = d.document();
@@ -532,7 +532,7 @@ fn insert_into_wide_list_lands_exactly() {
     );
 }
 
-/// xorshift64* — tiny, deterministic, good enough to scatter op choices.
+/// xorshift64*: tiny, deterministic, good enough to scatter op choices.
 fn storm_roll(state: &mut u64, n: u64) -> u64 {
     *state ^= *state << 13;
     *state ^= *state >> 7;
@@ -556,7 +556,7 @@ fn storm_pick(d: &Dom, tracked: &[NodeId], state: &mut u64) -> Option<NodeId> {
 /// bidirectional-link audit after every step.
 ///
 /// This is the property-style guard for the parent-pointer/child-list
-/// duality — the exact invariant class whose silent breakage a one-node-
+/// duality, the exact invariant class whose silent breakage a one-node-
 /// two-parents corruption would need (see `unlink_from_current_parent`'s
 /// defect policy). Seeded xorshift, so any failure reproduces exactly; no
 /// property-testing dependency, per the repo's dependency diet.
@@ -672,7 +672,7 @@ fn fragments_are_detached_containers() {
 
 // ── content model: the pre-insert gate (WHATWG ensure pre-insert validity) ──
 
-/// A document holds at most one element child — the spec throws
+/// A document holds at most one element child: the spec throws
 /// `HierarchyRequestError` for a second root
 /// (<https://dom.spec.whatwg.org/#concept-node-ensure-pre-insert-validity>).
 /// Before the gate this silently produced two roots, both of
@@ -733,7 +733,7 @@ fn doctype_placement_follows_the_content_model() {
 }
 /// Leaves are not parents: character data and doctypes refuse children with
 /// `HierarchyRequestError` (the gate's container-kind rule). This was audit
-/// finding M5 — the old code accepted the append and document-order matching
+/// finding M5: the old code accepted the append and document-order matching
 /// then walked the fake subtree.
 #[test]
 fn leaves_refuse_children_and_answer_empty_child_lists() {
@@ -778,7 +778,7 @@ fn documents_refuse_character_data() {
 /// path into a document. Before this gate, `reparent_children` was a
 /// one-call escape hatch around M4: it fabricated multi-root documents and
 /// character data under Document (subagent review R3-2). A run is validated
-/// as a *whole*, because per-child checks cannot see the pair — `[a, b]`
+/// as a *whole*, because per-child checks cannot see the pair: `[a, b]`
 /// into an empty document passes child-by-child and fails as a batch.
 ///
 /// Doctypes need no bulk-run test: gated insertion keeps them directly
@@ -852,12 +852,12 @@ fn reparent_children_into_a_document_honors_the_content_model() {
 }
 
 /// Fragments stay insertable as ordinary children in this tree. Note the
-/// deliberate divergence: a live DOM never *nests* a `DocumentFragment` —
+/// deliberate divergence: a live DOM never *nests* a `DocumentFragment`;
 /// its insertion algorithms splice the fragment's children into the parent
 /// instead. dom nests until the js layer needs splicing; the fragment
 /// clause of the document content model (>1 element child or any Text
 /// child makes a fragment uninsertable) belongs to that same splice work
-/// and rides with it — recorded as open finding L14.
+/// and rides with it, recorded as open finding L14.
 #[test]
 fn fragments_remain_legal_children() {
     let mut d = Dom::new();

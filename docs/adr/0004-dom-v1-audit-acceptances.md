@@ -2,8 +2,8 @@
 
 Date: 2026-08-25
 Status: Accepted. Consolidates the surviving open items of the dom v1 review
-rounds — two full-crate passes, an adversarial two-agent re-audit (21
-findings), and a follow-up diff review — into the permanent record, retiring
+rounds (two full-crate passes, an adversarial two-agent re-audit (21
+findings), and a follow-up diff review) into the permanent record, retiring
 the scratch paper trail. Every other finding those rounds raised landed:
 verified at close as 72 workspace tests green, clippy pedantic `-D warnings`
 clean, rustfmt clean.
@@ -11,8 +11,8 @@ clean, rustfmt clean.
 ## Context
 
 The audits ended with six findings deliberately not fixed. Each is a
-documented design acceptance — a known divergence from engine behavior or a
-bounded hazard — recorded with the condition that retires it, so later layers
+documented design acceptance, a known divergence from engine behavior or a
+bounded hazard, recorded with the condition that retires it, so later layers
 inherit decisions instead of rediscovering them as bugs.
 
 ## Accepted limitations
@@ -23,7 +23,7 @@ Appending a fragment to a live parent keeps the fragment node itself as the
 child. DOM insertion means the opposite: the standard's insert algorithm
 promotes a `DocumentFragment` to its children before placing anything
 ([dom spec](https://dom.spec.whatwg.org/#concept-node-insert)). No current
-caller depends on either semantics — template contents travel through the
+caller depends on either semantics; template contents travel through the
 sink's side map ([ADR 0003](0003-treesink-adapter-in-browser.md)), and the
 document content model already refuses illegal fragments on the way in.
 **Retires when:** the js layer implements real `appendChild`, which must
@@ -34,10 +34,10 @@ lands there too.
 
 ### Generation-wrap ABA
 
-A handle survives unless its slot recycles 2^32 times while held — billions
+A handle survives unless its slot recycles 2^32 times while held: billions
 of recycles of one slot against an outside observer. Accepted by design in
 [ADR 0002](0002-dom-layer-architecture.md)'s representation section (one tick
-site, wrapping arithmetic); the realistic case — one-recycle staleness — is
+site, wrapping arithmetic); the realistic case, one-recycle staleness, is
 pinned by `recycled_slots_never_impersonate_dead_nodes`. No trigger; revisit
 only on evidence.
 

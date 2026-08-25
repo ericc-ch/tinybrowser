@@ -98,7 +98,7 @@ fn parses_simple_document_with_implied_html_head_body() {
 #[test]
 fn recovers_from_crossed_tags_exactly_like_the_spec() {
     // Adoption-agency recovery: </b> fires while <p> is open. Outcome pinned
-    // against markup5ever_rcdom (same html5ever 0.39) via probe — the
+    // against markup5ever_rcdom (same html5ever 0.39) via probe; the
     // vendored html5lib suite is the long-term arbiter of such shapes.
     let parsed = parse_html("<b>1<p>2</b>3");
     let expected = "\
@@ -128,7 +128,7 @@ fn missing_doctype_selects_quirks_mode() {
 #[test]
 fn bogus_pi_markup_becomes_a_comment_per_spec() {
     // Modern HTML spec: `<?...>` hits "incorrectly-opened-comment" and the
-    // bogus-comment state swallows it verbatim — `create_pi` is never
+    // bogus-comment state swallows it verbatim; `create_pi` is never
     // involved for HTML documents.
     let parsed = parse_html("<?php echo 1 ?><html><body>x</body></html>");
     let d = &parsed.dom;

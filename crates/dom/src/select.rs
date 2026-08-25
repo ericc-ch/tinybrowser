@@ -1,10 +1,10 @@
 //! Selector matching over the arena, powered by Servo's `selectors` engine.
 //!
 //! Search takes a CSS selector string, compiles it against our name types,
-//! and walks descendants in document order — `querySelector` /
+//! and walks descendants in document order, `querySelector` /
 //! `querySelectorAll` semantics, minus boxes: known pseudo-elements parse
 //! like browsers' and match nothing (`qSA("p::before")` returns an empty
-//! list in every browser — MDN, "querySelectorAll"); unknown ones are
+//! list in every browser: MDN, "querySelectorAll"); unknown ones are
 //! refused, also as browsers refuse them.
 //!
 //! State pseudo-classes are defined here, not by the engine: `selectors`
@@ -17,7 +17,7 @@
 //! a headless tree (`:hover`, `:visited`, …), and anything outside both
 //! categories is refused at parse time, exactly as browsers refuse unknown
 //! names. A few states browsers *do* know (`:valid`/`:invalid`,
-//! `:open`/`:modal`, `:popover-open`) belong to neither bucket yet — they
+//! `:open`/`:modal`, `:popover-open`) belong to neither bucket yet; they
 //! measure models this tree does not have (constraint validation, dialog
 //! state) and stay refused until those models exist; the audit trail lists
 //! them rather than silently answering.
@@ -50,7 +50,7 @@ use crate::id::NodeId;
 use crate::node::{Attribute, NodeKind};
 use crate::state;
 
-/// The document-compatibility mode a query runs under — what html5ever's
+/// The document-compatibility mode a query runs under: what html5ever's
 /// tree builder reports and parsed pages carry.
 ///
 /// It changes exactly one matching behavior here: in full quirks mode,
@@ -155,7 +155,7 @@ atom_wrapper!(
     NsUrl(markup5ever::Namespace)
 );
 atom_wrapper!(
-    /// A namespace prefix (`svg|circle`) — never resolved; see [`SelectorLanguage`].
+    /// A namespace prefix (`svg|circle`): never resolved; see [`SelectorLanguage`].
     #[derive(Default)]
     NsPrefix(markup5ever::Prefix)
 );
@@ -189,7 +189,7 @@ impl ToCss for AttrValue {
 }
 
 impl PrecomputedHash for AttrValue {
-    // DJB2 (Daniel J. Bernstein): seed 5381, wrap-multiply by 33, add byte —
+    // DJB2 (Daniel J. Bernstein): seed 5381, wrap-multiply by 33, add byte,
     // the same constant recipe markup5ever's atoms use, so both sides of a
     // comparison hash alike.
     fn precomputed_hash(&self) -> u32 {
@@ -205,9 +205,9 @@ impl PrecomputedHash for AttrValue {
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum PseudoClass {
     // Hyperlinks (Selectors 4 §:link/:any-link; SVG2 for svg <a>).
-    /// `:link` / `:any-link` — a hyperlink: `a`/`area`/`link` with `href`.
+    /// `:link` / `:any-link`, a hyperlink: `a`/`area`/`link` with `href`.
     AnyLink,
-    /// `:link` — same hyperlink rule as [`PseudoClass::AnyLink`]; history
+    /// `:link`: same hyperlink rule as [`PseudoClass::AnyLink`]; history
     /// would only split them for `:visited`, which never matches here.
     Link,
     // Form-control UI states (HTML §pseudo-classes).
@@ -219,45 +219,45 @@ enum PseudoClass {
     ReadOnly,
     ReadWrite,
     PlaceholderShown,
-    /// `:default` — static subset: default checkedness/selectedness true
+    /// `:default`, static subset: default checkedness/selectedness true
     /// (`checked` checkbox/radio inputs, `selected` options); see
     /// [`crate::state::is_default`] for the deferred clause.
     Default,
-    /// `:indeterminate` — static subset: a `progress` without a value
+    /// `:indeterminate`, static subset: a `progress` without a value
     /// attribute; radio groups await the forms model.
     Indeterminate,
-    /// `:defined` — true except for valid-but-unregistered custom-element
+    /// `:defined`: true except for valid-but-unregistered custom-element
     /// names (HTML names containing `-`, minus the reserved set).
     Defined,
     // Inherited document-language states (Selectors 4).
-    /// `:lang(range…)` — nearest inherited `lang`, matched against each
+    /// `:lang(range…)`: nearest inherited `lang`, matched against each
     /// comma-separated range under RFC 4647 extended filtering.
     Lang(Vec<Box<str>>),
-    /// `:dir(direction)` — nearest inherited `dir`, `ltr` default.
+    /// `:dir(direction)`: nearest inherited `dir`, `ltr` default.
     Dir(Box<str>),
     // Vacuous states: real truth needs runtime context a headless tree
     // cannot have. They parse (browsers never throw on these) and match
     // nothing, exactly what a fresh page answers in a live browser.
-    /// `:visited` — no browsing history exists.
+    /// `:visited`: no browsing history exists.
     Visited,
-    /// `:hover` — there is no pointer.
+    /// `:hover`: there is no pointer.
     Hover,
-    /// `:active` — nothing is being pressed.
+    /// `:active`: nothing is being pressed.
     Active,
-    /// `:focus` — no focus owner until the js layer can hold one.
+    /// `:focus`: no focus owner until the js layer can hold one.
     Focus,
-    /// `:focus-within` — no focus owner to be inside of.
+    /// `:focus-within`: no focus owner to be inside of.
     FocusWithin,
-    /// `:focus-visible` — no focus heuristics without input events.
+    /// `:focus-visible`: no focus heuristics without input events.
     FocusVisible,
-    /// `:target` — no URL fragment is in play during a query.
+    /// `:target`: no URL fragment is in play during a query.
     Target,
-    /// `:in-range` / `:out-of-range` — need a live value and min/max model;
+    /// `:in-range` / `:out-of-range`: need a live value and min/max model;
     /// statically knowable only once numbers are parsed out of values, so
     /// deferred whole (subagent review R3-10).
     InRange,
     OutOfRange,
-    /// `:autofill` — autofill is a live UA activity, not markup.
+    /// `:autofill`: autofill is a live UA activity, not markup.
     Autofill,
 }
 
@@ -299,7 +299,7 @@ impl PseudoClass {
 
     /// Parses one functional pseudo-class argument out of an already-opened
     /// argument block (`(` consumed by the engine, closing delimiter
-    /// invisible to us — the nested parser reports end-of-input there).
+    /// invisible to us: the nested parser reports end-of-input there).
     ///
     /// Whitespace and comments inside the block are insignificant:
     /// `:lang( en )` parses like `:lang(en)` (Selectors 4 §whitespace).
@@ -308,7 +308,7 @@ impl PseudoClass {
         input: &mut CssParser<'i, '_>,
     ) -> Result<Self, cssparser::ParseError<'i, ParseFail>> {
         // One bare argument: an identifier, a quoted string, or a lone `*`
-        // wildcard (compound wildcards like `*-Cyrl` must be quoted — CSS
+        // wildcard (compound wildcards like `*-Cyrl` must be quoted; CSS
         // lexes an unquoted `*` as its own token, so the pieces would
         // arrive separately). Anything else is grammar misuse.
         let take_argument =
@@ -326,7 +326,7 @@ impl PseudoClass {
                 }
             };
         if name.eq_ignore_ascii_case("lang") {
-            // Comma-separated range list — Selectors 4's own example is
+            // Comma-separated range list: Selectors 4's own example is
             // `E:lang(sr, "*-Cyrl")`. Each range must be non-empty; empty
             // ranges match nothing under extended filtering, so accepting
             // them would only manufacture silent dead selectors.
@@ -438,8 +438,8 @@ impl ToCss for PseudoClass {
 /// Known pseudo-elements parse like browsers' and match nothing: real
 /// `querySelectorAll("p::before")` returns an empty list, never throws
 /// (MDN: "If the specified selectors include a CSS pseudo-element, the
-/// returned list is always empty"). dom creates no boxes — no layout, no
-/// generated content — so every variant refuses to match. Unknown names are
+/// returned list is always empty"). dom creates no boxes (no layout, no
+/// generated content), so every variant refuses to match. Unknown names are
 /// still refused at parse time, exactly as browsers refuse them.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PseudoElement {
@@ -516,7 +516,7 @@ impl SelectorImpl for Selectors {
 /// Parse-time policy: structural features on, state and pseudo-elements off.
 ///
 /// No default namespace is declared, so a bare type selector matches its
-/// local name in any namespace — standard CSS behavior absent `@namespace`.
+/// local name in any namespace, standard CSS behavior absent `@namespace`.
 #[derive(Debug, Default)]
 struct SelectorLanguage;
 
@@ -577,7 +577,7 @@ impl<'i> SelectorParser<'i> for SelectorLanguage {
     }
 }
 
-/// The class of a selector-parse failure — stable enough for programmatic
+/// The class of a selector-parse failure, stable enough for programmatic
 /// handling (`DOMException` mapping at the future js layer) without parsing
 /// text back.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -591,7 +591,7 @@ pub enum ParseFailKind {
     UnsupportedPseudo,
     /// An identifier appeared where only a selector may (`..x`).
     UnexpectedIdent,
-    /// A namespace prefix with no mapping (`svg|circle` — none exist here).
+    /// A namespace prefix with no mapping (`svg|circle`: none exist here).
     UnknownNamespacePrefix,
     /// Malformed pieces inside an attribute selector (`[href=]`).
     BadAttributeSelector,
@@ -606,7 +606,7 @@ pub enum ParseFailKind {
 /// plus the human-readable rendering of that specific failure.
 ///
 /// `selectors` ships no `Display` for its error kinds; [`SelectError::Syntax`]
-/// surfaces this type's text instead. The message stays stable per class —
+/// surfaces this type's text instead. The message stays stable per class;
 /// only the offending name varies.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ParseFail {
@@ -656,7 +656,7 @@ impl From<SelectorParseErrorKind<'_>> for ParseFail {
                 "pseudo-elements may not appear inside :is()/:where()".into(),
             ),
             // The engine's internal-state error is a defect indicator, not
-            // user grammar misuse — bucketing it as MisplacedFeature would
+            // user grammar misuse; bucketing it as MisplacedFeature would
             // mislead the future DOMException mapper (audit finding L12).
             K::InvalidState => (
                 ParseFailKind::MalformedInput,
@@ -740,7 +740,7 @@ impl<'a> DomElement<'a> {
     }
 
     /// First no-namespace attribute named `local`, under the element's case
-    /// regime. Delegates to [`crate::state::attr_value`] — the one home of
+    /// regime. Delegates to [`crate::state::attr_value`]: the one home of
     /// that policy, so `[href]` and `:link` can never drift apart again
     /// (subagent review R3-6).
     fn attr_value(&self, local: &str) -> Option<&'a str> {
@@ -764,7 +764,7 @@ impl Element for DomElement<'_> {
     /// Cache identity for nth-index/`:has` bookkeeping.
     ///
     /// Routed through the arena's slot storage: one live node owns one slot
-    /// and the shared borrow freezes addresses, so identity is exact — no
+    /// and the shared borrow freezes addresses, so identity is exact; no
     /// collisions between distinct elements, no aliasing of one element.
     fn opaque(&self) -> OpaqueElement {
         OpaqueElement::new(self.dom.cache_identity(self.id))
@@ -841,7 +841,7 @@ impl Element for DomElement<'_> {
 
     /// The engine pre-selects which spelling to ask about (lowercased for
     /// HTML in HTML documents), but hand-built trees are not obliged to hold
-    /// lowercased names the way a tokenized one does — so comparison routes
+    /// lowercased names the way a tokenized one does, so comparison routes
     /// through the shared case-regime policy, insensitive in both
     /// directions when we declared HTML-in-HTML.
     fn has_local_name(&self, local_name: &str) -> bool {
@@ -852,7 +852,7 @@ impl Element for DomElement<'_> {
         self.qual_name().is_some_and(|name| name.ns.as_ref() == ns)
     }
 
-    /// Same local name and namespace — the relation `nth-of-type` relies on.
+    /// Same local name and namespace: the relation `nth-of-type` relies on.
     fn is_same_type(&self, other: &Self) -> bool {
         match (self.qual_name(), other.qual_name()) {
             (Some(a), Some(b)) => {
@@ -923,7 +923,7 @@ impl Element for DomElement<'_> {
             // Vacuous set: the context these describe (browsing history,
             // URL fragment during a query, numeric range validation,
             // autofill activity) does not exist in a headless tree. A
-            // fresh page in a real browser answers the same way — no
+            // fresh page in a real browser answers the same way: no
             // matches.
             PseudoClass::Visited
             | PseudoClass::Hover
@@ -953,7 +953,7 @@ impl Element for DomElement<'_> {
         // No invalidation machinery exists here: queries are one-shot reads.
     }
 
-    /// `:link` / `:any-link` — a hyperlink in any namespace carrying an
+    /// `:link` / `:any-link`: a hyperlink in any namespace carrying an
     /// `href` (see `crate::state::is_hyperlink` for the spec citations).
     fn is_link(&self) -> bool {
         state::is_hyperlink(self.dom, self.id)
@@ -1018,7 +1018,7 @@ impl Element for DomElement<'_> {
 
 // ── Search ──────────────────────────────────────────────────────────────────
 
-/// Every descendant of `scope` in document order, scope itself excluded —
+/// Every descendant of `scope` in document order, scope itself excluded:
 /// the candidate set of a scoped query. Iterative (an explicit stack of
 /// child-list cursors), so tree depth costs nothing but bookkeeping.
 struct Descendants<'a> {
@@ -1119,7 +1119,7 @@ impl Dom {
     }
 
     /// Every descendant of `scope` matching the selector list, in document
-    /// order — `querySelectorAll` semantics. The scope node itself is not a
+    /// order: `querySelectorAll` semantics. The scope node itself is not a
     /// candidate; ancestors above it remain visible to combinators, exactly
     /// as in browsers.
     ///
@@ -1140,7 +1140,7 @@ impl Dom {
         Ok(self.find_matches(&list, scope, None, quirks_mode))
     }
 
-    /// The first matching descendant of `scope` in document order —
+    /// The first matching descendant of `scope` in document order:
     /// `querySelector` semantics. Stops scanning at the first hit.
     ///
     /// # Errors
@@ -1162,7 +1162,7 @@ impl Dom {
             .next())
     }
 
-    /// Whether one element matches the selector list — `Element.matches`
+    /// Whether one element matches the selector list: `Element.matches`
     /// semantics. Matching may walk this element's real ancestors and
     /// siblings, wherever it sits.
     ///

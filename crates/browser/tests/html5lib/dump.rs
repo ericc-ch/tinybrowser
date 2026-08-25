@@ -2,7 +2,7 @@
 //! compared byte-for-byte against the suite's `#document` sections.
 //!
 //! Format rules (upstream `tree-construction/README.md`): each node is one
-//! line — `| ` plus two spaces per ancestor above the document's children;
+//! line: `| ` plus two spaces per ancestor above the document's children;
 //! element attributes sort by local name and render as if they were first
 //! children; SVG/MathML elements and XLink/XML/XMLNS attributes carry a
 //! namespace designator prefix; template contents appear under a `content`
@@ -28,7 +28,7 @@ static XLINK_NS: LazyLock<dom::Namespace> = LazyLock::new(|| dom::Namespace::fro
 static XML_NS: LazyLock<dom::Namespace> = LazyLock::new(|| dom::Namespace::from(XML_NS_URL));
 static XMLNS_NS: LazyLock<dom::Namespace> = LazyLock::new(|| dom::Namespace::from(XMLNS_NS_URL));
 
-/// Dumps the children of `dom`'s document — the shape the suite expects for
+/// Dumps the children of `dom`'s document: the shape the suite expects for
 /// full-document parses. Template contents come from the parse result's side
 /// map, since they live outside every child list.
 pub fn dump_document(dom: &Dom, templates: &HashMap<NodeId, NodeId>) -> String {
