@@ -54,7 +54,14 @@ there; they had never actually been added).
 | ureq 3 (no built-in TLS) bridged to btls via `Agent::with_parts`, live dials incl. peet.ws echo | — | +1797 KB |
 | wreq 6.0.0-rc core (defaults) | — | +2545 KB |
 | wreq 6.0.0-rc + util presets | — | +3668 KB |
-| wreq 6.0.0-rc realistic (+cookies,gzip,brotli,zstd,preset) | — | +4020 KB |
+| wreq 6.0.0-rc realistic (+cookies,gzip,brotli,zstd,prefix,preset) | — | +4020 KB |
+| **url 2.x**, WHATWG parse incl. IDN host + join + serialize | — | +197 KB |
+| **tungstenite 0.30** (handshake feature only, no TLS), real loopback dial + frames + close | — | +184 KB |
+
+(url and tungstenite probed 2026-08-25 for the net-crate API effort
+(.scratch/net-crate/, decisions 04/06); same rustc 1.98.0, tuned profile,
+baseline re-measured at 290 KB — identical to the row above. In one binary
+they land +336 KB combined: ~53 KB shared-dependency overlap.)
 
 btls knob verification (safe API, sync over `std::net`, no tokio):
 `set_permute_extensions` shuffles extension order per connection, JA3 hash
@@ -94,28 +101,24 @@ standing truth.
   budget with CDP and a11y still unaccounted. Its patched-BoringSSL fork
   survives independently as the `btls`/`btls-sys` crate family (0.5.6),
   which is what the probe above exercises.
-- **Transport direction is open** (maintainer undecided as of 2026-08-25).
-  The measured option space is three shapes:
-  - *bare ureq + native-tls*: +490 KB net, ~2.5 MB stack. Fails the stealth
-    goal outright (OpenSSL fingerprint), passes only lenient gates.
-  - *ureq bridged to btls*: +1797 KB net, ~3.8 MB stack. No fork needed
-    (`Agent::with_parts`); chrome-ish TLS knobs flip some gates today, but
-    h1-only ALPN and lowercase header names cap it against Akamai-class
-    scoring.
-  - *hand-rolled sync HTTP/1.1+h2 on btls* (HPACK, framing, cookie jar,
-    persona presets on `std::net`, no async runtime): ≈1.3–1.7 MB net,
-    ≈3.6–3.7 MB stack, the only shape that reaches canonical-Chrome wire
-    behavior within budget.
-  Evidence, trade-offs, and the live matrix behind this are collected in
-  [.scratch/net-transport/open-decision.md](../../.scratch/net-transport/open-decision.md);
-  the ADR lands when the maintainer picks.
+- **Transport direction closed** (maintainer decision, 2026-08-25,
+  [ADR 0006](adr/0006-net-transport.md)): net v1 ships as *bare ureq +
+  native-tls* (+490 KB net, ~2.5 MB stack, 9/16 gates). Stealth is deferred,
+  not dropped: canonical-Chrome wire behavior stays the target, owned by the
+  later *hand-rolled h1/h2 on btls* milestone (≈1.3–1.7 MB net, the only
+  shape reaching it within budget). The *ureq→btls bridge* shape (+1797 KB,
+  h1-only ceiling) was declined — it buys neither ship-soonest nor
+  coherence. Full evidence and per-shape gate scores are in the ADR; the
+  sizes stay in the probe table above.
 - **ureq-over-btls bridging needs no vendoring**: ureq exposes
   `Agent::with_parts(config, connector, resolver)` for bespoke Connectors;
   the bridge is ~130 lines in our own crate. Fork/absorb becomes relevant
   only for internals (case-preserving headers, hosting an h2 stack inside
-  ureq's transport model), which is part of the open decision.
-- The earlier native-tls decision above stays recorded as history; its
-  rationale predates the stealth requirement and does not survive it.
+  ureq's transport model). Dormant now that the bridge shape is declined;
+  relevant again only if the deferred stealth milestone wants it.
+- The earlier native-tls decision above is reinstated for net v1 by
+  [ADR 0006](adr/0006-net-transport.md), with the stealth objection to it
+  deferred alongside the goal itself (see the ADR).
 
 ## Stack totals (tuned profile)
 
@@ -132,7 +135,7 @@ standing truth.
 
 - **html5ever over html5gum** (+~570 KB): buys the complete HTML5 tree-construction algorithm (insertion modes, foster parenting, adoption agency). html5gum is tokenizer-only; hand-rolling tree construction is weeks of fiddly spec work. Maturity wins under a 5MB budget.
 - **Tuned profile from day one**: default release costs +400–850KB for nothing. The flags are set once in the root Cargo.toml.
-- **native-tls, dynamically linked**: TLS lives in system `libssl.so.3`; we ship only glue (~482 KB tuned). Static rustls would add ~+2.0 MB: rejected. Consequence: target machine needs OpenSSL 3 installed (near-universal on Linux). *(2026-08-25: superseded by the stealth requirement; an OpenSSL ClientHello is one of the most-flagged fingerprints, see the net transport probes milestone. The row stays for its size data.)*
+- **native-tls, dynamically linked**: TLS lives in system `libssl.so.3`; we ship only glue (~482 KB tuned). Static rustls would add ~+2.0 MB: rejected. Consequence: target machine needs OpenSSL 3 installed (near-universal on Linux). *(2026-08-25: superseded within the day by the stealth requirement — its probes showed an OpenSSL ClientHello among the most-flagged fingerprints — then reinstated for net v1 by [ADR 0006](adr/0006-net-transport.md) with stealth deferred to the hand-rolled-btls milestone. The objection returns when that milestone does.)*
 - **panic = unwind kept**: abort saves only ~39 KB but kills `catch_unwind`, which every JS-exposed op needs so a Rust panic degrades to a JS error instead of unwinding through QuickJS's C frame.
 - **selectors later is cheap**, confirmed at the dom-v1 checkpoint: the whole dom layer (arena + selector engine + parser stack) measured +932 KB tuned, within ~2% of the html5ever+selectors estimates it subsumes (see Milestone section).
 - **Old servo stack (html5ever + selectors + cssparser as the _core_) was never the problem**: the old repo's total was bloat elsewhere. The parser swap alone does not hit 5MB; discipline at every milestone does.
@@ -146,5 +149,5 @@ standing truth.
 - DOM→JS binding glue: hundreds of rquickjs classes add up; keep dispatch tables data-driven.
 - CDP server: tokio-tungstenite-style async stack is expensive; prefer a lean HTTP+WebSocket impl on `std::net`.
 - A11y walker (accname computation, role mapping): budget ~100–200 KB, fine, but measure.
-- If net lands on btls: pin the crate family like html5ever (its BoringSSL fork is wreq-ecosystem); impersonation presets go stale with every Chrome release — a stale preset is itself a detection signal, so bump discipline applies to persona tables, not just crates.
+- When the deferred stealth milestone lands net on btls ([ADR 0006](adr/0006-net-transport.md)): pin the crate family like html5ever (its BoringSSL fork is wreq-ecosystem); impersonation presets go stale with every Chrome release — a stale preset is itself a detection signal, so bump discipline applies to persona tables, not just crates.
 - Re-measure marginals at every milestone; regressions must justify themselves in bytes.
