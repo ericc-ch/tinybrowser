@@ -65,6 +65,25 @@ First full run: **16 divergences in 3165 cases**. Oracle-tested against
   reason inline; **retires when the html5ever pin moves past the gap** or we
   implement the clone ourselves.
 
+### Upstream consolidation: the living suite moved to web-platform-tests
+
+In June 2026 upstream moved tree-construction maintenance into
+[web-platform-tests](https://github.com/web-platform-tests/wpt/tree/master/html/syntax/parsing)
+— same `.dat` format, owned directly in-tree under `resources/`, with the
+format README moved verbatim and Firefox dropping its html5lib-tests
+tracking the same week. Our submodule therefore pins a *frozen* repo:
+correct and stable, but it receives no new tests.
+
+**Planned migration (lands with the js milestone):** repoint the harness at
+WPT's `html/syntax/parsing/resources/*.dat` as part of adopting WPT
+properly — the point at which its testharness wrappers (`html5lib_write.html`
+et al., exercising `document.write` streaming) become runnable here for the
+first time. The mechanical cost is small by design: `suite_dir()` changes
+path, `dat.rs`/`dump.rs` stay identical, and whatever the file-set delta is
+gets triaged under the same fix-or-document gate. Until then the frozen pin
+trades freshness for zero churn against a ~2.6 GB monorepo whose bumps would
+drag unrelated movement into every review.
+
 ## Consequences
 
 - Trait-default audit (what else was silently answering defaults): 

@@ -18,6 +18,11 @@ the binary; it exists so tests are reproducible and offline-capable.
   `cargo test`; the harness fails loudly with that instruction otherwise.
 - **Updating**: move the submodule pin, rerun the harness, and apply the
   fix-or-document rule from `docs/testing.md` to every new divergence.
+- **Successor**: upstream maintenance moved to web-platform-tests —
+  `wpt/html/syntax/parsing/resources/*.dat`, same format, README included.
+  This pin is frozen and receives nothing new; the plan is to repoint the
+  harness at WPT when the js layer lands (ADR 0005, "Upstream
+  consolidation"). Until then this pin stays authoritative.
 
 ### Known exclusions
 

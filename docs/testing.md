@@ -35,4 +35,5 @@ Verified at audit close: 73 tests green across the workspace, clippy pedantic
 ## Explicitly deferred
 
 - Full web-platform-tests corpus: needs harness machinery that belongs to
-  later layers; adopt once js exists.
+  later layers; adopt once js exists. The parser suite's `.dat` source
+  moves to WPT at the same time (ADR 0005, "Upstream consolidation").
