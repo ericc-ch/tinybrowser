@@ -35,6 +35,88 @@ against the result.
 
 Against the pre-measurement estimate for the same stack (+941 KB +115 KB = +1056 KB release / +840 KB +75 KB = +915 KB tuned): tuned landed within ~2% (+17 KB); release ran +216 KB over; the delta carries dom's own storage/search code plus query execution, which the estimates omitted. Accepted: no regression to justify.
 
+## Milestone: net transport probes (2026-08-25)
+
+The stealth requirement landed before net v1: bot blockers (Cloudflare and
+alike) fingerprint three layers, TLS ClientHello (JA3/JA4), HTTP/2
+settings/pseudo-header order, and header set/order, so "bytes in, bytes out"
+must mean *browser-shaped* bytes. Probes dial `example.com` or
+`tls.peet.ws/api/all` live; rustc 1.98.0; tuned profile as committed to the
+root Cargo.toml this same day (the doc previously claimed those flags lived
+there; they had never actually been added).
+
+| Component | default `release` | tuned¹ |
+| ------------------------------------------------- | ---------------- | ------- |
+| baseline (empty main, re-measured) | 345 KB / 290 KB | 290 KB |
+| ureq 3 + native-tls (dyn libssl.so.3), real dial | — | +490 KB |
+| boring 4 raw TLS, handshake only | — | +1220 KB |
+| **btls 0.5.6 standalone**, peet.ws JA4 round-trip | — | +1302 KB |
+| ureq 3 (no built-in TLS) bridged to btls via `Agent::with_parts`, live dials incl. peet.ws echo | — | +1797 KB |
+| wreq 6.0.0-rc core (defaults) | — | +2545 KB |
+| wreq 6.0.0-rc + util presets | — | +3668 KB |
+| wreq 6.0.0-rc realistic (+cookies,gzip,brotli,zstd,preset) | — | +4020 KB |
+
+btls knob verification (safe API, sync over `std::net`, no tokio):
+`set_permute_extensions` shuffles extension order per connection, JA3 hash
+varies run-to-run while JA4 stays stable, exactly the Chrome 110+ behavior;
+`set_grease_enabled` applies; `set_curves_list` accepts `X25519MLKEM768` and
+offers group 4588 first with a real key share, matching current Chrome. The
+default ClientHello is recognizably non-browser (`t13d2811h1_257f3020b3a2`)
+until persona presets are fed in, which is expected; preset data is work,
+not risk.
+
+### Live-gate matrix snapshot (2026-08-25)
+
+Sixteen real targets across vendors (Cloudflare, Akamai, HUMAN,
+PerimeterX, Kasada) driven by three throwaway client builds matching the
+option space below; full methodology, target list, and verdict rules live in
+[testing.md](testing.md). Headline results:
+
+- Bare ureq+native-tls clears 9/16; the OpenSSL fingerprint (`t13d3011_…`,
+  no ALPN) hard-fails tjx, bangkokair, stockx, zillow, bestbuy.
+- The ureq+btls bridge clears 10/16: chrome-ish TLS knobs alone flipped
+  zillow from 403 to 200, but h1-only ALPN and lowercase headers still lose
+  tjx/bangkokair/bestbuy/stockx.
+- Full impersonation coherence (wreq Chrome148, stand-in for the hand-rolled
+  client's wire behavior) clears 11 plus 3 ambiguous redirect flows, and is
+  the only column presenting canonical Chrome (`t13d1516h2_8daaf6152771`)
+  while speaking h2 end-to-end.
+- g2.com and canadagoose blocked all three columns identically: that layer
+  is IP reputation, outside any client's reach.
+
+Cells rot per site per day; treat the matrix as a checkpoint method, not a
+standing truth.
+
+### Decision consequences
+
+- **wreq rejected wholesale** (review decision, 2026-08-25): the realistic
+  configuration (+4020 KB) puts the full stack at ~6.0 MB against the 5 MB
+  budget with CDP and a11y still unaccounted. Its patched-BoringSSL fork
+  survives independently as the `btls`/`btls-sys` crate family (0.5.6),
+  which is what the probe above exercises.
+- **Transport direction is open** (maintainer undecided as of 2026-08-25).
+  The measured option space is three shapes:
+  - *bare ureq + native-tls*: +490 KB net, ~2.5 MB stack. Fails the stealth
+    goal outright (OpenSSL fingerprint), passes only lenient gates.
+  - *ureq bridged to btls*: +1797 KB net, ~3.8 MB stack. No fork needed
+    (`Agent::with_parts`); chrome-ish TLS knobs flip some gates today, but
+    h1-only ALPN and lowercase header names cap it against Akamai-class
+    scoring.
+  - *hand-rolled sync HTTP/1.1+h2 on btls* (HPACK, framing, cookie jar,
+    persona presets on `std::net`, no async runtime): ≈1.3–1.7 MB net,
+    ≈3.6–3.7 MB stack, the only shape that reaches canonical-Chrome wire
+    behavior within budget.
+  Evidence, trade-offs, and the live matrix behind this are collected in
+  [.scratch/net-transport/open-decision.md](../../.scratch/net-transport/open-decision.md);
+  the ADR lands when the maintainer picks.
+- **ureq-over-btls bridging needs no vendoring**: ureq exposes
+  `Agent::with_parts(config, connector, resolver)` for bespoke Connectors;
+  the bridge is ~130 lines in our own crate. Fork/absorb becomes relevant
+  only for internals (case-preserving headers, hosting an h2 stack inside
+  ureq's transport model), which is part of the open decision.
+- The earlier native-tls decision above stays recorded as history; its
+  rationale predates the stealth requirement and does not survive it.
+
 ## Stack totals (tuned profile)
 
 | Stack                                                  | Total       | Headroom to 5 MB |
@@ -43,12 +125,14 @@ Against the pre-measurement estimate for the same stack (+941 KB +115 KB = +1056
 | same but html5gum instead                              | 1.73 MB     | ~3.27 MB         |
 | any of the above on default `release`                  | 2.7–3.3 MB  | n/a              |
 | chosen + **dom v1** (2026-08-23, components re-summed) | **~2.42 MB**| ~2.58 MB         |
+| dom v1 + quickjs + **net on btls, hand-rolled h1/h2** (est., pending preset work, see 2026-08-25 probes) | ~3.6–3.7 MB | ~1.3–1.4 MB |
+| dom v1 + quickjs + **net as ureq bridged to btls** (measured bridge) | ~3.8 MB | ~1.2 MB |
 
 ## Decisions
 
 - **html5ever over html5gum** (+~570 KB): buys the complete HTML5 tree-construction algorithm (insertion modes, foster parenting, adoption agency). html5gum is tokenizer-only; hand-rolling tree construction is weeks of fiddly spec work. Maturity wins under a 5MB budget.
 - **Tuned profile from day one**: default release costs +400–850KB for nothing. The flags are set once in the root Cargo.toml.
-- **native-tls, dynamically linked**: TLS lives in system `libssl.so.3`; we ship only glue (~482 KB tuned). Static rustls would add ~+2.0 MB: rejected. Consequence: target machine needs OpenSSL 3 installed (near-universal on Linux).
+- **native-tls, dynamically linked**: TLS lives in system `libssl.so.3`; we ship only glue (~482 KB tuned). Static rustls would add ~+2.0 MB: rejected. Consequence: target machine needs OpenSSL 3 installed (near-universal on Linux). *(2026-08-25: superseded by the stealth requirement; an OpenSSL ClientHello is one of the most-flagged fingerprints, see the net transport probes milestone. The row stays for its size data.)*
 - **panic = unwind kept**: abort saves only ~39 KB but kills `catch_unwind`, which every JS-exposed op needs so a Rust panic degrades to a JS error instead of unwinding through QuickJS's C frame.
 - **selectors later is cheap**, confirmed at the dom-v1 checkpoint: the whole dom layer (arena + selector engine + parser stack) measured +932 KB tuned, within ~2% of the html5ever+selectors estimates it subsumes (see Milestone section).
 - **Old servo stack (html5ever + selectors + cssparser as the _core_) was never the problem**: the old repo's total was bloat elsewhere. The parser swap alone does not hit 5MB; discipline at every milestone does.
@@ -62,4 +146,5 @@ Against the pre-measurement estimate for the same stack (+941 KB +115 KB = +1056
 - DOM→JS binding glue: hundreds of rquickjs classes add up; keep dispatch tables data-driven.
 - CDP server: tokio-tungstenite-style async stack is expensive; prefer a lean HTTP+WebSocket impl on `std::net`.
 - A11y walker (accname computation, role mapping): budget ~100–200 KB, fine, but measure.
+- If net lands on btls: pin the crate family like html5ever (its BoringSSL fork is wreq-ecosystem); impersonation presets go stale with every Chrome release — a stale preset is itself a detection signal, so bump discipline applies to persona tables, not just crates.
 - Re-measure marginals at every milestone; regressions must justify themselves in bytes.
