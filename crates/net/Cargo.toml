@@ -5,3 +5,18 @@ edition.workspace = true
 
 [lints]
 workspace = true
+
+[dependencies]
+# ADR 0006: v1 transport is bare ureq 3. Default features stay OFF: no TLS
+# until ticket 12 wires native-tls, no cookies (we own the jar above the
+# transport, ticket 13), no charset decoding (rejected by decision 02 —
+# keeps encoding_rs out of the binary). Plain http:// needs zero features.
+ureq = { version = "3", default-features = false }
+# Decision 04: servo's url crate at the entry; relative resolution lives in
+# browser, net only ever sees absolute URLs.
+url = "2"
+
+[dev-dependencies]
+# Property tests for pure domain modules (decision 10). Dev-only: never in
+# the shipped binary.
+proptest = "1"
