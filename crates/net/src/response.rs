@@ -164,11 +164,10 @@ impl Response {
         &self.headers
     }
 
-    /// The URL this response belongs to: the request URL, fragment included.
-    /// The fragment never goes on the wire
+    /// The URL this response belongs to after redirect following: the
+    /// last hop's URL, fragment included (inherited from the request when
+    /// `Location` had none). The fragment never goes on the wire
     /// ([fetch #http-network-or-cache-fetch](https://fetch.spec.whatwg.org/#http-network-or-cache-fetch)).
-    /// Redirect hops that change the URL are `browser`'s job; this crate
-    /// reports the URL of the single hop it dialed.
     #[must_use]
     pub fn final_url(&self) -> &Url {
         &self.final_url

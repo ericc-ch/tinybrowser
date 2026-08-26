@@ -2,9 +2,17 @@
 
 use std::time::Duration;
 
+use std::sync::{Arc, Mutex};
+
+use crate::cookie::{CookieJar, CookieOp, RetrievalKind};
+use crate::error::{NetError, ProtocolError};
 use crate::method::Method;
 use crate::request::RequestBuilder;
 use url::Url;
+
+/// Chrome's follow cap (fetch #http-redirect-fetch uses 20; matching the
+/// fingerprint target costs nothing versus ureq's default of 10).
+const DEFAULT_MAX_REDIRECTS: u32 = 20;
 
 /// Builder for [`Agent`] configuration (decision 02: config lives on the
 /// agent; per-request overrides deferred until a consumer demands them).
@@ -19,6 +27,10 @@ pub struct AgentBuilder {
     user_agent: Option<String>,
     timeout_global: Option<Duration>,
     timeout_per_call: Option<Duration>,
+    max_redirects: u32,
+    /// HTTP CONNECT authority, parsed by [`AgentBuilder::proxy`]. `None`
+    /// means no proxy (and environment `HTTP_PROXY` stays ignored).
+    proxy: Option<String>,
 }
 
 impl Default for AgentBuilder {
@@ -35,6 +47,8 @@ impl AgentBuilder {
             user_agent: None,
             timeout_global: None,
             timeout_per_call: None,
+            max_redirects: DEFAULT_MAX_REDIRECTS,
+            proxy: None,
         }
     }
 
@@ -58,39 +72,74 @@ impl AgentBuilder {
         self
     }
 
-    /// Time budget that resets at each backend call (ureq's per-call knob).
-    /// Redirect following is not this crate's job; `browser` owns that loop.
+    /// Time budget that resets at each backend call (ureq's per-call knob),
+    /// including each redirect hop `send()` follows.
     #[must_use]
     pub fn timeout_per_call(mut self, timeout: Duration) -> Self {
         self.timeout_per_call = Some(timeout);
         self
     }
 
+    /// How many `Location` hops `send()` will follow.
+    ///
+    /// Default **20** (Chrome / fetch #http-redirect-fetch). `0` means a
+    /// 3xx with `Location` is itself the final response (decision 02).
+    /// Exceeding a positive cap yields
+    /// [`NetError::Limit`](crate::NetError::Limit)`(`
+    /// [`LimitExceeded::Redirect`](crate::LimitExceeded::Redirect)`)`.
+    #[must_use]
+    pub fn max_redirects(mut self, max_redirects: u32) -> Self {
+        self.max_redirects = max_redirects;
+        self
+    }
+
+    /// Route every dial through an HTTP CONNECT proxy.
+    ///
+    /// The string is an `http://` authority (`http://user:pass@host:port`
+    /// or `http://host:port`). SOCKS stays off until measured (ticket 08);
+    /// environment `HTTP_PROXY` is never read.
+    ///
+    /// # Errors
+    ///
+    /// [`NetError::Protocol`](crate::NetError::Protocol)`(`
+    /// [`ProtocolError::InvalidProxy`](crate::ProtocolError::InvalidProxy)`)`
+    /// when the string is not a usable `http://` URI.
+    pub fn proxy(mut self, authority: &str) -> Result<Self, NetError> {
+        let parsed = Url::parse(authority).map_err(|_| invalid_proxy())?;
+        if parsed.scheme() != "http" || parsed.host_str().is_none() {
+            return Err(invalid_proxy());
+        }
+        // The backend parser is the conversion point for this knob: if it
+        // cannot represent a URI we already accepted as `http://host`, the
+        // caller still sees InvalidProxy rather than a later send() surprise.
+        ureq::Proxy::new(authority).map_err(|_| invalid_proxy())?;
+        self.proxy = Some(authority.to_owned());
+        Ok(self)
+    }
+
     /// Materialize the agent.
     ///
     /// The backend seam lives here too: this is the only place ureq's
     /// config is shaped (`http_status_as_error(false)` is decision 02's
-    /// statuses-as-data, set once at construction).
+    /// statuses-as-data, set once at construction). Redirect following is
+    /// ours (`max_redirects(0)` on the backend); TLS is native-tls, never
+    /// the rustls default ureq would pick if a feature leaked in.
     #[must_use]
     pub fn build(self) -> Agent {
         // Decision 02: net sends only headers we build ourselves. Every
         // backend-injected default is suppressed — a stray `ureq/3.4.0`
         // user-agent, an `Accept-Encoding: gzip` we cannot honor, or an
         // `HTTP_PROXY` picked up from the process environment would be
-        // wire behavior we don't own. Ticket 08's explicit proxy knob is
-        // still ahead; until it lands, proxy stays off. UA layering lives
-        // in `send()`, so the backend auto-header is None here too.
+        // wire behavior we don't own. UA layering lives in `send()`, so
+        // the backend auto-header is None here too.
         // Fetch-accurate extension methods (`patch`, `propfind`) need
         // `allow_non_standard_methods`: ureq's default `verify_version`
         // whitelist would otherwise refuse them.
-        // Redirect following belongs to `browser` (fetch
-        // #http-redirect-fetch). The backend returns 3xx as data
-        // (`max_redirects(0)`).
+        // Proxy is applied in [`crate::dial::open`], not by ureq — otherwise
+        // CONNECT would run twice.
         let config = ureq::config::Config::builder()
             .http_status_as_error(false)
             .max_redirects(0)
-            // Option-valued knobs pass straight through; None keeps backend
-            // defaults (no timeouts configured).
             .timeout_global(self.timeout_global)
             .timeout_per_call(self.timeout_per_call)
             .user_agent(ureq::config::AutoHeaderValue::None)
@@ -98,22 +147,57 @@ impl AgentBuilder {
             .accept_encoding(ureq::config::AutoHeaderValue::None)
             .proxy(None)
             .allow_non_standard_methods(true)
+            .tls_config(
+                ureq::tls::TlsConfig::builder()
+                    .provider(ureq::tls::TlsProvider::NativeTls)
+                    .build(),
+            )
             .build();
+        let inner = ureq::Agent::with_parts(
+            config,
+            crate::connector::NetConnector {
+                proxy: self.proxy.clone(),
+                timeout: self.timeout_per_call.or(self.timeout_global),
+            },
+            crate::connector::DialResolver,
+        );
         Agent {
-            inner: config.new_agent(),
+            inner,
             ua: self.user_agent,
+            max_redirects: self.max_redirects,
+            jar: Arc::new(Mutex::new(CookieJar::default())),
+            proxy: self.proxy,
+            timeout: self.timeout_per_call.or(self.timeout_global),
         }
     }
+}
+
+fn invalid_proxy() -> NetError {
+    NetError::Protocol(ProtocolError::InvalidProxy)
 }
 
 /// One connection pool plus its config: the object callers hold to dial.
 ///
 /// Cheap to clone (the backend pool is shared through an interior Arc);
 /// each clone dials through the same pool.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct Agent {
     pub(super) inner: ureq::Agent,
     pub(super) ua: Option<String>,
+    pub(super) max_redirects: u32,
+    pub(super) jar: Arc<Mutex<CookieJar>>,
+    pub(super) proxy: Option<String>,
+    pub(super) timeout: Option<Duration>,
+}
+
+impl std::fmt::Debug for Agent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Agent")
+            .field("max_redirects", &self.max_redirects)
+            .field("has_proxy", &self.proxy.is_some())
+            .field("jar", &self.jar)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Agent {
@@ -133,6 +217,44 @@ impl Agent {
     #[must_use]
     pub fn request(&self, method: Method, url: Url) -> RequestBuilder {
         RequestBuilder::new(self.clone(), method, url)
+    }
+
+    /// Cookie-string for `uri` as `document.cookie` would see it
+    /// ([RFC 6265bis §5.8.2](https://httpwg.org/http-extensions/draft-ietf-httpbis-rfc6265bis.html#name-non-http-apis)):
+    /// `HttpOnly` cookies are omitted; `Secure` cookies omit on cleartext URIs.
+    #[must_use]
+    pub fn cookies_for(&self, uri: &Url) -> String {
+        self.jar
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .cookie_string(CookieOp {
+                url: uri,
+                now: std::time::SystemTime::now(),
+                kind: RetrievalKind::NonHttp,
+                context: crate::Context::Navigation,
+                method: &Method::GET,
+                initiator: Some(uri),
+            })
+    }
+
+    /// Store one `Set-Cookie` line against `uri` as `document.cookie` would
+    /// ([RFC 6265bis §5.8.2](https://httpwg.org/http-extensions/draft-ietf-httpbis-rfc6265bis.html#name-non-http-apis)).
+    /// Invalid or `HttpOnly` input is ignored.
+    pub fn set_cookie(&self, value: &str, uri: &Url) {
+        self.jar
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .store(
+                value,
+                CookieOp {
+                    url: uri,
+                    now: std::time::SystemTime::now(),
+                    kind: RetrievalKind::NonHttp,
+                    context: crate::Context::Navigation,
+                    method: &Method::GET,
+                    initiator: Some(uri),
+                },
+            );
     }
 }
 

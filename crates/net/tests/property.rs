@@ -65,3 +65,72 @@ proptest! {
         }
     }
 }
+
+fn cookie_token() -> impl Strategy<Value = String> {
+    prop::string::string_regex("[A-Za-z][A-Za-z0-9]{0,12}").expect("regex")
+}
+
+proptest! {
+    /// Max-Age in the past (≤ 0) never matches; a large positive Max-Age does,
+    /// for a same-site document.cookie retrieval on the storing URI.
+    #[test]
+    fn expired_cookies_stop_matching(
+        name in cookie_token(),
+        value in cookie_token(),
+        max_age in -20i64..20,
+    ) {
+        let uri = url::Url::parse("https://example.com/app").expect("uri");
+        let agent = net::Agent::new();
+        agent.set_cookie(
+            &format!("{name}={value}; Path=/; Max-Age={max_age}"),
+            &uri,
+        );
+        let got = agent.cookies_for(&uri);
+        if max_age <= 0 {
+            prop_assert!(!got.contains(&name), "expired cookie leaked: {got}");
+        } else {
+            prop_assert!(got.contains(&format!("{name}={value}")), "live cookie missing: {got}");
+        }
+    }
+
+    /// A cookie stored against https://www.example.com/foo either comes back
+    /// for that URI or was rejected by domain/path/secure rules — never a
+    /// silent half-store.
+    #[test]
+    fn stored_cookie_is_retrievable_or_was_rejected(
+        name in cookie_token(),
+        value in cookie_token(),
+        domain in prop::sample::select(vec![
+            "",
+            "example.com",
+            "www.example.com",
+            "other.com",
+            "com",
+        ]),
+        path in prop::sample::select(vec!["/", "/foo", "/foo/bar", "/zzz"]),
+        secure in proptest::bool::ANY,
+    ) {
+        let uri = url::Url::parse("https://www.example.com/foo/bar").expect("uri");
+        let agent = net::Agent::new();
+        let mut line = format!("{name}={value}");
+        if !domain.is_empty() {
+            line.push_str("; Domain=");
+            line.push_str(domain);
+        }
+        line.push_str("; Path=");
+        line.push_str(path);
+        if secure {
+            line.push_str("; Secure");
+        }
+        agent.set_cookie(&line, &uri);
+        let got = agent.cookies_for(&uri);
+        let present = got.split("; ").any(|part| part == format!("{name}={value}"));
+        // Independent of production matchers: only these Domain/Path pairs
+        // are legal for https://www.example.com/foo/bar.
+        let should = matches!(
+            (domain, path),
+            ("" | "example.com" | "www.example.com", "/" | "/foo" | "/foo/bar")
+        );
+        prop_assert_eq!(present, should, "line={} got={}", line, got);
+    }
+}

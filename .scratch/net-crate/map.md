@@ -67,22 +67,21 @@ Decisions so far:
 
 Not yet specified:
 
-- (none — map complete; spec written, implementation tickets 11–14 open)
+- (none — map complete; spec written; 11–14 done)
 
 Implementation tickets (spec.md is the source of truth):
 
 - [11: Types + send() over loopback](./tickets/11-types-send-loopback.md) —
-  blocked by none
-- [12: Real TLS + policy knobs](./tickets/12-tls-policy-knobs.md) — blocked
-  by 11
+  done 2026-08-25
+- [12: Real TLS + policy knobs](./tickets/12-tls-policy-knobs.md) —
+  done 2026-08-26 (closes M1)
 - [13: Cookie jar above the transport](./tickets/13-cookie-jar.md) —
-  blocked by 11, parallel-safe with 12
+  done 2026-08-26 (closes M2)
 - [14: WebSocket via shared dial path](./tickets/14-websocket-shared-dial.md)
-  — blocked by 12
+  — done 2026-08-26 (closes M3)
 
-Deferred docs debt: CONTEXT.md terms (**Hard seam**, **Context**,
-**Conversion point**) get written when implementation completes — tracked
-as the last checkbox of ticket 14.
+CONTEXT.md terms (**Hard seam**, **Context**, **Conversion point**) written
+with ticket 14.
 
 Out of scope:
 

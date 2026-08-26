@@ -101,6 +101,13 @@ impl Method {
         Ok(Self(stored))
     }
 
+    /// RFC 9110 §9.2.1 safe methods. Lax's cross-site exception keys off this
+    /// ([RFC 6265bis §5.8.3](https://httpwg.org/http-extensions/draft-ietf-httpbis-rfc6265bis.html#name-retrieval)).
+    #[must_use]
+    pub fn is_safe(&self) -> bool {
+        matches!(self.0, Token::Get | Token::Head | Token::Options)
+    }
+
     /// The wire token: canonical uppercase for known methods, exactly what
     /// was parsed for extensions.
     #[must_use]

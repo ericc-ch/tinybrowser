@@ -11,7 +11,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use common::TestServer;
-use net::{Agent, AgentBuilder, LimitExceeded, Method, NetError, TimeoutKind, TransportError};
+use net::{
+    Agent, AgentBuilder, LimitExceeded, Method, NetError, ProtocolError, TimeoutKind,
+    TransportError,
+};
 
 /// How long the client side waits on a server-side observation before
 /// declaring the contract broken.
@@ -453,7 +456,8 @@ fn fragments_stay_on_final_url_and_leave_the_wire() {
 }
 
 #[test]
-fn redirect_status_with_location_is_data_not_a_follow() {
+fn zero_redirect_cap_returns_3xx_with_location_as_data() {
+    // Decision 02: cap 0 means the 3xx itself is the final response.
     let server = TestServer::start(|conn| {
         conn.read_request();
         conn.write_all(
@@ -463,10 +467,12 @@ fn redirect_status_with_location_is_data_not_a_follow() {
     });
 
     let asked = server.url("/a");
-    let response = Agent::new()
+    let response = AgentBuilder::new()
+        .max_redirects(0)
+        .build()
         .request(Method::GET, asked.clone())
         .send()
-        .expect("3xx is data");
+        .expect("3xx is data when the cap is 0");
 
     assert_eq!(response.status(), 302);
     assert_eq!(response.final_url(), &asked);
@@ -474,6 +480,344 @@ fn redirect_status_with_location_is_data_not_a_follow() {
     assert_eq!(server.requests().len(), 1);
     assert_eq!(server.requests()[0].target, "/a");
     server.assert_clean();
+}
+
+#[test]
+fn redirect_to_a_non_http_scheme_is_protocol_error() {
+    // fetch #http-redirect-fetch: Location whose scheme is not HTTP(S) is
+    // a network error, not a 3xx we hand to the caller.
+    let server = TestServer::start(|conn| {
+        conn.read_request();
+        conn.write_all(
+            b"HTTP/1.1 302 Found\r\nLocation: mailto:a@b\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        )
+        .expect("redirect write");
+    });
+    match Agent::new().request(Method::GET, server.url("/a")).send() {
+        Err(NetError::Protocol(ProtocolError::RejectedRequest)) => {}
+        other => panic!("expected Protocol(RejectedRequest), got {other:?}"),
+    }
+    server.assert_clean();
+}
+
+fn canned_redirect(status: u16, location: &str) -> Vec<u8> {
+    format!("HTTP/1.1 {status} Redirect\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+        .into_bytes()
+}
+
+#[test]
+fn redirect_chain_follows_until_200_and_exposes_final_url() {
+    let hops = Arc::new(std::sync::Mutex::new(0u32));
+    let server_hops = Arc::clone(&hops);
+    let server = TestServer::start(move |conn| {
+        conn.read_request();
+        let n = {
+            let mut guard = server_hops.lock().expect("hop counter");
+            let n = *guard;
+            *guard += 1;
+            n
+        };
+        if n < 2 {
+            conn.write_all(&canned_redirect(302, "/next"))
+                .expect("redirect write");
+        } else {
+            conn.write_all(&canned_ok(&[], b"landed"))
+                .expect("final write");
+        }
+    });
+
+    let asked = server.url("/start#section");
+    let response = Agent::new()
+        .request(Method::GET, asked)
+        .send()
+        .expect("redirect chain");
+
+    assert_eq!(response.status(), 200);
+    // Location had no fragment, so the original one is kept
+    // (fetch #http-redirect-fetch "location URL given request's current
+    // URL's fragment").
+    assert_eq!(response.final_url(), &server.url("/next#section"));
+    assert_eq!(response.into_body().bytes(16).expect("body"), b"landed");
+    let recorded = server.requests();
+    assert_eq!(recorded.len(), 3);
+    assert_eq!(recorded[0].target, "/start");
+    assert_eq!(recorded[1].target, "/next");
+    assert_eq!(recorded[2].target, "/next");
+    server.assert_clean();
+}
+
+#[test]
+fn exceeding_the_redirect_cap_is_limit_redirect() {
+    let server = TestServer::start(|conn| {
+        conn.read_request();
+        conn.write_all(&canned_redirect(302, "/loop"))
+            .expect("redirect write");
+    });
+
+    let result = AgentBuilder::new()
+        .max_redirects(2)
+        .build()
+        .request(Method::GET, server.url("/loop"))
+        .send();
+
+    match result {
+        Err(NetError::Limit(LimitExceeded::Redirect)) => {}
+        other => panic!("expected Limit(Redirect), got {other:?}"),
+    }
+    // Original + 2 follows, then the next 302 trips the cap (3 dials).
+    assert_eq!(server.requests().len(), 3);
+    server.assert_clean();
+}
+
+#[test]
+fn default_redirect_cap_is_chrome_20() {
+    // Distinguishes Chrome's 20 from ureq's default 10: 15 follows then a
+    // 200 must succeed; 21 consecutive 302s must Limit.
+    let hops = Arc::new(std::sync::Mutex::new(0u32));
+    let server_hops = Arc::clone(&hops);
+    let server = TestServer::start(move |conn| {
+        conn.read_request();
+        let n = {
+            let mut guard = server_hops.lock().expect("hop counter");
+            let n = *guard;
+            *guard += 1;
+            n
+        };
+        if n < 15 {
+            conn.write_all(&canned_redirect(302, "/h"))
+                .expect("redirect write");
+        } else {
+            conn.write_all(&canned_ok(&[], b"ok")).expect("final write");
+        }
+    });
+    let response = Agent::new()
+        .request(Method::GET, server.url("/h"))
+        .send()
+        .expect("15 follows is under Chrome's 20");
+    assert_eq!(response.status(), 200);
+    assert_eq!(server.requests().len(), 16);
+    server.assert_clean();
+
+    let loop_server = TestServer::start(|conn| {
+        conn.read_request();
+        conn.write_all(&canned_redirect(302, "/forever"))
+            .expect("redirect write");
+    });
+    match Agent::new()
+        .request(Method::GET, loop_server.url("/forever"))
+        .send()
+    {
+        Err(NetError::Limit(LimitExceeded::Redirect)) => {}
+        other => panic!("default cap must fire as Limit(Redirect), got {other:?}"),
+    }
+    assert_eq!(loop_server.requests().len(), 21);
+    loop_server.assert_clean();
+}
+
+#[test]
+fn post_302_becomes_get_without_the_body() {
+    let hops = Arc::new(std::sync::Mutex::new(0u32));
+    let server_hops = Arc::clone(&hops);
+    let server = TestServer::start(move |conn| {
+        conn.read_request();
+        let n = {
+            let mut guard = server_hops.lock().expect("hop counter");
+            let n = *guard;
+            *guard += 1;
+            n
+        };
+        if n == 0 {
+            conn.write_all(&canned_redirect(302, "/landed"))
+                .expect("redirect write");
+        } else {
+            conn.write_all(&canned_ok(&[], b"ok")).expect("final write");
+        }
+    });
+
+    Agent::new()
+        .request(Method::POST, server.url("/form"))
+        .body(b"field=1".to_vec())
+        .header("Content-Type", "application/x-www-form-urlencoded")
+        .expect("header")
+        .send()
+        .expect("302 POST redirect");
+
+    let recorded = server.requests();
+    assert_eq!(recorded[0].method, "POST");
+    assert_eq!(recorded[0].body, b"field=1");
+    assert_eq!(recorded[1].method, "GET");
+    assert!(recorded[1].body.is_empty());
+    assert!(recorded[1].header("content-type").is_none());
+    server.assert_clean();
+}
+
+#[test]
+fn post_307_replays_method_and_body() {
+    let hops = Arc::new(std::sync::Mutex::new(0u32));
+    let server_hops = Arc::clone(&hops);
+    let server = TestServer::start(move |conn| {
+        conn.read_request();
+        let n = {
+            let mut guard = server_hops.lock().expect("hop counter");
+            let n = *guard;
+            *guard += 1;
+            n
+        };
+        if n == 0 {
+            conn.write_all(&canned_redirect(307, "/landed"))
+                .expect("redirect write");
+        } else {
+            conn.write_all(&canned_ok(&[], b"ok")).expect("final write");
+        }
+    });
+
+    Agent::new()
+        .request(Method::POST, server.url("/form"))
+        .body(b"field=1".to_vec())
+        .send()
+        .expect("307 POST redirect");
+
+    let recorded = server.requests();
+    assert_eq!(recorded[0].method, "POST");
+    assert_eq!(recorded[1].method, "POST");
+    assert_eq!(recorded[1].body, b"field=1");
+    server.assert_clean();
+}
+
+#[test]
+fn proxy_knob_rejects_unusable_authority_strings() {
+    for bad in [
+        "",
+        "not a uri",
+        "socks5://127.0.0.1:1080",
+        "ftp://127.0.0.1:8080",
+        "http://",
+    ] {
+        match AgentBuilder::new().proxy(bad) {
+            Err(NetError::Protocol(ProtocolError::InvalidProxy)) => {}
+            other => panic!("{bad:?} must be InvalidProxy, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn proxy_knob_sends_http_traffic_to_the_configured_authority() {
+    // HTTP origin via an HTTP proxy uses absolute-form on the request
+    // line (RFC 9112). No live proxy: the recording server *is* the proxy.
+    let proxy = TestServer::start(|conn| {
+        let first = conn.read_request();
+        if first.method == "CONNECT" {
+            // Ticket 08: HTTP CONNECT. After 200 the client tunnels the GET.
+            conn.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                .expect("connect ok");
+            conn.read_request();
+            conn.write_all(&canned_ok(&[], b"via"))
+                .expect("tunneled write");
+        } else {
+            conn.write_all(&canned_ok(&[], b"via"))
+                .expect("proxy write");
+        }
+    });
+    let proxy_uri = format!("http://{}", proxy.local_addr());
+    let agent = AgentBuilder::new()
+        .proxy(&proxy_uri)
+        .expect("http proxy URI parses")
+        .timeout_global(Duration::from_secs(2))
+        .build();
+
+    let target = url::Url::parse("http://origin.test/via-proxy").expect("absolute");
+    let response = agent
+        .request(Method::GET, target)
+        .send()
+        .expect("proxied GET");
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.into_body().bytes(8).expect("body"), b"via");
+
+    let recorded = proxy.requests();
+    assert!(
+        recorded.iter().any(|req| {
+            let mentions_origin = req.target.contains("origin.test");
+            mentions_origin && (req.method == "CONNECT" || req.method == "GET")
+        }),
+        "proxy must see origin.test, got {recorded:?}"
+    );
+    proxy.assert_clean();
+}
+
+#[test]
+fn connect_keeps_bytes_that_arrived_with_the_200() {
+    let proxy = TestServer::start(|conn| {
+        let first = conn.read_request();
+        assert_eq!(first.method, "CONNECT");
+        let mut packed = b"HTTP/1.1 200 Connection Established\r\n\r\n".to_vec();
+        packed.extend_from_slice(&canned_ok(&[], b"ping"));
+        conn.write_all(&packed).expect("packed 200+origin");
+    });
+    let proxy_uri = format!("http://{}", proxy.local_addr());
+    let agent = AgentBuilder::new()
+        .proxy(&proxy_uri)
+        .expect("proxy")
+        .timeout_global(Duration::from_secs(2))
+        .build();
+    let target = url::Url::parse("http://origin.test/packed").expect("absolute");
+    let response = agent
+        .request(Method::GET, target)
+        .send()
+        .expect("proxied GET");
+    assert_eq!(response.into_body().bytes(8).expect("body"), b"ping");
+    proxy.assert_clean();
+}
+
+#[test]
+fn connect_sends_proxy_authorization_and_brackets_ipv6() {
+    let proxy = TestServer::start(|conn| {
+        let first = conn.read_request();
+        assert_eq!(first.method, "CONNECT");
+        conn.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+            .expect("connect ok");
+        conn.read_request();
+        conn.write_all(&canned_ok(&[], b"v6")).expect("tunneled");
+    });
+    let addr = proxy.local_addr();
+    let proxy_uri = format!("http://user:secret@{addr}");
+    let agent = AgentBuilder::new()
+        .proxy(&proxy_uri)
+        .expect("proxy")
+        .timeout_global(Duration::from_secs(2))
+        .build();
+    let target = url::Url::parse("http://[::1]/via").expect("ipv6 origin");
+    let response = agent
+        .request(Method::GET, target)
+        .send()
+        .expect("proxied GET");
+    assert_eq!(response.into_body().bytes(8).expect("body"), b"v6");
+    let recorded = proxy.requests();
+    assert_eq!(recorded[0].target, "[::1]:80");
+    assert_eq!(
+        recorded[0].header("proxy-authorization"),
+        Some("Basic dXNlcjpzZWNyZXQ=")
+    );
+    proxy.assert_clean();
+}
+
+#[test]
+fn https_to_a_plaintext_listener_is_a_tls_transport_error() {
+    // Proves native-tls is actually selected: without a TLS provider the
+    // failure would not be a handshake. Offline — the peer never speaks TLS.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let _server = std::thread::spawn(move || {
+        if let Ok((mut stream, _)) = listener.accept() {
+            use std::io::Write as _;
+            let _ = stream.write_all(b"NOT-TLS");
+        }
+    });
+
+    let url = url::Url::parse(&format!("https://{addr}/")).expect("absolute");
+    match Agent::new().request(Method::GET, url).send() {
+        Err(NetError::Transport(TransportError::Tls(_))) => {}
+        other => panic!("expected Transport(Tls), got {other:?}"),
+    }
 }
 
 #[test]

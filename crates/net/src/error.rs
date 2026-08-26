@@ -123,6 +123,9 @@ pub enum ProtocolError {
     /// The assembled request was rejected before it hit the wire (illegal
     /// method token at the backend, unusable URI, and similar).
     RejectedRequest,
+    /// [`AgentBuilder::proxy`](crate::AgentBuilder::proxy) was given a
+    /// string that is not an `http://` HTTP CONNECT authority.
+    InvalidProxy,
     /// A backend protocol failure that has no more specific tag. The
     /// string is diagnostics only; callers match this variant, not the
     /// text. Exists because ureq's error enum is `non_exhaustive`.
@@ -136,6 +139,9 @@ impl fmt::Display for ProtocolError {
                 f.write_str("backend produced an unrepresentable header")
             }
             Self::RejectedRequest => f.write_str("backend rejected the assembled request"),
+            Self::InvalidProxy => {
+                f.write_str("proxy URI must be an http:// HTTP CONNECT authority")
+            }
             Self::Other(reason) => f.write_str(reason),
         }
     }
@@ -215,6 +221,10 @@ impl From<ureq::Error> for NetError {
                 Self::Transport(TransportError::Timeout(kind))
             }
             U::Tls(detail) => Self::Transport(TransportError::Tls(detail.into())),
+            // native-tls feature: handshake/cert failures are this arm, not
+            // `Tls(&'static str)`. Mapped here so callers see Transport(Tls).
+            U::NativeTls(err) => Self::Transport(TransportError::Tls(err.to_string().into())),
+            U::Der(err) => Self::Transport(TransportError::Tls(err.to_string().into())),
 
             // Limits: keep the cap that fired so diagnostics explain
             // themselves.
@@ -229,8 +239,7 @@ impl From<ureq::Error> for NetError {
             // unreachable-by-config arms (StatusCode cannot fire with
             // http_status_as_error(false); cookie/charset/json features are
             // compiled out). TLS handshake failures are the `U::Tls` arm
-            // above; ticket 12 adds native-tls so that arm can actually
-            // fire from a dial.
+            // above.
             U::Http(_) => Self::Protocol(ProtocolError::RejectedRequest),
             other => Self::Protocol(ProtocolError::Other(other.to_string().into())),
         }

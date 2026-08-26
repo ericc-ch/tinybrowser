@@ -55,3 +55,15 @@ _Avoid_: pseudo-class handling (that word covers parsing too)
 **HTML integration point**:
 A foreign-content element where HTML parsing resumes instead of breaking out: SVG `foreignObject`/`desc`/`title` (unconditional), plus MathML `annotation-xml` when its `encoding` says HTML; that last one is answered by our TreeSink from a flag recorded at element creation (`browser`'s `integration_points`), per [html.spec.whatwg.org §13.2.6.6](https://html.spec.whatwg.org/multipage/parsing.html#html-integration-point).
 _Avoid_: integration element, breakout point
+
+**Hard seam**:
+The `net` crate's public type surface: every name callers see (`Agent`, `RequestBuilder`, `Response`, `Body`, `HeaderMap`, `Method`, `Context`, `NetError`, `WebSocket`) is ours, so a later transport swap (hand-rolled btls) cannot leak ureq or tungstenite types into `browser` or `js`.
+_Avoid_: abstraction layer, backend boundary (those mix the type rule with the conversion point)
+
+**Context**:
+Which initiator owns a `net` request (`Navigation`, `Fetch`, `Xhr`, `WsHandshake`). SameSite uses it for the Lax top-level navigation exception; schemeful same-site is initiator URL versus request URL. Future `Sec-Fetch-*` headers also key off it.
+_Avoid_: scope (dom selector root), initiator (the document URL passed separately)
+
+**Conversion point**:
+The few places inside `net` that talk to a backend crate (`AgentBuilder::build`, `RequestBuilder::send`, `Response::from_backend`, `From<ureq::Error>`, `dial::open`, `NetConnector`, `Agent::websocket`); nowhere else may mention ureq, native-tls, or tungstenite types.
+_Avoid_: adapter, wrapper, FFI boundary

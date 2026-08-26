@@ -9,17 +9,27 @@ the effort's doc debt.
 
 Blocked by: 12
 
-Status: open
+Status: done (2026-08-26)
 
-- [ ] ws:// loopback echo works through the public handle in both
+- [x] ws:// loopback echo works through the public handle in both
       directions; pings answered automatically by the pump
-- [ ] Fragmented text messages reassembled before delivery (recording
+- [x] Fragmented text messages reassembled before delivery (recording
       server sends fragments; handle sees one message)
-- [ ] Close handshake surfaces code/reason on the handle
-- [ ] Code-review check: exactly one dial path — `send()` and the WS
+- [x] Close handshake surfaces code/reason on the handle
+- [x] Code-review check: exactly one dial path — `send()` and the WS
       upgrade call the same function
-- [ ] Marginal measured (+184 KB expected) and row recorded in
+- [x] Marginal measured (+184 KB expected) and row recorded in
       docs/size-budget.md
-- [ ] Docs debt cleared once implementation completes: CONTEXT.md gains
+- [x] Docs debt cleared once implementation completes: CONTEXT.md gains
       **Hard seam**, **Context**, and **Conversion point** entries
       (deferred there by maintainer, 2026-08-25)
+
+Run notes:
+
+- Offline: `cargo test -p net --test websocket` (plus full `cargo test -p
+  net` after the shared connector).
+- Dial: `crates/net/src/dial.rs` `open()`; HTTP via `NetConnector::connect`,
+  WS via `Agent::websocket`.
+- Size: tungstenite 0.26 (`handshake` only; 0.30 was the original probe).
+  M3 probe +603 KB vs empty; +113 KB vs HTTPS-only (standalone tungstenite
+  was +184 KB). rustc 1.98.0, tuned profile.

@@ -9,18 +9,25 @@ safe with ticket 12.
 
 Blocked by: 11
 
-Status: open
+Status: done (2026-08-26)
 
-- [ ] Loopback two-request flow: server sets a cookie, next request
+- [x] Loopback two-request flow: server sets a cookie, next request
       carries it — covering domain-match, path-match, and host-only cases
-- [ ] `Secure` cookies never sent over cleartext http; `HttpOnly` cookies
+- [x] `Secure` cookies never sent over cleartext http; `HttpOnly` cookies
       invisible through `cookies_for()` (document.cookie semantics) while
       still riding request headers
-- [ ] SameSite matrix: `Lax` cookie withheld from cross-site
+- [x] SameSite matrix: `Lax` cookie withheld from cross-site
       `Context::Fetch`/`Xhr`, delivered on `Context::Navigation`
-- [ ] Expired cookies stop matching (proptest over timestamps)
-- [ ] Proptest invariant: any stored cookie either returns for a matching
+- [x] Expired cookies stop matching (proptest over timestamps)
+- [x] Proptest invariant: any stored cookie either returns for a matching
       URI or was correctly rejected by §5.3/§5.4 rules; RFC worked examples
       remain as concrete cases
-- [ ] Binary delta ≈ zero confirmed at measurement (our code only, no new
+- [x] Binary delta ≈ zero confirmed at measurement (our code only, no new
       dependency)
+
+Run notes:
+
+- Offline: `cargo test -p net --test cookies --test property`
+- Size: no new crate. Jar-only delta was ~+20 KB of our code on the M1
+  connector; HTTPS-only probe after ticket 14's shared dial is +490 KB
+  tuned vs empty (see size-budget.md M2/M3).

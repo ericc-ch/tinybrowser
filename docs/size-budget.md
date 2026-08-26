@@ -120,6 +120,48 @@ standing truth.
   [ADR 0006](adr/0006-net-transport.md), with the stealth objection to it
   deferred alongside the goal itself (see the ADR).
 
+## Milestone: net M1 dial (2026-08-26)
+
+Ticket 12 closed M1: `net::Agent` over ureq 3 + native-tls (dyn libssl.so.3) plus
+servo `url`, with `send()` following redirects (cap 20) and an HTTP CONNECT
+proxy knob. Probe binary actually GETs `https://example.com/` through the
+public API. rustc 1.98.0; tuned profile as in the root Cargo.toml.
+
+| Component | default `release` | tuned¹ |
+| ------------------------------------------------- | ---------------- | ------- |
+| baseline (empty main, re-measured) | — | 284 KB |
+| **net M1**: Agent + HTTPS `send()` (ureq native-tls + url + redirect/proxy policy) | — | **+679 KB** |
+
+Against the M1 estimate (+490 KB ureq/native-tls +197 KB url ≈ +700 KB): tuned
+landed −21 KB (shared-dep overlap plus our own types). Accepted.
+
+Live smokes (opt-in, `cargo test -p net --test live -- --ignored`): example.com
+200; tls.peet.ws JA4 still `t13d3011_…` (OpenSSL native-tls, drift check).
+
+## Milestone: net M2 cookie jar + M3 WebSocket (2026-08-26)
+
+Ticket 13 put an RFC 6265bis jar above the transport (no new dependency). Ticket 14
+replaced ureq's `DefaultConnector` with a net-owned `dial::open` shared by
+`send()` and `Agent::websocket`, then linked tungstenite 0.26 (`handshake` only).
+Probes call the public API against `127.0.0.1:1` (enough to keep TLS and the
+WebSocket pump from being stripped). rustc 1.98.0; tuned profile as in the root
+Cargo.toml. Empty-main re-measured at 284 KB (290720 bytes), matching M1.
+
+| Component | default `release` | tuned¹ |
+| ------------------------------------------------- | ---------------- | ------- |
+| baseline (empty main, re-measured) | — | 284 KB |
+| **net M2/M3 HTTPS `send()`** (shared dial + jar, no WS call in the probe) | — | **+490 KB** |
+| **net M3** same probe plus `Agent::websocket` | — | **+603 KB** |
+| tungstenite marginal (M3 minus HTTPS-only) | — | **+113 KB** |
+
+Standalone tungstenite was probed at +184 KB (2026-08-25). In this crate it
+lands +113 KB on top of the HTTPS agent (~71 KB overlap with existing deps).
+HTTPS-only dropped from M1's +679 KB to +490 KB because `send()` no longer
+pulls ureq's default TCP/TLS connector stack.
+
+Cookie jar itself added no crate; mid-implementation it was ~+20 KB of our
+code on the old M1 connector. Accepted.
+
 ## Stack totals (tuned profile)
 
 | Stack                                                  | Total       | Headroom to 5 MB |
@@ -128,6 +170,8 @@ standing truth.
 | same but html5gum instead                              | 1.73 MB     | ~3.27 MB         |
 | any of the above on default `release`                  | 2.7–3.3 MB  | n/a              |
 | chosen + **dom v1** (2026-08-23, components re-summed) | **~2.42 MB**| ~2.58 MB         |
+| same + **net M1 dial** (2026-08-26; ureq probe swapped for measured crate, +189 KB over the +490 KB ureq row) | **~2.61 MB** | ~2.39 MB |
+| same + **net M3** (2026-08-26; shared dial + jar + tungstenite, +113 KB over the +490 KB ureq row) | **~2.53 MB** | ~2.47 MB |
 | dom v1 + quickjs + **net on btls, hand-rolled h1/h2** (est., pending preset work, see 2026-08-25 probes) | ~3.6–3.7 MB | ~1.3–1.4 MB |
 | dom v1 + quickjs + **net as ureq bridged to btls** (measured bridge) | ~3.8 MB | ~1.2 MB |
 

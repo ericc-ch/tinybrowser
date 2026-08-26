@@ -1,4 +1,5 @@
 //! Recording-fake loopback server shared by the net integration tests.
+#![allow(dead_code)]
 //!
 //! Per decision 10: assertions check captured requests, never spies or call
 //! counts. The server is a plain TCP listener speaking canned HTTP; every
@@ -129,6 +130,12 @@ impl Connection {
     pub fn write_all(&mut self, bytes: &[u8]) -> std::io::Result<()> {
         self.stream.write_all(bytes)?;
         self.stream.flush()
+    }
+
+    /// The live TCP stream, for upgrades (WebSocket handshake) that take
+    /// over the socket after the request head.
+    pub fn stream_mut(&mut self) -> &mut TcpStream {
+        &mut self.stream
     }
 
     /// Wait until the peer half-closes or resets the connection.
@@ -264,6 +271,12 @@ impl TestServer {
     #[must_use]
     pub fn url(&self, path: &str) -> url::Url {
         url::Url::parse(&format!("http://{}{path}", self.addr)).expect("server URL is absolute")
+    }
+
+    /// Absolute `ws://` URL for `path` on this server's loopback address.
+    #[must_use]
+    pub fn ws_url(&self, path: &str) -> url::Url {
+        url::Url::parse(&format!("ws://{}{path}", self.addr)).expect("server URL is absolute")
     }
 
     /// All requests recorded so far, in arrival order.
