@@ -11,15 +11,16 @@
 //!
 //! Every public type is ours: [`Agent`], [`RequestBuilder`], [`Response`],
 //! [`Body`], [`HeaderMap`], [`Method`], [`Context`], [`NetError`]. Backend
-//! types exist only inside `send()`'s single conversion point
-//! ([`RequestBuilder::send`] / `Response::from_backend`) and never appear
-//! in a signature. Statuses are data, bodies stream, cancellation is drop.
+//! types exist only inside `AgentBuilder::build`, [`RequestBuilder::send`],
+//! [`Response::from_backend`], and `From<ureq::Error>` — never in a
+//! signature. Statuses are data, bodies stream, cancellation is drop.
+//! `send()` is one hop; `browser` follows redirects.
 //!
 //! # Seam map
 //!
 //! ```text
 //! browser (fan-in):  navigation + injected fetch/XHR/WebSocket over Agent
-//! js:                HttpTransport trait defined here-side, injected in
+//! js:                HttpTransport trait defined in js, implemented in browser
 //! net:               dial, stream, cookie jar above the transport
 //! ```
 //!
@@ -37,7 +38,7 @@ mod token;
 
 pub use agent::{Agent, AgentBuilder};
 pub use context::Context;
-pub use error::{LimitExceeded, NetError, TimeoutKind, TransportError};
+pub use error::{LimitExceeded, NetError, ProtocolError, TimeoutKind, TransportError};
 pub use header::{HeaderError, HeaderMap};
 pub use method::{InvalidMethod, Method};
 pub use request::RequestBuilder;

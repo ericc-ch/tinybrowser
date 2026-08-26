@@ -851,15 +851,11 @@ fn reparent_children_into_a_document_honors_the_content_model() {
     );
 }
 
-/// Fragments stay insertable as ordinary children in this tree. Note the
-/// deliberate divergence: a live DOM never *nests* a `DocumentFragment`;
-/// its insertion algorithms splice the fragment's children into the parent
-/// instead. dom nests until the js layer needs splicing; the fragment
-/// clause of the document content model (>1 element child or any Text
-/// child makes a fragment uninsertable) belongs to that same splice work
-/// and rides with it, recorded as open finding L14.
+/// Fragments splice: inserting a fragment moves its children into the
+/// parent and leaves the fragment empty
+/// (<https://dom.spec.whatwg.org/#concept-node-insert>).
 #[test]
-fn fragments_remain_legal_children() {
+fn inserting_a_fragment_splices_its_children() {
     let mut d = Dom::new();
     let doc = d.document();
     let frag = d.create_fragment();
@@ -869,7 +865,45 @@ fn fragments_remain_legal_children() {
     d.append(doc, host).unwrap();
 
     d.append(host, frag).unwrap();
-    assert_eq!(d.parent(frag), Some(host));
+    assert_eq!(d.parent(item), Some(host));
+    assert_eq!(
+        d.children(host).unwrap().copied().collect::<Vec<_>>(),
+        vec![item]
+    );
+    assert_eq!(d.parent(frag), None);
+    assert_eq!(d.children(frag).unwrap().count(), 0);
+    assert!(d.contains(frag));
+}
+
+/// A fragment with two element children cannot land in a document
+/// (<https://dom.spec.whatwg.org/#concept-node-ensure-pre-insert-validity>).
+#[test]
+fn document_refuses_a_fragment_with_two_element_children() {
+    let mut d = Dom::new();
+    let frag = d.create_fragment();
+    let a = d.create_element(qn("html"), Vec::new());
+    let b = d.create_element(qn("body"), Vec::new());
+    d.append(frag, a).unwrap();
+    d.append(frag, b).unwrap();
+    assert_eq!(
+        d.append(d.document(), frag),
+        Err(DomError::HierarchyRequest)
+    );
+    assert_eq!(d.children(frag).unwrap().count(), 2);
+}
+
+#[test]
+fn handles_from_another_document_do_not_resolve() {
+    let mut a = Dom::new();
+    let mut b = Dom::new();
+    let a_el = a.create_element(qn("div"), Vec::new());
+    let b_el = b.create_element(qn("div"), Vec::new());
+    assert_ne!(a_el, b_el);
+    assert!(!a.contains(b_el));
+    assert!(!b.contains(a_el));
+    assert_eq!(a.append(a.document(), b_el), Err(DomError::StaleNode));
+    a.append(a.document(), a_el).unwrap();
+    assert_eq!(a.parent(a_el), Some(a.document()));
 }
 
 /// Attribute names are unique per DOM (`NamedNodeMap` keyed by qualified

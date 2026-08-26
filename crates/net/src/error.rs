@@ -115,6 +115,34 @@ impl fmt::Display for LimitExceeded {
 
 impl std::error::Error for LimitExceeded {}
 
+/// Why the peer, or a request we built, was refused as HTTP.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ProtocolError {
+    /// A header from the backend could not be stored in [`crate::HeaderMap`].
+    UnrepresentableHeader,
+    /// The assembled request was rejected before it hit the wire (illegal
+    /// method token at the backend, unusable URI, and similar).
+    RejectedRequest,
+    /// A backend protocol failure that has no more specific tag. The
+    /// string is diagnostics only; callers match this variant, not the
+    /// text. Exists because ureq's error enum is `non_exhaustive`.
+    Other(Box<str>),
+}
+
+impl fmt::Display for ProtocolError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnrepresentableHeader => {
+                f.write_str("backend produced an unrepresentable header")
+            }
+            Self::RejectedRequest => f.write_str("backend rejected the assembled request"),
+            Self::Other(reason) => f.write_str(reason),
+        }
+    }
+}
+
+impl std::error::Error for ProtocolError {}
+
 /// Everything `send()` can fail with.
 ///
 /// Expected failures only, as values (repo rule): callers match and recover.
@@ -125,7 +153,7 @@ pub enum NetError {
     Transport(TransportError),
     /// The peer violated HTTP enough that we refuse to continue, or the
     /// backend rejected a locally-built request.
-    Protocol(Box<str>),
+    Protocol(ProtocolError),
     /// A configured cap was hit.
     Limit(LimitExceeded),
 }
@@ -134,7 +162,7 @@ impl fmt::Display for NetError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Transport(err) => write!(f, "transport: {err}"),
-            Self::Protocol(reason) => write!(f, "protocol violation: {reason}"),
+            Self::Protocol(err) => write!(f, "protocol violation: {err}"),
             Self::Limit(limit) => write!(f, "limit exceeded: {limit}"),
         }
     }
@@ -144,7 +172,8 @@ impl std::error::Error for NetError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Transport(err) => Some(err),
-            _ => None,
+            Self::Protocol(err) => Some(err),
+            Self::Limit(err) => Some(err),
         }
     }
 }
@@ -202,7 +231,8 @@ impl From<ureq::Error> for NetError {
             // compiled out). TLS handshake failures are the `U::Tls` arm
             // above; ticket 12 adds native-tls so that arm can actually
             // fire from a dial.
-            other => Self::Protocol(other.to_string().into()),
+            U::Http(_) => Self::Protocol(ProtocolError::RejectedRequest),
+            other => Self::Protocol(ProtocolError::Other(other.to_string().into())),
         }
     }
 }

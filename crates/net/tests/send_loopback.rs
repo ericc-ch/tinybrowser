@@ -93,10 +93,7 @@ fn get_round_trips_status_headers_and_streamed_body() {
 
 #[test]
 fn every_http_status_arrives_as_data() {
-    // 3xx statuses are excluded: the v1 backend follows redirects itself,
-    // and a canned 3xx without (or with looping) Location is ticket 12's
-    // redirect-cap territory. 4xx/5xx prove the statuses-as-data contract.
-    for status in [201u16, 404, 500] {
+    for status in [201u16, 302, 404, 500] {
         let server = TestServer::start(move |conn| {
             conn.read_request();
             let canned = format!("HTTP/1.1 {status} Whatever\r\nContent-Length: 2\r\n\r\nno");
@@ -434,7 +431,7 @@ fn invalid_header_values_are_rejected_at_the_boundary() {
 }
 
 #[test]
-fn fragments_are_stripped_before_the_network() {
+fn fragments_stay_on_final_url_and_leave_the_wire() {
     let server = TestServer::start(|conn| {
         conn.read_request();
         conn.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
@@ -442,14 +439,11 @@ fn fragments_are_stripped_before_the_network() {
     });
 
     // Navigation to anchored URLs is the common case; the fragment must
-    // never reach the request line, and the final URL must not carry one.
-    let anchored = {
-        let mut url = server.url("/page#section-2");
-        url.set_fragment(None);
-        url
-    };
+    // never reach the request line, and final_url must keep it for
+    // location.hash after this hop.
+    let anchored = server.url("/page#section-2");
     let response = Agent::new()
-        .request(Method::GET, server.url("/page#section-2"))
+        .request(Method::GET, anchored.clone())
         .send()
         .expect("send works");
 
@@ -459,72 +453,26 @@ fn fragments_are_stripped_before_the_network() {
 }
 
 #[test]
-fn redirect_chain_updates_final_url_and_records_every_hop() {
-    let server = TestServer::start(|conn| {
-        let req = conn.read_request();
-        if req.target == "/a" {
-            conn.write_all(
-                b"HTTP/1.1 302 Found\r\nLocation: /b\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-            )
-            .expect("redirect write");
-        } else {
-            conn.write_all(
-                b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nfinal",
-            )
-            .expect("landing write");
-        }
-    });
-
-    let response = Agent::new()
-        .request(Method::GET, server.url("/a"))
-        .send()
-        .expect("redirects resolve");
-
-    assert_eq!(response.status(), 200);
-    // final_url is the post-redirect location; the original URL is not
-    // silently substituted (Firefox's URI-vs-originalURI split).
-    assert_eq!(response.final_url(), &server.url("/b"));
-    assert_eq!(
-        response.into_body().bytes(16).expect("body reads"),
-        b"final"
-    );
-    let requests = server.requests();
-    let targets: Vec<&str> = requests.iter().map(|req| req.target.as_str()).collect();
-    assert_eq!(targets, ["/a", "/b"], "every hop hits the wire in order");
-    server.assert_clean();
-}
-
-#[test]
-fn redirect_cap_fires_as_limit_redirect_and_bounds_the_loop() {
+fn redirect_status_with_location_is_data_not_a_follow() {
     let server = TestServer::start(|conn| {
         conn.read_request();
         conn.write_all(
-            b"HTTP/1.1 302 Found\r\nLocation: /loop\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            b"HTTP/1.1 302 Found\r\nLocation: /b\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
         )
-        .expect("loop write");
+        .expect("redirect write");
     });
 
-    let cap = 2;
-    let result = AgentBuilder::new()
-        .max_redirects(cap)
-        .build()
-        .request(Method::GET, server.url("/loop"))
-        .send();
+    let asked = server.url("/a");
+    let response = Agent::new()
+        .request(Method::GET, asked.clone())
+        .send()
+        .expect("3xx is data");
 
-    match result {
-        Err(NetError::Limit(LimitExceeded::Redirect)) => {}
-        other => panic!("expected Limit(Redirect), got {other:?}"),
-    }
-    // The cap must actually bound the loop (no exact-hop pinning: how the
-    // backend counts against the cap is its own semantics).
-    let hops = server.requests().len();
-    assert!(hops >= 2, "at least one redirect followed before the cap");
-    // Lossless widening (u32 → usize); `as` is the honest form, there is
-    // no From<u32> for usize on this toolchain.
-    assert!(hops <= cap as usize + 1, "cap bound the loop, saw {hops}");
-    for recorded in server.requests() {
-        assert_eq!(recorded.target, "/loop");
-    }
+    assert_eq!(response.status(), 302);
+    assert_eq!(response.final_url(), &asked);
+    assert_eq!(response.headers().get("location"), Some(&b"/b"[..]));
+    assert_eq!(server.requests().len(), 1);
+    assert_eq!(server.requests()[0].target, "/a");
     server.assert_clean();
 }
 
@@ -604,102 +552,6 @@ fn buffered_body_enforces_the_caller_size_cap() {
         .bytes(16)
         .expect("exact fit");
     assert_eq!(got, vec![b'y'; 16]);
-    server.assert_clean();
-}
-
-#[test]
-fn post_307_replays_method_and_body() {
-    // fetch #http-redirect-fetch: 307 keeps POST + body. ureq used to
-    // abort this as RedirectFailed; net owns the follow loop so it must
-    // not.
-    let server = TestServer::start(|conn| {
-        let req = conn.read_request();
-        if req.target == "/a" {
-            conn.write_all(
-                b"HTTP/1.1 307 Temporary Redirect\r\nLocation: /b\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-            )
-            .expect("redirect write");
-        } else {
-            conn.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
-                .expect("landing write");
-        }
-    });
-
-    let response = Agent::new()
-        .request(Method::POST, server.url("/a"))
-        .body(b"payload".as_slice())
-        .send()
-        .expect("307 POST follows");
-
-    assert_eq!(response.status(), 200);
-    assert_eq!(response.final_url(), &server.url("/b"));
-    assert_eq!(response.into_body().bytes(8).expect("body"), b"ok");
-    let requests = server.requests();
-    assert_eq!(requests.len(), 2);
-    assert_eq!(requests[0].method, "POST");
-    assert_eq!(requests[0].body, b"payload");
-    assert_eq!(requests[1].method, "POST");
-    assert_eq!(requests[1].target, "/b");
-    assert_eq!(requests[1].body, b"payload");
-    server.assert_clean();
-}
-
-#[test]
-fn post_302_becomes_get_without_the_body() {
-    let server = TestServer::start(|conn| {
-        let req = conn.read_request();
-        if req.target == "/a" {
-            conn.write_all(
-                b"HTTP/1.1 302 Found\r\nLocation: /b\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-            )
-            .expect("redirect write");
-        } else {
-            conn.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
-                .expect("landing write");
-        }
-    });
-
-    Agent::new()
-        .request(Method::POST, server.url("/a"))
-        .body(b"payload".as_slice())
-        .send()
-        .expect("302 POST follows as GET");
-
-    let requests = server.requests();
-    assert_eq!(requests[0].method, "POST");
-    assert_eq!(requests[0].body, b"payload");
-    assert_eq!(requests[1].method, "GET");
-    assert_eq!(requests[1].target, "/b");
-    assert!(requests[1].body.is_empty());
-    assert!(requests[1].header("content-length").is_none());
-    server.assert_clean();
-}
-
-#[test]
-fn cookie_header_survives_a_same_origin_redirect() {
-    let server = TestServer::start(|conn| {
-        let req = conn.read_request();
-        if req.target == "/a" {
-            conn.write_all(
-                b"HTTP/1.1 302 Found\r\nLocation: /b\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-            )
-            .expect("redirect write");
-        } else {
-            conn.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
-                .expect("landing write");
-        }
-    });
-
-    Agent::new()
-        .request(Method::GET, server.url("/a"))
-        .header("Cookie", "a=1")
-        .expect("valid header")
-        .send()
-        .expect("redirects");
-
-    let requests = server.requests();
-    assert_eq!(requests[0].header("cookie"), Some("a=1"));
-    assert_eq!(requests[1].header("cookie"), Some("a=1"));
     server.assert_clean();
 }
 

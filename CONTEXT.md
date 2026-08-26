@@ -3,7 +3,7 @@
 ## Terms
 
 **NodeId**:
-Copyable handle naming exactly one live node; carries a slot number plus generation and is the only value that crosses crate boundaries.
+Copyable handle naming exactly one live node in one `Dom`; carries a document id, slot number, and generation, and is the only value that crosses crate boundaries.
 _Avoid_: pointer, reference, node ref
 
 **Slot**:
@@ -18,7 +18,7 @@ A NodeId whose node was destroyed; every lookup reports absence instead of retur
 _Avoid_: dangling reference
 
 **Quirks mode**:
-The document-compatibility mode html5ever reports for a parsed page (NoQuirks / LimitedQuirks / Quirks); dom's selector queries take it because full quirks makes class/id matching ASCII-case-insensitive.
+The document-compatibility mode html5ever reports for a parsed page (NoQuirks / LimitedQuirks / Quirks); stored on `Dom` because full quirks makes class/id matching ASCII-case-insensitive.
 _Avoid_: compatibility mode, IE mode
 
 **Detach**:
@@ -30,7 +30,7 @@ Recursively freeing a subtree's slots so every handle into it goes stale.
 _Avoid_: drop, delete
 
 **TreeSink adapter**:
-Thin layer above dom that translates html5ever's tree-construction instructions into Dom mutations; lives in `browser` as `browser::parse_html` (ADR 0003) and owns the parser dependency, keeping dom free of parser crates (dom itself carries only markup5ever for names).
+Thin layer above dom that translates html5ever's tree-construction instructions into Dom mutations; lives in `browser` as `browser::parse_html` (ADR 0002) and owns the parser dependency, keeping dom free of parser crates (dom itself carries only markup5ever for names).
 _Avoid_: parser glue, binding layer
 
 **QualName**:

@@ -6,9 +6,6 @@ use crate::method::Method;
 use crate::request::RequestBuilder;
 use url::Url;
 
-/// Default redirect cap: 20, Chrome parity (decision 08).
-const DEFAULT_REDIRECT_CAP: u32 = 20;
-
 /// Builder for [`Agent`] configuration (decision 02: config lives on the
 /// agent; per-request overrides deferred until a consumer demands them).
 ///
@@ -20,7 +17,6 @@ pub struct AgentBuilder {
     /// Verbatim `User-Agent` header injected into every request. `None`
     /// means net sends no UA of its own.
     user_agent: Option<String>,
-    redirect_cap: u32,
     timeout_global: Option<Duration>,
     timeout_per_call: Option<Duration>,
 }
@@ -37,7 +33,6 @@ impl AgentBuilder {
     pub fn new() -> Self {
         Self {
             user_agent: None,
-            redirect_cap: DEFAULT_REDIRECT_CAP,
             timeout_global: None,
             timeout_per_call: None,
         }
@@ -56,14 +51,6 @@ impl AgentBuilder {
         self
     }
 
-    /// Cap followed redirects; exceeding it fails with
-    /// [`NetError::Limit(LimitExceeded::Redirect)`](crate::NetError::Limit).
-    #[must_use]
-    pub fn max_redirects(mut self, cap: u32) -> Self {
-        self.redirect_cap = cap;
-        self
-    }
-
     /// End-to-end time budget per call, including body reads.
     #[must_use]
     pub fn timeout_global(mut self, timeout: Duration) -> Self {
@@ -71,7 +58,8 @@ impl AgentBuilder {
         self
     }
 
-    /// Time budget that resets at each redirect hop.
+    /// Time budget that resets at each backend call (ureq's per-call knob).
+    /// Redirect following is not this crate's job; `browser` owns that loop.
     #[must_use]
     pub fn timeout_per_call(mut self, timeout: Duration) -> Self {
         self.timeout_per_call = Some(timeout);
@@ -95,10 +83,9 @@ impl AgentBuilder {
         // Fetch-accurate extension methods (`patch`, `propfind`) need
         // `allow_non_standard_methods`: ureq's default `verify_version`
         // whitelist would otherwise refuse them.
-        // Redirect following is ours (fetch #http-redirect-fetch), not
-        // ureq's: 307/308 must replay method and body, and Cookie must
-        // survive same-origin hops until the jar lands. The backend is
-        // told to return 3xx as data (`max_redirects(0)`).
+        // Redirect following belongs to `browser` (fetch
+        // #http-redirect-fetch). The backend returns 3xx as data
+        // (`max_redirects(0)`).
         let config = ureq::config::Config::builder()
             .http_status_as_error(false)
             .max_redirects(0)
@@ -115,7 +102,6 @@ impl AgentBuilder {
         Agent {
             inner: config.new_agent(),
             ua: self.user_agent,
-            redirect_cap: self.redirect_cap,
         }
     }
 }
@@ -128,7 +114,6 @@ impl AgentBuilder {
 pub struct Agent {
     pub(super) inner: ureq::Agent,
     pub(super) ua: Option<String>,
-    pub(super) redirect_cap: u32,
 }
 
 impl Agent {

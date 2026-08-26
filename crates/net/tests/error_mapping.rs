@@ -7,7 +7,7 @@
 
 use std::io;
 
-use net::{LimitExceeded, NetError, TimeoutKind, TransportError};
+use net::{LimitExceeded, NetError, ProtocolError, TimeoutKind, TransportError};
 
 #[test]
 fn transport_arms_map_faithfully() {
@@ -110,8 +110,8 @@ fn protocol_shaped_arms_land_in_protocol_with_reasons() {
         ureq::Error::InvalidProxyUrl,
     ] {
         match NetError::from(err) {
-            NetError::Protocol(reason) => assert!(!reason.is_empty()),
-            other => panic!("expected Protocol, got {other:?}"),
+            NetError::Protocol(ProtocolError::Other(reason)) => assert!(!reason.is_empty()),
+            other => panic!("expected Protocol(Other), got {other:?}"),
         }
     }
 
@@ -121,7 +121,7 @@ fn protocol_shaped_arms_land_in_protocol_with_reasons() {
         .body(())
         .expect_err("NUL in header name is an http::Error");
     match ureq::Error::Http(http_err).into() {
-        NetError::Protocol(_) => {}
+        NetError::Protocol(ProtocolError::RejectedRequest) => {}
         other => panic!("expected Protocol, got {other:?}"),
     }
 }

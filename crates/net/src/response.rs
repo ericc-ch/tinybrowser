@@ -128,33 +128,18 @@ impl Response {
     pub(super) fn from_backend(
         response: ureq::http::Response<ureq::Body>,
         context: Context,
+        final_url: Url,
     ) -> Result<Self, NetError> {
-        use ureq::ResponseExt as _;
-
         let status = response.status().as_u16();
 
         let mut headers = HeaderMap::new();
         for (name, value) in response.headers() {
             headers
                 .insert(name.as_str(), value.as_bytes())
-                .map_err(|err| {
-                    NetError::Protocol(
-                        format!("backend produced unrepresentable header: {err}").into(),
-                    )
+                .map_err(|_| {
+                    NetError::Protocol(crate::error::ProtocolError::UnrepresentableHeader)
                 })?;
         }
-
-        // Final URL after redirects (Firefox's URI-vs-originalURI split:
-        // original stays on the caller's request). The fragment is absent
-        // because `send()` strips it before dialing (fetch
-        // #http-network-or-cache-fetch), and wire URIs carry no fragment —
-        // so the round-trip through string form loses nothing.
-        let uri = response.get_uri();
-        let final_url = Url::parse(uri.to_string().as_str()).map_err(|err| {
-            NetError::Protocol(
-                format!("backend produced unparseable final URL {uri}: {err}").into(),
-            )
-        })?;
 
         let body = Body::from_reader(response.into_body().into_reader());
 
@@ -179,7 +164,11 @@ impl Response {
         &self.headers
     }
 
-    /// The post-redirect location the response actually came from.
+    /// The URL this response belongs to: the request URL, fragment included.
+    /// The fragment never goes on the wire
+    /// ([fetch #http-network-or-cache-fetch](https://fetch.spec.whatwg.org/#http-network-or-cache-fetch)).
+    /// Redirect hops that change the URL are `browser`'s job; this crate
+    /// reports the URL of the single hop it dialed.
     #[must_use]
     pub fn final_url(&self) -> &Url {
         &self.final_url

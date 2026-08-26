@@ -14,7 +14,7 @@ Answer:
   necko types. `browser` implements the trait over `net::Agent` and is the
   only place that sees both worlds (ADR 0001 fan-in rule).
 - **Precedent**: the consumer-side-trait inversion is the same pattern as
-  html5ever's `TreeSink` implemented by our `Sink` (ADR 0003) — lower
+  html5ever's `TreeSink` implemented by our `Sink` (ADR 0002) — lower
   layer declares the interface, upper layer fills it in.
 - **Mechanics**:
   - Trait method is sync/blocking; promise settlement is `js` internals

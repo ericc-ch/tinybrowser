@@ -29,7 +29,7 @@ pub struct Parsed {
     /// How many spec parse errors the tokenizer/tree builder reported.
     pub parse_errors: u32,
     /// `<template>` element → its contents fragment. Contents live *outside*
-    /// the child list per spec ([ADR 0003](../../docs/adr/0003-treesink-adapter-in-browser.md)),
+    /// the child list per spec ([ADR 0002](../../docs/adr/0002-dom-layer-architecture.md)),
     /// so this map is the only way to reach them, exactly like the
     /// `template.content` DOM property.
     pub template_contents: HashMap<Handle, Handle>,
@@ -305,6 +305,12 @@ impl TreeSink for Sink {
 
     fn set_quirks_mode(&self, mode: QuirksMode) {
         self.quirks_mode.set(mode);
+        let stored = match mode {
+            QuirksMode::NoQuirks => dom::QuirksMode::NoQuirks,
+            QuirksMode::LimitedQuirks => dom::QuirksMode::LimitedQuirks,
+            QuirksMode::Quirks => dom::QuirksMode::Quirks,
+        };
+        self.dom.borrow_mut().set_quirks_mode(stored);
     }
 
     fn append_before_sibling(&self, sibling: &Self::Handle, new_node: NodeOrText<Self::Handle>) {

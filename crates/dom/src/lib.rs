@@ -25,7 +25,7 @@ mod node;
 mod select;
 mod state;
 
-pub use arena::{Dom, DomError, NodeRef};
+pub use arena::{Dom, DomError, NodeRef, QuirksMode};
 pub use id::NodeId;
 pub use node::{Attribute, LocalName, Namespace, NodeKind, Prefix, QualName, html_namespace};
-pub use select::{ParseFail, ParseFailKind, QuirksMode, SelectError};
+pub use select::{ParseFail, ParseFailKind, SelectError};
