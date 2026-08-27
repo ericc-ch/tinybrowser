@@ -11,6 +11,16 @@ Sub-5MB stripped x86_64 binary is the goal. Measure size at milestones.
 - Web-platform behavior is defined by the WHATWG specs. When implementing or reviewing a conformance claim, cite the governing spec section right where it is implemented (anchor links, e.g. `dom.spec.whatwg.org/#concept-node-ensure-pre-insert-validity`).
 - For engine ground truth on how browsers actually behave, read Firefox's implementation: fetch single files from `github.com/mozilla-firefox/firefox` (via `raw.githubusercontent.com`) or search [searchfox.org](https://searchfox.org). Never clone that repo, it is far too big.
 
+## Environment
+
+- The pinned toolchain (rustc/cargo 1.98, rustfmt, clippy) and the OpenSSL that
+  `native-tls` links against come from the nix flake devshell (`flake.nix`,
+  `rust-toolchain.toml`). Run cargo inside it: `nix develop --command cargo …`
+  (or `direnv allow` once, since `.envrc` runs `use flake`). The repo edition is
+  2024, so the system's stock toolchain may be too old outside the devshell.
+- `cargo test -p browser` needs the vendored html5lib suite; initialize it with
+  `git submodule update --init --recursive`.
+
 ## Further Reading
 
 - `CONTEXT.md`
