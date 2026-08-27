@@ -221,9 +221,10 @@ impl Agent {
         RequestBuilder::new(self.clone(), method, url)
     }
 
-    /// Cookie-string for `uri` as `document.cookie` would see it
+    /// Cookie-string for `uri` using the non-HTTP jar API
     /// ([RFC 6265bis §5.8.2](https://httpwg.org/http-extensions/draft-ietf-httpbis-rfc6265bis.html#name-non-http-apis)):
     /// `HttpOnly` cookies are omitted; `Secure` cookies omit on cleartext URIs.
+    /// Page `document.cookie` in `browser` calls this; it is not the DOM property.
     #[must_use]
     pub fn cookies_for(&self, uri: &Url) -> String {
         self.jar
@@ -239,9 +240,10 @@ impl Agent {
             })
     }
 
-    /// Store one `Set-Cookie` line against `uri` as `document.cookie` would
+    /// Store one cookie line against `uri` using the non-HTTP jar API
     /// ([RFC 6265bis §5.8.2](https://httpwg.org/http-extensions/draft-ietf-httpbis-rfc6265bis.html#name-non-http-apis)).
-    /// Invalid or `HttpOnly` input is ignored.
+    /// Invalid or `HttpOnly` input is ignored. Page `document.cookie` assignment
+    /// in `browser` calls this.
     pub fn set_cookie(&self, value: &str, uri: &Url) {
         self.jar
             .lock()

@@ -1,6 +1,7 @@
 We are building the smallest headless browser for AI agents.
 Single binary, no cheating, no sidecar processes.
 Sub-5MB stripped x86_64 binary is the goal. Measure size at milestones.
+Prefer the light path that stays fast for one page: our HTML job list, Tokio only as the waiter, not a web-server stack.
 
 ## Working rules
 
@@ -10,6 +11,8 @@ Sub-5MB stripped x86_64 binary is the goal. Measure size at milestones.
 - Breaking changes and full rewrites are always fine. When code fights you, assume it is wrong: zoom out, fix the design, don't patch around it.
 - Web-platform behavior is defined by the WHATWG specs. When implementing or reviewing a conformance claim, cite the governing spec section right where it is implemented (anchor links, e.g. `dom.spec.whatwg.org/#concept-node-ensure-pre-insert-validity`).
 - For engine ground truth on how browsers actually behave, read Firefox's implementation: fetch single files from `github.com/mozilla-firefox/firefox` (via `raw.githubusercontent.com`) or search [searchfox.org](https://searchfox.org). Never clone that repo, it is far too big.
+- One OS thread owns a page (`Dom`, later JS). That thread runs HTML jobs from a queue we own (parse, script, timer, `fetch` callback). The thread is a Tokio **current-thread** runtime with features `rt` and `time` only. Waiting on the network is `spawn_blocking` around `Agent::send()`, never a blocking `send()` on the page thread.
+- Do not add tokio `full`, smol, axum, or hyper. Those are a fat scheduler or HTTP *server* stacks. We are not a website. CDP, when it exists, is a thin socket on `std::net` unless a milestone proves otherwise. Size numbers: [`wiki/researches/size-budget.md`](wiki/researches/size-budget.md). Crate and loop decisions: [`wiki/works/engine-charter/map.md`](wiki/works/engine-charter/map.md).
 
 ## Environment
 

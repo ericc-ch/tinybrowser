@@ -191,7 +191,29 @@ code on the old M1 connector. Accepted.
   confirm at the next parse+query probe.
 
 - DOM→JS binding glue: hundreds of rquickjs classes add up; keep dispatch tables data-driven.
-- CDP server: tokio-tungstenite-style async stack is expensive; prefer a lean HTTP+WebSocket impl on `std::net`.
+- CDP server: do not take axum/hyper/tokio `full`. Prefer a lean HTTP+WebSocket impl on `std::net`.
 - A11y walker (accname computation, role mapping): budget ~100–200 KB, fine, but measure.
 - When the deferred stealth milestone lands net on btls ([ADR 0006](../adrs/0006-net-transport.md)): pin the crate family like html5ever (its BoringSSL fork is wreq-ecosystem); impersonation presets go stale with every Chrome release — a stale preset is itself a detection signal, so bump discipline applies to persona tables, not just crates.
 - Re-measure marginals at every milestone; regressions must justify themselves in bytes.
+
+## Milestone: async runtime probes (2026-08-27)
+
+Throwaway binaries, rustc 1.98.0, tuned profile as in the root Cargo.toml. Each probe
+called the library (sleep, spawn, and/or a TCP connect to `127.0.0.1:1`) so LTO could
+not drop it. Empty `main` re-measured at 284 KB (290912 bytes).
+
+| Probe | What ran | tuned delta |
+| ------------------------------------------------ | --- | ------- |
+| tokio 1.53 `rt`+`time`, current-thread | `sleep(1ms)` | **+66 KB** |
+| tokio `rt`+`time`+`net`, current-thread | sleep + `TcpStream` | **+116 KB** |
+| tokio `rt-multi-thread`+`time` | sleep + `spawn` | **+144 KB** |
+| tokio `full` (mt + net + fs + …) | sleep + spawn + TCP + `fs::metadata` | **+208 KB** |
+| smol 2 | `Timer` + `spawn` | **+142 KB** |
+| `async-executor` + `async-io` | local executor + timer + spawn | **+85 KB** |
+| `futures` `LocalPool` | ready future only (no timer, no I/O) | **+12 KB** |
+
+Tokio 1.53 default features are empty; `full` is the fat switch. smol is not smaller
+than current-thread tokio with timers. Decision: page thread is tokio current-thread
+`rt`+`time` (~+66 KB); HTML jobs stay our queue; ureq via `spawn_blocking`; never
+`full` / smol / axum / hyper ([engine charter ticket 02](../works/engine-charter/tickets/02-event-loop.md)).
+Add tokio `net` only if a later milestone needs async sockets on that runtime.

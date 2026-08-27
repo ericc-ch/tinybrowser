@@ -5,10 +5,9 @@
 //!
 //! # Seam map
 //!
-//! Dependencies go downward only; `browser` is the single fan-in point.
-//! See [`wiki/adrs/0001-workspace-crates-with-enforced-edges.md`](../wiki/adrs/0001-workspace-crates-with-enforced-edges.md).
-//!
 //! ```text
-//! main → browser → {dom, net, js}
+//! main → browser → {dom, net}
 //!      (future: cdp → browser)
 //! ```
+//!
+//! See [ADR 0007](../wiki/adrs/0007-engine-charter.md).

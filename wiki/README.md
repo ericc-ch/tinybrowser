@@ -8,12 +8,19 @@ Index of project knowledge. Query starts here.
 
 ## ADRs
 
-- [0001 Workspace crates with enforced edges](adrs/0001-workspace-crates-with-enforced-edges.md) — downward-only crate graph; `browser` is the fan-in point
+- [0001 Workspace crates](adrs/0001-workspace-crates-with-enforced-edges.md) — history: not a monolith; live graph is 0007
 - [0002 DOM layer architecture](adrs/0002-dom-layer-architecture.md) — generational arena, TreeSink in `browser` (supersedes 0003 and 0004)
 - [0003 TreeSink adapter in browser](adrs/0003-treesink-adapter-in-browser.md) — superseded by 0002
 - [0004 DOM v1 audit acceptances](adrs/0004-dom-v1-audit-acceptances.md) — superseded by 0002
 - [0005 html5lib tree-construction suite](adrs/0005-html5lib-tree-construction-suite.md) — pinned submodule harness; fix-or-document divergences
 - [0006 Net transport](adrs/0006-net-transport.md) — v1 is ureq 3 + native-tls; stealth deferred to hand-rolled btls
+- [0007 Engine charter](adrs/0007-engine-charter.md) — three crates, HTML jobs + Tokio waiter, `browser` holds `Agent`
+
+## Works
+
+- [Engine charter](works/engine-charter/map.md) — thinner crate law and the real holes
+- [Engine charter spec](works/engine-charter/spec.md) — decided engine shape (loop, crates, layers)
+- [Engine charter session](works/engine-charter/session.md) — 2026-08-27 continuation
 
 ## Research
 

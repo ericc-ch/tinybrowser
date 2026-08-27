@@ -1,14 +1,9 @@
-//! `PageActor` and navigation lifecycle: sessions, waits, wiring.
+//! Engine crate: `parse_html` (html5ever `TreeSink`) and, later, the page
+//! (jobs, `Agent`, QuickJS). Depends on `dom` and `net`
+//! ([ADR 0007](../../wiki/adrs/0007-engine-charter.md)).
 //!
-//! The single fan-in point over `dom`, `net`, and `js`. Injects the HTTP
-//! adapter into the JS runtime. Everything above it goes through here; when
-//! CDP arrives it will depend on this crate alone.
-//!
-//! This crate also hosts the html5ever [`TreeSink`] adapter (per
-//! wiki/adrs/0002-dom-layer-architecture.md): the parser narrates tree
-//! construction, and [`Sink`] translates each instruction into `Dom`
-//! mutations. Storage stays parser-free in `dom`; parsing stays storage-free
-//! here.
+//! Future CDP depends on this crate alone. Fetch is `net::Agent` held here,
+//! not a `HttpTransport` trait.
 
 use std::borrow::Cow;
 use std::cell::{Cell, RefCell};

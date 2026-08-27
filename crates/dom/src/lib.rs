@@ -14,9 +14,8 @@
 //! # Seam map
 //!
 //! ```text
-//! browser (or glue crate):  html5ever TreeSink → Dom mutations
-//! js:                       QuickJS wrappers ↔ NodeId handles
-//! dom:                      slots, generations, children lists
+//! browser:  html5ever TreeSink → Dom mutations; later QuickJS ↔ NodeId
+//! dom:      slots, generations, children lists
 //! ```
 
 mod arena;

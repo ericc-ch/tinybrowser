@@ -21,13 +21,12 @@
 //! # Seam map
 //!
 //! ```text
-//! browser (fan-in):  navigation + injected fetch/XHR/WebSocket over Agent
-//! js:                HttpTransport trait defined in js, implemented in browser
-//! net:               dial, stream, cookie jar above the transport
+//! browser:  navigation + fetch/XHR/WebSocket over Agent (holds Agent)
+//! net:      dial, stream, cookie jar
 //! ```
 //!
-//! Sync everywhere (`std::net`, no tokio). Blocking IO is the default
-//! until a decision says otherwise.
+//! Blocking `send()` / `upgrade`. The page thread must call them through
+//! Tokio `spawn_blocking` ([ADR 0007](../../wiki/adrs/0007-engine-charter.md)).
 
 mod agent;
 mod connector;

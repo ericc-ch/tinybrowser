@@ -432,8 +432,8 @@ pub(crate) fn is_defined(dom: &Dom, id: NodeId) -> bool {
 /// [`lang_range_matches`] for the exact algorithm, including wildcards.
 ///
 /// Only the literal `lang` attribute feeds inheritance today; `xml:lang`
-/// and HTTP `Content-Language` defaults are unrepresented (documented cut,
-/// revisit with the net layer).
+/// and HTTP `Content-Language` defaults are unrepresented (document state
+/// in `browser` / `Dom` when navigation exists, not a `net` feature).
 pub(crate) fn lang_matches(dom: &Dom, id: NodeId, ranges: &[Box<str>]) -> bool {
     let mut found: Option<&str> = None;
     let mut cursor = Some(id);

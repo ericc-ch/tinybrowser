@@ -30,7 +30,7 @@ Recursively freeing a subtree's slots so every handle into it goes stale.
 _Avoid_: drop, delete
 
 **TreeSink adapter**:
-Thin layer above dom that translates html5ever's tree-construction instructions into Dom mutations; lives in `browser` as `browser::parse_html` (ADR 0002) and owns the parser dependency, keeping dom free of parser crates (dom itself carries only markup5ever for names).
+Thin layer in `browser` (`parse_html`) that translates html5ever tree-construction instructions into `Dom` mutations. `dom` has no html5ever dependency; it still pins `markup5ever` for interned names. Template contents are associated on `Dom`.
 _Avoid_: parser glue, binding layer
 
 **QualName**:
@@ -38,7 +38,8 @@ Qualified element name: namespace plus optional prefix plus local name. Comes fr
 _Avoid_: tag name (only the local part)
 
 **Fan-in point**:
-The `browser` crate: the only place allowed to depend on several layers at once (ADR 0001).
+The `browser` crate: engine (parser + later page). Root `tinybrowser` depends on it only. Future `cdp` depends on it only ([ADR 0007](adrs/0007-engine-charter.md)).
+_Avoid_: “only crate that may import two layers” as a religion; `cargo test -p dom` is allowed
 
 **Scope**:
 The live node a selector query is rooted at; candidates are its descendants in document order, and the scope itself is never one of its own results, while matching still sees real ancestors above it.
@@ -49,7 +50,7 @@ The one gate every dom insertion walks (`append`, `insert_before`), mirroring WH
 _Avoid_: append checks, validation scattered per method
 
 **Element state**:
-A pseudo-class truth (`:disabled`, `:lang(en)`, …) answered by `state.rs` against static markup: fully when markup determines it, otherwise as a documented static subset; states whose context cannot exist in a headless tree (pointer, focus, history) parse but match nothing.
+A pseudo-class truth (`:disabled`, `:lang(en)`, …) answered by `state.rs` against static markup: fully when markup determines it, otherwise as a documented static subset; states whose context cannot exist in a headless tree (pointer, focus, history) parse but match nothing. `:lang()` document language beyond the `lang` attribute is page/`Dom` state, not `net`.
 _Avoid_: pseudo-class handling (that word covers parsing too)
 
 **HTML integration point**:
@@ -57,8 +58,16 @@ A foreign-content element where HTML parsing resumes instead of breaking out: SV
 _Avoid_: integration element, breakout point
 
 **Hard seam**:
-The `net` crate's public type surface: every name callers see (`Agent`, `RequestBuilder`, `Response`, `Body`, `HeaderMap`, `Method`, `Context`, `NetError`, `WebSocket`) is ours, so a later transport swap (hand-rolled btls) cannot leak ureq or tungstenite types into `browser` or `js`.
+The `net` crate's public type surface: every name callers see (`Agent`, `RequestBuilder`, `Response`, `Body`, `HeaderMap`, `Method`, `Context`, `NetError`, `WebSocket`) is ours, so a later transport swap cannot leak ureq or tungstenite into `browser`.
 _Avoid_: abstraction layer, backend boundary (those mix the type rule with the conversion point)
+
+**HTML job**:
+One unit of page work the spec orders: parse, run a script, fire `setTimeout`, deliver a `fetch` callback. Our queue on the page thread, not Tokio's Future list.
+_Avoid_: async task (that means a Rust Future)
+
+**Host timer**:
+A JS function plus deadline stored by our `setTimeout` implementation. QuickJS does not own it. We call the function later via the engine.
+_Avoid_: macrotask inside QuickJS
 
 **Context**:
 Which initiator owns a `net` request (`Navigation`, `Fetch`, `Xhr`, `WsHandshake`). SameSite uses it for the Lax top-level navigation exception; schemeful same-site is initiator URL versus request URL. Future `Sec-Fetch-*` headers also key off it.
