@@ -2,23 +2,29 @@
 
 /// Handle to one node in a [`crate::Dom`].
 ///
-/// A `NodeId` is two integers: which slot of the arena to look in, and which
-/// generation of that slot the handle was issued for. When a node is destroyed
-/// its slot is recycled and the slot's generation ticks, so any handle issued
-/// earlier stops matching; every lookup then reports "gone" instead of
-/// returning some other node.
+/// A `NodeId` is three integers: which document it was issued by, which slot
+/// of that arena to look in, and which generation of that slot. Destroying a
+/// node recycles the slot and ticks generation, so an old handle reports
+/// "gone" instead of naming a stranger in the same cell. The document id
+/// stops a handle from document A from naming a live node in document B that
+/// happens to share slot and generation.
 ///
 /// Copy it freely, store it anywhere, hand it to JavaScript later. The only
 /// thing you can do with it is pass it back to the [`crate::Dom`] it came from.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct NodeId {
+    pub(crate) document: u32,
     pub(crate) slot: u32,
     pub(crate) generation: u32,
 }
 
 impl NodeId {
-    pub(crate) const fn new(slot: u32, generation: u32) -> Self {
-        Self { slot, generation }
+    pub(crate) const fn new(document: u32, slot: u32, generation: u32) -> Self {
+        Self {
+            document,
+            slot,
+            generation,
+        }
     }
 
     /// Slot index as an array position. Only valid when

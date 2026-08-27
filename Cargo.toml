@@ -47,7 +47,7 @@ cargo = { level = "deny", priority = -1 }
 cargo_common_metadata = { level = "allow", priority = 1 }
 # The servo selector stack (cssparser + selectors: phf 0.11, syn 2) and the
 # html5ever name stack (web_atoms via markup5ever =0.39.0: phf 0.13) are each
-# pinned by recorded decisions (docs/adr/0002, docs/size-budget.md). Their
+# pinned by recorded decisions (wiki/adrs/0002, wiki/researches/size-budget.md). Their
 # transitive overlap cannot be deduped without breaking a pin; measured, not
 # guessed, at every size checkpoint.
 multiple_crate_versions = { level = "allow", priority = 1 }
@@ -80,7 +80,7 @@ redundant_clone = "deny"
 needless_collect = "deny"
 
 # ─── Release profile ──────────────────────────────────────────────────────────
-# The tuned profile from docs/size-budget.md: every tuned marginal measured
+# The tuned profile from wiki/researches/size-budget.md: every tuned marginal measured
 # there assumes exactly these flags. Lives here so any measurement in the doc
 # reproduces verbatim (`cargo build --release`, no env overrides).
 [profile.release]

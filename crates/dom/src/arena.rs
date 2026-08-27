@@ -3,9 +3,33 @@
 use std::cell::Cell;
 use std::fmt;
 use std::marker::PhantomData;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use crate::id::NodeId;
 use crate::node::{Attribute, Node, NodeKind, QualName};
+
+/// Next document id for a freshly constructed [`Dom`]. Relaxed arithmetic is
+/// enough: the only requirement is that two live `Dom` values do not share
+/// an id until the counter wraps (2^32 documents, accepted like generation
+/// wrap).
+static NEXT_DOCUMENT_ID: AtomicU32 = AtomicU32::new(0);
+
+/// The document-compatibility mode a query runs under: what html5ever's
+/// tree builder reports and parsed pages carry.
+///
+/// It changes exactly one matching behavior: in full quirks mode, class
+/// and id selector values compare ASCII-case-insensitively (the WHATWG
+/// id/class quirk). Standards and limited-quirks modes stay exact.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum QuirksMode {
+    /// Standards mode: full CSS case rules.
+    #[default]
+    NoQuirks,
+    /// Limited quirks: same selector rules as standards mode.
+    LimitedQuirks,
+    /// Full quirks: legacy case-insensitive class/id matching.
+    Quirks,
+}
 
 /// Why a mutation was refused.
 ///
@@ -98,6 +122,8 @@ pub struct Dom {
     slots: Vec<Slot>,
     free: Vec<u32>,
     document: NodeId,
+    document_id: u32,
+    quirks_mode: QuirksMode,
     /// `Cell<()>` is `Send` + `!Sync`; `PhantomData` makes `Dom` inherit
     /// exactly that split. Deleting this field would silently re-derive
     /// `Sync`, which is the point: that deletion has to be a conscious act.
@@ -114,6 +140,7 @@ impl Dom {
     /// An empty document containing just the root `Document` node.
     #[must_use]
     pub fn new() -> Self {
+        let document_id = NEXT_DOCUMENT_ID.fetch_add(1, Ordering::Relaxed);
         let root = Node {
             parent: None,
             children: Vec::new(),
@@ -125,9 +152,23 @@ impl Dom {
                 node: Some(root),
             }],
             free: Vec::new(),
-            document: NodeId::new(0, 0),
+            document: NodeId::new(document_id, 0, 0),
+            document_id,
+            quirks_mode: QuirksMode::NoQuirks,
             _share_forbidden: PhantomData,
         }
+    }
+
+    /// Compatibility mode this document answers selector queries under.
+    #[must_use]
+    pub fn quirks_mode(&self) -> QuirksMode {
+        self.quirks_mode
+    }
+
+    /// Sets the compatibility mode. The html5ever adapter writes this from
+    /// the tree builder; tests may set it to exercise the id/class quirk.
+    pub fn set_quirks_mode(&mut self, mode: QuirksMode) {
+        self.quirks_mode = mode;
     }
 
     /// The root `Document` node; every other node descends from it.
@@ -180,7 +221,8 @@ impl Dom {
     /// so identity survives detachment too.
     #[must_use]
     pub(crate) fn cache_identity(&self, id: NodeId) -> &Slot {
-        &self.slots[id.index()]
+        self.live_slot(id)
+            .expect("selector cache identity requires a live handle")
     }
 
     /// Creates an element node, unattached until something appends it.
@@ -285,18 +327,11 @@ impl Dom {
             return Err(DomError::HierarchyRequest);
         }
         self.ensure_pre_insert_validity(parent, child, None)?;
-        self.unlink_from_current_parent(child);
-
-        // Defect guards, not input errors: liveness was checked above, so
-        // `None` here means the parent-pointer/child-list duality is broken.
-        // Panicking beats reporting a lying "stale node" to callers.
-        let list = self
-            .children_mut(parent)
-            .expect("verified-live parent has no child list");
-        list.push(child);
-        if let Some(node) = self.node_mut(child) {
-            node.parent = Some(parent);
+        if self.is_fragment(child) {
+            self.splice_fragment(parent, child, None);
+            return Ok(());
         }
+        self.place_node(parent, child, None);
         Ok(())
     }
 
@@ -325,6 +360,9 @@ impl Dom {
         // beside; a detached one has none: the outer pre-insert
         // algorithm's parent-null refusal (`NotFoundError`).
         let parent = self.parent(sibling).ok_or(DomError::NoParent)?;
+        if node == self.document {
+            return Err(DomError::HierarchyRequest);
+        }
         // Node-beside-itself means "stay put": the gate would reject this
         // as a cycle (a node contains itself), but the spec's answer is a
         // silent return, so it short-circuits before validation.
@@ -332,23 +370,11 @@ impl Dom {
             return Ok(());
         }
         self.ensure_pre_insert_validity(parent, node, Some(sibling))?;
-        self.unlink_from_current_parent(node);
-
-        // Defect guards, not input errors: `parent` and `sibling` were both
-        // verified live above, so a miss here means the parent-pointer/
-        // child-list duality is broken. Panicking beats reporting a lying
-        // "stale node" to callers.
-        let list = self
-            .children_mut(parent)
-            .expect("verified-live parent has no child list");
-        let position = list
-            .iter()
-            .position(|&entry| entry == sibling)
-            .expect("live sibling missing from its own parent's list");
-        list.insert(position, node);
-        if let Some(attached) = self.node_mut(node) {
-            attached.parent = Some(parent);
+        if self.is_fragment(node) {
+            self.splice_fragment(parent, node, Some(sibling));
+            return Ok(());
         }
+        self.place_node(parent, node, Some(sibling));
         Ok(())
     }
 
@@ -397,39 +423,43 @@ impl Dom {
         // `insert_before` before calling this gate: the spec's answer there
         // is *do nothing*, which a validation-only function cannot express.
         //
-        // Content-model rules. Outside a document, a doctype is never
-        // welcome and everything else slides in unchecked.
+        // Content-model rules. Outside a document, a doctype as the
+        // inserted node is never welcome; a fragment's children are not
+        // checked here (the spec returns after the doctype-on-node
+        // test: <https://dom.spec.whatwg.org/#concept-node-ensure-pre-insert-validity>).
         if !matches!(
             self.get(parent).map(|view| view.kind()),
             Some(NodeKind::Document)
         ) {
-            if matches!(
-                self.get(node).map(|view| view.kind()),
-                Some(NodeKind::Doctype { .. })
-            ) {
+            if !self.is_fragment(node)
+                && matches!(
+                    self.get(node).map(|view| view.kind()),
+                    Some(NodeKind::Doctype { .. })
+                )
+            {
                 return Err(DomError::HierarchyRequest);
             }
             return Ok(());
         }
-        // Inside a document: splice `node` into the standing children at its
-        // insertion point and hand the whole resulting sequence to the
-        // content model: the same single encoding the bulk-move path
-        // answers to, where positional flag-scanning would duplicate the
-        // invariant (and per-child checks cannot see a violating pair like
-        // `[html, main]`).
+        // Inside a document: splice the incoming nodes (the node itself,
+        // or a fragment's children —
+        // <https://dom.spec.whatwg.org/#concept-node-insert>) into the
+        // standing children at the insertion point and hand the whole
+        // resulting sequence to the content model.
+        let incoming = self.incoming_nodes(node);
         let mut sequence: Vec<NodeId> = Vec::new();
         let mut inserted = false;
         if let Some(kids) = self.children(parent) {
             for existing in kids {
                 if !inserted && Some(*existing) == reference {
-                    sequence.push(node);
+                    sequence.extend_from_slice(&incoming);
                     inserted = true;
                 }
                 sequence.push(*existing);
             }
         }
         if !inserted {
-            sequence.push(node);
+            sequence.extend_from_slice(&incoming);
         }
         self.ensure_document_content_model(&sequence)
     }
@@ -462,7 +492,7 @@ impl Dom {
     /// pointer is updated. Endpoints must be container kinds, and draining
     /// the document root is refused. For non-document destinations the
     /// shape of the moved run stays unvalidated: the html5ever tree
-    /// builder's trusted internal flows (ADR 0003) never emit
+    /// builder's trusted internal flows (ADR 0002) never emit
     /// content-model violations, and gated insertion paths make smuggling
     /// impossible (a doctype can only ever sit directly under the root,
     /// so none can appear in a moved run). When `to` **is** the document,
@@ -678,16 +708,99 @@ impl Dom {
     // ── internals ────────────────────────────────────────────────────────
 
     fn live_slot(&self, id: NodeId) -> Option<&Slot> {
+        if id.document != self.document_id {
+            return None;
+        }
         self.slots
             .get(id.index())
             .filter(|slot| slot.generation == id.generation && slot.node.is_some())
     }
 
     fn node_mut(&mut self, id: NodeId) -> Option<&mut Node> {
+        if id.document != self.document_id {
+            return None;
+        }
         self.slots
             .get_mut(id.index())
             .filter(|slot| slot.generation == id.generation)
             .and_then(|slot| slot.node.as_mut())
+    }
+
+    fn is_fragment(&self, id: NodeId) -> bool {
+        matches!(
+            self.get(id).map(|view| view.kind()),
+            Some(NodeKind::Fragment)
+        )
+    }
+
+    /// Nodes the insert algorithm actually places: a fragment's children,
+    /// otherwise the node itself
+    /// (<https://dom.spec.whatwg.org/#concept-node-insert>).
+    fn incoming_nodes(&self, node: NodeId) -> Vec<NodeId> {
+        if self.is_fragment(node) {
+            self.children(node)
+                .map(|kids| kids.copied().collect())
+                .unwrap_or_default()
+        } else {
+            vec![node]
+        }
+    }
+
+    /// Places a non-fragment `node` under `parent` before `before` (or at
+    /// the end when `before` is `None`).
+    fn place_node(&mut self, parent: NodeId, node: NodeId, before: Option<NodeId>) {
+        self.unlink_from_current_parent(node);
+        let list = self
+            .children_mut(parent)
+            .expect("verified-live parent has no child list");
+        match before {
+            None => list.push(node),
+            Some(sibling) => {
+                let position = list
+                    .iter()
+                    .position(|&entry| entry == sibling)
+                    .expect("live sibling missing from its own parent's list");
+                list.insert(position, node);
+            }
+        }
+        if let Some(attached) = self.node_mut(node) {
+            attached.parent = Some(parent);
+        }
+    }
+
+    /// Insert a fragment by moving its children under `parent`, leaving the
+    /// fragment empty and unparented
+    /// (<https://dom.spec.whatwg.org/#concept-node-insert>).
+    fn splice_fragment(&mut self, parent: NodeId, fragment: NodeId, before: Option<NodeId>) {
+        self.unlink_from_current_parent(fragment);
+        if let Some(node) = self.node_mut(fragment) {
+            node.parent = None;
+        }
+        let moved = self
+            .children_mut(fragment)
+            .map(std::mem::take)
+            .expect("verified-live fragment has no child list");
+        if moved.is_empty() {
+            return;
+        }
+        let list = self
+            .children_mut(parent)
+            .expect("verified-live parent has no child list");
+        let position = match before {
+            None => list.len(),
+            Some(sibling) => list
+                .iter()
+                .position(|&entry| entry == sibling)
+                .expect("live sibling missing from its own parent's list"),
+        };
+        for (offset, id) in moved.iter().enumerate() {
+            list.insert(position + offset, *id);
+        }
+        for id in moved {
+            if let Some(node) = self.node_mut(id) {
+                node.parent = Some(parent);
+            }
+        }
     }
 
     fn children_mut(&mut self, id: NodeId) -> Option<&mut Vec<NodeId>> {
@@ -781,7 +894,7 @@ impl Dom {
                 generation,
                 node: Some(node),
             };
-            return NodeId::new(slot, generation);
+            return NodeId::new(self.document_id, slot, generation);
         }
         // The bound is the `u32` handle width itself; exhausting it requires
         // >4 billion slots (hundreds of GB of arena), an impossible runtime
@@ -795,6 +908,6 @@ impl Dom {
             generation: 0,
             node: Some(node),
         });
-        NodeId::new(slot, 0)
+        NodeId::new(self.document_id, slot, 0)
     }
 }

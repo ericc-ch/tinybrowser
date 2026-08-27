@@ -5,7 +5,7 @@
 //! each scripting-flag setting the case demands) and compares the resulting
 //! tree, rendered in html5lib dump form ([`dump`]), against the spec-mandated
 //! `#document` section. This is the parse-correctness bar from
-//! `docs/testing.md`: the same suite production engines run, covering the
+//! `wiki/researches/testing.md`: the same suite production engines run, covering the
 //! tree-construction algorithms hand-written fixtures miss (foster parenting,
 //! adoption agency, template contents).
 //!

@@ -129,20 +129,14 @@ fn build() -> Page {
 #[test]
 fn type_selector_matches_by_local_name_in_document_order() {
     let page = build();
-    let hits = page
-        .d
-        .select_all(page.d.document(), "p", QuirksMode::NoQuirks)
-        .unwrap();
+    let hits = page.d.select_all(page.d.document(), "p").unwrap();
     assert_eq!(hits, vec![page.first_p, page.second_p]);
 }
 
 #[test]
 fn universal_selects_every_element_but_nothing_else() {
     let page = build();
-    let hits = page
-        .d
-        .select_all(page.d.document(), "*", QuirksMode::NoQuirks)
-        .unwrap();
+    let hits = page.d.select_all(page.d.document(), "*").unwrap();
     assert_eq!(
         hits,
         vec![
@@ -166,28 +160,20 @@ fn universal_selects_every_element_but_nothing_else() {
 fn class_and_id_match_token_lists() {
     let page = build();
     assert_eq!(
-        page.d
-            .select_all(page.d.document(), "#main", QuirksMode::NoQuirks)
-            .unwrap(),
+        page.d.select_all(page.d.document(), "#main").unwrap(),
         vec![page.main]
     );
     assert_eq!(
-        page.d
-            .select_all(page.d.document(), ".b", QuirksMode::NoQuirks)
-            .unwrap(),
+        page.d.select_all(page.d.document(), ".b").unwrap(),
         vec![page.main]
     );
     assert_eq!(
-        page.d
-            .select_all(page.d.document(), ".x", QuirksMode::NoQuirks)
-            .unwrap(),
+        page.d.select_all(page.d.document(), ".x").unwrap(),
         vec![page.first_p, page.li3]
     );
     // multiple classes on one element
     assert_eq!(
-        page.d
-            .select_first(page.d.document(), ".y.z", QuirksMode::NoQuirks)
-            .unwrap(),
+        page.d.select_first(page.d.document(), ".y.z").unwrap(),
         Some(page.second_p)
     );
 }
@@ -197,36 +183,18 @@ fn attribute_operators_follow_css_rules() {
     let page = build();
 
     assert_eq!(
-        page.d
-            .select_first(page.d.document(), "[href]", QuirksMode::NoQuirks)
-            .unwrap(),
+        page.d.select_first(page.d.document(), "[href]").unwrap(),
         Some(page.span)
     );
     assert_eq!(
         page.d
-            .select_first(
-                page.d.document(),
-                r#"[href="https://example.com/page"]"#,
-                QuirksMode::NoQuirks
-            )
+            .select_first(page.d.document(), r#"[href="https://example.com/page"]"#)
             .unwrap(),
         Some(page.span)
     );
-    assert!(
-        page.d
-            .matches(page.span, r#"[href^="https://"]"#, QuirksMode::NoQuirks)
-            .unwrap()
-    );
-    assert!(
-        page.d
-            .matches(page.span, r#"[href$="/page"]"#, QuirksMode::NoQuirks)
-            .unwrap()
-    );
-    assert!(
-        page.d
-            .matches(page.span, "[href*=\"example\"]", QuirksMode::NoQuirks)
-            .unwrap()
-    );
+    assert!(page.d.matches(page.span, r#"[href^="https://"]"#).unwrap());
+    assert!(page.d.matches(page.span, r#"[href$="/page"]"#).unwrap());
+    assert!(page.d.matches(page.span, "[href*=\"example\"]").unwrap());
 
     // ~= token match and |= dash-prefix match need purpose-built fixtures
     let mut d = Dom::new();
@@ -237,45 +205,22 @@ fn attribute_operators_follow_css_rules() {
     d.append(body, rel).unwrap();
     d.append(body, lang).unwrap();
 
-    assert!(
-        d.matches(rel, r#"[rel~="nofollow"]"#, QuirksMode::NoQuirks)
-            .unwrap()
-    );
-    assert!(
-        !d.matches(rel, r#"[rel~="follow"]"#, QuirksMode::NoQuirks)
-            .unwrap()
-    );
-    assert!(
-        d.matches(lang, "[lang|=\"en\"]", QuirksMode::NoQuirks)
-            .unwrap()
-    );
-    assert!(
-        !d.matches(lang, "[lang|=\"fr\"]", QuirksMode::NoQuirks)
-            .unwrap()
-    );
+    assert!(d.matches(rel, r#"[rel~="nofollow"]"#).unwrap());
+    assert!(!d.matches(rel, r#"[rel~="follow"]"#).unwrap());
+    assert!(d.matches(lang, "[lang|=\"en\"]").unwrap());
+    assert!(!d.matches(lang, "[lang|=\"fr\"]").unwrap());
     // `lang` is on the HTML list of value-case-insensitive attributes...
-    assert!(
-        d.matches(lang, "[LANG=\"en-us\"]", QuirksMode::NoQuirks)
-            .unwrap()
-    );
+    assert!(d.matches(lang, "[LANG=\"en-us\"]").unwrap());
     // ...`href` is not: exact compare misses, the `i` flag hits
     assert!(
         !page
             .d
-            .matches(
-                page.span,
-                r#"[href="HTTPS://EXAMPLE.COM/PAGE"]"#,
-                QuirksMode::NoQuirks
-            )
+            .matches(page.span, r#"[href="HTTPS://EXAMPLE.COM/PAGE"]"#)
             .unwrap()
     );
     assert!(
         page.d
-            .matches(
-                page.span,
-                r#"[href="HTTPS://EXAMPLE.COM/PAGE" i]"#,
-                QuirksMode::NoQuirks
-            )
+            .matches(page.span, r#"[href="HTTPS://EXAMPLE.COM/PAGE" i]"#)
             .unwrap()
     );
 }
@@ -286,37 +231,24 @@ fn combinators_respect_tree_structure() {
     let doc = page.d.document();
 
     assert_eq!(
-        page.d
-            .select_all(doc, "ul > li", QuirksMode::NoQuirks)
-            .unwrap(),
+        page.d.select_all(doc, "ul > li").unwrap(),
         vec![page.li1, page.li2, page.li3]
     );
     assert_eq!(
-        page.d
-            .select_all(doc, "body > p", QuirksMode::NoQuirks)
-            .unwrap(),
+        page.d.select_all(doc, "body > p").unwrap(),
         Vec::<NodeId>::new(),
         "the paragraphs sit under div, not body"
     );
     // adjacent sibling: text nodes are skipped
     assert_eq!(
-        page.d
-            .select_first(doc, "span + p", QuirksMode::NoQuirks)
-            .unwrap(),
+        page.d.select_first(doc, "span + p").unwrap(),
         Some(page.second_p)
     );
     // subsequent sibling across the ul subtree boundary
-    assert_eq!(
-        page.d
-            .select_first(doc, "div ~ em", QuirksMode::NoQuirks)
-            .unwrap(),
-        Some(page.em)
-    );
+    assert_eq!(page.d.select_first(doc, "div ~ em").unwrap(), Some(page.em));
     // ancestors above the scope stay visible to combinators
     assert_eq!(
-        page.d
-            .select_first(page.main, "body > *", QuirksMode::NoQuirks)
-            .unwrap(),
+        page.d.select_first(page.main, "body > *").unwrap(),
         None,
         "div's descendants cannot have body as parent"
     );
@@ -327,46 +259,29 @@ fn structural_pseudos_work_through_the_engine() {
     let page = build();
     let doc = page.d.document();
 
+    assert_eq!(page.d.select_first(doc, ":root").unwrap(), Some(page.html));
     assert_eq!(
-        page.d
-            .select_first(doc, ":root", QuirksMode::NoQuirks)
-            .unwrap(),
-        Some(page.html)
-    );
-    assert_eq!(
-        page.d
-            .select_first(page.main, "p:first-child", QuirksMode::NoQuirks)
-            .unwrap(),
+        page.d.select_first(page.main, "p:first-child").unwrap(),
         Some(page.first_p)
     );
     assert_eq!(
-        page.d
-            .select_first(page.main, "p:last-child", QuirksMode::NoQuirks)
-            .unwrap(),
+        page.d.select_first(page.main, "p:last-child").unwrap(),
         Some(page.second_p)
     );
     assert_eq!(
-        page.d
-            .select_all(page.list, "li:nth-child(2n+1)", QuirksMode::NoQuirks)
-            .unwrap(),
+        page.d.select_all(page.list, "li:nth-child(2n+1)").unwrap(),
         vec![page.li1, page.li3]
     );
     assert_eq!(
-        page.d
-            .select_all(doc, "li:not(.x)", QuirksMode::NoQuirks)
-            .unwrap(),
+        page.d.select_all(doc, "li:not(.x)").unwrap(),
         vec![page.li1, page.li2]
     );
     assert_eq!(
-        page.d
-            .select_all(doc, ":is(h1, em)", QuirksMode::NoQuirks)
-            .unwrap(),
+        page.d.select_all(doc, ":is(h1, em)").unwrap(),
         vec![page.em]
     );
     assert_eq!(
-        page.d
-            .select_all(doc, "div:has(> span)", QuirksMode::NoQuirks)
-            .unwrap(),
+        page.d.select_all(doc, "div:has(> span)").unwrap(),
         vec![page.main]
     );
 }
@@ -383,17 +298,16 @@ fn empty_matches_only_truly_empty_elements() {
     let note = d.create_comment("only a comment");
     d.append(commented, note).unwrap();
 
-    assert!(d.matches(hollow, ":empty", QuirksMode::NoQuirks).unwrap());
+    assert!(d.matches(hollow, ":empty").unwrap());
     assert!(
-        d.matches(commented, ":empty", QuirksMode::NoQuirks)
-            .unwrap(),
+        d.matches(commented, ":empty").unwrap(),
         "comments do not count"
     );
 
     let filled = d.create_element(qn("div"), Vec::new());
     let letter = d.create_text("x");
     d.append(filled, letter).unwrap();
-    assert!(!d.matches(filled, ":empty", QuirksMode::NoQuirks).unwrap());
+    assert!(!d.matches(filled, ":empty").unwrap());
 }
 
 #[test]
@@ -406,17 +320,11 @@ fn detached_subtrees_are_invisible_from_the_document() {
     d.append(keep, orphan).unwrap();
 
     // while attached, the query sees it
-    assert_eq!(
-        d.select_all(doc, "aside", QuirksMode::NoQuirks).unwrap(),
-        vec![orphan]
-    );
+    assert_eq!(d.select_all(doc, "aside").unwrap(), vec![orphan]);
 
     // after detaching, the whole subtree vanishes from document queries...
     d.detach(orphan).unwrap();
-    assert_eq!(
-        d.select_all(doc, "*", QuirksMode::NoQuirks).unwrap(),
-        vec![keep]
-    );
+    assert_eq!(d.select_all(doc, "*").unwrap(), vec![keep]);
 
     // ...yet the subtree itself stays intact: the orphan is still live and
     // matchable (a scoped query excludes its own scope node, so `*` from the
@@ -426,44 +334,31 @@ fn detached_subtrees_are_invisible_from_the_document() {
     assert!(d.contains(orphan));
     assert_eq!(d.parent(note), Some(orphan));
     assert_eq!(
-        d.select_all(orphan, "*", QuirksMode::NoQuirks).unwrap(),
+        d.select_all(orphan, "*").unwrap(),
         Vec::<NodeId>::new(),
         "scope node excluded; text nodes never match"
     );
-    assert!(d.matches(orphan, "aside", QuirksMode::NoQuirks).unwrap());
+    assert!(d.matches(orphan, "aside").unwrap());
 }
 
 #[test]
 fn the_scope_node_is_never_its_own_hit() {
     let page = build();
-    let hits = page
-        .d
-        .select_all(page.main, "*", QuirksMode::NoQuirks)
-        .unwrap();
+    let hits = page.d.select_all(page.main, "*").unwrap();
     assert_eq!(
         hits,
         vec![page.first_p, page.span, page.second_p],
         "descendants only, document order"
     );
     // but the scope itself is still matchable through `matches`
-    assert!(
-        page.d
-            .matches(page.main, "div#main", QuirksMode::NoQuirks)
-            .unwrap()
-    );
+    assert!(page.d.matches(page.main, "div#main").unwrap());
 }
 
 #[test]
 fn results_are_document_ordered_regardless_of_selector_order() {
     let page = build();
-    let a = page
-        .d
-        .select_all(page.d.document(), "em, #main", QuirksMode::NoQuirks)
-        .unwrap();
-    let b = page
-        .d
-        .select_all(page.d.document(), "#main, em", QuirksMode::NoQuirks)
-        .unwrap();
+    let a = page.d.select_all(page.d.document(), "em, #main").unwrap();
+    let b = page.d.select_all(page.d.document(), "#main, em").unwrap();
     assert_eq!(a, vec![page.main, page.em]);
     assert_eq!(a, b);
 }
@@ -472,17 +367,10 @@ fn results_are_document_ordered_regardless_of_selector_order() {
 fn select_first_returns_first_hit_or_none() {
     let page = build();
     assert_eq!(
-        page.d
-            .select_first(page.d.document(), "li", QuirksMode::NoQuirks)
-            .unwrap(),
+        page.d.select_first(page.d.document(), "li").unwrap(),
         Some(page.li1)
     );
-    assert_eq!(
-        page.d
-            .select_first(page.d.document(), "h1", QuirksMode::NoQuirks)
-            .unwrap(),
-        None
-    );
+    assert_eq!(page.d.select_first(page.d.document(), "h1").unwrap(), None);
 }
 
 #[test]
@@ -492,15 +380,15 @@ fn stale_handles_are_reported_not_ignored() {
     page.d.destroy(ghost_target).unwrap();
 
     assert_eq!(
-        page.d.select_all(ghost_target, "*", QuirksMode::NoQuirks),
+        page.d.select_all(ghost_target, "*"),
         Err(SelectError::StaleNode)
     );
     assert_eq!(
-        page.d.select_first(ghost_target, "*", QuirksMode::NoQuirks),
+        page.d.select_first(ghost_target, "*"),
         Err(SelectError::StaleNode)
     );
     assert_eq!(
-        page.d.matches(ghost_target, "em", QuirksMode::NoQuirks),
+        page.d.matches(ghost_target, "em"),
         Err(SelectError::StaleNode)
     );
 }
@@ -509,17 +397,11 @@ fn stale_handles_are_reported_not_ignored() {
 fn matches_rejects_non_element_nodes() {
     let mut d = Dom::new();
     let text = d.create_text("plain");
-    assert_eq!(
-        d.matches(text, "*", QuirksMode::NoQuirks),
-        Err(SelectError::NotAnElement)
-    );
+    assert_eq!(d.matches(text, "*"), Err(SelectError::NotAnElement));
 
     // a destroyed handle still reports staleness, not kind confusion
     d.destroy(text).unwrap();
-    assert_eq!(
-        d.matches(text, "*", QuirksMode::NoQuirks),
-        Err(SelectError::StaleNode)
-    );
+    assert_eq!(d.matches(text, "*"), Err(SelectError::StaleNode));
 }
 
 #[test]
@@ -541,28 +423,18 @@ fn nth_child_of_indexes_the_matching_subset() {
 
     // `of S` renumbers within the matching subset: the two `.x` elements sit
     // at overall positions 3 and 4, so the *second* one is li.x, not b2.
+    assert_eq!(d.select_first(ul, ":nth-child(2 of .x)").unwrap(), Some(lx));
     assert_eq!(
-        d.select_first(ul, ":nth-child(2 of .x)", QuirksMode::NoQuirks)
-            .unwrap(),
-        Some(lx)
-    );
-    assert_eq!(
-        d.select_first(ul, "li:nth-child(1 of li.a)", QuirksMode::NoQuirks)
-            .unwrap(),
+        d.select_first(ul, "li:nth-child(1 of li.a)").unwrap(),
         Some(a1)
     );
     assert_eq!(
-        d.select_first(ul, "li:nth-child(2 of li.a)", QuirksMode::NoQuirks)
-            .unwrap(),
+        d.select_first(ul, "li:nth-child(2 of li.a)").unwrap(),
         Some(a5)
     );
 
     // plain nth-child still counts every element sibling
-    assert_eq!(
-        d.select_first(ul, ":nth-child(3)", QuirksMode::NoQuirks)
-            .unwrap(),
-        Some(px)
-    );
+    assert_eq!(d.select_first(ul, ":nth-child(3)").unwrap(), Some(px));
 }
 
 #[test]
@@ -584,12 +456,12 @@ fn link_pseudo_class_matches_html_links_under_either_spelling() {
         d.append(body, id).unwrap();
     }
 
-    let hits = d.select_all(doc, ":link", QuirksMode::NoQuirks).unwrap();
+    let hits = d.select_all(doc, ":link").unwrap();
     assert_eq!(hits, vec![anchor, shouty, link_el]);
 
     // CSS keywords are case-insensitive
     assert_eq!(
-        d.select_all(doc, ":LINK", QuirksMode::NoQuirks).unwrap(),
+        d.select_all(doc, ":LINK").unwrap(),
         hits,
         "keyword spelling changed the result"
     );
@@ -617,19 +489,14 @@ fn user_state_pseudo_classes_parse_but_never_match() {
         ":autofill",
     ] {
         assert_eq!(
-            page.d
-                .select_all(page.d.document(), selector, QuirksMode::NoQuirks)
-                .unwrap(),
+            page.d.select_all(page.d.document(), selector).unwrap(),
             Vec::new(),
             "{selector} matched a static headless tree"
         );
     }
     // ...and they parse inside compounds too.
     assert!(
-        !page
-            .d
-            .matches(page.span, "a:hover", QuirksMode::NoQuirks)
-            .unwrap(),
+        !page.d.matches(page.span, "a:hover").unwrap(),
         "compound with a state pseudo must not leak through"
     );
 }
@@ -638,45 +505,28 @@ fn user_state_pseudo_classes_parse_but_never_match() {
 fn unknown_state_pseudo_classes_still_refuse() {
     let page = build();
     assert!(matches!(
-        page.d
-            .select_all(page.d.document(), ":frobnicate", QuirksMode::NoQuirks),
+        page.d.select_all(page.d.document(), ":frobnicate"),
         Err(SelectError::Syntax(_))
     ));
 }
 
 #[test]
 fn quirks_mode_flips_class_and_id_case_rules() {
-    let page = build();
+    let mut page = build();
 
     // The fixture's div is `id="main" class="a b"`; exact spellings match
     // under every mode.
-    assert!(
-        page.d
-            .matches(page.main, ".b", QuirksMode::NoQuirks)
-            .unwrap()
-    );
+    assert!(page.d.matches(page.main, ".b").unwrap());
 
     // Standards and limited-quirks keep class/id values case-sensitive.
-    assert!(
-        !page
-            .d
-            .matches(page.main, ".B", QuirksMode::NoQuirks)
-            .unwrap()
-    );
-    assert!(
-        !page
-            .d
-            .matches(page.main, "#MAIN", QuirksMode::LimitedQuirks)
-            .unwrap()
-    );
+    assert!(!page.d.matches(page.main, ".B").unwrap());
+    page.d.set_quirks_mode(QuirksMode::LimitedQuirks);
+    assert!(!page.d.matches(page.main, "#MAIN").unwrap());
 
     // Full quirks applies the WHATWG id/class quirk: ASCII-insensitive.
-    assert!(page.d.matches(page.main, ".B", QuirksMode::Quirks).unwrap());
-    assert!(
-        page.d
-            .matches(page.main, "#MAIN", QuirksMode::Quirks)
-            .unwrap()
-    );
+    page.d.set_quirks_mode(QuirksMode::Quirks);
+    assert!(page.d.matches(page.main, ".B").unwrap());
+    assert!(page.d.matches(page.main, "#MAIN").unwrap());
 }
 
 #[test]
@@ -687,7 +537,7 @@ fn bad_selectors_are_syntax_errors_with_readable_messages() {
     for selector in ["", "  ", "div >", "..x", ":frobnicate", "::frobnicate"] {
         let error = page
             .d
-            .select_all(page.d.document(), selector, QuirksMode::NoQuirks)
+            .select_all(page.d.document(), selector)
             .expect_err(selector);
         match error {
             SelectError::Syntax(fail) => {
@@ -704,14 +554,10 @@ fn bad_selectors_are_syntax_errors_with_readable_messages() {
 #[test]
 fn syntax_errors_carry_a_machine_readable_class() {
     let page = build();
-    let class_of =
-        |selector: &str| match page
-            .d
-            .select_all(page.d.document(), selector, QuirksMode::NoQuirks)
-        {
-            Err(SelectError::Syntax(fail)) => fail.kind(),
-            other => panic!("{selector:?}: expected syntax error, got {other:?}"),
-        };
+    let class_of = |selector: &str| match page.d.select_all(page.d.document(), selector) {
+        Err(SelectError::Syntax(fail)) => fail.kind(),
+        other => panic!("{selector:?}: expected syntax error, got {other:?}"),
+    };
 
     assert_eq!(class_of(""), ParseFailKind::EmptySelector);
     assert_eq!(class_of("div >"), ParseFailKind::DanglingCombinator);
@@ -723,10 +569,7 @@ fn syntax_errors_carry_a_machine_readable_class() {
     );
 
     // the class travels with the text, not instead of it
-    let Err(SelectError::Syntax(fail)) =
-        page.d
-            .select_all(page.d.document(), ":frobnicate", QuirksMode::NoQuirks)
-    else {
+    let Err(SelectError::Syntax(fail)) = page.d.select_all(page.d.document(), ":frobnicate") else {
         unreachable!("expected a syntax error for :frobnicate");
     };
     assert_eq!(
@@ -744,20 +587,13 @@ fn pseudo_elements_parse_but_never_match() {
     let page = build();
     for selector in ["p::before", "p::after", "p::first-line", "::selection"] {
         assert_eq!(
-            page.d
-                .select_all(page.d.document(), selector, QuirksMode::NoQuirks)
-                .unwrap(),
+            page.d.select_all(page.d.document(), selector).unwrap(),
             Vec::<NodeId>::new(),
             "{selector} matched a tree that builds no boxes"
         );
     }
     // compound with a known pseudo-element also just matches nothing
-    assert!(
-        !page
-            .d
-            .matches(page.first_p, "p::marker", QuirksMode::NoQuirks)
-            .unwrap()
-    );
+    assert!(!page.d.matches(page.first_p, "p::marker").unwrap());
 }
 
 #[test]
@@ -774,13 +610,11 @@ fn type_selectors_without_namespace_qualifier_match_any_namespace() {
     d.append(d.document(), svg_circle).unwrap();
 
     assert_eq!(
-        d.select_all(d.document(), "circle", QuirksMode::NoQuirks)
-            .unwrap(),
+        d.select_all(d.document(), "circle").unwrap(),
         vec![svg_circle]
     );
     assert_eq!(
-        d.select_all(d.document(), "*|circle", QuirksMode::NoQuirks)
-            .unwrap(),
+        d.select_all(d.document(), "*|circle").unwrap(),
         vec![svg_circle]
     );
 }
@@ -799,10 +633,10 @@ fn hand_built_mixed_case_names_match_like_tokenized_trees_would() {
     d.append(doc, shouty).unwrap();
 
     // tag and attribute NAME casing is normalized away...
-    assert!(d.matches(shouty, "button", QuirksMode::NoQuirks).unwrap());
-    assert!(d.matches(shouty, ".Big", QuirksMode::NoQuirks).unwrap());
+    assert!(d.matches(shouty, "button").unwrap());
+    assert!(d.matches(shouty, ".Big").unwrap());
     // ...but class VALUE casing never is, in standards mode
-    assert!(!d.matches(shouty, ".big", QuirksMode::NoQuirks).unwrap());
+    assert!(!d.matches(shouty, ".big").unwrap());
 }
 
 // ── form-control UI states (HTML §pseudo-classes) ───────────────────────────
@@ -847,7 +681,7 @@ fn form_states_match_from_static_markup() {
     ] {
         d.append(body, id).unwrap();
     }
-    let hits = |selector: &str| d.select_all(body, selector, QuirksMode::NoQuirks).unwrap();
+    let hits = |selector: &str| d.select_all(body, selector).unwrap();
 
     // disableable population only: a div is neither enabled nor disabled
     assert_eq!(
@@ -918,7 +752,7 @@ fn fieldset_and_select_disability_inherits() {
     let sheltered = d.create_element(qn("option"), Vec::new());
     d.append(dead_group, sheltered).unwrap();
 
-    let hits = |selector: &str| d.select_all(body, selector, QuirksMode::NoQuirks).unwrap();
+    let hits = |selector: &str| d.select_all(body, selector).unwrap();
 
     // The reviewed code walked ancestors only for option/optgroup, so this
     // input answered `:enabled` while sitting in a dead fieldset (R3-3).
@@ -996,9 +830,7 @@ fn checked_defaults_apply_without_selected_attributes() {
     let bare = d.create_element(qn("option"), Vec::new());
     d.append(mixed, bare).unwrap();
 
-    let hits = d
-        .select_all(body, ":checked", QuirksMode::NoQuirks)
-        .unwrap();
+    let hits = d.select_all(body, ":checked").unwrap();
     assert_eq!(
         hits,
         vec![s1, p2, g_lone, g_pick],
@@ -1043,9 +875,7 @@ fn placeholder_shown_respects_input_types_and_values() {
         d.append(body, id).unwrap();
     }
 
-    let hits = d
-        .select_all(body, ":placeholder-shown", QuirksMode::NoQuirks)
-        .unwrap();
+    let hits = d.select_all(body, ":placeholder-shown").unwrap();
     assert_eq!(
         hits,
         vec![shown, searchable, area_empty],
@@ -1085,18 +915,14 @@ fn default_and_indeterminate_answer_their_static_subsets() {
         d.append(body, id).unwrap();
     }
 
-    let defaults = d
-        .select_all(body, ":default", QuirksMode::NoQuirks)
-        .unwrap();
+    let defaults = d.select_all(body, ":default").unwrap();
     assert_eq!(
         defaults,
         vec![box_checked, picked],
         "default submit buttons need the forms model; everything else is markup"
     );
 
-    let indeterminate = d
-        .select_all(body, ":indeterminate", QuirksMode::NoQuirks)
-        .unwrap();
+    let indeterminate = d.select_all(body, ":indeterminate").unwrap();
     assert_eq!(indeterminate, vec![loading]);
 }
 
@@ -1124,17 +950,13 @@ fn any_link_and_link_cover_html_and_svg() {
 
     for selector in [":link", ":any-link"] {
         assert_eq!(
-            d.select_all(doc, selector, QuirksMode::NoQuirks).unwrap(),
+            d.select_all(doc, selector).unwrap(),
             vec![svg_link, html_link],
             "{selector} should treat svg <a> as a hyperlink"
         );
     }
     // :visited parses beside :link and misses everything, as everywhere
-    assert!(
-        d.select_all(doc, ":visited", QuirksMode::NoQuirks)
-            .unwrap()
-            .is_empty()
-    );
+    assert!(d.select_all(doc, ":visited").unwrap().is_empty());
 }
 
 /// `:defined` (<https://html.spec.whatwg.org/#selector-defined>): true for
@@ -1164,27 +986,18 @@ fn defined_covers_everything_but_unregistered_custom_names() {
         d.append(body, id).unwrap();
     }
 
-    assert!(!d.matches(widget, ":defined", QuirksMode::NoQuirks).unwrap());
+    assert!(!d.matches(widget, ":defined").unwrap());
     // hand-built uppercase custom names are the same custom name
-    assert!(
-        !d.matches(shouty_widget, ":defined", QuirksMode::NoQuirks)
-            .unwrap()
-    );
+    assert!(!d.matches(shouty_widget, ":defined").unwrap());
     // reserved hyphenated SVG/HTML legacy names are not custom elements
-    assert!(
-        d.matches(reserved, ":defined", QuirksMode::NoQuirks)
-            .unwrap()
-    );
+    assert!(d.matches(reserved, ":defined").unwrap());
     // foreign elements are always defined, even with reserved-ish names
-    assert!(
-        d.matches(reserved_svg, ":defined", QuirksMode::NoQuirks)
-            .unwrap()
-    );
-    assert!(d.matches(plain, ":defined", QuirksMode::NoQuirks).unwrap());
+    assert!(d.matches(reserved_svg, ":defined").unwrap());
+    assert!(d.matches(plain, ":defined").unwrap());
 
     // and the split shows up in queries: only the two widgets miss
     // (body, reserved, reserved-svg, plain are all defined)
-    let hits = d.select_all(doc, ":defined", QuirksMode::NoQuirks).unwrap();
+    let hits = d.select_all(doc, ":defined").unwrap();
     assert_eq!(hits.len(), 4);
 }
 
@@ -1202,26 +1015,23 @@ fn lang_and_dir_inherit_from_ancestors() {
     d.append(rtl, inner).unwrap();
 
     // range matching: en-US satisfies :lang(en), not :lang(fr)
-    assert!(d.matches(inner, ":lang(en)", QuirksMode::NoQuirks).unwrap());
-    assert!(
-        d.matches(inner, ":LANG(en-US)", QuirksMode::NoQuirks)
-            .unwrap()
-    );
-    assert!(!d.matches(inner, ":lang(fr)", QuirksMode::NoQuirks).unwrap());
+    assert!(d.matches(inner, ":lang(en)").unwrap());
+    assert!(d.matches(inner, ":LANG(en-US)").unwrap());
+    assert!(!d.matches(inner, ":lang(fr)").unwrap());
 
     // dir inherits from the nearest HTML ancestor carrying one; documents
     // without any dir default to ltr
-    assert!(d.matches(rtl, ":dir(rtl)", QuirksMode::NoQuirks).unwrap());
-    assert!(!d.matches(rtl, ":dir(ltr)", QuirksMode::NoQuirks).unwrap());
-    assert!(d.matches(inner, ":dir(RTL)", QuirksMode::NoQuirks).unwrap());
+    assert!(d.matches(rtl, ":dir(rtl)").unwrap());
+    assert!(!d.matches(rtl, ":dir(ltr)").unwrap());
+    assert!(d.matches(inner, ":dir(RTL)").unwrap());
 
     let other = d.create_element(qn("aside"), Vec::new());
     d.append(html, other).unwrap();
-    assert!(d.matches(other, ":dir(ltr)", QuirksMode::NoQuirks).unwrap());
+    assert!(d.matches(other, ":dir(ltr)").unwrap());
 
     // a bad direction is a syntax error, like browsers throw for :dir(up)
     assert!(matches!(
-        d.select_all(doc, ":dir(up)", QuirksMode::NoQuirks),
+        d.select_all(doc, ":dir(up)"),
         Err(SelectError::Syntax(_))
     ));
 }
@@ -1239,11 +1049,7 @@ fn lang_ranges_follow_extended_filtering() {
     d.append(doc, html).unwrap();
     let p = d.create_element(qn("p"), Vec::new());
     d.append(html, p).unwrap();
-    let hits = |selector: &str| {
-        d.select_all(doc, selector, QuirksMode::NoQuirks)
-            .unwrap()
-            .contains(&p)
-    };
+    let hits = |selector: &str| d.select_all(doc, selector).unwrap().contains(&p);
 
     // Extended filtering is positional: range subtags correspond to tag
     // subtags in order, `*` consumes exactly one, trailing tag subtags are
@@ -1283,7 +1089,7 @@ fn lang_ranges_follow_extended_filtering() {
         ":lang(en fr)",
     ] {
         assert!(
-            d.select_all(doc, bad, QuirksMode::NoQuirks).is_err(),
+            d.select_all(doc, bad).is_err(),
             "{bad} should refuse to parse"
         );
     }
@@ -1301,16 +1107,10 @@ fn multibyte_lang_values_never_crash_the_matcher() {
     d.append(doc, host).unwrap();
 
     // Range shorter than the tag, splitting inside 'ñ': must be Ok(false).
-    assert_eq!(d.matches(host, ":lang(a)", QuirksMode::NoQuirks), Ok(false));
+    assert_eq!(d.matches(host, ":lang(a)"), Ok(false));
     // Exact match across the multibyte character still works.
-    assert_eq!(
-        d.matches(host, ":lang(añx)", QuirksMode::NoQuirks),
-        Ok(true)
-    );
-    assert_eq!(
-        d.matches(host, ":lang(añ)", QuirksMode::NoQuirks),
-        Ok(false)
-    );
+    assert_eq!(d.matches(host, ":lang(añx)"), Ok(true));
+    assert_eq!(d.matches(host, ":lang(añ)"), Ok(false));
 }
 
 /// Pinned v1 behavior: with no explicit scope element in the matching
@@ -1323,15 +1123,13 @@ fn multibyte_lang_values_never_crash_the_matcher() {
 fn document_scoped_queries_resolve_scope_to_the_document_element() {
     let page = build();
     assert_eq!(
-        page.d
-            .select_all(page.d.document(), ":scope", QuirksMode::NoQuirks)
-            .unwrap(),
+        page.d.select_all(page.d.document(), ":scope").unwrap(),
         vec![page.html]
     );
     // and it composes like any other compound
     assert_eq!(
         page.d
-            .select_all(page.d.document(), ":scope > body", QuirksMode::NoQuirks)
+            .select_all(page.d.document(), ":scope > body")
             .unwrap(),
         vec![page.body]
     );

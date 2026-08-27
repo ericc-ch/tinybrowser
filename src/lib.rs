@@ -6,7 +6,7 @@
 //! # Seam map
 //!
 //! Dependencies go downward only; `browser` is the single fan-in point.
-//! See `docs/adr/0001-workspace-crates-with-enforced-edges.md`.
+//! See [`wiki/adrs/0001-workspace-crates-with-enforced-edges.md`](../wiki/adrs/0001-workspace-crates-with-enforced-edges.md).
 //!
 //! ```text
 //! main → browser → {dom, net, js}

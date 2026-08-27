@@ -1,6 +1,6 @@
 //! Document storage for tinybrowser: a generational-arena DOM tree.
 //!
-//! Dependencies by charter ([ADR 0002](../../docs/adr/0002-dom-layer-architecture.md)):
+//! Dependencies by charter ([ADR 0002](../../wiki/adrs/0002-dom-layer-architecture.md)):
 //! pinned `markup5ever` name types plus the Servo selector stack, never a
 //! parsing dependency. This crate is representation
 //! plus mutation commands; the html5ever adapter lives above it, and nothing
@@ -25,7 +25,7 @@ mod node;
 mod select;
 mod state;
 
-pub use arena::{Dom, DomError, NodeRef};
+pub use arena::{Dom, DomError, NodeRef, QuirksMode};
 pub use id::NodeId;
 pub use node::{Attribute, LocalName, Namespace, NodeKind, Prefix, QualName, html_namespace};
-pub use select::{ParseFail, ParseFailKind, QuirksMode, SelectError};
+pub use select::{ParseFail, ParseFailKind, SelectError};
