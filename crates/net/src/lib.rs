@@ -48,4 +48,3 @@ pub use method::{InvalidMethod, Method};
 pub use request::RequestBuilder;
 pub use response::{Body, Response};
 pub use websocket::{WebSocket, WsEvent, WsMessage};
-

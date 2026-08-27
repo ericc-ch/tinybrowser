@@ -702,21 +702,12 @@ fn proxy_knob_rejects_unusable_authority_strings() {
 
 #[test]
 fn proxy_knob_sends_http_traffic_to_the_configured_authority() {
-    // HTTP origin via an HTTP proxy uses absolute-form on the request
-    // line (RFC 9112). No live proxy: the recording server *is* the proxy.
+    // HTTP origin via an HTTP proxy: TCP to the proxy, origin-form request
+    // line, Host names the origin. ureq cannot emit RFC 9112 absolute-form.
     let proxy = TestServer::start(|conn| {
-        let first = conn.read_request();
-        if first.method == "CONNECT" {
-            // Ticket 08: HTTP CONNECT. After 200 the client tunnels the GET.
-            conn.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
-                .expect("connect ok");
-            conn.read_request();
-            conn.write_all(&canned_ok(&[], b"via"))
-                .expect("tunneled write");
-        } else {
-            conn.write_all(&canned_ok(&[], b"via"))
-                .expect("proxy write");
-        }
+        conn.read_request();
+        conn.write_all(&canned_ok(&[], b"via"))
+            .expect("proxy write");
     });
     let proxy_uri = format!("http://{}", proxy.local_addr());
     let agent = AgentBuilder::new()
@@ -734,49 +725,21 @@ fn proxy_knob_sends_http_traffic_to_the_configured_authority() {
     assert_eq!(response.into_body().bytes(8).expect("body"), b"via");
 
     let recorded = proxy.requests();
+    assert_eq!(recorded[0].method, "GET");
+    assert_eq!(recorded[0].target, "/via-proxy");
+    assert_eq!(recorded[0].header("host"), Some("origin.test"));
     assert!(
-        recorded.iter().any(|req| {
-            let mentions_origin = req.target.contains("origin.test");
-            mentions_origin && (req.method == "CONNECT" || req.method == "GET")
-        }),
-        "proxy must see origin.test, got {recorded:?}"
+        recorded.iter().all(|req| req.method != "CONNECT"),
+        "http:// through a forward proxy must not CONNECT, got {recorded:?}"
     );
     proxy.assert_clean();
 }
 
 #[test]
-fn connect_keeps_bytes_that_arrived_with_the_200() {
+fn http_proxy_sends_proxy_authorization_on_the_get() {
     let proxy = TestServer::start(|conn| {
-        let first = conn.read_request();
-        assert_eq!(first.method, "CONNECT");
-        let mut packed = b"HTTP/1.1 200 Connection Established\r\n\r\n".to_vec();
-        packed.extend_from_slice(&canned_ok(&[], b"ping"));
-        conn.write_all(&packed).expect("packed 200+origin");
-    });
-    let proxy_uri = format!("http://{}", proxy.local_addr());
-    let agent = AgentBuilder::new()
-        .proxy(&proxy_uri)
-        .expect("proxy")
-        .timeout_global(Duration::from_secs(2))
-        .build();
-    let target = url::Url::parse("http://origin.test/packed").expect("absolute");
-    let response = agent
-        .request(Method::GET, target)
-        .send()
-        .expect("proxied GET");
-    assert_eq!(response.into_body().bytes(8).expect("body"), b"ping");
-    proxy.assert_clean();
-}
-
-#[test]
-fn connect_sends_proxy_authorization_and_brackets_ipv6() {
-    let proxy = TestServer::start(|conn| {
-        let first = conn.read_request();
-        assert_eq!(first.method, "CONNECT");
-        conn.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
-            .expect("connect ok");
         conn.read_request();
-        conn.write_all(&canned_ok(&[], b"v6")).expect("tunneled");
+        conn.write_all(&canned_ok(&[], b"v6")).expect("proxy write");
     });
     let addr = proxy.local_addr();
     let proxy_uri = format!("http://user:secret@{addr}");
@@ -785,14 +748,16 @@ fn connect_sends_proxy_authorization_and_brackets_ipv6() {
         .expect("proxy")
         .timeout_global(Duration::from_secs(2))
         .build();
-    let target = url::Url::parse("http://[::1]/via").expect("ipv6 origin");
+    let target = url::Url::parse("http://origin.test/via").expect("absolute");
     let response = agent
         .request(Method::GET, target)
         .send()
         .expect("proxied GET");
     assert_eq!(response.into_body().bytes(8).expect("body"), b"v6");
     let recorded = proxy.requests();
-    assert_eq!(recorded[0].target, "[::1]:80");
+    assert_eq!(recorded[0].method, "GET");
+    assert_eq!(recorded[0].target, "/via");
+    assert_eq!(recorded[0].header("host"), Some("origin.test"));
     assert_eq!(
         recorded[0].header("proxy-authorization"),
         Some("Basic dXNlcjpzZWNyZXQ=")
@@ -815,7 +780,17 @@ fn https_to_a_plaintext_listener_is_a_tls_transport_error() {
 
     let url = url::Url::parse(&format!("https://{addr}/")).expect("absolute");
     match Agent::new().request(Method::GET, url).send() {
-        Err(NetError::Transport(TransportError::Tls(_))) => {}
+        Err(NetError::Transport(TransportError::Tls(detail))) => {
+            assert_ne!(
+                detail.as_ref(),
+                "tls handshake failed",
+                "native-tls text must survive the ureq connector, got {detail}"
+            );
+            assert!(
+                !detail.is_empty(),
+                "Transport(Tls) must carry a handshake reason"
+            );
+        }
         other => panic!("expected Transport(Tls), got {other:?}"),
     }
 }

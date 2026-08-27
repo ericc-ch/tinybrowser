@@ -14,7 +14,7 @@ use crate::dial::{self, RawStream};
 
 /// DNS stays in [`dial::open`]; ureq still requires a resolver step before
 /// the connector runs, so this returns a dummy address and never looks up
-/// the origin host (needed so `http://origin.test` through a CONNECT proxy
+/// the origin host (needed so `http://origin.test` through a proxy
 /// does not fail DNS).
 #[derive(Debug, Default)]
 pub(crate) struct DialResolver;
@@ -48,7 +48,8 @@ impl Connector for NetConnector {
         if chained.is_some() {
             return Err(ureq::Error::ConnectionFailed);
         }
-        let url = Url::parse(&details.uri.to_string()).map_err(|_| ureq::Error::ConnectionFailed)?;
+        let url =
+            Url::parse(&details.uri.to_string()).map_err(|_| ureq::Error::ConnectionFailed)?;
         let stream = dial::open(&url, self.proxy.as_deref(), self.timeout).map_err(to_ureq)?;
         let buffers = LazyBuffers::new(
             details.config.input_buffer_size(),
@@ -78,7 +79,9 @@ impl Transport for StreamTransport {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         apply_timeout(&stream, timeout, true)?;
         let output = &self.buffers.output()[..amount];
-        stream.write_all(output).map_err(|err| map_io(err, timeout))?;
+        stream
+            .write_all(output)
+            .map_err(|err| map_io(err, timeout))?;
         Ok(())
     }
 
@@ -116,11 +119,7 @@ impl fmt::Debug for StreamTransport {
     }
 }
 
-fn apply_timeout(
-    stream: &RawStream,
-    timeout: NextTimeout,
-    write: bool,
-) -> Result<(), ureq::Error> {
+fn apply_timeout(stream: &RawStream, timeout: NextTimeout, write: bool) -> Result<(), ureq::Error> {
     let dur = match timeout.not_zero() {
         Some(ureq::unversioned::transport::time::Duration::Exact(d)) => Some(d),
         _ => None,
@@ -145,8 +144,8 @@ fn map_io(err: std::io::Error, timeout: NextTimeout) -> ureq::Error {
 fn to_ureq(err: crate::NetError) -> ureq::Error {
     match err {
         crate::NetError::Transport(crate::TransportError::Io(e)) => ureq::Error::Io(e),
-        crate::NetError::Transport(crate::TransportError::Tls(_)) => {
-            ureq::Error::Tls("tls handshake failed")
+        crate::NetError::Transport(crate::TransportError::Tls(detail)) => {
+            ureq::Error::Io(std::io::Error::other(crate::error::DialTlsFailure(detail)))
         }
         crate::NetError::Transport(crate::TransportError::Connect(_)) => {
             ureq::Error::ConnectionFailed

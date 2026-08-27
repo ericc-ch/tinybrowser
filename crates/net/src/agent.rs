@@ -136,7 +136,7 @@ impl AgentBuilder {
         // `allow_non_standard_methods`: ureq's default `verify_version`
         // whitelist would otherwise refuse them.
         // Proxy is applied in [`crate::dial::open`], not by ureq — otherwise
-        // CONNECT would run twice.
+        // ureq would CONNECT while we also dial the proxy.
         let config = ureq::config::Config::builder()
             .http_status_as_error(false)
             .max_redirects(0)

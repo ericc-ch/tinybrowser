@@ -4,9 +4,9 @@ mod common;
 
 use common::TestServer;
 use net::{Agent, Method, WsEvent, WsMessage};
-use tungstenite::protocol::frame::coding::{Data, OpCode};
 use tungstenite::protocol::frame::Frame;
-use tungstenite::{accept, accept_hdr, Message};
+use tungstenite::protocol::frame::coding::{Data, OpCode};
+use tungstenite::{Message, accept, accept_hdr};
 
 /// tungstenite's `Callback` `Err` is `ErrorResponse` (~136 bytes); we cannot
 /// shrink a third-party handshake callback.
@@ -14,10 +14,8 @@ use tungstenite::{accept, accept_hdr, Message};
 fn attach_lax_cookie(
     _: &tungstenite::handshake::server::Request,
     mut response: tungstenite::handshake::server::Response,
-) -> Result<
-    tungstenite::handshake::server::Response,
-    tungstenite::handshake::server::ErrorResponse,
-> {
+) -> Result<tungstenite::handshake::server::Response, tungstenite::handshake::server::ErrorResponse>
+{
     response.headers_mut().append(
         "Set-Cookie",
         "lax=1; Path=/; SameSite=Lax"
@@ -58,7 +56,7 @@ fn echo_works_in_both_directions() {
 }
 
 #[test]
-fn pump_answers_server_pings() {
+fn take_next_message_answers_server_pings() {
     let ponged = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let flag = std::sync::Arc::clone(&ponged);
     let server = TestServer::start(move |conn| {
@@ -82,15 +80,15 @@ fn pump_answers_server_pings() {
     let ws = Agent::new()
         .websocket(&server.ws_url("/ping"))
         .expect("ws handshake");
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    while !ponged.load(std::sync::atomic::Ordering::Acquire) {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "server never saw a pong"
-        );
-        std::thread::sleep(std::time::Duration::from_millis(5));
+    // Pings are answered on read, not by a background thread.
+    match ws.take_next_message().expect("close after ping") {
+        WsEvent::Close { .. } => {}
+        WsEvent::Message(msg) => panic!("expected close after ping/pong, got {msg:?}"),
     }
-    drop(ws);
+    assert!(
+        ponged.load(std::sync::atomic::Ordering::Acquire),
+        "server never saw a pong"
+    );
     server.assert_clean();
 }
 
@@ -161,12 +159,15 @@ fn handshake_set_cookie_is_stored_and_same_site_ws_sends_lax() {
             n
         };
         if n == 0 {
-            let mut ws = accept_hdr(conn.stream_mut(), attach_lax_cookie).expect("server handshake");
+            let mut ws =
+                accept_hdr(conn.stream_mut(), attach_lax_cookie).expect("server handshake");
             let _ = ws.read();
         } else {
             conn.read_request();
             let mut out = Vec::new();
-            out.extend_from_slice(b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\nConnection: close\r\n\r\nx");
+            out.extend_from_slice(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\nConnection: close\r\n\r\nx",
+            );
             conn.write_all(&out).expect("http");
         }
     });

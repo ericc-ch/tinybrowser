@@ -1,40 +1,31 @@
-//! WebSocket handle: handshake through [`crate::dial::open`], pump thread
-//! after the 101.
+//! WebSocket handle: handshake through [`crate::dial::open`], then the
+//! caller owns the socket. [`WebSocket::send`] writes; [`WebSocket::take_next_message`]
+//! reads (and answers pings).
 
-use std::sync::mpsc::{self, RecvError, SyncSender};
 use std::sync::Mutex;
-use std::thread;
-use std::time::Duration;
 
 use tungstenite::client::IntoClientRequest as _;
-use tungstenite::handshake::client::ClientHandshake;
 use tungstenite::handshake::HandshakeError;
+use tungstenite::handshake::client::ClientHandshake;
+use tungstenite::protocol::frame::Utf8Bytes;
 use tungstenite::protocol::frame::coding::CloseCode;
 use tungstenite::protocol::{CloseFrame, Message};
 use url::Url;
 
+use crate::Context;
 use crate::agent::Agent;
 use crate::cookie::{CookieOp, RetrievalKind};
 use crate::dial::RawStream;
 use crate::error::{NetError, ProtocolError, TransportError};
 use crate::method::Method;
-use crate::Context;
 
-const EVENT_QUEUE: usize = 32;
-const CMD_QUEUE: usize = 32;
-
-/// A live WebSocket after a successful upgrade.
+/// A live WebSocket after a successful upgrade. The TCP (or TLS) stream
+/// lives here; there is no background thread.
 pub struct WebSocket {
-    cmds: SyncSender<Cmd>,
-    events: Mutex<mpsc::Receiver<WsEvent>>,
+    inner: Mutex<tungstenite::WebSocket<RawStream>>,
 }
 
-enum Cmd {
-    Send(Message),
-    Close { code: u16, reason: String },
-}
-
-/// One event from the pump: a data message or the close handshake.
+/// One event from a read: a data message or the close handshake.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum WsEvent {
     /// Reassembled text or binary payload.
@@ -51,57 +42,83 @@ pub enum WsMessage {
 }
 
 impl WebSocket {
-    /// Send an application message. Queued for the pump thread.
+    /// Write one application message.
     ///
     /// # Errors
     ///
-    /// [`NetError::Transport`] if the pump has already exited.
+    /// [`NetError::Transport`] if the socket is already dead.
     pub fn send(&self, message: WsMessage) -> Result<(), NetError> {
         let msg = match message {
             WsMessage::Text(t) => Message::Text(t.into()),
             WsMessage::Binary(b) => Message::Binary(b.into()),
         };
-        self.cmds
-            .send(Cmd::Send(msg))
-            .map_err(|_| NetError::Transport(TransportError::Io(std::io::Error::other("ws closed"))))
+        self.lock().send(msg).map_err(ws_err)
     }
 
     /// Initiate a close handshake (RFC 6455 §7.4).
     ///
     /// # Errors
     ///
-    /// [`NetError::Transport`] if the pump has already exited.
+    /// [`NetError::Transport`] if the socket is already dead.
     pub fn close(&self, code: u16, reason: &str) -> Result<(), NetError> {
-        self.cmds
-            .send(Cmd::Close {
-                code,
-                reason: reason.to_owned(),
-            })
-            .map_err(|_| NetError::Transport(TransportError::Io(std::io::Error::other("ws closed"))))
+        let frame = CloseFrame {
+            code: CloseCode::from(code),
+            reason: Utf8Bytes::from(reason),
+        };
+        self.lock().close(Some(frame)).map_err(ws_err)
     }
 
     /// Block until the next application message or close event.
     ///
+    /// Control frames are handled here: a `Ping` is answered with `Pong`
+    /// and the read continues. Idle connections wait; there is no 32-slot
+    /// queue in front of the socket.
+    ///
     /// # Errors
     ///
-    /// [`NetError::Transport`] if the pump thread ended without a close event.
+    /// [`NetError::Transport`] on a socket failure with no close frame.
     pub fn take_next_message(&self) -> Result<WsEvent, NetError> {
-        self.events
+        let mut inner = self.lock();
+        loop {
+            match inner.read() {
+                Ok(Message::Text(t)) => {
+                    return Ok(WsEvent::Message(WsMessage::Text(t.to_string())));
+                }
+                Ok(Message::Binary(b)) => {
+                    return Ok(WsEvent::Message(WsMessage::Binary(b.to_vec())));
+                }
+                Ok(Message::Ping(p)) => {
+                    inner.send(Message::Pong(p)).map_err(ws_err)?;
+                }
+                Ok(Message::Pong(_) | Message::Frame(_)) => {}
+                Ok(Message::Close(frame)) => {
+                    let (code, reason) = match frame {
+                        Some(f) => (u16::from(f.code), f.reason.to_string()),
+                        None => (1005, String::new()),
+                    };
+                    let _ = inner.close(None);
+                    return Ok(WsEvent::Close { code, reason });
+                }
+                Err(err) => return Err(ws_err(err)),
+            }
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, tungstenite::WebSocket<RawStream>> {
+        self.inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .recv()
-            .map_err(|RecvError { .. }| {
-                NetError::Transport(TransportError::Io(std::io::Error::other("ws pump ended")))
-            })
     }
 }
 
 impl Drop for WebSocket {
     fn drop(&mut self) {
-        let _ = self.cmds.try_send(Cmd::Close {
-            code: 1001,
-            reason: String::new(),
-        });
+        if let Ok(mut inner) = self.inner.lock() {
+            let _ = inner.close(Some(CloseFrame {
+                code: CloseCode::Away,
+                reason: Utf8Bytes::from(""),
+            }));
+        }
     }
 }
 
@@ -133,12 +150,12 @@ impl Agent {
         }
         let stream = crate::dial::open(url, self.proxy.as_deref(), self.timeout)?;
         if let Some(limit) = self.timeout {
-            stream.set_read_timeout(Some(limit)).map_err(|err| {
-                NetError::Transport(TransportError::Io(err))
-            })?;
-            stream.set_write_timeout(Some(limit)).map_err(|err| {
-                NetError::Transport(TransportError::Io(err))
-            })?;
+            stream
+                .set_read_timeout(Some(limit))
+                .map_err(|err| NetError::Transport(TransportError::Io(err)))?;
+            stream
+                .set_write_timeout(Some(limit))
+                .map_err(|err| NetError::Transport(TransportError::Io(err)))?;
         }
         let cookie = self
             .jar
@@ -159,14 +176,20 @@ impl Agent {
         if !cookie.is_empty() {
             request.headers_mut().insert(
                 tungstenite::http::header::COOKIE,
-                cookie.parse().map_err(|_| {
-                    NetError::Protocol(ProtocolError::RejectedRequest)
-                })?,
+                cookie
+                    .parse()
+                    .map_err(|_| NetError::Protocol(ProtocolError::RejectedRequest))?,
             );
         }
-        let (ws, response) = tungstenite::client(request, stream).map_err(handshake_err)?;
+        let (mut ws, response) = tungstenite::client(request, stream).map_err(handshake_err)?;
         harvest_ws_cookies(self, url, initiator, &response);
-        Ok(start_pump(ws))
+        // Handshake used the agent timeout. Live reads wait for a frame.
+        let raw = ws.get_mut();
+        let _ = raw.set_read_timeout(None);
+        let _ = raw.set_write_timeout(None);
+        Ok(WebSocket {
+            inner: Mutex::new(ws),
+        })
     }
 }
 
@@ -196,117 +219,6 @@ fn harvest_ws_cookies(
             );
         }
     }
-}
-
-struct PumpIo {
-    ws: tungstenite::WebSocket<RawStream>,
-    cmds: mpsc::Receiver<Cmd>,
-    events: SyncSender<WsEvent>,
-}
-
-fn start_pump(ws: tungstenite::WebSocket<RawStream>) -> WebSocket {
-    let (cmd_tx, cmd_rx) = mpsc::sync_channel(CMD_QUEUE);
-    let (ev_tx, ev_rx) = mpsc::sync_channel(EVENT_QUEUE);
-    thread::spawn(move || {
-        PumpIo {
-            ws,
-            cmds: cmd_rx,
-            events: ev_tx,
-        }
-        .run();
-    });
-    WebSocket {
-        cmds: cmd_tx,
-        events: Mutex::new(ev_rx),
-    }
-}
-
-impl PumpIo {
-    fn run(mut self) {
-        let _ = self
-            .ws
-            .get_mut()
-            .set_read_timeout(Some(Duration::from_millis(25)));
-        let mut sent_close = false;
-        loop {
-            match self.cmds.try_recv() {
-                Ok(Cmd::Send(msg)) => {
-                    if self.ws.send(msg).is_err() {
-                        emit_abort(&self.events, &mut sent_close);
-                        break;
-                    }
-                }
-                Ok(Cmd::Close { code, reason }) => {
-                    let frame = CloseFrame {
-                        code: CloseCode::from(code),
-                        reason: reason.into(),
-                    };
-                    if self.ws.close(Some(frame)).is_err() {
-                        emit_abort(&self.events, &mut sent_close);
-                        break;
-                    }
-                }
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    emit_abort(&self.events, &mut sent_close);
-                    break;
-                }
-                Err(mpsc::TryRecvError::Empty) => {}
-            }
-            match self.ws.read() {
-                Ok(Message::Text(t)) => {
-                    if self
-                        .events
-                        .send(WsEvent::Message(WsMessage::Text(t.to_string())))
-                        .is_err()
-                    {
-                        break;
-                    }
-                }
-                Ok(Message::Binary(b)) => {
-                    if self
-                        .events
-                        .send(WsEvent::Message(WsMessage::Binary(b.to_vec())))
-                        .is_err()
-                    {
-                        break;
-                    }
-                }
-                Ok(Message::Ping(p)) => {
-                    let _ = self.ws.send(Message::Pong(p));
-                }
-                Ok(Message::Pong(_) | Message::Frame(_)) => {}
-                Ok(Message::Close(frame)) => {
-                    let (code, reason) = match frame {
-                        Some(f) => (u16::from(f.code), f.reason.to_string()),
-                        None => (1005, String::new()),
-                    };
-                    let _ = self.ws.close(None);
-                    if !sent_close {
-                        let _ = self.events.send(WsEvent::Close { code, reason });
-                    }
-                    break;
-                }
-                Err(tungstenite::Error::Io(err))
-                    if err.kind() == std::io::ErrorKind::WouldBlock
-                        || err.kind() == std::io::ErrorKind::TimedOut => {}
-                Err(_) => {
-                    emit_abort(&self.events, &mut sent_close);
-                    break;
-                }
-            }
-        }
-    }
-}
-
-fn emit_abort(events: &SyncSender<WsEvent>, sent_close: &mut bool) {
-    if *sent_close {
-        return;
-    }
-    *sent_close = true;
-    let _ = events.send(WsEvent::Close {
-        code: 1006,
-        reason: String::new(),
-    });
 }
 
 fn handshake_err(err: HandshakeError<ClientHandshake<RawStream>>) -> NetError {

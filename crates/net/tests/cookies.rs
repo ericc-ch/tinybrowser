@@ -330,6 +330,17 @@ fn public_suffix_domain_is_rejected() {
 }
 
 #[test]
+fn s3_amazonaws_com_is_a_public_suffix() {
+    let uri = url::Url::parse("https://evil.s3.amazonaws.com/obj").expect("uri");
+    let agent = Agent::new();
+    agent.set_cookie("x=1; Path=/; Domain=s3.amazonaws.com", &uri);
+    assert!(
+        agent.cookies_for(&uri).is_empty(),
+        "Domain=s3.amazonaws.com must not store from a bucket host"
+    );
+}
+
+#[test]
 fn replacing_a_cookie_keeps_creation_order() {
     let uri = url::Url::parse("https://example.com/").expect("uri");
     let agent = Agent::new();

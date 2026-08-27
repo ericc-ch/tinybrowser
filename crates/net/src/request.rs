@@ -121,7 +121,8 @@ impl RequestBuilder {
         loop {
             let mut wire = url.clone();
             wire.set_fragment(None);
-            let hop_headers = with_jar_cookie(&agent, &url, &headers, context, &method, initiator.as_ref());
+            let hop_headers =
+                with_jar_cookie(&agent, &url, &headers, context, &method, initiator.as_ref());
             let response = dispatch(
                 &agent,
                 &method,
@@ -131,7 +132,14 @@ impl RequestBuilder {
                 context,
                 url.clone(),
             )?;
-            harvest_set_cookie(&agent, &url, &response, context, &method, initiator.as_ref());
+            harvest_set_cookie(
+                &agent,
+                &url,
+                &response,
+                context,
+                &method,
+                initiator.as_ref(),
+            );
 
             let Some(location) = followable_location(response.status(), response.headers())? else {
                 return Ok(response);
@@ -205,7 +213,10 @@ fn harvest_set_cookie(
     initiator: Option<&Url>,
 ) {
     let now = SystemTime::now();
-    let mut jar = agent.jar.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut jar = agent
+        .jar
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     for value in response.headers().get_all("set-cookie") {
         if let Ok(text) = std::str::from_utf8(value) {
             jar.store(
@@ -307,6 +318,14 @@ fn dispatch(
     }
     for (name, value) in headers.iter() {
         builder = builder.header(name, value);
+    }
+    // ureq writes origin-form only. Forward-proxy credentials ride this
+    // header; CONNECT puts them on the CONNECT request in dial instead.
+    if wire_url.scheme() == "http"
+        && headers.get("proxy-authorization").is_none()
+        && let Some(value) = crate::dial::proxy_basic_token(agent.proxy.as_deref())
+    {
+        builder = builder.header("Proxy-Authorization", value);
     }
 
     let rejected = |_| NetError::Protocol(ProtocolError::RejectedRequest);

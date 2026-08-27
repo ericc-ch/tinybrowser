@@ -6,7 +6,9 @@
 //! feature stays off; `send()` is the only place that harvests
 //! `Set-Cookie` or emits `Cookie`.
 
+use std::collections::HashSet;
 use std::fmt;
+use std::sync::OnceLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use url::{Host, Url};
@@ -82,7 +84,8 @@ impl CookieJar {
         let Some(stored) = receive_cookie(parsed, &op, &self.cookies) else {
             return;
         };
-        self.cookies.retain(|old| !same_cookie_identity(old, &stored));
+        self.cookies
+            .retain(|old| !same_cookie_identity(old, &stored));
         self.cookies.push(stored);
         self.evict_expired(op.now);
     }
@@ -249,7 +252,10 @@ fn receive_cookie(
         return None;
     }
     if let Some(old) = existing.iter().find(|old| {
-        old.name == parsed.name && old.domain == domain && old.host_only == host_only && old.path == path
+        old.name == parsed.name
+            && old.domain == domain
+            && old.host_only == host_only
+            && old.path == path
     }) {
         if matches!(kind, RetrievalKind::NonHttp) && old.http_only {
             return None;
@@ -290,7 +296,9 @@ fn cookie_expiry(parsed: &ParsedSetCookie, now: SystemTime) -> Option<SystemTime
             Some(now + Duration::from_secs(secs).min(MAX_LIFETIME))
         }
     } else {
-        parsed.expires.map(|expires| expires.min(now + MAX_LIFETIME))
+        parsed
+            .expires
+            .map(|expires| expires.min(now + MAX_LIFETIME))
     }
 }
 
@@ -341,7 +349,12 @@ fn overlays_secure_cookie(
         })
 }
 
-fn cookie_prefixes_ok(parsed: &ParsedSetCookie, secure: bool, host_only: bool, path_attr: Option<&str>) -> bool {
+fn cookie_prefixes_ok(
+    parsed: &ParsedSetCookie,
+    secure: bool,
+    host_only: bool,
+    path_attr: Option<&str>,
+) -> bool {
     let lname = parsed.name.to_ascii_lowercase();
     let lvalue = parsed.value.to_ascii_lowercase();
     let prefix = if lname.is_empty() {
@@ -403,8 +416,7 @@ fn samesite_allows(
         SameSite::None => true,
         SameSite::Strict => same_site_request,
         SameSite::Lax | SameSite::Default => {
-            same_site_request
-                || (context == Context::Navigation && method.is_safe())
+            same_site_request || (context == Context::Navigation && method.is_safe())
         }
     }
 }
@@ -422,53 +434,100 @@ fn schemeful_same_site(a: &Url, b: &Url) -> bool {
 }
 
 fn site_tuple(url: &Url) -> Option<(String, String)> {
-    Some((url.scheme().to_owned(), registrable_domain(&canonicalize_host(url)?)))
+    Some((
+        url.scheme().to_owned(),
+        registrable_domain(&canonicalize_host(url)?),
+    ))
 }
 
 fn registrable_domain(host: &str) -> String {
     if is_ip(host) {
         return host.to_owned();
     }
-    let labels: Vec<&str> = host.split('.').collect();
-    if labels.len() < 2 {
-        return host.to_owned();
+    let host = host.trim_matches('.').to_ascii_lowercase();
+    let suffix = public_suffix(&host);
+    if host == suffix {
+        return host;
     }
-    let last_two = format!("{}.{}", labels[labels.len() - 2], labels[labels.len() - 1]);
-    if is_public_suffix(&last_two) {
-        if labels.len() < 3 {
-            return last_two;
-        }
-        return labels[labels.len() - 3..].join(".");
-    }
-    last_two
+    let Some(prefix) = host.strip_suffix(&suffix).and_then(|p| p.strip_suffix('.')) else {
+        return host;
+    };
+    let label = prefix.rsplit('.').next().unwrap_or(prefix);
+    format!("{label}.{suffix}")
 }
 
-/// Compact PSL stand-in: no extra crate (ticket 13).
+/// Vendored PSL (<https://publicsuffix.org/list/public_suffix_list.dat>), no crate.
+/// Matching: exception, then longest rule, then implicit `*`.
+/// `localhost` is not a suffix so host-only cookies still store.
 fn is_public_suffix(domain: &str) -> bool {
-    let d = domain.to_ascii_lowercase();
-    if !d.contains('.') {
-        return d != "localhost";
+    let d = domain.trim_matches('.').to_ascii_lowercase();
+    if d == "localhost" || d.is_empty() {
+        return false;
     }
-    matches!(
-        d.as_str(),
-        "co.uk"
-            | "org.uk"
-            | "ac.uk"
-            | "gov.uk"
-            | "co.jp"
-            | "ne.jp"
-            | "or.jp"
-            | "com.au"
-            | "net.au"
-            | "org.au"
-            | "co.nz"
-            | "com.br"
-            | "co.kr"
-            | "com.mx"
-            | "github.io"
-            | "herokuapp.com"
-            | "appspot.com"
-    )
+    public_suffix(&d) == d
+}
+
+struct SuffixList {
+    rules: HashSet<Box<str>>,
+    wildcards: HashSet<Box<str>>,
+    exceptions: HashSet<Box<str>>,
+}
+
+fn suffix_list() -> &'static SuffixList {
+    static LIST: OnceLock<SuffixList> = OnceLock::new();
+    LIST.get_or_init(|| {
+        let mut rules = HashSet::new();
+        let mut wildcards = HashSet::new();
+        let mut exceptions = HashSet::new();
+        for raw in include_str!("public_suffix_list.dat").lines() {
+            let line = raw.trim();
+            if line.is_empty() || line.starts_with("//") {
+                continue;
+            }
+            if let Some(rest) = line.strip_prefix('!') {
+                exceptions.insert(Box::from(rest.to_ascii_lowercase()));
+            } else if let Some(rest) = line.strip_prefix("*.") {
+                wildcards.insert(Box::from(rest.to_ascii_lowercase()));
+            } else {
+                rules.insert(Box::from(line.to_ascii_lowercase()));
+            }
+        }
+        SuffixList {
+            rules,
+            wildcards,
+            exceptions,
+        }
+    })
+}
+
+fn public_suffix(host: &str) -> String {
+    let labels: Vec<&str> = host.split('.').filter(|l| !l.is_empty()).collect();
+    if labels.is_empty() {
+        return String::new();
+    }
+    let list = suffix_list();
+    let suffix_at = |i: usize| labels[i..].join(".");
+    let mut matched_rule = None;
+    for i in 0..labels.len() {
+        let suffix = suffix_at(i);
+        if list.exceptions.contains(suffix.as_str()) {
+            return suffix_at(i + 1);
+        }
+        let parent = if i + 1 < labels.len() {
+            suffix_at(i + 1)
+        } else {
+            String::new()
+        };
+        if matched_rule.is_none()
+            && (list.rules.contains(suffix.as_str()) || list.wildcards.contains(parent.as_str()))
+        {
+            matched_rule = Some(i);
+        }
+    }
+    if let Some(i) = matched_rule {
+        return suffix_at(i);
+    }
+    labels[labels.len() - 1].to_owned()
 }
 
 /// [§5.1.3](https://httpwg.org/http-extensions/draft-ietf-httpbis-rfc6265bis.html#section-5.1.3)
@@ -600,5 +659,31 @@ fn civil_to_system(
         Some(UNIX_EPOCH + Duration::from_secs(u64::try_from(secs).ok()?))
     } else {
         UNIX_EPOCH.checked_sub(Duration::from_secs(u64::try_from(-secs).ok()?))
+    }
+}
+
+#[cfg(test)]
+mod public_suffix_lookup {
+    use super::{is_public_suffix, registrable_domain};
+
+    #[test]
+    fn s3_amazonaws_com_is_the_suffix_not_amazonaws_com() {
+        assert!(is_public_suffix("s3.amazonaws.com"));
+        assert!(!is_public_suffix("evil.s3.amazonaws.com"));
+        assert_eq!(
+            registrable_domain("evil.s3.amazonaws.com"),
+            "evil.s3.amazonaws.com"
+        );
+        assert_eq!(registrable_domain("www.example.com"), "example.com");
+        assert_eq!(registrable_domain("www.bbc.co.uk"), "bbc.co.uk");
+    }
+
+    #[test]
+    fn wildcard_and_exception_rules_apply() {
+        // PSL: `*.ck` with exception `!www.ck`.
+        assert!(is_public_suffix("foo.ck"));
+        assert!(!is_public_suffix("www.ck"));
+        assert_eq!(registrable_domain("bar.foo.ck"), "bar.foo.ck");
+        assert_eq!(registrable_domain("www.ck"), "www.ck");
     }
 }

@@ -124,7 +124,11 @@ impl Write for RawStream {
     }
 }
 
-/// Dial `url`, applying the optional HTTP CONNECT proxy and TLS.
+/// Dial `url`, applying the optional HTTP proxy and TLS.
+///
+/// `http://` through a proxy is a forward-proxy TCP connection: ureq writes
+/// origin-form (`GET /path`) plus `Host`. `https`/`ws`/`wss` tunnel with
+/// CONNECT first (WebSocket and TLS cannot be origin-form GETs to the proxy).
 pub(crate) fn open(
     url: &Url,
     proxy: Option<&str>,
@@ -134,9 +138,16 @@ pub(crate) fn open(
         .host_str()
         .ok_or(NetError::Protocol(ProtocolError::RejectedRequest))?;
     let tls = matches!(url.scheme(), "https" | "wss");
-    let port = url.port_or_known_default().unwrap_or(if tls { 443 } else { 80 });
+    let tunnel = tls || url.scheme() == "ws";
+    let port = url
+        .port_or_known_default()
+        .unwrap_or(if tls { 443 } else { 80 });
     let socket = if let Some(proxy) = proxy {
-        connect_via_proxy(proxy, host, port, timeout)?
+        if tunnel {
+            connect_via_proxy(proxy, host, port, timeout)?
+        } else {
+            tcp_to_proxy(proxy, timeout)?
+        }
     } else {
         Socket::new(connect_tcp(host, port, timeout)?, Vec::new())
     };
@@ -150,9 +161,8 @@ pub(crate) fn open(
             .tcp
             .set_write_timeout(timeout)
             .map_err(map_connect_io)?;
-        let connector = TlsConnector::new().map_err(|err| {
-            NetError::Transport(TransportError::Tls(err.to_string().into()))
-        })?;
+        let connector = TlsConnector::new()
+            .map_err(|err| NetError::Transport(TransportError::Tls(err.to_string().into())))?;
         let tls_stream = match connector.connect(host, socket) {
             Ok(s) => s,
             Err(native_tls::HandshakeError::Failure(err)) => {
@@ -173,9 +183,9 @@ pub(crate) fn open(
 }
 
 fn connect_tcp(host: &str, port: u16, timeout: Option<Duration>) -> Result<TcpStream, NetError> {
-    let addrs = (host, port).to_socket_addrs().map_err(|_| {
-        NetError::Transport(TransportError::Dns(host.into()))
-    })?;
+    let addrs = (host, port)
+        .to_socket_addrs()
+        .map_err(|_| NetError::Transport(TransportError::Dns(host.into())))?;
     let mut last = None;
     for addr in addrs {
         let result = match timeout {
@@ -191,6 +201,32 @@ fn connect_tcp(host: &str, port: u16, timeout: Option<Duration>) -> Result<TcpSt
         Some(err) => Err(map_connect_io(err)),
         None => Err(NetError::Transport(TransportError::Dns(host.into()))),
     }
+}
+
+fn tcp_to_proxy(proxy: &str, timeout: Option<Duration>) -> Result<Socket, NetError> {
+    let proxy_url =
+        Url::parse(proxy).map_err(|_| NetError::Protocol(ProtocolError::InvalidProxy))?;
+    let phost = proxy_url
+        .host_str()
+        .ok_or(NetError::Protocol(ProtocolError::InvalidProxy))?;
+    let proxy_port = proxy_url.port_or_known_default().unwrap_or(80);
+    Ok(Socket::new(
+        connect_tcp(phost, proxy_port, timeout)?,
+        Vec::new(),
+    ))
+}
+
+/// Basic token for `Proxy-Authorization` on an origin-form HTTP request
+/// (CONNECT carries the same value on the CONNECT request instead).
+pub(crate) fn proxy_basic_token(proxy: Option<&str>) -> Option<String> {
+    let proxy = proxy?;
+    let proxy_url = Url::parse(proxy).ok()?;
+    if proxy_url.username().is_empty() {
+        return None;
+    }
+    let password = proxy_url.password().unwrap_or("");
+    let token = base64_basic(&format!("{}:{password}", proxy_url.username()));
+    Some(format!("Basic {token}"))
 }
 
 fn connect_via_proxy(
@@ -210,11 +246,9 @@ fn connect_via_proxy(
     stream.set_write_timeout(timeout).map_err(map_connect_io)?;
     let authority = connect_authority(host, port);
     let mut req = format!("CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n");
-    if !proxy_url.username().is_empty() {
-        let password = proxy_url.password().unwrap_or("");
-        let token = base64_basic(&format!("{}:{password}", proxy_url.username()));
-        req.push_str("Proxy-Authorization: Basic ");
-        req.push_str(&token);
+    if let Some(value) = proxy_basic_token(Some(proxy)) {
+        req.push_str("Proxy-Authorization: ");
+        req.push_str(&value);
         req.push_str("\r\n");
     }
     req.push_str("\r\n");
@@ -291,5 +325,38 @@ fn map_connect_io(err: std::io::Error) -> NetError {
             NetError::Transport(TransportError::Timeout(TimeoutKind::Connect))
         }
         _ => NetError::Transport(TransportError::Io(err)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::thread;
+
+    #[test]
+    fn connect_authority_brackets_unbracketed_ipv6() {
+        assert_eq!(connect_authority("::1", 80), "[::1]:80");
+        assert_eq!(connect_authority("example.com", 443), "example.com:443");
+    }
+
+    #[test]
+    fn connect_keeps_bytes_after_the_200() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut buf = [0u8; 512];
+            let _ = stream.read(&mut buf);
+            let mut packed = b"HTTP/1.1 200 Connection Established\r\n\r\n".to_vec();
+            packed.extend_from_slice(b"PING");
+            stream.write_all(&packed).expect("packed");
+        });
+        let proxy = format!("http://{addr}");
+        let mut socket = connect_via_proxy(&proxy, "origin.test", 443, None).expect("CONNECT 200");
+        let mut out = [0u8; 4];
+        socket.read_exact(&mut out).expect("leftover");
+        assert_eq!(&out, b"PING");
     }
 }

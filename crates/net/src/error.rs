@@ -184,6 +184,20 @@ impl std::error::Error for NetError {
     }
 }
 
+/// Carries native-tls handshake text through `ureq::Error::Io`.
+/// `ureq::Error::Tls` only accepts `&'static str`, so the connector cannot
+/// use that arm without flattening the message.
+#[derive(Debug)]
+pub(crate) struct DialTlsFailure(pub Box<str>);
+
+impl fmt::Display for DialTlsFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for DialTlsFailure {}
+
 /// The error conversion point: ureq's flat error surface folded into our
 /// three-arm taxonomy. Every arm is exhaustive over ureq 3's
 /// `#[non_exhaustive]` enum with one deliberate fallback (`Other`-style
@@ -200,7 +214,15 @@ impl From<ureq::Error> for NetError {
             U::ConnectProxyFailed(detail) => {
                 Self::Transport(TransportError::Connect(detail.into()))
             }
-            U::Io(err) => Self::Transport(TransportError::Io(err)),
+            U::Io(err) => {
+                if let Some(tls) = err
+                    .get_ref()
+                    .and_then(|inner| inner.downcast_ref::<DialTlsFailure>())
+                {
+                    return Self::Transport(TransportError::Tls(tls.0.clone()));
+                }
+                Self::Transport(TransportError::Io(err))
+            }
             U::Timeout(which) => {
                 use ureq::Timeout as T;
                 let kind = match which {
