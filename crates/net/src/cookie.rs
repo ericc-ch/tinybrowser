@@ -185,9 +185,15 @@ fn parse_set_cookie(input: &str) -> Option<ParsedSetCookie> {
             None => (av, ""),
         };
         if aname.eq_ignore_ascii_case("Max-Age") {
-            parsed.max_age = avalue.parse::<i64>().ok();
+            // Ignore this cookie-av on parse failure; do not clear a prior
+            // Max-Age in the same header (RFC 6265bis storage model).
+            if let Ok(n) = avalue.parse::<i64>() {
+                parsed.max_age = Some(n);
+            }
         } else if aname.eq_ignore_ascii_case("Expires") {
-            parsed.expires = parse_imf_fixdate(avalue);
+            if let Some(t) = parse_cookie_date(avalue) {
+                parsed.expires = Some(t);
+            }
         } else if aname.eq_ignore_ascii_case("Domain") {
             let d = avalue.strip_prefix('.').unwrap_or(avalue);
             if d.len() <= 1024 {
@@ -590,43 +596,170 @@ fn has_ctl_excluding_htab(s: &str) -> bool {
     s.bytes().any(|b| (b < 0x20 && b != b'\t') || b == 0x7F)
 }
 
-fn parse_imf_fixdate(s: &str) -> Option<SystemTime> {
-    // RFC 9110 IMF-fixdate: `Sun, 06 Nov 1994 08:49:37 GMT`
-    let s = s.trim();
-    let rest = s.split_once(", ").map_or(s, |(_, r)| r);
-    let mut parts = rest.split_whitespace();
-    let day: u32 = parts.next()?.parse().ok()?;
-    let month = month_num(parts.next()?)?;
-    let year: i32 = parts.next()?.parse().ok()?;
-    let hms = parts.next()?;
-    let mut t = hms.split(':');
-    let hour: u32 = t.next()?.parse().ok()?;
-    let min: u32 = t.next()?.parse().ok()?;
-    let sec: u32 = t.next()?.parse().ok()?;
-    let zone = parts.next()?;
-    if !zone.eq_ignore_ascii_case("GMT") {
+/// Cookie-date parse
+/// ([RFC 6265bis §5.1.1](https://httpwg.org/http-extensions/draft-ietf-httpbis-rfc6265bis.html#name-dates)).
+///
+/// Splits on the spec delimiter octet set, then picks time / day / month /
+/// year from each token. Year-value 70–99 adds 1900, 0–69 adds 2000; year
+/// below 1601 and dates that do not exist abort.
+fn parse_cookie_date(s: &str) -> Option<SystemTime> {
+    let mut hour = None;
+    let mut min = None;
+    let mut sec = None;
+    let mut day = None;
+    let mut month = None;
+    let mut year = None;
+
+    for token in cookie_date_tokens(s) {
+        if hour.is_none()
+            && let Some((h, m, s)) = parse_time_token(token)
+        {
+            hour = Some(h);
+            min = Some(m);
+            sec = Some(s);
+            continue;
+        }
+        if day.is_none()
+            && let Some(d) = parse_day_token(token)
+        {
+            day = Some(d);
+            continue;
+        }
+        if month.is_none()
+            && let Some(m) = month_num(token)
+        {
+            month = Some(m);
+            continue;
+        }
+        if year.is_none()
+            && let Some(y) = parse_year_token(token)
+        {
+            year = Some(y);
+        }
+    }
+
+    let year = year?;
+    let month = month?;
+    let day = day?;
+    let hour = hour?;
+    let min = min?;
+    let sec = sec?;
+    if year < 1601 || !(1..=31).contains(&day) || hour > 23 || min > 59 || sec > 59 {
         return None;
     }
-    if parts.next().is_some() {
+    if day > days_in_month(year, month)? {
         return None;
     }
     civil_to_system(year, month, day, hour, min, sec)
 }
 
+/// `delimiter` in RFC 6265bis §5.1.1 (`%x09 / %x20-2F / %x3B-40 / %x5B-60 / %x7B-7E`).
+fn is_cookie_date_delimiter(b: u8) -> bool {
+    matches!(b, 0x09 | 0x20..=0x2F | 0x3B..=0x40 | 0x5B..=0x60 | 0x7B..=0x7E)
+}
+
+fn cookie_date_tokens(s: &str) -> impl Iterator<Item = &str> {
+    s.as_bytes()
+        .split(|b| is_cookie_date_delimiter(*b))
+        .filter(|chunk| !chunk.is_empty())
+        .map(|chunk| std::str::from_utf8(chunk).unwrap_or(""))
+}
+
+/// `1*2DIGIT [ non-digit *OCTET ]`. A leftover leading digit means the
+/// token is not a day (so `1994` is a year, not day 19).
+fn parse_day_token(token: &str) -> Option<u32> {
+    let (n, rest) = take_ascii_digits(token.as_bytes(), 1, 2)?;
+    if rest.first().is_some_and(u8::is_ascii_digit) {
+        return None;
+    }
+    u32::try_from(n).ok()
+}
+
+fn parse_time_token(token: &str) -> Option<(u32, u32, u32)> {
+    let bytes = token.as_bytes();
+    let (hour, rest) = take_ascii_digits(bytes, 1, 2)?;
+    let rest = rest.strip_prefix(b":")?;
+    let (min, rest) = take_ascii_digits(rest, 1, 2)?;
+    let rest = rest.strip_prefix(b":")?;
+    let (sec, rest) = take_ascii_digits(rest, 1, 2)?;
+    if rest.first().is_some_and(u8::is_ascii_digit) {
+        return None;
+    }
+    Some((
+        u32::try_from(hour).ok()?,
+        u32::try_from(min).ok()?,
+        u32::try_from(sec).ok()?,
+    ))
+}
+
+/// `2*4DIGIT [ non-digit *OCTET ]`, then the 0–69 / 70–99 century rule
+/// on the numeric year-value.
+fn parse_year_token(token: &str) -> Option<i32> {
+    let (n, rest) = take_ascii_digits(token.as_bytes(), 2, 4)?;
+    if rest.first().is_some_and(u8::is_ascii_digit) {
+        return None;
+    }
+    Some(if (70..=99).contains(&n) {
+        n + 1900
+    } else if (0..=69).contains(&n) {
+        n + 2000
+    } else {
+        n
+    })
+}
+
+fn take_ascii_digits(bytes: &[u8], min: usize, max: usize) -> Option<(i32, &[u8])> {
+    let mut n = 0usize;
+    while n < bytes.len() && n < max && bytes[n].is_ascii_digit() {
+        n += 1;
+    }
+    if n < min {
+        return None;
+    }
+    let value = std::str::from_utf8(&bytes[..n]).ok()?.parse().ok()?;
+    Some((value, &bytes[n..]))
+}
+
 fn month_num(m: &str) -> Option<u32> {
-    Some(match m {
-        "Jan" => 1,
-        "Feb" => 2,
-        "Mar" => 3,
-        "Apr" => 4,
-        "May" => 5,
-        "Jun" => 6,
-        "Jul" => 7,
-        "Aug" => 8,
-        "Sep" => 9,
-        "Oct" => 10,
-        "Nov" => 11,
-        "Dec" => 12,
+    // First three octets, ASCII-folded. Byte indexing avoids panicking on
+    // a mid-codepoint slice of a hostile Expires month token.
+    let b = m.as_bytes();
+    if b.len() < 3 {
+        return None;
+    }
+    let key = [
+        b[0].to_ascii_lowercase(),
+        b[1].to_ascii_lowercase(),
+        b[2].to_ascii_lowercase(),
+    ];
+    Some(match &key {
+        b"jan" => 1,
+        b"feb" => 2,
+        b"mar" => 3,
+        b"apr" => 4,
+        b"may" => 5,
+        b"jun" => 6,
+        b"jul" => 7,
+        b"aug" => 8,
+        b"sep" => 9,
+        b"oct" => 10,
+        b"nov" => 11,
+        b"dec" => 12,
+        _ => return None,
+    })
+}
+
+fn days_in_month(year: i32, month: u32) -> Option<u32> {
+    Some(match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 => {
+            if year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) {
+                29
+            } else {
+                28
+            }
+        }
         _ => return None,
     })
 }
@@ -639,7 +772,7 @@ fn civil_to_system(
     min: u32,
     sec: u32,
 ) -> Option<SystemTime> {
-    if !(1..=12).contains(&month) || day == 0 || day > 31 || hour > 23 || min > 59 || sec > 60 {
+    if !(1..=12).contains(&month) || day == 0 || day > 31 || hour > 23 || min > 59 || sec > 59 {
         return None;
     }
     let y = i64::from(if month <= 2 { year - 1 } else { year });
@@ -685,5 +818,61 @@ mod public_suffix_lookup {
         assert!(!is_public_suffix("www.ck"));
         assert_eq!(registrable_domain("bar.foo.ck"), "bar.foo.ck");
         assert_eq!(registrable_domain("www.ck"), "www.ck");
+    }
+}
+
+#[cfg(test)]
+mod same_site_none_retrieval {
+    use super::{SameSite, samesite_allows};
+    use crate::context::Context;
+    use crate::method::Method;
+
+    #[test]
+    fn none_is_sent_on_cross_site_fetch() {
+        assert!(samesite_allows(
+            SameSite::None,
+            false,
+            Context::Fetch,
+            &Method::GET
+        ));
+    }
+}
+
+#[cfg(test)]
+mod cookie_date_parse {
+    use super::parse_cookie_date;
+    use std::time::SystemTime;
+
+    #[test]
+    fn hyphenated_two_digit_year_and_imf_form() {
+        let past = parse_cookie_date("Wed, 09-Jun-01 10:18:14 GMT").expect("past");
+        assert!(past < SystemTime::now());
+        let future = parse_cookie_date("Sun, 06 Nov 2094 08:49:37 GMT").expect("future");
+        assert!(future > SystemTime::now());
+    }
+
+    #[test]
+    fn slash_delimited_netscape_form_parses() {
+        let past = parse_cookie_date("09/Nov/1999 23:12:40 GMT").expect("slash date");
+        assert!(past < SystemTime::now());
+    }
+
+    #[test]
+    fn year_below_1601_and_impossible_day_fail() {
+        assert!(parse_cookie_date("Sun, 06 Nov 1600 08:49:37 GMT").is_none());
+        assert!(parse_cookie_date("Sun, 31 Feb 2094 08:49:37 GMT").is_none());
+    }
+
+    #[test]
+    fn three_digit_year_gets_the_century_rule() {
+        // 099 → 99 → 1999 (70–99 add 1900), not rejected for length 3.
+        let past = parse_cookie_date("Sun, 06 Nov 099 08:49:37 GMT").expect("3-digit year");
+        assert!(past < SystemTime::now());
+    }
+
+    #[test]
+    fn non_ascii_month_token_does_not_panic() {
+        // Before the fix, month_num sliced m[..3] and panicked on this token.
+        assert!(parse_cookie_date("Wed, 09 ááá 2094 08:49:37 GMT").is_none());
     }
 }

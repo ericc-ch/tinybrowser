@@ -1,21 +1,21 @@
-//! [`RequestBuilder`]: everything a dial carries, up to `send()`.
+//! [`RequestBuilder`]: everything a dial carries, up to `send()` or `upgrade()`.
 
 use std::str::FromStr as _;
-use std::time::SystemTime;
 
 use crate::agent::Agent;
 use crate::context::Context;
-use crate::cookie::{CookieOp, RetrievalKind};
 use crate::error::{LimitExceeded, NetError, ProtocolError};
 use crate::header::{HeaderError, HeaderMap};
 use crate::method::Method;
 use crate::response::Response;
+use crate::websocket::{self, WebSocket};
 use url::Url;
 
 /// A request under construction: method, absolute URL, headers, initiator
 /// [`Context`], optional body.
 ///
-/// Built from [`Agent::request`]; finished with [`RequestBuilder::send`].
+/// Built from [`Agent::request`]; finished with [`RequestBuilder::send`]
+/// (HTTP) or [`RequestBuilder::upgrade`] (WebSocket).
 #[derive(Debug)]
 pub struct RequestBuilder {
     agent: Agent,
@@ -57,6 +57,9 @@ impl RequestBuilder {
     }
 
     /// Set the initiator context. Defaults to [`Context::Navigation`].
+    ///
+    /// [`RequestBuilder::upgrade`] forces [`Context::WsHandshake`] regardless
+    /// of this value (the finish path is the handshake).
     #[must_use]
     pub fn with_context(mut self, context: Context) -> Self {
         self.context = context;
@@ -64,11 +67,12 @@ impl RequestBuilder {
     }
 
     /// Document URL used for schemeful same-site cookie checks
-    /// ([RFC 6265bis §5.2](https://httpwg.org/http-extensions/draft-ietf-httpbis-rfc6265bis.html#name-same-site-and-cross-site-re)).
+    /// ([RFC 6265bis §5.2](https://httpwg.org/http-extensions/draft-ietf-httpbis-rfc6265bis.html#name-same-site-and-cross-site-re))
+    /// and, on [`RequestBuilder::upgrade`], the handshake `Origin` header.
     ///
     /// `None` (the default) means a first-party / embedder load: the request
-    /// is same-site with itself. `browser` sets this to the document URL
-    /// for fetch/XHR/navigation from a page.
+    /// is same-site with itself and no `Origin` is sent on upgrade.
+    /// `browser` sets this to the document URL for page-initiated dials.
     #[must_use]
     pub fn with_initiator(mut self, initiator: Url) -> Self {
         self.initiator = Some(initiator);
@@ -76,13 +80,16 @@ impl RequestBuilder {
     }
 
     /// Attach a request body (any `POST`/`PUT`-style payload).
+    ///
+    /// Ignored by [`RequestBuilder::upgrade`] (the handshake is always GET
+    /// with no body).
     #[must_use]
     pub fn body(mut self, bytes: impl Into<Vec<u8>>) -> Self {
         self.body = Some(bytes.into());
         self
     }
 
-    /// The initiator context this request will carry.
+    /// The initiator context this request will carry on [`RequestBuilder::send`].
     #[must_use]
     pub fn context(&self) -> Context {
         self.context
@@ -121,8 +128,8 @@ impl RequestBuilder {
         loop {
             let mut wire = url.clone();
             wire.set_fragment(None);
-            let hop_headers =
-                with_jar_cookie(&agent, &url, &headers, context, &method, initiator.as_ref());
+            let mut hop_headers = headers.clone();
+            agent.prepare_outbound(&mut hop_headers, &url, context, &method, initiator.as_ref());
             let response = dispatch(
                 &agent,
                 &method,
@@ -132,13 +139,15 @@ impl RequestBuilder {
                 context,
                 url.clone(),
             )?;
-            harvest_set_cookie(
-                &agent,
+            agent.store_set_cookie_lines(
                 &url,
-                &response,
                 context,
                 &method,
                 initiator.as_ref(),
+                response
+                    .headers()
+                    .get_all("set-cookie")
+                    .filter_map(|v| std::str::from_utf8(v).ok()),
             );
 
             let Some(location) = followable_location(response.status(), response.headers())? else {
@@ -166,71 +175,41 @@ impl RequestBuilder {
             drop(response);
         }
     }
-}
 
-fn with_jar_cookie(
-    agent: &Agent,
-    url: &Url,
-    headers: &HeaderMap,
-    context: Context,
-    method: &Method,
-    initiator: Option<&Url>,
-) -> HeaderMap {
-    let mut hop = headers.clone();
-    let cookie = agent
-        .jar
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .cookie_string(CookieOp {
-            url,
-            now: SystemTime::now(),
-            kind: RetrievalKind::Http,
+    /// Open a WebSocket through the shared dial path.
+    ///
+    /// Forces GET and [`Context::WsHandshake`]. Cookie, agent `User-Agent`,
+    /// and `Origin` (when [`RequestBuilder::with_initiator`] was set) run
+    /// through the same [`Agent::prepare_outbound`] path as
+    /// [`RequestBuilder::send`]. Upgrade / `Sec-WebSocket-*` headers are
+    /// written at the tungstenite conversion point.
+    ///
+    /// # Errors
+    ///
+    /// [`NetError::Protocol`] for a non-`ws`/`wss` URL; transport/TLS
+    /// failures as usual.
+    pub fn upgrade(self) -> Result<WebSocket, NetError> {
+        if !matches!(self.url.scheme(), "ws" | "wss") {
+            return Err(NetError::Protocol(ProtocolError::RejectedRequest));
+        }
+        let method = Method::GET;
+        let context = Context::WsHandshake;
+        let mut headers = self.headers;
+        self.agent.prepare_outbound(
+            &mut headers,
+            &self.url,
             context,
-            method,
-            initiator,
-        });
-    if cookie.is_empty() {
-        return hop;
-    }
-    if let Some(existing) = hop.get("cookie") {
-        let merged = format!("{}; {cookie}", String::from_utf8_lossy(existing));
-        hop.remove("cookie");
-        if hop.insert("Cookie", merged.as_bytes()).is_err() {
-            return hop;
-        }
-    } else if hop.insert("Cookie", cookie.as_bytes()).is_err() {
-        return hop;
-    }
-    hop
-}
-
-fn harvest_set_cookie(
-    agent: &Agent,
-    url: &Url,
-    response: &Response,
-    context: Context,
-    method: &Method,
-    initiator: Option<&Url>,
-) {
-    let now = SystemTime::now();
-    let mut jar = agent
-        .jar
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    for value in response.headers().get_all("set-cookie") {
-        if let Ok(text) = std::str::from_utf8(value) {
-            jar.store(
-                text,
-                CookieOp {
-                    url,
-                    now,
-                    kind: RetrievalKind::Http,
-                    context,
-                    method,
-                    initiator,
-                },
-            );
-        }
+            &method,
+            self.initiator.as_ref(),
+        );
+        websocket::connect(
+            &self.agent,
+            &self.url,
+            &headers,
+            context,
+            &method,
+            self.initiator.as_ref(),
+        )
     }
 }
 
@@ -312,10 +291,6 @@ fn dispatch(
         )
         .uri(wire_url.as_str());
 
-    let request_sets_ua = headers.get_all("user-agent").next().is_some();
-    if !request_sets_ua && let Some(ua) = &agent.ua {
-        builder = builder.header("User-Agent", ua);
-    }
     for (name, value) in headers.iter() {
         builder = builder.header(name, value);
     }

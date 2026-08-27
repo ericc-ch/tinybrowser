@@ -25,6 +25,54 @@ fn attach_lax_cookie(
     Ok(response)
 }
 
+struct CaptureOriginUa {
+    slot: std::sync::Arc<std::sync::Mutex<Option<(String, String)>>>,
+}
+
+impl tungstenite::handshake::server::Callback for CaptureOriginUa {
+    fn on_request(
+        self,
+        request: &tungstenite::handshake::server::Request,
+        response: tungstenite::handshake::server::Response,
+    ) -> Result<
+        tungstenite::handshake::server::Response,
+        tungstenite::handshake::server::ErrorResponse,
+    > {
+        let origin = request
+            .headers()
+            .get("origin")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_owned();
+        let ua = request
+            .headers()
+            .get("user-agent")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_owned();
+        *self.slot.lock().expect("capture") = Some((origin, ua));
+        Ok(response)
+    }
+}
+
+struct NoteOriginPresent {
+    slot: std::sync::Arc<std::sync::Mutex<bool>>,
+}
+
+impl tungstenite::handshake::server::Callback for NoteOriginPresent {
+    fn on_request(
+        self,
+        request: &tungstenite::handshake::server::Request,
+        response: tungstenite::handshake::server::Response,
+    ) -> Result<
+        tungstenite::handshake::server::Response,
+        tungstenite::handshake::server::ErrorResponse,
+    > {
+        *self.slot.lock().expect("flag") = request.headers().contains_key("origin");
+        Ok(response)
+    }
+}
+
 #[test]
 fn echo_works_in_both_directions() {
     let server = TestServer::start(|conn| {
@@ -39,7 +87,8 @@ fn echo_works_in_both_directions() {
     });
 
     let ws = Agent::new()
-        .websocket(&server.ws_url("/echo"))
+        .request(Method::GET, server.ws_url("/echo"))
+        .upgrade()
         .expect("ws handshake");
     ws.send(WsMessage::Text("hello".into()))
         .expect("client send");
@@ -78,7 +127,8 @@ fn take_next_message_answers_server_pings() {
     });
 
     let ws = Agent::new()
-        .websocket(&server.ws_url("/ping"))
+        .request(Method::GET, server.ws_url("/ping"))
+        .upgrade()
         .expect("ws handshake");
     // Pings are answered on read, not by a background thread.
     match ws.take_next_message().expect("close after ping") {
@@ -112,7 +162,8 @@ fn fragmented_text_arrives_as_one_message() {
     });
 
     let ws = Agent::new()
-        .websocket(&server.ws_url("/frag"))
+        .request(Method::GET, server.ws_url("/frag"))
+        .upgrade()
         .expect("ws handshake");
     assert_eq!(
         ws.take_next_message().expect("reassembled"),
@@ -135,7 +186,8 @@ fn close_handshake_surfaces_code_and_reason() {
     });
 
     let ws = Agent::new()
-        .websocket(&server.ws_url("/close"))
+        .request(Method::GET, server.ws_url("/close"))
+        .upgrade()
         .expect("ws handshake");
     match ws.take_next_message().expect("close event") {
         WsEvent::Close { code, reason } => {
@@ -174,7 +226,7 @@ fn handshake_set_cookie_is_stored_and_same_site_ws_sends_lax() {
 
     let agent = Agent::new();
     let ws_url = server.ws_url("/ws");
-    let ws = agent.websocket(&ws_url).expect("ws");
+    let ws = agent.request(Method::GET, ws_url).upgrade().expect("ws");
     ws.close(1000, "").expect("close");
     agent
         .request(Method::GET, server.url("/next"))
@@ -184,6 +236,69 @@ fn handshake_set_cookie_is_stored_and_same_site_ws_sends_lax() {
     assert!(
         recorded.iter().any(|r| r.header("cookie") == Some("lax=1")),
         "same-site follow-up must carry the 101 Set-Cookie, got {recorded:?}"
+    );
+    server.assert_clean();
+}
+
+#[test]
+fn upgrade_with_initiator_sends_origin_and_agent_user_agent() {
+    let captured = std::sync::Arc::new(std::sync::Mutex::new(None::<(String, String)>));
+    let capture = std::sync::Arc::clone(&captured);
+    let server = TestServer::start(move |conn| {
+        let mut ws = accept_hdr(
+            conn.stream_mut(),
+            CaptureOriginUa {
+                slot: std::sync::Arc::clone(&capture),
+            },
+        )
+        .expect("server handshake");
+        let _ = ws.read();
+    });
+
+    let agent = net::AgentBuilder::new()
+        .user_agent("tinybrowser-test/1")
+        .build();
+    let document = url::Url::parse("https://app.example/page").expect("document");
+    let ws = agent
+        .request(Method::GET, server.ws_url("/ws"))
+        .with_initiator(document)
+        .upgrade()
+        .expect("ws");
+    ws.close(1000, "").expect("close");
+
+    let (origin, ua) = captured
+        .lock()
+        .expect("capture")
+        .clone()
+        .expect("handshake saw headers");
+    assert_eq!(origin, "https://app.example");
+    assert_eq!(ua, "tinybrowser-test/1");
+    server.assert_clean();
+}
+
+#[test]
+fn bare_upgrade_omits_origin() {
+    let saw_origin = std::sync::Arc::new(std::sync::Mutex::new(false));
+    let flag = std::sync::Arc::clone(&saw_origin);
+    let server = TestServer::start(move |conn| {
+        let mut ws = accept_hdr(
+            conn.stream_mut(),
+            NoteOriginPresent {
+                slot: std::sync::Arc::clone(&flag),
+            },
+        )
+        .expect("server handshake");
+        let _ = ws.read();
+    });
+
+    let ws = Agent::new()
+        .request(Method::GET, server.ws_url("/ws"))
+        .upgrade()
+        .expect("ws");
+    ws.close(1000, "").expect("close");
+    assert!(
+        !*saw_origin.lock().expect("flag"),
+        "embedder dial without a document must not invent Origin"
     );
     server.assert_clean();
 }

@@ -4,8 +4,10 @@ use std::time::Duration;
 
 use std::sync::{Arc, Mutex};
 
+use crate::context::Context;
 use crate::cookie::{CookieJar, CookieOp, RetrievalKind};
 use crate::error::{NetError, ProtocolError};
+use crate::header::HeaderMap;
 use crate::method::Method;
 use crate::request::RequestBuilder;
 use url::Url;
@@ -231,7 +233,7 @@ impl Agent {
                 url: uri,
                 now: std::time::SystemTime::now(),
                 kind: RetrievalKind::NonHttp,
-                context: crate::Context::Navigation,
+                context: Context::Navigation,
                 method: &Method::GET,
                 initiator: Some(uri),
             })
@@ -250,11 +252,89 @@ impl Agent {
                     url: uri,
                     now: std::time::SystemTime::now(),
                     kind: RetrievalKind::NonHttp,
-                    context: crate::Context::Navigation,
+                    context: Context::Navigation,
                     method: &Method::GET,
                     initiator: Some(uri),
                 },
             );
+    }
+
+    /// Merge jar Cookie, agent User-Agent, and (for [`Context::WsHandshake`]
+    /// with an initiator) Origin into `headers` before a wire dial.
+    ///
+    /// Shared by [`RequestBuilder::send`](crate::RequestBuilder::send) and
+    /// [`RequestBuilder::upgrade`](crate::RequestBuilder::upgrade).
+    pub(crate) fn prepare_outbound(
+        &self,
+        headers: &mut HeaderMap,
+        url: &Url,
+        context: Context,
+        method: &Method,
+        initiator: Option<&Url>,
+    ) {
+        let cookie = self
+            .jar
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .cookie_string(CookieOp {
+                url,
+                now: std::time::SystemTime::now(),
+                kind: RetrievalKind::Http,
+                context,
+                method,
+                initiator,
+            });
+        if !cookie.is_empty() {
+            if let Some(existing) = headers.get("cookie") {
+                let merged = format!("{}; {cookie}", String::from_utf8_lossy(existing));
+                headers.remove("cookie");
+                let _ = headers.insert("Cookie", merged.as_bytes());
+            } else {
+                let _ = headers.insert("Cookie", cookie.as_bytes());
+            }
+        }
+        if headers.get("user-agent").is_none()
+            && let Some(ua) = &self.ua
+        {
+            let _ = headers.insert("User-Agent", ua.as_bytes());
+        }
+        // Page WS sends Origin from the document; embedder dials omit it.
+        if context == Context::WsHandshake
+            && let Some(document) = initiator
+        {
+            let origin = document.origin().ascii_serialization();
+            headers.remove("origin");
+            let _ = headers.insert("Origin", origin.as_bytes());
+        }
+    }
+
+    /// Harvest `Set-Cookie` lines already parsed at a response boundary.
+    pub(crate) fn store_set_cookie_lines(
+        &self,
+        url: &Url,
+        context: Context,
+        method: &Method,
+        initiator: Option<&Url>,
+        lines: impl IntoIterator<Item = impl AsRef<str>>,
+    ) {
+        let now = std::time::SystemTime::now();
+        let mut jar = self
+            .jar
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for line in lines {
+            jar.store(
+                line.as_ref(),
+                CookieOp {
+                    url,
+                    now,
+                    kind: RetrievalKind::Http,
+                    context,
+                    method,
+                    initiator,
+                },
+            );
+        }
     }
 }
 

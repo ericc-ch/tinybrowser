@@ -375,3 +375,88 @@ fn rfc_worked_example_sid_with_path_and_domain() {
             .is_empty()
     );
 }
+
+#[test]
+fn same_site_none_requires_secure_and_survives_document_cookie() {
+    let https = url::Url::parse("https://example.com/").expect("https");
+    let http = url::Url::parse("http://example.com/").expect("http");
+    let agent = Agent::new();
+    agent.set_cookie("x=1; Path=/; SameSite=None", &https);
+    assert!(
+        agent.cookies_for(&https).is_empty(),
+        "SameSite=None without Secure must not store"
+    );
+    agent.set_cookie("n=1; Path=/; Secure; SameSite=None", &https);
+    assert_eq!(agent.cookies_for(&https), "n=1");
+    assert!(
+        agent.cookies_for(&http).is_empty(),
+        "Secure cookie must not appear on cleartext document.cookie"
+    );
+}
+
+#[test]
+fn cookie_name_prefixes_enforce_secure_and_host_rules() {
+    let https = url::Url::parse("https://www.example.com/app").expect("https");
+    let agent = Agent::new();
+    agent.set_cookie("__Secure-a=1; Path=/", &https);
+    assert!(
+        agent.cookies_for(&https).is_empty(),
+        "__Secure- without Secure must reject"
+    );
+    agent.set_cookie("__Secure-a=1; Path=/; Secure", &https);
+    assert_eq!(agent.cookies_for(&https), "__Secure-a=1");
+
+    agent.set_cookie("__Host-b=1; Path=/docs; Secure", &https);
+    assert!(
+        !agent.cookies_for(&https).contains("__Host-b"),
+        "__Host- requires Path=/"
+    );
+    agent.set_cookie("__Host-b=1; Path=/; Secure; Domain=example.com", &https);
+    assert!(
+        !agent.cookies_for(&https).contains("__Host-b"),
+        "__Host- must be host-only (no Domain)"
+    );
+    agent.set_cookie("__Host-b=1; Path=/; Secure", &https);
+    assert!(
+        agent.cookies_for(&https).contains("__Host-b=1"),
+        "__Host- with Secure + Path=/ must store"
+    );
+}
+
+#[test]
+fn expires_cookie_date_accepts_two_digit_year_and_hyphen_form() {
+    let https = url::Url::parse("https://example.com/").expect("https");
+    let agent = Agent::new();
+    // Past rfc850-ish date → expired immediately.
+    agent.set_cookie(
+        "gone=1; Path=/; Expires=Wed, 09-Jun-01 10:18:14 GMT",
+        &https,
+    );
+    assert!(agent.cookies_for(&https).is_empty());
+    // Far-future IMF-fixdate still stores.
+    agent.set_cookie(
+        "stay=1; Path=/; Expires=Sun, 06 Nov 2094 08:49:37 GMT",
+        &https,
+    );
+    assert_eq!(agent.cookies_for(&https), "stay=1");
+    // Slash delimiters are in the cookie-date grammar; a past date must
+    // expire, not fail-open into a session cookie.
+    agent.set_cookie("slash=1; Path=/; Expires=09/Nov/1999 23:12:40 GMT", &https);
+    assert!(
+        !agent.cookies_for(&https).contains("slash="),
+        "past slash-delimited Expires must not persist as a session cookie"
+    );
+}
+
+#[test]
+fn max_age_parse_failure_does_not_clear_prior_max_age() {
+    let https = url::Url::parse("https://example.com/").expect("https");
+    let agent = Agent::new();
+    // If a failed Max-Age av wiped the prior one, this would become a
+    // session cookie and stay visible. Keeping Max-Age=0 expires it.
+    agent.set_cookie("x=1; Path=/; Max-Age=0; Max-Age=nope", &https);
+    assert!(
+        agent.cookies_for(&https).is_empty(),
+        "failed Max-Age av must be ignored, keeping the earlier Max-Age=0"
+    );
+}

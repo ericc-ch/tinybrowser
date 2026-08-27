@@ -685,6 +685,147 @@ fn post_307_replays_method_and_body() {
 }
 
 #[test]
+fn post_301_becomes_get_without_the_body() {
+    let hops = Arc::new(std::sync::Mutex::new(0u32));
+    let server_hops = Arc::clone(&hops);
+    let server = TestServer::start(move |conn| {
+        conn.read_request();
+        let n = {
+            let mut guard = server_hops.lock().expect("hop counter");
+            let n = *guard;
+            *guard += 1;
+            n
+        };
+        if n == 0 {
+            conn.write_all(&canned_redirect(301, "/landed"))
+                .expect("redirect write");
+        } else {
+            conn.write_all(&canned_ok(&[], b"ok")).expect("final write");
+        }
+    });
+
+    Agent::new()
+        .request(Method::POST, server.url("/form"))
+        .body(b"field=1".to_vec())
+        .header("Content-Type", "application/x-www-form-urlencoded")
+        .expect("header")
+        .send()
+        .expect("301 POST redirect");
+
+    let recorded = server.requests();
+    assert_eq!(recorded[0].method, "POST");
+    assert_eq!(recorded[1].method, "GET");
+    assert!(recorded[1].body.is_empty());
+    assert!(recorded[1].header("content-type").is_none());
+    server.assert_clean();
+}
+
+#[test]
+fn put_303_becomes_get_without_the_body() {
+    let hops = Arc::new(std::sync::Mutex::new(0u32));
+    let server_hops = Arc::clone(&hops);
+    let server = TestServer::start(move |conn| {
+        conn.read_request();
+        let n = {
+            let mut guard = server_hops.lock().expect("hop counter");
+            let n = *guard;
+            *guard += 1;
+            n
+        };
+        if n == 0 {
+            conn.write_all(&canned_redirect(303, "/landed"))
+                .expect("redirect write");
+        } else {
+            conn.write_all(&canned_ok(&[], b"ok")).expect("final write");
+        }
+    });
+
+    Agent::new()
+        .request(Method::PUT, server.url("/resource"))
+        .body(b"payload".to_vec())
+        .header("Content-Type", "text/plain")
+        .expect("header")
+        .send()
+        .expect("303 PUT redirect");
+
+    let recorded = server.requests();
+    assert_eq!(recorded[0].method, "PUT");
+    assert_eq!(recorded[1].method, "GET");
+    assert!(recorded[1].body.is_empty());
+    assert!(recorded[1].header("content-type").is_none());
+    server.assert_clean();
+}
+
+#[test]
+fn post_308_replays_method_and_body() {
+    let hops = Arc::new(std::sync::Mutex::new(0u32));
+    let server_hops = Arc::clone(&hops);
+    let server = TestServer::start(move |conn| {
+        conn.read_request();
+        let n = {
+            let mut guard = server_hops.lock().expect("hop counter");
+            let n = *guard;
+            *guard += 1;
+            n
+        };
+        if n == 0 {
+            conn.write_all(&canned_redirect(308, "/landed"))
+                .expect("redirect write");
+        } else {
+            conn.write_all(&canned_ok(&[], b"ok")).expect("final write");
+        }
+    });
+
+    Agent::new()
+        .request(Method::POST, server.url("/form"))
+        .body(b"field=1".to_vec())
+        .send()
+        .expect("308 POST redirect");
+
+    let recorded = server.requests();
+    assert_eq!(recorded[0].method, "POST");
+    assert_eq!(recorded[1].method, "POST");
+    assert_eq!(recorded[1].body, b"field=1");
+    server.assert_clean();
+}
+
+#[test]
+fn cross_origin_redirect_strips_authorization() {
+    // Distinct ports ⇒ distinct origins. fetch #http-redirect-fetch removes
+    // Authorization when the next hop is cross-origin.
+    let landing = TestServer::start(move |conn| {
+        conn.read_request();
+        conn.write_all(&canned_ok(&[], b"landed"))
+            .expect("landing write");
+    });
+
+    let landing_addr = landing.local_addr();
+    let first = TestServer::start(move |conn| {
+        conn.read_request();
+        let location = format!("http://{landing_addr}/landed");
+        conn.write_all(&canned_redirect(302, &location))
+            .expect("redirect write");
+    });
+
+    Agent::new()
+        .request(Method::GET, first.url("/start"))
+        .header("Authorization", "Bearer secret")
+        .expect("header")
+        .send()
+        .expect("cross-origin redirect");
+
+    let first_reqs = first.requests();
+    let land_reqs = landing.requests();
+    assert_eq!(first_reqs[0].header("authorization"), Some("Bearer secret"));
+    assert!(
+        land_reqs[0].header("authorization").is_none(),
+        "Authorization must not follow a cross-origin redirect, got {land_reqs:?}"
+    );
+    first.assert_clean();
+    landing.assert_clean();
+}
+
+#[test]
 fn proxy_knob_rejects_unusable_authority_strings() {
     for bad in [
         "",
