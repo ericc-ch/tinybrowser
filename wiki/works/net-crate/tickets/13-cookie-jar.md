@@ -30,4 +30,4 @@ Run notes:
 - Offline: `cargo test -p net --test cookies --test property`
 - Size: no new crate. Jar-only delta was ~+20 KB of our code on the M1
   connector; HTTPS-only probe after ticket 14's shared dial is +490 KB
-  tuned vs empty (see size-budget.md M2/M3).
+  tuned vs empty (see [size-budget.md](../../../researches/size-budget.md) M2/M3).

@@ -16,12 +16,12 @@ Answer:
   loopback server's Set-Cookie survives across two requests per spec
   rules. Near-zero binary cost (our own code).
 - **M3 "ws"**: shared dial-path refactor (HTTP backend and WS call net's
-  one dial function), tungstenite pump thread (06), handshake through
-  `Agent`. Done when loopback echo works through the public handle.
-  Adds ≈ +184 KB (already probed).
+  one dial function), tungstenite framing with caller-owned socket (06),
+  handshake through `RequestBuilder::upgrade`. Done when loopback echo
+  works through the public handle. Adds ≈ +184 KB (already probed).
 - Ordering logic mirrors why option A was chosen: dials exist after M1,
   cookies unbreak real gates after M2, WS last because nothing waits on
-  it. Every milestone records its marginal in size-budget.md per repo
+  it. Every milestone records its marginal in [size-budget.md](../../../researches/size-budget.md) per repo
   discipline.
 - **Out of this effort's scope**: `browser`/`js` wiring (HttpTransport
   impl, fetch bindings) — that is the follow-on effort once `net` stands

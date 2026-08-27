@@ -10,7 +10,7 @@ Known upstream gap: `webkit02.dat` #44–47 (`<selectedcontent>` under relaxed `
 
 ## Options considered
 
-- **Committed snapshot** (what [webidl.md](../webidl.md) prefers for IDL): reproducible offline, but ~2 MB in git history. A submodule pins the SHA and keeps the bytes out; clones need `git submodule update --init` (harness fails loudly with that instruction). Pin details live in [VENDORED.md](../../third_party/VENDORED.md).
+- **Committed snapshot** (what [webidl.md](../researches/webidl.md) prefers for IDL): reproducible offline, but ~2 MB in git history. A submodule pins the SHA and keeps the bytes out; clones need `git submodule update --init` (harness fails loudly with that instruction). Pin details live in [VENDORED.md](../../third_party/VENDORED.md).
 - **Tracking html5lib master:** impossible after the June 2026 move into web-platform-tests.
 
 ## Consequences

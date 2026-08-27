@@ -1,7 +1,7 @@
 //! tinybrowser's network layer: bytes in, bytes out, cookies managed.
 //!
-//! Charter ([ADR 0006](../../docs/adr/0006-net-transport.md), decisions in
-//! `.scratch/net-crate/`): a small sync client owning its entire public
+//! Charter ([ADR 0006](../../wiki/adrs/0006-net-transport.md), decisions in
+//! [`wiki/works/net-crate/`](../../wiki/works/net-crate/spec.md)): a small sync client owning its entire public
 //! type surface. v1 dials through ureq 3 + native-tls; the deferred stealth milestone replaces the backend with a
 //! hand-rolled `BoringSSL` stack — and **no consumer changes**, because of
 //! the hard seam below.
@@ -11,10 +11,12 @@
 //! Every public type is ours: [`Agent`], [`RequestBuilder`], [`Response`],
 //! [`Body`], [`HeaderMap`], [`Method`], [`Context`], [`NetError`],
 //! [`WebSocket`]. Backend types exist only inside `AgentBuilder::build`,
-//! [`RequestBuilder::send`], [`Response::from_backend`], `From<ureq::Error>`,
-//! `dial::open`, `NetConnector`, and [`Agent::websocket`] — never in a
-//! signature. Statuses are data, bodies stream, cancellation is drop.
-//! `send()` follows redirects (Chrome cap 20; ureq's table stays off).
+//! [`RequestBuilder::send`], [`RequestBuilder::upgrade`],
+//! [`Response::from_backend`], `From<ureq::Error>`, `dial::open`, and
+//! `NetConnector` — never in a signature. Statuses are data, bodies stream,
+//! cancellation is drop. `send()` follows redirects (Chrome cap 20; ureq's
+//! table stays off). HTTP and WebSocket share one outbound builder:
+//! [`RequestBuilder::send`] and [`RequestBuilder::upgrade`].
 //!
 //! # Seam map
 //!

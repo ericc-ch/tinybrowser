@@ -13,7 +13,7 @@ Answer:
   frames, closing-handshake state machine). **Probed same-day:
   +184 KB tuned** (handshake feature only, no TLS — we dial ourselves);
   `url` probed at **+197 KB**; both together **+336 KB** (~53 KB shared
-  deps). Rows recorded in size-budget.md; gate passed, adoption stands.
+  deps). Rows recorded in [size-budget.md](../../../researches/size-budget.md); gate passed, adoption stands.
 - **Who writes tungstenite**: snapview org on GitHub (2,384 stars, active
   — 0.30.0 shipped July 2026, MSRV 1.85); lead contributor daniel-abramov
   (~207 commits), with alexheretic and agalakhov. ~282M crates.io
@@ -23,12 +23,16 @@ Answer:
   a live connection after `101 Switching Protocols` is undocumented;
   instead of betting on that escape hatch, WS dials its own connection
   through the same config. The btls swap replaces one dial function.
-- **Handshake**: ordinary request through `Agent` tagged
-  `Context::WsHandshake`; net builds `Upgrade`/`Sec-WebSocket-*` headers.
-- **Threading**: pump thread owns the socket post-upgrade; reads frames
-  into a bounded queue, auto-answers pings, serializes sends under a
-  lock. JS-visible handle: send / close / take-next-message.
+- **Handshake**: ordinary request through `Agent` / `RequestBuilder`
+  tagged `Context::WsHandshake`; finish with `upgrade()`. Cookie, UA,
+  and Origin share `prepare_outbound` with HTTP `send()`.
+- **Threading**: caller owns the socket post-upgrade (no background
+  pump). `send` / `close` / `take_next_message` block on the calling
+  thread; pings are answered while reading. JS event-loop delivery stays
+  in `browser`/`js`.
 - **Injection** mirrors ticket 03: trait defined in `js`, implemented in
-  `browser`; JS `open/message/error/close` events map onto the pump.
+  `browser`; JS `open/message/error/close` events map onto the handle.
 - **Close codes** surface as the `close` event's code/reason per
   RFC 6455 §7.4.
+- **Handshake headers**: `Origin` from `with_initiator` on upgrade;
+  agent `User-Agent` when configured. Bare upgrade omits `Origin`.

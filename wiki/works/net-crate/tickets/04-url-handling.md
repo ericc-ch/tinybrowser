@@ -16,7 +16,7 @@ Answer:
   subtly wrong.
 - **Gate kept but softened**: the tuned marginal gets measured at the
   implementation milestone (probe exercising real parses, per
-  size-budget.md discipline) and recorded there — adoption is not revoked
+  [size-budget.md](../../../researches/size-budget.md) discipline) and recorded there — adoption is not revoked
   unless the number lands absurdly high; maintainer prefers servo here.
 - **Facts behind the fork**: Cargo.lock had no url/idna/
   percent-encoding crates; ureq 3 speaks `http::Uri` and does NOT pull

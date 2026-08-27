@@ -5,7 +5,7 @@
 //! CDP arrives it will depend on this crate alone.
 //!
 //! This crate also hosts the html5ever [`TreeSink`] adapter (per
-//! docs/adr/0002-dom-layer-architecture.md): the parser narrates tree
+//! wiki/adrs/0002-dom-layer-architecture.md): the parser narrates tree
 //! construction, and [`Sink`] translates each instruction into `Dom`
 //! mutations. Storage stays parser-free in `dom`; parsing stays storage-free
 //! here.
@@ -29,7 +29,7 @@ pub struct Parsed {
     /// How many spec parse errors the tokenizer/tree builder reported.
     pub parse_errors: u32,
     /// `<template>` element → its contents fragment. Contents live *outside*
-    /// the child list per spec ([ADR 0002](../../docs/adr/0002-dom-layer-architecture.md)),
+    /// the child list per spec ([ADR 0002](../../wiki/adrs/0002-dom-layer-architecture.md)),
     /// so this map is the only way to reach them, exactly like the
     /// `template.content` DOM property.
     pub template_contents: HashMap<Handle, Handle>,

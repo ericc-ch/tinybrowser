@@ -8,7 +8,7 @@ cannot see.
 
 Vendored as a pinned submodule (`third_party/html5lib-tests`, decisions and
 acceptances in
-[ADR 0005](adr/0005-html5lib-tree-construction-suite.md)); the harness at
+[ADR 0005](../adrs/0005-html5lib-tree-construction-suite.md)); the harness at
 `crates/browser/tests/html5lib.rs` runs every full-document case through the
 public API under both scripting-flag settings and diffs byte-exactly against
 the spec-mandated tree: **3165 cases green**; fragment-context cases (192)

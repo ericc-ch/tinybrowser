@@ -13,6 +13,4 @@ Sub-5MB stripped x86_64 binary is the goal. Measure size at milestones.
 
 ## Further Reading
 
-- `CONTEXT.md`
-- `docs/`
-- `.scratch/`
+- [`wiki/README.md`](wiki/README.md) — terms, ADRs, size/testing notes, in-flight work

@@ -8,17 +8,17 @@ touching any consumer.
 
 Notes:
 
-- Stack fixed by [ADR 0006](../../docs/adr/0006-net-transport.md): v1 =
+- Stack fixed by [ADR 0006](../../adrs/0006-net-transport.md): v1 =
   ureq 3 + native-tls (~+490 KB tuned, dyn libssl.so.3). Stealth
   (canonical-Chrome wire behavior) is deferred to a later btls milestone,
   NOT abandoned — the API designed here must survive that swap.
-- Edges per [ADR 0001](../../docs/adr/0001-workspace-crates-with-enforced-edges.md):
+- Edges per [ADR 0001](../../adrs/0001-workspace-crates-with-enforced-edges.md):
   `net` depends on nothing; `js` never depends on `net` (fetch injected via
   a consumer-side trait); `browser` is the fan-in point that wires them.
 - Sync everywhere: `std::net`, no tokio (probe precedent + size-budget
   watchlist). Blocking IO is the default until a decision says otherwise.
 - Repo rules: AGENTS.md (no unsafe; cite governing specs inline; measure
-  binary size at milestones); size-budget.md discipline applies to every
+  binary size at milestones); [size-budget.md](../../researches/size-budget.md) discipline applies to every
   implementation milestone.
 - Fact-finding (ureq 3 API truths: header case behavior, redirect hooks,
   connector/resolver surface) goes to sub-agents when a decision needs it;
@@ -50,7 +50,8 @@ Decisions so far:
   `Agent`; persistence deferred to CDP milestone.
 - [06: WebSocket shape](./tickets/06-websocket-shape.md): tungstenite
   framing (probed +184 KB), one dial path owned by net shared with HTTP,
-  pump thread post-upgrade, js-side injection trait, RFC 6455 close codes.
+  caller owns socket post-upgrade (no pump thread), js-side injection
+  trait, RFC 6455 close codes.
 - [07: Navigation-facing API](./tickets/07-navigation-api.md): navigation
   is an ordinary `Context::Navigation` request; redirect chain deferred to
   CDP; referrer is a plain browser-set header; error pages belong to
@@ -80,7 +81,7 @@ Implementation tickets (spec.md is the source of truth):
 - [14: WebSocket via shared dial path](./tickets/14-websocket-shared-dial.md)
   — done 2026-08-26 (closes M3)
 
-CONTEXT.md terms (**Hard seam**, **Context**, **Conversion point**) written
+[CONTEXT.md](../../CONTEXT.md) terms (**Hard seam**, **Context**, **Conversion point**) written
 with ticket 14.
 
 Out of scope:

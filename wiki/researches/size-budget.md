@@ -59,7 +59,7 @@ there; they had never actually been added).
 | **tungstenite 0.30** (handshake feature only, no TLS), real loopback dial + frames + close | — | +184 KB |
 
 (url and tungstenite probed 2026-08-25 for the net-crate API effort
-(.scratch/net-crate/, decisions 04/06); same rustc 1.98.0, tuned profile,
+([wiki/works/net-crate/](../works/net-crate/map.md), decisions 04/06); same rustc 1.98.0, tuned profile,
 baseline re-measured at 290 KB — identical to the row above. In one binary
 they land +336 KB combined: ~53 KB shared-dependency overlap.)
 
@@ -102,7 +102,7 @@ standing truth.
   survives independently as the `btls`/`btls-sys` crate family (0.5.6),
   which is what the probe above exercises.
 - **Transport direction closed** (maintainer decision, 2026-08-25,
-  [ADR 0006](adr/0006-net-transport.md)): net v1 ships as *bare ureq +
+  [ADR 0006](../adrs/0006-net-transport.md)): net v1 ships as *bare ureq +
   native-tls* (+490 KB net, ~2.5 MB stack, 9/16 gates). Stealth is deferred,
   not dropped: canonical-Chrome wire behavior stays the target, owned by the
   later *hand-rolled h1/h2 on btls* milestone (≈1.3–1.7 MB net, the only
@@ -117,7 +117,7 @@ standing truth.
   ureq's transport model). Dormant now that the bridge shape is declined;
   relevant again only if the deferred stealth milestone wants it.
 - The earlier native-tls decision above is reinstated for net v1 by
-  [ADR 0006](adr/0006-net-transport.md), with the stealth objection to it
+  [ADR 0006](../adrs/0006-net-transport.md), with the stealth objection to it
   deferred alongside the goal itself (see the ADR).
 
 ## Milestone: net M1 dial (2026-08-26)
@@ -142,16 +142,16 @@ Live smokes (opt-in, `cargo test -p net --test live -- --ignored`): example.com
 
 Ticket 13 put an RFC 6265bis jar above the transport (no new dependency). Ticket 14
 replaced ureq's `DefaultConnector` with a net-owned `dial::open` shared by
-`send()` and `Agent::websocket`, then linked tungstenite 0.26 (`handshake` only).
+`send()` and `RequestBuilder::upgrade`, then linked tungstenite 0.26 (`handshake` only).
 Probes call the public API against `127.0.0.1:1` (enough to keep TLS and the
-WebSocket pump from being stripped). rustc 1.98.0; tuned profile as in the root
+WebSocket framing from being stripped). rustc 1.98.0; tuned profile as in the root
 Cargo.toml. Empty-main re-measured at 284 KB (290720 bytes), matching M1.
 
 | Component | default `release` | tuned¹ |
 | ------------------------------------------------- | ---------------- | ------- |
 | baseline (empty main, re-measured) | — | 284 KB |
 | **net M2/M3 HTTPS `send()`** (shared dial + jar, no WS call in the probe) | — | **+490 KB** |
-| **net M3** same probe plus `Agent::websocket` | — | **+603 KB** |
+| **net M3** same probe plus `RequestBuilder::upgrade` | — | **+603 KB** |
 | tungstenite marginal (M3 minus HTTPS-only) | — | **+113 KB** |
 
 Standalone tungstenite was probed at +184 KB (2026-08-25). In this crate it
@@ -179,7 +179,7 @@ code on the old M1 connector. Accepted.
 
 - **html5ever over html5gum** (+~570 KB): buys the complete HTML5 tree-construction algorithm (insertion modes, foster parenting, adoption agency). html5gum is tokenizer-only; hand-rolling tree construction is weeks of fiddly spec work. Maturity wins under a 5MB budget.
 - **Tuned profile from day one**: default release costs +400–850KB for nothing. The flags are set once in the root Cargo.toml.
-- **native-tls, dynamically linked**: TLS lives in system `libssl.so.3`; we ship only glue (~482 KB tuned). Static rustls would add ~+2.0 MB: rejected. Consequence: target machine needs OpenSSL 3 installed (near-universal on Linux). *(2026-08-25: superseded within the day by the stealth requirement — its probes showed an OpenSSL ClientHello among the most-flagged fingerprints — then reinstated for net v1 by [ADR 0006](adr/0006-net-transport.md) with stealth deferred to the hand-rolled-btls milestone. The objection returns when that milestone does.)*
+- **native-tls, dynamically linked**: TLS lives in system `libssl.so.3`; we ship only glue (~482 KB tuned). Static rustls would add ~+2.0 MB: rejected. Consequence: target machine needs OpenSSL 3 installed (near-universal on Linux). *(2026-08-25: superseded within the day by the stealth requirement — its probes showed an OpenSSL ClientHello among the most-flagged fingerprints — then reinstated for net v1 by [ADR 0006](../adrs/0006-net-transport.md) with stealth deferred to the hand-rolled-btls milestone. The objection returns when that milestone does.)*
 - **panic = unwind kept**: abort saves only ~39 KB but kills `catch_unwind`, which every JS-exposed op needs so a Rust panic degrades to a JS error instead of unwinding through QuickJS's C frame.
 - **selectors later is cheap**, confirmed at the dom-v1 checkpoint: the whole dom layer (arena + selector engine + parser stack) measured +932 KB tuned, within ~2% of the html5ever+selectors estimates it subsumes (see Milestone section).
 - **Old servo stack (html5ever + selectors + cssparser as the _core_) was never the problem**: the old repo's total was bloat elsewhere. The parser swap alone does not hit 5MB; discipline at every milestone does.
@@ -193,5 +193,5 @@ code on the old M1 connector. Accepted.
 - DOM→JS binding glue: hundreds of rquickjs classes add up; keep dispatch tables data-driven.
 - CDP server: tokio-tungstenite-style async stack is expensive; prefer a lean HTTP+WebSocket impl on `std::net`.
 - A11y walker (accname computation, role mapping): budget ~100–200 KB, fine, but measure.
-- When the deferred stealth milestone lands net on btls ([ADR 0006](adr/0006-net-transport.md)): pin the crate family like html5ever (its BoringSSL fork is wreq-ecosystem); impersonation presets go stale with every Chrome release — a stale preset is itself a detection signal, so bump discipline applies to persona tables, not just crates.
+- When the deferred stealth milestone lands net on btls ([ADR 0006](../adrs/0006-net-transport.md)): pin the crate family like html5ever (its BoringSSL fork is wreq-ecosystem); impersonation presets go stale with every Chrome release — a stale preset is itself a detection signal, so bump discipline applies to persona tables, not just crates.
 - Re-measure marginals at every milestone; regressions must justify themselves in bytes.

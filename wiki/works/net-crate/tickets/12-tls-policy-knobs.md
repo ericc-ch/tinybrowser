@@ -19,7 +19,7 @@ Status: done (2026-08-26)
 - [x] peet.ws JA4 echo confirms the OpenSSL `t13d3011_…` fingerprint —
       drift detection, not gate-passing
 - [x] Marginal measured vs empty-main baseline (expect ≈ +700 KB with
-      ticket 11) and row recorded in docs/size-budget.md
+      ticket 11) and row recorded in wiki/researches/size-budget.md
 
 Run notes:
 

@@ -49,9 +49,11 @@ Implementation decisions:
   harvest Set-Cookie / build Cookie header inside `send()`; backend cookie
   feature off; SameSite keyed off `Context` (Lax default); persistence
   deferred to CDP.
-- WebSocket: tungstenite framing behind a passed size gate (+184 KB);
-  handshake through `Agent` with `Context::WsHandshake`; one dial path
-  shared by HTTP and WS; pump thread owns the socket post-upgrade.
+- WebSocket: tungstenite framing behind a measured size gate (+184 KB);
+  handshake through `RequestBuilder::upgrade` with `Context::WsHandshake`;
+  one dial path and one outbound prepare shared with HTTP `send()`;
+  caller owns the socket post-upgrade (no background pump). `browser`/`js`
+  map DOM events onto the handle.
 - JS boundary: `HttpTransport` trait + plain types defined in `js`,
   implemented in `browser` over `net::Agent`, injected as
   `Box<dyn HttpTransport>` at runtime construction (same inversion as
@@ -59,7 +61,7 @@ Implementation decisions:
 - Policy: proxy builder knob now (HTTP CONNECT; SOCKS unmeasured), redirect
   cap default 20 (Chrome parity), no HTTP auth in v1.
 - Milestones: M1 dial (+~700 KB expected) → M2 jar → M3 ws; each records
-  its marginal in docs/size-budget.md.
+  its marginal in [size-budget.md](../../researches/size-budget.md).
 
 Testing decisions:
 
@@ -79,10 +81,13 @@ Out of scope:
 - EventSource, HTTP disk cache, h2/canonical-Chrome wire work (deferred
   stealth milestone, ADR 0006), SOCKS proxy (until measured), HTTP auth,
   jar persistence (CDP milestone), browser/js wiring (follow-on effort).
+- Fetch `mode` / CORS / preflight / opaque responses, `credentials`
+  omit/include/same-origin, and referrer policy: those belong in
+  `browser`/`js` above this dial, not in `net`.
 
 Notes:
 
-- Decisions 01–10: .scratch/net-crate/tickets/
+- Decisions 01–10: [tickets/](./tickets/)
 - Ground truth used: ureq 3.4 docs (docs.rs), Firefox nsIChannel.idl +
   FetchDriver.h (raw.githubusercontent.com per AGENTS.md), RFC 9110 §5.1,
   RFC 6265bis §5.3–5.4, WHATWG fetch #http-network-or-cache-fetch.

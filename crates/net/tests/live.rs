@@ -31,7 +31,7 @@ fn example_com_https_round_trips() {
 #[ignore = "live network; ticket 12 peet.ws JA4 drift check"]
 fn peet_ws_ja4_is_the_openssl_native_tls_shape() {
     // Drift detection, not a gate pass. v1 native-tls/OpenSSL ClientHello
-    // is recorded as `t13d3011_…` in docs/size-budget.md (2026-08-25).
+    // is recorded as `t13d3011_…` in wiki/researches/size-budget.md (2026-08-25).
     let response = live_get("https://tls.peet.ws/api/all");
     assert_eq!(response.status(), 200);
     let body = response

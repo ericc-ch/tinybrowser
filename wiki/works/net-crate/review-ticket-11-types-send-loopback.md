@@ -4,7 +4,7 @@ Reviewed: 2026-08-25 (uncommitted working tree vs `HEAD`). Findings re-checked
 against the tree on 2026-08-26.
 
 Scope: `crates/net/src/*` (new), `crates/net/tests/*` (new), `lib.rs` /
-`Cargo.toml` diffs, ticket bookkeeping in `.scratch/net-crate/`.
+`Cargo.toml` diffs, ticket bookkeeping in `wiki/works/net-crate/`.
 
 Verified before reviewing:
 
@@ -152,7 +152,7 @@ Two specific nits inside it:
 - Size discipline: ticket 11 doesn't demand it, but this diff pulls ureq +
   url (+603 lockfile lines) into the binary's dependency graph, and repo law
   is "measure size at milestones." When tickets 08 + 12 complete M1, the
-  ≈+700 KB marginal goes in `docs/size-budget.md` — don't let the milestone
+  ≈+700 KB marginal goes in `wiki/researches/size-budget.md` — don't let the milestone
   slip past the measurement.
 
 ## Verdict

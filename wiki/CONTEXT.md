@@ -65,5 +65,5 @@ Which initiator owns a `net` request (`Navigation`, `Fetch`, `Xhr`, `WsHandshake
 _Avoid_: scope (dom selector root), initiator (the document URL passed separately)
 
 **Conversion point**:
-The few places inside `net` that talk to a backend crate (`AgentBuilder::build`, `RequestBuilder::send`, `Response::from_backend`, `From<ureq::Error>`, `dial::open`, `NetConnector`, `Agent::websocket`); nowhere else may mention ureq, native-tls, or tungstenite types.
+The few places inside `net` that talk to a backend crate (`AgentBuilder::build`, `RequestBuilder::send`, `RequestBuilder::upgrade`, `Response::from_backend`, `From<ureq::Error>`, `dial::open`, `NetConnector`); nowhere else may mention ureq, native-tls, or tungstenite types.
 _Avoid_: adapter, wrapper, FFI boundary

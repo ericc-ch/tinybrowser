@@ -8,7 +8,7 @@ The API must survive that swap: public types are ours; the backend lives behind 
 
 ## Options considered
 
-Measured 2026-08-25 against real dials and the sixteen-target live gate ([testing.md](../testing.md)):
+Measured 2026-08-25 against real dials and the sixteen-target live gate ([testing.md](../researches/testing.md)):
 
 | | A: ureq + native-tls | B: ureq bridged to btls | C: hand-rolled h1/h2 on btls |
 | --- | --- | --- | --- |
@@ -22,4 +22,4 @@ Measured 2026-08-25 against real dials and the sixteen-target live gate ([testin
 
 ## Consequences
 
-Akamai-class gates fail until the stealth milestone. Probe knowledge (btls knobs, ureq `Agent::with_parts` bridge) stands as a reference. Size rows live in [size-budget.md](../size-budget.md); the native-tls / OpenSSL-fingerprint objection returns when that milestone does.
+Akamai-class gates fail until the stealth milestone. Probe knowledge (btls knobs, ureq `Agent::with_parts` bridge) stands as a reference. Size rows live in [size-budget.md](../researches/size-budget.md); the native-tls / OpenSSL-fingerprint objection returns when that milestone does.
