@@ -1,8 +1,8 @@
 //! tinybrowser's network layer: bytes in, bytes out, cookies managed.
 //!
-//! Charter ([ADR 0006](../../wiki/adrs/0006-net-transport.md), decisions in
-//! [`wiki/works/net-crate/`](../../wiki/works/net-crate/spec.md)): a small sync client owning its entire public
-//! type surface. v1 dials through ureq 3 + native-tls; the deferred stealth milestone replaces the backend with a
+//! Charter ([ADR 0006](../../wiki/adrs/0006-net-transport.md)): a small sync
+//! client owning its entire public type surface. v1 dials through ureq 3 +
+//! native-tls; the deferred stealth milestone replaces the backend with a
 //! hand-rolled `BoringSSL` stack — and **no consumer changes**, because of
 //! the hard seam below.
 //!

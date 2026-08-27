@@ -20,7 +20,3 @@ Index of project knowledge. Query starts here.
 - [Size budget](researches/size-budget.md) — measured binary marginals and stack totals
 - [Testing](researches/testing.md) — html5lib suite, public-API tests, live bot-gate matrix
 - [WebIDL verification](researches/webidl.md) — verify-don't-generate plan against vendored IDL
-
-## Works
-
-- [Net crate v1](works/net-crate/spec.md) — decided public API and implementation ([map](works/net-crate/map.md); tickets 01–14 done)

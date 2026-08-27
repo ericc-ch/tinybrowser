@@ -59,7 +59,7 @@ there; they had never actually been added).
 | **tungstenite 0.30** (handshake feature only, no TLS), real loopback dial + frames + close | — | +184 KB |
 
 (url and tungstenite probed 2026-08-25 for the net-crate API effort
-([wiki/works/net-crate/](../works/net-crate/map.md), decisions 04/06); same rustc 1.98.0, tuned profile,
+([ADR 0006](../adrs/0006-net-transport.md)); same rustc 1.98.0, tuned profile,
 baseline re-measured at 290 KB — identical to the row above. In one binary
 they land +336 KB combined: ~53 KB shared-dependency overlap.)
 
