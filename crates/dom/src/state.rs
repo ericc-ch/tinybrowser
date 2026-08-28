@@ -21,7 +21,7 @@
 
 use crate::arena::Dom;
 use crate::id::NodeId;
-use crate::node::{NodeKind, QualName, html_namespace};
+use crate::node::{NodeKind, QualName, html_namespace, xml_namespace};
 
 // ── shared lookups ──────────────────────────────────────────────────────────
 
@@ -83,8 +83,17 @@ pub(crate) fn attr_value<'a>(dom: &'a Dom, id: NodeId, name: &str) -> Option<&'a
     })
 }
 
-/// ASCII-case-insensitive equality: CSS keywords and the attribute values
-/// compared in these positions are case-insensitive.
+/// First `xml:lang` in the XML namespace.
+fn xml_lang_value(dom: &Dom, id: NodeId) -> Option<&str> {
+    let NodeKind::Element { attributes, .. } = dom.get(id)?.kind() else {
+        return None;
+    };
+    attributes.iter().find_map(|attribute| {
+        (attribute.name.ns == xml_namespace() && attribute.name.local.as_ref() == "lang")
+            .then_some(attribute.value.as_str())
+    })
+}
+
 fn eq_ignore_case(a: &str, b: &str) -> bool {
     a.eq_ignore_ascii_case(b)
 }
@@ -431,9 +440,8 @@ pub(crate) fn is_defined(dom: &Dom, id: NodeId) -> bool {
 /// (<https://drafts.csswg.org/selectors-4/#lang-pseudo>); see
 /// [`lang_range_matches`] for the exact algorithm, including wildcards.
 ///
-/// Only the literal `lang` attribute feeds inheritance today; `xml:lang`
-/// and HTTP `Content-Language` defaults are unrepresented (document state
-/// in `browser` / `Dom` when navigation exists, not a `net` feature).
+/// Only `lang` in no namespace, then `xml:lang`, then the document
+/// `Content-Language` default ([ADR 0007](../../../wiki/adrs/0007-engine-charter.md)).
 pub(crate) fn lang_matches(dom: &Dom, id: NodeId, ranges: &[Box<str>]) -> bool {
     let mut found: Option<&str> = None;
     let mut cursor = Some(id);
@@ -442,9 +450,14 @@ pub(crate) fn lang_matches(dom: &Dom, id: NodeId, ranges: &[Box<str>]) -> bool {
             found = Some(value);
             break;
         }
+        if let Some(value) = xml_lang_value(dom, current) {
+            found = Some(value);
+            break;
+        }
         cursor = dom.parent(current);
     }
-    let Some(tag) = found else {
+    let tag = found.or_else(|| dom.document_language());
+    let Some(tag) = tag else {
         return false;
     };
     ranges.iter().any(|range| lang_range_matches(range, tag))

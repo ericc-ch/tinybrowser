@@ -1,30 +1,27 @@
 # Session: engine charter (2026-08-27)
 
-State: Planning closed ([spec.md](./spec.md), [ADR 0007](../../adrs/0007-engine-charter.md)). Wiki/comments match; **no engine code**. Dirty `main` vs `9131250` / `origin/main`. Decision tickets 01–07 are answers, not implementation slices.
+State: Charter implementation is in the worktree, **uncommitted**. Product slices for this effort are done. CDP and stealth still later.
 
-Done:
-- [map.md](./map.md) complete; [spec.md](./spec.md)
-- ADR 0007 live; 0001 history; 0002/0006/CONTEXT/`AGENTS.md` aligned
-- Size probes recorded in [size-budget.md](../../researches/size-budget.md) (tokio `rt`+`time` +66 KB tuned)
+Done (uncommitted vs `origin/main`):
+- Crate graph, template-on-`Dom`, Tokio page waiter
+- `parse_html_fragment`; html5lib 3549 green (html5ever selectedcontent still listed)
+- `Page::goto`, `<base>` resolve, `Dom::document_language`
+- Thin `QuickJS` host: `Page::eval`, `setTimeout`, `fetch` Promise `{ status, text() }`, `document.cookie`
+- Three page contracts were red and are now the host: eval stringifies (`1+1` → `"2"`), JS fetch reads the body, timer/fetch callback throws push `PageEvent::ScriptFailed`. Stale JS fetch after `load_html` is ignored via `js_epoch`.
 
-In flight:
-- Uncommitted docs/rustdoc/`state.rs`/`agent.rs` comments
-- Cargo still has empty `crates/js`; `browser` and root still depend on `js`/`dom`/`net` (charter: root → `browser` only)
+JS is a thin host. Promises live in QuickJS. `HtmlJob` is timer / dial-finished / dial-failed. Navigation and `load_html` drop the realm. Dials are `http`/`https` only. No private-IP SSRF policy yet.
 
 Next:
-1. Commit the docs pass
-2. Optional `write-tickets` from the spec; or `do-work` in this order: drop unused `js` dep + root fan-in → template map onto `Dom` (html5lib dump via `Dom`) → Tokio current-thread `rt`+`time` on the page thread → `spawn_blocking` + `Agent` when navigation exists
-3. QuickJS/host APIs after a loop exists. Stealth later later.
+1. Commit if wanted
+2. CDP crate when needed
+3. Stealth later later
+4. Parser-driven `<script>` still not hooked to html5ever
 
-Decisions made: see spec. Do not reopen arena, html5ever, selectors-in-dom, wreq, `HttpTransport`, tokio `full`/axum/hyper.
+Decisions: JS callbacks live in JS globals (`__tb_timeouts`); Rust holds integer ids so `Persistent<Function>` never crosses `spawn_blocking`. No `unsafe`.
 
 Gotchas:
-- `nix develop --command cargo …` (rustc 1.98). `git submodule update --init` before `cargo test -p browser`
-- `unsafe_code = deny` in *this* repo; rquickjs may use unsafe internally
-- Put Tokio on `browser`, not `net`. Never `Agent::send()` on the page thread
-- QuickJS is `eval` / `execute_pending_job` / `call(fn)`. Host timers are our Vec. Throwaways `/tmp/qjs-host-demo`, `/tmp/js-engine-loop.html` may be gone
-- html5lib: 3165 full-document green; 192 fragment cases still skipped until fragment parse
-- Measure stripped size when Tokio or template-on-Dom lands
-- Firefox: fetch single files / searchfox; never clone
+- `nix develop --command cargo …`
+- `Page::run` must not nest inside another Tokio runtime
+- html5ever `selectedcontent` option-clone: `KNOWN_UPSTREAM_DIVERGENCES`
 
-Suggested skills: do-work (playbook: feature), write-tickets, tdd, review
+Suggested skills: do-work (playbook: session-pickup), review

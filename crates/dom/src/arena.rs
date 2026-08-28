@@ -1,12 +1,13 @@
 //! The arena: flat slot array, generational handles, tree mutations.
 
 use std::cell::Cell;
+use std::collections::HashMap;
 use std::fmt;
 use std::marker::PhantomData;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use crate::id::NodeId;
-use crate::node::{Attribute, Node, NodeKind, QualName};
+use crate::node::{Attribute, Node, NodeKind, QualName, html_namespace};
 
 /// Next document id for a freshly constructed [`Dom`]. Relaxed arithmetic is
 /// enough: the only requirement is that two live `Dom` values do not share
@@ -124,6 +125,13 @@ pub struct Dom {
     document: NodeId,
     document_id: u32,
     quirks_mode: QuirksMode,
+    /// HTTP `Content-Language` (and later `document` language) default for
+    /// `:lang()` when no `lang` / `xml:lang` is on the ancestor chain.
+    document_language: Option<String>,
+    /// `<template>` element → its contents fragment. Contents live outside
+    /// the element's child list
+    /// (<https://html.spec.whatwg.org/multipage/scripting.html#the-template-element>).
+    template_contents: HashMap<NodeId, NodeId>,
     /// `Cell<()>` is `Send` + `!Sync`; `PhantomData` makes `Dom` inherit
     /// exactly that split. Deleting this field would silently re-derive
     /// `Sync`, which is the point: that deletion has to be a conscious act.
@@ -155,6 +163,8 @@ impl Dom {
             document: NodeId::new(document_id, 0, 0),
             document_id,
             quirks_mode: QuirksMode::NoQuirks,
+            document_language: None,
+            template_contents: HashMap::new(),
             _share_forbidden: PhantomData,
         }
     }
@@ -169,6 +179,19 @@ impl Dom {
     /// the tree builder; tests may set it to exercise the id/class quirk.
     pub fn set_quirks_mode(&mut self, mode: QuirksMode) {
         self.quirks_mode = mode;
+    }
+
+    /// Document-level language from HTTP `Content-Language`, used by
+    /// `:lang()` when no element `lang` / `xml:lang` applies.
+    #[must_use]
+    pub fn document_language(&self) -> Option<&str> {
+        self.document_language.as_deref()
+    }
+
+    /// Sets the document language default. `browser` writes this after
+    /// navigation; tests may set it directly.
+    pub fn set_document_language(&mut self, language: Option<String>) {
+        self.document_language = language;
     }
 
     /// The root `Document` node; every other node descends from it.
@@ -291,7 +314,7 @@ impl Dom {
     /// Creates an empty document fragment, unattached like every fresh node.
     ///
     /// Fragments are containers outside the main tree: the contents root of
-    /// `<template>` elements (the parser associates them via its own map) and,
+    /// `<template>` elements (associated with [`Dom::set_template_contents`]) and,
     /// later, the context node for `innerHTML`-style fragment parsing.
     ///
     /// # Panics
@@ -299,6 +322,97 @@ impl Dom {
     /// See [`Dom::create_element`]: unreachable except beyond `u32::MAX` nodes.
     pub fn create_fragment(&mut self) -> NodeId {
         self.alloc(NodeKind::Fragment)
+    }
+
+    /// [Clones](https://dom.spec.whatwg.org/#concept-node-clone) `id` into a
+    /// new unattached node. `subtree` copies descendants (and a template's
+    /// contents fragment). The document node is refused: cloning a document
+    /// is a different spec operation.
+    ///
+    /// # Errors
+    ///
+    /// - [`DomError::StaleNode`] if `id` is stale.
+    /// - [`DomError::WrongNodeType`] if `id` is the document.
+    pub fn clone_node(&mut self, id: NodeId, subtree: bool) -> Result<NodeId, DomError> {
+        self.require_live(id)?;
+        if id == self.document {
+            return Err(DomError::WrongNodeType);
+        }
+        let copy = match self.get(id).map(|view| view.kind().clone()) {
+            Some(NodeKind::Doctype {
+                name,
+                public_id,
+                system_id,
+            }) => self.create_doctype(name, public_id, system_id),
+            Some(NodeKind::Element { name, attributes }) => self.create_element(name, attributes),
+            Some(NodeKind::Fragment) => self.create_fragment(),
+            Some(NodeKind::Text { data }) => self.create_text(data),
+            Some(NodeKind::Comment { data }) => self.create_comment(data),
+            Some(NodeKind::Document) | None => return Err(DomError::WrongNodeType),
+        };
+        if let Some(contents) = self.template_contents(id) {
+            let cloned_contents = self.clone_node(contents, true)?;
+            self.set_template_contents(copy, cloned_contents)?;
+        }
+        if subtree {
+            let kids: Vec<NodeId> = self
+                .children(id)
+                .map(|children| children.copied().collect())
+                .unwrap_or_default();
+            for kid in kids {
+                let child = self.clone_node(kid, true)?;
+                self.append(copy, child)?;
+            }
+        }
+        Ok(copy)
+    }
+
+    /// Associates `contents` as the [template contents](https://html.spec.whatwg.org/multipage/scripting.html#template-contents)
+    /// of `template`. The fragment stays out of `template`'s child list.
+    ///
+    /// Replacing an existing association destroys the previous fragment.
+    ///
+    /// # Errors
+    ///
+    /// - [`DomError::StaleNode`] if either handle is stale.
+    /// - [`DomError::WrongNodeType`] if `template` is not an HTML `template`
+    ///   element, `contents` is not a fragment, or `contents` already belongs
+    ///   to another template.
+    pub fn set_template_contents(
+        &mut self,
+        template: NodeId,
+        contents: NodeId,
+    ) -> Result<(), DomError> {
+        self.require_live(template)?;
+        self.require_live(contents)?;
+        if !self.is_html_template_element(template) {
+            return Err(DomError::WrongNodeType);
+        }
+        if !self.is_fragment(contents) {
+            return Err(DomError::WrongNodeType);
+        }
+        if self
+            .template_contents
+            .iter()
+            .any(|(&owner, &mapped)| mapped == contents && owner != template)
+        {
+            return Err(DomError::WrongNodeType);
+        }
+        if let Some(old) = self.template_contents.get(&template).copied()
+            && old != contents
+        {
+            self.destroy(old)?;
+            self.template_contents.remove(&template);
+        }
+        self.template_contents.insert(template, contents);
+        Ok(())
+    }
+
+    /// The contents fragment of `template`, if this document associated one.
+    #[must_use]
+    pub fn template_contents(&self, template: NodeId) -> Option<NodeId> {
+        let contents = self.template_contents.get(&template).copied()?;
+        self.contains(contents).then_some(contents)
     }
 
     /// Appends `child` as the last child of `parent`.
@@ -692,6 +806,11 @@ impl Dom {
 
         let mut pending = vec![id];
         while let Some(current) = pending.pop() {
+            if let Some(contents) = self.template_contents.remove(&current) {
+                pending.push(contents);
+            }
+            self.template_contents
+                .retain(|_, contents| *contents != current);
             let index = current.index();
             let slot = &mut self.slots[index];
             if let Some(node) = slot.node.take() {
@@ -731,6 +850,15 @@ impl Dom {
             self.get(id).map(|view| view.kind()),
             Some(NodeKind::Fragment)
         )
+    }
+
+    fn is_html_template_element(&self, id: NodeId) -> bool {
+        match self.get(id).map(|view| view.kind()) {
+            Some(NodeKind::Element { name, .. }) => {
+                name.ns == html_namespace() && name.local.as_ref().eq_ignore_ascii_case("template")
+            }
+            _ => false,
+        }
     }
 
     /// Nodes the insert algorithm actually places: a fragment's children,

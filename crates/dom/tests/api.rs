@@ -51,6 +51,39 @@ fn append_builds_chain_in_order() {
 }
 
 #[test]
+fn clone_node_copies_subtree_with_fresh_ids() {
+    let mut d = Dom::new();
+    let p = d.create_element(qn("p"), vec![attr("id", "a")]);
+    let text = d.create_text("hi");
+    d.append(p, text).unwrap();
+    let copy = d.clone_node(p, true).unwrap();
+    assert_ne!(copy, p);
+    match d.get(copy).map(|view| view.kind()) {
+        Some(NodeKind::Element { attributes, .. }) => {
+            assert_eq!(attributes[0].value, "a");
+        }
+        other => panic!("expected element, got {other:?}"),
+    }
+    let copied_text = d.children(copy).unwrap().copied().next().unwrap();
+    assert_ne!(copied_text, text);
+    match d.get(copied_text).map(|view| view.kind()) {
+        Some(NodeKind::Text { data }) => assert_eq!(data, "hi"),
+        other => panic!("expected text, got {other:?}"),
+    }
+    match d.get(text).map(|view| view.kind()) {
+        Some(NodeKind::Text { data }) => assert_eq!(data, "hi"),
+        other => panic!("original text changed: {other:?}"),
+    }
+}
+
+#[test]
+fn clone_node_refuses_the_document() {
+    let mut d = Dom::new();
+    let doc = d.document();
+    assert_eq!(d.clone_node(doc, true), Err(DomError::WrongNodeType));
+}
+
+#[test]
 fn append_moves_already_attached_nodes() {
     let mut d = Dom::new();
     let doc = d.document();
@@ -668,6 +701,52 @@ fn fragments_are_detached_containers() {
     // outside the main tree: no parent, but fully live and usable
     assert_eq!(d.parent(f), None);
     assert_eq!(d.children(f).unwrap().copied().collect::<Vec<_>>(), vec![t]);
+}
+
+#[test]
+fn template_contents_live_on_dom_outside_the_child_list() {
+    let mut d = Dom::new();
+    let template = d.create_element(qn("template"), Vec::new());
+    let contents = d.create_fragment();
+    let inner = d.create_element(qn("div"), Vec::new());
+    d.append(contents, inner).unwrap();
+
+    d.set_template_contents(template, contents).unwrap();
+    assert_eq!(d.template_contents(template), Some(contents));
+    assert_eq!(d.children(template).unwrap().count(), 0);
+    assert_eq!(
+        d.children(contents).unwrap().copied().collect::<Vec<_>>(),
+        vec![inner]
+    );
+
+    d.destroy(template).unwrap();
+    assert!(d.template_contents(template).is_none());
+    assert!(!d.contains(contents));
+    assert!(!d.contains(inner));
+}
+
+#[test]
+fn template_contents_refuse_non_template_and_shared_fragments() {
+    let mut d = Dom::new();
+    let div = d.create_element(qn("div"), Vec::new());
+    let fragment = d.create_fragment();
+    assert_eq!(
+        d.set_template_contents(div, fragment),
+        Err(DomError::WrongNodeType)
+    );
+
+    let template = d.create_element(qn("template"), Vec::new());
+    d.set_template_contents(template, fragment).unwrap();
+    let other = d.create_element(qn("template"), Vec::new());
+    assert_eq!(
+        d.set_template_contents(other, fragment),
+        Err(DomError::WrongNodeType)
+    );
+
+    let replacement = d.create_fragment();
+    d.set_template_contents(template, replacement).unwrap();
+    assert!(!d.contains(fragment));
+    assert_eq!(d.template_contents(template), Some(replacement));
 }
 
 // ── content model: the pre-insert gate (WHATWG ensure pre-insert validity) ──

@@ -20,6 +20,12 @@ pub fn html_namespace() -> Namespace {
     Namespace::from("http://www.w3.org/1999/xhtml")
 }
 
+/// The XML namespace URL (`xml:lang` lives here).
+#[must_use]
+pub fn xml_namespace() -> Namespace {
+    Namespace::from("http://www.w3.org/XML/1998/namespace")
+}
+
 /// One attribute: a qualified name and its value.
 ///
 /// Deliberately *not* `markup5ever::Attribute`: that one stores its value as

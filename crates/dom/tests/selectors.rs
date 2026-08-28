@@ -6,7 +6,7 @@
 
 use dom::{
     Attribute, Dom, LocalName, Namespace, NodeId, ParseFailKind, QualName, QuirksMode, SelectError,
-    html_namespace,
+    html_namespace, xml_namespace,
 };
 
 /// Qualified element name in the HTML namespace, no prefix.
@@ -1034,6 +1034,66 @@ fn lang_and_dir_inherit_from_ancestors() {
         d.select_all(doc, ":dir(up)"),
         Err(SelectError::Syntax(_))
     ));
+}
+
+#[test]
+fn lang_reads_xml_lang_and_document_content_language() {
+    let mut d = Dom::new();
+    let html = d.create_element(
+        qn("html"),
+        vec![
+            attr("lang", "en"),
+            Attribute {
+                name: QualName::new(None, xml_namespace(), LocalName::from("lang")),
+                value: "fr".into(),
+            },
+        ],
+    );
+    d.append(d.document(), html).unwrap();
+    let inner = d.create_element(qn("p"), Vec::new());
+    d.append(html, inner).unwrap();
+    d.set_document_language(Some("de".into()));
+    assert!(d.matches(inner, ":lang(en)").unwrap());
+    assert!(!d.matches(inner, ":lang(fr)").unwrap());
+    assert!(!d.matches(inner, ":lang(de)").unwrap());
+
+    let mut d = Dom::new();
+    let html = d.create_element(
+        qn("html"),
+        vec![Attribute {
+            name: QualName::new(None, xml_namespace(), LocalName::from("lang")),
+            value: "fr".into(),
+        }],
+    );
+    d.append(d.document(), html).unwrap();
+    let inner = d.create_element(qn("p"), Vec::new());
+    d.append(html, inner).unwrap();
+    d.set_document_language(Some("de".into()));
+    assert!(d.matches(inner, ":lang(fr)").unwrap());
+    assert!(!d.matches(inner, ":lang(de)").unwrap());
+
+    let mut d = Dom::new();
+    let html = d.create_element(qn("html"), Vec::new());
+    d.append(d.document(), html).unwrap();
+    let inner = d.create_element(qn("p"), vec![attr("lang", "en")]);
+    d.append(html, inner).unwrap();
+    d.set_document_language(Some("de".into()));
+    assert!(d.matches(inner, ":lang(en)").unwrap());
+    assert!(!d.matches(inner, ":lang(de)").unwrap());
+    assert!(d.matches(html, ":lang(de)").unwrap());
+
+    let mut d = Dom::new();
+    let html = d.create_element(
+        qn("html"),
+        vec![Attribute {
+            name: an("xml:lang"),
+            value: "fr".into(),
+        }],
+    );
+    d.append(d.document(), html).unwrap();
+    let inner = d.create_element(qn("p"), Vec::new());
+    d.append(html, inner).unwrap();
+    assert!(!d.matches(inner, ":lang(fr)").unwrap());
 }
 
 /// `:lang()` argument grammar and RFC 4647 §3.3.2 extended filtering
