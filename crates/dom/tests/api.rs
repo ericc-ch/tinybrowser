@@ -754,8 +754,8 @@ fn template_contents_refuse_non_template_and_shared_fragments() {
 /// A document holds at most one element child: the spec throws
 /// `HierarchyRequestError` for a second root
 /// (<https://dom.spec.whatwg.org/#concept-node-ensure-pre-insert-validity>).
-/// Before the gate this silently produced two roots, both of
-/// which matched `:root` (audit finding M4).
+/// Before the gate this silently produced two roots, both of which matched
+/// `:root`.
 #[test]
 fn documents_take_at_most_one_element_child() {
     let mut d = Dom::new();
@@ -854,11 +854,9 @@ fn documents_refuse_character_data() {
 }
 
 /// The bulk move answers to the document content model like every other
-/// path into a document. Before this gate, `reparent_children` was a
-/// one-call escape hatch around M4: it fabricated multi-root documents and
-/// character data under Document (subagent review R3-2). A run is validated
-/// as a *whole*, because per-child checks cannot see the pair: `[a, b]`
-/// into an empty document passes child-by-child and fails as a batch.
+/// path into a document. A run is validated as a *whole*, because per-child
+/// checks cannot see the pair: `[a, b]` into an empty document passes
+/// child-by-child and fails as a batch.
 ///
 /// Doctypes need no bulk-run test: gated insertion keeps them directly
 /// under the root, and draining the root is refused, so no doctype can
@@ -987,7 +985,7 @@ fn handles_from_another_document_do_not_resolve() {
 
 /// Attribute names are unique per DOM (`NamedNodeMap` keyed by qualified
 /// name); hand-built duplicates collapse first-wins, matching how repeated
-/// start tags merge (audit finding L10).
+/// start tags merge.
 #[test]
 fn duplicate_attributes_dedupe_first_wins() {
     let mut d = Dom::new();

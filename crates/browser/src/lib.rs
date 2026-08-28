@@ -23,7 +23,7 @@ use tendril::{StrTendril, TendrilSink};
 
 pub use dom::{Dom, DomError, NodeId};
 pub use net::Agent;
-pub use page::{Page, PageError, PageEvent};
+pub use page::{Page, PageError, PageEvent, ScriptFailure};
 
 /// The result of parsing one document.
 #[derive(Debug)]

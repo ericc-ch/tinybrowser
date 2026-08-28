@@ -127,8 +127,7 @@ pub enum ProtocolError {
     /// string that is not an `http://` HTTP CONNECT authority.
     InvalidProxy,
     /// A backend protocol failure that has no more specific tag. The
-    /// string is diagnostics only; callers match this variant, not the
-    /// text. Exists because ureq's error enum is `non_exhaustive`.
+    /// string is diagnostics only; callers match this variant, not the text.
     Other(Box<str>),
 }
 

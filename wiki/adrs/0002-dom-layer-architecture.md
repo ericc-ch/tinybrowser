@@ -21,7 +21,6 @@ The TreeSink is private in `browser`. `RefCell<Dom>` stays inside the sink: the 
 
 - **Fragment insertion splices** children into the parent and leaves the fragment empty, per [insert](https://dom.spec.whatwg.org/#concept-node-insert).
 - **Generation-wrap ABA** after 2^32 recycles of one slot is accepted; one-recycle staleness is tested.
-- **`:lang()`** reads the literal `lang` attribute only, for now. `xml:lang` is still an element attribute (`dom`). HTTP `Content-Language` is document state set by `browser` at navigation, not a `net` feature ([ADR 0007](0007-engine-charter.md)).
-- **Disabled fieldset** ignores the first-legend exemption ([HTML §4.10.4](https://html.spec.whatwg.org/multipage/form-elements.html#the-fieldset-element)).
+- **`:lang()`** reads `lang`, then `xml:lang`, then the document `Content-Language` default set by `browser` at navigation, not a `net` feature ([ADR 0007](0007-engine-charter.md)).
 - **`:scope`** under document queries is the document element. Element-rooted scope context lands with page JS.
 - **Constraint-validation and context-only pseudos** (`:valid`, `:paused`, `:open`, …) parse and match nothing until those features exist.

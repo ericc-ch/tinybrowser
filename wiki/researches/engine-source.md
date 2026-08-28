@@ -1,11 +1,19 @@
 # Reading engine source without cloning
 
-Ground truth for “what browsers do” is still the WHATWG spec. Engine
-source is the second source, used when the spec is silent or engines
-diverge. Do not clone Firefox, Chromium, or WebKit; they are too large.
+Ground truth for how browsers behave is the WHATWG spec. Engine source
+is the second source, used when the spec is silent or engines diverge.
 
-Open Firefox first (`AGENTS.md`). Chromium and WebKit are the same class
-of reference, not trees to keep locally.
+Read in this order:
+
+1. Spec.
+2. Firefox (Gecko).
+3. Chromium (Blink) if Gecko is silent or they disagree, or the question
+   is Blink, V8-adjacent, or Chrome net.
+4. WebKit if those two still disagree.
+
+Search and fetch single files. Never clone these repos; they are far too
+big. Chromium and WebKit are the same class of reference as Gecko, not
+trees to keep locally.
 
 ## Firefox (current default)
 
@@ -66,12 +74,3 @@ For our work, DOM / HTML / CSS live under WebCore:
 | Single-file fetch | `https://raw.githubusercontent.com/WebKit/WebKit/<rev>/path` |
 
 Verified 2026-08-28: GitHub raw 200 for `Source/WebCore/dom/Node.cpp` on `main`.
-
-## When to open which
-
-1. Spec first.
-2. Firefox Searchfox for Gecko behavior (our standing default).
-3. Chromium Code Search when the question is Blink, V8-adjacent, Chrome
-   net, or “what does Chrome do when Gecko disagrees.”
-4. WebKit only when those two already disagree and the spec still does
-   not settle it.

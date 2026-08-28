@@ -5,7 +5,7 @@ use std::net::TcpListener;
 use std::thread;
 use std::time::Duration;
 
-use browser::{Agent, Page, PageError, PageEvent};
+use browser::{Agent, Page, PageError, PageEvent, ScriptFailure};
 use dom::NodeKind;
 
 fn slow_ok_server(delay: Duration) -> String {
@@ -170,8 +170,8 @@ fn eval_throw_is_script_error() {
         .eval("throw new Error('boom')")
         .expect_err("throw should fail eval");
     assert!(
-        matches!(err, PageError::Script { .. }),
-        "expected PageError::Script, got {err:?}"
+        matches!(err, PageError::Script(ScriptFailure::Engine { .. })),
+        "expected engine script failure, got {err:?}"
     );
 }
 

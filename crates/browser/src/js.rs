@@ -5,12 +5,36 @@
 //! uses `Function::call` on the page thread.
 
 use std::cell::RefCell;
+use std::fmt;
 use std::rc::Rc;
 use std::time::Duration;
 
 use net::Agent;
 use rquickjs::{Array, Coerced, Context, FromJs, Function, Object, Runtime, Value, prelude::Func};
 use url::Url;
+
+#[derive(Debug)]
+pub(crate) enum JsError {
+    Engine(Box<str>),
+    BadTimerId,
+}
+
+impl JsError {
+    fn engine(err: impl fmt::Display) -> Self {
+        Self::Engine(err.to_string().into_boxed_str())
+    }
+}
+
+impl fmt::Display for JsError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Engine(message) => f.write_str(message),
+            Self::BadTimerId => f.write_str("bad timer id"),
+        }
+    }
+}
+
+impl std::error::Error for JsError {}
 
 pub(crate) struct PendingTimeout {
     pub delay: Duration,
@@ -31,9 +55,9 @@ pub(crate) struct JsHost {
 }
 
 impl JsHost {
-    pub(crate) fn new(agent: Agent, document_url: Url) -> Result<Self, String> {
-        let runtime = Runtime::new().map_err(|err| err.to_string())?;
-        let context = Context::full(&runtime).map_err(|err| err.to_string())?;
+    pub(crate) fn new(agent: Agent, document_url: Url) -> Result<Self, JsError> {
+        let runtime = Runtime::new().map_err(JsError::engine)?;
+        let context = Context::full(&runtime).map_err(JsError::engine)?;
         let pending_timeouts = Rc::new(RefCell::new(Vec::new()));
         let pending_fetches = Rc::new(RefCell::new(Vec::new()));
         let cookie = Rc::new(RefCell::new((agent, document_url)));
@@ -52,9 +76,9 @@ impl JsHost {
         self.cookie.borrow_mut().1 = url;
     }
 
-    pub(crate) fn eval(&self, source: &str) -> Result<String, String> {
-        let rendered: Result<String, String> = self.context.with(|ctx| {
-            let value: Value = ctx.eval(source).map_err(|err| err.to_string())?;
+    pub(crate) fn eval(&self, source: &str) -> Result<String, JsError> {
+        let rendered: Result<String, JsError> = self.context.with(|ctx| {
+            let value: Value = ctx.eval(source).map_err(JsError::engine)?;
             render_eval_result(&ctx, value)
         });
         let out = rendered?;
@@ -70,15 +94,15 @@ impl JsHost {
         std::mem::take(&mut *self.pending_fetches.borrow_mut())
     }
 
-    pub(crate) fn fire_timer(&self, js_id: i32) -> Result<(), String> {
-        let called: Result<(), String> = self.context.with(|ctx| {
+    pub(crate) fn fire_timer(&self, js_id: i32) -> Result<(), JsError> {
+        let called: Result<(), JsError> = self.context.with(|ctx| {
             let timeouts: Array = ctx
                 .globals()
                 .get("__tb_timeouts")
-                .map_err(|err| err.to_string())?;
-            let idx = usize::try_from(js_id).map_err(|_| "timer id".to_string())?;
-            let func: Function = timeouts.get(idx).map_err(|err| err.to_string())?;
-            func.call(()).map_err(|err| err.to_string())
+                .map_err(JsError::engine)?;
+            let idx = usize::try_from(js_id).map_err(|_| JsError::BadTimerId)?;
+            let func: Function = timeouts.get(idx).map_err(JsError::engine)?;
+            func.call(()).map_err(JsError::engine)
         });
         let jobs = self.run_jobs();
         called.and(jobs)
@@ -90,31 +114,31 @@ impl JsHost {
         ok: bool,
         status: i32,
         body: &str,
-    ) -> Result<(), String> {
+    ) -> Result<(), JsError> {
         let body = body.to_owned();
-        let called: Result<(), String> = self.context.with(|ctx| {
+        let called: Result<(), JsError> = self.context.with(|ctx| {
             let cbs: Object = ctx
                 .globals()
                 .get("__tb_fetchCbs")
-                .map_err(|err| err.to_string())?;
-            let func: Function = cbs.get(js_id).map_err(|err| err.to_string())?;
-            func.call((ok, status, body)).map_err(|err| err.to_string())
+                .map_err(JsError::engine)?;
+            let func: Function = cbs.get(js_id).map_err(JsError::engine)?;
+            func.call((ok, status, body)).map_err(JsError::engine)
         });
         let jobs = self.run_jobs();
         called.and(jobs)
     }
 
-    fn run_jobs(&self) -> Result<(), String> {
+    fn run_jobs(&self) -> Result<(), JsError> {
         loop {
             match self.runtime.execute_pending_job() {
                 Ok(true) => {}
                 Ok(false) => return Ok(()),
-                Err(err) => return Err(err.to_string()),
+                Err(err) => return Err(JsError::engine(err)),
             }
         }
     }
 
-    fn install(&self) -> Result<(), String> {
+    fn install(&self) -> Result<(), JsError> {
         let timeouts = self.pending_timeouts.clone();
         let fetches = self.pending_fetches.clone();
         let cookie_get = self.cookie.clone();
@@ -130,7 +154,7 @@ impl JsHost {
                         });
                     }),
                 )
-                .map_err(|err| err.to_string())?;
+                .map_err(JsError::engine)?;
 
             ctx.globals()
                 .set(
@@ -139,7 +163,7 @@ impl JsHost {
                         fetches.borrow_mut().push(PendingJsFetch { url, js_id });
                     }),
                 )
-                .map_err(|err| err.to_string())?;
+                .map_err(JsError::engine)?;
 
             ctx.globals()
                 .set(
@@ -149,7 +173,7 @@ impl JsHost {
                         agent.cookies_for(&url)
                     }),
                 )
-                .map_err(|err| err.to_string())?;
+                .map_err(JsError::engine)?;
 
             ctx.globals()
                 .set(
@@ -159,7 +183,7 @@ impl JsHost {
                         agent.set_cookie(&value, &url);
                     }),
                 )
-                .map_err(|err| err.to_string())?;
+                .map_err(JsError::engine)?;
 
             ctx.eval::<(), _>(
                 r"
@@ -196,19 +220,19 @@ globalThis.fetch = function(url) {
 };
 ",
             )
-            .map_err(|err| err.to_string())?;
+            .map_err(JsError::engine)?;
             Ok(())
         })
     }
 }
 
-fn render_eval_result<'js>(ctx: &rquickjs::Ctx<'js>, value: Value<'js>) -> Result<String, String> {
+fn render_eval_result<'js>(ctx: &rquickjs::Ctx<'js>, value: Value<'js>) -> Result<String, JsError> {
     if value.is_undefined() || value.is_null() {
         return Ok(String::new());
     }
     Coerced::<String>::from_js(ctx, value)
         .map(|coerced| coerced.0)
-        .map_err(|err| err.to_string())
+        .map_err(JsError::engine)
 }
 
 fn millis(delay: f64) -> u32 {

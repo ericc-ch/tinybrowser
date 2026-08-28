@@ -19,8 +19,7 @@
 //! names. A few states browsers *do* know (`:valid`/`:invalid`,
 //! `:open`/`:modal`, `:popover-open`) belong to neither bucket yet; they
 //! measure models this tree does not have (constraint validation, dialog
-//! state) and stay refused until those models exist; the audit trail lists
-//! them rather than silently answering.
+//! state) and stay refused rather than silently answering.
 //!
 //! Selector *names* are newtypes over the same interned atoms elements carry
 //! ([`crate::QualName`]), so a compiled selector compares names without ever
@@ -203,12 +202,9 @@ enum PseudoClass {
     ReadOnly,
     ReadWrite,
     PlaceholderShown,
-    /// `:default`, static subset: default checkedness/selectedness true
-    /// (`checked` checkbox/radio inputs, `selected` options); see
-    /// [`crate::state::is_default`] for the deferred clause.
+    /// `:default`, static subset: `checked` checkbox/radio, `selected` options.
     Default,
-    /// `:indeterminate`, static subset: a `progress` without a value
-    /// attribute; radio groups await the forms model.
+    /// `:indeterminate`, static subset: a `progress` without a value attribute.
     Indeterminate,
     /// `:defined`: true except for valid-but-unregistered custom-element
     /// names (HTML names containing `-`, minus the reserved set).
@@ -228,7 +224,7 @@ enum PseudoClass {
     Hover,
     /// `:active`: nothing is being pressed.
     Active,
-    /// `:focus`: no focus owner until the js layer can hold one.
+    /// `:focus`: no focus owner.
     Focus,
     /// `:focus-within`: no focus owner to be inside of.
     FocusWithin,
@@ -236,9 +232,7 @@ enum PseudoClass {
     FocusVisible,
     /// `:target`: no URL fragment is in play during a query.
     Target,
-    /// `:in-range` / `:out-of-range`: need a live value and min/max model;
-    /// statically knowable only once numbers are parsed out of values, so
-    /// deferred whole (subagent review R3-10).
+    /// `:in-range` / `:out-of-range`: no parsed min/max values.
     InRange,
     OutOfRange,
     /// `:autofill`: autofill is a live UA activity, not markup.
@@ -639,9 +633,7 @@ impl From<SelectorParseErrorKind<'_>> for ParseFail {
                 ParseFailKind::MisplacedFeature,
                 "pseudo-elements may not appear inside :is()/:where()".into(),
             ),
-            // The engine's internal-state error is a defect indicator, not
-            // user grammar misuse; bucketing it as MisplacedFeature would
-            // mislead the future DOMException mapper (audit finding L12).
+            // Engine internal-state error, not user grammar misuse.
             K::InvalidState => (
                 ParseFailKind::MalformedInput,
                 "internal selector-parser state error".into(),
@@ -724,9 +716,8 @@ impl<'a> DomElement<'a> {
     }
 
     /// First no-namespace attribute named `local`, under the element's case
-    /// regime. Delegates to [`crate::state::attr_value`]: the one home of
-    /// that policy, so `[href]` and `:link` can never drift apart again
-    /// (subagent review R3-6).
+    /// regime. Delegates to [`crate::state::attr_value`] so `[href]` and
+    /// `:link` share one lookup.
     fn attr_value(&self, local: &str) -> Option<&'a str> {
         state::attr_value(self.dom, self.id, local)
     }
@@ -884,8 +875,6 @@ impl Element for DomElement<'_> {
         pc: &PseudoClass,
         _context: &mut MatchingContext<Selectors>,
     ) -> bool {
-        // Named states are answered by crate::state under its truth
-        // policy; this match is only the routing table.
         match pc {
             PseudoClass::AnyLink | PseudoClass::Link => state::is_hyperlink(self.dom, self.id),
             PseudoClass::Enabled => state::is_enabled(self.dom, self.id),
@@ -899,16 +888,8 @@ impl Element for DomElement<'_> {
             PseudoClass::Defined => state::is_defined(self.dom, self.id),
             PseudoClass::Lang(ranges) => state::lang_matches(self.dom, self.id, ranges),
             PseudoClass::Dir(direction) => state::direction_is(self.dom, self.id, direction),
-            // Static subsets of states whose full semantics need runtime
-            // context; see crate::state for exactly which clause each
-            // covers and which stays deferred.
             PseudoClass::Indeterminate => state::is_indeterminate(self.dom, self.id),
             PseudoClass::Default => state::is_default(self.dom, self.id),
-            // Vacuous set: the context these describe (browsing history,
-            // URL fragment during a query, numeric range validation,
-            // autofill activity) does not exist in a headless tree. A
-            // fresh page in a real browser answers the same way: no
-            // matches.
             PseudoClass::Visited
             | PseudoClass::Hover
             | PseudoClass::Active
@@ -975,7 +956,9 @@ impl Element for DomElement<'_> {
     /// `:empty` ignores comments and doctypes; empty text counts as nothing.
     fn is_empty(&self) -> bool {
         let Some(mut kids) = self.dom.children(self.id) else {
-            return true; // unreachable mid-query: mutation is frozen by the borrow
+            unreachable!(
+                "selector matching walks live nodes; children() is None only for stale handles"
+            );
         };
         kids.all(|&kid| match self.dom.get(kid).map(|node| node.kind()) {
             Some(NodeKind::Text { data }) => data.is_empty(),
@@ -1045,10 +1028,6 @@ impl Iterator for Descendants<'_> {
 
 impl Dom {
     /// Compiles a selector list once per query.
-    ///
-    /// Callers that run the same selector in a hot loop should keep asking
-    /// through this string API for now; a compiled-list entry point is
-    /// deliberately deferred until the `js` layer proves it needs one.
     fn compile(selectors: &str) -> Result<SelectorList<Selectors>, SelectError> {
         let mut input = ParserInput::new(selectors);
         let mut parser = CssParser::new(&mut input);

@@ -6,14 +6,12 @@
 //! each state, so fidelity gaps are visible as missing functions rather
 //! than scattered strings.
 //!
-//! Truth policy (audit findings M3/L7): a state is implemented when static
-//! markup fully determines it (possibly as a documented subset of its full
-//! runtime semantics), answers `false` vacuously when the needed context
-//! cannot exist here (no pointer, no history), and never invents semantics
-//! beyond what the cited section defines. Where engines genuinely disagree
-//! or a clause is deferred, the cut is stated in the function's doc; those
-//! notes feed the audit trail, so a future reader inherits an accurate map
-//! rather than an optimistic one.
+//! Truth policy: a state is implemented when static markup fully determines
+//! it (possibly as a documented subset of its full runtime semantics),
+//! answers `false` vacuously when the needed context cannot exist here (no
+//! pointer, no history), and never invents semantics beyond what the cited
+//! section defines. Where engines disagree or a clause is a static subset,
+//! the cut is stated in the function's doc.
 //!
 //! Name and attribute lookups also live here ([`local_is`],
 //! [`attr_value`], [`is_html`]): one definition of the case-regime policy,
@@ -112,7 +110,6 @@ fn eq_ignore_case(a: &str, b: &str) -> bool {
 fn lang_range_matches(range: &str, tag: &str) -> bool {
     let range = range.to_ascii_lowercase();
     if range == "*" {
-        // The bare wildcard matches everything, per the RFC's special case.
         return true;
     }
     let tag = tag.to_ascii_lowercase();
@@ -120,7 +117,7 @@ fn lang_range_matches(range: &str, tag: &str) -> bool {
     for range_subtag in range.split('-') {
         match tag_subtags.next() {
             // Tag ran out first: it is less specific than the range demands.
-            None => return false,
+            None => return false, // tag less specific than the range
             Some(tag_subtag) => {
                 if range_subtag != "*" && range_subtag != tag_subtag {
                     return false;
@@ -140,7 +137,7 @@ fn lang_range_matches(range: &str, tag: &str) -> bool {
 /// match by element *type* and href, not by namespace; SVG2 gives `<a>`
 /// hyperlink status the same way
 /// (<https://svgwg.org/svg2-draft/struct.html#__svg__SVGElementElement>),
-/// which is why the old html-only gate was dropped (audit finding L9).
+/// which is why HTML-only matching would miss SVG `<a href>`.
 pub(crate) fn is_hyperlink(dom: &Dom, id: NodeId) -> bool {
     local_is(dom, id, &["a", "area", "link"]) && attr_value(dom, id, "href").is_some()
 }
@@ -164,14 +161,12 @@ fn is_form_control(dom: &Dom, id: NodeId) -> bool {
 /// `:disabled` / actually-disabled per HTML §4.15
 /// (<https://html.spec.whatwg.org/#selector-disabled>): a form control is
 /// disabled when it carries `disabled`; or when a *disabled* `fieldset` is
-/// among its ancestors (every disableable kind inherits that, not just
-/// options); or, for `option`/`optgroup`, when its nearest ancestor
-/// `select` is disabled; or, for an `option`, when its direct parent
-/// `optgroup` is disabled (§4.10.11).
-///
-/// Accepted approximation: the spec exempts descendants of a disabled
-/// fieldset's *first* `legend` child; that carve-out is not modeled. No
-/// agent-facing behavior depends on it before the js layer lands.
+/// among its ancestors, except descendants of that fieldset's first
+/// `legend` child
+/// (<https://html.spec.whatwg.org/#concept-fe-disabled>); or, for
+/// `option`/`optgroup`, when its nearest ancestor `select` is disabled; or,
+/// for an `option`, when its direct parent `optgroup` is disabled
+/// (§4.10.11).
 pub(crate) fn is_disabled(dom: &Dom, id: NodeId) -> bool {
     if !is_form_control(dom, id) {
         return false;
@@ -179,7 +174,6 @@ pub(crate) fn is_disabled(dom: &Dom, id: NodeId) -> bool {
     if attr_value(dom, id, "disabled").is_some() {
         return true;
     }
-    // option/optgroup additionally answer to their select's disability.
     if local_is(dom, id, &["option", "optgroup"]) {
         let mut cursor = dom.parent(id);
         while let Some(ancestor) = cursor {
@@ -187,16 +181,11 @@ pub(crate) fn is_disabled(dom: &Dom, id: NodeId) -> bool {
                 if attr_value(dom, ancestor, "disabled").is_some() {
                     return true;
                 }
-                break; // nearest select decides; further ancestors don't
+                break;
             }
             cursor = dom.parent(ancestor);
         }
     }
-    // …and an `option` answers to a directly enclosing disabled `optgroup`
-    // (§4.10.11: disabled "if it is a child of an optgroup that has a
-    // disabled attribute"), the inheritance channel beside the select
-    // above and the fieldset below. Direct parent only, per the spec's
-    // wording.
     if local_is(dom, id, &["option"])
         && dom.parent(id).is_some_and(|group| {
             local_is(dom, group, &["optgroup"]) && attr_value(dom, group, "disabled").is_some()
@@ -204,12 +193,35 @@ pub(crate) fn is_disabled(dom: &Dom, id: NodeId) -> bool {
     {
         return true;
     }
-    // …and every form control answers to a disabled fieldset ancestor.
+    disabled_by_fieldset(dom, id)
+}
+
+fn is_descendant_of(dom: &Dom, id: NodeId, ancestor: NodeId) -> bool {
+    let mut cursor = dom.parent(id);
+    while let Some(current) = cursor {
+        if current == ancestor {
+            return true;
+        }
+        cursor = dom.parent(current);
+    }
+    false
+}
+
+fn first_legend_child(dom: &Dom, fieldset: NodeId) -> Option<NodeId> {
+    let kids = dom.children(fieldset)?;
+    kids.copied().find(|&kid| local_is(dom, kid, &["legend"]))
+}
+
+fn disabled_by_fieldset(dom: &Dom, id: NodeId) -> bool {
     let mut cursor = dom.parent(id);
     while let Some(ancestor) = cursor {
         if local_is(dom, ancestor, &["fieldset"]) && attr_value(dom, ancestor, "disabled").is_some()
         {
-            return true;
+            let in_first_legend = first_legend_child(dom, ancestor)
+                .is_some_and(|legend| is_descendant_of(dom, id, legend));
+            if !in_first_legend {
+                return true;
+            }
         }
         cursor = dom.parent(ancestor);
     }
@@ -265,7 +277,7 @@ fn collect_descendant_options(dom: &Dom, root: NodeId, options: &mut Vec<NodeId>
 /// has a static default (in a select without `multiple`, the first option
 /// of its list of options is selected when nothing in that list carries
 /// `selected`, and the list flattens `optgroup`s), so fresh parsed pages
-/// answer exactly as browsers do (subagent review R3-4).
+/// answer as browsers do.
 pub(crate) fn is_checked(dom: &Dom, id: NodeId) -> bool {
     if local_is(dom, id, &["input"]) {
         let ty = attr_value(dom, id, "type").unwrap_or("text");
@@ -276,8 +288,6 @@ pub(crate) fn is_checked(dom: &Dom, id: NodeId) -> bool {
         if has_selected_attribute(dom, id) {
             return true;
         }
-        // Default selectedness: first option of a non-multiple select whose
-        // list carries no `selected` at all.
         let Some(select) = owning_select(dom, id) else {
             return false;
         };
@@ -374,11 +384,8 @@ pub(crate) fn is_placeholder_shown(dom: &Dom, id: NodeId) -> bool {
 }
 
 /// `:default`, static subset of <https://html.spec.whatwg.org/#selector-default>:
-/// controls whose *default* checkedness/selectedness is true (checkbox/
-/// radio inputs carrying `checked`, options carrying `selected`). The other
-/// default clause, the first submit button of a form being its default
-/// button, needs the form-owner association no tree stores yet; until the
-/// forms model lands, such buttons do not match.
+/// checkbox/radio inputs with `checked`, options with `selected`. Form
+/// default-submit buttons are not represented (no form-owner association).
 pub(crate) fn is_default(dom: &Dom, id: NodeId) -> bool {
     if local_is(dom, id, &["input"]) {
         let ty = attr_value(dom, id, "type").unwrap_or("text");
@@ -388,12 +395,9 @@ pub(crate) fn is_default(dom: &Dom, id: NodeId) -> bool {
     local_is(dom, id, &["option"]) && has_selected_attribute(dom, id)
 }
 
-/// `:indeterminate`, static subset: a `progress` element without a `value`
-/// attribute (<https://html.spec.whatwg.org/#the-progress-element>: "the
-/// progress bar is indeterminate … when the element has no value
-/// attribute"). Radio groups also feed this state, but group membership is
-/// scoped by form owner (an association no tree stores yet), so radios
-/// stay deferred until the forms model lands.
+/// `:indeterminate`, static subset: a `progress` without a `value`
+/// attribute (<https://html.spec.whatwg.org/#the-progress-element>). Radio
+/// groups are not represented (no form-owner association).
 pub(crate) fn is_indeterminate(dom: &Dom, id: NodeId) -> bool {
     local_is(dom, id, &["progress"]) && attr_value(dom, id, "value").is_none()
 }
@@ -401,9 +405,8 @@ pub(crate) fn is_indeterminate(dom: &Dom, id: NodeId) -> bool {
 /// `:defined` per <https://html.spec.whatwg.org/#selector-defined>: an
 /// element is undefined when it is a valid-but-unregistered *custom
 /// element*, an HTML-ns name containing `-` that is not one of the
-/// reserved hyphenated names. That set is fully static here (no registry
-/// can exist), so the truth is representable and represented (subagent
-/// review R3-9).
+/// reserved hyphenated names. No custom-element registry exists here, so
+/// every other hyphenated HTML name is undefined.
 pub(crate) fn is_defined(dom: &Dom, id: NodeId) -> bool {
     const RESERVED: &[&str] = &[
         "annotation-xml",
@@ -418,14 +421,12 @@ pub(crate) fn is_defined(dom: &Dom, id: NodeId) -> bool {
         return false;
     };
     if name.ns != html_namespace() {
-        return true; // foreign elements are always defined
+        return true;
     }
     let local = name.local.as_ref();
     if !local.contains('-') {
         return true;
     }
-    // Hyphenated HTML name: defined only when it is one of the reserved
-    // legacy names; anything else is an unregistered custom element.
     RESERVED
         .iter()
         .any(|reserved| local.eq_ignore_ascii_case(reserved))
@@ -477,11 +478,8 @@ fn dir_attr(dom: &Dom, id: NodeId) -> Option<&str> {
 
 /// `:dir(direction)`: nearest HTML ancestor-or-self with a `dir` attribute
 /// of `ltr`/`rtl` (<https://drafts.csswg.org/selectors-4/#dir-pseudo>).
-/// Defaults to `ltr`, the root default for HTML documents. Two documented
-/// cuts: `dir="auto"` needs first-strong-character scanning (a static pass,
-/// but one needing Unicode bidi classification; deferred, not a layout
-/// feature; subagent review R3-20), and invalid `dir` values fall through
-/// to inheritance per the spec's Undefined-direction state.
+/// Defaults to `ltr`. `dir="auto"` is not classified (needs first-strong
+/// bidi); invalid values inherit, per Undefined direction.
 pub(crate) fn direction_is(dom: &Dom, id: NodeId, want: &str) -> bool {
     let mut cursor = Some(id);
     while let Some(current) = cursor {
@@ -490,6 +488,5 @@ pub(crate) fn direction_is(dom: &Dom, id: NodeId, want: &str) -> bool {
         }
         cursor = dom.parent(current);
     }
-    // No effective direction in the chain: the document default.
     eq_ignore_case(want, "ltr")
 }

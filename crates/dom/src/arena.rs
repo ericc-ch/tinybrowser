@@ -41,10 +41,9 @@ pub enum QuirksMode {
 pub enum DomError {
     /// A handle named a node that no longer exists.
     StaleNode,
-    /// The move would place a node inside its own subtree. Browsers report
-    /// this as `HierarchyRequestError` too, and the future js binding layer
-    /// must fold it into that same exception, kept distinct because
-    /// callers can only produce it deliberately.
+    /// The move would place a node inside its own subtree. Browsers also
+    /// report this as `HierarchyRequestError`; kept distinct so a binding
+    /// can map both without losing the cycle case.
     CycleForbidden,
     /// The tree's hierarchy or content model forbids the operation:
     /// a document gaining a second root or a misplaced doctype, character
@@ -510,14 +509,8 @@ impl Dom {
         node: NodeId,
         reference: Option<NodeId>,
     ) -> Result<(), DomError> {
-        // The container-kind rule: only Document, DocumentFragment, and
-        // Element nodes accept children. Character data and doctypes are
-        // leaves; a leaf with a child list is exactly the corruption
-        // document-order matching once walked into (audit finding M5).
-        //
-        // Kind reads stay borrowed: this gate runs per insertion on the
-        // parse hot path, so cloning kinds (and their attribute lists) just
-        // to match on the variant is pure waste.
+        // Container kinds only. Leaves with a child list would be arena corruption.
+        // Kind stays borrowed: this gate is on the parse hot path.
         if !matches!(
             self.get(parent).map(|view| view.kind()),
             Some(NodeKind::Document | NodeKind::Element { .. } | NodeKind::Fragment)
@@ -533,9 +526,8 @@ impl Dom {
         if self.would_cycle(node, parent) {
             return Err(DomError::CycleForbidden);
         }
-        // Node-beside-itself ("then return") is short-circuited by
-        // `insert_before` before calling this gate: the spec's answer there
-        // is *do nothing*, which a validation-only function cannot express.
+        // `insert_before` handles node-beside-itself (spec: do nothing)
+        // before this gate.
         //
         // Content-model rules. Outside a document, a doctype as the
         // inserted node is never welcome; a fragment's children are not
@@ -610,12 +602,10 @@ impl Dom {
     /// content-model violations, and gated insertion paths make smuggling
     /// impossible (a doctype can only ever sit directly under the root,
     /// so none can appear in a moved run). When `to` **is** the document,
-    /// though, the full document content model applies to the *resulting*
-    /// sequence; see [`Dom::ensure_document_content_model`]. Validating
-    /// the moved children one-by-one would not be enough: a bulk move is
-    /// one operation, and `[html, main]` into an empty document passes
-    /// per-child while violating the model as a pair (subagent review
-    /// R3-2).
+    /// the full document content model applies to the *resulting* sequence;
+    /// see [`Dom::ensure_document_content_model`]. A bulk move is one
+    /// operation: `[html, main]` into an empty document would pass
+    /// per-child and fail as a pair.
     ///
     /// # Panics
     ///
@@ -635,8 +625,7 @@ impl Dom {
         if from == to {
             return Ok(());
         }
-        // Both endpoints accept children, or the move would strand nodes
-        // under leaves (finding M5's corruption shape, bulk edition).
+        // Both endpoints accept children, or the move would strand nodes under leaves.
         for endpoint in [from, to] {
             if !matches!(
                 self.get(endpoint).map(|view| view.kind()),
@@ -692,34 +681,28 @@ impl Dom {
     /// The document content model over one candidate child sequence. No
     /// character data anywhere, at most one element child, at most one
     /// doctype placed strictly ahead of that element; comments may sit
-    /// anywhere, and fragments stay opaque containers (the L14 splice
-    /// divergence). Deliberately the *only* encoding of the model:
+    /// anywhere, and fragments stay opaque containers. Deliberately the *only* encoding of the model:
     /// incremental insertions arrive as their resulting sequence from
     /// [`Dom::ensure_pre_insert_validity`], bulk moves as the document's
-    /// standing children followed by the moved run, where per-child checks
-    /// cannot see a violating pair like `[html, main]` (subagent review
-    /// R3-2).
+    /// standing children followed by the moved run. Per-child checks cannot
+    /// see a violating pair like `[html, main]`.
     fn ensure_document_content_model(&self, sequence: &[NodeId]) -> Result<(), DomError> {
         let mut element_seen = false;
         let mut doctype_seen = false;
         for &id in sequence {
             match self.get(id).map(|view| view.kind()) {
                 Some(NodeKind::Element { .. }) => {
-                    // A second document element is refused wherever it
-                    // would land.
                     if element_seen {
                         return Err(DomError::HierarchyRequest);
                     }
                     element_seen = true;
                 }
                 Some(NodeKind::Doctype { .. }) => {
-                    // One doctype, and only ahead of the document element.
                     if doctype_seen || element_seen {
                         return Err(DomError::HierarchyRequest);
                     }
                     doctype_seen = true;
                 }
-                // Documents hold no character data.
                 Some(NodeKind::Text { .. }) => return Err(DomError::HierarchyRequest),
                 _ => {}
             }

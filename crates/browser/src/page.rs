@@ -25,6 +25,32 @@ const MAX_IN_FLIGHT_DIALS: usize = 16;
 /// Default `Agent` per-call timeout for [`Page::new`].
 const PAGE_FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Why `QuickJS` eval or a host callback failed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ScriptFailure {
+    /// Engine, parse, or thrown script error. `message` is diagnostics.
+    Engine {
+        /// Engine wording.
+        message: Box<str>,
+    },
+    /// A timer slot id was not a valid array index.
+    BadTimerId,
+    /// The host was not present after construction. A defect if it surfaces.
+    HostMissing,
+}
+
+impl fmt::Display for ScriptFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Engine { message } => f.write_str(message),
+            Self::BadTimerId => f.write_str("bad timer id"),
+            Self::HostMissing => f.write_str("js host missing"),
+        }
+    }
+}
+
+impl std::error::Error for ScriptFailure {}
+
 /// Why a page API call was refused.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PageError {
@@ -35,22 +61,28 @@ pub enum PageError {
         spec: String,
     },
     /// `QuickJS` eval or a host callback failed.
-    Script {
-        /// Engine or host message.
-        message: String,
-    },
+    Script(ScriptFailure),
 }
 
 impl fmt::Display for PageError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidUrl { spec } => write!(f, "invalid url: {spec}"),
-            Self::Script { message } => write!(f, "script: {message}"),
+            Self::Script(failure) => write!(f, "script: {failure}"),
         }
     }
 }
 
 impl std::error::Error for PageError {}
+
+impl From<crate::js::JsError> for PageError {
+    fn from(err: crate::js::JsError) -> Self {
+        match err {
+            crate::js::JsError::Engine(message) => Self::Script(ScriptFailure::Engine { message }),
+            crate::js::JsError::BadTimerId => Self::Script(ScriptFailure::BadTimerId),
+        }
+    }
+}
 
 /// Observable HTML-job outcomes, in the order the page ran them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -310,19 +342,15 @@ impl Page {
     /// [`PageError::Script`] when the engine cannot start or the script throws.
     pub fn eval(&mut self, source: &str) -> Result<String, PageError> {
         if self.js.is_none() {
-            self.js = Some(
-                crate::js::JsHost::new(self.agent.clone(), self.document_url.clone())
-                    .map_err(|message| PageError::Script { message })?,
-            );
+            self.js = Some(crate::js::JsHost::new(
+                self.agent.clone(),
+                self.document_url.clone(),
+            )?);
         }
-        let out = self
-            .js
-            .as_ref()
-            .ok_or_else(|| PageError::Script {
-                message: "js host missing after install".into(),
-            })?
-            .eval(source)
-            .map_err(|message| PageError::Script { message })?;
+        let Some(js) = self.js.as_ref() else {
+            return Err(PageError::Script(ScriptFailure::HostMissing));
+        };
+        let out = js.eval(source)?;
         self.adopt_js_work();
         Ok(out)
     }
