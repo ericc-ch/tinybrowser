@@ -217,3 +217,7 @@ than current-thread tokio with timers. Decision: page thread is tokio current-th
 `rt`+`time` (~+66 KB); HTML jobs stay our queue; ureq via `spawn_blocking`; never
 `full` / smol / axum / hyper ([engine charter ticket 02](../works/engine-charter/tickets/02-event-loop.md)).
 Add tokio `net` only if a later milestone needs async sockets on that runtime.
+
+## Milestone: page thread in `browser` (2026-08-27)
+
+`browser` depends on tokio 1.53 `rt`+`time`+`macros` (`macros` is compile-only) and rquickjs 0.12.2 (`std`+`macro`). `Page::run` is the current-thread waiter; fetch uses `JoinSet::spawn_blocking`. The stub `tinybrowser` CLI does not call `Page`, so tuned LTO still ships **294944 bytes** (~288 KB) unless a later CLI load path references `Page`. Re-measure when the CLI actually loads a page or evals script.

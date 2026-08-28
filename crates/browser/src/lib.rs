@@ -1,18 +1,29 @@
-//! Engine crate: `parse_html` (html5ever `TreeSink`) and, later, the page
-//! (jobs, `Agent`, QuickJS). Depends on `dom` and `net`
+//! Engine crate: `parse_html` (html5ever `TreeSink`) and the page
+//! (HTML jobs, `Agent`, `QuickJS` host). Depends on `dom` and `net`
 //! ([ADR 0007](../../wiki/adrs/0007-engine-charter.md)).
 //!
 //! Future CDP depends on this crate alone. Fetch is `net::Agent` held here,
-//! not a `HttpTransport` trait.
+//! not a `HttpTransport` trait. `Agent::send` runs through `spawn_blocking`
+//! on the page thread.
+
+mod js;
+mod page;
 
 use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
-use dom::{Attribute as DomAttribute, Dom, NodeId as Handle, NodeKind, QualName};
+use dom::{
+    Attribute as DomAttribute, LocalName, Namespace, NodeId as Handle, NodeKind, QualName,
+    html_namespace,
+};
 use html5ever::tree_builder::{ElementFlags, NodeOrText, QuirksMode, TreeSink};
 use markup5ever::interface::tree_builder::ElemName;
 use tendril::{StrTendril, TendrilSink};
+
+pub use dom::{Dom, DomError, NodeId};
+pub use net::Agent;
+pub use page::{Page, PageError, PageEvent, ScriptFailure};
 
 /// The result of parsing one document.
 #[derive(Debug)]
@@ -23,11 +34,6 @@ pub struct Parsed {
     pub quirks_mode: QuirksMode,
     /// How many spec parse errors the tokenizer/tree builder reported.
     pub parse_errors: u32,
-    /// `<template>` element → its contents fragment. Contents live *outside*
-    /// the child list per spec ([ADR 0002](../../wiki/adrs/0002-dom-layer-architecture.md)),
-    /// so this map is the only way to reach them, exactly like the
-    /// `template.content` DOM property.
-    pub template_contents: HashMap<Handle, Handle>,
 }
 
 /// Parses a full HTML document into a fresh [`Dom`] with the scripting flag
@@ -57,6 +63,43 @@ pub fn parse_html_with_scripting(input: &str, scripting_enabled: bool) -> Parsed
     html5ever::parse_document(sink, opts).one(input)
 }
 
+/// Parses an HTML fragment with `context` as the
+/// [context element](https://html.spec.whatwg.org/multipage/parsing.html#html-fragment-parsing-algorithm)
+/// local name, using html5lib's `svg ` / `math ` prefixes for foreign
+/// namespaces. The returned tree is a document whose `html` element holds
+/// the fragment's nodes (html5ever's fragment root).
+#[must_use]
+pub fn parse_html_fragment(input: &str, context: &str, scripting_enabled: bool) -> Parsed {
+    let opts = html5ever::ParseOpts {
+        tree_builder: html5ever::tree_builder::TreeBuilderOpts {
+            scripting_enabled,
+            ..html5ever::tree_builder::TreeBuilderOpts::default()
+        },
+        ..html5ever::ParseOpts::default()
+    };
+    let sink = Sink::new();
+    html5ever::parse_fragment(
+        sink,
+        opts,
+        fragment_context_name(context),
+        Vec::new(),
+        scripting_enabled,
+    )
+    .one(input)
+}
+
+fn fragment_context_name(spec: &str) -> QualName {
+    const SVG: &str = "http://www.w3.org/2000/svg";
+    const MATHML: &str = "http://www.w3.org/1998/Math/MathML";
+    if let Some(local) = spec.strip_prefix("svg ") {
+        QualName::new(None, Namespace::from(SVG), LocalName::from(local))
+    } else if let Some(local) = spec.strip_prefix("math ") {
+        QualName::new(None, Namespace::from(MATHML), LocalName::from(local))
+    } else {
+        QualName::new(None, html_namespace(), LocalName::from(spec))
+    }
+}
+
 // ── the sink ────────────────────────────────────────────────────────────────
 
 struct Sink {
@@ -69,9 +112,6 @@ struct Sink {
     dom: RefCell<Dom>,
     quirks_mode: Cell<QuirksMode>,
     parse_errors: Cell<u32>,
-    /// `<template>` element → its contents fragment. Contents live *outside*
-    /// the child list per spec, so a side map keeps them out of `children()`.
-    template_contents: RefCell<HashMap<Handle, Handle>>,
     /// Elements the tree builder flagged as
     /// [HTML integration points](https://html.spec.whatwg.org/multipage/parsing.html#html-integration-point):
     /// `MathML` `annotation-xml` whose `encoding` makes HTML content parse
@@ -88,7 +128,6 @@ impl Sink {
             dom: RefCell::new(Dom::new()),
             quirks_mode: Cell::new(QuirksMode::NoQuirks),
             parse_errors: Cell::new(0),
-            template_contents: RefCell::new(HashMap::new()),
             integration_points: RefCell::new(HashSet::new()),
         }
     }
@@ -175,7 +214,6 @@ impl TreeSink for Sink {
             dom: self.dom.into_inner(),
             quirks_mode: self.quirks_mode.get(),
             parse_errors: self.parse_errors.get(),
-            template_contents: self.template_contents.into_inner(),
         }
     }
 
@@ -213,9 +251,10 @@ impl TreeSink for Sink {
         let element = self.dom.borrow_mut().create_element(name, converted);
         if flags.template {
             let contents = self.dom.borrow_mut().create_fragment();
-            self.template_contents
+            self.dom
                 .borrow_mut()
-                .insert(element, contents);
+                .set_template_contents(element, contents)
+                .expect("fresh template element accepts a fresh contents fragment");
         }
         if flags.mathml_annotation_xml_integration_point {
             self.integration_points.borrow_mut().insert(element);
@@ -278,10 +317,9 @@ impl TreeSink for Sink {
     }
 
     fn get_template_contents(&self, target: &Self::Handle) -> Self::Handle {
-        *self
-            .template_contents
+        self.dom
             .borrow()
-            .get(target)
+            .template_contents(*target)
             .unwrap_or_else(|| panic!("template contents requested for a non-template"))
     }
 
@@ -355,5 +393,180 @@ impl TreeSink for Sink {
             .borrow_mut()
             .reparent_children(*node, *new_parent)
             .expect("builder reparents between live, cycle-free nodes");
+    }
+
+    /// [Maybe clone an option into selectedcontent](https://html.spec.whatwg.org/multipage/form-elements.html#maybe-clone-an-option-into-selectedcontent).
+    fn maybe_clone_an_option_into_selectedcontent(&self, option: &Self::Handle) {
+        let mut dom = self.dom.borrow_mut();
+        let Some(select) = nearest_html_select(&dom, *option) else {
+            return;
+        };
+        if !option_is_selected(&dom, *option, select) {
+            return;
+        }
+        let Some(selectedcontent) = enabled_selectedcontent(&dom, select) else {
+            return;
+        };
+        clone_option_into_selectedcontent(&mut dom, *option, selectedcontent);
+    }
+}
+
+fn is_html_named(dom: &Dom, id: Handle, local: &str) -> bool {
+    match dom.get(id).map(|node| node.kind()) {
+        Some(NodeKind::Element { name, .. }) => {
+            name.ns == html_namespace() && name.local.as_ref().eq_ignore_ascii_case(local)
+        }
+        _ => false,
+    }
+}
+
+fn html_bool_attr(dom: &Dom, id: Handle, local: &str) -> bool {
+    match dom.get(id).map(|node| node.kind()) {
+        Some(NodeKind::Element { attributes, .. }) => attributes.iter().any(|attribute| {
+            attribute.name.ns.is_empty()
+                && attribute.name.local.as_ref().eq_ignore_ascii_case(local)
+        }),
+        _ => false,
+    }
+}
+
+fn html_attr_value(dom: &Dom, id: Handle, local: &str) -> Option<String> {
+    match dom.get(id).map(|node| node.kind()) {
+        Some(NodeKind::Element { attributes, .. }) => attributes.iter().find_map(|attribute| {
+            (attribute.name.ns.is_empty()
+                && attribute.name.local.as_ref().eq_ignore_ascii_case(local))
+            .then(|| attribute.value.clone())
+        }),
+        _ => None,
+    }
+}
+
+fn nearest_html_select(dom: &Dom, mut id: Handle) -> Option<Handle> {
+    loop {
+        id = dom.parent(id)?;
+        if is_html_named(dom, id, "select") {
+            return Some(id);
+        }
+    }
+}
+
+/// [Select display size](https://html.spec.whatwg.org/multipage/form-elements.html#concept-select-size).
+fn select_display_size(dom: &Dom, select: Handle) -> u32 {
+    if let Some(raw) = html_attr_value(dom, select, "size")
+        && let Ok(size) = raw.trim().parse::<u32>()
+        && size > 0
+    {
+        return size;
+    }
+    if html_bool_attr(dom, select, "multiple") {
+        4
+    } else {
+        1
+    }
+}
+
+/// [List of options](https://html.spec.whatwg.org/multipage/form-elements.html#concept-select-option-list).
+fn html_list_of_options(dom: &Dom, select: Handle) -> Vec<Handle> {
+    let mut out = Vec::new();
+    let Some(kids) = dom.children(select) else {
+        return out;
+    };
+    for kid in kids.copied() {
+        if is_html_named(dom, kid, "option") {
+            out.push(kid);
+        } else if is_html_named(dom, kid, "optgroup")
+            && let Some(grouped) = dom.children(kid)
+        {
+            for inner in grouped.copied() {
+                if is_html_named(dom, inner, "option") {
+                    out.push(inner);
+                }
+            }
+        }
+    }
+    out
+}
+
+fn option_is_disabled(dom: &Dom, option: Handle) -> bool {
+    if html_bool_attr(dom, option, "disabled") {
+        return true;
+    }
+    let Some(parent) = dom.parent(option) else {
+        return false;
+    };
+    is_html_named(dom, parent, "optgroup") && html_bool_attr(dom, parent, "disabled")
+}
+
+/// Parse-time [selectedness](https://html.spec.whatwg.org/multipage/form-elements.html#concept-option-selectedness)
+/// plus the [selectedness setting algorithm](https://html.spec.whatwg.org/multipage/form-elements.html#selectedness-setting-algorithm).
+fn option_is_selected(dom: &Dom, option: Handle, select: Handle) -> bool {
+    let options = html_list_of_options(dom, select);
+    let mut selected: Vec<bool> = options
+        .iter()
+        .map(|&id| html_bool_attr(dom, id, "selected"))
+        .collect();
+    let multiple = html_bool_attr(dom, select, "multiple");
+    if !multiple
+        && select_display_size(dom, select) == 1
+        && !selected.iter().any(|&flag| flag)
+        && let Some(index) = options.iter().position(|&id| !option_is_disabled(dom, id))
+    {
+        selected[index] = true;
+    } else if !multiple
+        && selected.iter().filter(|flag| **flag).count() >= 2
+        && let Some(last) = selected.iter().rposition(|flag| *flag)
+    {
+        for (index, flag) in selected.iter_mut().enumerate() {
+            *flag = index == last;
+        }
+    }
+    options
+        .iter()
+        .position(|&id| id == option)
+        .and_then(|index| selected.get(index).copied())
+        .unwrap_or(false)
+}
+
+/// [Enabled selectedcontent](https://html.spec.whatwg.org/multipage/form-elements.html#get-a-select-s-enabled-selectedcontent).
+fn enabled_selectedcontent(dom: &Dom, select: Handle) -> Option<Handle> {
+    if html_bool_attr(dom, select, "multiple") {
+        return None;
+    }
+    first_html_named_descendant(dom, select, "selectedcontent")
+}
+
+fn first_html_named_descendant(dom: &Dom, root: Handle, local: &str) -> Option<Handle> {
+    let kids = dom.children(root)?;
+    for kid in kids.copied() {
+        if is_html_named(dom, kid, local) {
+            return Some(kid);
+        }
+        if let Some(found) = first_html_named_descendant(dom, kid, local) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+/// [Clone an option into a selectedcontent](https://html.spec.whatwg.org/multipage/form-elements.html#clone-an-option-into-a-selectedcontent).
+fn clone_option_into_selectedcontent(dom: &mut Dom, option: Handle, selectedcontent: Handle) {
+    let stale: Vec<Handle> = dom
+        .children(selectedcontent)
+        .map(|children| children.copied().collect())
+        .unwrap_or_default();
+    for child in stale {
+        dom.destroy(child)
+            .expect("selectedcontent children are live descendants");
+    }
+    let kids: Vec<Handle> = dom
+        .children(option)
+        .map(|children| children.copied().collect())
+        .unwrap_or_default();
+    for kid in kids {
+        let cloned = dom
+            .clone_node(kid, true)
+            .expect("option children clone into new nodes");
+        dom.append(selectedcontent, cloned)
+            .expect("selectedcontent accepts cloned option children");
     }
 }

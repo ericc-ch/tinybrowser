@@ -6,7 +6,7 @@
 
 use dom::{
     Attribute, Dom, LocalName, Namespace, NodeId, ParseFailKind, QualName, QuirksMode, SelectError,
-    html_namespace,
+    html_namespace, xml_namespace,
 };
 
 /// Qualified element name in the HTML namespace, no prefix.
@@ -642,8 +642,7 @@ fn hand_built_mixed_case_names_match_like_tokenized_trees_would() {
 // ── form-control UI states (HTML §pseudo-classes) ───────────────────────────
 
 /// The attribute-derived UI states match exactly what static markup
-/// determines; audit finding L7: these used to throw `SyntaxError` where
-/// every browser returns matches.
+/// determines. Browsers return matches for these names; they are not syntax errors.
 #[test]
 fn form_states_match_from_static_markup() {
     let mut d = Dom::new();
@@ -714,12 +713,11 @@ fn form_states_match_from_static_markup() {
     assert_eq!(hits(":placeholder-shown"), vec![hinted]);
 }
 
-/// Disability inherits per HTML §4.15 (*Disabled elements*): EVERY form
+/// Disability inherits per HTML §4.15 (*Disabled elements*): every form
 /// control under a disabled `<fieldset>` is disabled (not just options);
 /// option/optgroup additionally answer to their nearest disabled
 /// `<select>`, and an `option` answers to its directly enclosing disabled
-/// `<optgroup>` (§4.10.11). The first-`legend` exemption stays an unmodeled
-/// approximation (see `state::is_disabled`); nothing here exercises legends.
+/// `<optgroup>` (§4.10.11).
 #[test]
 fn fieldset_and_select_disability_inherits() {
     let mut d = Dom::new();
@@ -754,8 +752,6 @@ fn fieldset_and_select_disability_inherits() {
 
     let hits = |selector: &str| d.select_all(body, selector).unwrap();
 
-    // The reviewed code walked ancestors only for option/optgroup, so this
-    // input answered `:enabled` while sitting in a dead fieldset (R3-3).
     assert!(hits(":disabled").contains(&inside));
     assert!(!hits(":enabled").contains(&inside));
     assert!(
@@ -774,13 +770,44 @@ fn fieldset_and_select_disability_inherits() {
     assert!(!hits(":enabled").contains(&bystander));
 }
 
+/// HTML `#concept-fe-disabled`: descendants of a disabled fieldset's first
+/// `legend` child are not disabled by that fieldset. A later legend, or a
+/// control outside any legend, still is.
+#[test]
+fn disabled_fieldset_exempts_first_legend_descendants() {
+    let mut d = Dom::new();
+    let body = body_under(&mut d);
+
+    let fieldset = d.create_element(qn("fieldset"), vec![attr("disabled", "")]);
+    d.append(body, fieldset).unwrap();
+    let note = d.create_element(qn("p"), Vec::new());
+    d.append(fieldset, note).unwrap();
+    let first_legend = d.create_element(qn("legend"), Vec::new());
+    d.append(fieldset, first_legend).unwrap();
+    let in_first = d.create_element(qn("input"), Vec::new());
+    d.append(first_legend, in_first).unwrap();
+    let later_legend = d.create_element(qn("legend"), Vec::new());
+    d.append(fieldset, later_legend).unwrap();
+    let in_later = d.create_element(qn("input"), Vec::new());
+    d.append(later_legend, in_later).unwrap();
+    let outside = d.create_element(qn("input"), Vec::new());
+    d.append(fieldset, outside).unwrap();
+
+    let hits = |selector: &str| d.select_all(body, selector).unwrap();
+    assert!(
+        !hits(":disabled").contains(&in_first),
+        "first legend descendants stay enabled"
+    );
+    assert!(hits(":enabled").contains(&in_first));
+    assert!(hits(":disabled").contains(&in_later));
+    assert!(hits(":disabled").contains(&outside));
+}
+
 /// Selectedness has a static default (HTML *concept-option-selectedness*):
 /// in a select without `multiple`, the first option of its list of options
 /// is selected when nothing in that list carries `selected`, and the list
 /// flattens `optgroup`s, so wrapped options answer like bare ones. Fresh
-/// parsed pages therefore match `:checked` exactly as browsers do
-/// (subagent review R3-4; the optgroup shapes were missed by that round's
-/// fixtures and caught by the pass-4 review probes).
+/// parsed pages therefore match `:checked` exactly as browsers do.
 #[test]
 fn checked_defaults_apply_without_selected_attributes() {
     let mut d = Dom::new();
@@ -840,8 +867,8 @@ fn checked_defaults_apply_without_selected_attributes() {
 
 /// A placeholder is *shown* only where one can render and only while the
 /// control's value is empty
-/// (<https://html.spec.whatwg.org/#attr-input-placeholder>; subagent review
-/// R3-11: a checkbox carrying `placeholder` used to match).
+/// (<https://html.spec.whatwg.org/#attr-input-placeholder>). A checkbox
+/// with `placeholder` does not match.
 #[test]
 fn placeholder_shown_respects_input_types_and_values() {
     let mut d = Dom::new();
@@ -883,11 +910,8 @@ fn placeholder_shown_respects_input_types_and_values() {
     );
 }
 
-/// Statically knowable subsets of two states whose full semantics need a
-/// forms model: `:default` answers default-checked/-selected controls (the
-/// default-submit-button clause stays deferred), `:indeterminate` answers a
-/// `progress` without a value attribute (radio groups stay deferred);
-/// see `state::is_default` / `state::is_indeterminate` (R3-10).
+/// Static subsets: `:default` matches default-checked/-selected controls;
+/// `:indeterminate` matches a `progress` without a value attribute.
 #[test]
 fn default_and_indeterminate_answer_their_static_subsets() {
     let mut d = Dom::new();
@@ -919,7 +943,7 @@ fn default_and_indeterminate_answer_their_static_subsets() {
     assert_eq!(
         defaults,
         vec![box_checked, picked],
-        "default submit buttons need the forms model; everything else is markup"
+        "checked/selected markup only; submit buttons are not form-associated here"
     );
 
     let indeterminate = d.select_all(body, ":indeterminate").unwrap();
@@ -927,7 +951,7 @@ fn default_and_indeterminate_answer_their_static_subsets() {
 }
 
 /// `:any-link` shares the hyperlink rule; both hit SVG `<a href>` too
-/// (audit finding L9: browsers match hyperlinks in any namespace).
+/// (Selectors 4 matches by element type and href, not HTML namespace).
 #[test]
 fn any_link_and_link_cover_html_and_svg() {
     let mut d = Dom::new();
@@ -961,9 +985,7 @@ fn any_link_and_link_cover_html_and_svg() {
 
 /// `:defined` (<https://html.spec.whatwg.org/#selector-defined>): true for
 /// everything except valid-but-unregistered custom-element names: HTML
-/// names containing `-`, minus the reserved hyphenated set. That set is
-/// fully static here, so the old "always true" shortcut was a lie for
-/// `<my-widget>`-shaped markup (subagent review R3-9).
+/// names containing `-`, minus the reserved hyphenated set.
 #[test]
 fn defined_covers_everything_but_unregistered_custom_names() {
     let mut d = Dom::new();
@@ -1036,11 +1058,70 @@ fn lang_and_dir_inherit_from_ancestors() {
     ));
 }
 
+#[test]
+fn lang_reads_xml_lang_and_document_content_language() {
+    let mut d = Dom::new();
+    let html = d.create_element(
+        qn("html"),
+        vec![
+            attr("lang", "en"),
+            Attribute {
+                name: QualName::new(None, xml_namespace(), LocalName::from("lang")),
+                value: "fr".into(),
+            },
+        ],
+    );
+    d.append(d.document(), html).unwrap();
+    let inner = d.create_element(qn("p"), Vec::new());
+    d.append(html, inner).unwrap();
+    d.set_document_language(Some("de".into()));
+    assert!(d.matches(inner, ":lang(en)").unwrap());
+    assert!(!d.matches(inner, ":lang(fr)").unwrap());
+    assert!(!d.matches(inner, ":lang(de)").unwrap());
+
+    let mut d = Dom::new();
+    let html = d.create_element(
+        qn("html"),
+        vec![Attribute {
+            name: QualName::new(None, xml_namespace(), LocalName::from("lang")),
+            value: "fr".into(),
+        }],
+    );
+    d.append(d.document(), html).unwrap();
+    let inner = d.create_element(qn("p"), Vec::new());
+    d.append(html, inner).unwrap();
+    d.set_document_language(Some("de".into()));
+    assert!(d.matches(inner, ":lang(fr)").unwrap());
+    assert!(!d.matches(inner, ":lang(de)").unwrap());
+
+    let mut d = Dom::new();
+    let html = d.create_element(qn("html"), Vec::new());
+    d.append(d.document(), html).unwrap();
+    let inner = d.create_element(qn("p"), vec![attr("lang", "en")]);
+    d.append(html, inner).unwrap();
+    d.set_document_language(Some("de".into()));
+    assert!(d.matches(inner, ":lang(en)").unwrap());
+    assert!(!d.matches(inner, ":lang(de)").unwrap());
+    assert!(d.matches(html, ":lang(de)").unwrap());
+
+    let mut d = Dom::new();
+    let html = d.create_element(
+        qn("html"),
+        vec![Attribute {
+            name: an("xml:lang"),
+            value: "fr".into(),
+        }],
+    );
+    d.append(d.document(), html).unwrap();
+    let inner = d.create_element(qn("p"), Vec::new());
+    d.append(html, inner).unwrap();
+    assert!(!d.matches(inner, ":lang(fr)").unwrap());
+}
+
 /// `:lang()` argument grammar and RFC 4647 §3.3.2 extended filtering
 /// (Selectors 4 §lang-pseudo): comma-separated ranges, `*` wildcard subtags,
 /// insignificant whitespace, and no way to make a malformed attribute
-/// value crash the matcher (subagent review R3-1: byte slicing used to
-/// panic on multibyte `lang` values).
+/// value crash the matcher.
 #[test]
 fn lang_ranges_follow_extended_filtering() {
     let mut d = Dom::new();
@@ -1095,10 +1176,8 @@ fn lang_ranges_follow_extended_filtering() {
     }
 }
 
-/// Regression pin for subagent review R3-1: `lang` values are untrusted
-/// markup, and matching used to slice them by byte index: a multibyte
-/// value plus an unlucky range crashed the whole process. Every query here
-/// must answer, not panic; the middle one used to die on a char boundary.
+/// Malformed `lang` values are untrusted markup. Matching must answer, not
+/// panic, including when a range would split inside a multibyte character.
 #[test]
 fn multibyte_lang_values_never_crash_the_matcher() {
     let mut d = Dom::new();

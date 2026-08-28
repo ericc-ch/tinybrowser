@@ -11,8 +11,8 @@ acceptances in
 [ADR 0005](../adrs/0005-html5lib-tree-construction-suite.md)); the harness at
 `crates/browser/tests/html5lib.rs` runs every full-document case through the
 public API under both scripting-flag settings and diffs byte-exactly against
-the spec-mandated tree: **3165 cases green**; fragment-context cases (192)
-defer until fragment parsing exists, upstream's `<selectedcontent>` gap is a
+the spec-mandated tree: **3549 cases green** (full-document plus fragment-context),
+upstream's `<selectedcontent>` gap is a
 documented divergence. This was the standing open item from the dom-layer
 milestone; it covers exactly the misnesting/foster-parenting/adoption-agency
 traps hand-written fixtures miss.

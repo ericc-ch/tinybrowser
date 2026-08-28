@@ -4,9 +4,9 @@ Hand-written parse fixtures miss foster parenting, the adoption agency, template
 
 Status: accepted
 
-Every full-document case runs under each scripting-flag setting the markers demand; dumps compare byte-exactly. `#document-fragment` cases are counted and skipped until fragment parsing exists. New divergences fail the build: fix or document, never silently ignore.
+Every full-document and `#document-fragment` case runs under each scripting-flag setting the markers demand; dumps compare byte-exactly. New divergences fail the build: fix or document, never silently ignore.
 
-Known upstream gap: `webkit02.dat` #44–47 (`<selectedcontent>` under relaxed `<select>`). html5ever leaves `maybe_clone_an_option_into_selectedcontent` unimplemented; `markup5ever_rcdom` diverges identically. Listed in `KNOWN_UPSTREAM_DIVERGENCES`; retires when the html5ever pin moves past it.
+Known upstream gap: `webkit02.dat` #44–47 (`<selectedcontent>` / `<option>` under relaxed `<select>`, html5ever `maybe_clone_an_option_into_selectedcontent` unimplemented) and `tests_innerHTML_1.dat` #75 (select fragment `<input><option>`: spec wants only `<option>`; html5ever keeps `<input>`). `markup5ever_rcdom` diverges identically. Listed in `KNOWN_UPSTREAM_DIVERGENCES`; retires when the html5ever pin moves past it.
 
 ## Options considered
 

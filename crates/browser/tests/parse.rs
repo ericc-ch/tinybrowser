@@ -147,7 +147,78 @@ fn template_contents_do_not_pollute_the_child_list() {
     let body = child(d, html, 1);
     let template = child(d, body, 0);
     assert_eq!(local_name(d, template), "template");
-    // contents live outside children(); they are reachable only through the
-    // fragment association, which the serializer layer will consult
     assert_eq!(d.children(template).unwrap().count(), 0);
+    let contents = d
+        .template_contents(template)
+        .expect("parsed template has contents on Dom");
+    let locals: Vec<_> = d
+        .children(contents)
+        .unwrap()
+        .copied()
+        .map(|id| local_name(d, id))
+        .collect();
+    assert_eq!(locals, ["div", "span"]);
+}
+
+#[test]
+fn explicit_option_end_tag_clones_into_selectedcontent() {
+    // html5ever calls TreeSink::maybe_clone_an_option_into_selectedcontent
+    // only for an explicit </option>
+    // (https://html.spec.whatwg.org/multipage/form-elements.html#maybe-clone-an-option-into-selectedcontent).
+    let parsed =
+        parse_html("<select><button><selectedcontent></button><option>X</option></select>");
+    let expected = "\
+#document
+| <html>
+|   <head>
+|   <body>
+|     <select>
+|       <button>
+|         <selectedcontent>
+|           \"X\"
+|       <option>
+|         \"X\"
+";
+    assert_eq!(dump(&parsed), expected);
+}
+
+#[test]
+fn selected_option_replaces_selectedcontent_clone() {
+    let parsed = parse_html(
+        "<select><button><selectedcontent></button><option>X</option><option selected>Y</option></select>",
+    );
+    let expected = "\
+#document
+| <html>
+|   <head>
+|   <body>
+|     <select>
+|       <button>
+|         <selectedcontent>
+|           \"Y\"
+|       <option>
+|         \"X\"
+|       <option>
+|         \"Y\"
+";
+    assert_eq!(dump(&parsed), expected);
+}
+
+#[test]
+fn multiple_select_skips_selectedcontent_clone() {
+    let parsed = parse_html(
+        "<select multiple><button><selectedcontent></button><option>X</option></select>",
+    );
+    let expected = "\
+#document
+| <html>
+|   <head>
+|   <body>
+|     <select>
+|       <button>
+|         <selectedcontent>
+|       <option>
+|         \"X\"
+";
+    assert_eq!(dump(&parsed), expected);
 }

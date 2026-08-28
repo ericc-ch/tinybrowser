@@ -26,7 +26,8 @@ the binary; it exists so tests are reproducible and offline-capable.
 
 ### Known exclusions
 
-Cases carrying a `#document-fragment` section exercise fragment parsing
-(`innerHTML`-style), which `browser::parse_html` does not offer yet. The
-harness counts them, skips them, and prints the count; the exclusion retires
-when fragment parsing lands (see ADR 0005).
+None for tree-construction: fragment cases run through `parse_html_fragment`.
+html5ever's unimplemented `selectedcontent` option-clone (`webkit02.dat` #44–47)
+and select-fragment `<input><option>` (`tests_innerHTML_1.dat` #75) are listed in
+`KNOWN_UPSTREAM_DIVERGENCES` with pinned dumps under
+`crates/browser/tests/html5lib/accepted/` (see ADR 0005).
