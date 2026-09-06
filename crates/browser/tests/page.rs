@@ -334,3 +334,34 @@ fn load_html_puts_the_tree_on_the_page() {
         .expect("p");
     assert_eq!(element_text(&parsed.dom, p), "hi");
 }
+
+#[test]
+fn rejected_fetch_chain_drains_before_run_returns() {
+    let mut page = Page::new();
+    page.eval("fetch('file:///one').catch(() => fetch('file:///two')).catch(() => setTimeout(() => { globalThis.done = true; }, 0))").expect("queue");
+    page.run();
+    assert_eq!(page.eval("globalThis.done").expect("read"), "true");
+}
+
+#[test]
+fn throwing_script_still_runs_microtasks_and_releases_timers() {
+    let mut page = Page::new();
+    assert!(page.eval("Promise.resolve().then(() => { globalThis.microtask = true; }); setTimeout(() => { globalThis.timer = true; }, 0); throw Error('boom')").is_err());
+    assert_eq!(page.eval("globalThis.microtask").expect("read"), "true");
+    page.run();
+    assert_eq!(page.eval("globalThis.timer").expect("read"), "true");
+    assert_eq!(
+        page.eval("Object.keys(__tb_timeouts).length")
+            .expect("slots"),
+        "0"
+    );
+}
+
+#[test]
+fn load_html_supersedes_queued_navigation() {
+    let mut page = Page::new();
+    page.goto("http://127.0.0.1:1/").expect("queue");
+    page.load_html("<p>local</p>");
+    page.run();
+    assert!(page.events().is_empty());
+}

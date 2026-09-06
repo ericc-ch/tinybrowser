@@ -5,7 +5,8 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
-use std::future::pending;
+use std::future::{Future, pending, poll_fn};
+use std::task::Poll;
 use std::time::Duration;
 
 use dom::NodeKind;
@@ -251,6 +252,9 @@ impl Page {
 
     /// Parses `input` into this page's tree and starts a new JS realm.
     pub fn load_html(&mut self, input: &str) {
+        self.nav_epoch = self.nav_epoch.saturating_add(1);
+        self.queued_dials
+            .retain(|dial| !matches!(dial, QueuedDial::Navigate { .. }));
         self.reset_js_realm();
         self.parsed = Some(parse_html(input));
         if let Some(parsed) = &mut self.parsed {
@@ -350,9 +354,9 @@ impl Page {
         let Some(js) = self.js.as_ref() else {
             return Err(PageError::Script(ScriptFailure::HostMissing));
         };
-        let out = js.eval(source)?;
+        let out = js.eval(source).map_err(PageError::from);
         self.adopt_js_work();
-        Ok(out)
+        out
     }
 
     /// Jobs that have already run, in order.
@@ -415,6 +419,13 @@ impl Page {
                 self.adopt_js_work();
                 self.launch_queued_dials();
             }
+            if self
+                .js
+                .as_ref()
+                .is_some_and(crate::js::JsHost::has_pending_work)
+            {
+                continue;
+            }
             let fetches_pending = !self.fetches.is_empty();
             let queued = !self.queued_dials.is_empty();
             let next_deadline = self.next_timer_deadline();
@@ -424,17 +435,28 @@ impl Page {
             if queued && !fetches_pending {
                 continue;
             }
-            tokio::select! {
-                Some(joined) = self.fetches.join_next(), if fetches_pending => {
-                    match joined.expect("fetch worker panicked") {
-                        Ok(done) => self.jobs.push_back(HtmlJob::DialFinished(done)),
-                        Err(fail) => self.jobs.push_back(HtmlJob::DialFailed(fail)),
-                    }
+            let deadline = wait_until(next_deadline);
+            let mut deadline = std::pin::pin!(deadline);
+            let job = poll_fn(|cx| {
+                if deadline.as_mut().poll(cx).is_ready() {
+                    return Poll::Ready(None);
                 }
-                () = wait_until(next_deadline) => {
-                    while let Some(id) = self.due_timer() {
-                        self.jobs.push_back(HtmlJob::Timer(id));
-                    }
+                if fetches_pending
+                    && let Poll::Ready(Some(joined)) = self.fetches.poll_join_next(cx)
+                {
+                    return Poll::Ready(Some(joined));
+                }
+                Poll::Pending
+            })
+            .await;
+            if let Some(joined) = job {
+                match joined.expect("fetch worker panicked") {
+                    Ok(done) => self.jobs.push_back(HtmlJob::DialFinished(done)),
+                    Err(fail) => self.jobs.push_back(HtmlJob::DialFailed(fail)),
+                }
+            } else {
+                while let Some(id) = self.due_timer() {
+                    self.jobs.push_back(HtmlJob::Timer(id));
                 }
             }
         }

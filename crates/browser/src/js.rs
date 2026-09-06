@@ -81,9 +81,13 @@ impl JsHost {
             let value: Value = ctx.eval(source).map_err(JsError::engine)?;
             render_eval_result(&ctx, value)
         });
-        let out = rendered?;
-        self.run_jobs()?;
-        Ok(out)
+        // https://html.spec.whatwg.org/multipage/webappapis.html#clean-up-after-running-script
+        let jobs = self.run_jobs();
+        rendered.and_then(|out| jobs.map(|()| out))
+    }
+
+    pub(crate) fn has_pending_work(&self) -> bool {
+        !self.pending_timeouts.borrow().is_empty() || !self.pending_fetches.borrow().is_empty()
     }
 
     pub(crate) fn take_pending_timeouts(&self) -> Vec<PendingTimeout> {
@@ -102,6 +106,10 @@ impl JsHost {
                 .map_err(JsError::engine)?;
             let idx = usize::try_from(js_id).map_err(|_| JsError::BadTimerId)?;
             let func: Function = timeouts.get(idx).map_err(JsError::engine)?;
+            timeouts
+                .as_object()
+                .remove(js_id)
+                .map_err(JsError::engine)?;
             func.call(()).map_err(JsError::engine)
         });
         let jobs = self.run_jobs();

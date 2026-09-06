@@ -16,12 +16,6 @@ Index of project knowledge. Query starts here.
 - [0006 Net transport](adrs/0006-net-transport.md) — v1 is ureq 3 + native-tls; stealth deferred to hand-rolled btls
 - [0007 Engine charter](adrs/0007-engine-charter.md) — three crates, HTML jobs + Tokio waiter, `browser` holds `Agent`
 
-## Works
-
-- [Engine charter](works/engine-charter/map.md) — thinner crate law and the real holes
-- [Engine charter spec](works/engine-charter/spec.md) — decided engine shape (loop, crates, layers)
-- [Engine charter session](works/engine-charter/session.md) — 2026-08-27 continuation
-
 ## Research
 
 - [Size budget](researches/size-budget.md) — measured binary marginals and stack totals

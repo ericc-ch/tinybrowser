@@ -1075,8 +1075,8 @@ fn lang_reads_xml_lang_and_document_content_language() {
     let inner = d.create_element(qn("p"), Vec::new());
     d.append(html, inner).unwrap();
     d.set_document_language(Some("de".into()));
-    assert!(d.matches(inner, ":lang(en)").unwrap());
-    assert!(!d.matches(inner, ":lang(fr)").unwrap());
+    assert!(!d.matches(inner, ":lang(en)").unwrap());
+    assert!(d.matches(inner, ":lang(fr)").unwrap());
     assert!(!d.matches(inner, ":lang(de)").unwrap());
 
     let mut d = Dom::new();

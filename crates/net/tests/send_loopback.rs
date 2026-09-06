@@ -958,7 +958,7 @@ fn method_case_is_fetch_accurate_at_the_type_and_on_the_wire() {
     // a stealth-only property.
     let server = TestServer::start(|conn| {
         conn.read_request();
-        conn.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+        conn.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
             .expect("canned write");
     });
 
@@ -1058,4 +1058,40 @@ fn agent_ignores_env_http_proxy() {
     assert_eq!(response.status(), 200);
     assert_eq!(server.requests()[0].target, "/direct");
     server.assert_clean();
+}
+
+#[test]
+fn builder_debug_omits_proxy_credentials() {
+    let builder = AgentBuilder::new()
+        .proxy("http://user:secret@localhost:8080")
+        .expect("proxy");
+    let debug = format!("{builder:?}");
+    assert!(!debug.contains("user"));
+    assert!(!debug.contains("secret"));
+}
+
+#[test]
+fn ipv6_loopback_dials_without_dns_brackets() {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("[::1]:0").expect("IPv6 loopback");
+    let addr = listener.local_addr().expect("addr");
+    let worker = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept");
+        let mut head = Vec::new();
+        let mut byte = [0];
+        while !head.ends_with(b"\r\n\r\n") {
+            stream.read_exact(&mut byte).expect("head");
+            head.extend_from_slice(&byte);
+        }
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            .expect("response");
+    });
+    let url = url::Url::parse(&format!("http://{addr}/")).expect("url");
+    let response = Agent::new()
+        .request(Method::GET, url)
+        .send()
+        .expect("IPv6 dial");
+    assert_eq!(response.status(), 200);
+    worker.join().expect("worker");
 }

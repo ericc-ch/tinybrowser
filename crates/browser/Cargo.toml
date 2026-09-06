@@ -14,8 +14,8 @@ net = { workspace = true }
 markup5ever = "=0.39.0"
 html5ever = "=0.39.0"
 tendril = "0.5"
-# Page thread waiter: current-thread `rt`+`time`+`macros` (`macros` for `select!` only).
-tokio = { version = "1.53", default-features = false, features = ["rt", "time", "macros"] }
+# Page thread waiter: current-thread `rt`+`time`.
+tokio = { version = "1.53", default-features = false, features = ["rt", "time"] }
 url = "2"
 # QuickJS-ng via rquickjs; `std` uses shipped linux bindings (no bindgen).
-rquickjs = { version = "0.12.2", default-features = false, features = ["std", "macro"] }
+rquickjs = { version = "0.12.2", default-features = false, features = ["std"] }

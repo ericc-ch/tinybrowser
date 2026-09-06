@@ -337,30 +337,29 @@ impl Dom {
         if id == self.document {
             return Err(DomError::WrongNodeType);
         }
-        let copy = match self.get(id).map(|view| view.kind().clone()) {
-            Some(NodeKind::Doctype {
-                name,
-                public_id,
-                system_id,
-            }) => self.create_doctype(name, public_id, system_id),
-            Some(NodeKind::Element { name, attributes }) => self.create_element(name, attributes),
-            Some(NodeKind::Fragment) => self.create_fragment(),
-            Some(NodeKind::Text { data }) => self.create_text(data),
-            Some(NodeKind::Comment { data }) => self.create_comment(data),
-            Some(NodeKind::Document) | None => return Err(DomError::WrongNodeType),
-        };
-        if let Some(contents) = self.template_contents(id) {
-            let cloned_contents = self.clone_node(contents, true)?;
-            self.set_template_contents(copy, cloned_contents)?;
-        }
-        if subtree {
-            let kids: Vec<NodeId> = self
-                .children(id)
-                .map(|children| children.copied().collect())
-                .unwrap_or_default();
-            for kid in kids {
-                let child = self.clone_node(kid, true)?;
-                self.append(copy, child)?;
+        let copy = self.alloc(self.get(id).ok_or(DomError::StaleNode)?.kind().clone());
+        let mut pending = vec![(id, copy)];
+        while let Some((source, target)) = pending.pop() {
+            // https://html.spec.whatwg.org/multipage/scripting.html#the-template-element:cloning-steps
+            if let Some(contents) = self.template_contents(source) {
+                let cloned_contents = self.create_fragment();
+                self.set_template_contents(target, cloned_contents)?;
+                if subtree {
+                    pending.push((contents, cloned_contents));
+                }
+            }
+            if subtree {
+                let kids: Vec<NodeId> = self
+                    .children(source)
+                    .ok_or(DomError::StaleNode)?
+                    .copied()
+                    .collect();
+                for kid in kids {
+                    let child =
+                        self.alloc(self.get(kid).ok_or(DomError::StaleNode)?.kind().clone());
+                    self.append(target, child)?;
+                    pending.push((kid, child));
+                }
             }
         }
         Ok(copy)
@@ -373,6 +372,8 @@ impl Dom {
     ///
     /// # Errors
     ///
+    /// - [`DomError::CycleForbidden`] if the association creates a host-including cycle.
+    /// - [`DomError::HierarchyRequest`] if replacement would destroy the new contents.
     /// - [`DomError::StaleNode`] if either handle is stale.
     /// - [`DomError::WrongNodeType`] if `template` is not an HTML `template`
     ///   element, `contents` is not a fragment, or `contents` already belongs
@@ -397,9 +398,16 @@ impl Dom {
         {
             return Err(DomError::WrongNodeType);
         }
+        // https://dom.spec.whatwg.org/#concept-tree-host-including-inclusive-ancestor
+        if self.would_cycle(contents, template) {
+            return Err(DomError::CycleForbidden);
+        }
         if let Some(old) = self.template_contents.get(&template).copied()
             && old != contents
         {
+            if self.would_cycle(old, contents) {
+                return Err(DomError::HierarchyRequest);
+            }
             self.destroy(old)?;
             self.template_contents.remove(&template);
         }
@@ -937,12 +945,21 @@ impl Dom {
 
     /// True iff placing `subtree` under `into` would nest it inside itself.
     fn would_cycle(&self, subtree: NodeId, into: NodeId) -> bool {
+        // https://dom.spec.whatwg.org/#concept-tree-host-including-inclusive-ancestor
         let mut cursor = Some(into);
         while let Some(id) = cursor {
             if id == subtree {
                 return true;
             }
-            cursor = self.parent(id);
+            cursor = self.parent(id).or_else(|| {
+                if self.is_fragment(id) {
+                    self.template_contents
+                        .iter()
+                        .find_map(|(&host, &contents)| (contents == id).then_some(host))
+                } else {
+                    None
+                }
+            });
         }
         false
     }

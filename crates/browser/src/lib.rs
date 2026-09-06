@@ -501,30 +501,18 @@ fn option_is_disabled(dom: &Dom, option: Handle) -> bool {
 /// plus the [selectedness setting algorithm](https://html.spec.whatwg.org/multipage/form-elements.html#selectedness-setting-algorithm).
 fn option_is_selected(dom: &Dom, option: Handle, select: Handle) -> bool {
     let options = html_list_of_options(dom, select);
-    let mut selected: Vec<bool> = options
-        .iter()
-        .map(|&id| html_bool_attr(dom, id, "selected"))
-        .collect();
-    let multiple = html_bool_attr(dom, select, "multiple");
-    if !multiple
-        && select_display_size(dom, select) == 1
-        && !selected.iter().any(|&flag| flag)
-        && let Some(index) = options.iter().position(|&id| !option_is_disabled(dom, id))
-    {
-        selected[index] = true;
-    } else if !multiple
-        && selected.iter().filter(|flag| **flag).count() >= 2
-        && let Some(last) = selected.iter().rposition(|flag| *flag)
-    {
-        for (index, flag) in selected.iter_mut().enumerate() {
-            *flag = index == last;
-        }
+    if html_bool_attr(dom, select, "multiple") {
+        return options.contains(&option) && html_bool_attr(dom, option, "selected");
     }
-    options
+    let selected = options
         .iter()
-        .position(|&id| id == option)
-        .and_then(|index| selected.get(index).copied())
-        .unwrap_or(false)
+        .rfind(|&&id| html_bool_attr(dom, id, "selected"))
+        .or_else(|| {
+            (select_display_size(dom, select) == 1)
+                .then(|| options.iter().find(|&&id| !option_is_disabled(dom, id)))
+                .flatten()
+        });
+    selected == Some(&option)
 }
 
 /// [Enabled selectedcontent](https://html.spec.whatwg.org/multipage/form-elements.html#get-a-select-s-enabled-selectedcontent).
@@ -532,17 +520,23 @@ fn enabled_selectedcontent(dom: &Dom, select: Handle) -> Option<Handle> {
     if html_bool_attr(dom, select, "multiple") {
         return None;
     }
-    first_html_named_descendant(dom, select, "selectedcontent")
-}
-
-fn first_html_named_descendant(dom: &Dom, root: Handle, local: &str) -> Option<Handle> {
-    let kids = dom.children(root)?;
-    for kid in kids.copied() {
-        if is_html_named(dom, kid, local) {
-            return Some(kid);
+    let mut pending: Vec<_> = dom.children(select)?.rev().copied().collect();
+    while let Some(id) = pending.pop() {
+        if is_html_named(dom, id, "selectedcontent") {
+            // https://html.spec.whatwg.org/multipage/form-elements.html#the-selectedcontent-element
+            let mut ancestor = dom.parent(id);
+            while let Some(parent) = ancestor {
+                if is_html_named(dom, parent, "option")
+                    || is_html_named(dom, parent, "selectedcontent")
+                {
+                    return None;
+                }
+                ancestor = dom.parent(parent);
+            }
+            return Some(id);
         }
-        if let Some(found) = first_html_named_descendant(dom, kid, local) {
-            return Some(found);
+        if let Some(kids) = dom.children(id) {
+            pending.extend(kids.rev().copied());
         }
     }
     None

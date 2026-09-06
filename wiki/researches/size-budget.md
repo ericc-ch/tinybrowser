@@ -215,9 +215,26 @@ not drop it. Empty `main` re-measured at 284 KB (290912 bytes).
 Tokio 1.53 default features are empty; `full` is the fat switch. smol is not smaller
 than current-thread tokio with timers. Decision: page thread is tokio current-thread
 `rt`+`time` (~+66 KB); HTML jobs stay our queue; ureq via `spawn_blocking`; never
-`full` / smol / axum / hyper ([engine charter ticket 02](../works/engine-charter/tickets/02-event-loop.md)).
+`full` / smol / axum / hyper ([engine charter](../adrs/0007-engine-charter.md)).
 Add tokio `net` only if a later milestone needs async sockets on that runtime.
 
 ## Milestone: page thread in `browser` (2026-08-27)
 
 `browser` depends on tokio 1.53 `rt`+`time`+`macros` (`macros` is compile-only) and rquickjs 0.12.2 (`std`+`macro`). `Page::run` is the current-thread waiter; fetch uses `JoinSet::spawn_blocking`. The stub `tinybrowser` CLI does not call `Page`, so tuned LTO still ships **294944 bytes** (~288 KB) unless a later CLI load path references `Page`. Re-measure when the CLI actually loads a page or evals script.
+
+## Milestone: reviewed page engine (2026-09-06)
+
+Tokio now enables only `rt` and `time`; rquickjs enables only `std`. Build with
+`nix develop --command cargo build --release --example page_probe --bin tinybrowser`.
+With rustc 1.98.0 and the committed stripped x86_64 release profile:
+
+| Artifact | Bytes |
+| --- | ---: |
+| CLI stub (`target/release/tinybrowser`) | 294,944 |
+| Page engine (`target/release/examples/page_probe`) | 2,831,904 |
+
+The [probe](../../examples/page_probe.rs) references HTML parsing, navigation,
+QuickJS eval, timers, and the page loop, so LTO retains the engine. Running it
+without arguments prints `42`; passing an HTTP URL also navigates before eval.
+Native TLS still uses the dynamically linked Nix OpenSSL. This is a real engine
+checkpoint below 5 MB, not a finished browser or static distribution measurement.

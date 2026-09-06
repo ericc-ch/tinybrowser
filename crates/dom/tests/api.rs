@@ -1006,3 +1006,48 @@ fn duplicate_attributes_dedupe_first_wins() {
         other => panic!("expected element, got {other:?}"),
     }
 }
+
+#[test]
+fn template_host_cycles_are_rejected_without_mutation() {
+    let mut d = Dom::new();
+    let template = d.create_element(qn("template"), Vec::new());
+    let contents = d.create_fragment();
+    d.append(contents, template).expect("unassociated fragment");
+    assert_eq!(
+        d.set_template_contents(template, contents),
+        Err(DomError::CycleForbidden)
+    );
+    d.detach(template).expect("detach");
+    d.set_template_contents(template, contents)
+        .expect("associate");
+    assert_eq!(d.append(contents, template), Err(DomError::CycleForbidden));
+    let inner = d.create_element(qn("template"), Vec::new());
+    d.append(contents, inner).expect("nested template");
+    let nested = d.create_fragment();
+    d.set_template_contents(inner, nested)
+        .expect("nested contents");
+    assert_eq!(
+        d.set_template_contents(template, nested),
+        Err(DomError::WrongNodeType)
+    );
+    assert_eq!(d.append(nested, template), Err(DomError::CycleForbidden));
+    d.destroy(template).expect("destroy acyclic ownership tree");
+    assert!(!d.contains(nested));
+}
+
+#[test]
+fn shallow_template_clone_has_empty_contents() {
+    let mut d = Dom::new();
+    let template = d.create_element(qn("template"), Vec::new());
+    let contents = d.create_fragment();
+    let text = d.create_text("payload");
+    d.append(contents, text).expect("text");
+    d.set_template_contents(template, contents)
+        .expect("associate");
+    let shallow = d.clone_node(template, false).expect("shallow");
+    let empty = d.template_contents(shallow).expect("empty contents");
+    assert_eq!(d.children(empty).expect("children").count(), 0);
+    let deep = d.clone_node(template, true).expect("deep");
+    let copied = d.template_contents(deep).expect("copied contents");
+    assert_eq!(d.children(copied).expect("children").count(), 1);
+}

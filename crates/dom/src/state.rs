@@ -441,17 +441,20 @@ pub(crate) fn is_defined(dom: &Dom, id: NodeId) -> bool {
 /// (<https://drafts.csswg.org/selectors-4/#lang-pseudo>); see
 /// [`lang_range_matches`] for the exact algorithm, including wildcards.
 ///
-/// Only `lang` in no namespace, then `xml:lang`, then the document
-/// `Content-Language` default ([ADR 0007](../../../wiki/adrs/0007-engine-charter.md)).
+/// `xml:lang` takes precedence over `lang`, then the document
+/// `Content-Language` default (<https://html.spec.whatwg.org/multipage/dom.html#language>) ([ADR 0007](../../../wiki/adrs/0007-engine-charter.md)).
 pub(crate) fn lang_matches(dom: &Dom, id: NodeId, ranges: &[Box<str>]) -> bool {
     let mut found: Option<&str> = None;
     let mut cursor = Some(id);
     while let Some(current) = cursor {
-        if let Some(value) = attr_value(dom, current, "lang") {
+        if let Some(value) = xml_lang_value(dom, current) {
             found = Some(value);
             break;
         }
-        if let Some(value) = xml_lang_value(dom, current) {
+        if let Some(NodeKind::Element { name, .. }) = dom.get(current).map(|node| node.kind())
+            && (name.ns == html_namespace() || name.ns.as_ref() == "http://www.w3.org/2000/svg")
+            && let Some(value) = attr_value(dom, current, "lang")
+        {
             found = Some(value);
             break;
         }
