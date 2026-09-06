@@ -2,7 +2,6 @@
 members = [
     "crates/browser",
     "crates/dom",
-    "crates/js",
     "crates/net",
 ]
 
@@ -13,7 +12,6 @@ edition = "2024"
 [workspace.dependencies]
 browser = { path = "crates/browser" }
 dom = { path = "crates/dom" }
-js = { path = "crates/js" }
 net = { path = "crates/net" }
 
 [package]
@@ -26,9 +24,6 @@ workspace = true
 
 [dependencies]
 browser = { workspace = true }
-dom = { workspace = true }
-js = { workspace = true }
-net = { workspace = true }
 
 # ─── Lints ────────────────────────────────────────────────────────────────────
 # Strict (not strict-strict): `all` is error, `pedantic`/`cargo` are warnings.

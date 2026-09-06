@@ -2,7 +2,7 @@
 
 Crate slogans, a fake `js` seam, and parking DOM/language on `net` were fighting the product: a small page engine with a job loop, not a web-server org chart. The decided shape is three deep crates, HTML jobs on a Tokio current-thread waiter, `browser` holding `net::Agent` and `parse_html`.
 
-Status: accepted. Source: [engine-charter spec](../works/engine-charter/spec.md). Supersedes the crate table and “js must not depend on net” / root-depends-on-all-four rules in [ADR 0001](0001-workspace-crates-with-enforced-edges.md). Does not reopen [ADR 0002](0002-dom-layer-architecture.md) arena or [ADR 0006](0006-net-transport.md) v1 transport.
+Status: accepted. Supersedes the crate table and “js must not depend on net” / root-depends-on-all-four rules in [ADR 0001](0001-workspace-crates-with-enforced-edges.md). Does not reopen [ADR 0002](0002-dom-layer-architecture.md) arena or [ADR 0006](0006-net-transport.md) v1 transport.
 
 | crate | depends on | charter |
 |---|---|---|

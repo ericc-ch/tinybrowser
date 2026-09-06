@@ -22,20 +22,28 @@ mod dump;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use browser::parse_html_with_scripting;
+use browser::{parse_html_fragment, parse_html_with_scripting};
 
-/// Cases where our tree is *known* to diverge from the suite's expectation
-/// for reasons outside this workspace: html5ever itself leaves
-/// `maybe_clone_an_option_into_selectedcontent` unimplemented ("will result
-/// in a (slightly) incorrect DOM tree", per the trait docs), so an
-/// `<option>` after `<selectedcontent>` under the relaxed `<select>` rules
-/// mis-nests. Verified against rcdom (html5ever's own test DOM): it diverges
-/// identically. See ADR 0005. Revisit whenever the html5ever pin moves.
-const KNOWN_UPSTREAM_DIVERGENCES: &[(&str, &[usize], &str)] = &[(
-    "webkit02.dat",
-    &[44, 45, 46, 47],
-    "html5ever: maybe_clone_an_option_into_selectedcontent unimplemented",
-)];
+/// html5ever calls `TreeSink::maybe_clone_an_option_into_selectedcontent` only
+/// on an explicit `</option>` (servo/html5ever#712). We implement that hook.
+/// `webkit02.dat` #44–47 omit `</option>`, so the builder never asks and
+/// `<selectedcontent>` stays empty. `tests_innerHTML_1.dat` #75 is fragment
+/// context `select` with data `<input><option>` (spec wants a lone `<option>`);
+/// html5ever keeps `<input>` as well. Accepted dumps live in
+/// `tests/html5lib/accepted/` so a worse tree than today's html5ever still
+/// fails. See ADR 0005.
+const KNOWN_UPSTREAM_DIVERGENCES: &[(&str, &[usize], &str)] = &[
+    (
+        "webkit02.dat",
+        &[44, 45, 46, 47],
+        "html5ever: option-clone hook skipped on implied </option> (servo/html5ever#712)",
+    ),
+    (
+        "tests_innerHTML_1.dat",
+        &[75],
+        "html5ever: select fragment `<input><option>` keeps <input>; spec wants only <option>",
+    ),
+];
 
 /// Locates the vendored suite, refusing to run silently when a fresh clone
 /// skipped submodule initialization.
@@ -75,7 +83,6 @@ fn tree_construction_matches_spec_trees() {
 
     let mut failures = Vec::new();
     let mut ran = 0_usize;
-    let mut deferred_fragment_cases = 0_usize;
     let mut accepted_divergences = 0_usize;
 
     for path in &files {
@@ -87,16 +94,15 @@ fn tree_construction_matches_spec_trees() {
         let content = fs::read_to_string(path)
             .unwrap_or_else(|error| panic!("cannot read {file_name}: {error}"));
         for (index, case) in dat::parse_dat(&content).into_iter().enumerate() {
-            if case.fragment_context.is_some() {
-                // Fragment parsing (`innerHTML`-style) is not exposed yet;
-                // counted, not silently dropped. See VENDORED.md / ADR 0005.
-                deferred_fragment_cases += 1;
-                continue;
-            }
             for &scripting_on in case.scripting.settings() {
                 ran += 1;
-                let parsed = parse_html_with_scripting(&case.data, scripting_on);
-                let actual = dump::dump_document(&parsed.dom, &parsed.template_contents);
+                let actual = if let Some(context) = &case.fragment_context {
+                    let parsed = parse_html_fragment(&case.data, context, scripting_on);
+                    dump::dump_fragment(&parsed.dom)
+                } else {
+                    let parsed = parse_html_with_scripting(&case.data, scripting_on);
+                    dump::dump_document(&parsed.dom)
+                };
                 if actual == case.document {
                     continue;
                 }
@@ -104,9 +110,19 @@ fn tree_construction_matches_spec_trees() {
                     .iter()
                     .any(|(file, cases, _)| *file == file_name && cases.contains(&index));
                 if known {
-                    // Diverges exactly the way the documented upstream gap
-                    // predicts; counted in the summary, never a failure.
-                    accepted_divergences += 1;
+                    let pinned = accepted_dump(&file_name, index, scripting_on);
+                    if pinned.as_deref() == Some(actual.as_str()) {
+                        accepted_divergences += 1;
+                    } else {
+                        failures.push(Failure {
+                            file: file_name.clone(),
+                            case_index: index,
+                            scripting_on,
+                            input: case.data.clone(),
+                            expected: pinned.unwrap_or_else(|| "(missing accepted dump)".into()),
+                            actual,
+                        });
+                    }
                 } else {
                     failures.push(Failure {
                         file: file_name.clone(),
@@ -123,9 +139,7 @@ fn tree_construction_matches_spec_trees() {
 
     println!(
         "html5lib tree-construction: {ran} cases run, \
-         {accepted_divergences} runs matched documented upstream divergences, \
-         {deferred_fragment_cases} deferred (#document-fragment cases await \
-         fragment parsing)"
+         {accepted_divergences} runs matched documented upstream divergences"
     );
     assert!(
         failures.is_empty(),
@@ -177,5 +191,45 @@ fn flag_name(scripting_on: bool) -> &'static str {
         "script-on"
     } else {
         "script-off"
+    }
+}
+
+fn accepted_dir() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/html5lib/accepted")
+}
+
+fn accepted_path(file: &str, index: usize, scripting_on: bool) -> PathBuf {
+    accepted_dir().join(format!("{file}.{index}.{}.dump", flag_name(scripting_on)))
+}
+
+fn accepted_dump(file: &str, index: usize, scripting_on: bool) -> Option<String> {
+    fs::read_to_string(accepted_path(file, index, scripting_on)).ok()
+}
+
+/// Writes the current trees for [`KNOWN_UPSTREAM_DIVERGENCES`] into
+/// `tests/html5lib/accepted/`. Run when bumping html5ever, not in CI.
+#[test]
+#[ignore = "writes accepted dumps; run after an html5ever pin change"]
+fn write_accepted_upstream_dumps() {
+    let dir = suite_dir();
+    fs::create_dir_all(accepted_dir()).expect("accepted dir");
+    for (file, cases, _) in KNOWN_UPSTREAM_DIVERGENCES {
+        let content = fs::read_to_string(dir.join(file)).expect("dat readable");
+        for (index, case) in dat::parse_dat(&content).into_iter().enumerate() {
+            if !cases.contains(&index) {
+                continue;
+            }
+            for &scripting_on in case.scripting.settings() {
+                let actual = if let Some(context) = &case.fragment_context {
+                    let parsed = parse_html_fragment(&case.data, context, scripting_on);
+                    dump::dump_fragment(&parsed.dom)
+                } else {
+                    let parsed = parse_html_with_scripting(&case.data, scripting_on);
+                    dump::dump_document(&parsed.dom)
+                };
+                fs::write(accepted_path(file, index, scripting_on), actual)
+                    .expect("write accepted dump");
+            }
+        }
     }
 }

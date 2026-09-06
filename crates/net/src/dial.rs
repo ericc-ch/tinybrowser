@@ -183,6 +183,10 @@ pub(crate) fn open(
 }
 
 fn connect_tcp(host: &str, port: u16, timeout: Option<Duration>) -> Result<TcpStream, NetError> {
+    let host = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
     let addrs = (host, port)
         .to_socket_addrs()
         .map_err(|_| NetError::Transport(TransportError::Dns(host.into())))?;

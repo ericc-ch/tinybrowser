@@ -11,3 +11,8 @@
 //! ```
 //!
 //! See [ADR 0007](../wiki/adrs/0007-engine-charter.md).
+
+pub use browser::{
+    Agent, Dom, DomError, NodeId, Page, PageError, PageEvent, Parsed, parse_html,
+    parse_html_fragment, parse_html_with_scripting,
+};

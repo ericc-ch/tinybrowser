@@ -31,10 +31,19 @@ impl Resolver for DialResolver {
 }
 
 /// Shared-dial connector: TCP + CONNECT + TLS live in [`dial::open`].
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub(crate) struct NetConnector {
     pub(crate) proxy: Option<String>,
     pub(crate) timeout: Option<std::time::Duration>,
+}
+
+impl fmt::Debug for NetConnector {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("NetConnector")
+            .field("has_proxy", &self.proxy.is_some())
+            .field("timeout", &self.timeout)
+            .finish()
+    }
 }
 
 impl Connector for NetConnector {

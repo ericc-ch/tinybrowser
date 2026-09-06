@@ -22,7 +22,7 @@ const DEFAULT_MAX_REDIRECTS: u32 = 20;
 /// Every knob defaults to a decided value — constructing with
 /// [`AgentBuilder::new`] and building immediately yields the policy the
 /// decisions recorded.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct AgentBuilder {
     /// Verbatim `User-Agent` header injected into every request. `None`
     /// means net sends no UA of its own.
@@ -33,6 +33,17 @@ pub struct AgentBuilder {
     /// HTTP CONNECT authority, parsed by [`AgentBuilder::proxy`]. `None`
     /// means no proxy (and environment `HTTP_PROXY` stays ignored).
     proxy: Option<String>,
+}
+
+impl std::fmt::Debug for AgentBuilder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AgentBuilder")
+            .field("has_proxy", &self.proxy.is_some())
+            .field("timeout_global", &self.timeout_global)
+            .field("timeout_per_call", &self.timeout_per_call)
+            .field("max_redirects", &self.max_redirects)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Default for AgentBuilder {

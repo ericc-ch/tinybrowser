@@ -8,7 +8,6 @@
 //! namespace designator prefix; template contents appear under a `content`
 //! pseudo-node. The reference serializer is html5ever's rcdom test driver.
 
-use std::collections::HashMap;
 use std::sync::LazyLock;
 
 use dom::{Dom, NodeId, NodeKind};
@@ -29,9 +28,8 @@ static XML_NS: LazyLock<dom::Namespace> = LazyLock::new(|| dom::Namespace::from(
 static XMLNS_NS: LazyLock<dom::Namespace> = LazyLock::new(|| dom::Namespace::from(XMLNS_NS_URL));
 
 /// Dumps the children of `dom`'s document: the shape the suite expects for
-/// full-document parses. Template contents come from the parse result's side
-/// map, since they live outside every child list.
-pub fn dump_document(dom: &Dom, templates: &HashMap<NodeId, NodeId>) -> String {
+/// full-document parses. Template contents come from [`Dom::template_contents`].
+pub fn dump_document(dom: &Dom) -> String {
     let mut out = String::new();
     let document = dom.document();
     let top_level = dom
@@ -39,19 +37,43 @@ pub fn dump_document(dom: &Dom, templates: &HashMap<NodeId, NodeId>) -> String {
         .map(Iterator::collect::<Vec<_>>)
         .unwrap_or_default();
     for child in top_level {
-        serialize(dom, templates, *child, 1, &mut out);
+        serialize(dom, *child, 1, &mut out);
     }
     out.truncate(out.trim_end_matches('\n').len());
     out
 }
 
-fn serialize(
-    dom: &Dom,
-    templates: &HashMap<NodeId, NodeId>,
-    id: NodeId,
-    indent: usize,
-    out: &mut String,
-) {
+/// Dumps the children of the HTML-namespace `html` document element, which
+/// html5ever uses as the fragment root (not the context element itself).
+pub fn dump_fragment(dom: &Dom) -> String {
+    let mut out = String::new();
+    let Some(html) = html_document_element(dom) else {
+        return out;
+    };
+    let kids = dom
+        .children(html)
+        .map(Iterator::collect::<Vec<_>>)
+        .unwrap_or_default();
+    for child in kids {
+        serialize(dom, *child, 1, &mut out);
+    }
+    out.truncate(out.trim_end_matches('\n').len());
+    out
+}
+
+fn html_document_element(dom: &Dom) -> Option<NodeId> {
+    let html_ns = dom::html_namespace();
+    let kids = dom.children(dom.document())?;
+    kids.copied()
+        .find(|&id| match dom.get(id).map(|node| node.kind()) {
+            Some(NodeKind::Element { name, .. }) => {
+                name.ns == html_ns && name.local.as_ref() == "html"
+            }
+            _ => false,
+        })
+}
+
+fn serialize(dom: &Dom, id: NodeId, indent: usize, out: &mut String) {
     out.push('|');
     out.extend(std::iter::repeat_n(' ', indent));
 
@@ -128,10 +150,10 @@ fn serialize(
         .map(Iterator::collect::<Vec<_>>)
         .unwrap_or_default();
     for child in kids {
-        serialize(dom, templates, *child, indent + 2, out);
+        serialize(dom, *child, indent + 2, out);
     }
 
-    if let Some(contents) = templates.get(&id).copied() {
+    if let Some(contents) = dom.template_contents(id) {
         out.push('|');
         out.extend(std::iter::repeat_n(' ', indent + 2));
         out.push_str("content\n");
@@ -140,7 +162,7 @@ fn serialize(
             .map(Iterator::collect::<Vec<_>>)
             .unwrap_or_default();
         for child in inner {
-            serialize(dom, templates, *child, indent + 4, out);
+            serialize(dom, *child, indent + 4, out);
         }
     }
 }
