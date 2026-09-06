@@ -1,35 +1,34 @@
 # Handoff (2026-09-06)
 
-State: Test-suite trim is implemented on `main` and remains uncommitted.
-The worktree contains the compact public-boundary gates and deleted redundant
-fixtures; verification was intentionally skipped at the pause point.
+## State
 
-Done:
+`main` is at `d743e23` (`Trim test suite to high-signal gates`). The trim is committed; post-trim workspace verification is not recorded yet.
 
-- Hardened the html5lib gate with pinned execution/divergence counts and folded
-  the three selectedcontent regressions into it.
-- Replaced the DOM mutation storm with an independent model and reduced the
-  DOM, selector, page, cookie, HTTP, WebSocket, token, and error suites.
-- Removed ignored live tests, proptest fixtures/dependency, and internal-only
-  cookie/dial tests; updated `wiki/researches/testing.md` to the new budget.
+## Do next
 
-In flight:
+1. Initialize `third_party/html5lib-tests`, then run the Nix-based workspace test, fmt, and clippy checks.
+2. Finish the remaining test trim: `send_loopback.rs` still duplicates method-grammar coverage from `token_grammar.rs`; keep one wire-level custom-method case. Remove shallow one-use test helpers where inlining is clearer.
+3. Continue the page-engine milestone: execute loaded `<script>` elements and add the first real DOM bindings to JS.
 
-- Commit and push the current working tree on `main`; no tests or clippy run
-  after the final trim, by explicit request.
+Keep the compact public-boundary gates. If verification fails, repair those gates instead of restoring deleted one-off tests.
 
-Next:
+## Remaining product work
 
-1. Run the Nix-based workspace checks when work resumes.
-2. If anything fails, repair the compact gate rather than restoring deleted
-   one-off tests.
+- CLI `serve` and `fetch` commands are still stubs.
+- Loaded HTML does not execute script elements.
+- JS host is minimal: no DOM bindings beyond `document.cookie`, full Fetch/CORS, timer cancellation, or script execution budget.
+- WebIDL verification is designed but not implemented; no vendored webref snapshot, `weedle` harness, manifest diff, or CI gate exists yet.
+- Transport still has known limits around HTTP forward-proxy request form and deadline-bounded system DNS.
+- Current size probe is a page-engine checkpoint, not a finished browser-size claim.
 
-Decisions made:
+## Deferred milestones
 
-- Keep corpus cases and independent oracles; remove duplicated test functions.
-- Use deterministic loopback transcripts for page/network behavior.
+- Full WPT harness once the JS/DOM surface is large enough.
+- Canonical Chrome-like h1/h2 + TLS transport on `btls`.
+- CDP crate/server and later profile persistence.
 
-Gotchas:
+## Test facts
 
-- `third_party/html5lib-tests` must be initialized for the parser gate.
-- The html5lib expected run count is pinned at 3,549 with 10 accepted runs.
+- html5lib expected run count: 3,549.
+- Accepted upstream divergences: 10.
+- Keep corpus/oracle tests and deterministic loopback transcripts; trim duplicated behavior matrices.
