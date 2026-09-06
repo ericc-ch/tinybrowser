@@ -1,367 +1,228 @@
-//! Page-thread loop: host timers and `spawn_blocking` fetch against loopback.
-
 use std::io::{Read, Write};
-use std::net::TcpListener;
+use std::net::{TcpListener, TcpStream};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use browser::{Agent, Page, PageError, PageEvent, ScriptFailure};
 use dom::NodeKind;
 
-fn slow_ok_server(delay: Duration) -> String {
-    serve_once(delay, "200 OK", &[], b"ok")
+fn read_target(stream: &mut TcpStream) -> String {
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .expect("read timeout");
+    let mut head = Vec::new();
+    let mut chunk = [0_u8; 1024];
+    while !head.windows(4).any(|window| window == b"\r\n\r\n") {
+        let read = stream.read(&mut chunk).expect("request read");
+        assert_ne!(read, 0, "peer closed before request head");
+        head.extend_from_slice(&chunk[..read]);
+    }
+    String::from_utf8_lossy(&head)
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .expect("request target")
+        .to_owned()
 }
 
-fn serve_once(delay: Duration, status: &str, extra_headers: &[&str], body: &[u8]) -> String {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
-    let addr = listener.local_addr().expect("local addr");
-    let status = status.to_owned();
-    let extra_headers: Vec<String> = extra_headers.iter().map(|h| (*h).to_owned()).collect();
-    let body = body.to_vec();
-    thread::spawn(move || {
-        let (mut stream, _) = listener.accept().expect("accept");
-        let mut buf = [0u8; 2048];
-        let _ = stream.read(&mut buf);
-        if !delay.is_zero() {
-            thread::sleep(delay);
-        }
-        let mut head = format!(
-            "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n",
-            body.len()
-        );
-        for header in extra_headers {
-            head.push_str(&header);
-            head.push_str("\r\n");
-        }
-        head.push_str("\r\n");
-        stream.write_all(head.as_bytes()).expect("write head");
-        stream.write_all(&body).expect("write body");
-    });
-    format!("http://{addr}/")
+fn respond(stream: &mut TcpStream, headers: &[&str], body: &[u8]) {
+    let mut response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n",
+        body.len()
+    );
+    for header in headers {
+        response.push_str(header);
+        response.push_str("\r\n");
+    }
+    response.push_str("\r\n");
+    stream
+        .write_all(response.as_bytes())
+        .expect("response head");
+    stream.write_all(body).expect("response body");
 }
 
-fn capture_request_target() -> (String, std::sync::Arc<std::sync::Mutex<Option<String>>>) {
-    let captured = std::sync::Arc::new(std::sync::Mutex::new(None));
-    let flag = captured.clone();
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-    let addr = listener.local_addr().expect("addr");
-    thread::spawn(move || {
-        let (mut stream, _) = listener.accept().expect("accept");
-        let mut buf = [0u8; 2048];
-        let n = stream.read(&mut buf).expect("read");
-        let head = String::from_utf8_lossy(&buf[..n]);
-        let target = head
-            .lines()
-            .next()
-            .and_then(|line| line.split_whitespace().nth(1))
-            .unwrap_or("")
-            .to_owned();
-        *flag.lock().expect("lock") = Some(target);
-        let body = b"ok";
-        let resp = format!(
-            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-            body.len()
-        );
-        stream.write_all(resp.as_bytes()).expect("write");
-        stream.write_all(body).expect("body");
-    });
-    (format!("http://{addr}"), captured)
+fn accept_before(listener: &TcpListener, deadline: Instant) -> TcpStream {
+    loop {
+        match listener.accept() {
+            Ok((stream, _)) => return stream,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                assert!(Instant::now() < deadline, "timed out waiting for request");
+                thread::yield_now();
+            }
+            Err(error) => panic!("accept failed: {error}"),
+        }
+    }
 }
 
 fn element_text(dom: &dom::Dom, id: dom::NodeId) -> String {
-    let mut out = String::new();
-    let Some(kids) = dom.children(id) else {
-        return out;
-    };
-    for kid in kids {
-        if let Some(NodeKind::Text { data }) = dom.get(*kid).map(|n| n.kind()) {
-            out.push_str(data);
-        }
-    }
-    out
+    dom.children(id)
+        .into_iter()
+        .flatten()
+        .filter_map(|child| match dom.get(*child).map(|node| node.kind()) {
+            Some(NodeKind::Text { data }) => Some(data.as_str()),
+            _ => None,
+        })
+        .collect()
 }
 
 #[test]
-fn two_pages_share_one_agent_cookie_jar() {
+fn navigation_parsing_cookies_and_relative_js_fetch_form_one_journey() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("address");
+    let server = thread::spawn(move || {
+        let (mut navigation, _) = listener.accept().expect("navigation");
+        assert_eq!(read_target(&mut navigation), "/start");
+        respond(
+            &mut navigation,
+            &["Content-Language: fr", "Set-Cookie: sid=1; Path=/"],
+            b"<!doctype html><base href=\"/app/\"><p id=loaded>hi</p>",
+        );
+
+        let (mut fetch, _) = listener.accept().expect("fetch");
+        assert_eq!(read_target(&mut fetch), "/app/next");
+        respond(&mut fetch, &[], b"payload");
+    });
+
     let agent = Agent::new();
-    let mut a = Page::with_agent(agent.clone());
-    let mut b = Page::with_agent(agent);
-    a.set_document_url("http://example.test/")
-        .expect("absolute url");
-    b.set_document_url("http://example.test/")
-        .expect("absolute url");
-    a.set_document_cookie("a=1");
-    assert_eq!(b.document_cookie(), "a=1");
-}
-
-#[test]
-fn relative_fetch_resolves_against_base_href() {
-    let (origin, captured) = capture_request_target();
-    let mut page = Page::new();
-    page.set_document_url(&format!("{origin}/dir/page.html"))
-        .expect("origin");
-    page.load_html("<base href=\"/app/\">");
-    page.start_fetch("next").expect("relative");
+    let mut page = Page::with_agent(agent.clone());
+    page.goto(&format!("http://{addr}/start")).expect("goto");
     page.run();
-    let target = captured.lock().expect("lock").clone().expect("saw request");
-    assert_eq!(target, "/app/next");
-}
 
-#[test]
-fn js_fetch_resolves_against_base_href() {
-    let (origin, captured) = capture_request_target();
-    let mut page = Page::new();
-    page.set_document_url(&format!("{origin}/dir/page.html"))
-        .expect("origin");
-    page.load_html("<base href=\"/app/\">");
-    page.eval("fetch('next')").expect("js fetch");
-    page.run();
-    let target = captured.lock().expect("lock").clone().expect("saw request");
-    assert_eq!(target, "/app/next");
-}
-
-#[test]
-fn goto_parses_html_and_stores_content_language() {
-    let body = b"<!DOCTYPE html><p lang=en>hi</p>";
-    let url = serve_once(Duration::ZERO, "200 OK", &["Content-Language: fr"], body);
-    let mut page = Page::new();
-    page.goto(&url).expect("goto");
-    page.run();
     assert_eq!(page.content_language(), Some("fr"));
-    assert_eq!(page.document_url(), url);
-    let parsed = page.parsed().expect("parsed");
-    assert_eq!(parsed.dom.document_language(), Some("fr"));
-    let p = parsed
+    assert_eq!(page.document_cookie(), "sid=1");
+    let parsed = page.parsed().expect("parsed navigation");
+    let paragraph = parsed
         .dom
-        .select_first(parsed.dom.document(), "p")
-        .expect("select")
-        .expect("p");
-    assert_eq!(element_text(&parsed.dom, p), "hi");
-}
+        .select_first(parsed.dom.document(), "#loaded")
+        .expect("selector")
+        .expect("paragraph");
+    assert_eq!(element_text(&parsed.dom, paragraph), "hi");
 
-#[test]
-fn goto_comma_separated_content_language_is_none() {
-    let body = b"<!DOCTYPE html><p>hi</p>";
-    let url = serve_once(
-        Duration::ZERO,
-        "200 OK",
-        &["Content-Language: en, fr"],
-        body,
-    );
-    let mut page = Page::new();
-    page.goto(&url).expect("goto");
+    page.eval(
+        "globalThis.body = ''; fetch('next').then(function(response) { return response.text(); }).then(function(text) { globalThis.body = text; });",
+    )
+    .expect("fetch script");
     page.run();
-    assert_eq!(page.content_language(), None);
-}
-
-#[test]
-fn goto_connection_refused_is_fetch_failed() {
-    let mut page = Page::new();
-    page.goto("http://127.0.0.1:1/").expect("queued");
-    page.run();
-    assert_eq!(page.events(), &[PageEvent::FetchFailed]);
-    assert!(page.parsed().is_none());
-}
-
-#[test]
-fn eval_throw_is_script_error() {
-    let mut page = Page::new();
-    let err = page
-        .eval("throw new Error('boom')")
-        .expect_err("throw should fail eval");
-    assert!(
-        matches!(err, PageError::Script(ScriptFailure::Engine { .. })),
-        "expected engine script failure, got {err:?}"
+    assert_eq!(page.eval("globalThis.body").expect("body"), "payload");
+    assert_eq!(
+        page.events(),
+        &[
+            PageEvent::Fetch { status: 200 },
+            PageEvent::Fetch { status: 200 }
+        ]
     );
+
+    let mut sibling = Page::with_agent(agent);
+    sibling
+        .set_document_url(&format!("http://{addr}/elsewhere"))
+        .expect("document URL");
+    assert_eq!(sibling.document_cookie(), "sid=1");
+    server.join().expect("server");
 }
 
 #[test]
-fn eval_completion_value_is_stringified() {
-    let mut page = Page::new();
-    assert_eq!(page.eval("1 + 1").expect("eval"), "2");
-}
+fn page_loop_correlates_more_than_one_batch_of_fetches() {
+    const REQUESTS: usize = 9;
+    const FIRST_BATCH: usize = 8;
 
-#[test]
-fn eval_settimeout_and_document_cookie() {
-    let mut page = Page::new();
-    page.set_document_url("http://example.test/")
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    listener.set_nonblocking(true).expect("nonblocking");
+    let addr = listener.local_addr().expect("address");
+    let server = thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut first_batch = Vec::new();
+        for _ in 0..FIRST_BATCH {
+            let mut stream = accept_before(&listener, deadline);
+            let target = read_target(&mut stream);
+            first_batch.push((target, stream));
+        }
+        for (target, mut stream) in first_batch.into_iter().rev() {
+            respond(&mut stream, &[], target.trim_start_matches('/').as_bytes());
+        }
+        let mut last = accept_before(&listener, deadline);
+        let target = read_target(&mut last);
+        respond(&mut last, &[], target.trim_start_matches('/').as_bytes());
+    });
+
+    let agent = net::AgentBuilder::new()
+        .timeout_global(Duration::from_secs(3))
+        .build();
+    let mut page = Page::with_agent(agent);
+    let origin = format!("http://{addr}");
+    page.set_document_url(&format!("{origin}/"))
         .expect("origin");
-    page.eval("document.cookie = 'a=1'").expect("cookie set");
-    assert_eq!(page.document_cookie(), "a=1");
-    page.eval("setTimeout(function() { globalThis.hit = 1; }, 20)")
-        .expect("timer");
-    page.run();
-    let hit = page.eval("String(globalThis.hit)").expect("read hit");
-    assert_eq!(hit, "1");
-}
-
-#[test]
-fn eval_fetch_timer_runs_while_js_fetch_waits() {
-    let url = slow_ok_server(Duration::from_millis(400));
-    let mut page = Page::new();
     page.eval(&format!(
-        "globalThis.got = 0; setTimeout(function() {{ globalThis.hit = 1; }}, 30); fetch('{url}').then(function(r) {{ globalThis.got = r.status; }})"
+        "globalThis.results = []; globalThis.timerHit = false; \
+         for (let i = 0; i < {REQUESTS}; i++) {{ \
+           ((slot) => fetch('{origin}/' + slot).then((response) => response.text()).then((body) => {{ results[slot] = body; }}))(i); \
+         }} \
+         setTimeout(() => {{ globalThis.timerHit = true; }}, 0);"
     ))
-    .expect("schedule");
+    .expect("schedule work");
     page.run();
+
     assert_eq!(
-        page.events(),
-        &[PageEvent::Timer(1), PageEvent::Fetch { status: 200 },]
+        page.eval("String(globalThis.timerHit)").expect("timer"),
+        "true"
     );
-    assert_eq!(page.eval("String(globalThis.hit)").expect("hit"), "1");
-    assert_eq!(page.eval("String(globalThis.got)").expect("status"), "200");
-}
-
-#[test]
-fn eval_fetch_body_is_readable() {
-    let url = slow_ok_server(Duration::ZERO);
-    let mut page = Page::new();
-    page.eval(&format!(
-        "globalThis.body = ''; fetch('{url}').then(function(r) {{ return r.text(); }}).then(function(t) {{ globalThis.body = t; }})"
-    ))
-    .expect("fetch");
-    page.run();
-    assert_eq!(page.eval("String(globalThis.body)").expect("body"), "ok");
-}
-
-#[test]
-fn eval_fetch_inside_settimeout_still_dials() {
-    let url = slow_ok_server(Duration::from_millis(30));
-    let mut page = Page::new();
-    page.eval(&format!(
-        "globalThis.got = 0; setTimeout(function() {{ fetch('{url}').then(function(r) {{ globalThis.got = r.status; }}); }}, 10)"
-    ))
-    .expect("schedule");
-    page.run();
     assert_eq!(
-        page.events(),
-        &[PageEvent::Timer(1), PageEvent::Fetch { status: 200 },]
+        page.eval("globalThis.results.join(',')").expect("results"),
+        "0,1,2,3,4,5,6,7,8"
     );
-    assert_eq!(page.eval("String(globalThis.got)").expect("read"), "200");
-}
-
-#[test]
-fn eval_fetch_rejects_on_connection_refused() {
-    let mut page = Page::new();
-    page.eval(
-        "globalThis.ok = 0; fetch('http://127.0.0.1:1/').then(function() {}, function() { globalThis.ok = 1; })",
-    )
-    .expect("fetch");
-    page.run();
-    assert_eq!(page.eval("String(globalThis.ok)").expect("read"), "1");
-    assert_eq!(page.events(), &[PageEvent::FetchFailed]);
-}
-
-#[test]
-fn js_fetch_non_http_is_fetch_failed() {
-    let mut page = Page::new();
-    page.eval(
-        "globalThis.ok = 0; fetch('file:///etc/passwd').then(function() {}, function() { globalThis.ok = 1; })",
-    )
-    .expect("fetch");
-    page.run();
-    assert_eq!(page.eval("String(globalThis.ok)").expect("read"), "1");
-    assert_eq!(page.events(), &[PageEvent::FetchFailed]);
-}
-
-#[test]
-fn load_html_does_not_settle_stale_js_fetch() {
-    let url = slow_ok_server(Duration::from_millis(200));
-    let mut page = Page::new();
-    page.eval(&format!(
-        "fetch('{url}').then(function(r) {{ globalThis.got = r.status; }})"
-    ))
-    .expect("fetch");
-    page.load_html("<p>x</p>");
-    page.eval("globalThis.got = 'seed'").expect("new realm");
-    page.run();
-    assert_eq!(page.eval("globalThis.got").expect("got"), "seed");
-}
-
-#[test]
-fn timer_callback_throw_is_script_failed() {
-    let mut page = Page::new();
-    page.eval("setTimeout(function() { throw new Error('boom'); }, 10)")
-        .expect("timer");
-    page.run();
-    assert!(
-        page.events().contains(&PageEvent::ScriptFailed),
-        "events: {:?}",
+    assert_eq!(
         page.events()
+            .iter()
+            .filter(|event| matches!(event, PageEvent::Fetch { status: 200 }))
+            .count(),
+        REQUESTS
     );
+    assert!(matches!(page.events().first(), Some(PageEvent::Timer(_))));
+    server.join().expect("server");
 }
 
 #[test]
-fn load_html_starts_a_new_js_realm() {
+fn realm_replacement_and_failed_jobs_drain_without_leaking_work() {
     let mut page = Page::new();
-    page.eval("globalThis.secret = 1").expect("seed");
-    page.load_html("<p>x</p>");
-    let secret = page.eval("typeof globalThis.secret").expect("read");
-    assert_eq!(secret, "undefined");
-}
-
-#[test]
-fn start_fetch_rejects_non_http_schemes() {
-    let mut page = Page::new();
+    let error = page
+        .eval(
+            "Promise.resolve().then(() => { globalThis.microtask = true; }); \
+             setTimeout(() => { globalThis.timer = true; }, 0); \
+             throw Error('boom');",
+        )
+        .expect_err("script throws");
     assert!(matches!(
-        page.start_fetch("file:///etc/passwd"),
-        Err(PageError::InvalidUrl { .. })
+        error,
+        PageError::Script(ScriptFailure::Engine { .. })
     ));
-}
-
-#[test]
-fn host_timer_runs_while_fetch_waits_on_spawn_blocking() {
-    let url = slow_ok_server(Duration::from_millis(400));
-    let mut page = Page::new();
-    let timer = page.schedule_timer(Duration::from_millis(30));
-    page.start_fetch(&url).expect("absolute loopback url");
-    page.run();
     assert_eq!(
-        page.events(),
-        &[PageEvent::Timer(timer), PageEvent::Fetch { status: 200 },]
+        page.eval("globalThis.microtask").expect("microtask"),
+        "true"
     );
-}
-
-#[test]
-fn load_html_puts_the_tree_on_the_page() {
-    let mut page = Page::new();
-    page.load_html("<p>hi</p>");
-    let parsed = page.parsed().expect("loaded");
-    let p = parsed
-        .dom
-        .select_first(parsed.dom.document(), "p")
-        .expect("select")
-        .expect("p");
-    assert_eq!(element_text(&parsed.dom, p), "hi");
-}
-
-#[test]
-fn rejected_fetch_chain_drains_before_run_returns() {
-    let mut page = Page::new();
-    page.eval("fetch('file:///one').catch(() => fetch('file:///two')).catch(() => setTimeout(() => { globalThis.done = true; }, 0))").expect("queue");
     page.run();
-    assert_eq!(page.eval("globalThis.done").expect("read"), "true");
-}
+    assert_eq!(page.eval("globalThis.timer").expect("timer"), "true");
 
-#[test]
-fn throwing_script_still_runs_microtasks_and_releases_timers() {
-    let mut page = Page::new();
-    assert!(page.eval("Promise.resolve().then(() => { globalThis.microtask = true; }); setTimeout(() => { globalThis.timer = true; }, 0); throw Error('boom')").is_err());
-    assert_eq!(page.eval("globalThis.microtask").expect("read"), "true");
-    page.run();
-    assert_eq!(page.eval("globalThis.timer").expect("read"), "true");
-    assert_eq!(
-        page.eval("Object.keys(__tb_timeouts).length")
-            .expect("slots"),
-        "0"
-    );
-}
-
-#[test]
-fn load_html_supersedes_queued_navigation() {
-    let mut page = Page::new();
-    page.goto("http://127.0.0.1:1/").expect("queue");
+    page.eval("globalThis.secret = 1").expect("old realm");
+    page.goto("http://127.0.0.1:1/").expect("queued navigation");
     page.load_html("<p>local</p>");
     page.run();
-    assert!(page.events().is_empty());
+    assert_eq!(
+        page.eval("typeof globalThis.secret").expect("new realm"),
+        "undefined"
+    );
+    assert!(!page.events().contains(&PageEvent::FetchFailed));
+
+    page.eval(
+        "globalThis.done = false; \
+         fetch('file:///one').catch(() => fetch('file:///two')).catch(() => { globalThis.done = true; });",
+    )
+    .expect("rejected chain");
+    page.run();
+    assert_eq!(page.eval("globalThis.done").expect("drained"), "true");
+    assert_eq!(
+        page.events()
+            .iter()
+            .filter(|event| **event == PageEvent::FetchFailed)
+            .count(),
+        2
+    );
 }

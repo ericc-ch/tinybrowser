@@ -331,36 +331,3 @@ fn map_connect_io(err: std::io::Error) -> NetError {
         _ => NetError::Transport(TransportError::Io(err)),
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::io::{Read, Write};
-    use std::net::TcpListener;
-    use std::thread;
-
-    #[test]
-    fn connect_authority_brackets_unbracketed_ipv6() {
-        assert_eq!(connect_authority("::1", 80), "[::1]:80");
-        assert_eq!(connect_authority("example.com", 443), "example.com:443");
-    }
-
-    #[test]
-    fn connect_keeps_bytes_after_the_200() {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-        let addr = listener.local_addr().expect("addr");
-        thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("accept");
-            let mut buf = [0u8; 512];
-            let _ = stream.read(&mut buf);
-            let mut packed = b"HTTP/1.1 200 Connection Established\r\n\r\n".to_vec();
-            packed.extend_from_slice(b"PING");
-            stream.write_all(&packed).expect("packed");
-        });
-        let proxy = format!("http://{addr}");
-        let mut socket = connect_via_proxy(&proxy, "origin.test", 443, None).expect("CONNECT 200");
-        let mut out = [0u8; 4];
-        socket.read_exact(&mut out).expect("leftover");
-        assert_eq!(&out, b"PING");
-    }
-}

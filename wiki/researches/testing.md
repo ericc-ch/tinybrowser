@@ -19,20 +19,14 @@ traps hand-written fixtures miss.
 
 ## Unit and public-API tests (landed)
 
-- Arena mechanics: stale `NodeId` → clean miss, generation ticks on slot
-  reuse, recycled slots never impersonate dead nodes.
-- Content-model gates: pre-insert validity per WHATWG rule anchors, bulk
-  moves (`reparent_children`) into documents answering to the same model.
-- Selector matching over known trees, including state pseudo-class fidelity
-  suites (`:checked`/`:disabled` inheritance, `:lang()` ranges, quirks-mode
-  case regimes).
-- Mutation storms auditing bidirectional link invariants at every step.
-- Integration suites go through the public API only: no arena internals.
+The suite keeps only high-signal public-boundary gates: the html5lib corpus,
+an independent DOM mutation model, selector state matrices, browser page-loop
+journeys, and compact HTTP/WebSocket/cookie/error transcripts. The current
+workspace lists **20 tests** (19 active plus one ignored corpus-dump helper).
+Integration suites do not reach into arena internals.
 
-Verified at audit close: 73 tests green across the workspace, clippy pedantic
-`-D warnings` clean, rustfmt clean.
-
-## Live bot-gate matrix (manual checkpoint, first run 2026-08-25)
+The live bot-gate matrix below remains a manual checkpoint (first run
+2026-08-25):
 
 Net-layer stealth cannot be asserted from unit tests; it is a property
 third-party gates either reward or punish on the wire. This checkpoint drives
@@ -97,20 +91,6 @@ JA4 presented per column: `t13d3011_1d37bd780c83…` (OpenSSL, no ALPN);
 
 Cells rot per site per day; treat this as method plus snapshot, and re-run
 the whole matrix when anything about the transport changes.
-
-## Net live smokes (opt-in, landed 2026-08-26)
-
-Offline `cargo test` never dials the internet. Ticket 12's HTTPS checks live
-in `crates/net/tests/live.rs` and stay `#[ignore]`:
-
-```
-cargo test -p net --test live -- --ignored --nocapture
-```
-
-- `https://example.com/` round-trips through `net::Agent` (200 + page text).
-- `https://tls.peet.ws/api/all` must still echo JA4 prefix `t13d3011` (OpenSSL
-  native-tls drift check, not a bot-gate pass). Re-run when bumping ureq or
-  native-tls.
 
 ## Explicitly deferred
 

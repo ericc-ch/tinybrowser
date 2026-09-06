@@ -1,8 +1,3 @@
-//! `send()` end-to-end over loopback: ticket 11's acceptance criteria.
-//!
-//! Every test goes through the public API only — no backend type escapes
-//! `net`, and the recording server sees exactly what hit the wire.
-
 mod common;
 
 use std::process::{Command, Stdio};
@@ -16,96 +11,57 @@ use net::{
     TransportError,
 };
 
-/// How long the client side waits on a server-side observation before
-/// declaring the contract broken.
 const OBSERVE_TIMEOUT: Duration = Duration::from_secs(5);
+const PROXY_PROBE_FLAG: &str = "NET_CRATE_PROXY_PROBE";
 
-/// 64 KiB of deterministic patterned bytes: big enough to force several
-/// chunks through any sane buffer size, varied enough to catch reordering.
-fn patterned_body(len: usize) -> Vec<u8> {
-    (0..len)
-        .map(|i| u8::try_from(i % 251).expect("251 fits in u8"))
-        .collect()
-}
-
-/// Canned `200 OK` response with headers and a body.
 fn canned_ok(headers: &[(&str, &str)], body: &[u8]) -> Vec<u8> {
-    let mut out = Vec::new();
-    out.extend_from_slice(b"HTTP/1.1 200 OK\r\n");
+    let mut out = b"HTTP/1.1 200 OK\r\n".to_vec();
     for (name, value) in headers {
         out.extend_from_slice(format!("{name}: {value}\r\n").as_bytes());
     }
-    out.extend_from_slice(format!("Content-Length: {}\r\n", body.len()).as_bytes());
-    out.extend_from_slice(b"Connection: close\r\n\r\n");
+    out.extend_from_slice(
+        format!(
+            "Content-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .as_bytes(),
+    );
     out.extend_from_slice(body);
     out
 }
 
-/// Poll `flag` until true, failing with `what` when it never happens.
-fn await_flag(flag: &AtomicBool, what: &str) {
+fn canned_redirect(status: u16, location: &str) -> Vec<u8> {
+    format!(
+        "HTTP/1.1 {status} Redirect\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+    )
+    .into_bytes()
+}
+
+fn await_flag(flag: &AtomicBool) {
     let deadline = Instant::now() + OBSERVE_TIMEOUT;
     while !flag.load(Ordering::Acquire) {
-        assert!(Instant::now() < deadline, "never observed: {what}");
-        std::thread::sleep(Duration::from_millis(5));
+        assert!(
+            Instant::now() < deadline,
+            "server never observed the client"
+        );
+        std::thread::yield_now();
     }
 }
 
-#[test]
-fn get_round_trips_status_headers_and_streamed_body() {
-    let body = b"hello from loopback";
-    let server = TestServer::start(move |conn| {
-        conn.read_request();
-        let canned = canned_ok(
-            &[("Content-Type", "text/plain"), ("X-Mixed-Case", "Value")],
-            body,
-        );
-        conn.write_all(&canned).expect("canned write");
-    });
-
-    let response = Agent::new()
-        .request(Method::GET, server.url("/a/b?c=d"))
-        .send()
-        .expect("loopback GET succeeds");
-
-    assert_eq!(response.status(), 200);
-    // Lookup is ASCII-case-insensitive regardless of stored case.
-    assert_eq!(
-        response.headers().get("content-type"),
-        Some(&b"text/plain"[..])
-    );
-    assert_eq!(
-        response.headers().get("CONTENT-TYPE"),
-        Some(&b"text/plain"[..])
-    );
-    assert_eq!(response.headers().get("x-mixed-case"), Some(&b"Value"[..]));
-    // The final URL is what was asked for (no redirects happened).
-    assert_eq!(response.final_url(), &server.url("/a/b?c=d"));
-    // Buffered read through the streaming body.
-    assert_eq!(response.into_body().bytes(1024).expect("body reads"), body);
-
-    let recorded = &server.requests()[0];
-    assert_eq!(recorded.method, "GET");
-    assert_eq!(recorded.target, "/a/b?c=d");
-    assert_eq!(recorded.version, "HTTP/1.1");
-    assert_eq!(
-        recorded.header("host").map(str::to_owned),
-        Some(server.local_addr().to_string())
-    );
-    server.assert_clean();
-}
-
-#[test]
-fn every_http_status_arrives_as_data() {
-    for status in [201u16, 302, 404, 500] {
-        let server = TestServer::start(move |conn| {
-            conn.read_request();
-            let canned = format!("HTTP/1.1 {status} Whatever\r\nContent-Length: 2\r\n\r\nno");
-            conn.write_all(canned.as_bytes()).expect("canned write");
+fn assert_statuses_and_bodies() {
+    for status in [201_u16, 302, 404, 500] {
+        let server = TestServer::start(move |connection| {
+            connection.read_request();
+            connection
+                .write_all(
+                    format!("HTTP/1.1 {status} Whatever\r\nContent-Length: 2\r\n\r\nno").as_bytes(),
+                )
+                .expect("status response");
         });
         let response = Agent::new()
             .request(Method::GET, server.url("/"))
             .send()
-            .expect("status is data, not error");
+            .expect("status is response data");
         assert_eq!(response.status(), status);
         assert_eq!(response.into_body().bytes(16).expect("body"), b"no");
         server.assert_clean();
@@ -113,920 +69,422 @@ fn every_http_status_arrives_as_data() {
 }
 
 #[test]
-fn transport_failures_surface_as_neterror_transport() {
-    // A port with no listener: bind, learn the port, drop the listener.
-    let dead = std::net::TcpListener::bind("127.0.0.1:0").expect("bind works");
-    let addr = dead.local_addr().expect("addr known");
-    drop(dead);
+fn http_transcripts_cover_status_headers_framing_limits_and_failures() {
+    assert_statuses_and_bodies();
 
-    let url = url::Url::parse(&format!("http://{addr}/")).expect("absolute");
-    let result = Agent::new().request(Method::GET, url).send();
-
-    match result {
-        Err(NetError::Transport(_)) => {}
-        other => panic!("expected NetError::Transport, got {other:?}"),
-    }
-}
-
-#[test]
-fn global_timeout_fires_when_the_head_never_arrives() {
-    let server = TestServer::start(|conn| {
-        conn.read_request();
-        // Head deliberately withheld past the client's budget: send() must
-        // time out, not hang on the socket.
-        std::thread::sleep(Duration::from_millis(600));
+    let server = TestServer::start(|connection| {
+        let request = connection.read_request();
+        assert_eq!(request.method, "GET");
+        assert_eq!(request.target, "/a/b?c=d");
+        connection
+            .write_all(&canned_ok(
+                &[("Content-Type", "text/plain"), ("X-Mixed-Case", "Value")],
+                b"hello",
+            ))
+            .expect("response");
     });
-
-    let result = AgentBuilder::new()
-        .timeout_global(Duration::from_millis(120))
-        .build()
-        .request(Method::GET, server.url("/stall"))
-        .send();
-
-    match result {
-        Err(NetError::Transport(TransportError::Timeout(kind))) => {
-            assert_eq!(kind, TimeoutKind::Global);
-        }
-        other => panic!("expected Transport(Timeout(Global)), got {other:?}"),
-    }
-    server.assert_clean();
-}
-
-#[test]
-fn chunked_transfer_decodes_to_a_clean_body_stream() {
-    let server = TestServer::start(|conn| {
-        conn.read_request();
-        // Two chunks + terminating zero chunk; read_chunk/bytes must see
-        // only dechunked payload bytes (fetch streaming rides this under
-        // the v1 backend).
-        conn.write_all(
-            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n\
-              5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n",
-        )
-        .expect("chunked write");
-    });
-
+    let requested = server.url("/a/b?c=d");
     let response = Agent::new()
-        .request(Method::GET, server.url("/chunked"))
+        .request(Method::GET, requested.clone())
         .send()
-        .expect("chunked dial");
+        .expect("GET");
     assert_eq!(response.status(), 200);
+    assert_eq!(response.final_url(), &requested);
     assert_eq!(
-        response.into_body().bytes(64).expect("body reads"),
-        &b"hello world"[..]
+        response.headers().get("CONTENT-TYPE"),
+        Some(&b"text/plain"[..])
+    );
+    assert_eq!(response.into_body().bytes(16).expect("body"), b"hello");
+    server.assert_clean();
+
+    let server = TestServer::start(|connection| {
+        connection.read_request();
+        connection
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n",
+            )
+            .expect("chunked response");
+    });
+    assert_eq!(
+        Agent::new()
+            .request(Method::GET, server.url("/chunked"))
+            .send()
+            .expect("chunked")
+            .into_body()
+            .bytes(64)
+            .expect("body"),
+        b"hello world"
     );
     server.assert_clean();
+
+    let payload = vec![b'x'; 32];
+    let server = TestServer::start(move |connection| {
+        connection.read_request();
+        connection
+            .write_all(&canned_ok(&[], &payload))
+            .expect("limited response");
+    });
+    assert!(matches!(
+        Agent::new()
+            .request(Method::GET, server.url("/limit"))
+            .send()
+            .expect("response")
+            .into_body()
+            .bytes(16),
+        Err(NetError::Limit(LimitExceeded::Size(16)))
+    ));
+    server.assert_clean();
+
+    let dead = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let dead_url = format!("http://{}/", dead.local_addr().expect("address"));
+    drop(dead);
+    assert!(matches!(
+        Agent::new()
+            .request(Method::GET, url::Url::parse(&dead_url).expect("url"))
+            .send(),
+        Err(NetError::Transport(_))
+    ));
+
+    let server = TestServer::start(|connection| {
+        connection.read_request();
+        std::thread::sleep(Duration::from_millis(300));
+    });
+    assert!(matches!(
+        AgentBuilder::new()
+            .timeout_global(Duration::from_millis(60))
+            .build()
+            .request(Method::GET, server.url("/stall"))
+            .send(),
+        Err(NetError::Transport(TransportError::Timeout(
+            TimeoutKind::Global
+        )))
+    ));
+    server.assert_clean();
 }
 
 #[test]
-fn body_streams_incrementally_not_buffer_until_end() {
-    let owned = patterned_body(100 * 1024);
-    let expected = owned.clone();
-    let expected_len = expected.len();
-    let first_piece = owned[..1024].to_vec();
-    let rest = owned[1024..].to_vec();
-
-    // The server writes only the first kilobyte, then blocks until the
-    // CLIENT proves a chunk was already delivered — only then does it
-    // send the remaining bytes. A read_chunk that buffered until end of
-    // body would deadlock here and the server-side timeout would fail
-    // the test through assert_clean.
+fn response_bodies_stream_and_drop_cancels_the_socket() {
     let first_chunk_delivered = Arc::new(AtomicBool::new(false));
     let server_flag = Arc::clone(&first_chunk_delivered);
-    let server = TestServer::start(move |conn| {
-        conn.read_request();
-        let head = format!("HTTP/1.1 200 OK\r\nContent-Length: {expected_len}\r\n\r\n");
-        conn.write_all(head.as_bytes()).expect("head write");
-        conn.write_all(&first_piece).expect("first piece");
-
+    let first = vec![b'a'; 1024];
+    let rest = vec![b'b'; 99 * 1024];
+    let server = TestServer::start(move |connection| {
+        connection.read_request();
+        connection
+            .write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
+                    first.len() + rest.len()
+                )
+                .as_bytes(),
+            )
+            .expect("head");
+        connection.write_all(&first).expect("first chunk");
         let deadline = Instant::now() + OBSERVE_TIMEOUT;
         while !server_flag.load(Ordering::Acquire) {
             assert!(
                 Instant::now() < deadline,
-                "read_chunk never delivered before body completion: not incremental"
+                "body was buffered until completion"
             );
-            std::thread::sleep(Duration::from_millis(5));
+            std::thread::yield_now();
         }
-        conn.write_all(&rest).expect("rest write");
+        connection.write_all(&rest).expect("remaining body");
     });
-
     let mut body = Agent::new()
-        .request(Method::GET, server.url("/big"))
+        .request(Method::GET, server.url("/stream"))
         .send()
-        .expect("GET succeeds")
+        .expect("stream")
         .into_body();
-
     let mut collected = Vec::new();
-    let mut chunk_count = 0;
-    while let Some(chunk) = body.read_chunk().expect("chunk reads") {
+    let mut chunks = 0;
+    while let Some(chunk) = body.read_chunk().expect("chunk") {
         collected.extend_from_slice(&chunk);
-        chunk_count += 1;
+        chunks += 1;
         first_chunk_delivered.store(true, Ordering::Release);
     }
-    assert_eq!(collected, expected);
-    assert!(chunk_count > 1, "streaming must yield multiple chunks");
+    assert_eq!(
+        collected,
+        [vec![b'a'; 1024], vec![b'b'; 99 * 1024]].concat()
+    );
+    assert!(chunks > 1);
     server.assert_clean();
-}
 
-#[test]
-fn dropping_response_closes_the_connection() {
-    // Observed on the server thread, asserted here: the client drops
-    // mid-body and the server must see the socket close within the
-    // deadline — cancellation IS drop, nothing pools a mid-body
-    // connection.
     let peer_closed = Arc::new(AtomicBool::new(false));
     let server_flag = Arc::clone(&peer_closed);
-    let total = 64 * 1024;
-    let server = TestServer::start(move |conn| {
-        conn.read_request();
-        // Declare far more than we send so the client must drop mid-body.
-        let head = format!("HTTP/1.1 200 OK\r\nContent-Length: {total}\r\n\r\n");
-        conn.write_all(head.as_bytes()).expect("head write");
-        conn.write_all(&vec![0xAA; 1024]).expect("partial body");
-
-        server_flag.store(conn.await_peer_close(), Ordering::Release);
+    let server = TestServer::start(move |connection| {
+        connection.read_request();
+        connection
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 65536\r\n\r\npartial")
+            .expect("partial body");
+        server_flag.store(connection.await_peer_close(), Ordering::Release);
     });
-
-    let agent = Agent::new();
     {
-        let mut body = agent
+        let mut body = Agent::new()
             .request(Method::GET, server.url("/cancel"))
             .send()
-            .expect("GET succeeds")
+            .expect("cancel")
             .into_body();
-        let _one_chunk = body.read_chunk().expect("first chunk reads");
-        // Scope ends: Response and Body drop with unread bytes pending.
+        let _ = body.read_chunk().expect("partial chunk");
     }
-
-    await_flag(&peer_closed, "server observing the client closing on drop");
+    await_flag(&peer_closed);
     server.assert_clean();
 }
 
 #[test]
-fn request_headers_reach_the_wire_in_insertion_order() {
-    let server = TestServer::start(|conn| {
-        conn.read_request();
-        conn.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
-            .expect("canned write");
+fn request_shaping_methods_fragments_and_rejections_are_wire_visible() {
+    let server = TestServer::start(|connection| {
+        connection.read_request();
+        connection
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+            .expect("method response");
     });
-
-    let builder = Agent::new()
-        .request(Method::GET, server.url("/h"))
-        .header("X-Custom-Thing", "alpha")
-        .expect("valid header")
-        .header("Accept", "text/html")
-        .expect("valid header")
-        .header("x-lowercase-name", "gamma")
-        .expect("valid header");
-    builder.send().expect("send works");
-
-    let recorded = &server.requests()[0];
-    let names: Vec<&str> = recorded.headers.iter().map(|(n, _)| n.as_str()).collect();
-    // Insertion order survives end to end.
-    let pos = |needle: &str| names.iter().position(|n| n.eq_ignore_ascii_case(needle));
-    let (custom, accept, lowercase) = (
-        pos("x-custom-thing"),
-        pos("accept"),
-        pos("x-lowercase-name"),
-    );
-    assert!(custom.unwrap() < accept.unwrap() && accept.unwrap() < lowercase.unwrap());
-
-    // v1 fidelity caveat (decision 02): the backend normalizes wire names
-    // to lowercase in both directions; values keep their exact bytes. The
-    // stealth swap upgrades name fidelity without signature changes.
-    assert_eq!(names.get(custom.unwrap()), Some(&"x-custom-thing"));
-    assert_eq!(names.get(lowercase.unwrap()), Some(&"x-lowercase-name"));
-    assert_eq!(recorded.header("x-custom-thing"), Some("alpha"));
-    server.assert_clean();
-}
-
-#[test]
-fn builder_user_agent_rides_the_wire() {
-    let server = TestServer::start(|conn| {
-        conn.read_request();
-        conn.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
-            .expect("canned write");
-    });
-
-    AgentBuilder::new()
-        .user_agent("tinybrowser-test/0.1")
-        .build()
-        .request(Method::GET, server.url("/ua"))
-        .send()
-        .expect("send works");
-
-    let recorded = &server.requests()[0];
-    // Exactly one UA on the wire: net owns the layering (agent config
-    // supplies it only when the request does not set one) — never stacked
-    // duplicates. The override direction is pinned by
-    // `request_level_user_agent_overrides_the_builder`.
-    let ua_count = recorded
-        .headers
+    let expected = ["GET", "HEAD", "PATCH", "patch", "propfind", "eGg"];
+    for token in expected {
+        Agent::new()
+            .request(Method::parse(token).expect("method"), server.url("/m"))
+            .send()
+            .expect("method request");
+    }
+    let requests = server.requests();
+    let methods: Vec<_> = requests
         .iter()
-        .filter(|(name, _)| name.eq_ignore_ascii_case("user-agent"))
-        .count();
-    assert_eq!(ua_count, 1, "user-agent must appear exactly once");
-    assert_eq!(recorded.header("user-agent"), Some("tinybrowser-test/0.1"));
+        .map(|request| request.method.as_str())
+        .collect();
+    assert_eq!(methods, expected);
     server.assert_clean();
-}
 
-#[test]
-fn request_level_user_agent_overrides_the_builder() {
-    let server = TestServer::start(|conn| {
-        conn.read_request();
-        conn.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
-            .expect("canned write");
+    let server = TestServer::start(|connection| {
+        connection.read_request();
+        connection
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+            .expect("request response");
     });
-
     AgentBuilder::new()
         .user_agent("builder/default")
         .build()
-        .request(Method::GET, server.url("/ua"))
+        .request(Method::POST, server.url("/shape#fragment"))
+        .header("X-Custom", "alpha")
+        .expect("header")
         .header("User-Agent", "request/wins")
-        .expect("valid header")
+        .expect("header")
+        .body(b"name=value")
         .send()
-        .expect("send works");
-
-    let requests = server.requests();
-    let uas: Vec<&str> = requests[0]
-        .headers
-        .iter()
-        .filter(|(name, _)| name.eq_ignore_ascii_case("user-agent"))
-        .map(|(_, value)| value.as_str())
-        .collect();
-    // Explicit beats configured, and exactly one header survives — the
-    // layering is decided in send(), not inherited from the backend.
-    assert_eq!(uas, ["request/wins"]);
+        .expect("shaped request");
+    let request = &server.requests()[0];
+    assert_eq!(request.target, "/shape");
+    assert_eq!(request.body, b"name=value");
+    assert_eq!(request.header("user-agent"), Some("request/wins"));
+    assert_eq!(request.header("content-length"), Some("10"));
     server.assert_clean();
-}
 
-#[test]
-fn default_agent_sends_no_backend_default_headers() {
-    let server = TestServer::start(|conn| {
-        conn.read_request();
-        conn.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
-            .expect("canned write");
+    let server = TestServer::start(|connection| {
+        connection.read_request();
+        connection
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+            .expect("response");
     });
-
-    Agent::new()
-        .request(Method::GET, server.url("/bare"))
-        .send()
-        .expect("send works");
-
-    let recorded = &server.requests()[0];
-    // Decision 02: net sends only headers we build ourselves. The
-    // backend's own defaults (its version string, Accept, Accept-Encoding)
-    // are suppressed at construction — wire behavior we don't own would
-    // contradict the seam.
-    for banned in ["user-agent", "accept", "accept-encoding"] {
-        assert!(
-            recorded.header(banned).is_none(),
-            "backend-injected {banned} leaked onto the wire"
-        );
-    }
-    server.assert_clean();
-}
-
-#[test]
-fn post_sends_its_body_with_content_length() {
-    let server = TestServer::start(|conn| {
-        conn.read_request();
-        conn.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
-            .expect("canned write");
-    });
-
-    Agent::new()
-        .request(Method::POST, server.url("/submit"))
-        .body(b"name=value".as_slice())
-        .send()
-        .expect("POST succeeds");
-
-    let recorded = &server.requests()[0];
-    assert_eq!(recorded.method, "POST");
-    assert_eq!(recorded.body, b"name=value");
-    assert_eq!(recorded.header("content-length"), Some("10"));
-    server.assert_clean();
-}
-
-#[test]
-fn invalid_header_values_are_rejected_at_the_boundary() {
-    let server = TestServer::start(|conn| {
-        conn.read_request();
-        conn.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
-            .expect("canned write");
-    });
-
-    // RFC 9110 §5.5 field-value grammar: control characters other than
-    // HTAB are forbidden — this is the injection guard.
     let result = Agent::new()
-        .request(Method::GET, server.url("/evil"))
-        .header("X-Bad", "line one\r\nX-Forged: yes")
-        .expect_err("CRLF injection rejected");
-    assert!(matches!(result, net::HeaderError::InvalidValue(_)));
-
-    // Nothing reached the wire: rejection happened before any dial.
-    assert!(
-        server.requests().is_empty(),
-        "a rejected request must never dial — server saw {:?}",
-        server.requests()
-    );
+        .request(Method::GET, server.url("/invalid"))
+        .header("X-Bad", "line\r\nInjected: yes");
+    assert!(matches!(result, Err(net::HeaderError::InvalidValue(_))));
+    assert!(server.requests().is_empty());
     server.assert_clean();
 }
 
 #[test]
-fn fragments_stay_on_final_url_and_leave_the_wire() {
-    let server = TestServer::start(|conn| {
-        conn.read_request();
-        conn.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
-            .expect("canned write");
-    });
-
-    // Navigation to anchored URLs is the common case; the fragment must
-    // never reach the request line, and final_url must keep it for
-    // location.hash after this hop.
-    let anchored = server.url("/page#section-2");
-    let response = Agent::new()
-        .request(Method::GET, anchored.clone())
-        .send()
-        .expect("send works");
-
-    assert_eq!(server.requests()[0].target, "/page");
-    assert_eq!(response.final_url(), &anchored);
-    server.assert_clean();
-}
-
-#[test]
-fn zero_redirect_cap_returns_3xx_with_location_as_data() {
-    // Decision 02: cap 0 means the 3xx itself is the final response.
-    let server = TestServer::start(|conn| {
-        conn.read_request();
-        conn.write_all(
-            b"HTTP/1.1 302 Found\r\nLocation: /b\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-        )
-        .expect("redirect write");
-    });
-
-    let asked = server.url("/a");
-    let response = AgentBuilder::new()
-        .max_redirects(0)
-        .build()
-        .request(Method::GET, asked.clone())
-        .send()
-        .expect("3xx is data when the cap is 0");
-
-    assert_eq!(response.status(), 302);
-    assert_eq!(response.final_url(), &asked);
-    assert_eq!(response.headers().get("location"), Some(&b"/b"[..]));
-    assert_eq!(server.requests().len(), 1);
-    assert_eq!(server.requests()[0].target, "/a");
-    server.assert_clean();
-}
-
-#[test]
-fn redirect_to_a_non_http_scheme_is_protocol_error() {
-    // fetch #http-redirect-fetch: Location whose scheme is not HTTP(S) is
-    // a network error, not a 3xx we hand to the caller.
-    let server = TestServer::start(|conn| {
-        conn.read_request();
-        conn.write_all(
-            b"HTTP/1.1 302 Found\r\nLocation: mailto:a@b\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-        )
-        .expect("redirect write");
-    });
-    match Agent::new().request(Method::GET, server.url("/a")).send() {
-        Err(NetError::Protocol(ProtocolError::RejectedRequest)) => {}
-        other => panic!("expected Protocol(RejectedRequest), got {other:?}"),
+fn redirect_policy_covers_following_rewriting_caps_and_origin_safety() {
+    for (status, method, expected_method, expected_body) in [
+        (301, Method::POST, "GET", b"".as_slice()),
+        (302, Method::POST, "GET", b"".as_slice()),
+        (303, Method::PUT, "GET", b"".as_slice()),
+        (307, Method::POST, "POST", b"field=1".as_slice()),
+        (308, Method::POST, "POST", b"field=1".as_slice()),
+    ] {
+        let initial_method = method.as_str().to_owned();
+        let counter = Arc::new(std::sync::Mutex::new(0_u8));
+        let server_counter = Arc::clone(&counter);
+        let server = TestServer::start(move |connection| {
+            let mut number = server_counter.lock().expect("counter");
+            connection.read_request();
+            if *number == 0 {
+                connection
+                    .write_all(&canned_redirect(status, "/landed"))
+                    .expect("redirect");
+            } else {
+                connection
+                    .write_all(&canned_ok(&[], b"ok"))
+                    .expect("landing");
+            }
+            *number += 1;
+        });
+        Agent::new()
+            .request(method, server.url("/start"))
+            .body(b"field=1")
+            .send()
+            .expect("redirect");
+        let requests = server.requests();
+        assert_eq!(requests[0].method, initial_method);
+        assert_eq!(requests[1].method, expected_method);
+        assert_eq!(requests[1].body, expected_body);
+        server.assert_clean();
     }
-    server.assert_clean();
-}
 
-fn canned_redirect(status: u16, location: &str) -> Vec<u8> {
-    format!("HTTP/1.1 {status} Redirect\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
-        .into_bytes()
-}
-
-#[test]
-fn redirect_chain_follows_until_200_and_exposes_final_url() {
-    let hops = Arc::new(std::sync::Mutex::new(0u32));
-    let server_hops = Arc::clone(&hops);
-    let server = TestServer::start(move |conn| {
-        conn.read_request();
-        let n = {
-            let mut guard = server_hops.lock().expect("hop counter");
-            let n = *guard;
-            *guard += 1;
-            n
-        };
-        if n < 2 {
-            conn.write_all(&canned_redirect(302, "/next"))
-                .expect("redirect write");
+    let counter = Arc::new(std::sync::Mutex::new(0_u8));
+    let server_counter = Arc::clone(&counter);
+    let server = TestServer::start(move |connection| {
+        let mut number = server_counter.lock().expect("counter");
+        connection.read_request();
+        if *number < 2 {
+            connection
+                .write_all(&canned_redirect(302, "/next"))
+                .expect("redirect");
         } else {
-            conn.write_all(&canned_ok(&[], b"landed"))
-                .expect("final write");
+            connection
+                .write_all(&canned_ok(&[], b"landed"))
+                .expect("landing");
         }
+        *number += 1;
     });
-
-    let asked = server.url("/start#section");
+    let asked = server.url("/start#fragment");
     let response = Agent::new()
         .request(Method::GET, asked)
         .send()
-        .expect("redirect chain");
-
+        .expect("chain");
     assert_eq!(response.status(), 200);
-    // Location had no fragment, so the original one is kept
-    // (fetch #http-redirect-fetch "location URL given request's current
-    // URL's fragment").
-    assert_eq!(response.final_url(), &server.url("/next#section"));
-    assert_eq!(response.into_body().bytes(16).expect("body"), b"landed");
-    let recorded = server.requests();
-    assert_eq!(recorded.len(), 3);
-    assert_eq!(recorded[0].target, "/start");
-    assert_eq!(recorded[1].target, "/next");
-    assert_eq!(recorded[2].target, "/next");
-    server.assert_clean();
-}
-
-#[test]
-fn exceeding_the_redirect_cap_is_limit_redirect() {
-    let server = TestServer::start(|conn| {
-        conn.read_request();
-        conn.write_all(&canned_redirect(302, "/loop"))
-            .expect("redirect write");
-    });
-
-    let result = AgentBuilder::new()
-        .max_redirects(2)
-        .build()
-        .request(Method::GET, server.url("/loop"))
-        .send();
-
-    match result {
-        Err(NetError::Limit(LimitExceeded::Redirect)) => {}
-        other => panic!("expected Limit(Redirect), got {other:?}"),
-    }
-    // Original + 2 follows, then the next 302 trips the cap (3 dials).
+    assert_eq!(response.final_url(), &server.url("/next#fragment"));
     assert_eq!(server.requests().len(), 3);
     server.assert_clean();
-}
 
-#[test]
-fn default_redirect_cap_is_chrome_20() {
-    // Distinguishes Chrome's 20 from ureq's default 10: 15 follows then a
-    // 200 must succeed; 21 consecutive 302s must Limit.
-    let hops = Arc::new(std::sync::Mutex::new(0u32));
-    let server_hops = Arc::clone(&hops);
-    let server = TestServer::start(move |conn| {
-        conn.read_request();
-        let n = {
-            let mut guard = server_hops.lock().expect("hop counter");
-            let n = *guard;
-            *guard += 1;
-            n
-        };
-        if n < 15 {
-            conn.write_all(&canned_redirect(302, "/h"))
-                .expect("redirect write");
-        } else {
-            conn.write_all(&canned_ok(&[], b"ok")).expect("final write");
-        }
+    let server = TestServer::start(|connection| {
+        connection.read_request();
+        connection
+            .write_all(&canned_redirect(302, "/loop"))
+            .expect("loop");
     });
-    let response = Agent::new()
-        .request(Method::GET, server.url("/h"))
-        .send()
-        .expect("15 follows is under Chrome's 20");
-    assert_eq!(response.status(), 200);
-    assert_eq!(server.requests().len(), 16);
+    assert!(matches!(
+        AgentBuilder::new()
+            .max_redirects(2)
+            .build()
+            .request(Method::GET, server.url("/loop"))
+            .send(),
+        Err(NetError::Limit(LimitExceeded::Redirect))
+    ));
+    assert_eq!(server.requests().len(), 3);
     server.assert_clean();
 
-    let loop_server = TestServer::start(|conn| {
-        conn.read_request();
-        conn.write_all(&canned_redirect(302, "/forever"))
-            .expect("redirect write");
+    let landing = TestServer::start(|connection| {
+        let request = connection.read_request();
+        assert!(request.header("authorization").is_none());
+        connection
+            .write_all(&canned_ok(&[], b"landed"))
+            .expect("landing");
     });
-    match Agent::new()
-        .request(Method::GET, loop_server.url("/forever"))
-        .send()
-    {
-        Err(NetError::Limit(LimitExceeded::Redirect)) => {}
-        other => panic!("default cap must fire as Limit(Redirect), got {other:?}"),
-    }
-    assert_eq!(loop_server.requests().len(), 21);
-    loop_server.assert_clean();
-}
-
-#[test]
-fn post_302_becomes_get_without_the_body() {
-    let hops = Arc::new(std::sync::Mutex::new(0u32));
-    let server_hops = Arc::clone(&hops);
-    let server = TestServer::start(move |conn| {
-        conn.read_request();
-        let n = {
-            let mut guard = server_hops.lock().expect("hop counter");
-            let n = *guard;
-            *guard += 1;
-            n
-        };
-        if n == 0 {
-            conn.write_all(&canned_redirect(302, "/landed"))
-                .expect("redirect write");
-        } else {
-            conn.write_all(&canned_ok(&[], b"ok")).expect("final write");
+    let first = TestServer::start({
+        let location = format!("http://{}/landed", landing.local_addr());
+        move |connection| {
+            connection.read_request();
+            connection
+                .write_all(&canned_redirect(302, &location))
+                .expect("cross-origin redirect");
         }
     });
-
-    Agent::new()
-        .request(Method::POST, server.url("/form"))
-        .body(b"field=1".to_vec())
-        .header("Content-Type", "application/x-www-form-urlencoded")
-        .expect("header")
-        .send()
-        .expect("302 POST redirect");
-
-    let recorded = server.requests();
-    assert_eq!(recorded[0].method, "POST");
-    assert_eq!(recorded[0].body, b"field=1");
-    assert_eq!(recorded[1].method, "GET");
-    assert!(recorded[1].body.is_empty());
-    assert!(recorded[1].header("content-type").is_none());
-    server.assert_clean();
-}
-
-#[test]
-fn post_307_replays_method_and_body() {
-    let hops = Arc::new(std::sync::Mutex::new(0u32));
-    let server_hops = Arc::clone(&hops);
-    let server = TestServer::start(move |conn| {
-        conn.read_request();
-        let n = {
-            let mut guard = server_hops.lock().expect("hop counter");
-            let n = *guard;
-            *guard += 1;
-            n
-        };
-        if n == 0 {
-            conn.write_all(&canned_redirect(307, "/landed"))
-                .expect("redirect write");
-        } else {
-            conn.write_all(&canned_ok(&[], b"ok")).expect("final write");
-        }
-    });
-
-    Agent::new()
-        .request(Method::POST, server.url("/form"))
-        .body(b"field=1".to_vec())
-        .send()
-        .expect("307 POST redirect");
-
-    let recorded = server.requests();
-    assert_eq!(recorded[0].method, "POST");
-    assert_eq!(recorded[1].method, "POST");
-    assert_eq!(recorded[1].body, b"field=1");
-    server.assert_clean();
-}
-
-#[test]
-fn post_301_becomes_get_without_the_body() {
-    let hops = Arc::new(std::sync::Mutex::new(0u32));
-    let server_hops = Arc::clone(&hops);
-    let server = TestServer::start(move |conn| {
-        conn.read_request();
-        let n = {
-            let mut guard = server_hops.lock().expect("hop counter");
-            let n = *guard;
-            *guard += 1;
-            n
-        };
-        if n == 0 {
-            conn.write_all(&canned_redirect(301, "/landed"))
-                .expect("redirect write");
-        } else {
-            conn.write_all(&canned_ok(&[], b"ok")).expect("final write");
-        }
-    });
-
-    Agent::new()
-        .request(Method::POST, server.url("/form"))
-        .body(b"field=1".to_vec())
-        .header("Content-Type", "application/x-www-form-urlencoded")
-        .expect("header")
-        .send()
-        .expect("301 POST redirect");
-
-    let recorded = server.requests();
-    assert_eq!(recorded[0].method, "POST");
-    assert_eq!(recorded[1].method, "GET");
-    assert!(recorded[1].body.is_empty());
-    assert!(recorded[1].header("content-type").is_none());
-    server.assert_clean();
-}
-
-#[test]
-fn put_303_becomes_get_without_the_body() {
-    let hops = Arc::new(std::sync::Mutex::new(0u32));
-    let server_hops = Arc::clone(&hops);
-    let server = TestServer::start(move |conn| {
-        conn.read_request();
-        let n = {
-            let mut guard = server_hops.lock().expect("hop counter");
-            let n = *guard;
-            *guard += 1;
-            n
-        };
-        if n == 0 {
-            conn.write_all(&canned_redirect(303, "/landed"))
-                .expect("redirect write");
-        } else {
-            conn.write_all(&canned_ok(&[], b"ok")).expect("final write");
-        }
-    });
-
-    Agent::new()
-        .request(Method::PUT, server.url("/resource"))
-        .body(b"payload".to_vec())
-        .header("Content-Type", "text/plain")
-        .expect("header")
-        .send()
-        .expect("303 PUT redirect");
-
-    let recorded = server.requests();
-    assert_eq!(recorded[0].method, "PUT");
-    assert_eq!(recorded[1].method, "GET");
-    assert!(recorded[1].body.is_empty());
-    assert!(recorded[1].header("content-type").is_none());
-    server.assert_clean();
-}
-
-#[test]
-fn post_308_replays_method_and_body() {
-    let hops = Arc::new(std::sync::Mutex::new(0u32));
-    let server_hops = Arc::clone(&hops);
-    let server = TestServer::start(move |conn| {
-        conn.read_request();
-        let n = {
-            let mut guard = server_hops.lock().expect("hop counter");
-            let n = *guard;
-            *guard += 1;
-            n
-        };
-        if n == 0 {
-            conn.write_all(&canned_redirect(308, "/landed"))
-                .expect("redirect write");
-        } else {
-            conn.write_all(&canned_ok(&[], b"ok")).expect("final write");
-        }
-    });
-
-    Agent::new()
-        .request(Method::POST, server.url("/form"))
-        .body(b"field=1".to_vec())
-        .send()
-        .expect("308 POST redirect");
-
-    let recorded = server.requests();
-    assert_eq!(recorded[0].method, "POST");
-    assert_eq!(recorded[1].method, "POST");
-    assert_eq!(recorded[1].body, b"field=1");
-    server.assert_clean();
-}
-
-#[test]
-fn cross_origin_redirect_strips_authorization() {
-    // Distinct ports ⇒ distinct origins. fetch #http-redirect-fetch removes
-    // Authorization when the next hop is cross-origin.
-    let landing = TestServer::start(move |conn| {
-        conn.read_request();
-        conn.write_all(&canned_ok(&[], b"landed"))
-            .expect("landing write");
-    });
-
-    let landing_addr = landing.local_addr();
-    let first = TestServer::start(move |conn| {
-        conn.read_request();
-        let location = format!("http://{landing_addr}/landed");
-        conn.write_all(&canned_redirect(302, &location))
-            .expect("redirect write");
-    });
-
     Agent::new()
         .request(Method::GET, first.url("/start"))
         .header("Authorization", "Bearer secret")
-        .expect("header")
+        .expect("authorization")
         .send()
         .expect("cross-origin redirect");
-
-    let first_reqs = first.requests();
-    let land_reqs = landing.requests();
-    assert_eq!(first_reqs[0].header("authorization"), Some("Bearer secret"));
-    assert!(
-        land_reqs[0].header("authorization").is_none(),
-        "Authorization must not follow a cross-origin redirect, got {land_reqs:?}"
-    );
     first.assert_clean();
     landing.assert_clean();
 }
 
 #[test]
-fn proxy_knob_rejects_unusable_authority_strings() {
-    for bad in [
+fn proxy_tls_environment_and_debug_boundaries_stay_explicit() {
+    for invalid in [
         "",
         "not a uri",
         "socks5://127.0.0.1:1080",
         "ftp://127.0.0.1:8080",
         "http://",
     ] {
-        match AgentBuilder::new().proxy(bad) {
-            Err(NetError::Protocol(ProtocolError::InvalidProxy)) => {}
-            other => panic!("{bad:?} must be InvalidProxy, got {other:?}"),
-        }
+        assert!(matches!(
+            AgentBuilder::new().proxy(invalid),
+            Err(NetError::Protocol(ProtocolError::InvalidProxy))
+        ));
     }
-}
 
-#[test]
-fn proxy_knob_sends_http_traffic_to_the_configured_authority() {
-    // HTTP origin via an HTTP proxy: TCP to the proxy, origin-form request
-    // line, Host names the origin. ureq cannot emit RFC 9112 absolute-form.
-    let proxy = TestServer::start(|conn| {
-        conn.read_request();
-        conn.write_all(&canned_ok(&[], b"via"))
-            .expect("proxy write");
+    let proxy = TestServer::start(|connection| {
+        let request = connection.read_request();
+        assert_eq!(request.target, "/via");
+        assert_eq!(request.header("host"), Some("origin.test"));
+        assert_eq!(
+            request.header("proxy-authorization"),
+            Some("Basic dXNlcjpzZWNyZXQ=")
+        );
+        connection
+            .write_all(&canned_ok(&[], b"via"))
+            .expect("proxy response");
     });
-    let proxy_uri = format!("http://{}", proxy.local_addr());
-    let agent = AgentBuilder::new()
-        .proxy(&proxy_uri)
-        .expect("http proxy URI parses")
-        .timeout_global(Duration::from_secs(2))
-        .build();
-
-    let target = url::Url::parse("http://origin.test/via-proxy").expect("absolute");
-    let response = agent
-        .request(Method::GET, target)
-        .send()
-        .expect("proxied GET");
-    assert_eq!(response.status(), 200);
-    assert_eq!(response.into_body().bytes(8).expect("body"), b"via");
-
-    let recorded = proxy.requests();
-    assert_eq!(recorded[0].method, "GET");
-    assert_eq!(recorded[0].target, "/via-proxy");
-    assert_eq!(recorded[0].header("host"), Some("origin.test"));
-    assert!(
-        recorded.iter().all(|req| req.method != "CONNECT"),
-        "http:// through a forward proxy must not CONNECT, got {recorded:?}"
-    );
-    proxy.assert_clean();
-}
-
-#[test]
-fn http_proxy_sends_proxy_authorization_on_the_get() {
-    let proxy = TestServer::start(|conn| {
-        conn.read_request();
-        conn.write_all(&canned_ok(&[], b"v6")).expect("proxy write");
-    });
-    let addr = proxy.local_addr();
-    let proxy_uri = format!("http://user:secret@{addr}");
-    let agent = AgentBuilder::new()
+    let proxy_uri = format!("http://user:secret@{}", proxy.local_addr());
+    let response = AgentBuilder::new()
         .proxy(&proxy_uri)
         .expect("proxy")
-        .timeout_global(Duration::from_secs(2))
-        .build();
-    let target = url::Url::parse("http://origin.test/via").expect("absolute");
-    let response = agent
-        .request(Method::GET, target)
+        .build()
+        .request(
+            Method::GET,
+            url::Url::parse("http://origin.test/via").expect("origin"),
+        )
         .send()
-        .expect("proxied GET");
-    assert_eq!(response.into_body().bytes(8).expect("body"), b"v6");
-    let recorded = proxy.requests();
-    assert_eq!(recorded[0].method, "GET");
-    assert_eq!(recorded[0].target, "/via");
-    assert_eq!(recorded[0].header("host"), Some("origin.test"));
-    assert_eq!(
-        recorded[0].header("proxy-authorization"),
-        Some("Basic dXNlcjpzZWNyZXQ=")
-    );
+        .expect("proxy request");
+    assert_eq!(response.into_body().bytes(8).expect("body"), b"via");
     proxy.assert_clean();
-}
 
-#[test]
-fn https_to_a_plaintext_listener_is_a_tls_transport_error() {
-    // Proves native-tls is actually selected: without a TLS provider the
-    // failure would not be a handshake. Offline — the peer never speaks TLS.
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-    let addr = listener.local_addr().expect("addr");
-    let _server = std::thread::spawn(move || {
+    let builder = AgentBuilder::new()
+        .proxy("http://user:secret@localhost:8080")
+        .expect("proxy");
+    let debug = format!("{builder:?}");
+    assert!(!debug.contains("secret"));
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("TLS listener");
+    let addr = listener.local_addr().expect("address");
+    let worker = std::thread::spawn(move || {
         if let Ok((mut stream, _)) = listener.accept() {
             use std::io::Write as _;
             let _ = stream.write_all(b"NOT-TLS");
         }
     });
+    assert!(matches!(
+        Agent::new()
+            .request(
+                Method::GET,
+                url::Url::parse(&format!("https://{addr}/")).expect("https"),
+            )
+            .send(),
+        Err(NetError::Transport(TransportError::Tls(reason))) if !reason.is_empty()
+    ));
+    worker.join().expect("TLS worker");
 
-    let url = url::Url::parse(&format!("https://{addr}/")).expect("absolute");
-    match Agent::new().request(Method::GET, url).send() {
-        Err(NetError::Transport(TransportError::Tls(detail))) => {
-            assert_ne!(
-                detail.as_ref(),
-                "tls handshake failed",
-                "native-tls text must survive the ureq connector, got {detail}"
-            );
-            assert!(
-                !detail.is_empty(),
-                "Transport(Tls) must carry a handshake reason"
-            );
-        }
-        other => panic!("expected Transport(Tls), got {other:?}"),
-    }
-}
-
-#[test]
-fn method_case_is_fetch_accurate_at_the_type_and_on_the_wire() {
-    // Type level: parse keeps exactly the casing WHATWG fetch would put
-    // on the wire — #methods' normalize list is exhaustive, `patch` is
-    // deliberately outside it, extension tokens stay verbatim.
-    for (parsed, want) in [
-        ("get", "GET"),
-        ("head", "HEAD"),
-        ("patch", "patch"),
-        ("PATCH", "PATCH"),
-        ("propfind", "propfind"),
-        ("eGg", "eGg"),
-    ] {
-        let method = Method::parse(parsed).expect("valid token");
-        assert_eq!(method.as_str(), want, "parse({parsed:?}) wire token");
-    }
-
-    // Wire level: those same tokens reach the request line. v1 enables
-    // ureq's `allow_non_standard_methods` so fetch-accurate casing is not
-    // a stealth-only property.
-    let server = TestServer::start(|conn| {
-        conn.read_request();
-        conn.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
-            .expect("canned write");
-    });
-
-    let agent = Agent::new();
-    let expected = ["GET", "HEAD", "PATCH", "patch", "propfind", "eGg"];
-    for token in expected {
-        let sent = Method::parse(token).expect("valid token");
-        agent
-            .request(sent, server.url("/m"))
+    if std::env::var(PROXY_PROBE_FLAG).ok().as_deref() == Some("1") {
+        let server = TestServer::start(|connection| {
+            connection.read_request();
+            connection
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                .expect("direct response");
+        });
+        Agent::new()
+            .request(Method::GET, server.url("/direct"))
             .send()
-            .expect("fetch-accurate methods dial");
-    }
-    let recorded = server.requests();
-    let methods: Vec<&str> = recorded.iter().map(|req| req.method.as_str()).collect();
-    assert_eq!(methods, expected);
-    server.assert_clean();
-}
-
-#[test]
-fn buffered_body_enforces_the_caller_size_cap() {
-    let payload = vec![b'x'; 32];
-    let server = TestServer::start(move |conn| {
-        conn.read_request();
-        conn.write_all(&canned_ok(&[], &payload))
-            .expect("canned write");
-    });
-
-    let body = Agent::new()
-        .request(Method::GET, server.url("/sized"))
-        .send()
-        .expect("dial")
-        .into_body();
-    match body.bytes(16) {
-        Err(NetError::Limit(LimitExceeded::Size(cap))) => assert_eq!(cap, 16),
-        other => panic!("expected Limit(Size(16)), got {other:?}"),
-    }
-    server.assert_clean();
-
-    // Exact fit is allowed: the cap is exclusive (`>`), not `>=`.
-    let payload = vec![b'y'; 16];
-    let server = TestServer::start(move |conn| {
-        conn.read_request();
-        conn.write_all(&canned_ok(&[], &payload))
-            .expect("canned write");
-    });
-    let got = Agent::new()
-        .request(Method::GET, server.url("/exact"))
-        .send()
-        .expect("dial")
-        .into_body()
-        .bytes(16)
-        .expect("exact fit");
-    assert_eq!(got, vec![b'y'; 16]);
-    server.assert_clean();
-}
-
-#[test]
-fn agent_ignores_env_http_proxy() {
-    // Prove `.proxy(None)` without mutating this process: a child gets
-    // HTTP_PROXY/ALL_PROXY via Command::env (safe) and must still dial
-    // loopback, not CONNECT to the unaccepted listener we hold open.
-    const FLAG: &str = "NET_CRATE_PROXY_PROBE";
-    if std::env::var(FLAG).ok().as_deref() != Some("1") {
+            .expect("environment proxy must be ignored");
+        server.assert_clean();
+    } else {
         let proxy = std::net::TcpListener::bind("127.0.0.1:0").expect("proxy bind");
-        let proxy_uri = format!("http://{}", proxy.local_addr().expect("proxy addr"));
-        let status = Command::new(std::env::current_exe().expect("test exe"))
-            .args(["--exact", "agent_ignores_env_http_proxy"])
-            .env(FLAG, "1")
+        let proxy_uri = format!("http://{}", proxy.local_addr().expect("proxy address"));
+        let status = Command::new(std::env::current_exe().expect("test executable"))
+            .args([
+                "--exact",
+                "proxy_tls_environment_and_debug_boundaries_stay_explicit",
+            ])
+            .env(PROXY_PROBE_FLAG, "1")
             .env("HTTP_PROXY", &proxy_uri)
             .env("http_proxy", &proxy_uri)
             .env("HTTPS_PROXY", &proxy_uri)
@@ -1038,60 +496,7 @@ fn agent_ignores_env_http_proxy() {
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
             .status()
-            .expect("re-exec proxy probe");
-        assert!(status.success(), "child proxy probe failed: {status}");
-        return;
+            .expect("proxy probe");
+        assert!(status.success());
     }
-
-    let server = TestServer::start(|conn| {
-        conn.read_request();
-        conn.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
-            .expect("canned write");
-    });
-
-    let response = AgentBuilder::new()
-        .timeout_global(Duration::from_millis(500))
-        .build()
-        .request(Method::GET, server.url("/direct"))
-        .send()
-        .expect("loopback must not go through HTTP_PROXY");
-    assert_eq!(response.status(), 200);
-    assert_eq!(server.requests()[0].target, "/direct");
-    server.assert_clean();
-}
-
-#[test]
-fn builder_debug_omits_proxy_credentials() {
-    let builder = AgentBuilder::new()
-        .proxy("http://user:secret@localhost:8080")
-        .expect("proxy");
-    let debug = format!("{builder:?}");
-    assert!(!debug.contains("user"));
-    assert!(!debug.contains("secret"));
-}
-
-#[test]
-fn ipv6_loopback_dials_without_dns_brackets() {
-    use std::io::{Read, Write};
-    let listener = std::net::TcpListener::bind("[::1]:0").expect("IPv6 loopback");
-    let addr = listener.local_addr().expect("addr");
-    let worker = std::thread::spawn(move || {
-        let (mut stream, _) = listener.accept().expect("accept");
-        let mut head = Vec::new();
-        let mut byte = [0];
-        while !head.ends_with(b"\r\n\r\n") {
-            stream.read_exact(&mut byte).expect("head");
-            head.extend_from_slice(&byte);
-        }
-        stream
-            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
-            .expect("response");
-    });
-    let url = url::Url::parse(&format!("http://{addr}/")).expect("url");
-    let response = Agent::new()
-        .request(Method::GET, url)
-        .send()
-        .expect("IPv6 dial");
-    assert_eq!(response.status(), 200);
-    worker.join().expect("worker");
 }

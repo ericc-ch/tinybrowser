@@ -24,6 +24,9 @@ use std::path::{Path, PathBuf};
 
 use browser::{parse_html_fragment, parse_html_with_scripting};
 
+const EXPECTED_CORPUS_RUNS: usize = 3_549;
+const EXPECTED_ACCEPTED_DIVERGENCES: usize = 10;
+
 /// html5ever calls `TreeSink::maybe_clone_an_option_into_selectedcontent` only
 /// on an explicit `</option>` (servo/html5ever#712). We implement that hook.
 /// `webkit02.dat` #44–47 omit `</option>`, so the builder never asks and
@@ -137,9 +140,35 @@ fn tree_construction_matches_spec_trees() {
         }
     }
 
+    for (input, expected) in [
+        (
+            "<select><button><selectedcontent></button><option>X</option></select>",
+            "| <html>\n|   <head>\n|   <body>\n|     <select>\n|       <button>\n|         <selectedcontent>\n|           \"X\"\n|       <option>\n|         \"X\"",
+        ),
+        (
+            "<select><button><selectedcontent></button><option>X</option><option selected>Y</option></select>",
+            "| <html>\n|   <head>\n|   <body>\n|     <select>\n|       <button>\n|         <selectedcontent>\n|           \"Y\"\n|       <option>\n|         \"X\"\n|       <option>\n|         selected=\"\"\n|         \"Y\"",
+        ),
+        (
+            "<select multiple><button><selectedcontent></button><option>X</option></select>",
+            "| <html>\n|   <head>\n|   <body>\n|     <select>\n|       multiple=\"\"\n|       <button>\n|         <selectedcontent>\n|       <option>\n|         \"X\"",
+        ),
+    ] {
+        let parsed = parse_html_with_scripting(input, true);
+        assert_eq!(dump::dump_document(&parsed.dom), expected);
+    }
+
     println!(
         "html5lib tree-construction: {ran} cases run, \
          {accepted_divergences} runs matched documented upstream divergences"
+    );
+    assert_eq!(
+        ran, EXPECTED_CORPUS_RUNS,
+        "html5lib corpus run count drifted"
+    );
+    assert_eq!(
+        accepted_divergences, EXPECTED_ACCEPTED_DIVERGENCES,
+        "accepted html5lib divergence count drifted"
     );
     assert!(
         failures.is_empty(),
