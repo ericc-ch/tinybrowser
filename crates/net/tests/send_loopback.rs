@@ -37,25 +37,14 @@ fn canned_redirect(status: u16, location: &str) -> Vec<u8> {
     .into_bytes()
 }
 
-fn await_flag(flag: &AtomicBool) {
-    let deadline = Instant::now() + OBSERVE_TIMEOUT;
-    while !flag.load(Ordering::Acquire) {
-        assert!(
-            Instant::now() < deadline,
-            "server never observed the client"
-        );
-        std::thread::yield_now();
-    }
-}
-
-fn assert_statuses_and_bodies() {
+#[test]
+fn http_transcripts_cover_status_headers_framing_limits_and_failures() {
     for status in [201_u16, 302, 404, 500] {
         let server = TestServer::start(move |connection| {
             connection.read_request();
+            let response = format!("HTTP/1.1 {status} Whatever\r\nContent-Length: 2\r\n\r\nno");
             connection
-                .write_all(
-                    format!("HTTP/1.1 {status} Whatever\r\nContent-Length: 2\r\n\r\nno").as_bytes(),
-                )
+                .write_all(response.as_bytes())
                 .expect("status response");
         });
         let response = Agent::new()
@@ -66,11 +55,6 @@ fn assert_statuses_and_bodies() {
         assert_eq!(response.into_body().bytes(16).expect("body"), b"no");
         server.assert_clean();
     }
-}
-
-#[test]
-fn http_transcripts_cover_status_headers_framing_limits_and_failures() {
-    assert_statuses_and_bodies();
 
     let server = TestServer::start(|connection| {
         let request = connection.read_request();
@@ -226,31 +210,33 @@ fn response_bodies_stream_and_drop_cancels_the_socket() {
             .into_body();
         let _ = body.read_chunk().expect("partial chunk");
     }
-    await_flag(&peer_closed);
+    let deadline = Instant::now() + OBSERVE_TIMEOUT;
+    while !peer_closed.load(Ordering::Acquire) {
+        assert!(
+            Instant::now() < deadline,
+            "server never observed the client"
+        );
+        std::thread::yield_now();
+    }
     server.assert_clean();
 }
 
 #[test]
-fn request_shaping_methods_fragments_and_rejections_are_wire_visible() {
+fn request_shaping_custom_method_fragments_and_rejections_are_wire_visible() {
     let server = TestServer::start(|connection| {
-        connection.read_request();
+        let request = connection.read_request();
+        assert_eq!(request.method, "propfind");
         connection
             .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
             .expect("method response");
     });
-    let expected = ["GET", "HEAD", "PATCH", "patch", "propfind", "eGg"];
-    for token in expected {
-        Agent::new()
-            .request(Method::parse(token).expect("method"), server.url("/m"))
-            .send()
-            .expect("method request");
-    }
-    let requests = server.requests();
-    let methods: Vec<_> = requests
-        .iter()
-        .map(|request| request.method.as_str())
-        .collect();
-    assert_eq!(methods, expected);
+    Agent::new()
+        .request(
+            Method::parse("propfind").expect("custom method"),
+            server.url("/m"),
+        )
+        .send()
+        .expect("custom method request");
     server.assert_clean();
 
     let server = TestServer::start(|connection| {

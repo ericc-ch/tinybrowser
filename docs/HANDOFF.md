@@ -1,14 +1,13 @@
-# Handoff (2026-09-06)
+# Handoff (2026-09-07)
 
 ## State
 
-`main` is at `d743e23` (`Trim test suite to high-signal gates`). The trim is committed; post-trim workspace verification is not recorded yet.
+`main` is at `2ba65c9` (`docs: refresh handoff`). The final test trim is in the working tree: the loopback suite keeps one wire-level custom-method case and no longer uses its shallow one-call helpers. The Nix-based workspace test, format, and clippy checks pass.
 
 ## Do next
 
-1. Initialize `third_party/html5lib-tests`, then run the Nix-based workspace test, fmt, and clippy checks.
-2. Finish the remaining test trim: `send_loopback.rs` still duplicates method-grammar coverage from `token_grammar.rs`; keep one wire-level custom-method case. Remove shallow one-use test helpers where inlining is clearer.
-3. Continue the page-engine milestone: execute loaded `<script>` elements and add the first real DOM bindings to JS.
+1. Commit the final test trim.
+2. Continue the page-engine milestone: execute loaded `<script>` elements and add the first real DOM bindings to JS.
 
 Keep the compact public-boundary gates. If verification fails, repair those gates instead of restoring deleted one-off tests.
 
