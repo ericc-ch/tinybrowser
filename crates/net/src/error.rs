@@ -1,187 +1,80 @@
-use std::fmt;
-
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// Which timeout budget was exceeded.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum TimeoutKind {
+    #[error("global")]
     Global,
+    #[error("per-call")]
     PerCall,
+    #[error("resolve")]
     Resolve,
+    #[error("connect")]
     Connect,
+    #[error("send-request")]
     SendRequest,
+    #[error("send-body")]
     SendBody,
+    #[error("recv-response")]
     RecvResponse,
+    #[error("recv-body")]
     RecvBody,
+    /// A backend timeout name this crate does not map.
+    #[error("unknown ({0})")]
     Unknown(Box<str>),
 }
 
-impl fmt::Display for TimeoutKind {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Global => f.write_str("global"),
-            Self::PerCall => f.write_str("per-call"),
-            Self::Resolve => f.write_str("resolve"),
-            Self::Connect => f.write_str("connect"),
-            Self::SendRequest => f.write_str("send-request"),
-            Self::SendBody => f.write_str("send-body"),
-            Self::RecvResponse => f.write_str("recv-response"),
-            Self::RecvBody => f.write_str("recv-body"),
-            Self::Unknown(name) => write!(f, "unknown ({name})"),
-        }
-    }
-}
-
-#[derive(Debug)]
+/// Failure to dial, complete TLS, or transfer bytes.
+#[derive(Debug, thiserror::Error)]
 pub enum TransportError {
+    /// DNS lookup failed for this host.
+    #[error("dns lookup failed for {0}")]
     Dns(Box<str>),
+    /// TCP or proxy CONNECT failed. The string is a short reason, such as `CONNECT 403`.
+    #[error("connection failed: {0}")]
     Connect(Box<str>),
+    /// TLS handshake or certificate verification failed.
+    #[error("tls failure: {0}")]
     Tls(Box<str>),
+    #[error("{0} timeout exceeded")]
     Timeout(TimeoutKind),
-    Io(std::io::Error),
+    #[error("io error: {0}")]
+    Io(#[source] std::io::Error),
 }
 
-impl fmt::Display for TransportError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Dns(host) => write!(f, "dns lookup failed for {host}"),
-            Self::Connect(detail) => write!(f, "connection failed: {detail}"),
-            Self::Tls(detail) => write!(f, "tls failure: {detail}"),
-            Self::Timeout(kind) => write!(f, "{kind} timeout exceeded"),
-            Self::Io(err) => write!(f, "io error: {err}"),
-        }
-    }
-}
-
-impl std::error::Error for TransportError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Io(err) => Some(err),
-            _ => None,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// A configured cap was exceeded.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum LimitExceeded {
+    /// Redirect hop count reached [`AgentBuilder::max_redirects`].
+    #[error("redirect cap exceeded")]
     Redirect,
+    /// Response body would exceed the caller-supplied byte cap.
+    #[error("size cap exceeded: {0} bytes")]
     Size(u64),
 }
 
-impl fmt::Display for LimitExceeded {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Redirect => f.write_str("redirect cap exceeded"),
-            Self::Size(cap) => write!(f, "size cap exceeded: {cap} bytes"),
-        }
-    }
-}
-
-impl std::error::Error for LimitExceeded {}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// The request or response could not be represented as HTTP.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum ProtocolError {
+    /// A response header name or value is not a valid HTTP field.
+    #[error("backend produced an unrepresentable header")]
     UnrepresentableHeader,
+    /// The URL, method, or assembled request was rejected.
+    #[error("backend rejected the assembled request")]
     RejectedRequest,
+    /// Proxy URI is not an `http://` HTTP CONNECT authority with a host.
+    #[error("proxy URI must be an http:// HTTP CONNECT authority")]
     InvalidProxy,
+    /// Another protocol failure, with the backend's wording.
+    #[error("{0}")]
     Other(Box<str>),
 }
 
-impl fmt::Display for ProtocolError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::UnrepresentableHeader => {
-                f.write_str("backend produced an unrepresentable header")
-            }
-            Self::RejectedRequest => f.write_str("backend rejected the assembled request"),
-            Self::InvalidProxy => {
-                f.write_str("proxy URI must be an http:// HTTP CONNECT authority")
-            }
-            Self::Other(reason) => f.write_str(reason),
-        }
-    }
-}
-
-impl std::error::Error for ProtocolError {}
-
-#[derive(Debug)]
+/// Failure from [`RequestBuilder::send`], [`RequestBuilder::upgrade`], or body reads.
+#[derive(Debug, thiserror::Error)]
 pub enum NetError {
-    Transport(TransportError),
-    Protocol(ProtocolError),
-    Limit(LimitExceeded),
-}
-
-impl fmt::Display for NetError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Transport(err) => write!(f, "transport: {err}"),
-            Self::Protocol(err) => write!(f, "protocol violation: {err}"),
-            Self::Limit(limit) => write!(f, "limit exceeded: {limit}"),
-        }
-    }
-}
-
-impl std::error::Error for NetError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Transport(err) => Some(err),
-            Self::Protocol(err) => Some(err),
-            Self::Limit(err) => Some(err),
-        }
-    }
-}
-
-#[derive(Debug)]
-pub(crate) struct DialTlsFailure(pub Box<str>);
-
-impl fmt::Display for DialTlsFailure {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-impl std::error::Error for DialTlsFailure {}
-
-impl From<ureq::Error> for NetError {
-    fn from(err: ureq::Error) -> Self {
-        use ureq::Error as U;
-        match err {
-            U::HostNotFound => Self::Transport(TransportError::Dns("host not found".into())),
-            U::ConnectionFailed => {
-                Self::Transport(TransportError::Connect("connection failed".into()))
-            }
-            U::ConnectProxyFailed(detail) => {
-                Self::Transport(TransportError::Connect(detail.into()))
-            }
-            U::Io(err) => {
-                if let Some(tls) = err
-                    .get_ref()
-                    .and_then(|inner| inner.downcast_ref::<DialTlsFailure>())
-                {
-                    return Self::Transport(TransportError::Tls(tls.0.clone()));
-                }
-                Self::Transport(TransportError::Io(err))
-            }
-            U::Timeout(which) => {
-                use ureq::Timeout as T;
-                let kind = match which {
-                    T::Global => TimeoutKind::Global,
-                    T::PerCall => TimeoutKind::PerCall,
-                    T::Resolve => TimeoutKind::Resolve,
-                    T::Connect => TimeoutKind::Connect,
-                    T::SendRequest => TimeoutKind::SendRequest,
-                    T::SendBody => TimeoutKind::SendBody,
-                    T::RecvResponse => TimeoutKind::RecvResponse,
-                    T::RecvBody => TimeoutKind::RecvBody,
-                    other => TimeoutKind::Unknown(format!("{other:?}").into()),
-                };
-                Self::Transport(TransportError::Timeout(kind))
-            }
-            U::Tls(detail) => Self::Transport(TransportError::Tls(detail.into())),
-            U::NativeTls(err) => Self::Transport(TransportError::Tls(err.to_string().into())),
-            U::Der(err) => Self::Transport(TransportError::Tls(err.to_string().into())),
-            U::TooManyRedirects => Self::Limit(LimitExceeded::Redirect),
-            U::BodyExceedsLimit(cap) => Self::Limit(LimitExceeded::Size(cap)),
-            U::LargeResponseHeader(_, cap) => Self::Limit(LimitExceeded::Size(cap as u64)),
-            U::Http(_) => Self::Protocol(ProtocolError::RejectedRequest),
-            other => Self::Protocol(ProtocolError::Other(other.to_string().into())),
-        }
-    }
+    #[error("transport: {0}")]
+    Transport(#[source] TransportError),
+    #[error("protocol violation: {0}")]
+    Protocol(#[source] ProtocolError),
+    #[error("limit exceeded: {0}")]
+    Limit(#[source] LimitExceeded),
 }

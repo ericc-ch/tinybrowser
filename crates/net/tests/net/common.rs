@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -241,4 +242,40 @@ impl Drop for TestServer {
             let _ = handle.join();
         }
     }
+}
+
+pub fn canned_ok(headers: &[(&str, &str)], body: &[u8]) -> Vec<u8> {
+    let mut out = b"HTTP/1.1 200 OK\r\n".to_vec();
+    for (name, value) in headers {
+        out.extend_from_slice(format!("{name}: {value}\r\n").as_bytes());
+    }
+    out.extend_from_slice(
+        format!(
+            "Content-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .as_bytes(),
+    );
+    out.extend_from_slice(body);
+    out
+}
+
+pub fn canned_redirect(status: u16, location: &str) -> Vec<u8> {
+    format!(
+        "HTTP/1.1 {status} Redirect\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+    )
+    .into_bytes()
+}
+
+pub fn scripted(replies: impl IntoIterator<Item = Vec<u8>> + Send + 'static) -> TestServer {
+    let replies = Mutex::new(replies.into_iter().collect::<VecDeque<_>>());
+    TestServer::start(move |connection| {
+        connection.read_request();
+        let reply = replies
+            .lock()
+            .expect("scripted replies")
+            .pop_front()
+            .expect("scripted reply for request");
+        connection.write_all(&reply).expect("scripted response");
+    })
 }

@@ -6,7 +6,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use url::{Host, Url};
 
 use crate::context::Context;
-use crate::method::Method;
+use crate::protocol::Method;
 
 // https://httpwg.org/http-extensions/draft-ietf-httpbis-rfc6265bis.html#name-cookie-lifetime-limits
 const MAX_LIFETIME: Duration = Duration::from_hours(9600);
@@ -58,6 +58,7 @@ pub(crate) struct CookieOp<'a> {
     pub context: Context,
     pub method: &'a Method,
     pub initiator: Option<&'a Url>,
+    pub cross_site_redirect: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -80,8 +81,6 @@ impl CookieJar {
         self.evict_expired(op.now);
         self.evict_excess();
     }
-
-    pub(crate) fn cookie_string(&mut self, op: CookieOp<'_>) -> String {
 
     pub(crate) fn cookie_string(&mut self, op: CookieOp<'_>) -> String {
         self.evict_expired(op.now);
@@ -129,10 +128,7 @@ impl CookieJar {
     }
 
     fn evict_excess(&mut self) {
-        loop {
-            let Some(domain) = over_quota_domain(&self.cookies) else {
-                break;
-            };
+        while let Some(domain) = over_quota_domain(&self.cookies) {
             if !evict_one(&mut self.cookies, Some(&domain)) {
                 break;
             }
@@ -161,13 +157,19 @@ fn evict_one(cookies: &mut Vec<StoredCookie>, domain: Option<&str>) -> bool {
         .iter()
         .enumerate()
         .filter(|(_, cookie)| domain.is_none_or(|d| cookie.domain == d))
-        .min_by(|(_, a), (_, b)| match (a.secure, b.secure) {
-            (false, true) => std::cmp::Ordering::Less,
-            (true, false) => std::cmp::Ordering::Greater,
-            _ => a
+        .min_by(|(_, a), (_, b)| {
+            let by_age = a
                 .last_access
                 .cmp(&b.last_access)
-                .then_with(|| a.created.cmp(&b.created)),
+                .then_with(|| a.created.cmp(&b.created));
+            if domain.is_none() {
+                return by_age;
+            }
+            match (a.secure, b.secure) {
+                (false, true) => std::cmp::Ordering::Less,
+                (true, false) => std::cmp::Ordering::Greater,
+                _ => by_age,
+            }
         })
         .map(|(i, _)| i);
     if let Some(i) = victim {
@@ -235,7 +237,7 @@ fn parse_set_cookie(input: &str) -> Option<ParsedSetCookie> {
             None => (av, ""),
         };
         if aname.eq_ignore_ascii_case("Max-Age") {
-            if let Ok(n) = avalue.parse::<i64>() {
+            if let Some(n) = parse_max_age(avalue) {
                 parsed.max_age = Some(n);
             }
         } else if aname.eq_ignore_ascii_case("Expires") {
@@ -270,6 +272,14 @@ fn parse_set_cookie(input: &str) -> Option<ParsedSetCookie> {
     Some(parsed)
 }
 
+fn parse_max_age(value: &str) -> Option<i64> {
+    let digits = value.strip_prefix('-').unwrap_or(value);
+    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    value.parse().ok()
+}
+
 fn receive_cookie(
     parsed: ParsedSetCookie,
     op: &CookieOp<'_>,
@@ -297,7 +307,7 @@ fn receive_cookie(
         return None;
     }
     if same_site != SameSite::None
-        && !is_same_site_request(op.initiator, request_url)
+        && !op.is_same_site_request()
         && op.context != Context::Navigation
     {
         return None;
@@ -368,12 +378,7 @@ fn cookie_scope(
         None => String::new(),
     };
     if !domain_attr.is_empty() {
-        if is_ip(host) {
-            if domain_attr != host {
-                return None;
-            }
-            domain_attr.clear();
-        } else if is_public_suffix(&domain_attr) {
+        if is_ip(host) || is_public_suffix(&domain_attr) {
             if domain_attr != host {
                 return None;
             }
@@ -457,7 +462,7 @@ impl StoredCookie {
         }
         samesite_allows(
             self.same_site,
-            is_same_site_request(op.initiator, op.url),
+            op.is_same_site_request(),
             op.context,
             op.method,
         )
@@ -486,14 +491,19 @@ fn samesite_allows(
     }
 }
 
-fn is_same_site_request(initiator: Option<&Url>, target: &Url) -> bool {
-    match initiator {
-        None => true,
-        Some(from) => schemeful_same_site(from, target),
+impl CookieOp<'_> {
+    fn is_same_site_request(&self) -> bool {
+        if self.cross_site_redirect {
+            return false;
+        }
+        match self.initiator {
+            None => true,
+            Some(from) => schemeful_same_site(from, self.url),
+        }
     }
 }
 
-fn schemeful_same_site(a: &Url, b: &Url) -> bool {
+pub(crate) fn schemeful_same_site(a: &Url, b: &Url) -> bool {
     site_tuple(a) == site_tuple(b)
 }
 

@@ -10,22 +10,28 @@ use tungstenite::protocol::{CloseFrame, Message};
 use url::Url;
 
 use crate::Context;
-use crate::agent::Agent;
-use crate::dial::RawStream;
+use crate::client::Agent;
 use crate::error::{NetError, ProtocolError, TransportError};
-use crate::header::HeaderMap;
-use crate::method::Method;
+use crate::protocol::{HeaderMap, Method};
+use crate::transport::RawStream;
 
+/// Open WebSocket. Dropping it sends close code 1001 (Going Away).
 pub struct WebSocket {
     inner: Mutex<tungstenite::WebSocket<RawStream>>,
 }
 
+/// Incoming WebSocket event after control frames are handled.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum WsEvent {
     Message(WsMessage),
-    Close { code: u16, reason: String },
+    /// Peer close. `code` is 1005 when the peer omitted a close frame.
+    Close {
+        code: u16,
+        reason: String,
+    },
 }
 
+/// WebSocket data frame.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum WsMessage {
     Text(String),
@@ -33,6 +39,12 @@ pub enum WsMessage {
 }
 
 impl WebSocket {
+    /// Sends a data frame.
+    ///
+    /// # Errors
+    ///
+    /// [`NetError::Transport`] on I/O failure. [`NetError::Protocol`] when the
+    /// frame cannot be encoded.
     pub fn send(&self, message: WsMessage) -> Result<(), NetError> {
         let msg = match message {
             WsMessage::Text(t) => Message::Text(t.into()),
@@ -41,6 +53,12 @@ impl WebSocket {
         self.lock().send(msg).map_err(ws_err)
     }
 
+    /// Sends a close frame with the given code and reason.
+    ///
+    /// # Errors
+    ///
+    /// [`NetError::Transport`] on I/O failure. [`NetError::Protocol`] when the
+    /// close frame cannot be written.
     pub fn close(&self, code: u16, reason: &str) -> Result<(), NetError> {
         let frame = CloseFrame {
             code: CloseCode::from(code),
@@ -49,6 +67,12 @@ impl WebSocket {
         self.lock().close(Some(frame)).map_err(ws_err)
     }
 
+    /// Next data or close event. Ping frames are answered with pong and skipped.
+    ///
+    /// # Errors
+    ///
+    /// [`NetError::Transport`] on I/O failure. [`NetError::Protocol`] when the
+    /// frame stream is invalid.
     pub fn take_next_message(&self) -> Result<WsEvent, NetError> {
         let mut inner = self.lock();
         loop {
@@ -104,8 +128,8 @@ pub(crate) fn connect(
     method: &Method,
     initiator: Option<&Url>,
 ) -> Result<WebSocket, NetError> {
-    let stream = crate::dial::open(url, agent.proxy.as_deref(), agent.timeout)?;
-    if let Some(limit) = agent.timeout {
+    let stream = crate::transport::open(url, agent.engine.proxy.as_deref(), agent.engine.timeout)?;
+    if let Some(limit) = agent.engine.timeout {
         stream
             .set_read_timeout(Some(limit))
             .map_err(|err| NetError::Transport(TransportError::Io(err)))?;
@@ -133,6 +157,7 @@ pub(crate) fn connect(
         context,
         method,
         initiator,
+        false,
         response
             .headers()
             .get_all("set-cookie")
@@ -155,7 +180,6 @@ fn is_websocket_reserved(name: &str) -> bool {
             | "sec-websocket-key"
             | "sec-websocket-version"
             | "sec-websocket-extensions"
-            | "sec-websocket-protocol"
     )
 }
 

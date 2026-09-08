@@ -520,7 +520,9 @@ dependencies = [
 name = "net"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "native-tls",
+ "thiserror",
  "tungstenite",
  "ureq",
  "url",

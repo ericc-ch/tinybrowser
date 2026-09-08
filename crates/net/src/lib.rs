@@ -1,23 +1,19 @@
-//! [Fetch](https://fetch.spec.whatwg.org/) network layer.
+//! Blocking HTTP and WebSocket client for the page engine.
+//!
+//! Types in this crate are the public network surface. Behavior follows
+//! [Fetch](https://fetch.spec.whatwg.org/) for HTTP and the WebSocket protocol
+//! for `ws`/`wss`.
 
-mod agent;
-mod connector;
+mod client;
 mod context;
 mod cookie;
-mod dial;
 mod error;
-mod header;
-mod method;
-mod request;
-mod response;
-mod token;
+mod protocol;
+mod transport;
 mod websocket;
 
-pub use agent::{Agent, AgentBuilder};
+pub use client::{Agent, AgentBuilder, Body, RequestBuilder, Response};
 pub use context::Context;
 pub use error::{LimitExceeded, NetError, ProtocolError, TimeoutKind, TransportError};
-pub use header::{HeaderError, HeaderMap};
-pub use method::{InvalidMethod, Method};
-pub use request::RequestBuilder;
-pub use response::{Body, Response};
+pub use protocol::{HeaderError, HeaderMap, InvalidMethod, Method};
 pub use websocket::{WebSocket, WsEvent, WsMessage};

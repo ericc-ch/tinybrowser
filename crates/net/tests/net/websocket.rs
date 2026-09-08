@@ -7,7 +7,7 @@ use tungstenite::protocol::frame::coding::{CloseCode, Data, OpCode};
 use tungstenite::{Message, accept_hdr};
 
 struct HandshakeCapture {
-    slot: Arc<Mutex<Option<(String, String)>>>,
+    slot: Arc<Mutex<Option<(String, String, String)>>>,
 }
 
 impl tungstenite::handshake::server::Callback for HandshakeCapture {
@@ -31,7 +31,17 @@ impl tungstenite::handshake::server::Callback for HandshakeCapture {
             .and_then(|value| value.to_str().ok())
             .unwrap_or("")
             .to_owned();
-        *self.slot.lock().expect("capture") = Some((origin, user_agent));
+        let protocol = request
+            .headers()
+            .get("sec-websocket-protocol")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("")
+            .to_owned();
+        *self.slot.lock().expect("capture") = Some((origin, user_agent, protocol));
+        response.headers_mut().append(
+            "Sec-WebSocket-Protocol",
+            "tinybrowser-test".parse().expect("protocol header"),
+        );
         response.headers_mut().append(
             "Set-Cookie",
             "lax=1; Path=/; SameSite=Lax"
@@ -43,7 +53,7 @@ impl tungstenite::handshake::server::Callback for HandshakeCapture {
 }
 
 fn start_websocket_server(
-    captured: Arc<Mutex<Option<(String, String)>>>,
+    captured: Arc<Mutex<Option<(String, String, String)>>>,
     requests: Arc<Mutex<u8>>,
 ) -> TestServer {
     TestServer::start(move |connection| {
@@ -122,6 +132,8 @@ fn websocket_transcript_covers_handshake_frames_control_and_cookie_reuse() {
         url::Url::parse(&format!("ws://{}/page", server.local_addr())).expect("document");
     let socket = agent
         .request(Method::GET, server.ws_url("/socket"))
+        .header("Sec-WebSocket-Protocol", "tinybrowser-test")
+        .expect("protocol")
         .with_initiator(document)
         .upgrade()
         .expect("upgrade");
@@ -140,13 +152,14 @@ fn websocket_transcript_covers_handshake_frames_control_and_cookie_reuse() {
         }
     );
 
-    let (origin, user_agent) = captured
+    let (origin, user_agent, protocol) = captured
         .lock()
         .expect("capture")
         .clone()
         .expect("captured handshake");
     assert_eq!(origin, format!("ws://{}", server.local_addr()));
     assert_eq!(user_agent, "tinybrowser-test/1");
+    assert_eq!(protocol, "tinybrowser-test");
 
     agent
         .request(Method::GET, server.url("/after"))

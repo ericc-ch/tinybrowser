@@ -115,12 +115,37 @@ fn same_site_context_controls_cross_site_request_cookies() {
         .body(b"x")
         .send()
         .expect("cross post");
+    agent
+        .request(Method::GET, server.url("/"))
+        .with_initiator(url::Url::parse("https://evil.example/").expect("foreign"))
+        .send()
+        .expect("default navigation");
 
     let recorded = server.requests();
     assert!(recorded[1].header("cookie").is_none());
     assert_eq!(recorded[2].header("cookie"), Some("lax=2"));
     assert!(recorded[3].header("cookie").is_none());
+    assert_eq!(recorded[4].header("cookie"), Some("lax=2"));
     server.assert_clean();
+}
+
+#[test]
+fn cookie_max_age_and_global_eviction_follow_storage_rules() {
+    let agent = Agent::new();
+    let url = url::Url::parse("https://max-age.example/").expect("max-age URL");
+    agent.set_cookie("plus=1; Path=/; Max-Age=+0", &url);
+    assert_eq!(agent.cookies_for(&url), "plus=1");
+
+    let oldest = url::Url::parse("https://oldest.example/").expect("oldest URL");
+    agent.set_cookie("secure=1; Path=/; Secure", &oldest);
+    for domain in 0..60 {
+        let domain =
+            url::Url::parse(&format!("https://d{domain}.example/")).expect("quota domain URL");
+        for cookie in 0..50 {
+            agent.set_cookie(&format!("c{cookie}={cookie}; Path=/"), &domain);
+        }
+    }
+    assert!(agent.cookies_for(&oldest).is_empty());
 }
 
 #[test]
