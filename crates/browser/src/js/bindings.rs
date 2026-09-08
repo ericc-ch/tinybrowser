@@ -1,17 +1,21 @@
-//! Host objects for `Node`, `Document`, `Element`, `Event`, and `Window`.
+//! Host objects for `Node` (Document/Element/Text share this class today).
 //!
 //! `JsLifetime` is an unsafe rquickjs trait. The types here store no JS
 //! pointers, so `Changed<'to> = Self` is sound.
 
 #![allow(unsafe_code)]
-#![allow(clippy::needless_pass_by_value, clippy::unused_self)]
+#![allow(
+    clippy::needless_pass_by_value,
+    clippy::unused_self,
+    reason = "rquickjs method ABI passes Ctx by value; Document methods currently live on JsNode"
+)]
 
 use std::cell::RefCell;
 use std::rc::Rc;
 
 use dom::{LocalName, Namespace, NodeId, NodeKind, QualName, html_namespace};
 use rquickjs::{
-    Array, Class, Ctx, Exception, Function, Object, Persistent, Result, Value,
+    Array, Class, Ctx, Exception, FromJs, Function, Object, Persistent, Result, Value,
     class::{Trace, Tracer},
 };
 
@@ -292,11 +296,7 @@ impl JsNode {
             let Some(parsed) = parsed.parsed.as_ref() else {
                 return Ok(Value::new_null(ctx));
             };
-            parsed
-                .dom
-                .select_first(self.handle.0, &format!("#{id}"))
-                .ok()
-                .flatten()
+            find_element_by_id(&parsed.dom, parsed.dom.document(), &id)
         };
         match found {
             Some(node) => wrap_node(&ctx, node).map(rquickjs::Class::into_value),
@@ -492,7 +492,16 @@ pub(super) fn fire_window_load(ctx: &Ctx<'_>) -> Result<()> {
 }
 
 fn wrap_node<'js>(ctx: &Ctx<'js>, id: NodeId) -> Result<Class<'js, JsNode>> {
-    Class::instance(ctx.clone(), JsNode { handle: Handle(id) })
+    let world = world(ctx)?;
+    if let Some(saved) = world.borrow().wrapper(id) {
+        let value = saved.restore(ctx)?;
+        return Class::<JsNode>::from_js(ctx, value);
+    }
+    let class = Class::instance(ctx.clone(), JsNode { handle: Handle(id) })?;
+    world
+        .borrow_mut()
+        .intern_wrapper(id, Persistent::save(ctx, Class::into_value(class.clone())));
+    Ok(class)
 }
 
 fn world(ctx: &Ctx<'_>) -> Result<Rc<RefCell<World>>> {
@@ -552,4 +561,27 @@ fn collect_by_tag(dom: &dom::Dom, scope: NodeId, name: &str) -> Vec<NodeId> {
         }
     }
     out
+}
+
+fn find_element_by_id(dom: &dom::Dom, scope: NodeId, id: &str) -> Option<NodeId> {
+    let mut stack: Vec<NodeId> = dom
+        .children(scope)
+        .map(|kids| kids.copied().collect())
+        .unwrap_or_default();
+    stack.reverse();
+    while let Some(node) = stack.pop() {
+        if matches!(
+            dom.get(node).map(|item| item.kind()),
+            Some(NodeKind::Element { .. })
+        ) && dom.attribute(node, "id").as_deref() == Some(id)
+        {
+            return Some(node);
+        }
+        if let Some(kids) = dom.children(node) {
+            let mut kids: Vec<_> = kids.copied().collect();
+            kids.reverse();
+            stack.extend(kids);
+        }
+    }
+    None
 }

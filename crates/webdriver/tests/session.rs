@@ -72,4 +72,87 @@ fn session_execute_script_roundtrip() {
         Some(r#"{"script":"arguments[0](3)","args":[]}"#),
     );
     assert_eq!(async_result["value"].as_f64(), Some(3.0));
+
+    let delayed = request(
+        &addr,
+        "POST",
+        &format!("/session/{id}/execute/async"),
+        Some(
+            r#"{"script":"var cb = arguments[0]; setTimeout(function() { cb(4); }, 0);","args":[]}"#,
+        ),
+    );
+    assert_eq!(delayed["value"].as_f64(), Some(4.0));
+
+    let nan = request(
+        &addr,
+        "POST",
+        &format!("/session/{id}/execute/sync"),
+        Some(r#"{"script":"return NaN","args":[]}"#),
+    );
+    assert_eq!(nan["value"], json!(null));
+}
+
+#[test]
+fn navigate_returns_after_load_not_after_timers() {
+    let page_listener = TcpListener::bind("127.0.0.1:0").expect("page bind");
+    let page_addr = page_listener.local_addr().expect("page addr");
+    let server = thread::spawn(move || {
+        let (mut navigation, _) = page_listener.accept().expect("navigation");
+        let mut head = Vec::new();
+        let mut chunk = [0_u8; 1024];
+        while !head.windows(4).any(|window| window == b"\r\n\r\n") {
+            let read = navigation.read(&mut chunk).expect("request");
+            assert_ne!(read, 0);
+            head.extend_from_slice(&chunk[..read]);
+        }
+        let body = b"<!doctype html><script>window.early = 1; setTimeout(function() { window.late = 1; }, 30000);</script>";
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        navigation.write_all(response.as_bytes()).expect("head");
+        navigation.write_all(body).expect("body");
+    });
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("addr").to_string();
+    thread::spawn(move || {
+        let _ = webdriver::serve(&listener);
+    });
+
+    let created = request(&addr, "POST", "/session", Some("{}"));
+    let id = created["value"]["sessionId"]
+        .as_str()
+        .expect("session id")
+        .to_owned();
+
+    let started = Instant::now();
+    let navigated = request(
+        &addr,
+        "POST",
+        &format!("/session/{id}/url"),
+        Some(&format!(r#"{{"url":"http://{page_addr}/"}}"#)),
+    );
+    assert_eq!(navigated["value"], json!(null));
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "navigate waited for host timers"
+    );
+
+    let early = request(
+        &addr,
+        "POST",
+        &format!("/session/{id}/execute/sync"),
+        Some(r#"{"script":"return window.early","args":[]}"#),
+    );
+    assert_eq!(early["value"].as_f64(), Some(1.0));
+
+    let late = request(
+        &addr,
+        "POST",
+        &format!("/session/{id}/execute/sync"),
+        Some(r#"{"script":"return typeof window.late","args":[]}"#),
+    );
+    assert_eq!(late["value"], json!("undefined"));
+    server.join().expect("server");
 }

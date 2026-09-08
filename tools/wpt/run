@@ -8,13 +8,16 @@ ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 WPT="$ROOT/third_party/wpt"
 
 if ! command -v python3 >/dev/null 2>&1; then
-  UV_PY="${HOME}/.local/share/uv/python/cpython-3.12-linux-x86_64-gnu/bin"
-  if [[ -x "${UV_PY}/python3" ]]; then
-    PATH="${UV_PY}:${PATH}"
-  else
-    echo "python3 is required to run WPT" >&2
-    exit 1
+  if command -v uv >/dev/null 2>&1; then
+    UV_PY="$(uv python find 3.12 2>/dev/null || true)"
+    if [[ -n "${UV_PY}" ]]; then
+      PATH="$(dirname "${UV_PY}"):${PATH}"
+    fi
   fi
+fi
+if ! command -v python3 >/dev/null 2>&1; then
+  echo "python3 is required to run WPT" >&2
+  exit 1
 fi
 
 cd "$ROOT"

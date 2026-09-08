@@ -82,9 +82,9 @@ A page-JS object whose identity and methods are Rust (rquickjs class wrapping a 
 _Avoid_: polyfill, binding glue, wrapper (those mix host objects with JS-written APIs)
 
 **WebDriver**:
-W3C HTTP automation protocol. This is how wptrunner loads a real document and collects testharness results (`./wpt run tinybrowser …`).
+W3C HTTP automation protocol. This is how wptrunner loads a real document and collects testharness results (`./tools/wpt/run [tests]`, which builds the binary and runs `./wpt run --binary … --ssl-type none tinybrowser`).
 _Avoid_: CDP (that is the later agent-facing protocol, not the WPT driver)
 
 **WPT gate**:
-web-platform-tests is the suite for web-visible behavior (DOM, HTML, fetch, cookies, WebSocket as JS sees them). A parallel browser-crate JS/DOM suite is not kept once testharness runs through WebDriver.
+web-platform-tests is the suite for web-visible behavior (DOM, HTML, fetch, cookies, WebSocket as JS sees them). Browser-crate JS/DOM tests stay until testharness actually completes through WebDriver; they are not a second web suite.
 _Avoid_: “WPT covers net” (it does not import `net::Agent`; transport unit tests are a different layer)

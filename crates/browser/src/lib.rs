@@ -1,6 +1,6 @@
 //! Engine crate: `parse_html` (html5ever `TreeSink`) and the page
 //! (HTML jobs, `Agent`, `QuickJS` host). Depends on `dom` and `net`
-//! ([ADR 0007](../../wiki/adrs/0007-engine-charter.md)).
+//! ([ADR 0007](../../../docs/adrs/0007-engine-charter.md)).
 //!
 //! Future CDP depends on this crate alone. Fetch is `net::Agent` held here,
 //! not a `HttpTransport` trait. `Agent::send` runs through `spawn_blocking`

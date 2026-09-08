@@ -92,8 +92,10 @@ JA4 presented per column: `t13d3011_1d37bd780c83…` (OpenSSL, no ALPN);
 Cells rot per site per day; treat this as method plus snapshot, and re-run
 the whole matrix when anything about the transport changes.
 
-## Explicitly deferred
+## WPT runner (landed; testharness bar still open)
 
-- Full web-platform-tests corpus: needs harness machinery that belongs to
-  later layers; adopt once js exists. The parser suite's `.dat` source
-  moves to WPT at the same time (ADR 0005, "Upstream consolidation").
+The full WPT tree is pinned and driven by in-process classic WebDriver
+(`./tools/wpt/run`). HTTPS tests are off (`--ssl-type none`) until cert
+trust exists. html5lib-tests remain the parser gate. A passing testharness
+file through that runner is the next evidence, not a claim of this
+landing ([ADR 0008](../adrs/0008-wpt-via-webdriver.md)).

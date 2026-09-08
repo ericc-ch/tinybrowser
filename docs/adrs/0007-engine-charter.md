@@ -9,7 +9,7 @@ Status: accepted. Supersedes the crate table and “js must not depend on net”
 | `dom` | n/a | arena, `NodeId`, selectors |
 | `net` | n/a | blocking HTTP/WS + cookie jar; public types ours ([ADR 0006](0006-net-transport.md)) |
 | `browser` | `dom`, `net` | engine: TreeSink, later page + QuickJS; holds `Agent` |
-| root `tinybrowser` | `browser` | embedder + bins |
+| root `tinybrowser` | `browser`, `webdriver` | embedder + bins; WebDriver is in-process ([ADR 0008](0008-wpt-via-webdriver.md)) |
 
 One compile-error law: future `cdp` depends on `browser` alone. `cargo test -p` a leaf crate is not reach-around. No `js` crate until QuickJS has a small public surface (the empty workspace member is leftover). No `HttpTransport` trait.
 

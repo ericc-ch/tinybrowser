@@ -235,13 +235,21 @@ fn classic_scripts_run_and_window_load_fires() {
     page.load_html(
         r#"<!doctype html>
 <title>t</title>
+<body></body>
 <script>
 window.scriptRan = true;
+implicit = 1;
+window.sameBody = document.body === document.getElementsByTagName('body')[0];
 window.addEventListener("load", function() { window.loadFired = true; });
 </script>"#,
     );
     assert_eq!(
         page.eval("String(window.scriptRan)").expect("script"),
+        "true"
+    );
+    assert_eq!(page.eval("String(implicit)").expect("sloppy"), "1");
+    assert_eq!(
+        page.eval("String(window.sameBody)").expect("identity"),
         "true"
     );
     assert_eq!(page.eval("String(window.loadFired)").expect("load"), "true");
@@ -287,4 +295,54 @@ window.addEventListener("load", function() { window.loadSaw = window.fromLib; })
     assert_eq!(page.eval("String(window.fromLib)").expect("lib"), "7");
     assert_eq!(page.eval("String(window.loadSaw)").expect("load"), "7");
     server.join().expect("server");
+}
+
+#[test]
+fn navigation_load_does_not_wait_for_host_timers() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("address");
+    let server = thread::spawn(move || {
+        let (mut navigation, _) = listener.accept().expect("navigation");
+        assert_eq!(read_target(&mut navigation), "/page");
+        respond(
+            &mut navigation,
+            &["Content-Type: text/html"],
+            br#"<!doctype html>
+<p id="a.b">x</p>
+<script>
+window.early = true;
+setTimeout(function() { window.late = true; }, 30000);
+</script>"#,
+        );
+    });
+
+    let mut page = Page::new();
+    page.goto(&format!("http://{addr}/page")).expect("goto");
+    let started = Instant::now();
+    page.run_until_load();
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "load waited for host timers"
+    );
+    assert!(!page.last_navigation_failed());
+    assert_eq!(page.eval("String(window.early)").expect("early"), "true");
+    assert_eq!(page.eval("typeof window.late").expect("late"), "undefined");
+    assert_eq!(
+        page.eval("document.readyState").expect("readyState"),
+        "complete"
+    );
+    assert_eq!(
+        page.eval("document.getElementById('a.b').firstChild.data")
+            .expect("id"),
+        "x"
+    );
+    server.join().expect("server");
+}
+
+#[test]
+fn failed_navigation_is_reported() {
+    let mut page = Page::new();
+    page.goto("http://127.0.0.1:1/").expect("queued");
+    page.run_until_load();
+    assert!(page.last_navigation_failed());
 }

@@ -238,3 +238,18 @@ QuickJS eval, timers, and the page loop, so LTO retains the engine. Running it
 without arguments prints `42`; passing an HTTP URL also navigates before eval.
 Native TLS still uses the dynamically linked Nix OpenSSL. This is a real engine
 checkpoint below 5 MB, not a finished browser or static distribution measurement.
+
+## Milestone: WPT WebDriver host (2026-09-08)
+
+The CLI now serves in-process classic WebDriver (`tinybrowser --webdriver=PORT`),
+so LTO keeps the page engine, `rquickjs` `classes`+`macro`, and `serde_json`.
+rustc 1.98.0, committed stripped x86_64 release profile:
+
+| Artifact | Bytes |
+| --- | ---: |
+| CLI (`target/release/tinybrowser`) | 3,068,320 |
+| Page engine (`target/release/examples/page_probe`) | 2,975,936 |
+
+Previous CLI stub (294,944) did not reference `Page`. The probe grew ~144 KB
+from host-object classes and classic-script loading. Still under 5 MB.
+

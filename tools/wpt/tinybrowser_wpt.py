@@ -1,7 +1,8 @@
 # tinybrowser wptrunner product. Install into the WPT venv:
 #   pip install -e tools/wpt
 # then:
-#   third_party/wpt/wpt run --binary /path/to/tinybrowser tinybrowser [tests]
+#   third_party/wpt/wpt run --binary /path/to/tinybrowser --ssl-type none tinybrowser [tests]
+# or: ./tools/wpt/run [tests]
 
 from __future__ import annotations
 
@@ -82,5 +83,5 @@ class TinyBrowserProtocol(WebDriverProtocol):
 
 
 class TinyBrowserTestharnessExecutor(WebDriverTestharnessExecutor):
-    supports_testdriver = True
+    supports_testdriver = False
     protocol_cls = TinyBrowserProtocol

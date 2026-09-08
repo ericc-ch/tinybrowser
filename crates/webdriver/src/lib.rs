@@ -12,6 +12,8 @@ use browser::{Page, PageError, ScriptValue};
 use serde_json::{Value, json};
 
 const ELEMENT_KEY: &str = "element-6066-11e4-a52e-4f735466cecf";
+const MAX_HEAD: usize = 65_536;
+const MAX_BODY: usize = 8_388_608;
 
 /// Serves classic `WebDriver` on `listener` until the process exits.
 ///
@@ -132,7 +134,10 @@ fn navigate(sessions: &mut Sessions, session: &str, body: &str) -> (u16, Value) 
     };
     match window.page.goto(&url) {
         Ok(()) => {
-            window.page.run();
+            window.page.run_until_load();
+            if window.page.last_navigation_failed() {
+                return error(500, "unknown error", "navigation failed");
+            }
             ok(Value::Null)
         }
         Err(PageError::InvalidUrl { spec }) => error(400, "invalid argument", &spec),
@@ -165,7 +170,12 @@ fn execute(sessions: &mut Sessions, session: &str, body: &str, asynchronous: boo
         if let Err(err) = window.page.execute_script(&wrapped) {
             return error(500, "javascript error", &err.to_string());
         }
-        window.page.run();
+        window.page.run_until(|page| {
+            matches!(
+                page.execute_script("globalThis.__wd_done === true"),
+                Ok(ScriptValue::Bool(true))
+            )
+        });
         match window.page.execute_script("globalThis.__wd_async") {
             Ok(value) => ok(encode(window, value)),
             Err(err) => error(500, "javascript error", &err.to_string()),
@@ -183,8 +193,10 @@ fn wrap_script(script: &str, args: &Value, asynchronous: bool) -> String {
     if asynchronous {
         format!(
             "globalThis.__wd_async = undefined;\n\
+             globalThis.__wd_done = false;\n\
              (function() {{ {script} }}).apply(null, {args_json}.concat([function(v) {{ \
                globalThis.__wd_async = v === undefined ? null : v; \
+               globalThis.__wd_done = true; \
              }}]));"
         )
     } else {
@@ -196,7 +208,13 @@ fn encode(window: &mut Window, value: ScriptValue) -> Value {
     match value {
         ScriptValue::Undefined | ScriptValue::Null => Value::Null,
         ScriptValue::Bool(flag) => json!(flag),
-        ScriptValue::Number(number) => json!(number),
+        ScriptValue::Number(number) => {
+            if number.is_finite() {
+                json!(number)
+            } else {
+                Value::Null
+            }
+        }
         ScriptValue::String(text) => json!(text),
         ScriptValue::List(items) => {
             Value::Array(items.into_iter().map(|item| encode(window, item)).collect())
@@ -317,6 +335,12 @@ fn read_request(stream: &mut TcpStream) -> std::io::Result<(String, String, Stri
     let mut head = Vec::new();
     let mut byte = [0_u8; 1];
     while !head.windows(4).any(|window| window == b"\r\n\r\n") {
+        if head.len() >= MAX_HEAD {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "request head too large",
+            ));
+        }
         let read = stream.read(&mut byte)?;
         if read == 0 {
             return Err(std::io::Error::new(
@@ -342,6 +366,12 @@ fn read_request(stream: &mut TcpStream) -> std::io::Result<(String, String, Stri
         {
             content_length = length;
         }
+    }
+    if content_length > MAX_BODY {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "request body too large",
+        ));
     }
     let mut body = vec![0_u8; content_length];
     if content_length > 0 {

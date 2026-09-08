@@ -12,7 +12,10 @@ use std::fmt;
 use std::rc::Rc;
 use std::time::Duration;
 
-use rquickjs::{Array, Coerced, Context, FromJs, Function, Object, Runtime, Value, prelude::Func};
+use rquickjs::{
+    Array, Coerced, Context, FromJs, Function, Object, Runtime, Value, context::EvalOptions,
+    prelude::Func,
+};
 
 pub(crate) use world::World;
 
@@ -104,7 +107,7 @@ impl JsHost {
 
     pub(crate) fn eval(&self, source: &str) -> Result<String, JsError> {
         let rendered: Result<String, JsError> = self.context.with(|ctx| {
-            let value: Value = ctx.eval(source).map_err(JsError::engine)?;
+            let value: Value = eval_classic(&ctx, source)?;
             render_eval_result(&ctx, value)
         });
         // https://html.spec.whatwg.org/multipage/webappapis.html#clean-up-after-running-script
@@ -114,7 +117,7 @@ impl JsHost {
 
     pub(crate) fn eval_value(&self, source: &str) -> Result<crate::js::ScriptValue, JsError> {
         let decoded: Result<ScriptValue, JsError> = self.context.with(|ctx| {
-            let value: Value = ctx.eval(source).map_err(JsError::engine)?;
+            let value: Value = eval_classic(&ctx, source)?;
             decode_value(&ctx, value)
         });
         let jobs = self.run_jobs();
@@ -398,6 +401,13 @@ fn element_text(tree: &dom::Dom, id: dom::NodeId) -> String {
         }
     }
     text
+}
+
+fn eval_classic<'js, V: FromJs<'js>>(ctx: &rquickjs::Ctx<'js>, source: &str) -> Result<V, JsError> {
+    let mut options = EvalOptions::default();
+    options.strict = false;
+    ctx.eval_with_options(source, options)
+        .map_err(JsError::engine)
 }
 
 fn decode_value<'js>(ctx: &rquickjs::Ctx<'js>, value: Value<'js>) -> Result<ScriptValue, JsError> {

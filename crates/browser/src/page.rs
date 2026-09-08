@@ -1,6 +1,6 @@
 //! One page: HTML jobs we own, Tokio current-thread as the waiter, `Agent` for HTTP.
 //!
-//! [ADR 0007](../../../wiki/adrs/0007-engine-charter.md): the page thread is
+//! [ADR 0007](../../../docs/adrs/0007-engine-charter.md): the page thread is
 //! Tokio `rt`+`time` only. `Agent::send` runs on `spawn_blocking`.
 
 use std::cell::{Ref, RefCell};
@@ -11,7 +11,6 @@ use std::rc::Rc;
 use std::task::Poll;
 use std::time::Duration;
 
-use dom::NodeKind;
 use net::{Agent, AgentBuilder, Context, Method};
 use tokio::task::JoinSet;
 use tokio::time::{Instant, sleep_until};
@@ -135,30 +134,36 @@ enum QueuedDial {
     },
 }
 
+enum CompletedDial {
+    Fetch {
+        status: u16,
+    },
+    Navigate {
+        status: u16,
+        body: Vec<u8>,
+        final_url: Url,
+        content_language: Option<String>,
+        epoch: u64,
+    },
+    JsFetch {
+        status: u16,
+        body: Vec<u8>,
+        id: i32,
+        epoch: u64,
+    },
+    ClassicScript {
+        status: u16,
+        body: Vec<u8>,
+        epoch: u64,
+    },
+}
+
 #[derive(Clone, Copy)]
-enum DialKind {
+enum DialFail {
     Fetch,
-    Navigate,
-    JsFetch,
-    ClassicScript,
-}
-
-struct CompletedDial {
-    kind: DialKind,
-    status: u16,
-    body: Vec<u8>,
-    final_url: Url,
-    content_language: Option<String>,
-    js_fetch_id: Option<i32>,
-    nav_epoch: Option<u64>,
-    js_epoch: Option<u64>,
-}
-
-#[derive(Clone, Copy)]
-struct DialFail {
-    js_fetch_id: Option<i32>,
-    js_epoch: Option<u64>,
-    classic_script: bool,
+    Navigate { epoch: u64 },
+    JsFetch { id: i32, epoch: u64 },
+    ClassicScript { epoch: u64 },
 }
 
 struct HostTimer {
@@ -185,6 +190,8 @@ pub struct Page {
     js_epoch: u64,
     pending_classic: VecDeque<ClassicScript>,
     classic_fetch_in_flight: bool,
+    nav_in_flight: Option<u64>,
+    navigation_failed: bool,
 }
 
 impl Default for Page {
@@ -236,6 +243,8 @@ impl Page {
             js_epoch: 0,
             pending_classic: VecDeque::new(),
             classic_fetch_in_flight: false,
+            nav_in_flight: None,
+            navigation_failed: false,
         }
     }
 
@@ -346,6 +355,8 @@ impl Page {
     pub fn goto(&mut self, url: &str) -> Result<(), PageError> {
         let url = self.resolve_dial_url(url)?;
         self.nav_epoch = self.nav_epoch.saturating_add(1);
+        self.navigation_failed = false;
+        self.nav_in_flight = None;
         let epoch = self.nav_epoch;
         let initiator = self.document_url.clone();
         self.queued_dials
@@ -394,6 +405,12 @@ impl Page {
         &self.events
     }
 
+    /// True when the last [`Page::goto`] dial failed (DNS, connect, or body read).
+    #[must_use]
+    pub fn last_navigation_failed(&self) -> bool {
+        self.navigation_failed
+    }
+
     /// Parks this thread as the page Tokio waiter until no jobs, timers,
     /// queued dials, or in-flight fetches remain. Must not run inside another
     /// runtime.
@@ -403,6 +420,31 @@ impl Page {
     /// If called from inside a Tokio runtime, if the current-thread runtime
     /// cannot be built, or a `spawn_blocking` fetch worker panics.
     pub fn run(&mut self) {
+        self.block_on_pump(|_| true);
+    }
+
+    /// Parks until the current navigation has fired `load`, without waiting
+    /// for leftover host timers. `WebDriver` page-load strategy `normal`.
+    ///
+    /// [WebDriver navigate to URL](https://w3c.github.io/webdriver/#navigate-to)
+    ///
+    /// # Panics
+    ///
+    /// Same conditions as [`Page::run`].
+    pub fn run_until_load(&mut self) {
+        self.block_on_pump(|page| page.waiting_for_load());
+    }
+
+    /// Parks like [`Page::run`], but returns as soon as `stop` is true.
+    ///
+    /// # Panics
+    ///
+    /// Same conditions as [`Page::run`].
+    pub fn run_until(&mut self, mut stop: impl FnMut(&mut Self) -> bool) {
+        self.block_on_pump(|page| !stop(page));
+    }
+
+    fn block_on_pump(&mut self, keep_waiting: impl FnMut(&mut Self) -> bool) {
         assert!(
             tokio::runtime::Handle::try_current().is_err(),
             "Page::run must not run inside another Tokio runtime"
@@ -411,7 +453,7 @@ impl Page {
             .enable_time()
             .build()
             .expect("current-thread Tokio runtime for the page thread");
-        runtime.block_on(self.pump());
+        runtime.block_on(self.pump(keep_waiting));
     }
 
     fn resolve_dial_url(&self, spec: &str) -> Result<Url, PageError> {
@@ -432,7 +474,7 @@ impl Page {
         let Ok(Some(base_el)) = parsed.dom.select_first(parsed.dom.document(), "base[href]") else {
             return self.document_url.clone();
         };
-        let Some(href) = element_attr(&parsed.dom, base_el, "href") else {
+        let Some(href) = parsed.dom.attribute(base_el, "href") else {
             return self.document_url.clone();
         };
         self.document_url
@@ -440,7 +482,7 @@ impl Page {
             .unwrap_or_else(|_| self.document_url.clone())
     }
 
-    async fn pump(&mut self) {
+    async fn pump(&mut self, mut keep_waiting: impl FnMut(&mut Self) -> bool) {
         loop {
             self.adopt_js_work();
             self.launch_queued_dials();
@@ -448,6 +490,12 @@ impl Page {
                 self.run_job(job);
                 self.adopt_js_work();
                 self.launch_queued_dials();
+                if !keep_waiting(self) {
+                    return;
+                }
+            }
+            if !keep_waiting(self) {
+                return;
             }
             if self
                 .js
@@ -492,6 +540,17 @@ impl Page {
         }
     }
 
+    fn waiting_for_load(&self) -> bool {
+        self.queued_dials.iter().any(|dial| match dial {
+            QueuedDial::Navigate { epoch, .. } => *epoch == self.nav_epoch,
+            QueuedDial::ClassicScript { epoch, .. } => *epoch == self.js_epoch,
+            QueuedDial::Fetch { .. } | QueuedDial::JsFetch { .. } => false,
+        }) || self.nav_in_flight == Some(self.nav_epoch)
+            || self.classic_fetch_in_flight
+            || !self.pending_classic.is_empty()
+            || !self.world.borrow().document_ready
+    }
+
     fn launch_queued_dials(&mut self) {
         let mut leftover = Vec::new();
         let queued = std::mem::take(&mut self.queued_dials);
@@ -500,138 +559,94 @@ impl Page {
                 leftover.push(dial);
                 continue;
             }
-            let (kind, url, context, js_fetch_id, initiator, nav_epoch, js_epoch) = match dial {
-                QueuedDial::Fetch { url, initiator } => (
-                    DialKind::Fetch,
-                    url,
-                    Context::Fetch,
-                    None,
-                    initiator,
-                    None,
-                    None,
-                ),
-                QueuedDial::Navigate {
-                    url,
-                    initiator,
-                    epoch,
-                } => (
-                    DialKind::Navigate,
-                    url,
-                    Context::Navigation,
-                    None,
-                    initiator,
-                    Some(epoch),
-                    None,
-                ),
-                QueuedDial::JsFetch {
-                    url,
-                    initiator,
-                    id,
-                    epoch,
-                } => (
-                    DialKind::JsFetch,
-                    url,
-                    Context::Fetch,
-                    Some(id),
-                    initiator,
-                    None,
-                    Some(epoch),
-                ),
-                QueuedDial::ClassicScript {
-                    url,
-                    initiator,
-                    epoch,
-                } => (
-                    DialKind::ClassicScript,
-                    url,
-                    Context::Fetch,
-                    None,
-                    initiator,
-                    None,
-                    Some(epoch),
-                ),
-            };
+            if let QueuedDial::Navigate { epoch, .. } = &dial {
+                self.nav_in_flight = Some(*epoch);
+            }
             let agent = self.agent.clone();
-            self.fetches.spawn_blocking(move || {
-                let fail = DialFail {
-                    js_fetch_id,
-                    js_epoch,
-                    classic_script: matches!(kind, DialKind::ClassicScript),
-                };
-                let response = agent
-                    .request(Method::GET, url)
-                    .with_context(context)
-                    .with_initiator(initiator)
-                    .send()
-                    .map_err(|_| fail)?;
-                let status = response.status();
-                let final_url = response.final_url().clone();
-                let content_language = response
-                    .headers()
-                    .get("content-language")
-                    .and_then(|bytes| std::str::from_utf8(bytes).ok())
-                    .and_then(content_language_tag);
-                let body = if matches!(kind, DialKind::Fetch) {
-                    Vec::new()
-                } else {
-                    response
-                        .into_body()
-                        .bytes(FETCH_BODY_LIMIT)
-                        .map_err(|_| fail)?
-                };
-                Ok(CompletedDial {
-                    kind,
-                    status,
-                    body,
-                    final_url,
-                    content_language,
-                    js_fetch_id,
-                    nav_epoch,
-                    js_epoch,
-                })
-            });
+            self.fetches
+                .spawn_blocking(move || send_dial(&agent, &dial));
         }
         leftover.extend(std::mem::take(&mut self.queued_dials));
         self.queued_dials = leftover;
     }
 
     fn finish_dial(&mut self, done: CompletedDial) {
-        self.events.push(PageEvent::Fetch {
-            status: done.status,
-        });
-        if matches!(done.kind, DialKind::Navigate) && done.nav_epoch == Some(self.nav_epoch) {
-            self.apply_navigation(done.final_url, done.content_language, &done.body);
-        }
-        if let (DialKind::JsFetch, Some(id), Some(epoch)) =
-            (done.kind, done.js_fetch_id, done.js_epoch)
-            && epoch == self.js_epoch
-        {
-            let body = String::from_utf8_lossy(&done.body);
-            self.settle_js_fetch(id, true, i32::from(done.status), &body);
-        }
-        if matches!(done.kind, DialKind::ClassicScript) && done.js_epoch == Some(self.js_epoch) {
-            self.classic_fetch_in_flight = false;
-            self.pending_classic.pop_front();
-            if (200..300).contains(&done.status) {
-                let source = String::from_utf8_lossy(&done.body);
-                self.eval_classic(&source);
+        match done {
+            CompletedDial::Fetch { status } => {
+                self.events.push(PageEvent::Fetch { status });
             }
-            self.advance_classic_scripts();
+            CompletedDial::Navigate {
+                status,
+                body,
+                final_url,
+                content_language,
+                epoch,
+            } => {
+                self.events.push(PageEvent::Fetch { status });
+                if self.nav_in_flight == Some(epoch) {
+                    self.nav_in_flight = None;
+                }
+                if epoch == self.nav_epoch {
+                    self.navigation_failed = false;
+                    self.apply_navigation(final_url, content_language, &body);
+                }
+            }
+            CompletedDial::JsFetch {
+                status,
+                body,
+                id,
+                epoch,
+            } => {
+                self.events.push(PageEvent::Fetch { status });
+                if epoch == self.js_epoch {
+                    let body = String::from_utf8_lossy(&body);
+                    self.settle_js_fetch(id, true, i32::from(status), &body);
+                }
+            }
+            CompletedDial::ClassicScript {
+                status,
+                body,
+                epoch,
+            } => {
+                self.events.push(PageEvent::Fetch { status });
+                if epoch == self.js_epoch {
+                    self.classic_fetch_in_flight = false;
+                    self.pending_classic.pop_front();
+                    if (200..300).contains(&status) {
+                        let source = String::from_utf8_lossy(&body);
+                        self.eval_classic(&source);
+                    }
+                    self.advance_classic_scripts();
+                }
+            }
         }
         self.adopt_js_work();
     }
 
     fn fail_dial(&mut self, fail: DialFail) {
         self.events.push(PageEvent::FetchFailed);
-        if let (Some(id), Some(epoch)) = (fail.js_fetch_id, fail.js_epoch)
-            && epoch == self.js_epoch
-        {
-            self.settle_js_fetch(id, false, 0, "");
-        }
-        if fail.classic_script && fail.js_epoch == Some(self.js_epoch) {
-            self.classic_fetch_in_flight = false;
-            self.pending_classic.pop_front();
-            self.advance_classic_scripts();
+        match fail {
+            DialFail::Fetch => {}
+            DialFail::Navigate { epoch } => {
+                if self.nav_in_flight == Some(epoch) {
+                    self.nav_in_flight = None;
+                }
+                if epoch == self.nav_epoch {
+                    self.navigation_failed = true;
+                }
+            }
+            DialFail::JsFetch { id, epoch } => {
+                if epoch == self.js_epoch {
+                    self.settle_js_fetch(id, false, 0, "");
+                }
+            }
+            DialFail::ClassicScript { epoch } => {
+                if epoch == self.js_epoch {
+                    self.classic_fetch_in_flight = false;
+                    self.pending_classic.pop_front();
+                    self.advance_classic_scripts();
+                }
+            }
         }
         self.adopt_js_work();
     }
@@ -840,6 +855,68 @@ impl Page {
     }
 }
 
+fn send_dial(agent: &Agent, dial: &QueuedDial) -> Result<CompletedDial, DialFail> {
+    let fail = match dial {
+        QueuedDial::Fetch { .. } => DialFail::Fetch,
+        QueuedDial::Navigate { epoch, .. } => DialFail::Navigate { epoch: *epoch },
+        QueuedDial::JsFetch { id, epoch, .. } => DialFail::JsFetch {
+            id: *id,
+            epoch: *epoch,
+        },
+        QueuedDial::ClassicScript { epoch, .. } => DialFail::ClassicScript { epoch: *epoch },
+    };
+    let (url, context, initiator, read_body) = match dial {
+        QueuedDial::Fetch { url, initiator } => (url, Context::Fetch, initiator, false),
+        QueuedDial::Navigate { url, initiator, .. } => (url, Context::Navigation, initiator, true),
+        QueuedDial::JsFetch { url, initiator, .. }
+        | QueuedDial::ClassicScript { url, initiator, .. } => {
+            (url, Context::Fetch, initiator, true)
+        }
+    };
+    let response = agent
+        .request(Method::GET, url.clone())
+        .with_context(context)
+        .with_initiator(initiator.clone())
+        .send()
+        .map_err(|_| fail)?;
+    let status = response.status();
+    let final_url = response.final_url().clone();
+    let content_language = response
+        .headers()
+        .get("content-language")
+        .and_then(|bytes| std::str::from_utf8(bytes).ok())
+        .and_then(content_language_tag);
+    let body = if read_body {
+        response
+            .into_body()
+            .bytes(FETCH_BODY_LIMIT)
+            .map_err(|_| fail)?
+    } else {
+        Vec::new()
+    };
+    Ok(match dial {
+        QueuedDial::Fetch { .. } => CompletedDial::Fetch { status },
+        QueuedDial::Navigate { epoch, .. } => CompletedDial::Navigate {
+            status,
+            body,
+            final_url,
+            content_language,
+            epoch: *epoch,
+        },
+        QueuedDial::JsFetch { id, epoch, .. } => CompletedDial::JsFetch {
+            status,
+            body,
+            id: *id,
+            epoch: *epoch,
+        },
+        QueuedDial::ClassicScript { epoch, .. } => CompletedDial::ClassicScript {
+            status,
+            body,
+            epoch: *epoch,
+        },
+    })
+}
+
 /// One `Content-Language` tag, or `None` when the header lists several
 /// languages ([HTML document language](https://html.spec.whatwg.org/multipage/dom.html#language)).
 fn content_language_tag(raw: &str) -> Option<String> {
@@ -852,17 +929,6 @@ fn content_language_tag(raw: &str) -> Option<String> {
         return None;
     }
     Some(first)
-}
-
-fn element_attr(dom: &dom::Dom, id: dom::NodeId, name: &str) -> Option<String> {
-    match dom.get(id).map(|node| node.kind()) {
-        Some(NodeKind::Element { attributes, .. }) => attributes.iter().find_map(|attribute| {
-            (attribute.name.ns.is_empty()
-                && attribute.name.local.as_ref().eq_ignore_ascii_case(name))
-            .then(|| attribute.value.clone())
-        }),
-        _ => None,
-    }
 }
 
 async fn wait_until(deadline: Option<Instant>) {

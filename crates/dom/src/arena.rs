@@ -778,19 +778,23 @@ impl Dom {
         value: impl Into<String>,
     ) -> Result<(), DomError> {
         let node = self.node_mut(id).ok_or(DomError::StaleNode)?;
-        let NodeKind::Element { attributes, .. } = &mut node.kind else {
+        let NodeKind::Element { name, attributes } = &mut node.kind else {
             return Err(DomError::WrongNodeType);
+        };
+        let local = if name.ns == html_namespace() {
+            local.to_ascii_lowercase()
+        } else {
+            local.to_owned()
         };
         let value = value.into();
         if let Some(existing) = attributes.iter_mut().find(|attribute| {
-            attribute.name.ns.is_empty()
-                && attribute.name.local.as_ref().eq_ignore_ascii_case(local)
+            attribute.name.ns.is_empty() && attribute.name.local.as_ref() == local
         }) {
             existing.value = value;
             return Ok(());
         }
         attributes.push(Attribute {
-            name: QualName::new(None, Namespace::from(""), LocalName::from(local)),
+            name: QualName::new(None, Namespace::from(""), LocalName::from(local.as_str())),
             value,
         });
         Ok(())

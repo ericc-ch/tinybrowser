@@ -9,6 +9,3 @@ workspace = true
 [dependencies]
 browser = { workspace = true }
 serde_json = "1"
-
-[dev-dependencies]
-serde_json = "1"
