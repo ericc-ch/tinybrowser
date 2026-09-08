@@ -1,18 +1,12 @@
-//! Shared dial: TCP, HTTP CONNECT, native-tls.
-//!
-//! HTTP `send()` and WebSocket upgrades both call [`open`]. The deferred
-//! stealth swap replaces this function only.
-
 use std::io::{Read, Write};
-use std::net::{TcpStream, ToSocketAddrs};
-use std::time::Duration;
+use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
+use std::time::{Duration, Instant};
 
 use native_tls::{TlsConnector, TlsStream};
 use url::Url;
 
 use crate::error::{NetError, ProtocolError, TimeoutKind, TransportError};
 
-/// TCP plus unread bytes that arrived with the CONNECT response head.
 pub(crate) struct Socket {
     tcp: TcpStream,
     prefix: Vec<u8>,
@@ -46,7 +40,6 @@ impl Write for Socket {
     }
 }
 
-/// Connected byte stream, TLS already applied when the URL is https/wss.
 pub(crate) enum RawStream {
     Plain(Socket),
     Tls(TlsStream<Socket>),
@@ -72,7 +65,6 @@ impl RawStream {
         matches!(self, Self::Tls(_))
     }
 
-    /// Liveness probe that must not consume bytes (TLS records included).
     pub(crate) fn peek_open(&self) -> bool {
         if let Self::Plain(s) = self
             && !s.prefix.is_empty()
@@ -94,7 +86,9 @@ impl RawStream {
             Ok(0) | Err(_) => false,
             Ok(_) => true,
         };
-        let _ = tcp.set_nonblocking(false);
+        if tcp.set_nonblocking(false).is_err() {
+            return false;
+        }
         open
     }
 }
@@ -124,11 +118,6 @@ impl Write for RawStream {
     }
 }
 
-/// Dial `url`, applying the optional HTTP proxy and TLS.
-///
-/// `http://` through a proxy is a forward-proxy TCP connection: ureq writes
-/// origin-form (`GET /path`) plus `Host`. `https`/`ws`/`wss` tunnel with
-/// CONNECT first (WebSocket and TLS cannot be origin-form GETs to the proxy).
 pub(crate) fn open(
     url: &Url,
     proxy: Option<&str>,
@@ -182,17 +171,31 @@ pub(crate) fn open(
     }
 }
 
+fn remaining(deadline: Option<Instant>) -> Option<Duration> {
+    deadline.map(|end| end.saturating_duration_since(Instant::now()))
+}
+
+fn timed_out(kind: TimeoutKind) -> NetError {
+    NetError::Transport(TransportError::Timeout(kind))
+}
+
 fn connect_tcp(host: &str, port: u16, timeout: Option<Duration>) -> Result<TcpStream, NetError> {
     let host = host
         .strip_prefix('[')
         .and_then(|h| h.strip_suffix(']'))
         .unwrap_or(host);
-    let addrs = (host, port)
-        .to_socket_addrs()
-        .map_err(|_| NetError::Transport(TransportError::Dns(host.into())))?;
+    let deadline = timeout.map(|limit| Instant::now() + limit);
+    if remaining(deadline) == Some(Duration::ZERO) {
+        return Err(timed_out(TimeoutKind::Resolve));
+    }
+    let addrs = resolve_addrs(host, port, remaining(deadline))?;
     let mut last = None;
     for addr in addrs {
-        let result = match timeout {
+        let leftover = remaining(deadline);
+        if leftover == Some(Duration::ZERO) {
+            return Err(timed_out(TimeoutKind::Connect));
+        }
+        let result = match leftover {
             Some(limit) => TcpStream::connect_timeout(&addr, limit),
             None => TcpStream::connect(addr),
         };
@@ -204,6 +207,37 @@ fn connect_tcp(host: &str, port: u16, timeout: Option<Duration>) -> Result<TcpSt
     match last {
         Some(err) => Err(map_connect_io(err)),
         None => Err(NetError::Transport(TransportError::Dns(host.into()))),
+    }
+}
+
+fn resolve_addrs(
+    host: &str,
+    port: u16,
+    timeout: Option<Duration>,
+) -> Result<Vec<SocketAddr>, NetError> {
+    let Some(limit) = timeout else {
+        return (host, port)
+            .to_socket_addrs()
+            .map(Iterator::collect)
+            .map_err(|_| NetError::Transport(TransportError::Dns(host.into())));
+    };
+    let host_owned = host.to_owned();
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    std::thread::Builder::new()
+        .name("net-dns".into())
+        .spawn(move || {
+            let resolved = (host_owned.as_str(), port)
+                .to_socket_addrs()
+                .map(Iterator::collect);
+            let _ = tx.send(resolved);
+        })
+        .map_err(map_connect_io)?;
+    match rx.recv_timeout(limit) {
+        Ok(Ok(addrs)) => Ok(addrs),
+        Ok(Err(_)) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            Err(NetError::Transport(TransportError::Dns(host.into())))
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(timed_out(TimeoutKind::Resolve)),
     }
 }
 
@@ -220,8 +254,6 @@ fn tcp_to_proxy(proxy: &str, timeout: Option<Duration>) -> Result<Socket, NetErr
     ))
 }
 
-/// Basic token for `Proxy-Authorization` on an origin-form HTTP request
-/// (CONNECT carries the same value on the CONNECT request instead).
 pub(crate) fn proxy_basic_token(proxy: Option<&str>) -> Option<String> {
     let proxy = proxy?;
     let proxy_url = Url::parse(proxy).ok()?;
@@ -229,8 +261,11 @@ pub(crate) fn proxy_basic_token(proxy: Option<&str>) -> Option<String> {
         return None;
     }
     let password = proxy_url.password().unwrap_or("");
-    let token = base64_basic(&format!("{}:{password}", proxy_url.username()));
-    Some(format!("Basic {token}"))
+    Some(basic_authorization(proxy_url.username(), password))
+}
+
+pub(crate) fn basic_authorization(username: &str, password: &str) -> String {
+    format!("Basic {}", base64_basic(&format!("{username}:{password}")))
 }
 
 fn connect_via_proxy(
@@ -248,7 +283,11 @@ fn connect_via_proxy(
     let mut stream = connect_tcp(phost, proxy_port, timeout)?;
     stream.set_read_timeout(timeout).map_err(map_connect_io)?;
     stream.set_write_timeout(timeout).map_err(map_connect_io)?;
-    let authority = connect_authority(host, port);
+    let authority = if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    };
     let mut req = format!("CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n");
     if let Some(value) = proxy_basic_token(Some(proxy)) {
         req.push_str("Proxy-Authorization: ");
@@ -262,13 +301,15 @@ fn connect_via_proxy(
     loop {
         if let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
             let leftover = buf[end + 4..].to_vec();
-            let head = String::from_utf8_lossy(&buf[..end + 4]);
-            let status = head
-                .split_whitespace()
-                .nth(1)
+            let head = String::from_utf8_lossy(&buf[..end]);
+            let status_line = head.lines().next().unwrap_or("");
+            let mut tokens = status_line.split_whitespace();
+            let version = tokens.next().unwrap_or("");
+            let status = tokens
+                .next()
                 .and_then(|s| s.parse::<u16>().ok())
                 .unwrap_or(0);
-            if status != 200 {
+            if !version.starts_with("HTTP/") || status != 200 {
                 return Err(NetError::Transport(TransportError::Connect(
                     format!("CONNECT {status}").into(),
                 )));
@@ -284,14 +325,6 @@ fn connect_via_proxy(
             return Err(NetError::Protocol(ProtocolError::RejectedRequest));
         }
         buf.extend_from_slice(&chunk[..n]);
-    }
-}
-
-fn connect_authority(host: &str, port: u16) -> String {
-    if host.contains(':') && !host.starts_with('[') {
-        format!("[{host}]:{port}")
-    } else {
-        format!("{host}:{port}")
     }
 }
 
@@ -326,7 +359,7 @@ fn base64_basic(input: &str) -> String {
 fn map_connect_io(err: std::io::Error) -> NetError {
     match err.kind() {
         std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock => {
-            NetError::Transport(TransportError::Timeout(TimeoutKind::Connect))
+            timed_out(TimeoutKind::Connect)
         }
         _ => NetError::Transport(TransportError::Io(err)),
     }

@@ -1,13 +1,5 @@
-//! WebSocket handle and the upgrade conversion point.
-//!
-//! Handshake dials through [`crate::dial::open`]. Application headers
-//! (Cookie, User-Agent, Origin) arrive already prepared by
-//! [`crate::Agent::prepare_outbound`]; this module writes Upgrade /
-//! `Sec-WebSocket-*` at the tungstenite seam, then the caller owns the
-//! socket. [`WebSocket::send`] writes; [`WebSocket::take_next_message`]
-//! reads (and answers pings).
-
 use std::sync::Mutex;
+use std::time::Duration;
 
 use tungstenite::client::IntoClientRequest as _;
 use tungstenite::handshake::HandshakeError;
@@ -24,22 +16,16 @@ use crate::error::{NetError, ProtocolError, TransportError};
 use crate::header::HeaderMap;
 use crate::method::Method;
 
-/// A live WebSocket after a successful upgrade. The TCP (or TLS) stream
-/// lives here; there is no background thread.
 pub struct WebSocket {
     inner: Mutex<tungstenite::WebSocket<RawStream>>,
 }
 
-/// One event from a read: a data message or the close handshake.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum WsEvent {
-    /// Reassembled text or binary payload.
     Message(WsMessage),
-    /// RFC 6455 §7.4 close code and reason.
     Close { code: u16, reason: String },
 }
 
-/// Application data on the WebSocket.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum WsMessage {
     Text(String),
@@ -47,11 +33,6 @@ pub enum WsMessage {
 }
 
 impl WebSocket {
-    /// Write one application message.
-    ///
-    /// # Errors
-    ///
-    /// [`NetError::Transport`] if the socket is already dead.
     pub fn send(&self, message: WsMessage) -> Result<(), NetError> {
         let msg = match message {
             WsMessage::Text(t) => Message::Text(t.into()),
@@ -60,11 +41,6 @@ impl WebSocket {
         self.lock().send(msg).map_err(ws_err)
     }
 
-    /// Initiate a close handshake (RFC 6455 §7.4).
-    ///
-    /// # Errors
-    ///
-    /// [`NetError::Transport`] if the socket is already dead.
     pub fn close(&self, code: u16, reason: &str) -> Result<(), NetError> {
         let frame = CloseFrame {
             code: CloseCode::from(code),
@@ -73,15 +49,6 @@ impl WebSocket {
         self.lock().close(Some(frame)).map_err(ws_err)
     }
 
-    /// Block until the next application message or close event.
-    ///
-    /// Control frames are handled here: a `Ping` is answered with `Pong`
-    /// and the read continues. Idle connections wait; there is no 32-slot
-    /// queue in front of the socket.
-    ///
-    /// # Errors
-    ///
-    /// [`NetError::Transport`] on a socket failure with no close frame.
     pub fn take_next_message(&self) -> Result<WsEvent, NetError> {
         let mut inner = self.lock();
         loop {
@@ -119,6 +86,8 @@ impl WebSocket {
 impl Drop for WebSocket {
     fn drop(&mut self) {
         if let Ok(mut inner) = self.inner.lock() {
+            let raw = inner.get_mut();
+            let _ = raw.set_write_timeout(Some(Duration::from_secs(1)));
             let _ = inner.close(Some(CloseFrame {
                 code: CloseCode::Away,
                 reason: Utf8Bytes::from(""),
@@ -127,9 +96,6 @@ impl Drop for WebSocket {
     }
 }
 
-/// Dial, write prepared headers onto a tungstenite client request (which
-/// supplies Upgrade / `Sec-WebSocket-*`), harvest Set-Cookie, return the
-/// live handle. Conversion point for tungstenite.
 pub(crate) fn connect(
     agent: &Agent,
     url: &Url,
@@ -152,6 +118,9 @@ pub(crate) fn connect(
         .into_client_request()
         .map_err(|err| NetError::Protocol(ProtocolError::Other(err.to_string().into())))?;
     for (name, value) in headers.iter() {
+        if is_websocket_reserved(name) {
+            continue;
+        }
         let header_name = tungstenite::http::HeaderName::from_bytes(name.as_bytes())
             .map_err(|_| NetError::Protocol(ProtocolError::RejectedRequest))?;
         let header_value = tungstenite::http::HeaderValue::from_bytes(value)
@@ -170,13 +139,24 @@ pub(crate) fn connect(
             .into_iter()
             .filter_map(|v| v.to_str().ok()),
     );
-    // Handshake used the agent timeout. Live reads wait for a frame.
     let raw = ws.get_mut();
     let _ = raw.set_read_timeout(None);
     let _ = raw.set_write_timeout(None);
     Ok(WebSocket {
         inner: Mutex::new(ws),
     })
+}
+
+fn is_websocket_reserved(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "connection"
+            | "upgrade"
+            | "sec-websocket-key"
+            | "sec-websocket-version"
+            | "sec-websocket-extensions"
+            | "sec-websocket-protocol"
+    )
 }
 
 fn handshake_err(err: HandshakeError<ClientHandshake<RawStream>>) -> NetError {

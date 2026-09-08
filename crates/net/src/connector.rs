@@ -1,5 +1,3 @@
-//! ureq [`Connector`] that dials through [`crate::dial::open`].
-
 use std::fmt;
 use std::io::{Read, Write};
 use std::sync::Mutex;
@@ -12,10 +10,6 @@ use url::Url;
 
 use crate::dial::{self, RawStream};
 
-/// DNS stays in [`dial::open`]; ureq still requires a resolver step before
-/// the connector runs, so this returns a dummy address and never looks up
-/// the origin host (needed so `http://origin.test` through a proxy
-/// does not fail DNS).
 #[derive(Debug, Default)]
 pub(crate) struct DialResolver;
 
@@ -30,7 +24,6 @@ impl Resolver for DialResolver {
     }
 }
 
-/// Shared-dial connector: TCP + CONNECT + TLS live in [`dial::open`].
 #[derive(Clone)]
 pub(crate) struct NetConnector {
     pub(crate) proxy: Option<String>,
@@ -164,8 +157,8 @@ fn to_ureq(err: crate::NetError) -> ureq::Error {
             let t = match kind {
                 crate::TimeoutKind::PerCall => ureq::Timeout::PerCall,
                 crate::TimeoutKind::Connect => ureq::Timeout::Connect,
+                crate::TimeoutKind::Resolve => ureq::Timeout::Resolve,
                 crate::TimeoutKind::Global
-                | crate::TimeoutKind::Resolve
                 | crate::TimeoutKind::SendRequest
                 | crate::TimeoutKind::SendBody
                 | crate::TimeoutKind::RecvResponse

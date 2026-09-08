@@ -1,11 +1,9 @@
-mod common;
-
+use super::common::TestServer;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use common::TestServer;
 use net::{
     Agent, AgentBuilder, LimitExceeded, Method, NetError, ProtocolError, TimeoutKind,
     TransportError,
@@ -60,6 +58,7 @@ fn http_transcripts_cover_status_headers_framing_limits_and_failures() {
         let request = connection.read_request();
         assert_eq!(request.method, "GET");
         assert_eq!(request.target, "/a/b?c=d");
+        assert_eq!(request.version, "HTTP/1.1");
         connection
             .write_all(&canned_ok(
                 &[("Content-Type", "text/plain"), ("X-Mixed-Case", "Value")],
@@ -468,7 +467,7 @@ fn proxy_tls_environment_and_debug_boundaries_stay_explicit() {
         let status = Command::new(std::env::current_exe().expect("test executable"))
             .args([
                 "--exact",
-                "proxy_tls_environment_and_debug_boundaries_stay_explicit",
+                "send_loopback::proxy_tls_environment_and_debug_boundaries_stay_explicit",
             ])
             .env(PROXY_PROBE_FLAG, "1")
             .env("HTTP_PROXY", &proxy_uri)
@@ -485,4 +484,156 @@ fn proxy_tls_environment_and_debug_boundaries_stay_explicit() {
             .expect("proxy probe");
         assert!(status.success());
     }
+}
+
+#[test]
+fn ipv6_loopback_send_and_connect_paths_are_exercised() {
+    let server = TestServer::start_v6(|connection| {
+        let request = connection.read_request();
+        assert_eq!(request.target, "/v6");
+        connection
+            .write_all(&canned_ok(&[], b"v6"))
+            .expect("v6 response");
+    });
+    let response = Agent::new()
+        .request(Method::GET, server.url("/v6"))
+        .send()
+        .expect("ipv6 send");
+    assert_eq!(response.into_body().bytes(8).expect("body"), b"v6");
+    server.assert_clean();
+
+    let proxy = TestServer::start(|connection| {
+        let request = connection.read_request();
+        assert_eq!(request.method, "CONNECT");
+        assert_eq!(request.target, "origin.test:443");
+        connection
+            .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\nNOT-TLS")
+            .expect("connect 200");
+    });
+    let proxy_uri = format!("http://{}", proxy.local_addr());
+    assert!(matches!(
+        AgentBuilder::new()
+            .proxy(&proxy_uri)
+            .expect("proxy")
+            .build()
+            .request(
+                Method::GET,
+                url::Url::parse("https://origin.test/").expect("https"),
+            )
+            .send(),
+        Err(NetError::Transport(TransportError::Tls(_)))
+    ));
+    proxy.assert_clean();
+
+    let denied = TestServer::start(|connection| {
+        connection.read_request();
+        connection
+            .write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n")
+            .expect("connect 403");
+    });
+    assert!(matches!(
+        AgentBuilder::new()
+            .proxy(&format!("http://{}", denied.local_addr()))
+            .expect("proxy")
+            .build()
+            .request(
+                Method::GET,
+                url::Url::parse("https://origin.test/").expect("https"),
+            )
+            .send(),
+        Err(NetError::Transport(TransportError::Connect(_)))
+    ));
+    denied.assert_clean();
+
+    let icy = TestServer::start(|connection| {
+        connection.read_request();
+        connection.write_all(b"ICY 200 OK\r\n\r\n").expect("icy");
+    });
+    assert!(matches!(
+        AgentBuilder::new()
+            .proxy(&format!("http://{}", icy.local_addr()))
+            .expect("proxy")
+            .build()
+            .request(
+                Method::GET,
+                url::Url::parse("https://origin.test/").expect("https"),
+            )
+            .send(),
+        Err(NetError::Transport(TransportError::Connect(_)))
+    ));
+    icy.assert_clean();
+
+    let wss = std::net::TcpListener::bind("127.0.0.1:0").expect("wss listener");
+    let wss_addr = wss.local_addr().expect("address");
+    let worker = std::thread::spawn(move || {
+        if let Ok((mut stream, _)) = wss.accept() {
+            use std::io::Write as _;
+            let _ = stream.write_all(b"NOT-TLS");
+        }
+    });
+    assert!(matches!(
+        Agent::new()
+            .request(
+                Method::GET,
+                url::Url::parse(&format!("wss://{wss_addr}/")).expect("wss"),
+            )
+            .upgrade(),
+        Err(NetError::Transport(TransportError::Tls(_))) | Err(NetError::Protocol(_))
+    ));
+    worker.join().expect("wss worker");
+}
+
+#[test]
+fn url_credentials_host_redirect_and_non_http_schemes_are_wire_visible() {
+    let server = TestServer::start(|connection| {
+        let request = connection.read_request();
+        assert_eq!(request.header("authorization"), Some("Basic dXNlcjpwYXNz"));
+        connection
+            .write_all(&canned_ok(&[], b"ok"))
+            .expect("auth response");
+    });
+    let mut url = server.url("/");
+    url.set_username("user").expect("username");
+    url.set_password(Some("pass")).expect("password");
+    Agent::new()
+        .request(Method::GET, url)
+        .send()
+        .expect("basic");
+    server.assert_clean();
+
+    let landing = TestServer::start(|connection| {
+        let request = connection.read_request();
+        assert_ne!(request.header("host"), Some("evil.example"));
+        assert!(request.header("content-length").is_none() || request.body.is_empty());
+        connection
+            .write_all(&canned_ok(&[], b"landed"))
+            .expect("landing");
+    });
+    let first = TestServer::start({
+        let location = format!("http://{}/landed", landing.local_addr());
+        move |connection| {
+            connection.read_request();
+            connection
+                .write_all(&canned_redirect(302, &location))
+                .expect("redirect");
+        }
+    });
+    Agent::new()
+        .request(Method::POST, first.url("/start"))
+        .header("Host", "evil.example")
+        .expect("host")
+        .header("Content-Length", "7")
+        .expect("length")
+        .body(b"field=1")
+        .send()
+        .expect("cross-origin host stripped");
+    first.assert_clean();
+    landing.assert_clean();
+
+    assert!(matches!(
+        Agent::new()
+            .request(Method::GET, url::Url::parse("ws://127.0.0.1/").expect("ws"))
+            .send(),
+        Err(NetError::Protocol(ProtocolError::RejectedRequest))
+    ));
 }

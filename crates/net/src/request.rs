@@ -1,5 +1,3 @@
-//! [`RequestBuilder`]: everything a dial carries, up to `send()` or `upgrade()`.
-
 use std::str::FromStr as _;
 
 use crate::agent::Agent;
@@ -11,11 +9,6 @@ use crate::response::Response;
 use crate::websocket::{self, WebSocket};
 use url::Url;
 
-/// A request under construction: method, absolute URL, headers, initiator
-/// [`Context`], optional body.
-///
-/// Built from [`Agent::request`]; finished with [`RequestBuilder::send`]
-/// (HTTP) or [`RequestBuilder::upgrade`] (WebSocket).
 #[derive(Debug)]
 pub struct RequestBuilder {
     agent: Agent,
@@ -40,82 +33,39 @@ impl RequestBuilder {
         }
     }
 
-    /// Add one request header, keeping case and insertion order.
-    ///
-    /// Duplicate names are legal and stay in order (RFC 9110 §5.2).
-    /// `User-Agent` set here suppresses the agent-level default instead of
-    /// stacking with it; additional request-level `User-Agent` entries
-    /// still append.
-    ///
-    /// # Errors
-    ///
-    /// [`HeaderError`] for invalid names or values — same grammar rules as
-    /// [`HeaderMap::insert`](crate::HeaderMap::insert).
     pub fn header(mut self, name: &str, value: &str) -> Result<Self, HeaderError> {
         self.headers.insert(name, value.as_bytes())?;
         Ok(self)
     }
 
-    /// Set the initiator context. Defaults to [`Context::Navigation`].
-    ///
-    /// [`RequestBuilder::upgrade`] forces [`Context::WsHandshake`] regardless
-    /// of this value (the finish path is the handshake).
     #[must_use]
     pub fn with_context(mut self, context: Context) -> Self {
         self.context = context;
         self
     }
 
-    /// Document URL used for schemeful same-site cookie checks
-    /// ([RFC 6265bis §5.2](https://httpwg.org/http-extensions/draft-ietf-httpbis-rfc6265bis.html#name-same-site-and-cross-site-re))
-    /// and, on [`RequestBuilder::upgrade`], the handshake `Origin` header.
-    ///
-    /// `None` (the default) means a first-party / embedder load: the request
-    /// is same-site with itself and no `Origin` is sent on upgrade.
-    /// `browser` sets this to the document URL for page-initiated dials.
     #[must_use]
     pub fn with_initiator(mut self, initiator: Url) -> Self {
         self.initiator = Some(initiator);
         self
     }
 
-    /// Attach a request body (any `POST`/`PUT`-style payload).
-    ///
-    /// Ignored by [`RequestBuilder::upgrade`] (the handshake is always GET
-    /// with no body).
     #[must_use]
     pub fn body(mut self, bytes: impl Into<Vec<u8>>) -> Self {
         self.body = Some(bytes.into());
         self
     }
 
-    /// The initiator context this request will carry on [`RequestBuilder::send`].
     #[must_use]
     pub fn context(&self) -> Context {
         self.context
     }
 
-    /// Dial, following redirects up to the agent's cap.
-    ///
-    /// Intermediate 301/302/303/307/308 hops with a `Location` are
-    /// followed ([fetch #http-redirect-fetch](https://fetch.spec.whatwg.org/#http-redirect-fetch));
-    /// a 3xx with no Location, or when the cap is 0, is itself the final
-    /// response. The HTTP status of that final response, including 3xx,
-    /// comes back as `Ok` (decision 02, statuses-as-data). Transport
-    /// failures and protocol violations arrive as `Err`.
-    ///
-    /// The fragment is stripped from each request line
-    /// ([fetch #http-network-or-cache-fetch](https://fetch.spec.whatwg.org/#http-network-or-cache-fetch))
-    /// and kept on [`Response::final_url`], inherited across hops when the
-    /// `Location` has none.
-    ///
-    /// # Errors
-    ///
-    /// [`NetError::Transport`] when the dial or socket fails;
-    /// [`NetError::Protocol`] when the peer speaks malformed HTTP, the
-    /// backend rejects the built request, or a `Location` is unusable;
-    /// [`NetError::Limit`] when a size or redirect cap fires.
+    // https://fetch.spec.whatwg.org/#http-redirect-fetch
     pub fn send(self) -> Result<Response, NetError> {
+        if !matches!(self.url.scheme(), "http" | "https") {
+            return Err(NetError::Protocol(ProtocolError::RejectedRequest));
+        }
         let mut method = self.method;
         let mut url = self.url;
         let mut headers = self.headers;
@@ -130,6 +80,7 @@ impl RequestBuilder {
             wire.set_fragment(None);
             let mut hop_headers = headers.clone();
             agent.prepare_outbound(&mut hop_headers, &url, context, &method, initiator.as_ref());
+            apply_url_credentials(&mut hop_headers, &url);
             let response = dispatch(
                 &agent,
                 &method,
@@ -176,18 +127,6 @@ impl RequestBuilder {
         }
     }
 
-    /// Open a WebSocket through the shared dial path.
-    ///
-    /// Forces GET and [`Context::WsHandshake`]. Cookie, agent `User-Agent`,
-    /// and `Origin` (when [`RequestBuilder::with_initiator`] was set) run
-    /// through the same [`Agent::prepare_outbound`] path as
-    /// [`RequestBuilder::send`]. Upgrade / `Sec-WebSocket-*` headers are
-    /// written at the tungstenite conversion point.
-    ///
-    /// # Errors
-    ///
-    /// [`NetError::Protocol`] for a non-`ws`/`wss` URL; transport/TLS
-    /// failures as usual.
     pub fn upgrade(self) -> Result<WebSocket, NetError> {
         if !matches!(self.url.scheme(), "ws" | "wss") {
             return Err(NetError::Protocol(ProtocolError::RejectedRequest));
@@ -213,8 +152,6 @@ impl RequestBuilder {
     }
 }
 
-/// 301/302/303/307/308 with a non-empty Location, per fetch's redirect
-/// status set. Other 3xx (300, 304, …) stay as the final response.
 fn followable_location(status: u16, headers: &HeaderMap) -> Result<Option<&str>, NetError> {
     if !matches!(status, 301 | 302 | 303 | 307 | 308) {
         return Ok(None);
@@ -230,8 +167,7 @@ fn followable_location(status: u16, headers: &HeaderMap) -> Result<Option<&str>,
     Ok(Some(location))
 }
 
-/// Resolve `Location` against the current URL and inherit the fragment
-/// when the redirect doesn't supply one (fetch #http-redirect-fetch).
+// https://fetch.spec.whatwg.org/#http-redirect-fetch
 fn resolve_location(current: &Url, location: &str) -> Result<Url, NetError> {
     let mut next = current
         .join(location)
@@ -247,7 +183,7 @@ fn resolve_location(current: &Url, location: &str) -> Result<Url, NetError> {
     Ok(next)
 }
 
-/// Method/body/header mutations for one hop (fetch #http-redirect-fetch).
+// https://fetch.spec.whatwg.org/#http-redirect-fetch
 fn apply_redirect_policy(
     status: u16,
     current: &Url,
@@ -261,16 +197,28 @@ fn apply_redirect_policy(
     if post_to_get || see_other {
         *method = Method::GET;
         *body = None;
-        // fetch "request-body-header name"
         headers.remove("content-encoding");
         headers.remove("content-language");
         headers.remove("content-location");
         headers.remove("content-type");
+        headers.remove("content-length");
+        headers.remove("transfer-encoding");
     }
     if current.origin() != next.origin() {
         headers.remove("authorization");
         headers.remove("cookie");
+        headers.remove("host");
     }
+}
+
+fn apply_url_credentials(headers: &mut HeaderMap, url: &Url) {
+    // https://fetch.spec.whatwg.org/#http-network-or-cache-fetch
+    if headers.get("authorization").is_some() || url.username().is_empty() {
+        return;
+    }
+    let value = crate::dial::basic_authorization(url.username(), url.password().unwrap_or(""));
+    headers.remove("authorization");
+    let _ = headers.insert("Authorization", value.as_bytes());
 }
 
 fn dispatch(
@@ -282,8 +230,6 @@ fn dispatch(
     context: Context,
     logical_url: Url,
 ) -> Result<Response, NetError> {
-    // ureq types appear only here and in `Response::from_backend` /
-    // `From<ureq::Error>` (decision 01).
     let mut builder = ureq::http::Request::builder()
         .method(
             ureq::http::Method::from_str(method.as_str())
@@ -294,8 +240,6 @@ fn dispatch(
     for (name, value) in headers.iter() {
         builder = builder.header(name, value);
     }
-    // ureq writes origin-form only. Forward-proxy credentials ride this
-    // header; CONNECT puts them on the CONNECT request in dial instead.
     if wire_url.scheme() == "http"
         && headers.get("proxy-authorization").is_none()
         && let Some(value) = crate::dial::proxy_basic_token(agent.proxy.as_deref())

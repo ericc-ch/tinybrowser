@@ -1,33 +1,31 @@
-# Handoff (2026-09-07)
+# Handoff (2026-09-08)
 
-## State
+State: `main` is `16c604cc5d2afa1f8f4c52fc3ceeacd90f9714ba` (`Finish test suite trim`). JS/WPT worktree `js-wpt-a3f8c2d1` was aborted and removed; nothing from it was merged. Local `wiki/` → `docs/` moves may still be uncommitted on this tree.
 
-`main` is at `2ba65c9` (`docs: refresh handoff`). The final test trim is in the working tree: the loopback suite keeps one wire-level custom-method case and no longer uses its shallow one-call helpers. The Nix-based workspace test, format, and clippy checks pass.
+Done:
 
-## Do next
+- Test-suite trim on `main`: `16c604cc5d2afa1f8f4c52fc3ceeacd90f9714ba` (commit on origin-tracking `main`; not re-run in this abort).
 
-1. Commit the final test trim.
-2. Continue the page-engine milestone: execute loaded `<script>` elements and add the first real DOM bindings to JS.
+In flight:
 
-Keep the compact public-boundary gates. If verification fails, repair those gates instead of restoring deleted one-off tests.
+- None. Discarded worktree had uncommitted TreeSink extract, `Rc<RefCell<Dom>>`, prelude wrappers, and a testharness boot that stubbed Window in the test instead of implementing it in the engine.
 
-## Remaining product work
+Next:
 
-- CLI `serve` and `fetch` commands are still stubs.
-- Loaded HTML does not execute script elements.
-- JS host is minimal: no DOM bindings beyond `document.cookie`, full Fetch/CORS, timer cancellation, or script execution budget.
-- WebIDL verification is designed but not implemented; no vendored webref snapshot, `weedle` harness, manifest diff, or CI gate exists yet.
-- Transport still has known limits around HTTP forward-proxy request form and deadline-bounded system DNS.
-- Current size probe is a page-engine checkpoint, not a finished browser-size claim.
+1. Split html5ever TreeSink out of `crates/browser/src/lib.rs` (mechanical; html5lib must stay green).
+2. Put the live `Dom` on `Page` in `Rc<RefCell<Dom>>` so host ops can touch the tree during `eval` (same reason cookies already use a cell).
+3. Grow the **engine** JS host: Rust owns the tree/net/timers; self-hosted prelude owns `window` / `Document` / `Node` / `Element` names. One `Element` type, not a rquickjs class per tag. Implement the Window/DOM APIs testharness needs **in that host**, not as test fakes.
+4. First gate: `Page::eval` WPT `testharness.js` + `idlharness.js`, inject `interfaces/dom.idl` as text (no WPT HTTP server, no full WPT checkout). Commit pass/fail snapshot. Almost all FAIL is success until rows go green (`getElementById`, then classic `<script>`).
+5. Do not generate IDL tests in Rust, do not codegen rquickjs classes, do not inject jsdom.
 
-## Deferred milestones
+Decisions made:
 
-- Full WPT harness once the JS/DOM surface is large enough.
-- Canonical Chrome-like h1/h2 + TLS transport on `btls`.
-- CDP crate/server and later profile persistence.
+- Oracle is WPT DOM idlharness, not a homegrown generator ([idlharness](https://web-platform-tests.org/writing-tests/idlharness.html)).
+- rquickjs stays `std` only (`docs/adrs/0007-engine-charter.md`).
+- Fake Window in the test wrapper is the wrong seam; testharness must see the page engine.
 
-## Test facts
+Gotchas:
 
-- html5lib expected run count: 3,549.
-- Accepted upstream divergences: 10.
-- Keep corpus/oracle tests and deterministic loopback transcripts; trim duplicated behavior matrices.
+- `JsHost` cannot take `&mut Page` from QuickJS callbacks; the tree must be a side cell like the cookie jar.
+- `Page::eval` today does not run HTML `<script>` nodes; that is after the first DOM surface, not a second WPT.
+- Work in a git worktree if implementing again; do not mix with the uncommitted docs path move.

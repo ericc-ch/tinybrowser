@@ -1,8 +1,6 @@
-mod common;
-
+use super::common::TestServer;
 use std::sync::{Arc, Mutex};
 
-use common::TestServer;
 use net::{AgentBuilder, Method, WsEvent, WsMessage};
 use tungstenite::protocol::frame::Frame;
 use tungstenite::protocol::frame::coding::{CloseCode, Data, OpCode};

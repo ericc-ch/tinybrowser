@@ -1,11 +1,3 @@
-//! RFC 6265bis cookie jar, above the transport.
-//!
-//! Storage and retrieval cite
-//! [draft-ietf-httpbis-rfc6265bis](https://httpwg.org/http-extensions/draft-ietf-httpbis-rfc6265bis.html)
-//! section anchors, not step numbers (AGENTS.md). The backend cookie
-//! feature stays off; `send()` is the only place that harvests
-//! `Set-Cookie` or emits `Cookie`.
-
 use std::collections::HashSet;
 use std::fmt;
 use std::sync::OnceLock;
@@ -16,9 +8,11 @@ use url::{Host, Url};
 use crate::context::Context;
 use crate::method::Method;
 
-/// 400-day lifetime cap
-/// ([§5.5](https://httpwg.org/http-extensions/draft-ietf-httpbis-rfc6265bis.html#name-cookie-lifetime-limits)).
+// https://httpwg.org/http-extensions/draft-ietf-httpbis-rfc6265bis.html#name-cookie-lifetime-limits
 const MAX_LIFETIME: Duration = Duration::from_hours(9600);
+// https://httpwg.org/http-extensions/draft-ietf-httpbis-rfc6265bis.html#name-storage-model
+const MAX_COOKIES_PER_DOMAIN: usize = 50;
+const MAX_COOKIES: usize = 3000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SameSite {
@@ -36,13 +30,13 @@ struct StoredCookie {
     domain: String,
     path: String,
     created: SystemTime,
+    last_access: SystemTime,
     host_only: bool,
     secure: bool,
     http_only: bool,
     same_site: SameSite,
 }
 
-/// In-memory cookie store. `Agent` wraps this in `Arc<Mutex<_>>`.
 #[derive(Clone, Default)]
 pub(crate) struct CookieJar {
     cookies: Vec<StoredCookie>,
@@ -56,8 +50,6 @@ impl fmt::Debug for CookieJar {
     }
 }
 
-/// Retrieval/storage inputs shared by HTTP `send()`, `document.cookie`, and
-/// the WebSocket handshake.
 #[derive(Clone, Copy)]
 pub(crate) struct CookieOp<'a> {
     pub url: &'a Url,
@@ -70,9 +62,7 @@ pub(crate) struct CookieOp<'a> {
 
 #[derive(Clone, Copy)]
 pub(crate) enum RetrievalKind {
-    /// `Cookie` request header.
     Http,
-    /// `document.cookie` / [`crate::Agent::cookies_for`].
     NonHttp,
 }
 
@@ -88,7 +78,10 @@ impl CookieJar {
             .retain(|old| !same_cookie_identity(old, &stored));
         self.cookies.push(stored);
         self.evict_expired(op.now);
+        self.evict_excess();
     }
+
+    pub(crate) fn cookie_string(&mut self, op: CookieOp<'_>) -> String {
 
     pub(crate) fn cookie_string(&mut self, op: CookieOp<'_>) -> String {
         self.evict_expired(op.now);
@@ -96,20 +89,28 @@ impl CookieJar {
             return String::new();
         };
         let path = op.url.path();
-
-        let mut matched: Vec<&StoredCookie> = self
+        let mut matched: Vec<usize> = self
             .cookies
             .iter()
-            .filter(|cookie| cookie.matches(&host, path, &op))
+            .enumerate()
+            .filter(|(_, cookie)| cookie.matches(&host, path, &op))
+            .map(|(i, _)| i)
             .collect();
-        matched.sort_by(|a, b| {
-            b.path
+        for &i in &matched {
+            self.cookies[i].last_access = op.now;
+        }
+        matched.sort_by(|&a, &b| {
+            let left = &self.cookies[a];
+            let right = &self.cookies[b];
+            right
+                .path
                 .len()
-                .cmp(&a.path.len())
-                .then_with(|| a.created.cmp(&b.created))
+                .cmp(&left.path.len())
+                .then_with(|| left.created.cmp(&right.created))
         });
         let mut out = String::new();
-        for (i, cookie) in matched.iter().enumerate() {
+        for (i, &idx) in matched.iter().enumerate() {
+            let cookie = &self.cookies[idx];
             if i > 0 {
                 out.push_str("; ");
             }
@@ -126,6 +127,55 @@ impl CookieJar {
         self.cookies
             .retain(|cookie| cookie.expiry.is_none_or(|exp| exp > now));
     }
+
+    fn evict_excess(&mut self) {
+        loop {
+            let Some(domain) = over_quota_domain(&self.cookies) else {
+                break;
+            };
+            if !evict_one(&mut self.cookies, Some(&domain)) {
+                break;
+            }
+        }
+        while self.cookies.len() > MAX_COOKIES {
+            if !evict_one(&mut self.cookies, None) {
+                break;
+            }
+        }
+    }
+}
+
+fn over_quota_domain(cookies: &[StoredCookie]) -> Option<String> {
+    let mut domains = HashSet::new();
+    for cookie in cookies {
+        domains.insert(cookie.domain.as_str());
+    }
+    domains.into_iter().find_map(|domain| {
+        let count = cookies.iter().filter(|c| c.domain == domain).count();
+        (count > MAX_COOKIES_PER_DOMAIN).then(|| domain.to_owned())
+    })
+}
+
+fn evict_one(cookies: &mut Vec<StoredCookie>, domain: Option<&str>) -> bool {
+    let victim = cookies
+        .iter()
+        .enumerate()
+        .filter(|(_, cookie)| domain.is_none_or(|d| cookie.domain == d))
+        .min_by(|(_, a), (_, b)| match (a.secure, b.secure) {
+            (false, true) => std::cmp::Ordering::Less,
+            (true, false) => std::cmp::Ordering::Greater,
+            _ => a
+                .last_access
+                .cmp(&b.last_access)
+                .then_with(|| a.created.cmp(&b.created)),
+        })
+        .map(|(i, _)| i);
+    if let Some(i) = victim {
+        cookies.remove(i);
+        true
+    } else {
+        false
+    }
 }
 
 struct ParsedSetCookie {
@@ -141,7 +191,7 @@ struct ParsedSetCookie {
 }
 
 fn parse_set_cookie(input: &str) -> Option<ParsedSetCookie> {
-    // §5.6: CTL excluding HTAB aborts the whole string.
+    // https://httpwg.org/http-extensions/draft-ietf-httpbis-rfc6265bis.html#name-cookie-parsing
     if input.bytes().any(|b| (b < 0x20 && b != b'\t') || b == 0x7F) {
         return None;
     }
@@ -185,8 +235,6 @@ fn parse_set_cookie(input: &str) -> Option<ParsedSetCookie> {
             None => (av, ""),
         };
         if aname.eq_ignore_ascii_case("Max-Age") {
-            // Ignore this cookie-av on parse failure; do not clear a prior
-            // Max-Age in the same header (RFC 6265bis storage model).
             if let Ok(n) = avalue.parse::<i64>() {
                 parsed.max_age = Some(n);
             }
@@ -273,6 +321,7 @@ fn receive_cookie(
             domain,
             path,
             created: old.created,
+            last_access: now,
             host_only,
             secure,
             http_only,
@@ -286,6 +335,7 @@ fn receive_cookie(
         domain,
         path,
         created: now,
+        last_access: now,
         host_only,
         secure,
         http_only,
@@ -313,15 +363,22 @@ fn cookie_scope(
     request_url: &Url,
     host: &str,
 ) -> Option<(bool, String, String, Option<String>)> {
-    let domain_attr = parsed.domain.clone().unwrap_or_default();
+    let mut domain_attr = match parsed.domain.as_deref() {
+        Some(raw) => canonicalize_domain_attr(raw)?,
+        None => String::new(),
+    };
     if !domain_attr.is_empty() {
-        if domain_attr.bytes().any(|b| b > 127) {
-            return None;
-        }
-        if is_public_suffix(&domain_attr) {
-            return None;
-        }
-        if !domain_match(host, &domain_attr) {
+        if is_ip(host) {
+            if domain_attr != host {
+                return None;
+            }
+            domain_attr.clear();
+        } else if is_public_suffix(&domain_attr) {
+            if domain_attr != host {
+                return None;
+            }
+            domain_attr.clear();
+        } else if !domain_match(host, &domain_attr) {
             return None;
         }
     }
@@ -361,13 +418,12 @@ fn cookie_prefixes_ok(
     host_only: bool,
     path_attr: Option<&str>,
 ) -> bool {
-    let lname = parsed.name.to_ascii_lowercase();
-    let lvalue = parsed.value.to_ascii_lowercase();
-    let prefix = if lname.is_empty() {
-        lvalue.as_str()
-    } else {
-        lname.as_str()
-    };
+    // https://httpwg.org/http-extensions/draft-ietf-httpbis-rfc6265bis.html#name-storage-model
+    if parsed.name.is_empty() {
+        let lvalue = parsed.value.to_ascii_lowercase();
+        return !lvalue.starts_with("__secure-") && !lvalue.starts_with("__host-");
+    }
+    let prefix = parsed.name.to_ascii_lowercase();
     if prefix.starts_with("__secure-") && !secure {
         return false;
     }
@@ -385,6 +441,9 @@ impl StoredCookie {
             domain_match(host, &self.domain)
         };
         if !host_ok {
+            return false;
+        }
+        if !self.host_only && is_public_suffix(&self.domain) {
             return false;
         }
         if !path_match(request_path, &self.path) {
@@ -434,7 +493,6 @@ fn is_same_site_request(initiator: Option<&Url>, target: &Url) -> bool {
     }
 }
 
-/// Scheme plus registrable domain (PSL stand-in).
 fn schemeful_same_site(a: &Url, b: &Url) -> bool {
     site_tuple(a) == site_tuple(b)
 }
@@ -462,12 +520,9 @@ fn registrable_domain(host: &str) -> String {
     format!("{label}.{suffix}")
 }
 
-/// Vendored PSL (<https://publicsuffix.org/list/public_suffix_list.dat>), no crate.
-/// Matching: exception, then longest rule, then implicit `*`.
-/// `localhost` is not a suffix so host-only cookies still store.
 fn is_public_suffix(domain: &str) -> bool {
     let d = domain.trim_matches('.').to_ascii_lowercase();
-    if d == "localhost" || d.is_empty() {
+    if d.is_empty() {
         return false;
     }
     public_suffix(&d) == d
@@ -536,7 +591,7 @@ fn public_suffix(host: &str) -> String {
     labels[labels.len() - 1].to_owned()
 }
 
-/// [§5.1.3](https://httpwg.org/http-extensions/draft-ietf-httpbis-rfc6265bis.html#section-5.1.3)
+// https://httpwg.org/http-extensions/draft-ietf-httpbis-rfc6265bis.html#section-5.1.3
 pub(crate) fn domain_match(host: &str, domain: &str) -> bool {
     if host.eq_ignore_ascii_case(domain) {
         return true;
@@ -551,7 +606,7 @@ pub(crate) fn domain_match(host: &str, domain: &str) -> bool {
         && host.as_bytes()[host.len() - domain.len() - 1] == b'.'
 }
 
-/// [§5.1.4](https://httpwg.org/http-extensions/draft-ietf-httpbis-rfc6265bis.html#section-5.1.4)
+// https://httpwg.org/http-extensions/draft-ietf-httpbis-rfc6265bis.html#section-5.1.4
 pub(crate) fn path_match(request_path: &str, cookie_path: &str) -> bool {
     if request_path == cookie_path {
         return true;
@@ -584,24 +639,46 @@ fn canonicalize_host(url: &Url) -> Option<String> {
     }
 }
 
+fn canonicalize_domain_attr(raw: &str) -> Option<String> {
+    let stripped = raw.strip_prefix('.').unwrap_or(raw);
+    if stripped.len() > 1024 {
+        return None;
+    }
+    match Host::parse(stripped).ok()? {
+        Host::Domain(d) => Some(d),
+        Host::Ipv4(ip) => Some(ip.to_string()),
+        Host::Ipv6(ip) => Some(ip.to_string()),
+    }
+}
+
 fn is_ip(host: &str) -> bool {
     host.parse::<std::net::IpAddr>().is_ok()
 }
 
 fn is_secure_url(url: &Url) -> bool {
-    url.scheme() == "https" || url.scheme() == "wss"
+    // https://html.spec.whatwg.org/multipage/webappapis.html#secure-contexts
+    if url.scheme() == "https" || url.scheme() == "wss" {
+        return true;
+    }
+    if url.scheme() != "http" && url.scheme() != "ws" {
+        return false;
+    }
+    match url.host() {
+        Some(Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(Host::Ipv6(ip)) => ip.is_loopback(),
+        Some(Host::Domain(d)) => {
+            let d = d.trim_end_matches('.').to_ascii_lowercase();
+            d == "localhost" || d.ends_with(".localhost")
+        }
+        None => false,
+    }
 }
 
 fn has_ctl_excluding_htab(s: &str) -> bool {
     s.bytes().any(|b| (b < 0x20 && b != b'\t') || b == 0x7F)
 }
 
-/// Cookie-date parse
-/// ([RFC 6265bis §5.1.1](https://httpwg.org/http-extensions/draft-ietf-httpbis-rfc6265bis.html#name-dates)).
-///
-/// Splits on the spec delimiter octet set, then picks time / day / month /
-/// year from each token. Year-value 70–99 adds 1900, 0–69 adds 2000; year
-/// below 1601 and dates that do not exist abort.
+// https://httpwg.org/http-extensions/draft-ietf-httpbis-rfc6265bis.html#name-dates
 fn parse_cookie_date(s: &str) -> Option<SystemTime> {
     let mut hour = None;
     let mut min = None;
@@ -653,7 +730,6 @@ fn parse_cookie_date(s: &str) -> Option<SystemTime> {
     civil_to_system(year, month, day, hour, min, sec)
 }
 
-/// `delimiter` in RFC 6265bis §5.1.1 (`%x09 / %x20-2F / %x3B-40 / %x5B-60 / %x7B-7E`).
 fn is_cookie_date_delimiter(b: u8) -> bool {
     matches!(b, 0x09 | 0x20..=0x2F | 0x3B..=0x40 | 0x5B..=0x60 | 0x7B..=0x7E)
 }
@@ -665,8 +741,6 @@ fn cookie_date_tokens(s: &str) -> impl Iterator<Item = &str> {
         .map(|chunk| std::str::from_utf8(chunk).unwrap_or(""))
 }
 
-/// `1*2DIGIT [ non-digit *OCTET ]`. A leftover leading digit means the
-/// token is not a day (so `1994` is a year, not day 19).
 fn parse_day_token(token: &str) -> Option<u32> {
     let (n, rest) = take_ascii_digits(token.as_bytes(), 1, 2)?;
     if rest.first().is_some_and(u8::is_ascii_digit) {
@@ -692,8 +766,6 @@ fn parse_time_token(token: &str) -> Option<(u32, u32, u32)> {
     ))
 }
 
-/// `2*4DIGIT [ non-digit *OCTET ]`, then the 0–69 / 70–99 century rule
-/// on the numeric year-value.
 fn parse_year_token(token: &str) -> Option<i32> {
     let (n, rest) = take_ascii_digits(token.as_bytes(), 2, 4)?;
     if rest.first().is_some_and(u8::is_ascii_digit) {
@@ -721,8 +793,6 @@ fn take_ascii_digits(bytes: &[u8], min: usize, max: usize) -> Option<(i32, &[u8]
 }
 
 fn month_num(m: &str) -> Option<u32> {
-    // First three octets, ASCII-folded. Byte indexing avoids panicking on
-    // a mid-codepoint slice of a hostile Expires month token.
     let b = m.as_bytes();
     if b.len() < 3 {
         return None;

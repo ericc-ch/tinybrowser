@@ -1,6 +1,4 @@
-mod common;
-
-use common::TestServer;
+use super::common::TestServer;
 use net::{Agent, Context, Method};
 
 fn response(set_cookies: &[&str], body: &[u8]) -> Vec<u8> {
@@ -56,9 +54,15 @@ fn http_cookies_scope_by_path_and_visibility() {
         .expect("unscoped");
 
     let recorded = server.requests();
-    assert_eq!(recorded[1].header("cookie"), Some("sid=1; hidden=2; lax=3"));
-    assert_eq!(recorded[2].header("cookie"), Some("hidden=2; lax=3"));
-    assert_eq!(agent.cookies_for(&root), "lax=3");
+    assert_eq!(
+        recorded[1].header("cookie"),
+        Some("sid=1; hidden=2; lax=3; secure=4")
+    );
+    assert_eq!(
+        recorded[2].header("cookie"),
+        Some("hidden=2; lax=3; secure=4")
+    );
+    assert_eq!(agent.cookies_for(&root), "lax=3; secure=4");
     server.assert_clean();
 }
 
@@ -140,4 +144,39 @@ fn cookie_security_prefixes_expiry_and_public_suffixes_are_enforced() {
     let s3 = url::Url::parse("https://evil.s3.amazonaws.com/obj").expect("s3");
     agent.set_cookie("bucket=1; Path=/; Domain=s3.amazonaws.com", &s3);
     assert!(agent.cookies_for(&s3).is_empty());
+
+    let pages = url::Url::parse("https://github.io/").expect("pages");
+    agent.set_cookie("id=1; Path=/; Domain=github.io", &pages);
+    assert_eq!(agent.cookies_for(&pages), "id=1");
+    assert!(
+        agent
+            .cookies_for(&url::Url::parse("https://foo.github.io/").expect("sub"))
+            .is_empty()
+    );
+
+    agent.set_cookie("__Secure-x; Path=/; Secure", &https);
+    assert_eq!(agent.cookies_for(&https), "__Secure-a=2; __Host-b=3");
+
+    let localhost = url::Url::parse("http://localhost/app").expect("localhost");
+    agent.set_cookie("dev=1; Path=/; Secure", &localhost);
+    assert_eq!(agent.cookies_for(&localhost), "dev=1");
+
+    let ip = url::Url::parse("http://127.0.0.1/").expect("ip");
+    agent.set_cookie("a=1; Path=/; Domain=127.0.0.1", &ip);
+    assert_eq!(agent.cookies_for(&ip), "a=1");
+    agent.set_cookie("b=1; Path=/; Domain=192.0.2.1", &ip);
+    assert_eq!(agent.cookies_for(&ip), "a=1");
+
+    let idn = url::Url::parse("https://xn--mnchen-3ya.de/").expect("idn");
+    agent.set_cookie("c=1; Path=/; Domain=münchen.de", &idn);
+    assert_eq!(agent.cookies_for(&idn), "c=1");
+
+    let quota = url::Url::parse("https://quota.example/").expect("quota");
+    for i in 0..51 {
+        agent.set_cookie(&format!("n{i}={i}; Path=/"), &quota);
+    }
+    let listed = agent.cookies_for(&quota);
+    assert_eq!(listed.split("; ").count(), 50);
+    assert!(!listed.contains("n0="));
+    assert!(listed.contains("n50="));
 }

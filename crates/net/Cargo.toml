@@ -7,15 +7,7 @@ edition.workspace = true
 workspace = true
 
 [dependencies]
-# ADR 0006: v1 transport is bare ureq 3 + native-tls. Default features stay
-# OFF: no cookies (we own the jar above the transport, ticket 13), no
-# charset decoding (rejected by decision 02 — keeps encoding_rs out of the
-# binary). native-tls is never auto-selected by ureq; AgentBuilder::build
-# sets TlsProvider::NativeTls at the conversion point.
 ureq = { version = "3", default-features = false, features = ["native-tls"] }
 native-tls = "0.2"
-# Decision 06: framing only; we dial TLS ourselves (ticket 14).
 tungstenite = { version = "0.26", default-features = false, features = ["handshake"] }
-# Decision 04: servo's url crate at the entry; relative resolution lives in
-# browser, net only ever sees absolute URLs.
 url = "2"

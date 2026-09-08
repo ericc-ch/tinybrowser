@@ -1,29 +1,20 @@
-We are building the smallest headless browser for AI agents.
-Single binary, no cheating, no sidecar processes.
-Sub-5MB stripped x86_64 binary is the goal. Measure size at milestones.
-Prefer the light path that stays fast for one page: our HTML job list, Tokio only as the waiter, not a web-server stack.
+# tinybrowser
 
-## Working rules
+We build a headless browser for AI agents as a single binary without sidecar processes. Dynamic linking for standard system libraries like libc and OpenSSL is fine. The target binary size is under 5MB stripped on x86_64. Measure binary size at milestones.
 
-- `unsafe` is forbidden by default. Reach for it only after a safe design is proven impossible; prove it by attempting it, not by assuming it can't exist.
-- Every `unsafe` block carries a `// SAFETY:` comment spelling out the invariant that makes it sound (the linter already rejects missing ones).
-- Never silence the compiler or a lint to make an error go away. When a check fires, find the design flaw it points at and fix that. An `#[allow]`/`unwrap`-style escape needs a written justification at the same spot and is a last resort.
-- Breaking changes and full rewrites are always fine. When code fights you, assume it is wrong: zoom out, fix the design, don't patch around it.
-- Web-platform behavior is defined by the WHATWG specs. When implementing or reviewing a conformance claim, cite the governing spec section right where it is implemented (anchor links, e.g. `dom.spec.whatwg.org/#concept-node-ensure-pre-insert-validity`).
-- For engine ground truth on how browsers actually behave, read Firefox's implementation: fetch single files from `github.com/mozilla-firefox/firefox` (via `raw.githubusercontent.com`) or search [searchfox.org](https://searchfox.org). Never clone that repo, it is far too big.
-- One OS thread owns a page (`Dom`, later JS). That thread runs HTML jobs from a queue we own (parse, script, timer, `fetch` callback). The thread is a Tokio **current-thread** runtime with features `rt` and `time` only. Waiting on the network is `spawn_blocking` around `Agent::send()`, never a blocking `send()` on the page thread.
-- Do not add tokio `full`, smol, axum, or hyper. Those are a fat scheduler or HTTP *server* stacks. We are not a website. CDP, when it exists, is a thin socket on `std::net` unless a milestone proves otherwise. Size numbers: [`wiki/researches/size-budget.md`](wiki/researches/size-budget.md). Crate and loop decisions: [`wiki/adrs/0007-engine-charter.md`](wiki/adrs/0007-engine-charter.md).
+## Working Rules
 
-## Environment
+- Avoid `unsafe`. Use `unsafe` only after proving a safe design is impossible. Document every `unsafe` block with a `// SAFETY:` comment that explains the invariant.
+- Fix compiler errors and lints at the root cause. Do not silence checks with `#[allow]` or unwrap calls. If an escape is unavoidable, explain the reason in a comment.
+- Redesign code that resists changes instead of patching around flaws. Full rewrites are welcome.
+- Keep dependencies small. Do not add server frameworks or heavy async runtimes like full Tokio. See [docs/adrs/0007-engine-charter.md](docs/adrs/0007-engine-charter.md).
+- Run network calls with `spawn_blocking`. Do not block the page thread.
+- Follow WHATWG specifications for web platform behavior. Link to the exact spec section in comments next to the code.
+- Check Firefox for real-world browser behavior. Inspect single files through [searchfox.org](https://searchfox.org) or `raw.githubusercontent.com`. Do not clone the repository.
+- Run `git submodule update --init --recursive` before running tests in `crates/browser`.
 
-- The pinned toolchain (rustc/cargo 1.98, rustfmt, clippy) and the OpenSSL that
-  `native-tls` links against come from the nix flake devshell (`flake.nix`,
-  `rust-toolchain.toml`). Run cargo inside it: `nix develop --command cargo …`
-  (or `direnv allow` once, since `.envrc` runs `use flake`). The repo edition is
-  2024, so the system's stock toolchain may be too old outside the devshell.
-- `cargo test -p browser` needs the vendored html5lib suite; initialize it with
-  `git submodule update --init --recursive`.
+## Reference
 
-## Further Reading
-
-- [`wiki/README.md`](wiki/README.md) — terms, ADRs, size/testing notes
+- Read [docs/CONTEXT.md](docs/CONTEXT.md) for domain terms.
+- Read [docs/adrs/](docs/adrs/) for architectural decisions.
+- Read [docs/researches/size-budget.md](docs/researches/size-budget.md) for size tracking.
