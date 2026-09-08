@@ -3,6 +3,7 @@ members = [
     "crates/browser",
     "crates/dom",
     "crates/net",
+    "crates/webdriver",
 ]
 
 [workspace.package]
@@ -13,6 +14,7 @@ edition = "2024"
 browser = { path = "crates/browser" }
 dom = { path = "crates/dom" }
 net = { path = "crates/net" }
+webdriver = { path = "crates/webdriver" }
 
 [package]
 name = "tinybrowser"
@@ -24,6 +26,7 @@ workspace = true
 
 [dependencies]
 browser = { workspace = true }
+webdriver = { workspace = true }
 
 # ─── Lints ────────────────────────────────────────────────────────────────────
 # Strict (not strict-strict): `all` is error, `pedantic`/`cargo` are warnings.

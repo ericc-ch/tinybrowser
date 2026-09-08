@@ -1,0 +1,15 @@
+[project]
+name = "tinybrowser-wpt"
+version = "0.1.0"
+description = "wptrunner product plugin for tinybrowser"
+requires-python = ">=3.10"
+
+[project.entry-points."wptrunner.products"]
+tinybrowser = "tinybrowser_wpt:load"
+
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = ["tinybrowser_wpt"]

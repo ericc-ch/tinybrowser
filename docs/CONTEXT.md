@@ -76,3 +76,15 @@ _Avoid_: scope (dom selector root), initiator (the document URL passed separatel
 **Conversion point**:
 The few places inside `net` that talk to a backend crate (`AgentBuilder::build`, `RequestBuilder::send`, `RequestBuilder::upgrade`, `Response::from_backend`, `From<ureq::Error>`, `dial::open`, `NetConnector`); nowhere else may mention ureq, native-tls, or tungstenite types.
 _Avoid_: adapter, wrapper, FFI boundary
+
+**Host object**:
+A page-JS object whose identity and methods are Rust (rquickjs class wrapping a `NodeId` or other page-owned handle). WebIDL interfaces with branding, tree mutation, or a host resource are host objects. ECMAScript-only sugar on top of them may be JS.
+_Avoid_: polyfill, binding glue, wrapper (those mix host objects with JS-written APIs)
+
+**WebDriver**:
+W3C HTTP automation protocol. This is how wptrunner loads a real document and collects testharness results (`./wpt run tinybrowser …`).
+_Avoid_: CDP (that is the later agent-facing protocol, not the WPT driver)
+
+**WPT gate**:
+web-platform-tests is the suite for web-visible behavior (DOM, HTML, fetch, cookies, WebSocket as JS sees them). A parallel browser-crate JS/DOM suite is not kept once testharness runs through WebDriver.
+_Avoid_: “WPT covers net” (it does not import `net::Agent`; transport unit tests are a different layer)

@@ -7,7 +7,7 @@ use std::marker::PhantomData;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use crate::id::NodeId;
-use crate::node::{Attribute, Node, NodeKind, QualName, html_namespace};
+use crate::node::{Attribute, LocalName, Namespace, Node, NodeKind, QualName, html_namespace};
 
 /// Next document id for a freshly constructed [`Dom`]. Relaxed arithmetic is
 /// enough: the only requirement is that two live `Dom` values do not share
@@ -742,6 +742,57 @@ impl Dom {
                 attributes.push(attr);
             }
         }
+        Ok(())
+    }
+
+    /// The value of the unnamespaced attribute `local` on element `id`.
+    ///
+    /// [DOM getAttribute](https://dom.spec.whatwg.org/#dom-element-getattribute)
+    /// after HTML’s ASCII-lowercase name conversion
+    /// ([HTML attribute names](https://html.spec.whatwg.org/multipage/syntax.html#syntax-attribute-name)).
+    #[must_use]
+    pub fn attribute(&self, id: NodeId, local: &str) -> Option<String> {
+        match self.get(id).map(|node| node.kind()) {
+            Some(NodeKind::Element { attributes, .. }) => attributes.iter().find_map(|attribute| {
+                (attribute.name.ns.is_empty()
+                    && attribute.name.local.as_ref().eq_ignore_ascii_case(local))
+                .then(|| attribute.value.clone())
+            }),
+            _ => None,
+        }
+    }
+
+    /// Sets the unnamespaced attribute `local` on element `id`, replacing a
+    /// same-name attribute if one exists.
+    ///
+    /// [DOM setAttribute](https://dom.spec.whatwg.org/#dom-element-setattribute)
+    ///
+    /// # Errors
+    ///
+    /// - [`DomError::StaleNode`] if `id` is stale.
+    /// - [`DomError::WrongNodeType`] if `id` is not an element.
+    pub fn set_attribute(
+        &mut self,
+        id: NodeId,
+        local: &str,
+        value: impl Into<String>,
+    ) -> Result<(), DomError> {
+        let node = self.node_mut(id).ok_or(DomError::StaleNode)?;
+        let NodeKind::Element { attributes, .. } = &mut node.kind else {
+            return Err(DomError::WrongNodeType);
+        };
+        let value = value.into();
+        if let Some(existing) = attributes.iter_mut().find(|attribute| {
+            attribute.name.ns.is_empty()
+                && attribute.name.local.as_ref().eq_ignore_ascii_case(local)
+        }) {
+            existing.value = value;
+            return Ok(());
+        }
+        attributes.push(Attribute {
+            name: QualName::new(None, Namespace::from(""), LocalName::from(local)),
+            value,
+        });
         Ok(())
     }
 

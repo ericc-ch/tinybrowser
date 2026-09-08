@@ -3,9 +3,11 @@
 //! [ADR 0007](../../../wiki/adrs/0007-engine-charter.md): the page thread is
 //! Tokio `rt`+`time` only. `Agent::send` runs on `spawn_blocking`.
 
+use std::cell::{Ref, RefCell};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::future::{Future, pending, poll_fn};
+use std::rc::Rc;
 use std::task::Poll;
 use std::time::Duration;
 
@@ -15,7 +17,10 @@ use tokio::task::JoinSet;
 use tokio::time::{Instant, sleep_until};
 use url::Url;
 
+use crate::js::{ClassicScript, World, collect_classic_scripts};
 use crate::{Parsed, parse_html};
+
+pub use crate::js::ScriptValue;
 
 /// Upper bound on a host-fetch / navigation body read inside `spawn_blocking`.
 const FETCH_BODY_LIMIT: usize = 1_048_576;
@@ -123,6 +128,11 @@ enum QueuedDial {
         id: i32,
         epoch: u64,
     },
+    ClassicScript {
+        url: Url,
+        initiator: Url,
+        epoch: u64,
+    },
 }
 
 #[derive(Clone, Copy)]
@@ -130,6 +140,7 @@ enum DialKind {
     Fetch,
     Navigate,
     JsFetch,
+    ClassicScript,
 }
 
 struct CompletedDial {
@@ -147,6 +158,7 @@ struct CompletedDial {
 struct DialFail {
     js_fetch_id: Option<i32>,
     js_epoch: Option<u64>,
+    classic_script: bool,
 }
 
 struct HostTimer {
@@ -158,7 +170,7 @@ struct HostTimer {
 /// One browsing context: tree, cookie jar via [`Agent`], HTML job list.
 pub struct Page {
     agent: Agent,
-    parsed: Option<Parsed>,
+    world: Rc<RefCell<World>>,
     document_url: Url,
     content_language: Option<String>,
     jobs: VecDeque<HtmlJob>,
@@ -171,6 +183,8 @@ pub struct Page {
     js_timer_slots: HashMap<u32, i32>,
     nav_epoch: u64,
     js_epoch: u64,
+    pending_classic: VecDeque<ClassicScript>,
+    classic_fetch_in_flight: bool,
 }
 
 impl Default for Page {
@@ -201,10 +215,14 @@ impl Page {
     /// Only if `about:blank` fails to parse, which is a URL-crate defect.
     #[must_use]
     pub fn with_agent(agent: Agent) -> Self {
+        let document_url = Url::parse("about:blank").expect("about:blank is a valid URL");
         Self {
+            world: Rc::new(RefCell::new(World::new(
+                agent.clone(),
+                document_url.clone(),
+            ))),
             agent,
-            parsed: None,
-            document_url: Url::parse("about:blank").expect("about:blank is a valid URL"),
+            document_url,
             content_language: None,
             jobs: VecDeque::new(),
             timers: Vec::new(),
@@ -216,13 +234,15 @@ impl Page {
             js_timer_slots: HashMap::new(),
             nav_epoch: 0,
             js_epoch: 0,
+            pending_classic: VecDeque::new(),
+            classic_fetch_in_flight: false,
         }
     }
 
     /// Last parse result, if any.
     #[must_use]
-    pub fn parsed(&self) -> Option<&Parsed> {
-        self.parsed.as_ref()
+    pub fn parsed(&self) -> Option<Ref<'_, Parsed>> {
+        Ref::filter_map(self.world.borrow(), |world| world.parsed.as_ref()).ok()
     }
 
     /// Document URL after navigation (cookie initiator and relative-URL base).
@@ -236,16 +256,13 @@ impl Page {
     /// a tree exists.
     #[must_use]
     pub fn content_language(&self) -> Option<&str> {
-        self.parsed
-            .as_ref()
-            .and_then(|parsed| parsed.dom.document_language())
-            .or(self.content_language.as_deref())
+        self.content_language.as_deref()
     }
 
     /// Records the document-level `Content-Language` default.
     pub fn set_content_language(&mut self, value: Option<String>) {
         self.content_language.clone_from(&value);
-        if let Some(parsed) = &mut self.parsed {
+        if let Some(parsed) = self.world.borrow_mut().parsed.as_mut() {
             parsed.dom.set_document_language(value);
         }
     }
@@ -256,12 +273,16 @@ impl Page {
         self.queued_dials
             .retain(|dial| !matches!(dial, QueuedDial::Navigate { .. }));
         self.reset_js_realm();
-        self.parsed = Some(parse_html(input));
-        if let Some(parsed) = &mut self.parsed {
-            parsed
-                .dom
-                .set_document_language(self.content_language.clone());
+        {
+            let mut world = self.world.borrow_mut();
+            world.replace_document(parse_html(input));
+            if let Some(parsed) = world.parsed.as_mut() {
+                parsed
+                    .dom
+                    .set_document_language(self.content_language.clone());
+            }
         }
+        self.boot_document();
     }
 
     /// Sets the document URL used as cookie initiator and relative-URL base.
@@ -272,9 +293,7 @@ impl Page {
     pub fn set_document_url(&mut self, url: &str) -> Result<(), PageError> {
         self.document_url =
             Url::parse(url).map_err(|_| PageError::InvalidUrl { spec: url.into() })?;
-        if let Some(js) = &self.js {
-            js.set_document_url(self.document_url.clone());
-        }
+        self.world.borrow_mut().document_url = self.document_url.clone();
         Ok(())
     }
 
@@ -345,16 +364,26 @@ impl Page {
     ///
     /// [`PageError::Script`] when the engine cannot start or the script throws.
     pub fn eval(&mut self, source: &str) -> Result<String, PageError> {
-        if self.js.is_none() {
-            self.js = Some(crate::js::JsHost::new(
-                self.agent.clone(),
-                self.document_url.clone(),
-            )?);
-        }
+        self.ensure_js()?;
         let Some(js) = self.js.as_ref() else {
             return Err(PageError::Script(ScriptFailure::HostMissing));
         };
         let out = js.eval(source).map_err(PageError::from);
+        self.adopt_js_work();
+        out
+    }
+
+    /// Evaluates `source` and returns a structured JS value for `WebDriver`.
+    ///
+    /// # Errors
+    ///
+    /// [`PageError::Script`] when the engine cannot start or the script throws.
+    pub fn execute_script(&mut self, source: &str) -> Result<ScriptValue, PageError> {
+        self.ensure_js()?;
+        let Some(js) = self.js.as_ref() else {
+            return Err(PageError::Script(ScriptFailure::HostMissing));
+        };
+        let out = js.eval_value(source).map_err(PageError::from);
         self.adopt_js_work();
         out
     }
@@ -396,7 +425,8 @@ impl Page {
     }
 
     fn base_url(&self) -> Url {
-        let Some(parsed) = &self.parsed else {
+        let world = self.world.borrow();
+        let Some(parsed) = world.parsed.as_ref() else {
             return self.document_url.clone();
         };
         let Ok(Some(base_el)) = parsed.dom.select_first(parsed.dom.document(), "base[href]") else {
@@ -507,12 +537,26 @@ impl Page {
                     None,
                     Some(epoch),
                 ),
+                QueuedDial::ClassicScript {
+                    url,
+                    initiator,
+                    epoch,
+                } => (
+                    DialKind::ClassicScript,
+                    url,
+                    Context::Fetch,
+                    None,
+                    initiator,
+                    None,
+                    Some(epoch),
+                ),
             };
             let agent = self.agent.clone();
             self.fetches.spawn_blocking(move || {
                 let fail = DialFail {
                     js_fetch_id,
                     js_epoch,
+                    classic_script: matches!(kind, DialKind::ClassicScript),
                 };
                 let response = agent
                     .request(Method::GET, url)
@@ -565,6 +609,15 @@ impl Page {
             let body = String::from_utf8_lossy(&done.body);
             self.settle_js_fetch(id, true, i32::from(done.status), &body);
         }
+        if matches!(done.kind, DialKind::ClassicScript) && done.js_epoch == Some(self.js_epoch) {
+            self.classic_fetch_in_flight = false;
+            self.pending_classic.pop_front();
+            if (200..300).contains(&done.status) {
+                let source = String::from_utf8_lossy(&done.body);
+                self.eval_classic(&source);
+            }
+            self.advance_classic_scripts();
+        }
         self.adopt_js_work();
     }
 
@@ -575,18 +628,28 @@ impl Page {
         {
             self.settle_js_fetch(id, false, 0, "");
         }
+        if fail.classic_script && fail.js_epoch == Some(self.js_epoch) {
+            self.classic_fetch_in_flight = false;
+            self.pending_classic.pop_front();
+            self.advance_classic_scripts();
+        }
         self.adopt_js_work();
     }
 
     fn apply_navigation(&mut self, final_url: Url, content_language: Option<String>, body: &[u8]) {
         self.reset_js_realm();
         let html = String::from_utf8_lossy(body);
-        self.document_url = final_url;
+        self.document_url = final_url.clone();
         self.content_language.clone_from(&content_language);
-        self.parsed = Some(parse_html(&html));
-        if let Some(parsed) = &mut self.parsed {
-            parsed.dom.set_document_language(content_language);
+        {
+            let mut world = self.world.borrow_mut();
+            world.document_url = final_url;
+            world.replace_document(parse_html(&html));
+            if let Some(parsed) = world.parsed.as_mut() {
+                parsed.dom.set_document_language(content_language);
+            }
         }
+        self.boot_document();
     }
 
     fn settle_js_fetch(&mut self, id: i32, ok: bool, status: i32, body: &str) {
@@ -632,7 +695,27 @@ impl Page {
             .as_ref()
             .map(crate::js::JsHost::take_pending_fetches)
             .unwrap_or_default();
+        let cancels: HashSet<i32> = self
+            .js
+            .as_ref()
+            .map(crate::js::JsHost::take_pending_cancels)
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+        for js_id in &cancels {
+            if let Some(page_id) = self
+                .js_timer_slots
+                .iter()
+                .find_map(|(&page_id, &id)| (id == *js_id).then_some(page_id))
+            {
+                self.js_timer_slots.remove(&page_id);
+                self.timers.retain(|timer| timer.id != page_id);
+            }
+        }
         for timeout in timeouts {
+            if cancels.contains(&timeout.js_id) {
+                continue;
+            }
             let id = self.schedule_timer(timeout.delay);
             self.js_timer_slots.insert(id, timeout.js_id);
         }
@@ -654,13 +737,87 @@ impl Page {
 
     fn reset_js_realm(&mut self) {
         self.js_epoch = self.js_epoch.saturating_add(1);
-        self.queued_dials
-            .retain(|dial| !matches!(dial, QueuedDial::JsFetch { .. }));
+        self.queued_dials.retain(|dial| {
+            !matches!(
+                dial,
+                QueuedDial::JsFetch { .. } | QueuedDial::ClassicScript { .. }
+            )
+        });
         let js_timer_ids: HashSet<u32> = self.js_timer_slots.keys().copied().collect();
         self.timers
             .retain(|timer| !js_timer_ids.contains(&timer.id));
         self.js_timer_slots.clear();
         self.js = None;
+        self.pending_classic.clear();
+        self.classic_fetch_in_flight = false;
+    }
+
+    fn ensure_js(&mut self) -> Result<(), PageError> {
+        if self.js.is_none() {
+            self.js = Some(crate::js::JsHost::new(self.world.clone()).map_err(PageError::from)?);
+        }
+        Ok(())
+    }
+
+    fn boot_document(&mut self) {
+        if self.ensure_js().is_err() {
+            self.events.push(PageEvent::ScriptFailed);
+            return;
+        }
+        let scripts = collect_classic_scripts(&self.world.borrow());
+        self.pending_classic = scripts.into();
+        self.advance_classic_scripts();
+    }
+
+    fn eval_classic(&mut self, source: &str) {
+        if let Some(js) = &self.js {
+            Self::note_script(&mut self.events, js.eval(source).is_err());
+        }
+        self.adopt_js_work();
+    }
+
+    fn advance_classic_scripts(&mut self) {
+        loop {
+            match self.pending_classic.front().cloned() {
+                Some(ClassicScript::Inline(source)) => {
+                    self.pending_classic.pop_front();
+                    self.eval_classic(&source);
+                }
+                Some(ClassicScript::Src(src)) => {
+                    if self.classic_fetch_in_flight {
+                        return;
+                    }
+                    if let Ok(url) = self.resolve_dial_url(&src) {
+                        self.classic_fetch_in_flight = true;
+                        let initiator = self.document_url.clone();
+                        self.queued_dials.push(QueuedDial::ClassicScript {
+                            url,
+                            initiator,
+                            epoch: self.js_epoch,
+                        });
+                    } else {
+                        self.pending_classic.pop_front();
+                        continue;
+                    }
+                    return;
+                }
+                None => {
+                    self.fire_document_load();
+                    return;
+                }
+            }
+        }
+    }
+
+    fn fire_document_load(&mut self) {
+        if self.world.borrow().document_ready {
+            return;
+        }
+        self.world.borrow_mut().document_ready = true;
+        if let Some(js) = &self.js {
+            Self::note_script(&mut self.events, js.fire_load().is_err());
+        }
+        self.adopt_js_work();
     }
 
     fn next_timer_deadline(&self) -> Option<Instant> {

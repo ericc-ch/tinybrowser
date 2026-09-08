@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# Run WPT against tinybrowser. Builds the debug binary, installs the
+# wptrunner product into WPT's venv, then execs ./wpt run.
+#
+# Requires /etc/hosts entries from `./wpt make-hosts-file` (once per machine).
+set -euo pipefail
+ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+WPT="$ROOT/third_party/wpt"
+
+if ! command -v python3 >/dev/null 2>&1; then
+  UV_PY="${HOME}/.local/share/uv/python/cpython-3.12-linux-x86_64-gnu/bin"
+  if [[ -x "${UV_PY}/python3" ]]; then
+    PATH="${UV_PY}:${PATH}"
+  else
+    echo "python3 is required to run WPT" >&2
+    exit 1
+  fi
+fi
+
+cd "$ROOT"
+cargo build -q --offline 2>/dev/null || cargo build -q
+BINARY="$ROOT/target/debug/tinybrowser"
+cd "$WPT"
+python3 "$WPT/wpt" run --help >/dev/null
+VENV="$WPT/_venv3"
+if [[ ! -x "$VENV/bin/pip" ]]; then
+  echo "WPT virtualenv not found at $VENV" >&2
+  exit 1
+fi
+"$VENV/bin/pip" install -e "$ROOT/tools/wpt" >/dev/null
+exec python3 "$WPT/wpt" run --binary "$BINARY" --ssl-type none tinybrowser "$@"

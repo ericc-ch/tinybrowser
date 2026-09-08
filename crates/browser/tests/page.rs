@@ -90,13 +90,15 @@ fn navigation_parsing_cookies_and_relative_js_fetch_form_one_journey() {
 
     assert_eq!(page.content_language(), Some("fr"));
     assert_eq!(page.document_cookie(), "sid=1");
-    let parsed = page.parsed().expect("parsed navigation");
-    let paragraph = parsed
-        .dom
-        .select_first(parsed.dom.document(), "#loaded")
-        .expect("selector")
-        .expect("paragraph");
-    assert_eq!(element_text(&parsed.dom, paragraph), "hi");
+    {
+        let parsed = page.parsed().expect("parsed navigation");
+        let paragraph = parsed
+            .dom
+            .select_first(parsed.dom.document(), "#loaded")
+            .expect("selector")
+            .expect("paragraph");
+        assert_eq!(element_text(&parsed.dom, paragraph), "hi");
+    }
 
     page.eval(
         "globalThis.body = ''; fetch('next').then(function(response) { return response.text(); }).then(function(text) { globalThis.body = text; });",
@@ -225,4 +227,64 @@ fn realm_replacement_and_failed_jobs_drain_without_leaking_work() {
             .count(),
         2
     );
+}
+
+#[test]
+fn classic_scripts_run_and_window_load_fires() {
+    let mut page = Page::new();
+    page.load_html(
+        r#"<!doctype html>
+<title>t</title>
+<script>
+window.scriptRan = true;
+window.addEventListener("load", function() { window.loadFired = true; });
+</script>"#,
+    );
+    assert_eq!(
+        page.eval("String(window.scriptRan)").expect("script"),
+        "true"
+    );
+    assert_eq!(page.eval("String(window.loadFired)").expect("load"), "true");
+    assert_eq!(
+        page.eval("document.getElementsByTagName('title')[0].firstChild.data")
+            .expect("title"),
+        "t"
+    );
+    assert_eq!(
+        page.eval("document.readyState").expect("readyState"),
+        "complete"
+    );
+}
+
+#[test]
+fn external_classic_scripts_run_before_load() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("address");
+    let server = thread::spawn(move || {
+        let (mut navigation, _) = listener.accept().expect("navigation");
+        assert_eq!(read_target(&mut navigation), "/page");
+        respond(
+            &mut navigation,
+            &["Content-Type: text/html"],
+            br#"<!doctype html>
+<script src="/lib.js"></script>
+<script>
+window.addEventListener("load", function() { window.loadSaw = window.fromLib; });
+</script>"#,
+        );
+        let (mut script, _) = listener.accept().expect("script");
+        assert_eq!(read_target(&mut script), "/lib.js");
+        respond(
+            &mut script,
+            &["Content-Type: text/javascript"],
+            b"window.fromLib = 7;",
+        );
+    });
+
+    let mut page = Page::new();
+    page.goto(&format!("http://{addr}/page")).expect("goto");
+    page.run();
+    assert_eq!(page.eval("String(window.fromLib)").expect("lib"), "7");
+    assert_eq!(page.eval("String(window.loadSaw)").expect("load"), "7");
+    server.join().expect("server");
 }
