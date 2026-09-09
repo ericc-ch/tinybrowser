@@ -63,6 +63,9 @@ pub enum ProtocolError {
     /// Proxy URI is not an `http://` HTTP CONNECT authority with a host.
     #[error("proxy URI must be an http:// HTTP CONNECT authority")]
     InvalidProxy,
+    /// `--resolve=PATTERN=ADDR` is not `PATTERN=IPv4` or `PATTERN=fail`.
+    #[error("resolve spec must be PATTERN=IPv4 or PATTERN=fail")]
+    InvalidResolve,
     /// Another protocol failure, with the backend's wording.
     #[error("{0}")]
     Other(Box<str>),

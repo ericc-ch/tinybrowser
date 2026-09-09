@@ -469,6 +469,11 @@ pub(super) fn install(ctx: &Ctx<'_>, world: &Rc<RefCell<World>>) -> Result<()> {
     globals.set("location", location)?;
     globals.set("window", globals.clone())?;
     globals.set("self", globals.clone())?;
+    // https://html.spec.whatwg.org/multipage/nav-history-apis.html#dom-parent
+    globals.set("parent", globals.clone())?;
+    // https://html.spec.whatwg.org/multipage/nav-history-apis.html#dom-top
+    globals.set("top", globals.clone())?;
+    globals.set("opener", Value::new_null(ctx.clone()))?;
 
     globals.set(
         "addEventListener",

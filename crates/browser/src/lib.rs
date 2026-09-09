@@ -22,7 +22,7 @@ use markup5ever::interface::tree_builder::ElemName;
 use tendril::{StrTendril, TendrilSink};
 
 pub use dom::{Dom, DomError, NodeId};
-pub use net::Agent;
+pub use net::{Agent, AgentBuilder};
 pub use page::{Page, PageError, PageEvent, ScriptFailure, ScriptValue};
 
 /// The result of parsing one document.

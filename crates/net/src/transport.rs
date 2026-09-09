@@ -15,6 +15,7 @@ use url::Url;
 
 use crate::error::{NetError, ProtocolError, TimeoutKind, TransportError};
 use crate::protocol::{HeaderMap, Method};
+use crate::resolve::{HostMap, Mapped};
 
 #[derive(Debug, thiserror::Error)]
 #[error("{0}")]
@@ -25,6 +26,7 @@ pub(crate) struct HttpEngine {
     inner: ureq::Agent,
     pub(crate) proxy: Option<String>,
     pub(crate) timeout: Option<Duration>,
+    pub(crate) host_map: HostMap,
 }
 
 impl HttpEngine {
@@ -32,6 +34,7 @@ impl HttpEngine {
         timeout_global: Option<Duration>,
         timeout_per_call: Option<Duration>,
         proxy: Option<String>,
+        host_map: HostMap,
     ) -> Self {
         let timeout = timeout_per_call.or(timeout_global);
         let config = ureq::config::Config::builder()
@@ -55,6 +58,7 @@ impl HttpEngine {
             NetConnector {
                 proxy: proxy.clone(),
                 timeout,
+                host_map: host_map.clone(),
             },
             DialResolver,
         );
@@ -62,6 +66,7 @@ impl HttpEngine {
             inner,
             proxy,
             timeout,
+            host_map,
         }
     }
 
@@ -178,6 +183,7 @@ impl Resolver for DialResolver {
 struct NetConnector {
     proxy: Option<String>,
     timeout: Option<Duration>,
+    host_map: HostMap,
 }
 
 impl fmt::Debug for NetConnector {
@@ -185,7 +191,8 @@ impl fmt::Debug for NetConnector {
         f.debug_struct("NetConnector")
             .field("has_proxy", &self.proxy.is_some())
             .field("timeout", &self.timeout)
-            .finish()
+            .field("has_host_map", &!self.host_map.is_empty())
+            .finish_non_exhaustive()
     }
 }
 
@@ -202,7 +209,7 @@ impl Connector for NetConnector {
         }
         let url =
             Url::parse(&details.uri.to_string()).map_err(|_| ureq::Error::ConnectionFailed)?;
-        let stream = open(&url, self.proxy.as_deref(), self.timeout).map_err(to_ureq)?;
+        let stream = open(&url, self.proxy.as_deref(), self.timeout, &self.host_map).map_err(to_ureq)?;
         let buffers = LazyBuffers::new(
             details.config.input_buffer_size(),
             details.config.output_buffer_size(),
@@ -437,6 +444,7 @@ pub(crate) fn open(
     url: &Url,
     proxy: Option<&str>,
     timeout: Option<Duration>,
+    host_map: &HostMap,
 ) -> Result<RawStream, NetError> {
     let host = url
         .host_str()
@@ -448,12 +456,12 @@ pub(crate) fn open(
         .unwrap_or(if tls { 443 } else { 80 });
     let socket = if let Some(proxy) = proxy {
         if tunnel {
-            connect_via_proxy(proxy, host, port, timeout)?
+            connect_via_proxy(proxy, host, port, timeout, host_map)?
         } else {
-            tcp_to_proxy(proxy, timeout)?
+            tcp_to_proxy(proxy, timeout, host_map)?
         }
     } else {
-        Socket::new(connect_tcp(host, port, timeout)?, Vec::new())
+        Socket::new(connect_tcp(host, port, timeout, host_map)?, Vec::new())
     };
     let _ = socket.tcp.set_nodelay(true);
     if tls {
@@ -494,7 +502,12 @@ fn timed_out(kind: TimeoutKind) -> NetError {
     NetError::Transport(TransportError::Timeout(kind))
 }
 
-fn connect_tcp(host: &str, port: u16, timeout: Option<Duration>) -> Result<TcpStream, NetError> {
+fn connect_tcp(
+    host: &str,
+    port: u16,
+    timeout: Option<Duration>,
+    host_map: &HostMap,
+) -> Result<TcpStream, NetError> {
     let host = host
         .strip_prefix('[')
         .and_then(|h| h.strip_suffix(']'))
@@ -503,7 +516,7 @@ fn connect_tcp(host: &str, port: u16, timeout: Option<Duration>) -> Result<TcpSt
     if remaining(deadline) == Some(Duration::ZERO) {
         return Err(timed_out(TimeoutKind::Resolve));
     }
-    let addrs = resolve_addrs(host, port, remaining(deadline))?;
+    let addrs = resolve_addrs(host, port, remaining(deadline), host_map)?;
     let mut last = None;
     for addr in addrs {
         let leftover = remaining(deadline);
@@ -529,7 +542,15 @@ fn resolve_addrs(
     host: &str,
     port: u16,
     timeout: Option<Duration>,
+    host_map: &HostMap,
 ) -> Result<Vec<SocketAddr>, NetError> {
+    match host_map.lookup(host) {
+        Some(Mapped::Fail) => {
+            return Err(NetError::Transport(TransportError::Dns(host.into())));
+        }
+        Some(Mapped::Addr(ip)) => return Ok(vec![SocketAddr::from((ip, port))]),
+        None => {}
+    }
     let Some(limit) = timeout else {
         return (host, port)
             .to_socket_addrs()
@@ -556,7 +577,11 @@ fn resolve_addrs(
     }
 }
 
-fn tcp_to_proxy(proxy: &str, timeout: Option<Duration>) -> Result<Socket, NetError> {
+fn tcp_to_proxy(
+    proxy: &str,
+    timeout: Option<Duration>,
+    host_map: &HostMap,
+) -> Result<Socket, NetError> {
     let proxy_url =
         Url::parse(proxy).map_err(|_| NetError::Protocol(ProtocolError::InvalidProxy))?;
     let phost = proxy_url
@@ -564,7 +589,7 @@ fn tcp_to_proxy(proxy: &str, timeout: Option<Duration>) -> Result<Socket, NetErr
         .ok_or(NetError::Protocol(ProtocolError::InvalidProxy))?;
     let proxy_port = proxy_url.port_or_known_default().unwrap_or(80);
     Ok(Socket::new(
-        connect_tcp(phost, proxy_port, timeout)?,
+        connect_tcp(phost, proxy_port, timeout, host_map)?,
         Vec::new(),
     ))
 }
@@ -591,6 +616,7 @@ fn connect_via_proxy(
     host: &str,
     port: u16,
     timeout: Option<Duration>,
+    host_map: &HostMap,
 ) -> Result<Socket, NetError> {
     let proxy_url =
         Url::parse(proxy).map_err(|_| NetError::Protocol(ProtocolError::InvalidProxy))?;
@@ -598,7 +624,7 @@ fn connect_via_proxy(
         .host_str()
         .ok_or(NetError::Protocol(ProtocolError::InvalidProxy))?;
     let proxy_port = proxy_url.port_or_known_default().unwrap_or(80);
-    let mut stream = connect_tcp(phost, proxy_port, timeout)?;
+    let mut stream = connect_tcp(phost, proxy_port, timeout, host_map)?;
     stream.set_read_timeout(timeout).map_err(map_connect_io)?;
     stream.set_write_timeout(timeout).map_err(map_connect_io)?;
     let authority = if host.contains(':') && !host.starts_with('[') {

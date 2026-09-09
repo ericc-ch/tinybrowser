@@ -12,8 +12,9 @@ The WPT pin is the **full** tree at SHA `92054a74d0c6a1ed2e9024d71ebf2880f2af02e
 
 - In-process classic WebDriver on `tinybrowser --webdriver=PORT` (the `webdriver` crate; root `tinybrowser` depends on it).
 - Out-of-tree wptrunner product (`tools/wpt`) plus `./tools/wpt/run`.
-- HTTP-only first bar: `--ssl-type none` (HTTPS testharness files are excluded until cert trust exists).
-- Hosts: `tinybrowser` is not on WPT’s skip list; install `./wpt make-hosts-file` into `/etc/hosts`.
+- HTTP-only first bar: `--ssl-type none` (HTTPS testharness files are excluded until cert trust exists). `./tools/wpt/run` also drops extra listen ports (`https-*`, `http-local`, `http-public`, `ws`, `dns`, …) so the runner does not bind extra loopbacks or start a DNS server.
+- Hosts: `./tools/wpt/run` skips WPT’s `/etc/hosts` check and launches `tinybrowser --webdriver=PORT --resolve=*.test=127.0.0.1` (plus `nonexistent.*.test=fail` and `*.test.`). No machine hosts file. Do not patch vendored WPT.
+- `./tools/wpt/run` passes `--no-pause-after-test` (wptrunner otherwise pauses after a single file, and testharness `output: 1` never finishes on our DOM) and `--no-restart-on-unexpected`.
 - Testdriver user-input tests are skipped (`supports_testdriver = False`) until click/send_keys are real. The testharness executor still uses testdriver `run()` for result collection.
 - html5lib-tests stay the parser gate until testharness runs `html/syntax/parsing/`. Browser-crate JS/DOM tests stay until that green bar exists.
 
@@ -27,3 +28,4 @@ WebIDL: verify against vendored IDL ([webidl.md](../researches/webidl.md)); do n
 - **In-process `Page` loader instead of WebDriver:** same HTML files, not the canonical runner. Rejected.
 - **Sparse WPT checkout:** smaller clone; cannot run an arbitrary test when adding an API. Rejected.
 - **JS polyfills for Node/Document/Event:** fails WebIDL branding and WPT. Rejected.
+- **Machine `/etc/hosts` for WPT names:** not portable; rejected in favor of `--resolve` on `AgentBuilder` plus a skip in `./tools/wpt/run`.

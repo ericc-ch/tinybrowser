@@ -3,6 +3,7 @@
 # then:
 #   third_party/wpt/wpt run --binary /path/to/tinybrowser --ssl-type none tinybrowser [tests]
 # or: ./tools/wpt/run [tests]
+# ./tools/wpt/run skips the /etc/hosts check and this product passes --resolve.
 
 from __future__ import annotations
 
@@ -75,7 +76,13 @@ class TinyBrowser(WebDriverBrowser):
         )
 
     def make_command(self):
-        return [self.webdriver_binary, f"--webdriver={self.port}"] + self.webdriver_args
+        return [
+            self.webdriver_binary,
+            f"--webdriver={self.port}",
+            "--resolve=nonexistent.*.test=fail",
+            "--resolve=*.test=127.0.0.1",
+            "--resolve=*.test.=127.0.0.1",
+        ] + self.webdriver_args
 
 
 class TinyBrowserProtocol(WebDriverProtocol):

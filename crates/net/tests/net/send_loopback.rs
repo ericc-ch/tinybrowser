@@ -613,3 +613,51 @@ fn url_credentials_host_redirect_and_non_http_schemes_are_wire_visible() {
         Err(NetError::Protocol(ProtocolError::RejectedRequest))
     ));
 }
+
+#[test]
+fn resolve_maps_hit_miss_and_fail() {
+    assert!(matches!(
+        AgentBuilder::new().resolve("not-a-spec"),
+        Err(NetError::Protocol(ProtocolError::InvalidResolve))
+    ));
+
+    let server = scripted([canned_ok(&[], b"mapped")]);
+    let port = server.local_addr().port();
+    let mapped = url::Url::parse(&format!("http://web-platform.test:{port}/"))
+        .expect("mapped URL");
+    let agent = AgentBuilder::new()
+        .resolve("nonexistent.*.test=fail")
+        .expect("fail rule")
+        .resolve("*.test=127.0.0.1")
+        .expect("glob rule")
+        .build();
+    let response = agent
+        .request(Method::GET, mapped)
+        .send()
+        .expect("mapped hit");
+    assert_eq!(response.into_body().bytes(16).expect("body"), b"mapped");
+    assert_eq!(
+        server.requests()[0]
+            .header("Host")
+            .map(|value| value.split(':').next()),
+        Some(Some("web-platform.test"))
+    );
+    server.assert_clean();
+
+    let miss_server = scripted([canned_ok(&[], b"direct")]);
+    let miss = agent
+        .request(Method::GET, miss_server.url("/"))
+        .send()
+        .expect("unmapped 127.0.0.1 uses libc");
+    assert_eq!(miss.into_body().bytes(16).expect("body"), b"direct");
+    miss_server.assert_clean();
+
+    let failed = agent.request(
+        Method::GET,
+        url::Url::parse("http://nonexistent.web-platform.test/").expect("fail URL"),
+    );
+    assert!(matches!(
+        failed.send(),
+        Err(NetError::Transport(TransportError::Dns(_)))
+    ));
+}

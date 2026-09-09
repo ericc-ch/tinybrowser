@@ -8,6 +8,7 @@ use crate::context::Context;
 use crate::cookie::{CookieJar, CookieOp, RetrievalKind};
 use crate::error::{LimitExceeded, NetError, ProtocolError, TransportError};
 use crate::protocol::{HeaderError, HeaderMap, Method};
+use crate::resolve::HostMap;
 use crate::transport::{HttpEngine, basic_authorization};
 use crate::websocket::{self, WebSocket};
 
@@ -25,6 +26,7 @@ pub struct AgentBuilder {
     timeout_per_call: Option<Duration>,
     max_redirects: u32,
     proxy: Option<String>,
+    host_map: HostMap,
 }
 
 impl std::fmt::Debug for AgentBuilder {
@@ -34,6 +36,7 @@ impl std::fmt::Debug for AgentBuilder {
             .field("timeout_global", &self.timeout_global)
             .field("timeout_per_call", &self.timeout_per_call)
             .field("max_redirects", &self.max_redirects)
+            .field("has_host_map", &!self.host_map.is_empty())
             .finish_non_exhaustive()
     }
 }
@@ -54,6 +57,7 @@ impl AgentBuilder {
             timeout_per_call: None,
             max_redirects: DEFAULT_MAX_REDIRECTS,
             proxy: None,
+            host_map: HostMap::default(),
         }
     }
 
@@ -99,11 +103,30 @@ impl AgentBuilder {
         Ok(self)
     }
 
+    /// Append a `--resolve=PATTERN=ADDR` rewrite. First match wins.
+    ///
+    /// `PATTERN` is an exact host or a `*` glob (`*.test`, `nonexistent.*.test`).
+    /// `ADDR` is an IPv4 literal or `fail` (lookup error, no libc DNS).
+    ///
+    /// # Errors
+    ///
+    /// [`ProtocolError::InvalidResolve`] when `spec` is not `PATTERN=IPv4` or
+    /// `PATTERN=fail`.
+    pub fn resolve(mut self, spec: &str) -> Result<Self, NetError> {
+        self.host_map = self.host_map.with_spec(spec)?;
+        Ok(self)
+    }
+
     /// Builds an agent with a private cookie jar and the selected transport options.
     #[must_use]
     pub fn build(self) -> Agent {
         Agent {
-            engine: HttpEngine::new(self.timeout_global, self.timeout_per_call, self.proxy),
+            engine: HttpEngine::new(
+                self.timeout_global,
+                self.timeout_per_call,
+                self.proxy,
+                self.host_map,
+            ),
             ua: self.user_agent,
             max_redirects: self.max_redirects,
             jar: Arc::new(Mutex::new(CookieJar::default())),

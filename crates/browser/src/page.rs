@@ -205,11 +205,13 @@ impl Page {
     /// document URL `about:blank`.
     #[must_use]
     pub fn new() -> Self {
-        Self::with_agent(
-            AgentBuilder::new()
-                .timeout_per_call(PAGE_FETCH_TIMEOUT)
-                .build(),
-        )
+        Self::from_builder(AgentBuilder::new())
+    }
+
+    /// Empty page using `builder` plus the default per-call fetch timeout.
+    #[must_use]
+    pub fn from_builder(builder: AgentBuilder) -> Self {
+        Self::with_agent(builder.timeout_per_call(PAGE_FETCH_TIMEOUT).build())
     }
 
     /// A page that uses `agent` for every dial and for `document.cookie`.
@@ -420,7 +422,7 @@ impl Page {
     /// If called from inside a Tokio runtime, if the current-thread runtime
     /// cannot be built, or a `spawn_blocking` fetch worker panics.
     pub fn run(&mut self) {
-        self.block_on_pump(|_| true);
+        self.block_on_pump(None, |_| true);
     }
 
     /// Parks until the current navigation has fired `load`, without waiting
@@ -432,7 +434,16 @@ impl Page {
     ///
     /// Same conditions as [`Page::run`].
     pub fn run_until_load(&mut self) {
-        self.block_on_pump(|page| page.waiting_for_load());
+        self.block_on_pump(None, |page| page.waiting_for_load());
+    }
+
+    /// Parks like [`Page::run_until_load`], returning `false` if `timeout` elapses first.
+    ///
+    /// # Panics
+    ///
+    /// Same conditions as [`Page::run`].
+    pub fn run_until_load_timeout(&mut self, timeout: Duration) -> bool {
+        self.run_until_timeout(timeout, |page| !page.waiting_for_load())
     }
 
     /// Parks like [`Page::run`], but returns as soon as `stop` is true.
@@ -441,10 +452,31 @@ impl Page {
     ///
     /// Same conditions as [`Page::run`].
     pub fn run_until(&mut self, mut stop: impl FnMut(&mut Self) -> bool) {
-        self.block_on_pump(|page| !stop(page));
+        self.block_on_pump(None, |page| !stop(page));
     }
 
-    fn block_on_pump(&mut self, keep_waiting: impl FnMut(&mut Self) -> bool) {
+    /// Parks like [`Page::run_until`], returning `false` if `timeout` elapses first.
+    ///
+    /// # Panics
+    ///
+    /// Same conditions as [`Page::run`].
+    pub fn run_until_timeout(
+        &mut self,
+        timeout: Duration,
+        mut stop: impl FnMut(&mut Self) -> bool,
+    ) -> bool {
+        let deadline = Instant::now() + timeout;
+        self.block_on_pump(Some(deadline), |page| {
+            Instant::now() < deadline && !stop(page)
+        });
+        stop(self)
+    }
+
+    fn block_on_pump(
+        &mut self,
+        cap: Option<Instant>,
+        keep_waiting: impl FnMut(&mut Self) -> bool,
+    ) {
         assert!(
             tokio::runtime::Handle::try_current().is_err(),
             "Page::run must not run inside another Tokio runtime"
@@ -453,7 +485,7 @@ impl Page {
             .enable_time()
             .build()
             .expect("current-thread Tokio runtime for the page thread");
-        runtime.block_on(self.pump(keep_waiting));
+        runtime.block_on(self.pump(cap, keep_waiting));
     }
 
     fn resolve_dial_url(&self, spec: &str) -> Result<Url, PageError> {
@@ -482,7 +514,7 @@ impl Page {
             .unwrap_or_else(|_| self.document_url.clone())
     }
 
-    async fn pump(&mut self, mut keep_waiting: impl FnMut(&mut Self) -> bool) {
+    async fn pump(&mut self, cap: Option<Instant>, mut keep_waiting: impl FnMut(&mut Self) -> bool) {
         loop {
             self.adopt_js_work();
             self.launch_queued_dials();
@@ -506,7 +538,10 @@ impl Page {
             }
             let fetches_pending = !self.fetches.is_empty();
             let queued = !self.queued_dials.is_empty();
-            let next_deadline = self.next_timer_deadline();
+            let next_deadline = match (self.next_timer_deadline(), cap) {
+                (Some(timer), Some(limit)) => Some(timer.min(limit)),
+                (timer, limit) => timer.or(limit),
+            };
             if !fetches_pending && !queued && next_deadline.is_none() {
                 break;
             }

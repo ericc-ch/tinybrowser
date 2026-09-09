@@ -37,7 +37,7 @@ fn session_execute_script_roundtrip() {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let addr = listener.local_addr().expect("addr").to_string();
     thread::spawn(move || {
-        let _ = webdriver::serve(&listener);
+        let _ = webdriver::serve(&listener, webdriver::AgentBuilder::new());
     });
 
     let status = request(&addr, "GET", "/status", None);
@@ -117,7 +117,7 @@ fn navigate_returns_after_load_not_after_timers() {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let addr = listener.local_addr().expect("addr").to_string();
     thread::spawn(move || {
-        let _ = webdriver::serve(&listener);
+        let _ = webdriver::serve(&listener, webdriver::AgentBuilder::new());
     });
 
     let created = request(&addr, "POST", "/session", Some("{}"));
@@ -154,5 +154,70 @@ fn navigate_returns_after_load_not_after_timers() {
         Some(r#"{"script":"return typeof window.late","args":[]}"#),
     );
     assert_eq!(late["value"], json!("undefined"));
+    server.join().expect("server");
+}
+
+#[test]
+fn new_window_uses_builder_resolve_map() {
+    let page_listener = TcpListener::bind("127.0.0.1:0").expect("page bind");
+    let page_addr = page_listener.local_addr().expect("page addr");
+    let server = thread::spawn(move || {
+        let (mut navigation, _) = page_listener.accept().expect("navigation");
+        let mut head = Vec::new();
+        let mut chunk = [0_u8; 1024];
+        while !head.windows(4).any(|window| window == b"\r\n\r\n") {
+            let read = navigation.read(&mut chunk).expect("request");
+            assert_ne!(read, 0);
+            head.extend_from_slice(&chunk[..read]);
+        }
+        let body = b"<!doctype html><title>mapped</title>";
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        navigation.write_all(response.as_bytes()).expect("head");
+        navigation.write_all(body).expect("body");
+    });
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("addr").to_string();
+    thread::spawn(move || {
+        let builder = webdriver::AgentBuilder::new()
+            .resolve("*.test=127.0.0.1")
+            .expect("resolve map");
+        let _ = webdriver::serve(&listener, builder);
+    });
+
+    let created = request(&addr, "POST", "/session", Some("{}"));
+    let id = created["value"]["sessionId"]
+        .as_str()
+        .expect("session id")
+        .to_owned();
+
+    let opened = request(&addr, "POST", &format!("/session/{id}/window/new"), Some("{}"));
+    let handle = opened["value"]["handle"].as_str().expect("handle").to_owned();
+    request(
+        &addr,
+        "POST",
+        &format!("/session/{id}/window"),
+        Some(&format!(r#"{{"handle":"{handle}"}}"#)),
+    );
+
+    let navigated = request(
+        &addr,
+        "POST",
+        &format!("/session/{id}/url"),
+        Some(&format!(
+            r#"{{"url":"http://web-platform.test:{}/"}}"#,
+            page_addr.port()
+        )),
+    );
+    assert_eq!(navigated["value"], json!(null));
+
+    let current = request(&addr, "GET", &format!("/session/{id}/url"), None);
+    assert_eq!(
+        current["value"].as_str().expect("url"),
+        format!("http://web-platform.test:{}/", page_addr.port())
+    );
     server.join().expect("server");
 }

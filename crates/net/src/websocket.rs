@@ -128,7 +128,12 @@ pub(crate) fn connect(
     method: &Method,
     initiator: Option<&Url>,
 ) -> Result<WebSocket, NetError> {
-    let stream = crate::transport::open(url, agent.engine.proxy.as_deref(), agent.engine.timeout)?;
+    let stream = crate::transport::open(
+        url,
+        agent.engine.proxy.as_deref(),
+        agent.engine.timeout,
+        &agent.engine.host_map,
+    )?;
     if let Some(limit) = agent.engine.timeout {
         stream
             .set_read_timeout(Some(limit))

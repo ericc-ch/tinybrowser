@@ -2,7 +2,8 @@
 # Run WPT against tinybrowser. Builds the debug binary, installs the
 # wptrunner product into WPT's venv, then execs ./wpt run.
 #
-# Requires /etc/hosts entries from `./wpt make-hosts-file` (once per machine).
+# Skips WPT's /etc/hosts check: the product passes --resolve maps instead.
+# Defaults --no-pause-after-test so a single file does not wait for a keypress.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 WPT="$ROOT/third_party/wpt"
@@ -31,4 +32,14 @@ if [[ ! -x "$VENV/bin/pip" ]]; then
   exit 1
 fi
 "$VENV/bin/pip" install -e "$ROOT/tools/wpt" >/dev/null
-exec python3 "$WPT/wpt" run --binary "$BINARY" --ssl-type none tinybrowser "$@"
+args=("$@")
+if [[ ! " $* " =~ --test-types ]]; then
+  args=(--test-types=testharness "${args[@]}")
+fi
+if [[ ! " $* " =~ --pause-after-test ]] && [[ ! " $* " =~ --no-pause-after-test ]]; then
+  args=(--no-pause-after-test "${args[@]}")
+fi
+if [[ ! " $* " =~ --no-restart-on-unexpected ]] && [[ ! " $* " =~ --restart-on-unexpected ]]; then
+  args=(--no-restart-on-unexpected "${args[@]}")
+fi
+exec "$VENV/bin/python" "$ROOT/tools/wpt/launch.py" --binary "$BINARY" --ssl-type none tinybrowser "${args[@]}"

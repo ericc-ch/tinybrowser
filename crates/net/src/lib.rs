@@ -9,6 +9,7 @@ mod context;
 mod cookie;
 mod error;
 mod protocol;
+mod resolve;
 mod transport;
 mod websocket;
 

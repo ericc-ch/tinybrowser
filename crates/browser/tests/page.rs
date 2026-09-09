@@ -254,6 +254,11 @@ window.addEventListener("load", function() { window.loadFired = true; });
     );
     assert_eq!(page.eval("String(window.loadFired)").expect("load"), "true");
     assert_eq!(
+        page.eval("String(window.parent === window && window.top === window)")
+            .expect("top window"),
+        "true"
+    );
+    assert_eq!(
         page.eval("document.getElementsByTagName('title')[0].firstChild.data")
             .expect("title"),
         "t"

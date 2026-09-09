@@ -7,21 +7,33 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::time::Duration;
 
 use browser::{Page, PageError, ScriptValue};
 use serde_json::{Value, json};
 
+pub use browser::AgentBuilder;
+
 const ELEMENT_KEY: &str = "element-6066-11e4-a52e-4f735466cecf";
 const MAX_HEAD: usize = 65_536;
 const MAX_BODY: usize = 8_388_608;
+const DEFAULT_SCRIPT_TIMEOUT: Duration = Duration::from_millis(30_000);
+const DEFAULT_PAGE_LOAD_TIMEOUT: Duration = Duration::from_millis(300_000);
 
 /// Serves classic `WebDriver` on `listener` until the process exits.
+///
+/// Each session builds a [`Page`] from `builder` (separate cookie jar).
 ///
 /// # Errors
 ///
 /// Returns when `accept` fails.
-pub fn serve(listener: &TcpListener) -> std::io::Result<()> {
-    let mut sessions = Sessions::default();
+pub fn serve(listener: &TcpListener, builder: AgentBuilder) -> std::io::Result<()> {
+    let mut sessions = Sessions {
+        builder,
+        next_session: 0,
+        next_window: 0,
+        open: HashMap::new(),
+    };
     loop {
         let (stream, _) = listener.accept()?;
         if let Err(error) = handle_connection(stream, &mut sessions) {
@@ -30,8 +42,8 @@ pub fn serve(listener: &TcpListener) -> std::io::Result<()> {
     }
 }
 
-#[derive(Default)]
 struct Sessions {
+    builder: AgentBuilder,
     next_session: u32,
     next_window: u32,
     open: HashMap<String, Session>,
@@ -40,6 +52,8 @@ struct Sessions {
 struct Session {
     current: String,
     windows: HashMap<String, Window>,
+    script_timeout: Duration,
+    page_load_timeout: Duration,
 }
 
 struct Window {
@@ -49,25 +63,28 @@ struct Window {
 }
 
 impl Sessions {
+    fn blank_window(&self) -> Window {
+        let mut page = Page::from_builder(self.builder.clone());
+        page.load_html("<!doctype html><title></title>");
+        Window {
+            page,
+            elements: HashMap::new(),
+            next_element: 0,
+        }
+    }
+
     fn create(&mut self) -> String {
         self.next_session += 1;
         let id = format!("s{}", self.next_session);
         self.next_window += 1;
         let handle = format!("w{}", self.next_window);
-        let mut page = Page::new();
-        page.load_html("<!doctype html><title></title>");
         self.open.insert(
             id.clone(),
             Session {
                 current: handle.clone(),
-                windows: HashMap::from([(
-                    handle,
-                    Window {
-                        page,
-                        elements: HashMap::new(),
-                        next_element: 0,
-                    },
-                )]),
+                windows: HashMap::from([(handle, self.blank_window())]),
+                script_timeout: DEFAULT_SCRIPT_TIMEOUT,
+                page_load_timeout: DEFAULT_PAGE_LOAD_TIMEOUT,
             },
         );
         id
@@ -111,10 +128,8 @@ fn dispatch(method: &str, path: &str, body: &str, sessions: &mut Sessions) -> (u
         ("POST", ["session", _session, "window", "rect"]) => {
             ok(json!({"x":0,"y":0,"width":800,"height":600}))
         }
-        ("POST", ["session", _session, "timeouts"]) => ok(Value::Null),
-        ("GET", ["session", _session, "timeouts"]) => {
-            ok(json!({"implicit": 0, "pageLoad": 300_000, "script": 30_000}))
-        }
+        ("POST", ["session", session, "timeouts"]) => set_timeouts(sessions, session, body),
+        ("GET", ["session", session, "timeouts"]) => get_timeouts(sessions, session),
         ("POST", ["session", _session, "element", _, "click"]) => ok(Value::Null),
         ("POST", ["session", _session, "actions"]) => ok(Value::Null),
         ("DELETE", ["session", _session, "actions"]) => ok(Value::Null),
@@ -129,12 +144,18 @@ fn navigate(sessions: &mut Sessions, session: &str, body: &str) -> (u16, Value) 
     else {
         return error(400, "invalid argument", "missing url");
     };
+    let page_load_timeout = match sessions.open.get(session) {
+        Some(found) => found.page_load_timeout,
+        None => return error(404, "invalid session id", session),
+    };
     let Some(window) = current_mut(sessions, session) else {
         return error(404, "invalid session id", session);
     };
     match window.page.goto(&url) {
         Ok(()) => {
-            window.page.run_until_load();
+            if !window.page.run_until_load_timeout(page_load_timeout) {
+                return error(500, "timeout", "navigation timed out");
+            }
             if window.page.last_navigation_failed() {
                 return error(500, "unknown error", "navigation failed");
             }
@@ -162,6 +183,10 @@ fn execute(sessions: &mut Sessions, session: &str, body: &str, asynchronous: boo
         .and_then(Value::as_str)
         .unwrap_or_default();
     let args = parsed.get("args").cloned().unwrap_or(json!([]));
+    let script_timeout = match sessions.open.get(session) {
+        Some(found) => found.script_timeout,
+        None => return error(404, "invalid session id", session),
+    };
     let Some(window) = current_mut(sessions, session) else {
         return error(404, "invalid session id", session);
     };
@@ -170,12 +195,14 @@ fn execute(sessions: &mut Sessions, session: &str, body: &str, asynchronous: boo
         if let Err(err) = window.page.execute_script(&wrapped) {
             return error(500, "javascript error", &err.to_string());
         }
-        window.page.run_until(|page| {
+        if !window.page.run_until_timeout(script_timeout, |page| {
             matches!(
                 page.execute_script("globalThis.__wd_done === true"),
                 Ok(ScriptValue::Bool(true))
             )
-        });
+        }) {
+            return error(500, "script timeout", "script timeout");
+        }
         match window.page.execute_script("globalThis.__wd_async") {
             Ok(value) => ok(encode(window, value)),
             Err(err) => error(500, "javascript error", &err.to_string()),
@@ -235,6 +262,40 @@ fn encode(window: &mut Window, value: ScriptValue) -> Value {
     }
 }
 
+fn get_timeouts(sessions: &Sessions, session: &str) -> (u16, Value) {
+    match sessions.open.get(session) {
+        Some(found) => ok(json!({
+            "implicit": 0,
+            "pageLoad": found.page_load_timeout.as_millis() as u64,
+            "script": found.script_timeout.as_millis() as u64,
+        })),
+        None => error(404, "invalid session id", session),
+    }
+}
+
+fn set_timeouts(sessions: &mut Sessions, session: &str, body: &str) -> (u16, Value) {
+    let parsed: Value = match serde_json::from_str(body) {
+        Ok(value) => value,
+        Err(err) => return error(400, "invalid argument", &err.to_string()),
+    };
+    let Some(found) = sessions.open.get_mut(session) else {
+        return error(404, "invalid session id", session);
+    };
+    if let Some(ms) = parsed.get("script").and_then(json_millis) {
+        found.script_timeout = Duration::from_millis(ms);
+    }
+    if let Some(ms) = parsed.get("pageLoad").and_then(json_millis) {
+        found.page_load_timeout = Duration::from_millis(ms);
+    }
+    ok(Value::Null)
+}
+
+fn json_millis(value: &Value) -> Option<u64> {
+    value
+        .as_u64()
+        .or_else(|| value.as_f64().and_then(|ms| (ms >= 0.0).then_some(ms as u64)))
+}
+
 fn current_window(sessions: &Sessions, session: &str) -> (u16, Value) {
     match sessions.open.get(session) {
         Some(found) => ok(json!(found.current)),
@@ -275,19 +336,11 @@ fn new_window(sessions: &mut Sessions, session: &str) -> (u16, Value) {
     }
     sessions.next_window += 1;
     let handle = format!("w{}", sessions.next_window);
-    let mut page = Page::new();
-    page.load_html("<!doctype html><title></title>");
+    let window = sessions.blank_window();
     let Some(found) = sessions.open.get_mut(session) else {
         return error(404, "invalid session id", session);
     };
-    found.windows.insert(
-        handle.clone(),
-        Window {
-            page,
-            elements: HashMap::new(),
-            next_element: 0,
-        },
-    );
+    found.windows.insert(handle.clone(), window);
     ok(json!({"handle": handle, "type": "window"}))
 }
 
