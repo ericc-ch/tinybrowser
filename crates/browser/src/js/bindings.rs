@@ -703,9 +703,30 @@ fn create_kind<'js>(
 
 fn valid_qualified_name(tag: &str) -> bool {
     match tag.split_once(':') {
-        Some((prefix, local)) => !prefix.is_empty() && !local.is_empty() && !local.contains(':'),
-        None => !tag.is_empty(),
+        Some((prefix, local)) => valid_ncname(prefix) && valid_ncname(local),
+        None => valid_ncname(tag),
     }
+}
+
+// https://www.w3.org/TR/xml-names/#NT-NCName
+fn valid_ncname(name: &str) -> bool {
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(first) if is_name_start(first) => chars.all(is_name_char),
+        _ => false,
+    }
+}
+
+// https://www.w3.org/TR/xml/#NT-NameStartChar minus ":"
+fn is_name_start(c: char) -> bool {
+    matches!(c, 'A'..='Z' | '_' | 'a'..='z' | '\u{C0}'..='\u{D6}' | '\u{D8}'..='\u{F6}' | '\u{F8}'..='\u{2FF}' | '\u{370}'..='\u{37D}' | '\u{37F}'..='\u{1FFF}' | '\u{200C}'..='\u{200D}' | '\u{2070}'..='\u{218F}' | '\u{2C00}'..='\u{2FEF}' | '\u{3001}'..='\u{D7FF}' | '\u{F900}'..='\u{FDCF}' | '\u{FDF0}'..='\u{FFFD}')
+        || ('\u{10000}'..='\u{EFFFF}').contains(&c)
+}
+
+// https://www.w3.org/TR/xml/#NT-NameChar minus ":"
+fn is_name_char(c: char) -> bool {
+    is_name_start(c)
+        || matches!(c, '-' | '.' | '0'..='9' | '\u{B7}' | '\u{0300}'..='\u{036F}' | '\u{203F}'..='\u{2040}')
 }
 
 fn split_qualified_name(tag: &str) -> (Option<&str>, &str) {

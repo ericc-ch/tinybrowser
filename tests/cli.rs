@@ -73,6 +73,15 @@ fn daemon_rejects_webdriver_and_resolve() {
         err.contains("--daemon and --resolve are mutually exclusive"),
         "{err}"
     );
+
+    let command = Command::new(env!("CARGO_BIN_EXE_tinybrowser"))
+        .args(["--daemon", "create"])
+        .stdin(Stdio::null())
+        .output()
+        .expect("cli");
+    assert!(!command.status.success());
+    let err = String::from_utf8_lossy(&command.stderr);
+    assert!(err.contains("--daemon does not accept a command"), "{err}");
 }
 
 #[test]

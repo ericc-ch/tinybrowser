@@ -98,6 +98,9 @@ fn parse_mode(args: &[String]) -> Result<Mode, String> {
         if resolve {
             return Err("--daemon and --resolve are mutually exclusive".to_owned());
         }
+        if !rest.is_empty() {
+            return Err("--daemon does not accept a command".to_owned());
+        }
         return Ok(Mode::Daemon { profile });
     }
     if let Some(port) = port {

@@ -140,6 +140,14 @@ fn webidl_node_name_doctype_and_branding() {
                 catch (e) {{ return String(e).indexOf("InvalidCharacterError") >= 0; }}
               }})(),
               (function() {{
+                try {{ document.createElementNS("{htmlns}", "a b"); return "no"; }}
+                catch (e) {{ return String(e).indexOf("InvalidCharacterError") >= 0; }}
+              }})(),
+              (function() {{
+                try {{ document.createElementNS("{htmlns}", "a!"); return "no"; }}
+                catch (e) {{ return String(e).indexOf("InvalidCharacterError") >= 0; }}
+              }})(),
+              (function() {{
                 Element = 1;
                 return document.createElement("p").nodeName;
               }})()
@@ -149,7 +157,7 @@ fn webidl_node_name_doctype_and_branding() {
         .expect("webidl");
     assert_eq!(
         got,
-        "I|I|svg|SVG|X:B|#text|#comment|#document|html|#document-fragment|function|true|true|true|true|true|true|true|true|true|true|true|true|true|true|true|true|true|P"
+        "I|I|svg|SVG|X:B|#text|#comment|#document|html|#document-fragment|function|true|true|true|true|true|true|true|true|true|true|true|true|true|true|true|true|true|true|true|P"
     );
     let _ = std::fs::remove_dir_all(data_home);
 }
