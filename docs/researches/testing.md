@@ -1,8 +1,10 @@
 # Testing Strategy
 
-Two tiers, ordered by what they catch: parse correctness against the
-spec-mandated tree, then unit/public-API tests for everything the suite
-cannot see.
+Web-visible platform behavior is WPT (`./tools/wpt/run`). `cargo test` is
+tinybrowser-specific: parser corpus, product adapters, page pump, and
+transport. Browser-crate JS/DOM cargo tests are stand-ins until the first
+testharness file is green; they are not a second web suite
+([ADR 0008](../adrs/0008-wpt-via-webdriver.md)).
 
 ## Parse correctness: html5lib tree-construction suite (**landed 2026-08-25**)
 
@@ -22,10 +24,12 @@ fixtures miss.
 
 ## Unit and public-API tests (landed)
 
-The suite keeps only high-signal public-boundary gates: the html5lib corpus,
-an independent DOM mutation model, selector state matrices, browser page-loop
-journeys, and compact HTTP/WebSocket/cookie/error transcripts. Counted 2026-09-09
-from workspace `#[test]` items: **54 tests** (53 active plus one ignored
+`cargo test` covers product and transport boundaries: daemon lock, CDP
+flatten/method-not-found/`Browser.close`, WebDriver one-session and
+`DELETE /session` leaving tabs, unsupported click, page pump vs unrelated
+fetch, cookie file mode, CLI flag errors, `net::Agent` cookies/loopback/WS,
+and inbound HTTP/1.1 on `http1`. Counted 2026-09-09
+from workspace `#[test]` items: **58 tests** (57 active plus one ignored
 corpus-dump helper in `crates/browser/tests/html5lib.rs`).
 Integration suites do not reach into arena internals.
 
@@ -99,5 +103,5 @@ the whole matrix when anything about the transport changes.
 ## WPT runner (landed; testharness bar still open)
 
 The full WPT tree is pinned and driven by classic WebDriver (`./tools/wpt/run`) over `BrowserHandle`. Isolation is a fresh temporary `XDG_RUNTIME_DIR` and `XDG_DATA_HOME` per WebDriver endpoint (`tools/wpt/tinybrowser_wpt.py`). HTTPS tests are off (`--ssl-type none`) until cert trust exists.
-html5lib-tests remain the parser gate. A passing testharness
+html5lib-tests remain the parser gate until testharness runs `html/syntax/parsing/`. Browser-crate JS/DOM cargo tests (`createElementNS`, `nodeName`, `instanceof`) are stand-ins until the first testharness file is green; delete them then. A passing testharness
 file through that runner is the next evidence, not a claim of this landing.

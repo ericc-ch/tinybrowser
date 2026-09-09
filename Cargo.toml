@@ -3,6 +3,7 @@ members = [
     "crates/browser",
     "crates/cdp",
     "crates/dom",
+    "crates/http1",
     "crates/net",
     "crates/webdriver",
 ]
@@ -15,6 +16,7 @@ edition = "2024"
 browser = { path = "crates/browser" }
 cdp = { path = "crates/cdp" }
 dom = { path = "crates/dom" }
+http1 = { path = "crates/http1" }
 net = { path = "crates/net" }
 webdriver = { path = "crates/webdriver" }
 

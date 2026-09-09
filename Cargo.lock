@@ -77,6 +77,7 @@ version = "0.1.0"
 dependencies = [
  "base64",
  "browser",
+ "http1",
  "serde_json",
  "tungstenite",
 ]
@@ -363,6 +364,10 @@ dependencies = [
  "bytes",
  "itoa",
 ]
+
+[[package]]
+name = "http1"
+version = "0.1.0"
 
 [[package]]
 name = "httparse"
@@ -1398,6 +1403,7 @@ name = "webdriver"
 version = "0.1.0"
 dependencies = [
  "browser",
+ "http1",
  "serde_json",
 ]
 

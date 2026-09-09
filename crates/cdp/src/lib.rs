@@ -5,7 +5,7 @@
 //! method-not-found. Flattened `sessionId` routing on the browser socket.
 
 use std::collections::HashMap;
-use std::io::{self, Read, Write};
+use std::io::{self, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -16,8 +16,6 @@ use serde_json::{Value, json};
 use tungstenite::protocol::{Role, WebSocket};
 use tungstenite::{Message, handshake::derive_accept_key};
 
-const MAX_HEAD: usize = 65_536;
-const MAX_BODY: usize = 8_388_608;
 const PRODUCT: &str = "tinybrowser/0.1.0";
 
 /// Serves CDP HTTP discovery and WebSocket endpoints on `listener`.
@@ -132,8 +130,9 @@ fn connect_ws(addr: SocketAddr, path: &str) -> io::Result<Client> {
         "GET {path} HTTP/1.1\r\nHost: {host}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: {key}\r\n\r\n"
     );
     stream.write_all(request.as_bytes())?;
-    let (start, headers, _) = read_head(&mut stream)?;
-    let status = start
+    let message = http1::read_message(&mut stream)?;
+    let status = message
+        .start
         .split_whitespace()
         .nth(1)
         .and_then(|value| value.parse::<u16>().ok())
@@ -141,7 +140,7 @@ fn connect_ws(addr: SocketAddr, path: &str) -> io::Result<Client> {
     if status != 101 {
         return Err(io::Error::other(format!("ws handshake {status}")));
     }
-    let accept = header(&headers, "sec-websocket-accept");
+    let accept = message.header("sec-websocket-accept");
     if accept != Some(derive_accept_key(key.as_bytes()).as_str()) {
         return Err(io::Error::other("ws accept mismatch"));
     }
@@ -168,26 +167,23 @@ fn handle_connection(
     stop: Arc<AtomicBool>,
 ) -> io::Result<()> {
     stream.set_read_timeout(Some(Duration::from_secs(30)))?;
-    let (start, headers, _) = read_head(&mut stream)?;
-    let mut parts = start.split_whitespace();
-    let method = parts.next().unwrap_or("");
-    let path = parts.next().unwrap_or("/");
-    if method != "GET" {
-        write_http(&mut stream, 405, "text/plain", b"method not allowed")?;
+    let request = http1::read_request(&mut stream)?;
+    if request.method != "GET" {
+        http1::write_response(&mut stream, 405, "text/plain", b"method not allowed")?;
         return Ok(());
     }
-    if is_websocket(&headers) {
+    if is_websocket(&request) {
         stream.set_read_timeout(None)?;
-        return serve_socket(stream, path, &headers, browser, bound, stop);
+        return serve_socket(stream, &request, browser, bound, stop);
     }
-    match path {
+    match request.path.as_str() {
         "/json/version" | "/json/version/" => {
             let body = json!({
                 "Browser": PRODUCT,
                 "Protocol-Version": "1.3",
                 "webSocketDebuggerUrl": format!("ws://{bound}/devtools/browser"),
             });
-            write_http(
+            http1::write_response(
                 &mut stream,
                 200,
                 "application/json",
@@ -196,14 +192,14 @@ fn handle_connection(
         }
         "/json" | "/json/" | "/json/list" | "/json/list/" => {
             let body = json_list(&browser, bound);
-            write_http(
+            http1::write_response(
                 &mut stream,
                 200,
                 "application/json",
                 body.to_string().as_bytes(),
             )
         }
-        _ => write_http(&mut stream, 404, "text/plain", b"not found"),
+        _ => http1::write_response(&mut stream, 404, "text/plain", b"not found"),
     }
 }
 
@@ -225,21 +221,20 @@ fn json_list(browser: &BrowserHandle, bound: SocketAddr) -> Value {
     Value::Array(targets)
 }
 
-fn is_websocket(headers: &[(String, String)]) -> bool {
-    headers.iter().any(|(name, value)| {
-        name.eq_ignore_ascii_case("upgrade") && value.eq_ignore_ascii_case("websocket")
-    })
+fn is_websocket(request: &http1::Request) -> bool {
+    request
+        .header("upgrade")
+        .is_some_and(|value| value.eq_ignore_ascii_case("websocket"))
 }
 
 fn serve_socket(
     mut stream: TcpStream,
-    path: &str,
-    headers: &[(String, String)],
+    request: &http1::Request,
     browser: BrowserHandle,
     bound: SocketAddr,
     stop: Arc<AtomicBool>,
 ) -> io::Result<()> {
-    let page = match page_from_path(path, &browser) {
+    let page = match page_from_path(&request.path, &browser) {
         Ok(page) => page,
         Err(error) => {
             let status = if error.kind() == io::ErrorKind::NotFound {
@@ -247,7 +242,7 @@ fn serve_socket(
             } else {
                 400
             };
-            write_http(
+            http1::write_response(
                 &mut stream,
                 status,
                 "text/plain",
@@ -256,7 +251,8 @@ fn serve_socket(
             return Ok(());
         }
     };
-    let key = header(headers, "sec-websocket-key")
+    let key = request
+        .header("sec-websocket-key")
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing websocket key"))?;
     let accept = derive_accept_key(key.as_bytes());
     let response = format!(
@@ -592,80 +588,6 @@ fn attach_session(reply: &mut Value, session: Option<&str>) {
     {
         object.insert("sessionId".into(), json!(session));
     }
-}
-
-fn header<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
-    headers
-        .iter()
-        .find(|(key, _)| key.eq_ignore_ascii_case(name))
-        .map(|(_, value)| value.as_str())
-}
-
-type HttpHead = (String, Vec<(String, String)>, Vec<u8>);
-
-fn read_head(stream: &mut TcpStream) -> io::Result<HttpHead> {
-    let mut head = Vec::new();
-    let mut byte = [0_u8; 1];
-    while !head.windows(4).any(|window| window == b"\r\n\r\n") {
-        if head.len() >= MAX_HEAD {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "request head too large",
-            ));
-        }
-        let read = stream.read(&mut byte)?;
-        if read == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "closed during head",
-            ));
-        }
-        head.push(byte[0]);
-    }
-    let text = String::from_utf8_lossy(&head);
-    let mut lines = text.split("\r\n");
-    let start = lines.next().unwrap_or("").to_owned();
-    let mut headers = Vec::new();
-    let mut content_length = 0_usize;
-    for line in lines {
-        if line.is_empty() {
-            break;
-        }
-        let Some((name, value)) = line.split_once(':') else {
-            continue;
-        };
-        if name.eq_ignore_ascii_case("content-length") {
-            content_length = value.trim().parse().unwrap_or(0);
-        }
-        headers.push((name.trim().to_owned(), value.trim().to_owned()));
-    }
-    if content_length > MAX_BODY {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "request body too large",
-        ));
-    }
-    let mut body = vec![0_u8; content_length];
-    if content_length > 0 {
-        stream.read_exact(&mut body)?;
-    }
-    Ok((start, headers, body))
-}
-
-fn write_http(stream: &mut TcpStream, status: u16, ctype: &str, body: &[u8]) -> io::Result<()> {
-    let reason = match status {
-        200 => "OK",
-        400 => "Bad Request",
-        404 => "Not Found",
-        405 => "Method Not Allowed",
-        _ => "Error",
-    };
-    let head = format!(
-        "HTTP/1.1 {status} {reason}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-        body.len()
-    );
-    stream.write_all(head.as_bytes())?;
-    stream.write_all(body)
 }
 
 fn ws_io(err: tungstenite::Error) -> io::Error {

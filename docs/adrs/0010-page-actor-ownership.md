@@ -55,3 +55,4 @@ Wrapper caches and host objects live on the actor. One `JsNode` host class plus 
 
 - WebDriver and CDP both drive `PageHandle` through `BrowserHandle`. Neither holds DOM or QuickJS values.
 - `Page::block_on_pump` and `Page::execute_script` are internal to the actor.
+- `Page` stays one owner. The `page` module is split by job (`pump`, `navigate`, `intern`) without extra types.

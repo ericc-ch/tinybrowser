@@ -38,7 +38,7 @@ Qualified element name: namespace plus optional prefix plus local name. Comes fr
 _Avoid_: tag name (only the local part)
 
 **Fan-in point**:
-The `browser` crate: engine (parser, page, QuickJS). Root `tinybrowser` depends on `browser`, `cdp`, and `webdriver`. Root must not depend on `dom` or `net`. Both protocol crates depend on `browser`, never on each other ([ADR 0007](adrs/0007-engine-charter.md)).
+The `browser` crate: engine (parser, page, QuickJS). Root `tinybrowser` depends on `browser`, `cdp`, and `webdriver`. Root must not depend on `dom` or `net`. Both protocol crates depend on `browser` and `http1`, never on each other ([ADR 0007](adrs/0007-engine-charter.md)).
 _Avoid_: “only crate that may import two layers” as a religion; `cargo test -p dom` is allowed
 
 **Scope**:
@@ -143,6 +143,10 @@ _Avoid_: CDP (CLI/agent control, not the WPT driver), WebDriver as owner of Brow
 Ordered `--resolve=PATTERN=ADDR` rewrites on `AgentBuilder`; `PATTERN` is an exact host or `*` glob, `ADDR` is an IPv4 literal or `fail`. First match wins. Default is empty (libc DNS). `./tools/wpt/run` passes the `.test` lines and skips WPT’s `/etc/hosts` check; the binary does not remap unless the flag is set.
 _Avoid_: hosts file, `/etc/hosts` for WPT
 
+**http1**:
+Inbound HTTP/1.1 reader/writer for loopback protocol adapters (CDP discovery, WebDriver REST). Request-line, headers, `Content-Length`. Not the outbound `net` client. No hyper or axum ([ADR 0007](adrs/0007-engine-charter.md)).
+_Avoid_: putting this in `net` (outbound client) or `browser` (engine)
+
 **WPT gate**:
-web-platform-tests is the suite for web-visible behavior (DOM, HTML, fetch, cookies, WebSocket as JS sees them). Browser-crate JS/DOM tests stay until testharness actually completes through WebDriver; they are not a second web suite.
-_Avoid_: “WPT covers net” (it does not import `net::Agent`; transport unit tests are a different layer)
+web-platform-tests is the suite for web-visible behavior (DOM, HTML, fetch, cookies, WebSocket as JS sees them). `./tools/wpt/run` is that gate. `cargo test` covers product and transport: daemon lock, CDP flatten, WebDriver one-session, pump vs unrelated fetch, cookie file mode, CLI flag errors, `net::Agent`. html5lib-tests stay the parser gate until testharness runs `html/syntax/parsing/`. Browser-crate JS/DOM cargo tests are stand-ins until the first testharness file is green; delete them then.
+_Avoid_: “WPT covers net” (it does not import `net::Agent`; transport unit tests are a different layer), growing a second web suite in `cargo test`

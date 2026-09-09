@@ -2,7 +2,8 @@
 //! (HTML jobs, `NetworkSession`, `QuickJS` host). Depends on `dom` and `net`
 //! ([ADR 0007](../../../docs/adrs/0007-engine-charter.md)).
 //!
-//! The `cdp` crate depends on this crate alone. Browser owns
+//! The `cdp` and `webdriver` crates depend on this crate and on `http1`.
+//! They do not depend on each other, `dom`, or `net`. Browser owns
 //! [`NetworkSession`] ([ADR 0010](../../../docs/adrs/0010-page-actor-ownership.md)).
 //! Blocking send runs through `spawn_blocking` on the page thread.
 

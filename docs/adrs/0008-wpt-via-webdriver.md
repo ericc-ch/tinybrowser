@@ -26,7 +26,7 @@ The exact launch flag may stay `--webdriver=PORT` or change. That flag is open. 
 - Hosts: `./tools/wpt/run` skips WPT’s `/etc/hosts` check and launches `tinybrowser --webdriver=PORT --resolve=*.test=127.0.0.1` (plus `nonexistent.*.test=fail` and `*.test.`). No machine hosts file. Do not patch vendored WPT.
 - `./tools/wpt/run` passes `--no-pause-after-test` (wptrunner otherwise pauses after a single file, and testharness `output: 1` never finishes on our DOM) and `--no-restart-on-unexpected`.
 - Testdriver user-input tests are skipped (`supports_testdriver = False`) until click/send_keys are real. The testharness executor still uses testdriver `run()` for result collection. Click and actions endpoints return `unsupported operation` until they change browser state.
-- html5lib-tests stay the parser gate until testharness runs `html/syntax/parsing/`. Browser-crate JS/DOM tests stay until that green bar exists.
+- html5lib-tests stay the parser gate until testharness runs `html/syntax/parsing/`. Browser-crate JS/DOM cargo tests are stand-ins until the first testharness file is green; delete them then. They are not a second web suite.
 
 Invocation: `pip install -e tools/wpt` into the WPT venv, then `./tools/wpt/run [tests]`.
 

@@ -7,7 +7,6 @@
 //! or the cookie jar.
 
 use std::collections::HashMap;
-use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::time::{Duration, Instant};
 
@@ -17,8 +16,6 @@ use serde_json::{Value, json};
 pub use browser::AgentBuilder;
 
 const ELEMENT_KEY: &str = "element-6066-11e4-a52e-4f735466cecf";
-const MAX_HEAD: usize = 65_536;
-const MAX_BODY: usize = 8_388_608;
 const DEFAULT_SCRIPT_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_PAGE_LOAD_TIMEOUT: Duration = Duration::from_secs(300);
 
@@ -92,9 +89,20 @@ impl Sessions {
 }
 
 fn handle_connection(mut stream: TcpStream, sessions: &mut Sessions) -> std::io::Result<()> {
-    let (method, path, body) = read_request(&mut stream)?;
-    let (status, payload) = dispatch(&method, &path, &body, sessions);
-    write_response(&mut stream, status, &payload)
+    let request = http1::read_request(&mut stream)?;
+    let method = if request.method.is_empty() {
+        "GET".to_owned()
+    } else {
+        request.method
+    };
+    let body = String::from_utf8_lossy(&request.body).into_owned();
+    let (status, payload) = dispatch(&method, &request.path, &body, sessions);
+    http1::write_response(
+        &mut stream,
+        status,
+        "application/json; charset=utf-8",
+        payload.to_string().as_bytes(),
+    )
 }
 
 fn dispatch(method: &str, path: &str, body: &str, sessions: &mut Sessions) -> (u16, Value) {
@@ -479,69 +487,4 @@ fn error(status: u16, err: &str, message: &str) -> (u16, Value) {
         status,
         json!({"value": {"error": err, "message": message, "stacktrace": ""}}),
     )
-}
-
-fn read_request(stream: &mut TcpStream) -> std::io::Result<(String, String, String)> {
-    let mut head = Vec::new();
-    let mut byte = [0_u8; 1];
-    while !head.windows(4).any(|window| window == b"\r\n\r\n") {
-        if head.len() >= MAX_HEAD {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "request head too large",
-            ));
-        }
-        let read = stream.read(&mut byte)?;
-        if read == 0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                "closed",
-            ));
-        }
-        head.push(byte[0]);
-    }
-    let text = String::from_utf8_lossy(&head);
-    let mut lines = text.split("\r\n");
-    let request = lines.next().unwrap_or("");
-    let mut parts = request.split_whitespace();
-    let method = parts.next().unwrap_or("GET").to_owned();
-    let path = parts.next().unwrap_or("/").to_owned();
-    let mut content_length = 0_usize;
-    for line in lines {
-        let Some((name, value)) = line.split_once(':') else {
-            continue;
-        };
-        if name.eq_ignore_ascii_case("content-length")
-            && let Ok(length) = value.trim().parse()
-        {
-            content_length = length;
-        }
-    }
-    if content_length > MAX_BODY {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "request body too large",
-        ));
-    }
-    let mut body = vec![0_u8; content_length];
-    if content_length > 0 {
-        stream.read_exact(&mut body)?;
-    }
-    Ok((method, path, String::from_utf8_lossy(&body).into_owned()))
-}
-
-fn write_response(stream: &mut TcpStream, status: u16, payload: &Value) -> std::io::Result<()> {
-    let body = payload.to_string();
-    let reason = match status {
-        200 => "OK",
-        400 => "Bad Request",
-        404 => "Not Found",
-        _ => "Error",
-    };
-    let head = format!(
-        "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-        body.len()
-    );
-    stream.write_all(head.as_bytes())?;
-    stream.write_all(body.as_bytes())
 }
