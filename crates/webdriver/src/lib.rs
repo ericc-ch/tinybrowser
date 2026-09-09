@@ -9,7 +9,7 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use browser::{BrowserHandle, PageError, PageHandle, RemoteValue, ScriptFailure};
 use serde_json::{Value, json};
@@ -137,9 +137,15 @@ fn dispatch(method: &str, path: &str, body: &str, sessions: &mut Sessions) -> (u
         }
         ("POST", ["session", session, "timeouts"]) => set_timeouts(sessions, session, body),
         ("GET", ["session", session, "timeouts"]) => get_timeouts(sessions, session),
-        ("POST", ["session", _session, "element", _, "click"]) => ok(Value::Null),
-        ("POST", ["session", _session, "actions"]) => ok(Value::Null),
-        ("DELETE", ["session", _session, "actions"]) => ok(Value::Null),
+        ("POST", ["session", _session, "element", _, "click"]) => {
+            error(500, "unsupported operation", "element click")
+        }
+        ("POST", ["session", _session, "actions"]) => {
+            error(500, "unsupported operation", "actions")
+        }
+        ("DELETE", ["session", _session, "actions"]) => {
+            error(500, "unsupported operation", "release actions")
+        }
         _ => error(404, "unknown command", path),
     }
 }
@@ -203,19 +209,26 @@ fn execute(sessions: &mut Sessions, session: &str, body: &str, asynchronous: boo
     let Some(window) = current(sessions, session) else {
         return error(404, "invalid session id", session);
     };
+    let started = Instant::now();
     let wrapped = wrap_script(script, &args, asynchronous);
     match window
         .page
         .execute_script_timeout(&wrapped, Some(script_timeout))
     {
         Err(err) => script_error(&err),
-        Ok(_) if asynchronous => wait_for_async(window, script_timeout),
+        Ok(_) if asynchronous => wait_for_async(window, remaining(started, script_timeout)),
         Ok(value) => match window.page.execute_script("globalThis.__wd_wait === true") {
-            Ok(RemoteValue::Bool(true)) => wait_for_async(window, script_timeout),
+            Ok(RemoteValue::Bool(true)) => {
+                wait_for_async(window, remaining(started, script_timeout))
+            }
             Ok(_) => ok(encode(&value)),
             Err(err) => script_error(&err),
         },
     }
+}
+
+fn remaining(started: Instant, budget: Duration) -> Duration {
+    budget.saturating_sub(started.elapsed())
 }
 
 fn wait_for_async(window: &Window, script_timeout: Duration) -> (u16, Value) {
@@ -227,8 +240,16 @@ fn wait_for_async(window: &Window, script_timeout: Duration) -> (u16, Value) {
         Ok(true) => {}
         Err(err) => return error(500, "unknown error", &err.to_string()),
     }
-    match window.page.execute_script("globalThis.__wd_err") {
-        Ok(RemoteValue::String(message)) if !message.is_empty() => {
+    match window
+        .page
+        .execute_script("globalThis.__wd_failed === true")
+    {
+        Ok(RemoteValue::Bool(true)) => {
+            let message = match window.page.execute_script("String(globalThis.__wd_err)") {
+                Ok(RemoteValue::String(text)) => text,
+                Ok(_) => "javascript error".to_owned(),
+                Err(err) => return script_error(&err),
+            };
             return error(500, "javascript error", &message);
         }
         Ok(_) => {}
@@ -255,6 +276,7 @@ fn wrap_script(script: &str, args: &Value, asynchronous: bool) -> String {
         format!(
             "globalThis.__wd_async = undefined;\n\
              globalThis.__wd_err = undefined;\n\
+             globalThis.__wd_failed = false;\n\
              globalThis.__wd_done = false;\n\
              globalThis.__wd_wait = false;\n\
              (function() {{ {script} }}).apply(null, {args_json}.concat([function(v) {{ \
@@ -266,6 +288,7 @@ fn wrap_script(script: &str, args: &Value, asynchronous: bool) -> String {
         format!(
             "globalThis.__wd_async = undefined;\n\
              globalThis.__wd_err = undefined;\n\
+             globalThis.__wd_failed = false;\n\
              globalThis.__wd_done = false;\n\
              globalThis.__wd_wait = false;\n\
              (function() {{\n\
@@ -275,6 +298,7 @@ fn wrap_script(script: &str, args: &Value, asynchronous: bool) -> String {
                    globalThis.__wd_async = v === undefined ? null : v;\n\
                    globalThis.__wd_done = true;\n\
                  }}, function(e) {{\n\
+                   globalThis.__wd_failed = true;\n\
                    globalThis.__wd_err = e == null ? 'undefined' : (e && e.message ? String(e.message) : String(e));\n\
                    globalThis.__wd_done = true;\n\
                  }});\n\

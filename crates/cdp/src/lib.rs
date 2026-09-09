@@ -124,6 +124,8 @@ impl Client {
 
 fn connect_ws(addr: SocketAddr, path: &str) -> io::Result<Client> {
     let mut stream = TcpStream::connect(addr)?;
+    stream.set_read_timeout(Some(Duration::from_secs(30)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(30)))?;
     let key = client_key();
     let host = addr.to_string();
     let request = format!(

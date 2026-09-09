@@ -63,6 +63,7 @@ enum Mode {
 fn parse_mode(args: &[String]) -> Result<Mode, String> {
     let mut port = None;
     let mut daemon = false;
+    let mut resolve = false;
     let mut profile = Profile::default();
     let mut builder = AgentBuilder::new();
     let mut rest = Vec::new();
@@ -73,6 +74,7 @@ fn parse_mode(args: &[String]) -> Result<Mode, String> {
             port = Some(parse_port(value)?);
         } else if let Some(spec) = arg.strip_prefix("--resolve=") {
             builder = builder.resolve(spec).map_err(|err| err.to_string())?;
+            resolve = true;
         } else if arg == "--daemon" {
             daemon = true;
         } else if let Some(value) = arg.strip_prefix("--profile=") {
@@ -90,6 +92,12 @@ fn parse_mode(args: &[String]) -> Result<Mode, String> {
         index += 1;
     }
     if daemon {
+        if port.is_some() {
+            return Err("--daemon and --webdriver are mutually exclusive".to_owned());
+        }
+        if resolve {
+            return Err("--daemon and --resolve are mutually exclusive".to_owned());
+        }
         return Ok(Mode::Daemon { profile });
     }
     if let Some(port) = port {

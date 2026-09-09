@@ -59,6 +59,28 @@ fn page_handle_commands_are_values_only() {
 }
 
 #[test]
+fn execute_script_reuses_one_remote_id_for_the_same_node() {
+    let data_home = temp_data_home();
+    let browser = Browser::open_in(&data_home, &Profile::default());
+    let page = browser.handle().create_page().expect("page");
+    page.load_html("<!doctype html><p>hi</p>").expect("load");
+    let value = page
+        .execute_script("[document.body, document.body]")
+        .expect("pair");
+    let RemoteValue::List(items) = value else {
+        panic!("expected list, got {value:?}");
+    };
+    assert_eq!(items.len(), 2, "{items:?}");
+    match (&items[0], &items[1]) {
+        (RemoteValue::Node(first), RemoteValue::Node(second)) => {
+            assert_eq!(first, second, "same node must intern to one remote id");
+        }
+        other => panic!("expected node pair, got {other:?}"),
+    }
+    let _ = std::fs::remove_dir_all(data_home);
+}
+
+#[test]
 fn webidl_node_name_doctype_and_branding() {
     let data_home = temp_data_home();
     let browser = Browser::open_in(&data_home, &Profile::default());
@@ -104,6 +126,22 @@ fn webidl_node_name_doctype_and_branding() {
               (function() {{
                 try {{ document.createElementNS("http://example.test", "xml:x"); return "no"; }}
                 catch (e) {{ return String(e).indexOf("NamespaceError") >= 0; }}
+              }})(),
+              (function() {{
+                try {{ document.createElementNS("{htmlns}", "a:b:c"); return "no"; }}
+                catch (e) {{ return String(e).indexOf("InvalidCharacterError") >= 0; }}
+              }})(),
+              (function() {{
+                try {{ document.createElementNS("{htmlns}", ":a"); return "no"; }}
+                catch (e) {{ return String(e).indexOf("InvalidCharacterError") >= 0; }}
+              }})(),
+              (function() {{
+                try {{ document.createElementNS("{htmlns}", "a:"); return "no"; }}
+                catch (e) {{ return String(e).indexOf("InvalidCharacterError") >= 0; }}
+              }})(),
+              (function() {{
+                Element = 1;
+                return document.createElement("p").nodeName;
               }})()
             ].join("|")
             "#
@@ -111,7 +149,7 @@ fn webidl_node_name_doctype_and_branding() {
         .expect("webidl");
     assert_eq!(
         got,
-        "I|I|svg|SVG|X:B|#text|#comment|#document|html|#document-fragment|function|true|true|true|true|true|true|true|true|true|true|true|true|true|true"
+        "I|I|svg|SVG|X:B|#text|#comment|#document|html|#document-fragment|function|true|true|true|true|true|true|true|true|true|true|true|true|true|true|true|true|true|P"
     );
     let _ = std::fs::remove_dir_all(data_home);
 }

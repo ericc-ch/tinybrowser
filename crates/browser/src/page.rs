@@ -204,6 +204,7 @@ pub struct Page {
     runtime: Option<Runtime>,
     stop: Arc<Stop>,
     next_remote: u64,
+    remote_by_node: HashMap<dom::NodeId, u64>,
 }
 
 impl Default for Page {
@@ -276,6 +277,7 @@ impl Page {
             runtime: None,
             stop,
             next_remote: 0,
+            remote_by_node: HashMap::new(),
         }
     }
 
@@ -470,8 +472,12 @@ impl Page {
                     .map(|(key, item)| (key, self.intern_script(item)))
                     .collect(),
             ),
-            ScriptValue::Node(_) => {
+            ScriptValue::Node(id) => {
+                if let Some(&remote) = self.remote_by_node.get(&id) {
+                    return crate::RemoteValue::Node(remote);
+                }
                 self.next_remote = self.next_remote.saturating_add(1);
+                self.remote_by_node.insert(id, self.next_remote);
                 crate::RemoteValue::Node(self.next_remote)
             }
         }
@@ -548,10 +554,18 @@ impl Page {
         mut stop: impl FnMut(&mut Self) -> bool,
     ) -> bool {
         let deadline = Instant::now() + timeout;
+        let mut done = false;
         self.block_on_pump(Some(deadline), |page| {
-            Instant::now() < deadline && !stop(page) && !page.stopped()
+            if Instant::now() >= deadline || page.stopped() {
+                return false;
+            }
+            if stop(page) {
+                done = true;
+                return false;
+            }
+            true
         });
-        stop(self)
+        done
     }
 
     fn block_on_pump(&mut self, cap: Option<Instant>, keep_waiting: impl FnMut(&mut Self) -> bool) {
@@ -903,6 +917,7 @@ impl Page {
         self.js = None;
         self.pending_classic.clear();
         self.classic_fetch_in_flight = false;
+        self.remote_by_node.clear();
     }
 
     fn ensure_js(&mut self) -> Result<(), PageError> {

@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use dom::NodeId;
-use rquickjs::{Persistent, Value, function::Function};
+use rquickjs::{Object, Persistent, Value, function::Function};
 use url::Url;
 
 use crate::Parsed;
@@ -33,6 +33,7 @@ pub(crate) struct World {
     pub document_ready: bool,
     listeners: HashMap<EventTargetKey, Vec<Listener>>,
     wrappers: HashMap<NodeId, Persistent<Value<'static>>>,
+    brands: HashMap<&'static str, Persistent<Object<'static>>>,
 }
 
 impl World {
@@ -45,6 +46,7 @@ impl World {
             document_ready: false,
             listeners: HashMap::new(),
             wrappers: HashMap::new(),
+            brands: HashMap::new(),
         }
     }
 
@@ -62,6 +64,7 @@ impl World {
     pub(crate) fn clear_listeners(&mut self) {
         self.listeners.clear();
         self.wrappers.clear();
+        self.brands.clear();
     }
 
     pub(crate) fn wrapper(&self, id: NodeId) -> Option<Persistent<Value<'static>>> {
@@ -70,6 +73,14 @@ impl World {
 
     pub(crate) fn intern_wrapper(&mut self, id: NodeId, value: Persistent<Value<'static>>) {
         self.wrappers.insert(id, value);
+    }
+
+    pub(crate) fn intern_brand(&mut self, name: &'static str, proto: Persistent<Object<'static>>) {
+        self.brands.insert(name, proto);
+    }
+
+    pub(crate) fn brand(&self, name: &str) -> Option<Persistent<Object<'static>>> {
+        self.brands.get(name).cloned()
     }
 
     pub(crate) fn listeners(
@@ -91,9 +102,9 @@ impl World {
 pub(crate) struct SharedWorld(pub Rc<RefCell<World>>);
 
 #[allow(unsafe_code)]
-// SAFETY: `SharedWorld` is an `Rc` to page state. Listener and wrapper
-// persistents are dropped in `clear_listeners` / `replace_document` before
-// `JsHost` drops the runtime they were saved from.
+// SAFETY: `SharedWorld` is an `Rc` to page state. Listener, wrapper, and
+// brand persistents are dropped in `clear_listeners` / `replace_document`
+// before `JsHost` drops the runtime they were saved from.
 unsafe impl rquickjs::JsLifetime<'_> for SharedWorld {
     type Changed<'to> = SharedWorld;
 }

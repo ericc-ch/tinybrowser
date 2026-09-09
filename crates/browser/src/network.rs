@@ -7,7 +7,7 @@ use std::env;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -20,6 +20,7 @@ use crate::profile::{Profile, ProfileName};
 pub(crate) const PAGE_FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 
 const COOKIES_VERSION: &str = "tinybrowser-cookies-v1";
+static COOKIE_TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// Durable backing for one Profile under `XDG_DATA_HOME`.
 pub struct ProfileStore {
@@ -135,7 +136,8 @@ impl ProfileStore {
             return;
         }
         let path = dir.join("cookies");
-        let tmp = dir.join(format!("cookies.{}.tmp", std::process::id()));
+        let seq = COOKIE_TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let tmp = dir.join(format!("cookies.{}.{seq}.tmp", std::process::id()));
         let encoded = encode_cookies(&agent.export_cookies());
         if fs::write(&tmp, &encoded).is_ok() {
             let _ = restrict_file(&tmp);

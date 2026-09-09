@@ -25,7 +25,7 @@ fixtures miss.
 The suite keeps only high-signal public-boundary gates: the html5lib corpus,
 an independent DOM mutation model, selector state matrices, browser page-loop
 journeys, and compact HTTP/WebSocket/cookie/error transcripts. Counted 2026-09-09
-from workspace `#[test]` items: **51 tests** (50 active plus one ignored
+from workspace `#[test]` items: **54 tests** (53 active plus one ignored
 corpus-dump helper in `crates/browser/tests/html5lib.rs`).
 Integration suites do not reach into arena internals.
 

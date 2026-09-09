@@ -91,13 +91,16 @@ class TinyBrowser(WebDriverBrowser):
         ] + self.webdriver_args
 
     def stop(self, force=False):
-        success = super().stop(force=force)
-        self._remove_profile()
-        return success
+        try:
+            return super().stop(force=force)
+        finally:
+            self._remove_profile()
 
     def cleanup(self):
-        super().cleanup()
-        self._remove_profile()
+        try:
+            super().cleanup()
+        finally:
+            self._remove_profile()
 
     def _ensure_profile(self):
         if self._profile_root is not None:

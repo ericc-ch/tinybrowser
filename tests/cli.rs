@@ -1,50 +1,16 @@
+mod common;
+
 use std::io::{Read, Write};
-use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
-fn stamp() -> u128 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("time")
-        .as_nanos()
-}
+use common::Fixture;
 
-fn temp_dirs() -> (PathBuf, PathBuf) {
-    let root = std::env::temp_dir().join(format!("tinybrowser-cli-{}", stamp()));
-    let runtime = root.join("run");
-    let data = root.join("data");
-    std::fs::create_dir_all(&runtime).expect("runtime");
-    std::fs::create_dir_all(&data).expect("data");
-    (runtime, data)
-}
-
-fn spawn_daemon(runtime: &Path, data: &Path) -> Child {
-    Command::new(env!("CARGO_BIN_EXE_tinybrowser"))
-        .args(["--daemon"])
-        .env("XDG_RUNTIME_DIR", runtime)
-        .env("XDG_DATA_HOME", data)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("daemon")
-}
-
-fn wait_daemon(runtime: &Path) {
-    let path = runtime.join("tinybrowser/default/daemon.json");
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while std::fs::read_to_string(&path).is_err() {
-        assert!(Instant::now() < deadline, "daemon missing");
-        std::thread::sleep(Duration::from_millis(20));
-    }
-}
-
-fn cli(runtime: &Path, data: &Path, args: &[&str]) -> String {
+fn cli(fixture: &Fixture, args: &[&str]) -> String {
     let output = Command::new(env!("CARGO_BIN_EXE_tinybrowser"))
         .args(args)
-        .env("XDG_RUNTIME_DIR", runtime)
-        .env("XDG_DATA_HOME", data)
+        .env("XDG_RUNTIME_DIR", &fixture.runtime)
+        .env("XDG_DATA_HOME", &fixture.data)
         .output()
         .expect("cli");
     assert!(
@@ -56,60 +22,90 @@ fn cli(runtime: &Path, data: &Path, args: &[&str]) -> String {
     String::from_utf8_lossy(&output.stdout).into_owned()
 }
 
-#[test]
-fn create_list_eval_close_over_cdp() {
-    let (runtime, data) = temp_dirs();
-    let mut daemon = spawn_daemon(&runtime, &data);
-    wait_daemon(&runtime);
-
-    let created = cli(&runtime, &data, &["create"]).trim().to_owned();
-    assert!(!created.is_empty(), "create id");
-    let listed = cli(&runtime, &data, &["list"]);
-    assert!(listed.contains(&created), "{listed}");
-    let eval = cli(&runtime, &data, &["eval", "1+2"]).trim().to_owned();
-    assert!(eval == "3" || eval == "3.0", "eval={eval}");
-    cli(&runtime, &data, &["close", &created]);
-    let listed = cli(&runtime, &data, &["list"]);
-    assert!(!listed.contains(&created), "{listed}");
-
-    let _ = daemon.kill();
-    let _ = daemon.wait();
-    let _ = std::fs::remove_dir_all(runtime.parent().expect("root"));
-}
-
-fn kill_registered(runtime: &Path) {
-    let path = runtime.join("tinybrowser/default/daemon.json");
-    if let Ok(text) = std::fs::read_to_string(path)
-        && let Ok(value) = serde_json::from_str::<serde_json::Value>(&text)
-        && let Some(pid) = value["pid"].as_u64()
-    {
-        let _ = Command::new("kill").arg(pid.to_string()).status();
-    }
-}
-
-fn cli_status(runtime: &Path, data: &Path, args: &[&str]) -> std::process::Output {
+fn cli_status(fixture: &Fixture, args: &[&str]) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_tinybrowser"))
         .args(args)
-        .env("XDG_RUNTIME_DIR", runtime)
-        .env("XDG_DATA_HOME", data)
+        .env("XDG_RUNTIME_DIR", &fixture.runtime)
+        .env("XDG_DATA_HOME", &fixture.data)
         .output()
         .expect("cli")
 }
 
 #[test]
-fn cli_autostarts_daemon_and_select_navigate_close_last() {
-    let (runtime, data) = temp_dirs();
-    let created = cli(&runtime, &data, &["create"]).trim().to_owned();
-    assert!(!created.is_empty(), "create id");
-    wait_daemon(&runtime);
+fn create_list_eval_close_over_cdp() {
+    let mut fixture = Fixture::new("tinybrowser-cli");
+    fixture.spawn_daemon();
+    let _ = fixture.wait_json();
 
-    let other = cli(&runtime, &data, &["create"]).trim().to_owned();
-    cli(&runtime, &data, &["select", &created]);
+    let created = cli(&fixture, &["create"]).trim().to_owned();
+    assert!(!created.is_empty(), "create id");
+    let listed = cli(&fixture, &["list"]);
+    assert!(listed.contains(&created), "{listed}");
+    let eval = cli(&fixture, &["eval", "1+2"]).trim().to_owned();
+    assert!(eval == "3" || eval == "3.0", "eval={eval}");
+    cli(&fixture, &["close", &created]);
+    let listed = cli(&fixture, &["list"]);
+    assert!(!listed.contains(&created), "{listed}");
+}
+
+#[test]
+fn daemon_rejects_webdriver_and_resolve() {
+    let webdriver = Command::new(env!("CARGO_BIN_EXE_tinybrowser"))
+        .args(["--daemon", "--webdriver=9"])
+        .stdin(Stdio::null())
+        .output()
+        .expect("cli");
+    assert!(!webdriver.status.success());
+    let err = String::from_utf8_lossy(&webdriver.stderr);
+    assert!(
+        err.contains("--daemon and --webdriver are mutually exclusive"),
+        "{err}"
+    );
+
+    let resolve = Command::new(env!("CARGO_BIN_EXE_tinybrowser"))
+        .args(["--daemon", "--resolve=*.test=127.0.0.1"])
+        .stdin(Stdio::null())
+        .output()
+        .expect("cli");
+    assert!(!resolve.status.success());
+    let err = String::from_utf8_lossy(&resolve.stderr);
+    assert!(
+        err.contains("--daemon and --resolve are mutually exclusive"),
+        "{err}"
+    );
+}
+
+#[test]
+fn cli_autostarts_daemon_and_select_navigate_close_last() {
+    let fixture = Fixture::new("tinybrowser-cli");
+    let created = cli(&fixture, &["create"]).trim().to_owned();
+    assert!(!created.is_empty(), "create id");
+    let _ = fixture.wait_json();
+
+    let other = cli(&fixture, &["create"]).trim().to_owned();
+    cli(&fixture, &["select", &created]);
 
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("page bind");
+    listener
+        .set_nonblocking(true)
+        .expect("accept must not hang the test");
     let page_addr = listener.local_addr().expect("page addr");
     let page_server = std::thread::spawn(move || {
-        let (mut stream, _) = listener.accept().expect("accept");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let (mut stream, _) = loop {
+            match listener.accept() {
+                Ok(pair) => break pair,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(Instant::now() < deadline, "CLI never connected");
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Err(error) => panic!("accept: {error}"),
+            }
+        };
+        stream.set_nonblocking(false).expect("blocking");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("read timeout");
         let mut buf = [0_u8; 512];
         let _ = stream.read(&mut buf);
         let body = b"<!doctype html><p id=ok>nav</p>";
@@ -120,14 +116,9 @@ fn cli_autostarts_daemon_and_select_navigate_close_last() {
         stream.write_all(response.as_bytes()).expect("head");
         stream.write_all(body).expect("body");
     });
-    cli(
-        &runtime,
-        &data,
-        &["navigate", &format!("http://{page_addr}/")],
-    );
+    cli(&fixture, &["navigate", &format!("http://{page_addr}/")]);
     let eval = cli(
-        &runtime,
-        &data,
+        &fixture,
         &[
             "eval",
             "document.getElementsByTagName('p')[0].firstChild.data",
@@ -138,17 +129,14 @@ fn cli_autostarts_daemon_and_select_navigate_close_last() {
     assert_eq!(eval, "\"nav\"", "eval={eval}");
     page_server.join().expect("page server");
 
-    cli(&runtime, &data, &["close"]);
-    let listed = cli(&runtime, &data, &["list"]);
+    cli(&fixture, &["close"]);
+    let listed = cli(&fixture, &["list"]);
     assert!(!listed.contains(&created), "{listed}");
     assert!(listed.contains(&other), "{listed}");
 
-    cli(&runtime, &data, &["close"]);
-    let listed = cli(&runtime, &data, &["list"]);
+    cli(&fixture, &["close"]);
+    let listed = cli(&fixture, &["list"]);
     assert!(listed.trim().is_empty(), "{listed}");
-    let failed = cli_status(&runtime, &data, &["eval", "1"]);
+    let failed = cli_status(&fixture, &["eval", "1"]);
     assert!(!failed.status.success());
-
-    kill_registered(&runtime);
-    let _ = std::fs::remove_dir_all(runtime.parent().expect("root"));
 }

@@ -139,6 +139,14 @@ fn execute_sync_waits_for_returned_promise_or_script_timeout() {
     );
     assert_eq!(rejected["value"]["error"], json!("javascript error"));
 
+    let empty_reject = request(
+        &addr,
+        "POST",
+        &format!("/session/{id}/execute/sync"),
+        Some(r#"{"script":"return Promise.reject('')","args":[]}"#),
+    );
+    assert_eq!(empty_reject["value"]["error"], json!("javascript error"));
+
     let wait_object = request(
         &addr,
         "POST",
@@ -166,6 +174,28 @@ fn execute_sync_waits_for_returned_promise_or_script_timeout() {
     assert!(
         started.elapsed() < Duration::from_secs(2),
         "script timeout waited {:?}",
+        started.elapsed()
+    );
+
+    request(
+        &addr,
+        "POST",
+        &format!("/session/{id}/timeouts"),
+        Some(r#"{"script":400}"#),
+    );
+    let started = Instant::now();
+    let remaining_budget = request(
+        &addr,
+        "POST",
+        &format!("/session/{id}/execute/sync"),
+        Some(
+            r#"{"script":"var t = Date.now(); while (Date.now() - t < 250) {} return new Promise(function(resolve) { setTimeout(function() { resolve(1); }, 250); });","args":[]}"#,
+        ),
+    );
+    assert_eq!(remaining_budget["value"]["error"], json!("script timeout"));
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "shared script timeout waited {:?}",
         started.elapsed()
     );
 }
@@ -362,4 +392,25 @@ fn execute_sync_interrupts_infinite_loop() {
         "interrupt waited {:?}",
         started.elapsed()
     );
+}
+
+#[test]
+fn click_and_actions_are_unsupported() {
+    let (addr, _browser) = start(AgentBuilder::new());
+    let created = request(&addr, "POST", "/session", Some("{}"));
+    let id = created["value"]["sessionId"]
+        .as_str()
+        .expect("session id")
+        .to_owned();
+    let click = request(
+        &addr,
+        "POST",
+        &format!("/session/{id}/element/1/click"),
+        Some("{}"),
+    );
+    assert_eq!(click["value"]["error"], json!("unsupported operation"));
+    let actions = request(&addr, "POST", &format!("/session/{id}/actions"), Some("{}"));
+    assert_eq!(actions["value"]["error"], json!("unsupported operation"));
+    let released = request(&addr, "DELETE", &format!("/session/{id}/actions"), None);
+    assert_eq!(released["value"]["error"], json!("unsupported operation"));
 }

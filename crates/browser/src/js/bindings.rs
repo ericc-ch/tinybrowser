@@ -90,7 +90,7 @@ impl JsNode {
     }
     #[qjs(get, rename = "nodeType")]
     fn node_type(&self, ctx: Ctx<'_>) -> Result<i32> {
-        match node_kind(&ctx, self.handle.0)? {
+        with_node_kind(&ctx, self.handle.0, |kind| match kind {
             Some(NodeKind::Element { .. }) => Ok(1),
             Some(NodeKind::Text { .. }) => Ok(3),
             Some(NodeKind::Comment { .. }) => Ok(8),
@@ -98,22 +98,22 @@ impl JsNode {
             Some(NodeKind::Doctype { .. }) => Ok(10),
             Some(NodeKind::Fragment) => Ok(11),
             None => Err(Exception::throw_type(&ctx, "stale node")),
-        }
+        })?
     }
 
     // https://dom.spec.whatwg.org/#dom-node-nodename
     // https://dom.spec.whatwg.org/#concept-element-html-uppercased-qualified-name
     #[qjs(get, rename = "nodeName")]
     fn node_name(&self, ctx: Ctx<'_>) -> Result<String> {
-        match node_kind(&ctx, self.handle.0)? {
-            Some(NodeKind::Element { name, .. }) => Ok(element_node_name(&name)),
+        with_node_kind(&ctx, self.handle.0, |kind| match kind {
+            Some(NodeKind::Element { name, .. }) => Ok(element_node_name(name)),
             Some(NodeKind::Text { .. }) => Ok("#text".into()),
             Some(NodeKind::Comment { .. }) => Ok("#comment".into()),
             Some(NodeKind::Document) => Ok("#document".into()),
-            Some(NodeKind::Doctype { name, .. }) => Ok(name),
+            Some(NodeKind::Doctype { name, .. }) => Ok(name.clone()),
             Some(NodeKind::Fragment) => Ok("#document-fragment".into()),
             None => Err(Exception::throw_type(&ctx, "stale node")),
-        }
+        })?
     }
 
     #[qjs(get, rename = "firstChild")]
@@ -224,6 +224,9 @@ impl JsNode {
             Some(ns) if !ns.is_empty() => Namespace::from(ns),
             _ => Namespace::from(""),
         };
+        if !valid_qualified_name(&tag) {
+            return Err(Exception::throw_type(&ctx, "InvalidCharacterError"));
+        }
         let (prefix, local) = split_qualified_name(&tag);
         // https://dom.spec.whatwg.org/#validate-and-extract
         if prefix.is_some() && namespace_is_null {
@@ -537,17 +540,20 @@ fn wrap_node<'js>(ctx: &Ctx<'js>, id: NodeId) -> Result<Value<'js>> {
 }
 
 fn instantiate_node<'js>(ctx: &Ctx<'js>, id: NodeId) -> Result<Value<'js>> {
-    let kind = node_kind(ctx, id)?;
+    let brand = with_node_kind(ctx, id, |kind| match kind {
+        Some(NodeKind::Document) => Some("Document"),
+        Some(NodeKind::Element { .. }) => Some("Element"),
+        Some(NodeKind::Text { .. }) => Some("Text"),
+        Some(NodeKind::Comment { .. }) => Some("Comment"),
+        Some(NodeKind::Doctype { .. }) => Some("DocumentType"),
+        Some(NodeKind::Fragment) => Some("DocumentFragment"),
+        None => None,
+    })?;
+    let Some(brand) = brand else {
+        return Err(Exception::throw_type(ctx, "stale node"));
+    };
     let class = Class::instance(ctx.clone(), JsNode { handle: Handle(id) })?;
-    if let Some(proto) = match kind {
-        Some(NodeKind::Document) => class_proto(ctx, "Document")?,
-        Some(NodeKind::Element { .. }) => class_proto(ctx, "Element")?,
-        Some(NodeKind::Text { .. }) => class_proto(ctx, "Text")?,
-        Some(NodeKind::Comment { .. }) => class_proto(ctx, "Comment")?,
-        Some(NodeKind::Doctype { .. }) => class_proto(ctx, "DocumentType")?,
-        Some(NodeKind::Fragment) => class_proto(ctx, "DocumentFragment")?,
-        None => return Err(Exception::throw_type(ctx, "stale node")),
-    } {
+    if let Some(proto) = class_proto(ctx, brand)? {
         class.set_prototype(Some(&proto))?;
     }
     Ok(Class::into_value(class))
@@ -595,15 +601,20 @@ fn install_brands(ctx: &Ctx<'_>) -> Result<()> {
         let proto = Object::new(ctx.clone())?;
         proto.set_prototype(Some(&node_proto))?;
         proto.set("constructor", ctor.clone())?;
-        ctor.set("prototype", proto)?;
+        ctor.set("prototype", proto.clone())?;
+        world(ctx)?
+            .borrow_mut()
+            .intern_brand(name, Persistent::save(ctx, proto));
         ctx.globals().set(name, ctor)?;
     }
     Ok(())
 }
 
 fn class_proto<'js>(ctx: &Ctx<'js>, name: &str) -> Result<Option<Object<'js>>> {
-    let ctor: Object = ctx.globals().get(name)?;
-    Ok(Some(ctor.get("prototype")?))
+    let Some(saved) = world(ctx)?.borrow().brand(name) else {
+        return Ok(None);
+    };
+    Ok(Some(saved.restore(ctx)?))
 }
 
 fn world(ctx: &Ctx<'_>) -> Result<Rc<RefCell<World>>> {
@@ -643,20 +654,24 @@ fn fire<'js>(
     Ok(true)
 }
 
-fn node_kind(ctx: &Ctx<'_>, id: NodeId) -> Result<Option<NodeKind>> {
+fn with_node_kind<T>(
+    ctx: &Ctx<'_>,
+    id: NodeId,
+    read: impl FnOnce(Option<&NodeKind>) -> T,
+) -> Result<T> {
     let world = world(ctx)?;
     let parsed = world.borrow();
     let Some(parsed) = parsed.parsed.as_ref() else {
         return Err(Exception::throw_type(ctx, "no document"));
     };
-    Ok(parsed.dom.get(id).map(|node| node.kind().clone()))
+    Ok(read(parsed.dom.get(id).map(|node| node.kind())))
 }
 
 fn character_data(ctx: &Ctx<'_>, id: NodeId) -> Result<String> {
-    match node_kind(ctx, id)? {
-        Some(NodeKind::Text { data } | NodeKind::Comment { data }) => Ok(data),
-        _ => Ok(String::new()),
-    }
+    with_node_kind(ctx, id, |kind| match kind {
+        Some(NodeKind::Text { data } | NodeKind::Comment { data }) => data.clone(),
+        _ => String::new(),
+    })
 }
 
 fn create_html_element<'js>(ctx: &Ctx<'js>, tag: &str) -> Result<Value<'js>> {
@@ -684,6 +699,13 @@ fn create_kind<'js>(
     let id = make(&mut parsed.dom);
     drop(world);
     wrap_node(ctx, id)
+}
+
+fn valid_qualified_name(tag: &str) -> bool {
+    match tag.split_once(':') {
+        Some((prefix, local)) => !prefix.is_empty() && !local.is_empty() && !local.contains(':'),
+        None => !tag.is_empty(),
+    }
 }
 
 fn split_qualified_name(tag: &str) -> (Option<&str>, &str) {
