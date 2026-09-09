@@ -253,3 +253,31 @@ rustc 1.98.0, committed stripped x86_64 release profile:
 Previous CLI stub (294,944) did not reference `Page`. The probe grew ~144 KB
 from host-object classes and classic-script loading. Still under 5 MB.
 
+## Milestone: HEAD re-measure (2026-09-09)
+
+Stripped x86_64 release artifacts already built at `e050c38` (`wip: wpt`),
+rustc 1.98.0, same committed profile:
+
+| Artifact | Bytes |
+| --- | ---: |
+| CLI (`target/release/tinybrowser`) | 3,076,896 |
+| Page engine (`target/release/examples/page_probe`) | 2,978,496 |
+
+CLI grew 8,576 bytes from the 2026-09-08 WebDriver-host row (3,068,320).
+The probe grew 2,560 bytes. Headroom to the 5,000,000-byte limit remains about
+1.9 MB.
+
+## Milestone: named-profile daemon, CDP, and WebDriver adapter (2026-09-09)
+
+Rebuild after the dirty-tree slices (actor/Browser, ProfileStore, daemon, `cdp`,
+CLI, WebDriver adapter, WebIDL branding, WPT temp XDG profile):
+`cargo build --release --example page_probe --bin tinybrowser`. rustc 1.98.0,
+committed stripped x86_64 release profile. No axum, hyper, or Tokio `full`.
+
+| Artifact | Bytes |
+| --- | ---: |
+| CLI (`target/release/tinybrowser`) | 3,398,512 |
+| Page engine (`target/release/examples/page_probe`) | 3,013,552 |
+
+CLI grew 321,616 bytes from the HEAD re-measure (3,076,896). The probe grew
+35,056 bytes. Headroom to the 5,000,000-byte limit remains about 1.60 MB.

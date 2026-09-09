@@ -1,5 +1,5 @@
 use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tungstenite::client::IntoClientRequest as _;
 use tungstenite::handshake::HandshakeError;
@@ -128,13 +128,16 @@ pub(crate) fn connect(
     method: &Method,
     initiator: Option<&Url>,
 ) -> Result<WebSocket, NetError> {
+    let started = Instant::now();
+    let budget = agent.engine.budget_at(started);
+    let _guard = crate::transport::enter_budget(budget);
     let stream = crate::transport::open(
         url,
         agent.engine.proxy.as_deref(),
-        agent.engine.timeout,
+        budget.deadline(),
         &agent.engine.host_map,
     )?;
-    if let Some(limit) = agent.engine.timeout {
+    if let Some(limit) = budget.remaining() {
         stream
             .set_read_timeout(Some(limit))
             .map_err(|err| NetError::Transport(TransportError::Io(err)))?;

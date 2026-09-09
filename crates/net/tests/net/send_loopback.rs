@@ -104,6 +104,49 @@ fn http_transcripts_cover_status_headers_framing_limits_and_failures() {
 }
 
 #[test]
+fn timeout_global_covers_every_redirect_hop() {
+    let hop_delay = Duration::from_millis(80);
+    let global = Duration::from_millis(150);
+    let hops = Arc::new(std::sync::Mutex::new(0_u8));
+    let server_hops = Arc::clone(&hops);
+    let server = TestServer::start(move |connection| {
+        connection.read_request();
+        std::thread::sleep(hop_delay);
+        let mut number = server_hops.lock().expect("hop counter");
+        *number = number.saturating_add(1);
+        let payload = if *number < 3 {
+            canned_redirect(302, "/next")
+        } else {
+            canned_ok(&[], b"landed")
+        };
+        let _ = connection.write_all(&payload);
+    });
+    let started = Instant::now();
+    let result = AgentBuilder::new()
+        .timeout_global(global)
+        .build()
+        .request(Method::GET, server.url("/start"))
+        .send();
+    let elapsed = started.elapsed();
+    assert!(
+        matches!(
+            result,
+            Err(NetError::Transport(TransportError::Timeout(
+                TimeoutKind::Global
+            )))
+        ),
+        "expected global timeout, got {result:?}"
+    );
+    assert!(
+        elapsed < Duration::from_millis(400),
+        "absolute deadline waited {elapsed:?}"
+    );
+    assert!(hop_delay < global);
+    assert!(hop_delay.saturating_mul(3) > global);
+    server.assert_clean();
+}
+
+#[test]
 fn response_bodies_stream_and_drop_cancels_the_socket() {
     let first_chunk_delivered = Arc::new(AtomicBool::new(false));
     let server_flag = Arc::clone(&first_chunk_delivered);
@@ -623,8 +666,7 @@ fn resolve_maps_hit_miss_and_fail() {
 
     let server = scripted([canned_ok(&[], b"mapped")]);
     let port = server.local_addr().port();
-    let mapped = url::Url::parse(&format!("http://web-platform.test:{port}/"))
-        .expect("mapped URL");
+    let mapped = url::Url::parse(&format!("http://web-platform.test:{port}/")).expect("mapped URL");
     let agent = AgentBuilder::new()
         .resolve("nonexistent.*.test=fail")
         .expect("fail rule")

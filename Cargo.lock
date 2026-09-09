@@ -72,6 +72,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "cdp"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "browser",
+ "serde_json",
+ "tungstenite",
+]
+
+[[package]]
 name = "cfg-if"
 version = "1.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1202,6 +1212,8 @@ name = "tinybrowser"
 version = "0.1.0"
 dependencies = [
  "browser",
+ "cdp",
+ "serde_json",
  "webdriver",
 ]
 

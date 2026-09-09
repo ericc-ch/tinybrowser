@@ -1,22 +1,14 @@
-//! Host objects for `Node` (Document/Element/Text share this class today).
-//!
-//! `JsLifetime` is an unsafe rquickjs trait. The types here store no JS
-//! pointers, so `Changed<'to> = Self` is sound.
-
-#![allow(unsafe_code)]
-#![allow(
-    clippy::needless_pass_by_value,
-    clippy::unused_self,
-    reason = "rquickjs method ABI passes Ctx by value; Document methods currently live on JsNode"
-)]
+//! Host objects for DOM nodes, one interface per class.
 
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use dom::{LocalName, Namespace, NodeId, NodeKind, QualName, html_namespace};
+use dom::{LocalName, Namespace, NodeId, NodeKind, Prefix, QualName, html_namespace};
 use rquickjs::{
     Array, Class, Ctx, Exception, FromJs, Function, Object, Persistent, Result, Value,
     class::{Trace, Tracer},
+    function::Constructor,
+    prelude::This,
 };
 
 use super::world::{EventTargetKey, Listener, SharedWorld, World};
@@ -24,6 +16,7 @@ use super::world::{EventTargetKey, Listener, SharedWorld, World};
 #[derive(Clone, Copy)]
 struct Handle(NodeId);
 
+#[allow(unsafe_code)]
 // SAFETY: `Handle` is three integers; it contains no JS values to retag.
 unsafe impl rquickjs::JsLifetime<'_> for Handle {
     type Changed<'to> = Handle;
@@ -33,12 +26,29 @@ impl<'js> Trace<'js> for Handle {
     fn trace<'a>(&self, _tracer: Tracer<'a, 'js>) {}
 }
 
+macro_rules! branded_node {
+    ($name:ident, $js:literal) => {
+        #[derive(Trace)]
+        #[rquickjs::class(rename = $js)]
+        pub(crate) struct $name {
+            handle: Handle,
+        }
+
+        #[allow(unsafe_code)]
+        // SAFETY: holds only a `Handle` of integers.
+        unsafe impl rquickjs::JsLifetime<'_> for $name {
+            type Changed<'to> = $name;
+        }
+    };
+}
+
 #[derive(Trace)]
 #[rquickjs::class(rename = "Event")]
 pub struct JsEvent {
     typ: String,
 }
 
+#[allow(unsafe_code)]
 // SAFETY: `JsEvent` holds only a Rust `String`.
 unsafe impl rquickjs::JsLifetime<'_> for JsEvent {
     type Changed<'to> = JsEvent;
@@ -57,11 +67,7 @@ impl JsEvent {
     }
 }
 
-#[derive(Trace)]
-#[rquickjs::class(rename = "Node")]
-pub(crate) struct JsNode {
-    handle: Handle,
-}
+branded_node!(JsNode, "Node");
 
 impl JsNode {
     pub(crate) fn node_id(&self) -> NodeId {
@@ -69,21 +75,20 @@ impl JsNode {
     }
 }
 
-// SAFETY: `JsNode` holds only a `Handle` of integers.
-unsafe impl rquickjs::JsLifetime<'_> for JsNode {
-    type Changed<'to> = JsNode;
-}
-
 #[rquickjs::methods]
+#[allow(
+    clippy::needless_pass_by_value,
+    clippy::unused_self,
+    reason = "rquickjs method ABI passes Ctx by value; create* is a document method"
+)]
 impl JsNode {
+    #[qjs(constructor)]
+    fn ctor(ctx: Ctx<'_>) -> Result<Self> {
+        Err(Exception::throw_type(&ctx, "Illegal constructor"))
+    }
     #[qjs(get, rename = "nodeType")]
     fn node_type(&self, ctx: Ctx<'_>) -> Result<i32> {
-        let world = world(&ctx)?;
-        let parsed = world.borrow();
-        let Some(parsed) = parsed.parsed.as_ref() else {
-            return Err(Exception::throw_type(&ctx, "no document"));
-        };
-        match parsed.dom.get(self.handle.0).map(|node| node.kind()) {
+        match node_kind(&ctx, self.handle.0)? {
             Some(NodeKind::Element { .. }) => Ok(1),
             Some(NodeKind::Text { .. }) => Ok(3),
             Some(NodeKind::Comment { .. }) => Ok(8),
@@ -94,19 +99,16 @@ impl JsNode {
         }
     }
 
+    // https://dom.spec.whatwg.org/#dom-node-nodename
+    // https://dom.spec.whatwg.org/#concept-element-html-uppercased-qualified-name
     #[qjs(get, rename = "nodeName")]
     fn node_name(&self, ctx: Ctx<'_>) -> Result<String> {
-        let world = world(&ctx)?;
-        let parsed = world.borrow();
-        let Some(parsed) = parsed.parsed.as_ref() else {
-            return Err(Exception::throw_type(&ctx, "no document"));
-        };
-        match parsed.dom.get(self.handle.0).map(|node| node.kind()) {
-            Some(NodeKind::Element { name, .. }) => Ok(name.local.as_ref().to_ascii_uppercase()),
+        match node_kind(&ctx, self.handle.0)? {
+            Some(NodeKind::Element { name, .. }) => Ok(element_node_name(&name)),
             Some(NodeKind::Text { .. }) => Ok("#text".into()),
             Some(NodeKind::Comment { .. }) => Ok("#comment".into()),
             Some(NodeKind::Document) => Ok("#document".into()),
-            Some(NodeKind::Doctype { name, .. }) => Ok(name.clone()),
+            Some(NodeKind::Doctype { name, .. }) => Ok(name),
             Some(NodeKind::Fragment) => Ok("#document-fragment".into()),
             None => Err(Exception::throw_type(&ctx, "stale node")),
         }
@@ -126,7 +128,7 @@ impl JsNode {
                 .and_then(|mut kids| kids.next().copied())
         };
         match id {
-            Some(child) => wrap_node(&ctx, child).map(rquickjs::Class::into_value),
+            Some(child) => wrap_node(&ctx, child),
             None => Ok(Value::new_null(ctx)),
         }
     }
@@ -140,7 +142,7 @@ impl JsNode {
             .as_ref()
             .and_then(|parsed| parsed.dom.parent(self.handle.0));
         match id {
-            Some(parent) => wrap_node(&ctx, parent).map(rquickjs::Class::into_value),
+            Some(parent) => wrap_node(&ctx, parent),
             None => Ok(Value::new_null(ctx)),
         }
     }
@@ -167,13 +169,11 @@ impl JsNode {
     }
 
     #[qjs(rename = "appendChild")]
-    fn append_child<'js>(
-        &self,
-        ctx: Ctx<'js>,
-        child: Class<'js, JsNode>,
-    ) -> Result<Class<'js, JsNode>> {
+    fn append_child<'js>(&self, ctx: Ctx<'js>, child: Value<'js>) -> Result<Value<'js>> {
+        let Some(kid) = host_node_id(&ctx, &child) else {
+            return Err(Exception::throw_type(&ctx, "not a node"));
+        };
         let parent = self.handle.0;
-        let kid = child.borrow().handle.0;
         let world = world(&ctx)?;
         let mut world = world.borrow_mut();
         let Some(parsed) = world.parsed.as_mut() else {
@@ -183,7 +183,174 @@ impl JsNode {
             .dom
             .append(parent, kid)
             .map_err(|err| Exception::throw_type(&ctx, &err.to_string()))?;
-        Ok(child)
+        drop(world);
+        wrap_node(&ctx, kid)
+    }
+
+    #[qjs(rename = "addEventListener")]
+    fn add_event_listener<'js>(
+        &self,
+        ctx: Ctx<'js>,
+        typ: String,
+        callback: Function<'js>,
+    ) -> Result<()> {
+        add_listener(&ctx, EventTargetKey::Node(self.handle.0), typ, callback)
+    }
+
+    #[qjs(rename = "dispatchEvent")]
+    fn dispatch_event<'js>(&self, ctx: Ctx<'js>, event: Class<'js, JsEvent>) -> Result<bool> {
+        let typ = event.borrow().typ.clone();
+        fire(&ctx, EventTargetKey::Node(self.handle.0), &typ, &event)
+    }
+
+    #[qjs(rename = "createElement")]
+    fn create_element<'js>(&self, ctx: Ctx<'js>, tag: String) -> Result<Value<'js>> {
+        create_html_element(&ctx, &tag)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-document-createelementns
+    // https://dom.spec.whatwg.org/#internal-createelementns-steps
+    #[qjs(rename = "createElementNS")]
+    fn create_element_ns<'js>(
+        &self,
+        ctx: Ctx<'js>,
+        ns: OptString,
+        tag: String,
+    ) -> Result<Value<'js>> {
+        let namespace = match ns.0 {
+            Some(ns) if !ns.is_empty() => Namespace::from(ns),
+            _ => Namespace::from(""),
+        };
+        let (prefix, local) = split_qualified_name(&tag);
+        let name = QualName::new(prefix.map(Prefix::from), namespace, LocalName::from(local));
+        create_element_named(&ctx, name)
+    }
+
+    #[qjs(rename = "createTextNode")]
+    fn create_text_node<'js>(&self, ctx: Ctx<'js>, data: String) -> Result<Value<'js>> {
+        create_kind(&ctx, |dom| dom.create_text(data))
+    }
+
+    // https://dom.spec.whatwg.org/#dom-document-createcomment
+    #[qjs(rename = "createComment")]
+    fn create_comment<'js>(&self, ctx: Ctx<'js>, data: String) -> Result<Value<'js>> {
+        create_kind(&ctx, |dom| dom.create_comment(data))
+    }
+
+    // https://dom.spec.whatwg.org/#dom-document-createdocumentfragment
+    #[qjs(rename = "createDocumentFragment")]
+    fn create_document_fragment<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
+        create_kind(&ctx, dom::Dom::create_fragment)
+    }
+
+    #[qjs(rename = "getElementById")]
+    fn get_element_by_id<'js>(&self, ctx: Ctx<'js>, id: String) -> Result<Value<'js>> {
+        let world = world(&ctx)?;
+        let found = {
+            let parsed = world.borrow();
+            let Some(parsed) = parsed.parsed.as_ref() else {
+                return Ok(Value::new_null(ctx));
+            };
+            find_element_by_id(&parsed.dom, parsed.dom.document(), &id)
+        };
+        match found {
+            Some(node) => wrap_node(&ctx, node),
+            None => Ok(Value::new_null(ctx)),
+        }
+    }
+
+    #[qjs(rename = "getElementsByTagName")]
+    fn get_elements_by_tag_name<'js>(&self, ctx: Ctx<'js>, name: String) -> Result<Array<'js>> {
+        elements_by_tag(&ctx, self.handle.0, &name)
+    }
+
+    #[qjs(get)]
+    fn body<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
+        let world = world(&ctx)?;
+        let found = world.borrow().parsed.as_ref().and_then(|parsed| {
+            parsed
+                .dom
+                .select_first(parsed.dom.document(), "body")
+                .ok()
+                .flatten()
+        });
+        match found {
+            Some(id) => wrap_node(&ctx, id),
+            None => Ok(Value::new_null(ctx)),
+        }
+    }
+
+    #[qjs(get, rename = "documentElement")]
+    fn document_element<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
+        let world = world(&ctx)?;
+        let found = {
+            let parsed = world.borrow();
+            let Some(parsed) = parsed.parsed.as_ref() else {
+                return Ok(Value::new_null(ctx));
+            };
+            parsed
+                .dom
+                .children(parsed.dom.document())
+                .into_iter()
+                .flatten()
+                .copied()
+                .find(|&id| {
+                    matches!(
+                        parsed.dom.get(id).map(|node| node.kind()),
+                        Some(NodeKind::Element { .. })
+                    )
+                })
+        };
+        match found {
+            Some(id) => wrap_node(&ctx, id),
+            None => Ok(Value::new_null(ctx)),
+        }
+    }
+
+    // https://dom.spec.whatwg.org/#dom-document-doctype
+    #[qjs(get, rename = "doctype")]
+    fn doctype<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
+        let world = world(&ctx)?;
+        let found = {
+            let parsed = world.borrow();
+            let Some(parsed) = parsed.parsed.as_ref() else {
+                return Ok(Value::new_null(ctx));
+            };
+            parsed
+                .dom
+                .children(parsed.dom.document())
+                .into_iter()
+                .flatten()
+                .copied()
+                .find(|&id| {
+                    matches!(
+                        parsed.dom.get(id).map(|node| node.kind()),
+                        Some(NodeKind::Doctype { .. })
+                    )
+                })
+        };
+        match found {
+            Some(id) => wrap_node(&ctx, id),
+            None => Ok(Value::new_null(ctx)),
+        }
+    }
+
+    #[qjs(get, rename = "readyState")]
+    fn ready_state(&self, ctx: Ctx<'_>) -> Result<String> {
+        let world = world(&ctx)?;
+        let world = world.borrow();
+        let is_document = world
+            .parsed
+            .as_ref()
+            .is_some_and(|parsed| parsed.dom.document() == self.handle.0);
+        if !is_document {
+            return Ok(String::new());
+        }
+        Ok(if world.document_ready {
+            "complete".into()
+        } else {
+            "loading".into()
+        })
     }
 
     #[qjs(rename = "getAttribute")]
@@ -260,177 +427,7 @@ impl JsNode {
 
     #[qjs(get)]
     fn data(&self, ctx: Ctx<'_>) -> Result<String> {
-        let world = world(&ctx)?;
-        let parsed = world.borrow();
-        let Some(parsed) = parsed.parsed.as_ref() else {
-            return Ok(String::new());
-        };
-        match parsed.dom.get(self.handle.0).map(|node| node.kind()) {
-            Some(NodeKind::Text { data } | NodeKind::Comment { data }) => Ok(data.clone()),
-            _ => Ok(String::new()),
-        }
-    }
-
-    #[qjs(rename = "getElementsByTagName")]
-    fn get_elements_by_tag_name<'js>(&self, ctx: Ctx<'js>, name: String) -> Result<Array<'js>> {
-        let world = world(&ctx)?;
-        let ids = {
-            let parsed = world.borrow();
-            let Some(parsed) = parsed.parsed.as_ref() else {
-                return Array::new(ctx);
-            };
-            collect_by_tag(&parsed.dom, self.handle.0, &name)
-        };
-        let list = Array::new(ctx.clone())?;
-        for (index, id) in ids.into_iter().enumerate() {
-            list.set(index, wrap_node(&ctx, id)?)?;
-        }
-        Ok(list)
-    }
-
-    #[qjs(rename = "getElementById")]
-    fn get_element_by_id<'js>(&self, ctx: Ctx<'js>, id: String) -> Result<Value<'js>> {
-        let world = world(&ctx)?;
-        let found = {
-            let parsed = world.borrow();
-            let Some(parsed) = parsed.parsed.as_ref() else {
-                return Ok(Value::new_null(ctx));
-            };
-            find_element_by_id(&parsed.dom, parsed.dom.document(), &id)
-        };
-        match found {
-            Some(node) => wrap_node(&ctx, node).map(rquickjs::Class::into_value),
-            None => Ok(Value::new_null(ctx)),
-        }
-    }
-
-    #[qjs(rename = "createElement")]
-    fn create_element<'js>(&self, ctx: Ctx<'js>, tag: String) -> Result<Class<'js, JsNode>> {
-        let world = world(&ctx)?;
-        let mut world = world.borrow_mut();
-        let Some(parsed) = world.parsed.as_mut() else {
-            return Err(Exception::throw_type(&ctx, "no document"));
-        };
-        let name = QualName::new(
-            None,
-            html_namespace(),
-            LocalName::from(tag.to_ascii_lowercase()),
-        );
-        let id = parsed.dom.create_element(name, Vec::new());
-        drop(world);
-        wrap_node(&ctx, id)
-    }
-
-    #[qjs(rename = "createElementNS")]
-    fn create_element_ns<'js>(
-        &self,
-        ctx: Ctx<'js>,
-        ns: OptString,
-        tag: String,
-    ) -> Result<Class<'js, JsNode>> {
-        let world = world(&ctx)?;
-        let mut world = world.borrow_mut();
-        let Some(parsed) = world.parsed.as_mut() else {
-            return Err(Exception::throw_type(&ctx, "no document"));
-        };
-        let namespace = match ns.0 {
-            Some(ns) if !ns.is_empty() => Namespace::from(ns),
-            _ => Namespace::from(""),
-        };
-        let local = tag.rsplit(':').next().unwrap_or(&tag);
-        let name = QualName::new(None, namespace, LocalName::from(local));
-        let id = parsed.dom.create_element(name, Vec::new());
-        drop(world);
-        wrap_node(&ctx, id)
-    }
-
-    #[qjs(rename = "createTextNode")]
-    fn create_text_node<'js>(&self, ctx: Ctx<'js>, data: String) -> Result<Class<'js, JsNode>> {
-        let world = world(&ctx)?;
-        let mut world = world.borrow_mut();
-        let Some(parsed) = world.parsed.as_mut() else {
-            return Err(Exception::throw_type(&ctx, "no document"));
-        };
-        let id = parsed.dom.create_text(data);
-        drop(world);
-        wrap_node(&ctx, id)
-    }
-
-    #[qjs(get)]
-    fn body<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
-        let world = world(&ctx)?;
-        let found = world.borrow().parsed.as_ref().and_then(|parsed| {
-            parsed
-                .dom
-                .select_first(parsed.dom.document(), "body")
-                .ok()
-                .flatten()
-        });
-        match found {
-            Some(id) => wrap_node(&ctx, id).map(rquickjs::Class::into_value),
-            None => Ok(Value::new_null(ctx)),
-        }
-    }
-
-    #[qjs(get, rename = "documentElement")]
-    fn document_element<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
-        let world = world(&ctx)?;
-        let found = {
-            let parsed = world.borrow();
-            let Some(parsed) = parsed.parsed.as_ref() else {
-                return Ok(Value::new_null(ctx));
-            };
-            parsed
-                .dom
-                .children(parsed.dom.document())
-                .into_iter()
-                .flatten()
-                .copied()
-                .find(|&id| {
-                    matches!(
-                        parsed.dom.get(id).map(|node| node.kind()),
-                        Some(NodeKind::Element { .. })
-                    )
-                })
-        };
-        match found {
-            Some(id) => wrap_node(&ctx, id).map(rquickjs::Class::into_value),
-            None => Ok(Value::new_null(ctx)),
-        }
-    }
-
-    #[qjs(get, rename = "readyState")]
-    fn ready_state(&self, ctx: Ctx<'_>) -> Result<String> {
-        let world = world(&ctx)?;
-        let world = world.borrow();
-        let is_document = world
-            .parsed
-            .as_ref()
-            .is_some_and(|parsed| parsed.dom.document() == self.handle.0);
-        if !is_document {
-            return Ok(String::new());
-        }
-        Ok(if world.document_ready {
-            "complete".into()
-        } else {
-            "loading".into()
-        })
-    }
-
-    #[qjs(rename = "addEventListener")]
-    fn add_event_listener<'js>(
-        &self,
-        ctx: Ctx<'js>,
-        typ: String,
-        callback: Function<'js>,
-    ) -> Result<()> {
-        add_listener(&ctx, EventTargetKey::Node(self.handle.0), typ, callback)
-    }
-
-    #[qjs(rename = "dispatchEvent")]
-    fn dispatch_event<'js>(&self, ctx: Ctx<'js>, event: Class<'js, JsEvent>) -> Result<bool> {
-        let typ = event.borrow().typ.clone();
-        fire(&ctx, EventTargetKey::Node(self.handle.0), &typ, event)
+        character_data(&ctx, self.handle.0)
     }
 }
 
@@ -451,6 +448,7 @@ pub(super) fn install(ctx: &Ctx<'_>, world: &Rc<RefCell<World>>) -> Result<()> {
     let globals = ctx.globals();
     Class::<JsEvent>::define(&globals)?;
     Class::<JsNode>::define(&globals)?;
+    install_brands(ctx)?;
 
     let document_id = world
         .borrow()
@@ -482,6 +480,10 @@ pub(super) fn install(ctx: &Ctx<'_>, world: &Rc<RefCell<World>>) -> Result<()> {
     Ok(())
 }
 
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "rquickjs Func ABI passes Ctx by value"
+)]
 fn window_add_event_listener<'js>(
     ctx: Ctx<'js>,
     typ: String,
@@ -492,21 +494,99 @@ fn window_add_event_listener<'js>(
 
 pub(super) fn fire_window_load(ctx: &Ctx<'_>) -> Result<()> {
     let event = Class::instance(ctx.clone(), JsEvent { typ: "load".into() })?;
-    fire(ctx, EventTargetKey::Window, "load", event)?;
+    fire(ctx, EventTargetKey::Window, "load", &event)?;
     Ok(())
 }
 
-fn wrap_node<'js>(ctx: &Ctx<'js>, id: NodeId) -> Result<Class<'js, JsNode>> {
-    let world = world(ctx)?;
-    if let Some(saved) = world.borrow().wrapper(id) {
-        let value = saved.restore(ctx)?;
-        return Class::<JsNode>::from_js(ctx, value);
+pub(super) fn host_node_id<'js>(ctx: &Ctx<'js>, value: &Value<'js>) -> Option<NodeId> {
+    Class::<JsNode>::from_js(ctx, value.clone())
+        .ok()
+        .map(|node| node.borrow().node_id())
+}
+
+fn wrap_node<'js>(ctx: &Ctx<'js>, id: NodeId) -> Result<Value<'js>> {
+    let world_rc = world(ctx)?;
+    if let Some(saved) = world_rc.borrow().wrapper(id)
+        && let Some(value) = deref_weak(ctx, saved)?
+    {
+        return Ok(value);
     }
-    let class = Class::instance(ctx.clone(), JsNode { handle: Handle(id) })?;
-    world
+    let value = instantiate_node(ctx, id)?;
+    let weak = make_weak(ctx, value.clone())?;
+    world_rc
         .borrow_mut()
-        .intern_wrapper(id, Persistent::save(ctx, Class::into_value(class.clone())));
-    Ok(class)
+        .intern_wrapper(id, Persistent::save(ctx, weak));
+    Ok(value)
+}
+
+fn instantiate_node<'js>(ctx: &Ctx<'js>, id: NodeId) -> Result<Value<'js>> {
+    let kind = node_kind(ctx, id)?;
+    let class = Class::instance(ctx.clone(), JsNode { handle: Handle(id) })?;
+    if let Some(proto) = match kind {
+        Some(NodeKind::Document) => class_proto(ctx, "Document")?,
+        Some(NodeKind::Element { .. }) => class_proto(ctx, "Element")?,
+        Some(NodeKind::Text { .. }) => class_proto(ctx, "Text")?,
+        Some(NodeKind::Comment { .. }) => class_proto(ctx, "Comment")?,
+        Some(NodeKind::Doctype { .. }) => class_proto(ctx, "DocumentType")?,
+        Some(NodeKind::Fragment) => class_proto(ctx, "DocumentFragment")?,
+        None => return Err(Exception::throw_type(ctx, "stale node")),
+    } {
+        class.set_prototype(Some(&proto))?;
+    }
+    Ok(Class::into_value(class))
+}
+
+fn make_weak<'js>(ctx: &Ctx<'js>, target: Value<'js>) -> Result<Value<'js>> {
+    let ctor: Constructor = ctx.globals().get("WeakRef")?;
+    ctor.construct((target,))
+}
+
+fn deref_weak<'js>(
+    ctx: &Ctx<'js>,
+    saved: Persistent<Value<'static>>,
+) -> Result<Option<Value<'js>>> {
+    let weak = saved.restore(ctx)?;
+    let object = weak
+        .as_object()
+        .ok_or_else(|| Exception::throw_type(ctx, "weak wrapper"))?;
+    let deref: Function = object.get("deref")?;
+    let value: Value = deref.call((This(object.clone()),))?;
+    if value.is_undefined() {
+        Ok(None)
+    } else {
+        Ok(Some(value))
+    }
+}
+
+fn install_brands(ctx: &Ctx<'_>) -> Result<()> {
+    let node_proto = Class::<JsNode>::prototype(ctx)?
+        .ok_or_else(|| Exception::throw_type(ctx, "Node prototype"))?;
+    for name in [
+        "Document",
+        "Element",
+        "Text",
+        "Comment",
+        "DocumentType",
+        "DocumentFragment",
+    ] {
+        let mut options = rquickjs::context::EvalOptions::default();
+        options.strict = false;
+        let ctor: Function = ctx.eval_with_options(
+            "(function() { throw new TypeError('Illegal constructor'); })",
+            options,
+        )?;
+        let proto = Object::new(ctx.clone())?;
+        proto.set_prototype(Some(&node_proto))?;
+        proto.set("constructor", ctor.clone())?;
+        ctor.set("prototype", proto)?;
+        ctx.globals().set(name, ctor)?;
+    }
+    Ok(())
+}
+
+fn class_proto<'js>(ctx: &Ctx<'js>, name: &str) -> Result<Option<Object<'js>>> {
+    let ctor: Object = ctx.globals().get(name)?;
+    Ok(Some(ctor.get("prototype")?))
 }
 
 fn world(ctx: &Ctx<'_>) -> Result<Rc<RefCell<World>>> {
@@ -536,7 +616,7 @@ fn fire<'js>(
     ctx: &Ctx<'js>,
     target: EventTargetKey,
     typ: &str,
-    event: Class<'js, JsEvent>,
+    event: &Class<'js, JsEvent>,
 ) -> Result<bool> {
     let callbacks = world(ctx)?.borrow().listeners(target, typ);
     for callback in callbacks {
@@ -544,6 +624,84 @@ fn fire<'js>(
         func.call::<_, ()>((event.clone(),))?;
     }
     Ok(true)
+}
+
+fn node_kind(ctx: &Ctx<'_>, id: NodeId) -> Result<Option<NodeKind>> {
+    let world = world(ctx)?;
+    let parsed = world.borrow();
+    let Some(parsed) = parsed.parsed.as_ref() else {
+        return Err(Exception::throw_type(ctx, "no document"));
+    };
+    Ok(parsed.dom.get(id).map(|node| node.kind().clone()))
+}
+
+fn character_data(ctx: &Ctx<'_>, id: NodeId) -> Result<String> {
+    match node_kind(ctx, id)? {
+        Some(NodeKind::Text { data } | NodeKind::Comment { data }) => Ok(data),
+        _ => Ok(String::new()),
+    }
+}
+
+fn create_html_element<'js>(ctx: &Ctx<'js>, tag: &str) -> Result<Value<'js>> {
+    let name = QualName::new(
+        None,
+        html_namespace(),
+        LocalName::from(tag.to_ascii_lowercase()),
+    );
+    create_element_named(ctx, name)
+}
+
+fn create_element_named<'js>(ctx: &Ctx<'js>, name: QualName) -> Result<Value<'js>> {
+    create_kind(ctx, |dom| dom.create_element(name, Vec::new()))
+}
+
+fn create_kind<'js>(
+    ctx: &Ctx<'js>,
+    make: impl FnOnce(&mut dom::Dom) -> NodeId,
+) -> Result<Value<'js>> {
+    let world = world(ctx)?;
+    let mut world = world.borrow_mut();
+    let Some(parsed) = world.parsed.as_mut() else {
+        return Err(Exception::throw_type(ctx, "no document"));
+    };
+    let id = make(&mut parsed.dom);
+    drop(world);
+    wrap_node(ctx, id)
+}
+
+fn split_qualified_name(tag: &str) -> (Option<&str>, &str) {
+    match tag.split_once(':') {
+        Some((prefix, local)) if !prefix.is_empty() && !local.is_empty() => (Some(prefix), local),
+        _ => (None, tag),
+    }
+}
+
+fn element_node_name(name: &QualName) -> String {
+    let qualified = match &name.prefix {
+        Some(prefix) if !prefix.is_empty() => format!("{prefix}:{}", name.local),
+        _ => name.local.to_string(),
+    };
+    if name.ns == html_namespace() {
+        qualified.to_ascii_uppercase()
+    } else {
+        qualified
+    }
+}
+
+fn elements_by_tag<'js>(ctx: &Ctx<'js>, scope: NodeId, name: &str) -> Result<Array<'js>> {
+    let world = world(ctx)?;
+    let ids = {
+        let parsed = world.borrow();
+        let Some(parsed) = parsed.parsed.as_ref() else {
+            return Array::new(ctx.clone());
+        };
+        collect_by_tag(&parsed.dom, scope, name)
+    };
+    let list = Array::new(ctx.clone())?;
+    for (index, id) in ids.into_iter().enumerate() {
+        list.set(index, wrap_node(ctx, id)?)?;
+    }
+    Ok(list)
 }
 
 fn collect_by_tag(dom: &dom::Dom, scope: NodeId, name: &str) -> Vec<NodeId> {

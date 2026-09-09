@@ -139,6 +139,114 @@ impl CookieJar {
             }
         }
     }
+
+    pub(crate) fn snapshot(&self) -> Vec<CookieRecord> {
+        self.cookies
+            .iter()
+            .filter(|cookie| cookie.expiry.is_some())
+            .map(|cookie| CookieRecord {
+                name: cookie.name.clone(),
+                value: cookie.value.clone(),
+                expiry: cookie.expiry,
+                domain: cookie.domain.clone(),
+                path: cookie.path.clone(),
+                created: cookie.created,
+                last_access: cookie.last_access,
+                host_only: cookie.host_only,
+                secure: cookie.secure,
+                http_only: cookie.http_only,
+                same_site: CookieSameSite::from(cookie.same_site),
+            })
+            .collect()
+    }
+
+    pub(crate) fn restore(&mut self, records: Vec<CookieRecord>, now: SystemTime) {
+        for record in records {
+            if record.expiry.is_some_and(|expiry| expiry <= now) {
+                continue;
+            }
+            let stored = StoredCookie {
+                name: record.name,
+                value: record.value,
+                expiry: record.expiry,
+                domain: record.domain,
+                path: record.path,
+                created: record.created,
+                last_access: record.last_access,
+                host_only: record.host_only,
+                secure: record.secure,
+                http_only: record.http_only,
+                same_site: SameSite::from(record.same_site),
+            };
+            self.cookies
+                .retain(|old| !same_cookie_identity(old, &stored));
+            self.cookies.push(stored);
+        }
+        self.evict_expired(now);
+        self.evict_excess();
+    }
+}
+
+/// One persistent cookie. Session cookies (`expiry` absent) are omitted on export.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CookieRecord {
+    /// Cookie name.
+    pub name: String,
+    /// Cookie value.
+    pub value: String,
+    /// Absolute expiry. `None` is a session cookie.
+    pub expiry: Option<SystemTime>,
+    /// Canonical domain.
+    pub domain: String,
+    /// Path prefix.
+    pub path: String,
+    /// Creation time.
+    pub created: SystemTime,
+    /// Last access time.
+    pub last_access: SystemTime,
+    /// Host-only flag from the storage model.
+    pub host_only: bool,
+    /// Secure-only flag.
+    pub secure: bool,
+    /// `HttpOnly` flag.
+    pub http_only: bool,
+    /// `SameSite` attribute.
+    pub same_site: CookieSameSite,
+}
+
+/// `SameSite` value stored with a cookie.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CookieSameSite {
+    /// `SameSite=Strict`.
+    Strict,
+    /// `SameSite=Lax`.
+    Lax,
+    /// `SameSite=None`.
+    None,
+    /// No `SameSite` attribute; default Lax-like behavior in the jar.
+    Default,
+}
+
+impl From<SameSite> for CookieSameSite {
+    fn from(value: SameSite) -> Self {
+        match value {
+            SameSite::Strict => Self::Strict,
+            SameSite::Lax => Self::Lax,
+            SameSite::None => Self::None,
+            SameSite::Default => Self::Default,
+        }
+    }
+}
+
+impl From<CookieSameSite> for SameSite {
+    fn from(value: CookieSameSite) -> Self {
+        match value {
+            CookieSameSite::Strict => Self::Strict,
+            CookieSameSite::Lax => Self::Lax,
+            CookieSameSite::None => Self::None,
+            CookieSameSite::Default => Self::Default,
+        }
+    }
 }
 
 fn over_quota_domain(cookies: &[StoredCookie]) -> Option<String> {

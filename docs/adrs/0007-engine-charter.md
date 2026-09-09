@@ -1,21 +1,22 @@
 # Engine charter
 
-Crate slogans, a fake `js` seam, and parking DOM/language on `net` were fighting the product: a small page engine with a job loop, not a web-server org chart. The decided shape is three deep crates, HTML jobs on a Tokio current-thread waiter, `browser` holding `net::Agent` and `parse_html`.
+Crate slogans, a fake `js` seam, and parking DOM/language on `net` were fighting the product: a small page engine with a job loop, not a web-server org chart. The decided shape is three deep crates, HTML jobs on a Tokio current-thread waiter, and `browser` holding `parse_html`. Browser owns `NetworkSession` ([ADR 0010](0010-page-actor-ownership.md)).
 
-Status: accepted. Supersedes the crate table and “js must not depend on net” / root-depends-on-all-four rules in [ADR 0001](0001-workspace-crates-with-enforced-edges.md). Does not reopen [ADR 0002](0002-dom-layer-architecture.md) arena or [ADR 0006](0006-net-transport.md) v1 transport.
+Status: accepted. Supersedes the crate table and “js must not depend on net” / root-depends-on-all-four rules in [ADR 0001](0001-workspace-crates-with-enforced-edges.md). Does not reopen [ADR 0002](0002-dom-layer-architecture.md) arena or [ADR 0006](0006-net-transport.md) v1 transport. [ADR 0009](0009-named-profile-daemon.md) takes named profiles and CDP as the CLI. [ADR 0010](0010-page-actor-ownership.md) takes Browser ownership, `NetworkSession`, and the long-lived page runtime. Crate graph, Tokio `rt`+`time`, `spawn_blocking`, public `net` types, and size/lint bounds stay.
 
 | crate | depends on | charter |
 |---|---|---|
 | `dom` | n/a | arena, `NodeId`, selectors |
-| `net` | n/a | blocking HTTP/WS + cookie jar; public types ours ([ADR 0006](0006-net-transport.md)) |
-| `browser` | `dom`, `net` | engine: TreeSink, later page + QuickJS; holds `Agent` |
-| root `tinybrowser` | `browser`, `webdriver` | embedder + bins; WebDriver is in-process ([ADR 0008](0008-wpt-via-webdriver.md)) |
+| `net` | n/a | blocking HTTP/WS + live cookie jar; public types ours ([ADR 0006](0006-net-transport.md)) |
+| `browser` | `dom`, `net` | engine: TreeSink, page + QuickJS. Browser owns `NetworkSession` ([ADR 0010](0010-page-actor-ownership.md)) |
+| `cdp` | `browser` | CDP server/client adapter; no direct `dom`, `net`, or `webdriver` dependency ([ADR 0009](0009-named-profile-daemon.md)) |
+| root `tinybrowser` | `browser`, `cdp`, `webdriver` | embedder + bins; WebDriver is a `BrowserHandle` adapter and the WPT host ([ADR 0008](0008-wpt-via-webdriver.md)) |
 
-One compile-error law: future `cdp` depends on `browser` alone. `cargo test -p` a leaf crate is not reach-around. No `js` crate until QuickJS has a small public surface (the empty workspace member is leftover). No `HttpTransport` trait.
+One compile-error law: `cdp` depends on `browser` alone. `webdriver` and `cdp` do not depend on each other. `cargo test -p` a leaf crate is not reach-around. QuickJS lives in `browser`. No `js` crate. No `HttpTransport` trait.
 
-Page thread: Tokio current-thread, features `rt` + `time` only. HTML tasks and microtasks are our queue. `send` / `upgrade` only via `spawn_blocking`. No tokio `full`, smol, axum, hyper. Stealth (Chrome TLS/h2) is later later.
+Page thread: Tokio current-thread, features `rt` + `time` only. HTML jobs and microtasks are our queue. `send` / `upgrade` only via `spawn_blocking`. No tokio `full`, smol, axum, hyper. Stealth (Chrome TLS/h2) is later later. Each page actor has a long-lived current-thread runtime ([ADR 0010](0010-page-actor-ownership.md)).
 
-Template contents live on `Dom`. Cookie jar stays on `Agent`; `document.cookie` and `Content-Language` are page/document. Persistence is in-memory until a profile, not CDP.
+Template contents live on `Dom`. The live cookie jar stays on `Agent`. `NetworkSession` loads and persists that jar through `ProfileStore`. `document.cookie` and `Content-Language` are page/document. CDP does not own cookies. Durable named profiles and the CDP control plane are in [ADR 0009](0009-named-profile-daemon.md).
 
 ## Options considered
 

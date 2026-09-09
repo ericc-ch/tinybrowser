@@ -3,18 +3,16 @@
 //! `JsLifetime` is an unsafe rquickjs trait. Persistents are lifetime-erased
 //! and dropped in `clear_listeners` before the `QuickJS` runtime.
 
-#![allow(unsafe_code)]
-
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
 use dom::NodeId;
-use net::Agent;
 use rquickjs::{Persistent, Value, function::Function};
 use url::Url;
 
 use crate::Parsed;
+use crate::network::FetchHandle;
 
 pub(crate) struct Listener {
     pub typ: String,
@@ -30,7 +28,7 @@ pub(crate) enum EventTargetKey {
 pub(crate) struct World {
     pub parsed: Option<Parsed>,
     pub document_url: Url,
-    pub agent: Agent,
+    pub fetch: FetchHandle,
     pub pending_cancels: Vec<i32>,
     pub document_ready: bool,
     listeners: HashMap<EventTargetKey, Vec<Listener>>,
@@ -38,11 +36,11 @@ pub(crate) struct World {
 }
 
 impl World {
-    pub(crate) fn new(agent: Agent, document_url: Url) -> Self {
+    pub(crate) fn new(fetch: FetchHandle, document_url: Url) -> Self {
         Self {
             parsed: None,
             document_url,
-            agent,
+            fetch,
             pending_cancels: Vec::new(),
             document_ready: false,
             listeners: HashMap::new(),
@@ -92,6 +90,7 @@ impl World {
 #[derive(Clone)]
 pub(crate) struct SharedWorld(pub Rc<RefCell<World>>);
 
+#[allow(unsafe_code)]
 // SAFETY: `SharedWorld` is an `Rc` to page state. Listener and wrapper
 // persistents are dropped in `clear_listeners` / `replace_document` before
 // `JsHost` drops the runtime they were saved from.

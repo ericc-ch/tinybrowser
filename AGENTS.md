@@ -1,6 +1,6 @@
 # tinybrowser
 
-We build a headless browser for AI agents as a single binary without sidecar processes. Dynamic linking for standard system libraries like libc and OpenSSL is fine. The target binary size is under 5MB stripped on x86_64. Measure binary size at milestones.
+We build a headless browser for AI agents as one executable. There is no separately shipped or versioned helper program such as chromedriver or Node. The same tinybrowser executable may self-spawn a detached profile daemon now and renderer workers in a later security phase. Dynamic linking for standard system libraries like libc and OpenSSL is fine. The target binary size is under 5MB stripped on x86_64. Measure binary size at milestones.
 
 ## Working Rules
 

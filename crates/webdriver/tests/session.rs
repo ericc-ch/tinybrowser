@@ -3,7 +3,22 @@ use std::net::{TcpListener, TcpStream};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use browser::{AgentBuilder, Browser, NetworkSession, Profile, ProfileStore};
 use serde_json::{Value, json};
+
+fn start(builder: AgentBuilder) -> (String, Browser) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("addr").to_string();
+    let browser = Browser::open_with_network(NetworkSession::from_builder(
+        builder,
+        ProfileStore::memory(&Profile::default()),
+    ));
+    let handle = browser.handle();
+    thread::spawn(move || {
+        let _ = webdriver::serve(&listener, handle);
+    });
+    (addr, browser)
+}
 
 fn request(addr: &str, method: &str, path: &str, body: Option<&str>) -> Value {
     let payload = body.unwrap_or("");
@@ -34,11 +49,7 @@ fn request(addr: &str, method: &str, path: &str, body: Option<&str>) -> Value {
 
 #[test]
 fn session_execute_script_roundtrip() {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-    let addr = listener.local_addr().expect("addr").to_string();
-    thread::spawn(move || {
-        let _ = webdriver::serve(&listener, webdriver::AgentBuilder::new());
-    });
+    let (addr, _browser) = start(AgentBuilder::new());
 
     let status = request(&addr, "GET", "/status", None);
     assert_eq!(status["value"]["ready"], json!(true));
@@ -93,6 +104,73 @@ fn session_execute_script_roundtrip() {
 }
 
 #[test]
+fn execute_sync_waits_for_returned_promise_or_script_timeout() {
+    let (addr, _browser) = start(AgentBuilder::new());
+
+    let created = request(&addr, "POST", "/session", Some("{}"));
+    let id = created["value"]["sessionId"]
+        .as_str()
+        .expect("session id")
+        .to_owned();
+
+    let resolved = request(
+        &addr,
+        "POST",
+        &format!("/session/{id}/execute/sync"),
+        Some(r#"{"script":"return Promise.resolve(7)","args":[]}"#),
+    );
+    assert_eq!(resolved["value"].as_f64(), Some(7.0));
+
+    let delayed = request(
+        &addr,
+        "POST",
+        &format!("/session/{id}/execute/sync"),
+        Some(
+            r#"{"script":"return new Promise(function(resolve) { setTimeout(function() { resolve(8); }, 0); })","args":[]}"#,
+        ),
+    );
+    assert_eq!(delayed["value"].as_f64(), Some(8.0));
+
+    let rejected = request(
+        &addr,
+        "POST",
+        &format!("/session/{id}/execute/sync"),
+        Some(r#"{"script":"return Promise.reject()","args":[]}"#),
+    );
+    assert_eq!(rejected["value"]["error"], json!("javascript error"));
+
+    let wait_object = request(
+        &addr,
+        "POST",
+        &format!("/session/{id}/execute/sync"),
+        Some(r#"{"script":"return { __wd_wait: true }","args":[]}"#),
+    );
+    assert_eq!(wait_object["value"], json!({"__wd_wait": true}));
+
+    request(
+        &addr,
+        "POST",
+        &format!("/session/{id}/timeouts"),
+        Some(r#"{"script":200}"#),
+    );
+    let started = Instant::now();
+    let timed_out = request(
+        &addr,
+        "POST",
+        &format!("/session/{id}/execute/sync"),
+        Some(
+            r#"{"script":"return new Promise(function(resolve) { setTimeout(function() { resolve(1); }, 30000); })","args":[]}"#,
+        ),
+    );
+    assert_eq!(timed_out["value"]["error"], json!("script timeout"));
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "script timeout waited {:?}",
+        started.elapsed()
+    );
+}
+
+#[test]
 fn navigate_returns_after_load_not_after_timers() {
     let page_listener = TcpListener::bind("127.0.0.1:0").expect("page bind");
     let page_addr = page_listener.local_addr().expect("page addr");
@@ -114,11 +192,7 @@ fn navigate_returns_after_load_not_after_timers() {
         navigation.write_all(body).expect("body");
     });
 
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-    let addr = listener.local_addr().expect("addr").to_string();
-    thread::spawn(move || {
-        let _ = webdriver::serve(&listener, webdriver::AgentBuilder::new());
-    });
+    let (addr, _browser) = start(AgentBuilder::new());
 
     let created = request(&addr, "POST", "/session", Some("{}"));
     let id = created["value"]["sessionId"]
@@ -179,14 +253,10 @@ fn new_window_uses_builder_resolve_map() {
         navigation.write_all(body).expect("body");
     });
 
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-    let addr = listener.local_addr().expect("addr").to_string();
-    thread::spawn(move || {
-        let builder = webdriver::AgentBuilder::new()
-            .resolve("*.test=127.0.0.1")
-            .expect("resolve map");
-        let _ = webdriver::serve(&listener, builder);
-    });
+    let builder = AgentBuilder::new()
+        .resolve("*.test=127.0.0.1")
+        .expect("resolve map");
+    let (addr, _browser) = start(builder);
 
     let created = request(&addr, "POST", "/session", Some("{}"));
     let id = created["value"]["sessionId"]
@@ -194,8 +264,16 @@ fn new_window_uses_builder_resolve_map() {
         .expect("session id")
         .to_owned();
 
-    let opened = request(&addr, "POST", &format!("/session/{id}/window/new"), Some("{}"));
-    let handle = opened["value"]["handle"].as_str().expect("handle").to_owned();
+    let opened = request(
+        &addr,
+        "POST",
+        &format!("/session/{id}/window/new"),
+        Some("{}"),
+    );
+    let handle = opened["value"]["handle"]
+        .as_str()
+        .expect("handle")
+        .to_owned();
     request(
         &addr,
         "POST",
@@ -220,4 +298,67 @@ fn new_window_uses_builder_resolve_map() {
         format!("http://web-platform.test:{}/", page_addr.port())
     );
     server.join().expect("server");
+}
+
+#[test]
+fn one_session_delete_leaves_pages_close_last_window_invalidates() {
+    let (addr, browser) = start(AgentBuilder::new());
+
+    let created = request(&addr, "POST", "/session", Some("{}"));
+    let id = created["value"]["sessionId"]
+        .as_str()
+        .expect("session id")
+        .to_owned();
+    assert_eq!(browser.handle().pages().len(), 1);
+
+    let second = request(&addr, "POST", "/session", Some("{}"));
+    assert_eq!(second["value"]["error"], json!("session not created"));
+    assert_eq!(browser.handle().pages().len(), 1);
+
+    request(&addr, "DELETE", &format!("/session/{id}"), None);
+    assert_eq!(browser.handle().pages().len(), 1);
+    let gone = request(&addr, "GET", &format!("/session/{id}/window"), None);
+    assert_eq!(gone["value"]["error"], json!("invalid session id"));
+
+    let created = request(&addr, "POST", "/session", Some("{}"));
+    let id = created["value"]["sessionId"]
+        .as_str()
+        .expect("session id")
+        .to_owned();
+    assert_eq!(browser.handle().pages().len(), 2);
+
+    let closed = request(&addr, "DELETE", &format!("/session/{id}/window"), None);
+    assert_eq!(closed["value"], json!([]));
+    assert_eq!(browser.handle().pages().len(), 1);
+    let invalid = request(&addr, "GET", &format!("/session/{id}/window"), None);
+    assert_eq!(invalid["value"]["error"], json!("invalid session id"));
+}
+
+#[test]
+fn execute_sync_interrupts_infinite_loop() {
+    let (addr, _browser) = start(AgentBuilder::new());
+    let created = request(&addr, "POST", "/session", Some("{}"));
+    let id = created["value"]["sessionId"]
+        .as_str()
+        .expect("session id")
+        .to_owned();
+    request(
+        &addr,
+        "POST",
+        &format!("/session/{id}/timeouts"),
+        Some(r#"{"script":200}"#),
+    );
+    let started = Instant::now();
+    let timed_out = request(
+        &addr,
+        "POST",
+        &format!("/session/{id}/execute/sync"),
+        Some(r#"{"script":"while(true){}","args":[]}"#),
+    );
+    assert_eq!(timed_out["value"]["error"], json!("script timeout"));
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "interrupt waited {:?}",
+        started.elapsed()
+    );
 }

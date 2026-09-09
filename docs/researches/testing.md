@@ -11,18 +11,22 @@ acceptances in
 [ADR 0005](../adrs/0005-html5lib-tree-construction-suite.md)); the harness at
 `crates/browser/tests/html5lib.rs` runs every full-document case through the
 public API under both scripting-flag settings and diffs byte-exactly against
-the spec-mandated tree: **3549 cases green** (full-document plus fragment-context),
-upstream's `<selectedcontent>` gap is a
-documented divergence. This was the standing open item from the dom-layer
-milestone; it covers exactly the misnesting/foster-parenting/adoption-agency
-traps hand-written fixtures miss.
+the spec-mandated tree: **3549 runs** with **10 accepted divergences**
+(full-document plus fragment-context). The accepted set is html5ever’s
+`<selectedcontent>` option-clone (`webkit02.dat` #44–47) and select-fragment
+`<input><option>` (`tests_innerHTML_1.dat` #75), both scripting flags, listed
+in `KNOWN_UPSTREAM_DIVERGENCES` ([ADR 0005](../adrs/0005-html5lib-tree-construction-suite.md)).
+This was the standing open item from the dom-layer milestone; it covers
+exactly the misnesting/foster-parenting/adoption-agency traps hand-written
+fixtures miss.
 
 ## Unit and public-API tests (landed)
 
 The suite keeps only high-signal public-boundary gates: the html5lib corpus,
 an independent DOM mutation model, selector state matrices, browser page-loop
-journeys, and compact HTTP/WebSocket/cookie/error transcripts. The current
-workspace lists **20 tests** (19 active plus one ignored corpus-dump helper).
+journeys, and compact HTTP/WebSocket/cookie/error transcripts. Counted 2026-09-09
+from workspace `#[test]` items: **51 tests** (50 active plus one ignored
+corpus-dump helper in `crates/browser/tests/html5lib.rs`).
 Integration suites do not reach into arena internals.
 
 The live bot-gate matrix below remains a manual checkpoint (first run
@@ -94,8 +98,6 @@ the whole matrix when anything about the transport changes.
 
 ## WPT runner (landed; testharness bar still open)
 
-The full WPT tree is pinned and driven by in-process classic WebDriver
-(`./tools/wpt/run`). HTTPS tests are off (`--ssl-type none`) until cert
-trust exists. html5lib-tests remain the parser gate. A passing testharness
-file through that runner is the next evidence, not a claim of this
-landing ([ADR 0008](../adrs/0008-wpt-via-webdriver.md)).
+The full WPT tree is pinned and driven by classic WebDriver (`./tools/wpt/run`) over `BrowserHandle`. Isolation is a fresh temporary `XDG_RUNTIME_DIR` and `XDG_DATA_HOME` per WebDriver endpoint (`tools/wpt/tinybrowser_wpt.py`). HTTPS tests are off (`--ssl-type none`) until cert trust exists.
+html5lib-tests remain the parser gate. A passing testharness
+file through that runner is the next evidence, not a claim of this landing.

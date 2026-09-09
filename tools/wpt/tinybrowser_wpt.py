@@ -4,10 +4,14 @@
 #   third_party/wpt/wpt run --binary /path/to/tinybrowser --ssl-type none tinybrowser [tests]
 # or: ./tools/wpt/run [tests]
 # ./tools/wpt/run skips the /etc/hosts check and this product passes --resolve.
+# Each WebDriver endpoint gets a fresh temporary XDG profile.
 
 from __future__ import annotations
 
+import os
+import shutil
 import sys
+import tempfile
 
 from wptrunner.browsers.base import WebDriverBrowser, get_timeout_multiplier, require_arg
 from wptrunner.executors import executor_kwargs as base_executor_kwargs
@@ -65,6 +69,7 @@ def env_options():
 class TinyBrowser(WebDriverBrowser):
     def __init__(self, logger, binary, webdriver_host="127.0.0.1", binary_args=None, **kwargs):
         args = list(binary_args or [])
+        self._profile_root = None
         super().__init__(
             logger,
             binary=binary,
@@ -76,6 +81,7 @@ class TinyBrowser(WebDriverBrowser):
         )
 
     def make_command(self):
+        self._ensure_profile()
         return [
             self.webdriver_binary,
             f"--webdriver={self.port}",
@@ -83,6 +89,32 @@ class TinyBrowser(WebDriverBrowser):
             "--resolve=*.test=127.0.0.1",
             "--resolve=*.test.=127.0.0.1",
         ] + self.webdriver_args
+
+    def stop(self, force=False):
+        success = super().stop(force=force)
+        self._remove_profile()
+        return success
+
+    def cleanup(self):
+        super().cleanup()
+        self._remove_profile()
+
+    def _ensure_profile(self):
+        if self._profile_root is not None:
+            return
+        self._profile_root = tempfile.mkdtemp(prefix="tinybrowser-wpt-")
+        runtime = os.path.join(self._profile_root, "run")
+        data = os.path.join(self._profile_root, "data")
+        os.makedirs(runtime)
+        os.makedirs(data)
+        self.env["XDG_RUNTIME_DIR"] = runtime
+        self.env["XDG_DATA_HOME"] = data
+
+    def _remove_profile(self):
+        root = self._profile_root
+        self._profile_root = None
+        if root is not None:
+            shutil.rmtree(root, ignore_errors=True)
 
 
 class TinyBrowserProtocol(WebDriverProtocol):

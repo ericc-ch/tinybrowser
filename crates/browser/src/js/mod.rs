@@ -7,10 +7,10 @@
 mod bindings;
 mod world;
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::fmt;
 use std::rc::Rc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rquickjs::{
     Array, Coerced, Context, FromJs, Function, Object, Runtime, Value, context::EvalOptions,
@@ -52,6 +52,7 @@ pub(crate) enum ClassicScript {
 #[derive(Debug)]
 pub(crate) enum JsError {
     Engine(Box<str>),
+    Interrupted,
     BadTimerId,
 }
 
@@ -65,6 +66,7 @@ impl fmt::Display for JsError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Engine(message) => f.write_str(message),
+            Self::Interrupted => f.write_str("interrupted"),
             Self::BadTimerId => f.write_str("bad timer id"),
         }
     }
@@ -115,12 +117,34 @@ impl JsHost {
         rendered.and_then(|out| jobs.map(|()| out))
     }
 
-    pub(crate) fn eval_value(&self, source: &str) -> Result<crate::js::ScriptValue, JsError> {
+    pub(crate) fn eval_value_deadline(
+        &self,
+        source: &str,
+        deadline: Option<Instant>,
+    ) -> Result<crate::js::ScriptValue, JsError> {
+        let interrupted = Rc::new(Cell::new(false));
+        if let Some(deadline) = deadline {
+            let flag = Rc::clone(&interrupted);
+            self.runtime.set_interrupt_handler(Some(Box::new(move || {
+                if Instant::now() >= deadline {
+                    flag.set(true);
+                    true
+                } else {
+                    false
+                }
+            })));
+        }
+        let _clear = ClearInterrupt {
+            runtime: &self.runtime,
+        };
         let decoded: Result<ScriptValue, JsError> = self.context.with(|ctx| {
             let value: Value = eval_classic(&ctx, source)?;
             decode_value(&ctx, value)
         });
         let jobs = self.run_jobs();
+        if interrupted.get() {
+            return Err(JsError::Interrupted);
+        }
         decoded.and_then(|value| jobs.map(|()| value))
     }
 
@@ -241,7 +265,7 @@ impl JsHost {
                     "__cookieGet",
                     Func::from(move || {
                         let world = cookie_get.borrow();
-                        world.agent.cookies_for(&world.document_url)
+                        world.fetch.cookies_for(&world.document_url)
                     }),
                 )
                 .map_err(JsError::engine)?;
@@ -251,7 +275,7 @@ impl JsHost {
                     "__cookieSet",
                     Func::from(move |value: String| {
                         let world = cookie_set.borrow();
-                        world.agent.set_cookie(&value, &world.document_url);
+                        world.fetch.set_cookie(&value, &world.document_url);
                     }),
                 )
                 .map_err(JsError::engine)?;
@@ -403,6 +427,16 @@ fn element_text(tree: &dom::Dom, id: dom::NodeId) -> String {
     text
 }
 
+struct ClearInterrupt<'a> {
+    runtime: &'a Runtime,
+}
+
+impl Drop for ClearInterrupt<'_> {
+    fn drop(&mut self) {
+        self.runtime.set_interrupt_handler(None);
+    }
+}
+
 fn eval_classic<'js, V: FromJs<'js>>(ctx: &rquickjs::Ctx<'js>, source: &str) -> Result<V, JsError> {
     let mut options = EvalOptions::default();
     options.strict = false;
@@ -436,6 +470,9 @@ fn decode_value_inner<'js>(
     }
     if let Ok(node) = rquickjs::Class::<bindings::JsNode>::from_js(ctx, value.clone()) {
         return Ok(ScriptValue::Node(node.borrow().node_id()));
+    }
+    if let Some(id) = bindings::host_node_id(ctx, &value) {
+        return Ok(ScriptValue::Node(id));
     }
     if let Some(array) = value.as_array() {
         let mut items = Vec::with_capacity(array.len());

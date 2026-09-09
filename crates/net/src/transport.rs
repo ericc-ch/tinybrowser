@@ -1,3 +1,4 @@
+use std::cell::Cell;
 use std::fmt;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
@@ -21,11 +22,94 @@ use crate::resolve::{HostMap, Mapped};
 #[error("{0}")]
 struct DialTlsFailure(Box<str>);
 
+thread_local! {
+    static CALL_BUDGET: Cell<CallBudget> = const { Cell::new(CallBudget::NONE) };
+}
+
+/// Absolute deadlines for one `send` / `upgrade` call.
+///
+/// `global` is fixed at the start of the call and covers every redirect hop.
+/// `hop` is `timeout_per_call` measured from the current hop.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CallBudget {
+    pub global: Option<Instant>,
+    pub hop: Option<Instant>,
+}
+
+impl CallBudget {
+    pub const NONE: Self = Self {
+        global: None,
+        hop: None,
+    };
+
+    pub fn from_engine(
+        timeout_global: Option<Duration>,
+        timeout_per_call: Option<Duration>,
+        start: Instant,
+    ) -> Self {
+        Self {
+            global: timeout_global.map(|limit| start + limit),
+            hop: timeout_per_call.map(|limit| start + limit),
+        }
+    }
+
+    pub fn with_hop_start(self, timeout_per_call: Option<Duration>, hop_start: Instant) -> Self {
+        Self {
+            global: self.global,
+            hop: timeout_per_call.map(|limit| hop_start + limit),
+        }
+    }
+
+    pub fn deadline(self) -> Option<Instant> {
+        match (self.global, self.hop) {
+            (Some(global), Some(hop)) => Some(global.min(hop)),
+            (global, hop) => global.or(hop),
+        }
+    }
+
+    pub fn remaining(self) -> Option<Duration> {
+        remaining(self.deadline())
+    }
+
+    pub fn is_expired(self) -> bool {
+        self.remaining() == Some(Duration::ZERO)
+    }
+
+    pub fn timeout_kind(self, fallback: TimeoutKind) -> TimeoutKind {
+        let now = Instant::now();
+        if self.global.is_some_and(|end| now >= end) {
+            TimeoutKind::Global
+        } else if self.hop.is_some_and(|end| now >= end) {
+            TimeoutKind::PerCall
+        } else {
+            fallback
+        }
+    }
+}
+
+pub(crate) fn enter_budget(budget: CallBudget) -> BudgetGuard {
+    CALL_BUDGET.set(budget);
+    BudgetGuard
+}
+
+pub(crate) struct BudgetGuard;
+
+impl Drop for BudgetGuard {
+    fn drop(&mut self) {
+        CALL_BUDGET.set(CallBudget::NONE);
+    }
+}
+
+fn current_budget() -> CallBudget {
+    CALL_BUDGET.get()
+}
+
 #[derive(Clone)]
 pub(crate) struct HttpEngine {
     inner: ureq::Agent,
     pub(crate) proxy: Option<String>,
-    pub(crate) timeout: Option<Duration>,
+    pub(crate) timeout_global: Option<Duration>,
+    pub(crate) timeout_per_call: Option<Duration>,
     pub(crate) host_map: HostMap,
 }
 
@@ -36,12 +120,11 @@ impl HttpEngine {
         proxy: Option<String>,
         host_map: HostMap,
     ) -> Self {
-        let timeout = timeout_per_call.or(timeout_global);
         let config = ureq::config::Config::builder()
             .http_status_as_error(false)
             .max_redirects(0)
-            .timeout_global(timeout_global)
-            .timeout_per_call(timeout_per_call)
+            .timeout_global(None)
+            .timeout_per_call(None)
             .user_agent(ureq::config::AutoHeaderValue::None)
             .accept(ureq::config::AutoHeaderValue::None)
             .accept_encoding(ureq::config::AutoHeaderValue::None)
@@ -57,7 +140,6 @@ impl HttpEngine {
             config,
             NetConnector {
                 proxy: proxy.clone(),
-                timeout,
                 host_map: host_map.clone(),
             },
             DialResolver,
@@ -65,9 +147,14 @@ impl HttpEngine {
         Self {
             inner,
             proxy,
-            timeout,
+            timeout_global,
+            timeout_per_call,
             host_map,
         }
+    }
+
+    pub(crate) fn budget_at(&self, start: Instant) -> CallBudget {
+        CallBudget::from_engine(self.timeout_global, self.timeout_per_call, start)
     }
 
     pub(crate) fn send(
@@ -76,7 +163,12 @@ impl HttpEngine {
         wire_url: &Url,
         headers: &HeaderMap,
         body: Option<&[u8]>,
+        budget: CallBudget,
     ) -> Result<(u16, HeaderMap, Box<dyn Read + Send>), NetError> {
+        if budget.is_expired() {
+            return Err(timed_out(budget.timeout_kind(TimeoutKind::Global)));
+        }
+        let _guard = enter_budget(budget);
         let mut builder = ureq::http::Request::builder()
             .method(
                 ureq::http::Method::from_str(method.as_str())
@@ -112,7 +204,32 @@ impl HttpEngine {
                 .insert(name.as_str(), value.as_bytes())
                 .map_err(|_| NetError::Protocol(ProtocolError::UnrepresentableHeader))?;
         }
-        Ok((status, mapped, Box::new(response.into_body().into_reader())))
+        Ok((
+            status,
+            mapped,
+            Box::new(BudgetedReader {
+                inner: response.into_body().into_reader(),
+                budget,
+            }),
+        ))
+    }
+}
+
+struct BudgetedReader<R> {
+    inner: R,
+    budget: CallBudget,
+}
+
+impl<R: Read> Read for BudgetedReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.budget.is_expired() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "global timeout exceeded",
+            ));
+        }
+        let _guard = enter_budget(self.budget);
+        self.inner.read(buf)
     }
 }
 
@@ -182,7 +299,6 @@ impl Resolver for DialResolver {
 #[derive(Clone)]
 struct NetConnector {
     proxy: Option<String>,
-    timeout: Option<Duration>,
     host_map: HostMap,
 }
 
@@ -190,7 +306,6 @@ impl fmt::Debug for NetConnector {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("NetConnector")
             .field("has_proxy", &self.proxy.is_some())
-            .field("timeout", &self.timeout)
             .field("has_host_map", &!self.host_map.is_empty())
             .finish_non_exhaustive()
     }
@@ -209,7 +324,13 @@ impl Connector for NetConnector {
         }
         let url =
             Url::parse(&details.uri.to_string()).map_err(|_| ureq::Error::ConnectionFailed)?;
-        let stream = open(&url, self.proxy.as_deref(), self.timeout, &self.host_map).map_err(to_ureq)?;
+        let stream = open(
+            &url,
+            self.proxy.as_deref(),
+            hop_deadline(details),
+            &self.host_map,
+        )
+        .map_err(to_ureq)?;
         let buffers = LazyBuffers::new(
             details.config.input_buffer_size(),
             details.config.output_buffer_size(),
@@ -278,11 +399,35 @@ impl fmt::Debug for StreamTransport {
     }
 }
 
-fn apply_timeout(stream: &RawStream, timeout: NextTimeout, write: bool) -> Result<(), ureq::Error> {
-    let dur = match timeout.not_zero() {
-        Some(ureq::unversioned::transport::time::Duration::Exact(d)) => Some(d),
+fn hop_deadline(details: &ConnectionDetails) -> Option<Instant> {
+    let from_ureq = match details.timeout.not_zero() {
+        Some(ureq::unversioned::transport::time::Duration::Exact(duration)) => {
+            Some(Instant::now() + duration)
+        }
         _ => None,
     };
+    match (current_budget().deadline(), from_ureq) {
+        (Some(budget), Some(ureq_end)) => Some(budget.min(ureq_end)),
+        (budget, ureq_end) => budget.or(ureq_end),
+    }
+}
+
+fn socket_timeout(timeout: NextTimeout) -> Option<Duration> {
+    let from_ureq = match timeout.not_zero() {
+        Some(ureq::unversioned::transport::time::Duration::Exact(duration)) => Some(duration),
+        _ => None,
+    };
+    match (current_budget().remaining(), from_ureq) {
+        (Some(budget), Some(ureq_end)) => Some(budget.min(ureq_end)),
+        (budget, ureq_end) => budget.or(ureq_end),
+    }
+}
+
+fn apply_timeout(stream: &RawStream, timeout: NextTimeout, write: bool) -> Result<(), ureq::Error> {
+    let dur = socket_timeout(timeout);
+    if dur == Some(Duration::ZERO) {
+        return Err(budget_timeout(timeout));
+    }
     if write {
         stream.set_write_timeout(dur).map_err(ureq::Error::from)?;
     } else {
@@ -291,11 +436,26 @@ fn apply_timeout(stream: &RawStream, timeout: NextTimeout, write: bool) -> Resul
     Ok(())
 }
 
+fn budget_timeout(timeout: NextTimeout) -> ureq::Error {
+    let kind =
+        current_budget().timeout_kind(TimeoutKind::Unknown(format!("{:?}", timeout.reason).into()));
+    let mapped = match kind {
+        TimeoutKind::PerCall => ureq::Timeout::PerCall,
+        TimeoutKind::Connect => ureq::Timeout::Connect,
+        TimeoutKind::Resolve => ureq::Timeout::Resolve,
+        TimeoutKind::Global
+        | TimeoutKind::SendRequest
+        | TimeoutKind::SendBody
+        | TimeoutKind::RecvResponse
+        | TimeoutKind::RecvBody
+        | TimeoutKind::Unknown(_) => ureq::Timeout::Global,
+    };
+    ureq::Error::Timeout(mapped)
+}
+
 fn map_io(err: std::io::Error, timeout: NextTimeout) -> ureq::Error {
     match err.kind() {
-        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock => {
-            ureq::Error::Timeout(timeout.reason)
-        }
+        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock => budget_timeout(timeout),
         _ => ureq::Error::from(err),
     }
 }
@@ -443,9 +603,14 @@ impl Write for RawStream {
 pub(crate) fn open(
     url: &Url,
     proxy: Option<&str>,
-    timeout: Option<Duration>,
+    deadline: Option<Instant>,
     host_map: &HostMap,
 ) -> Result<RawStream, NetError> {
+    if remaining(deadline) == Some(Duration::ZERO) {
+        return Err(timed_out(
+            current_budget().timeout_kind(TimeoutKind::Connect),
+        ));
+    }
     let host = url
         .host_str()
         .ok_or(NetError::Protocol(ProtocolError::RejectedRequest))?;
@@ -456,15 +621,21 @@ pub(crate) fn open(
         .unwrap_or(if tls { 443 } else { 80 });
     let socket = if let Some(proxy) = proxy {
         if tunnel {
-            connect_via_proxy(proxy, host, port, timeout, host_map)?
+            connect_via_proxy(proxy, host, port, deadline, host_map)?
         } else {
-            tcp_to_proxy(proxy, timeout, host_map)?
+            tcp_to_proxy(proxy, deadline, host_map)?
         }
     } else {
-        Socket::new(connect_tcp(host, port, timeout, host_map)?, Vec::new())
+        Socket::new(connect_tcp(host, port, deadline, host_map)?, Vec::new())
     };
     let _ = socket.tcp.set_nodelay(true);
     if tls {
+        let timeout = remaining(deadline);
+        if timeout == Some(Duration::ZERO) {
+            return Err(timed_out(
+                current_budget().timeout_kind(TimeoutKind::Connect),
+            ));
+        }
         socket
             .tcp
             .set_read_timeout(timeout)
@@ -505,23 +676,26 @@ fn timed_out(kind: TimeoutKind) -> NetError {
 fn connect_tcp(
     host: &str,
     port: u16,
-    timeout: Option<Duration>,
+    deadline: Option<Instant>,
     host_map: &HostMap,
 ) -> Result<TcpStream, NetError> {
     let host = host
         .strip_prefix('[')
         .and_then(|h| h.strip_suffix(']'))
         .unwrap_or(host);
-    let deadline = timeout.map(|limit| Instant::now() + limit);
     if remaining(deadline) == Some(Duration::ZERO) {
-        return Err(timed_out(TimeoutKind::Resolve));
+        return Err(timed_out(
+            current_budget().timeout_kind(TimeoutKind::Resolve),
+        ));
     }
     let addrs = resolve_addrs(host, port, remaining(deadline), host_map)?;
     let mut last = None;
     for addr in addrs {
         let leftover = remaining(deadline);
         if leftover == Some(Duration::ZERO) {
-            return Err(timed_out(TimeoutKind::Connect));
+            return Err(timed_out(
+                current_budget().timeout_kind(TimeoutKind::Connect),
+            ));
         }
         let result = match leftover {
             Some(limit) => TcpStream::connect_timeout(&addr, limit),
@@ -573,13 +747,15 @@ fn resolve_addrs(
         Ok(Err(_)) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
             Err(NetError::Transport(TransportError::Dns(host.into())))
         }
-        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(timed_out(TimeoutKind::Resolve)),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(timed_out(
+            current_budget().timeout_kind(TimeoutKind::Resolve),
+        )),
     }
 }
 
 fn tcp_to_proxy(
     proxy: &str,
-    timeout: Option<Duration>,
+    deadline: Option<Instant>,
     host_map: &HostMap,
 ) -> Result<Socket, NetError> {
     let proxy_url =
@@ -589,7 +765,7 @@ fn tcp_to_proxy(
         .ok_or(NetError::Protocol(ProtocolError::InvalidProxy))?;
     let proxy_port = proxy_url.port_or_known_default().unwrap_or(80);
     Ok(Socket::new(
-        connect_tcp(phost, proxy_port, timeout, host_map)?,
+        connect_tcp(phost, proxy_port, deadline, host_map)?,
         Vec::new(),
     ))
 }
@@ -615,7 +791,7 @@ fn connect_via_proxy(
     proxy: &str,
     host: &str,
     port: u16,
-    timeout: Option<Duration>,
+    deadline: Option<Instant>,
     host_map: &HostMap,
 ) -> Result<Socket, NetError> {
     let proxy_url =
@@ -624,7 +800,13 @@ fn connect_via_proxy(
         .host_str()
         .ok_or(NetError::Protocol(ProtocolError::InvalidProxy))?;
     let proxy_port = proxy_url.port_or_known_default().unwrap_or(80);
-    let mut stream = connect_tcp(phost, proxy_port, timeout, host_map)?;
+    let mut stream = connect_tcp(phost, proxy_port, deadline, host_map)?;
+    let timeout = remaining(deadline);
+    if timeout == Some(Duration::ZERO) {
+        return Err(timed_out(
+            current_budget().timeout_kind(TimeoutKind::Connect),
+        ));
+    }
     stream.set_read_timeout(timeout).map_err(map_connect_io)?;
     stream.set_write_timeout(timeout).map_err(map_connect_io)?;
     let authority = if host.contains(':') && !host.starts_with('[') {
@@ -675,7 +857,7 @@ fn connect_via_proxy(
 fn map_connect_io(err: std::io::Error) -> NetError {
     match err.kind() {
         std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock => {
-            timed_out(TimeoutKind::Connect)
+            timed_out(current_budget().timeout_kind(TimeoutKind::Connect))
         }
         _ => NetError::Transport(TransportError::Io(err)),
     }

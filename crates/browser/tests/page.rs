@@ -1,5 +1,7 @@
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -350,4 +352,52 @@ fn failed_navigation_is_reported() {
     page.goto("http://127.0.0.1:1/").expect("queued");
     page.run_until_load();
     assert!(page.last_navigation_failed());
+}
+
+#[test]
+fn run_until_load_does_not_wait_for_unrelated_fetch() {
+    let slow = TcpListener::bind("127.0.0.1:0").expect("slow bind");
+    let slow_addr = slow.local_addr().expect("slow addr");
+    let page_listener = TcpListener::bind("127.0.0.1:0").expect("page bind");
+    let page_addr = page_listener.local_addr().expect("page addr");
+    let release = Arc::new(AtomicBool::new(false));
+    let slow_flag = Arc::clone(&release);
+    let slow_server = thread::spawn(move || {
+        let (mut stream, _) = slow.accept().expect("slow accept");
+        let _ = read_target(&mut stream);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !slow_flag.load(Ordering::SeqCst) {
+            assert!(Instant::now() < deadline, "slow fetch never released");
+            thread::sleep(Duration::from_millis(10));
+        }
+        respond(&mut stream, &[], b"slow");
+    });
+    let page_server = thread::spawn(move || {
+        let (mut stream, _) = page_listener.accept().expect("page accept");
+        let _ = read_target(&mut stream);
+        let html = format!(
+            "<!doctype html><script>fetch('http://{slow_addr}/slow').then(function() {{ window.slowDone = true; }});</script>"
+        );
+        respond(&mut stream, &["Content-Type: text/html"], html.as_bytes());
+    });
+
+    let mut page = Page::new();
+    page.goto(&format!("http://{page_addr}/")).expect("goto");
+    let started = Instant::now();
+    page.run_until_load();
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "load waited for unrelated fetch: {:?}",
+        started.elapsed()
+    );
+    assert!(!page.last_navigation_failed());
+    assert_eq!(
+        page.eval("typeof window.slowDone").expect("slow"),
+        "undefined"
+    );
+    release.store(true, Ordering::SeqCst);
+    page.run();
+    assert_eq!(page.eval("String(window.slowDone)").expect("done"), "true");
+    slow_server.join().expect("slow server");
+    page_server.join().expect("page server");
 }

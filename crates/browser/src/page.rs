@@ -1,22 +1,27 @@
-//! One page: HTML jobs we own, Tokio current-thread as the waiter, `Agent` for HTTP.
+//! One page: HTML jobs we own, Tokio current-thread as the waiter, fetch handle for HTTP.
 //!
 //! [ADR 0007](../../../docs/adrs/0007-engine-charter.md): the page thread is
-//! Tokio `rt`+`time` only. `Agent::send` runs on `spawn_blocking`.
+//! Tokio `rt`+`time` only. Blocking send runs on `spawn_blocking`.
 
 use std::cell::{Ref, RefCell};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::future::{Future, pending, poll_fn};
 use std::rc::Rc;
-use std::task::Poll;
-use std::time::Duration;
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::task::{Poll, Waker};
+use std::time::{Duration, Instant as WallClock};
 
 use net::{Agent, AgentBuilder, Context, Method};
+use tokio::runtime::Runtime;
 use tokio::task::JoinSet;
 use tokio::time::{Instant, sleep_until};
 use url::Url;
 
 use crate::js::{ClassicScript, World, collect_classic_scripts};
+use crate::network::{FetchHandle, PAGE_FETCH_TIMEOUT};
 use crate::{Parsed, parse_html};
 
 pub use crate::js::ScriptValue;
@@ -26,9 +31,6 @@ const FETCH_BODY_LIMIT: usize = 1_048_576;
 
 /// Caps concurrent `spawn_blocking` dials so one eval loop cannot exhaust threads.
 const MAX_IN_FLIGHT_DIALS: usize = 16;
-
-/// Default `Agent` per-call timeout for [`Page::new`].
-const PAGE_FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Why `QuickJS` eval or a host callback failed.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -42,6 +44,8 @@ pub enum ScriptFailure {
     BadTimerId,
     /// The host was not present after construction. A defect if it surfaces.
     HostMissing,
+    /// `QuickJS` interrupt handler stopped a long-running script.
+    Interrupted,
 }
 
 impl fmt::Display for ScriptFailure {
@@ -50,6 +54,7 @@ impl fmt::Display for ScriptFailure {
             Self::Engine { message } => f.write_str(message),
             Self::BadTimerId => f.write_str("bad timer id"),
             Self::HostMissing => f.write_str("js host missing"),
+            Self::Interrupted => f.write_str("interrupted"),
         }
     }
 }
@@ -67,6 +72,8 @@ pub enum PageError {
     },
     /// `QuickJS` eval or a host callback failed.
     Script(ScriptFailure),
+    /// The page actor thread has stopped.
+    ActorStopped,
 }
 
 impl fmt::Display for PageError {
@@ -74,6 +81,7 @@ impl fmt::Display for PageError {
         match self {
             Self::InvalidUrl { spec } => write!(f, "invalid url: {spec}"),
             Self::Script(failure) => write!(f, "script: {failure}"),
+            Self::ActorStopped => f.write_str("page actor stopped"),
         }
     }
 }
@@ -84,6 +92,7 @@ impl From<crate::js::JsError> for PageError {
     fn from(err: crate::js::JsError) -> Self {
         match err {
             crate::js::JsError::Engine(message) => Self::Script(ScriptFailure::Engine { message }),
+            crate::js::JsError::Interrupted => Self::Script(ScriptFailure::Interrupted),
             crate::js::JsError::BadTimerId => Self::Script(ScriptFailure::BadTimerId),
         }
     }
@@ -172,9 +181,9 @@ struct HostTimer {
     fired: bool,
 }
 
-/// One browsing context: tree, cookie jar via [`Agent`], HTML job list.
+/// One browsing context: tree, cookie jar via [`FetchHandle`], HTML job list.
 pub struct Page {
-    agent: Agent,
+    fetch: FetchHandle,
     world: Rc<RefCell<World>>,
     document_url: Url,
     content_language: Option<String>,
@@ -192,11 +201,20 @@ pub struct Page {
     classic_fetch_in_flight: bool,
     nav_in_flight: Option<u64>,
     navigation_failed: bool,
+    runtime: Option<Runtime>,
+    stop: Arc<Stop>,
+    next_remote: u64,
 }
 
 impl Default for Page {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl Drop for Page {
+    fn drop(&mut self) {
+        self.shutdown_runtime();
     }
 }
 
@@ -224,13 +242,21 @@ impl Page {
     /// Only if `about:blank` fails to parse, which is a URL-crate defect.
     #[must_use]
     pub fn with_agent(agent: Agent) -> Self {
+        Self::with_fetch(FetchHandle::from_agent(agent))
+    }
+
+    pub(crate) fn with_fetch(fetch: FetchHandle) -> Self {
+        Self::with_fetch_stop(fetch, Arc::new(Stop::new()))
+    }
+
+    pub(crate) fn with_fetch_stop(fetch: FetchHandle, stop: Arc<Stop>) -> Self {
         let document_url = Url::parse("about:blank").expect("about:blank is a valid URL");
         Self {
             world: Rc::new(RefCell::new(World::new(
-                agent.clone(),
+                fetch.clone(),
                 document_url.clone(),
             ))),
-            agent,
+            fetch,
             document_url,
             content_language: None,
             jobs: VecDeque::new(),
@@ -247,6 +273,9 @@ impl Page {
             classic_fetch_in_flight: false,
             nav_in_flight: None,
             navigation_failed: false,
+            runtime: None,
+            stop,
+            next_remote: 0,
         }
     }
 
@@ -311,12 +340,12 @@ impl Page {
     /// `document.cookie` getter: non-HTTP jar read for this document URL.
     #[must_use]
     pub fn document_cookie(&self) -> String {
-        self.agent.cookies_for(&self.document_url)
+        self.fetch.cookies_for(&self.document_url)
     }
 
     /// `document.cookie` setter: non-HTTP jar write for this document URL.
     pub fn set_document_cookie(&self, value: &str) {
-        self.agent.set_cookie(value, &self.document_url);
+        self.fetch.set_cookie(value, &self.document_url);
     }
 
     /// HTML host timer: fire [`PageEvent::Timer`] after `delay`.
@@ -392,13 +421,58 @@ impl Page {
     ///
     /// [`PageError::Script`] when the engine cannot start or the script throws.
     pub fn execute_script(&mut self, source: &str) -> Result<ScriptValue, PageError> {
+        self.execute_script_deadline(source, None)
+    }
+
+    pub(crate) fn execute_script_deadline(
+        &mut self,
+        source: &str,
+        deadline: Option<WallClock>,
+    ) -> Result<ScriptValue, PageError> {
         self.ensure_js()?;
         let Some(js) = self.js.as_ref() else {
             return Err(PageError::Script(ScriptFailure::HostMissing));
         };
-        let out = js.eval_value(source).map_err(PageError::from);
+        let out = js
+            .eval_value_deadline(source, deadline)
+            .map_err(PageError::from);
         self.adopt_js_work();
         out
+    }
+
+    pub(crate) fn execute_remote(
+        &mut self,
+        source: &str,
+        timeout: Option<Duration>,
+    ) -> Result<crate::RemoteValue, PageError> {
+        let deadline = timeout.map(|duration| WallClock::now() + duration);
+        let value = self.execute_script_deadline(source, deadline)?;
+        Ok(self.intern_script(value))
+    }
+
+    fn intern_script(&mut self, value: ScriptValue) -> crate::RemoteValue {
+        match value {
+            ScriptValue::Undefined | ScriptValue::Null => crate::RemoteValue::Null,
+            ScriptValue::Bool(flag) => crate::RemoteValue::Bool(flag),
+            ScriptValue::Number(number) => crate::RemoteValue::Number(number),
+            ScriptValue::String(text) => crate::RemoteValue::String(text),
+            ScriptValue::List(items) => crate::RemoteValue::List(
+                items
+                    .into_iter()
+                    .map(|item| self.intern_script(item))
+                    .collect(),
+            ),
+            ScriptValue::Map(entries) => crate::RemoteValue::Map(
+                entries
+                    .into_iter()
+                    .map(|(key, item)| (key, self.intern_script(item)))
+                    .collect(),
+            ),
+            ScriptValue::Node(_) => {
+                self.next_remote = self.next_remote.saturating_add(1);
+                crate::RemoteValue::Node(self.next_remote)
+            }
+        }
     }
 
     /// Jobs that have already run, in order.
@@ -422,7 +496,7 @@ impl Page {
     /// If called from inside a Tokio runtime, if the current-thread runtime
     /// cannot be built, or a `spawn_blocking` fetch worker panics.
     pub fn run(&mut self) {
-        self.block_on_pump(None, |_| true);
+        self.block_on_pump(None, |page| !page.stopped());
     }
 
     /// Parks until the current navigation has fired `load`, without waiting
@@ -434,7 +508,7 @@ impl Page {
     ///
     /// Same conditions as [`Page::run`].
     pub fn run_until_load(&mut self) {
-        self.block_on_pump(None, |page| page.waiting_for_load());
+        self.block_on_pump(None, |page| page.waiting_for_load() && !page.stopped());
     }
 
     /// Parks like [`Page::run_until_load`], returning `false` if `timeout` elapses first.
@@ -446,13 +520,19 @@ impl Page {
         self.run_until_timeout(timeout, |page| !page.waiting_for_load())
     }
 
+    pub(crate) fn run_until_js_true(&mut self, source: &str, timeout: Duration) -> bool {
+        self.run_until_timeout(timeout, |page| {
+            matches!(page.execute_script(source), Ok(ScriptValue::Bool(true)))
+        })
+    }
+
     /// Parks like [`Page::run`], but returns as soon as `stop` is true.
     ///
     /// # Panics
     ///
     /// Same conditions as [`Page::run`].
     pub fn run_until(&mut self, mut stop: impl FnMut(&mut Self) -> bool) {
-        self.block_on_pump(None, |page| !stop(page));
+        self.block_on_pump(None, |page| !stop(page) && !page.stopped());
     }
 
     /// Parks like [`Page::run_until`], returning `false` if `timeout` elapses first.
@@ -467,25 +547,36 @@ impl Page {
     ) -> bool {
         let deadline = Instant::now() + timeout;
         self.block_on_pump(Some(deadline), |page| {
-            Instant::now() < deadline && !stop(page)
+            Instant::now() < deadline && !stop(page) && !page.stopped()
         });
         stop(self)
     }
 
-    fn block_on_pump(
-        &mut self,
-        cap: Option<Instant>,
-        keep_waiting: impl FnMut(&mut Self) -> bool,
-    ) {
+    fn block_on_pump(&mut self, cap: Option<Instant>, keep_waiting: impl FnMut(&mut Self) -> bool) {
         assert!(
             tokio::runtime::Handle::try_current().is_err(),
             "Page::run must not run inside another Tokio runtime"
         );
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_time()
-            .build()
-            .expect("current-thread Tokio runtime for the page thread");
+        let runtime = self.runtime.take().unwrap_or_else(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .build()
+                .expect("current-thread Tokio runtime for the page thread")
+        });
         runtime.block_on(self.pump(cap, keep_waiting));
+        self.runtime = Some(runtime);
+    }
+
+    pub(crate) fn shutdown_runtime(&mut self) {
+        self.stop.request();
+        self.fetches.abort_all();
+        if let Some(runtime) = self.runtime.take() {
+            runtime.shutdown_background();
+        }
+    }
+
+    fn stopped(&self) -> bool {
+        self.stop.is_set()
     }
 
     fn resolve_dial_url(&self, spec: &str) -> Result<Url, PageError> {
@@ -514,7 +605,11 @@ impl Page {
             .unwrap_or_else(|_| self.document_url.clone())
     }
 
-    async fn pump(&mut self, cap: Option<Instant>, mut keep_waiting: impl FnMut(&mut Self) -> bool) {
+    async fn pump(
+        &mut self,
+        cap: Option<Instant>,
+        mut keep_waiting: impl FnMut(&mut Self) -> bool,
+    ) {
         loop {
             self.adopt_js_work();
             self.launch_queued_dials();
@@ -550,7 +645,12 @@ impl Page {
             }
             let deadline = wait_until(next_deadline);
             let mut deadline = std::pin::pin!(deadline);
+            let stop = Arc::clone(&self.stop);
             let job = poll_fn(|cx| {
+                stop.register(cx.waker());
+                if stop.is_set() {
+                    return Poll::Ready(None);
+                }
                 if deadline.as_mut().poll(cx).is_ready() {
                     return Poll::Ready(None);
                 }
@@ -597,9 +697,9 @@ impl Page {
             if let QueuedDial::Navigate { epoch, .. } = &dial {
                 self.nav_in_flight = Some(*epoch);
             }
-            let agent = self.agent.clone();
+            let fetch = self.fetch.clone();
             self.fetches
-                .spawn_blocking(move || send_dial(&agent, &dial));
+                .spawn_blocking(move || send_dial(&fetch, &dial));
         }
         leftover.extend(std::mem::take(&mut self.queued_dials));
         self.queued_dials = leftover;
@@ -890,7 +990,7 @@ impl Page {
     }
 }
 
-fn send_dial(agent: &Agent, dial: &QueuedDial) -> Result<CompletedDial, DialFail> {
+fn send_dial(fetch: &FetchHandle, dial: &QueuedDial) -> Result<CompletedDial, DialFail> {
     let fail = match dial {
         QueuedDial::Fetch { .. } => DialFail::Fetch,
         QueuedDial::Navigate { epoch, .. } => DialFail::Navigate { epoch: *epoch },
@@ -908,12 +1008,13 @@ fn send_dial(agent: &Agent, dial: &QueuedDial) -> Result<CompletedDial, DialFail
             (url, Context::Fetch, initiator, true)
         }
     };
-    let response = agent
+    let response = fetch
         .request(Method::GET, url.clone())
         .with_context(context)
         .with_initiator(initiator.clone())
         .send()
         .map_err(|_| fail)?;
+    fetch.persist();
     let status = response.status();
     let final_url = response.final_url().clone();
     let content_language = response
@@ -964,6 +1065,43 @@ fn content_language_tag(raw: &str) -> Option<String> {
         return None;
     }
     Some(first)
+}
+
+pub(crate) struct Stop {
+    flag: AtomicBool,
+    waker: Mutex<Option<Waker>>,
+}
+
+impl Stop {
+    pub(crate) fn new() -> Self {
+        Self {
+            flag: AtomicBool::new(false),
+            waker: Mutex::new(None),
+        }
+    }
+
+    pub(crate) fn request(&self) {
+        self.flag.store(true, Ordering::Relaxed);
+        if let Some(waker) = self
+            .waker
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        {
+            waker.wake();
+        }
+    }
+
+    fn is_set(&self) -> bool {
+        self.flag.load(Ordering::Relaxed)
+    }
+
+    fn register(&self, waker: &Waker) {
+        *self
+            .waker
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(waker.clone());
+    }
 }
 
 async fn wait_until(deadline: Option<Instant>) {

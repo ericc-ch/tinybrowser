@@ -442,7 +442,7 @@ pub(crate) fn is_defined(dom: &Dom, id: NodeId) -> bool {
 /// [`lang_range_matches`] for the exact algorithm, including wildcards.
 ///
 /// `xml:lang` takes precedence over `lang`, then the document
-/// `Content-Language` default (<https://html.spec.whatwg.org/multipage/dom.html#language>) ([ADR 0007](../../../wiki/adrs/0007-engine-charter.md)).
+/// `Content-Language` default (<https://html.spec.whatwg.org/multipage/dom.html#language>) ([ADR 0007](../../../docs/adrs/0007-engine-charter.md)).
 pub(crate) fn lang_matches(dom: &Dom, id: NodeId, ranges: &[Box<str>]) -> bool {
     let mut found: Option<&str> = None;
     let mut cursor = Some(id);

@@ -17,7 +17,7 @@ the binary; it exists so tests are reproducible and offline-capable.
 - **Fresh clones** need `git submodule update --init` before
   `cargo test`; the harness fails loudly with that instruction otherwise.
 - **Updating**: move the submodule pin, rerun the harness, and apply the
-  fix-or-document rule from `wiki/researches/testing.md` to every new divergence.
+  fix-or-document rule from `docs/researches/testing.md` to every new divergence.
 - **Successor**: upstream maintenance moved to web-platform-tests:
   `wpt/html/syntax/parsing/resources/*.dat`, same format, README included.
   This pin is frozen and receives nothing new; html5lib-tests stay the
@@ -41,8 +41,11 @@ and select-fragment `<input><option>` (`tests_innerHTML_1.dat` #75) are listed i
 - **Pinned revision**: `92054a74d0c6a1ed2e9024d71ebf2880f2af02e2`
 - **License**: each test's own license; see WPT `LICENSE.md`.
 - **Fresh clones**: `git submodule update --init --recursive`.
-- **Driver**: classic WebDriver in-process on `tinybrowser --webdriver=PORT`
+- **Driver**: classic WebDriver on `tinybrowser --webdriver=PORT` over
+  `BrowserHandle`, with a fresh temporary XDG profile per endpoint
   ([ADR 0008](../docs/adrs/0008-wpt-via-webdriver.md)).
 - **Runner**: `pip install -e tools/wpt` into the WPT venv (or `tools/wpt/run`),
-  then `./wpt run --binary /path/to/tinybrowser tinybrowser [tests]`.
-  Install hosts once with `./wpt make-hosts-file` appended to `/etc/hosts`.
+  then `./wpt run --binary /path/to/tinybrowser --ssl-type none tinybrowser [tests]`.
+  `./tools/wpt/run` skips WPT’s `/etc/hosts` check and passes `--resolve`
+  ([ADR 0008](../docs/adrs/0008-wpt-via-webdriver.md)). Do not require a
+  machine hosts file.

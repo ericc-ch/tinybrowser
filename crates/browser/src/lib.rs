@@ -1,13 +1,18 @@
 //! Engine crate: `parse_html` (html5ever `TreeSink`) and the page
-//! (HTML jobs, `Agent`, `QuickJS` host). Depends on `dom` and `net`
+//! (HTML jobs, `NetworkSession`, `QuickJS` host). Depends on `dom` and `net`
 //! ([ADR 0007](../../../docs/adrs/0007-engine-charter.md)).
 //!
-//! Future CDP depends on this crate alone. Fetch is `net::Agent` held here,
-//! not a `HttpTransport` trait. `Agent::send` runs through `spawn_blocking`
-//! on the page thread.
+//! The `cdp` crate depends on this crate alone. Browser owns
+//! [`NetworkSession`] ([ADR 0010](../../../docs/adrs/0010-page-actor-ownership.md)).
+//! Blocking send runs through `spawn_blocking` on the page thread.
 
+mod actor;
+mod browser;
 mod js;
+mod network;
 mod page;
+mod profile;
+mod remote;
 
 use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
@@ -21,9 +26,14 @@ use html5ever::tree_builder::{ElementFlags, NodeOrText, QuirksMode, TreeSink};
 use markup5ever::interface::tree_builder::ElemName;
 use tendril::{StrTendril, TendrilSink};
 
+pub use actor::{PageHandle, PageId, RequestId};
+pub use browser::{Browser, BrowserError, BrowserHandle};
 pub use dom::{Dom, DomError, NodeId};
 pub use net::{Agent, AgentBuilder};
+pub use network::{FetchHandle, NetworkSession, ProfileStore};
 pub use page::{Page, PageError, PageEvent, ScriptFailure, ScriptValue};
+pub use profile::{Profile, ProfileError, ProfileName};
+pub use remote::RemoteValue;
 
 /// The result of parsing one document.
 #[derive(Debug)]

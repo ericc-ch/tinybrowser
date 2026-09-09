@@ -1,15 +1,15 @@
 use std::io;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use url::Url;
 
 use crate::context::Context;
 use crate::cookie::{CookieJar, CookieOp, RetrievalKind};
-use crate::error::{LimitExceeded, NetError, ProtocolError, TransportError};
+use crate::error::{LimitExceeded, NetError, ProtocolError, TimeoutKind, TransportError};
 use crate::protocol::{HeaderError, HeaderMap, Method};
 use crate::resolve::HostMap;
-use crate::transport::{HttpEngine, basic_authorization};
+use crate::transport::{CallBudget, HttpEngine, basic_authorization};
 use crate::websocket::{self, WebSocket};
 
 const CHUNK_SIZE: usize = 16 * 1024;
@@ -211,6 +211,23 @@ impl Agent {
             );
     }
 
+    /// Persistent cookies from the live jar. Session cookies are omitted.
+    #[must_use]
+    pub fn export_cookies(&self) -> Vec<crate::CookieRecord> {
+        self.jar
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .snapshot()
+    }
+
+    /// Loads `records` into the live jar, replacing matching identities.
+    pub fn import_cookies(&self, records: Vec<crate::CookieRecord>) {
+        self.jar
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .restore(records, (self.now)());
+    }
+
     pub(crate) fn prepare_outbound(
         &self,
         headers: &mut HeaderMap,
@@ -378,8 +395,16 @@ impl RequestBuilder {
         let context = self.context;
         let initiator = self.initiator;
         let mut cross_site_redirect = false;
+        let started = Instant::now();
+        let mut budget = agent.engine.budget_at(started);
 
         loop {
+            if budget.is_expired() {
+                return Err(NetError::Transport(TransportError::Timeout(
+                    budget.timeout_kind(TimeoutKind::Global),
+                )));
+            }
+            budget = budget.with_hop_start(agent.engine.timeout_per_call, Instant::now());
             let mut wire = url.clone();
             wire.set_fragment(None);
             let mut hop_headers = headers.clone();
@@ -395,9 +420,15 @@ impl RequestBuilder {
             let (status, response_headers, reader) =
                 agent
                     .engine
-                    .send(&method, &wire, &hop_headers, body.as_deref())?;
-            let response =
-                Response::from_parts(status, response_headers, reader, context, url.clone());
+                    .send(&method, &wire, &hop_headers, body.as_deref(), budget)?;
+            let response = Response::from_parts(
+                status,
+                response_headers,
+                reader,
+                context,
+                url.clone(),
+                budget,
+            );
             agent.store_set_cookie_lines(
                 &url,
                 context,
@@ -538,6 +569,7 @@ fn apply_url_credentials(headers: &mut HeaderMap, url: &Url) {
 /// Streaming response body. Dropping it closes the socket.
 pub struct Body {
     inner: Box<dyn io::Read + Send>,
+    budget: CallBudget,
 }
 
 impl std::fmt::Debug for Body {
@@ -547,8 +579,8 @@ impl std::fmt::Debug for Body {
 }
 
 impl Body {
-    fn from_reader(inner: Box<dyn io::Read + Send>) -> Self {
-        Self { inner }
+    fn from_reader(inner: Box<dyn io::Read + Send>, budget: CallBudget) -> Self {
+        Self { inner, budget }
     }
 
     /// Next chunk, or `None` at end of body.
@@ -566,6 +598,16 @@ impl Body {
                     return Ok(Some(buf));
                 }
                 Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
+                Err(err)
+                    if matches!(
+                        err.kind(),
+                        io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+                    ) =>
+                {
+                    return Err(NetError::Transport(TransportError::Timeout(
+                        self.budget.timeout_kind(TimeoutKind::RecvBody),
+                    )));
+                }
                 Err(err) => return Err(NetError::Transport(TransportError::Io(err))),
             }
         }
@@ -616,13 +658,14 @@ impl Response {
         body: Box<dyn io::Read + Send>,
         context: Context,
         final_url: Url,
+        budget: CallBudget,
     ) -> Self {
         Self {
             status,
             headers,
             final_url,
             context,
-            body: Body::from_reader(body),
+            body: Body::from_reader(body, budget),
         }
     }
 
