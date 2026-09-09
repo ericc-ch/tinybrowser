@@ -45,7 +45,7 @@ and select-fragment `<input><option>` (`tests_innerHTML_1.dat` #75) are listed i
   `BrowserHandle`, with a fresh temporary XDG profile per endpoint
   ([ADR 0008](../docs/adrs/0008-wpt-via-webdriver.md)).
 - **Runner**: `pip install -e tools/wpt` into the WPT venv (or `tools/wpt/run`),
-  then `./wpt run --binary /path/to/tinybrowser --ssl-type none tinybrowser [tests]`.
+  then `./tools/wpt/run --binary /path/to/tinybrowser --ssl-type none tinybrowser [tests]`.
   `./tools/wpt/run` skips WPT’s `/etc/hosts` check and passes `--resolve`
   ([ADR 0008](../docs/adrs/0008-wpt-via-webdriver.md)). Do not require a
   machine hosts file.

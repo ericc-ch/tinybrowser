@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant, SystemTime};
 
-use browser::{Browser, Profile, ProfileName};
+use browser::{Browser, Profile, ProfileName, ProfileStore};
 use serde_json::{Value, json};
 
 /// Registration recorded at `$XDG_RUNTIME_DIR/tinybrowser/<profile>/daemon.json`.
@@ -43,6 +43,7 @@ pub fn run(profile: &Profile, data_home: &Path) -> io::Result<()> {
     let Some(_lock) = acquire_lock(&runtime)? else {
         return Ok(());
     };
+    let lock_path = runtime.join("lock");
     let listener = TcpListener::bind(("127.0.0.1", 0))?;
     let addr = listener.local_addr()?;
     write_endpoint(
@@ -54,7 +55,9 @@ pub fn run(profile: &Profile, data_home: &Path) -> io::Result<()> {
         },
     )?;
     let browser = Browser::open_in(data_home, profile);
-    cdp::serve(&listener, &browser.handle())
+    let result = cdp::serve(&listener, &browser.handle());
+    let _ = fs::remove_file(&lock_path);
+    result
 }
 
 /// Returns a live endpoint, starting a detached daemon when missing.
@@ -173,7 +176,11 @@ enum LockStatus {
 
 fn lock_status(path: &Path) -> LockStatus {
     let Ok(text) = fs::read_to_string(path) else {
-        return LockStatus::InProgress;
+        return if lock_file_stale(path) {
+            LockStatus::Stale
+        } else {
+            LockStatus::InProgress
+        };
     };
     let trimmed = text.trim();
     if trimmed.is_empty() {
@@ -284,16 +291,7 @@ fn pid_alive(pid: u32) -> bool {
 ///
 /// Both `XDG_DATA_HOME` and `HOME` are unset or empty.
 pub fn data_home() -> io::Result<PathBuf> {
-    if let Some(dir) = std::env::var_os("XDG_DATA_HOME").filter(|value| !value.is_empty()) {
-        return Ok(PathBuf::from(dir));
-    }
-    if let Some(home) = std::env::var_os("HOME").filter(|value| !value.is_empty()) {
-        return Ok(PathBuf::from(home).join(".local/share"));
-    }
-    Err(io::Error::new(
-        io::ErrorKind::NotFound,
-        "XDG_DATA_HOME and HOME are unset",
-    ))
+    ProfileStore::data_home()
 }
 
 /// Selected target id for the CLI convenience.

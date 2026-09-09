@@ -28,6 +28,8 @@ Page actors receive a value-only network/fetch handle. They do not expose or own
 
 `ProfileStore` owns every durable web-data feature the engine supports. Cookies first. Later localStorage, IndexedDB, HTTP cache, and similar site data use the same store. CDP does not own cookies.
 
+The live jar is marked dirty on cookie changes. `ProfileStore` writes the cookie file on navigation, page stop, and `NetworkSession` drop (including `Browser.close`). `document.cookie` does not write disk on the page thread.
+
 Open tabs, active documents, JavaScript heaps, `sessionStorage`, and in-flight requests are not restored after the daemon restarts.
 
 ## Isolation

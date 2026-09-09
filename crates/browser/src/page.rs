@@ -323,6 +323,7 @@ impl Page {
             }
         }
         self.boot_document();
+        self.fetch.persist();
     }
 
     /// Sets the document URL used as cookie initiator and relative-URL base.
@@ -452,7 +453,8 @@ impl Page {
 
     fn intern_script(&mut self, value: ScriptValue) -> crate::RemoteValue {
         match value {
-            ScriptValue::Undefined | ScriptValue::Null => crate::RemoteValue::Null,
+            ScriptValue::Undefined => crate::RemoteValue::Undefined,
+            ScriptValue::Null => crate::RemoteValue::Null,
             ScriptValue::Bool(flag) => crate::RemoteValue::Bool(flag),
             ScriptValue::Number(number) => crate::RemoteValue::Number(number),
             ScriptValue::String(text) => crate::RemoteValue::String(text),
@@ -568,6 +570,7 @@ impl Page {
     }
 
     pub(crate) fn shutdown_runtime(&mut self) {
+        self.fetch.persist();
         self.stop.request();
         self.fetches.abort_all();
         if let Some(runtime) = self.runtime.take() {
@@ -1014,7 +1017,10 @@ fn send_dial(fetch: &FetchHandle, dial: &QueuedDial) -> Result<CompletedDial, Di
         .with_initiator(initiator.clone())
         .send()
         .map_err(|_| fail)?;
-    fetch.persist();
+    fetch.mark_dirty();
+    if matches!(dial, QueuedDial::Navigate { .. }) {
+        fetch.persist();
+    }
     let status = response.status();
     let final_url = response.final_url().clone();
     let content_language = response

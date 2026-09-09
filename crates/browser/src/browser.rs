@@ -5,6 +5,7 @@
 
 use std::collections::HashMap;
 use std::fmt;
+use std::io;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
@@ -32,9 +33,15 @@ pub struct BrowserHandle {
 
 impl Browser {
     /// Opens a browser on `profile` with cookies under the process XDG data home.
-    #[must_use]
-    pub fn open(profile: &Profile) -> Self {
-        Self::with_store(ProfileStore::open(profile), net::AgentBuilder::new())
+    ///
+    /// # Errors
+    ///
+    /// Both `XDG_DATA_HOME` and `HOME` are unset or empty.
+    pub fn open(profile: &Profile) -> io::Result<Self> {
+        Ok(Self::with_store(
+            ProfileStore::open(profile)?,
+            net::AgentBuilder::new(),
+        ))
     }
 
     /// Opens a browser on `profile` with cookies under `data_home`.

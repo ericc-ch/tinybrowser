@@ -61,6 +61,26 @@ fn browser_target_page_runtime_flatten_and_method_not_found() {
         .expect("eval");
     assert_eq!(evaluated["result"]["value"].as_f64(), Some(2.0));
 
+    let null_value = client
+        .call(
+            "Runtime.evaluate",
+            &json!({"expression": "null"}),
+            Some(&session),
+        )
+        .expect("null");
+    assert_eq!(null_value["result"]["subtype"], json!("null"));
+    assert_eq!(null_value["result"]["value"], json!(null));
+
+    let undefined_value = client
+        .call(
+            "Runtime.evaluate",
+            &json!({"expression": "undefined"}),
+            Some(&session),
+        )
+        .expect("undefined");
+    assert_eq!(undefined_value["result"]["type"], json!("undefined"));
+    assert!(undefined_value["result"].get("subtype").is_none());
+
     let missing = client.call("Foo.bar", &json!({}), None);
     let err = missing.expect_err("method-not-found");
     assert!(err.to_string().contains("wasn't found"), "{err}");
@@ -68,6 +88,12 @@ fn browser_target_page_runtime_flatten_and_method_not_found() {
     client
         .call("Target.closeTarget", &json!({"targetId": target_id}), None)
         .expect("close");
+
+    let before = browser.handle().pages().len();
+    let bad = client.call("Target.createTarget", &json!({"url": "notaurl"}), None);
+    assert!(bad.is_err(), "invalid createTarget url");
+    assert_eq!(browser.handle().pages().len(), before);
+
     let _ = std::fs::remove_dir_all(data_home);
 }
 

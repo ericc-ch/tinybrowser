@@ -32,6 +32,14 @@ fn page_handle_commands_are_values_only() {
         page.execute_script("1 + 1").expect("number"),
         RemoteValue::Number(2.0)
     );
+    assert_eq!(
+        page.execute_script("null").expect("null"),
+        RemoteValue::Null
+    );
+    assert_eq!(
+        page.execute_script("undefined").expect("undefined"),
+        RemoteValue::Undefined
+    );
     assert!(matches!(
         page.execute_script("document.body").expect("node"),
         RemoteValue::Node(_)
@@ -88,6 +96,14 @@ fn webidl_node_name_doctype_and_branding() {
               (function() {{
                 var node = document.createComment("x");
                 return String(document.documentElement.appendChild(node) === node);
+              }})(),
+              (function() {{
+                try {{ document.createElementNS(null, "a:b"); return "no"; }}
+                catch (e) {{ return String(e).indexOf("NamespaceError") >= 0; }}
+              }})(),
+              (function() {{
+                try {{ document.createElementNS("http://example.test", "xml:x"); return "no"; }}
+                catch (e) {{ return String(e).indexOf("NamespaceError") >= 0; }}
               }})()
             ].join("|")
             "#
@@ -95,7 +111,7 @@ fn webidl_node_name_doctype_and_branding() {
         .expect("webidl");
     assert_eq!(
         got,
-        "I|I|svg|SVG|X:B|#text|#comment|#document|html|#document-fragment|function|true|true|true|true|true|true|true|true|true|true|true|true"
+        "I|I|svg|SVG|X:B|#text|#comment|#document|html|#document-fragment|function|true|true|true|true|true|true|true|true|true|true|true|true|true|true"
     );
     let _ = std::fs::remove_dir_all(data_home);
 }

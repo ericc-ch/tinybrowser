@@ -3,7 +3,9 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use dom::{LocalName, Namespace, NodeId, NodeKind, Prefix, QualName, html_namespace};
+use dom::{
+    LocalName, Namespace, NodeId, NodeKind, Prefix, QualName, html_namespace, xml_namespace,
+};
 use rquickjs::{
     Array, Class, Ctx, Exception, FromJs, Function, Object, Persistent, Result, Value,
     class::{Trace, Tracer},
@@ -217,11 +219,26 @@ impl JsNode {
         ns: OptString,
         tag: String,
     ) -> Result<Value<'js>> {
+        let namespace_is_null = ns.0.as_ref().is_none_or(String::is_empty);
         let namespace = match ns.0 {
             Some(ns) if !ns.is_empty() => Namespace::from(ns),
             _ => Namespace::from(""),
         };
         let (prefix, local) = split_qualified_name(&tag);
+        // https://dom.spec.whatwg.org/#validate-and-extract
+        if prefix.is_some() && namespace_is_null {
+            return Err(Exception::throw_type(&ctx, "NamespaceError"));
+        }
+        if prefix == Some("xml") && namespace != xml_namespace() {
+            return Err(Exception::throw_type(&ctx, "NamespaceError"));
+        }
+        let xmlns = Namespace::from("http://www.w3.org/2000/xmlns/");
+        if (prefix == Some("xmlns") || tag == "xmlns") && namespace != xmlns {
+            return Err(Exception::throw_type(&ctx, "NamespaceError"));
+        }
+        if namespace == xmlns && prefix != Some("xmlns") && tag != "xmlns" {
+            return Err(Exception::throw_type(&ctx, "NamespaceError"));
+        }
         let name = QualName::new(prefix.map(Prefix::from), namespace, LocalName::from(local));
         create_element_named(&ctx, name)
     }

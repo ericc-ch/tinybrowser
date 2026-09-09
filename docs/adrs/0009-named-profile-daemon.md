@@ -12,13 +12,13 @@ The daemon binds only `127.0.0.1` on a random available port. It stops on explic
 
 Registration is user-only at `$XDG_RUNTIME_DIR/tinybrowser/<profile>/daemon.json` and is atomically replaced. It records PID and endpoint data enough for health checks and stale-owner cleanup. A startup lock in the same profile directory lets concurrent CLI invocations elect one daemon. This does not protect against a hostile process running as the same user.
 
-First-slice trust is Chrome-style local CDP. There is no custom CDP authentication protocol.
+First-slice trust is Chrome-style local CDP: bind `127.0.0.1`, user-only runtime files, no `Host`/`Origin` checks, and no websocket token. There is no custom CDP authentication protocol.
 
 The same executable may later self-spawn renderer workers. That is still one shipped program. The process seam is [ADR 0010](0010-page-actor-ownership.md).
 
 ## Durable data
 
-Durable browser data lives at `$XDG_DATA_HOME/tinybrowser/profiles/<profile>/` (using the XDG default when the variable is unset). Cookies are first. Later site data uses the same store. Browser owns `ProfileStore`. CDP does not own cookies ([ADR 0010](0010-page-actor-ownership.md)).
+Durable browser data lives at `$XDG_DATA_HOME/tinybrowser/profiles/<profile>/` (using the XDG default when the variable is unset). Opening a store requires `XDG_DATA_HOME` or `HOME`; missing both is an error. Cookie files are mode `0o600`. Cookies are first. Later site data uses the same store. Browser owns `ProfileStore`. CDP does not own cookies ([ADR 0010](0010-page-actor-ownership.md)).
 
 ## Control
 

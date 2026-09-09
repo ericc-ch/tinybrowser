@@ -7,6 +7,7 @@ use std::env;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -25,6 +26,7 @@ pub struct ProfileStore {
     name: ProfileName,
     root: Option<PathBuf>,
     disk: Mutex<DiskStore>,
+    dirty: AtomicBool,
 }
 
 #[derive(Clone, Copy)]
@@ -35,10 +37,31 @@ enum DiskStore {
 }
 
 impl ProfileStore {
+    /// Data home for profile files: `XDG_DATA_HOME` or `$HOME/.local/share`.
+    ///
+    /// # Errors
+    ///
+    /// Both `XDG_DATA_HOME` and `HOME` are unset or empty.
+    pub fn data_home() -> io::Result<PathBuf> {
+        if let Some(dir) = env::var_os("XDG_DATA_HOME").filter(|value| !value.is_empty()) {
+            return Ok(PathBuf::from(dir));
+        }
+        if let Some(home) = env::var_os("HOME").filter(|value| !value.is_empty()) {
+            return Ok(PathBuf::from(home).join(".local/share"));
+        }
+        Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "XDG_DATA_HOME and HOME are unset",
+        ))
+    }
+
     /// Opens the on-disk store for `profile` under the process XDG data home.
-    #[must_use]
-    pub fn open(profile: &Profile) -> Self {
-        Self::open_in(&data_home(), profile)
+    ///
+    /// # Errors
+    ///
+    /// Both `XDG_DATA_HOME` and `HOME` are unset or empty.
+    pub fn open(profile: &Profile) -> io::Result<Self> {
+        Ok(Self::open_in(&Self::data_home()?, profile))
     }
 
     /// Opens the on-disk store for `profile` under `data_home`.
@@ -53,6 +76,7 @@ impl ProfileStore {
                     .join(profile.name().as_str()),
             ),
             disk: Mutex::new(DiskStore::Ready),
+            dirty: AtomicBool::new(false),
         }
     }
 
@@ -63,6 +87,7 @@ impl ProfileStore {
             name: profile.name().clone(),
             root: None,
             disk: Mutex::new(DiskStore::Memory),
+            dirty: AtomicBool::new(false),
         }
     }
 
@@ -90,6 +115,10 @@ impl ProfileStore {
         }
     }
 
+    pub(crate) fn mark_dirty(&self) {
+        self.dirty.store(true, Ordering::SeqCst);
+    }
+
     pub(crate) fn save_from(&self, agent: &Agent) {
         let Some(dir) = self.root.as_ref() else {
             return;
@@ -98,16 +127,27 @@ impl ProfileStore {
         if matches!(*disk, DiskStore::Memory | DiskStore::Corrupt) {
             return;
         }
-        if fs::create_dir_all(dir).is_err() {
+        if !self.dirty.swap(false, Ordering::SeqCst) {
+            return;
+        }
+        if fs::create_dir_all(dir).is_err() || restrict_dir(dir).is_err() {
+            self.dirty.store(true, Ordering::SeqCst);
             return;
         }
         let path = dir.join("cookies");
         let tmp = dir.join(format!("cookies.{}.tmp", std::process::id()));
         let encoded = encode_cookies(&agent.export_cookies());
-        if fs::write(&tmp, encoded).is_ok() {
-            let _ = fs::rename(tmp, path);
+        if fs::write(&tmp, &encoded).is_ok() {
+            let _ = restrict_file(&tmp);
+            if fs::rename(&tmp, &path).is_ok() {
+                let _ = restrict_file(&path);
+            } else {
+                let _ = fs::remove_file(&tmp);
+                self.dirty.store(true, Ordering::SeqCst);
+            }
         } else {
-            let _ = fs::remove_file(tmp);
+            let _ = fs::remove_file(&tmp);
+            self.dirty.store(true, Ordering::SeqCst);
         }
     }
 
@@ -205,7 +245,11 @@ impl FetchHandle {
     /// `document.cookie` setter for `url`.
     pub fn set_cookie(&self, value: &str, url: &Url) {
         self.agent.set_cookie(value, url);
-        self.persist();
+        self.store.mark_dirty();
+    }
+
+    pub(crate) fn mark_dirty(&self) {
+        self.store.mark_dirty();
     }
 
     pub(crate) fn persist(&self) {
@@ -217,16 +261,30 @@ impl FetchHandle {
     }
 }
 
-fn data_home() -> PathBuf {
-    env::var_os("XDG_DATA_HOME")
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| {
-            env::var_os("HOME")
-                .filter(|value| !value.is_empty())
-                .map(|home| PathBuf::from(home).join(".local/share"))
-        })
-        .unwrap_or_else(|| PathBuf::from("/tmp"))
+fn restrict_dir(path: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+    Ok(())
+}
+
+fn restrict_file(path: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+    Ok(())
 }
 
 fn encode_cookies(records: &[CookieRecord]) -> String {

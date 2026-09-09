@@ -9,7 +9,7 @@ use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use browser::{BrowserHandle, PageError, PageHandle, PageId, RemoteValue};
 use serde_json::{Value, json};
@@ -34,6 +34,12 @@ pub fn serve(listener: &TcpListener, browser: &BrowserHandle) -> io::Result<()> 
         let (stream, _) = match listener.accept() {
             Ok(pair) => pair,
             Err(_) if stop.load(Ordering::SeqCst) => return Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) if accept_retry(&error) => {
+                eprintln!("cdp: accept {error}");
+                std::thread::sleep(Duration::from_millis(10));
+                continue;
+            }
             Err(error) => return Err(error),
         };
         if stop.load(Ordering::SeqCst) {
@@ -159,6 +165,7 @@ fn handle_connection(
     bound: SocketAddr,
     stop: Arc<AtomicBool>,
 ) -> io::Result<()> {
+    stream.set_read_timeout(Some(Duration::from_secs(30)))?;
     let (start, headers, _) = read_head(&mut stream)?;
     let mut parts = start.split_whitespace();
     let method = parts.next().unwrap_or("");
@@ -168,6 +175,7 @@ fn handle_connection(
         return Ok(());
     }
     if is_websocket(&headers) {
+        stream.set_read_timeout(None)?;
         return serve_socket(stream, path, &headers, browser, bound, stop);
     }
     match path {
@@ -427,7 +435,10 @@ impl Conn {
                     .browser
                     .create_page()
                     .map_err(|err| DispatchError::Failed(err.to_string()))?;
-                open_url(&page, url)?;
+                if let Err(error) = open_url(&page, url) {
+                    let _ = self.browser.close_page(page.id());
+                    return Err(error);
+                }
                 Ok(json!({ "targetId": page.id().to_string() }))
             }
             "Target.closeTarget" => {
@@ -542,9 +553,23 @@ fn target_id(value: Option<&Value>) -> Result<PageId, DispatchError> {
     Ok(PageId::new(id))
 }
 
+fn accept_retry(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::WouldBlock
+            | io::ErrorKind::TimedOut
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::OutOfMemory
+            | io::ErrorKind::ResourceBusy
+            | io::ErrorKind::QuotaExceeded
+    )
+}
+
 fn remote_preview(value: &RemoteValue) -> Value {
     match value {
-        RemoteValue::Null => json!({"type": "undefined"}),
+        RemoteValue::Undefined => json!({"type": "undefined"}),
+        RemoteValue::Null => json!({"type": "object", "subtype": "null", "value": null}),
         RemoteValue::Bool(flag) => json!({"type": "boolean", "value": flag}),
         RemoteValue::Number(number) => json!({"type": "number", "value": number}),
         RemoteValue::String(text) => json!({"type": "string", "value": text}),

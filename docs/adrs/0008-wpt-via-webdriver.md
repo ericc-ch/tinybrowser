@@ -28,7 +28,7 @@ The exact launch flag may stay `--webdriver=PORT` or change. That flag is open. 
 - Testdriver user-input tests are skipped (`supports_testdriver = False`) until click/send_keys are real. The testharness executor still uses testdriver `run()` for result collection. Click and actions endpoints currently return success without doing work.
 - html5lib-tests stay the parser gate until testharness runs `html/syntax/parsing/`. Browser-crate JS/DOM tests stay until that green bar exists.
 
-Invocation: `pip install -e tools/wpt` into the WPT venv, then `./wpt run --binary /path/to/tinybrowser --ssl-type none tinybrowser [tests]`, or `./tools/wpt/run [tests]`.
+Invocation: `pip install -e tools/wpt` into the WPT venv, then `./tools/wpt/run [tests]`.
 
 WebIDL: verify against vendored IDL ([webidl.md](../researches/webidl.md)); do not codegen bindings. Interfaces with branding, tree mutation, or a host resource are Rust host objects around `NodeId` (or page-owned handles). Other APIs may be implemented in JS to keep binary size down.
 

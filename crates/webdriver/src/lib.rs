@@ -65,8 +65,10 @@ struct Window {
 impl Sessions {
     fn blank_window(&self) -> Result<Window, String> {
         let page = self.browser.create_page().map_err(|err| err.to_string())?;
-        page.load_html("<!doctype html><title></title>")
-            .map_err(|err| err.to_string())?;
+        if let Err(error) = page.load_html("<!doctype html><title></title>") {
+            let _ = self.browser.close_page(page.id());
+            return Err(error.to_string());
+        }
         Ok(Window { page })
     }
 
@@ -287,7 +289,7 @@ fn wrap_script(script: &str, args: &Value, asynchronous: bool) -> String {
 
 fn encode(value: &RemoteValue) -> Value {
     match value {
-        RemoteValue::Null => Value::Null,
+        RemoteValue::Undefined | RemoteValue::Null => Value::Null,
         RemoteValue::Bool(flag) => json!(flag),
         RemoteValue::Number(number) => {
             if number.is_finite() {

@@ -3,7 +3,9 @@
 /// JSON-shaped script result. No DOM handles or `QuickJS` values.
 #[derive(Clone, Debug, PartialEq)]
 pub enum RemoteValue {
-    /// JS `undefined` or `null`.
+    /// JS `undefined`.
+    Undefined,
+    /// JS `null`.
     Null,
     /// JS boolean.
     Bool(bool),

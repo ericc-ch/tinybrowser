@@ -114,11 +114,11 @@ A named durable browser data set. The implicit name is `default`. One daemon and
 _Avoid_: session (WebDriver or CDP session), runtime owner of pages
 
 **ProfileStore**:
-Durable backing for one Profile under `XDG_DATA_HOME`. Cookies first. Later localStorage, IndexedDB, HTTP cache, and similar site data use the same store. It is not a second live cookie jar ([ADR 0010](adrs/0010-page-actor-ownership.md)).
+Durable backing for one Profile under `XDG_DATA_HOME`. Cookies first. Later localStorage, IndexedDB, HTTP cache, and similar site data use the same store. It is not a second live cookie jar. Missing both `XDG_DATA_HOME` and `HOME` is an error; the store does not fall back to `/tmp` ([ADR 0010](adrs/0010-page-actor-ownership.md)).
 _Avoid_: cookie jar on `Agent` as the lasting durable owner
 
 **NetworkSession**:
-Browser-owned live networking service for one Profile. It wraps one shared `net::Agent`, which keeps the connection pool, transport settings, and live cookie jar. `ProfileStore` is durable backing, not another live jar. The service loads cookies into the jar and persists jar changes. Page actors receive a value-only network/fetch handle; they do not expose or own `net::Agent`. Blocking net calls stay on `spawn_blocking`. Completions return as actor events ([ADR 0010](adrs/0010-page-actor-ownership.md), hard seam [ADR 0006](adrs/0006-net-transport.md)).
+Browser-owned live networking service for one Profile. It wraps one shared `net::Agent`, which keeps the connection pool, transport settings, and live cookie jar. `ProfileStore` is durable backing, not another live jar. The service loads cookies into the jar and writes dirty cookies on navigation, page stop, and session drop. Page actors receive a value-only network/fetch handle; they do not expose or own `net::Agent`. Blocking net calls stay on `spawn_blocking`. Completions return as actor events ([ADR 0010](adrs/0010-page-actor-ownership.md), hard seam [ADR 0006](adrs/0006-net-transport.md)).
 _Avoid_: Agent as a second durable owner, page-owned Agent
 
 **Profile daemon**:
@@ -126,7 +126,7 @@ The browser process for one named Profile, spawned from the same executable. A C
 _Avoid_: separately shipped helper, idle-exit server
 
 **CDP**:
-Chrome DevTools Protocol. Control plane for the CLI and external tools. First slice uses Chrome-style local trust (loopback, no custom CDP auth). Honest Browser, Target, Page, and Runtime subsets. Unsupported methods return method-not-found.
+Chrome DevTools Protocol. Control plane for the CLI and external tools. First slice uses Chrome-style local trust: loopback bind, user-only runtime files, no `Host`/`Origin` checks, no websocket token. Honest Browser, Target, Page, and Runtime subsets. Unsupported methods return method-not-found.
 _Avoid_: private RPC, pretending to support a method
 
 **Flattened session**:

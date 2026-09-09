@@ -120,26 +120,26 @@ fn overlapping_daemons_share_one_endpoint() {
     let (runtime, data) = temp_dirs();
     let mut first = spawn_daemon(&runtime, &data);
     let mut second = spawn_daemon(&runtime, &data);
-    let info = wait_json(&runtime);
-    let pid = u32::try_from(info["pid"].as_u64().expect("pid")).expect("pid u32");
-    assert!(pid_alive(pid));
-    let again = wait_json(&runtime);
-    assert_eq!(again["pid"], info["pid"]);
-    assert_eq!(again["port"], info["port"]);
     let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        let first_dead = first.try_wait().expect("first wait").is_some();
-        let second_dead = second.try_wait().expect("second wait").is_some();
-        if first_dead ^ second_dead {
-            break;
+    let winner_pid = loop {
+        let first_exited = first.try_wait().expect("first wait").is_some();
+        let second_exited = second.try_wait().expect("second wait").is_some();
+        match (first_exited, second_exited) {
+            (true, false) => break second.id(),
+            (false, true) => break first.id(),
+            (true, true) => panic!("both overlapping daemons exited"),
+            (false, false) => {
+                assert!(
+                    Instant::now() < deadline,
+                    "one overlapping daemon must exit"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
         }
-        assert!(
-            Instant::now() < deadline,
-            "one overlapping daemon must exit"
-        );
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    assert!(pid_alive(pid));
+    };
+    let info = wait_json(&runtime);
+    assert_eq!(info["pid"].as_u64().expect("pid"), u64::from(winner_pid));
+    assert!(pid_alive(winner_pid));
     let _ = first.kill();
     let _ = first.wait();
     let _ = second.kill();

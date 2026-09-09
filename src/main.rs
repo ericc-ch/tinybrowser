@@ -110,6 +110,13 @@ fn parse_port(value: &str) -> Result<u16, String> {
 }
 
 fn serve_webdriver(port: u16, builder: AgentBuilder, profile: &Profile) -> ExitCode {
+    let data_home = match daemon::data_home() {
+        Ok(home) => home,
+        Err(error) => {
+            eprintln!("webdriver: {error}");
+            return ExitCode::from(1);
+        }
+    };
     let listener = match std::net::TcpListener::bind(("127.0.0.1", port)) {
         Ok(listener) => listener,
         Err(error) => {
@@ -119,7 +126,7 @@ fn serve_webdriver(port: u16, builder: AgentBuilder, profile: &Profile) -> ExitC
     };
     let browser = Browser::open_with_network(NetworkSession::from_builder(
         builder,
-        ProfileStore::open(profile),
+        ProfileStore::open_in(&data_home, profile),
     ));
     if let Err(error) = webdriver::serve(&listener, browser.handle()) {
         eprintln!("webdriver: {error}");

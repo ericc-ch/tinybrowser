@@ -26,6 +26,21 @@ fn persistent_cookies_survive_browser_restart() {
             .expect("set cookie");
         assert_eq!(page.document_cookie().expect("cookie"), "sid=1");
     }
+    let cookie_path = data_home
+        .join("tinybrowser")
+        .join("profiles")
+        .join("work")
+        .join("cookies");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&cookie_path)
+            .expect("cookie file")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600, "cookie file mode {mode:#o}");
+    }
     let browser = Browser::open_in(&data_home, &profile);
     let page = browser.handle().create_page().expect("page");
     page.set_document_url(url.as_str()).expect("document url");
