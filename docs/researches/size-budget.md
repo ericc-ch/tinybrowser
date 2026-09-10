@@ -213,14 +213,21 @@ not drop it. Empty `main` re-measured at 284 KB (290912 bytes).
 | `futures` `LocalPool` | ready future only (no timer, no I/O) | **+12 KB** |
 
 Tokio 1.53 default features are empty; `full` is the fat switch. smol is not smaller
-than current-thread tokio with timers. Decision: page thread is tokio current-thread
-`rt`+`time` (~+66 KB); HTML jobs stay our queue; ureq via `spawn_blocking`; never
-`full` / smol / axum / hyper ([engine charter](../adrs/0007-engine-charter.md)).
-Add tokio `net` only if a later milestone needs async sockets on that runtime.
+than current-thread tokio with timers. The page thread therefore uses Tokio
+current-thread `rt`+`time` (~+66 KB); HTML jobs stay in our queue; never `full` /
+smol / axum / hyper ([engine charter](../adrs/0007-engine-charter.md)). The original
+per-page `spawn_blocking` choice was superseded on 2026-09-10 by one browser-owned,
+bounded blocking network executor. Add Tokio `net` only if a later milestone needs
+async sockets on the page runtime.
 
 ## Milestone: page thread in `browser` (2026-08-27)
 
-`browser` depends on tokio 1.53 `rt`+`time`+`macros` (`macros` is compile-only) and rquickjs 0.12.2 (`std`+`macro`). `Page::run` is the current-thread waiter; fetch uses `JoinSet::spawn_blocking`. The stub `tinybrowser` CLI does not call `Page`, so tuned LTO still ships **294944 bytes** (~288 KB) unless a later CLI load path references `Page`. Re-measure when the CLI actually loads a page or evals script.
+At this historical checkpoint, `browser` depended on Tokio 1.53
+`rt`+`time`+`macros` (`macros` is compile-only) and rquickjs 0.12.2
+(`std`+`macro`). `Page::run` was the current-thread waiter and fetch used
+`JoinSet::spawn_blocking`. The stub `tinybrowser` CLI did not call `Page`, so tuned
+LTO shipped **294944 bytes** (~288 KB). Both the stub CLI and per-page blocking-task
+ownership were superseded by later milestones below.
 
 ## Milestone: reviewed page engine (2026-09-06)
 
@@ -281,3 +288,23 @@ committed stripped x86_64 release profile. No axum, hyper, or Tokio `full`.
 
 CLI grew 321,616 bytes from the HEAD re-measure (3,076,896). The probe grew
 35,056 bytes. Headroom to the 5,000,000-byte limit remains about 1.60 MB.
+
+## Milestone: autonomous page architecture (2026-09-10)
+
+Rebuild after incremental parser/script execution, WHATWG byte decoding,
+interface-correct live DOM collections, autonomous page actors, typed CDP load
+events, bounded browser-owned networking, QuickJS limits, and durable locked
+profiles. Command: `nix develop --command cargo build --release --offline
+--example page_probe --bin tinybrowser`; rustc 1.98.0, committed stripped x86_64
+release profile.
+
+| Artifact | Bytes | Headroom to 5,000,000 |
+| --- | ---: | ---: |
+| CLI (`target/release/tinybrowser`) | 3,613,712 | 1,386,288 |
+| Page engine (`target/release/examples/page_probe`) | 3,325,968 | 1,674,032 |
+
+Against the immediate pre-refactor measurement, the CLI grew 207,072 bytes and
+the page probe grew 308,608 bytes. Most of the new retained code is the
+`encoding_rs` decoder and WebIDL/event/parser machinery; networking still uses no
+framework or multi-thread async runtime. The shipping executable remains 27.7%
+below the hard limit.

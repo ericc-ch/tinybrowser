@@ -112,6 +112,7 @@ fn navigation_parsing_cookies_and_relative_js_fetch_form_one_journey() {
         page.events(),
         &[
             PageEvent::Fetch { status: 200 },
+            PageEvent::Load,
             PageEvent::Fetch { status: 200 }
         ]
     );
@@ -269,6 +270,63 @@ window.addEventListener("load", function() { window.loadFired = true; });
         page.eval("document.readyState").expect("readyState"),
         "complete"
     );
+}
+
+#[test]
+fn parser_blocking_script_observes_and_mutates_the_partial_document() {
+    let mut page = Page::new();
+    page.load_html(
+        r#"<!doctype html>
+<head><script>
+window.bodyWasMissing = document.body === null;
+var marker = document.createElement("meta");
+marker.id = "made-while-parsing";
+document.documentElement.appendChild(marker);
+document.write('<meta id="written">');
+</script></head>
+<body><p>later</p></body>"#,
+    );
+
+    assert_eq!(
+        page.eval("String(window.bodyWasMissing)").expect("body"),
+        "true"
+    );
+    assert_eq!(
+        page.eval("String(document.getElementById('made-while-parsing') !== null)")
+            .expect("mutation"),
+        "true"
+    );
+    assert_eq!(
+        page.eval("String(document.getElementById('written') !== null)")
+            .expect("document.write"),
+        "true"
+    );
+    assert_eq!(page.eval("document.readyState").expect("state"), "complete");
+}
+
+#[test]
+fn navigation_decodes_bytes_before_tokenization() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("address");
+    let server = thread::spawn(move || {
+        let (mut navigation, _) = listener.accept().expect("navigation");
+        let _target = read_target(&mut navigation);
+        respond(
+            &mut navigation,
+            &["Content-Type: text/html; charset=windows-1252"],
+            b"<!doctype html><p id=value>\x80</p>",
+        );
+    });
+    let mut page = Page::new();
+    page.goto(&format!("http://{addr}/")).expect("goto");
+    page.run_until_load();
+
+    assert_eq!(
+        page.eval("document.getElementById('value').firstChild.data")
+            .expect("decoded text"),
+        "€"
+    );
+    server.join().expect("server");
 }
 
 #[test]

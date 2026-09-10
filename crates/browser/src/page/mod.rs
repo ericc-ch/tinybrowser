@@ -1,7 +1,7 @@
 //! One page: HTML jobs we own, Tokio current-thread as the waiter, fetch handle for HTTP.
 //!
 //! [ADR 0007](../../../../docs/adrs/0007-engine-charter.md): the page thread is
-//! Tokio `rt`+`time` only. Blocking send runs on `spawn_blocking`. `Page` stays
+//! Tokio `rt`+`time` only. Blocking sends use the browser network executor. `Page` stays
 //! one owner; this module is split by job ([ADR 0010](../../../../docs/adrs/0010-page-actor-ownership.md)).
 
 use std::cell::{Ref, RefCell};
@@ -11,18 +11,18 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::task::Waker;
 use std::time::Instant as WallClock;
 
 use net::{Agent, AgentBuilder};
 use tokio::runtime::Runtime;
-use tokio::task::JoinSet;
 use tokio::time::Instant;
 use url::Url;
 
-use crate::Parsed;
-use crate::js::{ClassicScript, World};
+use crate::js::World;
 use crate::network::{FetchHandle, PAGE_FETCH_TIMEOUT};
+use crate::{ActiveParser, Parsed};
 
 mod intern;
 mod navigate;
@@ -30,11 +30,10 @@ mod pump;
 
 pub use crate::js::ScriptValue;
 
-/// Upper bound on a host-fetch / navigation body read inside `spawn_blocking`.
+/// Upper bound on a host-fetch or navigation body.
 const FETCH_BODY_LIMIT: usize = 1_048_576;
 
-/// Caps concurrent `spawn_blocking` dials so one eval loop cannot exhaust threads.
-const MAX_IN_FLIGHT_DIALS: usize = 16;
+const MAX_QUEUED_JS_FETCHES: usize = 256;
 
 /// Why `QuickJS` eval or a host callback failed.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -105,6 +104,8 @@ impl From<crate::js::JsError> for PageError {
 /// Observable HTML-job outcomes, in the order the page ran them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PageEvent {
+    /// The document reached `readyState = "complete"` and dispatched `load`.
+    Load,
     /// A host timer whose delay elapsed.
     Timer(u32),
     /// A `fetch` or navigation job finished with this HTTP status.
@@ -124,6 +125,7 @@ enum HtmlJob {
     DialFailed(DialFail),
 }
 
+#[derive(Clone)]
 enum QueuedDial {
     Fetch {
         url: Url,
@@ -156,6 +158,7 @@ enum CompletedDial {
         body: Vec<u8>,
         final_url: Url,
         content_language: Option<String>,
+        content_type: Option<String>,
         epoch: u64,
     },
     JsFetch {
@@ -194,14 +197,16 @@ pub struct Page {
     jobs: VecDeque<HtmlJob>,
     timers: Vec<HostTimer>,
     next_timer_id: u32,
-    fetches: JoinSet<Result<CompletedDial, DialFail>>,
+    dial_tx: Sender<Result<CompletedDial, DialFail>>,
+    dial_rx: Receiver<Result<CompletedDial, DialFail>>,
+    in_flight_dials: usize,
     queued_dials: Vec<QueuedDial>,
     events: Vec<PageEvent>,
     js: Option<crate::js::JsHost>,
     js_timer_slots: HashMap<u32, i32>,
     nav_epoch: u64,
     js_epoch: u64,
-    pending_classic: VecDeque<ClassicScript>,
+    active_parser: Option<ActiveParser>,
     classic_fetch_in_flight: bool,
     nav_in_flight: Option<u64>,
     navigation_failed: bool,
@@ -256,6 +261,7 @@ impl Page {
 
     pub(crate) fn with_fetch_stop(fetch: FetchHandle, stop: Arc<Stop>) -> Self {
         let document_url = Url::parse("about:blank").expect("about:blank is a valid URL");
+        let (dial_tx, dial_rx) = mpsc::channel();
         Self {
             world: Rc::new(RefCell::new(World::new(
                 fetch.clone(),
@@ -267,14 +273,16 @@ impl Page {
             jobs: VecDeque::new(),
             timers: Vec::new(),
             next_timer_id: 1,
-            fetches: JoinSet::new(),
+            dial_tx,
+            dial_rx,
+            in_flight_dials: 0,
             queued_dials: Vec::new(),
             events: Vec::new(),
             js: None,
             js_timer_slots: HashMap::new(),
             nav_epoch: 0,
             js_epoch: 0,
-            pending_classic: VecDeque::new(),
+            active_parser: None,
             classic_fetch_in_flight: false,
             nav_in_flight: None,
             navigation_failed: false,
@@ -390,7 +398,10 @@ impl Page {
 
     fn ensure_js(&mut self) -> Result<(), PageError> {
         if self.js.is_none() {
-            self.js = Some(crate::js::JsHost::new(self.world.clone()).map_err(PageError::from)?);
+            self.js = Some(
+                crate::js::JsHost::new(self.world.clone(), Arc::clone(&self.stop))
+                    .map_err(PageError::from)?,
+            );
         }
         Ok(())
     }
@@ -427,7 +438,7 @@ impl Stop {
         }
     }
 
-    fn is_set(&self) -> bool {
+    pub(crate) fn is_set(&self) -> bool {
         self.flag.load(Ordering::Relaxed)
     }
 

@@ -2,6 +2,7 @@
 
 use std::io::{self, Write};
 use std::process::ExitCode;
+use std::time::{Duration, Instant};
 
 use browser::Profile;
 use serde_json::{Value, json};
@@ -89,7 +90,29 @@ fn evaluate(client: &mut cdp::Client, profile: &Profile, script: &str) -> io::Re
 
 fn navigate(client: &mut cdp::Client, profile: &Profile, url: &str) -> io::Result<()> {
     let session = attach_selected(client, profile)?;
+    client.call("Page.enable", &json!({}), Some(&session))?;
     client.call("Page.navigate", &json!({"url": url}), Some(&session))?;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "navigation did not finish within 30 seconds",
+            ));
+        };
+        let Some(event) = client.read_event(remaining)? else {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "navigation did not finish within 30 seconds",
+            ));
+        };
+        if event.get("method").and_then(Value::as_str) == Some("Page.loadEventFired")
+            && event.get("sessionId").and_then(Value::as_str) == Some(&session)
+        {
+            break;
+        }
+    }
+    client.call("Page.disable", &json!({}), Some(&session))?;
     Ok(())
 }
 

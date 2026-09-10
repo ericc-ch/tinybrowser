@@ -32,23 +32,35 @@ pub struct BrowserHandle {
 }
 
 impl Browser {
+    /// Opens an in-memory browser whose profile is discarded at shutdown.
+    ///
+    /// # Errors
+    ///
+    /// The JavaScript or networking session could not be initialized.
+    pub fn ephemeral() -> io::Result<Self> {
+        Self::with_store(
+            ProfileStore::memory(&Profile::default()),
+            net::AgentBuilder::new(),
+        )
+    }
+
     /// Opens a browser on `profile` with cookies under the process XDG data home.
     ///
     /// # Errors
     ///
     /// Both `XDG_DATA_HOME` and `HOME` are unset or empty.
     pub fn open(profile: &Profile) -> io::Result<Self> {
-        Ok(Self::with_store(
-            ProfileStore::open(profile)?,
-            net::AgentBuilder::new(),
-        ))
+        Self::with_store(ProfileStore::open(profile)?, net::AgentBuilder::new())
     }
 
     /// Opens a browser on `profile` with cookies under `data_home`.
-    #[must_use]
-    pub fn open_in(data_home: &Path, profile: &Profile) -> Self {
+    ///
+    /// # Errors
+    ///
+    /// The profile directory cannot be created, read, or exclusively locked.
+    pub fn open_in(data_home: &Path, profile: &Profile) -> io::Result<Self> {
         Self::with_store(
-            ProfileStore::open_in(data_home, profile),
+            ProfileStore::open_in(data_home, profile)?,
             net::AgentBuilder::new(),
         )
     }
@@ -66,8 +78,8 @@ impl Browser {
         }
     }
 
-    fn with_store(store: ProfileStore, builder: net::AgentBuilder) -> Self {
-        Self::open_with_network(NetworkSession::from_builder(builder, store))
+    fn with_store(store: ProfileStore, builder: net::AgentBuilder) -> io::Result<Self> {
+        NetworkSession::from_builder(builder, store).map(Self::open_with_network)
     }
 
     /// Value-only handle for this browser.
@@ -87,7 +99,7 @@ impl Browser {
 
 impl Drop for Browser {
     fn drop(&mut self) {
-        self.handle().close();
+        let _result = self.handle().close();
     }
 }
 
@@ -163,21 +175,29 @@ impl BrowserHandle {
         self.lock().live
     }
 
-    /// Stops every page and refuses later commands. Idempotent.
-    pub fn close(&self) {
-        {
+    /// Stops every page, persists the profile, and refuses later commands.
+    ///
+    /// # Errors
+    ///
+    /// The final durable profile write failed.
+    pub fn close(&self) -> io::Result<()> {
+        let should_close_pages = {
             let mut inner = self.lock();
-            if !inner.live {
-                return;
+            if inner.live {
+                inner.live = false;
+                true
+            } else {
+                false
             }
-            inner.live = false;
+        };
+        if should_close_pages {
+            self.close_all();
         }
-        self.persist();
-        self.close_all();
+        self.persist()
     }
 
-    fn persist(&self) {
-        self.lock().network.persist();
+    fn persist(&self) -> io::Result<()> {
+        self.lock().network.persist()
     }
 
     fn close_all(&self) {

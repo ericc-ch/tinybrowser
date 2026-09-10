@@ -9,10 +9,10 @@ use serde_json::{Value, json};
 fn start(builder: AgentBuilder) -> (String, Browser) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let addr = listener.local_addr().expect("addr").to_string();
-    let browser = Browser::open_with_network(NetworkSession::from_builder(
-        builder,
-        ProfileStore::memory(&Profile::default()),
-    ));
+    let browser = Browser::open_with_network(
+        NetworkSession::from_builder(builder, ProfileStore::memory(&Profile::default()))
+            .expect("network"),
+    );
     let handle = browser.handle();
     thread::spawn(move || {
         let _ = webdriver::serve(&listener, handle);

@@ -7,7 +7,7 @@ use dom::{
     LocalName, Namespace, NodeId, NodeKind, Prefix, QualName, html_namespace, xml_namespace,
 };
 use rquickjs::{
-    Array, Class, Ctx, Exception, FromJs, Function, Object, Persistent, Result, Value,
+    Class, Ctx, Exception, FromJs, Function, Object, Persistent, Result, Value,
     class::{Trace, Tracer},
     function::Constructor,
     prelude::This,
@@ -70,6 +70,46 @@ impl JsEvent {
 }
 
 branded_node!(JsNode, "Node");
+
+#[derive(Trace, rquickjs::JsLifetime)]
+enum CollectionKind {
+    Children,
+    ElementsByTag(String),
+}
+
+#[derive(Trace, rquickjs::JsLifetime)]
+#[rquickjs::class(rename = "NodeList")]
+struct JsCollection {
+    scope: Handle,
+    kind: CollectionKind,
+}
+
+#[rquickjs::methods]
+impl JsCollection {
+    #[qjs(constructor)]
+    fn ctor(ctx: Ctx<'_>) -> Result<Self> {
+        let error = Exception::throw_type(&ctx, "Illegal constructor");
+        drop(ctx);
+        Err(error)
+    }
+
+    #[qjs(get)]
+    fn length(&self, ctx: Ctx<'_>) -> Result<usize> {
+        let result = collection_ids(&ctx, self.scope.0, &self.kind).map(|ids| ids.len());
+        drop(ctx);
+        result
+    }
+
+    fn item<'js>(&self, ctx: Ctx<'js>, index: usize) -> Result<Value<'js>> {
+        match collection_ids(&ctx, self.scope.0, &self.kind)?
+            .get(index)
+            .copied()
+        {
+            Some(id) => wrap_node(&ctx, id),
+            None => Ok(Value::new_null(ctx)),
+        }
+    }
+}
 
 impl JsNode {
     pub(crate) fn node_id(&self) -> NodeId {
@@ -150,24 +190,8 @@ impl JsNode {
     }
 
     #[qjs(get, rename = "childNodes")]
-    fn child_nodes<'js>(&self, ctx: Ctx<'js>) -> Result<Array<'js>> {
-        let world = world(&ctx)?;
-        let ids: Vec<NodeId> = world
-            .borrow()
-            .parsed
-            .as_ref()
-            .and_then(|parsed| {
-                parsed
-                    .dom
-                    .children(self.handle.0)
-                    .map(|kids| kids.copied().collect())
-            })
-            .unwrap_or_default();
-        let list = Array::new(ctx.clone())?;
-        for (index, id) in ids.into_iter().enumerate() {
-            list.set(index, wrap_node(&ctx, id)?)?;
-        }
-        Ok(list)
+    fn child_nodes<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
+        live_collection(&ctx, self.handle.0, CollectionKind::Children, None)
     }
 
     #[qjs(rename = "appendChild")]
@@ -263,6 +287,17 @@ impl JsNode {
         create_kind(&ctx, dom::Dom::create_fragment)
     }
 
+    // https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#document-write-steps
+    #[qjs(rename = "write")]
+    fn write(&self, ctx: Ctx<'_>, html: String) -> Result<()> {
+        let world = world(&ctx)?;
+        let mut world = world.borrow_mut();
+        if world.parser_active {
+            world.pending_html_writes.push(html);
+        }
+        Ok(())
+    }
+
     #[qjs(rename = "getElementById")]
     fn get_element_by_id<'js>(&self, ctx: Ctx<'js>, id: String) -> Result<Value<'js>> {
         let world = world(&ctx)?;
@@ -280,7 +315,7 @@ impl JsNode {
     }
 
     #[qjs(rename = "getElementsByTagName")]
-    fn get_elements_by_tag_name<'js>(&self, ctx: Ctx<'js>, name: String) -> Result<Array<'js>> {
+    fn get_elements_by_tag_name<'js>(&self, ctx: Ctx<'js>, name: String) -> Result<Value<'js>> {
         elements_by_tag(&ctx, self.handle.0, &name)
     }
 
@@ -468,7 +503,9 @@ pub(super) fn install(ctx: &Ctx<'_>, world: &Rc<RefCell<World>>) -> Result<()> {
     let globals = ctx.globals();
     Class::<JsEvent>::define(&globals)?;
     Class::<JsNode>::define(&globals)?;
+    Class::<JsCollection>::define(&globals)?;
     install_brands(ctx)?;
+    install_collection_brand(ctx)?;
 
     let document_id = world
         .borrow()
@@ -582,31 +619,106 @@ fn deref_weak<'js>(
 }
 
 fn install_brands(ctx: &Ctx<'_>) -> Result<()> {
-    let node_proto = Class::<JsNode>::prototype(ctx)?
-        .ok_or_else(|| Exception::throw_type(ctx, "Node prototype"))?;
+    // https://webidl.spec.whatwg.org/#interface-prototype-object
+    // https://dom.spec.whatwg.org/#interface-node
+    ctx.eval::<(), _>(
+        r"
+(function() {
+  const native = globalThis.Node.prototype;
+  function illegal() { throw new TypeError('Illegal constructor'); }
+  function define(name, parent, members) {
+    const ctor = function() { return illegal(); };
+    const proto = Object.create(parent ? parent.prototype : Object.prototype);
+    for (const member of members) {
+      const descriptor = Object.getOwnPropertyDescriptor(native, member);
+      if (descriptor) Object.defineProperty(proto, member, descriptor);
+    }
+    Object.defineProperty(proto, 'constructor', { value: ctor, writable: true, configurable: true });
+    Object.defineProperty(ctor, 'prototype', { value: proto, writable: false });
+    Object.defineProperty(globalThis, name, { value: ctor, writable: true, configurable: true });
+    return ctor;
+  }
+  const EventTargetInterface = define('EventTarget', null, [
+    'addEventListener', 'dispatchEvent'
+  ]);
+  const NodeInterface = define('Node', EventTargetInterface, [
+    'nodeType', 'nodeName', 'firstChild', 'parentNode', 'childNodes', 'appendChild'
+  ]);
+  const DocumentInterface = define('Document', NodeInterface, [
+    'createElement', 'createElementNS', 'createTextNode', 'createComment',
+    'createDocumentFragment', 'write', 'getElementById', 'getElementsByTagName',
+    'body', 'documentElement', 'doctype', 'readyState'
+  ]);
+  const ElementInterface = define('Element', NodeInterface, [
+    'getElementsByTagName', 'getAttribute', 'setAttribute', 'id', 'src',
+    'name', 'content'
+  ]);
+  const CharacterDataInterface = define('CharacterData', NodeInterface, ['data']);
+  define('Text', CharacterDataInterface, []);
+  define('Comment', CharacterDataInterface, []);
+  define('DocumentType', NodeInterface, []);
+  define('DocumentFragment', NodeInterface, []);
+  void DocumentInterface;
+  void ElementInterface;
+})();
+",
+    )?;
     for name in [
         "Document",
         "Element",
+        "CharacterData",
         "Text",
         "Comment",
         "DocumentType",
         "DocumentFragment",
     ] {
-        let mut options = rquickjs::context::EvalOptions::default();
-        options.strict = false;
-        let ctor: Function = ctx.eval_with_options(
-            "(function() { throw new TypeError('Illegal constructor'); })",
-            options,
-        )?;
-        let proto = Object::new(ctx.clone())?;
-        proto.set_prototype(Some(&node_proto))?;
-        proto.set("constructor", ctor.clone())?;
-        ctor.set("prototype", proto.clone())?;
+        let ctor: Function = ctx.globals().get(name)?;
+        let proto: Object = ctor.get("prototype")?;
         world(ctx)?
             .borrow_mut()
             .intern_brand(name, Persistent::save(ctx, proto));
-        ctx.globals().set(name, ctor)?;
     }
+    Ok(())
+}
+
+fn install_collection_brand(ctx: &Ctx<'_>) -> Result<()> {
+    ctx.eval::<(), _>(
+        r"
+(function() {
+  const native = globalThis.NodeList.prototype;
+  const ctor = function() { throw new TypeError('Illegal constructor'); };
+  const proto = Object.create(Object.prototype);
+  for (const member of ['length', 'item']) {
+    const descriptor = Object.getOwnPropertyDescriptor(native, member);
+    if (descriptor) Object.defineProperty(proto, member, descriptor);
+  }
+  Object.defineProperty(proto, 'constructor', { value: ctor, writable: true, configurable: true });
+  Object.defineProperty(ctor, 'prototype', { value: proto, writable: false });
+  Object.defineProperty(globalThis, 'HTMLCollection', { value: ctor, writable: true, configurable: true });
+  Object.defineProperty(globalThis, '__tb_liveCollection', {
+    enumerable: false,
+    configurable: false,
+    writable: false,
+    value: function(target) {
+      return new Proxy(target, {
+        get: function(inner, property) {
+          if (typeof property === 'string' && /^(0|[1-9][0-9]*)$/.test(property)) {
+            return inner.item(Number(property));
+          }
+          const value = Reflect.get(inner, property, inner);
+          return typeof value === 'function' ? value.bind(inner) : value;
+        }
+      });
+    }
+  });
+})();
+",
+    )?;
+    let ctor: Function = ctx.globals().get("HTMLCollection")?;
+    let proto: Object = ctor.get("prototype")?;
+    world(ctx)?
+        .borrow_mut()
+        .intern_brand("HTMLCollection", Persistent::save(ctx, proto));
     Ok(())
 }
 
@@ -748,20 +860,51 @@ fn element_node_name(name: &QualName) -> String {
     }
 }
 
-fn elements_by_tag<'js>(ctx: &Ctx<'js>, scope: NodeId, name: &str) -> Result<Array<'js>> {
-    let world = world(ctx)?;
-    let ids = {
-        let parsed = world.borrow();
-        let Some(parsed) = parsed.parsed.as_ref() else {
-            return Array::new(ctx.clone());
-        };
-        collect_by_tag(&parsed.dom, scope, name)
-    };
-    let list = Array::new(ctx.clone())?;
-    for (index, id) in ids.into_iter().enumerate() {
-        list.set(index, wrap_node(ctx, id)?)?;
+fn elements_by_tag<'js>(ctx: &Ctx<'js>, scope: NodeId, name: &str) -> Result<Value<'js>> {
+    live_collection(
+        ctx,
+        scope,
+        CollectionKind::ElementsByTag(name.to_owned()),
+        Some("HTMLCollection"),
+    )
+}
+
+fn live_collection<'js>(
+    ctx: &Ctx<'js>,
+    scope: NodeId,
+    kind: CollectionKind,
+    brand: Option<&str>,
+) -> Result<Value<'js>> {
+    let class = Class::instance(
+        ctx.clone(),
+        JsCollection {
+            scope: Handle(scope),
+            kind,
+        },
+    )?;
+    if let Some(brand) = brand
+        && let Some(proto) = class_proto(ctx, brand)?
+    {
+        class.set_prototype(Some(&proto))?;
     }
-    Ok(list)
+    let proxy: Function = ctx.globals().get("__tb_liveCollection")?;
+    proxy.call((Class::into_value(class),))
+}
+
+fn collection_ids(ctx: &Ctx<'_>, scope: NodeId, kind: &CollectionKind) -> Result<Vec<NodeId>> {
+    let world = world(ctx)?;
+    let parsed = world.borrow();
+    let Some(parsed) = parsed.parsed.as_ref() else {
+        return Ok(Vec::new());
+    };
+    Ok(match kind {
+        CollectionKind::Children => parsed
+            .dom
+            .children(scope)
+            .map(|children| children.copied().collect())
+            .unwrap_or_default(),
+        CollectionKind::ElementsByTag(name) => collect_by_tag(&parsed.dom, scope, name),
+    })
 }
 
 fn collect_by_tag(dom: &dom::Dom, scope: NodeId, name: &str) -> Vec<NodeId> {

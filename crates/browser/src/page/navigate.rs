@@ -5,9 +5,11 @@ use url::Url;
 
 use crate::js::ClassicScript;
 use crate::network::FetchHandle;
-use crate::parse_html;
+use crate::{ActiveParser, ParseProgress};
 
-use super::{CompletedDial, DialFail, FETCH_BODY_LIMIT, Page, PageError, PageEvent, QueuedDial};
+use super::{
+    CompletedDial, DialFail, FETCH_BODY_LIMIT, Page, PageError, PageEvent, QueuedDial, Stop,
+};
 
 impl Page {
     /// Parses `input` into this page's tree and starts a new JS realm.
@@ -16,17 +18,7 @@ impl Page {
         self.queued_dials
             .retain(|dial| !matches!(dial, QueuedDial::Navigate { .. }));
         self.reset_js_realm();
-        {
-            let mut world = self.world.borrow_mut();
-            world.replace_document(parse_html(input));
-            if let Some(parsed) = world.parsed.as_mut() {
-                parsed
-                    .dom
-                    .set_document_language(self.content_language.clone());
-            }
-        }
-        self.boot_document();
-        self.fetch.persist();
+        self.start_document(input);
     }
 
     /// Queues a GET `fetch` job. [`Page::run`] performs the send.
@@ -104,6 +96,7 @@ impl Page {
                 body,
                 final_url,
                 content_language,
+                content_type,
                 epoch,
             } => {
                 self.events.push(PageEvent::Fetch { status });
@@ -112,7 +105,12 @@ impl Page {
                 }
                 if epoch == self.nav_epoch {
                     self.navigation_failed = false;
-                    self.apply_navigation(final_url, content_language, &body);
+                    self.apply_navigation(
+                        final_url,
+                        content_language,
+                        content_type.as_deref(),
+                        &body,
+                    );
                 }
             }
             CompletedDial::JsFetch {
@@ -135,12 +133,12 @@ impl Page {
                 self.events.push(PageEvent::Fetch { status });
                 if epoch == self.js_epoch {
                     self.classic_fetch_in_flight = false;
-                    self.pending_classic.pop_front();
                     if (200..300).contains(&status) {
                         let source = String::from_utf8_lossy(&body);
                         self.eval_classic(&source);
                     }
-                    self.advance_classic_scripts();
+                    self.sync_parser_from_world();
+                    self.advance_parser();
                 }
             }
         }
@@ -167,28 +165,27 @@ impl Page {
             DialFail::ClassicScript { epoch } => {
                 if epoch == self.js_epoch {
                     self.classic_fetch_in_flight = false;
-                    self.pending_classic.pop_front();
-                    self.advance_classic_scripts();
+                    self.sync_parser_from_world();
+                    self.advance_parser();
                 }
             }
         }
         self.adopt_js_work();
     }
 
-    fn apply_navigation(&mut self, final_url: Url, content_language: Option<String>, body: &[u8]) {
+    fn apply_navigation(
+        &mut self,
+        final_url: Url,
+        content_language: Option<String>,
+        content_type: Option<&str>,
+        body: &[u8],
+    ) {
         self.reset_js_realm();
-        let html = String::from_utf8_lossy(body);
+        let html = decode_html(body, content_type);
         self.document_url = final_url.clone();
-        self.content_language.clone_from(&content_language);
-        {
-            let mut world = self.world.borrow_mut();
-            world.document_url = final_url;
-            world.replace_document(parse_html(&html));
-            if let Some(parsed) = world.parsed.as_mut() {
-                parsed.dom.set_document_language(content_language);
-            }
-        }
-        self.boot_document();
+        self.content_language = content_language;
+        self.world.borrow_mut().document_url = final_url;
+        self.start_document(&html);
     }
 
     pub(in crate::page) fn settle_js_fetch(&mut self, id: i32, ok: bool, status: i32, body: &str) {
@@ -213,19 +210,17 @@ impl Page {
             .retain(|timer| !js_timer_ids.contains(&timer.id));
         self.js_timer_slots.clear();
         self.js = None;
-        self.pending_classic.clear();
+        self.active_parser = None;
+        self.world.borrow_mut().parser_active = false;
+        self.world.borrow_mut().pending_html_writes.clear();
         self.classic_fetch_in_flight = false;
         self.remote_by_node.clear();
     }
 
-    fn boot_document(&mut self) {
-        if self.ensure_js().is_err() {
-            self.events.push(PageEvent::ScriptFailed);
-            return;
-        }
-        let scripts = crate::js::collect_classic_scripts(&self.world.borrow());
-        self.pending_classic = scripts.into();
-        self.advance_classic_scripts();
+    fn start_document(&mut self, html: &str) {
+        self.world.borrow_mut().parser_active = true;
+        self.active_parser = Some(ActiveParser::new(html));
+        self.advance_parser();
     }
 
     fn eval_classic(&mut self, source: &str) {
@@ -235,36 +230,90 @@ impl Page {
         self.adopt_js_work();
     }
 
-    fn advance_classic_scripts(&mut self) {
+    // https://html.spec.whatwg.org/multipage/parsing.html#parsing-main-intext
+    // https://html.spec.whatwg.org/multipage/scripting.html#prepare-the-script-element
+    fn advance_parser(&mut self) {
         loop {
-            match self.pending_classic.front().cloned() {
-                Some(ClassicScript::Inline(source)) => {
-                    self.pending_classic.pop_front();
-                    self.eval_classic(&source);
-                }
-                Some(ClassicScript::Src(src)) => {
-                    if self.classic_fetch_in_flight {
-                        return;
-                    }
-                    if let Ok(url) = self.resolve_dial_url(&src) {
-                        self.classic_fetch_in_flight = true;
-                        let initiator = self.document_url.clone();
-                        self.queued_dials.push(QueuedDial::ClassicScript {
-                            url,
-                            initiator,
-                            epoch: self.js_epoch,
-                        });
+            let Some(parser) = self.active_parser.as_ref() else {
+                return;
+            };
+            match parser.advance() {
+                ParseProgress::Script(id) => {
+                    let parsed = parser.take_state();
+                    if self.js.is_none() {
+                        self.world.borrow_mut().replace_document(parsed);
+                        if self.ensure_js().is_err() {
+                            self.events.push(PageEvent::ScriptFailed);
+                            self.sync_parser_from_world();
+                            continue;
+                        }
                     } else {
-                        self.pending_classic.pop_front();
-                        continue;
+                        self.world.borrow_mut().parsed = Some(parsed);
                     }
-                    return;
+                    if let Some(parsed) = self.world.borrow_mut().parsed.as_mut() {
+                        parsed
+                            .dom
+                            .set_document_language(self.content_language.clone());
+                    }
+                    let script = crate::js::classic_script_at(&self.world.borrow(), id);
+                    match script {
+                        Some(ClassicScript::Inline(source)) => {
+                            self.eval_classic(&source);
+                            self.sync_parser_from_world();
+                        }
+                        Some(ClassicScript::Src(src)) => {
+                            if let Ok(url) = self.resolve_dial_url(&src) {
+                                self.classic_fetch_in_flight = true;
+                                let initiator = self.document_url.clone();
+                                self.queued_dials.push(QueuedDial::ClassicScript {
+                                    url,
+                                    initiator,
+                                    epoch: self.js_epoch,
+                                });
+                                return;
+                            }
+                            self.sync_parser_from_world();
+                        }
+                        None => self.sync_parser_from_world(),
+                    }
                 }
-                None => {
+                ParseProgress::Done => {
+                    let Some(parser) = self.active_parser.take() else {
+                        return;
+                    };
+                    let mut parsed = parser.finish();
+                    parsed
+                        .dom
+                        .set_document_language(self.content_language.clone());
+                    if self.js.is_none() {
+                        self.world.borrow_mut().replace_document(parsed);
+                        if self.ensure_js().is_err() {
+                            self.events.push(PageEvent::ScriptFailed);
+                            return;
+                        }
+                    } else {
+                        self.world.borrow_mut().parsed = Some(parsed);
+                    }
+                    self.world.borrow_mut().parser_active = false;
                     self.fire_document_load();
                     return;
                 }
             }
+        }
+    }
+
+    fn sync_parser_from_world(&self) {
+        let Some(parser) = self.active_parser.as_ref() else {
+            return;
+        };
+        let mut world = self.world.borrow_mut();
+        let writes = std::mem::take(&mut world.pending_html_writes).concat();
+        if let Some(parsed) = world.parsed.take() {
+            parser.restore(parsed);
+        }
+        drop(world);
+        if !writes.is_empty() {
+            parser.insert_html(writes);
         }
     }
 
@@ -273,6 +322,7 @@ impl Page {
             return;
         }
         self.world.borrow_mut().document_ready = true;
+        self.events.push(PageEvent::Load);
         if let Some(js) = &self.js {
             super::note_script(&mut self.events, js.fire_load().is_err());
         }
@@ -283,6 +333,7 @@ impl Page {
 pub(in crate::page) fn send_dial(
     fetch: &FetchHandle,
     dial: &QueuedDial,
+    stop: &Stop,
 ) -> Result<CompletedDial, DialFail> {
     let fail = match dial {
         QueuedDial::Fetch { .. } => DialFail::Fetch,
@@ -307,10 +358,10 @@ pub(in crate::page) fn send_dial(
         .with_initiator(initiator.clone())
         .send()
         .map_err(|_| fail)?;
-    fetch.mark_dirty();
-    if matches!(dial, QueuedDial::Navigate { .. }) {
-        fetch.persist();
+    if stop.is_set() {
+        return Err(fail);
     }
+    fetch.mark_dirty();
     let status = response.status();
     let final_url = response.final_url().clone();
     let content_language = response
@@ -318,11 +369,21 @@ pub(in crate::page) fn send_dial(
         .get("content-language")
         .and_then(|bytes| std::str::from_utf8(bytes).ok())
         .and_then(content_language_tag);
+    let content_type = response
+        .headers()
+        .get("content-type")
+        .and_then(|bytes| std::str::from_utf8(bytes).ok())
+        .map(str::to_owned);
     let body = if read_body {
-        response
-            .into_body()
-            .bytes(FETCH_BODY_LIMIT)
-            .map_err(|_| fail)?
+        let mut body = response.into_body();
+        let mut bytes = Vec::new();
+        while let Some(chunk) = body.read_chunk().map_err(|_| fail)? {
+            if stop.is_set() || bytes.len().saturating_add(chunk.len()) > FETCH_BODY_LIMIT {
+                return Err(fail);
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        bytes
     } else {
         Vec::new()
     };
@@ -333,6 +394,7 @@ pub(in crate::page) fn send_dial(
             body,
             final_url,
             content_language,
+            content_type,
             epoch: *epoch,
         },
         QueuedDial::JsFetch { id, epoch, .. } => CompletedDial::JsFetch {
@@ -347,6 +409,57 @@ pub(in crate::page) fn send_dial(
             epoch: *epoch,
         },
     })
+}
+
+// https://html.spec.whatwg.org/multipage/parsing.html#encoding-sniffing-algorithm
+// https://encoding.spec.whatwg.org/#concept-encoding-get
+fn decode_html(body: &[u8], content_type: Option<&str>) -> String {
+    let bom = encoding_rs::Encoding::for_bom(body);
+    let header = content_type.and_then(charset_from_content_type);
+    let prescan = prescan_charset(body);
+    let (encoding, bom_len) = bom
+        .or_else(|| header.map(|encoding| (encoding, 0)))
+        .or_else(|| prescan.map(|encoding| (encoding, 0)))
+        .unwrap_or((encoding_rs::WINDOWS_1252, 0));
+    encoding
+        .decode_without_bom_handling(&body[bom_len..])
+        .0
+        .into_owned()
+}
+
+fn charset_from_content_type(content_type: &str) -> Option<&'static encoding_rs::Encoding> {
+    content_type.split(';').skip(1).find_map(|parameter| {
+        let (name, value) = parameter.split_once('=')?;
+        if !name.trim().eq_ignore_ascii_case("charset") {
+            return None;
+        }
+        let label = value.trim().trim_matches(['\'', '"']);
+        encoding_rs::Encoding::for_label(label.as_bytes())
+    })
+}
+
+fn prescan_charset(body: &[u8]) -> Option<&'static encoding_rs::Encoding> {
+    let prefix = &body[..body.len().min(1024)];
+    let ascii = String::from_utf8_lossy(prefix).to_ascii_lowercase();
+    let mut cursor = 0;
+    while let Some(relative_start) = ascii[cursor..].find("<meta") {
+        let start = cursor + relative_start;
+        let end = ascii[start..]
+            .find('>')
+            .map_or(ascii.len(), |offset| start + offset);
+        let tag = &ascii[start..end];
+        if let Some(relative_charset) = tag.find("charset=") {
+            let label = tag[relative_charset + "charset=".len()..]
+                .trim_start_matches([' ', '\t', '\r', '\n', '\'', '"'])
+                .split([' ', '\t', '\r', '\n', '\'', '"', ';', '>'])
+                .next()?;
+            if let Some(encoding) = encoding_rs::Encoding::for_label(label.as_bytes()) {
+                return Some(encoding);
+            }
+        }
+        cursor = end.saturating_add(1);
+    }
+    None
 }
 
 /// One `Content-Language` tag, or `None` when the header lists several

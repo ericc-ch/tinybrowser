@@ -4,10 +4,11 @@
 //! receive [`FetchHandle`]. They do not expose or own [`net::Agent`].
 
 use std::env;
-use std::fs;
-use std::io;
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::{self, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -20,21 +21,17 @@ use crate::profile::{Profile, ProfileName};
 pub(crate) const PAGE_FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 
 const COOKIES_VERSION: &str = "tinybrowser-cookies-v1";
+const MAX_BROWSER_DIALS: usize = 16;
+const MAX_QUEUED_DIALS: usize = 256;
 static COOKIE_TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// Durable backing for one Profile under `XDG_DATA_HOME`.
 pub struct ProfileStore {
     name: ProfileName,
     root: Option<PathBuf>,
-    disk: Mutex<DiskStore>,
+    _lock: Option<File>,
+    disk: Mutex<()>,
     dirty: AtomicBool,
-}
-
-#[derive(Clone, Copy)]
-enum DiskStore {
-    Memory,
-    Ready,
-    Corrupt,
 }
 
 impl ProfileStore {
@@ -62,23 +59,35 @@ impl ProfileStore {
     ///
     /// Both `XDG_DATA_HOME` and `HOME` are unset or empty.
     pub fn open(profile: &Profile) -> io::Result<Self> {
-        Ok(Self::open_in(&Self::data_home()?, profile))
+        Self::open_in(&Self::data_home()?, profile)
     }
 
-    /// Opens the on-disk store for `profile` under `data_home`.
-    #[must_use]
-    pub fn open_in(data_home: &Path, profile: &Profile) -> Self {
-        Self {
+    /// Opens and exclusively locks the on-disk store for `profile` under `data_home`.
+    ///
+    /// # Errors
+    ///
+    /// The directory cannot be created or another process owns the profile.
+    pub fn open_in(data_home: &Path, profile: &Profile) -> io::Result<Self> {
+        let root = data_home
+            .join("tinybrowser")
+            .join("profiles")
+            .join(profile.name().as_str());
+        fs::create_dir_all(&root)?;
+        restrict_dir(&root)?;
+        let lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(root.join("lock"))?;
+        lock.try_lock().map_err(io::Error::from)?;
+        Ok(Self {
             name: profile.name().clone(),
-            root: Some(
-                data_home
-                    .join("tinybrowser")
-                    .join("profiles")
-                    .join(profile.name().as_str()),
-            ),
-            disk: Mutex::new(DiskStore::Ready),
+            root: Some(root),
+            _lock: Some(lock),
+            disk: Mutex::new(()),
             dirty: AtomicBool::new(false),
-        }
+        })
     }
 
     /// In-memory store: [`ProfileStore::save_from`] is a no-op.
@@ -87,73 +96,77 @@ impl ProfileStore {
         Self {
             name: profile.name().clone(),
             root: None,
-            disk: Mutex::new(DiskStore::Memory),
+            _lock: None,
+            disk: Mutex::new(()),
             dirty: AtomicBool::new(false),
         }
     }
 
-    pub(crate) fn load_into(&self, agent: &Agent) {
+    pub(crate) fn load_into(&self, agent: &Agent) -> io::Result<()> {
         let Some(path) = self.cookies_path() else {
-            return;
+            return Ok(());
         };
-        let mut disk = self.lock_disk();
-        match fs::read_to_string(&path) {
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                *disk = DiskStore::Ready;
-            }
-            Err(_) => {
-                *disk = DiskStore::Corrupt;
-            }
-            Ok(text) => match parse_cookies(&text) {
-                Ok(records) => {
-                    agent.import_cookies(records);
-                    *disk = DiskStore::Ready;
-                }
-                Err(_) => {
-                    *disk = DiskStore::Corrupt;
-                }
-            },
+        let _disk = self.lock_disk();
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        let records = std::str::from_utf8(&bytes)
+            .ok()
+            .and_then(|text| parse_cookies(text).ok());
+        if let Some(records) = records {
+            agent.import_cookies(records);
+            return Ok(());
         }
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+        fs::rename(
+            &path,
+            path.with_file_name(format!("cookies.corrupt.{stamp}")),
+        )?;
+        Ok(())
     }
 
     pub(crate) fn mark_dirty(&self) {
         self.dirty.store(true, Ordering::SeqCst);
     }
 
-    pub(crate) fn save_from(&self, agent: &Agent) {
+    pub(crate) fn save_from(&self, agent: &Agent) -> io::Result<()> {
         let Some(dir) = self.root.as_ref() else {
-            return;
+            return Ok(());
         };
-        let disk = self.lock_disk();
-        if matches!(*disk, DiskStore::Memory | DiskStore::Corrupt) {
-            return;
+        let _disk = self.lock_disk();
+        if !self.dirty.load(Ordering::SeqCst) {
+            return Ok(());
         }
-        if !self.dirty.swap(false, Ordering::SeqCst) {
-            return;
-        }
-        if fs::create_dir_all(dir).is_err() || restrict_dir(dir).is_err() {
-            self.dirty.store(true, Ordering::SeqCst);
-            return;
-        }
+        fs::create_dir_all(dir)?;
+        restrict_dir(dir)?;
         let path = dir.join("cookies");
         let seq = COOKIE_TMP_SEQ.fetch_add(1, Ordering::Relaxed);
         let tmp = dir.join(format!("cookies.{}.{seq}.tmp", std::process::id()));
         let encoded = encode_cookies(&agent.export_cookies());
-        if fs::write(&tmp, &encoded).is_ok() {
-            let _ = restrict_file(&tmp);
-            if fs::rename(&tmp, &path).is_ok() {
-                let _ = restrict_file(&path);
-            } else {
-                let _ = fs::remove_file(&tmp);
-                self.dirty.store(true, Ordering::SeqCst);
-            }
-        } else {
-            let _ = fs::remove_file(&tmp);
-            self.dirty.store(true, Ordering::SeqCst);
+        let write_result = (|| {
+            let mut file = OpenOptions::new().write(true).create_new(true).open(&tmp)?;
+            restrict_file(&tmp)?;
+            file.write_all(encoded.as_bytes())?;
+            file.sync_all()?;
+            fs::rename(&tmp, &path)?;
+            restrict_file(&path)?;
+            File::open(dir)?.sync_all()?;
+            Ok(())
+        })();
+        if let Err(error) = write_result {
+            let _remove_result = fs::remove_file(&tmp);
+            return Err(error);
         }
+        self.dirty.store(false, Ordering::SeqCst);
+        Ok(())
     }
 
-    fn lock_disk(&self) -> std::sync::MutexGuard<'_, DiskStore> {
+    fn lock_disk(&self) -> std::sync::MutexGuard<'_, ()> {
         self.disk
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -174,27 +187,34 @@ impl ProfileStore {
 ///
 /// Wraps one shared [`Agent`]: connection pool, transport settings, and the
 /// live cookie jar. [`ProfileStore`] is durable backing, not a second jar.
-#[derive(Clone)]
 pub struct NetworkSession {
     agent: Agent,
     store: Arc<ProfileStore>,
+    executor: NetworkExecutor,
 }
 
 impl NetworkSession {
     /// Session from `builder`, with the default per-call fetch timeout.
-    #[must_use]
-    pub fn from_builder(builder: AgentBuilder, store: ProfileStore) -> Self {
+    ///
+    /// # Errors
+    ///
+    /// Stored profile data could not be read or quarantined.
+    pub fn from_builder(builder: AgentBuilder, store: ProfileStore) -> io::Result<Self> {
         Self::from_agent(builder.timeout_per_call(PAGE_FETCH_TIMEOUT).build(), store)
     }
 
     /// Session that shares `agent` (and therefore its cookie jar).
-    #[must_use]
-    pub fn from_agent(agent: Agent, store: ProfileStore) -> Self {
-        store.load_into(&agent);
-        Self {
+    ///
+    /// # Errors
+    ///
+    /// Stored profile data could not be read or quarantined.
+    pub fn from_agent(agent: Agent, store: ProfileStore) -> io::Result<Self> {
+        store.load_into(&agent)?;
+        Ok(Self {
             agent,
             store: Arc::new(store),
-        }
+            executor: NetworkExecutor::new(),
+        })
     }
 
     /// Value-only fetch handle for a page actor.
@@ -203,11 +223,12 @@ impl NetworkSession {
         FetchHandle {
             agent: self.agent.clone(),
             store: Arc::clone(&self.store),
+            executor: self.executor.clone(),
         }
     }
 
-    pub(crate) fn persist(&self) {
-        self.store.save_from(&self.agent);
+    pub(crate) fn persist(&self) -> io::Result<()> {
+        self.store.save_from(&self.agent)
     }
 
     pub(crate) fn profile_name(&self) -> ProfileName {
@@ -217,17 +238,18 @@ impl NetworkSession {
 
 impl Drop for NetworkSession {
     fn drop(&mut self) {
-        self.persist();
+        let _result = self.persist();
     }
 }
 
 /// Cloneable, sendable handle for cookies and blocking HTTP.
 ///
-/// Completions return to the page actor as events after `spawn_blocking`.
+/// Completions return to the page actor from the bounded network executor.
 #[derive(Clone)]
 pub struct FetchHandle {
     agent: Agent,
     store: Arc<ProfileStore>,
+    executor: NetworkExecutor,
 }
 
 impl FetchHandle {
@@ -235,6 +257,7 @@ impl FetchHandle {
         Self {
             agent,
             store: Arc::new(ProfileStore::memory(&Profile::default())),
+            executor: NetworkExecutor::new(),
         }
     }
 
@@ -254,12 +277,49 @@ impl FetchHandle {
         self.store.mark_dirty();
     }
 
-    pub(crate) fn persist(&self) {
-        self.store.save_from(&self.agent);
-    }
-
     pub(crate) fn request(&self, method: Method, url: Url) -> net::RequestBuilder {
         self.agent.request(method, url)
+    }
+
+    pub(crate) fn try_submit(&self, operation: impl FnOnce() + Send + 'static) -> Result<(), ()> {
+        self.executor.try_submit(operation)
+    }
+}
+
+type NetworkJob = Box<dyn FnOnce() + Send + 'static>;
+
+#[derive(Clone)]
+struct NetworkExecutor {
+    tx: SyncSender<NetworkJob>,
+}
+
+impl NetworkExecutor {
+    fn new() -> Self {
+        let (tx, rx) = mpsc::sync_channel::<NetworkJob>(MAX_QUEUED_DIALS);
+        let receiver = Arc::new(Mutex::new(rx));
+        for _ in 0..MAX_BROWSER_DIALS {
+            let receiver = Arc::clone(&receiver);
+            std::thread::spawn(move || {
+                loop {
+                    let job = receiver
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .recv();
+                    let Ok(job) = job else {
+                        return;
+                    };
+                    job();
+                }
+            });
+        }
+        Self { tx }
+    }
+
+    fn try_submit(&self, operation: impl FnOnce() + Send + 'static) -> Result<(), ()> {
+        match self.tx.try_send(Box::new(operation)) {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) => Err(()),
+        }
     }
 }
 

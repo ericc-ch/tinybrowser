@@ -14,6 +14,7 @@ net = { workspace = true }
 markup5ever = "=0.39.0"
 html5ever = "=0.39.0"
 tendril = "0.5"
+encoding_rs = "0.8"
 # Page thread waiter: current-thread `rt`+`time`.
 tokio = { version = "1.53", default-features = false, features = ["rt", "time"] }
 url = "2"

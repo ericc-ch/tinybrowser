@@ -2,7 +2,7 @@
 
 Crate slogans, a fake `js` seam, and parking DOM/language on `net` were fighting the product: a small page engine with a job loop, not a web-server org chart. The decided shape is three deep crates, a zero-dep inbound HTTP/1.1 helper for protocol adapters, HTML jobs on a Tokio current-thread waiter, and `browser` holding `parse_html`. Browser owns `NetworkSession` ([ADR 0010](0010-page-actor-ownership.md)).
 
-Status: accepted. Supersedes the crate table and “js must not depend on net” / root-depends-on-all-four rules in [ADR 0001](0001-workspace-crates-with-enforced-edges.md). Does not reopen [ADR 0002](0002-dom-layer-architecture.md) arena or [ADR 0006](0006-net-transport.md) v1 transport. [ADR 0009](0009-named-profile-daemon.md) takes named profiles and CDP as the CLI. [ADR 0010](0010-page-actor-ownership.md) takes Browser ownership, `NetworkSession`, and the long-lived page runtime. Crate graph, Tokio `rt`+`time`, `spawn_blocking`, public `net` types, and size/lint bounds stay.
+Status: accepted. Supersedes the crate table and “js must not depend on net” / root-depends-on-all-four rules in [ADR 0001](0001-workspace-crates-with-enforced-edges.md). Does not reopen [ADR 0002](0002-dom-layer-architecture.md) arena or [ADR 0006](0006-net-transport.md) v1 transport. [ADR 0009](0009-named-profile-daemon.md) takes named profiles and CDP as the CLI. [ADR 0010](0010-page-actor-ownership.md) takes autonomous page scheduling, incremental parsing, Browser ownership, and the bounded network executor. Crate graph, Tokio `rt`+`time`, public `net` types, and size/lint bounds stay.
 
 | crate | depends on | charter |
 |---|---|---|
@@ -16,7 +16,7 @@ Status: accepted. Supersedes the crate table and “js must not depend on net”
 
 One compile-error law: `cdp` and `webdriver` may depend on `http1`. They must not depend on each other, `dom`, or `net`. `cargo test -p` a leaf crate is not reach-around. QuickJS lives in `browser`. No `js` crate. No `HttpTransport` trait.
 
-Page thread: Tokio current-thread, features `rt` + `time` only. HTML jobs and microtasks are our queue. `send` / `upgrade` only via `spawn_blocking`. No tokio `full`, smol, axum, hyper. Stealth (Chrome TLS/h2) is later later. Each page actor has a long-lived current-thread runtime ([ADR 0010](0010-page-actor-ownership.md)).
+Page thread: Tokio current-thread, features `rt` + `time` only. HTML jobs and microtasks are our queue. Blocking `send` work runs on the bounded Browser-owned executor, never the page thread. No tokio `full`, smol, axum, hyper. Stealth (Chrome TLS/h2) is later later. Each page actor has a long-lived current-thread runtime ([ADR 0010](0010-page-actor-ownership.md)).
 
 Template contents live on `Dom`. The live cookie jar stays on `Agent`. `NetworkSession` loads and persists that jar through `ProfileStore`. `document.cookie` and `Content-Language` are page/document. CDP does not own cookies. Durable named profiles and the CDP control plane are in [ADR 0009](0009-named-profile-daemon.md).
 

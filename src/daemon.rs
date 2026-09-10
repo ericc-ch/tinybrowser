@@ -54,7 +54,7 @@ pub fn run(profile: &Profile, data_home: &Path) -> io::Result<()> {
             port: addr.port(),
         },
     )?;
-    let browser = Browser::open_in(data_home, profile);
+    let browser = Browser::open_in(data_home, profile)?;
     let result = cdp::serve(&listener, &browser.handle());
     let _ = fs::remove_file(&lock_path);
     result

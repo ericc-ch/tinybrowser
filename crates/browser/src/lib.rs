@@ -5,7 +5,7 @@
 //! The `cdp` and `webdriver` crates depend on this crate and on `http1`.
 //! They do not depend on each other, `dom`, or `net`. Browser owns
 //! [`NetworkSession`] ([ADR 0010](../../../docs/adrs/0010-page-actor-ownership.md)).
-//! Blocking send runs through `spawn_blocking` on the page thread.
+//! Blocking sends run on the browser-owned bounded network executor.
 
 mod actor;
 mod browser;
@@ -24,7 +24,7 @@ use dom::{
     html_namespace,
 };
 use html5ever::tree_builder::{ElementFlags, NodeOrText, QuirksMode, TreeSink};
-use markup5ever::interface::tree_builder::ElemName;
+use markup5ever::interface::{TokenizerResult, tree_builder::ElemName};
 use tendril::{StrTendril, TendrilSink};
 
 pub use actor::{PageHandle, PageId, RequestId};
@@ -45,6 +45,56 @@ pub struct Parsed {
     pub quirks_mode: QuirksMode,
     /// How many spec parse errors the tokenizer/tree builder reported.
     pub parse_errors: u32,
+}
+
+pub(crate) enum ParseProgress {
+    Script(Handle),
+    Done,
+}
+
+pub(crate) struct ActiveParser {
+    parser: html5ever::Parser<Sink>,
+}
+
+impl ActiveParser {
+    pub(crate) fn new(input: &str) -> Self {
+        let opts = html5ever::ParseOpts {
+            tree_builder: html5ever::tree_builder::TreeBuilderOpts {
+                scripting_enabled: true,
+                ..html5ever::tree_builder::TreeBuilderOpts::default()
+            },
+            ..html5ever::ParseOpts::default()
+        };
+        let parser = html5ever::parse_document(Sink::new(), opts);
+        parser.input_buffer.push_back(StrTendril::from(input));
+        Self { parser }
+    }
+
+    pub(crate) fn advance(&self) -> ParseProgress {
+        loop {
+            match self.parser.tokenizer.feed(&self.parser.input_buffer) {
+                TokenizerResult::Done => return ParseProgress::Done,
+                TokenizerResult::Script(handle) => return ParseProgress::Script(handle),
+                TokenizerResult::EncodingIndicator(_) => {}
+            }
+        }
+    }
+
+    pub(crate) fn take_state(&self) -> Parsed {
+        self.parser.tokenizer.sink.sink.take_state()
+    }
+
+    pub(crate) fn restore(&self, parsed: Parsed) {
+        self.parser.tokenizer.sink.sink.restore(parsed);
+    }
+
+    pub(crate) fn insert_html(&self, html: String) {
+        self.parser.input_buffer.push_front(StrTendril::from(html));
+    }
+
+    pub(crate) fn finish(self) -> Parsed {
+        self.parser.finish()
+    }
 }
 
 /// Parses a full HTML document into a fresh [`Dom`] with the scripting flag
@@ -141,6 +191,20 @@ impl Sink {
             parse_errors: Cell::new(0),
             integration_points: RefCell::new(HashSet::new()),
         }
+    }
+
+    fn take_state(&self) -> Parsed {
+        Parsed {
+            dom: std::mem::replace(&mut *self.dom.borrow_mut(), Dom::new()),
+            quirks_mode: self.quirks_mode.get(),
+            parse_errors: self.parse_errors.get(),
+        }
+    }
+
+    fn restore(&self, parsed: Parsed) {
+        *self.dom.borrow_mut() = parsed.dom;
+        self.quirks_mode.set(parsed.quirks_mode);
+        self.parse_errors.set(parsed.parse_errors);
     }
 
     /// Places character data under `parent`, coalescing with the neighbor

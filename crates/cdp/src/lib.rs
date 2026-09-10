@@ -4,14 +4,15 @@
 //! subsets of Browser, Target, Page, and Runtime. Unsupported methods return
 //! method-not-found. Flattened `sessionId` routing on the browser socket.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::{self, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::Receiver;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use browser::{BrowserHandle, PageError, PageHandle, PageId, RemoteValue};
+use browser::{BrowserHandle, PageError, PageEvent, PageHandle, PageId, RemoteValue};
 use serde_json::{Value, json};
 use tungstenite::protocol::{Role, WebSocket};
 use tungstenite::{Message, handshake::derive_accept_key};
@@ -57,6 +58,7 @@ pub fn serve(listener: &TcpListener, browser: &BrowserHandle) -> io::Result<()> 
 pub struct Client {
     socket: WebSocket<TcpStream>,
     next_id: i64,
+    events: VecDeque<Value>,
 }
 
 impl Client {
@@ -116,6 +118,61 @@ impl Client {
                 }
                 return Ok(parsed.get("result").cloned().unwrap_or(Value::Null));
             }
+            if parsed.get("method").is_some() {
+                self.events.push_back(parsed);
+            }
+        }
+    }
+
+    /// Reads the next protocol event, returning `None` when `timeout` elapses.
+    ///
+    /// # Errors
+    ///
+    /// Transport or JSON decoding failure.
+    pub fn read_event(&mut self, timeout: Duration) -> io::Result<Option<Value>> {
+        if let Some(event) = self.events.pop_front() {
+            return Ok(Some(event));
+        }
+        self.socket.get_mut().set_read_timeout(Some(timeout))?;
+        let result = loop {
+            match self.socket.read() {
+                Ok(Message::Text(text)) => {
+                    let parsed: Value = match serde_json::from_str(&text).map_err(json_io) {
+                        Ok(parsed) => parsed,
+                        Err(error) => break Err(error),
+                    };
+                    if parsed.get("method").is_some() {
+                        break Ok(Some(parsed));
+                    }
+                }
+                Ok(Message::Ping(payload)) => {
+                    if let Err(error) = self.socket.send(Message::Pong(payload)).map_err(ws_io) {
+                        break Err(error);
+                    }
+                }
+                Ok(Message::Close(_)) => break Ok(None),
+                Err(tungstenite::Error::Io(error))
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    break Ok(None);
+                }
+                Err(error) => break Err(ws_io(error)),
+                Ok(_) => {}
+            }
+        };
+        let reset = self
+            .socket
+            .get_mut()
+            .set_read_timeout(Some(Duration::from_secs(30)));
+        match result {
+            Err(error) => Err(error),
+            Ok(event) => {
+                reset?;
+                Ok(event)
+            }
         }
     }
 }
@@ -147,6 +204,7 @@ fn connect_ws(addr: SocketAddr, path: &str) -> io::Result<Client> {
     Ok(Client {
         socket: WebSocket::from_raw_socket(stream, Role::Client, None),
         next_id: 0,
+        events: VecDeque::new(),
     })
 }
 
@@ -267,6 +325,8 @@ fn serve_socket(
         page,
         bound,
         stop,
+        subscriptions: Vec::new(),
+        clock_origin: std::time::Instant::now(),
     };
     conn.run()
 }
@@ -305,20 +365,57 @@ struct Conn {
     page: Option<PageHandle>,
     bound: SocketAddr,
     stop: Arc<AtomicBool>,
+    subscriptions: Vec<PageSubscription>,
+    clock_origin: std::time::Instant,
+}
+
+struct PageSubscription {
+    page_id: PageId,
+    session: Option<String>,
+    events: Receiver<PageEvent>,
 }
 
 impl Conn {
     fn run(&mut self) -> io::Result<()> {
+        self.socket
+            .get_mut()
+            .set_read_timeout(Some(Duration::from_millis(20)))?;
         loop {
+            self.flush_page_events()?;
             match self.socket.read() {
                 Ok(Message::Text(text)) => self.dispatch_text(&text)?,
                 Ok(Message::Ping(payload)) => {
                     self.socket.send(Message::Pong(payload)).map_err(ws_io)?;
                 }
+                Err(tungstenite::Error::Io(error))
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                    ) => {}
                 Ok(Message::Close(_)) | Err(_) => return Ok(()),
                 Ok(_) => {}
             }
         }
+    }
+
+    fn flush_page_events(&mut self) -> io::Result<()> {
+        let mut messages = Vec::new();
+        for subscription in &self.subscriptions {
+            for event in subscription.events.try_iter() {
+                if event == PageEvent::Load {
+                    let mut message = json!({
+                        "method": "Page.loadEventFired",
+                        "params": {"timestamp": self.clock_origin.elapsed().as_secs_f64()},
+                    });
+                    attach_session(&mut message, subscription.session.as_deref());
+                    messages.push(message);
+                }
+            }
+        }
+        for message in messages {
+            self.send_json(&message)?;
+        }
+        Ok(())
     }
 
     fn dispatch_text(&mut self, text: &str) -> io::Result<()> {
@@ -394,10 +491,10 @@ impl Conn {
                 .get(session)
                 .cloned()
                 .ok_or_else(|| DispatchError::Failed("unknown session".into()))?;
-            return session_method(method, params, &page);
+            return self.dispatch_page_method(method, params, &page, Some(session));
         }
         if let Some(page) = self.page.clone() {
-            return session_method(method, params, &page);
+            return self.dispatch_page_method(method, params, &page, None);
         }
         match method {
             "Browser.getVersion" => Ok(json!({
@@ -408,8 +505,11 @@ impl Conn {
                 "jsVersion": "QuickJS",
             })),
             "Browser.close" => {
-                self.browser.close();
+                self.browser
+                    .close()
+                    .map_err(|error| DispatchError::Failed(error.to_string()))?;
                 self.sessions.clear();
+                self.subscriptions.clear();
                 self.page = None;
                 self.stop.store(true, Ordering::SeqCst);
                 let _ = TcpStream::connect(self.bound);
@@ -445,6 +545,7 @@ impl Conn {
                     .close_page(id)
                     .map_err(|err| DispatchError::Failed(err.to_string()))?;
                 self.sessions.retain(|_, page| page.id() != id);
+                self.subscriptions.retain(|item| item.page_id != id);
                 if self.page.as_ref().is_some_and(|page| page.id() == id) {
                     self.page = None;
                 }
@@ -473,17 +574,67 @@ impl Conn {
             "Target.detachFromTarget" => {
                 if let Some(session) = params.get("sessionId").and_then(Value::as_str) {
                     self.sessions.remove(session);
+                    self.subscriptions
+                        .retain(|item| item.session.as_deref() != Some(session));
                 }
                 Ok(json!({}))
             }
             _ => Err(DispatchError::MethodNotFound),
         }
     }
+
+    fn dispatch_page_method(
+        &mut self,
+        method: &str,
+        params: &Value,
+        page: &PageHandle,
+        session: Option<&str>,
+    ) -> Result<Value, DispatchError> {
+        match method {
+            "Page.enable" => {
+                self.subscribe_page(page, session)?;
+                Ok(json!({}))
+            }
+            "Page.disable" => {
+                self.unsubscribe_page(page.id(), session);
+                Ok(json!({}))
+            }
+            _ => session_method(method, params, page),
+        }
+    }
+
+    fn subscribe_page(
+        &mut self,
+        page: &PageHandle,
+        session: Option<&str>,
+    ) -> Result<(), DispatchError> {
+        if self
+            .subscriptions
+            .iter()
+            .any(|item| item.page_id == page.id() && item.session.as_deref() == session)
+        {
+            return Ok(());
+        }
+        let events = page
+            .subscribe()
+            .map_err(|error| DispatchError::Failed(error.to_string()))?;
+        self.subscriptions.push(PageSubscription {
+            page_id: page.id(),
+            session: session.map(str::to_owned),
+            events,
+        });
+        Ok(())
+    }
+
+    fn unsubscribe_page(&mut self, page_id: PageId, session: Option<&str>) {
+        self.subscriptions
+            .retain(|item| item.page_id != page_id || item.session.as_deref() != session);
+    }
 }
 
 fn session_method(method: &str, params: &Value, page: &PageHandle) -> Result<Value, DispatchError> {
     match method {
-        "Page.enable" | "Runtime.enable" | "Page.disable" | "Runtime.disable" => Ok(json!({})),
+        "Runtime.enable" | "Runtime.disable" => Ok(json!({})),
         "Page.navigate" => {
             let url = params
                 .get("url")
@@ -519,8 +670,6 @@ fn open_url(page: &PageHandle, url: &str) -> Result<(), DispatchError> {
         return Ok(());
     }
     page.goto(url)
-        .map_err(|err| DispatchError::Failed(err.to_string()))?;
-    page.run_until_load()
         .map_err(|err| DispatchError::Failed(err.to_string()))?;
     Ok(())
 }

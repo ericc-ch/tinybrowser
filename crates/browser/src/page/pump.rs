@@ -4,11 +4,26 @@ use std::sync::Arc;
 use std::task::Poll;
 use std::time::Duration;
 
-use tokio::time::{Instant, sleep_until};
+use tokio::time::{Instant, sleep, sleep_until};
 
-use super::{HostTimer, HtmlJob, MAX_IN_FLIGHT_DIALS, Page, PageEvent, QueuedDial, ScriptValue};
+use super::{HostTimer, HtmlJob, MAX_QUEUED_JS_FETCHES, Page, PageEvent, QueuedDial};
 
 impl Page {
+    pub(crate) fn drive_for(&mut self, budget: Duration) {
+        let _completed = self.run_until_timeout(budget, |_| false);
+    }
+
+    pub(crate) fn has_background_work(&self) -> bool {
+        !self.jobs.is_empty()
+            || !self.timers.is_empty()
+            || self.in_flight_dials > 0
+            || !self.queued_dials.is_empty()
+            || self
+                .js
+                .as_ref()
+                .is_some_and(crate::js::JsHost::has_pending_work)
+    }
+
     /// HTML host timer: fire [`PageEvent::Timer`] after `delay`.
     #[must_use]
     pub fn schedule_timer(&mut self, delay: Duration) -> u32 {
@@ -28,8 +43,8 @@ impl Page {
     ///
     /// # Panics
     ///
-    /// If called from inside a Tokio runtime, if the current-thread runtime
-    /// cannot be built, or a `spawn_blocking` fetch worker panics.
+    /// If called from inside a Tokio runtime or the current-thread runtime
+    /// cannot be built.
     pub fn run(&mut self) {
         self.block_on_pump(None, |page| !page.stopped());
     }
@@ -53,12 +68,6 @@ impl Page {
     /// Same conditions as [`Page::run`].
     pub fn run_until_load_timeout(&mut self, timeout: Duration) -> bool {
         self.run_until_timeout(timeout, |page| !page.waiting_for_load())
-    }
-
-    pub(crate) fn run_until_js_true(&mut self, source: &str, timeout: Duration) -> bool {
-        self.run_until_timeout(timeout, |page| {
-            matches!(page.execute_script(source), Ok(ScriptValue::Bool(true)))
-        })
     }
 
     /// Parks like [`Page::run`], but returns as soon as `stop` is true.
@@ -111,9 +120,9 @@ impl Page {
     }
 
     pub(crate) fn shutdown_runtime(&mut self) {
-        self.fetch.persist();
         self.stop.request();
-        self.fetches.abort_all();
+        self.queued_dials.clear();
+        self.in_flight_dials = 0;
         if let Some(runtime) = self.runtime.take() {
             runtime.shutdown_background();
         }
@@ -129,6 +138,13 @@ impl Page {
         mut keep_waiting: impl FnMut(&mut Self) -> bool,
     ) {
         loop {
+            while let Ok(completed) = self.dial_rx.try_recv() {
+                self.in_flight_dials = self.in_flight_dials.saturating_sub(1);
+                match completed {
+                    Ok(done) => self.jobs.push_back(HtmlJob::DialFinished(done)),
+                    Err(fail) => self.jobs.push_back(HtmlJob::DialFailed(fail)),
+                }
+            }
             self.adopt_js_work();
             self.launch_queued_dials();
             while let Some(job) = self.jobs.pop_front() {
@@ -149,7 +165,7 @@ impl Page {
             {
                 continue;
             }
-            let fetches_pending = !self.fetches.is_empty();
+            let fetches_pending = self.in_flight_dials > 0;
             let queued = !self.queued_dials.is_empty();
             let next_deadline = match (self.next_timer_deadline(), cap) {
                 (Some(timer), Some(limit)) => Some(timer.min(limit)),
@@ -159,48 +175,42 @@ impl Page {
                 break;
             }
             if queued && !fetches_pending {
+                sleep(Duration::from_millis(1)).await;
                 continue;
             }
-            let deadline = wait_until(next_deadline);
+            let network_poll = fetches_pending.then(|| Instant::now() + Duration::from_millis(1));
+            let wake_at = match (next_deadline, network_poll) {
+                (Some(timer), Some(network)) => Some(timer.min(network)),
+                (timer, network) => timer.or(network),
+            };
+            let deadline = wait_until(wake_at);
             let mut deadline = std::pin::pin!(deadline);
             let stop = Arc::clone(&self.stop);
-            let job = poll_fn(|cx| {
+            poll_fn(|cx| {
                 stop.register(cx.waker());
                 if stop.is_set() {
-                    return Poll::Ready(None);
+                    return Poll::Ready(());
                 }
                 if deadline.as_mut().poll(cx).is_ready() {
-                    return Poll::Ready(None);
-                }
-                if fetches_pending
-                    && let Poll::Ready(Some(joined)) = self.fetches.poll_join_next(cx)
-                {
-                    return Poll::Ready(Some(joined));
+                    return Poll::Ready(());
                 }
                 Poll::Pending
             })
             .await;
-            if let Some(joined) = job {
-                match joined.expect("fetch worker panicked") {
-                    Ok(done) => self.jobs.push_back(HtmlJob::DialFinished(done)),
-                    Err(fail) => self.jobs.push_back(HtmlJob::DialFailed(fail)),
-                }
-            } else {
-                while let Some(id) = self.due_timer() {
-                    self.jobs.push_back(HtmlJob::Timer(id));
-                }
+            while let Some(id) = self.due_timer() {
+                self.jobs.push_back(HtmlJob::Timer(id));
             }
         }
     }
 
-    fn waiting_for_load(&self) -> bool {
+    pub(crate) fn waiting_for_load(&self) -> bool {
         self.queued_dials.iter().any(|dial| match dial {
             QueuedDial::Navigate { epoch, .. } => *epoch == self.nav_epoch,
             QueuedDial::ClassicScript { epoch, .. } => *epoch == self.js_epoch,
             QueuedDial::Fetch { .. } | QueuedDial::JsFetch { .. } => false,
         }) || self.nav_in_flight == Some(self.nav_epoch)
             || self.classic_fetch_in_flight
-            || !self.pending_classic.is_empty()
+            || self.active_parser.is_some()
             || !self.world.borrow().document_ready
     }
 
@@ -208,16 +218,28 @@ impl Page {
         let mut leftover = Vec::new();
         let queued = std::mem::take(&mut self.queued_dials);
         for dial in queued {
-            if self.fetches.len() >= MAX_IN_FLIGHT_DIALS {
+            let task_dial = dial.clone();
+            let fetch = self.fetch.clone();
+            let completed = self.dial_tx.clone();
+            let stop = Arc::clone(&self.stop);
+            if self
+                .fetch
+                .try_submit(move || {
+                    if stop.is_set() {
+                        return;
+                    }
+                    let result = super::navigate::send_dial(&fetch, &task_dial, &stop);
+                    let _send_result = completed.send(result);
+                })
+                .is_err()
+            {
                 leftover.push(dial);
                 continue;
             }
             if let QueuedDial::Navigate { epoch, .. } = &dial {
                 self.nav_in_flight = Some(*epoch);
             }
-            let fetch = self.fetch.clone();
-            self.fetches
-                .spawn_blocking(move || super::navigate::send_dial(&fetch, &dial));
+            self.in_flight_dials = self.in_flight_dials.saturating_add(1);
         }
         leftover.extend(std::mem::take(&mut self.queued_dials));
         self.queued_dials = leftover;
@@ -276,6 +298,16 @@ impl Page {
             self.js_timer_slots.insert(id, timeout.js_id);
         }
         for fetch in fetches {
+            let queued_js_fetches = self
+                .queued_dials
+                .iter()
+                .filter(|dial| matches!(dial, QueuedDial::JsFetch { .. }))
+                .count();
+            if queued_js_fetches >= MAX_QUEUED_JS_FETCHES {
+                self.events.push(PageEvent::FetchFailed);
+                self.settle_js_fetch(fetch.js_id, false, 0, "");
+                continue;
+            }
             if let Ok(url) = self.resolve_dial_url(&fetch.url) {
                 let initiator = self.document_url.clone();
                 self.queued_dials.push(QueuedDial::JsFetch {

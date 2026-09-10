@@ -1,7 +1,7 @@
 //! `QuickJS` host for one [`Page`]: eval, timers, `fetch`, DOM host objects.
 //!
 //! Callbacks live in JS (`__tb_timeouts`, `__tb_fetchCbs`). Rust holds
-//! integer ids so a `Function` never crosses `spawn_blocking`. Invocation
+//! integer ids so a `Function` never crosses the page boundary. Invocation
 //! uses `Function::call` on the page thread.
 
 mod bindings;
@@ -10,6 +10,7 @@ mod world;
 use std::cell::{Cell, RefCell};
 use std::fmt;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use rquickjs::{
@@ -18,6 +19,12 @@ use rquickjs::{
 };
 
 pub(crate) use world::World;
+
+use crate::page::Stop;
+
+const MAX_RUNTIME_MEMORY: usize = 32 * 1024 * 1024;
+const MAX_RUNTIME_STACK: usize = 512 * 1024;
+const DEFAULT_SCRIPT_BUDGET: Duration = Duration::from_secs(5);
 
 /// A value produced by [`crate::Page::execute_script`].
 #[derive(Clone, Debug, PartialEq)]
@@ -88,18 +95,22 @@ pub(crate) struct JsHost {
     runtime: Runtime,
     context: Context,
     world: Rc<RefCell<World>>,
+    stop: Arc<Stop>,
     pending_timeouts: Rc<RefCell<Vec<PendingTimeout>>>,
     pending_fetches: Rc<RefCell<Vec<PendingJsFetch>>>,
 }
 
 impl JsHost {
-    pub(crate) fn new(world: Rc<RefCell<World>>) -> Result<Self, JsError> {
+    pub(crate) fn new(world: Rc<RefCell<World>>, stop: Arc<Stop>) -> Result<Self, JsError> {
         let runtime = Runtime::new().map_err(JsError::engine)?;
+        runtime.set_memory_limit(MAX_RUNTIME_MEMORY);
+        runtime.set_max_stack_size(MAX_RUNTIME_STACK);
         let context = Context::full(&runtime).map_err(JsError::engine)?;
         let host = Self {
             runtime,
             context,
             world,
+            stop,
             pending_timeouts: Rc::new(RefCell::new(Vec::new())),
             pending_fetches: Rc::new(RefCell::new(Vec::new())),
         };
@@ -108,13 +119,15 @@ impl JsHost {
     }
 
     pub(crate) fn eval(&self, source: &str) -> Result<String, JsError> {
-        let rendered: Result<String, JsError> = self.context.with(|ctx| {
-            let value: Value = eval_classic(&ctx, source)?;
-            render_eval_result(&ctx, value)
-        });
-        // https://html.spec.whatwg.org/multipage/webappapis.html#clean-up-after-running-script
-        let jobs = self.run_jobs();
-        rendered.and_then(|out| jobs.map(|()| out))
+        self.with_budget(None, || {
+            let rendered: Result<String, JsError> = self.context.with(|ctx| {
+                let value: Value = eval_classic(&ctx, source)?;
+                render_eval_result(&ctx, value)
+            });
+            // https://html.spec.whatwg.org/multipage/webappapis.html#clean-up-after-running-script
+            let jobs = self.run_jobs();
+            rendered.and_then(|out| jobs.map(|()| out))
+        })
     }
 
     pub(crate) fn eval_value_deadline(
@@ -122,30 +135,14 @@ impl JsHost {
         source: &str,
         deadline: Option<Instant>,
     ) -> Result<crate::js::ScriptValue, JsError> {
-        let interrupted = Rc::new(Cell::new(false));
-        if let Some(deadline) = deadline {
-            let flag = Rc::clone(&interrupted);
-            self.runtime.set_interrupt_handler(Some(Box::new(move || {
-                if Instant::now() >= deadline {
-                    flag.set(true);
-                    true
-                } else {
-                    false
-                }
-            })));
-        }
-        let _clear = ClearInterrupt {
-            runtime: &self.runtime,
-        };
-        let decoded: Result<ScriptValue, JsError> = self.context.with(|ctx| {
-            let value: Value = eval_classic(&ctx, source)?;
-            decode_value(&ctx, value)
-        });
-        let jobs = self.run_jobs();
-        if interrupted.get() {
-            return Err(JsError::Interrupted);
-        }
-        decoded.and_then(|value| jobs.map(|()| value))
+        self.with_budget(deadline, || {
+            let decoded: Result<ScriptValue, JsError> = self.context.with(|ctx| {
+                let value: Value = eval_classic(&ctx, source)?;
+                decode_value(&ctx, value)
+            });
+            let jobs = self.run_jobs();
+            decoded.and_then(|value| jobs.map(|()| value))
+        })
     }
 
     pub(crate) fn has_pending_work(&self) -> bool {
@@ -165,21 +162,23 @@ impl JsHost {
     }
 
     pub(crate) fn fire_timer(&self, js_id: i32) -> Result<(), JsError> {
-        let called: Result<(), JsError> = self.context.with(|ctx| {
-            let timeouts: Array = ctx
-                .globals()
-                .get("__tb_timeouts")
-                .map_err(JsError::engine)?;
-            let idx = usize::try_from(js_id).map_err(|_| JsError::BadTimerId)?;
-            let func: Function = timeouts.get(idx).map_err(JsError::engine)?;
-            timeouts
-                .as_object()
-                .remove(js_id)
-                .map_err(JsError::engine)?;
-            func.call(()).map_err(JsError::engine)
-        });
-        let jobs = self.run_jobs();
-        called.and(jobs)
+        self.with_budget(None, || {
+            let called: Result<(), JsError> = self.context.with(|ctx| {
+                let timeouts: Array = ctx
+                    .globals()
+                    .get("__tb_timeouts")
+                    .map_err(JsError::engine)?;
+                let idx = usize::try_from(js_id).map_err(|_| JsError::BadTimerId)?;
+                let func: Function = timeouts.get(idx).map_err(JsError::engine)?;
+                timeouts
+                    .as_object()
+                    .remove(js_id)
+                    .map_err(JsError::engine)?;
+                func.call(()).map_err(JsError::engine)
+            });
+            let jobs = self.run_jobs();
+            called.and(jobs)
+        })
     }
 
     pub(crate) fn finish_js_fetch(
@@ -189,25 +188,54 @@ impl JsHost {
         status: i32,
         body: &str,
     ) -> Result<(), JsError> {
-        let body = body.to_owned();
-        let called: Result<(), JsError> = self.context.with(|ctx| {
-            let cbs: Object = ctx
-                .globals()
-                .get("__tb_fetchCbs")
-                .map_err(JsError::engine)?;
-            let func: Function = cbs.get(js_id).map_err(JsError::engine)?;
-            func.call((ok, status, body)).map_err(JsError::engine)
-        });
-        let jobs = self.run_jobs();
-        called.and(jobs)
+        self.with_budget(None, || {
+            let body = body.to_owned();
+            let called: Result<(), JsError> = self.context.with(|ctx| {
+                let cbs: Object = ctx
+                    .globals()
+                    .get("__tb_fetchCbs")
+                    .map_err(JsError::engine)?;
+                let func: Function = cbs.get(js_id).map_err(JsError::engine)?;
+                func.call((ok, status, body)).map_err(JsError::engine)
+            });
+            let jobs = self.run_jobs();
+            called.and(jobs)
+        })
     }
 
     pub(crate) fn fire_load(&self) -> Result<(), JsError> {
-        let fired: Result<(), JsError> = self
-            .context
-            .with(|ctx| bindings::fire_window_load(&ctx).map_err(JsError::engine));
-        let jobs = self.run_jobs();
-        fired.and(jobs)
+        self.with_budget(None, || {
+            let fired: Result<(), JsError> = self
+                .context
+                .with(|ctx| bindings::fire_window_load(&ctx).map_err(JsError::engine));
+            let jobs = self.run_jobs();
+            fired.and(jobs)
+        })
+    }
+
+    fn with_budget<T>(
+        &self,
+        deadline: Option<Instant>,
+        operation: impl FnOnce() -> Result<T, JsError>,
+    ) -> Result<T, JsError> {
+        let deadline = deadline.unwrap_or_else(|| Instant::now() + DEFAULT_SCRIPT_BUDGET);
+        let interrupted = Rc::new(Cell::new(false));
+        let flag = Rc::clone(&interrupted);
+        let stop = Arc::clone(&self.stop);
+        self.runtime.set_interrupt_handler(Some(Box::new(move || {
+            let should_interrupt = stop.is_set() || Instant::now() >= deadline;
+            flag.set(should_interrupt);
+            should_interrupt
+        })));
+        let _clear = ClearInterrupt {
+            runtime: &self.runtime,
+        };
+        let result = operation();
+        if interrupted.get() {
+            Err(JsError::Interrupted)
+        } else {
+            result
+        }
     }
 
     fn run_jobs(&self) -> Result<(), JsError> {
@@ -333,31 +361,15 @@ impl Drop for JsHost {
     }
 }
 
-pub(crate) fn collect_classic_scripts(world: &World) -> Vec<ClassicScript> {
-    let Some(parsed) = world.parsed.as_ref() else {
-        return Vec::new();
-    };
-    let mut out = Vec::new();
-    let mut stack: Vec<_> = parsed
-        .dom
-        .children(parsed.dom.document())
-        .map(|kids| kids.copied().collect())
-        .unwrap_or_default();
-    stack.reverse();
-    while let Some(id) = stack.pop() {
-        if is_classic_script(&parsed.dom, id) {
-            match parsed.dom.attribute(id, "src") {
-                Some(src) if !src.trim().is_empty() => out.push(ClassicScript::Src(src)),
-                _ => out.push(ClassicScript::Inline(element_text(&parsed.dom, id))),
-            }
-        }
-        if let Some(kids) = parsed.dom.children(id) {
-            let mut kids: Vec<_> = kids.copied().collect();
-            kids.reverse();
-            stack.extend(kids);
-        }
+pub(crate) fn classic_script_at(world: &World, id: dom::NodeId) -> Option<ClassicScript> {
+    let parsed = world.parsed.as_ref()?;
+    if !is_classic_script(&parsed.dom, id) {
+        return None;
     }
-    out
+    match parsed.dom.attribute(id, "src") {
+        Some(src) if !src.trim().is_empty() => Some(ClassicScript::Src(src)),
+        _ => Some(ClassicScript::Inline(element_text(&parsed.dom, id))),
+    }
 }
 
 fn is_classic_script(tree: &dom::Dom, id: dom::NodeId) -> bool {

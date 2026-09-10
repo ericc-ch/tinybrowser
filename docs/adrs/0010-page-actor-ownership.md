@@ -1,58 +1,77 @@
-# Browser, Profile, and PageActor
+# Autonomous page actors and browser-owned resources
 
-One profile daemon hosts one Browser bound to one named Profile. Browser owns `ProfileStore`, the shared `NetworkSession`, and the page registry of `PageHandle`s. A `PageHandle` addresses a `PageActor`. Profile is the named durable identity, not a runtime owner between Browser and pages.
+Status: accepted. Replaces the caller-driven pump, page-owned blocking pools,
+post-parse script scan, and best-effort profile writes previously recorded here.
 
-Status: accepted. Keeps [ADR 0007](0007-engine-charter.md) Tokio `rt`+`time`, HTML jobs on our queue, `spawn_blocking` for `send` / `upgrade`, and crate/lint/size bounds. Keeps the [ADR 0006](0006-net-transport.md) hard seam. Durable profile files, daemon lifetime, CDP, and WebDriver are in [ADR 0009](0009-named-profile-daemon.md).
+## Decision
 
-## Ownership
+One profile daemon hosts one `Browser`. `Browser` owns the page registry,
+`ProfileStore`, shared cookie jar, and one bounded network executor. The executor
+has 16 blocking workers and a 256-job browser-wide queue. A page submits
+value-only work tagged by its navigation or JavaScript epoch. Queued work checks
+page cancellation before starting; closing a page discards later completions.
 
-`Browser` owns `ProfileStore`, the shared `NetworkSession`, and the page registry.
+Each `PageActor` owns its DOM, active HTML parser, QuickJS realm, timers, and
+navigation state on one OS thread. It advances work while idle. Wait requests
+register conditions and do not monopolize the actor. `PageHandle` crosses this
+boundary using commands, request IDs, values, event receivers, and explicit
+errors. DOM references, QuickJS values, and callbacks stay on the actor.
 
-A `Page` is a top-level browsing context, a tab identity. It survives navigation. Its active `Document` is replaced on navigation.
+The public `tinybrowser` crate exposes `Browser`, `BrowserHandle`, and
+`PageHandle`, not the directly driven engine `Page`. The lower-level `browser`
+workspace crate keeps parser and direct-page APIs for conformance tests.
 
-Each page is a `PageActor` on one OS thread. That thread has one long-lived current-thread Tokio runtime. The actor owns DOM, the QuickJS realm, the wrapper cache, document state, HTML-job queues, timers, and navigation state.
+## Parsing and scripts
 
-`PageHandle` communicates with `PageActor` only through commands, events, request IDs, values, and explicit errors. No DOM references, QuickJS values, callbacks, or closures cross the boundary.
+Navigation bytes are decoded before tokenization using BOM, HTTP charset, and
+the HTML prescan, with Windows-1252 as the fallback. This follows the
+[HTML encoding sniffing algorithm](https://html.spec.whatwg.org/multipage/parsing.html#encoding-sniffing-algorithm)
+and the [Encoding label lookup](https://encoding.spec.whatwg.org/#concept-encoding-get).
 
-`BrowserHandle` is the value-only handle protocols use to drive Browser.
+The page drives html5ever incrementally. On a parser-blocking script end tag it
+pauses tokenization, exposes the partial DOM to QuickJS, runs the script, applies
+DOM mutations and parser-time `document.write()` input, then resumes the same
+tokenizer. The relevant behavior is defined by HTML's
+[text insertion mode](https://html.spec.whatwg.org/multipage/parsing.html#parsing-main-intext),
+[script preparation](https://html.spec.whatwg.org/multipage/scripting.html#prepare-the-script-element),
+and [dynamic markup insertion](https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#document-write-steps).
 
-## NetworkSession
+## Scheduling, events, and limits
 
-`NetworkSession` is the browser-owned live networking service. It wraps one shared `net::Agent`, which keeps the connection pool, transport settings, and live cookie jar. Public `net` types stay ours ([ADR 0006](0006-net-transport.md)).
+The page loop multiplexes commands, timer deadlines, network completions,
+QuickJS jobs, and wait conditions. `Page.enable` subscribes CDP clients to
+unsolicited page events; navigation starts asynchronously and load completion is
+reported as `Page.loadEventFired`.
 
-`ProfileStore` is durable backing, not another live jar. `NetworkSession` loads persisted cookies into `Agent` and saves jar changes through `ProfileStore`.
+Every QuickJS entry point has a five-second default execution budget, a 32 MiB
+heap limit, a 512 KiB stack limit, and a stop-aware interrupt handler. An
+explicit protocol deadline may shorten the execution budget. This makes page
+shutdown independent of script cooperation.
 
-Page actors receive a value-only network/fetch handle. They do not expose or own `net::Agent`. Blocking net calls stay off the page thread through `spawn_blocking`. Completions return as actor events.
+## DOM bindings
+
+DOM wrappers retain one native `NodeId` host representation, but public WebIDL
+prototype objects expose only the members belonging to their interfaces.
+`Document`, `Element`, `CharacterData`, `Text`, `Comment`, `DocumentType`, and
+`DocumentFragment` inherit through `Node`, which inherits from `EventTarget`, according to the
+[WebIDL interface prototype model](https://webidl.spec.whatwg.org/#interface-prototype-object).
+`childNodes` and `getElementsByTagName()` return live `NodeList` and
+`HTMLCollection` host objects rather than array snapshots.
 
 ## Persistence
 
-`ProfileStore` owns every durable web-data feature the engine supports. Cookies first. Later localStorage, IndexedDB, HTTP cache, and similar site data use the same store. CDP does not own cookies.
+Opening a durable profile takes an OS-backed exclusive file lock. A second
+writer fails explicitly. Invalid cookie data is renamed to a timestamped
+`cookies.corrupt.*` file and the profile starts with an empty jar. Other read
+errors propagate. Writes use a same-directory temporary file, file `fsync`,
+atomic rename, and directory `fsync`; failures remain dirty and propagate from
+explicit `BrowserHandle::close`.
 
-The live jar is marked dirty on cookie changes. `ProfileStore` writes the cookie file on navigation, page stop, and `NetworkSession` drop (including `Browser.close`). `document.cookie` does not write disk on the page thread.
-
-Open tabs, active documents, JavaScript heaps, `sessionStorage`, and in-flight requests are not restored after the daemon restarts.
+Shutdown first refuses new work, then closes every page, and finally persists
+the quiescent cookie jar. Repeating close retries a failed durable write.
 
 ## Isolation
 
-Threads improve scheduling and ownership isolation. They are not a Spectre security boundary.
-
-Keep one process with page threads for now. A later security phase may self-spawn the same executable into sandboxed renderer processes, preferably isolated by site rather than blindly one process per tab. The value-only `PageHandle` boundary is the seam that later IPC would reuse.
-
-## Host objects
-
-Wrapper caches and host objects live on the actor. One `JsNode` host class plus JS constructor branding is the first slice. Later: one host object per WebIDL interface. The wrapper cache is a JS `WeakRef`, so exposing a node to JavaScript does not root that node for the document lifetime.
-
-## Options considered
-
-- **Keep `Page` on the embedder thread with a fresh runtime per `run`:** Runtime drop waits for started `spawn_blocking` work, so `run_until_load` can wait on unrelated slow fetches. Rejected as the lasting shape.
-- **Closures or `NodeId` borrows across the actor boundary:** convenient now, expensive to undo when renderers become processes. Rejected.
-- **One OS process per tab now:** cost and complexity before a security design. Rejected. Site-isolated renderer processes are a later phase.
-- **Treat page threads as a Spectre boundary:** they isolate scheduling and ownership only.
-- **Two authoritative cookie jars:** live `Agent` jar plus a separate store jar. Rejected. One live jar, durable backing in `ProfileStore`.
-- **Strong wrapper cache for the document lifetime:** a strong `Persistent` map. Rejected as the lasting shape. Use a weak cache.
-
-## Consequences
-
-- WebDriver and CDP both drive `PageHandle` through `BrowserHandle`. Neither holds DOM or QuickJS values.
-- `Page::block_on_pump` and `Page::execute_script` are internal to the actor.
-- `Page` stays one owner. The `page` module is split by job (`pump`, `navigate`, `intern`) without extra types.
+Threads enforce ownership but are not a security boundary. A later renderer
+process may reuse the value-only page seam. Process isolation is not required to
+make ordering, cancellation, resource bounds, and shutdown correct in-process.

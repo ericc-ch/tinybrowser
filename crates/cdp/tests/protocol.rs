@@ -28,7 +28,7 @@ fn spawn_server(browser: browser::BrowserHandle) -> (std::net::SocketAddr, threa
 #[test]
 fn browser_target_page_runtime_flatten_and_method_not_found() {
     let data_home = temp_data_home();
-    let browser = Browser::open_in(&data_home, &Profile::default());
+    let browser = Browser::open_in(&data_home, &Profile::default()).expect("browser");
     let (addr, _server) = spawn_server(browser.handle());
     thread::sleep(Duration::from_millis(20));
     let mut client = cdp::Client::connect(addr).expect("connect");
@@ -133,7 +133,7 @@ fn page_navigate_loads_http_document() {
     });
 
     let data_home = temp_data_home();
-    let browser = Browser::open_in(&data_home, &Profile::default());
+    let browser = Browser::open_in(&data_home, &Profile::default()).expect("browser");
     let (addr, _cdp) = spawn_server(browser.handle());
     thread::sleep(Duration::from_millis(20));
     let mut client = cdp::Client::connect(addr).expect("connect");
@@ -150,12 +150,21 @@ fn page_navigate_loads_http_document() {
         .expect("attach");
     let session = attached["sessionId"].as_str().expect("session").to_owned();
     client
+        .call("Page.enable", &json!({}), Some(&session))
+        .expect("enable page events");
+    client
         .call(
             "Page.navigate",
             &json!({"url": format!("http://{page_addr}/")}),
             Some(&session),
         )
         .expect("navigate");
+    let event = client
+        .read_event(Duration::from_secs(1))
+        .expect("read event")
+        .expect("load event");
+    assert_eq!(event["method"], json!("Page.loadEventFired"));
+    assert_eq!(event["sessionId"], json!(session));
     let evaluated = client
         .call(
             "Runtime.evaluate",
@@ -192,7 +201,7 @@ fn http_get(addr: std::net::SocketAddr, path: &str) -> (u16, String) {
 #[test]
 fn json_discovery_page_socket_close_target_and_browser_close() {
     let data_home = temp_data_home();
-    let browser = Browser::open_in(&data_home, &Profile::default());
+    let browser = Browser::open_in(&data_home, &Profile::default()).expect("browser");
     let (addr, server) = spawn_server(browser.handle());
     thread::sleep(Duration::from_millis(20));
 

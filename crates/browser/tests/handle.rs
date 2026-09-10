@@ -15,7 +15,7 @@ fn temp_data_home() -> std::path::PathBuf {
 #[test]
 fn page_handle_commands_are_values_only() {
     let data_home = temp_data_home();
-    let browser = Browser::open_in(&data_home, &Profile::default());
+    let browser = Browser::open_in(&data_home, &Profile::default()).expect("browser");
     assert_eq!(browser.profile_name().as_str(), "default");
     let handle = browser.handle();
     let page = handle.create_page().expect("page");
@@ -49,7 +49,7 @@ fn page_handle_commands_are_values_only() {
     page.set_document_cookie("a=1").expect("cookie");
     assert_eq!(page.document_cookie().expect("cookie get"), "a=1");
     assert!(!page.last_navigation_failed().expect("nav"));
-    assert_eq!(page.events().expect("events"), Vec::<PageEvent>::new());
+    assert_eq!(page.events().expect("events"), vec![PageEvent::Load]);
     page.shutdown().expect("shutdown");
     handle.close_page(page.id()).expect("remove stopped page");
     handle
@@ -61,7 +61,7 @@ fn page_handle_commands_are_values_only() {
 #[test]
 fn execute_script_reuses_one_remote_id_for_the_same_node() {
     let data_home = temp_data_home();
-    let browser = Browser::open_in(&data_home, &Profile::default());
+    let browser = Browser::open_in(&data_home, &Profile::default()).expect("browser");
     let page = browser.handle().create_page().expect("page");
     page.load_html("<!doctype html><p>hi</p>").expect("load");
     let value = page
@@ -81,9 +81,154 @@ fn execute_script_reuses_one_remote_id_for_the_same_node() {
 }
 
 #[test]
+fn page_actor_advances_timers_without_a_run_command() {
+    let data_home = temp_data_home();
+    let browser = Browser::open_in(&data_home, &Profile::default()).expect("browser");
+    let page = browser.handle().create_page().expect("page");
+    page.load_html("<!doctype html><title></title>")
+        .expect("load");
+    page.eval("globalThis.fired = false; setTimeout(() => { fired = true; }, 10)")
+        .expect("timer");
+
+    std::thread::sleep(Duration::from_millis(50));
+
+    assert_eq!(page.eval("String(fired)").expect("fired"), "true");
+    let _ = std::fs::remove_dir_all(data_home);
+}
+
+#[test]
+fn page_events_are_pushed_to_subscribers() {
+    let data_home = temp_data_home();
+    let browser = Browser::open_in(&data_home, &Profile::default()).expect("browser");
+    let page = browser.handle().create_page().expect("page");
+    let events = page.subscribe().expect("subscribe");
+
+    page.load_html("<!doctype html><title></title>")
+        .expect("load");
+
+    assert_eq!(
+        events.recv_timeout(Duration::from_secs(1)).expect("event"),
+        PageEvent::Load
+    );
+    let _ = std::fs::remove_dir_all(data_home);
+}
+
+#[test]
+fn a_wait_does_not_monopolize_the_page_actor() {
+    let data_home = temp_data_home();
+    let browser = Browser::open_in(&data_home, &Profile::default()).expect("browser");
+    let page = browser.handle().create_page().expect("page");
+    page.load_html("<!doctype html><title></title>")
+        .expect("load");
+    page.eval("setTimeout(() => {}, 250)").expect("timer");
+    let first_request = page.next_request_id().get();
+    let waiter = page.clone();
+    let waiting = std::thread::spawn(move || waiter.run());
+    let submitted = std::time::Instant::now() + Duration::from_secs(1);
+    while page.next_request_id().get() == first_request {
+        assert!(
+            std::time::Instant::now() < submitted,
+            "wait was not submitted"
+        );
+        std::thread::yield_now();
+    }
+
+    let started = std::time::Instant::now();
+    assert_eq!(page.eval("String(1 + 1)").expect("concurrent eval"), "2");
+    assert!(
+        started.elapsed() < Duration::from_millis(100),
+        "wait command monopolized the actor"
+    );
+    waiting.join().expect("wait thread").expect("wait result");
+    let _ = std::fs::remove_dir_all(data_home);
+}
+
+#[test]
+fn dom_mutation_survives_a_failed_parser_blocking_script() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::mpsc;
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("address");
+    let (script_requested, requested) = mpsc::channel();
+    let (release, released) = mpsc::channel();
+    let server = std::thread::spawn(move || {
+        let (mut page, _) = listener.accept().expect("page request");
+        let mut request = [0_u8; 512];
+        let _bytes_read = page.read(&mut request).expect("read page request");
+        let body = b"<!doctype html><body><div id=before></div><script src=/missing></script><p id=after></p>";
+        write!(
+            page,
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .expect("page head");
+        page.write_all(body).expect("page body");
+        drop(page);
+
+        let (mut script, _) = listener.accept().expect("script request");
+        let _bytes_read = script.read(&mut request).expect("read script request");
+        script_requested.send(()).expect("requested signal");
+        released.recv().expect("release script");
+    });
+
+    let browser = Browser::ephemeral().expect("browser");
+    let page = browser.handle().create_page().expect("page");
+    page.goto(&format!("http://{addr}/")).expect("goto");
+    requested
+        .recv_timeout(Duration::from_secs(1))
+        .expect("external script request");
+    page.eval("document.getElementById('before').id = 'mutated'")
+        .expect("mutation while parser paused");
+    release.send(()).expect("release");
+    assert!(
+        page.run_until_load_timeout(Duration::from_secs(1))
+            .expect("load wait")
+    );
+    assert_eq!(
+        page.eval(
+            "document.getElementById('mutated').id + ':' + document.getElementById('after').id"
+        )
+        .expect("completed document"),
+        "mutated:after"
+    );
+    server.join().expect("server");
+}
+
+#[test]
+fn shutdown_interrupts_a_running_script() {
+    let data_home = temp_data_home();
+    let browser = Browser::open_in(&data_home, &Profile::default()).expect("browser");
+    let page = browser.handle().create_page().expect("page");
+    page.load_html("<!doctype html><title></title>")
+        .expect("load");
+    let first_request = page.next_request_id().get();
+    let evaluator = page.clone();
+    let running = std::thread::spawn(move || evaluator.eval("while (true) {}"));
+    let deadline = std::time::Instant::now() + Duration::from_secs(1);
+    while page.next_request_id().get() == first_request {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "eval was not submitted"
+        );
+        std::thread::yield_now();
+    }
+
+    let started = std::time::Instant::now();
+    page.shutdown().expect("shutdown");
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "shutdown did not interrupt script"
+    );
+    assert!(running.join().expect("evaluator").is_err());
+    let _ = std::fs::remove_dir_all(data_home);
+}
+
+#[test]
 fn webidl_node_name_doctype_and_branding() {
     let data_home = temp_data_home();
-    let browser = Browser::open_in(&data_home, &Profile::default());
+    let browser = Browser::open_in(&data_home, &Profile::default()).expect("browser");
     let page = browser.handle().create_page().expect("page");
     page.load_html("<!doctype html><title></title>")
         .expect("load");
@@ -103,10 +248,13 @@ fn webidl_node_name_doctype_and_branding() {
               document.nodeName,
               document.doctype.nodeName,
               document.createDocumentFragment().nodeName,
+              typeof EventTarget,
               typeof Document,
+              String(Object.getPrototypeOf(Node.prototype) === EventTarget.prototype),
               String(Object.getPrototypeOf(document) === Document.prototype),
               String(document instanceof Document),
               String(document instanceof Node),
+              String(document instanceof EventTarget),
               String(document.createElement("p") instanceof Element),
               String(document.createTextNode("x") instanceof Text),
               String(document.createComment("x") instanceof Comment),
@@ -115,6 +263,12 @@ fn webidl_node_name_doctype_and_branding() {
               String(document.body === document.body),
               String(document.doctype === document.doctype),
               String(document.createElement("p") instanceof Node),
+              String(document.createTextNode("x") instanceof CharacterData),
+              typeof document.createTextNode("x").createElement,
+              typeof document.createTextNode("x").getAttribute,
+              typeof document.createElement("p").createElement,
+              typeof document.createElement("p").data,
+              typeof document.getAttribute,
               (function() {{
                 var node = document.createComment("x");
                 return String(document.documentElement.appendChild(node) === node);
@@ -157,8 +311,43 @@ fn webidl_node_name_doctype_and_branding() {
         .expect("webidl");
     assert_eq!(
         got,
-        "I|I|svg|SVG|X:B|#text|#comment|#document|html|#document-fragment|function|true|true|true|true|true|true|true|true|true|true|true|true|true|true|true|true|true|true|true|P"
+        "I|I|svg|SVG|X:B|#text|#comment|#document|html|#document-fragment|function|function|true|true|true|true|true|true|true|true|true|true|true|true|true|true|undefined|undefined|undefined|undefined|undefined|true|true|true|true|true|true|true|true|P"
     );
+    let _ = std::fs::remove_dir_all(data_home);
+}
+
+#[test]
+fn dom_collections_are_live_host_objects() {
+    let data_home = temp_data_home();
+    let browser = Browser::open_in(&data_home, &Profile::default()).expect("browser");
+    let page = browser.handle().create_page().expect("page");
+    page.load_html("<!doctype html><body></body>")
+        .expect("load");
+
+    let result = page
+        .eval(
+            r"
+var elements = document.getElementsByTagName('p');
+var children = document.body.childNodes;
+var before = elements.length + ':' + children.length;
+var paragraph = document.createElement('p');
+paragraph.id = 'later';
+document.body.appendChild(paragraph);
+[
+  before,
+  elements.length,
+  elements.item(0).id,
+  elements[0].id,
+  children.length,
+  children[0].id,
+  elements instanceof HTMLCollection,
+  children instanceof NodeList
+].join('|')
+",
+        )
+        .expect("collections");
+
+    assert_eq!(result, "0:0|1|later|later|1|later|true|true");
     let _ = std::fs::remove_dir_all(data_home);
 }
 
@@ -225,7 +414,7 @@ fn page_handle_run_until_load_does_not_wait_for_unrelated_fetch() {
     });
 
     let data_home = temp_data_home();
-    let browser = Browser::open_in(&data_home, &Profile::default());
+    let browser = Browser::open_in(&data_home, &Profile::default()).expect("browser");
     let page = browser.handle().create_page().expect("page");
     page.goto(&format!("http://{page_addr}/")).expect("goto");
     let started = Instant::now();

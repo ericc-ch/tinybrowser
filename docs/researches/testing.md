@@ -28,8 +28,8 @@ fixtures miss.
 flatten/method-not-found/`Browser.close`, WebDriver one-session and
 `DELETE /session` leaving tabs, unsupported click, page pump vs unrelated
 fetch, cookie file mode, CLI flag errors, `net::Agent` cookies/loopback/WS,
-and inbound HTTP/1.1 on `http1`. Counted 2026-09-09
-from workspace `#[test]` items: **58 tests** (57 active plus one ignored
+and inbound HTTP/1.1 on `http1`. Counted 2026-09-10
+from workspace `#[test]` items: **68 tests** (67 active plus one ignored
 corpus-dump helper in `crates/browser/tests/html5lib.rs`).
 Integration suites do not reach into arena internals.
 

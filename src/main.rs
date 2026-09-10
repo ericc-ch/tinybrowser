@@ -135,10 +135,16 @@ fn serve_webdriver(port: u16, builder: AgentBuilder, profile: &Profile) -> ExitC
             return ExitCode::from(1);
         }
     };
-    let browser = Browser::open_with_network(NetworkSession::from_builder(
-        builder,
-        ProfileStore::open_in(&data_home, profile),
-    ));
+    let network = match ProfileStore::open_in(&data_home, profile)
+        .and_then(|store| NetworkSession::from_builder(builder, store))
+    {
+        Ok(network) => network,
+        Err(error) => {
+            eprintln!("webdriver profile failed: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    let browser = Browser::open_with_network(network);
     if let Err(error) = webdriver::serve(&listener, browser.handle()) {
         eprintln!("webdriver: {error}");
         return ExitCode::from(1);
