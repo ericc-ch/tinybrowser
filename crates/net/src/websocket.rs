@@ -9,7 +9,7 @@ use tungstenite::protocol::frame::coding::CloseCode;
 use tungstenite::protocol::{CloseFrame, Message};
 use url::Url;
 
-use crate::Context;
+use crate::InitiatorKind;
 use crate::client::Agent;
 use crate::error::{NetError, ProtocolError, TransportError};
 use crate::protocol::{HeaderMap, Method};
@@ -124,7 +124,7 @@ pub(crate) fn connect(
     agent: &Agent,
     url: &Url,
     headers: &HeaderMap,
-    context: Context,
+    initiator_kind: InitiatorKind,
     method: &Method,
     initiator: Option<&Url>,
 ) -> Result<WebSocket, NetError> {
@@ -162,7 +162,7 @@ pub(crate) fn connect(
     let (mut ws, response) = tungstenite::client(request, stream).map_err(handshake_err)?;
     agent.store_set_cookie_lines(
         url,
-        context,
+        initiator_kind,
         method,
         initiator,
         false,

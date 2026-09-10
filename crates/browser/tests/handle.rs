@@ -1,6 +1,6 @@
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use browser::{Browser, PageEvent, Profile, RemoteValue, Renderers};
+use browser::{Browser, Profile, RemoteValue, Renderers, TabEvent};
 
 fn temp_data_home() -> std::path::PathBuf {
     let stamp = SystemTime::now()
@@ -19,43 +19,38 @@ fn page_handle_commands_are_values_only() {
         Browser::open_in_with(&data_home, &Profile::default(), Renderers::Local).expect("browser");
     assert_eq!(browser.profile_name().as_str(), "default");
     let handle = browser.handle();
-    let page = handle.create_page().expect("page");
-    let first = page.next_request_id();
-    page.load_html("<!doctype html><p id=x>hi</p>")
+    let tab = handle.create_tab().expect("tab");
+    let first = tab.next_request_id();
+    tab.load_html("<!doctype html><p id=x>hi</p>")
         .expect("load html");
-    assert_ne!(page.next_request_id().get(), first.get());
+    assert_ne!(tab.next_request_id().get(), first.get());
     assert_eq!(
-        page.eval("document.getElementsByTagName('p')[0].firstChild.data")
+        tab.eval("document.getElementsByTagName('p')[0].firstChild.data")
             .expect("text"),
         "hi"
     );
     assert_eq!(
-        page.execute_script("1 + 1").expect("number"),
+        tab.execute_script("1 + 1").expect("number"),
         RemoteValue::Number(2.0)
     );
+    assert_eq!(tab.execute_script("null").expect("null"), RemoteValue::Null);
     assert_eq!(
-        page.execute_script("null").expect("null"),
-        RemoteValue::Null
-    );
-    assert_eq!(
-        page.execute_script("undefined").expect("undefined"),
+        tab.execute_script("undefined").expect("undefined"),
         RemoteValue::Undefined
     );
     assert!(matches!(
-        page.execute_script("document.body").expect("node"),
+        tab.execute_script("document.body").expect("node"),
         RemoteValue::Node(_)
     ));
-    page.set_document_url("http://example.test/")
+    tab.set_document_url("http://example.test/")
         .expect("document url");
-    page.set_document_cookie("a=1").expect("cookie");
-    assert_eq!(page.document_cookie().expect("cookie get"), "a=1");
-    assert!(!page.last_navigation_failed().expect("nav"));
-    assert_eq!(page.events().expect("events"), vec![PageEvent::Load]);
-    page.shutdown().expect("shutdown");
-    handle.close_page(page.id()).expect("remove stopped page");
-    handle
-        .close_page(page.id())
-        .expect_err("unknown after close");
+    tab.set_document_cookie("a=1").expect("cookie");
+    assert_eq!(tab.document_cookie().expect("cookie get"), "a=1");
+    assert!(!tab.last_navigation_failed().expect("nav"));
+    assert_eq!(tab.events().expect("events"), vec![TabEvent::Load]);
+    tab.shutdown().expect("shutdown");
+    handle.close_tab(tab.id()).expect("remove stopped tab");
+    handle.close_tab(tab.id()).expect_err("unknown after close");
     let _ = std::fs::remove_dir_all(data_home);
 }
 
@@ -64,9 +59,9 @@ fn execute_script_reuses_one_remote_id_for_the_same_node() {
     let data_home = temp_data_home();
     let browser =
         Browser::open_in_with(&data_home, &Profile::default(), Renderers::Local).expect("browser");
-    let page = browser.handle().create_page().expect("page");
-    page.load_html("<!doctype html><p>hi</p>").expect("load");
-    let value = page
+    let tab = browser.handle().create_tab().expect("tab");
+    tab.load_html("<!doctype html><p>hi</p>").expect("load");
+    let value = tab
         .execute_script("[document.body, document.body]")
         .expect("pair");
     let RemoteValue::List(items) = value else {
@@ -87,15 +82,15 @@ fn page_actor_advances_timers_without_a_run_command() {
     let data_home = temp_data_home();
     let browser =
         Browser::open_in_with(&data_home, &Profile::default(), Renderers::Local).expect("browser");
-    let page = browser.handle().create_page().expect("page");
-    page.load_html("<!doctype html><title></title>")
+    let tab = browser.handle().create_tab().expect("tab");
+    tab.load_html("<!doctype html><title></title>")
         .expect("load");
-    page.eval("globalThis.fired = false; setTimeout(() => { fired = true; }, 10)")
+    tab.eval("globalThis.fired = false; setTimeout(() => { fired = true; }, 10)")
         .expect("timer");
 
     std::thread::sleep(Duration::from_millis(50));
 
-    assert_eq!(page.eval("String(fired)").expect("fired"), "true");
+    assert_eq!(tab.eval("String(fired)").expect("fired"), "true");
     let _ = std::fs::remove_dir_all(data_home);
 }
 
@@ -104,15 +99,15 @@ fn page_events_are_pushed_to_subscribers() {
     let data_home = temp_data_home();
     let browser =
         Browser::open_in_with(&data_home, &Profile::default(), Renderers::Local).expect("browser");
-    let page = browser.handle().create_page().expect("page");
-    let events = page.subscribe().expect("subscribe");
+    let tab = browser.handle().create_tab().expect("tab");
+    let events = tab.subscribe().expect("subscribe");
 
-    page.load_html("<!doctype html><title></title>")
+    tab.load_html("<!doctype html><title></title>")
         .expect("load");
 
     assert_eq!(
         events.recv_timeout(Duration::from_secs(1)).expect("event"),
-        PageEvent::Load
+        TabEvent::Load
     );
     let _ = std::fs::remove_dir_all(data_home);
 }
@@ -122,15 +117,15 @@ fn a_wait_does_not_monopolize_the_page_actor() {
     let data_home = temp_data_home();
     let browser =
         Browser::open_in_with(&data_home, &Profile::default(), Renderers::Local).expect("browser");
-    let page = browser.handle().create_page().expect("page");
-    page.load_html("<!doctype html><title></title>")
+    let tab = browser.handle().create_tab().expect("tab");
+    tab.load_html("<!doctype html><title></title>")
         .expect("load");
-    page.eval("setTimeout(() => {}, 250)").expect("timer");
-    let first_request = page.next_request_id().get();
-    let waiter = page.clone();
+    tab.eval("setTimeout(() => {}, 250)").expect("timer");
+    let first_request = tab.next_request_id().get();
+    let waiter = tab.clone();
     let waiting = std::thread::spawn(move || waiter.run());
     let submitted = std::time::Instant::now() + Duration::from_secs(1);
-    while page.next_request_id().get() == first_request {
+    while tab.next_request_id().get() == first_request {
         assert!(
             std::time::Instant::now() < submitted,
             "wait was not submitted"
@@ -139,7 +134,7 @@ fn a_wait_does_not_monopolize_the_page_actor() {
     }
 
     let started = std::time::Instant::now();
-    assert_eq!(page.eval("String(1 + 1)").expect("concurrent eval"), "2");
+    assert_eq!(tab.eval("String(1 + 1)").expect("concurrent eval"), "2");
     assert!(
         started.elapsed() < Duration::from_millis(100),
         "wait command monopolized the actor"
@@ -159,18 +154,18 @@ fn dom_mutation_survives_a_failed_parser_blocking_script() {
     let (script_requested, requested) = mpsc::channel();
     let (release, released) = mpsc::channel();
     let server = std::thread::spawn(move || {
-        let (mut page, _) = listener.accept().expect("page request");
+        let (mut tab, _) = listener.accept().expect("server request");
         let mut request = [0_u8; 512];
-        let _bytes_read = page.read(&mut request).expect("read page request");
+        let _bytes_read = tab.read(&mut request).expect("read tab request");
         let body = b"<!doctype html><body><div id=before></div><script src=/missing></script><p id=after></p>";
         write!(
-            page,
+            tab,
             "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
             body.len()
         )
-        .expect("page head");
-        page.write_all(body).expect("page body");
-        drop(page);
+        .expect("server head");
+        tab.write_all(body).expect("tab body");
+        drop(tab);
 
         let (mut script, _) = listener.accept().expect("script request");
         let _bytes_read = script.read(&mut request).expect("read script request");
@@ -179,20 +174,20 @@ fn dom_mutation_survives_a_failed_parser_blocking_script() {
     });
 
     let browser = Browser::ephemeral().expect("browser");
-    let page = browser.handle().create_page().expect("page");
-    page.goto(&format!("http://{addr}/")).expect("goto");
+    let tab = browser.handle().create_tab().expect("tab");
+    tab.goto(&format!("http://{addr}/")).expect("goto");
     requested
         .recv_timeout(Duration::from_secs(1))
         .expect("external script request");
-    page.eval("document.getElementById('before').id = 'mutated'")
+    tab.eval("document.getElementById('before').id = 'mutated'")
         .expect("mutation while parser paused");
     release.send(()).expect("release");
     assert!(
-        page.run_until_load_timeout(Duration::from_secs(1))
+        tab.run_until_load_timeout(Duration::from_secs(1))
             .expect("load wait")
     );
     assert_eq!(
-        page.eval(
+        tab.eval(
             "document.getElementById('mutated').id + ':' + document.getElementById('after').id"
         )
         .expect("completed document"),
@@ -231,22 +226,22 @@ fn cross_site_navigation_swaps_the_document() {
     let data_home = temp_data_home();
     let browser =
         Browser::open_in_with(&data_home, &Profile::default(), Renderers::Local).expect("browser");
-    let page = browser.handle().create_page().expect("page");
-    page.goto(&format!("http://{first_addr}/")).expect("goto a");
-    page.run_until_load().expect("load a");
-    page.eval("globalThis.secret = 'a'").expect("secret");
+    let tab = browser.handle().create_tab().expect("tab");
+    tab.goto(&format!("http://{first_addr}/")).expect("goto a");
+    tab.run_until_load().expect("load a");
+    tab.eval("globalThis.secret = 'a'").expect("secret");
 
     // `localhost` and `127.0.0.1` are different sites: the tab must mount the
     // new document in a renderer for the new site, not reuse the old realm.
-    page.goto(&format!("http://localhost:{}/", second_addr.port()))
+    tab.goto(&format!("http://localhost:{}/", second_addr.port()))
         .expect("goto b");
-    page.run_until_load().expect("load b");
+    tab.run_until_load().expect("load b");
     assert_eq!(
-        page.document_url().expect("url"),
+        tab.document_url().expect("url"),
         format!("http://localhost:{}/", second_addr.port())
     );
     assert_eq!(
-        page.eval("typeof globalThis.secret").expect("realm"),
+        tab.eval("typeof globalThis.secret").expect("realm"),
         "undefined"
     );
 
@@ -260,10 +255,10 @@ fn failed_navigation_is_reported() {
     let data_home = temp_data_home();
     let browser =
         Browser::open_in_with(&data_home, &Profile::default(), Renderers::Local).expect("browser");
-    let page = browser.handle().create_page().expect("page");
-    page.goto("http://127.0.0.1:1/").expect("queued");
-    page.run_until_load().expect("load wait");
-    assert!(page.last_navigation_failed().expect("nav"));
+    let tab = browser.handle().create_tab().expect("tab");
+    tab.goto("http://127.0.0.1:1/").expect("queued");
+    tab.run_until_load().expect("load wait");
+    assert!(tab.last_navigation_failed().expect("nav"));
     let _ = std::fs::remove_dir_all(data_home);
 }
 
@@ -272,14 +267,14 @@ fn shutdown_interrupts_a_running_script() {
     let data_home = temp_data_home();
     let browser =
         Browser::open_in_with(&data_home, &Profile::default(), Renderers::Local).expect("browser");
-    let page = browser.handle().create_page().expect("page");
-    page.load_html("<!doctype html><title></title>")
+    let tab = browser.handle().create_tab().expect("tab");
+    tab.load_html("<!doctype html><title></title>")
         .expect("load");
-    let first_request = page.next_request_id().get();
-    let evaluator = page.clone();
+    let first_request = tab.next_request_id().get();
+    let evaluator = tab.clone();
     let running = std::thread::spawn(move || evaluator.eval("while (true) {}"));
     let deadline = std::time::Instant::now() + Duration::from_secs(1);
-    while page.next_request_id().get() == first_request {
+    while tab.next_request_id().get() == first_request {
         assert!(
             std::time::Instant::now() < deadline,
             "eval was not submitted"
@@ -288,7 +283,7 @@ fn shutdown_interrupts_a_running_script() {
     }
 
     let started = std::time::Instant::now();
-    page.shutdown().expect("shutdown");
+    tab.shutdown().expect("shutdown");
     assert!(
         started.elapsed() < Duration::from_secs(1),
         "shutdown did not interrupt script"
@@ -302,12 +297,12 @@ fn webidl_node_name_doctype_and_branding() {
     let data_home = temp_data_home();
     let browser =
         Browser::open_in_with(&data_home, &Profile::default(), Renderers::Local).expect("browser");
-    let page = browser.handle().create_page().expect("page");
-    page.load_html("<!doctype html><title></title>")
+    let tab = browser.handle().create_tab().expect("tab");
+    tab.load_html("<!doctype html><title></title>")
         .expect("load");
     let htmlns = "http://www.w3.org/1999/xhtml";
     let svgns = "http://www.w3.org/2000/svg";
-    let got = page
+    let got = tab
         .eval(&format!(
             r#"
             [
@@ -394,11 +389,10 @@ fn dom_collections_are_live_host_objects() {
     let data_home = temp_data_home();
     let browser =
         Browser::open_in_with(&data_home, &Profile::default(), Renderers::Local).expect("browser");
-    let page = browser.handle().create_page().expect("page");
-    page.load_html("<!doctype html><body></body>")
-        .expect("load");
+    let tab = browser.handle().create_tab().expect("tab");
+    tab.load_html("<!doctype html><body></body>").expect("load");
 
-    let result = page
+    let result = tab
         .eval(
             r"
 var elements = document.getElementsByTagName('p');
@@ -464,8 +458,8 @@ fn page_handle_run_until_load_does_not_wait_for_unrelated_fetch() {
 
     let slow = TcpListener::bind("127.0.0.1:0").expect("slow bind");
     let slow_addr = slow.local_addr().expect("slow addr");
-    let page_listener = TcpListener::bind("127.0.0.1:0").expect("page bind");
-    let page_addr = page_listener.local_addr().expect("page addr");
+    let server_listener = TcpListener::bind("127.0.0.1:0").expect("server bind");
+    let server_addr = server_listener.local_addr().expect("server addr");
     let release = Arc::new(AtomicBool::new(false));
     let slow_flag = Arc::clone(&release);
     let slow_server = thread::spawn(move || {
@@ -478,8 +472,8 @@ fn page_handle_run_until_load_does_not_wait_for_unrelated_fetch() {
         }
         respond(&mut stream, b"slow");
     });
-    let page_server = thread::spawn(move || {
-        let (mut stream, _) = page_listener.accept().expect("page accept");
+    let server = thread::spawn(move || {
+        let (mut stream, _) = server_listener.accept().expect("server accept");
         let _ = read_target(&mut stream);
         let html = format!(
             "<!doctype html><script>fetch('http://{slow_addr}/slow').then(function() {{ window.slowDone = true; }});</script>"
@@ -490,24 +484,24 @@ fn page_handle_run_until_load_does_not_wait_for_unrelated_fetch() {
     let data_home = temp_data_home();
     let browser =
         Browser::open_in_with(&data_home, &Profile::default(), Renderers::Local).expect("browser");
-    let page = browser.handle().create_page().expect("page");
-    page.goto(&format!("http://{page_addr}/")).expect("goto");
+    let tab = browser.handle().create_tab().expect("tab");
+    tab.goto(&format!("http://{server_addr}/")).expect("goto");
     let started = Instant::now();
-    page.run_until_load().expect("load");
+    tab.run_until_load().expect("load");
     assert!(
         started.elapsed() < Duration::from_secs(1),
         "handle load waited for unrelated fetch: {:?}",
         started.elapsed()
     );
-    assert!(!page.last_navigation_failed().expect("nav"));
+    assert!(!tab.last_navigation_failed().expect("nav"));
     assert_eq!(
-        page.eval("typeof window.slowDone").expect("slow"),
+        tab.eval("typeof window.slowDone").expect("slow"),
         "undefined"
     );
     release.store(true, Ordering::SeqCst);
-    page.run().expect("drain");
-    assert_eq!(page.eval("String(window.slowDone)").expect("done"), "true");
+    tab.run().expect("drain");
+    assert_eq!(tab.eval("String(window.slowDone)").expect("done"), "true");
     slow_server.join().expect("slow server");
-    page_server.join().expect("page server");
+    server.join().expect("server");
     let _ = std::fs::remove_dir_all(data_home);
 }

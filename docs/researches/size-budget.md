@@ -190,7 +190,7 @@ code on the old M1 connector. Accepted.
   confirm at the next parse+query probe.
 
 - DOM→JS binding glue: hundreds of rquickjs classes add up; keep dispatch tables data-driven.
-- Host protocol stack: **superseded** — [ADR 0012](../adrs/0012-host-protocol-and-cli-stack.md) accepts axum + clap and retires the `http1` crate. The renderer path still takes no web-server stack and no CLI crate; its only serialization is the value-only IPC seam, and its runtime stays current-thread `rt`+`time`.
+- Browser-process protocol stack: **superseded** — [ADR 0012](../adrs/0012-host-protocol-and-cli-stack.md) accepts axum + clap and retires the `http1` crate. The renderer path still takes no web-server stack and no CLI crate; its only serialization is the value-only IPC seam, and its runtime stays current-thread `rt`+`time`.
 - A11y walker (accname computation, role mapping): budget ~100–200 KB, fine, but measure.
 - When the deferred stealth milestone lands net on btls ([ADR 0006](../adrs/0006-net-transport.md)): pin the crate family like html5ever (its BoringSSL fork is wreq-ecosystem); impersonation presets go stale with every Chrome release — a stale preset is itself a detection signal, so bump discipline applies to persona tables, not just crates.
 - Re-measure marginals at every milestone; regressions must justify themselves in bytes.
@@ -212,40 +212,40 @@ not drop it. Empty `main` re-measured at 284 KB (290912 bytes).
 | `futures` `LocalPool` | ready future only (no timer, no I/O) | **+12 KB** |
 
 Tokio 1.53 default features are empty; `full` is the fat switch. smol is not smaller
-than current-thread tokio with timers. The page thread therefore uses Tokio
-current-thread `rt`+`time` (~+66 KB); HTML jobs stay in our queue; never `full` /
+than current-thread tokio with timers. The tab thread therefore uses Tokio
+current-thread `rt`+`time` (~+66 KB); page tasks stay in our queue; never `full` /
 smol / axum / hyper ([engine charter](../adrs/0007-engine-charter.md)). The original
 per-page `spawn_blocking` choice was superseded on 2026-09-10 by one browser-owned,
 bounded blocking network executor. Add Tokio `net` only if a later milestone needs
 async sockets on the page runtime.
 
-## Milestone: page thread in `browser` (2026-08-27)
+## Milestone: tab thread in `browser` (2026-08-27)
 
 At this historical checkpoint, `browser` depended on Tokio 1.53
 `rt`+`time`+`macros` (`macros` is compile-only) and rquickjs 0.12.2
 (`std`+`macro`). `Page::run` was the current-thread waiter and fetch used
-`JoinSet::spawn_blocking`. The stub `tinybrowser` CLI did not call `Page`, so tuned
+`JoinSet::spawn_blocking`. The stub `tinybrowser` CLI did not call `Tab`, so tuned
 LTO shipped **294944 bytes** (~288 KB). Both the stub CLI and per-page blocking-task
 ownership were superseded by later milestones below.
 
 ## Milestone: reviewed page engine (2026-09-06)
 
 Tokio now enables only `rt` and `time`; rquickjs enables only `std`. Build with
-`nix develop --command cargo build --release --example page_probe --bin tinybrowser`.
+`nix develop --command cargo build --release --example tab_probe --bin tinybrowser`.
 With rustc 1.98.0 and the committed stripped x86_64 release profile:
 
 | Artifact | Bytes |
 | --- | ---: |
 | CLI stub (`target/release/tinybrowser`) | 294,944 |
-| Page engine (`target/release/examples/page_probe`) | 2,831,904 |
+| page engine (`target/release/examples/tab_probe`) | 2,831,904 |
 
-The [probe](../../examples/page_probe.rs) references HTML parsing, navigation,
+The [probe](../../examples/tab_probe.rs) references HTML parsing, navigation,
 QuickJS eval, timers, and the page loop, so LTO retains the engine. Running it
 without arguments prints `42`; passing an HTTP URL also navigates before eval.
 Native TLS still uses the dynamically linked Nix OpenSSL. This is a real engine
 checkpoint below 5 MB, not a finished browser or static distribution measurement.
 
-## Milestone: WPT WebDriver host (2026-09-08)
+## Milestone: WPT WebDriver endpoint (2026-09-08)
 
 The CLI now serves in-process classic WebDriver (`tinybrowser --webdriver=PORT`),
 so LTO keeps the page engine, `rquickjs` `classes`+`macro`, and `serde_json`.
@@ -254,10 +254,10 @@ rustc 1.98.0, committed stripped x86_64 release profile:
 | Artifact | Bytes |
 | --- | ---: |
 | CLI (`target/release/tinybrowser`) | 3,068,320 |
-| Page engine (`target/release/examples/page_probe`) | 2,975,936 |
+| page engine (`target/release/examples/tab_probe`) | 2,975,936 |
 
-Previous CLI stub (294,944) did not reference `Page`. The probe grew ~144 KB
-from host-object classes and classic-script loading. Still under 5 MB.
+Previous CLI stub (294,944) did not reference `Tab`. The probe grew ~144 KB
+from platform-object classes and classic-script loading. Still under 5 MB.
 
 ## Milestone: HEAD re-measure (2026-09-09)
 
@@ -267,9 +267,9 @@ rustc 1.98.0, same committed profile:
 | Artifact | Bytes |
 | --- | ---: |
 | CLI (`target/release/tinybrowser`) | 3,076,896 |
-| Page engine (`target/release/examples/page_probe`) | 2,978,496 |
+| page engine (`target/release/examples/tab_probe`) | 2,978,496 |
 
-CLI grew 8,576 bytes from the 2026-09-08 WebDriver-host row (3,068,320).
+CLI grew 8,576 bytes from the 2026-09-08 WebDriver endpoint row (3,068,320).
 The probe grew 2,560 bytes. Headroom to the 5,000,000-byte limit remains about
 1.9 MB.
 
@@ -277,13 +277,13 @@ The probe grew 2,560 bytes. Headroom to the 5,000,000-byte limit remains about
 
 Rebuild after the dirty-tree slices (actor/Browser, ProfileStore, daemon, `cdp`,
 CLI, WebDriver adapter, WebIDL branding, WPT temp XDG profile):
-`cargo build --release --example page_probe --bin tinybrowser`. rustc 1.98.0,
+`cargo build --release --example tab_probe --bin tinybrowser`. rustc 1.98.0,
 committed stripped x86_64 release profile. No axum, hyper, or Tokio `full`.
 
 | Artifact | Bytes |
 | --- | ---: |
 | CLI (`target/release/tinybrowser`) | 3,398,512 |
-| Page engine (`target/release/examples/page_probe`) | 3,013,552 |
+| page engine (`target/release/examples/tab_probe`) | 3,013,552 |
 
 CLI grew 321,616 bytes from the HEAD re-measure (3,076,896). The probe grew
 35,056 bytes. Headroom to the 5,000,000-byte limit remains about 1.60 MB.
@@ -291,16 +291,16 @@ CLI grew 321,616 bytes from the HEAD re-measure (3,076,896). The probe grew
 ## Milestone: autonomous page architecture (2026-09-10)
 
 Rebuild after incremental parser/script execution, WHATWG byte decoding,
-interface-correct live DOM collections, autonomous page actors, typed CDP load
+interface-correct live DOM collections, autonomous tab actors, typed CDP load
 events, bounded browser-owned networking, QuickJS limits, and durable locked
 profiles. Command: `nix develop --command cargo build --release --offline
---example page_probe --bin tinybrowser`; rustc 1.98.0, committed stripped x86_64
+--example tab_probe --bin tinybrowser`; rustc 1.98.0, committed stripped x86_64
 release profile.
 
 | Artifact | Bytes | Headroom to 5,000,000 |
 | --- | ---: | ---: |
 | CLI (`target/release/tinybrowser`) | 3,613,712 | 1,386,288 |
-| Page engine (`target/release/examples/page_probe`) | 3,325,968 | 1,674,032 |
+| page engine (`target/release/examples/tab_probe`) | 3,325,968 | 1,674,032 |
 
 Against the immediate pre-refactor measurement, the CLI grew 207,072 bytes and
 the page probe grew 308,608 bytes. Most of the new retained code is the
@@ -308,23 +308,23 @@ the page probe grew 308,608 bytes. Most of the new retained code is the
 framework or multi-thread async runtime. The shipping executable remains 27.7%
 below the hard limit.
 
-## Milestone: axum + clap host stack (2026-09-10)
+## Milestone: axum + clap browser-process stack (2026-09-10)
 
 [ADR 0012](../adrs/0012-host-protocol-and-cli-stack.md) replaced the `http1`
 crate with axum (CDP HTTP + WebSocket, WebDriver REST) and the hand-rolled
 argument parser with clap; the size cap moved to 10 MB in the same decision.
-Command: `nix develop --command cargo build --release --example page_probe --bin
+Command: `nix develop --command cargo build --release --example tab_probe --bin
 tinybrowser`; rustc 1.98.0, committed stripped x86_64 release profile.
 
 | Artifact | Bytes | Headroom to 10,000,000 |
 | --- | ---: | ---: |
 | CLI (`target/release/tinybrowser`) | 4,421,008 | 5,578,992 |
-| Page engine (`target/release/examples/page_probe`) | 3,389,088 | 6,610,912 |
+| page engine (`target/release/examples/tab_probe`) | 3,389,088 | 6,610,912 |
 
 The CLI grew 807,296 bytes over the autonomous-page row (3,613,712). axum +
 hyper + tower + clap plus the Tokio multi-thread/net server runtime account for
 it. The probe grew 63,120 bytes (3,325,968): workspace feature unification now
-builds its Tokio with the `net`/`rt-multi-thread` features the host stack
+builds its Tokio with the `net`/`rt-multi-thread` features the browser-process stack
 enables. The renderer path still takes no web-server stack and no CLI crate; its
 only serialization is the value-only IPC seam (`serde` in `protocol.rs`/`process.rs`),
 and the renderer runtime stays current-thread `rt`+`time`.
@@ -333,20 +333,20 @@ and the renderer runtime stays current-thread `rt`+`time`.
 
 [ADR 0011](../adrs/0011-renderer-processes-per-site.md) split the engine into
 the `renderer` crate (parser, `Dom`, QuickJS, value-only seam) and the `browser`
-host (Browser, tab `Page`, navigation, `NetworkSession`, renderer registry).
-The host spawns one `--renderer` process per site instance; tests use the
+browser side (Browser, tab `Tab`, navigation, `NetworkSession`, renderer registry).
+The browser process spawns one `--renderer` process per site instance; tests use the
 in-process local backend. Command: `nix develop --command cargo build --release
---example page_probe --bin tinybrowser`; rustc 1.98.0, committed stripped
+--example tab_probe --bin tinybrowser`; rustc 1.98.0, committed stripped
 x86_64 release profile.
 
 | Artifact | Bytes | Headroom to 10,000,000 |
 | --- | ---: | ---: |
 | CLI (`target/release/tinybrowser`) | 4,606,592 | 5,393,408 |
-| Page engine (`target/release/examples/page_probe`) | 3,582,736 | 6,417,264 |
+| page engine (`target/release/examples/tab_probe`) | 3,582,736 | 6,417,264 |
 
 The CLI grew 185,584 bytes over the axum+clap row (4,421,008): serde-derive IPC
 types, the renderer link/registry, and process spawn/IO. The probe grew 193,648
-bytes (3,389,088) because it now links the same host+renderer pair the shipping
+bytes (3,389,088) because it now links the same browser+renderer pair the shipping
 binary does. Renderer `serde` is confined to the `protocol` module. QuickJS
 stays per realm; the renderer process is the isolation unit.
 
@@ -358,7 +358,7 @@ failures; same command and profile as the milestone above.
 | Artifact | Bytes | Headroom to 10,000,000 |
 | --- | ---: | ---: |
 | CLI (`target/release/tinybrowser`) | 4,632,736 | 5,367,264 |
-| Page engine (`target/release/examples/page_probe`) | 3,600,016 | 6,399,984 |
+| page engine (`target/release/examples/tab_probe`) | 3,600,016 | 6,399,984 |
 
 Changes: non-finite JS numbers are string-encoded in the IPC seam, the
 `--renderer` child sends a `Ready` handshake, a dead renderer drains pending

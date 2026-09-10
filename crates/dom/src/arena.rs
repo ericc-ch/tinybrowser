@@ -115,7 +115,7 @@ impl<'a> NodeRef<'a> {
 ///
 /// [`Send`] but deliberately not [`Sync`]: a `Dom` may be handed between
 /// workers, but two threads can never touch one simultaneously (one worker
-/// per page; see the dom-layer wayfinding tickets). The marker field below is
+/// per document; see the dom-layer wayfinding tickets). The marker field below is
 /// what suppresses the otherwise-auto-derived `Sync`.
 #[derive(Debug)]
 pub struct Dom {

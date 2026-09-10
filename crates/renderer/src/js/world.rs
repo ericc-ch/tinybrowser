@@ -1,4 +1,4 @@
-//! Shared page world for the JS host.
+//! Shared JS world for the renderer.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -10,7 +10,7 @@ use rquickjs::{Object, Persistent, Value, function::Function};
 use url::Url;
 
 use crate::Parsed;
-use crate::protocol::HostServices;
+use crate::protocol::BrowserServices;
 
 pub(crate) struct Listener {
     pub typ: String,
@@ -26,7 +26,7 @@ pub(crate) enum EventTargetKey {
 pub(crate) struct World {
     pub parsed: Option<Parsed>,
     pub document_url: Url,
-    pub services: Arc<dyn HostServices>,
+    pub services: Arc<dyn BrowserServices>,
     pub pending_cancels: Vec<i32>,
     pub pending_html_writes: Vec<String>,
     pub parser_active: bool,
@@ -37,7 +37,7 @@ pub(crate) struct World {
 }
 
 impl World {
-    pub(crate) fn new(services: Arc<dyn HostServices>, document_url: Url) -> Self {
+    pub(crate) fn new(services: Arc<dyn BrowserServices>, document_url: Url) -> Self {
         Self {
             parsed: None,
             document_url,

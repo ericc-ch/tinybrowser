@@ -1,6 +1,6 @@
-//! One document: HTML jobs we own, Tokio current-thread as the waiter, host
-//! services for dials and cookies. The renderer owns the document; the host
-//! owns the tab and drives navigation
+//! One document: HTML tasks we own, Tokio current-thread as the waiter, browser
+//! services for dials and cookies. The renderer owns the document; the browser
+//! process owns the tab and drives navigation
 //! ([ADR 0011](../../../../docs/adrs/0011-renderer-processes-per-site.md)).
 
 use std::cell::{Ref, RefCell};
@@ -18,7 +18,7 @@ use tokio::time::Instant;
 use url::Url;
 
 use crate::js::World;
-use crate::protocol::{HostServices, Mount, PageError, PageEvent, ScriptFailure};
+use crate::protocol::{BrowserServices, Mount, ScriptFailure, TabError, TabEvent};
 use crate::{ActiveParser, Parsed};
 
 mod dial;
@@ -32,7 +32,7 @@ pub(crate) const FETCH_BODY_LIMIT: usize = 1_048_576;
 
 const MAX_QUEUED_JS_FETCHES: usize = 256;
 
-enum HtmlJob {
+enum Task {
     Timer(u32),
     DialFinished(CompletedDial),
     DialFailed(DialFail),
@@ -73,28 +73,28 @@ pub(crate) enum DialFail {
     ClassicScript { epoch: u64 },
 }
 
-struct HostTimer {
+struct Timer {
     id: u32,
     when: Instant,
     fired: bool,
 }
 
-/// One document: tree, HTML job list, `QuickJS` realm, and host services.
+/// One document: tree, task list, `QuickJS` realm, and browser services.
 pub struct Document {
-    services: Arc<dyn HostServices>,
+    services: Arc<dyn BrowserServices>,
     world: Rc<RefCell<World>>,
     url: Url,
     content_language: Option<String>,
-    jobs: VecDeque<HtmlJob>,
-    timers: Vec<HostTimer>,
+    tasks: VecDeque<Task>,
+    timers: Vec<Timer>,
     next_timer_id: u32,
     dial_tx: Sender<Result<CompletedDial, DialFail>>,
     dial_rx: Receiver<Result<CompletedDial, DialFail>>,
     dial_pool: DialPool,
     in_flight_dials: usize,
     queued_dials: Vec<QueuedDial>,
-    events: Vec<PageEvent>,
-    js: Option<crate::js::JsHost>,
+    events: Vec<TabEvent>,
+    js: Option<crate::js::JsRealm>,
     js_timer_slots: HashMap<u32, i32>,
     js_epoch: u64,
     active_parser: Option<ActiveParser>,
@@ -114,11 +114,11 @@ impl Drop for Document {
 impl Document {
     /// An empty document whose dials and cookies go through `services`.
     #[must_use]
-    pub fn new(services: Arc<dyn HostServices>) -> Self {
+    pub fn new(services: Arc<dyn BrowserServices>) -> Self {
         Self::with_stop(services, Arc::new(Stop::new()))
     }
 
-    pub(crate) fn with_stop(services: Arc<dyn HostServices>, stop: Arc<Stop>) -> Self {
+    pub(crate) fn with_stop(services: Arc<dyn BrowserServices>, stop: Arc<Stop>) -> Self {
         let document_url = Url::parse("about:blank").expect("about:blank is a valid URL");
         let (dial_tx, dial_rx) = mpsc::channel();
         Self {
@@ -129,7 +129,7 @@ impl Document {
             services,
             url: document_url,
             content_language: None,
-            jobs: VecDeque::new(),
+            tasks: VecDeque::new(),
             timers: Vec::new(),
             next_timer_id: 1,
             dial_tx,
@@ -181,9 +181,9 @@ impl Document {
     ///
     /// # Errors
     ///
-    /// [`PageError::InvalidUrl`] when `url` is not an absolute URL.
-    pub fn set_document_url(&mut self, url: &str) -> Result<(), PageError> {
-        self.url = Url::parse(url).map_err(|_| PageError::InvalidUrl { spec: url.into() })?;
+    /// [`TabError::InvalidUrl`] when `url` is not an absolute URL.
+    pub fn set_document_url(&mut self, url: &str) -> Result<(), TabError> {
+        self.url = Url::parse(url).map_err(|_| TabError::InvalidUrl { spec: url.into() })?;
         self.world.borrow_mut().document_url = self.url.clone();
         Ok(())
     }
@@ -203,13 +203,13 @@ impl Document {
     ///
     /// # Errors
     ///
-    /// [`PageError::Script`] when the engine cannot start or the script throws.
-    pub fn eval(&mut self, source: &str) -> Result<String, PageError> {
+    /// [`TabError::Script`] when the engine cannot start or the script throws.
+    pub fn eval(&mut self, source: &str) -> Result<String, TabError> {
         self.ensure_js()?;
         let Some(js) = self.js.as_ref() else {
-            return Err(PageError::Script(ScriptFailure::HostMissing));
+            return Err(TabError::Script(ScriptFailure::HostMissing));
         };
-        let out = js.eval(source).map_err(PageError::from);
+        let out = js.eval(source).map_err(TabError::from);
         self.adopt_js_work();
         out
     }
@@ -218,8 +218,8 @@ impl Document {
     ///
     /// # Errors
     ///
-    /// [`PageError::Script`] when the engine cannot start or the script throws.
-    pub fn execute_script(&mut self, source: &str) -> Result<ScriptValue, PageError> {
+    /// [`TabError::Script`] when the engine cannot start or the script throws.
+    pub fn execute_script(&mut self, source: &str) -> Result<ScriptValue, TabError> {
         self.execute_script_deadline(source, None)
     }
 
@@ -227,21 +227,21 @@ impl Document {
         &mut self,
         source: &str,
         deadline: Option<WallClock>,
-    ) -> Result<ScriptValue, PageError> {
+    ) -> Result<ScriptValue, TabError> {
         self.ensure_js()?;
         let Some(js) = self.js.as_ref() else {
-            return Err(PageError::Script(ScriptFailure::HostMissing));
+            return Err(TabError::Script(ScriptFailure::HostMissing));
         };
         let out = js
             .eval_value_deadline(source, deadline)
-            .map_err(PageError::from);
+            .map_err(TabError::from);
         self.adopt_js_work();
         out
     }
 
     /// Jobs that have already run, in order.
     #[must_use]
-    pub fn events(&self) -> &[PageEvent] {
+    pub fn events(&self) -> &[TabEvent] {
         &self.events
     }
 
@@ -266,11 +266,11 @@ impl Document {
         self.start_document(input);
     }
 
-    fn ensure_js(&mut self) -> Result<(), PageError> {
+    fn ensure_js(&mut self) -> Result<(), TabError> {
         if self.js.is_none() {
             self.js = Some(
-                crate::js::JsHost::new(self.world.clone(), Arc::clone(&self.stop))
-                    .map_err(PageError::from)?,
+                crate::js::JsRealm::new(self.world.clone(), Arc::clone(&self.stop))
+                    .map_err(TabError::from)?,
             );
         }
         Ok(())
@@ -319,7 +319,7 @@ impl Document {
                     if self.js.is_none() {
                         self.world.borrow_mut().replace_document(parsed);
                         if self.ensure_js().is_err() {
-                            self.events.push(PageEvent::ScriptFailed);
+                            self.events.push(TabEvent::ScriptFailed);
                             self.sync_parser_from_world();
                             continue;
                         }
@@ -364,7 +364,7 @@ impl Document {
                     if self.js.is_none() {
                         self.world.borrow_mut().replace_document(parsed);
                         if self.ensure_js().is_err() {
-                            self.events.push(PageEvent::ScriptFailed);
+                            self.events.push(TabEvent::ScriptFailed);
                             return;
                         }
                     } else {
@@ -378,12 +378,12 @@ impl Document {
         }
     }
 
-    pub(in crate::document) fn resolve_dial_url(&self, spec: &str) -> Result<Url, PageError> {
+    pub(in crate::document) fn resolve_dial_url(&self, spec: &str) -> Result<Url, TabError> {
         let url = Url::parse(spec)
             .or_else(|_| self.base_url().join(spec))
-            .map_err(|_| PageError::InvalidUrl { spec: spec.into() })?;
+            .map_err(|_| TabError::InvalidUrl { spec: spec.into() })?;
         if url.scheme() != "http" && url.scheme() != "https" {
-            return Err(PageError::InvalidUrl { spec: spec.into() });
+            return Err(TabError::InvalidUrl { spec: spec.into() });
         }
         Ok(url)
     }
@@ -410,7 +410,7 @@ impl Document {
                 id,
                 epoch,
             } => {
-                self.events.push(PageEvent::Fetch { status });
+                self.events.push(TabEvent::Fetch { status });
                 if epoch == self.js_epoch {
                     let body = String::from_utf8_lossy(&body);
                     self.settle_js_fetch(id, true, i32::from(status), &body);
@@ -421,7 +421,7 @@ impl Document {
                 body,
                 epoch,
             } => {
-                self.events.push(PageEvent::Fetch { status });
+                self.events.push(TabEvent::Fetch { status });
                 if epoch == self.js_epoch {
                     self.classic_fetch_in_flight = false;
                     if (200..300).contains(&status) {
@@ -437,7 +437,7 @@ impl Document {
     }
 
     pub(in crate::document) fn fail_dial(&mut self, fail: DialFail) {
-        self.events.push(PageEvent::FetchFailed);
+        self.events.push(TabEvent::FetchFailed);
         match fail {
             DialFail::JsFetch { id, epoch } => {
                 if epoch == self.js_epoch {
@@ -490,7 +490,7 @@ impl Document {
             return;
         }
         self.world.borrow_mut().document_ready = true;
-        self.events.push(PageEvent::Load);
+        self.events.push(TabEvent::Load);
         if let Some(js) = &self.js {
             note_script(&mut self.events, js.fire_load().is_err());
         }
@@ -498,13 +498,13 @@ impl Document {
     }
 }
 
-pub(crate) fn note_script(events: &mut Vec<PageEvent>, failed: bool) {
+pub(crate) fn note_script(events: &mut Vec<TabEvent>, failed: bool) {
     if failed {
-        events.push(PageEvent::ScriptFailed);
+        events.push(TabEvent::ScriptFailed);
     }
 }
 
-impl From<crate::js::JsError> for PageError {
+impl From<crate::js::JsError> for TabError {
     fn from(err: crate::js::JsError) -> Self {
         match err {
             crate::js::JsError::Engine(message) => Self::Script(ScriptFailure::Engine { message }),
@@ -516,7 +516,7 @@ impl From<crate::js::JsError> for PageError {
 
 type DialJob = Box<dyn FnOnce() + Send + 'static>;
 
-/// Bounded workers for blocking [`HostServices::dial`] calls.
+/// Bounded workers for blocking [`BrowserServices::dial`] calls.
 struct DialPool {
     tx: SyncSender<DialJob>,
 }
@@ -531,29 +531,29 @@ impl DialPool {
             let receiver = Arc::clone(&receiver);
             std::thread::spawn(move || {
                 loop {
-                    let job = receiver
+                    let work = receiver
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
                         .recv();
-                    let Ok(job) = job else {
+                    let Ok(work) = work else {
                         return;
                     };
-                    job();
+                    work();
                 }
             });
         }
         Self { tx }
     }
 
-    fn try_submit(&self, job: impl FnOnce() + Send + 'static) -> Result<(), ()> {
-        match self.tx.try_send(Box::new(job)) {
+    fn try_submit(&self, work: impl FnOnce() + Send + 'static) -> Result<(), ()> {
+        match self.tx.try_send(Box::new(work)) {
             Ok(()) => Ok(()),
             Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) => Err(()),
         }
     }
 }
 
-/// Page-stop flag shared by the renderer loop, JS interrupt handler, and dials.
+/// Document-stop flag shared by the renderer loop, JS interrupt handler, and dials.
 pub struct Stop {
     flag: AtomicBool,
     waker: Mutex<Option<Waker>>,

@@ -1,8 +1,8 @@
 //! Renderer crate: the page engine for one document — HTML parser,
-//! `Dom`, `QuickJS` — behind the value-only host seam.
+//! `Dom`, `QuickJS` — behind the value-only browser seam.
 //!
 //! [ADR 0011](../../../docs/adrs/0011-renderer-processes-per-site.md): the
-//! renderer owns `Document` and never links `net`; the host owns `Page`, the
+//! renderer owns `Document` and never links `net`; the browser process owns `Tab`, the
 //! tab, navigation, network, and cookies. The same [`run`] loop backs the
 //! in-process backend and the `--renderer` child.
 
@@ -30,8 +30,8 @@ mod remote;
 pub use document::{Document, ScriptValue, Stop};
 pub use process::serve_stdio;
 pub use protocol::{
-    Command, DialKind, DialOutcome, DialRequest, FromRenderer, HostServices, Mount, PageError,
-    PageEvent, Reply, ScriptFailure, ServiceCall, ServiceReply, ToRenderer,
+    BrowserServices, Command, DialKind, DialOutcome, DialRequest, FromRenderer, Mount, Reply,
+    ScriptFailure, ServiceCall, ServiceReply, TabError, TabEvent, ToRenderer,
 };
 pub use remote::RemoteValue;
 
@@ -167,7 +167,7 @@ fn fragment_context_name(spec: &str) -> QualName {
 pub fn run(
     inbox: &Receiver<ToRenderer>,
     outbox: &Sender<FromRenderer>,
-    services: Arc<dyn HostServices>,
+    services: Arc<dyn BrowserServices>,
 ) {
     run_with_stop(inbox, outbox, services, &Arc::new(Stop::new()));
 }
@@ -177,7 +177,7 @@ pub fn run(
 pub fn run_with_stop(
     inbox: &Receiver<ToRenderer>,
     outbox: &Sender<FromRenderer>,
-    services: Arc<dyn HostServices>,
+    services: Arc<dyn BrowserServices>,
     stop: &Arc<Stop>,
 ) {
     let mut document = Document::with_stop(services, Arc::clone(stop));

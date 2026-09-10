@@ -1,7 +1,7 @@
 //! Host side of the renderer seam: registry, handles, and routing pumps.
 //!
 //! [ADR 0011](../../../docs/adrs/0011-renderer-processes-per-site.md): the
-//! handle is value-only; replies, events, and host-service calls cross a
+//! handle is value-only; replies, events, and browser-service calls cross a
 //! channel pair (local backend) or a pipe (process backend).
 
 use std::collections::HashMap;
@@ -14,13 +14,13 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use renderer::{
-    Command as RendererCommand, FromRenderer, HostServices, PageError, PageEvent, Reply,
-    ServiceCall, ServiceReply, Stop, ToRenderer,
+    BrowserServices, Command as RendererCommand, FromRenderer, Reply, ServiceCall, ServiceReply,
+    Stop, TabError, TabEvent, ToRenderer,
 };
 use url::Url;
 
 use crate::network::FetchHandle;
-use crate::site::SiteKey;
+use crate::site::Site;
 
 /// Upper bound on one request to a renderer. The renderer budget is seconds;
 /// this is a last-resort wake-up if its reply path dies silently.
@@ -45,10 +45,10 @@ pub struct RendererId(u64);
 /// Value-only handle to one renderer.
 pub struct RendererHandle {
     id: RendererId,
-    site: SiteKey,
+    site: Site,
     sink: Sink,
     pending: Arc<Mutex<HashMap<u64, Sender<Reply>>>>,
-    subscribers: Arc<Mutex<Vec<Sender<PageEvent>>>>,
+    subscribers: Arc<Mutex<Vec<Sender<TabEvent>>>>,
     next_request: Arc<AtomicU64>,
     stop: Option<Arc<Stop>>,
     child: Option<Arc<Mutex<Child>>>,
@@ -65,7 +65,7 @@ impl RendererHandle {
 
     /// Site instance this renderer is locked to.
     #[must_use]
-    pub fn site(&self) -> &SiteKey {
+    pub fn site(&self) -> &Site {
         &self.site
     }
 
@@ -73,8 +73,8 @@ impl RendererHandle {
     ///
     /// # Errors
     ///
-    /// [`PageError::ActorStopped`] when the renderer is gone.
-    pub fn request(&self, command: RendererCommand) -> Result<Reply, PageError> {
+    /// [`TabError::ActorStopped`] when the renderer is gone.
+    pub fn request(&self, command: RendererCommand) -> Result<Reply, TabError> {
         let id = self.next_request.fetch_add(1, Ordering::Relaxed);
         let (reply_tx, reply_rx) = mpsc::channel();
         self.pending
@@ -86,7 +86,7 @@ impl RendererHandle {
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .remove(&id);
-            return Err(PageError::ActorStopped);
+            return Err(TabError::ActorStopped);
         }
         if let Ok(reply) = reply_rx.recv_timeout(REQUEST_TIMEOUT) {
             return Ok(reply);
@@ -95,12 +95,12 @@ impl RendererHandle {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .remove(&id);
-        Err(PageError::ActorStopped)
+        Err(TabError::ActorStopped)
     }
 
     /// Subscribes to renderer document events after this call.
     #[must_use]
-    pub fn subscribe(&self) -> Receiver<PageEvent> {
+    pub fn subscribe(&self) -> Receiver<TabEvent> {
         let (tx, rx) = mpsc::channel();
         self.subscribers
             .lock()
@@ -155,7 +155,7 @@ impl Drop for RendererHandle {
 pub struct RendererRegistry {
     backend: Renderers,
     fetch: FetchHandle,
-    idle: Mutex<HashMap<SiteKey, Vec<Arc<RendererHandle>>>>,
+    idle: Mutex<HashMap<Site, Vec<Arc<RendererHandle>>>>,
     next: AtomicU64,
 }
 
@@ -174,7 +174,7 @@ impl RendererRegistry {
     /// # Errors
     ///
     /// Process spawn failure.
-    pub fn acquire(&self, site: &SiteKey) -> io::Result<Arc<RendererHandle>> {
+    pub fn acquire(&self, site: &Site) -> io::Result<Arc<RendererHandle>> {
         if let Some(handle) = self
             .idle
             .lock()
@@ -200,7 +200,7 @@ impl RendererRegistry {
     }
 
     /// Returns a renderer to the idle pool, keyed by its site. Opaque
-    /// per-page instances are dropped instead: no other page can reuse them.
+    /// per-tab instances are dropped instead: no other tab can reuse them.
     pub fn release(&self, handle: Arc<RendererHandle>) {
         if handle.site().is_opaque() {
             return;
@@ -254,8 +254,8 @@ enum Incoming {
 
 fn spawn_local(
     id: RendererId,
-    site: SiteKey,
-    services: Arc<dyn HostServices>,
+    site: Site,
+    services: Arc<dyn BrowserServices>,
     fetch: FetchHandle,
 ) -> RendererHandle {
     let (to_tx, to_rx) = mpsc::channel::<ToRenderer>();
@@ -302,7 +302,7 @@ fn spawn_local(
     }
 }
 
-fn spawn_process(id: RendererId, site: SiteKey, fetch: FetchHandle) -> io::Result<RendererHandle> {
+fn spawn_process(id: RendererId, site: Site, fetch: FetchHandle) -> io::Result<RendererHandle> {
     let mut child = Command::new(std::env::current_exe()?)
         .arg("--renderer")
         .stdin(Stdio::piped())
@@ -367,7 +367,7 @@ fn pump_loop(
     incoming: Incoming,
     sink: &Sink,
     pending: &Arc<Mutex<HashMap<u64, Sender<Reply>>>>,
-    subscribers: &Arc<Mutex<Vec<Sender<PageEvent>>>>,
+    subscribers: &Arc<Mutex<Vec<Sender<TabEvent>>>>,
     fetch: &FetchHandle,
     child: Option<&Arc<Mutex<Child>>>,
     ready: Option<Sender<bool>>,
@@ -422,7 +422,7 @@ fn route(
     message: FromRenderer,
     sink: &Sink,
     pending: &Arc<Mutex<HashMap<u64, Sender<Reply>>>>,
-    subscribers: &Arc<Mutex<Vec<Sender<PageEvent>>>>,
+    subscribers: &Arc<Mutex<Vec<Sender<TabEvent>>>>,
     fetch: &FetchHandle,
     offload_dials: bool,
 ) {

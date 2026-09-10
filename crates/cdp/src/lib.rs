@@ -6,6 +6,11 @@
 //! [ADR 0012](../../../docs/adrs/0012-host-protocol-and-cli-stack.md): axum
 //! serves the loopback HTTP and WebSocket endpoints. The synchronous
 //! [`Client`] used by the CLI and tests stays on tungstenite.
+//!
+//! Names: the wire object is a CDP **page target** (`"type": "page"`,
+//! `Page.*`); it maps to a [`browser::TabHandle`]. CDP's experimental **tab
+//! target** is the browser-UI container and is not modeled
+//! ([ADR 0013](../../../docs/adrs/0013-vocabulary-and-process-names.md)).
 
 use std::collections::{HashMap, VecDeque};
 use std::io;
@@ -20,7 +25,7 @@ use axum::http::StatusCode;
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Json, Response};
 use axum::routing::get;
-use browser::{BrowserHandle, PageError, PageEvent, PageHandle, PageId, RemoteValue};
+use browser::{BrowserHandle, RemoteValue, TabError, TabEvent, TabHandle, TabId};
 use serde_json::{Value, json};
 use tokio::sync::watch;
 use tungstenite::client::IntoClientRequest;
@@ -78,9 +83,9 @@ pub fn serve(listener: &TcpListener, browser: &BrowserHandle) -> io::Result<()> 
                             return (StatusCode::BAD_REQUEST, "invalid page target")
                                 .into_response();
                         };
-                        match state.browser.page(PageId::new(id)) {
-                            Ok(page) => {
-                                ws.on_upgrade(move |socket| run_socket(socket, state, Some(page)))
+                        match state.browser.tab(TabId::new(id)) {
+                            Ok(tab) => {
+                                ws.on_upgrade(move |socket| run_socket(socket, state, Some(tab)))
                             }
                             Err(_) => {
                                 (StatusCode::NOT_FOUND, "unknown page target").into_response()
@@ -109,7 +114,7 @@ struct AppState {
     stop: watch::Sender<bool>,
 }
 
-/// Discovery walks page actors; keep it off the async workers ([ADR 0012]).
+/// Discovery walks tab actors; keep it off the async workers ([ADR 0012]).
 ///
 /// [ADR 0012]: ../../../docs/adrs/0012-host-protocol-and-cli-stack.md
 async fn discovery(State(state): State<AppState>) -> Response {
@@ -145,12 +150,12 @@ fn version_json(state: &AppState) -> Value {
 
 fn list_json(state: &AppState) -> Value {
     let mut targets = Vec::new();
-    for id in state.browser.pages() {
+    for id in state.browser.tabs() {
         let url = state
             .browser
-            .page(id)
+            .tab(id)
             .ok()
-            .and_then(|page| page.document_url().ok())
+            .and_then(|tab| tab.document_url().ok())
             .unwrap_or_else(|| "about:blank".into());
         targets.push(json!({
             "id": id.to_string(),
@@ -304,21 +309,21 @@ fn connect_ws(addr: SocketAddr, path: &str) -> io::Result<Client> {
 }
 
 /// Per-WebSocket protocol state. Commands dispatch synchronously against
-/// [`PageHandle`]; the socket loop is async.
+/// [`TabHandle`]; the socket loop is async.
 struct Conn {
     browser: BrowserHandle,
-    sessions: HashMap<String, PageHandle>,
+    sessions: HashMap<String, TabHandle>,
     next_session: u64,
-    page: Option<PageHandle>,
+    tab: Option<TabHandle>,
     stop: watch::Sender<bool>,
-    subscriptions: Vec<PageSubscription>,
+    subscriptions: Vec<TabSubscription>,
     clock_origin: Instant,
 }
 
-struct PageSubscription {
-    page_id: PageId,
+struct TabSubscription {
+    tab_id: TabId,
     session: Option<String>,
-    events: Receiver<PageEvent>,
+    events: Receiver<TabEvent>,
 }
 
 /// One text reply plus whether the socket closes after it.
@@ -333,7 +338,7 @@ impl Conn {
         let mut messages = Vec::new();
         for subscription in &self.subscriptions {
             for event in subscription.events.try_iter() {
-                if event == PageEvent::Load {
+                if event == TabEvent::Load {
                     let mut message = json!({
                         "method": "Page.loadEventFired",
                         "params": {"timestamp": self.clock_origin.elapsed().as_secs_f64()},
@@ -419,15 +424,15 @@ impl Conn {
             return Err(DispatchError::Failed("browser closed".into()));
         }
         if let Some(session) = session {
-            let page = self
+            let tab = self
                 .sessions
                 .get(session)
                 .cloned()
                 .ok_or_else(|| DispatchError::Failed("unknown session".into()))?;
-            return self.dispatch_page_method(method, params, &page, Some(session));
+            return self.dispatch_tab_method(method, params, &tab, Some(session));
         }
-        if let Some(page) = self.page.clone() {
-            return self.dispatch_page_method(method, params, &page, None);
+        if let Some(tab) = self.tab.clone() {
+            return self.dispatch_tab_method(method, params, &tab, None);
         }
         match method {
             "Browser.getVersion" => Ok(json!({
@@ -443,14 +448,14 @@ impl Conn {
                     .map_err(|error| DispatchError::Failed(error.to_string()))?;
                 self.sessions.clear();
                 self.subscriptions.clear();
-                self.page = None;
+                self.tab = None;
                 let _result = self.stop.send(true);
                 Ok(json!({}))
             }
             "Target.getTargets" => {
                 let target_infos: Vec<Value> = self
                     .browser
-                    .pages()
+                    .tabs()
                     .into_iter()
                     .map(|id| target_info(&self.browser, id))
                     .collect();
@@ -461,25 +466,25 @@ impl Conn {
                     .get("url")
                     .and_then(Value::as_str)
                     .unwrap_or("about:blank");
-                let page = self
+                let tab = self
                     .browser
-                    .create_page()
+                    .create_tab()
                     .map_err(|err| DispatchError::Failed(err.to_string()))?;
-                if let Err(error) = open_url(&page, url) {
-                    let _ = self.browser.close_page(page.id());
+                if let Err(error) = open_url(&tab, url) {
+                    let _ = self.browser.close_tab(tab.id());
                     return Err(error);
                 }
-                Ok(json!({ "targetId": page.id().to_string() }))
+                Ok(json!({ "targetId": tab.id().to_string() }))
             }
             "Target.closeTarget" => {
                 let id = target_id(params.get("targetId"))?;
                 self.browser
-                    .close_page(id)
+                    .close_tab(id)
                     .map_err(|err| DispatchError::Failed(err.to_string()))?;
-                self.sessions.retain(|_, page| page.id() != id);
-                self.subscriptions.retain(|item| item.page_id != id);
-                if self.page.as_ref().is_some_and(|page| page.id() == id) {
-                    self.page = None;
+                self.sessions.retain(|_, tab| tab.id() != id);
+                self.subscriptions.retain(|item| item.tab_id != id);
+                if self.tab.as_ref().is_some_and(|tab| tab.id() == id) {
+                    self.tab = None;
                 }
                 Ok(json!({ "success": true }))
             }
@@ -494,13 +499,13 @@ impl Conn {
                         "attachToTarget requires flatten".into(),
                     ));
                 }
-                let page = self
+                let tab = self
                     .browser
-                    .page(id)
+                    .tab(id)
                     .map_err(|err| DispatchError::Failed(err.to_string()))?;
                 let session_id = format!("s{}", self.next_session);
                 self.next_session = self.next_session.saturating_add(1);
-                self.sessions.insert(session_id.clone(), page);
+                self.sessions.insert(session_id.clone(), tab);
                 Ok(json!({ "sessionId": session_id }))
             }
             "Target.detachFromTarget" => {
@@ -515,61 +520,61 @@ impl Conn {
         }
     }
 
-    fn dispatch_page_method(
+    fn dispatch_tab_method(
         &mut self,
         method: &str,
         params: &Value,
-        page: &PageHandle,
+        tab: &TabHandle,
         session: Option<&str>,
     ) -> Result<Value, DispatchError> {
         match method {
             "Page.enable" => {
-                self.subscribe_page(page, session)?;
+                self.subscribe_tab(tab, session)?;
                 Ok(json!({}))
             }
             "Page.disable" => {
-                self.unsubscribe_page(page.id(), session);
+                self.unsubscribe_tab(tab.id(), session);
                 Ok(json!({}))
             }
-            _ => session_method(method, params, page),
+            _ => session_method(method, params, tab),
         }
     }
 
-    fn subscribe_page(
+    fn subscribe_tab(
         &mut self,
-        page: &PageHandle,
+        tab: &TabHandle,
         session: Option<&str>,
     ) -> Result<(), DispatchError> {
         if self
             .subscriptions
             .iter()
-            .any(|item| item.page_id == page.id() && item.session.as_deref() == session)
+            .any(|item| item.tab_id == tab.id() && item.session.as_deref() == session)
         {
             return Ok(());
         }
-        let events = page
+        let events = tab
             .subscribe()
             .map_err(|error| DispatchError::Failed(error.to_string()))?;
-        self.subscriptions.push(PageSubscription {
-            page_id: page.id(),
+        self.subscriptions.push(TabSubscription {
+            tab_id: tab.id(),
             session: session.map(str::to_owned),
             events,
         });
         Ok(())
     }
 
-    fn unsubscribe_page(&mut self, page_id: PageId, session: Option<&str>) {
+    fn unsubscribe_tab(&mut self, tab_id: TabId, session: Option<&str>) {
         self.subscriptions
-            .retain(|item| item.page_id != page_id || item.session.as_deref() != session);
+            .retain(|item| item.tab_id != tab_id || item.session.as_deref() != session);
     }
 }
 
-async fn run_socket(mut socket: WebSocket, state: AppState, page: Option<PageHandle>) {
+async fn run_socket(mut socket: WebSocket, state: AppState, tab: Option<TabHandle>) {
     let mut conn = Conn {
         browser: state.browser,
         sessions: HashMap::new(),
         next_session: 1,
-        page,
+        tab,
         stop: state.stop,
         subscriptions: Vec::new(),
         clock_origin: Instant::now(),
@@ -623,7 +628,7 @@ async fn run_socket(mut socket: WebSocket, state: AppState, page: Option<PageHan
     let _ = socket.send(WsMessage::Close(None)).await;
 }
 
-fn session_method(method: &str, params: &Value, page: &PageHandle) -> Result<Value, DispatchError> {
+fn session_method(method: &str, params: &Value, tab: &TabHandle) -> Result<Value, DispatchError> {
     match method {
         "Runtime.enable" | "Runtime.disable" => Ok(json!({})),
         "Page.navigate" => {
@@ -631,18 +636,18 @@ fn session_method(method: &str, params: &Value, page: &PageHandle) -> Result<Val
                 .get("url")
                 .and_then(Value::as_str)
                 .ok_or_else(|| DispatchError::Failed("missing url".into()))?;
-            open_url(page, url)?;
-            Ok(json!({ "frameId": page.id().to_string() }))
+            open_url(tab, url)?;
+            Ok(json!({ "frameId": tab.id().to_string() }))
         }
         "Runtime.evaluate" => {
             let expression = params
                 .get("expression")
                 .and_then(Value::as_str)
                 .ok_or_else(|| DispatchError::Failed("missing expression".into()))?;
-            match page.execute_script(expression) {
+            match tab.execute_script(expression) {
                 Ok(value) => Ok(json!({ "result": remote_preview(&value) })),
-                Err(PageError::ActorStopped) => {
-                    Err(DispatchError::Failed("page actor stopped".into()))
+                Err(TabError::ActorStopped) => {
+                    Err(DispatchError::Failed("tab actor stopped".into()))
                 }
                 Err(err) => Ok(json!({
                     "result": {"type": "undefined"},
@@ -654,22 +659,22 @@ fn session_method(method: &str, params: &Value, page: &PageHandle) -> Result<Val
     }
 }
 
-fn open_url(page: &PageHandle, url: &str) -> Result<(), DispatchError> {
+fn open_url(tab: &TabHandle, url: &str) -> Result<(), DispatchError> {
     if url.is_empty() || url == "about:blank" {
-        page.load_html("<!doctype html><title></title>")
+        tab.load_html("<!doctype html><title></title>")
             .map_err(|err| DispatchError::Failed(err.to_string()))?;
         return Ok(());
     }
-    page.goto(url)
+    tab.goto(url)
         .map_err(|err| DispatchError::Failed(err.to_string()))?;
     Ok(())
 }
 
-fn target_info(browser: &BrowserHandle, id: PageId) -> Value {
+fn target_info(browser: &BrowserHandle, id: TabId) -> Value {
     let url = browser
-        .page(id)
+        .tab(id)
         .ok()
-        .and_then(|page| page.document_url().ok())
+        .and_then(|tab| tab.document_url().ok())
         .unwrap_or_else(|| "about:blank".into());
     json!({
         "targetId": id.to_string(),
@@ -681,14 +686,14 @@ fn target_info(browser: &BrowserHandle, id: PageId) -> Value {
     })
 }
 
-fn target_id(value: Option<&Value>) -> Result<PageId, DispatchError> {
+fn target_id(value: Option<&Value>) -> Result<TabId, DispatchError> {
     let raw = value
         .and_then(Value::as_str)
         .ok_or_else(|| DispatchError::Failed("missing targetId".into()))?;
     let id = raw
         .parse::<u64>()
         .map_err(|_| DispatchError::Failed("invalid targetId".into()))?;
-    Ok(PageId::new(id))
+    Ok(TabId::new(id))
 }
 
 fn remote_preview(value: &RemoteValue) -> Value {

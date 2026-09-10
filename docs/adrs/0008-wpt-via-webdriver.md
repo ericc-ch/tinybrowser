@@ -1,6 +1,6 @@
 # WPT via WebDriver
 
-Web-visible behavior is verified by the full web-platform-tests tree, driven the way browsers drive it: `./tools/wpt/run` over **WebDriver**. Host objects are Rust; remaining APIs may be JS. CDP is not the test runner.
+Web-visible behavior is verified by the full web-platform-tests tree, driven the way browsers drive it: `./tools/wpt/run` over **WebDriver**. Platform objects are Rust; remaining APIs may be JS. CDP is not the test runner.
 
 Status: accepted for WPT-via-WebDriver. The WebDriver adapter and “does not own Browser” law live in [ADR 0009](0009-named-profile-daemon.md). Temporary-profile isolation lives in `tools/wpt/tinybrowser_wpt.py`.
 
@@ -10,7 +10,7 @@ The WPT pin is the **full** tree at SHA `92054a74d0c6a1ed2e9024d71ebf2880f2af02e
 
 ## Isolation
 
-WebDriver is a peer adapter over `BrowserHandle` ([ADR 0009](0009-named-profile-daemon.md)). `--webdriver=PORT` remains the WPT host.
+WebDriver is a peer adapter over `BrowserHandle` ([ADR 0009](0009-named-profile-daemon.md)). `--webdriver=PORT` remains the WPT endpoint.
 
 The runner gives each WebDriver endpoint a fresh temporary profile. `TinyBrowser` sets `XDG_RUNTIME_DIR` and `XDG_DATA_HOME` to a new temp tree before launch, and deletes that tree on `stop` / `cleanup`. It must not select a dirty persistent profile.
 
@@ -20,7 +20,7 @@ The exact launch flag may stay `--webdriver=PORT` or change. That flag is open. 
 
 ## What shipped
 
-- Classic WebDriver on `tinybrowser --webdriver=PORT` as a `BrowserHandle` adapter (the `webdriver` crate; root `tinybrowser` depends on it). This is the WPT host ([ADR 0009](0009-named-profile-daemon.md)).
+- Classic WebDriver on `tinybrowser --webdriver=PORT` as a `BrowserHandle` adapter (the `webdriver` crate; root `tinybrowser` depends on it). This is the WPT endpoint ([ADR 0009](0009-named-profile-daemon.md)).
 - Out-of-tree wptrunner product (`tools/wpt`) plus `./tools/wpt/run`. Each endpoint gets a fresh temporary XDG profile.
 - HTTP-only first bar: `--ssl-type none` (HTTPS testharness files are excluded until cert trust exists). `./tools/wpt/run` also drops extra listen ports (`https-*`, `http-local`, `http-public`, `ws`, `dns`, …) so the runner does not bind extra loopbacks or start a DNS server.
 - Hosts: `./tools/wpt/run` skips WPT’s `/etc/hosts` check and launches `tinybrowser --webdriver=PORT --resolve=*.test=127.0.0.1` (plus `nonexistent.*.test=fail` and `*.test.`). No machine hosts file. Do not patch vendored WPT.
@@ -30,12 +30,12 @@ The exact launch flag may stay `--webdriver=PORT` or change. That flag is open. 
 
 Invocation: `pip install -e tools/wpt` into the WPT venv, then `./tools/wpt/run [tests]`.
 
-WebIDL: host objects are hand-written around `NodeId` (or page-owned handles). Do not codegen bindings. Other APIs may be JS.
+WebIDL: platform objects are hand-written around `NodeId` (or tab-owned handles). Do not codegen bindings. Other APIs may be JS.
 
 ## Options considered
 
 - **CDP as the WPT driver:** matches a future agent product, not wptrunner’s testharness executor. Rejected for this gate.
-- **In-process `Page` loader instead of WebDriver:** same HTML files, not the canonical runner. Rejected.
+- **In-process `Tab` loader instead of WebDriver:** same HTML files, not the canonical runner. Rejected.
 - **Sparse WPT checkout:** smaller clone; cannot run an arbitrary test when adding an API. Rejected.
 - **JS polyfills for Node/Document/Event:** fails WebIDL branding and WPT. Rejected.
 - **Build-time IDL codegen:** fights hand-written classes. wasm-bindgen-style warn-and-skip hides drift. Rejected.

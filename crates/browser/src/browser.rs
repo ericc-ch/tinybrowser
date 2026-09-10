@@ -6,7 +6,7 @@ use std::io;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use crate::actor::{PageActor, PageHandle, PageId};
+use crate::actor::{TabActor, TabHandle, TabId};
 use crate::link::{RendererRegistry, Renderers};
 use crate::network::{NetworkSession, ProfileStore};
 use crate::profile::{Profile, ProfileName};
@@ -20,8 +20,8 @@ struct BrowserInner {
     live: bool,
     network: NetworkSession,
     registry: Arc<RendererRegistry>,
-    pages: HashMap<PageId, PageActor>,
-    next_page: u64,
+    tabs: HashMap<TabId, TabActor>,
+    next_tab: u64,
 }
 
 /// Value-only handle protocols use to drive [`Browser`].
@@ -100,8 +100,8 @@ impl Browser {
                 live: true,
                 network,
                 registry,
-                pages: HashMap::new(),
-                next_page: 1,
+                tabs: HashMap::new(),
+                next_tab: 1,
             })),
         }
     }
@@ -149,54 +149,54 @@ impl BrowserHandle {
         self.profile().name().clone()
     }
 
-    /// Starts a page actor and returns its handle.
+    /// Starts a tab actor and returns its handle.
     ///
     /// # Errors
     ///
     /// [`BrowserError::Stopped`] when the owning [`Browser`] has been dropped.
-    pub fn create_page(&self) -> Result<PageHandle, BrowserError> {
+    pub fn create_tab(&self) -> Result<TabHandle, BrowserError> {
         let mut inner = self.lock();
         if !inner.live {
             return Err(BrowserError::Stopped);
         }
-        let id = PageId::new(inner.next_page);
-        inner.next_page = inner.next_page.saturating_add(1);
+        let id = TabId::new(inner.next_tab);
+        inner.next_tab = inner.next_tab.saturating_add(1);
         let fetch = inner.network.fetch_handle();
         let registry = Arc::clone(&inner.registry);
-        let actor = PageActor::spawn(id, fetch, registry);
+        let actor = TabActor::spawn(id, fetch, registry);
         let handle = actor.handle.clone();
-        inner.pages.insert(id, actor);
+        inner.tabs.insert(id, actor);
         Ok(handle)
     }
 
-    /// Live page identities.
+    /// Live tab identities.
     #[must_use]
-    pub fn pages(&self) -> Vec<PageId> {
-        self.lock().pages.keys().copied().collect()
+    pub fn tabs(&self) -> Vec<TabId> {
+        self.lock().tabs.keys().copied().collect()
     }
 
-    /// Handle for a live page.
+    /// Handle for a live tab.
     ///
     /// # Errors
     ///
-    /// [`BrowserError::UnknownPage`] when `id` is not in the registry.
-    pub fn page(&self, id: PageId) -> Result<PageHandle, BrowserError> {
+    /// [`BrowserError::UnknownTab`] when `id` is not in the registry.
+    pub fn tab(&self, id: TabId) -> Result<TabHandle, BrowserError> {
         self.lock()
-            .pages
+            .tabs
             .get(&id)
             .map(|actor| actor.handle.clone())
-            .ok_or(BrowserError::UnknownPage)
+            .ok_or(BrowserError::UnknownTab)
     }
 
     /// Stops `id` and joins its actor thread.
     ///
     /// # Errors
     ///
-    /// [`BrowserError::UnknownPage`] when `id` is not in the registry.
-    pub fn close_page(&self, id: PageId) -> Result<(), BrowserError> {
+    /// [`BrowserError::UnknownTab`] when `id` is not in the registry.
+    pub fn close_tab(&self, id: TabId) -> Result<(), BrowserError> {
         let mut inner = self.lock();
-        let Some(mut actor) = inner.pages.remove(&id) else {
-            return Err(BrowserError::UnknownPage);
+        let Some(mut actor) = inner.tabs.remove(&id) else {
+            return Err(BrowserError::UnknownTab);
         };
         drop(inner);
         actor.shutdown();
@@ -209,7 +209,7 @@ impl BrowserHandle {
         self.lock().live
     }
 
-    /// Stops every page, persists the profile, and refuses later commands.
+    /// Stops every tab, persists the profile, and refuses later commands.
     ///
     /// # Errors
     ///
@@ -237,7 +237,7 @@ impl BrowserHandle {
 
     fn close_all(&self) {
         let mut inner = self.lock();
-        let actors: Vec<PageActor> = inner.pages.drain().map(|(_, actor)| actor).collect();
+        let actors: Vec<TabActor> = inner.tabs.drain().map(|(_, actor)| actor).collect();
         drop(inner);
         for mut actor in actors {
             actor.shutdown();
@@ -254,8 +254,8 @@ impl BrowserHandle {
 /// Why a browser handle call was refused.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BrowserError {
-    /// No page with that id is live.
-    UnknownPage,
+    /// No tab with that id is live.
+    UnknownTab,
     /// The owning [`Browser`] has been dropped.
     Stopped,
 }
@@ -263,7 +263,7 @@ pub enum BrowserError {
 impl fmt::Display for BrowserError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::UnknownPage => f.write_str("unknown page"),
+            Self::UnknownTab => f.write_str("unknown tab"),
             Self::Stopped => f.write_str("browser stopped"),
         }
     }

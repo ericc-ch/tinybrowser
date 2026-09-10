@@ -19,6 +19,6 @@
 //! See [ADR 0007](../docs/adrs/0007-engine-charter.md).
 
 pub use browser::{
-    AgentBuilder, Browser, BrowserError, BrowserHandle, PageError, PageEvent, PageHandle, PageId,
-    Profile, ProfileError, ProfileName, RemoteValue, RequestId, ScriptFailure,
+    AgentBuilder, Browser, BrowserError, BrowserHandle, Profile, ProfileError, ProfileName,
+    RemoteValue, RequestId, ScriptFailure, TabError, TabEvent, TabHandle, TabId,
 };

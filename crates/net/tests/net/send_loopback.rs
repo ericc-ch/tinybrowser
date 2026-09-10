@@ -391,7 +391,7 @@ fn cross_site_redirect_taints_samesite_cookie_inclusion() {
     agent.set_cookie("strict=1; Path=/; SameSite=Strict", &start);
     agent
         .request(Method::GET, start.clone())
-        .with_context(net::Context::Fetch)
+        .with_initiator_kind(net::InitiatorKind::Fetch)
         .with_initiator(start)
         .send()
         .expect("redirect chain");

@@ -1,14 +1,14 @@
 use std::time::{Duration, Instant as WallClock};
 
 use super::{Document, ScriptValue};
-use crate::protocol::PageError;
+use crate::protocol::TabError;
 
 impl Document {
     pub(crate) fn execute_remote(
         &mut self,
         source: &str,
         timeout: Option<Duration>,
-    ) -> Result<crate::RemoteValue, PageError> {
+    ) -> Result<crate::RemoteValue, TabError> {
         let deadline = timeout.map(|duration| WallClock::now() + duration);
         let value = self.execute_script_deadline(source, deadline)?;
         Ok(self.intern_script(value))

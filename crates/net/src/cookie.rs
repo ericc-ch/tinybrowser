@@ -5,7 +5,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use url::{Host, Url};
 
-use crate::context::Context;
+use crate::initiator::InitiatorKind;
 use crate::protocol::Method;
 
 // https://httpwg.org/http-extensions/draft-ietf-httpbis-rfc6265bis.html#name-cookie-lifetime-limits
@@ -55,7 +55,7 @@ pub(crate) struct CookieOp<'a> {
     pub url: &'a Url,
     pub now: SystemTime,
     pub kind: RetrievalKind,
-    pub context: Context,
+    pub initiator_kind: InitiatorKind,
     pub method: &'a Method,
     pub initiator: Option<&'a Url>,
     pub cross_site_redirect: bool,
@@ -416,7 +416,7 @@ fn receive_cookie(
     }
     if same_site != SameSite::None
         && !op.is_same_site_request()
-        && op.context != Context::Navigation
+        && op.initiator_kind != InitiatorKind::Navigation
     {
         return None;
     }
@@ -571,7 +571,7 @@ impl StoredCookie {
         samesite_allows(
             self.same_site,
             op.is_same_site_request(),
-            op.context,
+            op.initiator_kind,
             op.method,
         )
     }
@@ -587,14 +587,14 @@ fn same_cookie_identity(old: &StoredCookie, stored: &StoredCookie) -> bool {
 fn samesite_allows(
     same_site: SameSite,
     same_site_request: bool,
-    context: Context,
+    initiator_kind: InitiatorKind,
     method: &Method,
 ) -> bool {
     match same_site {
         SameSite::None => true,
         SameSite::Strict => same_site_request,
         SameSite::Lax | SameSite::Default => {
-            same_site_request || (context == Context::Navigation && method.is_safe())
+            same_site_request || (initiator_kind == InitiatorKind::Navigation && method.is_safe())
         }
     }
 }

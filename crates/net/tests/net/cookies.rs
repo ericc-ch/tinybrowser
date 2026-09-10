@@ -1,5 +1,5 @@
 use super::common::TestServer;
-use net::{Agent, Context, Method};
+use net::{Agent, InitiatorKind, Method};
 
 fn response(set_cookies: &[&str], body: &[u8]) -> Vec<u8> {
     let mut out = format!(
@@ -93,24 +93,24 @@ fn same_site_context_controls_cross_site_request_cookies() {
     let foreign = url::Url::parse("https://evil.example/").expect("foreign");
     agent
         .request(Method::GET, uri.clone())
-        .with_context(Context::Navigation)
+        .with_initiator_kind(InitiatorKind::Navigation)
         .send()
         .expect("set");
     agent
         .request(Method::GET, uri.clone())
-        .with_context(Context::Fetch)
+        .with_initiator_kind(InitiatorKind::Fetch)
         .with_initiator(foreign.clone())
         .send()
         .expect("cross fetch");
     agent
         .request(Method::GET, uri.clone())
-        .with_context(Context::Navigation)
+        .with_initiator_kind(InitiatorKind::Navigation)
         .with_initiator(foreign.clone())
         .send()
         .expect("cross navigation");
     agent
         .request(Method::POST, uri)
-        .with_context(Context::Navigation)
+        .with_initiator_kind(InitiatorKind::Navigation)
         .with_initiator(foreign)
         .body(b"x")
         .send()

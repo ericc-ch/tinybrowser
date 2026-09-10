@@ -21,11 +21,11 @@ fn persistent_cookies_survive_browser_restart() {
     {
         let browser =
             Browser::open_in_with(&data_home, &profile, Renderers::Local).expect("browser");
-        let page = browser.handle().create_page().expect("page");
-        page.set_document_url(url.as_str()).expect("document url");
-        page.set_document_cookie("sid=1; Max-Age=3600; Path=/")
+        let tab = browser.handle().create_tab().expect("tab");
+        tab.set_document_url(url.as_str()).expect("document url");
+        tab.set_document_cookie("sid=1; Max-Age=3600; Path=/")
             .expect("set cookie");
-        assert_eq!(page.document_cookie().expect("cookie"), "sid=1");
+        assert_eq!(tab.document_cookie().expect("cookie"), "sid=1");
     }
     let cookie_path = data_home
         .join("tinybrowser")
@@ -43,9 +43,9 @@ fn persistent_cookies_survive_browser_restart() {
         assert_eq!(mode, 0o600, "cookie file mode {mode:#o}");
     }
     let browser = Browser::open_in_with(&data_home, &profile, Renderers::Local).expect("browser");
-    let page = browser.handle().create_page().expect("page");
-    page.set_document_url(url.as_str()).expect("document url");
-    assert_eq!(page.document_cookie().expect("reloaded"), "sid=1");
+    let tab = browser.handle().create_tab().expect("tab");
+    tab.set_document_url(url.as_str()).expect("document url");
+    assert_eq!(tab.document_cookie().expect("reloaded"), "sid=1");
     let _ = std::fs::remove_dir_all(data_home);
 }
 
@@ -57,15 +57,15 @@ fn session_cookies_are_not_written_to_disk() {
     {
         let browser =
             Browser::open_in_with(&data_home, &profile, Renderers::Local).expect("browser");
-        let page = browser.handle().create_page().expect("page");
-        page.set_document_url(url.as_str()).expect("document url");
-        page.set_document_cookie("tmp=1").expect("session cookie");
-        assert_eq!(page.document_cookie().expect("cookie"), "tmp=1");
+        let tab = browser.handle().create_tab().expect("tab");
+        tab.set_document_url(url.as_str()).expect("document url");
+        tab.set_document_cookie("tmp=1").expect("session cookie");
+        assert_eq!(tab.document_cookie().expect("cookie"), "tmp=1");
     }
     let browser = Browser::open_in_with(&data_home, &profile, Renderers::Local).expect("browser");
-    let page = browser.handle().create_page().expect("page");
-    page.set_document_url(url.as_str()).expect("document url");
-    assert_eq!(page.document_cookie().expect("empty"), "");
+    let tab = browser.handle().create_tab().expect("tab");
+    tab.set_document_url(url.as_str()).expect("document url");
+    assert_eq!(tab.document_cookie().expect("empty"), "");
     let _ = std::fs::remove_dir_all(data_home);
 }
 
@@ -75,8 +75,8 @@ fn pages_share_the_profile_cookie_jar() {
     let browser =
         Browser::open_in_with(&data_home, &Profile::default(), Renderers::Local).expect("browser");
     let handle = browser.handle();
-    let first = handle.create_page().expect("first");
-    let second = handle.create_page().expect("second");
+    let first = handle.create_tab().expect("first");
+    let second = handle.create_tab().expect("second");
     first
         .set_document_url("https://example.test/")
         .expect("url");
@@ -179,9 +179,9 @@ fn close_page_returns_while_a_fetch_is_blocked() {
     let browser =
         Browser::open_in_with(&data_home, &Profile::default(), Renderers::Local).expect("browser");
     let handle = browser.handle();
-    let page = handle.create_page().expect("page");
-    page.goto(&format!("http://{addr}/")).expect("goto");
-    let waiting = page.clone();
+    let tab = handle.create_tab().expect("tab");
+    tab.goto(&format!("http://{addr}/")).expect("goto");
+    let waiting = tab.clone();
     let pump = thread::spawn(move || waiting.run_until_load());
     let wait_deadline = Instant::now() + Duration::from_secs(2);
     while !accepted.load(Ordering::SeqCst) {
@@ -192,7 +192,7 @@ fn close_page_returns_while_a_fetch_is_blocked() {
         thread::sleep(Duration::from_millis(5));
     }
     let started = Instant::now();
-    handle.close_page(page.id()).expect("close");
+    handle.close_tab(tab.id()).expect("close");
     assert!(
         started.elapsed() < Duration::from_secs(2),
         "close waited for blocked fetch: {:?}",

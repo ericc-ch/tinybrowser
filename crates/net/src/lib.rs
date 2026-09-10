@@ -5,17 +5,17 @@
 //! for `ws`/`wss`.
 
 mod client;
-mod context;
 mod cookie;
 mod error;
+mod initiator;
 mod protocol;
 mod resolve;
 mod transport;
 mod websocket;
 
 pub use client::{Agent, AgentBuilder, Body, RequestBuilder, Response};
-pub use context::Context;
 pub use cookie::{CookieRecord, CookieSameSite, site};
 pub use error::{LimitExceeded, NetError, ProtocolError, TimeoutKind, TransportError};
+pub use initiator::InitiatorKind;
 pub use protocol::{HeaderError, HeaderMap, InvalidMethod, Method};
 pub use websocket::{WebSocket, WsEvent, WsMessage};

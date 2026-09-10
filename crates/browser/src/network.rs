@@ -1,6 +1,6 @@
 //! Browser-owned live networking: one [`net::Agent`] behind a value-only handle.
 //!
-//! [ADR 0010](../../../docs/adrs/0010-page-actor-ownership.md): page actors
+//! [ADR 0010](../../../docs/adrs/0010-tab-actor-ownership.md): tab actors
 //! receive [`FetchHandle`]. They do not expose or own [`net::Agent`].
 
 use std::env;
@@ -12,7 +12,7 @@ use std::sync::mpsc::{self, Sender, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use net::{Agent, AgentBuilder, Context, CookieRecord, CookieSameSite, Method};
+use net::{Agent, AgentBuilder, CookieRecord, CookieSameSite, InitiatorKind, Method};
 use renderer::{DialOutcome, DialRequest};
 use url::Url;
 
@@ -230,7 +230,7 @@ impl NetworkSession {
         })
     }
 
-    /// Value-only fetch handle for a page actor.
+    /// Value-only fetch handle for a tab actor.
     #[must_use]
     pub fn fetch_handle(&self) -> FetchHandle {
         FetchHandle {
@@ -257,7 +257,7 @@ impl Drop for NetworkSession {
 
 /// Cloneable, sendable handle for cookies and blocking HTTP.
 ///
-/// Completions return to the page actor from the bounded network executor.
+/// Completions return to the tab actor from the bounded network executor.
 #[derive(Clone)]
 pub struct FetchHandle {
     agent: Agent,
@@ -305,7 +305,7 @@ impl FetchHandle {
     fn navigate_blocking(&self, url: &Url, initiator: &Url) -> Result<NavOutcome, ()> {
         let response = self
             .request(Method::GET, url.clone())
-            .with_context(Context::Navigation)
+            .with_initiator_kind(InitiatorKind::Navigation)
             .with_initiator(initiator.clone())
             .send()
             .map_err(|_| ())?;
@@ -344,7 +344,7 @@ impl FetchHandle {
         let initiator = Url::parse(&request.initiator).ok()?;
         let response = self
             .request(Method::GET, url)
-            .with_context(Context::Fetch)
+            .with_initiator_kind(InitiatorKind::Fetch)
             .with_initiator(initiator)
             .send()
             .ok()?;

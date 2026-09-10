@@ -1,9 +1,9 @@
 use super::{CompletedDial, DialFail, FETCH_BODY_LIMIT, QueuedDial, Stop};
-use crate::protocol::{DialKind, DialRequest, HostServices};
+use crate::protocol::{BrowserServices, DialKind, DialRequest};
 
-/// Performs one queued dial through the host and shapes the completion.
+/// Performs one queued dial through the browser side and shapes the completion.
 pub(in crate::document) fn send_dial(
-    services: &dyn HostServices,
+    services: &dyn BrowserServices,
     dial: &QueuedDial,
     stop: &Stop,
 ) -> Result<CompletedDial, DialFail> {

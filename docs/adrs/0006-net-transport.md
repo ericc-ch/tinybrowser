@@ -49,4 +49,4 @@ JA4: `t13d3011_…` (OpenSSL, no ALPN); `t13d2811h1_257f3020b3a2…` (chrome kno
 
 ## Consequences
 
-Akamai-class gates fail until the stealth milestone ([ADR 0007](0007-engine-charter.md): later later). Probe knowledge (btls knobs, ureq `Agent::with_parts` bridge) stands as a reference. Size rows live in [size-budget.md](../researches/size-budget.md); the native-tls / OpenSSL-fingerprint objection returns when that milestone does. `net` stays blocking; the Browser-owned bounded executor runs it away from page threads.
+Akamai-class gates fail until the stealth milestone ([ADR 0007](0007-engine-charter.md): later later). Probe knowledge (btls knobs, ureq `Agent::with_parts` bridge) stands as a reference. Size rows live in [size-budget.md](../researches/size-budget.md); the native-tls / OpenSSL-fingerprint objection returns when that milestone does. `net` stays blocking; the Browser-owned bounded executor runs it away from renderer threads.

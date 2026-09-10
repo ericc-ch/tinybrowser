@@ -1,8 +1,8 @@
-//! One host-side page (tab): identity, navigation, and the renderer link.
+//! One browser-side tab: identity, navigation, and the renderer link.
 //!
-//! [ADR 0011](../../../docs/adrs/0011-renderer-processes-per-site.md): the host
-//! dials, picks the site renderer, and mounts the document; the renderer owns
-//! the document. `PageHandle` is the protocol surface and stays value-only.
+//! [ADR 0011](../../../docs/adrs/0011-renderer-processes-per-site.md): the browser
+//! process dials, picks the site renderer, and mounts the document; the renderer
+//! owns the document. `TabHandle` is the protocol surface and stays value-only.
 
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -11,19 +11,19 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use renderer::{Command as RendererCommand, Mount, PageError, PageEvent, RemoteValue, Reply};
+use renderer::{Command as RendererCommand, Mount, RemoteValue, Reply, TabError, TabEvent};
 use url::Url;
 
 use crate::link::{RendererHandle, RendererRegistry};
 use crate::network::{FetchHandle, NavOutcome};
-use crate::site::SiteKey;
+use crate::site::Site;
 
 /// Identity of one tab in a [`crate::Browser`] registry.
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
-pub struct PageId(u64);
+pub struct TabId(u64);
 
-impl PageId {
-    /// Constructs a page id from a protocol integer.
+impl TabId {
+    /// Constructs a tab id from a protocol integer.
     #[must_use]
     pub fn new(raw: u64) -> Self {
         Self(raw)
@@ -36,7 +36,7 @@ impl PageId {
     }
 }
 
-impl fmt::Display for PageId {
+impl fmt::Display for TabId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.0)
     }
@@ -57,20 +57,20 @@ impl RequestId {
 enum Command {
     LoadHtml {
         html: String,
-        reply: Sender<Result<(), PageError>>,
+        reply: Sender<Result<(), TabError>>,
     },
     Goto {
         url: String,
-        reply: Sender<Result<(), PageError>>,
+        reply: Sender<Result<(), TabError>>,
     },
     Eval {
         source: String,
-        reply: Sender<Result<String, PageError>>,
+        reply: Sender<Result<String, TabError>>,
     },
     Execute {
         source: String,
         timeout: Option<Duration>,
-        reply: Sender<Result<RemoteValue, PageError>>,
+        reply: Sender<Result<RemoteValue, TabError>>,
     },
     Run {
         reply: Sender<()>,
@@ -102,13 +102,13 @@ enum Command {
     },
     SetDocumentUrl {
         url: String,
-        reply: Sender<Result<(), PageError>>,
+        reply: Sender<Result<(), TabError>>,
     },
     Events {
-        reply: Sender<Vec<PageEvent>>,
+        reply: Sender<Vec<TabEvent>>,
     },
     Subscribe {
-        reply: Sender<Receiver<PageEvent>>,
+        reply: Sender<Receiver<TabEvent>>,
     },
     LastNavigationFailed {
         reply: Sender<bool>,
@@ -137,19 +137,19 @@ enum Waiter {
     },
 }
 
-/// Value-only handle to one [`PageActor`].
+/// Value-only handle to one [`TabActor`].
 #[derive(Clone)]
-pub struct PageHandle {
-    id: PageId,
+pub struct TabHandle {
+    id: TabId,
     next_request: Arc<AtomicU64>,
     current: Arc<Mutex<Option<Arc<RendererHandle>>>>,
     tx: Sender<Envelope>,
 }
 
-impl PageHandle {
+impl TabHandle {
     /// Tab identity in the owning browser.
     #[must_use]
-    pub fn id(&self) -> PageId {
+    pub fn id(&self) -> TabId {
         self.id
     }
 
@@ -159,12 +159,12 @@ impl PageHandle {
         RequestId(self.next_request.load(Ordering::Relaxed))
     }
 
-    /// Parses `html` into this page and starts a new JS realm.
+    /// Parses `html` into this tab and starts a new JS realm.
     ///
     /// # Errors
     ///
-    /// [`PageError::ActorStopped`] when the page or its renderer has shut down.
-    pub fn load_html(&self, html: &str) -> Result<(), PageError> {
+    /// [`TabError::ActorStopped`] when the tab or its renderer has shut down.
+    pub fn load_html(&self, html: &str) -> Result<(), TabError> {
         let (reply, rx) = mpsc::channel();
         self.send(Command::LoadHtml {
             html: html.to_owned(),
@@ -173,13 +173,13 @@ impl PageHandle {
         recv_result(&rx)
     }
 
-    /// Starts navigation. The page continues independently; call
-    /// [`PageHandle::run_until_load`] only when the caller needs to wait.
+    /// Starts navigation. The tab continues independently; call
+    /// [`TabHandle::run_until_load`] only when the caller needs to wait.
     ///
     /// # Errors
     ///
-    /// [`PageError::InvalidUrl`] or [`PageError::ActorStopped`].
-    pub fn goto(&self, url: &str) -> Result<(), PageError> {
+    /// [`TabError::InvalidUrl`] or [`TabError::ActorStopped`].
+    pub fn goto(&self, url: &str) -> Result<(), TabError> {
         let (reply, rx) = mpsc::channel();
         self.send(Command::Goto {
             url: url.to_owned(),
@@ -192,8 +192,8 @@ impl PageHandle {
     ///
     /// # Errors
     ///
-    /// [`PageError::Script`] or [`PageError::ActorStopped`].
-    pub fn eval(&self, source: &str) -> Result<String, PageError> {
+    /// [`TabError::Script`] or [`TabError::ActorStopped`].
+    pub fn eval(&self, source: &str) -> Result<String, TabError> {
         let (reply, rx) = mpsc::channel();
         self.send(Command::Eval {
             source: source.to_owned(),
@@ -206,8 +206,8 @@ impl PageHandle {
     ///
     /// # Errors
     ///
-    /// [`PageError::Script`] or [`PageError::ActorStopped`].
-    pub fn execute_script(&self, source: &str) -> Result<RemoteValue, PageError> {
+    /// [`TabError::Script`] or [`TabError::ActorStopped`].
+    pub fn execute_script(&self, source: &str) -> Result<RemoteValue, TabError> {
         self.execute_script_timeout(source, None)
     }
 
@@ -215,12 +215,12 @@ impl PageHandle {
     ///
     /// # Errors
     ///
-    /// [`PageError::Script`] or [`PageError::ActorStopped`].
+    /// [`TabError::Script`] or [`TabError::ActorStopped`].
     pub fn execute_script_timeout(
         &self,
         source: &str,
         timeout: Option<Duration>,
-    ) -> Result<RemoteValue, PageError> {
+    ) -> Result<RemoteValue, TabError> {
         let (reply, rx) = mpsc::channel();
         self.send(Command::Execute {
             source: source.to_owned(),
@@ -230,12 +230,12 @@ impl PageHandle {
         recv_result(&rx)
     }
 
-    /// Waits until no page jobs remain without preventing other commands.
+    /// Waits until no tab jobs remain without preventing other commands.
     ///
     /// # Errors
     ///
-    /// [`PageError::ActorStopped`].
-    pub fn run(&self) -> Result<(), PageError> {
+    /// [`TabError::ActorStopped`].
+    pub fn run(&self) -> Result<(), TabError> {
         let (reply, rx) = mpsc::channel();
         self.send(Command::Run { reply })?;
         recv_unit(&rx)
@@ -245,19 +245,19 @@ impl PageHandle {
     ///
     /// # Errors
     ///
-    /// [`PageError::ActorStopped`].
-    pub fn run_until_load(&self) -> Result<(), PageError> {
+    /// [`TabError::ActorStopped`].
+    pub fn run_until_load(&self) -> Result<(), TabError> {
         let (reply, rx) = mpsc::channel();
         self.send(Command::RunUntilLoad { reply })?;
         recv_unit(&rx)
     }
 
-    /// Waits like [`PageHandle::run_until_load`], returning `false` on timeout.
+    /// Waits like [`TabHandle::run_until_load`], returning `false` on timeout.
     ///
     /// # Errors
     ///
-    /// [`PageError::ActorStopped`].
-    pub fn run_until_load_timeout(&self, timeout: Duration) -> Result<bool, PageError> {
+    /// [`TabError::ActorStopped`].
+    pub fn run_until_load_timeout(&self, timeout: Duration) -> Result<bool, TabError> {
         let (reply, rx) = mpsc::channel();
         self.send(Command::RunUntilLoadTimeout { timeout, reply })?;
         recv_bool(&rx)
@@ -267,8 +267,8 @@ impl PageHandle {
     ///
     /// # Errors
     ///
-    /// [`PageError::ActorStopped`].
-    pub fn run_until_js_true(&self, source: &str, timeout: Duration) -> Result<bool, PageError> {
+    /// [`TabError::ActorStopped`].
+    pub fn run_until_js_true(&self, source: &str, timeout: Duration) -> Result<bool, TabError> {
         let (reply, rx) = mpsc::channel();
         self.send(Command::RunUntilJsTrue {
             source: source.to_owned(),
@@ -282,8 +282,8 @@ impl PageHandle {
     ///
     /// # Errors
     ///
-    /// [`PageError::ActorStopped`].
-    pub fn document_url(&self) -> Result<String, PageError> {
+    /// [`TabError::ActorStopped`].
+    pub fn document_url(&self) -> Result<String, TabError> {
         let (reply, rx) = mpsc::channel();
         self.send(Command::DocumentUrl { reply })?;
         recv_text(&rx)
@@ -293,8 +293,8 @@ impl PageHandle {
     ///
     /// # Errors
     ///
-    /// [`PageError::ActorStopped`].
-    pub fn content_language(&self) -> Result<Option<String>, PageError> {
+    /// [`TabError::ActorStopped`].
+    pub fn content_language(&self) -> Result<Option<String>, TabError> {
         let (reply, rx) = mpsc::channel();
         self.send(Command::ContentLanguage { reply })?;
         recv_optional_text(&rx)
@@ -304,8 +304,8 @@ impl PageHandle {
     ///
     /// # Errors
     ///
-    /// [`PageError::ActorStopped`].
-    pub fn document_cookie(&self) -> Result<String, PageError> {
+    /// [`TabError::ActorStopped`].
+    pub fn document_cookie(&self) -> Result<String, TabError> {
         let (reply, rx) = mpsc::channel();
         self.send(Command::CookieGet { reply })?;
         recv_text(&rx)
@@ -315,8 +315,8 @@ impl PageHandle {
     ///
     /// # Errors
     ///
-    /// [`PageError::ActorStopped`].
-    pub fn set_document_cookie(&self, value: &str) -> Result<(), PageError> {
+    /// [`TabError::ActorStopped`].
+    pub fn set_document_cookie(&self, value: &str) -> Result<(), TabError> {
         let (reply, rx) = mpsc::channel();
         self.send(Command::CookieSet {
             value: value.to_owned(),
@@ -329,8 +329,8 @@ impl PageHandle {
     ///
     /// # Errors
     ///
-    /// [`PageError::InvalidUrl`] or [`PageError::ActorStopped`].
-    pub fn set_document_url(&self, url: &str) -> Result<(), PageError> {
+    /// [`TabError::InvalidUrl`] or [`TabError::ActorStopped`].
+    pub fn set_document_url(&self, url: &str) -> Result<(), TabError> {
         let (reply, rx) = mpsc::channel();
         self.send(Command::SetDocumentUrl {
             url: url.to_owned(),
@@ -343,42 +343,42 @@ impl PageHandle {
     ///
     /// # Errors
     ///
-    /// [`PageError::ActorStopped`].
-    pub fn events(&self) -> Result<Vec<PageEvent>, PageError> {
+    /// [`TabError::ActorStopped`].
+    pub fn events(&self) -> Result<Vec<TabEvent>, TabError> {
         let (reply, rx) = mpsc::channel();
         self.send(Command::Events { reply })?;
         recv_events(&rx)
     }
 
-    /// Subscribes to page events emitted after this call.
+    /// Subscribes to tab events emitted after this call.
     ///
     /// # Errors
     ///
-    /// [`PageError::ActorStopped`] when the actor has shut down.
-    pub fn subscribe(&self) -> Result<Receiver<PageEvent>, PageError> {
+    /// [`TabError::ActorStopped`] when the actor has shut down.
+    pub fn subscribe(&self) -> Result<Receiver<TabEvent>, TabError> {
         let (reply, rx) = mpsc::channel();
         self.send(Command::Subscribe { reply })?;
-        rx.recv().map_err(|_| PageError::ActorStopped)
+        rx.recv().map_err(|_| TabError::ActorStopped)
     }
 
     /// True when the last navigation dial failed.
     ///
     /// # Errors
     ///
-    /// [`PageError::ActorStopped`].
-    pub fn last_navigation_failed(&self) -> Result<bool, PageError> {
+    /// [`TabError::ActorStopped`].
+    pub fn last_navigation_failed(&self) -> Result<bool, TabError> {
         let (reply, rx) = mpsc::channel();
         self.send(Command::LastNavigationFailed { reply })?;
         recv_bool(&rx)
     }
 
-    /// Asks the page to stop. Further commands fail with
-    /// [`PageError::ActorStopped`].
+    /// Asks the tab to stop. Further commands fail with
+    /// [`TabError::ActorStopped`].
     ///
     /// # Errors
     ///
-    /// [`PageError::ActorStopped`] if the actor is already gone.
-    pub fn shutdown(&self) -> Result<(), PageError> {
+    /// [`TabError::ActorStopped`] if the actor is already gone.
+    pub fn shutdown(&self) -> Result<(), TabError> {
         self.interrupt_renderer();
         let (reply, rx) = mpsc::channel();
         self.send(Command::Shutdown { reply })?;
@@ -396,62 +396,62 @@ impl PageHandle {
         }
     }
 
-    fn send(&self, command: Command) -> Result<(), PageError> {
+    fn send(&self, command: Command) -> Result<(), TabError> {
         let request_id = RequestId(self.next_request.fetch_add(1, Ordering::Relaxed));
         self.tx
             .send(Envelope {
                 request_id,
                 command,
             })
-            .map_err(|_| PageError::ActorStopped)
+            .map_err(|_| TabError::ActorStopped)
     }
 }
 
-fn recv_result<T>(rx: &Receiver<Result<T, PageError>>) -> Result<T, PageError> {
-    rx.recv().unwrap_or(Err(PageError::ActorStopped))
+fn recv_result<T>(rx: &Receiver<Result<T, TabError>>) -> Result<T, TabError> {
+    rx.recv().unwrap_or(Err(TabError::ActorStopped))
 }
 
-fn recv_unit(rx: &Receiver<()>) -> Result<(), PageError> {
-    rx.recv().map_err(|_| PageError::ActorStopped)
+fn recv_unit(rx: &Receiver<()>) -> Result<(), TabError> {
+    rx.recv().map_err(|_| TabError::ActorStopped)
 }
 
-fn recv_bool(rx: &Receiver<bool>) -> Result<bool, PageError> {
-    rx.recv().map_err(|_| PageError::ActorStopped)
+fn recv_bool(rx: &Receiver<bool>) -> Result<bool, TabError> {
+    rx.recv().map_err(|_| TabError::ActorStopped)
 }
 
-fn recv_text(rx: &Receiver<String>) -> Result<String, PageError> {
-    rx.recv().map_err(|_| PageError::ActorStopped)
+fn recv_text(rx: &Receiver<String>) -> Result<String, TabError> {
+    rx.recv().map_err(|_| TabError::ActorStopped)
 }
 
-fn recv_optional_text(rx: &Receiver<Option<String>>) -> Result<Option<String>, PageError> {
-    rx.recv().map_err(|_| PageError::ActorStopped)
+fn recv_optional_text(rx: &Receiver<Option<String>>) -> Result<Option<String>, TabError> {
+    rx.recv().map_err(|_| TabError::ActorStopped)
 }
 
-fn recv_events(rx: &Receiver<Vec<PageEvent>>) -> Result<Vec<PageEvent>, PageError> {
-    rx.recv().map_err(|_| PageError::ActorStopped)
+fn recv_events(rx: &Receiver<Vec<TabEvent>>) -> Result<Vec<TabEvent>, TabError> {
+    rx.recv().map_err(|_| TabError::ActorStopped)
 }
 
-/// Join handle and command sender for one page actor thread.
-pub(crate) struct PageActor {
-    pub handle: PageHandle,
+/// Join handle and command sender for one tab actor thread.
+pub(crate) struct TabActor {
+    pub handle: TabHandle,
     join: Option<JoinHandle<()>>,
 }
 
-impl PageActor {
-    pub(crate) fn spawn(id: PageId, fetch: FetchHandle, registry: Arc<RendererRegistry>) -> Self {
+impl TabActor {
+    pub(crate) fn spawn(id: TabId, fetch: FetchHandle, registry: Arc<RendererRegistry>) -> Self {
         let (tx, rx) = mpsc::channel();
         let current = Arc::new(Mutex::new(None));
-        let handle = PageHandle {
+        let handle = TabHandle {
             id,
             next_request: Arc::new(AtomicU64::new(1)),
             current: Arc::clone(&current),
             tx,
         };
-        let page = Page::new(id, fetch, registry, current);
+        let tab = Tab::new(id, fetch, registry, current);
         let join = thread::Builder::new()
-            .name(format!("page-{id}"))
-            .spawn(move || actor_loop(&rx, page))
-            .expect("page actor thread");
+            .name(format!("tab-{id}"))
+            .spawn(move || actor_loop(&rx, tab))
+            .expect("tab actor thread");
         Self {
             handle,
             join: Some(join),
@@ -472,7 +472,7 @@ impl PageActor {
     }
 }
 
-impl Drop for PageActor {
+impl Drop for TabActor {
     fn drop(&mut self) {
         self.shutdown();
     }
@@ -485,15 +485,15 @@ struct ActiveNavigation {
     submitted: bool,
 }
 
-/// Host-owned tab state: identity, URL, navigation, and the renderer link.
-struct Page {
-    id: PageId,
+/// Browser-owned tab state: identity, URL, navigation, and the renderer link.
+struct Tab {
+    id: TabId,
     registry: Arc<RendererRegistry>,
     fetch: FetchHandle,
     current: Arc<Mutex<Option<Arc<RendererHandle>>>>,
     renderer: Option<Arc<RendererHandle>>,
-    site: Option<SiteKey>,
-    events_rx: Option<Receiver<PageEvent>>,
+    site: Option<Site>,
+    events_rx: Option<Receiver<TabEvent>>,
     document_url: Url,
     content_language: Option<String>,
     document_loaded: bool,
@@ -503,12 +503,12 @@ struct Page {
     nav: Option<ActiveNavigation>,
     dial_tx: Sender<(u64, Result<NavOutcome, ()>)>,
     dial_rx: Receiver<(u64, Result<NavOutcome, ()>)>,
-    events: Vec<PageEvent>,
+    events: Vec<TabEvent>,
 }
 
-impl Page {
+impl Tab {
     fn new(
-        id: PageId,
+        id: TabId,
         fetch: FetchHandle,
         registry: Arc<RendererRegistry>,
         current: Arc<Mutex<Option<Arc<RendererHandle>>>>,
@@ -535,11 +535,8 @@ impl Page {
         }
     }
 
-    fn load_html(&mut self, html: &str) -> Result<(), PageError> {
-        let site = self
-            .site
-            .clone()
-            .unwrap_or_else(|| SiteKey::opaque(self.id));
+    fn load_html(&mut self, html: &str) -> Result<(), TabError> {
+        let site = self.site.clone().unwrap_or_else(|| Site::opaque(self.id));
         let mount = Mount {
             url: "about:blank".to_owned(),
             content_type: Some("text/html; charset=utf-8".to_owned()),
@@ -549,7 +546,7 @@ impl Page {
         self.mount(&site, mount)
     }
 
-    fn goto(&mut self, spec: &str) -> Result<(), PageError> {
+    fn goto(&mut self, spec: &str) -> Result<(), TabError> {
         let url = self.resolve_url(spec)?;
         self.nav_epoch = self.nav_epoch.saturating_add(1);
         self.navigation_failed = false;
@@ -563,20 +560,20 @@ impl Page {
         Ok(())
     }
 
-    fn resolve_url(&self, spec: &str) -> Result<Url, PageError> {
+    fn resolve_url(&self, spec: &str) -> Result<Url, TabError> {
         let url = Url::parse(spec)
             .or_else(|_| self.document_url.join(spec))
-            .map_err(|_| PageError::InvalidUrl { spec: spec.into() })?;
+            .map_err(|_| TabError::InvalidUrl { spec: spec.into() })?;
         if url.scheme() != "http" && url.scheme() != "https" {
-            return Err(PageError::InvalidUrl { spec: spec.into() });
+            return Err(TabError::InvalidUrl { spec: spec.into() });
         }
         Ok(url)
     }
 
-    fn set_document_url(&mut self, url: &str) -> Result<(), PageError> {
-        let parsed = Url::parse(url).map_err(|_| PageError::InvalidUrl { spec: url.into() })?;
+    fn set_document_url(&mut self, url: &str) -> Result<(), TabError> {
+        let parsed = Url::parse(url).map_err(|_| TabError::InvalidUrl { spec: url.into() })?;
         self.document_url = parsed;
-        // A fresh page may not have a renderer yet; the URL is host state and
+        // A fresh tab may not have a renderer yet; the URL is browser state and
         // mounts carry it, so the forward is best-effort.
         let command = RendererCommand::SetDocumentUrl {
             url: url.to_owned(),
@@ -593,14 +590,14 @@ impl Page {
         self.fetch.set_cookie(value, &self.document_url);
     }
 
-    fn ensure_renderer(&mut self, site: &SiteKey) -> Result<(), PageError> {
+    fn ensure_renderer(&mut self, site: &Site) -> Result<(), TabError> {
         if self.renderer.is_some() && self.site.as_ref() == Some(site) {
             return Ok(());
         }
         let handle =
             self.registry
                 .acquire(site)
-                .map_err(|error| PageError::RendererUnavailable {
+                .map_err(|error| TabError::RendererUnavailable {
                     message: error.to_string(),
                 })?;
         if let Some(old) = self.renderer.take() {
@@ -613,7 +610,7 @@ impl Page {
         Ok(())
     }
 
-    fn mount(&mut self, site: &SiteKey, mount: Mount) -> Result<(), PageError> {
+    fn mount(&mut self, site: &Site, mount: Mount) -> Result<(), TabError> {
         self.ensure_renderer(site)?;
         self.document_loaded = false;
         let result = self
@@ -634,10 +631,10 @@ impl Page {
         self.events_rx = None;
     }
 
-    fn renderer_request(&self, command: RendererCommand) -> Result<Reply, PageError> {
+    fn renderer_request(&self, command: RendererCommand) -> Result<Reply, TabError> {
         match &self.renderer {
             Some(renderer) => renderer.request(command),
-            None => Err(PageError::ActorStopped),
+            None => Err(TabError::ActorStopped),
         }
     }
 
@@ -673,19 +670,19 @@ impl Page {
             }
             self.nav = None;
             if let Ok(outcome) = result {
-                self.events.push(PageEvent::Fetch {
+                self.events.push(TabEvent::Fetch {
                     status: outcome.status,
                 });
                 self.commit_navigation(outcome);
             } else {
-                self.events.push(PageEvent::FetchFailed);
+                self.events.push(TabEvent::FetchFailed);
                 self.navigation_failed = true;
             }
         }
     }
 
     fn commit_navigation(&mut self, outcome: NavOutcome) {
-        let site = SiteKey::for_url(&outcome.final_url).unwrap_or_else(|| SiteKey::opaque(self.id));
+        let site = Site::for_url(&outcome.final_url).unwrap_or_else(|| Site::opaque(self.id));
         self.document_url = outcome.final_url.clone();
         self.content_language.clone_from(&outcome.content_language);
         let mount = Mount {
@@ -707,7 +704,7 @@ impl Page {
             }
         }
         for event in arrived {
-            if event == PageEvent::Load {
+            if event == TabEvent::Load {
                 self.document_loaded = true;
             }
             self.events.push(event);
@@ -743,15 +740,15 @@ impl Page {
     }
 }
 
-fn actor_loop(rx: &Receiver<Envelope>, mut page: Page) {
+fn actor_loop(rx: &Receiver<Envelope>, mut tab: Tab) {
     let mut subscribers = Vec::new();
     let mut published_events = 0;
     let mut waiters = Vec::new();
     loop {
-        page.pump_renderer();
-        page.launch_navigation();
-        page.pump_navigation();
-        let received = if page.busy() || !waiters.is_empty() || !subscribers.is_empty() {
+        tab.pump_renderer();
+        tab.launch_navigation();
+        tab.pump_navigation();
+        let received = if tab.busy() || !waiters.is_empty() || !subscribers.is_empty() {
             rx.recv_timeout(Duration::from_millis(10))
         } else {
             rx.recv().map_err(|_| RecvTimeoutError::Disconnected)
@@ -759,39 +756,39 @@ fn actor_loop(rx: &Receiver<Envelope>, mut page: Page) {
         let envelope = match received {
             Ok(envelope) => envelope,
             Err(RecvTimeoutError::Timeout) => {
-                publish_events(&page, &mut published_events, &mut subscribers);
-                resolve_waiters(&mut page, &mut waiters);
+                publish_events(&tab, &mut published_events, &mut subscribers);
+                resolve_waiters(&mut tab, &mut waiters);
                 continue;
             }
             Err(RecvTimeoutError::Disconnected) => break,
         };
         let _request_id = envelope.request_id;
-        if handle_command(&mut page, envelope.command, &mut waiters, &mut subscribers) {
+        if handle_command(&mut tab, envelope.command, &mut waiters, &mut subscribers) {
             return;
         }
-        page.pump_renderer();
-        publish_events(&page, &mut published_events, &mut subscribers);
-        resolve_waiters(&mut page, &mut waiters);
+        tab.pump_renderer();
+        publish_events(&tab, &mut published_events, &mut subscribers);
+        resolve_waiters(&mut tab, &mut waiters);
     }
-    page.stop_renderer();
+    tab.stop_renderer();
 }
 
 /// Handles one command; `true` means the actor returns.
 fn handle_command(
-    page: &mut Page,
+    tab: &mut Tab,
     command: Command,
     waiters: &mut Vec<Waiter>,
-    subscribers: &mut Vec<Sender<PageEvent>>,
+    subscribers: &mut Vec<Sender<TabEvent>>,
 ) -> bool {
     match command {
         Command::LoadHtml { html, reply } => {
-            let _ = reply.send(page.load_html(&html));
+            let _ = reply.send(tab.load_html(&html));
         }
         Command::Goto { url, reply } => {
-            let _ = reply.send(page.goto(&url));
+            let _ = reply.send(tab.goto(&url));
         }
         Command::Eval { source, reply } => {
-            let result = page
+            let result = tab
                 .renderer_request(RendererCommand::Eval { source })
                 .and_then(reply_text);
             let _ = reply.send(result);
@@ -801,7 +798,7 @@ fn handle_command(
             timeout,
             reply,
         } => {
-            let result = page
+            let result = tab
                 .renderer_request(RendererCommand::ExecuteScript {
                     source,
                     timeout_ms: timeout.map(millis),
@@ -833,23 +830,23 @@ fn handle_command(
             });
         }
         Command::DocumentUrl { reply } => {
-            let _ = reply.send(page.document_url.to_string());
+            let _ = reply.send(tab.document_url.to_string());
         }
         Command::ContentLanguage { reply } => {
-            let _ = reply.send(page.content_language.clone());
+            let _ = reply.send(tab.content_language.clone());
         }
         Command::CookieGet { reply } => {
-            let _ = reply.send(page.document_cookie());
+            let _ = reply.send(tab.document_cookie());
         }
         Command::CookieSet { value, reply } => {
-            page.set_document_cookie(&value);
+            tab.set_document_cookie(&value);
             let _ = reply.send(());
         }
         Command::SetDocumentUrl { url, reply } => {
-            let _ = reply.send(page.set_document_url(&url));
+            let _ = reply.send(tab.set_document_url(&url));
         }
         Command::Events { reply } => {
-            let _ = reply.send(page.events.clone());
+            let _ = reply.send(tab.events.clone());
         }
         Command::Subscribe { reply } => {
             let (events, event_rx) = mpsc::channel();
@@ -857,10 +854,10 @@ fn handle_command(
             let _ = reply.send(event_rx);
         }
         Command::LastNavigationFailed { reply } => {
-            let _ = reply.send(page.navigation_failed);
+            let _ = reply.send(tab.navigation_failed);
         }
         Command::Shutdown { reply } => {
-            page.stop_renderer();
+            tab.stop_renderer();
             let _ = reply.send(());
             return true;
         }
@@ -868,18 +865,18 @@ fn handle_command(
     false
 }
 
-fn resolve_waiters(page: &mut Page, waiters: &mut Vec<Waiter>) {
+fn resolve_waiters(tab: &mut Tab, waiters: &mut Vec<Waiter>) {
     let now = Instant::now();
     let mut pending = Vec::new();
     for waiter in std::mem::take(waiters) {
         match waiter {
-            Waiter::Idle(reply) if !page.has_background_work() => {
+            Waiter::Idle(reply) if !tab.has_background_work() => {
                 let _ = reply.send(());
             }
-            Waiter::Load(reply) if !page.waiting_for_load() => {
+            Waiter::Load(reply) if !tab.waiting_for_load() => {
                 let _ = reply.send(());
             }
-            Waiter::LoadTimeout { reply, .. } if !page.waiting_for_load() => {
+            Waiter::LoadTimeout { reply, .. } if !tab.waiting_for_load() => {
                 let _ = reply.send(true);
             }
             Waiter::LoadTimeout { deadline, reply } if now >= deadline => {
@@ -893,7 +890,7 @@ fn resolve_waiters(page: &mut Page, waiters: &mut Vec<Waiter>) {
                 if now >= deadline {
                     let _ = reply.send(false);
                 } else if matches!(
-                    page.renderer_request(RendererCommand::ExecuteScript {
+                    tab.renderer_request(RendererCommand::ExecuteScript {
                         source: source.clone(),
                         timeout_ms: None
                     }),
@@ -914,30 +911,30 @@ fn resolve_waiters(page: &mut Page, waiters: &mut Vec<Waiter>) {
     *waiters = pending;
 }
 
-fn publish_events(page: &Page, cursor: &mut usize, subscribers: &mut Vec<Sender<PageEvent>>) {
-    let events = &page.events[*cursor..];
+fn publish_events(tab: &Tab, cursor: &mut usize, subscribers: &mut Vec<Sender<TabEvent>>) {
+    let events = &tab.events[*cursor..];
     subscribers.retain(|subscriber| events.iter().all(|event| subscriber.send(*event).is_ok()));
-    *cursor = page.events.len();
+    *cursor = tab.events.len();
 }
 
-fn reply_unit(reply: Reply) -> Result<(), PageError> {
+fn reply_unit(reply: Reply) -> Result<(), TabError> {
     match reply {
         Reply::Unit(result) => result,
-        _ => Err(PageError::ActorStopped),
+        _ => Err(TabError::ActorStopped),
     }
 }
 
-fn reply_text(reply: Reply) -> Result<String, PageError> {
+fn reply_text(reply: Reply) -> Result<String, TabError> {
     match reply {
         Reply::Text(result) => result,
-        _ => Err(PageError::ActorStopped),
+        _ => Err(TabError::ActorStopped),
     }
 }
 
-fn reply_value(reply: Reply) -> Result<RemoteValue, PageError> {
+fn reply_value(reply: Reply) -> Result<RemoteValue, TabError> {
     match reply {
         Reply::Value(result) => result,
-        _ => Err(PageError::ActorStopped),
+        _ => Err(TabError::ActorStopped),
     }
 }
 

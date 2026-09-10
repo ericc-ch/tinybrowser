@@ -1,8 +1,8 @@
 //! `QuickJS` host for one [`crate::Document`]: eval, timers, `fetch`, DOM host objects.
 //!
 //! Callbacks live in JS (`__tb_timeouts`, `__tb_fetchCbs`). Rust holds
-//! integer ids so a `Function` never crosses the page boundary. Invocation
-//! uses `Function::call` on the page thread.
+//! integer ids so a `Function` never crosses the JS boundary. Invocation
+//! uses `Function::call` on the renderer thread.
 
 mod bindings;
 mod world;
@@ -91,7 +91,7 @@ pub(crate) struct PendingJsFetch {
     pub js_id: i32,
 }
 
-pub(crate) struct JsHost {
+pub(crate) struct JsRealm {
     runtime: Runtime,
     context: Context,
     world: Rc<RefCell<World>>,
@@ -100,7 +100,7 @@ pub(crate) struct JsHost {
     pending_fetches: Rc<RefCell<Vec<PendingJsFetch>>>,
 }
 
-impl JsHost {
+impl JsRealm {
     pub(crate) fn new(world: Rc<RefCell<World>>, stop: Arc<Stop>) -> Result<Self, JsError> {
         let runtime = Runtime::new().map_err(JsError::engine)?;
         runtime.set_memory_limit(MAX_RUNTIME_MEMORY);
@@ -355,7 +355,7 @@ globalThis.fetch = function(url) {
     }
 }
 
-impl Drop for JsHost {
+impl Drop for JsRealm {
     fn drop(&mut self) {
         self.world.borrow_mut().clear_listeners();
     }

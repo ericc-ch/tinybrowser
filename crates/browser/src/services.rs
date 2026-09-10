@@ -1,6 +1,6 @@
-//! [`renderer::HostServices`] over the browser-owned network service.
+//! [`renderer::BrowserServices`] over the browser-owned network service.
 
-use renderer::{DialOutcome, DialRequest, HostServices};
+use renderer::{BrowserServices, DialOutcome, DialRequest};
 use url::Url;
 
 use crate::network::FetchHandle;
@@ -15,7 +15,7 @@ impl FetchServices {
     }
 }
 
-impl HostServices for FetchServices {
+impl BrowserServices for FetchServices {
     fn dial(&self, request: &DialRequest) -> Option<DialOutcome> {
         // Run the blocking dial on the browser-owned pool, not the renderer's
         // dial workers ([ADR 0010], [ADR 0011]).

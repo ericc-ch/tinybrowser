@@ -1,23 +1,25 @@
 # Handoff (2026-09-10)
 
 State: Per-site renderer-process split landed on top of the earlier dirty tree,
-then hardened from two adversarial reviews. `cargo test --workspace` green
-(three consecutive full runs), `cargo clippy --workspace --all-targets` and
-`cargo fmt --all --check` clean. Nothing committed. Latest release measure:
-CLI 4,632,736 bytes, page_probe 3,600,016, against the 10 MB cap.
+then hardened from two adversarial reviews. Vocabulary standardized to browser
+process / renderer process / tab (ADR 0013). `cargo test --workspace` green,
+`cargo clippy --workspace --all-targets` and `cargo fmt --all --check` clean.
+Nothing committed. Latest release measure: CLI 4,632,736 bytes, tab_probe
+3,600,016, against the 10 MB cap.
 
 Done:
 
 - [ADR 0011](../docs/adrs/0011-renderer-processes-per-site.md): renderer process
-  per site instance; tab `Page` in the host. [ADR 0012](../docs/adrs/0012-host-protocol-and-cli-stack.md):
-  axum + clap, `http1` retired, 10 MB cap. ADR 0007 table, AGENTS.md, CONTEXT.md,
-  size-budget.md updated.
-- New `crates/renderer`: parser/`Sink`, `Document` (`Dom` + QuickJS + jobs +
-  timers), value-only `protocol` (serde), `HostServices`, `--renderer` stdio
+  per site instance; tab `Tab` in the browser process. [ADR 0012](../docs/adrs/0012-host-protocol-and-cli-stack.md):
+  axum + clap, `http1` retired, 10 MB cap. [ADR 0013](../docs/adrs/0013-vocabulary-and-process-names.md):
+  browser process / renderer process / tab vocabulary. ADR 0007 table, AGENTS.md,
+  CONTEXT.md, size-budget.md updated.
+- New `crates/renderer`: parser/`Sink`, `Document` (`Dom` + QuickJS + tasks +
+  timers), value-only `protocol` (serde), `BrowserServices`, `--renderer` stdio
   transport. The crate has no `net` dependency (tests use it as a dev-dependency
-  for a test host).
-- `crates/browser` is host-only now: `Browser`, tab `Page` + `PageActor`
-  coordinator, `RendererRegistry` with Local/Process backends, host-side
+  for test services).
+- `crates/browser` is browser-side only now: `Browser`, tab `Tab` + `TabActor`
+  coordinator, `RendererRegistry` with Local/Process backends, browser-side
   navigation dials, cookies on the shared `NetworkSession`.
 - CLI on clap; CDP and WebDriver on axum; `crates/http1` deleted.
 - Tests moved: renderer document suite (9) + html5lib corpus; new cross-site
@@ -35,7 +37,7 @@ Next:
 
 1. Run `./tools/wpt/run` on the process path (not run this session).
 2. Renderer sandboxing (namespaces/seccomp) — separate security phase.
-3. Host-side navigation resolves relative URLs against the document URL only;
+3. Browser-side navigation resolves relative URLs against the document URL only;
    `<base href>` is still honored inside the renderer for scripts/fetch. Add
    base-URL reporting if navigation needs it.
 4. OOPIF when iframe documents land; renderer preallocation and a RAM-based
@@ -45,6 +47,6 @@ Gotchas:
 
 - `Browser::open_in` / `open_with_network` default to `Renderers::Process`;
   library tests must use `open_in_with(..., Renderers::Local)` or `ephemeral`,
-  because the test binary cannot host `--renderer`.
+  because the test binary cannot spawn `--renderer`.
 - The renderer child speaks JSON lines on stdout; never `println!` in renderer
   code.

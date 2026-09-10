@@ -203,10 +203,10 @@ fn execute_sync_waits_for_returned_promise_or_script_timeout() {
 
 #[test]
 fn navigate_returns_after_load_not_after_timers() {
-    let page_listener = TcpListener::bind("127.0.0.1:0").expect("page bind");
-    let page_addr = page_listener.local_addr().expect("page addr");
+    let server_listener = TcpListener::bind("127.0.0.1:0").expect("server bind");
+    let server_addr = server_listener.local_addr().expect("server addr");
     let server = thread::spawn(move || {
-        let (mut navigation, _) = page_listener.accept().expect("navigation");
+        let (mut navigation, _) = server_listener.accept().expect("navigation");
         let mut head = Vec::new();
         let mut chunk = [0_u8; 1024];
         while !head.windows(4).any(|window| window == b"\r\n\r\n") {
@@ -236,7 +236,7 @@ fn navigate_returns_after_load_not_after_timers() {
         &addr,
         "POST",
         &format!("/session/{id}/url"),
-        Some(&format!(r#"{{"url":"http://{page_addr}/"}}"#)),
+        Some(&format!(r#"{{"url":"http://{server_addr}/"}}"#)),
     );
     assert_eq!(navigated["value"], json!(null));
     assert!(
@@ -264,10 +264,10 @@ fn navigate_returns_after_load_not_after_timers() {
 
 #[test]
 fn new_window_uses_builder_resolve_map() {
-    let page_listener = TcpListener::bind("127.0.0.1:0").expect("page bind");
-    let page_addr = page_listener.local_addr().expect("page addr");
+    let server_listener = TcpListener::bind("127.0.0.1:0").expect("server bind");
+    let server_addr = server_listener.local_addr().expect("server addr");
     let server = thread::spawn(move || {
-        let (mut navigation, _) = page_listener.accept().expect("navigation");
+        let (mut navigation, _) = server_listener.accept().expect("navigation");
         let mut head = Vec::new();
         let mut chunk = [0_u8; 1024];
         while !head.windows(4).any(|window| window == b"\r\n\r\n") {
@@ -318,7 +318,7 @@ fn new_window_uses_builder_resolve_map() {
         &format!("/session/{id}/url"),
         Some(&format!(
             r#"{{"url":"http://web-platform.test:{}/"}}"#,
-            page_addr.port()
+            server_addr.port()
         )),
     );
     assert_eq!(navigated["value"], json!(null));
@@ -326,7 +326,7 @@ fn new_window_uses_builder_resolve_map() {
     let current = request(&addr, "GET", &format!("/session/{id}/url"), None);
     assert_eq!(
         current["value"].as_str().expect("url"),
-        format!("http://web-platform.test:{}/", page_addr.port())
+        format!("http://web-platform.test:{}/", server_addr.port())
     );
     server.join().expect("server");
 }
@@ -340,15 +340,15 @@ fn one_session_delete_leaves_pages_close_last_window_invalidates() {
         .as_str()
         .expect("session id")
         .to_owned();
-    assert_eq!(browser.handle().pages().len(), 1);
+    assert_eq!(browser.handle().tabs().len(), 1);
 
     let second = request(&addr, "POST", "/session", Some("{}"));
     assert_eq!(second["value"]["error"], json!("session not created"));
-    assert_eq!(browser.handle().pages().len(), 1);
+    assert_eq!(browser.handle().tabs().len(), 1);
 
     request(&addr, "DELETE", &format!("/session/{id}"), None);
     // ADR 0009: product DELETE /session detaches automation and leaves tabs.
-    assert_eq!(browser.handle().pages().len(), 1);
+    assert_eq!(browser.handle().tabs().len(), 1);
     let gone = request(&addr, "GET", &format!("/session/{id}/window"), None);
     assert_eq!(gone["value"]["error"], json!("invalid session id"));
 
@@ -357,11 +357,11 @@ fn one_session_delete_leaves_pages_close_last_window_invalidates() {
         .as_str()
         .expect("session id")
         .to_owned();
-    assert_eq!(browser.handle().pages().len(), 2);
+    assert_eq!(browser.handle().tabs().len(), 2);
 
     let closed = request(&addr, "DELETE", &format!("/session/{id}/window"), None);
     assert_eq!(closed["value"], json!([]));
-    assert_eq!(browser.handle().pages().len(), 1);
+    assert_eq!(browser.handle().tabs().len(), 1);
     let invalid = request(&addr, "GET", &format!("/session/{id}/window"), None);
     assert_eq!(invalid["value"]["error"], json!("invalid session id"));
 }
@@ -396,7 +396,7 @@ fn execute_sync_interrupts_infinite_loop() {
 }
 
 #[test]
-fn click_and_actions_are_unsupported() {
+fn click_and_perform_actions_are_unsupported_release_is_a_noop() {
     let (addr, _browser) = start(AgentBuilder::new());
     let created = request(&addr, "POST", "/session", Some("{}"));
     let id = created["value"]["sessionId"]
@@ -413,5 +413,5 @@ fn click_and_actions_are_unsupported() {
     let actions = request(&addr, "POST", &format!("/session/{id}/actions"), Some("{}"));
     assert_eq!(actions["value"]["error"], json!("unsupported operation"));
     let released = request(&addr, "DELETE", &format!("/session/{id}/actions"), None);
-    assert_eq!(released["value"]["error"], json!("unsupported operation"));
+    assert_eq!(released["value"], Value::Null);
 }

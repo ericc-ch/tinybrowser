@@ -3,7 +3,7 @@
 //! Speaks the W3C HTTP protocol
 //! ([WebDriver](https://w3c.github.io/webdriver/)) enough for testharness:
 //! session, navigate, execute script, windows. Adapter over
-//! [`BrowserHandle`](browser::BrowserHandle); it does not own Browser, pages,
+//! [`BrowserHandle`](browser::BrowserHandle); it does not own Browser, tabs,
 //! or the cookie jar.
 
 use std::collections::HashMap;
@@ -16,7 +16,7 @@ use axum::body::Bytes;
 use axum::extract::State;
 use axum::http::{Method, StatusCode, Uri};
 use axum::response::{IntoResponse, Json, Response};
-use browser::{BrowserHandle, PageError, PageHandle, RemoteValue, ScriptFailure};
+use browser::{BrowserHandle, RemoteValue, ScriptFailure, TabError, TabHandle};
 use serde_json::{Value, json};
 
 pub use browser::AgentBuilder;
@@ -115,17 +115,17 @@ struct Session {
 }
 
 struct Window {
-    page: PageHandle,
+    tab: TabHandle,
 }
 
 impl Sessions {
     fn blank_window(&self) -> Result<Window, String> {
-        let page = self.browser.create_page().map_err(|err| err.to_string())?;
-        if let Err(error) = page.load_html("<!doctype html><title></title>") {
-            let _ = self.browser.close_page(page.id());
+        let tab = self.browser.create_tab().map_err(|err| err.to_string())?;
+        if let Err(error) = tab.load_html("<!doctype html><title></title>") {
+            let _ = self.browser.close_tab(tab.id());
             return Err(error.to_string());
         }
-        Ok(Window { page })
+        Ok(Window { tab })
     }
 
     fn create(&mut self) -> Result<String, String> {
@@ -193,8 +193,14 @@ fn dispatch(method: &str, path: &str, body: &str, sessions: &mut Sessions) -> (u
         ("POST", ["session", _session, "actions"]) => {
             error(500, "unsupported operation", "actions")
         }
-        ("DELETE", ["session", _session, "actions"]) => {
-            error(500, "unsupported operation", "release actions")
+        // Release Actions ([WebDriver] release-actions). No input state can
+        // exist while Perform Actions is unsupported, so releasing is a no-op.
+        ("DELETE", ["session", session, "actions"]) => {
+            if sessions.open.contains_key(*session) {
+                ok(Value::Null)
+            } else {
+                error(404, "invalid session id", session)
+            }
         }
         _ => error(404, "unknown command", path),
     }
@@ -214,27 +220,27 @@ fn navigate(sessions: &mut Sessions, session: &str, body: &str) -> (u16, Value) 
     let Some(window) = current(sessions, session) else {
         return error(404, "invalid session id", session);
     };
-    match window.page.goto(&url) {
+    match window.tab.goto(&url) {
         Ok(()) => {
-            match window.page.run_until_load_timeout(page_load_timeout) {
+            match window.tab.run_until_load_timeout(page_load_timeout) {
                 Ok(false) => return error(500, "timeout", "navigation timed out"),
                 Ok(true) => {}
                 Err(err) => return error(500, "unknown error", &err.to_string()),
             }
-            match window.page.last_navigation_failed() {
+            match window.tab.last_navigation_failed() {
                 Ok(true) => error(500, "unknown error", "navigation failed"),
                 Ok(false) => ok(Value::Null),
                 Err(err) => error(500, "unknown error", &err.to_string()),
             }
         }
-        Err(PageError::InvalidUrl { spec }) => error(400, "invalid argument", &spec),
+        Err(TabError::InvalidUrl { spec }) => error(400, "invalid argument", &spec),
         Err(err) => error(500, "unknown error", &err.to_string()),
     }
 }
 
 fn current_url(sessions: &Sessions, session: &str) -> (u16, Value) {
     match current(sessions, session) {
-        Some(window) => match window.page.document_url() {
+        Some(window) => match window.tab.document_url() {
             Ok(url) => ok(json!(url)),
             Err(err) => error(500, "unknown error", &err.to_string()),
         },
@@ -262,12 +268,12 @@ fn execute(sessions: &mut Sessions, session: &str, body: &str, asynchronous: boo
     let started = Instant::now();
     let wrapped = wrap_script(script, &args, asynchronous);
     match window
-        .page
+        .tab
         .execute_script_timeout(&wrapped, Some(script_timeout))
     {
         Err(err) => script_error(&err),
         Ok(_) if asynchronous => wait_for_async(window, remaining(started, script_timeout)),
-        Ok(value) => match window.page.execute_script("globalThis.__wd_wait === true") {
+        Ok(value) => match window.tab.execute_script("globalThis.__wd_wait === true") {
             Ok(RemoteValue::Bool(true)) => {
                 wait_for_async(window, remaining(started, script_timeout))
             }
@@ -283,19 +289,16 @@ fn remaining(started: Instant, budget: Duration) -> Duration {
 
 fn wait_for_async(window: &Window, script_timeout: Duration) -> (u16, Value) {
     match window
-        .page
+        .tab
         .run_until_js_true("globalThis.__wd_done === true", script_timeout)
     {
         Ok(false) => return error(500, "script timeout", "script timeout"),
         Ok(true) => {}
         Err(err) => return error(500, "unknown error", &err.to_string()),
     }
-    match window
-        .page
-        .execute_script("globalThis.__wd_failed === true")
-    {
+    match window.tab.execute_script("globalThis.__wd_failed === true") {
         Ok(RemoteValue::Bool(true)) => {
-            let message = match window.page.execute_script("String(globalThis.__wd_err)") {
+            let message = match window.tab.execute_script("String(globalThis.__wd_err)") {
                 Ok(RemoteValue::String(text)) => text,
                 Ok(_) => "javascript error".to_owned(),
                 Err(err) => return script_error(&err),
@@ -305,15 +308,15 @@ fn wait_for_async(window: &Window, script_timeout: Duration) -> (u16, Value) {
         Ok(_) => {}
         Err(err) => return script_error(&err),
     }
-    match window.page.execute_script("globalThis.__wd_async") {
+    match window.tab.execute_script("globalThis.__wd_async") {
         Ok(value) => ok(encode(&value)),
         Err(err) => script_error(&err),
     }
 }
 
-fn script_error(err: &PageError) -> (u16, Value) {
+fn script_error(err: &TabError) -> (u16, Value) {
     match err {
-        PageError::Script(ScriptFailure::Interrupted) => {
+        TabError::Script(ScriptFailure::Interrupted) => {
             error(500, "script timeout", "script timeout")
         }
         _ => error(500, "javascript error", &err.to_string()),
@@ -489,21 +492,21 @@ fn new_window(sessions: &mut Sessions, session: &str) -> (u16, Value) {
 }
 
 fn close_window(sessions: &mut Sessions, session: &str) -> (u16, Value) {
-    let (page_id, remaining) = {
+    let (tab_id, remaining) = {
         let Some(found) = sessions.open.get_mut(session) else {
             return error(404, "invalid session id", session);
         };
         let Some(window) = found.windows.remove(&found.current) else {
             return error(404, "no such window", &found.current);
         };
-        let page_id = window.page.id();
+        let tab_id = window.tab.id();
         let remaining: Vec<String> = found.windows.keys().cloned().collect();
         if let Some(next) = remaining.first() {
             found.current.clone_from(next);
         }
-        (page_id, remaining)
+        (tab_id, remaining)
     };
-    let _ = sessions.browser.close_page(page_id);
+    let _ = sessions.browser.close_tab(tab_id);
     if remaining.is_empty() {
         sessions.open.remove(session);
     }

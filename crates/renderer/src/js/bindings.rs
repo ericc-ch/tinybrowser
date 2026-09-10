@@ -1,4 +1,4 @@
-//! Host objects for DOM nodes, one interface per class.
+//! Platform objects for DOM nodes, one interface per class.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -714,7 +714,7 @@ fn class_proto<'js>(ctx: &Ctx<'js>, name: &str) -> Result<Option<Object<'js>>> {
 fn world(ctx: &Ctx<'_>) -> Result<Rc<RefCell<World>>> {
     ctx.userdata::<SharedWorld>()
         .map(|guard| guard.0.clone())
-        .ok_or_else(|| Exception::throw_internal(ctx, "missing page world"))
+        .ok_or_else(|| Exception::throw_internal(ctx, "missing JS world"))
 }
 
 fn add_listener<'js>(

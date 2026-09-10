@@ -1,12 +1,12 @@
-# Host protocol stack: axum + clap, 10 MB size cap
+# Browser-process protocol stack: axum + clap, 10 MB size cap
 
-The host's loopback protocol adapters and CLI stop being hand-rolled. Inbound HTTP
+The browser process's loopback protocol adapters and CLI stop being hand-rolled. Inbound HTTP
 for CDP and WebDriver runs on **axum** (hyper/tower); CLI parsing runs on **clap**.
 The stripped-binary ceiling moves from 5 MB to **10 MB**.
 
 Status: accepted (2026-09-10). Supersedes the "no axum/hyper" rule and the `http1`
 crate in [ADR 0007](0007-engine-charter.md). The engine charter otherwise stands:
-the page runtime is still Tokio current-thread `rt`+`time`, blocking page work runs
+the renderer runtime is still Tokio current-thread `rt`+`time`, blocking work runs
 on the browser-owned executor, and the renderer path takes no web-server stack.
 
 ## Decision
@@ -22,8 +22,8 @@ on the browser-owned executor, and the renderer path takes no web-server stack.
   `docs/researches/size-budget.md`. Milestones still measure marginals; the cap is a
   ceiling, not a target, and regressions still justify themselves in bytes.
 - No HTTP framework, CLI crate, or multi-thread runtime enters the renderer. The renderer's `protocol` module uses `serde`/`serde_json` for the value-only IPC seam ([ADR 0011](0011-renderer-processes-per-site.md)); nothing else in the renderer serializes. Renderer IPC is std IPC, not HTTP.
-- The renderer runtime keeps Tokio current-thread `rt`+`time`. The host may take
-  `rt-multi-thread` + `net` for the server; host page actors are plain OS threads
+- The renderer runtime keeps Tokio current-thread `rt`+`time`. The browser process may take
+  `rt-multi-thread` + `net` for the server; tab actors are plain OS threads
   and renderers keep their own current-thread runtimes.
 
 ## Why
@@ -36,7 +36,7 @@ on the browser-owned executor, and the renderer path takes no web-server stack.
   catch-all error. clap gives one parse path, real help, and shell completion later.
 - The 5 MB cap forced these decisions more than the product did. At the single
   measured engine baseline the binary is 3.5 MB; a 10 MB cap keeps the engine lean
-  while letting the host layer use maintained crates.
+  while letting the browser-process layer use maintained crates.
 
 ## Consequences
 
@@ -44,9 +44,9 @@ on the browser-owned executor, and the renderer path takes no web-server stack.
   +1.5–2.5 MB tuned. Measure at the port and record it in
   `docs/researches/size-budget.md`.
 - `http1` leaves the workspace, its tests, and `CONTEXT.md`.
-- Blocking `BrowserHandle`/`PageHandle` calls inside async handlers go through
+- Blocking `BrowserHandle`/`TabHandle` calls inside async handlers go through
   `tokio::task::spawn_blocking`, never a blocking `send()` on a runtime worker.
-- The daemon and `--webdriver` mode each build a Tokio runtime for the server. Page
+- The daemon and `--webdriver` mode each build a Tokio runtime for the server. Tab
   actors keep their own current-thread runtimes; no runtime is nested inside
   another.
 - `cargo test` CLI flag-error cases change with clap's messages; the tests assert

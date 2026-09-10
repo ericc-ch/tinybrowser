@@ -90,10 +90,10 @@ fn browser_target_page_runtime_flatten_and_method_not_found() {
         .call("Target.closeTarget", &json!({"targetId": target_id}), None)
         .expect("close");
 
-    let before = browser.handle().pages().len();
+    let before = browser.handle().tabs().len();
     let bad = client.call("Target.createTarget", &json!({"url": "notaurl"}), None);
     assert!(bad.is_err(), "invalid createTarget url");
-    assert_eq!(browser.handle().pages().len(), before);
+    assert_eq!(browser.handle().tabs().len(), before);
 
     let _ = std::fs::remove_dir_all(data_home);
 }
@@ -119,8 +119,8 @@ fn page_navigate_loads_http_document() {
             .to_owned()
     }
 
-    let listener = TcpListener::bind("127.0.0.1:0").expect("page bind");
-    let page_addr = listener.local_addr().expect("page addr");
+    let listener = TcpListener::bind("127.0.0.1:0").expect("server bind");
+    let server_addr = listener.local_addr().expect("server addr");
     let server = thread::spawn(move || {
         let (mut stream, _) = listener.accept().expect("accept");
         let _ = read_target(&mut stream);
@@ -153,11 +153,11 @@ fn page_navigate_loads_http_document() {
     let session = attached["sessionId"].as_str().expect("session").to_owned();
     client
         .call("Page.enable", &json!({}), Some(&session))
-        .expect("enable page events");
+        .expect("enable Page events");
     client
         .call(
             "Page.navigate",
-            &json!({"url": format!("http://{page_addr}/")}),
+            &json!({"url": format!("http://{server_addr}/")}),
             Some(&session),
         )
         .expect("navigate");
@@ -175,7 +175,7 @@ fn page_navigate_loads_http_document() {
         )
         .expect("eval");
     assert_eq!(evaluated["result"]["value"], json!("hi"));
-    server.join().expect("page server");
+    server.join().expect("server");
     let _ = std::fs::remove_dir_all(data_home);
 }
 

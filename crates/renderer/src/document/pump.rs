@@ -6,8 +6,8 @@ use std::time::Duration;
 
 use tokio::time::{Instant, sleep, sleep_until};
 
-use super::{Document, HostTimer, HtmlJob, MAX_QUEUED_JS_FETCHES, QueuedDial, note_script};
-use crate::protocol::PageEvent;
+use super::{Document, MAX_QUEUED_JS_FETCHES, QueuedDial, Task, Timer, note_script};
+use crate::protocol::TabEvent;
 
 impl Document {
     pub(crate) fn drive_for(&mut self, budget: Duration) {
@@ -15,22 +15,22 @@ impl Document {
     }
 
     pub(crate) fn has_background_work(&self) -> bool {
-        !self.jobs.is_empty()
+        !self.tasks.is_empty()
             || !self.timers.is_empty()
             || self.in_flight_dials > 0
             || !self.queued_dials.is_empty()
             || self
                 .js
                 .as_ref()
-                .is_some_and(crate::js::JsHost::has_pending_work)
+                .is_some_and(crate::js::JsRealm::has_pending_work)
     }
 
-    /// HTML host timer: fire [`PageEvent::Timer`] after `delay`.
+    /// HTML host timer: fire [`TabEvent::Timer`] after `delay`.
     #[must_use]
     pub fn schedule_timer(&mut self, delay: Duration) -> u32 {
         let id = self.next_timer_id;
         self.next_timer_id = self.next_timer_id.saturating_add(1);
-        self.timers.push(HostTimer {
+        self.timers.push(Timer {
             id,
             when: Instant::now() + delay,
             fired: false,
@@ -38,7 +38,7 @@ impl Document {
         id
     }
 
-    /// Parks this thread as the document Tokio waiter until no jobs, timers,
+    /// Parks this thread as the document Tokio waiter until no tasks, timers,
     /// queued dials, or in-flight fetches remain. Must not run inside another
     /// runtime.
     ///
@@ -144,14 +144,14 @@ impl Document {
             while let Ok(completed) = self.dial_rx.try_recv() {
                 self.in_flight_dials = self.in_flight_dials.saturating_sub(1);
                 match completed {
-                    Ok(done) => self.jobs.push_back(HtmlJob::DialFinished(done)),
-                    Err(fail) => self.jobs.push_back(HtmlJob::DialFailed(fail)),
+                    Ok(done) => self.tasks.push_back(Task::DialFinished(done)),
+                    Err(fail) => self.tasks.push_back(Task::DialFailed(fail)),
                 }
             }
             self.adopt_js_work();
             self.launch_queued_dials();
-            while let Some(job) = self.jobs.pop_front() {
-                self.run_job(job);
+            while let Some(task) = self.tasks.pop_front() {
+                self.run_task(task);
                 self.adopt_js_work();
                 self.launch_queued_dials();
                 if !keep_waiting(self) {
@@ -164,7 +164,7 @@ impl Document {
             if self
                 .js
                 .as_ref()
-                .is_some_and(crate::js::JsHost::has_pending_work)
+                .is_some_and(crate::js::JsRealm::has_pending_work)
             {
                 continue;
             }
@@ -201,7 +201,7 @@ impl Document {
             })
             .await;
             while let Some(id) = self.due_timer() {
-                self.jobs.push_back(HtmlJob::Timer(id));
+                self.tasks.push_back(Task::Timer(id));
             }
         }
     }
@@ -243,10 +243,10 @@ impl Document {
         self.queued_dials = leftover;
     }
 
-    fn run_job(&mut self, job: HtmlJob) {
-        match job {
-            HtmlJob::Timer(id) => {
-                self.events.push(PageEvent::Timer(id));
+    fn run_task(&mut self, task: Task) {
+        match task {
+            Task::Timer(id) => {
+                self.events.push(TabEvent::Timer(id));
                 if let Some(js_id) = self.js_timer_slots.remove(&id)
                     && let Some(js) = &self.js
                 {
@@ -255,8 +255,8 @@ impl Document {
                 self.timers.retain(|timer| timer.id != id);
                 self.adopt_js_work();
             }
-            HtmlJob::DialFinished(done) => self.finish_dial(done),
-            HtmlJob::DialFailed(fail) => self.fail_dial(fail),
+            Task::DialFinished(done) => self.finish_dial(done),
+            Task::DialFailed(fail) => self.fail_dial(fail),
         }
     }
 
@@ -264,17 +264,17 @@ impl Document {
         let timeouts = self
             .js
             .as_ref()
-            .map(crate::js::JsHost::take_pending_timeouts)
+            .map(crate::js::JsRealm::take_pending_timeouts)
             .unwrap_or_default();
         let fetches = self
             .js
             .as_ref()
-            .map(crate::js::JsHost::take_pending_fetches)
+            .map(crate::js::JsRealm::take_pending_fetches)
             .unwrap_or_default();
         let cancels: HashSet<i32> = self
             .js
             .as_ref()
-            .map(crate::js::JsHost::take_pending_cancels)
+            .map(crate::js::JsRealm::take_pending_cancels)
             .unwrap_or_default()
             .into_iter()
             .collect();
@@ -302,7 +302,7 @@ impl Document {
                 .filter(|dial| matches!(dial, QueuedDial::JsFetch { .. }))
                 .count();
             if queued_js_fetches >= MAX_QUEUED_JS_FETCHES {
-                self.events.push(PageEvent::FetchFailed);
+                self.events.push(TabEvent::FetchFailed);
                 self.settle_js_fetch(fetch.js_id, false, 0, "");
                 continue;
             }
@@ -315,7 +315,7 @@ impl Document {
                     epoch: self.js_epoch,
                 });
             } else {
-                self.events.push(PageEvent::FetchFailed);
+                self.events.push(TabEvent::FetchFailed);
                 self.settle_js_fetch(fetch.js_id, false, 0, "");
             }
         }

@@ -2,7 +2,7 @@
 //!
 //! [ADR 0011](../../../docs/adrs/0011-renderer-processes-per-site.md): the
 //! child is the same executable; commands arrive on stdin, replies, events,
-//! and host-service calls leave on stdout. stderr stays for diagnostics.
+//! and browser-service calls leave on stdout. stderr stays for diagnostics.
 
 use std::collections::HashMap;
 use std::io::{self, BufRead, Write};
@@ -14,7 +14,7 @@ use std::thread;
 use url::Url;
 
 use crate::protocol::{
-    Command, DialOutcome, DialRequest, FromRenderer, HostServices, ServiceCall, ServiceReply,
+    BrowserServices, Command, DialOutcome, DialRequest, FromRenderer, ServiceCall, ServiceReply,
     ToRenderer,
 };
 
@@ -83,7 +83,7 @@ fn write_messages(rx: &mpsc::Receiver<FromRenderer>) {
     }
 }
 
-/// [`HostServices`] proxy that asks the host over the pipe.
+/// [`BrowserServices`] proxy that asks the browser process over the pipe.
 struct PipeServices {
     out: Sender<FromRenderer>,
     pending: Mutex<HashMap<u64, Sender<ServiceReply>>>,
@@ -132,7 +132,7 @@ impl PipeServices {
     }
 }
 
-impl HostServices for PipeServices {
+impl BrowserServices for PipeServices {
     fn dial(&self, request: &DialRequest) -> Option<DialOutcome> {
         match self.call(ServiceCall::Dial(request.clone()))? {
             ServiceReply::Dial(outcome) => outcome,

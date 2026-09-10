@@ -4,9 +4,9 @@ use std::time::{Duration, Instant, SystemTime};
 
 use url::Url;
 
-use crate::context::Context;
 use crate::cookie::{CookieJar, CookieOp, RetrievalKind};
 use crate::error::{LimitExceeded, NetError, ProtocolError, TimeoutKind, TransportError};
+use crate::initiator::InitiatorKind;
 use crate::protocol::{HeaderError, HeaderMap, Method};
 use crate::resolve::HostMap;
 use crate::transport::{CallBudget, HttpEngine, basic_authorization};
@@ -185,7 +185,7 @@ impl Agent {
                 url: uri,
                 now: (self.now)(),
                 kind: RetrievalKind::NonHttp,
-                context: Context::Fetch,
+                initiator_kind: InitiatorKind::Fetch,
                 method: &Method::GET,
                 initiator: Some(uri),
                 cross_site_redirect: false,
@@ -203,7 +203,7 @@ impl Agent {
                     url: uri,
                     now: (self.now)(),
                     kind: RetrievalKind::NonHttp,
-                    context: Context::Fetch,
+                    initiator_kind: InitiatorKind::Fetch,
                     method: &Method::GET,
                     initiator: Some(uri),
                     cross_site_redirect: false,
@@ -232,7 +232,7 @@ impl Agent {
         &self,
         headers: &mut HeaderMap,
         url: &Url,
-        context: Context,
+        initiator_kind: InitiatorKind,
         method: &Method,
         initiator: Option<&Url>,
         cross_site_redirect: bool,
@@ -245,7 +245,7 @@ impl Agent {
                 url,
                 now: (self.now)(),
                 kind: RetrievalKind::Http,
-                context,
+                initiator_kind,
                 method,
                 initiator,
                 cross_site_redirect,
@@ -264,7 +264,7 @@ impl Agent {
         {
             let _ = headers.insert("User-Agent", ua.as_bytes());
         }
-        if context == Context::WsHandshake
+        if initiator_kind == InitiatorKind::WsHandshake
             && let Some(document) = initiator
         {
             let origin = document.origin().ascii_serialization();
@@ -276,7 +276,7 @@ impl Agent {
     pub(crate) fn store_set_cookie_lines(
         &self,
         url: &Url,
-        context: Context,
+        initiator_kind: InitiatorKind,
         method: &Method,
         initiator: Option<&Url>,
         cross_site_redirect: bool,
@@ -294,7 +294,7 @@ impl Agent {
                     url,
                     now,
                     kind: RetrievalKind::Http,
-                    context,
+                    initiator_kind,
                     method,
                     initiator,
                     cross_site_redirect,
@@ -310,14 +310,14 @@ impl Default for Agent {
     }
 }
 
-/// One outbound request. Default [`Context`] is [`Context::Navigation`].
+/// One outbound request. Default [`InitiatorKind`] is [`InitiatorKind::Navigation`].
 #[derive(Debug)]
 pub struct RequestBuilder {
     agent: Agent,
     method: Method,
     url: Url,
     headers: HeaderMap,
-    context: Context,
+    initiator_kind: InitiatorKind,
     initiator: Option<Url>,
     body: Option<Vec<u8>>,
 }
@@ -329,7 +329,7 @@ impl RequestBuilder {
             method,
             url,
             headers: HeaderMap::new(),
-            context: Context::default(),
+            initiator_kind: InitiatorKind::default(),
             initiator: None,
             body: None,
         }
@@ -347,8 +347,8 @@ impl RequestBuilder {
 
     /// Sets the initiator class used for `SameSite` and (later) `Sec-Fetch-*`.
     #[must_use]
-    pub fn with_context(mut self, context: Context) -> Self {
-        self.context = context;
+    pub fn with_initiator_kind(mut self, initiator_kind: InitiatorKind) -> Self {
+        self.initiator_kind = initiator_kind;
         self
     }
 
@@ -368,8 +368,8 @@ impl RequestBuilder {
 
     /// Initiator class for this request.
     #[must_use]
-    pub fn context(&self) -> Context {
-        self.context
+    pub fn initiator_kind(&self) -> InitiatorKind {
+        self.initiator_kind
     }
 
     /// Sends the request and follows HTTP redirects per
@@ -392,7 +392,7 @@ impl RequestBuilder {
         let mut body = self.body;
         let mut followed = 0u32;
         let agent = self.agent;
-        let context = self.context;
+        let initiator_kind = self.initiator_kind;
         let initiator = self.initiator;
         let mut cross_site_redirect = false;
         let started = Instant::now();
@@ -411,7 +411,7 @@ impl RequestBuilder {
             agent.prepare_outbound(
                 &mut hop_headers,
                 &url,
-                context,
+                initiator_kind,
                 &method,
                 initiator.as_ref(),
                 cross_site_redirect,
@@ -425,13 +425,13 @@ impl RequestBuilder {
                 status,
                 response_headers,
                 reader,
-                context,
+                initiator_kind,
                 url.clone(),
                 budget,
             );
             agent.store_set_cookie_lines(
                 &url,
-                context,
+                initiator_kind,
                 &method,
                 initiator.as_ref(),
                 cross_site_redirect,
@@ -479,12 +479,12 @@ impl RequestBuilder {
             return Err(NetError::Protocol(ProtocolError::RejectedRequest));
         }
         let method = Method::GET;
-        let context = Context::WsHandshake;
+        let initiator_kind = InitiatorKind::WsHandshake;
         let mut headers = self.headers;
         self.agent.prepare_outbound(
             &mut headers,
             &self.url,
-            context,
+            initiator_kind,
             &method,
             self.initiator.as_ref(),
             false,
@@ -493,7 +493,7 @@ impl RequestBuilder {
             &self.agent,
             &self.url,
             &headers,
-            context,
+            initiator_kind,
             &method,
             self.initiator.as_ref(),
         )
@@ -647,7 +647,7 @@ pub struct Response {
     status: u16,
     headers: HeaderMap,
     final_url: Url,
-    context: Context,
+    initiator_kind: InitiatorKind,
     body: Body,
 }
 
@@ -656,7 +656,7 @@ impl Response {
         status: u16,
         headers: HeaderMap,
         body: Box<dyn io::Read + Send>,
-        context: Context,
+        initiator_kind: InitiatorKind,
         final_url: Url,
         budget: CallBudget,
     ) -> Self {
@@ -664,7 +664,7 @@ impl Response {
             status,
             headers,
             final_url,
-            context,
+            initiator_kind,
             body: Body::from_reader(body, budget),
         }
     }
@@ -689,8 +689,8 @@ impl Response {
 
     /// Initiator class that produced this response.
     #[must_use]
-    pub fn context(&self) -> Context {
-        self.context
+    pub fn initiator_kind(&self) -> InitiatorKind {
+        self.initiator_kind
     }
 
     /// Consumes the response and returns its body stream.

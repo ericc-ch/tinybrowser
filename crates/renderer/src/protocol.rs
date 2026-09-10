@@ -1,4 +1,4 @@
-//! The value-only seam between host and renderer.
+//! The value-only seam between browser process and renderer process.
 //!
 //! [ADR 0011](../../../docs/adrs/0011-renderer-processes-per-site.md): commands,
 //! request ids, events, script results, and explicit errors cross. DOM handles,
@@ -14,7 +14,7 @@ use crate::RemoteValue;
 
 /// Why a renderer API call was refused.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum PageError {
+pub enum TabError {
     /// The URL string could not be parsed, joined, or was not `http`/`https`.
     InvalidUrl {
         /// The spec the caller passed.
@@ -31,7 +31,7 @@ pub enum PageError {
     },
 }
 
-impl fmt::Display for PageError {
+impl fmt::Display for TabError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidUrl { spec } => write!(f, "invalid url: {spec}"),
@@ -44,7 +44,7 @@ impl fmt::Display for PageError {
     }
 }
 
-impl std::error::Error for PageError {}
+impl std::error::Error for TabError {}
 
 /// Why `QuickJS` eval or a host callback failed.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -77,7 +77,7 @@ impl std::error::Error for ScriptFailure {}
 
 /// Observable HTML-job outcomes, in the order the renderer ran them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum PageEvent {
+pub enum TabEvent {
     /// The document reached `readyState = "complete"` and dispatched `load`.
     Load,
     /// A host timer whose delay elapsed.
@@ -138,11 +138,11 @@ pub struct Mount {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Reply {
     /// Unit result.
-    Unit(Result<(), PageError>),
+    Unit(Result<(), TabError>),
     /// String result.
-    Text(Result<String, PageError>),
+    Text(Result<String, TabError>),
     /// Value-only script result.
-    Value(Result<RemoteValue, PageError>),
+    Value(Result<RemoteValue, TabError>),
     /// Boolean result.
     Bool(bool),
 }
@@ -152,7 +152,7 @@ pub enum Reply {
 pub enum ToRenderer {
     /// One command with its correlation id.
     Request {
-        /// Request id chosen by the host.
+        /// Request id chosen by the browser process.
         id: u64,
         /// The command.
         command: Command,
@@ -179,8 +179,8 @@ pub enum FromRenderer {
         reply: Reply,
     },
     /// Unsolicited document event.
-    Event(PageEvent),
-    /// A host service the renderer cannot perform itself.
+    Event(TabEvent),
+    /// A browser service the renderer cannot perform itself.
     ServiceCall {
         /// Service-call id chosen by the renderer.
         id: u64,
@@ -189,7 +189,7 @@ pub enum FromRenderer {
     },
 }
 
-/// What the renderer needs the host to do.
+/// What the renderer needs the browser process to do.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum ServiceCall {
     /// Blocking HTTP GET.
@@ -230,7 +230,7 @@ pub enum DialKind {
     ClassicScript,
 }
 
-/// One blocking GET the renderer asks the host to perform.
+/// One blocking GET the renderer asks the browser process to perform.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DialRequest {
     /// Why the dial happens.
@@ -262,7 +262,7 @@ pub struct DialOutcome {
 ///
 /// In-process this is the `browser` crate's network adapter. In the
 /// `--renderer` child it is a pipe proxy. Renderer code never names `net`.
-pub trait HostServices: Send + Sync + 'static {
+pub trait BrowserServices: Send + Sync + 'static {
     /// Blocking GET. `None` is a transport, timeout, or body-limit failure.
     ///
     /// Called from the renderer's dial workers, never from the render loop.
@@ -406,7 +406,7 @@ mod tests {
             },
             FromRenderer::Reply {
                 id: 2,
-                reply: Reply::Unit(Err(PageError::Script(ScriptFailure::Interrupted))),
+                reply: Reply::Unit(Err(TabError::Script(ScriptFailure::Interrupted))),
             },
             FromRenderer::Reply {
                 id: 3,
@@ -420,7 +420,7 @@ mod tests {
                 id: 5,
                 reply: Reply::Value(Ok(RemoteValue::List(vec![RemoteValue::Number(1.0)]))),
             },
-            FromRenderer::Event(PageEvent::Fetch { status: 404 }),
+            FromRenderer::Event(TabEvent::Fetch { status: 404 }),
             FromRenderer::ServiceCall {
                 id: 6,
                 call: ServiceCall::Dial(DialRequest {

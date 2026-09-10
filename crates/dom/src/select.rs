@@ -217,7 +217,7 @@ enum PseudoClass {
     Dir(Box<str>),
     // Vacuous states: real truth needs runtime context a headless tree
     // cannot have. They parse (browsers never throw on these) and match
-    // nothing, exactly what a fresh page answers in a live browser.
+    // nothing, exactly what a fresh document answers in a live browser.
     /// `:visited`: no browsing history exists.
     Visited,
     /// `:hover`: there is no pointer.

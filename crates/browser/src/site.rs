@@ -4,14 +4,14 @@
 
 use url::Url;
 
-use crate::actor::PageId;
+use crate::actor::TabId;
 
 /// Chrome-style site: scheme plus registrable domain (`https://example.co.uk`),
-/// or an opaque per-page instance for non-HTTP(S) documents.
+/// or an opaque per-tab instance for non-HTTP(S) documents.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct SiteKey(String);
+pub struct Site(String);
 
-impl SiteKey {
+impl Site {
     /// Site for an HTTP(S) URL; `None` for opaque or non-HTTP URLs.
     #[must_use]
     pub fn for_url(url: &Url) -> Option<Self> {
@@ -22,14 +22,14 @@ impl SiteKey {
         }
     }
 
-    /// Opaque instance for one page's non-HTTP documents.
+    /// Opaque instance for one tab's non-HTTP documents.
     #[must_use]
-    pub fn opaque(page: PageId) -> Self {
-        Self(format!("opaque:page-{}", page.get()))
+    pub fn opaque(tab: TabId) -> Self {
+        Self(format!("opaque:tab-{}", tab.get()))
     }
 
-    /// Whether this key is a per-page opaque instance, which is never reusable
-    /// by another page.
+    /// Whether this key is a per-tab opaque instance, which is never reusable
+    /// by another tab.
     #[must_use]
     pub fn is_opaque(&self) -> bool {
         self.0.starts_with("opaque:")

@@ -1,4 +1,4 @@
-//! Value-only script results that may cross the host seam.
+//! Value-only script results that may cross the browser seam.
 
 use serde::{Deserialize, Serialize};
 

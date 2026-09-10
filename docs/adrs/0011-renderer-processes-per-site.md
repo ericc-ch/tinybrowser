@@ -2,13 +2,13 @@
 
 tinybrowser isolates pages by **site instance**, not by tab and not by origin. Each
 site instance runs its page engine in a **renderer process** — the same executable
-spawned as `--renderer` — while the tab (`Page`), navigation, network, and cookies
-stay in the host process. This replaces the "threads are the seam, process isolation
+spawned as `--renderer` — while the tab (`Tab`), navigation, network, and cookies
+stay in the browser process. This replaces the "threads are the seam, process isolation
 is later" posture of [ADR 0010](0010-page-actor-ownership.md).
 
 Status: accepted. Replaces the Isolation section of [ADR 0010](0010-page-actor-ownership.md).
 Extends the self-spawned-worker allowance of [ADR 0009](0009-named-profile-daemon.md).
-`PageHandle`, `PageId`, and the protocol adapters do not change.
+`TabHandle`, `TabId`, and the protocol adapters do not change.
 
 ## Decision
 
@@ -24,31 +24,31 @@ Extends the self-spawned-worker allowance of [ADR 0009](0009-named-profile-daemo
 - One OS process per live site instance: the same executable, invoked as
   `tinybrowser --renderer`. The process boundary, not a thread, is the isolation
   property.
-- The host owns **`Page`** (tab): `PageId`, navigation state, the document URL, and
-  the site decision; the host's `Browser` owns the renderer registry. The renderer
-  owns **`Document`**: `Dom`, QuickJS realm, active parser, HTML jobs, and host
+- The browser process owns **`Tab`** (tab): `TabId`, navigation state, the document URL, and
+  the site decision; the browser process's `Browser` owns the renderer registry. The renderer
+  owns **`Document`**: `Dom`, QuickJS realm, active parser, tasks, and browser
   timers.
-- Navigation is host-driven. The host dials, observes the final URL and headers,
+- Navigation is browser-driven. The browser process dials, observes the final URL and headers,
   computes the site, and mounts the document in the renderer for that site. A
-  cross-site navigation mounts the new document in a different renderer; `Page` and
-  `PageId` survive.
-- Host-to-renderer communication is value-only over IPC: commands, request ids,
+  cross-site navigation mounts the new document in a different renderer; `Tab` and
+  `TabId` survive.
+- Browser-to-renderer communication is value-only over IPC: commands, request ids,
   events, script results, and explicit errors. DOM handles, QuickJS values,
   callbacks, Rust borrows, and `net` types never cross.
-- Renderer code never links `net`. Dials, cookies, and profile persistence are host
-  services reached through the seam; the host's `NetworkSession` remains one per
+- Renderer code never links `net`. Dials, cookies, and profile persistence are browser-side
+  services reached through the seam; the browser process's `NetworkSession` remains one per
   profile.
 - One frame per tab in v1. Renderers are spawned per site instance so that
   same-site iframes can join a renderer and cross-site iframes can get their own
   (OOPIF) without moving owners.
 - QuickJS 5 s / 32 MiB / 512 KiB stay per-realm v0 survival knobs, not web-platform
-  numbers. Renderer count is host policy capped from available RAM later. There is no
+  numbers. Renderer count is browser-process policy capped from available RAM later. There is no
   shared QuickJS heap.
 
 ## Why the site cut
 
 - **Same heap is not isolation.** Threads in one process share an address space; a
-  read primitive in one page reaches every other page in the process. Only separate
+  read primitive in one document reaches every other document in the process. Only separate
   address spaces make the boundary real.
 - **Tabs are the wrong grain.** Once iframe documents exist, two sites in one tab
   must not share a heap, and one site's frames in a tab must share one (synchronous
@@ -77,10 +77,10 @@ Engine ground truth:
 
 - The first navigation to a new site pays process startup. Preallocated renderers
   are a later optimization, not a v1 requirement.
-- A renderer crash loses that document, not the browser process. The host reports it
-  as a page error and can reload; v1 does not promise automatic recovery.
+- A renderer crash loses that document, not the browser process. The browser process reports it
+  as a tab error and can reload; v1 does not promise automatic recovery.
 - The `browser` crate splits: a `renderer` crate owns the page engine and the
-  renderer entry point; `browser` keeps host ownership. The seam's value types are
+  renderer entry point; `browser` keeps browser-side ownership. The seam's value types are
   defined before the crate split, so the crate boundary is not designed twice.
 - Tests use an in-process renderer backend for speed where the process boundary is
   not under test; at least one loopback E2E test crosses a real `--renderer`

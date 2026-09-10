@@ -137,8 +137,8 @@ fn create_list_eval_close_over_cdp() {
 
 #[test]
 fn renderer_process_runs_classic_scripts_and_fetches() {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("page bind");
-    let addr = listener.local_addr().expect("page addr");
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("server bind");
+    let addr = listener.local_addr().expect("server addr");
     let server = std::thread::spawn(move || {
         for _ in 0..3 {
             let (mut stream, _) = listener.accept().expect("accept");
@@ -205,7 +205,7 @@ fn renderer_process_runs_classic_scripts_and_fetches() {
         "js fetch must cross the renderer pipe"
     );
     cli(&fixture, &["close"]);
-    server.join().expect("page server");
+    server.join().expect("server");
 }
 
 #[test]
@@ -324,12 +324,12 @@ fn cli_autostarts_daemon_and_select_navigate_close_last() {
     let other = cli(&fixture, &["create"]).trim().to_owned();
     cli(&fixture, &["select", &created]);
 
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("page bind");
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("server bind");
     listener
         .set_nonblocking(true)
         .expect("accept must not hang the test");
-    let page_addr = listener.local_addr().expect("page addr");
-    let page_server = std::thread::spawn(move || {
+    let server_addr = listener.local_addr().expect("server addr");
+    let server = std::thread::spawn(move || {
         let deadline = Instant::now() + Duration::from_secs(5);
         let (mut stream, _) = loop {
             match listener.accept() {
@@ -355,7 +355,7 @@ fn cli_autostarts_daemon_and_select_navigate_close_last() {
         stream.write_all(response.as_bytes()).expect("head");
         stream.write_all(body).expect("body");
     });
-    cli(&fixture, &["navigate", &format!("http://{page_addr}/")]);
+    cli(&fixture, &["navigate", &format!("http://{server_addr}/")]);
     let eval = cli(
         &fixture,
         &[
@@ -366,7 +366,7 @@ fn cli_autostarts_daemon_and_select_navigate_close_last() {
     .trim()
     .to_owned();
     assert_eq!(eval, "\"nav\"", "eval={eval}");
-    page_server.join().expect("page server");
+    server.join().expect("server");
 
     cli(&fixture, &["close"]);
     let listed = cli(&fixture, &["list"]);

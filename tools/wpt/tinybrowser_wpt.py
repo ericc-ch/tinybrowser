@@ -127,3 +127,13 @@ class TinyBrowserProtocol(WebDriverProtocol):
 class TinyBrowserTestharnessExecutor(WebDriverTestharnessExecutor):
     supports_testdriver = False
     protocol_cls = TinyBrowserProtocol
+
+    def create_test_window(self, protocol):
+        # WebDriverTestharnessExecutor.create_test_window clicks the root
+        # element to move focus to the new window. Input is not modeled yet
+        # (Perform Actions is unsupported), so skip that click and keep the
+        # window's initial about:blank.
+        test_window = protocol.base.create_window()
+        protocol.base.set_window(test_window)
+        protocol.base.execute_script(self.window_loaded_script, asynchronous=True)
+        return test_window

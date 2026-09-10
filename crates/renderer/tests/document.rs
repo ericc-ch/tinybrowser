@@ -6,19 +6,19 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use dom::NodeKind;
-use net::{Agent, AgentBuilder, Context, Method};
+use net::{Agent, AgentBuilder, InitiatorKind, Method};
 use renderer::{
-    DialKind, DialOutcome, DialRequest, Document, HostServices, Mount, PageError, PageEvent,
-    ScriptFailure,
+    BrowserServices, DialKind, DialOutcome, DialRequest, Document, Mount, ScriptFailure, TabError,
+    TabEvent,
 };
 use url::Url;
 
-/// Test host: dials through `net` and keeps one cookie jar.
-struct TestHost {
+/// Test services: dials through `net` and keeps one cookie jar.
+struct TestServices {
     agent: Agent,
 }
 
-impl TestHost {
+impl TestServices {
     fn new() -> Self {
         Self {
             agent: Agent::new(),
@@ -29,13 +29,13 @@ impl TestHost {
         Self { agent }
     }
 
-    /// Host-side navigation dial (what the browser does before `mount`).
+    /// Browser-side navigation dial (what the browser does before `mount`).
     fn navigate(&self, url: &str) -> Option<DialOutcome> {
         let url = Url::parse(url).ok()?;
         let response = self
             .agent
             .request(Method::GET, url)
-            .with_context(Context::Navigation)
+            .with_initiator_kind(InitiatorKind::Navigation)
             .send()
             .ok()?;
         let status = response.status();
@@ -65,17 +65,17 @@ impl TestHost {
     }
 }
 
-impl HostServices for TestHost {
+impl BrowserServices for TestServices {
     fn dial(&self, request: &DialRequest) -> Option<DialOutcome> {
         let url = Url::parse(&request.url).ok()?;
-        let context = match request.kind {
-            DialKind::JsFetch | DialKind::ClassicScript => Context::Fetch,
+        let initiator_kind = match request.kind {
+            DialKind::JsFetch | DialKind::ClassicScript => InitiatorKind::Fetch,
         };
         let initiator = Url::parse(&request.initiator).ok()?;
         let response = self
             .agent
             .request(Method::GET, url)
-            .with_context(context)
+            .with_initiator_kind(initiator_kind)
             .with_initiator(initiator)
             .send()
             .ok()?;
@@ -113,13 +113,13 @@ impl HostServices for TestHost {
     fn mark_dirty(&self) {}
 }
 
-fn document() -> (Document, Arc<TestHost>) {
-    let host = Arc::new(TestHost::new());
-    (Document::new(host.clone()), host)
+fn document() -> (Document, Arc<TestServices>) {
+    let services = Arc::new(TestServices::new());
+    (Document::new(services.clone()), services)
 }
 
-fn goto(document: &mut Document, host: &TestHost, url: &str) {
-    let outcome = host.navigate(url).expect("navigation dial");
+fn goto(document: &mut Document, services: &TestServices, url: &str) {
+    let outcome = services.navigate(url).expect("navigation dial");
     document.mount(&Mount {
         url: outcome.final_url,
         content_type: outcome.content_type,
@@ -218,15 +218,15 @@ fn navigation_parsing_cookies_and_relative_js_fetch_form_one_journey() {
         respond(&mut fetch, &[], b"payload");
     });
 
-    let host = Arc::new(TestHost::with_agent(Agent::new()));
-    let mut page = Document::new(host.clone());
-    goto(&mut page, &host, &format!("http://{addr}/start"));
-    page.run();
+    let services = Arc::new(TestServices::with_agent(Agent::new()));
+    let mut doc = Document::new(services.clone());
+    goto(&mut doc, &services, &format!("http://{addr}/start"));
+    doc.run();
 
-    assert_eq!(page.content_language(), Some("fr"));
-    assert_eq!(page.document_cookie(), "sid=1");
+    assert_eq!(doc.content_language(), Some("fr"));
+    assert_eq!(doc.document_cookie(), "sid=1");
     {
-        let parsed = page.parsed().expect("parsed navigation");
+        let parsed = doc.parsed().expect("parsed navigation");
         let paragraph = parsed
             .dom
             .select_first(parsed.dom.document(), "#loaded")
@@ -235,21 +235,21 @@ fn navigation_parsing_cookies_and_relative_js_fetch_form_one_journey() {
         assert_eq!(element_text(&parsed.dom, paragraph), "hi");
     }
 
-    page.eval(
+    doc.eval(
         "globalThis.body = ''; fetch('next').then(function(response) { return response.text(); }).then(function(text) { globalThis.body = text; });",
     )
     .expect("fetch script");
-    page.run();
-    assert_eq!(page.eval("globalThis.body").expect("body"), "payload");
-    // Navigation's own Fetch event belongs to the host now; the renderer
+    doc.run();
+    assert_eq!(doc.eval("globalThis.body").expect("body"), "payload");
+    // Navigation's own Fetch event belongs to the browser process now; the renderer
     // reports the document load and the subresource fetch.
     assert_eq!(
-        page.events(),
-        &[PageEvent::Load, PageEvent::Fetch { status: 200 }]
+        doc.events(),
+        &[TabEvent::Load, TabEvent::Fetch { status: 200 }]
     );
 
-    let sibling_host = Arc::new(TestHost::with_agent(host.agent.clone()));
-    let mut sibling = Document::new(sibling_host);
+    let sibling_services = Arc::new(TestServices::with_agent(services.agent.clone()));
+    let mut sibling = Document::new(sibling_services);
     sibling
         .set_document_url(&format!("http://{addr}/elsewhere"))
         .expect("document URL");
@@ -284,12 +284,11 @@ fn page_loop_correlates_more_than_one_batch_of_fetches() {
     let agent = AgentBuilder::new()
         .timeout_global(Duration::from_secs(3))
         .build();
-    let host = Arc::new(TestHost::with_agent(agent));
-    let mut page = Document::new(host);
+    let services = Arc::new(TestServices::with_agent(agent));
+    let mut doc = Document::new(services);
     let origin = format!("http://{addr}");
-    page.set_document_url(&format!("{origin}/"))
-        .expect("origin");
-    page.eval(&format!(
+    doc.set_document_url(&format!("{origin}/")).expect("origin");
+    doc.eval(&format!(
         "globalThis.results = []; globalThis.timerHit = false; \
          for (let i = 0; i < {REQUESTS}; i++) {{ \
            ((slot) => fetch('{origin}/' + slot).then((response) => response.text()).then((body) => {{ results[slot] = body; }}))(i); \
@@ -297,31 +296,31 @@ fn page_loop_correlates_more_than_one_batch_of_fetches() {
          setTimeout(() => {{ globalThis.timerHit = true; }}, 0);"
     ))
     .expect("schedule work");
-    page.run();
+    doc.run();
 
     assert_eq!(
-        page.eval("String(globalThis.timerHit)").expect("timer"),
+        doc.eval("String(globalThis.timerHit)").expect("timer"),
         "true"
     );
     assert_eq!(
-        page.eval("globalThis.results.join(',')").expect("results"),
+        doc.eval("globalThis.results.join(',')").expect("results"),
         "0,1,2,3,4,5,6,7,8"
     );
     assert_eq!(
-        page.events()
+        doc.events()
             .iter()
-            .filter(|event| matches!(event, PageEvent::Fetch { status: 200 }))
+            .filter(|event| matches!(event, TabEvent::Fetch { status: 200 }))
             .count(),
         REQUESTS
     );
-    assert!(matches!(page.events().first(), Some(PageEvent::Timer(_))));
+    assert!(matches!(doc.events().first(), Some(TabEvent::Timer(_))));
     server.join().expect("server");
 }
 
 #[test]
 fn realm_replacement_and_failed_jobs_drain_without_leaking_work() {
-    let (mut page, _host) = document();
-    let error = page
+    let (mut doc, _host) = document();
+    let error = doc
         .eval(
             "Promise.resolve().then(() => { globalThis.microtask = true; }); \
              setTimeout(() => { globalThis.timer = true; }, 0); \
@@ -330,35 +329,32 @@ fn realm_replacement_and_failed_jobs_drain_without_leaking_work() {
         .expect_err("script throws");
     assert!(matches!(
         error,
-        PageError::Script(ScriptFailure::Engine { .. })
+        TabError::Script(ScriptFailure::Engine { .. })
     ));
-    assert_eq!(
-        page.eval("globalThis.microtask").expect("microtask"),
-        "true"
-    );
-    page.run();
-    assert_eq!(page.eval("globalThis.timer").expect("timer"), "true");
+    assert_eq!(doc.eval("globalThis.microtask").expect("microtask"), "true");
+    doc.run();
+    assert_eq!(doc.eval("globalThis.timer").expect("timer"), "true");
 
-    page.eval("globalThis.secret = 1").expect("old realm");
-    page.load_html("<p>local</p>");
-    page.run();
+    doc.eval("globalThis.secret = 1").expect("old realm");
+    doc.load_html("<p>local</p>");
+    doc.run();
     assert_eq!(
-        page.eval("typeof globalThis.secret").expect("new realm"),
+        doc.eval("typeof globalThis.secret").expect("new realm"),
         "undefined"
     );
-    assert!(!page.events().contains(&PageEvent::FetchFailed));
+    assert!(!doc.events().contains(&TabEvent::FetchFailed));
 
-    page.eval(
+    doc.eval(
         "globalThis.done = false; \
          fetch('file:///one').catch(() => fetch('file:///two')).catch(() => { globalThis.done = true; });",
     )
     .expect("rejected chain");
-    page.run();
-    assert_eq!(page.eval("globalThis.done").expect("drained"), "true");
+    doc.run();
+    assert_eq!(doc.eval("globalThis.done").expect("drained"), "true");
     assert_eq!(
-        page.events()
+        doc.events()
             .iter()
-            .filter(|event| **event == PageEvent::FetchFailed)
+            .filter(|event| **event == TabEvent::FetchFailed)
             .count(),
         2
     );
@@ -366,8 +362,8 @@ fn realm_replacement_and_failed_jobs_drain_without_leaking_work() {
 
 #[test]
 fn classic_scripts_run_and_window_load_fires() {
-    let (mut page, _host) = document();
-    page.load_html(
+    let (mut doc, _host) = document();
+    doc.load_html(
         r#"<!doctype html>
 <title>t</title>
 <body></body>
@@ -379,35 +375,35 @@ window.addEventListener("load", function() { window.loadFired = true; });
 </script>"#,
     );
     assert_eq!(
-        page.eval("String(window.scriptRan)").expect("script"),
+        doc.eval("String(window.scriptRan)").expect("script"),
         "true"
     );
-    assert_eq!(page.eval("String(implicit)").expect("sloppy"), "1");
+    assert_eq!(doc.eval("String(implicit)").expect("sloppy"), "1");
     assert_eq!(
-        page.eval("String(window.sameBody)").expect("identity"),
+        doc.eval("String(window.sameBody)").expect("identity"),
         "true"
     );
-    assert_eq!(page.eval("String(window.loadFired)").expect("load"), "true");
+    assert_eq!(doc.eval("String(window.loadFired)").expect("load"), "true");
     assert_eq!(
-        page.eval("String(window.parent === window && window.top === window)")
+        doc.eval("String(window.parent === window && window.top === window)")
             .expect("top window"),
         "true"
     );
     assert_eq!(
-        page.eval("document.getElementsByTagName('title')[0].firstChild.data")
+        doc.eval("document.getElementsByTagName('title')[0].firstChild.data")
             .expect("title"),
         "t"
     );
     assert_eq!(
-        page.eval("document.readyState").expect("readyState"),
+        doc.eval("document.readyState").expect("readyState"),
         "complete"
     );
 }
 
 #[test]
 fn parser_blocking_script_observes_and_mutates_the_partial_document() {
-    let (mut page, _host) = document();
-    page.load_html(
+    let (mut doc, _host) = document();
+    doc.load_html(
         r#"<!doctype html>
 <head><script>
 window.bodyWasMissing = document.body === null;
@@ -420,20 +416,20 @@ document.write('<meta id="written">');
     );
 
     assert_eq!(
-        page.eval("String(window.bodyWasMissing)").expect("body"),
+        doc.eval("String(window.bodyWasMissing)").expect("body"),
         "true"
     );
     assert_eq!(
-        page.eval("String(document.getElementById('made-while-parsing') !== null)")
+        doc.eval("String(document.getElementById('made-while-parsing') !== null)")
             .expect("mutation"),
         "true"
     );
     assert_eq!(
-        page.eval("String(document.getElementById('written') !== null)")
+        doc.eval("String(document.getElementById('written') !== null)")
             .expect("document.write"),
         "true"
     );
-    assert_eq!(page.eval("document.readyState").expect("state"), "complete");
+    assert_eq!(doc.eval("document.readyState").expect("state"), "complete");
 }
 
 #[test]
@@ -449,13 +445,13 @@ fn navigation_decodes_bytes_before_tokenization() {
             b"<!doctype html><p id=value>\x80</p>",
         );
     });
-    let host = Arc::new(TestHost::new());
-    let mut page = Document::new(host.clone());
-    goto(&mut page, &host, &format!("http://{addr}/"));
-    page.run_until_load();
+    let services = Arc::new(TestServices::new());
+    let mut doc = Document::new(services.clone());
+    goto(&mut doc, &services, &format!("http://{addr}/"));
+    doc.run_until_load();
 
     assert_eq!(
-        page.eval("document.getElementById('value').firstChild.data")
+        doc.eval("document.getElementById('value').firstChild.data")
             .expect("decoded text"),
         "€"
     );
@@ -468,7 +464,7 @@ fn external_classic_scripts_run_before_load() {
     let addr = listener.local_addr().expect("address");
     let server = thread::spawn(move || {
         let (mut navigation, _) = listener.accept().expect("navigation");
-        assert_eq!(read_target(&mut navigation), "/page");
+        assert_eq!(read_target(&mut navigation), "/doc");
         respond(
             &mut navigation,
             &["Content-Type: text/html"],
@@ -487,12 +483,12 @@ window.addEventListener("load", function() { window.loadSaw = window.fromLib; })
         );
     });
 
-    let host = Arc::new(TestHost::new());
-    let mut page = Document::new(host.clone());
-    goto(&mut page, &host, &format!("http://{addr}/page"));
-    page.run();
-    assert_eq!(page.eval("String(window.fromLib)").expect("lib"), "7");
-    assert_eq!(page.eval("String(window.loadSaw)").expect("load"), "7");
+    let services = Arc::new(TestServices::new());
+    let mut doc = Document::new(services.clone());
+    goto(&mut doc, &services, &format!("http://{addr}/doc"));
+    doc.run();
+    assert_eq!(doc.eval("String(window.fromLib)").expect("lib"), "7");
+    assert_eq!(doc.eval("String(window.loadSaw)").expect("load"), "7");
     server.join().expect("server");
 }
 
@@ -502,7 +498,7 @@ fn navigation_load_does_not_wait_for_host_timers() {
     let addr = listener.local_addr().expect("address");
     let server = thread::spawn(move || {
         let (mut navigation, _) = listener.accept().expect("navigation");
-        assert_eq!(read_target(&mut navigation), "/page");
+        assert_eq!(read_target(&mut navigation), "/doc");
         respond(
             &mut navigation,
             &["Content-Type: text/html"],
@@ -515,23 +511,23 @@ setTimeout(function() { window.late = true; }, 30000);
         );
     });
 
-    let host = Arc::new(TestHost::new());
-    let mut page = Document::new(host.clone());
-    goto(&mut page, &host, &format!("http://{addr}/page"));
+    let services = Arc::new(TestServices::new());
+    let mut doc = Document::new(services.clone());
+    goto(&mut doc, &services, &format!("http://{addr}/doc"));
     let started = Instant::now();
-    page.run_until_load();
+    doc.run_until_load();
     assert!(
         started.elapsed() < Duration::from_secs(2),
-        "load waited for host timers"
+        "load waited for services timers"
     );
-    assert_eq!(page.eval("String(window.early)").expect("early"), "true");
-    assert_eq!(page.eval("typeof window.late").expect("late"), "undefined");
+    assert_eq!(doc.eval("String(window.early)").expect("early"), "true");
+    assert_eq!(doc.eval("typeof window.late").expect("late"), "undefined");
     assert_eq!(
-        page.eval("document.readyState").expect("readyState"),
+        doc.eval("document.readyState").expect("readyState"),
         "complete"
     );
     assert_eq!(
-        page.eval("document.getElementById('a.b').firstChild.data")
+        doc.eval("document.getElementById('a.b').firstChild.data")
             .expect("id"),
         "x"
     );
@@ -542,8 +538,8 @@ setTimeout(function() { window.late = true; }, 30000);
 fn run_until_load_does_not_wait_for_unrelated_fetch() {
     let slow = TcpListener::bind("127.0.0.1:0").expect("slow bind");
     let slow_addr = slow.local_addr().expect("slow addr");
-    let page_listener = TcpListener::bind("127.0.0.1:0").expect("page bind");
-    let page_addr = page_listener.local_addr().expect("page addr");
+    let page_listener = TcpListener::bind("127.0.0.1:0").expect("doc bind");
+    let page_addr = page_listener.local_addr().expect("doc addr");
     let release = Arc::new(AtomicBool::new(false));
     let slow_flag = Arc::clone(&release);
     let slow_server = thread::spawn(move || {
@@ -557,7 +553,7 @@ fn run_until_load_does_not_wait_for_unrelated_fetch() {
         respond(&mut stream, &[], b"slow");
     });
     let page_server = thread::spawn(move || {
-        let (mut stream, _) = page_listener.accept().expect("page accept");
+        let (mut stream, _) = page_listener.accept().expect("doc accept");
         let _ = read_target(&mut stream);
         let html = format!(
             "<!doctype html><script>fetch('http://{slow_addr}/slow').then(function() {{ window.slowDone = true; }});</script>"
@@ -565,23 +561,23 @@ fn run_until_load_does_not_wait_for_unrelated_fetch() {
         respond(&mut stream, &["Content-Type: text/html"], html.as_bytes());
     });
 
-    let host = Arc::new(TestHost::new());
-    let mut page = Document::new(host.clone());
-    goto(&mut page, &host, &format!("http://{page_addr}/"));
+    let services = Arc::new(TestServices::new());
+    let mut doc = Document::new(services.clone());
+    goto(&mut doc, &services, &format!("http://{page_addr}/"));
     let started = Instant::now();
-    page.run_until_load();
+    doc.run_until_load();
     assert!(
         started.elapsed() < Duration::from_secs(1),
         "load waited for unrelated fetch: {:?}",
         started.elapsed()
     );
     assert_eq!(
-        page.eval("typeof window.slowDone").expect("slow"),
+        doc.eval("typeof window.slowDone").expect("slow"),
         "undefined"
     );
     release.store(true, Ordering::SeqCst);
-    page.run();
-    assert_eq!(page.eval("String(window.slowDone)").expect("done"), "true");
+    doc.run();
+    assert_eq!(doc.eval("String(window.slowDone)").expect("done"), "true");
     slow_server.join().expect("slow server");
-    page_server.join().expect("page server");
+    page_server.join().expect("doc server");
 }

@@ -4,7 +4,7 @@
 
 Status: accepted
 
-Nodes live in `Vec<Slot>`; public identity is `NodeId { document, slot, generation }`. The document id is unique per `Dom` so a handle cannot name a live node in a different tree. Generations tick once per reallocation; destruction empties the cell without ticking. `Dom` is `Send` and structurally `!Sync` (`PhantomData<Cell<()>>`); one worker per page, zero locks. Selector queries read `Dom`'s quirks mode (the WHATWG id/class quirk); the parser writes that flag.
+Nodes live in `Vec<Slot>`; public identity is `NodeId { document, slot, generation }`. The document id is unique per `Dom` so a handle cannot name a live node in a different tree. Generations tick once per reallocation; destruction empties the cell without ticking. `Dom` is `Send` and structurally `!Sync` (`PhantomData<Cell<()>>`); one worker per document, zero locks. Selector queries read `Dom`'s quirks mode (the WHATWG id/class quirk); the parser writes that flag.
 
 The TreeSink is private in `browser`. `RefCell<Dom>` stays inside the sink: the driver is single-threaded and non-reentrant, so overlapping borrows panic instead of corrupting the tree. Adjacent `AppendText` chunks merge before they reach `dom`. `<template>` contents live on `Dom` (handle → fragment), not the element's child list and not a map on `Parsed`.
 
@@ -22,5 +22,5 @@ The TreeSink is private in `browser`. `RefCell<Dom>` stays inside the sink: the 
 - **Fragment insertion splices** children into the parent and leaves the fragment empty, per [insert](https://dom.spec.whatwg.org/#concept-node-insert).
 - **Generation-wrap ABA** after 2^32 recycles of one slot is accepted; one-recycle staleness is tested.
 - **`:lang()`** reads `lang`, then `xml:lang`, then the document `Content-Language` default set by `browser` at navigation, not a `net` feature ([ADR 0007](0007-engine-charter.md)).
-- **`:scope`** under document queries is the document element. Element-rooted scope context lands with page JS.
+- **`:scope`** under document queries is the document element. Element-rooted scope context lands with document JS.
 - **Constraint-validation and context-only pseudos** (`:valid`, `:paused`, `:open`, …) parse and match nothing until those features exist.
