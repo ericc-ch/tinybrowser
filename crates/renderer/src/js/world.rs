@@ -25,6 +25,9 @@ pub(crate) enum EventTargetKey {
 
 pub(crate) struct World {
     pub parsed: Option<Parsed>,
+    /// Documents created by DOM APIs (`createHTMLDocument`, `createDocument`)
+    /// beyond the parser's main document, keyed by their `NodeId` document id.
+    pub extra_documents: HashMap<u32, Parsed>,
     pub document_url: Url,
     pub services: Arc<dyn BrowserServices>,
     pub pending_cancels: Vec<i32>,
@@ -53,6 +56,7 @@ impl World {
     pub(crate) fn new(services: Arc<dyn BrowserServices>, document_url: Url) -> Self {
         Self {
             parsed: None,
+            extra_documents: HashMap::new(),
             document_url,
             services,
             pending_cancels: Vec::new(),
@@ -80,6 +84,33 @@ impl World {
         self.wrappers.clear();
         self.token_lists.clear();
         self.named_node_maps.clear();
+    }
+
+    /// The document tree that owns `id`.
+    pub(crate) fn document(&self, id: NodeId) -> Option<&Parsed> {
+        if let Some(parsed) = self.parsed.as_ref()
+            && parsed.dom.document_id() == id.document_id()
+        {
+            return Some(parsed);
+        }
+        self.extra_documents.get(&id.document_id())
+    }
+
+    /// Mutable version of [`World::document`].
+    pub(crate) fn document_mut(&mut self, id: NodeId) -> Option<&mut Parsed> {
+        if let Some(parsed) = self.parsed.as_ref()
+            && parsed.dom.document_id() == id.document_id()
+        {
+            return self.parsed.as_mut();
+        }
+        self.extra_documents.get_mut(&id.document_id())
+    }
+
+    /// Stores a secondary document and returns its root id.
+    pub(crate) fn add_document(&mut self, parsed: Parsed) -> NodeId {
+        let id = parsed.dom.document();
+        self.extra_documents.insert(id.document_id(), parsed);
+        id
     }
 
     pub(crate) fn add_listener(&mut self, target: EventTargetKey, listener: Listener) {

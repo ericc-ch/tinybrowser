@@ -581,3 +581,65 @@ fn run_until_load_does_not_wait_for_unrelated_fetch() {
     slow_server.join().expect("slow server");
     page_server.join().expect("doc server");
 }
+
+#[test]
+fn created_documents_are_second_trees() {
+    let (mut doc, _host) = document();
+    doc.load_html("<!doctype html><title>main</title><body><p id=here>x</p></body>");
+
+    assert_eq!(
+        doc.eval(
+            "var secondary = document.implementation.createHTMLDocument('T');\
+             String(secondary.contentType)"
+        )
+        .expect("contentType"),
+        "text/html"
+    );
+    assert_eq!(
+        doc.eval(
+            "secondary.body.appendChild(secondary.createElement('p')).textContent = 'second';\
+             secondary.title"
+        )
+        .expect("title"),
+        "T"
+    );
+    assert_eq!(
+        doc.eval("String(secondary.body.firstChild.textContent)")
+            .expect("secondary body"),
+        "second"
+    );
+    // The two documents are separate trees.
+    assert_eq!(
+        doc.eval("String(document.getElementById('here') !== null)")
+            .expect("main lookup"),
+        "true"
+    );
+    assert_eq!(
+        doc.eval("String(secondary.getElementById('here') === null)")
+            .expect("secondary lookup"),
+        "true"
+    );
+    assert_eq!(
+        doc.eval("String(secondary.documentElement.ownerDocument === secondary)")
+            .expect("ownerDocument"),
+        "true"
+    );
+
+    assert_eq!(
+        doc.eval(
+            "var xml = document.implementation.createDocument(null, '', null);\
+             String(xml.createElement('x').namespaceURI)"
+        )
+        .expect("xml namespace"),
+        "null"
+    );
+    assert_eq!(
+        doc.eval(
+            "var xhtml = document.implementation.createDocument(\
+               'http://www.w3.org/1999/xhtml', 'html', null);\
+             xhtml.contentType + '|' + String(xhtml.createElement('x').namespaceURI)"
+        )
+        .expect("xhtml document"),
+        "application/xhtml+xml|http://www.w3.org/1999/xhtml"
+    );
+}

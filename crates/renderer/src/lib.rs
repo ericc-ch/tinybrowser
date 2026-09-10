@@ -44,6 +44,8 @@ pub struct Parsed {
     pub quirks_mode: QuirksMode,
     /// How many spec parse errors the tokenizer/tree builder reported.
     pub parse_errors: u32,
+    /// MIME type this document reports from `document.contentType`.
+    pub content_type: &'static str,
 }
 
 pub(crate) enum ParseProgress {
@@ -276,6 +278,7 @@ impl Sink {
             dom: std::mem::replace(&mut *self.dom.borrow_mut(), dom::Dom::new()),
             quirks_mode: self.quirks_mode.get(),
             parse_errors: self.parse_errors.get(),
+            content_type: "text/html",
         }
     }
 
@@ -367,6 +370,7 @@ impl TreeSink for Sink {
             dom: self.dom.into_inner(),
             quirks_mode: self.quirks_mode.get(),
             parse_errors: self.parse_errors.get(),
+            content_type: "text/html",
         }
     }
 

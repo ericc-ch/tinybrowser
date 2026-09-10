@@ -201,6 +201,12 @@ impl Dom {
         self.document
     }
 
+    /// This document's arena id, for per-document renderer lookups.
+    #[must_use]
+    pub fn document_id(&self) -> u32 {
+        self.document_id
+    }
+
     /// Whether `id` names a currently live node.
     ///
     /// A destroyed node's handle fails here even though a different node may

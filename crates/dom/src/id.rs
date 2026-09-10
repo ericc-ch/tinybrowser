@@ -35,4 +35,10 @@ impl NodeId {
     pub(crate) fn index(self) -> usize {
         self.slot as usize
     }
+
+    /// Which document issued this handle; the key for per-document lookups.
+    #[must_use]
+    pub fn document_id(self) -> u32 {
+        self.document
+    }
 }
