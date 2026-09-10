@@ -1,8 +1,9 @@
 use std::time::{Duration, Instant as WallClock};
 
-use super::{Page, PageError, ScriptValue};
+use super::{Document, ScriptValue};
+use crate::protocol::PageError;
 
-impl Page {
+impl Document {
     pub(crate) fn execute_remote(
         &mut self,
         source: &str,

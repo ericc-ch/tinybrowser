@@ -38,7 +38,7 @@ Qualified element name: namespace plus optional prefix plus local name. Comes fr
 _Avoid_: tag name (only the local part)
 
 **Fan-in point**:
-The `browser` crate: engine (parser, page, QuickJS). Root `tinybrowser` depends on `browser`, `cdp`, and `webdriver`. Root must not depend on `dom` or `net`. Both protocol crates depend on `browser` and `http1`, never on each other ([ADR 0007](adrs/0007-engine-charter.md)).
+The `browser` crate: host ownership (Browser, tab `Page`, `NetworkSession`, renderer link). Root `tinybrowser` depends on `browser`, `cdp`, `webdriver`, and `renderer` (the last only for the hidden `--renderer` mode). Root must not depend on `dom` or `net`. Both protocol crates depend only on `browser`, never on each other ([ADR 0007](adrs/0007-engine-charter.md), [ADR 0011](adrs/0011-renderer-processes-per-site.md)).
 _Avoid_: “only crate that may import two layers” as a religion; `cargo test -p dom` is allowed
 
 **Scope**:
@@ -74,7 +74,7 @@ Which initiator owns a `net` request (`Navigation`, `Fetch`, `Xhr`, `WsHandshake
 _Avoid_: scope (dom selector root), initiator (the document URL passed separately)
 
 **Conversion point**:
-The few places inside `net` that talk to a backend crate (`AgentBuilder::build`, `RequestBuilder::send`, `RequestBuilder::upgrade`, `Response::from_backend`, `From<ureq::Error>`, `dial::open`, `NetConnector`); nowhere else may mention ureq, native-tls, or tungstenite types.
+The places inside `net` that mention ureq, native-tls, or tungstenite: `transport` (`HttpEngine` construction, `HttpEngine::send`, `open`, `NetConnector`, `From<ureq::Error>`) and `websocket` (handshake and frames). Public types stay ours. `AgentBuilder::build`, `RequestBuilder::send`, and `RequestBuilder::upgrade` call those sites and must not name backend types.
 _Avoid_: adapter, wrapper, FFI boundary
 
 **Host object**:
@@ -84,23 +84,43 @@ One native `JsNode` representation holds a `NodeId`, while separate WebIDL proto
 _Avoid_: polyfill, binding glue, wrapper (those mix host objects with JS-written APIs)
 
 **Page**:
-A top-level browsing context (a tab). It keeps its identity across navigation. The actor-owned tab is `Page`; other threads talk to it through `PageHandle` / `PageActor` ([ADR 0010](adrs/0010-page-actor-ownership.md)).
-_Avoid_: document (the active document is replaced on navigation)
+A top-level browsing context (a tab), owned by the host. It keeps its identity across navigation; the document it points at lives in the renderer for its site ([ADR 0011](adrs/0011-renderer-processes-per-site.md)). Other threads talk to it through `PageHandle`.
+_Avoid_: document (the active document is replaced on navigation), site instance
 
 **Document**:
-The active document of a Page. Navigation replaces it. The Page remains.
+The active document of a Page: `Dom`, QuickJS realm, active parser, HTML jobs, and timers. It lives in the renderer process for its site. Navigation replaces it; the Page remains.
 _Avoid_: page, tab
 
 **PageHandle**:
-The value-only handle other threads and protocols use to talk to one `PageActor`. Commands, events, request IDs, values, and explicit errors may cross. DOM references, QuickJS values, callbacks, and closures must not.
-_Avoid_: Page (the actor-owned tab), NodeId (tree identity inside the actor)
+The value-only handle other threads and protocols use to talk to one `Page` (tab) in the host. Commands, events, request IDs, values, and explicit errors may cross. DOM references, QuickJS values, callbacks, and closures must not.
+_Avoid_: RendererHandle (the host's handle to a renderer process), NodeId (tree identity inside a renderer)
+
+**RendererHandle**:
+The value-only handle the host uses to command one renderer process. Commands, request IDs, events, script results, and explicit errors may cross. DOM handles, QuickJS values, and callbacks must not.
+_Avoid_: PageHandle (the tab handle protocols hold)
+
+**IPC seam**:
+The value-only message boundary between host and renderer ([ADR 0011](adrs/0011-renderer-processes-per-site.md)). In-process backends implement the same messages for tests; the process backend puts them on a pipe or socket. HTTP is not used here.
+_Avoid_: RPC, HTTP, CDP
 
 **PageActor**:
-One OS thread per Page, one long-lived current-thread Tokio runtime. Owns DOM, active parser, QuickJS realm, wrapper cache, document state, HTML-job queues, timers, and navigation state. It advances work while idle; wait requests register conditions instead of driving or monopolizing the actor ([ADR 0010](adrs/0010-page-actor-ownership.md)).
-_Avoid_: Page thread as a Spectre boundary (threads isolate ownership and scheduling only)
+The host-side coordinator thread for one `Page`: identity, navigation dials, waiters, and the renderer link. It owns no DOM and no JS; the renderer owns the `Document` ([ADR 0011](adrs/0011-renderer-processes-per-site.md)).
+_Avoid_: renderer (the process that owns the document), page thread as a Spectre boundary
+
+**Renderer**:
+The page-engine half of the browser: `Dom`, QuickJS realm, active parser, HTML jobs, and timers. Runs in its own OS process, one per live site instance, spawned from the same executable as `--renderer`. It advances work while idle and never links `net` ([ADR 0011](adrs/0011-renderer-processes-per-site.md)). Tests and `Browser::ephemeral` may run the same loop in-process (local backend); production runs a process per site.
+_Avoid_: content process (Firefox's name), worker, PageActor
+
+**Site instance**:
+The isolation unit: scheme plus registrable domain (eTLD+1), unique per browsing context group. One renderer process per live site instance; a cross-site navigation moves the Page's document to the renderer for the new site ([ADR 0011](adrs/0011-renderer-processes-per-site.md)).
+_Avoid_: origin (scheme + host + port), tab, domain
+
+**Host**:
+The process-side half of the browser: `Browser`, the `Page` registry, `NetworkSession`, the renderer registry, and the protocol adapters. It dials, decides the site, and mounts documents in renderers.
+_Avoid_: browser process / parent process (Chrome's and Firefox's names for the concept)
 
 **Browser**:
-One daemon process hosts one Browser bound to one named Profile. Browser owns `ProfileStore`, the shared `NetworkSession`, and the page registry of `PageHandle`s ([ADR 0010](adrs/0010-page-actor-ownership.md)).
+One daemon process hosts one Browser bound to one named Profile. Browser owns `ProfileStore`, the shared `NetworkSession`, the page registry of `PageHandle`s, and the renderer registry keyed by site instance ([ADR 0010](adrs/0010-page-actor-ownership.md), [ADR 0011](adrs/0011-renderer-processes-per-site.md)).
 _Avoid_: WebDriver session (that is automation state only), Profile as a runtime owner between Browser and pages
 
 **BrowserHandle**:
@@ -116,7 +136,7 @@ Exclusively locked durable backing for one Profile under `XDG_DATA_HOME`. Cookie
 _Avoid_: cookie jar on `Agent` as the lasting durable owner
 
 **NetworkSession**:
-Browser-owned live networking service for one Profile. It wraps one shared `net::Agent`, a fixed 16-worker blocking executor, and a bounded 256-job queue. `ProfileStore` is durable backing, not another live jar. Page actors submit through a value-only fetch handle and receive completions as actor events; they own neither `net::Agent` nor blocking pools. Closing a page cancels queued work before it starts and rejects later completions ([ADR 0010](adrs/0010-page-actor-ownership.md), hard seam [ADR 0006](adrs/0006-net-transport.md)).
+Browser-owned live networking service for one Profile. It wraps one shared `net::Agent`, a fixed 16-worker blocking executor, and a bounded 256-job queue. `ProfileStore` is durable backing, not another live jar. Renderers submit dials and cookie operations through the host seam and receive completions as renderer events; they own neither `net::Agent` nor blocking pools. Closing a page cancels queued work before it starts and rejects later completions ([ADR 0010](adrs/0010-page-actor-ownership.md), hard seam [ADR 0006](adrs/0006-net-transport.md)).
 _Avoid_: Agent as a second durable owner, page-owned Agent
 
 **Profile daemon**:
@@ -140,10 +160,6 @@ _Avoid_: CDP (CLI/agent control, not the WPT driver), WebDriver as owner of Brow
 **Resolve map**:
 Ordered `--resolve=PATTERN=ADDR` rewrites on `AgentBuilder`; `PATTERN` is an exact host or `*` glob, `ADDR` is an IPv4 literal or `fail`. First match wins. Default is empty (libc DNS). `./tools/wpt/run` passes the `.test` lines and skips WPT’s `/etc/hosts` check; the binary does not remap unless the flag is set.
 _Avoid_: hosts file, `/etc/hosts` for WPT
-
-**http1**:
-Inbound HTTP/1.1 reader/writer for loopback protocol adapters (CDP discovery, WebDriver REST). Request-line, headers, `Content-Length`. Not the outbound `net` client. No hyper or axum ([ADR 0007](adrs/0007-engine-charter.md)).
-_Avoid_: putting this in `net` (outbound client) or `browser` (engine)
 
 **WPT gate**:
 web-platform-tests is the suite for web-visible behavior (DOM, HTML, fetch, cookies, WebSocket as JS sees them). `./tools/wpt/run` is that gate. `cargo test` covers product and transport: daemon lock, CDP flatten, WebDriver one-session, pump vs unrelated fetch, cookie file mode, CLI flag errors, `net::Agent`. html5lib-tests stay the parser gate until testharness runs `html/syntax/parsing/`. Browser-crate JS/DOM cargo tests are stand-ins until the first testharness file is green; delete them then.

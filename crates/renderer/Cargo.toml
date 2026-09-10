@@ -1,0 +1,28 @@
+[package]
+name = "renderer"
+version.workspace = true
+edition.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+dom = { workspace = true }
+# Exactly html5ever 0.39's own markup5ever; same pin as dom's charter, so
+# parser QualNames flow into dom as one type, no conversion layer.
+markup5ever = "=0.39.0"
+html5ever = "=0.39.0"
+tendril = "0.5"
+encoding_rs = "0.8"
+# Renderer waiter: current-thread `rt`+`time`; never a multi-thread server stack.
+tokio = { version = "1.53", default-features = false, features = ["rt", "time"] }
+url = "2"
+# QuickJS-ng via rquickjs; `std` uses shipped linux bindings (no bindgen).
+rquickjs = { version = "0.12.2", default-features = false, features = ["std", "classes", "macro"] }
+# Value-only IPC seam ([ADR 0011](../../../docs/adrs/0011-renderer-processes-per-site.md)).
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+# Host services in renderer tests; the library itself never links `net`.
+net = { workspace = true }

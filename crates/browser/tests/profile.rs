@@ -1,6 +1,6 @@
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use browser::{Browser, Profile};
+use browser::{Browser, Profile, Renderers};
 use url::Url;
 
 fn temp_data_home() -> std::path::PathBuf {
@@ -19,7 +19,8 @@ fn persistent_cookies_survive_browser_restart() {
     let profile = Profile::parse("work").expect("profile");
     let url = Url::parse("https://example.test/app").expect("url");
     {
-        let browser = Browser::open_in(&data_home, &profile).expect("browser");
+        let browser =
+            Browser::open_in_with(&data_home, &profile, Renderers::Local).expect("browser");
         let page = browser.handle().create_page().expect("page");
         page.set_document_url(url.as_str()).expect("document url");
         page.set_document_cookie("sid=1; Max-Age=3600; Path=/")
@@ -41,7 +42,7 @@ fn persistent_cookies_survive_browser_restart() {
             & 0o777;
         assert_eq!(mode, 0o600, "cookie file mode {mode:#o}");
     }
-    let browser = Browser::open_in(&data_home, &profile).expect("browser");
+    let browser = Browser::open_in_with(&data_home, &profile, Renderers::Local).expect("browser");
     let page = browser.handle().create_page().expect("page");
     page.set_document_url(url.as_str()).expect("document url");
     assert_eq!(page.document_cookie().expect("reloaded"), "sid=1");
@@ -54,13 +55,14 @@ fn session_cookies_are_not_written_to_disk() {
     let profile = Profile::default();
     let url = Url::parse("https://example.test/").expect("url");
     {
-        let browser = Browser::open_in(&data_home, &profile).expect("browser");
+        let browser =
+            Browser::open_in_with(&data_home, &profile, Renderers::Local).expect("browser");
         let page = browser.handle().create_page().expect("page");
         page.set_document_url(url.as_str()).expect("document url");
         page.set_document_cookie("tmp=1").expect("session cookie");
         assert_eq!(page.document_cookie().expect("cookie"), "tmp=1");
     }
-    let browser = Browser::open_in(&data_home, &profile).expect("browser");
+    let browser = Browser::open_in_with(&data_home, &profile, Renderers::Local).expect("browser");
     let page = browser.handle().create_page().expect("page");
     page.set_document_url(url.as_str()).expect("document url");
     assert_eq!(page.document_cookie().expect("empty"), "");
@@ -70,7 +72,8 @@ fn session_cookies_are_not_written_to_disk() {
 #[test]
 fn pages_share_the_profile_cookie_jar() {
     let data_home = temp_data_home();
-    let browser = Browser::open_in(&data_home, &Profile::default()).expect("browser");
+    let browser =
+        Browser::open_in_with(&data_home, &Profile::default(), Renderers::Local).expect("browser");
     let handle = browser.handle();
     let first = handle.create_page().expect("first");
     let second = handle.create_page().expect("second");
@@ -91,15 +94,16 @@ fn pages_share_the_profile_cookie_jar() {
 fn a_profile_has_exactly_one_writer() {
     let data_home = temp_data_home();
     let profile = Profile::default();
-    let first = Browser::open_in(&data_home, &profile).expect("first browser");
+    let first =
+        Browser::open_in_with(&data_home, &profile, Renderers::Local).expect("first browser");
 
-    let error = Browser::open_in(&data_home, &profile)
+    let error = Browser::open_in_with(&data_home, &profile, Renderers::Local)
         .err()
         .expect("second writer must fail");
 
     assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
     drop(first);
-    Browser::open_in(&data_home, &profile).expect("lock released");
+    Browser::open_in_with(&data_home, &profile, Renderers::Local).expect("lock released");
     let _ = std::fs::remove_dir_all(data_home);
 }
 
@@ -113,7 +117,8 @@ fn corrupt_cookie_data_is_quarantined_and_profile_recovers() {
     std::fs::create_dir_all(&profile_dir).expect("profile directory");
     std::fs::write(profile_dir.join("cookies"), b"not a cookie store").expect("corrupt cookies");
 
-    let browser = Browser::open_in(&data_home, &Profile::default()).expect("recovered browser");
+    let browser = Browser::open_in_with(&data_home, &Profile::default(), Renderers::Local)
+        .expect("recovered browser");
     let quarantined = std::fs::read_dir(&profile_dir)
         .expect("profile entries")
         .filter_map(Result::ok)
@@ -171,7 +176,8 @@ fn close_page_returns_while_a_fetch_is_blocked() {
     });
 
     let data_home = temp_data_home();
-    let browser = Browser::open_in(&data_home, &Profile::default()).expect("browser");
+    let browser =
+        Browser::open_in_with(&data_home, &Profile::default(), Renderers::Local).expect("browser");
     let handle = browser.handle();
     let page = handle.create_page().expect("page");
     page.goto(&format!("http://{addr}/")).expect("goto");

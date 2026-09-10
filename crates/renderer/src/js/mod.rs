@@ -1,4 +1,4 @@
-//! `QuickJS` host for one [`Page`]: eval, timers, `fetch`, DOM host objects.
+//! `QuickJS` host for one [`crate::Document`]: eval, timers, `fetch`, DOM host objects.
 //!
 //! Callbacks live in JS (`__tb_timeouts`, `__tb_fetchCbs`). Rust holds
 //! integer ids so a `Function` never crosses the page boundary. Invocation
@@ -20,13 +20,13 @@ use rquickjs::{
 
 pub(crate) use world::World;
 
-use crate::page::Stop;
+use crate::document::Stop;
 
 const MAX_RUNTIME_MEMORY: usize = 32 * 1024 * 1024;
 const MAX_RUNTIME_STACK: usize = 512 * 1024;
 const DEFAULT_SCRIPT_BUDGET: Duration = Duration::from_secs(5);
 
-/// A value produced by [`crate::Page::execute_script`].
+/// A value produced by [`crate::Document::execute_script`].
 #[derive(Clone, Debug, PartialEq)]
 pub enum ScriptValue {
     /// JS `undefined`.
@@ -293,7 +293,7 @@ impl JsHost {
                     "__cookieGet",
                     Func::from(move || {
                         let world = cookie_get.borrow();
-                        world.fetch.cookies_for(&world.document_url)
+                        world.services.cookies_for(&world.document_url)
                     }),
                 )
                 .map_err(JsError::engine)?;
@@ -303,7 +303,7 @@ impl JsHost {
                     "__cookieSet",
                     Func::from(move |value: String| {
                         let world = cookie_set.borrow();
-                        world.fetch.set_cookie(&value, &world.document_url);
+                        world.services.set_cookie(&value, &world.document_url);
                     }),
                 )
                 .map_err(JsError::engine)?;

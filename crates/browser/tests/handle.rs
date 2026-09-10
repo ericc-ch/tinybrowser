@@ -1,6 +1,6 @@
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use browser::{Browser, PageEvent, Profile, RemoteValue};
+use browser::{Browser, PageEvent, Profile, RemoteValue, Renderers};
 
 fn temp_data_home() -> std::path::PathBuf {
     let stamp = SystemTime::now()
@@ -15,7 +15,8 @@ fn temp_data_home() -> std::path::PathBuf {
 #[test]
 fn page_handle_commands_are_values_only() {
     let data_home = temp_data_home();
-    let browser = Browser::open_in(&data_home, &Profile::default()).expect("browser");
+    let browser =
+        Browser::open_in_with(&data_home, &Profile::default(), Renderers::Local).expect("browser");
     assert_eq!(browser.profile_name().as_str(), "default");
     let handle = browser.handle();
     let page = handle.create_page().expect("page");
@@ -61,7 +62,8 @@ fn page_handle_commands_are_values_only() {
 #[test]
 fn execute_script_reuses_one_remote_id_for_the_same_node() {
     let data_home = temp_data_home();
-    let browser = Browser::open_in(&data_home, &Profile::default()).expect("browser");
+    let browser =
+        Browser::open_in_with(&data_home, &Profile::default(), Renderers::Local).expect("browser");
     let page = browser.handle().create_page().expect("page");
     page.load_html("<!doctype html><p>hi</p>").expect("load");
     let value = page
@@ -83,7 +85,8 @@ fn execute_script_reuses_one_remote_id_for_the_same_node() {
 #[test]
 fn page_actor_advances_timers_without_a_run_command() {
     let data_home = temp_data_home();
-    let browser = Browser::open_in(&data_home, &Profile::default()).expect("browser");
+    let browser =
+        Browser::open_in_with(&data_home, &Profile::default(), Renderers::Local).expect("browser");
     let page = browser.handle().create_page().expect("page");
     page.load_html("<!doctype html><title></title>")
         .expect("load");
@@ -99,7 +102,8 @@ fn page_actor_advances_timers_without_a_run_command() {
 #[test]
 fn page_events_are_pushed_to_subscribers() {
     let data_home = temp_data_home();
-    let browser = Browser::open_in(&data_home, &Profile::default()).expect("browser");
+    let browser =
+        Browser::open_in_with(&data_home, &Profile::default(), Renderers::Local).expect("browser");
     let page = browser.handle().create_page().expect("page");
     let events = page.subscribe().expect("subscribe");
 
@@ -116,7 +120,8 @@ fn page_events_are_pushed_to_subscribers() {
 #[test]
 fn a_wait_does_not_monopolize_the_page_actor() {
     let data_home = temp_data_home();
-    let browser = Browser::open_in(&data_home, &Profile::default()).expect("browser");
+    let browser =
+        Browser::open_in_with(&data_home, &Profile::default(), Renderers::Local).expect("browser");
     let page = browser.handle().create_page().expect("page");
     page.load_html("<!doctype html><title></title>")
         .expect("load");
@@ -197,9 +202,76 @@ fn dom_mutation_survives_a_failed_parser_blocking_script() {
 }
 
 #[test]
+fn cross_site_navigation_swaps_the_document() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    fn serve(listener: &TcpListener, body: &'static [u8]) {
+        let (mut stream, _) = listener.accept().expect("accept");
+        let mut chunk = [0_u8; 1024];
+        let _ = stream.read(&mut chunk).expect("request");
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .expect("head");
+        stream.write_all(body).expect("body");
+    }
+
+    let first = TcpListener::bind("127.0.0.1:0").expect("first bind");
+    let first_addr = first.local_addr().expect("first addr");
+    let second = TcpListener::bind("127.0.0.1:0").expect("second bind");
+    let second_addr = second.local_addr().expect("second addr");
+    let first_server =
+        std::thread::spawn(move || serve(&first, b"<!doctype html><title>a</title>"));
+    let second_server =
+        std::thread::spawn(move || serve(&second, b"<!doctype html><title>b</title>"));
+
+    let data_home = temp_data_home();
+    let browser =
+        Browser::open_in_with(&data_home, &Profile::default(), Renderers::Local).expect("browser");
+    let page = browser.handle().create_page().expect("page");
+    page.goto(&format!("http://{first_addr}/")).expect("goto a");
+    page.run_until_load().expect("load a");
+    page.eval("globalThis.secret = 'a'").expect("secret");
+
+    // `localhost` and `127.0.0.1` are different sites: the tab must mount the
+    // new document in a renderer for the new site, not reuse the old realm.
+    page.goto(&format!("http://localhost:{}/", second_addr.port()))
+        .expect("goto b");
+    page.run_until_load().expect("load b");
+    assert_eq!(
+        page.document_url().expect("url"),
+        format!("http://localhost:{}/", second_addr.port())
+    );
+    assert_eq!(
+        page.eval("typeof globalThis.secret").expect("realm"),
+        "undefined"
+    );
+
+    first_server.join().expect("first server");
+    second_server.join().expect("second server");
+    let _ = std::fs::remove_dir_all(data_home);
+}
+
+#[test]
+fn failed_navigation_is_reported() {
+    let data_home = temp_data_home();
+    let browser =
+        Browser::open_in_with(&data_home, &Profile::default(), Renderers::Local).expect("browser");
+    let page = browser.handle().create_page().expect("page");
+    page.goto("http://127.0.0.1:1/").expect("queued");
+    page.run_until_load().expect("load wait");
+    assert!(page.last_navigation_failed().expect("nav"));
+    let _ = std::fs::remove_dir_all(data_home);
+}
+
+#[test]
 fn shutdown_interrupts_a_running_script() {
     let data_home = temp_data_home();
-    let browser = Browser::open_in(&data_home, &Profile::default()).expect("browser");
+    let browser =
+        Browser::open_in_with(&data_home, &Profile::default(), Renderers::Local).expect("browser");
     let page = browser.handle().create_page().expect("page");
     page.load_html("<!doctype html><title></title>")
         .expect("load");
@@ -228,7 +300,8 @@ fn shutdown_interrupts_a_running_script() {
 #[test]
 fn webidl_node_name_doctype_and_branding() {
     let data_home = temp_data_home();
-    let browser = Browser::open_in(&data_home, &Profile::default()).expect("browser");
+    let browser =
+        Browser::open_in_with(&data_home, &Profile::default(), Renderers::Local).expect("browser");
     let page = browser.handle().create_page().expect("page");
     page.load_html("<!doctype html><title></title>")
         .expect("load");
@@ -319,7 +392,8 @@ fn webidl_node_name_doctype_and_branding() {
 #[test]
 fn dom_collections_are_live_host_objects() {
     let data_home = temp_data_home();
-    let browser = Browser::open_in(&data_home, &Profile::default()).expect("browser");
+    let browser =
+        Browser::open_in_with(&data_home, &Profile::default(), Renderers::Local).expect("browser");
     let page = browser.handle().create_page().expect("page");
     page.load_html("<!doctype html><body></body>")
         .expect("load");
@@ -414,7 +488,8 @@ fn page_handle_run_until_load_does_not_wait_for_unrelated_fetch() {
     });
 
     let data_home = temp_data_home();
-    let browser = Browser::open_in(&data_home, &Profile::default()).expect("browser");
+    let browser =
+        Browser::open_in_with(&data_home, &Profile::default(), Renderers::Local).expect("browser");
     let page = browser.handle().create_page().expect("page");
     page.goto(&format!("http://{page_addr}/")).expect("goto");
     let started = Instant::now();

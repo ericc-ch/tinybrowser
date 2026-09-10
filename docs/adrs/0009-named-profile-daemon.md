@@ -2,7 +2,7 @@
 
 tinybrowser ships one executable. There is no separately shipped or versioned helper such as chromedriver or Node. A CLI command starts a detached background process of that same executable when the selected profile daemon is missing. Control for CLI and external tools is CDP. Classic WebDriver is a peer adapter over the same browser, not a second owner.
 
-Status: accepted. Keeps [ADR 0007](0007-engine-charter.md) crate graph, Tokio `rt`+`time`, bounded blocking-network execution, and size/lint bounds. The `cdp` adapter is a peer crate that depends on `browser` and `http1`. Extends [ADR 0008](0008-wpt-via-webdriver.md): WebDriver stays the WPT driver. Browser, `PageHandle`, and `NetworkSession` live in [ADR 0010](0010-page-actor-ownership.md).
+Status: accepted. Keeps [ADR 0007](0007-engine-charter.md) crate graph, Tokio `rt`+`time`, bounded blocking-network execution, and size/lint bounds. The `cdp` adapter is a peer crate that depends on `browser` and inbound `axum` (retired `http1` by [ADR 0012](0012-host-protocol-and-cli-stack.md)). Extends [ADR 0008](0008-wpt-via-webdriver.md): WebDriver stays the WPT driver. Browser, `PageHandle`, and `NetworkSession` live in [ADR 0010](0010-page-actor-ownership.md).
 
 ## Process
 
@@ -54,4 +54,4 @@ WPT isolation, runner teardown, and the future launch flag are in [ADR 0008](000
 
 - `tinybrowser --webdriver=PORT` is the WPT host: classic WebDriver over `BrowserHandle`, with a runner-supplied temporary profile ([ADR 0008](0008-wpt-via-webdriver.md)). The product CLI talks CDP to a named-profile daemon.
 - Cookies persist through `ProfileStore` under `XDG_DATA_HOME`. The live jar stays on `net::Agent`.
-- The `cdp` crate depends on `browser` and `http1`. Root hosts it beside `webdriver`; the protocol crates do not depend on each other ([ADR 0007](0007-engine-charter.md)).
+- The `cdp` crate depends on `browser` and inbound `axum` ([ADR 0012](0012-host-protocol-and-cli-stack.md)). Root hosts it beside `webdriver`; the protocol crates do not depend on each other ([ADR 0007](0007-engine-charter.md)).

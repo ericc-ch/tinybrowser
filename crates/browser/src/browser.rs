@@ -1,7 +1,4 @@
 //! One Browser bound to one named Profile.
-//!
-//! [ADR 0010](../../../docs/adrs/0010-page-actor-ownership.md): owns
-//! [`ProfileStore`], the shared [`NetworkSession`], and the page registry.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -10,6 +7,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use crate::actor::{PageActor, PageHandle, PageId};
+use crate::link::{RendererRegistry, Renderers};
 use crate::network::{NetworkSession, ProfileStore};
 use crate::profile::{Profile, ProfileName};
 
@@ -21,6 +19,7 @@ pub struct Browser {
 struct BrowserInner {
     live: bool,
     network: NetworkSession,
+    registry: Arc<RendererRegistry>,
     pages: HashMap<PageId, PageActor>,
     next_page: u64,
 }
@@ -32,7 +31,8 @@ pub struct BrowserHandle {
 }
 
 impl Browser {
-    /// Opens an in-memory browser whose profile is discarded at shutdown.
+    /// Opens an in-memory browser with in-process renderers whose profile is
+    /// discarded at shutdown. Tests and embedding use this fast path.
     ///
     /// # Errors
     ///
@@ -41,45 +41,78 @@ impl Browser {
         Self::with_store(
             ProfileStore::memory(&Profile::default()),
             net::AgentBuilder::new(),
+            Renderers::Local,
         )
     }
 
-    /// Opens a browser on `profile` with cookies under the process XDG data home.
+    /// Opens a browser on `profile` with cookies under the process XDG data
+    /// home and renderer processes ([ADR 0011]).
+    ///
+    /// [ADR 0011]: ../../../docs/adrs/0011-renderer-processes-per-site.md
     ///
     /// # Errors
     ///
     /// Both `XDG_DATA_HOME` and `HOME` are unset or empty.
     pub fn open(profile: &Profile) -> io::Result<Self> {
-        Self::with_store(ProfileStore::open(profile)?, net::AgentBuilder::new())
+        Self::open_in(&ProfileStore::data_home()?, profile)
     }
 
-    /// Opens a browser on `profile` with cookies under `data_home`.
+    /// Opens a browser on `profile` with cookies under `data_home` and
+    /// renderer processes.
     ///
     /// # Errors
     ///
     /// The profile directory cannot be created, read, or exclusively locked.
     pub fn open_in(data_home: &Path, profile: &Profile) -> io::Result<Self> {
+        Self::open_in_with(data_home, profile, Renderers::Process)
+    }
+
+    /// [`Browser::open_in`] with an explicit renderer backend.
+    ///
+    /// # Errors
+    ///
+    /// The profile directory cannot be created, read, or exclusively locked.
+    pub fn open_in_with(
+        data_home: &Path,
+        profile: &Profile,
+        renderers: Renderers,
+    ) -> io::Result<Self> {
         Self::with_store(
             ProfileStore::open_in(data_home, profile)?,
             net::AgentBuilder::new(),
+            renderers,
         )
     }
 
-    /// Opens a browser that shares `network` (and its cookie jar).
+    /// Opens a browser that shares `network` (and its cookie jar) with
+    /// renderer processes.
     #[must_use]
     pub fn open_with_network(network: NetworkSession) -> Self {
+        Self::open_with_network_and(network, Renderers::Process)
+    }
+
+    /// [`Browser::open_with_network`] with an explicit renderer backend.
+    #[must_use]
+    pub fn open_with_network_and(network: NetworkSession, renderers: Renderers) -> Self {
+        let registry = Arc::new(RendererRegistry::new(renderers, network.fetch_handle()));
         Self {
             inner: Arc::new(Mutex::new(BrowserInner {
                 live: true,
                 network,
+                registry,
                 pages: HashMap::new(),
                 next_page: 1,
             })),
         }
     }
 
-    fn with_store(store: ProfileStore, builder: net::AgentBuilder) -> io::Result<Self> {
-        NetworkSession::from_builder(builder, store).map(Self::open_with_network)
+    fn with_store(
+        store: ProfileStore,
+        builder: net::AgentBuilder,
+        renderers: Renderers,
+    ) -> io::Result<Self> {
+        NetworkSession::from_builder(builder, store)
+            .map(|network| Self::open_with_network_and(network, renderers))
     }
 
     /// Value-only handle for this browser.
@@ -129,7 +162,8 @@ impl BrowserHandle {
         let id = PageId::new(inner.next_page);
         inner.next_page = inner.next_page.saturating_add(1);
         let fetch = inner.network.fetch_handle();
-        let actor = PageActor::spawn(id, fetch);
+        let registry = Arc::clone(&inner.registry);
+        let actor = PageActor::spawn(id, fetch, registry);
         let handle = actor.handle.clone();
         inner.pages.insert(id, actor);
         Ok(handle)
@@ -192,6 +226,7 @@ impl BrowserHandle {
         };
         if should_close_pages {
             self.close_all();
+            self.lock().registry.shutdown();
         }
         self.persist()
     }

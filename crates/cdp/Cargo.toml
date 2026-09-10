@@ -7,8 +7,9 @@ edition.workspace = true
 workspace = true
 
 [dependencies]
-base64 = "0.23"
+axum = { version = "0.8", features = ["ws"] }
 browser = { workspace = true }
-http1 = { workspace = true }
 serde_json = "1"
+tokio = { version = "1.53", default-features = false, features = ["rt-multi-thread", "net", "sync", "time"] }
+# Client-side WebSocket only (CLI and tests); the server side is axum's ws.
 tungstenite = { version = "0.26", default-features = false, features = ["handshake"] }

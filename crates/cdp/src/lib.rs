@@ -3,21 +3,31 @@
 //! [ADR 0009](../../../docs/adrs/0009-named-profile-daemon.md): honest first
 //! subsets of Browser, Target, Page, and Runtime. Unsupported methods return
 //! method-not-found. Flattened `sessionId` routing on the browser socket.
+//! [ADR 0012](../../../docs/adrs/0012-host-protocol-and-cli-stack.md): axum
+//! serves the loopback HTTP and WebSocket endpoints. The synchronous
+//! [`Client`] used by the CLI and tests stays on tungstenite.
 
 use std::collections::{HashMap, VecDeque};
-use std::io::{self, Write};
+use std::io;
 use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Receiver;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
+use axum::Router;
+use axum::extract::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade};
+use axum::extract::{Path, Request, State};
+use axum::http::StatusCode;
+use axum::middleware::{self, Next};
+use axum::response::{IntoResponse, Json, Response};
+use axum::routing::get;
 use browser::{BrowserHandle, PageError, PageEvent, PageHandle, PageId, RemoteValue};
 use serde_json::{Value, json};
-use tungstenite::protocol::{Role, WebSocket};
-use tungstenite::{Message, handshake::derive_accept_key};
+use tokio::sync::watch;
+use tungstenite::client::IntoClientRequest;
+use tungstenite::protocol::{Message, WebSocket as ClientSocket};
 
 const PRODUCT: &str = "tinybrowser/0.1.0";
+const EVENT_POLL: Duration = Duration::from_millis(20);
 
 /// Serves CDP HTTP discovery and WebSocket endpoints on `listener`.
 ///
@@ -25,38 +35,136 @@ const PRODUCT: &str = "tinybrowser/0.1.0";
 ///
 /// # Errors
 ///
-/// Returns when `accept` fails.
+/// Returns when the listener cannot be converted or serving fails.
 pub fn serve(listener: &TcpListener, browser: &BrowserHandle) -> io::Result<()> {
     let bound = listener.local_addr()?;
-    let stop = Arc::new(AtomicBool::new(false));
-    loop {
-        let (stream, _) = match listener.accept() {
-            Ok(pair) => pair,
-            Err(_) if stop.load(Ordering::SeqCst) => return Ok(()),
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-            Err(error) if accept_retry(&error) => {
-                eprintln!("cdp: accept {error}");
-                std::thread::sleep(Duration::from_millis(10));
-                continue;
-            }
-            Err(error) => return Err(error),
+    let std_listener = listener.try_clone()?;
+    std_listener.set_nonblocking(true)?;
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()?;
+    let browser = browser.clone();
+    let result: io::Result<()> = runtime.block_on(async move {
+        let listener = tokio::net::TcpListener::from_std(std_listener)?;
+        let (stop, mut stopping) = watch::channel(false);
+        let state = AppState {
+            browser,
+            bound,
+            stop: stop.clone(),
         };
-        if stop.load(Ordering::SeqCst) {
-            return Ok(());
-        }
-        let browser = browser.clone();
-        let stop = Arc::clone(&stop);
-        std::thread::spawn(move || {
-            if let Err(error) = handle_connection(stream, browser, bound, stop) {
-                eprintln!("cdp: {error}");
-            }
-        });
+        let app = Router::new()
+            .route(
+                "/json/version",
+                get(|State(state): State<AppState>| async move { Json(version_json(&state)) }),
+            )
+            .route("/json", get(discovery))
+            .route("/json/list", get(discovery))
+            .route(
+                "/devtools/browser",
+                get(
+                    |ws: WebSocketUpgrade, State(state): State<AppState>| async move {
+                        ws.on_upgrade(move |socket| run_socket(socket, state, None))
+                    },
+                ),
+            )
+            .route(
+                "/devtools/page/{id}",
+                get(
+                    |Path(raw): Path<String>,
+                     ws: WebSocketUpgrade,
+                     State(state): State<AppState>| async move {
+                        let Ok(id) = raw.parse::<u64>() else {
+                            return (StatusCode::BAD_REQUEST, "invalid page target")
+                                .into_response();
+                        };
+                        match state.browser.page(PageId::new(id)) {
+                            Ok(page) => {
+                                ws.on_upgrade(move |socket| run_socket(socket, state, Some(page)))
+                            }
+                            Err(_) => {
+                                (StatusCode::NOT_FOUND, "unknown page target").into_response()
+                            }
+                        }
+                    },
+                ),
+            )
+            .layer(middleware::from_fn(strip_trailing_slash))
+            .fallback(|| async { (StatusCode::NOT_FOUND, "not found") })
+            .with_state(state);
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async move {
+                let _result = stopping.wait_for(|stopping| *stopping).await;
+            })
+            .await?;
+        Ok(())
+    });
+    result
+}
+
+#[derive(Clone)]
+struct AppState {
+    browser: BrowserHandle,
+    bound: SocketAddr,
+    stop: watch::Sender<bool>,
+}
+
+/// Discovery walks page actors; keep it off the async workers ([ADR 0012]).
+///
+/// [ADR 0012]: ../../../docs/adrs/0012-host-protocol-and-cli-stack.md
+async fn discovery(State(state): State<AppState>) -> Response {
+    match tokio::task::spawn_blocking(move || list_json(&state)).await {
+        Ok(value) => Json(value).into_response(),
+        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "discovery failed").into_response(),
     }
+}
+
+/// Legacy CDP clients append a trailing slash; normalize before routing.
+async fn strip_trailing_slash(mut request: Request, next: Next) -> Response {
+    let uri = request.uri().clone();
+    let path = uri.path();
+    if path.len() > 1 && path.ends_with('/') {
+        let normalized = match uri.query() {
+            Some(query) => format!("{}?{query}", path.trim_end_matches('/')),
+            None => path.trim_end_matches('/').to_owned(),
+        };
+        if let Ok(parsed) = normalized.parse() {
+            *request.uri_mut() = parsed;
+        }
+    }
+    next.run(request).await
+}
+
+fn version_json(state: &AppState) -> Value {
+    json!({
+        "Browser": PRODUCT,
+        "Protocol-Version": "1.3",
+        "webSocketDebuggerUrl": format!("ws://{}/devtools/browser", state.bound),
+    })
+}
+
+fn list_json(state: &AppState) -> Value {
+    let mut targets = Vec::new();
+    for id in state.browser.pages() {
+        let url = state
+            .browser
+            .page(id)
+            .ok()
+            .and_then(|page| page.document_url().ok())
+            .unwrap_or_else(|| "about:blank".into());
+        targets.push(json!({
+            "id": id.to_string(),
+            "type": "page",
+            "url": url,
+            "webSocketDebuggerUrl": format!("ws://{}/devtools/page/{id}", state.bound),
+        }));
+    }
+    Value::Array(targets)
 }
 
 /// Client for the browser WebSocket.
 pub struct Client {
-    socket: WebSocket<TcpStream>,
+    socket: ClientSocket<TcpStream>,
     next_id: i64,
     events: VecDeque<Value>,
 }
@@ -178,195 +286,33 @@ impl Client {
 }
 
 fn connect_ws(addr: SocketAddr, path: &str) -> io::Result<Client> {
-    let mut stream = TcpStream::connect(addr)?;
+    let stream = TcpStream::connect(addr)?;
     stream.set_read_timeout(Some(Duration::from_secs(30)))?;
     stream.set_write_timeout(Some(Duration::from_secs(30)))?;
-    let key = client_key();
-    let host = addr.to_string();
-    let request = format!(
-        "GET {path} HTTP/1.1\r\nHost: {host}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: {key}\r\n\r\n"
-    );
-    stream.write_all(request.as_bytes())?;
-    let message = http1::read_message(&mut stream)?;
-    let status = message
-        .start
-        .split_whitespace()
-        .nth(1)
-        .and_then(|value| value.parse::<u16>().ok())
-        .unwrap_or(0);
-    if status != 101 {
-        return Err(io::Error::other(format!("ws handshake {status}")));
-    }
-    let accept = message.header("sec-websocket-accept");
-    if accept != Some(derive_accept_key(key.as_bytes()).as_str()) {
-        return Err(io::Error::other("ws accept mismatch"));
-    }
+    let url = format!("ws://{addr}{path}");
+    let request = url
+        .as_str()
+        .into_client_request()
+        .map_err(|error| io::Error::other(error.to_string()))?;
+    let (socket, _response) = tungstenite::client::client(request, stream)
+        .map_err(|error| io::Error::other(error.to_string()))?;
     Ok(Client {
-        socket: WebSocket::from_raw_socket(stream, Role::Client, None),
+        socket,
         next_id: 0,
         events: VecDeque::new(),
     })
 }
 
-fn client_key() -> String {
-    let mut raw = [0_u8; 16];
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(1, |duration| duration.as_nanos())
-        .to_le_bytes();
-    raw.copy_from_slice(&nanos[..16]);
-    base64::Engine::encode(&base64::engine::general_purpose::STANDARD, raw)
-}
-
-fn handle_connection(
-    mut stream: TcpStream,
-    browser: BrowserHandle,
-    bound: SocketAddr,
-    stop: Arc<AtomicBool>,
-) -> io::Result<()> {
-    stream.set_read_timeout(Some(Duration::from_secs(30)))?;
-    let request = http1::read_request(&mut stream)?;
-    if request.method != "GET" {
-        http1::write_response(&mut stream, 405, "text/plain", b"method not allowed")?;
-        return Ok(());
-    }
-    if is_websocket(&request) {
-        stream.set_read_timeout(None)?;
-        return serve_socket(stream, &request, browser, bound, stop);
-    }
-    match request.path.as_str() {
-        "/json/version" | "/json/version/" => {
-            let body = json!({
-                "Browser": PRODUCT,
-                "Protocol-Version": "1.3",
-                "webSocketDebuggerUrl": format!("ws://{bound}/devtools/browser"),
-            });
-            http1::write_response(
-                &mut stream,
-                200,
-                "application/json",
-                body.to_string().as_bytes(),
-            )
-        }
-        "/json" | "/json/" | "/json/list" | "/json/list/" => {
-            let body = json_list(&browser, bound);
-            http1::write_response(
-                &mut stream,
-                200,
-                "application/json",
-                body.to_string().as_bytes(),
-            )
-        }
-        _ => http1::write_response(&mut stream, 404, "text/plain", b"not found"),
-    }
-}
-
-fn json_list(browser: &BrowserHandle, bound: SocketAddr) -> Value {
-    let mut targets = Vec::new();
-    for id in browser.pages() {
-        let url = browser
-            .page(id)
-            .ok()
-            .and_then(|page| page.document_url().ok())
-            .unwrap_or_else(|| "about:blank".into());
-        targets.push(json!({
-            "id": id.to_string(),
-            "type": "page",
-            "url": url,
-            "webSocketDebuggerUrl": format!("ws://{bound}/devtools/page/{id}"),
-        }));
-    }
-    Value::Array(targets)
-}
-
-fn is_websocket(request: &http1::Request) -> bool {
-    request
-        .header("upgrade")
-        .is_some_and(|value| value.eq_ignore_ascii_case("websocket"))
-}
-
-fn serve_socket(
-    mut stream: TcpStream,
-    request: &http1::Request,
-    browser: BrowserHandle,
-    bound: SocketAddr,
-    stop: Arc<AtomicBool>,
-) -> io::Result<()> {
-    let page = match page_from_path(&request.path, &browser) {
-        Ok(page) => page,
-        Err(error) => {
-            let status = if error.kind() == io::ErrorKind::NotFound {
-                404
-            } else {
-                400
-            };
-            http1::write_response(
-                &mut stream,
-                status,
-                "text/plain",
-                error.to_string().as_bytes(),
-            )?;
-            return Ok(());
-        }
-    };
-    let key = request
-        .header("sec-websocket-key")
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing websocket key"))?;
-    let accept = derive_accept_key(key.as_bytes());
-    let response = format!(
-        "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n"
-    );
-    stream.write_all(response.as_bytes())?;
-    let mut conn = Conn {
-        browser,
-        socket: WebSocket::from_raw_socket(stream, Role::Server, None),
-        sessions: HashMap::new(),
-        next_session: 1,
-        page,
-        bound,
-        stop,
-        subscriptions: Vec::new(),
-        clock_origin: std::time::Instant::now(),
-    };
-    conn.run()
-}
-
-fn page_from_path(path: &str, browser: &BrowserHandle) -> io::Result<Option<PageHandle>> {
-    let path = path.trim_end_matches('/');
-    if path == "/devtools/browser" {
-        return Ok(None);
-    }
-    let Some(rest) = path.strip_prefix("/devtools/page/") else {
-        return Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            "not a devtools socket",
-        ));
-    };
-    if rest.is_empty() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "invalid page target",
-        ));
-    }
-    let raw = rest
-        .parse::<u64>()
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid page target"))?;
-    browser
-        .page(PageId::new(raw))
-        .map(Some)
-        .map_err(|_| io::Error::new(io::ErrorKind::NotFound, "unknown page target"))
-}
-
+/// Per-WebSocket protocol state. Commands dispatch synchronously against
+/// [`PageHandle`]; the socket loop is async.
 struct Conn {
     browser: BrowserHandle,
-    socket: WebSocket<TcpStream>,
     sessions: HashMap<String, PageHandle>,
     next_session: u64,
     page: Option<PageHandle>,
-    bound: SocketAddr,
-    stop: Arc<AtomicBool>,
+    stop: watch::Sender<bool>,
     subscriptions: Vec<PageSubscription>,
-    clock_origin: std::time::Instant,
+    clock_origin: Instant,
 }
 
 struct PageSubscription {
@@ -375,30 +321,15 @@ struct PageSubscription {
     events: Receiver<PageEvent>,
 }
 
-impl Conn {
-    fn run(&mut self) -> io::Result<()> {
-        self.socket
-            .get_mut()
-            .set_read_timeout(Some(Duration::from_millis(20)))?;
-        loop {
-            self.flush_page_events()?;
-            match self.socket.read() {
-                Ok(Message::Text(text)) => self.dispatch_text(&text)?,
-                Ok(Message::Ping(payload)) => {
-                    self.socket.send(Message::Pong(payload)).map_err(ws_io)?;
-                }
-                Err(tungstenite::Error::Io(error))
-                    if matches!(
-                        error.kind(),
-                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
-                    ) => {}
-                Ok(Message::Close(_)) | Err(_) => return Ok(()),
-                Ok(_) => {}
-            }
-        }
-    }
+/// One text reply plus whether the socket closes after it.
+struct Outcome {
+    reply: Value,
+    close: bool,
+}
 
-    fn flush_page_events(&mut self) -> io::Result<()> {
+impl Conn {
+    /// Page events accumulated since the last flush, each ready to send.
+    fn take_event_messages(&self) -> Vec<Value> {
         let mut messages = Vec::new();
         for subscription in &self.subscriptions {
             for event in subscription.events.try_iter() {
@@ -412,28 +343,31 @@ impl Conn {
                 }
             }
         }
-        for message in messages {
-            self.send_json(&message)?;
-        }
-        Ok(())
+        messages
     }
 
-    fn dispatch_text(&mut self, text: &str) -> io::Result<()> {
+    fn dispatch_text(&mut self, text: &str) -> Outcome {
         let parsed: Value = match serde_json::from_str(text) {
             Ok(value) => value,
             Err(err) => {
-                return self.send_json(&json!({
-                    "id": Value::Null,
-                    "error": {"code": -32700, "message": err.to_string()},
-                }));
+                return Outcome {
+                    reply: json!({
+                        "id": Value::Null,
+                        "error": {"code": -32700, "message": err.to_string()},
+                    }),
+                    close: false,
+                };
             }
         };
         let id = parsed.get("id").cloned().unwrap_or(Value::Null);
         let Some(method) = parsed.get("method").and_then(Value::as_str) else {
-            return self.send_json(&json!({
-                "id": id,
-                "error": {"code": -32600, "message": "missing method"},
-            }));
+            return Outcome {
+                reply: json!({
+                    "id": id,
+                    "error": {"code": -32600, "message": "missing method"},
+                }),
+                close: false,
+            };
         };
         let empty = json!({});
         let params = parsed.get("params").unwrap_or(&empty);
@@ -442,11 +376,10 @@ impl Conn {
             Ok(result) => {
                 let mut reply = json!({"id": id, "result": result});
                 attach_session(&mut reply, session);
-                self.send_json(&reply)?;
-                if method == "Browser.close" {
-                    return Ok(());
+                Outcome {
+                    reply,
+                    close: method == "Browser.close",
                 }
-                Ok(())
             }
             Err(DispatchError::MethodNotFound) => {
                 let mut reply = json!({
@@ -457,7 +390,10 @@ impl Conn {
                     },
                 });
                 attach_session(&mut reply, session);
-                self.send_json(&reply)
+                Outcome {
+                    reply,
+                    close: false,
+                }
             }
             Err(DispatchError::Failed(message)) => {
                 let mut reply = json!({
@@ -465,15 +401,12 @@ impl Conn {
                     "error": {"code": -32000, "message": message},
                 });
                 attach_session(&mut reply, session);
-                self.send_json(&reply)
+                Outcome {
+                    reply,
+                    close: false,
+                }
             }
         }
-    }
-
-    fn send_json(&mut self, value: &Value) -> io::Result<()> {
-        self.socket
-            .send(Message::Text(value.to_string().into()))
-            .map_err(ws_io)
     }
 
     fn dispatch(
@@ -511,8 +444,7 @@ impl Conn {
                 self.sessions.clear();
                 self.subscriptions.clear();
                 self.page = None;
-                self.stop.store(true, Ordering::SeqCst);
-                let _ = TcpStream::connect(self.bound);
+                let _result = self.stop.send(true);
                 Ok(json!({}))
             }
             "Target.getTargets" => {
@@ -632,6 +564,65 @@ impl Conn {
     }
 }
 
+async fn run_socket(mut socket: WebSocket, state: AppState, page: Option<PageHandle>) {
+    let mut conn = Conn {
+        browser: state.browser,
+        sessions: HashMap::new(),
+        next_session: 1,
+        page,
+        stop: state.stop,
+        subscriptions: Vec::new(),
+        clock_origin: Instant::now(),
+    };
+    let mut poll = tokio::time::interval(EVENT_POLL);
+    poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        let outcome = tokio::select! {
+            _ = poll.tick() => None,
+            incoming = socket.recv() => match incoming {
+                Some(Ok(WsMessage::Text(text))) => {
+                    let text = text.as_str().to_owned();
+                    Some(tokio::task::block_in_place(|| conn.dispatch_text(&text)))
+                }
+                Some(Ok(WsMessage::Ping(payload))) => {
+                    let _ = socket.send(WsMessage::Pong(payload)).await;
+                    None
+                }
+                None | Some(Ok(WsMessage::Close(_)) | Err(_)) => break,
+                Some(Ok(_)) => None,            },
+        };
+        let mut failed = false;
+        for message in conn.take_event_messages() {
+            if socket
+                .send(WsMessage::text(message.to_string()))
+                .await
+                .is_err()
+            {
+                failed = true;
+                break;
+            }
+        }
+        if failed {
+            break;
+        }
+        let Some(outcome) = outcome else {
+            continue;
+        };
+        let close = outcome.close;
+        if socket
+            .send(WsMessage::text(outcome.reply.to_string()))
+            .await
+            .is_err()
+        {
+            break;
+        }
+        if close {
+            break;
+        }
+    }
+    let _ = socket.send(WsMessage::Close(None)).await;
+}
+
 fn session_method(method: &str, params: &Value, page: &PageHandle) -> Result<Value, DispatchError> {
     match method {
         "Runtime.enable" | "Runtime.disable" => Ok(json!({})),
@@ -698,19 +689,6 @@ fn target_id(value: Option<&Value>) -> Result<PageId, DispatchError> {
         .parse::<u64>()
         .map_err(|_| DispatchError::Failed("invalid targetId".into()))?;
     Ok(PageId::new(id))
-}
-
-fn accept_retry(error: &io::Error) -> bool {
-    matches!(
-        error.kind(),
-        io::ErrorKind::WouldBlock
-            | io::ErrorKind::TimedOut
-            | io::ErrorKind::ConnectionAborted
-            | io::ErrorKind::ConnectionReset
-            | io::ErrorKind::OutOfMemory
-            | io::ErrorKind::ResourceBusy
-            | io::ErrorKind::QuotaExceeded
-    )
 }
 
 fn remote_preview(value: &RemoteValue) -> Value {

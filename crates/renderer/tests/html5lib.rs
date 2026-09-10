@@ -1,16 +1,17 @@
 //! The html5lib tree-construction conformance suite
 //! (`third_party/html5lib-tests`, pinned per `third_party/VENDORED.md`).
 //!
-//! Every case feeds its `#data` markup through [`browser::parse_html`] (under
-//! each scripting-flag setting the case demands) and compares the resulting
-//! tree, rendered in html5lib dump form ([`dump`]), against the spec-mandated
-//! `#document` section. This is the parse-correctness bar from
-//! `docs/researches/testing.md`: the same suite production engines run, covering the
+//! Every case feeds its `#data` markup through
+//! [`renderer::parse_html_with_scripting`] or [`renderer::parse_html_fragment`]
+//! (under each scripting-flag setting the case demands) and compares the
+//! resulting tree, rendered in html5lib dump form ([`dump`]), against the
+//! spec-mandated `#document` section. This is the parse-correctness bar from
+//! ADR 0005: the same suite production engines run, covering the
 //! tree-construction algorithms hand-written fixtures miss (foster parenting,
 //! adoption agency, template contents).
 //!
 //! Gate policy (ADR 0005): a failing case either becomes a fix or a written
-//! acceptance before this milestone closes: no silent ignores.
+//! acceptance. No silent ignores.
 
 // Test-crate roots resolve `mod` against `tests/`, so the helpers live in
 // their own directory next to this file, pinned explicitly.
@@ -22,7 +23,7 @@ mod dump;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use browser::{parse_html_fragment, parse_html_with_scripting};
+use renderer::{parse_html_fragment, parse_html_with_scripting};
 
 const EXPECTED_CORPUS_RUNS: usize = 3_549;
 const EXPECTED_ACCEPTED_DIVERGENCES: usize = 10;

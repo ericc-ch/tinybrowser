@@ -1,18 +1,16 @@
 //! Shared page world for the JS host.
-//!
-//! `JsLifetime` is an unsafe rquickjs trait. Persistents are lifetime-erased
-//! and dropped in `clear_listeners` before the `QuickJS` runtime.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use dom::NodeId;
 use rquickjs::{Object, Persistent, Value, function::Function};
 use url::Url;
 
 use crate::Parsed;
-use crate::network::FetchHandle;
+use crate::protocol::HostServices;
 
 pub(crate) struct Listener {
     pub typ: String,
@@ -28,7 +26,7 @@ pub(crate) enum EventTargetKey {
 pub(crate) struct World {
     pub parsed: Option<Parsed>,
     pub document_url: Url,
-    pub fetch: FetchHandle,
+    pub services: Arc<dyn HostServices>,
     pub pending_cancels: Vec<i32>,
     pub pending_html_writes: Vec<String>,
     pub parser_active: bool,
@@ -39,11 +37,11 @@ pub(crate) struct World {
 }
 
 impl World {
-    pub(crate) fn new(fetch: FetchHandle, document_url: Url) -> Self {
+    pub(crate) fn new(services: Arc<dyn HostServices>, document_url: Url) -> Self {
         Self {
             parsed: None,
             document_url,
-            fetch,
+            services,
             pending_cancels: Vec::new(),
             pending_html_writes: Vec::new(),
             parser_active: false,
@@ -102,13 +100,5 @@ impl World {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, rquickjs::JsLifetime)]
 pub(crate) struct SharedWorld(pub Rc<RefCell<World>>);
-
-#[allow(unsafe_code)]
-// SAFETY: `SharedWorld` is an `Rc` to page state. Listener, wrapper, and
-// brand persistents are dropped in `clear_listeners` / `replace_document`
-// before `JsHost` drops the runtime they were saved from.
-unsafe impl rquickjs::JsLifetime<'_> for SharedWorld {
-    type Changed<'to> = SharedWorld;
-}

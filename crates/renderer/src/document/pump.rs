@@ -6,9 +6,10 @@ use std::time::Duration;
 
 use tokio::time::{Instant, sleep, sleep_until};
 
-use super::{HostTimer, HtmlJob, MAX_QUEUED_JS_FETCHES, Page, PageEvent, QueuedDial};
+use super::{Document, HostTimer, HtmlJob, MAX_QUEUED_JS_FETCHES, QueuedDial, note_script};
+use crate::protocol::PageEvent;
 
-impl Page {
+impl Document {
     pub(crate) fn drive_for(&mut self, budget: Duration) {
         let _completed = self.run_until_timeout(budget, |_| false);
     }
@@ -37,7 +38,7 @@ impl Page {
         id
     }
 
-    /// Parks this thread as the page Tokio waiter until no jobs, timers,
+    /// Parks this thread as the document Tokio waiter until no jobs, timers,
     /// queued dials, or in-flight fetches remain. Must not run inside another
     /// runtime.
     ///
@@ -46,44 +47,46 @@ impl Page {
     /// If called from inside a Tokio runtime or the current-thread runtime
     /// cannot be built.
     pub fn run(&mut self) {
-        self.block_on_pump(None, |page| !page.stopped());
+        self.block_on_pump(None, |document| !document.stopped());
     }
 
-    /// Parks until the current navigation has fired `load`, without waiting
-    /// for leftover host timers. `WebDriver` page-load strategy `normal`.
-    ///
-    /// [WebDriver navigate to URL](https://w3c.github.io/webdriver/#navigate-to)
+    /// Parks until the current document has fired `load` and finished classic
+    /// scripts, without waiting for leftover host timers.
     ///
     /// # Panics
     ///
-    /// Same conditions as [`Page::run`].
+    /// Same conditions as [`Document::run`].
     pub fn run_until_load(&mut self) {
-        self.block_on_pump(None, |page| page.waiting_for_load() && !page.stopped());
+        self.block_on_pump(None, |document| {
+            document.waiting_for_load() && !document.stopped()
+        });
     }
 
-    /// Parks like [`Page::run_until_load`], returning `false` if `timeout` elapses first.
+    /// Parks like [`Document::run_until_load`], returning `false` if `timeout`
+    /// elapses first.
     ///
     /// # Panics
     ///
-    /// Same conditions as [`Page::run`].
+    /// Same conditions as [`Document::run`].
     pub fn run_until_load_timeout(&mut self, timeout: Duration) -> bool {
-        self.run_until_timeout(timeout, |page| !page.waiting_for_load())
+        self.run_until_timeout(timeout, |document| !document.waiting_for_load())
     }
 
-    /// Parks like [`Page::run`], but returns as soon as `stop` is true.
+    /// Parks like [`Document::run`], but returns as soon as `stop` is true.
     ///
     /// # Panics
     ///
-    /// Same conditions as [`Page::run`].
+    /// Same conditions as [`Document::run`].
     pub fn run_until(&mut self, mut stop: impl FnMut(&mut Self) -> bool) {
-        self.block_on_pump(None, |page| !stop(page) && !page.stopped());
+        self.block_on_pump(None, |document| !stop(document) && !document.stopped());
     }
 
-    /// Parks like [`Page::run_until`], returning `false` if `timeout` elapses first.
+    /// Parks like [`Document::run_until`], returning `false` if `timeout`
+    /// elapses first.
     ///
     /// # Panics
     ///
-    /// Same conditions as [`Page::run`].
+    /// Same conditions as [`Document::run`].
     pub fn run_until_timeout(
         &mut self,
         timeout: Duration,
@@ -91,11 +94,11 @@ impl Page {
     ) -> bool {
         let deadline = Instant::now() + timeout;
         let mut done = false;
-        self.block_on_pump(Some(deadline), |page| {
-            if Instant::now() >= deadline || page.stopped() {
+        self.block_on_pump(Some(deadline), |document| {
+            if Instant::now() >= deadline || document.stopped() {
                 return false;
             }
-            if stop(page) {
+            if stop(document) {
                 done = true;
                 return false;
             }
@@ -107,13 +110,13 @@ impl Page {
     fn block_on_pump(&mut self, cap: Option<Instant>, keep_waiting: impl FnMut(&mut Self) -> bool) {
         assert!(
             tokio::runtime::Handle::try_current().is_err(),
-            "Page::run must not run inside another Tokio runtime"
+            "Document::run must not run inside another Tokio runtime"
         );
         let runtime = self.runtime.take().unwrap_or_else(|| {
             tokio::runtime::Builder::new_current_thread()
                 .enable_time()
                 .build()
-                .expect("current-thread Tokio runtime for the page thread")
+                .expect("current-thread Tokio runtime for the renderer thread")
         });
         runtime.block_on(self.pump(cap, keep_waiting));
         self.runtime = Some(runtime);
@@ -205,11 +208,9 @@ impl Page {
 
     pub(crate) fn waiting_for_load(&self) -> bool {
         self.queued_dials.iter().any(|dial| match dial {
-            QueuedDial::Navigate { epoch, .. } => *epoch == self.nav_epoch,
             QueuedDial::ClassicScript { epoch, .. } => *epoch == self.js_epoch,
-            QueuedDial::Fetch { .. } | QueuedDial::JsFetch { .. } => false,
-        }) || self.nav_in_flight == Some(self.nav_epoch)
-            || self.classic_fetch_in_flight
+            QueuedDial::JsFetch { .. } => false,
+        }) || self.classic_fetch_in_flight
             || self.active_parser.is_some()
             || !self.world.borrow().document_ready
     }
@@ -219,25 +220,22 @@ impl Page {
         let queued = std::mem::take(&mut self.queued_dials);
         for dial in queued {
             let task_dial = dial.clone();
-            let fetch = self.fetch.clone();
+            let services = Arc::clone(&self.services);
             let completed = self.dial_tx.clone();
             let stop = Arc::clone(&self.stop);
             if self
-                .fetch
+                .dial_pool
                 .try_submit(move || {
                     if stop.is_set() {
                         return;
                     }
-                    let result = super::navigate::send_dial(&fetch, &task_dial, &stop);
+                    let result = super::dial::send_dial(services.as_ref(), &task_dial, &stop);
                     let _send_result = completed.send(result);
                 })
                 .is_err()
             {
                 leftover.push(dial);
                 continue;
-            }
-            if let QueuedDial::Navigate { epoch, .. } = &dial {
-                self.nav_in_flight = Some(*epoch);
             }
             self.in_flight_dials = self.in_flight_dials.saturating_add(1);
         }
@@ -252,7 +250,7 @@ impl Page {
                 if let Some(js_id) = self.js_timer_slots.remove(&id)
                     && let Some(js) = &self.js
                 {
-                    super::note_script(&mut self.events, js.fire_timer(js_id).is_err());
+                    note_script(&mut self.events, js.fire_timer(js_id).is_err());
                 }
                 self.timers.retain(|timer| timer.id != id);
                 self.adopt_js_work();
@@ -262,7 +260,7 @@ impl Page {
         }
     }
 
-    pub(in crate::page) fn adopt_js_work(&mut self) {
+    pub(in crate::document) fn adopt_js_work(&mut self) {
         let timeouts = self
             .js
             .as_ref()
@@ -309,7 +307,7 @@ impl Page {
                 continue;
             }
             if let Ok(url) = self.resolve_dial_url(&fetch.url) {
-                let initiator = self.document_url.clone();
+                let initiator = self.url.clone();
                 self.queued_dials.push(QueuedDial::JsFetch {
                     url,
                     initiator,

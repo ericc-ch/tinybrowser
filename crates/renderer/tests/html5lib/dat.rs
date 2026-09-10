@@ -41,7 +41,7 @@ pub struct Case {
     /// The `#document` section: the spec-mandated tree in html5lib dump form.
     pub document: String,
     /// The `#document-fragment` context element, if present. The harness
-    /// feeds these through [`browser::parse_html_fragment`].
+    /// feeds these through [`renderer::parse_html_fragment`].
     pub fragment_context: Option<String>,
     /// Which scripting-flag settings the case demands.
     pub scripting: Scripting,

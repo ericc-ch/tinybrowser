@@ -1,7 +1,0 @@
-[package]
-name = "http1"
-version.workspace = true
-edition.workspace = true
-
-[lints]
-workspace = true

@@ -2,7 +2,8 @@
 //!
 //! One executable. No separately shipped helper. Engine stops at DOM + JS.
 //! The same executable may self-spawn a profile daemon
-//! ([ADR 0009](../docs/adrs/0009-named-profile-daemon.md)).
+//! ([ADR 0009](../docs/adrs/0009-named-profile-daemon.md)) and renderer
+//! processes ([ADR 0011](../docs/adrs/0011-renderer-processes-per-site.md)).
 //! The embeddable surface lives here; CDP is a peer crate.
 
 mod cli;
@@ -11,113 +12,154 @@ mod daemon;
 use std::process::ExitCode;
 
 use browser::{AgentBuilder, Browser, NetworkSession, Profile, ProfileStore};
+use clap::{Parser, Subcommand};
 
-pub(crate) const USAGE: &str = "usage: tinybrowser [--profile=NAME] [--webdriver=PORT] [--resolve=PATTERN=ADDR]... [--daemon] [create|list|select|eval|navigate|close] ...";
+#[derive(Parser)]
+#[command(
+    name = "tinybrowser",
+    version,
+    about = "The smallest headless browser for AI agents"
+)]
+struct Cli {
+    /// Named profile (implicit name: `default`)
+    #[arg(
+        long,
+        global = true,
+        value_name = "NAME",
+        value_parser = parse_profile,
+        default_value = "default"
+    )]
+    profile: Profile,
+
+    /// Serve classic `WebDriver` on this loopback port
+    #[arg(long, value_name = "PORT")]
+    webdriver: Option<u16>,
+
+    /// Rewrite a host to an address; repeatable
+    #[arg(long = "resolve", global = true, value_name = "PATTERN=ADDR")]
+    resolve: Vec<String>,
+
+    /// Run the profile daemon until the process exits (internal)
+    #[arg(long, hide = true)]
+    daemon: bool,
+
+    /// Run a renderer worker on stdin/stdout (internal)
+    #[arg(long, hide = true)]
+    renderer: bool,
+
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(Subcommand)]
+pub(crate) enum Command {
+    /// Create a tab and select it
+    Create {
+        /// Document URL (defaults to about:blank)
+        url: Option<String>,
+    },
+    /// List live tabs
+    List,
+    /// Select the tab later commands use
+    Select {
+        /// Target id from `list`
+        id: String,
+    },
+    /// Evaluate a script in the selected tab
+    #[command(alias = "evaluate")]
+    Eval {
+        /// Script source
+        script: String,
+    },
+    /// Navigate the selected tab
+    Navigate {
+        /// Document URL
+        url: String,
+    },
+    /// Close a tab (defaults to the selected tab)
+    Close {
+        /// Target id from `list`
+        id: Option<String>,
+    },
+}
 
 fn main() -> ExitCode {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    match parse_mode(&args) {
-        Ok(Mode::Usage) => {
-            eprintln!("{USAGE}");
-            ExitCode::from(2)
-        }
-        Ok(Mode::WebDriver {
-            port,
-            builder,
-            profile,
-        }) => serve_webdriver(port, builder, &profile),
-        Ok(Mode::Daemon { profile }) => {
-            match daemon::data_home().and_then(|home| daemon::run(&profile, &home)) {
-                Ok(()) => ExitCode::SUCCESS,
-                Err(error) => {
-                    eprintln!("daemon: {error}");
-                    ExitCode::from(1)
-                }
+    let cli = Cli::parse();
+    if let Some(error) = mode_conflict(&cli) {
+        return usage_error(error);
+    }
+    if cli.renderer {
+        return match renderer::serve_stdio() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("renderer: {error}");
+                ExitCode::from(1)
             }
-        }
-        Ok(Mode::Cli { profile, rest }) => cli::run(&profile, &rest),
-        Err(error) => {
-            eprintln!("{error}");
-            eprintln!("{USAGE}");
-            ExitCode::from(2)
-        }
+        };
+    }
+    if cli.daemon {
+        return match daemon::data_home().and_then(|home| daemon::run(&cli.profile, &home)) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("daemon: {error}");
+                ExitCode::from(1)
+            }
+        };
+    }
+    let builder = match resolve_builder(&cli.resolve) {
+        Ok(builder) => builder,
+        Err(error) => return usage_error(&error),
+    };
+    if let Some(port) = cli.webdriver {
+        return serve_webdriver(port, builder, &cli.profile);
+    }
+    if let Some(command) = cli.command {
+        cli::run(&cli.profile, command)
+    } else {
+        let mut command = <Cli as clap::CommandFactory>::command();
+        let _result = command.print_help();
+        ExitCode::from(2)
     }
 }
 
-enum Mode {
-    Usage,
-    WebDriver {
-        port: u16,
-        builder: AgentBuilder,
-        profile: Profile,
-    },
-    Daemon {
-        profile: Profile,
-    },
-    Cli {
-        profile: Profile,
-        rest: Vec<String>,
-    },
+fn parse_profile(value: &str) -> Result<Profile, String> {
+    Profile::parse(value).map_err(|error| error.to_string())
 }
 
-fn parse_mode(args: &[String]) -> Result<Mode, String> {
-    let mut port = None;
-    let mut daemon = false;
-    let mut resolve = false;
-    let mut profile = Profile::default();
+fn resolve_builder(specs: &[String]) -> Result<AgentBuilder, String> {
     let mut builder = AgentBuilder::new();
-    let mut rest = Vec::new();
-    let mut index = 0;
-    while index < args.len() {
-        let arg = &args[index];
-        if let Some(value) = arg.strip_prefix("--webdriver=") {
-            port = Some(parse_port(value)?);
-        } else if let Some(spec) = arg.strip_prefix("--resolve=") {
-            builder = builder.resolve(spec).map_err(|err| err.to_string())?;
-            resolve = true;
-        } else if arg == "--daemon" {
-            daemon = true;
-        } else if let Some(value) = arg.strip_prefix("--profile=") {
-            profile = Profile::parse(value).map_err(|err| err.to_string())?;
-        } else if arg == "--profile" {
-            index += 1;
-            let value = args.get(index).ok_or_else(|| USAGE.to_owned())?;
-            profile = Profile::parse(value).map_err(|err| err.to_string())?;
-        } else if arg.starts_with('-') {
-            return Err(USAGE.to_owned());
-        } else {
-            rest.extend(args[index..].iter().cloned());
-            break;
-        }
-        index += 1;
+    for spec in specs {
+        builder = builder.resolve(spec).map_err(|error| error.to_string())?;
     }
-    if daemon {
-        if port.is_some() {
-            return Err("--daemon and --webdriver are mutually exclusive".to_owned());
-        }
-        if resolve {
-            return Err("--daemon and --resolve are mutually exclusive".to_owned());
-        }
-        if !rest.is_empty() {
-            return Err("--daemon does not accept a command".to_owned());
-        }
-        return Ok(Mode::Daemon { profile });
-    }
-    if let Some(port) = port {
-        return Ok(Mode::WebDriver {
-            port,
-            builder,
-            profile,
-        });
-    }
-    if rest.is_empty() {
-        return Ok(Mode::Usage);
-    }
-    Ok(Mode::Cli { profile, rest })
+    Ok(builder)
 }
 
-fn parse_port(value: &str) -> Result<u16, String> {
-    value.parse::<u16>().map_err(|_| USAGE.to_owned())
+fn mode_conflict(cli: &Cli) -> Option<&'static str> {
+    if cli.renderer {
+        if cli.daemon || cli.webdriver.is_some() || !cli.resolve.is_empty() || cli.command.is_some()
+        {
+            return Some("--renderer does not accept other modes or commands");
+        }
+        return None;
+    }
+    if !cli.daemon {
+        return None;
+    }
+    if cli.webdriver.is_some() {
+        return Some("--daemon and --webdriver are mutually exclusive");
+    }
+    if !cli.resolve.is_empty() {
+        return Some("--daemon and --resolve are mutually exclusive");
+    }
+    if cli.command.is_some() {
+        return Some("--daemon does not accept a command");
+    }
+    None
+}
+
+fn usage_error(message: &str) -> ExitCode {
+    eprintln!("error: {message}");
+    ExitCode::from(2)
 }
 
 fn serve_webdriver(port: u16, builder: AgentBuilder, profile: &Profile) -> ExitCode {

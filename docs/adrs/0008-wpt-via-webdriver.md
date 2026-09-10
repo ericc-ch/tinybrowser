@@ -30,7 +30,7 @@ The exact launch flag may stay `--webdriver=PORT` or change. That flag is open. 
 
 Invocation: `pip install -e tools/wpt` into the WPT venv, then `./tools/wpt/run [tests]`.
 
-WebIDL: verify against vendored IDL ([webidl.md](../researches/webidl.md)); do not codegen bindings. Interfaces with branding, tree mutation, or a host resource are Rust host objects around `NodeId` (or page-owned handles). Other APIs may be implemented in JS to keep binary size down.
+WebIDL: host objects are hand-written around `NodeId` (or page-owned handles). Do not codegen bindings. Other APIs may be JS.
 
 ## Options considered
 
@@ -38,5 +38,7 @@ WebIDL: verify against vendored IDL ([webidl.md](../researches/webidl.md)); do n
 - **In-process `Page` loader instead of WebDriver:** same HTML files, not the canonical runner. Rejected.
 - **Sparse WPT checkout:** smaller clone; cannot run an arbitrary test when adding an API. Rejected.
 - **JS polyfills for Node/Document/Event:** fails WebIDL branding and WPT. Rejected.
+- **Build-time IDL codegen:** fights hand-written classes. wasm-bindgen-style warn-and-skip hides drift. Rejected.
+- **weedle flatten/diff against webref:** not in tree. First evidence of WebIDL shape is testharness.
 - **Machine `/etc/hosts` for WPT names:** not portable; rejected in favor of `--resolve` on `AgentBuilder` plus a skip in `./tools/wpt/run`.
 - **Reuse a dirty persistent profile for WPT:** leaks cookies and tabs across testharness sessions. Rejected.

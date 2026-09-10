@@ -8,17 +8,30 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{self, SyncSender, TrySendError};
+use std::sync::mpsc::{self, Sender, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use net::{Agent, AgentBuilder, CookieRecord, CookieSameSite, Method};
+use net::{Agent, AgentBuilder, Context, CookieRecord, CookieSameSite, Method};
+use renderer::{DialOutcome, DialRequest};
 use url::Url;
 
 use crate::profile::{Profile, ProfileName};
 
-/// Default per-call fetch timeout for a page-owned or browser-owned agent.
+/// Default per-call fetch timeout on a [`FetchHandle`].
 pub(crate) const PAGE_FETCH_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Upper bound on a navigation body.
+pub(crate) const NAV_BODY_LIMIT: usize = 1_048_576;
+
+/// One completed navigation dial.
+pub(crate) struct NavOutcome {
+    pub status: u16,
+    pub final_url: Url,
+    pub content_type: Option<String>,
+    pub content_language: Option<String>,
+    pub body: Vec<u8>,
+}
 
 const COOKIES_VERSION: &str = "tinybrowser-cookies-v1";
 const MAX_BROWSER_DIALS: usize = 16;
@@ -253,14 +266,6 @@ pub struct FetchHandle {
 }
 
 impl FetchHandle {
-    pub(crate) fn from_agent(agent: Agent) -> Self {
-        Self {
-            agent,
-            store: Arc::new(ProfileStore::memory(&Profile::default())),
-            executor: NetworkExecutor::new(),
-        }
-    }
-
     /// `document.cookie` getter for `url`.
     #[must_use]
     pub fn cookies_for(&self, url: &Url) -> String {
@@ -279,6 +284,99 @@ impl FetchHandle {
 
     pub(crate) fn request(&self, method: Method, url: Url) -> net::RequestBuilder {
         self.agent.request(method, url)
+    }
+
+    /// Starts a navigation dial on the browser executor; the completion
+    /// returns on `reply` tagged with `epoch`.
+    pub(crate) fn dial_navigation(
+        &self,
+        epoch: u64,
+        url: Url,
+        initiator: Url,
+        reply: Sender<(u64, Result<NavOutcome, ()>)>,
+    ) -> Result<(), ()> {
+        let fetch = self.clone();
+        self.try_submit(move || {
+            let outcome = fetch.navigate_blocking(&url, &initiator);
+            let _send_result = reply.send((epoch, outcome));
+        })
+    }
+
+    fn navigate_blocking(&self, url: &Url, initiator: &Url) -> Result<NavOutcome, ()> {
+        let response = self
+            .request(Method::GET, url.clone())
+            .with_context(Context::Navigation)
+            .with_initiator(initiator.clone())
+            .send()
+            .map_err(|_| ())?;
+        let status = response.status();
+        let final_url = response.final_url().clone();
+        let content_language = response
+            .headers()
+            .get("content-language")
+            .and_then(|bytes| std::str::from_utf8(bytes).ok())
+            .and_then(content_language_tag);
+        let content_type = response
+            .headers()
+            .get("content-type")
+            .and_then(|bytes| std::str::from_utf8(bytes).ok())
+            .map(str::to_owned);
+        let mut body = response.into_body();
+        let mut bytes = Vec::new();
+        while let Some(chunk) = body.read_chunk().map_err(|_| ())? {
+            if bytes.len().saturating_add(chunk.len()) > NAV_BODY_LIMIT {
+                return Err(());
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        Ok(NavOutcome {
+            status,
+            final_url,
+            content_type,
+            content_language,
+            body: bytes,
+        })
+    }
+
+    /// Blocking GET for one renderer service call.
+    pub(crate) fn dial_request(&self, request: &DialRequest) -> Option<DialOutcome> {
+        let url = Url::parse(&request.url).ok()?;
+        let initiator = Url::parse(&request.initiator).ok()?;
+        let response = self
+            .request(Method::GET, url)
+            .with_context(Context::Fetch)
+            .with_initiator(initiator)
+            .send()
+            .ok()?;
+        let status = response.status();
+        let final_url = response.final_url().to_string();
+        let content_language = response
+            .headers()
+            .get("content-language")
+            .and_then(|bytes| std::str::from_utf8(bytes).ok())
+            .and_then(content_language_tag);
+        let content_type = response
+            .headers()
+            .get("content-type")
+            .and_then(|bytes| std::str::from_utf8(bytes).ok())
+            .map(str::to_owned);
+        let mut body = Vec::new();
+        if request.read_body {
+            let mut response_body = response.into_body();
+            while let Some(chunk) = response_body.read_chunk().ok()? {
+                if body.len().saturating_add(chunk.len()) > NAV_BODY_LIMIT {
+                    return None;
+                }
+                body.extend_from_slice(&chunk);
+            }
+        }
+        Some(DialOutcome {
+            status,
+            final_url,
+            content_type,
+            content_language,
+            body,
+        })
     }
 
     pub(crate) fn try_submit(&self, operation: impl FnOnce() + Send + 'static) -> Result<(), ()> {
@@ -535,4 +633,18 @@ fn parse_same_site(raw: &str) -> io::Result<CookieSameSite> {
             "cookie same-site",
         )),
     }
+}
+
+/// One `Content-Language` tag, or `None` when the header lists several
+/// languages ([HTML document language](https://html.spec.whatwg.org/multipage/dom.html#language)).
+fn content_language_tag(raw: &str) -> Option<String> {
+    let mut tags = raw
+        .split(',')
+        .map(|part| part.split(';').next().unwrap_or(part).trim())
+        .filter(|tag| !tag.is_empty());
+    let first = tags.next()?.to_owned();
+    if tags.next().is_some() {
+        return None;
+    }
+    Some(first)
 }

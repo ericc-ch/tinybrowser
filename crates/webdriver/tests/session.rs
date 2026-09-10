@@ -3,15 +3,16 @@ use std::net::{TcpListener, TcpStream};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use browser::{AgentBuilder, Browser, NetworkSession, Profile, ProfileStore};
+use browser::{AgentBuilder, Browser, NetworkSession, Profile, ProfileStore, Renderers};
 use serde_json::{Value, json};
 
 fn start(builder: AgentBuilder) -> (String, Browser) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let addr = listener.local_addr().expect("addr").to_string();
-    let browser = Browser::open_with_network(
+    let browser = Browser::open_with_network_and(
         NetworkSession::from_builder(builder, ProfileStore::memory(&Profile::default()))
             .expect("network"),
+        Renderers::Local,
     );
     let handle = browser.handle();
     thread::spawn(move || {

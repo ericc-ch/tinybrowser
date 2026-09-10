@@ -5,8 +5,141 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use browser::{Agent, Page, PageError, PageEvent, ScriptFailure};
 use dom::NodeKind;
+use net::{Agent, AgentBuilder, Context, Method};
+use renderer::{
+    DialKind, DialOutcome, DialRequest, Document, HostServices, Mount, PageError, PageEvent,
+    ScriptFailure,
+};
+use url::Url;
+
+/// Test host: dials through `net` and keeps one cookie jar.
+struct TestHost {
+    agent: Agent,
+}
+
+impl TestHost {
+    fn new() -> Self {
+        Self {
+            agent: Agent::new(),
+        }
+    }
+
+    fn with_agent(agent: Agent) -> Self {
+        Self { agent }
+    }
+
+    /// Host-side navigation dial (what the browser does before `mount`).
+    fn navigate(&self, url: &str) -> Option<DialOutcome> {
+        let url = Url::parse(url).ok()?;
+        let response = self
+            .agent
+            .request(Method::GET, url)
+            .with_context(Context::Navigation)
+            .send()
+            .ok()?;
+        let status = response.status();
+        let final_url = response.final_url().to_string();
+        let content_language = response
+            .headers()
+            .get("content-language")
+            .and_then(|bytes| std::str::from_utf8(bytes).ok())
+            .and_then(content_language_tag);
+        let content_type = response
+            .headers()
+            .get("content-type")
+            .and_then(|bytes| std::str::from_utf8(bytes).ok())
+            .map(str::to_owned);
+        let mut body = response.into_body();
+        let mut bytes = Vec::new();
+        while let Some(chunk) = body.read_chunk().ok()? {
+            bytes.extend_from_slice(&chunk);
+        }
+        Some(DialOutcome {
+            status,
+            final_url,
+            content_type,
+            content_language,
+            body: bytes,
+        })
+    }
+}
+
+impl HostServices for TestHost {
+    fn dial(&self, request: &DialRequest) -> Option<DialOutcome> {
+        let url = Url::parse(&request.url).ok()?;
+        let context = match request.kind {
+            DialKind::JsFetch | DialKind::ClassicScript => Context::Fetch,
+        };
+        let initiator = Url::parse(&request.initiator).ok()?;
+        let response = self
+            .agent
+            .request(Method::GET, url)
+            .with_context(context)
+            .with_initiator(initiator)
+            .send()
+            .ok()?;
+        let status = response.status();
+        let final_url = response.final_url().to_string();
+        let content_type = response
+            .headers()
+            .get("content-type")
+            .and_then(|bytes| std::str::from_utf8(bytes).ok())
+            .map(str::to_owned);
+        let mut body = Vec::new();
+        if request.read_body {
+            let mut response_body = response.into_body();
+            while let Some(chunk) = response_body.read_chunk().ok()? {
+                body.extend_from_slice(&chunk);
+            }
+        }
+        Some(DialOutcome {
+            status,
+            final_url,
+            content_type,
+            content_language: None,
+            body,
+        })
+    }
+
+    fn cookies_for(&self, url: &Url) -> String {
+        self.agent.cookies_for(url)
+    }
+
+    fn set_cookie(&self, value: &str, url: &Url) {
+        self.agent.set_cookie(value, url);
+    }
+
+    fn mark_dirty(&self) {}
+}
+
+fn document() -> (Document, Arc<TestHost>) {
+    let host = Arc::new(TestHost::new());
+    (Document::new(host.clone()), host)
+}
+
+fn goto(document: &mut Document, host: &TestHost, url: &str) {
+    let outcome = host.navigate(url).expect("navigation dial");
+    document.mount(&Mount {
+        url: outcome.final_url,
+        content_type: outcome.content_type,
+        content_language: outcome.content_language,
+        body: outcome.body,
+    });
+}
+
+/// One `Content-Language` tag, or `None` when the header lists several.
+fn content_language_tag(raw: &str) -> Option<String> {
+    let mut tags = raw
+        .split(',')
+        .map(|part| part.split(';').next().unwrap_or(part).trim())
+        .filter(|tag| !tag.is_empty());
+    let first = tags.next()?.to_owned();
+    if tags.next().is_some() {
+        return None;
+    }
+    Some(first)
+}
 
 fn read_target(stream: &mut TcpStream) -> String {
     stream
@@ -85,9 +218,9 @@ fn navigation_parsing_cookies_and_relative_js_fetch_form_one_journey() {
         respond(&mut fetch, &[], b"payload");
     });
 
-    let agent = Agent::new();
-    let mut page = Page::with_agent(agent.clone());
-    page.goto(&format!("http://{addr}/start")).expect("goto");
+    let host = Arc::new(TestHost::with_agent(Agent::new()));
+    let mut page = Document::new(host.clone());
+    goto(&mut page, &host, &format!("http://{addr}/start"));
     page.run();
 
     assert_eq!(page.content_language(), Some("fr"));
@@ -108,16 +241,15 @@ fn navigation_parsing_cookies_and_relative_js_fetch_form_one_journey() {
     .expect("fetch script");
     page.run();
     assert_eq!(page.eval("globalThis.body").expect("body"), "payload");
+    // Navigation's own Fetch event belongs to the host now; the renderer
+    // reports the document load and the subresource fetch.
     assert_eq!(
         page.events(),
-        &[
-            PageEvent::Fetch { status: 200 },
-            PageEvent::Load,
-            PageEvent::Fetch { status: 200 }
-        ]
+        &[PageEvent::Load, PageEvent::Fetch { status: 200 }]
     );
 
-    let mut sibling = Page::with_agent(agent);
+    let sibling_host = Arc::new(TestHost::with_agent(host.agent.clone()));
+    let mut sibling = Document::new(sibling_host);
     sibling
         .set_document_url(&format!("http://{addr}/elsewhere"))
         .expect("document URL");
@@ -149,10 +281,11 @@ fn page_loop_correlates_more_than_one_batch_of_fetches() {
         respond(&mut last, &[], target.trim_start_matches('/').as_bytes());
     });
 
-    let agent = net::AgentBuilder::new()
+    let agent = AgentBuilder::new()
         .timeout_global(Duration::from_secs(3))
         .build();
-    let mut page = Page::with_agent(agent);
+    let host = Arc::new(TestHost::with_agent(agent));
+    let mut page = Document::new(host);
     let origin = format!("http://{addr}");
     page.set_document_url(&format!("{origin}/"))
         .expect("origin");
@@ -187,7 +320,7 @@ fn page_loop_correlates_more_than_one_batch_of_fetches() {
 
 #[test]
 fn realm_replacement_and_failed_jobs_drain_without_leaking_work() {
-    let mut page = Page::new();
+    let (mut page, _host) = document();
     let error = page
         .eval(
             "Promise.resolve().then(() => { globalThis.microtask = true; }); \
@@ -207,7 +340,6 @@ fn realm_replacement_and_failed_jobs_drain_without_leaking_work() {
     assert_eq!(page.eval("globalThis.timer").expect("timer"), "true");
 
     page.eval("globalThis.secret = 1").expect("old realm");
-    page.goto("http://127.0.0.1:1/").expect("queued navigation");
     page.load_html("<p>local</p>");
     page.run();
     assert_eq!(
@@ -234,7 +366,7 @@ fn realm_replacement_and_failed_jobs_drain_without_leaking_work() {
 
 #[test]
 fn classic_scripts_run_and_window_load_fires() {
-    let mut page = Page::new();
+    let (mut page, _host) = document();
     page.load_html(
         r#"<!doctype html>
 <title>t</title>
@@ -274,7 +406,7 @@ window.addEventListener("load", function() { window.loadFired = true; });
 
 #[test]
 fn parser_blocking_script_observes_and_mutates_the_partial_document() {
-    let mut page = Page::new();
+    let (mut page, _host) = document();
     page.load_html(
         r#"<!doctype html>
 <head><script>
@@ -317,8 +449,9 @@ fn navigation_decodes_bytes_before_tokenization() {
             b"<!doctype html><p id=value>\x80</p>",
         );
     });
-    let mut page = Page::new();
-    page.goto(&format!("http://{addr}/")).expect("goto");
+    let host = Arc::new(TestHost::new());
+    let mut page = Document::new(host.clone());
+    goto(&mut page, &host, &format!("http://{addr}/"));
     page.run_until_load();
 
     assert_eq!(
@@ -354,8 +487,9 @@ window.addEventListener("load", function() { window.loadSaw = window.fromLib; })
         );
     });
 
-    let mut page = Page::new();
-    page.goto(&format!("http://{addr}/page")).expect("goto");
+    let host = Arc::new(TestHost::new());
+    let mut page = Document::new(host.clone());
+    goto(&mut page, &host, &format!("http://{addr}/page"));
     page.run();
     assert_eq!(page.eval("String(window.fromLib)").expect("lib"), "7");
     assert_eq!(page.eval("String(window.loadSaw)").expect("load"), "7");
@@ -381,15 +515,15 @@ setTimeout(function() { window.late = true; }, 30000);
         );
     });
 
-    let mut page = Page::new();
-    page.goto(&format!("http://{addr}/page")).expect("goto");
+    let host = Arc::new(TestHost::new());
+    let mut page = Document::new(host.clone());
+    goto(&mut page, &host, &format!("http://{addr}/page"));
     let started = Instant::now();
     page.run_until_load();
     assert!(
         started.elapsed() < Duration::from_secs(2),
         "load waited for host timers"
     );
-    assert!(!page.last_navigation_failed());
     assert_eq!(page.eval("String(window.early)").expect("early"), "true");
     assert_eq!(page.eval("typeof window.late").expect("late"), "undefined");
     assert_eq!(
@@ -402,14 +536,6 @@ setTimeout(function() { window.late = true; }, 30000);
         "x"
     );
     server.join().expect("server");
-}
-
-#[test]
-fn failed_navigation_is_reported() {
-    let mut page = Page::new();
-    page.goto("http://127.0.0.1:1/").expect("queued");
-    page.run_until_load();
-    assert!(page.last_navigation_failed());
 }
 
 #[test]
@@ -439,8 +565,9 @@ fn run_until_load_does_not_wait_for_unrelated_fetch() {
         respond(&mut stream, &["Content-Type: text/html"], html.as_bytes());
     });
 
-    let mut page = Page::new();
-    page.goto(&format!("http://{page_addr}/")).expect("goto");
+    let host = Arc::new(TestHost::new());
+    let mut page = Document::new(host.clone());
+    goto(&mut page, &host, &format!("http://{page_addr}/"));
     let started = Instant::now();
     page.run_until_load();
     assert!(
@@ -448,7 +575,6 @@ fn run_until_load_does_not_wait_for_unrelated_fetch() {
         "load waited for unrelated fetch: {:?}",
         started.elapsed()
     );
-    assert!(!page.last_navigation_failed());
     assert_eq!(
         page.eval("typeof window.slowDone").expect("slow"),
         "undefined"

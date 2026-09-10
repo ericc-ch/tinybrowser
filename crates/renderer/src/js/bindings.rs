@@ -15,14 +15,8 @@ use rquickjs::{
 
 use super::world::{EventTargetKey, Listener, SharedWorld, World};
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, rquickjs::JsLifetime)]
 struct Handle(NodeId);
-
-#[allow(unsafe_code)]
-// SAFETY: `Handle` is three integers; it contains no JS values to retag.
-unsafe impl rquickjs::JsLifetime<'_> for Handle {
-    type Changed<'to> = Handle;
-}
 
 impl<'js> Trace<'js> for Handle {
     fn trace<'a>(&self, _tracer: Tracer<'a, 'js>) {}
@@ -30,30 +24,18 @@ impl<'js> Trace<'js> for Handle {
 
 macro_rules! branded_node {
     ($name:ident, $js:literal) => {
-        #[derive(Trace)]
+        #[derive(Trace, rquickjs::JsLifetime)]
         #[rquickjs::class(rename = $js)]
         pub(crate) struct $name {
             handle: Handle,
         }
-
-        #[allow(unsafe_code)]
-        // SAFETY: holds only a `Handle` of integers.
-        unsafe impl rquickjs::JsLifetime<'_> for $name {
-            type Changed<'to> = $name;
-        }
     };
 }
 
-#[derive(Trace)]
+#[derive(Trace, rquickjs::JsLifetime)]
 #[rquickjs::class(rename = "Event")]
 pub struct JsEvent {
     typ: String,
-}
-
-#[allow(unsafe_code)]
-// SAFETY: `JsEvent` holds only a Rust `String`.
-unsafe impl rquickjs::JsLifetime<'_> for JsEvent {
-    type Changed<'to> = JsEvent;
 }
 
 #[rquickjs::methods]

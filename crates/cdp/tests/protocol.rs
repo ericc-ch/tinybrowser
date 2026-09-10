@@ -3,7 +3,7 @@ use std::net::{TcpListener, TcpStream};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use browser::{Browser, Profile};
+use browser::{Browser, Profile, Renderers};
 use serde_json::json;
 
 fn temp_data_home() -> std::path::PathBuf {
@@ -28,7 +28,8 @@ fn spawn_server(browser: browser::BrowserHandle) -> (std::net::SocketAddr, threa
 #[test]
 fn browser_target_page_runtime_flatten_and_method_not_found() {
     let data_home = temp_data_home();
-    let browser = Browser::open_in(&data_home, &Profile::default()).expect("browser");
+    let browser =
+        Browser::open_in_with(&data_home, &Profile::default(), Renderers::Local).expect("browser");
     let (addr, _server) = spawn_server(browser.handle());
     thread::sleep(Duration::from_millis(20));
     let mut client = cdp::Client::connect(addr).expect("connect");
@@ -133,7 +134,8 @@ fn page_navigate_loads_http_document() {
     });
 
     let data_home = temp_data_home();
-    let browser = Browser::open_in(&data_home, &Profile::default()).expect("browser");
+    let browser =
+        Browser::open_in_with(&data_home, &Profile::default(), Renderers::Local).expect("browser");
     let (addr, _cdp) = spawn_server(browser.handle());
     thread::sleep(Duration::from_millis(20));
     let mut client = cdp::Client::connect(addr).expect("connect");
@@ -201,7 +203,8 @@ fn http_get(addr: std::net::SocketAddr, path: &str) -> (u16, String) {
 #[test]
 fn json_discovery_page_socket_close_target_and_browser_close() {
     let data_home = temp_data_home();
-    let browser = Browser::open_in(&data_home, &Profile::default()).expect("browser");
+    let browser =
+        Browser::open_in_with(&data_home, &Profile::default(), Renderers::Local).expect("browser");
     let (addr, server) = spawn_server(browser.handle());
     thread::sleep(Duration::from_millis(20));
 

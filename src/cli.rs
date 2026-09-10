@@ -7,10 +7,11 @@ use std::time::{Duration, Instant};
 use browser::Profile;
 use serde_json::{Value, json};
 
+use crate::Command;
 use crate::daemon;
 
-pub fn run(profile: &Profile, args: &[String]) -> ExitCode {
-    match run_inner(profile, args) {
+pub fn run(profile: &Profile, command: Command) -> ExitCode {
+    match run_inner(profile, command) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("{error}");
@@ -19,23 +20,21 @@ pub fn run(profile: &Profile, args: &[String]) -> ExitCode {
     }
 }
 
-fn run_inner(profile: &Profile, rest: &[String]) -> io::Result<()> {
+fn run_inner(profile: &Profile, command: Command) -> io::Result<()> {
     let data_home = daemon::data_home()?;
     let endpoint = daemon::ensure(profile, &data_home)?;
     let mut client = cdp::Client::connect(endpoint.addr())?;
-    match rest {
-        [] => list(&mut client),
-        [cmd] if cmd == "list" => list(&mut client),
-        [cmd] if cmd == "create" => create(&mut client, profile, "about:blank"),
-        [cmd, url] if cmd == "create" => create(&mut client, profile, url),
-        [cmd, id] if cmd == "select" => daemon::write_selected(profile, id),
-        [cmd, script] if cmd == "eval" || cmd == "evaluate" => {
-            evaluate(&mut client, profile, script)
-        }
-        [cmd, url] if cmd == "navigate" => navigate(&mut client, profile, url),
-        [cmd] if cmd == "close" => close(&mut client, profile, None),
-        [cmd, id] if cmd == "close" => close(&mut client, profile, Some(id)),
-        _ => Err(io::Error::new(io::ErrorKind::InvalidInput, crate::USAGE)),
+    match command {
+        Command::Create { url } => create(
+            &mut client,
+            profile,
+            url.as_deref().unwrap_or("about:blank"),
+        ),
+        Command::List => list(&mut client),
+        Command::Select { id } => daemon::write_selected(profile, &id),
+        Command::Eval { script } => evaluate(&mut client, profile, &script),
+        Command::Navigate { url } => navigate(&mut client, profile, &url),
+        Command::Close { id } => close(&mut client, profile, id.as_deref()),
     }
 }
 

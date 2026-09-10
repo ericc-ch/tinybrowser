@@ -7,9 +7,15 @@
 //! or the cookie jar.
 
 use std::collections::HashMap;
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpListener;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use axum::Router;
+use axum::body::Bytes;
+use axum::extract::State;
+use axum::http::{Method, StatusCode, Uri};
+use axum::response::{IntoResponse, Json, Response};
 use browser::{BrowserHandle, PageError, PageHandle, RemoteValue, ScriptFailure};
 use serde_json::{Value, json};
 
@@ -25,20 +31,73 @@ const DEFAULT_PAGE_LOAD_TIMEOUT: Duration = Duration::from_secs(300);
 ///
 /// # Errors
 ///
-/// Returns when `accept` fails.
+/// Returns when the listener cannot be converted or serving fails.
 pub fn serve(listener: &TcpListener, browser: BrowserHandle) -> std::io::Result<()> {
-    let mut sessions = Sessions {
+    let std_listener = listener.try_clone()?;
+    std_listener.set_nonblocking(true)?;
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()?;
+    let sessions = Arc::new(Mutex::new(Sessions {
         browser,
         next_session: 0,
         next_window: 0,
         open: HashMap::new(),
+    }));
+    let result: std::io::Result<()> = runtime.block_on(async move {
+        let listener = tokio::net::TcpListener::from_std(std_listener)?;
+        let app = Router::new()
+            .fallback(dispatch_request)
+            .with_state(AppState { sessions });
+        axum::serve(listener, app).await
+    });
+    result
+}
+
+#[derive(Clone)]
+struct AppState {
+    sessions: Arc<Mutex<Sessions>>,
+}
+
+async fn dispatch_request(
+    State(state): State<AppState>,
+    method: Method,
+    uri: Uri,
+    body: Bytes,
+) -> Response {
+    let method = method.as_str().to_owned();
+    let path = uri.path().to_owned();
+    let body = String::from_utf8_lossy(&body).into_owned();
+    let sessions = Arc::clone(&state.sessions);
+    let result = tokio::task::spawn_blocking(move || {
+        let mut sessions = sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        dispatch(&method, &path, &body, &mut sessions)
+    })
+    .await;
+    let Ok((status, payload)) = result else {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({
+                "value": {
+                    "error": "unknown error",
+                    "message": "dispatch panicked",
+                    "stacktrace": ""
+                }
+            })),
+        )
+            .into_response();
     };
-    loop {
-        let (stream, _) = listener.accept()?;
-        if let Err(error) = handle_connection(stream, &mut sessions) {
-            eprintln!("webdriver: {error}");
-        }
-    }
+    let status = StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    let mut response = (status, Json(payload)).into_response();
+    // W3C WebDriver JSON is UTF-8; keep the charset the old adapter wrote.
+    response.headers_mut().insert(
+        axum::http::header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_static("application/json; charset=utf-8"),
+    );
+    response
 }
 
 struct Sessions {
@@ -86,23 +145,6 @@ impl Sessions {
         );
         Ok(id)
     }
-}
-
-fn handle_connection(mut stream: TcpStream, sessions: &mut Sessions) -> std::io::Result<()> {
-    let request = http1::read_request(&mut stream)?;
-    let method = if request.method.is_empty() {
-        "GET".to_owned()
-    } else {
-        request.method
-    };
-    let body = String::from_utf8_lossy(&request.body).into_owned();
-    let (status, payload) = dispatch(&method, &request.path, &body, sessions);
-    http1::write_response(
-        &mut stream,
-        status,
-        "application/json; charset=utf-8",
-        payload.to_string().as_bytes(),
-    )
 }
 
 fn dispatch(method: &str, path: &str, body: &str, sessions: &mut Sessions) -> (u16, Value) {

@@ -1,6 +1,6 @@
 # Size Budget
 
-Goal: **sub-5MB stripped x86_64 binary** (AGENTS.md Vision). Measured 2026-08-21 and 2026-08-23, rustc 1.98.0, Linux.
+Goal: **sub-10MB stripped x86_64 binary** (raised from 5MB on 2026-09-10 by [ADR 0012](../adrs/0012-host-protocol-and-cli-stack.md); the 5MB columns below are historical, not targets). Measured 2026-08-21 and 2026-08-23, rustc 1.98.0, Linux.
 
 Reproduce each dependency row with a probe binary that really exercises it
 (tokenize, dial, JS eval, parse+query). Marginal = binary delta vs an
@@ -76,8 +76,7 @@ not risk.
 
 Sixteen real targets across vendors (Cloudflare, Akamai, HUMAN,
 PerimeterX, Kasada) driven by three throwaway client builds matching the
-option space below; full methodology, target list, and verdict rules live in
-[testing.md](testing.md). Headline results:
+option space in [ADR 0006](../adrs/0006-net-transport.md). Headline results:
 
 - Bare ureq+native-tls clears 9/16; the OpenSSL fingerprint (`t13d3011_…`,
   no ALPN) hard-fails tjx, bangkokair, stockx, zillow, bestbuy.
@@ -135,13 +134,13 @@ public API. rustc 1.98.0; tuned profile as in the root Cargo.toml.
 Against the M1 estimate (+490 KB ureq/native-tls +197 KB url ≈ +700 KB): tuned
 landed −21 KB (shared-dep overlap plus our own types). Accepted.
 
-Live smokes (opt-in, `cargo test -p net --test live -- --ignored`): example.com
-200; tls.peet.ws JA4 still `t13d3011_…` (OpenSSL native-tls, drift check).
+Live smokes at this checkpoint used a throwaway probe, not a workspace test:
+example.com 200; tls.peet.ws JA4 still `t13d3011_…` (OpenSSL native-tls, drift check).
 
 ## Milestone: net M2 cookie jar + M3 WebSocket (2026-08-26)
 
 Ticket 13 put an RFC 6265bis jar above the transport (no new dependency). Ticket 14
-replaced ureq's `DefaultConnector` with a net-owned `dial::open` shared by
+replaced ureq's `DefaultConnector` with a net-owned `transport::open` shared by
 `send()` and `RequestBuilder::upgrade`, then linked tungstenite 0.26 (`handshake` only).
 Probes call the public API against `127.0.0.1:1` (enough to keep TLS and the
 WebSocket framing from being stripped). rustc 1.98.0; tuned profile as in the root
@@ -191,7 +190,7 @@ code on the old M1 connector. Accepted.
   confirm at the next parse+query probe.
 
 - DOM→JS binding glue: hundreds of rquickjs classes add up; keep dispatch tables data-driven.
-- CDP server: do not take axum/hyper/tokio `full`. Prefer a lean HTTP+WebSocket impl on `std::net`.
+- Host protocol stack: **superseded** — [ADR 0012](../adrs/0012-host-protocol-and-cli-stack.md) accepts axum + clap and retires the `http1` crate. The renderer path still takes no web-server stack and no CLI crate; its only serialization is the value-only IPC seam, and its runtime stays current-thread `rt`+`time`.
 - A11y walker (accname computation, role mapping): budget ~100–200 KB, fine, but measure.
 - When the deferred stealth milestone lands net on btls ([ADR 0006](../adrs/0006-net-transport.md)): pin the crate family like html5ever (its BoringSSL fork is wreq-ecosystem); impersonation presets go stale with every Chrome release — a stale preset is itself a detection signal, so bump discipline applies to persona tables, not just crates.
 - Re-measure marginals at every milestone; regressions must justify themselves in bytes.
@@ -308,3 +307,61 @@ the page probe grew 308,608 bytes. Most of the new retained code is the
 `encoding_rs` decoder and WebIDL/event/parser machinery; networking still uses no
 framework or multi-thread async runtime. The shipping executable remains 27.7%
 below the hard limit.
+
+## Milestone: axum + clap host stack (2026-09-10)
+
+[ADR 0012](../adrs/0012-host-protocol-and-cli-stack.md) replaced the `http1`
+crate with axum (CDP HTTP + WebSocket, WebDriver REST) and the hand-rolled
+argument parser with clap; the size cap moved to 10 MB in the same decision.
+Command: `nix develop --command cargo build --release --example page_probe --bin
+tinybrowser`; rustc 1.98.0, committed stripped x86_64 release profile.
+
+| Artifact | Bytes | Headroom to 10,000,000 |
+| --- | ---: | ---: |
+| CLI (`target/release/tinybrowser`) | 4,421,008 | 5,578,992 |
+| Page engine (`target/release/examples/page_probe`) | 3,389,088 | 6,610,912 |
+
+The CLI grew 807,296 bytes over the autonomous-page row (3,613,712). axum +
+hyper + tower + clap plus the Tokio multi-thread/net server runtime account for
+it. The probe grew 63,120 bytes (3,325,968): workspace feature unification now
+builds its Tokio with the `net`/`rt-multi-thread` features the host stack
+enables. The renderer path still takes no web-server stack and no CLI crate; its
+only serialization is the value-only IPC seam (`serde` in `protocol.rs`/`process.rs`),
+and the renderer runtime stays current-thread `rt`+`time`.
+
+## Milestone: renderer processes and per-site isolation (2026-09-10)
+
+[ADR 0011](../adrs/0011-renderer-processes-per-site.md) split the engine into
+the `renderer` crate (parser, `Dom`, QuickJS, value-only seam) and the `browser`
+host (Browser, tab `Page`, navigation, `NetworkSession`, renderer registry).
+The host spawns one `--renderer` process per site instance; tests use the
+in-process local backend. Command: `nix develop --command cargo build --release
+--example page_probe --bin tinybrowser`; rustc 1.98.0, committed stripped
+x86_64 release profile.
+
+| Artifact | Bytes | Headroom to 10,000,000 |
+| --- | ---: | ---: |
+| CLI (`target/release/tinybrowser`) | 4,606,592 | 5,393,408 |
+| Page engine (`target/release/examples/page_probe`) | 3,582,736 | 6,417,264 |
+
+The CLI grew 185,584 bytes over the axum+clap row (4,421,008): serde-derive IPC
+types, the renderer link/registry, and process spawn/IO. The probe grew 193,648
+bytes (3,389,088) because it now links the same host+renderer pair the shipping
+binary does. Renderer `serde` is confined to the `protocol` module. QuickJS
+stays per realm; the renderer process is the isolation unit.
+
+### Post-review hardening (2026-09-10)
+
+An adversarial review of the split fixed the IPC death paths and several silent
+failures; same command and profile as the milestone above.
+
+| Artifact | Bytes | Headroom to 10,000,000 |
+| --- | ---: | ---: |
+| CLI (`target/release/tinybrowser`) | 4,632,736 | 5,367,264 |
+| Page engine (`target/release/examples/page_probe`) | 3,600,016 | 6,399,984 |
+
+Changes: non-finite JS numbers are string-encoded in the IPC seam, the
+`--renderer` child sends a `Ready` handshake, a dead renderer drains pending
+requests instead of stranding callers, opaque per-page renderers are reaped on
+release, idle pools drain on Browser close, and local renderer dials run on the
+browser-owned executor. CLI +26,144 bytes over the milestone above.

@@ -2,7 +2,7 @@
 
 `dom` is a generational arena of `NodeId` handles so JS and parser mutations never hold a Rust borrow across a reentry, and a dead handle cannot resolve to a recycled stranger. html5ever lives above it in `browser::parse_html`: storage has no tree-builder dependency (it still pins `markup5ever` for names). The sink owns parser vocabulary (chunked text). `<template>` contents are a fragment associated on `Dom`, not in the template element’s child list ([ADR 0007](0007-engine-charter.md)).
 
-Status: accepted (supersedes [0003](0003-treesink-adapter-in-browser.md) and [0004](0004-dom-v1-audit-acceptances.md))
+Status: accepted
 
 Nodes live in `Vec<Slot>`; public identity is `NodeId { document, slot, generation }`. The document id is unique per `Dom` so a handle cannot name a live node in a different tree. Generations tick once per reallocation; destruction empties the cell without ticking. `Dom` is `Send` and structurally `!Sync` (`PhantomData<Cell<()>>`); one worker per page, zero locks. Selector queries read `Dom`'s quirks mode (the WHATWG id/class quirk); the parser writes that flag.
 

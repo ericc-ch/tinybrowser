@@ -3,8 +3,8 @@ members = [
     "crates/browser",
     "crates/cdp",
     "crates/dom",
-    "crates/http1",
     "crates/net",
+    "crates/renderer",
     "crates/webdriver",
 ]
 
@@ -16,8 +16,8 @@ edition = "2024"
 browser = { path = "crates/browser" }
 cdp = { path = "crates/cdp" }
 dom = { path = "crates/dom" }
-http1 = { path = "crates/http1" }
 net = { path = "crates/net" }
+renderer = { path = "crates/renderer" }
 webdriver = { path = "crates/webdriver" }
 
 [package]
@@ -31,7 +31,9 @@ workspace = true
 [dependencies]
 browser = { workspace = true }
 cdp = { workspace = true }
+renderer = { workspace = true }
 webdriver = { workspace = true }
+clap = { version = "4.5", features = ["derive"] }
 serde_json = "1"
 
 # ─── Lints ────────────────────────────────────────────────────────────────────
