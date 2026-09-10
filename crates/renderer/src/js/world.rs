@@ -33,7 +33,8 @@ pub(crate) struct World {
     pub document_ready: bool,
     listeners: HashMap<EventTargetKey, Vec<Listener>>,
     wrappers: HashMap<NodeId, Persistent<Value<'static>>>,
-    brands: HashMap<&'static str, Persistent<Object<'static>>>,
+    token_lists: HashMap<NodeId, Persistent<Value<'static>>>,
+    brands: HashMap<String, Persistent<Object<'static>>>,
 }
 
 impl World {
@@ -48,6 +49,7 @@ impl World {
             document_ready: false,
             listeners: HashMap::new(),
             wrappers: HashMap::new(),
+            token_lists: HashMap::new(),
             brands: HashMap::new(),
         }
     }
@@ -57,6 +59,7 @@ impl World {
         self.document_ready = false;
         self.listeners.clear();
         self.wrappers.clear();
+        self.token_lists.clear();
     }
 
     pub(crate) fn add_listener(&mut self, target: EventTargetKey, listener: Listener) {
@@ -66,6 +69,7 @@ impl World {
     pub(crate) fn clear_listeners(&mut self) {
         self.listeners.clear();
         self.wrappers.clear();
+        self.token_lists.clear();
         self.brands.clear();
     }
 
@@ -77,8 +81,20 @@ impl World {
         self.wrappers.insert(id, value);
     }
 
-    pub(crate) fn intern_brand(&mut self, name: &'static str, proto: Persistent<Object<'static>>) {
-        self.brands.insert(name, proto);
+    pub(crate) fn token_list(&self, id: NodeId) -> Option<Persistent<Value<'static>>> {
+        self.token_lists.get(&id).cloned()
+    }
+
+    pub(crate) fn intern_token_list(&mut self, id: NodeId, value: Persistent<Value<'static>>) {
+        self.token_lists.insert(id, value);
+    }
+
+    pub(crate) fn intern_brand(
+        &mut self,
+        name: impl Into<String>,
+        proto: Persistent<Object<'static>>,
+    ) {
+        self.brands.insert(name.into(), proto);
     }
 
     pub(crate) fn brand(&self, name: &str) -> Option<Persistent<Object<'static>>> {

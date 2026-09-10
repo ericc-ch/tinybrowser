@@ -889,14 +889,170 @@ impl Dom {
     /// ([HTML attribute names](https://html.spec.whatwg.org/multipage/syntax.html#syntax-attribute-name)).
     #[must_use]
     pub fn attribute(&self, id: NodeId, local: &str) -> Option<String> {
+        self.find_attribute(id, local)
+            .map(|attribute| attribute.value.clone())
+    }
+
+    /// [Element.hasAttribute](https://dom.spec.whatwg.org/#dom-element-hasattribute):
+    /// exact local-name match; HTML elements lowercase the queried name.
+    #[must_use]
+    pub fn has_attribute(&self, id: NodeId, local: &str) -> bool {
+        self.find_attribute(id, local).is_some()
+    }
+
+    /// [Element.getAttributeNS](https://dom.spec.whatwg.org/#dom-element-getattributens):
+    /// exact namespace and local-name match, prefix ignored.
+    #[must_use]
+    pub fn attribute_ns(&self, id: NodeId, ns: &str, local: &str) -> Option<String> {
         match self.get(id).map(|node| node.kind()) {
             Some(NodeKind::Element { attributes, .. }) => attributes.iter().find_map(|attribute| {
-                (attribute.name.ns.is_empty()
-                    && attribute.name.local.as_ref().eq_ignore_ascii_case(local))
-                .then(|| attribute.value.clone())
+                (attribute.name.ns.as_ref() == ns && attribute.name.local.as_ref() == local)
+                    .then(|| attribute.value.clone())
             }),
             _ => None,
         }
+    }
+
+    /// [Element.getAttributeNames](https://dom.spec.whatwg.org/#dom-element-getattributenames):
+    /// qualified names in attribute order.
+    #[must_use]
+    pub fn attribute_names(&self, id: NodeId) -> Vec<String> {
+        match self.get(id).map(|node| node.kind()) {
+            Some(NodeKind::Element { attributes, .. }) => attributes
+                .iter()
+                .map(|attribute| Self::qualified_name(&attribute.name))
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// [Element.removeAttribute](https://dom.spec.whatwg.org/#dom-element-removeattribute).
+    ///
+    /// # Errors
+    ///
+    /// - [`DomError::StaleNode`] if `id` is stale.
+    /// - [`DomError::WrongNodeType`] if `id` is not an element.
+    pub fn remove_attribute(&mut self, id: NodeId, local: &str) -> Result<(), DomError> {
+        let node = self.node_mut(id).ok_or(DomError::StaleNode)?;
+        let NodeKind::Element { name, attributes } = &mut node.kind else {
+            return Err(DomError::WrongNodeType);
+        };
+        let local = if name.ns == html_namespace() {
+            local.to_ascii_lowercase()
+        } else {
+            local.to_owned()
+        };
+        attributes.retain(|attribute| {
+            !(attribute.name.ns.is_empty() && attribute.name.local.as_ref() == local)
+        });
+        Ok(())
+    }
+
+    /// [Element.removeAttributeNS](https://dom.spec.whatwg.org/#dom-element-removeattributens).
+    ///
+    /// # Errors
+    ///
+    /// - [`DomError::StaleNode`] if `id` is stale.
+    /// - [`DomError::WrongNodeType`] if `id` is not an element.
+    pub fn remove_attribute_ns(
+        &mut self,
+        id: NodeId,
+        ns: &str,
+        local: &str,
+    ) -> Result<(), DomError> {
+        let node = self.node_mut(id).ok_or(DomError::StaleNode)?;
+        let NodeKind::Element { attributes, .. } = &mut node.kind else {
+            return Err(DomError::WrongNodeType);
+        };
+        attributes.retain(|attribute| {
+            !(attribute.name.ns.as_ref() == ns && attribute.name.local.as_ref() == local)
+        });
+        Ok(())
+    }
+
+    /// Replaces every child of `parent` with `node`
+    /// (<https://dom.spec.whatwg.org/#concept-node-replace-all>). Removed
+    /// children stay alive, detached, like the spec's remove step.
+    ///
+    /// # Errors
+    ///
+    /// - [`DomError::StaleNode`] if either handle is stale.
+    /// - [`DomError::HierarchyRequest`] if `parent` cannot contain children,
+    ///   `node` is a doctype outside a document, or the document content
+    ///   model refuses the replacement.
+    /// - [`DomError::CycleForbidden`] if `node` is an ancestor of `parent`.
+    pub fn replace_all(&mut self, parent: NodeId, node: NodeId) -> Result<(), DomError> {
+        self.ensure_alive(parent, node)?;
+        if !matches!(
+            self.get(parent).map(|view| view.kind()),
+            Some(NodeKind::Document | NodeKind::Element { .. } | NodeKind::Fragment)
+        ) {
+            return Err(DomError::HierarchyRequest);
+        }
+        if self.would_cycle(node, parent) {
+            return Err(DomError::CycleForbidden);
+        }
+        if matches!(
+            self.get(parent).map(|view| view.kind()),
+            Some(NodeKind::Document)
+        ) {
+            let incoming = self.incoming_nodes(node);
+            self.ensure_document_content_model(&incoming)?;
+        } else if !self.is_fragment(node)
+            && matches!(
+                self.get(node).map(|view| view.kind()),
+                Some(NodeKind::Doctype { .. })
+            )
+        {
+            return Err(DomError::HierarchyRequest);
+        }
+        let kids: Vec<NodeId> = self
+            .children(parent)
+            .map(|kids| kids.copied().collect())
+            .unwrap_or_default();
+        for kid in kids {
+            self.unlink_from_current_parent(kid);
+            if let Some(detached) = self.node_mut(kid) {
+                detached.parent = None;
+            }
+        }
+        if self.is_fragment(node) {
+            self.splice_fragment(parent, node, None);
+        } else {
+            self.place_node(parent, node, None);
+        }
+        Ok(())
+    }
+
+    /// Sets the attribute `name` on element `id`, replacing an attribute with
+    /// the same qualified name.
+    ///
+    /// [DOM setAttributeNS](https://dom.spec.whatwg.org/#dom-element-setattributens)
+    ///
+    /// # Errors
+    ///
+    /// - [`DomError::StaleNode`] if `id` is stale.
+    /// - [`DomError::WrongNodeType`] if `id` is not an element.
+    pub fn set_attribute_named(
+        &mut self,
+        id: NodeId,
+        name: QualName,
+        value: impl Into<String>,
+    ) -> Result<(), DomError> {
+        let node = self.node_mut(id).ok_or(DomError::StaleNode)?;
+        let NodeKind::Element { attributes, .. } = &mut node.kind else {
+            return Err(DomError::WrongNodeType);
+        };
+        let value = value.into();
+        if let Some(existing) = attributes
+            .iter_mut()
+            .find(|attribute| attribute.name == name)
+        {
+            existing.value = value;
+            return Ok(());
+        }
+        attributes.push(Attribute { name, value });
+        Ok(())
     }
 
     /// Sets the unnamespaced attribute `local` on element `id`, replacing a
@@ -1033,6 +1189,31 @@ impl Dom {
             self.get(id).map(|view| view.kind()),
             Some(NodeKind::Fragment)
         )
+    }
+
+    /// A qualified name's serialization: `prefix:local` or just `local`.
+    fn qualified_name(name: &QualName) -> String {
+        match &name.prefix {
+            Some(prefix) if !prefix.is_empty() => format!("{prefix}:{}", name.local),
+            _ => name.local.to_string(),
+        }
+    }
+
+    /// The element's own unnamespaced attribute whose local name matches
+    /// `local`; HTML elements ASCII-lowercase the queried name first
+    /// ([DOM has-attribute](https://dom.spec.whatwg.org/#concept-element-attribute-has)).
+    fn find_attribute<'a>(&'a self, id: NodeId, local: &str) -> Option<&'a Attribute> {
+        let NodeKind::Element { name, attributes } = self.get(id)?.kind() else {
+            return None;
+        };
+        let local = if name.ns == html_namespace() {
+            local.to_ascii_lowercase()
+        } else {
+            local.to_owned()
+        };
+        attributes.iter().find(|attribute| {
+            attribute.name.ns.is_empty() && attribute.name.local.as_ref() == local
+        })
     }
 
     fn is_html_template_element(&self, id: NodeId) -> bool {

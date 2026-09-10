@@ -26,6 +26,12 @@ pub fn xml_namespace() -> Namespace {
     Namespace::from("http://www.w3.org/XML/1998/namespace")
 }
 
+/// The SVG namespace URL.
+#[must_use]
+pub fn svg_namespace() -> Namespace {
+    Namespace::from("http://www.w3.org/2000/svg")
+}
+
 /// One attribute: a qualified name and its value.
 ///
 /// Deliberately *not* `markup5ever::Attribute`: that one stores its value as

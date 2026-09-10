@@ -5,12 +5,12 @@ use std::rc::Rc;
 
 use dom::{
     DomError, LocalName, Namespace, NodeId, NodeKind, Prefix, QualName, html_namespace,
-    xml_namespace,
+    svg_namespace,
 };
 use rquickjs::{
     Class, Ctx, Exception, FromJs, Function, Object, Persistent, Result, Value,
     class::{Trace, Tracer},
-    function::{Constructor, Rest},
+    function::{Constructor, Opt, Rest},
     prelude::This,
 };
 
@@ -239,6 +239,224 @@ fn valid_doctype_name(name: &str) -> bool {
         .any(|c| matches!(c, '\t' | '\n' | '\u{c}' | '\r' | ' ' | '\0' | '>'))
 }
 
+/// `DOMTokenList` for `Element.classList`
+/// (<https://dom.spec.whatwg.org/#interface-domtokenlist>).
+#[derive(Trace, rquickjs::JsLifetime)]
+#[rquickjs::class(rename = "DOMTokenList")]
+pub struct JsTokenList {
+    element: Handle,
+}
+
+#[rquickjs::methods]
+#[allow(
+    clippy::needless_pass_by_value,
+    clippy::unused_self,
+    reason = "rquickjs method ABI passes Ctx by value; DOMTokenList methods may ignore self"
+)]
+impl JsTokenList {
+    #[qjs(constructor)]
+    fn ctor(ctx: Ctx<'_>) -> Result<Self> {
+        Err(Exception::throw_type(&ctx, "Illegal constructor"))
+    }
+
+    // https://dom.spec.whatwg.org/#dom-domtokenlist-length
+    #[qjs(get)]
+    fn length(&self, ctx: Ctx<'_>) -> Result<usize> {
+        Ok(class_tokens(&ctx, self.element.0)?.len())
+    }
+
+    // https://dom.spec.whatwg.org/#dom-domtokenlist-value
+    #[qjs(get)]
+    fn value(&self, ctx: Ctx<'_>) -> Result<String> {
+        let world = world(&ctx)?;
+        Ok(world
+            .borrow()
+            .parsed
+            .as_ref()
+            .and_then(|parsed| parsed.dom.attribute(self.element.0, "class"))
+            .unwrap_or_default())
+    }
+
+    #[qjs(set, rename = "value")]
+    fn set_value(&self, ctx: Ctx<'_>, value: WebIdlString) -> Result<()> {
+        write_class(&ctx, self.element.0, &value.0)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-domtokenlist-item
+    #[qjs(rename = "item")]
+    fn item<'js>(&self, ctx: Ctx<'js>, index: i64) -> Result<Value<'js>> {
+        let tokens = class_tokens(&ctx, self.element.0)?;
+        match usize::try_from(index)
+            .ok()
+            .and_then(|index| tokens.get(index))
+        {
+            Some(token) => string_value(&ctx, token),
+            None => Ok(Value::new_null(ctx)),
+        }
+    }
+
+    // https://dom.spec.whatwg.org/#dom-domtokenlist-contains
+    #[qjs(rename = "contains")]
+    fn contains(&self, ctx: Ctx<'_>, token: WebIdlString) -> Result<bool> {
+        // `contains` does not validate its argument
+        // (<https://dom.spec.whatwg.org/#dom-domtokenlist-contains>).
+        Ok(class_tokens(&ctx, self.element.0)?.contains(&token.0))
+    }
+
+    // https://dom.spec.whatwg.org/#dom-domtokenlist-add
+    #[qjs(rename = "add")]
+    fn add(&self, ctx: Ctx<'_>, tokens: Rest<WebIdlString>) -> Result<()> {
+        let mut current = class_tokens(&ctx, self.element.0)?;
+        for token in tokens.0 {
+            validate_token(&ctx, &token.0)?;
+            if !current.contains(&token.0) {
+                current.push(token.0);
+            }
+        }
+        // The update steps run even when no token was added, normalizing
+        // the attribute (<https://dom.spec.whatwg.org/#dom-domtokenlist-add>).
+        write_class_tokens(&ctx, self.element.0, &current)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-domtokenlist-remove
+    #[qjs(rename = "remove")]
+    fn remove(&self, ctx: Ctx<'_>, tokens: Rest<WebIdlString>) -> Result<()> {
+        let mut current = class_tokens(&ctx, self.element.0)?;
+        for token in tokens.0 {
+            validate_token(&ctx, &token.0)?;
+            current.retain(|existing| existing != &token.0);
+        }
+        write_class_tokens(&ctx, self.element.0, &current)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-domtokenlist-toggle
+    #[qjs(rename = "toggle")]
+    fn toggle(&self, ctx: Ctx<'_>, token: WebIdlString, force: Opt<bool>) -> Result<bool> {
+        validate_token(&ctx, &token.0)?;
+        let mut current = class_tokens(&ctx, self.element.0)?;
+        let present = current.contains(&token.0);
+        let should_be_present = force.0.unwrap_or(!present);
+        if should_be_present != present {
+            if should_be_present {
+                current.push(token.0);
+            } else {
+                current.retain(|existing| existing != &token.0);
+            }
+            write_class_tokens(&ctx, self.element.0, &current)?;
+        }
+        Ok(should_be_present)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-domtokenlist-replace
+    #[qjs(rename = "replace")]
+    fn replace(&self, ctx: Ctx<'_>, old: WebIdlString, new: WebIdlString) -> Result<bool> {
+        validate_token(&ctx, &old.0)?;
+        validate_token(&ctx, &new.0)?;
+        let mut current = class_tokens(&ctx, self.element.0)?;
+        if !current.contains(&old.0) {
+            return Ok(false);
+        }
+        for token in &mut current {
+            if token == &old.0 {
+                token.clone_from(&new.0);
+            }
+        }
+        // Replacing can duplicate an existing token; the token set keeps the
+        // first occurrence (https://github.com/whatwg/dom/issues/443).
+        let mut deduped: Vec<String> = Vec::with_capacity(current.len());
+        for token in current {
+            if !deduped.contains(&token) {
+                deduped.push(token);
+            }
+        }
+        write_class_tokens(&ctx, self.element.0, &deduped)?;
+        Ok(true)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-domtokenlist-supports
+    #[qjs(rename = "supports")]
+    fn supports(&self, ctx: Ctx<'_>, _token: WebIdlString) -> Result<bool> {
+        // The spec ends with "throw a TypeError"
+        // (<https://dom.spec.whatwg.org/#dom-domtokenlist-supports>).
+        Err(Exception::throw_type(
+            &ctx,
+            "DOMTokenList has no supported tokens",
+        ))
+    }
+
+    // https://dom.spec.whatwg.org/#interface-domtokenlist: stringifier
+    #[qjs(rename = "toString")]
+    fn to_string_js(&self, ctx: Ctx<'_>) -> Result<String> {
+        let world = world(&ctx)?;
+        Ok(world
+            .borrow()
+            .parsed
+            .as_ref()
+            .and_then(|parsed| parsed.dom.attribute(self.element.0, "class"))
+            .unwrap_or_default())
+    }
+}
+
+/// The element's class tokens: an ordered set, so duplicates collapse.
+fn class_tokens(ctx: &Ctx<'_>, id: NodeId) -> Result<Vec<String>> {
+    let world = world(ctx)?;
+    let mut tokens: Vec<String> = Vec::new();
+    for token in world
+        .borrow()
+        .parsed
+        .as_ref()
+        .and_then(|parsed| parsed.dom.attribute(id, "class"))
+        .unwrap_or_default()
+        .split_ascii_whitespace()
+    {
+        if !tokens.iter().any(|existing| existing == token) {
+            tokens.push(token.to_string());
+        }
+    }
+    Ok(tokens)
+}
+
+/// [Token validation](https://dom.spec.whatwg.org/#validate-a-token).
+fn validate_token(ctx: &Ctx<'_>, token: &str) -> Result<()> {
+    if token.is_empty() {
+        return Err(throw_dom(ctx, "SyntaxError", "token is empty"));
+    }
+    if token
+        .chars()
+        .any(|c| matches!(c, '\t' | '\n' | '\u{c}' | '\r' | ' '))
+    {
+        return Err(throw_dom(
+            ctx,
+            "InvalidCharacterError",
+            "token contains ASCII whitespace",
+        ));
+    }
+    Ok(())
+}
+
+/// Writes the token list back as the class attribute. The update steps set
+/// the attribute even when the list serializes to the empty string; when the
+/// attribute does not exist and the value is empty they do nothing
+/// (<https://dom.spec.whatwg.org/#concept-dtl-update>).
+fn write_class_tokens(ctx: &Ctx<'_>, id: NodeId, tokens: &[String]) -> Result<()> {
+    write_class(ctx, id, &tokens.join(" "))
+}
+
+fn write_class(ctx: &Ctx<'_>, id: NodeId, value: &str) -> Result<()> {
+    let world = world(ctx)?;
+    let mut world = world.borrow_mut();
+    let Some(parsed) = world.parsed.as_mut() else {
+        return Ok(());
+    };
+    if value.is_empty() && parsed.dom.attribute(id, "class").is_none() {
+        return Ok(());
+    }
+    parsed
+        .dom
+        .set_attribute(id, "class", value)
+        .map_err(|err| throw_dom_error(ctx, err))
+}
+
 /// Builds and throws a `DOMException` from Rust with a real prototype, so
 /// `instanceof DOMException` and `constructor` checks pass.
 fn throw_dom(ctx: &Ctx<'_>, name: &str, message: &str) -> rquickjs::Error {
@@ -274,7 +492,12 @@ branded_node!(JsNode, "Node");
 #[derive(Trace, rquickjs::JsLifetime)]
 enum CollectionKind {
     Children,
+    ElementChildren,
     ElementsByTag(String),
+    ElementsByTagNs { namespace: String, local: String },
+    ElementsByClass(String),
+    ElementsByName(String),
+    Static(Vec<Handle>),
 }
 
 #[derive(Trace, rquickjs::JsLifetime)]
@@ -443,30 +666,7 @@ impl JsNode {
         ns: OptString,
         tag: String,
     ) -> Result<Value<'js>> {
-        let namespace_is_null = ns.0.as_ref().is_none_or(String::is_empty);
-        let namespace = match ns.0 {
-            Some(ns) if !ns.is_empty() => Namespace::from(ns),
-            _ => Namespace::from(""),
-        };
-        if !valid_qualified_name(&tag) {
-            return Err(Exception::throw_type(&ctx, "InvalidCharacterError"));
-        }
-        let (prefix, local) = split_qualified_name(&tag);
-        // https://dom.spec.whatwg.org/#validate-and-extract
-        if prefix.is_some() && namespace_is_null {
-            return Err(Exception::throw_type(&ctx, "NamespaceError"));
-        }
-        if prefix == Some("xml") && namespace != xml_namespace() {
-            return Err(Exception::throw_type(&ctx, "NamespaceError"));
-        }
-        let xmlns = Namespace::from("http://www.w3.org/2000/xmlns/");
-        if (prefix == Some("xmlns") || tag == "xmlns") && namespace != xmlns {
-            return Err(Exception::throw_type(&ctx, "NamespaceError"));
-        }
-        if namespace == xmlns && prefix != Some("xmlns") && tag != "xmlns" {
-            return Err(Exception::throw_type(&ctx, "NamespaceError"));
-        }
-        let name = QualName::new(prefix.map(Prefix::from), namespace, LocalName::from(local));
+        let name = validate_and_extract(&ctx, ns.0.as_deref(), &tag, NodeContext::Element)?;
         create_element_named(&ctx, name)
     }
 
@@ -506,7 +706,7 @@ impl JsNode {
             let Some(parsed) = parsed.parsed.as_ref() else {
                 return Ok(Value::new_null(ctx));
             };
-            find_element_by_id(&parsed.dom, parsed.dom.document(), &id)
+            find_element_by_id(&parsed.dom, self.handle.0, &id)
         };
         match found {
             Some(node) => wrap_node(&ctx, node),
@@ -522,6 +722,13 @@ impl JsNode {
 
     #[qjs(rename = "getElementsByTagName")]
     fn get_elements_by_tag_name<'js>(&self, ctx: Ctx<'js>, name: String) -> Result<Value<'js>> {
+        // An HTML document lowercases the queried qualified name
+        // (<https://dom.spec.whatwg.org/#concept-getelementsbytagname>).
+        let name = if is_html_document(&ctx) {
+            name.to_ascii_lowercase()
+        } else {
+            name
+        };
         elements_by_tag(&ctx, self.handle.0, &name)
     }
 
@@ -596,6 +803,7 @@ impl JsNode {
         }
     }
 
+    // https://dom.spec.whatwg.org/#dom-document-readyState
     #[qjs(get, rename = "readyState")]
     fn ready_state(&self, ctx: Ctx<'_>) -> Result<String> {
         let world = world(&ctx)?;
@@ -614,18 +822,78 @@ impl JsNode {
         })
     }
 
-    #[qjs(rename = "getAttribute")]
-    fn get_attribute(&self, ctx: Ctx<'_>, name: String) -> Result<Option<String>> {
+    // https://dom.spec.whatwg.org/#dom-document-url
+    #[qjs(get, rename = "URL")]
+    fn url(&self, ctx: Ctx<'_>) -> Result<String> {
+        Ok(world(&ctx)?.borrow().document_url.as_str().to_owned())
+    }
+
+    // https://dom.spec.whatwg.org/#dom-document-documenturi
+    #[qjs(get, rename = "documentURI")]
+    fn document_uri(&self, ctx: Ctx<'_>) -> Result<String> {
+        Ok(world(&ctx)?.borrow().document_url.as_str().to_owned())
+    }
+
+    // https://encoding.spec.whatwg.org/#dom-document-characterset
+    #[qjs(get, rename = "characterSet")]
+    fn character_set(&self) -> &'static str {
+        "UTF-8"
+    }
+
+    #[qjs(get, rename = "charset")]
+    fn charset(&self) -> &'static str {
+        "UTF-8"
+    }
+
+    #[qjs(get, rename = "inputEncoding")]
+    fn input_encoding(&self) -> &'static str {
+        "UTF-8"
+    }
+
+    // https://dom.spec.whatwg.org/#dom-document-contenttype
+    #[qjs(get, rename = "contentType")]
+    fn content_type(&self) -> &'static str {
+        "text/html"
+    }
+
+    // https://dom.spec.whatwg.org/#dom-document-compatmode
+    #[qjs(get, rename = "compatMode")]
+    fn compat_mode(&self, ctx: Ctx<'_>) -> Result<String> {
         let world = world(&ctx)?;
-        Ok(world
+        let parsed = world.borrow();
+        let quirks = parsed
+            .parsed
+            .as_ref()
+            .is_some_and(|parsed| parsed.quirks_mode == markup5ever::interface::QuirksMode::Quirks);
+        Ok(if quirks { "BackCompat" } else { "CSS1Compat" }.into())
+    }
+
+    #[qjs(rename = "getAttribute")]
+    fn get_attribute<'js>(&self, ctx: Ctx<'js>, name: String) -> Result<Value<'js>> {
+        if !valid_attribute_local_name(&name) {
+            return Ok(Value::new_null(ctx));
+        }
+        let world = world(&ctx)?;
+        let found = world
             .borrow()
             .parsed
             .as_ref()
-            .and_then(|parsed| parsed.dom.attribute(self.handle.0, &name)))
+            .and_then(|parsed| parsed.dom.attribute(self.handle.0, &name));
+        match found {
+            Some(value) => string_value(&ctx, &value),
+            None => Ok(Value::new_null(ctx)),
+        }
     }
 
     #[qjs(rename = "setAttribute")]
-    fn set_attribute(&self, ctx: Ctx<'_>, name: String, value: String) -> Result<()> {
+    fn set_attribute(&self, ctx: Ctx<'_>, name: String, value: WebIdlString) -> Result<()> {
+        if !valid_attribute_local_name(&name) {
+            return Err(throw_dom(
+                &ctx,
+                "InvalidCharacterError",
+                "attribute name does not match the XML Name production",
+            ));
+        }
         let world = world(&ctx)?;
         let mut world = world.borrow_mut();
         let Some(parsed) = world.parsed.as_mut() else {
@@ -633,8 +901,8 @@ impl JsNode {
         };
         parsed
             .dom
-            .set_attribute(self.handle.0, &name, value)
-            .map_err(|err| Exception::throw_type(&ctx, &err.to_string()))
+            .set_attribute(self.handle.0, &name, value.0)
+            .map_err(|err| throw_dom_error(&ctx, err))
     }
 
     #[qjs(get)]
@@ -650,7 +918,7 @@ impl JsNode {
 
     #[qjs(set, rename = "id")]
     fn set_id(&self, ctx: Ctx<'_>, value: String) -> Result<()> {
-        self.set_attribute(ctx, "id".into(), value)
+        self.set_attribute(ctx, "id".into(), WebIdlString(value))
     }
 
     #[qjs(get)]
@@ -664,6 +932,11 @@ impl JsNode {
             .unwrap_or_default())
     }
 
+    #[qjs(set, rename = "src")]
+    fn set_src(&self, ctx: Ctx<'_>, value: WebIdlString) -> Result<()> {
+        self.set_attribute(ctx, "src".into(), value)
+    }
+
     #[qjs(get)]
     fn name(&self, ctx: Ctx<'_>) -> Result<String> {
         let world = world(&ctx)?;
@@ -675,6 +948,11 @@ impl JsNode {
             .unwrap_or_default())
     }
 
+    #[qjs(set, rename = "name")]
+    fn set_name(&self, ctx: Ctx<'_>, value: WebIdlString) -> Result<()> {
+        self.set_attribute(ctx, "name".into(), value)
+    }
+
     #[qjs(get)]
     fn content(&self, ctx: Ctx<'_>) -> Result<String> {
         let world = world(&ctx)?;
@@ -684,6 +962,29 @@ impl JsNode {
             .as_ref()
             .and_then(|parsed| parsed.dom.attribute(self.handle.0, "content"))
             .unwrap_or_default())
+    }
+
+    #[qjs(set, rename = "content")]
+    fn set_content(&self, ctx: Ctx<'_>, value: WebIdlString) -> Result<()> {
+        self.set_attribute(ctx, "content".into(), value)
+    }
+
+    /// Reflected inline style content attribute. A real
+    /// `CSSStyleDeclaration` needs the CSSOM; this reflects the string.
+    #[qjs(get, rename = "style")]
+    fn style(&self, ctx: Ctx<'_>) -> Result<String> {
+        let world = world(&ctx)?;
+        Ok(world
+            .borrow()
+            .parsed
+            .as_ref()
+            .and_then(|parsed| parsed.dom.attribute(self.handle.0, "style"))
+            .unwrap_or_default())
+    }
+
+    #[qjs(set, rename = "style")]
+    fn set_style(&self, ctx: Ctx<'_>, value: WebIdlString) -> Result<()> {
+        self.set_attribute(ctx, "style".into(), value)
     }
 
     #[qjs(get)]
@@ -743,7 +1044,7 @@ impl JsNode {
         Ok(parsed
             .dom
             .children(self.handle.0)
-            .is_some_and(|kids| kids.len() > 0))
+            .is_some_and(|mut kids| kids.next().is_some()))
     }
 
     // https://dom.spec.whatwg.org/#dom-node-nodevalue
@@ -821,6 +1122,788 @@ impl JsNode {
         Ok(())
     }
 
+    // ── ParentNode ───────────────────────────────────────────────────────
+
+    // https://dom.spec.whatwg.org/#dom-parentnode-children
+    #[qjs(get)]
+    fn children<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
+        live_collection(
+            &ctx,
+            self.handle.0,
+            CollectionKind::ElementChildren,
+            Some("HTMLCollection"),
+        )
+    }
+
+    // https://dom.spec.whatwg.org/#dom-parentnode-firstelementchild
+    #[qjs(get, rename = "firstElementChild")]
+    fn first_element_child<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
+        let world = world(&ctx)?;
+        let found = {
+            let parsed = world.borrow();
+            let Some(parsed) = parsed.parsed.as_ref() else {
+                return Ok(Value::new_null(ctx));
+            };
+            parsed
+                .dom
+                .children(self.handle.0)
+                .and_then(|kids| kids.copied().find(|&kid| is_element(&parsed.dom, kid)))
+        };
+        child_value(&ctx, found)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-parentnode-lastelementchild
+    #[qjs(get, rename = "lastElementChild")]
+    fn last_element_child<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
+        let world = world(&ctx)?;
+        let found = {
+            let parsed = world.borrow();
+            let Some(parsed) = parsed.parsed.as_ref() else {
+                return Ok(Value::new_null(ctx));
+            };
+            parsed.dom.children(self.handle.0).and_then(|kids| {
+                kids.rev()
+                    .copied()
+                    .find(|&kid| is_element(&parsed.dom, kid))
+            })
+        };
+        child_value(&ctx, found)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-parentnode-childelementcount
+    #[qjs(get, rename = "childElementCount")]
+    fn child_element_count(&self, ctx: Ctx<'_>) -> Result<usize> {
+        let world = world(&ctx)?;
+        let parsed = world.borrow();
+        let Some(parsed) = parsed.parsed.as_ref() else {
+            return Ok(0);
+        };
+        Ok(parsed.dom.children(self.handle.0).map_or(0, |kids| {
+            kids.filter(|&kid| is_element(&parsed.dom, *kid)).count()
+        }))
+    }
+
+    // https://dom.spec.whatwg.org/#dom-parentnode-append
+    #[qjs(rename = "append")]
+    fn append<'js>(&self, ctx: Ctx<'js>, nodes: Rest<Value<'js>>) -> Result<()> {
+        let node = convert_nodes_into_node(&ctx, nodes)?;
+        let world = world(&ctx)?;
+        let mut world = world.borrow_mut();
+        let Some(parsed) = world.parsed.as_mut() else {
+            return Err(Exception::throw_type(&ctx, "no document"));
+        };
+        parsed
+            .dom
+            .pre_insert(self.handle.0, node, None)
+            .map_err(|err| throw_dom_error(&ctx, err))
+    }
+
+    // https://dom.spec.whatwg.org/#dom-parentnode-prepend
+    #[qjs(rename = "prepend")]
+    fn prepend<'js>(&self, ctx: Ctx<'js>, nodes: Rest<Value<'js>>) -> Result<()> {
+        let node = convert_nodes_into_node(&ctx, nodes)?;
+        let world = world(&ctx)?;
+        let mut world = world.borrow_mut();
+        let Some(parsed) = world.parsed.as_mut() else {
+            return Err(Exception::throw_type(&ctx, "no document"));
+        };
+        let reference = parsed
+            .dom
+            .children(self.handle.0)
+            .and_then(|kids| kids.copied().next());
+        parsed
+            .dom
+            .pre_insert(self.handle.0, node, reference)
+            .map_err(|err| throw_dom_error(&ctx, err))
+    }
+
+    // https://dom.spec.whatwg.org/#dom-parentnode-replacechildren
+    #[qjs(rename = "replaceChildren")]
+    fn replace_children<'js>(&self, ctx: Ctx<'js>, nodes: Rest<Value<'js>>) -> Result<()> {
+        let node = convert_nodes_into_node(&ctx, nodes)?;
+        let world = world(&ctx)?;
+        let mut world = world.borrow_mut();
+        let Some(parsed) = world.parsed.as_mut() else {
+            return Err(Exception::throw_type(&ctx, "no document"));
+        };
+        parsed
+            .dom
+            .replace_all(self.handle.0, node)
+            .map_err(|err| throw_dom_error(&ctx, err))
+    }
+
+    // https://dom.spec.whatwg.org/#dom-parentnode-queryselector
+    #[qjs(rename = "querySelector")]
+    fn query_selector<'js>(&self, ctx: Ctx<'js>, selectors: WebIdlString) -> Result<Value<'js>> {
+        let world = world(&ctx)?;
+        let found = {
+            let parsed = world.borrow();
+            let Some(parsed) = parsed.parsed.as_ref() else {
+                return Ok(Value::new_null(ctx));
+            };
+            parsed
+                .dom
+                .select_first(self.handle.0, &selectors.0)
+                .map_err(|err| select_error(&ctx, &err))?
+        };
+        child_value(&ctx, found)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-parentnode-queryselectorall
+    #[qjs(rename = "querySelectorAll")]
+    fn query_selector_all<'js>(
+        &self,
+        ctx: Ctx<'js>,
+        selectors: WebIdlString,
+    ) -> Result<Value<'js>> {
+        let world = world(&ctx)?;
+        let ids = {
+            let parsed = world.borrow();
+            let Some(parsed) = parsed.parsed.as_ref() else {
+                return Ok(Value::new_null(ctx));
+            };
+            parsed
+                .dom
+                .select_all(self.handle.0, &selectors.0)
+                .map_err(|err| select_error(&ctx, &err))?
+        };
+        let handles = ids.into_iter().map(Handle).collect();
+        live_collection(&ctx, self.handle.0, CollectionKind::Static(handles), None)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-element-matches
+    #[qjs(rename = "matches")]
+    fn matches(&self, ctx: Ctx<'_>, selectors: WebIdlString) -> Result<bool> {
+        let world = world(&ctx)?;
+        let parsed = world.borrow();
+        let Some(parsed) = parsed.parsed.as_ref() else {
+            return Ok(false);
+        };
+        parsed
+            .dom
+            .matches(self.handle.0, &selectors.0)
+            .map_err(|err| select_error(&ctx, &err))
+    }
+
+    // https://dom.spec.whatwg.org/#dom-element-closest
+    #[qjs(rename = "closest")]
+    fn closest<'js>(&self, ctx: Ctx<'js>, selectors: WebIdlString) -> Result<Value<'js>> {
+        let world = world(&ctx)?;
+        let found = {
+            let parsed = world.borrow();
+            let Some(parsed) = parsed.parsed.as_ref() else {
+                return Ok(Value::new_null(ctx));
+            };
+            let mut candidate = None;
+            let mut cursor = Some(self.handle.0);
+            while let Some(id) = cursor {
+                if is_element(&parsed.dom, id)
+                    && parsed
+                        .dom
+                        .matches(id, &selectors.0)
+                        .map_err(|err| select_error(&ctx, &err))?
+                {
+                    candidate = Some(id);
+                    break;
+                }
+                cursor = parsed.dom.parent(id);
+            }
+            candidate
+        };
+        child_value(&ctx, found)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-element-getelementsbyclassname
+    #[qjs(rename = "getElementsByClassName")]
+    fn get_elements_by_class_name<'js>(
+        &self,
+        ctx: Ctx<'js>,
+        names: WebIdlString,
+    ) -> Result<Value<'js>> {
+        live_collection(
+            &ctx,
+            self.handle.0,
+            CollectionKind::ElementsByClass(names.0),
+            Some("HTMLCollection"),
+        )
+    }
+
+    // https://dom.spec.whatwg.org/#dom-document-title
+    #[qjs(get)]
+    fn title(&self, ctx: Ctx<'_>) -> Result<String> {
+        let world = world(&ctx)?;
+        let parsed = world.borrow();
+        let Some(parsed) = parsed.parsed.as_ref() else {
+            return Ok(String::new());
+        };
+        let title = parsed
+            .dom
+            .select_first(parsed.dom.document(), "title")
+            .ok()
+            .flatten();
+        Ok(title.map_or_else(String::new, |title| descendant_text(&parsed.dom, title)))
+    }
+
+    #[qjs(set, rename = "title")]
+    fn set_title(&self, ctx: Ctx<'_>, value: WebIdlString) -> Result<()> {
+        let world = world(&ctx)?;
+        let mut world = world.borrow_mut();
+        let Some(parsed) = world.parsed.as_mut() else {
+            return Ok(());
+        };
+        let dom = &mut parsed.dom;
+        let title = dom
+            .select_first(dom.document(), "title")
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| {
+                let name = QualName::new(None, html_namespace(), LocalName::from("title"));
+                let title = dom.create_element(name, Vec::new());
+                let target = dom
+                    .select_first(dom.document(), "head")
+                    .ok()
+                    .flatten()
+                    .or_else(|| dom.select_first(dom.document(), "html").ok().flatten());
+                if let Some(target) = target {
+                    let _ = dom.append(target, title);
+                }
+                title
+            });
+        let kids: Vec<NodeId> = dom
+            .children(title)
+            .map(|kids| kids.copied().collect())
+            .unwrap_or_default();
+        for kid in kids {
+            dom.detach(kid).map_err(|err| throw_dom_error(&ctx, err))?;
+        }
+        if !value.0.is_empty() {
+            let text = dom.create_text(value.0);
+            dom.append(title, text)
+                .map_err(|err| throw_dom_error(&ctx, err))?;
+        }
+        Ok(())
+    }
+
+    // https://html.spec.whatwg.org/multipage/dom.html#dom-document-getelementsbyname
+    #[qjs(rename = "getElementsByName")]
+    fn get_elements_by_name<'js>(&self, ctx: Ctx<'js>, name: WebIdlString) -> Result<Value<'js>> {
+        live_collection(
+            &ctx,
+            self.handle.0,
+            CollectionKind::ElementsByName(name.0),
+            None,
+        )
+    }
+
+    // https://dom.spec.whatwg.org/#dom-element-getelementsbytagnamens
+    #[qjs(rename = "getElementsByTagNameNS")]
+    fn get_elements_by_tag_name_ns<'js>(
+        &self,
+        ctx: Ctx<'js>,
+        namespace: OptString,
+        local: WebIdlString,
+    ) -> Result<Value<'js>> {
+        let local = if is_html_document(&ctx) {
+            local.0.to_ascii_lowercase()
+        } else {
+            local.0
+        };
+        live_collection(
+            &ctx,
+            self.handle.0,
+            CollectionKind::ElementsByTagNs {
+                namespace: namespace.0.unwrap_or_default(),
+                local,
+            },
+            Some("HTMLCollection"),
+        )
+    }
+
+    // ── ChildNode / NonDocumentTypeChildNode ─────────────────────────────
+
+    // https://dom.spec.whatwg.org/#dom-childnode-before
+    #[qjs(rename = "before")]
+    fn before<'js>(&self, ctx: Ctx<'js>, nodes: Rest<Value<'js>>) -> Result<()> {
+        let node = convert_nodes_into_node(&ctx, nodes)?;
+        let world = world(&ctx)?;
+        let mut world = world.borrow_mut();
+        let Some(parsed) = world.parsed.as_mut() else {
+            return Err(Exception::throw_type(&ctx, "no document"));
+        };
+        let Some(parent) = parsed.dom.parent(self.handle.0) else {
+            return Ok(());
+        };
+        let previous = parsed.dom.sibling(self.handle.0, false);
+        let reference = match previous {
+            Some(previous) => parsed.dom.sibling(previous, true),
+            None => parsed
+                .dom
+                .children(parent)
+                .and_then(|kids| kids.copied().next()),
+        };
+        parsed
+            .dom
+            .pre_insert(parent, node, reference)
+            .map_err(|err| throw_dom_error(&ctx, err))
+    }
+
+    // https://dom.spec.whatwg.org/#dom-childnode-after
+    #[qjs(rename = "after")]
+    fn after<'js>(&self, ctx: Ctx<'js>, nodes: Rest<Value<'js>>) -> Result<()> {
+        let node = convert_nodes_into_node(&ctx, nodes)?;
+        let world = world(&ctx)?;
+        let mut world = world.borrow_mut();
+        let Some(parsed) = world.parsed.as_mut() else {
+            return Err(Exception::throw_type(&ctx, "no document"));
+        };
+        let Some(parent) = parsed.dom.parent(self.handle.0) else {
+            return Ok(());
+        };
+        let reference = parsed.dom.sibling(self.handle.0, true);
+        parsed
+            .dom
+            .pre_insert(parent, node, reference)
+            .map_err(|err| throw_dom_error(&ctx, err))
+    }
+
+    // https://dom.spec.whatwg.org/#dom-childnode-replacewith
+    #[qjs(rename = "replaceWith")]
+    fn replace_with<'js>(&self, ctx: Ctx<'js>, nodes: Rest<Value<'js>>) -> Result<()> {
+        let node = convert_nodes_into_node(&ctx, nodes)?;
+        let world = world(&ctx)?;
+        let mut world = world.borrow_mut();
+        let Some(parsed) = world.parsed.as_mut() else {
+            return Err(Exception::throw_type(&ctx, "no document"));
+        };
+        let Some(parent) = parsed.dom.parent(self.handle.0) else {
+            return Ok(());
+        };
+        if parsed.dom.parent(self.handle.0) == Some(parent) {
+            return parsed
+                .dom
+                .replace_child(parent, node, self.handle.0)
+                .map_err(|err| throw_dom_error(&ctx, err));
+        }
+        let reference = parsed.dom.sibling(self.handle.0, true);
+        parsed
+            .dom
+            .pre_insert(parent, node, reference)
+            .map_err(|err| throw_dom_error(&ctx, err))
+    }
+
+    // https://dom.spec.whatwg.org/#dom-nondocumenttypechildnode-previouselementsibling
+    #[qjs(get, rename = "previousElementSibling")]
+    fn previous_element_sibling<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
+        element_sibling_value(&ctx, self.handle.0, false)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-nondocumenttypechildnode-nextelementsibling
+    #[qjs(get, rename = "nextElementSibling")]
+    fn next_element_sibling<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
+        element_sibling_value(&ctx, self.handle.0, true)
+    }
+
+    // ── Element identity and attributes ─────────────────────────────────
+
+    // https://dom.spec.whatwg.org/#dom-element-tagname
+    #[qjs(get, rename = "tagName")]
+    fn tag_name(&self, ctx: Ctx<'_>) -> Result<String> {
+        with_node_kind(&ctx, self.handle.0, |kind| match kind {
+            Some(NodeKind::Element { name, .. }) => element_node_name(name),
+            _ => String::new(),
+        })
+    }
+
+    // https://dom.spec.whatwg.org/#dom-element-localname
+    #[qjs(get, rename = "localName")]
+    fn local_name(&self, ctx: Ctx<'_>) -> Result<String> {
+        with_node_kind(&ctx, self.handle.0, |kind| match kind {
+            Some(NodeKind::Element { name, .. }) => name.local.to_string(),
+            _ => String::new(),
+        })
+    }
+
+    // https://dom.spec.whatwg.org/#dom-element-prefix
+    #[qjs(get)]
+    fn prefix<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
+        let prefix = with_node_kind(&ctx, self.handle.0, |kind| match kind {
+            Some(NodeKind::Element { name, .. }) => name
+                .prefix
+                .as_ref()
+                .filter(|prefix| !prefix.is_empty())
+                .map(ToString::to_string),
+            _ => None,
+        })?;
+        match prefix {
+            Some(prefix) => string_value(&ctx, &prefix),
+            None => Ok(Value::new_null(ctx)),
+        }
+    }
+
+    // https://dom.spec.whatwg.org/#dom-element-namespaceuri
+    #[qjs(get, rename = "namespaceURI")]
+    fn namespace_uri<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
+        let namespace = with_node_kind(&ctx, self.handle.0, |kind| match kind {
+            Some(NodeKind::Element { name, .. }) => {
+                (!name.ns.is_empty()).then(|| name.ns.to_string())
+            }
+            _ => None,
+        })?;
+        match namespace {
+            Some(namespace) => string_value(&ctx, &namespace),
+            None => Ok(Value::new_null(ctx)),
+        }
+    }
+
+    // https://dom.spec.whatwg.org/#dom-element-classname
+    #[qjs(get, rename = "className")]
+    fn class_name(&self, ctx: Ctx<'_>) -> Result<String> {
+        let world = world(&ctx)?;
+        Ok(world
+            .borrow()
+            .parsed
+            .as_ref()
+            .and_then(|parsed| parsed.dom.attribute(self.handle.0, "class"))
+            .unwrap_or_default())
+    }
+
+    #[qjs(set, rename = "className")]
+    fn set_class_name(&self, ctx: Ctx<'_>, value: WebIdlString) -> Result<()> {
+        let world = world(&ctx)?;
+        let mut world = world.borrow_mut();
+        let Some(parsed) = world.parsed.as_mut() else {
+            return Err(Exception::throw_type(&ctx, "no document"));
+        };
+        parsed
+            .dom
+            .set_attribute(self.handle.0, "class", value.0)
+            .map_err(|err| throw_dom_error(&ctx, err))
+    }
+
+    // https://dom.spec.whatwg.org/#dom-element-classlist
+    #[qjs(get, rename = "classList")]
+    fn class_list<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
+        let world_rc = world(&ctx)?;
+        if let Some(saved) = world_rc.borrow().token_list(self.handle.0)
+            && let Some(value) = deref_weak(&ctx, saved)?
+        {
+            return Ok(value);
+        }
+        let class = Class::instance(
+            ctx.clone(),
+            JsTokenList {
+                element: self.handle,
+            },
+        )?;
+        let raw = Class::into_value(class);
+        // Indexed access (`classList[0]`) goes through the shared proxy.
+        let proxy: Function = ctx.globals().get("__tb_liveCollection")?;
+        let value: Value = proxy.call((raw,))?;
+        let weak = make_weak(&ctx, value.clone())?;
+        world_rc
+            .borrow_mut()
+            .intern_token_list(self.handle.0, Persistent::save(&ctx, weak));
+        Ok(value)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-element-hasattribute
+    #[qjs(rename = "hasAttribute")]
+    fn has_attribute(&self, ctx: Ctx<'_>, name: WebIdlString) -> Result<bool> {
+        if !valid_attribute_local_name(&name.0) {
+            return Ok(false);
+        }
+        let world = world(&ctx)?;
+        let parsed = world.borrow();
+        let Some(parsed) = parsed.parsed.as_ref() else {
+            return Ok(false);
+        };
+        Ok(parsed.dom.has_attribute(self.handle.0, &name.0))
+    }
+
+    // https://dom.spec.whatwg.org/#dom-element-getattributens
+    #[qjs(rename = "getAttributeNS")]
+    fn get_attribute_ns<'js>(
+        &self,
+        ctx: Ctx<'js>,
+        namespace: OptString,
+        local: WebIdlString,
+    ) -> Result<Value<'js>> {
+        let namespace = namespace.0.unwrap_or_default();
+        let world = world(&ctx)?;
+        let found = world
+            .borrow()
+            .parsed
+            .as_ref()
+            .and_then(|parsed| parsed.dom.attribute_ns(self.handle.0, &namespace, &local.0));
+        match found {
+            Some(value) => string_value(&ctx, &value),
+            None => Ok(Value::new_null(ctx)),
+        }
+    }
+
+    // https://dom.spec.whatwg.org/#dom-element-hasattributens
+    #[qjs(rename = "hasAttributeNS")]
+    fn has_attribute_ns(
+        &self,
+        ctx: Ctx<'_>,
+        namespace: OptString,
+        local: WebIdlString,
+    ) -> Result<bool> {
+        let namespace = namespace.0.unwrap_or_default();
+        let world = world(&ctx)?;
+        let parsed = world.borrow();
+        let Some(parsed) = parsed.parsed.as_ref() else {
+            return Ok(false);
+        };
+        Ok(parsed
+            .dom
+            .attribute_ns(self.handle.0, &namespace, &local.0)
+            .is_some())
+    }
+
+    // https://dom.spec.whatwg.org/#dom-element-setattributens
+    #[qjs(rename = "setAttributeNS")]
+    fn set_attribute_ns(
+        &self,
+        ctx: Ctx<'_>,
+        namespace: OptString,
+        qualified: WebIdlString,
+        value: WebIdlString,
+    ) -> Result<()> {
+        // setAttributeNS never lowercases its name, even on HTML elements
+        // (<https://dom.spec.whatwg.org/#dom-element-setattributens>).
+        let name = validate_and_extract(
+            &ctx,
+            namespace.0.as_deref(),
+            &qualified.0,
+            NodeContext::Attribute,
+        )?;
+        let world = world(&ctx)?;
+        let mut world = world.borrow_mut();
+        let Some(parsed) = world.parsed.as_mut() else {
+            return Err(Exception::throw_type(&ctx, "no document"));
+        };
+        parsed
+            .dom
+            .set_attribute_named(self.handle.0, name, value.0)
+            .map_err(|err| throw_dom_error(&ctx, err))
+    }
+
+    // https://dom.spec.whatwg.org/#dom-element-removeattribute
+    #[qjs(rename = "removeAttribute")]
+    fn remove_attribute(&self, ctx: Ctx<'_>, name: WebIdlString) -> Result<()> {
+        if !valid_attribute_local_name(&name.0) {
+            return Ok(());
+        }
+        let world = world(&ctx)?;
+        let mut world = world.borrow_mut();
+        let Some(parsed) = world.parsed.as_mut() else {
+            return Ok(());
+        };
+        parsed
+            .dom
+            .remove_attribute(self.handle.0, &name.0)
+            .map_err(|err| throw_dom_error(&ctx, err))
+    }
+
+    // https://dom.spec.whatwg.org/#dom-element-removeattributens
+    #[qjs(rename = "removeAttributeNS")]
+    fn remove_attribute_ns(
+        &self,
+        ctx: Ctx<'_>,
+        namespace: OptString,
+        local: WebIdlString,
+    ) -> Result<()> {
+        let namespace = namespace.0.unwrap_or_default();
+        let world = world(&ctx)?;
+        let mut world = world.borrow_mut();
+        let Some(parsed) = world.parsed.as_mut() else {
+            return Ok(());
+        };
+        parsed
+            .dom
+            .remove_attribute_ns(self.handle.0, &namespace, &local.0)
+            .map_err(|err| throw_dom_error(&ctx, err))
+    }
+
+    // https://dom.spec.whatwg.org/#dom-element-getattributenames
+    #[qjs(rename = "getAttributeNames")]
+    fn get_attribute_names(&self, ctx: Ctx<'_>) -> Result<Vec<String>> {
+        let world = world(&ctx)?;
+        Ok(world
+            .borrow()
+            .parsed
+            .as_ref()
+            .map(|parsed| parsed.dom.attribute_names(self.handle.0))
+            .unwrap_or_default())
+    }
+
+    // https://dom.spec.whatwg.org/#dom-element-toggleattribute
+    #[qjs(rename = "toggleAttribute")]
+    fn toggle_attribute(&self, ctx: Ctx<'_>, name: WebIdlString, force: Opt<bool>) -> Result<bool> {
+        if !valid_attribute_local_name(&name.0) {
+            return Err(throw_dom(
+                &ctx,
+                "InvalidCharacterError",
+                "attribute name does not match the XML Name production",
+            ));
+        }
+        let world = world(&ctx)?;
+        let mut world = world.borrow_mut();
+        let Some(parsed) = world.parsed.as_mut() else {
+            return Err(Exception::throw_type(&ctx, "no document"));
+        };
+        let exists = parsed.dom.has_attribute(self.handle.0, &name.0);
+        let should_exist = force.0.unwrap_or(!exists);
+        if should_exist && !exists {
+            parsed
+                .dom
+                .set_attribute(self.handle.0, &name.0, String::new())
+                .map_err(|err| throw_dom_error(&ctx, err))?;
+        } else if !should_exist && exists {
+            parsed
+                .dom
+                .remove_attribute(self.handle.0, &name.0)
+                .map_err(|err| throw_dom_error(&ctx, err))?;
+        }
+        Ok(should_exist)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-node-normalize
+    #[qjs(rename = "normalize")]
+    fn normalize(&self, ctx: Ctx<'_>) -> Result<()> {
+        let world = world(&ctx)?;
+        let mut world = world.borrow_mut();
+        let Some(parsed) = world.parsed.as_mut() else {
+            return Ok(());
+        };
+        let dom = &mut parsed.dom;
+        // A Text node normalizes only itself; containers merge adjacent
+        // Text children and drop empty ones.
+        if let Some(NodeKind::Text { data }) = dom.get(self.handle.0).map(|node| node.kind()) {
+            if data.is_empty() {
+                dom.detach(self.handle.0)
+                    .map_err(|err| throw_dom_error(&ctx, err))?;
+            }
+            return Ok(());
+        }
+        let mut containers: Vec<NodeId> = vec![self.handle.0];
+        let mut stack = vec![self.handle.0];
+        while let Some(id) = stack.pop() {
+            if let Some(kids) = dom.children(id) {
+                for &kid in kids {
+                    if matches!(
+                        dom.get(kid).map(|node| node.kind()),
+                        Some(NodeKind::Element { .. })
+                    ) {
+                        containers.push(kid);
+                        stack.push(kid);
+                    }
+                }
+            }
+        }
+        for container in containers {
+            loop {
+                let kids: Vec<NodeId> = dom
+                    .children(container)
+                    .map(|kids| kids.copied().collect())
+                    .unwrap_or_default();
+                let run_start = kids.windows(2).position(|window| {
+                    matches!(
+                        (
+                            dom.get(window[0]).map(|node| node.kind()),
+                            dom.get(window[1]).map(|node| node.kind()),
+                        ),
+                        (Some(NodeKind::Text { .. }), Some(NodeKind::Text { .. }))
+                    )
+                });
+                match run_start {
+                    Some(start) => {
+                        let mut run = vec![kids[start]];
+                        for &id in &kids[start + 1..] {
+                            if matches!(
+                                dom.get(id).map(|node| node.kind()),
+                                Some(NodeKind::Text { .. })
+                            ) {
+                                run.push(id);
+                            } else {
+                                break;
+                            }
+                        }
+                        let mut data = String::new();
+                        for &id in &run {
+                            if let Some(NodeKind::Text { data: part }) =
+                                dom.get(id).map(|node| node.kind())
+                            {
+                                data.push_str(part);
+                            }
+                        }
+                        let first = run[0];
+                        dom.set_text(first, data)
+                            .map_err(|err| throw_dom_error(&ctx, err))?;
+                        for &id in &run[1..] {
+                            dom.detach(id).map_err(|err| throw_dom_error(&ctx, err))?;
+                        }
+                    }
+                    None => break,
+                }
+            }
+            let kids: Vec<NodeId> = dom
+                .children(container)
+                .map(|kids| kids.copied().collect())
+                .unwrap_or_default();
+            for kid in kids {
+                if matches!(
+                    dom.get(kid).map(|node| node.kind()),
+                    Some(NodeKind::Text { data }) if data.is_empty()
+                ) {
+                    dom.detach(kid).map_err(|err| throw_dom_error(&ctx, err))?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    // https://dom.spec.whatwg.org/#dom-node-comparedocumentposition
+    #[qjs(rename = "compareDocumentPosition")]
+    fn compare_document_position<'js>(&self, ctx: Ctx<'js>, other: Value<'js>) -> Result<u16> {
+        const DISCONNECTED: u16 = 1;
+        const PRECEDING: u16 = 2;
+        const FOLLOWING: u16 = 4;
+        const CONTAINS: u16 = 8;
+        const CONTAINED_BY: u16 = 16;
+        const IMPLEMENTATION_SPECIFIC: u16 = 32;
+        let Some(other) = host_node_id(&ctx, &other) else {
+            return Err(Exception::throw_type(&ctx, "argument is not a Node"));
+        };
+        let a = self.handle.0;
+        if a == other {
+            return Ok(0);
+        }
+        let world = world(&ctx)?;
+        let parsed = world.borrow();
+        let Some(parsed) = parsed.parsed.as_ref() else {
+            return Ok(DISCONNECTED | IMPLEMENTATION_SPECIFIC);
+        };
+        let dom = &parsed.dom;
+        if root_of(dom, a) != root_of(dom, other) {
+            return Ok(DISCONNECTED | IMPLEMENTATION_SPECIFIC);
+        }
+        let ancestors_a = ancestor_chain(dom, a);
+        let ancestors_b = ancestor_chain(dom, other);
+        if ancestors_a.contains(&other) {
+            return Ok(CONTAINED_BY | FOLLOWING);
+        }
+        if ancestors_b.contains(&a) {
+            return Ok(CONTAINS | PRECEDING);
+        }
+        Ok(if tree_order(dom, a, other) == std::cmp::Ordering::Less {
+            PRECEDING
+        } else {
+            FOLLOWING
+        })
+    }
+
     // https://dom.spec.whatwg.org/#dom-node-issamenode
     #[qjs(rename = "isSameNode")]
     fn is_same_node<'js>(&self, ctx: Ctx<'js>, other: Value<'js>) -> bool {
@@ -896,7 +1979,7 @@ impl JsNode {
 
     // https://dom.spec.whatwg.org/#dom-node-clonenode
     #[qjs(rename = "cloneNode")]
-    fn clone_node<'js>(&self, ctx: Ctx<'js>, deep: Option<bool>) -> Result<Value<'js>> {
+    fn clone_node<'js>(&self, ctx: Ctx<'js>, deep: Opt<bool>) -> Result<Value<'js>> {
         let world = world(&ctx)?;
         let mut world = world.borrow_mut();
         let Some(parsed) = world.parsed.as_mut() else {
@@ -911,7 +1994,7 @@ impl JsNode {
         }
         let clone = parsed
             .dom
-            .clone_node(self.handle.0, deep.unwrap_or(false))
+            .clone_node(self.handle.0, deep.0.unwrap_or(false))
             .map_err(|err| throw_dom_error(&ctx, err))?;
         drop(world);
         wrap_node(&ctx, clone)
@@ -1170,6 +2253,49 @@ fn webidl_to_string<'js>(ctx: &Ctx<'js>, value: Value<'js>) -> Result<String> {
     text.to_string()
 }
 
+/// The renderer only parses HTML documents today.
+fn is_html_document(ctx: &Ctx<'_>) -> bool {
+    world(ctx).is_ok_and(|world| world.borrow().parsed.is_some())
+}
+
+/// [Converting nodes into a node](https://dom.spec.whatwg.org/#convert-nodes-into-a-node):
+/// strings become `Text`, one node stays itself, several become a fragment.
+fn convert_nodes_into_node<'js>(ctx: &Ctx<'js>, nodes: Rest<Value<'js>>) -> Result<NodeId> {
+    let world = world(ctx)?;
+    let mut world = world.borrow_mut();
+    let Some(parsed) = world.parsed.as_mut() else {
+        return Err(Exception::throw_type(ctx, "no document"));
+    };
+    let dom = &mut parsed.dom;
+    let mut ids: Vec<NodeId> = Vec::with_capacity(nodes.0.len());
+    for value in nodes.0 {
+        if let Some(id) = host_node_id(ctx, &value) {
+            ids.push(id);
+        } else {
+            let text = webidl_to_string(ctx, value)?;
+            ids.push(dom.create_text(text));
+        }
+    }
+    if ids.len() == 1 {
+        return Ok(ids[0]);
+    }
+    let fragment = dom.create_fragment();
+    for id in ids {
+        dom.append(fragment, id)
+            .map_err(|err| throw_dom_error(ctx, err))?;
+    }
+    Ok(fragment)
+}
+
+/// A selector syntax error is a `SyntaxError` `DOMException`
+/// (<https://dom.spec.whatwg.org/#scope-match-a-selectors-string>).
+fn select_error(ctx: &Ctx<'_>, err: &dom::SelectError) -> rquickjs::Error {
+    match err {
+        dom::SelectError::Syntax(_) => throw_dom(ctx, "SyntaxError", &err.to_string()),
+        _ => Exception::throw_internal(ctx, &err.to_string()),
+    }
+}
+
 /// Integer conversion from a `double`
 /// (<https://webidl.spec.whatwg.org/#abstract-opdef-converttoint>): NaN and
 /// infinities become 0, then the truncated value wraps modulo 2^32.
@@ -1195,6 +2321,7 @@ pub(super) fn install(ctx: &Ctx<'_>, world: &Rc<RefCell<World>>) -> Result<()> {
     Class::<JsCollection>::define(&globals)?;
     Class::<JsDomException>::define(&globals)?;
     Class::<JsImplementation>::define(&globals)?;
+    Class::<JsTokenList>::define(&globals)?;
     install_brands(ctx)?;
     install_collection_brand(ctx)?;
     install_dom_exception_codes(ctx)?;
@@ -1276,7 +2403,7 @@ fn wrap_node<'js>(ctx: &Ctx<'js>, id: NodeId) -> Result<Value<'js>> {
 fn instantiate_node<'js>(ctx: &Ctx<'js>, id: NodeId) -> Result<Value<'js>> {
     let brand = with_node_kind(ctx, id, |kind| match kind {
         Some(NodeKind::Document) => Some("Document"),
-        Some(NodeKind::Element { .. }) => Some("Element"),
+        Some(NodeKind::Element { name, .. }) => Some(element_interface(name)),
         Some(NodeKind::Text { .. }) => Some("Text"),
         Some(NodeKind::Comment { .. }) => Some("Comment"),
         Some(NodeKind::Doctype { .. }) => Some("DocumentType"),
@@ -1291,6 +2418,156 @@ fn instantiate_node<'js>(ctx: &Ctx<'js>, id: NodeId) -> Result<Value<'js>> {
         class.set_prototype(Some(&proto))?;
     }
     Ok(Class::into_value(class))
+}
+
+/// The element interface for a qualified name
+/// (<https://html.spec.whatwg.org/multipage/dom.html#elements-in-the-dom:html-element>
+/// and its SVG counterparts). Names outside the HTML and SVG namespaces keep
+/// the base `Element` interface.
+fn element_interface(name: &QualName) -> &'static str {
+    if name.ns == html_namespace() {
+        html_element_interface(name.local.as_ref())
+    } else if name.ns == svg_namespace() {
+        "SVGElement"
+    } else {
+        "Element"
+    }
+}
+
+/// `local` name to element interface
+/// (<https://html.spec.whatwg.org/multipage/dom.html#elements-in-the-dom:html-element>).
+const ELEMENT_INTERFACES: &[(&str, &str)] = &[
+    ("a", "HTMLAnchorElement"),
+    ("abbr", "HTMLElement"),
+    ("acronym", "HTMLElement"),
+    ("address", "HTMLElement"),
+    ("area", "HTMLAreaElement"),
+    ("article", "HTMLElement"),
+    ("aside", "HTMLElement"),
+    ("audio", "HTMLAudioElement"),
+    ("b", "HTMLElement"),
+    ("base", "HTMLBaseElement"),
+    ("bdi", "HTMLElement"),
+    ("bdo", "HTMLElement"),
+    ("bgsound", "HTMLElement"),
+    ("big", "HTMLElement"),
+    ("blockquote", "HTMLElement"),
+    ("body", "HTMLBodyElement"),
+    ("br", "HTMLBRElement"),
+    ("button", "HTMLButtonElement"),
+    ("canvas", "HTMLCanvasElement"),
+    ("caption", "HTMLTableCaptionElement"),
+    ("center", "HTMLElement"),
+    ("cite", "HTMLElement"),
+    ("code", "HTMLElement"),
+    ("col", "HTMLTableColElement"),
+    ("colgroup", "HTMLTableColElement"),
+    ("data", "HTMLDataElement"),
+    ("datalist", "HTMLDataListElement"),
+    ("dd", "HTMLElement"),
+    ("del", "HTMLModElement"),
+    ("details", "HTMLElement"),
+    ("dfn", "HTMLElement"),
+    ("dialog", "HTMLDialogElement"),
+    ("dir", "HTMLDirectoryElement"),
+    ("div", "HTMLDivElement"),
+    ("dl", "HTMLDListElement"),
+    ("dt", "HTMLElement"),
+    ("embed", "HTMLEmbedElement"),
+    ("fieldset", "HTMLFieldSetElement"),
+    ("figcaption", "HTMLElement"),
+    ("figure", "HTMLElement"),
+    ("font", "HTMLFontElement"),
+    ("footer", "HTMLElement"),
+    ("form", "HTMLFormElement"),
+    ("frame", "HTMLFrameElement"),
+    ("frameset", "HTMLFrameSetElement"),
+    ("h1", "HTMLHeadingElement"),
+    ("h2", "HTMLHeadingElement"),
+    ("h3", "HTMLHeadingElement"),
+    ("h4", "HTMLHeadingElement"),
+    ("h5", "HTMLHeadingElement"),
+    ("h6", "HTMLHeadingElement"),
+    ("head", "HTMLHeadElement"),
+    ("header", "HTMLElement"),
+    ("hgroup", "HTMLElement"),
+    ("hr", "HTMLHRElement"),
+    ("html", "HTMLHtmlElement"),
+    ("i", "HTMLElement"),
+    ("iframe", "HTMLIFrameElement"),
+    ("img", "HTMLImageElement"),
+    ("input", "HTMLInputElement"),
+    ("ins", "HTMLModElement"),
+    ("isindex", "HTMLElement"),
+    ("kbd", "HTMLElement"),
+    ("label", "HTMLLabelElement"),
+    ("legend", "HTMLLegendElement"),
+    ("li", "HTMLLIElement"),
+    ("link", "HTMLLinkElement"),
+    ("main", "HTMLElement"),
+    ("map", "HTMLMapElement"),
+    ("mark", "HTMLElement"),
+    ("marquee", "HTMLElement"),
+    ("meta", "HTMLMetaElement"),
+    ("meter", "HTMLMeterElement"),
+    ("nav", "HTMLElement"),
+    ("nobr", "HTMLElement"),
+    ("noframes", "HTMLElement"),
+    ("noscript", "HTMLElement"),
+    ("object", "HTMLObjectElement"),
+    ("ol", "HTMLOListElement"),
+    ("optgroup", "HTMLOptGroupElement"),
+    ("option", "HTMLOptionElement"),
+    ("output", "HTMLOutputElement"),
+    ("p", "HTMLParagraphElement"),
+    ("param", "HTMLParamElement"),
+    ("pre", "HTMLPreElement"),
+    ("progress", "HTMLProgressElement"),
+    ("q", "HTMLQuoteElement"),
+    ("rp", "HTMLElement"),
+    ("rt", "HTMLElement"),
+    ("ruby", "HTMLElement"),
+    ("s", "HTMLElement"),
+    ("samp", "HTMLElement"),
+    ("script", "HTMLScriptElement"),
+    ("section", "HTMLElement"),
+    ("select", "HTMLSelectElement"),
+    ("small", "HTMLElement"),
+    ("source", "HTMLSourceElement"),
+    ("spacer", "HTMLElement"),
+    ("span", "HTMLSpanElement"),
+    ("strike", "HTMLElement"),
+    ("style", "HTMLStyleElement"),
+    ("sub", "HTMLElement"),
+    ("summary", "HTMLElement"),
+    ("sup", "HTMLElement"),
+    ("table", "HTMLTableElement"),
+    ("tbody", "HTMLTableSectionElement"),
+    ("td", "HTMLTableCellElement"),
+    ("template", "HTMLTemplateElement"),
+    ("textarea", "HTMLTextAreaElement"),
+    ("th", "HTMLTableCellElement"),
+    ("time", "HTMLTimeElement"),
+    ("title", "HTMLTitleElement"),
+    ("tr", "HTMLTableRowElement"),
+    ("track", "HTMLTrackElement"),
+    ("tt", "HTMLElement"),
+    ("u", "HTMLElement"),
+    ("ul", "HTMLUListElement"),
+    ("unknown", "HTMLUnknownElement"),
+    ("var", "HTMLElement"),
+    ("video", "HTMLVideoElement"),
+    ("wbr", "HTMLElement"),
+];
+
+fn html_element_interface(local: &str) -> &'static str {
+    if let Some((_, interface)) = ELEMENT_INTERFACES.iter().find(|(name, _)| *name == local) {
+        return interface;
+    }
+    if local.contains('-') {
+        return "HTMLElement";
+    }
+    "HTMLUnknownElement"
 }
 
 fn make_weak<'js>(ctx: &Ctx<'js>, target: Value<'js>) -> Result<Value<'js>> {
@@ -1315,11 +2592,9 @@ fn deref_weak<'js>(
     }
 }
 
-fn install_brands(ctx: &Ctx<'_>) -> Result<()> {
-    // https://webidl.spec.whatwg.org/#interface-prototype-object
-    // https://dom.spec.whatwg.org/#interface-node
-    ctx.eval::<(), _>(
-        r"
+/// Prototype-brand installation script for the browser-realm platform
+/// objects; one `define` per `WebIDL` interface.
+const INSTALL_BRANDS_JS: &str = r"
 (function() {
   const native = globalThis.Node.prototype;
   function illegal() { throw new TypeError('Illegal constructor'); }
@@ -1328,7 +2603,10 @@ fn install_brands(ctx: &Ctx<'_>) -> Result<()> {
     const proto = Object.create(parent ? parent.prototype : Object.prototype);
     for (const member of members) {
       const descriptor = Object.getOwnPropertyDescriptor(native, member);
-      if (descriptor) Object.defineProperty(proto, member, descriptor);
+      if (descriptor) {
+        descriptor.configurable = true;
+        Object.defineProperty(proto, member, descriptor);
+      }
     }
     Object.defineProperty(proto, 'constructor', { value: ctor, writable: true, configurable: true });
     Object.defineProperty(ctor, 'prototype', { value: proto, writable: false });
@@ -1344,45 +2622,174 @@ fn install_brands(ctx: &Ctx<'_>) -> Result<()> {
     'ownerDocument', 'hasChildNodes', 'nodeValue', 'textContent', 'isSameNode',
     'isEqualNode', 'contains', 'getRootNode', 'isConnected', 'cloneNode',
     'insertBefore', 'removeChild', 'replaceChild', 'lookupNamespaceURI',
-    'lookupPrefix', 'isDefaultNamespace'
+    'lookupPrefix', 'isDefaultNamespace', 'normalize',
+    'compareDocumentPosition'
   ]);
+  for (const [name, value] of [
+    ['DOCUMENT_POSITION_DISCONNECTED', 1],
+    ['DOCUMENT_POSITION_PRECEDING', 2],
+    ['DOCUMENT_POSITION_FOLLOWING', 4],
+    ['DOCUMENT_POSITION_CONTAINS', 8],
+    ['DOCUMENT_POSITION_CONTAINED_BY', 16],
+    ['DOCUMENT_POSITION_IMPLEMENTATION_SPECIFIC', 32],
+  ]) {
+    Object.defineProperty(NodeInterface, name, { value, writable: false, configurable: true });
+    Object.defineProperty(NodeInterface.prototype, name, { value, writable: false, configurable: true });
+  }
   const DocumentInterface = define('Document', NodeInterface, [
     'createElement', 'createElementNS', 'createTextNode', 'createComment',
     'createDocumentFragment', 'write', 'getElementById', 'getElementsByTagName',
-    'body', 'documentElement', 'doctype', 'readyState', 'implementation'
+    'getElementsByTagNameNS', 'getElementsByClassName',
+    'body', 'documentElement', 'doctype', 'readyState', 'implementation',
+    'children', 'firstElementChild', 'lastElementChild', 'childElementCount',
+    'append', 'prepend', 'replaceChildren', 'querySelector', 'querySelectorAll',
+    'URL', 'documentURI', 'characterSet', 'charset', 'inputEncoding',
+    'contentType', 'compatMode', 'title', 'getElementsByName'
   ]);
   const ElementInterface = define('Element', NodeInterface, [
-    'getElementsByTagName', 'getAttribute', 'setAttribute', 'id', 'src',
-    'name', 'content', 'remove'
+    'getElementsByTagName', 'getElementsByTagNameNS', 'getElementsByClassName',
+    'getAttribute',
+    'setAttribute', 'hasAttribute', 'getAttributeNS', 'setAttributeNS',
+    'hasAttributeNS', 'removeAttribute', 'removeAttributeNS',
+    'getAttributeNames', 'toggleAttribute', 'matches', 'closest', 'children',
+    'firstElementChild', 'lastElementChild', 'childElementCount', 'append',
+    'prepend', 'replaceChildren', 'querySelector', 'querySelectorAll',
+    'before', 'after', 'replaceWith', 'previousElementSibling',
+    'nextElementSibling', 'tagName', 'localName', 'prefix', 'namespaceURI',
+    'className', 'classList', 'id', 'src', 'name', 'content', 'remove'
   ]);
+  // classList is `[PutForwards=value]`: assigning to it sets `.value`
+  // (<https://dom.spec.whatwg.org/#dom-element-classlist>).
+  {
+    const descriptor = Object.getOwnPropertyDescriptor(ElementInterface.prototype, 'classList');
+    Object.defineProperty(ElementInterface.prototype, 'classList', {
+      get: descriptor.get,
+      set: function(value) { this.classList.value = value; },
+      enumerable: true,
+      configurable: true,
+    });
+  }
   const CharacterDataInterface = define('CharacterData', NodeInterface, [
     'data', 'length', 'substringData', 'appendData', 'insertData', 'deleteData',
-    'replaceData', 'remove'
+    'replaceData', 'remove', 'before', 'after', 'replaceWith',
+    'previousElementSibling', 'nextElementSibling'
   ]);
-  define('Text', CharacterDataInterface, []);
-  define('Comment', CharacterDataInterface, []);
-  define('DocumentType', NodeInterface, ['remove']);
-  define('DocumentFragment', NodeInterface, []);
-  void DocumentInterface;
-  void ElementInterface;
+  const TextInterface = define('Text', CharacterDataInterface, []);
+  const CommentInterface = define('Comment', CharacterDataInterface, []);
+  const DocumentTypeInterface = define('DocumentType', NodeInterface, [
+    'remove', 'before', 'after', 'replaceWith'
+  ]);
+  const DocumentFragmentInterface = define('DocumentFragment', NodeInterface, [
+    'children', 'firstElementChild', 'lastElementChild', 'childElementCount',
+    'append', 'prepend', 'replaceChildren', 'querySelector', 'querySelectorAll',
+    'getElementById'
+  ]);
+  const HTMLElementInterface = define('HTMLElement', ElementInterface, []);
+  const HTMLUnknownElementInterface = define('HTMLUnknownElement', HTMLElementInterface, []);
+  const HTMLMediaElementInterface = define('HTMLMediaElement', HTMLElementInterface, []);
+  const SVGElementInterface = define('SVGElement', ElementInterface, []);
+  const table = {
+    Document: DocumentInterface.prototype,
+    Element: ElementInterface.prototype,
+    CharacterData: CharacterDataInterface.prototype,
+    Text: TextInterface.prototype,
+    Comment: CommentInterface.prototype,
+    DocumentType: DocumentTypeInterface.prototype,
+    DocumentFragment: DocumentFragmentInterface.prototype,
+    HTMLElement: HTMLElementInterface.prototype,
+    HTMLUnknownElement: HTMLUnknownElementInterface.prototype,
+    HTMLMediaElement: HTMLMediaElementInterface.prototype,
+    SVGElement: SVGElementInterface.prototype,
+  };
+  // Every element interface chains to HTMLElement except the media pair,
+  // which chains through HTMLMediaElement, and SVG, which chains to Element.
+  for (const [name, parent] of [
+    ['HTMLAnchorElement', HTMLElementInterface],
+    ['HTMLAreaElement', HTMLElementInterface],
+    ['HTMLAudioElement', HTMLMediaElementInterface],
+    ['HTMLBaseElement', HTMLElementInterface],
+    ['HTMLBodyElement', HTMLElementInterface],
+    ['HTMLBRElement', HTMLElementInterface],
+    ['HTMLButtonElement', HTMLElementInterface],
+    ['HTMLCanvasElement', HTMLElementInterface],
+    ['HTMLDataElement', HTMLElementInterface],
+    ['HTMLDataListElement', HTMLElementInterface],
+    ['HTMLDialogElement', HTMLElementInterface],
+    ['HTMLDirectoryElement', HTMLElementInterface],
+    ['HTMLDivElement', HTMLElementInterface],
+    ['HTMLDListElement', HTMLElementInterface],
+    ['HTMLEmbedElement', HTMLElementInterface],
+    ['HTMLFieldSetElement', HTMLElementInterface],
+    ['HTMLFontElement', HTMLElementInterface],
+    ['HTMLFormElement', HTMLElementInterface],
+    ['HTMLFrameElement', HTMLElementInterface],
+    ['HTMLFrameSetElement', HTMLElementInterface],
+    ['HTMLHeadingElement', HTMLElementInterface],
+    ['HTMLHeadElement', HTMLElementInterface],
+    ['HTMLHRElement', HTMLElementInterface],
+    ['HTMLHtmlElement', HTMLElementInterface],
+    ['HTMLIFrameElement', HTMLElementInterface],
+    ['HTMLImageElement', HTMLElementInterface],
+    ['HTMLInputElement', HTMLElementInterface],
+    ['HTMLLabelElement', HTMLElementInterface],
+    ['HTMLLIElement', HTMLElementInterface],
+    ['HTMLLegendElement', HTMLElementInterface],
+    ['HTMLLinkElement', HTMLElementInterface],
+    ['HTMLMapElement', HTMLElementInterface],
+    ['HTMLMetaElement', HTMLElementInterface],
+    ['HTMLMeterElement', HTMLElementInterface],
+    ['HTMLModElement', HTMLElementInterface],
+    ['HTMLObjectElement', HTMLElementInterface],
+    ['HTMLOListElement', HTMLElementInterface],
+    ['HTMLOptGroupElement', HTMLElementInterface],
+    ['HTMLOptionElement', HTMLElementInterface],
+    ['HTMLOutputElement', HTMLElementInterface],
+    ['HTMLParagraphElement', HTMLElementInterface],
+    ['HTMLParamElement', HTMLElementInterface],
+    ['HTMLPreElement', HTMLElementInterface],
+    ['HTMLProgressElement', HTMLElementInterface],
+    ['HTMLQuoteElement', HTMLElementInterface],
+    ['HTMLScriptElement', HTMLElementInterface],
+    ['HTMLSelectElement', HTMLElementInterface],
+    ['HTMLSourceElement', HTMLElementInterface],
+    ['HTMLSpanElement', HTMLElementInterface],
+    ['HTMLStyleElement', HTMLElementInterface],
+    ['HTMLTableCaptionElement', HTMLElementInterface],
+    ['HTMLTableCellElement', HTMLElementInterface],
+    ['HTMLTableColElement', HTMLElementInterface],
+    ['HTMLTableElement', HTMLElementInterface],
+    ['HTMLTableRowElement', HTMLElementInterface],
+    ['HTMLTableSectionElement', HTMLElementInterface],
+    ['HTMLTemplateElement', HTMLElementInterface],
+    ['HTMLTextAreaElement', HTMLElementInterface],
+    ['HTMLTimeElement', HTMLElementInterface],
+    ['HTMLTitleElement', HTMLElementInterface],
+    ['HTMLTrackElement', HTMLElementInterface],
+    ['HTMLUListElement', HTMLElementInterface],
+    ['HTMLVideoElement', HTMLMediaElementInterface],
+  ]) {
+    table[name] = define(name, parent, []).prototype;
+  }
+  Object.defineProperty(globalThis, '__tb_brandTable', {
+    enumerable: false,
+    configurable: true,
+    value: table,
+  });
 })();
-",
-    )?;
-    for name in [
-        "Document",
-        "Element",
-        "CharacterData",
-        "Text",
-        "Comment",
-        "DocumentType",
-        "DocumentFragment",
-    ] {
-        let ctor: Function = ctx.globals().get(name)?;
-        let proto: Object = ctor.get("prototype")?;
+";
+
+fn install_brands(ctx: &Ctx<'_>) -> Result<()> {
+    ctx.eval::<(), _>(INSTALL_BRANDS_JS)?;
+    let table: Object = ctx.globals().get("__tb_brandTable")?;
+    let entries = table
+        .props::<String, Object>()
+        .collect::<Result<Vec<(String, Object)>>>()?;
+    for (name, proto) in entries {
         world(ctx)?
             .borrow_mut()
             .intern_brand(name, Persistent::save(ctx, proto));
     }
+    ctx.eval::<(), _>("delete globalThis.__tb_brandTable")?;
     Ok(())
 }
 
@@ -1408,10 +2815,17 @@ fn install_collection_brand(ctx: &Ctx<'_>) -> Result<()> {
       return new Proxy(target, {
         get: function(inner, property) {
           if (typeof property === 'string' && /^(0|[1-9][0-9]*)$/.test(property)) {
-            return inner.item(Number(property));
+            const index = Number(property);
+            return index < inner.length ? inner.item(index) : undefined;
           }
           const value = Reflect.get(inner, property, inner);
           return typeof value === 'function' ? value.bind(inner) : value;
+        },
+        set: function(inner, property, value) {
+          if (typeof property === 'string' && /^(0|[1-9][0-9]*)$/.test(property)) {
+            return true;
+          }
+          return Reflect.set(inner, property, value, inner);
         }
       });
     }
@@ -1569,6 +2983,27 @@ fn sibling_value<'js>(ctx: &Ctx<'js>, id: NodeId, forward: bool) -> Result<Value
     child_value(ctx, sibling)
 }
 
+/// The nearest element sibling in the given direction
+/// (<https://dom.spec.whatwg.org/#dom-nondocumenttypechildnode-nextelementsibling>).
+fn element_sibling_value<'js>(ctx: &Ctx<'js>, id: NodeId, forward: bool) -> Result<Value<'js>> {
+    let world = world(ctx)?;
+    let found = {
+        let parsed = world.borrow();
+        let Some(parsed) = parsed.parsed.as_ref() else {
+            return Ok(Value::new_null(ctx.clone()));
+        };
+        let mut cursor = parsed.dom.sibling(id, forward);
+        while let Some(sibling) = cursor {
+            if is_element(&parsed.dom, sibling) {
+                break;
+            }
+            cursor = parsed.dom.sibling(sibling, forward);
+        }
+        cursor
+    };
+    child_value(ctx, found)
+}
+
 fn string_value<'js>(ctx: &Ctx<'js>, text: &str) -> Result<Value<'js>> {
     Ok(rquickjs::String::from_str(ctx.clone(), text)?.into_value())
 }
@@ -1710,6 +3145,15 @@ fn locate_prefix(dom: &dom::Dom, cursor: NodeId, namespace: &str) -> Option<Stri
 }
 
 fn create_html_element<'js>(ctx: &Ctx<'js>, tag: &str) -> Result<Value<'js>> {
+    // https://dom.spec.whatwg.org/#dom-document-createelement: validate, then
+    // lowercase for an HTML document.
+    if !valid_element_local_name(tag) {
+        return Err(throw_dom(
+            ctx,
+            "InvalidCharacterError",
+            "tag name is not a valid element local name",
+        ));
+    }
     let name = QualName::new(
         None,
         html_namespace(),
@@ -1736,50 +3180,132 @@ fn create_kind<'js>(
     wrap_node(ctx, id)
 }
 
-fn valid_qualified_name(tag: &str) -> bool {
-    match tag.split_once(':') {
-        Some((prefix, local)) => valid_ncname(prefix) && valid_ncname(local),
-        None => valid_ncname(tag),
-    }
+/// Which context a qualified name is validated in
+/// (<https://dom.spec.whatwg.org/#validate-and-extract> steps 6 and 7).
+#[derive(Clone, Copy)]
+enum NodeContext {
+    Attribute,
+    Element,
 }
 
-// https://www.w3.org/TR/xml-names/#NT-NCName
-fn valid_ncname(name: &str) -> bool {
+/// [Validate and extract](https://dom.spec.whatwg.org/#validate-and-extract)
+/// a namespace and qualified name.
+fn validate_and_extract(
+    ctx: &Ctx<'_>,
+    namespace: Option<&str>,
+    qualified: &str,
+    context: NodeContext,
+) -> Result<QualName> {
+    let namespace = namespace.filter(|namespace| !namespace.is_empty());
+    let (prefix, local) = match qualified.split_once(':') {
+        Some((prefix, local)) => {
+            if !valid_namespace_prefix(prefix) {
+                return Err(throw_dom(
+                    ctx,
+                    "InvalidCharacterError",
+                    "invalid namespace prefix",
+                ));
+            }
+            (Some(prefix), local)
+        }
+        None => (None, qualified),
+    };
+    let local_valid = match context {
+        NodeContext::Attribute => valid_attribute_local_name(local),
+        NodeContext::Element => valid_element_local_name(local),
+    };
+    if !local_valid {
+        return Err(throw_dom(
+            ctx,
+            "InvalidCharacterError",
+            "invalid local name",
+        ));
+    }
+    let xml = "http://www.w3.org/XML/1998/namespace";
+    let xmlns = "http://www.w3.org/2000/xmlns/";
+    if prefix.is_some() && namespace.is_none() {
+        return Err(throw_dom(ctx, "NamespaceError", "prefix without namespace"));
+    }
+    if prefix == Some("xml") && namespace != Some(xml) {
+        return Err(throw_dom(
+            ctx,
+            "NamespaceError",
+            "xml prefix with wrong namespace",
+        ));
+    }
+    if (qualified == "xmlns" || prefix == Some("xmlns")) && namespace != Some(xmlns) {
+        return Err(throw_dom(
+            ctx,
+            "NamespaceError",
+            "xmlns name with wrong namespace",
+        ));
+    }
+    if namespace == Some(xmlns) && qualified != "xmlns" && prefix != Some("xmlns") {
+        return Err(throw_dom(
+            ctx,
+            "NamespaceError",
+            "xmlns namespace without xmlns name",
+        ));
+    }
+    Ok(QualName::new(
+        prefix.map(Prefix::from),
+        Namespace::from(namespace.unwrap_or("")),
+        LocalName::from(local),
+    ))
+}
+
+/// [Valid namespace prefix](https://dom.spec.whatwg.org/#valid-namespace-prefix).
+fn valid_namespace_prefix(prefix: &str) -> bool {
+    !prefix.is_empty()
+        && !prefix
+            .chars()
+            .any(|c| is_infra_whitespace(c) || matches!(c, '\0' | '/' | '>'))
+}
+
+/// [Valid attribute local name](https://dom.spec.whatwg.org/#valid-attribute-local-name).
+fn valid_attribute_local_name(local: &str) -> bool {
+    !local.is_empty()
+        && !local
+            .chars()
+            .any(|c| is_infra_whitespace(c) || matches!(c, '\0' | '/' | '=' | '>'))
+}
+
+/// [Valid element local name](https://dom.spec.whatwg.org/#valid-element-local-name).
+fn valid_element_local_name(name: &str) -> bool {
     let mut chars = name.chars();
-    match chars.next() {
-        Some(first) if is_name_start(first) => chars.all(is_name_char),
-        _ => false,
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if first.is_ascii_alphabetic() {
+        return !name
+            .chars()
+            .any(|c| is_infra_whitespace(c) || matches!(c, '\0' | '/' | '>'));
     }
-}
-
-// https://www.w3.org/TR/xml/#NT-NameStartChar minus ":"
-fn is_name_start(c: char) -> bool {
-    matches!(c, 'A'..='Z' | '_' | 'a'..='z' | '\u{C0}'..='\u{D6}' | '\u{D8}'..='\u{F6}' | '\u{F8}'..='\u{2FF}' | '\u{370}'..='\u{37D}' | '\u{37F}'..='\u{1FFF}' | '\u{200C}'..='\u{200D}' | '\u{2070}'..='\u{218F}' | '\u{2C00}'..='\u{2FEF}' | '\u{3001}'..='\u{D7FF}' | '\u{F900}'..='\u{FDCF}' | '\u{FDF0}'..='\u{FFFD}')
-        || ('\u{10000}'..='\u{EFFFF}').contains(&c)
-}
-
-// https://www.w3.org/TR/xml/#NT-NameChar minus ":"
-fn is_name_char(c: char) -> bool {
-    is_name_start(c)
-        || matches!(c, '-' | '.' | '0'..='9' | '\u{B7}' | '\u{0300}'..='\u{036F}' | '\u{203F}'..='\u{2040}')
-}
-
-fn split_qualified_name(tag: &str) -> (Option<&str>, &str) {
-    match tag.split_once(':') {
-        Some((prefix, local)) if !prefix.is_empty() && !local.is_empty() => (Some(prefix), local),
-        _ => (None, tag),
+    if first != ':' && first != '_' && u32::from(first) < 0x80 {
+        return false;
     }
+    name.chars().all(|c| {
+        c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | ':' | '_') || u32::from(c) >= 0x80
+    })
+}
+
+fn is_infra_whitespace(c: char) -> bool {
+    matches!(c, '\t' | '\n' | '\u{c}' | '\r' | ' ')
 }
 
 fn element_node_name(name: &QualName) -> String {
-    let qualified = match &name.prefix {
-        Some(prefix) if !prefix.is_empty() => format!("{prefix}:{}", name.local),
-        _ => name.local.to_string(),
-    };
+    let qualified = qualified_name(name);
     if name.ns == html_namespace() {
         qualified.to_ascii_uppercase()
     } else {
         qualified
+    }
+}
+
+fn qualified_name(name: &QualName) -> String {
+    match &name.prefix {
+        Some(prefix) if !prefix.is_empty() => format!("{prefix}:{}", name.local),
+        _ => name.local.to_string(),
     }
 }
 
@@ -1826,7 +3352,23 @@ fn collection_ids(ctx: &Ctx<'_>, scope: NodeId, kind: &CollectionKind) -> Result
             .children(scope)
             .map(|children| children.copied().collect())
             .unwrap_or_default(),
+        CollectionKind::ElementChildren => parsed
+            .dom
+            .children(scope)
+            .map(|children| {
+                children
+                    .copied()
+                    .filter(|&kid| is_element(&parsed.dom, kid))
+                    .collect()
+            })
+            .unwrap_or_default(),
         CollectionKind::ElementsByTag(name) => collect_by_tag(&parsed.dom, scope, name),
+        CollectionKind::ElementsByTagNs { namespace, local } => {
+            collect_by_tag_ns(&parsed.dom, scope, namespace, local)
+        }
+        CollectionKind::ElementsByClass(names) => collect_by_class(&parsed.dom, scope, names),
+        CollectionKind::ElementsByName(name) => collect_by_name(&parsed.dom, scope, name),
+        CollectionKind::Static(handles) => handles.iter().map(|handle| handle.0).collect(),
     })
 }
 
@@ -1839,7 +3381,7 @@ fn collect_by_tag(dom: &dom::Dom, scope: NodeId, name: &str) -> Vec<NodeId> {
     stack.reverse();
     while let Some(id) = stack.pop() {
         if let Some(NodeKind::Element { name: qual, .. }) = dom.get(id).map(|node| node.kind())
-            && (name == "*" || qual.local.as_ref().eq_ignore_ascii_case(name))
+            && (name == "*" || qualified_name(qual) == name)
         {
             out.push(id);
         }
@@ -1850,6 +3392,132 @@ fn collect_by_tag(dom: &dom::Dom, scope: NodeId, name: &str) -> Vec<NodeId> {
         }
     }
     out
+}
+
+fn collect_by_name(dom: &dom::Dom, scope: NodeId, name: &str) -> Vec<NodeId> {
+    let mut out = Vec::new();
+    let mut stack: Vec<NodeId> = dom
+        .children(scope)
+        .map(|kids| kids.copied().collect())
+        .unwrap_or_default();
+    stack.reverse();
+    while let Some(id) = stack.pop() {
+        if is_element(dom, id) && dom.attribute(id, "name").as_deref() == Some(name) {
+            out.push(id);
+        }
+        if let Some(kids) = dom.children(id) {
+            let mut kids: Vec<_> = kids.copied().collect();
+            kids.reverse();
+            stack.extend(kids);
+        }
+    }
+    out
+}
+
+fn collect_by_tag_ns(dom: &dom::Dom, scope: NodeId, namespace: &str, local: &str) -> Vec<NodeId> {
+    let mut out = Vec::new();
+    let mut stack: Vec<NodeId> = dom
+        .children(scope)
+        .map(|kids| kids.copied().collect())
+        .unwrap_or_default();
+    stack.reverse();
+    while let Some(id) = stack.pop() {
+        if let Some(NodeKind::Element { name, .. }) = dom.get(id).map(|node| node.kind())
+            && (namespace == "*" || name.ns.as_ref() == namespace)
+            && (local == "*" || name.local.as_ref() == local)
+        {
+            out.push(id);
+        }
+        if let Some(kids) = dom.children(id) {
+            let mut kids: Vec<_> = kids.copied().collect();
+            kids.reverse();
+            stack.extend(kids);
+        }
+    }
+    out
+}
+
+fn collect_by_class(dom: &dom::Dom, scope: NodeId, names: &str) -> Vec<NodeId> {
+    let wanted: Vec<&str> = names.split_ascii_whitespace().collect();
+    let mut out = Vec::new();
+    let mut stack: Vec<NodeId> = dom
+        .children(scope)
+        .map(|kids| kids.copied().collect())
+        .unwrap_or_default();
+    stack.reverse();
+    while let Some(id) = stack.pop() {
+        if let Some(NodeKind::Element { .. }) = dom.get(id).map(|node| node.kind()) {
+            let classes = dom.attribute(id, "class").unwrap_or_default();
+            let tokens: Vec<&str> = classes.split_ascii_whitespace().collect();
+            if wanted.iter().all(|want| tokens.contains(want)) {
+                out.push(id);
+            }
+        }
+        if let Some(kids) = dom.children(id) {
+            let mut kids: Vec<_> = kids.copied().collect();
+            kids.reverse();
+            stack.extend(kids);
+        }
+    }
+    out
+}
+
+fn is_element(dom: &dom::Dom, id: NodeId) -> bool {
+    matches!(
+        dom.get(id).map(|node| node.kind()),
+        Some(NodeKind::Element { .. })
+    )
+}
+
+/// The root of the tree `id` participates in (itself when detached).
+fn root_of(dom: &dom::Dom, id: NodeId) -> NodeId {
+    let mut root = id;
+    while let Some(parent) = dom.parent(root) {
+        root = parent;
+    }
+    root
+}
+
+/// `id` followed by its inclusive ancestors, nearest first.
+fn ancestor_chain(dom: &dom::Dom, id: NodeId) -> Vec<NodeId> {
+    let mut chain = vec![id];
+    let mut cursor = id;
+    while let Some(parent) = dom.parent(cursor) {
+        chain.push(parent);
+        cursor = parent;
+    }
+    chain
+}
+
+/// Document order of two nodes in one tree
+/// (<https://dom.spec.whatwg.org/#concept-tree-order>).
+fn tree_order(dom: &dom::Dom, a: NodeId, b: NodeId) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    let chain_a = ancestor_chain(dom, a);
+    let chain_b = ancestor_chain(dom, b);
+    let mut common = 0;
+    while common < chain_a.len()
+        && common < chain_b.len()
+        && chain_a[chain_a.len() - 1 - common] == chain_b[chain_b.len() - 1 - common]
+    {
+        common += 1;
+    }
+    let Some(parent) = chain_a
+        .len()
+        .checked_sub(common)
+        .and_then(|index| chain_a.get(index))
+    else {
+        return Ordering::Less;
+    };
+    let child_a = chain_a[chain_a.len() - 1 - common];
+    let child_b = chain_b[chain_b.len() - 1 - common];
+    let kids: Vec<NodeId> = dom
+        .children(*parent)
+        .map(|kids| kids.copied().collect())
+        .unwrap_or_default();
+    let position_a = kids.iter().position(|&kid| kid == child_a);
+    let position_b = kids.iter().position(|&kid| kid == child_b);
+    position_a.cmp(&position_b)
 }
 
 fn find_element_by_id(dom: &dom::Dom, scope: NodeId, id: &str) -> Option<NodeId> {
