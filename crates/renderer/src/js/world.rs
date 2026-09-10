@@ -38,6 +38,7 @@ pub(crate) struct World {
     wrappers: HashMap<NodeId, Persistent<Value<'static>>>,
     token_lists: HashMap<NodeId, Persistent<Value<'static>>>,
     named_node_maps: HashMap<NodeId, Persistent<Value<'static>>>,
+    implementations: HashMap<u32, Persistent<Value<'static>>>,
     brands: HashMap<String, Persistent<Object<'static>>>,
     /// `Attr` platform-object identity, keyed by a per-realm id.
     pub(crate) attrs: HashMap<u64, AttrState>,
@@ -67,6 +68,7 @@ impl World {
             wrappers: HashMap::new(),
             token_lists: HashMap::new(),
             named_node_maps: HashMap::new(),
+            implementations: HashMap::new(),
             brands: HashMap::new(),
             attrs: HashMap::new(),
             attr_owners: HashMap::new(),
@@ -84,6 +86,16 @@ impl World {
         self.wrappers.clear();
         self.token_lists.clear();
         self.named_node_maps.clear();
+        self.implementations.clear();
+    }
+
+    /// One `DOMImplementation` object per document, for identity.
+    pub(crate) fn implementation(&self, id: NodeId) -> Option<Persistent<Value<'static>>> {
+        self.implementations.get(&id.document_id()).cloned()
+    }
+
+    pub(crate) fn intern_implementation(&mut self, id: NodeId, value: Persistent<Value<'static>>) {
+        self.implementations.insert(id.document_id(), value);
     }
 
     /// The document tree that owns `id`.
@@ -122,6 +134,7 @@ impl World {
         self.wrappers.clear();
         self.token_lists.clear();
         self.named_node_maps.clear();
+        self.implementations.clear();
         self.brands.clear();
     }
 

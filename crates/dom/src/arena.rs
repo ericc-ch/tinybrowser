@@ -316,6 +316,31 @@ impl Dom {
         self.alloc(NodeKind::Comment { data: data.into() })
     }
 
+    /// Creates a CDATA section holding `data`.
+    ///
+    /// # Panics
+    ///
+    /// See [`Dom::create_element`]: unreachable except beyond `u32::MAX` nodes.
+    pub fn create_cdata_section(&mut self, data: impl Into<String>) -> NodeId {
+        self.alloc(NodeKind::CDataSection { data: data.into() })
+    }
+
+    /// Creates a processing instruction with `target` and `data`.
+    ///
+    /// # Panics
+    ///
+    /// See [`Dom::create_element`]: unreachable except beyond `u32::MAX` nodes.
+    pub fn create_processing_instruction(
+        &mut self,
+        target: impl Into<String>,
+        data: impl Into<String>,
+    ) -> NodeId {
+        self.alloc(NodeKind::ProcessingInstruction {
+            target: target.into(),
+            data: data.into(),
+        })
+    }
+
     /// Creates a doctype node.
     ///
     /// # Panics
@@ -559,6 +584,31 @@ impl Dom {
         if self.parent(child) != Some(parent) {
             return Err(DomError::NoParent);
         }
+        // Same insertability gate as pre-insert
+        // (<https://dom.spec.whatwg.org/#concept-node-ensure-pre-insert-validity>).
+        if !matches!(
+            self.get(node).map(|view| view.kind()),
+            Some(
+                NodeKind::Fragment
+                    | NodeKind::Doctype { .. }
+                    | NodeKind::Element { .. }
+                    | NodeKind::Text { .. }
+                    | NodeKind::Comment { .. }
+            )
+        ) {
+            return Err(DomError::HierarchyRequest);
+        }
+        if !matches!(
+            self.get(parent).map(|view| view.kind()),
+            Some(NodeKind::Document)
+        ) && !self.is_fragment(node)
+            && matches!(
+                self.get(node).map(|view| view.kind()),
+                Some(NodeKind::Doctype { .. })
+            )
+        {
+            return Err(DomError::HierarchyRequest);
+        }
         if matches!(
             self.get(parent).map(|view| view.kind()),
             Some(NodeKind::Document)
@@ -586,6 +636,41 @@ impl Dom {
             self.splice_fragment(parent, node, reference);
         } else {
             self.place_node(parent, node, reference);
+        }
+        Ok(())
+    }
+
+    /// Pre-insert validation steps 1–3 only: parent type, ancestor cycle,
+    /// and reference membership
+    /// (<https://dom.spec.whatwg.org/#concept-node-ensure-pre-insert-validity>).
+    ///
+    /// The bindings run this before copying a cross-document node so the
+    /// observable error order matches the spec.
+    ///
+    /// # Errors
+    ///
+    /// - [`DomError::HierarchyRequest`] when `parent` cannot contain children.
+    /// - [`DomError::CycleForbidden`] if `node` is an ancestor of `parent`.
+    /// - [`DomError::NoParent`] if `reference` is not a child of `parent`.
+    pub fn validate_pre_insert(
+        &self,
+        parent: NodeId,
+        node: NodeId,
+        reference: Option<NodeId>,
+    ) -> Result<(), DomError> {
+        if !matches!(
+            self.get(parent).map(|view| view.kind()),
+            Some(NodeKind::Document | NodeKind::Element { .. } | NodeKind::Fragment)
+        ) {
+            return Err(DomError::HierarchyRequest);
+        }
+        if self.would_cycle(node, parent) {
+            return Err(DomError::CycleForbidden);
+        }
+        if let Some(reference) = reference
+            && self.parent(reference) != Some(parent)
+        {
+            return Err(DomError::NoParent);
         }
         Ok(())
     }
@@ -667,6 +752,21 @@ impl Dom {
         if !matches!(
             self.get(parent).map(|view| view.kind()),
             Some(NodeKind::Document | NodeKind::Element { .. } | NodeKind::Fragment)
+        ) {
+            return Err(DomError::HierarchyRequest);
+        }
+        // Only DocumentFragment, DocumentType, Element, and CharacterData
+        // nodes are insertable; a Document node is refused here
+        // (<https://dom.spec.whatwg.org/#concept-node-ensure-pre-insert-validity> step 4).
+        if !matches!(
+            self.get(node).map(|view| view.kind()),
+            Some(
+                NodeKind::Fragment
+                    | NodeKind::Doctype { .. }
+                    | NodeKind::Element { .. }
+                    | NodeKind::Text { .. }
+                    | NodeKind::Comment { .. }
+            )
         ) {
             return Err(DomError::HierarchyRequest);
         }
@@ -1186,6 +1286,48 @@ impl Dom {
             id,
             |kind| match kind {
                 NodeKind::Comment { data } => Some(data),
+                _ => None,
+            },
+            data.into(),
+        )
+    }
+
+    /// Replaces the data of the CDATA section `id`.
+    ///
+    /// # Errors
+    ///
+    /// - [`DomError::StaleNode`] if `id` is stale.
+    /// - [`DomError::WrongNodeType`] if `id` is not a CDATA section.
+    pub fn set_cdata_section(
+        &mut self,
+        id: NodeId,
+        data: impl Into<String>,
+    ) -> Result<(), DomError> {
+        self.set_data(
+            id,
+            |kind| match kind {
+                NodeKind::CDataSection { data } => Some(data),
+                _ => None,
+            },
+            data.into(),
+        )
+    }
+
+    /// Replaces the data of the processing instruction `id`.
+    ///
+    /// # Errors
+    ///
+    /// - [`DomError::StaleNode`] if `id` is stale.
+    /// - [`DomError::WrongNodeType`] if `id` is not a processing instruction.
+    pub fn set_processing_instruction(
+        &mut self,
+        id: NodeId,
+        data: impl Into<String>,
+    ) -> Result<(), DomError> {
+        self.set_data(
+            id,
+            |kind| match kind {
+                NodeKind::ProcessingInstruction { data, .. } => Some(data),
                 _ => None,
             },
             data.into(),

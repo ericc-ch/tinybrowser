@@ -65,6 +65,10 @@ pub enum NodeKind {
     Fragment,
     /// Character data; adjacent runs are *not* merged by dom itself.
     Text { data: String },
+    /// CDATA character data (`<![CDATA[...]]>` in XML).
+    CDataSection { data: String },
+    /// An XML processing instruction.
+    ProcessingInstruction { target: String, data: String },
     /// An HTML comment.
     Comment { data: String },
 }
