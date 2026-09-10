@@ -1389,8 +1389,11 @@ impl JsMutationRecord {
     }
 
     #[qjs(get, rename = "attributeNamespace")]
-    fn attribute_namespace<'js>(&self, ctx: Ctx<'js>) -> Value<'js> {
-        Value::new_null(ctx)
+    fn attribute_namespace<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
+        match &self.record.attribute_namespace {
+            Some(namespace) => string_value(&ctx, namespace),
+            None => Ok(Value::new_null(ctx)),
+        }
     }
 
     #[qjs(get, rename = "oldValue")]
@@ -1442,20 +1445,56 @@ impl JsMutationObserver {
     #[qjs(rename = "observe")]
     fn observe<'js>(&self, ctx: Ctx<'js>, target: Value<'js>, options: Object<'js>) -> Result<()> {
         let target = required_node(&ctx, &target)?;
-        let mut parsed = ObserverOptions {
-            child_list: option_truthy(&ctx, &options, "childList")?,
-            attributes: option_truthy(&ctx, &options, "attributes")?,
-            character_data: option_truthy(&ctx, &options, "characterData")?,
-            subtree: option_truthy(&ctx, &options, "subtree")?,
-            attribute_old_value: option_truthy(&ctx, &options, "attributeOldValue")?,
-            character_data_old_value: option_truthy(&ctx, &options, "characterDataOldValue")?,
+        let attributes_present = options.contains_key("attributes")?;
+        let attributes = option_truthy(&ctx, &options, "attributes")?;
+        let attribute_old_value_present = options.contains_key("attributeOldValue")?;
+        let attribute_old_value = option_truthy(&ctx, &options, "attributeOldValue")?;
+        let character_data_present = options.contains_key("characterData")?;
+        let character_data = option_truthy(&ctx, &options, "characterData")?;
+        let character_data_old_value_present = options.contains_key("characterDataOldValue")?;
+        let character_data_old_value = option_truthy(&ctx, &options, "characterDataOldValue")?;
+        let attribute_filter = match options.get::<_, Value>("attributeFilter") {
+            Ok(value) if !value.is_undefined() && !value.is_null() => {
+                let array = value.into_array().ok_or_else(|| {
+                    Exception::throw_type(&ctx, "attributeFilter must be a sequence")
+                })?;
+                let mut filter = Vec::new();
+                for entry in array.iter::<Value>() {
+                    filter.push(webidl_to_string(&ctx, entry?)?);
+                }
+                Some(filter)
+            }
+            _ => None,
         };
-        if parsed.attribute_old_value {
-            parsed.attributes = true;
+        // Present-but-false option flags conflict with their companions
+        // (<https://dom.spec.whatwg.org/#dom-mutationobserver-observe>).
+        if attributes_present
+            && !attributes
+            && (attribute_old_value_present || attribute_filter.is_some())
+        {
+            return Err(Exception::throw_type(
+                &ctx,
+                "attributes is false but attributeOldValue/attributeFilter is present",
+            ));
         }
-        if parsed.character_data_old_value {
-            parsed.character_data = true;
+        if character_data_present && !character_data && character_data_old_value_present {
+            return Err(Exception::throw_type(
+                &ctx,
+                "characterData is false but characterDataOldValue is present",
+            ));
         }
+        let parsed = ObserverOptions {
+            child_list: option_truthy(&ctx, &options, "childList")?,
+            attributes: attributes
+                || (!attributes_present
+                    && (attribute_old_value_present || attribute_filter.is_some())),
+            character_data: character_data
+                || (!character_data_present && character_data_old_value_present),
+            subtree: option_truthy(&ctx, &options, "subtree")?,
+            attribute_old_value,
+            character_data_old_value,
+            attribute_filter,
+        };
         if !(parsed.child_list || parsed.attributes || parsed.character_data) {
             return Err(Exception::throw_type(
                 &ctx,
@@ -1513,6 +1552,81 @@ fn option_truthy<'js>(ctx: &Ctx<'js>, options: &Object<'js>, key: &str) -> Resul
     }
     let to_boolean: Function = ctx.globals().get("Boolean")?;
     to_boolean.call((value,))
+}
+
+/// Backs the constructible platform interfaces (`new Text(…)`); the current
+/// realm's main document owns the new node
+/// (<https://dom.spec.whatwg.org/#dom-text-text>).
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "rquickjs Func ABI passes Ctx and Rest by value"
+)]
+fn construct_node<'js>(
+    ctx: Ctx<'js>,
+    name: WebIdlString,
+    args: Rest<Value<'js>>,
+) -> Result<Value<'js>> {
+    let first = args.0.into_iter().next();
+    match name.0.as_str() {
+        "Text" => {
+            let data = constructor_string(&ctx, first)?;
+            let document = main_document(&ctx)?;
+            create_kind(&ctx, document, |dom| dom.create_text(data))
+        }
+        "Comment" => {
+            let data = constructor_string(&ctx, first)?;
+            let document = main_document(&ctx)?;
+            create_kind(&ctx, document, |dom| dom.create_comment(data))
+        }
+        "DocumentFragment" => {
+            let document = main_document(&ctx)?;
+            create_kind(&ctx, document, dom::Dom::create_fragment)
+        }
+        "Document" => {
+            let parsed = crate::Parsed {
+                dom: dom::Dom::new(),
+                quirks_mode: markup5ever::interface::QuirksMode::NoQuirks,
+                parse_errors: 0,
+                content_type: "text/html",
+            };
+            let root = world(&ctx)?.borrow_mut().add_document(parsed);
+            wrap_node(&ctx, root)
+        }
+        "XMLDocument" => {
+            let parsed = crate::Parsed {
+                dom: dom::Dom::new(),
+                quirks_mode: markup5ever::interface::QuirksMode::NoQuirks,
+                parse_errors: 0,
+                content_type: "application/xml",
+            };
+            let root = world(&ctx)?.borrow_mut().add_document(parsed);
+            wrap_node(&ctx, root)
+        }
+        other => Err(Exception::throw_type(
+            &ctx,
+            &format!("{other} is not a constructor"),
+        )),
+    }
+}
+
+/// Constructor `DOMString` with the IDL default: missing and `undefined` are
+/// the empty string, `null` is "null" (<https://webidl.spec.whatwg.org/#es-DOMString>).
+fn constructor_string<'js>(ctx: &Ctx<'js>, value: Option<Value<'js>>) -> Result<String> {
+    match value {
+        None => Ok(String::new()),
+        Some(value) if value.is_undefined() => Ok(String::new()),
+        Some(value) => webidl_to_string(ctx, value),
+    }
+}
+
+/// The document of the current realm's global object.
+fn main_document(ctx: &Ctx<'_>) -> Result<NodeId> {
+    world(ctx)?
+        .borrow()
+        .parsed
+        .as_ref()
+        .map(|parsed| parsed.dom.document())
+        .ok_or_else(|| Exception::throw_type(ctx, "no document"))
 }
 
 /// Delivers queued records to observer callbacks; installed as a global and
@@ -2097,8 +2211,8 @@ impl JsNode {
     }
 
     #[qjs(rename = "createElement")]
-    fn create_element<'js>(&self, ctx: Ctx<'js>, tag: String) -> Result<Value<'js>> {
-        create_html_element(&ctx, self.handle.0, &tag)
+    fn create_element<'js>(&self, ctx: Ctx<'js>, tag: WebIdlString) -> Result<Value<'js>> {
+        create_html_element(&ctx, self.handle.0, &tag.0)
     }
 
     // https://dom.spec.whatwg.org/#dom-document-createelementns
@@ -2108,21 +2222,21 @@ impl JsNode {
         &self,
         ctx: Ctx<'js>,
         ns: OptString,
-        tag: String,
+        tag: WebIdlString,
     ) -> Result<Value<'js>> {
-        let name = validate_and_extract(&ctx, ns.0.as_deref(), &tag, NodeContext::Element)?;
+        let name = validate_and_extract(&ctx, ns.0.as_deref(), &tag.0, NodeContext::Element)?;
         create_element_named(&ctx, self.handle.0, name)
     }
 
     #[qjs(rename = "createTextNode")]
-    fn create_text_node<'js>(&self, ctx: Ctx<'js>, data: String) -> Result<Value<'js>> {
-        create_kind(&ctx, self.handle.0, |dom| dom.create_text(data))
+    fn create_text_node<'js>(&self, ctx: Ctx<'js>, data: WebIdlString) -> Result<Value<'js>> {
+        create_kind(&ctx, self.handle.0, |dom| dom.create_text(data.0))
     }
 
     // https://dom.spec.whatwg.org/#dom-document-createcomment
     #[qjs(rename = "createComment")]
-    fn create_comment<'js>(&self, ctx: Ctx<'js>, data: String) -> Result<Value<'js>> {
-        create_kind(&ctx, self.handle.0, |dom| dom.create_comment(data))
+    fn create_comment<'js>(&self, ctx: Ctx<'js>, data: WebIdlString) -> Result<Value<'js>> {
+        create_kind(&ctx, self.handle.0, |dom| dom.create_comment(data.0))
     }
 
     // https://dom.spec.whatwg.org/#dom-document-createprocessinginstruction
@@ -2249,24 +2363,24 @@ impl JsNode {
 
     // https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#document-write-steps
     #[qjs(rename = "write")]
-    fn write(&self, ctx: Ctx<'_>, html: String) -> Result<()> {
+    fn write(&self, ctx: Ctx<'_>, html: WebIdlString) -> Result<()> {
         let world = world(&ctx)?;
         let mut world = world.borrow_mut();
         if world.parser_active {
-            world.pending_html_writes.push(html);
+            world.pending_html_writes.push(html.0);
         }
         Ok(())
     }
 
     #[qjs(rename = "getElementById")]
-    fn get_element_by_id<'js>(&self, ctx: Ctx<'js>, id: String) -> Result<Value<'js>> {
+    fn get_element_by_id<'js>(&self, ctx: Ctx<'js>, id: WebIdlString) -> Result<Value<'js>> {
         let world = world(&ctx)?;
         let found = {
             let parsed = world.borrow();
             let Some(parsed) = parsed.document(self.handle.0) else {
                 return Ok(Value::new_null(ctx));
             };
-            find_element_by_id(&parsed.dom, self.handle.0, &id)
+            find_element_by_id(&parsed.dom, self.handle.0, &id.0)
         };
         match found {
             Some(node) => wrap_node(&ctx, node),
@@ -2298,8 +2412,12 @@ impl JsNode {
     }
 
     #[qjs(rename = "getElementsByTagName")]
-    fn get_elements_by_tag_name<'js>(&self, ctx: Ctx<'js>, name: String) -> Result<Value<'js>> {
-        elements_by_tag(&ctx, self.handle.0, &name)
+    fn get_elements_by_tag_name<'js>(
+        &self,
+        ctx: Ctx<'js>,
+        name: WebIdlString,
+    ) -> Result<Value<'js>> {
+        elements_by_tag(&ctx, self.handle.0, &name.0)
     }
 
     #[qjs(get)]
@@ -2450,15 +2568,15 @@ impl JsNode {
     }
 
     #[qjs(rename = "getAttribute")]
-    fn get_attribute<'js>(&self, ctx: Ctx<'js>, name: String) -> Result<Value<'js>> {
-        if !valid_attribute_local_name(&name) {
+    fn get_attribute<'js>(&self, ctx: Ctx<'js>, name: WebIdlString) -> Result<Value<'js>> {
+        if !valid_attribute_local_name(&name.0) {
             return Ok(Value::new_null(ctx));
         }
         let world = world(&ctx)?;
         let found = world
             .borrow()
             .document(self.handle.0)
-            .and_then(|parsed| parsed.dom.attribute(self.handle.0, &name));
+            .and_then(|parsed| parsed.dom.attribute(self.handle.0, &name.0));
         match found {
             Some(value) => string_value(&ctx, &value),
             None => Ok(Value::new_null(ctx)),
@@ -2466,8 +2584,8 @@ impl JsNode {
     }
 
     #[qjs(rename = "setAttribute")]
-    fn set_attribute(&self, ctx: Ctx<'_>, name: String, value: WebIdlString) -> Result<()> {
-        if !valid_attribute_local_name(&name) {
+    fn set_attribute(&self, ctx: Ctx<'_>, name: WebIdlString, value: WebIdlString) -> Result<()> {
+        if !valid_attribute_local_name(&name.0) {
             return Err(throw_dom(
                 &ctx,
                 "InvalidCharacterError",
@@ -2475,9 +2593,9 @@ impl JsNode {
             ));
         }
         let local = if element_is_html(&ctx, self.handle.0) {
-            name.to_ascii_lowercase()
+            name.0.to_ascii_lowercase()
         } else {
-            name
+            name.0
         };
         {
             let world = world(&ctx)?;
@@ -2505,8 +2623,8 @@ impl JsNode {
     }
 
     #[qjs(set, rename = "id")]
-    fn set_id(&self, ctx: Ctx<'_>, value: String) -> Result<()> {
-        self.set_attribute(ctx, "id".into(), WebIdlString(value))
+    fn set_id(&self, ctx: Ctx<'_>, value: WebIdlString) -> Result<()> {
+        self.set_attribute(ctx, WebIdlString("id".into()), value)
     }
 
     #[qjs(get)]
@@ -2521,7 +2639,7 @@ impl JsNode {
 
     #[qjs(set, rename = "src")]
     fn set_src(&self, ctx: Ctx<'_>, value: WebIdlString) -> Result<()> {
-        self.set_attribute(ctx, "src".into(), value)
+        self.set_attribute(ctx, WebIdlString("src".into()), value)
     }
 
     #[qjs(get)]
@@ -2573,7 +2691,7 @@ impl JsNode {
 
     #[qjs(set, rename = "name")]
     fn set_name(&self, ctx: Ctx<'_>, value: WebIdlString) -> Result<()> {
-        self.set_attribute(ctx, "name".into(), value)
+        self.set_attribute(ctx, WebIdlString("name".into()), value)
     }
 
     #[qjs(get)]
@@ -2588,7 +2706,7 @@ impl JsNode {
 
     #[qjs(set, rename = "content")]
     fn set_content(&self, ctx: Ctx<'_>, value: WebIdlString) -> Result<()> {
-        self.set_attribute(ctx, "content".into(), value)
+        self.set_attribute(ctx, WebIdlString("content".into()), value)
     }
 
     /// URL-reflected `href`: parsed against the document base and stored
@@ -2614,7 +2732,7 @@ impl JsNode {
         let resolved = url::Url::parse(&value.0)
             .or_else(|_| url::Url::parse(&base).and_then(|base| base.join(&value.0)))
             .map_or_else(|_| value.0, |url| url.to_string());
-        self.set_attribute(ctx, "href".into(), WebIdlString(resolved))
+        self.set_attribute(ctx, WebIdlString("href".into()), WebIdlString(resolved))
     }
 
     /// Reflected inline style content attribute. A real
@@ -2631,7 +2749,7 @@ impl JsNode {
 
     #[qjs(set, rename = "style")]
     fn set_style(&self, ctx: Ctx<'_>, value: WebIdlString) -> Result<()> {
-        self.set_attribute(ctx, "style".into(), value)
+        self.set_attribute(ctx, WebIdlString("style".into()), value)
     }
 
     #[qjs(get)]
@@ -2730,7 +2848,12 @@ impl JsNode {
                 let text = descendant_text(&parsed.dom, self.handle.0);
                 string_value(&ctx, &text)
             }
-            Some(NodeKind::Text { data } | NodeKind::Comment { data }) => string_value(&ctx, data),
+            Some(
+                NodeKind::Text { data }
+                | NodeKind::CDataSection { data }
+                | NodeKind::ProcessingInstruction { data, .. }
+                | NodeKind::Comment { data },
+            ) => string_value(&ctx, data),
             _ => Ok(Value::new_null(ctx)),
         }
     }
@@ -2772,18 +2895,14 @@ impl JsNode {
             Some(NodeKind::Document | NodeKind::Doctype { .. }) => return Ok(()),
             _ => {}
         }
-        let kids: Vec<NodeId> = dom
-            .children(self.handle.0)
-            .map(|kids| kids.copied().collect())
-            .unwrap_or_default();
-        for kid in kids {
-            dom.destroy(kid).map_err(|err| throw_dom_error(&ctx, err))?;
-        }
+        let replacement = dom.create_fragment();
         if !text.is_empty() {
             let text_id = dom.create_text(text);
-            dom.append(self.handle.0, text_id)
+            dom.append(replacement, text_id)
                 .map_err(|err| throw_dom_error(&ctx, err))?;
         }
+        dom.replace_all(self.handle.0, replacement)
+            .map_err(|err| throw_dom_error(&ctx, err))?;
         drop(world);
         schedule_mutation_delivery(&ctx)
     }
@@ -3647,61 +3766,36 @@ impl JsNode {
             }
         }
         for container in containers {
-            loop {
-                let kids: Vec<NodeId> = dom
-                    .children(container)
-                    .map(|kids| kids.copied().collect())
-                    .unwrap_or_default();
-                let run_start = kids.windows(2).position(|window| {
-                    matches!(
-                        (
-                            dom.get(window[0]).map(|node| node.kind()),
-                            dom.get(window[1]).map(|node| node.kind()),
-                        ),
-                        (Some(NodeKind::Text { .. }), Some(NodeKind::Text { .. }))
-                    )
-                });
-                match run_start {
-                    Some(start) => {
-                        let mut run = vec![kids[start]];
-                        for &id in &kids[start + 1..] {
-                            if matches!(
-                                dom.get(id).map(|node| node.kind()),
-                                Some(NodeKind::Text { .. })
-                            ) {
-                                run.push(id);
-                            } else {
-                                break;
-                            }
-                        }
-                        let mut data = String::new();
-                        for &id in &run {
-                            if let Some(NodeKind::Text { data: part }) =
-                                dom.get(id).map(|node| node.kind())
-                            {
-                                data.push_str(part);
-                            }
-                        }
-                        let first = run[0];
-                        dom.set_text(first, data)
-                            .map_err(|err| throw_dom_error(&ctx, err))?;
-                        for &id in &run[1..] {
-                            dom.detach(id).map_err(|err| throw_dom_error(&ctx, err))?;
-                        }
-                    }
-                    None => break,
-                }
-            }
             let kids: Vec<NodeId> = dom
                 .children(container)
                 .map(|kids| kids.copied().collect())
                 .unwrap_or_default();
+            // In tree order: drop empty Text nodes, merge contiguous runs
+            // into the first non-empty one
+            // (<https://dom.spec.whatwg.org/#dom-node-normalize>).
+            let mut merged: Option<NodeId> = None;
             for kid in kids {
-                if matches!(
-                    dom.get(kid).map(|node| node.kind()),
-                    Some(NodeKind::Text { data }) if data.is_empty()
-                ) {
-                    dom.detach(kid).map_err(|err| throw_dom_error(&ctx, err))?;
+                match dom.get(kid).map(|node| node.kind()) {
+                    Some(NodeKind::Text { data }) if data.is_empty() => {
+                        dom.detach(kid).map_err(|err| throw_dom_error(&ctx, err))?;
+                    }
+                    Some(NodeKind::Text { data }) => {
+                        if let Some(previous) = merged {
+                            let joined = format!(
+                                "{}{data}",
+                                match dom.get(previous).map(|node| node.kind()) {
+                                    Some(NodeKind::Text { data }) => data.clone(),
+                                    _ => String::new(),
+                                }
+                            );
+                            dom.set_text(previous, joined)
+                                .map_err(|err| throw_dom_error(&ctx, err))?;
+                            dom.detach(kid).map_err(|err| throw_dom_error(&ctx, err))?;
+                        } else {
+                            merged = Some(kid);
+                        }
+                    }
+                    _ => merged = None,
                 }
             }
         }
@@ -3747,6 +3841,23 @@ impl JsNode {
         } else {
             FOLLOWING
         })
+    }
+
+    // https://dom.spec.whatwg.org/#dom-node-parentelement
+    #[qjs(get, rename = "parentElement")]
+    fn parent_element<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
+        let world_rc = world(&ctx)?;
+        let parent = {
+            let parsed = world_rc.borrow();
+            let Some(parsed) = parsed.document(self.handle.0) else {
+                return Ok(Value::new_null(ctx));
+            };
+            parsed
+                .dom
+                .parent(self.handle.0)
+                .filter(|&parent| is_element(&parsed.dom, parent))
+        };
+        child_value(&ctx, parent)
     }
 
     // https://dom.spec.whatwg.org/#dom-node-issamenode
@@ -4297,6 +4408,10 @@ pub(super) fn install(ctx: &Ctx<'_>, world: &Rc<RefCell<World>>) -> Result<()> {
         "__tb_deliver_mutations",
         rquickjs::prelude::Func::from(deliver_mutations),
     )?;
+    globals.set(
+        "__tb_construct",
+        rquickjs::prelude::Func::from(construct_node),
+    )?;
     install_brands(ctx)?;
     install_collection_brand(ctx)?;
     install_dom_exception_codes(ctx)?;
@@ -4579,8 +4694,15 @@ const INSTALL_BRANDS_JS: &str = r"
 (function() {
   const native = globalThis.Node.prototype;
   function illegal() { throw new TypeError('Illegal constructor'); }
-  function define(name, parent, members) {
-    const ctor = function() { return illegal(); };
+  function define(name, parent, members, constructible) {
+    const ctor = constructible
+      ? function() {
+          return globalThis.__tb_construct.apply(
+            globalThis,
+            [name].concat(Array.prototype.slice.call(arguments))
+          );
+        }
+      : function() { return illegal(); };
     const proto = Object.create(parent ? parent.prototype : Object.prototype);
     for (const member of members) {
       const descriptor = Object.getOwnPropertyDescriptor(native, member);
@@ -4604,7 +4726,7 @@ const INSTALL_BRANDS_JS: &str = r"
     'isEqualNode', 'contains', 'getRootNode', 'isConnected', 'cloneNode',
     'insertBefore', 'removeChild', 'replaceChild', 'lookupNamespaceURI',
     'lookupPrefix', 'isDefaultNamespace', 'normalize',
-    'compareDocumentPosition'
+    'compareDocumentPosition', 'parentElement'
   ]);
   for (const [name, value] of [
     ['ELEMENT_NODE', 1],
@@ -4641,7 +4763,7 @@ const INSTALL_BRANDS_JS: &str = r"
     'URL', 'documentURI', 'location', 'characterSet', 'charset',
     'inputEncoding', 'contentType', 'compatMode', 'title',
     'getElementsByName', 'importNode'
-  ]);
+  ], true);
   const ElementInterface = define('Element', NodeInterface, [
     'getElementsByTagName', 'getElementsByTagNameNS', 'getElementsByClassName',
     'getAttribute',
@@ -4675,12 +4797,12 @@ const INSTALL_BRANDS_JS: &str = r"
     'replaceData', 'remove', 'before', 'after', 'replaceWith',
     'previousElementSibling', 'nextElementSibling'
   ]);
-  const TextInterface = define('Text', CharacterDataInterface, []);
+  const TextInterface = define('Text', CharacterDataInterface, [], true);
   const CDATASectionInterface = define('CDATASection', TextInterface, []);
   const ProcessingInstructionInterface = define('ProcessingInstruction', CharacterDataInterface, [
     'target'
   ]);
-  const CommentInterface = define('Comment', CharacterDataInterface, []);
+  const CommentInterface = define('Comment', CharacterDataInterface, [], true);
   const DocumentTypeInterface = define('DocumentType', NodeInterface, [
     'remove', 'before', 'after', 'replaceWith', 'name', 'publicId', 'systemId'
   ]);
@@ -4688,7 +4810,7 @@ const INSTALL_BRANDS_JS: &str = r"
     'children', 'firstElementChild', 'lastElementChild', 'childElementCount',
     'append', 'prepend', 'replaceChildren', 'querySelector', 'querySelectorAll',
     'getElementById'
-  ]);
+  ], true);
   const HTMLElementInterface = define('HTMLElement', ElementInterface, []);
   const HTMLUnknownElementInterface = define('HTMLUnknownElement', HTMLElementInterface, []);
   const HTMLMediaElementInterface = define('HTMLMediaElement', HTMLElementInterface, []);

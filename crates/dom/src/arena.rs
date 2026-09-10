@@ -49,6 +49,7 @@ pub enum Mutation {
     Attributes {
         target: NodeId,
         name: String,
+        namespace: String,
         old_value: Option<String>,
     },
     /// Character data replaced on `target`.
@@ -158,6 +159,7 @@ pub struct Dom {
     /// plumbing; empty and unrecorded unless someone observes the document.
     mutations: Vec<Mutation>,
     record_mutations: bool,
+    recording_suppressed: bool,
     /// `Cell<()>` is `Send` + `!Sync`; `PhantomData` makes `Dom` inherit
     /// exactly that split. Deleting this field would silently re-derive
     /// `Sync`, which is the point: that deletion has to be a conscious act.
@@ -193,6 +195,7 @@ impl Dom {
             template_contents: HashMap::new(),
             mutations: Vec::new(),
             record_mutations: false,
+            recording_suppressed: false,
             _share_forbidden: PhantomData,
         }
     }
@@ -212,7 +215,7 @@ impl Dom {
     }
 
     fn record(&mut self, mutation: Mutation) {
-        if self.record_mutations {
+        if self.record_mutations && !self.recording_suppressed {
             self.mutations.push(mutation);
         }
     }
@@ -640,6 +643,8 @@ impl Dom {
                     | NodeKind::Doctype { .. }
                     | NodeKind::Element { .. }
                     | NodeKind::Text { .. }
+                    | NodeKind::CDataSection { .. }
+                    | NodeKind::ProcessingInstruction { .. }
                     | NodeKind::Comment { .. }
             )
         ) {
@@ -671,10 +676,13 @@ impl Dom {
             }
             self.ensure_document_content_model(&sequence)?;
         }
+        let previous = self.sibling(child, false);
         let mut reference = self.sibling(child, true);
         if reference == Some(node) {
             reference = self.sibling(node, true);
         }
+        let added = self.incoming_nodes(node);
+        self.recording_suppressed = true;
         self.unlink_from_current_parent(child);
         if let Some(detached) = self.node_mut(child) {
             detached.parent = None;
@@ -684,6 +692,14 @@ impl Dom {
         } else {
             self.place_node(parent, node, reference);
         }
+        self.recording_suppressed = false;
+        self.record(Mutation::ChildList {
+            target: parent,
+            added,
+            removed: vec![child],
+            previous,
+            next: reference,
+        });
         Ok(())
     }
 
@@ -812,6 +828,8 @@ impl Dom {
                     | NodeKind::Doctype { .. }
                     | NodeKind::Element { .. }
                     | NodeKind::Text { .. }
+                    | NodeKind::CDataSection { .. }
+                    | NodeKind::ProcessingInstruction { .. }
                     | NodeKind::Comment { .. }
             )
         ) {
@@ -1121,6 +1139,7 @@ impl Dom {
             self.record(Mutation::Attributes {
                 target: id,
                 name: local,
+                namespace: String::new(),
                 old_value: removed_value,
             });
         }
@@ -1158,6 +1177,7 @@ impl Dom {
             self.record(Mutation::Attributes {
                 target: id,
                 name: local.to_owned(),
+                namespace: ns.to_owned(),
                 old_value: removed_value,
             });
         }
@@ -1200,11 +1220,13 @@ impl Dom {
         {
             return Err(DomError::HierarchyRequest);
         }
-        let kids: Vec<NodeId> = self
+        let removed: Vec<NodeId> = self
             .children(parent)
             .map(|kids| kids.copied().collect())
             .unwrap_or_default();
-        for kid in kids {
+        let added = self.incoming_nodes(node);
+        self.recording_suppressed = true;
+        for &kid in &removed {
             self.unlink_from_current_parent(kid);
             if let Some(detached) = self.node_mut(kid) {
                 detached.parent = None;
@@ -1215,6 +1237,14 @@ impl Dom {
         } else {
             self.place_node(parent, node, None);
         }
+        self.recording_suppressed = false;
+        self.record(Mutation::ChildList {
+            target: parent,
+            added,
+            removed,
+            previous: None,
+            next: None,
+        });
         Ok(())
     }
 
@@ -1265,6 +1295,7 @@ impl Dom {
         self.record(Mutation::Attributes {
             target: id,
             name: local.to_owned(),
+            namespace: namespace.to_owned(),
             old_value,
         });
         Ok(())
@@ -1291,6 +1322,7 @@ impl Dom {
         };
         let value = value.into();
         let recorded_name = Self::qualified_name(&name);
+        let recorded_namespace = name.ns.to_string();
         let old_value = attributes
             .iter()
             .find(|attribute| attribute.name == name)
@@ -1306,6 +1338,7 @@ impl Dom {
         self.record(Mutation::Attributes {
             target: id,
             name: recorded_name,
+            namespace: recorded_namespace,
             old_value,
         });
         Ok(())
@@ -1354,6 +1387,7 @@ impl Dom {
         self.record(Mutation::Attributes {
             target: id,
             name: local,
+            namespace: String::new(),
             old_value,
         });
         Ok(())

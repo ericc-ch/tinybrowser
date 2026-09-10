@@ -26,7 +26,7 @@ impl<'js> Trace<'js> for Handle {
     clippy::struct_excessive_bools,
     reason = "each bool is a MutationObserverInit dictionary member"
 )]
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Default)]
 pub(crate) struct ObserverOptions {
     pub child_list: bool,
     pub attributes: bool,
@@ -34,9 +34,10 @@ pub(crate) struct ObserverOptions {
     pub subtree: bool,
     pub attribute_old_value: bool,
     pub character_data_old_value: bool,
+    pub attribute_filter: Option<Vec<String>>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub(crate) struct Observation {
     pub target: Handle,
     pub options: ObserverOptions,
@@ -52,6 +53,7 @@ pub(crate) struct RecordData {
     pub previous: Option<Handle>,
     pub next: Option<Handle>,
     pub attribute_name: Option<String>,
+    pub attribute_namespace: Option<String>,
     pub old_value: Option<String>,
 }
 
@@ -345,7 +347,15 @@ fn match_observation(
         }
         let enabled = match kind {
             0 => observation.options.child_list,
-            1 => observation.options.attributes,
+            1 => {
+                observation.options.attributes
+                    && match (&observation.options.attribute_filter, mutation) {
+                        (Some(filter), dom::Mutation::Attributes { name, .. }) => {
+                            filter.iter().any(|wanted| wanted == name)
+                        }
+                        _ => true,
+                    }
+            }
             _ => observation.options.character_data,
         };
         if !enabled {
@@ -372,11 +382,13 @@ fn record(observation: &Observation, mutation: &dom::Mutation) -> RecordData {
             previous: previous.map(Handle),
             next: next.map(Handle),
             attribute_name: None,
+            attribute_namespace: None,
             old_value: None,
         },
         dom::Mutation::Attributes {
             target,
             name,
+            namespace,
             old_value,
         } => RecordData {
             typ: "attributes".into(),
@@ -386,6 +398,7 @@ fn record(observation: &Observation, mutation: &dom::Mutation) -> RecordData {
             previous: None,
             next: None,
             attribute_name: Some(name.clone()),
+            attribute_namespace: (!namespace.is_empty()).then(|| namespace.clone()),
             old_value: observation
                 .options
                 .attribute_old_value
@@ -400,6 +413,7 @@ fn record(observation: &Observation, mutation: &dom::Mutation) -> RecordData {
             previous: None,
             next: None,
             attribute_name: None,
+            attribute_namespace: None,
             old_value: observation
                 .options
                 .character_data_old_value
