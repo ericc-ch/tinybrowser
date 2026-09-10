@@ -34,6 +34,27 @@ pub enum QuirksMode {
     Quirks,
 }
 
+/// One recorded tree mutation, for `MutationObserver` delivery.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Mutation {
+    /// Children added and/or removed on `target`, in one operation.
+    ChildList {
+        target: NodeId,
+        added: Vec<NodeId>,
+        removed: Vec<NodeId>,
+        previous: Option<NodeId>,
+        next: Option<NodeId>,
+    },
+    /// An attribute set, changed, or removed on `target`.
+    Attributes {
+        target: NodeId,
+        name: String,
+        old_value: Option<String>,
+    },
+    /// Character data replaced on `target`.
+    CharacterData { target: NodeId, old_value: String },
+}
+
 /// Why a mutation was refused.
 ///
 /// Stale handles and structural mistakes surface as values, never as panics,
@@ -133,6 +154,10 @@ pub struct Dom {
     /// the element's child list
     /// (<https://html.spec.whatwg.org/multipage/scripting.html#the-template-element>).
     template_contents: HashMap<NodeId, NodeId>,
+    /// Recorded mutations, drained by the renderer's `MutationObserver`
+    /// plumbing; empty and unrecorded unless someone observes the document.
+    mutations: Vec<Mutation>,
+    record_mutations: bool,
     /// `Cell<()>` is `Send` + `!Sync`; `PhantomData` makes `Dom` inherit
     /// exactly that split. Deleting this field would silently re-derive
     /// `Sync`, which is the point: that deletion has to be a conscious act.
@@ -166,7 +191,29 @@ impl Dom {
             quirks_mode: QuirksMode::NoQuirks,
             document_language: None,
             template_contents: HashMap::new(),
+            mutations: Vec::new(),
+            record_mutations: false,
             _share_forbidden: PhantomData,
+        }
+    }
+
+    /// Turns mutation recording on or off; recording costs nothing while no
+    /// `MutationObserver` is registered.
+    pub fn set_record_mutations(&mut self, recording: bool) {
+        self.record_mutations = recording;
+        if !recording {
+            self.mutations.clear();
+        }
+    }
+
+    /// Drains the recorded mutations in order.
+    pub fn take_mutations(&mut self) -> Vec<Mutation> {
+        std::mem::take(&mut self.mutations)
+    }
+
+    fn record(&mut self, mutation: Mutation) {
+        if self.record_mutations {
+            self.mutations.push(mutation);
         }
     }
 
@@ -1061,13 +1108,22 @@ impl Dom {
             local.to_owned()
         };
         let mut removed = false;
+        let mut removed_value = None;
         attributes.retain(|attribute| {
             if !removed && Self::qualified_name(&attribute.name) == local {
                 removed = true;
+                removed_value = Some(attribute.value.clone());
                 return false;
             }
             true
         });
+        if removed {
+            self.record(Mutation::Attributes {
+                target: id,
+                name: local,
+                old_value: removed_value,
+            });
+        }
         Ok(())
     }
 
@@ -1083,13 +1139,28 @@ impl Dom {
         ns: &str,
         local: &str,
     ) -> Result<(), DomError> {
-        let node = self.node_mut(id).ok_or(DomError::StaleNode)?;
-        let NodeKind::Element { attributes, .. } = &mut node.kind else {
-            return Err(DomError::WrongNodeType);
+        let removed_value = {
+            let node = self.node_mut(id).ok_or(DomError::StaleNode)?;
+            let NodeKind::Element { attributes, .. } = &mut node.kind else {
+                return Err(DomError::WrongNodeType);
+            };
+            let mut removed = None;
+            attributes.retain(|attribute| {
+                if attribute.name.ns.as_ref() == ns && attribute.name.local.as_ref() == local {
+                    removed = Some(attribute.value.clone());
+                    return false;
+                }
+                true
+            });
+            removed
         };
-        attributes.retain(|attribute| {
-            !(attribute.name.ns.as_ref() == ns && attribute.name.local.as_ref() == local)
-        });
+        if removed_value.is_some() {
+            self.record(Mutation::Attributes {
+                target: id,
+                name: local.to_owned(),
+                old_value: removed_value,
+            });
+        }
         Ok(())
     }
 
@@ -1171,19 +1242,30 @@ impl Dom {
             return Err(DomError::WrongNodeType);
         };
         let value = value.into();
+        let old_value = attributes
+            .iter()
+            .find(|attribute| {
+                attribute.name.ns.as_ref() == namespace && attribute.name.local.as_ref() == local
+            })
+            .map(|attribute| attribute.value.clone());
         if let Some(existing) = attributes.iter_mut().find(|attribute| {
             attribute.name.ns.as_ref() == namespace && attribute.name.local.as_ref() == local
         }) {
             existing.value = value;
-            return Ok(());
+        } else {
+            attributes.push(Attribute {
+                name: QualName::new(
+                    prefix.map(Prefix::from),
+                    Namespace::from(namespace),
+                    LocalName::from(local),
+                ),
+                value,
+            });
         }
-        attributes.push(Attribute {
-            name: QualName::new(
-                prefix.map(Prefix::from),
-                Namespace::from(namespace),
-                LocalName::from(local),
-            ),
-            value,
+        self.record(Mutation::Attributes {
+            target: id,
+            name: local.to_owned(),
+            old_value,
         });
         Ok(())
     }
@@ -1208,14 +1290,24 @@ impl Dom {
             return Err(DomError::WrongNodeType);
         };
         let value = value.into();
+        let recorded_name = Self::qualified_name(&name);
+        let old_value = attributes
+            .iter()
+            .find(|attribute| attribute.name == name)
+            .map(|attribute| attribute.value.clone());
         if let Some(existing) = attributes
             .iter_mut()
             .find(|attribute| attribute.name == name)
         {
             existing.value = value;
-            return Ok(());
+        } else {
+            attributes.push(Attribute { name, value });
         }
-        attributes.push(Attribute { name, value });
+        self.record(Mutation::Attributes {
+            target: id,
+            name: recorded_name,
+            old_value,
+        });
         Ok(())
     }
 
@@ -1244,16 +1336,25 @@ impl Dom {
             local.to_owned()
         };
         let value = value.into();
+        let old_value = attributes
+            .iter()
+            .find(|attribute| Self::qualified_name(&attribute.name) == local)
+            .map(|attribute| attribute.value.clone());
         if let Some(existing) = attributes
             .iter_mut()
             .find(|attribute| Self::qualified_name(&attribute.name) == local)
         {
             existing.value = value;
-            return Ok(());
+        } else {
+            attributes.push(Attribute {
+                name: QualName::new(None, Namespace::from(""), LocalName::from(local.as_str())),
+                value,
+            });
         }
-        attributes.push(Attribute {
-            name: QualName::new(None, Namespace::from(""), LocalName::from(local.as_str())),
-            value,
+        self.record(Mutation::Attributes {
+            target: id,
+            name: local,
+            old_value,
         });
         Ok(())
     }
@@ -1452,6 +1553,29 @@ impl Dom {
     /// the end when `before` is `None`).
     fn place_node(&mut self, parent: NodeId, node: NodeId, before: Option<NodeId>) {
         self.unlink_from_current_parent(node);
+        let (previous, next) = {
+            let list: Vec<NodeId> = self
+                .children(parent)
+                .expect("verified-live parent has no child list")
+                .copied()
+                .collect();
+            match before {
+                None => (list.last().copied(), None),
+                Some(sibling) => {
+                    let position = list
+                        .iter()
+                        .position(|&entry| entry == sibling)
+                        .expect("live sibling missing from its own parent's list");
+                    (
+                        position
+                            .checked_sub(1)
+                            .and_then(|index| list.get(index))
+                            .copied(),
+                        Some(sibling),
+                    )
+                }
+            }
+        };
         let list = self
             .children_mut(parent)
             .expect("verified-live parent has no child list");
@@ -1468,6 +1592,13 @@ impl Dom {
         if let Some(attached) = self.node_mut(node) {
             attached.parent = Some(parent);
         }
+        self.record(Mutation::ChildList {
+            target: parent,
+            added: vec![node],
+            removed: Vec::new(),
+            previous,
+            next,
+        });
     }
 
     /// Insert a fragment by moving its children under `parent`, leaving the
@@ -1482,12 +1613,37 @@ impl Dom {
             .children_mut(fragment)
             .map(std::mem::take)
             .expect("verified-live fragment has no child list");
+        if !moved.is_empty() {
+            self.record(Mutation::ChildList {
+                target: fragment,
+                added: Vec::new(),
+                removed: moved.clone(),
+                previous: None,
+                next: None,
+            });
+        }
         if moved.is_empty() {
             return;
         }
         let list = self
             .children_mut(parent)
             .expect("verified-live parent has no child list");
+        let (previous, next) = match before {
+            None => (list.last().copied(), None),
+            Some(sibling) => {
+                let position = list
+                    .iter()
+                    .position(|&entry| entry == sibling)
+                    .expect("live sibling missing from its own parent's list");
+                (
+                    position
+                        .checked_sub(1)
+                        .and_then(|index| list.get(index))
+                        .copied(),
+                    Some(sibling),
+                )
+            }
+        };
         let position = match before {
             None => list.len(),
             Some(sibling) => list
@@ -1498,11 +1654,18 @@ impl Dom {
         for (offset, id) in moved.iter().enumerate() {
             list.insert(position + offset, *id);
         }
-        for id in moved {
-            if let Some(node) = self.node_mut(id) {
+        for id in &moved {
+            if let Some(node) = self.node_mut(*id) {
                 node.parent = Some(parent);
             }
         }
+        self.record(Mutation::ChildList {
+            target: parent,
+            added: moved,
+            removed: Vec::new(),
+            previous,
+            next,
+        });
     }
 
     fn children_mut(&mut self, id: NodeId) -> Option<&mut Vec<NodeId>> {
@@ -1556,6 +1719,31 @@ impl Dom {
     /// parents (or none), which later mutations would compound.
     fn unlink_from_current_parent(&mut self, id: NodeId) {
         if let Some(old_parent) = self.parent(id) {
+            let (previous, next) = {
+                let list: Vec<NodeId> = self
+                    .children(old_parent)
+                    .expect("live parent has no child list")
+                    .copied()
+                    .collect();
+                let position = list
+                    .iter()
+                    .position(|&entry| entry == id)
+                    .expect("child missing from the very list its parent pointer names");
+                (
+                    position
+                        .checked_sub(1)
+                        .and_then(|index| list.get(index))
+                        .copied(),
+                    list.get(position + 1).copied(),
+                )
+            };
+            self.record(Mutation::ChildList {
+                target: old_parent,
+                added: Vec::new(),
+                removed: vec![id],
+                previous,
+                next,
+            });
             let list = self
                 .children_mut(old_parent)
                 .expect("live parent has no child list");
@@ -1576,7 +1764,11 @@ impl Dom {
         let node = self.node_mut(id).ok_or(DomError::StaleNode)?;
         match extract(&mut node.kind) {
             Some(field) => {
-                *field = data;
+                let old_value = std::mem::replace(field, data);
+                self.record(Mutation::CharacterData {
+                    target: id,
+                    old_value,
+                });
                 Ok(())
             }
             None => Err(DomError::WrongNodeType),

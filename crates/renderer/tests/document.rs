@@ -643,3 +643,33 @@ fn created_documents_are_second_trees() {
         "application/xhtml+xml|http://www.w3.org/1999/xhtml"
     );
 }
+
+#[test]
+fn mutation_observers_queue_and_deliver_records() {
+    let (mut doc, _host) = document();
+    doc.load_html("<!doctype html><body><div id=t>x</div></body>");
+    doc.eval(
+        "window.delivered = 0;\
+         window.obs = new MutationObserver(function(records) { window.delivered += records.length; });\
+         var t = document.getElementById('t');\
+         obs.observe(t, {attributes: true, attributeOldValue: true, childList: true, subtree: true, characterData: true, characterDataOldValue: true});\
+         t.setAttribute('x', '1');",
+    )
+    .expect("observe and mutate");
+    // The queued delivery microtask runs with the eval's job drain.
+    assert_eq!(doc.eval("String(window.delivered)").expect("delivery"), "1");
+    // takeRecords drains the synchronous queue with old values.
+    assert_eq!(
+        doc.eval(
+            "t.setAttribute('x', '2');\
+             t.appendChild(document.createTextNode('hi'));\
+             t.lastChild.data = 'bye';\
+             var taken = obs.takeRecords();\
+             taken.map(function(r) { return r.type + ':' + String(r.oldValue); }).join(',')"
+        )
+        .expect("takeRecords"),
+        "attributes:1,childList:null,characterData:hi"
+    );
+    // Records already delivered are not re-delivered.
+    assert_eq!(doc.eval("String(window.delivered)").expect("delivery"), "1");
+}

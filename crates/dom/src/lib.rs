@@ -24,7 +24,7 @@ mod node;
 mod select;
 mod state;
 
-pub use arena::{Dom, DomError, NodeRef, QuirksMode};
+pub use arena::{Dom, DomError, Mutation, NodeRef, QuirksMode};
 pub use id::NodeId;
 pub use node::{
     Attribute, LocalName, Namespace, NodeKind, Prefix, QualName, html_namespace, svg_namespace,

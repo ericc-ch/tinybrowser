@@ -9,19 +9,15 @@ use dom::{
 };
 use rquickjs::{
     Class, Ctx, Exception, FromJs, Function, Object, Persistent, Result, Value,
-    class::{Trace, Tracer},
+    class::Trace,
     function::{Constructor, Opt, Rest},
     prelude::This,
 };
 
-use super::world::{AttrState, EventTargetKey, Listener, SharedWorld, World};
-
-#[derive(Clone, Copy, rquickjs::JsLifetime)]
-struct Handle(NodeId);
-
-impl<'js> Trace<'js> for Handle {
-    fn trace<'a>(&self, _tracer: Tracer<'a, 'js>) {}
-}
+use super::world::{
+    AttrState, EventTargetKey, Handle, Listener, Observation, ObserverOptions, ObserverState,
+    RecordData, SharedWorld, World,
+};
 
 macro_rules! branded_node {
     ($name:ident, $js:literal) => {
@@ -585,7 +581,9 @@ fn write_class(ctx: &Ctx<'_>, id: NodeId, value: &str) -> Result<()> {
     parsed
         .dom
         .set_attribute(id, "class", value)
-        .map_err(|err| throw_dom_error(ctx, err))
+        .map_err(|err| throw_dom_error(ctx, err))?;
+    drop(world);
+    schedule_mutation_delivery(ctx)
 }
 
 /// One `Attr` platform object
@@ -983,7 +981,9 @@ fn set_attr_value(ctx: &Ctx<'_>, id: u64, value: String) -> Result<()> {
     parsed
         .dom
         .set_attribute_by_ns(owner, &namespace, prefix.as_deref(), &local, value)
-        .map_err(|err| throw_dom_error(ctx, err))
+        .map_err(|err| throw_dom_error(ctx, err))?;
+    drop(world);
+    schedule_mutation_delivery(ctx)
 }
 
 /// Rebuilds the `NamedNodeMap` object's own index and named properties
@@ -1137,7 +1137,8 @@ fn detach_attr(ctx: &Ctx<'_>, element: NodeId, namespace: &str, local: &str) -> 
         world.attr_owners.insert(id, None);
     }
     drop(world);
-    touch_named_node_map(ctx, element)
+    touch_named_node_map(ctx, element)?;
+    schedule_mutation_delivery(ctx)
 }
 
 /// Keeps an existing attached `Attr` wrapper in sync after a value change.
@@ -1158,7 +1159,8 @@ fn touch_attr(
         world.attr_owners.insert(id, Some(element));
     }
     drop(world);
-    touch_named_node_map(ctx, element)
+    touch_named_node_map(ctx, element)?;
+    schedule_mutation_delivery(ctx)
 }
 
 /// Removes the DOM attribute identified by `(namespace, local)` and syncs
@@ -1194,7 +1196,8 @@ fn remove_attribute_sync(
         world.attr_owners.insert(id, None);
     }
     drop(world);
-    touch_named_node_map(ctx, element)
+    touch_named_node_map(ctx, element)?;
+    schedule_mutation_delivery(ctx)
 }
 
 /// `setAttributeNode` / `setAttributeNodeNS`
@@ -1269,6 +1272,7 @@ fn set_attribute_node<'js>(
             .insert((element, state.namespace.clone(), state.local.clone()), id);
     }
     touch_named_node_map(ctx, element)?;
+    schedule_mutation_delivery(ctx)?;
     match previous {
         Some(previous) => attr_wrapper(ctx, previous),
         None => Ok(Value::new_null(ctx.clone())),
@@ -1325,6 +1329,239 @@ impl JsDomParser {
         let root = world(&ctx)?.borrow_mut().add_document(parsed);
         wrap_node(&ctx, root)
     }
+}
+
+/// `MutationRecord` (<https://dom.spec.whatwg.org/#interface-mutationrecord>).
+#[derive(Trace, rquickjs::JsLifetime)]
+#[rquickjs::class(rename = "MutationRecord")]
+pub struct JsMutationRecord {
+    record: RecordData,
+}
+
+#[rquickjs::methods]
+#[allow(
+    clippy::needless_pass_by_value,
+    clippy::unused_self,
+    reason = "rquickjs method ABI passes Ctx by value"
+)]
+impl JsMutationRecord {
+    #[qjs(constructor)]
+    fn ctor(ctx: Ctx<'_>) -> Result<Self> {
+        Err(Exception::throw_type(&ctx, "Illegal constructor"))
+    }
+
+    #[qjs(get, rename = "type")]
+    fn record_type(&self) -> String {
+        self.record.typ.clone()
+    }
+
+    #[qjs(get)]
+    fn target<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
+        wrap_node(&ctx, self.record.target.0)
+    }
+
+    #[qjs(get, rename = "addedNodes")]
+    fn added_nodes<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
+        node_list(&ctx, self.record.target.0, &self.record.added)
+    }
+
+    #[qjs(get, rename = "removedNodes")]
+    fn removed_nodes<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
+        node_list(&ctx, self.record.target.0, &self.record.removed)
+    }
+
+    #[qjs(get, rename = "previousSibling")]
+    fn previous_sibling<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
+        child_value(&ctx, self.record.previous.map(|handle| handle.0))
+    }
+
+    #[qjs(get, rename = "nextSibling")]
+    fn next_sibling<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
+        child_value(&ctx, self.record.next.map(|handle| handle.0))
+    }
+
+    #[qjs(get, rename = "attributeName")]
+    fn attribute_name<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
+        match &self.record.attribute_name {
+            Some(name) => string_value(&ctx, name),
+            None => Ok(Value::new_null(ctx)),
+        }
+    }
+
+    #[qjs(get, rename = "attributeNamespace")]
+    fn attribute_namespace<'js>(&self, ctx: Ctx<'js>) -> Value<'js> {
+        Value::new_null(ctx)
+    }
+
+    #[qjs(get, rename = "oldValue")]
+    fn old_value<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
+        match &self.record.old_value {
+            Some(value) => string_value(&ctx, value),
+            None => Ok(Value::new_null(ctx)),
+        }
+    }
+}
+
+fn node_list<'js>(ctx: &Ctx<'js>, scope: NodeId, nodes: &[Handle]) -> Result<Value<'js>> {
+    live_collection(ctx, scope, CollectionKind::Static(nodes.to_vec()), None)
+}
+
+/// `MutationObserver` (<https://dom.spec.whatwg.org/#interface-mutationobserver>).
+#[derive(Trace, rquickjs::JsLifetime)]
+#[rquickjs::class(rename = "MutationObserver")]
+pub struct JsMutationObserver {
+    id: u64,
+}
+
+#[rquickjs::methods]
+#[allow(
+    clippy::needless_pass_by_value,
+    clippy::unused_self,
+    reason = "rquickjs method ABI passes Ctx by value"
+)]
+impl JsMutationObserver {
+    // https://dom.spec.whatwg.org/#dom-mutationobserver-mutationobserver
+    #[qjs(constructor)]
+    fn new<'js>(ctx: Ctx<'js>, callback: Function<'js>) -> Result<Self> {
+        let world_rc = world(&ctx)?;
+        let mut world = world_rc.borrow_mut();
+        world.next_observer_id += 1;
+        let id = world.next_observer_id;
+        world.observers.insert(
+            id,
+            ObserverState {
+                callback: Persistent::save(&ctx, callback),
+                observations: Vec::new(),
+                queue: Vec::new(),
+            },
+        );
+        Ok(Self { id })
+    }
+
+    // https://dom.spec.whatwg.org/#dom-mutationobserver-observe
+    #[qjs(rename = "observe")]
+    fn observe<'js>(&self, ctx: Ctx<'js>, target: Value<'js>, options: Object<'js>) -> Result<()> {
+        let target = required_node(&ctx, &target)?;
+        let mut parsed = ObserverOptions {
+            child_list: option_truthy(&ctx, &options, "childList")?,
+            attributes: option_truthy(&ctx, &options, "attributes")?,
+            character_data: option_truthy(&ctx, &options, "characterData")?,
+            subtree: option_truthy(&ctx, &options, "subtree")?,
+            attribute_old_value: option_truthy(&ctx, &options, "attributeOldValue")?,
+            character_data_old_value: option_truthy(&ctx, &options, "characterDataOldValue")?,
+        };
+        if parsed.attribute_old_value {
+            parsed.attributes = true;
+        }
+        if parsed.character_data_old_value {
+            parsed.character_data = true;
+        }
+        if !(parsed.child_list || parsed.attributes || parsed.character_data) {
+            return Err(Exception::throw_type(
+                &ctx,
+                "options must set childList, attributes, or characterData",
+            ));
+        }
+        let world_rc = world(&ctx)?;
+        let mut world = world_rc.borrow_mut();
+        let Some(observer) = world.observers.get_mut(&self.id) else {
+            return Ok(());
+        };
+        observer.observations.push(Observation {
+            target: Handle(target),
+            options: parsed,
+        });
+        world.set_recording(true);
+        Ok(())
+    }
+
+    // https://dom.spec.whatwg.org/#dom-mutationobserver-disconnect
+    #[qjs(rename = "disconnect")]
+    fn disconnect(&self, ctx: Ctx<'_>) -> Result<()> {
+        let world_rc = world(&ctx)?;
+        let mut world = world_rc.borrow_mut();
+        world.observers.remove(&self.id);
+        if world.observers.is_empty() {
+            world.set_recording(false);
+        }
+        Ok(())
+    }
+
+    // https://dom.spec.whatwg.org/#dom-mutationobserver-takerecords
+    #[qjs(rename = "takeRecords")]
+    fn take_records<'js>(&self, ctx: Ctx<'js>) -> Result<Vec<Value<'js>>> {
+        let world_rc = world(&ctx)?;
+        let queue = {
+            let mut world = world_rc.borrow_mut();
+            world.drain_mutations();
+            world.take_observer_queue(self.id)
+        };
+        queue
+            .into_iter()
+            .map(|record| {
+                Ok(Class::instance(ctx.clone(), JsMutationRecord { record })?.into_value())
+            })
+            .collect()
+    }
+}
+
+/// Dictionary member truthiness (`ToBoolean`, missing members are false).
+fn option_truthy<'js>(ctx: &Ctx<'js>, options: &Object<'js>, key: &str) -> Result<bool> {
+    let value: Value = options.get(key)?;
+    if value.is_undefined() || value.is_null() {
+        return Ok(false);
+    }
+    let to_boolean: Function = ctx.globals().get("Boolean")?;
+    to_boolean.call((value,))
+}
+
+/// Delivers queued records to observer callbacks; installed as a global and
+/// scheduled as a microtask after every mutation.
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "rquickjs Func ABI passes Ctx by value"
+)]
+fn deliver_mutations(ctx: Ctx<'_>) -> Result<()> {
+    let world_rc = world(&ctx)?;
+    loop {
+        let ready = {
+            let mut world = world_rc.borrow_mut();
+            world.drain_mutations();
+            world.take_ready()
+        };
+        if ready.is_empty() {
+            break;
+        }
+        for (id, callback, records) in ready {
+            let array = rquickjs::Array::new(ctx.clone())?;
+            for (index, record) in records.into_iter().enumerate() {
+                array.set(
+                    index,
+                    Class::instance(ctx.clone(), JsMutationRecord { record })?.into_value(),
+                )?;
+            }
+            let observer = Class::instance(ctx.clone(), JsMutationObserver { id })?;
+            let callback = callback.restore(&ctx)?;
+            callback.call::<_, ()>((array, Class::into_value(observer)))?;
+        }
+    }
+    world_rc.borrow_mut().delivery_scheduled = false;
+    Ok(())
+}
+
+/// Schedules one microtask that drains the mutation log, if needed.
+fn schedule_mutation_delivery(ctx: &Ctx<'_>) -> Result<()> {
+    let world_rc = world(ctx)?;
+    {
+        let mut world = world_rc.borrow_mut();
+        if world.observers.is_empty() || world.delivery_scheduled {
+            return Ok(());
+        }
+        world.delivery_scheduled = true;
+    }
+    let deliver: Function = ctx.globals().get("__tb_deliver_mutations")?;
+    let queue: Function = ctx.globals().get("queueMicrotask")?;
+    queue.call::<_, ()>((deliver,))
 }
 
 /// A small well-formedness-oriented XML parser for `DOMParser`'s XML types.
@@ -1839,6 +2076,7 @@ impl JsNode {
             .pre_insert(parent, kid, None)
             .map_err(|err| throw_dom_error(&ctx, err))?;
         drop(world);
+        schedule_mutation_delivery(&ctx)?;
         wrap_node(&ctx, kid)
     }
 
@@ -2252,7 +2490,8 @@ impl JsNode {
                 .set_attribute(self.handle.0, &local, value.0.clone())
                 .map_err(|err| throw_dom_error(&ctx, err))?;
         }
-        touch_attr(&ctx, self.handle.0, "", &local, &value.0)
+        touch_attr(&ctx, self.handle.0, "", &local, &value.0)?;
+        schedule_mutation_delivery(&ctx)
     }
 
     #[qjs(get)]
@@ -2507,24 +2746,28 @@ impl JsNode {
         let dom = &mut parsed.dom;
         match dom.get(self.handle.0).map(|node| node.kind()) {
             Some(NodeKind::Text { .. }) => {
-                return dom
-                    .set_text(self.handle.0, text)
-                    .map_err(|err| throw_dom_error(&ctx, err));
+                dom.set_text(self.handle.0, text)
+                    .map_err(|err| throw_dom_error(&ctx, err))?;
+                drop(world);
+                return schedule_mutation_delivery(&ctx);
             }
             Some(NodeKind::Comment { .. }) => {
-                return dom
-                    .set_comment(self.handle.0, text)
-                    .map_err(|err| throw_dom_error(&ctx, err));
+                dom.set_comment(self.handle.0, text)
+                    .map_err(|err| throw_dom_error(&ctx, err))?;
+                drop(world);
+                return schedule_mutation_delivery(&ctx);
             }
             Some(NodeKind::CDataSection { .. }) => {
-                return dom
-                    .set_cdata_section(self.handle.0, text)
-                    .map_err(|err| throw_dom_error(&ctx, err));
+                dom.set_cdata_section(self.handle.0, text)
+                    .map_err(|err| throw_dom_error(&ctx, err))?;
+                drop(world);
+                return schedule_mutation_delivery(&ctx);
             }
             Some(NodeKind::ProcessingInstruction { .. }) => {
-                return dom
-                    .set_processing_instruction(self.handle.0, text)
-                    .map_err(|err| throw_dom_error(&ctx, err));
+                dom.set_processing_instruction(self.handle.0, text)
+                    .map_err(|err| throw_dom_error(&ctx, err))?;
+                drop(world);
+                return schedule_mutation_delivery(&ctx);
             }
             Some(NodeKind::Document | NodeKind::Doctype { .. }) => return Ok(()),
             _ => {}
@@ -2541,7 +2784,8 @@ impl JsNode {
             dom.append(self.handle.0, text_id)
                 .map_err(|err| throw_dom_error(&ctx, err))?;
         }
-        Ok(())
+        drop(world);
+        schedule_mutation_delivery(&ctx)
     }
 
     // ── ParentNode ───────────────────────────────────────────────────────
@@ -2617,7 +2861,9 @@ impl JsNode {
         parsed
             .dom
             .pre_insert(self.handle.0, node, None)
-            .map_err(|err| throw_dom_error(&ctx, err))
+            .map_err(|err| throw_dom_error(&ctx, err))?;
+        drop(world);
+        schedule_mutation_delivery(&ctx)
     }
 
     // https://dom.spec.whatwg.org/#dom-parentnode-prepend
@@ -2636,7 +2882,9 @@ impl JsNode {
         parsed
             .dom
             .pre_insert(self.handle.0, node, reference)
-            .map_err(|err| throw_dom_error(&ctx, err))
+            .map_err(|err| throw_dom_error(&ctx, err))?;
+        drop(world);
+        schedule_mutation_delivery(&ctx)
     }
 
     // https://dom.spec.whatwg.org/#dom-parentnode-replacechildren
@@ -2651,7 +2899,9 @@ impl JsNode {
         parsed
             .dom
             .replace_all(self.handle.0, node)
-            .map_err(|err| throw_dom_error(&ctx, err))
+            .map_err(|err| throw_dom_error(&ctx, err))?;
+        drop(world);
+        schedule_mutation_delivery(&ctx)
     }
 
     // https://dom.spec.whatwg.org/#dom-parentnode-queryselector
@@ -2803,7 +3053,8 @@ impl JsNode {
             dom.append(title, text)
                 .map_err(|err| throw_dom_error(&ctx, err))?;
         }
-        Ok(())
+        drop(world);
+        schedule_mutation_delivery(&ctx)
     }
 
     // https://html.spec.whatwg.org/multipage/dom.html#dom-document-getelementsbyname
@@ -2866,7 +3117,9 @@ impl JsNode {
         parsed
             .dom
             .pre_insert(parent, node, reference)
-            .map_err(|err| throw_dom_error(&ctx, err))
+            .map_err(|err| throw_dom_error(&ctx, err))?;
+        drop(world);
+        schedule_mutation_delivery(&ctx)
     }
 
     // https://dom.spec.whatwg.org/#dom-childnode-after
@@ -2885,7 +3138,9 @@ impl JsNode {
         parsed
             .dom
             .pre_insert(parent, node, reference)
-            .map_err(|err| throw_dom_error(&ctx, err))
+            .map_err(|err| throw_dom_error(&ctx, err))?;
+        drop(world);
+        schedule_mutation_delivery(&ctx)
     }
 
     // https://dom.spec.whatwg.org/#dom-childnode-replacewith
@@ -2901,16 +3156,19 @@ impl JsNode {
             return Ok(());
         };
         if parsed.dom.parent(self.handle.0) == Some(parent) {
-            return parsed
+            parsed
                 .dom
                 .replace_child(parent, node, self.handle.0)
-                .map_err(|err| throw_dom_error(&ctx, err));
+                .map_err(|err| throw_dom_error(&ctx, err))?;
+        } else {
+            let reference = parsed.dom.sibling(self.handle.0, true);
+            parsed
+                .dom
+                .pre_insert(parent, node, reference)
+                .map_err(|err| throw_dom_error(&ctx, err))?;
         }
-        let reference = parsed.dom.sibling(self.handle.0, true);
-        parsed
-            .dom
-            .pre_insert(parent, node, reference)
-            .map_err(|err| throw_dom_error(&ctx, err))
+        drop(world);
+        schedule_mutation_delivery(&ctx)
     }
 
     // https://dom.spec.whatwg.org/#dom-nondocumenttypechildnode-previouselementsibling
@@ -3008,7 +3266,9 @@ impl JsNode {
         parsed
             .dom
             .set_attribute(self.handle.0, "class", value.0)
-            .map_err(|err| throw_dom_error(&ctx, err))
+            .map_err(|err| throw_dom_error(&ctx, err))?;
+        drop(world);
+        schedule_mutation_delivery(&ctx)
     }
 
     // https://dom.spec.whatwg.org/#dom-element-classlist
@@ -3132,7 +3392,8 @@ impl JsNode {
                 )
                 .map_err(|err| throw_dom_error(&ctx, err))?;
         }
-        touch_attr(&ctx, self.handle.0, &namespace, &local, &value.0)
+        touch_attr(&ctx, self.handle.0, &namespace, &local, &value.0)?;
+        schedule_mutation_delivery(&ctx)
     }
 
     // https://dom.spec.whatwg.org/#dom-element-removeattribute
@@ -3157,7 +3418,8 @@ impl JsNode {
                 .remove_attribute(self.handle.0, &local)
                 .map_err(|err| throw_dom_error(&ctx, err))?;
         }
-        detach_attr(&ctx, self.handle.0, "", &local)
+        detach_attr(&ctx, self.handle.0, "", &local)?;
+        schedule_mutation_delivery(&ctx)
     }
 
     // https://dom.spec.whatwg.org/#dom-element-removeattributens
@@ -3180,7 +3442,8 @@ impl JsNode {
                 .remove_attribute_ns(self.handle.0, &namespace, &local.0)
                 .map_err(|err| throw_dom_error(&ctx, err))?;
         }
-        detach_attr(&ctx, self.handle.0, &namespace, &local.0)
+        detach_attr(&ctx, self.handle.0, &namespace, &local.0)?;
+        schedule_mutation_delivery(&ctx)
     }
 
     // https://dom.spec.whatwg.org/#dom-element-getattributenames
@@ -3345,6 +3608,7 @@ impl JsNode {
             } else {
                 detach_attr(&ctx, self.handle.0, "", &local)?;
             }
+            schedule_mutation_delivery(&ctx)?;
         }
         Ok(should_exist)
     }
@@ -3441,7 +3705,8 @@ impl JsNode {
                 }
             }
         }
-        Ok(())
+        drop(world);
+        schedule_mutation_delivery(&ctx)
     }
 
     // https://dom.spec.whatwg.org/#dom-node-comparedocumentposition
@@ -3611,6 +3876,7 @@ impl JsNode {
         dom.pre_insert(self.handle.0, node, reference)
             .map_err(|err| throw_dom_error(&ctx, err))?;
         drop(world);
+        schedule_mutation_delivery(&ctx)?;
         wrap_node(&ctx, node)
     }
 
@@ -3635,6 +3901,7 @@ impl JsNode {
             .detach(child)
             .map_err(|err| throw_dom_error(&ctx, err))?;
         drop(world);
+        schedule_mutation_delivery(&ctx)?;
         wrap_node(&ctx, child)
     }
 
@@ -3670,6 +3937,7 @@ impl JsNode {
             .replace_child(self.handle.0, node, child)
             .map_err(|err| throw_dom_error(&ctx, err))?;
         drop(world);
+        schedule_mutation_delivery(&ctx)?;
         wrap_node(&ctx, child)
     }
 
@@ -3729,7 +3997,9 @@ impl JsNode {
         parsed
             .dom
             .detach(self.handle.0)
-            .map_err(|err| throw_dom_error(&ctx, err))
+            .map_err(|err| throw_dom_error(&ctx, err))?;
+        drop(world);
+        schedule_mutation_delivery(&ctx)
     }
 
     // https://dom.spec.whatwg.org/#dom-characterdata-length
@@ -4021,6 +4291,12 @@ pub(super) fn install(ctx: &Ctx<'_>, world: &Rc<RefCell<World>>) -> Result<()> {
     Class::<JsAttr>::define(&globals)?;
     Class::<JsNamedNodeMap>::define(&globals)?;
     Class::<JsDomParser>::define(&globals)?;
+    Class::<JsMutationObserver>::define(&globals)?;
+    Class::<JsMutationRecord>::define(&globals)?;
+    globals.set(
+        "__tb_deliver_mutations",
+        rquickjs::prelude::Func::from(deliver_mutations),
+    )?;
     install_brands(ctx)?;
     install_collection_brand(ctx)?;
     install_dom_exception_codes(ctx)?;
@@ -4741,24 +5017,34 @@ fn set_character_data(ctx: &Ctx<'_>, id: NodeId, data: String) -> Result<()> {
         return Ok(());
     };
     match parsed.dom.get(id).map(|node| node.kind()) {
-        Some(NodeKind::Text { .. }) => parsed
-            .dom
-            .set_text(id, data)
-            .map_err(|err| throw_dom_error(ctx, err)),
-        Some(NodeKind::CDataSection { .. }) => parsed
-            .dom
-            .set_cdata_section(id, data)
-            .map_err(|err| throw_dom_error(ctx, err)),
-        Some(NodeKind::ProcessingInstruction { .. }) => parsed
-            .dom
-            .set_processing_instruction(id, data)
-            .map_err(|err| throw_dom_error(ctx, err)),
-        Some(NodeKind::Comment { .. }) => parsed
-            .dom
-            .set_comment(id, data)
-            .map_err(|err| throw_dom_error(ctx, err)),
-        _ => Ok(()),
+        Some(NodeKind::Text { .. }) => {
+            parsed
+                .dom
+                .set_text(id, data)
+                .map_err(|err| throw_dom_error(ctx, err))?;
+        }
+        Some(NodeKind::CDataSection { .. }) => {
+            parsed
+                .dom
+                .set_cdata_section(id, data)
+                .map_err(|err| throw_dom_error(ctx, err))?;
+        }
+        Some(NodeKind::ProcessingInstruction { .. }) => {
+            parsed
+                .dom
+                .set_processing_instruction(id, data)
+                .map_err(|err| throw_dom_error(ctx, err))?;
+        }
+        Some(NodeKind::Comment { .. }) => {
+            parsed
+                .dom
+                .set_comment(id, data)
+                .map_err(|err| throw_dom_error(ctx, err))?;
+        }
+        _ => return Ok(()),
     }
+    drop(world);
+    schedule_mutation_delivery(ctx)
 }
 
 /// `WebIDL` `unsigned long` offset conversion plus the `CharacterData` bounds

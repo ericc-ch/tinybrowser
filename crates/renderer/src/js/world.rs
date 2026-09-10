@@ -6,11 +6,60 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use dom::NodeId;
-use rquickjs::{Object, Persistent, Value, function::Function};
+use rquickjs::{Object, Persistent, Value, class::Trace, function::Function};
 use url::Url;
 
 use crate::Parsed;
 use crate::protocol::BrowserServices;
+
+/// One DOM node handle owned by the JS world.
+#[derive(Clone, Copy, rquickjs::JsLifetime)]
+pub(crate) struct Handle(pub(crate) NodeId);
+
+impl<'js> Trace<'js> for Handle {
+    fn trace<'a>(&self, _tracer: rquickjs::class::Tracer<'a, 'js>) {}
+}
+
+/// `MutationObserver` options, already normalized. The booleans mirror the
+/// `MutationObserverInit` dictionary one-for-one.
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "each bool is a MutationObserverInit dictionary member"
+)]
+#[derive(Clone, Copy, Default)]
+pub(crate) struct ObserverOptions {
+    pub child_list: bool,
+    pub attributes: bool,
+    pub character_data: bool,
+    pub subtree: bool,
+    pub attribute_old_value: bool,
+    pub character_data_old_value: bool,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct Observation {
+    pub target: Handle,
+    pub options: ObserverOptions,
+}
+
+/// One queued `MutationRecord`, ready to wrap for JS.
+#[derive(Clone, rquickjs::JsLifetime, Trace)]
+pub(crate) struct RecordData {
+    pub typ: String,
+    pub target: Handle,
+    pub added: Vec<Handle>,
+    pub removed: Vec<Handle>,
+    pub previous: Option<Handle>,
+    pub next: Option<Handle>,
+    pub attribute_name: Option<String>,
+    pub old_value: Option<String>,
+}
+
+pub(crate) struct ObserverState {
+    pub callback: Persistent<Function<'static>>,
+    pub observations: Vec<Observation>,
+    pub queue: Vec<RecordData>,
+}
 
 pub(crate) struct Listener {
     pub typ: String,
@@ -51,6 +100,10 @@ pub(crate) struct World {
     /// Attached attributes: (element, namespace, local) -> `Attr` id.
     pub(crate) attr_ids: HashMap<(NodeId, String, String), u64>,
     pub(crate) next_attr_id: u64,
+    /// Registered `MutationObserver`s, keyed by their platform id.
+    pub(crate) observers: HashMap<u64, ObserverState>,
+    pub(crate) next_observer_id: u64,
+    pub(crate) delivery_scheduled: bool,
 }
 
 impl World {
@@ -76,7 +129,85 @@ impl World {
             attr_wrappers: HashMap::new(),
             attr_ids: HashMap::new(),
             next_attr_id: 0,
+            observers: HashMap::new(),
+            next_observer_id: 0,
+            delivery_scheduled: false,
         }
+    }
+
+    /// Turns mutation recording on for every document in the world.
+    pub(crate) fn set_recording(&mut self, recording: bool) {
+        if let Some(parsed) = self.parsed.as_mut() {
+            parsed.dom.set_record_mutations(recording);
+        }
+        for parsed in self.extra_documents.values_mut() {
+            parsed.dom.set_record_mutations(recording);
+        }
+    }
+
+    /// Drains every document's mutation log and matches the mutations
+    /// against all registered observers, appending to their queues.
+    pub(crate) fn drain_mutations(&mut self) {
+        let mut drained: Vec<(u32, Vec<dom::Mutation>)> = Vec::new();
+        if let Some(parsed) = self.parsed.as_mut() {
+            let mutations = parsed.dom.take_mutations();
+            if !mutations.is_empty() {
+                drained.push((parsed.dom.document_id(), mutations));
+            }
+        }
+        for parsed in self.extra_documents.values_mut() {
+            let mutations = parsed.dom.take_mutations();
+            if !mutations.is_empty() {
+                drained.push((parsed.dom.document_id(), mutations));
+            }
+        }
+        if drained.is_empty() || self.observers.is_empty() {
+            return;
+        }
+        let World {
+            parsed,
+            extra_documents,
+            observers,
+            ..
+        } = self;
+        for (document_id, mutations) in drained {
+            let dom = parsed
+                .as_ref()
+                .filter(|parsed| parsed.dom.document_id() == document_id)
+                .map(|parsed| &parsed.dom)
+                .or_else(|| extra_documents.get(&document_id).map(|parsed| &parsed.dom));
+            let Some(dom) = dom else {
+                continue;
+            };
+            for mutation in mutations {
+                for observer in observers.values_mut() {
+                    if let Some(record) = match_observation(dom, observer, &mutation) {
+                        observer.queue.push(record);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Removes and returns one observer's queued records.
+    pub(crate) fn take_observer_queue(&mut self, observer: u64) -> Vec<RecordData> {
+        self.observers
+            .get_mut(&observer)
+            .map(|state| std::mem::take(&mut state.queue))
+            .unwrap_or_default()
+    }
+
+    /// Removes observers that have queued records, for callback delivery.
+    pub(crate) fn take_ready(
+        &mut self,
+    ) -> Vec<(u64, Persistent<Function<'static>>, Vec<RecordData>)> {
+        let mut ready = Vec::new();
+        for (&id, state) in &mut self.observers {
+            if !state.queue.is_empty() {
+                ready.push((id, state.callback.clone(), std::mem::take(&mut state.queue)));
+            }
+        }
+        ready
     }
 
     pub(crate) fn replace_document(&mut self, parsed: Parsed) {
@@ -87,6 +218,9 @@ impl World {
         self.token_lists.clear();
         self.named_node_maps.clear();
         self.implementations.clear();
+        // A new realm owns fresh observers; navigation drops the old ones.
+        self.observers.clear();
+        self.delivery_scheduled = false;
     }
 
     /// One `DOMImplementation` object per document, for identity.
@@ -136,6 +270,7 @@ impl World {
         self.named_node_maps.clear();
         self.implementations.clear();
         self.brands.clear();
+        self.observers.clear();
     }
 
     pub(crate) fn wrapper(&self, id: NodeId) -> Option<Persistent<Value<'static>>> {
@@ -187,6 +322,101 @@ impl World {
             .map(|listener| listener.callback.clone())
             .collect()
     }
+}
+
+/// Whether `mutation` is observable by `observer`, producing a record when
+/// it is (<https://dom.spec.whatwg.org/#concept-mo-queue>).
+fn match_observation(
+    dom: &dom::Dom,
+    observer: &ObserverState,
+    mutation: &dom::Mutation,
+) -> Option<RecordData> {
+    let (target, kind) = match mutation {
+        dom::Mutation::ChildList { target, .. } => (*target, 0_u8),
+        dom::Mutation::Attributes { target, .. } => (*target, 1_u8),
+        dom::Mutation::CharacterData { target, .. } => (*target, 2_u8),
+    };
+    for observation in &observer.observations {
+        let in_scope = observation.target.0 == target
+            || (observation.options.subtree
+                && inclusive_descendant(dom, observation.target.0, target));
+        if !in_scope {
+            continue;
+        }
+        let enabled = match kind {
+            0 => observation.options.child_list,
+            1 => observation.options.attributes,
+            _ => observation.options.character_data,
+        };
+        if !enabled {
+            continue;
+        }
+        return Some(record(observation, mutation));
+    }
+    None
+}
+
+fn record(observation: &Observation, mutation: &dom::Mutation) -> RecordData {
+    match mutation {
+        dom::Mutation::ChildList {
+            target,
+            added,
+            removed,
+            previous,
+            next,
+        } => RecordData {
+            typ: "childList".into(),
+            target: Handle(*target),
+            added: added.iter().copied().map(Handle).collect(),
+            removed: removed.iter().copied().map(Handle).collect(),
+            previous: previous.map(Handle),
+            next: next.map(Handle),
+            attribute_name: None,
+            old_value: None,
+        },
+        dom::Mutation::Attributes {
+            target,
+            name,
+            old_value,
+        } => RecordData {
+            typ: "attributes".into(),
+            target: Handle(*target),
+            added: Vec::new(),
+            removed: Vec::new(),
+            previous: None,
+            next: None,
+            attribute_name: Some(name.clone()),
+            old_value: observation
+                .options
+                .attribute_old_value
+                .then(|| old_value.clone())
+                .flatten(),
+        },
+        dom::Mutation::CharacterData { target, old_value } => RecordData {
+            typ: "characterData".into(),
+            target: Handle(*target),
+            added: Vec::new(),
+            removed: Vec::new(),
+            previous: None,
+            next: None,
+            attribute_name: None,
+            old_value: observation
+                .options
+                .character_data_old_value
+                .then(|| old_value.clone()),
+        },
+    }
+}
+
+fn inclusive_descendant(dom: &dom::Dom, ancestor: NodeId, node: NodeId) -> bool {
+    let mut cursor = Some(node);
+    while let Some(id) = cursor {
+        if id == ancestor {
+            return true;
+        }
+        cursor = dom.parent(id);
+    }
+    false
 }
 
 #[derive(Clone, rquickjs::JsLifetime)]
