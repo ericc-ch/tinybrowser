@@ -34,7 +34,19 @@ pub(crate) struct World {
     listeners: HashMap<EventTargetKey, Vec<Listener>>,
     wrappers: HashMap<NodeId, Persistent<Value<'static>>>,
     token_lists: HashMap<NodeId, Persistent<Value<'static>>>,
+    named_node_maps: HashMap<NodeId, Persistent<Value<'static>>>,
     brands: HashMap<String, Persistent<Object<'static>>>,
+    /// `Attr` platform-object identity, keyed by a per-realm id.
+    pub(crate) attrs: HashMap<u64, AttrState>,
+    /// Owner element for each `Attr` id; `None` while detached.
+    pub(crate) attr_owners: HashMap<u64, Option<NodeId>>,
+    /// Last known value, so a detached `Attr` keeps its data.
+    pub(crate) attr_values: HashMap<u64, String>,
+    /// Wrapper object for each `Attr` id (identity is the id).
+    pub(crate) attr_wrappers: HashMap<u64, Persistent<Value<'static>>>,
+    /// Attached attributes: (element, namespace, local) -> `Attr` id.
+    pub(crate) attr_ids: HashMap<(NodeId, String, String), u64>,
+    pub(crate) next_attr_id: u64,
 }
 
 impl World {
@@ -50,7 +62,14 @@ impl World {
             listeners: HashMap::new(),
             wrappers: HashMap::new(),
             token_lists: HashMap::new(),
+            named_node_maps: HashMap::new(),
             brands: HashMap::new(),
+            attrs: HashMap::new(),
+            attr_owners: HashMap::new(),
+            attr_values: HashMap::new(),
+            attr_wrappers: HashMap::new(),
+            attr_ids: HashMap::new(),
+            next_attr_id: 0,
         }
     }
 
@@ -60,6 +79,7 @@ impl World {
         self.listeners.clear();
         self.wrappers.clear();
         self.token_lists.clear();
+        self.named_node_maps.clear();
     }
 
     pub(crate) fn add_listener(&mut self, target: EventTargetKey, listener: Listener) {
@@ -70,6 +90,7 @@ impl World {
         self.listeners.clear();
         self.wrappers.clear();
         self.token_lists.clear();
+        self.named_node_maps.clear();
         self.brands.clear();
     }
 
@@ -87,6 +108,14 @@ impl World {
 
     pub(crate) fn intern_token_list(&mut self, id: NodeId, value: Persistent<Value<'static>>) {
         self.token_lists.insert(id, value);
+    }
+
+    pub(crate) fn named_node_map(&self, id: NodeId) -> Option<Persistent<Value<'static>>> {
+        self.named_node_maps.get(&id).cloned()
+    }
+
+    pub(crate) fn intern_named_node_map(&mut self, id: NodeId, value: Persistent<Value<'static>>) {
+        self.named_node_maps.insert(id, value);
     }
 
     pub(crate) fn intern_brand(
@@ -118,3 +147,11 @@ impl World {
 
 #[derive(Clone, rquickjs::JsLifetime)]
 pub(crate) struct SharedWorld(pub Rc<RefCell<World>>);
+
+/// Identity of one `Attr` platform object.
+pub(crate) struct AttrState {
+    pub namespace: String,
+    pub prefix: Option<String>,
+    pub local: String,
+    pub qualified: String,
+}

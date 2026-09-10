@@ -14,7 +14,7 @@ use rquickjs::{
     prelude::This,
 };
 
-use super::world::{EventTargetKey, Listener, SharedWorld, World};
+use super::world::{AttrState, EventTargetKey, Listener, SharedWorld, World};
 
 #[derive(Clone, Copy, rquickjs::JsLifetime)]
 struct Handle(NodeId);
@@ -350,8 +350,7 @@ impl JsTokenList {
     // https://dom.spec.whatwg.org/#dom-domtokenlist-replace
     #[qjs(rename = "replace")]
     fn replace(&self, ctx: Ctx<'_>, old: WebIdlString, new: WebIdlString) -> Result<bool> {
-        validate_token(&ctx, &old.0)?;
-        validate_token(&ctx, &new.0)?;
+        validate_token_pair(&ctx, &old.0, &new.0)?;
         let mut current = class_tokens(&ctx, self.element.0)?;
         if !current.contains(&old.0) {
             return Ok(false);
@@ -434,6 +433,26 @@ fn validate_token(ctx: &Ctx<'_>, token: &str) -> Result<()> {
     Ok(())
 }
 
+/// `replace` validates emptiness for both tokens before whitespace
+/// (<https://dom.spec.whatwg.org/#dom-domtokenlist-replace>).
+fn validate_token_pair(ctx: &Ctx<'_>, old: &str, new: &str) -> Result<()> {
+    if old.is_empty() || new.is_empty() {
+        return Err(throw_dom(ctx, "SyntaxError", "token is empty"));
+    }
+    if old
+        .chars()
+        .chain(new.chars())
+        .any(|c| matches!(c, '\t' | '\n' | '\u{c}' | '\r' | ' '))
+    {
+        return Err(throw_dom(
+            ctx,
+            "InvalidCharacterError",
+            "token contains ASCII whitespace",
+        ));
+    }
+    Ok(())
+}
+
 /// Writes the token list back as the class attribute. The update steps set
 /// the attribute even when the list serializes to the empty string; when the
 /// attribute does not exist and the value is empty they do nothing
@@ -455,6 +474,678 @@ fn write_class(ctx: &Ctx<'_>, id: NodeId, value: &str) -> Result<()> {
         .dom
         .set_attribute(id, "class", value)
         .map_err(|err| throw_dom_error(ctx, err))
+}
+
+/// One `Attr` platform object
+/// (<https://dom.spec.whatwg.org/#interface-attr>). Identity lives in the
+/// World's attr registry so `el.attributes[0] === el.getAttributeNode(name)`.
+#[derive(Trace, rquickjs::JsLifetime)]
+#[rquickjs::class(rename = "Attr")]
+pub struct JsAttr {
+    id: u64,
+}
+
+#[rquickjs::methods]
+#[allow(
+    clippy::needless_pass_by_value,
+    clippy::unused_self,
+    reason = "rquickjs method ABI passes Ctx by value; Attr methods may ignore self"
+)]
+impl JsAttr {
+    #[qjs(constructor)]
+    fn ctor(ctx: Ctx<'_>) -> Result<Self> {
+        Err(Exception::throw_type(&ctx, "Illegal constructor"))
+    }
+
+    // https://dom.spec.whatwg.org/#dom-attr-name
+    #[qjs(get)]
+    fn name(&self, ctx: Ctx<'_>) -> Result<String> {
+        Ok(attr_state(&ctx, self.id)?.qualified)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-attr-localname
+    #[qjs(get, rename = "localName")]
+    fn local_name(&self, ctx: Ctx<'_>) -> Result<String> {
+        Ok(attr_state(&ctx, self.id)?.local)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-attr-prefix
+    #[qjs(get)]
+    fn prefix<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
+        match attr_state(&ctx, self.id)?.prefix {
+            Some(prefix) => string_value(&ctx, &prefix),
+            None => Ok(Value::new_null(ctx)),
+        }
+    }
+
+    // https://dom.spec.whatwg.org/#dom-attr-namespaceuri
+    #[qjs(get, rename = "namespaceURI")]
+    fn namespace_uri<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
+        let namespace = attr_state(&ctx, self.id)?.namespace;
+        if namespace.is_empty() {
+            Ok(Value::new_null(ctx))
+        } else {
+            string_value(&ctx, &namespace)
+        }
+    }
+
+    // https://dom.spec.whatwg.org/#dom-attr-value
+    #[qjs(get)]
+    fn value(&self, ctx: Ctx<'_>) -> Result<String> {
+        attr_value(&ctx, self.id)
+    }
+
+    #[qjs(set, rename = "value")]
+    fn set_value(&self, ctx: Ctx<'_>, value: WebIdlString) -> Result<()> {
+        set_attr_value(&ctx, self.id, value.0)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-node-nodevalue
+    #[qjs(get, rename = "nodeValue")]
+    fn node_value(&self, ctx: Ctx<'_>) -> Result<String> {
+        attr_value(&ctx, self.id)
+    }
+
+    #[qjs(set, rename = "nodeValue")]
+    fn set_node_value(&self, ctx: Ctx<'_>, value: WebIdlString) -> Result<()> {
+        set_attr_value(&ctx, self.id, value.0)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-node-textcontent
+    #[qjs(get, rename = "textContent")]
+    fn text_content(&self, ctx: Ctx<'_>) -> Result<String> {
+        attr_value(&ctx, self.id)
+    }
+
+    #[qjs(set, rename = "textContent")]
+    fn set_text_content(&self, ctx: Ctx<'_>, value: WebIdlString) -> Result<()> {
+        set_attr_value(&ctx, self.id, value.0)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-attr-ownerelement
+    #[qjs(get, rename = "ownerElement")]
+    fn owner_element<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
+        child_value(&ctx, attr_owner(&ctx, self.id))
+    }
+
+    // https://dom.spec.whatwg.org/#dom-attr-specified
+    #[qjs(get)]
+    fn specified(&self) -> bool {
+        true
+    }
+
+    #[qjs(get, rename = "nodeType")]
+    fn node_type(&self) -> i32 {
+        2
+    }
+
+    #[qjs(get, rename = "nodeName")]
+    fn node_name(&self, ctx: Ctx<'_>) -> Result<String> {
+        Ok(attr_state(&ctx, self.id)?.qualified)
+    }
+
+    #[qjs(get, rename = "ownerDocument")]
+    fn owner_document<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
+        let document = world(&ctx)?
+            .borrow()
+            .parsed
+            .as_ref()
+            .map(|parsed| parsed.dom.document());
+        child_value(&ctx, document)
+    }
+}
+
+/// `NamedNodeMap`, live over the element's attribute list
+/// (<https://dom.spec.whatwg.org/#interface-namednodemap>).
+#[derive(Trace, rquickjs::JsLifetime)]
+#[rquickjs::class(rename = "NamedNodeMap")]
+pub struct JsNamedNodeMap {
+    element: Handle,
+}
+
+#[rquickjs::methods]
+#[allow(
+    clippy::needless_pass_by_value,
+    clippy::unused_self,
+    reason = "rquickjs method ABI passes Ctx by value"
+)]
+impl JsNamedNodeMap {
+    #[qjs(constructor)]
+    fn ctor(ctx: Ctx<'_>) -> Result<Self> {
+        Err(Exception::throw_type(&ctx, "Illegal constructor"))
+    }
+
+    // https://dom.spec.whatwg.org/#dom-namednodemap-length
+    #[qjs(get)]
+    fn length(&self, ctx: Ctx<'_>) -> Result<usize> {
+        let world = world(&ctx)?;
+        let parsed = world.borrow();
+        let Some(parsed) = parsed.parsed.as_ref() else {
+            return Ok(0);
+        };
+        Ok(parsed
+            .dom
+            .attributes(self.element.0)
+            .map_or(0, <[dom::Attribute]>::len))
+    }
+
+    // https://dom.spec.whatwg.org/#dom-namednodemap-item
+    #[qjs(rename = "item")]
+    fn item<'js>(&self, ctx: Ctx<'js>, index: i64) -> Result<Value<'js>> {
+        let Some(attribute) = attribute_at(&ctx, self.element.0, index)? else {
+            return Ok(Value::new_null(ctx));
+        };
+        match attached_attr_id(&ctx, self.element.0, &attribute.0, &attribute.1)? {
+            Some(id) => attr_wrapper(&ctx, id),
+            None => Ok(Value::new_null(ctx)),
+        }
+    }
+
+    // https://dom.spec.whatwg.org/#dom-namednodemap-getnameditem
+    #[qjs(rename = "getNamedItem")]
+    fn get_named_item<'js>(&self, ctx: Ctx<'js>, name: WebIdlString) -> Result<Value<'js>> {
+        named_item(&ctx, self.element.0, &name.0)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-namednodemap-getnameditemns
+    #[qjs(rename = "getNamedItemNS")]
+    fn get_named_item_ns<'js>(
+        &self,
+        ctx: Ctx<'js>,
+        namespace: OptString,
+        local: WebIdlString,
+    ) -> Result<Value<'js>> {
+        let namespace = namespace.0.unwrap_or_default();
+        match attached_attr_id(&ctx, self.element.0, &namespace, &local.0)? {
+            Some(id) => attr_wrapper(&ctx, id),
+            None => Ok(Value::new_null(ctx)),
+        }
+    }
+
+    // https://dom.spec.whatwg.org/#dom-namednodemap-setnameditem
+    #[qjs(rename = "setNamedItem")]
+    fn set_named_item<'js>(&self, ctx: Ctx<'js>, attr: Value<'js>) -> Result<Value<'js>> {
+        set_attribute_node(&ctx, self.element.0, &attr)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-namednodemap-setnameditemns
+    #[qjs(rename = "setNamedItemNS")]
+    fn set_named_item_ns<'js>(&self, ctx: Ctx<'js>, attr: Value<'js>) -> Result<Value<'js>> {
+        set_attribute_node(&ctx, self.element.0, &attr)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-namednodemap-removenameditem
+    #[qjs(rename = "removeNamedItem")]
+    fn remove_named_item<'js>(&self, ctx: Ctx<'js>, name: WebIdlString) -> Result<Value<'js>> {
+        let name = if element_is_html(&ctx, self.element.0) {
+            name.0.to_ascii_lowercase()
+        } else {
+            name.0
+        };
+        let world_rc = world(&ctx)?;
+        let found = {
+            let world = world_rc.borrow();
+            let Some(parsed) = world.parsed.as_ref() else {
+                return Err(throw_dom(&ctx, "NotFoundError", "no such attribute"));
+            };
+            parsed.dom.attributes(self.element.0).and_then(|list| {
+                list.iter()
+                    .find(|attribute| qualified_name(&attribute.name) == name)
+                    .map(|attribute| {
+                        (
+                            attribute.name.ns.to_string(),
+                            attribute.name.local.to_string(),
+                        )
+                    })
+            })
+        };
+        let Some((namespace, local)) = found else {
+            return Err(throw_dom(&ctx, "NotFoundError", "no such attribute"));
+        };
+        let value = match attached_attr_id(&ctx, self.element.0, &namespace, &local)? {
+            Some(id) => attr_wrapper(&ctx, id)?,
+            None => Value::new_null(ctx.clone()),
+        };
+        remove_attribute_sync(&ctx, self.element.0, &namespace, &local, true)?;
+        Ok(value)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-namednodemap-removenameditemns
+    #[qjs(rename = "removeNamedItemNS")]
+    fn remove_named_item_ns<'js>(
+        &self,
+        ctx: Ctx<'js>,
+        namespace: OptString,
+        local: WebIdlString,
+    ) -> Result<Value<'js>> {
+        let namespace = namespace.0.unwrap_or_default();
+        let value = match attached_attr_id(&ctx, self.element.0, &namespace, &local.0)? {
+            Some(id) => attr_wrapper(&ctx, id)?,
+            None => return Err(throw_dom(&ctx, "NotFoundError", "no such attribute")),
+        };
+        remove_attribute_sync(&ctx, self.element.0, &namespace, &local.0, true)?;
+        Ok(value)
+    }
+}
+
+/// `(namespace, local)` of the attribute at `index`, if any.
+fn attribute_at(ctx: &Ctx<'_>, element: NodeId, index: i64) -> Result<Option<(String, String)>> {
+    let world_rc = world(ctx)?;
+    let world = world_rc.borrow();
+    let Some(parsed) = world.parsed.as_ref() else {
+        return Ok(None);
+    };
+    let Some(list) = parsed.dom.attributes(element) else {
+        return Ok(None);
+    };
+    Ok(usize::try_from(index)
+        .ok()
+        .and_then(|index| list.get(index))
+        .map(|attribute| {
+            (
+                attribute.name.ns.to_string(),
+                attribute.name.local.to_string(),
+            )
+        }))
+}
+
+/// The attribute with qualified name `name`, as an `Attr` wrapper.
+fn named_item<'js>(ctx: &Ctx<'js>, element: NodeId, name: &str) -> Result<Value<'js>> {
+    let name = if element_is_html(ctx, element) {
+        name.to_ascii_lowercase()
+    } else {
+        name.to_owned()
+    };
+    let world_rc = world(ctx)?;
+    let found = {
+        let world = world_rc.borrow();
+        let Some(parsed) = world.parsed.as_ref() else {
+            return Ok(Value::new_null(ctx.clone()));
+        };
+        parsed.dom.attributes(element).and_then(|list| {
+            list.iter()
+                .find(|attribute| qualified_name(&attribute.name) == name)
+                .map(|attribute| {
+                    (
+                        attribute.name.ns.to_string(),
+                        attribute.name.local.to_string(),
+                    )
+                })
+        })
+    };
+    match found {
+        Some((namespace, local)) => match attached_attr_id(ctx, element, &namespace, &local)? {
+            Some(id) => attr_wrapper(ctx, id),
+            None => Ok(Value::new_null(ctx.clone())),
+        },
+        None => Ok(Value::new_null(ctx.clone())),
+    }
+}
+
+// ── Attr registry helpers ────────────────────────────────────────────────
+
+fn attr_state(ctx: &Ctx<'_>, id: u64) -> Result<AttrState> {
+    let world_rc = world(ctx)?;
+    let world = world_rc.borrow();
+    world
+        .attrs
+        .get(&id)
+        .map(|state| AttrState {
+            namespace: state.namespace.clone(),
+            prefix: state.prefix.clone(),
+            local: state.local.clone(),
+            qualified: state.qualified.clone(),
+        })
+        .ok_or_else(|| Exception::throw_type(ctx, "stale attribute"))
+}
+
+/// The attached element for `id`, or `None` when detached.
+fn attr_owner(ctx: &Ctx<'_>, id: u64) -> Option<NodeId> {
+    let world_rc = world(ctx).ok()?;
+    let world = world_rc.borrow();
+    let owner = world.attr_owners.get(&id).copied().flatten()?;
+    let state = world.attrs.get(&id)?;
+    let parsed = world.parsed.as_ref()?;
+    parsed
+        .dom
+        .attribute_ns(owner, &state.namespace, &state.local)
+        .map(|_| owner)
+}
+
+fn attr_value(ctx: &Ctx<'_>, id: u64) -> Result<String> {
+    if let Some(owner) = attr_owner(ctx, id) {
+        let world_rc = world(ctx)?;
+        let world = world_rc.borrow();
+        if let Some(state) = world.attrs.get(&id)
+            && let Some(parsed) = world.parsed.as_ref()
+            && let Some(value) = parsed
+                .dom
+                .attribute_ns(owner, &state.namespace, &state.local)
+        {
+            return Ok(value);
+        }
+    }
+    let world_rc = world(ctx)?;
+    Ok(world_rc
+        .borrow()
+        .attr_values
+        .get(&id)
+        .cloned()
+        .unwrap_or_default())
+}
+
+fn set_attr_value(ctx: &Ctx<'_>, id: u64, value: String) -> Result<()> {
+    let world_rc = world(ctx)?;
+    let mut world = world_rc.borrow_mut();
+    world.attr_values.insert(id, value.clone());
+    let Some(owner) = world.attr_owners.get(&id).copied().flatten() else {
+        return Ok(());
+    };
+    let Some(state) = world.attrs.get(&id) else {
+        return Ok(());
+    };
+    let (namespace, prefix, local) = (
+        state.namespace.clone(),
+        state.prefix.clone(),
+        state.local.clone(),
+    );
+    let Some(parsed) = world.parsed.as_mut() else {
+        return Ok(());
+    };
+    parsed
+        .dom
+        .set_attribute_by_ns(owner, &namespace, prefix.as_deref(), &local, value)
+        .map_err(|err| throw_dom_error(ctx, err))
+}
+
+/// Rebuilds the `NamedNodeMap` object's own index and named properties
+/// (<https://dom.spec.whatwg.org/#interface-namednodemap>: named properties
+/// never shadow interface members). HTML elements expose only qualified
+/// names that survive ASCII lowercasing, since the named getter lowercases
+/// (Firefox: `nsDOMAttributeMap::GetSupportedNames`).
+fn refresh_named_node_map<'js>(ctx: &Ctx<'js>, element: NodeId, map: &Value<'js>) -> Result<()> {
+    let html = element_is_html(ctx, element);
+    let names: Vec<String> = {
+        let world_rc = world(ctx)?;
+        let world = world_rc.borrow();
+        world
+            .parsed
+            .as_ref()
+            .map(|parsed| parsed.dom.attribute_names(element))
+            .unwrap_or_default()
+    };
+    let refresh: Function = ctx.globals().get("__tb_refreshNamedNodeMap")?;
+    refresh.call::<_, ()>((map.clone(), names, html))?;
+    Ok(())
+}
+
+/// Refreshes the cached `NamedNodeMap` after a mutation, when one exists.
+fn touch_named_node_map(ctx: &Ctx<'_>, element: NodeId) -> Result<()> {
+    let world_rc = world(ctx)?;
+    let Some(saved) = world_rc.borrow().named_node_map(element) else {
+        return Ok(());
+    };
+    if let Some(value) = deref_weak(ctx, saved)? {
+        refresh_named_node_map(ctx, element, &value)?;
+    }
+    Ok(())
+}
+
+/// The `Attr` id attached at `(element, namespace, local)`, creating the
+/// platform object's identity on first access. Clears a stale mapping when
+/// the attribute is gone.
+fn attached_attr_id(
+    ctx: &Ctx<'_>,
+    element: NodeId,
+    namespace: &str,
+    local: &str,
+) -> Result<Option<u64>> {
+    let world_rc = world(ctx)?;
+    let mut world = world_rc.borrow_mut();
+    let info = {
+        let Some(parsed) = world.parsed.as_ref() else {
+            return Ok(None);
+        };
+        parsed.dom.attributes(element).and_then(|list| {
+            list.iter()
+                .find(|attribute| {
+                    attribute.name.ns.as_ref() == namespace
+                        && attribute.name.local.as_ref() == local
+                })
+                .map(|attribute| {
+                    (
+                        attribute
+                            .name
+                            .prefix
+                            .as_ref()
+                            .filter(|prefix| !prefix.is_empty())
+                            .map(ToString::to_string),
+                        qualified_name(&attribute.name),
+                        attribute.value.clone(),
+                    )
+                })
+        })
+    };
+    let key = (element, namespace.to_owned(), local.to_owned());
+    let Some((prefix, qualified, value)) = info else {
+        if let Some(id) = world.attr_ids.remove(&key) {
+            world.attr_owners.insert(id, None);
+        }
+        return Ok(None);
+    };
+    if let Some(&id) = world.attr_ids.get(&key) {
+        world.attr_values.insert(id, value);
+        world.attr_owners.insert(id, Some(element));
+        return Ok(Some(id));
+    }
+    let id = world.next_attr_id;
+    world.next_attr_id += 1;
+    world.attrs.insert(
+        id,
+        AttrState {
+            namespace: namespace.to_owned(),
+            prefix,
+            local: local.to_owned(),
+            qualified,
+        },
+    );
+    world.attr_owners.insert(id, Some(element));
+    world.attr_values.insert(id, value);
+    world.attr_ids.insert(key, id);
+    Ok(Some(id))
+}
+
+/// Restores or creates the wrapper for an `Attr` id.
+fn attr_wrapper<'js>(ctx: &Ctx<'js>, id: u64) -> Result<Value<'js>> {
+    let world_rc = world(ctx)?;
+    if let Some(saved) = world_rc.borrow().attr_wrappers.get(&id).cloned()
+        && let Some(value) = deref_weak(ctx, saved)?
+    {
+        return Ok(value);
+    }
+    let class = Class::instance(ctx.clone(), JsAttr { id })?;
+    let value = Class::into_value(class);
+    let weak = make_weak(ctx, value.clone())?;
+    world_rc
+        .borrow_mut()
+        .attr_wrappers
+        .insert(id, Persistent::save(ctx, weak));
+    Ok(value)
+}
+
+/// Creates a detached `Attr` identity; attaches via `setAttributeNode`.
+fn new_detached_attr(
+    ctx: &Ctx<'_>,
+    namespace: String,
+    prefix: Option<String>,
+    local: String,
+    qualified: String,
+) -> Result<u64> {
+    let world_rc = world(ctx)?;
+    let mut world = world_rc.borrow_mut();
+    let id = world.next_attr_id;
+    world.next_attr_id += 1;
+    world.attrs.insert(
+        id,
+        AttrState {
+            namespace,
+            prefix,
+            local,
+            qualified,
+        },
+    );
+    world.attr_owners.insert(id, None);
+    world.attr_values.insert(id, String::new());
+    Ok(id)
+}
+
+/// Marks the `Attr` at `(element, namespace, local)` detached.
+fn detach_attr(ctx: &Ctx<'_>, element: NodeId, namespace: &str, local: &str) -> Result<()> {
+    let world_rc = world(ctx)?;
+    let mut world = world_rc.borrow_mut();
+    if let Some(id) = world
+        .attr_ids
+        .remove(&(element, namespace.to_owned(), local.to_owned()))
+    {
+        world.attr_owners.insert(id, None);
+    }
+    drop(world);
+    touch_named_node_map(ctx, element)
+}
+
+/// Keeps an existing attached `Attr` wrapper in sync after a value change.
+fn touch_attr(
+    ctx: &Ctx<'_>,
+    element: NodeId,
+    namespace: &str,
+    local: &str,
+    value: &str,
+) -> Result<()> {
+    let world_rc = world(ctx)?;
+    let mut world = world_rc.borrow_mut();
+    if let Some(&id) = world
+        .attr_ids
+        .get(&(element, namespace.to_owned(), local.to_owned()))
+    {
+        world.attr_values.insert(id, value.to_owned());
+        world.attr_owners.insert(id, Some(element));
+    }
+    drop(world);
+    touch_named_node_map(ctx, element)
+}
+
+/// Removes the DOM attribute identified by `(namespace, local)` and syncs
+/// the registry; used by `removeAttributeNode` and `NamedNodeMap.remove*`.
+fn remove_attribute_sync(
+    ctx: &Ctx<'_>,
+    element: NodeId,
+    namespace: &str,
+    local: &str,
+    by_namespace: bool,
+) -> Result<()> {
+    let world_rc = world(ctx)?;
+    let mut world = world_rc.borrow_mut();
+    let Some(parsed) = world.parsed.as_mut() else {
+        return Ok(());
+    };
+    let result = if by_namespace {
+        parsed
+            .dom
+            .remove_attribute_ns(element, namespace, local)
+            .map_err(|err| throw_dom_error(ctx, err))
+    } else {
+        parsed
+            .dom
+            .remove_attribute(element, local)
+            .map_err(|err| throw_dom_error(ctx, err))
+    };
+    result?;
+    if let Some(id) = world
+        .attr_ids
+        .remove(&(element, namespace.to_owned(), local.to_owned()))
+    {
+        world.attr_owners.insert(id, None);
+    }
+    drop(world);
+    touch_named_node_map(ctx, element)
+}
+
+/// `setAttributeNode` / `setAttributeNodeNS`
+/// (<https://dom.spec.whatwg.org/#concept-element-attributes-set>).
+fn set_attribute_node<'js>(
+    ctx: &Ctx<'js>,
+    element: NodeId,
+    attr: &Value<'js>,
+) -> Result<Value<'js>> {
+    let class = Class::<JsAttr>::from_js(ctx, attr.clone())
+        .map_err(|_| Exception::throw_type(ctx, "argument is not an Attr"))?;
+    let id = class.borrow().id;
+    let state = attr_state(ctx, id)?;
+    let owner = attr_owner(ctx, id);
+    if let Some(owner) = owner
+        && owner != element
+    {
+        return Err(throw_dom(
+            ctx,
+            "InUseAttributeError",
+            "attribute is already associated with another element",
+        ));
+    }
+    let value = attr_value(ctx, id)?;
+    // The previous Attr with this identity becomes detached and is returned.
+    let previous = {
+        let world_rc = world(ctx)?;
+        let key = (element, state.namespace.clone(), state.local.clone());
+        world_rc
+            .borrow()
+            .attr_ids
+            .get(&key)
+            .copied()
+            .filter(|previous| *previous != id)
+    };
+    // Setting an attribute that is already attached here is a no-op that
+    // returns the attribute itself
+    // (<https://dom.spec.whatwg.org/#concept-element-attributes-set> step 4).
+    if previous.is_none() && attr_owner(ctx, id) == Some(element) && {
+        let world_rc = world(ctx)?;
+        let world = world_rc.borrow();
+        world
+            .attr_ids
+            .get(&(element, state.namespace.clone(), state.local.clone()))
+            == Some(&id)
+    } {
+        return Ok(attr.clone());
+    }
+    {
+        let world_rc = world(ctx)?;
+        let mut world = world_rc.borrow_mut();
+        if let Some(previous) = previous {
+            world.attr_owners.insert(previous, None);
+        }
+        let Some(parsed) = world.parsed.as_mut() else {
+            return Err(Exception::throw_type(ctx, "no document"));
+        };
+        parsed
+            .dom
+            .set_attribute_by_ns(
+                element,
+                &state.namespace,
+                state.prefix.as_deref(),
+                &state.local,
+                value.clone(),
+            )
+            .map_err(|err| throw_dom_error(ctx, err))?;
+        world.attr_values.insert(id, value);
+        world.attr_owners.insert(id, Some(element));
+        world
+            .attr_ids
+            .insert((element, state.namespace.clone(), state.local.clone()), id);
+    }
+    touch_named_node_map(ctx, element)?;
+    match previous {
+        Some(previous) => attr_wrapper(ctx, previous),
+        None => Ok(Value::new_null(ctx.clone())),
+    }
 }
 
 /// Builds and throws a `DOMException` from Rust with a real prototype, so
@@ -681,6 +1372,49 @@ impl JsNode {
         create_kind(&ctx, |dom| dom.create_comment(data))
     }
 
+    // https://dom.spec.whatwg.org/#dom-document-createattribute
+    #[qjs(rename = "createAttribute")]
+    fn create_attribute<'js>(&self, ctx: Ctx<'js>, name: WebIdlString) -> Result<Value<'js>> {
+        if !valid_attribute_local_name(&name.0) {
+            return Err(throw_dom(
+                &ctx,
+                "InvalidCharacterError",
+                "attribute name is not a valid attribute local name",
+            ));
+        }
+        let id = new_detached_attr(&ctx, String::new(), None, name.0.clone(), name.0)?;
+        attr_wrapper(&ctx, id)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-document-createattributens
+    #[qjs(rename = "createAttributeNS")]
+    fn create_attribute_ns<'js>(
+        &self,
+        ctx: Ctx<'js>,
+        namespace: OptString,
+        qualified: WebIdlString,
+    ) -> Result<Value<'js>> {
+        let name = validate_and_extract(
+            &ctx,
+            namespace.0.as_deref(),
+            &qualified.0,
+            NodeContext::Attribute,
+        )?;
+        let prefix = name
+            .prefix
+            .as_ref()
+            .filter(|prefix| !prefix.is_empty())
+            .map(ToString::to_string);
+        let id = new_detached_attr(
+            &ctx,
+            name.ns.to_string(),
+            prefix,
+            name.local.to_string(),
+            qualified_name(&name),
+        )?;
+        attr_wrapper(&ctx, id)
+    }
+
     // https://dom.spec.whatwg.org/#dom-document-createdocumentfragment
     #[qjs(rename = "createDocumentFragment")]
     fn create_document_fragment<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
@@ -722,13 +1456,6 @@ impl JsNode {
 
     #[qjs(rename = "getElementsByTagName")]
     fn get_elements_by_tag_name<'js>(&self, ctx: Ctx<'js>, name: String) -> Result<Value<'js>> {
-        // An HTML document lowercases the queried qualified name
-        // (<https://dom.spec.whatwg.org/#concept-getelementsbytagname>).
-        let name = if is_html_document(&ctx) {
-            name.to_ascii_lowercase()
-        } else {
-            name
-        };
         elements_by_tag(&ctx, self.handle.0, &name)
     }
 
@@ -891,18 +1618,26 @@ impl JsNode {
             return Err(throw_dom(
                 &ctx,
                 "InvalidCharacterError",
-                "attribute name does not match the XML Name production",
+                "attribute name is not a valid attribute local name",
             ));
         }
-        let world = world(&ctx)?;
-        let mut world = world.borrow_mut();
-        let Some(parsed) = world.parsed.as_mut() else {
-            return Err(Exception::throw_type(&ctx, "no document"));
+        let local = if element_is_html(&ctx, self.handle.0) {
+            name.to_ascii_lowercase()
+        } else {
+            name
         };
-        parsed
-            .dom
-            .set_attribute(self.handle.0, &name, value.0)
-            .map_err(|err| throw_dom_error(&ctx, err))
+        {
+            let world = world(&ctx)?;
+            let mut world = world.borrow_mut();
+            let Some(parsed) = world.parsed.as_mut() else {
+                return Err(Exception::throw_type(&ctx, "no document"));
+            };
+            parsed
+                .dom
+                .set_attribute(self.handle.0, &local, value.0.clone())
+                .map_err(|err| throw_dom_error(&ctx, err))?;
+        }
+        touch_attr(&ctx, self.handle.0, "", &local, &value.0)
     }
 
     #[qjs(get)]
@@ -1678,15 +2413,31 @@ impl JsNode {
             &qualified.0,
             NodeContext::Attribute,
         )?;
-        let world = world(&ctx)?;
-        let mut world = world.borrow_mut();
-        let Some(parsed) = world.parsed.as_mut() else {
-            return Err(Exception::throw_type(&ctx, "no document"));
-        };
-        parsed
-            .dom
-            .set_attribute_named(self.handle.0, name, value.0)
-            .map_err(|err| throw_dom_error(&ctx, err))
+        let namespace = name.ns.to_string();
+        let prefix = name
+            .prefix
+            .as_ref()
+            .filter(|prefix| !prefix.is_empty())
+            .map(ToString::to_string);
+        let local = name.local.to_string();
+        {
+            let world = world(&ctx)?;
+            let mut world = world.borrow_mut();
+            let Some(parsed) = world.parsed.as_mut() else {
+                return Err(Exception::throw_type(&ctx, "no document"));
+            };
+            parsed
+                .dom
+                .set_attribute_by_ns(
+                    self.handle.0,
+                    &namespace,
+                    prefix.as_deref(),
+                    &local,
+                    value.0.clone(),
+                )
+                .map_err(|err| throw_dom_error(&ctx, err))?;
+        }
+        touch_attr(&ctx, self.handle.0, &namespace, &local, &value.0)
     }
 
     // https://dom.spec.whatwg.org/#dom-element-removeattribute
@@ -1695,15 +2446,23 @@ impl JsNode {
         if !valid_attribute_local_name(&name.0) {
             return Ok(());
         }
-        let world = world(&ctx)?;
-        let mut world = world.borrow_mut();
-        let Some(parsed) = world.parsed.as_mut() else {
-            return Ok(());
+        let local = if element_is_html(&ctx, self.handle.0) {
+            name.0.to_ascii_lowercase()
+        } else {
+            name.0
         };
-        parsed
-            .dom
-            .remove_attribute(self.handle.0, &name.0)
-            .map_err(|err| throw_dom_error(&ctx, err))
+        {
+            let world = world(&ctx)?;
+            let mut world = world.borrow_mut();
+            let Some(parsed) = world.parsed.as_mut() else {
+                return Ok(());
+            };
+            parsed
+                .dom
+                .remove_attribute(self.handle.0, &local)
+                .map_err(|err| throw_dom_error(&ctx, err))?;
+        }
+        detach_attr(&ctx, self.handle.0, "", &local)
     }
 
     // https://dom.spec.whatwg.org/#dom-element-removeattributens
@@ -1715,15 +2474,18 @@ impl JsNode {
         local: WebIdlString,
     ) -> Result<()> {
         let namespace = namespace.0.unwrap_or_default();
-        let world = world(&ctx)?;
-        let mut world = world.borrow_mut();
-        let Some(parsed) = world.parsed.as_mut() else {
-            return Ok(());
-        };
-        parsed
-            .dom
-            .remove_attribute_ns(self.handle.0, &namespace, &local.0)
-            .map_err(|err| throw_dom_error(&ctx, err))
+        {
+            let world = world(&ctx)?;
+            let mut world = world.borrow_mut();
+            let Some(parsed) = world.parsed.as_mut() else {
+                return Ok(());
+            };
+            parsed
+                .dom
+                .remove_attribute_ns(self.handle.0, &namespace, &local.0)
+                .map_err(|err| throw_dom_error(&ctx, err))?;
+        }
+        detach_attr(&ctx, self.handle.0, &namespace, &local.0)
     }
 
     // https://dom.spec.whatwg.org/#dom-element-getattributenames
@@ -1738,6 +2500,115 @@ impl JsNode {
             .unwrap_or_default())
     }
 
+    // https://dom.spec.whatwg.org/#dom-element-attributes
+    #[qjs(get)]
+    fn attributes<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
+        let world_rc = world(&ctx)?;
+        if let Some(saved) = world_rc.borrow().named_node_map(self.handle.0)
+            && let Some(value) = deref_weak(&ctx, saved)?
+        {
+            refresh_named_node_map(&ctx, self.handle.0, &value)?;
+            return Ok(value);
+        }
+        let class = Class::instance(
+            ctx.clone(),
+            JsNamedNodeMap {
+                element: self.handle,
+            },
+        )?;
+        let value = Class::into_value(class);
+        refresh_named_node_map(&ctx, self.handle.0, &value)?;
+        let weak = make_weak(&ctx, value.clone())?;
+        world_rc
+            .borrow_mut()
+            .intern_named_node_map(self.handle.0, Persistent::save(&ctx, weak));
+        Ok(value)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-element-hasattributes
+    #[qjs(rename = "hasAttributes")]
+    fn has_attributes(&self, ctx: Ctx<'_>) -> Result<bool> {
+        let world = world(&ctx)?;
+        let parsed = world.borrow();
+        let Some(parsed) = parsed.parsed.as_ref() else {
+            return Ok(false);
+        };
+        Ok(parsed
+            .dom
+            .attributes(self.handle.0)
+            .is_some_and(|list| !list.is_empty()))
+    }
+
+    // https://dom.spec.whatwg.org/#dom-element-getattributenode
+    #[qjs(rename = "getAttributeNode")]
+    fn get_attribute_node<'js>(&self, ctx: Ctx<'js>, name: WebIdlString) -> Result<Value<'js>> {
+        if !valid_attribute_local_name(&name.0) {
+            return Ok(Value::new_null(ctx));
+        }
+        let name = if element_is_html(&ctx, self.handle.0) {
+            name.0.to_ascii_lowercase()
+        } else {
+            name.0
+        };
+        match attached_attr_id(&ctx, self.handle.0, "", &name)? {
+            Some(id) => attr_wrapper(&ctx, id),
+            None => Ok(Value::new_null(ctx)),
+        }
+    }
+
+    // https://dom.spec.whatwg.org/#dom-element-getattributenodens
+    #[qjs(rename = "getAttributeNodeNS")]
+    fn get_attribute_node_ns<'js>(
+        &self,
+        ctx: Ctx<'js>,
+        namespace: OptString,
+        local: WebIdlString,
+    ) -> Result<Value<'js>> {
+        let namespace = namespace.0.unwrap_or_default();
+        match attached_attr_id(&ctx, self.handle.0, &namespace, &local.0)? {
+            Some(id) => attr_wrapper(&ctx, id),
+            None => Ok(Value::new_null(ctx)),
+        }
+    }
+
+    // https://dom.spec.whatwg.org/#dom-element-setattributenode
+    #[qjs(rename = "setAttributeNode")]
+    fn set_attribute_node<'js>(&self, ctx: Ctx<'js>, attr: Value<'js>) -> Result<Value<'js>> {
+        set_attribute_node(&ctx, self.handle.0, &attr)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-element-setattributenodens
+    #[qjs(rename = "setAttributeNodeNS")]
+    fn set_attribute_node_ns<'js>(&self, ctx: Ctx<'js>, attr: Value<'js>) -> Result<Value<'js>> {
+        set_attribute_node(&ctx, self.handle.0, &attr)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-element-removeattributenode
+    #[qjs(rename = "removeAttributeNode")]
+    fn remove_attribute_node<'js>(&self, ctx: Ctx<'js>, attr: Value<'js>) -> Result<Value<'js>> {
+        let class = Class::<JsAttr>::from_js(&ctx, attr.clone())
+            .map_err(|_| Exception::throw_type(&ctx, "argument is not an Attr"))?;
+        let id = class.borrow().id;
+        let state = attr_state(&ctx, id)?;
+        let attached_here = attr_owner(&ctx, id) == Some(self.handle.0) && {
+            let world_rc = world(&ctx)?;
+            let world = world_rc.borrow();
+            world
+                .attr_ids
+                .get(&(self.handle.0, state.namespace.clone(), state.local.clone()))
+                == Some(&id)
+        };
+        if !attached_here {
+            return Err(throw_dom(
+                &ctx,
+                "NotFoundError",
+                "attribute is not attached to this element",
+            ));
+        }
+        remove_attribute_sync(&ctx, self.handle.0, &state.namespace, &state.local, true)?;
+        Ok(attr)
+    }
+
     // https://dom.spec.whatwg.org/#dom-element-toggleattribute
     #[qjs(rename = "toggleAttribute")]
     fn toggle_attribute(&self, ctx: Ctx<'_>, name: WebIdlString, force: Opt<bool>) -> Result<bool> {
@@ -1745,26 +2616,41 @@ impl JsNode {
             return Err(throw_dom(
                 &ctx,
                 "InvalidCharacterError",
-                "attribute name does not match the XML Name production",
+                "attribute name is not a valid attribute local name",
             ));
         }
-        let world = world(&ctx)?;
-        let mut world = world.borrow_mut();
-        let Some(parsed) = world.parsed.as_mut() else {
-            return Err(Exception::throw_type(&ctx, "no document"));
+        let local = if element_is_html(&ctx, self.handle.0) {
+            name.0.to_ascii_lowercase()
+        } else {
+            name.0
         };
-        let exists = parsed.dom.has_attribute(self.handle.0, &name.0);
-        let should_exist = force.0.unwrap_or(!exists);
-        if should_exist && !exists {
-            parsed
-                .dom
-                .set_attribute(self.handle.0, &name.0, String::new())
-                .map_err(|err| throw_dom_error(&ctx, err))?;
-        } else if !should_exist && exists {
-            parsed
-                .dom
-                .remove_attribute(self.handle.0, &name.0)
-                .map_err(|err| throw_dom_error(&ctx, err))?;
+        let (should_exist, changed) = {
+            let world = world(&ctx)?;
+            let mut world = world.borrow_mut();
+            let Some(parsed) = world.parsed.as_mut() else {
+                return Err(Exception::throw_type(&ctx, "no document"));
+            };
+            let exists = parsed.dom.has_attribute(self.handle.0, &local);
+            let should_exist = force.0.unwrap_or(!exists);
+            if should_exist && !exists {
+                parsed
+                    .dom
+                    .set_attribute(self.handle.0, &local, String::new())
+                    .map_err(|err| throw_dom_error(&ctx, err))?;
+            } else if !should_exist && exists {
+                parsed
+                    .dom
+                    .remove_attribute(self.handle.0, &local)
+                    .map_err(|err| throw_dom_error(&ctx, err))?;
+            }
+            (should_exist, should_exist != exists)
+        };
+        if changed {
+            if should_exist {
+                touch_attr(&ctx, self.handle.0, "", &local, "")?;
+            } else {
+                detach_attr(&ctx, self.handle.0, "", &local)?;
+            }
         }
         Ok(should_exist)
     }
@@ -2258,6 +3144,22 @@ fn is_html_document(ctx: &Ctx<'_>) -> bool {
     world(ctx).is_ok_and(|world| world.borrow().parsed.is_some())
 }
 
+/// Whether `id` names an element in the HTML namespace.
+fn element_is_html(ctx: &Ctx<'_>, id: NodeId) -> bool {
+    let Ok(world) = world(ctx) else {
+        return false;
+    };
+    let parsed = world.borrow();
+    matches!(
+        parsed
+            .parsed
+            .as_ref()
+            .and_then(|parsed| parsed.dom.get(id))
+            .map(|node| node.kind()),
+        Some(NodeKind::Element { name, .. }) if name.ns == html_namespace()
+    )
+}
+
 /// [Converting nodes into a node](https://dom.spec.whatwg.org/#convert-nodes-into-a-node):
 /// strings become `Text`, one node stays itself, several become a fragment.
 fn convert_nodes_into_node<'js>(ctx: &Ctx<'js>, nodes: Rest<Value<'js>>) -> Result<NodeId> {
@@ -2322,6 +3224,8 @@ pub(super) fn install(ctx: &Ctx<'_>, world: &Rc<RefCell<World>>) -> Result<()> {
     Class::<JsDomException>::define(&globals)?;
     Class::<JsImplementation>::define(&globals)?;
     Class::<JsTokenList>::define(&globals)?;
+    Class::<JsAttr>::define(&globals)?;
+    Class::<JsNamedNodeMap>::define(&globals)?;
     install_brands(ctx)?;
     install_collection_brand(ctx)?;
     install_dom_exception_codes(ctx)?;
@@ -2638,7 +3542,8 @@ const INSTALL_BRANDS_JS: &str = r"
   }
   const DocumentInterface = define('Document', NodeInterface, [
     'createElement', 'createElementNS', 'createTextNode', 'createComment',
-    'createDocumentFragment', 'write', 'getElementById', 'getElementsByTagName',
+    'createAttribute', 'createAttributeNS', 'createDocumentFragment', 'write',
+    'getElementById', 'getElementsByTagName',
     'getElementsByTagNameNS', 'getElementsByClassName',
     'body', 'documentElement', 'doctype', 'readyState', 'implementation',
     'children', 'firstElementChild', 'lastElementChild', 'childElementCount',
@@ -2651,12 +3556,15 @@ const INSTALL_BRANDS_JS: &str = r"
     'getAttribute',
     'setAttribute', 'hasAttribute', 'getAttributeNS', 'setAttributeNS',
     'hasAttributeNS', 'removeAttribute', 'removeAttributeNS',
-    'getAttributeNames', 'toggleAttribute', 'matches', 'closest', 'children',
+    'getAttributeNames', 'toggleAttribute', 'attributes', 'hasAttributes',
+    'getAttributeNode', 'getAttributeNodeNS', 'setAttributeNode',
+    'setAttributeNodeNS', 'removeAttributeNode', 'matches', 'closest',
+    'children',
     'firstElementChild', 'lastElementChild', 'childElementCount', 'append',
     'prepend', 'replaceChildren', 'querySelector', 'querySelectorAll',
     'before', 'after', 'replaceWith', 'previousElementSibling',
     'nextElementSibling', 'tagName', 'localName', 'prefix', 'namespaceURI',
-    'className', 'classList', 'id', 'src', 'name', 'content', 'remove'
+    'className', 'classList', 'id', 'src', 'name', 'content', 'style', 'remove'
   ]);
   // classList is `[PutForwards=value]`: assigning to it sets `.value`
   // (<https://dom.spec.whatwg.org/#dom-element-classlist>).
@@ -2793,9 +3701,8 @@ fn install_brands(ctx: &Ctx<'_>) -> Result<()> {
     Ok(())
 }
 
-fn install_collection_brand(ctx: &Ctx<'_>) -> Result<()> {
-    ctx.eval::<(), _>(
-        r"
+/// Collection and legacy index-property proxies for the browser realm.
+const INSTALL_COLLECTIONS_JS: &str = r"
 (function() {
   const native = globalThis.NodeList.prototype;
   const ctor = function() { throw new TypeError('Illegal constructor'); };
@@ -2812,6 +3719,18 @@ fn install_collection_brand(ctx: &Ctx<'_>) -> Result<()> {
     configurable: false,
     writable: false,
     value: function(target) {
+      // Only platform methods need binding to the target; Object.prototype
+      // built-ins like hasOwnProperty must see the proxy as `this`.
+      function isPlatformMethod(inner, property) {
+        let proto = Object.getPrototypeOf(inner);
+        while (proto && proto !== Object.prototype) {
+          if (Object.prototype.hasOwnProperty.call(proto, property)) {
+            return true;
+          }
+          proto = Object.getPrototypeOf(proto);
+        }
+        return false;
+      }
       return new Proxy(target, {
         get: function(inner, property) {
           if (typeof property === 'string' && /^(0|[1-9][0-9]*)$/.test(property)) {
@@ -2819,7 +3738,37 @@ fn install_collection_brand(ctx: &Ctx<'_>) -> Result<()> {
             return index < inner.length ? inner.item(index) : undefined;
           }
           const value = Reflect.get(inner, property, inner);
-          return typeof value === 'function' ? value.bind(inner) : value;
+          if (typeof value === 'function' && isPlatformMethod(inner, property)) {
+            return value.bind(inner);
+          }
+          return value;
+        },
+        has: function(inner, property) {
+          if (typeof property === 'string' && /^(0|[1-9][0-9]*)$/.test(property)) {
+            return Number(property) < inner.length;
+          }
+          return Reflect.has(inner, property);
+        },
+        ownKeys: function(inner) {
+          const keys = [];
+          for (let i = 0; i < inner.length; i++) {
+            keys.push(String(i));
+          }
+          return keys;
+        },
+        getOwnPropertyDescriptor: function(inner, property) {
+          if (typeof property === 'string' && /^(0|[1-9][0-9]*)$/.test(property)) {
+            const index = Number(property);
+            if (index < inner.length) {
+              return {
+                value: inner.item(index),
+                enumerable: true,
+                configurable: true,
+                writable: false,
+              };
+            }
+          }
+          return Reflect.getOwnPropertyDescriptor(inner, property);
         },
         set: function(inner, property, value) {
           if (typeof property === 'string' && /^(0|[1-9][0-9]*)$/.test(property)) {
@@ -2830,9 +3779,45 @@ fn install_collection_brand(ctx: &Ctx<'_>) -> Result<()> {
       });
     }
   });
+  // NamedNodeMap exposes both indexed and named properties, and its own
+  // property names are the indices followed by the qualified names
+  // (<https://dom.spec.whatwg.org/#interface-namednodemap>).
+  // NamedNodeMap exposes indexed and named properties as real own
+  // properties; interface members and prototype methods always win.
+  Object.defineProperty(globalThis, '__tb_refreshNamedNodeMap', {
+    enumerable: false,
+    configurable: false,
+    writable: false,
+    value: function(map, names, lowercaseOnly) {
+      for (const key of Object.getOwnPropertyNames(map)) {
+        delete map[key];
+      }
+      for (let i = 0; i < names.length; i++) {
+        const attr = map.item(i);
+        Object.defineProperty(map, String(i), {
+          value: attr,
+          enumerable: true,
+          configurable: true,
+          writable: false,
+        });
+        const name = names[i];
+        const named = !lowercaseOnly || !/[A-Z]/.test(name);
+        if (named && !(name in map)) {
+          Object.defineProperty(map, name, {
+            value: attr,
+            enumerable: false,
+            configurable: true,
+            writable: false,
+          });
+        }
+      }
+    }
+  });
 })();
-",
-    )?;
+";
+
+fn install_collection_brand(ctx: &Ctx<'_>) -> Result<()> {
+    ctx.eval::<(), _>(INSTALL_COLLECTIONS_JS)?;
     let ctor: Function = ctx.globals().get("HTMLCollection")?;
     let proto: Object = ctor.get("prototype")?;
     world(ctx)?
@@ -3373,6 +4358,10 @@ fn collection_ids(ctx: &Ctx<'_>, scope: NodeId, kind: &CollectionKind) -> Result
 }
 
 fn collect_by_tag(dom: &dom::Dom, scope: NodeId, name: &str) -> Vec<NodeId> {
+    // In an HTML document, an HTML-namespace element matches the queried
+    // name ASCII-lowercased; other elements match the name exactly
+    // (<https://dom.spec.whatwg.org/#concept-getelementsbytagname>).
+    let lowered = name.to_ascii_lowercase();
     let mut out = Vec::new();
     let mut stack: Vec<NodeId> = dom
         .children(scope)
@@ -3380,10 +4369,15 @@ fn collect_by_tag(dom: &dom::Dom, scope: NodeId, name: &str) -> Vec<NodeId> {
         .unwrap_or_default();
     stack.reverse();
     while let Some(id) = stack.pop() {
-        if let Some(NodeKind::Element { name: qual, .. }) = dom.get(id).map(|node| node.kind())
-            && (name == "*" || qualified_name(qual) == name)
-        {
-            out.push(id);
+        if let Some(NodeKind::Element { name: qual, .. }) = dom.get(id).map(|node| node.kind()) {
+            let matches = if qual.ns == html_namespace() {
+                qualified_name(qual) == lowered
+            } else {
+                qualified_name(qual) == name
+            };
+            if name == "*" || matches {
+                out.push(id);
+            }
         }
         if let Some(kids) = dom.children(id) {
             let mut kids: Vec<_> = kids.copied().collect();

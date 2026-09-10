@@ -7,7 +7,9 @@ use std::marker::PhantomData;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use crate::id::NodeId;
-use crate::node::{Attribute, LocalName, Namespace, Node, NodeKind, QualName, html_namespace};
+use crate::node::{
+    Attribute, LocalName, Namespace, Node, NodeKind, Prefix, QualName, html_namespace,
+};
 
 /// Next document id for a freshly constructed [`Dom`]. Relaxed arithmetic is
 /// enough: the only requirement is that two live `Dom` values do not share
@@ -882,11 +884,11 @@ impl Dom {
         Ok(())
     }
 
-    /// The value of the unnamespaced attribute `local` on element `id`.
+    /// The value of the attribute whose qualified name is `local` on element
+    /// `id`.
     ///
     /// [DOM getAttribute](https://dom.spec.whatwg.org/#dom-element-getattribute)
-    /// after HTML’s ASCII-lowercase name conversion
-    /// ([HTML attribute names](https://html.spec.whatwg.org/multipage/syntax.html#syntax-attribute-name)).
+    /// after HTML’s ASCII-lowercase name conversion.
     #[must_use]
     pub fn attribute(&self, id: NodeId, local: &str) -> Option<String> {
         self.find_attribute(id, local)
@@ -926,6 +928,16 @@ impl Dom {
         }
     }
 
+    /// The element's attribute list, or `None` when `id` is stale or not an
+    /// element. Used by the `NamedNodeMap` platform object.
+    #[must_use]
+    pub fn attributes(&self, id: NodeId) -> Option<&[Attribute]> {
+        match self.get(id).map(|node| node.kind()) {
+            Some(NodeKind::Element { attributes, .. }) => Some(attributes),
+            _ => None,
+        }
+    }
+
     /// [Element.removeAttribute](https://dom.spec.whatwg.org/#dom-element-removeattribute).
     ///
     /// # Errors
@@ -942,8 +954,13 @@ impl Dom {
         } else {
             local.to_owned()
         };
+        let mut removed = false;
         attributes.retain(|attribute| {
-            !(attribute.name.ns.is_empty() && attribute.name.local.as_ref() == local)
+            if !removed && Self::qualified_name(&attribute.name) == local {
+                removed = true;
+                return false;
+            }
+            true
         });
         Ok(())
     }
@@ -1024,6 +1041,47 @@ impl Dom {
         Ok(())
     }
 
+    /// Sets an attribute identified by namespace and local name, replacing
+    /// the first attribute with that namespace and local name (the existing
+    /// prefix is kept, matching "set an attribute value").
+    ///
+    /// [DOM setAttributeNS](https://dom.spec.whatwg.org/#dom-element-setattributens)
+    /// and `setAttributeNode` land here.
+    ///
+    /// # Errors
+    ///
+    /// - [`DomError::StaleNode`] if `id` is stale.
+    /// - [`DomError::WrongNodeType`] if `id` is not an element.
+    pub fn set_attribute_by_ns(
+        &mut self,
+        id: NodeId,
+        namespace: &str,
+        prefix: Option<&str>,
+        local: &str,
+        value: impl Into<String>,
+    ) -> Result<(), DomError> {
+        let node = self.node_mut(id).ok_or(DomError::StaleNode)?;
+        let NodeKind::Element { attributes, .. } = &mut node.kind else {
+            return Err(DomError::WrongNodeType);
+        };
+        let value = value.into();
+        if let Some(existing) = attributes.iter_mut().find(|attribute| {
+            attribute.name.ns.as_ref() == namespace && attribute.name.local.as_ref() == local
+        }) {
+            existing.value = value;
+            return Ok(());
+        }
+        attributes.push(Attribute {
+            name: QualName::new(
+                prefix.map(Prefix::from),
+                Namespace::from(namespace),
+                LocalName::from(local),
+            ),
+            value,
+        });
+        Ok(())
+    }
+
     /// Sets the attribute `name` on element `id`, replacing an attribute with
     /// the same qualified name.
     ///
@@ -1080,9 +1138,10 @@ impl Dom {
             local.to_owned()
         };
         let value = value.into();
-        if let Some(existing) = attributes.iter_mut().find(|attribute| {
-            attribute.name.ns.is_empty() && attribute.name.local.as_ref() == local
-        }) {
+        if let Some(existing) = attributes
+            .iter_mut()
+            .find(|attribute| Self::qualified_name(&attribute.name) == local)
+        {
             existing.value = value;
             return Ok(());
         }
@@ -1202,6 +1261,9 @@ impl Dom {
     /// The element's own unnamespaced attribute whose local name matches
     /// `local`; HTML elements ASCII-lowercase the queried name first
     /// ([DOM has-attribute](https://dom.spec.whatwg.org/#concept-element-attribute-has)).
+    /// The first attribute on `id` whose **qualified name** is `local`; HTML
+    /// elements ASCII-lowercase the queried name first
+    /// ([DOM get-an-attribute-by-name](https://dom.spec.whatwg.org/#concept-element-attributes-get-by-name)).
     fn find_attribute<'a>(&'a self, id: NodeId, local: &str) -> Option<&'a Attribute> {
         let NodeKind::Element { name, attributes } = self.get(id)?.kind() else {
             return None;
@@ -1211,9 +1273,9 @@ impl Dom {
         } else {
             local.to_owned()
         };
-        attributes.iter().find(|attribute| {
-            attribute.name.ns.is_empty() && attribute.name.local.as_ref() == local
-        })
+        attributes
+            .iter()
+            .find(|attribute| Self::qualified_name(&attribute.name) == local)
     }
 
     fn is_html_template_element(&self, id: NodeId) -> bool {
