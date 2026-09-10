@@ -235,6 +235,22 @@ impl Dom {
             .map(|node| node.children.iter())
     }
 
+    /// The sibling of `id` adjacent in the given direction, or `None`.
+    #[must_use]
+    pub fn sibling(&self, id: NodeId, forward: bool) -> Option<NodeId> {
+        let parent = self.parent(id)?;
+        let kids: Vec<NodeId> = self.children(parent)?.copied().collect();
+        let position = kids.iter().position(|&kid| kid == id)?;
+        if forward {
+            kids.get(position + 1).copied()
+        } else {
+            position
+                .checked_sub(1)
+                .and_then(|before| kids.get(before))
+                .copied()
+        }
+    }
+
     /// A stable identity token for `id`, for selector-engine caches.
     ///
     /// One live node owns exactly one slot, and matching runs under a shared
@@ -496,6 +512,127 @@ impl Dom {
             return Ok(());
         }
         self.place_node(parent, node, Some(sibling));
+        Ok(())
+    }
+
+    /// [Replaces](https://dom.spec.whatwg.org/#concept-node-replace) `child`
+    /// with `node` inside `parent`. `child` stays alive (detached) after the
+    /// call; the caller returns it.
+    ///
+    /// Validation runs against the child sequence *without* `child`
+    /// (`childrenToExclude` in the spec's ensure-pre-insert-validity), so a
+    /// refused replacement leaves the tree untouched.
+    ///
+    /// # Errors
+    ///
+    /// - [`DomError::StaleNode`] if any handle is stale.
+    /// - [`DomError::NoParent`] if `child` is not a child of `parent`
+    ///   (`NotFoundError`).
+    /// - [`DomError::HierarchyRequest`] / [`DomError::CycleForbidden`] as
+    ///   from [`Dom::ensure_pre_insert_validity`].
+    pub fn replace_child(
+        &mut self,
+        parent: NodeId,
+        node: NodeId,
+        child: NodeId,
+    ) -> Result<(), DomError> {
+        self.require_live(parent)?;
+        self.require_live(node)?;
+        self.require_live(child)?;
+        if !matches!(
+            self.get(parent).map(|view| view.kind()),
+            Some(NodeKind::Document | NodeKind::Element { .. } | NodeKind::Fragment)
+        ) {
+            return Err(DomError::HierarchyRequest);
+        }
+        if self.would_cycle(node, parent) {
+            return Err(DomError::CycleForbidden);
+        }
+        if self.parent(child) != Some(parent) {
+            return Err(DomError::NoParent);
+        }
+        if matches!(
+            self.get(parent).map(|view| view.kind()),
+            Some(NodeKind::Document)
+        ) {
+            let incoming = self.incoming_nodes(node);
+            let mut sequence: Vec<NodeId> = Vec::new();
+            for &existing in self.children(parent).into_iter().flatten() {
+                if existing == child {
+                    sequence.extend_from_slice(&incoming);
+                } else {
+                    sequence.push(existing);
+                }
+            }
+            self.ensure_document_content_model(&sequence)?;
+        }
+        let mut reference = self.sibling(child, true);
+        if reference == Some(node) {
+            reference = self.sibling(node, true);
+        }
+        self.unlink_from_current_parent(child);
+        if let Some(detached) = self.node_mut(child) {
+            detached.parent = None;
+        }
+        if self.is_fragment(node) {
+            self.splice_fragment(parent, node, reference);
+        } else {
+            self.place_node(parent, node, reference);
+        }
+        Ok(())
+    }
+
+    /// [Pre-inserts](https://dom.spec.whatwg.org/#concept-node-pre-insert)
+    /// `node` into `parent` before null or `reference`, validating in spec
+    /// order and returning the node that was inserted.
+    ///
+    /// `append`/`insert_before` derive the parent from an existing sibling and
+    /// serve trusted parser flows; this is the public web-visible entry point
+    /// whose validation order (parent type, ancestor cycle, reference
+    /// membership) tests observe.
+    ///
+    /// # Errors
+    ///
+    /// - [`DomError::StaleNode`] if any handle is stale.
+    /// - [`DomError::HierarchyRequest`] if `parent` cannot contain children
+    ///   or the content model refuses `node`.
+    /// - [`DomError::CycleForbidden`] if `node` is an ancestor of `parent`.
+    /// - [`DomError::NoParent`] if `reference` is not a child of `parent`.
+    pub fn pre_insert(
+        &mut self,
+        parent: NodeId,
+        node: NodeId,
+        reference: Option<NodeId>,
+    ) -> Result<(), DomError> {
+        self.ensure_alive(parent, node)?;
+        if !matches!(
+            self.get(parent).map(|view| view.kind()),
+            Some(NodeKind::Document | NodeKind::Element { .. } | NodeKind::Fragment)
+        ) {
+            return Err(DomError::HierarchyRequest);
+        }
+        if self.would_cycle(node, parent) {
+            return Err(DomError::CycleForbidden);
+        }
+        if let Some(reference) = reference {
+            self.require_live(reference)?;
+            if self.parent(reference) != Some(parent) {
+                return Err(DomError::NoParent);
+            }
+        }
+        self.ensure_pre_insert_validity(parent, node, reference)?;
+        // The reference child may be the node itself: inserting a node beside
+        // itself is a legal stay-put no-op.
+        let reference = if reference == Some(node) {
+            self.sibling(node, true)
+        } else {
+            reference
+        };
+        if self.is_fragment(node) {
+            self.splice_fragment(parent, node, reference);
+        } else {
+            self.place_node(parent, node, reference);
+        }
         Ok(())
     }
 
