@@ -22,6 +22,7 @@ use markup5ever::interface::{TokenizerResult, tree_builder::ElemName};
 use tendril::{StrTendril, TendrilSink};
 
 mod document;
+mod documents;
 mod engine;
 mod js;
 mod process;

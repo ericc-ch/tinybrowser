@@ -225,15 +225,15 @@ fn navigation_parsing_cookies_and_relative_js_fetch_form_one_journey() {
 
     assert_eq!(doc.content_language(), Some("fr"));
     assert_eq!(doc.document_cookie(), "sid=1");
-    {
-        let parsed = doc.parsed().expect("parsed navigation");
+    doc.with_parsed(|parsed| {
         let paragraph = parsed
             .dom
             .select_first(parsed.dom.document(), "#loaded")
             .expect("selector")
             .expect("paragraph");
         assert_eq!(element_text(&parsed.dom, paragraph), "hi");
-    }
+    })
+    .expect("parsed navigation");
 
     doc.eval(
         "globalThis.body = ''; fetch('next').then(function(response) { return response.text(); }).then(function(text) { globalThis.body = text; });",
@@ -601,15 +601,17 @@ fn engine_drives_the_main_frame_through_the_host() {
     );
     assert_eq!(engine.events(), vec![TabEvent::Load]);
     assert_eq!(engine.document_url(), "about:blank");
-    let parsed = engine.parsed().expect("parsed document");
-    assert!(
-        parsed
-            .dom
-            .select_first(parsed.dom.document(), "#x")
-            .expect("selector")
-            .is_some()
-    );
-    drop(parsed);
+    engine
+        .with_parsed(|parsed| {
+            assert!(
+                parsed
+                    .dom
+                    .select_first(parsed.dom.document(), "#x")
+                    .expect("selector")
+                    .is_some()
+            );
+        })
+        .expect("parsed document");
     engine.shutdown();
 }
 

@@ -225,11 +225,12 @@ impl JsImplementation {
             ));
         }
         let world = world(&ctx)?;
-        let mut world = world.borrow_mut();
-        let Some(parsed) = world.document_mut(self.document.0) else {
+        let world = world.borrow();
+        let Some(mut parsed) = world.document_mut(self.document.0) else {
             return Err(Exception::throw_type(&ctx, "no document"));
         };
         let id = parsed.dom.create_doctype(name, public_id, system_id);
+        drop(parsed);
         drop(world);
         wrap_node(&ctx, id)
     }
@@ -601,8 +602,8 @@ fn write_class_tokens(ctx: &Ctx<'_>, id: NodeId, tokens: &[String]) -> Result<()
 
 fn write_class(ctx: &Ctx<'_>, id: NodeId, value: &str) -> Result<()> {
     let world = world(ctx)?;
-    let mut world = world.borrow_mut();
-    let Some(parsed) = world.document_mut(id) else {
+    let world = world.borrow();
+    let Some(mut parsed) = world.document_mut(id) else {
         return Ok(());
     };
     if value.is_empty() && parsed.dom.attribute(id, "class").is_none() {
@@ -612,6 +613,7 @@ fn write_class(ctx: &Ctx<'_>, id: NodeId, value: &str) -> Result<()> {
         .dom
         .set_attribute(id, "class", value)
         .map_err(|err| throw_dom_error(ctx, err))?;
+    drop(parsed);
     drop(world);
     schedule_mutation_delivery(ctx)
 }
@@ -733,17 +735,14 @@ impl JsAttr {
                 world(&ctx).ok().and_then(|world| {
                     world
                         .borrow()
-                        .parsed
-                        .as_ref()
-                        .map(|parsed| parsed.dom.document())
+                        .with_main_document(|parsed| parsed.dom.document())
                 })
             },
             |owner| {
                 world(&ctx).ok().and_then(|world| {
                     world
                         .borrow()
-                        .document(owner)
-                        .map(|parsed| parsed.dom.document())
+                        .with_document(owner, |parsed| parsed.dom.document())
                 })
             },
         );
@@ -1005,13 +1004,14 @@ fn set_attr_value(ctx: &Ctx<'_>, id: u64, value: String) -> Result<()> {
         state.prefix.clone(),
         state.local.clone(),
     );
-    let Some(parsed) = world.document_mut(owner) else {
+    let Some(mut parsed) = world.document_mut(owner) else {
         return Ok(());
     };
     parsed
         .dom
         .set_attribute_by_ns(owner, &namespace, prefix.as_deref(), &local, value)
         .map_err(|err| throw_dom_error(ctx, err))?;
+    drop(parsed);
     drop(world);
     schedule_mutation_delivery(ctx)
 }
@@ -1203,29 +1203,32 @@ fn remove_attribute_sync(
     by_namespace: bool,
 ) -> Result<()> {
     let world_rc = world(ctx)?;
-    let mut world = world_rc.borrow_mut();
-    let Some(parsed) = world.document_mut(element) else {
-        return Ok(());
-    };
-    let result = if by_namespace {
-        parsed
-            .dom
-            .remove_attribute_ns(element, namespace, local)
-            .map_err(|err| throw_dom_error(ctx, err))
-    } else {
-        parsed
-            .dom
-            .remove_attribute(element, local)
-            .map_err(|err| throw_dom_error(ctx, err))
-    };
-    result?;
-    if let Some(id) = world
-        .attr_ids
-        .remove(&(element, namespace.to_owned(), local.to_owned()))
     {
-        world.attr_owners.insert(id, None);
+        let world = world_rc.borrow();
+        let Some(mut parsed) = world.document_mut(element) else {
+            return Ok(());
+        };
+        if by_namespace {
+            parsed
+                .dom
+                .remove_attribute_ns(element, namespace, local)
+                .map_err(|err| throw_dom_error(ctx, err))?;
+        } else {
+            parsed
+                .dom
+                .remove_attribute(element, local)
+                .map_err(|err| throw_dom_error(ctx, err))?;
+        }
     }
-    drop(world);
+    {
+        let mut world = world_rc.borrow_mut();
+        if let Some(id) = world
+            .attr_ids
+            .remove(&(element, namespace.to_owned(), local.to_owned()))
+        {
+            world.attr_owners.insert(id, None);
+        }
+    }
     touch_named_node_map(ctx, element)?;
     schedule_mutation_delivery(ctx)
 }
@@ -1282,24 +1285,26 @@ fn set_attribute_node<'js>(
         if let Some(previous) = previous {
             world.attr_owners.insert(previous, None);
         }
-        let Some(parsed) = world.document_mut(element) else {
-            return Err(Exception::throw_type(ctx, "no document"));
-        };
-        parsed
-            .dom
-            .set_attribute_by_ns(
-                element,
-                &state.namespace,
-                state.prefix.as_deref(),
-                &state.local,
-                value.clone(),
-            )
-            .map_err(|err| throw_dom_error(ctx, err))?;
+        {
+            let Some(mut parsed) = world.document_mut(element) else {
+                return Err(Exception::throw_type(ctx, "no document"));
+            };
+            parsed
+                .dom
+                .set_attribute_by_ns(
+                    element,
+                    &state.namespace,
+                    state.prefix.as_deref(),
+                    &state.local,
+                    value.clone(),
+                )
+                .map_err(|err| throw_dom_error(ctx, err))?;
+        }
         world.attr_values.insert(id, value);
         world.attr_owners.insert(id, Some(element));
         world
             .attr_ids
-            .insert((element, state.namespace.clone(), state.local.clone()), id);
+            .insert((element, state.namespace.clone(), state.local), id);
     }
     touch_named_node_map(ctx, element)?;
     schedule_mutation_delivery(ctx)?;
@@ -1653,9 +1658,7 @@ fn constructor_string<'js>(ctx: &Ctx<'js>, value: Option<Value<'js>>) -> Result<
 fn main_document(ctx: &Ctx<'_>) -> Result<NodeId> {
     world(ctx)?
         .borrow()
-        .parsed
-        .as_ref()
-        .map(|parsed| parsed.dom.document())
+        .with_main_document(|parsed| parsed.dom.document())
         .ok_or_else(|| Exception::throw_type(ctx, "no document"))
 }
 
@@ -1914,8 +1917,8 @@ fn adopt_across_documents(ctx: &Ctx<'_>, parent: NodeId, node: NodeId) -> Result
             "nodes belong to different documents",
         ));
     };
-    let mut world = world_rc.borrow_mut();
-    let Some(target) = world.document_mut(parent) else {
+    let world = world_rc.borrow();
+    let Some(mut target) = world.document_mut(parent) else {
         return Err(throw_dom(
             ctx,
             "HierarchyRequestError",
@@ -2211,14 +2214,15 @@ impl JsNode {
         let kid = adopt_across_documents(&ctx, self.handle.0, kid)?;
         let parent = self.handle.0;
         let world = world(&ctx)?;
-        let mut world = world.borrow_mut();
-        let Some(parsed) = world.document_mut(self.handle.0) else {
+        let world = world.borrow();
+        let Some(mut parsed) = world.document_mut(self.handle.0) else {
             return Err(Exception::throw_type(&ctx, "no document"));
         };
         parsed
             .dom
             .pre_insert(parent, kid, None)
             .map_err(|err| throw_dom_error(&ctx, err))?;
+        drop(parsed);
         drop(world);
         schedule_mutation_delivery(&ctx)?;
         wrap_node(&ctx, kid)
@@ -2381,12 +2385,13 @@ impl JsNode {
         let Some(tree) = tree else {
             return Err(Exception::throw_type(&ctx, "stale node"));
         };
-        let mut world = world_rc.borrow_mut();
-        let Some(target) = world.document_mut(self.handle.0) else {
+        let world = world_rc.borrow();
+        let Some(mut target) = world.document_mut(self.handle.0) else {
             return Err(Exception::throw_type(&ctx, "no document"));
         };
         let id =
             materialize_import(&mut target.dom, &tree).map_err(|err| throw_dom_error(&ctx, err))?;
+        drop(target);
         drop(world);
         wrap_node(&ctx, id)
     }
@@ -2629,8 +2634,8 @@ impl JsNode {
         };
         {
             let world = world(&ctx)?;
-            let mut world = world.borrow_mut();
-            let Some(parsed) = world.document_mut(self.handle.0) else {
+            let world = world.borrow();
+            let Some(mut parsed) = world.document_mut(self.handle.0) else {
                 return Err(Exception::throw_type(&ctx, "no document"));
             };
             parsed
@@ -2798,9 +2803,13 @@ impl JsNode {
         let world = world(&ctx)?;
         let id = world
             .borrow()
-            .document(self.handle.0)
-            .and_then(|parsed| parsed.dom.children(self.handle.0))
-            .and_then(|kids| kids.last().copied());
+            .with_document(self.handle.0, |parsed| {
+                parsed
+                    .dom
+                    .children(self.handle.0)
+                    .and_then(|kids| kids.last().copied())
+            })
+            .flatten();
         child_value(&ctx, id)
     }
 
@@ -2892,8 +2901,8 @@ impl JsNode {
     fn set_text_content(&self, ctx: Ctx<'_>, value: OptString) -> Result<()> {
         let text = value.0.unwrap_or_default();
         let world = world(&ctx)?;
-        let mut world = world.borrow_mut();
-        let Some(parsed) = world.document_mut(self.handle.0) else {
+        let world = world.borrow();
+        let Some(mut parsed) = world.document_mut(self.handle.0) else {
             return Ok(());
         };
         let dom = &mut parsed.dom;
@@ -2901,24 +2910,28 @@ impl JsNode {
             Some(NodeKind::Text { .. }) => {
                 dom.set_text(self.handle.0, text)
                     .map_err(|err| throw_dom_error(&ctx, err))?;
+                drop(parsed);
                 drop(world);
                 return schedule_mutation_delivery(&ctx);
             }
             Some(NodeKind::Comment { .. }) => {
                 dom.set_comment(self.handle.0, text)
                     .map_err(|err| throw_dom_error(&ctx, err))?;
+                drop(parsed);
                 drop(world);
                 return schedule_mutation_delivery(&ctx);
             }
             Some(NodeKind::CDataSection { .. }) => {
                 dom.set_cdata_section(self.handle.0, text)
                     .map_err(|err| throw_dom_error(&ctx, err))?;
+                drop(parsed);
                 drop(world);
                 return schedule_mutation_delivery(&ctx);
             }
             Some(NodeKind::ProcessingInstruction { .. }) => {
                 dom.set_processing_instruction(self.handle.0, text)
                     .map_err(|err| throw_dom_error(&ctx, err))?;
+                drop(parsed);
                 drop(world);
                 return schedule_mutation_delivery(&ctx);
             }
@@ -2933,6 +2946,7 @@ impl JsNode {
         }
         dom.replace_all(self.handle.0, replacement)
             .map_err(|err| throw_dom_error(&ctx, err))?;
+        drop(parsed);
         drop(world);
         schedule_mutation_delivery(&ctx)
     }
@@ -3003,14 +3017,15 @@ impl JsNode {
     fn append<'js>(&self, ctx: Ctx<'js>, nodes: Rest<Value<'js>>) -> Result<()> {
         let node = convert_nodes_into_node(&ctx, self.handle.0, nodes)?;
         let world = world(&ctx)?;
-        let mut world = world.borrow_mut();
-        let Some(parsed) = world.document_mut(self.handle.0) else {
+        let world = world.borrow();
+        let Some(mut parsed) = world.document_mut(self.handle.0) else {
             return Err(Exception::throw_type(&ctx, "no document"));
         };
         parsed
             .dom
             .pre_insert(self.handle.0, node, None)
             .map_err(|err| throw_dom_error(&ctx, err))?;
+        drop(parsed);
         drop(world);
         schedule_mutation_delivery(&ctx)
     }
@@ -3020,8 +3035,8 @@ impl JsNode {
     fn prepend<'js>(&self, ctx: Ctx<'js>, nodes: Rest<Value<'js>>) -> Result<()> {
         let node = convert_nodes_into_node(&ctx, self.handle.0, nodes)?;
         let world = world(&ctx)?;
-        let mut world = world.borrow_mut();
-        let Some(parsed) = world.document_mut(self.handle.0) else {
+        let world = world.borrow();
+        let Some(mut parsed) = world.document_mut(self.handle.0) else {
             return Err(Exception::throw_type(&ctx, "no document"));
         };
         let reference = parsed
@@ -3032,6 +3047,7 @@ impl JsNode {
             .dom
             .pre_insert(self.handle.0, node, reference)
             .map_err(|err| throw_dom_error(&ctx, err))?;
+        drop(parsed);
         drop(world);
         schedule_mutation_delivery(&ctx)
     }
@@ -3041,14 +3057,15 @@ impl JsNode {
     fn replace_children<'js>(&self, ctx: Ctx<'js>, nodes: Rest<Value<'js>>) -> Result<()> {
         let node = convert_nodes_into_node(&ctx, self.handle.0, nodes)?;
         let world = world(&ctx)?;
-        let mut world = world.borrow_mut();
-        let Some(parsed) = world.document_mut(self.handle.0) else {
+        let world = world.borrow();
+        let Some(mut parsed) = world.document_mut(self.handle.0) else {
             return Err(Exception::throw_type(&ctx, "no document"));
         };
         parsed
             .dom
             .replace_all(self.handle.0, node)
             .map_err(|err| throw_dom_error(&ctx, err))?;
+        drop(parsed);
         drop(world);
         schedule_mutation_delivery(&ctx)
     }
@@ -3168,8 +3185,8 @@ impl JsNode {
     #[qjs(set, rename = "title")]
     fn set_title(&self, ctx: Ctx<'_>, value: WebIdlString) -> Result<()> {
         let world = world(&ctx)?;
-        let mut world = world.borrow_mut();
-        let Some(parsed) = world.document_mut(self.handle.0) else {
+        let world = world.borrow();
+        let Some(mut parsed) = world.document_mut(self.handle.0) else {
             return Ok(());
         };
         let dom = &mut parsed.dom;
@@ -3202,6 +3219,7 @@ impl JsNode {
             dom.append(title, text)
                 .map_err(|err| throw_dom_error(&ctx, err))?;
         }
+        drop(parsed);
         drop(world);
         schedule_mutation_delivery(&ctx)
     }
@@ -3248,8 +3266,8 @@ impl JsNode {
     fn before<'js>(&self, ctx: Ctx<'js>, nodes: Rest<Value<'js>>) -> Result<()> {
         let node = convert_nodes_into_node(&ctx, self.handle.0, nodes)?;
         let world = world(&ctx)?;
-        let mut world = world.borrow_mut();
-        let Some(parsed) = world.document_mut(self.handle.0) else {
+        let world = world.borrow();
+        let Some(mut parsed) = world.document_mut(self.handle.0) else {
             return Err(Exception::throw_type(&ctx, "no document"));
         };
         let Some(parent) = parsed.dom.parent(self.handle.0) else {
@@ -3267,6 +3285,7 @@ impl JsNode {
             .dom
             .pre_insert(parent, node, reference)
             .map_err(|err| throw_dom_error(&ctx, err))?;
+        drop(parsed);
         drop(world);
         schedule_mutation_delivery(&ctx)
     }
@@ -3276,8 +3295,8 @@ impl JsNode {
     fn after<'js>(&self, ctx: Ctx<'js>, nodes: Rest<Value<'js>>) -> Result<()> {
         let node = convert_nodes_into_node(&ctx, self.handle.0, nodes)?;
         let world = world(&ctx)?;
-        let mut world = world.borrow_mut();
-        let Some(parsed) = world.document_mut(self.handle.0) else {
+        let world = world.borrow();
+        let Some(mut parsed) = world.document_mut(self.handle.0) else {
             return Err(Exception::throw_type(&ctx, "no document"));
         };
         let Some(parent) = parsed.dom.parent(self.handle.0) else {
@@ -3288,6 +3307,7 @@ impl JsNode {
             .dom
             .pre_insert(parent, node, reference)
             .map_err(|err| throw_dom_error(&ctx, err))?;
+        drop(parsed);
         drop(world);
         schedule_mutation_delivery(&ctx)
     }
@@ -3297,8 +3317,8 @@ impl JsNode {
     fn replace_with<'js>(&self, ctx: Ctx<'js>, nodes: Rest<Value<'js>>) -> Result<()> {
         let node = convert_nodes_into_node(&ctx, self.handle.0, nodes)?;
         let world = world(&ctx)?;
-        let mut world = world.borrow_mut();
-        let Some(parsed) = world.document_mut(self.handle.0) else {
+        let world = world.borrow();
+        let Some(mut parsed) = world.document_mut(self.handle.0) else {
             return Err(Exception::throw_type(&ctx, "no document"));
         };
         let Some(parent) = parsed.dom.parent(self.handle.0) else {
@@ -3316,6 +3336,7 @@ impl JsNode {
                 .pre_insert(parent, node, reference)
                 .map_err(|err| throw_dom_error(&ctx, err))?;
         }
+        drop(parsed);
         drop(world);
         schedule_mutation_delivery(&ctx)
     }
@@ -3408,14 +3429,15 @@ impl JsNode {
     #[qjs(set, rename = "className")]
     fn set_class_name(&self, ctx: Ctx<'_>, value: WebIdlString) -> Result<()> {
         let world = world(&ctx)?;
-        let mut world = world.borrow_mut();
-        let Some(parsed) = world.document_mut(self.handle.0) else {
+        let world = world.borrow();
+        let Some(mut parsed) = world.document_mut(self.handle.0) else {
             return Err(Exception::throw_type(&ctx, "no document"));
         };
         parsed
             .dom
             .set_attribute(self.handle.0, "class", value.0)
             .map_err(|err| throw_dom_error(&ctx, err))?;
+        drop(parsed);
         drop(world);
         schedule_mutation_delivery(&ctx)
     }
@@ -3526,8 +3548,8 @@ impl JsNode {
         let local = name.local.to_string();
         {
             let world = world(&ctx)?;
-            let mut world = world.borrow_mut();
-            let Some(parsed) = world.document_mut(self.handle.0) else {
+            let world = world.borrow();
+            let Some(mut parsed) = world.document_mut(self.handle.0) else {
                 return Err(Exception::throw_type(&ctx, "no document"));
             };
             parsed
@@ -3558,8 +3580,8 @@ impl JsNode {
         };
         {
             let world = world(&ctx)?;
-            let mut world = world.borrow_mut();
-            let Some(parsed) = world.document_mut(self.handle.0) else {
+            let world = world.borrow();
+            let Some(mut parsed) = world.document_mut(self.handle.0) else {
                 return Ok(());
             };
             parsed
@@ -3582,8 +3604,8 @@ impl JsNode {
         let namespace = namespace.0.unwrap_or_default();
         {
             let world = world(&ctx)?;
-            let mut world = world.borrow_mut();
-            let Some(parsed) = world.document_mut(self.handle.0) else {
+            let world = world.borrow();
+            let Some(mut parsed) = world.document_mut(self.handle.0) else {
                 return Ok(());
             };
             parsed
@@ -3732,8 +3754,8 @@ impl JsNode {
         };
         let (should_exist, changed) = {
             let world = world(&ctx)?;
-            let mut world = world.borrow_mut();
-            let Some(parsed) = world.document_mut(self.handle.0) else {
+            let world = world.borrow();
+            let Some(mut parsed) = world.document_mut(self.handle.0) else {
                 return Err(Exception::throw_type(&ctx, "no document"));
             };
             let exists = parsed.dom.has_attribute(self.handle.0, &local);
@@ -3766,8 +3788,8 @@ impl JsNode {
     #[qjs(rename = "normalize")]
     fn normalize(&self, ctx: Ctx<'_>) -> Result<()> {
         let world = world(&ctx)?;
-        let mut world = world.borrow_mut();
-        let Some(parsed) = world.document_mut(self.handle.0) else {
+        let world = world.borrow();
+        let Some(mut parsed) = world.document_mut(self.handle.0) else {
             return Ok(());
         };
         let dom = &mut parsed.dom;
@@ -3829,6 +3851,7 @@ impl JsNode {
                 }
             }
         }
+        drop(parsed);
         drop(world);
         schedule_mutation_delivery(&ctx)
     }
@@ -3967,8 +3990,8 @@ impl JsNode {
     #[qjs(rename = "cloneNode")]
     fn clone_node<'js>(&self, ctx: Ctx<'js>, deep: Opt<bool>) -> Result<Value<'js>> {
         let world = world(&ctx)?;
-        let mut world = world.borrow_mut();
-        let Some(parsed) = world.document_mut(self.handle.0) else {
+        let world = world.borrow();
+        let Some(mut parsed) = world.document_mut(self.handle.0) else {
             return Err(Exception::throw_type(&ctx, "no document"));
         };
         if self.handle.0 == parsed.dom.document() {
@@ -3982,6 +4005,7 @@ impl JsNode {
             .dom
             .clone_node(self.handle.0, deep.0.unwrap_or(false))
             .map_err(|err| throw_dom_error(&ctx, err))?;
+        drop(parsed);
         drop(world);
         wrap_node(&ctx, clone)
     }
@@ -4009,13 +4033,14 @@ impl JsNode {
         }
         let node = adopt_across_documents(&ctx, self.handle.0, node)?;
         let world = world(&ctx)?;
-        let mut world = world.borrow_mut();
-        let Some(parsed) = world.document_mut(self.handle.0) else {
+        let world = world.borrow();
+        let Some(mut parsed) = world.document_mut(self.handle.0) else {
             return Err(Exception::throw_type(&ctx, "no document"));
         };
         let dom = &mut parsed.dom;
         dom.pre_insert(self.handle.0, node, reference)
             .map_err(|err| throw_dom_error(&ctx, err))?;
+        drop(parsed);
         drop(world);
         schedule_mutation_delivery(&ctx)?;
         wrap_node(&ctx, node)
@@ -4026,8 +4051,8 @@ impl JsNode {
     fn remove_child<'js>(&self, ctx: Ctx<'js>, child: Value<'js>) -> Result<Value<'js>> {
         let child = required_node(&ctx, &child)?;
         let world = world(&ctx)?;
-        let mut world = world.borrow_mut();
-        let Some(parsed) = world.document_mut(self.handle.0) else {
+        let world = world.borrow();
+        let Some(mut parsed) = world.document_mut(self.handle.0) else {
             return Err(Exception::throw_type(&ctx, "no document"));
         };
         if parsed.dom.parent(child) != Some(self.handle.0) {
@@ -4041,6 +4066,7 @@ impl JsNode {
             .dom
             .detach(child)
             .map_err(|err| throw_dom_error(&ctx, err))?;
+        drop(parsed);
         drop(world);
         schedule_mutation_delivery(&ctx)?;
         wrap_node(&ctx, child)
@@ -4069,14 +4095,15 @@ impl JsNode {
         }
         let node = adopt_across_documents(&ctx, self.handle.0, node)?;
         let world = world(&ctx)?;
-        let mut world = world.borrow_mut();
-        let Some(parsed) = world.document_mut(self.handle.0) else {
+        let world = world.borrow();
+        let Some(mut parsed) = world.document_mut(self.handle.0) else {
             return Err(Exception::throw_type(&ctx, "no document"));
         };
         parsed
             .dom
             .replace_child(self.handle.0, node, child)
             .map_err(|err| throw_dom_error(&ctx, err))?;
+        drop(parsed);
         drop(world);
         schedule_mutation_delivery(&ctx)?;
         wrap_node(&ctx, child)
@@ -4131,14 +4158,15 @@ impl JsNode {
     #[qjs(rename = "remove")]
     fn remove(&self, ctx: Ctx<'_>) -> Result<()> {
         let world = world(&ctx)?;
-        let mut world = world.borrow_mut();
-        let Some(parsed) = world.document_mut(self.handle.0) else {
+        let world = world.borrow();
+        let Some(mut parsed) = world.document_mut(self.handle.0) else {
             return Ok(());
         };
         parsed
             .dom
             .detach(self.handle.0)
             .map_err(|err| throw_dom_error(&ctx, err))?;
+        drop(parsed);
         drop(world);
         schedule_mutation_delivery(&ctx)
     }
@@ -4313,9 +4341,8 @@ fn is_main_document(ctx: &Ctx<'_>, id: NodeId) -> bool {
     };
     let world = world_rc.borrow();
     world
-        .parsed
-        .as_ref()
-        .is_some_and(|parsed| parsed.dom.document_id() == id.document_id())
+        .with_main_document(|parsed| parsed.dom.document_id() == id.document_id())
+        .unwrap_or(false)
 }
 
 fn document_url_string(ctx: &Ctx<'_>, id: NodeId) -> String {
@@ -4345,13 +4372,12 @@ fn element_is_html(ctx: &Ctx<'_>, id: NodeId) -> bool {
         return false;
     };
     let parsed = world.borrow();
-    matches!(
-        parsed
-            .document(id)
-            .and_then(|parsed| parsed.dom.get(id))
-            .map(|node| node.kind()),
-        Some(NodeKind::Element { name, .. }) if name.ns == html_namespace()
-    )
+    parsed.with_document(id, |parsed| {
+        matches!(
+            parsed.dom.get(id).map(|node| node.kind()),
+            Some(NodeKind::Element { name, .. }) if name.ns == html_namespace()
+        )
+    }) == Some(true)
 }
 
 /// [Converting nodes into a node](https://dom.spec.whatwg.org/#convert-nodes-into-a-node):
@@ -4362,8 +4388,8 @@ fn convert_nodes_into_node<'js>(
     nodes: Rest<Value<'js>>,
 ) -> Result<NodeId> {
     let world = world(ctx)?;
-    let mut world = world.borrow_mut();
-    let Some(parsed) = world.document_mut(document) else {
+    let world = world.borrow();
+    let Some(mut parsed) = world.document_mut(document) else {
         return Err(Exception::throw_type(ctx, "no document"));
     };
     let dom = &mut parsed.dom;
@@ -4448,9 +4474,7 @@ pub(super) fn install(ctx: &Ctx<'_>, world: &Rc<RefCell<World>>) -> Result<()> {
 
     let document_id = world
         .borrow()
-        .parsed
-        .as_ref()
-        .map(|parsed| parsed.dom.document());
+        .with_main_document(|parsed| parsed.dom.document());
     if let Some(id) = document_id {
         globals.set("document", wrap_node(ctx, id)?)?;
     }
@@ -5182,8 +5206,8 @@ fn character_data(ctx: &Ctx<'_>, id: NodeId) -> Result<String> {
 /// `CharacterData` node; other kinds are a silent no-op (`nodeValue` setter).
 fn set_character_data(ctx: &Ctx<'_>, id: NodeId, data: String) -> Result<()> {
     let world = world(ctx)?;
-    let mut world = world.borrow_mut();
-    let Some(parsed) = world.document_mut(id) else {
+    let world = world.borrow();
+    let Some(mut parsed) = world.document_mut(id) else {
         return Ok(());
     };
     match parsed.dom.get(id).map(|node| node.kind()) {
@@ -5213,6 +5237,7 @@ fn set_character_data(ctx: &Ctx<'_>, id: NodeId, data: String) -> Result<()> {
         }
         _ => return Ok(()),
     }
+    drop(parsed);
     drop(world);
     schedule_mutation_delivery(ctx)
 }
@@ -5473,11 +5498,12 @@ fn create_kind<'js>(
     make: impl FnOnce(&mut dom::Dom) -> NodeId,
 ) -> Result<Value<'js>> {
     let world = world(ctx)?;
-    let mut world = world.borrow_mut();
-    let Some(parsed) = world.document_mut(document) else {
+    let world = world.borrow();
+    let Some(mut parsed) = world.document_mut(document) else {
         return Err(Exception::throw_type(ctx, "no document"));
     };
     let id = make(&mut parsed.dom);
+    drop(parsed);
     drop(world);
     wrap_node(ctx, id)
 }
@@ -5912,8 +5938,13 @@ mod realm_tests {
         url: &str,
         html: &str,
     ) -> Rc<RefCell<World>> {
-        let mut world = World::new(Arc::clone(services), Url::parse(url).expect("test url"));
-        world.parsed = Some(crate::parse_html(html));
+        let documents = Rc::new(RefCell::new(crate::documents::DocumentStore::default()));
+        let mut world = World::new(
+            Arc::clone(services),
+            Url::parse(url).expect("test url"),
+            documents,
+        );
+        world.replace_document(crate::parse_html(html));
         Rc::new(RefCell::new(world))
     }
 

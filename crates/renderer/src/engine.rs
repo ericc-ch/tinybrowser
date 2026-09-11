@@ -5,12 +5,14 @@
 //! `QuickJS` `Runtime` and one Tokio waiter per renderer process; `Document` is
 //! one frame. Child frames join the same engine sharing both.
 
-use std::cell::Ref;
+use std::cell::RefCell;
 use std::collections::BTreeMap;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::document::{Document, Stop, Waiter};
+use crate::documents::DocumentStore;
 use crate::js::SharedJsRuntime;
 use crate::protocol::{BrowserServices, FrameId, Mount, TabError, TabEvent};
 use crate::{Parsed, RemoteValue, ScriptValue};
@@ -27,6 +29,8 @@ const FRAME_STEP: Duration = Duration::from_millis(1);
 pub struct Engine {
     js_runtime: SharedJsRuntime,
     waiter: Waiter,
+    /// Every frame's trees, shared across their realms.
+    documents: Rc<RefCell<DocumentStore>>,
     services: Arc<dyn BrowserServices>,
     stop: Arc<Stop>,
     frames: BTreeMap<FrameId, Document>,
@@ -45,10 +49,12 @@ impl Engine {
     pub fn with_stop(services: Arc<dyn BrowserServices>, stop: Arc<Stop>) -> Self {
         let js_runtime = SharedJsRuntime::default();
         let waiter = Waiter::new();
+        let documents = Rc::new(RefCell::new(DocumentStore::default()));
         let main = Document::with_shared(
             Arc::clone(&services),
             js_runtime.clone(),
             waiter.clone(),
+            Rc::clone(&documents),
             Arc::clone(&stop),
         );
         let mut frames = BTreeMap::new();
@@ -56,6 +62,7 @@ impl Engine {
         Self {
             js_runtime,
             waiter,
+            documents,
             services,
             stop,
             frames,
@@ -71,6 +78,7 @@ impl Engine {
             Arc::clone(&self.services),
             self.js_runtime.clone(),
             self.waiter.clone(),
+            Rc::clone(&self.documents),
             Arc::clone(&self.stop),
         );
         self.frames.insert(frame, document);
@@ -231,10 +239,9 @@ impl Engine {
         self.main().content_language()
     }
 
-    /// Main frame last parse result, if any.
-    #[must_use]
-    pub fn parsed(&self) -> Option<Ref<'_, Parsed>> {
-        self.main().parsed()
+    /// Runs `reader` against the main frame's active document, if any.
+    pub fn with_parsed<R>(&self, reader: impl FnOnce(&Parsed) -> R) -> Option<R> {
+        self.main().with_parsed(reader)
     }
 
     /// Jobs that have already run, in order, for every frame.

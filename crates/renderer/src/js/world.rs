@@ -1,6 +1,8 @@
 //! Shared JS world for the renderer.
 
-use std::collections::HashMap;
+use std::cell::{Ref, RefCell, RefMut};
+use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 use std::sync::Arc;
 
 use dom::NodeId;
@@ -8,6 +10,7 @@ use rquickjs::{Object, Persistent, Value, class::Trace, function::Function};
 use url::Url;
 
 use crate::Parsed;
+use crate::documents::DocumentStore;
 use crate::protocol::BrowserServices;
 
 /// One DOM node handle owned by the JS world.
@@ -73,10 +76,12 @@ pub(crate) enum EventTargetKey {
 }
 
 pub(crate) struct World {
-    pub parsed: Option<Parsed>,
-    /// Documents created by DOM APIs (`createHTMLDocument`, `createDocument`)
-    /// beyond the parser's main document, keyed by their `NodeId` document id.
-    pub extra_documents: HashMap<u32, Parsed>,
+    /// Every tree the renderer process holds, shared by all realms.
+    documents: Rc<RefCell<DocumentStore>>,
+    /// The active document of the frame this realm belongs to.
+    document: Option<u32>,
+    /// Document ids this realm created; only these feed its observers.
+    owned: HashSet<u32>,
     pub document_url: Url,
     pub services: Arc<dyn BrowserServices>,
     pub pending_cancels: Vec<i32>,
@@ -107,10 +112,15 @@ pub(crate) struct World {
 }
 
 impl World {
-    pub(crate) fn new(services: Arc<dyn BrowserServices>, document_url: Url) -> Self {
+    pub(crate) fn new(
+        services: Arc<dyn BrowserServices>,
+        document_url: Url,
+        documents: Rc<RefCell<DocumentStore>>,
+    ) -> Self {
         Self {
-            parsed: None,
-            extra_documents: HashMap::new(),
+            documents,
+            document: None,
+            owned: HashSet::new(),
             document_url,
             services,
             pending_cancels: Vec::new(),
@@ -135,53 +145,37 @@ impl World {
         }
     }
 
-    /// Turns mutation recording on for every document in the world.
+    /// Turns mutation recording on for this realm's documents.
     pub(crate) fn set_recording(&mut self, recording: bool) {
-        if let Some(parsed) = self.parsed.as_mut() {
-            parsed.dom.set_record_mutations(recording);
-        }
-        for parsed in self.extra_documents.values_mut() {
-            parsed.dom.set_record_mutations(recording);
+        let mut documents = self.documents.borrow_mut();
+        for id in &self.owned {
+            if let Some(parsed) = documents.get_mut(*id) {
+                parsed.dom.set_record_mutations(recording);
+            }
         }
     }
 
-    /// Drains every document's mutation log and matches the mutations
+    /// Drains this realm's documents' mutation logs and matches the mutations
     /// against all registered observers, appending to their queues.
     pub(crate) fn drain_mutations(&mut self) {
-        let mut drained: Vec<(u32, Vec<dom::Mutation>)> = Vec::new();
-        if let Some(parsed) = self.parsed.as_mut() {
-            let mutations = parsed.dom.take_mutations();
-            if !mutations.is_empty() {
-                drained.push((parsed.dom.document_id(), mutations));
-            }
-        }
-        for parsed in self.extra_documents.values_mut() {
-            let mutations = parsed.dom.take_mutations();
-            if !mutations.is_empty() {
-                drained.push((parsed.dom.document_id(), mutations));
-            }
-        }
-        if drained.is_empty() || self.observers.is_empty() {
-            return;
-        }
         let World {
-            parsed,
-            extra_documents,
+            documents,
+            owned,
             observers,
             ..
         } = self;
-        for (document_id, mutations) in drained {
-            let dom = parsed
-                .as_ref()
-                .filter(|parsed| parsed.dom.document_id() == document_id)
-                .map(|parsed| &parsed.dom)
-                .or_else(|| extra_documents.get(&document_id).map(|parsed| &parsed.dom));
-            let Some(dom) = dom else {
+        let mut documents = documents.borrow_mut();
+        for id in owned.iter() {
+            let Some(parsed) = documents.get_mut(*id) else {
                 continue;
             };
+            let mutations = parsed.dom.take_mutations();
+            if mutations.is_empty() || observers.is_empty() {
+                continue;
+            }
             for mutation in mutations {
                 for observer in observers.values_mut() {
-                    if let Some(record) = match_observation(dom, observer, &mutation) {
+                    if let Some(record) = match_observation(&parsed.dom, observer, &mutation) {
                         observer.queue.push(record);
                     }
                 }
@@ -211,7 +205,10 @@ impl World {
     }
 
     pub(crate) fn replace_document(&mut self, parsed: Parsed) {
-        self.parsed = Some(parsed);
+        self.drop_active_document();
+        let id = self.documents.borrow_mut().insert(parsed);
+        self.document = Some(id);
+        self.owned.insert(id);
         self.document_ready = false;
         self.listeners.clear();
         self.wrappers.clear();
@@ -221,6 +218,46 @@ impl World {
         // A new realm owns fresh observers; navigation drops the old ones.
         self.observers.clear();
         self.delivery_scheduled = false;
+    }
+
+    /// Installs the frame's active document without clearing realm caches;
+    /// the parser owns the tree mid-parse.
+    pub(crate) fn set_document(&mut self, parsed: Parsed) {
+        self.drop_active_document();
+        let id = self.documents.borrow_mut().insert(parsed);
+        self.document = Some(id);
+        self.owned.insert(id);
+    }
+
+    fn drop_active_document(&mut self) {
+        if let Some(old) = self.document.take() {
+            self.owned.remove(&old);
+            self.documents.borrow_mut().remove(old);
+        }
+    }
+
+    /// The active document of the frame this realm belongs to.
+    pub(crate) fn main_document(&self) -> Option<Ref<'_, Parsed>> {
+        let id = self.document?;
+        Ref::filter_map(self.documents.borrow(), |store| store.get(id)).ok()
+    }
+
+    /// Mutable access to the active document.
+    pub(crate) fn main_document_mut(&self) -> Option<RefMut<'_, Parsed>> {
+        let id = self.document?;
+        RefMut::filter_map(self.documents.borrow_mut(), |store| store.get_mut(id)).ok()
+    }
+
+    /// Removes the active document from the store, for the parser to own.
+    pub(crate) fn take_main_document(&mut self) -> Option<Parsed> {
+        let id = self.document.take()?;
+        self.owned.remove(&id);
+        self.documents.borrow_mut().remove(id)
+    }
+
+    /// Id of the active document, when one is installed.
+    pub(crate) fn main_document_id(&self) -> Option<u32> {
+        self.document
     }
 
     /// One `DOMImplementation` object per document, for identity.
@@ -233,30 +270,44 @@ impl World {
     }
 
     /// The document tree that owns `id`.
-    pub(crate) fn document(&self, id: NodeId) -> Option<&Parsed> {
-        if let Some(parsed) = self.parsed.as_ref()
-            && parsed.dom.document_id() == id.document_id()
-        {
-            return Some(parsed);
-        }
-        self.extra_documents.get(&id.document_id())
+    pub(crate) fn document(&self, id: NodeId) -> Option<Ref<'_, Parsed>> {
+        Ref::filter_map(self.documents.borrow(), |store| store.get(id.document_id())).ok()
+    }
+
+    /// Runs `reader` against the tree owning `id`.
+    ///
+    /// Prefer this to [`World::document`] when a guard would outlive the
+    /// caller's `World` borrow; the tree borrow ends with the closure.
+    pub(crate) fn with_document<R>(
+        &self,
+        id: NodeId,
+        reader: impl FnOnce(&Parsed) -> R,
+    ) -> Option<R> {
+        let store = self.documents.borrow();
+        store.get(id.document_id()).map(reader)
+    }
+
+    /// Runs `reader` against the frame's active document.
+    pub(crate) fn with_main_document<R>(&self, reader: impl FnOnce(&Parsed) -> R) -> Option<R> {
+        let id = self.document?;
+        let store = self.documents.borrow();
+        store.get(id).map(reader)
     }
 
     /// Mutable version of [`World::document`].
-    pub(crate) fn document_mut(&mut self, id: NodeId) -> Option<&mut Parsed> {
-        if let Some(parsed) = self.parsed.as_ref()
-            && parsed.dom.document_id() == id.document_id()
-        {
-            return self.parsed.as_mut();
-        }
-        self.extra_documents.get_mut(&id.document_id())
+    pub(crate) fn document_mut(&self, id: NodeId) -> Option<RefMut<'_, Parsed>> {
+        RefMut::filter_map(self.documents.borrow_mut(), |store| {
+            store.get_mut(id.document_id())
+        })
+        .ok()
     }
 
     /// Stores a secondary document and returns its root id.
     pub(crate) fn add_document(&mut self, parsed: Parsed) -> NodeId {
-        let id = parsed.dom.document();
-        self.extra_documents.insert(id.document_id(), parsed);
-        id
+        let root = parsed.dom.document();
+        let id = self.documents.borrow_mut().insert(parsed);
+        self.owned.insert(id);
+        root
     }
 
     pub(crate) fn add_listener(&mut self, target: EventTargetKey, listener: Listener) {

@@ -389,7 +389,7 @@ impl Drop for JsRealm {
 }
 
 pub(crate) fn classic_script_at(world: &World, id: dom::NodeId) -> Option<ClassicScript> {
-    let parsed = world.parsed.as_ref()?;
+    let parsed = world.document(id)?;
     if !is_classic_script(&parsed.dom, id) {
         return None;
     }

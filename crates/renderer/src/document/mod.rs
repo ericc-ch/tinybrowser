@@ -3,7 +3,7 @@
 //! process owns the tab and drives navigation
 //! ([ADR 0011](../../../../docs/adrs/0011-renderer-processes-per-site.md)).
 
-use std::cell::{OnceCell, Ref, RefCell};
+use std::cell::{OnceCell, RefCell};
 use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -17,6 +17,7 @@ use tokio::runtime::Runtime as TokioRuntime;
 use tokio::time::Instant;
 use url::Url;
 
+use crate::documents::DocumentStore;
 use crate::js::{SharedJsRuntime, World};
 use crate::protocol::{BrowserServices, Mount, ScriptFailure, TabError, TabEvent};
 use crate::{ActiveParser, Parsed};
@@ -104,6 +105,8 @@ impl Waiter {
 pub struct Document {
     services: Arc<dyn BrowserServices>,
     world: Rc<RefCell<World>>,
+    /// The shared, realm-agnostic store this frame's trees live in.
+    documents: Rc<RefCell<DocumentStore>>,
     js_runtime: SharedJsRuntime,
     waiter: Waiter,
     url: Url,
@@ -145,15 +148,18 @@ impl Document {
             services,
             SharedJsRuntime::default(),
             Waiter::new(),
+            Rc::new(RefCell::new(DocumentStore::default())),
             Arc::new(Stop::new()),
         )
     }
 
-    /// A document sharing its renderer process's `QuickJS` heap and waiter.
+    /// A document sharing its renderer process's `QuickJS` heap, waiter, and
+    /// document store.
     pub(crate) fn with_shared(
         services: Arc<dyn BrowserServices>,
         js_runtime: SharedJsRuntime,
         waiter: Waiter,
+        documents: Rc<RefCell<DocumentStore>>,
         stop: Arc<Stop>,
     ) -> Self {
         let document_url = Url::parse("about:blank").expect("about:blank is a valid URL");
@@ -162,8 +168,10 @@ impl Document {
             world: Rc::new(RefCell::new(World::new(
                 Arc::clone(&services),
                 document_url.clone(),
+                Rc::clone(&documents),
             ))),
             services,
+            documents,
             js_runtime,
             waiter,
             url: document_url,
@@ -188,10 +196,12 @@ impl Document {
         }
     }
 
-    /// Last parse result, if any.
-    #[must_use]
-    pub fn parsed(&self) -> Option<Ref<'_, Parsed>> {
-        Ref::filter_map(self.world.borrow(), |world| world.parsed.as_ref()).ok()
+    /// Runs `reader` against the frame's active document, if any.
+    pub fn with_parsed<R>(&self, reader: impl FnOnce(&Parsed) -> R) -> Option<R> {
+        let id = self.world.borrow().main_document_id()?;
+        let documents = Rc::clone(&self.documents);
+        let store = documents.borrow();
+        store.get(id).map(reader)
     }
 
     /// Document URL (cookie initiator and relative-URL base).
@@ -210,7 +220,7 @@ impl Document {
     /// Records the document-level `Content-Language` default.
     pub fn set_content_language(&mut self, value: Option<String>) {
         self.content_language.clone_from(&value);
-        if let Some(parsed) = self.world.borrow_mut().parsed.as_mut() {
+        if let Some(mut parsed) = self.world.borrow().main_document_mut() {
             parsed.dom.set_document_language(value);
         }
     }
@@ -366,9 +376,9 @@ impl Document {
                             continue;
                         }
                     } else {
-                        self.world.borrow_mut().parsed = Some(parsed);
+                        self.world.borrow_mut().set_document(parsed);
                     }
-                    if let Some(parsed) = self.world.borrow_mut().parsed.as_mut() {
+                    if let Some(mut parsed) = self.world.borrow().main_document_mut() {
                         parsed
                             .dom
                             .set_document_language(self.content_language.clone());
@@ -410,7 +420,7 @@ impl Document {
                             return;
                         }
                     } else {
-                        self.world.borrow_mut().parsed = Some(parsed);
+                        self.world.borrow_mut().set_document(parsed);
                     }
                     self.world.borrow_mut().parser_active = false;
                     self.fire_document_load();
@@ -432,7 +442,7 @@ impl Document {
 
     fn base_url(&self) -> Url {
         let world = self.world.borrow();
-        let Some(parsed) = world.parsed.as_ref() else {
+        let Some(parsed) = world.main_document() else {
             return self.url.clone();
         };
         let Ok(Some(base_el)) = parsed.dom.select_first(parsed.dom.document(), "base[href]") else {
@@ -518,7 +528,7 @@ impl Document {
         };
         let mut world = self.world.borrow_mut();
         let writes = std::mem::take(&mut world.pending_html_writes).concat();
-        if let Some(parsed) = world.parsed.take() {
+        if let Some(parsed) = world.take_main_document() {
             parser.restore(parsed);
         }
         drop(world);
