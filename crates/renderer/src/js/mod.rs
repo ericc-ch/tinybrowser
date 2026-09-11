@@ -241,6 +241,22 @@ impl JsRealm {
         })
     }
 
+    /// Microtask checkpoint for parser-driven mutations: schedules the
+    /// delivery microtask when records are pending and runs the job queue.
+    ///
+    /// Parser insertions record mutations without entering a JS binding, so
+    /// nothing else schedules delivery. Called between parser scripts, where
+    /// the spec drains microtasks before the next script runs.
+    pub(crate) fn deliver_mutations(&self) -> Result<(), JsError> {
+        self.with_budget(None, || {
+            let scheduled: Result<(), JsError> = self
+                .context
+                .with(|ctx| bindings::schedule_mutation_delivery(&ctx).map_err(JsError::engine));
+            let jobs = self.run_jobs();
+            scheduled.and(jobs)
+        })
+    }
+
     fn with_budget<T>(
         &self,
         deadline: Option<Instant>,

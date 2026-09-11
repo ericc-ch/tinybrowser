@@ -770,10 +770,25 @@ impl Dom {
             reference = self.sibling(node, true);
         }
         let added = self.incoming_nodes(node);
+        // Adopt `node` first: removing it from its old parent stays
+        // observable even though the replacement suppresses observers
+        // (<https://dom.spec.whatwg.org/#concept-node-adopt>). Its connection
+        // transitions coalesce, like every other move.
+        self.record_unlink(node);
+        // Remove `child` and insert `node` with observers suppressed
+        // (<https://dom.spec.whatwg.org/#concept-node-replace>). The removal
+        // still runs the removing steps, so iframe connection transitions
+        // fire: a replaced iframe's frame must not survive.
+        let mut removed = Vec::new();
         self.recording_suppressed = true;
-        self.unlink_from_current_parent(child);
-        if let Some(detached) = self.node_mut(child) {
-            detached.parent = None;
+        if child != node && self.parent(child) == Some(parent) {
+            let child_snapshot = self.connection_snapshot(child);
+            self.unlink_from_current_parent(child);
+            if let Some(detached) = self.node_mut(child) {
+                detached.parent = None;
+            }
+            self.record_snapshot(child_snapshot);
+            removed.push(child);
         }
         if self.is_fragment(node) {
             self.splice_fragment(parent, node, reference);
@@ -784,7 +799,7 @@ impl Dom {
         self.record(Mutation::ChildList {
             target: parent,
             added,
-            removed: vec![child],
+            removed,
             previous,
             next: reference,
         });
@@ -1228,10 +1243,18 @@ impl Dom {
         };
         let mut removed = false;
         let mut removed_value = None;
+        let mut recorded_name = String::new();
+        let mut recorded_namespace = String::new();
         attributes.retain(|attribute| {
             if !removed && Self::qualified_name(&attribute.name) == local {
                 removed = true;
                 removed_value = Some(attribute.value.clone());
+                // `MutationRecord.attributeName` is the attribute's local
+                // name and `attributeNamespace` its namespace, not the
+                // queried qualified name
+                // (<https://dom.spec.whatwg.org/#dom-mutationrecord-attributename>).
+                recorded_name = attribute.name.local.to_string();
+                recorded_namespace = attribute.name.ns.to_string();
                 return false;
             }
             true
@@ -1239,8 +1262,8 @@ impl Dom {
         if removed {
             self.record(Mutation::Attributes {
                 target: id,
-                name: local,
-                namespace: String::new(),
+                name: recorded_name,
+                namespace: recorded_namespace,
                 old_value: removed_value,
             });
         }
@@ -1349,13 +1372,19 @@ impl Dom {
         }
         self.recording_suppressed = false;
         self.record_snapshot(removed_snapshot);
-        self.record(Mutation::ChildList {
-            target: parent,
-            added,
-            removed,
-            previous: None,
-            next: None,
-        });
+        // "If either addedNodes or removedNodes is not empty, then queue a
+        // tree mutation record" (<https://dom.spec.whatwg.org/#concept-node-replace-all>):
+        // e.g. `textContent = ""` on an already-empty element changes nothing
+        // and is silent.
+        if !added.is_empty() || !removed.is_empty() {
+            self.record(Mutation::ChildList {
+                target: parent,
+                added,
+                removed,
+                previous: None,
+                next: None,
+            });
+        }
         Ok(())
     }
 
@@ -1432,7 +1461,7 @@ impl Dom {
             return Err(DomError::WrongNodeType);
         };
         let value = value.into();
-        let recorded_name = Self::qualified_name(&name);
+        let recorded_name = name.local.to_string();
         let recorded_namespace = name.ns.to_string();
         let old_value = attributes
             .iter()
@@ -1480,25 +1509,32 @@ impl Dom {
             local.to_owned()
         };
         let value = value.into();
-        let old_value = attributes
+        let existing = attributes
             .iter()
-            .find(|attribute| Self::qualified_name(&attribute.name) == local)
-            .map(|attribute| attribute.value.clone());
-        if let Some(existing) = attributes
-            .iter_mut()
-            .find(|attribute| Self::qualified_name(&attribute.name) == local)
-        {
-            existing.value = value;
+            .position(|attribute| Self::qualified_name(&attribute.name) == local);
+        // A matched attribute can carry a namespace even though the query is
+        // unnamespaced (`setAttribute("xlink:href", …)` on an SVG element);
+        // the record reports the changed attribute's real name and namespace
+        // (<https://dom.spec.whatwg.org/#dom-mutationrecord-attributename>).
+        let (recorded_name, recorded_namespace, old_value) = if let Some(index) = existing {
+            let attribute = &mut attributes[index];
+            let old_value = std::mem::replace(&mut attribute.value, value);
+            (
+                attribute.name.local.to_string(),
+                attribute.name.ns.to_string(),
+                Some(old_value),
+            )
         } else {
             attributes.push(Attribute {
                 name: QualName::new(None, Namespace::from(""), LocalName::from(local.as_str())),
                 value,
             });
-        }
+            (local, String::new(), None)
+        };
         self.record(Mutation::Attributes {
             target: id,
-            name: local,
-            namespace: String::new(),
+            name: recorded_name,
+            namespace: recorded_namespace,
             old_value,
         });
         Ok(())
@@ -1699,41 +1735,39 @@ impl Dom {
     fn place_node(&mut self, parent: NodeId, node: NodeId, before: Option<NodeId>) {
         let tracked = self.connection_snapshot(node);
         self.unlink_from_current_parent(node);
-        let (previous, next) = {
-            let list: Vec<NodeId> = self
-                .children(parent)
+        // Insertion index; `None` appends. The sibling references for the
+        // mutation record are computed only while recording: the child-list
+        // copy this used to do was per-insert overhead on the parse path,
+        // where no observer exists.
+        let position = before.map(|sibling| {
+            self.children(parent)
                 .expect("verified-live parent has no child list")
-                .copied()
-                .collect();
-            match before {
+                .position(|&entry| entry == sibling)
+                .expect("live sibling missing from its own parent's list")
+        });
+        let (previous, next) = if self.record_mutations && !self.recording_suppressed {
+            let list = self
+                .children(parent)
+                .expect("verified-live parent has no child list");
+            match position {
                 None => (list.last().copied(), None),
-                Some(sibling) => {
-                    let position = list
-                        .iter()
-                        .position(|&entry| entry == sibling)
-                        .expect("live sibling missing from its own parent's list");
-                    (
-                        position
-                            .checked_sub(1)
-                            .and_then(|index| list.get(index))
-                            .copied(),
-                        Some(sibling),
-                    )
-                }
+                Some(index) => (
+                    index
+                        .checked_sub(1)
+                        .and_then(|previous| list.clone().nth(previous))
+                        .copied(),
+                    list.clone().nth(index).copied(),
+                ),
             }
+        } else {
+            (None, None)
         };
         let list = self
             .children_mut(parent)
             .expect("verified-live parent has no child list");
-        match before {
+        match position {
             None => list.push(node),
-            Some(sibling) => {
-                let position = list
-                    .iter()
-                    .position(|&entry| entry == sibling)
-                    .expect("live sibling missing from its own parent's list");
-                list.insert(position, node);
-            }
+            Some(index) => list.insert(index, node),
         }
         if let Some(attached) = self.node_mut(node) {
             attached.parent = Some(parent);
@@ -1865,6 +1899,50 @@ impl Dom {
         false
     }
 
+    /// Queues the removal record for `id` from its current parent, without
+    /// touching the tree.
+    ///
+    /// Shared by [`Dom::unlink_from_current_parent`] and the replace
+    /// algorithm's adopt step, whose removal is observable even though the
+    /// rest of the replacement suppresses observers
+    /// (<https://dom.spec.whatwg.org/#concept-node-adopt>). The caller has
+    /// verified `id` live; a missing list entry is arena corruption.
+    fn record_unlink(&mut self, id: NodeId) {
+        if !self.record_mutations || self.recording_suppressed {
+            return;
+        }
+        let Some(parent) = self.parent(id) else {
+            return;
+        };
+        let mut previous = None;
+        let mut next = None;
+        let mut found = false;
+        for &entry in self
+            .children(parent)
+            .expect("live parent has no child list")
+        {
+            if entry == id {
+                found = true;
+            } else if found {
+                next = Some(entry);
+                break;
+            } else {
+                previous = Some(entry);
+            }
+        }
+        assert!(
+            found,
+            "child missing from the very list its parent pointer names"
+        );
+        self.record(Mutation::ChildList {
+            target: parent,
+            added: Vec::new(),
+            removed: vec![id],
+            previous,
+            next,
+        });
+    }
+
     /// Removes `id` from whichever list currently holds it.
     ///
     /// Defect policy, like every other structural site in this module: `id`
@@ -1874,38 +1952,15 @@ impl Dom {
     /// parents (or none), which later mutations would compound.
     fn unlink_from_current_parent(&mut self, id: NodeId) {
         if let Some(old_parent) = self.parent(id) {
-            let (previous, next) = {
-                let list: Vec<NodeId> = self
-                    .children(old_parent)
-                    .expect("live parent has no child list")
-                    .copied()
-                    .collect();
-                let position = list
-                    .iter()
-                    .position(|&entry| entry == id)
-                    .expect("child missing from the very list its parent pointer names");
-                (
-                    position
-                        .checked_sub(1)
-                        .and_then(|index| list.get(index))
-                        .copied(),
-                    list.get(position + 1).copied(),
-                )
-            };
-            self.record(Mutation::ChildList {
-                target: old_parent,
-                added: Vec::new(),
-                removed: vec![id],
-                previous,
-                next,
-            });
+            let position = self
+                .children(old_parent)
+                .expect("live parent has no child list")
+                .position(|&entry| entry == id)
+                .expect("child missing from the very list its parent pointer names");
+            self.record_unlink(id);
             let list = self
                 .children_mut(old_parent)
                 .expect("live parent has no child list");
-            let position = list
-                .iter()
-                .position(|&entry| entry == id)
-                .expect("child missing from the very list its parent pointer names");
             list.remove(position);
         }
     }

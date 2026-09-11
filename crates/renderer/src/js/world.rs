@@ -110,8 +110,22 @@ pub(crate) struct RecordData {
 
 pub(crate) struct ObserverState {
     pub callback: Persistent<Function<'static>>,
+    /// The observer platform object, for the callback's `this` value and
+    /// second argument
+    /// (<https://dom.spec.whatwg.org/#notify-mutation-observers>). Present
+    /// while the observer is registered; cleared by `disconnect`.
+    pub object: Option<Persistent<Object<'static>>>,
     pub observations: Vec<Observation>,
     pub queue: Vec<RecordData>,
+}
+
+/// One observer with queued records, ready for callback delivery.
+pub(crate) struct ReadyObserver {
+    /// Creation-order id; delivery follows it.
+    pub id: u64,
+    pub callback: Persistent<Function<'static>>,
+    pub object: Persistent<Object<'static>>,
+    pub records: Vec<RecordData>,
 }
 
 pub(crate) struct Listener {
@@ -243,16 +257,26 @@ impl World {
             .unwrap_or_default()
     }
 
-    /// Removes observers that have queued records, for callback delivery.
-    pub(crate) fn take_ready(
-        &mut self,
-    ) -> Vec<(u64, Persistent<Function<'static>>, Vec<RecordData>)> {
+    /// Removes observers that have queued records, for callback delivery
+    /// (<https://dom.spec.whatwg.org/#notify-mutation-observers>).
+    ///
+    /// Sorted by observer id so delivery is deterministic and follows
+    /// registration order; `HashMap` iteration order is not.
+    pub(crate) fn take_ready(&mut self) -> Vec<ReadyObserver> {
         let mut ready = Vec::new();
         for (&id, state) in &mut self.observers {
-            if !state.queue.is_empty() {
-                ready.push((id, state.callback.clone(), std::mem::take(&mut state.queue)));
+            if !state.queue.is_empty()
+                && let Some(object) = &state.object
+            {
+                ready.push(ReadyObserver {
+                    id,
+                    callback: state.callback.clone(),
+                    object: object.clone(),
+                    records: std::mem::take(&mut state.queue),
+                });
             }
         }
+        ready.sort_by_key(|observer| observer.id);
         ready
     }
 
@@ -453,6 +477,11 @@ impl World {
 
 /// Whether `mutation` is observable by `observer`, producing a record when
 /// it is (<https://dom.spec.whatwg.org/#concept-mo-queue>).
+///
+/// Every in-scope, enabled registration contributes; one observer gets one
+/// record per mutation, and it carries the old value when *any* interested
+/// registration asked for it (the spec's `interestedObservers` map folds the
+/// registrations per observer).
 fn match_observation(
     dom: &dom::Dom,
     observer: &ObserverState,
@@ -463,6 +492,9 @@ fn match_observation(
         dom::Mutation::Attributes { target, .. } => (*target, 1_u8),
         dom::Mutation::CharacterData { target, .. } => (*target, 2_u8),
     };
+    let mut matched = false;
+    let mut want_attribute_old_value = false;
+    let mut want_character_data_old_value = false;
     for observation in &observer.observations {
         let in_scope = observation.target.0 == target
             || (observation.options.subtree
@@ -475,9 +507,15 @@ fn match_observation(
             1 => {
                 observation.options.attributes
                     && match (&observation.options.attribute_filter, mutation) {
-                        (Some(filter), dom::Mutation::Attributes { name, .. }) => {
-                            filter.iter().any(|wanted| wanted == name)
-                        }
+                        // A filter only ever matches unnamespaced attributes;
+                        // namespaced ones are always skipped
+                        // (<https://dom.spec.whatwg.org/#queue-a-mutation-record>).
+                        (
+                            Some(filter),
+                            dom::Mutation::Attributes {
+                                name, namespace, ..
+                            },
+                        ) => namespace.is_empty() && filter.iter().any(|wanted| wanted == name),
                         _ => true,
                     }
             }
@@ -486,12 +524,24 @@ fn match_observation(
         if !enabled {
             continue;
         }
-        return Some(record(observation, mutation));
+        matched = true;
+        want_attribute_old_value |= observation.options.attribute_old_value;
+        want_character_data_old_value |= observation.options.character_data_old_value;
     }
-    None
+    matched.then(|| {
+        record(
+            want_attribute_old_value,
+            want_character_data_old_value,
+            mutation,
+        )
+    })
 }
 
-fn record(observation: &Observation, mutation: &dom::Mutation) -> RecordData {
+fn record(
+    want_attribute_old_value: bool,
+    want_character_data_old_value: bool,
+    mutation: &dom::Mutation,
+) -> RecordData {
     match mutation {
         dom::Mutation::ChildList {
             target,
@@ -524,9 +574,7 @@ fn record(observation: &Observation, mutation: &dom::Mutation) -> RecordData {
             next: None,
             attribute_name: Some(name.clone()),
             attribute_namespace: (!namespace.is_empty()).then(|| namespace.clone()),
-            old_value: observation
-                .options
-                .attribute_old_value
+            old_value: want_attribute_old_value
                 .then(|| old_value.clone())
                 .flatten(),
         },
@@ -539,10 +587,7 @@ fn record(observation: &Observation, mutation: &dom::Mutation) -> RecordData {
             next: None,
             attribute_name: None,
             attribute_namespace: None,
-            old_value: observation
-                .options
-                .character_data_old_value
-                .then(|| old_value.clone()),
+            old_value: want_character_data_old_value.then(|| old_value.clone()),
         },
     }
 }

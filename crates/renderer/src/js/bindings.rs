@@ -1493,6 +1493,7 @@ impl JsMutationObserver {
             id,
             ObserverState {
                 callback: Persistent::save(&ctx, callback),
+                object: None,
                 observations: Vec::new(),
                 queue: Vec::new(),
             },
@@ -1502,7 +1503,13 @@ impl JsMutationObserver {
 
     // https://dom.spec.whatwg.org/#dom-mutationobserver-observe
     #[qjs(rename = "observe")]
-    fn observe<'js>(&self, ctx: Ctx<'js>, target: Value<'js>, options: Object<'js>) -> Result<()> {
+    fn observe<'js>(
+        &self,
+        ctx: Ctx<'js>,
+        this: This<Object<'js>>,
+        target: Value<'js>,
+        options: Object<'js>,
+    ) -> Result<()> {
         let target = required_node(&ctx, &target)?;
         let attributes_present = options.contains_key("attributes")?;
         let attributes = option_truthy(&ctx, &options, "attributes")?;
@@ -1562,13 +1569,30 @@ impl JsMutationObserver {
         }
         let world_rc = world(&ctx)?;
         let mut world = world_rc.borrow_mut();
+        // Records already in the log belong to observers registered before
+        // this call; this observer's stream starts at registration. The spec
+        // queues records only to already-registered observers, so the defer
+        // has to close the gap here.
+        world.drain_mutations();
         let Some(observer) = world.observers.get_mut(&self.id) else {
             return Ok(());
         };
-        observer.observations.push(Observation {
-            target: Handle(target),
-            options: parsed,
-        });
+        // One registration per (observer, target): a repeated observe
+        // replaces the options instead of adding a second registration
+        // (<https://dom.spec.whatwg.org/#dom-mutationobserver-observe>).
+        if let Some(existing) = observer
+            .observations
+            .iter_mut()
+            .find(|observation| observation.target.0 == target)
+        {
+            existing.options = parsed;
+        } else {
+            observer.observations.push(Observation {
+                target: Handle(target),
+                options: parsed,
+            });
+        }
+        observer.object = Some(Persistent::save(&ctx, this.0));
         world.set_recording(true);
         Ok(())
     }
@@ -1578,8 +1602,17 @@ impl JsMutationObserver {
     fn disconnect(&self, ctx: Ctx<'_>) -> Result<()> {
         let world_rc = world(&ctx)?;
         let mut world = world_rc.borrow_mut();
-        world.observers.remove(&self.id);
-        if world.observers.is_empty() {
+        if let Some(observer) = world.observers.get_mut(&self.id) {
+            observer.observations.clear();
+            observer.queue.clear();
+            observer.object = None;
+        }
+        // Recording costs nothing while nobody has a registration.
+        if world
+            .observers
+            .values()
+            .all(|observer| observer.observations.is_empty())
+        {
             world.set_recording(false);
         }
         Ok(())
@@ -1703,13 +1736,25 @@ fn main_document(ctx: &Ctx<'_>) -> Result<NodeId> {
 }
 
 /// Delivers queued records to observer callbacks; installed as a global and
-/// scheduled as a microtask after every mutation.
+/// scheduled as a microtask after every mutation
+/// (<https://dom.spec.whatwg.org/#notify-mutation-observers>).
 #[allow(
     clippy::needless_pass_by_value,
     reason = "rquickjs Func ABI passes Ctx by value"
 )]
 fn deliver_mutations(ctx: Ctx<'_>) -> Result<()> {
-    let world_rc = world(&ctx)?;
+    let result = deliver_ready(&ctx);
+    // Release the schedule slot even when a callback threw; otherwise a
+    // throwing observer would silently stop every later delivery.
+    world(&ctx)?.borrow_mut().delivery_scheduled = false;
+    result
+}
+
+fn deliver_ready(ctx: &Ctx<'_>) -> Result<()> {
+    let world_rc = world(ctx)?;
+    // A callback can mutate again and queue more records; keep draining until
+    // nothing is left.
+    let mut first_error = None;
     loop {
         let ready = {
             let mut world = world_rc.borrow_mut();
@@ -1719,33 +1764,48 @@ fn deliver_mutations(ctx: Ctx<'_>) -> Result<()> {
         if ready.is_empty() {
             break;
         }
-        for (id, callback, records) in ready {
+        for observer in ready {
             let array = rquickjs::Array::new(ctx.clone())?;
-            for (index, record) in records.into_iter().enumerate() {
+            for (index, record) in observer.records.into_iter().enumerate() {
                 array.set(
                     index,
                     Class::instance(ctx.clone(), JsMutationRecord { record })?.into_value(),
                 )?;
             }
-            let observer = Class::instance(ctx.clone(), JsMutationObserver { id })?;
-            let callback = callback.restore(&ctx)?;
-            callback.call::<_, ()>((array, Class::into_value(observer)))?;
+            let object = observer.object.restore(ctx)?;
+            let callback = observer.callback.restore(ctx)?;
+            // The callback's `this` value and second argument are the
+            // observer object. A throwing callback is reported and does not
+            // stop the remaining observers.
+            if let Err(error) = callback.call::<_, ()>((This(object.clone()), array, object))
+                && first_error.is_none()
+            {
+                first_error = Some(error);
+            }
         }
     }
-    world_rc.borrow_mut().delivery_scheduled = false;
-    Ok(())
+    match first_error {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
 }
 
-/// Schedules one microtask that drains the mutation log, if needed.
-fn schedule_mutation_delivery(ctx: &Ctx<'_>) -> Result<()> {
+/// Schedules one microtask that delivers queued records, if needed.
+///
+/// Matching runs here, not at delivery time: a mutation's observer scope is
+/// decided by the tree shape it happened in, and a moved or newly attached
+/// node must not retroactively pull an earlier mutation into a different
+/// observer (`<https://dom.spec.whatwg.org/#queue-a-mutation-record>` picks
+/// interested observers when the mutation is queued).
+pub(super) fn schedule_mutation_delivery(ctx: &Ctx<'_>) -> Result<()> {
     let world_rc = world(ctx)?;
-    {
-        let mut world = world_rc.borrow_mut();
-        if world.observers.is_empty() || world.delivery_scheduled {
-            return Ok(());
-        }
-        world.delivery_scheduled = true;
+    let mut world = world_rc.borrow_mut();
+    world.drain_mutations();
+    if world.observers.is_empty() || world.delivery_scheduled {
+        return Ok(());
     }
+    world.delivery_scheduled = true;
+    drop(world);
     let deliver: Function = ctx.globals().get("__tb_deliver_mutations")?;
     let queue: Function = ctx.globals().get("queueMicrotask")?;
     queue.call::<_, ()>((deliver,))

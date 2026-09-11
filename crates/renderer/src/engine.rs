@@ -270,7 +270,13 @@ impl Engine {
         let deadline = Instant::now() + budget;
         loop {
             for document in self.frames.values_mut() {
-                document.drive_for(FRAME_STEP);
+                let now = Instant::now();
+                if now >= deadline {
+                    return;
+                }
+                // Each frame gets at most one step, and never past the shared
+                // deadline: many frames must not multiply the budget.
+                document.drive_for(FRAME_STEP.min(deadline - now));
             }
             if Instant::now() >= deadline || !self.has_background_work() {
                 return;

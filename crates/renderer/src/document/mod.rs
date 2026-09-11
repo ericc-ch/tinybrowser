@@ -369,6 +369,17 @@ impl Document {
         self.adopt_js_work();
     }
 
+    /// Drains parser-driven mutation records at a microtask checkpoint
+    /// (<https://html.spec.whatwg.org/multipage/webappapis.html#perform-a-microtask-checkpoint>).
+    /// Parser insertions bypass the JS bindings that schedule delivery, so
+    /// the document's `MutationObserver`s would otherwise not fire until the
+    /// next scripted mutation.
+    fn deliver_mutations(&mut self) {
+        if let Some(js) = &self.js {
+            note_script(&mut self.events, js.deliver_mutations().is_err());
+        }
+    }
+
     // https://html.spec.whatwg.org/multipage/parsing.html#parsing-main-intext
     // https://html.spec.whatwg.org/multipage/scripting.html#prepare-the-script-element
     fn advance_parser(&mut self) {
@@ -396,6 +407,9 @@ impl Document {
                             .dom
                             .set_document_language(self.content_language.clone());
                     }
+                    // Microtask checkpoint before the script runs; parser
+                    // mutations queued since the last script deliver now.
+                    self.deliver_mutations();
                     let script = crate::js::classic_script_at(&self.world.borrow(), id);
                     match script {
                         Some(crate::js::ClassicScript::Inline(source)) => {
@@ -438,6 +452,8 @@ impl Document {
                         self.register_document(document);
                     }
                     self.world.borrow_mut().parser_active = false;
+                    // Deliver parser mutations before the load event.
+                    self.deliver_mutations();
                     self.fire_document_load();
                     return;
                 }
