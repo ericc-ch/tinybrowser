@@ -14,8 +14,8 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use renderer::{
-    BrowserServices, Command as RendererCommand, FromRenderer, Reply, ServiceCall, ServiceReply,
-    Stop, TabError, TabEvent, ToRenderer,
+    BrowserServices, Command as RendererCommand, FrameId, FromRenderer, Reply, ServiceCall,
+    ServiceReply, Stop, TabError, TabEvent, ToRenderer,
 };
 use url::Url;
 
@@ -42,13 +42,16 @@ pub enum Renderers {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct RendererId(u64);
 
+/// Live subscribers to one renderer's frame-tagged document events.
+type EventSubscribers = Arc<Mutex<Vec<Sender<(FrameId, TabEvent)>>>>;
+
 /// Value-only handle to one renderer.
 pub struct RendererHandle {
     id: RendererId,
     site: Site,
     sink: Sink,
     pending: Arc<Mutex<HashMap<u64, Sender<Reply>>>>,
-    subscribers: Arc<Mutex<Vec<Sender<TabEvent>>>>,
+    subscribers: EventSubscribers,
     next_request: Arc<AtomicU64>,
     stop: Option<Arc<Stop>>,
     child: Option<Arc<Mutex<Child>>>,
@@ -100,7 +103,7 @@ impl RendererHandle {
 
     /// Subscribes to renderer document events after this call.
     #[must_use]
-    pub fn subscribe(&self) -> Receiver<TabEvent> {
+    pub fn subscribe(&self) -> Receiver<(FrameId, TabEvent)> {
         let (tx, rx) = mpsc::channel();
         self.subscribers
             .lock()
@@ -367,7 +370,7 @@ fn pump_loop(
     incoming: Incoming,
     sink: &Sink,
     pending: &Arc<Mutex<HashMap<u64, Sender<Reply>>>>,
-    subscribers: &Arc<Mutex<Vec<Sender<TabEvent>>>>,
+    subscribers: &EventSubscribers,
     fetch: &FetchHandle,
     child: Option<&Arc<Mutex<Child>>>,
     ready: Option<Sender<bool>>,
@@ -422,7 +425,7 @@ fn route(
     message: FromRenderer,
     sink: &Sink,
     pending: &Arc<Mutex<HashMap<u64, Sender<Reply>>>>,
-    subscribers: &Arc<Mutex<Vec<Sender<TabEvent>>>>,
+    subscribers: &EventSubscribers,
     fetch: &FetchHandle,
     offload_dials: bool,
 ) {
@@ -438,11 +441,11 @@ fn route(
                 let _ = reply_tx.send(reply);
             }
         }
-        FromRenderer::Event(event) => {
+        FromRenderer::Event { frame, event } => {
             subscribers
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
-                .retain(|subscriber| subscriber.send(event).is_ok());
+                .retain(|subscriber| subscriber.send((frame, event)).is_ok());
         }
         FromRenderer::ServiceCall { id, call } => {
             if offload_dials && let ServiceCall::Dial(request) = call {

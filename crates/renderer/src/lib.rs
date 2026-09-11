@@ -8,7 +8,7 @@
 
 use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::time::Duration;
@@ -185,7 +185,7 @@ pub fn run_with_stop(
     stop: &Arc<Stop>,
 ) {
     let mut engine = Engine::with_stop(services, Arc::clone(stop));
-    let mut published = 0;
+    let mut published = HashMap::new();
     loop {
         let received = if engine.has_background_work() {
             inbox.recv_timeout(Duration::from_millis(10))
@@ -216,17 +216,20 @@ fn handle_command(
     stop: &Arc<document::Stop>,
 ) -> (Reply, bool) {
     match command {
-        Command::Mount(mount) => {
-            engine.mount(&mount);
-            (Reply::Unit(Ok(())), false)
-        }
-        Command::Eval { source } => (Reply::Text(engine.eval(&source)), false),
-        Command::ExecuteScript { source, timeout_ms } => {
+        Command::Mount { frame, mount } => (Reply::Unit(engine.mount_frame(frame, &mount)), false),
+        Command::Eval { frame, source } => (Reply::Text(engine.eval_in(frame, &source)), false),
+        Command::ExecuteScript {
+            frame,
+            source,
+            timeout_ms,
+        } => {
             let timeout = timeout_ms.map(Duration::from_millis);
-            let value = engine.execute_remote(&source, timeout);
+            let value = engine.execute_remote_in(frame, &source, timeout);
             (Reply::Value(value), false)
         }
-        Command::SetDocumentUrl { url } => (Reply::Unit(engine.set_document_url(&url)), false),
+        Command::SetDocumentUrl { frame, url } => {
+            (Reply::Unit(engine.set_document_url_in(frame, &url)), false)
+        }
         Command::IsIdle => (Reply::Bool(!engine.has_background_work()), false),
         Command::Shutdown => {
             stop.request();
@@ -235,12 +238,17 @@ fn handle_command(
     }
 }
 
-fn publish(engine: &Engine, published: &mut usize, outbox: &Sender<FromRenderer>) {
-    let events = engine.events();
-    for event in &events[*published..] {
-        let _ = outbox.send(FromRenderer::Event(*event));
+fn publish(engine: &Engine, cursors: &mut HashMap<FrameId, usize>, outbox: &Sender<FromRenderer>) {
+    for (frame, document) in engine.frames() {
+        let cursor = cursors.entry(frame).or_default();
+        for event in &document.events()[*cursor..] {
+            let _ = outbox.send(FromRenderer::Event {
+                frame,
+                event: *event,
+            });
+        }
+        *cursor = document.events().len();
     }
-    *published = events.len();
 }
 
 // ── the sink ────────────────────────────────────────────────────────────────

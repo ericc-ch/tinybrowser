@@ -83,6 +83,13 @@ impl Engine {
         self.frames.get_mut(&frame)
     }
 
+    /// Every frame the engine currently hosts, with its id.
+    pub fn frames(&self) -> impl Iterator<Item = (FrameId, &Document)> {
+        self.frames
+            .iter()
+            .map(|(&frame, document)| (frame, document))
+    }
+
     /// The tab's main frame.
     fn main(&self) -> &Document {
         self.frames
@@ -101,6 +108,19 @@ impl Engine {
         self.main_mut().mount(mount);
     }
 
+    /// Replaces one frame's document from a host mount.
+    ///
+    /// # Errors
+    ///
+    /// [`TabError::UnknownFrame`] when the engine does not host `frame`.
+    pub fn mount_frame(&mut self, frame: FrameId, mount: &Mount) -> Result<(), TabError> {
+        let document = self
+            .frame_mut(frame)
+            .ok_or(TabError::UnknownFrame { frame: frame.get() })?;
+        document.mount(mount);
+        Ok(())
+    }
+
     /// Parses `html` into the main frame and starts a new realm.
     pub fn load_html(&mut self, html: &str) {
         self.main_mut().load_html(html);
@@ -112,7 +132,18 @@ impl Engine {
     ///
     /// [`TabError::Script`] when the engine cannot start or the script throws.
     pub fn eval(&mut self, source: &str) -> Result<String, TabError> {
-        self.main_mut().eval(source)
+        self.eval_in(FrameId::MAIN, source)
+    }
+
+    /// Evaluates `source` in one frame and returns its string coercion.
+    ///
+    /// # Errors
+    ///
+    /// [`TabError::UnknownFrame`] or [`TabError::Script`].
+    pub fn eval_in(&mut self, frame: FrameId, source: &str) -> Result<String, TabError> {
+        self.frame_mut(frame)
+            .ok_or(TabError::UnknownFrame { frame: frame.get() })?
+            .eval(source)
     }
 
     /// Evaluates `source` in the main frame and returns a value-only result.
@@ -121,7 +152,22 @@ impl Engine {
     ///
     /// Same as [`Engine::eval`].
     pub fn execute_script(&mut self, source: &str) -> Result<ScriptValue, TabError> {
-        self.main_mut().execute_script(source)
+        self.execute_script_in(FrameId::MAIN, source)
+    }
+
+    /// Evaluates `source` in one frame and returns a value-only result.
+    ///
+    /// # Errors
+    ///
+    /// [`TabError::UnknownFrame`] or [`TabError::Script`].
+    pub fn execute_script_in(
+        &mut self,
+        frame: FrameId,
+        source: &str,
+    ) -> Result<ScriptValue, TabError> {
+        self.frame_mut(frame)
+            .ok_or(TabError::UnknownFrame { frame: frame.get() })?
+            .execute_script(source)
     }
 
     /// Evaluates `source` and interns node handles for the protocol.
@@ -134,7 +180,23 @@ impl Engine {
         source: &str,
         timeout: Option<Duration>,
     ) -> Result<RemoteValue, TabError> {
-        self.main_mut().execute_remote(source, timeout)
+        self.execute_remote_in(FrameId::MAIN, source, timeout)
+    }
+
+    /// Evaluates `source` in one frame and interns node handles for the protocol.
+    ///
+    /// # Errors
+    ///
+    /// [`TabError::UnknownFrame`] or [`TabError::Script`].
+    pub fn execute_remote_in(
+        &mut self,
+        frame: FrameId,
+        source: &str,
+        timeout: Option<Duration>,
+    ) -> Result<RemoteValue, TabError> {
+        self.frame_mut(frame)
+            .ok_or(TabError::UnknownFrame { frame: frame.get() })?
+            .execute_remote(source, timeout)
     }
 
     /// Sets the main frame's document URL.
@@ -143,7 +205,18 @@ impl Engine {
     ///
     /// [`TabError::InvalidUrl`] when `url` is not an absolute URL.
     pub fn set_document_url(&mut self, url: &str) -> Result<(), TabError> {
-        self.main_mut().set_document_url(url)
+        self.set_document_url_in(FrameId::MAIN, url)
+    }
+
+    /// Sets one frame's document URL.
+    ///
+    /// # Errors
+    ///
+    /// [`TabError::UnknownFrame`] or [`TabError::InvalidUrl`].
+    pub fn set_document_url_in(&mut self, frame: FrameId, url: &str) -> Result<(), TabError> {
+        self.frame_mut(frame)
+            .ok_or(TabError::UnknownFrame { frame: frame.get() })?
+            .set_document_url(url)
     }
 
     /// Main frame document URL.

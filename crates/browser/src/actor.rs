@@ -11,7 +11,9 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use renderer::{Command as RendererCommand, Mount, RemoteValue, Reply, TabError, TabEvent};
+use renderer::{
+    Command as RendererCommand, FrameId, Mount, RemoteValue, Reply, TabError, TabEvent,
+};
 use url::Url;
 
 use crate::link::{RendererHandle, RendererRegistry};
@@ -493,7 +495,7 @@ struct Tab {
     current: Arc<Mutex<Option<Arc<RendererHandle>>>>,
     renderer: Option<Arc<RendererHandle>>,
     site: Option<Site>,
-    events_rx: Option<Receiver<TabEvent>>,
+    events_rx: Option<Receiver<(FrameId, TabEvent)>>,
     document_url: Url,
     content_language: Option<String>,
     document_loaded: bool,
@@ -576,6 +578,7 @@ impl Tab {
         // A fresh tab may not have a renderer yet; the URL is browser state and
         // mounts carry it, so the forward is best-effort.
         let command = RendererCommand::SetDocumentUrl {
+            frame: FrameId::MAIN,
             url: url.to_owned(),
         };
         let _result = self.renderer_request(command).and_then(reply_unit);
@@ -614,7 +617,10 @@ impl Tab {
         self.ensure_renderer(site)?;
         self.document_loaded = false;
         let result = self
-            .renderer_request(RendererCommand::Mount(mount))
+            .renderer_request(RendererCommand::Mount {
+                frame: FrameId::MAIN,
+                mount,
+            })
             .and_then(reply_unit);
         if result.is_err() {
             // A dead renderer must not be reused: drop it so the next mount
@@ -703,8 +709,8 @@ impl Tab {
                 arrived.push(event);
             }
         }
-        for event in arrived {
-            if event == TabEvent::Load {
+        for (frame, event) in arrived {
+            if frame == FrameId::MAIN && event == TabEvent::Load {
                 self.document_loaded = true;
             }
             self.events.push(event);
@@ -789,7 +795,10 @@ fn handle_command(
         }
         Command::Eval { source, reply } => {
             let result = tab
-                .renderer_request(RendererCommand::Eval { source })
+                .renderer_request(RendererCommand::Eval {
+                    frame: FrameId::MAIN,
+                    source,
+                })
                 .and_then(reply_text);
             let _ = reply.send(result);
         }
@@ -800,6 +809,7 @@ fn handle_command(
         } => {
             let result = tab
                 .renderer_request(RendererCommand::ExecuteScript {
+                    frame: FrameId::MAIN,
                     source,
                     timeout_ms: timeout.map(millis),
                 })
@@ -891,6 +901,7 @@ fn resolve_waiters(tab: &mut Tab, waiters: &mut Vec<Waiter>) {
                     let _ = reply.send(false);
                 } else if matches!(
                     tab.renderer_request(RendererCommand::ExecuteScript {
+                        frame: FrameId::MAIN,
                         source: source.clone(),
                         timeout_ms: None
                     }),
