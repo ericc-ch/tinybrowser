@@ -14,7 +14,7 @@ use std::thread;
 use url::Url;
 
 use crate::protocol::{
-    BrowserServices, Command, DialOutcome, DialRequest, FromRenderer, ServiceCall, ServiceReply,
+    BrowserServices, Command, DialCompletion, DialRequest, FromRenderer, ServiceCall, ServiceReply,
     ToRenderer,
 };
 
@@ -86,8 +86,13 @@ fn write_messages(rx: &mpsc::Receiver<FromRenderer>) {
 /// [`BrowserServices`] proxy that asks the browser process over the pipe.
 struct PipeServices {
     out: Sender<FromRenderer>,
-    pending: Mutex<HashMap<u64, Sender<ServiceReply>>>,
+    pending: Mutex<HashMap<u64, PendingService>>,
     next: AtomicU64,
+}
+
+enum PendingService {
+    Blocking(Sender<ServiceReply>),
+    Dial(DialCompletion),
 }
 
 impl PipeServices {
@@ -105,7 +110,7 @@ impl PipeServices {
         self.pending
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .insert(id, reply_tx);
+            .insert(id, PendingService::Blocking(reply_tx));
         if self
             .out
             .send(FromRenderer::ServiceCall { id, call })
@@ -121,22 +126,44 @@ impl PipeServices {
     }
 
     fn deliver(&self, id: u64, reply: ServiceReply) {
-        if let Some(reply_tx) = self
+        let pending = self
             .pending
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .remove(&id)
-        {
-            let _ = reply_tx.send(reply);
+            .remove(&id);
+        match pending {
+            Some(PendingService::Blocking(reply_tx)) => {
+                let _ = reply_tx.send(reply);
+            }
+            Some(PendingService::Dial(completion)) => match reply {
+                ServiceReply::Dial(outcome) => completion(outcome),
+                ServiceReply::Cookie(_) | ServiceReply::Unit => completion(None),
+            },
+            None => {}
         }
     }
 }
 
 impl BrowserServices for PipeServices {
-    fn dial(&self, request: &DialRequest) -> Option<DialOutcome> {
-        match self.call(ServiceCall::Dial(request.clone()))? {
-            ServiceReply::Dial(outcome) => outcome,
-            _ => None,
+    fn start_dial(&self, request: DialRequest, completion: DialCompletion) {
+        let id = self.next.fetch_add(1, Ordering::Relaxed);
+        self.pending
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(id, PendingService::Dial(std::sync::Arc::clone(&completion)));
+        if self
+            .out
+            .send(FromRenderer::ServiceCall {
+                id,
+                call: ServiceCall::Dial(request),
+            })
+            .is_err()
+        {
+            self.pending
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .remove(&id);
+            completion(None);
         }
     }
 
@@ -154,9 +181,5 @@ impl BrowserServices for PipeServices {
             value: value.to_owned(),
             url: url.to_string(),
         });
-    }
-
-    fn mark_dirty(&self) {
-        let _result = self.call(ServiceCall::MarkDirty);
     }
 }

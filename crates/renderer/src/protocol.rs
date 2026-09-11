@@ -6,6 +6,7 @@
 //! in-process backend and the `--renderer` pipe.
 
 use std::fmt;
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use url::Url;
@@ -240,7 +241,7 @@ pub enum FromRenderer {
 /// What the renderer needs the browser process to do.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum ServiceCall {
-    /// Blocking HTTP GET.
+    /// HTTP GET submitted to the browser-owned network executor.
     Dial(DialRequest),
     /// `document.cookie` getter.
     CookieGet {
@@ -254,8 +255,6 @@ pub enum ServiceCall {
         /// Document URL.
         url: String,
     },
-    /// Mark the durable profile dirty.
-    MarkDirty,
 }
 
 /// Answer to a [`ServiceCall`].
@@ -265,7 +264,7 @@ pub enum ServiceReply {
     Dial(Option<DialOutcome>),
     /// Cookie getter result.
     Cookie(String),
-    /// No payload (`CookieSet`, `MarkDirty`).
+    /// No payload (`CookieSet`).
     Unit,
 }
 
@@ -306,24 +305,25 @@ pub struct DialOutcome {
     pub body: Vec<u8>,
 }
 
-/// Host services the renderer calls synchronously.
+/// Completion for a dial submitted to the browser process.
+pub type DialCompletion = Arc<dyn Fn(Option<DialOutcome>) + Send + Sync + 'static>;
+
+/// Host services the renderer reaches through the browser-process seam.
 ///
 /// In-process this is the `browser` crate's network adapter. In the
 /// `--renderer` child it is a pipe proxy. Renderer code never names `net`.
 pub trait BrowserServices: Send + Sync + 'static {
-    /// Blocking GET. `None` is a transport, timeout, or body-limit failure.
-    ///
-    /// Called from the renderer's dial workers, never from the render loop.
-    fn dial(&self, request: &DialRequest) -> Option<DialOutcome>;
+    /// Submits one GET without blocking the renderer thread. The completion
+    /// receives `None` for transport, timeout, queue, or body-limit failure.
+    /// Implementations must invoke it exactly once, including when submission
+    /// is rejected.
+    fn start_dial(&self, request: DialRequest, completion: DialCompletion);
 
     /// `document.cookie` getter for `url`.
     fn cookies_for(&self, url: &Url) -> String;
 
     /// `document.cookie` setter for `url`.
     fn set_cookie(&self, value: &str, url: &Url);
-
-    /// Mark the durable profile dirty after a cookie write.
-    fn mark_dirty(&self);
 }
 
 #[cfg(test)]
@@ -499,10 +499,6 @@ mod tests {
                     value: "a=1".into(),
                     url: "http://example.test/".into(),
                 },
-            },
-            FromRenderer::ServiceCall {
-                id: 9,
-                call: ServiceCall::MarkDirty,
             },
         ];
         for message in messages {

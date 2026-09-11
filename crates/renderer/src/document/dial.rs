@@ -1,11 +1,24 @@
-use super::{CompletedDial, DialFail, FETCH_BODY_LIMIT, QueuedDial, Stop};
-use crate::protocol::{BrowserServices, DialKind, DialRequest};
+use super::{CompletedDial, DialFail, QueuedDial};
+use crate::protocol::{DialKind, DialOutcome, DialRequest};
 
-/// Performs one queued dial through the browser side and shapes the completion.
-pub(in crate::document) fn send_dial(
-    services: &dyn BrowserServices,
+pub(in crate::document) fn request(dial: &QueuedDial) -> DialRequest {
+    let (url, kind, initiator) = match dial {
+        QueuedDial::JsFetch { url, initiator, .. } => (url, DialKind::JsFetch, initiator),
+        QueuedDial::ClassicScript { url, initiator, .. } => {
+            (url, DialKind::ClassicScript, initiator)
+        }
+    };
+    DialRequest {
+        kind,
+        url: url.to_string(),
+        initiator: initiator.to_string(),
+        read_body: true,
+    }
+}
+
+pub(in crate::document) fn complete(
     dial: &QueuedDial,
-    stop: &Stop,
+    outcome: Option<DialOutcome>,
 ) -> Result<CompletedDial, DialFail> {
     let fail = match dial {
         QueuedDial::JsFetch { id, epoch, .. } => DialFail::JsFetch {
@@ -14,26 +27,7 @@ pub(in crate::document) fn send_dial(
         },
         QueuedDial::ClassicScript { epoch, .. } => DialFail::ClassicScript { epoch: *epoch },
     };
-    let (url, kind, initiator, read_body) = match dial {
-        QueuedDial::JsFetch { url, initiator, .. } => (url, DialKind::JsFetch, initiator, true),
-        QueuedDial::ClassicScript { url, initiator, .. } => {
-            (url, DialKind::ClassicScript, initiator, true)
-        }
-    };
-    let request = DialRequest {
-        kind,
-        url: url.to_string(),
-        initiator: initiator.to_string(),
-        read_body,
-    };
-    let outcome = services.dial(&request).ok_or(fail)?;
-    if stop.is_set() {
-        return Err(fail);
-    }
-    services.mark_dirty();
-    if outcome.body.len() > FETCH_BODY_LIMIT {
-        return Err(fail);
-    }
+    let outcome = outcome.ok_or(fail)?;
     Ok(match dial {
         QueuedDial::JsFetch { id, epoch, .. } => CompletedDial::JsFetch {
             status: outcome.status,

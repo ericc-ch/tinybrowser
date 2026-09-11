@@ -1,6 +1,8 @@
 //! [`renderer::BrowserServices`] over the browser-owned network service.
 
-use renderer::{BrowserServices, DialOutcome, DialRequest};
+use std::sync::Arc;
+
+use renderer::{BrowserServices, DialCompletion, DialRequest};
 use url::Url;
 
 use crate::network::FetchHandle;
@@ -16,20 +18,19 @@ impl FetchServices {
 }
 
 impl BrowserServices for FetchServices {
-    fn dial(&self, request: &DialRequest) -> Option<DialOutcome> {
-        // Run the blocking dial on the browser-owned pool, not the renderer's
-        // dial workers ([ADR 0010], [ADR 0011]).
+    fn start_dial(&self, request: DialRequest, completion: DialCompletion) {
         let fetch = self.fetch.clone();
         let worker = fetch.clone();
-        let request = request.clone();
-        let (reply_tx, reply_rx) = std::sync::mpsc::channel();
-        fetch
+        let worker_completion = Arc::clone(&completion);
+        if fetch
             .try_submit(move || {
                 let outcome = worker.dial_request(&request);
-                let _ = reply_tx.send(outcome);
+                worker_completion(outcome);
             })
-            .ok()?;
-        reply_rx.recv().ok().flatten()
+            .is_err()
+        {
+            completion(None);
+        }
     }
 
     fn cookies_for(&self, url: &Url) -> String {
@@ -38,9 +39,5 @@ impl BrowserServices for FetchServices {
 
     fn set_cookie(&self, value: &str, url: &Url) {
         self.fetch.set_cookie(value, url);
-    }
-
-    fn mark_dirty(&self) {
-        self.fetch.mark_dirty();
     }
 }

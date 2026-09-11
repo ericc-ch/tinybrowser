@@ -278,10 +278,6 @@ impl FetchHandle {
         self.store.mark_dirty();
     }
 
-    pub(crate) fn mark_dirty(&self) {
-        self.store.mark_dirty();
-    }
-
     pub(crate) fn request(&self, method: Method, url: Url) -> net::RequestBuilder {
         self.agent.request(method, url)
     }
@@ -309,6 +305,7 @@ impl FetchHandle {
             .with_initiator(initiator.clone())
             .send()
             .map_err(|_| ())?;
+        self.store.mark_dirty();
         let status = response.status();
         let final_url = response.final_url().clone();
         let content_language = response
@@ -348,6 +345,7 @@ impl FetchHandle {
             .with_initiator(initiator)
             .send()
             .ok()?;
+        self.store.mark_dirty();
         let status = response.status();
         let final_url = response.final_url().to_string();
         let content_language = response

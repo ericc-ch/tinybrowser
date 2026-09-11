@@ -6024,13 +6024,13 @@ mod realm_tests {
     use super::{world, wrap_node};
     use crate::document::Stop;
     use crate::js::{JsRealm, SharedJsRuntime, World};
-    use crate::protocol::{BrowserServices, DialOutcome, DialRequest};
+    use crate::protocol::{BrowserServices, DialCompletion, DialRequest};
 
     struct NullServices;
 
     impl BrowserServices for NullServices {
-        fn dial(&self, _request: &DialRequest) -> Option<DialOutcome> {
-            None
+        fn start_dial(&self, _request: DialRequest, completion: DialCompletion) {
+            completion(None);
         }
 
         fn cookies_for(&self, _url: &Url) -> String {
@@ -6038,8 +6038,6 @@ mod realm_tests {
         }
 
         fn set_cookie(&self, _value: &str, _url: &Url) {}
-
-        fn mark_dirty(&self) {}
     }
 
     fn world_with_document(

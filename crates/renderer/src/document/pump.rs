@@ -4,9 +4,9 @@ use std::sync::Arc;
 use std::task::Poll;
 use std::time::Duration;
 
-use tokio::time::{Instant, sleep, sleep_until};
+use tokio::time::{Instant, sleep_until};
 
-use super::{Document, MAX_QUEUED_JS_FETCHES, QueuedDial, Task, Timer, note_script};
+use super::{Document, MAX_PENDING_JS_FETCHES, QueuedDial, Task, Timer, note_script};
 use crate::protocol::TabEvent;
 
 impl Document {
@@ -163,37 +163,45 @@ impl Document {
                 continue;
             }
             let fetches_pending = self.in_flight_dials > 0;
-            let queued = !self.queued_dials.is_empty();
             let next_deadline = match (self.next_timer_deadline(), cap) {
                 (Some(timer), Some(limit)) => Some(timer.min(limit)),
                 (timer, limit) => timer.or(limit),
             };
-            if !fetches_pending && !queued && next_deadline.is_none() {
+            if !fetches_pending && next_deadline.is_none() {
                 break;
             }
-            if queued && !fetches_pending {
-                sleep(Duration::from_millis(1)).await;
-                continue;
-            }
-            let network_poll = fetches_pending.then(|| Instant::now() + Duration::from_millis(1));
-            let wake_at = match (next_deadline, network_poll) {
-                (Some(timer), Some(network)) => Some(timer.min(network)),
-                (timer, network) => timer.or(network),
-            };
-            let deadline = wait_until(wake_at);
+            let deadline = wait_until(next_deadline);
             let mut deadline = std::pin::pin!(deadline);
             let stop = Arc::clone(&self.stop);
-            poll_fn(|cx| {
+            let completed = poll_fn(|cx| {
                 stop.register(cx.waker());
+                *self
+                    .dial_waker
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(cx.waker().clone());
+                if let Ok(completed) = self.dial_rx.try_recv() {
+                    return Poll::Ready(Some(completed));
+                }
                 if stop.is_set() {
-                    return Poll::Ready(());
+                    return Poll::Ready(None);
                 }
                 if deadline.as_mut().poll(cx).is_ready() {
-                    return Poll::Ready(());
+                    return Poll::Ready(None);
                 }
                 Poll::Pending
             })
             .await;
+            self.dial_waker
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+            if let Some(completed) = completed {
+                self.in_flight_dials = self.in_flight_dials.saturating_sub(1);
+                match completed {
+                    Ok(done) => self.tasks.push_back(Task::DialFinished(done)),
+                    Err(fail) => self.tasks.push_back(Task::DialFailed(fail)),
+                }
+            }
             while let Some(id) = self.due_timer() {
                 self.tasks.push_back(Task::Timer(id));
             }
@@ -210,31 +218,32 @@ impl Document {
     }
 
     fn launch_queued_dials(&mut self) {
-        let mut leftover = Vec::new();
         let queued = std::mem::take(&mut self.queued_dials);
         for dial in queued {
             let task_dial = dial.clone();
-            let services = Arc::clone(&self.services);
             let completed = self.dial_tx.clone();
+            let dial_waker = Arc::clone(&self.dial_waker);
             let stop = Arc::clone(&self.stop);
-            if self
-                .dial_pool
-                .try_submit(move || {
+            let request = super::dial::request(&dial);
+            self.services.start_dial(
+                request,
+                Arc::new(move |outcome| {
                     if stop.is_set() {
                         return;
                     }
-                    let result = super::dial::send_dial(services.as_ref(), &task_dial, &stop);
+                    let result = super::dial::complete(&task_dial, outcome);
                     let _send_result = completed.send(result);
-                })
-                .is_err()
-            {
-                leftover.push(dial);
-                continue;
-            }
+                    let waker = dial_waker
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .take();
+                    if let Some(waker) = waker {
+                        waker.wake();
+                    }
+                }),
+            );
             self.in_flight_dials = self.in_flight_dials.saturating_add(1);
         }
-        leftover.extend(std::mem::take(&mut self.queued_dials));
-        self.queued_dials = leftover;
     }
 
     fn run_task(&mut self, task: Task) {
@@ -290,12 +299,13 @@ impl Document {
             self.js_timer_slots.insert(id, timeout.js_id);
         }
         for fetch in fetches {
-            let queued_js_fetches = self
-                .queued_dials
-                .iter()
-                .filter(|dial| matches!(dial, QueuedDial::JsFetch { .. }))
-                .count();
-            if queued_js_fetches >= MAX_QUEUED_JS_FETCHES {
+            let pending_js_fetches = self.in_flight_dials.saturating_add(
+                self.queued_dials
+                    .iter()
+                    .filter(|dial| matches!(dial, QueuedDial::JsFetch { .. }))
+                    .count(),
+            );
+            if pending_js_fetches >= MAX_PENDING_JS_FETCHES {
                 self.events.push(TabEvent::FetchFailed);
                 self.settle_js_fetch(fetch.js_id, false, 0, "");
                 continue;

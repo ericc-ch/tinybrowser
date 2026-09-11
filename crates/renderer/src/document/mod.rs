@@ -9,7 +9,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TrySendError};
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::task::Waker;
 use std::time::Instant as WallClock;
 
@@ -28,10 +28,7 @@ mod pump;
 
 pub use crate::js::ScriptValue;
 
-/// Upper bound on a host-fetch or document body.
-pub(crate) const FETCH_BODY_LIMIT: usize = 1_048_576;
-
-const MAX_QUEUED_JS_FETCHES: usize = 256;
+const MAX_PENDING_JS_FETCHES: usize = 256;
 
 enum Task {
     Timer(u32),
@@ -116,7 +113,7 @@ pub struct Document {
     next_timer_id: u32,
     dial_tx: Sender<Result<CompletedDial, DialFail>>,
     dial_rx: Receiver<Result<CompletedDial, DialFail>>,
-    dial_pool: DialPool,
+    dial_waker: Arc<Mutex<Option<Waker>>>,
     in_flight_dials: usize,
     queued_dials: Vec<QueuedDial>,
     events: Vec<TabEvent>,
@@ -168,6 +165,7 @@ impl Document {
     ) -> Self {
         let document_url = Url::parse("about:blank").expect("about:blank is a valid URL");
         let (dial_tx, dial_rx) = mpsc::channel();
+        let dial_waker = Arc::new(Mutex::new(None));
         Self {
             world: Rc::new(RefCell::new(World::new(
                 Arc::clone(&services),
@@ -186,7 +184,7 @@ impl Document {
             next_timer_id: 1,
             dial_tx,
             dial_rx,
-            dial_pool: DialPool::new(),
+            dial_waker,
             in_flight_dials: 0,
             queued_dials: Vec::new(),
             events: Vec::new(),
@@ -593,45 +591,6 @@ impl From<crate::js::JsError> for TabError {
             crate::js::JsError::Engine(message) => Self::Script(ScriptFailure::Engine { message }),
             crate::js::JsError::Interrupted => Self::Script(ScriptFailure::Interrupted),
             crate::js::JsError::BadTimerId => Self::Script(ScriptFailure::BadTimerId),
-        }
-    }
-}
-
-type DialJob = Box<dyn FnOnce() + Send + 'static>;
-
-/// Bounded workers for blocking [`BrowserServices::dial`] calls.
-struct DialPool {
-    tx: SyncSender<DialJob>,
-}
-
-impl DialPool {
-    fn new() -> Self {
-        const WORKERS: usize = 16;
-        const QUEUE: usize = 256;
-        let (tx, rx) = mpsc::sync_channel::<DialJob>(QUEUE);
-        let receiver = Arc::new(Mutex::new(rx));
-        for _ in 0..WORKERS {
-            let receiver = Arc::clone(&receiver);
-            std::thread::spawn(move || {
-                loop {
-                    let work = receiver
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .recv();
-                    let Ok(work) = work else {
-                        return;
-                    };
-                    work();
-                }
-            });
-        }
-        Self { tx }
-    }
-
-    fn try_submit(&self, work: impl FnOnce() + Send + 'static) -> Result<(), ()> {
-        match self.tx.try_send(Box::new(work)) {
-            Ok(()) => Ok(()),
-            Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) => Err(()),
         }
     }
 }

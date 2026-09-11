@@ -1,6 +1,7 @@
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -8,8 +9,8 @@ use std::time::{Duration, Instant};
 use dom::NodeKind;
 use net::{Agent, AgentBuilder, InitiatorKind, Method};
 use renderer::{
-    BrowserServices, DialKind, DialOutcome, DialRequest, Document, Engine, Mount, ScriptFailure,
-    TabError, TabEvent,
+    BrowserServices, DialCompletion, DialKind, DialOutcome, DialRequest, Document, Engine, Mount,
+    ScriptFailure, TabError, TabEvent,
 };
 use url::Url;
 
@@ -66,40 +67,9 @@ impl TestServices {
 }
 
 impl BrowserServices for TestServices {
-    fn dial(&self, request: &DialRequest) -> Option<DialOutcome> {
-        let url = Url::parse(&request.url).ok()?;
-        let initiator_kind = match request.kind {
-            DialKind::JsFetch | DialKind::ClassicScript => InitiatorKind::Fetch,
-        };
-        let initiator = Url::parse(&request.initiator).ok()?;
-        let response = self
-            .agent
-            .request(Method::GET, url)
-            .with_initiator_kind(initiator_kind)
-            .with_initiator(initiator)
-            .send()
-            .ok()?;
-        let status = response.status();
-        let final_url = response.final_url().to_string();
-        let content_type = response
-            .headers()
-            .get("content-type")
-            .and_then(|bytes| std::str::from_utf8(bytes).ok())
-            .map(str::to_owned);
-        let mut body = Vec::new();
-        if request.read_body {
-            let mut response_body = response.into_body();
-            while let Some(chunk) = response_body.read_chunk().ok()? {
-                body.extend_from_slice(&chunk);
-            }
-        }
-        Some(DialOutcome {
-            status,
-            final_url,
-            content_type,
-            content_language: None,
-            body,
-        })
+    fn start_dial(&self, request: DialRequest, completion: DialCompletion) {
+        let agent = self.agent.clone();
+        thread::spawn(move || completion(test_dial(&agent, &request)));
     }
 
     fn cookies_for(&self, url: &Url) -> String {
@@ -109,8 +79,61 @@ impl BrowserServices for TestServices {
     fn set_cookie(&self, value: &str, url: &Url) {
         self.agent.set_cookie(value, url);
     }
+}
 
-    fn mark_dirty(&self) {}
+fn test_dial(agent: &Agent, request: &DialRequest) -> Option<DialOutcome> {
+    let url = Url::parse(&request.url).ok()?;
+    let initiator_kind = match request.kind {
+        DialKind::JsFetch | DialKind::ClassicScript => InitiatorKind::Fetch,
+    };
+    let initiator = Url::parse(&request.initiator).ok()?;
+    let response = agent
+        .request(Method::GET, url)
+        .with_initiator_kind(initiator_kind)
+        .with_initiator(initiator)
+        .send()
+        .ok()?;
+    let status = response.status();
+    let final_url = response.final_url().to_string();
+    let content_type = response
+        .headers()
+        .get("content-type")
+        .and_then(|bytes| std::str::from_utf8(bytes).ok())
+        .map(str::to_owned);
+    let mut body = Vec::new();
+    if request.read_body {
+        let mut response_body = response.into_body();
+        while let Some(chunk) = response_body.read_chunk().ok()? {
+            body.extend_from_slice(&chunk);
+        }
+    }
+    Some(DialOutcome {
+        status,
+        final_url,
+        content_type,
+        content_language: None,
+        body,
+    })
+}
+
+#[derive(Default)]
+struct HoldingServices {
+    pending: Mutex<Vec<DialCompletion>>,
+}
+
+impl BrowserServices for HoldingServices {
+    fn start_dial(&self, _request: DialRequest, completion: DialCompletion) {
+        self.pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(completion);
+    }
+
+    fn cookies_for(&self, _url: &Url) -> String {
+        String::new()
+    }
+
+    fn set_cookie(&self, _value: &str, _url: &Url) {}
 }
 
 fn document() -> (Document, Arc<TestServices>) {
@@ -315,6 +338,44 @@ fn page_loop_correlates_more_than_one_batch_of_fetches() {
     );
     assert!(matches!(doc.events().first(), Some(TabEvent::Timer(_))));
     server.join().expect("server");
+}
+
+#[test]
+fn pending_fetch_budget_includes_submitted_dials() {
+    let services = Arc::new(HoldingServices::default());
+    let mut doc = Document::new(services.clone());
+    doc.set_document_url("https://example.test/")
+        .expect("document URL");
+    doc.eval("for (let i = 0; i < 200; i++) fetch('/first/' + i).catch(() => {});")
+        .expect("first batch");
+    let _ = doc.run_until_timeout(Duration::from_millis(1), |_| false);
+    assert_eq!(
+        services
+            .pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len(),
+        200
+    );
+
+    doc.eval("for (let i = 0; i < 100; i++) fetch('/second/' + i).catch(() => {});")
+        .expect("second batch");
+    let _ = doc.run_until_timeout(Duration::from_millis(1), |_| false);
+    assert_eq!(
+        services
+            .pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len(),
+        256
+    );
+    assert_eq!(
+        doc.events()
+            .iter()
+            .filter(|event| **event == TabEvent::FetchFailed)
+            .count(),
+        44
+    );
 }
 
 #[test]

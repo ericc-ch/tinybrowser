@@ -365,3 +365,22 @@ Changes: non-finite JS numbers are string-encoded in the IPC seam, the
 requests instead of stranding callers, opaque per-page renderers are reaped on
 release, idle pools drain on Browser close, and local renderer dials run on the
 browser-owned executor. CLI +26,144 bytes over the milestone above.
+
+## Milestone: shared renderer network executor (2026-09-11)
+
+Rebuild at `3f66f0a` plus the network-executor cleanup, after the frames and
+per-frame-realms merge. Command: `nix develop --command cargo build --release
+--offline --example tab_probe --bin tinybrowser`; rustc 1.98.0, committed
+stripped x86_64 release profile.
+
+| Artifact | Bytes | Headroom to 10,000,000 |
+| --- | ---: | ---: |
+| CLI (`target/release/tinybrowser`) | 5,222,176 | 4,777,824 |
+| page engine (`target/release/examples/tab_probe`) | 4,182,032 | 5,817,968 |
+
+The renderer no longer creates a 16-thread dial pool per document. Every
+navigation, classic-script load, and JavaScript fetch now uses the one bounded
+browser-owned executor; dial completion wakes the current-thread renderer
+waiter instead of being polled every millisecond. The preceding size row
+predates the frames/realms merge, so this checkpoint is the new comparison
+baseline rather than an attribution of the full delta to this cleanup.

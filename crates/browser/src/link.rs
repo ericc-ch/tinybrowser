@@ -379,7 +379,7 @@ fn pump_loop(
     match incoming {
         Incoming::Local(receiver) => {
             while let Ok(message) = receiver.recv() {
-                route(message, sink, pending, subscribers, fetch, false);
+                route(message, sink, pending, subscribers, fetch);
             }
         }
         Incoming::Pipe(mut reader) => {
@@ -402,7 +402,7 @@ fn pump_loop(
                     }
                     continue;
                 }
-                route(message, sink, pending, subscribers, fetch, true);
+                route(message, sink, pending, subscribers, fetch);
             }
         }
     }
@@ -427,7 +427,6 @@ fn route(
     pending: &Arc<Mutex<HashMap<u64, Sender<Reply>>>>,
     subscribers: &EventSubscribers,
     fetch: &FetchHandle,
-    offload_dials: bool,
 ) {
     match message {
         // Handled by the pipe handshake; never routed.
@@ -447,8 +446,8 @@ fn route(
                 .unwrap_or_else(PoisonError::into_inner)
                 .retain(|subscriber| subscriber.send((frame, event)).is_ok());
         }
-        FromRenderer::ServiceCall { id, call } => {
-            if offload_dials && let ServiceCall::Dial(request) = call {
+        FromRenderer::ServiceCall { id, call } => match call {
+            ServiceCall::Dial(request) => {
                 let worker_fetch = fetch.clone();
                 let worker_sink = sink.clone();
                 let submitted = fetch.try_submit(move || {
@@ -464,31 +463,24 @@ fn route(
                         reply: ServiceReply::Dial(None),
                     });
                 }
-                return;
             }
-            let reply = inline_service(fetch, call);
-            let _ = sink.send(ToRenderer::ServiceReply { id, reply });
-        }
-    }
-}
-
-fn inline_service(fetch: &FetchHandle, call: ServiceCall) -> ServiceReply {
-    match call {
-        ServiceCall::Dial(request) => ServiceReply::Dial(fetch.dial_request(&request)),
-        ServiceCall::CookieGet { url } => ServiceReply::Cookie(
-            Url::parse(&url)
-                .map(|url| fetch.cookies_for(&url))
-                .unwrap_or_default(),
-        ),
-        ServiceCall::CookieSet { value, url } => {
-            if let Ok(url) = Url::parse(&url) {
-                fetch.set_cookie(&value, &url);
+            ServiceCall::CookieGet { url } => {
+                let reply = ServiceReply::Cookie(
+                    Url::parse(&url)
+                        .map(|url| fetch.cookies_for(&url))
+                        .unwrap_or_default(),
+                );
+                let _ = sink.send(ToRenderer::ServiceReply { id, reply });
             }
-            ServiceReply::Unit
-        }
-        ServiceCall::MarkDirty => {
-            fetch.mark_dirty();
-            ServiceReply::Unit
-        }
+            ServiceCall::CookieSet { value, url } => {
+                if let Ok(url) = Url::parse(&url) {
+                    fetch.set_cookie(&value, &url);
+                }
+                let _ = sink.send(ToRenderer::ServiceReply {
+                    id,
+                    reply: ServiceReply::Unit,
+                });
+            }
+        },
     }
 }

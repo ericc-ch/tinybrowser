@@ -50,6 +50,44 @@ fn persistent_cookies_survive_browser_restart() {
 }
 
 #[test]
+fn response_cookies_survive_browser_restart() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("address");
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept");
+        let mut request = [0_u8; 1024];
+        let _ = stream.read(&mut request).expect("request");
+        stream
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nSet-Cookie: sid=network; Max-Age=3600; Path=/\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            )
+            .expect("response");
+    });
+
+    let data_home = temp_data_home();
+    let profile = Profile::parse("network-cookie").expect("profile");
+    let url = format!("http://{addr}/");
+    {
+        let browser =
+            Browser::open_in_with(&data_home, &profile, Renderers::Local).expect("browser");
+        let tab = browser.handle().create_tab().expect("tab");
+        tab.goto(&url).expect("goto");
+        tab.run_until_load().expect("load");
+        assert_eq!(tab.document_cookie().expect("live cookie"), "sid=network");
+    }
+    server.join().expect("server");
+
+    let browser = Browser::open_in_with(&data_home, &profile, Renderers::Local).expect("restart");
+    let tab = browser.handle().create_tab().expect("tab");
+    tab.set_document_url(&url).expect("document url");
+    assert_eq!(tab.document_cookie().expect("stored cookie"), "sid=network");
+    let _ = std::fs::remove_dir_all(data_home);
+}
+
+#[test]
 fn session_cookies_are_not_written_to_disk() {
     let data_home = temp_data_home();
     let profile = Profile::default();

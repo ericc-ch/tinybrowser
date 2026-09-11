@@ -33,8 +33,9 @@ pub use document::{Document, ScriptValue, Stop};
 pub use engine::Engine;
 pub use process::serve_stdio;
 pub use protocol::{
-    BrowserServices, Command, DialKind, DialOutcome, DialRequest, FrameId, FromRenderer, Mount,
-    Reply, ScriptFailure, ServiceCall, ServiceReply, TabError, TabEvent, ToRenderer,
+    BrowserServices, Command, DialCompletion, DialKind, DialOutcome, DialRequest, FrameId,
+    FromRenderer, Mount, Reply, ScriptFailure, ServiceCall, ServiceReply, TabError, TabEvent,
+    ToRenderer,
 };
 pub use remote::RemoteValue;
 
