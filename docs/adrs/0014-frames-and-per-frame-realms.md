@@ -25,8 +25,15 @@ the protocol adapters.
   so same-site frames belong to one agent while cross-site frames do not.
 - **The page engine (`renderer::Engine`) owns process-wide state:** the QuickJS
   `Runtime`, one Tokio current-thread runtime as the waiter, the frame registry,
-  and the command/pump loops. `Document` stops owning either runtime; it is one
-  frame's tree, realm, parser, tasks, and timers.
+  and the document/realm stores. `Document` stops owning either runtime; it is
+  one frame's tree, realm, parser, tasks, and timers.
+- **Trees are realm-agnostic; wrappers are realm-associated.** A shared
+  `DocumentStore` maps globally unique document ids to trees. One JS wrapper
+  per node is cached renderer-wide and created with the owner realm's
+  prototypes, so same-site frames share wrapper identity and cross-realm
+  property access stays realm-correct without entering another context.
+  Blink stores the main-world wrapper on the C++ object; Gecko keeps one
+  wrapper per object and outerizes across compartments.
 - **`FrameId` addresses a frame inside one renderer process.** It is minted by the
   engine and carried by commands and events that target a frame. The browser
   process keeps the authoritative frame tree (parent, container element, site,
