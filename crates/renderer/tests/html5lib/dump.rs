@@ -107,6 +107,9 @@ fn serialize(dom: &Dom, id: NodeId, indent: usize, out: &mut String) {
             out.push_str(&data);
             out.push_str("\"\n");
         }
+        NodeKind::CDataSection { .. } | NodeKind::ProcessingInstruction { .. } => {
+            unreachable!("the HTML parser emits neither CDATA sections nor processing instructions")
+        }
         NodeKind::Comment { data } => {
             out.push_str("<!-- ");
             out.push_str(&data);

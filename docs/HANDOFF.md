@@ -1,52 +1,56 @@
-# Handoff (2026-09-10)
+# Handoff (2026-09-11)
 
-State: Per-site renderer-process split landed on top of the earlier dirty tree,
-then hardened from two adversarial reviews. Vocabulary standardized to browser
-process / renderer process / tab (ADR 0013). `cargo test --workspace` green,
-`cargo clippy --workspace --all-targets` and `cargo fmt --all --check` clean.
-Nothing committed. Latest release measure: CLI 4,632,736 bytes, tab_probe
-3,600,016, against the 10 MB cap.
+State: Branch `wpt-pass-chasing`, HEAD `2b0a24d`, tree clean. ADR 0014 steps
+1-3, cross-realm option 2 (phases 1-2), and the DOM iframe lifecycle hook are
+committed; iframe elements are not created yet. `cargo test --workspace` 27
+suites, clippy, fmt green (all via `direnv exec .`).
 
 Done:
 
-- [ADR 0011](../docs/adrs/0011-renderer-processes-per-site.md): renderer process
-  per site instance; tab `Tab` in the browser process. [ADR 0012](../docs/adrs/0012-host-protocol-and-cli-stack.md):
-  axum + clap, `http1` retired, 10 MB cap. [ADR 0013](../docs/adrs/0013-vocabulary-and-process-names.md):
-  browser process / renderer process / tab vocabulary. ADR 0007 table, AGENTS.md,
-  CONTEXT.md, size-budget.md updated.
-- New `crates/renderer`: parser/`Sink`, `Document` (`Dom` + QuickJS + tasks +
-  timers), value-only `protocol` (serde), `BrowserServices`, `--renderer` stdio
-  transport. The crate has no `net` dependency (tests use it as a dev-dependency
-  for test services).
-- `crates/browser` is browser-side only now: `Browser`, tab `Tab` + `TabActor`
-  coordinator, `RendererRegistry` with Local/Process backends, browser-side
-  navigation dials, cookies on the shared `NetworkSession`.
-- CLI on clap; CDP and WebDriver on axum; `crates/http1` deleted.
-- Tests moved: renderer document suite (9) + html5lib corpus; new cross-site
-  document-swap test; new end-to-end `--renderer` process tests (classic script,
-  JS `fetch`, non-finite results, close during a running script, opaque renderer
-  reap).
-- Two adversarial reviews landed; fixes: non-finite JS numbers are string-encoded
-  in the IPC seam, a `Ready` handshake bounds bad renderer spawns, dead renderers
-  drain pending requests (with a request timeout), opaque renderers are reaped on
-  release, idle pools drain on Browser close, local dials run on the browser
-  executor, and CDP discovery runs on `spawn_blocking` with trailing-slash
-  normalization. `RemoteValue`/reply/command round-trip tests added.
+- `488371c` engine owns one QuickJS `Runtime` + Tokio waiter; `Document` is a
+  frame; `DOMException` inherits `Error.prototype`. Proof: 27 suites; WPT
+  `dom/nodes/Node-nodeName.html`, `Element-tagName.html` passed.
+- `9083c1e`, `3de769a` frame + world registries and frame-addressed
+  commands/events. Proof: `realm_tests::realms_share_a_heap_and_resolve_*`
+  and protocol round-trip tests.
+- `bbd1f82` `DocumentStore`: trees realm-agnostic, keyed by document id.
+  Proof: 27 suites green, no behavior change.
+- `849b8ec` `RealmRegistry`: one wrapper per node shared by same-site realms
+  with the owner realm's prototypes. Proof:
+  `wrappers_are_shared_with_the_owner_realms_prototypes`.
+- `c3fd899` `dom::Lifecycle` records iframe connection transitions, including
+  later-inserted detached subtrees. Proof:
+  `connection_transitions_record_lifecycle_events`.
+
+In flight: nothing uncommitted. Step-4 fork open; ADR 0014 "Frame realm
+creation timing" (rquickjs `Context::with` borrows the runtime; no nested
+realm creation) recommends A (deferred materialization + `WindowProxy`) over
+B (context pool). Resume by writing the shared `FrameTree`.
 
 Next:
 
-1. Run `./tools/wpt/run` on the process path (not run this session).
-2. Renderer sandboxing (namespaces/seccomp) — separate security phase.
-3. Browser-side navigation resolves relative URLs against the document URL only;
-   `<base href>` is still honored inside the renderer for scripts/fetch. Add
-   base-URL reporting if navigation needs it.
-4. OOPIF when iframe documents land; renderer preallocation and a RAM-based
-   renderer count cap.
+1. `FrameTree` shared by `Engine` and `Document`: mint `FrameId`, own
+   `Rc<RefCell<Document>>` frames, recursive lookup for commands/events.
+2. `HTMLIFrameElement` members (`contentWindow`, `contentDocument`, `srcdoc`,
+   `name`) + `window.frames`/`length`; create realms at safe points.
+3. `src` navigation (dial + browser mount by `FrameId`); then WebDriver
+   `switch to frame`, OOPIF, `Symbol.toStringTag`, adoption, `sandbox`.
+
+Decisions made:
+
+- [ADR 0014](adrs/0014-frames-and-per-frame-realms.md): one `Context` per
+  frame; trees realm-agnostic; wrappers shared per node, owner prototypes;
+  cross-origin checks in the first iframe milestone.
+- Cargo tests cover product/transport/engine only; web behavior is WPT's job.
+- Realm registries live on the engine, never thread-locals.
 
 Gotchas:
 
-- `Browser::open_in` / `open_with_network` default to `Renderers::Process`;
-  library tests must use `open_in_with(..., Renderers::Local)` or `ephemeral`,
-  because the test binary cannot spawn `--renderer`.
-- The renderer child speaks JSON lines on stdout; never `println!` in renderer
-  code.
+- Build only inside `direnv exec .`; targeted WPT:
+  `direnv exec . ./tools/wpt/run <files>`.
+- `crates/renderer/src/js/bindings.rs` `realm_tests` is the cross-realm
+  canary (persistents, wrapper identity, registry lifetime).
+- Prefer `World::with_document`/`with_main_document` when a guard would
+  outlive the borrow.
+- `Engine` drop order: frames, registry, runtime (`JS_FreeRuntime` asserts).
+- WPT `exceptions.html` timeout waits on `iframe.onload`, not a hang.

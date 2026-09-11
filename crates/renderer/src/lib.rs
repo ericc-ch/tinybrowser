@@ -8,7 +8,7 @@
 
 use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::time::Duration;
@@ -22,16 +22,19 @@ use markup5ever::interface::{TokenizerResult, tree_builder::ElemName};
 use tendril::{StrTendril, TendrilSink};
 
 mod document;
+mod documents;
+mod engine;
 mod js;
 mod process;
 mod protocol;
 mod remote;
 
 pub use document::{Document, ScriptValue, Stop};
+pub use engine::Engine;
 pub use process::serve_stdio;
 pub use protocol::{
-    BrowserServices, Command, DialKind, DialOutcome, DialRequest, FromRenderer, Mount, Reply,
-    ScriptFailure, ServiceCall, ServiceReply, TabError, TabEvent, ToRenderer,
+    BrowserServices, Command, DialKind, DialOutcome, DialRequest, FrameId, FromRenderer, Mount,
+    Reply, ScriptFailure, ServiceCall, ServiceReply, TabError, TabEvent, ToRenderer,
 };
 pub use remote::RemoteValue;
 
@@ -44,6 +47,8 @@ pub struct Parsed {
     pub quirks_mode: QuirksMode,
     /// How many spec parse errors the tokenizer/tree builder reported.
     pub parse_errors: u32,
+    /// MIME type this document reports from `document.contentType`.
+    pub content_type: &'static str,
 }
 
 pub(crate) enum ParseProgress {
@@ -180,17 +185,17 @@ pub fn run_with_stop(
     services: Arc<dyn BrowserServices>,
     stop: &Arc<Stop>,
 ) {
-    let mut document = Document::with_stop(services, Arc::clone(stop));
-    let mut published = 0;
+    let mut engine = Engine::with_stop(services, Arc::clone(stop));
+    let mut published = HashMap::new();
     loop {
-        let received = if document.has_background_work() {
+        let received = if engine.has_background_work() {
             inbox.recv_timeout(Duration::from_millis(10))
         } else {
             inbox.recv().map_err(|_| RecvTimeoutError::Disconnected)
         };
         match received {
             Ok(ToRenderer::Request { id, command }) => {
-                let (reply, shutdown) = handle_command(&mut document, command, stop);
+                let (reply, shutdown) = handle_command(&mut engine, command, stop);
                 let _ = outbox.send(FromRenderer::Reply { id, reply });
                 if shutdown {
                     break;
@@ -198,32 +203,35 @@ pub fn run_with_stop(
             }
             // Service replies are routed by the transport, never delivered here.
             Ok(ToRenderer::ServiceReply { .. }) => {}
-            Err(RecvTimeoutError::Timeout) => document.drive_for(Duration::from_millis(10)),
+            Err(RecvTimeoutError::Timeout) => engine.drive_for(Duration::from_millis(10)),
             Err(RecvTimeoutError::Disconnected) => break,
         }
-        publish(&document, &mut published, outbox);
+        publish(&engine, &mut published, outbox);
     }
-    document.shutdown_runtime();
+    engine.shutdown();
 }
 
 fn handle_command(
-    document: &mut Document,
+    engine: &mut Engine,
     command: Command,
     stop: &Arc<document::Stop>,
 ) -> (Reply, bool) {
     match command {
-        Command::Mount(mount) => {
-            document.mount(&mount);
-            (Reply::Unit(Ok(())), false)
-        }
-        Command::Eval { source } => (Reply::Text(document.eval(&source)), false),
-        Command::ExecuteScript { source, timeout_ms } => {
+        Command::Mount { frame, mount } => (Reply::Unit(engine.mount_frame(frame, &mount)), false),
+        Command::Eval { frame, source } => (Reply::Text(engine.eval_in(frame, &source)), false),
+        Command::ExecuteScript {
+            frame,
+            source,
+            timeout_ms,
+        } => {
             let timeout = timeout_ms.map(Duration::from_millis);
-            let value = document.execute_remote(&source, timeout);
+            let value = engine.execute_remote_in(frame, &source, timeout);
             (Reply::Value(value), false)
         }
-        Command::SetDocumentUrl { url } => (Reply::Unit(document.set_document_url(&url)), false),
-        Command::IsIdle => (Reply::Bool(!document.has_background_work()), false),
+        Command::SetDocumentUrl { frame, url } => {
+            (Reply::Unit(engine.set_document_url_in(frame, &url)), false)
+        }
+        Command::IsIdle => (Reply::Bool(!engine.has_background_work()), false),
         Command::Shutdown => {
             stop.request();
             (Reply::Unit(Ok(())), true)
@@ -231,12 +239,17 @@ fn handle_command(
     }
 }
 
-fn publish(document: &Document, published: &mut usize, outbox: &Sender<FromRenderer>) {
-    let events = &document.events()[*published..];
-    for event in events {
-        let _ = outbox.send(FromRenderer::Event(*event));
+fn publish(engine: &Engine, cursors: &mut HashMap<FrameId, usize>, outbox: &Sender<FromRenderer>) {
+    for (frame, document) in engine.frames() {
+        let cursor = cursors.entry(frame).or_default();
+        for event in &document.events()[*cursor..] {
+            let _ = outbox.send(FromRenderer::Event {
+                frame,
+                event: *event,
+            });
+        }
+        *cursor = document.events().len();
     }
-    *published = document.events().len();
 }
 
 // ── the sink ────────────────────────────────────────────────────────────────
@@ -276,6 +289,7 @@ impl Sink {
             dom: std::mem::replace(&mut *self.dom.borrow_mut(), dom::Dom::new()),
             quirks_mode: self.quirks_mode.get(),
             parse_errors: self.parse_errors.get(),
+            content_type: "text/html",
         }
     }
 
@@ -367,6 +381,7 @@ impl TreeSink for Sink {
             dom: self.dom.into_inner(),
             quirks_mode: self.quirks_mode.get(),
             parse_errors: self.parse_errors.get(),
+            content_type: "text/html",
         }
     }
 

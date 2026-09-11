@@ -2,4 +2,3 @@ target/
 .direnv/
 __pycache__/
 *.egg-info/
-docs/architecture.html

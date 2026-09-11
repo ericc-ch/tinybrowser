@@ -24,9 +24,10 @@ mod node;
 mod select;
 mod state;
 
-pub use arena::{Dom, DomError, NodeRef, QuirksMode};
+pub use arena::{Dom, DomError, Lifecycle, Mutation, NodeRef, QuirksMode};
 pub use id::NodeId;
 pub use node::{
-    Attribute, LocalName, Namespace, NodeKind, Prefix, QualName, html_namespace, xml_namespace,
+    Attribute, LocalName, Namespace, NodeKind, Prefix, QualName, html_namespace, svg_namespace,
+    xml_namespace,
 };
 pub use select::{ParseFail, ParseFailKind, SelectError};

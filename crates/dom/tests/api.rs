@@ -1,4 +1,4 @@
-use dom::{Attribute, Dom, DomError, LocalName, Namespace, NodeId, NodeKind, QualName};
+use dom::{Attribute, Dom, DomError, Lifecycle, LocalName, Namespace, NodeId, NodeKind, QualName};
 
 const HTML_NS: &str = "http://www.w3.org/1999/xhtml";
 
@@ -285,4 +285,39 @@ fn document_fragments_templates_and_clones_keep_their_contracts() {
 
     let other = Dom::new();
     assert_eq!(dom.append(html, other.document()), Err(DomError::StaleNode));
+}
+
+#[test]
+fn connection_transitions_record_lifecycle_events() {
+    let mut dom = Dom::new();
+    let root = dom.document();
+    let html = dom.create_element(qn("html"), Vec::new());
+    let body = dom.create_element(qn("body"), Vec::new());
+    let iframe = dom.create_element(qn("iframe"), Vec::new());
+
+    dom.append(root, html).expect("html");
+    dom.append(html, body).expect("body");
+    // Only iframe transitions are tracked; ordinary elements are not.
+    assert!(dom.take_lifecycle().is_empty());
+
+    dom.append(body, iframe).expect("iframe");
+    assert_eq!(dom.take_lifecycle(), vec![Lifecycle::Inserted(iframe)]);
+
+    // A detached subtree records nothing until it is connected...
+    let detached = dom.create_element(qn("div"), Vec::new());
+    let nested = dom.create_element(qn("iframe"), Vec::new());
+    dom.append(detached, nested).expect("detached iframe");
+    assert!(dom.take_lifecycle().is_empty());
+
+    // ...then every iframe in the inserted subtree is reported.
+    dom.append(body, detached).expect("connect subtree");
+    assert_eq!(dom.take_lifecycle(), vec![Lifecycle::Inserted(nested)]);
+
+    // Moving a connected element is not a removal plus insertion.
+    dom.append(body, nested).expect("move nested");
+    assert!(dom.take_lifecycle().is_empty());
+
+    // Detaching reports the removed iframe.
+    dom.detach(nested).expect("detach");
+    assert_eq!(dom.take_lifecycle(), vec![Lifecycle::Removed(nested)]);
 }

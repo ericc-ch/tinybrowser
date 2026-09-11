@@ -7,7 +7,9 @@
 mod bindings;
 mod world;
 
-use std::cell::{Cell, RefCell};
+pub(crate) use world::RealmRegistry;
+
+use std::cell::{Cell, OnceCell, RefCell};
 use std::fmt;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -91,6 +93,28 @@ pub(crate) struct PendingJsFetch {
     pub js_id: i32,
 }
 
+/// One renderer process's `QuickJS` heap, created on first use and shared by
+/// every frame in the process.
+///
+/// Several `QuickJS` contexts may share one runtime and its objects, "similar to
+/// frames of the same origin sharing JavaScript objects in a web browser"
+/// (<https://bellard.org/quickjs/quickjs.html>, JSRuntime): the same-site-frame
+/// model of [ADR 0014](../../../../docs/adrs/0014-frames-and-per-frame-realms.md).
+/// The creation result is cached so a heap that cannot start fails every realm
+/// the same way instead of retrying.
+#[derive(Clone, Default)]
+pub(crate) struct SharedJsRuntime(Rc<OnceCell<Result<Runtime, Box<str>>>>);
+
+impl SharedJsRuntime {
+    pub(crate) fn get(&self) -> Result<&Runtime, JsError> {
+        let slot = self
+            .0
+            .get_or_init(|| Runtime::new().map_err(|err| err.to_string().into_boxed_str()));
+        slot.as_ref()
+            .map_err(|message| JsError::Engine(message.clone()))
+    }
+}
+
 pub(crate) struct JsRealm {
     runtime: Runtime,
     context: Context,
@@ -101,8 +125,12 @@ pub(crate) struct JsRealm {
 }
 
 impl JsRealm {
-    pub(crate) fn new(world: Rc<RefCell<World>>, stop: Arc<Stop>) -> Result<Self, JsError> {
-        let runtime = Runtime::new().map_err(JsError::engine)?;
+    pub(crate) fn new(
+        shared: &SharedJsRuntime,
+        world: Rc<RefCell<World>>,
+        stop: Arc<Stop>,
+    ) -> Result<Self, JsError> {
+        let runtime = shared.get()?.clone();
         runtime.set_memory_limit(MAX_RUNTIME_MEMORY);
         runtime.set_max_stack_size(MAX_RUNTIME_STACK);
         let context = Context::full(&runtime).map_err(JsError::engine)?;
@@ -210,6 +238,22 @@ impl JsRealm {
                 .with(|ctx| bindings::fire_window_load(&ctx).map_err(JsError::engine));
             let jobs = self.run_jobs();
             fired.and(jobs)
+        })
+    }
+
+    /// Microtask checkpoint for parser-driven mutations: schedules the
+    /// delivery microtask when records are pending and runs the job queue.
+    ///
+    /// Parser insertions record mutations without entering a JS binding, so
+    /// nothing else schedules delivery. Called between parser scripts, where
+    /// the spec drains microtasks before the next script runs.
+    pub(crate) fn deliver_mutations(&self) -> Result<(), JsError> {
+        self.with_budget(None, || {
+            let scheduled: Result<(), JsError> = self
+                .context
+                .with(|ctx| bindings::schedule_mutation_delivery(&ctx).map_err(JsError::engine));
+            let jobs = self.run_jobs();
+            scheduled.and(jobs)
         })
     }
 
@@ -357,12 +401,18 @@ globalThis.fetch = function(url) {
 
 impl Drop for JsRealm {
     fn drop(&mut self) {
-        self.world.borrow_mut().clear_listeners();
+        bindings::forget_world(&self.context);
+        let world = self.world.clone();
+        let mut world = world.borrow_mut();
+        // Release this realm's cached wrappers and document associations
+        // before its QuickJS context goes away; sibling realms keep theirs.
+        world.forget_owned_documents();
+        world.clear_listeners();
     }
 }
 
 pub(crate) fn classic_script_at(world: &World, id: dom::NodeId) -> Option<ClassicScript> {
-    let parsed = world.parsed.as_ref()?;
+    let parsed = world.document(id)?;
     if !is_classic_script(&parsed.dom, id) {
         return None;
     }

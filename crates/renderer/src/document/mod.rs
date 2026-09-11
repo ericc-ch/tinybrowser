@@ -3,7 +3,7 @@
 //! process owns the tab and drives navigation
 //! ([ADR 0011](../../../../docs/adrs/0011-renderer-processes-per-site.md)).
 
-use std::cell::{Ref, RefCell};
+use std::cell::{OnceCell, RefCell};
 use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -13,11 +13,12 @@ use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TrySendError};
 use std::task::Waker;
 use std::time::Instant as WallClock;
 
-use tokio::runtime::Runtime;
+use tokio::runtime::Runtime as TokioRuntime;
 use tokio::time::Instant;
 use url::Url;
 
-use crate::js::World;
+use crate::documents::DocumentStore;
+use crate::js::{RealmRegistry, SharedJsRuntime, World};
 use crate::protocol::{BrowserServices, Mount, ScriptFailure, TabError, TabEvent};
 use crate::{ActiveParser, Parsed};
 
@@ -79,10 +80,35 @@ struct Timer {
     fired: bool,
 }
 
+/// The renderer process's Tokio waiter, built on first use and shared by every
+/// frame. All frames run their pump as futures on this one current-thread
+/// runtime ([ADR 0014](../../../../docs/adrs/0014-frames-and-per-frame-realms.md)).
+#[derive(Clone)]
+pub(crate) struct Waiter(Rc<OnceCell<TokioRuntime>>);
+
+impl Waiter {
+    pub(crate) fn new() -> Self {
+        Self(Rc::new(OnceCell::new()))
+    }
+
+    pub(crate) fn get(&self) -> &TokioRuntime {
+        self.0.get_or_init(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .build()
+                .expect("current-thread Tokio runtime for the renderer thread")
+        })
+    }
+}
+
 /// One document: tree, task list, `QuickJS` realm, and browser services.
 pub struct Document {
     services: Arc<dyn BrowserServices>,
     world: Rc<RefCell<World>>,
+    /// The shared, realm-agnostic store this frame's trees live in.
+    documents: Rc<RefCell<DocumentStore>>,
+    js_runtime: SharedJsRuntime,
+    waiter: Waiter,
     url: Url,
     content_language: Option<String>,
     tasks: VecDeque<Task>,
@@ -99,7 +125,6 @@ pub struct Document {
     js_epoch: u64,
     active_parser: Option<ActiveParser>,
     classic_fetch_in_flight: bool,
-    runtime: Option<Runtime>,
     stop: Arc<Stop>,
     next_remote: u64,
     remote_by_node: HashMap<dom::NodeId, u64>,
@@ -107,26 +132,53 @@ pub struct Document {
 
 impl Drop for Document {
     fn drop(&mut self) {
-        self.shutdown_runtime();
+        self.shutdown();
     }
 }
 
 impl Document {
-    /// An empty document whose dials and cookies go through `services`.
+    /// An empty standalone document with its own `QuickJS` heap and waiter.
+    ///
+    /// Renderer frames are built with [`Document::with_shared`], so every frame
+    /// of one process shares one heap; this constructor serves tests and
+    /// one-off documents.
     #[must_use]
     pub fn new(services: Arc<dyn BrowserServices>) -> Self {
-        Self::with_stop(services, Arc::new(Stop::new()))
+        let documents = Rc::new(RefCell::new(DocumentStore::default()));
+        let registry = Rc::new(RefCell::new(RealmRegistry::default()));
+        Self::with_shared(
+            services,
+            SharedJsRuntime::default(),
+            Waiter::new(),
+            documents,
+            &registry,
+            Arc::new(Stop::new()),
+        )
     }
 
-    pub(crate) fn with_stop(services: Arc<dyn BrowserServices>, stop: Arc<Stop>) -> Self {
+    /// A document sharing its renderer process's `QuickJS` heap, waiter,
+    /// document store, and realm registry.
+    pub(crate) fn with_shared(
+        services: Arc<dyn BrowserServices>,
+        js_runtime: SharedJsRuntime,
+        waiter: Waiter,
+        documents: Rc<RefCell<DocumentStore>>,
+        registry: &Rc<RefCell<RealmRegistry>>,
+        stop: Arc<Stop>,
+    ) -> Self {
         let document_url = Url::parse("about:blank").expect("about:blank is a valid URL");
         let (dial_tx, dial_rx) = mpsc::channel();
         Self {
             world: Rc::new(RefCell::new(World::new(
                 Arc::clone(&services),
                 document_url.clone(),
+                Rc::clone(&documents),
+                Rc::clone(registry),
             ))),
             services,
+            documents,
+            js_runtime,
+            waiter,
             url: document_url,
             content_language: None,
             tasks: VecDeque::new(),
@@ -143,17 +195,18 @@ impl Document {
             js_epoch: 0,
             active_parser: None,
             classic_fetch_in_flight: false,
-            runtime: None,
             stop,
             next_remote: 0,
             remote_by_node: HashMap::new(),
         }
     }
 
-    /// Last parse result, if any.
-    #[must_use]
-    pub fn parsed(&self) -> Option<Ref<'_, Parsed>> {
-        Ref::filter_map(self.world.borrow(), |world| world.parsed.as_ref()).ok()
+    /// Runs `reader` against the frame's active document, if any.
+    pub fn with_parsed<R>(&self, reader: impl FnOnce(&Parsed) -> R) -> Option<R> {
+        let id = self.world.borrow().main_document_id()?;
+        let documents = Rc::clone(&self.documents);
+        let store = documents.borrow();
+        store.get(id).map(reader)
     }
 
     /// Document URL (cookie initiator and relative-URL base).
@@ -172,7 +225,7 @@ impl Document {
     /// Records the document-level `Content-Language` default.
     pub fn set_content_language(&mut self, value: Option<String>) {
         self.content_language.clone_from(&value);
-        if let Some(parsed) = self.world.borrow_mut().parsed.as_mut() {
+        if let Some(mut parsed) = self.world.borrow().main_document_mut() {
             parsed.dom.set_document_language(value);
         }
     }
@@ -266,11 +319,21 @@ impl Document {
         self.start_document(input);
     }
 
+    /// Records `document` as this realm's so wrappers resolve its owner.
+    fn register_document(&self, document: u32) {
+        let registry = self.world.borrow().registry();
+        registry.borrow_mut().insert_document(document, &self.world);
+    }
+
     fn ensure_js(&mut self) -> Result<(), TabError> {
         if self.js.is_none() {
             self.js = Some(
-                crate::js::JsRealm::new(self.world.clone(), Arc::clone(&self.stop))
-                    .map_err(TabError::from)?,
+                crate::js::JsRealm::new(
+                    &self.js_runtime,
+                    self.world.clone(),
+                    Arc::clone(&self.stop),
+                )
+                .map_err(TabError::from)?,
             );
         }
         Ok(())
@@ -306,6 +369,17 @@ impl Document {
         self.adopt_js_work();
     }
 
+    /// Drains parser-driven mutation records at a microtask checkpoint
+    /// (<https://html.spec.whatwg.org/multipage/webappapis.html#perform-a-microtask-checkpoint>).
+    /// Parser insertions bypass the JS bindings that schedule delivery, so
+    /// the document's `MutationObserver`s would otherwise not fire until the
+    /// next scripted mutation.
+    fn deliver_mutations(&mut self) {
+        if let Some(js) = &self.js {
+            note_script(&mut self.events, js.deliver_mutations().is_err());
+        }
+    }
+
     // https://html.spec.whatwg.org/multipage/parsing.html#parsing-main-intext
     // https://html.spec.whatwg.org/multipage/scripting.html#prepare-the-script-element
     fn advance_parser(&mut self) {
@@ -317,20 +391,25 @@ impl Document {
                 crate::ParseProgress::Script(id) => {
                     let parsed = parser.take_state();
                     if self.js.is_none() {
-                        self.world.borrow_mut().replace_document(parsed);
+                        let document = self.world.borrow_mut().replace_document(parsed);
+                        self.register_document(document);
                         if self.ensure_js().is_err() {
                             self.events.push(TabEvent::ScriptFailed);
                             self.sync_parser_from_world();
                             continue;
                         }
                     } else {
-                        self.world.borrow_mut().parsed = Some(parsed);
+                        let document = self.world.borrow_mut().set_document(parsed);
+                        self.register_document(document);
                     }
-                    if let Some(parsed) = self.world.borrow_mut().parsed.as_mut() {
+                    if let Some(mut parsed) = self.world.borrow().main_document_mut() {
                         parsed
                             .dom
                             .set_document_language(self.content_language.clone());
                     }
+                    // Microtask checkpoint before the script runs; parser
+                    // mutations queued since the last script deliver now.
+                    self.deliver_mutations();
                     let script = crate::js::classic_script_at(&self.world.borrow(), id);
                     match script {
                         Some(crate::js::ClassicScript::Inline(source)) => {
@@ -362,15 +441,19 @@ impl Document {
                         .dom
                         .set_document_language(self.content_language.clone());
                     if self.js.is_none() {
-                        self.world.borrow_mut().replace_document(parsed);
+                        let document = self.world.borrow_mut().replace_document(parsed);
+                        self.register_document(document);
                         if self.ensure_js().is_err() {
                             self.events.push(TabEvent::ScriptFailed);
                             return;
                         }
                     } else {
-                        self.world.borrow_mut().parsed = Some(parsed);
+                        let document = self.world.borrow_mut().set_document(parsed);
+                        self.register_document(document);
                     }
                     self.world.borrow_mut().parser_active = false;
+                    // Deliver parser mutations before the load event.
+                    self.deliver_mutations();
                     self.fire_document_load();
                     return;
                 }
@@ -390,7 +473,7 @@ impl Document {
 
     fn base_url(&self) -> Url {
         let world = self.world.borrow();
-        let Some(parsed) = world.parsed.as_ref() else {
+        let Some(parsed) = world.main_document() else {
             return self.url.clone();
         };
         let Ok(Some(base_el)) = parsed.dom.select_first(parsed.dom.document(), "base[href]") else {
@@ -476,7 +559,7 @@ impl Document {
         };
         let mut world = self.world.borrow_mut();
         let writes = std::mem::take(&mut world.pending_html_writes).concat();
-        if let Some(parsed) = world.parsed.take() {
+        if let Some(parsed) = world.take_main_document() {
             parser.restore(parsed);
         }
         drop(world);

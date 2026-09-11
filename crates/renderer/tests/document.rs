@@ -8,8 +8,8 @@ use std::time::{Duration, Instant};
 use dom::NodeKind;
 use net::{Agent, AgentBuilder, InitiatorKind, Method};
 use renderer::{
-    BrowserServices, DialKind, DialOutcome, DialRequest, Document, Mount, ScriptFailure, TabError,
-    TabEvent,
+    BrowserServices, DialKind, DialOutcome, DialRequest, Document, Engine, Mount, ScriptFailure,
+    TabError, TabEvent,
 };
 use url::Url;
 
@@ -225,15 +225,15 @@ fn navigation_parsing_cookies_and_relative_js_fetch_form_one_journey() {
 
     assert_eq!(doc.content_language(), Some("fr"));
     assert_eq!(doc.document_cookie(), "sid=1");
-    {
-        let parsed = doc.parsed().expect("parsed navigation");
+    doc.with_parsed(|parsed| {
         let paragraph = parsed
             .dom
             .select_first(parsed.dom.document(), "#loaded")
             .expect("selector")
             .expect("paragraph");
         assert_eq!(element_text(&parsed.dom, paragraph), "hi");
-    }
+    })
+    .expect("parsed navigation");
 
     doc.eval(
         "globalThis.body = ''; fetch('next').then(function(response) { return response.text(); }).then(function(text) { globalThis.body = text; });",
@@ -580,4 +580,67 @@ fn run_until_load_does_not_wait_for_unrelated_fetch() {
     assert_eq!(doc.eval("String(window.slowDone)").expect("done"), "true");
     slow_server.join().expect("slow server");
     page_server.join().expect("doc server");
+}
+
+#[test]
+fn engine_drives_the_main_frame_through_the_host() {
+    let services = Arc::new(TestServices::new());
+    let mut engine = Engine::new(services);
+    engine.load_html("<!doctype html><p id=x>hi</p>");
+    engine.run_until_load();
+
+    assert_eq!(
+        engine
+            .eval("document.getElementById('x').textContent")
+            .expect("text"),
+        "hi"
+    );
+    assert_eq!(
+        engine.execute_script("1 + 1").expect("number"),
+        renderer::ScriptValue::Number(2.0)
+    );
+    assert_eq!(engine.events(), vec![TabEvent::Load]);
+    assert_eq!(engine.document_url(), "about:blank");
+    engine
+        .with_parsed(|parsed| {
+            assert!(
+                parsed
+                    .dom
+                    .select_first(parsed.dom.document(), "#x")
+                    .expect("selector")
+                    .is_some()
+            );
+        })
+        .expect("parsed document");
+    engine.shutdown();
+}
+
+#[test]
+fn engine_hosts_child_frames_on_the_main_heap() {
+    let services = Arc::new(TestServices::new());
+    let mut engine = Engine::new(services);
+    engine.load_html("<!doctype html><title>main</title>");
+    engine.run_until_load();
+
+    let child = engine.create_frame();
+    engine
+        .frame_mut(child)
+        .expect("child frame")
+        .load_html("<!doctype html><p id=c>child</p>");
+    engine.run_until_load();
+
+    assert_eq!(engine.eval("document.title").expect("main title"), "main");
+    assert_eq!(
+        engine
+            .frame_mut(child)
+            .expect("child frame")
+            .eval("document.getElementById('c').textContent")
+            .expect("child text"),
+        "child"
+    );
+    assert!(
+        engine.frame_mut(renderer::FrameId::new(99)).is_none(),
+        "unknown frames are not addressable"
+    );
+    engine.shutdown();
 }

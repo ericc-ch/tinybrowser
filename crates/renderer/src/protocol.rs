@@ -12,6 +12,32 @@ use url::Url;
 
 use crate::RemoteValue;
 
+/// Renderer-process identity of one frame.
+///
+/// [ADR 0014](../../../docs/adrs/0014-frames-and-per-frame-realms.md): the
+/// renderer mints ids for the frames it hosts; the browser process routes
+/// frame-addressed commands and events by it. The tab's main frame is
+/// [`FrameId::MAIN`] in every renderer.
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct FrameId(u64);
+
+impl FrameId {
+    /// The tab's main frame, present in every renderer.
+    pub const MAIN: Self = Self(0);
+
+    /// Constructs a frame id from a protocol integer.
+    #[must_use]
+    pub fn new(raw: u64) -> Self {
+        Self(raw)
+    }
+
+    /// Stable numeric identity for protocol messages.
+    #[must_use]
+    pub fn get(self) -> u64 {
+        self.0
+    }
+}
+
 /// Why a renderer API call was refused.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TabError {
@@ -19,6 +45,11 @@ pub enum TabError {
     InvalidUrl {
         /// The spec the caller passed.
         spec: String,
+    },
+    /// The renderer does not host the addressed frame.
+    UnknownFrame {
+        /// The frame id the caller passed.
+        frame: u64,
     },
     /// `QuickJS` eval or a host callback failed.
     Script(ScriptFailure),
@@ -35,6 +66,7 @@ impl fmt::Display for TabError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidUrl { spec } => write!(f, "invalid url: {spec}"),
+            Self::UnknownFrame { frame } => write!(f, "unknown frame: {frame}"),
             Self::Script(failure) => write!(f, "script: {failure}"),
             Self::ActorStopped => f.write_str("renderer stopped"),
             Self::RendererUnavailable { message } => {
@@ -96,22 +128,33 @@ pub enum TabEvent {
 /// Host command to a renderer.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Command {
-    /// Replace the document: decode, reset the realm, parse, run to load.
-    Mount(Mount),
-    /// Evaluate `source` and return its string coercion.
+    /// Replace one frame's document: decode, reset the realm, parse, run to load.
+    Mount {
+        /// Frame to replace.
+        frame: FrameId,
+        /// The document to mount.
+        mount: Mount,
+    },
+    /// Evaluate `source` in one frame and return its string coercion.
     Eval {
+        /// Frame to evaluate in.
+        frame: FrameId,
         /// Script source.
         source: String,
     },
-    /// Evaluate `source` and return a value-only result.
+    /// Evaluate `source` in one frame and return a value-only result.
     ExecuteScript {
+        /// Frame to evaluate in.
+        frame: FrameId,
         /// Script source.
         source: String,
         /// Optional execution budget in milliseconds.
         timeout_ms: Option<u64>,
     },
-    /// Set the document URL used as cookie initiator and relative-URL base.
+    /// Set one frame's document URL used as cookie initiator and relative-URL base.
     SetDocumentUrl {
+        /// Frame to update.
+        frame: FrameId,
         /// Absolute URL.
         url: String,
     },
@@ -179,7 +222,12 @@ pub enum FromRenderer {
         reply: Reply,
     },
     /// Unsolicited document event.
-    Event(TabEvent),
+    Event {
+        /// Frame that emitted the event.
+        frame: FrameId,
+        /// The event.
+        event: TabEvent,
+    },
     /// A browser service the renderer cannot perform itself.
     ServiceCall {
         /// Service-call id chosen by the renderer.
@@ -338,22 +386,27 @@ mod tests {
         let messages = [
             ToRenderer::Request {
                 id: 1,
-                command: Command::Mount(Mount {
-                    url: "about:blank".into(),
-                    content_type: None,
-                    content_language: None,
-                    body: vec![1, 2, 3],
-                }),
+                command: Command::Mount {
+                    frame: FrameId::MAIN,
+                    mount: Mount {
+                        url: "about:blank".into(),
+                        content_type: None,
+                        content_language: None,
+                        body: vec![1, 2, 3],
+                    },
+                },
             },
             ToRenderer::Request {
                 id: 2,
                 command: Command::Eval {
+                    frame: FrameId::new(3),
                     source: "1+1".into(),
                 },
             },
             ToRenderer::Request {
                 id: 3,
                 command: Command::ExecuteScript {
+                    frame: FrameId::MAIN,
                     source: "x".into(),
                     timeout_ms: Some(50),
                 },
@@ -361,6 +414,7 @@ mod tests {
             ToRenderer::Request {
                 id: 4,
                 command: Command::SetDocumentUrl {
+                    frame: FrameId::MAIN,
                     url: "http://example.test/".into(),
                 },
             },
@@ -420,7 +474,10 @@ mod tests {
                 id: 5,
                 reply: Reply::Value(Ok(RemoteValue::List(vec![RemoteValue::Number(1.0)]))),
             },
-            FromRenderer::Event(TabEvent::Fetch { status: 404 }),
+            FromRenderer::Event {
+                frame: FrameId::MAIN,
+                event: TabEvent::Fetch { status: 404 },
+            },
             FromRenderer::ServiceCall {
                 id: 6,
                 call: ServiceCall::Dial(DialRequest {

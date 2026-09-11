@@ -112,23 +112,17 @@ impl Document {
             tokio::runtime::Handle::try_current().is_err(),
             "Document::run must not run inside another Tokio runtime"
         );
-        let runtime = self.runtime.take().unwrap_or_else(|| {
-            tokio::runtime::Builder::new_current_thread()
-                .enable_time()
-                .build()
-                .expect("current-thread Tokio runtime for the renderer thread")
-        });
-        runtime.block_on(self.pump(cap, keep_waiting));
-        self.runtime = Some(runtime);
+        let waiter = self.waiter.clone();
+        waiter.get().block_on(self.pump(cap, keep_waiting));
     }
 
-    pub(crate) fn shutdown_runtime(&mut self) {
+    /// Stops the frame and drops its queued work. The shared waiter and `QuickJS`
+    /// heap belong to the page engine, not the frame, so they are not touched.
+    pub(crate) fn shutdown(&mut self) {
         self.stop.request();
         self.queued_dials.clear();
         self.in_flight_dials = 0;
-        if let Some(runtime) = self.runtime.take() {
-            runtime.shutdown_background();
-        }
+        self.world.borrow_mut().forget_owned_documents();
     }
 
     fn stopped(&self) -> bool {
