@@ -84,6 +84,24 @@ the protocol adapters.
   it; `Document::run`'s per-document Tokio runtime and its "not inside another
   runtime" assertion are replaced by engine-level pumping.
 
+## Frame realm creation timing
+
+QuickJS allows several contexts per runtime, but rquickjs serializes access:
+`Context::with` and `Context::full` borrow the raw runtime
+(`rquickjs-core/src/context/base.rs:121`, `safe_ref.rs`), so no second realm
+can be created from inside a running one. A child navigable therefore cannot
+get its realm *during* the parent script that inserts it.
+
+The engine creates frame realms at the next safe point instead: between script
+executions while the parser runs (markup iframes, which are the common case)
+and at the end of the task for scripted `appendChild(iframe)`. The frame's
+`contentWindow` is a stable `WindowProxy` object from insertion time, while
+`contentWindow.document` and `contentDocument` become live once the realm
+materialized. The spec's exact insertion-time availability is approximated,
+not met; WPT `insertion-removing-steps` is the suite that stays red until
+realm creation can nest (a pre-created context pool is the escape hatch if
+that timing turns out to matter).
+
 ## Options considered
 
 - **One context per tab with window-proxy objects (no second realm).** Rejected:

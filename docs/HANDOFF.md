@@ -31,7 +31,12 @@ Next (ADR 0014 step 4):
 
 1. **DOM lifecycle hooks.** Add insertion/post-connection/removing steps to
    `dom` (iframe creates its content navigable in post-connection and destroys
-   it in removing; WPT `insertion-removing-steps` probes the timing).
+   it in removing). Parser insertion can materialize a child realm
+   synchronously; a scripted `appendChild(iframe)` cannot, because rquickjs
+   cannot create a context inside a running one (see ADR 0014 "Frame realm
+   creation timing"). Frame trees (`FrameTree` shared by engine and documents)
+   should be the next structural step, then iframe bindings with a
+   `WindowProxy` that binds to the child realm once it exists.
 2. **iframe bindings + srcdoc.** `HTMLIFrameElement` members (`contentWindow`,
    `contentDocument`, `srcdoc`, `name`); filter creation must reach the engine:
    `Sink`/parser notifications go through `Document` to `Engine::create_frame`
