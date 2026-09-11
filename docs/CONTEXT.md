@@ -93,8 +93,24 @@ A top-level browsing context: the identity that survives navigation and the thin
 _Avoid_: page (CDP method names and HTTP prose only), document (the active content is replaced on navigation), site instance, CDP tab target
 
 **Document**:
-The active document of a Tab: `Dom`, QuickJS realm, active parser, tasks, and timers. It lives in the renderer process for its site. Navigation replaces it; the Tab remains.
-_Avoid_: page, tab
+The active document of a Frame: `Dom`, QuickJS realm, active parser, tasks, and timers. It lives in the renderer process for its site. Navigation replaces it; the Frame and Tab remain.
+_Avoid_: page, tab, frame
+
+**Frame**:
+One navigable as our implementation models it: a `Document` plus its QuickJS realm inside a renderer process, addressed by `FrameId`. A tab's **main frame** is its top-level navigable; a **child frame** is an `iframe`'s content navigable. The browser process owns the frame tree (parent, container element, site, URL, load state); the renderer hosts the frame's document ([ADR 0014](adrs/0014-frames-and-per-frame-realms.md)).
+_Avoid_: browsing context (the spec's older umbrella term), window (the realm global)
+
+**FrameId**:
+Renderer-local identity for one frame, minted by the page engine and stable across same-renderer navigations. Frame-addressed commands and events carry it across the IPC seam. Cross-process frames (OOPIF) later map a browser-owned identity onto the id inside each renderer.
+_Avoid_: TabId (browser-process tab identity), NodeId (tree identity)
+
+**WindowProxy**:
+The object `window`, `self`, and `iframe.contentWindow` expose: an exotic object per navigable wrapping the current `Window` that survives navigation. Cross-origin access is limited to the spec allowlist (`postMessage`, `location` setter, `close`, `frames`, `length`, ...); `postMessage` is the sanctioned channel ([the WindowProxy exotic object](https://html.spec.whatwg.org/multipage/nav-history-apis.html#the-windowproxy-exotic-object)).
+_Avoid_: window (the realm's global object), globalThis
+
+**Realm**:
+One QuickJS `Context`: a global object, intrinsic constructors, and prototype chains. One realm per frame. Same-site realms share their renderer's QuickJS `Runtime` (heap), which is what lets same-origin frames pass objects synchronously; the agent cluster key the spec uses is the site ([ADR 0014](adrs/0014-frames-and-per-frame-realms.md)).
+_Avoid_: context (alone), world (Blink's extension concept), isolate
 
 **TabHandle**:
 The value-only handle other threads and protocols use to talk to one `Tab` in the browser process. Commands, events, request IDs, values, and explicit errors may cross. DOM references, QuickJS values, callbacks, and closures must not.
@@ -113,11 +129,11 @@ The browser-process coordinator thread for one `Tab`: identity, navigation dials
 _Avoid_: renderer process (the process that owns the document), tab thread as a Spectre boundary
 
 **Page engine**:
-The code and runtime that owns a `Document`: HTML parser, `Dom`, QuickJS realm, task queue, and timers. It is the `renderer` crate. "renderer" alone means the process; the engine runs inside it, and in-process for tests.
+The code and runtime that holds frames and their documents: HTML parser, `Dom`, QuickJS realms, task queues, and timers. It is the `renderer` crate; the Rust type is `renderer::Engine`. One engine per renderer process owns the shared QuickJS `Runtime`, the Tokio waiter, and the frame registry; "renderer" alone means the process ([ADR 0014](adrs/0014-frames-and-per-frame-realms.md)).
 _Avoid_: renderer (as a code noun), content engine, browser engine
 
 **Renderer process**:
-The process hosting the page engine: `Dom`, QuickJS realm, active parser, tasks, and timers. Runs in its own OS process, one per live site instance, spawned from the same executable as `--renderer`. It advances work while idle and never links `net` ([ADR 0011](adrs/0011-renderer-processes-per-site.md)). Tests and `Browser::ephemeral` may run the same loop in-process (local backend); production runs a process per site. Chromium calls it the renderer process, Gecko the content process ([Gecko process model](https://firefox-source-docs.mozilla.org/dom/ipc/process_model.html)).
+The process hosting the page engine: one shared QuickJS `Runtime`, one Tokio waiter, and one `Document` plus realm per frame. Runs in its own OS process, one per live site instance, spawned from the same executable as `--renderer`. It advances work while idle and never links `net` ([ADR 0011](adrs/0011-renderer-processes-per-site.md), [ADR 0014](adrs/0014-frames-and-per-frame-realms.md)). Tests and `Browser::ephemeral` may run the same loop in-process (local backend); production runs a process per site. Chromium calls it the renderer process, Gecko the content process ([Gecko process model](https://firefox-source-docs.mozilla.org/dom/ipc/process_model.html)).
 _Avoid_: content process (Gecko's name for the same thing; use renderer process), worker, TabActor
 
 **Site**:

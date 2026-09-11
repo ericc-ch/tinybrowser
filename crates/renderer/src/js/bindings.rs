@@ -4397,6 +4397,7 @@ pub(super) fn install(ctx: &Ctx<'_>, world: &Rc<RefCell<World>>) -> Result<()> {
     Class::<JsNode>::define(&globals)?;
     Class::<JsCollection>::define(&globals)?;
     Class::<JsDomException>::define(&globals)?;
+    inherit_error_prototype(&globals)?;
     Class::<JsImplementation>::define(&globals)?;
     Class::<JsTokenList>::define(&globals)?;
     Class::<JsAttr>::define(&globals)?;
@@ -5053,6 +5054,19 @@ fn class_proto<'js>(ctx: &Ctx<'js>, name: &str) -> Result<Option<Object<'js>>> {
         return Ok(None);
     };
     Ok(Some(saved.restore(ctx)?))
+}
+
+/// `DOMException` is an exception interface: its interface prototype object's
+/// `[[Prototype]]` is `%Error.prototype%`, so `String(exception)` is
+/// `"Name: message"` and `instanceof Error` holds
+/// (<https://webidl.spec.whatwg.org/#js-DOMException-specialness>).
+fn inherit_error_prototype(globals: &Object<'_>) -> Result<()> {
+    let constructor: Object = globals.get("DOMException")?;
+    let prototype: Object = constructor.get("prototype")?;
+    let error: Object = globals.get("Error")?;
+    let error_prototype: Object = error.get("prototype")?;
+    prototype.set_prototype(Some(&error_prototype))?;
+    Ok(())
 }
 
 /// `WebIDL` constants appear on the `interface object`, the `interface

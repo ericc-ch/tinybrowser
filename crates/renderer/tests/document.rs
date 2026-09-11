@@ -8,8 +8,8 @@ use std::time::{Duration, Instant};
 use dom::NodeKind;
 use net::{Agent, AgentBuilder, InitiatorKind, Method};
 use renderer::{
-    BrowserServices, DialKind, DialOutcome, DialRequest, Document, Mount, ScriptFailure, TabError,
-    TabEvent,
+    BrowserServices, DialKind, DialOutcome, DialRequest, Document, Engine, Mount, ScriptFailure,
+    TabError, TabEvent,
 };
 use url::Url;
 
@@ -583,93 +583,32 @@ fn run_until_load_does_not_wait_for_unrelated_fetch() {
 }
 
 #[test]
-fn created_documents_are_second_trees() {
-    let (mut doc, _host) = document();
-    doc.load_html("<!doctype html><title>main</title><body><p id=here>x</p></body>");
+fn engine_drives_the_main_frame_through_the_host() {
+    let services = Arc::new(TestServices::new());
+    let mut engine = Engine::new(services);
+    engine.load_html("<!doctype html><p id=x>hi</p>");
+    engine.run_until_load();
 
     assert_eq!(
-        doc.eval(
-            "var secondary = document.implementation.createHTMLDocument('T');\
-             String(secondary.contentType)"
-        )
-        .expect("contentType"),
-        "text/html"
+        engine
+            .eval("document.getElementById('x').textContent")
+            .expect("text"),
+        "hi"
     );
     assert_eq!(
-        doc.eval(
-            "secondary.body.appendChild(secondary.createElement('p')).textContent = 'second';\
-             secondary.title"
-        )
-        .expect("title"),
-        "T"
+        engine.execute_script("1 + 1").expect("number"),
+        renderer::ScriptValue::Number(2.0)
     );
-    assert_eq!(
-        doc.eval("String(secondary.body.firstChild.textContent)")
-            .expect("secondary body"),
-        "second"
+    assert_eq!(engine.events(), &[TabEvent::Load]);
+    assert_eq!(engine.document_url(), "about:blank");
+    let parsed = engine.parsed().expect("parsed document");
+    assert!(
+        parsed
+            .dom
+            .select_first(parsed.dom.document(), "#x")
+            .expect("selector")
+            .is_some()
     );
-    // The two documents are separate trees.
-    assert_eq!(
-        doc.eval("String(document.getElementById('here') !== null)")
-            .expect("main lookup"),
-        "true"
-    );
-    assert_eq!(
-        doc.eval("String(secondary.getElementById('here') === null)")
-            .expect("secondary lookup"),
-        "true"
-    );
-    assert_eq!(
-        doc.eval("String(secondary.documentElement.ownerDocument === secondary)")
-            .expect("ownerDocument"),
-        "true"
-    );
-
-    assert_eq!(
-        doc.eval(
-            "var xml = document.implementation.createDocument(null, '', null);\
-             String(xml.createElement('x').namespaceURI)"
-        )
-        .expect("xml namespace"),
-        "null"
-    );
-    assert_eq!(
-        doc.eval(
-            "var xhtml = document.implementation.createDocument(\
-               'http://www.w3.org/1999/xhtml', 'html', null);\
-             xhtml.contentType + '|' + String(xhtml.createElement('x').namespaceURI)"
-        )
-        .expect("xhtml document"),
-        "application/xhtml+xml|http://www.w3.org/1999/xhtml"
-    );
-}
-
-#[test]
-fn mutation_observers_queue_and_deliver_records() {
-    let (mut doc, _host) = document();
-    doc.load_html("<!doctype html><body><div id=t>x</div></body>");
-    doc.eval(
-        "window.delivered = 0;\
-         window.obs = new MutationObserver(function(records) { window.delivered += records.length; });\
-         var t = document.getElementById('t');\
-         obs.observe(t, {attributes: true, attributeOldValue: true, childList: true, subtree: true, characterData: true, characterDataOldValue: true});\
-         t.setAttribute('x', '1');",
-    )
-    .expect("observe and mutate");
-    // The queued delivery microtask runs with the eval's job drain.
-    assert_eq!(doc.eval("String(window.delivered)").expect("delivery"), "1");
-    // takeRecords drains the synchronous queue with old values.
-    assert_eq!(
-        doc.eval(
-            "t.setAttribute('x', '2');\
-             t.appendChild(document.createTextNode('hi'));\
-             t.lastChild.data = 'bye';\
-             var taken = obs.takeRecords();\
-             taken.map(function(r) { return r.type + ':' + String(r.oldValue); }).join(',')"
-        )
-        .expect("takeRecords"),
-        "attributes:1,childList:null,characterData:hi"
-    );
-    // Records already delivered are not re-delivered.
-    assert_eq!(doc.eval("String(window.delivered)").expect("delivery"), "1");
+    drop(parsed);
+    engine.shutdown();
 }

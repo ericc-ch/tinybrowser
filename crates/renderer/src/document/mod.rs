@@ -3,7 +3,7 @@
 //! process owns the tab and drives navigation
 //! ([ADR 0011](../../../../docs/adrs/0011-renderer-processes-per-site.md)).
 
-use std::cell::{Ref, RefCell};
+use std::cell::{OnceCell, Ref, RefCell};
 use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -13,11 +13,11 @@ use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TrySendError};
 use std::task::Waker;
 use std::time::Instant as WallClock;
 
-use tokio::runtime::Runtime;
+use tokio::runtime::Runtime as TokioRuntime;
 use tokio::time::Instant;
 use url::Url;
 
-use crate::js::World;
+use crate::js::{SharedJsRuntime, World};
 use crate::protocol::{BrowserServices, Mount, ScriptFailure, TabError, TabEvent};
 use crate::{ActiveParser, Parsed};
 
@@ -79,10 +79,33 @@ struct Timer {
     fired: bool,
 }
 
+/// The renderer process's Tokio waiter, built on first use and shared by every
+/// frame. All frames run their pump as futures on this one current-thread
+/// runtime ([ADR 0014](../../../../docs/adrs/0014-frames-and-per-frame-realms.md)).
+#[derive(Clone)]
+pub(crate) struct Waiter(Rc<OnceCell<TokioRuntime>>);
+
+impl Waiter {
+    pub(crate) fn new() -> Self {
+        Self(Rc::new(OnceCell::new()))
+    }
+
+    pub(crate) fn get(&self) -> &TokioRuntime {
+        self.0.get_or_init(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .build()
+                .expect("current-thread Tokio runtime for the renderer thread")
+        })
+    }
+}
+
 /// One document: tree, task list, `QuickJS` realm, and browser services.
 pub struct Document {
     services: Arc<dyn BrowserServices>,
     world: Rc<RefCell<World>>,
+    js_runtime: SharedJsRuntime,
+    waiter: Waiter,
     url: Url,
     content_language: Option<String>,
     tasks: VecDeque<Task>,
@@ -99,7 +122,6 @@ pub struct Document {
     js_epoch: u64,
     active_parser: Option<ActiveParser>,
     classic_fetch_in_flight: bool,
-    runtime: Option<Runtime>,
     stop: Arc<Stop>,
     next_remote: u64,
     remote_by_node: HashMap<dom::NodeId, u64>,
@@ -107,18 +129,33 @@ pub struct Document {
 
 impl Drop for Document {
     fn drop(&mut self) {
-        self.shutdown_runtime();
+        self.shutdown();
     }
 }
 
 impl Document {
-    /// An empty document whose dials and cookies go through `services`.
+    /// An empty standalone document with its own `QuickJS` heap and waiter.
+    ///
+    /// Renderer frames are built with [`Document::with_shared`], so every frame
+    /// of one process shares one heap; this constructor serves tests and
+    /// one-off documents.
     #[must_use]
     pub fn new(services: Arc<dyn BrowserServices>) -> Self {
-        Self::with_stop(services, Arc::new(Stop::new()))
+        Self::with_shared(
+            services,
+            SharedJsRuntime::default(),
+            Waiter::new(),
+            Arc::new(Stop::new()),
+        )
     }
 
-    pub(crate) fn with_stop(services: Arc<dyn BrowserServices>, stop: Arc<Stop>) -> Self {
+    /// A document sharing its renderer process's `QuickJS` heap and waiter.
+    pub(crate) fn with_shared(
+        services: Arc<dyn BrowserServices>,
+        js_runtime: SharedJsRuntime,
+        waiter: Waiter,
+        stop: Arc<Stop>,
+    ) -> Self {
         let document_url = Url::parse("about:blank").expect("about:blank is a valid URL");
         let (dial_tx, dial_rx) = mpsc::channel();
         Self {
@@ -127,6 +164,8 @@ impl Document {
                 document_url.clone(),
             ))),
             services,
+            js_runtime,
+            waiter,
             url: document_url,
             content_language: None,
             tasks: VecDeque::new(),
@@ -143,7 +182,6 @@ impl Document {
             js_epoch: 0,
             active_parser: None,
             classic_fetch_in_flight: false,
-            runtime: None,
             stop,
             next_remote: 0,
             remote_by_node: HashMap::new(),
@@ -269,8 +307,12 @@ impl Document {
     fn ensure_js(&mut self) -> Result<(), TabError> {
         if self.js.is_none() {
             self.js = Some(
-                crate::js::JsRealm::new(self.world.clone(), Arc::clone(&self.stop))
-                    .map_err(TabError::from)?,
+                crate::js::JsRealm::new(
+                    &self.js_runtime,
+                    self.world.clone(),
+                    Arc::clone(&self.stop),
+                )
+                .map_err(TabError::from)?,
             );
         }
         Ok(())

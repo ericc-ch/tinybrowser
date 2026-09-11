@@ -7,7 +7,7 @@
 mod bindings;
 mod world;
 
-use std::cell::{Cell, RefCell};
+use std::cell::{Cell, OnceCell, RefCell};
 use std::fmt;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -91,6 +91,28 @@ pub(crate) struct PendingJsFetch {
     pub js_id: i32,
 }
 
+/// One renderer process's `QuickJS` heap, created on first use and shared by
+/// every frame in the process.
+///
+/// Several `QuickJS` contexts may share one runtime and its objects, "similar to
+/// frames of the same origin sharing JavaScript objects in a web browser"
+/// (<https://bellard.org/quickjs/quickjs.html>, JSRuntime): the same-site-frame
+/// model of [ADR 0014](../../../../docs/adrs/0014-frames-and-per-frame-realms.md).
+/// The creation result is cached so a heap that cannot start fails every realm
+/// the same way instead of retrying.
+#[derive(Clone, Default)]
+pub(crate) struct SharedJsRuntime(Rc<OnceCell<Result<Runtime, Box<str>>>>);
+
+impl SharedJsRuntime {
+    pub(crate) fn get(&self) -> Result<&Runtime, JsError> {
+        let slot = self
+            .0
+            .get_or_init(|| Runtime::new().map_err(|err| err.to_string().into_boxed_str()));
+        slot.as_ref()
+            .map_err(|message| JsError::Engine(message.clone()))
+    }
+}
+
 pub(crate) struct JsRealm {
     runtime: Runtime,
     context: Context,
@@ -101,8 +123,12 @@ pub(crate) struct JsRealm {
 }
 
 impl JsRealm {
-    pub(crate) fn new(world: Rc<RefCell<World>>, stop: Arc<Stop>) -> Result<Self, JsError> {
-        let runtime = Runtime::new().map_err(JsError::engine)?;
+    pub(crate) fn new(
+        shared: &SharedJsRuntime,
+        world: Rc<RefCell<World>>,
+        stop: Arc<Stop>,
+    ) -> Result<Self, JsError> {
+        let runtime = shared.get()?.clone();
         runtime.set_memory_limit(MAX_RUNTIME_MEMORY);
         runtime.set_max_stack_size(MAX_RUNTIME_STACK);
         let context = Context::full(&runtime).map_err(JsError::engine)?;

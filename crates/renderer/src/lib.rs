@@ -22,12 +22,14 @@ use markup5ever::interface::{TokenizerResult, tree_builder::ElemName};
 use tendril::{StrTendril, TendrilSink};
 
 mod document;
+mod engine;
 mod js;
 mod process;
 mod protocol;
 mod remote;
 
 pub use document::{Document, ScriptValue, Stop};
+pub use engine::Engine;
 pub use process::serve_stdio;
 pub use protocol::{
     BrowserServices, Command, DialKind, DialOutcome, DialRequest, FromRenderer, Mount, Reply,
@@ -182,17 +184,17 @@ pub fn run_with_stop(
     services: Arc<dyn BrowserServices>,
     stop: &Arc<Stop>,
 ) {
-    let mut document = Document::with_stop(services, Arc::clone(stop));
+    let mut engine = Engine::with_stop(services, Arc::clone(stop));
     let mut published = 0;
     loop {
-        let received = if document.has_background_work() {
+        let received = if engine.has_background_work() {
             inbox.recv_timeout(Duration::from_millis(10))
         } else {
             inbox.recv().map_err(|_| RecvTimeoutError::Disconnected)
         };
         match received {
             Ok(ToRenderer::Request { id, command }) => {
-                let (reply, shutdown) = handle_command(&mut document, command, stop);
+                let (reply, shutdown) = handle_command(&mut engine, command, stop);
                 let _ = outbox.send(FromRenderer::Reply { id, reply });
                 if shutdown {
                     break;
@@ -200,32 +202,32 @@ pub fn run_with_stop(
             }
             // Service replies are routed by the transport, never delivered here.
             Ok(ToRenderer::ServiceReply { .. }) => {}
-            Err(RecvTimeoutError::Timeout) => document.drive_for(Duration::from_millis(10)),
+            Err(RecvTimeoutError::Timeout) => engine.drive_for(Duration::from_millis(10)),
             Err(RecvTimeoutError::Disconnected) => break,
         }
-        publish(&document, &mut published, outbox);
+        publish(&engine, &mut published, outbox);
     }
-    document.shutdown_runtime();
+    engine.shutdown();
 }
 
 fn handle_command(
-    document: &mut Document,
+    engine: &mut Engine,
     command: Command,
     stop: &Arc<document::Stop>,
 ) -> (Reply, bool) {
     match command {
         Command::Mount(mount) => {
-            document.mount(&mount);
+            engine.mount(&mount);
             (Reply::Unit(Ok(())), false)
         }
-        Command::Eval { source } => (Reply::Text(document.eval(&source)), false),
+        Command::Eval { source } => (Reply::Text(engine.eval(&source)), false),
         Command::ExecuteScript { source, timeout_ms } => {
             let timeout = timeout_ms.map(Duration::from_millis);
-            let value = document.execute_remote(&source, timeout);
+            let value = engine.execute_remote(&source, timeout);
             (Reply::Value(value), false)
         }
-        Command::SetDocumentUrl { url } => (Reply::Unit(document.set_document_url(&url)), false),
-        Command::IsIdle => (Reply::Bool(!document.has_background_work()), false),
+        Command::SetDocumentUrl { url } => (Reply::Unit(engine.set_document_url(&url)), false),
+        Command::IsIdle => (Reply::Bool(!engine.has_background_work()), false),
         Command::Shutdown => {
             stop.request();
             (Reply::Unit(Ok(())), true)
@@ -233,12 +235,12 @@ fn handle_command(
     }
 }
 
-fn publish(document: &Document, published: &mut usize, outbox: &Sender<FromRenderer>) {
-    let events = &document.events()[*published..];
+fn publish(engine: &Engine, published: &mut usize, outbox: &Sender<FromRenderer>) {
+    let events = &engine.events()[*published..];
     for event in events {
         let _ = outbox.send(FromRenderer::Event(*event));
     }
-    *published = document.events().len();
+    *published = engine.events().len();
 }
 
 // ── the sink ────────────────────────────────────────────────────────────────
