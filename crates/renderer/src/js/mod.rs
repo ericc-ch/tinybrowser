@@ -383,6 +383,7 @@ globalThis.fetch = function(url) {
 
 impl Drop for JsRealm {
     fn drop(&mut self) {
+        bindings::forget_world(&self.context);
         self.world.borrow_mut().clear_listeners();
     }
 }

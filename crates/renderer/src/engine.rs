@@ -6,21 +6,31 @@
 //! one frame. Child frames join the same engine sharing both.
 
 use std::cell::Ref;
+use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::document::{Document, Stop, Waiter};
 use crate::js::SharedJsRuntime;
-use crate::protocol::{BrowserServices, Mount, TabError, TabEvent};
+use crate::protocol::{BrowserServices, FrameId, Mount, TabError, TabEvent};
 use crate::{Parsed, RemoteValue, ScriptValue};
+
+/// How long one frame may occupy the waiter before the engine gives the next
+/// frame a turn.
+const FRAME_STEP: Duration = Duration::from_millis(1);
 
 /// One renderer process's page engine.
 ///
-/// The first frame is the tab's main frame; the shared heap and waiter are
-/// handed to every frame the engine creates, so same-site frames can pass
-/// JavaScript objects synchronously.
+/// The main frame is the tab's top-level document; child frames share the
+/// engine's heap and waiter, so same-site frames can pass JavaScript objects
+/// synchronously.
 pub struct Engine {
-    main: Document,
+    js_runtime: SharedJsRuntime,
+    waiter: Waiter,
+    services: Arc<dyn BrowserServices>,
+    stop: Arc<Stop>,
+    frames: BTreeMap<FrameId, Document>,
+    next_frame: u64,
 }
 
 impl Engine {
@@ -35,19 +45,65 @@ impl Engine {
     pub fn with_stop(services: Arc<dyn BrowserServices>, stop: Arc<Stop>) -> Self {
         let js_runtime = SharedJsRuntime::default();
         let waiter = Waiter::new();
+        let main = Document::with_shared(
+            Arc::clone(&services),
+            js_runtime.clone(),
+            waiter.clone(),
+            Arc::clone(&stop),
+        );
+        let mut frames = BTreeMap::new();
+        frames.insert(FrameId::MAIN, main);
         Self {
-            main: Document::with_shared(services, js_runtime, waiter, stop),
+            js_runtime,
+            waiter,
+            services,
+            stop,
+            frames,
+            next_frame: 1,
         }
+    }
+
+    /// Creates a child frame on this engine's heap and waiter.
+    pub fn create_frame(&mut self) -> FrameId {
+        let frame = FrameId::new(self.next_frame);
+        self.next_frame = self.next_frame.saturating_add(1);
+        let document = Document::with_shared(
+            Arc::clone(&self.services),
+            self.js_runtime.clone(),
+            self.waiter.clone(),
+            Arc::clone(&self.stop),
+        );
+        self.frames.insert(frame, document);
+        frame
+    }
+
+    /// The frame with this id, when the engine still hosts it.
+    #[must_use]
+    pub fn frame_mut(&mut self, frame: FrameId) -> Option<&mut Document> {
+        self.frames.get_mut(&frame)
+    }
+
+    /// The tab's main frame.
+    fn main(&self) -> &Document {
+        self.frames
+            .get(&FrameId::MAIN)
+            .expect("engine always hosts its main frame")
+    }
+
+    fn main_mut(&mut self) -> &mut Document {
+        self.frames
+            .get_mut(&FrameId::MAIN)
+            .expect("engine always hosts its main frame")
     }
 
     /// Replaces the main frame's document from a host mount.
     pub fn mount(&mut self, mount: &Mount) {
-        self.main.mount(mount);
+        self.main_mut().mount(mount);
     }
 
     /// Parses `html` into the main frame and starts a new realm.
     pub fn load_html(&mut self, html: &str) {
-        self.main.load_html(html);
+        self.main_mut().load_html(html);
     }
 
     /// Evaluates `source` in the main frame and returns its string coercion.
@@ -56,7 +112,7 @@ impl Engine {
     ///
     /// [`TabError::Script`] when the engine cannot start or the script throws.
     pub fn eval(&mut self, source: &str) -> Result<String, TabError> {
-        self.main.eval(source)
+        self.main_mut().eval(source)
     }
 
     /// Evaluates `source` in the main frame and returns a value-only result.
@@ -65,7 +121,7 @@ impl Engine {
     ///
     /// Same as [`Engine::eval`].
     pub fn execute_script(&mut self, source: &str) -> Result<ScriptValue, TabError> {
-        self.main.execute_script(source)
+        self.main_mut().execute_script(source)
     }
 
     /// Evaluates `source` and interns node handles for the protocol.
@@ -78,7 +134,7 @@ impl Engine {
         source: &str,
         timeout: Option<Duration>,
     ) -> Result<RemoteValue, TabError> {
-        self.main.execute_remote(source, timeout)
+        self.main_mut().execute_remote(source, timeout)
     }
 
     /// Sets the main frame's document URL.
@@ -87,57 +143,78 @@ impl Engine {
     ///
     /// [`TabError::InvalidUrl`] when `url` is not an absolute URL.
     pub fn set_document_url(&mut self, url: &str) -> Result<(), TabError> {
-        self.main.set_document_url(url)
+        self.main_mut().set_document_url(url)
     }
 
     /// Main frame document URL.
     #[must_use]
     pub fn document_url(&self) -> &str {
-        self.main.document_url()
+        self.main().document_url()
     }
 
     /// Main frame document `Content-Language`, if any.
     #[must_use]
     pub fn content_language(&self) -> Option<&str> {
-        self.main.content_language()
+        self.main().content_language()
     }
 
     /// Main frame last parse result, if any.
     #[must_use]
     pub fn parsed(&self) -> Option<Ref<'_, Parsed>> {
-        self.main.parsed()
+        self.main().parsed()
     }
 
-    /// Jobs that have already run, in order.
+    /// Jobs that have already run, in order, for every frame.
     #[must_use]
-    pub fn events(&self) -> &[TabEvent] {
-        self.main.events()
+    pub fn events(&self) -> Vec<TabEvent> {
+        self.frames
+            .values()
+            .flat_map(|document| document.events().iter().copied())
+            .collect()
     }
 
-    /// True when the engine has no jobs, timers, dials, or pending JS work.
+    /// True when any frame has jobs, timers, dials, or pending JS work.
     #[must_use]
     pub fn has_background_work(&self) -> bool {
-        self.main.has_background_work()
+        self.frames.values().any(Document::has_background_work)
     }
 
     /// Advances every frame for at most `budget`.
     pub fn drive_for(&mut self, budget: Duration) {
-        self.main.drive_for(budget);
+        let deadline = Instant::now() + budget;
+        loop {
+            for document in self.frames.values_mut() {
+                document.drive_for(FRAME_STEP);
+            }
+            if Instant::now() >= deadline || !self.has_background_work() {
+                return;
+            }
+        }
     }
 
     /// Parks the renderer thread until no frame has tasks, timers, queued
     /// dials, or fetches.
     pub fn run(&mut self) {
-        self.main.run();
+        while self.has_background_work() {
+            for document in self.frames.values_mut() {
+                document.drive_for(FRAME_STEP);
+            }
+        }
     }
 
-    /// Parks until the main frame has fired `load`.
+    /// Parks until every frame has fired `load`.
     pub fn run_until_load(&mut self) {
-        self.main.run_until_load();
+        while self.frames.values().any(Document::waiting_for_load) {
+            for document in self.frames.values_mut() {
+                document.drive_for(FRAME_STEP);
+            }
+        }
     }
 
     /// Stops every frame. Further work must go through [`Engine::new`].
     pub fn shutdown(&mut self) {
-        self.main.shutdown();
+        for document in self.frames.values_mut() {
+            document.shutdown();
+        }
     }
 }

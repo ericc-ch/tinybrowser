@@ -599,7 +599,7 @@ fn engine_drives_the_main_frame_through_the_host() {
         engine.execute_script("1 + 1").expect("number"),
         renderer::ScriptValue::Number(2.0)
     );
-    assert_eq!(engine.events(), &[TabEvent::Load]);
+    assert_eq!(engine.events(), vec![TabEvent::Load]);
     assert_eq!(engine.document_url(), "about:blank");
     let parsed = engine.parsed().expect("parsed document");
     assert!(
@@ -610,5 +610,35 @@ fn engine_drives_the_main_frame_through_the_host() {
             .is_some()
     );
     drop(parsed);
+    engine.shutdown();
+}
+
+#[test]
+fn engine_hosts_child_frames_on_the_main_heap() {
+    let services = Arc::new(TestServices::new());
+    let mut engine = Engine::new(services);
+    engine.load_html("<!doctype html><title>main</title>");
+    engine.run_until_load();
+
+    let child = engine.create_frame();
+    engine
+        .frame_mut(child)
+        .expect("child frame")
+        .load_html("<!doctype html><p id=c>child</p>");
+    engine.run_until_load();
+
+    assert_eq!(engine.eval("document.title").expect("main title"), "main");
+    assert_eq!(
+        engine
+            .frame_mut(child)
+            .expect("child frame")
+            .eval("document.getElementById('c').textContent")
+            .expect("child text"),
+        "child"
+    );
+    assert!(
+        engine.frame_mut(renderer::FrameId::new(99)).is_none(),
+        "unknown frames are not addressable"
+    );
     engine.shutdown();
 }

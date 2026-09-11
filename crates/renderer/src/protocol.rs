@@ -12,6 +12,32 @@ use url::Url;
 
 use crate::RemoteValue;
 
+/// Renderer-process identity of one frame.
+///
+/// [ADR 0014](../../../docs/adrs/0014-frames-and-per-frame-realms.md): the
+/// renderer mints ids for the frames it hosts; the browser process routes
+/// frame-addressed commands and events by it. The tab's main frame is
+/// [`FrameId::MAIN`] in every renderer.
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct FrameId(u64);
+
+impl FrameId {
+    /// The tab's main frame, present in every renderer.
+    pub const MAIN: Self = Self(0);
+
+    /// Constructs a frame id from a protocol integer.
+    #[must_use]
+    pub fn new(raw: u64) -> Self {
+        Self(raw)
+    }
+
+    /// Stable numeric identity for protocol messages.
+    #[must_use]
+    pub fn get(self) -> u64 {
+        self.0
+    }
+}
+
 /// Why a renderer API call was refused.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TabError {

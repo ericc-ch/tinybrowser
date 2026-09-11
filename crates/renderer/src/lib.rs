@@ -32,8 +32,8 @@ pub use document::{Document, ScriptValue, Stop};
 pub use engine::Engine;
 pub use process::serve_stdio;
 pub use protocol::{
-    BrowserServices, Command, DialKind, DialOutcome, DialRequest, FromRenderer, Mount, Reply,
-    ScriptFailure, ServiceCall, ServiceReply, TabError, TabEvent, ToRenderer,
+    BrowserServices, Command, DialKind, DialOutcome, DialRequest, FrameId, FromRenderer, Mount,
+    Reply, ScriptFailure, ServiceCall, ServiceReply, TabError, TabEvent, ToRenderer,
 };
 pub use remote::RemoteValue;
 
@@ -236,11 +236,11 @@ fn handle_command(
 }
 
 fn publish(engine: &Engine, published: &mut usize, outbox: &Sender<FromRenderer>) {
-    let events = &engine.events()[*published..];
-    for event in events {
+    let events = engine.events();
+    for event in &events[*published..] {
         let _ = outbox.send(FromRenderer::Event(*event));
     }
-    *published = engine.events().len();
+    *published = events.len();
 }
 
 // ── the sink ────────────────────────────────────────────────────────────────

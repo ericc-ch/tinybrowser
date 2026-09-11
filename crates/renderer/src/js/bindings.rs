@@ -1,7 +1,8 @@
 //! Platform objects for DOM nodes, one interface per class.
 
 use std::cell::RefCell;
-use std::rc::Rc;
+use std::collections::HashMap;
+use std::rc::{Rc, Weak};
 
 use dom::{
     DomError, LocalName, Namespace, NodeId, NodeKind, Prefix, QualName, html_namespace,
@@ -16,8 +17,37 @@ use rquickjs::{
 
 use super::world::{
     AttrState, EventTargetKey, Handle, Listener, Observation, ObserverOptions, ObserverState,
-    RecordData, SharedWorld, World,
+    RecordData, World,
 };
+
+thread_local! {
+    /// JS world per live realm, keyed by its QuickJS context pointer.
+    ///
+    /// Runtime userdata would be one slot per renderer process, and the second
+    /// frame would overwrite the first; each realm needs its own. One renderer
+    /// thread hosts every frame, and entries are removed when the realm drops,
+    /// so the map is thread-local and keyed by pointer identity.
+    static REALM_WORLDS: RefCell<HashMap<usize, Weak<RefCell<World>>>> =
+        RefCell::new(HashMap::new());
+}
+
+/// Remembers `world` as the JS world of the realm behind `ctx`.
+fn register_world(ctx: &Ctx<'_>, world: &Rc<RefCell<World>>) {
+    REALM_WORLDS.with(|worlds| {
+        worlds
+            .borrow_mut()
+            .insert(ctx.as_raw().as_ptr() as usize, Rc::downgrade(world));
+    });
+}
+
+/// Forgets the realm behind `context`; called when its realm is dropped.
+pub(super) fn forget_world(context: &rquickjs::Context) {
+    REALM_WORLDS.with(|worlds| {
+        worlds
+            .borrow_mut()
+            .remove(&(context.as_raw().as_ptr() as usize));
+    });
+}
 
 macro_rules! branded_node {
     ($name:ident, $js:literal) => {
@@ -4390,8 +4420,7 @@ fn webidl_unsigned_long(number: f64) -> u32 {
 }
 
 pub(super) fn install(ctx: &Ctx<'_>, world: &Rc<RefCell<World>>) -> Result<()> {
-    ctx.store_userdata(SharedWorld(world.clone()))
-        .map_err(|err| Exception::throw_internal(ctx, &err.to_string()))?;
+    register_world(ctx, world);
     let globals = ctx.globals();
     Class::<JsEvent>::define(&globals)?;
     Class::<JsNode>::define(&globals)?;
@@ -5083,8 +5112,13 @@ fn install_dom_exception_codes(ctx: &Ctx<'_>) -> Result<()> {
 }
 
 fn world(ctx: &Ctx<'_>) -> Result<Rc<RefCell<World>>> {
-    ctx.userdata::<SharedWorld>()
-        .map(|guard| guard.0.clone())
+    REALM_WORLDS
+        .with(|worlds| {
+            worlds
+                .borrow()
+                .get(&(ctx.as_raw().as_ptr() as usize))
+                .and_then(Weak::upgrade)
+        })
         .ok_or_else(|| Exception::throw_internal(ctx, "missing JS world"))
 }
 
@@ -5841,4 +5875,93 @@ fn find_element_by_id(dom: &dom::Dom, scope: NodeId, id: &str) -> Option<NodeId>
         }
     }
     None
+}
+
+#[cfg(test)]
+mod realm_tests {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    use std::sync::Arc;
+
+    use rquickjs::{Persistent, Value};
+    use url::Url;
+
+    use super::world;
+    use crate::document::Stop;
+    use crate::js::{JsRealm, SharedJsRuntime, World};
+    use crate::protocol::{BrowserServices, DialOutcome, DialRequest};
+
+    struct NullServices;
+
+    impl BrowserServices for NullServices {
+        fn dial(&self, _request: &DialRequest) -> Option<DialOutcome> {
+            None
+        }
+
+        fn cookies_for(&self, _url: &Url) -> String {
+            String::new()
+        }
+
+        fn set_cookie(&self, _value: &str, _url: &Url) {}
+
+        fn mark_dirty(&self) {}
+    }
+
+    fn world_with_document(
+        services: &Arc<dyn BrowserServices>,
+        url: &str,
+        html: &str,
+    ) -> Rc<RefCell<World>> {
+        let mut world = World::new(Arc::clone(services), Url::parse(url).expect("test url"));
+        world.parsed = Some(crate::parse_html(html));
+        Rc::new(RefCell::new(world))
+    }
+
+    #[test]
+    fn realms_share_a_heap_and_resolve_their_own_world() {
+        let services: Arc<dyn BrowserServices> = Arc::new(NullServices);
+        let shared = SharedJsRuntime::default();
+        let stop = Arc::new(Stop::new());
+        let world_a =
+            world_with_document(&services, "https://a.test/", "<!doctype html><p id=a></p>");
+        let world_b =
+            world_with_document(&services, "https://b.test/", "<!doctype html><p id=b></p>");
+        let realm_a = JsRealm::new(&shared, world_a.clone(), Arc::clone(&stop)).expect("realm a");
+        let realm_b = JsRealm::new(&shared, world_b.clone(), Arc::clone(&stop)).expect("realm b");
+
+        // Each realm resolves its own world; one runtime-wide slot would
+        // clobber the first world when the second realm installs.
+        for (realm, expected) in [(&realm_a, &world_a), (&realm_b, &world_b)] {
+            realm.context.with(|ctx| {
+                let resolved = world(&ctx).expect("world");
+                assert!(
+                    Rc::ptr_eq(&resolved, expected),
+                    "realm resolved a foreign world"
+                );
+            });
+        }
+
+        // A function created in realm A is callable in realm B: one heap.
+        let add_one = realm_a.context.with(|ctx| {
+            let value: Value = super::super::eval_classic(&ctx, "(x) => x + 1").expect("function");
+            Persistent::save(&ctx, value)
+        });
+        realm_b.context.with(|ctx| {
+            let value = add_one.restore(&ctx).expect("restore");
+            let function = value.into_function().expect("function value");
+            let result: i32 = function.call((41,)).expect("call");
+            assert_eq!(result, 42);
+        });
+
+        // Separate documents stay separate trees.
+        realm_a.context.with(|ctx| {
+            let mine: bool =
+                super::super::eval_classic(&ctx, "document.getElementById('a') !== null")
+                    .expect("own tree");
+            let theirs: bool =
+                super::super::eval_classic(&ctx, "document.getElementById('b') === null")
+                    .expect("foreign tree");
+            assert!(mine && theirs);
+        });
+    }
 }

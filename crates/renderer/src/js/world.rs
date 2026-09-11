@@ -1,8 +1,6 @@
 //! Shared JS world for the renderer.
 
-use std::cell::RefCell;
 use std::collections::HashMap;
-use std::rc::Rc;
 use std::sync::Arc;
 
 use dom::NodeId;
@@ -432,9 +430,6 @@ fn inclusive_descendant(dom: &dom::Dom, ancestor: NodeId, node: NodeId) -> bool 
     }
     false
 }
-
-#[derive(Clone, rquickjs::JsLifetime)]
-pub(crate) struct SharedWorld(pub Rc<RefCell<World>>);
 
 /// Identity of one `Attr` platform object.
 pub(crate) struct AttrState {
