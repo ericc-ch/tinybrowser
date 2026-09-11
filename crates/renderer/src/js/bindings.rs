@@ -16,8 +16,8 @@ use rquickjs::{
 };
 
 use super::world::{
-    AttrState, EventTargetKey, Handle, Listener, Observation, ObserverOptions, ObserverState,
-    RecordData, World,
+    AttrState, DocumentStreamCommand, EventTargetKey, FrameNavigation, Handle, Listener,
+    Observation, ObserverOptions, ObserverState, RecordData, World,
 };
 
 thread_local! {
@@ -641,6 +641,7 @@ fn write_class(ctx: &Ctx<'_>, id: NodeId, value: &str) -> Result<()> {
 #[rquickjs::class(rename = "Attr")]
 pub struct JsAttr {
     id: u64,
+    scope: Handle,
 }
 
 #[rquickjs::methods]
@@ -658,19 +659,19 @@ impl JsAttr {
     // https://dom.spec.whatwg.org/#dom-attr-name
     #[qjs(get)]
     fn name(&self, ctx: Ctx<'_>) -> Result<String> {
-        Ok(attr_state(&ctx, self.id)?.qualified)
+        Ok(attr_state(&ctx, self.scope.0, self.id)?.qualified)
     }
 
     // https://dom.spec.whatwg.org/#dom-attr-localname
     #[qjs(get, rename = "localName")]
     fn local_name(&self, ctx: Ctx<'_>) -> Result<String> {
-        Ok(attr_state(&ctx, self.id)?.local)
+        Ok(attr_state(&ctx, self.scope.0, self.id)?.local)
     }
 
     // https://dom.spec.whatwg.org/#dom-attr-prefix
     #[qjs(get)]
     fn prefix<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
-        match attr_state(&ctx, self.id)?.prefix {
+        match attr_state(&ctx, self.scope.0, self.id)?.prefix {
             Some(prefix) => string_value(&ctx, &prefix),
             None => Ok(Value::new_null(ctx)),
         }
@@ -679,7 +680,7 @@ impl JsAttr {
     // https://dom.spec.whatwg.org/#dom-attr-namespaceuri
     #[qjs(get, rename = "namespaceURI")]
     fn namespace_uri<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
-        let namespace = attr_state(&ctx, self.id)?.namespace;
+        let namespace = attr_state(&ctx, self.scope.0, self.id)?.namespace;
         if namespace.is_empty() {
             Ok(Value::new_null(ctx))
         } else {
@@ -690,40 +691,40 @@ impl JsAttr {
     // https://dom.spec.whatwg.org/#dom-attr-value
     #[qjs(get)]
     fn value(&self, ctx: Ctx<'_>) -> Result<String> {
-        attr_value(&ctx, self.id)
+        attr_value(&ctx, self.scope.0, self.id)
     }
 
     #[qjs(set, rename = "value")]
     fn set_value(&self, ctx: Ctx<'_>, value: WebIdlString) -> Result<()> {
-        set_attr_value(&ctx, self.id, value.0)
+        set_attr_value(&ctx, self.scope.0, self.id, value.0)
     }
 
     // https://dom.spec.whatwg.org/#dom-node-nodevalue
     #[qjs(get, rename = "nodeValue")]
     fn node_value(&self, ctx: Ctx<'_>) -> Result<String> {
-        attr_value(&ctx, self.id)
+        attr_value(&ctx, self.scope.0, self.id)
     }
 
     #[qjs(set, rename = "nodeValue")]
     fn set_node_value(&self, ctx: Ctx<'_>, value: WebIdlString) -> Result<()> {
-        set_attr_value(&ctx, self.id, value.0)
+        set_attr_value(&ctx, self.scope.0, self.id, value.0)
     }
 
     // https://dom.spec.whatwg.org/#dom-node-textcontent
     #[qjs(get, rename = "textContent")]
     fn text_content(&self, ctx: Ctx<'_>) -> Result<String> {
-        attr_value(&ctx, self.id)
+        attr_value(&ctx, self.scope.0, self.id)
     }
 
     #[qjs(set, rename = "textContent")]
     fn set_text_content(&self, ctx: Ctx<'_>, value: WebIdlString) -> Result<()> {
-        set_attr_value(&ctx, self.id, value.0)
+        set_attr_value(&ctx, self.scope.0, self.id, value.0)
     }
 
     // https://dom.spec.whatwg.org/#dom-attr-ownerelement
     #[qjs(get, rename = "ownerElement")]
     fn owner_element<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
-        child_value(&ctx, attr_owner(&ctx, self.id))
+        child_value(&ctx, attr_owner(&ctx, self.scope.0, self.id))
     }
 
     // https://dom.spec.whatwg.org/#dom-attr-specified
@@ -739,23 +740,23 @@ impl JsAttr {
 
     #[qjs(get, rename = "nodeName")]
     fn node_name(&self, ctx: Ctx<'_>) -> Result<String> {
-        Ok(attr_state(&ctx, self.id)?.qualified)
+        Ok(attr_state(&ctx, self.scope.0, self.id)?.qualified)
     }
 
     #[qjs(get, rename = "ownerDocument")]
     fn owner_document<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
         // An attached Attr belongs to its owner element's document; a
         // detached one reports the main document.
-        let document = attr_owner(&ctx, self.id).map_or_else(
+        let document = attr_owner(&ctx, self.scope.0, self.id).map_or_else(
             || {
-                world(&ctx).ok().and_then(|world| {
+                world_for_node(&ctx, self.scope.0).ok().and_then(|world| {
                     world
                         .borrow()
-                        .with_main_document(|parsed| parsed.dom.document())
+                        .with_document(self.scope.0, |parsed| parsed.dom.document())
                 })
             },
             |owner| {
-                world(&ctx).ok().and_then(|world| {
+                world_for_node(&ctx, owner).ok().and_then(|world| {
                     world
                         .borrow()
                         .with_document(owner, |parsed| parsed.dom.document())
@@ -807,7 +808,7 @@ impl JsNamedNodeMap {
             return Ok(Value::new_null(ctx));
         };
         match attached_attr_id(&ctx, self.element.0, &attribute.0, &attribute.1)? {
-            Some(id) => attr_wrapper(&ctx, id),
+            Some(id) => attr_wrapper(&ctx, self.element.0, id),
             None => Ok(Value::new_null(ctx)),
         }
     }
@@ -828,7 +829,7 @@ impl JsNamedNodeMap {
     ) -> Result<Value<'js>> {
         let namespace = namespace.0.unwrap_or_default();
         match attached_attr_id(&ctx, self.element.0, &namespace, &local.0)? {
-            Some(id) => attr_wrapper(&ctx, id),
+            Some(id) => attr_wrapper(&ctx, self.element.0, id),
             None => Ok(Value::new_null(ctx)),
         }
     }
@@ -874,7 +875,7 @@ impl JsNamedNodeMap {
             return Err(throw_dom(&ctx, "NotFoundError", "no such attribute"));
         };
         let value = match attached_attr_id(&ctx, self.element.0, &namespace, &local)? {
-            Some(id) => attr_wrapper(&ctx, id)?,
+            Some(id) => attr_wrapper(&ctx, self.element.0, id)?,
             None => Value::new_null(ctx.clone()),
         };
         remove_attribute_sync(&ctx, self.element.0, &namespace, &local, true)?;
@@ -891,7 +892,7 @@ impl JsNamedNodeMap {
     ) -> Result<Value<'js>> {
         let namespace = namespace.0.unwrap_or_default();
         let value = match attached_attr_id(&ctx, self.element.0, &namespace, &local.0)? {
-            Some(id) => attr_wrapper(&ctx, id)?,
+            Some(id) => attr_wrapper(&ctx, self.element.0, id)?,
             None => return Err(throw_dom(&ctx, "NotFoundError", "no such attribute")),
         };
         remove_attribute_sync(&ctx, self.element.0, &namespace, &local.0, true)?;
@@ -901,7 +902,7 @@ impl JsNamedNodeMap {
 
 /// `(namespace, local)` of the attribute at `index`, if any.
 fn attribute_at(ctx: &Ctx<'_>, element: NodeId, index: i64) -> Result<Option<(String, String)>> {
-    let world_rc = world(ctx)?;
+    let world_rc = world_for_node(ctx, element)?;
     let world = world_rc.borrow();
     let Some(parsed) = world.document(element) else {
         return Ok(None);
@@ -927,7 +928,7 @@ fn named_item<'js>(ctx: &Ctx<'js>, element: NodeId, name: &str) -> Result<Value<
     } else {
         name.to_owned()
     };
-    let world_rc = world(ctx)?;
+    let world_rc = world_for_node(ctx, element)?;
     let found = {
         let world = world_rc.borrow();
         let Some(parsed) = world.document(element) else {
@@ -946,7 +947,7 @@ fn named_item<'js>(ctx: &Ctx<'js>, element: NodeId, name: &str) -> Result<Value<
     };
     match found {
         Some((namespace, local)) => match attached_attr_id(ctx, element, &namespace, &local)? {
-            Some(id) => attr_wrapper(ctx, id),
+            Some(id) => attr_wrapper(ctx, element, id),
             None => Ok(Value::new_null(ctx.clone())),
         },
         None => Ok(Value::new_null(ctx.clone())),
@@ -955,8 +956,8 @@ fn named_item<'js>(ctx: &Ctx<'js>, element: NodeId, name: &str) -> Result<Value<
 
 // ── Attr registry helpers ────────────────────────────────────────────────
 
-fn attr_state(ctx: &Ctx<'_>, id: u64) -> Result<AttrState> {
-    let world_rc = world(ctx)?;
+fn attr_state(ctx: &Ctx<'_>, scope: NodeId, id: u64) -> Result<AttrState> {
+    let world_rc = world_for_node(ctx, scope)?;
     let world = world_rc.borrow();
     world
         .attrs
@@ -971,8 +972,8 @@ fn attr_state(ctx: &Ctx<'_>, id: u64) -> Result<AttrState> {
 }
 
 /// The attached element for `id`, or `None` when detached.
-fn attr_owner(ctx: &Ctx<'_>, id: u64) -> Option<NodeId> {
-    let world_rc = world(ctx).ok()?;
+fn attr_owner(ctx: &Ctx<'_>, scope: NodeId, id: u64) -> Option<NodeId> {
+    let world_rc = world_for_node(ctx, scope).ok()?;
     let world = world_rc.borrow();
     let owner = world.attr_owners.get(&id).copied().flatten()?;
     let state = world.attrs.get(&id)?;
@@ -983,9 +984,9 @@ fn attr_owner(ctx: &Ctx<'_>, id: u64) -> Option<NodeId> {
         .map(|_| owner)
 }
 
-fn attr_value(ctx: &Ctx<'_>, id: u64) -> Result<String> {
-    if let Some(owner) = attr_owner(ctx, id) {
-        let world_rc = world(ctx)?;
+fn attr_value(ctx: &Ctx<'_>, scope: NodeId, id: u64) -> Result<String> {
+    if let Some(owner) = attr_owner(ctx, scope, id) {
+        let world_rc = world_for_node(ctx, scope)?;
         let world = world_rc.borrow();
         if let Some(state) = world.attrs.get(&id)
             && let Some(parsed) = world.document(owner)
@@ -996,7 +997,7 @@ fn attr_value(ctx: &Ctx<'_>, id: u64) -> Result<String> {
             return Ok(value);
         }
     }
-    let world_rc = world(ctx)?;
+    let world_rc = world_for_node(ctx, scope)?;
     Ok(world_rc
         .borrow()
         .attr_values
@@ -1005,8 +1006,8 @@ fn attr_value(ctx: &Ctx<'_>, id: u64) -> Result<String> {
         .unwrap_or_default())
 }
 
-fn set_attr_value(ctx: &Ctx<'_>, id: u64, value: String) -> Result<()> {
-    let world_rc = world(ctx)?;
+fn set_attr_value(ctx: &Ctx<'_>, scope: NodeId, id: u64, value: String) -> Result<()> {
+    let world_rc = world_for_node(ctx, scope)?;
     let mut world = world_rc.borrow_mut();
     world.attr_values.insert(id, value.clone());
     let Some(owner) = world.attr_owners.get(&id).copied().flatten() else {
@@ -1040,7 +1041,7 @@ fn set_attr_value(ctx: &Ctx<'_>, id: u64, value: String) -> Result<()> {
 fn refresh_named_node_map<'js>(ctx: &Ctx<'js>, element: NodeId, map: &Value<'js>) -> Result<()> {
     let html = element_is_html(ctx, element);
     let names: Vec<String> = {
-        let world_rc = world(ctx)?;
+        let world_rc = world_for_node(ctx, element)?;
         let world = world_rc.borrow();
         world
             .document(element)
@@ -1054,7 +1055,7 @@ fn refresh_named_node_map<'js>(ctx: &Ctx<'js>, element: NodeId, map: &Value<'js>
 
 /// Refreshes the cached `NamedNodeMap` after a mutation, when one exists.
 fn touch_named_node_map(ctx: &Ctx<'_>, element: NodeId) -> Result<()> {
-    let world_rc = world(ctx)?;
+    let world_rc = world_for_node(ctx, element)?;
     let Some(saved) = world_rc.borrow().named_node_map(element) else {
         return Ok(());
     };
@@ -1073,7 +1074,7 @@ fn attached_attr_id(
     namespace: &str,
     local: &str,
 ) -> Result<Option<u64>> {
-    let world_rc = world(ctx)?;
+    let world_rc = world_for_node(ctx, element)?;
     let mut world = world_rc.borrow_mut();
     let info = {
         let Some(parsed) = world.document(element) else {
@@ -1129,14 +1130,20 @@ fn attached_attr_id(
 }
 
 /// Restores or creates the wrapper for an `Attr` id.
-fn attr_wrapper<'js>(ctx: &Ctx<'js>, id: u64) -> Result<Value<'js>> {
-    let world_rc = world(ctx)?;
+fn attr_wrapper<'js>(ctx: &Ctx<'js>, scope: NodeId, id: u64) -> Result<Value<'js>> {
+    let world_rc = world_for_node(ctx, scope)?;
     if let Some(saved) = world_rc.borrow().attr_wrappers.get(&id).cloned()
         && let Some(value) = deref_weak(ctx, saved)?
     {
         return Ok(value);
     }
-    let class = Class::instance(ctx.clone(), JsAttr { id })?;
+    let class = Class::instance(
+        ctx.clone(),
+        JsAttr {
+            id,
+            scope: Handle(scope),
+        },
+    )?;
     let value = Class::into_value(class);
     let weak = make_weak(ctx, value.clone())?;
     world_rc
@@ -1149,12 +1156,13 @@ fn attr_wrapper<'js>(ctx: &Ctx<'js>, id: u64) -> Result<Value<'js>> {
 /// Creates a detached `Attr` identity; attaches via `setAttributeNode`.
 fn new_detached_attr(
     ctx: &Ctx<'_>,
+    scope: NodeId,
     namespace: String,
     prefix: Option<String>,
     local: String,
     qualified: String,
 ) -> Result<u64> {
-    let world_rc = world(ctx)?;
+    let world_rc = world_for_node(ctx, scope)?;
     let mut world = world_rc.borrow_mut();
     let id = world.next_attr_id;
     world.next_attr_id += 1;
@@ -1174,7 +1182,7 @@ fn new_detached_attr(
 
 /// Marks the `Attr` at `(element, namespace, local)` detached.
 fn detach_attr(ctx: &Ctx<'_>, element: NodeId, namespace: &str, local: &str) -> Result<()> {
-    let world_rc = world(ctx)?;
+    let world_rc = world_for_node(ctx, element)?;
     let mut world = world_rc.borrow_mut();
     if let Some(id) = world
         .attr_ids
@@ -1195,7 +1203,7 @@ fn touch_attr(
     local: &str,
     value: &str,
 ) -> Result<()> {
-    let world_rc = world(ctx)?;
+    let world_rc = world_for_node(ctx, element)?;
     let mut world = world_rc.borrow_mut();
     if let Some(&id) = world
         .attr_ids
@@ -1218,7 +1226,7 @@ fn remove_attribute_sync(
     local: &str,
     by_namespace: bool,
 ) -> Result<()> {
-    let world_rc = world(ctx)?;
+    let world_rc = world_for_node(ctx, element)?;
     {
         let world = world_rc.borrow();
         let Some(mut parsed) = world.document_mut(element) else {
@@ -1258,9 +1266,12 @@ fn set_attribute_node<'js>(
 ) -> Result<Value<'js>> {
     let class = Class::<JsAttr>::from_js(ctx, attr.clone())
         .map_err(|_| Exception::throw_type(ctx, "argument is not an Attr"))?;
-    let id = class.borrow().id;
-    let state = attr_state(ctx, id)?;
-    let owner = attr_owner(ctx, id);
+    let (id, scope) = {
+        let attr = class.borrow();
+        (attr.id, attr.scope.0)
+    };
+    let state = attr_state(ctx, scope, id)?;
+    let owner = attr_owner(ctx, scope, id);
     if let Some(owner) = owner
         && owner != element
     {
@@ -1270,10 +1281,10 @@ fn set_attribute_node<'js>(
             "attribute is already associated with another element",
         ));
     }
-    let value = attr_value(ctx, id)?;
+    let value = attr_value(ctx, scope, id)?;
     // The previous Attr with this identity becomes detached and is returned.
     let previous = {
-        let world_rc = world(ctx)?;
+        let world_rc = world_for_node(ctx, element)?;
         let key = (element, state.namespace.clone(), state.local.clone());
         world_rc
             .borrow()
@@ -1285,8 +1296,8 @@ fn set_attribute_node<'js>(
     // Setting an attribute that is already attached here is a no-op that
     // returns the attribute itself
     // (<https://dom.spec.whatwg.org/#concept-element-attributes-set> step 4).
-    if previous.is_none() && attr_owner(ctx, id) == Some(element) && {
-        let world_rc = world(ctx)?;
+    if previous.is_none() && attr_owner(ctx, scope, id) == Some(element) && {
+        let world_rc = world_for_node(ctx, element)?;
         let world = world_rc.borrow();
         world
             .attr_ids
@@ -1296,7 +1307,7 @@ fn set_attribute_node<'js>(
         return Ok(attr.clone());
     }
     {
-        let world_rc = world(ctx)?;
+        let world_rc = world_for_node(ctx, element)?;
         let mut world = world_rc.borrow_mut();
         if let Some(previous) = previous {
             world.attr_owners.insert(previous, None);
@@ -1325,7 +1336,7 @@ fn set_attribute_node<'js>(
     touch_named_node_map(ctx, element)?;
     schedule_mutation_delivery(ctx)?;
     match previous {
-        Some(previous) => attr_wrapper(ctx, previous),
+        Some(previous) => attr_wrapper(ctx, element, previous),
         None => Ok(Value::new_null(ctx.clone())),
     }
 }
@@ -2034,6 +2045,7 @@ enum ImportSnapshot {
         name: QualName,
         attributes: Vec<dom::Attribute>,
         children: Vec<ImportSnapshot>,
+        template_contents: Option<Vec<ImportSnapshot>>,
     },
     Text(String),
     CData(String),
@@ -2068,6 +2080,19 @@ fn import_snapshot(dom: &dom::Dom, id: NodeId, deep: bool) -> Option<ImportSnaps
             name: name.clone(),
             attributes: attributes.clone(),
             children: children(deep),
+            template_contents: dom.template_contents(id).map(|contents| {
+                if deep {
+                    dom.children(contents)
+                        .map(|kids| {
+                            kids.copied()
+                                .filter_map(|kid| import_snapshot(dom, kid, true))
+                                .collect()
+                        })
+                        .unwrap_or_default()
+                } else {
+                    Vec::new()
+                }
+            }),
         }),
         NodeKind::Text { data } => Some(ImportSnapshot::Text(data.clone())),
         NodeKind::CDataSection { data } => Some(ImportSnapshot::CData(data.clone())),
@@ -2101,11 +2126,20 @@ fn materialize_import(
             name,
             attributes,
             children,
+            template_contents,
         } => {
             let id = dom.create_element(name.clone(), attributes.clone());
             for child in children {
                 let child = materialize_import(dom, child)?;
                 dom.append(id, child)?;
+            }
+            if let Some(contents) = template_contents {
+                let fragment = dom.create_fragment();
+                for child in contents {
+                    let child = materialize_import(dom, child)?;
+                    dom.append(fragment, child)?;
+                }
+                dom.set_template_contents(id, fragment)?;
             }
             Ok(id)
         }
@@ -2127,6 +2161,188 @@ fn materialize_import(
                 dom.append(id, child)?;
             }
             Ok(id)
+        }
+    }
+}
+
+// https://html.spec.whatwg.org/multipage/parsing.html#serialising-html-fragments
+fn serialize_html_fragment(dom: &dom::Dom, element: NodeId) -> String {
+    let root = dom.template_contents(element).unwrap_or(element);
+    let parent = match dom.get(element).map(|node| node.kind()) {
+        Some(NodeKind::Element { name, .. }) => Some((name.ns.clone(), name.local.clone())),
+        _ => None,
+    };
+    let mut output = String::new();
+    let children: Vec<NodeId> = dom
+        .children(root)
+        .map(|children| children.copied().collect())
+        .unwrap_or_default();
+    for child in children {
+        serialize_html_node(
+            dom,
+            child,
+            parent.as_ref().map(|(namespace, local)| (namespace, local)),
+            &mut output,
+        );
+    }
+    output
+}
+
+fn serialize_html_node(
+    dom: &dom::Dom,
+    id: NodeId,
+    parent: Option<(&Namespace, &LocalName)>,
+    output: &mut String,
+) {
+    let Some(kind) = dom.get(id).map(|node| node.kind().clone()) else {
+        return;
+    };
+    match kind {
+        NodeKind::Document | NodeKind::Fragment => {
+            let children: Vec<NodeId> = dom
+                .children(id)
+                .map(|children| children.copied().collect())
+                .unwrap_or_default();
+            for child in children {
+                serialize_html_node(dom, child, parent, output);
+            }
+        }
+        NodeKind::Doctype { name, .. } => {
+            output.push_str("<!DOCTYPE ");
+            output.push_str(&name);
+            output.push('>');
+        }
+        NodeKind::Text { data } => {
+            let raw_text = parent.is_some_and(|(namespace, local)| {
+                namespace == &html_namespace()
+                    && matches!(
+                        local.as_ref(),
+                        "style"
+                            | "script"
+                            | "xmp"
+                            | "iframe"
+                            | "noembed"
+                            | "noscript"
+                            | "noframes"
+                            | "plaintext"
+                    )
+            });
+            if raw_text {
+                output.push_str(&data);
+            } else {
+                push_escaped_text(output, &data);
+            }
+        }
+        NodeKind::CDataSection { data } => {
+            output.push_str("<![CDATA[");
+            output.push_str(&data);
+            output.push_str("]]>");
+        }
+        NodeKind::ProcessingInstruction { target, data } => {
+            output.push_str("<?");
+            output.push_str(&target);
+            output.push(' ');
+            output.push_str(&data);
+            output.push('>');
+        }
+        NodeKind::Comment { data } => {
+            output.push_str("<!--");
+            output.push_str(&data);
+            output.push_str("-->");
+        }
+        NodeKind::Element { name, attributes } => {
+            serialize_html_element(dom, id, &name, &attributes, output);
+        }
+    }
+}
+
+fn serialize_html_element(
+    dom: &dom::Dom,
+    id: NodeId,
+    name: &QualName,
+    attributes: &[dom::Attribute],
+    output: &mut String,
+) {
+    output.push('<');
+    push_qualified_name(output, name.prefix.as_ref(), &name.local);
+    for attribute in attributes {
+        output.push(' ');
+        push_qualified_name(
+            output,
+            attribute.name.prefix.as_ref(),
+            &attribute.name.local,
+        );
+        output.push_str("=\"");
+        push_escaped_attribute(output, &attribute.value);
+        output.push('"');
+    }
+    output.push('>');
+
+    let is_html_void = name.ns == html_namespace()
+        && matches!(
+            name.local.as_ref(),
+            "area"
+                | "base"
+                | "basefont"
+                | "bgsound"
+                | "link"
+                | "meta"
+                | "br"
+                | "col"
+                | "embed"
+                | "hr"
+                | "img"
+                | "input"
+                | "keygen"
+                | "param"
+                | "source"
+                | "track"
+                | "wbr"
+        );
+    if is_html_void {
+        return;
+    }
+
+    let child_root = dom.template_contents(id).unwrap_or(id);
+    let children: Vec<NodeId> = dom
+        .children(child_root)
+        .map(|children| children.copied().collect())
+        .unwrap_or_default();
+    for child in children {
+        serialize_html_node(dom, child, Some((&name.ns, &name.local)), output);
+    }
+    output.push_str("</");
+    push_qualified_name(output, name.prefix.as_ref(), &name.local);
+    output.push('>');
+}
+
+fn push_qualified_name(output: &mut String, prefix: Option<&Prefix>, local: &LocalName) {
+    if let Some(prefix) = prefix {
+        output.push_str(prefix.as_ref());
+        output.push(':');
+    }
+    output.push_str(local.as_ref());
+}
+
+fn push_escaped_text(output: &mut String, text: &str) {
+    for character in text.chars() {
+        match character {
+            '&' => output.push_str("&amp;"),
+            '\u{00a0}' => output.push_str("&nbsp;"),
+            '<' => output.push_str("&lt;"),
+            '>' => output.push_str("&gt;"),
+            _ => output.push(character),
+        }
+    }
+}
+
+fn push_escaped_attribute(output: &mut String, value: &str) {
+    for character in value.chars() {
+        match character {
+            '&' => output.push_str("&amp;"),
+            '\u{00a0}' => output.push_str("&nbsp;"),
+            '"' => output.push_str("&quot;"),
+            _ => output.push(character),
         }
     }
 }
@@ -2419,8 +2635,15 @@ impl JsNode {
                 "attribute name is not a valid attribute local name",
             ));
         }
-        let id = new_detached_attr(&ctx, String::new(), None, name.0.clone(), name.0)?;
-        attr_wrapper(&ctx, id)
+        let id = new_detached_attr(
+            &ctx,
+            self.handle.0,
+            String::new(),
+            None,
+            name.0.clone(),
+            name.0,
+        )?;
+        attr_wrapper(&ctx, self.handle.0, id)
     }
 
     // https://dom.spec.whatwg.org/#dom-document-createattributens
@@ -2444,12 +2667,13 @@ impl JsNode {
             .map(ToString::to_string);
         let id = new_detached_attr(
             &ctx,
+            self.handle.0,
             name.ns.to_string(),
             prefix,
             name.local.to_string(),
             qualified_name(&name),
         )?;
-        attr_wrapper(&ctx, id)
+        attr_wrapper(&ctx, self.handle.0, id)
     }
 
     // https://dom.spec.whatwg.org/#dom-document-createdocumentfragment
@@ -2467,7 +2691,7 @@ impl JsNode {
         deep: Opt<bool>,
     ) -> Result<Value<'js>> {
         let source_id = required_node(&ctx, &node)?;
-        let world_rc = world(&ctx)?;
+        let world_rc = world_for_node(&ctx, self.handle.0)?;
         let tree = {
             let world = world_rc.borrow();
             let Some(source) = world.document(source_id) else {
@@ -2496,15 +2720,44 @@ impl JsNode {
         wrap_node(&ctx, id)
     }
 
+    // https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-document-open
+    #[qjs(rename = "open")]
+    fn open_document<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
+        world_for_node(&ctx, self.handle.0)?
+            .borrow_mut()
+            .queue_document_stream(DocumentStreamCommand::Open)
+            .map_err(|()| Exception::throw_range(&ctx, "document stream budget exceeded"))?;
+        wrap_node(&ctx, self.handle.0)
+    }
+
     // https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#document-write-steps
     #[qjs(rename = "write")]
     fn write(&self, ctx: Ctx<'_>, html: WebIdlString) -> Result<()> {
-        let world = world(&ctx)?;
+        let world = world_for_node(&ctx, self.handle.0)?;
         let mut world = world.borrow_mut();
         if world.parser_active {
+            if !world.reserve_stream_bytes(html.0.len()) {
+                return Err(Exception::throw_range(
+                    &ctx,
+                    "document stream budget exceeded",
+                ));
+            }
             world.pending_html_writes.push(html.0);
+        } else {
+            world
+                .queue_document_stream(DocumentStreamCommand::Write(html.0))
+                .map_err(|()| Exception::throw_range(&ctx, "document stream budget exceeded"))?;
         }
         Ok(())
+    }
+
+    // https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-document-close
+    #[qjs(rename = "close")]
+    fn close_document(&self, ctx: Ctx<'_>) -> Result<()> {
+        world_for_node(&ctx, self.handle.0)?
+            .borrow_mut()
+            .queue_document_stream(DocumentStreamCommand::Close)
+            .map_err(|()| Exception::throw_range(&ctx, "document stream budget exceeded"))
     }
 
     #[qjs(rename = "getElementById")]
@@ -2568,6 +2821,17 @@ impl JsNode {
         match found {
             Some(id) => wrap_node(&ctx, id),
             None => Ok(Value::new_null(ctx)),
+        }
+    }
+
+    // https://html.spec.whatwg.org/multipage/dom.html#dom-document-currentscript
+    #[qjs(get, rename = "currentScript")]
+    fn current_script<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
+        let world = world(&ctx)?;
+        let current = world.borrow().current_script;
+        match current {
+            Some(id) if id.document_id() == self.handle.0.document_id() => wrap_node(&ctx, id),
+            _ => Ok(Value::new_null(ctx)),
         }
     }
 
@@ -2774,7 +3038,68 @@ impl JsNode {
 
     #[qjs(set, rename = "src")]
     fn set_src(&self, ctx: Ctx<'_>, value: WebIdlString) -> Result<()> {
-        self.set_attribute(ctx, WebIdlString("src".into()), value)
+        let source = value.0.clone();
+        self.set_attribute(
+            ctx.clone(),
+            WebIdlString("src".into()),
+            WebIdlString(value.0),
+        )?;
+
+        let is_iframe = with_node_kind(&ctx, self.handle.0, |kind| {
+            matches!(
+                kind,
+                Some(NodeKind::Element { name, .. })
+                    if name.ns == html_namespace() && name.local.as_ref() == "iframe"
+            )
+        })?;
+        if !is_iframe {
+            return Ok(());
+        }
+
+        let world_rc = world(&ctx)?;
+        let contents = world_rc.borrow().object_url_contents(&source);
+        let Some(contents) = contents else {
+            return Ok(());
+        };
+        world_rc
+            .borrow_mut()
+            .queue_frame_navigation(FrameNavigation::ObjectUrl {
+                container: self.handle.0,
+                contents,
+            });
+        Ok(())
+    }
+
+    // https://html.spec.whatwg.org/multipage/iframe-embed-object.html#dom-iframe-contentdocument
+    #[qjs(get, rename = "contentDocument")]
+    fn content_document<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
+        let is_iframe = with_node_kind(&ctx, self.handle.0, |kind| {
+            matches!(
+                kind,
+                Some(NodeKind::Element { name, .. })
+                    if name.ns == html_namespace() && name.local.as_ref() == "iframe"
+            )
+        })?;
+        if !is_iframe {
+            return Ok(Value::new_null(ctx));
+        }
+        let world = world(&ctx)?;
+        let root = world.borrow().frame_document(self.handle.0);
+        match root {
+            Some(root) => {
+                let parent_origin = world.borrow().document_url.origin();
+                let child_origin = world
+                    .borrow()
+                    .owner_world(root)
+                    .map(|child| child.borrow().document_url.origin());
+                if child_origin.is_some_and(|origin| origin == parent_origin) {
+                    wrap_node(&ctx, root)
+                } else {
+                    Ok(Value::new_null(ctx))
+                }
+            }
+            None => Ok(Value::new_null(ctx)),
+        }
     }
 
     #[qjs(get)]
@@ -2830,18 +3155,130 @@ impl JsNode {
     }
 
     #[qjs(get)]
-    fn content(&self, ctx: Ctx<'_>) -> Result<String> {
+    fn content<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
         let world = world(&ctx)?;
-        Ok(world
+        let template_contents = {
+            let world = world.borrow();
+            world.document(self.handle.0).and_then(|parsed| {
+                let is_template = matches!(
+                    parsed.dom.get(self.handle.0).map(|node| node.kind()),
+                    Some(NodeKind::Element { name, .. })
+                        if name.ns == html_namespace() && name.local.as_ref() == "template"
+                );
+                is_template
+                    .then(|| parsed.dom.template_contents(self.handle.0))
+                    .flatten()
+            })
+        };
+        if let Some(contents) = template_contents {
+            return wrap_node(&ctx, contents);
+        }
+
+        let value = world
             .borrow()
             .document(self.handle.0)
             .and_then(|parsed| parsed.dom.attribute(self.handle.0, "content"))
-            .unwrap_or_default())
+            .unwrap_or_default();
+        Ok(Value::from_string(rquickjs::String::from_str(ctx, &value)?))
     }
 
     #[qjs(set, rename = "content")]
     fn set_content(&self, ctx: Ctx<'_>, value: WebIdlString) -> Result<()> {
         self.set_attribute(ctx, WebIdlString("content".into()), value)
+    }
+
+    // https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-element-innerhtml
+    #[qjs(get, rename = "innerHTML")]
+    fn inner_html(&self, ctx: Ctx<'_>) -> Result<String> {
+        let world = world(&ctx)?;
+        let parsed = world.borrow();
+        let Some(parsed) = parsed.document(self.handle.0) else {
+            return Err(Exception::throw_type(&ctx, "no document"));
+        };
+        Ok(serialize_html_fragment(&parsed.dom, self.handle.0))
+    }
+
+    // https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-element-innerhtml
+    #[qjs(set, rename = "innerHTML")]
+    fn set_inner_html(&self, ctx: Ctx<'_>, value: WebIdlString) -> Result<()> {
+        let (context, is_template) = with_node_kind(&ctx, self.handle.0, |kind| match kind {
+            Some(NodeKind::Element { name, .. }) => {
+                let context = if name.ns == svg_namespace() {
+                    format!("svg {}", name.local)
+                } else if name.ns.as_ref() == "http://www.w3.org/1998/Math/MathML" {
+                    format!("math {}", name.local)
+                } else {
+                    name.local.to_string()
+                };
+                Some((
+                    context,
+                    name.ns == html_namespace() && name.local.as_ref() == "template",
+                ))
+            }
+            _ => None,
+        })?
+        .ok_or_else(|| Exception::throw_type(&ctx, "innerHTML requires an element"))?;
+
+        let parsed_fragment = crate::parse_html_fragment(&value.0, &context, true);
+        let fragment_root = parsed_fragment
+            .dom
+            .children(parsed_fragment.dom.document())
+            .and_then(|children| {
+                children.copied().find(|&id| {
+                    matches!(
+                        parsed_fragment.dom.get(id).map(|node| node.kind()),
+                        Some(NodeKind::Element { name, .. })
+                            if name.ns == html_namespace() && name.local.as_ref() == "html"
+                    )
+                })
+            })
+            .ok_or_else(|| Exception::throw_internal(&ctx, "fragment parser omitted its root"))?;
+        let snapshots: Vec<ImportSnapshot> = parsed_fragment
+            .dom
+            .children(fragment_root)
+            .map(|children| {
+                children
+                    .copied()
+                    .filter_map(|child| import_snapshot(&parsed_fragment.dom, child, true))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let world = world(&ctx)?;
+        let world = world.borrow();
+        let Some(mut parsed) = world.document_mut(self.handle.0) else {
+            return Err(Exception::throw_type(&ctx, "no document"));
+        };
+        let target = if is_template {
+            if let Some(contents) = parsed.dom.template_contents(self.handle.0) {
+                contents
+            } else {
+                let contents = parsed.dom.create_fragment();
+                parsed
+                    .dom
+                    .set_template_contents(self.handle.0, contents)
+                    .map_err(|err| throw_dom_error(&ctx, err))?;
+                contents
+            }
+        } else {
+            self.handle.0
+        };
+        let replacement = parsed.dom.create_fragment();
+        for snapshot in &snapshots {
+            let child = materialize_import(&mut parsed.dom, snapshot)
+                .map_err(|err| throw_dom_error(&ctx, err))?;
+            parsed
+                .dom
+                .append(replacement, child)
+                .map_err(|err| throw_dom_error(&ctx, err))?;
+        }
+        parsed
+            .dom
+            .replace_all(target, replacement)
+            .map_err(|err| throw_dom_error(&ctx, err))?;
+        drop(parsed);
+        drop(world);
+        schedule_mutation_delivery(&ctx)
     }
 
     /// URL-reflected `href`: parsed against the document base and stored
@@ -2870,16 +3307,22 @@ impl JsNode {
         self.set_attribute(ctx, WebIdlString("href".into()), WebIdlString(resolved))
     }
 
-    /// Reflected inline style content attribute. A real
-    /// `CSSStyleDeclaration` needs the CSSOM; this reflects the string.
     #[qjs(get, rename = "style")]
-    fn style(&self, ctx: Ctx<'_>) -> Result<String> {
-        let world = world(&ctx)?;
-        Ok(world
-            .borrow()
-            .document(self.handle.0)
-            .and_then(|parsed| parsed.dom.attribute(self.handle.0, "style"))
-            .unwrap_or_default())
+    fn style<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
+        let world_rc = world_for_node(&ctx, self.handle.0)?;
+        if let Some(saved) = world_rc.borrow().style_declaration(self.handle.0)
+            && let Some(value) = deref_weak(&ctx, saved)?
+        {
+            return Ok(value);
+        }
+        let factory: Function = ctx.globals().get("__tbMakeStyle")?;
+        let element = wrap_node(&ctx, self.handle.0)?;
+        let value: Value = factory.call((element,))?;
+        let weak = make_weak(&ctx, value.clone())?;
+        world_rc
+            .borrow_mut()
+            .intern_style_declaration(self.handle.0, Persistent::save(&ctx, weak));
+        Ok(value)
     }
 
     #[qjs(set, rename = "style")]
@@ -3568,6 +4011,25 @@ impl JsNode {
         Ok(value)
     }
 
+    // https://html.spec.whatwg.org/multipage/dom.html#concept-domstringmap-pairs
+    #[qjs(get)]
+    fn dataset<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
+        let world_rc = world_for_node(&ctx, self.handle.0)?;
+        if let Some(saved) = world_rc.borrow().dataset(self.handle.0)
+            && let Some(value) = deref_weak(&ctx, saved)?
+        {
+            return Ok(value);
+        }
+        let factory: Function = ctx.globals().get("__tbMakeDataset")?;
+        let element = wrap_node(&ctx, self.handle.0)?;
+        let value: Value = factory.call((element,))?;
+        let weak = make_weak(&ctx, value.clone())?;
+        world_rc
+            .borrow_mut()
+            .intern_dataset(self.handle.0, Persistent::save(&ctx, weak));
+        Ok(value)
+    }
+
     // https://dom.spec.whatwg.org/#dom-element-hasattribute
     #[qjs(rename = "hasAttribute")]
     fn has_attribute(&self, ctx: Ctx<'_>, name: WebIdlString) -> Result<bool> {
@@ -3731,7 +4193,7 @@ impl JsNode {
     // https://dom.spec.whatwg.org/#dom-element-attributes
     #[qjs(get)]
     fn attributes<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
-        let world_rc = world(&ctx)?;
+        let world_rc = world_for_node(&ctx, self.handle.0)?;
         if let Some(saved) = world_rc.borrow().named_node_map(self.handle.0)
             && let Some(value) = deref_weak(&ctx, saved)?
         {
@@ -3779,7 +4241,7 @@ impl JsNode {
             name.0
         };
         match attached_attr_id(&ctx, self.handle.0, "", &name)? {
-            Some(id) => attr_wrapper(&ctx, id),
+            Some(id) => attr_wrapper(&ctx, self.handle.0, id),
             None => Ok(Value::new_null(ctx)),
         }
     }
@@ -3794,7 +4256,7 @@ impl JsNode {
     ) -> Result<Value<'js>> {
         let namespace = namespace.0.unwrap_or_default();
         match attached_attr_id(&ctx, self.handle.0, &namespace, &local.0)? {
-            Some(id) => attr_wrapper(&ctx, id),
+            Some(id) => attr_wrapper(&ctx, self.handle.0, id),
             None => Ok(Value::new_null(ctx)),
         }
     }
@@ -3816,10 +4278,13 @@ impl JsNode {
     fn remove_attribute_node<'js>(&self, ctx: Ctx<'js>, attr: Value<'js>) -> Result<Value<'js>> {
         let class = Class::<JsAttr>::from_js(&ctx, attr.clone())
             .map_err(|_| Exception::throw_type(&ctx, "argument is not an Attr"))?;
-        let id = class.borrow().id;
-        let state = attr_state(&ctx, id)?;
-        let attached_here = attr_owner(&ctx, id) == Some(self.handle.0) && {
-            let world_rc = world(&ctx)?;
+        let (id, scope) = {
+            let attr = class.borrow();
+            (attr.id, attr.scope.0)
+        };
+        let state = attr_state(&ctx, scope, id)?;
+        let attached_here = attr_owner(&ctx, scope, id) == Some(self.handle.0) && {
+            let world_rc = world_for_node(&ctx, self.handle.0)?;
             let world = world_rc.borrow();
             world
                 .attr_ids
@@ -4581,9 +5046,15 @@ pub(super) fn install(ctx: &Ctx<'_>, world: &Rc<RefCell<World>>) -> Result<()> {
 
     let pathname = world.borrow().document_url.path().to_owned();
     let href = world.borrow().document_url.as_str().to_owned();
+    let search = world
+        .borrow()
+        .document_url
+        .query()
+        .map_or_else(String::new, |query| format!("?{query}"));
     let location = Object::new(ctx.clone())?;
     location.set("pathname", pathname)?;
     location.set("href", href)?;
+    location.set("search", search)?;
     globals.set("location", location)?;
     globals.set("window", globals.clone())?;
     globals.set("self", globals.clone())?;
@@ -4620,6 +5091,20 @@ fn window_add_event_listener<'js>(
 pub(super) fn fire_window_load(ctx: &Ctx<'_>) -> Result<()> {
     let event = Class::instance(ctx.clone(), JsEvent { typ: "load".into() })?;
     fire(ctx, EventTargetKey::Window, "load", &event)?;
+    Ok(())
+}
+
+pub(super) fn fire_node_load(ctx: &Ctx<'_>, id: NodeId) -> Result<()> {
+    let event = Class::instance(ctx.clone(), JsEvent { typ: "load".into() })?;
+    fire(ctx, EventTargetKey::Node(id), "load", &event)?;
+    let value = wrap_node(ctx, id)?;
+    let Some(object) = value.as_object() else {
+        return Ok(());
+    };
+    let handler: Value = object.get("onload")?;
+    if let Some(handler) = handler.as_function() {
+        handler.call::<_, ()>((This(object.clone()), event))?;
+    }
     Ok(())
 }
 
@@ -4917,7 +5402,7 @@ const INSTALL_BRANDS_JS: &str = r"
   const DocumentInterface = define('Document', NodeInterface, [
     'createElement', 'createElementNS', 'createTextNode', 'createComment',
     'createProcessingInstruction', 'createCDATASection', 'createAttribute',
-    'createAttributeNS', 'createDocumentFragment', 'write',
+    'createAttributeNS', 'createDocumentFragment', 'open', 'write', 'close',
     'getElementById', 'getElementsByTagName',
     'getElementsByTagNameNS', 'getElementsByClassName',
     'body', 'documentElement', 'doctype', 'readyState', 'implementation',
@@ -4925,7 +5410,7 @@ const INSTALL_BRANDS_JS: &str = r"
     'append', 'prepend', 'replaceChildren', 'querySelector', 'querySelectorAll',
     'URL', 'documentURI', 'location', 'characterSet', 'charset',
     'inputEncoding', 'contentType', 'compatMode', 'title',
-    'getElementsByName', 'importNode'
+    'getElementsByName', 'importNode', 'currentScript'
   ], true);
   const ElementInterface = define('Element', NodeInterface, [
     'getElementsByTagName', 'getElementsByTagNameNS', 'getElementsByClassName',
@@ -4940,7 +5425,7 @@ const INSTALL_BRANDS_JS: &str = r"
     'prepend', 'replaceChildren', 'querySelector', 'querySelectorAll',
     'before', 'after', 'replaceWith', 'previousElementSibling',
     'nextElementSibling', 'tagName', 'localName', 'prefix', 'namespaceURI',
-    'className', 'classList', 'id', 'src', 'href', 'name', 'content', 'style',
+    'className', 'classList', 'dataset', 'id', 'src', 'href', 'name', 'content', 'innerHTML', 'style',
     'remove'
   ]);
   // classList is `[PutForwards=value]`: assigning to it sets `.value`
@@ -5061,7 +5546,8 @@ const INSTALL_BRANDS_JS: &str = r"
     ['HTMLUListElement', HTMLElementInterface],
     ['HTMLVideoElement', HTMLMediaElementInterface],
   ]) {
-    table[name] = define(name, parent, []).prototype;
+    const members = name === 'HTMLIFrameElement' ? ['contentDocument'] : [];
+    table[name] = define(name, parent, members).prototype;
   }
   Object.defineProperty(globalThis, '__tb_brandTable', {
     enumerable: false,
@@ -5090,6 +5576,27 @@ fn install_brands(ctx: &Ctx<'_>) -> Result<()> {
 const INSTALL_COLLECTIONS_JS: &str = r"
 (function() {
   const native = globalThis.NodeList.prototype;
+  function values() {
+    let index = 0;
+    const collection = this;
+    return {
+      next: function() {
+        if (index >= collection.length) return { value: undefined, done: true };
+        return { value: collection.item(index++), done: false };
+      },
+      [Symbol.iterator]: function() { return this; }
+    };
+  }
+  Object.defineProperty(native, Symbol.iterator, {
+    value: values,
+    writable: true,
+    configurable: true,
+  });
+  Object.defineProperty(globalThis.NamedNodeMap.prototype, Symbol.iterator, {
+    value: values,
+    writable: true,
+    configurable: true,
+  });
   const ctor = function() { throw new TypeError('Illegal constructor'); };
   const proto = Object.create(Object.prototype);
   for (const member of ['length', 'item']) {
@@ -5097,6 +5604,11 @@ const INSTALL_COLLECTIONS_JS: &str = r"
     if (descriptor) Object.defineProperty(proto, member, descriptor);
   }
   Object.defineProperty(proto, 'constructor', { value: ctor, writable: true, configurable: true });
+  Object.defineProperty(proto, Symbol.iterator, {
+    value: values,
+    writable: true,
+    configurable: true,
+  });
   Object.defineProperty(ctor, 'prototype', { value: proto, writable: false });
   Object.defineProperty(globalThis, 'HTMLCollection', { value: ctor, writable: true, configurable: true });
   Object.defineProperty(globalThis, '__tb_liveCollection', {
@@ -5255,6 +5767,12 @@ fn world(ctx: &Ctx<'_>) -> Result<Rc<RefCell<World>>> {
         .ok_or_else(|| Exception::throw_internal(ctx, "missing JS world"))
 }
 
+fn world_for_node(ctx: &Ctx<'_>, id: NodeId) -> Result<Rc<RefCell<World>>> {
+    let current = world(ctx)?;
+    let owner = current.borrow().owner_world(id);
+    Ok(owner.unwrap_or(current))
+}
+
 fn add_listener<'js>(
     ctx: &Ctx<'js>,
     target: EventTargetKey,
@@ -5262,7 +5780,11 @@ fn add_listener<'js>(
     callback: Function<'js>,
 ) -> Result<()> {
     let saved = Persistent::save(ctx, callback);
-    world(ctx)?.borrow_mut().add_listener(
+    let owner = match target {
+        EventTargetKey::Node(id) => world_for_node(ctx, id)?,
+        EventTargetKey::Window => world(ctx)?,
+    };
+    owner.borrow_mut().add_listener(
         target,
         Listener {
             typ,
@@ -5278,7 +5800,11 @@ fn fire<'js>(
     typ: &str,
     event: &Class<'js, JsEvent>,
 ) -> Result<bool> {
-    let callbacks = world(ctx)?.borrow().listeners(target, typ);
+    let owner = match target {
+        EventTargetKey::Node(id) => world_for_node(ctx, id)?,
+        EventTargetKey::Window => world(ctx)?,
+    };
+    let callbacks = owner.borrow().listeners(target, typ);
     for callback in callbacks {
         let func = callback.restore(ctx)?;
         func.call::<_, ()>((event.clone(),))?;
@@ -5598,7 +6124,23 @@ fn create_element_named<'js>(
     document: NodeId,
     name: QualName,
 ) -> Result<Value<'js>> {
-    create_kind(ctx, document, |dom| dom.create_element(name, Vec::new()))
+    let is_template = name.ns == html_namespace() && name.local.as_ref() == "template";
+    let world = world(ctx)?;
+    let world = world.borrow();
+    let Some(mut parsed) = world.document_mut(document) else {
+        return Err(Exception::throw_type(ctx, "no document"));
+    };
+    let id = parsed.dom.create_element(name, Vec::new());
+    if is_template {
+        let contents = parsed.dom.create_fragment();
+        parsed
+            .dom
+            .set_template_contents(id, contents)
+            .map_err(|err| throw_dom_error(ctx, err))?;
+    }
+    drop(parsed);
+    drop(world);
+    wrap_node(ctx, id)
 }
 
 fn create_kind<'js>(
@@ -6051,7 +6593,7 @@ mod realm_tests {
             Arc::clone(services),
             Url::parse(url).expect("test url"),
             Rc::clone(documents),
-            Rc::clone(registry),
+            registry,
         );
         let id = world.replace_document(crate::parse_html(html));
         let world = Rc::new(RefCell::new(world));

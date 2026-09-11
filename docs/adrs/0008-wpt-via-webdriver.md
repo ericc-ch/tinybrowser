@@ -6,7 +6,7 @@ Status: accepted for WPT-via-WebDriver. The WebDriver adapter and “does not ow
 
 wptrunner’s testharness executor navigates a real HTML document and reads results from `testharness.js` / `testharnessreport.js`. That path is WebDriver. CDP is the CLI and agent control plane ([ADR 0009](0009-named-profile-daemon.md)). Using CDP as the WPT driver would implement the wrong protocol for WPT.
 
-The WPT pin is the **full** tree at SHA `92054a74d0c6a1ed2e9024d71ebf2880f2af02e2` (submodule `third_party/wpt`). The first green testharness bar is still the goal, not a claim of this landing.
+The WPT pin is the **full** tree at SHA `92054a74d0c6a1ed2e9024d71ebf2880f2af02e2` (submodule `third_party/wpt`). Testharness pages run through the WebDriver adapter, including all official html5lib parser wrapper variants; individual conformance failures remain visible as WPT subtest failures.
 
 ## Isolation
 
@@ -25,8 +25,13 @@ The exact launch flag may stay `--webdriver=PORT` or change. That flag is open. 
 - HTTP-only first bar: `--ssl-type none` (HTTPS testharness files are excluded until cert trust exists). `./tools/wpt/run` also drops extra listen ports (`https-*`, `http-local`, `http-public`, `ws`, `dns`, …) so the runner does not bind extra loopbacks or start a DNS server.
 - Hosts: `./tools/wpt/run` skips WPT’s `/etc/hosts` check and launches `tinybrowser --webdriver=PORT --resolve=*.test=127.0.0.1` (plus `nonexistent.*.test=fail` and `*.test.`). No machine hosts file. Do not patch vendored WPT.
 - `./tools/wpt/run` passes `--no-pause-after-test` (wptrunner otherwise pauses after a single file, and testharness `output: 1` never finishes on our DOM) and `--no-restart-on-unexpected`.
+- Product expectations live outside the vendored tree under tools/wpt/metadata;
+  the runner supplies that metadata root together with WPT's pinned manifest.
 - Testdriver user-input tests are skipped (`supports_testdriver = False`) until click/send_keys are real. The testharness executor still uses testdriver `run()` for result collection. Click and actions endpoints return `unsupported operation` until they change browser state.
-- html5lib-tests stay the parser gate until testharness runs `html/syntax/parsing/`. Browser-crate JS/DOM cargo tests are stand-ins until the first testharness file is green; delete them then. They are not a second web suite.
+- The maintained html5lib parser corpus runs through
+  `./tools/wpt/run 'html/syntax/parsing/html5lib_*.html'`. Its former frozen
+  submodule and Cargo harness are gone; [ADR 0005](0005-html5lib-tree-construction-suite.md)
+  records the migration evidence.
 
 Invocation: `pip install -e tools/wpt` into the WPT venv, then `./tools/wpt/run [tests]`.
 

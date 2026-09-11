@@ -6,20 +6,21 @@
 //! one frame. Child frames join the same engine sharing both.
 
 use std::cell::RefCell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::document::{Document, Stop, Waiter};
 use crate::documents::DocumentStore;
-use crate::js::{RealmRegistry, SharedJsRuntime};
+use crate::js::{DocumentStreamCommand, FrameNavigation, RealmRegistry, SharedJsRuntime};
 use crate::protocol::{BrowserServices, FrameId, Mount, TabError, TabEvent};
 use crate::{Parsed, RemoteValue, ScriptValue};
 
 /// How long one frame may occupy the waiter before the engine gives the next
 /// frame a turn.
 const FRAME_STEP: Duration = Duration::from_millis(1);
+const MAX_FRAMES: usize = 64;
 
 /// One renderer process's page engine.
 ///
@@ -36,6 +37,8 @@ pub struct Engine {
     services: Arc<dyn BrowserServices>,
     stop: Arc<Stop>,
     frames: BTreeMap<FrameId, Document>,
+    child_frames: HashMap<dom::NodeId, (FrameId, FrameId)>,
+    pending_frame_loads: HashSet<dom::NodeId>,
     next_frame: u64,
 }
 
@@ -71,6 +74,8 @@ impl Engine {
             services,
             stop,
             frames,
+            child_frames: HashMap::new(),
+            pending_frame_loads: HashSet::new(),
             next_frame: 1,
         }
     }
@@ -119,7 +124,9 @@ impl Engine {
 
     /// Replaces the main frame's document from a host mount.
     pub fn mount(&mut self, mount: &Mount) {
+        self.remove_descendants(FrameId::MAIN);
         self.main_mut().mount(mount);
+        self.reconcile_frames();
     }
 
     /// Replaces one frame's document from a host mount.
@@ -128,16 +135,20 @@ impl Engine {
     ///
     /// [`TabError::UnknownFrame`] when the engine does not host `frame`.
     pub fn mount_frame(&mut self, frame: FrameId, mount: &Mount) -> Result<(), TabError> {
+        self.remove_descendants(frame);
         let document = self
             .frame_mut(frame)
             .ok_or(TabError::UnknownFrame { frame: frame.get() })?;
         document.mount(mount);
+        self.reconcile_frames();
         Ok(())
     }
 
     /// Parses `html` into the main frame and starts a new realm.
     pub fn load_html(&mut self, html: &str) {
+        self.remove_descendants(FrameId::MAIN);
         self.main_mut().load_html(html);
+        self.reconcile_frames();
     }
 
     /// Evaluates `source` in the main frame and returns its string coercion.
@@ -155,9 +166,12 @@ impl Engine {
     ///
     /// [`TabError::UnknownFrame`] or [`TabError::Script`].
     pub fn eval_in(&mut self, frame: FrameId, source: &str) -> Result<String, TabError> {
-        self.frame_mut(frame)
+        let result = self
+            .frame_mut(frame)
             .ok_or(TabError::UnknownFrame { frame: frame.get() })?
-            .eval(source)
+            .eval(source);
+        self.reconcile_frames();
+        result
     }
 
     /// Evaluates `source` in the main frame and returns a value-only result.
@@ -179,9 +193,12 @@ impl Engine {
         frame: FrameId,
         source: &str,
     ) -> Result<ScriptValue, TabError> {
-        self.frame_mut(frame)
+        let result = self
+            .frame_mut(frame)
             .ok_or(TabError::UnknownFrame { frame: frame.get() })?
-            .execute_script(source)
+            .execute_script(source);
+        self.reconcile_frames();
+        result
     }
 
     /// Evaluates `source` and interns node handles for the protocol.
@@ -208,9 +225,12 @@ impl Engine {
         source: &str,
         timeout: Option<Duration>,
     ) -> Result<RemoteValue, TabError> {
-        self.frame_mut(frame)
+        let result = self
+            .frame_mut(frame)
             .ok_or(TabError::UnknownFrame { frame: frame.get() })?
-            .execute_remote(source, timeout)
+            .execute_remote(source, timeout);
+        self.reconcile_frames();
+        result
     }
 
     /// Sets the main frame's document URL.
@@ -262,21 +282,30 @@ impl Engine {
     /// True when any frame has jobs, timers, dials, or pending JS work.
     #[must_use]
     pub fn has_background_work(&self) -> bool {
-        self.frames.values().any(Document::has_background_work)
+        !self.pending_frame_loads.is_empty()
+            || self
+                .frames
+                .values()
+                .any(|document| document.has_background_work() || document.has_engine_requests())
     }
 
     /// Advances every frame for at most `budget`.
     pub fn drive_for(&mut self, budget: Duration) {
         let deadline = Instant::now() + budget;
         loop {
-            for document in self.frames.values_mut() {
+            let frames: Vec<FrameId> = self.frames.keys().copied().collect();
+            for frame in frames {
                 let now = Instant::now();
                 if now >= deadline {
                     return;
                 }
+                let Some(document) = self.frames.get_mut(&frame) else {
+                    continue;
+                };
                 // Each frame gets at most one step, and never past the shared
                 // deadline: many frames must not multiply the budget.
                 document.drive_for(FRAME_STEP.min(deadline - now));
+                self.reconcile_frames();
             }
             if Instant::now() >= deadline || !self.has_background_work() {
                 return;
@@ -288,8 +317,12 @@ impl Engine {
     /// dials, or fetches.
     pub fn run(&mut self) {
         while self.has_background_work() {
-            for document in self.frames.values_mut() {
-                document.drive_for(FRAME_STEP);
+            let frames: Vec<FrameId> = self.frames.keys().copied().collect();
+            for frame in frames {
+                if let Some(document) = self.frames.get_mut(&frame) {
+                    document.drive_for(FRAME_STEP);
+                }
+                self.reconcile_frames();
             }
         }
     }
@@ -297,10 +330,194 @@ impl Engine {
     /// Parks until every frame has fired `load`.
     pub fn run_until_load(&mut self) {
         while self.frames.values().any(Document::waiting_for_load) {
-            for document in self.frames.values_mut() {
-                document.drive_for(FRAME_STEP);
+            let frames: Vec<FrameId> = self.frames.keys().copied().collect();
+            for frame in frames {
+                if let Some(document) = self.frames.get_mut(&frame) {
+                    document.drive_for(FRAME_STEP);
+                }
+                self.reconcile_frames();
             }
         }
+    }
+
+    fn reconcile_frames(&mut self) {
+        loop {
+            let frame_ids: Vec<FrameId> = self.frames.keys().copied().collect();
+            let mut lifecycle = Vec::new();
+            let mut navigations = Vec::new();
+            let mut streams = Vec::new();
+            for frame in frame_ids {
+                let Some(document) = self.frames.get_mut(&frame) else {
+                    continue;
+                };
+                lifecycle.extend(
+                    document
+                        .take_lifecycle()
+                        .into_iter()
+                        .map(|event| (frame, event)),
+                );
+                navigations.extend(document.take_frame_navigations());
+                let commands = document.take_document_stream();
+                if !commands.is_empty() {
+                    streams.push((frame, commands));
+                }
+            }
+            let had_work = !lifecycle.is_empty() || !navigations.is_empty() || !streams.is_empty();
+            self.apply_lifecycle(lifecycle);
+            self.apply_navigations(navigations);
+            self.apply_streams(streams);
+            let fired_load = self.fire_ready_frame_loads();
+            if !had_work && !fired_load {
+                break;
+            }
+        }
+    }
+
+    fn apply_lifecycle(&mut self, events: Vec<(FrameId, dom::Lifecycle)>) {
+        for (parent, event) in events {
+            match event {
+                dom::Lifecycle::Inserted(container) => {
+                    if self.child_frames.contains_key(&container) {
+                        continue;
+                    }
+                    if self.frames.len() >= MAX_FRAMES {
+                        continue;
+                    }
+                    let child = self.create_frame();
+                    let parent_url = self
+                        .frames
+                        .get(&parent)
+                        .map(|document| document.document_url().to_owned());
+                    if let Some(document) = self.frames.get_mut(&child) {
+                        if let Some(parent_url) = parent_url {
+                            let _ = document.set_document_url(&parent_url);
+                        }
+                        document.load_html("");
+                    }
+                    self.child_frames.insert(container, (parent, child));
+                    self.publish_frame_document(container, child);
+                }
+                dom::Lifecycle::Removed(container) => {
+                    self.remove_subtree(container);
+                }
+            }
+        }
+    }
+
+    /// Removes a frame and every descendant it owns before the backing
+    /// document is replaced or disconnected. Lifecycle events can arrive only
+    /// for the direct iframe, so recurse through the renderer's mirrored tree
+    /// explicitly to avoid stale realms and pending loads.
+    fn remove_subtree(&mut self, container: dom::NodeId) {
+        let Some((_, child)) = self.child_frames.remove(&container) else {
+            return;
+        };
+        let descendants: Vec<dom::NodeId> = self
+            .child_frames
+            .iter()
+            .filter_map(|(&nested, &(parent, _))| (parent == child).then_some(nested))
+            .collect();
+        for nested in descendants {
+            self.remove_subtree(nested);
+        }
+        self.pending_frame_loads.remove(&container);
+        self.registry.borrow_mut().forget_frame(container);
+        self.frames.remove(&child);
+    }
+
+    fn remove_descendants(&mut self, parent: FrameId) {
+        let containers: Vec<dom::NodeId> = self
+            .child_frames
+            .iter()
+            .filter_map(|(&container, &(owner, _))| (owner == parent).then_some(container))
+            .collect();
+        for container in containers {
+            self.remove_subtree(container);
+        }
+    }
+
+    fn apply_navigations(&mut self, navigations: Vec<FrameNavigation>) {
+        for navigation in navigations {
+            match navigation {
+                FrameNavigation::ObjectUrl {
+                    container,
+                    contents,
+                } => {
+                    let Some((_, child)) = self.child_frames.get(&container).copied() else {
+                        continue;
+                    };
+                    let parent_url = self
+                        .child_frames
+                        .get(&container)
+                        .and_then(|(parent, _)| self.frames.get(parent))
+                        .map(|document| document.document_url().to_owned());
+                    if let Some(document) = self.frames.get_mut(&child) {
+                        if let Some(parent_url) = parent_url {
+                            let _ = document.set_document_url(&parent_url);
+                        }
+                        document.load_html(&contents);
+                    }
+                    self.publish_frame_document(container, child);
+                    self.pending_frame_loads.insert(container);
+                }
+            }
+        }
+    }
+
+    fn apply_streams(&mut self, streams: Vec<(FrameId, Vec<DocumentStreamCommand>)>) {
+        for (frame, commands) in streams {
+            let container = self
+                .child_frames
+                .iter()
+                .find_map(|(&container, &(_, child))| (child == frame).then_some(container));
+            let mut closed = false;
+            if let Some(document) = self.frames.get_mut(&frame) {
+                for command in commands {
+                    closed |= matches!(&command, DocumentStreamCommand::Close);
+                    document.apply_document_stream(command);
+                }
+            }
+            if let Some(container) = container {
+                self.publish_frame_document(container, frame);
+                if closed {
+                    self.pending_frame_loads.insert(container);
+                }
+            }
+        }
+    }
+
+    fn publish_frame_document(&mut self, container: dom::NodeId, frame: FrameId) {
+        let document = self.frames.get(&frame).and_then(Document::document_root);
+        if let Some(document) = document {
+            self.registry
+                .borrow_mut()
+                .set_frame_document(container, document);
+        }
+    }
+
+    fn fire_ready_frame_loads(&mut self) -> bool {
+        let ready: Vec<dom::NodeId> = self
+            .pending_frame_loads
+            .iter()
+            .copied()
+            .filter(|container| {
+                self.child_frames
+                    .get(container)
+                    .and_then(|(_, child)| self.frames.get(child))
+                    .is_some_and(|document| !document.waiting_for_load())
+            })
+            .collect();
+        for container in &ready {
+            self.pending_frame_loads.remove(container);
+            let Some((parent, child)) = self.child_frames.get(container).copied() else {
+                continue;
+            };
+            self.publish_frame_document(*container, child);
+            if let Some(document) = self.frames.get_mut(&parent) {
+                document.fire_node_load(*container);
+            }
+        }
+        !ready.is_empty()
     }
 
     /// Stops every frame. Further work must go through [`Engine::new`].

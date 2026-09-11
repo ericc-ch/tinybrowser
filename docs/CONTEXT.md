@@ -191,5 +191,5 @@ Ordered `--resolve=PATTERN=ADDR` rewrites on `AgentBuilder`; `PATTERN` is an exa
 _Avoid_: hosts file, `/etc/hosts` for WPT
 
 **WPT gate**:
-web-platform-tests is the suite for web-visible behavior (DOM, HTML, fetch, cookies, WebSocket as JS sees them). `./tools/wpt/run` is that gate. `cargo test` covers product and transport: daemon lock, CDP flatten, WebDriver one-session, pump vs unrelated fetch, cookie file mode, CLI flag errors, `net::Agent`. html5lib-tests stay the parser gate until testharness runs `html/syntax/parsing/`. Browser-crate JS/DOM cargo tests are stand-ins until the first testharness file is green; delete them then.
-_Avoid_: “WPT covers net” (it does not import `net::Agent`; transport unit tests are a different layer), growing a second web suite in `cargo test`
+web-platform-tests is the suite for web-visible behavior (DOM, HTML, fetch, cookies, WebSocket as JS sees them). `./tools/wpt/run` is that gate; the HTML parser corpus is `./tools/wpt/run 'html/syntax/parsing/html5lib_*.html'`. `cargo test` covers product and transport: daemon lock, CDP flatten, WebDriver one-session, pump vs unrelated fetch, cookie file mode, CLI flag errors, `net::Agent`.
+_Avoid_: “WPT covers net” (it does not import `net::Agent`; transport unit tests are a different layer), a frozen html5lib submodule, growing a second web suite in `cargo test`

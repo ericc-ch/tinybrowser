@@ -19,13 +19,25 @@ use crate::protocol::BrowserServices;
 /// alive, so cached wrappers never outlive the heap.
 #[derive(Default)]
 pub(crate) struct RealmRegistry {
+    budget: Rc<RefCell<ResourceBudget>>,
     /// The World that owns each document id, for wrapper realm resolution.
     documents: HashMap<u32, Weak<RefCell<World>>>,
     /// One wrapper per node, shared by every realm in this renderer process.
     /// The persistent holds a `WeakRef`, so an unreferenced wrapper can still
     /// be collected.
     wrappers: HashMap<NodeId, Persistent<Value<'static>>>,
+    /// The active child document for each connected iframe container.
+    frame_documents: HashMap<NodeId, NodeId>,
 }
+
+#[derive(Default)]
+struct ResourceBudget {
+    pending_stream_bytes: usize,
+    object_url_bytes: usize,
+}
+
+const MAX_PENDING_STREAM_BYTES: usize = 8 * 1024 * 1024;
+const MAX_OBJECT_URL_BYTES: usize = 8 * 1024 * 1024;
 
 impl RealmRegistry {
     /// Remembers that `world` owns the document `id`.
@@ -44,6 +56,8 @@ impl RealmRegistry {
     pub(crate) fn forget_document(&mut self, id: u32) {
         self.documents.remove(&id);
         self.wrappers.retain(|node, _| node.document_id() != id);
+        self.frame_documents
+            .retain(|_, document| document.document_id() != id);
     }
 
     /// The shared wrapper cache entry for `id`, when one exists.
@@ -56,11 +70,41 @@ impl RealmRegistry {
         self.wrappers.insert(id, value);
     }
 
+    pub(crate) fn frame_document(&self, container: NodeId) -> Option<NodeId> {
+        self.frame_documents.get(&container).copied()
+    }
+
+    pub(crate) fn set_frame_document(&mut self, container: NodeId, document: NodeId) {
+        self.frame_documents.insert(container, document);
+    }
+
+    pub(crate) fn forget_frame(&mut self, container: NodeId) {
+        self.frame_documents.remove(&container);
+    }
+
     /// Drops every cached wrapper; called while the runtime is still alive.
     pub(crate) fn clear(&mut self) {
         self.documents.clear();
         self.wrappers.clear();
+        self.frame_documents.clear();
     }
+
+    fn budget(&self) -> Rc<RefCell<ResourceBudget>> {
+        Rc::clone(&self.budget)
+    }
+}
+
+pub(crate) enum FrameNavigation {
+    ObjectUrl {
+        container: NodeId,
+        contents: Rc<str>,
+    },
+}
+
+pub(crate) enum DocumentStreamCommand {
+    Open,
+    Write(String),
+    Close,
 }
 
 /// One DOM node handle owned by the JS world.
@@ -152,11 +196,19 @@ pub(crate) struct World {
     pub services: Arc<dyn BrowserServices>,
     pub pending_cancels: Vec<i32>,
     pub pending_html_writes: Vec<String>,
+    frame_navigations: Vec<FrameNavigation>,
+    document_stream: Vec<DocumentStreamCommand>,
+    object_urls: HashMap<String, Rc<str>>,
+    budget: Rc<RefCell<ResourceBudget>>,
+    next_object_url: u64,
     pub parser_active: bool,
+    pub current_script: Option<NodeId>,
     pub document_ready: bool,
     listeners: HashMap<EventTargetKey, Vec<Listener>>,
     token_lists: HashMap<NodeId, Persistent<Value<'static>>>,
     named_node_maps: HashMap<NodeId, Persistent<Value<'static>>>,
+    style_declarations: HashMap<NodeId, Persistent<Value<'static>>>,
+    datasets: HashMap<NodeId, Persistent<Value<'static>>>,
     implementations: HashMap<u32, Persistent<Value<'static>>>,
     brands: HashMap<String, Persistent<Object<'static>>>,
     /// `Attr` platform-object identity, keyed by a per-realm id.
@@ -176,27 +228,57 @@ pub(crate) struct World {
     pub(crate) delivery_scheduled: bool,
 }
 
+impl Drop for World {
+    fn drop(&mut self) {
+        let object_bytes = self
+            .object_urls
+            .values()
+            .map(|value| value.len())
+            .sum::<usize>();
+        let mut budget = self.budget.borrow_mut();
+        budget.object_url_bytes = budget.object_url_bytes.saturating_sub(object_bytes);
+        let stream_bytes = self
+            .document_stream
+            .iter()
+            .filter_map(|command| match command {
+                DocumentStreamCommand::Write(value) => Some(value.len()),
+                _ => None,
+            })
+            .chain(self.pending_html_writes.iter().map(String::len))
+            .sum::<usize>();
+        budget.pending_stream_bytes = budget.pending_stream_bytes.saturating_sub(stream_bytes);
+    }
+}
+
 impl World {
     pub(crate) fn new(
         services: Arc<dyn BrowserServices>,
         document_url: Url,
         documents: Rc<RefCell<DocumentStore>>,
-        registry: Rc<RefCell<RealmRegistry>>,
+        registry: &Rc<RefCell<RealmRegistry>>,
     ) -> Self {
         Self {
             documents,
-            registry,
+            registry: Rc::clone(registry),
             document: None,
             owned: HashSet::new(),
             document_url,
             services,
             pending_cancels: Vec::new(),
             pending_html_writes: Vec::new(),
+            frame_navigations: Vec::new(),
+            document_stream: Vec::new(),
+            object_urls: HashMap::new(),
+            budget: registry.borrow().budget(),
+            next_object_url: 0,
             parser_active: false,
+            current_script: None,
             document_ready: false,
             listeners: HashMap::new(),
             token_lists: HashMap::new(),
             named_node_maps: HashMap::new(),
+            style_declarations: HashMap::new(),
+            datasets: HashMap::new(),
             implementations: HashMap::new(),
             brands: HashMap::new(),
             attrs: HashMap::new(),
@@ -287,10 +369,17 @@ impl World {
         self.document = Some(id);
         self.owned.insert(id);
         self.document_ready = false;
+        self.current_script = None;
         self.listeners.clear();
         self.token_lists.clear();
         self.named_node_maps.clear();
+        self.style_declarations.clear();
+        self.datasets.clear();
         self.implementations.clear();
+        self.clear_attributes();
+        self.frame_navigations.clear();
+        let pending = self.take_document_stream();
+        drop(pending);
         // A new realm owns fresh observers; navigation drops the old ones.
         self.observers.clear();
         self.delivery_scheduled = false;
@@ -304,6 +393,7 @@ impl World {
         let id = self.documents.borrow_mut().insert(parsed);
         self.document = Some(id);
         self.owned.insert(id);
+        self.current_script = None;
         id
     }
 
@@ -419,6 +509,91 @@ impl World {
         root
     }
 
+    pub(crate) fn frame_document(&self, container: NodeId) -> Option<NodeId> {
+        self.registry.borrow().frame_document(container)
+    }
+
+    pub(crate) fn queue_frame_navigation(&mut self, navigation: FrameNavigation) {
+        self.frame_navigations.push(navigation);
+    }
+
+    pub(crate) fn take_frame_navigations(&mut self) -> Vec<FrameNavigation> {
+        std::mem::take(&mut self.frame_navigations)
+    }
+
+    pub(crate) fn queue_document_stream(
+        &mut self,
+        command: DocumentStreamCommand,
+    ) -> std::result::Result<(), ()> {
+        if let DocumentStreamCommand::Write(value) = &command
+            && !self.reserve_stream_bytes(value.len())
+        {
+            return Err(());
+        }
+        self.document_stream.push(command);
+        Ok(())
+    }
+
+    pub(crate) fn take_document_stream(&mut self) -> Vec<DocumentStreamCommand> {
+        let commands = std::mem::take(&mut self.document_stream);
+        let bytes = commands
+            .iter()
+            .map(|command| match command {
+                DocumentStreamCommand::Write(value) => value.len(),
+                _ => 0,
+            })
+            .sum::<usize>();
+        self.release_stream_bytes(bytes);
+        commands
+    }
+
+    pub(crate) fn reserve_stream_bytes(&self, bytes: usize) -> bool {
+        let mut budget = self.budget.borrow_mut();
+        let Some(total) = budget.pending_stream_bytes.checked_add(bytes) else {
+            return false;
+        };
+        if total > MAX_PENDING_STREAM_BYTES {
+            return false;
+        }
+        budget.pending_stream_bytes = total;
+        true
+    }
+
+    pub(crate) fn release_stream_bytes(&self, bytes: usize) {
+        let mut budget = self.budget.borrow_mut();
+        budget.pending_stream_bytes = budget.pending_stream_bytes.saturating_sub(bytes);
+    }
+
+    pub(crate) fn has_engine_requests(&self) -> bool {
+        !self.frame_navigations.is_empty() || !self.document_stream.is_empty()
+    }
+
+    pub(crate) fn create_object_url(&mut self, contents: String) -> Option<String> {
+        let length = contents.len();
+        let mut budget = self.budget.borrow_mut();
+        let total = budget.object_url_bytes.checked_add(length)?;
+        if total > MAX_OBJECT_URL_BYTES {
+            return None;
+        }
+        let id = self.next_object_url;
+        self.next_object_url = self.next_object_url.wrapping_add(1);
+        let url = format!("blob:tinybrowser/{id}");
+        self.object_urls.insert(url.clone(), Rc::from(contents));
+        budget.object_url_bytes = total;
+        Some(url)
+    }
+
+    pub(crate) fn object_url_contents(&self, url: &str) -> Option<Rc<str>> {
+        self.object_urls.get(url).cloned()
+    }
+
+    pub(crate) fn revoke_object_url(&mut self, url: &str) {
+        if let Some(contents) = self.object_urls.remove(url) {
+            let mut budget = self.budget.borrow_mut();
+            budget.object_url_bytes = budget.object_url_bytes.saturating_sub(contents.len());
+        }
+    }
+
     pub(crate) fn add_listener(&mut self, target: EventTargetKey, listener: Listener) {
         self.listeners.entry(target).or_default().push(listener);
     }
@@ -427,9 +602,21 @@ impl World {
         self.listeners.clear();
         self.token_lists.clear();
         self.named_node_maps.clear();
+        self.style_declarations.clear();
+        self.datasets.clear();
         self.implementations.clear();
         self.brands.clear();
+        self.clear_attributes();
         self.observers.clear();
+    }
+
+    fn clear_attributes(&mut self) {
+        self.attrs.clear();
+        self.attr_owners.clear();
+        self.attr_values.clear();
+        self.attr_wrappers.clear();
+        self.attr_ids.clear();
+        self.next_attr_id = 0;
     }
 
     pub(crate) fn token_list(&self, id: NodeId) -> Option<Persistent<Value<'static>>> {
@@ -446,6 +633,26 @@ impl World {
 
     pub(crate) fn intern_named_node_map(&mut self, id: NodeId, value: Persistent<Value<'static>>) {
         self.named_node_maps.insert(id, value);
+    }
+
+    pub(crate) fn style_declaration(&self, id: NodeId) -> Option<Persistent<Value<'static>>> {
+        self.style_declarations.get(&id).cloned()
+    }
+
+    pub(crate) fn intern_style_declaration(
+        &mut self,
+        id: NodeId,
+        value: Persistent<Value<'static>>,
+    ) {
+        self.style_declarations.insert(id, value);
+    }
+
+    pub(crate) fn dataset(&self, id: NodeId) -> Option<Persistent<Value<'static>>> {
+        self.datasets.get(&id).cloned()
+    }
+
+    pub(crate) fn intern_dataset(&mut self, id: NodeId, value: Persistent<Value<'static>>) {
+        self.datasets.insert(id, value);
     }
 
     pub(crate) fn intern_brand(

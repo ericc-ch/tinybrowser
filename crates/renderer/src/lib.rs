@@ -97,6 +97,10 @@ impl ActiveParser {
         self.parser.input_buffer.push_front(StrTendril::from(html));
     }
 
+    pub(crate) fn append_html(&self, html: String) {
+        self.parser.input_buffer.push_back(StrTendril::from(html));
+    }
+
     pub(crate) fn finish(self) -> Parsed {
         self.parser.finish()
     }
@@ -305,49 +309,37 @@ impl Sink {
     /// home here. The append path (`before == None`) checks the last child;
     /// the insert path checks `before`'s previous sibling.
     fn insert_text(&self, parent: Handle, before: Option<Handle>, text: &str) {
-        let merged = self.neighbor_before(parent, before).and_then(|handle| {
-            match self.dom.borrow().get(handle).map(|node| node.kind()) {
-                Some(NodeKind::Text { data }) => {
-                    let mut merged = data.clone();
-                    merged.push_str(text);
-                    Some((handle, merged))
-                }
-                _ => None,
-            }
-        });
-        let Some((handle, merged)) = merged else {
-            let fresh = self.dom.borrow_mut().create_text(text);
-            let placed = match before {
-                None => self.dom.borrow_mut().append(parent, fresh),
-                Some(sibling) => self.dom.borrow_mut().insert_before(sibling, fresh),
-            };
-            placed.expect("builder places text beside a live parented anchor");
-            return;
-        };
-        self.dom
-            .borrow_mut()
-            .set_text(handle, merged)
-            .expect("live text node stays live within one sink call");
-    }
-
-    /// The node positioned to absorb new character data: `before`'s previous
-    /// sibling, or the current last child on the append path.
-    fn neighbor_before(&self, parent: Handle, before: Option<Handle>) -> Option<Handle> {
-        let dom = self.dom.borrow();
-        let position = match before {
-            None => {
-                return dom
-                    .children(parent)
-                    .and_then(|mut kids| kids.next_back().copied());
-            }
+        let mut dom = self.dom.borrow_mut();
+        let neighbor = match before {
+            None => dom
+                .children(parent)
+                .and_then(|mut kids| kids.next_back().copied()),
             Some(sibling) => dom
                 .children(parent)
                 .and_then(|mut kids| kids.position(|&kid| kid == sibling))
-                .expect("parented sibling sits inside its parent's child list"),
+                .and_then(|position| {
+                    dom.children(parent)
+                        .and_then(|mut kids| kids.nth(position.checked_sub(1)?))
+                        .copied()
+                }),
         };
-        dom.children(parent)
-            .and_then(|mut kids| kids.nth(position.checked_sub(1)?))
-            .copied()
+        if let Some(handle) = neighbor
+            && let Some(NodeKind::Text { data }) = dom.get(handle).map(|node| node.kind())
+        {
+            let mut merged = data.clone();
+            merged.push_str(text);
+            let _ = dom.set_text(handle, merged);
+            return;
+        }
+        let fresh = dom.create_text(text);
+        let placed = match before {
+            None => dom.append(parent, fresh),
+            Some(sibling) => dom.insert_before(sibling, fresh),
+        };
+        // A parser-blocking script may have moved or removed the insertion
+        // point since html5ever last yielded. The HTML tree builder ignores
+        // that insertion rather than taking down the renderer.
+        let _ = placed;
     }
 }
 /// Owned element-name view satisfying the sink's GAT. `Ref::deref` loans are
@@ -445,10 +437,7 @@ impl TreeSink for Sink {
     fn append(&self, parent: &Self::Handle, child: NodeOrText<Self::Handle>) {
         match child {
             NodeOrText::AppendNode(node) => {
-                self.dom
-                    .borrow_mut()
-                    .append(*parent, node)
-                    .expect("builder appends a parentless live node");
+                let _ = self.dom.borrow_mut().append(*parent, node);
             }
             NodeOrText::AppendText(ref text) => self.insert_text(*parent, None, text),
         }
@@ -479,10 +468,7 @@ impl TreeSink for Sink {
             public_id.to_string(),
             system_id.to_string(),
         );
-        self.dom
-            .borrow_mut()
-            .append(doc, doctype)
-            .expect("document accepts its own doctype");
+        let _ = self.dom.borrow_mut().append(doc, doctype);
     }
 
     fn get_template_contents(&self, target: &Self::Handle) -> Self::Handle {
@@ -518,20 +504,15 @@ impl TreeSink for Sink {
     fn append_before_sibling(&self, sibling: &Self::Handle, new_node: NodeOrText<Self::Handle>) {
         match new_node {
             NodeOrText::AppendNode(node) => {
-                self.dom
-                    .borrow_mut()
-                    .insert_before(*sibling, node)
-                    .expect("builder inserts beside a live parented sibling");
+                let _ = self.dom.borrow_mut().insert_before(*sibling, node);
             }
             NodeOrText::AppendText(ref text) => {
                 // Merge into the previous sibling when that is text; the
                 // builder promises `sibling` itself is not a text node.
-                let parent = self
-                    .dom
-                    .borrow()
-                    .parent(*sibling)
-                    .expect("sibling has a parent per builder promise");
-                self.insert_text(parent, Some(*sibling), text);
+                let parent = { self.dom.borrow().parent(*sibling) };
+                if let Some(parent) = parent {
+                    self.insert_text(parent, Some(*sibling), text);
+                }
             }
         }
     }
@@ -544,24 +525,18 @@ impl TreeSink for Sink {
                 value: attr.value.to_string(),
             })
             .collect();
-        self.dom
+        let _ = self
+            .dom
             .borrow_mut()
-            .add_attrs_if_missing(*target, converted)
-            .expect("builder adds attributes to a live element");
+            .add_attrs_if_missing(*target, converted);
     }
 
     fn remove_from_parent(&self, target: &Self::Handle) {
-        self.dom
-            .borrow_mut()
-            .detach(*target)
-            .expect("builder detaches non-root elements only");
+        let _ = self.dom.borrow_mut().detach(*target);
     }
 
     fn reparent_children(&self, node: &Self::Handle, new_parent: &Self::Handle) {
-        self.dom
-            .borrow_mut()
-            .reparent_children(*node, *new_parent)
-            .expect("builder reparents between live, cycle-free nodes");
+        let _ = self.dom.borrow_mut().reparent_children(*node, *new_parent);
     }
 
     /// [Maybe clone an option into selectedcontent](https://html.spec.whatwg.org/multipage/form-elements.html#maybe-clone-an-option-into-selectedcontent).

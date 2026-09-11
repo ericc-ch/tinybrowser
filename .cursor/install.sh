@@ -24,7 +24,7 @@ for rc in "$HOME/.bashrc" "$HOME/.profile"; do
   grep -qF 'nix-profile/etc/profile.d/nix.sh' "$rc" || printf '%s\n' "$SRC_LINE" >>"$rc"
 done
 
-# Vendored html5lib tree-construction suite; browser tests assert it exists.
+# Vendored WPT suite, including the html5lib parser corpus and wrappers.
 git submodule update --init --recursive
 
 # Personal agent skills from the public nixos-config repo. The repo is

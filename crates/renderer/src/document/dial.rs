@@ -35,9 +35,10 @@ pub(in crate::document) fn complete(
             id: *id,
             epoch: *epoch,
         },
-        QueuedDial::ClassicScript { epoch, .. } => CompletedDial::ClassicScript {
+        QueuedDial::ClassicScript { element, epoch, .. } => CompletedDial::ClassicScript {
             status: outcome.status,
             body: outcome.body,
+            element: *element,
             epoch: *epoch,
         },
     })

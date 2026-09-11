@@ -219,6 +219,14 @@ per-page `spawn_blocking` choice was superseded on 2026-09-10 by one browser-own
 bounded blocking network executor. Add Tokio `net` only if a later milestone needs
 async sockets on the page runtime.
 
+## Milestone: html5lib WPT browser path (2026-09-11)
+
+After the official WPT URL, `document.write`, incremental-write, and fragment
+wrappers could all complete, `cargo build --release` produced a stripped
+x86_64 `tinybrowser` of **5,273,088 bytes (5.03 MiB)**. This milestone added no
+dependency; its DOM/JS binding and iframe-document support remains comfortably
+under the 10 MB target.
+
 ## Milestone: tab thread in `browser` (2026-08-27)
 
 At this historical checkpoint, `browser` depended on Tokio 1.53

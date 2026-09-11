@@ -11,7 +11,7 @@ use crate::protocol::TabEvent;
 
 impl Document {
     pub(crate) fn drive_for(&mut self, budget: Duration) {
-        let _completed = self.run_until_timeout(budget, |_| false);
+        let _completed = self.run_until_timeout(budget, |document| document.has_engine_requests());
     }
 
     pub(crate) fn has_background_work(&self) -> bool {
@@ -120,6 +120,10 @@ impl Document {
     /// heap belong to the page engine, not the frame, so they are not touched.
     pub(crate) fn shutdown(&mut self) {
         self.stop.request();
+        self.release();
+    }
+
+    pub(crate) fn release(&mut self) {
         self.queued_dials.clear();
         self.in_flight_dials = 0;
         self.world.borrow_mut().forget_owned_documents();

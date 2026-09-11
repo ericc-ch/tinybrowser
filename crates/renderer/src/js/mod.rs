@@ -7,7 +7,7 @@
 mod bindings;
 mod world;
 
-pub(crate) use world::RealmRegistry;
+pub(crate) use world::{DocumentStreamCommand, FrameNavigation, RealmRegistry};
 
 use std::cell::{Cell, OnceCell, RefCell};
 use std::fmt;
@@ -27,6 +27,330 @@ use crate::document::Stop;
 const MAX_RUNTIME_MEMORY: usize = 32 * 1024 * 1024;
 const MAX_RUNTIME_STACK: usize = 512 * 1024;
 const DEFAULT_SCRIPT_BUDGET: Duration = Duration::from_secs(5);
+
+const INSTALL_WEB_APIS_JS: &str = r"
+globalThis.__tb_timeouts = [];
+globalThis.__tb_fetchCbs = Object.create(null);
+globalThis.__tb_fetchSeq = 0;
+['__scheduleTimeout','__cancelTimeout','__queueFetch','__cookieGet','__cookieSet','__tbCreateObjectURL','__tbRevokeObjectURL','__tbResolveUrl','__tb_timeouts','__tb_fetchCbs'].forEach(function(k) {
+  Object.defineProperty(globalThis, k, { writable: false, configurable: false, enumerable: false });
+});
+globalThis.setTimeout = function(fn, ms) {
+  var id = globalThis.__tb_timeouts.length;
+  globalThis.__tb_timeouts.push(fn);
+  globalThis.__scheduleTimeout(id, Number(ms));
+  return id;
+};
+globalThis.clearTimeout = function(id) {
+  globalThis.__tb_timeouts[id] = function() {};
+  globalThis.__cancelTimeout(Number(id));
+};
+if (!globalThis.document) {
+  globalThis.document = {};
+}
+Object.defineProperty(document, 'cookie', {
+  get() { return globalThis.__cookieGet(); },
+  set(v) { globalThis.__cookieSet(String(v)); }
+});
+globalThis.fetch = function(url) {
+  return new Promise(function(resolve, reject) {
+    var id = ++globalThis.__tb_fetchSeq;
+    globalThis.__tb_fetchCbs[id] = function(ok, status, body) {
+      delete globalThis.__tb_fetchCbs[id];
+      if (ok) resolve({
+        status: status,
+        ok: status >= 200 && status <= 299,
+        text: function() { return Promise.resolve(String(body)); }
+      });
+      else reject(new Error('fetch failed'));
+    };
+    globalThis.__queueFetch(String(url), id);
+  });
+};
+// https://w3c.github.io/FileAPI/#blob
+const __tbBlobData = new WeakMap();
+const __tbUtf8Length = value => {
+  let bytes = 0;
+  for (const character of value) {
+    const code = character.codePointAt(0);
+    bytes += code <= 0x7f ? 1 : code <= 0x7ff ? 2 : code <= 0xffff ? 3 : 4;
+  }
+  return bytes;
+};
+globalThis.Blob = class Blob {
+  constructor(blobParts, options) {
+    const parts = blobParts === undefined ? [] : blobParts;
+    const contents = Array.from(parts, part =>
+      part instanceof Blob ? __tbBlobData.get(part).contents : String(part)
+    ).join('');
+    let type = options && options.type !== undefined ? String(options.type) : '';
+    if ([...type].some(character => character < ' ' || character > '~')) type = '';
+    __tbBlobData.set(this, { contents, type: type.toLowerCase() });
+  }
+  get size() { return __tbUtf8Length(__tbBlobData.get(this).contents); }
+  get type() { return __tbBlobData.get(this).type; }
+  text() { return Promise.resolve(__tbBlobData.get(this).contents); }
+  slice(start, end, contentType) {
+    const contents = __tbBlobData.get(this).contents;
+    const size = contents.length;
+    start = start === undefined ? 0 : Number(start);
+    end = end === undefined ? size : Number(end);
+    const relativeStart = start < 0 ? Math.max(size + start, 0) : Math.min(start, size);
+    const relativeEnd = end < 0 ? Math.max(size + end, 0) : Math.min(end, size);
+    return new Blob([contents.slice(relativeStart, Math.max(relativeStart, relativeEnd))],
+      { type: contentType === undefined ? '' : contentType });
+  }
+};
+// https://w3c.github.io/FileAPI/#dfn-createObjectURL
+globalThis.URL = class URL {
+  constructor(input, base) {
+    const href = globalThis.__tbResolveUrl(
+      String(input),
+      base === undefined ? undefined : String(base)
+    );
+    if (href === null) throw new TypeError('Invalid URL');
+    this.href = href;
+    this._searchParams = new URLSearchParams(this.search);
+    this._searchParams._sync = value => {
+      const hash = this.hash;
+      const base = this.href.split(/[?#]/, 1)[0];
+      this.href = base + (value ? '?' + value : '') + hash;
+    };
+  }
+  toString() { return this.href; }
+  toJSON() { return this.href; }
+  get search() {
+    const match = this.href.match(/\?[^#]*/);
+    return match ? match[0] : '';
+  }
+  get hash() {
+    const index = this.href.indexOf('#');
+    return index < 0 ? '' : this.href.slice(index);
+  }
+  get origin() {
+    const match = this.href.match(/^([a-z][a-z0-9+.-]*:\/\/[^/]+)/i);
+    if (!match) return 'null';
+    const prefix = match[1];
+    const authority = prefix.slice(prefix.indexOf('//') + 2);
+    return prefix.slice(0, prefix.indexOf('//') + 2) + authority.slice(authority.lastIndexOf('@') + 1);
+  }
+  get protocol() { return this.href.slice(0, this.href.indexOf(':') + 1); }
+  get searchParams() { return this._searchParams; }
+};
+globalThis.URL.createObjectURL = function(blob) {
+  if (!(blob instanceof Blob)) throw new TypeError('value is not a Blob');
+  const url = globalThis.__tbCreateObjectURL(__tbBlobData.get(blob).contents);
+  if (url == null) throw new RangeError('object URL budget exceeded');
+  return url;
+};
+// https://w3c.github.io/FileAPI/#dfn-revokeObjectURL
+globalThis.URL.revokeObjectURL = function(url) {
+  globalThis.__tbRevokeObjectURL(String(url));
+};
+// https://url.spec.whatwg.org/#interface-urlsearchparams
+globalThis.URLSearchParams = class URLSearchParams {
+  constructor(init) {
+    this._pairs = [];
+    this._sync = null;
+    if (init instanceof URLSearchParams) {
+      this._pairs = init._pairs.map(pair => pair.slice());
+      return;
+    }
+    if (init !== null && typeof init === 'object') {
+      if (typeof init[Symbol.iterator] === 'function') {
+        for (const pair of init) {
+          const values = Array.from(pair);
+          if (values.length !== 2) throw new TypeError('parameter pair must contain two values');
+          this._pairs.push([String(values[0]), String(values[1])]);
+        }
+      } else {
+        for (const name of Object.keys(init)) this._pairs.push([name, String(init[name])]);
+      }
+      return;
+    }
+    var input = String(init === undefined ? '' : init);
+    if (input.charAt(0) === '?') input = input.slice(1);
+    if (!input) return;
+    const decode = value => {
+      value = value.replace(/\+/g, ' ');
+      try { return decodeURIComponent(value); }
+      catch (_) { return value.replace(/%([0-9a-f]{2})/gi, (_m, hex) => String.fromCharCode(parseInt(hex, 16))); }
+    };
+    for (const item of input.split('&')) {
+      const separator = item.indexOf('=');
+      const name = separator < 0 ? item : item.slice(0, separator);
+      const value = separator < 0 ? '' : item.slice(separator + 1);
+      this._pairs.push([
+        decode(name),
+        decode(value)
+      ]);
+    }
+  }
+  get(name) {
+    name = String(name);
+    for (const pair of this._pairs) {
+      if (pair[0] === name) return pair[1];
+    }
+    return null;
+  }
+  getAll(name) {
+    name = String(name);
+    return this._pairs.filter(pair => pair[0] === name).map(pair => pair[1]);
+  }
+  has(name, value) {
+    name = String(name);
+    if (arguments.length < 2) return this._pairs.some(pair => pair[0] === name);
+    value = String(value);
+    return this._pairs.some(pair => pair[0] === name && pair[1] === value);
+  }
+  append(name, value) { this._pairs.push([String(name), String(value)]); if (this._sync) this._sync(this.toString()); }
+  set(name, value) {
+    name = String(name);
+    value = String(value);
+    const index = this._pairs.findIndex(pair => pair[0] === name);
+    if (index < 0) {
+      this._pairs.push([name, value]);
+      if (this._sync) this._sync(this.toString());
+      return;
+    }
+    this._pairs[index][1] = value;
+    this._pairs = this._pairs.filter((pair, current) => pair[0] !== name || current === index);
+    if (this._sync) this._sync(this.toString());
+  }
+  delete(name, value) {
+    name = String(name);
+    if (arguments.length < 2) {
+      this._pairs = this._pairs.filter(pair => pair[0] !== name);
+    } else {
+      value = String(value);
+      this._pairs = this._pairs.filter(pair => pair[0] !== name || pair[1] !== value);
+    }
+    if (this._sync) this._sync(this.toString());
+  }
+  sort() {
+    this._pairs = this._pairs.map((pair, index) => ({ pair, index }))
+      .sort((a, b) => a.pair[0] < b.pair[0] ? -1 : a.pair[0] > b.pair[0] ? 1 : a.index - b.index)
+      .map(entry => entry.pair);
+    if (this._sync) this._sync(this.toString());
+  }
+  entries() { return this._pairs[Symbol.iterator](); }
+  keys() { return this._pairs.map(pair => pair[0])[Symbol.iterator](); }
+  values() { return this._pairs.map(pair => pair[1])[Symbol.iterator](); }
+  forEach(callback, thisArg) {
+    for (const pair of this._pairs) callback.call(thisArg, pair[1], pair[0], this);
+  }
+  toString() {
+    const encode = value => encodeURIComponent(value)
+      .replace(/%20/g, '+')
+      .replace(/[!'()~]/g, character =>
+        '%' + character.charCodeAt(0).toString(16).toUpperCase());
+    return this._pairs.map(pair => encode(pair[0]) + '=' + encode(pair[1])).join('&');
+  }
+  [Symbol.iterator]() { return this.entries(); }
+};
+
+globalThis.__tbMakeDataset = element => new Proxy(Object.create(null), {
+  get(_target, property) {
+    if (property === Symbol.toStringTag) return 'DOMStringMap';
+    if (typeof property !== 'string') return undefined;
+    const name = 'data-' + property.replace(/[A-Z]/g, letter => '-' + letter.toLowerCase());
+    const value = element.getAttribute(name);
+    return value === null ? undefined : value;
+  },
+  set(_target, property, value) {
+    property = String(property);
+    if (/-[a-z]/.test(property)) throw new DOMException('invalid dataset property', 'SyntaxError');
+    const name = 'data-' + property.replace(/[A-Z]/g, letter => '-' + letter.toLowerCase());
+    element.setAttribute(name, String(value));
+    return true;
+  },
+  deleteProperty(_target, property) {
+    property = String(property);
+    const name = 'data-' + property.replace(/[A-Z]/g, letter => '-' + letter.toLowerCase());
+    element.removeAttribute(name);
+    return true;
+  },
+  ownKeys() {
+    return element.getAttributeNames().filter(name =>
+      name.startsWith('data-') && !/[A-Z]/.test(name.slice(5))
+    ).map(name => name.slice(5).replace(/-([a-z])/g, (_match, letter) => letter.toUpperCase()));
+  },
+  getOwnPropertyDescriptor(_target, property) {
+    const value = this.get(_target, property);
+    if (value === undefined) return undefined;
+    return { configurable: true, enumerable: true, writable: true, value };
+  }
+});
+
+globalThis.__tbMakeStyle = element => {
+  const splitDeclarations = value => {
+    const parts = []; let start = 0; let quote = '';
+    for (let i = 0; i < value.length; i++) {
+      const character = value[i];
+      if (quote) { if (character === quote && value[i - 1] !== '\\') quote = ''; }
+      else if (character === String.fromCharCode(34) || character === String.fromCharCode(39)) quote = character;
+      else if (character === ';') { parts.push(value.slice(start, i)); start = i + 1; }
+    }
+    parts.push(value.slice(start));
+    return parts;
+  };
+  const read = () => {
+    const declarations = [];
+    for (const part of splitDeclarations(element.getAttribute('style') || '')) {
+      const separator = part.indexOf(':');
+      if (separator < 0) continue;
+      const name = part.slice(0, separator).trim().toLowerCase();
+      if (name) declarations.push([name, part.slice(separator + 1).trim()]);
+    }
+    return declarations;
+  };
+  const write = declarations => {
+    const value = declarations.map(pair => pair[0] + ': ' + pair[1] + ';').join(' ');
+    if (value) element.setAttribute('style', value);
+    else element.removeAttribute('style');
+  };
+  const propertyName = property =>
+    String(property).replace(/[A-Z]/g, letter => '-' + letter.toLowerCase());
+  const target = {
+    get cssText() { return element.getAttribute('style') || ''; },
+    set cssText(value) { element.setAttribute('style', String(value)); },
+    get length() { return read().length; },
+    item(index) {
+      const pair = read()[Number(index)];
+      return pair ? pair[0] : '';
+    },
+    getPropertyValue(name) {
+      const pair = read().find(item => item[0] === String(name).toLowerCase());
+      return pair ? pair[1] : '';
+    },
+    setProperty(name, value) {
+      name = String(name).toLowerCase();
+      value = String(value);
+      const declarations = read().filter(pair => pair[0] !== name);
+      if (value) declarations.push([name, value]);
+      write(declarations);
+    },
+    removeProperty(name) {
+      name = String(name).toLowerCase();
+      const old = this.getPropertyValue(name);
+      write(read().filter(pair => pair[0] !== name));
+      return old;
+    }
+  };
+  return new Proxy(target, {
+    get(target, property, receiver) {
+      if (Reflect.has(target, property)) return Reflect.get(target, property, receiver);
+      if (typeof property !== 'string') return undefined;
+      return target.getPropertyValue(propertyName(property));
+    },
+    set(target, property, value, receiver) {
+      if (Reflect.has(target, property)) return Reflect.set(target, property, value, receiver);
+      target.setProperty(propertyName(property), value);
+      return true;
+    }
+  });
+};
+";
 
 /// A value produced by [`crate::Document::execute_script`].
 #[derive(Clone, Debug, PartialEq)]
@@ -241,6 +565,16 @@ impl JsRealm {
         })
     }
 
+    pub(crate) fn fire_node_load(&self, id: dom::NodeId) -> Result<(), JsError> {
+        self.with_budget(None, || {
+            let fired: Result<(), JsError> = self
+                .context
+                .with(|ctx| bindings::fire_node_load(&ctx, id).map_err(JsError::engine));
+            let jobs = self.run_jobs();
+            fired.and(jobs)
+        })
+    }
+
     /// Microtask checkpoint for parser-driven mutations: schedules the
     /// delivery microtask when records are pending and runs the job queue.
     ///
@@ -299,6 +633,9 @@ impl JsRealm {
         let cookie_get = world.clone();
         let cookie_set = world.clone();
         let cancel_world = world.clone();
+        let object_url_create = world.clone();
+        let object_url_revoke = world.clone();
+        let url_resolve = world.clone();
         self.context.with(|ctx| {
             bindings::install(&ctx, &world).map_err(JsError::engine)?;
 
@@ -352,48 +689,44 @@ impl JsRealm {
                 )
                 .map_err(JsError::engine)?;
 
-            ctx.eval::<(), _>(
-                r"
-globalThis.__tb_timeouts = [];
-globalThis.__tb_fetchCbs = Object.create(null);
-globalThis.__tb_fetchSeq = 0;
-['__scheduleTimeout','__cancelTimeout','__queueFetch','__cookieGet','__cookieSet','__tb_timeouts','__tb_fetchCbs'].forEach(function(k) {
-  Object.defineProperty(globalThis, k, { writable: false, configurable: false, enumerable: false });
-});
-globalThis.setTimeout = function(fn, ms) {
-  var id = globalThis.__tb_timeouts.length;
-  globalThis.__tb_timeouts.push(fn);
-  globalThis.__scheduleTimeout(id, Number(ms));
-  return id;
-};
-globalThis.clearTimeout = function(id) {
-  globalThis.__tb_timeouts[id] = function() {};
-  globalThis.__cancelTimeout(Number(id));
-};
-if (!globalThis.document) {
-  globalThis.document = {};
-}
-Object.defineProperty(document, 'cookie', {
-  get() { return globalThis.__cookieGet(); },
-  set(v) { globalThis.__cookieSet(String(v)); }
-});
-globalThis.fetch = function(url) {
-  return new Promise(function(resolve, reject) {
-    var id = ++globalThis.__tb_fetchSeq;
-    globalThis.__tb_fetchCbs[id] = function(ok, status, body) {
-      delete globalThis.__tb_fetchCbs[id];
-      if (ok) resolve({
-        status: status,
-        text: function() { return Promise.resolve(String(body)); }
-      });
-      else reject(new Error('fetch failed'));
-    };
-    globalThis.__queueFetch(String(url), id);
-  });
-};
-",
-            )
-            .map_err(JsError::engine)?;
+            ctx.globals()
+                .set(
+                    "__tbCreateObjectURL",
+                    Func::from(move |contents: String| {
+                        object_url_create.borrow_mut().create_object_url(contents)
+                    }),
+                )
+                .map_err(JsError::engine)?;
+
+            ctx.globals()
+                .set(
+                    "__tbRevokeObjectURL",
+                    Func::from(move |url: String| {
+                        object_url_revoke.borrow_mut().revoke_object_url(&url);
+                    }),
+                )
+                .map_err(JsError::engine)?;
+
+            ctx.globals()
+                .set(
+                    "__tbResolveUrl",
+                    Func::from(move |input: String, base: Option<String>| {
+                        let fallback = url_resolve.borrow().document_url.clone();
+                        let resolved = match base {
+                            Some(base) => url::Url::parse(&base)
+                                .ok()
+                                .and_then(|base| base.join(&input).ok()),
+                            None => url::Url::parse(&input)
+                                .ok()
+                                .or_else(|| fallback.join(&input).ok()),
+                        };
+                        resolved.map(|url| url.to_string())
+                    }),
+                )
+                .map_err(JsError::engine)?;
+
+            ctx.eval::<(), _>(INSTALL_WEB_APIS_JS)
+                .map_err(JsError::engine)?;
             Ok(())
         })
     }

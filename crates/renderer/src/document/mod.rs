@@ -18,7 +18,7 @@ use tokio::time::Instant;
 use url::Url;
 
 use crate::documents::DocumentStore;
-use crate::js::{RealmRegistry, SharedJsRuntime, World};
+use crate::js::{DocumentStreamCommand, FrameNavigation, RealmRegistry, SharedJsRuntime, World};
 use crate::protocol::{BrowserServices, Mount, ScriptFailure, TabError, TabEvent};
 use crate::{ActiveParser, Parsed};
 
@@ -47,6 +47,7 @@ pub(crate) enum QueuedDial {
     ClassicScript {
         url: Url,
         initiator: Url,
+        element: dom::NodeId,
         epoch: u64,
     },
 }
@@ -61,6 +62,7 @@ pub(crate) enum CompletedDial {
     ClassicScript {
         status: u16,
         body: Vec<u8>,
+        element: dom::NodeId,
         epoch: u64,
     },
 }
@@ -121,6 +123,7 @@ pub struct Document {
     js_timer_slots: HashMap<u32, i32>,
     js_epoch: u64,
     active_parser: Option<ActiveParser>,
+    parser_eof: bool,
     classic_fetch_in_flight: bool,
     stop: Arc<Stop>,
     next_remote: u64,
@@ -129,7 +132,7 @@ pub struct Document {
 
 impl Drop for Document {
     fn drop(&mut self) {
-        self.shutdown();
+        self.release();
     }
 }
 
@@ -171,7 +174,7 @@ impl Document {
                 Arc::clone(&services),
                 document_url.clone(),
                 Rc::clone(&documents),
-                Rc::clone(registry),
+                registry,
             ))),
             services,
             documents,
@@ -192,6 +195,7 @@ impl Document {
             js_timer_slots: HashMap::new(),
             js_epoch: 0,
             active_parser: None,
+            parser_eof: true,
             classic_fetch_in_flight: false,
             stop,
             next_remote: 0,
@@ -205,6 +209,38 @@ impl Document {
         let documents = Rc::clone(&self.documents);
         let store = documents.borrow();
         store.get(id).map(reader)
+    }
+
+    pub(crate) fn document_root(&self) -> Option<dom::NodeId> {
+        self.world
+            .borrow()
+            .with_main_document(|parsed| parsed.dom.document())
+    }
+
+    pub(crate) fn take_lifecycle(&mut self) -> Vec<dom::Lifecycle> {
+        self.world
+            .borrow()
+            .main_document_mut()
+            .map_or_else(Vec::new, |mut parsed| parsed.dom.take_lifecycle())
+    }
+
+    pub(crate) fn take_frame_navigations(&mut self) -> Vec<FrameNavigation> {
+        self.world.borrow_mut().take_frame_navigations()
+    }
+
+    pub(crate) fn take_document_stream(&mut self) -> Vec<DocumentStreamCommand> {
+        self.world.borrow_mut().take_document_stream()
+    }
+
+    pub(crate) fn has_engine_requests(&self) -> bool {
+        self.world.borrow().has_engine_requests()
+    }
+
+    pub(crate) fn fire_node_load(&mut self, id: dom::NodeId) {
+        if let Some(js) = &self.js {
+            note_script(&mut self.events, js.fire_node_load(id).is_err());
+        }
+        self.adopt_js_work();
     }
 
     /// Document URL (cookie initiator and relative-URL base).
@@ -348,22 +384,57 @@ impl Document {
         self.js_timer_slots.clear();
         self.js = None;
         self.active_parser = None;
+        self.parser_eof = true;
         self.world.borrow_mut().parser_active = false;
-        self.world.borrow_mut().pending_html_writes.clear();
+        self.world.borrow_mut().current_script = None;
+        let mut world = self.world.borrow_mut();
+        let bytes = world
+            .pending_html_writes
+            .iter()
+            .map(String::len)
+            .sum::<usize>();
+        world.pending_html_writes.clear();
+        world.release_stream_bytes(bytes);
         self.classic_fetch_in_flight = false;
         self.remote_by_node.clear();
     }
 
     fn start_document(&mut self, html: &str) {
         self.world.borrow_mut().parser_active = true;
+        self.parser_eof = true;
         self.active_parser = Some(ActiveParser::new(html));
         self.advance_parser();
     }
 
-    fn eval_classic(&mut self, source: &str) {
+    pub(crate) fn apply_document_stream(&mut self, command: DocumentStreamCommand) {
+        match command {
+            DocumentStreamCommand::Open => {
+                self.reset_js_realm();
+                self.world.borrow_mut().parser_active = true;
+                self.parser_eof = false;
+                self.active_parser = Some(ActiveParser::new(""));
+            }
+            DocumentStreamCommand::Write(html) => {
+                if let Some(parser) = &self.active_parser {
+                    parser.append_html(html);
+                    self.advance_parser();
+                }
+            }
+            DocumentStreamCommand::Close => {
+                self.parser_eof = true;
+                self.advance_parser();
+            }
+        }
+    }
+
+    fn eval_classic(&mut self, source: &str, element: Option<dom::NodeId>) {
+        // https://html.spec.whatwg.org/multipage/webappapis.html#run-a-classic-script
+        let previous = self.world.borrow().current_script;
+        self.world.borrow_mut().current_script = element;
         if let Some(js) = &self.js {
             note_script(&mut self.events, js.eval(source).is_err());
         }
+        self.world.borrow_mut().current_script = previous;
         self.adopt_js_work();
     }
 
@@ -411,7 +482,7 @@ impl Document {
                     let script = crate::js::classic_script_at(&self.world.borrow(), id);
                     match script {
                         Some(crate::js::ClassicScript::Inline(source)) => {
-                            self.eval_classic(&source);
+                            self.eval_classic(&source, Some(id));
                             self.sync_parser_from_world();
                         }
                         Some(crate::js::ClassicScript::Src(src)) => {
@@ -421,6 +492,7 @@ impl Document {
                                 self.queued_dials.push(QueuedDial::ClassicScript {
                                     url,
                                     initiator,
+                                    element: id,
                                     epoch: self.js_epoch,
                                 });
                                 return;
@@ -431,6 +503,9 @@ impl Document {
                     }
                 }
                 crate::ParseProgress::Done => {
+                    if !self.parser_eof {
+                        return;
+                    }
                     let Some(parser) = self.active_parser.take() else {
                         return;
                     };
@@ -500,6 +575,7 @@ impl Document {
             CompletedDial::ClassicScript {
                 status,
                 body,
+                element,
                 epoch,
             } => {
                 self.events.push(TabEvent::Fetch { status });
@@ -507,7 +583,7 @@ impl Document {
                     self.classic_fetch_in_flight = false;
                     if (200..300).contains(&status) {
                         let source = String::from_utf8_lossy(&body);
-                        self.eval_classic(&source);
+                        self.eval_classic(&source, Some(element));
                     }
                     self.sync_parser_from_world();
                     self.advance_parser();
@@ -556,7 +632,10 @@ impl Document {
             return;
         };
         let mut world = self.world.borrow_mut();
-        let writes = std::mem::take(&mut world.pending_html_writes).concat();
+        let pending = std::mem::take(&mut world.pending_html_writes);
+        let bytes = pending.iter().map(String::len).sum::<usize>();
+        world.release_stream_bytes(bytes);
+        let writes = pending.concat();
         if let Some(parsed) = world.take_main_document() {
             parser.restore(parsed);
         }

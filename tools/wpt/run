@@ -33,13 +33,27 @@ if [[ ! -x "$VENV/bin/pip" ]]; then
 fi
 "$VENV/bin/pip" install -e "$ROOT/tools/wpt" >/dev/null
 args=("$@")
-if [[ ! " $* " =~ --test-types ]]; then
+has_option() {
+  local option="$1" arg
+  shift
+  for arg in "$@"; do
+    [[ "$arg" == "$option" || "$arg" == "$option="* ]] && return 0
+  done
+  return 1
+}
+if ! has_option --metadata "${args[@]}"; then
+  args=(--metadata "$ROOT/tools/wpt/metadata" "${args[@]}")
+fi
+if ! has_option --manifest "${args[@]}"; then
+  args=(--manifest "$WPT/MANIFEST.json" "${args[@]}")
+fi
+if ! has_option --test-types "${args[@]}"; then
   args=(--test-types=testharness "${args[@]}")
 fi
-if [[ ! " $* " =~ --pause-after-test ]] && [[ ! " $* " =~ --no-pause-after-test ]]; then
+if ! has_option --pause-after-test "${args[@]}" && ! has_option --no-pause-after-test "${args[@]}"; then
   args=(--no-pause-after-test "${args[@]}")
 fi
-if [[ ! " $* " =~ --no-restart-on-unexpected ]] && [[ ! " $* " =~ --restart-on-unexpected ]]; then
+if ! has_option --no-restart-on-unexpected "${args[@]}" && ! has_option --restart-on-unexpected "${args[@]}"; then
   args=(--no-restart-on-unexpected "${args[@]}")
 fi
 exec "$VENV/bin/python" "$ROOT/tools/wpt/launch.py" --binary "$BINARY" --ssl-type none tinybrowser "${args[@]}"
