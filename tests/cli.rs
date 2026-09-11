@@ -315,6 +315,60 @@ fn daemon_rejects_webdriver_and_resolve() {
 }
 
 #[test]
+fn cli_rejects_unknown_log_level() {
+    let fixture = Fixture::new("tinybrowser-log-level");
+    let output = cli_status(&fixture, &["--log-level=noisy", "list"]);
+    assert!(!output.status.success());
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(err.contains("unknown log level"), "{err}");
+}
+
+#[test]
+fn verbose_logs_debug_on_stderr_but_default_does_not() {
+    let fixture = Fixture::new("tinybrowser-verbose");
+    let plain = cli_status(&fixture, &["list"]);
+    let verbose = cli_status(&fixture, &["--verbose", "list"]);
+    let plain_err = String::from_utf8_lossy(&plain.stderr);
+    let verbose_err = String::from_utf8_lossy(&verbose.stderr);
+    assert!(!plain_err.contains("level=DEBUG"), "{plain_err}");
+    assert!(verbose_err.contains("level=DEBUG"), "{verbose_err}");
+    assert!(verbose_err.contains("target=cli"), "{verbose_err}");
+}
+
+#[test]
+fn log_level_reaches_the_daemon_file() {
+    let fixture = Fixture::new("tinybrowser-log-file");
+    let _ = cli(&fixture, &["--log-level=debug", "create"]);
+    let path = fixture.data.join("tinybrowser/logs/default.log");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Ok(text) = std::fs::read_to_string(&path)
+            && text.contains("process=daemon")
+            && text.contains("level=DEBUG")
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no daemon debug record at {}",
+            path.display()
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    let _ = cli(&fixture, &["close"]);
+}
+
+#[test]
+fn short_v_prints_the_version() {
+    let fixture = Fixture::new("tinybrowser-version");
+    let output = cli_status(&fixture, &["-v"]);
+    assert!(output.status.success());
+    let out = String::from_utf8_lossy(&output.stdout);
+    assert!(out.contains("tinybrowser"), "{out}");
+    assert!(out.contains("0.1.0"), "{out}");
+}
+
+#[test]
 fn cli_autostarts_daemon_and_select_navigate_close_last() {
     let fixture = Fixture::new("tinybrowser-cli");
     let created = cli(&fixture, &["create"]).trim().to_owned();

@@ -3,6 +3,7 @@ members = [
     "crates/browser",
     "crates/cdp",
     "crates/dom",
+    "crates/logging",
     "crates/net",
     "crates/renderer",
     "crates/webdriver",
@@ -16,6 +17,7 @@ edition = "2024"
 browser = { path = "crates/browser" }
 cdp = { path = "crates/cdp" }
 dom = { path = "crates/dom" }
+logging = { path = "crates/logging" }
 net = { path = "crates/net" }
 renderer = { path = "crates/renderer" }
 webdriver = { path = "crates/webdriver" }
@@ -33,6 +35,7 @@ browser = { workspace = true }
 cdp = { workspace = true }
 renderer = { workspace = true }
 webdriver = { workspace = true }
+logging = { workspace = true }
 clap = { version = "4.5", features = ["derive"] }
 serde_json = "1"
 

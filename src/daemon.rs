@@ -54,6 +54,13 @@ pub fn run(profile: &Profile, data_home: &Path) -> io::Result<()> {
             port: addr.port(),
         },
     )?;
+    logging::debug!(target: "daemon", "runtime dir {}", runtime.display());
+    logging::info!(
+        target: "daemon",
+        "serving profile {} on 127.0.0.1:{}",
+        profile.name().as_str(),
+        addr.port()
+    );
     let browser = Browser::open_in(data_home, profile)?;
     let result = cdp::serve(&listener, &browser.handle());
     let _ = fs::remove_file(&lock_path);
@@ -88,6 +95,7 @@ pub fn spawn_detached(profile: &Profile, data_home: &Path) -> io::Result<()> {
         .arg("--daemon")
         .arg(format!("--profile={}", profile.name().as_str()))
         .env("XDG_DATA_HOME", data_home)
+        .env("TINYBROWSER_LOG", logging::level().as_str())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
