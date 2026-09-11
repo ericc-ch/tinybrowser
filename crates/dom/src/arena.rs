@@ -56,6 +56,20 @@ pub enum Mutation {
     CharacterData { target: NodeId, old_value: String },
 }
 
+/// A connection transition of one element, for HTML lifecycle steps.
+///
+/// [HTML's post-connection and removing steps](https://html.spec.whatwg.org/multipage/iframe-embed-object.html#the-iframe-element)
+/// hang off exactly these transitions: an iframe creates its content
+/// navigable when it becomes connected and destroys it when disconnected.
+/// Recorded always, independent of `MutationObserver` recording.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Lifecycle {
+    /// An element became connected to a document.
+    Inserted(NodeId),
+    /// An element became disconnected from a document.
+    Removed(NodeId),
+}
+
 /// Why a mutation was refused.
 ///
 /// Stale handles and structural mistakes surface as values, never as panics,
@@ -160,6 +174,9 @@ pub struct Dom {
     mutations: Vec<Mutation>,
     record_mutations: bool,
     recording_suppressed: bool,
+    /// Connection transitions in order; never suppressed, because the
+    /// renderer's frame lifetime hangs off them, not off observers.
+    lifecycle: Vec<Lifecycle>,
     /// `Cell<()>` is `Send` + `!Sync`; `PhantomData` makes `Dom` inherit
     /// exactly that split. Deleting this field would silently re-derive
     /// `Sync`, which is the point: that deletion has to be a conscious act.
@@ -196,6 +213,7 @@ impl Dom {
             mutations: Vec::new(),
             record_mutations: false,
             recording_suppressed: false,
+            lifecycle: Vec::new(),
             _share_forbidden: PhantomData,
         }
     }
@@ -212,6 +230,76 @@ impl Dom {
     /// Drains the recorded mutations in order.
     pub fn take_mutations(&mut self) -> Vec<Mutation> {
         std::mem::take(&mut self.mutations)
+    }
+
+    /// Drains the recorded connection transitions in order.
+    pub fn take_lifecycle(&mut self) -> Vec<Lifecycle> {
+        std::mem::take(&mut self.lifecycle)
+    }
+
+    /// Records an element's transition from its previous connected state.
+    ///
+    /// Only `iframe` elements are tracked for now: they are the sole consumer
+    /// of connection transitions (content-navigable creation and destruction),
+    /// and filtering here keeps the parser's hot path free of per-element
+    /// bookkeeping. Custom elements will need an opt-in form of this hook.
+    fn record_transition(&mut self, id: NodeId, was_connected: bool) {
+        if !self.is_iframe_element(id) {
+            return;
+        }
+        let connected = self.is_connected(id);
+        if connected != was_connected {
+            self.lifecycle.push(if connected {
+                Lifecycle::Inserted(id)
+            } else {
+                Lifecycle::Removed(id)
+            });
+        }
+    }
+
+    /// Whether `id` is an HTML `iframe` element.
+    fn is_iframe_element(&self, id: NodeId) -> bool {
+        matches!(
+            self.get(id).map(|view| view.kind()),
+            Some(NodeKind::Element { name, .. })
+                if name.ns == html_namespace() && name.local.as_ref() == "iframe"
+        )
+    }
+
+    /// The iframe elements in `id`'s inclusive subtree with their
+    /// connectivity, for a post-connection/removing step pass.
+    fn connection_snapshot(&self, id: NodeId) -> Vec<(NodeId, bool)> {
+        let mut snapshot = Vec::new();
+        let mut stack = vec![id];
+        while let Some(current) = stack.pop() {
+            if self.is_iframe_element(current) {
+                snapshot.push((current, self.is_connected(current)));
+            }
+            if let Some(children) = self.children(current) {
+                stack.extend(children.copied());
+            }
+        }
+        snapshot
+    }
+
+    /// Records every transition in a snapshot taken before an operation.
+    fn record_snapshot(&mut self, snapshot: Vec<(NodeId, bool)>) {
+        for (id, was_connected) in snapshot {
+            self.record_transition(id, was_connected);
+        }
+    }
+
+    /// Whether `id`'s ancestor chain reaches the document root.
+    #[must_use]
+    pub fn is_connected(&self, id: NodeId) -> bool {
+        let mut cursor = Some(id);
+        while let Some(node) = cursor {
+            if node == self.document {
+                return true;
+            }
+            cursor = self.parent(node);
+        }
+        false
     }
 
     fn record(&mut self, mutation: Mutation) {
@@ -902,10 +990,12 @@ impl Dom {
         if id == self.document {
             return Err(DomError::HierarchyRequest);
         }
+        let tracked = self.connection_snapshot(id);
         self.unlink_from_current_parent(id);
         if let Some(node) = self.node_mut(id) {
             node.parent = None;
         }
+        self.record_snapshot(tracked);
         Ok(())
     }
 
@@ -978,21 +1068,32 @@ impl Dom {
         // Defect guards, not input errors: both handles were verified live
         // above, so a miss here means the parent-pointer/child-list duality
         // is broken. Panicking beats reporting a lying "stale node".
+        let from_connected = self.is_connected(from);
+        let to_connected = self.is_connected(to);
         let moved = self
             .children_mut(from)
             .map(std::mem::take)
             .expect("verified-live `from` has no child list");
+        let tracked: Vec<(NodeId, bool)> = if from_connected == to_connected {
+            Vec::new()
+        } else {
+            moved
+                .iter()
+                .flat_map(|&id| self.connection_snapshot(id))
+                .collect()
+        };
         let list = self
             .children_mut(to)
             .expect("verified-live `to` has no child list");
         for id in &moved {
             list.push(*id);
         }
-        for id in moved {
+        for &id in &moved {
             if let Some(node) = self.node_mut(id) {
                 node.parent = Some(to);
             }
         }
+        self.record_snapshot(tracked);
         Ok(())
     }
 
@@ -1220,10 +1321,19 @@ impl Dom {
         {
             return Err(DomError::HierarchyRequest);
         }
+        let parent_connected = self.is_connected(parent);
         let removed: Vec<NodeId> = self
             .children(parent)
             .map(|kids| kids.copied().collect())
             .unwrap_or_default();
+        let removed_snapshot: Vec<(NodeId, bool)> = if parent_connected {
+            removed
+                .iter()
+                .flat_map(|&id| self.connection_snapshot(id))
+                .collect()
+        } else {
+            Vec::new()
+        };
         let added = self.incoming_nodes(node);
         self.recording_suppressed = true;
         for &kid in &removed {
@@ -1238,6 +1348,7 @@ impl Dom {
             self.place_node(parent, node, None);
         }
         self.recording_suppressed = false;
+        self.record_snapshot(removed_snapshot);
         self.record(Mutation::ChildList {
             target: parent,
             added,
@@ -1586,6 +1697,7 @@ impl Dom {
     /// Places a non-fragment `node` under `parent` before `before` (or at
     /// the end when `before` is `None`).
     fn place_node(&mut self, parent: NodeId, node: NodeId, before: Option<NodeId>) {
+        let tracked = self.connection_snapshot(node);
         self.unlink_from_current_parent(node);
         let (previous, next) = {
             let list: Vec<NodeId> = self
@@ -1626,6 +1738,7 @@ impl Dom {
         if let Some(attached) = self.node_mut(node) {
             attached.parent = Some(parent);
         }
+        self.record_snapshot(tracked);
         self.record(Mutation::ChildList {
             target: parent,
             added: vec![node],
@@ -1639,6 +1752,13 @@ impl Dom {
     /// fragment empty and unparented
     /// (<https://dom.spec.whatwg.org/#concept-node-insert>).
     fn splice_fragment(&mut self, parent: NodeId, fragment: NodeId, before: Option<NodeId>) {
+        let tracked: Vec<(NodeId, bool)> = self
+            .children(fragment)
+            .map(|children| children.copied().collect::<Vec<_>>())
+            .unwrap_or_default()
+            .iter()
+            .flat_map(|&id| self.connection_snapshot(id))
+            .collect();
         self.unlink_from_current_parent(fragment);
         if let Some(node) = self.node_mut(fragment) {
             node.parent = None;
@@ -1693,6 +1813,7 @@ impl Dom {
                 node.parent = Some(parent);
             }
         }
+        self.record_snapshot(tracked);
         self.record(Mutation::ChildList {
             target: parent,
             added: moved,
