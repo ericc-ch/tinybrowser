@@ -122,6 +122,7 @@ impl Document {
         self.stop.request();
         self.queued_dials.clear();
         self.in_flight_dials = 0;
+        self.world.borrow_mut().forget_owned_documents();
     }
 
     fn stopped(&self) -> bool {

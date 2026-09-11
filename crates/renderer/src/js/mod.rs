@@ -7,6 +7,8 @@
 mod bindings;
 mod world;
 
+pub(crate) use world::RealmRegistry;
+
 use std::cell::{Cell, OnceCell, RefCell};
 use std::fmt;
 use std::rc::Rc;
@@ -384,7 +386,12 @@ globalThis.fetch = function(url) {
 impl Drop for JsRealm {
     fn drop(&mut self) {
         bindings::forget_world(&self.context);
-        self.world.borrow_mut().clear_listeners();
+        let world = self.world.clone();
+        let mut world = world.borrow_mut();
+        // Release this realm's cached wrappers and document associations
+        // before its QuickJS context goes away; sibling realms keep theirs.
+        world.forget_owned_documents();
+        world.clear_listeners();
     }
 }
 

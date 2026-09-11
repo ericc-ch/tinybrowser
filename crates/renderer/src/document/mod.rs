@@ -18,7 +18,7 @@ use tokio::time::Instant;
 use url::Url;
 
 use crate::documents::DocumentStore;
-use crate::js::{SharedJsRuntime, World};
+use crate::js::{RealmRegistry, SharedJsRuntime, World};
 use crate::protocol::{BrowserServices, Mount, ScriptFailure, TabError, TabEvent};
 use crate::{ActiveParser, Parsed};
 
@@ -144,22 +144,26 @@ impl Document {
     /// one-off documents.
     #[must_use]
     pub fn new(services: Arc<dyn BrowserServices>) -> Self {
+        let documents = Rc::new(RefCell::new(DocumentStore::default()));
+        let registry = Rc::new(RefCell::new(RealmRegistry::default()));
         Self::with_shared(
             services,
             SharedJsRuntime::default(),
             Waiter::new(),
-            Rc::new(RefCell::new(DocumentStore::default())),
+            documents,
+            &registry,
             Arc::new(Stop::new()),
         )
     }
 
-    /// A document sharing its renderer process's `QuickJS` heap, waiter, and
-    /// document store.
+    /// A document sharing its renderer process's `QuickJS` heap, waiter,
+    /// document store, and realm registry.
     pub(crate) fn with_shared(
         services: Arc<dyn BrowserServices>,
         js_runtime: SharedJsRuntime,
         waiter: Waiter,
         documents: Rc<RefCell<DocumentStore>>,
+        registry: &Rc<RefCell<RealmRegistry>>,
         stop: Arc<Stop>,
     ) -> Self {
         let document_url = Url::parse("about:blank").expect("about:blank is a valid URL");
@@ -169,6 +173,7 @@ impl Document {
                 Arc::clone(&services),
                 document_url.clone(),
                 Rc::clone(&documents),
+                Rc::clone(registry),
             ))),
             services,
             documents,
@@ -314,6 +319,12 @@ impl Document {
         self.start_document(input);
     }
 
+    /// Records `document` as this realm's so wrappers resolve its owner.
+    fn register_document(&self, document: u32) {
+        let registry = self.world.borrow().registry();
+        registry.borrow_mut().insert_document(document, &self.world);
+    }
+
     fn ensure_js(&mut self) -> Result<(), TabError> {
         if self.js.is_none() {
             self.js = Some(
@@ -369,14 +380,16 @@ impl Document {
                 crate::ParseProgress::Script(id) => {
                     let parsed = parser.take_state();
                     if self.js.is_none() {
-                        self.world.borrow_mut().replace_document(parsed);
+                        let document = self.world.borrow_mut().replace_document(parsed);
+                        self.register_document(document);
                         if self.ensure_js().is_err() {
                             self.events.push(TabEvent::ScriptFailed);
                             self.sync_parser_from_world();
                             continue;
                         }
                     } else {
-                        self.world.borrow_mut().set_document(parsed);
+                        let document = self.world.borrow_mut().set_document(parsed);
+                        self.register_document(document);
                     }
                     if let Some(mut parsed) = self.world.borrow().main_document_mut() {
                         parsed
@@ -414,13 +427,15 @@ impl Document {
                         .dom
                         .set_document_language(self.content_language.clone());
                     if self.js.is_none() {
-                        self.world.borrow_mut().replace_document(parsed);
+                        let document = self.world.borrow_mut().replace_document(parsed);
+                        self.register_document(document);
                         if self.ensure_js().is_err() {
                             self.events.push(TabEvent::ScriptFailed);
                             return;
                         }
                     } else {
-                        self.world.borrow_mut().set_document(parsed);
+                        let document = self.world.borrow_mut().set_document(parsed);
+                        self.register_document(document);
                     }
                     self.world.borrow_mut().parser_active = false;
                     self.fire_document_load();

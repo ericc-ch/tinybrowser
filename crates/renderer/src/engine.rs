@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use crate::document::{Document, Stop, Waiter};
 use crate::documents::DocumentStore;
-use crate::js::SharedJsRuntime;
+use crate::js::{RealmRegistry, SharedJsRuntime};
 use crate::protocol::{BrowserServices, FrameId, Mount, TabError, TabEvent};
 use crate::{Parsed, RemoteValue, ScriptValue};
 
@@ -31,6 +31,8 @@ pub struct Engine {
     waiter: Waiter,
     /// Every frame's trees, shared across their realms.
     documents: Rc<RefCell<DocumentStore>>,
+    /// Document ownership and the shared wrapper cache.
+    registry: Rc<RefCell<RealmRegistry>>,
     services: Arc<dyn BrowserServices>,
     stop: Arc<Stop>,
     frames: BTreeMap<FrameId, Document>,
@@ -50,11 +52,13 @@ impl Engine {
         let js_runtime = SharedJsRuntime::default();
         let waiter = Waiter::new();
         let documents = Rc::new(RefCell::new(DocumentStore::default()));
+        let registry = Rc::new(RefCell::new(RealmRegistry::default()));
         let main = Document::with_shared(
             Arc::clone(&services),
             js_runtime.clone(),
             waiter.clone(),
             Rc::clone(&documents),
+            &registry,
             Arc::clone(&stop),
         );
         let mut frames = BTreeMap::new();
@@ -63,6 +67,7 @@ impl Engine {
             js_runtime,
             waiter,
             documents,
+            registry,
             services,
             stop,
             frames,
@@ -79,6 +84,7 @@ impl Engine {
             self.js_runtime.clone(),
             self.waiter.clone(),
             Rc::clone(&self.documents),
+            &self.registry,
             Arc::clone(&self.stop),
         );
         self.frames.insert(frame, document);
@@ -296,5 +302,15 @@ impl Engine {
         for document in self.frames.values_mut() {
             document.shutdown();
         }
+    }
+}
+
+impl Drop for Engine {
+    fn drop(&mut self) {
+        // Drop realms before the wrapper cache so cached JS values never
+        // outlive the QuickJS heap. The engine's own runtime handle is the
+        // last one and drops with the struct.
+        self.frames.clear();
+        self.registry.borrow_mut().clear();
     }
 }

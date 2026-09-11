@@ -290,7 +290,15 @@ impl JsImplementation {
                 .append(document, element)
                 .map_err(|err| throw_dom_error(&ctx, err))?;
         }
-        let root = world(&ctx)?.borrow_mut().add_document(parsed);
+        let world_rc = world(&ctx)?;
+
+        let root = world_rc.borrow_mut().add_document(parsed);
+
+        let registry = world_rc.borrow().registry();
+
+        registry
+            .borrow_mut()
+            .insert_document(root.document_id(), &world_rc);
         wrap_node(&ctx, root)
     }
 
@@ -348,7 +356,15 @@ impl JsImplementation {
             .dom
             .append(html, body)
             .map_err(|err| throw_dom_error(&ctx, err))?;
-        let root = world(&ctx)?.borrow_mut().add_document(parsed);
+        let world_rc = world(&ctx)?;
+
+        let root = world_rc.borrow_mut().add_document(parsed);
+
+        let registry = world_rc.borrow().registry();
+
+        registry
+            .borrow_mut()
+            .insert_document(root.document_id(), &world_rc);
         wrap_node(&ctx, root)
     }
 }
@@ -1361,7 +1377,15 @@ impl JsDomParser {
         } else {
             parse_xml_document(&source.0, content_type)
         };
-        let root = world(&ctx)?.borrow_mut().add_document(parsed);
+        let world_rc = world(&ctx)?;
+
+        let root = world_rc.borrow_mut().add_document(parsed);
+
+        let registry = world_rc.borrow().registry();
+
+        registry
+            .borrow_mut()
+            .insert_document(root.document_id(), &world_rc);
         wrap_node(&ctx, root)
     }
 }
@@ -1624,7 +1648,15 @@ fn construct_node<'js>(
                 parse_errors: 0,
                 content_type: "text/html",
             };
-            let root = world(&ctx)?.borrow_mut().add_document(parsed);
+            let world_rc = world(&ctx)?;
+
+            let root = world_rc.borrow_mut().add_document(parsed);
+
+            let registry = world_rc.borrow().registry();
+
+            registry
+                .borrow_mut()
+                .insert_document(root.document_id(), &world_rc);
             wrap_node(&ctx, root)
         }
         "XMLDocument" => {
@@ -1634,7 +1666,15 @@ fn construct_node<'js>(
                 parse_errors: 0,
                 content_type: "application/xml",
             };
-            let root = world(&ctx)?.borrow_mut().add_document(parsed);
+            let world_rc = world(&ctx)?;
+
+            let root = world_rc.borrow_mut().add_document(parsed);
+
+            let registry = world_rc.borrow().registry();
+
+            registry
+                .borrow_mut()
+                .insert_document(root.document_id(), &world_rc);
             wrap_node(&ctx, root)
         }
         other => Err(Exception::throw_type(
@@ -4531,7 +4571,7 @@ pub(super) fn host_node_id<'js>(ctx: &Ctx<'js>, value: &Value<'js>) -> Option<No
 
 fn wrap_node<'js>(ctx: &Ctx<'js>, id: NodeId) -> Result<Value<'js>> {
     let world_rc = world(ctx)?;
-    if let Some(saved) = world_rc.borrow().wrapper(id)
+    if let Some(saved) = world_rc.borrow().shared_wrapper(id)
         && let Some(value) = deref_weak(ctx, saved)?
     {
         return Ok(value);
@@ -4539,8 +4579,8 @@ fn wrap_node<'js>(ctx: &Ctx<'js>, id: NodeId) -> Result<Value<'js>> {
     let value = instantiate_node(ctx, id)?;
     let weak = make_weak(ctx, value.clone())?;
     world_rc
-        .borrow_mut()
-        .intern_wrapper(id, Persistent::save(ctx, weak));
+        .borrow()
+        .intern_shared_wrapper(id, Persistent::save(ctx, weak));
     Ok(value)
 }
 
@@ -4564,8 +4604,17 @@ fn instantiate_node<'js>(ctx: &Ctx<'js>, id: NodeId) -> Result<Value<'js>> {
         return Err(Exception::throw_type(ctx, "stale node"));
     };
     let class = Class::instance(ctx.clone(), JsNode { handle: Handle(id) })?;
-    if let Some(proto) = class_proto(ctx, brand)? {
-        class.set_prototype(Some(&proto))?;
+    // The wrapper belongs to the realm that owns the node's document, not to
+    // the realm that happens to create it first. Its prototypes come from the
+    // owner realm, so `instanceof` and `getPrototypeOf` stay realm-correct
+    // even when a same-site frame reads another frame's DOM.
+    let owner = world(ctx)?.borrow().owner_world(id);
+    let proto = match &owner {
+        Some(owner) => owner.borrow().brand(brand),
+        None => world(ctx)?.borrow().brand(brand),
+    };
+    if let Some(proto) = proto {
+        class.set_prototype(Some(&proto.restore(ctx)?))?;
     }
     Ok(Class::into_value(class))
 }
@@ -5912,7 +5961,7 @@ mod realm_tests {
     use rquickjs::{Persistent, Value};
     use url::Url;
 
-    use super::world;
+    use super::{world, wrap_node};
     use crate::document::Stop;
     use crate::js::{JsRealm, SharedJsRuntime, World};
     use crate::protocol::{BrowserServices, DialOutcome, DialRequest};
@@ -5935,17 +5984,21 @@ mod realm_tests {
 
     fn world_with_document(
         services: &Arc<dyn BrowserServices>,
+        documents: &Rc<RefCell<crate::documents::DocumentStore>>,
+        registry: &Rc<RefCell<crate::js::RealmRegistry>>,
         url: &str,
         html: &str,
     ) -> Rc<RefCell<World>> {
-        let documents = Rc::new(RefCell::new(crate::documents::DocumentStore::default()));
         let mut world = World::new(
             Arc::clone(services),
             Url::parse(url).expect("test url"),
-            documents,
+            Rc::clone(documents),
+            Rc::clone(registry),
         );
-        world.replace_document(crate::parse_html(html));
-        Rc::new(RefCell::new(world))
+        let id = world.replace_document(crate::parse_html(html));
+        let world = Rc::new(RefCell::new(world));
+        registry.borrow_mut().insert_document(id, &world);
+        world
     }
 
     #[test]
@@ -5953,10 +6006,22 @@ mod realm_tests {
         let services: Arc<dyn BrowserServices> = Arc::new(NullServices);
         let shared = SharedJsRuntime::default();
         let stop = Arc::new(Stop::new());
-        let world_a =
-            world_with_document(&services, "https://a.test/", "<!doctype html><p id=a></p>");
-        let world_b =
-            world_with_document(&services, "https://b.test/", "<!doctype html><p id=b></p>");
+        let documents = Rc::new(RefCell::new(crate::documents::DocumentStore::default()));
+        let registry = Rc::new(RefCell::new(crate::js::RealmRegistry::default()));
+        let world_a = world_with_document(
+            &services,
+            &documents,
+            &registry,
+            "https://a.test/",
+            "<!doctype html><p id=a></p>",
+        );
+        let world_b = world_with_document(
+            &services,
+            &documents,
+            &registry,
+            "https://b.test/",
+            "<!doctype html><p id=b></p>",
+        );
         let realm_a = JsRealm::new(&shared, world_a.clone(), Arc::clone(&stop)).expect("realm a");
         let realm_b = JsRealm::new(&shared, world_b.clone(), Arc::clone(&stop)).expect("realm b");
 
@@ -5993,6 +6058,96 @@ mod realm_tests {
                 super::super::eval_classic(&ctx, "document.getElementById('b') === null")
                     .expect("foreign tree");
             assert!(mine && theirs);
+        });
+    }
+
+    #[test]
+    fn wrappers_are_shared_with_the_owner_realms_prototypes() {
+        let services: Arc<dyn BrowserServices> = Arc::new(NullServices);
+        let shared = SharedJsRuntime::default();
+        let stop = Arc::new(Stop::new());
+        let documents = Rc::new(RefCell::new(crate::documents::DocumentStore::default()));
+        let registry = Rc::new(RefCell::new(crate::js::RealmRegistry::default()));
+        let world_a = world_with_document(
+            &services,
+            &documents,
+            &registry,
+            "https://a.test/",
+            "<!doctype html><p id=a></p>",
+        );
+        let world_b = world_with_document(
+            &services,
+            &documents,
+            &registry,
+            "https://b.test/",
+            "<!doctype html><p id=b></p>",
+        );
+        let realm_a = JsRealm::new(&shared, world_a, Arc::clone(&stop)).expect("realm a");
+        let realm_b = JsRealm::new(&shared, world_b.clone(), Arc::clone(&stop)).expect("realm b");
+        let b_root = world_b
+            .borrow()
+            .with_main_document(|parsed| parsed.dom.document())
+            .expect("b document");
+
+        // Realm A wraps realm B's document: the same object as B's `document`.
+        let from_a = realm_a.context.with(|ctx| {
+            let value = match wrap_node(&ctx, b_root) {
+                Ok(value) => value,
+                Err(err) => {
+                    let caught = ctx.catch();
+                    let message: String = caught
+                        .as_object()
+                        .and_then(|object| object.get("message").ok())
+                        .unwrap_or_default();
+                    panic!("wrap failed: {err:?}: {message}");
+                }
+            };
+            Persistent::save(&ctx, value)
+        });
+        realm_b.context.with(|ctx| {
+            let own: Value = super::super::eval_classic(&ctx, "document").expect("b document");
+            let wrapped = from_a.restore(&ctx).expect("restore");
+            assert_eq!(own, wrapped, "one wrapper is shared across realms");
+            ctx.globals().set("__w", wrapped).expect("test global");
+            let is_document: bool = super::super::eval_classic(
+                &ctx,
+                "Object.getPrototypeOf(__w) === Document.prototype",
+            )
+            .expect("prototype");
+            assert!(is_document, "wrapper keeps the owner realm's prototype");
+        });
+
+        // Reading and mutating from A are visible in B through the same tree.
+        realm_a.context.with(|ctx| {
+            let value = wrap_node(&ctx, b_root).expect("wrap b document in a");
+            let object = value.into_object().expect("object");
+            ctx.globals().set("__b", object).expect("test global");
+            let _: () = super::super::eval_classic(&ctx, "__b.body.setAttribute('x', '1')")
+                .expect("mutate");
+        });
+        realm_b.context.with(|ctx| {
+            let seen: bool =
+                super::super::eval_classic(&ctx, "document.body.getAttribute('x') === '1'")
+                    .expect("read");
+            assert!(seen, "mutations from realm A reach realm B's tree");
+            let element: Value =
+                super::super::eval_classic(&ctx, "document.documentElement").expect("element");
+            ctx.globals().set("__el", element).expect("test global");
+        });
+        let element_from_a = realm_a.context.with(|ctx| {
+            let value = wrap_node(&ctx, b_root).expect("wrap b document in a");
+            let object = value.into_object().expect("object");
+            let element: Value = object.get("documentElement").expect("documentElement");
+            Persistent::save(&ctx, element)
+        });
+        realm_b.context.with(|ctx| {
+            let restored = element_from_a.restore(&ctx).expect("restore");
+            ctx.globals()
+                .set("__el_from_a", restored)
+                .expect("test global");
+            let same: bool =
+                super::super::eval_classic(&ctx, "__el_from_a === __el").expect("identity");
+            assert!(same, "cross-realm property reads return the shared wrapper");
         });
     }
 }
