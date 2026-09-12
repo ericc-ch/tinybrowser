@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::rc::Rc;
 
 use fixed_decimal::{
@@ -396,8 +397,13 @@ const INSTALL_INTL_JS: &str = r"
     const signDisplay = stringOption(
       options, 'signDisplay', ['auto', 'never', 'always', 'exceptZero', 'negative'], 'auto'
     );
+    // SetNumberFormatUnitOptions stores [[Currency]] only for currency style,
+    // so resolvedOptions must not expose the currency fields for other styles.
+    // https://402.ecma-international.org/#sec-setnumberformatunitoptions
     const slots = {
-      locale, numberingSystem, style, currency, currencyDisplay, currencySign,
+      locale, numberingSystem, style,
+      currency: style === 'currency' ? currency : undefined,
+      currencyDisplay, currencySign,
       minimumIntegerDigits, minimumFractionDigits, maximumFractionDigits,
       minimumSignificantDigits, maximumSignificantDigits,
       useGrouping, signDisplay, boundFormat: null,
@@ -596,8 +602,16 @@ const INSTALL_INTL_JS: &str = r"
     for (let index = 0; index < timeComponentNames.length; index += 1) {
       if (components[timeComponentNames[index]] !== undefined) hasTimeComponents = true;
     }
-    if (!hasDateComponents && !hasTimeComponents && dateStyle === undefined &&
-        timeStyle === undefined) {
+    // CreateDateTimeFormat lets only the component group named by `required`
+    // veto the defaults, then applies the groups named by `defaults`.
+    // https://402.ecma-international.org/#sec-createdatetimeformat
+    const needDefaults = dateStyle === undefined && timeStyle === undefined &&
+      (required === 'date'
+        ? !hasDateComponents
+        : required === 'time'
+          ? !hasTimeComponents
+          : !hasDateComponents && !hasTimeComponents);
+    if (needDefaults) {
       if (defaults === 'date' || defaults === 'all') {
         components.year = components.month = components.day = 'numeric';
       }
@@ -789,16 +803,44 @@ const INSTALL_INTL_JS: &str = r"
 })();
 ";
 
+struct IntlData {
+    canonicalizer: Rc<LocaleCanonicalizer>,
+    provider: Rc<IntlProvider>,
+}
+
+thread_local! {
+    // `JsRealm::new` installs Intl once per realm, but the ICU payloads behind
+    // canonicalization and fallback are immutable and independent of the realm.
+    // Deserialize them once per renderer thread instead of once per document.
+    static INTL_DATA: RefCell<Option<IntlData>> = const { RefCell::new(None) };
+}
+
+fn intl_data(ctx: &Ctx<'_>) -> Result<(Rc<LocaleCanonicalizer>, Rc<IntlProvider>)> {
+    INTL_DATA.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        if let Some(data) = slot.as_ref() {
+            return Ok((Rc::clone(&data.canonicalizer), Rc::clone(&data.provider)));
+        }
+        let blob = BlobDataProvider::try_new_from_static_blob(ICU_DATA)
+            .map_err(|err| Exception::throw_internal(ctx, &err.to_string()))?;
+        let canonicalizer = Rc::new(
+            LocaleCanonicalizer::try_new_common_with_buffer_provider(&blob)
+                .map_err(|err| Exception::throw_internal(ctx, &err.to_string()))?,
+        );
+        let fallbacker = LocaleFallbacker::try_new_with_buffer_provider(&blob)
+            .map_err(|err| Exception::throw_internal(ctx, &err.to_string()))?;
+        let data = IntlData {
+            canonicalizer,
+            provider: Rc::new(LocaleFallbackProvider::new(blob, fallbacker)),
+        };
+        let handles = (Rc::clone(&data.canonicalizer), Rc::clone(&data.provider));
+        *slot = Some(data);
+        Ok(handles)
+    })
+}
+
 pub(super) fn install(ctx: &Ctx<'_>) -> Result<()> {
-    let blob = BlobDataProvider::try_new_from_static_blob(ICU_DATA)
-        .map_err(|err| Exception::throw_internal(ctx, &err.to_string()))?;
-    let canonicalizer = Rc::new(
-        LocaleCanonicalizer::try_new_common_with_buffer_provider(&blob)
-            .map_err(|err| Exception::throw_internal(ctx, &err.to_string()))?,
-    );
-    let fallbacker = LocaleFallbacker::try_new_with_buffer_provider(&blob)
-        .map_err(|err| Exception::throw_internal(ctx, &err.to_string()))?;
-    let provider = Rc::new(LocaleFallbackProvider::new(blob, fallbacker));
+    let (canonicalizer, provider) = intl_data(ctx)?;
 
     let number_provider = Rc::clone(&provider);
     let date_provider = Rc::clone(&provider);
@@ -903,6 +945,36 @@ fn format_date_time_args(
     format_date_time(ctx, provider, &input)
 }
 
+// ECMA-402 formats the exact mathematical value of strings parsed with the
+// ECMA-262 `StringNumericLiteral` grammar, which accepts a decimal point with
+// no digit on one side (`".5"`, `"1."`). `fixed_decimal` 0.7.2 requires a
+// digit on both sides, so adapt the exact string at this boundary.
+// https://402.ecma-international.org/#sec-tointlmathematicalvalue
+// https://262.ecma-international.org/#sec-stringnumericliteral
+fn parse_exact_decimal(ctx: &Ctx<'_>, value: &str) -> Result<Decimal> {
+    let value = value.strip_prefix('+').unwrap_or(value);
+    let mut normalized = String::with_capacity(value.len() + 1);
+    match value.strip_prefix("-.") {
+        Some(fraction) => {
+            normalized.push_str("-0.");
+            normalized.push_str(fraction);
+        }
+        None => match value.strip_prefix('.') {
+            Some(fraction) => {
+                normalized.push_str("0.");
+                normalized.push_str(fraction);
+            }
+            None => normalized.push_str(value),
+        },
+    }
+    if normalized.ends_with('.') {
+        normalized.pop();
+    }
+    normalized
+        .parse::<Decimal>()
+        .map_err(|err| Exception::throw_internal(ctx, &err.to_string()))
+}
+
 fn format_number(
     ctx: &Ctx<'_>,
     provider: &IntlProvider,
@@ -920,11 +992,7 @@ fn format_number(
             Decimal::try_from_f64(*value, FloatPrecision::RoundTrip)
                 .map_err(|err| Exception::throw_internal(ctx, &err.to_string()))?
         }
-        NumberFormatValue::Exact(value) => value
-            .strip_prefix('+')
-            .unwrap_or(value)
-            .parse::<Decimal>()
-            .map_err(|err| Exception::throw_internal(ctx, &err.to_string()))?,
+        NumberFormatValue::Exact(value) => parse_exact_decimal(ctx, value)?,
     };
     prepare_decimal(input, &mut decimal);
     format_prepared_decimal(ctx, provider, input, locale, &decimal)

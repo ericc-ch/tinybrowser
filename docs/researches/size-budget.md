@@ -444,12 +444,12 @@ merge target are recorded in [ADR 0017](../adrs/0017-intl-core-slice.md); this
 milestone does not claim full ECMA-402 conformance.
 
 Command: `nix develop --command cargo build --release --bin tinybrowser`;
-rustc 1.98.1, stripped x86_64 release profile. The baseline is the immediately
+rustc 1.98.0, stripped x86_64 release profile. The baseline is the immediately
 preceding merged-main checkpoint above.
 
 | Artifact | Baseline | With Intl | Delta | Headroom to 10,000,000 |
 | --- | ---: | ---: | ---: | ---: |
-| CLI (`target/release/tinybrowser`) | 5,357,600 | 5,808,960 | **+451,360** | 4,191,040 |
+| CLI (`target/release/tinybrowser`) | 5,357,600 | 5,813,824 | **+456,224** | 4,186,176 |
 
 The generated postcard blob is 125,426 bytes. Marker-based generation keeps
 unused ICU datasets out of the executable; `tools/intl/generate-data` records
