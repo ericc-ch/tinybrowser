@@ -341,7 +341,7 @@ and the renderer runtime stays current-thread `rt`+`time`.
 
 [ADR 0011](../adrs/0011-renderer-processes-per-site.md) split the engine into
 the `renderer` crate (parser, `Dom`, QuickJS, value-only seam) and the `browser`
-browser side (Browser, tab `Tab`, navigation, `NetworkSession`, renderer registry).
+browser side (Browser, tab `Tab`, navigation, `NetworkSession`, renderer factory).
 The browser process spawns one `--renderer` process per site instance; tests use the
 in-process local backend. Command: `nix develop --command cargo build --release
 --example tab_probe --bin tinybrowser`; rustc 1.98.0, committed stripped
@@ -353,7 +353,7 @@ x86_64 release profile.
 | page engine (`target/release/examples/tab_probe`) | 3,582,736 | 6,417,264 |
 
 The CLI grew 185,584 bytes over the axum+clap row (4,421,008): serde-derive IPC
-types, the renderer link/registry, and process spawn/IO. The probe grew 193,648
+types, the renderer link/factory, and process spawn/IO. The probe grew 193,648
 bytes (3,389,088) because it now links the same browser+renderer pair the shipping
 binary does. Renderer `serde` is confined to the `protocol` module. QuickJS
 stays per realm; the renderer process is the isolation unit.
@@ -393,9 +393,29 @@ waiter instead of being polled every millisecond. The preceding size row
 predates the frames/realms merge, so this checkpoint is the new comparison
 baseline rather than an attribution of the full delta to this cleanup.
 
+## Milestone: logging (2026-09-12)
+
+[ADR 0015](../adrs/0015-logging.md) adds the std-only `logging` crate (levels,
+stderr console, bounded async batched file sink with rotation), the
+`--log-level`/`--verbose` flags, per-profile daemon logs, and renderer stderr
+forwarding. Main had moved to `ccf16b8` (renderer code, not only the html5lib
+move) after the row above, so the baseline was rebuilt at `ccf16b8` in a
+detached worktree with the same rustc 1.98.0 and committed stripped x86_64
+release profile; both sides ran plain `cargo build --release --bin tinybrowser
+--example tab_probe` (no `nix develop`, no `--offline`).
+
+| Artifact | Baseline `ccf16b8` | With logging | Delta | Headroom to 10,000,000 |
+| --- | ---: | ---: | ---: | ---: |
+| CLI (`target/release/tinybrowser`) | 5,310,416 | 5,348,832 | **+38,416** | 4,651,168 |
+| page engine (`target/release/examples/tab_probe`) | 4,270,848 | 4,289,040 | **+18,192** | 5,710,960 |
+
+The probe delta is the cleaner marginal for the crate and the browser/renderer
+wiring; the CLI delta adds the clap surface (level value parser, help text) and
+the per-process file config. Both numbers are recorded in ADR 0015.
+
 ## Milestone: renderer reference monitor and bounded queues (2026-09-12)
 
-[ADR 0015](../adrs/0015-renderer-seam-reference-monitor.md) added browser-owned
+[ADR 0016](../adrs/0016-renderer-seam-reference-monitor.md) added browser-owned
 site-lock validation, an 8 MiB IPC frame limit, bounded command/event retention,
 and removed the unbounded idle-renderer pool. Command: `nix develop --command
 cargo build --release --offline --example tab_probe --bin tinybrowser`; rustc

@@ -49,13 +49,19 @@ Firefox likewise validates principals received from content processes in
   `Url` inward. Raw renderer text does not cross the authorization boundary.
 - Newline-delimited JSON remains the transport because replacing it does not
   improve the trust model by itself. Encoding and decoding enforce an 8 MiB
-  message budget before deserialization; missing delimiters and invalid JSON
-  fail closed. The existing 1 MiB navigation-body limit remains independent.
-- Tab command queues and event subscribers are bounded. A tab retains only its
-  most recent 1,024 product events, production renderer event logs are drained
-  after publication, the renderer-to-tab handoff fails closed at 4,096 queued
-  events, and a protocol subscriber that cannot accept 256 queued events is
-  disconnected.
+  message budget while writing and before deserialization; missing delimiters
+  and invalid JSON fail closed. The existing 1 MiB navigation-body limit
+  remains independent.
+- Renderer inboxes retain at most 256 messages and outboxes at most 4,096.
+  Saturation terminates the renderer so lifecycle messages are never silently
+  dropped. Writer failures and failed browser-service replies also terminate
+  the renderer and release blocked callers.
+- Tab command queues, retained waiters, and subscriber registrations are each
+  capped at 256. A tab retains only its most recent 1,024 product events,
+  production renderer event logs are drained after publication, pending
+  document events fail closed at 2,048, the renderer-to-tab handoff fails
+  closed at 4,096 queued events, and a protocol subscriber that cannot accept
+  256 queued events is disconnected.
 - Renderers are terminated when their document leaves the tab. The previous
   unbounded idle pool was removed because its processes kept driving old page
   work and grew with navigation history.

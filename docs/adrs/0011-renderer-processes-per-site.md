@@ -10,7 +10,7 @@ Status: accepted. Replaces the Isolation section of [ADR 0010](0010-page-actor-o
 Extends the self-spawned-worker allowance of [ADR 0009](0009-named-profile-daemon.md).
 `TabHandle`, `TabId`, and the protocol adapters do not change.
 Browser-side authorization and resource bounds on this seam are specified by
-[ADR 0015](0015-renderer-seam-reference-monitor.md).
+[ADR 0016](0016-renderer-seam-reference-monitor.md).
 
 ## Decision
 
@@ -26,7 +26,7 @@ Browser-side authorization and resource bounds on this seam are specified by
   `tinybrowser --renderer`. The process boundary, not a thread, is the isolation
   property.
 - The browser process owns **`Tab`** (tab): `TabId`, navigation state, the document URL, and
-  the site decision; the browser process's `Browser` owns the renderer registry. The renderer
+  the site decision; the browser process's `Browser` owns the renderer factory. The renderer
   owns **`Document`**: `Dom`, QuickJS realm, active parser, tasks, and browser
   timers.
 - Navigation is browser-driven. The browser process dials, observes the final URL and headers,
@@ -91,7 +91,7 @@ Engine ground truth:
   not under test; at least one loopback E2E test crosses a real `--renderer`
   process.
 - Sandboxing (seccomp, namespaces) is a later security phase. Separate address
-  spaces, value-only IPC, and the browser-side reference monitor in ADR 0015 are
+  spaces, value-only IPC, and the browser-side reference monitor in ADR 0016 are
   the current properties; they do not make an unsandboxed child safe against
   arbitrary native code execution.
 - `--renderer` is an internal mode, not a user feature, and is hidden from help.

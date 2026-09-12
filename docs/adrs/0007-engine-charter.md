@@ -9,7 +9,7 @@ Status: accepted. Does not reopen [ADR 0002](0002-dom-layer-architecture.md) are
 | `dom` | n/a | arena, `NodeId`, selectors |
 | `net` | n/a | blocking HTTP/WS + live cookie jar; public types ours ([ADR 0006](0006-net-transport.md)) |
 | `renderer` | `dom` | page engine: TreeSink, `Document` + QuickJS, value-only browser seam; never `net` ([ADR 0011](0011-renderer-processes-per-site.md)) |
-| `browser` | `net`, `renderer` | browser side: Browser, tab `Tab`, tab registry, `NetworkSession`, renderer registry/backends ([ADR 0010](0010-page-actor-ownership.md), [ADR 0011](0011-renderer-processes-per-site.md)) |
+| `browser` | `net`, `renderer` | browser side: Browser, tab `Tab`, tab registry, `NetworkSession`, renderer factory/backends ([ADR 0010](0010-page-actor-ownership.md), [ADR 0011](0011-renderer-processes-per-site.md)) |
 | `cdp` | `browser`, `axum` | CDP server/client adapter; no direct `dom`, `net`, `renderer`, or `webdriver` dependency ([ADR 0009](0009-named-profile-daemon.md), [ADR 0012](0012-host-protocol-and-cli-stack.md)) |
 | `webdriver` | `browser`, `axum` | classic WebDriver adapter over `BrowserHandle`; WPT endpoint ([ADR 0008](0008-wpt-via-webdriver.md)) |
 | root `tinybrowser` | `browser`, `cdp`, `webdriver`, `renderer` | embedder + bins; `renderer` only for the hidden `--renderer` mode |

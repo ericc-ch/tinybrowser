@@ -14,7 +14,7 @@ pub fn run(profile: &Profile, command: Command) -> ExitCode {
     match run_inner(profile, command) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("{error}");
+            logging::error!(target: "cli", "{error}");
             ExitCode::from(1)
         }
     }
@@ -24,6 +24,7 @@ fn run_inner(profile: &Profile, command: Command) -> io::Result<()> {
     let data_home = daemon::data_home()?;
     let endpoint = daemon::ensure(profile, &data_home)?;
     let mut client = cdp::Client::connect(endpoint.addr())?;
+    logging::debug!(target: "cli", "connected to profile daemon on {}", endpoint.addr());
     match command {
         Command::Create { url } => create(
             &mut client,

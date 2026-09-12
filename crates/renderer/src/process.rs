@@ -7,15 +7,16 @@
 use std::collections::HashMap;
 use std::io::{self, BufReader, Write};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{self, Sender};
-use std::sync::{Mutex, PoisonError};
+use std::sync::mpsc::{self, Sender, SyncSender};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
 
 use url::Url;
 
+use crate::Stop;
 use crate::protocol::{
-    BrowserServices, Command, DialCompletion, DialRequest, FromRenderer, ServiceCall, ServiceReply,
-    ToRenderer,
+    BrowserServices, Command, DialCompletion, DialRequest, FromRenderer, RENDERER_INBOX_CAPACITY,
+    RENDERER_OUTBOX_CAPACITY, ServiceCall, ServiceReply, ToRenderer,
 };
 
 /// Runs the renderer child until `Shutdown` or stdin closes.
@@ -24,14 +25,28 @@ use crate::protocol::{
 ///
 /// I/O failure while draining the writer.
 pub fn serve_stdio() -> io::Result<()> {
-    let (command_tx, command_rx) = mpsc::channel::<ToRenderer>();
-    let (out_tx, out_rx) = mpsc::channel::<FromRenderer>();
-    let writer = thread::spawn(move || write_messages(&out_rx));
-    let services = std::sync::Arc::new(PipeServices::new(out_tx.clone()));
-    let _ready = out_tx.send(FromRenderer::Ready);
-    let reader_services = std::sync::Arc::clone(&services);
+    let (command_tx, command_rx) = mpsc::sync_channel::<ToRenderer>(RENDERER_INBOX_CAPACITY);
+    let (out_tx, out_rx) = mpsc::sync_channel::<FromRenderer>(RENDERER_OUTBOX_CAPACITY);
+    let stop = Arc::new(Stop::new());
+    let writer_stop = Arc::clone(&stop);
+    let writer_commands = command_tx.clone();
+    let writer = thread::spawn(move || {
+        let result = write_messages(&out_rx);
+        if result.is_err() {
+            writer_stop.request();
+            let _ = writer_commands.try_send(ToRenderer::Request {
+                id: 0,
+                command: Command::Shutdown,
+            });
+        }
+        result
+    });
+    let services = Arc::new(PipeServices::new(out_tx.clone()));
+    let _ready = out_tx.try_send(FromRenderer::Ready);
+    logging::info!(target: "renderer", "ready");
+    let reader_services = Arc::clone(&services);
     thread::spawn(move || read_messages(&command_tx, &reader_services));
-    crate::run(&command_rx, &out_tx, services);
+    crate::run_with_stop(&command_rx, &out_tx, services, &stop);
     // The reader returns on `Shutdown`, dropping its `PipeServices` clone, so
     // the writer channel closes and the child can exit.
     drop(out_tx);
@@ -40,7 +55,7 @@ pub fn serve_stdio() -> io::Result<()> {
         .map_err(|_| io::Error::other("writer panicked"))?
 }
 
-fn read_messages(command_tx: &Sender<ToRenderer>, services: &PipeServices) {
+fn read_messages(command_tx: &SyncSender<ToRenderer>, services: &PipeServices) {
     let mut input = BufReader::new(io::stdin());
     let mut buffer = Vec::new();
     loop {
@@ -48,7 +63,7 @@ fn read_messages(command_tx: &Sender<ToRenderer>, services: &PipeServices) {
             Ok(Some(message)) => message,
             Ok(None) => return,
             Err(error) => {
-                eprintln!("renderer: invalid host message: {error}");
+                logging::error!(target: "renderer::ipc", "bad host message: {error}");
                 return;
             }
         };
@@ -84,7 +99,7 @@ fn write_messages(rx: &mpsc::Receiver<FromRenderer>) -> io::Result<()> {
 
 /// [`BrowserServices`] proxy that asks the browser process over the pipe.
 struct PipeServices {
-    out: Sender<FromRenderer>,
+    out: SyncSender<FromRenderer>,
     pending: Mutex<HashMap<u64, PendingService>>,
     next: AtomicU64,
 }
@@ -95,7 +110,7 @@ enum PendingService {
 }
 
 impl PipeServices {
-    fn new(out: Sender<FromRenderer>) -> Self {
+    fn new(out: SyncSender<FromRenderer>) -> Self {
         Self {
             out,
             pending: Mutex::new(HashMap::new()),
@@ -112,7 +127,7 @@ impl PipeServices {
             .insert(id, PendingService::Blocking(reply_tx));
         if self
             .out
-            .send(FromRenderer::ServiceCall { id, call })
+            .try_send(FromRenderer::ServiceCall { id, call })
             .is_err()
         {
             self.pending
@@ -152,7 +167,7 @@ impl BrowserServices for PipeServices {
             .insert(id, PendingService::Dial(std::sync::Arc::clone(&completion)));
         if self
             .out
-            .send(FromRenderer::ServiceCall {
+            .try_send(FromRenderer::ServiceCall {
                 id,
                 call: ServiceCall::Dial(request),
             })

@@ -125,11 +125,11 @@ The value-only message boundary between browser process and renderer process ([A
 _Avoid_: RPC, HTTP, CDP
 
 **Renderer site lock**:
-An immutable browser-process authorization bound to one renderer before content is mounted. A renderer may request cookies or claim an initiator only for URLs in that schemeful site; an opaque lock accepts only `about:`, `blob:`, and `data:` documents. The browser process validates every child service call and terminates a process renderer on a violation ([ADR 0015](adrs/0015-renderer-seam-reference-monitor.md)). This is a reference-monitor property, not a renderer sandbox.
+An immutable browser-process authorization bound to one renderer before content is mounted. A renderer may request cookies or claim an initiator only for URLs in that schemeful site; an opaque lock accepts only `about:`, `blob:`, and `data:` documents. The browser process validates every child service call and terminates a process renderer on a violation ([ADR 0016](adrs/0016-renderer-seam-reference-monitor.md)). This is a reference-monitor property, not a renderer sandbox.
 _Avoid_: trusting the renderer's initiator string, treating a process boundary alone as a sandbox
 
 **IPC message budget**:
-The maximum encoded size of one browser/renderer message: 8 MiB, enforced before JSON deserialization in both directions. Navigation bodies have their smaller 1 MiB budget. Oversized or undelimited process messages terminate the renderer transport ([ADR 0015](adrs/0015-renderer-seam-reference-monitor.md)).
+The maximum encoded size of one browser/renderer message: 8 MiB, enforced before JSON deserialization in both directions. Navigation bodies have their smaller 1 MiB budget. Oversized or undelimited process messages terminate the renderer transport ([ADR 0016](adrs/0016-renderer-seam-reference-monitor.md)).
 _Avoid_: line length, body limit (those are different budgets)
 
 **TabActor**:
@@ -153,7 +153,7 @@ The isolation unit: one site within one browsing context group. One renderer pro
 _Avoid_: origin (scheme + host + port), tab, domain
 
 **Browser process**:
-The process-side half of the browser: `Browser`, the tab registry, `NetworkSession`, the renderer registry, and the protocol adapters. One per profile, started as `--daemon` or `--webdriver`. Chromium calls it the browser process, Gecko the parent process ([Chromium multi-process architecture](https://www.chromium.org/developers/design-documents/multi-process-architecture/), [Gecko process model](https://firefox-source-docs.mozilla.org/dom/ipc/process_model.html)).
+The process-side half of the browser: `Browser`, the tab registry, `NetworkSession`, the renderer factory, and the protocol adapters. One per profile, started as `--daemon` or `--webdriver`. Chromium calls it the browser process, Gecko the parent process ([Chromium multi-process architecture](https://www.chromium.org/developers/design-documents/multi-process-architecture/), [Gecko process model](https://firefox-source-docs.mozilla.org/dom/ipc/process_model.html)).
 _Avoid_: host (as a noun), daemon process, browser (the `Browser` type), UI process
 
 **Browser**:

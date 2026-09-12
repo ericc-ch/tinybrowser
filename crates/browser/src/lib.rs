@@ -22,4 +22,4 @@ pub use link::Renderers;
 pub use net::{Agent, AgentBuilder};
 pub use network::{FetchHandle, NetworkSession, ProfileStore};
 pub use profile::{Profile, ProfileError, ProfileName};
-pub use renderer::{RemoteValue, ScriptFailure, TabError, TabEvent};
+pub use renderer::{RemoteValue, ResourceLimit, ScriptFailure, TabError, TabEvent};

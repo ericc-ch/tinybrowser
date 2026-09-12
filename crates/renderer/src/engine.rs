@@ -279,16 +279,17 @@ impl Engine {
             .collect()
     }
 
-    pub(crate) fn take_events(&mut self) -> Vec<(FrameId, TabEvent)> {
-        self.frames
-            .iter_mut()
-            .flat_map(|(&frame, document)| {
+    pub(crate) fn take_events(&mut self) -> Result<Vec<(FrameId, TabEvent)>, ()> {
+        let mut events = Vec::new();
+        for (&frame, document) in &mut self.frames {
+            events.extend(
                 document
-                    .take_events()
+                    .take_events()?
                     .into_iter()
-                    .map(move |event| (frame, event))
-            })
-            .collect()
+                    .map(|event| (frame, event)),
+            );
+        }
+        Ok(events)
     }
 
     /// True when any frame has jobs, timers, dials, or pending JS work.

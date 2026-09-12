@@ -1,6 +1,6 @@
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use browser::{Browser, Profile, RemoteValue, Renderers, TabError, TabEvent};
+use browser::{Browser, Profile, RemoteValue, Renderers, ResourceLimit, TabError, TabEvent};
 
 fn temp_data_home() -> std::path::PathBuf {
     let stamp = SystemTime::now()
@@ -131,6 +131,66 @@ fn page_events_are_pushed_to_subscribers() {
         events.recv_timeout(Duration::from_secs(1)).expect("event"),
         TabEvent::Load
     );
+    let _ = std::fs::remove_dir_all(data_home);
+}
+
+#[test]
+fn subscriber_registrations_have_a_fixed_memory_budget() {
+    let data_home = temp_data_home();
+    let browser =
+        Browser::open_in_with(&data_home, &Profile::default(), Renderers::Local).expect("browser");
+    let tab = browser.handle().create_tab().expect("tab");
+
+    for _ in 0..256 {
+        drop(tab.subscribe().expect("subscriber within budget"));
+    }
+    assert!(matches!(
+        tab.subscribe(),
+        Err(TabError::ResourceLimit {
+            resource: ResourceLimit::TabSubscribers
+        })
+    ));
+    let _ = std::fs::remove_dir_all(data_home);
+}
+
+#[test]
+fn retained_waiters_have_a_fixed_memory_budget() {
+    use std::sync::{Arc, Barrier, mpsc};
+
+    let data_home = temp_data_home();
+    let browser =
+        Browser::open_in_with(&data_home, &Profile::default(), Renderers::Local).expect("browser");
+    let tab = browser.handle().create_tab().expect("tab");
+    let barrier = Arc::new(Barrier::new(258));
+    let (result_tx, result_rx) = mpsc::channel();
+    let mut waiters = Vec::new();
+
+    for _ in 0..257 {
+        let waiter = tab.clone();
+        let start = Arc::clone(&barrier);
+        let result_tx = result_tx.clone();
+        waiters.push(std::thread::spawn(move || {
+            start.wait();
+            let _ = result_tx.send(waiter.run_until_load());
+        }));
+    }
+    drop(result_tx);
+    barrier.wait();
+
+    let result = result_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("one waiter must be rejected");
+    assert!(matches!(
+        result,
+        Err(TabError::ResourceLimit {
+            resource: ResourceLimit::TabWaiters
+        })
+    ));
+
+    tab.shutdown().expect("shutdown");
+    for waiter in waiters {
+        waiter.join().expect("waiter thread");
+    }
     let _ = std::fs::remove_dir_all(data_home);
 }
 

@@ -13,7 +13,8 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use renderer::{
-    Command as RendererCommand, FrameId, Mount, RemoteValue, Reply, TabError, TabEvent,
+    Command as RendererCommand, FrameId, Mount, RemoteValue, Reply, ResourceLimit, TabError,
+    TabEvent,
 };
 use url::Url;
 
@@ -24,6 +25,8 @@ use crate::site::Site;
 const MAX_EVENT_HISTORY: usize = 1024;
 const EVENT_SUBSCRIBER_CAPACITY: usize = 256;
 const COMMAND_CAPACITY: usize = 256;
+const MAX_WAITERS: usize = 256;
+const MAX_SUBSCRIBERS: usize = 256;
 
 /// Identity of one tab in a [`crate::Browser`] registry.
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
@@ -80,19 +83,19 @@ enum Command {
         reply: Sender<Result<RemoteValue, TabError>>,
     },
     Run {
-        reply: Sender<()>,
+        reply: Sender<Result<(), TabError>>,
     },
     RunUntilLoad {
-        reply: Sender<()>,
+        reply: Sender<Result<(), TabError>>,
     },
     RunUntilLoadTimeout {
         timeout: Duration,
-        reply: Sender<bool>,
+        reply: Sender<Result<bool, TabError>>,
     },
     RunUntilJsTrue {
         source: String,
         timeout: Duration,
-        reply: Sender<bool>,
+        reply: Sender<Result<bool, TabError>>,
     },
     DocumentUrl {
         reply: Sender<String>,
@@ -115,7 +118,7 @@ enum Command {
         reply: Sender<Vec<TabEvent>>,
     },
     Subscribe {
-        reply: Sender<Receiver<TabEvent>>,
+        reply: Sender<Result<Receiver<TabEvent>, TabError>>,
     },
     LastNavigationFailed {
         reply: Sender<bool>,
@@ -131,16 +134,16 @@ struct Envelope {
 }
 
 enum Waiter {
-    Idle(Sender<()>),
-    Load(Sender<()>),
+    Idle(Sender<Result<(), TabError>>),
+    Load(Sender<Result<(), TabError>>),
     LoadTimeout {
         deadline: Instant,
-        reply: Sender<bool>,
+        reply: Sender<Result<bool, TabError>>,
     },
     JsTrue {
         source: String,
         deadline: Instant,
-        reply: Sender<bool>,
+        reply: Sender<Result<bool, TabError>>,
     },
 }
 
@@ -245,7 +248,7 @@ impl TabHandle {
     pub fn run(&self) -> Result<(), TabError> {
         let (reply, rx) = mpsc::channel();
         self.send(Command::Run { reply })?;
-        recv_unit(&rx)
+        recv_result(&rx)
     }
 
     /// Waits until the current navigation has fired `load`.
@@ -256,7 +259,7 @@ impl TabHandle {
     pub fn run_until_load(&self) -> Result<(), TabError> {
         let (reply, rx) = mpsc::channel();
         self.send(Command::RunUntilLoad { reply })?;
-        recv_unit(&rx)
+        recv_result(&rx)
     }
 
     /// Waits like [`TabHandle::run_until_load`], returning `false` on timeout.
@@ -267,7 +270,7 @@ impl TabHandle {
     pub fn run_until_load_timeout(&self, timeout: Duration) -> Result<bool, TabError> {
         let (reply, rx) = mpsc::channel();
         self.send(Command::RunUntilLoadTimeout { timeout, reply })?;
-        recv_bool(&rx)
+        recv_result(&rx)
     }
 
     /// Waits until `source` evaluates to JS `true`, returning `false` on timeout.
@@ -282,7 +285,7 @@ impl TabHandle {
             timeout,
             reply,
         })?;
-        recv_bool(&rx)
+        recv_result(&rx)
     }
 
     /// Document URL after navigation.
@@ -365,7 +368,7 @@ impl TabHandle {
     pub fn subscribe(&self) -> Result<Receiver<TabEvent>, TabError> {
         let (reply, rx) = mpsc::channel();
         self.send(Command::Subscribe { reply })?;
-        rx.recv().map_err(|_| TabError::ActorStopped)
+        recv_result(&rx)
     }
 
     /// True when the last navigation dial failed.
@@ -820,27 +823,33 @@ fn handle_command(tab: &mut Tab, command: Command, waiters: &mut Vec<Waiter>) ->
             let _ = reply.send(result);
         }
         Command::Run { reply } => {
-            waiters.push(Waiter::Idle(reply));
+            retain_waiter(waiters, Waiter::Idle(reply));
         }
         Command::RunUntilLoad { reply } => {
-            waiters.push(Waiter::Load(reply));
+            retain_waiter(waiters, Waiter::Load(reply));
         }
         Command::RunUntilLoadTimeout { timeout, reply } => {
-            waiters.push(Waiter::LoadTimeout {
-                deadline: Instant::now() + timeout,
-                reply,
-            });
+            retain_waiter(
+                waiters,
+                Waiter::LoadTimeout {
+                    deadline: Instant::now() + timeout,
+                    reply,
+                },
+            );
         }
         Command::RunUntilJsTrue {
             source,
             timeout,
             reply,
         } => {
-            waiters.push(Waiter::JsTrue {
-                source,
-                deadline: Instant::now() + timeout,
-                reply,
-            });
+            retain_waiter(
+                waiters,
+                Waiter::JsTrue {
+                    source,
+                    deadline: Instant::now() + timeout,
+                    reply,
+                },
+            );
         }
         Command::DocumentUrl { reply } => {
             let _ = reply.send(tab.document_url.to_string());
@@ -862,9 +871,15 @@ fn handle_command(tab: &mut Tab, command: Command, waiters: &mut Vec<Waiter>) ->
             let _ = reply.send(tab.events.iter().copied().collect());
         }
         Command::Subscribe { reply } => {
-            let (events, event_rx) = mpsc::sync_channel(EVENT_SUBSCRIBER_CAPACITY);
-            tab.subscribers.push(events);
-            let _ = reply.send(event_rx);
+            if tab.subscribers.len() == MAX_SUBSCRIBERS {
+                let _ = reply.send(Err(TabError::ResourceLimit {
+                    resource: ResourceLimit::TabSubscribers,
+                }));
+            } else {
+                let (events, event_rx) = mpsc::sync_channel(EVENT_SUBSCRIBER_CAPACITY);
+                tab.subscribers.push(events);
+                let _ = reply.send(Ok(event_rx));
+            }
         }
         Command::LastNavigationFailed { reply } => {
             let _ = reply.send(tab.navigation_failed);
@@ -878,22 +893,40 @@ fn handle_command(tab: &mut Tab, command: Command, waiters: &mut Vec<Waiter>) ->
     false
 }
 
+fn retain_waiter(waiters: &mut Vec<Waiter>, waiter: Waiter) {
+    if waiters.len() < MAX_WAITERS {
+        waiters.push(waiter);
+        return;
+    }
+    let error = TabError::ResourceLimit {
+        resource: ResourceLimit::TabWaiters,
+    };
+    match waiter {
+        Waiter::Idle(reply) | Waiter::Load(reply) => {
+            let _ = reply.send(Err(error));
+        }
+        Waiter::LoadTimeout { reply, .. } | Waiter::JsTrue { reply, .. } => {
+            let _ = reply.send(Err(error));
+        }
+    }
+}
+
 fn resolve_waiters(tab: &mut Tab, waiters: &mut Vec<Waiter>) {
     let now = Instant::now();
     let mut pending = Vec::new();
     for waiter in std::mem::take(waiters) {
         match waiter {
             Waiter::Idle(reply) if !tab.has_background_work() => {
-                let _ = reply.send(());
+                let _ = reply.send(Ok(()));
             }
             Waiter::Load(reply) if !tab.waiting_for_load() => {
-                let _ = reply.send(());
+                let _ = reply.send(Ok(()));
             }
             Waiter::LoadTimeout { reply, .. } if !tab.waiting_for_load() => {
-                let _ = reply.send(true);
+                let _ = reply.send(Ok(true));
             }
             Waiter::LoadTimeout { deadline, reply } if now >= deadline => {
-                let _ = reply.send(false);
+                let _ = reply.send(Ok(false));
             }
             Waiter::JsTrue {
                 source,
@@ -901,7 +934,7 @@ fn resolve_waiters(tab: &mut Tab, waiters: &mut Vec<Waiter>) {
                 reply,
             } => {
                 if now >= deadline {
-                    let _ = reply.send(false);
+                    let _ = reply.send(Ok(false));
                 } else if matches!(
                     tab.renderer_request(RendererCommand::ExecuteScript {
                         frame: FrameId::MAIN,
@@ -910,7 +943,7 @@ fn resolve_waiters(tab: &mut Tab, waiters: &mut Vec<Waiter>) {
                     }),
                     Ok(Reply::Value(Ok(RemoteValue::Bool(true))))
                 ) {
-                    let _ = reply.send(true);
+                    let _ = reply.send(Ok(true));
                 } else {
                     pending.push(Waiter::JsTrue {
                         source,

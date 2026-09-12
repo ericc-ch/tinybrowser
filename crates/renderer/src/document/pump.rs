@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use tokio::time::{Instant, sleep_until};
 
-use super::{Document, MAX_PENDING_JS_FETCHES, QueuedDial, Task, Timer, note_script};
+use super::{Document, MAX_PENDING_JS_FETCHES, QueuedDial, Task, Timer};
 use crate::protocol::TabEvent;
 
 impl Document {
@@ -253,11 +253,12 @@ impl Document {
     fn run_task(&mut self, task: Task) {
         match task {
             Task::Timer(id) => {
-                self.events.push(TabEvent::Timer(id));
+                self.record_event(TabEvent::Timer(id));
                 if let Some(js_id) = self.js_timer_slots.remove(&id)
                     && let Some(js) = &self.js
+                    && js.fire_timer(js_id).is_err()
                 {
-                    note_script(&mut self.events, js.fire_timer(js_id).is_err());
+                    self.record_event(TabEvent::ScriptFailed);
                 }
                 self.timers.retain(|timer| timer.id != id);
                 self.adopt_js_work();
@@ -310,7 +311,7 @@ impl Document {
                     .count(),
             );
             if pending_js_fetches >= MAX_PENDING_JS_FETCHES {
-                self.events.push(TabEvent::FetchFailed);
+                self.record_event(TabEvent::FetchFailed);
                 self.settle_js_fetch(fetch.js_id, false, 0, "");
                 continue;
             }
@@ -323,7 +324,7 @@ impl Document {
                     epoch: self.js_epoch,
                 });
             } else {
-                self.events.push(TabEvent::FetchFailed);
+                self.record_event(TabEvent::FetchFailed);
                 self.settle_js_fetch(fetch.js_id, false, 0, "");
             }
         }
