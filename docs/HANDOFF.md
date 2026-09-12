@@ -1,56 +1,45 @@
-# Handoff (2026-09-11)
+# Handoff (2026-09-12)
 
-State: Branch `wpt-pass-chasing`, HEAD `2b0a24d`, tree clean. ADR 0014 steps
-1-3, cross-realm option 2 (phases 1-2), and the DOM iframe lifecycle hook are
-committed; iframe elements are not created yet. `cargo test --workspace` 27
-suites, clippy, fmt green (all via `direnv exec .`).
+State: `main` is clean and synchronized with `origin/main` at `44f957f` (PR #6
+merged). No open PRs, nothing in flight.
 
 Done:
 
-- `488371c` engine owns one QuickJS `Runtime` + Tokio waiter; `Document` is a
-  frame; `DOMException` inherits `Error.prototype`. Proof: 27 suites; WPT
-  `dom/nodes/Node-nodeName.html`, `Element-tagName.html` passed.
-- `9083c1e`, `3de769a` frame + world registries and frame-addressed
-  commands/events. Proof: `realm_tests::realms_share_a_heap_and_resolve_*`
-  and protocol round-trip tests.
-- `bbd1f82` `DocumentStore`: trees realm-agnostic, keyed by document id.
-  Proof: 27 suites green, no behavior change.
-- `849b8ec` `RealmRegistry`: one wrapper per node shared by same-site realms
-  with the owner realm's prototypes. Proof:
-  `wrappers_are_shared_with_the_owner_realms_prototypes`.
-- `c3fd899` `dom::Lifecycle` records iframe connection transitions, including
-  later-inserted detached subtrees. Proof:
-  `connection_transitions_record_lifecycle_events`.
-
-In flight: nothing uncommitted. Step-4 fork open; ADR 0014 "Frame realm
-creation timing" (rquickjs `Context::with` borrows the runtime; no nested
-realm creation) recommends A (deferred materialization + `WindowProxy`) over
-B (context pool). Resume by writing the shared `FrameTree`.
+- PR #6 "Harden the renderer boundary" merged as `44f957f`. Branch head
+  `b3094be` merged `main` (`32cd01d`) and carried the CodeRabbit hardening set
+  plus an ADR renumber. Proof: `git diff --check`, `cargo fmt --check`, strict
+  Clippy, and full `nix develop --command cargo test --workspace --all-targets`
+  all green in `/tmp/tinybrowser-pr6-fix.e0VUcd` before merge.
+- CodeRabbit PR #6 findings were reviewed item by item and kept on merit:
+  waiter/subscriber caps, fail-closed service replies, bounded renderer
+  inbox/outbox, writer-failure shutdown, size-limited IPC encoding, and the
+  docs registry-to-factory wording. The branch ADR was renamed
+  `0016-renderer-seam-reference-monitor.md` because `0015-logging.md` landed in
+  main first.
+- PR #5 review fixes (`61adf4d`, `fc29a4a`) already in `main` were re-checked;
+  they are real fixes (rotation state on failure, 0600/0700 private mode,
+  line-break escaping), so they stay.
 
 Next:
 
-1. `FrameTree` shared by `Engine` and `Document`: mint `FrameId`, own
-   `Rc<RefCell<Document>>` frames, recursive lookup for commands/events.
-2. `HTMLIFrameElement` members (`contentWindow`, `contentDocument`, `srcdoc`,
-   `name`) + `window.frames`/`length`; create realms at safe points.
-3. `src` navigation (dial + browser mount by `FrameId`); then WebDriver
-   `switch to frame`, OOPIF, `Symbol.toStringTag`, adoption, `sandbox`.
+- Optional cleanup: remove the `/tmp/tinybrowser-pr6-fix.e0VUcd` and
+  `~/.local/share/opencode/worktree/174cc2/nimble-cactus` worktrees, and delete
+  the local `backup/pr6-coderabbit-findings` tag (pre-amend snapshot of the PR
+  #6 merge).
+- The next feature work is in ADR 0016's scope limits: browser-owned frame
+  routing / OOPIF before cross-site iframe navigation ships, and the renderer
+  sandbox. ADR 0014's frame tree steps are still open.
 
 Decisions made:
 
-- [ADR 0014](adrs/0014-frames-and-per-frame-realms.md): one `Context` per
-  frame; trees realm-agnostic; wrappers shared per node, owner prototypes;
-  cross-origin checks in the first iframe milestone.
-- Cargo tests cover product/transport/engine only; web behavior is WPT's job.
-- Realm registries live on the engine, never thread-locals.
+- CodeRabbit is advisory. Apply findings on merit; do not chase the bot. The
+  repo has no branch protection, so a CodeRabbit `CHANGES_REQUESTED` never
+  blocks a merge.
+- When a later merge finds its ADR number taken in `main`, renumber the
+  unmerged ADR (0015 logging won; renderer seam became 0016).
 
 Gotchas:
 
-- Build only inside `direnv exec .`; targeted WPT:
-  `direnv exec . ./tools/wpt/run <files>`.
-- `crates/renderer/src/js/bindings.rs` `realm_tests` is the cross-realm
-  canary (persistents, wrapper identity, registry lifetime).
-- Prefer `World::with_document`/`with_main_document` when a guard would
-  outlive the borrow.
-- `Engine` drop order: frames, registry, runtime (`JS_FreeRuntime` asserts).
-- WPT `exceptions.html` timeout waits on `iframe.onload`, not a hang.
+- Run Cargo commands inside `nix develop`; direct Cargo lacks OpenSSL/pkg-config.
+- `backup/pr6-coderabbit-findings` is a local-only tag; delete it only after
+  confirming nothing needs the pre-amend merge snapshot.
