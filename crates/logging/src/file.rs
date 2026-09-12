@@ -212,12 +212,16 @@ fn rotate(file: &mut File, path: &Path, buffer: &str, written: u64) -> u64 {
     if fs::rename(path, &backup).is_err() {
         return write_current(file, buffer, previous);
     }
-    let fresh = File::options()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(path);
+    let mut options = File::options();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let fresh = options.open(path);
     if let Ok(fresh) = fresh {
+        let _ = restrict_file(path);
         *file = fresh;
         write_current(file, buffer, len(buffer))
     } else {
@@ -416,6 +420,26 @@ mod tests {
         let dir_mode = fs::metadata(&dir).expect("dir").permissions().mode() & 0o777;
         assert_eq!(file_mode, 0o600, "log file");
         assert_eq!(dir_mode, 0o700, "log directory");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rotated_log_files_are_user_private() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let (dir, path) = temp_path("rotated-permissions");
+        let file = open(&path).expect("file");
+        let (tx, rx) = mpsc::sync_channel(8);
+        let writer_path = path.clone();
+        let writer = thread::spawn(move || run(&rx, &writer_path, file, 1));
+
+        assert!(tx.try_send(Message::Line("rotate".to_owned())).is_ok());
+        flush(&tx);
+        assert!(tx.try_send(Message::Stop).is_ok());
+        writer.join().expect("writer");
+
+        let mode = fs::metadata(&path).expect("live").permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "rotated log file");
         let _ = fs::remove_dir_all(dir);
     }
 }
