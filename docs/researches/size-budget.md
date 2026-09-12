@@ -341,7 +341,7 @@ and the renderer runtime stays current-thread `rt`+`time`.
 
 [ADR 0011](../adrs/0011-renderer-processes-per-site.md) split the engine into
 the `renderer` crate (parser, `Dom`, QuickJS, value-only seam) and the `browser`
-browser side (Browser, tab `Tab`, navigation, `NetworkSession`, renderer registry).
+browser side (Browser, tab `Tab`, navigation, `NetworkSession`, renderer factory).
 The browser process spawns one `--renderer` process per site instance; tests use the
 in-process local backend. Command: `nix develop --command cargo build --release
 --example tab_probe --bin tinybrowser`; rustc 1.98.0, committed stripped
@@ -353,7 +353,7 @@ x86_64 release profile.
 | page engine (`target/release/examples/tab_probe`) | 3,582,736 | 6,417,264 |
 
 The CLI grew 185,584 bytes over the axum+clap row (4,421,008): serde-derive IPC
-types, the renderer link/registry, and process spawn/IO. The probe grew 193,648
+types, the renderer link/factory, and process spawn/IO. The probe grew 193,648
 bytes (3,389,088) because it now links the same browser+renderer pair the shipping
 binary does. Renderer `serde` is confined to the `protocol` module. QuickJS
 stays per realm; the renderer process is the isolation unit.
@@ -412,3 +412,21 @@ release profile; both sides ran plain `cargo build --release --bin tinybrowser
 The probe delta is the cleaner marginal for the crate and the browser/renderer
 wiring; the CLI delta adds the clap surface (level value parser, help text) and
 the per-process file config. Both numbers are recorded in ADR 0015.
+
+## Milestone: renderer reference monitor and bounded queues (2026-09-12)
+
+[ADR 0016](../adrs/0016-renderer-seam-reference-monitor.md) added browser-owned
+site-lock validation, an 8 MiB IPC frame limit, bounded command/event retention,
+and removed the unbounded idle-renderer pool. Command: `nix develop --command
+cargo build --release --offline --example tab_probe --bin tinybrowser`; rustc
+1.98.0, stripped x86_64 release profile.
+
+| Artifact | Bytes | Headroom to 10,000,000 |
+| --- | ---: | ---: |
+| CLI (`target/release/tinybrowser`) | 5,313,616 | 4,686,384 |
+| page engine (`target/release/examples/tab_probe`) | 4,267,488 | 5,732,512 |
+
+The CLI grew 91,440 bytes and the probe 85,456 bytes from the prior checkpoint.
+The shared bounded JSON codec accounts for most new code; deleting idle pooling
+keeps runtime process growth tied to live documents. The shipping binary remains
+46.9% below the hard limit.

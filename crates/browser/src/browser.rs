@@ -7,7 +7,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use crate::actor::{TabActor, TabHandle, TabId};
-use crate::link::{RendererRegistry, Renderers};
+use crate::link::{RendererFactory, Renderers};
 use crate::network::{NetworkSession, ProfileStore};
 use crate::profile::{Profile, ProfileName};
 
@@ -19,7 +19,7 @@ pub struct Browser {
 struct BrowserInner {
     live: bool,
     network: NetworkSession,
-    registry: Arc<RendererRegistry>,
+    renderers: Arc<RendererFactory>,
     tabs: HashMap<TabId, TabActor>,
     next_tab: u64,
 }
@@ -94,12 +94,12 @@ impl Browser {
     /// [`Browser::open_with_network`] with an explicit renderer backend.
     #[must_use]
     pub fn open_with_network_and(network: NetworkSession, renderers: Renderers) -> Self {
-        let registry = Arc::new(RendererRegistry::new(renderers, network.fetch_handle()));
+        let renderers = Arc::new(RendererFactory::new(renderers, network.fetch_handle()));
         Self {
             inner: Arc::new(Mutex::new(BrowserInner {
                 live: true,
                 network,
-                registry,
+                renderers,
                 tabs: HashMap::new(),
                 next_tab: 1,
             })),
@@ -162,8 +162,8 @@ impl BrowserHandle {
         let id = TabId::new(inner.next_tab);
         inner.next_tab = inner.next_tab.saturating_add(1);
         let fetch = inner.network.fetch_handle();
-        let registry = Arc::clone(&inner.registry);
-        let actor = TabActor::spawn(id, fetch, registry);
+        let renderers = Arc::clone(&inner.renderers);
+        let actor = TabActor::spawn(id, fetch, renderers);
         let handle = actor.handle.clone();
         inner.tabs.insert(id, actor);
         Ok(handle)
@@ -226,7 +226,6 @@ impl BrowserHandle {
         };
         if should_close_pages {
             self.close_all();
-            self.lock().registry.shutdown();
         }
         self.persist()
     }

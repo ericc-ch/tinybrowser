@@ -336,13 +336,16 @@ impl FetchHandle {
     }
 
     /// Blocking GET for one renderer service call.
-    pub(crate) fn dial_request(&self, request: &DialRequest) -> Option<DialOutcome> {
+    pub(crate) fn dial_request(
+        &self,
+        request: &DialRequest,
+        initiator: &Url,
+    ) -> Option<DialOutcome> {
         let url = Url::parse(&request.url).ok()?;
-        let initiator = Url::parse(&request.initiator).ok()?;
         let response = self
             .request(Method::GET, url)
             .with_initiator_kind(InitiatorKind::Fetch)
-            .with_initiator(initiator)
+            .with_initiator(initiator.clone())
             .send()
             .ok()?;
         self.store.mark_dirty();

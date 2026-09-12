@@ -1,6 +1,6 @@
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use browser::{Browser, Profile, RemoteValue, Renderers, TabEvent};
+use browser::{Browser, Profile, RemoteValue, Renderers, ResourceLimit, TabError, TabEvent};
 
 fn temp_data_home() -> std::path::PathBuf {
     let stamp = SystemTime::now()
@@ -21,6 +21,8 @@ fn page_handle_commands_are_values_only() {
     let handle = browser.handle();
     let tab = handle.create_tab().expect("tab");
     let first = tab.next_request_id();
+    tab.set_document_url("http://example.test/")
+        .expect("document url");
     tab.load_html("<!doctype html><p id=x>hi</p>")
         .expect("load html");
     assert_ne!(tab.next_request_id().get(), first.get());
@@ -42,8 +44,6 @@ fn page_handle_commands_are_values_only() {
         tab.execute_script("document.body").expect("node"),
         RemoteValue::Node(_)
     ));
-    tab.set_document_url("http://example.test/")
-        .expect("document url");
     tab.set_document_cookie("a=1").expect("cookie");
     assert_eq!(tab.document_cookie().expect("cookie get"), "a=1");
     assert!(!tab.last_navigation_failed().expect("nav"));
@@ -51,6 +51,28 @@ fn page_handle_commands_are_values_only() {
     tab.shutdown().expect("shutdown");
     handle.close_tab(tab.id()).expect("remove stopped tab");
     handle.close_tab(tab.id()).expect_err("unknown after close");
+    let _ = std::fs::remove_dir_all(data_home);
+}
+
+#[test]
+fn a_live_renderer_cannot_rewrite_its_document_origin() {
+    let data_home = temp_data_home();
+    let browser =
+        Browser::open_in_with(&data_home, &Profile::default(), Renderers::Local).expect("browser");
+    let tab = browser.handle().create_tab().expect("tab");
+    tab.set_document_url("https://a.example.test/start")
+        .expect("initial url");
+    tab.load_html("<!doctype html><title></title>")
+        .expect("load");
+
+    assert!(matches!(
+        tab.set_document_url("https://b.example.test/next"),
+        Err(TabError::InvalidUrl { .. })
+    ));
+    assert_eq!(
+        tab.document_url().expect("document url"),
+        "https://a.example.test/start"
+    );
     let _ = std::fs::remove_dir_all(data_home);
 }
 
@@ -109,6 +131,82 @@ fn page_events_are_pushed_to_subscribers() {
         events.recv_timeout(Duration::from_secs(1)).expect("event"),
         TabEvent::Load
     );
+    let _ = std::fs::remove_dir_all(data_home);
+}
+
+#[test]
+fn subscriber_registrations_have_a_fixed_memory_budget() {
+    let data_home = temp_data_home();
+    let browser =
+        Browser::open_in_with(&data_home, &Profile::default(), Renderers::Local).expect("browser");
+    let tab = browser.handle().create_tab().expect("tab");
+
+    for _ in 0..256 {
+        drop(tab.subscribe().expect("subscriber within budget"));
+    }
+    assert!(matches!(
+        tab.subscribe(),
+        Err(TabError::ResourceLimit {
+            resource: ResourceLimit::TabSubscribers
+        })
+    ));
+    let _ = std::fs::remove_dir_all(data_home);
+}
+
+#[test]
+fn retained_waiters_have_a_fixed_memory_budget() {
+    use std::sync::{Arc, Barrier, mpsc};
+
+    let data_home = temp_data_home();
+    let browser =
+        Browser::open_in_with(&data_home, &Profile::default(), Renderers::Local).expect("browser");
+    let tab = browser.handle().create_tab().expect("tab");
+    let barrier = Arc::new(Barrier::new(258));
+    let (result_tx, result_rx) = mpsc::channel();
+    let mut waiters = Vec::new();
+
+    for _ in 0..257 {
+        let waiter = tab.clone();
+        let start = Arc::clone(&barrier);
+        let result_tx = result_tx.clone();
+        waiters.push(std::thread::spawn(move || {
+            start.wait();
+            let _ = result_tx.send(waiter.run_until_load());
+        }));
+    }
+    drop(result_tx);
+    barrier.wait();
+
+    let result = result_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("one waiter must be rejected");
+    assert!(matches!(
+        result,
+        Err(TabError::ResourceLimit {
+            resource: ResourceLimit::TabWaiters
+        })
+    ));
+
+    tab.shutdown().expect("shutdown");
+    for waiter in waiters {
+        waiter.join().expect("waiter thread");
+    }
+    let _ = std::fs::remove_dir_all(data_home);
+}
+
+#[test]
+fn tab_event_history_has_a_fixed_memory_budget() {
+    let data_home = temp_data_home();
+    let browser =
+        Browser::open_in_with(&data_home, &Profile::default(), Renderers::Local).expect("browser");
+    let tab = browser.handle().create_tab().expect("tab");
+    tab.load_html("<!doctype html><title></title>")
+        .expect("load");
+    tab.eval("for (let i = 0; i < 1100; i++) setTimeout(() => {}, 0)")
+        .expect("timers");
+    tab.run().expect("drain");
+
+    assert_eq!(tab.events().expect("events").len(), 1024);
     let _ = std::fs::remove_dir_all(data_home);
 }
 

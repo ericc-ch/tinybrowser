@@ -29,6 +29,7 @@ mod pump;
 pub use crate::js::ScriptValue;
 
 const MAX_PENDING_JS_FETCHES: usize = 256;
+const MAX_PENDING_EVENTS: usize = 2048;
 
 enum Task {
     Timer(u32),
@@ -119,6 +120,7 @@ pub struct Document {
     in_flight_dials: usize,
     queued_dials: Vec<QueuedDial>,
     events: Vec<TabEvent>,
+    events_overflowed: bool,
     js: Option<crate::js::JsRealm>,
     js_timer_slots: HashMap<u32, i32>,
     js_epoch: u64,
@@ -191,6 +193,7 @@ impl Document {
             in_flight_dials: 0,
             queued_dials: Vec::new(),
             events: Vec::new(),
+            events_overflowed: false,
             js: None,
             js_timer_slots: HashMap::new(),
             js_epoch: 0,
@@ -237,8 +240,10 @@ impl Document {
     }
 
     pub(crate) fn fire_node_load(&mut self, id: dom::NodeId) {
-        if let Some(js) = &self.js {
-            note_script(&mut self.events, js.fire_node_load(id).is_err());
+        if let Some(js) = &self.js
+            && js.fire_node_load(id).is_err()
+        {
+            self.record_event(TabEvent::ScriptFailed);
         }
         self.adopt_js_work();
     }
@@ -330,6 +335,14 @@ impl Document {
     #[must_use]
     pub fn events(&self) -> &[TabEvent] {
         &self.events
+    }
+
+    pub(crate) fn take_events(&mut self) -> Result<Vec<TabEvent>, ()> {
+        if std::mem::take(&mut self.events_overflowed) {
+            self.events.clear();
+            return Err(());
+        }
+        Ok(std::mem::take(&mut self.events))
     }
 
     /// Replaces the document from a host mount: new realm, decoded bytes,
@@ -431,8 +444,10 @@ impl Document {
         // https://html.spec.whatwg.org/multipage/webappapis.html#run-a-classic-script
         let previous = self.world.borrow().current_script;
         self.world.borrow_mut().current_script = element;
-        if let Some(js) = &self.js {
-            note_script(&mut self.events, js.eval(source).is_err());
+        if let Some(js) = &self.js
+            && js.eval(source).is_err()
+        {
+            self.record_event(TabEvent::ScriptFailed);
         }
         self.world.borrow_mut().current_script = previous;
         self.adopt_js_work();
@@ -444,8 +459,10 @@ impl Document {
     /// the document's `MutationObserver`s would otherwise not fire until the
     /// next scripted mutation.
     fn deliver_mutations(&mut self) {
-        if let Some(js) = &self.js {
-            note_script(&mut self.events, js.deliver_mutations().is_err());
+        if let Some(js) = &self.js
+            && js.deliver_mutations().is_err()
+        {
+            self.record_event(TabEvent::ScriptFailed);
         }
     }
 
@@ -463,7 +480,7 @@ impl Document {
                         let document = self.world.borrow_mut().replace_document(parsed);
                         self.register_document(document);
                         if self.ensure_js().is_err() {
-                            self.events.push(TabEvent::ScriptFailed);
+                            self.record_event(TabEvent::ScriptFailed);
                             self.sync_parser_from_world();
                             continue;
                         }
@@ -517,7 +534,7 @@ impl Document {
                         let document = self.world.borrow_mut().replace_document(parsed);
                         self.register_document(document);
                         if self.ensure_js().is_err() {
-                            self.events.push(TabEvent::ScriptFailed);
+                            self.record_event(TabEvent::ScriptFailed);
                             return;
                         }
                     } else {
@@ -566,7 +583,7 @@ impl Document {
                 id,
                 epoch,
             } => {
-                self.events.push(TabEvent::Fetch { status });
+                self.record_event(TabEvent::Fetch { status });
                 if epoch == self.js_epoch {
                     let body = String::from_utf8_lossy(&body);
                     self.settle_js_fetch(id, true, i32::from(status), &body);
@@ -578,7 +595,7 @@ impl Document {
                 element,
                 epoch,
             } => {
-                self.events.push(TabEvent::Fetch { status });
+                self.record_event(TabEvent::Fetch { status });
                 if epoch == self.js_epoch {
                     self.classic_fetch_in_flight = false;
                     if (200..300).contains(&status) {
@@ -594,7 +611,7 @@ impl Document {
     }
 
     pub(in crate::document) fn fail_dial(&mut self, fail: DialFail) {
-        self.events.push(TabEvent::FetchFailed);
+        self.record_event(TabEvent::FetchFailed);
         match fail {
             DialFail::JsFetch { id, epoch } => {
                 if epoch == self.js_epoch {
@@ -619,11 +636,10 @@ impl Document {
         status: i32,
         body: &str,
     ) {
-        if let Some(js) = &self.js {
-            note_script(
-                &mut self.events,
-                js.finish_js_fetch(id, ok, status, body).is_err(),
-            );
+        if let Some(js) = &self.js
+            && js.finish_js_fetch(id, ok, status, body).is_err()
+        {
+            self.record_event(TabEvent::ScriptFailed);
         }
     }
 
@@ -650,17 +666,21 @@ impl Document {
             return;
         }
         self.world.borrow_mut().document_ready = true;
-        self.events.push(TabEvent::Load);
-        if let Some(js) = &self.js {
-            note_script(&mut self.events, js.fire_load().is_err());
+        self.record_event(TabEvent::Load);
+        if let Some(js) = &self.js
+            && js.fire_load().is_err()
+        {
+            self.record_event(TabEvent::ScriptFailed);
         }
         self.adopt_js_work();
     }
-}
 
-pub(crate) fn note_script(events: &mut Vec<TabEvent>, failed: bool) {
-    if failed {
-        events.push(TabEvent::ScriptFailed);
+    pub(in crate::document) fn record_event(&mut self, event: TabEvent) {
+        if self.events.len() == MAX_PENDING_EVENTS {
+            self.events_overflowed = true;
+            return;
+        }
+        self.events.push(event);
     }
 }
 

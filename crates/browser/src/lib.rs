@@ -18,9 +18,8 @@ mod site;
 
 pub use actor::{RequestId, TabHandle, TabId};
 pub use browser::{Browser, BrowserError, BrowserHandle};
-pub use link::{RendererId, RendererRegistry, Renderers};
+pub use link::Renderers;
 pub use net::{Agent, AgentBuilder};
 pub use network::{FetchHandle, NetworkSession, ProfileStore};
 pub use profile::{Profile, ProfileError, ProfileName};
-pub use renderer::{RemoteValue, ScriptFailure, TabError, TabEvent};
-pub use site::Site;
+pub use renderer::{RemoteValue, ResourceLimit, ScriptFailure, TabError, TabEvent};
