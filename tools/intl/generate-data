@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+DATAGEN="${ICU4X_DATAGEN:-icu4x-datagen}"
+BINARY="${1:-$ROOT/target/release/tinybrowser}"
+OUTPUT="$ROOT/crates/renderer/src/js/intl_data.postcard"
+EXPECTED_VERSION="icu4x-datagen 2.3.0"
+
+if [[ "$("$DATAGEN" --version)" != "$EXPECTED_VERSION" ]]; then
+  echo "$EXPECTED_VERSION is required to regenerate Intl data" >&2
+  exit 1
+fi
+
+if [[ ! -x "$BINARY" ]]; then
+  echo "marker binary not found: $BINARY" >&2
+  exit 1
+fi
+
+"$DATAGEN" \
+  --markers-for-bin "$BINARY" \
+  --locales en-US es-ES de-DE ja-JP fr-FR zh-CN ko-KR \
+  --format blob \
+  --deduplication maximal \
+  --out "$OUTPUT" \
+  --overwrite

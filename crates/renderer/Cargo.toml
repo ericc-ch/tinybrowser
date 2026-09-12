@@ -15,6 +15,19 @@ markup5ever = "=0.39.0"
 html5ever = "=0.39.0"
 tendril = "0.5"
 encoding_rs = "0.8"
+# ECMA-402 formatting uses a locale-filtered ICU4X blob generated for the
+# supported locale set; compiled_data would retain every CLDR locale.
+fixed_decimal = { version = "0.7.2", features = ["ryu"] }
+icu_calendar = { version = "2.3.0", default-features = false }
+icu_datetime = { version = "2.3.0", default-features = false, features = ["serde"] }
+icu_decimal = { version = "2.3.0", default-features = false, features = ["alloc", "ryu", "serde"] }
+icu_experimental = { version = "0.6.0", default-features = false, features = ["ryu", "serde"] }
+icu_locale = { version = "2.3.1", default-features = false, features = ["serde"] }
+icu_locale_core = "2.3.0"
+icu_provider = { version = "2.3.1", default-features = false }
+icu_provider_adapters = { version = "2.3.0", features = ["serde"] }
+icu_provider_blob = { version = "2.3.0", features = ["alloc"] }
+writeable = "0.6"
 # Renderer waiter: current-thread `rt`+`time`; never a multi-thread server stack.
 tokio = { version = "1.53", default-features = false, features = ["rt", "time"] }
 url = "2"
