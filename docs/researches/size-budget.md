@@ -392,3 +392,21 @@ browser-owned executor; dial completion wakes the current-thread renderer
 waiter instead of being polled every millisecond. The preceding size row
 predates the frames/realms merge, so this checkpoint is the new comparison
 baseline rather than an attribution of the full delta to this cleanup.
+
+## Milestone: renderer reference monitor and bounded queues (2026-09-12)
+
+[ADR 0015](../adrs/0015-renderer-seam-reference-monitor.md) added browser-owned
+site-lock validation, an 8 MiB IPC frame limit, bounded command/event retention,
+and removed the unbounded idle-renderer pool. Command: `nix develop --command
+cargo build --release --offline --example tab_probe --bin tinybrowser`; rustc
+1.98.0, stripped x86_64 release profile.
+
+| Artifact | Bytes | Headroom to 10,000,000 |
+| --- | ---: | ---: |
+| CLI (`target/release/tinybrowser`) | 5,313,616 | 4,686,384 |
+| page engine (`target/release/examples/tab_probe`) | 4,267,488 | 5,732,512 |
+
+The CLI grew 91,440 bytes and the probe 85,456 bytes from the prior checkpoint.
+The shared bounded JSON codec accounts for most new code; deleting idle pooling
+keeps runtime process growth tied to live documents. The shipping binary remains
+46.9% below the hard limit.

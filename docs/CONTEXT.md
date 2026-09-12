@@ -97,7 +97,7 @@ The active document of a Frame: `Dom`, QuickJS realm, active parser, tasks, and 
 _Avoid_: page, tab, frame
 
 **Frame**:
-One navigable as our implementation models it: a `Document` plus its QuickJS realm inside a renderer process, addressed by `FrameId`. A tab's **main frame** is its top-level navigable; a **child frame** is an `iframe`'s content navigable. The browser process owns the frame tree (parent, container element, site, URL, load state); the renderer hosts the frame's document ([ADR 0014](adrs/0014-frames-and-per-frame-realms.md)).
+One navigable as our implementation models it: a `Document` plus its QuickJS realm inside a renderer process, addressed by `FrameId`. A tab's **main frame** is its top-level navigable; a **child frame** is an `iframe`'s content navigable. The renderer currently owns its child-frame registry. Browser-owned global frame identity and cross-site process routing are required before network-backed cross-site iframe navigation ships ([ADR 0014](adrs/0014-frames-and-per-frame-realms.md)).
 _Avoid_: browsing context (the spec's older umbrella term), window (the realm global)
 
 **FrameId**:
@@ -124,6 +124,14 @@ _Avoid_: TabHandle (the tab handle protocols hold)
 The value-only message boundary between browser process and renderer process ([ADR 0011](adrs/0011-renderer-processes-per-site.md)). In-process backends implement the same messages for tests; the process backend puts them on a pipe or socket. HTTP is not used here.
 _Avoid_: RPC, HTTP, CDP
 
+**Renderer site lock**:
+An immutable browser-process authorization bound to one renderer before content is mounted. A renderer may request cookies or claim an initiator only for URLs in that schemeful site; an opaque lock accepts only `about:`, `blob:`, and `data:` documents. The browser process validates every child service call and terminates a process renderer on a violation ([ADR 0015](adrs/0015-renderer-seam-reference-monitor.md)). This is a reference-monitor property, not a renderer sandbox.
+_Avoid_: trusting the renderer's initiator string, treating a process boundary alone as a sandbox
+
+**IPC message budget**:
+The maximum encoded size of one browser/renderer message: 8 MiB, enforced before JSON deserialization in both directions. Navigation bodies have their smaller 1 MiB budget. Oversized or undelimited process messages terminate the renderer transport ([ADR 0015](adrs/0015-renderer-seam-reference-monitor.md)).
+_Avoid_: line length, body limit (those are different budgets)
+
 **TabActor**:
 The browser-process coordinator thread for one `Tab`: identity, navigation dials, waiters, and the renderer link. It owns no DOM and no JS; the renderer process owns the `Document` ([ADR 0011](adrs/0011-renderer-processes-per-site.md)).
 _Avoid_: renderer process (the process that owns the document), tab thread as a Spectre boundary
@@ -149,7 +157,7 @@ The process-side half of the browser: `Browser`, the tab registry, `NetworkSessi
 _Avoid_: host (as a noun), daemon process, browser (the `Browser` type), UI process
 
 **Browser**:
-One browser process hosts one Browser bound to one named Profile. Browser owns `ProfileStore`, the shared `NetworkSession`, the tab registry of `TabHandle`s, and the renderer registry keyed by site instance ([ADR 0010](adrs/0010-page-actor-ownership.md), [ADR 0011](adrs/0011-renderer-processes-per-site.md)).
+One browser process hosts one Browser bound to one named Profile. Browser owns `ProfileStore`, the shared `NetworkSession`, the tab registry of `TabHandle`s, and the renderer factory that applies browser-owned site locks ([ADR 0010](adrs/0010-page-actor-ownership.md), [ADR 0011](adrs/0011-renderer-processes-per-site.md)).
 _Avoid_: WebDriver session (that is automation state only), Profile as a runtime owner between Browser and tabs
 
 **BrowserHandle**:

@@ -1,6 +1,6 @@
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use browser::{Browser, Profile, RemoteValue, Renderers, TabEvent};
+use browser::{Browser, Profile, RemoteValue, Renderers, TabError, TabEvent};
 
 fn temp_data_home() -> std::path::PathBuf {
     let stamp = SystemTime::now()
@@ -21,6 +21,8 @@ fn page_handle_commands_are_values_only() {
     let handle = browser.handle();
     let tab = handle.create_tab().expect("tab");
     let first = tab.next_request_id();
+    tab.set_document_url("http://example.test/")
+        .expect("document url");
     tab.load_html("<!doctype html><p id=x>hi</p>")
         .expect("load html");
     assert_ne!(tab.next_request_id().get(), first.get());
@@ -42,8 +44,6 @@ fn page_handle_commands_are_values_only() {
         tab.execute_script("document.body").expect("node"),
         RemoteValue::Node(_)
     ));
-    tab.set_document_url("http://example.test/")
-        .expect("document url");
     tab.set_document_cookie("a=1").expect("cookie");
     assert_eq!(tab.document_cookie().expect("cookie get"), "a=1");
     assert!(!tab.last_navigation_failed().expect("nav"));
@@ -51,6 +51,28 @@ fn page_handle_commands_are_values_only() {
     tab.shutdown().expect("shutdown");
     handle.close_tab(tab.id()).expect("remove stopped tab");
     handle.close_tab(tab.id()).expect_err("unknown after close");
+    let _ = std::fs::remove_dir_all(data_home);
+}
+
+#[test]
+fn a_live_renderer_cannot_rewrite_its_document_origin() {
+    let data_home = temp_data_home();
+    let browser =
+        Browser::open_in_with(&data_home, &Profile::default(), Renderers::Local).expect("browser");
+    let tab = browser.handle().create_tab().expect("tab");
+    tab.set_document_url("https://a.example.test/start")
+        .expect("initial url");
+    tab.load_html("<!doctype html><title></title>")
+        .expect("load");
+
+    assert!(matches!(
+        tab.set_document_url("https://b.example.test/next"),
+        Err(TabError::InvalidUrl { .. })
+    ));
+    assert_eq!(
+        tab.document_url().expect("document url"),
+        "https://a.example.test/start"
+    );
     let _ = std::fs::remove_dir_all(data_home);
 }
 
@@ -109,6 +131,22 @@ fn page_events_are_pushed_to_subscribers() {
         events.recv_timeout(Duration::from_secs(1)).expect("event"),
         TabEvent::Load
     );
+    let _ = std::fs::remove_dir_all(data_home);
+}
+
+#[test]
+fn tab_event_history_has_a_fixed_memory_budget() {
+    let data_home = temp_data_home();
+    let browser =
+        Browser::open_in_with(&data_home, &Profile::default(), Renderers::Local).expect("browser");
+    let tab = browser.handle().create_tab().expect("tab");
+    tab.load_html("<!doctype html><title></title>")
+        .expect("load");
+    tab.eval("for (let i = 0; i < 1100; i++) setTimeout(() => {}, 0)")
+        .expect("timers");
+    tab.run().expect("drain");
+
+    assert_eq!(tab.events().expect("events").len(), 1024);
     let _ = std::fs::remove_dir_all(data_home);
 }
 

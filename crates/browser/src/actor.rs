@@ -4,9 +4,10 @@
 //! process dials, picks the site renderer, and mounts the document; the renderer
 //! owns the document. `TabHandle` is the protocol surface and stays value-only.
 
+use std::collections::VecDeque;
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -16,9 +17,13 @@ use renderer::{
 };
 use url::Url;
 
-use crate::link::{RendererHandle, RendererRegistry};
+use crate::link::{RendererFactory, RendererHandle};
 use crate::network::{FetchHandle, NavOutcome};
 use crate::site::Site;
+
+const MAX_EVENT_HISTORY: usize = 1024;
+const EVENT_SUBSCRIBER_CAPACITY: usize = 256;
+const COMMAND_CAPACITY: usize = 256;
 
 /// Identity of one tab in a [`crate::Browser`] registry.
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
@@ -145,7 +150,7 @@ pub struct TabHandle {
     id: TabId,
     next_request: Arc<AtomicU64>,
     current: Arc<Mutex<Option<Arc<RendererHandle>>>>,
-    tx: Sender<Envelope>,
+    tx: SyncSender<Envelope>,
 }
 
 impl TabHandle {
@@ -327,7 +332,7 @@ impl TabHandle {
         recv_unit(&rx)
     }
 
-    /// Sets the document URL used as cookie initiator and relative-URL base.
+    /// Sets the initial document URL before the first mount.
     ///
     /// # Errors
     ///
@@ -341,7 +346,7 @@ impl TabHandle {
         recv_result(&rx)
     }
 
-    /// Jobs that have already run, in order.
+    /// The most recent jobs that ran, in order, capped at 1,024 events.
     ///
     /// # Errors
     ///
@@ -440,8 +445,8 @@ pub(crate) struct TabActor {
 }
 
 impl TabActor {
-    pub(crate) fn spawn(id: TabId, fetch: FetchHandle, registry: Arc<RendererRegistry>) -> Self {
-        let (tx, rx) = mpsc::channel();
+    pub(crate) fn spawn(id: TabId, fetch: FetchHandle, renderers: Arc<RendererFactory>) -> Self {
+        let (tx, rx) = mpsc::sync_channel(COMMAND_CAPACITY);
         let current = Arc::new(Mutex::new(None));
         let handle = TabHandle {
             id,
@@ -449,7 +454,7 @@ impl TabActor {
             current: Arc::clone(&current),
             tx,
         };
-        let tab = Tab::new(id, fetch, registry, current);
+        let tab = Tab::new(id, fetch, renderers, current);
         let join = thread::Builder::new()
             .name(format!("tab-{id}"))
             .spawn(move || actor_loop(&rx, tab))
@@ -490,7 +495,7 @@ struct ActiveNavigation {
 /// Browser-owned tab state: identity, URL, navigation, and the renderer link.
 struct Tab {
     id: TabId,
-    registry: Arc<RendererRegistry>,
+    renderers: Arc<RendererFactory>,
     fetch: FetchHandle,
     current: Arc<Mutex<Option<Arc<RendererHandle>>>>,
     renderer: Option<Arc<RendererHandle>>,
@@ -505,20 +510,21 @@ struct Tab {
     nav: Option<ActiveNavigation>,
     dial_tx: Sender<(u64, Result<NavOutcome, ()>)>,
     dial_rx: Receiver<(u64, Result<NavOutcome, ()>)>,
-    events: Vec<TabEvent>,
+    events: VecDeque<TabEvent>,
+    subscribers: Vec<SyncSender<TabEvent>>,
 }
 
 impl Tab {
     fn new(
         id: TabId,
         fetch: FetchHandle,
-        registry: Arc<RendererRegistry>,
+        renderers: Arc<RendererFactory>,
         current: Arc<Mutex<Option<Arc<RendererHandle>>>>,
     ) -> Self {
         let (dial_tx, dial_rx) = mpsc::channel();
         Self {
             id,
-            registry,
+            renderers,
             fetch,
             current,
             renderer: None,
@@ -533,14 +539,17 @@ impl Tab {
             nav: None,
             dial_tx,
             dial_rx,
-            events: Vec::new(),
+            events: VecDeque::new(),
+            subscribers: Vec::new(),
         }
     }
 
     fn load_html(&mut self, html: &str) -> Result<(), TabError> {
-        let site = self.site.clone().unwrap_or_else(|| Site::opaque(self.id));
+        let site = Site::for_url(&self.document_url)
+            .or_else(|| self.site.clone())
+            .unwrap_or_else(|| Site::opaque(self.id));
         let mount = Mount {
-            url: "about:blank".to_owned(),
+            url: self.document_url.to_string(),
             content_type: Some("text/html; charset=utf-8".to_owned()),
             content_language: None,
             body: html.as_bytes().to_vec(),
@@ -574,14 +583,10 @@ impl Tab {
 
     fn set_document_url(&mut self, url: &str) -> Result<(), TabError> {
         let parsed = Url::parse(url).map_err(|_| TabError::InvalidUrl { spec: url.into() })?;
+        if self.renderer.is_some() {
+            return Err(TabError::InvalidUrl { spec: url.into() });
+        }
         self.document_url = parsed;
-        // A fresh tab may not have a renderer yet; the URL is browser state and
-        // mounts carry it, so the forward is best-effort.
-        let command = RendererCommand::SetDocumentUrl {
-            frame: FrameId::MAIN,
-            url: url.to_owned(),
-        };
-        let _result = self.renderer_request(command).and_then(reply_unit);
         Ok(())
     }
 
@@ -598,14 +603,12 @@ impl Tab {
             return Ok(());
         }
         let handle =
-            self.registry
+            self.renderers
                 .acquire(site)
                 .map_err(|error| TabError::RendererUnavailable {
                     message: error.to_string(),
                 })?;
-        if let Some(old) = self.renderer.take() {
-            self.registry.release(old);
-        }
+        self.drop_renderer();
         self.events_rx = Some(handle.subscribe());
         *self.current.lock().unwrap_or_else(PoisonError::into_inner) = Some(Arc::clone(&handle));
         self.site = Some(site.clone());
@@ -676,12 +679,12 @@ impl Tab {
             }
             self.nav = None;
             if let Ok(outcome) = result {
-                self.events.push(TabEvent::Fetch {
+                self.record_event(TabEvent::Fetch {
                     status: outcome.status,
                 });
                 self.commit_navigation(outcome);
             } else {
-                self.events.push(TabEvent::FetchFailed);
+                self.record_event(TabEvent::FetchFailed);
                 self.navigation_failed = true;
             }
         }
@@ -713,8 +716,17 @@ impl Tab {
             if frame == FrameId::MAIN && event == TabEvent::Load {
                 self.document_loaded = true;
             }
-            self.events.push(event);
+            self.record_event(event);
         }
+    }
+
+    fn record_event(&mut self, event: TabEvent) {
+        if self.events.len() == MAX_EVENT_HISTORY {
+            self.events.pop_front();
+        }
+        self.events.push_back(event);
+        self.subscribers
+            .retain(|subscriber| matches!(subscriber.try_send(event), Ok(())));
     }
 
     fn busy(&self) -> bool {
@@ -747,14 +759,12 @@ impl Tab {
 }
 
 fn actor_loop(rx: &Receiver<Envelope>, mut tab: Tab) {
-    let mut subscribers = Vec::new();
-    let mut published_events = 0;
     let mut waiters = Vec::new();
     loop {
         tab.pump_renderer();
         tab.launch_navigation();
         tab.pump_navigation();
-        let received = if tab.busy() || !waiters.is_empty() || !subscribers.is_empty() {
+        let received = if tab.busy() || !waiters.is_empty() || !tab.subscribers.is_empty() {
             rx.recv_timeout(Duration::from_millis(10))
         } else {
             rx.recv().map_err(|_| RecvTimeoutError::Disconnected)
@@ -762,30 +772,23 @@ fn actor_loop(rx: &Receiver<Envelope>, mut tab: Tab) {
         let envelope = match received {
             Ok(envelope) => envelope,
             Err(RecvTimeoutError::Timeout) => {
-                publish_events(&tab, &mut published_events, &mut subscribers);
                 resolve_waiters(&mut tab, &mut waiters);
                 continue;
             }
             Err(RecvTimeoutError::Disconnected) => break,
         };
         let _request_id = envelope.request_id;
-        if handle_command(&mut tab, envelope.command, &mut waiters, &mut subscribers) {
+        if handle_command(&mut tab, envelope.command, &mut waiters) {
             return;
         }
         tab.pump_renderer();
-        publish_events(&tab, &mut published_events, &mut subscribers);
         resolve_waiters(&mut tab, &mut waiters);
     }
     tab.stop_renderer();
 }
 
 /// Handles one command; `true` means the actor returns.
-fn handle_command(
-    tab: &mut Tab,
-    command: Command,
-    waiters: &mut Vec<Waiter>,
-    subscribers: &mut Vec<Sender<TabEvent>>,
-) -> bool {
+fn handle_command(tab: &mut Tab, command: Command, waiters: &mut Vec<Waiter>) -> bool {
     match command {
         Command::LoadHtml { html, reply } => {
             let _ = reply.send(tab.load_html(&html));
@@ -856,11 +859,11 @@ fn handle_command(
             let _ = reply.send(tab.set_document_url(&url));
         }
         Command::Events { reply } => {
-            let _ = reply.send(tab.events.clone());
+            let _ = reply.send(tab.events.iter().copied().collect());
         }
         Command::Subscribe { reply } => {
-            let (events, event_rx) = mpsc::channel();
-            subscribers.push(events);
+            let (events, event_rx) = mpsc::sync_channel(EVENT_SUBSCRIBER_CAPACITY);
+            tab.subscribers.push(events);
             let _ = reply.send(event_rx);
         }
         Command::LastNavigationFailed { reply } => {
@@ -920,12 +923,6 @@ fn resolve_waiters(tab: &mut Tab, waiters: &mut Vec<Waiter>) {
         }
     }
     *waiters = pending;
-}
-
-fn publish_events(tab: &Tab, cursor: &mut usize, subscribers: &mut Vec<Sender<TabEvent>>) {
-    let events = &tab.events[*cursor..];
-    subscribers.retain(|subscriber| events.iter().all(|event| subscriber.send(*event).is_ok()));
-    *cursor = tab.events.len();
 }
 
 fn reply_unit(reply: Reply) -> Result<(), TabError> {

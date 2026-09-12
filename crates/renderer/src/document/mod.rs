@@ -332,6 +332,10 @@ impl Document {
         &self.events
     }
 
+    pub(crate) fn take_events(&mut self) -> Vec<TabEvent> {
+        std::mem::take(&mut self.events)
+    }
+
     /// Replaces the document from a host mount: new realm, decoded bytes,
     /// parsed to load. The host has already dialed and chosen this renderer.
     pub fn mount(&mut self, mount: &Mount) {

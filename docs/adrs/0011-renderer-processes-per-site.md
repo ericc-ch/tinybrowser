@@ -9,18 +9,19 @@ is later" posture of [ADR 0010](0010-page-actor-ownership.md).
 Status: accepted. Replaces the Isolation section of [ADR 0010](0010-page-actor-ownership.md).
 Extends the self-spawned-worker allowance of [ADR 0009](0009-named-profile-daemon.md).
 `TabHandle`, `TabId`, and the protocol adapters do not change.
+Browser-side authorization and resource bounds on this seam are specified by
+[ADR 0015](0015-renderer-seam-reference-monitor.md).
 
 ## Decision
 
-- The security and memory boundary is a **site instance**: scheme plus registrable
+- The address-space and crash boundary is a **site instance**: scheme plus registrable
   domain (eTLD+1), for example `https://example.co.uk`. Subdomains share a site
   because `document.domain` and cookies do; ports do not affect site identity.
   This is finer than a tab (cross-site frames must split) and coarser than an origin
   (same-site frames must be able to share a heap).
 - A site instance is unique per (site, browsing context group), following Chrome's
-  Principal Instance rule. v1 has no opener groups and no iframe documents, so in
-  practice each tab's current site is one site instance. The registry key is the
-  site instance, never the tab.
+  Principal Instance rule. v1 has no opener groups or network-backed cross-site
+  iframe documents, so in practice each tab's current site is one site instance.
 - One OS process per live site instance: the same executable, invoked as
   `tinybrowser --renderer`. The process boundary, not a thread, is the isolation
   property.
@@ -38,12 +39,12 @@ Extends the self-spawned-worker allowance of [ADR 0009](0009-named-profile-daemo
 - Renderer code never links `net`. Dials, cookies, and profile persistence are browser-side
   services reached through the seam; the browser process's `NetworkSession` remains one per
   profile.
-- One frame per tab in v1. Renderers are spawned per site instance so that
-  same-site iframes can join a renderer and cross-site iframes can get their own
-  (OOPIF) without moving owners.
-- QuickJS 5 s / 32 MiB / 512 KiB stay per-realm v0 survival knobs, not web-platform
-  numbers. Renderer count is browser-process policy capped from available RAM later. There is no
-  shared QuickJS heap.
+- Child frames currently share their top-level renderer. Network-backed
+  cross-site iframe navigation must not ship until the browser owns the frame
+  tree and can assign out-of-process iframes (OOPIF).
+- QuickJS 5 s / 32 MiB / 512 KiB are renderer-process survival knobs, not
+  web-platform numbers. Realms hosted by one renderer share its QuickJS heap.
+  Renderer-count policy remains browser-owned.
 
 ## Why the site cut
 
@@ -77,6 +78,10 @@ Engine ground truth:
 
 - The first navigation to a new site pays process startup. Preallocated renderers
   are a later optimization, not a v1 requirement.
+- Renderers are not pooled after navigation. The old process is terminated so
+  its page work cannot outlive its document and idle processes cannot grow with
+  navigation history. A future pool needs a measured benefit, a hard capacity,
+  and a proven reset-to-quiescence operation.
 - A renderer crash loses that document, not the browser process. The browser process reports it
   as a tab error and can reload; v1 does not promise automatic recovery.
 - The `browser` crate splits: a `renderer` crate owns the page engine and the
@@ -86,7 +91,9 @@ Engine ground truth:
   not under test; at least one loopback E2E test crosses a real `--renderer`
   process.
 - Sandboxing (seccomp, namespaces) is a later security phase. Separate address
-  spaces and value-only IPC are the v1 properties.
+  spaces, value-only IPC, and the browser-side reference monitor in ADR 0015 are
+  the current properties; they do not make an unsandboxed child safe against
+  arbitrary native code execution.
 - `--renderer` is an internal mode, not a user feature, and is hidden from help.
 
 ## Options considered

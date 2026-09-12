@@ -3,8 +3,9 @@
 The renderer process becomes a **frame host**: one QuickJS `Runtime` (heap) and
 one Tokio waiter are shared by every frame in the process, while each frame owns
 its own `Document` and its own QuickJS `Context` (realm). The `iframe` element
-creates and destroys frames through DOM lifecycle steps, and the browser process
-owns the authoritative frame tree that routes per-frame navigation.
+creates and destroys frames through DOM lifecycle steps. The renderer currently
+owns the child-frame registry; browser-owned cross-site frame routing remains a
+required OOPIF milestone.
 
 Status: accepted. Extends [ADR 0011](0011-renderer-processes-per-site.md);
 the site-instance cut it defined was chosen for exactly this feature
@@ -35,9 +36,11 @@ the protocol adapters.
   Blink stores the main-world wrapper on the C++ object; Gecko keeps one
   wrapper per object and outerizes across compartments.
 - **`FrameId` addresses a frame inside one renderer process.** It is minted by the
-  engine and carried by commands and events that target a frame. The browser
-  process keeps the authoritative frame tree (parent, container element, site,
-  URL, load state) and routes navigation to the renderer for the frame's site.
+  engine and carried by commands and events that target a frame. Today the
+  engine keeps the child-frame map. Before network-backed cross-site iframe
+  navigation ships, the browser process must own a global frame identity and
+  authoritative parent/site/process map, as Chromium's `FrameTree` and Gecko's
+  parent-process `BrowsingContext` tree do.
 - **`contentWindow` returns a `WindowProxy`, not the frame's global object.** The
   proxy identity survives navigation, per
   [the WindowProxy exotic object](https://html.spec.whatwg.org/multipage/nav-history-apis.html#the-windowproxy-exotic-object).
@@ -62,8 +65,10 @@ the protocol adapters.
   `DidNotifySubtreeInsertionsToDocument` opens the URL); Gecko uses
   `BindToTree`/`UnbindFromTree`.
 - **Process isolation for cross-site frames is phased, access checks are not.**
-  The first implementation hosts all frames of a tab in the tab's renderer.
-  OOPIF (a renderer per cross-site frame site) is the next milestone. The
+  The current implementation hosts its limited child documents in the tab's
+  renderer and does not expose network-backed cross-site iframe navigation.
+  OOPIF (a renderer per cross-site frame site) is required before that feature
+  can ship. The
   cross-origin property checks and the `contentDocument` null rule are not
   deferred: without them, co-tenancy leaks immediately.
 
@@ -74,9 +79,9 @@ the protocol adapters.
   budget and the execution deadline machinery.
 - `RemoteValue::Node` interning moves from per-`Document` to per-renderer, since
   WebDriver element ids come from it and two frames must not emit the same id.
-- `RendererRegistry` pooling changes: a renderer hosting live frames cannot be
-  returned to the idle pool by site; frame lifetimes, not tab navigation alone,
-  decide when a renderer is releasable.
+- Renderer lifetime follows the document tree it hosts. Renderers are not put
+  in an idle pool after navigation because old frame tasks must not survive into
+  a later document.
 - The single-document public API of the `renderer` crate changes. The in-process
   backend, the `--renderer` child, and the renderer integration tests all drive
   an `Engine`.

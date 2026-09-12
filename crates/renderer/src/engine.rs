@@ -279,6 +279,18 @@ impl Engine {
             .collect()
     }
 
+    pub(crate) fn take_events(&mut self) -> Vec<(FrameId, TabEvent)> {
+        self.frames
+            .iter_mut()
+            .flat_map(|(&frame, document)| {
+                document
+                    .take_events()
+                    .into_iter()
+                    .map(move |event| (frame, event))
+            })
+            .collect()
+    }
+
     /// True when any frame has jobs, timers, dials, or pending JS work.
     #[must_use]
     pub fn has_background_work(&self) -> bool {

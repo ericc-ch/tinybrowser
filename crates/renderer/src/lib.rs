@@ -8,7 +8,7 @@
 
 use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::time::Duration;
@@ -34,8 +34,8 @@ pub use engine::Engine;
 pub use process::serve_stdio;
 pub use protocol::{
     BrowserServices, Command, DialCompletion, DialKind, DialOutcome, DialRequest, FrameId,
-    FromRenderer, Mount, Reply, ScriptFailure, ServiceCall, ServiceReply, TabError, TabEvent,
-    ToRenderer,
+    FromRenderer, MAX_IPC_MESSAGE_BYTES, Mount, Reply, ScriptFailure, ServiceCall, ServiceReply,
+    TabError, TabEvent, ToRenderer, encode_ipc_message, read_ipc_message,
 };
 pub use remote::RemoteValue;
 
@@ -191,7 +191,6 @@ pub fn run_with_stop(
     stop: &Arc<Stop>,
 ) {
     let mut engine = Engine::with_stop(services, Arc::clone(stop));
-    let mut published = HashMap::new();
     loop {
         let received = if engine.has_background_work() {
             inbox.recv_timeout(Duration::from_millis(10))
@@ -211,7 +210,7 @@ pub fn run_with_stop(
             Err(RecvTimeoutError::Timeout) => engine.drive_for(Duration::from_millis(10)),
             Err(RecvTimeoutError::Disconnected) => break,
         }
-        publish(&engine, &mut published, outbox);
+        publish(&mut engine, outbox);
     }
     engine.shutdown();
 }
@@ -244,16 +243,9 @@ fn handle_command(
     }
 }
 
-fn publish(engine: &Engine, cursors: &mut HashMap<FrameId, usize>, outbox: &Sender<FromRenderer>) {
-    for (frame, document) in engine.frames() {
-        let cursor = cursors.entry(frame).or_default();
-        for event in &document.events()[*cursor..] {
-            let _ = outbox.send(FromRenderer::Event {
-                frame,
-                event: *event,
-            });
-        }
-        *cursor = document.events().len();
+fn publish(engine: &mut Engine, outbox: &Sender<FromRenderer>) {
+    for (frame, event) in engine.take_events() {
+        let _ = outbox.send(FromRenderer::Event { frame, event });
     }
 }
 

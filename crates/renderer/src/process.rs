@@ -5,7 +5,7 @@
 //! and browser-service calls leave on stdout. stderr stays for diagnostics.
 
 use std::collections::HashMap;
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufReader, Write};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Mutex, PoisonError};
@@ -37,18 +37,18 @@ pub fn serve_stdio() -> io::Result<()> {
     drop(out_tx);
     writer
         .join()
-        .map_err(|_| io::Error::other("writer panicked"))?;
-    Ok(())
+        .map_err(|_| io::Error::other("writer panicked"))?
 }
 
 fn read_messages(command_tx: &Sender<ToRenderer>, services: &PipeServices) {
-    let stdin = io::stdin();
-    let mut lines = stdin.lock().lines();
-    while let Some(Ok(line)) = lines.next() {
-        let message = match serde_json::from_str::<ToRenderer>(&line) {
-            Ok(message) => message,
+    let mut input = BufReader::new(io::stdin());
+    let mut buffer = Vec::new();
+    loop {
+        let message = match crate::read_ipc_message::<ToRenderer>(&mut input, &mut buffer) {
+            Ok(Some(message)) => message,
+            Ok(None) => return,
             Err(error) => {
-                eprintln!("renderer: bad host message: {error}");
+                eprintln!("renderer: invalid host message: {error}");
                 return;
             }
         };
@@ -70,17 +70,16 @@ fn read_messages(command_tx: &Sender<ToRenderer>, services: &PipeServices) {
     }
 }
 
-fn write_messages(rx: &mpsc::Receiver<FromRenderer>) {
+fn write_messages(rx: &mpsc::Receiver<FromRenderer>) -> io::Result<()> {
     let stdout = io::stdout();
     let mut out = stdout.lock();
     for message in rx {
-        let Ok(line) = serde_json::to_string(&message) else {
-            return;
-        };
-        if writeln!(out, "{line}").is_err() || out.flush().is_err() {
-            return;
-        }
+        let line = crate::encode_ipc_message(&message)?;
+        out.write_all(&line)?;
+        out.write_all(b"\n")?;
+        out.flush()?;
     }
+    Ok(())
 }
 
 /// [`BrowserServices`] proxy that asks the browser process over the pipe.
