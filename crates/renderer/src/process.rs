@@ -29,6 +29,7 @@ pub fn serve_stdio() -> io::Result<()> {
     let writer = thread::spawn(move || write_messages(&out_rx));
     let services = std::sync::Arc::new(PipeServices::new(out_tx.clone()));
     let _ready = out_tx.send(FromRenderer::Ready);
+    logging::info!(target: "renderer", "ready");
     let reader_services = std::sync::Arc::clone(&services);
     thread::spawn(move || read_messages(&command_tx, &reader_services));
     crate::run(&command_rx, &out_tx, services);
@@ -48,7 +49,7 @@ fn read_messages(command_tx: &Sender<ToRenderer>, services: &PipeServices) {
         let message = match serde_json::from_str::<ToRenderer>(&line) {
             Ok(message) => message,
             Err(error) => {
-                eprintln!("renderer: bad host message: {error}");
+                logging::error!(target: "renderer::ipc", "bad host message: {error}");
                 return;
             }
         };

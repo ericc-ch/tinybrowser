@@ -392,3 +392,23 @@ browser-owned executor; dial completion wakes the current-thread renderer
 waiter instead of being polled every millisecond. The preceding size row
 predates the frames/realms merge, so this checkpoint is the new comparison
 baseline rather than an attribution of the full delta to this cleanup.
+
+## Milestone: logging (2026-09-12)
+
+[ADR 0015](../adrs/0015-logging.md) adds the std-only `logging` crate (levels,
+stderr console, bounded async batched file sink with rotation), the
+`--log-level`/`--verbose` flags, per-profile daemon logs, and renderer stderr
+forwarding. Main had moved to `ccf16b8` (renderer code, not only the html5lib
+move) after the row above, so the baseline was rebuilt at `ccf16b8` in a
+detached worktree with the same rustc 1.98.0 and committed stripped x86_64
+release profile; both sides ran plain `cargo build --release --bin tinybrowser
+--example tab_probe` (no `nix develop`, no `--offline`).
+
+| Artifact | Baseline `ccf16b8` | With logging | Delta | Headroom to 10,000,000 |
+| --- | ---: | ---: | ---: | ---: |
+| CLI (`target/release/tinybrowser`) | 5,310,416 | 5,348,832 | **+38,416** | 4,651,168 |
+| page engine (`target/release/examples/tab_probe`) | 4,270,848 | 4,289,040 | **+18,192** | 5,710,960 |
+
+The probe delta is the cleaner marginal for the crate and the browser/renderer
+wiring; the CLI delta adds the clap surface (level value parser, help text) and
+the per-process file config. Both numbers are recorded in ADR 0015.

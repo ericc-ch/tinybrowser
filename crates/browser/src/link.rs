@@ -57,6 +57,7 @@ pub struct RendererHandle {
     child: Option<Arc<Mutex<Child>>>,
     renderer_join: Option<JoinHandle<()>>,
     pump_join: Option<JoinHandle<()>>,
+    stderr_join: Option<JoinHandle<()>>,
 }
 
 impl RendererHandle {
@@ -141,6 +142,9 @@ impl RendererHandle {
             let mut child = child.lock().unwrap_or_else(PoisonError::into_inner);
             let _ = child.kill();
             let _ = child.wait();
+        }
+        if let Some(join) = self.stderr_join.take() {
+            let _ = join.join();
         }
         if let Some(join) = self.renderer_join.take() {
             let _ = join.join();
@@ -302,16 +306,19 @@ fn spawn_local(
         child: None,
         renderer_join: Some(renderer_join),
         pump_join: Some(pump_join),
+        stderr_join: None,
     }
 }
 
 fn spawn_process(id: RendererId, site: Site, fetch: FetchHandle) -> io::Result<RendererHandle> {
-    let mut child = Command::new(std::env::current_exe()?)
+    let mut command = Command::new(std::env::current_exe()?);
+    command
         .arg("--renderer")
+        .env("TINYBROWSER_LOG", logging::level().as_str())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
-        .spawn()?;
+        .stderr(Stdio::piped());
+    let mut child = command.spawn()?;
     let Some(stdin) = child.stdin.take() else {
         let _ = child.kill();
         let _ = child.wait();
@@ -321,6 +328,11 @@ fn spawn_process(id: RendererId, site: Site, fetch: FetchHandle) -> io::Result<R
         let _ = child.kill();
         let _ = child.wait();
         return Err(io::Error::other("renderer stdout missing"));
+    };
+    let Some(stderr) = child.stderr.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(io::Error::other("renderer stderr missing"));
     };
     let child = Arc::new(Mutex::new(child));
     let sink = Sink::Pipe(Arc::new(Mutex::new(stdin)));
@@ -346,12 +358,21 @@ fn spawn_process(id: RendererId, site: Site, fetch: FetchHandle) -> io::Result<R
             );
         })
         .expect("renderer pump thread");
+    let stderr_join = thread::Builder::new()
+        .name(format!("renderer-{id:?}-stderr"))
+        .spawn(move || forward_stderr(stderr))
+        .expect("renderer stderr thread");
     if ready_rx.recv_timeout(HANDSHAKE_TIMEOUT) != Ok(true) {
         let mut child = child.lock().unwrap_or_else(PoisonError::into_inner);
         let _ = child.kill();
         let _ = child.wait();
         return Err(io::Error::other("renderer handshake failed"));
     }
+    logging::debug!(
+        target: "browser::link",
+        "renderer {id:?} ready for site {}",
+        site.as_str()
+    );
     Ok(RendererHandle {
         id,
         site,
@@ -363,7 +384,29 @@ fn spawn_process(id: RendererId, site: Site, fetch: FetchHandle) -> io::Result<R
         child: Some(child),
         renderer_join: None,
         pump_join: Some(pump_join),
+        stderr_join: Some(stderr_join),
     })
+}
+
+/// Pumps one renderer child's stderr into this process's logger.
+///
+/// The child formats its own level and target; the browser only forwards the
+/// lines, so renderer records land in the daemon's console and file without a
+/// second file writer ([ADR 0015](../../../docs/adrs/0015-logging.md)).
+fn forward_stderr(stderr: std::process::ChildStderr) {
+    let mut reader = BufReader::new(stderr);
+    let mut bytes = Vec::new();
+    loop {
+        bytes.clear();
+        match reader.read_until(b'\n', &mut bytes) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {
+                // Renderer output is diagnostic text; one invalid UTF-8 line
+                // must not stop later lines from being forwarded.
+                logging::log_forwarded(&String::from_utf8_lossy(&bytes));
+            }
+        }
+    }
 }
 
 fn pump_loop(
@@ -391,7 +434,11 @@ fn pump_loop(
                     Ok(_) => {}
                 }
                 let Ok(message) = serde_json::from_str::<FromRenderer>(line.trim()) else {
-                    eprintln!("renderer: bad child message: {}", line.trim());
+                    logging::error!(
+                        target: "browser::link",
+                        "bad renderer message: {}",
+                        line.trim()
+                    );
                     break;
                 };
                 if let Some(ready_tx) = ready.take() {
