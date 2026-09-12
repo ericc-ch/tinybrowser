@@ -417,16 +417,17 @@ the per-process file config. Both numbers are recorded in ADR 0015.
 
 [ADR 0016](../adrs/0016-renderer-seam-reference-monitor.md) added browser-owned
 site-lock validation, an 8 MiB IPC frame limit, bounded command/event retention,
-and removed the unbounded idle-renderer pool. Command: `nix develop --command
-cargo build --release --offline --example tab_probe --bin tinybrowser`; rustc
-1.98.0, stripped x86_64 release profile.
+and removed the unbounded idle-renderer pool. The row below was re-measured on
+merged `main` (`44f957f`, after the logging merge). Command: `nix develop
+--command cargo build --release --offline --example tab_probe --bin
+tinybrowser`; rustc 1.98.0, stripped x86_64 release profile.
 
 | Artifact | Bytes | Headroom to 10,000,000 |
 | --- | ---: | ---: |
-| CLI (`target/release/tinybrowser`) | 5,313,616 | 4,686,384 |
-| page engine (`target/release/examples/tab_probe`) | 4,267,488 | 5,732,512 |
+| CLI (`target/release/tinybrowser`) | 5,357,600 | 4,642,400 |
+| page engine (`target/release/examples/tab_probe`) | 4,291,920 | 5,708,080 |
 
-The CLI grew 91,440 bytes and the probe 85,456 bytes from the prior checkpoint.
-The shared bounded JSON codec accounts for most new code; deleting idle pooling
-keeps runtime process growth tied to live documents. The shipping binary remains
-46.9% below the hard limit.
+The CLI grew 8,768 bytes and the probe 2,880 bytes from the logging checkpoint.
+The shared bounded JSON codec and the renderer queue caps account for most new
+code; deleting idle pooling keeps runtime process growth tied to live documents.
+The shipping binary remains 46.4% below the hard limit.
