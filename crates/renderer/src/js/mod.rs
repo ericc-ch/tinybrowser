@@ -5,6 +5,7 @@
 //! uses `Function::call` on the renderer thread.
 
 mod bindings;
+mod intl;
 mod world;
 
 pub(crate) use world::{DocumentStreamCommand, FrameNavigation, RealmRegistry};
@@ -638,6 +639,7 @@ impl JsRealm {
         let url_resolve = world.clone();
         self.context.with(|ctx| {
             bindings::install(&ctx, &world).map_err(JsError::engine)?;
+            intl::install(&ctx).map_err(JsError::engine)?;
 
             ctx.globals()
                 .set(

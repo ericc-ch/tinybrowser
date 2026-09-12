@@ -1,0 +1,75 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+TEST262="$ROOT/third_party/wpt/third_party/test262"
+BINARY="${1:-$ROOT/target/release/tinybrowser}"
+TARGET="$ROOT/tools/intl/test262-target.txt"
+STATE_DIR="$(mktemp -d)"
+PROFILE="intl-test262-$$"
+export XDG_RUNTIME_DIR="$STATE_DIR/runtime"
+export XDG_DATA_HOME="$STATE_DIR/data"
+
+cleanup() {
+  local daemon_file="$XDG_RUNTIME_DIR/tinybrowser/$PROFILE/daemon.json"
+  local daemon_pid=""
+  if [[ -f "$daemon_file" ]]; then
+    daemon_pid="$(sed -n 's/.*"pid":\([0-9][0-9]*\).*/\1/p' "$daemon_file")"
+  fi
+  if [[ -n "$daemon_pid" && -r "/proc/$daemon_pid/cmdline" ]]; then
+    local daemon_args
+    daemon_args="$(tr '\0' ' ' <"/proc/$daemon_pid/cmdline")"
+    if [[ "$daemon_args" == *"--profile=$PROFILE"* ]]; then
+      kill "$daemon_pid" 2>/dev/null || true
+    fi
+  fi
+  rm -rf -- "$STATE_DIR"
+}
+trap cleanup EXIT
+
+if [[ ! -x "$BINARY" ]]; then
+  echo "tinybrowser release binary not found: $BINARY" >&2
+  exit 1
+fi
+
+passed=0
+while IFS= read -r relative_path; do
+  [[ -z "$relative_path" ]] && continue
+  test_file="$TEST262/test/$relative_path"
+  if [[ ! -f "$test_file" ]]; then
+    echo "target test not found: $relative_path" >&2
+    exit 1
+  fi
+
+  harness="$(<"$TEST262/harness/sta.js")"
+  harness+=$'\n'
+  harness+="$(<"$TEST262/harness/assert.js")"
+  includes="$(sed -n 's/^includes: \[\(.*\)\]/\1/p' "$test_file")"
+  IFS=',' read -ra include_names <<<"$includes"
+  for include in "${include_names[@]}"; do
+    include="${include//[[:space:]]/}"
+    [[ -z "$include" ]] && continue
+    harness+=$'\n'
+    harness+="$(<"$TEST262/harness/$include")"
+  done
+
+  "$BINARY" --log-level error --profile "$PROFILE" create >/dev/null
+  source=$'(function() {\ntry {\n'
+  source+="$harness"
+  source+=$'\n'
+  source+="$(<"$test_file")"
+  source+=$'\nreturn "PASS";\n} catch (error) {\n'
+  source+=$'return "FAIL: " + error.name + ": " + error.message;\n}\n})()'
+
+  if output="$("$BINARY" --log-level error --profile "$PROFILE" eval "$source" 2>&1)" &&
+    [[ "$output" == '"PASS"' ]]; then
+    printf 'PASS %s\n' "$relative_path"
+    passed=$((passed + 1))
+  else
+    printf 'FAIL %s\n%s\n' "$relative_path" "$output" >&2
+    exit 1
+  fi
+  "$BINARY" --log-level error --profile "$PROFILE" close >/dev/null
+done <"$TARGET"
+
+printf '%s Intl Test262 target cases passed\n' "$passed"
