@@ -1,11 +1,14 @@
 use std::rc::Rc;
 
-use fixed_decimal::{Decimal, FloatPrecision, SignedRoundingMode, UnsignedRoundingMode};
+use fixed_decimal::{
+    Decimal, FloatPrecision, Sign, SignDisplay, SignedRoundingMode, UnsignedRoundingMode,
+};
 use icu_calendar::Gregorian;
 use icu_datetime::{
     FixedCalendarDateTimeFormatter, NoCalendarFormatter,
     fieldsets::{T, YMD, YMDE},
     input::{Date, DateTime, Time},
+    options::YearStyle,
 };
 use icu_decimal::{
     DecimalFormatter,
@@ -23,7 +26,7 @@ use icu_experimental::dimension::{
     },
     provider::currency::fractions::CurrencyFractionsV1,
 };
-use icu_locale::fallback::LocaleFallbacker;
+use icu_locale::{LocaleCanonicalizer, fallback::LocaleFallbacker};
 use icu_locale_core::Locale;
 use icu_provider::{DataProvider, DataRequest, buf::AsDeserializingBufferProvider};
 use icu_provider_adapters::fallback::LocaleFallbackProvider;
@@ -35,7 +38,7 @@ type IntlProvider = LocaleFallbackProvider<BlobDataProvider>;
 
 struct NumberFormatInput {
     locale: String,
-    value: f64,
+    value: NumberFormatValue,
     style: String,
     currency: String,
     currency_display: String,
@@ -43,7 +46,15 @@ struct NumberFormatInput {
     minimum_integer_digits: u8,
     minimum_fraction_digits: u8,
     maximum_fraction_digits: u8,
+    minimum_significant_digits: u8,
+    maximum_significant_digits: u8,
     use_grouping: bool,
+    sign_display: String,
+}
+
+enum NumberFormatValue {
+    Number(f64),
+    Exact(String),
 }
 
 struct DateTimeFormatInput {
@@ -60,8 +71,13 @@ struct DateTimeFormatInput {
 
 const ICU_DATA: &[u8] = include_bytes!("intl_data.postcard");
 
-// ECMA-402 constructor and prototype surface:
+// ECMA-402 defines the constructor surface and option algorithms. Firefox uses
+// the same boundary we use here: SpiderMonkey validates options into internal
+// slots, then creates a native formatter from that normalized record.
 // https://402.ecma-international.org/#sec-intl-object
+// https://searchfox.org/firefox-main/source/js/src/builtin/intl/NumberFormat.cpp#1128-1307
+// https://searchfox.org/firefox-main/source/js/src/builtin/intl/NumberFormat.cpp#1652-1689
+// https://searchfox.org/firefox-main/source/js/src/builtin/intl/DateTimeFormat.cpp#497-855
 const INSTALL_INTL_JS: &str = r"
 (function() {
   const nativeCanonicalLocale = globalThis.__tbIntlCanonicalLocale;
@@ -76,14 +92,26 @@ const INSTALL_INTL_JS: &str = r"
   delete globalThis.__tbIntlFormatDateTime;
 
   const call = Function.prototype.call.bind(Function.prototype.call);
-  const arrayFrom = Array.from.bind(Array);
   const objectConstructor = Object;
-  const objectAssign = Object.assign;
+  const objectCreate = Object.create;
   const stringConstructor = String;
+  const stringToUpperCase = Function.prototype.call.bind(String.prototype.toUpperCase);
+  const stringToLowerCase = Function.prototype.call.bind(String.prototype.toLowerCase);
+  const stringTrim = Function.prototype.call.bind(String.prototype.trim);
   const numberConstructor = Number;
   const numberIsFinite = Number.isFinite;
+  const numberMaxSafeInteger = Number.MAX_SAFE_INTEGER;
+  const booleanConstructor = Boolean;
   const numberValueOf = Number.prototype.valueOf;
+  const bigintValueOf = BigInt.prototype.valueOf;
+  const symbolToPrimitive = Symbol.toPrimitive;
+  const arrayIndexOf = Function.prototype.call.bind(Array.prototype.indexOf);
+  const arrayPush = Function.prototype.call.bind(Array.prototype.push);
+  const arrayConcat = Function.prototype.call.bind(Array.prototype.concat);
+  const regexpTest = Function.prototype.call.bind(RegExp.prototype.test);
   const mathFloor = Math.floor;
+  const mathMax = Math.max;
+  const mathMin = Math.min;
   const dateConstructor = Date;
   const dateNow = Date.now;
   const dateValueOf = Date.prototype.valueOf;
@@ -96,20 +124,51 @@ const INSTALL_INTL_JS: &str = r"
 
   const numberSlots = new WeakMap();
   const dateTimeSlots = new WeakMap();
+  const numberSlotsGet = numberSlots.get.bind(numberSlots);
+  const numberSlotsSet = numberSlots.set.bind(numberSlots);
+  const dateTimeSlotsGet = dateTimeSlots.get.bind(dateTimeSlots);
+  const dateTimeSlotsSet = dateTimeSlots.set.bind(dateTimeSlots);
 
   // https://402.ecma-international.org/#sec-canonicalizelocalelist
   function localeList(locales) {
     if (locales === undefined) return [];
     if (typeof locales === 'string') return [locales];
-    return arrayFrom(locales, stringConstructor);
+    if (locales === null) throw new TypeError('locales must not be null');
+    const object = objectConstructor(locales);
+    const numericLength = +object.length;
+    const length = mathMin(
+      mathMax(numberIsFinite(numericLength) ? mathFloor(numericLength) : 0, 0),
+      numberMaxSafeInteger
+    );
+    const result = [];
+    for (let index = 0; index < length; index += 1) {
+      if (!(index in object)) continue;
+      const value = object[index];
+      if (value === null || (typeof value !== 'string' && typeof value !== 'object' &&
+          typeof value !== 'function')) {
+        throw new TypeError('locale list elements must be strings or objects');
+      }
+      arrayPush(result, stringConstructor(value));
+    }
+    return result;
+  }
+
+  function canonicalLocaleList(locales) {
+    const requested = localeList(locales);
+    const result = [];
+    for (let index = 0; index < requested.length; index += 1) {
+      const tag = requested[index];
+      const canonical = nativeCanonicalLocale(stringConstructor(tag));
+      if (canonical === '!') throw new RangeError('invalid language tag: ' + tag);
+      if (arrayIndexOf(result, canonical) < 0) arrayPush(result, canonical);
+    }
+    return result;
   }
 
   function resolveLocale(locales) {
-    const requested = localeList(locales);
-    for (const tag of requested) {
-      const canonical = nativeCanonicalLocale(stringConstructor(tag));
-      if (canonical === '!') throw new RangeError('invalid language tag: ' + tag);
-      const resolved = nativeResolveLocale(canonical);
+    const requested = canonicalLocaleList(locales);
+    for (let index = 0; index < requested.length; index += 1) {
+      const resolved = nativeResolveLocale(requested[index]);
       if (resolved) return resolved;
     }
     return 'en-US';
@@ -120,18 +179,18 @@ const INSTALL_INTL_JS: &str = r"
     options = optionsObject(options);
     stringOption(options, 'localeMatcher', ['lookup', 'best fit'], 'best fit');
     const result = [];
-    for (const tag of localeList(locales)) {
-      const canonical = nativeCanonicalLocale(stringConstructor(tag));
-      if (canonical === '!') throw new RangeError('invalid language tag: ' + tag);
-      if (nativeResolveLocale(canonical) && result.indexOf(canonical) < 0) {
-        result.push(canonical);
+    const requested = canonicalLocaleList(locales);
+    for (let index = 0; index < requested.length; index += 1) {
+      const canonical = requested[index];
+      if (nativeResolveLocale(canonical) && arrayIndexOf(result, canonical) < 0) {
+        arrayPush(result, canonical);
       }
     }
     return result;
   }
 
   function optionsObject(options) {
-    if (options === undefined) return {};
+    if (options === undefined) return objectCreate(null);
     if (options === null) throw new TypeError('options must be an object');
     return objectConstructor(options);
   }
@@ -140,18 +199,56 @@ const INSTALL_INTL_JS: &str = r"
     const value = options[name];
     if (value === undefined) return fallback;
     const text = stringConstructor(value);
-    if (values.indexOf(text) < 0) throw new RangeError('invalid ' + name);
+    if (arrayIndexOf(values, text) < 0) throw new RangeError('invalid ' + name);
     return text;
   }
 
   function digitOption(options, name, fallback, minimum, maximum) {
     const value = options[name];
     if (value === undefined) return fallback;
-    const integer = mathFloor(numberConstructor(value));
+    const integer = mathFloor(+value);
     if (!numberIsFinite(integer) || integer < minimum || integer > maximum) {
       throw new RangeError('invalid ' + name);
     }
     return integer;
+  }
+
+  function primitiveNumberHint(value) {
+    if (value === null || (typeof value !== 'object' && typeof value !== 'function')) {
+      return value;
+    }
+    const exotic = value[symbolToPrimitive];
+    if (exotic !== undefined) {
+      if (typeof exotic !== 'function') throw new TypeError('@@toPrimitive must be callable');
+      const primitive = call(exotic, value, 'number');
+      if (primitive === null || (typeof primitive !== 'object' &&
+          typeof primitive !== 'function')) return primitive;
+      throw new TypeError('@@toPrimitive must return a primitive');
+    }
+    const methods = ['valueOf', 'toString'];
+    for (let index = 0; index < methods.length; index += 1) {
+      const method = value[methods[index]];
+      if (typeof method !== 'function') continue;
+      const primitive = call(method, value);
+      if (primitive === null || (typeof primitive !== 'object' &&
+          typeof primitive !== 'function')) return primitive;
+    }
+    throw new TypeError('cannot convert object to a primitive value');
+  }
+
+  // https://402.ecma-international.org/#sec-tointlmathematicalvalue
+  function intlMathematicalValue(value) {
+    const primitive = primitiveNumberHint(value);
+    if (typeof primitive === 'bigint') {
+      return { number: 0, exact: stringConstructor(primitive) };
+    }
+    if (typeof primitive === 'string') {
+      const text = stringTrim(primitive);
+      if (regexpTest(/^[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)$/, text)) {
+        return { number: 0, exact: text };
+      }
+    }
+    return { number: +primitive, exact: '' };
   }
 
   // https://402.ecma-international.org/#sec-intl.numberformat
@@ -159,146 +256,396 @@ const INSTALL_INTL_JS: &str = r"
     if (!new.target) return new NumberFormat(locales, options);
     const locale = resolveLocale(locales);
     options = optionsObject(options);
-    const style = stringOption(options, 'style', ['decimal', 'percent', 'currency'], 'decimal');
+    stringOption(options, 'localeMatcher', ['lookup', 'best fit'], 'best fit');
+    const numberingSystemOption = options.numberingSystem;
+    let numberingSystem = 'latn';
+    if (numberingSystemOption !== undefined) {
+      numberingSystem = stringToLowerCase(stringConstructor(numberingSystemOption));
+      if (!regexpTest(/^[a-z0-9]{3,8}(?:-[a-z0-9]{3,8})*$/, numberingSystem)) {
+        throw new RangeError('invalid numberingSystem');
+      }
+      if (numberingSystem !== 'latn') {
+        throw new RangeError('only the latn numbering system is currently supported');
+      }
+    }
+
+    // ResolveOptions and SetNumberFormatUnitOptions are kept in specification
+    // order so getters observe the same sequence as Firefox.
+    const style = stringOption(
+      options, 'style', ['decimal', 'percent', 'currency', 'unit'], 'decimal'
+    );
+    const currencyOption = options.currency;
     let currency;
-    let currencyDisplay = 'symbol';
-    let currencySign = 'standard';
-    if (style === 'currency') {
-      const currencyOption = options.currency;
-      if (currencyOption === undefined) throw new TypeError('currency is required');
-      currency = stringConstructor(currencyOption).toUpperCase();
-      if (!/^[A-Z]{3}$/.test(currency)) throw new RangeError('invalid currency');
-      currencyDisplay = stringOption(
-        options, 'currencyDisplay', ['symbol', 'narrowSymbol', 'code', 'name'], 'symbol'
-      );
-      currencySign = stringOption(options, 'currencySign', ['standard', 'accounting'], 'standard');
+    if (currencyOption !== undefined) {
+      const currencyText = stringConstructor(currencyOption);
+      if (!regexpTest(/^[A-Za-z]{3}$/, currencyText)) throw new RangeError('invalid currency');
+      currency = stringToUpperCase(currencyText);
     }
-    if (style === 'currency' &&
-        (options.minimumFractionDigits !== undefined || options.maximumFractionDigits !== undefined)) {
-      throw new RangeError('currency fraction digit overrides are not currently supported');
+    if (style === 'currency' && currency === undefined) {
+      throw new TypeError('currency is required');
     }
+    const currencyDisplay = stringOption(
+      options, 'currencyDisplay', ['symbol', 'narrowSymbol', 'code', 'name'], 'symbol'
+    );
+    const currencySign = stringOption(
+      options, 'currencySign', ['standard', 'accounting'], 'standard'
+    );
+    const unitOption = options.unit;
+    const unit = unitOption === undefined ? undefined : stringConstructor(unitOption);
+    if (style === 'unit' && unit === undefined) throw new TypeError('unit is required');
+    stringOption(options, 'unitDisplay', ['short', 'narrow', 'long'], 'short');
+    if (style === 'unit') throw new RangeError('unit formatting is not currently supported');
+
+    const notation = stringOption(
+      options, 'notation', ['standard', 'scientific', 'engineering', 'compact'], 'standard'
+    );
+    if (notation !== 'standard') throw new RangeError('notation is not currently supported');
     const currencyDigits = style === 'currency'
       ? nativeCurrencyDigits(currency)
       : 0;
     const defaultMaximum = style === 'percent' ? 0 : style === 'currency' ? currencyDigits : 3;
     const defaultMinimum = style === 'currency' ? defaultMaximum : 0;
     const minimumIntegerDigits = digitOption(options, 'minimumIntegerDigits', 1, 1, 21);
-    const minimumFractionDigits = digitOption(
-      options, 'minimumFractionDigits', defaultMinimum, 0, 100
-    );
-    const maximumFractionDigits = digitOption(
-      options, 'maximumFractionDigits', Math.max(defaultMaximum, minimumFractionDigits), 0, 100
-    );
-    if (minimumFractionDigits > maximumFractionDigits) {
-      throw new RangeError('minimumFractionDigits exceeds maximumFractionDigits');
+    const minimumFractionOption = options.minimumFractionDigits;
+    const maximumFractionOption = options.maximumFractionDigits;
+    const minimumSignificantOption = options.minimumSignificantDigits;
+    const maximumSignificantOption = options.maximumSignificantDigits;
+    const roundingIncrement = digitOption(options, 'roundingIncrement', 1, 1, 5000);
+    if (roundingIncrement !== 1) {
+      throw new RangeError('roundingIncrement is not currently supported');
     }
-    const useGrouping = options.useGrouping === undefined ? true : Boolean(options.useGrouping);
+    const roundingMode = stringOption(
+      options, 'roundingMode',
+      ['ceil', 'floor', 'expand', 'trunc', 'halfCeil', 'halfFloor', 'halfExpand',
+       'halfTrunc', 'halfEven'],
+      'halfExpand'
+    );
+    if (roundingMode !== 'halfExpand') {
+      throw new RangeError('roundingMode is not currently supported');
+    }
+    const roundingPriority = stringOption(
+      options, 'roundingPriority', ['auto', 'morePrecision', 'lessPrecision'], 'auto'
+    );
+    if (roundingPriority !== 'auto') {
+      throw new RangeError('roundingPriority is not currently supported');
+    }
+    const trailingZeroDisplay = stringOption(
+      options, 'trailingZeroDisplay', ['auto', 'stripIfInteger'], 'auto'
+    );
+    if (trailingZeroDisplay !== 'auto') {
+      throw new RangeError('trailingZeroDisplay is not currently supported');
+    }
+
+    let minimumFractionDigits = 0;
+    let maximumFractionDigits = 0;
+    let minimumSignificantDigits = 0;
+    let maximumSignificantDigits = 0;
+    if (minimumSignificantOption !== undefined || maximumSignificantOption !== undefined) {
+      minimumSignificantDigits = minimumSignificantOption === undefined
+        ? 1
+        : digitOption(
+          { minimumSignificantDigits: minimumSignificantOption },
+          'minimumSignificantDigits', 1, 1, 21
+        );
+      maximumSignificantDigits = maximumSignificantOption === undefined
+        ? 21
+        : digitOption(
+          { maximumSignificantDigits: maximumSignificantOption },
+          'maximumSignificantDigits', 21, minimumSignificantDigits, 21
+        );
+    } else {
+      const specifiedMinimum = minimumFractionOption === undefined
+        ? undefined
+        : digitOption(
+          { minimumFractionDigits: minimumFractionOption },
+          'minimumFractionDigits', defaultMinimum, 0, 100
+        );
+      const specifiedMaximum = maximumFractionOption === undefined
+        ? undefined
+        : digitOption(
+          { maximumFractionDigits: maximumFractionOption },
+          'maximumFractionDigits', defaultMaximum, 0, 100
+        );
+      minimumFractionDigits = specifiedMinimum === undefined
+        ? specifiedMaximum === undefined ? defaultMinimum : mathMin(defaultMinimum, specifiedMaximum)
+        : specifiedMinimum;
+      maximumFractionDigits = specifiedMaximum === undefined
+        ? mathMax(defaultMaximum, minimumFractionDigits)
+        : specifiedMaximum;
+      if (minimumFractionDigits > maximumFractionDigits) {
+        throw new RangeError('minimumFractionDigits exceeds maximumFractionDigits');
+      }
+    }
+
+    stringOption(options, 'compactDisplay', ['short', 'long'], 'short');
+    const groupingOption = options.useGrouping;
+    let useGrouping = true;
+    if (typeof groupingOption === 'string') {
+      const grouping = stringOption(
+        { useGrouping: groupingOption }, 'useGrouping',
+        ['min2', 'auto', 'always', 'true', 'false'], 'auto'
+      );
+      if (grouping === 'min2') throw new RangeError('min2 grouping is not currently supported');
+      useGrouping = grouping !== 'false';
+    } else if (groupingOption !== undefined) {
+      useGrouping = booleanConstructor(groupingOption);
+    }
+    if (style !== 'decimal' && !useGrouping) {
+      throw new RangeError('disabling grouping is currently supported only for decimal style');
+    }
+    const signDisplay = stringOption(
+      options, 'signDisplay', ['auto', 'never', 'always', 'exceptZero', 'negative'], 'auto'
+    );
     const slots = {
-      locale, style, currency, currencyDisplay, currencySign,
+      locale, numberingSystem, style, currency, currencyDisplay, currencySign,
       minimumIntegerDigits, minimumFractionDigits, maximumFractionDigits,
-      useGrouping, boundFormat: null,
+      minimumSignificantDigits, maximumSignificantDigits,
+      useGrouping, signDisplay, boundFormat: null,
     };
-    numberSlots.set(this, slots);
+    numberSlotsSet(this, slots);
   }
   Object.defineProperty(NumberFormat, 'length', { value: 0 });
 
   Object.defineProperty(NumberFormat.prototype, 'format', {
     configurable: true,
     get: function() {
-      const slots = numberSlots.get(this);
+      const slots = numberSlotsGet(this);
       if (!slots) throw new TypeError('incompatible NumberFormat receiver');
       if (!slots.boundFormat) {
-        slots.boundFormat = value => nativeFormatNumber([
-          slots.locale,
-          numberConstructor(value),
-          slots.style,
-          slots.currency || '',
-          slots.currencyDisplay,
-          slots.currencySign,
-          slots.minimumIntegerDigits,
-          slots.minimumFractionDigits,
-          slots.maximumFractionDigits,
-          slots.useGrouping
-        ]);
+        slots.boundFormat = value => {
+          const mathematical = intlMathematicalValue(value);
+          return nativeFormatNumber([
+            slots.locale,
+            mathematical.number,
+            mathematical.exact,
+            slots.style,
+            slots.currency || '',
+            slots.currencyDisplay,
+            slots.currencySign,
+            slots.minimumIntegerDigits,
+            slots.minimumFractionDigits,
+            slots.maximumFractionDigits,
+            slots.minimumSignificantDigits,
+            slots.maximumSignificantDigits,
+            slots.useGrouping,
+            slots.signDisplay
+          ]);
+        };
       }
       return slots.boundFormat;
     },
   });
+  Object.defineProperty(
+    Object.getOwnPropertyDescriptor(NumberFormat.prototype, 'format').get,
+    'name',
+    { value: 'get format' }
+  );
 
-  NumberFormat.prototype.resolvedOptions = function() {
-    const slots = numberSlots.get(this);
-    if (!slots) throw new TypeError('incompatible NumberFormat receiver');
-    const result = {
-      locale: slots.locale,
-      numberingSystem: 'latn',
-      style: slots.style,
-      minimumIntegerDigits: slots.minimumIntegerDigits,
-      minimumFractionDigits: slots.minimumFractionDigits,
-      maximumFractionDigits: slots.maximumFractionDigits,
-      useGrouping: slots.useGrouping ? 'auto' : false,
-      notation: 'standard',
-      signDisplay: 'auto',
-      roundingIncrement: 1,
-      roundingMode: 'halfExpand',
-      roundingPriority: 'auto',
-      trailingZeroDisplay: 'auto',
-    };
-    if (slots.currency) {
-      result.currency = slots.currency;
-      result.currencyDisplay = slots.currencyDisplay;
-      result.currencySign = slots.currencySign;
-    }
-    return result;
-  };
-  NumberFormat.supportedLocalesOf = supportedLocales;
-
-  function dateStyle(options) {
-    const explicit = stringOption(options, 'dateStyle', ['full', 'long', 'medium', 'short'], undefined);
-    if (explicit !== undefined) return explicit;
-    const hasDate = options.weekday !== undefined || options.year !== undefined ||
-      options.month !== undefined || options.day !== undefined;
-    if (!hasDate) return undefined;
-    if (options.weekday !== undefined) return 'full';
-    if (options.month === 'long') return 'long';
-    if (options.month === 'short') return 'medium';
-    return 'short';
-  }
-
-  function timeStyle(options) {
-    const explicit = stringOption(options, 'timeStyle', ['full', 'long', 'medium', 'short'], undefined);
-    if (explicit !== undefined) return explicit;
-    return options.hour !== undefined || options.minute !== undefined || options.second !== undefined
-      ? (options.second === undefined ? 'short' : 'medium')
-      : undefined;
-  }
+  Object.defineProperty(NumberFormat.prototype, 'resolvedOptions', {
+    value: function resolvedOptions() {
+      const slots = numberSlotsGet(this);
+      if (!slots) throw new TypeError('incompatible NumberFormat receiver');
+      const result = {
+        locale: slots.locale,
+        numberingSystem: slots.numberingSystem,
+        style: slots.style,
+      };
+      if (slots.currency) {
+        result.currency = slots.currency;
+        result.currencyDisplay = slots.currencyDisplay;
+        result.currencySign = slots.currencySign;
+      }
+      result.minimumIntegerDigits = slots.minimumIntegerDigits;
+      if (slots.maximumSignificantDigits) {
+        result.minimumSignificantDigits = slots.minimumSignificantDigits;
+        result.maximumSignificantDigits = slots.maximumSignificantDigits;
+      } else {
+        result.minimumFractionDigits = slots.minimumFractionDigits;
+        result.maximumFractionDigits = slots.maximumFractionDigits;
+      }
+      result.useGrouping = slots.useGrouping ? 'auto' : false;
+      result.notation = 'standard';
+      result.signDisplay = slots.signDisplay;
+      result.roundingIncrement = 1;
+      result.roundingMode = 'halfExpand';
+      result.roundingPriority = 'auto';
+      result.trailingZeroDisplay = 'auto';
+      return result;
+    },
+    writable: true,
+    configurable: true,
+  });
+  Object.defineProperty(NumberFormat, 'supportedLocalesOf', {
+    value: function supportedLocalesOf(locales) {
+      return supportedLocales(locales, arguments[1]);
+    },
+    writable: true,
+    configurable: true,
+  });
+  Object.defineProperty(NumberFormat.prototype, Symbol.toStringTag, {
+    value: 'Intl.NumberFormat',
+    configurable: true,
+  });
+  Object.defineProperty(NumberFormat, 'prototype', { writable: false });
 
   const styleCode = { short: 1, medium: 2, long: 3, full: 4 };
+  const dateComponentNames = ['weekday', 'era', 'year', 'month', 'day'];
+  const timeComponentNames = [
+    'dayPeriod', 'hour', 'minute', 'second', 'fractionalSecondDigits', 'timeZoneName'
+  ];
+  const allComponentNames = arrayConcat(dateComponentNames, timeComponentNames);
+
+  // https://402.ecma-international.org/#sec-todatetimeoptions
+  function toDateTimeOptions(options) {
+    return objectCreate(options === undefined ? null : optionsObject(options));
+  }
+
+  function datePatternCode(components) {
+    const hasYear = components.year !== undefined;
+    const hasMonth = components.month !== undefined;
+    const hasDay = components.day !== undefined;
+    const hasWeekday = components.weekday !== undefined;
+    if (components.era !== undefined) {
+      throw new RangeError('era formatting is not currently supported');
+    }
+    if (hasYear && hasMonth && hasDay && !hasWeekday && components.year === 'numeric' &&
+        components.month === 'numeric' &&
+        components.day === 'numeric') return 5;
+    if (!hasYear && !hasMonth && !hasDay && !hasWeekday) return 0;
+    throw new RangeError('this date component combination is not currently supported');
+  }
+
+  // ECMA-402 gathers the component and style options before matching a locale pattern.
+  // https://402.ecma-international.org/#sec-createdatetimeformat
+  function initializeDateTimeFormat(instance, locales, options, required, defaults) {
+    const locale = resolveLocale(locales);
+    options = toDateTimeOptions(options);
+    stringOption(options, 'localeMatcher', ['lookup', 'best fit'], 'best fit');
+    const calendarOption = options.calendar;
+    if (calendarOption !== undefined &&
+        stringToLowerCase(stringConstructor(calendarOption)) !== 'gregory') {
+      throw new RangeError('only the gregory calendar is currently supported');
+    }
+    const numberingSystemOption = options.numberingSystem;
+    if (numberingSystemOption !== undefined &&
+        stringToLowerCase(stringConstructor(numberingSystemOption)) !== 'latn') {
+      throw new RangeError('only the latn numbering system is currently supported');
+    }
+    const hour12Option = options.hour12;
+    if (hour12Option !== undefined) booleanConstructor(hour12Option);
+    const hourCycleOption = stringOption(
+      options, 'hourCycle', ['h11', 'h12', 'h23', 'h24'], undefined
+    );
+    if (hour12Option !== undefined || hourCycleOption !== undefined) {
+      throw new RangeError('hour cycle overrides are not currently supported');
+    }
+    const timeZoneOption = options.timeZone;
+    const timeZone = timeZoneOption === undefined ? 'UTC' : stringConstructor(timeZoneOption);
+    if (stringToUpperCase(timeZone) !== 'UTC') {
+      throw new RangeError('only UTC is currently supported');
+    }
+
+    const components = {
+      weekday: stringOption(options, 'weekday', ['narrow', 'short', 'long'], undefined),
+      era: stringOption(options, 'era', ['narrow', 'short', 'long'], undefined),
+      year: stringOption(options, 'year', ['2-digit', 'numeric'], undefined),
+      month: stringOption(
+        options, 'month', ['2-digit', 'numeric', 'narrow', 'short', 'long'], undefined
+      ),
+      day: stringOption(options, 'day', ['2-digit', 'numeric'], undefined),
+      dayPeriod: stringOption(options, 'dayPeriod', ['narrow', 'short', 'long'], undefined),
+      hour: stringOption(options, 'hour', ['2-digit', 'numeric'], undefined),
+      minute: stringOption(options, 'minute', ['2-digit', 'numeric'], undefined),
+      second: stringOption(options, 'second', ['2-digit', 'numeric'], undefined),
+      fractionalSecondDigits: options.fractionalSecondDigits === undefined
+        ? undefined
+        : digitOption(options, 'fractionalSecondDigits', undefined, 1, 3),
+      timeZoneName: stringOption(
+        options, 'timeZoneName',
+        ['short', 'long', 'shortOffset', 'longOffset', 'shortGeneric', 'longGeneric'],
+        undefined
+      ),
+    };
+    stringOption(options, 'formatMatcher', ['basic', 'best fit'], 'best fit');
+    const dateStyle = stringOption(
+      options, 'dateStyle', ['full', 'long', 'medium', 'short'], undefined
+    );
+    const timeStyle = stringOption(
+      options, 'timeStyle', ['full', 'long', 'medium', 'short'], undefined
+    );
+    if (dateStyle !== undefined || timeStyle !== undefined) {
+      for (let index = 0; index < allComponentNames.length; index += 1) {
+        const name = allComponentNames[index];
+        if (components[name] !== undefined) {
+          throw new TypeError('dateStyle/timeStyle cannot be combined with components');
+        }
+      }
+      if (required === 'date' && timeStyle !== undefined) {
+        throw new TypeError('timeStyle is not valid for date-only formatting');
+      }
+      if (required === 'time' && dateStyle !== undefined) {
+        throw new TypeError('dateStyle is not valid for time-only formatting');
+      }
+    }
+
+    let hasTimeComponents = false;
+    let hasDateComponents = false;
+    for (let index = 0; index < dateComponentNames.length; index += 1) {
+      if (components[dateComponentNames[index]] !== undefined) hasDateComponents = true;
+    }
+    for (let index = 0; index < timeComponentNames.length; index += 1) {
+      if (components[timeComponentNames[index]] !== undefined) hasTimeComponents = true;
+    }
+    if (!hasDateComponents && !hasTimeComponents && dateStyle === undefined &&
+        timeStyle === undefined) {
+      if (defaults === 'date' || defaults === 'all') {
+        components.year = components.month = components.day = 'numeric';
+      }
+      if (defaults === 'time' || defaults === 'all') {
+        components.hour = components.minute = components.second = 'numeric';
+        hasTimeComponents = true;
+      }
+    }
+    if (hasTimeComponents && (components.hour === undefined || components.minute === undefined)) {
+      throw new RangeError('time formatting currently requires hour and minute');
+    }
+    if (components.dayPeriod !== undefined || components.fractionalSecondDigits !== undefined ||
+        components.timeZoneName !== undefined) {
+      throw new RangeError('this time component is not currently supported');
+    }
+    const dateCode = dateStyle === undefined
+      ? datePatternCode(components)
+      : styleCode[dateStyle];
+    const timeCode = timeStyle === undefined
+      ? hasTimeComponents ? (components.second === undefined ? 1 : 2) : 0
+      : styleCode[timeStyle];
+    const usesHour = timeCode !== 0;
+    const hour12 = locale === 'en-US' || locale === 'ko-KR';
+    dateTimeSlotsSet(instance, {
+      locale, dateStyle, timeStyle, timeZone: 'UTC', components,
+      dateCode, timeCode, usesHour, hour12, boundFormat: null,
+    });
+  }
 
   // https://402.ecma-international.org/#sec-intl.datetimeformat
   function DateTimeFormat(locales, options) {
     if (!new.target) return new DateTimeFormat(locales, options);
-    const locale = resolveLocale(locales);
-    options = optionsObject(options);
-    const timeZone = options.timeZone === undefined ? 'UTC' : stringConstructor(options.timeZone);
-    if (timeZone.toUpperCase() !== 'UTC') {
-      throw new RangeError('only UTC is currently supported');
-    }
-    let date = dateStyle(options);
-    let time = timeStyle(options);
-    if (date === undefined && time === undefined) date = 'short';
-    dateTimeSlots.set(this, { locale, dateStyle: date, timeStyle: time, timeZone: 'UTC', boundFormat: null });
+    initializeDateTimeFormat(this, locales, options, 'any', 'date');
   }
   Object.defineProperty(DateTimeFormat, 'length', { value: 0 });
 
   Object.defineProperty(DateTimeFormat.prototype, 'format', {
     configurable: true,
     get: function() {
-      const slots = dateTimeSlots.get(this);
+      const slots = dateTimeSlotsGet(this);
       if (!slots) throw new TypeError('incompatible DateTimeFormat receiver');
       if (!slots.boundFormat) {
         slots.boundFormat = value => {
+          if (slots.timeStyle === 'long' || slots.timeStyle === 'full') {
+            throw new RangeError('long time styles require unsupported time zone names');
+          }
           const date = new dateConstructor(
-            value === undefined ? dateNow() : numberConstructor(value)
+            value === undefined ? dateNow() : +value
           );
           if (!numberIsFinite(call(dateValueOf, date))) throw new RangeError('invalid time value');
           return nativeFormatDateTime([
@@ -306,29 +653,58 @@ const INSTALL_INTL_JS: &str = r"
             call(dateGetUTCFullYear, date), call(dateGetUTCMonth, date) + 1,
             call(dateGetUTCDate, date), call(dateGetUTCHours, date),
             call(dateGetUTCMinutes, date), call(dateGetUTCSeconds, date),
-            slots.dateStyle ? styleCode[slots.dateStyle] : 0,
-            slots.timeStyle ? styleCode[slots.timeStyle] : 0
+            slots.dateCode, slots.timeCode
           ]);
         };
       }
       return slots.boundFormat;
     },
   });
+  Object.defineProperty(
+    Object.getOwnPropertyDescriptor(DateTimeFormat.prototype, 'format').get,
+    'name',
+    { value: 'get format' }
+  );
 
-  DateTimeFormat.prototype.resolvedOptions = function() {
-    const slots = dateTimeSlots.get(this);
-    if (!slots) throw new TypeError('incompatible DateTimeFormat receiver');
-    const result = {
-      locale: slots.locale,
-      calendar: 'gregory',
-      numberingSystem: 'latn',
-      timeZone: slots.timeZone,
-    };
-    if (slots.dateStyle) result.dateStyle = slots.dateStyle;
-    if (slots.timeStyle) result.timeStyle = slots.timeStyle;
-    return result;
-  };
-  DateTimeFormat.supportedLocalesOf = supportedLocales;
+  Object.defineProperty(DateTimeFormat.prototype, 'resolvedOptions', {
+    value: function resolvedOptions() {
+      const slots = dateTimeSlotsGet(this);
+      if (!slots) throw new TypeError('incompatible DateTimeFormat receiver');
+      const result = {
+        locale: slots.locale,
+        calendar: 'gregory',
+        numberingSystem: 'latn',
+        timeZone: slots.timeZone,
+      };
+      if (slots.usesHour) {
+        result.hourCycle = slots.hour12 ? 'h12' : 'h23';
+        result.hour12 = slots.hour12;
+      }
+      if (slots.dateStyle) result.dateStyle = slots.dateStyle;
+      if (slots.timeStyle) result.timeStyle = slots.timeStyle;
+      if (!slots.dateStyle && !slots.timeStyle) {
+        for (let index = 0; index < allComponentNames.length; index += 1) {
+          const name = allComponentNames[index];
+          if (slots.components[name] !== undefined) result[name] = slots.components[name];
+        }
+      }
+      return result;
+    },
+    writable: true,
+    configurable: true,
+  });
+  Object.defineProperty(DateTimeFormat, 'supportedLocalesOf', {
+    value: function supportedLocalesOf(locales) {
+      return supportedLocales(locales, arguments[1]);
+    },
+    writable: true,
+    configurable: true,
+  });
+  Object.defineProperty(DateTimeFormat.prototype, Symbol.toStringTag, {
+    value: 'Intl.DateTimeFormat',
+    configurable: true,
+  });
+  Object.defineProperty(DateTimeFormat, 'prototype', { writable: false });
 
   const IntlObject = {};
   Object.defineProperties(IntlObject, {
@@ -336,18 +712,15 @@ const INSTALL_INTL_JS: &str = r"
     DateTimeFormat: { value: DateTimeFormat, writable: true, configurable: true },
     getCanonicalLocales: {
       // https://402.ecma-international.org/#sec-intl.getcanonicallocales
-      value: function(locales) {
-        const result = [];
-        for (const tag of localeList(locales)) {
-          const canonical = nativeCanonicalLocale(stringConstructor(tag));
-          if (canonical === '!') throw new RangeError('invalid language tag: ' + tag);
-          if (result.indexOf(canonical) < 0) result.push(canonical);
-        }
-        return result;
+      value: function getCanonicalLocales(locales) {
+        return canonicalLocaleList(locales);
       },
       writable: true,
       configurable: true,
     },
+  });
+  Object.defineProperty(IntlObject, Symbol.toStringTag, {
+    value: 'Intl', configurable: true,
   });
   Object.defineProperty(globalThis, 'Intl', {
     value: IntlObject,
@@ -356,35 +729,62 @@ const INSTALL_INTL_JS: &str = r"
   });
 
   // https://402.ecma-international.org/#sup-number.prototype.tolocalestring
-  Number.prototype.toLocaleString = function(locales, options) {
-    return new NumberFormat(locales, options).format(call(numberValueOf, this));
+  const numberLocaleMethods = {
+    toLocaleString() {
+      const value = call(numberValueOf, this);
+      return new NumberFormat(arguments[0], arguments[1]).format(value);
+    },
+  };
+  // Firefox likewise keeps BigInt as an exact mathematical value until the
+  // backend boundary instead of coercing it through Number.
+  // https://searchfox.org/firefox-main/source/js/src/builtin/intl/NumberFormat.cpp#2023
+  const bigintLocaleMethods = {
+    toLocaleString() {
+      const value = call(bigintValueOf, this);
+      return new NumberFormat(arguments[0], arguments[1]).format(value);
+    },
   };
   // https://402.ecma-international.org/#sup-date.prototype.tolocalestring
-  Date.prototype.toLocaleString = function(locales, options) {
-    const value = call(dateValueOf, this);
-    if (!numberIsFinite(value)) return 'Invalid Date';
-    const merged = objectAssign(
-      { dateStyle: 'short', timeStyle: 'medium' },
-      options === undefined ? {} : optionsObject(options)
-    );
-    return new DateTimeFormat(locales, merged).format(value);
+  const dateLocaleMethods = {
+    toLocaleString() {
+      const value = call(dateValueOf, this);
+      if (!numberIsFinite(value)) return 'Invalid Date';
+      const formatter = objectCreate(DateTimeFormat.prototype);
+      initializeDateTimeFormat(formatter, arguments[0], arguments[1], 'any', 'all');
+      return formatter.format(value);
+    },
+    toLocaleDateString() {
+      const value = call(dateValueOf, this);
+      if (!numberIsFinite(value)) return 'Invalid Date';
+      const formatter = objectCreate(DateTimeFormat.prototype);
+      initializeDateTimeFormat(formatter, arguments[0], arguments[1], 'date', 'date');
+      return formatter.format(value);
+    },
+    toLocaleTimeString() {
+      const value = call(dateValueOf, this);
+      if (!numberIsFinite(value)) return 'Invalid Date';
+      const formatter = objectCreate(DateTimeFormat.prototype);
+      initializeDateTimeFormat(formatter, arguments[0], arguments[1], 'time', 'time');
+      return formatter.format(value);
+    },
   };
-  Date.prototype.toLocaleDateString = function(locales, options) {
-    const value = call(dateValueOf, this);
-    if (!numberIsFinite(value)) return 'Invalid Date';
-    const merged = objectAssign(
-      { dateStyle: 'short' }, options === undefined ? {} : optionsObject(options)
-    );
-    return new DateTimeFormat(locales, merged).format(value);
-  };
-  Date.prototype.toLocaleTimeString = function(locales, options) {
-    const value = call(dateValueOf, this);
-    if (!numberIsFinite(value)) return 'Invalid Date';
-    const merged = objectAssign(
-      { timeStyle: 'medium' }, options === undefined ? {} : optionsObject(options)
-    );
-    return new DateTimeFormat(locales, merged).format(value);
-  };
+  Object.defineProperty(Number.prototype, 'toLocaleString', {
+    value: numberLocaleMethods.toLocaleString, writable: true, configurable: true,
+  });
+  Object.defineProperty(BigInt.prototype, 'toLocaleString', {
+    value: bigintLocaleMethods.toLocaleString, writable: true, configurable: true,
+  });
+  Object.defineProperties(Date.prototype, {
+    toLocaleString: {
+      value: dateLocaleMethods.toLocaleString, writable: true, configurable: true,
+    },
+    toLocaleDateString: {
+      value: dateLocaleMethods.toLocaleDateString, writable: true, configurable: true,
+    },
+    toLocaleTimeString: {
+      value: dateLocaleMethods.toLocaleTimeString, writable: true, configurable: true,
+    },
+  });
 
 })();
 ";
@@ -392,6 +792,10 @@ const INSTALL_INTL_JS: &str = r"
 pub(super) fn install(ctx: &Ctx<'_>) -> Result<()> {
     let blob = BlobDataProvider::try_new_from_static_blob(ICU_DATA)
         .map_err(|err| Exception::throw_internal(ctx, &err.to_string()))?;
+    let canonicalizer = Rc::new(
+        LocaleCanonicalizer::try_new_common_with_buffer_provider(&blob)
+            .map_err(|err| Exception::throw_internal(ctx, &err.to_string()))?,
+    );
     let fallbacker = LocaleFallbacker::try_new_with_buffer_provider(&blob)
         .map_err(|err| Exception::throw_internal(ctx, &err.to_string()))?;
     let provider = Rc::new(LocaleFallbackProvider::new(blob, fallbacker));
@@ -399,10 +803,11 @@ pub(super) fn install(ctx: &Ctx<'_>) -> Result<()> {
     let number_provider = Rc::clone(&provider);
     let date_provider = Rc::clone(&provider);
     let currency_provider = Rc::clone(&provider);
+    let locale_canonicalizer = Rc::clone(&canonicalizer);
     let globals = ctx.globals();
     globals.set(
         "__tbIntlCanonicalLocale",
-        Func::from(|tag: String| canonicalize_locale(&tag)),
+        Func::from(move |tag: String| canonicalize_locale(&locale_canonicalizer, &tag)),
     )?;
     globals.set(
         "__tbIntlResolveLocale",
@@ -446,23 +851,35 @@ fn resolve_locale(tag: &str) -> String {
     .to_owned()
 }
 
-fn canonicalize_locale(tag: &str) -> String {
-    tag.parse::<Locale>()
-        .map_or_else(|_| "!".to_owned(), |locale| locale.to_string())
+fn canonicalize_locale(canonicalizer: &LocaleCanonicalizer, tag: &str) -> String {
+    let Ok(mut locale) = tag.parse::<Locale>() else {
+        return "!".to_owned();
+    };
+    canonicalizer.canonicalize(&mut locale);
+    locale.to_string()
 }
 
 fn format_number_args(ctx: &Ctx<'_>, provider: &IntlProvider, args: &Array<'_>) -> Result<String> {
+    let number: f64 = args.get(1)?;
+    let exact: String = args.get(2)?;
     let input = NumberFormatInput {
         locale: args.get(0)?,
-        value: args.get(1)?,
-        style: args.get(2)?,
-        currency: args.get(3)?,
-        currency_display: args.get(4)?,
-        currency_sign: args.get(5)?,
-        minimum_integer_digits: args.get(6)?,
-        minimum_fraction_digits: args.get(7)?,
-        maximum_fraction_digits: args.get(8)?,
-        use_grouping: args.get(9)?,
+        value: if exact.is_empty() {
+            NumberFormatValue::Number(number)
+        } else {
+            NumberFormatValue::Exact(exact)
+        },
+        style: args.get(3)?,
+        currency: args.get(4)?,
+        currency_display: args.get(5)?,
+        currency_sign: args.get(6)?,
+        minimum_integer_digits: args.get(7)?,
+        minimum_fraction_digits: args.get(8)?,
+        maximum_fraction_digits: args.get(9)?,
+        minimum_significant_digits: args.get(10)?,
+        maximum_significant_digits: args.get(11)?,
+        use_grouping: args.get(12)?,
+        sign_display: args.get(13)?,
     };
     format_number(ctx, provider, &input)
 }
@@ -491,43 +908,77 @@ fn format_number(
     provider: &IntlProvider,
     input: &NumberFormatInput,
 ) -> Result<String> {
-    if input.value.is_nan() {
-        return Ok("NaN".to_owned());
-    }
-    if input.value.is_infinite() {
-        return Ok(if input.value.is_sign_negative() {
-            "-∞"
-        } else {
-            "∞"
-        }
-        .to_owned());
-    }
-
     let locale = input
         .locale
         .parse::<Locale>()
         .map_err(|err| Exception::throw_internal(ctx, &err.to_string()))?;
-    let mut decimal = Decimal::try_from_f64(input.value, FloatPrecision::RoundTrip)
-        .map_err(|err| Exception::throw_internal(ctx, &err.to_string()))?;
+    let mut decimal = match &input.value {
+        NumberFormatValue::Number(value) if !value.is_finite() => {
+            return format_nonfinite(ctx, provider, input, locale, *value);
+        }
+        NumberFormatValue::Number(value) => {
+            Decimal::try_from_f64(*value, FloatPrecision::RoundTrip)
+                .map_err(|err| Exception::throw_internal(ctx, &err.to_string()))?
+        }
+        NumberFormatValue::Exact(value) => value
+            .strip_prefix('+')
+            .unwrap_or(value)
+            .parse::<Decimal>()
+            .map_err(|err| Exception::throw_internal(ctx, &err.to_string()))?,
+    };
+    prepare_decimal(input, &mut decimal);
+    format_prepared_decimal(ctx, provider, input, locale, &decimal)
+}
+
+fn prepare_decimal(input: &NumberFormatInput, decimal: &mut Decimal) {
     if input.style == "percent" {
         decimal.multiply_pow10(2);
         decimal.trim_start();
     }
-    let position = -i16::from(input.maximum_fraction_digits);
-    decimal.round_with_mode(
-        position,
-        SignedRoundingMode::Unsigned(UnsignedRoundingMode::HalfExpand),
-    );
-    decimal.trim_end();
-    decimal.pad_end(-i16::from(input.minimum_fraction_digits));
+    if input.maximum_significant_digits == 0 {
+        let position = -i16::from(input.maximum_fraction_digits);
+        decimal.round_with_mode(
+            position,
+            SignedRoundingMode::Unsigned(UnsignedRoundingMode::HalfExpand),
+        );
+        decimal.trim_end();
+        decimal.pad_end(-i16::from(input.minimum_fraction_digits));
+    } else {
+        let position =
+            decimal.nonzero_magnitude_start() - i16::from(input.maximum_significant_digits) + 1;
+        decimal.round_with_mode(
+            position,
+            SignedRoundingMode::Unsigned(UnsignedRoundingMode::HalfExpand),
+        );
+        decimal.trim_end();
+        let minimum_position =
+            decimal.nonzero_magnitude_start() - i16::from(input.minimum_significant_digits) + 1;
+        decimal.pad_end(minimum_position);
+    }
     decimal.pad_start(i16::from(input.minimum_integer_digits));
+    let display = match input.sign_display.as_str() {
+        "never" => SignDisplay::Never,
+        "always" => SignDisplay::Always,
+        "exceptZero" => SignDisplay::ExceptZero,
+        "negative" => SignDisplay::Negative,
+        _ => SignDisplay::Auto,
+    };
+    decimal.apply_sign_display(display);
+}
 
+fn format_prepared_decimal(
+    ctx: &Ctx<'_>,
+    provider: &IntlProvider,
+    input: &NumberFormatInput,
+    locale: Locale,
+    decimal: &Decimal,
+) -> Result<String> {
     match input.style.as_str() {
         "currency" => format_currency(
             ctx,
             provider,
             locale,
-            &decimal,
+            decimal,
             &input.currency,
             &input.currency_display,
             &input.currency_sign,
@@ -539,7 +990,7 @@ fn format_number(
                 PercentFormatterOptions::default(),
             )
             .map_err(|err| Exception::throw_internal(ctx, &err.to_string()))?;
-            Ok(formatter.format(&decimal).write_to_string().into_owned())
+            Ok(formatter.format(decimal).write_to_string().into_owned())
         }
         _ => {
             let grouping = if input.use_grouping {
@@ -553,9 +1004,45 @@ fn format_number(
                 DecimalFormatterOptions::from(grouping),
             )
             .map_err(|err| Exception::throw_internal(ctx, &err.to_string()))?;
-            Ok(formatter.format(&decimal).write_to_string().into_owned())
+            Ok(formatter.format(decimal).write_to_string().into_owned())
         }
     }
+}
+
+fn format_nonfinite(
+    ctx: &Ctx<'_>,
+    provider: &IntlProvider,
+    input: &NumberFormatInput,
+    locale: Locale,
+    value: f64,
+) -> Result<String> {
+    let mut placeholder = Decimal::from(0);
+    if value.is_sign_negative() {
+        placeholder.set_sign(Sign::Negative);
+    }
+    prepare_decimal(input, &mut placeholder);
+    let formatted = format_prepared_decimal(ctx, provider, input, locale.clone(), &placeholder)?;
+
+    let mut unsigned = placeholder;
+    unsigned.set_sign(Sign::None);
+    let number_formatter = DecimalFormatter::try_new_with_buffer_provider(
+        provider,
+        locale.into(),
+        DecimalFormatterOptions::from(GroupingStrategy::Never),
+    )
+    .map_err(|err| Exception::throw_internal(ctx, &err.to_string()))?;
+    let digits = number_formatter
+        .format(&unsigned)
+        .write_to_string()
+        .into_owned();
+    let replacement = if value.is_nan() { "NaN" } else { "∞" };
+    if !formatted.contains(&digits) {
+        return Err(Exception::throw_internal(
+            ctx,
+            "ICU4X non-finite placeholder did not contain its decimal digits",
+        ));
+    }
+    Ok(formatted.replacen(&digits, replacement, 1))
 }
 
 fn currency_digits(ctx: &Ctx<'_>, provider: &IntlProvider, currency: &str) -> Result<u8> {
@@ -656,40 +1143,106 @@ fn format_date_time(
         .map_err(|err| Exception::throw_range(ctx, &err.to_string()))?;
     let datetime = DateTime { date, time };
 
-    let output = match (input.date_style, input.time_style) {
-        (0, 1) => {
-            NoCalendarFormatter::try_new_with_buffer_provider(provider, locale.into(), T::hm())
-                .map(|formatter| formatter.format(&time).write_to_string().into_owned())
+    match (input.date_style, input.time_style) {
+        (0, time_style) => format_time(ctx, provider, locale, time, time_style),
+        (date_style, 0) => format_date(ctx, provider, locale, date, date_style),
+        (date_style, time_style) => {
+            format_combined(ctx, provider, locale, &datetime, date_style, time_style)
         }
-        (0, 2..=u8::MAX) => {
-            NoCalendarFormatter::try_new_with_buffer_provider(provider, locale.into(), T::hms())
-                .map(|formatter| formatter.format(&time).write_to_string().into_owned())
-        }
-        (1, 0) => FixedCalendarDateTimeFormatter::<Gregorian, _>::try_new_with_buffer_provider(
+    }
+}
+
+fn format_time(
+    ctx: &Ctx<'_>,
+    provider: &IntlProvider,
+    locale: Locale,
+    time: Time,
+    style: u8,
+) -> Result<String> {
+    let output = if style == 1 {
+        NoCalendarFormatter::try_new_with_buffer_provider(provider, locale.into(), T::hm())
+            .map(|formatter| formatter.format(&time).write_to_string().into_owned())
+    } else {
+        NoCalendarFormatter::try_new_with_buffer_provider(provider, locale.into(), T::hms())
+            .map(|formatter| formatter.format(&time).write_to_string().into_owned())
+    }
+    .map_err(|err| Exception::throw_internal(ctx, &err.to_string()))?;
+    Ok(output)
+}
+
+fn format_date(
+    ctx: &Ctx<'_>,
+    provider: &IntlProvider,
+    locale: Locale,
+    date: Date<Gregorian>,
+    style: u8,
+) -> Result<String> {
+    let output = match style {
+        1 => FixedCalendarDateTimeFormatter::<Gregorian, _>::try_new_with_buffer_provider(
             provider,
             locale.into(),
             YMD::short(),
         )
         .map(|formatter| formatter.format(&date).write_to_string().into_owned()),
-        (2, 0) => FixedCalendarDateTimeFormatter::<Gregorian, _>::try_new_with_buffer_provider(
+        2 => FixedCalendarDateTimeFormatter::<Gregorian, _>::try_new_with_buffer_provider(
             provider,
             locale.into(),
             YMD::medium(),
         )
         .map(|formatter| formatter.format(&date).write_to_string().into_owned()),
-        (3, 0) => FixedCalendarDateTimeFormatter::<Gregorian, _>::try_new_with_buffer_provider(
+        3 => FixedCalendarDateTimeFormatter::<Gregorian, _>::try_new_with_buffer_provider(
             provider,
             locale.into(),
             YMD::long(),
         )
         .map(|formatter| formatter.format(&date).write_to_string().into_owned()),
-        (4..=u8::MAX, 0) => {
+        5 => FixedCalendarDateTimeFormatter::<Gregorian, _>::try_new_with_buffer_provider(
+            provider,
+            locale.into(),
+            YMD::short().with_year_style(YearStyle::Full),
+        )
+        .map(|formatter| formatter.format(&date).write_to_string().into_owned()),
+        _ => FixedCalendarDateTimeFormatter::<Gregorian, _>::try_new_with_buffer_provider(
+            provider,
+            locale.into(),
+            YMDE::long(),
+        )
+        .map(|formatter| formatter.format(&date).write_to_string().into_owned()),
+    }
+    .map_err(|err| Exception::throw_internal(ctx, &err.to_string()))?;
+    Ok(output)
+}
+
+fn format_combined(
+    ctx: &Ctx<'_>,
+    provider: &IntlProvider,
+    locale: Locale,
+    datetime: &DateTime<Gregorian>,
+    date_style: u8,
+    time_style: u8,
+) -> Result<String> {
+    let output = match (date_style, time_style) {
+        (5, 1) => FixedCalendarDateTimeFormatter::<Gregorian, _>::try_new_with_buffer_provider(
+            provider,
+            locale.into(),
+            YMD::short().with_year_style(YearStyle::Full).with_time_hm(),
+        )
+        .map(|formatter| formatter.format(datetime).write_to_string().into_owned()),
+        (5, _) => FixedCalendarDateTimeFormatter::<Gregorian, _>::try_new_with_buffer_provider(
+            provider,
+            locale.into(),
+            YMD::short()
+                .with_year_style(YearStyle::Full)
+                .with_time_hms(),
+        )
+        .map(|formatter| formatter.format(datetime).write_to_string().into_owned()),
+        (4..=u8::MAX, 1) => {
             FixedCalendarDateTimeFormatter::<Gregorian, _>::try_new_with_buffer_provider(
                 provider,
                 locale.into(),
-                YMDE::long(),
+                YMDE::long().with_time_hm(),
             )
-            .map(|formatter| formatter.format(&date).write_to_string().into_owned())
+            .map(|formatter| formatter.format(datetime).write_to_string().into_owned())
         }
         (4..=u8::MAX, _) => {
             FixedCalendarDateTimeFormatter::<Gregorian, _>::try_new_with_buffer_provider(
@@ -697,26 +1250,44 @@ fn format_date_time(
                 locale.into(),
                 YMDE::long().with_time_hms(),
             )
-            .map(|formatter| formatter.format(&datetime).write_to_string().into_owned())
+            .map(|formatter| formatter.format(datetime).write_to_string().into_owned())
         }
+        (3, 1) => FixedCalendarDateTimeFormatter::<Gregorian, _>::try_new_with_buffer_provider(
+            provider,
+            locale.into(),
+            YMD::long().with_time_hm(),
+        )
+        .map(|formatter| formatter.format(datetime).write_to_string().into_owned()),
         (3, _) => FixedCalendarDateTimeFormatter::<Gregorian, _>::try_new_with_buffer_provider(
             provider,
             locale.into(),
             YMD::long().with_time_hms(),
         )
-        .map(|formatter| formatter.format(&datetime).write_to_string().into_owned()),
+        .map(|formatter| formatter.format(datetime).write_to_string().into_owned()),
+        (2, 1) => FixedCalendarDateTimeFormatter::<Gregorian, _>::try_new_with_buffer_provider(
+            provider,
+            locale.into(),
+            YMD::medium().with_time_hm(),
+        )
+        .map(|formatter| formatter.format(datetime).write_to_string().into_owned()),
         (2, _) => FixedCalendarDateTimeFormatter::<Gregorian, _>::try_new_with_buffer_provider(
             provider,
             locale.into(),
             YMD::medium().with_time_hms(),
         )
-        .map(|formatter| formatter.format(&datetime).write_to_string().into_owned()),
-        _ => FixedCalendarDateTimeFormatter::<Gregorian, _>::try_new_with_buffer_provider(
+        .map(|formatter| formatter.format(datetime).write_to_string().into_owned()),
+        (1, 1) => FixedCalendarDateTimeFormatter::<Gregorian, _>::try_new_with_buffer_provider(
             provider,
             locale.into(),
             YMD::short().with_time_hm(),
         )
-        .map(|formatter| formatter.format(&datetime).write_to_string().into_owned()),
+        .map(|formatter| formatter.format(datetime).write_to_string().into_owned()),
+        _ => FixedCalendarDateTimeFormatter::<Gregorian, _>::try_new_with_buffer_provider(
+            provider,
+            locale.into(),
+            YMD::short().with_time_hms(),
+        )
+        .map(|formatter| formatter.format(datetime).write_to_string().into_owned()),
     }
     .map_err(|err| Exception::throw_internal(ctx, &err.to_string()))?;
     Ok(output)

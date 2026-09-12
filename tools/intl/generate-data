@@ -3,19 +3,29 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 DATAGEN="${ICU4X_DATAGEN:-icu4x-datagen}"
-BINARY="${1:-$ROOT/target/release/tinybrowser}"
+BINARY="$ROOT/target/release/tinybrowser"
 OUTPUT="$ROOT/crates/renderer/src/js/intl_data.postcard"
 EXPECTED_VERSION="icu4x-datagen 2.3.0"
 
-if [[ "$("$DATAGEN" --version)" != "$EXPECTED_VERSION" ]]; then
-  echo "$EXPECTED_VERSION is required to regenerate Intl data" >&2
+if ! command -v "$DATAGEN" >/dev/null 2>&1; then
+  echo "install icu4x-datagen 2.3.0 with:" >&2
+  echo "cargo install icu4x-datagen --version 2.3.0 --features unstable" >&2
   exit 1
 fi
 
-if [[ ! -x "$BINARY" ]]; then
-  echo "marker binary not found: $BINARY" >&2
+if [[ "$("$DATAGEN" --version)" != "$EXPECTED_VERSION" ]]; then
+  echo "$EXPECTED_VERSION with the unstable feature is required to regenerate Intl data" >&2
   exit 1
 fi
+
+if (( $# != 0 )); then
+  echo "usage: tools/intl/generate-data" >&2
+  exit 1
+fi
+
+# Marker discovery must use current code. Building here prevents a stale
+# executable from silently omitting newly referenced ICU4X data.
+(cd "$ROOT" && cargo build --release --bin tinybrowser)
 
 "$DATAGEN" \
   --markers-for-bin "$BINARY" \
