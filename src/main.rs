@@ -35,6 +35,9 @@ struct Cli {
     profile: Profile,
 
     /// Minimum log level: error, warn, info, debug, or trace [default: info]
+    ///
+    /// A running daemon keeps its start-up level; `--verbose` is shorthand for
+    /// `--log-level=debug`.
     #[arg(long, global = true, value_name = "LEVEL", value_parser = parse_level)]
     log_level: Option<Level>,
 
@@ -43,7 +46,12 @@ struct Cli {
     verbose: bool,
 
     /// Print version
-    #[arg(short = 'v', long = "version", action = clap::ArgAction::Version)]
+    #[arg(
+        short = 'v',
+        long = "version",
+        short_alias = 'V',
+        action = clap::ArgAction::Version
+    )]
     version: (),
 
     /// Serve classic `WebDriver` on this loopback port
@@ -102,7 +110,9 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
     install_logger(&cli);
     let code = run(cli);
-    logging::flush();
+    if !logging::flush() {
+        logging::error!(target: "logging", "file log did not flush before exit");
+    }
     code
 }
 

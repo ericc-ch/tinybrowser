@@ -39,6 +39,8 @@ pub(crate) fn dropped(process: &str, pid: u32, count: u64) -> String {
 
 /// RFC 3339 UTC with milliseconds, for example `2026-09-12T00:00:00.123Z`.
 pub(crate) fn timestamp(time: SystemTime) -> String {
+    // Pre-epoch clocks clamp to the epoch instead of rendering a negative
+    // year; system clocks before 1970 are not a case worth carrying.
     let since_epoch = time.duration_since(UNIX_EPOCH).unwrap_or_default();
     let seconds = since_epoch.as_secs();
     let millis = since_epoch.subsec_millis();
@@ -73,7 +75,7 @@ fn push_field(out: &mut String, name: &str, value: &str) {
     out.push_str(name);
     out.push('=');
     if needs_quote(value) {
-        push_quoted(out, value, false);
+        push_quoted(out, value);
     } else {
         out.push_str(value);
     }
@@ -85,7 +87,7 @@ fn push_message(out: &mut String, args: fmt::Arguments<'_>) {
     let _ = write!(message, "{args}");
     out.push_str(" message=");
     if needs_quote(&message) {
-        push_quoted(out, &message, true);
+        push_quoted(out, &message);
     } else {
         out.push_str(&message);
     }
@@ -98,14 +100,16 @@ fn needs_quote(value: &str) -> bool {
             .any(|c| c.is_whitespace() || c == '"' || c == '=')
 }
 
-fn push_quoted(out: &mut String, value: &str, escape_newlines: bool) {
+/// Appends a quoted value, escaping quotes, backslashes, and line breaks so
+/// one record always occupies one physical line.
+fn push_quoted(out: &mut String, value: &str) {
     out.push('"');
     for c in value.chars() {
         match c {
             '"' => out.push_str("\\\""),
             '\\' => out.push_str("\\\\"),
-            '\n' if escape_newlines => out.push_str("\\n"),
-            '\r' if escape_newlines => out.push_str("\\r"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
             _ => out.push(c),
         }
     }
@@ -160,6 +164,13 @@ mod tests {
             rest,
             "level=ERROR process=cli pid=7 target=cli message=\"bad \\\"value\\\" a=b\\nnext\""
         );
+    }
+
+    #[test]
+    fn newlines_in_targets_stay_on_one_line() {
+        let line = record("p", 1, Level::Info, "a\nb", format_args!("m"));
+        assert_eq!(line.lines().count(), 1, "{line}");
+        assert!(line.contains("target=\"a\\nb\""), "{line}");
     }
 
     #[test]

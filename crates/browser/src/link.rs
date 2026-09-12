@@ -394,11 +394,17 @@ fn spawn_process(id: RendererId, site: Site, fetch: FetchHandle) -> io::Result<R
 /// lines, so renderer records land in the daemon's console and file without a
 /// second file writer ([ADR 0015](../../../docs/adrs/0015-logging.md)).
 fn forward_stderr(stderr: std::process::ChildStderr) {
-    let reader = BufReader::new(stderr);
-    for line in reader.lines() {
-        match line {
-            Ok(line) => logging::log_forwarded(&line),
-            Err(_) => break,
+    let mut reader = BufReader::new(stderr);
+    let mut bytes = Vec::new();
+    loop {
+        bytes.clear();
+        match reader.read_until(b'\n', &mut bytes) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {
+                // Renderer output is diagnostic text; one invalid UTF-8 line
+                // must not stop later lines from being forwarded.
+                logging::log_forwarded(&String::from_utf8_lossy(&bytes));
+            }
         }
     }
 }

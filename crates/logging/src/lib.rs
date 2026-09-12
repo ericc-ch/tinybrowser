@@ -208,42 +208,53 @@ impl Logger {
         }
         self.report_drops();
         let line = format::record(self.process, self.pid, level, target, args);
-        self.emit(&line);
+        if !self.emit(&line) {
+            self.drops.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     /// Forwards one already-formatted line (a renderer child's stderr).
     pub fn log_forwarded(&self, line: &str) {
         self.report_drops();
-        self.emit(line.trim_end_matches(['\r', '\n']));
-    }
-
-    /// Blocks until the file writer has flushed every accepted record.
-    pub fn flush(&self) {
-        if let Some(file) = &self.file {
-            file.flush();
-        }
-    }
-
-    fn emit(&self, line: &str) {
-        if self.console {
-            write_console(line);
-        }
-        let Some(file) = &self.file else {
-            return;
-        };
-        if !file.try_send(line) {
+        if !self.emit(line.trim_end_matches(['\r', '\n'])) {
             self.drops.fetch_add(1, Ordering::Relaxed);
         }
     }
 
+    /// Flushes pending records; `false` when the file writer did not catch up
+    /// within its bound, or is gone. True when there is no file sink.
+    pub fn flush(&self) -> bool {
+        self.report_drops();
+        self.file.as_ref().is_none_or(file::FileSink::flush)
+    }
+
+    /// Writes one line to the console and queues it for the file.
+    ///
+    /// Returns `false` when the file queue is full; console failure is
+    /// deliberately ignored.
+    fn emit(&self, line: &str) -> bool {
+        if self.console {
+            write_console(line);
+        }
+        let Some(file) = &self.file else {
+            return true;
+        };
+        file.try_send(line)
+    }
+
     /// Emits one warning for records the bounded file queue has dropped.
+    ///
+    /// When the warning itself cannot be queued, the count is restored so the
+    /// next record reports the full total instead of just the warning.
     fn report_drops(&self) {
         let dropped = self.drops.swap(0, Ordering::Relaxed);
         if dropped == 0 {
             return;
         }
         let line = format::dropped(self.process, self.pid, dropped);
-        self.emit(&line);
+        if !self.emit(&line) {
+            self.drops.fetch_add(dropped, Ordering::Relaxed);
+        }
     }
 }
 
@@ -289,65 +300,95 @@ pub fn log_forwarded(line: &str) {
     }
 }
 
-/// Flushes the installed logger's pending file records.
-pub fn flush() {
-    if let Some(logger) = LOGGER.get() {
-        logger.flush();
-    }
+/// Flushes the installed logger's pending records; `false` when its file
+/// writer did not catch up in time. True when no logger is installed.
+#[must_use]
+pub fn flush() -> bool {
+    LOGGER.get().is_none_or(Logger::flush)
 }
 
-/// Logs at [`Level::Error`].
+/// Logs at [`Level::Error`] when the threshold enables it.
+///
+/// Arguments are evaluated only when the record is enabled.
 #[macro_export]
 macro_rules! error {
     (target: $target:expr, $($arg:tt)*) => {
-        $crate::log($crate::Level::Error, $target, format_args!($($arg)*))
+        if $crate::enabled($crate::Level::Error) {
+            $crate::log($crate::Level::Error, $target, format_args!($($arg)*))
+        }
     };
     ($($arg:tt)*) => {
-        $crate::log($crate::Level::Error, module_path!(), format_args!($($arg)*))
+        if $crate::enabled($crate::Level::Error) {
+            $crate::log($crate::Level::Error, module_path!(), format_args!($($arg)*))
+        }
     };
 }
 
-/// Logs at [`Level::Warn`].
+/// Logs at [`Level::Warn`] when the threshold enables it.
+///
+/// Arguments are evaluated only when the record is enabled.
 #[macro_export]
 macro_rules! warn {
     (target: $target:expr, $($arg:tt)*) => {
-        $crate::log($crate::Level::Warn, $target, format_args!($($arg)*))
+        if $crate::enabled($crate::Level::Warn) {
+            $crate::log($crate::Level::Warn, $target, format_args!($($arg)*))
+        }
     };
     ($($arg:tt)*) => {
-        $crate::log($crate::Level::Warn, module_path!(), format_args!($($arg)*))
+        if $crate::enabled($crate::Level::Warn) {
+            $crate::log($crate::Level::Warn, module_path!(), format_args!($($arg)*))
+        }
     };
 }
 
-/// Logs at [`Level::Info`].
+/// Logs at [`Level::Info`] when the threshold enables it.
+///
+/// Arguments are evaluated only when the record is enabled.
 #[macro_export]
 macro_rules! info {
     (target: $target:expr, $($arg:tt)*) => {
-        $crate::log($crate::Level::Info, $target, format_args!($($arg)*))
+        if $crate::enabled($crate::Level::Info) {
+            $crate::log($crate::Level::Info, $target, format_args!($($arg)*))
+        }
     };
     ($($arg:tt)*) => {
-        $crate::log($crate::Level::Info, module_path!(), format_args!($($arg)*))
+        if $crate::enabled($crate::Level::Info) {
+            $crate::log($crate::Level::Info, module_path!(), format_args!($($arg)*))
+        }
     };
 }
 
-/// Logs at [`Level::Debug`].
+/// Logs at [`Level::Debug`] when the threshold enables it.
+///
+/// Arguments are evaluated only when the record is enabled.
 #[macro_export]
 macro_rules! debug {
     (target: $target:expr, $($arg:tt)*) => {
-        $crate::log($crate::Level::Debug, $target, format_args!($($arg)*))
+        if $crate::enabled($crate::Level::Debug) {
+            $crate::log($crate::Level::Debug, $target, format_args!($($arg)*))
+        }
     };
     ($($arg:tt)*) => {
-        $crate::log($crate::Level::Debug, module_path!(), format_args!($($arg)*))
+        if $crate::enabled($crate::Level::Debug) {
+            $crate::log($crate::Level::Debug, module_path!(), format_args!($($arg)*))
+        }
     };
 }
 
-/// Logs at [`Level::Trace`].
+/// Logs at [`Level::Trace`] when the threshold enables it.
+///
+/// Arguments are evaluated only when the record is enabled.
 #[macro_export]
 macro_rules! trace {
     (target: $target:expr, $($arg:tt)*) => {
-        $crate::log($crate::Level::Trace, $target, format_args!($($arg)*))
+        if $crate::enabled($crate::Level::Trace) {
+            $crate::log($crate::Level::Trace, $target, format_args!($($arg)*))
+        }
     };
     ($($arg:tt)*) => {
-        $crate::log($crate::Level::Trace, module_path!(), format_args!($($arg)*))
+        if $crate::enabled($crate::Level::Trace) {
+            $crate::log($crate::Level::Trace, module_path!(), format_args!($($arg)*))
+        }
     };
 }
 
@@ -397,6 +438,22 @@ mod tests {
     }
 
     #[test]
+    fn disabled_macros_do_not_evaluate_arguments() {
+        let mut evaluated = false;
+        crate::info!(target: "test", "{}", {
+            evaluated = true;
+            "value"
+        });
+        assert!(!evaluated, "a filtered macro must not run its arguments");
+    }
+
+    #[test]
+    fn console_only_logger_flushes_trivially() {
+        let logger = Logger::new(Config::new("test").level(Level::Info).console(false));
+        assert!(logger.flush());
+    }
+
+    #[test]
     fn a_full_file_queue_drops_instead_of_blocking() {
         let (sink, _never_read) = file::FileSink::stalled(2);
         let logger = Logger {
@@ -412,5 +469,24 @@ mod tests {
         assert_eq!(logger.drops.load(Ordering::Relaxed), 0);
         logger.log(Level::Info, "test", format_args!("three"));
         assert_eq!(logger.drops.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn a_failed_drop_warning_keeps_the_count() {
+        let (sink, _never_read) = file::FileSink::stalled(1);
+        let logger = Logger {
+            level: AtomicU8::new(Level::Trace as u8),
+            process: "test",
+            pid: 1,
+            console: false,
+            file: Some(sink),
+            drops: AtomicU64::new(0),
+        };
+        logger.log(Level::Info, "test", format_args!("one"));
+        logger.log(Level::Info, "test", format_args!("two"));
+        assert_eq!(logger.drops.load(Ordering::Relaxed), 1);
+        // The warning cannot be queued either; the pending count must survive.
+        logger.log(Level::Info, "test", format_args!("three"));
+        assert_eq!(logger.drops.load(Ordering::Relaxed), 2);
     }
 }

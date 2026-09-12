@@ -406,10 +406,9 @@ release profile; both sides ran plain `cargo build --release --bin tinybrowser
 
 | Artifact | Baseline `ccf16b8` | With logging | Delta | Headroom to 10,000,000 |
 | --- | ---: | ---: | ---: | ---: |
-| CLI (`target/release/tinybrowser`) | 5,310,416 | 5,347,008 | **+36,592** | 4,652,992 |
-| page engine (`target/release/examples/tab_probe`) | 4,270,848 | 4,288,976 | **+18,128** | 5,711,024 |
+| CLI (`target/release/tinybrowser`) | 5,310,416 | 5,348,832 | **+38,416** | 4,651,168 |
+| page engine (`target/release/examples/tab_probe`) | 4,270,848 | 4,289,040 | **+18,192** | 5,710,960 |
 
 The probe delta is the cleaner marginal for the crate and the browser/renderer
 wiring; the CLI delta adds the clap surface (level value parser, help text) and
-the per-process file config. Both land inside the ADR's +15–30 KB estimate to
-within a few KB on the probe side.
+the per-process file config. Both numbers are recorded in ADR 0015.

@@ -18,7 +18,7 @@ change any protocol, `TabHandle`, or the daemon contract of
 
 ## Context
 
-Today the only diagnostics are six `eprintln!` sites (fatal CLI errors and two
+Today the only diagnostics are ten `eprintln!` sites (fatal CLI errors and two
 bad-IPC-message branches). There are no levels, no filtering, no structure, and
 no file. A detached daemon runs with `Stdio::null()` for all three streams
 (`src/daemon.rs`), so it is currently completely silent. Renderer children
@@ -52,8 +52,9 @@ and `webdriver` adopt it where they have diagnostics, and `dom`/`net` do not
 - **Default (nothing installed) is a disabled no-op.** Library crates and
   tests stay silent unless the process entry point installs a logger. This is
   the Rust answer to Effect's `MinimumLogLevel = None`.
-- Format arguments are evaluated only after the level check, so a disabled
-  `debug!` costs one boolean load.
+- Macros check `enabled()` before building `format_args!`, so a disabled
+  `debug!` does not evaluate its arguments. A direct `log()` call still checks
+  the level after the caller has built its arguments.
 
 ### 3. Console sink writes to stderr, one logfmt line per record
 
@@ -82,12 +83,18 @@ computed locally (day-from-civil), no `chrono`.
 - One dedicated `logging-file` OS thread per process that has a file sink. Its
   `SyncSender<Message>` is bounded (1024 records); `log` uses `try_send`, and a
   full queue increments an `AtomicU64` instead of blocking the caller. The next
-  batch writes one `WARN ... dropped N records` line.
-- The writer batches up to 256 records / 64 KiB per `write_all`, with a 250 ms
-  window; no `fsync` (logs are diagnostics, not durable data). `flush()` writes
-  the pending batch and acks.
+  record emits one `WARN ... dropped N records` line; when that warning cannot
+  be queued either, its count is restored for the next attempt.
+- The writer batches up to 256 records / 64 KiB per `write_all`. The 250 ms
+  window starts when the first record enters the buffer, so a steady trickle is
+  written at least every window instead of resetting the timer per record; no
+  `fsync` (logs are diagnostics, not durable data). `flush()` waits up to two
+  seconds for the pending batch and reports `false` when the writer does not
+  catch up.
 - Rotation is one backup at 8 MiB (`<file>` → `<file>.1`), checked in the
-  writer thread only.
+  writer thread only. Every failure path keeps writing through the live
+  descriptor with a count that matches the file, so a failed rename cannot
+  silently disable the cap or orphan the live path.
 - An open failure is non-fatal: the logger warns once on stderr and runs
   console-only.
 - "Low priority" means best-effort, non-blocking, drop-under-pressure. OS
@@ -133,8 +140,9 @@ computed locally (day-from-civil), no `chrono`.
 ### 7. Shutdown
 
 `main` becomes a thin wrapper that calls `logging::flush()` before returning
-any `ExitCode`; the writer thread also drains on channel disconnect. A crash
-can lose at most the current 250 ms batch.
+any `ExitCode` and emits an error when the file writer does not catch up; the
+writer thread also drains on channel disconnect. A crash can lose the current
+buffered batch and any records still queued.
 
 ## Implementation shape
 
@@ -171,7 +179,7 @@ can lose at most the current 250 ms batch.
 ## Consequences
 
 - Binary size measured 2026-09-12 against a rebuilt `main` baseline
-  (`ccf16b8`): **+36,592 bytes CLI, +18,128 bytes `tab_probe`** tuned and
+  (`ccf16b8`): **+38,416 bytes CLI, +18,192 bytes `tab_probe`** tuned and
   stripped, recorded in `docs/researches/size-budget.md`.
 - Root, `browser`, and `renderer` gain a `logging` dependency; library code can
   now emit diagnostics, but stays silent until `main` installs a logger.
@@ -179,7 +187,12 @@ can lose at most the current 250 ms batch.
   `$XDG_DATA_HOME/tinybrowser/logs/`. No `logs` CLI command in v1; deleting the
   directory is safe while no daemon runs.
 - A log level is not inheritable by an already-running daemon or by later CLI
-  calls; document in `--help`.
+  calls; the `--log-level` help says so.
+- The console sink is a synchronous stderr write. A process whose stderr
+  consumer stops draining (for example, a foreground `--webdriver` piped into a
+  stalled reader) can backpressure a renderer through the browser's forwarding
+  pipe; the detached daemon's null stderr is immune. Making the console
+  non-blocking needs `O_NONBLOCK` (unsafe) or a second writer thread.
 - WPT is unaffected: test runs use a temporary `XDG_DATA_HOME`, and the
   console sink is stderr.
 - The `log` crate facade (html5ever parse errors) and `tracing` (axum) remain
@@ -190,13 +203,18 @@ can lose at most the current 250 ms batch.
 
 - Level parsing, ordering, and threshold filtering; `--log-level` parsing,
   explicit-value-wins over `--verbose`, and the `-v` version action.
-- logfmt formatting: quoting, escaping, single-line invariant, known RFC 3339
-  timestamps.
-- File sink: records appear after `flush()`; batching writes whole lines;
-  rotation renames at the cap; open failure falls back to console-only.
+- logfmt formatting: quoting, escaping (including newlines in `target`), the
+  single-line invariant, and known RFC 3339 timestamps.
+- File sink success paths: records appear after `flush()`; batching writes whole
+  lines; rotation renames at the cap; open failure falls back to console-only.
+- File sink failure paths: a failed archive keeps writing and counting toward
+  the cap; a steady trickle flushes within the window; the log file and its
+  directory are user-private.
 - Drop path: the bounded queue rejects instead of blocking when the receiver is
   stalled, the logger counts the drop, and the next record emits a `dropped N`
   warning.
+- Renderer forwarding: the daemon log contains the forwarded
+  `process=renderer` record, so the `TINYBROWSER_LOG` plumbing is covered.
 - No web-platform behavior is asserted here; WPT stays the conformance gate.
 
 ## Options considered
