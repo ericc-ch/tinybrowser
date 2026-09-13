@@ -237,6 +237,12 @@ impl std::error::Error for ScriptFailure {}
 pub enum TabEvent {
     /// The document reached `readyState = "complete"` and dispatched `load`.
     Load,
+    /// A child frame reached `load`; the top frame is unaffected.
+    ChildLoad,
+    /// A navigation committed; the document URL now reflects the final URL.
+    Navigated,
+    /// A navigation dial failed; the tab keeps its previous document.
+    NavigationFailed,
     /// A host timer whose delay elapsed.
     Timer(u32),
     /// A `fetch` or navigation job finished with this HTTP status.

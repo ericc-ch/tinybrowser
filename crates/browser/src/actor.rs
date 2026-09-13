@@ -685,15 +685,22 @@ impl Tab {
                 self.record_event(TabEvent::Fetch {
                     status: outcome.status,
                 });
-                self.commit_navigation(outcome);
+                let mounted = self.commit_navigation(outcome);
+                self.record_event(if mounted {
+                    TabEvent::Navigated
+                } else {
+                    TabEvent::NavigationFailed
+                });
             } else {
                 self.record_event(TabEvent::FetchFailed);
                 self.navigation_failed = true;
+                self.record_event(TabEvent::NavigationFailed);
             }
         }
     }
 
-    fn commit_navigation(&mut self, outcome: NavOutcome) {
+    /// Returns true when the new document mounted.
+    fn commit_navigation(&mut self, outcome: NavOutcome) -> bool {
         let site = Site::for_url(&outcome.final_url).unwrap_or_else(|| Site::opaque(self.id));
         self.document_url = outcome.final_url.clone();
         self.content_language.clone_from(&outcome.content_language);
@@ -705,7 +712,9 @@ impl Tab {
         };
         if self.mount(&site, mount).is_err() {
             self.navigation_failed = true;
+            return false;
         }
+        true
     }
 
     fn pump_renderer(&mut self) {
@@ -718,8 +727,12 @@ impl Tab {
         for (frame, event) in arrived {
             if frame == FrameId::MAIN && event == TabEvent::Load {
                 self.document_loaded = true;
+                self.record_event(event);
+            } else if event == TabEvent::Load {
+                self.record_event(TabEvent::ChildLoad);
+            } else {
+                self.record_event(event);
             }
-            self.record_event(event);
         }
     }
 

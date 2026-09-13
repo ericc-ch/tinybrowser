@@ -82,6 +82,34 @@ fn browser_target_page_runtime_flatten_and_method_not_found() {
     assert_eq!(undefined_value["result"]["type"], json!("undefined"));
     assert!(undefined_value["result"].get("subtype").is_none());
 
+    // `returnByValue` defaults to false: primitives serialize inline, objects
+    // come back as handles.
+    let primitive = client
+        .call(
+            "Runtime.evaluate",
+            &json!({"expression": "1 + 1"}),
+            Some(&session),
+        )
+        .expect("primitive");
+    assert_eq!(primitive["result"]["value"].as_f64(), Some(2.0));
+    assert!(
+        primitive["result"].get("objectId").is_none(),
+        "primitive must not carry an objectId"
+    );
+
+    let object = client
+        .call(
+            "Runtime.evaluate",
+            &json!({"expression": "({a: 1})"}),
+            Some(&session),
+        )
+        .expect("object");
+    assert!(
+        object["result"]["objectId"].is_string(),
+        "objects come back as handles"
+    );
+    assert!(object["result"].get("value").is_none());
+
     let missing = client.call("Foo.bar", &json!({}), None);
     let err = missing.expect_err("method-not-found");
     assert!(err.to_string().contains("wasn't found"), "{err}");

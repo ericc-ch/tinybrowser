@@ -15,7 +15,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::sync::mpsc::Receiver;
+use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
 use axum::Router;
@@ -304,9 +304,8 @@ struct Conn {
     clock_origin: Instant,
     auto_attach: bool,
     events: Vec<Value>,
-    nav_urls: HashMap<TabId, String>,
     loader_ids: HashMap<TabId, String>,
-    last_frame_urls: HashMap<TabId, String>,
+    isolated_worlds: HashMap<TabId, Vec<String>>,
     next_loader: u64,
     next_context: u64,
     next_handle: u64,
@@ -314,6 +313,7 @@ struct Conn {
 
 struct TabSubscription {
     tab_id: TabId,
+    tab: TabHandle,
     session: Option<String>,
     events: Receiver<TabEvent>,
 }
@@ -326,40 +326,30 @@ struct Outcome {
 
 impl Conn {
     /// Page events accumulated since the last flush, each ready to send.
+    ///
+    /// May call into the tab actor (final URL after redirects), so callers run
+    /// this inside a blocking region.
     fn take_event_messages(&mut self) -> Vec<Value> {
         let mut messages = std::mem::take(&mut self.events);
         let timestamp = self.clock_origin.elapsed().as_secs_f64();
         let mut pending = Vec::new();
         for subscription in &self.subscriptions {
             for event in subscription.events.try_iter() {
-                pending.push((subscription.tab_id, subscription.session.clone(), event));
+                pending.push((
+                    subscription.tab.clone(),
+                    subscription.session.clone(),
+                    event,
+                ));
             }
         }
-        for (tab_id, session, event) in pending {
-            let frame_id = tab_id.to_string();
-            let url = self.nav_urls.get(&tab_id).cloned().unwrap_or_default();
-            let loader_id = self.loader_ids.get(&tab_id).cloned().unwrap_or_default();
+        for (tab, session, event) in pending {
             match event {
-                // `TabEvent::Fetch` also covers JS `fetch`; only a navigation
-                // URL change is a frame commit.
-                TabEvent::Fetch { .. } => {
-                    if url.is_empty() || self.last_frame_urls.get(&tab_id) == Some(&url) {
-                        continue;
-                    }
-                    self.last_frame_urls.insert(tab_id, url.clone());
-                    let mut message = json!({
-                        "method": "Page.frameNavigated",
-                        "params": {"frame": {
-                            "id": frame_id,
-                            "loaderId": loader_id,
-                            "url": url,
-                            "mimeType": "text/html",
-                        }},
-                    });
-                    attach_session(&mut message, session.as_deref());
-                    messages.push(message);
+                TabEvent::Navigated => {
+                    self.push_navigated(&mut messages, &tab, session.as_deref());
                 }
                 TabEvent::Load => {
+                    let frame_id = tab.id().to_string();
+                    let loader_id = self.loader_ids.get(&tab.id()).cloned().unwrap_or_default();
                     let mut lifecycle = json!({
                         "method": "Page.lifecycleEvent",
                         "params": {
@@ -382,6 +372,65 @@ impl Conn {
             }
         }
         messages
+    }
+
+    /// Emits the commit event set: frame commit plus the new document's
+    /// execution contexts (default and every known isolated world).
+    fn push_navigated(
+        &mut self,
+        messages: &mut Vec<Value>,
+        tab: &TabHandle,
+        session: Option<&str>,
+    ) {
+        let tab_id = tab.id();
+        let frame_id = tab_id.to_string();
+        let loader_id = self.loader_ids.get(&tab_id).cloned().unwrap_or_default();
+        // Final URL after redirects, not the requested one.
+        let url = tab.document_url().unwrap_or_default();
+        let mut navigated = json!({
+            "method": "Page.frameNavigated",
+            "params": {"frame": {
+                "id": frame_id,
+                "loaderId": loader_id,
+                "url": url,
+                "mimeType": "text/html",
+            }},
+        });
+        attach_session(&mut navigated, session);
+        messages.push(navigated);
+        // The new document is a new realm: drop announced contexts so clients
+        // (Playwright) re-create their utility world.
+        let mut cleared = json!({
+            "method": "Runtime.executionContextsCleared",
+            "params": {},
+        });
+        attach_session(&mut cleared, session);
+        messages.push(cleared);
+        let mut worlds = vec![String::new()];
+        if let Some(isolated) = self.isolated_worlds.get(&tab_id) {
+            worlds.extend(isolated.iter().cloned());
+        }
+        for world in worlds {
+            let context_id = self.next_context;
+            self.next_context = self.next_context.saturating_add(1);
+            let default = world.is_empty();
+            let mut created = json!({
+                "method": "Runtime.executionContextCreated",
+                "params": {"context": {
+                    "id": context_id,
+                    "origin": "://",
+                    "name": world,
+                    "uniqueId": format!("ctx-{context_id}"),
+                    "auxData": {
+                        "isDefault": default,
+                        "type": if default { "default" } else { "isolated" },
+                        "frameId": frame_id,
+                    },
+                }},
+            });
+            attach_session(&mut created, session);
+            messages.push(created);
+        }
     }
 
     /// Resolves the requested target (or the first live one) for `Target.getTargetInfo`.
@@ -613,6 +662,8 @@ impl Conn {
                     .map_err(|err| DispatchError::Failed(err.to_string()))?;
                 self.sessions.retain(|_, tab| tab.id() != id);
                 self.subscriptions.retain(|item| item.tab_id != id);
+                self.loader_ids.remove(&id);
+                self.isolated_worlds.remove(&id);
                 if self.tab.as_ref().is_some_and(|tab| tab.id() == id) {
                     self.tab = None;
                 }
@@ -673,11 +724,24 @@ impl Conn {
                     .ok_or_else(|| DispatchError::Failed("missing url".into()))?;
                 let loader_id = format!("{}", self.next_loader);
                 self.next_loader = self.next_loader.saturating_add(1);
-                self.nav_urls.insert(tab.id(), url.to_owned());
                 self.loader_ids.insert(tab.id(), loader_id.clone());
-                self.last_frame_urls.remove(&tab.id());
+                let frame_id = tab.id().to_string();
+                if url.is_empty() || url == "about:blank" {
+                    open_url(tab, url)?;
+                    return Ok(json!({"frameId": frame_id, "loaderId": loader_id}));
+                }
+                let events = tab
+                    .subscribe()
+                    .map_err(|error| DispatchError::Failed(error.to_string()))?;
                 open_url(tab, url)?;
-                Ok(json!({"frameId": tab.id().to_string(), "loaderId": loader_id}))
+                match wait_for_navigation(&events, Duration::from_secs(30)) {
+                    Ok(()) => Ok(json!({"frameId": frame_id, "loaderId": loader_id})),
+                    Err(error_text) => Ok(json!({
+                        "frameId": frame_id,
+                        "loaderId": loader_id,
+                        "errorText": error_text,
+                    })),
+                }
             }
             "Runtime.enable" => {
                 self.push_session_event(
@@ -708,6 +772,12 @@ impl Conn {
                     .get("worldName")
                     .and_then(Value::as_str)
                     .unwrap_or("");
+                if !name.is_empty() {
+                    let worlds = self.isolated_worlds.entry(tab.id()).or_default();
+                    if !worlds.iter().any(|existing| existing == name) {
+                        worlds.push(name.to_owned());
+                    }
+                }
                 self.push_session_event(
                     session,
                     "Runtime.executionContextCreated",
@@ -786,60 +856,54 @@ impl Conn {
         }
     }
 
+    /// Stores the result in a page-side handle and returns its `objectId`;
+    /// primitives are serializable and returned inline.
     fn runtime_handle(&mut self, tab: &TabHandle, source: &str) -> Value {
         let handle = self.next_handle;
         self.next_handle = self.next_handle.saturating_add(1);
-        let script = format!(
-            "(() => {{ globalThis.__tb_handles = globalThis.__tb_handles || {{}}; const v = ({source}); globalThis.__tb_handles[{}] = v; return typeof v; }})()",
-            json_string(&handle.to_string()),
-        );
-        let kind = match tab.execute_script(&script) {
-            Ok(RemoteValue::String(text)) => text,
-            Ok(_) => "object".to_owned(),
+        let script = RUNTIME_HANDLE
+            .replace("__ID__", &json_string(&handle.to_string()))
+            .replace("__SOURCE__", source);
+        let value = match tab.execute_script(&script) {
+            Ok(value) => value,
             Err(error) => return exception_reply(&error),
         };
-        let cdp_type = match kind.as_str() {
-            "function" | "number" | "string" | "boolean" => kind.as_str(),
-            _ => "object",
-        };
-        json!({"result": {"type": cdp_type, "objectId": handle.to_string()}})
+        if let RemoteValue::String(text) = value
+            && let Ok(parsed) = serde_json::from_str::<Value>(&text)
+        {
+            return json!({"result": parsed});
+        }
+        exception_text_reply("unexpected script result")
     }
 
-    /// Resolves the value (awaiting a thenable via microtask capture) and
-    /// serializes it to a CDP `RemoteObject`.
+    /// Resolves the value (awaiting a thenable via the waiter) and serializes
+    /// it to a CDP `RemoteObject`.
     fn runtime_value(tab: &TabHandle, source: &str) -> Value {
-        let schedule = format!(
-            "(() => {{ globalThis.__tb_async = {{ done: false }}; Promise.resolve(({source})).then((v) => {{ globalThis.__tb_async.done = true; globalThis.__tb_async.value = v; }}, (e) => {{ globalThis.__tb_async.done = true; globalThis.__tb_async.error = String((e && e.message) || e); }}); return \"scheduled\"; }})()"
-        );
+        let schedule = RUNTIME_SCHEDULE.replace("__SOURCE__", source);
         if let Err(error) = tab.execute_script(&schedule) {
             return exception_reply(&error);
         }
-        let deadline = Instant::now() + Duration::from_secs(2);
-        loop {
-            let value = match tab.execute_script(RUNTIME_READ) {
-                Ok(value) => value,
-                Err(error) => return exception_reply(&error),
-            };
-            if let RemoteValue::String(text) = value
-                && let Ok(parsed) = serde_json::from_str::<Value>(&text)
-            {
-                if parsed.get("pending").is_some() && Instant::now() < deadline {
-                    std::thread::sleep(Duration::from_millis(5));
-                    continue;
-                }
-                if let Some(error) = parsed.get("error").and_then(Value::as_str) {
-                    return json!({
-                        "result": {"type": "undefined"},
-                        "exceptionDetails": {"text": error},
-                    });
-                }
-                return json!({"result": parsed});
-            }
-            return json!({
-                "result": {"type": "undefined"},
-                "exceptionDetails": {"text": "unexpected script result"},
-            });
+        match tab.run_until_js_true(
+            "Boolean(globalThis.__tb_async && globalThis.__tb_async.done)",
+            Duration::from_secs(2),
+        ) {
+            Ok(true) => {}
+            Ok(false) => return exception_text_reply("awaitPromise timed out"),
+            Err(error) => return exception_reply(&error),
         }
+        let value = match tab.execute_script(RUNTIME_READ) {
+            Ok(value) => value,
+            Err(error) => return exception_reply(&error),
+        };
+        if let RemoteValue::String(text) = value
+            && let Ok(parsed) = serde_json::from_str::<Value>(&text)
+        {
+            if let Some(error) = parsed.get("error").and_then(Value::as_str) {
+                return exception_text_reply(error);
+            }
+            return json!({"result": parsed});
+        }
+        exception_text_reply("unexpected script result")
     }
 
     fn subscribe_tab(
@@ -859,6 +923,7 @@ impl Conn {
             .map_err(|error| DispatchError::Failed(error.to_string()))?;
         self.subscriptions.push(TabSubscription {
             tab_id: tab.id(),
+            tab: tab.clone(),
             session: session.map(str::to_owned),
             events,
         });
@@ -882,9 +947,8 @@ async fn run_socket(mut socket: WebSocket, state: AppState, tab: Option<TabHandl
         clock_origin: Instant::now(),
         auto_attach: false,
         events: Vec::new(),
-        nav_urls: HashMap::new(),
         loader_ids: HashMap::new(),
-        last_frame_urls: HashMap::new(),
+        isolated_worlds: HashMap::new(),
         next_loader: 1,
         next_context: 1000,
         next_handle: 1,
@@ -907,7 +971,7 @@ async fn run_socket(mut socket: WebSocket, state: AppState, tab: Option<TabHandl
                 Some(Ok(_)) => None,            },
         };
         let mut failed = false;
-        for message in conn.take_event_messages() {
+        for message in tokio::task::block_in_place(|| conn.take_event_messages()) {
             if socket
                 .send(WsMessage::text(message.to_string()))
                 .await
@@ -970,6 +1034,26 @@ fn session_method(method: &str, tab: &TabHandle) -> Result<Value, DispatchError>
     }
 }
 
+/// Waits for the next navigation outcome on a temporary subscription.
+fn wait_for_navigation(events: &Receiver<TabEvent>, timeout: Duration) -> Result<(), &'static str> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err("net::ERR_TIMED_OUT");
+        }
+        match events.recv_timeout(remaining) {
+            Ok(TabEvent::Navigated) => return Ok(()),
+            Ok(TabEvent::NavigationFailed | TabEvent::FetchFailed) => {
+                return Err("net::ERR_FAILED");
+            }
+            Ok(_) => {}
+            Err(RecvTimeoutError::Timeout) => return Err("net::ERR_TIMED_OUT"),
+            Err(RecvTimeoutError::Disconnected) => return Err("net::ERR_ABORTED"),
+        }
+    }
+}
+
 fn open_url(tab: &TabHandle, url: &str) -> Result<(), DispatchError> {
     if url.is_empty() || url == "about:blank" {
         tab.load_html("<!doctype html><title></title>")
@@ -1011,6 +1095,41 @@ fn exception_reply(error: &TabError) -> Value {
     })
 }
 
+/// A failed runtime call with a literal message.
+fn exception_text_reply(text: &str) -> Value {
+    json!({
+        "result": {"type": "undefined"},
+        "exceptionDetails": {"text": text},
+    })
+}
+
+/// Schedules `__SOURCE__` and captures its settled value.
+const RUNTIME_SCHEDULE: &str = r#"(() => {
+  globalThis.__tb_async = { done: false };
+  Promise.resolve((__SOURCE__)).then(
+    (v) => { globalThis.__tb_async.done = true; globalThis.__tb_async.value = v; },
+    (e) => { globalThis.__tb_async.done = true; globalThis.__tb_async.error = String((e && e.message) || e); }
+  );
+  return "scheduled";
+})()"#;
+
+/// Evaluates `__SOURCE__`, stores a non-primitive in `__ID__`, and returns the
+/// CDP `RemoteObject` JSON (primitives inline, per protocol).
+const RUNTIME_HANDLE: &str = r#"(() => {
+  globalThis.__tb_handles = globalThis.__tb_handles || {};
+  const v = (__SOURCE__);
+  if (v === null) return JSON.stringify({ type: "object", subtype: "null", value: null });
+  const t = typeof v;
+  if (t === "undefined") return JSON.stringify({ type: "undefined" });
+  if (t === "number") {
+    if (Number.isFinite(v)) return JSON.stringify({ type: "number", value: v });
+    return JSON.stringify({ type: "number", unserializableValue: Number.isNaN(v) ? "NaN" : (v > 0 ? "Infinity" : "-Infinity") });
+  }
+  if (t === "string" || t === "boolean") return JSON.stringify({ type: t, value: v });
+  globalThis.__tb_handles[__ID__] = v;
+  return JSON.stringify({ type: t === "function" ? "function" : "object", objectId: __ID__ });
+})()"#;
+
 /// Reads the captured async result and serializes it as a CDP `RemoteObject`.
 const RUNTIME_READ: &str = r#"(() => {
   const s = globalThis.__tb_async;
@@ -1020,7 +1139,11 @@ const RUNTIME_READ: &str = r#"(() => {
   if (v === null) return JSON.stringify({ type: "object", subtype: "null", value: null });
   const t = typeof v;
   if (t === "undefined") return JSON.stringify({ type: "undefined" });
-  if (t === "string" || t === "number" || t === "boolean") return JSON.stringify({ type: t, value: v });
+  if (t === "number") {
+    if (Number.isFinite(v)) return JSON.stringify({ type: "number", value: v });
+    return JSON.stringify({ type: "number", unserializableValue: Number.isNaN(v) ? "NaN" : (v > 0 ? "Infinity" : "-Infinity") });
+  }
+  if (t === "string" || t === "boolean") return JSON.stringify({ type: t, value: v });
   try { return JSON.stringify({ type: "object", value: v }); }
   catch (e) { return JSON.stringify({ type: "object" }); }
 })()"#;

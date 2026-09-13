@@ -45,7 +45,8 @@ pub fn serve_stdio() -> io::Result<()> {
     let _ready = out_tx.try_send(FromRenderer::Ready);
     logging::info!(target: "renderer", "ready");
     let reader_services = Arc::clone(&services);
-    thread::spawn(move || read_messages(&command_tx, &reader_services));
+    let reader_stop = Arc::clone(&stop);
+    thread::spawn(move || read_messages(&command_tx, &reader_services, &reader_stop));
     crate::run_with_stop(&command_rx, &out_tx, services, &stop);
     // The reader returns on `Shutdown`, dropping its `PipeServices` clone, so
     // the writer channel closes and the child can exit.
@@ -55,16 +56,16 @@ pub fn serve_stdio() -> io::Result<()> {
         .map_err(|_| io::Error::other("writer panicked"))?
 }
 
-fn read_messages(command_tx: &SyncSender<ToRenderer>, services: &PipeServices) {
+fn read_messages(command_tx: &SyncSender<ToRenderer>, services: &PipeServices, stop: &Arc<Stop>) {
     let mut input = BufReader::new(io::stdin());
     let mut buffer = Vec::new();
     loop {
         let message = match crate::read_ipc_message::<ToRenderer>(&mut input, &mut buffer) {
             Ok(Some(message)) => message,
-            Ok(None) => return,
+            Ok(None) => break,
             Err(error) => {
                 logging::error!(target: "renderer::ipc", "bad host message: {error}");
-                return;
+                break;
             }
         };
         match message {
@@ -83,6 +84,13 @@ fn read_messages(command_tx: &SyncSender<ToRenderer>, services: &PipeServices) {
             ToRenderer::ServiceReply { id, reply } => services.deliver(id, reply),
         }
     }
+    // The host is gone (EOF or a broken pipe). A renderer must not outlive its
+    // browser: interrupt in-flight work and stop the loop.
+    stop.request();
+    let _ = command_tx.send(ToRenderer::Request {
+        id: 0,
+        command: Command::Shutdown,
+    });
 }
 
 fn write_messages(rx: &mpsc::Receiver<FromRenderer>) -> io::Result<()> {

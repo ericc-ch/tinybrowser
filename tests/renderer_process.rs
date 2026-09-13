@@ -157,12 +157,18 @@ fn spawn(fixture: &mut Fixture) -> (cdp::Client, String) {
 fn renderer_process_survives_non_finite_results() {
     let mut fixture = Fixture::new("tinybrowser-renderer");
     let (mut client, created) = spawn(&mut fixture);
+    let session = attach(&mut client, &created);
 
-    assert_eq!(
-        eval(&mut client, &created, "1/0").unwrap(),
-        "null",
-        "non-finite number crosses as JSON null"
-    );
+    let infinity = client
+        .call(
+            "Runtime.evaluate",
+            &json!({"expression": "1/0", "returnByValue": true}),
+            Some(&session),
+        )
+        .expect("infinity");
+    assert_eq!(infinity["result"]["unserializableValue"], json!("Infinity"));
+    assert!(infinity["result"].get("value").is_none());
+
     // The renderer must still answer after a non-finite result.
     assert_eq!(eval(&mut client, &created, "2+2").unwrap(), "4");
     close(&mut client, &created);
@@ -220,6 +226,44 @@ fn closing_an_opaque_page_reaps_its_renderer_process() {
     // The daemon's initial tab keeps its renderer; close it too.
     close(&mut client, &initial_targets[0]);
     wait_for_renderer_count(daemon, 0, Duration::from_secs(5));
+}
+
+#[test]
+fn renderers_exit_when_the_daemon_is_killed() {
+    let mut fixture = Fixture::new("tinybrowser-renderer");
+    fixture.spawn_daemon();
+    let _ = fixture.wait_json();
+    let daemon = daemon_pid(&fixture);
+    wait_for_renderers(daemon, false, Duration::from_secs(5));
+    let renderers = renderer_children(daemon);
+    assert!(!renderers.is_empty(), "initial tab must have a renderer");
+
+    let killed = std::process::Command::new("kill")
+        .args(["-9", &daemon.to_string()])
+        .status()
+        .expect("kill");
+    assert!(killed.success(), "SIGKILL daemon");
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let alive: Vec<u32> = renderers
+            .iter()
+            .copied()
+            .filter(|pid| pid_alive(*pid))
+            .collect();
+        if alive.is_empty() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "renderers outlived their daemon: {alive:?}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn pid_alive(pid: u32) -> bool {
+    std::path::Path::new("/proc").join(pid.to_string()).exists()
 }
 
 #[test]
