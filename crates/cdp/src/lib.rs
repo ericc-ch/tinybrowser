@@ -32,6 +32,9 @@ use tungstenite::protocol::{Message, WebSocket as ClientSocket};
 
 const PRODUCT: &str = "tinybrowser/0.1.0";
 const EVENT_POLL: Duration = Duration::from_millis(20);
+/// One default browser context; Playwright requires `browserContextId` on
+/// attached targets.
+const DEFAULT_BROWSER_CONTEXT_ID: &str = "tinybrowser-default";
 
 /// Serves CDP HTTP discovery and WebSocket endpoints on `listener`.
 ///
@@ -299,6 +302,14 @@ struct Conn {
     stop: watch::Sender<bool>,
     subscriptions: Vec<TabSubscription>,
     clock_origin: Instant,
+    auto_attach: bool,
+    events: Vec<Value>,
+    nav_urls: HashMap<TabId, String>,
+    loader_ids: HashMap<TabId, String>,
+    last_frame_urls: HashMap<TabId, String>,
+    next_loader: u64,
+    next_context: u64,
+    next_handle: u64,
 }
 
 struct TabSubscription {
@@ -315,21 +326,121 @@ struct Outcome {
 
 impl Conn {
     /// Page events accumulated since the last flush, each ready to send.
-    fn take_event_messages(&self) -> Vec<Value> {
-        let mut messages = Vec::new();
+    fn take_event_messages(&mut self) -> Vec<Value> {
+        let mut messages = std::mem::take(&mut self.events);
+        let timestamp = self.clock_origin.elapsed().as_secs_f64();
+        let mut pending = Vec::new();
         for subscription in &self.subscriptions {
             for event in subscription.events.try_iter() {
-                if event == TabEvent::Load {
+                pending.push((subscription.tab_id, subscription.session.clone(), event));
+            }
+        }
+        for (tab_id, session, event) in pending {
+            let frame_id = tab_id.to_string();
+            let url = self.nav_urls.get(&tab_id).cloned().unwrap_or_default();
+            let loader_id = self.loader_ids.get(&tab_id).cloned().unwrap_or_default();
+            match event {
+                // `TabEvent::Fetch` also covers JS `fetch`; only a navigation
+                // URL change is a frame commit.
+                TabEvent::Fetch { .. } => {
+                    if url.is_empty() || self.last_frame_urls.get(&tab_id) == Some(&url) {
+                        continue;
+                    }
+                    self.last_frame_urls.insert(tab_id, url.clone());
                     let mut message = json!({
-                        "method": "Page.loadEventFired",
-                        "params": {"timestamp": self.clock_origin.elapsed().as_secs_f64()},
+                        "method": "Page.frameNavigated",
+                        "params": {"frame": {
+                            "id": frame_id,
+                            "loaderId": loader_id,
+                            "url": url,
+                            "mimeType": "text/html",
+                        }},
                     });
-                    attach_session(&mut message, subscription.session.as_deref());
+                    attach_session(&mut message, session.as_deref());
                     messages.push(message);
                 }
+                TabEvent::Load => {
+                    let mut lifecycle = json!({
+                        "method": "Page.lifecycleEvent",
+                        "params": {
+                            "frameId": frame_id,
+                            "loaderId": loader_id,
+                            "name": "load",
+                            "timestamp": timestamp,
+                        },
+                    });
+                    attach_session(&mut lifecycle, session.as_deref());
+                    messages.push(lifecycle);
+                    let mut load = json!({
+                        "method": "Page.loadEventFired",
+                        "params": {"timestamp": timestamp},
+                    });
+                    attach_session(&mut load, session.as_deref());
+                    messages.push(load);
+                }
+                _ => {}
             }
         }
         messages
+    }
+
+    /// Resolves the requested target (or the first live one) for `Target.getTargetInfo`.
+    fn target_info_for(&mut self, params: &Value) -> Result<Value, DispatchError> {
+        let id = match params.get("targetId").and_then(Value::as_str) {
+            Some(raw) => raw
+                .parse::<u64>()
+                .map(TabId::new)
+                .map_err(|_| DispatchError::Failed("invalid targetId".into()))?,
+            None => self
+                .browser
+                .tabs()
+                .first()
+                .copied()
+                .ok_or_else(|| DispatchError::Failed("no target".into()))?,
+        };
+        Ok(json!({"targetInfo": target_info(&self.browser, id)}))
+    }
+
+    /// Enables or disables auto-attach and announces existing targets.
+    fn set_auto_attach(&mut self, params: &Value) -> Value {
+        let auto_attach = params
+            .get("autoAttach")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        self.auto_attach = auto_attach;
+        if auto_attach {
+            for id in self.browser.tabs() {
+                if let Ok(tab) = self.browser.tab(id) {
+                    let session_id = self.mint_session(&tab);
+                    self.push_attached(&session_id, &tab);
+                }
+            }
+        }
+        json!({})
+    }
+
+    /// Registers a new flattened session for `tab`.
+    fn mint_session(&mut self, tab: &TabHandle) -> String {
+        let session_id = format!("s{}", self.next_session);
+        self.next_session = self.next_session.saturating_add(1);
+        self.sessions.insert(session_id.clone(), tab.clone());
+        session_id
+    }
+
+    /// Queues `Target.attachedToTarget` for auto-attach clients.
+    fn push_attached(&mut self, session_id: &str, tab: &TabHandle) {
+        let mut info = target_info(&self.browser, tab.id());
+        if let Some(object) = info.as_object_mut() {
+            object.insert("attached".into(), json!(true));
+        }
+        self.events.push(json!({
+            "method": "Target.attachedToTarget",
+            "params": {
+                "sessionId": session_id,
+                "targetInfo": info,
+                "waitingForDebugger": false,
+            },
+        }));
     }
 
     fn dispatch_text(&mut self, text: &str) -> Outcome {
@@ -415,6 +526,10 @@ impl Conn {
         if let Some(tab) = self.tab.clone() {
             return self.dispatch_tab_method(method, params, &tab, None);
         }
+        self.dispatch_browser(method, params)
+    }
+
+    fn dispatch_browser(&mut self, method: &str, params: &Value) -> Result<Value, DispatchError> {
         match method {
             "Browser.getVersion" => Ok(json!({
                 "protocolVersion": "1.3",
@@ -422,6 +537,11 @@ impl Conn {
                 "revision": "0",
                 "userAgent": PRODUCT,
                 "jsVersion": "QuickJS",
+            })),
+            "Browser.setDownloadBehavior" => Ok(json!({})),
+            "Browser.getWindowForTarget" => Ok(json!({
+                "windowId": 1,
+                "bounds": {"left": 0, "top": 0, "width": 1280, "height": 720, "windowState": "normal"},
             })),
             "Browser.close" => {
                 self.browser
@@ -433,6 +553,14 @@ impl Conn {
                 let _result = self.stop.send(true);
                 Ok(json!({}))
             }
+            _ => self.dispatch_target(method, params),
+        }
+    }
+
+    fn dispatch_target(&mut self, method: &str, params: &Value) -> Result<Value, DispatchError> {
+        match method {
+            "Target.setAutoAttach" => Ok(self.set_auto_attach(params)),
+            "Target.getTargetInfo" => self.target_info_for(params),
             "Target.getTargets" => {
                 let target_infos: Vec<Value> = self
                     .browser
@@ -455,10 +583,31 @@ impl Conn {
                     let _ = self.browser.close_tab(tab.id());
                     return Err(error);
                 }
+                if self.auto_attach {
+                    let session_id = self.mint_session(&tab);
+                    self.push_attached(&session_id, &tab);
+                }
                 Ok(json!({ "targetId": tab.id().to_string() }))
             }
             "Target.closeTarget" => {
                 let id = target_id(params.get("targetId"))?;
+                if self.auto_attach {
+                    let detached: Vec<String> = self
+                        .sessions
+                        .iter()
+                        .filter(|(_, tab)| tab.id() == id)
+                        .map(|(session, _)| session.clone())
+                        .collect();
+                    for session_id in detached {
+                        self.events.push(json!({
+                            "method": "Target.detachedFromTarget",
+                            "params": {
+                                "sessionId": session_id,
+                                "targetId": id.to_string(),
+                            },
+                        }));
+                    }
+                }
                 self.browser
                     .close_tab(id)
                     .map_err(|err| DispatchError::Failed(err.to_string()))?;
@@ -517,7 +666,179 @@ impl Conn {
                 self.unsubscribe_tab(tab.id(), session);
                 Ok(json!({}))
             }
-            _ => session_method(method, params, tab),
+            "Page.navigate" => {
+                let url = params
+                    .get("url")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| DispatchError::Failed("missing url".into()))?;
+                let loader_id = format!("{}", self.next_loader);
+                self.next_loader = self.next_loader.saturating_add(1);
+                self.nav_urls.insert(tab.id(), url.to_owned());
+                self.loader_ids.insert(tab.id(), loader_id.clone());
+                self.last_frame_urls.remove(&tab.id());
+                open_url(tab, url)?;
+                Ok(json!({"frameId": tab.id().to_string(), "loaderId": loader_id}))
+            }
+            "Runtime.enable" => {
+                self.push_session_event(
+                    session,
+                    "Runtime.executionContextCreated",
+                    &json!({"context": {
+                        "id": tab.id().get(),
+                        "origin": "://",
+                        "name": "",
+                        "uniqueId": format!("ctx-{}", tab.id()),
+                        "auxData": {
+                            "isDefault": true,
+                            "type": "default",
+                            "frameId": tab.id().to_string(),
+                        },
+                    }}),
+                );
+                Ok(json!({}))
+            }
+            "Page.createIsolatedWorld" => {
+                let context_id = self.next_context;
+                self.next_context = self.next_context.saturating_add(1);
+                let frame_id = params
+                    .get("frameId")
+                    .and_then(Value::as_str)
+                    .map_or_else(|| tab.id().to_string(), str::to_owned);
+                let name = params
+                    .get("worldName")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                self.push_session_event(
+                    session,
+                    "Runtime.executionContextCreated",
+                    &json!({"context": {
+                        "id": context_id,
+                        "origin": "://",
+                        "name": name,
+                        "uniqueId": format!("ctx-{context_id}"),
+                        "auxData": {
+                            "isDefault": false,
+                            "type": "isolated",
+                            "frameId": frame_id,
+                        },
+                    }}),
+                );
+                Ok(json!({"executionContextId": context_id}))
+            }
+            "Target.getTargetInfo" => {
+                let mut info = target_info(&self.browser, tab.id());
+                if let Some(object) = info.as_object_mut() {
+                    object.insert("attached".into(), json!(true));
+                }
+                Ok(json!({"targetInfo": info}))
+            }
+            "Runtime.evaluate" | "Runtime.callFunctionOn" => {
+                self.dispatch_runtime(method, params, tab)
+            }
+            _ => session_method(method, tab),
+        }
+    }
+
+    /// Queues an event for one session (or the direct page socket).
+    fn push_session_event(&mut self, session: Option<&str>, method: &str, params: &Value) {
+        let mut message = json!({"method": method, "params": params});
+        attach_session(&mut message, session);
+        self.events.push(message);
+    }
+
+    /// `Runtime.evaluate` / `Runtime.callFunctionOn` with value or handle
+    /// semantics. Handles live in the page as `globalThis.__tb_handles`, so the
+    /// adapter needs no JS value storage of its own.
+    fn dispatch_runtime(
+        &mut self,
+        method: &str,
+        params: &Value,
+        tab: &TabHandle,
+    ) -> Result<Value, DispatchError> {
+        let return_by_value = params
+            .get("returnByValue")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let source = if method == "Runtime.evaluate" {
+            let expression = params
+                .get("expression")
+                .and_then(Value::as_str)
+                .ok_or_else(|| DispatchError::Failed("missing expression".into()))?;
+            // `expression` is a script (statements allowed); indirect eval keeps
+            // its completion value without parenthesizing a trailing `;`.
+            format!("(0, eval)({})", json_string(expression))
+        } else {
+            let declaration = params
+                .get("functionDeclaration")
+                .and_then(Value::as_str)
+                .ok_or_else(|| DispatchError::Failed("missing functionDeclaration".into()))?;
+            let receiver = match params.get("objectId").and_then(Value::as_str) {
+                Some(id) => format!("globalThis.__tb_handles[{}]", json_string(id)),
+                None => "undefined".to_owned(),
+            };
+            let arguments = arguments_expression(params);
+            format!("({declaration}).apply({receiver}, {arguments})")
+        };
+        if return_by_value {
+            Ok(Self::runtime_value(tab, &source))
+        } else {
+            Ok(self.runtime_handle(tab, &source))
+        }
+    }
+
+    fn runtime_handle(&mut self, tab: &TabHandle, source: &str) -> Value {
+        let handle = self.next_handle;
+        self.next_handle = self.next_handle.saturating_add(1);
+        let script = format!(
+            "(() => {{ globalThis.__tb_handles = globalThis.__tb_handles || {{}}; const v = ({source}); globalThis.__tb_handles[{}] = v; return typeof v; }})()",
+            json_string(&handle.to_string()),
+        );
+        let kind = match tab.execute_script(&script) {
+            Ok(RemoteValue::String(text)) => text,
+            Ok(_) => "object".to_owned(),
+            Err(error) => return exception_reply(&error),
+        };
+        let cdp_type = match kind.as_str() {
+            "function" | "number" | "string" | "boolean" => kind.as_str(),
+            _ => "object",
+        };
+        json!({"result": {"type": cdp_type, "objectId": handle.to_string()}})
+    }
+
+    /// Resolves the value (awaiting a thenable via microtask capture) and
+    /// serializes it to a CDP `RemoteObject`.
+    fn runtime_value(tab: &TabHandle, source: &str) -> Value {
+        let schedule = format!(
+            "(() => {{ globalThis.__tb_async = {{ done: false }}; Promise.resolve(({source})).then((v) => {{ globalThis.__tb_async.done = true; globalThis.__tb_async.value = v; }}, (e) => {{ globalThis.__tb_async.done = true; globalThis.__tb_async.error = String((e && e.message) || e); }}); return \"scheduled\"; }})()"
+        );
+        if let Err(error) = tab.execute_script(&schedule) {
+            return exception_reply(&error);
+        }
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let value = match tab.execute_script(RUNTIME_READ) {
+                Ok(value) => value,
+                Err(error) => return exception_reply(&error),
+            };
+            if let RemoteValue::String(text) = value
+                && let Ok(parsed) = serde_json::from_str::<Value>(&text)
+            {
+                if parsed.get("pending").is_some() && Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(5));
+                    continue;
+                }
+                if let Some(error) = parsed.get("error").and_then(Value::as_str) {
+                    return json!({
+                        "result": {"type": "undefined"},
+                        "exceptionDetails": {"text": error},
+                    });
+                }
+                return json!({"result": parsed});
+            }
+            return json!({
+                "result": {"type": "undefined"},
+                "exceptionDetails": {"text": "unexpected script result"},
+            });
         }
     }
 
@@ -559,6 +880,14 @@ async fn run_socket(mut socket: WebSocket, state: AppState, tab: Option<TabHandl
         stop: state.stop,
         subscriptions: Vec::new(),
         clock_origin: Instant::now(),
+        auto_attach: false,
+        events: Vec::new(),
+        nav_urls: HashMap::new(),
+        loader_ids: HashMap::new(),
+        last_frame_urls: HashMap::new(),
+        next_loader: 1,
+        next_context: 1000,
+        next_handle: 1,
     };
     let mut poll = tokio::time::interval(EVENT_POLL);
     poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -609,33 +938,34 @@ async fn run_socket(mut socket: WebSocket, state: AppState, tab: Option<TabHandl
     let _ = socket.send(WsMessage::Close(None)).await;
 }
 
-fn session_method(method: &str, params: &Value, tab: &TabHandle) -> Result<Value, DispatchError> {
+fn session_method(method: &str, tab: &TabHandle) -> Result<Value, DispatchError> {
     match method {
-        "Runtime.enable" | "Runtime.disable" => Ok(json!({})),
-        "Page.navigate" => {
-            let url = params
-                .get("url")
-                .and_then(Value::as_str)
-                .ok_or_else(|| DispatchError::Failed("missing url".into()))?;
-            open_url(tab, url)?;
-            Ok(json!({ "frameId": tab.id().to_string() }))
+        "Page.getFrameTree" => {
+            let url = tab
+                .document_url()
+                .map_err(|error| DispatchError::Failed(error.to_string()))?;
+            Ok(json!({"frameTree": {"frame": {
+                "id": tab.id().to_string(),
+                "loaderId": "",
+                "url": url,
+                "mimeType": "text/html",
+            }}}))
         }
-        "Runtime.evaluate" => {
-            let expression = params
-                .get("expression")
-                .and_then(Value::as_str)
-                .ok_or_else(|| DispatchError::Failed("missing expression".into()))?;
-            match tab.execute_script(expression) {
-                Ok(value) => Ok(json!({ "result": remote_preview(&value) })),
-                Err(TabError::ActorStopped) => {
-                    Err(DispatchError::Failed("tab actor stopped".into()))
-                }
-                Err(err) => Ok(json!({
-                    "result": {"type": "undefined"},
-                    "exceptionDetails": {"text": err.to_string()},
-                })),
-            }
-        }
+        "Page.addScriptToEvaluateOnNewDocument" => Ok(json!({"identifier": "1"})),
+        "Runtime.disable"
+        | "Target.setAutoAttach"
+        | "Runtime.runIfWaitingForDebugger"
+        | "Log.enable"
+        | "Page.setLifecycleEventsEnabled"
+        | "Network.enable"
+        | "Emulation.setFocusEmulationEnabled"
+        | "Emulation.setDeviceMetricsOverride"
+        | "Emulation.setTouchEmulationEnabled"
+        | "Emulation.setEmulatedMedia"
+        | "Emulation.setScriptExecutionDisabled"
+        | "Runtime.addBinding"
+        | "Security.setIgnoreCertificateErrors"
+        | "Page.setBypassCSP" => Ok(json!({})),
         _ => Err(DispatchError::MethodNotFound),
     }
 }
@@ -651,6 +981,50 @@ fn open_url(tab: &TabHandle, url: &str) -> Result<(), DispatchError> {
     Ok(())
 }
 
+/// Builds the JS argument array for `Runtime.callFunctionOn`.
+fn arguments_expression(params: &Value) -> String {
+    let mut parts = Vec::new();
+    if let Some(arguments) = params.get("arguments").and_then(Value::as_array) {
+        for argument in arguments {
+            if let Some(id) = argument.get("objectId").and_then(Value::as_str) {
+                parts.push(format!("globalThis.__tb_handles[{}]", json_string(id)));
+            } else if let Some(value) = argument.get("value") {
+                parts.push(serde_json::to_string(value).unwrap_or_else(|_| "undefined".to_owned()));
+            } else {
+                parts.push("undefined".to_owned());
+            }
+        }
+    }
+    format!("[{}]", parts.join(", "))
+}
+
+/// JS string literal for embedding in generated source.
+fn json_string(value: &str) -> String {
+    serde_json::to_string(value).unwrap_or_else(|_| "\"\"".to_owned())
+}
+
+/// A failed runtime call, shaped like a CDP exception.
+fn exception_reply(error: &TabError) -> Value {
+    json!({
+        "result": {"type": "undefined"},
+        "exceptionDetails": {"text": error.to_string()},
+    })
+}
+
+/// Reads the captured async result and serializes it as a CDP `RemoteObject`.
+const RUNTIME_READ: &str = r#"(() => {
+  const s = globalThis.__tb_async;
+  if (!s || !s.done) return JSON.stringify({ pending: true });
+  if (s.error !== undefined) return JSON.stringify({ error: s.error });
+  const v = s.value;
+  if (v === null) return JSON.stringify({ type: "object", subtype: "null", value: null });
+  const t = typeof v;
+  if (t === "undefined") return JSON.stringify({ type: "undefined" });
+  if (t === "string" || t === "number" || t === "boolean") return JSON.stringify({ type: t, value: v });
+  try { return JSON.stringify({ type: "object", value: v }); }
+  catch (e) { return JSON.stringify({ type: "object" }); }
+})()"#;
+
 fn target_info(browser: &BrowserHandle, id: TabId) -> Value {
     let url = browser
         .tab(id)
@@ -664,6 +1038,7 @@ fn target_info(browser: &BrowserHandle, id: TabId) -> Value {
         "url": url,
         "attached": false,
         "canAccessOpener": false,
+        "browserContextId": DEFAULT_BROWSER_CONTEXT_ID,
     })
 }
 
@@ -675,19 +1050,6 @@ fn target_id(value: Option<&Value>) -> Result<TabId, DispatchError> {
         .parse::<u64>()
         .map_err(|_| DispatchError::Failed("invalid targetId".into()))?;
     Ok(TabId::new(id))
-}
-
-fn remote_preview(value: &RemoteValue) -> Value {
-    match value {
-        RemoteValue::Undefined => json!({"type": "undefined"}),
-        RemoteValue::Null => json!({"type": "object", "subtype": "null", "value": null}),
-        RemoteValue::Bool(flag) => json!({"type": "boolean", "value": flag}),
-        RemoteValue::Number(number) => json!({"type": "number", "value": number}),
-        RemoteValue::String(text) => json!({"type": "string", "value": text}),
-        RemoteValue::List(_) => json!({"type": "object", "subtype": "array"}),
-        RemoteValue::Map(_) => json!({"type": "object"}),
-        RemoteValue::Node(_) => json!({"type": "object", "subtype": "node"}),
-    }
 }
 
 enum DispatchError {

@@ -1,7 +1,7 @@
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use browser::{Browser, Profile, Renderers};
 use serde_json::json;
@@ -56,7 +56,7 @@ fn browser_target_page_runtime_flatten_and_method_not_found() {
     let evaluated = client
         .call(
             "Runtime.evaluate",
-            &json!({"expression": "1 + 1"}),
+            &json!({"expression": "1 + 1", "returnByValue": true}),
             Some(&session),
         )
         .expect("eval");
@@ -65,7 +65,7 @@ fn browser_target_page_runtime_flatten_and_method_not_found() {
     let null_value = client
         .call(
             "Runtime.evaluate",
-            &json!({"expression": "null"}),
+            &json!({"expression": "null", "returnByValue": true}),
             Some(&session),
         )
         .expect("null");
@@ -75,7 +75,7 @@ fn browser_target_page_runtime_flatten_and_method_not_found() {
     let undefined_value = client
         .call(
             "Runtime.evaluate",
-            &json!({"expression": "undefined"}),
+            &json!({"expression": "undefined", "returnByValue": true}),
             Some(&session),
         )
         .expect("undefined");
@@ -161,16 +161,22 @@ fn page_navigate_loads_http_document() {
             Some(&session),
         )
         .expect("navigate");
-    let event = client
-        .read_event(Duration::from_secs(1))
-        .expect("read event")
-        .expect("load event");
-    assert_eq!(event["method"], json!("Page.loadEventFired"));
-    assert_eq!(event["sessionId"], json!(session));
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let load = loop {
+        let event = client
+            .read_event(Duration::from_millis(500))
+            .expect("read event")
+            .expect("load event");
+        if event["method"] == json!("Page.loadEventFired") {
+            break event;
+        }
+        assert!(Instant::now() < deadline, "no load event: {event}");
+    };
+    assert_eq!(load["sessionId"], json!(session));
     let evaluated = client
         .call(
             "Runtime.evaluate",
-            &json!({"expression": "document.getElementsByTagName('p')[0].firstChild.data"}),
+            &json!({"expression": "document.getElementsByTagName('p')[0].firstChild.data", "returnByValue": true}),
             Some(&session),
         )
         .expect("eval");
@@ -241,7 +247,11 @@ fn json_discovery_page_socket_close_target_and_browser_close() {
     let mut page_client =
         cdp::Client::connect_path(addr, &format!("/devtools/page/{target_id}")).expect("page ws");
     let evaluated = page_client
-        .call("Runtime.evaluate", &json!({"expression": "1+1"}), None)
+        .call(
+            "Runtime.evaluate",
+            &json!({"expression": "1+1", "returnByValue": true}),
+            None,
+        )
         .expect("page eval");
     assert_eq!(evaluated["result"]["value"].as_f64(), Some(2.0));
 

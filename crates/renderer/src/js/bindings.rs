@@ -3198,6 +3198,24 @@ impl JsNode {
         Ok(serialize_html_fragment(&parsed.dom, self.handle.0))
     }
 
+    // https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-element-outerhtml
+    #[qjs(get, rename = "outerHTML")]
+    fn outer_html(&self, ctx: Ctx<'_>) -> Result<String> {
+        let world = world(&ctx)?;
+        let parsed = world.borrow();
+        let Some(parsed) = parsed.document(self.handle.0) else {
+            return Err(Exception::throw_type(&ctx, "no document"));
+        };
+        let Some(NodeKind::Element { name, attributes }) =
+            parsed.dom.get(self.handle.0).map(|node| node.kind())
+        else {
+            return Err(Exception::throw_type(&ctx, "outerHTML requires an element"));
+        };
+        let mut output = String::new();
+        serialize_html_element(&parsed.dom, self.handle.0, name, attributes, &mut output);
+        Ok(output)
+    }
+
     // https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-element-innerhtml
     #[qjs(set, rename = "innerHTML")]
     fn set_inner_html(&self, ctx: Ctx<'_>, value: WebIdlString) -> Result<()> {
@@ -5425,7 +5443,7 @@ const INSTALL_BRANDS_JS: &str = r"
     'prepend', 'replaceChildren', 'querySelector', 'querySelectorAll',
     'before', 'after', 'replaceWith', 'previousElementSibling',
     'nextElementSibling', 'tagName', 'localName', 'prefix', 'namespaceURI',
-    'className', 'classList', 'dataset', 'id', 'src', 'href', 'name', 'content', 'innerHTML', 'style',
+    'className', 'classList', 'dataset', 'id', 'src', 'href', 'name', 'content', 'outerHTML', 'innerHTML', 'style',
     'remove'
   ]);
   // classList is `[PutForwards=value]`: assigning to it sets `.value`
