@@ -28,6 +28,6 @@ pub use arena::{Dom, DomError, Lifecycle, Mutation, NodeRef, QuirksMode};
 pub use id::NodeId;
 pub use node::{
     Attribute, LocalName, Namespace, NodeKind, Prefix, QualName, html_namespace, svg_namespace,
-    xml_namespace,
+    xlink_namespace, xml_namespace, xmlns_namespace,
 };
 pub use select::{ParseFail, ParseFailKind, SelectError};

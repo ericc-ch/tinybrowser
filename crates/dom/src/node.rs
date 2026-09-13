@@ -32,6 +32,20 @@ pub fn svg_namespace() -> Namespace {
     Namespace::from("http://www.w3.org/2000/svg")
 }
 
+/// The `xmlns` declaration namespace URL
+/// (<https://www.w3.org/TR/xml-names/#ns-decl>).
+#[must_use]
+pub fn xmlns_namespace() -> Namespace {
+    Namespace::from("http://www.w3.org/2000/xmlns/")
+}
+
+/// The `xlink` namespace URL, used only by HTML serialization's attribute
+/// name rule (<https://html.spec.whatwg.org/multipage/parsing.html#attribute-s-serialized-name>).
+#[must_use]
+pub fn xlink_namespace() -> Namespace {
+    Namespace::from("http://www.w3.org/1999/xlink")
+}
+
 /// One attribute: a qualified name and its value.
 ///
 /// Deliberately *not* `markup5ever::Attribute`: that one stores its value as

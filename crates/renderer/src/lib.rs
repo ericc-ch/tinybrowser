@@ -28,6 +28,8 @@ mod js;
 mod process;
 mod protocol;
 mod remote;
+mod serialize;
+mod xml;
 
 pub use document::{Document, ScriptValue, Stop};
 pub use engine::Engine;

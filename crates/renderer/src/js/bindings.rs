@@ -1386,7 +1386,7 @@ impl JsDomParser {
             parsed.content_type = content_type;
             parsed
         } else {
-            parse_xml_document(&source.0, content_type)
+            crate::xml::parse_document(&source.0, content_type)
         };
         let world_rc = world(&ctx)?;
 
@@ -1398,6 +1398,46 @@ impl JsDomParser {
             .borrow_mut()
             .insert_document(root.document_id(), &world_rc);
         wrap_node(&ctx, root)
+    }
+}
+
+/// `XMLSerializer` (<https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#xmlserializer>).
+#[derive(Trace, rquickjs::JsLifetime)]
+#[rquickjs::class(rename = "XMLSerializer")]
+pub struct JsXmlSerializer {
+    _reserved: Option<Handle>,
+}
+
+#[rquickjs::methods]
+#[allow(
+    clippy::needless_pass_by_value,
+    clippy::unused_self,
+    reason = "rquickjs method ABI passes Ctx by value; XMLSerializer is a stateless constructor"
+)]
+impl JsXmlSerializer {
+    #[qjs(constructor)]
+    fn new() -> Self {
+        Self { _reserved: None }
+    }
+
+    // https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-xmlserializer-serializetostring
+    #[qjs(rename = "serializeToString")]
+    fn serialize_to_string<'js>(&self, ctx: Ctx<'js>, root: Value<'js>) -> Result<String> {
+        // An `Attr` serializes as the empty string
+        // (<https://w3c.github.io/DOM-Parsing/#dfn-xml-serialization-algorithm>).
+        if Class::<JsAttr>::from_js(&ctx, root.clone()).is_ok() {
+            return Ok(String::new());
+        }
+        let Some(id) = host_node_id(&ctx, &root) else {
+            return Err(Exception::throw_type(&ctx, "argument is not a Node"));
+        };
+        let world = world(&ctx)?;
+        let world = world.borrow();
+        let Some(parsed) = world.document(id) else {
+            return Err(Exception::throw_type(&ctx, "no document"));
+        };
+        crate::serialize::serialize_xml(&parsed.dom, id, false)
+            .map_err(|err| throw_dom(&ctx, "InvalidStateError", &err.to_string()))
     }
 }
 
@@ -1686,11 +1726,13 @@ fn construct_node<'js>(
             create_kind(&ctx, document, dom::Dom::create_fragment)
         }
         "Document" => {
+            // The `Document` constructor creates an XML document
+            // (<https://dom.spec.whatwg.org/#dom-document-document>).
             let parsed = crate::Parsed {
                 dom: dom::Dom::new(),
                 quirks_mode: markup5ever::interface::QuirksMode::NoQuirks,
                 parse_errors: 0,
-                content_type: "text/html",
+                content_type: "application/xml",
             };
             let world_rc = world(&ctx)?;
 
@@ -1820,184 +1862,6 @@ pub(super) fn schedule_mutation_delivery(ctx: &Ctx<'_>) -> Result<()> {
     let deliver: Function = ctx.globals().get("__tb_deliver_mutations")?;
     let queue: Function = ctx.globals().get("queueMicrotask")?;
     queue.call::<_, ()>((deliver,))
-}
-
-/// A small well-formedness-oriented XML parser for `DOMParser`'s XML types.
-///
-/// html5ever only parses HTML, and the XML types here exist to give scripts a
-/// separate document tree with the requested content type. Supported syntax:
-/// elements with quoted attributes, text, comments, declarations, and
-/// self-closing tags. Malformed input yields a document holding a
-/// `parsererror` element.
-fn parse_xml_document(input: &str, content_type: &'static str) -> crate::Parsed {
-    let mut parsed = crate::Parsed {
-        dom: dom::Dom::new(),
-        quirks_mode: markup5ever::interface::QuirksMode::NoQuirks,
-        parse_errors: 0,
-        content_type,
-    };
-    let document = parsed.dom.document();
-    let mut stack = vec![document];
-    let mut rest = input;
-    while let Some(start) = rest.find('<') {
-        if start > 0 {
-            let text = &rest[..start];
-            let parent = *stack.last().unwrap_or(&document);
-            let node = parsed.dom.create_text(text);
-            if parsed.dom.append(parent, node).is_err() {
-                xml_malformed(&mut parsed, document);
-                return parsed;
-            }
-        }
-        rest = &rest[start..];
-        let Some(remaining) = parse_xml_construct(&mut parsed, document, &mut stack, rest) else {
-            xml_malformed(&mut parsed, document);
-            return parsed;
-        };
-        rest = remaining;
-    }
-    if !rest.is_empty() {
-        let parent = *stack.last().unwrap_or(&document);
-        let node = parsed.dom.create_text(rest);
-        let _ = parsed.dom.append(parent, node);
-    }
-    parsed
-}
-
-/// Adds the `parsererror` element to a malformed XML document.
-fn xml_malformed(parsed: &mut crate::Parsed, document: NodeId) {
-    let error = parsed.dom.create_element(
-        QualName::new(None, Namespace::from(""), LocalName::from("parsererror")),
-        Vec::new(),
-    );
-    let _ = parsed.dom.append(document, error);
-}
-
-/// Consumes one `<...>` XML construct, returning the remaining input.
-fn parse_xml_construct<'a>(
-    parsed: &mut crate::Parsed,
-    document: NodeId,
-    stack: &mut Vec<NodeId>,
-    rest: &'a str,
-) -> Option<&'a str> {
-    if let Some(body) = rest.strip_prefix("<![CDATA[") {
-        let end = body.find("]]>")?;
-        let text = parsed.dom.create_cdata_section(&body[..end]);
-        let parent = *stack.last().unwrap_or(&document);
-        parsed.dom.append(parent, text).ok()?;
-        return Some(&body[end + 3..]);
-    }
-    if rest.starts_with("<?") {
-        let end = rest.find("?>")?;
-        let inner = &rest[2..end];
-        let mut parts = inner.splitn(2, char::is_whitespace);
-        let target = parts.next().unwrap_or_default();
-        let data = parts.next().unwrap_or_default().trim_start();
-        if !target.eq_ignore_ascii_case("xml") {
-            let node = parsed.dom.create_processing_instruction(target, data);
-            let parent = *stack.last().unwrap_or(&document);
-            parsed.dom.append(parent, node).ok()?;
-        }
-        return Some(&rest[end + 2..]);
-    }
-    if rest.starts_with("<!--") {
-        let end = rest.find("-->")?;
-        return Some(&rest[end + 3..]);
-    }
-    if rest.starts_with("<!") {
-        let end = rest.find('>')?;
-        return Some(&rest[end + 1..]);
-    }
-    let closing = rest.starts_with("</");
-    let tag_end = find_tag_end(rest)?;
-    let inner = rest[if closing { 2 } else { 1 }..tag_end].trim();
-    let remaining = &rest[tag_end + 1..];
-    if closing {
-        if stack.len() > 1 {
-            stack.pop();
-        }
-        return Some(remaining);
-    }
-    let self_closing = inner.ends_with('/');
-    let inner = inner.trim_end_matches('/');
-    let mut parts = inner.splitn(2, char::is_whitespace);
-    let name = parts.next().filter(|name| !name.is_empty())?;
-    let attributes = match parts.next() {
-        Some(rest) => parse_xml_attributes(rest)?,
-        None => Vec::new(),
-    };
-    let (prefix, local) = match name.split_once(':') {
-        Some((prefix, local)) => (Some(prefix), local),
-        None => (None, name),
-    };
-    let mut namespace = Namespace::from("");
-    let mut kept = Vec::with_capacity(attributes.len());
-    for attribute in attributes {
-        let attribute_name = attribute.name.local.as_ref();
-        if attribute_name == "xmlns" {
-            namespace = Namespace::from(attribute.value.as_str());
-        } else if let Some(declared) = attribute_name.strip_prefix("xmlns:") {
-            if Some(declared) == prefix {
-                namespace = Namespace::from(attribute.value.as_str());
-            }
-        } else {
-            kept.push(attribute);
-        }
-    }
-    let element = parsed.dom.create_element(
-        QualName::new(
-            prefix.map(dom::Prefix::from),
-            namespace,
-            LocalName::from(local),
-        ),
-        kept,
-    );
-    let parent = *stack.last().unwrap_or(&document);
-    parsed.dom.append(parent, element).ok()?;
-    if !self_closing {
-        stack.push(element);
-    }
-    Some(remaining)
-}
-
-/// Index of the `>` that closes a tag, respecting quoted attribute values.
-fn find_tag_end(rest: &str) -> Option<usize> {
-    let mut quote = None;
-    for (index, ch) in rest.char_indices() {
-        match (quote, ch) {
-            (Some(open), close) if close == open => quote = None,
-            (None, '"' | '\'') => quote = Some(ch),
-            (None, '>') => return Some(index),
-            _ => {}
-        }
-    }
-    None
-}
-
-/// Parses `name="value"` pairs; `None` on unquoted or truncated input.
-fn parse_xml_attributes(input: &str) -> Option<Vec<dom::Attribute>> {
-    let mut attributes = Vec::new();
-    let mut rest = input.trim();
-    while !rest.is_empty() {
-        let eq = rest.find('=')?;
-        let name = rest[..eq].trim();
-        if name.is_empty() {
-            return None;
-        }
-        let after = rest[eq + 1..].trim_start();
-        let quote = after.chars().next()?;
-        if quote != '"' && quote != '\'' {
-            return None;
-        }
-        let end = after[1..].find(quote)? + 1;
-        let value = after[1..end].to_owned();
-        attributes.push(dom::Attribute {
-            name: QualName::new(None, Namespace::from(""), LocalName::from(name)),
-            value,
-        });
-        rest = after[end + 1..].trim_start();
-    }
-    Some(attributes)
 }
 
 /// Cross-document insertion: a `DocumentType` is copied into the parent's
@@ -2165,188 +2029,6 @@ fn materialize_import(
     }
 }
 
-// https://html.spec.whatwg.org/multipage/parsing.html#serialising-html-fragments
-fn serialize_html_fragment(dom: &dom::Dom, element: NodeId) -> String {
-    let root = dom.template_contents(element).unwrap_or(element);
-    let parent = match dom.get(element).map(|node| node.kind()) {
-        Some(NodeKind::Element { name, .. }) => Some((name.ns.clone(), name.local.clone())),
-        _ => None,
-    };
-    let mut output = String::new();
-    let children: Vec<NodeId> = dom
-        .children(root)
-        .map(|children| children.copied().collect())
-        .unwrap_or_default();
-    for child in children {
-        serialize_html_node(
-            dom,
-            child,
-            parent.as_ref().map(|(namespace, local)| (namespace, local)),
-            &mut output,
-        );
-    }
-    output
-}
-
-fn serialize_html_node(
-    dom: &dom::Dom,
-    id: NodeId,
-    parent: Option<(&Namespace, &LocalName)>,
-    output: &mut String,
-) {
-    let Some(kind) = dom.get(id).map(|node| node.kind().clone()) else {
-        return;
-    };
-    match kind {
-        NodeKind::Document | NodeKind::Fragment => {
-            let children: Vec<NodeId> = dom
-                .children(id)
-                .map(|children| children.copied().collect())
-                .unwrap_or_default();
-            for child in children {
-                serialize_html_node(dom, child, parent, output);
-            }
-        }
-        NodeKind::Doctype { name, .. } => {
-            output.push_str("<!DOCTYPE ");
-            output.push_str(&name);
-            output.push('>');
-        }
-        NodeKind::Text { data } => {
-            let raw_text = parent.is_some_and(|(namespace, local)| {
-                namespace == &html_namespace()
-                    && matches!(
-                        local.as_ref(),
-                        "style"
-                            | "script"
-                            | "xmp"
-                            | "iframe"
-                            | "noembed"
-                            | "noscript"
-                            | "noframes"
-                            | "plaintext"
-                    )
-            });
-            if raw_text {
-                output.push_str(&data);
-            } else {
-                push_escaped_text(output, &data);
-            }
-        }
-        NodeKind::CDataSection { data } => {
-            output.push_str("<![CDATA[");
-            output.push_str(&data);
-            output.push_str("]]>");
-        }
-        NodeKind::ProcessingInstruction { target, data } => {
-            output.push_str("<?");
-            output.push_str(&target);
-            output.push(' ');
-            output.push_str(&data);
-            output.push('>');
-        }
-        NodeKind::Comment { data } => {
-            output.push_str("<!--");
-            output.push_str(&data);
-            output.push_str("-->");
-        }
-        NodeKind::Element { name, attributes } => {
-            serialize_html_element(dom, id, &name, &attributes, output);
-        }
-    }
-}
-
-fn serialize_html_element(
-    dom: &dom::Dom,
-    id: NodeId,
-    name: &QualName,
-    attributes: &[dom::Attribute],
-    output: &mut String,
-) {
-    output.push('<');
-    push_qualified_name(output, name.prefix.as_ref(), &name.local);
-    for attribute in attributes {
-        output.push(' ');
-        push_qualified_name(
-            output,
-            attribute.name.prefix.as_ref(),
-            &attribute.name.local,
-        );
-        output.push_str("=\"");
-        push_escaped_attribute(output, &attribute.value);
-        output.push('"');
-    }
-    output.push('>');
-
-    let is_html_void = name.ns == html_namespace()
-        && matches!(
-            name.local.as_ref(),
-            "area"
-                | "base"
-                | "basefont"
-                | "bgsound"
-                | "link"
-                | "meta"
-                | "br"
-                | "col"
-                | "embed"
-                | "hr"
-                | "img"
-                | "input"
-                | "keygen"
-                | "param"
-                | "source"
-                | "track"
-                | "wbr"
-        );
-    if is_html_void {
-        return;
-    }
-
-    let child_root = dom.template_contents(id).unwrap_or(id);
-    let children: Vec<NodeId> = dom
-        .children(child_root)
-        .map(|children| children.copied().collect())
-        .unwrap_or_default();
-    for child in children {
-        serialize_html_node(dom, child, Some((&name.ns, &name.local)), output);
-    }
-    output.push_str("</");
-    push_qualified_name(output, name.prefix.as_ref(), &name.local);
-    output.push('>');
-}
-
-fn push_qualified_name(output: &mut String, prefix: Option<&Prefix>, local: &LocalName) {
-    if let Some(prefix) = prefix {
-        output.push_str(prefix.as_ref());
-        output.push(':');
-    }
-    output.push_str(local.as_ref());
-}
-
-fn push_escaped_text(output: &mut String, text: &str) {
-    for character in text.chars() {
-        match character {
-            '&' => output.push_str("&amp;"),
-            '\u{00a0}' => output.push_str("&nbsp;"),
-            '<' => output.push_str("&lt;"),
-            '>' => output.push_str("&gt;"),
-            _ => output.push(character),
-        }
-    }
-}
-
-fn push_escaped_attribute(output: &mut String, value: &str) {
-    for character in value.chars() {
-        match character {
-            '&' => output.push_str("&amp;"),
-            '\u{00a0}' => output.push_str("&nbsp;"),
-            '"' => output.push_str("&quot;"),
-            _ => output.push(character),
-        }
-    }
-}
-
 /// Builds and throws a `DOMException` from Rust with a real prototype, so
 /// `instanceof DOMException` and `constructor` checks pass.
 fn throw_dom(ctx: &Ctx<'_>, name: &str, message: &str) -> rquickjs::Error {
@@ -2428,6 +2110,53 @@ impl JsNode {
     pub(crate) fn node_id(&self) -> NodeId {
         self.handle.0
     }
+}
+
+/// The context string the HTML fragment parser expects for an element with
+/// this qualified name: html5lib's `svg `/`math ` prefixes for foreign
+/// namespaces
+/// (<https://html.spec.whatwg.org/multipage/parsing.html#html-fragment-parsing-algorithm>).
+fn html_fragment_context(name: &QualName) -> String {
+    if name.ns == svg_namespace() {
+        format!("svg {}", name.local)
+    } else if name.ns.as_ref() == "http://www.w3.org/1998/Math/MathML" {
+        format!("math {}", name.local)
+    } else {
+        name.local.to_string()
+    }
+}
+
+/// Parses `markup` as an HTML fragment in `context` and snapshots the
+/// resulting nodes for insertion into a document.
+fn parse_html_fragment_snapshots(
+    ctx: &Ctx<'_>,
+    markup: &str,
+    context: &str,
+) -> Result<Vec<ImportSnapshot>> {
+    let parsed_fragment = crate::parse_html_fragment(markup, context, true);
+    let fragment_root = parsed_fragment
+        .dom
+        .children(parsed_fragment.dom.document())
+        .and_then(|children| {
+            children.copied().find(|&id| {
+                matches!(
+                    parsed_fragment.dom.get(id).map(|node| node.kind()),
+                    Some(NodeKind::Element { name, .. })
+                        if name.ns == html_namespace() && name.local.as_ref() == "html"
+                )
+            })
+        })
+        .ok_or_else(|| Exception::throw_internal(ctx, "fragment parser omitted its root"))?;
+    Ok(parsed_fragment
+        .dom
+        .children(fragment_root)
+        .map(|children| {
+            children
+                .copied()
+                .filter_map(|child| import_snapshot(&parsed_fragment.dom, child, true))
+                .collect()
+        })
+        .unwrap_or_default())
 }
 
 #[rquickjs::methods]
@@ -2597,7 +2326,7 @@ impl JsNode {
         target: WebIdlString,
         data: WebIdlString,
     ) -> Result<Value<'js>> {
-        if !valid_xml_name(&target.0) {
+        if !crate::xml::is_valid_name(&target.0) {
             return Err(throw_dom(
                 &ctx,
                 "InvalidCharacterError",
@@ -3195,7 +2924,15 @@ impl JsNode {
         let Some(parsed) = parsed.document(self.handle.0) else {
             return Err(Exception::throw_type(&ctx, "no document"));
         };
-        Ok(serialize_html_fragment(&parsed.dom, self.handle.0))
+        if parsed.content_type == "text/html" {
+            Ok(crate::serialize::serialize_html_fragment(
+                &parsed.dom,
+                self.handle.0,
+            ))
+        } else {
+            crate::serialize::serialize_xml_children(&parsed.dom, self.handle.0, true)
+                .map_err(|err| throw_dom(&ctx, "InvalidStateError", &err.to_string()))
+        }
     }
 
     // https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-element-outerhtml
@@ -3211,56 +2948,35 @@ impl JsNode {
         else {
             return Err(Exception::throw_type(&ctx, "outerHTML requires an element"));
         };
-        let mut output = String::new();
-        serialize_html_element(&parsed.dom, self.handle.0, name, attributes, &mut output);
-        Ok(output)
+        if parsed.content_type == "text/html" {
+            let mut output = String::new();
+            crate::serialize::serialize_html_element(
+                &parsed.dom,
+                self.handle.0,
+                name,
+                attributes,
+                &mut output,
+            );
+            Ok(output)
+        } else {
+            crate::serialize::serialize_xml(&parsed.dom, self.handle.0, true)
+                .map_err(|err| throw_dom(&ctx, "InvalidStateError", &err.to_string()))
+        }
     }
 
     // https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-element-innerhtml
     #[qjs(set, rename = "innerHTML")]
-    fn set_inner_html(&self, ctx: Ctx<'_>, value: WebIdlString) -> Result<()> {
+    fn set_inner_html(&self, ctx: Ctx<'_>, value: LegacyNullString) -> Result<()> {
         let (context, is_template) = with_node_kind(&ctx, self.handle.0, |kind| match kind {
-            Some(NodeKind::Element { name, .. }) => {
-                let context = if name.ns == svg_namespace() {
-                    format!("svg {}", name.local)
-                } else if name.ns.as_ref() == "http://www.w3.org/1998/Math/MathML" {
-                    format!("math {}", name.local)
-                } else {
-                    name.local.to_string()
-                };
-                Some((
-                    context,
-                    name.ns == html_namespace() && name.local.as_ref() == "template",
-                ))
-            }
+            Some(NodeKind::Element { name, .. }) => Some((
+                html_fragment_context(name),
+                name.ns == html_namespace() && name.local.as_ref() == "template",
+            )),
             _ => None,
         })?
         .ok_or_else(|| Exception::throw_type(&ctx, "innerHTML requires an element"))?;
 
-        let parsed_fragment = crate::parse_html_fragment(&value.0, &context, true);
-        let fragment_root = parsed_fragment
-            .dom
-            .children(parsed_fragment.dom.document())
-            .and_then(|children| {
-                children.copied().find(|&id| {
-                    matches!(
-                        parsed_fragment.dom.get(id).map(|node| node.kind()),
-                        Some(NodeKind::Element { name, .. })
-                            if name.ns == html_namespace() && name.local.as_ref() == "html"
-                    )
-                })
-            })
-            .ok_or_else(|| Exception::throw_internal(&ctx, "fragment parser omitted its root"))?;
-        let snapshots: Vec<ImportSnapshot> = parsed_fragment
-            .dom
-            .children(fragment_root)
-            .map(|children| {
-                children
-                    .copied()
-                    .filter_map(|child| import_snapshot(&parsed_fragment.dom, child, true))
-                    .collect()
-            })
-            .unwrap_or_default();
+        let snapshots = parse_html_fragment_snapshots(&ctx, &value.0, &context)?;
 
         let world = world(&ctx)?;
         let world = world.borrow();
@@ -3293,6 +3009,61 @@ impl JsNode {
         parsed
             .dom
             .replace_all(target, replacement)
+            .map_err(|err| throw_dom_error(&ctx, err))?;
+        drop(parsed);
+        drop(world);
+        schedule_mutation_delivery(&ctx)
+    }
+
+    // https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-element-outerhtml
+    #[qjs(set, rename = "outerHTML")]
+    fn set_outer_html(&self, ctx: Ctx<'_>, value: LegacyNullString) -> Result<()> {
+        let world_rc = world(&ctx)?;
+        let (parent, context) = {
+            let world = world_rc.borrow();
+            let Some(parsed) = world.document(self.handle.0) else {
+                return Err(Exception::throw_type(&ctx, "no document"));
+            };
+            let Some(parent) = parsed.dom.parent(self.handle.0) else {
+                // A parentless element has nothing to replace.
+                return Ok(());
+            };
+            let Some(kind) = parsed.dom.get(parent).map(|node| node.kind().clone()) else {
+                return Err(Exception::throw_type(&ctx, "no document"));
+            };
+            match kind {
+                NodeKind::Document => {
+                    return Err(throw_dom(
+                        &ctx,
+                        "NoModificationAllowedError",
+                        "the parent of the element is a Document",
+                    ));
+                }
+                NodeKind::Element { name, .. } => (parent, html_fragment_context(&name)),
+                // A DocumentFragment has no parsing context of its own; a
+                // body element stands in
+                // (<https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-element-outerhtml>).
+                _ => (parent, "body".to_owned()),
+            }
+        };
+        let snapshots = parse_html_fragment_snapshots(&ctx, &value.0, &context)?;
+
+        let world = world_rc.borrow();
+        let Some(mut parsed) = world.document_mut(self.handle.0) else {
+            return Err(Exception::throw_type(&ctx, "no document"));
+        };
+        let replacement = parsed.dom.create_fragment();
+        for snapshot in &snapshots {
+            let child = materialize_import(&mut parsed.dom, snapshot)
+                .map_err(|err| throw_dom_error(&ctx, err))?;
+            parsed
+                .dom
+                .append(replacement, child)
+                .map_err(|err| throw_dom_error(&ctx, err))?;
+        }
+        parsed
+            .dom
+            .replace_child(parent, replacement, self.handle.0)
             .map_err(|err| throw_dom_error(&ctx, err))?;
         drop(parsed);
         drop(world);
@@ -5041,6 +4812,7 @@ pub(super) fn install(ctx: &Ctx<'_>, world: &Rc<RefCell<World>>) -> Result<()> {
     Class::<JsAttr>::define(&globals)?;
     Class::<JsNamedNodeMap>::define(&globals)?;
     Class::<JsDomParser>::define(&globals)?;
+    Class::<JsXmlSerializer>::define(&globals)?;
     Class::<JsMutationObserver>::define(&globals)?;
     Class::<JsMutationRecord>::define(&globals)?;
     globals.set(
@@ -6257,29 +6029,6 @@ fn valid_namespace_prefix(prefix: &str) -> bool {
         && !prefix
             .chars()
             .any(|c| is_infra_whitespace(c) || matches!(c, '\0' | '/' | '>'))
-}
-
-/// The XML `Name` production (colons allowed), used by
-/// `createProcessingInstruction` targets
-/// (<https://www.w3.org/TR/xml/#NT-Name>).
-fn valid_xml_name(name: &str) -> bool {
-    let mut chars = name.chars();
-    match chars.next() {
-        Some(first) if is_name_start(first) => chars.all(is_name_char),
-        _ => false,
-    }
-}
-
-// https://www.w3.org/TR/xml/#NT-NameStartChar
-fn is_name_start(c: char) -> bool {
-    matches!(c, ':' | 'A'..='Z' | '_' | 'a'..='z' | '\u{C0}'..='\u{D6}' | '\u{D8}'..='\u{F6}' | '\u{F8}'..='\u{2FF}' | '\u{370}'..='\u{37D}' | '\u{37F}'..='\u{1FFF}' | '\u{200C}'..='\u{200D}' | '\u{2070}'..='\u{218F}' | '\u{2C00}'..='\u{2FEF}' | '\u{3001}'..='\u{D7FF}' | '\u{F900}'..='\u{FDCF}' | '\u{FDF0}'..='\u{FFFD}')
-        || ('\u{10000}'..='\u{EFFFF}').contains(&c)
-}
-
-// https://www.w3.org/TR/xml/#NT-NameChar
-fn is_name_char(c: char) -> bool {
-    is_name_start(c)
-        || matches!(c, '-' | '.' | '0'..='9' | '\u{B7}' | '\u{0300}'..='\u{036F}' | '\u{203F}'..='\u{2040}')
 }
 
 /// [Valid attribute local name](https://dom.spec.whatwg.org/#valid-attribute-local-name).

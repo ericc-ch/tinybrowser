@@ -68,54 +68,6 @@ globalThis.fetch = function(url) {
     globalThis.__queueFetch(String(url), id);
   });
 };
-globalThis.XMLSerializer = function XMLSerializer() {};
-globalThis.XMLSerializer.prototype.serializeToString = function(node) {
-  function escapeText(value) {
-    return String(value).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-  }
-  function escapeAttr(value) {
-    return String(value).replace(/&/g, '&amp;').replace(/\x22/g, '&quot;').replace(/</g, '&lt;');
-  }
-  function attributeText(element) {
-    const map = element.attributes;
-    let out = '';
-    if (!map) return out;
-    for (let i = 0; i < map.length; i++) {
-      const attr = map.item ? map.item(i) : map[i];
-      if (attr) out += ' ' + attr.name + '=\x22' + escapeAttr(attr.value) + '\x22';
-    }
-    return out;
-  }
-  function childList(node) {
-    const list = node.childNodes;
-    const out = [];
-    if (!list) return out;
-    for (let i = 0; i < list.length; i++) out.push(list.item ? list.item(i) : list[i]);
-    return out;
-  }
-  function serialize(current) {
-    if (!current) return '';
-    const type = current.nodeType;
-    if (type === 1) {
-      const name = String(current.tagName || current.nodeName).toLowerCase();
-      let out = '<' + name + attributeText(current) + '>';
-      const children = childList(current);
-      for (let i = 0; i < children.length; i++) out += serialize(children[i]);
-      return out + '</' + name + '>';
-    }
-    if (type === 3) return escapeText(current.nodeValue || '');
-    if (type === 8) return '<!--' + (current.nodeValue || '') + '-->';
-    if (type === 10) return '<!DOCTYPE ' + (current.name || '') + '>';
-    if (type === 9) {
-      let out = '';
-      if (current.doctype) out += serialize(current.doctype);
-      if (current.documentElement) out += serialize(current.documentElement);
-      return out;
-    }
-    return '';
-  }
-  return serialize(node);
-};
 // https://w3c.github.io/FileAPI/#blob
 const __tbBlobData = new WeakMap();
 const __tbUtf8Length = value => {
