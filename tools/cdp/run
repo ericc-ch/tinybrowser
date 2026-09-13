@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# Run Chromium's inspector-protocol corpus against the debug binary.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+
+if ! command -v node >/dev/null 2>&1; then
+  echo "node is required to run the CDP corpus (nix develop)" >&2
+  exit 1
+fi
+
+cd "$ROOT"
+cargo build -q --offline 2>/dev/null || cargo build -q
+export TINYBROWSER_BIN="$ROOT/target/debug/tinybrowser"
+node --test "$ROOT/tools/cdp/runner.test.mjs"
+exec node --experimental-vm-modules "$ROOT/tools/cdp/runner.mjs" "$@"

@@ -184,6 +184,10 @@ _Avoid_: separately shipped helper, idle-exit server
 Chrome DevTools Protocol. Control plane for the CLI and external tools. First slice uses Chrome-style local trust: loopback bind, user-only runtime files, no `Host`/`Origin` checks, no websocket token. Honest Browser, Target, Page, and Runtime subsets. Unsupported methods return method-not-found.
 _Avoid_: private RPC, pretending to support a method
 
+**CDP corpus gate**:
+Chromium's two Blink inspector-protocol trees, vendored in full at a pinned Chromium revision under `third_party/blink-cdp`. `./tools/cdp/run` executes promoted passing tests; `./tools/cdp/run --all` attempts every paired test and reports one category per test (unsupported method, protocol failure, missing fixture, harness gap, timeout, crash). A Node host supplies the upstream `TestRunner` shape and speaks raw CDP to a fresh tinybrowser daemon in an isolated worker process per test ([ADR 0018](adrs/0018-blink-cdp-corpus.md)). This gate checks CDP response/event behavior; the Playwright gate separately checks compatibility with a real external client.
+_Avoid_: CDP tests as WPT, Chromium as a git submodule, treating a Playwright smoke pass as CDP conformance
+
 **Flattened session**:
 CDP routing on the browser WebSocket. `Target.attachToTarget` with `flatten` true returns a `sessionId`. Later target commands and events carry `sessionId` at the top JSON level. Direct page sockets need no `sessionId`. Both paths reach the same `TabHandle`.
 _Avoid_: a second tab object per socket

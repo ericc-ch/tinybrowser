@@ -26,3 +26,22 @@ the binary; it exists so tests are reproducible and offline-capable.
   `innerHTML` in the URL wrapper ([ADR 0005](../docs/adrs/0005-html5lib-tree-construction-suite.md)).
   Known tinybrowser results are baselined outside the submodule in
   `tools/wpt/metadata`.
+
+## Blink inspector-protocol tests
+
+- **What**: Chromium's complete `inspector-protocol` and HTTP
+  `inspector-protocol` web-test trees, including expected text output and local
+  resources.
+- **Upstream**: <https://chromium.googlesource.com/chromium/src/>; direct
+  snapshots from the two Gitiles archive endpoints recorded in
+  `third_party/blink-cdp/README.md`.
+- **Pinned revision**: `578830dbc33cea008a78bc6ff9825f85a83343a7`.
+- **License**: Chromium's BSD-style license in `third_party/blink-cdp/LICENSE`.
+- **Size**: about 20 MB across 3,609 files; test input only, never compiled
+  into the binary.
+- **Update**: change `third_party/blink-cdp/REVISION`, update the pin recorded
+  here, then run `./tools/cdp/update`. The updater stages both archives and
+  refuses to swap in a tree that is empty or contains anything but regular
+  files and directories.
+- **Runner**: `./tools/cdp/run` for promoted passing tests;
+  `./tools/cdp/run --all` for the complete exploratory scoreboard.

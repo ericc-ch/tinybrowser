@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+# Refresh the two vendored inspector-protocol trees at the pinned revision.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+VENDOR="$ROOT/third_party/blink-cdp"
+REVISION="$(tr -d '[:space:]' < "$VENDOR/REVISION")"
+
+# Documentation pins the same revision; refuse to download when they disagree.
+if ! grep -qF "$REVISION" "$ROOT/third_party/VENDORED.md"; then
+  echo "third_party/VENDORED.md does not record revision $REVISION" >&2
+  exit 1
+fi
+
+STAGE="$VENDOR/.update-stage"
+rm -rf "$STAGE"
+mkdir -p "$STAGE/inspector-protocol" "$STAGE/http-inspector-protocol"
+
+# Restore any tree that was moved aside if the swap does not complete.
+restore() {
+  if [ -e "$VENDOR/.old-inspector-protocol" ] && [ ! -e "$VENDOR/inspector-protocol" ]; then
+    mv "$VENDOR/.old-inspector-protocol" "$VENDOR/inspector-protocol"
+  fi
+  if [ -e "$VENDOR/.old-http-inspector-protocol" ] && [ ! -e "$VENDOR/http-inspector-protocol" ]; then
+    mv "$VENDOR/.old-http-inspector-protocol" "$VENDOR/http-inspector-protocol"
+  fi
+  rm -rf "$STAGE"
+}
+trap restore EXIT
+
+BASE="https://chromium.googlesource.com/chromium/src/+archive/$REVISION/third_party/blink/web_tests"
+curl -fsSL "$BASE/inspector-protocol.tar.gz" -o "$STAGE/inspector-protocol.tar.gz"
+curl -fsSL "$BASE/http/tests/inspector-protocol.tar.gz" -o "$STAGE/http-inspector-protocol.tar.gz"
+curl -fsSL "https://raw.githubusercontent.com/chromium/chromium/$REVISION/LICENSE" -o "$STAGE/LICENSE"
+
+tar -xzf "$STAGE/inspector-protocol.tar.gz" -C "$STAGE/inspector-protocol"
+tar -xzf "$STAGE/http-inspector-protocol.tar.gz" -C "$STAGE/http-inspector-protocol"
+rm "$STAGE/inspector-protocol.tar.gz" "$STAGE/http-inspector-protocol.tar.gz"
+
+if find "$STAGE" \! -type f \! -type d | grep -q .; then
+  echo "refusing update: archive contains entries other than regular files and directories" >&2
+  exit 1
+fi
+if [ -z "$(ls -A "$STAGE/inspector-protocol")" ] || [ -z "$(ls -A "$STAGE/http-inspector-protocol")" ]; then
+  echo "refusing update: an extracted tree is empty" >&2
+  exit 1
+fi
+
+rm -rf "$VENDOR/.old-inspector-protocol" "$VENDOR/.old-http-inspector-protocol"
+mv "$VENDOR/inspector-protocol" "$VENDOR/.old-inspector-protocol"
+mv "$VENDOR/http-inspector-protocol" "$VENDOR/.old-http-inspector-protocol"
+mv "$STAGE/inspector-protocol" "$VENDOR/inspector-protocol"
+mv "$STAGE/http-inspector-protocol" "$VENDOR/http-inspector-protocol"
+mv "$STAGE/LICENSE" "$VENDOR/LICENSE"
+rm -rf "$VENDOR/.old-inspector-protocol" "$VENDOR/.old-http-inspector-protocol"
+
+echo "updated Blink CDP corpus at $REVISION"

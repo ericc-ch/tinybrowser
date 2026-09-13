@@ -1,7 +1,8 @@
-target/
+/target/
 .direnv/
 __pycache__/
 *.egg-info/
 tools/playwright/node_modules/
 tools/playwright/test-results/
 tools/playwright/playwright-report/
+third_party/blink-cdp/.update-stage/
