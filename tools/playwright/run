@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# Run the Playwright compatibility gate against the debug binary.
+#
+# Playwright connects to a tinybrowser daemon over CDP; no bundled browser is
+# launched, so `playwright install` is never needed. Node and npm come from the
+# nix dev shell (see flake.nix).
+set -euo pipefail
+ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+
+if ! command -v node >/dev/null 2>&1 || ! command -v npm >/dev/null 2>&1; then
+  echo "node + npm are required to run the Playwright gate (nix develop)" >&2
+  exit 1
+fi
+
+cd "$ROOT"
+cargo build -q --offline 2>/dev/null || cargo build -q
+export TINYBROWSER_BIN="$ROOT/target/debug/tinybrowser"
+
+cd "$ROOT/tools/playwright"
+if [ ! -d node_modules ]; then
+  npm install --no-audit --no-fund
+fi
+exec npx playwright test "$@"

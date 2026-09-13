@@ -1,0 +1,8 @@
+{
+  "name": "tinybrowser-playwright",
+  "private": true,
+  "description": "Playwright compatibility gate for tinybrowser",
+  "devDependencies": {
+    "@playwright/test": "1.63.0"
+  }
+}

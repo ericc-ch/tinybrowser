@@ -1,0 +1,94 @@
+import { test as base } from "@playwright/test";
+import { spawn } from "node:child_process";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { createServer } from "node:http";
+import type { AddressInfo } from "node:net";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+export interface Daemon {
+  /** HTTP discovery origin, e.g. `http://127.0.0.1:41234`. */
+  origin: string;
+  /** Classic-script + fetch page served by the fixture. */
+  pageUrl: string;
+}
+
+interface Fixtures {
+  daemon: Daemon;
+}
+
+const PAGE = `<!doctype html><title>tiny</title><script src="/lib.js"></script><script>window.ready = false; fetch('/data').then(r => r.text()).then(t => { window.payload = t; window.ready = true; });</script>`;
+
+async function waitForPort(jsonPath: string, timeoutMs: number): Promise<number> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      return JSON.parse(readFileSync(jsonPath, "utf8")).port as number;
+    } catch {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+  }
+  throw new Error(`daemon.json missing at ${jsonPath}`);
+}
+
+export const test = base.extend<Fixtures>({
+  daemon: async ({}, use) => {
+    const binary = process.env.TINYBROWSER_BIN;
+    if (!binary) {
+      throw new Error("TINYBROWSER_BIN is not set; run ./tools/playwright/run");
+    }
+    const root = mkdtempSync(join(tmpdir(), "tinybrowser-pw-"));
+    const runtime = join(root, "run");
+    const data = join(root, "data");
+    mkdirSync(runtime, { recursive: true });
+    mkdirSync(data, { recursive: true });
+
+    const httpServer = createServer((request, response) => {
+      const path = new URL(request.url ?? "/", "http://localhost").pathname;
+      if (path === "/page") {
+        response.writeHead(200, { "content-type": "text/html" });
+        response.end(PAGE);
+      } else if (path === "/lib.js") {
+        response.writeHead(200, { "content-type": "text/javascript" });
+        response.end("window.fromLib = 7;");
+      } else if (path === "/data") {
+        response.writeHead(200, { "content-type": "text/plain" });
+        response.end("payload");
+      } else {
+        response.writeHead(404);
+        response.end("not found");
+      }
+    });
+    await new Promise<void>((resolve) => httpServer.listen(0, "127.0.0.1", resolve));
+    const httpPort = (httpServer.address() as AddressInfo).port;
+
+    // Detached so cleanup can kill the daemon and its renderer children as one
+    // process group.
+    const daemon = spawn(binary, ["--daemon", "--profile=default"], {
+      env: { ...process.env, XDG_RUNTIME_DIR: runtime, XDG_DATA_HOME: data },
+      stdio: "ignore",
+      detached: true,
+    });
+    if (daemon.pid === undefined) throw new Error("daemon did not spawn");
+
+    const port = await waitForPort(
+      join(runtime, "tinybrowser", "default", "daemon.json"),
+      10_000,
+    );
+
+    await use({
+      origin: `http://127.0.0.1:${port}`,
+      pageUrl: `http://127.0.0.1:${httpPort}/page`,
+    });
+
+    try {
+      process.kill(-daemon.pid, "SIGKILL");
+    } catch {
+      // Already gone.
+    }
+    await new Promise<void>((resolve) => httpServer.close(() => resolve()));
+    rmSync(root, { recursive: true, force: true });
+  },
+});
+
+export { expect } from "@playwright/test";

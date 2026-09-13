@@ -33,6 +33,7 @@
         nativeBuildInputs = [
           rustToolchain
           pkgs.pkg-config
+          pkgs.nodejs_24
         ];
         buildInputs = [
           pkgs.openssl
