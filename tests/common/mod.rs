@@ -1,3 +1,9 @@
+//! Shared fixtures for the binary-level integration tests.
+//!
+//! Every `tests/*.rs` file compiles its own copy of this module, so helpers used
+//! by one test binary are dead code in the others.
+#![allow(dead_code)]
+
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -53,6 +59,32 @@ impl Fixture {
             assert!(Instant::now() < deadline, "daemon.json missing");
             std::thread::sleep(Duration::from_millis(20));
         }
+    }
+
+    pub fn endpoint(&self) -> std::net::SocketAddr {
+        let info = self.wait_json();
+        let port = u16::try_from(info["port"].as_u64().expect("port")).expect("port");
+        format!("127.0.0.1:{port}").parse().expect("addr")
+    }
+
+    pub fn connect(&self) -> cdp::Client {
+        cdp::Client::connect(self.endpoint()).expect("cdp connect")
+    }
+
+    pub fn spawn_daemon_with_env(&mut self, key: &str, value: &str) -> u32 {
+        let child = Command::new(env!("CARGO_BIN_EXE_tinybrowser"))
+            .args(["--daemon", "--profile=default"])
+            .env("XDG_RUNTIME_DIR", &self.runtime)
+            .env("XDG_DATA_HOME", &self.data)
+            .env(key, value)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn daemon");
+        let id = child.id();
+        self.children.push(child);
+        id
     }
 }
 

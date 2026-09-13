@@ -6,11 +6,10 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, SystemTime};
 
 use browser::{Browser, Profile, ProfileName, ProfileStore};
-use serde_json::{Value, json};
+use serde_json::json;
 
 /// Registration recorded at `$XDG_RUNTIME_DIR/tinybrowser/<profile>/daemon.json`.
 #[derive(Clone, Debug)]
@@ -21,14 +20,6 @@ pub struct DaemonEndpoint {
     pub host: String,
     /// Bound port.
     pub port: u16,
-}
-
-impl DaemonEndpoint {
-    /// Loopback socket for CDP clients.
-    #[must_use]
-    pub fn addr(&self) -> std::net::SocketAddr {
-        std::net::SocketAddr::from(([127, 0, 0, 1], self.port))
-    }
 }
 
 /// Runs the profile daemon until the process exits.
@@ -65,69 +56,6 @@ pub fn run(profile: &Profile, data_home: &Path) -> io::Result<()> {
     let result = cdp::serve(&listener, &browser.handle());
     let _ = fs::remove_file(&lock_path);
     result
-}
-
-/// Returns a live endpoint, starting a detached daemon when missing.
-///
-/// # Errors
-///
-/// Spawn or wait failure.
-pub fn ensure(profile: &Profile, data_home: &Path) -> io::Result<DaemonEndpoint> {
-    let runtime = profile_runtime_dir(profile.name())?;
-    if let Some(existing) = read_endpoint(&runtime)
-        && pid_alive(existing.pid)
-    {
-        return Ok(existing);
-    }
-    spawn_detached(profile, data_home)?;
-    wait_endpoint(profile, Duration::from_secs(5))
-}
-
-/// Starts the same executable as `--daemon` without attaching stdio.
-///
-/// # Errors
-///
-/// Spawn failure.
-pub fn spawn_detached(profile: &Profile, data_home: &Path) -> io::Result<()> {
-    let exe = std::env::current_exe()?;
-    let mut command = Command::new(exe);
-    command
-        .arg("--daemon")
-        .arg(format!("--profile={}", profile.name().as_str()))
-        .env("XDG_DATA_HOME", data_home)
-        .env("TINYBROWSER_LOG", logging::level().as_str())
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    if let Some(runtime) = env_runtime_dir() {
-        command.env("XDG_RUNTIME_DIR", runtime);
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        command.process_group(0);
-    }
-    command.spawn()?;
-    Ok(())
-}
-
-fn wait_endpoint(profile: &Profile, timeout: Duration) -> io::Result<DaemonEndpoint> {
-    let runtime = profile_runtime_dir(profile.name())?;
-    let deadline = Instant::now() + timeout;
-    loop {
-        if let Some(existing) = read_endpoint(&runtime)
-            && pid_alive(existing.pid)
-        {
-            return Ok(existing);
-        }
-        if Instant::now() >= deadline {
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "profile daemon did not start",
-            ));
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    }
 }
 
 fn profile_runtime_dir(name: &ProfileName) -> io::Result<PathBuf> {
@@ -250,31 +178,6 @@ fn restrict_file(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
-fn read_endpoint(runtime: &Path) -> Option<DaemonEndpoint> {
-    let path = runtime.join("daemon.json");
-    let text = fs::read_to_string(path).ok()?;
-    let value: Value = serde_json::from_str(&text).ok()?;
-    let pid = value.get("pid").and_then(Value::as_u64)?;
-    let port = value.get("port").and_then(Value::as_u64)?;
-    let host = value
-        .get("host")
-        .and_then(Value::as_str)
-        .unwrap_or("127.0.0.1");
-    if host != "127.0.0.1" {
-        return None;
-    }
-    let pid = u32::try_from(pid).ok()?;
-    let port = u16::try_from(port).ok()?;
-    if pid <= 1 || port == 0 {
-        return None;
-    }
-    Some(DaemonEndpoint {
-        pid,
-        host: host.to_owned(),
-        port,
-    })
-}
-
 fn write_endpoint(runtime: &Path, endpoint: &DaemonEndpoint) -> io::Result<()> {
     let path = runtime.join("daemon.json");
     let tmp = runtime.join("daemon.json.tmp");
@@ -300,46 +203,4 @@ fn pid_alive(pid: u32) -> bool {
 /// Both `XDG_DATA_HOME` and `HOME` are unset or empty.
 pub fn data_home() -> io::Result<PathBuf> {
     ProfileStore::data_home()
-}
-
-/// Selected target id for the CLI convenience.
-///
-/// # Errors
-///
-/// Runtime dir missing or write failure.
-pub fn write_selected(profile: &Profile, target: &str) -> io::Result<()> {
-    let runtime = profile_runtime_dir(profile.name())?;
-    fs::create_dir_all(&runtime)?;
-    restrict_dir(&runtime)?;
-    let path = runtime.join("selected");
-    fs::write(&path, target)?;
-    restrict_file(&path)
-}
-
-/// Drops the last selected target id.
-///
-/// # Errors
-///
-/// Runtime dir missing.
-pub fn clear_selected(profile: &Profile) -> io::Result<()> {
-    let runtime = profile_runtime_dir(profile.name())?;
-    match fs::remove_file(runtime.join("selected")) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error),
-    }
-}
-
-/// Last selected target, if any.
-///
-/// # Errors
-///
-/// Runtime dir missing.
-pub fn read_selected(profile: &Profile) -> io::Result<Option<String>> {
-    let runtime = profile_runtime_dir(profile.name())?;
-    match fs::read_to_string(runtime.join("selected")) {
-        Ok(text) => Ok(Some(text.trim().to_owned())),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error),
-    }
 }

@@ -6,14 +6,13 @@
 //! processes ([ADR 0011](../docs/adrs/0011-renderer-processes-per-site.md)).
 //! The embeddable surface lives here; CDP is a peer crate.
 
-mod cli;
 mod daemon;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
 
 use browser::{AgentBuilder, Browser, NetworkSession, Profile, ProfileStore};
-use clap::{Parser, Subcommand};
+use clap::Parser;
 use logging::{Config, Level, Logger};
 
 #[derive(Parser)]
@@ -69,55 +68,20 @@ struct Cli {
     /// Run a renderer worker on stdin/stdout (internal)
     #[arg(long, hide = true)]
     renderer: bool,
-
-    #[command(subcommand)]
-    command: Option<Command>,
-}
-
-#[derive(Subcommand)]
-pub(crate) enum Command {
-    /// Create a tab and select it
-    Create {
-        /// Document URL (defaults to about:blank)
-        url: Option<String>,
-    },
-    /// List live tabs
-    List,
-    /// Select the tab later commands use
-    Select {
-        /// Target id from `list`
-        id: String,
-    },
-    /// Evaluate a script in the selected tab
-    #[command(alias = "evaluate")]
-    Eval {
-        /// Script source
-        script: String,
-    },
-    /// Navigate the selected tab
-    Navigate {
-        /// Document URL
-        url: String,
-    },
-    /// Close a tab (defaults to the selected tab)
-    Close {
-        /// Target id from `list`
-        id: Option<String>,
-    },
 }
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
     install_logger(&cli);
-    let code = run(cli);
+    let code = run(&cli);
     if !logging::flush() {
         logging::error!(target: "logging", "file log did not flush before exit");
     }
     code
 }
 
-fn run(cli: Cli) -> ExitCode {
-    if let Some(error) = mode_conflict(&cli) {
+fn run(cli: &Cli) -> ExitCode {
+    if let Some(error) = mode_conflict(cli) {
         return usage_error(error);
     }
     if cli.renderer {
@@ -145,13 +109,9 @@ fn run(cli: Cli) -> ExitCode {
     if let Some(port) = cli.webdriver {
         return serve_webdriver(port, builder, &cli.profile);
     }
-    if let Some(command) = cli.command {
-        cli::run(&cli.profile, command)
-    } else {
-        let mut command = <Cli as clap::CommandFactory>::command();
-        let _result = command.print_help();
-        ExitCode::from(2)
-    }
+    let mut command = <Cli as clap::CommandFactory>::command();
+    let _result = command.print_help();
+    ExitCode::from(2)
 }
 
 /// Installs the process logger for the mode and flags this invocation selected.
@@ -218,9 +178,8 @@ fn resolve_builder(specs: &[String]) -> Result<AgentBuilder, String> {
 
 fn mode_conflict(cli: &Cli) -> Option<&'static str> {
     if cli.renderer {
-        if cli.daemon || cli.webdriver.is_some() || !cli.resolve.is_empty() || cli.command.is_some()
-        {
-            return Some("--renderer does not accept other modes or commands");
+        if cli.daemon || cli.webdriver.is_some() || !cli.resolve.is_empty() {
+            return Some("--renderer does not accept other modes or flags");
         }
         return None;
     }
@@ -232,9 +191,6 @@ fn mode_conflict(cli: &Cli) -> Option<&'static str> {
     }
     if !cli.resolve.is_empty() {
         return Some("--daemon and --resolve are mutually exclusive");
-    }
-    if cli.command.is_some() {
-        return Some("--daemon does not accept a command");
     }
     None
 }
