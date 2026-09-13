@@ -53,6 +53,15 @@ pub fn run(profile: &Profile, data_home: &Path) -> io::Result<()> {
         addr.port()
     );
     let browser = Browser::open_in(data_home, profile)?;
+    // Real browsers start with one page target; clients (Playwright included)
+    // assume at least one top-level traversable exists.
+    let initial = browser
+        .handle()
+        .create_tab()
+        .map_err(|error| io::Error::other(error.to_string()))?;
+    initial
+        .load_html("<!doctype html><title></title>")
+        .map_err(|error| io::Error::other(error.to_string()))?;
     let result = cdp::serve(&listener, &browser.handle());
     let _ = fs::remove_file(&lock_path);
     result

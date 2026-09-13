@@ -146,6 +146,32 @@ fn wait_for_renderers(daemon: u32, expect_empty: bool, timeout: Duration) {
     }
 }
 
+fn wait_for_renderer_count(daemon: u32, expected: usize, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if renderer_children(daemon).len() == expected {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "renderer count never reached {expected}: {:?}",
+            renderer_children(daemon)
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn target_ids(client: &mut cdp::Client) -> Vec<String> {
+    client
+        .call("Target.getTargets", &json!({}), None)
+        .expect("targets")["targetInfos"]
+        .as_array()
+        .expect("targetInfos")
+        .iter()
+        .map(|info| info["targetId"].as_str().expect("targetId").to_owned())
+        .collect()
+}
+
 fn spawn(fixture: &mut Fixture) -> (cdp::Client, String) {
     fixture.spawn_daemon();
     let _ = fixture.wait_json();
@@ -195,10 +221,15 @@ fn renderer_process_runs_classic_scripts_and_fetches() {
     });
 
     let mut fixture = Fixture::new("tinybrowser-renderer");
-    let (mut client, created) = spawn(&mut fixture);
+    fixture.spawn_daemon();
+    let _ = fixture.wait_json();
+    let mut client = fixture.connect();
     let daemon = daemon_pid(&fixture);
+    wait_for_renderers(daemon, false, Duration::from_secs(5));
+    let initial_renderers = renderer_children(daemon).len();
+    let created = create(&mut client);
     assert!(
-        !renderer_children(daemon).is_empty(),
+        renderer_children(daemon).len() > initial_renderers,
         "create must spawn a --renderer child of the daemon"
     );
     navigate(&mut client, &created, &format!("http://{addr}/page"));
@@ -273,12 +304,27 @@ fn close_interrupts_a_running_script_in_the_renderer_process() {
 #[test]
 fn closing_an_opaque_page_reaps_its_renderer_process() {
     let mut fixture = Fixture::new("tinybrowser-renderer");
-    let (mut client, created) = spawn(&mut fixture);
+    fixture.spawn_daemon();
+    let _ = fixture.wait_json();
+    let mut client = fixture.connect();
     let daemon = daemon_pid(&fixture);
     wait_for_renderers(daemon, false, Duration::from_secs(5));
+    let initial_targets = target_ids(&mut client);
+    assert_eq!(
+        initial_targets.len(),
+        1,
+        "daemon starts with one initial tab"
+    );
+    let before = renderer_children(daemon).len();
 
+    let created = create(&mut client);
+    wait_for_renderer_count(daemon, before + 1, Duration::from_secs(5));
     close(&mut client, &created);
-    wait_for_renderers(daemon, true, Duration::from_secs(5));
+    wait_for_renderer_count(daemon, before, Duration::from_secs(5));
+
+    // The daemon's initial tab keeps its renderer; close it too.
+    close(&mut client, &initial_targets[0]);
+    wait_for_renderer_count(daemon, 0, Duration::from_secs(5));
 }
 
 #[test]

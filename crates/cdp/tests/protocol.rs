@@ -216,6 +216,8 @@ fn json_discovery_page_socket_close_target_and_browser_close() {
 
     let (status, version) = http_get(addr, "/json/version");
     assert_eq!(status, 200);
+    let (slash_status, _) = http_get(addr, "/json/version/");
+    assert_eq!(slash_status, 200, "legacy clients append a trailing slash");
     let version: serde_json::Value = serde_json::from_str(&version).expect("version json");
     assert_eq!(version["Browser"], json!("tinybrowser/0.1.0"));
     assert_eq!(
@@ -226,7 +228,11 @@ fn json_discovery_page_socket_close_target_and_browser_close() {
     let (status, list) = http_get(addr, "/json/list");
     assert_eq!(status, 200);
     let list: serde_json::Value = serde_json::from_str(&list).expect("list json");
-    let page_url = list[0]["webSocketDebuggerUrl"].as_str().expect("page ws");
+    let entry = list
+        .as_array()
+        .and_then(|items| items.iter().find(|item| item["id"] == json!(target_id)))
+        .expect("created target in discovery");
+    let page_url = entry["webSocketDebuggerUrl"].as_str().expect("page ws");
     assert!(
         page_url.ends_with(&format!("/devtools/page/{target_id}")),
         "{page_url}"

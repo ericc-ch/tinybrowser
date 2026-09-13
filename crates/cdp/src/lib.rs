@@ -20,9 +20,8 @@ use std::time::{Duration, Instant};
 
 use axum::Router;
 use axum::extract::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade};
-use axum::extract::{Path, Request, State};
+use axum::extract::{Path, State};
 use axum::http::StatusCode;
-use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Json, Response};
 use axum::routing::get;
 use browser::{BrowserHandle, RemoteValue, TabError, TabEvent, TabHandle, TabId};
@@ -58,43 +57,41 @@ pub fn serve(listener: &TcpListener, browser: &BrowserHandle) -> io::Result<()> 
             bound,
             stop: stop.clone(),
         };
+        let version =
+            get(|State(state): State<AppState>| async move { Json(version_json(&state)) });
+        let discovery = get(discovery);
+        let browser_socket = get(
+            |ws: WebSocketUpgrade, State(state): State<AppState>| async move {
+                ws.on_upgrade(move |socket| run_socket(socket, state, None))
+            },
+        );
+        let page_socket = get(
+            |Path(raw): Path<String>,
+             ws: WebSocketUpgrade,
+             State(state): State<AppState>| async move {
+                let Ok(id) = raw.parse::<u64>() else {
+                    return (StatusCode::BAD_REQUEST, "invalid page target").into_response();
+                };
+                match state.browser.tab(TabId::new(id)) {
+                    Ok(tab) => ws.on_upgrade(move |socket| run_socket(socket, state, Some(tab))),
+                    Err(_) => (StatusCode::NOT_FOUND, "unknown page target").into_response(),
+                }
+            },
+        );
+        // Legacy CDP clients (Playwright included) append a trailing slash to
+        // discovery URLs; register both spellings rather than relying on a
+        // middleware layer, which axum does not apply to fallbacks.
         let app = Router::new()
-            .route(
-                "/json/version",
-                get(|State(state): State<AppState>| async move { Json(version_json(&state)) }),
-            )
-            .route("/json", get(discovery))
-            .route("/json/list", get(discovery))
-            .route(
-                "/devtools/browser",
-                get(
-                    |ws: WebSocketUpgrade, State(state): State<AppState>| async move {
-                        ws.on_upgrade(move |socket| run_socket(socket, state, None))
-                    },
-                ),
-            )
-            .route(
-                "/devtools/page/{id}",
-                get(
-                    |Path(raw): Path<String>,
-                     ws: WebSocketUpgrade,
-                     State(state): State<AppState>| async move {
-                        let Ok(id) = raw.parse::<u64>() else {
-                            return (StatusCode::BAD_REQUEST, "invalid page target")
-                                .into_response();
-                        };
-                        match state.browser.tab(TabId::new(id)) {
-                            Ok(tab) => {
-                                ws.on_upgrade(move |socket| run_socket(socket, state, Some(tab)))
-                            }
-                            Err(_) => {
-                                (StatusCode::NOT_FOUND, "unknown page target").into_response()
-                            }
-                        }
-                    },
-                ),
-            )
-            .layer(middleware::from_fn(strip_trailing_slash))
+            .route("/json/version", version.clone())
+            .route("/json/version/", version)
+            .route("/json", discovery.clone())
+            .route("/json/", discovery.clone())
+            .route("/json/list", discovery.clone())
+            .route("/json/list/", discovery)
+            .route("/devtools/browser", browser_socket.clone())
+            .route("/devtools/browser/", browser_socket)
+            .route("/devtools/page/{id}", page_socket.clone())
+            .route("/devtools/page/{id}/", page_socket)
             .fallback(|| async { (StatusCode::NOT_FOUND, "not found") })
             .with_state(state);
         axum::serve(listener, app)
@@ -122,22 +119,6 @@ async fn discovery(State(state): State<AppState>) -> Response {
         Ok(value) => Json(value).into_response(),
         Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "discovery failed").into_response(),
     }
-}
-
-/// Legacy CDP clients append a trailing slash; normalize before routing.
-async fn strip_trailing_slash(mut request: Request, next: Next) -> Response {
-    let uri = request.uri().clone();
-    let path = uri.path();
-    if path.len() > 1 && path.ends_with('/') {
-        let normalized = match uri.query() {
-            Some(query) => format!("{}?{query}", path.trim_end_matches('/')),
-            None => path.trim_end_matches('/').to_owned(),
-        };
-        if let Ok(parsed) = normalized.parse() {
-            *request.uri_mut() = parsed;
-        }
-    }
-    next.run(request).await
 }
 
 fn version_json(state: &AppState) -> Value {
