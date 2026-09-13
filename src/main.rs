@@ -8,6 +8,8 @@
 
 mod cli;
 mod daemon;
+#[cfg(feature = "screenshot")]
+mod screenshot;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -104,6 +106,17 @@ pub(crate) enum Command {
         /// Target id from `list`
         id: Option<String>,
     },
+    /// Render a local HTML file to a PNG (spike; Blitz backend, no daemon)
+    #[cfg(feature = "screenshot")]
+    Screenshot {
+        /// Input HTML file
+        html: PathBuf,
+        /// Output PNG file
+        out: PathBuf,
+        /// Font file (TTF/OTF) that resolves every generic family (spike-only)
+        #[arg(long, value_name = "PATH")]
+        font: PathBuf,
+    },
 }
 
 fn main() -> ExitCode {
@@ -137,6 +150,10 @@ fn run(cli: Cli) -> ExitCode {
                 ExitCode::from(1)
             }
         };
+    }
+    #[cfg(feature = "screenshot")]
+    if let Some(Command::Screenshot { html, out, font }) = &cli.command {
+        return screenshot::run(html, out, font);
     }
     let builder = match resolve_builder(&cli.resolve) {
         Ok(builder) => builder,
