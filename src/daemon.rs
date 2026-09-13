@@ -37,14 +37,6 @@ pub fn run(profile: &Profile, data_home: &Path) -> io::Result<()> {
     let lock_path = runtime.join("lock");
     let listener = TcpListener::bind(("127.0.0.1", 0))?;
     let addr = listener.local_addr()?;
-    write_endpoint(
-        &runtime,
-        &DaemonEndpoint {
-            pid: std::process::id(),
-            host: "127.0.0.1".into(),
-            port: addr.port(),
-        },
-    )?;
     logging::debug!(target: "daemon", "runtime dir {}", runtime.display());
     logging::info!(
         target: "daemon",
@@ -62,6 +54,16 @@ pub fn run(profile: &Profile, data_home: &Path) -> io::Result<()> {
     initial
         .load_html("<!doctype html><title></title>")
         .map_err(|error| io::Error::other(error.to_string()))?;
+    // Publish only once the browser can actually serve; a start-up failure
+    // must not leave an endpoint pointing at a dead port.
+    write_endpoint(
+        &runtime,
+        &DaemonEndpoint {
+            pid: std::process::id(),
+            host: "127.0.0.1".into(),
+            port: addr.port(),
+        },
+    )?;
     let result = cdp::serve(&listener, &browser.handle());
     let _ = fs::remove_file(&lock_path);
     result
