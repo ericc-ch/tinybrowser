@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html>
+<head>
+<style>
+  :root { color-scheme: light; }
+  html, body { margin: 0; padding: 0; }
+  body {
+    font-family: sans-serif;
+    background: #eef1f5;
+    color: #1c2430;
+  }
+  header {
+    background: linear-gradient(90deg, #1b2a4a, #27558f);
+    color: #ffffff;
+    padding: 24px 32px;
+  }
+  header h1 { margin: 0; font-size: 28px; }
+  header p { margin: 6px 0 0; opacity: 0.85; }
+  main { padding: 24px 32px; }
+  .cards { display: flex; gap: 16px; }
+  .card {
+    flex: 1 1 0;
+    background: #ffffff;
+    border: 1px solid #d3dae4;
+    border-radius: 10px;
+    padding: 16px;
+    box-shadow: 0 2px 6px rgba(20, 30, 50, 0.12);
+  }
+  .card h2 { margin: 0 0 8px; font-size: 18px; }
+  .swatches { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin-top: 12px; }
+  .swatch { height: 48px; border-radius: 6px; }
+  .s1 { background: #e5484d; }
+  .s2 { background: #30a46c; }
+  .s3 { background: #0091ff; }
+  table { width: 100%; border-collapse: collapse; margin-top: 20px; background: #ffffff; }
+  th, td { text-align: left; padding: 8px 12px; border-bottom: 1px solid #e2e8f0; }
+  th { background: #f7f9fc; }
+  tr:last-child td { border-bottom: none; }
+  footer { padding: 16px 32px; color: #5b6775; font-size: 13px; }
+</style>
+</head>
+<body>
+  <header>
+    <h1>tinybrowser screenshot probe</h1>
+    <p>Blitz style + layout, vello_cpu raster, one PNG, no window.</p>
+  </header>
+  <main>
+    <div class="cards">
+      <div class="card">
+        <h2>Flex card</h2>
+        <p>Three cards in a flex row, each with a border, radius and shadow.</p>
+        <div class="swatches">
+          <div class="swatch s1"></div>
+          <div class="swatch s2"></div>
+          <div class="swatch s3"></div>
+        </div>
+      </div>
+      <div class="card">
+        <h2>Text</h2>
+        <p>Regular, <b>bold</b> and <i>italic</i> runs. Text shaping and glyph cache come from Parley.</p>
+      </div>
+      <div class="card">
+        <h2>Layout</h2>
+        <p>Block margins, flex gap and a grid of swatches, resolved by Taffy under Stylo.</p>
+      </div>
+    </div>
+    <table>
+      <tr><th>Stage</th><th>Owner</th><th>Cost</th></tr>
+      <tr><td>Parse HTML</td><td>html5ever</td><td>measured</td></tr>
+      <tr><td>Cascade</td><td>Stylo</td><td>measured</td></tr>
+      <tr><td>Box tree</td><td>Taffy</td><td>measured</td></tr>
+      <tr><td>Raster</td><td>vello_cpu</td><td>measured</td></tr>
+    </table>
+  </main>
+  <footer>Rendered by the Blitz spike, not by the shipping tinybrowser engine.</footer>
+</body>
+</html>

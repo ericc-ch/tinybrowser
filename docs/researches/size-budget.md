@@ -463,3 +463,77 @@ number defaults and option-read order, exact BigInt and decimal-string output,
 currency and sign behavior, locale alias canonicalization, date/time styles,
 and prototype methods. This explicit target is evidence for the implemented
 slice, not a substitute for a future full `intl402` conformance run.
+
+## Spike: Blitz one-shot screenshot (2026-09-13)
+
+Branch `spike/blitz-screenshot` answers the question opened in
+`projects/tinybrowser/screenshot.md` (Obsidian): what does HTML -> layout ->
+CPU raster -> PNG actually cost in the shipping binary?
+
+Stack measured: Blitz 0.3.0-beta.2 lean (`blitz-dom` + `blitz-html` +
+`blitz-traits`, `default-features = false`), styles and layout via Stylo 0.20
+and Taffy 0.14, paint via `blitz-paint` (anyrender 0.13) into
+`anyrender_vello_cpu` 0.17 (vello_cpu 0.1), PNG via `png` 0.17. Fonts come
+from one supplied TTF through `build_single_font_ctx` (no system-font
+discovery, no fontconfig). rustc 1.98.0, tuned profile, stripped, x86_64.
+
+Standalone probe (`spikes/blitz-screenshot`, empty bin = 290,944 bytes):
+
+| Rung | Bytes | Delta |
+| --- | ---: | ---: |
+| empty bin | 290,944 | — |
+| + Blitz parse + resolve + resolve_layout | 6,236,256 | +5,945,312 |
+| + blitz-paint + anyrender + vello_cpu + png | 8,573,248 | +8,282,304 |
+
+Shipping CLI (`nix develop --command cargo build --release --bin tinybrowser`):
+
+| Build | Bytes | Delta |
+| --- | ---: | ---: |
+| baseline (feature off) | 5,810,304 | — |
+| `--features screenshot`, layout only (paint crates enabled but unreferenced) | 10,788,304 | +4,978,000 |
+| `--features screenshot`, full render + PNG | 13,113,008 | +7,302,704 |
+
+Findings:
+
+- The standalone layout rung (+5.95 MB) reproduces the +5.4 MB estimate in the
+  Obsidian note. The vello_cpu paint backend adds +2.34 MB on top.
+- Deduplication with existing workspace crates (html5ever 0.39, url, fontique)
+  saves ~0.98 MB: +8.28 MB standalone becomes +7.30 MB on the CLI.
+- **The layout rung alone crosses the 10,000,000 byte ceiling** (10.79 MB).
+  Paint, PNG, and font bytes are not the blocker; Blitz's Stylo + Taffy +
+  Parley integration is. A tiny-skia backend cannot fix this by itself
+  (tiny-skia's probe delta was +221 KB against +2.34 MB for vello_cpu).
+- One-shot output is deterministic and fast: a 1000x800 page renders in ~20 ms
+  wall (parse + style + layout + raster + PNG), byte-identical across runs.
+- Fidelity is real-CSS-subset quality: flex, grid, gradients, border-radius,
+  box-shadow, and text shaping render correctly; `border-collapse` table
+  borders show artifacts (Blitz paint, not the probe wiring).
+
+Consequence: arbitrary-page screenshots via Blitz need an explicit product
+decision (raise the ceiling past ~13 MB for the full stack, or fall back to the
+Taffy + own-cascade subset for agent-UI pages) before any paint work starts.
+The spike code is not merged; it exists to price the decision.
+
+### Follow-up: trim experiments (2026-09-13)
+
+Same branch, same profile. Levers measured against those numbers:
+
+| Lever | Effect | Cost |
+| --- | ---: | --- |
+| `panic = "abort"` in the release profile | −1,190,368 B on the full CLI (13,113,008 → 11,922,640); −527,520 B feature-off | rquickjs catches panics at the C callback boundary; abort turns a panicking JS-op into renderer-process death instead of a JS error |
+| `-C relocation-model=static` (non-PIE) | −574,240 B on the probe (net of a larger `.rodata` and smaller `.rela.dyn`) | loses ASLR; renderer content is untrusted |
+| ICF (`-fuse-ld=lld -Wl,--icf=all`) | −107,392 B on the probe, PIE kept | lld must join the build toolchain |
+| `-C force-unwind-tables=no` | 0 B (stripping already drops local CFI) | none |
+| `image` default codecs | already absent: blitz-dom sets `default-features = false` | — |
+| UPX `--best --lzma` (full CLI, abort) | 11,922,640 → 3,716,652 B (31.2%) | ~186 ms added to every process start, including renderer spawns; AV/EDR flagging |
+
+`cargo bloat` on the probe (`.text` = 5.0 MiB): Stylo 1.4 MiB, vello_cpu
+1.0 MiB, blitz_dom 711 KiB, std 426 KiB, Parley stack (skrifa + harfrust +
+read_fonts + fontique + parley) 690 KiB. Isolated probes: a `fontdue` stack
+costs +116 KB against that Parley stack (~570 KB saving, complex scripts
+lost).
+
+Scenario to stay under 10,000,000 with Blitz: 13,113,008 → 11,922,640
+(abort) → ~11.35 MB (non-PIE, probe-scaled estimate) → ~10.3 MB (tiny-skia
+paint backend) → ~9.7 MB (fontdue text) and a little more with ICF. Every
+lever is required, including the panic-policy and ASLR calls.

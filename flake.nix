@@ -33,6 +33,15 @@
         nativeBuildInputs = [
           rustToolchain
           pkgs.pkg-config
+          # Size-budget and spike toolchain. Stylo's build script needs a
+          # `python3` on PATH; the rest reproduce the measurements in
+          # docs/researches/size-budget.md and spikes/blitz-screenshot.
+          pkgs.python3
+          pkgs.cargo-bloat
+          pkgs.lld
+          pkgs.upx
+          pkgs.xz
+          pkgs.binutils
         ];
         buildInputs = [
           pkgs.openssl

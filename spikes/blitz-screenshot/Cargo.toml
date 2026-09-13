@@ -1,0 +1,32 @@
+[package]
+name = "blitz-screenshot"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# Throwaway probe: HTML -> Blitz style/layout -> anyrender paint -> PNG.
+# Third-party ranges are deliberately not shared with the workspace lock:
+# this spike answers "what does the stack cost", not "how do we wire it".
+[dependencies]
+anyrender = "0.13"
+anyrender_vello_cpu = "0.17"
+blitz-dom = { version = "=0.3.0-beta.2", default-features = false }
+blitz-html = { version = "=0.3.0-beta.2", default-features = false }
+blitz-paint = { version = "=0.3.0-beta.2", default-features = false }
+blitz-traits = "=0.3.0-beta.2"
+peniko = "0.6"
+png = "0.17"
+
+[features]
+# Off by default: the interesting question is the cost without system fonts.
+# fontconfig is also a system dependency the shipping binary must not need.
+system-fonts = ["blitz-dom/system-fonts"]
+
+# Mirrors the workspace release profile so measurements compare with
+# docs/researches/size-budget.md checkpoints.
+[profile.release]
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+strip = true
+panic = "abort"

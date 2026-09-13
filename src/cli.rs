@@ -36,6 +36,12 @@ fn run_inner(profile: &Profile, command: Command) -> io::Result<()> {
         Command::Eval { script } => evaluate(&mut client, profile, &script),
         Command::Navigate { url } => navigate(&mut client, profile, &url),
         Command::Close { id } => close(&mut client, profile, id.as_deref()),
+        // The CLI renders this command in-process before the daemon path; the
+        // arm only keeps the match exhaustive when the spike feature is on.
+        #[cfg(feature = "screenshot")]
+        Command::Screenshot { .. } => Err(io::Error::other(
+            "screenshot renders in-process and never reaches the daemon",
+        )),
     }
 }
 
