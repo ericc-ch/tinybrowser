@@ -20,6 +20,7 @@ use html5ever::tree_builder::{ElementFlags, NodeOrText, QuirksMode, TreeSink};
 use markup5ever::interface::{TokenizerResult, tree_builder::ElemName};
 use tendril::{StrTendril, TendrilSink};
 
+mod channel;
 mod document;
 mod documents;
 mod engine;
@@ -30,15 +31,18 @@ mod remote;
 mod serialize;
 mod xml;
 
+pub use channel::{
+    Frame, FrameKind, HEADER_BYTES, MAX_BODY_CHUNK_BYTES, MAX_CONTROL_BYTES, PROTOCOL_VERSION,
+    read_body, read_control, read_frame, write_body, write_control, write_frame,
+};
 use document::Stop;
 use engine::Engine;
-pub use process::serve_stdio;
+pub use process::serve;
 use protocol::BrowserServices;
 pub use protocol::{
-    Command, DialKind, DialOutcome, DialRequest, FrameId, FromRenderer, MAX_IPC_MESSAGE_BYTES,
-    Mount, RENDERER_INBOX_CAPACITY, RENDERER_OUTBOX_CAPACITY, Reply, ResourceLimit, ScriptFailure,
-    ServiceCall, ServiceReply, TabError, TabEvent, ToRenderer, encode_ipc_message,
-    read_ipc_message,
+    Command, DialKind, DialOutcome, DialRequest, FrameId, FromRenderer, Mount,
+    RENDERER_INBOX_CAPACITY, RENDERER_OUTBOX_CAPACITY, Reply, ResourceLimit, ScriptFailure,
+    ServiceCall, ServiceReply, TabError, TabEvent, ToRenderer,
 };
 pub use remote::RemoteValue;
 
@@ -188,8 +192,9 @@ fn run(
                     break;
                 }
             }
-            // Service replies are routed by the transport, never delivered here.
-            Ok(ToRenderer::ServiceReply { .. }) => {}
+            // Service replies are routed by the transport; the handshake is
+            // consumed before this loop starts.
+            Ok(ToRenderer::ServiceReply { .. } | ToRenderer::Hello) => {}
             Err(RecvTimeoutError::Timeout) => engine.drive_for(Duration::from_millis(10)),
             Err(RecvTimeoutError::Disconnected) => break,
         }

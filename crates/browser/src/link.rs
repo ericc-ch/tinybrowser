@@ -1,12 +1,12 @@
 //! Browser side of the renderer seam: factory, handles, and routing pumps.
 //!
-//! [ADR 0011](../../../docs/adrs/0011-renderer-processes-per-site.md): the
-//! handle is value-only; replies, events, and browser-service calls cross a
-//! pipe.
+//! [ADR 0019](../../../docs/adrs/0019-async-browser-runtime-and-io.md): the
+//! handle is value-only; replies, events, and browser-service calls cross one
+//! private platform channel in length-prefixed frames.
 
 use std::collections::HashMap;
-use std::io::{self, BufRead, BufReader, Write};
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::io::{self, BufRead, BufReader, Read, Write};
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -161,15 +161,12 @@ impl RendererFactory {
 }
 
 #[derive(Clone)]
-struct Sink(Arc<Mutex<ChildStdin>>);
+struct Sink(Arc<Mutex<Box<dyn Write + Send>>>);
 
 impl Sink {
     fn send(&self, message: &ToRenderer) -> io::Result<()> {
-        let line = renderer::encode_ipc_message(message)?;
-        let mut stdin = self.0.lock().unwrap_or_else(PoisonError::into_inner);
-        stdin.write_all(&line)?;
-        stdin.write_all(b"\n")?;
-        stdin.flush()
+        let mut writer = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        renderer::write_control(&mut *writer, message)
     }
 
     fn shutdown(&self) -> io::Result<()> {
@@ -183,14 +180,36 @@ impl Sink {
 
 struct RendererViolation;
 
-fn spawn_process(id: RendererId, site: &Site, fetch: FetchHandle) -> io::Result<RendererHandle> {
-    let mut command = Command::new(std::env::current_exe()?);
+/// One spawned child and its host-side channel endpoints.
+struct SpawnedRenderer {
+    child: Child,
+    reader: Box<dyn Read + Send>,
+    writer: Box<dyn Write + Send>,
+}
+
+/// Spawns one renderer child and returns its host-side reader and writer.
+///
+/// Unix passes one end of an unnamed socket pair as the child's file
+/// descriptor 0. Other platforms keep the piped stdin/stdout transport until
+/// their platform channel lands.
+#[cfg(unix)]
+fn spawn_transport(command: &mut Command) -> io::Result<SpawnedRenderer> {
+    let (host, child_end) = std::os::unix::net::UnixStream::pair()?;
     command
-        .arg("renderer")
-        .env("TINYBROWSER_LOG", logging::level().as_str())
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .stdin(Stdio::from(std::os::fd::OwnedFd::from(child_end)))
+        .stdout(Stdio::null());
+    let child = command.spawn()?;
+    let writer = host.try_clone()?;
+    Ok(SpawnedRenderer {
+        child,
+        reader: Box::new(host),
+        writer: Box::new(writer),
+    })
+}
+
+#[cfg(not(unix))]
+fn spawn_transport(command: &mut Command) -> io::Result<SpawnedRenderer> {
+    command.stdin(Stdio::piped()).stdout(Stdio::piped());
     let mut child = command.spawn()?;
     let Some(stdin) = child.stdin.take() else {
         let _ = child.kill();
@@ -202,13 +221,31 @@ fn spawn_process(id: RendererId, site: &Site, fetch: FetchHandle) -> io::Result<
         let _ = child.wait();
         return Err(io::Error::other("renderer stdout missing"));
     };
+    Ok(SpawnedRenderer {
+        child,
+        reader: Box::new(stdout),
+        writer: Box::new(stdin),
+    })
+}
+
+fn spawn_process(id: RendererId, site: &Site, fetch: FetchHandle) -> io::Result<RendererHandle> {
+    let mut command = Command::new(std::env::current_exe()?);
+    command
+        .arg("renderer")
+        .env("TINYBROWSER_LOG", logging::level().as_str())
+        .stderr(Stdio::piped());
+    let SpawnedRenderer {
+        mut child,
+        reader,
+        writer,
+    } = spawn_transport(&mut command)?;
     let Some(stderr) = child.stderr.take() else {
         let _ = child.kill();
         let _ = child.wait();
         return Err(io::Error::other("renderer stderr missing"));
     };
     let child = Arc::new(Mutex::new(child));
-    let sink = Sink(Arc::new(Mutex::new(stdin)));
+    let sink = Sink(Arc::new(Mutex::new(writer)));
     let pending = Arc::new(Mutex::new(HashMap::new()));
     let alive = Arc::new(AtomicBool::new(true));
     let subscribers = Arc::new(Mutex::new(Vec::new()));
@@ -232,14 +269,16 @@ fn spawn_process(id: RendererId, site: &Site, fetch: FetchHandle) -> io::Result<
                 site: &pump_site,
                 child: &pump_child,
             };
-            pump_loop(BufReader::new(stdout), &context, Some(ready_tx));
+            pump_loop(reader, &context, Some(ready_tx));
         })
         .expect("renderer pump thread");
     let stderr_join = thread::Builder::new()
         .name(format!("renderer-{id:?}-stderr"))
         .spawn(move || forward_stderr(stderr))
         .expect("renderer stderr thread");
-    if ready_rx.recv_timeout(HANDSHAKE_TIMEOUT) != Ok(true) {
+    if sink.send(&ToRenderer::Hello).is_err()
+        || ready_rx.recv_timeout(HANDSHAKE_TIMEOUT) != Ok(true)
+    {
         let mut child = child.lock().unwrap_or_else(PoisonError::into_inner);
         let _ = child.kill();
         let _ = child.wait();
@@ -379,14 +418,14 @@ fn forward_stderr(stderr: std::process::ChildStderr) {
 }
 
 fn pump_loop(
-    mut reader: BufReader<std::process::ChildStdout>,
+    mut reader: Box<dyn Read + Send>,
     context: &PumpContext<'_>,
     ready: Option<Sender<bool>>,
 ) {
     let mut ready = ready;
     let mut buffer = Vec::new();
     loop {
-        let message = match renderer::read_ipc_message(&mut reader, &mut buffer) {
+        let message = match renderer::read_control::<FromRenderer>(&mut reader, &mut buffer) {
             Ok(Some(message)) => message,
             Ok(None) => break,
             Err(error) => {

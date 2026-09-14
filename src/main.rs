@@ -65,7 +65,7 @@ enum Command {
         )]
         profile: Profile,
     },
-    /// Run a renderer worker on stdin/stdout
+    /// Run a renderer worker on its private platform channel
     Renderer,
     /// Serve classic `WebDriver` on this loopback port
     Webdriver {
@@ -98,7 +98,7 @@ fn main() -> ExitCode {
 
 fn run(cli: &Cli) -> ExitCode {
     match &cli.command {
-        Some(Command::Renderer) => match renderer::serve_stdio() {
+        Some(Command::Renderer) => match renderer::serve() {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
                 logging::error!(target: "renderer", "{error}");

@@ -496,3 +496,21 @@ This is not the workspace marginal because tinybrowser already links Tokio and
 hyper through axum. The 1.01 MB standalone delta fits the 4,231,840-byte headroom
 from the preceding shipping binary. The checkpoint that integrates net v2 must
 record the authoritative shipping-binary size.
+
+## Milestone: async shell and platform channel, P2-P4 (2026-09-15)
+
+The first v2 checkpoints moved the browser runtime into the executable, made
+`BrowserHandle` and `TabHandle` async-only with one browser task and one tab
+coordinator task per tab, and replaced the renderer stdin/stdout JSON lines with
+a length-prefixed frame protocol over an inherited Unix socket pair. Command:
+`nix develop --command cargo build --release --bin tinybrowser`; rustc 1.98.0,
+stripped x86_64 release profile.
+
+| Artifact | Baseline `c67c22a` | After P2-P4 | Delta | Headroom to 10,000,000 |
+| --- | ---: | ---: | ---: | ---: |
+| CLI (`target/release/tinybrowser`) | 5,768,160 | 5,857,840 | **+89,680** | 4,142,160 |
+
+The delta covers three checkpoints: executable-owned runtime, async owner tasks
+replacing the registry mutex and per-tab threads, and the framed platform
+channel. It includes the Tokio `rt`/`sync`/`time`/`macros` features that the
+browser crate now enables directly.

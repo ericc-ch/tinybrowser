@@ -176,10 +176,7 @@ fn serializes_as_void(name: &QualName) -> bool {
 /// SVG elements, the qualified name otherwise
 /// (<https://html.spec.whatwg.org/multipage/parsing.html#serialising-html-fragments>).
 fn push_html_element_name(output: &mut String, name: &QualName) {
-    if name.ns == html_namespace()
-        || name.ns == svg_namespace()
-        || name.ns.as_ref() == MATHML_NS
-    {
+    if name.ns == html_namespace() || name.ns == svg_namespace() || name.ns.as_ref() == MATHML_NS {
         output.push_str(name.local.as_ref());
     } else {
         push_qualified_name(output, name.prefix.as_ref(), &name.local);
@@ -447,11 +444,8 @@ impl<'a> XmlSerializer<'a> {
             map: inherited_map.clone(),
             local_prefixes: Vec::new(),
         };
-        let local_default = record_namespace_information(
-            attributes,
-            &mut scope.map,
-            &mut scope.local_prefixes,
-        );
+        let local_default =
+            record_namespace_information(attributes, &mut scope.map, &mut scope.local_prefixes);
         let mut child_context = context.map(str::to_owned);
         let mut defaults = DefaultDeclarationHandling::Keep;
         let qualified;
@@ -516,8 +510,9 @@ impl<'a> XmlSerializer<'a> {
                             child_context = inherit_default(value);
                         }
                     } else {
-                        let declared =
-                            local_default.as_deref().is_some_and(|value| normalize(value) == ns);
+                        let declared = local_default
+                            .as_deref()
+                            .is_some_and(|value| normalize(value) == ns);
                         qualified = name.local.to_string();
                         output.push_str(&qualified);
                         if declared {
@@ -599,15 +594,18 @@ impl<'a> XmlSerializer<'a> {
                 }
                 if self.require_well_formed
                     && attribute.name.local.as_ref() != "xmlns"
-                    && (attribute.value.is_empty()
-                        || attribute.value == xmlns_namespace().as_ref())
+                    && (attribute.value.is_empty() || attribute.value == xmlns_namespace().as_ref())
                 {
                     return Err(XmlSerializeError);
                 }
                 let declared_here = scope.local_prefixes.iter().any(|(name, ns)| {
                     name == local && ns.as_deref() == normalize(&attribute.value)
                 });
-                if scope.map.contains_prefix(normalize(&attribute.value), local) && !declared_here {
+                if scope
+                    .map
+                    .contains_prefix(normalize(&attribute.value), local)
+                    && !declared_here
+                {
                     continue;
                 }
                 Some("xmlns".to_owned())
@@ -754,8 +752,7 @@ fn record_namespace_information(
 /// namespace (parsed) or not (created with `setAttribute`).
 fn is_default_declaration(attribute: &Attribute) -> bool {
     attribute.name.prefix.is_none()
-        && (attribute.name.ns == xmlns_namespace()
-            || attribute.name.local.as_ref() == "xmlns")
+        && (attribute.name.ns == xmlns_namespace() || attribute.name.local.as_ref() == "xmlns")
 }
 
 /// The element's namespace after a locally declared default declaration;

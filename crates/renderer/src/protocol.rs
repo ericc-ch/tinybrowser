@@ -5,112 +5,18 @@
 //! `QuickJS` values, callbacks, and `net` types never do.
 
 use std::fmt;
-use std::io::{self, BufRead, Read, Write};
 use std::sync::Arc;
 
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde::{Deserialize, Serialize};
 use url::Url;
 
 use crate::RemoteValue;
-
-/// Maximum encoded size of one browser/renderer IPC message.
-///
-/// Navigation bodies are capped at 1 MiB by the browser. The larger wire cap
-/// leaves room for JSON's byte-array expansion and structured script results
-/// while bounding allocation before deserialization.
-pub const MAX_IPC_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
 
 /// Maximum browser-to-renderer commands retained by one renderer transport.
 pub const RENDERER_INBOX_CAPACITY: usize = 256;
 
 /// Maximum renderer-to-browser messages retained by one renderer transport.
 pub const RENDERER_OUTBOX_CAPACITY: usize = 4096;
-
-/// Encodes one newline-delimited IPC message after enforcing the wire budget.
-///
-/// # Errors
-///
-/// Serialization failure or a message larger than [`MAX_IPC_MESSAGE_BYTES`].
-pub fn encode_ipc_message<T: Serialize>(message: &T) -> io::Result<Vec<u8>> {
-    let mut encoded = IpcBuffer::new();
-    serde_json::to_writer(&mut encoded, message).map_err(|error| {
-        if error.io_error_kind() == Some(io::ErrorKind::InvalidData) {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                "renderer IPC message exceeds limit",
-            )
-        } else {
-            io::Error::other(error)
-        }
-    })?;
-    Ok(encoded.bytes)
-}
-
-struct IpcBuffer {
-    bytes: Vec<u8>,
-}
-
-impl IpcBuffer {
-    fn new() -> Self {
-        Self {
-            bytes: Vec::with_capacity(1024),
-        }
-    }
-}
-
-impl Write for IpcBuffer {
-    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        if bytes.len() > MAX_IPC_MESSAGE_BYTES.saturating_sub(self.bytes.len()) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "renderer IPC message exceeds limit",
-            ));
-        }
-        self.bytes.extend_from_slice(bytes);
-        Ok(bytes.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
-
-/// Reads one newline-delimited IPC message without permitting an unbounded
-/// line allocation.
-///
-/// # Errors
-///
-/// I/O failure, invalid JSON, a missing delimiter, or an oversized message.
-pub fn read_ipc_message<T: DeserializeOwned>(
-    reader: &mut impl BufRead,
-    buffer: &mut Vec<u8>,
-) -> io::Result<Option<T>> {
-    buffer.clear();
-    let mut limited = reader.take((MAX_IPC_MESSAGE_BYTES + 2) as u64);
-    let read = limited.read_until(b'\n', buffer)?;
-    if read == 0 {
-        return Ok(None);
-    }
-    if !buffer.ends_with(b"\n") {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "renderer IPC message exceeds limit or is not delimited",
-        ));
-    }
-    buffer.pop();
-    if buffer.ends_with(b"\r") {
-        buffer.pop();
-    }
-    if buffer.len() > MAX_IPC_MESSAGE_BYTES {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "renderer IPC message exceeds limit",
-        ));
-    }
-    serde_json::from_slice(buffer)
-        .map(Some)
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
-}
 
 /// Renderer-process identity of one frame.
 ///
@@ -312,6 +218,8 @@ pub enum Reply {
 /// Host to renderer traffic.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum ToRenderer {
+    /// First frame from the browser process: protocol handshake.
+    Hello,
     /// One command with its correlation id.
     Request {
         /// Request id chosen by the browser process.
@@ -500,24 +408,22 @@ mod tests {
     }
 
     #[test]
-    fn ipc_codec_rejects_messages_over_the_wire_budget() {
+    fn control_messages_round_trip_through_the_frame_codec() {
         let message = ToRenderer::Request {
             id: 1,
             command: Command::Eval {
                 frame: FrameId::MAIN,
-                source: "x".repeat(MAX_IPC_MESSAGE_BYTES),
+                source: "x".repeat(1024),
             },
         };
-        let error = encode_ipc_message(&message).expect_err("oversized message");
-        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-
-        let mut bytes = vec![b'0'; MAX_IPC_MESSAGE_BYTES + 1];
-        bytes.push(b'\n');
-        let mut reader = io::Cursor::new(bytes);
+        let mut bytes = Vec::new();
+        crate::channel::write_control(&mut bytes, &message).expect("write");
+        let mut reader = std::io::Cursor::new(bytes);
         let mut buffer = Vec::new();
-        let error = read_ipc_message::<serde_json::Value>(&mut reader, &mut buffer)
-            .expect_err("oversized frame");
-        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        let back: ToRenderer = crate::channel::read_control(&mut reader, &mut buffer)
+            .expect("read")
+            .expect("one frame");
+        assert!(matches!(back, ToRenderer::Request { id: 1, .. }));
     }
 
     #[test]
