@@ -6,7 +6,8 @@ exist: Chromium's **browser process** / **renderer process**, Gecko's
 **parent process** / **content process**, the HTML spec's **navigable** /
 **top-level traversable** / **Document**, and CDP's **target** / **session**.
 
-Status: accepted (2026-09-10). Supersedes the terminology of
+Status: accepted (2026-09-10) and amended by
+[ADR 0019](0019-async-browser-runtime-and-io.md). Supersedes the terminology of
 [ADR 0009](0009-named-profile-daemon.md), [ADR 0010](0010-page-actor-ownership.md),
 and [ADR 0011](0011-renderer-processes-per-site.md) where they say "host",
 "page", "HTML job", or "context". The mechanisms in those ADRs are unchanged.
@@ -39,7 +40,7 @@ and [ADR 0011](0011-renderer-processes-per-site.md) where they say "host",
   content layer calls this object a `WebContents`, and Gecko's parent process
   calls its analog the `CanonicalBrowsingContext`.
 - Code renames the `Page` family to `Tab`: `Page` → `Tab`, `PageId` → `TabId`,
-  `PageHandle` → `TabHandle`, `PageActor` → `TabActor`, `PageError` →
+  `PageHandle` → `TabHandle`, `PageActor` → tab coordinator, `PageError` →
   `TabError`, `PageEvent` → `TabEvent`, `create_page`/`close_page` →
   `create_tab`/`close_tab`, `pages()`/`page(id)` → `tabs()`/`tab(id)`.
 - "page" stays only where a protocol or the web uses it: CDP `Page.*` method

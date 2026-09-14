@@ -2,7 +2,13 @@
 
 tinybrowser ships one executable. There is no separately shipped or versioned helper such as chromedriver or Node. A CLI command starts a detached background process of that same executable when the selected profile daemon is missing. Control for CLI and external tools is CDP. Classic WebDriver is a peer adapter over the same browser, not a second owner.
 
-Status: accepted. Keeps [ADR 0007](0007-engine-charter.md) crate graph, Tokio `rt`+`time`, bounded blocking-network execution, and size/lint bounds. The `cdp` adapter is a peer crate that depends on `browser` and inbound `axum` (retired `http1` by [ADR 0012](0012-host-protocol-and-cli-stack.md)). Extends [ADR 0008](0008-wpt-via-webdriver.md): WebDriver stays the WPT driver. Browser, `TabHandle`, and `NetworkSession` live in [ADR 0010](0010-page-actor-ownership.md).
+Status: accepted and amended by
+[ADR 0019](0019-async-browser-runtime-and-io.md). The `cdp` adapter is a peer
+crate that depends on `browser` and inbound `axum` (retired `http1` by
+[ADR 0012](0012-host-protocol-and-cli-stack.md)). WebDriver stays the WPT driver.
+Browser, `TabHandle`, and `NetworkSession` live in
+[ADR 0010](0010-page-actor-ownership.md). The executable now owns one browser
+runtime, and both protocol adapters await the same async browser API.
 
 ## Process
 
@@ -30,7 +36,9 @@ CDP allows multiple client attachments. Tab actors serialize commands. Concurren
 
 Initial CLI behavior creates, lists, selects, evaluates in, navigates, and closes targets through CDP. A last-target convenience is allowed. Target IDs stay explicit and visible.
 
-Keep CDP off axum, hyper, and Tokio `full` ([ADR 0007](0007-engine-charter.md)). Prefer a small HTTP plus WebSocket server.
+Keep Tokio `full` out of every process. CDP uses axum for inbound HTTP and
+WebSockets. It runs on the executable-owned browser runtime and does not create
+a private runtime.
 
 ## WebDriver
 

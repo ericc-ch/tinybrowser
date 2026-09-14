@@ -4,25 +4,30 @@ The browser process's loopback protocol adapters and CLI stop being hand-rolled.
 for CDP and WebDriver runs on **axum** (hyper/tower); CLI parsing runs on **clap**.
 The stripped-binary ceiling moves from 5 MB to **10 MB**.
 
-Status: accepted (2026-09-10). Supersedes the "no axum/hyper" rule and the `http1`
-crate in [ADR 0007](0007-engine-charter.md). The engine charter otherwise stands:
-the renderer runtime is still Tokio current-thread `rt`+`time`, blocking work runs
-on the browser-owned executor, and the renderer path takes no web-server stack.
+Status: accepted (2026-09-10) and amended by
+[ADR 0019](0019-async-browser-runtime-and-io.md). Supersedes the "no axum/hyper"
+rule and the `http1` crate in [ADR 0007](0007-engine-charter.md). ADR 0019 moves
+runtime ownership to the executable, makes the adapters async, and uses
+hyper-util for outbound browser networking. The renderer still takes no
+web-server stack or multi-thread runtime. Axum stays during the core migration.
+The final server-stack checkpoint measures axum against direct hyper and records
+the resulting choice.
 
 ## Decision
 
-- CDP and WebDriver inbound HTTP is served by **axum** on a Tokio runtime. CDP
-  WebSockets use axum's `ws` support. `net`'s outbound WebSocket client stays on
-  tungstenite ([ADR 0006](0006-net-transport.md)).
+- CDP and WebDriver inbound HTTP is served by **axum** on the browser process's Tokio runtime. CDP
+  WebSockets use axum's `ws` support. `net`'s outbound WebSocket client uses
+  Tokio and `tokio-tungstenite` ([ADR 0019](0019-async-browser-runtime-and-io.md)).
 - CLI parsing is **clap** (derive). Process modes are subcommands: `daemon`, `renderer`, and `webdriver --port=PORT`. `--profile=NAME` lives on `daemon` and `webdriver`; `--resolve=PATTERN=ADDR` lives on `webdriver`. `--log-level`, `--verbose`, and `--version` stay global. `create`, `list`, `select`, `eval`, `navigate`, and `close` become real subcommands later.
 - The `http1` crate is deleted once both adapters are ported.
 - The size budget is **10 MB stripped x86_64** (was 5 MB), tracked in AGENTS.md and
   `docs/researches/size-budget.md`. Milestones still measure marginals; the cap is a
   ceiling, not a target, and regressions still justify themselves in bytes.
-- No HTTP framework, CLI crate, or multi-thread runtime enters the renderer. The renderer's `protocol` module uses `serde`/`serde_json` for the value-only IPC seam ([ADR 0011](0011-renderer-processes-per-site.md)); nothing else in the renderer serializes. Renderer IPC is std IPC, not HTTP.
-- The renderer runtime keeps Tokio current-thread `rt`+`time`. The browser process may take
-  `rt-multi-thread` + `net` for the server; tab actors are plain OS threads
-  and renderers keep their own current-thread runtimes.
+- No HTTP framework, CLI crate, or multi-thread runtime enters the renderer. The renderer's `protocol` module uses `serde`/`serde_json` for small control payloads on the value-only IPC seam ([ADR 0019](0019-async-browser-runtime-and-io.md)); raw body chunks do not use JSON.
+- The renderer keeps one Tokio current-thread runtime. The renderer enables only
+  the features needed for its waiter and private platform channel. The browser
+  process owns one multi-thread runtime for adapters, browser tasks, tabs,
+  networking, and renderer channels.
 
 ## Why
 
@@ -42,11 +47,10 @@ on the browser-owned executor, and the renderer path takes no web-server stack.
   +1.5–2.5 MB tuned. Measure at the port and record it in
   `docs/researches/size-budget.md`.
 - `http1` leaves the workspace, its tests, and `CONTEXT.md`.
-- Blocking `BrowserHandle`/`TabHandle` calls inside async handlers go through
-  `tokio::task::spawn_blocking`, never a blocking `send()` on a runtime worker.
-- The daemon and `webdriver` command each build a Tokio runtime for the server. Tab
-  actors keep their own current-thread runtimes; no runtime is nested inside
-  another.
+- `BrowserHandle` and `TabHandle` are async-only. Axum handlers await them
+  directly.
+- The executable builds one Tokio runtime for the browser process. CDP and
+  WebDriver receive the runtime context and never nest a private runtime.
 - `cargo test` CLI flag-error cases change with clap's messages; the tests assert
   clap's behavior instead of the hand-rolled strings.
 

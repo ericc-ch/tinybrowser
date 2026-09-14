@@ -1,10 +1,13 @@
 # Net transport
 
-Net v1 ships bare ureq 3 + native-tls so dials exist at the smallest binary cost (~+490 KB tuned, ~2.5 MB stack). Canonical-Chrome wire behavior (JA3/JA4, HTTP/2 settings and pseudo-header order, header case) stays the target and is deferred to a later hand-rolled h1/h2 stack on `btls`, not dropped.
+Net v1 shipped bare ureq 3 + native-tls so dials existed at the smallest binary cost (~+490 KB tuned, ~2.5 MB stack). Canonical-Chrome wire behavior (JA3/JA4, HTTP/2 settings and pseudo-header order, header case) stays the target.
 
-Status: accepted
+Status: superseded for active transport by
+[ADR 0019](0019-async-browser-runtime-and-io.md). This ADR remains the v1
+transport and stealth-probe record. The public `net` type seam remains.
 
-The API must survive that swap: public types are ours; ureq, native-tls, and tungstenite stay in `transport` and `websocket`.
+The API survives transport swaps: public types are ours, and backend types stay
+private to `transport` and `websocket`.
 
 ## Options considered
 
@@ -49,4 +52,8 @@ JA4: `t13d3011_…` (OpenSSL, no ALPN); `t13d2811h1_257f3020b3a2…` (chrome kno
 
 ## Consequences
 
-Akamai-class gates fail until the stealth milestone ([ADR 0007](0007-engine-charter.md): later later). Probe knowledge (btls knobs, ureq `Agent::with_parts` bridge) stands as a reference. Size rows live in [size-budget.md](../researches/size-budget.md); the native-tls / OpenSSL-fingerprint objection returns when that milestone does. `net` stays blocking; the Browser-owned bounded executor runs it away from renderer threads.
+Akamai-class gates fail until the stealth milestone. Probe knowledge (btls knobs,
+ureq `Agent::with_parts` bridge) remains a reference. Size rows live in
+[size-budget.md](../researches/size-budget.md). Net v2 uses async hyper-util and
+hyper-rustls first, then replaces the private TLS connector with `btls` at the
+stealth milestone. Tinybrowser does not hand-write HTTP/1.1 or HTTP/2.

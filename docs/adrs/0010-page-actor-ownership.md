@@ -1,21 +1,24 @@
-# Autonomous tab actors and browser-owned resources
+# Autonomous tab coordination and browser-owned resources
 
-Status: accepted. Replaces the caller-driven pump, tab-owned blocking pools,
-post-parse script scan, and best-effort profile writes previously recorded here.
+Status: accepted and amended by
+[ADR 0019](0019-async-browser-runtime-and-io.md). Replaces the caller-driven
+pump, tab-owned pools, post-parse script scan, and best-effort profile writes
+previously recorded here. ADR 0019 replaces browser-process tab threads and the
+blocking network executor with Tokio tasks and async networking.
 
 ## Decision
 
 One profile daemon hosts one `Browser`. `Browser` owns the tab registry,
-`ProfileStore`, shared cookie jar, and one bounded network executor. The executor
-has 16 blocking workers and a 256-job browser-wide queue. A tab submits
-value-only work tagged by its navigation or JavaScript epoch. Queued work checks
-tab cancellation before starting; closing a tab discards later completions.
+`ProfileStore`, shared cookie jar, async `NetworkSession`, and renderer process
+manager. A browser task owns this state. `BrowserHandle` reaches the task through
+a bounded async command channel.
 
-Each `TabActor` owns its DOM, active HTML parser, QuickJS realm, timers, and
-navigation state on one OS thread. It advances work while idle. Wait requests
-register conditions and do not monopolize the actor. `TabHandle` crosses this
+Each tab coordinator is a Tokio task in the browser process. It owns navigation
+state, waiters, subscriptions, and the renderer handle. `TabHandle` crosses this
 boundary using commands, request IDs, values, event receivers, and explicit
-errors. DOM references, QuickJS values, and callbacks stay on the actor.
+errors. The renderer process owns the DOM, active HTML parser, QuickJS realm,
+timers, and page task queue. DOM references, QuickJS values, and callbacks stay
+in the renderer.
 
 The public `tinybrowser` crate exposes `Browser`, `BrowserHandle`, and
 `TabHandle`, not the directly driven engine `Tab`. The lower-level `browser`
@@ -65,13 +68,14 @@ writer fails explicitly. Invalid cookie data is renamed to a timestamped
 `cookies.corrupt.*` file and the profile starts with an empty jar. Other read
 errors propagate. Writes use a same-directory temporary file, file `fsync`,
 atomic rename, and directory `fsync`; failures remain dirty and propagate from
-explicit `BrowserHandle::close`.
+explicit `BrowserHandle::close().await`.
 
 Shutdown first refuses new work, then closes every tab, and finally persists
 the quiescent cookie jar. Repeating close retries a failed durable write.
 
 ## Isolation
 
-Threads enforce ownership but are not a security boundary. A later renderer
-process may reuse the value-only renderer seam. Process isolation is not required to
-make ordering, cancellation, resource bounds, and shutdown correct in-process.
+One renderer OS thread owns the page engine. The process boundary, immutable
+site lock, and browser-side reference monitor provide the active isolation
+shape. See [ADR 0011](0011-renderer-processes-per-site.md) and
+[ADR 0016](0016-renderer-seam-reference-monitor.md).

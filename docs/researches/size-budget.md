@@ -174,11 +174,11 @@ code on the old M1 connector. Accepted.
 | dom v1 + quickjs + **net on btls, hand-rolled h1/h2** (est., pending preset work, see 2026-08-25 probes) | ~3.6–3.7 MB | ~1.3–1.4 MB |
 | dom v1 + quickjs + **net as ureq bridged to btls** (measured bridge) | ~3.8 MB | ~1.2 MB |
 
-## Decisions
+## Historical v1 decisions
 
 - **html5ever over html5gum** (+~570 KB): buys the complete HTML5 tree-construction algorithm (insertion modes, foster parenting, adoption agency). html5gum is tokenizer-only; hand-rolling tree construction is weeks of fiddly spec work. Maturity wins under a 5MB budget.
 - **Tuned profile from day one**: default release costs +400–850KB for nothing. The flags are set once in the root Cargo.toml.
-- **native-tls, dynamically linked**: TLS lives in system `libssl.so.3`; we ship only glue (~482 KB tuned). Static rustls would add ~+2.0 MB: rejected. Consequence: target machine needs OpenSSL 3 installed (near-universal on Linux). *(2026-08-25: superseded within the day by the stealth requirement — its probes showed an OpenSSL ClientHello among the most-flagged fingerprints — then reinstated for net v1 by [ADR 0006](../adrs/0006-net-transport.md) with stealth deferred to the hand-rolled-btls milestone. The objection returns when that milestone does.)*
+- **native-tls, dynamically linked**: Net v1 used TLS from system `libssl.so.3` and shipped only glue (~482 KB tuned). [ADR 0019](../adrs/0019-async-browser-runtime-and-io.md) supersedes this choice with hyper-rustls for async net v2. The stealth milestone still replaces the private TLS connector with `btls`.
 - **panic = unwind kept**: abort saves only ~39 KB but kills `catch_unwind`, which every JS-exposed op needs so a Rust panic degrades to a JS error instead of unwinding through QuickJS's C frame.
 - **selectors later is cheap**, confirmed at the dom-v1 checkpoint: the whole dom layer (arena + selector engine + parser stack) measured +932 KB tuned, within ~2% of the html5ever+selectors estimates it subsumes (see Milestone section).
 - **Old servo stack (html5ever + selectors + cssparser as the _core_) was never the problem**: the old repo's total was bloat elsewhere. The parser swap alone does not hit 5MB; discipline at every milestone does.
@@ -190,7 +190,7 @@ code on the old M1 connector. Accepted.
   confirm at the next parse+query probe.
 
 - DOM→JS binding glue: hundreds of rquickjs classes add up; keep dispatch tables data-driven.
-- Browser-process protocol stack: **superseded** — [ADR 0012](../adrs/0012-host-protocol-and-cli-stack.md) accepts axum + clap and retires the `http1` crate. The renderer path still takes no web-server stack and no CLI crate; its only serialization is the value-only IPC seam, and its runtime stays current-thread `rt`+`time`.
+- Browser-process async I/O: [ADR 0019](../adrs/0019-async-browser-runtime-and-io.md) adds hyper-util and hyper-rustls for outbound networking and async platform-channel features to the current-thread renderer. Axum stays during the core migration, then a measured checkpoint compares it with direct hyper. The renderer still takes no web-server stack, HTTP client, CLI crate, or multi-thread runtime.
 - A11y walker (accname computation, role mapping): budget ~100–200 KB, fine, but measure.
 - When the deferred stealth milestone lands net on btls ([ADR 0006](../adrs/0006-net-transport.md)): pin the crate family like html5ever (its BoringSSL fork is wreq-ecosystem); impersonation presets go stale with every Chrome release — a stale preset is itself a detection signal, so bump discipline applies to persona tables, not just crates.
 - Re-measure marginals at every milestone; regressions must justify themselves in bytes.
@@ -211,13 +211,12 @@ not drop it. Empty `main` re-measured at 284 KB (290912 bytes).
 | `async-executor` + `async-io` | local executor + timer + spawn | **+85 KB** |
 | `futures` `LocalPool` | ready future only (no timer, no I/O) | **+12 KB** |
 
-Tokio 1.53 default features are empty; `full` is the fat switch. smol is not smaller
-than current-thread tokio with timers. The tab thread therefore uses Tokio
-current-thread `rt`+`time` (~+66 KB); page tasks stay in our queue; never `full` /
-smol / axum / hyper ([engine charter](../adrs/0007-engine-charter.md)). The original
-per-page `spawn_blocking` choice was superseded on 2026-09-10 by one browser-owned,
-bounded blocking network executor. Add Tokio `net` only if a later milestone needs
-async sockets on the page runtime.
+Tokio 1.53 default features are empty; `full` is the fat switch. Smol is not
+smaller than current-thread Tokio with timers. At this checkpoint the tab
+thread used Tokio current-thread `rt`+`time` (~+66 KB), and page tasks stayed in
+the engine queue. [ADR 0019](../adrs/0019-async-browser-runtime-and-io.md) later
+selected one multi-thread browser runtime and a current-thread renderer waiter
+with only the features needed for async platform-channel I/O.
 
 ## Milestone: html5lib WPT browser path (2026-09-11)
 
@@ -247,7 +246,7 @@ With rustc 1.98.0 and the committed stripped x86_64 release profile:
 | CLI stub (`target/release/tinybrowser`) | 294,944 |
 | page engine (`target/release/examples/tab_probe`) | 2,831,904 |
 
-The [probe](../../examples/tab_probe.rs) references HTML parsing, navigation,
+The now-retired `examples/tab_probe.rs` probe references HTML parsing, navigation,
 QuickJS eval, timers, and the page loop, so LTO retains the engine. Running it
 without arguments prints `42`; passing an HTTP URL also navigates before eval.
 Native TLS still uses the dynamically linked Nix OpenSSL. This is a real engine
@@ -335,7 +334,7 @@ it. The probe grew 63,120 bytes (3,325,968): workspace feature unification now
 builds its Tokio with the `net`/`rt-multi-thread` features the browser-process stack
 enables. The renderer path still takes no web-server stack and no CLI crate; its
 only serialization is the value-only IPC seam (`serde` in `protocol.rs`/`process.rs`),
-and the renderer runtime stays current-thread `rt`+`time`.
+and the renderer runtime stays current-thread.
 
 ## Milestone: renderer processes and per-site isolation (2026-09-10)
 
@@ -478,3 +477,22 @@ Command: `nix develop --command cargo build --release --bin tinybrowser`; rustc
 | Artifact | Bytes | Headroom to 10,000,000 |
 | --- | ---: | ---: |
 | CLI (`target/release/tinybrowser`) | 5,768,160 | 4,231,840 |
+
+## Preflight: async HTTP/2 and TLS (2026-09-14)
+
+A throwaway client used hyper-util 0.1.20, hyper-rustls 0.27.9 with default
+features disabled, the `ring` provider, and native roots. The probe completed an
+HTTP/2-capable HTTPS request to `https://example.com/` and received `200 OK` with
+559 response bytes. The matching HTTP-only probe exercised the same hyper client
+without TLS.
+
+| Standalone artifact | Tuned bytes |
+| --- | ---: |
+| HTTP-only hyper client | 1,011,872 |
+| HTTPS hyper-rustls client | 2,023,832 |
+| Isolated TLS delta | **1,011,960** |
+
+This is not the workspace marginal because tinybrowser already links Tokio and
+hyper through axum. The 1.01 MB standalone delta fits the 4,231,840-byte headroom
+from the preceding shipping binary. The checkpoint that integrates net v2 must
+record the authoritative shipping-binary size.
