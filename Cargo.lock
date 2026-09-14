@@ -1980,6 +1980,7 @@ dependencies = [
  "logging",
  "renderer",
  "serde_json",
+ "tokio",
  "webdriver",
 ]
 

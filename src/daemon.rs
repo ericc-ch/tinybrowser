@@ -27,7 +27,7 @@ pub struct DaemonEndpoint {
 /// # Errors
 ///
 /// Bind, registration, or serve failure.
-pub fn run(profile: &Profile, data_home: &Path) -> io::Result<()> {
+pub async fn run(profile: &Profile, data_home: &Path) -> io::Result<()> {
     let runtime = profile_runtime_dir(profile.name())?;
     fs::create_dir_all(&runtime)?;
     restrict_dir(&runtime)?;
@@ -64,7 +64,7 @@ pub fn run(profile: &Profile, data_home: &Path) -> io::Result<()> {
             port: addr.port(),
         },
     )?;
-    let result = cdp::serve(&listener, &browser.handle());
+    let result = cdp::serve(&listener, &browser.handle()).await;
     let _ = fs::remove_file(&lock_path);
     result
 }

@@ -43,68 +43,57 @@ const DEFAULT_BROWSER_CONTEXT_ID: &str = "tinybrowser-default";
 /// # Errors
 ///
 /// Returns when the listener cannot be converted or serving fails.
-pub fn serve(listener: &TcpListener, browser: &BrowserHandle) -> io::Result<()> {
+pub async fn serve(listener: &TcpListener, browser: &BrowserHandle) -> io::Result<()> {
     let bound = listener.local_addr()?;
     let std_listener = listener.try_clone()?;
     std_listener.set_nonblocking(true)?;
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()?;
     let browser = browser.clone();
-    let result: io::Result<()> = runtime.block_on(async move {
-        let listener = tokio::net::TcpListener::from_std(std_listener)?;
-        let (stop, mut stopping) = watch::channel(false);
-        let state = AppState {
-            browser,
-            bound,
-            stop: stop.clone(),
-        };
-        let version =
-            get(|State(state): State<AppState>| async move { Json(version_json(&state)) });
-        let discovery = get(discovery);
-        let browser_socket = get(
-            |ws: WebSocketUpgrade, State(state): State<AppState>| async move {
-                ws.on_upgrade(move |socket| run_socket(socket, state, None))
-            },
-        );
-        let page_socket = get(
-            |Path(raw): Path<String>,
-             ws: WebSocketUpgrade,
-             State(state): State<AppState>| async move {
-                let Ok(id) = raw.parse::<u64>() else {
-                    return (StatusCode::BAD_REQUEST, "invalid page target").into_response();
-                };
-                match state.browser.tab(TabId::new(id)) {
-                    Ok(tab) => ws.on_upgrade(move |socket| run_socket(socket, state, Some(tab))),
-                    Err(_) => (StatusCode::NOT_FOUND, "unknown page target").into_response(),
-                }
-            },
-        );
-        // Legacy CDP clients (Playwright included) append a trailing slash to
-        // discovery URLs; register both spellings rather than relying on a
-        // middleware layer, which axum does not apply to fallbacks.
-        let app = Router::new()
-            .route("/json/version", version.clone())
-            .route("/json/version/", version)
-            .route("/json", discovery.clone())
-            .route("/json/", discovery.clone())
-            .route("/json/list", discovery.clone())
-            .route("/json/list/", discovery)
-            .route("/devtools/browser", browser_socket.clone())
-            .route("/devtools/browser/", browser_socket)
-            .route("/devtools/page/{id}", page_socket.clone())
-            .route("/devtools/page/{id}/", page_socket)
-            .fallback(|| async { (StatusCode::NOT_FOUND, "not found") })
-            .with_state(state);
-        axum::serve(listener, app)
-            .with_graceful_shutdown(async move {
-                let _result = stopping.wait_for(|stopping| *stopping).await;
-            })
-            .await?;
-        Ok(())
-    });
-    result
+    let listener = tokio::net::TcpListener::from_std(std_listener)?;
+    let (stop, mut stopping) = watch::channel(false);
+    let state = AppState {
+        browser,
+        bound,
+        stop: stop.clone(),
+    };
+    let version = get(|State(state): State<AppState>| async move { Json(version_json(&state)) });
+    let discovery = get(discovery);
+    let browser_socket = get(
+        |ws: WebSocketUpgrade, State(state): State<AppState>| async move {
+            ws.on_upgrade(move |socket| run_socket(socket, state, None))
+        },
+    );
+    let page_socket = get(
+        |Path(raw): Path<String>, ws: WebSocketUpgrade, State(state): State<AppState>| async move {
+            let Ok(id) = raw.parse::<u64>() else {
+                return (StatusCode::BAD_REQUEST, "invalid page target").into_response();
+            };
+            match state.browser.tab(TabId::new(id)) {
+                Ok(tab) => ws.on_upgrade(move |socket| run_socket(socket, state, Some(tab))),
+                Err(_) => (StatusCode::NOT_FOUND, "unknown page target").into_response(),
+            }
+        },
+    );
+    // Legacy CDP clients (Playwright included) append a trailing slash to
+    // discovery URLs; register both spellings rather than relying on a
+    // middleware layer, which axum does not apply to fallbacks.
+    let app = Router::new()
+        .route("/json/version", version.clone())
+        .route("/json/version/", version)
+        .route("/json", discovery.clone())
+        .route("/json/", discovery.clone())
+        .route("/json/list", discovery.clone())
+        .route("/json/list/", discovery)
+        .route("/devtools/browser", browser_socket.clone())
+        .route("/devtools/browser/", browser_socket)
+        .route("/devtools/page/{id}", page_socket.clone())
+        .route("/devtools/page/{id}/", page_socket)
+        .fallback(|| async { (StatusCode::NOT_FOUND, "not found") })
+        .with_state(state);
+    axum::serve(listener, app)
+        .with_graceful_shutdown(async move {
+            let _result = stopping.wait_for(|stopping| *stopping).await;
+        })
+        .await
 }
 
 #[derive(Clone)]

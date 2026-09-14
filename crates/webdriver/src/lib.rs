@@ -32,27 +32,20 @@ const DEFAULT_PAGE_LOAD_TIMEOUT: Duration = Duration::from_secs(300);
 /// # Errors
 ///
 /// Returns when the listener cannot be converted or serving fails.
-pub fn serve(listener: &TcpListener, browser: BrowserHandle) -> std::io::Result<()> {
+pub async fn serve(listener: &TcpListener, browser: BrowserHandle) -> std::io::Result<()> {
     let std_listener = listener.try_clone()?;
     std_listener.set_nonblocking(true)?;
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()?;
     let sessions = Arc::new(Mutex::new(Sessions {
         browser,
         next_session: 0,
         next_window: 0,
         open: HashMap::new(),
     }));
-    let result: std::io::Result<()> = runtime.block_on(async move {
-        let listener = tokio::net::TcpListener::from_std(std_listener)?;
-        let app = Router::new()
-            .fallback(dispatch_request)
-            .with_state(AppState { sessions });
-        axum::serve(listener, app).await
-    });
-    result
+    let listener = tokio::net::TcpListener::from_std(std_listener)?;
+    let app = Router::new()
+        .fallback(dispatch_request)
+        .with_state(AppState { sessions });
+    axum::serve(listener, app).await
 }
 
 #[derive(Clone)]
