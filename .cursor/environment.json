@@ -1,0 +1,5 @@
+{
+  "name": "tinybrowser",
+  "user": "ubuntu",
+  "install": "bash .cursor/install.sh"
+}
