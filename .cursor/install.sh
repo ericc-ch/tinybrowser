@@ -20,6 +20,14 @@ set -euo pipefail
 # Run from the repository root regardless of where install is invoked.
 cd "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
+# WPT (`tools/wpt/run`) needs the vendored suite. It is a large submodule, so it
+# is opt-in to keep environment builds lean (Nix snapshot and default image):
+#   TINYBROWSER_INIT_WPT=1 .cursor/install.sh
+if [ "${TINYBROWSER_INIT_WPT:-0}" = "1" ]; then
+  echo "Initializing the WPT submodule (third_party/wpt)…"
+  git submodule update --init --recursive
+fi
+
 NIX_SH="$HOME/.nix-profile/etc/profile.d/nix.sh"
 
 if [ -e "$NIX_SH" ]; then
@@ -73,14 +81,6 @@ if ! pkg-config --exists openssl 2>/dev/null; then
   echo "Installing OpenSSL development headers (openssl-sys build dependency)…"
   sudo apt-get update -qq
   sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq libssl-dev pkg-config
-fi
-
-# WPT (`tools/wpt/run`) needs the vendored suite. It is a large submodule, so it
-# is opt-in to keep environment builds lean:
-#   TINYBROWSER_INIT_WPT=1 .cursor/install.sh
-if [ "${TINYBROWSER_INIT_WPT:-0}" = "1" ]; then
-  echo "Initializing the WPT submodule (third_party/wpt)…"
-  git submodule update --init --recursive
 fi
 
 # Compile the workspace plus its test/example targets so later `cargo test`
