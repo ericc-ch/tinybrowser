@@ -15,7 +15,6 @@
 use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
 use axum::Router;
@@ -26,12 +25,12 @@ use axum::response::{IntoResponse, Json, Response};
 use axum::routing::get;
 use browser::{BrowserHandle, RemoteValue, TabError, TabEvent, TabHandle, TabId};
 use serde_json::{Value, json};
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch};
+use tokio::task::JoinHandle;
 use tungstenite::client::IntoClientRequest;
 use tungstenite::protocol::{Message, WebSocket as ClientSocket};
 
 const PRODUCT: &str = "tinybrowser/0.1.0";
-const EVENT_POLL: Duration = Duration::from_millis(20);
 /// One default browser context; Playwright requires `browserContextId` on
 /// attached targets.
 const DEFAULT_BROWSER_CONTEXT_ID: &str = "tinybrowser-default";
@@ -67,7 +66,7 @@ pub async fn serve(listener: &TcpListener, browser: &BrowserHandle) -> io::Resul
             let Ok(id) = raw.parse::<u64>() else {
                 return (StatusCode::BAD_REQUEST, "invalid page target").into_response();
             };
-            match state.browser.tab(TabId::new(id)) {
+            match state.browser.tab(TabId::new(id)).await {
                 Ok(tab) => ws.on_upgrade(move |socket| run_socket(socket, state, Some(tab))),
                 Err(_) => (StatusCode::NOT_FOUND, "unknown page target").into_response(),
             }
@@ -103,14 +102,8 @@ struct AppState {
     stop: watch::Sender<bool>,
 }
 
-/// Discovery walks tab actors; keep it off the async workers ([ADR 0012]).
-///
-/// [ADR 0012]: ../../../docs/adrs/0012-host-protocol-and-cli-stack.md
 async fn discovery(State(state): State<AppState>) -> Response {
-    match tokio::task::spawn_blocking(move || list_json(&state)).await {
-        Ok(value) => Json(value).into_response(),
-        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "discovery failed").into_response(),
-    }
+    Json(list_json(&state).await).into_response()
 }
 
 fn version_json(state: &AppState) -> Value {
@@ -121,15 +114,16 @@ fn version_json(state: &AppState) -> Value {
     })
 }
 
-fn list_json(state: &AppState) -> Value {
+async fn list_json(state: &AppState) -> Value {
     let mut targets = Vec::new();
-    for id in state.browser.tabs() {
-        let url = state
-            .browser
-            .tab(id)
-            .ok()
-            .and_then(|tab| tab.document_url().ok())
-            .unwrap_or_else(|| "about:blank".into());
+    for id in state.browser.tabs().await.unwrap_or_default() {
+        let url = match state.browser.tab(id).await {
+            Ok(tab) => tab
+                .document_url()
+                .await
+                .unwrap_or_else(|_| "about:blank".into()),
+            Err(_) => "about:blank".into(),
+        };
         targets.push(json!({
             "id": id.to_string(),
             "type": "page",
@@ -281,8 +275,7 @@ fn connect_ws(addr: SocketAddr, path: &str) -> io::Result<Client> {
     })
 }
 
-/// Per-WebSocket protocol state. Commands dispatch synchronously against
-/// [`TabHandle`]; the socket loop is async.
+/// Per-WebSocket async protocol state.
 struct Conn {
     browser: BrowserHandle,
     sessions: HashMap<String, TabHandle>,
@@ -290,6 +283,8 @@ struct Conn {
     tab: Option<TabHandle>,
     stop: watch::Sender<bool>,
     subscriptions: Vec<TabSubscription>,
+    tab_events_tx: mpsc::Sender<ConnEvent>,
+    tab_events_rx: mpsc::Receiver<ConnEvent>,
     clock_origin: Instant,
     auto_attach: bool,
     events: Vec<Value>,
@@ -302,9 +297,14 @@ struct Conn {
 
 struct TabSubscription {
     tab_id: TabId,
+    session: Option<String>,
+    forward: JoinHandle<()>,
+}
+
+struct ConnEvent {
     tab: TabHandle,
     session: Option<String>,
-    events: Receiver<TabEvent>,
+    event: TabEvent,
 }
 
 /// One text reply plus whether the socket closes after it.
@@ -314,58 +314,49 @@ struct Outcome {
 }
 
 impl Conn {
-    /// Page events accumulated since the last flush, each ready to send.
-    ///
-    /// May call into the tab actor (final URL after redirects), so callers run
-    /// this inside a blocking region.
-    fn take_event_messages(&mut self) -> Vec<Value> {
-        let mut messages = std::mem::take(&mut self.events);
+    fn take_queued_events(&mut self) -> Vec<Value> {
+        std::mem::take(&mut self.events)
+    }
+
+    async fn event_messages(&mut self, incoming: ConnEvent) -> Vec<Value> {
+        let mut messages = Vec::new();
         let timestamp = self.clock_origin.elapsed().as_secs_f64();
-        let mut pending = Vec::new();
-        for subscription in &self.subscriptions {
-            for event in subscription.events.try_iter() {
-                pending.push((
-                    subscription.tab.clone(),
-                    subscription.session.clone(),
-                    event,
-                ));
+        let tab = incoming.tab;
+        let session = incoming.session;
+        match incoming.event {
+            TabEvent::Navigated => {
+                self.push_navigated(&mut messages, &tab, session.as_deref())
+                    .await;
             }
-        }
-        for (tab, session, event) in pending {
-            match event {
-                TabEvent::Navigated => {
-                    self.push_navigated(&mut messages, &tab, session.as_deref());
-                }
-                TabEvent::Load => {
-                    let frame_id = tab.id().to_string();
-                    let loader_id = self.loader_ids.get(&tab.id()).cloned().unwrap_or_default();
-                    let mut lifecycle = json!({
-                        "method": "Page.lifecycleEvent",
-                        "params": {
-                            "frameId": frame_id,
-                            "loaderId": loader_id,
-                            "name": "load",
-                            "timestamp": timestamp,
-                        },
-                    });
-                    attach_session(&mut lifecycle, session.as_deref());
-                    messages.push(lifecycle);
-                    let mut load = json!({
-                        "method": "Page.loadEventFired",
-                        "params": {"timestamp": timestamp},
-                    });
-                    attach_session(&mut load, session.as_deref());
-                    messages.push(load);
-                }
-                _ => {}
+            TabEvent::Load => {
+                let frame_id = tab.id().to_string();
+                let loader_id = self.loader_ids.get(&tab.id()).cloned().unwrap_or_default();
+                let mut lifecycle = json!({
+                    "method": "Page.lifecycleEvent",
+                    "params": {
+                        "frameId": frame_id,
+                        "loaderId": loader_id,
+                        "name": "load",
+                        "timestamp": timestamp,
+                    },
+                });
+                attach_session(&mut lifecycle, session.as_deref());
+                messages.push(lifecycle);
+                let mut load = json!({
+                    "method": "Page.loadEventFired",
+                    "params": {"timestamp": timestamp},
+                });
+                attach_session(&mut load, session.as_deref());
+                messages.push(load);
             }
+            _ => {}
         }
         messages
     }
 
     /// Emits the commit event set: frame commit plus the new document's
     /// execution contexts (default and every known isolated world).
-    fn push_navigated(
+    async fn push_navigated(
         &mut self,
         messages: &mut Vec<Value>,
         tab: &TabHandle,
@@ -375,7 +366,7 @@ impl Conn {
         let frame_id = tab_id.to_string();
         let loader_id = self.loader_ids.get(&tab_id).cloned().unwrap_or_default();
         // Final URL after redirects, not the requested one.
-        let url = tab.document_url().unwrap_or_default();
+        let url = tab.document_url().await.unwrap_or_default();
         let mut navigated = json!({
             "method": "Page.frameNavigated",
             "params": {"frame": {
@@ -423,7 +414,7 @@ impl Conn {
     }
 
     /// Resolves the requested target (or the first live one) for `Target.getTargetInfo`.
-    fn target_info_for(&mut self, params: &Value) -> Result<Value, DispatchError> {
+    async fn target_info_for(&mut self, params: &Value) -> Result<Value, DispatchError> {
         let id = match params.get("targetId").and_then(Value::as_str) {
             Some(raw) => raw
                 .parse::<u64>()
@@ -432,25 +423,27 @@ impl Conn {
             None => self
                 .browser
                 .tabs()
+                .await
+                .map_err(|error| DispatchError::Failed(error.to_string()))?
                 .first()
                 .copied()
                 .ok_or_else(|| DispatchError::Failed("no target".into()))?,
         };
-        Ok(json!({"targetInfo": target_info(&self.browser, id)}))
+        Ok(json!({"targetInfo": target_info(&self.browser, id).await}))
     }
 
     /// Enables or disables auto-attach and announces existing targets.
-    fn set_auto_attach(&mut self, params: &Value) -> Value {
+    async fn set_auto_attach(&mut self, params: &Value) -> Value {
         let auto_attach = params
             .get("autoAttach")
             .and_then(Value::as_bool)
             .unwrap_or(false);
         self.auto_attach = auto_attach;
         if auto_attach {
-            for id in self.browser.tabs() {
-                if let Ok(tab) = self.browser.tab(id) {
+            for id in self.browser.tabs().await.unwrap_or_default() {
+                if let Ok(tab) = self.browser.tab(id).await {
                     let session_id = self.mint_session(&tab);
-                    self.push_attached(&session_id, &tab);
+                    self.push_attached(&session_id, &tab).await;
                 }
             }
         }
@@ -466,8 +459,8 @@ impl Conn {
     }
 
     /// Queues `Target.attachedToTarget` for auto-attach clients.
-    fn push_attached(&mut self, session_id: &str, tab: &TabHandle) {
-        let mut info = target_info(&self.browser, tab.id());
+    async fn push_attached(&mut self, session_id: &str, tab: &TabHandle) {
+        let mut info = target_info(&self.browser, tab.id()).await;
         if let Some(object) = info.as_object_mut() {
             object.insert("attached".into(), json!(true));
         }
@@ -481,7 +474,7 @@ impl Conn {
         }));
     }
 
-    fn dispatch_text(&mut self, text: &str) -> Outcome {
+    async fn dispatch_text(&mut self, text: &str) -> Outcome {
         let parsed: Value = match serde_json::from_str(text) {
             Ok(value) => value,
             Err(err) => {
@@ -507,7 +500,7 @@ impl Conn {
         let empty = json!({});
         let params = parsed.get("params").unwrap_or(&empty);
         let session = parsed.get("sessionId").and_then(Value::as_str);
-        match self.dispatch(method, params, session) {
+        match self.dispatch(method, params, session).await {
             Ok(result) => {
                 let mut reply = json!({"id": id, "result": result});
                 attach_session(&mut reply, session);
@@ -544,13 +537,13 @@ impl Conn {
         }
     }
 
-    fn dispatch(
+    async fn dispatch(
         &mut self,
         method: &str,
         params: &Value,
         session: Option<&str>,
     ) -> Result<Value, DispatchError> {
-        if method != "Browser.close" && !self.browser.is_live() {
+        if method != "Browser.close" && !self.browser.is_live().await.unwrap_or(false) {
             return Err(DispatchError::Failed("browser closed".into()));
         }
         if let Some(session) = session {
@@ -559,15 +552,21 @@ impl Conn {
                 .get(session)
                 .cloned()
                 .ok_or_else(|| DispatchError::Failed("unknown session".into()))?;
-            return self.dispatch_tab_method(method, params, &tab, Some(session));
+            return self
+                .dispatch_tab_method(method, params, &tab, Some(session))
+                .await;
         }
         if let Some(tab) = self.tab.clone() {
-            return self.dispatch_tab_method(method, params, &tab, None);
+            return self.dispatch_tab_method(method, params, &tab, None).await;
         }
-        self.dispatch_browser(method, params)
+        self.dispatch_browser(method, params).await
     }
 
-    fn dispatch_browser(&mut self, method: &str, params: &Value) -> Result<Value, DispatchError> {
+    async fn dispatch_browser(
+        &mut self,
+        method: &str,
+        params: &Value,
+    ) -> Result<Value, DispatchError> {
         match method {
             "Browser.getVersion" => Ok(json!({
                 "protocolVersion": "1.3",
@@ -584,28 +583,36 @@ impl Conn {
             "Browser.close" => {
                 self.browser
                     .close()
+                    .await
                     .map_err(|error| DispatchError::Failed(error.to_string()))?;
                 self.sessions.clear();
-                self.subscriptions.clear();
+                self.stop_subscriptions();
                 self.tab = None;
                 let _result = self.stop.send(true);
                 Ok(json!({}))
             }
-            _ => self.dispatch_target(method, params),
+            _ => self.dispatch_target(method, params).await,
         }
     }
 
-    fn dispatch_target(&mut self, method: &str, params: &Value) -> Result<Value, DispatchError> {
+    async fn dispatch_target(
+        &mut self,
+        method: &str,
+        params: &Value,
+    ) -> Result<Value, DispatchError> {
         match method {
-            "Target.setAutoAttach" => Ok(self.set_auto_attach(params)),
-            "Target.getTargetInfo" => self.target_info_for(params),
+            "Target.setAutoAttach" => Ok(self.set_auto_attach(params).await),
+            "Target.getTargetInfo" => self.target_info_for(params).await,
             "Target.getTargets" => {
-                let target_infos: Vec<Value> = self
+                let mut target_infos = Vec::new();
+                for id in self
                     .browser
                     .tabs()
-                    .into_iter()
-                    .map(|id| target_info(&self.browser, id))
-                    .collect();
+                    .await
+                    .map_err(|error| DispatchError::Failed(error.to_string()))?
+                {
+                    target_infos.push(target_info(&self.browser, id).await);
+                }
                 Ok(json!({ "targetInfos": target_infos }))
             }
             "Target.createTarget" => {
@@ -616,14 +623,15 @@ impl Conn {
                 let tab = self
                     .browser
                     .create_tab()
+                    .await
                     .map_err(|err| DispatchError::Failed(err.to_string()))?;
-                if let Err(error) = open_url(&tab, url) {
-                    let _ = self.browser.close_tab(tab.id());
+                if let Err(error) = open_url(&tab, url).await {
+                    let _result = self.browser.close_tab(tab.id()).await;
                     return Err(error);
                 }
                 if self.auto_attach {
                     let session_id = self.mint_session(&tab);
-                    self.push_attached(&session_id, &tab);
+                    self.push_attached(&session_id, &tab).await;
                 }
                 Ok(json!({ "targetId": tab.id().to_string() }))
             }
@@ -648,9 +656,10 @@ impl Conn {
                 }
                 self.browser
                     .close_tab(id)
+                    .await
                     .map_err(|err| DispatchError::Failed(err.to_string()))?;
                 self.sessions.retain(|_, tab| tab.id() != id);
-                self.subscriptions.retain(|item| item.tab_id != id);
+                self.unsubscribe_tab_id(id);
                 self.loader_ids.remove(&id);
                 self.isolated_worlds.remove(&id);
                 if self.tab.as_ref().is_some_and(|tab| tab.id() == id) {
@@ -672,6 +681,7 @@ impl Conn {
                 let tab = self
                     .browser
                     .tab(id)
+                    .await
                     .map_err(|err| DispatchError::Failed(err.to_string()))?;
                 let session_id = format!("s{}", self.next_session);
                 self.next_session = self.next_session.saturating_add(1);
@@ -681,8 +691,7 @@ impl Conn {
             "Target.detachFromTarget" => {
                 if let Some(session) = params.get("sessionId").and_then(Value::as_str) {
                     self.sessions.remove(session);
-                    self.subscriptions
-                        .retain(|item| item.session.as_deref() != Some(session));
+                    self.unsubscribe_session(session);
                 }
                 Ok(json!({}))
             }
@@ -690,7 +699,7 @@ impl Conn {
         }
     }
 
-    fn dispatch_tab_method(
+    async fn dispatch_tab_method(
         &mut self,
         method: &str,
         params: &Value,
@@ -699,39 +708,14 @@ impl Conn {
     ) -> Result<Value, DispatchError> {
         match method {
             "Page.enable" => {
-                self.subscribe_tab(tab, session)?;
+                self.subscribe_tab(tab, session).await?;
                 Ok(json!({}))
             }
             "Page.disable" => {
                 self.unsubscribe_tab(tab.id(), session);
                 Ok(json!({}))
             }
-            "Page.navigate" => {
-                let url = params
-                    .get("url")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| DispatchError::Failed("missing url".into()))?;
-                let loader_id = format!("{}", self.next_loader);
-                self.next_loader = self.next_loader.saturating_add(1);
-                self.loader_ids.insert(tab.id(), loader_id.clone());
-                let frame_id = tab.id().to_string();
-                if url.is_empty() || url == "about:blank" {
-                    open_url(tab, url)?;
-                    return Ok(json!({"frameId": frame_id, "loaderId": loader_id}));
-                }
-                let events = tab
-                    .subscribe()
-                    .map_err(|error| DispatchError::Failed(error.to_string()))?;
-                open_url(tab, url)?;
-                match wait_for_navigation(&events, Duration::from_secs(30)) {
-                    Ok(()) => Ok(json!({"frameId": frame_id, "loaderId": loader_id})),
-                    Err(error_text) => Ok(json!({
-                        "frameId": frame_id,
-                        "loaderId": loader_id,
-                        "errorText": error_text,
-                    })),
-                }
-            }
+            "Page.navigate" => self.navigate_tab(params, tab).await,
             "Runtime.enable" => {
                 self.push_session_event(
                     session,
@@ -785,16 +769,48 @@ impl Conn {
                 Ok(json!({"executionContextId": context_id}))
             }
             "Target.getTargetInfo" => {
-                let mut info = target_info(&self.browser, tab.id());
+                let mut info = target_info(&self.browser, tab.id()).await;
                 if let Some(object) = info.as_object_mut() {
                     object.insert("attached".into(), json!(true));
                 }
                 Ok(json!({"targetInfo": info}))
             }
             "Runtime.evaluate" | "Runtime.callFunctionOn" => {
-                self.dispatch_runtime(method, params, tab)
+                self.dispatch_runtime(method, params, tab).await
             }
-            _ => session_method(method, tab),
+            _ => session_method(method, tab).await,
+        }
+    }
+
+    async fn navigate_tab(
+        &mut self,
+        params: &Value,
+        tab: &TabHandle,
+    ) -> Result<Value, DispatchError> {
+        let url = params
+            .get("url")
+            .and_then(Value::as_str)
+            .ok_or_else(|| DispatchError::Failed("missing url".into()))?;
+        let loader_id = format!("{}", self.next_loader);
+        self.next_loader = self.next_loader.saturating_add(1);
+        self.loader_ids.insert(tab.id(), loader_id.clone());
+        let frame_id = tab.id().to_string();
+        if url.is_empty() || url == "about:blank" {
+            open_url(tab, url).await?;
+            return Ok(json!({"frameId": frame_id, "loaderId": loader_id}));
+        }
+        let events = tab
+            .subscribe()
+            .await
+            .map_err(|error| DispatchError::Failed(error.to_string()))?;
+        open_url(tab, url).await?;
+        match wait_for_navigation(events, Duration::from_secs(30)).await {
+            Ok(()) => Ok(json!({"frameId": frame_id, "loaderId": loader_id})),
+            Err(error_text) => Ok(json!({
+                "frameId": frame_id,
+                "loaderId": loader_id,
+                "errorText": error_text,
+            })),
         }
     }
 
@@ -808,7 +824,7 @@ impl Conn {
     /// `Runtime.evaluate` / `Runtime.callFunctionOn` with value or handle
     /// semantics. Handles live in the page as `globalThis.__tb_handles`, so the
     /// adapter needs no JS value storage of its own.
-    fn dispatch_runtime(
+    async fn dispatch_runtime(
         &mut self,
         method: &str,
         params: &Value,
@@ -839,21 +855,21 @@ impl Conn {
             format!("({declaration}).apply({receiver}, {arguments})")
         };
         if return_by_value {
-            Ok(Self::runtime_value(tab, &source))
+            Ok(Self::runtime_value(tab, &source).await)
         } else {
-            Ok(self.runtime_handle(tab, &source))
+            Ok(self.runtime_handle(tab, &source).await)
         }
     }
 
     /// Stores the result in a page-side handle and returns its `objectId`;
     /// primitives are serializable and returned inline.
-    fn runtime_handle(&mut self, tab: &TabHandle, source: &str) -> Value {
+    async fn runtime_handle(&mut self, tab: &TabHandle, source: &str) -> Value {
         let handle = self.next_handle;
         self.next_handle = self.next_handle.saturating_add(1);
         let script = RUNTIME_HANDLE
             .replace("__ID__", &json_string(&handle.to_string()))
             .replace("__SOURCE__", source);
-        let value = match tab.execute_script(&script) {
+        let value = match tab.execute_script(&script).await {
             Ok(value) => value,
             Err(error) => return exception_reply(&error),
         };
@@ -867,20 +883,23 @@ impl Conn {
 
     /// Resolves the value (awaiting a thenable via the waiter) and serializes
     /// it to a CDP `RemoteObject`.
-    fn runtime_value(tab: &TabHandle, source: &str) -> Value {
+    async fn runtime_value(tab: &TabHandle, source: &str) -> Value {
         let schedule = RUNTIME_SCHEDULE.replace("__SOURCE__", source);
-        if let Err(error) = tab.execute_script(&schedule) {
+        if let Err(error) = tab.execute_script(&schedule).await {
             return exception_reply(&error);
         }
-        match tab.run_until_js_true(
-            "Boolean(globalThis.__tb_async && globalThis.__tb_async.done)",
-            Duration::from_secs(2),
-        ) {
+        match tab
+            .run_until_js_true(
+                "Boolean(globalThis.__tb_async && globalThis.__tb_async.done)",
+                Duration::from_secs(2),
+            )
+            .await
+        {
             Ok(true) => {}
             Ok(false) => return exception_text_reply("awaitPromise timed out"),
             Err(error) => return exception_reply(&error),
         }
-        let value = match tab.execute_script(RUNTIME_READ) {
+        let value = match tab.execute_script(RUNTIME_READ).await {
             Ok(value) => value,
             Err(error) => return exception_reply(&error),
         };
@@ -895,7 +914,7 @@ impl Conn {
         exception_text_reply("unexpected script result")
     }
 
-    fn subscribe_tab(
+    async fn subscribe_tab(
         &mut self,
         tab: &TabHandle,
         session: Option<&str>,
@@ -909,23 +928,77 @@ impl Conn {
         }
         let events = tab
             .subscribe()
+            .await
             .map_err(|error| DispatchError::Failed(error.to_string()))?;
+        let tab_for_events = tab.clone();
+        let session_for_events = session.map(str::to_owned);
+        let tx = self.tab_events_tx.clone();
+        let mut events = events;
+        let forward = tokio::spawn(async move {
+            while let Some(event) = events.recv().await {
+                let message = ConnEvent {
+                    tab: tab_for_events.clone(),
+                    session: session_for_events.clone(),
+                    event,
+                };
+                if tx.send(message).await.is_err() {
+                    break;
+                }
+            }
+        });
         self.subscriptions.push(TabSubscription {
             tab_id: tab.id(),
-            tab: tab.clone(),
             session: session.map(str::to_owned),
-            events,
+            forward,
         });
         Ok(())
     }
 
     fn unsubscribe_tab(&mut self, tab_id: TabId, session: Option<&str>) {
-        self.subscriptions
-            .retain(|item| item.tab_id != tab_id || item.session.as_deref() != session);
+        let mut retained = Vec::new();
+        for subscription in self.subscriptions.drain(..) {
+            if subscription.tab_id == tab_id && subscription.session.as_deref() == session {
+                subscription.forward.abort();
+            } else {
+                retained.push(subscription);
+            }
+        }
+        self.subscriptions = retained;
+    }
+
+    fn stop_subscriptions(&mut self) {
+        for subscription in self.subscriptions.drain(..) {
+            subscription.forward.abort();
+        }
+    }
+
+    fn unsubscribe_tab_id(&mut self, tab_id: TabId) {
+        let mut retained = Vec::new();
+        for subscription in self.subscriptions.drain(..) {
+            if subscription.tab_id == tab_id {
+                subscription.forward.abort();
+            } else {
+                retained.push(subscription);
+            }
+        }
+        self.subscriptions = retained;
+    }
+
+    fn unsubscribe_session(&mut self, session: &str) {
+        let mut retained = Vec::new();
+        for subscription in self.subscriptions.drain(..) {
+            if subscription.session.as_deref() == Some(session) {
+                subscription.forward.abort();
+            } else {
+                retained.push(subscription);
+            }
+        }
+        self.subscriptions = retained;
     }
 }
 
 async fn run_socket(mut socket: WebSocket, state: AppState, tab: Option<TabHandle>) {
+    let (tab_events_tx, tab_events_rx) = mpsc::channel(256);
     let mut conn = Conn {
         browser: state.browser,
         sessions: HashMap::new(),
@@ -933,6 +1006,8 @@ async fn run_socket(mut socket: WebSocket, state: AppState, tab: Option<TabHandl
         tab,
         stop: state.stop,
         subscriptions: Vec::new(),
+        tab_events_tx,
+        tab_events_rx,
         clock_origin: Instant::now(),
         auto_attach: false,
         events: Vec::new(),
@@ -942,60 +1017,66 @@ async fn run_socket(mut socket: WebSocket, state: AppState, tab: Option<TabHandl
         next_context: 1000,
         next_handle: 1,
     };
-    let mut poll = tokio::time::interval(EVENT_POLL);
-    poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
-        let outcome = tokio::select! {
-            _ = poll.tick() => None,
-            incoming = socket.recv() => match incoming {
-                Some(Ok(WsMessage::Text(text))) => {
-                    let text = text.as_str().to_owned();
-                    Some(tokio::task::block_in_place(|| conn.dispatch_text(&text)))
-                }
-                Some(Ok(WsMessage::Ping(payload))) => {
-                    let _ = socket.send(WsMessage::Pong(payload)).await;
-                    None
-                }
-                None | Some(Ok(WsMessage::Close(_)) | Err(_)) => break,
-                Some(Ok(_)) => None,            },
+        let wake = tokio::select! {
+            event = conn.tab_events_rx.recv() => SocketWake::Event(event),
+            incoming = socket.recv() => SocketWake::Incoming(incoming),
         };
-        let mut failed = false;
-        for message in tokio::task::block_in_place(|| conn.take_event_messages()) {
-            if socket
-                .send(WsMessage::text(message.to_string()))
-                .await
-                .is_err()
-            {
-                failed = true;
-                break;
+        match wake {
+            SocketWake::Event(Some(event)) => {
+                let messages = conn.event_messages(event).await;
+                if send_messages(&mut socket, messages).await.is_err() {
+                    break;
+                }
             }
-        }
-        if failed {
-            break;
-        }
-        let Some(outcome) = outcome else {
-            continue;
-        };
-        let close = outcome.close;
-        if socket
-            .send(WsMessage::text(outcome.reply.to_string()))
-            .await
-            .is_err()
-        {
-            break;
-        }
-        if close {
-            break;
+            SocketWake::Event(None)
+            | SocketWake::Incoming(None | Some(Ok(WsMessage::Close(_)) | Err(_))) => break,
+            SocketWake::Incoming(Some(Ok(WsMessage::Text(text)))) => {
+                let outcome = conn.dispatch_text(text.as_str()).await;
+                let queued = conn.take_queued_events();
+                if send_messages(&mut socket, queued).await.is_err() {
+                    break;
+                }
+                let close = outcome.close;
+                if socket
+                    .send(WsMessage::text(outcome.reply.to_string()))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+                if close {
+                    break;
+                }
+            }
+            SocketWake::Incoming(Some(Ok(WsMessage::Ping(payload)))) => {
+                let _result = socket.send(WsMessage::Pong(payload)).await;
+            }
+            SocketWake::Incoming(Some(Ok(_))) => {}
         }
     }
-    let _ = socket.send(WsMessage::Close(None)).await;
+    conn.stop_subscriptions();
+    let _result = socket.send(WsMessage::Close(None)).await;
 }
 
-fn session_method(method: &str, tab: &TabHandle) -> Result<Value, DispatchError> {
+enum SocketWake {
+    Event(Option<ConnEvent>),
+    Incoming(Option<Result<WsMessage, axum::Error>>),
+}
+
+async fn send_messages(socket: &mut WebSocket, messages: Vec<Value>) -> Result<(), axum::Error> {
+    for message in messages {
+        socket.send(WsMessage::text(message.to_string())).await?;
+    }
+    Ok(())
+}
+
+async fn session_method(method: &str, tab: &TabHandle) -> Result<Value, DispatchError> {
     match method {
         "Page.getFrameTree" => {
             let url = tab
                 .document_url()
+                .await
                 .map_err(|error| DispatchError::Failed(error.to_string()))?;
             Ok(json!({"frameTree": {"frame": {
                 "id": tab.id().to_string(),
@@ -1024,32 +1105,38 @@ fn session_method(method: &str, tab: &TabHandle) -> Result<Value, DispatchError>
 }
 
 /// Waits for the next navigation outcome on a temporary subscription.
-fn wait_for_navigation(events: &Receiver<TabEvent>, timeout: Duration) -> Result<(), &'static str> {
-    let deadline = Instant::now() + timeout;
-    loop {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return Err("net::ERR_TIMED_OUT");
-        }
-        match events.recv_timeout(remaining) {
-            Ok(TabEvent::Navigated) => return Ok(()),
-            Ok(TabEvent::NavigationFailed | TabEvent::FetchFailed) => {
-                return Err("net::ERR_FAILED");
+async fn wait_for_navigation(
+    mut events: mpsc::Receiver<TabEvent>,
+    duration: Duration,
+) -> Result<(), &'static str> {
+    let result = tokio::time::timeout(duration, async {
+        loop {
+            match events.recv().await {
+                Some(TabEvent::Navigated) => return Ok(()),
+                Some(TabEvent::NavigationFailed | TabEvent::FetchFailed) => {
+                    return Err("net::ERR_FAILED");
+                }
+                Some(_) => {}
+                None => return Err("net::ERR_ABORTED"),
             }
-            Ok(_) => {}
-            Err(RecvTimeoutError::Timeout) => return Err("net::ERR_TIMED_OUT"),
-            Err(RecvTimeoutError::Disconnected) => return Err("net::ERR_ABORTED"),
         }
+    })
+    .await;
+    match result {
+        Ok(outcome) => outcome,
+        Err(_) => Err("net::ERR_TIMED_OUT"),
     }
 }
 
-fn open_url(tab: &TabHandle, url: &str) -> Result<(), DispatchError> {
+async fn open_url(tab: &TabHandle, url: &str) -> Result<(), DispatchError> {
     if url.is_empty() || url == "about:blank" {
         tab.load_html("<!doctype html><title></title>")
+            .await
             .map_err(|err| DispatchError::Failed(err.to_string()))?;
         return Ok(());
     }
     tab.goto(url)
+        .await
         .map_err(|err| DispatchError::Failed(err.to_string()))?;
     Ok(())
 }
@@ -1137,12 +1224,14 @@ const RUNTIME_READ: &str = r#"(() => {
   catch (e) { return JSON.stringify({ type: "object" }); }
 })()"#;
 
-fn target_info(browser: &BrowserHandle, id: TabId) -> Value {
-    let url = browser
-        .tab(id)
-        .ok()
-        .and_then(|tab| tab.document_url().ok())
-        .unwrap_or_else(|| "about:blank".into());
+async fn target_info(browser: &BrowserHandle, id: TabId) -> Value {
+    let url = match browser.tab(id).await {
+        Ok(tab) => tab
+            .document_url()
+            .await
+            .unwrap_or_else(|_| "about:blank".into()),
+        Err(_) => "about:blank".into(),
+    };
     json!({
         "targetId": id.to_string(),
         "type": "page",

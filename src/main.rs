@@ -227,6 +227,7 @@ async fn serve_webdriver(port: u16, builder: AgentBuilder, profile: &Profile) ->
             return Err(io::Error::other(format!("profile failed: {error}")));
         }
     };
-    let browser = Browser::open_with_network(network);
-    webdriver::serve(&listener, browser.handle()).await
+    let browser = Browser::open_with_network(network)?;
+    let result = webdriver::serve(&listener, browser.handle()).await;
+    result.and(browser.handle().close().await)
 }

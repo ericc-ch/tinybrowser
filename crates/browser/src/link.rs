@@ -1,4 +1,4 @@
-//! Host side of the renderer seam: factory, handles, and routing pumps.
+//! Browser side of the renderer seam: factory, handles, and routing pumps.
 //!
 //! [ADR 0011](../../../docs/adrs/0011-renderer-processes-per-site.md): the
 //! handle is value-only; replies, events, and browser-service calls cross a
@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::io::{self, BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TrySendError};
+use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -19,6 +19,7 @@ use renderer::{
     Command as RendererCommand, FrameId, FromRenderer, Reply, ServiceCall, ServiceReply, TabError,
     TabEvent, ToRenderer,
 };
+use tokio::sync::mpsc as async_mpsc;
 
 /// Upper bound on one request to a renderer. The renderer budget is seconds;
 /// this is a last-resort wake-up if its reply path dies silently.
@@ -27,7 +28,7 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 /// How long a `renderer` child has to say [`FromRenderer::Ready`].
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Bounded renderer-pump handoff to its owning tab actor. Saturation is a
+/// Bounded renderer-pump handoff to its owning tab coordinator. Saturation is a
 /// renderer protocol violation: dropping lifecycle events would corrupt tab
 /// state, while blocking the pump could strand a reply behind those events.
 const EVENT_SUBSCRIBER_CAPACITY: usize = 4096;
@@ -37,7 +38,7 @@ const EVENT_SUBSCRIBER_CAPACITY: usize = 4096;
 struct RendererId(u64);
 
 /// Live subscribers to one renderer's frame-tagged document events.
-type EventSubscribers = Arc<Mutex<Vec<SyncSender<(FrameId, TabEvent)>>>>;
+type EventSubscribers = Arc<Mutex<Vec<async_mpsc::Sender<(FrameId, TabEvent)>>>>;
 
 /// Value-only handle to one renderer.
 pub(crate) struct RendererHandle {
@@ -89,8 +90,8 @@ impl RendererHandle {
 
     /// Subscribes to renderer document events after this call.
     #[must_use]
-    pub(crate) fn subscribe(&self) -> Receiver<(FrameId, TabEvent)> {
-        let (tx, rx) = mpsc::sync_channel(EVENT_SUBSCRIBER_CAPACITY);
+    pub(crate) fn subscribe(&self) -> async_mpsc::Receiver<(FrameId, TabEvent)> {
+        let (tx, rx) = async_mpsc::channel(EVENT_SUBSCRIBER_CAPACITY);
         self.subscribers
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -292,8 +293,8 @@ impl PumpContext<'_> {
                     .unwrap_or_else(PoisonError::into_inner)
                     .retain(|subscriber| match subscriber.try_send((frame, event)) {
                         Ok(()) => true,
-                        Err(TrySendError::Disconnected(_)) => false,
-                        Err(TrySendError::Full(_)) => {
+                        Err(async_mpsc::error::TrySendError::Closed(_)) => false,
+                        Err(async_mpsc::error::TrySendError::Full(_)) => {
                             saturated = true;
                             false
                         }

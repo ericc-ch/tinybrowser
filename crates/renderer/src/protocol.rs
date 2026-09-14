@@ -187,9 +187,9 @@ impl std::error::Error for TabError {}
 /// Browser-owned retained-resource budgets exposed through [`TabError`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ResourceLimit {
-    /// Concurrent waits retained by one tab actor.
+    /// Concurrent waits retained by one tab coordinator.
     TabWaiters,
-    /// Event subscriptions retained by one tab actor.
+    /// Event subscriptions retained by one tab coordinator.
     TabSubscribers,
 }
 

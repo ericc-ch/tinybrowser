@@ -1,19 +1,21 @@
 //! Browser-owned live networking: one [`net::Agent`] behind a value-only handle.
 //!
-//! [ADR 0010](../../../docs/adrs/0010-tab-actor-ownership.md): tab actors
-//! receive [`FetchHandle`]. They do not expose or own [`net::Agent`].
+//! [ADR 0019](../../../docs/adrs/0019-async-browser-runtime-and-io.md): tab
+//! coordinators receive [`FetchHandle`]. They do not expose or own
+//! [`net::Agent`].
 
 use std::env;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{self, Sender, SyncSender, TrySendError};
+use std::sync::mpsc::{self, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use net::{Agent, AgentBuilder, CookieRecord, CookieSameSite, InitiatorKind, Method};
 use renderer::{DialOutcome, DialRequest};
+use tokio::sync::mpsc::UnboundedSender;
 use url::Url;
 
 use crate::profile::{Profile, ProfileName};
@@ -214,7 +216,7 @@ impl NetworkSession {
         })
     }
 
-    /// Value-only fetch handle for a tab actor.
+    /// Value-only fetch handle for a tab coordinator.
     #[must_use]
     pub(crate) fn fetch_handle(&self) -> FetchHandle {
         FetchHandle {
@@ -224,8 +226,12 @@ impl NetworkSession {
         }
     }
 
-    pub(crate) fn persist(&self) -> io::Result<()> {
-        self.store.save_from(&self.agent)
+    pub(crate) async fn persist(&self) -> io::Result<()> {
+        let store = Arc::clone(&self.store);
+        let agent = self.agent.clone();
+        tokio::task::spawn_blocking(move || store.save_from(&agent))
+            .await
+            .map_err(io::Error::other)?
     }
 
     pub(crate) fn profile_name(&self) -> ProfileName {
@@ -233,15 +239,9 @@ impl NetworkSession {
     }
 }
 
-impl Drop for NetworkSession {
-    fn drop(&mut self) {
-        let _result = self.persist();
-    }
-}
-
 /// Cloneable, sendable handle for cookies and blocking HTTP.
 ///
-/// Completions return to the tab actor from the bounded network executor.
+/// Completions return to the tab coordinator from the bounded network executor.
 #[derive(Clone)]
 pub(crate) struct FetchHandle {
     agent: Agent,
@@ -273,7 +273,7 @@ impl FetchHandle {
         epoch: u64,
         url: Url,
         initiator: Url,
-        reply: Sender<(u64, Result<NavOutcome, ()>)>,
+        reply: UnboundedSender<(u64, Result<NavOutcome, ()>)>,
     ) -> Result<(), ()> {
         let fetch = self.clone();
         self.try_submit(move || {
