@@ -2,8 +2,7 @@
 //!
 //! [ADR 0011](../../../docs/adrs/0011-renderer-processes-per-site.md): commands,
 //! request ids, events, script results, and explicit errors cross. DOM handles,
-//! `QuickJS` values, callbacks, and `net` types never do. The same types back the
-//! in-process backend and the `renderer` pipe.
+//! `QuickJS` values, callbacks, and `net` types never do.
 
 use std::fmt;
 use std::io::{self, BufRead, Read, Write};
@@ -282,15 +281,6 @@ pub enum Command {
         /// Optional execution budget in milliseconds.
         timeout_ms: Option<u64>,
     },
-    /// Set one frame's document URL used as cookie initiator and relative-URL base.
-    SetDocumentUrl {
-        /// Frame to update.
-        frame: FrameId,
-        /// Absolute URL.
-        url: String,
-    },
-    /// True when the renderer has no jobs, timers, dials, or pending JS work.
-    IsIdle,
     /// Stop the renderer loop.
     Shutdown,
 }
@@ -317,8 +307,6 @@ pub enum Reply {
     Text(Result<String, TabError>),
     /// Value-only script result.
     Value(Result<RemoteValue, TabError>),
-    /// Boolean result.
-    Bool(bool),
 }
 
 /// Host to renderer traffic.
@@ -436,13 +424,13 @@ pub struct DialOutcome {
 }
 
 /// Completion for a dial submitted to the browser process.
-pub type DialCompletion = Arc<dyn Fn(Option<DialOutcome>) + Send + Sync + 'static>;
+pub(crate) type DialCompletion = Arc<dyn Fn(Option<DialOutcome>) + Send + Sync + 'static>;
 
 /// Host services the renderer reaches through the browser-process seam.
 ///
-/// In-process this is the `browser` crate's network adapter. In the
-/// `renderer` child it is a pipe proxy. Renderer code never names `net`.
-pub trait BrowserServices: Send + Sync + 'static {
+/// The renderer child implements this as a pipe proxy. Renderer code never
+/// names `net`.
+pub(crate) trait BrowserServices: Send + Sync + 'static {
     /// Submits one GET without blocking the renderer thread. The completion
     /// receives `None` for transport, timeout, queue, or body-limit failure.
     /// Implementations must invoke it exactly once, including when submission
@@ -563,17 +551,6 @@ mod tests {
                 },
             },
             ToRenderer::Request {
-                id: 4,
-                command: Command::SetDocumentUrl {
-                    frame: FrameId::MAIN,
-                    url: "http://example.test/".into(),
-                },
-            },
-            ToRenderer::Request {
-                id: 5,
-                command: Command::IsIdle,
-            },
-            ToRenderer::Request {
                 id: 6,
                 command: Command::Shutdown,
             },
@@ -616,10 +593,6 @@ mod tests {
             FromRenderer::Reply {
                 id: 3,
                 reply: Reply::Text(Ok("ok".into())),
-            },
-            FromRenderer::Reply {
-                id: 4,
-                reply: Reply::Bool(false),
             },
             FromRenderer::Reply {
                 id: 5,

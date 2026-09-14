@@ -17,16 +17,16 @@ use tokio::runtime::Runtime as TokioRuntime;
 use tokio::time::Instant;
 use url::Url;
 
+use crate::ActiveParser;
 use crate::documents::DocumentStore;
 use crate::js::{DocumentStreamCommand, FrameNavigation, RealmRegistry, SharedJsRuntime, World};
 use crate::protocol::{BrowserServices, Mount, ScriptFailure, TabError, TabEvent};
-use crate::{ActiveParser, Parsed};
 
 mod dial;
 mod intern;
 mod pump;
 
-pub use crate::js::ScriptValue;
+pub(crate) use crate::js::ScriptValue;
 
 const MAX_PENDING_JS_FETCHES: usize = 256;
 const MAX_PENDING_EVENTS: usize = 2048;
@@ -102,11 +102,9 @@ impl Waiter {
 }
 
 /// One document: tree, task list, `QuickJS` realm, and browser services.
-pub struct Document {
+pub(crate) struct Document {
     services: Arc<dyn BrowserServices>,
     world: Rc<RefCell<World>>,
-    /// The shared, realm-agnostic store this frame's trees live in.
-    documents: Rc<RefCell<DocumentStore>>,
     js_runtime: SharedJsRuntime,
     waiter: Waiter,
     url: Url,
@@ -139,32 +137,13 @@ impl Drop for Document {
 }
 
 impl Document {
-    /// An empty standalone document with its own `QuickJS` heap and waiter.
-    ///
-    /// Renderer frames are built with [`Document::with_shared`], so every frame
-    /// of one process shares one heap; this constructor serves tests and
-    /// one-off documents.
-    #[must_use]
-    pub fn new(services: Arc<dyn BrowserServices>) -> Self {
-        let documents = Rc::new(RefCell::new(DocumentStore::default()));
-        let registry = Rc::new(RefCell::new(RealmRegistry::default()));
-        Self::with_shared(
-            services,
-            SharedJsRuntime::default(),
-            Waiter::new(),
-            documents,
-            &registry,
-            Arc::new(Stop::new()),
-        )
-    }
-
     /// A document sharing its renderer process's `QuickJS` heap, waiter,
     /// document store, and realm registry.
     pub(crate) fn with_shared(
         services: Arc<dyn BrowserServices>,
         js_runtime: SharedJsRuntime,
         waiter: Waiter,
-        documents: Rc<RefCell<DocumentStore>>,
+        documents: &Rc<RefCell<DocumentStore>>,
         registry: &Rc<RefCell<RealmRegistry>>,
         stop: Arc<Stop>,
     ) -> Self {
@@ -175,11 +154,10 @@ impl Document {
             world: Rc::new(RefCell::new(World::new(
                 Arc::clone(&services),
                 document_url.clone(),
-                Rc::clone(&documents),
+                Rc::clone(documents),
                 registry,
             ))),
             services,
-            documents,
             js_runtime,
             waiter,
             url: document_url,
@@ -204,14 +182,6 @@ impl Document {
             next_remote: 0,
             remote_by_node: HashMap::new(),
         }
-    }
-
-    /// Runs `reader` against the frame's active document, if any.
-    pub fn with_parsed<R>(&self, reader: impl FnOnce(&Parsed) -> R) -> Option<R> {
-        let id = self.world.borrow().main_document_id()?;
-        let documents = Rc::clone(&self.documents);
-        let store = documents.borrow();
-        store.get(id).map(reader)
     }
 
     pub(crate) fn document_root(&self) -> Option<dom::NodeId> {
@@ -250,23 +220,8 @@ impl Document {
 
     /// Document URL (cookie initiator and relative-URL base).
     #[must_use]
-    pub fn document_url(&self) -> &str {
+    pub(crate) fn document_url(&self) -> &str {
         self.url.as_str()
-    }
-
-    /// Document language: mount `Content-Language`, or the last
-    /// [`Document::set_content_language`] value.
-    #[must_use]
-    pub fn content_language(&self) -> Option<&str> {
-        self.content_language.as_deref()
-    }
-
-    /// Records the document-level `Content-Language` default.
-    pub fn set_content_language(&mut self, value: Option<String>) {
-        self.content_language.clone_from(&value);
-        if let Some(mut parsed) = self.world.borrow().main_document_mut() {
-            parsed.dom.set_document_language(value);
-        }
     }
 
     /// Sets the document URL used as cookie initiator and relative-URL base.
@@ -274,21 +229,10 @@ impl Document {
     /// # Errors
     ///
     /// [`TabError::InvalidUrl`] when `url` is not an absolute URL.
-    pub fn set_document_url(&mut self, url: &str) -> Result<(), TabError> {
+    pub(crate) fn set_document_url(&mut self, url: &str) -> Result<(), TabError> {
         self.url = Url::parse(url).map_err(|_| TabError::InvalidUrl { spec: url.into() })?;
         self.world.borrow_mut().document_url = self.url.clone();
         Ok(())
-    }
-
-    /// `document.cookie` getter: non-HTTP jar read for this document URL.
-    #[must_use]
-    pub fn document_cookie(&self) -> String {
-        self.services.cookies_for(&self.url)
-    }
-
-    /// `document.cookie` setter: non-HTTP jar write for this document URL.
-    pub fn set_document_cookie(&self, value: &str) {
-        self.services.set_cookie(value, &self.url);
     }
 
     /// Evaluates `source` as classic script on this document's JS context.
@@ -296,7 +240,7 @@ impl Document {
     /// # Errors
     ///
     /// [`TabError::Script`] when the engine cannot start or the script throws.
-    pub fn eval(&mut self, source: &str) -> Result<String, TabError> {
+    pub(crate) fn eval(&mut self, source: &str) -> Result<String, TabError> {
         self.ensure_js()?;
         let Some(js) = self.js.as_ref() else {
             return Err(TabError::Script(ScriptFailure::HostMissing));
@@ -304,15 +248,6 @@ impl Document {
         let out = js.eval(source).map_err(TabError::from);
         self.adopt_js_work();
         out
-    }
-
-    /// Evaluates `source` and returns a structured JS value.
-    ///
-    /// # Errors
-    ///
-    /// [`TabError::Script`] when the engine cannot start or the script throws.
-    pub fn execute_script(&mut self, source: &str) -> Result<ScriptValue, TabError> {
-        self.execute_script_deadline(source, None)
     }
 
     pub(crate) fn execute_script_deadline(
@@ -331,12 +266,6 @@ impl Document {
         out
     }
 
-    /// Jobs that have already run, in order.
-    #[must_use]
-    pub fn events(&self) -> &[TabEvent] {
-        &self.events
-    }
-
     pub(crate) fn take_events(&mut self) -> Result<Vec<TabEvent>, ()> {
         if std::mem::take(&mut self.events_overflowed) {
             self.events.clear();
@@ -347,7 +276,7 @@ impl Document {
 
     /// Replaces the document from a host mount: new realm, decoded bytes,
     /// parsed to load. The host has already dialed and chosen this renderer.
-    pub fn mount(&mut self, mount: &Mount) {
+    pub(crate) fn mount(&mut self, mount: &Mount) {
         self.reset_js_realm();
         let html = dial::decode_html(&mount.body, mount.content_type.as_deref());
         if let Ok(url) = Url::parse(&mount.url) {
@@ -361,7 +290,7 @@ impl Document {
     }
 
     /// Parses `input` into this document and starts a new JS realm.
-    pub fn load_html(&mut self, input: &str) {
+    pub(crate) fn load_html(&mut self, input: &str) {
         self.reset_js_realm();
         self.start_document(input);
     }
@@ -695,7 +624,7 @@ impl From<crate::js::JsError> for TabError {
 }
 
 /// Document-stop flag shared by the renderer loop, JS interrupt handler, and dials.
-pub struct Stop {
+pub(crate) struct Stop {
     flag: AtomicBool,
     waker: Mutex<Option<Waker>>,
 }
@@ -709,7 +638,7 @@ impl Default for Stop {
 impl Stop {
     /// A fresh, unset stop flag.
     #[must_use]
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             flag: AtomicBool::new(false),
             waker: Mutex::new(None),
@@ -717,7 +646,7 @@ impl Stop {
     }
 
     /// Requests a stop: interrupts `QuickJS` and wakes the pump.
-    pub fn request(&self) {
+    pub(crate) fn request(&self) {
         self.flag.store(true, Ordering::Relaxed);
         if let Some(waker) = self
             .waker
@@ -731,7 +660,7 @@ impl Stop {
 
     /// Whether [`Stop::request`] has run.
     #[must_use]
-    pub fn is_set(&self) -> bool {
+    pub(crate) fn is_set(&self) -> bool {
         self.flag.load(Ordering::Relaxed)
     }
 

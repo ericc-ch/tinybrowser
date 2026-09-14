@@ -342,8 +342,8 @@ and the renderer runtime stays current-thread `rt`+`time`.
 [ADR 0011](../adrs/0011-renderer-processes-per-site.md) split the engine into
 the `renderer` crate (parser, `Dom`, QuickJS, value-only seam) and the `browser`
 browser side (Browser, tab `Tab`, navigation, `NetworkSession`, renderer factory).
-The browser process spawns one `--renderer` process per site instance; tests use the
-in-process local backend. Command: `nix develop --command cargo build --release
+The browser process spawns one `--renderer` process per site instance. At this
+milestone, tests still used an in-process backend. Command: `nix develop --command cargo build --release
 --example tab_probe --bin tinybrowser`; rustc 1.98.0, committed stripped
 x86_64 release profile.
 
@@ -371,7 +371,7 @@ failures; same command and profile as the milestone above.
 Changes: non-finite JS numbers are string-encoded in the IPC seam, the
 `--renderer` child sends a `Ready` handshake, a dead renderer drains pending
 requests instead of stranding callers, opaque per-page renderers are reaped on
-release, idle pools drain on Browser close, and local renderer dials run on the
+release, idle pools drain on Browser close, and the then-local renderer dials run on the
 browser-owned executor. CLI +26,144 bytes over the milestone above.
 
 ## Milestone: shared renderer network executor (2026-09-11)
@@ -463,3 +463,18 @@ number defaults and option-read order, exact BigInt and decimal-string output,
 currency and sign behavior, locale alias canonicalization, date/time styles,
 and prototype methods. This explicit target is evidence for the implemented
 slice, not a substitute for a future full `intl402` conformance run.
+
+## Milestone: one renderer process path (2026-09-14)
+
+The browser now has one renderer implementation: the self-spawned `renderer`
+process and its value-only pipe. CDP and WebDriver integration tests launch the
+shipping executable and cross that same boundary. Removing the in-process
+transport also retired the local-only `tab_probe` artifact, so size tracking now
+uses the shipping executable directly.
+
+Command: `nix develop --command cargo build --release --bin tinybrowser`; rustc
+1.98.0, stripped x86_64 release profile.
+
+| Artifact | Bytes | Headroom to 10,000,000 |
+| --- | ---: | ---: |
+| CLI (`target/release/tinybrowser`) | 5,768,160 | 4,231,840 |

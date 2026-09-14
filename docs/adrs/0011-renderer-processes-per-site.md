@@ -87,9 +87,8 @@ Engine ground truth:
 - The `browser` crate splits: a `renderer` crate owns the page engine and the
   renderer entry point; `browser` keeps browser-side ownership. The seam's value types are
   defined before the crate split, so the crate boundary is not designed twice.
-- Tests use an in-process renderer backend for speed where the process boundary is
-  not under test; at least one loopback E2E test crosses a real `renderer`
-  process.
+- Tests exercise the renderer process through the same IPC boundary used in
+  production.
 - Sandboxing (seccomp, namespaces) is a later security phase. Separate address
   spaces, value-only IPC, and the browser-side reference monitor in ADR 0016 are
   the current properties; they do not make an unsandboxed child safe against

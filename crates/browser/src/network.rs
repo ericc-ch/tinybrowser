@@ -41,8 +41,8 @@ static COOKIE_TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 /// Durable backing for one Profile under `XDG_DATA_HOME`.
 pub struct ProfileStore {
     name: ProfileName,
-    root: Option<PathBuf>,
-    _lock: Option<File>,
+    root: PathBuf,
+    _lock: File,
     disk: Mutex<()>,
     dirty: AtomicBool,
 }
@@ -96,29 +96,15 @@ impl ProfileStore {
         lock.try_lock().map_err(io::Error::from)?;
         Ok(Self {
             name: profile.name().clone(),
-            root: Some(root),
-            _lock: Some(lock),
+            root,
+            _lock: lock,
             disk: Mutex::new(()),
             dirty: AtomicBool::new(false),
         })
     }
 
-    /// In-memory store: [`ProfileStore::save_from`] is a no-op.
-    #[must_use]
-    pub fn memory(profile: &Profile) -> Self {
-        Self {
-            name: profile.name().clone(),
-            root: None,
-            _lock: None,
-            disk: Mutex::new(()),
-            dirty: AtomicBool::new(false),
-        }
-    }
-
     pub(crate) fn load_into(&self, agent: &Agent) -> io::Result<()> {
-        let Some(path) = self.cookies_path() else {
-            return Ok(());
-        };
+        let path = self.cookies_path();
         let _disk = self.lock_disk();
         let bytes = match fs::read(&path) {
             Ok(bytes) => bytes,
@@ -148,9 +134,7 @@ impl ProfileStore {
     }
 
     pub(crate) fn save_from(&self, agent: &Agent) -> io::Result<()> {
-        let Some(dir) = self.root.as_ref() else {
-            return Ok(());
-        };
+        let dir = &self.root;
         let _disk = self.lock_disk();
         if !self.dirty.load(Ordering::SeqCst) {
             return Ok(());
@@ -185,8 +169,8 @@ impl ProfileStore {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    fn cookies_path(&self) -> Option<PathBuf> {
-        self.root.as_ref().map(|dir| dir.join("cookies"))
+    fn cookies_path(&self) -> PathBuf {
+        self.root.join("cookies")
     }
 
     /// Profile this store belongs to.
@@ -232,7 +216,7 @@ impl NetworkSession {
 
     /// Value-only fetch handle for a tab actor.
     #[must_use]
-    pub fn fetch_handle(&self) -> FetchHandle {
+    pub(crate) fn fetch_handle(&self) -> FetchHandle {
         FetchHandle {
             agent: self.agent.clone(),
             store: Arc::clone(&self.store),
@@ -259,7 +243,7 @@ impl Drop for NetworkSession {
 ///
 /// Completions return to the tab actor from the bounded network executor.
 #[derive(Clone)]
-pub struct FetchHandle {
+pub(crate) struct FetchHandle {
     agent: Agent,
     store: Arc<ProfileStore>,
     executor: NetworkExecutor,
@@ -268,12 +252,12 @@ pub struct FetchHandle {
 impl FetchHandle {
     /// `document.cookie` getter for `url`.
     #[must_use]
-    pub fn cookies_for(&self, url: &Url) -> String {
+    pub(crate) fn cookies_for(&self, url: &Url) -> String {
         self.agent.cookies_for(url)
     }
 
     /// `document.cookie` setter for `url`.
-    pub fn set_cookie(&self, value: &str, url: &Url) {
+    pub(crate) fn set_cookie(&self, value: &str, url: &Url) {
         self.agent.set_cookie(value, url);
         self.store.mark_dirty();
     }

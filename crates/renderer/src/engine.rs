@@ -11,11 +11,11 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::RemoteValue;
 use crate::document::{Document, Stop, Waiter};
 use crate::documents::DocumentStore;
 use crate::js::{DocumentStreamCommand, FrameNavigation, RealmRegistry, SharedJsRuntime};
 use crate::protocol::{BrowserServices, FrameId, Mount, TabError, TabEvent};
-use crate::{Parsed, RemoteValue, ScriptValue};
 
 /// How long one frame may occupy the waiter before the engine gives the next
 /// frame a turn.
@@ -27,7 +27,7 @@ const MAX_FRAMES: usize = 64;
 /// The main frame is the tab's top-level document; child frames share the
 /// engine's heap and waiter, so same-site frames can pass JavaScript objects
 /// synchronously.
-pub struct Engine {
+pub(crate) struct Engine {
     js_runtime: SharedJsRuntime,
     waiter: Waiter,
     /// Every frame's trees, shared across their realms.
@@ -43,15 +43,7 @@ pub struct Engine {
 }
 
 impl Engine {
-    /// An engine whose frames dial and read cookies through `services`.
-    #[must_use]
-    pub fn new(services: Arc<dyn BrowserServices>) -> Self {
-        Self::with_stop(services, Arc::new(Stop::new()))
-    }
-
-    /// [`Engine::new`] with an externally owned stop flag, so an in-process
-    /// host can interrupt a runaway script.
-    pub fn with_stop(services: Arc<dyn BrowserServices>, stop: Arc<Stop>) -> Self {
+    pub(crate) fn new(services: Arc<dyn BrowserServices>, stop: Arc<Stop>) -> Self {
         let js_runtime = SharedJsRuntime::default();
         let waiter = Waiter::new();
         let documents = Rc::new(RefCell::new(DocumentStore::default()));
@@ -60,7 +52,7 @@ impl Engine {
             Arc::clone(&services),
             js_runtime.clone(),
             waiter.clone(),
-            Rc::clone(&documents),
+            &documents,
             &registry,
             Arc::clone(&stop),
         );
@@ -80,15 +72,14 @@ impl Engine {
         }
     }
 
-    /// Creates a child frame on this engine's heap and waiter.
-    pub fn create_frame(&mut self) -> FrameId {
+    fn create_frame(&mut self) -> FrameId {
         let frame = FrameId::new(self.next_frame);
         self.next_frame = self.next_frame.saturating_add(1);
         let document = Document::with_shared(
             Arc::clone(&self.services),
             self.js_runtime.clone(),
             self.waiter.clone(),
-            Rc::clone(&self.documents),
+            &self.documents,
             &self.registry,
             Arc::clone(&self.stop),
         );
@@ -96,37 +87,8 @@ impl Engine {
         frame
     }
 
-    /// The frame with this id, when the engine still hosts it.
-    #[must_use]
-    pub fn frame_mut(&mut self, frame: FrameId) -> Option<&mut Document> {
+    fn frame_mut(&mut self, frame: FrameId) -> Option<&mut Document> {
         self.frames.get_mut(&frame)
-    }
-
-    /// Every frame the engine currently hosts, with its id.
-    pub fn frames(&self) -> impl Iterator<Item = (FrameId, &Document)> {
-        self.frames
-            .iter()
-            .map(|(&frame, document)| (frame, document))
-    }
-
-    /// The tab's main frame.
-    fn main(&self) -> &Document {
-        self.frames
-            .get(&FrameId::MAIN)
-            .expect("engine always hosts its main frame")
-    }
-
-    fn main_mut(&mut self) -> &mut Document {
-        self.frames
-            .get_mut(&FrameId::MAIN)
-            .expect("engine always hosts its main frame")
-    }
-
-    /// Replaces the main frame's document from a host mount.
-    pub fn mount(&mut self, mount: &Mount) {
-        self.remove_descendants(FrameId::MAIN);
-        self.main_mut().mount(mount);
-        self.reconcile_frames();
     }
 
     /// Replaces one frame's document from a host mount.
@@ -134,7 +96,7 @@ impl Engine {
     /// # Errors
     ///
     /// [`TabError::UnknownFrame`] when the engine does not host `frame`.
-    pub fn mount_frame(&mut self, frame: FrameId, mount: &Mount) -> Result<(), TabError> {
+    pub(crate) fn mount_frame(&mut self, frame: FrameId, mount: &Mount) -> Result<(), TabError> {
         self.remove_descendants(frame);
         let document = self
             .frame_mut(frame)
@@ -144,28 +106,12 @@ impl Engine {
         Ok(())
     }
 
-    /// Parses `html` into the main frame and starts a new realm.
-    pub fn load_html(&mut self, html: &str) {
-        self.remove_descendants(FrameId::MAIN);
-        self.main_mut().load_html(html);
-        self.reconcile_frames();
-    }
-
-    /// Evaluates `source` in the main frame and returns its string coercion.
-    ///
-    /// # Errors
-    ///
-    /// [`TabError::Script`] when the engine cannot start or the script throws.
-    pub fn eval(&mut self, source: &str) -> Result<String, TabError> {
-        self.eval_in(FrameId::MAIN, source)
-    }
-
     /// Evaluates `source` in one frame and returns its string coercion.
     ///
     /// # Errors
     ///
     /// [`TabError::UnknownFrame`] or [`TabError::Script`].
-    pub fn eval_in(&mut self, frame: FrameId, source: &str) -> Result<String, TabError> {
+    pub(crate) fn eval_in(&mut self, frame: FrameId, source: &str) -> Result<String, TabError> {
         let result = self
             .frame_mut(frame)
             .ok_or(TabError::UnknownFrame { frame: frame.get() })?
@@ -174,52 +120,12 @@ impl Engine {
         result
     }
 
-    /// Evaluates `source` in the main frame and returns a value-only result.
-    ///
-    /// # Errors
-    ///
-    /// Same as [`Engine::eval`].
-    pub fn execute_script(&mut self, source: &str) -> Result<ScriptValue, TabError> {
-        self.execute_script_in(FrameId::MAIN, source)
-    }
-
-    /// Evaluates `source` in one frame and returns a value-only result.
-    ///
-    /// # Errors
-    ///
-    /// [`TabError::UnknownFrame`] or [`TabError::Script`].
-    pub fn execute_script_in(
-        &mut self,
-        frame: FrameId,
-        source: &str,
-    ) -> Result<ScriptValue, TabError> {
-        let result = self
-            .frame_mut(frame)
-            .ok_or(TabError::UnknownFrame { frame: frame.get() })?
-            .execute_script(source);
-        self.reconcile_frames();
-        result
-    }
-
-    /// Evaluates `source` and interns node handles for the protocol.
-    ///
-    /// # Errors
-    ///
-    /// Same as [`Engine::eval`].
-    pub fn execute_remote(
-        &mut self,
-        source: &str,
-        timeout: Option<Duration>,
-    ) -> Result<RemoteValue, TabError> {
-        self.execute_remote_in(FrameId::MAIN, source, timeout)
-    }
-
     /// Evaluates `source` in one frame and interns node handles for the protocol.
     ///
     /// # Errors
     ///
     /// [`TabError::UnknownFrame`] or [`TabError::Script`].
-    pub fn execute_remote_in(
+    pub(crate) fn execute_remote_in(
         &mut self,
         frame: FrameId,
         source: &str,
@@ -231,52 +137,6 @@ impl Engine {
             .execute_remote(source, timeout);
         self.reconcile_frames();
         result
-    }
-
-    /// Sets the main frame's document URL.
-    ///
-    /// # Errors
-    ///
-    /// [`TabError::InvalidUrl`] when `url` is not an absolute URL.
-    pub fn set_document_url(&mut self, url: &str) -> Result<(), TabError> {
-        self.set_document_url_in(FrameId::MAIN, url)
-    }
-
-    /// Sets one frame's document URL.
-    ///
-    /// # Errors
-    ///
-    /// [`TabError::UnknownFrame`] or [`TabError::InvalidUrl`].
-    pub fn set_document_url_in(&mut self, frame: FrameId, url: &str) -> Result<(), TabError> {
-        self.frame_mut(frame)
-            .ok_or(TabError::UnknownFrame { frame: frame.get() })?
-            .set_document_url(url)
-    }
-
-    /// Main frame document URL.
-    #[must_use]
-    pub fn document_url(&self) -> &str {
-        self.main().document_url()
-    }
-
-    /// Main frame document `Content-Language`, if any.
-    #[must_use]
-    pub fn content_language(&self) -> Option<&str> {
-        self.main().content_language()
-    }
-
-    /// Runs `reader` against the main frame's active document, if any.
-    pub fn with_parsed<R>(&self, reader: impl FnOnce(&Parsed) -> R) -> Option<R> {
-        self.main().with_parsed(reader)
-    }
-
-    /// Jobs that have already run, in order, for every frame.
-    #[must_use]
-    pub fn events(&self) -> Vec<TabEvent> {
-        self.frames
-            .values()
-            .flat_map(|document| document.events().iter().copied())
-            .collect()
     }
 
     pub(crate) fn take_events(&mut self) -> Result<Vec<(FrameId, TabEvent)>, ()> {
@@ -294,7 +154,7 @@ impl Engine {
 
     /// True when any frame has jobs, timers, dials, or pending JS work.
     #[must_use]
-    pub fn has_background_work(&self) -> bool {
+    pub(crate) fn has_background_work(&self) -> bool {
         !self.pending_frame_loads.is_empty()
             || self
                 .frames
@@ -303,7 +163,7 @@ impl Engine {
     }
 
     /// Advances every frame for at most `budget`.
-    pub fn drive_for(&mut self, budget: Duration) {
+    pub(crate) fn drive_for(&mut self, budget: Duration) {
         let deadline = Instant::now() + budget;
         loop {
             let frames: Vec<FrameId> = self.frames.keys().copied().collect();
@@ -322,33 +182,6 @@ impl Engine {
             }
             if Instant::now() >= deadline || !self.has_background_work() {
                 return;
-            }
-        }
-    }
-
-    /// Parks the renderer thread until no frame has tasks, timers, queued
-    /// dials, or fetches.
-    pub fn run(&mut self) {
-        while self.has_background_work() {
-            let frames: Vec<FrameId> = self.frames.keys().copied().collect();
-            for frame in frames {
-                if let Some(document) = self.frames.get_mut(&frame) {
-                    document.drive_for(FRAME_STEP);
-                }
-                self.reconcile_frames();
-            }
-        }
-    }
-
-    /// Parks until every frame has fired `load`.
-    pub fn run_until_load(&mut self) {
-        while self.frames.values().any(Document::waiting_for_load) {
-            let frames: Vec<FrameId> = self.frames.keys().copied().collect();
-            for frame in frames {
-                if let Some(document) = self.frames.get_mut(&frame) {
-                    document.drive_for(FRAME_STEP);
-                }
-                self.reconcile_frames();
             }
         }
     }
@@ -533,8 +366,7 @@ impl Engine {
         !ready.is_empty()
     }
 
-    /// Stops every frame. Further work must go through [`Engine::new`].
-    pub fn shutdown(&mut self) {
+    pub(crate) fn shutdown(&mut self) {
         for document in self.frames.values_mut() {
             document.shutdown();
         }

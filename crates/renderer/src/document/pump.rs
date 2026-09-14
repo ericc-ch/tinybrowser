@@ -25,9 +25,7 @@ impl Document {
                 .is_some_and(crate::js::JsRealm::has_pending_work)
     }
 
-    /// HTML host timer: fire [`TabEvent::Timer`] after `delay`.
-    #[must_use]
-    pub fn schedule_timer(&mut self, delay: Duration) -> u32 {
+    fn schedule_timer(&mut self, delay: Duration) -> u32 {
         let id = self.next_timer_id;
         self.next_timer_id = self.next_timer_id.saturating_add(1);
         self.timers.push(Timer {
@@ -38,56 +36,7 @@ impl Document {
         id
     }
 
-    /// Parks this thread as the document Tokio waiter until no tasks, timers,
-    /// queued dials, or in-flight fetches remain. Must not run inside another
-    /// runtime.
-    ///
-    /// # Panics
-    ///
-    /// If called from inside a Tokio runtime or the current-thread runtime
-    /// cannot be built.
-    pub fn run(&mut self) {
-        self.block_on_pump(None, |document| !document.stopped());
-    }
-
-    /// Parks until the current document has fired `load` and finished classic
-    /// scripts, without waiting for leftover host timers.
-    ///
-    /// # Panics
-    ///
-    /// Same conditions as [`Document::run`].
-    pub fn run_until_load(&mut self) {
-        self.block_on_pump(None, |document| {
-            document.waiting_for_load() && !document.stopped()
-        });
-    }
-
-    /// Parks like [`Document::run_until_load`], returning `false` if `timeout`
-    /// elapses first.
-    ///
-    /// # Panics
-    ///
-    /// Same conditions as [`Document::run`].
-    pub fn run_until_load_timeout(&mut self, timeout: Duration) -> bool {
-        self.run_until_timeout(timeout, |document| !document.waiting_for_load())
-    }
-
-    /// Parks like [`Document::run`], but returns as soon as `stop` is true.
-    ///
-    /// # Panics
-    ///
-    /// Same conditions as [`Document::run`].
-    pub fn run_until(&mut self, mut stop: impl FnMut(&mut Self) -> bool) {
-        self.block_on_pump(None, |document| !stop(document) && !document.stopped());
-    }
-
-    /// Parks like [`Document::run_until`], returning `false` if `timeout`
-    /// elapses first.
-    ///
-    /// # Panics
-    ///
-    /// Same conditions as [`Document::run`].
-    pub fn run_until_timeout(
+    fn run_until_timeout(
         &mut self,
         timeout: Duration,
         mut stop: impl FnMut(&mut Self) -> bool,

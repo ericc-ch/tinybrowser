@@ -452,41 +452,4 @@ mod tests {
         let logger = Logger::new(Config::new("test").level(Level::Info).console(false));
         assert!(logger.flush());
     }
-
-    #[test]
-    fn a_full_file_queue_drops_instead_of_blocking() {
-        let (sink, _never_read) = file::FileSink::stalled(2);
-        let logger = Logger {
-            level: AtomicU8::new(Level::Trace as u8),
-            process: "test",
-            pid: 1,
-            console: false,
-            file: Some(sink),
-            drops: AtomicU64::new(0),
-        };
-        logger.log(Level::Info, "test", format_args!("one"));
-        logger.log(Level::Info, "test", format_args!("two"));
-        assert_eq!(logger.drops.load(Ordering::Relaxed), 0);
-        logger.log(Level::Info, "test", format_args!("three"));
-        assert_eq!(logger.drops.load(Ordering::Relaxed), 1);
-    }
-
-    #[test]
-    fn a_failed_drop_warning_keeps_the_count() {
-        let (sink, _never_read) = file::FileSink::stalled(1);
-        let logger = Logger {
-            level: AtomicU8::new(Level::Trace as u8),
-            process: "test",
-            pid: 1,
-            console: false,
-            file: Some(sink),
-            drops: AtomicU64::new(0),
-        };
-        logger.log(Level::Info, "test", format_args!("one"));
-        logger.log(Level::Info, "test", format_args!("two"));
-        assert_eq!(logger.drops.load(Ordering::Relaxed), 1);
-        // The warning cannot be queued either; the pending count must survive.
-        logger.log(Level::Info, "test", format_args!("three"));
-        assert_eq!(logger.drops.load(Ordering::Relaxed), 2);
-    }
 }

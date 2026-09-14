@@ -121,7 +121,7 @@ The value-only handle the browser process uses to command one renderer process. 
 _Avoid_: TabHandle (the tab handle protocols hold)
 
 **IPC seam**:
-The value-only message boundary between browser process and renderer process ([ADR 0011](adrs/0011-renderer-processes-per-site.md)). In-process backends implement the same messages for tests; the process backend puts them on a pipe or socket. HTTP is not used here.
+The value-only message boundary between browser process and renderer process ([ADR 0011](adrs/0011-renderer-processes-per-site.md)). Messages cross the renderer's stdin/stdout pipe. HTTP is not used here.
 _Avoid_: RPC, HTTP, CDP
 
 **Renderer site lock**:
@@ -141,7 +141,7 @@ The code and runtime that holds frames and their documents: HTML parser, `Dom`, 
 _Avoid_: renderer (as a code noun), content engine, browser engine
 
 **Renderer process**:
-The process hosting the page engine: one shared QuickJS `Runtime`, one Tokio waiter, and one `Document` plus realm per frame. Runs in its own OS process, one per live site instance, spawned from the same executable as `renderer`. It advances work while idle and never links `net` ([ADR 0011](adrs/0011-renderer-processes-per-site.md), [ADR 0014](adrs/0014-frames-and-per-frame-realms.md)). Tests and `Browser::ephemeral` may run the same loop in-process (local backend); production runs a process per site. Chromium calls it the renderer process, Gecko the content process ([Gecko process model](https://firefox-source-docs.mozilla.org/dom/ipc/process_model.html)).
+The process hosting the page engine: one shared QuickJS `Runtime`, one Tokio waiter, and one `Document` plus realm per frame. Runs in its own OS process, one per live site instance, spawned from the same executable as `renderer`. It advances work while idle and never links `net` ([ADR 0011](adrs/0011-renderer-processes-per-site.md), [ADR 0014](adrs/0014-frames-and-per-frame-realms.md)). Chromium calls it the renderer process, Gecko the content process ([Gecko process model](https://firefox-source-docs.mozilla.org/dom/ipc/process_model.html)).
 _Avoid_: content process (Gecko's name for the same thing; use renderer process), worker, TabActor
 
 **Site**:

@@ -1,4 +1,4 @@
-//! `QuickJS` host for one [`crate::Document`]: eval, timers, `fetch`, DOM host objects.
+//! `QuickJS` host for one document: eval, timers, `fetch`, DOM host objects.
 //!
 //! Callbacks live in JS (`__tb_timeouts`, `__tb_fetchCbs`). Rust holds
 //! integer ids so a `Function` never crosses the JS boundary. Invocation
@@ -353,7 +353,7 @@ globalThis.__tbMakeStyle = element => {
 };
 ";
 
-/// A value produced by [`crate::Document::execute_script`].
+/// A value produced by script evaluation.
 #[derive(Clone, Debug, PartialEq)]
 pub enum ScriptValue {
     /// JS `undefined`.

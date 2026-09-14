@@ -13,13 +13,11 @@ mod browser;
 mod link;
 mod network;
 mod profile;
-mod services;
 mod site;
 
-pub use actor::{RequestId, TabHandle, TabId};
+pub use actor::{TabHandle, TabId};
 pub use browser::{Browser, BrowserError, BrowserHandle};
-pub use link::Renderers;
 pub use net::{Agent, AgentBuilder};
-pub use network::{FetchHandle, NetworkSession, ProfileStore};
+pub use network::{NetworkSession, ProfileStore};
 pub use profile::{Profile, ProfileError, ProfileName};
 pub use renderer::{RemoteValue, ResourceLimit, ScriptFailure, TabError, TabEvent};
