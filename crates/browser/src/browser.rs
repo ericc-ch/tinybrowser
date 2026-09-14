@@ -7,11 +7,15 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use crate::actor::{TabActor, TabHandle, TabId};
-use crate::link::{RendererFactory, Renderers};
+use crate::link::RendererFactory;
 use crate::network::{NetworkSession, ProfileStore};
 use crate::profile::{Profile, ProfileName};
 
 /// Process-owned engine for one profile.
+///
+/// Renderer processes are the current executable invoked with `renderer` as
+/// its first argument. An embedding executable must dispatch that invocation
+/// to [`renderer::serve_stdio`].
 pub struct Browser {
     inner: Arc<Mutex<BrowserInner>>,
 }
@@ -31,20 +35,6 @@ pub struct BrowserHandle {
 }
 
 impl Browser {
-    /// Opens an in-memory browser with in-process renderers whose profile is
-    /// discarded at shutdown. Tests and embedding use this fast path.
-    ///
-    /// # Errors
-    ///
-    /// The JavaScript or networking session could not be initialized.
-    pub fn ephemeral() -> io::Result<Self> {
-        Self::with_store(
-            ProfileStore::memory(&Profile::default()),
-            net::AgentBuilder::new(),
-            Renderers::Local,
-        )
-    }
-
     /// Opens a browser on `profile` with cookies under the process XDG data
     /// home and renderer processes ([ADR 0011]).
     ///
@@ -64,37 +54,18 @@ impl Browser {
     ///
     /// The profile directory cannot be created, read, or exclusively locked.
     pub fn open_in(data_home: &Path, profile: &Profile) -> io::Result<Self> {
-        Self::open_in_with(data_home, profile, Renderers::Process)
-    }
-
-    /// [`Browser::open_in`] with an explicit renderer backend.
-    ///
-    /// # Errors
-    ///
-    /// The profile directory cannot be created, read, or exclusively locked.
-    pub fn open_in_with(
-        data_home: &Path,
-        profile: &Profile,
-        renderers: Renderers,
-    ) -> io::Result<Self> {
-        Self::with_store(
-            ProfileStore::open_in(data_home, profile)?,
+        NetworkSession::from_builder(
             net::AgentBuilder::new(),
-            renderers,
+            ProfileStore::open_in(data_home, profile)?,
         )
+        .map(Self::open_with_network)
     }
 
     /// Opens a browser that shares `network` (and its cookie jar) with
     /// renderer processes.
     #[must_use]
     pub fn open_with_network(network: NetworkSession) -> Self {
-        Self::open_with_network_and(network, Renderers::Process)
-    }
-
-    /// [`Browser::open_with_network`] with an explicit renderer backend.
-    #[must_use]
-    pub fn open_with_network_and(network: NetworkSession, renderers: Renderers) -> Self {
-        let renderers = Arc::new(RendererFactory::new(renderers, network.fetch_handle()));
+        let renderers = Arc::new(RendererFactory::new(network.fetch_handle()));
         Self {
             inner: Arc::new(Mutex::new(BrowserInner {
                 live: true,
@@ -104,15 +75,6 @@ impl Browser {
                 next_tab: 1,
             })),
         }
-    }
-
-    fn with_store(
-        store: ProfileStore,
-        builder: net::AgentBuilder,
-        renderers: Renderers,
-    ) -> io::Result<Self> {
-        NetworkSession::from_builder(builder, store)
-            .map(|network| Self::open_with_network_and(network, renderers))
     }
 
     /// Value-only handle for this browser.

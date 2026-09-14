@@ -20,5 +20,5 @@
 
 pub use browser::{
     AgentBuilder, Browser, BrowserError, BrowserHandle, Profile, ProfileError, ProfileName,
-    RemoteValue, RequestId, ScriptFailure, TabError, TabEvent, TabHandle, TabId,
+    RemoteValue, ScriptFailure, TabError, TabEvent, TabHandle, TabId,
 };

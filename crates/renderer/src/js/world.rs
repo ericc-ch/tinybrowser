@@ -454,11 +454,6 @@ impl World {
         self.documents.borrow_mut().remove(id)
     }
 
-    /// Id of the active document, when one is installed.
-    pub(crate) fn main_document_id(&self) -> Option<u32> {
-        self.document
-    }
-
     /// One `DOMImplementation` object per document, for identity.
     pub(crate) fn implementation(&self, id: NodeId) -> Option<Persistent<Value<'static>>> {
         self.implementations.get(&id.document_id()).cloned()

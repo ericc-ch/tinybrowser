@@ -4,9 +4,7 @@
 //! process dials, picks the site renderer, and mounts the document; the renderer
 //! owns the document. `TabHandle` is the protocol surface and stays value-only.
 
-use std::collections::VecDeque;
 use std::fmt;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::{self, JoinHandle};
@@ -22,7 +20,6 @@ use crate::link::{RendererFactory, RendererHandle};
 use crate::network::{FetchHandle, NavOutcome};
 use crate::site::Site;
 
-const MAX_EVENT_HISTORY: usize = 1024;
 const EVENT_SUBSCRIBER_CAPACITY: usize = 256;
 const COMMAND_CAPACITY: usize = 256;
 const MAX_WAITERS: usize = 256;
@@ -52,18 +49,6 @@ impl fmt::Display for TabId {
     }
 }
 
-/// Correlates one command with its reply.
-#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
-pub struct RequestId(u64);
-
-impl RequestId {
-    /// Numeric identity of this request.
-    #[must_use]
-    pub fn get(self) -> u64 {
-        self.0
-    }
-}
-
 enum Command {
     LoadHtml {
         html: String,
@@ -82,12 +67,6 @@ enum Command {
         timeout: Option<Duration>,
         reply: Sender<Result<RemoteValue, TabError>>,
     },
-    Run {
-        reply: Sender<Result<(), TabError>>,
-    },
-    RunUntilLoad {
-        reply: Sender<Result<(), TabError>>,
-    },
     RunUntilLoadTimeout {
         timeout: Duration,
         reply: Sender<Result<bool, TabError>>,
@@ -100,23 +79,6 @@ enum Command {
     DocumentUrl {
         reply: Sender<String>,
     },
-    ContentLanguage {
-        reply: Sender<Option<String>>,
-    },
-    CookieGet {
-        reply: Sender<String>,
-    },
-    CookieSet {
-        value: String,
-        reply: Sender<()>,
-    },
-    SetDocumentUrl {
-        url: String,
-        reply: Sender<Result<(), TabError>>,
-    },
-    Events {
-        reply: Sender<Vec<TabEvent>>,
-    },
     Subscribe {
         reply: Sender<Result<Receiver<TabEvent>, TabError>>,
     },
@@ -128,14 +90,7 @@ enum Command {
     },
 }
 
-struct Envelope {
-    request_id: RequestId,
-    command: Command,
-}
-
 enum Waiter {
-    Idle(Sender<Result<(), TabError>>),
-    Load(Sender<Result<(), TabError>>),
     LoadTimeout {
         deadline: Instant,
         reply: Sender<Result<bool, TabError>>,
@@ -151,9 +106,8 @@ enum Waiter {
 #[derive(Clone)]
 pub struct TabHandle {
     id: TabId,
-    next_request: Arc<AtomicU64>,
     current: Arc<Mutex<Option<Arc<RendererHandle>>>>,
-    tx: SyncSender<Envelope>,
+    tx: SyncSender<Command>,
 }
 
 impl TabHandle {
@@ -161,12 +115,6 @@ impl TabHandle {
     #[must_use]
     pub fn id(&self) -> TabId {
         self.id
-    }
-
-    /// Next request id that a command from this handle would use.
-    #[must_use]
-    pub fn next_request_id(&self) -> RequestId {
-        RequestId(self.next_request.load(Ordering::Relaxed))
     }
 
     /// Parses `html` into this tab and starts a new JS realm.
@@ -184,7 +132,7 @@ impl TabHandle {
     }
 
     /// Starts navigation. The tab continues independently; call
-    /// [`TabHandle::run_until_load`] only when the caller needs to wait.
+    /// [`TabHandle::run_until_load_timeout`] only when the caller needs to wait.
     ///
     /// # Errors
     ///
@@ -240,29 +188,8 @@ impl TabHandle {
         recv_result(&rx)
     }
 
-    /// Waits until no tab jobs remain without preventing other commands.
-    ///
-    /// # Errors
-    ///
-    /// [`TabError::ActorStopped`].
-    pub fn run(&self) -> Result<(), TabError> {
-        let (reply, rx) = mpsc::channel();
-        self.send(Command::Run { reply })?;
-        recv_result(&rx)
-    }
-
-    /// Waits until the current navigation has fired `load`.
-    ///
-    /// # Errors
-    ///
-    /// [`TabError::ActorStopped`].
-    pub fn run_until_load(&self) -> Result<(), TabError> {
-        let (reply, rx) = mpsc::channel();
-        self.send(Command::RunUntilLoad { reply })?;
-        recv_result(&rx)
-    }
-
-    /// Waits like [`TabHandle::run_until_load`], returning `false` on timeout.
+    /// Waits until the current navigation has fired `load`, returning `false`
+    /// on timeout.
     ///
     /// # Errors
     ///
@@ -299,67 +226,6 @@ impl TabHandle {
         recv_text(&rx)
     }
 
-    /// Document `Content-Language`, if any.
-    ///
-    /// # Errors
-    ///
-    /// [`TabError::ActorStopped`].
-    pub fn content_language(&self) -> Result<Option<String>, TabError> {
-        let (reply, rx) = mpsc::channel();
-        self.send(Command::ContentLanguage { reply })?;
-        recv_optional_text(&rx)
-    }
-
-    /// `document.cookie` getter.
-    ///
-    /// # Errors
-    ///
-    /// [`TabError::ActorStopped`].
-    pub fn document_cookie(&self) -> Result<String, TabError> {
-        let (reply, rx) = mpsc::channel();
-        self.send(Command::CookieGet { reply })?;
-        recv_text(&rx)
-    }
-
-    /// `document.cookie` setter.
-    ///
-    /// # Errors
-    ///
-    /// [`TabError::ActorStopped`].
-    pub fn set_document_cookie(&self, value: &str) -> Result<(), TabError> {
-        let (reply, rx) = mpsc::channel();
-        self.send(Command::CookieSet {
-            value: value.to_owned(),
-            reply,
-        })?;
-        recv_unit(&rx)
-    }
-
-    /// Sets the initial document URL before the first mount.
-    ///
-    /// # Errors
-    ///
-    /// [`TabError::InvalidUrl`] or [`TabError::ActorStopped`].
-    pub fn set_document_url(&self, url: &str) -> Result<(), TabError> {
-        let (reply, rx) = mpsc::channel();
-        self.send(Command::SetDocumentUrl {
-            url: url.to_owned(),
-            reply,
-        })?;
-        recv_result(&rx)
-    }
-
-    /// The most recent jobs that ran, in order, capped at 1,024 events.
-    ///
-    /// # Errors
-    ///
-    /// [`TabError::ActorStopped`].
-    pub fn events(&self) -> Result<Vec<TabEvent>, TabError> {
-        let (reply, rx) = mpsc::channel();
-        self.send(Command::Events { reply })?;
-        recv_events(&rx)
-    }
-
     /// Subscribes to tab events emitted after this call.
     ///
     /// # Errors
@@ -382,19 +248,6 @@ impl TabHandle {
         recv_bool(&rx)
     }
 
-    /// Asks the tab to stop. Further commands fail with
-    /// [`TabError::ActorStopped`].
-    ///
-    /// # Errors
-    ///
-    /// [`TabError::ActorStopped`] if the actor is already gone.
-    pub fn shutdown(&self) -> Result<(), TabError> {
-        self.interrupt_renderer();
-        let (reply, rx) = mpsc::channel();
-        self.send(Command::Shutdown { reply })?;
-        recv_unit(&rx)
-    }
-
     fn interrupt_renderer(&self) {
         if let Some(renderer) = self
             .current
@@ -407,13 +260,7 @@ impl TabHandle {
     }
 
     fn send(&self, command: Command) -> Result<(), TabError> {
-        let request_id = RequestId(self.next_request.fetch_add(1, Ordering::Relaxed));
-        self.tx
-            .send(Envelope {
-                request_id,
-                command,
-            })
-            .map_err(|_| TabError::ActorStopped)
+        self.tx.send(command).map_err(|_| TabError::ActorStopped)
     }
 }
 
@@ -421,23 +268,11 @@ fn recv_result<T>(rx: &Receiver<Result<T, TabError>>) -> Result<T, TabError> {
     rx.recv().unwrap_or(Err(TabError::ActorStopped))
 }
 
-fn recv_unit(rx: &Receiver<()>) -> Result<(), TabError> {
-    rx.recv().map_err(|_| TabError::ActorStopped)
-}
-
 fn recv_bool(rx: &Receiver<bool>) -> Result<bool, TabError> {
     rx.recv().map_err(|_| TabError::ActorStopped)
 }
 
 fn recv_text(rx: &Receiver<String>) -> Result<String, TabError> {
-    rx.recv().map_err(|_| TabError::ActorStopped)
-}
-
-fn recv_optional_text(rx: &Receiver<Option<String>>) -> Result<Option<String>, TabError> {
-    rx.recv().map_err(|_| TabError::ActorStopped)
-}
-
-fn recv_events(rx: &Receiver<Vec<TabEvent>>) -> Result<Vec<TabEvent>, TabError> {
     rx.recv().map_err(|_| TabError::ActorStopped)
 }
 
@@ -453,7 +288,6 @@ impl TabActor {
         let current = Arc::new(Mutex::new(None));
         let handle = TabHandle {
             id,
-            next_request: Arc::new(AtomicU64::new(1)),
             current: Arc::clone(&current),
             tx,
         };
@@ -471,10 +305,7 @@ impl TabActor {
     pub(crate) fn shutdown(&mut self) {
         self.handle.interrupt_renderer();
         let (reply, rx) = mpsc::channel();
-        let _ = self.handle.tx.send(Envelope {
-            request_id: RequestId(0),
-            command: Command::Shutdown { reply },
-        });
+        let _ = self.handle.tx.send(Command::Shutdown { reply });
         let _ = rx.recv_timeout(Duration::from_secs(2));
         if let Some(join) = self.join.take() {
             let _ = join.join();
@@ -505,7 +336,6 @@ struct Tab {
     site: Option<Site>,
     events_rx: Option<Receiver<(FrameId, TabEvent)>>,
     document_url: Url,
-    content_language: Option<String>,
     document_loaded: bool,
     nav_epoch: u64,
     nav_in_flight: Option<u64>,
@@ -513,7 +343,6 @@ struct Tab {
     nav: Option<ActiveNavigation>,
     dial_tx: Sender<(u64, Result<NavOutcome, ()>)>,
     dial_rx: Receiver<(u64, Result<NavOutcome, ()>)>,
-    events: VecDeque<TabEvent>,
     subscribers: Vec<SyncSender<TabEvent>>,
 }
 
@@ -534,7 +363,6 @@ impl Tab {
             site: None,
             events_rx: None,
             document_url: Url::parse("about:blank").expect("about:blank is a valid URL"),
-            content_language: None,
             document_loaded: false,
             nav_epoch: 0,
             nav_in_flight: None,
@@ -542,7 +370,6 @@ impl Tab {
             nav: None,
             dial_tx,
             dial_rx,
-            events: VecDeque::new(),
             subscribers: Vec::new(),
         }
     }
@@ -582,23 +409,6 @@ impl Tab {
             return Err(TabError::InvalidUrl { spec: spec.into() });
         }
         Ok(url)
-    }
-
-    fn set_document_url(&mut self, url: &str) -> Result<(), TabError> {
-        let parsed = Url::parse(url).map_err(|_| TabError::InvalidUrl { spec: url.into() })?;
-        if self.renderer.is_some() {
-            return Err(TabError::InvalidUrl { spec: url.into() });
-        }
-        self.document_url = parsed;
-        Ok(())
-    }
-
-    fn document_cookie(&self) -> String {
-        self.fetch.cookies_for(&self.document_url)
-    }
-
-    fn set_document_cookie(&self, value: &str) {
-        self.fetch.set_cookie(value, &self.document_url);
     }
 
     fn ensure_renderer(&mut self, site: &Site) -> Result<(), TabError> {
@@ -703,7 +513,6 @@ impl Tab {
     fn commit_navigation(&mut self, outcome: NavOutcome) -> bool {
         let site = Site::for_url(&outcome.final_url).unwrap_or_else(|| Site::opaque(self.id));
         self.document_url = outcome.final_url.clone();
-        self.content_language.clone_from(&outcome.content_language);
         let mount = Mount {
             url: outcome.final_url.to_string(),
             content_type: outcome.content_type,
@@ -737,29 +546,12 @@ impl Tab {
     }
 
     fn record_event(&mut self, event: TabEvent) {
-        if self.events.len() == MAX_EVENT_HISTORY {
-            self.events.pop_front();
-        }
-        self.events.push_back(event);
         self.subscribers
             .retain(|subscriber| matches!(subscriber.try_send(event), Ok(())));
     }
 
     fn busy(&self) -> bool {
         self.nav.is_some()
-    }
-
-    fn has_background_work(&mut self) -> bool {
-        if self.nav.is_some() {
-            return true;
-        }
-        if self.renderer.is_none() {
-            return false;
-        }
-        match self.renderer_request(RendererCommand::IsIdle) {
-            Ok(Reply::Bool(idle)) => !idle,
-            _ => false,
-        }
     }
 
     fn waiting_for_load(&self) -> bool {
@@ -774,7 +566,7 @@ impl Tab {
     }
 }
 
-fn actor_loop(rx: &Receiver<Envelope>, mut tab: Tab) {
+fn actor_loop(rx: &Receiver<Command>, mut tab: Tab) {
     let mut waiters = Vec::new();
     loop {
         tab.pump_renderer();
@@ -785,16 +577,15 @@ fn actor_loop(rx: &Receiver<Envelope>, mut tab: Tab) {
         } else {
             rx.recv().map_err(|_| RecvTimeoutError::Disconnected)
         };
-        let envelope = match received {
-            Ok(envelope) => envelope,
+        let command = match received {
+            Ok(command) => command,
             Err(RecvTimeoutError::Timeout) => {
                 resolve_waiters(&mut tab, &mut waiters);
                 continue;
             }
             Err(RecvTimeoutError::Disconnected) => break,
         };
-        let _request_id = envelope.request_id;
-        if handle_command(&mut tab, envelope.command, &mut waiters) {
+        if handle_command(&mut tab, command, &mut waiters) {
             return;
         }
         tab.pump_renderer();
@@ -835,12 +626,6 @@ fn handle_command(tab: &mut Tab, command: Command, waiters: &mut Vec<Waiter>) ->
                 .and_then(reply_value);
             let _ = reply.send(result);
         }
-        Command::Run { reply } => {
-            retain_waiter(waiters, Waiter::Idle(reply));
-        }
-        Command::RunUntilLoad { reply } => {
-            retain_waiter(waiters, Waiter::Load(reply));
-        }
         Command::RunUntilLoadTimeout { timeout, reply } => {
             retain_waiter(
                 waiters,
@@ -866,22 +651,6 @@ fn handle_command(tab: &mut Tab, command: Command, waiters: &mut Vec<Waiter>) ->
         }
         Command::DocumentUrl { reply } => {
             let _ = reply.send(tab.document_url.to_string());
-        }
-        Command::ContentLanguage { reply } => {
-            let _ = reply.send(tab.content_language.clone());
-        }
-        Command::CookieGet { reply } => {
-            let _ = reply.send(tab.document_cookie());
-        }
-        Command::CookieSet { value, reply } => {
-            tab.set_document_cookie(&value);
-            let _ = reply.send(());
-        }
-        Command::SetDocumentUrl { url, reply } => {
-            let _ = reply.send(tab.set_document_url(&url));
-        }
-        Command::Events { reply } => {
-            let _ = reply.send(tab.events.iter().copied().collect());
         }
         Command::Subscribe { reply } => {
             if tab.subscribers.len() == MAX_SUBSCRIBERS {
@@ -915,9 +684,6 @@ fn retain_waiter(waiters: &mut Vec<Waiter>, waiter: Waiter) {
         resource: ResourceLimit::TabWaiters,
     };
     match waiter {
-        Waiter::Idle(reply) | Waiter::Load(reply) => {
-            let _ = reply.send(Err(error));
-        }
         Waiter::LoadTimeout { reply, .. } | Waiter::JsTrue { reply, .. } => {
             let _ = reply.send(Err(error));
         }
@@ -929,12 +695,6 @@ fn resolve_waiters(tab: &mut Tab, waiters: &mut Vec<Waiter>) {
     let mut pending = Vec::new();
     for waiter in std::mem::take(waiters) {
         match waiter {
-            Waiter::Idle(reply) if !tab.has_background_work() => {
-                let _ = reply.send(Ok(()));
-            }
-            Waiter::Load(reply) if !tab.waiting_for_load() => {
-                let _ = reply.send(Ok(()));
-            }
             Waiter::LoadTimeout { reply, .. } if !tab.waiting_for_load() => {
                 let _ = reply.send(Ok(true));
             }
@@ -965,7 +725,7 @@ fn resolve_waiters(tab: &mut Tab, waiters: &mut Vec<Waiter>) {
                     });
                 }
             }
-            other => pending.push(other),
+            other @ Waiter::LoadTimeout { .. } => pending.push(other),
         }
     }
     *waiters = pending;

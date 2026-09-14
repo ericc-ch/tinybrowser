@@ -134,9 +134,6 @@ computed locally (day-from-civil), no `chrono`.
   its own `--log-level`/`--verbose`, or from `TINYBROWSER_LOG` when those
   flags are absent. A live daemon keeps its startup level; changing it needs
   a future CDP method.
-- In-process (local backend, `tab_probe`) renderer records use the same global
-  logger directly; no pump, no `process=renderer` tag.
-
 ### 7. Shutdown
 
 `main` becomes a thin wrapper that calls `logging::flush()` before returning

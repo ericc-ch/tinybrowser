@@ -2,7 +2,7 @@
 //!
 //! [ADR 0011](../../../docs/adrs/0011-renderer-processes-per-site.md): the
 //! handle is value-only; replies, events, and browser-service calls cross a
-//! channel pair (local backend) or a pipe (process backend).
+//! pipe.
 
 use std::collections::HashMap;
 use std::io::{self, BufRead, BufReader, Write};
@@ -16,9 +16,8 @@ use std::time::Duration;
 use crate::network::FetchHandle;
 use crate::site::Site;
 use renderer::{
-    BrowserServices, Command as RendererCommand, FrameId, FromRenderer, RENDERER_INBOX_CAPACITY,
-    RENDERER_OUTBOX_CAPACITY, Reply, ServiceCall, ServiceReply, Stop, TabError, TabEvent,
-    ToRenderer,
+    Command as RendererCommand, FrameId, FromRenderer, Reply, ServiceCall, ServiceReply, TabError,
+    TabEvent, ToRenderer,
 };
 
 /// Upper bound on one request to a renderer. The renderer budget is seconds;
@@ -32,15 +31,6 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 /// renderer protocol violation: dropping lifecycle events would corrupt tab
 /// state, while blocking the pump could strand a reply behind those events.
 const EVENT_SUBSCRIBER_CAPACITY: usize = 4096;
-
-/// Which backend hosts renderer work.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Renderers {
-    /// In-process renderer threads. Fast tests; no memory isolation.
-    Local,
-    /// One OS process per site instance, spawned as `renderer`.
-    Process,
-}
 
 /// Identity of one live renderer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -56,9 +46,7 @@ pub(crate) struct RendererHandle {
     alive: Arc<AtomicBool>,
     subscribers: EventSubscribers,
     next_request: Arc<AtomicU64>,
-    stop: Option<Arc<Stop>>,
-    child: Option<Arc<Mutex<Child>>>,
-    renderer_join: Option<JoinHandle<()>>,
+    child: Arc<Mutex<Child>>,
     pump_join: Option<JoinHandle<()>>,
     stderr_join: Option<JoinHandle<()>>,
 }
@@ -78,7 +66,11 @@ impl RendererHandle {
         }
         pending.insert(id, reply_tx);
         drop(pending);
-        if self.sink.send(ToRenderer::Request { id, command }).is_err() {
+        if self
+            .sink
+            .send(&ToRenderer::Request { id, command })
+            .is_err()
+        {
             self.pending
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
@@ -106,22 +98,17 @@ impl RendererHandle {
         rx
     }
 
-    /// Interrupts a blocked script now: the local backend flips the shared
-    /// stop flag; the process backend kills the child.
+    /// Interrupts a blocked script by killing the renderer process.
     pub(crate) fn interrupt(&self) {
-        if let Some(stop) = &self.stop {
-            stop.request();
-        }
-        if let Some(child) = &self.child {
-            let _ = child.lock().unwrap_or_else(PoisonError::into_inner).kill();
-        }
+        let _ = self
+            .child
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .kill();
     }
 
     /// Asks the renderer loop to stop without joining it.
     pub(crate) fn request_shutdown(&self) {
-        if let Some(stop) = &self.stop {
-            stop.request();
-        }
         let _ = self.sink.shutdown();
     }
 
@@ -131,15 +118,11 @@ impl RendererHandle {
         if let Some(join) = self.pump_join.take() {
             let _ = join.join();
         }
-        if let Some(child) = self.child.take() {
-            let mut child = child.lock().unwrap_or_else(PoisonError::into_inner);
-            let _ = child.kill();
-            let _ = child.wait();
-        }
+        let mut child = self.child.lock().unwrap_or_else(PoisonError::into_inner);
+        let _ = child.kill();
+        let _ = child.wait();
+        drop(child);
         if let Some(join) = self.stderr_join.take() {
-            let _ = join.join();
-        }
-        if let Some(join) = self.renderer_join.take() {
             let _ = join.join();
         }
     }
@@ -151,17 +134,15 @@ impl Drop for RendererHandle {
     }
 }
 
-/// Backend-selecting renderer factory.
+/// Renderer-process factory.
 pub(crate) struct RendererFactory {
-    backend: Renderers,
     fetch: FetchHandle,
     next: AtomicU64,
 }
 
 impl RendererFactory {
-    pub(crate) fn new(backend: Renderers, fetch: FetchHandle) -> Self {
+    pub(crate) fn new(fetch: FetchHandle) -> Self {
         Self {
-            backend,
             fetch,
             next: AtomicU64::new(1),
         }
@@ -174,46 +155,20 @@ impl RendererFactory {
     /// Process spawn failure.
     pub(crate) fn acquire(&self, site: &Site) -> io::Result<Arc<RendererHandle>> {
         let id = RendererId(self.next.fetch_add(1, Ordering::Relaxed));
-        match self.backend {
-            Renderers::Local => {
-                let services = Arc::new(crate::services::FetchServices::new(
-                    self.fetch.clone(),
-                    site.clone(),
-                ));
-                Ok(Arc::new(spawn_local(
-                    id,
-                    site,
-                    services,
-                    self.fetch.clone(),
-                )))
-            }
-            Renderers::Process => spawn_process(id, site, self.fetch.clone()).map(Arc::new),
-        }
+        spawn_process(id, site, self.fetch.clone()).map(Arc::new)
     }
 }
 
 #[derive(Clone)]
-enum Sink {
-    Local(SyncSender<ToRenderer>),
-    Pipe(Arc<Mutex<ChildStdin>>),
-}
+struct Sink(Arc<Mutex<ChildStdin>>);
 
 impl Sink {
-    fn send(&self, message: ToRenderer) -> io::Result<()> {
-        match self {
-            Self::Local(tx) => match tx.try_send(message) {
-                Ok(()) => Ok(()),
-                Err(TrySendError::Full(_)) => Err(io::Error::other("renderer inbox is full")),
-                Err(TrySendError::Disconnected(_)) => Err(io::Error::other("renderer stopped")),
-            },
-            Self::Pipe(stdin) => {
-                let line = renderer::encode_ipc_message(&message)?;
-                let mut stdin = stdin.lock().unwrap_or_else(PoisonError::into_inner);
-                stdin.write_all(&line)?;
-                stdin.write_all(b"\n")?;
-                stdin.flush()
-            }
-        }
+    fn send(&self, message: &ToRenderer) -> io::Result<()> {
+        let line = renderer::encode_ipc_message(message)?;
+        let mut stdin = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        stdin.write_all(&line)?;
+        stdin.write_all(b"\n")?;
+        stdin.flush()
     }
 
     fn shutdown(&self) -> io::Result<()> {
@@ -221,76 +176,11 @@ impl Sink {
             id: 0,
             command: RendererCommand::Shutdown,
         };
-        match self {
-            Self::Local(tx) => tx
-                .send(message)
-                .map_err(|_| io::Error::other("renderer stopped")),
-            Self::Pipe(_) => self.send(message),
-        }
+        self.send(&message)
     }
-}
-
-enum Incoming {
-    Local(Receiver<FromRenderer>),
-    Pipe(BufReader<std::process::ChildStdout>),
 }
 
 struct RendererViolation;
-
-fn spawn_local(
-    id: RendererId,
-    site: &Site,
-    services: Arc<dyn BrowserServices>,
-    fetch: FetchHandle,
-) -> RendererHandle {
-    let (to_tx, to_rx) = mpsc::sync_channel::<ToRenderer>(RENDERER_INBOX_CAPACITY);
-    let (from_tx, from_rx) = mpsc::sync_channel::<FromRenderer>(RENDERER_OUTBOX_CAPACITY);
-    let stop = Arc::new(Stop::new());
-    let renderer_stop = Arc::clone(&stop);
-    let renderer_name = format!("renderer-{id:?}");
-    let renderer_join = thread::Builder::new()
-        .name(renderer_name)
-        .spawn(move || renderer::run_with_stop(&to_rx, &from_tx, services, &renderer_stop))
-        .expect("renderer thread");
-    let sink = Sink::Local(to_tx);
-    let pending = Arc::new(Mutex::new(HashMap::new()));
-    let alive = Arc::new(AtomicBool::new(true));
-    let subscribers = Arc::new(Mutex::new(Vec::new()));
-    let pump_sink = sink.clone();
-    let pump_pending = Arc::clone(&pending);
-    let pump_alive = Arc::clone(&alive);
-    let pump_subscribers = Arc::clone(&subscribers);
-    let pump_stop = Arc::clone(&stop);
-    let pump_site = site.clone();
-    let name = format!("renderer-{id:?}-pump");
-    let pump_join = thread::Builder::new()
-        .name(name)
-        .spawn(move || {
-            let context = PumpContext {
-                sink: &pump_sink,
-                pending: &pump_pending,
-                alive: &pump_alive,
-                subscribers: &pump_subscribers,
-                fetch: &fetch,
-                site: &pump_site,
-                terminator: RendererTerminator::Local(pump_stop),
-            };
-            pump_loop(Incoming::Local(from_rx), &context, None);
-        })
-        .expect("renderer pump thread");
-    RendererHandle {
-        sink,
-        pending,
-        alive,
-        subscribers,
-        next_request: Arc::new(AtomicU64::new(1)),
-        stop: Some(stop),
-        child: None,
-        renderer_join: Some(renderer_join),
-        pump_join: Some(pump_join),
-        stderr_join: None,
-    }
-}
 
 fn spawn_process(id: RendererId, site: &Site, fetch: FetchHandle) -> io::Result<RendererHandle> {
     let mut command = Command::new(std::env::current_exe()?);
@@ -317,7 +207,7 @@ fn spawn_process(id: RendererId, site: &Site, fetch: FetchHandle) -> io::Result<
         return Err(io::Error::other("renderer stderr missing"));
     };
     let child = Arc::new(Mutex::new(child));
-    let sink = Sink::Pipe(Arc::new(Mutex::new(stdin)));
+    let sink = Sink(Arc::new(Mutex::new(stdin)));
     let pending = Arc::new(Mutex::new(HashMap::new()));
     let alive = Arc::new(AtomicBool::new(true));
     let subscribers = Arc::new(Mutex::new(Vec::new()));
@@ -339,13 +229,9 @@ fn spawn_process(id: RendererId, site: &Site, fetch: FetchHandle) -> io::Result<
                 subscribers: &pump_subscribers,
                 fetch: &fetch,
                 site: &pump_site,
-                terminator: RendererTerminator::Process(pump_child),
+                child: &pump_child,
             };
-            pump_loop(
-                Incoming::Pipe(BufReader::new(stdout)),
-                &context,
-                Some(ready_tx),
-            );
+            pump_loop(BufReader::new(stdout), &context, Some(ready_tx));
         })
         .expect("renderer pump thread");
     let stderr_join = thread::Builder::new()
@@ -368,9 +254,7 @@ fn spawn_process(id: RendererId, site: &Site, fetch: FetchHandle) -> io::Result<
         alive,
         subscribers,
         next_request: Arc::new(AtomicU64::new(1)),
-        stop: None,
-        child: Some(child),
-        renderer_join: None,
+        child,
         pump_join: Some(pump_join),
         stderr_join: Some(stderr_join),
     })
@@ -383,31 +267,7 @@ struct PumpContext<'a> {
     subscribers: &'a EventSubscribers,
     fetch: &'a FetchHandle,
     site: &'a Site,
-    terminator: RendererTerminator,
-}
-
-#[derive(Clone)]
-enum RendererTerminator {
-    Local(Arc<Stop>),
-    Process(Arc<Mutex<Child>>),
-}
-
-impl RendererTerminator {
-    fn terminate(&self, sink: &Sink) {
-        match self {
-            Self::Local(stop) => {
-                stop.request();
-                if matches!(sink, Sink::Local(_)) {
-                    let _ = sink.shutdown();
-                }
-            }
-            Self::Process(child) => {
-                let mut child = child.lock().unwrap_or_else(PoisonError::into_inner);
-                let _ = child.kill();
-                let _ = child.wait();
-            }
-        }
-    }
+    child: &'a Arc<Mutex<Child>>,
 }
 
 impl PumpContext<'_> {
@@ -449,24 +309,24 @@ impl PumpContext<'_> {
                     };
                     let worker_fetch = self.fetch.clone();
                     let worker_sink = self.sink.clone();
-                    let worker_terminator = self.terminator.clone();
+                    let worker_child = Arc::clone(self.child);
                     let worker_alive = Arc::clone(self.alive);
                     let submitted = self.fetch.try_submit(move || {
                         let outcome = worker_fetch.dial_request(&request, &initiator);
                         if worker_sink
-                            .send(ToRenderer::ServiceReply {
+                            .send(&ToRenderer::ServiceReply {
                                 id,
                                 reply: ServiceReply::Dial(outcome),
                             })
                             .is_err()
                         {
                             worker_alive.store(false, Ordering::Relaxed);
-                            worker_terminator.terminate(&worker_sink);
+                            terminate(&worker_child);
                         }
                     });
                     if submitted.is_err() {
                         self.sink
-                            .send(ToRenderer::ServiceReply {
+                            .send(&ToRenderer::ServiceReply {
                                 id,
                                 reply: ServiceReply::Dial(None),
                             })
@@ -479,7 +339,7 @@ impl PumpContext<'_> {
                     };
                     let reply = ServiceReply::Cookie(self.fetch.cookies_for(&url));
                     self.sink
-                        .send(ToRenderer::ServiceReply { id, reply })
+                        .send(&ToRenderer::ServiceReply { id, reply })
                         .map_err(|_| RendererViolation)?;
                 }
                 ServiceCall::CookieSet { value, url } => {
@@ -488,7 +348,7 @@ impl PumpContext<'_> {
                     };
                     self.fetch.set_cookie(&value, &url);
                     self.sink
-                        .send(ToRenderer::ServiceReply {
+                        .send(&ToRenderer::ServiceReply {
                             id,
                             reply: ServiceReply::Unit,
                         })
@@ -517,39 +377,32 @@ fn forward_stderr(stderr: std::process::ChildStderr) {
     }
 }
 
-fn pump_loop(incoming: Incoming, context: &PumpContext<'_>, ready: Option<Sender<bool>>) {
+fn pump_loop(
+    mut reader: BufReader<std::process::ChildStdout>,
+    context: &PumpContext<'_>,
+    ready: Option<Sender<bool>>,
+) {
     let mut ready = ready;
-    match incoming {
-        Incoming::Local(receiver) => {
-            while let Ok(message) = receiver.recv() {
-                if context.route(message).is_err() {
-                    break;
-                }
+    let mut buffer = Vec::new();
+    loop {
+        let message = match renderer::read_ipc_message(&mut reader, &mut buffer) {
+            Ok(Some(message)) => message,
+            Ok(None) => break,
+            Err(error) => {
+                logging::error!(target: "browser::link", "bad renderer message: {error}");
+                break;
             }
+        };
+        if let Some(ready_tx) = ready.take() {
+            let ok = matches!(message, FromRenderer::Ready);
+            let _ = ready_tx.send(ok);
+            if !ok {
+                break;
+            }
+            continue;
         }
-        Incoming::Pipe(mut reader) => {
-            let mut buffer = Vec::new();
-            loop {
-                let message = match renderer::read_ipc_message(&mut reader, &mut buffer) {
-                    Ok(Some(message)) => message,
-                    Ok(None) => break,
-                    Err(error) => {
-                        logging::error!(target: "browser::link", "bad renderer message: {error}");
-                        break;
-                    }
-                };
-                if let Some(ready_tx) = ready.take() {
-                    let ok = matches!(message, FromRenderer::Ready);
-                    let _ = ready_tx.send(ok);
-                    if !ok {
-                        break;
-                    }
-                    continue;
-                }
-                if context.route(message).is_err() {
-                    break;
-                }
-            }
+        if context.route(message).is_err() {
+            break;
         }
     }
     if let Some(ready_tx) = ready {
@@ -563,5 +416,11 @@ fn pump_loop(incoming: Incoming, context: &PumpContext<'_>, ready: Option<Sender
     context.alive.store(false, Ordering::Relaxed);
     pending.clear();
     drop(pending);
-    context.terminator.terminate(context.sink);
+    terminate(context.child);
+}
+
+fn terminate(child: &Arc<Mutex<Child>>) {
+    let mut child = child.lock().unwrap_or_else(PoisonError::into_inner);
+    let _ = child.kill();
+    let _ = child.wait();
 }

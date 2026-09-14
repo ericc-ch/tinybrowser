@@ -13,7 +13,7 @@ use std::thread;
 
 use url::Url;
 
-use crate::Stop;
+use crate::document::Stop;
 use crate::protocol::{
     BrowserServices, Command, DialCompletion, DialRequest, FromRenderer, RENDERER_INBOX_CAPACITY,
     RENDERER_OUTBOX_CAPACITY, ServiceCall, ServiceReply, ToRenderer,
@@ -47,7 +47,7 @@ pub fn serve_stdio() -> io::Result<()> {
     let reader_services = Arc::clone(&services);
     let reader_stop = Arc::clone(&stop);
     thread::spawn(move || read_messages(&command_tx, &reader_services, &reader_stop));
-    crate::run_with_stop(&command_rx, &out_tx, services, &stop);
+    crate::run(&command_rx, &out_tx, services, &stop);
     // The reader returns on `Shutdown`, dropping its `PipeServices` clone, so
     // the writer channel closes and the child can exit.
     drop(out_tx);

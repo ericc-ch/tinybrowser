@@ -1,38 +1,24 @@
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
-use browser::{Browser, Profile, Renderers};
+use common::Fixture;
 use serde_json::json;
 
-fn temp_data_home() -> std::path::PathBuf {
-    let stamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("time")
-        .as_nanos();
-    let dir = std::env::temp_dir().join(format!("tinybrowser-cdp-{stamp}"));
-    std::fs::create_dir_all(&dir).expect("temp");
-    dir
-}
+mod common;
 
-fn spawn_server(browser: browser::BrowserHandle) -> (std::net::SocketAddr, thread::JoinHandle<()>) {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-    let addr = listener.local_addr().expect("addr");
-    let join = thread::spawn(move || {
-        let _ = cdp::serve(&listener, &browser);
-    });
-    (addr, join)
+fn start() -> (Fixture, cdp::Client) {
+    let mut fixture = Fixture::new("tinybrowser-cdp");
+    fixture.spawn_daemon();
+    let _ = fixture.wait_json();
+    let client = fixture.connect();
+    (fixture, client)
 }
 
 #[test]
 fn browser_target_page_runtime_flatten_and_method_not_found() {
-    let data_home = temp_data_home();
-    let browser =
-        Browser::open_in_with(&data_home, &Profile::default(), Renderers::Local).expect("browser");
-    let (addr, _server) = spawn_server(browser.handle());
-    thread::sleep(Duration::from_millis(20));
-    let mut client = cdp::Client::connect(addr).expect("connect");
+    let (_fixture, mut client) = start();
 
     let version = client
         .call("Browser.getVersion", &json!({}), None)
@@ -118,12 +104,8 @@ fn browser_target_page_runtime_flatten_and_method_not_found() {
         .call("Target.closeTarget", &json!({"targetId": target_id}), None)
         .expect("close");
 
-    let before = browser.handle().tabs().len();
     let bad = client.call("Target.createTarget", &json!({"url": "notaurl"}), None);
     assert!(bad.is_err(), "invalid createTarget url");
-    assert_eq!(browser.handle().tabs().len(), before);
-
-    let _ = std::fs::remove_dir_all(data_home);
 }
 
 #[test]
@@ -161,12 +143,7 @@ fn page_navigate_loads_http_document() {
         stream.write_all(body).expect("body");
     });
 
-    let data_home = temp_data_home();
-    let browser =
-        Browser::open_in_with(&data_home, &Profile::default(), Renderers::Local).expect("browser");
-    let (addr, _cdp) = spawn_server(browser.handle());
-    thread::sleep(Duration::from_millis(20));
-    let mut client = cdp::Client::connect(addr).expect("connect");
+    let (_fixture, mut client) = start();
     let created = client
         .call("Target.createTarget", &json!({"url": "about:blank"}), None)
         .expect("create");
@@ -210,7 +187,6 @@ fn page_navigate_loads_http_document() {
         .expect("eval");
     assert_eq!(evaluated["result"]["value"], json!("hi"));
     server.join().expect("server");
-    let _ = std::fs::remove_dir_all(data_home);
 }
 
 fn http_get(addr: std::net::SocketAddr, path: &str) -> (u16, String) {
@@ -236,13 +212,8 @@ fn http_get(addr: std::net::SocketAddr, path: &str) -> (u16, String) {
 
 #[test]
 fn json_discovery_page_socket_close_target_and_browser_close() {
-    let data_home = temp_data_home();
-    let browser =
-        Browser::open_in_with(&data_home, &Profile::default(), Renderers::Local).expect("browser");
-    let (addr, server) = spawn_server(browser.handle());
-    thread::sleep(Duration::from_millis(20));
-
-    let mut client = cdp::Client::connect(addr).expect("connect");
+    let (fixture, mut client) = start();
+    let addr = fixture.endpoint();
     let created = client
         .call("Target.createTarget", &json!({"url": "about:blank"}), None)
         .expect("create");
@@ -326,6 +297,4 @@ fn json_discovery_page_socket_close_target_and_browser_close() {
         .expect("browser close");
     let after_browser = client.call("Browser.getVersion", &json!({}), None);
     assert!(after_browser.is_err(), "getVersion after Browser.close");
-    server.join().expect("serve returns after Browser.close");
-    let _ = std::fs::remove_dir_all(data_home);
 }

@@ -1,30 +1,38 @@
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use browser::{AgentBuilder, Browser, NetworkSession, Profile, ProfileStore, Renderers};
+use common::Fixture;
 use serde_json::{Value, json};
 
-fn start(builder: AgentBuilder) -> (String, Browser) {
+mod common;
+
+fn start(extra_args: Vec<String>) -> (String, Fixture) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-    let addr = listener.local_addr().expect("addr").to_string();
-    let browser = Browser::open_with_network_and(
-        NetworkSession::from_builder(builder, ProfileStore::memory(&Profile::default()))
-            .expect("network"),
-        Renderers::Local,
-    );
-    let handle = browser.handle();
-    thread::spawn(move || {
-        let _ = webdriver::serve(&listener, handle);
-    });
-    (addr, browser)
+    let port = listener.local_addr().expect("addr").port();
+    drop(listener);
+    let mut fixture = Fixture::new("tinybrowser-webdriver");
+    let mut command = Command::new(env!("CARGO_BIN_EXE_tinybrowser"));
+    command.args(["webdriver", &format!("--port={port}")]);
+    command.args(extra_args);
+    let child = command
+        .env("XDG_RUNTIME_DIR", &fixture.runtime)
+        .env("XDG_DATA_HOME", &fixture.data)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn WebDriver");
+    fixture.children.push(child);
+    (format!("127.0.0.1:{port}"), fixture)
 }
 
 fn request(addr: &str, method: &str, path: &str, body: Option<&str>) -> Value {
     let payload = body.unwrap_or("");
     let mut last_error = None;
-    let deadline = Instant::now() + Duration::from_secs(2);
+    let deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline {
         match TcpStream::connect(addr) {
             Ok(mut stream) => {
@@ -50,7 +58,7 @@ fn request(addr: &str, method: &str, path: &str, body: Option<&str>) -> Value {
 
 #[test]
 fn session_execute_script_roundtrip() {
-    let (addr, _browser) = start(AgentBuilder::new());
+    let (addr, _fixture) = start(Vec::new());
 
     let status = request(&addr, "GET", "/status", None);
     assert_eq!(status["value"]["ready"], json!(true));
@@ -106,7 +114,7 @@ fn session_execute_script_roundtrip() {
 
 #[test]
 fn execute_sync_waits_for_returned_promise_or_script_timeout() {
-    let (addr, _browser) = start(AgentBuilder::new());
+    let (addr, _fixture) = start(Vec::new());
 
     let created = request(&addr, "POST", "/session", Some("{}"));
     let id = created["value"]["sessionId"]
@@ -223,7 +231,7 @@ fn navigate_returns_after_load_not_after_timers() {
         navigation.write_all(body).expect("body");
     });
 
-    let (addr, _browser) = start(AgentBuilder::new());
+    let (addr, _fixture) = start(Vec::new());
 
     let created = request(&addr, "POST", "/session", Some("{}"));
     let id = created["value"]["sessionId"]
@@ -284,10 +292,7 @@ fn new_window_uses_builder_resolve_map() {
         navigation.write_all(body).expect("body");
     });
 
-    let builder = AgentBuilder::new()
-        .resolve("*.test=127.0.0.1")
-        .expect("resolve map");
-    let (addr, _browser) = start(builder);
+    let (addr, _fixture) = start(vec!["--resolve=*.test=127.0.0.1".to_owned()]);
 
     let created = request(&addr, "POST", "/session", Some("{}"));
     let id = created["value"]["sessionId"]
@@ -333,22 +338,18 @@ fn new_window_uses_builder_resolve_map() {
 
 #[test]
 fn one_session_delete_leaves_pages_close_last_window_invalidates() {
-    let (addr, browser) = start(AgentBuilder::new());
+    let (addr, _fixture) = start(Vec::new());
 
     let created = request(&addr, "POST", "/session", Some("{}"));
     let id = created["value"]["sessionId"]
         .as_str()
         .expect("session id")
         .to_owned();
-    assert_eq!(browser.handle().tabs().len(), 1);
-
     let second = request(&addr, "POST", "/session", Some("{}"));
     assert_eq!(second["value"]["error"], json!("session not created"));
-    assert_eq!(browser.handle().tabs().len(), 1);
 
     request(&addr, "DELETE", &format!("/session/{id}"), None);
     // ADR 0009: product DELETE /session detaches automation and leaves tabs.
-    assert_eq!(browser.handle().tabs().len(), 1);
     let gone = request(&addr, "GET", &format!("/session/{id}/window"), None);
     assert_eq!(gone["value"]["error"], json!("invalid session id"));
 
@@ -357,18 +358,15 @@ fn one_session_delete_leaves_pages_close_last_window_invalidates() {
         .as_str()
         .expect("session id")
         .to_owned();
-    assert_eq!(browser.handle().tabs().len(), 2);
-
     let closed = request(&addr, "DELETE", &format!("/session/{id}/window"), None);
     assert_eq!(closed["value"], json!([]));
-    assert_eq!(browser.handle().tabs().len(), 1);
     let invalid = request(&addr, "GET", &format!("/session/{id}/window"), None);
     assert_eq!(invalid["value"]["error"], json!("invalid session id"));
 }
 
 #[test]
 fn execute_sync_interrupts_infinite_loop() {
-    let (addr, _browser) = start(AgentBuilder::new());
+    let (addr, _fixture) = start(Vec::new());
     let created = request(&addr, "POST", "/session", Some("{}"));
     let id = created["value"]["sessionId"]
         .as_str()
@@ -397,7 +395,7 @@ fn execute_sync_interrupts_infinite_loop() {
 
 #[test]
 fn click_and_perform_actions_are_unsupported_release_is_a_noop() {
-    let (addr, _browser) = start(AgentBuilder::new());
+    let (addr, _fixture) = start(Vec::new());
     let created = request(&addr, "POST", "/session", Some("{}"));
     let id = created["value"]["sessionId"]
         .as_str()

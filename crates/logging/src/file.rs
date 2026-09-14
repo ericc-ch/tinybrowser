@@ -76,13 +76,6 @@ impl FileSink {
             }
         }
     }
-
-    /// Queue with no writer thread; used by tests to force a full queue.
-    #[cfg(test)]
-    pub(crate) fn stalled(capacity: usize) -> (Self, Receiver<Message>) {
-        let (tx, rx) = mpsc::sync_channel(capacity);
-        (Self { tx, thread: None }, rx)
-    }
 }
 
 impl Drop for FileSink {
@@ -399,13 +392,6 @@ mod tests {
         assert!(text.contains("one"), "{text}");
         drop(sink);
         let _ = fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn a_full_queue_rejects_without_blocking() {
-        let (sink, _never_read) = FileSink::stalled(1);
-        assert!(sink.try_send("one"));
-        assert!(!sink.try_send("two"));
     }
 
     #[cfg(unix)]

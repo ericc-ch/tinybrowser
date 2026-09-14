@@ -3,8 +3,7 @@
 //!
 //! [ADR 0011](../../../docs/adrs/0011-renderer-processes-per-site.md): the
 //! renderer owns `Document` and never links `net`; the browser process owns `Tab`, the
-//! tab, navigation, network, and cookies. The same [`run`] loop backs the
-//! in-process backend and the `renderer` child.
+//! tab, navigation, network, and cookies.
 
 use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
@@ -31,20 +30,21 @@ mod remote;
 mod serialize;
 mod xml;
 
-pub use document::{Document, ScriptValue, Stop};
-pub use engine::Engine;
+use document::Stop;
+use engine::Engine;
 pub use process::serve_stdio;
+use protocol::BrowserServices;
 pub use protocol::{
-    BrowserServices, Command, DialCompletion, DialKind, DialOutcome, DialRequest, FrameId,
-    FromRenderer, MAX_IPC_MESSAGE_BYTES, Mount, RENDERER_INBOX_CAPACITY, RENDERER_OUTBOX_CAPACITY,
-    Reply, ResourceLimit, ScriptFailure, ServiceCall, ServiceReply, TabError, TabEvent, ToRenderer,
-    encode_ipc_message, read_ipc_message,
+    Command, DialKind, DialOutcome, DialRequest, FrameId, FromRenderer, MAX_IPC_MESSAGE_BYTES,
+    Mount, RENDERER_INBOX_CAPACITY, RENDERER_OUTBOX_CAPACITY, Reply, ResourceLimit, ScriptFailure,
+    ServiceCall, ServiceReply, TabError, TabEvent, ToRenderer, encode_ipc_message,
+    read_ipc_message,
 };
 pub use remote::RemoteValue;
 
 /// The result of parsing one document.
 #[derive(Debug)]
-pub struct Parsed {
+pub(crate) struct Parsed {
     /// The parsed tree, rooted at [`Dom::document`].
     pub dom: dom::Dom,
     /// Compatibility mode selected by the doctype (or its absence).
@@ -115,19 +115,10 @@ impl ActiveParser {
 /// Broken markup is recovered exactly the way the HTML spec, and therefore
 /// every browser, mandates; that recovery is html5ever's job, not ours.
 #[must_use]
-pub fn parse_html(input: &str) -> Parsed {
-    parse_html_with_scripting(input, true)
-}
-
-/// Parses a full HTML document with the tree builder's
-/// [scripting flag](https://html.spec.whatwg.org/multipage/parsing.html#scripting-flag)
-/// set explicitly. The flag changes how `<noscript>` contents are parsed and
-/// feeds form-control behavior; conformance suites run both settings.
-#[must_use]
-pub fn parse_html_with_scripting(input: &str, scripting_enabled: bool) -> Parsed {
+pub(crate) fn parse_html(input: &str) -> Parsed {
     let opts = html5ever::ParseOpts {
         tree_builder: html5ever::tree_builder::TreeBuilderOpts {
-            scripting_enabled,
+            scripting_enabled: true,
             ..html5ever::tree_builder::TreeBuilderOpts::default()
         },
         ..html5ever::ParseOpts::default()
@@ -142,7 +133,7 @@ pub fn parse_html_with_scripting(input: &str, scripting_enabled: bool) -> Parsed
 /// namespaces. The returned tree is a document whose `html` element holds
 /// the fragment's nodes (html5ever's fragment root).
 #[must_use]
-pub fn parse_html_fragment(input: &str, context: &str, scripting_enabled: bool) -> Parsed {
+pub(crate) fn parse_html_fragment(input: &str, context: &str, scripting_enabled: bool) -> Parsed {
     let opts = html5ever::ParseOpts {
         tree_builder: html5ever::tree_builder::TreeBuilderOpts {
             scripting_enabled,
@@ -173,27 +164,13 @@ fn fragment_context_name(spec: &str) -> QualName {
     }
 }
 
-/// Runs one renderer loop until `Shutdown` or its inbox closes.
-///
-/// The in-process backend calls this on a thread; the `renderer` child calls
-/// it with the pipe's channels. Events and replies go to `outbox`.
-pub fn run(
-    inbox: &Receiver<ToRenderer>,
-    outbox: &SyncSender<FromRenderer>,
-    services: Arc<dyn BrowserServices>,
-) {
-    run_with_stop(inbox, outbox, services, &Arc::new(Stop::new()));
-}
-
-/// [`run`] with an externally owned stop flag, so an in-process host can
-/// interrupt a runaway script.
-pub fn run_with_stop(
+fn run(
     inbox: &Receiver<ToRenderer>,
     outbox: &SyncSender<FromRenderer>,
     services: Arc<dyn BrowserServices>,
     stop: &Arc<Stop>,
 ) {
-    let mut engine = Engine::with_stop(services, Arc::clone(stop));
+    let mut engine = Engine::new(services, Arc::clone(stop));
     loop {
         let received = if engine.has_background_work() {
             inbox.recv_timeout(Duration::from_millis(10))
@@ -241,10 +218,6 @@ fn handle_command(
             let value = engine.execute_remote_in(frame, &source, timeout);
             (Reply::Value(value), false)
         }
-        Command::SetDocumentUrl { frame, url } => {
-            (Reply::Unit(engine.set_document_url_in(frame, &url)), false)
-        }
-        Command::IsIdle => (Reply::Bool(!engine.has_background_work()), false),
         Command::Shutdown => {
             stop.request();
             (Reply::Unit(Ok(())), true)

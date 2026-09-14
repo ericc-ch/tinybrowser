@@ -82,9 +82,8 @@ the protocol adapters.
 - Renderer lifetime follows the document tree it hosts. Renderers are not put
   in an idle pool after navigation because old frame tasks must not survive into
   a later document.
-- The single-document public API of the `renderer` crate changes. The in-process
-  backend, the `renderer` child, and the renderer integration tests all drive
-  an `Engine`.
+- The `renderer` child drives a private `Engine`; browser-side callers use only
+  the value-only IPC protocol.
 - The renderer keeps one Tokio current-thread runtime and pumps all frames from
   it; `Document::run`'s per-document Tokio runtime and its "not inside another
   runtime" assertion are replaced by engine-level pumping.
