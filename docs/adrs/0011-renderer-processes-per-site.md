@@ -2,7 +2,7 @@
 
 tinybrowser isolates pages by **site instance**, not by tab and not by origin. Each
 site instance runs its page engine in a **renderer process** — the same executable
-spawned as `--renderer` — while the tab (`Tab`), navigation, network, and cookies
+spawned as `renderer` — while the tab (`Tab`), navigation, network, and cookies
 stay in the browser process. This replaces the "threads are the seam, process isolation
 is later" posture of [ADR 0010](0010-page-actor-ownership.md).
 
@@ -23,7 +23,7 @@ Browser-side authorization and resource bounds on this seam are specified by
   Principal Instance rule. v1 has no opener groups or network-backed cross-site
   iframe documents, so in practice each tab's current site is one site instance.
 - One OS process per live site instance: the same executable, invoked as
-  `tinybrowser --renderer`. The process boundary, not a thread, is the isolation
+  `tinybrowser renderer`. The process boundary, not a thread, is the isolation
   property.
 - The browser process owns **`Tab`** (tab): `TabId`, navigation state, the document URL, and
   the site decision; the browser process's `Browser` owns the renderer factory. The renderer
@@ -88,13 +88,13 @@ Engine ground truth:
   renderer entry point; `browser` keeps browser-side ownership. The seam's value types are
   defined before the crate split, so the crate boundary is not designed twice.
 - Tests use an in-process renderer backend for speed where the process boundary is
-  not under test; at least one loopback E2E test crosses a real `--renderer`
+  not under test; at least one loopback E2E test crosses a real `renderer`
   process.
 - Sandboxing (seccomp, namespaces) is a later security phase. Separate address
   spaces, value-only IPC, and the browser-side reference monitor in ADR 0016 are
   the current properties; they do not make an unsandboxed child safe against
   arbitrary native code execution.
-- `--renderer` is an internal mode, not a user feature, and is hidden from help.
+- `renderer` is a process subcommand of the same executable, used by the browser process to spawn site workers.
 
 ## Options considered
 

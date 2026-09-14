@@ -1,4 +1,4 @@
-//! Mode selection and flag parsing at the binary boundary.
+//! Subcommand selection and flag parsing at the binary boundary.
 
 mod common;
 
@@ -13,6 +13,11 @@ fn run(fixture: &Fixture, args: &[&str]) -> std::process::Output {
         .expect("run")
 }
 
+fn commands_table(help: &str) -> &str {
+    let rest = help.split("Commands:\n").nth(1).expect("Commands heading");
+    rest.split("\n\n").next().unwrap_or(rest)
+}
+
 #[test]
 fn short_v_prints_the_version() {
     let fixture = Fixture::new("tinybrowser-version");
@@ -24,31 +29,84 @@ fn short_v_prints_the_version() {
 }
 
 #[test]
+fn version_is_global() {
+    let fixture = Fixture::new("tinybrowser-version-global");
+    for args in [
+        &["daemon", "-v"][..],
+        &["renderer", "--version"],
+        &["webdriver", "-v"],
+    ] {
+        let output = run(&fixture, args);
+        assert!(output.status.success(), "{args:?}");
+        let out = String::from_utf8_lossy(&output.stdout);
+        assert!(out.contains("tinybrowser"), "{args:?}: {out}");
+        assert!(out.contains("0.1.0"), "{args:?}: {out}");
+    }
+}
+
+#[test]
 fn rejects_unknown_log_level() {
     let fixture = Fixture::new("tinybrowser-log-level");
     let output = run(&fixture, &["--log-level=noisy"]);
-    assert!(!output.status.success());
+    assert_eq!(output.status.code(), Some(2));
     let err = String::from_utf8_lossy(&output.stderr);
     assert!(err.contains("unknown log level"), "{err}");
 }
 
 #[test]
-fn daemon_rejects_webdriver_and_resolve() {
-    let fixture = Fixture::new("tinybrowser-mode-flags");
+fn help_lists_process_commands() {
+    let fixture = Fixture::new("tinybrowser-help");
+    let output = run(&fixture, &["--help"]);
+    assert!(output.status.success());
+    let out = String::from_utf8_lossy(&output.stdout);
+    let commands = commands_table(&out);
+    assert!(commands.contains("  daemon"), "{commands}");
+    assert!(commands.contains("  renderer"), "{commands}");
+    assert!(commands.contains("  webdriver"), "{commands}");
+}
 
-    let webdriver = run(&fixture, &["--daemon", "--webdriver=9"]);
-    assert!(!webdriver.status.success());
-    let err = String::from_utf8_lossy(&webdriver.stderr);
-    assert!(
-        err.contains("--daemon and --webdriver are mutually exclusive"),
-        "{err}"
-    );
+#[test]
+fn no_command_prints_help() {
+    let fixture = Fixture::new("tinybrowser-no-command");
+    let output = run(&fixture, &[]);
+    assert_eq!(output.status.code(), Some(2));
+    let out = String::from_utf8_lossy(&output.stdout);
+    let commands = commands_table(&out);
+    assert!(commands.contains("  daemon"), "{commands}");
+    assert!(commands.contains("  renderer"), "{commands}");
+    assert!(commands.contains("  webdriver"), "{commands}");
+}
 
-    let resolve = run(&fixture, &["--daemon", "--resolve=*.test=127.0.0.1"]);
-    assert!(!resolve.status.success());
-    let err = String::from_utf8_lossy(&resolve.stderr);
-    assert!(
-        err.contains("--daemon and --resolve are mutually exclusive"),
-        "{err}"
-    );
+#[test]
+fn old_mode_flags_are_rejected() {
+    let fixture = Fixture::new("tinybrowser-old-flags");
+    for args in [&["--daemon"][..], &["--renderer"], &["--webdriver=9"]] {
+        let output = run(&fixture, args);
+        assert_eq!(output.status.code(), Some(2), "{args:?}");
+    }
+}
+
+#[test]
+fn webdriver_requires_port() {
+    let fixture = Fixture::new("tinybrowser-webdriver-port");
+    let output = run(&fixture, &["webdriver"]);
+    assert_eq!(output.status.code(), Some(2));
+}
+
+#[test]
+fn profile_and_resolve_stay_on_their_commands() {
+    let fixture = Fixture::new("tinybrowser-flag-placement");
+    for args in [
+        &["--profile=default"][..],
+        &["--profile=default", "daemon"],
+        &["renderer", "--profile=default"],
+        &["renderer", "--resolve=*.test=127.0.0.1"],
+        &["--resolve=*.test=127.0.0.1"],
+        &["daemon", "--webdriver=9"],
+        &["daemon", "--resolve=*.test=127.0.0.1"],
+        &["daemon", "--port=9"],
+    ] {
+        let output = run(&fixture, args);
+        assert_eq!(output.status.code(), Some(2), "{args:?}");
+    }
 }

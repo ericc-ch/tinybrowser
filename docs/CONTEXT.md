@@ -43,7 +43,7 @@ Qualified element name: namespace plus optional prefix plus local name. Comes fr
 _Avoid_: tag name (only the local part)
 
 **Fan-in point**:
-The `browser` crate: browser-side ownership (Browser, tab `Tab`, `NetworkSession`, renderer link). Root `tinybrowser` depends on `browser`, `cdp`, `webdriver`, and `renderer` (the last only for the hidden `--renderer` mode). Root must not depend on `dom` or `net`. Both protocol crates depend only on `browser`, never on each other ([ADR 0007](adrs/0007-engine-charter.md), [ADR 0011](adrs/0011-renderer-processes-per-site.md)).
+The `browser` crate: browser-side ownership (Browser, tab `Tab`, `NetworkSession`, renderer link). Root `tinybrowser` depends on `browser`, `cdp`, `webdriver`, and `renderer` (the last only for the `renderer` subcommand). Root must not depend on `dom` or `net`. Both protocol crates depend only on `browser`, never on each other ([ADR 0007](adrs/0007-engine-charter.md), [ADR 0011](adrs/0011-renderer-processes-per-site.md)).
 _Avoid_: “only crate that may import two layers” as a religion; `cargo test -p dom` is allowed
 
 **Scope**:
@@ -141,7 +141,7 @@ The code and runtime that holds frames and their documents: HTML parser, `Dom`, 
 _Avoid_: renderer (as a code noun), content engine, browser engine
 
 **Renderer process**:
-The process hosting the page engine: one shared QuickJS `Runtime`, one Tokio waiter, and one `Document` plus realm per frame. Runs in its own OS process, one per live site instance, spawned from the same executable as `--renderer`. It advances work while idle and never links `net` ([ADR 0011](adrs/0011-renderer-processes-per-site.md), [ADR 0014](adrs/0014-frames-and-per-frame-realms.md)). Tests and `Browser::ephemeral` may run the same loop in-process (local backend); production runs a process per site. Chromium calls it the renderer process, Gecko the content process ([Gecko process model](https://firefox-source-docs.mozilla.org/dom/ipc/process_model.html)).
+The process hosting the page engine: one shared QuickJS `Runtime`, one Tokio waiter, and one `Document` plus realm per frame. Runs in its own OS process, one per live site instance, spawned from the same executable as `renderer`. It advances work while idle and never links `net` ([ADR 0011](adrs/0011-renderer-processes-per-site.md), [ADR 0014](adrs/0014-frames-and-per-frame-realms.md)). Tests and `Browser::ephemeral` may run the same loop in-process (local backend); production runs a process per site. Chromium calls it the renderer process, Gecko the content process ([Gecko process model](https://firefox-source-docs.mozilla.org/dom/ipc/process_model.html)).
 _Avoid_: content process (Gecko's name for the same thing; use renderer process), worker, TabActor
 
 **Site**:
@@ -153,7 +153,7 @@ The isolation unit: one site within one browsing context group. One renderer pro
 _Avoid_: origin (scheme + host + port), tab, domain
 
 **Browser process**:
-The process-side half of the browser: `Browser`, the tab registry, `NetworkSession`, the renderer factory, and the protocol adapters. One per profile, started as `--daemon` or `--webdriver`. Chromium calls it the browser process, Gecko the parent process ([Chromium multi-process architecture](https://www.chromium.org/developers/design-documents/multi-process-architecture/), [Gecko process model](https://firefox-source-docs.mozilla.org/dom/ipc/process_model.html)).
+The process-side half of the browser: `Browser`, the tab registry, `NetworkSession`, the renderer factory, and the protocol adapters. One per profile, started as `daemon` or `webdriver`. Chromium calls it the browser process, Gecko the parent process ([Chromium multi-process architecture](https://www.chromium.org/developers/design-documents/multi-process-architecture/), [Gecko process model](https://firefox-source-docs.mozilla.org/dom/ipc/process_model.html)).
 _Avoid_: host (as a noun), daemon process, browser (the `Browser` type), UI process
 
 **Browser**:
@@ -195,11 +195,11 @@ _Avoid_: a second tab object per socket
 **WebDriver**:
 W3C HTTP automation protocol. This is how wptrunner loads a real document and collects testharness results (`./tools/wpt/run [tests]`, which builds the binary and runs `./wpt run --binary … --ssl-type none tinybrowser`).
 
-A peer adapter over `BrowserHandle` and the selected profile ([ADR 0009](adrs/0009-named-profile-daemon.md)). `--webdriver=PORT` is the in-process WPT host. One active classic HTTP session. The session owns browsing-context selection, timeouts, element references, and input state only. WPT isolation is a temporary profile provided by the runner ([ADR 0008](adrs/0008-wpt-via-webdriver.md)).
+A peer adapter over `BrowserHandle` and the selected profile ([ADR 0009](adrs/0009-named-profile-daemon.md)). `tinybrowser webdriver --port=PORT` is the in-process WPT host. One active classic HTTP session. The session owns browsing-context selection, timeouts, element references, and input state only. WPT isolation is a temporary profile provided by the runner ([ADR 0008](adrs/0008-wpt-via-webdriver.md)).
 _Avoid_: CDP (CLI/agent control, not the WPT driver), WebDriver as owner of Browser or tabs
 
 **Resolve map**:
-Ordered `--resolve=PATTERN=ADDR` rewrites on `AgentBuilder`; `PATTERN` is an exact host or `*` glob, `ADDR` is an IPv4 literal or `fail`. First match wins. Default is empty (libc DNS). `./tools/wpt/run` passes the `.test` lines and skips WPT's `/etc/hosts` check; the binary does not remap unless the flag is set.
+Ordered `--resolve=PATTERN=ADDR` rewrites on the `webdriver` command (`AgentBuilder`); `PATTERN` is an exact host or `*` glob, `ADDR` is an IPv4 literal or `fail`. First match wins. Default is empty (libc DNS). `./tools/wpt/run` passes the `.test` lines and skips WPT's `/etc/hosts` check; the binary does not remap unless the flag is set.
 _Avoid_: hosts file, `/etc/hosts` for WPT
 
 **WPT gate**:

@@ -12,27 +12,18 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use browser::{AgentBuilder, Browser, NetworkSession, Profile, ProfileStore};
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use logging::{Config, Level, Logger};
 
 #[derive(Parser)]
 #[command(
     name = "tinybrowser",
     version,
+    propagate_version = true,
     disable_version_flag = true,
     about = "The smallest headless browser for AI agents"
 )]
 struct Cli {
-    /// Named profile (implicit name: `default`)
-    #[arg(
-        long,
-        global = true,
-        value_name = "NAME",
-        value_parser = parse_profile,
-        default_value = "default"
-    )]
-    profile: Profile,
-
     /// Minimum log level: error, warn, info, debug, or trace [default: info]
     ///
     /// A running daemon keeps its start-up level; `--verbose` is shorthand for
@@ -49,25 +40,47 @@ struct Cli {
         short = 'v',
         long = "version",
         short_alias = 'V',
+        global = true,
         action = clap::ArgAction::Version
     )]
     version: (),
 
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Run the profile daemon until the process exits
+    Daemon {
+        /// Named profile (implicit name: `default`)
+        #[arg(
+            long,
+            value_name = "NAME",
+            value_parser = parse_profile,
+            default_value = "default"
+        )]
+        profile: Profile,
+    },
+    /// Run a renderer worker on stdin/stdout
+    Renderer,
     /// Serve classic `WebDriver` on this loopback port
-    #[arg(long, value_name = "PORT")]
-    webdriver: Option<u16>,
-
-    /// Rewrite a host to an address; repeatable
-    #[arg(long = "resolve", global = true, value_name = "PATTERN=ADDR")]
-    resolve: Vec<String>,
-
-    /// Run the profile daemon until the process exits (internal)
-    #[arg(long, hide = true)]
-    daemon: bool,
-
-    /// Run a renderer worker on stdin/stdout (internal)
-    #[arg(long, hide = true)]
-    renderer: bool,
+    Webdriver {
+        /// Loopback port
+        #[arg(long, value_name = "PORT")]
+        port: u16,
+        /// Named profile (implicit name: `default`)
+        #[arg(
+            long,
+            value_name = "NAME",
+            value_parser = parse_profile,
+            default_value = "default"
+        )]
+        profile: Profile,
+        /// Rewrite a host to an address; repeatable
+        #[arg(long = "resolve", value_name = "PATTERN=ADDR")]
+        resolve: Vec<String>,
+    },
 }
 
 fn main() -> ExitCode {
@@ -81,37 +94,40 @@ fn main() -> ExitCode {
 }
 
 fn run(cli: &Cli) -> ExitCode {
-    if let Some(error) = mode_conflict(cli) {
-        return usage_error(error);
-    }
-    if cli.renderer {
-        return match renderer::serve_stdio() {
+    match &cli.command {
+        Some(Command::Renderer) => match renderer::serve_stdio() {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
                 logging::error!(target: "renderer", "{error}");
                 ExitCode::from(1)
             }
-        };
-    }
-    if cli.daemon {
-        return match daemon::data_home().and_then(|home| daemon::run(&cli.profile, &home)) {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(error) => {
-                logging::error!(target: "daemon", "{error}");
-                ExitCode::from(1)
+        },
+        Some(Command::Daemon { profile }) => {
+            match daemon::data_home().and_then(|home| daemon::run(profile, &home)) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(error) => {
+                    logging::error!(target: "daemon", "{error}");
+                    ExitCode::from(1)
+                }
             }
-        };
+        }
+        Some(Command::Webdriver {
+            port,
+            profile,
+            resolve,
+        }) => {
+            let builder = match resolve_builder(resolve) {
+                Ok(builder) => builder,
+                Err(error) => return usage_error(&error),
+            };
+            serve_webdriver(*port, builder, profile)
+        }
+        None => {
+            let mut command = <Cli as clap::CommandFactory>::command();
+            let _result = command.print_help();
+            ExitCode::from(2)
+        }
     }
-    let builder = match resolve_builder(&cli.resolve) {
-        Ok(builder) => builder,
-        Err(error) => return usage_error(&error),
-    };
-    if let Some(port) = cli.webdriver {
-        return serve_webdriver(port, builder, &cli.profile);
-    }
-    let mut command = <Cli as clap::CommandFactory>::command();
-    let _result = command.print_help();
-    ExitCode::from(2)
 }
 
 /// Installs the process logger for the mode and flags this invocation selected.
@@ -122,19 +138,15 @@ fn install_logger(cli: &Cli) {
         None
     });
     let level = requested.or_else(env_level).unwrap_or(Level::Info);
-    let process = if cli.renderer {
-        "renderer"
-    } else if cli.daemon {
-        "daemon"
-    } else if cli.webdriver.is_some() {
-        "webdriver"
-    } else {
-        "cli"
+    let process = match &cli.command {
+        Some(Command::Renderer) => "renderer",
+        Some(Command::Daemon { .. }) => "daemon",
+        Some(Command::Webdriver { .. }) => "webdriver",
+        None => "cli",
     };
     let mut config = Config::new(process).level(level);
-    if !cli.renderer
-        && (cli.daemon || cli.webdriver.is_some())
-        && let Some(path) = profile_log_file(&cli.profile)
+    if let Some(Command::Daemon { profile } | Command::Webdriver { profile, .. }) = &cli.command
+        && let Some(path) = profile_log_file(profile)
     {
         config = config.file(path);
     }
@@ -174,25 +186,6 @@ fn resolve_builder(specs: &[String]) -> Result<AgentBuilder, String> {
         builder = builder.resolve(spec).map_err(|error| error.to_string())?;
     }
     Ok(builder)
-}
-
-fn mode_conflict(cli: &Cli) -> Option<&'static str> {
-    if cli.renderer {
-        if cli.daemon || cli.webdriver.is_some() || !cli.resolve.is_empty() {
-            return Some("--renderer does not accept other modes or flags");
-        }
-        return None;
-    }
-    if !cli.daemon {
-        return None;
-    }
-    if cli.webdriver.is_some() {
-        return Some("--daemon and --webdriver are mutually exclusive");
-    }
-    if !cli.resolve.is_empty() {
-        return Some("--daemon and --resolve are mutually exclusive");
-    }
-    None
 }
 
 fn usage_error(message: &str) -> ExitCode {

@@ -14,9 +14,7 @@ on the browser-owned executor, and the renderer path takes no web-server stack.
 - CDP and WebDriver inbound HTTP is served by **axum** on a Tokio runtime. CDP
   WebSockets use axum's `ws` support. `net`'s outbound WebSocket client stays on
   tungstenite ([ADR 0006](0006-net-transport.md)).
-- CLI parsing is **clap** (derive). `--webdriver=PORT`, `--profile=NAME`,
-  `--resolve=PATTERN=ADDR`, and `--daemon` keep working; `create`, `list`, `select`,
-  `eval`, `navigate`, and `close` become real subcommands.
+- CLI parsing is **clap** (derive). Process modes are subcommands: `daemon`, `renderer`, and `webdriver --port=PORT`. `--profile=NAME` lives on `daemon` and `webdriver`; `--resolve=PATTERN=ADDR` lives on `webdriver`. `--log-level`, `--verbose`, and `--version` stay global. `create`, `list`, `select`, `eval`, `navigate`, and `close` become real subcommands later.
 - The `http1` crate is deleted once both adapters are ported.
 - The size budget is **10 MB stripped x86_64** (was 5 MB), tracked in AGENTS.md and
   `docs/researches/size-budget.md`. Milestones still measure marginals; the cap is a
@@ -46,7 +44,7 @@ on the browser-owned executor, and the renderer path takes no web-server stack.
 - `http1` leaves the workspace, its tests, and `CONTEXT.md`.
 - Blocking `BrowserHandle`/`TabHandle` calls inside async handlers go through
   `tokio::task::spawn_blocking`, never a blocking `send()` on a runtime worker.
-- The daemon and `--webdriver` mode each build a Tokio runtime for the server. Tab
+- The daemon and `webdriver` command each build a Tokio runtime for the server. Tab
   actors keep their own current-thread runtimes; no runtime is nested inside
   another.
 - `cargo test` CLI flag-error cases change with clap's messages; the tests assert

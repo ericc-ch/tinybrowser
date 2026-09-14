@@ -64,7 +64,7 @@ fn daemon_pid(fixture: &Fixture) -> u32 {
     u32::try_from(fixture.wait_json()["pid"].as_u64().expect("daemon pid")).expect("pid")
 }
 
-/// `--renderer` children of `daemon`, found through `/proc` (Linux).
+/// `renderer` children of `daemon`, found through `/proc` (Linux).
 fn renderer_children(daemon: u32) -> Vec<u32> {
     let mut children = Vec::new();
     let Ok(entries) = std::fs::read_dir("/proc") else {
@@ -80,7 +80,7 @@ fn renderer_children(daemon: u32) -> Vec<u32> {
         };
         if !cmdline
             .split(|byte| *byte == 0)
-            .any(|arg| arg == b"--renderer")
+            .any(|arg| arg == b"renderer")
         {
             continue;
         }

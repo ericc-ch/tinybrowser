@@ -15,11 +15,11 @@ and [ADR 0011](0011-renderer-processes-per-site.md) where they say "host",
 
 ### Processes
 
-- **browser process**: the process that runs `--daemon` or `--webdriver`. It
+- **browser process**: the process that runs `daemon` or `webdriver`. It
   owns the UI-less equivalents of UI, tabs, profiles, cookies, and networking.
   Equivalent to Chromium's browser process and Gecko's parent process; those are
   documented synonyms, not names we use.
-- **renderer process**: the process that runs `--renderer` and hosts the page
+- **renderer process**: the process that runs `renderer` and hosts the page
   engine for one site instance. Equivalent to Chromium's renderer process and
   Gecko's content process.
 - "host" is retired as a noun. Use **browser process** for the process and

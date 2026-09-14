@@ -34,7 +34,7 @@ impl Fixture {
 
     pub fn spawn_daemon(&mut self) -> u32 {
         let child = Command::new(env!("CARGO_BIN_EXE_tinybrowser"))
-            .args(["--daemon", "--profile=default"])
+            .args(["daemon", "--profile=default"])
             .env("XDG_RUNTIME_DIR", &self.runtime)
             .env("XDG_DATA_HOME", &self.data)
             .stdin(Stdio::null())
@@ -73,7 +73,7 @@ impl Fixture {
 
     pub fn spawn_daemon_with_env(&mut self, key: &str, value: &str) -> u32 {
         let child = Command::new(env!("CARGO_BIN_EXE_tinybrowser"))
-            .args(["--daemon", "--profile=default"])
+            .args(["daemon", "--profile=default"])
             .env("XDG_RUNTIME_DIR", &self.runtime)
             .env("XDG_DATA_HOME", &self.data)
             .env(key, value)

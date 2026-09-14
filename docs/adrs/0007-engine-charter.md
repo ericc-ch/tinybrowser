@@ -12,7 +12,7 @@ Status: accepted. Does not reopen [ADR 0002](0002-dom-layer-architecture.md) are
 | `browser` | `net`, `renderer` | browser side: Browser, tab `Tab`, tab registry, `NetworkSession`, renderer factory/backends ([ADR 0010](0010-page-actor-ownership.md), [ADR 0011](0011-renderer-processes-per-site.md)) |
 | `cdp` | `browser`, `axum` | CDP server/client adapter; no direct `dom`, `net`, `renderer`, or `webdriver` dependency ([ADR 0009](0009-named-profile-daemon.md), [ADR 0012](0012-host-protocol-and-cli-stack.md)) |
 | `webdriver` | `browser`, `axum` | classic WebDriver adapter over `BrowserHandle`; WPT endpoint ([ADR 0008](0008-wpt-via-webdriver.md)) |
-| root `tinybrowser` | `browser`, `cdp`, `webdriver`, `renderer` | embedder + bins; `renderer` only for the hidden `--renderer` mode |
+| root `tinybrowser` | `browser`, `cdp`, `webdriver`, `renderer` | embedder + bins; `renderer` only for the `renderer` subcommand |
 
 One compile-error law: `cdp` and `webdriver` must not depend on each other, `dom`, `net`, or `renderer`. `cargo test -p` a leaf crate is not reach-around. QuickJS lives in `renderer`. No `js` crate. No `HttpTransport` trait.
 

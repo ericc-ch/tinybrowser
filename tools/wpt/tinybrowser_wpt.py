@@ -84,7 +84,8 @@ class TinyBrowser(WebDriverBrowser):
         self._ensure_profile()
         return [
             self.webdriver_binary,
-            f"--webdriver={self.port}",
+            "webdriver",
+            f"--port={self.port}",
             "--resolve=nonexistent.*.test=fail",
             "--resolve=*.test=127.0.0.1",
             "--resolve=*.test.=127.0.0.1",

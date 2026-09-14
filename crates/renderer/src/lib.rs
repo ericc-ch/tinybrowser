@@ -4,7 +4,7 @@
 //! [ADR 0011](../../../docs/adrs/0011-renderer-processes-per-site.md): the
 //! renderer owns `Document` and never links `net`; the browser process owns `Tab`, the
 //! tab, navigation, network, and cookies. The same [`run`] loop backs the
-//! in-process backend and the `--renderer` child.
+//! in-process backend and the `renderer` child.
 
 use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
@@ -175,7 +175,7 @@ fn fragment_context_name(spec: &str) -> QualName {
 
 /// Runs one renderer loop until `Shutdown` or its inbox closes.
 ///
-/// The in-process backend calls this on a thread; the `--renderer` child calls
+/// The in-process backend calls this on a thread; the `renderer` child calls
 /// it with the pipe's channels. Events and replies go to `outbox`.
 pub fn run(
     inbox: &Receiver<ToRenderer>,

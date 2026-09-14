@@ -117,8 +117,8 @@ computed locally (day-from-civil), no `chrono`.
 | Process | Console | File | Level from |
 | --- | --- | --- | --- |
 | CLI command | stderr | no | its own `--log-level`/`--verbose` |
-| `--daemon` | stderr (null when detached) | `<data_home>/tinybrowser/logs/<profile>.log` | its own flags, passed by the spawner |
-| `--webdriver` | stderr | same per-profile file | its own flags |
+| `daemon` | stderr (null when detached) | `<data_home>/tinybrowser/logs/<profile>.log` | its own flags, passed by the spawner |
+| `webdriver` | stderr | same per-profile file | its own flags |
 | renderer child | stderr, forwarded | no | `TINYBROWSER_LOG` env from browser |
 
 - `data_home` is `ProfileStore::data_home()`; logs sit next to the store, not
@@ -130,10 +130,10 @@ computed locally (day-from-civil), no `chrono`.
   `process=renderer`. This keeps **one file writer** for the daemon (no
   cross-process rotation races) and keeps `stdout` pure IPC.
 - The renderer child receives `TINYBROWSER_LOG=<level>` from the browser;
-  `main` reads it in `--renderer` mode. A detached daemon receives the same env
-  from `daemon::spawn_detached`, so `tinybrowser --verbose create ...` starts a
-  daemon at `Debug` if one is not already running. A live daemon keeps its
-  startup level; changing it needs a future CDP method.
+  `main` reads it in the `renderer` command. A daemon keeps the level from
+  its own `--log-level`/`--verbose`, or from `TINYBROWSER_LOG` when those
+  flags are absent. A live daemon keeps its startup level; changing it needs
+  a future CDP method.
 - In-process (local backend, `tab_probe`) renderer records use the same global
   logger directly; no pump, no `process=renderer` tag.
 
@@ -155,8 +155,7 @@ buffered batch and any records still queued.
 - `src/main.rs`: `--log-level`/`--verbose`, `-v` version action, per-mode
   `Config`, per-profile log path, flush wrapper; fatal errors become
   `logging::error!` after install.
-- `src/daemon.rs`: `spawn_detached` passes the current level to the child via
-  `TINYBROWSER_LOG`; the daemon logs its bound port.
+- `src/daemon.rs`: the daemon logs its bound port.
 - `crates/browser/src/link.rs`: piped stderr + forwarding thread;
   `TINYBROWSER_LOG` for the child.
 - `crates/*/Cargo.toml`, root `Cargo.toml`: workspace member and dependencies.
@@ -189,7 +188,7 @@ buffered batch and any records still queued.
 - A log level is not inheritable by an already-running daemon or by later CLI
   calls; the `--log-level` help says so.
 - The console sink is a synchronous stderr write. A process whose stderr
-  consumer stops draining (for example, a foreground `--webdriver` piped into a
+  consumer stops draining (for example, a foreground `webdriver` piped into a
   stalled reader) can backpressure a renderer through the browser's forwarding
   pipe; the detached daemon's null stderr is immune. Making the console
   non-blocking needs `O_NONBLOCK` (unsafe) or a second writer thread.

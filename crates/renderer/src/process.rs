@@ -1,4 +1,4 @@
-//! `--renderer` child transport: one JSON object per line over stdin/stdout.
+//! `renderer` child transport: one JSON object per line over stdin/stdout.
 //!
 //! [ADR 0011](../../../docs/adrs/0011-renderer-processes-per-site.md): the
 //! child is the same executable; commands arrive on stdin, replies, events,

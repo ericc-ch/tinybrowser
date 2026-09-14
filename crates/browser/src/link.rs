@@ -25,7 +25,7 @@ use renderer::{
 /// this is a last-resort wake-up if its reply path dies silently.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// How long a `--renderer` child has to say [`FromRenderer::Ready`].
+/// How long a `renderer` child has to say [`FromRenderer::Ready`].
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Bounded renderer-pump handoff to its owning tab actor. Saturation is a
@@ -38,7 +38,7 @@ const EVENT_SUBSCRIBER_CAPACITY: usize = 4096;
 pub enum Renderers {
     /// In-process renderer threads. Fast tests; no memory isolation.
     Local,
-    /// One OS process per site instance, spawned as `--renderer`.
+    /// One OS process per site instance, spawned as `renderer`.
     Process,
 }
 
@@ -295,7 +295,7 @@ fn spawn_local(
 fn spawn_process(id: RendererId, site: &Site, fetch: FetchHandle) -> io::Result<RendererHandle> {
     let mut command = Command::new(std::env::current_exe()?);
     command
-        .arg("--renderer")
+        .arg("renderer")
         .env("TINYBROWSER_LOG", logging::level().as_str())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

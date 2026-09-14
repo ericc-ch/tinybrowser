@@ -3,7 +3,7 @@
 //! [ADR 0011](../../../docs/adrs/0011-renderer-processes-per-site.md): commands,
 //! request ids, events, script results, and explicit errors cross. DOM handles,
 //! `QuickJS` values, callbacks, and `net` types never do. The same types back the
-//! in-process backend and the `--renderer` pipe.
+//! in-process backend and the `renderer` pipe.
 
 use std::fmt;
 use std::io::{self, BufRead, Read, Write};
@@ -343,7 +343,7 @@ pub enum ToRenderer {
 /// Renderer to host traffic.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum FromRenderer {
-    /// First message from a `--renderer` child: protocol handshake.
+    /// First message from a `renderer` child: protocol handshake.
     Ready,
     /// Answer to a request.
     Reply {
@@ -441,7 +441,7 @@ pub type DialCompletion = Arc<dyn Fn(Option<DialOutcome>) + Send + Sync + 'stati
 /// Host services the renderer reaches through the browser-process seam.
 ///
 /// In-process this is the `browser` crate's network adapter. In the
-/// `--renderer` child it is a pipe proxy. Renderer code never names `net`.
+/// `renderer` child it is a pipe proxy. Renderer code never names `net`.
 pub trait BrowserServices: Send + Sync + 'static {
     /// Submits one GET without blocking the renderer thread. The completion
     /// receives `None` for transport, timeout, queue, or body-limit failure.

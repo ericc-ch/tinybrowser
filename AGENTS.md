@@ -1,6 +1,6 @@
 # tinybrowser
 
-We are building a headless browser for AI agents as one executable. There is no separately shipped or versioned helper program such as chromedriver or Node. The same tinybrowser executable may self-spawn a detached browser process (`--daemon`) and one renderer process per site instance ([ADR 0011](docs/adrs/0011-renderer-processes-per-site.md)); sandboxing renderers is a later security phase. Dynamic linking for standard system libraries like libc and OpenSSL is fine. The target binary size is under 10MB stripped on x86_64. Measure binary size at milestones.
+We are building a headless browser for AI agents as one executable. There is no separately shipped or versioned helper program such as chromedriver or Node. The same tinybrowser executable may self-spawn a detached browser process (`daemon`) and one renderer process per site instance (`renderer`; [ADR 0011](docs/adrs/0011-renderer-processes-per-site.md)); sandboxing renderers is a later security phase. Dynamic linking for standard system libraries like libc and OpenSSL is fine. The target binary size is under 10MB stripped on x86_64. Measure binary size at milestones.
 Prefer the light path that stays fast for one document: our task list, Tokio only as the waiter, not a web-server stack.
 
 ## Testing and conformance

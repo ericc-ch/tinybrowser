@@ -10,20 +10,18 @@ The WPT pin is the **full** tree at SHA `92054a74d0c6a1ed2e9024d71ebf2880f2af02e
 
 ## Isolation
 
-WebDriver is a peer adapter over `BrowserHandle` ([ADR 0009](0009-named-profile-daemon.md)). `--webdriver=PORT` remains the WPT endpoint.
+WebDriver is a peer adapter over `BrowserHandle` ([ADR 0009](0009-named-profile-daemon.md)). `tinybrowser webdriver --port=PORT` is the WPT endpoint.
 
 The runner gives each WebDriver endpoint a fresh temporary profile. `TinyBrowser` sets `XDG_RUNTIME_DIR` and `XDG_DATA_HOME` to a new temp tree before launch, and deletes that tree on `stop` / `cleanup`. It must not select a dirty persistent profile.
 
 Product `DELETE /session` detaches automation and preserves persistent tabs and data. Explicit close-window closes the selected tab, including the last tab, with spec-correct session behavior. Those product rules are not WPT isolation.
 
-The exact launch flag may stay `--webdriver=PORT` or change. That flag is open. The isolation grain is not.
-
 ## What shipped
 
-- Classic WebDriver on `tinybrowser --webdriver=PORT` as a `BrowserHandle` adapter (the `webdriver` crate; root `tinybrowser` depends on it). This is the WPT endpoint ([ADR 0009](0009-named-profile-daemon.md)).
+- Classic WebDriver on `tinybrowser webdriver --port=PORT` as a `BrowserHandle` adapter (the `webdriver` crate; root `tinybrowser` depends on it). This is the WPT endpoint ([ADR 0009](0009-named-profile-daemon.md)).
 - Out-of-tree wptrunner product (`tools/wpt`) plus `./tools/wpt/run`. Each endpoint gets a fresh temporary XDG profile.
 - HTTP-only first bar: `--ssl-type none` (HTTPS testharness files are excluded until cert trust exists). `./tools/wpt/run` also drops extra listen ports (`https-*`, `http-local`, `http-public`, `ws`, `dns`, …) so the runner does not bind extra loopbacks or start a DNS server.
-- Hosts: `./tools/wpt/run` skips WPT’s `/etc/hosts` check and launches `tinybrowser --webdriver=PORT --resolve=*.test=127.0.0.1` (plus `nonexistent.*.test=fail` and `*.test.`). No machine hosts file. Do not patch vendored WPT.
+- Hosts: `./tools/wpt/run` skips WPT’s `/etc/hosts` check and launches `tinybrowser webdriver --port=PORT --resolve=*.test=127.0.0.1` (plus `nonexistent.*.test=fail` and `*.test.`). No machine hosts file. Do not patch vendored WPT.
 - `./tools/wpt/run` passes `--no-pause-after-test` (wptrunner otherwise pauses after a single file, and testharness `output: 1` never finishes on our DOM) and `--no-restart-on-unexpected`.
 - Product expectations live outside the vendored tree under tools/wpt/metadata;
   the runner supplies that metadata root together with WPT's pinned manifest.

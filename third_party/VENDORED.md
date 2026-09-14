@@ -13,7 +13,7 @@ the binary; it exists so tests are reproducible and offline-capable.
 - **Pinned revision**: `92054a74d0c6a1ed2e9024d71ebf2880f2af02e2`
 - **License**: each test's own license; see WPT `LICENSE.md`.
 - **Fresh clones**: `git submodule update --init --recursive`.
-- **Driver**: classic WebDriver on `tinybrowser --webdriver=PORT` over
+- **Driver**: classic WebDriver on `tinybrowser webdriver --port=PORT` over
   `BrowserHandle`, with a fresh temporary XDG profile per endpoint
   ([ADR 0008](../docs/adrs/0008-wpt-via-webdriver.md)).
 - **Runner**: `./tools/wpt/run [tests]` builds the debug binary, installs `tools/wpt` into the WPT venv, skips the `/etc/hosts` check, and passes `--ssl-type none` plus `--resolve`

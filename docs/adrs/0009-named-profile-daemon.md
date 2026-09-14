@@ -38,7 +38,7 @@ Classic WebDriver is a peer adapter over `BrowserHandle` and the selected persis
 
 Allow one active classic WebDriver HTTP session, matching the endpoint-node model. Product `DELETE /session` detaches automation and leaves persistent tabs and profile data alive. Explicit close-window closes the selected tab, including the last tab, with spec-correct session behavior.
 
-WPT isolation, runner teardown, and the future launch flag are in [ADR 0008](0008-wpt-via-webdriver.md).
+WPT isolation, runner teardown, and the launch command are in [ADR 0008](0008-wpt-via-webdriver.md).
 
 ## Options considered
 
@@ -52,6 +52,6 @@ WPT isolation, runner teardown, and the future launch flag are in [ADR 0008](000
 
 ## Consequences
 
-- `tinybrowser --webdriver=PORT` is the WPT endpoint: classic WebDriver over `BrowserHandle`, with a runner-supplied temporary profile ([ADR 0008](0008-wpt-via-webdriver.md)). The product CLI talks CDP to a named-profile daemon.
+- `tinybrowser webdriver --port=PORT` is the WPT endpoint: classic WebDriver over `BrowserHandle`, with a runner-supplied temporary profile ([ADR 0008](0008-wpt-via-webdriver.md)). The product CLI talks CDP to a named-profile daemon.
 - Cookies persist through `ProfileStore` under `XDG_DATA_HOME`. The live jar stays on `net::Agent`.
 - The `cdp` crate depends on `browser` and inbound `axum` ([ADR 0012](0012-host-protocol-and-cli-stack.md)). Root wires it beside `webdriver`; the protocol crates do not depend on each other ([ADR 0007](0007-engine-charter.md)).
