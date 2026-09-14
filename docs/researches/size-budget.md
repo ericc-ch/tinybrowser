@@ -514,3 +514,35 @@ The delta covers three checkpoints: executable-owned runtime, async owner tasks
 replacing the registry mutex and per-tab threads, and the framed platform
 channel. It includes the Tokio `rt`/`sync`/`time`/`macros` features that the
 browser crate now enables directly.
+
+## Milestone: async renderer loop, P5 (2026-09-15)
+
+P5 moved the browser renderer host to Tokio tasks with oneshot replies and async
+shutdown and reaping, and moved the renderer loop to one current-thread runtime
+that selects commands, dial completions, timer deadlines, and shutdown. The
+engine's private waiter runtime and the 10 ms scheduler poll are gone. Command:
+`nix develop --command cargo build --release --bin tinybrowser`; rustc 1.98.0,
+stripped x86_64 release profile.
+
+| Artifact | After P2-P4 | After P5 | Delta | Headroom to 10,000,000 |
+| --- | ---: | ---: | ---: | ---: |
+| CLI (`target/release/tinybrowser`) | 5,857,840 | 5,891,456 | **+33,616** | 4,108,544 |
+
+## Measurement: 100-tab E0, P5 (2026-09-15)
+
+The E0 harness created 100 CDP targets on a release daemon with a fresh
+profile, then measured the whole process tree after five seconds of idle.
+
+| Metric | v1 (2026-09-14) | P5 |
+| --- | ---: | ---: |
+| Targets | 100 | 101 (one initial) |
+| Creation | 4.2 s | **702 ms** |
+| Threads | 629 | **323** |
+| File descriptors | ~300-600 (est.) | 925 |
+| PSS | 233 MB | **210 MB** |
+| Idle CPU | <=1% | **0%** |
+
+One renderer process still serves each blank target because blank sharing and
+the process budget are P11 work. File descriptors are the tight metric: 925 is
+close to a 1024 soft limit, so the process policy checkpoint must bound channel
+and pipe descriptors or raise the limit explicitly.

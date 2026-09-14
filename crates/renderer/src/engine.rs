@@ -9,27 +9,27 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+use tokio::sync::Notify;
+use tokio::time::Instant;
 
 use crate::RemoteValue;
-use crate::document::{Document, Stop, Waiter};
+use crate::document::{Document, Stop};
 use crate::documents::DocumentStore;
 use crate::js::{DocumentStreamCommand, FrameNavigation, RealmRegistry, SharedJsRuntime};
 use crate::protocol::{BrowserServices, FrameId, Mount, TabError, TabEvent};
 
-/// How long one frame may occupy the waiter before the engine gives the next
-/// frame a turn.
-const FRAME_STEP: Duration = Duration::from_millis(1);
 const MAX_FRAMES: usize = 64;
 
 /// One renderer process's page engine.
 ///
 /// The main frame is the tab's top-level document; child frames share the
-/// engine's heap and waiter, so same-site frames can pass JavaScript objects
-/// synchronously.
+/// engine's heap and wake handle, so same-site frames can pass JavaScript
+/// objects synchronously.
 pub(crate) struct Engine {
     js_runtime: SharedJsRuntime,
-    waiter: Waiter,
+    wake: Arc<Notify>,
     /// Every frame's trees, shared across their realms.
     documents: Rc<RefCell<DocumentStore>>,
     /// Document ownership and the shared wrapper cache.
@@ -43,15 +43,18 @@ pub(crate) struct Engine {
 }
 
 impl Engine {
-    pub(crate) fn new(services: Arc<dyn BrowserServices>, stop: Arc<Stop>) -> Self {
+    pub(crate) fn new(
+        services: Arc<dyn BrowserServices>,
+        stop: Arc<Stop>,
+        wake: Arc<Notify>,
+    ) -> Self {
         let js_runtime = SharedJsRuntime::default();
-        let waiter = Waiter::new();
         let documents = Rc::new(RefCell::new(DocumentStore::default()));
         let registry = Rc::new(RefCell::new(RealmRegistry::default()));
         let main = Document::with_shared(
             Arc::clone(&services),
             js_runtime.clone(),
-            waiter.clone(),
+            Arc::clone(&wake),
             &documents,
             &registry,
             Arc::clone(&stop),
@@ -60,7 +63,7 @@ impl Engine {
         frames.insert(FrameId::MAIN, main);
         Self {
             js_runtime,
-            waiter,
+            wake,
             documents,
             registry,
             services,
@@ -78,7 +81,7 @@ impl Engine {
         let document = Document::with_shared(
             Arc::clone(&self.services),
             self.js_runtime.clone(),
-            self.waiter.clone(),
+            Arc::clone(&self.wake),
             &self.documents,
             &self.registry,
             Arc::clone(&self.stop),
@@ -152,38 +155,25 @@ impl Engine {
         Ok(events)
     }
 
-    /// True when any frame has jobs, timers, dials, or pending JS work.
-    #[must_use]
-    pub(crate) fn has_background_work(&self) -> bool {
-        !self.pending_frame_loads.is_empty()
-            || self
-                .frames
-                .values()
-                .any(|document| document.has_background_work() || document.has_engine_requests())
+    /// Runs every immediately ready task in every frame. Never blocks.
+    pub(crate) fn pump_ready(&mut self) {
+        let frames: Vec<FrameId> = self.frames.keys().copied().collect();
+        for frame in frames {
+            let Some(document) = self.frames.get_mut(&frame) else {
+                continue;
+            };
+            document.pump_ready();
+            self.reconcile_frames();
+        }
     }
 
-    /// Advances every frame for at most `budget`.
-    pub(crate) fn drive_for(&mut self, budget: Duration) {
-        let deadline = Instant::now() + budget;
-        loop {
-            let frames: Vec<FrameId> = self.frames.keys().copied().collect();
-            for frame in frames {
-                let now = Instant::now();
-                if now >= deadline {
-                    return;
-                }
-                let Some(document) = self.frames.get_mut(&frame) else {
-                    continue;
-                };
-                // Each frame gets at most one step, and never past the shared
-                // deadline: many frames must not multiply the budget.
-                document.drive_for(FRAME_STEP.min(deadline - now));
-                self.reconcile_frames();
-            }
-            if Instant::now() >= deadline || !self.has_background_work() {
-                return;
-            }
-        }
+    /// Earliest timer deadline across every frame.
+    #[must_use]
+    pub(crate) fn next_deadline(&self) -> Option<Instant> {
+        self.frames
+            .values()
+            .filter_map(Document::next_deadline)
+            .min()
     }
 
     fn reconcile_frames(&mut self) {

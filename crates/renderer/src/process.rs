@@ -5,39 +5,59 @@
 //! unnamed socket pair as file descriptor 0 and the child reads and writes that
 //! endpoint. Other platforms keep the stdin/stdout pipes until their platform
 //! channel lands. stderr stays for diagnostics.
+//!
+//! The renderer loop runs as a future on one current-thread Tokio runtime and
+//! owns every wait: commands, dial completions, timer deadlines, and shutdown.
+//! The reader and writer stay blocking threads because synchronous browser
+//! service calls (`document.cookie`) must make progress while the page engine
+//! runs.
 
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{self, Sender, SyncSender};
+use std::sync::mpsc::{self as std_mpsc, Sender, SyncSender};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
 
 use url::Url;
 
-use crate::channel::{read_control, write_control};
+use crate::channel::read_control;
 use crate::document::Stop;
 use crate::protocol::{
     BrowserServices, Command, DialCompletion, DialRequest, FromRenderer, RENDERER_INBOX_CAPACITY,
     RENDERER_OUTBOX_CAPACITY, ServiceCall, ServiceReply, ToRenderer,
 };
+use tokio::sync::{Notify, mpsc};
 
 /// Runs the renderer child until `Shutdown` or the channel closes.
 ///
 /// # Errors
 ///
-/// I/O failure while draining the writer.
+/// Runtime creation, channel bootstrap, or writer failure.
 pub fn serve() -> io::Result<()> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()?;
+    let writer = runtime.block_on(serve_async())?;
+    writer
+        .join()
+        .map_err(|_| io::Error::other("writer panicked"))?
+}
+
+async fn serve_async() -> io::Result<thread::JoinHandle<io::Result<()>>> {
     let (input, output) = endpoint()?;
-    let (command_tx, command_rx) = mpsc::sync_channel::<ToRenderer>(RENDERER_INBOX_CAPACITY);
-    let (out_tx, out_rx) = mpsc::sync_channel::<FromRenderer>(RENDERER_OUTBOX_CAPACITY);
+    let (command_tx, command_rx) = mpsc::channel::<ToRenderer>(RENDERER_INBOX_CAPACITY);
+    let (out_tx, out_rx) = std_mpsc::sync_channel::<FromRenderer>(RENDERER_OUTBOX_CAPACITY);
     let stop = Arc::new(Stop::new());
+    let wake = Arc::new(Notify::new());
     let writer_stop = Arc::clone(&stop);
+    let writer_wake = Arc::clone(&wake);
     let writer_commands = command_tx.clone();
     let writer = thread::spawn(move || {
         let result = write_messages(&out_rx, output);
         if result.is_err() {
             writer_stop.request();
+            writer_wake.notify_one();
             let _ = writer_commands.try_send(ToRenderer::Request {
                 id: 0,
                 command: Command::Shutdown,
@@ -50,14 +70,21 @@ pub fn serve() -> io::Result<()> {
     logging::info!(target: "renderer", "ready");
     let reader_services = Arc::clone(&services);
     let reader_stop = Arc::clone(&stop);
-    thread::spawn(move || read_messages(input, &command_tx, &reader_services, &reader_stop));
-    crate::run(&command_rx, &out_tx, services, &stop);
+    let reader_wake = Arc::clone(&wake);
+    thread::spawn(move || {
+        read_messages(
+            input,
+            &command_tx,
+            &reader_services,
+            &reader_stop,
+            &reader_wake,
+        );
+    });
+    crate::run(command_rx, &out_tx, services, &stop, Arc::clone(&wake)).await;
     // The reader returns on `Shutdown`, dropping its `ChannelServices` clone, so
     // the writer channel closes and the child can exit.
     drop(out_tx);
-    writer
-        .join()
-        .map_err(|_| io::Error::other("writer panicked"))?
+    Ok(writer)
 }
 
 /// One child endpoint. Unix duplicates the inherited descriptor; other
@@ -80,9 +107,10 @@ fn endpoint() -> io::Result<(Box<dyn Read + Send>, Box<dyn Write + Send>)> {
 
 fn read_messages(
     mut input: Box<dyn Read + Send>,
-    command_tx: &SyncSender<ToRenderer>,
+    command_tx: &mpsc::Sender<ToRenderer>,
     services: &ChannelServices,
     stop: &Arc<Stop>,
+    wake: &Arc<Notify>,
 ) {
     let mut buffer = Vec::new();
     let mut greeted = false;
@@ -113,7 +141,7 @@ fn read_messages(
                         ..
                     }
                 );
-                if command_tx.send(message).is_err() || shutdown {
+                if command_tx.blocking_send(message).is_err() || shutdown {
                     return;
                 }
             }
@@ -123,23 +151,24 @@ fn read_messages(
     // The host is gone (EOF or a broken pipe). A renderer must not outlive its
     // browser: interrupt in-flight work and stop the loop.
     stop.request();
-    let _ = command_tx.send(ToRenderer::Request {
+    wake.notify_one();
+    let _ = command_tx.try_send(ToRenderer::Request {
         id: 0,
         command: Command::Shutdown,
     });
 }
 
 fn write_messages(
-    rx: &mpsc::Receiver<FromRenderer>,
+    rx: &std_mpsc::Receiver<FromRenderer>,
     mut output: Box<dyn Write + Send>,
 ) -> io::Result<()> {
     for message in rx {
-        write_control(&mut output, &message)?;
+        crate::write_control(&mut output, &message)?;
     }
     Ok(())
 }
 
-/// [`BrowserServices`] proxy that asks the browser process over the pipe.
+/// [`BrowserServices`] proxy that asks the browser process over the channel.
 struct ChannelServices {
     out: SyncSender<FromRenderer>,
     pending: Mutex<HashMap<u64, PendingService>>,
@@ -162,7 +191,7 @@ impl ChannelServices {
 
     fn call(&self, call: ServiceCall) -> Option<ServiceReply> {
         let id = self.next.fetch_add(1, Ordering::Relaxed);
-        let (reply_tx, reply_rx) = mpsc::channel();
+        let (reply_tx, reply_rx) = std_mpsc::channel();
         self.pending
             .lock()
             .unwrap_or_else(PoisonError::into_inner)

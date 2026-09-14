@@ -9,7 +9,7 @@ use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
 use std::sync::Arc;
-use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TrySendError};
+use std::sync::mpsc::{SyncSender, TrySendError};
 use std::time::Duration;
 
 use dom::{
@@ -170,42 +170,54 @@ fn fragment_context_name(spec: &str) -> QualName {
     }
 }
 
-fn run(
-    inbox: &Receiver<ToRenderer>,
+/// Runs the renderer loop until `Shutdown`, channel close, or stop.
+pub(crate) async fn run(
+    mut inbox: tokio::sync::mpsc::Receiver<ToRenderer>,
     outbox: &SyncSender<FromRenderer>,
     services: Arc<dyn BrowserServices>,
     stop: &Arc<Stop>,
+    wake: Arc<tokio::sync::Notify>,
 ) {
-    let mut engine = Engine::new(services, Arc::clone(stop));
+    let mut engine = Engine::new(services, Arc::clone(stop), Arc::clone(&wake));
     loop {
-        let received = if engine.has_background_work() {
-            inbox.recv_timeout(Duration::from_millis(10))
-        } else {
-            inbox.recv().map_err(|_| RecvTimeoutError::Disconnected)
-        };
-        match received {
-            Ok(ToRenderer::Request { id, command }) => {
-                let (reply, shutdown) = handle_command(&mut engine, command, stop);
-                if !send_to_browser(outbox, FromRenderer::Reply { id, reply }) {
-                    stop.request();
-                    break;
-                }
-                if shutdown {
-                    break;
-                }
-            }
-            // Service replies are routed by the transport; the handshake is
-            // consumed before this loop starts.
-            Ok(ToRenderer::ServiceReply { .. } | ToRenderer::Hello) => {}
-            Err(RecvTimeoutError::Timeout) => engine.drive_for(Duration::from_millis(10)),
-            Err(RecvTimeoutError::Disconnected) => break,
-        }
+        engine.pump_ready();
         if !publish(&mut engine, outbox) {
             stop.request();
             break;
         }
+        if stop.is_set() {
+            break;
+        }
+        let deadline = engine.next_deadline();
+        tokio::select! {
+            received = inbox.recv() => match received {
+                Some(ToRenderer::Request { id, command }) => {
+                    let (reply, shutdown) = handle_command(&mut engine, command, stop);
+                    if !send_to_browser(outbox, FromRenderer::Reply { id, reply }) {
+                        stop.request();
+                        break;
+                    }
+                    if shutdown {
+                        break;
+                    }
+                }
+                // The transport consumes the handshake and routes service
+                // replies; neither reaches this loop.
+                Some(ToRenderer::Hello | ToRenderer::ServiceReply { .. }) => {}
+                None => break,
+            },
+            () = wake.notified() => {}
+            () = wait_for_deadline(deadline) => {}
+        }
     }
     engine.shutdown();
+}
+
+async fn wait_for_deadline(deadline: Option<tokio::time::Instant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(deadline).await,
+        None => std::future::pending().await,
+    }
 }
 
 fn handle_command(

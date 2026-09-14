@@ -1,28 +1,58 @@
 use std::collections::HashSet;
-use std::future::{Future, pending, poll_fn};
 use std::sync::Arc;
-use std::task::Poll;
 use std::time::Duration;
 
-use tokio::time::{Instant, sleep_until};
+use tokio::time::Instant;
 
 use super::{Document, MAX_PENDING_JS_FETCHES, QueuedDial, Task, Timer};
 use crate::protocol::TabEvent;
 
 impl Document {
-    pub(crate) fn drive_for(&mut self, budget: Duration) {
-        let _completed = self.run_until_timeout(budget, |document| document.has_engine_requests());
-    }
-
-    pub(crate) fn has_background_work(&self) -> bool {
-        !self.tasks.is_empty()
-            || !self.timers.is_empty()
-            || self.in_flight_dials > 0
-            || !self.queued_dials.is_empty()
-            || self
+    /// Runs every immediately ready page task. Never blocks.
+    ///
+    /// The renderer loop owns all waiting: it sleeps until [`Document::next_deadline`]
+    /// or until a dial completion, channel message, or stop wakes it, then calls
+    /// this method again. That is why the page engine needs no private runtime.
+    pub(crate) fn pump_ready(&mut self) {
+        loop {
+            while let Ok(completed) = self.dial_rx.try_recv() {
+                self.in_flight_dials = self.in_flight_dials.saturating_sub(1);
+                match completed {
+                    Ok(done) => self.tasks.push_back(Task::DialFinished(done)),
+                    Err(fail) => self.tasks.push_back(Task::DialFailed(fail)),
+                }
+            }
+            while let Some(id) = self.due_timer() {
+                self.tasks.push_back(Task::Timer(id));
+            }
+            self.adopt_js_work();
+            self.launch_queued_dials();
+            while let Some(task) = self.tasks.pop_front() {
+                self.run_task(task);
+                self.adopt_js_work();
+                self.launch_queued_dials();
+                if self.stopped() {
+                    return;
+                }
+            }
+            if self.stopped() {
+                return;
+            }
+            if self
                 .js
                 .as_ref()
                 .is_some_and(crate::js::JsRealm::has_pending_work)
+            {
+                continue;
+            }
+            return;
+        }
+    }
+
+    /// Earliest timer deadline this document waits for.
+    #[must_use]
+    pub(crate) fn next_deadline(&self) -> Option<Instant> {
+        self.next_timer_deadline()
     }
 
     fn schedule_timer(&mut self, delay: Duration) -> u32 {
@@ -36,37 +66,8 @@ impl Document {
         id
     }
 
-    fn run_until_timeout(
-        &mut self,
-        timeout: Duration,
-        mut stop: impl FnMut(&mut Self) -> bool,
-    ) -> bool {
-        let deadline = Instant::now() + timeout;
-        let mut done = false;
-        self.block_on_pump(Some(deadline), |document| {
-            if Instant::now() >= deadline || document.stopped() {
-                return false;
-            }
-            if stop(document) {
-                done = true;
-                return false;
-            }
-            true
-        });
-        done
-    }
-
-    fn block_on_pump(&mut self, cap: Option<Instant>, keep_waiting: impl FnMut(&mut Self) -> bool) {
-        assert!(
-            tokio::runtime::Handle::try_current().is_err(),
-            "Document::run must not run inside another Tokio runtime"
-        );
-        let waiter = self.waiter.clone();
-        waiter.get().block_on(self.pump(cap, keep_waiting));
-    }
-
-    /// Stops the frame and drops its queued work. The shared waiter and `QuickJS`
-    /// heap belong to the page engine, not the frame, so they are not touched.
+    /// Stops the frame and drops its queued work. The shared `QuickJS` heap
+    /// belongs to the page engine, not the frame, so it is not touched.
     pub(crate) fn shutdown(&mut self) {
         self.stop.request();
         self.release();
@@ -80,85 +81,6 @@ impl Document {
 
     fn stopped(&self) -> bool {
         self.stop.is_set()
-    }
-
-    async fn pump(
-        &mut self,
-        cap: Option<Instant>,
-        mut keep_waiting: impl FnMut(&mut Self) -> bool,
-    ) {
-        loop {
-            while let Ok(completed) = self.dial_rx.try_recv() {
-                self.in_flight_dials = self.in_flight_dials.saturating_sub(1);
-                match completed {
-                    Ok(done) => self.tasks.push_back(Task::DialFinished(done)),
-                    Err(fail) => self.tasks.push_back(Task::DialFailed(fail)),
-                }
-            }
-            self.adopt_js_work();
-            self.launch_queued_dials();
-            while let Some(task) = self.tasks.pop_front() {
-                self.run_task(task);
-                self.adopt_js_work();
-                self.launch_queued_dials();
-                if !keep_waiting(self) {
-                    return;
-                }
-            }
-            if !keep_waiting(self) {
-                return;
-            }
-            if self
-                .js
-                .as_ref()
-                .is_some_and(crate::js::JsRealm::has_pending_work)
-            {
-                continue;
-            }
-            let fetches_pending = self.in_flight_dials > 0;
-            let next_deadline = match (self.next_timer_deadline(), cap) {
-                (Some(timer), Some(limit)) => Some(timer.min(limit)),
-                (timer, limit) => timer.or(limit),
-            };
-            if !fetches_pending && next_deadline.is_none() {
-                break;
-            }
-            let deadline = wait_until(next_deadline);
-            let mut deadline = std::pin::pin!(deadline);
-            let stop = Arc::clone(&self.stop);
-            let completed = poll_fn(|cx| {
-                stop.register(cx.waker());
-                *self
-                    .dial_waker
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(cx.waker().clone());
-                if let Ok(completed) = self.dial_rx.try_recv() {
-                    return Poll::Ready(Some(completed));
-                }
-                if stop.is_set() {
-                    return Poll::Ready(None);
-                }
-                if deadline.as_mut().poll(cx).is_ready() {
-                    return Poll::Ready(None);
-                }
-                Poll::Pending
-            })
-            .await;
-            self.dial_waker
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .take();
-            if let Some(completed) = completed {
-                self.in_flight_dials = self.in_flight_dials.saturating_sub(1);
-                match completed {
-                    Ok(done) => self.tasks.push_back(Task::DialFinished(done)),
-                    Err(fail) => self.tasks.push_back(Task::DialFailed(fail)),
-                }
-            }
-            while let Some(id) = self.due_timer() {
-                self.tasks.push_back(Task::Timer(id));
-            }
-        }
     }
 
     pub(crate) fn waiting_for_load(&self) -> bool {
@@ -175,7 +97,7 @@ impl Document {
         for dial in queued {
             let task_dial = dial.clone();
             let completed = self.dial_tx.clone();
-            let dial_waker = Arc::clone(&self.dial_waker);
+            let wake = Arc::clone(&self.wake);
             let stop = Arc::clone(&self.stop);
             let request = super::dial::request(&dial);
             self.services.start_dial(
@@ -186,13 +108,7 @@ impl Document {
                     }
                     let result = super::dial::complete(&task_dial, outcome);
                     let _send_result = completed.send(result);
-                    let waker = dial_waker
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .take();
-                    if let Some(waker) = waker {
-                        waker.wake();
-                    }
+                    wake.notify_one();
                 }),
             );
             self.in_flight_dials = self.in_flight_dials.saturating_add(1);
@@ -296,12 +212,5 @@ impl Document {
             .min_by_key(|timer| timer.when)?;
         timer.fired = true;
         Some(timer.id)
-    }
-}
-
-async fn wait_until(deadline: Option<Instant>) {
-    match deadline {
-        Some(when) => sleep_until(when).await,
-        None => pending().await,
     }
 }

@@ -112,6 +112,15 @@ the page engine. A selected page task still runs synchronously. Slow page work
 can delay that renderer, but it cannot block the browser runtime or another
 renderer.
 
+Synchronous browser-service calls are the one exception. `document.cookie` is a
+synchronous JavaScript API that must complete a browser round trip while the
+page engine runs, and a current-thread runtime cannot drive that reply while the
+engine thread is blocked. The renderer therefore keeps one blocking reader and
+one blocking writer thread for the channel. The renderer loop, its timers, task
+deadlines, and shutdown all wait asynchronously; only the two transport threads
+remain, and they carry no scheduler or polling work. Making the cookie service
+asynchronous would remove them.
+
 ### Framing and body streaming
 
 Renderer traffic uses length-prefixed frames. A fixed header carries the
