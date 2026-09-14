@@ -33,7 +33,9 @@ mod xml;
 
 pub use channel::{
     Frame, FrameKind, HEADER_BYTES, MAX_BODY_CHUNK_BYTES, MAX_CONTROL_BYTES, PROTOCOL_VERSION,
-    read_body, read_control, read_frame, write_body, write_control, write_frame,
+    read_body, read_body_async, read_control, read_control_async, read_frame, read_frame_async,
+    write_body, write_body_async, write_control, write_control_async, write_frame,
+    write_frame_async,
 };
 use document::Stop;
 use engine::Engine;

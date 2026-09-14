@@ -21,6 +21,7 @@
 use std::io::{self, Read, Write};
 
 use serde::{Serialize, de::DeserializeOwned};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// Framing and message ABI version for the renderer channel.
 pub const PROTOCOL_VERSION: u8 = 1;
@@ -109,20 +110,87 @@ pub fn write_frame(
     request: u64,
     payload: &[u8],
 ) -> io::Result<()> {
-    if payload.len() > kind.max_payload() {
+    let header = encode_header(kind, request, payload.len())?;
+    writer.write_all(&header)?;
+    writer.write_all(payload)?;
+    writer.flush()
+}
+
+/// Writes one control message as a JSON frame on an async writer.
+///
+/// # Errors
+///
+/// Serialization failure or a payload larger than [`MAX_CONTROL_BYTES`].
+pub async fn write_control_async<W: AsyncWrite + Unpin + ?Sized>(
+    writer: &mut W,
+    message: &impl Serialize,
+) -> io::Result<()> {
+    let payload = serde_json::to_vec(message).map_err(io::Error::other)?;
+    write_frame_async(writer, FrameKind::Control, 0, &payload).await
+}
+
+/// Writes one raw body chunk for `request` on an async writer.
+///
+/// # Errors
+///
+/// A payload larger than [`MAX_BODY_CHUNK_BYTES`] or write failure.
+pub async fn write_body_async<W: AsyncWrite + Unpin + ?Sized>(
+    writer: &mut W,
+    request: u64,
+    payload: &[u8],
+) -> io::Result<()> {
+    write_frame_async(writer, FrameKind::Body, request, payload).await
+}
+
+/// Writes one frame with the fixed header on an async writer.
+///
+/// # Errors
+///
+/// A payload larger than the kind limit or write failure.
+pub async fn write_frame_async<W: AsyncWrite + Unpin + ?Sized>(
+    writer: &mut W,
+    kind: FrameKind,
+    request: u64,
+    payload: &[u8],
+) -> io::Result<()> {
+    let header = encode_header(kind, request, payload.len())?;
+    writer.write_all(&header).await?;
+    writer.write_all(payload).await?;
+    writer.flush().await
+}
+
+fn encode_header(kind: FrameKind, request: u64, length: usize) -> io::Result<[u8; HEADER_BYTES]> {
+    if length > kind.max_payload() {
         return Err(invalid("renderer IPC payload exceeds limit"));
     }
     let length =
-        u32::try_from(payload.len()).map_err(|_| invalid("renderer IPC payload exceeds limit"))?;
+        u32::try_from(length).map_err(|_| invalid("renderer IPC payload exceeds limit"))?;
     let mut header = [0u8; HEADER_BYTES];
     header[0] = PROTOCOL_VERSION;
     header[1] = kind.wire();
     // header[2..4] is a zero flags field; readers reject nonzero values.
     header[4..12].copy_from_slice(&request.to_be_bytes());
     header[12..16].copy_from_slice(&length.to_be_bytes());
-    writer.write_all(&header)?;
-    writer.write_all(payload)?;
-    writer.flush()
+    Ok(header)
+}
+
+fn decode_header(header: &[u8; HEADER_BYTES]) -> io::Result<(FrameKind, u64, usize)> {
+    if header[0] != PROTOCOL_VERSION {
+        return Err(invalid("unsupported renderer IPC version"));
+    }
+    let kind = FrameKind::from_wire(header[1])
+        .ok_or_else(|| invalid("unknown renderer IPC frame kind"))?;
+    if header[2] != 0 || header[3] != 0 {
+        return Err(invalid("nonzero renderer IPC flags"));
+    }
+    let request = u64::from_be_bytes([
+        header[4], header[5], header[6], header[7], header[8], header[9], header[10], header[11],
+    ]);
+    let length = u32::from_be_bytes([header[12], header[13], header[14], header[15]]) as usize;
+    if length > kind.max_payload() {
+        return Err(invalid("renderer IPC frame exceeds limit"));
+    }
+    Ok((kind, request, length))
 }
 
 /// Reads one frame header and payload into `payload`.
@@ -140,25 +208,74 @@ pub fn read_frame(reader: &mut impl Read, payload: &mut Vec<u8>) -> io::Result<O
         return Ok(None);
     }
     read_exact(reader, &mut header[1..])?;
-    if header[0] != PROTOCOL_VERSION {
-        return Err(invalid("unsupported renderer IPC version"));
-    }
-    let kind = FrameKind::from_wire(header[1])
-        .ok_or_else(|| invalid("unknown renderer IPC frame kind"))?;
-    if header[2] != 0 || header[3] != 0 {
-        return Err(invalid("nonzero renderer IPC flags"));
-    }
-    let request = u64::from_be_bytes([
-        header[4], header[5], header[6], header[7], header[8], header[9], header[10], header[11],
-    ]);
-    let length = u32::from_be_bytes([header[12], header[13], header[14], header[15]]) as usize;
-    if length > kind.max_payload() {
-        return Err(invalid("renderer IPC frame exceeds limit"));
-    }
+    let (kind, request, length) = decode_header(&header)?;
     payload.clear();
     payload.resize(length, 0);
     read_exact(reader, payload)?;
     Ok(Some(Frame { kind, request }))
+}
+
+/// Reads one frame header and payload into `payload` on an async reader.
+///
+/// `Ok(None)` is a clean peer close at a frame boundary.
+///
+/// # Errors
+///
+/// I/O failure or a protocol violation.
+pub async fn read_frame_async<R: AsyncRead + Unpin + ?Sized>(
+    reader: &mut R,
+    payload: &mut Vec<u8>,
+) -> io::Result<Option<Frame>> {
+    let mut header = [0u8; HEADER_BYTES];
+    if reader.read(&mut header[..1]).await? == 0 {
+        return Ok(None);
+    }
+    read_exact_async(reader, &mut header[1..]).await?;
+    let (kind, request, length) = decode_header(&header)?;
+    payload.clear();
+    payload.resize(length, 0);
+    read_exact_async(reader, payload).await?;
+    Ok(Some(Frame { kind, request }))
+}
+
+/// Reads one control message on an async reader.
+///
+/// # Errors
+///
+/// I/O failure, a body frame, invalid JSON, or a protocol violation.
+pub async fn read_control_async<T: DeserializeOwned, R: AsyncRead + Unpin + ?Sized>(
+    reader: &mut R,
+    buffer: &mut Vec<u8>,
+) -> io::Result<Option<T>> {
+    match read_frame_async(reader, buffer).await? {
+        None => Ok(None),
+        Some(Frame {
+            kind: FrameKind::Control,
+            ..
+        }) => serde_json::from_slice(buffer)
+            .map(Some)
+            .map_err(|error| invalid(format!("invalid renderer IPC JSON: {error}"))),
+        Some(_) => Err(invalid("expected a control frame")),
+    }
+}
+
+/// Reads one raw body chunk on an async reader, returning its request id.
+///
+/// # Errors
+///
+/// I/O failure, a control frame, or a protocol violation.
+pub async fn read_body_async<R: AsyncRead + Unpin + ?Sized>(
+    reader: &mut R,
+    buffer: &mut Vec<u8>,
+) -> io::Result<Option<u64>> {
+    match read_frame_async(reader, buffer).await? {
+        None => Ok(None),
+        Some(Frame {
+            kind: FrameKind::Body,
+            request,
+        }) => Ok(Some(request)),
+        Some(_) => Err(invalid("expected a body frame")),
+    }
 }
 
 /// Reads one control message.
@@ -201,6 +318,20 @@ pub fn read_body(reader: &mut impl Read, buffer: &mut Vec<u8>) -> io::Result<Opt
 fn read_exact(reader: &mut impl Read, buffer: &mut [u8]) -> io::Result<()> {
     reader
         .read_exact(buffer)
+        .map_err(|error| match error.kind() {
+            io::ErrorKind::UnexpectedEof => invalid("truncated renderer IPC frame"),
+            _ => error,
+        })
+}
+
+async fn read_exact_async<R: AsyncRead + Unpin + ?Sized>(
+    reader: &mut R,
+    buffer: &mut [u8],
+) -> io::Result<()> {
+    reader
+        .read_exact(buffer)
+        .await
+        .map(|_| ())
         .map_err(|error| match error.kind() {
             io::ErrorKind::UnexpectedEof => invalid("truncated renderer IPC frame"),
             _ => error,

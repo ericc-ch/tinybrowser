@@ -431,12 +431,12 @@ impl Tab {
         if self.renderer.is_some() && self.site.as_ref() == Some(site) {
             return Ok(());
         }
-        let renderers = Arc::clone(&self.renderers);
-        let target_site = site.clone();
-        let handle = tokio::task::spawn_blocking(move || renderers.acquire(&target_site))
+        let handle = self
+            .renderers
+            .acquire(site)
             .await
-            .map_err(|error| renderer_unavailable(&error.to_string()))?
             .map_err(|error| renderer_unavailable(&error.to_string()))?;
+        let handle = Arc::new(handle);
         self.drop_renderer().await;
         self.events_rx = Some(handle.subscribe());
         *self.current.lock().unwrap_or_else(PoisonError::into_inner) = Some(Arc::clone(&handle));
@@ -466,7 +466,7 @@ impl Tab {
         self.site = None;
         self.events_rx = None;
         if let Some(renderer) = self.renderer.take() {
-            let _result = tokio::task::spawn_blocking(move || drop(renderer)).await;
+            renderer.shutdown().await;
         }
     }
 
@@ -474,9 +474,7 @@ impl Tab {
         let Some(renderer) = self.renderer.clone() else {
             return Err(TabError::ActorStopped);
         };
-        tokio::task::spawn_blocking(move || renderer.request(command))
-            .await
-            .unwrap_or(Err(TabError::ActorStopped))
+        renderer.request(command).await
     }
 
     fn launch_navigation(&mut self) {

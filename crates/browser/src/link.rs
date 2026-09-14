@@ -1,16 +1,14 @@
-//! Browser side of the renderer seam: factory, handles, and routing pumps.
+//! Browser side of the renderer seam: factory, handles, and async routing.
 //!
-//! [ADR 0019](../../../docs/adrs/0019-async-browser-runtime-and-io.md): the
-//! handle is value-only; replies, events, and browser-service calls cross one
-//! private platform channel in length-prefixed frames.
+//! [ADR 0019](../../../docs/adrs/0019-async-browser-runtime-and-io.md): one
+//! private platform channel per renderer, length-prefixed frames, async reader
+//! and writer tasks, and oneshot replies. The handle stays value-only.
 
 use std::collections::HashMap;
-use std::io::{self, BufRead, BufReader, Read, Write};
-use std::process::{Child, Command, Stdio};
+use std::io;
+use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex, PoisonError};
-use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use crate::network::FetchHandle;
@@ -19,7 +17,11 @@ use renderer::{
     Command as RendererCommand, FrameId, FromRenderer, Reply, ServiceCall, ServiceReply, TabError,
     TabEvent, ToRenderer,
 };
-use tokio::sync::mpsc as async_mpsc;
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite};
+use tokio::process::{Child, Command};
+use tokio::sync::{mpsc, oneshot, watch};
+use tokio::task::JoinHandle;
+use tokio::time::timeout;
 
 /// Upper bound on one request to a renderer. The renderer budget is seconds;
 /// this is a last-resort wake-up if its reply path dies silently.
@@ -28,28 +30,33 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 /// How long a `renderer` child has to say [`FromRenderer::Ready`].
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Bounded renderer-pump handoff to its owning tab coordinator. Saturation is a
-/// renderer protocol violation: dropping lifecycle events would corrupt tab
-/// state, while blocking the pump could strand a reply behind those events.
+/// How long teardown waits for transport tasks to finish.
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Bounded renderer-pump handoff to its owning tab coordinator. Saturation is
+/// a renderer protocol violation: dropping lifecycle events would corrupt tab
+/// state, while blocking the reader could strand a reply behind those events.
 const EVENT_SUBSCRIBER_CAPACITY: usize = 4096;
+
+/// Bounded browser-to-renderer command queue.
+const COMMAND_CAPACITY: usize = 256;
 
 /// Identity of one live renderer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct RendererId(u64);
 
 /// Live subscribers to one renderer's frame-tagged document events.
-type EventSubscribers = Arc<Mutex<Vec<async_mpsc::Sender<(FrameId, TabEvent)>>>>;
+type EventSubscribers = Arc<Mutex<Vec<mpsc::Sender<(FrameId, TabEvent)>>>>;
 
 /// Value-only handle to one renderer.
 pub(crate) struct RendererHandle {
-    sink: Sink,
-    pending: Arc<Mutex<HashMap<u64, Sender<Reply>>>>,
+    tx: mpsc::Sender<ToRenderer>,
+    pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Reply>>>>,
     alive: Arc<AtomicBool>,
     subscribers: EventSubscribers,
-    next_request: Arc<AtomicU64>,
-    child: Arc<Mutex<Child>>,
-    pump_join: Option<JoinHandle<()>>,
-    stderr_join: Option<JoinHandle<()>>,
+    next_request: AtomicU64,
+    kill: watch::Sender<bool>,
+    tasks: Mutex<Vec<JoinHandle<()>>>,
 }
 
 impl RendererHandle {
@@ -57,41 +64,38 @@ impl RendererHandle {
     ///
     /// # Errors
     ///
-    /// [`TabError::ActorStopped`] when the renderer is gone.
-    pub(crate) fn request(&self, command: RendererCommand) -> Result<Reply, TabError> {
+    /// [`TabError::ActorStopped`] when the renderer is gone or the reply does
+    /// not arrive within the request timeout.
+    pub(crate) async fn request(&self, command: RendererCommand) -> Result<Reply, TabError> {
         let id = self.next_request.fetch_add(1, Ordering::Relaxed);
-        let (reply_tx, reply_rx) = mpsc::channel();
-        let mut pending = self.pending.lock().unwrap_or_else(PoisonError::into_inner);
-        if !self.alive.load(Ordering::Relaxed) {
-            return Err(TabError::ActorStopped);
+        let (reply_tx, reply_rx) = oneshot::channel();
+        {
+            let mut pending = self.pending.lock().unwrap_or_else(PoisonError::into_inner);
+            if !self.alive.load(Ordering::Relaxed) {
+                return Err(TabError::ActorStopped);
+            }
+            pending.insert(id, reply_tx);
         }
-        pending.insert(id, reply_tx);
-        drop(pending);
         if self
-            .sink
-            .send(&ToRenderer::Request { id, command })
+            .tx
+            .send(ToRenderer::Request { id, command })
+            .await
             .is_err()
         {
-            self.pending
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .remove(&id);
+            self.remove_pending(id);
             return Err(TabError::ActorStopped);
         }
-        if let Ok(reply) = reply_rx.recv_timeout(REQUEST_TIMEOUT) {
-            return Ok(reply);
+        if let Ok(Ok(reply)) = timeout(REQUEST_TIMEOUT, reply_rx).await {
+            Ok(reply)
+        } else {
+            self.remove_pending(id);
+            Err(TabError::ActorStopped)
         }
-        self.pending
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .remove(&id);
-        Err(TabError::ActorStopped)
     }
-
     /// Subscribes to renderer document events after this call.
     #[must_use]
-    pub(crate) fn subscribe(&self) -> async_mpsc::Receiver<(FrameId, TabEvent)> {
-        let (tx, rx) = async_mpsc::channel(EVENT_SUBSCRIBER_CAPACITY);
+    pub(crate) fn subscribe(&self) -> mpsc::Receiver<(FrameId, TabEvent)> {
+        let (tx, rx) = mpsc::channel(EVENT_SUBSCRIBER_CAPACITY);
         self.subscribers
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -101,37 +105,46 @@ impl RendererHandle {
 
     /// Interrupts a blocked script by killing the renderer process.
     pub(crate) fn interrupt(&self) {
-        let _ = self
-            .child
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .kill();
+        let _ = self.kill.send(true);
     }
 
-    /// Asks the renderer loop to stop without joining it.
+    /// Asks the renderer loop to stop without waiting.
     pub(crate) fn request_shutdown(&self) {
-        let _ = self.sink.shutdown();
+        let _ = self.tx.try_send(ToRenderer::Request {
+            id: 0,
+            command: RendererCommand::Shutdown,
+        });
     }
 
-    fn shutdown(&mut self) {
+    /// Stops the renderer and waits for its transport tasks.
+    pub(crate) async fn shutdown(&self) {
         self.request_shutdown();
         self.interrupt();
-        if let Some(join) = self.pump_join.take() {
-            let _ = join.join();
+        let tasks = std::mem::take(&mut *self.tasks.lock().unwrap_or_else(PoisonError::into_inner));
+        for mut task in tasks {
+            if timeout(SHUTDOWN_TIMEOUT, &mut task).await.is_err() {
+                task.abort();
+                let _result = task.await;
+            }
         }
-        let mut child = self.child.lock().unwrap_or_else(PoisonError::into_inner);
-        let _ = child.kill();
-        let _ = child.wait();
-        drop(child);
-        if let Some(join) = self.stderr_join.take() {
-            let _ = join.join();
-        }
+    }
+
+    fn remove_pending(&self, id: u64) {
+        let _removed = self
+            .pending
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&id);
     }
 }
 
 impl Drop for RendererHandle {
     fn drop(&mut self) {
-        self.shutdown();
+        // Dropping `kill` stops the child task's watch and reaps the child.
+        for task in std::mem::take(&mut *self.tasks.lock().unwrap_or_else(PoisonError::into_inner))
+        {
+            task.abort();
+        }
     }
 }
 
@@ -153,28 +166,10 @@ impl RendererFactory {
     ///
     /// # Errors
     ///
-    /// Process spawn failure.
-    pub(crate) fn acquire(&self, site: &Site) -> io::Result<Arc<RendererHandle>> {
+    /// Process spawn failure or a failed protocol handshake.
+    pub(crate) async fn acquire(&self, site: &Site) -> io::Result<RendererHandle> {
         let id = RendererId(self.next.fetch_add(1, Ordering::Relaxed));
-        spawn_process(id, site, self.fetch.clone()).map(Arc::new)
-    }
-}
-
-#[derive(Clone)]
-struct Sink(Arc<Mutex<Box<dyn Write + Send>>>);
-
-impl Sink {
-    fn send(&self, message: &ToRenderer) -> io::Result<()> {
-        let mut writer = self.0.lock().unwrap_or_else(PoisonError::into_inner);
-        renderer::write_control(&mut *writer, message)
-    }
-
-    fn shutdown(&self) -> io::Result<()> {
-        let message = ToRenderer::Request {
-            id: 0,
-            command: RendererCommand::Shutdown,
-        };
-        self.send(&message)
+        spawn_process(id, site, self.fetch.clone()).await
     }
 }
 
@@ -183,8 +178,8 @@ struct RendererViolation;
 /// One spawned child and its host-side channel endpoints.
 struct SpawnedRenderer {
     child: Child,
-    reader: Box<dyn Read + Send>,
-    writer: Box<dyn Write + Send>,
+    reader: Box<dyn AsyncRead + Send + Unpin>,
+    writer: Box<dyn AsyncWrite + Send + Unpin>,
 }
 
 /// Spawns one renderer child and returns its host-side reader and writer.
@@ -199,10 +194,14 @@ fn spawn_transport(command: &mut Command) -> io::Result<SpawnedRenderer> {
         .stdin(Stdio::from(std::os::fd::OwnedFd::from(child_end)))
         .stdout(Stdio::null());
     let child = command.spawn()?;
-    let writer = host.try_clone()?;
+    let writer_std = host.try_clone()?;
+    host.set_nonblocking(true)?;
+    writer_std.set_nonblocking(true)?;
+    let reader = tokio::net::UnixStream::from_std(host)?;
+    let writer = tokio::net::UnixStream::from_std(writer_std)?;
     Ok(SpawnedRenderer {
         child,
-        reader: Box::new(host),
+        reader: Box::new(reader),
         writer: Box::new(writer),
     })
 }
@@ -212,13 +211,11 @@ fn spawn_transport(command: &mut Command) -> io::Result<SpawnedRenderer> {
     command.stdin(Stdio::piped()).stdout(Stdio::piped());
     let mut child = command.spawn()?;
     let Some(stdin) = child.stdin.take() else {
-        let _ = child.kill();
-        let _ = child.wait();
+        let _ = child.start_kill();
         return Err(io::Error::other("renderer stdin missing"));
     };
     let Some(stdout) = child.stdout.take() else {
-        let _ = child.kill();
-        let _ = child.wait();
+        let _ = child.start_kill();
         return Err(io::Error::other("renderer stdout missing"));
     };
     Ok(SpawnedRenderer {
@@ -228,7 +225,11 @@ fn spawn_transport(command: &mut Command) -> io::Result<SpawnedRenderer> {
     })
 }
 
-fn spawn_process(id: RendererId, site: &Site, fetch: FetchHandle) -> io::Result<RendererHandle> {
+async fn spawn_process(
+    id: RendererId,
+    site: &Site,
+    fetch: FetchHandle,
+) -> io::Result<RendererHandle> {
     let mut command = Command::new(std::env::current_exe()?);
     command
         .arg("renderer")
@@ -240,192 +241,123 @@ fn spawn_process(id: RendererId, site: &Site, fetch: FetchHandle) -> io::Result<
         writer,
     } = spawn_transport(&mut command)?;
     let Some(stderr) = child.stderr.take() else {
-        let _ = child.kill();
-        let _ = child.wait();
+        let _ = child.start_kill();
         return Err(io::Error::other("renderer stderr missing"));
     };
-    let child = Arc::new(Mutex::new(child));
-    let sink = Sink(Arc::new(Mutex::new(writer)));
+    let (tx, rx) = mpsc::channel::<ToRenderer>(COMMAND_CAPACITY);
+    let (kill, kill_rx) = watch::channel(false);
     let pending = Arc::new(Mutex::new(HashMap::new()));
     let alive = Arc::new(AtomicBool::new(true));
     let subscribers = Arc::new(Mutex::new(Vec::new()));
-    let pump_sink = sink.clone();
-    let pump_pending = Arc::clone(&pending);
-    let pump_alive = Arc::clone(&alive);
-    let pump_subscribers = Arc::clone(&subscribers);
-    let pump_child = Arc::clone(&child);
-    let pump_site = site.clone();
-    let (ready_tx, ready_rx) = mpsc::channel();
-    let name = format!("renderer-{id:?}-pump");
-    let pump_join = thread::Builder::new()
-        .name(name)
-        .spawn(move || {
-            let context = PumpContext {
-                sink: &pump_sink,
-                pending: &pump_pending,
-                alive: &pump_alive,
-                subscribers: &pump_subscribers,
-                fetch: &fetch,
-                site: &pump_site,
-                child: &pump_child,
-            };
-            pump_loop(reader, &context, Some(ready_tx));
-        })
-        .expect("renderer pump thread");
-    let stderr_join = thread::Builder::new()
-        .name(format!("renderer-{id:?}-stderr"))
-        .spawn(move || forward_stderr(stderr))
-        .expect("renderer stderr thread");
-    if sink.send(&ToRenderer::Hello).is_err()
-        || ready_rx.recv_timeout(HANDSHAKE_TIMEOUT) != Ok(true)
+    let (ready_tx, ready_rx) = oneshot::channel();
+    let writer_task = tokio::spawn(writer_task(
+        rx,
+        writer,
+        Arc::clone(&alive),
+        Arc::clone(&pending),
+        kill.clone(),
+        kill_rx.clone(),
+    ));
+    let reader_context = ReaderContext {
+        tx: tx.clone(),
+        pending: Arc::clone(&pending),
+        alive: Arc::clone(&alive),
+        subscribers: Arc::clone(&subscribers),
+        fetch: fetch.clone(),
+        site: site.clone(),
+        kill: kill.clone(),
+    };
+    let reader_task = tokio::spawn(reader_task(reader, reader_context, Some(ready_tx)));
+    let stderr_task = tokio::spawn(forward_stderr(stderr));
+    // Detached child task: it reaps the child when the channel closes or the
+    // handle signals a kill. Dropping every kill sender also stops it.
+    let _reaper = tokio::spawn(child_task(child, kill_rx));
+    if tx.send(ToRenderer::Hello).await.is_err()
+        || timeout(HANDSHAKE_TIMEOUT, ready_rx).await != Ok(Ok(true))
     {
-        let mut child = child.lock().unwrap_or_else(PoisonError::into_inner);
-        let _ = child.kill();
-        let _ = child.wait();
+        let _ = kill.send(true);
+        let _result = writer_task.await;
+        let _result = reader_task.await;
+        let _result = stderr_task.await;
         return Err(io::Error::other("renderer handshake failed"));
     }
     logging::debug!(
         target: "browser::link",
         "renderer {id:?} ready for site {site:?}"
     );
+    let tasks = vec![writer_task, reader_task, stderr_task];
     Ok(RendererHandle {
-        sink,
+        tx,
         pending,
         alive,
         subscribers,
-        next_request: Arc::new(AtomicU64::new(1)),
-        child,
-        pump_join: Some(pump_join),
-        stderr_join: Some(stderr_join),
+        next_request: AtomicU64::new(1),
+        kill,
+        tasks: Mutex::new(tasks),
     })
 }
 
-struct PumpContext<'a> {
-    sink: &'a Sink,
-    pending: &'a Arc<Mutex<HashMap<u64, Sender<Reply>>>>,
-    alive: &'a Arc<AtomicBool>,
-    subscribers: &'a EventSubscribers,
-    fetch: &'a FetchHandle,
-    site: &'a Site,
-    child: &'a Arc<Mutex<Child>>,
-}
-
-impl PumpContext<'_> {
-    fn route(&self, message: FromRenderer) -> Result<(), RendererViolation> {
-        match message {
-            // Handled by the pipe handshake; never routed.
-            FromRenderer::Ready => {}
-            FromRenderer::Reply { id, reply } => {
-                if let Some(reply_tx) = self
-                    .pending
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .remove(&id)
-                {
-                    let _ = reply_tx.send(reply);
-                }
-            }
-            FromRenderer::Event { frame, event } => {
-                let mut saturated = false;
-                self.subscribers
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .retain(|subscriber| match subscriber.try_send((frame, event)) {
-                        Ok(()) => true,
-                        Err(async_mpsc::error::TrySendError::Closed(_)) => false,
-                        Err(async_mpsc::error::TrySendError::Full(_)) => {
-                            saturated = true;
-                            false
-                        }
-                    });
-                if saturated {
-                    return Err(RendererViolation);
-                }
-            }
-            FromRenderer::ServiceCall { id, call } => match call {
-                ServiceCall::Dial(request) => {
-                    let Some(initiator) = self.site.authorize(&request.initiator) else {
-                        return Err(RendererViolation);
-                    };
-                    let worker_fetch = self.fetch.clone();
-                    let worker_sink = self.sink.clone();
-                    let worker_child = Arc::clone(self.child);
-                    let worker_alive = Arc::clone(self.alive);
-                    let submitted = self.fetch.try_submit(move || {
-                        let outcome = worker_fetch.dial_request(&request, &initiator);
-                        if worker_sink
-                            .send(&ToRenderer::ServiceReply {
-                                id,
-                                reply: ServiceReply::Dial(outcome),
-                            })
-                            .is_err()
-                        {
-                            worker_alive.store(false, Ordering::Relaxed);
-                            terminate(&worker_child);
-                        }
-                    });
-                    if submitted.is_err() {
-                        self.sink
-                            .send(&ToRenderer::ServiceReply {
-                                id,
-                                reply: ServiceReply::Dial(None),
-                            })
-                            .map_err(|_| RendererViolation)?;
-                    }
-                }
-                ServiceCall::CookieGet { url } => {
-                    let Some(url) = self.site.authorize(&url) else {
-                        return Err(RendererViolation);
-                    };
-                    let reply = ServiceReply::Cookie(self.fetch.cookies_for(&url));
-                    self.sink
-                        .send(&ToRenderer::ServiceReply { id, reply })
-                        .map_err(|_| RendererViolation)?;
-                }
-                ServiceCall::CookieSet { value, url } => {
-                    let Some(url) = self.site.authorize(&url) else {
-                        return Err(RendererViolation);
-                    };
-                    self.fetch.set_cookie(&value, &url);
-                    self.sink
-                        .send(&ToRenderer::ServiceReply {
-                            id,
-                            reply: ServiceReply::Unit,
-                        })
-                        .map_err(|_| RendererViolation)?;
-                }
-            },
+async fn child_task(mut child: Child, mut kill: watch::Receiver<bool>) {
+    tokio::select! {
+        _ = kill.changed() => {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
         }
-        Ok(())
+        _ = child.wait() => {}
     }
 }
 
-/// Pumps one renderer child's stderr into this process's logger.
-///
-/// The child formats its own level and target; the browser only forwards the
-/// lines, so renderer records land in the daemon's console and file without a
-/// second file writer ([ADR 0015](../../../docs/adrs/0015-logging.md)).
-fn forward_stderr(stderr: std::process::ChildStderr) {
-    let mut reader = BufReader::new(stderr);
-    let mut bytes = Vec::new();
+/// Shared route state for one renderer's reader task.
+struct ReaderContext {
+    tx: mpsc::Sender<ToRenderer>,
+    pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Reply>>>>,
+    alive: Arc<AtomicBool>,
+    subscribers: EventSubscribers,
+    fetch: FetchHandle,
+    site: Site,
+    kill: watch::Sender<bool>,
+}
+
+async fn writer_task(
+    mut rx: mpsc::Receiver<ToRenderer>,
+    mut writer: Box<dyn AsyncWrite + Send + Unpin>,
+    alive: Arc<AtomicBool>,
+    pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Reply>>>>,
+    kill: watch::Sender<bool>,
+    mut kill_rx: watch::Receiver<bool>,
+) {
     loop {
-        bytes.clear();
-        match reader.read_until(b'\n', &mut bytes) {
-            Ok(0) | Err(_) => break,
-            Ok(_) => logging::log_forwarded(&String::from_utf8_lossy(&bytes)),
+        let message = tokio::select! {
+            message = rx.recv() => match message {
+                Some(message) => message,
+                None => return,
+            },
+            _ = kill_rx.changed() => return,
+        };
+        if renderer::write_control_async(&mut *writer, &message)
+            .await
+            .is_err()
+        {
+            fail(&alive, &pending, &kill);
+            return;
         }
     }
 }
 
-fn pump_loop(
-    mut reader: Box<dyn Read + Send>,
-    context: &PumpContext<'_>,
-    ready: Option<Sender<bool>>,
+async fn reader_task(
+    mut reader: Box<dyn AsyncRead + Send + Unpin>,
+    context: ReaderContext,
+    ready: Option<oneshot::Sender<bool>>,
 ) {
     let mut ready = ready;
     let mut buffer = Vec::new();
     loop {
-        let message = match renderer::read_control::<FromRenderer>(&mut reader, &mut buffer) {
+        let message = match renderer::read_control_async::<FromRenderer, _>(
+            &mut *reader,
+            &mut buffer,
+        )
+        .await
+        {
             Ok(Some(message)) => message,
             Ok(None) => break,
             Err(error) => {
@@ -441,26 +373,131 @@ fn pump_loop(
             }
             continue;
         }
-        if context.route(message).is_err() {
+        if route(message, &context).is_err() {
             break;
         }
     }
     if let Some(ready_tx) = ready {
         let _ = ready_tx.send(false);
     }
-    // A dead renderer must not strand callers blocked in `request`.
-    let mut pending = context
-        .pending
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner);
-    context.alive.store(false, Ordering::Relaxed);
-    pending.clear();
-    drop(pending);
-    terminate(context.child);
+    fail(&context.alive, &context.pending, &context.kill);
 }
 
-fn terminate(child: &Arc<Mutex<Child>>) {
-    let mut child = child.lock().unwrap_or_else(PoisonError::into_inner);
-    let _ = child.kill();
-    let _ = child.wait();
+/// Routes one renderer message; a failure terminates the renderer.
+fn route(message: FromRenderer, context: &ReaderContext) -> Result<(), RendererViolation> {
+    match message {
+        // Handled by the channel handshake; never routed.
+        FromRenderer::Ready => {}
+        FromRenderer::Reply { id, reply } => {
+            if let Some(reply_tx) = context
+                .pending
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .remove(&id)
+            {
+                let _ = reply_tx.send(reply);
+            }
+        }
+        FromRenderer::Event { frame, event } => {
+            let mut saturated = false;
+            context
+                .subscribers
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .retain(|subscriber| match subscriber.try_send((frame, event)) {
+                    Ok(()) => true,
+                    Err(mpsc::error::TrySendError::Closed(_)) => false,
+                    Err(mpsc::error::TrySendError::Full(_)) => {
+                        saturated = true;
+                        false
+                    }
+                });
+            if saturated {
+                return Err(RendererViolation);
+            }
+        }
+        FromRenderer::ServiceCall { id, call } => match call {
+            ServiceCall::Dial(request) => {
+                let Some(initiator) = context.site.authorize(&request.initiator) else {
+                    return Err(RendererViolation);
+                };
+                let worker_fetch = context.fetch.clone();
+                let worker_tx = context.tx.clone();
+                let worker_pending = Arc::clone(&context.pending);
+                let worker_alive = Arc::clone(&context.alive);
+                let worker_kill = context.kill.clone();
+                let submitted = context.fetch.try_submit(move || {
+                    let outcome = worker_fetch.dial_request(&request, &initiator);
+                    if worker_tx
+                        .try_send(ToRenderer::ServiceReply {
+                            id,
+                            reply: ServiceReply::Dial(outcome),
+                        })
+                        .is_err()
+                    {
+                        fail(&worker_alive, &worker_pending, &worker_kill);
+                    }
+                });
+                if submitted.is_err() {
+                    send_reply(&context.tx, id, ServiceReply::Dial(None))?;
+                }
+            }
+            ServiceCall::CookieGet { url } => {
+                let Some(url) = context.site.authorize(&url) else {
+                    return Err(RendererViolation);
+                };
+                let reply = ServiceReply::Cookie(context.fetch.cookies_for(&url));
+                send_reply(&context.tx, id, reply)?;
+            }
+            ServiceCall::CookieSet { value, url } => {
+                let Some(url) = context.site.authorize(&url) else {
+                    return Err(RendererViolation);
+                };
+                context.fetch.set_cookie(&value, &url);
+                send_reply(&context.tx, id, ServiceReply::Unit)?;
+            }
+        },
+    }
+    Ok(())
+}
+
+fn send_reply(
+    tx: &mpsc::Sender<ToRenderer>,
+    id: u64,
+    reply: ServiceReply,
+) -> Result<(), RendererViolation> {
+    tx.try_send(ToRenderer::ServiceReply { id, reply })
+        .map_err(|_| RendererViolation)
+}
+
+fn fail(
+    alive: &Arc<AtomicBool>,
+    pending: &Arc<Mutex<HashMap<u64, oneshot::Sender<Reply>>>>,
+    kill: &watch::Sender<bool>,
+) {
+    alive.store(false, Ordering::Relaxed);
+    fail_pending(pending);
+    let _ = kill.send(true);
+}
+
+fn fail_pending(pending: &Arc<Mutex<HashMap<u64, oneshot::Sender<Reply>>>>) {
+    let mut pending = pending.lock().unwrap_or_else(PoisonError::into_inner);
+    pending.clear();
+}
+
+/// Forwards one renderer child's stderr into this process's logger.
+///
+/// The child formats its own level and target; the browser only forwards the
+/// lines, so renderer records land in the daemon's console and file without a
+/// second file writer ([ADR 0015](../../../docs/adrs/0015-logging.md)).
+async fn forward_stderr(stderr: tokio::process::ChildStderr) {
+    let mut reader = tokio::io::BufReader::new(stderr);
+    let mut bytes = Vec::new();
+    loop {
+        bytes.clear();
+        match reader.read_until(b'\n', &mut bytes).await {
+            Ok(0) | Err(_) => break,
+            Ok(_) => logging::log_forwarded(&String::from_utf8_lossy(&bytes)),
+        }
+    }
 }
