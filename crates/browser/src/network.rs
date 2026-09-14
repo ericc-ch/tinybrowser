@@ -9,7 +9,6 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{self, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -36,8 +35,6 @@ pub(crate) struct NavOutcome {
 }
 
 const COOKIES_VERSION: &str = "tinybrowser-cookies-v1";
-const MAX_BROWSER_DIALS: usize = 16;
-const MAX_QUEUED_DIALS: usize = 256;
 static COOKIE_TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// Durable backing for one Profile under `XDG_DATA_HOME`.
@@ -189,7 +186,6 @@ impl ProfileStore {
 pub struct NetworkSession {
     agent: Agent,
     store: Arc<ProfileStore>,
-    executor: NetworkExecutor,
 }
 
 impl NetworkSession {
@@ -212,7 +208,6 @@ impl NetworkSession {
         Ok(Self {
             agent,
             store: Arc::new(store),
-            executor: NetworkExecutor::new(),
         })
     }
 
@@ -222,7 +217,6 @@ impl NetworkSession {
         FetchHandle {
             agent: self.agent.clone(),
             store: Arc::clone(&self.store),
-            executor: self.executor.clone(),
         }
     }
 
@@ -239,14 +233,13 @@ impl NetworkSession {
     }
 }
 
-/// Cloneable, sendable handle for cookies and blocking HTTP.
+/// Cloneable, sendable handle for cookies and async HTTP.
 ///
-/// Completions return to the tab coordinator from the bounded network executor.
+/// Completions return to the tab coordinator as renderer events.
 #[derive(Clone)]
 pub(crate) struct FetchHandle {
     agent: Agent,
     store: Arc<ProfileStore>,
-    executor: NetworkExecutor,
 }
 
 impl FetchHandle {
@@ -266,28 +259,29 @@ impl FetchHandle {
         self.agent.request(method, url)
     }
 
-    /// Starts a navigation dial on the browser executor; the completion
-    /// returns on `reply` tagged with `epoch`.
+    /// Spawns one navigation dial; the completion returns on `reply` tagged
+    /// with `epoch`.
     pub(crate) fn dial_navigation(
         &self,
         epoch: u64,
         url: Url,
         initiator: Url,
         reply: UnboundedSender<(u64, Result<NavOutcome, ()>)>,
-    ) -> Result<(), ()> {
+    ) {
         let fetch = self.clone();
-        self.try_submit(move || {
-            let outcome = fetch.navigate_blocking(&url, &initiator);
+        tokio::spawn(async move {
+            let outcome = fetch.navigate(&url, &initiator).await;
             let _send_result = reply.send((epoch, outcome));
-        })
+        });
     }
 
-    fn navigate_blocking(&self, url: &Url, initiator: &Url) -> Result<NavOutcome, ()> {
+    async fn navigate(&self, url: &Url, initiator: &Url) -> Result<NavOutcome, ()> {
         let response = self
             .request(Method::GET, url.clone())
             .with_initiator_kind(InitiatorKind::Navigation)
             .with_initiator(initiator.clone())
             .send()
+            .await
             .map_err(|_| ())?;
         self.store.mark_dirty();
         let status = response.status();
@@ -304,7 +298,7 @@ impl FetchHandle {
             .map(str::to_owned);
         let mut body = response.into_body();
         let mut bytes = Vec::new();
-        while let Some(chunk) = body.read_chunk().map_err(|_| ())? {
+        while let Some(chunk) = body.read_chunk().await.map_err(|_| ())? {
             if bytes.len().saturating_add(chunk.len()) > NAV_BODY_LIMIT {
                 return Err(());
             }
@@ -319,8 +313,8 @@ impl FetchHandle {
         })
     }
 
-    /// Blocking GET for one renderer service call.
-    pub(crate) fn dial_request(
+    /// Async GET for one renderer service call.
+    pub(crate) async fn dial_request(
         &self,
         request: &DialRequest,
         initiator: &Url,
@@ -331,6 +325,7 @@ impl FetchHandle {
             .with_initiator_kind(InitiatorKind::Fetch)
             .with_initiator(initiator.clone())
             .send()
+            .await
             .ok()?;
         self.store.mark_dirty();
         let status = response.status();
@@ -348,7 +343,7 @@ impl FetchHandle {
         let mut body = Vec::new();
         if request.read_body {
             let mut response_body = response.into_body();
-            while let Some(chunk) = response_body.read_chunk().ok()? {
+            while let Some(chunk) = response_body.read_chunk().await.ok()? {
                 if body.len().saturating_add(chunk.len()) > NAV_BODY_LIMIT {
                     return None;
                 }
@@ -362,47 +357,6 @@ impl FetchHandle {
             content_language,
             body,
         })
-    }
-
-    pub(crate) fn try_submit(&self, operation: impl FnOnce() + Send + 'static) -> Result<(), ()> {
-        self.executor.try_submit(operation)
-    }
-}
-
-type NetworkJob = Box<dyn FnOnce() + Send + 'static>;
-
-#[derive(Clone)]
-struct NetworkExecutor {
-    tx: SyncSender<NetworkJob>,
-}
-
-impl NetworkExecutor {
-    fn new() -> Self {
-        let (tx, rx) = mpsc::sync_channel::<NetworkJob>(MAX_QUEUED_DIALS);
-        let receiver = Arc::new(Mutex::new(rx));
-        for _ in 0..MAX_BROWSER_DIALS {
-            let receiver = Arc::clone(&receiver);
-            std::thread::spawn(move || {
-                loop {
-                    let job = receiver
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .recv();
-                    let Ok(job) = job else {
-                        return;
-                    };
-                    job();
-                }
-            });
-        }
-        Self { tx }
-    }
-
-    fn try_submit(&self, operation: impl FnOnce() + Send + 'static) -> Result<(), ()> {
-        match self.tx.try_send(Box::new(operation)) {
-            Ok(()) => Ok(()),
-            Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) => Err(()),
-        }
     }
 }
 

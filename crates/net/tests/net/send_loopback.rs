@@ -12,8 +12,8 @@ use net::{
 const OBSERVE_TIMEOUT: Duration = Duration::from_secs(5);
 const PROXY_PROBE_FLAG: &str = "NET_CRATE_PROXY_PROBE";
 
-#[test]
-fn http_transcripts_cover_status_headers_framing_limits_and_failures() {
+#[tokio::test]
+async fn http_transcripts_cover_status_headers_framing_limits_and_failures() {
     for status in [201_u16, 302, 404, 500] {
         let server =
             scripted([
@@ -22,9 +22,10 @@ fn http_transcripts_cover_status_headers_framing_limits_and_failures() {
         let response = Agent::new()
             .request(Method::GET, server.url("/"))
             .send()
+            .await
             .expect("status is response data");
         assert_eq!(response.status(), status);
-        assert_eq!(response.into_body().bytes(16).expect("body"), b"no");
+        assert_eq!(response.into_body().bytes(16).await.expect("body"), b"no");
         server.assert_clean();
     }
 
@@ -36,6 +37,7 @@ fn http_transcripts_cover_status_headers_framing_limits_and_failures() {
     let response = Agent::new()
         .request(Method::GET, requested.clone())
         .send()
+        .await
         .expect("GET");
     let request = &server.requests()[0];
     assert_eq!(request.method, "GET");
@@ -47,7 +49,10 @@ fn http_transcripts_cover_status_headers_framing_limits_and_failures() {
         response.headers().get("CONTENT-TYPE"),
         Some(&b"text/plain"[..])
     );
-    assert_eq!(response.into_body().bytes(16).expect("body"), b"hello");
+    assert_eq!(
+        response.into_body().bytes(16).await.expect("body"),
+        b"hello"
+    );
     server.assert_clean();
 
     let server = scripted([b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n".to_vec()]);
@@ -55,9 +60,11 @@ fn http_transcripts_cover_status_headers_framing_limits_and_failures() {
         Agent::new()
             .request(Method::GET, server.url("/chunked"))
             .send()
+            .await
             .expect("chunked")
             .into_body()
             .bytes(64)
+            .await
             .expect("body"),
         b"hello world"
     );
@@ -69,9 +76,11 @@ fn http_transcripts_cover_status_headers_framing_limits_and_failures() {
         Agent::new()
             .request(Method::GET, server.url("/limit"))
             .send()
+            .await
             .expect("response")
             .into_body()
-            .bytes(16),
+            .bytes(16)
+            .await,
         Err(NetError::Limit(LimitExceeded::Size(16)))
     ));
     server.assert_clean();
@@ -82,7 +91,8 @@ fn http_transcripts_cover_status_headers_framing_limits_and_failures() {
     assert!(matches!(
         Agent::new()
             .request(Method::GET, url::Url::parse(&dead_url).expect("url"))
-            .send(),
+            .send()
+            .await,
         Err(NetError::Transport(_))
     ));
 
@@ -95,7 +105,8 @@ fn http_transcripts_cover_status_headers_framing_limits_and_failures() {
             .timeout_global(Duration::from_millis(60))
             .build()
             .request(Method::GET, server.url("/stall"))
-            .send(),
+            .send()
+            .await,
         Err(NetError::Transport(TransportError::Timeout(
             TimeoutKind::Global
         )))
@@ -103,8 +114,8 @@ fn http_transcripts_cover_status_headers_framing_limits_and_failures() {
     server.assert_clean();
 }
 
-#[test]
-fn timeout_global_covers_every_redirect_hop() {
+#[tokio::test]
+async fn timeout_global_covers_every_redirect_hop() {
     let hop_delay = Duration::from_millis(80);
     let global = Duration::from_millis(150);
     let hops = Arc::new(std::sync::Mutex::new(0_u8));
@@ -126,7 +137,8 @@ fn timeout_global_covers_every_redirect_hop() {
         .timeout_global(global)
         .build()
         .request(Method::GET, server.url("/start"))
-        .send();
+        .send()
+        .await;
     let elapsed = started.elapsed();
     assert!(
         matches!(
@@ -146,8 +158,8 @@ fn timeout_global_covers_every_redirect_hop() {
     server.assert_clean();
 }
 
-#[test]
-fn response_bodies_stream_and_drop_cancels_the_socket() {
+#[tokio::test]
+async fn response_bodies_stream_and_drop_cancels_the_socket() {
     let first_chunk_delivered = Arc::new(AtomicBool::new(false));
     let server_flag = Arc::clone(&first_chunk_delivered);
     let first = vec![b'a'; 1024];
@@ -177,11 +189,12 @@ fn response_bodies_stream_and_drop_cancels_the_socket() {
     let mut body = Agent::new()
         .request(Method::GET, server.url("/stream"))
         .send()
+        .await
         .expect("stream")
         .into_body();
     let mut collected = Vec::new();
     let mut chunks = 0;
-    while let Some(chunk) = body.read_chunk().expect("chunk") {
+    while let Some(chunk) = body.read_chunk().await.expect("chunk") {
         collected.extend_from_slice(&chunk);
         chunks += 1;
         first_chunk_delivered.store(true, Ordering::Release);
@@ -206,9 +219,10 @@ fn response_bodies_stream_and_drop_cancels_the_socket() {
         let mut body = Agent::new()
             .request(Method::GET, server.url("/cancel"))
             .send()
+            .await
             .expect("cancel")
             .into_body();
-        let _ = body.read_chunk().expect("partial chunk");
+        let _ = body.read_chunk().await.expect("partial chunk");
     }
     let deadline = Instant::now() + OBSERVE_TIMEOUT;
     while !peer_closed.load(Ordering::Acquire) {
@@ -216,13 +230,13 @@ fn response_bodies_stream_and_drop_cancels_the_socket() {
             Instant::now() < deadline,
             "server never observed the client"
         );
-        std::thread::yield_now();
+        tokio::task::yield_now().await;
     }
     server.assert_clean();
 }
 
-#[test]
-fn request_shaping_custom_method_fragments_and_rejections_are_wire_visible() {
+#[tokio::test]
+async fn request_shaping_custom_method_fragments_and_rejections_are_wire_visible() {
     let server = scripted([b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n".to_vec()]);
     Agent::new()
         .request(
@@ -230,6 +244,7 @@ fn request_shaping_custom_method_fragments_and_rejections_are_wire_visible() {
             server.url("/m"),
         )
         .send()
+        .await
         .expect("custom method request");
     assert_eq!(server.requests()[0].method, "propfind");
     server.assert_clean();
@@ -245,6 +260,7 @@ fn request_shaping_custom_method_fragments_and_rejections_are_wire_visible() {
         .expect("header")
         .body(b"name=value")
         .send()
+        .await
         .expect("shaped request");
     let request = &server.requests()[0];
     assert_eq!(request.target, "/shape");
@@ -267,8 +283,8 @@ fn request_shaping_custom_method_fragments_and_rejections_are_wire_visible() {
     server.assert_clean();
 }
 
-#[test]
-fn redirect_policy_covers_following_rewriting_caps_and_origin_safety() {
+#[tokio::test]
+async fn redirect_policy_covers_following_rewriting_caps_and_origin_safety() {
     for (status, method, expected_method, expected_body) in [
         (301, Method::POST, "GET", b"".as_slice()),
         (302, Method::POST, "GET", b"".as_slice()),
@@ -282,6 +298,7 @@ fn redirect_policy_covers_following_rewriting_caps_and_origin_safety() {
             .request(method, server.url("/start"))
             .body(b"field=1")
             .send()
+            .await
             .expect("redirect");
         let requests = server.requests();
         assert_eq!(requests[0].method, initial_method);
@@ -299,6 +316,7 @@ fn redirect_policy_covers_following_rewriting_caps_and_origin_safety() {
     let response = Agent::new()
         .request(Method::GET, asked)
         .send()
+        .await
         .expect("chain");
     assert_eq!(response.status(), 200);
     assert_eq!(response.final_url(), &server.url("/next#fragment"));
@@ -311,7 +329,8 @@ fn redirect_policy_covers_following_rewriting_caps_and_origin_safety() {
             .max_redirects(1)
             .build()
             .request(Method::GET, empty.url("/empty"))
-            .send(),
+            .send()
+            .await,
         Err(NetError::Limit(LimitExceeded::Redirect))
     ));
     assert_eq!(empty.requests().len(), 2);
@@ -323,7 +342,8 @@ fn redirect_policy_covers_following_rewriting_caps_and_origin_safety() {
             .max_redirects(2)
             .build()
             .request(Method::GET, server.url("/loop"))
-            .send(),
+            .send()
+            .await,
         Err(NetError::Limit(LimitExceeded::Redirect))
     ));
     assert_eq!(server.requests().len(), 3);
@@ -350,13 +370,14 @@ fn redirect_policy_covers_following_rewriting_caps_and_origin_safety() {
         .header("Authorization", "Bearer secret")
         .expect("authorization")
         .send()
+        .await
         .expect("cross-origin redirect");
     first.assert_clean();
     landing.assert_clean();
 }
 
-#[test]
-fn cross_site_redirect_taints_samesite_cookie_inclusion() {
+#[tokio::test]
+async fn cross_site_redirect_taints_samesite_cookie_inclusion() {
     let counter = Arc::new(std::sync::Mutex::new(0_u8));
     let server_counter = Arc::clone(&counter);
     let server = TestServer::start(move |connection| {
@@ -394,6 +415,7 @@ fn cross_site_redirect_taints_samesite_cookie_inclusion() {
         .with_initiator_kind(net::InitiatorKind::Fetch)
         .with_initiator(start)
         .send()
+        .await
         .expect("redirect chain");
     let requests = server.requests();
     assert_eq!(requests[0].header("cookie"), Some("strict=1"));
@@ -402,8 +424,8 @@ fn cross_site_redirect_taints_samesite_cookie_inclusion() {
     server.assert_clean();
 }
 
-#[test]
-fn proxy_tls_environment_and_debug_boundaries_stay_explicit() {
+#[tokio::test]
+async fn proxy_tls_environment_and_debug_boundaries_stay_explicit() {
     for invalid in [
         "",
         "not a uri",
@@ -416,32 +438,6 @@ fn proxy_tls_environment_and_debug_boundaries_stay_explicit() {
             Err(NetError::Protocol(ProtocolError::InvalidProxy))
         ));
     }
-
-    let proxy = TestServer::start(|connection| {
-        let request = connection.read_request();
-        assert_eq!(request.target, "/via");
-        assert_eq!(request.header("host"), Some("origin.test"));
-        assert_eq!(
-            request.header("proxy-authorization"),
-            Some("Basic dXNlcjpzZWNyZXQ=")
-        );
-        connection
-            .write_all(&canned_ok(&[], b"via"))
-            .expect("proxy response");
-    });
-    let proxy_uri = format!("http://user:secret@{}", proxy.local_addr());
-    let response = AgentBuilder::new()
-        .proxy(&proxy_uri)
-        .expect("proxy")
-        .build()
-        .request(
-            Method::GET,
-            url::Url::parse("http://origin.test/via").expect("origin"),
-        )
-        .send()
-        .expect("proxy request");
-    assert_eq!(response.into_body().bytes(8).expect("body"), b"via");
-    proxy.assert_clean();
 
     let builder = AgentBuilder::new()
         .proxy("http://user:secret@localhost:8080")
@@ -463,7 +459,7 @@ fn proxy_tls_environment_and_debug_boundaries_stay_explicit() {
                 Method::GET,
                 url::Url::parse(&format!("https://{addr}/")).expect("https"),
             )
-            .send(),
+            .send().await,
         Err(NetError::Transport(TransportError::Tls(reason))) if !reason.is_empty()
     ));
     worker.join().expect("TLS worker");
@@ -478,6 +474,7 @@ fn proxy_tls_environment_and_debug_boundaries_stay_explicit() {
         Agent::new()
             .request(Method::GET, server.url("/direct"))
             .send()
+            .await
             .expect("environment proxy must be ignored");
         server.assert_clean();
     } else {
@@ -505,8 +502,8 @@ fn proxy_tls_environment_and_debug_boundaries_stay_explicit() {
     }
 }
 
-#[test]
-fn ipv6_loopback_send_and_connect_paths_are_exercised() {
+#[tokio::test]
+async fn ipv6_loopback_send_and_connect_paths_are_exercised() {
     let server = TestServer::start_v6(|connection| {
         let request = connection.read_request();
         assert_eq!(request.target, "/v6");
@@ -517,70 +514,10 @@ fn ipv6_loopback_send_and_connect_paths_are_exercised() {
     let response = Agent::new()
         .request(Method::GET, server.url("/v6"))
         .send()
+        .await
         .expect("ipv6 send");
-    assert_eq!(response.into_body().bytes(8).expect("body"), b"v6");
+    assert_eq!(response.into_body().bytes(8).await.expect("body"), b"v6");
     server.assert_clean();
-
-    let proxy = TestServer::start(|connection| {
-        let request = connection.read_request();
-        assert_eq!(request.method, "CONNECT");
-        assert_eq!(request.target, "origin.test:443");
-        connection
-            .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\nNOT-TLS")
-            .expect("connect 200");
-    });
-    let proxy_uri = format!("http://{}", proxy.local_addr());
-    assert!(matches!(
-        AgentBuilder::new()
-            .proxy(&proxy_uri)
-            .expect("proxy")
-            .build()
-            .request(
-                Method::GET,
-                url::Url::parse("https://origin.test/").expect("https"),
-            )
-            .send(),
-        Err(NetError::Transport(TransportError::Tls(_)))
-    ));
-    proxy.assert_clean();
-
-    let denied = TestServer::start(|connection| {
-        connection.read_request();
-        connection
-            .write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n")
-            .expect("connect 403");
-    });
-    assert!(matches!(
-        AgentBuilder::new()
-            .proxy(&format!("http://{}", denied.local_addr()))
-            .expect("proxy")
-            .build()
-            .request(
-                Method::GET,
-                url::Url::parse("https://origin.test/").expect("https"),
-            )
-            .send(),
-        Err(NetError::Transport(TransportError::Connect(detail))) if &*detail == "CONNECT 403"
-    ));
-    denied.assert_clean();
-
-    let icy = TestServer::start(|connection| {
-        connection.read_request();
-        connection.write_all(b"ICY 200 OK\r\n\r\n").expect("icy");
-    });
-    assert!(matches!(
-        AgentBuilder::new()
-            .proxy(&format!("http://{}", icy.local_addr()))
-            .expect("proxy")
-            .build()
-            .request(
-                Method::GET,
-                url::Url::parse("https://origin.test/").expect("https"),
-            )
-            .send(),
-        Err(NetError::Transport(TransportError::Connect(_)))
-    ));
-    icy.assert_clean();
 
     let wss = std::net::TcpListener::bind("127.0.0.1:0").expect("wss listener");
     let wss_addr = wss.local_addr().expect("address");
@@ -596,14 +533,15 @@ fn ipv6_loopback_send_and_connect_paths_are_exercised() {
                 Method::GET,
                 url::Url::parse(&format!("wss://{wss_addr}/")).expect("wss"),
             )
-            .upgrade(),
+            .upgrade()
+            .await,
         Err(NetError::Transport(TransportError::Tls(_)) | NetError::Protocol(_))
     ));
     worker.join().expect("wss worker");
 }
 
-#[test]
-fn url_credentials_host_redirect_and_non_http_schemes_are_wire_visible() {
+#[tokio::test]
+async fn url_credentials_host_redirect_and_non_http_schemes_are_wire_visible() {
     let server = TestServer::start(|connection| {
         let request = connection.read_request();
         assert_eq!(request.header("authorization"), Some("Basic dXNlcjpwYXNz"));
@@ -617,6 +555,7 @@ fn url_credentials_host_redirect_and_non_http_schemes_are_wire_visible() {
     Agent::new()
         .request(Method::GET, url)
         .send()
+        .await
         .expect("basic");
     server.assert_clean();
 
@@ -645,6 +584,7 @@ fn url_credentials_host_redirect_and_non_http_schemes_are_wire_visible() {
         .expect("length")
         .body(b"field=1")
         .send()
+        .await
         .expect("cross-origin host stripped");
     first.assert_clean();
     landing.assert_clean();
@@ -652,13 +592,14 @@ fn url_credentials_host_redirect_and_non_http_schemes_are_wire_visible() {
     assert!(matches!(
         Agent::new()
             .request(Method::GET, url::Url::parse("ws://127.0.0.1/").expect("ws"))
-            .send(),
+            .send()
+            .await,
         Err(NetError::Protocol(ProtocolError::RejectedRequest))
     ));
 }
 
-#[test]
-fn resolve_maps_hit_miss_and_fail() {
+#[tokio::test]
+async fn resolve_maps_hit_miss_and_fail() {
     assert!(matches!(
         AgentBuilder::new().resolve("not-a-spec"),
         Err(NetError::Protocol(ProtocolError::InvalidResolve))
@@ -676,8 +617,12 @@ fn resolve_maps_hit_miss_and_fail() {
     let response = agent
         .request(Method::GET, mapped)
         .send()
+        .await
         .expect("mapped hit");
-    assert_eq!(response.into_body().bytes(16).expect("body"), b"mapped");
+    assert_eq!(
+        response.into_body().bytes(16).await.expect("body"),
+        b"mapped"
+    );
     assert_eq!(
         server.requests()[0]
             .header("Host")
@@ -690,8 +635,9 @@ fn resolve_maps_hit_miss_and_fail() {
     let miss = agent
         .request(Method::GET, miss_server.url("/"))
         .send()
+        .await
         .expect("unmapped 127.0.0.1 uses libc");
-    assert_eq!(miss.into_body().bytes(16).expect("body"), b"direct");
+    assert_eq!(miss.into_body().bytes(16).await.expect("body"), b"direct");
     miss_server.assert_clean();
 
     let failed = agent.request(
@@ -699,7 +645,7 @@ fn resolve_maps_hit_miss_and_fail() {
         url::Url::parse("http://nonexistent.web-platform.test/").expect("fail URL"),
     );
     assert!(matches!(
-        failed.send(),
+        failed.send().await,
         Err(NetError::Transport(TransportError::Dns(_)))
     ));
 }

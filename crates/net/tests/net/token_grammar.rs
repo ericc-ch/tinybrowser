@@ -1,7 +1,7 @@
 use net::{HeaderError, HeaderMap, Method};
 
-#[test]
-fn request_tokens_accept_the_protocol_grammar_and_reject_injection() {
+#[tokio::test]
+async fn request_tokens_accept_the_protocol_grammar_and_reject_injection() {
     let mut headers = HeaderMap::new();
     let token_alphabet = "!#$%&'*+-.^_`|~09AZaz";
     headers

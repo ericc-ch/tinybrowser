@@ -1,8 +1,5 @@
-use std::io;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
-
-use url::Url;
 
 use crate::cookie::{CookieJar, CookieOp, RetrievalKind};
 use crate::error::{LimitExceeded, NetError, ProtocolError, TimeoutKind, TransportError};
@@ -11,9 +8,9 @@ use crate::protocol::{HeaderError, HeaderMap, Method};
 use crate::resolve::HostMap;
 use crate::transport::{CallBudget, HttpEngine, basic_authorization};
 use crate::websocket::{self, WebSocket};
+use http_body_util::BodyExt as _;
+use url::Url;
 
-const CHUNK_SIZE: usize = 16 * 1024;
-// https://fetch.spec.whatwg.org/#http-redirect-fetch
 const DEFAULT_MAX_REDIRECTS: u32 = 20;
 
 /// Builds an [`Agent`].
@@ -382,7 +379,7 @@ impl RequestBuilder {
     /// [`NetError::Protocol`] for a non-`http`/`https` URL, a rejected request, or an
     /// unusable `Location`. [`NetError::Limit`] when the redirect cap is exceeded.
     /// [`NetError::Transport`] when a hop fails.
-    pub fn send(self) -> Result<Response, NetError> {
+    pub async fn send(self) -> Result<Response, NetError> {
         if !matches!(self.url.scheme(), "http" | "https") {
             return Err(NetError::Protocol(ProtocolError::RejectedRequest));
         }
@@ -417,10 +414,10 @@ impl RequestBuilder {
                 cross_site_redirect,
             );
             apply_url_credentials(&mut hop_headers, &url);
-            let (status, response_headers, reader) =
-                agent
-                    .engine
-                    .send(&method, &wire, &hop_headers, body.as_deref(), budget)?;
+            let (status, response_headers, reader) = agent
+                .engine
+                .send(&method, &wire, &hop_headers, body.as_deref(), budget)
+                .await?;
             let response = Response::from_parts(
                 status,
                 response_headers,
@@ -474,7 +471,7 @@ impl RequestBuilder {
     ///
     /// [`NetError::Protocol`] for a non-WebSocket URL or a failed handshake.
     /// [`NetError::Transport`] when the dial or TLS handshake fails.
-    pub fn upgrade(self) -> Result<WebSocket, NetError> {
+    pub async fn upgrade(self) -> Result<WebSocket, NetError> {
         if !matches!(self.url.scheme(), "ws" | "wss") {
             return Err(NetError::Protocol(ProtocolError::RejectedRequest));
         }
@@ -497,6 +494,7 @@ impl RequestBuilder {
             &method,
             self.initiator.as_ref(),
         )
+        .await
     }
 }
 
@@ -568,7 +566,7 @@ fn apply_url_credentials(headers: &mut HeaderMap, url: &Url) {
 
 /// Streaming response body. Dropping it closes the socket.
 pub struct Body {
-    inner: Box<dyn io::Read + Send>,
+    inner: hyper::body::Incoming,
     budget: CallBudget,
 }
 
@@ -579,7 +577,7 @@ impl std::fmt::Debug for Body {
 }
 
 impl Body {
-    fn from_reader(inner: Box<dyn io::Read + Send>, budget: CallBudget) -> Self {
+    fn from_incoming(inner: hyper::body::Incoming, budget: CallBudget) -> Self {
         Self { inner, budget }
     }
 
@@ -587,28 +585,38 @@ impl Body {
     ///
     /// # Errors
     ///
-    /// [`NetError::Transport`] when the socket read fails.
-    pub fn read_chunk(&mut self) -> Result<Option<Vec<u8>>, NetError> {
-        let mut buf = vec![0u8; CHUNK_SIZE];
+    /// [`NetError::Transport`] when the socket read fails or the deadline
+    /// expires.
+    pub async fn read_chunk(&mut self) -> Result<Option<Vec<u8>>, NetError> {
         loop {
-            match self.inner.read(&mut buf) {
-                Ok(0) => return Ok(None),
-                Ok(n) => {
-                    buf.truncate(n);
-                    return Ok(Some(buf));
-                }
-                Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
-                Err(err)
-                    if matches!(
-                        err.kind(),
-                        io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
-                    ) =>
+            let frame = match self.budget.deadline() {
+                Some(deadline) => match tokio::time::timeout_at(
+                    tokio::time::Instant::from_std(deadline),
+                    self.inner.frame(),
+                )
+                .await
                 {
-                    return Err(NetError::Transport(TransportError::Timeout(
-                        self.budget.timeout_kind(TimeoutKind::RecvBody),
+                    Ok(frame) => frame,
+                    Err(_) => {
+                        return Err(NetError::Transport(TransportError::Timeout(
+                            self.budget.timeout_kind(TimeoutKind::RecvBody),
+                        )));
+                    }
+                },
+                None => self.inner.frame().await,
+            };
+            match frame {
+                Some(Ok(frame)) => {
+                    if let Ok(data) = frame.into_data() {
+                        return Ok(Some(data.to_vec()));
+                    }
+                }
+                Some(Err(error)) => {
+                    return Err(NetError::Transport(TransportError::Io(
+                        std::io::Error::other(error),
                     )));
                 }
-                Err(err) => return Err(NetError::Transport(TransportError::Io(err))),
+                None => return Ok(None),
             }
         }
     }
@@ -619,9 +627,9 @@ impl Body {
     ///
     /// [`NetError::Limit`] when the body is larger than `limit`.
     /// [`NetError::Transport`] when a read fails.
-    pub fn bytes(mut self, limit: usize) -> Result<Vec<u8>, NetError> {
+    pub async fn bytes(mut self, limit: usize) -> Result<Vec<u8>, NetError> {
         let mut out = Vec::new();
-        while let Some(chunk) = self.read_chunk()? {
+        while let Some(chunk) = self.read_chunk().await? {
             if out.len() + chunk.len() > limit {
                 return Err(NetError::Limit(LimitExceeded::Size(limit as u64)));
             }
@@ -635,8 +643,9 @@ impl Body {
     /// # Errors
     ///
     /// Same as [`Body::bytes`].
-    pub fn text(self, limit: usize) -> Result<String, NetError> {
+    pub async fn text(self, limit: usize) -> Result<String, NetError> {
         self.bytes(limit)
+            .await
             .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
     }
 }
@@ -655,7 +664,7 @@ impl Response {
     fn from_parts(
         status: u16,
         headers: HeaderMap,
-        body: Box<dyn io::Read + Send>,
+        body: hyper::body::Incoming,
         initiator_kind: InitiatorKind,
         final_url: Url,
         budget: CallBudget,
@@ -665,7 +674,7 @@ impl Response {
             headers,
             final_url,
             initiator_kind,
-            body: Body::from_reader(body, budget),
+            body: Body::from_incoming(body, budget),
         }
     }
 

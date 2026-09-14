@@ -487,12 +487,9 @@ impl Tab {
         let epoch = nav.epoch;
         let url = nav.url.clone();
         let initiator = nav.initiator.clone();
-        if self
-            .fetch
-            .dial_navigation(epoch, url, initiator, self.dial_tx.clone())
-            .is_ok()
-            && let Some(nav) = self.nav.as_mut()
-        {
+        self.fetch
+            .dial_navigation(epoch, url, initiator, self.dial_tx.clone());
+        if let Some(nav) = self.nav.as_mut() {
             nav.submitted = true;
             self.nav_in_flight = Some(epoch);
         }

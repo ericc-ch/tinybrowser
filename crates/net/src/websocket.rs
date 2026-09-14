@@ -1,23 +1,25 @@
-use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
-use tungstenite::client::IntoClientRequest as _;
-use tungstenite::handshake::HandshakeError;
-use tungstenite::handshake::client::ClientHandshake;
-use tungstenite::protocol::frame::Utf8Bytes;
-use tungstenite::protocol::frame::coding::CloseCode;
-use tungstenite::protocol::{CloseFrame, Message};
+use futures_util::SinkExt as _;
+use futures_util::StreamExt as _;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
+use tokio_tungstenite::tungstenite::protocol::CloseFrame;
+use tokio_tungstenite::tungstenite::protocol::Message;
+use tokio_tungstenite::tungstenite::protocol::frame::Utf8Bytes;
+use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use url::Url;
 
 use crate::InitiatorKind;
 use crate::client::Agent;
-use crate::error::{NetError, ProtocolError, TransportError};
+use crate::error::{NetError, ProtocolError, TimeoutKind, TransportError};
 use crate::protocol::{HeaderMap, Method};
-use crate::transport::RawStream;
 
-/// Open WebSocket. Dropping it sends close code 1001 (Going Away).
+/// Open WebSocket. Dropping it closes the socket.
 pub struct WebSocket {
-    inner: Mutex<tungstenite::WebSocket<RawStream>>,
+    inner: tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+    budget: crate::transport::CallBudget,
 }
 
 /// Incoming WebSocket event after control frames are handled.
@@ -45,12 +47,12 @@ impl WebSocket {
     ///
     /// [`NetError::Transport`] on I/O failure. [`NetError::Protocol`] when the
     /// frame cannot be encoded.
-    pub fn send(&self, message: WsMessage) -> Result<(), NetError> {
-        let msg = match message {
-            WsMessage::Text(t) => Message::Text(t.into()),
-            WsMessage::Binary(b) => Message::Binary(b.into()),
+    pub async fn send(&mut self, message: WsMessage) -> Result<(), NetError> {
+        let message = match message {
+            WsMessage::Text(text) => Message::Text(text.into()),
+            WsMessage::Binary(bytes) => Message::Binary(bytes.into()),
         };
-        self.lock().send(msg).map_err(ws_err)
+        self.write(message).await
     }
 
     /// Sends a close frame with the given code and reason.
@@ -59,12 +61,13 @@ impl WebSocket {
     ///
     /// [`NetError::Transport`] on I/O failure. [`NetError::Protocol`] when the
     /// close frame cannot be written.
-    pub fn close(&self, code: u16, reason: &str) -> Result<(), NetError> {
+    pub async fn close(&mut self, code: u16, reason: &str) -> Result<(), NetError> {
         let frame = CloseFrame {
             code: CloseCode::from(code),
             reason: Utf8Bytes::from(reason),
         };
-        self.lock().close(Some(frame)).map_err(ws_err)
+        self.write(Message::Close(Some(frame))).await?;
+        self.inner.close(None).await.map_err(ws_err)
     }
 
     /// Next data or close event. Ping frames are answered with pong and skipped.
@@ -73,54 +76,74 @@ impl WebSocket {
     ///
     /// [`NetError::Transport`] on I/O failure. [`NetError::Protocol`] when the
     /// frame stream is invalid.
-    pub fn take_next_message(&self) -> Result<WsEvent, NetError> {
-        let mut inner = self.lock();
+    pub async fn take_next_message(&mut self) -> Result<WsEvent, NetError> {
         loop {
-            match inner.read() {
-                Ok(Message::Text(t)) => {
-                    return Ok(WsEvent::Message(WsMessage::Text(t.to_string())));
+            let next = match self.budget.deadline() {
+                Some(deadline) => match tokio::time::timeout_at(
+                    tokio::time::Instant::from_std(deadline),
+                    self.inner.next(),
+                )
+                .await
+                {
+                    Ok(next) => next,
+                    Err(_) => {
+                        return Err(NetError::Transport(TransportError::Timeout(
+                            self.budget.timeout_kind(TimeoutKind::RecvBody),
+                        )));
+                    }
+                },
+                None => self.inner.next().await,
+            };
+            match next {
+                Some(Ok(Message::Text(text))) => {
+                    return Ok(WsEvent::Message(WsMessage::Text(text.to_string())));
                 }
-                Ok(Message::Binary(b)) => {
-                    return Ok(WsEvent::Message(WsMessage::Binary(b.to_vec())));
+                Some(Ok(Message::Binary(bytes))) => {
+                    return Ok(WsEvent::Message(WsMessage::Binary(bytes.to_vec())));
                 }
-                Ok(Message::Ping(p)) => {
-                    inner.send(Message::Pong(p)).map_err(ws_err)?;
+                Some(Ok(Message::Ping(payload))) => {
+                    self.write(Message::Pong(payload)).await?;
                 }
-                Ok(Message::Pong(_) | Message::Frame(_)) => {}
-                Ok(Message::Close(frame)) => {
+                Some(Ok(Message::Pong(_) | Message::Frame(_))) => {}
+                Some(Ok(Message::Close(frame))) => {
                     let (code, reason) = match frame {
-                        Some(f) => (u16::from(f.code), f.reason.to_string()),
+                        Some(frame) => (u16::from(frame.code), frame.reason.to_string()),
                         None => (1005, String::new()),
                     };
-                    let _ = inner.close(None);
+                    let _result = self.inner.close(None).await;
                     return Ok(WsEvent::Close { code, reason });
                 }
-                Err(err) => return Err(ws_err(err)),
+                Some(Err(error)) => return Err(ws_err(error)),
+                None => {
+                    return Ok(WsEvent::Close {
+                        code: 1006,
+                        reason: String::new(),
+                    });
+                }
             }
         }
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, tungstenite::WebSocket<RawStream>> {
-        self.inner
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
-}
-
-impl Drop for WebSocket {
-    fn drop(&mut self) {
-        if let Ok(mut inner) = self.inner.lock() {
-            let raw = inner.get_mut();
-            let _ = raw.set_write_timeout(Some(Duration::from_secs(1)));
-            let _ = inner.close(Some(CloseFrame {
-                code: CloseCode::Away,
-                reason: Utf8Bytes::from(""),
-            }));
+    async fn write(&mut self, message: Message) -> Result<(), NetError> {
+        match self.budget.deadline() {
+            Some(deadline) => match tokio::time::timeout_at(
+                tokio::time::Instant::from_std(deadline),
+                self.inner.send(message),
+            )
+            .await
+            {
+                Ok(result) => result.map_err(ws_err),
+                Err(_) => Err(NetError::Transport(TransportError::Timeout(
+                    self.budget.timeout_kind(TimeoutKind::SendBody),
+                ))),
+            },
+            None => self.inner.send(message).await.map_err(ws_err),
         }
     }
 }
 
-pub(crate) fn connect(
+/// Polls one stream item without pulling in `futures-util`.
+pub(crate) async fn connect(
     agent: &Agent,
     url: &Url,
     headers: &HeaderMap,
@@ -130,36 +153,36 @@ pub(crate) fn connect(
 ) -> Result<WebSocket, NetError> {
     let started = Instant::now();
     let budget = agent.engine.budget_at(started);
-    let _guard = crate::transport::enter_budget(budget);
-    let stream = crate::transport::open(
-        url,
-        agent.engine.proxy.as_deref(),
-        budget.deadline(),
-        &agent.engine.host_map,
-    )?;
-    if let Some(limit) = budget.remaining() {
-        stream
-            .set_read_timeout(Some(limit))
-            .map_err(|err| NetError::Transport(TransportError::Io(err)))?;
-        stream
-            .set_write_timeout(Some(limit))
-            .map_err(|err| NetError::Transport(TransportError::Io(err)))?;
-    }
     let mut request = url
         .as_str()
         .into_client_request()
-        .map_err(|err| NetError::Protocol(ProtocolError::Other(err.to_string().into())))?;
+        .map_err(|error| NetError::Protocol(ProtocolError::Other(error.to_string().into())))?;
     for (name, value) in headers.iter() {
         if is_websocket_reserved(name) {
             continue;
         }
-        let header_name = tungstenite::http::HeaderName::from_bytes(name.as_bytes())
-            .map_err(|_| NetError::Protocol(ProtocolError::RejectedRequest))?;
-        let header_value = tungstenite::http::HeaderValue::from_bytes(value)
+        let header_name =
+            tokio_tungstenite::tungstenite::http::HeaderName::from_bytes(name.as_bytes())
+                .map_err(|_| NetError::Protocol(ProtocolError::RejectedRequest))?;
+        let header_value = tokio_tungstenite::tungstenite::http::HeaderValue::from_bytes(value)
             .map_err(|_| NetError::Protocol(ProtocolError::RejectedRequest))?;
         request.headers_mut().insert(header_name, header_value);
     }
-    let (mut ws, response) = tungstenite::client(request, stream).map_err(handshake_err)?;
+    let handshake = tokio_tungstenite::connect_async(request);
+    let (ws, response) = match budget.deadline() {
+        Some(deadline) => {
+            match tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), handshake).await
+            {
+                Ok(result) => result.map_err(ws_err)?,
+                Err(_) => {
+                    return Err(NetError::Transport(TransportError::Timeout(
+                        budget.timeout_kind(TimeoutKind::Connect),
+                    )));
+                }
+            }
+        }
+        None => handshake.await.map_err(ws_err)?,
+    };
     agent.store_set_cookie_lines(
         url,
         initiator_kind,
@@ -170,14 +193,9 @@ pub(crate) fn connect(
             .headers()
             .get_all("set-cookie")
             .into_iter()
-            .filter_map(|v| v.to_str().ok()),
+            .filter_map(|value| value.to_str().ok()),
     );
-    let raw = ws.get_mut();
-    let _ = raw.set_read_timeout(None);
-    let _ = raw.set_write_timeout(None);
-    Ok(WebSocket {
-        inner: Mutex::new(ws),
-    })
+    Ok(WebSocket { inner: ws, budget })
 }
 
 fn is_websocket_reserved(name: &str) -> bool {
@@ -191,18 +209,19 @@ fn is_websocket_reserved(name: &str) -> bool {
     )
 }
 
-fn handshake_err(err: HandshakeError<ClientHandshake<RawStream>>) -> NetError {
-    match err {
-        HandshakeError::Failure(err) => ws_err(err),
-        HandshakeError::Interrupted(_) => {
-            NetError::Protocol(ProtocolError::Other("ws handshake interrupted".into()))
+fn ws_err(error: tokio_tungstenite::tungstenite::Error) -> NetError {
+    use tokio_tungstenite::tungstenite::Error as Ws;
+    match error {
+        Ws::Io(error) => {
+            let tls = error
+                .get_ref()
+                .is_some_and(|inner| inner.downcast_ref::<rustls::Error>().is_some());
+            if tls || error.kind() == std::io::ErrorKind::InvalidData {
+                NetError::Transport(TransportError::Tls(error.to_string().into()))
+            } else {
+                NetError::Transport(TransportError::Io(error))
+            }
         }
-    }
-}
-
-fn ws_err(err: tungstenite::Error) -> NetError {
-    match err {
-        tungstenite::Error::Io(e) => NetError::Transport(TransportError::Io(e)),
         other => NetError::Protocol(ProtocolError::Other(other.to_string().into())),
     }
 }

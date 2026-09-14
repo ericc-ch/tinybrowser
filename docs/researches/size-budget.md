@@ -546,3 +546,26 @@ One renderer process still serves each blank target because blank sharing and
 the process budget are P11 work. File descriptors are the tight metric: 925 is
 close to a 1024 soft limit, so the process policy checkpoint must bound channel
 and pipe descriptors or raise the limit explicitly.
+
+## Milestone: hyper transport, P6 (2026-09-15)
+
+P6 replaced ureq 3 + native-tls with hyper-util, hyper-rustls 0.27 with the
+`ring` provider and native roots, and async bodies over `hyper::body::Incoming`.
+`net::WebSocket` moved to Tokio and tokio-tungstenite, and the browser network
+executor (16 OS threads, 256-job queue) is gone: navigation and renderer service
+dials run as Tokio tasks. Command: `nix develop --command cargo build --release
+--bin tinybrowser`; rustc 1.98.0, stripped x86_64 release profile.
+
+| Artifact | After P5 | After P6 | Delta | Headroom to 10,000,000 |
+| --- | ---: | ---: | ---: | ---: |
+| CLI (`target/release/tinybrowser`) | 5,891,456 | 7,287,200 | **+1,395,744** | 2,712,800 |
+
+The delta is the async client stack: hyper, h2, hyper-rustls, rustls, ring,
+rustls-native-certs, and webpki-roots. It also drops ureq and native-tls. The
+preflight predicted about 1.01 MB for TLS plus the HTTP-only hyper client; the
+rest is HTTP/2 framing, the native-root loader, and tokio-tungstenite.
+
+P6 defers two behaviors to P8 and the ledger records the gap: HTTP CONNECT
+proxy routing (the `proxy()` builder still validates and redacts, but requests
+do not tunnel yet) and `--resolve`-aware WebSocket dials (Tokio tungstenite
+resolves directly).

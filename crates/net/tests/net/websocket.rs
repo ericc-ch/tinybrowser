@@ -121,8 +121,8 @@ fn start_websocket_server(
     })
 }
 
-#[test]
-fn websocket_transcript_covers_handshake_frames_control_and_cookie_reuse() {
+#[tokio::test]
+async fn websocket_transcript_covers_handshake_frames_control_and_cookie_reuse() {
     let captured = Arc::new(Mutex::new(None));
     let requests = Arc::new(Mutex::new(0_u8));
     let server = start_websocket_server(Arc::clone(&captured), Arc::clone(&requests));
@@ -130,22 +130,24 @@ fn websocket_transcript_covers_handshake_frames_control_and_cookie_reuse() {
     let agent = AgentBuilder::new().user_agent("tinybrowser-test/1").build();
     let document =
         url::Url::parse(&format!("ws://{}/page", server.local_addr())).expect("document");
-    let socket = agent
+    let mut socket = agent
         .request(Method::GET, server.ws_url("/socket"))
         .header("Sec-WebSocket-Protocol", "tinybrowser-test")
         .expect("protocol")
         .with_initiator(document)
         .upgrade()
+        .await
         .expect("upgrade");
     socket
         .send(WsMessage::Text("from-client".into()))
+        .await
         .expect("client text");
     assert_eq!(
-        socket.take_next_message().expect("fragmented text"),
+        socket.take_next_message().await.expect("fragmented text"),
         WsEvent::Message(WsMessage::Text("hello".into()))
     );
     assert_eq!(
-        socket.take_next_message().expect("close after ping"),
+        socket.take_next_message().await.expect("close after ping"),
         WsEvent::Close {
             code: 1000,
             reason: "bye".into(),
@@ -164,6 +166,7 @@ fn websocket_transcript_covers_handshake_frames_control_and_cookie_reuse() {
     agent
         .request(Method::GET, server.url("/after"))
         .send()
+        .await
         .expect("cookie follow-up");
     assert_eq!(*requests.lock().expect("request count"), 2);
     server.assert_clean();

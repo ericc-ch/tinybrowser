@@ -15,8 +15,8 @@ fn response(set_cookies: &[&str], body: &[u8]) -> Vec<u8> {
     out
 }
 
-#[test]
-fn http_cookies_scope_by_path_and_visibility() {
+#[tokio::test]
+async fn http_cookies_scope_by_path_and_visibility() {
     let request_number = std::sync::Arc::new(std::sync::Mutex::new(0_u8));
     let counter = std::sync::Arc::clone(&request_number);
     let server = TestServer::start(move |connection| {
@@ -45,12 +45,18 @@ fn http_cookies_scope_by_path_and_visibility() {
     agent
         .request(Method::GET, root.clone())
         .send()
+        .await
         .expect("set cookies");
     let docs = server.url("/docs/guide");
-    agent.request(Method::GET, docs).send().expect("scoped");
+    agent
+        .request(Method::GET, docs)
+        .send()
+        .await
+        .expect("scoped");
     agent
         .request(Method::GET, server.url("/other"))
         .send()
+        .await
         .expect("unscoped");
 
     let recorded = server.requests();
@@ -66,8 +72,8 @@ fn http_cookies_scope_by_path_and_visibility() {
     server.assert_clean();
 }
 
-#[test]
-fn same_site_context_controls_cross_site_request_cookies() {
+#[tokio::test]
+async fn same_site_context_controls_cross_site_request_cookies() {
     let request_number = std::sync::Arc::new(std::sync::Mutex::new(0_u8));
     let counter = std::sync::Arc::clone(&request_number);
     let server = TestServer::start(move |connection| {
@@ -95,18 +101,21 @@ fn same_site_context_controls_cross_site_request_cookies() {
         .request(Method::GET, uri.clone())
         .with_initiator_kind(InitiatorKind::Navigation)
         .send()
+        .await
         .expect("set");
     agent
         .request(Method::GET, uri.clone())
         .with_initiator_kind(InitiatorKind::Fetch)
         .with_initiator(foreign.clone())
         .send()
+        .await
         .expect("cross fetch");
     agent
         .request(Method::GET, uri.clone())
         .with_initiator_kind(InitiatorKind::Navigation)
         .with_initiator(foreign.clone())
         .send()
+        .await
         .expect("cross navigation");
     agent
         .request(Method::POST, uri)
@@ -114,11 +123,13 @@ fn same_site_context_controls_cross_site_request_cookies() {
         .with_initiator(foreign)
         .body(b"x")
         .send()
+        .await
         .expect("cross post");
     agent
         .request(Method::GET, server.url("/"))
         .with_initiator(url::Url::parse("https://evil.example/").expect("foreign"))
         .send()
+        .await
         .expect("default navigation");
 
     let recorded = server.requests();
@@ -129,8 +140,8 @@ fn same_site_context_controls_cross_site_request_cookies() {
     server.assert_clean();
 }
 
-#[test]
-fn cookie_max_age_and_global_eviction_follow_storage_rules() {
+#[tokio::test]
+async fn cookie_max_age_and_global_eviction_follow_storage_rules() {
     let agent = Agent::new();
     let url = url::Url::parse("https://max-age.example/").expect("max-age URL");
     agent.set_cookie("plus=1; Path=/; Max-Age=+0", &url);
@@ -148,8 +159,8 @@ fn cookie_max_age_and_global_eviction_follow_storage_rules() {
     assert!(agent.cookies_for(&oldest).is_empty());
 }
 
-#[test]
-fn cookie_security_prefixes_expiry_and_public_suffixes_are_enforced() {
+#[tokio::test]
+async fn cookie_security_prefixes_expiry_and_public_suffixes_are_enforced() {
     let https = url::Url::parse("https://www.example.com/app").expect("https");
     let http = url::Url::parse("http://www.example.com/app").expect("http");
     let agent = Agent::new();

@@ -426,8 +426,8 @@ fn route(message: FromRenderer, context: &ReaderContext) -> Result<(), RendererV
                 let worker_pending = Arc::clone(&context.pending);
                 let worker_alive = Arc::clone(&context.alive);
                 let worker_kill = context.kill.clone();
-                let submitted = context.fetch.try_submit(move || {
-                    let outcome = worker_fetch.dial_request(&request, &initiator);
+                tokio::spawn(async move {
+                    let outcome = worker_fetch.dial_request(&request, &initiator).await;
                     if worker_tx
                         .try_send(ToRenderer::ServiceReply {
                             id,
@@ -438,9 +438,6 @@ fn route(message: FromRenderer, context: &ReaderContext) -> Result<(), RendererV
                         fail(&worker_alive, &worker_pending, &worker_kill);
                     }
                 });
-                if submitted.is_err() {
-                    send_reply(&context.tx, id, ServiceReply::Dial(None))?;
-                }
             }
             ServiceCall::CookieGet { url } => {
                 let Some(url) = context.site.authorize(&url) else {
