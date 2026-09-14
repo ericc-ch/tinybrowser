@@ -425,6 +425,64 @@ async fn cross_site_redirect_taints_samesite_cookie_inclusion() {
 }
 
 #[tokio::test]
+async fn connect_proxy_routes_https_and_reports_denials() {
+    let proxy = TestServer::start(|connection| {
+        let request = connection.read_request();
+        assert_eq!(request.method, "CONNECT");
+        assert_eq!(request.target, "origin.test:443");
+        assert_eq!(
+            request.header("proxy-authorization"),
+            Some("Basic dXNlcjpzZWNyZXQ=")
+        );
+        connection
+            .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\nNOT-TLS")
+            .expect("connect 200");
+        std::thread::sleep(Duration::from_millis(300));
+    });
+    let proxy_uri = format!("http://user:secret@{}", proxy.local_addr());
+    let err = AgentBuilder::new()
+        .proxy(&proxy_uri)
+        .expect("proxy")
+        .build()
+        .request(
+            Method::GET,
+            url::Url::parse("https://origin.test/").expect("https"),
+        )
+        .send()
+        .await
+        .expect_err("proxy request");
+    assert!(
+        matches!(
+            err,
+            NetError::Transport(TransportError::Connect(_) | TransportError::Tls(_))
+        ),
+        "unexpected proxy error: {err:?}"
+    );
+    proxy.assert_clean();
+
+    let denied = TestServer::start(|connection| {
+        connection.read_request();
+        connection
+            .write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n")
+            .expect("connect 403");
+    });
+    assert!(matches!(
+        AgentBuilder::new()
+            .proxy(&format!("http://{}", denied.local_addr()))
+            .expect("proxy")
+            .build()
+            .request(
+                Method::GET,
+                url::Url::parse("https://origin.test/").expect("https"),
+            )
+            .send()
+            .await,
+        Err(NetError::Transport(TransportError::Connect(_)))
+    ));
+    denied.assert_clean();
+}
+
+#[tokio::test]
 async fn proxy_tls_environment_and_debug_boundaries_stay_explicit() {
     for invalid in [
         "",

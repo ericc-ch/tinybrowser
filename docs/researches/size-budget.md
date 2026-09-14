@@ -569,3 +569,20 @@ P6 defers two behaviors to P8 and the ledger records the gap: HTTP CONNECT
 proxy routing (the `proxy()` builder still validates and redacts, but requests
 do not tunnel yet) and `--resolve`-aware WebSocket dials (Tokio tungstenite
 resolves directly).
+
+## Milestone: CONNECT proxy, P8 (2026-09-15)
+
+P8 routes HTTPS through an HTTP CONNECT proxy with hyper-util's `Tunnel`,
+including `Proxy-Authorization` from the proxy URI. The custom resolver keeps
+ordered `--resolve` rules ahead of system DNS, and `HttpConnector` supplies
+Happy Eyeballs for multi-address names. Command: `nix develop --command cargo
+build --release --bin tinybrowser`; rustc 1.98.0, stripped x86_64 release
+profile.
+
+| Artifact | After P6 | After P8 | Delta | Headroom to 10,000,000 |
+| --- | ---: | ---: | ---: | ---: |
+| CLI (`target/release/tinybrowser`) | 7,287,200 | 7,349,216 | **+62,016** | 2,650,784 |
+
+Plain `http://` requests through a proxy use CONNECT rather than browser
+absolute-form proxying, and WebSocket dials ignore `--resolve`; both are
+recorded as open P8 follow-ups in the migration ledger.

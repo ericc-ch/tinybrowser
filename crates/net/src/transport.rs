@@ -22,6 +22,7 @@ use hyper_rustls::HttpsConnector;
 use hyper_util::client::legacy::Client;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::client::legacy::connect::dns::{GaiResolver, Name};
+use hyper_util::client::legacy::connect::proxy::Tunnel;
 use hyper_util::rt::TokioExecutor;
 use tower_service::Service;
 use url::Url;
@@ -137,8 +138,11 @@ pub(crate) struct HttpEngine {
     pub(crate) proxy: Option<String>,
     pub(crate) timeout_global: Option<Duration>,
     pub(crate) timeout_per_call: Option<Duration>,
+    proxied: Option<ProxiedClient>,
     tls_error: Option<Box<str>>,
 }
+
+type ProxiedClient = Client<HttpsConnector<Tunnel<HttpConnector<HostResolver>>>, RequestBody>;
 
 impl HttpEngine {
     pub(crate) fn new(
@@ -151,34 +155,54 @@ impl HttpEngine {
             host_map,
             system: GaiResolver::new(),
         };
+        // `HttpConnector` resolves through `HostResolver` and applies Happy
+        // Eyeballs (300 ms default) when a name returns multiple addresses.
         let mut http = HttpConnector::new_with_resolver(resolver);
         http.enforce_http(false);
-        let (connector, tls_error) =
-            match hyper_rustls::HttpsConnectorBuilder::new().with_native_roots() {
-                Ok(builder) => (
-                    builder
-                        .https_or_http()
-                        .enable_http1()
-                        .enable_http2()
-                        .wrap_connector(http),
-                    None,
-                ),
-                Err(error) => (
-                    hyper_rustls::HttpsConnectorBuilder::new()
-                        .with_webpki_roots()
-                        .https_or_http()
-                        .enable_http1()
-                        .enable_http2()
-                        .wrap_connector(http),
-                    Some(Box::<str>::from(error.to_string())),
-                ),
-            };
+        let builder = hyper_rustls::HttpsConnectorBuilder::new().with_native_roots();
+        let (connector, tls_error) = match builder {
+            Ok(builder) => (
+                builder
+                    .https_or_http()
+                    .enable_http1()
+                    .enable_http2()
+                    .wrap_connector(http.clone()),
+                None,
+            ),
+            Err(error) => (
+                hyper_rustls::HttpsConnectorBuilder::new()
+                    .with_webpki_roots()
+                    .https_or_http()
+                    .enable_http1()
+                    .enable_http2()
+                    .wrap_connector(http.clone()),
+                Some(Box::<str>::from(error.to_string())),
+            ),
+        };
         let client = Client::builder(TokioExecutor::new()).build(connector);
+        let proxied = proxy.as_deref().and_then(|proxy| {
+            let (destination, auth) = proxy_destination(proxy).ok()?;
+            let mut tunnel = Tunnel::new(destination, http);
+            if let Some(auth) = auth {
+                tunnel = tunnel.with_auth(auth);
+            }
+            let builder = match hyper_rustls::HttpsConnectorBuilder::new().with_native_roots() {
+                Ok(builder) => builder,
+                Err(_) => hyper_rustls::HttpsConnectorBuilder::new().with_webpki_roots(),
+            };
+            let connector = builder
+                .https_or_http()
+                .enable_http1()
+                .enable_http2()
+                .wrap_connector(tunnel);
+            Some(Client::builder(TokioExecutor::new()).build(connector))
+        });
         Self {
             client,
             proxy,
             timeout_global,
             timeout_per_call,
+            proxied,
             tls_error,
         }
     }
@@ -240,7 +264,11 @@ impl HttpEngine {
             .map_err(|_| NetError::Protocol(ProtocolError::RejectedRequest))?;
 
         let host = wire_url.host_str().unwrap_or_default().to_owned();
-        let response = match wait_for(budget, self.client.request(request)).await {
+        let request_future = match &self.proxied {
+            Some(proxied) => proxied.request(request),
+            None => self.client.request(request),
+        };
+        let response = match wait_for(budget, request_future).await {
             Ok(Ok(response)) => response,
             Ok(Err(error)) => return Err(map_client_error(error, &host)),
             Err(error) => return Err(error),
@@ -312,6 +340,29 @@ fn map_client_error(error: hyper_util::client::legacy::Error, host: &str) -> Net
         return NetError::Transport(TransportError::Connect(error.to_string().into()));
     }
     NetError::Transport(TransportError::Io(std::io::Error::other(error)))
+}
+
+fn proxy_destination(
+    proxy: &str,
+) -> Result<(hyper::Uri, Option<hyper::header::HeaderValue>), NetError> {
+    let url = Url::parse(proxy).map_err(|_| NetError::Protocol(ProtocolError::InvalidProxy))?;
+    let host = url
+        .host_str()
+        .ok_or(NetError::Protocol(ProtocolError::InvalidProxy))?;
+    let port = url.port_or_known_default().unwrap_or(80);
+    let destination = format!("http://{host}:{port}")
+        .parse::<hyper::Uri>()
+        .map_err(|_| NetError::Protocol(ProtocolError::InvalidProxy))?;
+    let auth = if url.username().is_empty() {
+        None
+    } else {
+        Some(
+            basic_authorization(url.username(), url.password().unwrap_or(""))
+                .parse::<hyper::header::HeaderValue>()
+                .map_err(|_| NetError::Protocol(ProtocolError::InvalidProxy))?,
+        )
+    };
+    Ok((destination, auth))
 }
 
 pub(crate) fn basic_authorization(username: &str, password: &str) -> String {
