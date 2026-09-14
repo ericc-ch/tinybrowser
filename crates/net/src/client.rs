@@ -317,6 +317,7 @@ pub struct RequestBuilder {
     initiator_kind: InitiatorKind,
     initiator: Option<Url>,
     body: Option<Vec<u8>>,
+    deadline: Option<Instant>,
 }
 
 impl RequestBuilder {
@@ -329,6 +330,7 @@ impl RequestBuilder {
             initiator_kind: InitiatorKind::default(),
             initiator: None,
             body: None,
+            deadline: None,
         }
     }
 
@@ -363,6 +365,16 @@ impl RequestBuilder {
         self
     }
 
+    /// Sets the absolute deadline for this call, covering every redirect hop.
+    ///
+    /// Overrides [`AgentBuilder::timeout_global`] for this request. The per-call
+    /// timeout still applies hop by hop.
+    #[must_use]
+    pub fn deadline(mut self, deadline: Instant) -> Self {
+        self.deadline = Some(deadline);
+        self
+    }
+
     /// Initiator class for this request.
     #[must_use]
     pub fn initiator_kind(&self) -> InitiatorKind {
@@ -394,6 +406,9 @@ impl RequestBuilder {
         let mut cross_site_redirect = false;
         let started = Instant::now();
         let mut budget = agent.engine.budget_at(started);
+        if let Some(deadline) = self.deadline {
+            budget.global = Some(deadline);
+        }
 
         loop {
             if budget.is_expired() {

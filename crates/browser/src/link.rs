@@ -426,8 +426,9 @@ fn route(message: FromRenderer, context: &ReaderContext) -> Result<(), RendererV
                 let worker_pending = Arc::clone(&context.pending);
                 let worker_alive = Arc::clone(&context.alive);
                 let worker_kill = context.kill.clone();
+                let cancel = context.kill.subscribe();
                 tokio::spawn(async move {
-                    let outcome = worker_fetch.dial_request(&request, &initiator).await;
+                    let outcome = worker_fetch.dial_request(&request, &initiator, cancel).await;
                     if worker_tx
                         .try_send(ToRenderer::ServiceReply {
                             id,

@@ -222,7 +222,9 @@ impl ChannelServices {
             }
             Some(PendingService::Dial(completion)) => match reply {
                 ServiceReply::Dial(outcome) => completion(outcome),
-                ServiceReply::Cookie(_) | ServiceReply::Unit => completion(None),
+                ServiceReply::Cookie(_) | ServiceReply::Unit => {
+                    completion(Err(crate::protocol::DialFailure::Connect));
+                }
             },
             None => {}
         }
@@ -248,7 +250,7 @@ impl BrowserServices for ChannelServices {
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .remove(&id);
-            completion(None);
+            completion(Err(crate::protocol::DialFailure::Connect));
         }
     }
 

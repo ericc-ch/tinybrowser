@@ -29,7 +29,7 @@ icu_provider_adapters = { version = "2.3.0", features = ["serde"] }
 icu_provider_blob = { version = "2.3.0", features = ["alloc"] }
 writeable = "0.6"
 # Renderer waiter: current-thread `rt`+`time`; never a multi-thread server stack.
-tokio = { version = "1.53", default-features = false, features = ["rt", "time", "io-util", "net"] }
+tokio = { version = "1.53", default-features = false, features = ["rt", "time", "io-util", "net", "sync", "macros"] }
 url = "2"
 # QuickJS-ng via rquickjs; `std` uses shipped linux bindings (no bindgen).
 rquickjs = { version = "0.12.2", default-features = false, features = ["std", "classes", "macro"] }

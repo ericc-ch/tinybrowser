@@ -9,10 +9,10 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use renderer::{
-    Command as RendererCommand, FrameId, Mount, RemoteValue, Reply, ResourceLimit, TabError,
-    TabEvent,
+    Command as RendererCommand, DialFailure, FrameId, Mount, RemoteValue, Reply, ResourceLimit,
+    TabError, TabEvent,
 };
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, sleep_until, timeout};
 use url::Url;
@@ -357,8 +357,10 @@ struct Tab {
     nav_in_flight: Option<u64>,
     navigation_failed: bool,
     nav: Option<ActiveNavigation>,
-    dial_tx: mpsc::UnboundedSender<(u64, Result<NavOutcome, ()>)>,
-    dial_rx: mpsc::UnboundedReceiver<(u64, Result<NavOutcome, ()>)>,
+    dial_tx: mpsc::UnboundedSender<(u64, Result<NavOutcome, DialFailure>)>,
+    dial_rx: mpsc::UnboundedReceiver<(u64, Result<NavOutcome, DialFailure>)>,
+    dial_cancel: Option<watch::Sender<bool>>,
+    dial_guard: Option<JoinHandle<()>>,
     subscribers: Vec<mpsc::Sender<TabEvent>>,
 }
 
@@ -386,6 +388,8 @@ impl Tab {
             nav: None,
             dial_tx,
             dial_rx,
+            dial_cancel: None,
+            dial_guard: None,
             subscribers: Vec::new(),
         }
     }
@@ -487,15 +491,34 @@ impl Tab {
         let epoch = nav.epoch;
         let url = nav.url.clone();
         let initiator = nav.initiator.clone();
-        self.fetch
-            .dial_navigation(epoch, url, initiator, self.dial_tx.clone());
+        self.cancel_dial();
+        let (cancel, cancel_rx) = watch::channel(false);
+        let guard = self.fetch.dial_navigation(
+            epoch,
+            url,
+            initiator,
+            self.dial_tx.clone(),
+            cancel_rx,
+        );
+        self.dial_cancel = Some(cancel);
+        self.dial_guard = Some(guard);
         if let Some(nav) = self.nav.as_mut() {
             nav.submitted = true;
             self.nav_in_flight = Some(epoch);
         }
     }
 
-    async fn handle_navigation(&mut self, epoch: u64, result: Result<NavOutcome, ()>) {
+    /// Cancels the in-flight dial: signals the token and aborts the task.
+    fn cancel_dial(&mut self) {
+        if let Some(cancel) = self.dial_cancel.take() {
+            let _ = cancel.send(true);
+        }
+        if let Some(guard) = self.dial_guard.take() {
+            guard.abort();
+        }
+    }
+
+    async fn handle_navigation(&mut self, epoch: u64, result: Result<NavOutcome, DialFailure>) {
         if self.nav_in_flight == Some(epoch) {
             self.nav_in_flight = None;
         }
@@ -503,6 +526,8 @@ impl Tab {
         if !active {
             return;
         }
+        self.dial_cancel = None;
+        self.dial_guard = None;
         self.nav = None;
         if let Ok(outcome) = result {
             self.record_event(TabEvent::Fetch {
@@ -559,6 +584,7 @@ impl Tab {
     }
 
     async fn stop_renderer(&mut self) {
+        self.cancel_dial();
         if let Some(renderer) = &self.renderer {
             renderer.request_shutdown();
         }
@@ -566,9 +592,15 @@ impl Tab {
     }
 }
 
+impl Drop for Tab {
+    fn drop(&mut self) {
+        self.cancel_dial();
+    }
+}
+
 enum Wake {
     Command(Option<Command>),
-    Navigation(Option<(u64, Result<NavOutcome, ()>)>),
+    Navigation(Option<(u64, Result<NavOutcome, DialFailure>)>),
     Renderer(Option<(FrameId, TabEvent)>),
     WaiterDeadline,
 }

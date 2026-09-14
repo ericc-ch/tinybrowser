@@ -6339,7 +6339,7 @@ mod realm_tests {
 
     impl BrowserServices for NullServices {
         fn start_dial(&self, _request: DialRequest, completion: DialCompletion) {
-            completion(None);
+            completion(Err(crate::protocol::DialFailure::Connect));
         }
 
         fn cookies_for(&self, _url: &Url) -> String {

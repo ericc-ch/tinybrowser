@@ -42,7 +42,7 @@ use engine::Engine;
 pub use process::serve;
 use protocol::BrowserServices;
 pub use protocol::{
-    Command, DialKind, DialOutcome, DialRequest, FrameId, FromRenderer, Mount,
+    Command, DialFailure, DialKind, DialOutcome, DialRequest, FrameId, FromRenderer, Mount,
     RENDERER_INBOX_CAPACITY, RENDERER_OUTBOX_CAPACITY, Reply, ResourceLimit, ScriptFailure,
     ServiceCall, ServiceReply, TabError, TabEvent, ToRenderer,
 };

@@ -649,3 +649,23 @@ async fn resolve_maps_hit_miss_and_fail() {
         Err(NetError::Transport(TransportError::Dns(_)))
     ));
 }
+
+#[tokio::test]
+async fn request_deadline_expires_with_a_typed_timeout() {
+    let server = TestServer::start(|connection| {
+        connection.read_request();
+        // Never respond; the client's absolute deadline must fire.
+        std::thread::sleep(Duration::from_millis(600));
+    });
+    let deadline = Instant::now() + Duration::from_millis(80);
+    let error = Agent::new()
+        .request(Method::GET, server.url("/stall"))
+        .deadline(deadline)
+        .send()
+        .await
+        .expect_err("deadline must expire");
+    assert!(
+        matches!(error, NetError::Transport(TransportError::Timeout(_))),
+        "unexpected error: {error}"
+    );
+}

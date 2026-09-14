@@ -10,10 +10,11 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use net::{Agent, AgentBuilder, CookieRecord, CookieSameSite, InitiatorKind, Method};
-use renderer::{DialOutcome, DialRequest};
+use renderer::{DialFailure, DialOutcome, DialRequest};
+use tokio::sync::Semaphore;
 use tokio::sync::mpsc::UnboundedSender;
 use url::Url;
 
@@ -186,6 +187,7 @@ impl ProfileStore {
 pub struct NetworkSession {
     agent: Agent,
     store: Arc<ProfileStore>,
+    permits: NetworkPermits,
 }
 
 impl NetworkSession {
@@ -208,15 +210,18 @@ impl NetworkSession {
         Ok(Self {
             agent,
             store: Arc::new(store),
+            permits: NetworkPermits::new(),
         })
     }
 
-    /// Value-only fetch handle for a tab coordinator.
+    /// Value-only fetch handle for a tab coordinator, with its own per-tab cap.
     #[must_use]
     pub(crate) fn fetch_handle(&self) -> FetchHandle {
         FetchHandle {
             agent: self.agent.clone(),
             store: Arc::clone(&self.store),
+            permits: self.permits.clone(),
+            tab: Arc::new(Semaphore::new(MAX_TAB_DIALS)),
         }
     }
 
@@ -233,6 +238,26 @@ impl NetworkSession {
     }
 }
 
+/// Limits for in-flight dials: browser-wide and per reserved class.
+#[derive(Clone)]
+struct NetworkPermits {
+    global: Arc<Semaphore>,
+    navigation: Arc<Semaphore>,
+}
+
+impl NetworkPermits {
+    fn new() -> Self {
+        Self {
+            global: Arc::new(Semaphore::new(MAX_GLOBAL_DIALS)),
+            navigation: Arc::new(Semaphore::new(MAX_NAVIGATION_DIALS)),
+        }
+    }
+}
+
+const MAX_GLOBAL_DIALS: usize = 32;
+const MAX_NAVIGATION_DIALS: usize = 8;
+const MAX_TAB_DIALS: usize = 8;
+
 /// Cloneable, sendable handle for cookies and async HTTP.
 ///
 /// Completions return to the tab coordinator as renderer events.
@@ -240,6 +265,8 @@ impl NetworkSession {
 pub(crate) struct FetchHandle {
     agent: Agent,
     store: Arc<ProfileStore>,
+    permits: NetworkPermits,
+    tab: Arc<Semaphore>,
 }
 
 impl FetchHandle {
@@ -259,30 +286,39 @@ impl FetchHandle {
         self.agent.request(method, url)
     }
 
-    /// Spawns one navigation dial; the completion returns on `reply` tagged
-    /// with `epoch`.
+    /// Spawns one navigation dial and returns its task handle. The caller
+    /// aborts the handle to cancel the request. The completion returns on
+    /// `reply` tagged with `epoch`.
     pub(crate) fn dial_navigation(
         &self,
         epoch: u64,
         url: Url,
         initiator: Url,
-        reply: UnboundedSender<(u64, Result<NavOutcome, ()>)>,
-    ) {
+        reply: UnboundedSender<(u64, Result<NavOutcome, DialFailure>)>,
+        mut cancel: tokio::sync::watch::Receiver<bool>,
+    ) -> tokio::task::JoinHandle<()> {
         let fetch = self.clone();
         tokio::spawn(async move {
-            let outcome = fetch.navigate(&url, &initiator).await;
-            let _send_result = reply.send((epoch, outcome));
-        });
+            let result = tokio::select! {
+                biased;
+                _ = cancel.changed() => Err(DialFailure::Cancelled),
+                result = fetch.navigate(&url, &initiator) => result,
+            };
+            let _send_result = reply.send((epoch, result));
+        })
     }
 
-    async fn navigate(&self, url: &Url, initiator: &Url) -> Result<NavOutcome, ()> {
+    async fn navigate(&self, url: &Url, initiator: &Url) -> Result<NavOutcome, DialFailure> {
+        let deadline = Instant::now() + PAGE_FETCH_TIMEOUT;
+        let permits = Self::acquire(&self.permits.navigation, deadline).await?;
         let response = self
             .request(Method::GET, url.clone())
             .with_initiator_kind(InitiatorKind::Navigation)
             .with_initiator(initiator.clone())
+            .deadline(deadline)
             .send()
             .await
-            .map_err(|_| ())?;
+            .map_err(|error| dial_failure(&error))?;
         self.store.mark_dirty();
         let status = response.status();
         let final_url = response.final_url().clone();
@@ -298,12 +334,17 @@ impl FetchHandle {
             .map(str::to_owned);
         let mut body = response.into_body();
         let mut bytes = Vec::new();
-        while let Some(chunk) = body.read_chunk().await.map_err(|_| ())? {
+        while let Some(chunk) = body
+            .read_chunk()
+            .await
+            .map_err(|error| dial_failure(&error))?
+        {
             if bytes.len().saturating_add(chunk.len()) > NAV_BODY_LIMIT {
-                return Err(());
+                return Err(DialFailure::Limit);
             }
             bytes.extend_from_slice(&chunk);
         }
+        drop(permits);
         Ok(NavOutcome {
             status,
             final_url,
@@ -313,50 +354,95 @@ impl FetchHandle {
         })
     }
 
-    /// Async GET for one renderer service call.
+    /// Async GET for one renderer service call, cancelled when the renderer
+    /// dies or the tab closes.
     pub(crate) async fn dial_request(
         &self,
         request: &DialRequest,
         initiator: &Url,
-    ) -> Option<DialOutcome> {
-        let url = Url::parse(&request.url).ok()?;
-        let response = self
-            .request(Method::GET, url)
-            .with_initiator_kind(InitiatorKind::Fetch)
-            .with_initiator(initiator.clone())
-            .send()
-            .await
-            .ok()?;
-        self.store.mark_dirty();
-        let status = response.status();
-        let final_url = response.final_url().to_string();
-        let content_language = response
-            .headers()
-            .get("content-language")
-            .and_then(|bytes| std::str::from_utf8(bytes).ok())
-            .and_then(content_language_tag);
-        let content_type = response
-            .headers()
-            .get("content-type")
-            .and_then(|bytes| std::str::from_utf8(bytes).ok())
-            .map(str::to_owned);
-        let mut body = Vec::new();
-        if request.read_body {
-            let mut response_body = response.into_body();
-            while let Some(chunk) = response_body.read_chunk().await.ok()? {
-                if body.len().saturating_add(chunk.len()) > NAV_BODY_LIMIT {
-                    return None;
+        mut cancel: tokio::sync::watch::Receiver<bool>,
+    ) -> Result<DialOutcome, DialFailure> {
+        let call = async {
+            let deadline = Instant::now() + PAGE_FETCH_TIMEOUT;
+            let _global = Self::acquire(&self.permits.global, deadline).await?;
+            let _tab = Self::acquire(&self.tab, deadline).await?;
+            let url = Url::parse(&request.url).map_err(|_| DialFailure::Connect)?;
+            let response = self
+                .request(Method::GET, url)
+                .with_initiator_kind(InitiatorKind::Fetch)
+                .with_initiator(initiator.clone())
+                .deadline(deadline)
+                .send()
+                .await
+                .map_err(|error| dial_failure(&error))?;
+            self.store.mark_dirty();
+            let status = response.status();
+            let final_url = response.final_url().to_string();
+            let content_language = response
+                .headers()
+                .get("content-language")
+                .and_then(|bytes| std::str::from_utf8(bytes).ok())
+                .and_then(content_language_tag);
+            let content_type = response
+                .headers()
+                .get("content-type")
+                .and_then(|bytes| std::str::from_utf8(bytes).ok())
+                .map(str::to_owned);
+            let mut body = Vec::new();
+            if request.read_body {
+                let mut response_body = response.into_body();
+                while let Some(chunk) = response_body
+                    .read_chunk()
+                    .await
+                    .map_err(|error| dial_failure(&error))?
+                {
+                    if body.len().saturating_add(chunk.len()) > NAV_BODY_LIMIT {
+                        return Err(DialFailure::Limit);
+                    }
+                    body.extend_from_slice(&chunk);
                 }
-                body.extend_from_slice(&chunk);
             }
+            Ok(DialOutcome {
+                status,
+                final_url,
+                content_type,
+                content_language,
+                body,
+            })
+        };
+        tokio::select! {
+            biased;
+            _ = cancel.changed() => Err(DialFailure::Cancelled),
+            result = call => result,
         }
-        Some(DialOutcome {
-            status,
-            final_url,
-            content_type,
-            content_language,
-            body,
-        })
+    }
+
+    async fn acquire(
+        semaphore: &Arc<Semaphore>,
+        deadline: Instant,
+    ) -> Result<tokio::sync::OwnedSemaphorePermit, DialFailure> {
+        let permit = tokio::time::timeout_at(
+            tokio::time::Instant::from_std(deadline),
+            Arc::clone(semaphore).acquire_owned(),
+        )
+        .await;
+        match permit {
+            Ok(Ok(permit)) => Ok(permit),
+            Ok(Err(_)) => Err(DialFailure::Cancelled),
+            Err(_) => Err(DialFailure::QueueFull),
+        }
+    }
+}
+
+fn dial_failure(error: &net::NetError) -> DialFailure {
+    use net::{NetError, TransportError};
+    match error {
+        NetError::Transport(TransportError::Dns(_)) => DialFailure::Dns,
+        NetError::Transport(TransportError::Tls(_)) => DialFailure::Tls,
+        NetError::Transport(TransportError::Timeout(_)) => DialFailure::Timeout,
+        NetError::Limit(_) => DialFailure::Limit,
+        NetError::Transport(TransportError::Connect(_) | TransportError::Io(_))
+        | NetError::Protocol(_) => DialFailure::Connect,
     }
 }
 
@@ -586,4 +672,36 @@ fn content_language_tag(raw: &str) -> Option<String> {
         return None;
     }
     Some(first)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn exhausted_permits_fail_with_queue_full_before_the_deadline() {
+        let permits = Arc::new(Semaphore::new(1));
+        let _held = Arc::clone(&permits).acquire_owned().await.expect("permit");
+
+        let error = FetchHandle::acquire(&permits, Instant::now() + Duration::from_millis(50))
+            .await
+            .expect_err("second permit must time out");
+        assert_eq!(error, DialFailure::QueueFull);
+    }
+
+    #[tokio::test]
+    async fn released_permits_are_reusable() {
+        let permits = Arc::new(Semaphore::new(1));
+        {
+            let _held = Arc::clone(&permits).acquire_owned().await.expect("permit");
+            let error = FetchHandle::acquire(&permits, Instant::now() + Duration::from_millis(20))
+                .await
+                .expect_err("held permit");
+            assert_eq!(error, DialFailure::QueueFull);
+        }
+        let _again = FetchHandle::acquire(&permits, Instant::now() + Duration::from_millis(50))
+            .await
+            .expect("permit after release");
+    }
 }

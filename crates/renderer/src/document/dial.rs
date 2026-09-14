@@ -18,7 +18,7 @@ pub(in crate::document) fn request(dial: &QueuedDial) -> DialRequest {
 
 pub(in crate::document) fn complete(
     dial: &QueuedDial,
-    outcome: Option<DialOutcome>,
+    outcome: Result<DialOutcome, crate::protocol::DialFailure>,
 ) -> Result<CompletedDial, DialFail> {
     let fail = match dial {
         QueuedDial::JsFetch { id, epoch, .. } => DialFail::JsFetch {
@@ -27,7 +27,7 @@ pub(in crate::document) fn complete(
         },
         QueuedDial::ClassicScript { epoch, .. } => DialFail::ClassicScript { epoch: *epoch },
     };
-    let outcome = outcome.ok_or(fail)?;
+    let outcome = outcome.map_err(|_| fail)?;
     Ok(match dial {
         QueuedDial::JsFetch { id, epoch, .. } => CompletedDial::JsFetch {
             status: outcome.status,

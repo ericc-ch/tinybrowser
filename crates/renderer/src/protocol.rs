@@ -286,12 +286,31 @@ pub enum ServiceCall {
 /// Answer to a [`ServiceCall`].
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum ServiceReply {
-    /// Dial result; `None` is a transport/limit failure.
-    Dial(Option<DialOutcome>),
+    /// Dial result, with a typed failure.
+    Dial(Result<DialOutcome, DialFailure>),
     /// Cookie getter result.
     Cookie(String),
     /// No payload (`CookieSet`).
     Unit,
+}
+
+/// Why a browser-service dial failed. Preserved across the renderer seam.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DialFailure {
+    /// Host lookup failed.
+    Dns,
+    /// TCP or proxy connect failed.
+    Connect,
+    /// TLS handshake or certificate verification failed.
+    Tls,
+    /// A deadline expired.
+    Timeout,
+    /// A body or redirect cap was exceeded.
+    Limit,
+    /// A network permit was not available before the deadline.
+    QueueFull,
+    /// Navigation replacement, tab close, or renderer death cancelled the dial.
+    Cancelled,
 }
 
 /// Why the renderer is dialing.
@@ -332,7 +351,8 @@ pub struct DialOutcome {
 }
 
 /// Completion for a dial submitted to the browser process.
-pub(crate) type DialCompletion = Arc<dyn Fn(Option<DialOutcome>) + Send + Sync + 'static>;
+pub(crate) type DialCompletion =
+    Arc<dyn Fn(Result<DialOutcome, DialFailure>) + Send + Sync + 'static>;
 
 /// Host services the renderer reaches through the browser-process seam.
 ///
@@ -466,7 +486,7 @@ mod tests {
             },
             ToRenderer::ServiceReply {
                 id: 8,
-                reply: ServiceReply::Dial(Some(DialOutcome {
+                reply: ServiceReply::Dial(Ok(DialOutcome {
                     status: 200,
                     final_url: "http://example.test/".into(),
                     content_type: Some("text/html".into()),
