@@ -132,7 +132,7 @@ impl TabHandle {
     }
 
     /// Starts navigation. The tab continues independently; call
-    /// [`TabHandle::run_until_load`] only when the caller needs to wait.
+    /// [`TabHandle::run_until_load_timeout`] only when the caller needs to wait.
     ///
     /// # Errors
     ///

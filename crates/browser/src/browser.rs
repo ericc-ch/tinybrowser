@@ -12,6 +12,10 @@ use crate::network::{NetworkSession, ProfileStore};
 use crate::profile::{Profile, ProfileName};
 
 /// Process-owned engine for one profile.
+///
+/// Renderer processes are the current executable invoked with `renderer` as
+/// its first argument. An embedding executable must dispatch that invocation
+/// to [`renderer::serve_stdio`].
 pub struct Browser {
     inner: Arc<Mutex<BrowserInner>>,
 }
