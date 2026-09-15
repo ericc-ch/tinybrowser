@@ -20,8 +20,8 @@ use crate::js::{DocumentStreamCommand, FrameNavigation, RealmRegistry, SharedJsR
 use crate::protocol::{BrowserServices, Mount, ScriptFailure, TabError, TabEvent};
 
 mod dial;
+mod drain;
 mod intern;
-mod pump;
 
 pub(crate) use crate::js::ScriptValue;
 #[cfg(not(target_os = "wasi"))]

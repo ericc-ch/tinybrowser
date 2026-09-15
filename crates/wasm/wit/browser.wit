@@ -20,7 +20,7 @@ interface types {
         /// component instance, and reused for nothing else.
         id: u64,
         /// Component-side tab identity. The host uses it to find the tab to
-        /// pump, because a page's first request starts while its constructor
+        /// step, because a page's first request starts while its constructor
         /// runs and the host does not have the tab handle yet.
         owner: u64,
         kind: fetch-kind,
@@ -163,9 +163,9 @@ interface engine {
 
     /// One page, driven by the host.
     ///
-    /// The host owns the pump loop: it calls `pump` after every state change
-    /// it causes, then waits for the returned delay before pumping again.
-    /// Nothing runs while the host does not pump.
+    /// The host owns the loop: it calls `step` after every state change it
+    /// causes, then waits out the returned delay before stepping again.
+    /// Nothing runs while the host does not step.
     resource tab {
         /// Mounts `html` as the tab's first document at `url`.
         ///
@@ -174,7 +174,7 @@ interface engine {
         ///
         /// The mount parses and may start requests before this constructor
         /// returns, so a host must not call any other method of this resource
-        /// while a component export is on the stack: pump only after the call
+        /// while a component export is on the stack: step only after the call
         /// that caused it returns.
         constructor(url: string, html: string) -> result<tab, string>;
         /// This tab's `fetch-request.owner` value.
@@ -182,9 +182,13 @@ interface engine {
         /// Evaluates `source` in the main frame and returns its string
         /// coercion. Throws surface as the error side.
         eval: func(source: string) -> result<string, string>;
-        /// Runs every ready task, then returns milliseconds until the next
-        /// timer, or none when the page has nothing scheduled.
-        pump: func() -> option<u64>;
+        /// Advances the page one turn: runs every ready task, then returns
+        /// milliseconds until the next timer, or none when idle.
+        ///
+        /// The return value is measured after the work, so the two answers
+        /// cannot disagree: a timer the page just armed is included, and a
+        /// page that just went idle reports none.
+        step: func() -> option<u64>;
         /// Drains pending events and clears them from the tab.
         events: func() -> result<list<frame-event>, string>;
         /// Text of the document's title.
@@ -196,8 +200,8 @@ interface engine {
     /// Delivers one exchange's outcome, returning whether it was expected.
     ///
     /// A `false` answer means the request was unknown: already cancelled, or
-    /// its tab is gone. The host calls `pump` on the tab reporting this
-    /// request's `owner` after a `true` answer.
+    /// its tab is gone. The host steps the tab reporting this request's
+    /// `owner` after a `true` answer.
     complete-fetch: func(id: u64, outcome: result<fetch-response, fetch-error>) -> bool;
 }
 

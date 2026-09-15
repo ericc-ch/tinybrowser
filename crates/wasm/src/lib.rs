@@ -120,9 +120,9 @@ impl GuestTab for Tab {
         self.with_renderer(|renderer| renderer.eval(&source))
     }
 
-    fn pump(&self) -> Option<u64> {
+    fn step(&self) -> Option<u64> {
         let mut renderer = self.renderer.borrow_mut();
-        renderer.pump_ready();
+        renderer.drain_ready();
         renderer.time_until_deadline().map(|delay| {
             let milliseconds = delay.as_nanos().saturating_add(999_999) / 1_000_000;
             u64::try_from(milliseconds).unwrap_or(u64::MAX)

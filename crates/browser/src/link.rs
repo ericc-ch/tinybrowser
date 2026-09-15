@@ -34,7 +34,7 @@ pub(crate) const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long teardown waits for transport tasks to finish.
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// Bounded renderer-pump handoff to its owning tab coordinator. Saturation is
+/// Bounded renderer-event handoff to its owning tab coordinator. Saturation is
 /// a renderer protocol violation: dropping lifecycle events would corrupt tab
 /// state, while blocking the reader could strand a reply behind those events.
 const EVENT_SUBSCRIBER_CAPACITY: usize = 4096;

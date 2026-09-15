@@ -188,13 +188,13 @@ impl Engine {
     }
 
     /// Runs every immediately ready task in every frame. Never blocks.
-    pub(crate) fn pump_ready(&mut self) {
+    pub(crate) fn drain_ready(&mut self) {
         let frames: Vec<FrameId> = self.frames.keys().copied().collect();
         for frame in frames {
             let Some(document) = self.frames.get_mut(&frame) else {
                 continue;
             };
-            document.pump_ready();
+            document.drain_ready();
             self.reconcile_frames();
         }
     }

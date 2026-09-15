@@ -192,7 +192,7 @@ pub(crate) async fn run(
     let mut engines = HashMap::<RendererAssignmentId, Engine>::new();
     let mut responses = ResponseStreams::default();
     loop {
-        if !pump_engines(&mut engines, outbox) || stop.is_set() {
+        if !drain_engines(&mut engines, outbox) || stop.is_set() {
             stop.request();
             break;
         }
@@ -288,12 +288,12 @@ pub(crate) async fn run(
 }
 
 #[cfg(not(target_os = "wasi"))]
-fn pump_engines(
+fn drain_engines(
     engines: &mut HashMap<RendererAssignmentId, Engine>,
     outbox: &SyncSender<FromRenderer>,
 ) -> bool {
     for (assignment, engine) in engines {
-        engine.pump_ready();
+        engine.drain_ready();
         if !publish(*assignment, engine, outbox) {
             return false;
         }

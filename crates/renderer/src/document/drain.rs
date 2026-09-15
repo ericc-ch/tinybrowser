@@ -13,7 +13,7 @@ impl Document {
     /// The renderer loop owns all waiting: it sleeps until [`Document::next_deadline`]
     /// or until a dial completion, channel message, or stop wakes it, then calls
     /// this method again. That is why the page engine needs no private runtime.
-    pub(crate) fn pump_ready(&mut self) {
+    pub(crate) fn drain_ready(&mut self) {
         loop {
             self.adopt_dial_completions();
             while let Some(id) = self.due_timer() {

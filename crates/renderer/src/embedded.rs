@@ -36,7 +36,7 @@ impl EmbeddedRenderer {
     /// The engine rejected the mount.
     pub fn mount(&mut self, mount: &Mount) -> Result<(), TabError> {
         self.engine.mount_frame(FrameId::MAIN, mount)?;
-        self.engine.pump_ready();
+        self.engine.drain_ready();
         Ok(())
     }
 
@@ -64,8 +64,8 @@ impl EmbeddedRenderer {
     }
 
     /// Runs every immediately ready page task without blocking.
-    pub fn pump_ready(&mut self) {
-        self.engine.pump_ready();
+    pub fn drain_ready(&mut self) {
+        self.engine.drain_ready();
     }
 
     /// Removes and returns all pending main-frame events.
@@ -89,7 +89,7 @@ impl EmbeddedRenderer {
             .map(|deadline| deadline.saturating_duration_since(tokio::time::Instant::now()))
     }
 
-    /// Waits until a host completion or page timer may be pumped.
+    /// Waits until a host completion or page timer gives the engine work.
     pub async fn wait_until_ready(&self) {
         match self.engine.next_deadline() {
             Some(deadline) => {
