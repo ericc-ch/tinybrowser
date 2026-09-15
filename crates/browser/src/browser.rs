@@ -9,7 +9,7 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::actor::{TabHandle, TabId, TabTask};
-use crate::link::RendererFactory;
+use crate::link::RendererProcessManager;
 use crate::network::{NetworkSession, ProfileStore};
 use crate::profile::{Profile, ProfileName};
 
@@ -57,7 +57,7 @@ enum Command {
 struct BrowserState {
     live: bool,
     network: NetworkSession,
-    renderers: Arc<RendererFactory>,
+    renderers: Arc<RendererProcessManager>,
     tabs: HashMap<TabId, TabTask>,
     next_tab: u64,
 }
@@ -99,7 +99,7 @@ impl Browser {
         let runtime = tokio::runtime::Handle::try_current()
             .map_err(|error| io::Error::other(format!("browser runtime unavailable: {error}")))?;
         let profile = Profile::named(network.profile_name());
-        let renderers = Arc::new(RendererFactory::new(network.fetch_handle()));
+        let renderers = Arc::new(RendererProcessManager::new(network.fetch_handle()));
         let state = BrowserState {
             live: true,
             network,

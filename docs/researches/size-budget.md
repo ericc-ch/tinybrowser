@@ -599,3 +599,55 @@ profile.
 | Artifact | After P8 | After P9 | Delta | Headroom to 10,000,000 |
 | --- | ---: | ---: | ---: | ---: |
 | CLI (`target/release/tinybrowser`) | 7,349,216 | 7,368,096 | **+18,880** | 2,631,904 |
+
+## Checkpoint: incremental navigation parsing, P10 (2026-09-15)
+
+P10 feeds each response chunk into encoding sniffing and html5ever as it
+arrives, preserves parser-blocking scripts, and defers `document.write()`
+insertion until the fetch finishes. Its gates are cargo, Clippy, Playwright,
+the promoted Blink CDP case, and 56/56 focused html5lib `document.write()`
+variants (`html/syntax/parsing/html5lib_write.html`); P10 changes no
+framing-level code, so its row shares the P9 binary and no separate size was
+recorded. The IPC ABI is version 3 in P11 after assignment ids landed.
+
+## Milestone: renderer process policy, P11 (2026-09-15)
+
+P11 replaced the per-tab renderer factory with a browser-owned process manager.
+Blank targets are virtual: they hold no renderer until a script runs or a
+navigation commits. The manager keeps one unlocked spare, applies a soft limit
+derived from `/proc/meminfo` (`TINYBROWSER_RENDERER_PROCESS_LIMIT` overrides it
+for tests), reuses a same-site process over the limit, and hands each mounted
+top-level document a browser-minted `RendererAssignmentId` so one process hosts
+several isolated page engines. Command: `nix develop --command cargo build
+--release --bin tinybrowser`; rustc 1.98.0, stripped x86_64 release profile.
+
+| Artifact | After P9 | After P11 | Delta | Headroom to 10,000,000 |
+| --- | ---: | ---: | ---: | ---: |
+| CLI (`target/release/tinybrowser`) | 7,368,096 | 7,414,144 | **+46,048** | 2,585,856 |
+
+The delta covers P10 and P11 together; P10 was not measured separately.
+
+## Measurement: 100-tab E0, P11 (2026-09-15)
+
+The harness starts a release daemon on a fresh profile, creates 100 about:blank
+CDP targets, waits ten seconds, and measures the whole process tree. It then
+navigates one target to a loopback page that issues 50 parallel `fetch` calls.
+
+| Metric | P5 | P11 |
+| --- | ---: | ---: |
+| Targets | 101 | 101 |
+| Creation | 702 ms (Playwright page setup) | **17.5 ms (direct `Target.createTarget`)** |
+| Processes | 101 renderers | **3 (browser, spare, one live page)** |
+| Threads | 323 | **10** |
+| File descriptors | 925 | **33** |
+| PSS | 210 MB | **11.6 MB** |
+| Idle CPU | 0% | **0%** |
+| 50 parallel requests | not measured | **21.1 ms** |
+
+The earlier E0 created each target through Playwright `context.newPage()`, which
+also attaches, enables domains, and waits for execution-context events; the P11
+harness calls `Target.createTarget` directly, so the two creation numbers are
+not comparable. Blank-tab virtuality is what removes the per-target renderer,
+thread, and descriptor cost: P5's 925 descriptors came from one socket pair and
+process per blank target. The remaining descriptors are the CDP listener, the
+spare renderer's socket pair, and the live page's HTTP socket.

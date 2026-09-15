@@ -24,7 +24,7 @@ use serde::{Serialize, de::DeserializeOwned};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// Framing and message ABI version for the renderer channel.
-pub const PROTOCOL_VERSION: u8 = 2;
+pub const PROTOCOL_VERSION: u8 = 3;
 
 /// Fixed frame header size in bytes.
 pub const HEADER_BYTES: usize = 16;
@@ -368,6 +368,7 @@ mod tests {
     fn control_frames_round_trip() {
         let message = crate::ToRenderer::Request {
             id: 7,
+            assignment: crate::RendererAssignmentId::new(1),
             command: crate::Command::Eval {
                 frame: crate::FrameId::MAIN,
                 source: "1+1".into(),
@@ -410,6 +411,7 @@ mod tests {
 
         let message = crate::ToRenderer::Request {
             id: 1,
+            assignment: crate::RendererAssignmentId::new(1),
             command: crate::Command::Eval {
                 frame: crate::FrameId::MAIN,
                 source: "x".repeat(MAX_CONTROL_BYTES),

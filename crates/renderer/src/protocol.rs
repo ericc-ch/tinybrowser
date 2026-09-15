@@ -21,6 +21,24 @@ pub const RENDERER_OUTBOX_CAPACITY: usize = 4096;
 /// Maximum aggregate bytes retained for one streamed response.
 pub const MAX_RESPONSE_BODY_BYTES: usize = 1_048_576;
 
+/// Browser-minted identity of one top-level document hosted by a renderer.
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct RendererAssignmentId(u64);
+
+impl RendererAssignmentId {
+    /// Constructs an assignment id from a browser-process integer.
+    #[must_use]
+    pub fn new(raw: u64) -> Self {
+        Self(raw)
+    }
+
+    /// Stable numeric identity for protocol messages.
+    #[must_use]
+    pub fn get(self) -> u64 {
+        self.0
+    }
+}
+
 /// Renderer-process identity of one frame.
 ///
 /// [ADR 0014](../../../docs/adrs/0014-frames-and-per-frame-realms.md): the
@@ -224,10 +242,22 @@ pub enum Reply {
 pub enum ToRenderer {
     /// First frame from the browser process: protocol handshake.
     Hello,
+    /// Creates an isolated page engine inside this renderer process.
+    Assign {
+        /// Browser-minted assignment identity.
+        assignment: RendererAssignmentId,
+    },
+    /// Removes one page engine from this renderer process.
+    Release {
+        /// Browser-minted assignment identity.
+        assignment: RendererAssignmentId,
+    },
     /// One command with its correlation id.
     Request {
         /// Request id chosen by the browser process.
         id: u64,
+        /// Top-level document that owns the command.
+        assignment: RendererAssignmentId,
         /// The command.
         command: Command,
     },
@@ -263,6 +293,8 @@ pub enum ToRenderer {
 /// Metadata sent before the raw bytes of a top-level response.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ResponseStart {
+    /// Top-level document receiving this response.
+    pub assignment: RendererAssignmentId,
     /// Frame that will receive the document.
     pub frame: FrameId,
     /// Final HTTP status.
@@ -284,11 +316,15 @@ pub enum FromRenderer {
     Reply {
         /// Request id from [`ToRenderer::Request`].
         id: u64,
+        /// Top-level document that produced the reply.
+        assignment: RendererAssignmentId,
         /// The answer.
         reply: Reply,
     },
     /// Unsolicited document event.
     Event {
+        /// Top-level document that emitted the event.
+        assignment: RendererAssignmentId,
         /// Frame that emitted the event.
         frame: FrameId,
         /// The event.
@@ -296,6 +332,8 @@ pub enum FromRenderer {
     },
     /// A browser service the renderer cannot perform itself.
     ServiceCall {
+        /// Top-level document requesting the browser service.
+        assignment: RendererAssignmentId,
         /// Service-call id chosen by the renderer.
         id: u64,
         /// The call.
@@ -446,6 +484,7 @@ mod tests {
         for number in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
             let message = FromRenderer::Reply {
                 id: 3,
+                assignment: RendererAssignmentId::new(1),
                 reply: Reply::Value(Ok(RemoteValue::Number(number))),
             };
             round_trip(&message);
@@ -470,6 +509,7 @@ mod tests {
     fn control_messages_round_trip_through_the_frame_codec() {
         let message = ToRenderer::Request {
             id: 1,
+            assignment: RendererAssignmentId::new(1),
             command: Command::Eval {
                 frame: FrameId::MAIN,
                 source: "x".repeat(1024),
@@ -488,8 +528,15 @@ mod tests {
     #[test]
     fn host_to_renderer_messages_round_trip() {
         let messages = [
+            ToRenderer::Assign {
+                assignment: RendererAssignmentId::new(1),
+            },
+            ToRenderer::Release {
+                assignment: RendererAssignmentId::new(1),
+            },
             ToRenderer::Request {
                 id: 1,
+                assignment: RendererAssignmentId::new(1),
                 command: Command::Mount {
                     frame: FrameId::MAIN,
                     mount: Mount {
@@ -502,6 +549,7 @@ mod tests {
             },
             ToRenderer::Request {
                 id: 2,
+                assignment: RendererAssignmentId::new(1),
                 command: Command::Eval {
                     frame: FrameId::new(3),
                     source: "1+1".into(),
@@ -509,6 +557,7 @@ mod tests {
             },
             ToRenderer::Request {
                 id: 3,
+                assignment: RendererAssignmentId::new(1),
                 command: Command::ExecuteScript {
                     frame: FrameId::MAIN,
                     source: "x".into(),
@@ -517,11 +566,13 @@ mod tests {
             },
             ToRenderer::Request {
                 id: 6,
+                assignment: RendererAssignmentId::new(1),
                 command: Command::Shutdown,
             },
             ToRenderer::ResponseStart {
                 id: 10,
                 response: ResponseStart {
+                    assignment: RendererAssignmentId::new(1),
                     frame: FrameId::MAIN,
                     status: 200,
                     final_url: "http://example.test/".into(),
@@ -562,6 +613,7 @@ mod tests {
     fn mount_body_is_not_part_of_control_json() {
         let message = ToRenderer::Request {
             id: 1,
+            assignment: RendererAssignmentId::new(1),
             command: Command::Mount {
                 frame: FrameId::MAIN,
                 mount: Mount {
@@ -582,25 +634,31 @@ mod tests {
             FromRenderer::Ready,
             FromRenderer::Reply {
                 id: 1,
+                assignment: RendererAssignmentId::new(1),
                 reply: Reply::Unit(Ok(())),
             },
             FromRenderer::Reply {
                 id: 2,
+                assignment: RendererAssignmentId::new(1),
                 reply: Reply::Unit(Err(TabError::Script(ScriptFailure::Interrupted))),
             },
             FromRenderer::Reply {
                 id: 3,
+                assignment: RendererAssignmentId::new(1),
                 reply: Reply::Text(Ok("ok".into())),
             },
             FromRenderer::Reply {
                 id: 5,
+                assignment: RendererAssignmentId::new(1),
                 reply: Reply::Value(Ok(RemoteValue::List(vec![RemoteValue::Number(1.0)]))),
             },
             FromRenderer::Event {
+                assignment: RendererAssignmentId::new(1),
                 frame: FrameId::MAIN,
                 event: TabEvent::Fetch { status: 404 },
             },
             FromRenderer::ServiceCall {
+                assignment: RendererAssignmentId::new(1),
                 id: 6,
                 call: ServiceCall::Dial(DialRequest {
                     kind: DialKind::JsFetch,
@@ -610,12 +668,14 @@ mod tests {
                 }),
             },
             FromRenderer::ServiceCall {
+                assignment: RendererAssignmentId::new(1),
                 id: 7,
                 call: ServiceCall::CookieGet {
                     url: "http://example.test/".into(),
                 },
             },
             FromRenderer::ServiceCall {
+                assignment: RendererAssignmentId::new(1),
                 id: 8,
                 call: ServiceCall::CookieSet {
                     value: "a=1".into(),

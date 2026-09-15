@@ -17,7 +17,7 @@ use tokio::task::JoinHandle;
 use tokio::time::{Instant, sleep_until, timeout};
 use url::Url;
 
-use crate::link::{RendererFactory, RendererHandle};
+use crate::link::{RendererAssignment, RendererProcessManager};
 use crate::network::{FetchHandle, NAV_BODY_LIMIT, NavOutcome, dial_failure};
 use crate::site::Site;
 
@@ -108,7 +108,7 @@ enum Waiter {
 #[derive(Clone)]
 pub struct TabHandle {
     id: TabId,
-    current: Arc<Mutex<Option<Arc<RendererHandle>>>>,
+    current: Arc<Mutex<Option<Arc<RendererAssignment>>>>,
     tx: mpsc::Sender<Command>,
 }
 
@@ -290,7 +290,11 @@ pub(crate) struct TabTask {
 }
 
 impl TabTask {
-    pub(crate) fn spawn(id: TabId, fetch: FetchHandle, renderers: Arc<RendererFactory>) -> Self {
+    pub(crate) fn spawn(
+        id: TabId,
+        fetch: FetchHandle,
+        renderers: Arc<RendererProcessManager>,
+    ) -> Self {
         let (tx, rx) = mpsc::channel(COMMAND_CAPACITY);
         let current = Arc::new(Mutex::new(None));
         let handle = TabHandle {
@@ -345,10 +349,11 @@ struct ActiveNavigation {
 /// Browser-owned tab state: identity, URL, navigation, and renderer link.
 struct Tab {
     id: TabId,
-    renderers: Arc<RendererFactory>,
+    renderers: Arc<RendererProcessManager>,
     fetch: FetchHandle,
-    current: Arc<Mutex<Option<Arc<RendererHandle>>>>,
-    renderer: Option<Arc<RendererHandle>>,
+    current: Arc<Mutex<Option<Arc<RendererAssignment>>>>,
+    renderer: Option<Arc<RendererAssignment>>,
+    pending_mount: Option<Mount>,
     site: Option<Site>,
     events_rx: Option<mpsc::Receiver<(FrameId, TabEvent)>>,
     document_url: Url,
@@ -368,8 +373,8 @@ impl Tab {
     fn new(
         id: TabId,
         fetch: FetchHandle,
-        renderers: Arc<RendererFactory>,
-        current: Arc<Mutex<Option<Arc<RendererHandle>>>>,
+        renderers: Arc<RendererProcessManager>,
+        current: Arc<Mutex<Option<Arc<RendererAssignment>>>>,
     ) -> Self {
         let (dial_tx, dial_rx) = mpsc::unbounded_channel();
         Self {
@@ -378,6 +383,7 @@ impl Tab {
             fetch,
             current,
             renderer: None,
+            pending_mount: Some(blank_mount()),
             site: None,
             events_rx: None,
             document_url: Url::parse("about:blank").expect("about:blank is a valid URL"),
@@ -404,6 +410,12 @@ impl Tab {
             content_language: None,
             body: html.as_bytes().to_vec(),
         };
+        if self.renderer.is_none() && self.document_url.scheme() == "about" {
+            self.pending_mount = Some(mount);
+            self.document_loaded = true;
+            self.record_event(TabEvent::Load);
+            return Ok(());
+        }
         self.mount(&site, 200, mount).await
     }
 
@@ -440,7 +452,6 @@ impl Tab {
             .acquire(site)
             .await
             .map_err(|error| renderer_unavailable(&error.to_string()))?;
-        let handle = Arc::new(handle);
         self.drop_renderer().await;
         self.events_rx = Some(handle.subscribe());
         *self.current.lock().unwrap_or_else(PoisonError::into_inner) = Some(Arc::clone(&handle));
@@ -451,6 +462,7 @@ impl Tab {
 
     async fn mount(&mut self, site: &Site, status: u16, mount: Mount) -> Result<(), TabError> {
         self.ensure_renderer(site).await?;
+        self.pending_mount = None;
         self.document_loaded = false;
         let result = self
             .renderer
@@ -473,6 +485,7 @@ impl Tab {
         mut body: net::Body,
     ) -> Result<(), TabError> {
         self.ensure_renderer(site).await?;
+        self.pending_mount = None;
         self.document_loaded = false;
         let renderer = self.renderer.as_ref().ok_or(TabError::ActorStopped)?;
         let stream = renderer
@@ -515,11 +528,18 @@ impl Tab {
         self.site = None;
         self.events_rx = None;
         if let Some(renderer) = self.renderer.take() {
-            renderer.shutdown().await;
+            self.renderers.release(renderer).await;
         }
     }
 
-    async fn renderer_request(&self, command: RendererCommand) -> Result<Reply, TabError> {
+    async fn renderer_request(&mut self, command: RendererCommand) -> Result<Reply, TabError> {
+        if self.renderer.is_none() {
+            let mount = self.pending_mount.take().unwrap_or_else(blank_mount);
+            let site = Site::for_url(&self.document_url)
+                .or_else(|| self.site.clone())
+                .unwrap_or_else(|| Site::opaque(self.id));
+            self.mount(&site, 200, mount).await?;
+        }
         let Some(renderer) = self.renderer.clone() else {
             return Err(TabError::ActorStopped);
         };
@@ -630,10 +650,16 @@ impl Tab {
 
     async fn stop_renderer(&mut self) {
         self.cancel_dial();
-        if let Some(renderer) = &self.renderer {
-            renderer.request_shutdown();
-        }
         self.drop_renderer().await;
+    }
+}
+
+fn blank_mount() -> Mount {
+    Mount {
+        url: "about:blank".into(),
+        content_type: Some("text/html; charset=utf-8".into()),
+        content_language: None,
+        body: b"<!doctype html><title></title>".to_vec(),
     }
 }
 

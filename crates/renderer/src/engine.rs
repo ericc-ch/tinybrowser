@@ -391,6 +391,12 @@ impl Engine {
             document.shutdown();
         }
     }
+
+    pub(crate) fn release(&mut self) {
+        for document in self.frames.values_mut() {
+            document.release();
+        }
+    }
 }
 
 impl Drop for Engine {

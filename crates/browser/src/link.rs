@@ -7,19 +7,19 @@
 use std::collections::HashMap;
 use std::io;
 use std::process::Stdio;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, PoisonError, Weak};
 use std::time::Duration;
 
 use crate::network::FetchHandle;
 use crate::site::Site;
 use renderer::{
-    Command as RendererCommand, FrameId, FromRenderer, Mount, Reply, ResponseStart, ServiceCall,
-    ServiceReply, TabError, TabEvent, ToRenderer,
+    Command as RendererCommand, FrameId, FromRenderer, Mount, RendererAssignmentId, Reply,
+    ResponseStart, ServiceCall, ServiceReply, TabError, TabEvent, ToRenderer,
 };
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite};
 use tokio::process::{Child, Command};
-use tokio::sync::{mpsc, oneshot, watch};
+use tokio::sync::{Semaphore, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 
@@ -46,7 +46,13 @@ const COMMAND_CAPACITY: usize = 256;
 struct RendererId(u64);
 
 /// Live subscribers to one renderer's frame-tagged document events.
-type EventSubscribers = Arc<Mutex<Vec<mpsc::Sender<(FrameId, TabEvent)>>>>;
+type EventSubscribers =
+    Arc<Mutex<HashMap<RendererAssignmentId, Vec<mpsc::Sender<(FrameId, TabEvent)>>>>>;
+
+struct PendingReply {
+    assignment: RendererAssignmentId,
+    reply: oneshot::Sender<Reply>,
+}
 
 enum Outbound {
     Control(ToRenderer),
@@ -56,18 +62,62 @@ enum Outbound {
 /// Value-only handle to one renderer.
 pub(crate) struct RendererHandle {
     tx: mpsc::Sender<Outbound>,
-    pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Reply>>>>,
+    pending: Arc<Mutex<HashMap<u64, PendingReply>>>,
     alive: Arc<AtomicBool>,
     subscribers: EventSubscribers,
     next_request: AtomicU64,
     kill: watch::Sender<bool>,
     tasks: Mutex<Vec<JoinHandle<()>>>,
+    site: Arc<Mutex<Option<Site>>>,
+    assignments: AtomicUsize,
+    _slot: tokio::sync::OwnedSemaphorePermit,
+}
+
+/// One browser-authorized top-level document inside a renderer process.
+pub(crate) struct RendererAssignment {
+    id: RendererAssignmentId,
+    process: Arc<RendererHandle>,
+}
+
+impl RendererAssignment {
+    pub(crate) async fn request(&self, command: RendererCommand) -> Result<Reply, TabError> {
+        self.process.request(self.id, command).await
+    }
+
+    pub(crate) async fn mount(
+        &self,
+        frame: FrameId,
+        status: u16,
+        mount: Mount,
+    ) -> Result<Reply, TabError> {
+        self.process.mount(self.id, frame, status, mount).await
+    }
+
+    pub(crate) async fn start_response(
+        &self,
+        frame: FrameId,
+        status: u16,
+        mount: &Mount,
+    ) -> Result<ResponseWriter, TabError> {
+        self.process
+            .start_response(self.id, frame, status, mount)
+            .await
+    }
+
+    #[must_use]
+    pub(crate) fn subscribe(&self) -> mpsc::Receiver<(FrameId, TabEvent)> {
+        self.process.subscribe(self.id)
+    }
+
+    pub(crate) fn interrupt(&self) {
+        self.process.interrupt();
+    }
 }
 
 pub(crate) struct ResponseWriter {
     id: u64,
     tx: mpsc::Sender<Outbound>,
-    pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Reply>>>>,
+    pending: Arc<Mutex<HashMap<u64, PendingReply>>>,
     reply: Option<oneshot::Receiver<Reply>>,
 }
 
@@ -136,13 +186,52 @@ impl Drop for ResponseWriter {
 }
 
 impl RendererHandle {
+    fn bind(&self, site: &Site) -> io::Result<()> {
+        let mut lock = self.site.lock().unwrap_or_else(PoisonError::into_inner);
+        match &*lock {
+            Some(existing) if existing != site => {
+                Err(io::Error::other("renderer has a different site lock"))
+            }
+            Some(_) => Ok(()),
+            None => {
+                *lock = Some(site.clone());
+                Ok(())
+            }
+        }
+    }
+
+    async fn assign(&self, assignment: RendererAssignmentId) -> io::Result<()> {
+        self.tx
+            .send(Outbound::Control(ToRenderer::Assign { assignment }))
+            .await
+            .map_err(|_| io::Error::other("renderer stopped"))?;
+        self.assignments.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
+    async fn release(&self, assignment: RendererAssignmentId) {
+        self.subscribers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&assignment);
+        let _ = self
+            .tx
+            .send(Outbound::Control(ToRenderer::Release { assignment }))
+            .await;
+        self.assignments.fetch_sub(1, Ordering::Relaxed);
+    }
+
     /// Sends one command and waits for its reply.
     ///
     /// # Errors
     ///
     /// [`TabError::ActorStopped`] when the renderer is gone or the reply does
     /// not arrive within the request timeout.
-    pub(crate) async fn request(&self, command: RendererCommand) -> Result<Reply, TabError> {
+    async fn request(
+        &self,
+        assignment: RendererAssignmentId,
+        command: RendererCommand,
+    ) -> Result<Reply, TabError> {
         let id = self.next_request.fetch_add(1, Ordering::Relaxed);
         let (reply_tx, reply_rx) = oneshot::channel();
         {
@@ -150,11 +239,21 @@ impl RendererHandle {
             if !self.alive.load(Ordering::Relaxed) {
                 return Err(TabError::ActorStopped);
             }
-            pending.insert(id, reply_tx);
+            pending.insert(
+                id,
+                PendingReply {
+                    assignment,
+                    reply: reply_tx,
+                },
+            );
         }
         if self
             .tx
-            .send(Outbound::Control(ToRenderer::Request { id, command }))
+            .send(Outbound::Control(ToRenderer::Request {
+                id,
+                assignment,
+                command,
+            }))
             .await
             .is_err()
         {
@@ -171,21 +270,25 @@ impl RendererHandle {
 
     /// Streams one top-level response to the renderer and waits for its mount
     /// result. The body is carried only in bounded raw IPC frames.
-    pub(crate) async fn mount(
+    async fn mount(
         &self,
+        assignment: RendererAssignmentId,
         frame: FrameId,
         status: u16,
         mount: Mount,
     ) -> Result<Reply, TabError> {
-        let response = self.start_response(frame, status, &mount).await?;
+        let response = self
+            .start_response(assignment, frame, status, &mount)
+            .await?;
         for chunk in mount.body.chunks(renderer::MAX_BODY_CHUNK_BYTES) {
             response.write(chunk.to_vec()).await?;
         }
         response.finish().await
     }
 
-    pub(crate) async fn start_response(
+    async fn start_response(
         &self,
+        assignment: RendererAssignmentId,
         frame: FrameId,
         status: u16,
         mount: &Mount,
@@ -197,9 +300,16 @@ impl RendererHandle {
             if !self.alive.load(Ordering::Relaxed) {
                 return Err(TabError::ActorStopped);
             }
-            pending.insert(id, reply_tx);
+            pending.insert(
+                id,
+                PendingReply {
+                    assignment,
+                    reply: reply_tx,
+                },
+            );
         }
         let start = ResponseStart {
+            assignment,
             frame,
             status,
             final_url: mount.url.clone(),
@@ -227,11 +337,13 @@ impl RendererHandle {
     }
     /// Subscribes to renderer document events after this call.
     #[must_use]
-    pub(crate) fn subscribe(&self) -> mpsc::Receiver<(FrameId, TabEvent)> {
+    fn subscribe(&self, assignment: RendererAssignmentId) -> mpsc::Receiver<(FrameId, TabEvent)> {
         let (tx, rx) = mpsc::channel(EVENT_SUBSCRIBER_CAPACITY);
         self.subscribers
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
+            .entry(assignment)
+            .or_default()
             .push(tx);
         rx
     }
@@ -245,6 +357,7 @@ impl RendererHandle {
     pub(crate) fn request_shutdown(&self) {
         let _ = self.tx.try_send(Outbound::Control(ToRenderer::Request {
             id: 0,
+            assignment: RendererAssignmentId::new(0),
             command: RendererCommand::Shutdown,
         }));
     }
@@ -281,18 +394,39 @@ impl Drop for RendererHandle {
     }
 }
 
-/// Renderer-process factory.
-pub(crate) struct RendererFactory {
-    fetch: FetchHandle,
-    next: AtomicU64,
+/// Browser-owned renderer process manager.
+pub(crate) struct RendererProcessManager {
+    inner: Arc<ManagerInner>,
 }
 
-impl RendererFactory {
+struct ManagerInner {
+    fetch: FetchHandle,
+    next: AtomicU64,
+    next_assignment: AtomicU64,
+    slots: Arc<Semaphore>,
+    state: tokio::sync::Mutex<ManagerState>,
+}
+
+#[derive(Default)]
+struct ManagerState {
+    spare: Option<Arc<RendererHandle>>,
+    sites: HashMap<Site, Vec<Weak<RendererHandle>>>,
+    spawning_spare: bool,
+}
+
+impl RendererProcessManager {
     pub(crate) fn new(fetch: FetchHandle) -> Self {
-        Self {
-            fetch,
-            next: AtomicU64::new(1),
-        }
+        let manager = Self {
+            inner: Arc::new(ManagerInner {
+                fetch,
+                next: AtomicU64::new(1),
+                next_assignment: AtomicU64::new(1),
+                slots: Arc::new(Semaphore::new(renderer_process_limit())),
+                state: tokio::sync::Mutex::new(ManagerState::default()),
+            }),
+        };
+        manager.fill_spare();
+        manager
     }
 
     /// Creates a renderer locked to `site`.
@@ -300,10 +434,126 @@ impl RendererFactory {
     /// # Errors
     ///
     /// Process spawn failure or a failed protocol handshake.
-    pub(crate) async fn acquire(&self, site: &Site) -> io::Result<RendererHandle> {
-        let id = RendererId(self.next.fetch_add(1, Ordering::Relaxed));
-        spawn_process(id, site, self.fetch.clone()).await
+    pub(crate) async fn acquire(&self, site: &Site) -> io::Result<Arc<RendererAssignment>> {
+        let process = self.acquire_process(site).await?;
+        let assignment =
+            RendererAssignmentId::new(self.inner.next_assignment.fetch_add(1, Ordering::Relaxed));
+        process.assign(assignment).await?;
+        self.fill_spare();
+        Ok(Arc::new(RendererAssignment {
+            id: assignment,
+            process,
+        }))
     }
+
+    async fn acquire_process(&self, site: &Site) -> io::Result<Arc<RendererHandle>> {
+        let mut state = self.inner.state.lock().await;
+        let process = if let Some(spare) = state.spare.take() {
+            spare.bind(site)?;
+            spare
+        } else if let Ok(slot) = Arc::clone(&self.inner.slots).try_acquire_owned() {
+            let id = RendererId(self.inner.next.fetch_add(1, Ordering::Relaxed));
+            Arc::new(spawn_process(id, Some(site.clone()), self.inner.fetch.clone(), slot).await?)
+        } else {
+            let candidates = state.sites.entry(site.clone()).or_default();
+            candidates.retain(|candidate| {
+                candidate
+                    .upgrade()
+                    .is_some_and(|process| process.alive.load(Ordering::Relaxed))
+            });
+            candidates
+                .iter()
+                .find_map(Weak::upgrade)
+                .ok_or_else(|| io::Error::other("renderer process budget exhausted"))?
+        };
+        let processes = state.sites.entry(site.clone()).or_default();
+        if !processes.iter().any(|candidate| {
+            candidate
+                .upgrade()
+                .is_some_and(|candidate| Arc::ptr_eq(&candidate, &process))
+        }) {
+            processes.push(Arc::downgrade(&process));
+        }
+        Ok(process)
+    }
+
+    pub(crate) async fn release(&self, assignment: Arc<RendererAssignment>) {
+        let process = Arc::clone(&assignment.process);
+        process.release(assignment.id).await;
+        drop(assignment);
+        if process.assignments.load(Ordering::Relaxed) == 0 {
+            let site = process
+                .site
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone();
+            if let Some(site) = site {
+                let mut state = self.inner.state.lock().await;
+                if let Some(processes) = state.sites.get_mut(&site) {
+                    processes.retain(|candidate| {
+                        candidate
+                            .upgrade()
+                            .is_some_and(|candidate| !Arc::ptr_eq(&candidate, &process))
+                    });
+                    if processes.is_empty() {
+                        state.sites.remove(&site);
+                    }
+                }
+            }
+            process.shutdown().await;
+        }
+        drop(process);
+        self.fill_spare();
+    }
+
+    fn fill_spare(&self) {
+        let inner = Arc::clone(&self.inner);
+        tokio::spawn(async move {
+            {
+                let mut state = inner.state.lock().await;
+                if state.spare.is_some() || state.spawning_spare {
+                    return;
+                }
+                state.spawning_spare = true;
+            }
+            let result = match Arc::clone(&inner.slots).try_acquire_owned() {
+                Ok(slot) => {
+                    let id = RendererId(inner.next.fetch_add(1, Ordering::Relaxed));
+                    spawn_process(id, None, inner.fetch.clone(), slot)
+                        .await
+                        .map(Arc::new)
+                }
+                Err(_) => Err(io::Error::other("renderer process budget exhausted")),
+            };
+            let mut state = inner.state.lock().await;
+            state.spawning_spare = false;
+            if let Ok(spare) = result {
+                state.spare = Some(spare);
+            }
+        });
+    }
+}
+
+fn renderer_process_limit() -> usize {
+    if let Some(limit) = std::env::var_os("TINYBROWSER_RENDERER_PROCESS_LIMIT")
+        .and_then(|value| value.to_str()?.parse::<usize>().ok())
+        .filter(|limit| *limit > 0)
+    {
+        return limit;
+    }
+    let available_kib = std::fs::read_to_string("/proc/meminfo")
+        .ok()
+        .and_then(|text| {
+            text.lines().find_map(|line| {
+                line.strip_prefix("MemAvailable:")?
+                    .split_whitespace()
+                    .next()?
+                    .parse::<usize>()
+                    .ok()
+            })
+        })
+        .unwrap_or(512 * 1024);
+    (available_kib / (64 * 1024)).clamp(1, 128)
 }
 
 struct RendererViolation;
@@ -360,8 +610,9 @@ fn spawn_transport(command: &mut Command) -> io::Result<SpawnedRenderer> {
 
 async fn spawn_process(
     id: RendererId,
-    site: &Site,
+    site: Option<Site>,
     fetch: FetchHandle,
+    slot: tokio::sync::OwnedSemaphorePermit,
 ) -> io::Result<RendererHandle> {
     let mut command = Command::new(std::env::current_exe()?);
     command
@@ -381,7 +632,7 @@ async fn spawn_process(
     let (kill, kill_rx) = watch::channel(false);
     let pending = Arc::new(Mutex::new(HashMap::new()));
     let alive = Arc::new(AtomicBool::new(true));
-    let subscribers = Arc::new(Mutex::new(Vec::new()));
+    let subscribers = Arc::new(Mutex::new(HashMap::new()));
     let (ready_tx, ready_rx) = oneshot::channel();
     let writer_task = tokio::spawn(writer_task(
         rx,
@@ -391,13 +642,14 @@ async fn spawn_process(
         kill.clone(),
         kill_rx.clone(),
     ));
+    let site = Arc::new(Mutex::new(site));
     let reader_context = ReaderContext {
         tx: tx.clone(),
         pending: Arc::clone(&pending),
         alive: Arc::clone(&alive),
         subscribers: Arc::clone(&subscribers),
         fetch: fetch.clone(),
-        site: site.clone(),
+        site: Arc::clone(&site),
         kill: kill.clone(),
     };
     let reader_task = tokio::spawn(reader_task(reader, reader_context, Some(ready_tx)));
@@ -416,7 +668,7 @@ async fn spawn_process(
     }
     logging::debug!(
         target: "browser::link",
-        "renderer {id:?} ready for site {site:?}"
+        "renderer {id:?} ready for site lock {site:?}"
     );
     let tasks = vec![writer_task, reader_task, stderr_task];
     Ok(RendererHandle {
@@ -427,6 +679,9 @@ async fn spawn_process(
         next_request: AtomicU64::new(1),
         kill,
         tasks: Mutex::new(tasks),
+        site,
+        assignments: AtomicUsize::new(0),
+        _slot: slot,
     })
 }
 
@@ -443,11 +698,11 @@ async fn child_task(mut child: Child, mut kill: watch::Receiver<bool>) {
 /// Shared route state for one renderer's reader task.
 struct ReaderContext {
     tx: mpsc::Sender<Outbound>,
-    pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Reply>>>>,
+    pending: Arc<Mutex<HashMap<u64, PendingReply>>>,
     alive: Arc<AtomicBool>,
     subscribers: EventSubscribers,
     fetch: FetchHandle,
-    site: Site,
+    site: Arc<Mutex<Option<Site>>>,
     kill: watch::Sender<bool>,
 }
 
@@ -455,7 +710,7 @@ async fn writer_task(
     mut rx: mpsc::Receiver<Outbound>,
     mut writer: Box<dyn AsyncWrite + Send + Unpin>,
     alive: Arc<AtomicBool>,
-    pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Reply>>>>,
+    pending: Arc<Mutex<HashMap<u64, PendingReply>>>,
     kill: watch::Sender<bool>,
     mut kill_rx: watch::Receiver<bool>,
 ) {
@@ -526,77 +781,114 @@ fn route(message: FromRenderer, context: &ReaderContext) -> Result<(), RendererV
     match message {
         // Handled by the channel handshake; never routed.
         FromRenderer::Ready => {}
-        FromRenderer::Reply { id, reply } => {
-            if let Some(reply_tx) = context
+        FromRenderer::Reply {
+            id,
+            assignment,
+            reply,
+        } => {
+            if let Some(pending) = context
                 .pending
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .remove(&id)
             {
-                let _ = reply_tx.send(reply);
+                if pending.assignment != assignment {
+                    return Err(RendererViolation);
+                }
+                let _ = pending.reply.send(reply);
             }
         }
-        FromRenderer::Event { frame, event } => {
+        FromRenderer::Event {
+            assignment,
+            frame,
+            event,
+        } => {
             let mut saturated = false;
-            context
+            let mut subscribers = context
                 .subscribers
                 .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .retain(|subscriber| match subscriber.try_send((frame, event)) {
-                    Ok(()) => true,
-                    Err(mpsc::error::TrySendError::Closed(_)) => false,
-                    Err(mpsc::error::TrySendError::Full(_)) => {
-                        saturated = true;
-                        false
-                    }
-                });
+                .unwrap_or_else(PoisonError::into_inner);
+            let Some(assignment_subscribers) = subscribers.get_mut(&assignment) else {
+                return Err(RendererViolation);
+            };
+            assignment_subscribers.retain(|subscriber| match subscriber.try_send((frame, event)) {
+                Ok(()) => true,
+                Err(mpsc::error::TrySendError::Closed(_)) => false,
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    saturated = true;
+                    false
+                }
+            });
             if saturated {
                 return Err(RendererViolation);
             }
         }
-        FromRenderer::ServiceCall { id, call } => match call {
-            ServiceCall::Dial(request) => {
-                let Some(initiator) = context.site.authorize(&request.initiator) else {
-                    return Err(RendererViolation);
-                };
-                let worker_fetch = context.fetch.clone();
-                let worker_tx = context.tx.clone();
-                let worker_pending = Arc::clone(&context.pending);
-                let worker_alive = Arc::clone(&context.alive);
-                let worker_kill = context.kill.clone();
-                let cancel = context.kill.subscribe();
-                tokio::spawn(async move {
-                    let outcome = worker_fetch
-                        .dial_request(&request, &initiator, cancel)
-                        .await;
-                    if worker_tx
-                        .try_send(Outbound::Control(ToRenderer::ServiceReply {
-                            id,
-                            reply: ServiceReply::Dial(outcome),
-                        }))
-                        .is_err()
-                    {
-                        fail(&worker_alive, &worker_pending, &worker_kill);
-                    }
-                });
+        FromRenderer::ServiceCall {
+            assignment,
+            id,
+            call,
+        } => {
+            if !has_assignment(&context.subscribers, assignment) {
+                return Err(RendererViolation);
             }
-            ServiceCall::CookieGet { url } => {
-                let Some(url) = context.site.authorize(&url) else {
-                    return Err(RendererViolation);
-                };
-                let reply = ServiceReply::Cookie(context.fetch.cookies_for(&url));
-                send_reply(&context.tx, id, reply)?;
+            match call {
+                ServiceCall::Dial(request) => {
+                    let Some(initiator) = authorize(&context.site, &request.initiator) else {
+                        return Err(RendererViolation);
+                    };
+                    let worker_fetch = context.fetch.clone();
+                    let worker_tx = context.tx.clone();
+                    let worker_pending = Arc::clone(&context.pending);
+                    let worker_alive = Arc::clone(&context.alive);
+                    let worker_kill = context.kill.clone();
+                    let cancel = context.kill.subscribe();
+                    tokio::spawn(async move {
+                        let outcome = worker_fetch
+                            .dial_request(&request, &initiator, cancel)
+                            .await;
+                        if worker_tx
+                            .try_send(Outbound::Control(ToRenderer::ServiceReply {
+                                id,
+                                reply: ServiceReply::Dial(outcome),
+                            }))
+                            .is_err()
+                        {
+                            fail(&worker_alive, &worker_pending, &worker_kill);
+                        }
+                    });
+                }
+                ServiceCall::CookieGet { url } => {
+                    let Some(url) = authorize(&context.site, &url) else {
+                        return Err(RendererViolation);
+                    };
+                    let reply = ServiceReply::Cookie(context.fetch.cookies_for(&url));
+                    send_reply(&context.tx, id, reply)?;
+                }
+                ServiceCall::CookieSet { value, url } => {
+                    let Some(url) = authorize(&context.site, &url) else {
+                        return Err(RendererViolation);
+                    };
+                    context.fetch.set_cookie(&value, &url);
+                    send_reply(&context.tx, id, ServiceReply::Unit)?;
+                }
             }
-            ServiceCall::CookieSet { value, url } => {
-                let Some(url) = context.site.authorize(&url) else {
-                    return Err(RendererViolation);
-                };
-                context.fetch.set_cookie(&value, &url);
-                send_reply(&context.tx, id, ServiceReply::Unit)?;
-            }
-        },
+        }
     }
     Ok(())
+}
+
+fn has_assignment(subscribers: &EventSubscribers, assignment: RendererAssignmentId) -> bool {
+    subscribers
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .contains_key(&assignment)
+}
+
+fn authorize(site: &Mutex<Option<Site>>, spec: &str) -> Option<url::Url> {
+    site.lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .as_ref()
+        .and_then(|site| site.authorize(spec))
 }
 
 fn send_reply(
@@ -610,7 +902,7 @@ fn send_reply(
 
 fn fail(
     alive: &Arc<AtomicBool>,
-    pending: &Arc<Mutex<HashMap<u64, oneshot::Sender<Reply>>>>,
+    pending: &Arc<Mutex<HashMap<u64, PendingReply>>>,
     kill: &watch::Sender<bool>,
 ) {
     alive.store(false, Ordering::Relaxed);
@@ -618,7 +910,7 @@ fn fail(
     let _ = kill.send(true);
 }
 
-fn fail_pending(pending: &Arc<Mutex<HashMap<u64, oneshot::Sender<Reply>>>>) {
+fn fail_pending(pending: &Arc<Mutex<HashMap<u64, PendingReply>>>) {
     let mut pending = pending.lock().unwrap_or_else(PoisonError::into_inner);
     pending.clear();
 }

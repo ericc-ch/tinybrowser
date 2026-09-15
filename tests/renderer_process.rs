@@ -2,6 +2,8 @@
 
 mod common;
 
+use std::io::{Read, Write};
+use std::net::TcpListener;
 use std::time::{Duration, Instant};
 
 use common::Fixture;
@@ -203,7 +205,7 @@ fn close_interrupts_a_running_script_in_the_renderer_process() {
 }
 
 #[test]
-fn closing_an_opaque_page_reaps_its_renderer_process() {
+fn blank_targets_stay_virtual_and_idle_processes_collapse_to_one_spare() {
     let mut fixture = Fixture::new("tinybrowser-renderer");
     fixture.spawn_daemon();
     let _ = fixture.wait_json();
@@ -219,13 +221,21 @@ fn closing_an_opaque_page_reaps_its_renderer_process() {
     let before = renderer_children(daemon).len();
 
     let created = create(&mut client);
+    std::thread::sleep(Duration::from_millis(100));
+    assert_eq!(
+        renderer_children(daemon).len(),
+        before,
+        "creating a blank target must not consume the spare"
+    );
+
+    assert_eq!(eval(&mut client, &created, "2+2").unwrap(), "4");
     wait_for_renderer_count(daemon, before + 1, Duration::from_secs(5));
     close(&mut client, &created);
     wait_for_renderer_count(daemon, before, Duration::from_secs(5));
 
-    // The daemon's initial tab keeps its renderer; close it too.
+    // Closing the virtual initial tab leaves the manager's one unlocked spare.
     close(&mut client, &initial_targets[0]);
-    wait_for_renderer_count(daemon, 0, Duration::from_secs(5));
+    wait_for_renderer_count(daemon, before, Duration::from_secs(5));
 }
 
 #[test]
@@ -298,4 +308,70 @@ fn log_level_reaches_the_daemon_file() {
         "renderer ready record missing"
     );
     close(&mut client, &created);
+}
+
+#[test]
+fn same_site_assignments_share_only_after_the_process_budget() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let address = listener.local_addr().expect("address");
+    let server = std::thread::spawn(move || {
+        for _ in 0..2 {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut request = [0_u8; 1024];
+            let _ = stream.read(&mut request).expect("read request");
+            let body = b"<!doctype html><title>shared-site</title>";
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .expect("write head");
+            stream.write_all(body).expect("write body");
+        }
+    });
+
+    let mut fixture = Fixture::new("tinybrowser-renderer-budget");
+    fixture.spawn_daemon_with_env("TINYBROWSER_RENDERER_PROCESS_LIMIT", "1");
+    let _ = fixture.wait_json();
+    let daemon = daemon_pid(&fixture);
+    wait_for_renderer_count(daemon, 1, Duration::from_secs(5));
+    let mut client = fixture.connect();
+    let first = create(&mut client);
+    let second = create(&mut client);
+    let first_session = attach(&mut client, &first);
+    let second_session = attach(&mut client, &second);
+    for session in [&first_session, &second_session] {
+        client
+            .call("Page.enable", &json!({}), Some(session))
+            .expect("enable");
+        client
+            .call(
+                "Page.navigate",
+                &json!({"url": format!("http://{address}/")}),
+                Some(session),
+            )
+            .expect("navigate");
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut loaded = Vec::new();
+    while loaded.len() < 2 {
+        let event = client
+            .read_event(Duration::from_millis(500))
+            .expect("event read")
+            .expect("event");
+        if event["method"] == json!("Page.loadEventFired") {
+            loaded.push(event["sessionId"].as_str().expect("session").to_owned());
+        }
+        assert!(Instant::now() < deadline, "both assignments did not load");
+    }
+    assert_eq!(renderer_children(daemon).len(), 1);
+    assert_eq!(
+        eval(&mut client, &first, "window.marker = 41").unwrap(),
+        "41"
+    );
+    assert_eq!(
+        eval(&mut client, &second, "typeof window.marker").unwrap(),
+        "\"undefined\""
+    );
+    server.join().expect("server");
 }

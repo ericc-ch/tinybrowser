@@ -25,7 +25,7 @@ use crate::channel::{FrameKind, decode_control, read_frame};
 use crate::document::Stop;
 use crate::protocol::{
     BrowserServices, Command, DialCompletion, DialRequest, FromRenderer, RENDERER_INBOX_CAPACITY,
-    RENDERER_OUTBOX_CAPACITY, ServiceCall, ServiceReply, ToRenderer,
+    RENDERER_OUTBOX_CAPACITY, RendererAssignmentId, ServiceCall, ServiceReply, ToRenderer,
 };
 use tokio::sync::{Notify, mpsc};
 
@@ -60,6 +60,7 @@ async fn serve_async() -> io::Result<thread::JoinHandle<io::Result<()>>> {
             writer_wake.notify_one();
             let _ = writer_commands.try_send(RendererInput::Control(ToRenderer::Request {
                 id: 0,
+                assignment: RendererAssignmentId::new(0),
                 command: Command::Shutdown,
             }));
         }
@@ -148,11 +149,18 @@ fn read_messages(
                 logging::error!(target: "renderer::ipc", "duplicate handshake");
                 break;
             }
-            ToRenderer::Request { .. } if !greeted => {
+            ToRenderer::Assign { .. }
+            | ToRenderer::Release { .. }
+            | ToRenderer::Request { .. }
+            | ToRenderer::ResponseStart { .. }
+            | ToRenderer::ResponseEnd { .. }
+            | ToRenderer::ResponseError { .. }
+                if !greeted =>
+            {
                 logging::error!(target: "renderer::ipc", "request before handshake");
                 break;
             }
-            ToRenderer::Request { .. } => {
+            ToRenderer::Assign { .. } | ToRenderer::Release { .. } | ToRenderer::Request { .. } => {
                 let shutdown = matches!(
                     &message,
                     ToRenderer::Request {
@@ -180,12 +188,10 @@ fn read_messages(
                     return;
                 }
             }
-            ToRenderer::ResponseStart { .. } => {
+            ToRenderer::ResponseStart { .. }
+            | ToRenderer::ResponseEnd { .. }
+            | ToRenderer::ResponseError { .. } => {
                 logging::error!(target: "renderer::ipc", "response before handshake");
-                break;
-            }
-            ToRenderer::ResponseEnd { .. } | ToRenderer::ResponseError { .. } => {
-                logging::error!(target: "renderer::ipc", "response terminator before handshake");
                 break;
             }
             ToRenderer::ServiceReply { id, reply } => services.deliver(id, reply),
@@ -197,6 +203,7 @@ fn read_messages(
     wake.notify_one();
     let _ = command_tx.try_send(RendererInput::Control(ToRenderer::Request {
         id: 0,
+        assignment: RendererAssignmentId::new(0),
         command: Command::Shutdown,
     }));
 }
@@ -217,7 +224,7 @@ fn write_messages(
 }
 
 /// [`BrowserServices`] proxy that asks the browser process over the channel.
-struct ChannelServices {
+pub(crate) struct ChannelServices {
     out: SyncSender<FromRenderer>,
     pending: Mutex<HashMap<u64, PendingService>>,
     next: AtomicU64,
@@ -237,7 +244,7 @@ impl ChannelServices {
         }
     }
 
-    fn call(&self, call: ServiceCall) -> Option<ServiceReply> {
+    fn call(&self, assignment: RendererAssignmentId, call: ServiceCall) -> Option<ServiceReply> {
         let id = self.next.fetch_add(1, Ordering::Relaxed);
         let (reply_tx, reply_rx) = std_mpsc::channel();
         self.pending
@@ -246,7 +253,11 @@ impl ChannelServices {
             .insert(id, PendingService::Blocking(reply_tx));
         if self
             .out
-            .try_send(FromRenderer::ServiceCall { id, call })
+            .try_send(FromRenderer::ServiceCall {
+                assignment,
+                id,
+                call,
+            })
             .is_err()
         {
             self.pending
@@ -279,22 +290,40 @@ impl ChannelServices {
     }
 }
 
-impl BrowserServices for ChannelServices {
+pub(crate) struct AssignmentServices {
+    assignment: RendererAssignmentId,
+    channel: Arc<ChannelServices>,
+}
+
+impl AssignmentServices {
+    pub(crate) fn new(assignment: RendererAssignmentId, channel: Arc<ChannelServices>) -> Self {
+        Self {
+            assignment,
+            channel,
+        }
+    }
+}
+
+impl BrowserServices for AssignmentServices {
     fn start_dial(&self, request: DialRequest, completion: DialCompletion) {
-        let id = self.next.fetch_add(1, Ordering::Relaxed);
-        self.pending
+        let id = self.channel.next.fetch_add(1, Ordering::Relaxed);
+        self.channel
+            .pending
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .insert(id, PendingService::Dial(std::sync::Arc::clone(&completion)));
         if self
+            .channel
             .out
             .try_send(FromRenderer::ServiceCall {
+                assignment: self.assignment,
                 id,
                 call: ServiceCall::Dial(request),
             })
             .is_err()
         {
-            self.pending
+            self.channel
+                .pending
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .remove(&id);
@@ -303,18 +332,24 @@ impl BrowserServices for ChannelServices {
     }
 
     fn cookies_for(&self, url: &Url) -> String {
-        match self.call(ServiceCall::CookieGet {
-            url: url.to_string(),
-        }) {
+        match self.channel.call(
+            self.assignment,
+            ServiceCall::CookieGet {
+                url: url.to_string(),
+            },
+        ) {
             Some(ServiceReply::Cookie(value)) => value,
             _ => String::new(),
         }
     }
 
     fn set_cookie(&self, value: &str, url: &Url) {
-        let _result = self.call(ServiceCall::CookieSet {
-            value: value.to_owned(),
-            url: url.to_string(),
-        });
+        let _result = self.channel.call(
+            self.assignment,
+            ServiceCall::CookieSet {
+                value: value.to_owned(),
+                url: url.to_string(),
+            },
+        );
     }
 }
