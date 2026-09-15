@@ -1,0 +1,15 @@
+[package]
+name = "tinybrowser-wasm"
+version.workspace = true
+edition.workspace = true
+
+[lints]
+workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+renderer = { workspace = true }
+url = "2"
+wit-bindgen = "0.62"

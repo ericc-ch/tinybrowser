@@ -6,6 +6,7 @@ members = [
     "crates/logging",
     "crates/net",
     "crates/renderer",
+    "crates/wasm",
     "crates/webdriver",
 ]
 
