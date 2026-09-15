@@ -1,12 +1,14 @@
 use super::{CompletedDial, DialFail, QueuedDial};
 use crate::protocol::{DialKind, DialOutcome, DialRequest};
 
+#[cfg(not(target_os = "wasi"))]
 pub(crate) struct ResponseDecoder {
     content_type: Option<String>,
     pending: Vec<u8>,
     decoder: Option<encoding_rs::Decoder>,
 }
 
+#[cfg(not(target_os = "wasi"))]
 impl ResponseDecoder {
     pub(crate) fn new(content_type: Option<String>) -> Self {
         Self {
@@ -44,6 +46,7 @@ impl ResponseDecoder {
     }
 }
 
+#[cfg(not(target_os = "wasi"))]
 fn decode_chunk(decoder: &mut encoding_rs::Decoder, bytes: &[u8], last: bool) -> String {
     let mut output = String::with_capacity(
         decoder
@@ -72,6 +75,7 @@ fn decode_chunk(decoder: &mut encoding_rs::Decoder, bytes: &[u8], last: bool) ->
 
 // https://html.spec.whatwg.org/multipage/parsing.html#encoding-sniffing-algorithm
 // https://encoding.spec.whatwg.org/#concept-encoding-get
+#[cfg(not(target_os = "wasi"))]
 fn sniff_encoding(
     bytes: &[u8],
     content_type: Option<&str>,
@@ -92,6 +96,7 @@ fn sniff_encoding(
     (eof || bytes.len() >= 1024).then_some((encoding_rs::WINDOWS_1252, 0))
 }
 
+#[cfg(not(target_os = "wasi"))]
 fn bom_prefix(bytes: &[u8]) -> bool {
     [
         [0xEF, 0xBB, 0xBF].as_slice(),

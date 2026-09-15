@@ -23,7 +23,7 @@ use url::Url;
 use crate::channel::{FrameKind, decode_control, read_frame};
 use crate::document::Stop;
 use crate::protocol::{
-    BrowserServices, Command, DialCompletion, DialRequest, FromRenderer, RENDERER_INBOX_CAPACITY,
+    Command, DialCompletion, DialRequest, EngineHost, FromRenderer, RENDERER_INBOX_CAPACITY,
     RENDERER_OUTBOX_CAPACITY, RendererAssignmentId, ServiceCall, ServiceReply, ToRenderer,
 };
 use tokio::sync::{Notify, mpsc};
@@ -222,7 +222,7 @@ fn write_messages(
     Ok(())
 }
 
-/// [`BrowserServices`] proxy that asks the browser process over the channel.
+/// [`EngineHost`] proxy that asks the browser process over the channel.
 pub(crate) struct ChannelServices {
     out: SyncSender<FromRenderer>,
     pending: Mutex<HashMap<u64, PendingService>>,
@@ -303,7 +303,7 @@ impl AssignmentServices {
     }
 }
 
-impl BrowserServices for AssignmentServices {
+impl EngineHost for AssignmentServices {
     fn start_dial(&self, request: DialRequest, completion: DialCompletion) {
         let id = self.channel.next.fetch_add(1, Ordering::Relaxed);
         self.channel

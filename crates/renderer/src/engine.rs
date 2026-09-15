@@ -17,7 +17,7 @@ use crate::RemoteValue;
 use crate::document::{Document, Stop};
 use crate::documents::DocumentStore;
 use crate::js::{DocumentStreamCommand, FrameNavigation, RealmRegistry, SharedJsRuntime};
-use crate::protocol::{BrowserServices, FrameId, Mount, TabError, TabEvent};
+use crate::protocol::{EngineHost, FrameId, Mount, TabError, TabEvent};
 
 const MAX_FRAMES: usize = 64;
 
@@ -33,7 +33,7 @@ pub(crate) struct Engine {
     documents: Rc<RefCell<DocumentStore>>,
     /// Document ownership and the shared wrapper cache.
     registry: Rc<RefCell<RealmRegistry>>,
-    services: Arc<dyn BrowserServices>,
+    services: Arc<dyn EngineHost>,
     stop: Arc<Stop>,
     frames: BTreeMap<FrameId, Document>,
     child_frames: HashMap<dom::NodeId, (FrameId, FrameId)>,
@@ -42,11 +42,7 @@ pub(crate) struct Engine {
 }
 
 impl Engine {
-    pub(crate) fn new(
-        services: Arc<dyn BrowserServices>,
-        stop: Arc<Stop>,
-        wake: Arc<Notify>,
-    ) -> Self {
+    pub(crate) fn new(services: Arc<dyn EngineHost>, stop: Arc<Stop>, wake: Arc<Notify>) -> Self {
         let js_runtime = SharedJsRuntime::default();
         let documents = Rc::new(RefCell::new(DocumentStore::default()));
         let registry = Rc::new(RefCell::new(RealmRegistry::default()));
@@ -108,6 +104,7 @@ impl Engine {
         Ok(())
     }
 
+    #[cfg(not(target_os = "wasi"))]
     pub(crate) fn open_response(
         &mut self,
         response: &crate::protocol::ResponseStart,
@@ -122,6 +119,7 @@ impl Engine {
         Ok(())
     }
 
+    #[cfg(not(target_os = "wasi"))]
     pub(crate) fn write_response(&mut self, frame: FrameId, html: String) -> Result<(), TabError> {
         self.frame_mut(frame)
             .ok_or(TabError::UnknownFrame { frame: frame.get() })?
@@ -130,6 +128,7 @@ impl Engine {
         Ok(())
     }
 
+    #[cfg(not(target_os = "wasi"))]
     pub(crate) fn close_response(&mut self, frame: FrameId) -> Result<(), TabError> {
         self.frame_mut(frame)
             .ok_or(TabError::UnknownFrame { frame: frame.get() })?
@@ -391,6 +390,7 @@ impl Engine {
         }
     }
 
+    #[cfg(not(target_os = "wasi"))]
     pub(crate) fn release(&mut self) {
         for document in self.frames.values_mut() {
             document.release();

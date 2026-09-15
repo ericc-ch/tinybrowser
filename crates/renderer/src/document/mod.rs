@@ -17,13 +17,14 @@ use url::Url;
 use crate::ActiveParser;
 use crate::documents::DocumentStore;
 use crate::js::{DocumentStreamCommand, FrameNavigation, RealmRegistry, SharedJsRuntime, World};
-use crate::protocol::{BrowserServices, Mount, ScriptFailure, TabError, TabEvent};
+use crate::protocol::{EngineHost, Mount, ScriptFailure, TabError, TabEvent};
 
 mod dial;
 mod intern;
 mod pump;
 
 pub(crate) use crate::js::ScriptValue;
+#[cfg(not(target_os = "wasi"))]
 pub(crate) use dial::ResponseDecoder;
 
 const MAX_PENDING_JS_FETCHES: usize = 256;
@@ -80,7 +81,7 @@ struct Timer {
 
 /// One document: tree, task list, `QuickJS` realm, and browser services.
 pub(crate) struct Document {
-    services: Arc<dyn BrowserServices>,
+    services: Arc<dyn EngineHost>,
     world: Rc<RefCell<World>>,
     js_runtime: SharedJsRuntime,
     wake: Arc<Notify>,
@@ -116,7 +117,7 @@ impl Document {
     /// A document sharing its renderer process's `QuickJS` heap, wake handle,
     /// document store, and realm registry.
     pub(crate) fn with_shared(
-        services: Arc<dyn BrowserServices>,
+        services: Arc<dyn EngineHost>,
         js_runtime: SharedJsRuntime,
         wake: Arc<Notify>,
         documents: &Rc<RefCell<DocumentStore>>,
@@ -259,6 +260,7 @@ impl Document {
         self.start_document(&html);
     }
 
+    #[cfg(not(target_os = "wasi"))]
     pub(crate) fn open_response(&mut self, response: &crate::protocol::ResponseStart) {
         self.reset_js_realm();
         if let Ok(url) = Url::parse(&response.final_url) {
@@ -273,6 +275,7 @@ impl Document {
         self.active_parser = Some(ActiveParser::new(""));
     }
 
+    #[cfg(not(target_os = "wasi"))]
     pub(crate) fn write_response(&mut self, html: String) {
         if html.is_empty() {
             return;
@@ -285,6 +288,7 @@ impl Document {
         }
     }
 
+    #[cfg(not(target_os = "wasi"))]
     pub(crate) fn close_response(&mut self) {
         self.parser_eof = true;
         if !self.classic_fetch_in_flight {

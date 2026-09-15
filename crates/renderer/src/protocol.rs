@@ -426,14 +426,14 @@ pub struct DialOutcome {
 }
 
 /// Completion for a dial submitted to the browser process.
-pub(crate) type DialCompletion =
-    Arc<dyn Fn(Result<DialOutcome, DialFailure>) + Send + Sync + 'static>;
+pub type DialCompletion = Arc<dyn Fn(Result<DialOutcome, DialFailure>) + Send + Sync + 'static>;
 
-/// Host services the renderer reaches through the browser-process seam.
+/// Effects the page engine asks its host to perform.
 ///
-/// The renderer child implements this as a pipe proxy. Renderer code never
-/// names `net`.
-pub(crate) trait BrowserServices: Send + Sync + 'static {
+/// A native renderer process receives an implementation that forwards calls
+/// to the browser process. An embedded renderer receives an implementation
+/// from its caller. Renderer code never names `net`.
+pub trait EngineHost: Send + Sync + 'static {
     /// Submits one GET without blocking the renderer thread. The completion
     /// receives `None` for transport, timeout, queue, or body-limit failure.
     /// Implementations must invoke it exactly once, including when submission

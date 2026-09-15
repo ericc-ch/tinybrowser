@@ -6,9 +6,14 @@
 
 use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, HashSet};
+#[cfg(not(target_os = "wasi"))]
+use std::collections::HashMap;
+use std::collections::HashSet;
+#[cfg(not(target_os = "wasi"))]
 use std::sync::Arc;
+#[cfg(not(target_os = "wasi"))]
 use std::sync::mpsc::{SyncSender, TrySendError};
+#[cfg(not(target_os = "wasi"))]
 use std::time::Duration;
 
 use dom::{
@@ -22,8 +27,10 @@ use tendril::{StrTendril, TendrilSink};
 mod channel;
 mod document;
 mod documents;
+mod embedded;
 mod engine;
 mod js;
+#[cfg(not(target_os = "wasi"))]
 mod process;
 mod protocol;
 mod remote;
@@ -36,14 +43,18 @@ pub use channel::{
     read_frame_async, write_body, write_body_async, write_control, write_control_async,
     write_frame, write_frame_async,
 };
+#[cfg(not(target_os = "wasi"))]
 use document::Stop;
+pub use embedded::EmbeddedRenderer;
+#[cfg(not(target_os = "wasi"))]
 use engine::Engine;
+#[cfg(not(target_os = "wasi"))]
 pub use process::serve;
 pub use protocol::{
-    Command, DialFailure, DialKind, DialOutcome, DialRequest, FrameId, FromRenderer,
-    MAX_RESPONSE_BODY_BYTES, Mount, RENDERER_INBOX_CAPACITY, RENDERER_OUTBOX_CAPACITY,
-    RendererAssignmentId, Reply, ResourceLimit, ResponseStart, ScriptFailure, ServiceCall,
-    ServiceReply, TabError, TabEvent, ToRenderer,
+    Command, DialCompletion, DialFailure, DialKind, DialOutcome, DialRequest, EngineHost, FrameId,
+    FromRenderer, MAX_RESPONSE_BODY_BYTES, Mount, RENDERER_INBOX_CAPACITY,
+    RENDERER_OUTBOX_CAPACITY, RendererAssignmentId, Reply, ResourceLimit, ResponseStart,
+    ScriptFailure, ServiceCall, ServiceReply, TabError, TabEvent, ToRenderer,
 };
 pub use remote::RemoteValue;
 
@@ -170,6 +181,7 @@ fn fragment_context_name(spec: &str) -> QualName {
 }
 
 /// Runs the renderer loop until `Shutdown`, channel close, or stop.
+#[cfg(not(target_os = "wasi"))]
 pub(crate) async fn run(
     mut inbox: tokio::sync::mpsc::Receiver<process::RendererInput>,
     outbox: &SyncSender<FromRenderer>,
@@ -275,6 +287,7 @@ pub(crate) async fn run(
     }
 }
 
+#[cfg(not(target_os = "wasi"))]
 fn pump_engines(
     engines: &mut HashMap<RendererAssignmentId, Engine>,
     outbox: &SyncSender<FromRenderer>,
@@ -288,6 +301,7 @@ fn pump_engines(
     true
 }
 
+#[cfg(not(target_os = "wasi"))]
 struct ActiveResponse {
     assignment: RendererAssignmentId,
     frame: FrameId,
@@ -295,9 +309,11 @@ struct ActiveResponse {
     decoder: document::ResponseDecoder,
 }
 
+#[cfg(not(target_os = "wasi"))]
 #[derive(Default)]
 struct ResponseStreams(HashMap<u64, ActiveResponse>);
 
+#[cfg(not(target_os = "wasi"))]
 impl ResponseStreams {
     fn start(
         &mut self,
@@ -388,12 +404,14 @@ impl ResponseStreams {
     }
 }
 
+#[cfg(not(target_os = "wasi"))]
 fn stream_error(message: &str) -> TabError {
     TabError::RendererUnavailable {
         message: message.to_owned(),
     }
 }
 
+#[cfg(not(target_os = "wasi"))]
 async fn wait_for_deadline(deadline: Option<tokio::time::Instant>) {
     match deadline {
         Some(deadline) => tokio::time::sleep_until(deadline).await,
@@ -401,6 +419,7 @@ async fn wait_for_deadline(deadline: Option<tokio::time::Instant>) {
     }
 }
 
+#[cfg(not(target_os = "wasi"))]
 fn handle_command(
     engine: &mut Engine,
     command: Command,
@@ -425,6 +444,7 @@ fn handle_command(
     }
 }
 
+#[cfg(not(target_os = "wasi"))]
 fn publish(
     assignment: RendererAssignmentId,
     engine: &mut Engine,
@@ -448,6 +468,7 @@ fn publish(
     true
 }
 
+#[cfg(not(target_os = "wasi"))]
 fn send_to_browser(outbox: &SyncSender<FromRenderer>, message: FromRenderer) -> bool {
     match outbox.try_send(message) {
         Ok(()) => true,
