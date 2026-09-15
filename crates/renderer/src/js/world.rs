@@ -1,6 +1,6 @@
 //! Shared JS world for the renderer.
 
-use std::cell::{Ref, RefCell, RefMut};
+use std::cell::{Cell, Ref, RefCell, RefMut};
 use std::collections::{HashMap, HashSet};
 use std::rc::{Rc, Weak};
 use std::sync::Arc;
@@ -174,13 +174,34 @@ pub(crate) struct ReadyObserver {
 
 pub(crate) struct Listener {
     pub typ: String,
-    pub callback: Persistent<Function<'static>>,
+    pub callback: Option<Persistent<Value<'static>>>,
+    pub capture: bool,
+    pub once: bool,
+    pub passive: bool,
+    pub signal: Option<Persistent<Object<'static>>>,
+    /// Cleared when the listener is removed; a clone taken for dispatch still
+    /// sees the removal (<https://dom.spec.whatwg.org/#concept-event-listener>).
+    pub removed: Cell<bool>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum EventTargetKey {
     Window,
     Node(NodeId),
+    /// A constructible `EventTarget`, numbered per world.
+    Standalone(u64),
+}
+
+/// The current document readiness
+/// (<https://html.spec.whatwg.org/multipage/dom.html#current-document-readiness>).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReadyState {
+    /// The parser is still running.
+    Loading,
+    /// Parsing finished; `DOMContentLoaded` has fired.
+    Interactive,
+    /// The document is completely loaded; the `load` event has fired.
+    Complete,
 }
 
 pub(crate) struct World {
@@ -203,8 +224,11 @@ pub(crate) struct World {
     next_object_url: u64,
     pub parser_active: bool,
     pub current_script: Option<NodeId>,
-    pub document_ready: bool,
-    listeners: HashMap<EventTargetKey, Vec<Listener>>,
+    pub ready_state: ReadyState,
+    listeners: HashMap<EventTargetKey, Vec<Rc<Listener>>>,
+    /// The `EventTarget` object behind each `EventTargetKey::Standalone`.
+    standalone_targets: HashMap<u64, Persistent<Object<'static>>>,
+    next_standalone_target: u64,
     token_lists: HashMap<NodeId, Persistent<Value<'static>>>,
     named_node_maps: HashMap<NodeId, Persistent<Value<'static>>>,
     style_declarations: HashMap<NodeId, Persistent<Value<'static>>>,
@@ -273,8 +297,10 @@ impl World {
             next_object_url: 0,
             parser_active: false,
             current_script: None,
-            document_ready: false,
+            ready_state: ReadyState::Loading,
             listeners: HashMap::new(),
+            standalone_targets: HashMap::new(),
+            next_standalone_target: 0,
             token_lists: HashMap::new(),
             named_node_maps: HashMap::new(),
             style_declarations: HashMap::new(),
@@ -368,7 +394,7 @@ impl World {
         let id = self.documents.borrow_mut().insert(parsed);
         self.document = Some(id);
         self.owned.insert(id);
-        self.document_ready = false;
+        self.ready_state = ReadyState::Loading;
         self.current_script = None;
         self.listeners.clear();
         self.token_lists.clear();
@@ -585,12 +611,57 @@ impl World {
         }
     }
 
-    pub(crate) fn add_listener(&mut self, target: EventTargetKey, listener: Listener) {
+    pub(crate) fn add_listener(&mut self, target: EventTargetKey, listener: Rc<Listener>) {
         self.listeners.entry(target).or_default().push(listener);
+    }
+
+    /// A clone of one target's listener list, taken when dispatch invokes the
+    /// target (<https://dom.spec.whatwg.org/#concept-event-listener-invoke>).
+    pub(crate) fn listener_snapshot(&self, target: EventTargetKey) -> Vec<Rc<Listener>> {
+        self.listeners.get(&target).cloned().unwrap_or_default()
+    }
+
+    /// Drops one listener from a target's list; the listener's `removed` flag
+    /// is what a concurrent dispatch checks, so both happen together.
+    pub(crate) fn remove_listener(&mut self, target: EventTargetKey, listener: &Rc<Listener>) {
+        if let Some(list) = self.listeners.get_mut(&target) {
+            list.retain(|existing| !Rc::ptr_eq(existing, listener));
+        }
+    }
+
+    pub(crate) fn next_standalone_target(&mut self) -> u64 {
+        let id = self.next_standalone_target;
+        self.next_standalone_target = self.next_standalone_target.wrapping_add(1);
+        id
+    }
+
+    pub(crate) fn intern_standalone_target(
+        &mut self,
+        id: u64,
+        target: Persistent<Object<'static>>,
+    ) {
+        self.standalone_targets.insert(id, target);
+    }
+
+    pub(crate) fn standalone_target(&self, id: u64) -> Option<Persistent<Object<'static>>> {
+        self.standalone_targets.get(&id).cloned()
+    }
+
+    /// The parent of `id` in its tree, if any.
+    pub(crate) fn node_parent(&self, id: NodeId) -> Option<NodeId> {
+        self.document(id).and_then(|parsed| parsed.dom.parent(id))
+    }
+
+    /// Whether `id` is the root document node of its tree.
+    pub(crate) fn node_is_document(&self, id: NodeId) -> bool {
+        self.document(id)
+            .is_some_and(|parsed| parsed.dom.document() == id)
     }
 
     pub(crate) fn clear_listeners(&mut self) {
         self.listeners.clear();
+        self.standalone_targets.clear();
+        self.next_standalone_target = 0;
         self.token_lists.clear();
         self.named_node_maps.clear();
         self.style_declarations.clear();
@@ -656,20 +727,6 @@ impl World {
 
     pub(crate) fn brand(&self, name: &str) -> Option<Persistent<Object<'static>>> {
         self.brands.get(name).cloned()
-    }
-
-    pub(crate) fn listeners(
-        &self,
-        target: EventTargetKey,
-        typ: &str,
-    ) -> Vec<Persistent<Function<'static>>> {
-        self.listeners
-            .get(&target)
-            .into_iter()
-            .flatten()
-            .filter(|listener| listener.typ == typ)
-            .map(|listener| listener.callback.clone())
-            .collect()
     }
 }
 

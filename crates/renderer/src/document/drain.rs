@@ -94,7 +94,10 @@ impl Document {
             QueuedDial::JsFetch { .. } => false,
         }) || self.classic_fetch_in_flight
             || self.active_parser.is_some()
-            || !self.world.borrow().document_ready
+            || !matches!(
+                self.world.borrow().ready_state,
+                crate::js::ReadyState::Complete
+            )
     }
 
     fn launch_queued_dials(&mut self) {

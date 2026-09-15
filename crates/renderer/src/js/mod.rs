@@ -5,10 +5,11 @@
 //! uses `Function::call` on the renderer thread.
 
 mod bindings;
+mod events;
 mod intl;
 mod world;
 
-pub(crate) use world::{DocumentStreamCommand, FrameNavigation, RealmRegistry};
+pub(crate) use world::{DocumentStreamCommand, FrameNavigation, ReadyState, RealmRegistry};
 
 use std::cell::{Cell, OnceCell, RefCell};
 use std::fmt;
@@ -561,6 +562,18 @@ impl JsRealm {
             let fired: Result<(), JsError> = self
                 .context
                 .with(|ctx| bindings::fire_window_load(&ctx).map_err(JsError::engine));
+            let jobs = self.run_jobs();
+            fired.and(jobs)
+        })
+    }
+
+    /// Fires `DOMContentLoaded` at the document
+    /// (<https://html.spec.whatwg.org/multipage/parsing.html#the-end>).
+    pub(crate) fn fire_dom_content_loaded(&self) -> Result<(), JsError> {
+        self.with_budget(None, || {
+            let fired: Result<(), JsError> = self
+                .context
+                .with(|ctx| bindings::fire_dom_content_loaded(&ctx).map_err(JsError::engine));
             let jobs = self.run_jobs();
             fired.and(jobs)
         })
