@@ -5,17 +5,14 @@
 //! for `ws`/`wss`.
 
 mod client;
-mod cookie;
 mod error;
-mod initiator;
 mod protocol;
 mod resolve;
 mod transport;
 mod websocket;
 
 pub use client::{Agent, AgentBuilder, Body, RequestBuilder, Response};
-pub use cookie::{CookieRecord, CookieSameSite, site};
 pub use error::{LimitExceeded, NetError, ProtocolError, TimeoutKind, TransportError};
-pub use initiator::InitiatorKind;
 pub use protocol::{HeaderError, HeaderMap, InvalidMethod, Method};
+pub use tinybrowser_cookie::{CookieRecord, CookieSameSite, InitiatorKind, site};
 pub use websocket::{WebSocket, WsEvent, WsMessage};

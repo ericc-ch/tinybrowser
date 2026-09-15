@@ -2,6 +2,7 @@
 members = [
     "crates/browser",
     "crates/cdp",
+    "crates/cookies",
     "crates/dom",
     "crates/logging",
     "crates/net",
@@ -17,6 +18,7 @@ edition = "2024"
 [workspace.dependencies]
 browser = { path = "crates/browser" }
 cdp = { path = "crates/cdp" }
+tinybrowser-cookie = { path = "crates/cookies" }
 dom = { path = "crates/dom" }
 logging = { path = "crates/logging" }
 net = { path = "crates/net" }

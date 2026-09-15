@@ -5,14 +5,25 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use url::{Host, Url};
 
-use crate::initiator::InitiatorKind;
-use crate::protocol::Method;
-
 // https://httpwg.org/http-extensions/draft-ietf-httpbis-rfc6265bis.html#name-cookie-lifetime-limits
 const MAX_LIFETIME: Duration = Duration::from_hours(9600);
 // https://httpwg.org/http-extensions/draft-ietf-httpbis-rfc6265bis.html#name-storage-model
 const MAX_COOKIES_PER_DOMAIN: usize = 50;
 const MAX_COOKIES: usize = 3000;
+
+/// Which initiator owns an HTTP request.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum InitiatorKind {
+    /// Top-level navigation.
+    #[default]
+    Navigation,
+    /// Scripted `fetch()`.
+    Fetch,
+    /// Scripted `XMLHttpRequest`.
+    Xhr,
+    /// WebSocket handshake.
+    WsHandshake,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SameSite {
@@ -38,7 +49,7 @@ struct StoredCookie {
 }
 
 #[derive(Clone, Default)]
-pub(crate) struct CookieJar {
+pub struct CookieJar {
     cookies: Vec<StoredCookie>,
 }
 
@@ -51,24 +62,24 @@ impl fmt::Debug for CookieJar {
 }
 
 #[derive(Clone, Copy)]
-pub(crate) struct CookieOp<'a> {
+pub struct CookieOp<'a> {
     pub url: &'a Url,
     pub now: SystemTime,
     pub kind: RetrievalKind,
     pub initiator_kind: InitiatorKind,
-    pub method: &'a Method,
+    pub method_is_safe: bool,
     pub initiator: Option<&'a Url>,
     pub cross_site_redirect: bool,
 }
 
 #[derive(Clone, Copy)]
-pub(crate) enum RetrievalKind {
+pub enum RetrievalKind {
     Http,
     NonHttp,
 }
 
 impl CookieJar {
-    pub(crate) fn store(&mut self, set_cookie: &str, op: CookieOp<'_>) {
+    pub fn store(&mut self, set_cookie: &str, op: CookieOp<'_>) {
         let Some(parsed) = parse_set_cookie(set_cookie) else {
             return;
         };
@@ -82,7 +93,7 @@ impl CookieJar {
         self.evict_excess();
     }
 
-    pub(crate) fn cookie_string(&mut self, op: CookieOp<'_>) -> String {
+    pub fn cookie_string(&mut self, op: CookieOp<'_>) -> String {
         self.evict_expired(op.now);
         let Some(host) = canonicalize_host(op.url) else {
             return String::new();
@@ -140,7 +151,9 @@ impl CookieJar {
         }
     }
 
-    pub(crate) fn snapshot(&self) -> Vec<CookieRecord> {
+    /// Persistent cookies from the live jar. Session cookies are omitted.
+    #[must_use]
+    pub fn snapshot(&self) -> Vec<CookieRecord> {
         self.cookies
             .iter()
             .filter(|cookie| cookie.expiry.is_some())
@@ -160,7 +173,7 @@ impl CookieJar {
             .collect()
     }
 
-    pub(crate) fn restore(&mut self, records: Vec<CookieRecord>, now: SystemTime) {
+    pub fn restore(&mut self, records: Vec<CookieRecord>, now: SystemTime) {
         for record in records {
             if record.expiry.is_some_and(|expiry| expiry <= now) {
                 continue;
@@ -572,7 +585,7 @@ impl StoredCookie {
             self.same_site,
             op.is_same_site_request(),
             op.initiator_kind,
-            op.method,
+            op.method_is_safe,
         )
     }
 }
@@ -588,13 +601,13 @@ fn samesite_allows(
     same_site: SameSite,
     same_site_request: bool,
     initiator_kind: InitiatorKind,
-    method: &Method,
+    method_is_safe: bool,
 ) -> bool {
     match same_site {
         SameSite::None => true,
         SameSite::Strict => same_site_request,
         SameSite::Lax | SameSite::Default => {
-            same_site_request || (initiator_kind == InitiatorKind::Navigation && method.is_safe())
+            same_site_request || (initiator_kind == InitiatorKind::Navigation && method_is_safe)
         }
     }
 }
@@ -611,7 +624,13 @@ impl CookieOp<'_> {
     }
 }
 
-pub(crate) fn schemeful_same_site(a: &Url, b: &Url) -> bool {
+/// Whether two URLs share a site: same scheme and registrable domain.
+///
+/// Follows the `SameSite` definition in
+/// <https://httpwg.org/http-extensions/draft-ietf-httpbis-rfc6265bis.html#name-same-site-and-cross-site>.
+/// Opaque or non-HTTP(S) URLs are never same-site with anything.
+#[must_use]
+pub fn schemeful_same_site(a: &Url, b: &Url) -> bool {
     site_tuple(a) == site_tuple(b)
 }
 

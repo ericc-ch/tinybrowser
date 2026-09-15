@@ -1,0 +1,10 @@
+[package]
+name = "tinybrowser-cookie"
+version.workspace = true
+edition.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+url = "2"

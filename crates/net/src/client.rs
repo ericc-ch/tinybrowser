@@ -1,14 +1,14 @@
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
-use crate::cookie::{CookieJar, CookieOp, RetrievalKind};
+use crate::InitiatorKind;
 use crate::error::{LimitExceeded, NetError, ProtocolError, TimeoutKind, TransportError};
-use crate::initiator::InitiatorKind;
 use crate::protocol::{HeaderError, HeaderMap, Method};
 use crate::resolve::HostMap;
 use crate::transport::{CallBudget, HttpEngine, basic_authorization};
 use crate::websocket::{self, WebSocket};
 use http_body_util::BodyExt as _;
+use tinybrowser_cookie::{CookieJar, CookieOp, RetrievalKind};
 use url::Url;
 
 const DEFAULT_MAX_REDIRECTS: u32 = 20;
@@ -183,7 +183,7 @@ impl Agent {
                 now: (self.now)(),
                 kind: RetrievalKind::NonHttp,
                 initiator_kind: InitiatorKind::Fetch,
-                method: &Method::GET,
+                method_is_safe: true,
                 initiator: Some(uri),
                 cross_site_redirect: false,
             })
@@ -201,7 +201,7 @@ impl Agent {
                     now: (self.now)(),
                     kind: RetrievalKind::NonHttp,
                     initiator_kind: InitiatorKind::Fetch,
-                    method: &Method::GET,
+                    method_is_safe: true,
                     initiator: Some(uri),
                     cross_site_redirect: false,
                 },
@@ -243,7 +243,7 @@ impl Agent {
                 now: (self.now)(),
                 kind: RetrievalKind::Http,
                 initiator_kind,
-                method,
+                method_is_safe: method.is_safe(),
                 initiator,
                 cross_site_redirect,
             });
@@ -292,7 +292,7 @@ impl Agent {
                     now,
                     kind: RetrievalKind::Http,
                     initiator_kind,
-                    method,
+                    method_is_safe: method.is_safe(),
                     initiator,
                     cross_site_redirect,
                 },
@@ -465,7 +465,7 @@ impl RequestBuilder {
             }
 
             let next = resolve_location(&url, location)?;
-            cross_site_redirect |= !crate::cookie::schemeful_same_site(&url, &next);
+            cross_site_redirect |= !tinybrowser_cookie::schemeful_same_site(&url, &next);
             apply_redirect_policy(
                 response.status(),
                 &url,
