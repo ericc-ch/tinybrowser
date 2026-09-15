@@ -97,7 +97,7 @@ fn main() -> ExitCode {
 
 fn run(cli: &Cli) -> ExitCode {
     match &cli.command {
-        Some(Command::Renderer) => match renderer::serve() {
+        Some(Command::Renderer) => match browser::child::serve() {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
                 logging::error!(target: "renderer", "{error}");

@@ -10,7 +10,7 @@ use std::sync::Weak;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, PoisonError};
 
-use renderer::RendererAssignmentId;
+use crate::wire::RendererAssignmentId;
 use tokio::sync::Semaphore;
 
 use crate::link::{RendererAssignment, RendererHandle, spawn_process};

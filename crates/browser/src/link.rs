@@ -14,10 +14,11 @@ use tokio::process::Child;
 use crate::manager::RendererId;
 use crate::network::FetchHandle;
 use crate::site::Site;
-use renderer::{
-    Command as RendererCommand, FrameId, FromRenderer, Mount, RendererAssignmentId, Reply,
-    ResponseStart, ServiceCall, ServiceReply, TabError, TabEvent, ToRenderer,
+use crate::wire::{
+    Command as RendererCommand, FromRenderer, RendererAssignmentId, Reply, ResponseStart,
+    ServiceCall, ServiceReply, ToRenderer,
 };
+use renderer::{FrameId, Mount, TabError, TabEvent};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite};
 use tokio::process::Command;
 use tokio::sync::{mpsc, oneshot, watch};
@@ -119,7 +120,7 @@ pub(crate) struct ResponseWriter {
 
 impl ResponseWriter {
     pub(crate) async fn write(&self, payload: Vec<u8>) -> Result<(), TabError> {
-        if payload.len() > renderer::MAX_BODY_CHUNK_BYTES {
+        if payload.len() > crate::wire::channel::MAX_BODY_CHUNK_BYTES {
             return Err(TabError::RendererUnavailable {
                 message: "response chunk exceeds IPC limit".into(),
             });
@@ -288,7 +289,10 @@ impl RendererHandle {
         let response = self
             .start_response(assignment, frame, status, &mount)
             .await?;
-        for chunk in mount.body.chunks(renderer::MAX_BODY_CHUNK_BYTES) {
+        for chunk in mount
+            .body
+            .chunks(crate::wire::channel::MAX_BODY_CHUNK_BYTES)
+        {
             response.write(chunk.to_vec()).await?;
         }
         response.finish().await
@@ -433,10 +437,10 @@ pub(crate) async fn writer_task(
         };
         let result = match message {
             Outbound::Control(message) => {
-                renderer::write_control_async(&mut *writer, &message).await
+                crate::wire::channel::write_control_async(&mut *writer, &message).await
             }
             Outbound::Body { request, payload } => {
-                renderer::write_body_async(&mut *writer, request, &payload).await
+                crate::wire::channel::write_body_async(&mut *writer, request, &payload).await
             }
         };
         if result.is_err() {
@@ -454,7 +458,7 @@ pub(crate) async fn reader_task(
     let mut ready = ready;
     let mut buffer = Vec::new();
     loop {
-        let message = match renderer::read_control_async::<FromRenderer, _>(
+        let message = match crate::wire::channel::read_control_async::<FromRenderer, _>(
             &mut *reader,
             &mut buffer,
         )

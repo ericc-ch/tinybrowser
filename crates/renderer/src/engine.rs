@@ -116,19 +116,18 @@ impl Engine {
     /// # Errors
     ///
     /// [`TabError::UnknownFrame`] when the engine does not host the frame.
-    pub fn open_body(&mut self, response: &crate::protocol::ResponseStart) -> Result<(), TabError> {
-        self.remove_descendants(response.frame);
+    pub fn open_body(
+        &mut self,
+        frame: FrameId,
+        url: Option<&Url>,
+        content_type: Option<&str>,
+        content_language: Option<&str>,
+    ) -> Result<(), TabError> {
+        self.remove_descendants(frame);
         let document = self
-            .frame_mut(response.frame)
-            .ok_or(TabError::UnknownFrame {
-                frame: response.frame.get(),
-            })?;
-        let url = Url::parse(&response.final_url).ok();
-        document.begin_response(
-            url.as_ref(),
-            response.content_type.as_deref(),
-            response.content_language.as_deref(),
-        );
+            .frame_mut(frame)
+            .ok_or(TabError::UnknownFrame { frame: frame.get() })?;
+        document.begin_response(url, content_type, content_language);
         Ok(())
     }
 
@@ -191,6 +190,12 @@ impl Engine {
         result
     }
 
+    /// Removes and returns every pending event, with its frame.
+    ///
+    /// # Errors
+    ///
+    /// [`TabError::RendererUnavailable`] when a frame retained more events
+    /// than its limit; the queue empties and the excess is lost.
     pub fn take_events(&mut self) -> Result<Vec<(FrameId, TabEvent)>, TabError> {
         let mut events = Vec::new();
         for (&frame, document) in &mut self.frames {

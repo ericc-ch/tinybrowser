@@ -1,15 +1,22 @@
-//! `renderer` child transport: length-prefixed frames over the platform channel.
+//! The renderer *as a child process*: this crate's second role.
 //!
-//! The child is the same executable. On Unix the browser passes one end of an
-//! unnamed socket pair as file descriptor 0 and the child reads and writes that
-//! endpoint. Other platforms keep the stdin/stdout pipes until their platform
-//! channel lands. stderr stays for diagnostics.
+//! The child is the same executable re-executed with the `renderer` argument.
+//! On Unix the browser hands it one end of an unnamed socket pair as file
+//! descriptor 0; other platforms keep the stdin/stdout pipes. stderr stays for
+//! diagnostics, which `crate::link` forwards into the daemon's log.
 //!
-//! The renderer loop runs as a future on one current-thread Tokio runtime and
-//! owns every wait: commands, dial completions, timer deadlines, and shutdown.
-//! The reader and writer stay blocking threads because synchronous browser
-//! service calls (`document.cookie`) must make progress while the page engine
-//! runs.
+//! This module is child-side only. It must not reach for [`crate::link`],
+//! [`crate::manager`], [`crate::actor`], or [`crate::store`]: a renderer serves
+//! one process's pages and never acts as a browser. `serve` takes no handles
+//! for exactly that reason — everything it needs comes from fd 0 and the
+//! engine.
+//!
+//! The loop runs as a future on one current-thread Tokio runtime and owns every
+//! wait: commands, dial completions, timer deadlines, and shutdown. The reader
+//! and writer stay blocking threads because synchronous browser-service calls
+//! (`document.cookie`) must make progress while the page engine runs.
+
+mod session;
 
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
@@ -18,15 +25,15 @@ use std::sync::mpsc::{self as std_mpsc, Sender, SyncSender};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
 
+use renderer::{BrowserServices, DialCompletion, DialRequest, Stop};
+use tokio::sync::{Notify, mpsc};
 use url::Url;
 
-use crate::channel::{FrameKind, decode_control, read_frame};
-use crate::document::Stop;
-use crate::protocol::{
-    BrowserServices, Command, DialCompletion, DialRequest, FromRenderer, RENDERER_INBOX_CAPACITY,
-    RENDERER_OUTBOX_CAPACITY, RendererAssignmentId, ServiceCall, ServiceReply, ToRenderer,
+use crate::wire::channel::{FrameKind, decode_control, read_frame};
+use crate::wire::{
+    Command, FromRenderer, RENDERER_INBOX_CAPACITY, RENDERER_OUTBOX_CAPACITY, RendererAssignmentId,
+    ServiceCall, ServiceReply, ToRenderer,
 };
-use tokio::sync::{Notify, mpsc};
 
 /// Runs the renderer child until `Shutdown` or the channel closes.
 ///
@@ -80,7 +87,7 @@ async fn serve_async() -> io::Result<thread::JoinHandle<io::Result<()>>> {
             &reader_wake,
         );
     });
-    crate::run(command_rx, &out_tx, services, &stop, Arc::clone(&wake)).await;
+    session::run(command_rx, &out_tx, services, &stop, Arc::clone(&wake)).await;
     // The reader returns on `Shutdown`, dropping its `ChannelServices` clone, so
     // the writer channel closes and the child can exit.
     drop(out_tx);
@@ -217,7 +224,7 @@ fn write_messages(
     mut output: Box<dyn Write + Send>,
 ) -> io::Result<()> {
     for message in rx {
-        crate::write_control(&mut output, &message)?;
+        crate::wire::channel::write_control(&mut output, &message)?;
     }
     Ok(())
 }
@@ -281,7 +288,7 @@ impl ChannelServices {
             Some(PendingService::Dial(completion)) => match reply {
                 ServiceReply::Dial(outcome) => completion(outcome),
                 ServiceReply::Cookie(_) | ServiceReply::Unit => {
-                    completion(Err(crate::protocol::DialFailure::Connect));
+                    completion(Err(renderer::DialFailure::Connect));
                 }
             },
             None => {}
@@ -328,7 +335,7 @@ impl BrowserServices for AssignmentServices {
                 .unwrap_or_else(PoisonError::into_inner)
                 .remove(&id);
             if let Some(PendingService::Dial(completion)) = pending {
-                completion(Err(crate::protocol::DialFailure::Connect));
+                completion(Err(renderer::DialFailure::Connect));
             }
         }
     }

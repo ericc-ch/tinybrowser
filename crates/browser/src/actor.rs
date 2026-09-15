@@ -8,10 +8,8 @@ use std::future::pending;
 use std::sync::Arc;
 use std::time::Duration;
 
-use renderer::{
-    Command as RendererCommand, DialFailure, FrameId, Mount, RemoteValue, Reply, ResourceLimit,
-    TabError, TabEvent,
-};
+use crate::wire::{Command as RendererCommand, Reply};
+use renderer::{DialFailure, FrameId, Mount, RemoteValue, ResourceLimit, TabError, TabEvent};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, sleep_until, timeout};

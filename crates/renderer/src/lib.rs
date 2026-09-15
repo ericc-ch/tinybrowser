@@ -1,20 +1,15 @@
-//! Renderer crate: the page engine for one document — HTML parser,
-//! `Dom`, `QuickJS` — behind the value-only browser seam.
+//! Page engine for one document — HTML parser, `Dom`, `QuickJS` — behind the
+//! value-only browser seam.
 //!
-//! The renderer owns `Document` and never links `net`; the browser process
-//! owns `Tab`, the tab, navigation, network, and cookies.
+//! The engine owns `Document` and never links `net`; the browser process owns
+//! the tab, navigation, the network, and cookies. A carrier drives this crate:
+//! the browser's child transport on a native build, the WebAssembly component
+//! on a wasm build. Both feed the same [`Engine`], and both implement
+//! [`BrowserServices`] to supply effects.
 
 use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
-#[cfg(not(target_os = "wasi"))]
-use std::collections::HashMap;
 use std::collections::HashSet;
-#[cfg(not(target_os = "wasi"))]
-use std::sync::Arc;
-#[cfg(not(target_os = "wasi"))]
-use std::sync::mpsc::{SyncSender, TrySendError};
-#[cfg(not(target_os = "wasi"))]
-use std::time::Duration;
 
 use dom::{
     Attribute as DomAttribute, LocalName, Namespace, NodeId as Handle, NodeKind, QualName,
@@ -24,35 +19,22 @@ use html5ever::tree_builder::{ElementFlags, NodeOrText, QuirksMode, TreeSink};
 use markup5ever::interface::{TokenizerResult, tree_builder::ElemName};
 use tendril::{StrTendril, TendrilSink};
 
-mod channel;
 mod document;
 mod documents;
 mod embedded;
 mod engine;
 mod js;
-#[cfg(not(target_os = "wasi"))]
-mod process;
 mod protocol;
 mod remote;
 mod serialize;
 mod xml;
 
-pub use channel::{
-    Frame, FrameKind, HEADER_BYTES, MAX_BODY_CHUNK_BYTES, MAX_CONTROL_BYTES, PROTOCOL_VERSION,
-    decode_control, read_body, read_body_async, read_control, read_control_async, read_frame,
-    read_frame_async, write_body, write_body_async, write_control, write_control_async,
-    write_frame, write_frame_async,
-};
 pub use document::Stop;
 pub use embedded::EmbeddedRenderer;
 pub use engine::Engine;
-#[cfg(not(target_os = "wasi"))]
-pub use process::serve;
 pub use protocol::{
-    BrowserServices, Command, DialCompletion, DialFailure, DialKind, DialOutcome, DialRequest,
-    FrameId, FromRenderer, MAX_RESPONSE_BODY_BYTES, Mount, RENDERER_INBOX_CAPACITY,
-    RENDERER_OUTBOX_CAPACITY, RendererAssignmentId, Reply, ResourceLimit, ResponseStart,
-    ScriptFailure, ServiceCall, ServiceReply, TabError, TabEvent, ToRenderer,
+    BrowserServices, DialCompletion, DialFailure, DialKind, DialOutcome, DialRequest, FrameId,
+    MAX_RESPONSE_BODY_BYTES, Mount, ResourceLimit, ScriptFailure, TabError, TabEvent,
 };
 pub use remote::RemoteValue;
 
@@ -175,297 +157,6 @@ fn fragment_context_name(spec: &str) -> QualName {
         QualName::new(None, Namespace::from(MATHML), LocalName::from(local))
     } else {
         QualName::new(None, html_namespace(), LocalName::from(spec))
-    }
-}
-
-/// Runs the renderer loop until `Shutdown`, channel close, or stop.
-#[cfg(not(target_os = "wasi"))]
-pub(crate) async fn run(
-    mut inbox: tokio::sync::mpsc::Receiver<process::RendererInput>,
-    outbox: &SyncSender<FromRenderer>,
-    services: Arc<process::ChannelServices>,
-    stop: &Arc<Stop>,
-    wake: Arc<tokio::sync::Notify>,
-) {
-    let mut engines = HashMap::<RendererAssignmentId, Engine>::new();
-    let mut responses = ResponseStreams::default();
-    loop {
-        if !drain_engines(&mut engines, outbox) || stop.is_set() {
-            stop.request();
-            break;
-        }
-        let deadline = engines.values().filter_map(Engine::next_deadline).min();
-        tokio::select! {
-            received = inbox.recv() => match received {
-                Some(process::RendererInput::Control(ToRenderer::Assign { assignment })) => {
-                    if engines.contains_key(&assignment) {
-                        stop.request();
-                        break;
-                    }
-                    let assignment_services = Arc::new(process::AssignmentServices::new(
-                        assignment,
-                        Arc::clone(&services),
-                    ));
-                    engines.insert(
-                        assignment,
-                        Engine::new(assignment_services, Arc::clone(stop), Arc::clone(&wake)),
-                    );
-                }
-                Some(process::RendererInput::Control(ToRenderer::Release { assignment })) => {
-                    responses.release(assignment);
-                    if let Some(mut engine) = engines.remove(&assignment) {
-                        engine.release();
-                    }
-                }
-                Some(process::RendererInput::Control(ToRenderer::Request { id, assignment, command })) => {
-                    let Some(engine) = engines.get_mut(&assignment) else {
-                        if matches!(command, Command::Shutdown) {
-                            stop.request();
-                            break;
-                        }
-                        stop.request();
-                        break;
-                    };
-                    let (reply, shutdown) = handle_command(engine, command, stop);
-                    if !send_to_browser(outbox, FromRenderer::Reply { id, assignment, reply }) {
-                        stop.request();
-                        break;
-                    }
-                    if shutdown {
-                        break;
-                    }
-                }
-                Some(process::RendererInput::Control(ToRenderer::ResponseStart { id, response })) => {
-                    let Some(engine) = engines.get_mut(&response.assignment) else {
-                        stop.request();
-                        break;
-                    };
-                    if responses.start(id, response, engine).is_err() {
-                        stop.request();
-                        break;
-                    }
-                }
-                Some(process::RendererInput::Body { request, bytes }) => {
-                    if responses.push(request, &bytes, &mut engines).is_err() {
-                        stop.request();
-                        break;
-                    }
-                }
-                Some(process::RendererInput::Control(ToRenderer::ResponseEnd { id })) => {
-                    let (assignment, result) = responses.finish(id, &mut engines);
-                    let reply = Reply::Unit(result);
-                    if !send_to_browser(outbox, FromRenderer::Reply { id, assignment, reply }) {
-                        stop.request();
-                        break;
-                    }
-                }
-                Some(process::RendererInput::Control(ToRenderer::ResponseError { id, failure })) => {
-                    let (assignment, result) = responses.abort(id, failure);
-                    let reply = Reply::Unit(result);
-                    if !send_to_browser(outbox, FromRenderer::Reply { id, assignment, reply }) {
-                        stop.request();
-                        break;
-                    }
-                }
-                // The transport consumes the handshake, response stream, and
-                // service replies; none reaches this loop.
-                Some(
-                    process::RendererInput::Control(
-                        ToRenderer::Hello | ToRenderer::ServiceReply { .. },
-                    ),
-                ) => {}
-                None => break,
-            },
-            () = wake.notified() => {}
-            () = wait_for_deadline(deadline) => {}
-        }
-    }
-    for (_, mut engine) in engines {
-        engine.shutdown();
-    }
-}
-
-#[cfg(not(target_os = "wasi"))]
-fn drain_engines(
-    engines: &mut HashMap<RendererAssignmentId, Engine>,
-    outbox: &SyncSender<FromRenderer>,
-) -> bool {
-    for (assignment, engine) in engines {
-        engine.drain_ready();
-        if !publish(*assignment, engine, outbox) {
-            return false;
-        }
-    }
-    true
-}
-
-#[cfg(not(target_os = "wasi"))]
-struct ActiveResponse {
-    assignment: RendererAssignmentId,
-    frame: FrameId,
-    bytes: usize,
-}
-
-#[cfg(not(target_os = "wasi"))]
-#[derive(Default)]
-struct ResponseStreams(HashMap<u64, ActiveResponse>);
-
-#[cfg(not(target_os = "wasi"))]
-impl ResponseStreams {
-    fn start(
-        &mut self,
-        id: u64,
-        response: ResponseStart,
-        engine: &mut Engine,
-    ) -> Result<(), TabError> {
-        if self.0.contains_key(&id) {
-            return Err(stream_error("duplicate response start"));
-        }
-        engine.open_body(&response)?;
-        self.0.insert(
-            id,
-            ActiveResponse {
-                assignment: response.assignment,
-                frame: response.frame,
-                bytes: 0,
-            },
-        );
-        Ok(())
-    }
-
-    fn push(
-        &mut self,
-        id: u64,
-        bytes: &[u8],
-        engines: &mut HashMap<RendererAssignmentId, Engine>,
-    ) -> Result<(), TabError> {
-        let response = self
-            .0
-            .get_mut(&id)
-            .ok_or_else(|| stream_error("body frame without response start"))?;
-        response.bytes = response.bytes.saturating_add(bytes.len());
-        if response.bytes > MAX_RESPONSE_BODY_BYTES {
-            return Err(stream_error("streamed response exceeds body limit"));
-        }
-        engines
-            .get_mut(&response.assignment)
-            .ok_or_else(|| stream_error("response assignment is gone"))?
-            .write_body(response.frame, bytes)
-    }
-
-    fn finish(
-        &mut self,
-        id: u64,
-        engines: &mut HashMap<RendererAssignmentId, Engine>,
-    ) -> (RendererAssignmentId, Result<(), TabError>) {
-        let Some(response) = self.0.remove(&id) else {
-            return (
-                RendererAssignmentId::new(0),
-                Err(stream_error("response end without start")),
-            );
-        };
-        let assignment = response.assignment;
-        let result = engines
-            .get_mut(&assignment)
-            .ok_or_else(|| stream_error("response assignment is gone"))
-            .and_then(|engine| engine.end_body(response.frame));
-        (assignment, result)
-    }
-
-    fn abort(
-        &mut self,
-        id: u64,
-        failure: DialFailure,
-    ) -> (RendererAssignmentId, Result<(), TabError>) {
-        let Some(response) = self.0.remove(&id) else {
-            return (
-                RendererAssignmentId::new(0),
-                Err(stream_error("response error without start")),
-            );
-        };
-        (
-            response.assignment,
-            Err(stream_error(&format!(
-                "streamed response failed: {failure:?}"
-            ))),
-        )
-    }
-
-    fn release(&mut self, assignment: RendererAssignmentId) {
-        self.0
-            .retain(|_, response| response.assignment != assignment);
-    }
-}
-
-#[cfg(not(target_os = "wasi"))]
-fn stream_error(message: &str) -> TabError {
-    TabError::RendererUnavailable {
-        message: message.to_owned(),
-    }
-}
-
-#[cfg(not(target_os = "wasi"))]
-async fn wait_for_deadline(deadline: Option<tokio::time::Instant>) {
-    match deadline {
-        Some(deadline) => tokio::time::sleep_until(deadline).await,
-        None => std::future::pending().await,
-    }
-}
-
-#[cfg(not(target_os = "wasi"))]
-fn handle_command(
-    engine: &mut Engine,
-    command: Command,
-    stop: &Arc<document::Stop>,
-) -> (Reply, bool) {
-    match command {
-        Command::Mount { frame, mount } => (Reply::Unit(engine.mount_frame(frame, &mount)), false),
-        Command::Eval { frame, source } => (Reply::Text(engine.eval_in(frame, &source)), false),
-        Command::ExecuteScript {
-            frame,
-            source,
-            timeout_ms,
-        } => {
-            let timeout = timeout_ms.map(Duration::from_millis);
-            let value = engine.execute_remote_in(frame, &source, timeout);
-            (Reply::Value(value), false)
-        }
-        Command::Shutdown => {
-            stop.request();
-            (Reply::Unit(Ok(())), true)
-        }
-    }
-}
-
-#[cfg(not(target_os = "wasi"))]
-fn publish(
-    assignment: RendererAssignmentId,
-    engine: &mut Engine,
-    outbox: &SyncSender<FromRenderer>,
-) -> bool {
-    let Ok(events) = engine.take_events() else {
-        return false;
-    };
-    for (frame, event) in events {
-        if !send_to_browser(
-            outbox,
-            FromRenderer::Event {
-                assignment,
-                frame,
-                event,
-            },
-        ) {
-            return false;
-        }
-    }
-    true
-}
-
-#[cfg(not(target_os = "wasi"))]
-fn send_to_browser(outbox: &SyncSender<FromRenderer>, message: FromRenderer) -> bool {
-    match outbox.try_send(message) {
-        Ok(()) => true,
-        Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) => false,
     }
 }
 
