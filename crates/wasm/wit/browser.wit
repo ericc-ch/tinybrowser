@@ -51,9 +51,15 @@ interface types {
         /// HTTP status of this exchange, unreduced. A 3xx status is reported
         /// as such so the component can decide whether to follow it.
         status: u16,
-        /// Absolute URL of this exchange's response, when the host knows one
-        /// that differs from the request URL. The component falls back to the
-        /// request URL, so an empty value is safe.
+        /// Absolute URL the response bytes came from, when the host knows one
+        /// that differs from `fetch-request.url`.
+        ///
+        /// The component stores this exchange's `set-cookies` against it and
+        /// measures the cross-site taint from the request URL to it, so a host
+        /// that followed redirects itself must report the landing URL or its
+        /// cookies would be filed under the site it started from. The
+        /// component falls back to the request URL, so an empty value is safe
+        /// only when no redirect happened.
         final-url: string,
         /// `Content-Type` header, when the transport exposes it.
         content-type: option<string>,
@@ -103,8 +109,12 @@ interface host {
     /// 3xx status and its `Location` are reported back, and the component
     /// decides whether to ask for another exchange with a new request. A host
     /// that cannot see redirects, such as a browser `fetch` without an
-    /// intermediary, may follow them itself and report the final response; the
-    /// component then sees a status it does not follow and uses that response.
+    /// intermediary, may follow them itself and report the final response,
+    /// whose `final-url` and `set-cookies` must then describe that last
+    /// exchange; the component sees a status it does not follow, attributes
+    /// the response to `final-url`, and uses it. That fallback cannot carry
+    /// cookies honestly, because such a host can neither set `Cookie` nor read
+    /// `Set-Cookie`.
     ///
     /// A `true` answer obligates the host to call `engine.complete-fetch`
     /// exactly once for this `id`, unless the component cancels it first. The

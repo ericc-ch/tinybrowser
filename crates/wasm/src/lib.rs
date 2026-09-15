@@ -65,9 +65,14 @@ impl Guest for Component {
         match result {
             Err(error) => completion(Err(decode_fetch_error(error))),
             Ok(response) => {
-                // Store before following: the next hop's cookie header depends
-                // on this response, and its own taint.
-                store_hop_cookies(&chain, &response);
+                // A host that cannot see redirects answers with the exchange
+                // it ended on, so attribute this response to the URL it
+                // reports. Storing it against the requested hop would file one
+                // site's cookies under another's name. Store before following:
+                // the next hop's header depends on this response.
+                let source = reported_url(&chain, &response);
+                chain.cross_site_redirect |= !schemeful_same_site(&chain.url, &source);
+                store_hop_cookies(&source, &chain, &response);
                 match next_hop(&chain, &response) {
                     Ok(Some(next)) => {
                         chain.followed = chain.followed.saturating_add(1);
@@ -278,10 +283,22 @@ fn cookie_header(chain: &Chain) -> String {
     })
 }
 
-/// Stores one hop's `Set-Cookie` lines against the hop's own URL.
+/// Where a response came from, as far as the host can say.
+///
+/// The hop URL unless the host reports a different final URL, which is how a
+/// host that followed redirects itself tells us the bytes are not from the
+/// hop we asked for.
+fn reported_url(chain: &Chain, response: &FetchResponse) -> Url {
+    Url::parse(&response.final_url)
+        .ok()
+        .filter(|url| matches!(url.scheme(), "http" | "https"))
+        .unwrap_or_else(|| chain.url.clone())
+}
+
+/// Stores one exchange's `Set-Cookie` lines against the URL that sent them.
 ///
 /// <https://httpwg.org/http-extensions/draft-ietf-httpbis-rfc6265bis.html#name-the-set-cookie-header-field>
-fn store_hop_cookies(chain: &Chain, response: &FetchResponse) {
+fn store_hop_cookies(url: &Url, chain: &Chain, response: &FetchResponse) {
     if response.set_cookies.is_empty() {
         return;
     }
@@ -291,7 +308,7 @@ fn store_hop_cookies(chain: &Chain, response: &FetchResponse) {
         jar.store(
             line,
             CookieOp {
-                url: &chain.url,
+                url,
                 now,
                 kind: RetrievalKind::Http,
                 initiator_kind: InitiatorKind::Fetch,
