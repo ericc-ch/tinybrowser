@@ -586,3 +586,16 @@ profile.
 Plain `http://` requests through a proxy use CONNECT rather than browser
 absolute-form proxying, and WebSocket dials ignore `--resolve`; both are
 recorded as open P8 follow-ups in the migration ledger.
+
+## Milestone: streamed renderer responses, P9 (2026-09-15)
+
+P9 moves top-level document bodies out of JSON control messages. The browser
+sends `ResponseStart`, bounded raw body frames, and `ResponseEnd`; the renderer
+transport collects at most 1 MiB before forwarding the mount to the page
+engine. The IPC ABI version is now 2. Command: `nix develop --command cargo
+build --release --bin tinybrowser`; rustc 1.98.0, stripped x86_64 release
+profile.
+
+| Artifact | After P8 | After P9 | Delta | Headroom to 10,000,000 |
+| --- | ---: | ---: | ---: | ---: |
+| CLI (`target/release/tinybrowser`) | 7,349,216 | 7,368,096 | **+18,880** | 2,631,904 |

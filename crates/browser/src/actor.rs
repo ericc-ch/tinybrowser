@@ -404,7 +404,7 @@ impl Tab {
             content_language: None,
             body: html.as_bytes().to_vec(),
         };
-        self.mount(&site, mount).await
+        self.mount(&site, 200, mount).await
     }
 
     fn goto(&mut self, spec: &str) -> Result<(), TabError> {
@@ -449,14 +449,14 @@ impl Tab {
         Ok(())
     }
 
-    async fn mount(&mut self, site: &Site, mount: Mount) -> Result<(), TabError> {
+    async fn mount(&mut self, site: &Site, status: u16, mount: Mount) -> Result<(), TabError> {
         self.ensure_renderer(site).await?;
         self.document_loaded = false;
         let result = self
-            .renderer_request(RendererCommand::Mount {
-                frame: FrameId::MAIN,
-                mount,
-            })
+            .renderer
+            .as_ref()
+            .ok_or(TabError::ActorStopped)?
+            .mount(FrameId::MAIN, status, mount)
             .await
             .and_then(reply_unit);
         if result.is_err() {
@@ -493,13 +493,9 @@ impl Tab {
         let initiator = nav.initiator.clone();
         self.cancel_dial();
         let (cancel, cancel_rx) = watch::channel(false);
-        let guard = self.fetch.dial_navigation(
-            epoch,
-            url,
-            initiator,
-            self.dial_tx.clone(),
-            cancel_rx,
-        );
+        let guard =
+            self.fetch
+                .dial_navigation(epoch, url, initiator, self.dial_tx.clone(), cancel_rx);
         self.dial_cancel = Some(cancel);
         self.dial_guard = Some(guard);
         if let Some(nav) = self.nav.as_mut() {
@@ -556,7 +552,7 @@ impl Tab {
             content_language: outcome.content_language,
             body: outcome.body,
         };
-        if self.mount(&site, mount).await.is_err() {
+        if self.mount(&site, outcome.status, mount).await.is_err() {
             self.navigation_failed = true;
             return false;
         }

@@ -24,7 +24,7 @@ use serde::{Serialize, de::DeserializeOwned};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// Framing and message ABI version for the renderer channel.
-pub const PROTOCOL_VERSION: u8 = 1;
+pub const PROTOCOL_VERSION: u8 = 2;
 
 /// Fixed frame header size in bytes.
 pub const HEADER_BYTES: usize = 16;
@@ -252,9 +252,7 @@ pub async fn read_control_async<T: DeserializeOwned, R: AsyncRead + Unpin + ?Siz
         Some(Frame {
             kind: FrameKind::Control,
             ..
-        }) => serde_json::from_slice(buffer)
-            .map(Some)
-            .map_err(|error| invalid(format!("invalid renderer IPC JSON: {error}"))),
+        }) => decode_control(buffer).map(Some),
         Some(_) => Err(invalid("expected a control frame")),
     }
 }
@@ -292,9 +290,7 @@ pub fn read_control<T: DeserializeOwned>(
         Some(Frame {
             kind: FrameKind::Control,
             ..
-        }) => serde_json::from_slice(buffer)
-            .map(Some)
-            .map_err(|error| invalid(format!("invalid renderer IPC JSON: {error}"))),
+        }) => decode_control(buffer).map(Some),
         Some(_) => Err(invalid("expected a control frame")),
     }
 }
@@ -313,6 +309,16 @@ pub fn read_body(reader: &mut impl Read, buffer: &mut Vec<u8>) -> io::Result<Opt
         }) => Ok(Some(request)),
         Some(_) => Err(invalid("expected a body frame")),
     }
+}
+
+/// Decodes one control-frame payload after its frame header has been read.
+///
+/// # Errors
+///
+/// Invalid JSON or a payload that does not match `T`.
+pub fn decode_control<T: DeserializeOwned>(payload: &[u8]) -> io::Result<T> {
+    serde_json::from_slice(payload)
+        .map_err(|error| invalid(format!("invalid renderer IPC JSON: {error}")))
 }
 
 fn read_exact(reader: &mut impl Read, buffer: &mut [u8]) -> io::Result<()> {

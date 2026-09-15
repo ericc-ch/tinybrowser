@@ -33,18 +33,19 @@ mod xml;
 
 pub use channel::{
     Frame, FrameKind, HEADER_BYTES, MAX_BODY_CHUNK_BYTES, MAX_CONTROL_BYTES, PROTOCOL_VERSION,
-    read_body, read_body_async, read_control, read_control_async, read_frame, read_frame_async,
-    write_body, write_body_async, write_control, write_control_async, write_frame,
-    write_frame_async,
+    decode_control, read_body, read_body_async, read_control, read_control_async, read_frame,
+    read_frame_async, write_body, write_body_async, write_control, write_control_async,
+    write_frame, write_frame_async,
 };
 use document::Stop;
 use engine::Engine;
 pub use process::serve;
 use protocol::BrowserServices;
 pub use protocol::{
-    Command, DialFailure, DialKind, DialOutcome, DialRequest, FrameId, FromRenderer, Mount,
-    RENDERER_INBOX_CAPACITY, RENDERER_OUTBOX_CAPACITY, Reply, ResourceLimit, ScriptFailure,
-    ServiceCall, ServiceReply, TabError, TabEvent, ToRenderer,
+    Command, DialFailure, DialKind, DialOutcome, DialRequest, FrameId, FromRenderer,
+    MAX_RESPONSE_BODY_BYTES, Mount, RENDERER_INBOX_CAPACITY, RENDERER_OUTBOX_CAPACITY, Reply,
+    ResourceLimit, ResponseStart, ScriptFailure, ServiceCall, ServiceReply, TabError, TabEvent,
+    ToRenderer,
 };
 pub use remote::RemoteValue;
 
@@ -201,9 +202,15 @@ pub(crate) async fn run(
                         break;
                     }
                 }
-                // The transport consumes the handshake and routes service
-                // replies; neither reaches this loop.
-                Some(ToRenderer::Hello | ToRenderer::ServiceReply { .. }) => {}
+                // The transport consumes the handshake, response stream, and
+                // service replies; none reaches this loop.
+                Some(
+                    ToRenderer::Hello
+                    | ToRenderer::ResponseStart { .. }
+                    | ToRenderer::ResponseEnd { .. }
+                    | ToRenderer::ResponseError { .. }
+                    | ToRenderer::ServiceReply { .. },
+                ) => {}
                 None => break,
             },
             () = wake.notified() => {}

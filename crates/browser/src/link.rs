@@ -14,8 +14,8 @@ use std::time::Duration;
 use crate::network::FetchHandle;
 use crate::site::Site;
 use renderer::{
-    Command as RendererCommand, FrameId, FromRenderer, Reply, ServiceCall, ServiceReply, TabError,
-    TabEvent, ToRenderer,
+    Command as RendererCommand, FrameId, FromRenderer, Mount, Reply, ResponseStart, ServiceCall,
+    ServiceReply, TabError, TabEvent, ToRenderer,
 };
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite};
 use tokio::process::{Child, Command};
@@ -48,9 +48,14 @@ struct RendererId(u64);
 /// Live subscribers to one renderer's frame-tagged document events.
 type EventSubscribers = Arc<Mutex<Vec<mpsc::Sender<(FrameId, TabEvent)>>>>;
 
+enum Outbound {
+    Control(ToRenderer),
+    Body { request: u64, payload: Vec<u8> },
+}
+
 /// Value-only handle to one renderer.
 pub(crate) struct RendererHandle {
-    tx: mpsc::Sender<ToRenderer>,
+    tx: mpsc::Sender<Outbound>,
     pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Reply>>>>,
     alive: Arc<AtomicBool>,
     subscribers: EventSubscribers,
@@ -78,7 +83,74 @@ impl RendererHandle {
         }
         if self
             .tx
-            .send(ToRenderer::Request { id, command })
+            .send(Outbound::Control(ToRenderer::Request { id, command }))
+            .await
+            .is_err()
+        {
+            self.remove_pending(id);
+            return Err(TabError::ActorStopped);
+        }
+        if let Ok(Ok(reply)) = timeout(REQUEST_TIMEOUT, reply_rx).await {
+            Ok(reply)
+        } else {
+            self.remove_pending(id);
+            Err(TabError::ActorStopped)
+        }
+    }
+
+    /// Streams one top-level response to the renderer and waits for its mount
+    /// result. The body is carried only in bounded raw IPC frames.
+    pub(crate) async fn mount(
+        &self,
+        frame: FrameId,
+        status: u16,
+        mount: Mount,
+    ) -> Result<Reply, TabError> {
+        let id = self.next_request.fetch_add(1, Ordering::Relaxed);
+        let (reply_tx, reply_rx) = oneshot::channel();
+        {
+            let mut pending = self.pending.lock().unwrap_or_else(PoisonError::into_inner);
+            if !self.alive.load(Ordering::Relaxed) {
+                return Err(TabError::ActorStopped);
+            }
+            pending.insert(id, reply_tx);
+        }
+        let start = ResponseStart {
+            frame,
+            status,
+            final_url: mount.url,
+            content_type: mount.content_type,
+            content_language: mount.content_language,
+        };
+        if self
+            .tx
+            .send(Outbound::Control(ToRenderer::ResponseStart {
+                id,
+                response: start,
+            }))
+            .await
+            .is_err()
+        {
+            self.remove_pending(id);
+            return Err(TabError::ActorStopped);
+        }
+        for chunk in mount.body.chunks(renderer::MAX_BODY_CHUNK_BYTES) {
+            if self
+                .tx
+                .send(Outbound::Body {
+                    request: id,
+                    payload: chunk.to_vec(),
+                })
+                .await
+                .is_err()
+            {
+                self.remove_pending(id);
+                return Err(TabError::ActorStopped);
+            }
+        }
+        if self
+            .tx
+            .send(Outbound::Control(ToRenderer::ResponseEnd { id }))
             .await
             .is_err()
         {
@@ -110,10 +182,10 @@ impl RendererHandle {
 
     /// Asks the renderer loop to stop without waiting.
     pub(crate) fn request_shutdown(&self) {
-        let _ = self.tx.try_send(ToRenderer::Request {
+        let _ = self.tx.try_send(Outbound::Control(ToRenderer::Request {
             id: 0,
             command: RendererCommand::Shutdown,
-        });
+        }));
     }
 
     /// Stops the renderer and waits for its transport tasks.
@@ -244,7 +316,7 @@ async fn spawn_process(
         let _ = child.start_kill();
         return Err(io::Error::other("renderer stderr missing"));
     };
-    let (tx, rx) = mpsc::channel::<ToRenderer>(COMMAND_CAPACITY);
+    let (tx, rx) = mpsc::channel::<Outbound>(COMMAND_CAPACITY);
     let (kill, kill_rx) = watch::channel(false);
     let pending = Arc::new(Mutex::new(HashMap::new()));
     let alive = Arc::new(AtomicBool::new(true));
@@ -272,7 +344,7 @@ async fn spawn_process(
     // Detached child task: it reaps the child when the channel closes or the
     // handle signals a kill. Dropping every kill sender also stops it.
     let _reaper = tokio::spawn(child_task(child, kill_rx));
-    if tx.send(ToRenderer::Hello).await.is_err()
+    if tx.send(Outbound::Control(ToRenderer::Hello)).await.is_err()
         || timeout(HANDSHAKE_TIMEOUT, ready_rx).await != Ok(Ok(true))
     {
         let _ = kill.send(true);
@@ -309,7 +381,7 @@ async fn child_task(mut child: Child, mut kill: watch::Receiver<bool>) {
 
 /// Shared route state for one renderer's reader task.
 struct ReaderContext {
-    tx: mpsc::Sender<ToRenderer>,
+    tx: mpsc::Sender<Outbound>,
     pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Reply>>>>,
     alive: Arc<AtomicBool>,
     subscribers: EventSubscribers,
@@ -319,7 +391,7 @@ struct ReaderContext {
 }
 
 async fn writer_task(
-    mut rx: mpsc::Receiver<ToRenderer>,
+    mut rx: mpsc::Receiver<Outbound>,
     mut writer: Box<dyn AsyncWrite + Send + Unpin>,
     alive: Arc<AtomicBool>,
     pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Reply>>>>,
@@ -334,10 +406,15 @@ async fn writer_task(
             },
             _ = kill_rx.changed() => return,
         };
-        if renderer::write_control_async(&mut *writer, &message)
-            .await
-            .is_err()
-        {
+        let result = match message {
+            Outbound::Control(message) => {
+                renderer::write_control_async(&mut *writer, &message).await
+            }
+            Outbound::Body { request, payload } => {
+                renderer::write_body_async(&mut *writer, request, &payload).await
+            }
+        };
+        if result.is_err() {
             fail(&alive, &pending, &kill);
             return;
         }
@@ -428,12 +505,14 @@ fn route(message: FromRenderer, context: &ReaderContext) -> Result<(), RendererV
                 let worker_kill = context.kill.clone();
                 let cancel = context.kill.subscribe();
                 tokio::spawn(async move {
-                    let outcome = worker_fetch.dial_request(&request, &initiator, cancel).await;
+                    let outcome = worker_fetch
+                        .dial_request(&request, &initiator, cancel)
+                        .await;
                     if worker_tx
-                        .try_send(ToRenderer::ServiceReply {
+                        .try_send(Outbound::Control(ToRenderer::ServiceReply {
                             id,
                             reply: ServiceReply::Dial(outcome),
-                        })
+                        }))
                         .is_err()
                     {
                         fail(&worker_alive, &worker_pending, &worker_kill);
@@ -460,11 +539,11 @@ fn route(message: FromRenderer, context: &ReaderContext) -> Result<(), RendererV
 }
 
 fn send_reply(
-    tx: &mpsc::Sender<ToRenderer>,
+    tx: &mpsc::Sender<Outbound>,
     id: u64,
     reply: ServiceReply,
 ) -> Result<(), RendererViolation> {
-    tx.try_send(ToRenderer::ServiceReply { id, reply })
+    tx.try_send(Outbound::Control(ToRenderer::ServiceReply { id, reply }))
         .map_err(|_| RendererViolation)
 }
 

@@ -18,6 +18,9 @@ pub const RENDERER_INBOX_CAPACITY: usize = 256;
 /// Maximum renderer-to-browser messages retained by one renderer transport.
 pub const RENDERER_OUTBOX_CAPACITY: usize = 4096;
 
+/// Maximum aggregate bytes retained for one streamed response.
+pub const MAX_RESPONSE_BODY_BYTES: usize = 1_048_576;
+
 /// Renderer-process identity of one frame.
 ///
 /// [ADR 0014](../../../docs/adrs/0014-frames-and-per-frame-realms.md): the
@@ -201,6 +204,7 @@ pub struct Mount {
     /// HTTP `Content-Language`, when the document came from the network.
     pub content_language: Option<String>,
     /// Raw document bytes; the renderer decodes them.
+    #[serde(skip, default)]
     pub body: Vec<u8>,
 }
 
@@ -227,6 +231,26 @@ pub enum ToRenderer {
         /// The command.
         command: Command,
     },
+    /// Starts a streamed top-level response. Raw body frames with the same id
+    /// follow before [`ToRenderer::ResponseEnd`].
+    ResponseStart {
+        /// Request id chosen by the browser process.
+        id: u64,
+        /// Response metadata needed to mount the completed body.
+        response: ResponseStart,
+    },
+    /// Completes a streamed top-level response.
+    ResponseEnd {
+        /// Request id from [`ToRenderer::ResponseStart`].
+        id: u64,
+    },
+    /// Aborts a streamed top-level response.
+    ResponseError {
+        /// Request id from [`ToRenderer::ResponseStart`].
+        id: u64,
+        /// Typed transport failure.
+        failure: DialFailure,
+    },
     /// Answer to a [`ServiceCall`].
     ServiceReply {
         /// Service-call id chosen by the renderer.
@@ -234,6 +258,21 @@ pub enum ToRenderer {
         /// The answer.
         reply: ServiceReply,
     },
+}
+
+/// Metadata sent before the raw bytes of a top-level response.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ResponseStart {
+    /// Frame that will receive the document.
+    pub frame: FrameId,
+    /// Final HTTP status.
+    pub status: u16,
+    /// Final URL after redirects.
+    pub final_url: String,
+    /// HTTP `Content-Type`, when present.
+    pub content_type: Option<String>,
+    /// HTTP `Content-Language`, when present.
+    pub content_language: Option<String>,
 }
 
 /// Renderer to host traffic.
@@ -480,6 +519,21 @@ mod tests {
                 id: 6,
                 command: Command::Shutdown,
             },
+            ToRenderer::ResponseStart {
+                id: 10,
+                response: ResponseStart {
+                    frame: FrameId::MAIN,
+                    status: 200,
+                    final_url: "http://example.test/".into(),
+                    content_type: Some("text/html".into()),
+                    content_language: None,
+                },
+            },
+            ToRenderer::ResponseEnd { id: 10 },
+            ToRenderer::ResponseError {
+                id: 11,
+                failure: DialFailure::Timeout,
+            },
             ToRenderer::ServiceReply {
                 id: 7,
                 reply: ServiceReply::Cookie("a=1".into()),
@@ -502,6 +556,24 @@ mod tests {
         for message in messages {
             round_trip(&message);
         }
+    }
+
+    #[test]
+    fn mount_body_is_not_part_of_control_json() {
+        let message = ToRenderer::Request {
+            id: 1,
+            command: Command::Mount {
+                frame: FrameId::MAIN,
+                mount: Mount {
+                    url: "http://example.test/".into(),
+                    content_type: Some("text/html".into()),
+                    content_language: None,
+                    body: vec![1, 2, 3],
+                },
+            },
+        };
+        let value = serde_json::to_value(message).expect("serialize");
+        assert!(value.pointer("/Request/command/Mount/mount/body").is_none());
     }
 
     #[test]
