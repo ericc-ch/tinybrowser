@@ -6333,11 +6333,11 @@ mod realm_tests {
     use super::{world, wrap_node};
     use crate::document::Stop;
     use crate::js::{JsRealm, SharedJsRuntime, World};
-    use crate::protocol::{DialCompletion, DialRequest, EngineHost};
+    use crate::protocol::{BrowserServices, DialCompletion, DialRequest};
 
     struct NullServices;
 
-    impl EngineHost for NullServices {
+    impl BrowserServices for NullServices {
         fn start_dial(&self, _request: DialRequest, completion: DialCompletion) {
             completion(Err(crate::protocol::DialFailure::Connect));
         }
@@ -6350,7 +6350,7 @@ mod realm_tests {
     }
 
     fn world_with_document(
-        services: &Arc<dyn EngineHost>,
+        services: &Arc<dyn BrowserServices>,
         documents: &Rc<RefCell<crate::documents::DocumentStore>>,
         registry: &Rc<RefCell<crate::js::RealmRegistry>>,
         url: &str,
@@ -6370,7 +6370,7 @@ mod realm_tests {
 
     #[test]
     fn realms_share_a_heap_and_resolve_their_own_world() {
-        let services: Arc<dyn EngineHost> = Arc::new(NullServices);
+        let services: Arc<dyn BrowserServices> = Arc::new(NullServices);
         let shared = SharedJsRuntime::default();
         let stop = Arc::new(Stop::new());
         let documents = Rc::new(RefCell::new(crate::documents::DocumentStore::default()));
@@ -6430,7 +6430,7 @@ mod realm_tests {
 
     #[test]
     fn wrappers_are_shared_with_the_owner_realms_prototypes() {
-        let services: Arc<dyn EngineHost> = Arc::new(NullServices);
+        let services: Arc<dyn BrowserServices> = Arc::new(NullServices);
         let shared = SharedJsRuntime::default();
         let stop = Arc::new(Stop::new());
         let documents = Rc::new(RefCell::new(crate::documents::DocumentStore::default()));

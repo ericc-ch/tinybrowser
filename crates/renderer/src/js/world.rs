@@ -11,7 +11,7 @@ use url::Url;
 
 use crate::Parsed;
 use crate::documents::DocumentStore;
-use crate::protocol::EngineHost;
+use crate::protocol::BrowserServices;
 
 /// Renderer-process realm bookkeeping shared by every frame.
 ///
@@ -193,7 +193,7 @@ pub(crate) struct World {
     /// Document ids this realm created; only these feed its observers.
     owned: HashSet<u32>,
     pub document_url: Url,
-    pub services: Arc<dyn EngineHost>,
+    pub services: Arc<dyn BrowserServices>,
     pub pending_cancels: Vec<i32>,
     pub pending_html_writes: Vec<String>,
     frame_navigations: Vec<FrameNavigation>,
@@ -252,7 +252,7 @@ impl Drop for World {
 
 impl World {
     pub(crate) fn new(
-        services: Arc<dyn EngineHost>,
+        services: Arc<dyn BrowserServices>,
         document_url: Url,
         documents: Rc<RefCell<DocumentStore>>,
         registry: &Rc<RefCell<RealmRegistry>>,

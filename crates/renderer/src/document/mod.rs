@@ -17,7 +17,7 @@ use url::Url;
 use crate::ActiveParser;
 use crate::documents::DocumentStore;
 use crate::js::{DocumentStreamCommand, FrameNavigation, RealmRegistry, SharedJsRuntime, World};
-use crate::protocol::{EngineHost, Mount, ScriptFailure, TabError, TabEvent};
+use crate::protocol::{BrowserServices, Mount, ScriptFailure, TabError, TabEvent};
 
 mod dial;
 mod intern;
@@ -81,7 +81,7 @@ struct Timer {
 
 /// One document: tree, task list, `QuickJS` realm, and browser services.
 pub(crate) struct Document {
-    services: Arc<dyn EngineHost>,
+    services: Arc<dyn BrowserServices>,
     world: Rc<RefCell<World>>,
     js_runtime: SharedJsRuntime,
     wake: Arc<Notify>,
@@ -117,7 +117,7 @@ impl Document {
     /// A document sharing its renderer process's `QuickJS` heap, wake handle,
     /// document store, and realm registry.
     pub(crate) fn with_shared(
-        services: Arc<dyn EngineHost>,
+        services: Arc<dyn BrowserServices>,
         js_runtime: SharedJsRuntime,
         wake: Arc<Notify>,
         documents: &Rc<RefCell<DocumentStore>>,
@@ -247,17 +247,19 @@ impl Document {
 
     /// Replaces the document from a host mount: new realm, decoded bytes,
     /// parsed to load. The host has already dialed and chosen this renderer.
-    pub(crate) fn mount(&mut self, mount: &Mount) {
+    pub(crate) fn mount(&mut self, mount: &Mount) -> Result<(), TabError> {
+        let url = Url::parse(&mount.url).map_err(|_| TabError::InvalidUrl {
+            spec: mount.url.clone(),
+        })?;
         self.reset_js_realm();
         let html = dial::decode_html(&mount.body, mount.content_type.as_deref());
-        if let Ok(url) = Url::parse(&mount.url) {
-            self.url = url;
-        }
+        self.url = url;
         self.content_language.clone_from(&mount.content_language);
         let mut world = self.world.borrow_mut();
         world.document_url = self.url.clone();
         drop(world);
         self.start_document(&html);
+        Ok(())
     }
 
     #[cfg(not(target_os = "wasi"))]

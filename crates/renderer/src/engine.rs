@@ -17,7 +17,7 @@ use crate::RemoteValue;
 use crate::document::{Document, Stop};
 use crate::documents::DocumentStore;
 use crate::js::{DocumentStreamCommand, FrameNavigation, RealmRegistry, SharedJsRuntime};
-use crate::protocol::{EngineHost, FrameId, Mount, TabError, TabEvent};
+use crate::protocol::{BrowserServices, FrameId, Mount, TabError, TabEvent};
 
 const MAX_FRAMES: usize = 64;
 
@@ -33,7 +33,7 @@ pub(crate) struct Engine {
     documents: Rc<RefCell<DocumentStore>>,
     /// Document ownership and the shared wrapper cache.
     registry: Rc<RefCell<RealmRegistry>>,
-    services: Arc<dyn EngineHost>,
+    services: Arc<dyn BrowserServices>,
     stop: Arc<Stop>,
     frames: BTreeMap<FrameId, Document>,
     child_frames: HashMap<dom::NodeId, (FrameId, FrameId)>,
@@ -42,7 +42,11 @@ pub(crate) struct Engine {
 }
 
 impl Engine {
-    pub(crate) fn new(services: Arc<dyn EngineHost>, stop: Arc<Stop>, wake: Arc<Notify>) -> Self {
+    pub(crate) fn new(
+        services: Arc<dyn BrowserServices>,
+        stop: Arc<Stop>,
+        wake: Arc<Notify>,
+    ) -> Self {
         let js_runtime = SharedJsRuntime::default();
         let documents = Rc::new(RefCell::new(DocumentStore::default()));
         let registry = Rc::new(RefCell::new(RealmRegistry::default()));
@@ -95,11 +99,11 @@ impl Engine {
     ///
     /// [`TabError::UnknownFrame`] when the engine does not host `frame`.
     pub(crate) fn mount_frame(&mut self, frame: FrameId, mount: &Mount) -> Result<(), TabError> {
-        self.remove_descendants(frame);
         let document = self
             .frame_mut(frame)
             .ok_or(TabError::UnknownFrame { frame: frame.get() })?;
-        document.mount(mount);
+        document.mount(mount)?;
+        self.remove_descendants(frame);
         self.reconcile_frames();
         Ok(())
     }

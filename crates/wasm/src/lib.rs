@@ -3,7 +3,10 @@
 use std::cell::RefCell;
 use std::sync::Arc;
 
-use renderer::{DialCompletion, DialFailure, DialRequest, EmbeddedRenderer, EngineHost, Mount};
+use renderer::{
+    BrowserServices, DialCompletion, DialFailure, DialRequest, EmbeddedRenderer, Mount,
+    TabEvent as RendererEvent,
+};
 use url::Url;
 
 #[expect(
@@ -15,11 +18,11 @@ use url::Url;
 mod bindings {
     use super::Component;
 
-    wit_bindgen::generate!({ world: "demo" });
+    wit_bindgen::generate!({ world: "browser" });
     export!(Component with_types_in self);
 }
 
-use bindings::exports::tinybrowser::demo::engine::{Guest, GuestTab};
+use bindings::exports::tinybrowser::browser::engine::{Event, FrameEvent, Guest, GuestTab};
 
 struct Component;
 
@@ -28,39 +31,60 @@ impl Guest for Component {
 }
 
 struct Tab {
-    renderer: RefCell<Option<EmbeddedRenderer>>,
-    mount_error: Option<String>,
+    renderer: RefCell<EmbeddedRenderer>,
 }
 
 impl GuestTab for Tab {
-    fn new(url: String, html: String) -> Self {
-        let mut renderer = EmbeddedRenderer::new(Arc::new(DemoHost));
+    fn new(url: String, html: String) -> Result<Self, String> {
+        let mut renderer = EmbeddedRenderer::new(Arc::new(OfflineHost));
         let mount = Mount {
             url,
             content_type: Some("text/html; charset=utf-8".into()),
             content_language: None,
             body: html.into_bytes(),
         };
-        match renderer.mount(&mount) {
-            Ok(()) => Self {
-                renderer: RefCell::new(Some(renderer)),
-                mount_error: None,
-            },
-            Err(error) => Self {
-                renderer: RefCell::new(None),
-                mount_error: Some(error.to_string()),
-            },
-        }
+        renderer.mount(&mount).map_err(|error| error.to_string())?;
+        Ok(Self {
+            renderer: RefCell::new(renderer),
+        })
     }
 
     fn eval(&self, source: String) -> Result<String, String> {
         self.with_renderer(|renderer| renderer.eval(&source))
     }
 
-    fn pump(&self) {
-        if let Some(renderer) = self.renderer.borrow_mut().as_mut() {
-            renderer.pump_ready();
-        }
+    fn pump(&self) -> Option<u64> {
+        let mut renderer = self.renderer.borrow_mut();
+        renderer.pump_ready();
+        renderer.time_until_deadline().map(|delay| {
+            let milliseconds = delay.as_nanos().saturating_add(999_999) / 1_000_000;
+            u64::try_from(milliseconds).unwrap_or(u64::MAX)
+        })
+    }
+
+    fn events(&self) -> Result<Vec<FrameEvent>, String> {
+        self.renderer
+            .borrow_mut()
+            .take_events()
+            .map(|events| {
+                events
+                    .into_iter()
+                    .map(|(frame, event)| FrameEvent {
+                        frame: frame.get(),
+                        event: match event {
+                            RendererEvent::Load => Event::Load,
+                            RendererEvent::ChildLoad => Event::ChildLoad,
+                            RendererEvent::Navigated => Event::Navigated,
+                            RendererEvent::NavigationFailed => Event::NavigationFailed,
+                            RendererEvent::Timer(id) => Event::Timer(id),
+                            RendererEvent::Fetch { status } => Event::Fetch(status),
+                            RendererEvent::FetchFailed => Event::FetchFailed,
+                            RendererEvent::ScriptFailed => Event::ScriptFailed,
+                        },
+                    })
+                    .collect()
+            })
+            .map_err(|error| error.to_string())
     }
 
     fn title(&self) -> Result<String, String> {
@@ -79,20 +103,13 @@ impl Tab {
         &self,
         operation: impl FnOnce(&mut EmbeddedRenderer) -> Result<String, renderer::TabError>,
     ) -> Result<String, String> {
-        let mut renderer = self.renderer.borrow_mut();
-        match renderer.as_mut() {
-            Some(renderer) => operation(renderer).map_err(|error| error.to_string()),
-            None => Err(self
-                .mount_error
-                .clone()
-                .unwrap_or_else(|| "renderer is unavailable".into())),
-        }
+        operation(&mut self.renderer.borrow_mut()).map_err(|error| error.to_string())
     }
 }
 
-struct DemoHost;
+struct OfflineHost;
 
-impl EngineHost for DemoHost {
+impl BrowserServices for OfflineHost {
     fn start_dial(&self, _request: DialRequest, completion: DialCompletion) {
         completion(Err(DialFailure::Connect));
     }

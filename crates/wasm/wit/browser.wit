@@ -1,0 +1,32 @@
+package tinybrowser:browser@0.1.0;
+
+interface engine {
+    variant event {
+        load,
+        child-load,
+        navigated,
+        navigation-failed,
+        timer(u32),
+        fetch(u16),
+        fetch-failed,
+        script-failed,
+    }
+
+    record frame-event {
+        frame: u64,
+        event: event,
+    }
+
+    resource tab {
+        constructor(url: string, html: string) -> result<tab, string>;
+        eval: func(source: string) -> result<string, string>;
+        pump: func() -> option<u64>;
+        events: func() -> result<list<frame-event>, string>;
+        title: func() -> result<string, string>;
+        text: func() -> result<string, string>;
+    }
+}
+
+world browser {
+    export engine;
+}

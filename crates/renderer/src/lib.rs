@@ -51,8 +51,8 @@ use engine::Engine;
 #[cfg(not(target_os = "wasi"))]
 pub use process::serve;
 pub use protocol::{
-    Command, DialCompletion, DialFailure, DialKind, DialOutcome, DialRequest, EngineHost, FrameId,
-    FromRenderer, MAX_RESPONSE_BODY_BYTES, Mount, RENDERER_INBOX_CAPACITY,
+    BrowserServices, Command, DialCompletion, DialFailure, DialKind, DialOutcome, DialRequest,
+    FrameId, FromRenderer, MAX_RESPONSE_BODY_BYTES, Mount, RENDERER_INBOX_CAPACITY,
     RENDERER_OUTBOX_CAPACITY, RendererAssignmentId, Reply, ResourceLimit, ResponseStart,
     ScriptFailure, ServiceCall, ServiceReply, TabError, TabEvent, ToRenderer,
 };

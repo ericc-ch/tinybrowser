@@ -23,7 +23,7 @@ use url::Url;
 use crate::channel::{FrameKind, decode_control, read_frame};
 use crate::document::Stop;
 use crate::protocol::{
-    Command, DialCompletion, DialRequest, EngineHost, FromRenderer, RENDERER_INBOX_CAPACITY,
+    BrowserServices, Command, DialCompletion, DialRequest, FromRenderer, RENDERER_INBOX_CAPACITY,
     RENDERER_OUTBOX_CAPACITY, RendererAssignmentId, ServiceCall, ServiceReply, ToRenderer,
 };
 use tokio::sync::{Notify, mpsc};
@@ -222,7 +222,7 @@ fn write_messages(
     Ok(())
 }
 
-/// [`EngineHost`] proxy that asks the browser process over the channel.
+/// [`BrowserServices`] proxy that asks the browser process over the channel.
 pub(crate) struct ChannelServices {
     out: SyncSender<FromRenderer>,
     pending: Mutex<HashMap<u64, PendingService>>,
@@ -303,14 +303,14 @@ impl AssignmentServices {
     }
 }
 
-impl EngineHost for AssignmentServices {
+impl BrowserServices for AssignmentServices {
     fn start_dial(&self, request: DialRequest, completion: DialCompletion) {
         let id = self.channel.next.fetch_add(1, Ordering::Relaxed);
         self.channel
             .pending
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .insert(id, PendingService::Dial(std::sync::Arc::clone(&completion)));
+            .insert(id, PendingService::Dial(completion));
         if self
             .channel
             .out
@@ -321,12 +321,15 @@ impl EngineHost for AssignmentServices {
             })
             .is_err()
         {
-            self.channel
+            let pending = self
+                .channel
                 .pending
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .remove(&id);
-            completion(Err(crate::protocol::DialFailure::Connect));
+            if let Some(PendingService::Dial(completion)) = pending {
+                completion(Err(crate::protocol::DialFailure::Connect));
+            }
         }
     }
 

@@ -7,23 +7,25 @@ use tokio::sync::Notify;
 
 use crate::document::Stop;
 use crate::engine::Engine;
-use crate::{EngineHost, FrameId, Mount, RemoteValue, TabError, TabEvent};
+use crate::{BrowserServices, FrameId, Mount, RemoteValue, TabError, TabEvent};
 
 /// One renderer hosted directly in its caller's process.
 pub struct EmbeddedRenderer {
     engine: Engine,
     stop: Arc<Stop>,
+    wake: Arc<Notify>,
 }
 
 impl EmbeddedRenderer {
     /// Creates a renderer whose external effects are handled by `host`.
     #[must_use]
-    pub fn new(host: Arc<dyn EngineHost>) -> Self {
+    pub fn new(host: Arc<dyn BrowserServices>) -> Self {
         let stop = Arc::new(Stop::new());
         let wake = Arc::new(Notify::new());
         Self {
-            engine: Engine::new(host, Arc::clone(&stop), wake),
+            engine: Engine::new(host, Arc::clone(&stop), Arc::clone(&wake)),
             stop,
+            wake,
         }
     }
 
@@ -71,10 +73,9 @@ impl EmbeddedRenderer {
     /// # Errors
     ///
     /// The retained event limit was exceeded.
-    pub fn take_events(&mut self) -> Result<Vec<TabEvent>, TabError> {
+    pub fn take_events(&mut self) -> Result<Vec<(FrameId, TabEvent)>, TabError> {
         self.engine
             .take_events()
-            .map(|events| events.into_iter().map(|(_, event)| event).collect())
             .map_err(|()| TabError::RendererUnavailable {
                 message: "embedded renderer event queue overflowed".into(),
             })
@@ -86,6 +87,19 @@ impl EmbeddedRenderer {
         self.engine
             .next_deadline()
             .map(|deadline| deadline.saturating_duration_since(tokio::time::Instant::now()))
+    }
+
+    /// Waits until a host completion or page timer may be pumped.
+    pub async fn wait_until_ready(&self) {
+        match self.engine.next_deadline() {
+            Some(deadline) => {
+                tokio::select! {
+                    () = self.wake.notified() => {}
+                    () = tokio::time::sleep_until(deadline) => {}
+                }
+            }
+            None => self.wake.notified().await,
+        }
     }
 }
 

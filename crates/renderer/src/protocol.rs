@@ -4,7 +4,6 @@
 //! DOM handles, `QuickJS` values, callbacks, and `net` types never do.
 
 use std::fmt;
-use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use url::Url;
@@ -426,16 +425,17 @@ pub struct DialOutcome {
 }
 
 /// Completion for a dial submitted to the browser process.
-pub type DialCompletion = Arc<dyn Fn(Result<DialOutcome, DialFailure>) + Send + Sync + 'static>;
+pub type DialCompletion = Box<dyn FnOnce(Result<DialOutcome, DialFailure>) + Send + 'static>;
 
 /// Effects the page engine asks its host to perform.
 ///
 /// A native renderer process receives an implementation that forwards calls
 /// to the browser process. An embedded renderer receives an implementation
 /// from its caller. Renderer code never names `net`.
-pub trait EngineHost: Send + Sync + 'static {
+pub trait BrowserServices: Send + Sync + 'static {
     /// Submits one GET without blocking the renderer thread. The completion
-    /// receives `None` for transport, timeout, queue, or body-limit failure.
+    /// receives [`DialFailure`] for transport, timeout, queue, body-limit, or
+    /// cancellation failure.
     /// Implementations must invoke it exactly once, including when submission
     /// is rejected.
     fn start_dial(&self, request: DialRequest, completion: DialCompletion);
