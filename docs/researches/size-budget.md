@@ -674,9 +674,19 @@ Gates: `cargo test --workspace` (26 suites), Clippy, Playwright 4/4, Blink CDP
 1/1, 56 html5lib WPT tests as expected, and E0 (101 targets, 3 processes, 10
 threads, 33 descriptors, 0% idle CPU, 50 parallel requests in 20.0 ms). A live
 HTTPS smoke reports `http_version: h2` with JA4
-`t13d3012h2_1d37bd780c83_8e6e362c5eac`. E0 PSS rose from 11.0 MB to a
-14.9–20.3 MB range across runs because the daemon now maps system libcrypto,
-whose touched pages count toward PSS.
+`t13d3012h2_1d37bd780c83_8e6e362c5eac`.
+
+PSS attribution (2026-09-15): a controlled run against a local HTTPS server
+that closed every connection forced a fresh handshake per navigation, and
+measured per-process PSS split by anonymous and file-backed pages plus the
+`libcrypto`/`libssl` share. Between 10 and 110 handshakes the library footprint
+did not move (tree: 7.05 MB PSS / 9.87 MB RSS; daemon: 4.96 / 5.91), anonymous
+memory plateaued at ~7.6 MB, and the steady tree was ~17.7 MB PSS with ~10 MB
+file-backed. About 4.5 MB of libcrypto is touched before any dial while
+building the TLS contexts. The earlier E0 spread (14.9–20.3 MB) is sampling
+timing while the 50-request page and 100 tabs are active, not connection
+growth. The fixed shared-library cost is accepted; building the TLS contexts
+lazily would reduce only the idle footprint.
 
 ## Final gate: P14 (2026-09-15)
 
