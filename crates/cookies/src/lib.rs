@@ -1,3 +1,17 @@
+//! Cookie storage and the site identity its rules are written in terms of.
+//!
+//! A [`CookieJar`] is pure logic over URLs and time: no sockets, no
+//! filesystem, no async runtime. Both the native browser process and the
+//! WebAssembly component keep one, so the storage model, `SameSite` handling,
+//! and public-suffix checks live here once.
+//!
+//! [`site`] answers which registrable domain a URL belongs to, which is also
+//! what renderer isolation locks on; the two uses share one definition of site
+//! on purpose, because they disagreeing would be a security bug.
+//!
+//! Behavior follows
+//! [draft-ietf-httpbis-rfc6265bis](https://httpwg.org/http-extensions/draft-ietf-httpbis-rfc6265bis.html).
+
 use std::collections::HashSet;
 use std::fmt;
 use std::sync::OnceLock;
@@ -48,6 +62,11 @@ struct StoredCookie {
     same_site: SameSite,
 }
 
+/// The cookies one browser profile holds, keyed by domain and path.
+///
+/// The jar has no clock of its own: every operation takes `now` from its
+/// [`CookieOp`], so callers stay in control of time and tests stay
+/// deterministic.
 #[derive(Clone, Default)]
 pub struct CookieJar {
     cookies: Vec<StoredCookie>,
@@ -61,24 +80,46 @@ impl fmt::Debug for CookieJar {
     }
 }
 
+/// Everything one cookie operation needs that the jar cannot infer.
 #[derive(Clone, Copy)]
 pub struct CookieOp<'a> {
+    /// URL being requested, or the URL a `Set-Cookie` line arrived from.
     pub url: &'a Url,
+    /// Wall clock to evaluate expiry against.
     pub now: SystemTime,
+    /// Whether the operation reached the jar over HTTP or through script.
+    ///
+    /// Script cannot see or set `HttpOnly` cookies.
     pub kind: RetrievalKind,
+    /// What the request is for; `SameSite=Lax` treats a top-level navigation
+    /// differently from a subresource request.
     pub initiator_kind: InitiatorKind,
+    /// Whether the request's method is safe (`GET`/`HEAD`).
+    ///
+    /// Only consulted for a top-level navigation, where `SameSite=Lax` allows
+    /// a safe method; callers must pass the real method's safety.
     pub method_is_safe: bool,
+    /// Document URL the request started from, for the same-site check.
     pub initiator: Option<&'a Url>,
+    /// Whether a redirect chain has crossed sites before this request.
     pub cross_site_redirect: bool,
 }
 
+/// How a cookie operation reached the jar.
 #[derive(Clone, Copy)]
 pub enum RetrievalKind {
+    /// An HTTP request or response, which can carry `HttpOnly` cookies.
     Http,
+    /// The `document.cookie` getter or setter, which cannot.
     NonHttp,
 }
 
 impl CookieJar {
+    /// Stores one `Set-Cookie` line, ignoring it when the rules reject it.
+    ///
+    /// Rejection is not an error: a malformed line, a public-suffix domain, or
+    /// a `SameSite` cookie set from a cross-site context all mean "keep the
+    /// existing state".
     pub fn store(&mut self, set_cookie: &str, op: CookieOp<'_>) {
         let Some(parsed) = parse_set_cookie(set_cookie) else {
             return;
@@ -93,6 +134,8 @@ impl CookieJar {
         self.evict_excess();
     }
 
+    /// The `Cookie` header value for `op`: matching cookies, longest path
+    /// first, older cookies first within one path.
     pub fn cookie_string(&mut self, op: CookieOp<'_>) -> String {
         self.evict_expired(op.now);
         let Some(host) = canonicalize_host(op.url) else {
@@ -173,6 +216,10 @@ impl CookieJar {
             .collect()
     }
 
+    /// Loads `records` into the live jar, replacing matching identities.
+    ///
+    /// Expired records are dropped and the storage-model caps apply, so a
+    /// restored jar is indistinguishable from one built by `Set-Cookie`.
     pub fn restore(&mut self, records: Vec<CookieRecord>, now: SystemTime) {
         for record in records {
             if record.expiry.is_some_and(|expiry| expiry <= now) {

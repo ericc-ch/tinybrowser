@@ -12,7 +12,7 @@ mod transport;
 mod websocket;
 
 pub use client::{Agent, AgentBuilder, Body, RequestBuilder, Response};
+pub use cookies::{CookieRecord, CookieSameSite, InitiatorKind, site};
 pub use error::{LimitExceeded, NetError, ProtocolError, TimeoutKind, TransportError};
 pub use protocol::{HeaderError, HeaderMap, InvalidMethod, Method};
-pub use tinybrowser_cookie::{CookieRecord, CookieSameSite, InitiatorKind, site};
 pub use websocket::{WebSocket, WsEvent, WsMessage};

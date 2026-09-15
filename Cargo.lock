@@ -284,6 +284,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "cookies"
+version = "0.1.0"
+dependencies = [
+ "url",
+]
+
+[[package]]
 name = "core-foundation"
 version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1233,6 +1240,7 @@ version = "0.1.0"
 dependencies = [
  "base64 0.23.1",
  "bytes",
+ "cookies",
  "futures-util",
  "http-body-util",
  "hyper",
@@ -1240,7 +1248,6 @@ dependencies = [
  "hyper-util",
  "native-tls",
  "thiserror",
- "tinybrowser-cookie",
  "tokio",
  "tokio-native-tls",
  "tokio-tungstenite",
@@ -2053,18 +2060,11 @@ dependencies = [
 ]
 
 [[package]]
-name = "tinybrowser-cookie"
-version = "0.1.0"
-dependencies = [
- "url",
-]
-
-[[package]]
 name = "tinybrowser-wasm"
 version = "0.1.0"
 dependencies = [
+ "cookies",
  "renderer",
- "tinybrowser-cookie",
  "url",
  "wit-bindgen 0.62.0",
 ]

@@ -7,8 +7,8 @@ use crate::protocol::{HeaderError, HeaderMap, Method};
 use crate::resolve::HostMap;
 use crate::transport::{CallBudget, HttpEngine, basic_authorization};
 use crate::websocket::{self, WebSocket};
+use cookies::{CookieJar, CookieOp, RetrievalKind};
 use http_body_util::BodyExt as _;
-use tinybrowser_cookie::{CookieJar, CookieOp, RetrievalKind};
 use url::Url;
 
 const DEFAULT_MAX_REDIRECTS: u32 = 20;
@@ -465,7 +465,7 @@ impl RequestBuilder {
             }
 
             let next = resolve_location(&url, location)?;
-            cross_site_redirect |= !tinybrowser_cookie::schemeful_same_site(&url, &next);
+            cross_site_redirect |= !cookies::schemeful_same_site(&url, &next);
             apply_redirect_policy(
                 response.status(),
                 &url,
