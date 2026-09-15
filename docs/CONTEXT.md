@@ -63,7 +63,7 @@ A foreign-content element where HTML parsing resumes instead of breaking out: SV
 _Avoid_: integration element, breakout point
 
 **Hard seam**:
-The `net` crate's public type surface: every name callers see (`Agent`, `RequestBuilder`, `Response`, `Body`, `HeaderMap`, `Method`, `InitiatorKind`, `NetError`, `WebSocket`) is ours, so a later transport swap cannot leak hyper-util, rustls, or tokio-tungstenite into `browser`.
+The `net` crate's public type surface: every name callers see (`Agent`, `RequestBuilder`, `Response`, `Body`, `HeaderMap`, `Method`, `InitiatorKind`, `NetError`, `WebSocket`) is ours, so a later transport swap cannot leak hyper-util, native-tls, or tokio-tungstenite into `browser`.
 _Avoid_: abstraction layer, backend boundary (those mix the type rule with the conversion point)
 
 **Task**:
@@ -79,7 +79,7 @@ Which initiator owns a `net` request (`Navigation`, `Fetch`, `Xhr`, `WsHandshake
 _Avoid_: context (that is a browsing context), scope (dom selector root)
 
 **Conversion point**:
-The private places inside `net` that mention hyper-util, hyper-rustls, rustls, or tokio-tungstenite. Public types stay ours. Browser callers and the renderer protocol must not name backend types. The TLS connector remains replaceable by `btls` without changing the public seam ([ADR 0019](adrs/0019-async-browser-runtime-and-io.md)).
+The private places inside `net` that mention hyper-util, hyper-tls, native-tls, or tokio-tungstenite. Public types stay ours. Browser callers and the renderer protocol must not name backend types. The TLS connector remains replaceable by `btls` without changing the public seam ([ADR 0019](adrs/0019-async-browser-runtime-and-io.md)).
 _Avoid_: adapter, wrapper, FFI boundary
 
 **Platform object**:

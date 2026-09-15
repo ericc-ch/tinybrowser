@@ -691,7 +691,8 @@ The final binary is 7,414,144 bytes, 2,585,856 bytes (25.9%) under the
   expected, 0 unexpected, against the pinned WPT checkout `92054a74`.
 - E0: 101 targets, 3 processes, 10 threads, 33 file descriptors, 11.6 MB PSS,
   0% idle CPU, 50 parallel requests in 21.0 ms.
-- `cargo tree`: no `ureq`, `native-tls`, or `reqwest`; `tungstenite` only
+- `cargo tree`: no `ureq` or `reqwest`; the HTTP/WebSocket TLS backend is
+  the native-tls milestone below; `tungstenite` only
   through `tokio-tungstenite`.
 
 ## Checkpoint: structural cleanup, P12 (2026-09-15)
