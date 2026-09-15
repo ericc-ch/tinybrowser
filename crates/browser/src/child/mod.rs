@@ -5,11 +5,10 @@
 //! descriptor 0; other platforms keep the stdin/stdout pipes. stderr stays for
 //! diagnostics, which `crate::link` forwards into the daemon's log.
 //!
-//! This module is child-side only. It must not reach for [`crate::link`],
-//! [`crate::manager`], [`crate::actor`], or [`crate::store`]: a renderer serves
-//! one process's pages and never acts as a browser. `serve` takes no handles
-//! for exactly that reason — everything it needs comes from fd 0 and the
-//! engine.
+//! This module is child-side only. It must not reach for the `link`,
+//! `manager`, `actor`, or `store` modules: a renderer serves one process's
+//! pages and never acts as a browser. `serve` takes no handles for exactly that
+//! reason — everything it needs comes from fd 0 and the engine.
 //!
 //! The loop runs as a future on one current-thread Tokio runtime and owns every
 //! wait: commands, dial completions, timer deadlines, and shutdown. The reader
@@ -17,6 +16,12 @@
 //! (`document.cookie`) must make progress while the page engine runs.
 
 mod session;
+
+/// Bounded command channel: one renderer's inbound messages.
+const INBOX_CAPACITY: usize = 256;
+
+/// Bounded outbox: messages waiting to be written to the host.
+const OUTBOX_CAPACITY: usize = 4096;
 
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
@@ -31,8 +36,7 @@ use url::Url;
 
 use crate::wire::channel::{FrameKind, decode_control, read_frame};
 use crate::wire::{
-    Command, FromRenderer, RENDERER_INBOX_CAPACITY, RENDERER_OUTBOX_CAPACITY, RendererAssignmentId,
-    ServiceCall, ServiceReply, ToRenderer,
+    Command, FromRenderer, RendererAssignmentId, ServiceCall, ServiceReply, ToRenderer,
 };
 
 /// Runs the renderer child until `Shutdown` or the channel closes.
@@ -52,8 +56,8 @@ pub fn serve() -> io::Result<()> {
 
 async fn serve_async() -> io::Result<thread::JoinHandle<io::Result<()>>> {
     let (input, output) = endpoint()?;
-    let (command_tx, command_rx) = mpsc::channel::<RendererInput>(RENDERER_INBOX_CAPACITY);
-    let (out_tx, out_rx) = std_mpsc::sync_channel::<FromRenderer>(RENDERER_OUTBOX_CAPACITY);
+    let (command_tx, command_rx) = mpsc::channel::<RendererInput>(INBOX_CAPACITY);
+    let (out_tx, out_rx) = std_mpsc::sync_channel::<FromRenderer>(OUTBOX_CAPACITY);
     let stop = Arc::new(Stop::new());
     let wake = Arc::new(Notify::new());
     let writer_stop = Arc::clone(&stop);

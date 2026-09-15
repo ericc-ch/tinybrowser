@@ -36,7 +36,6 @@ workspace = true
 [dependencies]
 browser = { workspace = true }
 cdp = { workspace = true }
-renderer = { workspace = true }
 webdriver = { workspace = true }
 logging = { workspace = true }
 clap = { version = "4.5", features = ["derive"] }

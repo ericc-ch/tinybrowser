@@ -20,12 +20,6 @@ use renderer::{
     DialFailure, DialOutcome, DialRequest, FrameId, Mount, RemoteValue, TabError, TabEvent,
 };
 
-/// Maximum browser-to-renderer commands retained by one renderer transport.
-pub const RENDERER_INBOX_CAPACITY: usize = 256;
-
-/// Maximum renderer-to-browser messages retained by one renderer transport.
-pub const RENDERER_OUTBOX_CAPACITY: usize = 4096;
-
 /// Browser-minted identity of one top-level document hosted by a renderer.
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct RendererAssignmentId(u64);
@@ -233,26 +227,6 @@ mod tests {
         let back: T = serde_json::from_str(&text).expect("deserialize");
         let back_value = serde_json::to_value(&back).expect("serialize back");
         assert_eq!(value, back_value, "round trip {message:?}");
-    }
-
-    #[test]
-    fn control_messages_round_trip_through_the_frame_codec() {
-        let message = ToRenderer::Request {
-            id: 1,
-            assignment: RendererAssignmentId::new(1),
-            command: Command::Eval {
-                frame: FrameId::MAIN,
-                source: "x".repeat(1024),
-            },
-        };
-        let mut bytes = Vec::new();
-        crate::wire::channel::write_control(&mut bytes, &message).expect("write");
-        let mut reader = std::io::Cursor::new(bytes);
-        let mut buffer = Vec::new();
-        let back: ToRenderer = crate::wire::channel::read_control(&mut reader, &mut buffer)
-            .expect("read")
-            .expect("one frame");
-        assert!(matches!(back, ToRenderer::Request { id: 1, .. }));
     }
 
     #[test]

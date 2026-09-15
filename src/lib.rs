@@ -8,7 +8,7 @@
 //! # Seam map
 //!
 //! ```text
-//! main → {browser, cdp, webdriver, renderer}
+//! main → {browser, cdp, webdriver}
 //!        cdp → {browser, axum}
 //!        webdriver → {browser, axum}
 //!        browser → {net, renderer}

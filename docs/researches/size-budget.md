@@ -331,8 +331,8 @@ hyper + tower + clap plus the Tokio multi-thread/net server runtime account for
 it. The probe grew 63,120 bytes (3,325,968): workspace feature unification now
 builds its Tokio with the `net`/`rt-multi-thread` features the browser-process stack
 enables. The renderer path still takes no web-server stack and no CLI crate; its
-only serialization is the value-only IPC seam (`serde` in `protocol.rs`/`process.rs`),
-and the renderer runtime stays current-thread.
+only serialization is the value-only seam (`serde` in the renderer's protocol and
+browser's wire), and the renderer runtime stays current-thread.
 
 ## Milestone: renderer processes and per-site isolation (2026-09-10)
 

@@ -1,7 +1,10 @@
-//! The value-only seam between browser process and renderer process.
+//! What a carrier exchanges with the engine, and the port it calls back on.
 //!
-//! Commands, request ids, events, script results, and explicit errors cross.
-//! DOM handles, `QuickJS` values, callbacks, and `net` types never do.
+//! These are the engine's own types: frame identity, mounts, page events,
+//! dials, script results, and explicit errors. DOM handles, `QuickJS` values,
+//! callbacks, and `net` types never cross. The messages that carry them over a
+//! socket live in the browser crate's wire module, because only a carrier
+//! needs to know how they travel.
 
 use std::fmt;
 
