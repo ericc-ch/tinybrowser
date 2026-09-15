@@ -80,6 +80,7 @@ impl Document {
     pub(crate) fn release(&mut self) {
         self.queued_dials.clear();
         self.in_flight_dials = 0;
+        self.decoder = None;
         self.world.borrow_mut().forget_owned_documents();
     }
 

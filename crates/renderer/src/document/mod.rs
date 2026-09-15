@@ -67,6 +67,17 @@ pub(crate) enum CompletedDial {
     },
 }
 
+/// Who feeds the active parser, and therefore who may end it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ParserOwner {
+    /// A response body, or a document handed over whole: only the carrier
+    /// decides when the input ends.
+    Carrier,
+    /// A script's `document.open()`: it writes text, and `document.close()`
+    /// ends the parser.
+    Script,
+}
+
 #[derive(Clone, Copy)]
 pub(crate) enum DialFail {
     JsFetch { id: i32, epoch: u64 },
@@ -101,6 +112,9 @@ pub(crate) struct Document {
     js_epoch: u64,
     active_parser: Option<ActiveParser>,
     parser_eof: bool,
+    /// Who owns the active parser, which decides whether `document.close()` may
+    /// end it.
+    parser_owner: ParserOwner,
     /// Decoder for a body that is still arriving; `None` when the markup is
     /// already in hand.
     decoder: Option<dial::ResponseDecoder>,
@@ -155,6 +169,7 @@ impl Document {
             js_epoch: 0,
             active_parser: None,
             parser_eof: true,
+            parser_owner: ParserOwner::Carrier,
             decoder: None,
             classic_fetch_in_flight: false,
             stop,
@@ -267,12 +282,21 @@ impl Document {
 
     /// Opens a document body that will arrive in pieces.
     ///
-    /// The realm is already new when this runs; this only opens the parser and
-    /// the decoder.
-    fn open_parser(&mut self, content_type: Option<&str>) {
+    /// The realm is already new when this runs; this opens the parser and,
+    /// when a response feeds it, the decoder for that response.
+    fn open_parser(&mut self, content_type: Option<&str>, owner: ParserOwner) {
         self.world.borrow_mut().parser_active = true;
         self.parser_eof = false;
-        self.decoder = Some(dial::ResponseDecoder::new(content_type.map(str::to_owned)));
+        // A script writes text, not bytes, and it takes the input stream away
+        // from any live response: dropping the decoder ignores the rest of
+        // that body instead of decoding it with the wrong charset.
+        self.decoder = match owner {
+            ParserOwner::Carrier => {
+                Some(dial::ResponseDecoder::new(content_type.map(str::to_owned)))
+            }
+            ParserOwner::Script => None,
+        };
+        self.parser_owner = owner;
         self.active_parser = Some(ActiveParser::new(""));
     }
 
@@ -295,7 +319,7 @@ impl Document {
         let mut world = self.world.borrow_mut();
         world.document_url = self.url.clone();
         drop(world);
-        self.open_parser(content_type);
+        self.open_parser(content_type, ParserOwner::Carrier);
     }
 
     /// Feeds response bytes. The decoder holds them until the encoding is
@@ -305,17 +329,17 @@ impl Document {
             return;
         };
         let text = decoder.push(bytes);
-        self.write_text(&text);
+        self.write_text(text);
     }
 
     /// Feeds markup that is already decoded, as a script's `document.write`
     /// provides.
-    pub(crate) fn write_text(&mut self, text: &str) {
+    pub(crate) fn write_text(&mut self, text: String) {
         if text.is_empty() {
             return;
         }
         if let Some(parser) = &self.active_parser {
-            parser.append_html(text.to_owned());
+            parser.append_html(text);
             // A pending parsing-blocking script stops the parser: advancing
             // past it would run later scripts first. Appending is safe, so the
             // markup is not lost.
@@ -330,7 +354,7 @@ impl Document {
     pub(crate) fn end_body(&mut self) {
         if let Some(decoder) = self.decoder.take() {
             let text = decoder.finish();
-            self.write_text(&text);
+            self.write_text(text);
         }
         self.parser_eof = true;
         if !self.classic_fetch_in_flight {
@@ -338,11 +362,26 @@ impl Document {
         }
     }
 
-    /// A script's `document.open()`: a new realm over the same document and
-    /// URL, with a body the script will write.
+    /// Aborts a body the carrier will not finish.
+    ///
+    /// Without this the frame waits for bytes that never come, so its load
+    /// never fires and the tab stays loading forever.
+    pub(crate) fn abort_body(&mut self) {
+        self.decoder = None;
+        self.parser_eof = true;
+        if !self.classic_fetch_in_flight {
+            self.advance_parser();
+        }
+    }
+
+    /// A script's `document.open()`: a new realm, a parser the script owns, and
+    /// any live response aborted, because the script now holds the input
+    /// stream.
+    ///
+    /// <https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#document-open-steps>
     pub(crate) fn reopen_document(&mut self) {
         self.reset_js_realm();
-        self.open_parser(None);
+        self.open_parser(None, ParserOwner::Script);
     }
 
     /// Parses `input` into this document and starts a new JS realm.
@@ -353,7 +392,10 @@ impl Document {
         self.reset_js_realm();
         self.world.borrow_mut().parser_active = true;
         self.parser_eof = true;
+        // The markup is in hand, so no decoder is involved, but the carrier
+        // owns this parser: `document.close()` must not end it.
         self.decoder = None;
+        self.parser_owner = ParserOwner::Carrier;
         self.active_parser = Some(ActiveParser::new(input));
         self.advance_parser();
     }
@@ -410,8 +452,15 @@ impl Document {
     pub(crate) fn apply_document_stream(&mut self, command: DocumentStreamCommand) {
         match command {
             DocumentStreamCommand::Open => self.reopen_document(),
-            DocumentStreamCommand::Write(html) => self.write_text(&html),
-            DocumentStreamCommand::Close => self.end_body(),
+            DocumentStreamCommand::Write(html) => self.write_text(html),
+            // Only a parser a script opened is a script's to close; a response
+            // body ends when its exchange does.
+            // https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#closing-the-input-stream
+            DocumentStreamCommand::Close => {
+                if self.parser_owner == ParserOwner::Script {
+                    self.end_body();
+                }
+            }
         }
     }
 

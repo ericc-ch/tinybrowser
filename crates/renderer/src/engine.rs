@@ -157,6 +157,19 @@ impl Engine {
         Ok(())
     }
 
+    /// Abandons a response body that will not be finished.
+    ///
+    /// # Errors
+    ///
+    /// [`TabError::UnknownFrame`] when the engine does not host the frame.
+    pub fn abort_body(&mut self, frame: FrameId) -> Result<(), TabError> {
+        self.frame_mut(frame)
+            .ok_or(TabError::UnknownFrame { frame: frame.get() })?
+            .abort_body();
+        self.reconcile_frames();
+        Ok(())
+    }
+
     /// Evaluates `source` in one frame and returns its string coercion.
     ///
     /// # Errors

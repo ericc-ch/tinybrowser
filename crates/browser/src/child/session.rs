@@ -97,7 +97,7 @@ pub(super) async fn run(
                     }
                 }
                 Some(RendererInput::Control(ToRenderer::ResponseError { id, failure })) => {
-                    let (assignment, result) = responses.abort(id, failure);
+                    let (assignment, result) = responses.abort(id, failure, &mut engines);
                     let reply = Reply::Unit(result);
                     if !send_to_browser(outbox, FromRenderer::Reply { id, assignment, reply }) {
                         stop.request();
@@ -219,6 +219,7 @@ impl ResponseStreams {
         &mut self,
         id: u64,
         failure: DialFailure,
+        engines: &mut HashMap<RendererAssignmentId, Engine>,
     ) -> (RendererAssignmentId, Result<(), TabError>) {
         let Some(response) = self.0.remove(&id) else {
             return (
@@ -226,6 +227,11 @@ impl ResponseStreams {
                 Err(stream_error("response error without start")),
             );
         };
+        // Stop the frame's parser, or it waits for bytes that will never come
+        // and the tab stays loading forever.
+        if let Some(engine) = engines.get_mut(&response.assignment) {
+            let _ = engine.abort_body(response.frame);
+        }
         (
             response.assignment,
             Err(stream_error(&format!(
