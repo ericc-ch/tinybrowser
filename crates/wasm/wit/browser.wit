@@ -1,6 +1,53 @@
 package tinybrowser:browser@0.1.0;
 
+interface types {
+    enum fetch-kind {
+        js-fetch,
+        classic-script,
+    }
+
+    record fetch-request {
+        id: u64,
+        /// Component-side tab identity; the host routes completions by it.
+        owner: u64,
+        kind: fetch-kind,
+        url: string,
+        initiator: string,
+        read-body: bool,
+        max-body-bytes: u64,
+        cookie: string,
+    }
+
+    record fetch-response {
+        status: u16,
+        final-url: string,
+        content-type: option<string>,
+        content-language: option<string>,
+        set-cookies: list<string>,
+        body: list<u8>,
+    }
+
+    enum fetch-error {
+        dns,
+        connect,
+        tls,
+        timeout,
+        limit,
+        queue-full,
+        cancelled,
+    }
+}
+
+interface host {
+    use types.{fetch-request};
+
+    start-fetch: func(request: fetch-request) -> bool;
+    cancel-fetch: func(id: u64);
+}
+
 interface engine {
+    use types.{fetch-error, fetch-response};
+
     variant event {
         load,
         child-load,
@@ -19,14 +66,19 @@ interface engine {
 
     resource tab {
         constructor(url: string, html: string) -> result<tab, string>;
+        /// This tab's `fetch-request.owner` value.
+        owner: func() -> u64;
         eval: func(source: string) -> result<string, string>;
         pump: func() -> option<u64>;
         events: func() -> result<list<frame-event>, string>;
         title: func() -> result<string, string>;
         text: func() -> result<string, string>;
     }
+
+    complete-fetch: func(id: u64, outcome: result<fetch-response, fetch-error>) -> bool;
 }
 
 world browser {
+    import host;
     export engine;
 }
