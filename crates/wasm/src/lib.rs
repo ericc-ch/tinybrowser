@@ -73,6 +73,10 @@ impl Guest for Component {
                 let source = reported_url(&chain, &response);
                 chain.cross_site_redirect |= !schemeful_same_site(&chain.url, &source);
                 store_hop_cookies(&source, &chain, &response);
+                // From here the dial stands where this response came from: a
+                // relative `Location` resolves against that, not against the
+                // hop that was requested before the host moved us.
+                chain.url = source;
                 match next_hop(&chain, &response) {
                     Ok(Some(next)) => {
                         chain.followed = chain.followed.saturating_add(1);
