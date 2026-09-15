@@ -610,6 +610,16 @@ variants (`html/syntax/parsing/html5lib_write.html`); P10 changes no
 framing-level code, so its row shares the P9 binary and no separate size was
 recorded. The IPC ABI is version 3 in P11 after assignment ids landed.
 
+## Checkpoint: structural cleanup, P12 (2026-09-15)
+
+P12 split browser-owned persistence (`store.rs`), live networking
+(`network.rs`), and renderer process policy (`manager.rs`) out of the former
+`network.rs`/`link.rs` pair, and moved CDP's dispatch helpers and runtime script
+shapes into `cdp/src/dispatch.rs`. `cargo tree` contains no `ureq`,
+`native-tls`, or `reqwest`; `tungstenite` appears only through
+`tokio-tungstenite`, so no blocking page WebSocket path remains. Size is
+unchanged from P11 at 7,414,144 bytes, so the row stays in the P11 table.
+
 ## Milestone: renderer process policy, P11 (2026-09-15)
 
 P11 replaced the per-tab renderer factory with a browser-owned process manager.

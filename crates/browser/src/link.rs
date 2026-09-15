@@ -8,9 +8,11 @@ use std::collections::HashMap;
 use std::io;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, PoisonError, Weak};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
+use tokio::process::Child;
 
+use crate::manager::RendererId;
 use crate::network::FetchHandle;
 use crate::site::Site;
 use renderer::{
@@ -18,8 +20,8 @@ use renderer::{
     ResponseStart, ServiceCall, ServiceReply, TabError, TabEvent, ToRenderer,
 };
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite};
-use tokio::process::{Child, Command};
-use tokio::sync::{Semaphore, mpsc, oneshot, watch};
+use tokio::process::Command;
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 
@@ -28,7 +30,7 @@ use tokio::time::timeout;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// How long a `renderer` child has to say [`FromRenderer::Ready`].
-const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+pub(crate) const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// How long teardown waits for transport tasks to finish.
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
@@ -39,22 +41,18 @@ const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 const EVENT_SUBSCRIBER_CAPACITY: usize = 4096;
 
 /// Bounded browser-to-renderer command queue.
-const COMMAND_CAPACITY: usize = 256;
-
-/// Identity of one live renderer.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-struct RendererId(u64);
+pub(crate) const COMMAND_CAPACITY: usize = 256;
 
 /// Live subscribers to one renderer's frame-tagged document events.
 type EventSubscribers =
     Arc<Mutex<HashMap<RendererAssignmentId, Vec<mpsc::Sender<(FrameId, TabEvent)>>>>>;
 
-struct PendingReply {
+pub(crate) struct PendingReply {
     assignment: RendererAssignmentId,
     reply: oneshot::Sender<Reply>,
 }
 
-enum Outbound {
+pub(crate) enum Outbound {
     Control(ToRenderer),
     Body { request: u64, payload: Vec<u8> },
 }
@@ -63,20 +61,20 @@ enum Outbound {
 pub(crate) struct RendererHandle {
     tx: mpsc::Sender<Outbound>,
     pending: Arc<Mutex<HashMap<u64, PendingReply>>>,
-    alive: Arc<AtomicBool>,
+    pub(crate) alive: Arc<AtomicBool>,
     subscribers: EventSubscribers,
     next_request: AtomicU64,
     kill: watch::Sender<bool>,
     tasks: Mutex<Vec<JoinHandle<()>>>,
-    site: Arc<Mutex<Option<Site>>>,
-    assignments: AtomicUsize,
+    pub(crate) site: Arc<Mutex<Option<Site>>>,
+    pub(crate) assignments: AtomicUsize,
     _slot: tokio::sync::OwnedSemaphorePermit,
 }
 
 /// One browser-authorized top-level document inside a renderer process.
 pub(crate) struct RendererAssignment {
-    id: RendererAssignmentId,
-    process: Arc<RendererHandle>,
+    pub(crate) id: RendererAssignmentId,
+    pub(crate) process: Arc<RendererHandle>,
 }
 
 impl RendererAssignment {
@@ -186,7 +184,7 @@ impl Drop for ResponseWriter {
 }
 
 impl RendererHandle {
-    fn bind(&self, site: &Site) -> io::Result<()> {
+    pub(crate) fn bind(&self, site: &Site) -> io::Result<()> {
         let mut lock = self.site.lock().unwrap_or_else(PoisonError::into_inner);
         match &*lock {
             Some(existing) if existing != site => {
@@ -200,7 +198,7 @@ impl RendererHandle {
         }
     }
 
-    async fn assign(&self, assignment: RendererAssignmentId) -> io::Result<()> {
+    pub(crate) async fn assign(&self, assignment: RendererAssignmentId) -> io::Result<()> {
         self.tx
             .send(Outbound::Control(ToRenderer::Assign { assignment }))
             .await
@@ -209,7 +207,7 @@ impl RendererHandle {
         Ok(())
     }
 
-    async fn release(&self, assignment: RendererAssignmentId) {
+    pub(crate) async fn release(&self, assignment: RendererAssignmentId) {
         self.subscribers
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -394,319 +392,19 @@ impl Drop for RendererHandle {
     }
 }
 
-/// Browser-owned renderer process manager.
-pub(crate) struct RendererProcessManager {
-    inner: Arc<ManagerInner>,
-}
-
-struct ManagerInner {
-    fetch: FetchHandle,
-    next: AtomicU64,
-    next_assignment: AtomicU64,
-    slots: Arc<Semaphore>,
-    state: tokio::sync::Mutex<ManagerState>,
-}
-
-#[derive(Default)]
-struct ManagerState {
-    spare: Option<Arc<RendererHandle>>,
-    sites: HashMap<Site, Vec<Weak<RendererHandle>>>,
-    spawning_spare: bool,
-}
-
-impl RendererProcessManager {
-    pub(crate) fn new(fetch: FetchHandle) -> Self {
-        let manager = Self {
-            inner: Arc::new(ManagerInner {
-                fetch,
-                next: AtomicU64::new(1),
-                next_assignment: AtomicU64::new(1),
-                slots: Arc::new(Semaphore::new(renderer_process_limit())),
-                state: tokio::sync::Mutex::new(ManagerState::default()),
-            }),
-        };
-        manager.fill_spare();
-        manager
-    }
-
-    /// Creates a renderer locked to `site`.
-    ///
-    /// # Errors
-    ///
-    /// Process spawn failure or a failed protocol handshake.
-    pub(crate) async fn acquire(&self, site: &Site) -> io::Result<Arc<RendererAssignment>> {
-        let process = self.acquire_process(site).await?;
-        let assignment =
-            RendererAssignmentId::new(self.inner.next_assignment.fetch_add(1, Ordering::Relaxed));
-        process.assign(assignment).await?;
-        self.fill_spare();
-        Ok(Arc::new(RendererAssignment {
-            id: assignment,
-            process,
-        }))
-    }
-
-    async fn acquire_process(&self, site: &Site) -> io::Result<Arc<RendererHandle>> {
-        let mut state = self.inner.state.lock().await;
-        let process = if let Some(spare) = state.spare.take() {
-            spare.bind(site)?;
-            spare
-        } else if let Ok(slot) = Arc::clone(&self.inner.slots).try_acquire_owned() {
-            let id = RendererId(self.inner.next.fetch_add(1, Ordering::Relaxed));
-            Arc::new(spawn_process(id, Some(site.clone()), self.inner.fetch.clone(), slot).await?)
-        } else {
-            let candidates = state.sites.entry(site.clone()).or_default();
-            candidates.retain(|candidate| {
-                candidate
-                    .upgrade()
-                    .is_some_and(|process| process.alive.load(Ordering::Relaxed))
-            });
-            candidates
-                .iter()
-                .find_map(Weak::upgrade)
-                .ok_or_else(|| io::Error::other("renderer process budget exhausted"))?
-        };
-        let processes = state.sites.entry(site.clone()).or_default();
-        if !processes.iter().any(|candidate| {
-            candidate
-                .upgrade()
-                .is_some_and(|candidate| Arc::ptr_eq(&candidate, &process))
-        }) {
-            processes.push(Arc::downgrade(&process));
-        }
-        Ok(process)
-    }
-
-    pub(crate) async fn release(&self, assignment: Arc<RendererAssignment>) {
-        let process = Arc::clone(&assignment.process);
-        process.release(assignment.id).await;
-        drop(assignment);
-        if process.assignments.load(Ordering::Relaxed) == 0 {
-            let site = process
-                .site
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .clone();
-            if let Some(site) = site {
-                let mut state = self.inner.state.lock().await;
-                if let Some(processes) = state.sites.get_mut(&site) {
-                    processes.retain(|candidate| {
-                        candidate
-                            .upgrade()
-                            .is_some_and(|candidate| !Arc::ptr_eq(&candidate, &process))
-                    });
-                    if processes.is_empty() {
-                        state.sites.remove(&site);
-                    }
-                }
-            }
-            process.shutdown().await;
-        }
-        drop(process);
-        self.fill_spare();
-    }
-
-    fn fill_spare(&self) {
-        let inner = Arc::clone(&self.inner);
-        tokio::spawn(async move {
-            {
-                let mut state = inner.state.lock().await;
-                if state.spare.is_some() || state.spawning_spare {
-                    return;
-                }
-                state.spawning_spare = true;
-            }
-            let result = match Arc::clone(&inner.slots).try_acquire_owned() {
-                Ok(slot) => {
-                    let id = RendererId(inner.next.fetch_add(1, Ordering::Relaxed));
-                    spawn_process(id, None, inner.fetch.clone(), slot)
-                        .await
-                        .map(Arc::new)
-                }
-                Err(_) => Err(io::Error::other("renderer process budget exhausted")),
-            };
-            let mut state = inner.state.lock().await;
-            state.spawning_spare = false;
-            if let Ok(spare) = result {
-                state.spare = Some(spare);
-            }
-        });
-    }
-}
-
-fn renderer_process_limit() -> usize {
-    if let Some(limit) = std::env::var_os("TINYBROWSER_RENDERER_PROCESS_LIMIT")
-        .and_then(|value| value.to_str()?.parse::<usize>().ok())
-        .filter(|limit| *limit > 0)
-    {
-        return limit;
-    }
-    let available_kib = std::fs::read_to_string("/proc/meminfo")
-        .ok()
-        .and_then(|text| {
-            text.lines().find_map(|line| {
-                line.strip_prefix("MemAvailable:")?
-                    .split_whitespace()
-                    .next()?
-                    .parse::<usize>()
-                    .ok()
-            })
-        })
-        .unwrap_or(512 * 1024);
-    (available_kib / (64 * 1024)).clamp(1, 128)
-}
-
 struct RendererViolation;
 
-/// One spawned child and its host-side channel endpoints.
-struct SpawnedRenderer {
-    child: Child,
-    reader: Box<dyn AsyncRead + Send + Unpin>,
-    writer: Box<dyn AsyncWrite + Send + Unpin>,
-}
-
-/// Spawns one renderer child and returns its host-side reader and writer.
-///
-/// Unix passes one end of an unnamed socket pair as the child's file
-/// descriptor 0. Other platforms keep the piped stdin/stdout transport until
-/// their platform channel lands.
-#[cfg(unix)]
-fn spawn_transport(command: &mut Command) -> io::Result<SpawnedRenderer> {
-    let (host, child_end) = std::os::unix::net::UnixStream::pair()?;
-    command
-        .stdin(Stdio::from(std::os::fd::OwnedFd::from(child_end)))
-        .stdout(Stdio::null());
-    let child = command.spawn()?;
-    let writer_std = host.try_clone()?;
-    host.set_nonblocking(true)?;
-    writer_std.set_nonblocking(true)?;
-    let reader = tokio::net::UnixStream::from_std(host)?;
-    let writer = tokio::net::UnixStream::from_std(writer_std)?;
-    Ok(SpawnedRenderer {
-        child,
-        reader: Box::new(reader),
-        writer: Box::new(writer),
-    })
-}
-
-#[cfg(not(unix))]
-fn spawn_transport(command: &mut Command) -> io::Result<SpawnedRenderer> {
-    command.stdin(Stdio::piped()).stdout(Stdio::piped());
-    let mut child = command.spawn()?;
-    let Some(stdin) = child.stdin.take() else {
-        let _ = child.start_kill();
-        return Err(io::Error::other("renderer stdin missing"));
-    };
-    let Some(stdout) = child.stdout.take() else {
-        let _ = child.start_kill();
-        return Err(io::Error::other("renderer stdout missing"));
-    };
-    Ok(SpawnedRenderer {
-        child,
-        reader: Box::new(stdout),
-        writer: Box::new(stdin),
-    })
-}
-
-async fn spawn_process(
-    id: RendererId,
-    site: Option<Site>,
-    fetch: FetchHandle,
-    slot: tokio::sync::OwnedSemaphorePermit,
-) -> io::Result<RendererHandle> {
-    let mut command = Command::new(std::env::current_exe()?);
-    command
-        .arg("renderer")
-        .env("TINYBROWSER_LOG", logging::level().as_str())
-        .stderr(Stdio::piped());
-    let SpawnedRenderer {
-        mut child,
-        reader,
-        writer,
-    } = spawn_transport(&mut command)?;
-    let Some(stderr) = child.stderr.take() else {
-        let _ = child.start_kill();
-        return Err(io::Error::other("renderer stderr missing"));
-    };
-    let (tx, rx) = mpsc::channel::<Outbound>(COMMAND_CAPACITY);
-    let (kill, kill_rx) = watch::channel(false);
-    let pending = Arc::new(Mutex::new(HashMap::new()));
-    let alive = Arc::new(AtomicBool::new(true));
-    let subscribers = Arc::new(Mutex::new(HashMap::new()));
-    let (ready_tx, ready_rx) = oneshot::channel();
-    let writer_task = tokio::spawn(writer_task(
-        rx,
-        writer,
-        Arc::clone(&alive),
-        Arc::clone(&pending),
-        kill.clone(),
-        kill_rx.clone(),
-    ));
-    let site = Arc::new(Mutex::new(site));
-    let reader_context = ReaderContext {
-        tx: tx.clone(),
-        pending: Arc::clone(&pending),
-        alive: Arc::clone(&alive),
-        subscribers: Arc::clone(&subscribers),
-        fetch: fetch.clone(),
-        site: Arc::clone(&site),
-        kill: kill.clone(),
-    };
-    let reader_task = tokio::spawn(reader_task(reader, reader_context, Some(ready_tx)));
-    let stderr_task = tokio::spawn(forward_stderr(stderr));
-    // Detached child task: it reaps the child when the channel closes or the
-    // handle signals a kill. Dropping every kill sender also stops it.
-    let _reaper = tokio::spawn(child_task(child, kill_rx));
-    if tx.send(Outbound::Control(ToRenderer::Hello)).await.is_err()
-        || timeout(HANDSHAKE_TIMEOUT, ready_rx).await != Ok(Ok(true))
-    {
-        let _ = kill.send(true);
-        let _result = writer_task.await;
-        let _result = reader_task.await;
-        let _result = stderr_task.await;
-        return Err(io::Error::other("renderer handshake failed"));
-    }
-    logging::debug!(
-        target: "browser::link",
-        "renderer {id:?} ready for site lock {site:?}"
-    );
-    let tasks = vec![writer_task, reader_task, stderr_task];
-    Ok(RendererHandle {
-        tx,
-        pending,
-        alive,
-        subscribers,
-        next_request: AtomicU64::new(1),
-        kill,
-        tasks: Mutex::new(tasks),
-        site,
-        assignments: AtomicUsize::new(0),
-        _slot: slot,
-    })
-}
-
-async fn child_task(mut child: Child, mut kill: watch::Receiver<bool>) {
-    tokio::select! {
-        _ = kill.changed() => {
-            let _ = child.start_kill();
-            let _ = child.wait().await;
-        }
-        _ = child.wait() => {}
-    }
-}
-
-/// Shared route state for one renderer's reader task.
-struct ReaderContext {
+pub(crate) struct ReaderContext {
     tx: mpsc::Sender<Outbound>,
     pending: Arc<Mutex<HashMap<u64, PendingReply>>>,
-    alive: Arc<AtomicBool>,
+    pub(crate) alive: Arc<AtomicBool>,
     subscribers: EventSubscribers,
     fetch: FetchHandle,
     site: Arc<Mutex<Option<Site>>>,
     kill: watch::Sender<bool>,
 }
 
-async fn writer_task(
+pub(crate) async fn writer_task(
     mut rx: mpsc::Receiver<Outbound>,
     mut writer: Box<dyn AsyncWrite + Send + Unpin>,
     alive: Arc<AtomicBool>,
@@ -737,7 +435,7 @@ async fn writer_task(
     }
 }
 
-async fn reader_task(
+pub(crate) async fn reader_task(
     mut reader: Box<dyn AsyncRead + Send + Unpin>,
     context: ReaderContext,
     ready: Option<oneshot::Sender<bool>>,
@@ -920,7 +618,7 @@ fn fail_pending(pending: &Arc<Mutex<HashMap<u64, PendingReply>>>) {
 /// The child formats its own level and target; the browser only forwards the
 /// lines, so renderer records land in the daemon's console and file without a
 /// second file writer ([ADR 0015](../../../docs/adrs/0015-logging.md)).
-async fn forward_stderr(stderr: tokio::process::ChildStderr) {
+pub(crate) async fn forward_stderr(stderr: tokio::process::ChildStderr) {
     let mut reader = tokio::io::BufReader::new(stderr);
     let mut bytes = Vec::new();
     loop {
@@ -929,5 +627,141 @@ async fn forward_stderr(stderr: tokio::process::ChildStderr) {
             Ok(0) | Err(_) => break,
             Ok(_) => logging::log_forwarded(&String::from_utf8_lossy(&bytes)),
         }
+    }
+}
+/// One spawned child and its host-side channel endpoints.
+struct SpawnedRenderer {
+    child: Child,
+    reader: Box<dyn AsyncRead + Send + Unpin>,
+    writer: Box<dyn AsyncWrite + Send + Unpin>,
+}
+
+/// Spawns one renderer child and returns its host-side reader and writer.
+///
+/// Unix passes one end of an unnamed socket pair as the child's file
+/// descriptor 0. Other platforms keep the piped stdin/stdout transport until
+/// their platform channel lands.
+#[cfg(unix)]
+fn spawn_transport(command: &mut Command) -> io::Result<SpawnedRenderer> {
+    let (host, child_end) = std::os::unix::net::UnixStream::pair()?;
+    command
+        .stdin(Stdio::from(std::os::fd::OwnedFd::from(child_end)))
+        .stdout(Stdio::null());
+    let child = command.spawn()?;
+    let writer_std = host.try_clone()?;
+    host.set_nonblocking(true)?;
+    writer_std.set_nonblocking(true)?;
+    let reader = tokio::net::UnixStream::from_std(host)?;
+    let writer = tokio::net::UnixStream::from_std(writer_std)?;
+    Ok(SpawnedRenderer {
+        child,
+        reader: Box::new(reader),
+        writer: Box::new(writer),
+    })
+}
+
+#[cfg(not(unix))]
+fn spawn_transport(command: &mut Command) -> io::Result<SpawnedRenderer> {
+    command.stdin(Stdio::piped()).stdout(Stdio::piped());
+    let mut child = command.spawn()?;
+    let Some(stdin) = child.stdin.take() else {
+        let _ = child.start_kill();
+        return Err(io::Error::other("renderer stdin missing"));
+    };
+    let Some(stdout) = child.stdout.take() else {
+        let _ = child.start_kill();
+        return Err(io::Error::other("renderer stdout missing"));
+    };
+    Ok(SpawnedRenderer {
+        child,
+        reader: Box::new(stdout),
+        writer: Box::new(stdin),
+    })
+}
+
+pub(crate) async fn spawn_process(
+    id: RendererId,
+    site: Option<Site>,
+    fetch: FetchHandle,
+    slot: tokio::sync::OwnedSemaphorePermit,
+) -> io::Result<RendererHandle> {
+    let mut command = Command::new(std::env::current_exe()?);
+    command
+        .arg("renderer")
+        .env("TINYBROWSER_LOG", logging::level().as_str())
+        .stderr(Stdio::piped());
+    let SpawnedRenderer {
+        mut child,
+        reader,
+        writer,
+    } = spawn_transport(&mut command)?;
+    let Some(stderr) = child.stderr.take() else {
+        let _ = child.start_kill();
+        return Err(io::Error::other("renderer stderr missing"));
+    };
+    let (tx, rx) = mpsc::channel::<Outbound>(COMMAND_CAPACITY);
+    let (kill, kill_rx) = watch::channel(false);
+    let pending = Arc::new(Mutex::new(HashMap::new()));
+    let alive = Arc::new(AtomicBool::new(true));
+    let subscribers = Arc::new(Mutex::new(HashMap::new()));
+    let (ready_tx, ready_rx) = oneshot::channel();
+    let writer_task = tokio::spawn(writer_task(
+        rx,
+        writer,
+        Arc::clone(&alive),
+        Arc::clone(&pending),
+        kill.clone(),
+        kill_rx.clone(),
+    ));
+    let site = Arc::new(Mutex::new(site));
+    let reader_context = ReaderContext {
+        tx: tx.clone(),
+        pending: Arc::clone(&pending),
+        alive: Arc::clone(&alive),
+        subscribers: Arc::clone(&subscribers),
+        fetch: fetch.clone(),
+        site: Arc::clone(&site),
+        kill: kill.clone(),
+    };
+    let reader_task = tokio::spawn(reader_task(reader, reader_context, Some(ready_tx)));
+    let stderr_task = tokio::spawn(forward_stderr(stderr));
+    // Detached child task: it reaps the child when the channel closes or the
+    // handle signals a kill. Dropping every kill sender also stops it.
+    let _reaper = tokio::spawn(child_task(child, kill_rx));
+    if tx.send(Outbound::Control(ToRenderer::Hello)).await.is_err()
+        || timeout(HANDSHAKE_TIMEOUT, ready_rx).await != Ok(Ok(true))
+    {
+        let _ = kill.send(true);
+        let _result = writer_task.await;
+        let _result = reader_task.await;
+        let _result = stderr_task.await;
+        return Err(io::Error::other("renderer handshake failed"));
+    }
+    logging::debug!(
+        target: "browser::link",
+        "renderer {id:?} ready for site lock {site:?}"
+    );
+    let tasks = vec![writer_task, reader_task, stderr_task];
+    Ok(RendererHandle {
+        tx,
+        pending,
+        alive,
+        subscribers,
+        next_request: AtomicU64::new(1),
+        kill,
+        tasks: Mutex::new(tasks),
+        site,
+        assignments: AtomicUsize::new(0),
+        _slot: slot,
+    })
+}
+
+async fn child_task(mut child: Child, mut kill: watch::Receiver<bool>) {
+    tokio::select! {
+        _ = kill.changed() => {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+        }
+        _ = child.wait() => {}
     }
 }

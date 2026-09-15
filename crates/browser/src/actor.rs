@@ -17,7 +17,8 @@ use tokio::task::JoinHandle;
 use tokio::time::{Instant, sleep_until, timeout};
 use url::Url;
 
-use crate::link::{RendererAssignment, RendererProcessManager};
+use crate::link::RendererAssignment;
+use crate::manager::RendererProcessManager;
 use crate::network::{FetchHandle, NAV_BODY_LIMIT, NavOutcome, dial_failure};
 use crate::site::Site;
 

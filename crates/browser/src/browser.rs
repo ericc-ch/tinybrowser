@@ -9,9 +9,10 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::actor::{TabHandle, TabId, TabTask};
-use crate::link::RendererProcessManager;
-use crate::network::{NetworkSession, ProfileStore};
+use crate::manager::RendererProcessManager;
+use crate::network::NetworkSession;
 use crate::profile::{Profile, ProfileName};
+use crate::store::ProfileStore;
 
 const BROWSER_COMMAND_CAPACITY: usize = 256;
 
