@@ -50,6 +50,25 @@ Verdict: PASS = 200 with non-challenge body; FAIL(status) = >=400; FAIL(challeng
 
 JA4: `t13d3011_…` (OpenSSL, no ALPN); `t13d2811h1_257f3020b3a2…` (chrome knobs, h1); `t13d1516h2_8daaf6152771…` (canonical Chrome, h2). g2 and canadagoose blocked every column (IP reputation). Only column 3 cleared Akamai-class first-request scoring.
 
+## TLS backend revisit (2026-09-15)
+
+The async transport shipped hyper-rustls with ring (ADR 0019). A throwaway
+probe matrix then measured the four stacks: ureq + native-tls 761,712 bytes,
+hand-rolled hyper + native-tls with ALPN h2 917,400, hyper + hyper-rustls/ring
+1,847,440, and wreq + BoringSSL Chrome149 3,817,064. On that evidence the
+shipping transport moved to **hyper-tls + native-tls** (system OpenSSL) for
+both HTTP and WebSocket, keeping HTTP/2 by requesting ALPN `h2` ourselves.
+Binary size drops from 6,582,320 to 5,621,760 bytes (−960,560) and rustls,
+ring, and webpki leave the dependency graph.
+
+Costs, recorded: TLS behavior is per-platform again (OpenSSL on Linux,
+Security.framework on macOS, SChannel on Windows), the Linux build needs
+OpenSSL headers, and the JA4 becomes `t13d3012h2_1d37bd780c83_…` — the
+OpenSSL fingerprint of option A with h2 ALPN, not canonical Chrome. The
+stealth milestone target is unchanged: Chrome-parity TLS knobs (`btls` or
+equivalent) when anti-bot scoring becomes a product requirement, at the
+measured cost in the table above.
+
 ## Consequences
 
 Akamai-class gates fail until the stealth milestone. Probe knowledge (btls knobs,

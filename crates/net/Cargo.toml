@@ -11,13 +11,14 @@ base64 = "0.23"
 bytes = "1"
 http-body-util = "0.1"
 hyper = { version = "1", features = ["client", "http1", "http2"] }
-hyper-rustls = { version = "0.27", default-features = false, features = ["ring", "native-tokio", "webpki-tokio", "http1", "http2", "tls12"] }
+hyper-tls = { version = "0.6", features = ["alpn"] }
 hyper-util = { version = "0.1", features = ["client-legacy", "client-proxy", "http1", "http2", "tokio"] }
-rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+native-tls = { version = "0.2", features = ["alpn"] }
+tokio-native-tls = "0.3"
 thiserror = "2"
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }
 tokio = { version = "1.53", default-features = false, features = ["rt", "net", "time", "sync", "macros"] }
-tokio-tungstenite = { version = "0.29", default-features = false, features = ["connect", "rustls-tls-native-roots"] }
+tokio-tungstenite = { version = "0.29", default-features = false, features = ["connect", "native-tls"] }
 tower-service = "0.3"
 url = "2"
 

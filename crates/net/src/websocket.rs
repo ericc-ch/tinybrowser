@@ -215,7 +215,7 @@ fn ws_err(error: tokio_tungstenite::tungstenite::Error) -> NetError {
         Ws::Io(error) => {
             let tls = error
                 .get_ref()
-                .is_some_and(|inner| inner.downcast_ref::<rustls::Error>().is_some());
+                .is_some_and(|inner| inner.downcast_ref::<native_tls::Error>().is_some());
             if tls || error.kind() == std::io::ErrorKind::InvalidData {
                 NetError::Transport(TransportError::Tls(error.to_string().into()))
             } else {

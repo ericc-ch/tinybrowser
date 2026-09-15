@@ -1,4 +1,4 @@
-//! Async HTTP transport: hyper client, rustls TLS, tinybrowser deadlines.
+//! Async HTTP transport: hyper client, native-tls (OpenSSL) TLS, tinybrowser deadlines.
 //!
 //! [ADR 0019](../../../docs/adrs/0019-async-browser-runtime-and-io.md): the
 //! browser process owns one Tokio runtime. `net` never implements HTTP framing;
@@ -18,7 +18,7 @@ use bytes::Bytes;
 use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Empty, Full};
 use hyper::body::Incoming;
-use hyper_rustls::HttpsConnector;
+use hyper_tls::HttpsConnector;
 use hyper_util::client::legacy::Client;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::client::legacy::connect::dns::{GaiResolver, Name};
@@ -155,18 +155,16 @@ impl HttpEngine {
         // Eyeballs (300 ms default) when a name returns multiple addresses.
         let mut http = HttpConnector::new_with_resolver(resolver);
         http.enforce_http(false);
-        let builder = hyper_rustls::HttpsConnectorBuilder::new().with_native_roots();
-        // A host without a usable system trust store falls back to the
-        // bundled Mozilla roots and keeps working; the fallback is not an
-        // error for the request itself.
-        let connector = match builder {
-            Ok(builder) => builder,
-            Err(_) => hyper_rustls::HttpsConnectorBuilder::new().with_webpki_roots(),
-        }
-        .https_or_http()
-        .enable_http1()
-        .enable_http2()
-        .wrap_connector(http.clone());
+        // ALPN is configured here, not by `hyper-tls`: its `alpn` feature only
+        // reports the protocol the server picked. OpenSSL initialization
+        // failure is unrecoverable for TLS in this process, and hyper-tls's
+        // own constructors panic on it for the same reason.
+        let tls = native_tls::TlsConnector::builder()
+            .request_alpns(&["h2", "http/1.1"])
+            .build()
+            .expect("openssl tls connector");
+        let tls = tokio_native_tls::TlsConnector::from(tls);
+        let connector = HttpsConnector::from((http.clone(), tls.clone()));
         let client = Client::builder(TokioExecutor::new()).build(connector);
         let proxied = proxy.as_deref().and_then(|proxy| {
             let (destination, auth) = proxy_destination(proxy).ok()?;
@@ -174,15 +172,7 @@ impl HttpEngine {
             if let Some(auth) = auth {
                 tunnel = tunnel.with_auth(auth);
             }
-            let builder = match hyper_rustls::HttpsConnectorBuilder::new().with_native_roots() {
-                Ok(builder) => builder,
-                Err(_) => hyper_rustls::HttpsConnectorBuilder::new().with_webpki_roots(),
-            };
-            let connector = builder
-                .https_or_http()
-                .enable_http1()
-                .enable_http2()
-                .wrap_connector(tunnel);
+            let connector = HttpsConnector::from((tunnel, tls));
             Some(Client::builder(TokioExecutor::new()).build(connector))
         });
         Self {
@@ -298,7 +288,7 @@ fn map_client_error(error: hyper_util::client::legacy::Error, host: &str) -> Net
             if cause.downcast_ref::<ResolveFailure>().is_some() {
                 return NetError::Transport(TransportError::Dns(host.into()));
             }
-            if cause.downcast_ref::<rustls::Error>().is_some() && tls_reason.is_none() {
+            if cause.downcast_ref::<native_tls::Error>().is_some() && tls_reason.is_none() {
                 tls_reason = Some(cause.to_string().into());
             }
             if let Some(io) = cause.downcast_ref::<std::io::Error>() {

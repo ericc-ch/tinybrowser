@@ -658,6 +658,26 @@ Deferred levers, with measured or estimated cost:
 - `-Z build-std` with `panic_immediate_abort`: requires nightly; none is
   installed and the workspace pins stable 1.98.
 
+## Milestone: native-tls transport (2026-09-15)
+
+The TLS backend moved from hyper-rustls/ring to hyper-tls with native-tls
+(system OpenSSL, ALPN h2) for HTTP and WebSocket. rustls, ring, webpki, and
+rustls-native-certs leave the dependency graph. Command: `nix develop
+--command cargo build --release --bin tinybrowser`; rustc 1.98.1, stripped
+x86_64 release profile.
+
+| Artifact | After P14 + review | After native-tls | Delta | Headroom to 10,000,000 |
+| --- | ---: | ---: | ---: | ---: |
+| CLI (`target/release/tinybrowser`) | 6,582,320 | 5,621,760 | **−960,560** | 4,378,240 |
+
+Gates: `cargo test --workspace` (26 suites), Clippy, Playwright 4/4, Blink CDP
+1/1, 56 html5lib WPT tests as expected, and E0 (101 targets, 3 processes, 10
+threads, 33 descriptors, 0% idle CPU, 50 parallel requests in 20.0 ms). A live
+HTTPS smoke reports `http_version: h2` with JA4
+`t13d3012h2_1d37bd780c83_8e6e362c5eac`. E0 PSS rose from 11.0 MB to a
+14.9–20.3 MB range across runs because the daemon now maps system libcrypto,
+whose touched pages count toward PSS.
+
 ## Final gate: P14 (2026-09-15)
 
 The final binary is 7,414,144 bytes, 2,585,856 bytes (25.9%) under the
