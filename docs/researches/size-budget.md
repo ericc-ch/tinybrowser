@@ -627,6 +627,12 @@ Everything else in the table was measured and rejected or deferred.
 | TLS 1.3 only (`tls12` feature off) | 6,536,080 | −46,816 | reject: drops TLS 1.2 servers |
 | `opt-level = "s"` + abort + ICF | 6,962,144 | +379,248 | reject: `"z"` is smaller |
 
+After the CodeRabbit review round (assignment release/reuse fixes, trust-store
+fallback policy, typed DNS failures, and one `tungstenite` version instead of
+two) the binary is 6,582,320 bytes. Unifying `cdp` on `tungstenite` 0.29
+removed the duplicate 0.26 implementation and 1,600 bytes; the rest of the
+small growth is the assignment release watermark and reservation logic.
+
 Measured behavior with abort + ICF: `cargo test --workspace` (26 suites),
 Clippy, Playwright 4/4, Blink CDP 1/1, 173 html5lib WPT tests as expected, and
 E0 (101 targets, 3 processes, 10 threads, 33 descriptors, 11.0 MB PSS, 0% idle

@@ -373,5 +373,10 @@ fn same_site_assignments_share_only_after_the_process_budget() {
         eval(&mut client, &second, "typeof window.marker").unwrap(),
         "\"undefined\""
     );
+    // Releasing one assignment must not tear down a process that still hosts
+    // another same-site assignment.
+    close(&mut client, &first);
+    assert_eq!(eval(&mut client, &second, "2+2").unwrap(), "4");
+    assert_eq!(renderer_children(daemon).len(), 1);
     server.join().expect("server");
 }

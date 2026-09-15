@@ -66,7 +66,10 @@ impl RendererProcessManager {
         let process = self.acquire_process(site).await?;
         let assignment =
             RendererAssignmentId::new(self.inner.next_assignment.fetch_add(1, Ordering::Relaxed));
-        process.assign(assignment).await?;
+        if let Err(error) = process.assign(assignment).await {
+            process.unreserve_assignment();
+            return Err(error);
+        }
         self.fill_spare();
         Ok(Arc::new(RendererAssignment {
             id: assignment,
@@ -102,6 +105,9 @@ impl RendererProcessManager {
         }) {
             processes.push(Arc::downgrade(&process));
         }
+        // Reserve the assignment before the state lock is released so a
+        // concurrent release cannot observe zero and shut this process down.
+        process.reserve_assignment();
         Ok(process)
     }
 
@@ -109,25 +115,34 @@ impl RendererProcessManager {
         let process = Arc::clone(&assignment.process);
         process.release(assignment.id).await;
         drop(assignment);
-        if process.assignments.load(Ordering::Relaxed) == 0 {
-            let site = process
-                .site
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .clone();
-            if let Some(site) = site {
-                let mut state = self.inner.state.lock().await;
-                if let Some(processes) = state.sites.get_mut(&site) {
+        // Decide shutdown under the same lock that `acquire_process` reserves
+        // assignments with, so a new acquisition either keeps the process or
+        // arrives after it is removed from the site pool.
+        let site = process
+            .site
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        let mut shutdown = false;
+        {
+            let mut state = self.inner.state.lock().await;
+            if process.assignments.load(Ordering::Relaxed) == 0 {
+                if let Some(site) = &site
+                    && let Some(processes) = state.sites.get_mut(site)
+                {
                     processes.retain(|candidate| {
                         candidate
                             .upgrade()
                             .is_some_and(|candidate| !Arc::ptr_eq(&candidate, &process))
                     });
                     if processes.is_empty() {
-                        state.sites.remove(&site);
+                        state.sites.remove(site);
                     }
                 }
+                shutdown = true;
             }
+        }
+        if shutdown {
             process.shutdown().await;
         }
         drop(process);

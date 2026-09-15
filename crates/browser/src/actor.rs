@@ -5,6 +5,7 @@
 
 use std::fmt;
 use std::future::pending;
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
@@ -261,12 +262,18 @@ impl TabHandle {
         rx.await.map_err(|_| TabError::ActorStopped)
     }
 
+    /// Kills the renderer to break a blocked script, but only when this tab is
+    /// the process's last assignment. Over the soft process budget a renderer
+    /// can host several same-site assignments; killing it for one tab would
+    /// take the others down. A shared process whose script is wedged is
+    /// recovered by the process budget and renderer failure paths instead.
     fn interrupt_renderer(&self) {
         if let Some(renderer) = self
             .current
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clone()
+            && renderer.process.assignments.load(Ordering::Relaxed) <= 1
         {
             renderer.interrupt();
         }

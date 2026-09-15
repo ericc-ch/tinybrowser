@@ -289,7 +289,14 @@ async fn browser_loop(mut commands: mpsc::Receiver<Command>, mut state: BrowserS
             }
         }
     }
+    // Every command sender is gone: this is the drop path when
+    // `Browser::drop` could not queue `Command::Close`. Persist so a
+    // full channel never loses the profile's cookies.
     close_all(&mut state.tabs).await;
+    if state.live {
+        state.live = false;
+        let _result = state.network.persist().await;
+    }
 }
 
 async fn close_all(tabs: &mut HashMap<TabId, TabTask>) {

@@ -10,7 +10,10 @@ Status: accepted (2026-09-10) and amended by
 [ADR 0019](0019-async-browser-runtime-and-io.md). Supersedes the terminology of
 [ADR 0009](0009-named-profile-daemon.md), [ADR 0010](0010-page-actor-ownership.md),
 and [ADR 0011](0011-renderer-processes-per-site.md) where they say "host",
-"page", "HTML job", or "context". The mechanisms in those ADRs are unchanged.
+"page", "HTML job", or "context". This ADR changes terminology only; the
+scheduling, ownership, and renderer-process mechanisms those ADRs described
+are superseded by [ADR 0019](0019-async-browser-runtime-and-io.md), not by
+this one.
 
 ## Decision
 

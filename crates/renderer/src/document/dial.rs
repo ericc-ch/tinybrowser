@@ -178,9 +178,13 @@ fn prescan_charset(body: &[u8]) -> Option<&'static encoding_rs::Encoding> {
     let mut cursor = 0;
     while let Some(relative_start) = ascii[cursor..].find("<meta") {
         let start = cursor + relative_start;
-        let end = ascii[start..]
-            .find('>')
-            .map_or(ascii.len(), |offset| start + offset);
+        // An unterminated tag can still be streaming: `<meta charset=utf-16`
+        // would otherwise yield the valid label `utf-16` before the trailing
+        // `be` arrives. Wait for `>` instead of using the buffer end.
+        let Some(offset) = ascii[start..].find('>') else {
+            break;
+        };
+        let end = start + offset;
         let tag = &ascii[start..end];
         if let Some(relative_charset) = tag.find("charset=") {
             let label = tag[relative_charset + "charset=".len()..]

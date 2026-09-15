@@ -75,7 +75,8 @@ the quiescent cookie jar. Repeating close retries a failed durable write.
 
 ## Isolation
 
-One renderer OS thread owns the page engine. The process boundary, immutable
-site lock, and browser-side reference monitor provide the active isolation
-shape. See [ADR 0011](0011-renderer-processes-per-site.md) and
+One renderer OS thread owns the page engine. The process boundary, renderer
+authorization state (unlocked or locked to one site), and browser-side
+reference monitor provide the active isolation shape. See
+[ADR 0011](0011-renderer-processes-per-site.md) and
 [ADR 0016](0016-renderer-seam-reference-monitor.md).

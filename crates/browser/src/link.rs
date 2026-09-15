@@ -68,6 +68,9 @@ pub(crate) struct RendererHandle {
     tasks: Mutex<Vec<JoinHandle<()>>>,
     pub(crate) site: Arc<Mutex<Option<Site>>>,
     pub(crate) assignments: AtomicUsize,
+    /// Highest released assignment id. Assignment ids increase, so any
+    /// unassigned id at or below this watermark was released, not forged.
+    released: Arc<AtomicU64>,
     _slot: tokio::sync::OwnedSemaphorePermit,
 }
 
@@ -198,13 +201,24 @@ impl RendererHandle {
         }
     }
 
+    /// Counts an assignment that the manager selected this process for. The
+    /// manager holds its state lock across this call, so a concurrent release
+    /// cannot observe zero and shut the process down.
+    pub(crate) fn reserve_assignment(&self) {
+        self.assignments.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Rolls back a reservation whose `Assign` message never reached the
+    /// renderer.
+    pub(crate) fn unreserve_assignment(&self) {
+        self.assignments.fetch_sub(1, Ordering::Relaxed);
+    }
+
     pub(crate) async fn assign(&self, assignment: RendererAssignmentId) -> io::Result<()> {
         self.tx
             .send(Outbound::Control(ToRenderer::Assign { assignment }))
             .await
-            .map_err(|_| io::Error::other("renderer stopped"))?;
-        self.assignments.fetch_add(1, Ordering::Relaxed);
-        Ok(())
+            .map_err(|_| io::Error::other("renderer stopped"))
     }
 
     pub(crate) async fn release(&self, assignment: RendererAssignmentId) {
@@ -212,6 +226,7 @@ impl RendererHandle {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .remove(&assignment);
+        self.released.fetch_max(assignment.get(), Ordering::Relaxed);
         let _ = self
             .tx
             .send(Outbound::Control(ToRenderer::Release { assignment }))
@@ -401,6 +416,7 @@ pub(crate) struct ReaderContext {
     subscribers: EventSubscribers,
     fetch: FetchHandle,
     site: Arc<Mutex<Option<Site>>>,
+    released: Arc<AtomicU64>,
     kill: watch::Sender<bool>,
 }
 
@@ -507,7 +523,14 @@ fn route(message: FromRenderer, context: &ReaderContext) -> Result<(), RendererV
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
             let Some(assignment_subscribers) = subscribers.get_mut(&assignment) else {
-                return Err(RendererViolation);
+                // A released assignment still had messages in flight when the
+                // renderer processed `Release`; drop them instead of failing
+                // the process, which may host other assignments.
+                return if was_released(&context.released, assignment) {
+                    Ok(())
+                } else {
+                    Err(RendererViolation)
+                };
             };
             assignment_subscribers.retain(|subscriber| match subscriber.try_send((frame, event)) {
                 Ok(()) => true,
@@ -525,54 +548,88 @@ fn route(message: FromRenderer, context: &ReaderContext) -> Result<(), RendererV
             assignment,
             id,
             call,
-        } => {
-            if !has_assignment(&context.subscribers, assignment) {
+        } => route_service_call(context, assignment, id, call)?,
+    }
+    Ok(())
+}
+
+fn route_service_call(
+    context: &ReaderContext,
+    assignment: RendererAssignmentId,
+    id: u64,
+    call: ServiceCall,
+) -> Result<(), RendererViolation> {
+    if !has_assignment(&context.subscribers, assignment) {
+        // The renderer may have queued the call before it processed
+        // `Release`. Answer with a benign failure so a synchronous
+        // `document.cookie` caller cannot block forever, and keep the
+        // process alive for its other assignments.
+        if was_released(&context.released, assignment) {
+            return send_released_reply(&context.tx, id, &call);
+        }
+        return Err(RendererViolation);
+    }
+    match call {
+        ServiceCall::Dial(request) => {
+            let Some(initiator) = authorize(&context.site, &request.initiator) else {
                 return Err(RendererViolation);
-            }
-            match call {
-                ServiceCall::Dial(request) => {
-                    let Some(initiator) = authorize(&context.site, &request.initiator) else {
-                        return Err(RendererViolation);
-                    };
-                    let worker_fetch = context.fetch.clone();
-                    let worker_tx = context.tx.clone();
-                    let worker_pending = Arc::clone(&context.pending);
-                    let worker_alive = Arc::clone(&context.alive);
-                    let worker_kill = context.kill.clone();
-                    let cancel = context.kill.subscribe();
-                    tokio::spawn(async move {
-                        let outcome = worker_fetch
-                            .dial_request(&request, &initiator, cancel)
-                            .await;
-                        if worker_tx
-                            .try_send(Outbound::Control(ToRenderer::ServiceReply {
-                                id,
-                                reply: ServiceReply::Dial(outcome),
-                            }))
-                            .is_err()
-                        {
-                            fail(&worker_alive, &worker_pending, &worker_kill);
-                        }
-                    });
+            };
+            let worker_fetch = context.fetch.clone();
+            let worker_tx = context.tx.clone();
+            let worker_pending = Arc::clone(&context.pending);
+            let worker_alive = Arc::clone(&context.alive);
+            let worker_kill = context.kill.clone();
+            let cancel = context.kill.subscribe();
+            tokio::spawn(async move {
+                let outcome = worker_fetch
+                    .dial_request(&request, &initiator, cancel)
+                    .await;
+                if worker_tx
+                    .try_send(Outbound::Control(ToRenderer::ServiceReply {
+                        id,
+                        reply: ServiceReply::Dial(outcome),
+                    }))
+                    .is_err()
+                {
+                    fail(&worker_alive, &worker_pending, &worker_kill);
                 }
-                ServiceCall::CookieGet { url } => {
-                    let Some(url) = authorize(&context.site, &url) else {
-                        return Err(RendererViolation);
-                    };
-                    let reply = ServiceReply::Cookie(context.fetch.cookies_for(&url));
-                    send_reply(&context.tx, id, reply)?;
-                }
-                ServiceCall::CookieSet { value, url } => {
-                    let Some(url) = authorize(&context.site, &url) else {
-                        return Err(RendererViolation);
-                    };
-                    context.fetch.set_cookie(&value, &url);
-                    send_reply(&context.tx, id, ServiceReply::Unit)?;
-                }
-            }
+            });
+        }
+        ServiceCall::CookieGet { url } => {
+            let Some(url) = authorize(&context.site, &url) else {
+                return Err(RendererViolation);
+            };
+            let reply = ServiceReply::Cookie(context.fetch.cookies_for(&url));
+            send_reply(&context.tx, id, reply)?;
+        }
+        ServiceCall::CookieSet { value, url } => {
+            let Some(url) = authorize(&context.site, &url) else {
+                return Err(RendererViolation);
+            };
+            context.fetch.set_cookie(&value, &url);
+            send_reply(&context.tx, id, ServiceReply::Unit)?;
         }
     }
     Ok(())
+}
+
+fn was_released(released: &AtomicU64, assignment: RendererAssignmentId) -> bool {
+    assignment.get() <= released.load(Ordering::Relaxed)
+}
+
+/// Answers a late call from a released assignment so the renderer's blocking
+/// service path stays unblocked while its engine is torn down.
+fn send_released_reply(
+    tx: &mpsc::Sender<Outbound>,
+    id: u64,
+    call: &ServiceCall,
+) -> Result<(), RendererViolation> {
+    let reply = match call {
+        ServiceCall::Dial(_) => ServiceReply::Dial(Err(renderer::DialFailure::Cancelled)),
+        ServiceCall::CookieGet { .. } => ServiceReply::Cookie(String::new()),
+        ServiceCall::CookieSet { .. } => ServiceReply::Unit,
+    };
+    send_reply(tx, id, reply)
 }
 
 fn has_assignment(subscribers: &EventSubscribers, assignment: RendererAssignmentId) -> bool {
@@ -714,6 +771,7 @@ pub(crate) async fn spawn_process(
         kill_rx.clone(),
     ));
     let site = Arc::new(Mutex::new(site));
+    let released = Arc::new(AtomicU64::new(0));
     let reader_context = ReaderContext {
         tx: tx.clone(),
         pending: Arc::clone(&pending),
@@ -721,6 +779,7 @@ pub(crate) async fn spawn_process(
         subscribers: Arc::clone(&subscribers),
         fetch: fetch.clone(),
         site: Arc::clone(&site),
+        released: Arc::clone(&released),
         kill: kill.clone(),
     };
     let reader_task = tokio::spawn(reader_task(reader, reader_context, Some(ready_tx)));
@@ -752,6 +811,7 @@ pub(crate) async fn spawn_process(
         tasks: Mutex::new(tasks),
         site,
         assignments: AtomicUsize::new(0),
+        released,
         _slot: slot,
     })
 }

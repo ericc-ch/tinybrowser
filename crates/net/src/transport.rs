@@ -29,7 +29,7 @@ use url::Url;
 
 use crate::error::{NetError, ProtocolError, TimeoutKind, TransportError};
 use crate::protocol::{HeaderMap, Method};
-use crate::resolve::{HostMap, Mapped};
+use crate::resolve::{HostMap, Mapped, ResolveFailure};
 
 /// Absolute deadlines for one `send` / `upgrade` call.
 ///
@@ -100,7 +100,7 @@ pub(crate) struct HostResolver {
 
 impl Service<Name> for HostResolver {
     type Response = std::vec::IntoIter<SocketAddr>;
-    type Error = std::io::Error;
+    type Error = ResolveFailure;
     type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
 
     fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
@@ -113,16 +113,13 @@ impl Service<Name> for HostResolver {
                 // The connector replaces port zero with the URI's port.
                 Ok(vec![SocketAddr::new(ip.into(), 0)].into_iter())
             }),
-            Some(Mapped::Fail) => Box::pin(async move {
-                Err(std::io::Error::new(
-                    std::io::ErrorKind::NotFound,
-                    "host not found",
-                ))
-            }),
+            Some(Mapped::Fail) => Box::pin(async move { Err(ResolveFailure::Denied) }),
             None => {
                 let mut system = self.system.clone();
                 Box::pin(async move {
-                    let addrs = Service::call(&mut system, name).await?;
+                    let addrs = Service::call(&mut system, name)
+                        .await
+                        .map_err(ResolveFailure::System)?;
                     Ok(addrs.collect::<Vec<_>>().into_iter())
                 })
             }
@@ -139,7 +136,6 @@ pub(crate) struct HttpEngine {
     pub(crate) timeout_global: Option<Duration>,
     pub(crate) timeout_per_call: Option<Duration>,
     proxied: Option<ProxiedClient>,
-    tls_error: Option<Box<str>>,
 }
 
 type ProxiedClient = Client<HttpsConnector<Tunnel<HttpConnector<HostResolver>>>, RequestBody>;
@@ -160,25 +156,17 @@ impl HttpEngine {
         let mut http = HttpConnector::new_with_resolver(resolver);
         http.enforce_http(false);
         let builder = hyper_rustls::HttpsConnectorBuilder::new().with_native_roots();
-        let (connector, tls_error) = match builder {
-            Ok(builder) => (
-                builder
-                    .https_or_http()
-                    .enable_http1()
-                    .enable_http2()
-                    .wrap_connector(http.clone()),
-                None,
-            ),
-            Err(error) => (
-                hyper_rustls::HttpsConnectorBuilder::new()
-                    .with_webpki_roots()
-                    .https_or_http()
-                    .enable_http1()
-                    .enable_http2()
-                    .wrap_connector(http.clone()),
-                Some(Box::<str>::from(error.to_string())),
-            ),
-        };
+        // A host without a usable system trust store falls back to the
+        // bundled Mozilla roots and keeps working; the fallback is not an
+        // error for the request itself.
+        let connector = match builder {
+            Ok(builder) => builder,
+            Err(_) => hyper_rustls::HttpsConnectorBuilder::new().with_webpki_roots(),
+        }
+        .https_or_http()
+        .enable_http1()
+        .enable_http2()
+        .wrap_connector(http.clone());
         let client = Client::builder(TokioExecutor::new()).build(connector);
         let proxied = proxy.as_deref().and_then(|proxy| {
             let (destination, auth) = proxy_destination(proxy).ok()?;
@@ -203,7 +191,6 @@ impl HttpEngine {
             timeout_global,
             timeout_per_call,
             proxied,
-            tls_error,
         }
     }
 
@@ -226,9 +213,6 @@ impl HttpEngine {
         body: Option<&[u8]>,
         budget: CallBudget,
     ) -> Result<(u16, HeaderMap, Incoming), NetError> {
-        if let Some(detail) = &self.tls_error {
-            return Err(NetError::Transport(TransportError::Tls(detail.clone())));
-        }
         if budget.is_expired() {
             return Err(timed_out(budget.timeout_kind(TimeoutKind::Global)));
         }
@@ -308,6 +292,12 @@ fn map_client_error(error: hyper_util::client::legacy::Error, host: &str) -> Net
         let mut source = std::error::Error::source(&error);
         let mut tls_reason: Option<Box<str>> = None;
         while let Some(cause) = source {
+            // The resolver phase fails before any socket exists: `hyper-util`
+            // wraps `HostResolver`'s error in its connect error, and the typed
+            // cause survives the wrapping.
+            if cause.downcast_ref::<ResolveFailure>().is_some() {
+                return NetError::Transport(TransportError::Dns(host.into()));
+            }
             if cause.downcast_ref::<rustls::Error>().is_some() && tls_reason.is_none() {
                 tls_reason = Some(cause.to_string().into());
             }
