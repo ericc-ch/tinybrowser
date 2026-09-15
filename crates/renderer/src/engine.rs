@@ -224,13 +224,23 @@ impl Engine {
 
     /// Runs every immediately ready task in every frame. Never blocks.
     pub fn drain_ready(&mut self) {
+        // Reconcile around every task so a task that inserts an iframe is
+        // visible to the next task: `contentDocument` must not be null for an
+        // iframe that is already connected
+        // (https://html.spec.whatwg.org/multipage/iframe-embed-object.html#dom-iframe-contentdocument).
+        self.reconcile_frames();
         let frames: Vec<FrameId> = self.frames.keys().copied().collect();
         for frame in frames {
-            let Some(document) = self.frames.get_mut(&frame) else {
-                continue;
-            };
-            document.drain_ready();
-            self.reconcile_frames();
+            loop {
+                let more = match self.frames.get_mut(&frame) {
+                    Some(document) => document.drain_step(),
+                    None => false,
+                };
+                if !more {
+                    break;
+                }
+                self.reconcile_frames();
+            }
         }
     }
 

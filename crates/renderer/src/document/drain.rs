@@ -8,39 +8,29 @@ use super::{Document, MAX_PENDING_JS_FETCHES, QueuedDial, Task, Timer};
 use crate::protocol::TabEvent;
 
 impl Document {
-    /// Runs every immediately ready page task. Never blocks.
+    /// Runs one batch of ready work and reports whether more may follow.
     ///
-    /// The renderer loop owns all waiting: it sleeps until [`Document::next_deadline`]
-    /// or until a dial completion, channel message, or stop wakes it, then calls
-    /// this method again. That is why the page engine needs no private runtime.
-    pub(crate) fn drain_ready(&mut self) {
-        loop {
-            self.adopt_dial_completions();
-            while let Some(id) = self.due_timer() {
-                self.tasks.push_back(Task::Timer(id));
-            }
-            self.adopt_js_work();
-            self.launch_queued_dials();
-            self.adopt_dial_completions();
-            if let Some(task) = self.tasks.pop_front() {
-                self.run_task(task);
-                if self.stopped() {
-                    return;
-                }
-                continue;
-            }
-            if self.stopped() {
-                return;
-            }
-            if self
-                .js
-                .as_ref()
-                .is_some_and(crate::js::JsRealm::has_pending_work)
-            {
-                continue;
-            }
-            return;
+    /// The engine calls this instead of draining the whole document at once so
+    /// it can reconcile frame documents between tasks: a task that inserts an
+    /// iframe must be visible to the next task's `contentDocument` read.
+    pub(crate) fn drain_step(&mut self) -> bool {
+        self.adopt_dial_completions();
+        while let Some(id) = self.due_timer() {
+            self.tasks.push_back(Task::Timer(id));
         }
+        self.adopt_js_work();
+        self.launch_queued_dials();
+        self.adopt_dial_completions();
+        if let Some(task) = self.tasks.pop_front() {
+            self.run_task(task);
+            return !self.stopped();
+        }
+        if self.stopped() {
+            return false;
+        }
+        self.js
+            .as_ref()
+            .is_some_and(crate::js::JsRealm::has_pending_work)
     }
 
     fn adopt_dial_completions(&mut self) {
