@@ -1,80 +1,154 @@
+/// The browser component's host contract.
+///
+/// The component owns pages, cookies, and timers; the host owns the network
+/// transport. Every rule below is a host obligation. A host that cannot honor
+/// one must answer `connect` rather than guess, because the component trusts
+/// these answers for cookie and origin decisions.
 package tinybrowser:browser@0.1.0;
 
 interface types {
     enum fetch-kind {
+        /// A script's `fetch()` or `XMLHttpRequest`.
         js-fetch,
+        /// A classic `<script src>` load.
         classic-script,
     }
 
     record fetch-request {
+        /// Correlates this request with its completion.
         id: u64,
         /// Component-side tab identity; the host routes completions by it.
         owner: u64,
         kind: fetch-kind,
+        /// Absolute `http`/`https` URL to GET.
         url: string,
+        /// Document URL the request is made from.
         initiator: string,
+        /// When false, only status and metadata are used.
         read-body: bool,
+        /// Hard cap on `fetch-response.body`; a larger body is `limit`.
         max-body-bytes: u64,
+        /// Value for the `Cookie` request header; empty means no header.
+        ///
+        /// Browsers forbid scripts from setting `Cookie` and from reading
+        /// `Set-Cookie`, so a host that runs in a browser can only carry this
+        /// value through an intermediary it controls, such as the
+        /// development proxy in this repository's notes.
         cookie: string,
     }
 
     record fetch-response {
+        /// HTTP status of the final response.
         status: u16,
+        /// URL after redirects; used as the document's base URL.
         final-url: string,
+        /// `Content-Type` header, when the transport exposes it.
         content-type: option<string>,
+        /// `Content-Language` header, when the transport exposes it.
         content-language: option<string>,
+        /// Every `Set-Cookie` line of the final response, verbatim.
+        ///
+        /// The component parses and stores them; the host must not filter by
+        /// `HttpOnly`, and must not pre-join multiple lines.
         set-cookies: list<string>,
+        /// Response bytes, capped by `fetch-request.max-body-bytes`.
         body: list<u8>,
     }
 
     enum fetch-error {
+        /// Name resolution failed.
         dns,
+        /// Connection or proxy failure, including rejection by CORS.
         connect,
+        /// TLS handshake or certificate verification failed.
         tls,
+        /// A deadline expired.
         timeout,
+        /// `max-body-bytes` was exceeded, or a redirect cap was hit.
         limit,
+        /// The host had no capacity to start the request.
         queue-full,
+        /// The component cancelled the request, or the tab went away.
         cancelled,
     }
 }
 
+/// Transport the component asks for network work.
 interface host {
     use types.{fetch-request};
 
+    /// Starts one GET and returns whether it was accepted.
+    ///
+    /// A `true` answer obligates the host to call `engine.complete-fetch`
+    /// exactly once for this `id`, with either an `ok` response or an error.
+    /// A `false` answer means the component fails the dial itself, so the
+    /// host must not complete it. The call returns before the request
+    /// settles; the component pumps again once the completion arrives.
     start-fetch: func(request: fetch-request) -> bool;
+
+    /// Stops work for an unfinished request and completes it as `cancelled`.
     cancel-fetch: func(id: u64);
 }
 
+/// Page engine the host drives.
 interface engine {
     use types.{fetch-error, fetch-response};
 
     variant event {
+        /// The document reached `readyState = "complete"` and dispatched
+        /// `load`.
         load,
+        /// A child frame reached `load`; the top frame is unaffected.
         child-load,
+        /// A navigation committed; the document URL now reflects the final URL.
         navigated,
+        /// A navigation dial failed; the tab keeps its previous document.
         navigation-failed,
+        /// A host timer whose delay elapsed.
         timer(u32),
+        /// A `fetch` or navigation job finished with this HTTP status.
         fetch(u16),
+        /// `send` or the body read failed.
         fetch-failed,
+        /// A timer or `fetch` callback threw.
         script-failed,
     }
 
     record frame-event {
+        /// Frame the event happened in; `0` is the tab's main frame.
         frame: u64,
         event: event,
     }
 
+    /// One page, driven by the host.
+    ///
+    /// The host owns the pump loop: it calls `pump` after every state change
+    /// it causes, then waits for the returned delay before pumping again.
+    /// Nothing runs while the host does not pump.
     resource tab {
+        /// Mounts `html` as the tab's first document at `url`.
+        ///
+        /// Fails when `url` is not a valid absolute `http`/`https` URL, in
+        /// which case no tab exists and nothing was mounted.
         constructor(url: string, html: string) -> result<tab, string>;
         /// This tab's `fetch-request.owner` value.
         owner: func() -> u64;
+        /// Evaluates `source` in the main frame and returns its string
+        /// coercion. Throws surface as the error side.
         eval: func(source: string) -> result<string, string>;
+        /// Runs every ready task, then returns milliseconds until the next
+        /// timer, or none when the page has nothing scheduled.
         pump: func() -> option<u64>;
+        /// Drains pending events and clears them from the tab.
         events: func() -> result<list<frame-event>, string>;
         title: func() -> result<string, string>;
         text: func() -> result<string, string>;
     }
 
+    /// Delivers a dial's outcome, returning whether it belonged to a live tab.
+    ///
+    /// A `false` answer means the request was unknown: already cancelled, or
+    /// its tab is gone. The host calls `tab.pump` after a `true` answer.
     complete-fetch: func(id: u64, outcome: result<fetch-response, fetch-error>) -> bool;
 }
 
