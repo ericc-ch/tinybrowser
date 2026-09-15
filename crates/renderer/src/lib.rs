@@ -7,9 +7,9 @@
 
 use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TrySendError};
+use std::sync::mpsc::{SyncSender, TrySendError};
 use std::time::Duration;
 
 use dom::{
@@ -20,6 +20,7 @@ use html5ever::tree_builder::{ElementFlags, NodeOrText, QuirksMode, TreeSink};
 use markup5ever::interface::{TokenizerResult, tree_builder::ElemName};
 use tendril::{StrTendril, TendrilSink};
 
+mod channel;
 mod document;
 mod documents;
 mod engine;
@@ -30,15 +31,20 @@ mod remote;
 mod serialize;
 mod xml;
 
+pub use channel::{
+    Frame, FrameKind, HEADER_BYTES, MAX_BODY_CHUNK_BYTES, MAX_CONTROL_BYTES, PROTOCOL_VERSION,
+    decode_control, read_body, read_body_async, read_control, read_control_async, read_frame,
+    read_frame_async, write_body, write_body_async, write_control, write_control_async,
+    write_frame, write_frame_async,
+};
 use document::Stop;
 use engine::Engine;
-pub use process::serve_stdio;
-use protocol::BrowserServices;
+pub use process::serve;
 pub use protocol::{
-    Command, DialKind, DialOutcome, DialRequest, FrameId, FromRenderer, MAX_IPC_MESSAGE_BYTES,
-    Mount, RENDERER_INBOX_CAPACITY, RENDERER_OUTBOX_CAPACITY, Reply, ResourceLimit, ScriptFailure,
-    ServiceCall, ServiceReply, TabError, TabEvent, ToRenderer, encode_ipc_message,
-    read_ipc_message,
+    Command, DialFailure, DialKind, DialOutcome, DialRequest, FrameId, FromRenderer,
+    MAX_RESPONSE_BODY_BYTES, Mount, RENDERER_INBOX_CAPACITY, RENDERER_OUTBOX_CAPACITY,
+    RendererAssignmentId, Reply, ResourceLimit, ResponseStart, ScriptFailure, ServiceCall,
+    ServiceReply, TabError, TabEvent, ToRenderer,
 };
 pub use remote::RemoteValue;
 
@@ -164,41 +170,236 @@ fn fragment_context_name(spec: &str) -> QualName {
     }
 }
 
-fn run(
-    inbox: &Receiver<ToRenderer>,
+/// Runs the renderer loop until `Shutdown`, channel close, or stop.
+pub(crate) async fn run(
+    mut inbox: tokio::sync::mpsc::Receiver<process::RendererInput>,
     outbox: &SyncSender<FromRenderer>,
-    services: Arc<dyn BrowserServices>,
+    services: Arc<process::ChannelServices>,
     stop: &Arc<Stop>,
+    wake: Arc<tokio::sync::Notify>,
 ) {
-    let mut engine = Engine::new(services, Arc::clone(stop));
+    let mut engines = HashMap::<RendererAssignmentId, Engine>::new();
+    let mut responses = ResponseStreams::default();
     loop {
-        let received = if engine.has_background_work() {
-            inbox.recv_timeout(Duration::from_millis(10))
-        } else {
-            inbox.recv().map_err(|_| RecvTimeoutError::Disconnected)
-        };
-        match received {
-            Ok(ToRenderer::Request { id, command }) => {
-                let (reply, shutdown) = handle_command(&mut engine, command, stop);
-                if !send_to_browser(outbox, FromRenderer::Reply { id, reply }) {
-                    stop.request();
-                    break;
-                }
-                if shutdown {
-                    break;
-                }
-            }
-            // Service replies are routed by the transport, never delivered here.
-            Ok(ToRenderer::ServiceReply { .. }) => {}
-            Err(RecvTimeoutError::Timeout) => engine.drive_for(Duration::from_millis(10)),
-            Err(RecvTimeoutError::Disconnected) => break,
-        }
-        if !publish(&mut engine, outbox) {
+        if !pump_engines(&mut engines, outbox) || stop.is_set() {
             stop.request();
             break;
         }
+        let deadline = engines.values().filter_map(Engine::next_deadline).min();
+        tokio::select! {
+            received = inbox.recv() => match received {
+                Some(process::RendererInput::Control(ToRenderer::Assign { assignment })) => {
+                    if engines.contains_key(&assignment) {
+                        stop.request();
+                        break;
+                    }
+                    let assignment_services = Arc::new(process::AssignmentServices::new(
+                        assignment,
+                        Arc::clone(&services),
+                    ));
+                    engines.insert(
+                        assignment,
+                        Engine::new(assignment_services, Arc::clone(stop), Arc::clone(&wake)),
+                    );
+                }
+                Some(process::RendererInput::Control(ToRenderer::Release { assignment })) => {
+                    responses.release(assignment);
+                    if let Some(mut engine) = engines.remove(&assignment) {
+                        engine.release();
+                    }
+                }
+                Some(process::RendererInput::Control(ToRenderer::Request { id, assignment, command })) => {
+                    let Some(engine) = engines.get_mut(&assignment) else {
+                        if matches!(command, Command::Shutdown) {
+                            stop.request();
+                            break;
+                        }
+                        stop.request();
+                        break;
+                    };
+                    let (reply, shutdown) = handle_command(engine, command, stop);
+                    if !send_to_browser(outbox, FromRenderer::Reply { id, assignment, reply }) {
+                        stop.request();
+                        break;
+                    }
+                    if shutdown {
+                        break;
+                    }
+                }
+                Some(process::RendererInput::Control(ToRenderer::ResponseStart { id, response })) => {
+                    let Some(engine) = engines.get_mut(&response.assignment) else {
+                        stop.request();
+                        break;
+                    };
+                    if responses.start(id, response, engine).is_err() {
+                        stop.request();
+                        break;
+                    }
+                }
+                Some(process::RendererInput::Body { request, bytes }) => {
+                    if responses.push(request, &bytes, &mut engines).is_err() {
+                        stop.request();
+                        break;
+                    }
+                }
+                Some(process::RendererInput::Control(ToRenderer::ResponseEnd { id })) => {
+                    let (assignment, result) = responses.finish(id, &mut engines);
+                    let reply = Reply::Unit(result);
+                    if !send_to_browser(outbox, FromRenderer::Reply { id, assignment, reply }) {
+                        stop.request();
+                        break;
+                    }
+                }
+                Some(process::RendererInput::Control(ToRenderer::ResponseError { id, failure })) => {
+                    let (assignment, result) = responses.abort(id, failure);
+                    let reply = Reply::Unit(result);
+                    if !send_to_browser(outbox, FromRenderer::Reply { id, assignment, reply }) {
+                        stop.request();
+                        break;
+                    }
+                }
+                // The transport consumes the handshake, response stream, and
+                // service replies; none reaches this loop.
+                Some(
+                    process::RendererInput::Control(
+                        ToRenderer::Hello | ToRenderer::ServiceReply { .. },
+                    ),
+                ) => {}
+                None => break,
+            },
+            () = wake.notified() => {}
+            () = wait_for_deadline(deadline) => {}
+        }
     }
-    engine.shutdown();
+    for (_, mut engine) in engines {
+        engine.shutdown();
+    }
+}
+
+fn pump_engines(
+    engines: &mut HashMap<RendererAssignmentId, Engine>,
+    outbox: &SyncSender<FromRenderer>,
+) -> bool {
+    for (assignment, engine) in engines {
+        engine.pump_ready();
+        if !publish(*assignment, engine, outbox) {
+            return false;
+        }
+    }
+    true
+}
+
+struct ActiveResponse {
+    assignment: RendererAssignmentId,
+    frame: FrameId,
+    bytes: usize,
+    decoder: document::ResponseDecoder,
+}
+
+#[derive(Default)]
+struct ResponseStreams(HashMap<u64, ActiveResponse>);
+
+impl ResponseStreams {
+    fn start(
+        &mut self,
+        id: u64,
+        response: ResponseStart,
+        engine: &mut Engine,
+    ) -> Result<(), TabError> {
+        if self.0.contains_key(&id) {
+            return Err(stream_error("duplicate response start"));
+        }
+        engine.open_response(&response)?;
+        self.0.insert(
+            id,
+            ActiveResponse {
+                assignment: response.assignment,
+                frame: response.frame,
+                bytes: 0,
+                decoder: document::ResponseDecoder::new(response.content_type),
+            },
+        );
+        Ok(())
+    }
+
+    fn push(
+        &mut self,
+        id: u64,
+        bytes: &[u8],
+        engines: &mut HashMap<RendererAssignmentId, Engine>,
+    ) -> Result<(), TabError> {
+        let response = self
+            .0
+            .get_mut(&id)
+            .ok_or_else(|| stream_error("body frame without response start"))?;
+        response.bytes = response.bytes.saturating_add(bytes.len());
+        if response.bytes > MAX_RESPONSE_BODY_BYTES {
+            return Err(stream_error("streamed response exceeds body limit"));
+        }
+        engines
+            .get_mut(&response.assignment)
+            .ok_or_else(|| stream_error("response assignment is gone"))?
+            .write_response(response.frame, response.decoder.push(bytes))
+    }
+
+    fn finish(
+        &mut self,
+        id: u64,
+        engines: &mut HashMap<RendererAssignmentId, Engine>,
+    ) -> (RendererAssignmentId, Result<(), TabError>) {
+        let Some(response) = self.0.remove(&id) else {
+            return (
+                RendererAssignmentId::new(0),
+                Err(stream_error("response end without start")),
+            );
+        };
+        let assignment = response.assignment;
+        let result = engines
+            .get_mut(&assignment)
+            .ok_or_else(|| stream_error("response assignment is gone"))
+            .and_then(|engine| {
+                engine.write_response(response.frame, response.decoder.finish())?;
+                engine.close_response(response.frame)
+            });
+        (assignment, result)
+    }
+
+    fn abort(
+        &mut self,
+        id: u64,
+        failure: DialFailure,
+    ) -> (RendererAssignmentId, Result<(), TabError>) {
+        let Some(response) = self.0.remove(&id) else {
+            return (
+                RendererAssignmentId::new(0),
+                Err(stream_error("response error without start")),
+            );
+        };
+        (
+            response.assignment,
+            Err(stream_error(&format!(
+                "streamed response failed: {failure:?}"
+            ))),
+        )
+    }
+
+    fn release(&mut self, assignment: RendererAssignmentId) {
+        self.0
+            .retain(|_, response| response.assignment != assignment);
+    }
+}
+
+fn stream_error(message: &str) -> TabError {
+    TabError::RendererUnavailable {
+        message: message.to_owned(),
+    }
+}
+
+async fn wait_for_deadline(deadline: Option<tokio::time::Instant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(deadline).await,
+        None => std::future::pending().await,
+    }
 }
 
 fn handle_command(
@@ -225,12 +426,23 @@ fn handle_command(
     }
 }
 
-fn publish(engine: &mut Engine, outbox: &SyncSender<FromRenderer>) -> bool {
+fn publish(
+    assignment: RendererAssignmentId,
+    engine: &mut Engine,
+    outbox: &SyncSender<FromRenderer>,
+) -> bool {
     let Ok(events) = engine.take_events() else {
         return false;
     };
     for (frame, event) in events {
-        if !send_to_browser(outbox, FromRenderer::Event { frame, event }) {
+        if !send_to_browser(
+            outbox,
+            FromRenderer::Event {
+                assignment,
+                frame,
+                event,
+            },
+        ) {
             return false;
         }
     }

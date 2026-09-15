@@ -27,7 +27,7 @@ pub struct DaemonEndpoint {
 /// # Errors
 ///
 /// Bind, registration, or serve failure.
-pub fn run(profile: &Profile, data_home: &Path) -> io::Result<()> {
+pub async fn run(profile: &Profile, data_home: &Path) -> io::Result<()> {
     let runtime = profile_runtime_dir(profile.name())?;
     fs::create_dir_all(&runtime)?;
     restrict_dir(&runtime)?;
@@ -50,9 +50,11 @@ pub fn run(profile: &Profile, data_home: &Path) -> io::Result<()> {
     let initial = browser
         .handle()
         .create_tab()
+        .await
         .map_err(|error| io::Error::other(error.to_string()))?;
     initial
         .load_html("<!doctype html><title></title>")
+        .await
         .map_err(|error| io::Error::other(error.to_string()))?;
     // Publish only once the browser can actually serve; a start-up failure
     // must not leave an endpoint pointing at a dead port.
@@ -64,7 +66,10 @@ pub fn run(profile: &Profile, data_home: &Path) -> io::Result<()> {
             port: addr.port(),
         },
     )?;
-    let result = cdp::serve(&listener, &browser.handle());
+    let result = cdp::serve(&listener, &browser.handle()).await;
+    if result.is_err() {
+        let _close_result = browser.handle().close().await;
+    }
     let _ = fs::remove_file(&lock_path);
     result
 }

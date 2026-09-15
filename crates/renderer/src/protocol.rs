@@ -5,20 +5,12 @@
 //! `QuickJS` values, callbacks, and `net` types never do.
 
 use std::fmt;
-use std::io::{self, BufRead, Read, Write};
 use std::sync::Arc;
 
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde::{Deserialize, Serialize};
 use url::Url;
 
 use crate::RemoteValue;
-
-/// Maximum encoded size of one browser/renderer IPC message.
-///
-/// Navigation bodies are capped at 1 MiB by the browser. The larger wire cap
-/// leaves room for JSON's byte-array expansion and structured script results
-/// while bounding allocation before deserialization.
-pub const MAX_IPC_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
 
 /// Maximum browser-to-renderer commands retained by one renderer transport.
 pub const RENDERER_INBOX_CAPACITY: usize = 256;
@@ -26,90 +18,25 @@ pub const RENDERER_INBOX_CAPACITY: usize = 256;
 /// Maximum renderer-to-browser messages retained by one renderer transport.
 pub const RENDERER_OUTBOX_CAPACITY: usize = 4096;
 
-/// Encodes one newline-delimited IPC message after enforcing the wire budget.
-///
-/// # Errors
-///
-/// Serialization failure or a message larger than [`MAX_IPC_MESSAGE_BYTES`].
-pub fn encode_ipc_message<T: Serialize>(message: &T) -> io::Result<Vec<u8>> {
-    let mut encoded = IpcBuffer::new();
-    serde_json::to_writer(&mut encoded, message).map_err(|error| {
-        if error.io_error_kind() == Some(io::ErrorKind::InvalidData) {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                "renderer IPC message exceeds limit",
-            )
-        } else {
-            io::Error::other(error)
-        }
-    })?;
-    Ok(encoded.bytes)
-}
+/// Maximum aggregate bytes retained for one streamed response.
+pub const MAX_RESPONSE_BODY_BYTES: usize = 1_048_576;
 
-struct IpcBuffer {
-    bytes: Vec<u8>,
-}
+/// Browser-minted identity of one top-level document hosted by a renderer.
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct RendererAssignmentId(u64);
 
-impl IpcBuffer {
-    fn new() -> Self {
-        Self {
-            bytes: Vec::with_capacity(1024),
-        }
-    }
-}
-
-impl Write for IpcBuffer {
-    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        if bytes.len() > MAX_IPC_MESSAGE_BYTES.saturating_sub(self.bytes.len()) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "renderer IPC message exceeds limit",
-            ));
-        }
-        self.bytes.extend_from_slice(bytes);
-        Ok(bytes.len())
+impl RendererAssignmentId {
+    /// Constructs an assignment id from a browser-process integer.
+    #[must_use]
+    pub fn new(raw: u64) -> Self {
+        Self(raw)
     }
 
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
+    /// Stable numeric identity for protocol messages.
+    #[must_use]
+    pub fn get(self) -> u64 {
+        self.0
     }
-}
-
-/// Reads one newline-delimited IPC message without permitting an unbounded
-/// line allocation.
-///
-/// # Errors
-///
-/// I/O failure, invalid JSON, a missing delimiter, or an oversized message.
-pub fn read_ipc_message<T: DeserializeOwned>(
-    reader: &mut impl BufRead,
-    buffer: &mut Vec<u8>,
-) -> io::Result<Option<T>> {
-    buffer.clear();
-    let mut limited = reader.take((MAX_IPC_MESSAGE_BYTES + 2) as u64);
-    let read = limited.read_until(b'\n', buffer)?;
-    if read == 0 {
-        return Ok(None);
-    }
-    if !buffer.ends_with(b"\n") {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "renderer IPC message exceeds limit or is not delimited",
-        ));
-    }
-    buffer.pop();
-    if buffer.ends_with(b"\r") {
-        buffer.pop();
-    }
-    if buffer.len() > MAX_IPC_MESSAGE_BYTES {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "renderer IPC message exceeds limit",
-        ));
-    }
-    serde_json::from_slice(buffer)
-        .map(Some)
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
 }
 
 /// Renderer-process identity of one frame.
@@ -187,9 +114,9 @@ impl std::error::Error for TabError {}
 /// Browser-owned retained-resource budgets exposed through [`TabError`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ResourceLimit {
-    /// Concurrent waits retained by one tab actor.
+    /// Concurrent waits retained by one tab coordinator.
     TabWaiters,
-    /// Event subscriptions retained by one tab actor.
+    /// Event subscriptions retained by one tab coordinator.
     TabSubscribers,
 }
 
@@ -295,6 +222,7 @@ pub struct Mount {
     /// HTTP `Content-Language`, when the document came from the network.
     pub content_language: Option<String>,
     /// Raw document bytes; the renderer decodes them.
+    #[serde(skip, default)]
     pub body: Vec<u8>,
 }
 
@@ -312,12 +240,46 @@ pub enum Reply {
 /// Host to renderer traffic.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum ToRenderer {
+    /// First frame from the browser process: protocol handshake.
+    Hello,
+    /// Creates an isolated page engine inside this renderer process.
+    Assign {
+        /// Browser-minted assignment identity.
+        assignment: RendererAssignmentId,
+    },
+    /// Removes one page engine from this renderer process.
+    Release {
+        /// Browser-minted assignment identity.
+        assignment: RendererAssignmentId,
+    },
     /// One command with its correlation id.
     Request {
         /// Request id chosen by the browser process.
         id: u64,
+        /// Top-level document that owns the command.
+        assignment: RendererAssignmentId,
         /// The command.
         command: Command,
+    },
+    /// Starts a streamed top-level response. Raw body frames with the same id
+    /// follow before [`ToRenderer::ResponseEnd`].
+    ResponseStart {
+        /// Request id chosen by the browser process.
+        id: u64,
+        /// Response metadata needed to mount the completed body.
+        response: ResponseStart,
+    },
+    /// Completes a streamed top-level response.
+    ResponseEnd {
+        /// Request id from [`ToRenderer::ResponseStart`].
+        id: u64,
+    },
+    /// Aborts a streamed top-level response.
+    ResponseError {
+        /// Request id from [`ToRenderer::ResponseStart`].
+        id: u64,
+        /// Typed transport failure.
+        failure: DialFailure,
     },
     /// Answer to a [`ServiceCall`].
     ServiceReply {
@@ -326,6 +288,23 @@ pub enum ToRenderer {
         /// The answer.
         reply: ServiceReply,
     },
+}
+
+/// Metadata sent before the raw bytes of a top-level response.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ResponseStart {
+    /// Top-level document receiving this response.
+    pub assignment: RendererAssignmentId,
+    /// Frame that will receive the document.
+    pub frame: FrameId,
+    /// Final HTTP status.
+    pub status: u16,
+    /// Final URL after redirects.
+    pub final_url: String,
+    /// HTTP `Content-Type`, when present.
+    pub content_type: Option<String>,
+    /// HTTP `Content-Language`, when present.
+    pub content_language: Option<String>,
 }
 
 /// Renderer to host traffic.
@@ -337,11 +316,15 @@ pub enum FromRenderer {
     Reply {
         /// Request id from [`ToRenderer::Request`].
         id: u64,
+        /// Top-level document that produced the reply.
+        assignment: RendererAssignmentId,
         /// The answer.
         reply: Reply,
     },
     /// Unsolicited document event.
     Event {
+        /// Top-level document that emitted the event.
+        assignment: RendererAssignmentId,
         /// Frame that emitted the event.
         frame: FrameId,
         /// The event.
@@ -349,6 +332,8 @@ pub enum FromRenderer {
     },
     /// A browser service the renderer cannot perform itself.
     ServiceCall {
+        /// Top-level document requesting the browser service.
+        assignment: RendererAssignmentId,
         /// Service-call id chosen by the renderer.
         id: u64,
         /// The call.
@@ -378,12 +363,31 @@ pub enum ServiceCall {
 /// Answer to a [`ServiceCall`].
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum ServiceReply {
-    /// Dial result; `None` is a transport/limit failure.
-    Dial(Option<DialOutcome>),
+    /// Dial result, with a typed failure.
+    Dial(Result<DialOutcome, DialFailure>),
     /// Cookie getter result.
     Cookie(String),
     /// No payload (`CookieSet`).
     Unit,
+}
+
+/// Why a browser-service dial failed. Preserved across the renderer seam.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DialFailure {
+    /// Host lookup failed.
+    Dns,
+    /// TCP or proxy connect failed.
+    Connect,
+    /// TLS handshake or certificate verification failed.
+    Tls,
+    /// A deadline expired.
+    Timeout,
+    /// A body or redirect cap was exceeded.
+    Limit,
+    /// A network permit was not available before the deadline.
+    QueueFull,
+    /// Navigation replacement, tab close, or renderer death cancelled the dial.
+    Cancelled,
 }
 
 /// Why the renderer is dialing.
@@ -424,7 +428,8 @@ pub struct DialOutcome {
 }
 
 /// Completion for a dial submitted to the browser process.
-pub(crate) type DialCompletion = Arc<dyn Fn(Option<DialOutcome>) + Send + Sync + 'static>;
+pub(crate) type DialCompletion =
+    Arc<dyn Fn(Result<DialOutcome, DialFailure>) + Send + Sync + 'static>;
 
 /// Host services the renderer reaches through the browser-process seam.
 ///
@@ -479,6 +484,7 @@ mod tests {
         for number in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
             let message = FromRenderer::Reply {
                 id: 3,
+                assignment: RendererAssignmentId::new(1),
                 reply: Reply::Value(Ok(RemoteValue::Number(number))),
             };
             round_trip(&message);
@@ -500,31 +506,37 @@ mod tests {
     }
 
     #[test]
-    fn ipc_codec_rejects_messages_over_the_wire_budget() {
+    fn control_messages_round_trip_through_the_frame_codec() {
         let message = ToRenderer::Request {
             id: 1,
+            assignment: RendererAssignmentId::new(1),
             command: Command::Eval {
                 frame: FrameId::MAIN,
-                source: "x".repeat(MAX_IPC_MESSAGE_BYTES),
+                source: "x".repeat(1024),
             },
         };
-        let error = encode_ipc_message(&message).expect_err("oversized message");
-        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-
-        let mut bytes = vec![b'0'; MAX_IPC_MESSAGE_BYTES + 1];
-        bytes.push(b'\n');
-        let mut reader = io::Cursor::new(bytes);
+        let mut bytes = Vec::new();
+        crate::channel::write_control(&mut bytes, &message).expect("write");
+        let mut reader = std::io::Cursor::new(bytes);
         let mut buffer = Vec::new();
-        let error = read_ipc_message::<serde_json::Value>(&mut reader, &mut buffer)
-            .expect_err("oversized frame");
-        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        let back: ToRenderer = crate::channel::read_control(&mut reader, &mut buffer)
+            .expect("read")
+            .expect("one frame");
+        assert!(matches!(back, ToRenderer::Request { id: 1, .. }));
     }
 
     #[test]
     fn host_to_renderer_messages_round_trip() {
         let messages = [
+            ToRenderer::Assign {
+                assignment: RendererAssignmentId::new(1),
+            },
+            ToRenderer::Release {
+                assignment: RendererAssignmentId::new(1),
+            },
             ToRenderer::Request {
                 id: 1,
+                assignment: RendererAssignmentId::new(1),
                 command: Command::Mount {
                     frame: FrameId::MAIN,
                     mount: Mount {
@@ -537,6 +549,7 @@ mod tests {
             },
             ToRenderer::Request {
                 id: 2,
+                assignment: RendererAssignmentId::new(1),
                 command: Command::Eval {
                     frame: FrameId::new(3),
                     source: "1+1".into(),
@@ -544,6 +557,7 @@ mod tests {
             },
             ToRenderer::Request {
                 id: 3,
+                assignment: RendererAssignmentId::new(1),
                 command: Command::ExecuteScript {
                     frame: FrameId::MAIN,
                     source: "x".into(),
@@ -552,7 +566,24 @@ mod tests {
             },
             ToRenderer::Request {
                 id: 6,
+                assignment: RendererAssignmentId::new(1),
                 command: Command::Shutdown,
+            },
+            ToRenderer::ResponseStart {
+                id: 10,
+                response: ResponseStart {
+                    assignment: RendererAssignmentId::new(1),
+                    frame: FrameId::MAIN,
+                    status: 200,
+                    final_url: "http://example.test/".into(),
+                    content_type: Some("text/html".into()),
+                    content_language: None,
+                },
+            },
+            ToRenderer::ResponseEnd { id: 10 },
+            ToRenderer::ResponseError {
+                id: 11,
+                failure: DialFailure::Timeout,
             },
             ToRenderer::ServiceReply {
                 id: 7,
@@ -560,7 +591,7 @@ mod tests {
             },
             ToRenderer::ServiceReply {
                 id: 8,
-                reply: ServiceReply::Dial(Some(DialOutcome {
+                reply: ServiceReply::Dial(Ok(DialOutcome {
                     status: 200,
                     final_url: "http://example.test/".into(),
                     content_type: Some("text/html".into()),
@@ -579,30 +610,55 @@ mod tests {
     }
 
     #[test]
+    fn mount_body_is_not_part_of_control_json() {
+        let message = ToRenderer::Request {
+            id: 1,
+            assignment: RendererAssignmentId::new(1),
+            command: Command::Mount {
+                frame: FrameId::MAIN,
+                mount: Mount {
+                    url: "http://example.test/".into(),
+                    content_type: Some("text/html".into()),
+                    content_language: None,
+                    body: vec![1, 2, 3],
+                },
+            },
+        };
+        let value = serde_json::to_value(message).expect("serialize");
+        assert!(value.pointer("/Request/command/Mount/mount/body").is_none());
+    }
+
+    #[test]
     fn renderer_to_host_messages_round_trip() {
         let messages = [
             FromRenderer::Ready,
             FromRenderer::Reply {
                 id: 1,
+                assignment: RendererAssignmentId::new(1),
                 reply: Reply::Unit(Ok(())),
             },
             FromRenderer::Reply {
                 id: 2,
+                assignment: RendererAssignmentId::new(1),
                 reply: Reply::Unit(Err(TabError::Script(ScriptFailure::Interrupted))),
             },
             FromRenderer::Reply {
                 id: 3,
+                assignment: RendererAssignmentId::new(1),
                 reply: Reply::Text(Ok("ok".into())),
             },
             FromRenderer::Reply {
                 id: 5,
+                assignment: RendererAssignmentId::new(1),
                 reply: Reply::Value(Ok(RemoteValue::List(vec![RemoteValue::Number(1.0)]))),
             },
             FromRenderer::Event {
+                assignment: RendererAssignmentId::new(1),
                 frame: FrameId::MAIN,
                 event: TabEvent::Fetch { status: 404 },
             },
             FromRenderer::ServiceCall {
+                assignment: RendererAssignmentId::new(1),
                 id: 6,
                 call: ServiceCall::Dial(DialRequest {
                     kind: DialKind::JsFetch,
@@ -612,12 +668,14 @@ mod tests {
                 }),
             },
             FromRenderer::ServiceCall {
+                assignment: RendererAssignmentId::new(1),
                 id: 7,
                 call: ServiceCall::CookieGet {
                     url: "http://example.test/".into(),
                 },
             },
             FromRenderer::ServiceCall {
+                assignment: RendererAssignmentId::new(1),
                 id: 8,
                 call: ServiceCall::CookieSet {
                     value: "a=1".into(),

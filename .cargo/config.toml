@@ -1,2 +1,8 @@
 [env]
 RUST_TEST_THREADS = "1"
+
+# `--icf=all` folds identical code sections and saves about 64 KB in the
+# release binary. GNU ld.bfd rejects the flag, so select rustc's bundled LLD.
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "link-arg=-fuse-ld=lld", "-C", "link-arg=-Wl,--icf=all"]
+

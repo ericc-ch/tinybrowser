@@ -1,7 +1,37 @@
+use std::fmt;
 use std::net::Ipv4Addr;
 use std::sync::Arc;
 
 use crate::error::{NetError, ProtocolError};
+
+/// Resolution-phase failure. `hyper-util` wraps it in its own connect error;
+/// keeping a distinct type lets [`crate::transport`] classify the failure as
+/// DNS instead of guessing from the message text.
+#[derive(Debug)]
+pub(crate) enum ResolveFailure {
+    /// System resolver (`getaddrinfo`) failure.
+    System(std::io::Error),
+    /// A `--resolve=PATTERN=fail` rule denied the name.
+    Denied,
+}
+
+impl fmt::Display for ResolveFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::System(error) => write!(f, "system resolver failed: {error}"),
+            Self::Denied => f.write_str("host not found"),
+        }
+    }
+}
+
+impl std::error::Error for ResolveFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::System(error) => Some(error),
+            Self::Denied => None,
+        }
+    }
+}
 
 /// One `--resolve=PATTERN=ADDR` rule. First match wins.
 #[derive(Clone, Debug, Eq, PartialEq)]

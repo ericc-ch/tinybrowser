@@ -10,7 +10,8 @@ batched file writer. The API is Rust-shaped, not an Effect port: one
 process-global logger, macros, `FromStr`, no generic output types, services,
 fibers, or layers.
 
-Status: proposed (2026-09-12). Adds a leaf crate to the graph of
+Status: accepted (2026-09-12) and amended by
+[ADR 0019](0019-async-browser-runtime-and-io.md). Adds a leaf crate to the graph of
 [ADR 0007](0007-engine-charter.md) and crosses the renderer seam of
 [ADR 0011](0011-renderer-processes-per-site.md) with one stderr pipe. Does not
 change any protocol, `TabHandle`, or the daemon contract of
@@ -59,8 +60,8 @@ and `webdriver` adopt it where they have diagnostics, and `dom`/`net` do not
 ### 3. Console sink writes to stderr, one logfmt line per record
 
 stdout is reserved in every mode: CLI commands print results there, and a
-renderer child's stdout **is** the JSON IPC seam. Console records therefore go
-to stderr. This is exactly what Effect's `LogToStderr` reference exists for
+renderer child keeps protocol traffic on its inherited platform channel.
+Console records therefore go to stderr. This is exactly what Effect's `LogToStderr` reference exists for
 ("route built-in logger output to stderr while keeping stdout reserved for
 protocol messages or data output"). A later `--log-stdout` flag is additive;
 v1 has no stdout sink.
@@ -119,16 +120,16 @@ computed locally (day-from-civil), no `chrono`.
 | CLI command | stderr | no | its own `--log-level`/`--verbose` |
 | `daemon` | stderr (null when detached) | `<data_home>/tinybrowser/logs/<profile>.log` | its own flags, passed by the spawner |
 | `webdriver` | stderr | same per-profile file | its own flags |
-| renderer child | stderr, forwarded | no | `TINYBROWSER_LOG` env from browser |
+| renderer child | stderr, forwarded asynchronously | no | `TINYBROWSER_LOG` env from browser |
 
 - `data_home` is `ProfileStore::data_home()`; logs sit next to the store, not
   inside the locked `profiles/<name>` directory. Unresolvable home → console
   only.
-- The browser spawns renderers with `Stdio::piped()` stderr and a
-  `renderer-{id}-stderr` pump thread that forwards each line with
-  `log_forwarded`, so renderer records reach the daemon's console and file with
-  `process=renderer`. This keeps **one file writer** for the daemon (no
-  cross-process rotation races) and keeps `stdout` pure IPC.
+- The browser spawns renderers with `Stdio::piped()` stderr. An async task
+  forwards each line with `log_forwarded`, so renderer records reach the
+  daemon's console and file with `process=renderer`. This keeps **one file
+  writer** for the daemon and avoids cross-process rotation races. Renderer
+  protocol traffic stays on the separate platform channel.
 - The renderer child receives `TINYBROWSER_LOG=<level>` from the browser;
   `main` reads it in the `renderer` command. A daemon keeps the level from
   its own `--log-level`/`--verbose`, or from `TINYBROWSER_LOG` when those
@@ -153,7 +154,7 @@ buffered batch and any records still queued.
   `Config`, per-profile log path, flush wrapper; fatal errors become
   `logging::error!` after install.
 - `src/daemon.rs`: the daemon logs its bound port.
-- `crates/browser/src/link.rs`: piped stderr + forwarding thread;
+- Renderer process management: piped stderr plus an async forwarding task;
   `TINYBROWSER_LOG` for the child.
 - `crates/*/Cargo.toml`, root `Cargo.toml`: workspace member and dependencies.
 
@@ -166,11 +167,12 @@ buffered batch and any records still queued.
 - **A file sink must never apply backpressure to a page.** The renderer thread
   owns `Dom` and QuickJS; a synchronous file write on a slow disk would stall
   script execution. The bounded queue plus drop counter isolates that.
-- **stderr is the only safe console channel.** stdout is result data in the CLI
-  and protocol JSON in the renderer. Putting logs there breaks both.
+- **stderr is the only safe console channel.** stdout is result data in the CLI,
+  and renderer protocol data uses a separate private channel. Stderr keeps
+  diagnostics separate from both.
 - **One writer per file.** Renderer file logging or a shared O_APPEND file
-  would make rotation and interleaving racy; forwarding through the browser
-  costs one pipe and one thread per renderer.
+  would make rotation and interleaving racy. The browser forwards each renderer's
+  stderr from an async task.
 
 ## Consequences
 

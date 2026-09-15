@@ -8,7 +8,7 @@
 
 use std::collections::HashMap;
 use std::net::TcpListener;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::Router;
@@ -18,6 +18,7 @@ use axum::http::{Method, StatusCode, Uri};
 use axum::response::{IntoResponse, Json, Response};
 use browser::{BrowserHandle, RemoteValue, ScriptFailure, TabError, TabHandle};
 use serde_json::{Value, json};
+use tokio::sync::Mutex;
 
 pub use browser::AgentBuilder;
 
@@ -32,27 +33,20 @@ const DEFAULT_PAGE_LOAD_TIMEOUT: Duration = Duration::from_secs(300);
 /// # Errors
 ///
 /// Returns when the listener cannot be converted or serving fails.
-pub fn serve(listener: &TcpListener, browser: BrowserHandle) -> std::io::Result<()> {
+pub async fn serve(listener: &TcpListener, browser: BrowserHandle) -> std::io::Result<()> {
     let std_listener = listener.try_clone()?;
     std_listener.set_nonblocking(true)?;
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()?;
     let sessions = Arc::new(Mutex::new(Sessions {
         browser,
         next_session: 0,
         next_window: 0,
         open: HashMap::new(),
     }));
-    let result: std::io::Result<()> = runtime.block_on(async move {
-        let listener = tokio::net::TcpListener::from_std(std_listener)?;
-        let app = Router::new()
-            .fallback(dispatch_request)
-            .with_state(AppState { sessions });
-        axum::serve(listener, app).await
-    });
-    result
+    let listener = tokio::net::TcpListener::from_std(std_listener)?;
+    let app = Router::new()
+        .fallback(dispatch_request)
+        .with_state(AppState { sessions });
+    axum::serve(listener, app).await
 }
 
 #[derive(Clone)]
@@ -69,27 +63,8 @@ async fn dispatch_request(
     let method = method.as_str().to_owned();
     let path = uri.path().to_owned();
     let body = String::from_utf8_lossy(&body).into_owned();
-    let sessions = Arc::clone(&state.sessions);
-    let result = tokio::task::spawn_blocking(move || {
-        let mut sessions = sessions
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        dispatch(&method, &path, &body, &mut sessions)
-    })
-    .await;
-    let Ok((status, payload)) = result else {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({
-                "value": {
-                    "error": "unknown error",
-                    "message": "dispatch panicked",
-                    "stacktrace": ""
-                }
-            })),
-        )
-            .into_response();
-    };
+    let mut sessions = state.sessions.lock().await;
+    let (status, payload) = dispatch(&method, &path, &body, &mut sessions).await;
     let status = StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
     let mut response = (status, Json(payload)).into_response();
     // W3C WebDriver JSON is UTF-8; keep the charset the old adapter wrote.
@@ -119,21 +94,25 @@ struct Window {
 }
 
 impl Sessions {
-    fn blank_window(&self) -> Result<Window, String> {
-        let tab = self.browser.create_tab().map_err(|err| err.to_string())?;
-        if let Err(error) = tab.load_html("<!doctype html><title></title>") {
-            let _ = self.browser.close_tab(tab.id());
+    async fn blank_window(&self) -> Result<Window, String> {
+        let tab = self
+            .browser
+            .create_tab()
+            .await
+            .map_err(|err| err.to_string())?;
+        if let Err(error) = tab.load_html("<!doctype html><title></title>").await {
+            let _result = self.browser.close_tab(tab.id()).await;
             return Err(error.to_string());
         }
         Ok(Window { tab })
     }
 
-    fn create(&mut self) -> Result<String, String> {
+    async fn create(&mut self) -> Result<String, String> {
         self.next_session += 1;
         let id = format!("s{}", self.next_session);
         self.next_window += 1;
         let handle = format!("w{}", self.next_window);
-        let window = self.blank_window()?;
+        let window = self.blank_window().await?;
         self.open.insert(
             id.clone(),
             Session {
@@ -147,7 +126,7 @@ impl Sessions {
     }
 }
 
-fn dispatch(method: &str, path: &str, body: &str, sessions: &mut Sessions) -> (u16, Value) {
+async fn dispatch(method: &str, path: &str, body: &str, sessions: &mut Sessions) -> (u16, Value) {
     let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
     match (method, segments.as_slice()) {
         ("GET", ["status"]) => ok(json!({"ready": true, "message": "ready"})),
@@ -155,7 +134,7 @@ fn dispatch(method: &str, path: &str, body: &str, sessions: &mut Sessions) -> (u
             if !sessions.open.is_empty() {
                 return error(500, "session not created", "already have a session");
             }
-            match sessions.create() {
+            match sessions.create().await {
                 Ok(id) => {
                     ok(json!({"sessionId": id, "capabilities": {"browserName": "tinybrowser"}}))
                 }
@@ -166,19 +145,19 @@ fn dispatch(method: &str, path: &str, body: &str, sessions: &mut Sessions) -> (u
             sessions.open.remove(*session);
             ok(Value::Null)
         }
-        ("POST", ["session", session, "url"]) => navigate(sessions, session, body),
-        ("GET", ["session", session, "url"]) => current_url(sessions, session),
+        ("POST", ["session", session, "url"]) => navigate(sessions, session, body).await,
+        ("GET", ["session", session, "url"]) => current_url(sessions, session).await,
         ("POST", ["session", session, "execute", "sync"]) => {
-            execute(sessions, session, body, false)
+            execute(sessions, session, body, false).await
         }
         ("POST", ["session", session, "execute", "async"]) => {
-            execute(sessions, session, body, true)
+            execute(sessions, session, body, true).await
         }
         ("GET", ["session", session, "window"]) => current_window(sessions, session),
         ("GET", ["session", session, "window", "handles"]) => window_handles(sessions, session),
         ("POST", ["session", session, "window"]) => switch_window(sessions, session, body),
-        ("POST", ["session", session, "window", "new"]) => new_window(sessions, session),
-        ("DELETE", ["session", session, "window"]) => close_window(sessions, session),
+        ("POST", ["session", session, "window", "new"]) => new_window(sessions, session).await,
+        ("DELETE", ["session", session, "window"]) => close_window(sessions, session).await,
         ("GET", ["session", _session, "window", "rect"]) => {
             ok(json!({"x":0,"y":0,"width":800,"height":600}))
         }
@@ -206,7 +185,7 @@ fn dispatch(method: &str, path: &str, body: &str, sessions: &mut Sessions) -> (u
     }
 }
 
-fn navigate(sessions: &mut Sessions, session: &str, body: &str) -> (u16, Value) {
+async fn navigate(sessions: &mut Sessions, session: &str, body: &str) -> (u16, Value) {
     let Some(url) = serde_json::from_str::<Value>(body)
         .ok()
         .and_then(|value| value.get("url").and_then(Value::as_str).map(str::to_owned))
@@ -220,14 +199,14 @@ fn navigate(sessions: &mut Sessions, session: &str, body: &str) -> (u16, Value) 
     let Some(window) = current(sessions, session) else {
         return error(404, "invalid session id", session);
     };
-    match window.tab.goto(&url) {
+    match window.tab.goto(&url).await {
         Ok(()) => {
-            match window.tab.run_until_load_timeout(page_load_timeout) {
+            match window.tab.run_until_load_timeout(page_load_timeout).await {
                 Ok(false) => return error(500, "timeout", "navigation timed out"),
                 Ok(true) => {}
                 Err(err) => return error(500, "unknown error", &err.to_string()),
             }
-            match window.tab.last_navigation_failed() {
+            match window.tab.last_navigation_failed().await {
                 Ok(true) => error(500, "unknown error", "navigation failed"),
                 Ok(false) => ok(Value::Null),
                 Err(err) => error(500, "unknown error", &err.to_string()),
@@ -238,9 +217,9 @@ fn navigate(sessions: &mut Sessions, session: &str, body: &str) -> (u16, Value) 
     }
 }
 
-fn current_url(sessions: &Sessions, session: &str) -> (u16, Value) {
+async fn current_url(sessions: &Sessions, session: &str) -> (u16, Value) {
     match current(sessions, session) {
-        Some(window) => match window.tab.document_url() {
+        Some(window) => match window.tab.document_url().await {
             Ok(url) => ok(json!(url)),
             Err(err) => error(500, "unknown error", &err.to_string()),
         },
@@ -248,7 +227,12 @@ fn current_url(sessions: &Sessions, session: &str) -> (u16, Value) {
     }
 }
 
-fn execute(sessions: &mut Sessions, session: &str, body: &str, asynchronous: bool) -> (u16, Value) {
+async fn execute(
+    sessions: &mut Sessions,
+    session: &str,
+    body: &str,
+    asynchronous: bool,
+) -> (u16, Value) {
     let parsed: Value = match serde_json::from_str(body) {
         Ok(value) => value,
         Err(err) => return error(400, "invalid argument", &err.to_string()),
@@ -270,12 +254,17 @@ fn execute(sessions: &mut Sessions, session: &str, body: &str, asynchronous: boo
     match window
         .tab
         .execute_script_timeout(&wrapped, Some(script_timeout))
+        .await
     {
         Err(err) => script_error(&err),
-        Ok(_) if asynchronous => wait_for_async(window, remaining(started, script_timeout)),
-        Ok(value) => match window.tab.execute_script("globalThis.__wd_wait === true") {
+        Ok(_) if asynchronous => wait_for_async(window, remaining(started, script_timeout)).await,
+        Ok(value) => match window
+            .tab
+            .execute_script("globalThis.__wd_wait === true")
+            .await
+        {
             Ok(RemoteValue::Bool(true)) => {
-                wait_for_async(window, remaining(started, script_timeout))
+                wait_for_async(window, remaining(started, script_timeout)).await
             }
             Ok(_) => ok(encode(&value)),
             Err(err) => script_error(&err),
@@ -287,18 +276,27 @@ fn remaining(started: Instant, budget: Duration) -> Duration {
     budget.saturating_sub(started.elapsed())
 }
 
-fn wait_for_async(window: &Window, script_timeout: Duration) -> (u16, Value) {
+async fn wait_for_async(window: &Window, script_timeout: Duration) -> (u16, Value) {
     match window
         .tab
         .run_until_js_true("globalThis.__wd_done === true", script_timeout)
+        .await
     {
         Ok(false) => return error(500, "script timeout", "script timeout"),
         Ok(true) => {}
         Err(err) => return error(500, "unknown error", &err.to_string()),
     }
-    match window.tab.execute_script("globalThis.__wd_failed === true") {
+    match window
+        .tab
+        .execute_script("globalThis.__wd_failed === true")
+        .await
+    {
         Ok(RemoteValue::Bool(true)) => {
-            let message = match window.tab.execute_script("String(globalThis.__wd_err)") {
+            let message = match window
+                .tab
+                .execute_script("String(globalThis.__wd_err)")
+                .await
+            {
                 Ok(RemoteValue::String(text)) => text,
                 Ok(_) => "javascript error".to_owned(),
                 Err(err) => return script_error(&err),
@@ -308,7 +306,7 @@ fn wait_for_async(window: &Window, script_timeout: Duration) -> (u16, Value) {
         Ok(_) => {}
         Err(err) => return script_error(&err),
     }
-    match window.tab.execute_script("globalThis.__wd_async") {
+    match window.tab.execute_script("globalThis.__wd_async").await {
         Ok(value) => ok(encode(&value)),
         Err(err) => script_error(&err),
     }
@@ -474,13 +472,13 @@ fn switch_window(sessions: &mut Sessions, session: &str, body: &str) -> (u16, Va
     ok(Value::Null)
 }
 
-fn new_window(sessions: &mut Sessions, session: &str) -> (u16, Value) {
+async fn new_window(sessions: &mut Sessions, session: &str) -> (u16, Value) {
     if !sessions.open.contains_key(session) {
         return error(404, "invalid session id", session);
     }
     sessions.next_window += 1;
     let handle = format!("w{}", sessions.next_window);
-    let window = match sessions.blank_window() {
+    let window = match sessions.blank_window().await {
         Ok(window) => window,
         Err(err) => return error(500, "unknown error", &err),
     };
@@ -491,7 +489,7 @@ fn new_window(sessions: &mut Sessions, session: &str) -> (u16, Value) {
     ok(json!({"handle": handle, "type": "window"}))
 }
 
-fn close_window(sessions: &mut Sessions, session: &str) -> (u16, Value) {
+async fn close_window(sessions: &mut Sessions, session: &str) -> (u16, Value) {
     let (tab_id, remaining) = {
         let Some(found) = sessions.open.get_mut(session) else {
             return error(404, "invalid session id", session);
@@ -506,7 +504,7 @@ fn close_window(sessions: &mut Sessions, session: &str) -> (u16, Value) {
         }
         (tab_id, remaining)
     };
-    let _ = sessions.browser.close_tab(tab_id);
+    let _result = sessions.browser.close_tab(tab_id).await;
     if remaining.is_empty() {
         sessions.open.remove(session);
     }

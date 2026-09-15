@@ -11,8 +11,7 @@
 //! `parsererror` element, matching the HTML XML parsing rules.
 
 use dom::{
-    Attribute, Dom, LocalName, Namespace, NodeId, Prefix, QualName, xml_namespace,
-    xmlns_namespace,
+    Attribute, Dom, LocalName, Namespace, NodeId, Prefix, QualName, xml_namespace, xmlns_namespace,
 };
 
 use crate::Parsed;
@@ -417,7 +416,11 @@ impl<'a> XmlParser<'a> {
                 if !is_valid_ncname(raw_name) {
                     return Err(());
                 }
-                QualName::new(None, Namespace::from(""), LocalName::from(raw_name.as_str()))
+                QualName::new(
+                    None,
+                    Namespace::from(""),
+                    LocalName::from(raw_name.as_str()),
+                )
             };
             attributes.push(Attribute {
                 name: attribute_name,
@@ -425,11 +428,7 @@ impl<'a> XmlParser<'a> {
             });
         }
         Ok((
-            QualName::new(
-                prefix.map(Prefix::from),
-                namespace,
-                LocalName::from(local),
-            ),
+            QualName::new(prefix.map(Prefix::from), namespace, LocalName::from(local)),
             attributes,
         ))
     }

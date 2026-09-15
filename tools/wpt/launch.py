@@ -8,7 +8,7 @@ from pathlib import Path
 
 TLS_SCHEMES = ("https", "https-local", "https-public", "wss", "h2")
 # HTTP testharness only: extra schemes bind extra loopbacks or start DNS.
-HTTP_ONLY = ("http",)
+HTTP_ONLY = ("http", "ws")
 
 
 def patch_wpt(wpt_root: Path) -> None:

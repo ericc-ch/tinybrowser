@@ -1,19 +1,16 @@
-//! One document: HTML tasks we own, Tokio current-thread as the waiter, browser
-//! services for dials and cookies. The renderer owns the document; the browser
-//! process owns the tab and drives navigation
-//! ([ADR 0011](../../../../docs/adrs/0011-renderer-processes-per-site.md)).
+//! One document: HTML tasks we own, browser services for dials and cookies. The
+//! renderer loop owns every wait; the browser process owns the tab and drives
+//! navigation ([ADR 0019](../../../../docs/adrs/0019-async-browser-runtime-and-io.md)).
 
-use std::cell::{OnceCell, RefCell};
+use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
 use std::sync::Arc;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::task::Waker;
 use std::time::Instant as WallClock;
 
-use tokio::runtime::Runtime as TokioRuntime;
+use tokio::sync::Notify;
 use tokio::time::Instant;
 use url::Url;
 
@@ -27,6 +24,7 @@ mod intern;
 mod pump;
 
 pub(crate) use crate::js::ScriptValue;
+pub(crate) use dial::ResponseDecoder;
 
 const MAX_PENDING_JS_FETCHES: usize = 256;
 const MAX_PENDING_EVENTS: usize = 2048;
@@ -80,33 +78,12 @@ struct Timer {
     fired: bool,
 }
 
-/// The renderer process's Tokio waiter, built on first use and shared by every
-/// frame. All frames run their pump as futures on this one current-thread
-/// runtime ([ADR 0014](../../../../docs/adrs/0014-frames-and-per-frame-realms.md)).
-#[derive(Clone)]
-pub(crate) struct Waiter(Rc<OnceCell<TokioRuntime>>);
-
-impl Waiter {
-    pub(crate) fn new() -> Self {
-        Self(Rc::new(OnceCell::new()))
-    }
-
-    pub(crate) fn get(&self) -> &TokioRuntime {
-        self.0.get_or_init(|| {
-            tokio::runtime::Builder::new_current_thread()
-                .enable_time()
-                .build()
-                .expect("current-thread Tokio runtime for the renderer thread")
-        })
-    }
-}
-
 /// One document: tree, task list, `QuickJS` realm, and browser services.
 pub(crate) struct Document {
     services: Arc<dyn BrowserServices>,
     world: Rc<RefCell<World>>,
     js_runtime: SharedJsRuntime,
-    waiter: Waiter,
+    wake: Arc<Notify>,
     url: Url,
     content_language: Option<String>,
     tasks: VecDeque<Task>,
@@ -114,7 +91,6 @@ pub(crate) struct Document {
     next_timer_id: u32,
     dial_tx: Sender<Result<CompletedDial, DialFail>>,
     dial_rx: Receiver<Result<CompletedDial, DialFail>>,
-    dial_waker: Arc<Mutex<Option<Waker>>>,
     in_flight_dials: usize,
     queued_dials: Vec<QueuedDial>,
     events: Vec<TabEvent>,
@@ -137,19 +113,18 @@ impl Drop for Document {
 }
 
 impl Document {
-    /// A document sharing its renderer process's `QuickJS` heap, waiter,
+    /// A document sharing its renderer process's `QuickJS` heap, wake handle,
     /// document store, and realm registry.
     pub(crate) fn with_shared(
         services: Arc<dyn BrowserServices>,
         js_runtime: SharedJsRuntime,
-        waiter: Waiter,
+        wake: Arc<Notify>,
         documents: &Rc<RefCell<DocumentStore>>,
         registry: &Rc<RefCell<RealmRegistry>>,
         stop: Arc<Stop>,
     ) -> Self {
         let document_url = Url::parse("about:blank").expect("about:blank is a valid URL");
         let (dial_tx, dial_rx) = mpsc::channel();
-        let dial_waker = Arc::new(Mutex::new(None));
         Self {
             world: Rc::new(RefCell::new(World::new(
                 Arc::clone(&services),
@@ -159,7 +134,7 @@ impl Document {
             ))),
             services,
             js_runtime,
-            waiter,
+            wake,
             url: document_url,
             content_language: None,
             tasks: VecDeque::new(),
@@ -167,7 +142,6 @@ impl Document {
             next_timer_id: 1,
             dial_tx,
             dial_rx,
-            dial_waker,
             in_flight_dials: 0,
             queued_dials: Vec::new(),
             events: Vec::new(),
@@ -203,10 +177,6 @@ impl Document {
 
     pub(crate) fn take_document_stream(&mut self) -> Vec<DocumentStreamCommand> {
         self.world.borrow_mut().take_document_stream()
-    }
-
-    pub(crate) fn has_engine_requests(&self) -> bool {
-        self.world.borrow().has_engine_requests()
     }
 
     pub(crate) fn fire_node_load(&mut self, id: dom::NodeId) {
@@ -287,6 +257,39 @@ impl Document {
         world.document_url = self.url.clone();
         drop(world);
         self.start_document(&html);
+    }
+
+    pub(crate) fn open_response(&mut self, response: &crate::protocol::ResponseStart) {
+        self.reset_js_realm();
+        if let Ok(url) = Url::parse(&response.final_url) {
+            self.url = url;
+        }
+        self.content_language.clone_from(&response.content_language);
+        let mut world = self.world.borrow_mut();
+        world.document_url = self.url.clone();
+        world.parser_active = true;
+        drop(world);
+        self.parser_eof = false;
+        self.active_parser = Some(ActiveParser::new(""));
+    }
+
+    pub(crate) fn write_response(&mut self, html: String) {
+        if html.is_empty() {
+            return;
+        }
+        if let Some(parser) = &self.active_parser {
+            parser.append_html(html);
+            if !self.classic_fetch_in_flight {
+                self.advance_parser();
+            }
+        }
+    }
+
+    pub(crate) fn close_response(&mut self) {
+        self.parser_eof = true;
+        if !self.classic_fetch_in_flight {
+            self.advance_parser();
+        }
     }
 
     /// Parses `input` into this document and starts a new JS realm.
@@ -626,7 +629,6 @@ impl From<crate::js::JsError> for TabError {
 /// Document-stop flag shared by the renderer loop, JS interrupt handler, and dials.
 pub(crate) struct Stop {
     flag: AtomicBool,
-    waker: Mutex<Option<Waker>>,
 }
 
 impl Default for Stop {
@@ -641,33 +643,17 @@ impl Stop {
     pub(crate) fn new() -> Self {
         Self {
             flag: AtomicBool::new(false),
-            waker: Mutex::new(None),
         }
     }
 
-    /// Requests a stop: interrupts `QuickJS` and wakes the pump.
+    /// Requests a stop: interrupts `QuickJS` and marks the flag.
     pub(crate) fn request(&self) {
         self.flag.store(true, Ordering::Relaxed);
-        if let Some(waker) = self
-            .waker
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take()
-        {
-            waker.wake();
-        }
     }
 
     /// Whether [`Stop::request`] has run.
     #[must_use]
     pub(crate) fn is_set(&self) -> bool {
         self.flag.load(Ordering::Relaxed)
-    }
-
-    fn register(&self, waker: &Waker) {
-        *self
-            .waker
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(waker.clone());
     }
 }

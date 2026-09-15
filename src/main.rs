@@ -8,6 +8,9 @@
 
 mod daemon;
 
+use std::future::Future;
+use std::io;
+use std::net::TcpListener;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -62,7 +65,7 @@ enum Command {
         )]
         profile: Profile,
     },
-    /// Run a renderer worker on stdin/stdout
+    /// Run a renderer worker on its private platform channel
     Renderer,
     /// Serve classic `WebDriver` on this loopback port
     Webdriver {
@@ -95,22 +98,17 @@ fn main() -> ExitCode {
 
 fn run(cli: &Cli) -> ExitCode {
     match &cli.command {
-        Some(Command::Renderer) => match renderer::serve_stdio() {
+        Some(Command::Renderer) => match renderer::serve() {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
                 logging::error!(target: "renderer", "{error}");
                 ExitCode::from(1)
             }
         },
-        Some(Command::Daemon { profile }) => {
-            match daemon::data_home().and_then(|home| daemon::run(profile, &home)) {
-                Ok(()) => ExitCode::SUCCESS,
-                Err(error) => {
-                    logging::error!(target: "daemon", "{error}");
-                    ExitCode::from(1)
-                }
-            }
-        }
+        Some(Command::Daemon { profile }) => run_browser_process("daemon", async {
+            let home = daemon::data_home()?;
+            daemon::run(profile, &home).await
+        }),
         Some(Command::Webdriver {
             port,
             profile,
@@ -120,7 +118,7 @@ fn run(cli: &Cli) -> ExitCode {
                 Ok(builder) => builder,
                 Err(error) => return usage_error(&error),
             };
-            serve_webdriver(*port, builder, profile)
+            run_browser_process("webdriver", serve_webdriver(*port, builder, profile))
         }
         None => {
             let mut command = <Cli as clap::CommandFactory>::command();
@@ -193,34 +191,43 @@ fn usage_error(message: &str) -> ExitCode {
     ExitCode::from(2)
 }
 
-fn serve_webdriver(port: u16, builder: AgentBuilder, profile: &Profile) -> ExitCode {
-    let data_home = match daemon::data_home() {
-        Ok(home) => home,
+fn run_browser_process(
+    target: &'static str,
+    future: impl Future<Output = io::Result<()>>,
+) -> ExitCode {
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
         Err(error) => {
-            logging::error!(target: "webdriver", "{error}");
+            logging::error!(target: target, "runtime failed: {error}");
             return ExitCode::from(1);
         }
     };
-    let listener = match std::net::TcpListener::bind(("127.0.0.1", port)) {
-        Ok(listener) => listener,
+    match runtime.block_on(future) {
+        Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            logging::error!(target: "webdriver", "bind failed: {error}");
-            return ExitCode::from(1);
+            logging::error!(target: target, "{error}");
+            ExitCode::from(1)
         }
-    };
+    }
+}
+
+async fn serve_webdriver(port: u16, builder: AgentBuilder, profile: &Profile) -> io::Result<()> {
+    let data_home = daemon::data_home()?;
+    let listener = TcpListener::bind(("127.0.0.1", port))
+        .map_err(|error| io::Error::new(error.kind(), format!("bind failed: {error}")))?;
     let network = match ProfileStore::open_in(&data_home, profile)
         .and_then(|store| NetworkSession::from_builder(builder, store))
     {
         Ok(network) => network,
         Err(error) => {
-            logging::error!(target: "webdriver", "profile failed: {error}");
-            return ExitCode::from(1);
+            return Err(io::Error::other(format!("profile failed: {error}")));
         }
     };
-    let browser = Browser::open_with_network(network);
-    if let Err(error) = webdriver::serve(&listener, browser.handle()) {
-        logging::error!(target: "webdriver", "{error}");
-        return ExitCode::from(1);
-    }
-    ExitCode::SUCCESS
+    let browser = Browser::open_with_network(network)?;
+    let result = webdriver::serve(&listener, browser.handle()).await;
+    result.and(browser.handle().close().await)
 }

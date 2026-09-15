@@ -1,37 +1,66 @@
-//! One Browser bound to one named Profile.
+//! One async Browser bound to one named Profile.
 
 use std::collections::HashMap;
 use std::fmt;
 use std::io;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
-use crate::actor::{TabActor, TabHandle, TabId};
-use crate::link::RendererFactory;
-use crate::network::{NetworkSession, ProfileStore};
+use tokio::sync::{mpsc, oneshot};
+
+use crate::actor::{TabHandle, TabId, TabTask};
+use crate::manager::RendererProcessManager;
+use crate::network::NetworkSession;
 use crate::profile::{Profile, ProfileName};
+use crate::store::ProfileStore;
+
+const BROWSER_COMMAND_CAPACITY: usize = 256;
 
 /// Process-owned engine for one profile.
 ///
 /// Renderer processes are the current executable invoked with `renderer` as
 /// its first argument. An embedding executable must dispatch that invocation
-/// to [`renderer::serve_stdio`].
+/// to [`renderer::serve`].
 pub struct Browser {
-    inner: Arc<Mutex<BrowserInner>>,
+    handle: BrowserHandle,
 }
 
-struct BrowserInner {
-    live: bool,
-    network: NetworkSession,
-    renderers: Arc<RendererFactory>,
-    tabs: HashMap<TabId, TabActor>,
-    next_tab: u64,
-}
-
-/// Value-only handle protocols use to drive [`Browser`].
+/// Async value-only handle protocols use to drive [`Browser`].
 #[derive(Clone)]
 pub struct BrowserHandle {
-    inner: Arc<Mutex<BrowserInner>>,
+    profile: Profile,
+    tx: mpsc::Sender<Command>,
+}
+
+enum Command {
+    CreateTab {
+        reply: oneshot::Sender<Result<TabHandle, BrowserError>>,
+    },
+    Tabs {
+        reply: oneshot::Sender<Vec<TabId>>,
+    },
+    Tab {
+        id: TabId,
+        reply: oneshot::Sender<Result<TabHandle, BrowserError>>,
+    },
+    CloseTab {
+        id: TabId,
+        reply: oneshot::Sender<Result<(), BrowserError>>,
+    },
+    IsLive {
+        reply: oneshot::Sender<bool>,
+    },
+    Close {
+        reply: oneshot::Sender<io::Result<()>>,
+    },
+}
+
+struct BrowserState {
+    live: bool,
+    network: NetworkSession,
+    renderers: Arc<RendererProcessManager>,
+    tabs: HashMap<TabId, TabTask>,
+    next_tab: u64,
 }
 
 impl Browser {
@@ -54,47 +83,54 @@ impl Browser {
     ///
     /// The profile directory cannot be created, read, or exclusively locked.
     pub fn open_in(data_home: &Path, profile: &Profile) -> io::Result<Self> {
-        NetworkSession::from_builder(
+        let network = NetworkSession::from_builder(
             net::AgentBuilder::new(),
             ProfileStore::open_in(data_home, profile)?,
-        )
-        .map(Self::open_with_network)
+        )?;
+        Self::open_with_network(network)
     }
 
-    /// Opens a browser that shares `network` (and its cookie jar) with
-    /// renderer processes.
-    #[must_use]
-    pub fn open_with_network(network: NetworkSession) -> Self {
-        let renderers = Arc::new(RendererFactory::new(network.fetch_handle()));
-        Self {
-            inner: Arc::new(Mutex::new(BrowserInner {
-                live: true,
-                network,
-                renderers,
-                tabs: HashMap::new(),
-                next_tab: 1,
-            })),
-        }
+    /// Opens a browser that shares `network` and its cookie jar with renderer
+    /// processes.
+    ///
+    /// # Errors
+    ///
+    /// The caller is not running inside the executable-owned Tokio runtime.
+    pub fn open_with_network(network: NetworkSession) -> io::Result<Self> {
+        let runtime = tokio::runtime::Handle::try_current()
+            .map_err(|error| io::Error::other(format!("browser runtime unavailable: {error}")))?;
+        let profile = Profile::named(network.profile_name());
+        let renderers = Arc::new(RendererProcessManager::new(network.fetch_handle()));
+        let state = BrowserState {
+            live: true,
+            network,
+            renderers,
+            tabs: HashMap::new(),
+            next_tab: 1,
+        };
+        let (tx, rx) = mpsc::channel(BROWSER_COMMAND_CAPACITY);
+        runtime.spawn(browser_loop(rx, state));
+        Ok(Self {
+            handle: BrowserHandle { profile, tx },
+        })
     }
 
     /// Value-only handle for this browser.
     #[must_use]
     pub fn handle(&self) -> BrowserHandle {
-        BrowserHandle {
-            inner: Arc::clone(&self.inner),
-        }
+        self.handle.clone()
     }
 
     /// Profile this browser is bound to.
     #[must_use]
     pub fn profile_name(&self) -> ProfileName {
-        self.handle().profile_name()
+        self.handle.profile_name()
     }
 }
 
 impl Drop for Browser {
     fn drop(&mut self) {
-        let _result = self.handle().close();
+        self.handle.request_close();
     }
 }
 
@@ -102,39 +138,35 @@ impl BrowserHandle {
     /// Profile this browser is bound to.
     #[must_use]
     pub fn profile(&self) -> Profile {
-        Profile::named(self.lock().network.profile_name())
+        self.profile.clone()
     }
 
     /// Profile name, same as [`BrowserHandle::profile`].
     #[must_use]
     pub fn profile_name(&self) -> ProfileName {
-        self.profile().name().clone()
+        self.profile.name().clone()
     }
 
-    /// Starts a tab actor and returns its handle.
+    /// Starts a tab coordinator and returns its handle.
     ///
     /// # Errors
     ///
-    /// [`BrowserError::Stopped`] when the owning [`Browser`] has been dropped.
-    pub fn create_tab(&self) -> Result<TabHandle, BrowserError> {
-        let mut inner = self.lock();
-        if !inner.live {
-            return Err(BrowserError::Stopped);
-        }
-        let id = TabId::new(inner.next_tab);
-        inner.next_tab = inner.next_tab.saturating_add(1);
-        let fetch = inner.network.fetch_handle();
-        let renderers = Arc::clone(&inner.renderers);
-        let actor = TabActor::spawn(id, fetch, renderers);
-        let handle = actor.handle.clone();
-        inner.tabs.insert(id, actor);
-        Ok(handle)
+    /// [`BrowserError::Stopped`] when the owning [`Browser`] has closed.
+    pub async fn create_tab(&self) -> Result<TabHandle, BrowserError> {
+        let (reply, rx) = oneshot::channel();
+        self.send(Command::CreateTab { reply }).await?;
+        rx.await.unwrap_or(Err(BrowserError::Stopped))
     }
 
     /// Live tab identities.
-    #[must_use]
-    pub fn tabs(&self) -> Vec<TabId> {
-        self.lock().tabs.keys().copied().collect()
+    ///
+    /// # Errors
+    ///
+    /// [`BrowserError::Stopped`] when the browser task has stopped.
+    pub async fn tabs(&self) -> Result<Vec<TabId>, BrowserError> {
+        let (reply, rx) = oneshot::channel();
+        self.send(Command::Tabs { reply }).await?;
+        rx.await.map_err(|_| BrowserError::Stopped)
     }
 
     /// Handle for a live tab.
@@ -142,73 +174,134 @@ impl BrowserHandle {
     /// # Errors
     ///
     /// [`BrowserError::UnknownTab`] when `id` is not in the registry.
-    pub fn tab(&self, id: TabId) -> Result<TabHandle, BrowserError> {
-        self.lock()
-            .tabs
-            .get(&id)
-            .map(|actor| actor.handle.clone())
-            .ok_or(BrowserError::UnknownTab)
+    pub async fn tab(&self, id: TabId) -> Result<TabHandle, BrowserError> {
+        let (reply, rx) = oneshot::channel();
+        self.send(Command::Tab { id, reply }).await?;
+        rx.await.unwrap_or(Err(BrowserError::Stopped))
     }
 
-    /// Stops `id` and joins its actor thread.
+    /// Stops `id` and waits for its coordinator task.
     ///
     /// # Errors
     ///
     /// [`BrowserError::UnknownTab`] when `id` is not in the registry.
-    pub fn close_tab(&self, id: TabId) -> Result<(), BrowserError> {
-        let mut inner = self.lock();
-        let Some(mut actor) = inner.tabs.remove(&id) else {
-            return Err(BrowserError::UnknownTab);
-        };
-        drop(inner);
-        actor.shutdown();
-        Ok(())
+    pub async fn close_tab(&self, id: TabId) -> Result<(), BrowserError> {
+        let (reply, rx) = oneshot::channel();
+        self.send(Command::CloseTab { id, reply }).await?;
+        rx.await.unwrap_or(Err(BrowserError::Stopped))
     }
 
     /// Whether this browser still accepts commands.
-    #[must_use]
-    pub fn is_live(&self) -> bool {
-        self.lock().live
+    ///
+    /// # Errors
+    ///
+    /// [`BrowserError::Stopped`] when the browser task has stopped.
+    pub async fn is_live(&self) -> Result<bool, BrowserError> {
+        let (reply, rx) = oneshot::channel();
+        self.send(Command::IsLive { reply }).await?;
+        rx.await.map_err(|_| BrowserError::Stopped)
     }
 
     /// Stops every tab, persists the profile, and refuses later commands.
     ///
     /// # Errors
     ///
-    /// The final durable profile write failed.
-    pub fn close(&self) -> io::Result<()> {
-        let should_close_pages = {
-            let mut inner = self.lock();
-            if inner.live {
-                inner.live = false;
-                true
-            } else {
-                false
+    /// The final durable profile write failed or the browser task stopped.
+    pub async fn close(&self) -> io::Result<()> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(Command::Close { reply })
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "browser stopped"))?;
+        rx.await
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "browser stopped"))?
+    }
+
+    async fn send(&self, command: Command) -> Result<(), BrowserError> {
+        self.tx
+            .send(command)
+            .await
+            .map_err(|_| BrowserError::Stopped)
+    }
+
+    fn request_close(&self) {
+        let (reply, _rx) = oneshot::channel();
+        let _result = self.tx.try_send(Command::Close { reply });
+    }
+}
+
+async fn browser_loop(mut commands: mpsc::Receiver<Command>, mut state: BrowserState) {
+    while let Some(command) = commands.recv().await {
+        match command {
+            Command::CreateTab { reply } => {
+                let result = if state.live {
+                    let id = TabId::new(state.next_tab);
+                    state.next_tab = state.next_tab.saturating_add(1);
+                    let task = TabTask::spawn(
+                        id,
+                        state.network.fetch_handle(),
+                        Arc::clone(&state.renderers),
+                    );
+                    let handle = task.handle.clone();
+                    state.tabs.insert(id, task);
+                    Ok(handle)
+                } else {
+                    Err(BrowserError::Stopped)
+                };
+                let _result = reply.send(result);
             }
-        };
-        if should_close_pages {
-            self.close_all();
+            Command::Tabs { reply } => {
+                let tabs = state.tabs.keys().copied().collect();
+                let _result = reply.send(tabs);
+            }
+            Command::Tab { id, reply } => {
+                let tab = state
+                    .tabs
+                    .get(&id)
+                    .map(|task| task.handle.clone())
+                    .ok_or(BrowserError::UnknownTab);
+                let _result = reply.send(tab);
+            }
+            Command::CloseTab { id, reply } => {
+                let result = if let Some(mut task) = state.tabs.remove(&id) {
+                    task.shutdown().await;
+                    Ok(())
+                } else {
+                    Err(BrowserError::UnknownTab)
+                };
+                let _result = reply.send(result);
+            }
+            Command::IsLive { reply } => {
+                let _result = reply.send(state.live);
+            }
+            Command::Close { reply } => {
+                state.live = false;
+                close_all(&mut state.tabs).await;
+                match state.network.persist().await {
+                    Ok(()) => {
+                        let _result = reply.send(Ok(()));
+                        return;
+                    }
+                    Err(error) => {
+                        let _result = reply.send(Err(error));
+                    }
+                }
+            }
         }
-        self.persist()
     }
-
-    fn persist(&self) -> io::Result<()> {
-        self.lock().network.persist()
+    // Every command sender is gone: this is the drop path when
+    // `Browser::drop` could not queue `Command::Close`. Persist so a
+    // full channel never loses the profile's cookies.
+    close_all(&mut state.tabs).await;
+    if state.live {
+        state.live = false;
+        let _result = state.network.persist().await;
     }
+}
 
-    fn close_all(&self) {
-        let mut inner = self.lock();
-        let actors: Vec<TabActor> = inner.tabs.drain().map(|(_, actor)| actor).collect();
-        drop(inner);
-        for mut actor in actors {
-            actor.shutdown();
-        }
-    }
-
-    fn lock(&self) -> std::sync::MutexGuard<'_, BrowserInner> {
-        self.inner
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+async fn close_all(tabs: &mut HashMap<TabId, TabTask>) {
+    for mut task in tabs.drain().map(|(_, task)| task) {
+        task.shutdown().await;
     }
 }
 
@@ -217,7 +310,7 @@ impl BrowserHandle {
 pub enum BrowserError {
     /// No tab with that id is live.
     UnknownTab,
-    /// The owning [`Browser`] has been dropped.
+    /// The owning [`Browser`] has stopped.
     Stopped,
 }
 

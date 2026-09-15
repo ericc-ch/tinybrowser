@@ -8,7 +8,8 @@ is later" posture of [ADR 0010](0010-page-actor-ownership.md).
 
 Status: accepted. Replaces the Isolation section of [ADR 0010](0010-page-actor-ownership.md).
 Extends the self-spawned-worker allowance of [ADR 0009](0009-named-profile-daemon.md).
-`TabHandle`, `TabId`, and the protocol adapters do not change.
+`TabHandle`, `TabId`, and the protocol adapters keep their roles. Their APIs
+become async under [ADR 0019](0019-async-browser-runtime-and-io.md).
 Browser-side authorization and resource bounds on this seam are specified by
 [ADR 0016](0016-renderer-seam-reference-monitor.md).
 
@@ -22,11 +23,13 @@ Browser-side authorization and resource bounds on this seam are specified by
 - A site instance is unique per (site, browsing context group), following Chrome's
   Principal Instance rule. v1 has no opener groups or network-backed cross-site
   iframe documents, so in practice each tab's current site is one site instance.
-- One OS process per live site instance: the same executable, invoked as
-  `tinybrowser renderer`. The process boundary, not a thread, is the isolation
-  property.
+- Under the soft process limit, one OS process serves each live site instance.
+  The same executable runs as `tinybrowser renderer`. Over the limit, matching
+  same-site instances may reuse a process. The immutable site lock still
+  prevents cross-site process sharing. See
+  [ADR 0019](0019-async-browser-runtime-and-io.md).
 - The browser process owns **`Tab`** (tab): `TabId`, navigation state, the document URL, and
-  the site decision; the browser process's `Browser` owns the renderer factory. The renderer
+  the site decision; the browser process's `Browser` owns the renderer process manager. The renderer
   owns **`Document`**: `Dom`, QuickJS realm, active parser, tasks, and browser
   timers.
 - Navigation is browser-driven. The browser process dials, observes the final URL and headers,
@@ -44,7 +47,9 @@ Browser-side authorization and resource bounds on this seam are specified by
   tree and can assign out-of-process iframes (OOPIF).
 - QuickJS 5 s / 32 MiB / 512 KiB are renderer-process survival knobs, not
   web-platform numbers. Realms hosted by one renderer share its QuickJS heap.
-  Renderer-count policy remains browser-owned.
+  Renderer-count policy remains browser-owned. The renderer process manager
+  applies blank sharing, one spare, a memory-derived soft limit, and same-site
+  reuse over that limit.
 
 ## Why the site cut
 
@@ -76,12 +81,10 @@ Engine ground truth:
 
 ## Consequences
 
-- The first navigation to a new site pays process startup. Preallocated renderers
-  are a later optimization, not a v1 requirement.
-- Renderers are not pooled after navigation. The old process is terminated so
-  its page work cannot outlive its document and idle processes cannot grow with
-  navigation history. A future pool needs a measured benefit, a hard capacity,
-  and a proven reset-to-quiescence operation.
+- The manager keeps one unlocked spare when memory permits. Blank and opaque
+  documents may share one unlocked renderer until site-backed content commits.
+- A renderer that loses its last document is reaped unless it is the bounded
+  spare. Memory pressure removes the spare and idle renderers first.
 - A renderer crash loses that document, not the browser process. The browser process reports it
   as a tab error and can reload; v1 does not promise automatic recovery.
 - The `browser` crate splits: a `renderer` crate owns the page engine and the

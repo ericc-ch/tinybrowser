@@ -559,10 +559,6 @@ impl World {
         budget.pending_stream_bytes = budget.pending_stream_bytes.saturating_sub(bytes);
     }
 
-    pub(crate) fn has_engine_requests(&self) -> bool {
-        !self.frame_navigations.is_empty() || !self.document_stream.is_empty()
-    }
-
     pub(crate) fn create_object_url(&mut self, contents: String) -> Option<String> {
         let length = contents.len();
         let mut budget = self.budget.borrow_mut();

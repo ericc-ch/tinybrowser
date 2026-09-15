@@ -174,11 +174,11 @@ code on the old M1 connector. Accepted.
 | dom v1 + quickjs + **net on btls, hand-rolled h1/h2** (est., pending preset work, see 2026-08-25 probes) | ~3.6–3.7 MB | ~1.3–1.4 MB |
 | dom v1 + quickjs + **net as ureq bridged to btls** (measured bridge) | ~3.8 MB | ~1.2 MB |
 
-## Decisions
+## Historical v1 decisions
 
 - **html5ever over html5gum** (+~570 KB): buys the complete HTML5 tree-construction algorithm (insertion modes, foster parenting, adoption agency). html5gum is tokenizer-only; hand-rolling tree construction is weeks of fiddly spec work. Maturity wins under a 5MB budget.
 - **Tuned profile from day one**: default release costs +400–850KB for nothing. The flags are set once in the root Cargo.toml.
-- **native-tls, dynamically linked**: TLS lives in system `libssl.so.3`; we ship only glue (~482 KB tuned). Static rustls would add ~+2.0 MB: rejected. Consequence: target machine needs OpenSSL 3 installed (near-universal on Linux). *(2026-08-25: superseded within the day by the stealth requirement — its probes showed an OpenSSL ClientHello among the most-flagged fingerprints — then reinstated for net v1 by [ADR 0006](../adrs/0006-net-transport.md) with stealth deferred to the hand-rolled-btls milestone. The objection returns when that milestone does.)*
+- **native-tls, dynamically linked**: Net v1 used TLS from system `libssl.so.3` and shipped only glue (~482 KB tuned). [ADR 0019](../adrs/0019-async-browser-runtime-and-io.md) supersedes this choice with hyper-rustls for async net v2. The stealth milestone still replaces the private TLS connector with `btls`.
 - **panic = unwind kept**: abort saves only ~39 KB but kills `catch_unwind`, which every JS-exposed op needs so a Rust panic degrades to a JS error instead of unwinding through QuickJS's C frame.
 - **selectors later is cheap**, confirmed at the dom-v1 checkpoint: the whole dom layer (arena + selector engine + parser stack) measured +932 KB tuned, within ~2% of the html5ever+selectors estimates it subsumes (see Milestone section).
 - **Old servo stack (html5ever + selectors + cssparser as the _core_) was never the problem**: the old repo's total was bloat elsewhere. The parser swap alone does not hit 5MB; discipline at every milestone does.
@@ -190,7 +190,7 @@ code on the old M1 connector. Accepted.
   confirm at the next parse+query probe.
 
 - DOM→JS binding glue: hundreds of rquickjs classes add up; keep dispatch tables data-driven.
-- Browser-process protocol stack: **superseded** — [ADR 0012](../adrs/0012-host-protocol-and-cli-stack.md) accepts axum + clap and retires the `http1` crate. The renderer path still takes no web-server stack and no CLI crate; its only serialization is the value-only IPC seam, and its runtime stays current-thread `rt`+`time`.
+- Browser-process async I/O: [ADR 0019](../adrs/0019-async-browser-runtime-and-io.md) adds hyper-util and hyper-rustls for outbound networking and async platform-channel features to the current-thread renderer. Axum stays during the core migration, then a measured checkpoint compares it with direct hyper. The renderer still takes no web-server stack, HTTP client, CLI crate, or multi-thread runtime.
 - A11y walker (accname computation, role mapping): budget ~100–200 KB, fine, but measure.
 - When the deferred stealth milestone lands net on btls ([ADR 0006](../adrs/0006-net-transport.md)): pin the crate family like html5ever (its BoringSSL fork is wreq-ecosystem); impersonation presets go stale with every Chrome release — a stale preset is itself a detection signal, so bump discipline applies to persona tables, not just crates.
 - Re-measure marginals at every milestone; regressions must justify themselves in bytes.
@@ -211,13 +211,12 @@ not drop it. Empty `main` re-measured at 284 KB (290912 bytes).
 | `async-executor` + `async-io` | local executor + timer + spawn | **+85 KB** |
 | `futures` `LocalPool` | ready future only (no timer, no I/O) | **+12 KB** |
 
-Tokio 1.53 default features are empty; `full` is the fat switch. smol is not smaller
-than current-thread tokio with timers. The tab thread therefore uses Tokio
-current-thread `rt`+`time` (~+66 KB); page tasks stay in our queue; never `full` /
-smol / axum / hyper ([engine charter](../adrs/0007-engine-charter.md)). The original
-per-page `spawn_blocking` choice was superseded on 2026-09-10 by one browser-owned,
-bounded blocking network executor. Add Tokio `net` only if a later milestone needs
-async sockets on the page runtime.
+Tokio 1.53 default features are empty; `full` is the fat switch. Smol is not
+smaller than current-thread Tokio with timers. At this checkpoint the tab
+thread used Tokio current-thread `rt`+`time` (~+66 KB), and page tasks stayed in
+the engine queue. [ADR 0019](../adrs/0019-async-browser-runtime-and-io.md) later
+selected one multi-thread browser runtime and a current-thread renderer waiter
+with only the features needed for async platform-channel I/O.
 
 ## Milestone: html5lib WPT browser path (2026-09-11)
 
@@ -247,7 +246,7 @@ With rustc 1.98.0 and the committed stripped x86_64 release profile:
 | CLI stub (`target/release/tinybrowser`) | 294,944 |
 | page engine (`target/release/examples/tab_probe`) | 2,831,904 |
 
-The [probe](../../examples/tab_probe.rs) references HTML parsing, navigation,
+The now-retired `examples/tab_probe.rs` probe references HTML parsing, navigation,
 QuickJS eval, timers, and the page loop, so LTO retains the engine. Running it
 without arguments prints `42`; passing an HTTP URL also navigates before eval.
 Native TLS still uses the dynamically linked Nix OpenSSL. This is a real engine
@@ -335,7 +334,7 @@ it. The probe grew 63,120 bytes (3,325,968): workspace feature unification now
 builds its Tokio with the `net`/`rt-multi-thread` features the browser-process stack
 enables. The renderer path still takes no web-server stack and no CLI crate; its
 only serialization is the value-only IPC seam (`serde` in `protocol.rs`/`process.rs`),
-and the renderer runtime stays current-thread `rt`+`time`.
+and the renderer runtime stays current-thread.
 
 ## Milestone: renderer processes and per-site isolation (2026-09-10)
 
@@ -478,3 +477,282 @@ Command: `nix develop --command cargo build --release --bin tinybrowser`; rustc
 | Artifact | Bytes | Headroom to 10,000,000 |
 | --- | ---: | ---: |
 | CLI (`target/release/tinybrowser`) | 5,768,160 | 4,231,840 |
+
+## Preflight: async HTTP/2 and TLS (2026-09-14)
+
+A throwaway client used hyper-util 0.1.20, hyper-rustls 0.27.9 with default
+features disabled, the `ring` provider, and native roots. The probe completed an
+HTTP/2-capable HTTPS request to `https://example.com/` and received `200 OK` with
+559 response bytes. The matching HTTP-only probe exercised the same hyper client
+without TLS.
+
+| Standalone artifact | Tuned bytes |
+| --- | ---: |
+| HTTP-only hyper client | 1,011,872 |
+| HTTPS hyper-rustls client | 2,023,832 |
+| Isolated TLS delta | **1,011,960** |
+
+This is not the workspace marginal because tinybrowser already links Tokio and
+hyper through axum. The 1.01 MB standalone delta fits the 4,231,840-byte headroom
+from the preceding shipping binary. The checkpoint that integrates net v2 must
+record the authoritative shipping-binary size.
+
+## Milestone: async shell and platform channel, P2-P4 (2026-09-15)
+
+The first v2 checkpoints moved the browser runtime into the executable, made
+`BrowserHandle` and `TabHandle` async-only with one browser task and one tab
+coordinator task per tab, and replaced the renderer stdin/stdout JSON lines with
+a length-prefixed frame protocol over an inherited Unix socket pair. Command:
+`nix develop --command cargo build --release --bin tinybrowser`; rustc 1.98.0,
+stripped x86_64 release profile.
+
+| Artifact | Baseline `c67c22a` | After P2-P4 | Delta | Headroom to 10,000,000 |
+| --- | ---: | ---: | ---: | ---: |
+| CLI (`target/release/tinybrowser`) | 5,768,160 | 5,857,840 | **+89,680** | 4,142,160 |
+
+The delta covers three checkpoints: executable-owned runtime, async owner tasks
+replacing the registry mutex and per-tab threads, and the framed platform
+channel. It includes the Tokio `rt`/`sync`/`time`/`macros` features that the
+browser crate now enables directly.
+
+## Milestone: async renderer loop, P5 (2026-09-15)
+
+P5 moved the browser renderer host to Tokio tasks with oneshot replies and async
+shutdown and reaping, and moved the renderer loop to one current-thread runtime
+that selects commands, dial completions, timer deadlines, and shutdown. The
+engine's private waiter runtime and the 10 ms scheduler poll are gone. Command:
+`nix develop --command cargo build --release --bin tinybrowser`; rustc 1.98.0,
+stripped x86_64 release profile.
+
+| Artifact | After P2-P4 | After P5 | Delta | Headroom to 10,000,000 |
+| --- | ---: | ---: | ---: | ---: |
+| CLI (`target/release/tinybrowser`) | 5,857,840 | 5,891,456 | **+33,616** | 4,108,544 |
+
+## Measurement: 100-tab E0, P5 (2026-09-15)
+
+The E0 harness created 100 CDP targets on a release daemon with a fresh
+profile, then measured the whole process tree after five seconds of idle.
+
+| Metric | v1 (2026-09-14) | P5 |
+| --- | ---: | ---: |
+| Targets | 100 | 101 (one initial) |
+| Creation | 4.2 s | **702 ms** |
+| Threads | 629 | **323** |
+| File descriptors | ~300-600 (est.) | 925 |
+| PSS | 233 MB | **210 MB** |
+| Idle CPU | <=1% | **0%** |
+
+One renderer process still serves each blank target because blank sharing and
+the process budget are P11 work. File descriptors are the tight metric: 925 is
+close to a 1024 soft limit, so the process policy checkpoint must bound channel
+and pipe descriptors or raise the limit explicitly.
+
+## Milestone: hyper transport, P6 (2026-09-15)
+
+P6 replaced ureq 3 + native-tls with hyper-util, hyper-rustls 0.27 with the
+`ring` provider and native roots, and async bodies over `hyper::body::Incoming`.
+`net::WebSocket` moved to Tokio and tokio-tungstenite, and the browser network
+executor (16 OS threads, 256-job queue) is gone: navigation and renderer service
+dials run as Tokio tasks. Command: `nix develop --command cargo build --release
+--bin tinybrowser`; rustc 1.98.0, stripped x86_64 release profile.
+
+| Artifact | After P5 | After P6 | Delta | Headroom to 10,000,000 |
+| --- | ---: | ---: | ---: | ---: |
+| CLI (`target/release/tinybrowser`) | 5,891,456 | 7,287,200 | **+1,395,744** | 2,712,800 |
+
+The delta is the async client stack: hyper, h2, hyper-rustls, rustls, ring,
+rustls-native-certs, and webpki-roots. It also drops ureq and native-tls. The
+preflight predicted about 1.01 MB for TLS plus the HTTP-only hyper client; the
+rest is HTTP/2 framing, the native-root loader, and tokio-tungstenite.
+
+P6 defers two behaviors to P8 and the ledger records the gap: HTTP CONNECT
+proxy routing (the `proxy()` builder still validates and redacts, but requests
+do not tunnel yet) and `--resolve`-aware WebSocket dials (Tokio tungstenite
+resolves directly).
+
+## Milestone: CONNECT proxy, P8 (2026-09-15)
+
+P8 routes HTTPS through an HTTP CONNECT proxy with hyper-util's `Tunnel`,
+including `Proxy-Authorization` from the proxy URI. The custom resolver keeps
+ordered `--resolve` rules ahead of system DNS, and `HttpConnector` supplies
+Happy Eyeballs for multi-address names. Command: `nix develop --command cargo
+build --release --bin tinybrowser`; rustc 1.98.0, stripped x86_64 release
+profile.
+
+| Artifact | After P6 | After P8 | Delta | Headroom to 10,000,000 |
+| --- | ---: | ---: | ---: | ---: |
+| CLI (`target/release/tinybrowser`) | 7,287,200 | 7,349,216 | **+62,016** | 2,650,784 |
+
+Plain `http://` requests through a proxy use CONNECT rather than browser
+absolute-form proxying, and WebSocket dials ignore `--resolve`; both are
+recorded as open P8 follow-ups in the migration ledger.
+
+## Milestone: streamed renderer responses, P9 (2026-09-15)
+
+P9 moves top-level document bodies out of JSON control messages. The browser
+sends `ResponseStart`, bounded raw body frames, and `ResponseEnd`; the renderer
+transport collects at most 1 MiB before forwarding the mount to the page
+engine. The IPC ABI version is now 2. Command: `nix develop --command cargo
+build --release --bin tinybrowser`; rustc 1.98.0, stripped x86_64 release
+profile.
+
+| Artifact | After P8 | After P9 | Delta | Headroom to 10,000,000 |
+| --- | ---: | ---: | ---: | ---: |
+| CLI (`target/release/tinybrowser`) | 7,349,216 | 7,368,096 | **+18,880** | 2,631,904 |
+
+## Checkpoint: incremental navigation parsing, P10 (2026-09-15)
+
+P10 feeds each response chunk into encoding sniffing and html5ever as it
+arrives, preserves parser-blocking scripts, and defers `document.write()`
+insertion until the fetch finishes. Its gates are cargo, Clippy, Playwright,
+the promoted Blink CDP case, and 56/56 focused html5lib `document.write()`
+variants (`html/syntax/parsing/html5lib_write.html`); P10 changes no
+framing-level code, so its row shares the P9 binary and no separate size was
+recorded. The IPC ABI is version 3 in P11 after assignment ids landed.
+
+## Size experiment: abort and ICF (2026-09-15)
+
+Post-P14 experiments measured size levers against the shipping binary
+(7,414,144 bytes). The two kept settings are `panic = "abort"` in
+`[profile.release]` and lld ICF (`--icf=all`) via a Linux target rustflag.
+Everything else in the table was measured and rejected or deferred.
+
+| Experiment | Bytes | Delta | Decision |
+| --- | ---: | ---: | --- |
+| Baseline (P14) | 7,414,144 | — | — |
+| `panic = "abort"` | 6,652,624 | **−761,520** | **keep** |
+| + lld `--icf=all` | 6,582,896 | **−69,728** | **keep** |
+| + `relocation-model=static` (non-PIE) | 6,091,208 | −490,568 | reject: loses ASLR |
+| `webpki-roots` fallback removed | 6,577,424 | −75,200 | reject: loses the root-store fallback |
+| TLS 1.3 only (`tls12` feature off) | 6,536,080 | −46,816 | reject: drops TLS 1.2 servers |
+| `opt-level = "s"` + abort + ICF | 6,962,144 | +379,248 | reject: `"z"` is smaller |
+
+After the CodeRabbit review round (assignment release/reuse fixes, trust-store
+fallback policy, typed DNS failures, and one `tungstenite` version instead of
+two) the binary is 6,582,320 bytes. Unifying `cdp` on `tungstenite` 0.29
+removed the duplicate 0.26 implementation and 1,600 bytes; the rest of the
+small growth is the assignment release watermark and reservation logic.
+
+Measured behavior with abort + ICF: `cargo test --workspace` (26 suites),
+Clippy, Playwright 4/4, Blink CDP 1/1, 173 html5lib WPT tests as expected, and
+E0 (101 targets, 3 processes, 10 threads, 33 descriptors, 11.0 MB PSS, 0% idle
+CPU, 50 parallel requests in 22.7 ms). JS `throw`/`catch`, promise rejection,
+and renderer recovery behave normally; `panic = "abort"` only changes what
+happens after a Rust panic (a renderer child aborts instead of unwinding, and
+the browser reaps it), and rquickjs never uses unwinding for JS exceptions.
+
+`panic = "abort"` also means a Rust panic in the browser process ends the
+daemon instead of failing one Tokio task. That is the cost of the 761 KB.
+`cargo test --release` still builds its test units with unwinding.
+
+Deferred levers, with measured or estimated cost:
+
+- CDP server on hyper-direct instead of axum: standalone probe measured
+  525,608 bytes (ADR 0020); needs the adapter rewrite and must re-pass every
+  protocol gate.
+- Hand-rolled CLI parsing instead of clap: 131.4 KiB `.text`; ADR 0012 picks
+  clap, so this is a product decision.
+- Feature-gating Intl: the ICU4X blob is 125,426 bytes plus code; removes the
+  Intl surface.
+- Dropping HTTP/2: h2 is 63.4 KiB `.text` plus hyper paths; loses HTTP/2.
+- `-Z build-std` with `panic_immediate_abort`: requires nightly; none is
+  installed and the workspace pins stable 1.98.
+
+## Milestone: native-tls transport (2026-09-15)
+
+The TLS backend moved from hyper-rustls/ring to hyper-tls with native-tls
+(system OpenSSL, ALPN h2) for HTTP and WebSocket. rustls, ring, webpki, and
+rustls-native-certs leave the dependency graph. Command: `nix develop
+--command cargo build --release --bin tinybrowser`; rustc 1.98.1, stripped
+x86_64 release profile.
+
+| Artifact | After P14 + review | After native-tls | Delta | Headroom to 10,000,000 |
+| --- | ---: | ---: | ---: | ---: |
+| CLI (`target/release/tinybrowser`) | 6,582,320 | 5,621,760 | **−960,560** | 4,378,240 |
+
+Gates: `cargo test --workspace` (26 suites), Clippy, Playwright 4/4, Blink CDP
+1/1, 56 html5lib WPT tests as expected, and E0 (101 targets, 3 processes, 10
+threads, 33 descriptors, 0% idle CPU, 50 parallel requests in 20.0 ms). A live
+HTTPS smoke reports `http_version: h2` with JA4
+`t13d3012h2_1d37bd780c83_8e6e362c5eac`.
+
+PSS attribution (2026-09-15): a controlled run against a local HTTPS server
+that closed every connection forced a fresh handshake per navigation, and
+measured per-process PSS split by anonymous and file-backed pages plus the
+`libcrypto`/`libssl` share. Between 10 and 110 handshakes the library footprint
+did not move (tree: 7.05 MB PSS / 9.87 MB RSS; daemon: 4.96 / 5.91), anonymous
+memory plateaued at ~7.6 MB, and the steady tree was ~17.7 MB PSS with ~10 MB
+file-backed. About 4.5 MB of libcrypto is touched before any dial while
+building the TLS contexts. The earlier E0 spread (14.9–20.3 MB) is sampling
+timing while the 50-request page and 100 tabs are active, not connection
+growth. The fixed shared-library cost is accepted; building the TLS contexts
+lazily would reduce only the idle footprint.
+
+## Final gate: P14 (2026-09-15)
+
+The final binary is 7,414,144 bytes, 2,585,856 bytes (25.9%) under the
+10,000,000-byte cap. All P14 gates ran on the final HEAD:
+
+- `cargo test --workspace` (26 suites) and `cargo clippy --workspace
+  --all-targets`: green.
+- Playwright 4/4 and the promoted Blink CDP corpus case: green.
+- WPT `html/syntax/parsing/html5lib_write.html`,
+  `html5lib_url.html`, and `html5lib_write_single.html`: 173 tests ran as
+  expected, 0 unexpected, against the pinned WPT checkout `92054a74`.
+- E0: 101 targets, 3 processes, 10 threads, 33 file descriptors, 11.6 MB PSS,
+  0% idle CPU, 50 parallel requests in 21.0 ms.
+- `cargo tree`: no `ureq` or `reqwest`; the HTTP/WebSocket TLS backend is
+  the native-tls milestone below; `tungstenite` only
+  through `tokio-tungstenite`.
+
+## Checkpoint: structural cleanup, P12 (2026-09-15)
+
+P12 split browser-owned persistence (`store.rs`), live networking
+(`network.rs`), and renderer process policy (`manager.rs`) out of the former
+`network.rs`/`link.rs` pair, and moved CDP's dispatch helpers and runtime script
+shapes into `cdp/src/dispatch.rs`. `cargo tree` contains no `ureq`,
+`native-tls`, or `reqwest`; `tungstenite` appears only through
+`tokio-tungstenite`, so no blocking page WebSocket path remains. Size is
+unchanged from P11 at 7,414,144 bytes, so the row stays in the P11 table.
+
+## Milestone: renderer process policy, P11 (2026-09-15)
+
+P11 replaced the per-tab renderer factory with a browser-owned process manager.
+Blank targets are virtual: they hold no renderer until a script runs or a
+navigation commits. The manager keeps one unlocked spare, applies a soft limit
+derived from `/proc/meminfo` (`TINYBROWSER_RENDERER_PROCESS_LIMIT` overrides it
+for tests), reuses a same-site process over the limit, and hands each mounted
+top-level document a browser-minted `RendererAssignmentId` so one process hosts
+several isolated page engines. Command: `nix develop --command cargo build
+--release --bin tinybrowser`; rustc 1.98.0, stripped x86_64 release profile.
+
+| Artifact | After P9 | After P11 | Delta | Headroom to 10,000,000 |
+| --- | ---: | ---: | ---: | ---: |
+| CLI (`target/release/tinybrowser`) | 7,368,096 | 7,414,144 | **+46,048** | 2,585,856 |
+
+The delta covers P10 and P11 together; P10 was not measured separately.
+
+## Measurement: 100-tab E0, P11 (2026-09-15)
+
+The harness starts a release daemon on a fresh profile, creates 100 about:blank
+CDP targets, waits ten seconds, and measures the whole process tree. It then
+navigates one target to a loopback page that issues 50 parallel `fetch` calls.
+
+| Metric | P5 | P11 |
+| --- | ---: | ---: |
+| Targets | 101 | 101 |
+| Creation | 702 ms (Playwright page setup) | **17.5 ms (direct `Target.createTarget`)** |
+| Processes | 101 renderers | **3 (browser, spare, one live page)** |
+| Threads | 323 | **10** |
+| File descriptors | 925 | **33** |
+| PSS | 210 MB | **11.6 MB** |
+| Idle CPU | 0% | **0%** |
+| 50 parallel requests | not measured | **21.1 ms** |
+
+The earlier E0 created each target through Playwright `context.newPage()`, which
+also attaches, enables domains, and waits for execution-context events; the P11
+harness calls `Target.createTarget` directly, so the two creation numbers are
+not comparable. Blank-tab virtuality is what removes the per-target renderer,
+thread, and descriptor cost: P5's 925 descriptors came from one socket pair and
+process per blank target. The remaining descriptors are the CDP listener, the
+spare renderer's socket pair, and the live page's HTTP socket.

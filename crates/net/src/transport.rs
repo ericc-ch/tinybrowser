@@ -1,30 +1,35 @@
-use std::cell::Cell;
-use std::fmt;
-use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
-use std::str::FromStr as _;
-use std::sync::Mutex;
+//! Async HTTP transport: hyper client, native-tls (OpenSSL) TLS, tinybrowser deadlines.
+//!
+//! [ADR 0019](../../../docs/adrs/0019-async-browser-runtime-and-io.md): the
+//! browser process owns one Tokio runtime. `net` never implements HTTP framing;
+//! `hyper-util` supplies HTTP/1.1, HTTP/2, pooling, and the connector stack,
+//! while this module keeps tinybrowser's redirect, cookie, header, timeout, and
+//! error policy and applies `--resolve` rules ahead of system DNS.
+
+use std::convert::Infallible;
+use std::future::Future;
+use std::net::SocketAddr;
+use std::pin::Pin;
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use base64::Engine as _;
-use native_tls::{TlsConnector, TlsStream};
-use ureq::unversioned::resolver::{ResolvedSocketAddrs, Resolver};
-use ureq::unversioned::transport::{
-    Buffers, ConnectionDetails, Connector, LazyBuffers, NextTimeout, Transport,
-};
+use bytes::Bytes;
+use http_body_util::combinators::BoxBody;
+use http_body_util::{BodyExt, Empty, Full};
+use hyper::body::Incoming;
+use hyper_tls::HttpsConnector;
+use hyper_util::client::legacy::Client;
+use hyper_util::client::legacy::connect::HttpConnector;
+use hyper_util::client::legacy::connect::dns::{GaiResolver, Name};
+use hyper_util::client::legacy::connect::proxy::Tunnel;
+use hyper_util::rt::TokioExecutor;
+use tower_service::Service;
 use url::Url;
 
 use crate::error::{NetError, ProtocolError, TimeoutKind, TransportError};
 use crate::protocol::{HeaderMap, Method};
-use crate::resolve::{HostMap, Mapped};
-
-#[derive(Debug, thiserror::Error)]
-#[error("{0}")]
-struct DialTlsFailure(Box<str>);
-
-thread_local! {
-    static CALL_BUDGET: Cell<CallBudget> = const { Cell::new(CallBudget::NONE) };
-}
+use crate::resolve::{HostMap, Mapped, ResolveFailure};
 
 /// Absolute deadlines for one `send` / `upgrade` call.
 ///
@@ -37,11 +42,6 @@ pub(crate) struct CallBudget {
 }
 
 impl CallBudget {
-    pub const NONE: Self = Self {
-        global: None,
-        hop: None,
-    };
-
     pub fn from_engine(
         timeout_global: Option<Duration>,
         timeout_per_call: Option<Duration>,
@@ -87,31 +87,79 @@ impl CallBudget {
     }
 }
 
-pub(crate) fn enter_budget(budget: CallBudget) -> BudgetGuard {
-    CALL_BUDGET.set(budget);
-    BudgetGuard
+fn remaining(deadline: Option<Instant>) -> Option<Duration> {
+    deadline.map(|end| end.saturating_duration_since(Instant::now()))
 }
 
-pub(crate) struct BudgetGuard;
+/// Resolver that applies ordered `--resolve` rules before system DNS.
+#[derive(Clone)]
+pub(crate) struct HostResolver {
+    host_map: HostMap,
+    system: GaiResolver,
+}
 
-impl Drop for BudgetGuard {
-    fn drop(&mut self) {
-        CALL_BUDGET.set(CallBudget::NONE);
+impl Service<Name> for HostResolver {
+    type Response = std::vec::IntoIter<SocketAddr>;
+    type Error = ResolveFailure;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+    fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, name: Name) -> Self::Future {
+        match self.host_map.lookup(name.as_str()) {
+            Some(Mapped::Addr(ip)) => Box::pin(async move {
+                // The connector replaces port zero with the URI's port.
+                Ok(vec![SocketAddr::new(ip.into(), 0)].into_iter())
+            }),
+            Some(Mapped::Fail) => Box::pin(async move { Err(ResolveFailure::Denied) }),
+            None => {
+                let mut system = self.system.clone();
+                Box::pin(async move {
+                    let addrs = Service::call(&mut system, name)
+                        .await
+                        .map_err(ResolveFailure::System)?;
+                    Ok(addrs.collect::<Vec<_>>().into_iter())
+                })
+            }
+        }
     }
 }
 
-fn current_budget() -> CallBudget {
-    CALL_BUDGET.get()
+type RequestBody = BoxBody<Bytes, Infallible>;
+
+/// Any agent-dialed stream: plain TCP, a CONNECT tunnel, or TLS over either.
+pub(crate) trait TransportStream:
+    tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send
+{
+}
+impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> TransportStream for T {}
+
+/// Boxed [`TransportStream`] for WebSocket handshakes, whose stream types
+/// differ per scheme and proxy path.
+pub(crate) type BoxedStream = Box<dyn TransportStream>;
+
+async fn connect_service<C>(connector: &mut C, uri: hyper::Uri) -> Result<C::Response, C::Error>
+where
+    C: tower_service::Service<hyper::Uri>,
+{
+    std::future::poll_fn(|cx| connector.poll_ready(cx)).await?;
+    connector.call(uri).await
 }
 
 #[derive(Clone)]
 pub(crate) struct HttpEngine {
-    inner: ureq::Agent,
+    client: Client<HttpsConnector<HttpConnector<HostResolver>>, RequestBody>,
     pub(crate) proxy: Option<String>,
     pub(crate) timeout_global: Option<Duration>,
     pub(crate) timeout_per_call: Option<Duration>,
-    pub(crate) host_map: HostMap,
+    proxied: Option<ProxiedClient>,
+    http: HttpConnector<HostResolver>,
+    ws_tls: tokio_native_tls::TlsConnector,
 }
+
+type ProxiedClient = Client<HttpsConnector<Tunnel<HttpConnector<HostResolver>>>, RequestBody>;
 
 impl HttpEngine {
     pub(crate) fn new(
@@ -120,36 +168,109 @@ impl HttpEngine {
         proxy: Option<String>,
         host_map: HostMap,
     ) -> Self {
-        let config = ureq::config::Config::builder()
-            .http_status_as_error(false)
-            .max_redirects(0)
-            .timeout_global(None)
-            .timeout_per_call(None)
-            .user_agent(ureq::config::AutoHeaderValue::None)
-            .accept(ureq::config::AutoHeaderValue::None)
-            .accept_encoding(ureq::config::AutoHeaderValue::None)
-            .proxy(None)
-            .allow_non_standard_methods(true)
-            .tls_config(
-                ureq::tls::TlsConfig::builder()
-                    .provider(ureq::tls::TlsProvider::NativeTls)
-                    .build(),
-            )
-            .build();
-        let inner = ureq::Agent::with_parts(
-            config,
-            NetConnector {
-                proxy: proxy.clone(),
-                host_map: host_map.clone(),
-            },
-            DialResolver,
-        );
+        let resolver = HostResolver {
+            host_map,
+            system: GaiResolver::new(),
+        };
+        // `HttpConnector` resolves through `HostResolver` and applies Happy
+        // Eyeballs (300 ms default) when a name returns multiple addresses.
+        let mut http = HttpConnector::new_with_resolver(resolver);
+        http.enforce_http(false);
+        // ALPN is configured here, not by `hyper-tls`: its `alpn` feature only
+        // reports the protocol the server picked. OpenSSL initialization
+        // failure is unrecoverable for TLS in this process, and hyper-tls's
+        // own constructors panic on it for the same reason.
+        let tls = native_tls::TlsConnector::builder()
+            .request_alpns(&["h2", "http/1.1"])
+            .build()
+            .expect("openssl tls connector");
+        let tls = tokio_native_tls::TlsConnector::from(tls);
+        let connector = HttpsConnector::from((http.clone(), tls.clone()));
+        let client = Client::builder(TokioExecutor::new()).build(connector);
+        let proxied = proxy.as_deref().and_then(|proxy| {
+            let (destination, auth) = proxy_destination(proxy).ok()?;
+            let mut tunnel = Tunnel::new(destination, http.clone());
+            if let Some(auth) = auth {
+                tunnel = tunnel.with_auth(auth);
+            }
+            let connector = HttpsConnector::from((tunnel, tls));
+            Some(Client::builder(TokioExecutor::new()).build(connector))
+        });
+        // WebSocket upgrades are HTTP/1.1 only: asking for h2 here would let a
+        // server negotiate a protocol tungstenite cannot speak.
+        let ws_tls = native_tls::TlsConnector::builder()
+            .request_alpns(&["http/1.1"])
+            .build()
+            .expect("openssl tls connector");
         Self {
-            inner,
+            client,
             proxy,
             timeout_global,
             timeout_per_call,
-            host_map,
+            proxied,
+            http,
+            ws_tls: tokio_native_tls::TlsConnector::from(ws_tls),
+        }
+    }
+
+    /// Dials a WebSocket origin through the agent transport: `--resolve`, a
+    /// configured CONNECT proxy, and for `wss` the same TLS backend with
+    /// `http/1.1` ALPN.
+    pub(crate) async fn dial_websocket(&self, url: &Url) -> Result<BoxedStream, NetError> {
+        let secure = match url.scheme() {
+            "ws" => false,
+            "wss" => true,
+            _ => {
+                return Err(NetError::Protocol(ProtocolError::Other(
+                    "unsupported websocket scheme".into(),
+                )));
+            }
+        };
+        let host = url
+            .host_str()
+            .ok_or_else(|| NetError::Protocol(ProtocolError::Other("missing host".into())))?;
+        let authority = match url.port() {
+            Some(port) => format!("{host}:{port}"),
+            None => host.to_owned(),
+        };
+        let mut target = format!(
+            "{}://{authority}{}",
+            if secure { "https" } else { "http" },
+            url.path()
+        );
+        if let Some(query) = url.query() {
+            target.push('?');
+            target.push_str(query);
+        }
+        let uri: hyper::Uri = target
+            .parse()
+            .map_err(|_| NetError::Protocol(ProtocolError::RejectedRequest))?;
+
+        let stream: BoxedStream = if let Some(proxy) = self.proxy.as_deref() {
+            let (destination, auth) = proxy_destination(proxy).map_err(|_| {
+                NetError::Transport(TransportError::Connect("invalid proxy".into()))
+            })?;
+            let mut tunnel = Tunnel::new(destination, self.http.clone());
+            if let Some(auth) = auth {
+                tunnel = tunnel.with_auth(auth);
+            }
+            let connected = connect_service(&mut tunnel, uri)
+                .await
+                .map_err(connect_failure)?;
+            Box::new(connected.into_inner())
+        } else {
+            let connected = connect_service(&mut self.http.clone(), uri)
+                .await
+                .map_err(connect_failure)?;
+            Box::new(connected.into_inner())
+        };
+        if secure {
+            let tls = self.ws_tls.connect(host, stream).await.map_err(|error| {
+                NetError::Transport(TransportError::Tls(error.to_string().into()))
+            })?;
+            Ok(Box::new(tls))
+        } else {
+            Ok(stream)
         }
     }
 
@@ -157,45 +278,64 @@ impl HttpEngine {
         CallBudget::from_engine(self.timeout_global, self.timeout_per_call, start)
     }
 
-    pub(crate) fn send(
+    /// Sends one hop. Redirects, cookies, and header shaping belong to the
+    /// caller; this method applies the deadline and maps transport failures.
+    ///
+    /// # Errors
+    ///
+    /// [`NetError::Transport`] for DNS, connect, TLS, timeout, or I/O failure.
+    /// [`NetError::Protocol`] when the request cannot be represented.
+    pub(crate) async fn send(
         &self,
         method: &Method,
         wire_url: &Url,
         headers: &HeaderMap,
         body: Option<&[u8]>,
         budget: CallBudget,
-    ) -> Result<(u16, HeaderMap, Box<dyn Read + Send>), NetError> {
+    ) -> Result<(u16, HeaderMap, Incoming), NetError> {
         if budget.is_expired() {
             return Err(timed_out(budget.timeout_kind(TimeoutKind::Global)));
         }
-        let _guard = enter_budget(budget);
-        let mut builder = ureq::http::Request::builder()
+        let mut request = hyper::Request::builder()
             .method(
-                ureq::http::Method::from_str(method.as_str())
+                hyper::Method::from_bytes(method.as_str().as_bytes())
                     .map_err(|_| NetError::Protocol(ProtocolError::RejectedRequest))?,
             )
-            .uri(wire_url.as_str());
-
-        for (name, value) in headers.iter() {
-            builder = builder.header(name, value);
-        }
-        if wire_url.scheme() == "http"
-            && headers.get("proxy-authorization").is_none()
-            && let Some(value) = proxy_basic_token(self.proxy.as_deref())
+            .uri(
+                wire_url
+                    .as_str()
+                    .parse::<hyper::Uri>()
+                    .map_err(|_| NetError::Protocol(ProtocolError::RejectedRequest))?,
+            );
         {
-            builder = builder.header("Proxy-Authorization", value);
+            let request_headers = request
+                .headers_mut()
+                .ok_or(NetError::Protocol(ProtocolError::RejectedRequest))?;
+            for (name, value) in headers.iter() {
+                let name = hyper::header::HeaderName::from_bytes(name.as_bytes())
+                    .map_err(|_| NetError::Protocol(ProtocolError::RejectedRequest))?;
+                let value = hyper::header::HeaderValue::from_bytes(value)
+                    .map_err(|_| NetError::Protocol(ProtocolError::RejectedRequest))?;
+                request_headers.append(name, value);
+            }
         }
+        let request_body = match body {
+            Some(bytes) => Full::new(Bytes::copy_from_slice(bytes)).boxed(),
+            None => Empty::<Bytes>::new().boxed(),
+        };
+        let request = request
+            .body(request_body)
+            .map_err(|_| NetError::Protocol(ProtocolError::RejectedRequest))?;
 
-        let rejected = |_| NetError::Protocol(ProtocolError::RejectedRequest);
-        let response = match body {
-            Some(bytes) => self
-                .inner
-                .run(builder.body(bytes.to_vec()).map_err(rejected)?)
-                .map_err(NetError::from)?,
-            None => self
-                .inner
-                .run(builder.body(()).map_err(rejected)?)
-                .map_err(NetError::from)?,
+        let host = wire_url.host_str().unwrap_or_default().to_owned();
+        let request_future = match &self.proxied {
+            Some(proxied) => proxied.request(request),
+            None => self.client.request(request),
+        };
+        let response = match wait_for(budget, request_future).await {
+            Ok(Ok(response)) => response,
+            Ok(Err(error)) => return Err(map_client_error(error, &host)),
+            Err(error) => return Err(error),
         };
         let status = response.status().as_u16();
         let mut mapped = HeaderMap::new();
@@ -204,580 +344,99 @@ impl HttpEngine {
                 .insert(name.as_str(), value.as_bytes())
                 .map_err(|_| NetError::Protocol(ProtocolError::UnrepresentableHeader))?;
         }
-        Ok((
-            status,
-            mapped,
-            Box::new(BudgetedReader {
-                inner: response.into_body().into_reader(),
-                budget,
-            }),
-        ))
+        let _ = status;
+        Ok((response.status().as_u16(), mapped, response.into_body()))
     }
 }
 
-struct BudgetedReader<R> {
-    inner: R,
-    budget: CallBudget,
-}
-
-impl<R: Read> Read for BudgetedReader<R> {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        if self.budget.is_expired() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                "global timeout exceeded",
-            ));
-        }
-        let _guard = enter_budget(self.budget);
-        self.inner.read(buf)
-    }
-}
-
-impl From<ureq::Error> for NetError {
-    fn from(err: ureq::Error) -> Self {
-        use ureq::Error as U;
-        match err {
-            U::HostNotFound => Self::Transport(TransportError::Dns("host not found".into())),
-            U::ConnectionFailed => {
-                Self::Transport(TransportError::Connect("connection failed".into()))
+/// Awaits `future` under the call deadline.
+async fn wait_for<T>(budget: CallBudget, future: impl Future<Output = T>) -> Result<T, NetError> {
+    match budget.deadline() {
+        Some(deadline) => {
+            let deadline = tokio::time::Instant::from_std(deadline);
+            match tokio::time::timeout_at(deadline, future).await {
+                Ok(value) => Ok(value),
+                Err(_) => Err(timed_out(budget.timeout_kind(TimeoutKind::Global))),
             }
-            U::ConnectProxyFailed(detail) => {
-                Self::Transport(TransportError::Connect(detail.into()))
-            }
-            U::Io(err) => {
-                if let Some(tls) = err
-                    .get_ref()
-                    .and_then(|inner| inner.downcast_ref::<DialTlsFailure>())
-                {
-                    return Self::Transport(TransportError::Tls(tls.0.clone()));
-                }
-                Self::Transport(TransportError::Io(err))
-            }
-            U::Timeout(which) => {
-                use ureq::Timeout as T;
-                let kind = match which {
-                    T::Global => TimeoutKind::Global,
-                    T::PerCall => TimeoutKind::PerCall,
-                    T::Resolve => TimeoutKind::Resolve,
-                    T::Connect => TimeoutKind::Connect,
-                    T::SendRequest => TimeoutKind::SendRequest,
-                    T::SendBody => TimeoutKind::SendBody,
-                    T::RecvResponse => TimeoutKind::RecvResponse,
-                    T::RecvBody => TimeoutKind::RecvBody,
-                    other => TimeoutKind::Unknown(format!("{other:?}").into()),
-                };
-                Self::Transport(TransportError::Timeout(kind))
-            }
-            U::Tls(detail) => Self::Transport(TransportError::Tls(detail.into())),
-            U::NativeTls(err) => Self::Transport(TransportError::Tls(err.to_string().into())),
-            U::Der(err) => Self::Transport(TransportError::Tls(err.to_string().into())),
-            U::TooManyRedirects => Self::Limit(crate::error::LimitExceeded::Redirect),
-            U::BodyExceedsLimit(cap) => Self::Limit(crate::error::LimitExceeded::Size(cap)),
-            U::LargeResponseHeader(_, cap) => {
-                Self::Limit(crate::error::LimitExceeded::Size(cap as u64))
-            }
-            U::Http(_) => Self::Protocol(ProtocolError::RejectedRequest),
-            other => Self::Protocol(ProtocolError::Other(other.to_string().into())),
         }
+        None => Ok(future.await),
     }
-}
-
-#[derive(Debug, Default)]
-struct DialResolver;
-
-impl Resolver for DialResolver {
-    fn resolve(
-        &self,
-        _uri: &ureq::http::Uri,
-        _config: &ureq::config::Config,
-        _timeout: NextTimeout,
-    ) -> Result<ResolvedSocketAddrs, ureq::Error> {
-        Ok(self.empty())
-    }
-}
-
-#[derive(Clone)]
-struct NetConnector {
-    proxy: Option<String>,
-    host_map: HostMap,
-}
-
-impl fmt::Debug for NetConnector {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("NetConnector")
-            .field("has_proxy", &self.proxy.is_some())
-            .field("has_host_map", &!self.host_map.is_empty())
-            .finish_non_exhaustive()
-    }
-}
-
-impl Connector for NetConnector {
-    type Out = StreamTransport;
-
-    fn connect(
-        &self,
-        details: &ConnectionDetails,
-        chained: Option<()>,
-    ) -> Result<Option<Self::Out>, ureq::Error> {
-        if chained.is_some() {
-            return Err(ureq::Error::ConnectionFailed);
-        }
-        let url =
-            Url::parse(&details.uri.to_string()).map_err(|_| ureq::Error::ConnectionFailed)?;
-        let stream = open(
-            &url,
-            self.proxy.as_deref(),
-            hop_deadline(details),
-            &self.host_map,
-        )
-        .map_err(to_ureq)?;
-        let buffers = LazyBuffers::new(
-            details.config.input_buffer_size(),
-            details.config.output_buffer_size(),
-        );
-        Ok(Some(StreamTransport {
-            stream: Mutex::new(stream),
-            buffers,
-        }))
-    }
-}
-
-struct StreamTransport {
-    stream: Mutex<RawStream>,
-    buffers: LazyBuffers,
-}
-
-impl Transport for StreamTransport {
-    fn buffers(&mut self) -> &mut dyn Buffers {
-        &mut self.buffers
-    }
-
-    fn transmit_output(&mut self, amount: usize, timeout: NextTimeout) -> Result<(), ureq::Error> {
-        let mut stream = self
-            .stream
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        apply_timeout(&stream, timeout, true)?;
-        let output = &self.buffers.output()[..amount];
-        stream
-            .write_all(output)
-            .map_err(|err| map_io(err, timeout))?;
-        Ok(())
-    }
-
-    fn await_input(&mut self, timeout: NextTimeout) -> Result<bool, ureq::Error> {
-        let mut stream = self
-            .stream
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        apply_timeout(&stream, timeout, false)?;
-        let input = self.buffers.input_append_buf();
-        let amount = stream.read(input).map_err(|err| map_io(err, timeout))?;
-        self.buffers.input_appended(amount);
-        Ok(amount > 0)
-    }
-
-    fn is_open(&mut self) -> bool {
-        let stream = self
-            .stream
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        stream.peek_open()
-    }
-
-    fn is_tls(&self) -> bool {
-        self.stream
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .is_tls()
-    }
-}
-
-impl fmt::Debug for StreamTransport {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("StreamTransport").finish_non_exhaustive()
-    }
-}
-
-fn hop_deadline(details: &ConnectionDetails) -> Option<Instant> {
-    let from_ureq = match details.timeout.not_zero() {
-        Some(ureq::unversioned::transport::time::Duration::Exact(duration)) => {
-            Some(Instant::now() + duration)
-        }
-        _ => None,
-    };
-    match (current_budget().deadline(), from_ureq) {
-        (Some(budget), Some(ureq_end)) => Some(budget.min(ureq_end)),
-        (budget, ureq_end) => budget.or(ureq_end),
-    }
-}
-
-fn socket_timeout(timeout: NextTimeout) -> Option<Duration> {
-    let from_ureq = match timeout.not_zero() {
-        Some(ureq::unversioned::transport::time::Duration::Exact(duration)) => Some(duration),
-        _ => None,
-    };
-    match (current_budget().remaining(), from_ureq) {
-        (Some(budget), Some(ureq_end)) => Some(budget.min(ureq_end)),
-        (budget, ureq_end) => budget.or(ureq_end),
-    }
-}
-
-fn apply_timeout(stream: &RawStream, timeout: NextTimeout, write: bool) -> Result<(), ureq::Error> {
-    let dur = socket_timeout(timeout);
-    if dur == Some(Duration::ZERO) {
-        return Err(budget_timeout(timeout));
-    }
-    if write {
-        stream.set_write_timeout(dur).map_err(ureq::Error::from)?;
-    } else {
-        stream.set_read_timeout(dur).map_err(ureq::Error::from)?;
-    }
-    Ok(())
-}
-
-fn budget_timeout(timeout: NextTimeout) -> ureq::Error {
-    let kind =
-        current_budget().timeout_kind(TimeoutKind::Unknown(format!("{:?}", timeout.reason).into()));
-    let mapped = match kind {
-        TimeoutKind::PerCall => ureq::Timeout::PerCall,
-        TimeoutKind::Connect => ureq::Timeout::Connect,
-        TimeoutKind::Resolve => ureq::Timeout::Resolve,
-        TimeoutKind::Global
-        | TimeoutKind::SendRequest
-        | TimeoutKind::SendBody
-        | TimeoutKind::RecvResponse
-        | TimeoutKind::RecvBody
-        | TimeoutKind::Unknown(_) => ureq::Timeout::Global,
-    };
-    ureq::Error::Timeout(mapped)
-}
-
-fn map_io(err: std::io::Error, timeout: NextTimeout) -> ureq::Error {
-    match err.kind() {
-        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock => budget_timeout(timeout),
-        _ => ureq::Error::from(err),
-    }
-}
-
-fn to_ureq(err: NetError) -> ureq::Error {
-    match err {
-        NetError::Transport(TransportError::Io(e)) => ureq::Error::Io(e),
-        NetError::Transport(TransportError::Tls(detail)) => {
-            ureq::Error::Io(std::io::Error::other(DialTlsFailure(detail)))
-        }
-        NetError::Transport(TransportError::Connect(detail)) => {
-            ureq::Error::ConnectProxyFailed(detail.into())
-        }
-        NetError::Transport(TransportError::Dns(_)) => ureq::Error::HostNotFound,
-        NetError::Transport(TransportError::Timeout(kind)) => {
-            let t = match kind {
-                TimeoutKind::PerCall => ureq::Timeout::PerCall,
-                TimeoutKind::Connect => ureq::Timeout::Connect,
-                TimeoutKind::Resolve => ureq::Timeout::Resolve,
-                TimeoutKind::Global
-                | TimeoutKind::SendRequest
-                | TimeoutKind::SendBody
-                | TimeoutKind::RecvResponse
-                | TimeoutKind::RecvBody
-                | TimeoutKind::Unknown(_) => ureq::Timeout::Global,
-            };
-            ureq::Error::Timeout(t)
-        }
-        NetError::Protocol(ProtocolError::InvalidProxy) => ureq::Error::InvalidProxyUrl,
-        _ => ureq::Error::ConnectionFailed,
-    }
-}
-
-pub(crate) struct Socket {
-    tcp: TcpStream,
-    prefix: Vec<u8>,
-}
-
-impl Socket {
-    fn new(tcp: TcpStream, prefix: Vec<u8>) -> Self {
-        Self { tcp, prefix }
-    }
-}
-
-impl Read for Socket {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        if !self.prefix.is_empty() {
-            let n = buf.len().min(self.prefix.len());
-            buf[..n].copy_from_slice(&self.prefix[..n]);
-            self.prefix.drain(..n);
-            return Ok(n);
-        }
-        self.tcp.read(buf)
-    }
-}
-
-impl Write for Socket {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.tcp.write(buf)
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        self.tcp.flush()
-    }
-}
-
-pub(crate) enum RawStream {
-    Plain(Socket),
-    Tls(TlsStream<Socket>),
-}
-
-impl RawStream {
-    fn tcp(&self) -> &TcpStream {
-        match self {
-            Self::Plain(s) => &s.tcp,
-            Self::Tls(s) => &s.get_ref().tcp,
-        }
-    }
-
-    pub(crate) fn set_read_timeout(&self, timeout: Option<Duration>) -> std::io::Result<()> {
-        self.tcp().set_read_timeout(timeout)
-    }
-
-    pub(crate) fn set_write_timeout(&self, timeout: Option<Duration>) -> std::io::Result<()> {
-        self.tcp().set_write_timeout(timeout)
-    }
-
-    pub(crate) fn is_tls(&self) -> bool {
-        matches!(self, Self::Tls(_))
-    }
-
-    pub(crate) fn peek_open(&self) -> bool {
-        if let Self::Plain(s) = self
-            && !s.prefix.is_empty()
-        {
-            return true;
-        }
-        let tcp = self.tcp();
-        if tcp.set_nonblocking(true).is_err() {
-            return false;
-        }
-        let mut buf = [0];
-        let open = match tcp.peek(&mut buf) {
-            Err(err)
-                if err.kind() == std::io::ErrorKind::WouldBlock
-                    || err.kind() == std::io::ErrorKind::TimedOut =>
-            {
-                true
-            }
-            Ok(0) | Err(_) => false,
-            Ok(_) => true,
-        };
-        if tcp.set_nonblocking(false).is_err() {
-            return false;
-        }
-        open
-    }
-}
-
-impl Read for RawStream {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        match self {
-            Self::Plain(s) => s.read(buf),
-            Self::Tls(s) => s.read(buf),
-        }
-    }
-}
-
-impl Write for RawStream {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        match self {
-            Self::Plain(s) => s.write(buf),
-            Self::Tls(s) => s.write(buf),
-        }
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        match self {
-            Self::Plain(s) => s.flush(),
-            Self::Tls(s) => s.flush(),
-        }
-    }
-}
-
-pub(crate) fn open(
-    url: &Url,
-    proxy: Option<&str>,
-    deadline: Option<Instant>,
-    host_map: &HostMap,
-) -> Result<RawStream, NetError> {
-    if remaining(deadline) == Some(Duration::ZERO) {
-        return Err(timed_out(
-            current_budget().timeout_kind(TimeoutKind::Connect),
-        ));
-    }
-    let host = url
-        .host_str()
-        .ok_or(NetError::Protocol(ProtocolError::RejectedRequest))?;
-    let tls = matches!(url.scheme(), "https" | "wss");
-    let tunnel = tls || url.scheme() == "ws";
-    let port = url
-        .port_or_known_default()
-        .unwrap_or(if tls { 443 } else { 80 });
-    let socket = if let Some(proxy) = proxy {
-        if tunnel {
-            connect_via_proxy(proxy, host, port, deadline, host_map)?
-        } else {
-            tcp_to_proxy(proxy, deadline, host_map)?
-        }
-    } else {
-        Socket::new(connect_tcp(host, port, deadline, host_map)?, Vec::new())
-    };
-    let _ = socket.tcp.set_nodelay(true);
-    if tls {
-        let timeout = remaining(deadline);
-        if timeout == Some(Duration::ZERO) {
-            return Err(timed_out(
-                current_budget().timeout_kind(TimeoutKind::Connect),
-            ));
-        }
-        socket
-            .tcp
-            .set_read_timeout(timeout)
-            .map_err(map_connect_io)?;
-        socket
-            .tcp
-            .set_write_timeout(timeout)
-            .map_err(map_connect_io)?;
-        let connector = TlsConnector::new()
-            .map_err(|err| NetError::Transport(TransportError::Tls(err.to_string().into())))?;
-        let tls_stream = match connector.connect(host, socket) {
-            Ok(s) => s,
-            Err(native_tls::HandshakeError::Failure(err)) => {
-                return Err(NetError::Transport(TransportError::Tls(
-                    err.to_string().into(),
-                )));
-            }
-            Err(_) => {
-                return Err(NetError::Transport(TransportError::Tls(
-                    "tls handshake interrupted".into(),
-                )));
-            }
-        };
-        Ok(RawStream::Tls(tls_stream))
-    } else {
-        Ok(RawStream::Plain(socket))
-    }
-}
-
-fn remaining(deadline: Option<Instant>) -> Option<Duration> {
-    deadline.map(|end| end.saturating_duration_since(Instant::now()))
 }
 
 fn timed_out(kind: TimeoutKind) -> NetError {
     NetError::Transport(TransportError::Timeout(kind))
 }
 
-fn connect_tcp(
-    host: &str,
-    port: u16,
-    deadline: Option<Instant>,
-    host_map: &HostMap,
-) -> Result<TcpStream, NetError> {
-    let host = host
-        .strip_prefix('[')
-        .and_then(|h| h.strip_suffix(']'))
-        .unwrap_or(host);
-    if remaining(deadline) == Some(Duration::ZERO) {
-        return Err(timed_out(
-            current_budget().timeout_kind(TimeoutKind::Resolve),
-        ));
-    }
-    let addrs = resolve_addrs(host, port, remaining(deadline), host_map)?;
-    let mut last = None;
-    for addr in addrs {
-        let leftover = remaining(deadline);
-        if leftover == Some(Duration::ZERO) {
-            return Err(timed_out(
-                current_budget().timeout_kind(TimeoutKind::Connect),
-            ));
-        }
-        let result = match leftover {
-            Some(limit) => TcpStream::connect_timeout(&addr, limit),
-            None => TcpStream::connect(addr),
-        };
-        match result {
-            Ok(stream) => return Ok(stream),
-            Err(err) => last = Some(err),
-        }
-    }
-    match last {
-        Some(err) => Err(map_connect_io(err)),
-        None => Err(NetError::Transport(TransportError::Dns(host.into()))),
-    }
+fn connect_failure(error: impl std::fmt::Display) -> NetError {
+    NetError::Transport(TransportError::Connect(error.to_string().into()))
 }
 
-fn resolve_addrs(
-    host: &str,
-    port: u16,
-    timeout: Option<Duration>,
-    host_map: &HostMap,
-) -> Result<Vec<SocketAddr>, NetError> {
-    match host_map.lookup(host) {
-        Some(Mapped::Fail) => {
-            return Err(NetError::Transport(TransportError::Dns(host.into())));
+fn map_client_error(error: hyper_util::client::legacy::Error, host: &str) -> NetError {
+    if error.is_connect() {
+        let mut source = std::error::Error::source(&error);
+        let mut tls_reason: Option<Box<str>> = None;
+        while let Some(cause) = source {
+            // The resolver phase fails before any socket exists: `hyper-util`
+            // wraps `HostResolver`'s error in its connect error, and the typed
+            // cause survives the wrapping.
+            if cause.downcast_ref::<ResolveFailure>().is_some() {
+                return NetError::Transport(TransportError::Dns(host.into()));
+            }
+            if cause.downcast_ref::<native_tls::Error>().is_some() && tls_reason.is_none() {
+                tls_reason = Some(cause.to_string().into());
+            }
+            if let Some(io) = cause.downcast_ref::<std::io::Error>() {
+                if io.kind() == std::io::ErrorKind::NotFound {
+                    return NetError::Transport(TransportError::Dns(host.into()));
+                }
+                // A connect-phase io error that wraps another error is a
+                // protocol failure (TLS handshake, most often); plain OS
+                // errors carry no inner error.
+                let wrapped = io.get_ref().is_some();
+                if wrapped && tls_reason.is_none() {
+                    tls_reason = Some(io.to_string().into());
+                }
+            }
+            let text = cause.to_string();
+            let lowered = text.to_ascii_lowercase();
+            if tls_reason.is_none()
+                && (lowered.contains("tls")
+                    || lowered.contains("certificate")
+                    || lowered.contains("handshake"))
+            {
+                tls_reason = Some(text.into());
+            }
+            source = cause.source();
         }
-        Some(Mapped::Addr(ip)) => return Ok(vec![SocketAddr::from((ip, port))]),
-        None => {}
-    }
-    let Some(limit) = timeout else {
-        return (host, port)
-            .to_socket_addrs()
-            .map(Iterator::collect)
-            .map_err(|_| NetError::Transport(TransportError::Dns(host.into())));
-    };
-    let host_owned = host.to_owned();
-    let (tx, rx) = std::sync::mpsc::sync_channel(1);
-    std::thread::Builder::new()
-        .name("net-dns".into())
-        .spawn(move || {
-            let resolved = (host_owned.as_str(), port)
-                .to_socket_addrs()
-                .map(Iterator::collect);
-            let _ = tx.send(resolved);
-        })
-        .map_err(map_connect_io)?;
-    match rx.recv_timeout(limit) {
-        Ok(Ok(addrs)) => Ok(addrs),
-        Ok(Err(_)) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-            Err(NetError::Transport(TransportError::Dns(host.into())))
+        if let Some(reason) = tls_reason {
+            return NetError::Transport(TransportError::Tls(reason));
         }
-        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(timed_out(
-            current_budget().timeout_kind(TimeoutKind::Resolve),
-        )),
+        return NetError::Transport(TransportError::Connect(error.to_string().into()));
     }
+    NetError::Transport(TransportError::Io(std::io::Error::other(error)))
 }
 
-fn tcp_to_proxy(
+fn proxy_destination(
     proxy: &str,
-    deadline: Option<Instant>,
-    host_map: &HostMap,
-) -> Result<Socket, NetError> {
-    let proxy_url =
-        Url::parse(proxy).map_err(|_| NetError::Protocol(ProtocolError::InvalidProxy))?;
-    let phost = proxy_url
+) -> Result<(hyper::Uri, Option<hyper::header::HeaderValue>), NetError> {
+    let url = Url::parse(proxy).map_err(|_| NetError::Protocol(ProtocolError::InvalidProxy))?;
+    let host = url
         .host_str()
         .ok_or(NetError::Protocol(ProtocolError::InvalidProxy))?;
-    let proxy_port = proxy_url.port_or_known_default().unwrap_or(80);
-    Ok(Socket::new(
-        connect_tcp(phost, proxy_port, deadline, host_map)?,
-        Vec::new(),
-    ))
-}
-
-pub(crate) fn proxy_basic_token(proxy: Option<&str>) -> Option<String> {
-    let proxy = proxy?;
-    let proxy_url = Url::parse(proxy).ok()?;
-    if proxy_url.username().is_empty() {
-        return None;
-    }
-    let password = proxy_url.password().unwrap_or("");
-    Some(basic_authorization(proxy_url.username(), password))
+    let port = url.port_or_known_default().unwrap_or(80);
+    let destination = format!("http://{host}:{port}")
+        .parse::<hyper::Uri>()
+        .map_err(|_| NetError::Protocol(ProtocolError::InvalidProxy))?;
+    let auth = if url.username().is_empty() {
+        None
+    } else {
+        Some(
+            basic_authorization(url.username(), url.password().unwrap_or(""))
+                .parse::<hyper::header::HeaderValue>()
+                .map_err(|_| NetError::Protocol(ProtocolError::InvalidProxy))?,
+        )
+    };
+    Ok((destination, auth))
 }
 
 pub(crate) fn basic_authorization(username: &str, password: &str) -> String {
@@ -785,80 +444,4 @@ pub(crate) fn basic_authorization(username: &str, password: &str) -> String {
         "Basic {}",
         base64::engine::general_purpose::STANDARD.encode(format!("{username}:{password}"))
     )
-}
-
-fn connect_via_proxy(
-    proxy: &str,
-    host: &str,
-    port: u16,
-    deadline: Option<Instant>,
-    host_map: &HostMap,
-) -> Result<Socket, NetError> {
-    let proxy_url =
-        Url::parse(proxy).map_err(|_| NetError::Protocol(ProtocolError::InvalidProxy))?;
-    let phost = proxy_url
-        .host_str()
-        .ok_or(NetError::Protocol(ProtocolError::InvalidProxy))?;
-    let proxy_port = proxy_url.port_or_known_default().unwrap_or(80);
-    let mut stream = connect_tcp(phost, proxy_port, deadline, host_map)?;
-    let timeout = remaining(deadline);
-    if timeout == Some(Duration::ZERO) {
-        return Err(timed_out(
-            current_budget().timeout_kind(TimeoutKind::Connect),
-        ));
-    }
-    stream.set_read_timeout(timeout).map_err(map_connect_io)?;
-    stream.set_write_timeout(timeout).map_err(map_connect_io)?;
-    let authority = if host.contains(':') && !host.starts_with('[') {
-        format!("[{host}]:{port}")
-    } else {
-        format!("{host}:{port}")
-    };
-    let mut req = format!("CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n");
-    if let Some(value) = proxy_basic_token(Some(proxy)) {
-        req.push_str("Proxy-Authorization: ");
-        req.push_str(&value);
-        req.push_str("\r\n");
-    }
-    req.push_str("\r\n");
-    stream.write_all(req.as_bytes()).map_err(map_connect_io)?;
-    stream.flush().map_err(map_connect_io)?;
-    let mut buf = Vec::new();
-    loop {
-        if let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
-            let leftover = buf[end + 4..].to_vec();
-            let head = String::from_utf8_lossy(&buf[..end]);
-            let status_line = head.lines().next().unwrap_or("");
-            let mut tokens = status_line.split_whitespace();
-            let version = tokens.next().unwrap_or("");
-            let status = tokens
-                .next()
-                .and_then(|s| s.parse::<u16>().ok())
-                .unwrap_or(0);
-            if !version.starts_with("HTTP/") || status != 200 {
-                return Err(NetError::Transport(TransportError::Connect(
-                    format!("CONNECT {status}").into(),
-                )));
-            }
-            return Ok(Socket::new(stream, leftover));
-        }
-        if buf.len() > 64 * 1024 {
-            return Err(NetError::Protocol(ProtocolError::RejectedRequest));
-        }
-        let mut chunk = [0u8; 512];
-        let n = stream.read(&mut chunk).map_err(map_connect_io)?;
-        if n == 0 {
-            return Err(NetError::Protocol(ProtocolError::RejectedRequest));
-        }
-        buf.extend_from_slice(&chunk[..n]);
-    }
-}
-
-fn map_connect_io(err: std::io::Error) -> NetError {
-    match err.kind() {
-        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock => {
-            timed_out(current_budget().timeout_kind(TimeoutKind::Connect))
-        }
-        _ => NetError::Transport(TransportError::Io(err)),
-    }
 }

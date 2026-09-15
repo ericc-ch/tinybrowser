@@ -43,7 +43,7 @@ Qualified element name: namespace plus optional prefix plus local name. Comes fr
 _Avoid_: tag name (only the local part)
 
 **Fan-in point**:
-The `browser` crate: browser-side ownership (Browser, tab `Tab`, `NetworkSession`, renderer link). Root `tinybrowser` depends on `browser`, `cdp`, `webdriver`, and `renderer` (the last only for the `renderer` subcommand). Root must not depend on `dom` or `net`. Both protocol crates depend only on `browser`, never on each other ([ADR 0007](adrs/0007-engine-charter.md), [ADR 0011](adrs/0011-renderer-processes-per-site.md)).
+The `browser` crate: browser-side ownership (Browser, tab `Tab`, async `NetworkSession`, renderer process manager). Root `tinybrowser` depends on `browser`, `cdp`, `webdriver`, and `renderer` (the last only for the `renderer` subcommand). Root must not depend on `dom` or `net`. Both protocol crates depend only on `browser`, never on each other ([ADR 0007](adrs/0007-engine-charter.md), [ADR 0011](adrs/0011-renderer-processes-per-site.md)).
 _Avoid_: “only crate that may import two layers” as a religion; `cargo test -p dom` is allowed
 
 **Scope**:
@@ -63,7 +63,7 @@ A foreign-content element where HTML parsing resumes instead of breaking out: SV
 _Avoid_: integration element, breakout point
 
 **Hard seam**:
-The `net` crate's public type surface: every name callers see (`Agent`, `RequestBuilder`, `Response`, `Body`, `HeaderMap`, `Method`, `InitiatorKind`, `NetError`, `WebSocket`) is ours, so a later transport swap cannot leak ureq or tungstenite into `browser`.
+The `net` crate's public type surface: every name callers see (`Agent`, `RequestBuilder`, `Response`, `Body`, `HeaderMap`, `Method`, `InitiatorKind`, `NetError`, `WebSocket`) is ours, so a later transport swap cannot leak hyper-util, native-tls, or tokio-tungstenite into `browser`.
 _Avoid_: abstraction layer, backend boundary (those mix the type rule with the conversion point)
 
 **Task**:
@@ -79,7 +79,7 @@ Which initiator owns a `net` request (`Navigation`, `Fetch`, `Xhr`, `WsHandshake
 _Avoid_: context (that is a browsing context), scope (dom selector root)
 
 **Conversion point**:
-The places inside `net` that mention ureq, native-tls, or tungstenite: `transport` (`HttpEngine` construction, `HttpEngine::send`, `open`, `NetConnector`, `From<ureq::Error>`) and `websocket` (handshake and frames). Public types stay ours. `AgentBuilder::build`, `RequestBuilder::send`, and `RequestBuilder::upgrade` call those sites and must not name backend types.
+The private places inside `net` that mention hyper-util, hyper-tls, native-tls, or tokio-tungstenite. Public types stay ours. Browser callers and the renderer protocol must not name backend types. The TLS connector remains replaceable by `btls` without changing the public seam ([ADR 0019](adrs/0019-async-browser-runtime-and-io.md)).
 _Avoid_: adapter, wrapper, FFI boundary
 
 **Platform object**:
@@ -89,7 +89,7 @@ One native `JsNode` representation holds a `NodeId`, while separate WebIDL proto
 _Avoid_: host object, polyfill, binding glue, wrapper (those mix platform objects with JS-written APIs)
 
 **Tab**:
-A top-level browsing context: the identity that survives navigation and the thing a user-visible tab, a CDP target of type `page`, or a WebDriver window maps to. Owned by the browser process; other threads talk to it through `TabHandle`. On the CDP wire it is a **page target** (`"type": "page"`, `Page.*` methods); CDP's experimental **tab target** is the browser-UI container, which we do not model. In the HTML spec it is the top-level traversable; in Chromium it is a `WebContents`; in Gecko the browser UI calls it a tab and the parent-side DOM object is the `CanonicalBrowsingContext`.
+A top-level browsing context: the identity that survives navigation and the thing a user-visible tab, a CDP target of type `page`, or a WebDriver window maps to. Owned by one browser-process Tokio task; other tasks talk to it through `TabHandle`. On the CDP wire it is a **page target** (`"type": "page"`, `Page.*` methods); CDP's experimental **tab target** is the browser-UI container, which we do not model. In the HTML spec it is the top-level traversable; in Chromium it is a `WebContents`; in Gecko the browser UI calls it a tab and the parent-side DOM object is the `CanonicalBrowsingContext`.
 _Avoid_: page (CDP method names and HTTP prose only), document (the active content is replaced on navigation), site instance, CDP tab target
 
 **Document**:
@@ -113,35 +113,43 @@ One QuickJS `Context`: a global object, intrinsic constructors, and prototype ch
 _Avoid_: context (alone), world (Blink's extension concept), isolate
 
 **TabHandle**:
-The value-only handle other threads and protocols use to talk to one `Tab` in the browser process. Commands, events, request IDs, values, and explicit errors may cross. DOM references, QuickJS values, callbacks, and closures must not.
+The async-only value handle other tasks and protocols use to talk to one `Tab` in the browser process. Commands, events, request IDs, values, and explicit errors may cross. DOM references, QuickJS values, callbacks, and closures must not. V2 has no blocking facade.
 _Avoid_: RendererHandle (the browser process's handle to a renderer process), NodeId (tree identity inside a renderer process)
 
 **RendererHandle**:
-The value-only handle the browser process uses to command one renderer process. Commands, request IDs, events, script results, and explicit errors may cross. DOM handles, QuickJS values, and callbacks must not.
+The async value handle the browser process uses to command one renderer process. Commands, request IDs, events, script results, and explicit errors may cross. DOM handles, QuickJS values, and callbacks must not.
 _Avoid_: TabHandle (the tab handle protocols hold)
 
+**Renderer assignment**:
+One browser-owned top-level document placement in a renderer process. `RendererAssignmentId` binds a tab, navigation epoch, principal, and renderer process. Commands, events, browser-service calls, and cancellation carry the ID so one renderer can host shared blank documents or matching same-site instances without confusing their lifecycle or authority. The browser rejects stale IDs and IDs received from the wrong renderer channel ([ADR 0019](adrs/0019-async-browser-runtime-and-io.md)).
+_Avoid_: RendererHandle (identifies a process), TabId (survives navigation), FrameId (renderer-local frame identity)
+
+**Renderer platform channel**:
+The private inherited full-duplex channel between the browser process and one renderer process. Unix and macOS use an unnamed Unix-domain socket pair. Windows uses an overlapped duplex named pipe after its platform gate passes. The channel is async on both sides. Stderr remains separate. HTTP is not used here ([ADR 0019](adrs/0019-async-browser-runtime-and-io.md)).
+_Avoid_: RPC, HTTP, CDP, stdin/stdout protocol
+
 **IPC seam**:
-The value-only message boundary between browser process and renderer process ([ADR 0011](adrs/0011-renderer-processes-per-site.md)). Messages cross the renderer's stdin/stdout pipe. HTTP is not used here.
+The value-only message boundary carried by the renderer platform channel ([ADR 0011](adrs/0011-renderer-processes-per-site.md), [ADR 0019](adrs/0019-async-browser-runtime-and-io.md)). Small control payloads use JSON. Response body chunks use raw bytes.
 _Avoid_: RPC, HTTP, CDP
 
-**Renderer site lock**:
-An immutable browser-process authorization bound to one renderer before content is mounted. A renderer may request cookies or claim an initiator only for URLs in that schemeful site; an opaque lock accepts only `about:`, `blob:`, and `data:` documents. The browser process validates every child service call and terminates a process renderer on a violation ([ADR 0016](adrs/0016-renderer-seam-reference-monitor.md)). This is a reference-monitor property, not a renderer sandbox.
-_Avoid_: trusting the renderer's initiator string, treating a process boundary alone as a sandbox
+**Renderer authorization**:
+The browser-owned state for one renderer process: `Unlocked` or `Locked(Site)`. An unlocked renderer may host only browser-assigned initial blank documents and truly opaque documents with no inherited site. A locked renderer may host only documents in its immutable schemeful site. The browser validates each child service call against the renderer state and its `RendererAssignmentId`, then terminates the renderer on a violation ([ADR 0016](adrs/0016-renderer-seam-reference-monitor.md), [ADR 0019](adrs/0019-async-browser-runtime-and-io.md)). This is a reference-monitor property, not a renderer sandbox.
+_Avoid_: opaque lock, trusting the renderer's initiator string, treating a process boundary alone as a sandbox
 
 **IPC message budget**:
-The maximum encoded size of one browser/renderer message: 8 MiB, enforced before JSON deserialization in both directions. Navigation bodies have their smaller 1 MiB budget. Oversized or undelimited process messages terminate the renderer transport ([ADR 0016](adrs/0016-renderer-seam-reference-monitor.md)).
+The maximum encoded size of one browser/renderer control payload: 8 MiB, enforced before JSON deserialization in both directions. Raw response body chunks have a 64 KiB cap. Aggregate response limits belong to request policy. Readers validate the length-prefixed frame header before allocation. Oversized, invalid, unknown, or truncated frames terminate the renderer transport ([ADR 0016](adrs/0016-renderer-seam-reference-monitor.md), [ADR 0019](adrs/0019-async-browser-runtime-and-io.md)).
 _Avoid_: line length, body limit (those are different budgets)
 
-**TabActor**:
-The browser-process coordinator thread for one `Tab`: identity, navigation dials, waiters, and the renderer link. It owns no DOM and no JS; the renderer process owns the `Document` ([ADR 0011](adrs/0011-renderer-processes-per-site.md)).
-_Avoid_: renderer process (the process that owns the document), tab thread as a Spectre boundary
+**Tab coordinator**:
+The browser-process Tokio task for one `Tab`: identity, navigation, cancellation, waiters, subscriptions, and the renderer handle. It owns no DOM and no JS; the renderer process owns the `Document` ([ADR 0019](adrs/0019-async-browser-runtime-and-io.md)).
+_Avoid_: TabActor, tab thread, renderer process (the process that owns the document)
 
 **Page engine**:
 The code and runtime that holds frames and their documents: HTML parser, `Dom`, QuickJS realms, task queues, and timers. It is the `renderer` crate; the Rust type is `renderer::Engine`. One engine per renderer process owns the shared QuickJS `Runtime`, the Tokio waiter, and the frame registry; "renderer" alone means the process ([ADR 0014](adrs/0014-frames-and-per-frame-realms.md)).
 _Avoid_: renderer (as a code noun), content engine, browser engine
 
 **Renderer process**:
-The process hosting the page engine: one shared QuickJS `Runtime`, one Tokio waiter, and one `Document` plus realm per frame. Runs in its own OS process, one per live site instance, spawned from the same executable as `renderer`. It advances work while idle and never links `net` ([ADR 0011](adrs/0011-renderer-processes-per-site.md), [ADR 0014](adrs/0014-frames-and-per-frame-realms.md)). Chromium calls it the renderer process, Gecko the content process ([Gecko process model](https://firefox-source-docs.mozilla.org/dom/ipc/process_model.html)).
+The process hosting the page engine: one shared QuickJS `Runtime`, one current-thread Tokio waiter, and one `Document` plus realm per frame. Under the soft process limit, one renderer serves each live site instance. Over the limit, matching same-site instances may reuse a renderer. The same executable spawns it as `renderer`. It advances work while idle and never links `net` ([ADR 0011](adrs/0011-renderer-processes-per-site.md), [ADR 0014](adrs/0014-frames-and-per-frame-realms.md), [ADR 0019](adrs/0019-async-browser-runtime-and-io.md)). Chromium calls it the renderer process, Gecko the content process ([Gecko process model](https://firefox-source-docs.mozilla.org/dom/ipc/process_model.html)).
 _Avoid_: content process (Gecko's name for the same thing; use renderer process), worker, TabActor
 
 **Site**:
@@ -149,19 +157,19 @@ Scheme plus registrable domain (eTLD+1), for example `https://example.co.uk`. Su
 _Avoid_: origin (scheme + host + port), domain
 
 **Site instance**:
-The isolation unit: one site within one browsing context group. One renderer process per live site instance; a cross-site navigation moves the Tab's document to the renderer for the new site ([ADR 0011](adrs/0011-renderer-processes-per-site.md)). Matches Chromium's `SiteInstance`; Gecko selects it by `webIsolated=$SITE`.
+The isolation unit: one site within one browsing context group. A cross-site navigation moves the Tab's document to a renderer locked for the new site. A site instance gets a dedicated renderer under the soft process limit and may share a matching same-site renderer over the limit ([ADR 0011](adrs/0011-renderer-processes-per-site.md), [ADR 0019](adrs/0019-async-browser-runtime-and-io.md)). Matches Chromium's `SiteInstance`; Gecko selects it by `webIsolated=$SITE`.
 _Avoid_: origin (scheme + host + port), tab, domain
 
 **Browser process**:
-The process-side half of the browser: `Browser`, the tab registry, `NetworkSession`, the renderer factory, and the protocol adapters. One per profile, started as `daemon` or `webdriver`. Chromium calls it the browser process, Gecko the parent process ([Chromium multi-process architecture](https://www.chromium.org/developers/design-documents/multi-process-architecture/), [Gecko process model](https://firefox-source-docs.mozilla.org/dom/ipc/process_model.html)).
+The process-side half of the browser: one executable-owned Tokio runtime, `Browser`, the tab registry, async `NetworkSession`, renderer process manager, and protocol adapters. One per profile, started as `daemon` or `webdriver`. Chromium calls it the browser process, Gecko the parent process ([Chromium multi-process architecture](https://www.chromium.org/developers/design-documents/multi-process-architecture/), [Gecko process model](https://firefox-source-docs.mozilla.org/dom/ipc/process_model.html)).
 _Avoid_: host (as a noun), daemon process, browser (the `Browser` type), UI process
 
 **Browser**:
-One browser process hosts one Browser bound to one named Profile. Browser owns `ProfileStore`, the shared `NetworkSession`, the tab registry of `TabHandle`s, and the renderer factory that applies browser-owned site locks ([ADR 0010](adrs/0010-page-actor-ownership.md), [ADR 0011](adrs/0011-renderer-processes-per-site.md)).
+One browser process hosts one Browser bound to one named Profile. A browser task owns `ProfileStore`, the shared async `NetworkSession`, the tab registry of `TabHandle`s, and the renderer process manager that applies browser-owned renderer authorization ([ADR 0010](adrs/0010-page-actor-ownership.md), [ADR 0011](adrs/0011-renderer-processes-per-site.md), [ADR 0019](adrs/0019-async-browser-runtime-and-io.md)).
 _Avoid_: WebDriver session (that is automation state only), Profile as a runtime owner between Browser and tabs
 
 **BrowserHandle**:
-The value-only handle CDP and WebDriver use to drive Browser. Neither protocol owns Browser, Profile, or NetworkSession ([ADR 0009](adrs/0009-named-profile-daemon.md)).
+The async-only value handle CDP and WebDriver use to drive Browser. Neither protocol owns Browser, Profile, NetworkSession, or a private Tokio runtime. V2 has no blocking facade ([ADR 0009](adrs/0009-named-profile-daemon.md), [ADR 0019](adrs/0019-async-browser-runtime-and-io.md)).
 _Avoid_: Browser (the process-owned engine)
 
 **Profile**:
@@ -173,11 +181,11 @@ Exclusively locked durable backing for one Profile under `XDG_DATA_HOME`. Cookie
 _Avoid_: cookie jar on `Agent` as the lasting durable owner
 
 **NetworkSession**:
-Browser-owned live networking service for one Profile. It wraps one shared `net::Agent`, a fixed 16-worker blocking executor, and a bounded 256-task queue. `ProfileStore` is durable backing, not another live jar. Renderer processes submit dials and cookie operations through the browser side of the seam and receive completions as renderer events; they own neither `net::Agent` nor blocking pools. Closing a tab cancels queued work before it starts and rejects later completions ([ADR 0010](adrs/0010-page-actor-ownership.md), hard seam [ADR 0006](adrs/0006-net-transport.md)).
+Browser-owned async networking service for one Profile. It wraps one shared `net::Agent`, explicit browser-wide, per-tab, per-host, and WebSocket limits, and request cancellation. `ProfileStore` is durable backing, not another live jar. Renderer processes submit dials and cookie operations through the browser side of the seam and receive typed completions as renderer events; they own no `net::Agent` or HTTP stack. Replacing a navigation, closing a tab, or losing a renderer cancels the owned requests and releases their resources ([ADR 0019](adrs/0019-async-browser-runtime-and-io.md), hard seam [ADR 0006](adrs/0006-net-transport.md)).
 _Avoid_: Agent as a second durable owner, tab-owned Agent
 
 **Profile daemon**:
-The browser process for one named Profile, spawned from the same executable. A CLI command starts it detached when that profile daemon is missing. It binds `127.0.0.1` on a random port. It stops on explicit stop (`Browser.close`), OS user-session exit, or failure. Registration is user-only at `$XDG_RUNTIME_DIR/tinybrowser/<profile>/daemon.json`. A startup lock in that directory elects one daemon if several CLI processes start together ([ADR 0009](adrs/0009-named-profile-daemon.md)).
+The browser process for one named Profile, spawned from the same executable. A CLI command starts it detached when that profile daemon is missing. It binds `127.0.0.1` on a random port. It stops on explicit async close (`BrowserHandle::close().await`), OS user-session exit, or failure. Registration is user-only at `$XDG_RUNTIME_DIR/tinybrowser/<profile>/daemon.json`. A startup lock in that directory elects one daemon if several CLI processes start together ([ADR 0009](adrs/0009-named-profile-daemon.md)).
 _Avoid_: separately shipped helper, idle-exit server
 
 **CDP**:
