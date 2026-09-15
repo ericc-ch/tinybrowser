@@ -24,6 +24,7 @@ mod intern;
 mod pump;
 
 pub(crate) use crate::js::ScriptValue;
+pub(crate) use dial::ResponseDecoder;
 
 const MAX_PENDING_JS_FETCHES: usize = 256;
 const MAX_PENDING_EVENTS: usize = 2048;
@@ -256,6 +257,39 @@ impl Document {
         world.document_url = self.url.clone();
         drop(world);
         self.start_document(&html);
+    }
+
+    pub(crate) fn open_response(&mut self, response: &crate::protocol::ResponseStart) {
+        self.reset_js_realm();
+        if let Ok(url) = Url::parse(&response.final_url) {
+            self.url = url;
+        }
+        self.content_language.clone_from(&response.content_language);
+        let mut world = self.world.borrow_mut();
+        world.document_url = self.url.clone();
+        world.parser_active = true;
+        drop(world);
+        self.parser_eof = false;
+        self.active_parser = Some(ActiveParser::new(""));
+    }
+
+    pub(crate) fn write_response(&mut self, html: String) {
+        if html.is_empty() {
+            return;
+        }
+        if let Some(parser) = &self.active_parser {
+            parser.append_html(html);
+            if !self.classic_fetch_in_flight {
+                self.advance_parser();
+            }
+        }
+    }
+
+    pub(crate) fn close_response(&mut self) {
+        self.parser_eof = true;
+        if !self.classic_fetch_in_flight {
+            self.advance_parser();
+        }
     }
 
     /// Parses `input` into this document and starts a new JS realm.

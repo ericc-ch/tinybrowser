@@ -32,7 +32,8 @@ pub(crate) struct NavOutcome {
     pub final_url: Url,
     pub content_type: Option<String>,
     pub content_language: Option<String>,
-    pub body: Vec<u8>,
+    pub body: net::Body,
+    _permit: tokio::sync::OwnedSemaphorePermit,
 }
 
 const COOKIES_VERSION: &str = "tinybrowser-cookies-v1";
@@ -332,25 +333,14 @@ impl FetchHandle {
             .get("content-type")
             .and_then(|bytes| std::str::from_utf8(bytes).ok())
             .map(str::to_owned);
-        let mut body = response.into_body();
-        let mut bytes = Vec::new();
-        while let Some(chunk) = body
-            .read_chunk()
-            .await
-            .map_err(|error| dial_failure(&error))?
-        {
-            if bytes.len().saturating_add(chunk.len()) > NAV_BODY_LIMIT {
-                return Err(DialFailure::Limit);
-            }
-            bytes.extend_from_slice(&chunk);
-        }
-        drop(permits);
+        let body = response.into_body();
         Ok(NavOutcome {
             status,
             final_url,
             content_type,
             content_language,
-            body: bytes,
+            body,
+            _permit: permits,
         })
     }
 
@@ -434,7 +424,7 @@ impl FetchHandle {
     }
 }
 
-fn dial_failure(error: &net::NetError) -> DialFailure {
+pub(crate) fn dial_failure(error: &net::NetError) -> DialFailure {
     use net::{NetError, TransportError};
     match error {
         NetError::Transport(TransportError::Dns(_)) => DialFailure::Dns,

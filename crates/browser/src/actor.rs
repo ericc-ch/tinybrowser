@@ -18,7 +18,7 @@ use tokio::time::{Instant, sleep_until, timeout};
 use url::Url;
 
 use crate::link::{RendererFactory, RendererHandle};
-use crate::network::{FetchHandle, NavOutcome};
+use crate::network::{FetchHandle, NAV_BODY_LIMIT, NavOutcome, dial_failure};
 use crate::site::Site;
 
 const EVENT_SUBSCRIBER_CAPACITY: usize = 256;
@@ -465,6 +465,51 @@ impl Tab {
         result
     }
 
+    async fn mount_stream(
+        &mut self,
+        site: &Site,
+        status: u16,
+        mount: Mount,
+        mut body: net::Body,
+    ) -> Result<(), TabError> {
+        self.ensure_renderer(site).await?;
+        self.document_loaded = false;
+        let renderer = self.renderer.as_ref().ok_or(TabError::ActorStopped)?;
+        let stream = renderer
+            .start_response(FrameId::MAIN, status, &mount)
+            .await?;
+        let mut received = 0usize;
+        loop {
+            match body.read_chunk().await {
+                Ok(Some(chunk)) => {
+                    received = received.saturating_add(chunk.len());
+                    if received > NAV_BODY_LIMIT {
+                        let _ = stream.abort(DialFailure::Limit).await;
+                        self.drop_renderer().await;
+                        return Err(renderer_unavailable("navigation body exceeds limit"));
+                    }
+                    if let Err(error) = stream.write(chunk).await {
+                        drop(stream);
+                        self.drop_renderer().await;
+                        return Err(error);
+                    }
+                }
+                Ok(None) => break,
+                Err(error) => {
+                    let failure = dial_failure(&error);
+                    let _ = stream.abort(failure).await;
+                    self.drop_renderer().await;
+                    return Err(renderer_unavailable(&error.to_string()));
+                }
+            }
+        }
+        let result = stream.finish().await.and_then(reply_unit);
+        if result.is_err() {
+            self.drop_renderer().await;
+        }
+        result
+    }
+
     async fn drop_renderer(&mut self) {
         *self.current.lock().unwrap_or_else(PoisonError::into_inner) = None;
         self.site = None;
@@ -548,11 +593,15 @@ impl Tab {
         self.document_url = outcome.final_url.clone();
         let mount = Mount {
             url: outcome.final_url.to_string(),
-            content_type: outcome.content_type,
-            content_language: outcome.content_language,
-            body: outcome.body,
+            content_type: outcome.content_type.clone(),
+            content_language: outcome.content_language.clone(),
+            body: Vec::new(),
         };
-        if self.mount(&site, outcome.status, mount).await.is_err() {
+        if self
+            .mount_stream(&site, outcome.status, mount, outcome.body)
+            .await
+            .is_err()
+        {
             self.navigation_failed = true;
             return false;
         }

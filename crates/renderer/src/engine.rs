@@ -109,6 +109,36 @@ impl Engine {
         Ok(())
     }
 
+    pub(crate) fn open_response(
+        &mut self,
+        response: &crate::protocol::ResponseStart,
+    ) -> Result<(), TabError> {
+        self.remove_descendants(response.frame);
+        let document = self
+            .frame_mut(response.frame)
+            .ok_or(TabError::UnknownFrame {
+                frame: response.frame.get(),
+            })?;
+        document.open_response(response);
+        Ok(())
+    }
+
+    pub(crate) fn write_response(&mut self, frame: FrameId, html: String) -> Result<(), TabError> {
+        self.frame_mut(frame)
+            .ok_or(TabError::UnknownFrame { frame: frame.get() })?
+            .write_response(html);
+        self.reconcile_frames();
+        Ok(())
+    }
+
+    pub(crate) fn close_response(&mut self, frame: FrameId) -> Result<(), TabError> {
+        self.frame_mut(frame)
+            .ok_or(TabError::UnknownFrame { frame: frame.get() })?
+            .close_response();
+        self.reconcile_frames();
+        Ok(())
+    }
+
     /// Evaluates `source` in one frame and returns its string coercion.
     ///
     /// # Errors

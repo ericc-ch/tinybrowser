@@ -24,9 +24,8 @@ use url::Url;
 use crate::channel::{FrameKind, decode_control, read_frame};
 use crate::document::Stop;
 use crate::protocol::{
-    BrowserServices, Command, DialCompletion, DialRequest, FromRenderer, MAX_RESPONSE_BODY_BYTES,
-    Mount, RENDERER_INBOX_CAPACITY, RENDERER_OUTBOX_CAPACITY, ResponseStart, ServiceCall,
-    ServiceReply, ToRenderer,
+    BrowserServices, Command, DialCompletion, DialRequest, FromRenderer, RENDERER_INBOX_CAPACITY,
+    RENDERER_OUTBOX_CAPACITY, ServiceCall, ServiceReply, ToRenderer,
 };
 use tokio::sync::{Notify, mpsc};
 
@@ -47,7 +46,7 @@ pub fn serve() -> io::Result<()> {
 
 async fn serve_async() -> io::Result<thread::JoinHandle<io::Result<()>>> {
     let (input, output) = endpoint()?;
-    let (command_tx, command_rx) = mpsc::channel::<ToRenderer>(RENDERER_INBOX_CAPACITY);
+    let (command_tx, command_rx) = mpsc::channel::<RendererInput>(RENDERER_INBOX_CAPACITY);
     let (out_tx, out_rx) = std_mpsc::sync_channel::<FromRenderer>(RENDERER_OUTBOX_CAPACITY);
     let stop = Arc::new(Stop::new());
     let wake = Arc::new(Notify::new());
@@ -59,10 +58,10 @@ async fn serve_async() -> io::Result<thread::JoinHandle<io::Result<()>>> {
         if result.is_err() {
             writer_stop.request();
             writer_wake.notify_one();
-            let _ = writer_commands.try_send(ToRenderer::Request {
+            let _ = writer_commands.try_send(RendererInput::Control(ToRenderer::Request {
                 id: 0,
                 command: Command::Shutdown,
-            });
+            }));
         }
         result
     });
@@ -108,14 +107,13 @@ fn endpoint() -> io::Result<(Box<dyn Read + Send>, Box<dyn Write + Send>)> {
 
 fn read_messages(
     mut input: Box<dyn Read + Send>,
-    command_tx: &mpsc::Sender<ToRenderer>,
+    command_tx: &mpsc::Sender<RendererInput>,
     services: &ChannelServices,
     stop: &Arc<Stop>,
     wake: &Arc<Notify>,
 ) {
     let mut buffer = Vec::new();
     let mut greeted = false;
-    let mut responses = InboundResponses::default();
     loop {
         let frame = match read_frame(&mut input, &mut buffer) {
             Ok(Some(frame)) => frame,
@@ -126,8 +124,13 @@ fn read_messages(
             }
         };
         if frame.kind == FrameKind::Body {
-            if let Err(message) = responses.push(frame.request, &buffer) {
-                logging::error!(target: "renderer::ipc", "{message}");
+            if command_tx
+                .blocking_send(RendererInput::Body {
+                    request: frame.request,
+                    bytes: buffer.clone(),
+                })
+                .is_err()
+            {
                 break;
             }
             continue;
@@ -157,38 +160,32 @@ fn read_messages(
                         ..
                     }
                 );
-                if command_tx.blocking_send(message).is_err() || shutdown {
+                if command_tx
+                    .blocking_send(RendererInput::Control(message))
+                    .is_err()
+                    || shutdown
+                {
                     return;
                 }
             }
-            ToRenderer::ResponseStart { id, response } if greeted => {
-                if let Err(message) = responses.start(id, response) {
-                    logging::error!(target: "renderer::ipc", "{message}");
-                    break;
+            ToRenderer::ResponseStart { .. }
+            | ToRenderer::ResponseEnd { .. }
+            | ToRenderer::ResponseError { .. }
+                if greeted =>
+            {
+                if command_tx
+                    .blocking_send(RendererInput::Control(message))
+                    .is_err()
+                {
+                    return;
                 }
             }
             ToRenderer::ResponseStart { .. } => {
                 logging::error!(target: "renderer::ipc", "response before handshake");
                 break;
             }
-            ToRenderer::ResponseEnd { id } => {
-                let message = match responses.finish(id) {
-                    Ok(message) => message,
-                    Err(message) => {
-                        logging::error!(target: "renderer::ipc", "{message}");
-                        break;
-                    }
-                };
-                if command_tx.blocking_send(message).is_err() {
-                    return;
-                }
-            }
-            ToRenderer::ResponseError { id, failure } => {
-                if !responses.abort(id) {
-                    logging::error!(target: "renderer::ipc", "response error without start");
-                    break;
-                }
-                logging::error!(target: "renderer::ipc", "streamed response failed: {failure:?}");
+            ToRenderer::ResponseEnd { .. } | ToRenderer::ResponseError { .. } => {
+                logging::error!(target: "renderer::ipc", "response terminator before handshake");
                 break;
             }
             ToRenderer::ServiceReply { id, reply } => services.deliver(id, reply),
@@ -198,77 +195,15 @@ fn read_messages(
     // browser: interrupt in-flight work and stop the loop.
     stop.request();
     wake.notify_one();
-    let _ = command_tx.try_send(ToRenderer::Request {
+    let _ = command_tx.try_send(RendererInput::Control(ToRenderer::Request {
         id: 0,
         command: Command::Shutdown,
-    });
+    }));
 }
 
-struct InboundResponse {
-    response: ResponseStart,
-    body: Vec<u8>,
-}
-
-#[derive(Default)]
-struct InboundResponses(HashMap<u64, InboundResponse>);
-
-impl InboundResponses {
-    fn start(&mut self, id: u64, response: ResponseStart) -> Result<(), &'static str> {
-        if self
-            .0
-            .insert(
-                id,
-                InboundResponse {
-                    response,
-                    body: Vec::new(),
-                },
-            )
-            .is_some()
-        {
-            Err("duplicate response start")
-        } else {
-            Ok(())
-        }
-    }
-
-    fn push(&mut self, id: u64, bytes: &[u8]) -> Result<(), &'static str> {
-        let response = self
-            .0
-            .get_mut(&id)
-            .ok_or("body frame without response start")?;
-        if response.body.len().saturating_add(bytes.len()) > MAX_RESPONSE_BODY_BYTES {
-            return Err("streamed response exceeds body limit");
-        }
-        response.body.extend_from_slice(bytes);
-        Ok(())
-    }
-
-    fn finish(&mut self, id: u64) -> Result<ToRenderer, &'static str> {
-        let completed = self.0.remove(&id).ok_or("response end without start")?;
-        let ResponseStart {
-            frame,
-            final_url,
-            content_type,
-            content_language,
-            ..
-        } = completed.response;
-        Ok(ToRenderer::Request {
-            id,
-            command: Command::Mount {
-                frame,
-                mount: Mount {
-                    url: final_url,
-                    content_type,
-                    content_language,
-                    body: completed.body,
-                },
-            },
-        })
-    }
-
-    fn abort(&mut self, id: u64) -> bool {
-        self.0.remove(&id).is_some()
-    }
+pub(crate) enum RendererInput {
+    Control(ToRenderer),
+    Body { request: u64, bytes: Vec<u8> },
 }
 
 fn write_messages(

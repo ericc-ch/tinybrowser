@@ -64,6 +64,77 @@ pub(crate) struct RendererHandle {
     tasks: Mutex<Vec<JoinHandle<()>>>,
 }
 
+pub(crate) struct ResponseWriter {
+    id: u64,
+    tx: mpsc::Sender<Outbound>,
+    pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Reply>>>>,
+    reply: Option<oneshot::Receiver<Reply>>,
+}
+
+impl ResponseWriter {
+    pub(crate) async fn write(&self, payload: Vec<u8>) -> Result<(), TabError> {
+        if payload.len() > renderer::MAX_BODY_CHUNK_BYTES {
+            return Err(TabError::RendererUnavailable {
+                message: "response chunk exceeds IPC limit".into(),
+            });
+        }
+        self.tx
+            .send(Outbound::Body {
+                request: self.id,
+                payload,
+            })
+            .await
+            .map_err(|_| TabError::ActorStopped)
+    }
+
+    pub(crate) async fn finish(self) -> Result<Reply, TabError> {
+        let id = self.id;
+        self.terminate(ToRenderer::ResponseEnd { id }).await
+    }
+
+    pub(crate) async fn abort(self, failure: renderer::DialFailure) -> Result<Reply, TabError> {
+        let id = self.id;
+        self.terminate(ToRenderer::ResponseError { id, failure })
+            .await
+    }
+
+    async fn terminate(mut self, message: ToRenderer) -> Result<Reply, TabError> {
+        if self.tx.send(Outbound::Control(message)).await.is_err() {
+            return Err(TabError::ActorStopped);
+        }
+        let Some(reply) = self.reply.take() else {
+            return Err(TabError::ActorStopped);
+        };
+        if let Ok(Ok(reply)) = timeout(REQUEST_TIMEOUT, reply).await {
+            Ok(reply)
+        } else {
+            self.pending
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .remove(&self.id);
+            Err(TabError::ActorStopped)
+        }
+    }
+}
+
+impl Drop for ResponseWriter {
+    fn drop(&mut self) {
+        if self.reply.is_none() {
+            return;
+        }
+        self.pending
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&self.id);
+        let _ = self
+            .tx
+            .try_send(Outbound::Control(ToRenderer::ResponseError {
+                id: self.id,
+                failure: renderer::DialFailure::Cancelled,
+            }));
+    }
+}
+
 impl RendererHandle {
     /// Sends one command and waits for its reply.
     ///
@@ -106,6 +177,19 @@ impl RendererHandle {
         status: u16,
         mount: Mount,
     ) -> Result<Reply, TabError> {
+        let response = self.start_response(frame, status, &mount).await?;
+        for chunk in mount.body.chunks(renderer::MAX_BODY_CHUNK_BYTES) {
+            response.write(chunk.to_vec()).await?;
+        }
+        response.finish().await
+    }
+
+    pub(crate) async fn start_response(
+        &self,
+        frame: FrameId,
+        status: u16,
+        mount: &Mount,
+    ) -> Result<ResponseWriter, TabError> {
         let id = self.next_request.fetch_add(1, Ordering::Relaxed);
         let (reply_tx, reply_rx) = oneshot::channel();
         {
@@ -118,9 +202,9 @@ impl RendererHandle {
         let start = ResponseStart {
             frame,
             status,
-            final_url: mount.url,
-            content_type: mount.content_type,
-            content_language: mount.content_language,
+            final_url: mount.url.clone(),
+            content_type: mount.content_type.clone(),
+            content_language: mount.content_language.clone(),
         };
         if self
             .tx
@@ -134,35 +218,12 @@ impl RendererHandle {
             self.remove_pending(id);
             return Err(TabError::ActorStopped);
         }
-        for chunk in mount.body.chunks(renderer::MAX_BODY_CHUNK_BYTES) {
-            if self
-                .tx
-                .send(Outbound::Body {
-                    request: id,
-                    payload: chunk.to_vec(),
-                })
-                .await
-                .is_err()
-            {
-                self.remove_pending(id);
-                return Err(TabError::ActorStopped);
-            }
-        }
-        if self
-            .tx
-            .send(Outbound::Control(ToRenderer::ResponseEnd { id }))
-            .await
-            .is_err()
-        {
-            self.remove_pending(id);
-            return Err(TabError::ActorStopped);
-        }
-        if let Ok(Ok(reply)) = timeout(REQUEST_TIMEOUT, reply_rx).await {
-            Ok(reply)
-        } else {
-            self.remove_pending(id);
-            Err(TabError::ActorStopped)
-        }
+        Ok(ResponseWriter {
+            id,
+            tx: self.tx.clone(),
+            pending: Arc::clone(&self.pending),
+            reply: Some(reply_rx),
+        })
     }
     /// Subscribes to renderer document events after this call.
     #[must_use]

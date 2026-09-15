@@ -7,7 +7,7 @@
 
 use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::mpsc::{SyncSender, TrySendError};
 use std::time::Duration;
@@ -173,13 +173,14 @@ fn fragment_context_name(spec: &str) -> QualName {
 
 /// Runs the renderer loop until `Shutdown`, channel close, or stop.
 pub(crate) async fn run(
-    mut inbox: tokio::sync::mpsc::Receiver<ToRenderer>,
+    mut inbox: tokio::sync::mpsc::Receiver<process::RendererInput>,
     outbox: &SyncSender<FromRenderer>,
     services: Arc<dyn BrowserServices>,
     stop: &Arc<Stop>,
     wake: Arc<tokio::sync::Notify>,
 ) {
     let mut engine = Engine::new(services, Arc::clone(stop), Arc::clone(&wake));
+    let mut responses = ResponseStreams::default();
     loop {
         engine.pump_ready();
         if !publish(&mut engine, outbox) {
@@ -192,7 +193,7 @@ pub(crate) async fn run(
         let deadline = engine.next_deadline();
         tokio::select! {
             received = inbox.recv() => match received {
-                Some(ToRenderer::Request { id, command }) => {
+                Some(process::RendererInput::Control(ToRenderer::Request { id, command })) => {
                     let (reply, shutdown) = handle_command(&mut engine, command, stop);
                     if !send_to_browser(outbox, FromRenderer::Reply { id, reply }) {
                         stop.request();
@@ -202,14 +203,38 @@ pub(crate) async fn run(
                         break;
                     }
                 }
+                Some(process::RendererInput::Control(ToRenderer::ResponseStart { id, response })) => {
+                    if responses.start(id, response, &mut engine).is_err() {
+                        stop.request();
+                        break;
+                    }
+                }
+                Some(process::RendererInput::Body { request, bytes }) => {
+                    if responses.push(request, &bytes, &mut engine).is_err() {
+                        stop.request();
+                        break;
+                    }
+                }
+                Some(process::RendererInput::Control(ToRenderer::ResponseEnd { id })) => {
+                    let reply = Reply::Unit(responses.finish(id, &mut engine));
+                    if !send_to_browser(outbox, FromRenderer::Reply { id, reply }) {
+                        stop.request();
+                        break;
+                    }
+                }
+                Some(process::RendererInput::Control(ToRenderer::ResponseError { id, failure })) => {
+                    let reply = Reply::Unit(responses.abort(id, failure));
+                    if !send_to_browser(outbox, FromRenderer::Reply { id, reply }) {
+                        stop.request();
+                        break;
+                    }
+                }
                 // The transport consumes the handshake, response stream, and
                 // service replies; none reaches this loop.
                 Some(
-                    ToRenderer::Hello
-                    | ToRenderer::ResponseStart { .. }
-                    | ToRenderer::ResponseEnd { .. }
-                    | ToRenderer::ResponseError { .. }
-                    | ToRenderer::ServiceReply { .. },
+                    process::RendererInput::Control(
+                        ToRenderer::Hello | ToRenderer::ServiceReply { .. },
+                    ),
                 ) => {}
                 None => break,
             },
@@ -218,6 +243,74 @@ pub(crate) async fn run(
         }
     }
     engine.shutdown();
+}
+
+struct ActiveResponse {
+    frame: FrameId,
+    bytes: usize,
+    decoder: document::ResponseDecoder,
+}
+
+#[derive(Default)]
+struct ResponseStreams(HashMap<u64, ActiveResponse>);
+
+impl ResponseStreams {
+    fn start(
+        &mut self,
+        id: u64,
+        response: ResponseStart,
+        engine: &mut Engine,
+    ) -> Result<(), TabError> {
+        if self.0.contains_key(&id) {
+            return Err(stream_error("duplicate response start"));
+        }
+        engine.open_response(&response)?;
+        self.0.insert(
+            id,
+            ActiveResponse {
+                frame: response.frame,
+                bytes: 0,
+                decoder: document::ResponseDecoder::new(response.content_type),
+            },
+        );
+        Ok(())
+    }
+
+    fn push(&mut self, id: u64, bytes: &[u8], engine: &mut Engine) -> Result<(), TabError> {
+        let response = self
+            .0
+            .get_mut(&id)
+            .ok_or_else(|| stream_error("body frame without response start"))?;
+        response.bytes = response.bytes.saturating_add(bytes.len());
+        if response.bytes > MAX_RESPONSE_BODY_BYTES {
+            return Err(stream_error("streamed response exceeds body limit"));
+        }
+        engine.write_response(response.frame, response.decoder.push(bytes))
+    }
+
+    fn finish(&mut self, id: u64, engine: &mut Engine) -> Result<(), TabError> {
+        let response = self
+            .0
+            .remove(&id)
+            .ok_or_else(|| stream_error("response end without start"))?;
+        engine.write_response(response.frame, response.decoder.finish())?;
+        engine.close_response(response.frame)
+    }
+
+    fn abort(&mut self, id: u64, failure: DialFailure) -> Result<(), TabError> {
+        self.0
+            .remove(&id)
+            .ok_or_else(|| stream_error("response error without start"))?;
+        Err(stream_error(&format!(
+            "streamed response failed: {failure:?}"
+        )))
+    }
+}
+
+fn stream_error(message: &str) -> TabError {
+    TabError::RendererUnavailable {
+        message: message.to_owned(),
+    }
 }
 
 async fn wait_for_deadline(deadline: Option<tokio::time::Instant>) {
