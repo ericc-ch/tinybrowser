@@ -131,9 +131,11 @@ handshake completes before the browser mounts content.
 Small control payloads use JSON. Response body frames carry raw bytes. Control
 payloads retain the 8 MiB hard limit from ADR 0016. Each body chunk is at most
 64 KiB. Aggregate response limits belong to request policy, not IPC framing.
-Transport queues remain bounded by message count and retained bytes in both
-directions. Unknown versions, unknown message kinds, invalid lengths, truncated
-frames, and invalid control JSON fail closed.
+Transport queues are bounded by message count and per-frame size limits in
+both directions. Aggregate retained-byte budgets are still owed: one control
+frame may be 8 MiB, so a saturated command queue retains far more than its
+count suggests. Unknown versions, unknown message kinds, invalid lengths,
+truncated frames, and invalid control JSON fail closed.
 
 A streamed response has this order:
 
@@ -152,8 +154,9 @@ tinybrowser-owned behavior.
 
 The renderer process manager owns process creation, handshakes, site locks,
 assignment, failure, and reaping. Each mounted top-level document receives a
-browser-minted `RendererAssignmentId` bound to its tab, navigation epoch,
-principal, and renderer process. Commands, events, browser-service calls, and
+browser-minted `RendererAssignmentId` bound to its tab and renderer process.
+The tab enforces the navigation epoch separately at dials and waiters.
+Commands, events, browser-service calls, and
 cancellation carry this ID. The browser rejects stale IDs and IDs received from
 the wrong renderer channel.
 
@@ -185,10 +188,13 @@ network process remain later work.
 teardown errors. Shutdown runs in this order:
 
 1. Protocol adapters and the browser task refuse new work.
-2. The browser cancels tab requests and closes every tab coordinator.
-3. The renderer process manager closes channels, stops children, and reaps them.
-4. Network tasks release bodies, permits, and pooled resources.
-5. `ProfileStore` persists the quiescent cookie jar.
+2. The browser cancels tab requests and closes every tab coordinator, releasing
+   each tab's renderer assignment; processes with no assignments left stop and
+   are reaped here.
+3. Network tasks release bodies, permits, and pooled resources.
+4. `ProfileStore` persists the quiescent cookie jar.
+5. Dropping the process manager stops and reaps the remaining renderers:
+   spares and processes still shared by other tabs.
 6. The executable stops the protocol listener and runtime.
 
 Repeating `close` retries a failed durable profile write. `Drop` may request
