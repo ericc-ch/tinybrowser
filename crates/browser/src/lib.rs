@@ -1,20 +1,26 @@
-//! Browser-side crate: `Browser`, the tab registry, `NetworkSession`, and the
-//! value-only protocol surface. The tab engine lives in the `renderer` crate
-//! ([ADR 0011](../../../docs/adrs/0011-renderer-processes-per-site.md)).
+//! Browser-side crate: `Browser`, the tab registry, `NetworkSession`, and both
+//! ends of the renderer wire. The page engine itself lives in the `renderer`
+//! crate.
+//!
+//! The renderer runs either as a child process — this crate spawns it and
+//! [`child::serve`] is its entry point — or inside a WebAssembly component,
+//! which uses the engine without any of this.
 //!
 //! The `cdp` and `webdriver` crates depend on this crate. They do not depend
 //! on each other, `dom`, `net`, or `renderer`. Browser owns
-//! [`NetworkSession`] ([ADR 0019](../../../docs/adrs/0019-async-browser-runtime-and-io.md)).
+//! [`NetworkSession`].
 //! Browser and tab state live in bounded Tokio owner tasks.
 
 mod actor;
 mod browser;
+pub mod child;
 mod link;
 mod manager;
 mod network;
 mod profile;
 mod site;
 mod store;
+mod wire;
 
 pub use actor::{TabHandle, TabId};
 pub use browser::{Browser, BrowserError, BrowserHandle};

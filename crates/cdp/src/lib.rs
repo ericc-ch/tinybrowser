@@ -1,16 +1,14 @@
 //! CDP adapter over [`browser::BrowserHandle`].
 //!
-//! [ADR 0009](../../../docs/adrs/0009-named-profile-daemon.md): honest first
-//! subsets of Browser, Target, Page, and Runtime. Unsupported methods return
-//! method-not-found. Flattened `sessionId` routing on the browser socket.
-//! [ADR 0012](../../../docs/adrs/0012-host-protocol-and-cli-stack.md): axum
-//! serves the loopback HTTP and WebSocket endpoints. The synchronous
+//! Honest first subsets of Browser, Target, Page, and Runtime. Unsupported
+//! methods return method-not-found. Flattened `sessionId` routing on the
+//! browser socket.
+//! Axum serves the loopback HTTP and WebSocket endpoints. The synchronous
 //! [`Client`] used by the CLI and tests stays on tungstenite.
 //!
 //! Names: the wire object is a CDP **page target** (`"type": "page"`,
 //! `Page.*`); it maps to a [`browser::TabHandle`]. CDP's experimental **tab
-//! target** is the browser-UI container and is not modeled
-//! ([ADR 0013](../../../docs/adrs/0013-vocabulary-and-process-names.md)).
+//! target** is the browser-UI container and is not modeled.
 
 use std::collections::{HashMap, VecDeque};
 use std::io;

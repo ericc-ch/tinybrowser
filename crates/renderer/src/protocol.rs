@@ -1,48 +1,22 @@
-//! The value-only seam between browser process and renderer process.
+//! What a carrier exchanges with the engine, and the port it calls back on.
 //!
-//! [ADR 0011](../../../docs/adrs/0011-renderer-processes-per-site.md): commands,
-//! request ids, events, script results, and explicit errors cross. DOM handles,
-//! `QuickJS` values, callbacks, and `net` types never do.
+//! These are the engine's own types: frame identity, mounts, page events,
+//! dials, script results, and explicit errors. DOM handles, `QuickJS` values,
+//! callbacks, and `net` types never cross. The messages that carry them over a
+//! socket live in the browser crate's wire module, because only a carrier
+//! needs to know how they travel.
 
 use std::fmt;
-use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use url::Url;
 
-use crate::RemoteValue;
-
-/// Maximum browser-to-renderer commands retained by one renderer transport.
-pub const RENDERER_INBOX_CAPACITY: usize = 256;
-
-/// Maximum renderer-to-browser messages retained by one renderer transport.
-pub const RENDERER_OUTBOX_CAPACITY: usize = 4096;
-
 /// Maximum aggregate bytes retained for one streamed response.
 pub const MAX_RESPONSE_BODY_BYTES: usize = 1_048_576;
 
-/// Browser-minted identity of one top-level document hosted by a renderer.
-#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-pub struct RendererAssignmentId(u64);
-
-impl RendererAssignmentId {
-    /// Constructs an assignment id from a browser-process integer.
-    #[must_use]
-    pub fn new(raw: u64) -> Self {
-        Self(raw)
-    }
-
-    /// Stable numeric identity for protocol messages.
-    #[must_use]
-    pub fn get(self) -> u64 {
-        self.0
-    }
-}
-
 /// Renderer-process identity of one frame.
 ///
-/// [ADR 0014](../../../docs/adrs/0014-frames-and-per-frame-realms.md): the
-/// renderer mints ids for the frames it hosts; the browser process routes
+/// The renderer mints ids for the frames it hosts; the browser process routes
 /// frame-addressed commands and events by it. The tab's main frame is
 /// [`FrameId::MAIN`] in every renderer.
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -182,36 +156,6 @@ pub enum TabEvent {
     ScriptFailed,
 }
 
-/// Host command to a renderer.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub enum Command {
-    /// Replace one frame's document: decode, reset the realm, parse, run to load.
-    Mount {
-        /// Frame to replace.
-        frame: FrameId,
-        /// The document to mount.
-        mount: Mount,
-    },
-    /// Evaluate `source` in one frame and return its string coercion.
-    Eval {
-        /// Frame to evaluate in.
-        frame: FrameId,
-        /// Script source.
-        source: String,
-    },
-    /// Evaluate `source` in one frame and return a value-only result.
-    ExecuteScript {
-        /// Frame to evaluate in.
-        frame: FrameId,
-        /// Script source.
-        source: String,
-        /// Optional execution budget in milliseconds.
-        timeout_ms: Option<u64>,
-    },
-    /// Stop the renderer loop.
-    Shutdown,
-}
-
 /// One document to mount.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Mount {
@@ -224,151 +168,6 @@ pub struct Mount {
     /// Raw document bytes; the renderer decodes them.
     #[serde(skip, default)]
     pub body: Vec<u8>,
-}
-
-/// Renderer reply to one [`Command`].
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub enum Reply {
-    /// Unit result.
-    Unit(Result<(), TabError>),
-    /// String result.
-    Text(Result<String, TabError>),
-    /// Value-only script result.
-    Value(Result<RemoteValue, TabError>),
-}
-
-/// Host to renderer traffic.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub enum ToRenderer {
-    /// First frame from the browser process: protocol handshake.
-    Hello,
-    /// Creates an isolated page engine inside this renderer process.
-    Assign {
-        /// Browser-minted assignment identity.
-        assignment: RendererAssignmentId,
-    },
-    /// Removes one page engine from this renderer process.
-    Release {
-        /// Browser-minted assignment identity.
-        assignment: RendererAssignmentId,
-    },
-    /// One command with its correlation id.
-    Request {
-        /// Request id chosen by the browser process.
-        id: u64,
-        /// Top-level document that owns the command.
-        assignment: RendererAssignmentId,
-        /// The command.
-        command: Command,
-    },
-    /// Starts a streamed top-level response. Raw body frames with the same id
-    /// follow before [`ToRenderer::ResponseEnd`].
-    ResponseStart {
-        /// Request id chosen by the browser process.
-        id: u64,
-        /// Response metadata needed to mount the completed body.
-        response: ResponseStart,
-    },
-    /// Completes a streamed top-level response.
-    ResponseEnd {
-        /// Request id from [`ToRenderer::ResponseStart`].
-        id: u64,
-    },
-    /// Aborts a streamed top-level response.
-    ResponseError {
-        /// Request id from [`ToRenderer::ResponseStart`].
-        id: u64,
-        /// Typed transport failure.
-        failure: DialFailure,
-    },
-    /// Answer to a [`ServiceCall`].
-    ServiceReply {
-        /// Service-call id chosen by the renderer.
-        id: u64,
-        /// The answer.
-        reply: ServiceReply,
-    },
-}
-
-/// Metadata sent before the raw bytes of a top-level response.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct ResponseStart {
-    /// Top-level document receiving this response.
-    pub assignment: RendererAssignmentId,
-    /// Frame that will receive the document.
-    pub frame: FrameId,
-    /// Final HTTP status.
-    pub status: u16,
-    /// Final URL after redirects.
-    pub final_url: String,
-    /// HTTP `Content-Type`, when present.
-    pub content_type: Option<String>,
-    /// HTTP `Content-Language`, when present.
-    pub content_language: Option<String>,
-}
-
-/// Renderer to host traffic.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub enum FromRenderer {
-    /// First message from a `renderer` child: protocol handshake.
-    Ready,
-    /// Answer to a request.
-    Reply {
-        /// Request id from [`ToRenderer::Request`].
-        id: u64,
-        /// Top-level document that produced the reply.
-        assignment: RendererAssignmentId,
-        /// The answer.
-        reply: Reply,
-    },
-    /// Unsolicited document event.
-    Event {
-        /// Top-level document that emitted the event.
-        assignment: RendererAssignmentId,
-        /// Frame that emitted the event.
-        frame: FrameId,
-        /// The event.
-        event: TabEvent,
-    },
-    /// A browser service the renderer cannot perform itself.
-    ServiceCall {
-        /// Top-level document requesting the browser service.
-        assignment: RendererAssignmentId,
-        /// Service-call id chosen by the renderer.
-        id: u64,
-        /// The call.
-        call: ServiceCall,
-    },
-}
-
-/// What the renderer needs the browser process to do.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub enum ServiceCall {
-    /// HTTP GET submitted to the browser-owned network executor.
-    Dial(DialRequest),
-    /// `document.cookie` getter.
-    CookieGet {
-        /// Document URL.
-        url: String,
-    },
-    /// `document.cookie` setter.
-    CookieSet {
-        /// Cookie string.
-        value: String,
-        /// Document URL.
-        url: String,
-    },
-}
-
-/// Answer to a [`ServiceCall`].
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub enum ServiceReply {
-    /// Dial result, with a typed failure.
-    Dial(Result<DialOutcome, DialFailure>),
-    /// Cookie getter result.
-    Cookie(String),
-    /// No payload (`CookieSet`).
-    Unit,
 }
 
 /// Why a browser-service dial failed. Preserved across the renderer seam.
@@ -428,16 +227,17 @@ pub struct DialOutcome {
 }
 
 /// Completion for a dial submitted to the browser process.
-pub(crate) type DialCompletion =
-    Arc<dyn Fn(Result<DialOutcome, DialFailure>) + Send + Sync + 'static>;
+pub type DialCompletion = Box<dyn FnOnce(Result<DialOutcome, DialFailure>) + Send + 'static>;
 
-/// Host services the renderer reaches through the browser-process seam.
+/// Effects the page engine asks its host to perform.
 ///
-/// The renderer child implements this as a pipe proxy. Renderer code never
-/// names `net`.
-pub(crate) trait BrowserServices: Send + Sync + 'static {
+/// A native renderer process receives an implementation that forwards calls
+/// to the browser process. An embedded renderer receives an implementation
+/// from its caller. Renderer code never names `net`.
+pub trait BrowserServices: Send + Sync + 'static {
     /// Submits one GET without blocking the renderer thread. The completion
-    /// receives `None` for transport, timeout, queue, or body-limit failure.
+    /// receives [`DialFailure`] for transport, timeout, queue, body-limit, or
+    /// cancellation failure.
     /// Implementations must invoke it exactly once, including when submission
     /// is rejected.
     fn start_dial(&self, request: DialRequest, completion: DialCompletion);
@@ -451,7 +251,8 @@ pub(crate) trait BrowserServices: Send + Sync + 'static {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+
+    use crate::RemoteValue;
 
     fn round_trip<T>(message: &T)
     where
@@ -481,20 +282,14 @@ mod tests {
             round_trip(&value);
         }
 
+        // JSON has no NaN or Infinity, so the value seam encodes them itself;
+        // a carrier must be able to hand back exactly what it was given.
         for number in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
-            let message = FromRenderer::Reply {
-                id: 3,
-                assignment: RendererAssignmentId::new(1),
-                reply: Reply::Value(Ok(RemoteValue::Number(number))),
-            };
+            let message = RemoteValue::Number(number);
             round_trip(&message);
             let text = serde_json::to_string(&message).expect("serialize");
-            let back: FromRenderer = serde_json::from_str(&text).expect("deserialize");
-            let FromRenderer::Reply {
-                reply: Reply::Value(Ok(RemoteValue::Number(value))),
-                ..
-            } = back
-            else {
+            let value: RemoteValue = serde_json::from_str(&text).expect("deserialize");
+            let RemoteValue::Number(value) = value else {
                 panic!("non-finite number did not round trip");
             };
             if number.is_nan() {
@@ -502,189 +297,6 @@ mod tests {
             } else {
                 assert_eq!(value.to_bits(), number.to_bits());
             }
-        }
-    }
-
-    #[test]
-    fn control_messages_round_trip_through_the_frame_codec() {
-        let message = ToRenderer::Request {
-            id: 1,
-            assignment: RendererAssignmentId::new(1),
-            command: Command::Eval {
-                frame: FrameId::MAIN,
-                source: "x".repeat(1024),
-            },
-        };
-        let mut bytes = Vec::new();
-        crate::channel::write_control(&mut bytes, &message).expect("write");
-        let mut reader = std::io::Cursor::new(bytes);
-        let mut buffer = Vec::new();
-        let back: ToRenderer = crate::channel::read_control(&mut reader, &mut buffer)
-            .expect("read")
-            .expect("one frame");
-        assert!(matches!(back, ToRenderer::Request { id: 1, .. }));
-    }
-
-    #[test]
-    fn host_to_renderer_messages_round_trip() {
-        let messages = [
-            ToRenderer::Assign {
-                assignment: RendererAssignmentId::new(1),
-            },
-            ToRenderer::Release {
-                assignment: RendererAssignmentId::new(1),
-            },
-            ToRenderer::Request {
-                id: 1,
-                assignment: RendererAssignmentId::new(1),
-                command: Command::Mount {
-                    frame: FrameId::MAIN,
-                    mount: Mount {
-                        url: "about:blank".into(),
-                        content_type: None,
-                        content_language: None,
-                        body: vec![1, 2, 3],
-                    },
-                },
-            },
-            ToRenderer::Request {
-                id: 2,
-                assignment: RendererAssignmentId::new(1),
-                command: Command::Eval {
-                    frame: FrameId::new(3),
-                    source: "1+1".into(),
-                },
-            },
-            ToRenderer::Request {
-                id: 3,
-                assignment: RendererAssignmentId::new(1),
-                command: Command::ExecuteScript {
-                    frame: FrameId::MAIN,
-                    source: "x".into(),
-                    timeout_ms: Some(50),
-                },
-            },
-            ToRenderer::Request {
-                id: 6,
-                assignment: RendererAssignmentId::new(1),
-                command: Command::Shutdown,
-            },
-            ToRenderer::ResponseStart {
-                id: 10,
-                response: ResponseStart {
-                    assignment: RendererAssignmentId::new(1),
-                    frame: FrameId::MAIN,
-                    status: 200,
-                    final_url: "http://example.test/".into(),
-                    content_type: Some("text/html".into()),
-                    content_language: None,
-                },
-            },
-            ToRenderer::ResponseEnd { id: 10 },
-            ToRenderer::ResponseError {
-                id: 11,
-                failure: DialFailure::Timeout,
-            },
-            ToRenderer::ServiceReply {
-                id: 7,
-                reply: ServiceReply::Cookie("a=1".into()),
-            },
-            ToRenderer::ServiceReply {
-                id: 8,
-                reply: ServiceReply::Dial(Ok(DialOutcome {
-                    status: 200,
-                    final_url: "http://example.test/".into(),
-                    content_type: Some("text/html".into()),
-                    content_language: None,
-                    body: vec![1],
-                })),
-            },
-            ToRenderer::ServiceReply {
-                id: 9,
-                reply: ServiceReply::Unit,
-            },
-        ];
-        for message in messages {
-            round_trip(&message);
-        }
-    }
-
-    #[test]
-    fn mount_body_is_not_part_of_control_json() {
-        let message = ToRenderer::Request {
-            id: 1,
-            assignment: RendererAssignmentId::new(1),
-            command: Command::Mount {
-                frame: FrameId::MAIN,
-                mount: Mount {
-                    url: "http://example.test/".into(),
-                    content_type: Some("text/html".into()),
-                    content_language: None,
-                    body: vec![1, 2, 3],
-                },
-            },
-        };
-        let value = serde_json::to_value(message).expect("serialize");
-        assert!(value.pointer("/Request/command/Mount/mount/body").is_none());
-    }
-
-    #[test]
-    fn renderer_to_host_messages_round_trip() {
-        let messages = [
-            FromRenderer::Ready,
-            FromRenderer::Reply {
-                id: 1,
-                assignment: RendererAssignmentId::new(1),
-                reply: Reply::Unit(Ok(())),
-            },
-            FromRenderer::Reply {
-                id: 2,
-                assignment: RendererAssignmentId::new(1),
-                reply: Reply::Unit(Err(TabError::Script(ScriptFailure::Interrupted))),
-            },
-            FromRenderer::Reply {
-                id: 3,
-                assignment: RendererAssignmentId::new(1),
-                reply: Reply::Text(Ok("ok".into())),
-            },
-            FromRenderer::Reply {
-                id: 5,
-                assignment: RendererAssignmentId::new(1),
-                reply: Reply::Value(Ok(RemoteValue::List(vec![RemoteValue::Number(1.0)]))),
-            },
-            FromRenderer::Event {
-                assignment: RendererAssignmentId::new(1),
-                frame: FrameId::MAIN,
-                event: TabEvent::Fetch { status: 404 },
-            },
-            FromRenderer::ServiceCall {
-                assignment: RendererAssignmentId::new(1),
-                id: 6,
-                call: ServiceCall::Dial(DialRequest {
-                    kind: DialKind::JsFetch,
-                    url: "http://example.test/a".into(),
-                    initiator: "http://example.test/".into(),
-                    read_body: true,
-                }),
-            },
-            FromRenderer::ServiceCall {
-                assignment: RendererAssignmentId::new(1),
-                id: 7,
-                call: ServiceCall::CookieGet {
-                    url: "http://example.test/".into(),
-                },
-            },
-            FromRenderer::ServiceCall {
-                assignment: RendererAssignmentId::new(1),
-                id: 8,
-                call: ServiceCall::CookieSet {
-                    value: "a=1".into(),
-                    url: "http://example.test/".into(),
-                },
-            },
-        ];
-        for message in messages {
-            round_trip(&message);
         }
     }
 }

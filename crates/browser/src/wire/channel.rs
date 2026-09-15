@@ -1,8 +1,7 @@
 //! Length-prefixed frames for the renderer platform channel.
 //!
-//! [ADR 0019](../../../docs/adrs/0019-async-browser-runtime-and-io.md): one
-//! private full-duplex channel per renderer process. Every frame starts with a
-//! fixed 16-byte header:
+//! One private full-duplex channel per renderer process. Every frame starts
+//! with a fixed 16-byte header:
 //!
 //! ```text
 //! version: u8 | kind: u8 | flags: u16 (zero) | request id: u64 | length: u32
@@ -15,8 +14,8 @@
 //! peer cannot force an unbounded allocation.
 //!
 //! The first frame in each direction is the handshake: the browser sends
-//! [`ToRenderer::Hello`](crate::ToRenderer::Hello) and the renderer replies
-//! [`FromRenderer::Ready`](crate::FromRenderer::Ready).
+//! [`ToRenderer::Hello`](crate::wire::ToRenderer::Hello) and the renderer replies
+//! [`FromRenderer::Ready`](crate::wire::FromRenderer::Ready).
 
 use std::io::{self, Read, Write};
 
@@ -95,6 +94,7 @@ pub fn write_control<T: Serialize>(writer: &mut impl Write, message: &T) -> io::
 /// # Errors
 ///
 /// A payload larger than [`MAX_BODY_CHUNK_BYTES`] or write failure.
+#[cfg(test)]
 pub fn write_body(writer: &mut impl Write, request: u64, payload: &[u8]) -> io::Result<()> {
     write_frame(writer, FrameKind::Body, request, payload)
 }
@@ -257,30 +257,12 @@ pub async fn read_control_async<T: DeserializeOwned, R: AsyncRead + Unpin + ?Siz
     }
 }
 
-/// Reads one raw body chunk on an async reader, returning its request id.
-///
-/// # Errors
-///
-/// I/O failure, a control frame, or a protocol violation.
-pub async fn read_body_async<R: AsyncRead + Unpin + ?Sized>(
-    reader: &mut R,
-    buffer: &mut Vec<u8>,
-) -> io::Result<Option<u64>> {
-    match read_frame_async(reader, buffer).await? {
-        None => Ok(None),
-        Some(Frame {
-            kind: FrameKind::Body,
-            request,
-        }) => Ok(Some(request)),
-        Some(_) => Err(invalid("expected a body frame")),
-    }
-}
-
 /// Reads one control message.
 ///
 /// # Errors
 ///
 /// I/O failure, a body frame, invalid JSON, or a protocol violation.
+#[cfg(test)]
 pub fn read_control<T: DeserializeOwned>(
     reader: &mut impl Read,
     buffer: &mut Vec<u8>,
@@ -300,6 +282,7 @@ pub fn read_control<T: DeserializeOwned>(
 /// # Errors
 ///
 /// I/O failure, a control frame, or a protocol violation.
+#[cfg(test)]
 pub fn read_body(reader: &mut impl Read, buffer: &mut Vec<u8>) -> io::Result<Option<u64>> {
     match read_frame(reader, buffer)? {
         None => Ok(None),
@@ -366,11 +349,11 @@ mod tests {
 
     #[test]
     fn control_frames_round_trip() {
-        let message = crate::ToRenderer::Request {
+        let message = crate::wire::ToRenderer::Request {
             id: 7,
-            assignment: crate::RendererAssignmentId::new(1),
-            command: crate::Command::Eval {
-                frame: crate::FrameId::MAIN,
+            assignment: crate::wire::RendererAssignmentId::new(1),
+            command: crate::wire::Command::Eval {
+                frame: renderer::FrameId::MAIN,
                 source: "1+1".into(),
             },
         };
@@ -378,10 +361,13 @@ mod tests {
         write_control(&mut bytes, &message).expect("write");
         let mut reader = Cursor::new(bytes);
         let mut buffer = Vec::new();
-        let back: crate::ToRenderer = read_control(&mut reader, &mut buffer)
+        let back: crate::wire::ToRenderer = read_control(&mut reader, &mut buffer)
             .expect("read")
             .expect("one frame");
-        assert!(matches!(back, crate::ToRenderer::Request { id: 7, .. }));
+        assert!(matches!(
+            back,
+            crate::wire::ToRenderer::Request { id: 7, .. }
+        ));
     }
 
     #[test]
@@ -409,11 +395,11 @@ mod tests {
             .expect_err("oversized body");
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
 
-        let message = crate::ToRenderer::Request {
+        let message = crate::wire::ToRenderer::Request {
             id: 1,
-            assignment: crate::RendererAssignmentId::new(1),
-            command: crate::Command::Eval {
-                frame: crate::FrameId::MAIN,
+            assignment: crate::wire::RendererAssignmentId::new(1),
+            command: crate::wire::Command::Eval {
+                frame: renderer::FrameId::MAIN,
                 source: "x".repeat(MAX_CONTROL_BYTES),
             },
         };

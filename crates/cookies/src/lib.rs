@@ -1,3 +1,17 @@
+//! Cookie storage and the site identity its rules are written in terms of.
+//!
+//! A [`CookieJar`] is pure logic over URLs and time: no sockets, no
+//! filesystem, no async runtime. Both the native browser process and the
+//! WebAssembly component keep one, so the storage model, `SameSite` handling,
+//! and public-suffix checks live here once.
+//!
+//! [`site`] answers which registrable domain a URL belongs to, which is also
+//! what renderer isolation locks on; the two uses share one definition of site
+//! on purpose, because they disagreeing would be a security bug.
+//!
+//! Behavior follows
+//! [draft-ietf-httpbis-rfc6265bis](https://httpwg.org/http-extensions/draft-ietf-httpbis-rfc6265bis.html).
+
 use std::collections::HashSet;
 use std::fmt;
 use std::sync::OnceLock;
@@ -5,14 +19,25 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use url::{Host, Url};
 
-use crate::initiator::InitiatorKind;
-use crate::protocol::Method;
-
 // https://httpwg.org/http-extensions/draft-ietf-httpbis-rfc6265bis.html#name-cookie-lifetime-limits
 const MAX_LIFETIME: Duration = Duration::from_hours(9600);
 // https://httpwg.org/http-extensions/draft-ietf-httpbis-rfc6265bis.html#name-storage-model
 const MAX_COOKIES_PER_DOMAIN: usize = 50;
 const MAX_COOKIES: usize = 3000;
+
+/// Which initiator owns an HTTP request.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum InitiatorKind {
+    /// Top-level navigation.
+    #[default]
+    Navigation,
+    /// Scripted `fetch()`.
+    Fetch,
+    /// Scripted `XMLHttpRequest`.
+    Xhr,
+    /// WebSocket handshake.
+    WsHandshake,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SameSite {
@@ -37,8 +62,13 @@ struct StoredCookie {
     same_site: SameSite,
 }
 
+/// The cookies one browser profile holds, keyed by domain and path.
+///
+/// The jar has no clock of its own: every operation takes `now` from its
+/// [`CookieOp`], so callers stay in control of time and tests stay
+/// deterministic.
 #[derive(Clone, Default)]
-pub(crate) struct CookieJar {
+pub struct CookieJar {
     cookies: Vec<StoredCookie>,
 }
 
@@ -50,25 +80,47 @@ impl fmt::Debug for CookieJar {
     }
 }
 
+/// Everything one cookie operation needs that the jar cannot infer.
 #[derive(Clone, Copy)]
-pub(crate) struct CookieOp<'a> {
+pub struct CookieOp<'a> {
+    /// URL being requested, or the URL a `Set-Cookie` line arrived from.
     pub url: &'a Url,
+    /// Wall clock to evaluate expiry against.
     pub now: SystemTime,
+    /// Whether the operation reached the jar over HTTP or through script.
+    ///
+    /// Script cannot see or set `HttpOnly` cookies.
     pub kind: RetrievalKind,
+    /// What the request is for; `SameSite=Lax` treats a top-level navigation
+    /// differently from a subresource request.
     pub initiator_kind: InitiatorKind,
-    pub method: &'a Method,
+    /// Whether the request's method is safe (`GET`/`HEAD`).
+    ///
+    /// Only consulted for a top-level navigation, where `SameSite=Lax` allows
+    /// a safe method; callers must pass the real method's safety.
+    pub method_is_safe: bool,
+    /// Document URL the request started from, for the same-site check.
     pub initiator: Option<&'a Url>,
+    /// Whether a redirect chain has crossed sites before this request.
     pub cross_site_redirect: bool,
 }
 
+/// How a cookie operation reached the jar.
 #[derive(Clone, Copy)]
-pub(crate) enum RetrievalKind {
+pub enum RetrievalKind {
+    /// An HTTP request or response, which can carry `HttpOnly` cookies.
     Http,
+    /// The `document.cookie` getter or setter, which cannot.
     NonHttp,
 }
 
 impl CookieJar {
-    pub(crate) fn store(&mut self, set_cookie: &str, op: CookieOp<'_>) {
+    /// Stores one `Set-Cookie` line, ignoring it when the rules reject it.
+    ///
+    /// Rejection is not an error: a malformed line, a public-suffix domain, or
+    /// a `SameSite` cookie set from a cross-site context all mean "keep the
+    /// existing state".
+    pub fn store(&mut self, set_cookie: &str, op: CookieOp<'_>) {
         let Some(parsed) = parse_set_cookie(set_cookie) else {
             return;
         };
@@ -82,7 +134,9 @@ impl CookieJar {
         self.evict_excess();
     }
 
-    pub(crate) fn cookie_string(&mut self, op: CookieOp<'_>) -> String {
+    /// The `Cookie` header value for `op`: matching cookies, longest path
+    /// first, older cookies first within one path.
+    pub fn cookie_string(&mut self, op: CookieOp<'_>) -> String {
         self.evict_expired(op.now);
         let Some(host) = canonicalize_host(op.url) else {
             return String::new();
@@ -140,7 +194,9 @@ impl CookieJar {
         }
     }
 
-    pub(crate) fn snapshot(&self) -> Vec<CookieRecord> {
+    /// Persistent cookies from the live jar. Session cookies are omitted.
+    #[must_use]
+    pub fn snapshot(&self) -> Vec<CookieRecord> {
         self.cookies
             .iter()
             .filter(|cookie| cookie.expiry.is_some())
@@ -160,23 +216,18 @@ impl CookieJar {
             .collect()
     }
 
-    pub(crate) fn restore(&mut self, records: Vec<CookieRecord>, now: SystemTime) {
+    /// Loads `records` into the live jar, replacing matching identities.
+    ///
+    /// Records come from storage a caller controls, so each one is re-checked
+    /// against the rules [`CookieJar::store`] applies to a parsed line: a
+    /// rooted path, a canonical registrable domain, the prefix requirements,
+    /// `SameSite=None` needing `Secure`, and no weakening of a live cookie's
+    /// `Secure` flag. Expired records are dropped, expiry is capped, and the
+    /// storage-model caps apply.
+    pub fn restore(&mut self, records: Vec<CookieRecord>, now: SystemTime) {
         for record in records {
-            if record.expiry.is_some_and(|expiry| expiry <= now) {
+            let Some(stored) = self.sanitize(record, now) else {
                 continue;
-            }
-            let stored = StoredCookie {
-                name: record.name,
-                value: record.value,
-                expiry: record.expiry,
-                domain: record.domain,
-                path: record.path,
-                created: record.created,
-                last_access: record.last_access,
-                host_only: record.host_only,
-                secure: record.secure,
-                http_only: record.http_only,
-                same_site: SameSite::from(record.same_site),
             };
             self.cookies
                 .retain(|old| !same_cookie_identity(old, &stored));
@@ -184,6 +235,60 @@ impl CookieJar {
         }
         self.evict_expired(now);
         self.evict_excess();
+    }
+
+    /// The stored form of a record, or `None` when the rules reject it.
+    fn sanitize(&self, record: CookieRecord, now: SystemTime) -> Option<StoredCookie> {
+        if record.expiry.is_some_and(|expiry| expiry <= now) {
+            return None;
+        }
+        if !record.path.starts_with('/') {
+            return None;
+        }
+        // The record names its own domain, so require the canonical form the
+        // jar writes rather than trusting a raw attribute.
+        let domain = canonicalize_domain_attr(&record.domain)?;
+        if record.domain != domain {
+            return None;
+        }
+        let same_site = SameSite::from(record.same_site);
+        if same_site == SameSite::None && !record.secure {
+            return None;
+        }
+        if !record.host_only && (is_ip(&domain) || is_public_suffix(&domain)) {
+            return None;
+        }
+        if !cookie_prefixes_ok(
+            &record.name,
+            &record.value,
+            record.secure,
+            record.host_only,
+            Some(&record.path),
+        ) {
+            return None;
+        }
+        if overlays_secure_cookie(
+            &self.cookies,
+            &record.name,
+            &domain,
+            &record.path,
+            record.secure,
+        ) {
+            return None;
+        }
+        Some(StoredCookie {
+            name: record.name,
+            value: record.value,
+            expiry: record.expiry.map(|expiry| expiry.min(now + MAX_LIFETIME)),
+            domain,
+            path: record.path,
+            created: record.created,
+            last_access: record.last_access,
+            host_only: record.host_only,
+            secure: record.secure,
+            http_only: record.http_only,
+            same_site,
+        })
     }
 }
 
@@ -420,7 +525,13 @@ fn receive_cookie(
     {
         return None;
     }
-    if !cookie_prefixes_ok(&parsed, secure, host_only, path_attr.as_deref()) {
+    if !cookie_prefixes_ok(
+        &parsed.name,
+        &parsed.value,
+        secure,
+        host_only,
+        path_attr.as_deref(),
+    ) {
         return None;
     }
     if let Some(old) = existing.iter().find(|old| {
@@ -526,17 +637,18 @@ fn overlays_secure_cookie(
 }
 
 fn cookie_prefixes_ok(
-    parsed: &ParsedSetCookie,
+    name: &str,
+    value: &str,
     secure: bool,
     host_only: bool,
     path_attr: Option<&str>,
 ) -> bool {
     // https://httpwg.org/http-extensions/draft-ietf-httpbis-rfc6265bis.html#name-storage-model
-    if parsed.name.is_empty() {
-        let lvalue = parsed.value.to_ascii_lowercase();
+    if name.is_empty() {
+        let lvalue = value.to_ascii_lowercase();
         return !lvalue.starts_with("__secure-") && !lvalue.starts_with("__host-");
     }
-    let prefix = parsed.name.to_ascii_lowercase();
+    let prefix = name.to_ascii_lowercase();
     if prefix.starts_with("__secure-") && !secure {
         return false;
     }
@@ -572,7 +684,7 @@ impl StoredCookie {
             self.same_site,
             op.is_same_site_request(),
             op.initiator_kind,
-            op.method,
+            op.method_is_safe,
         )
     }
 }
@@ -588,13 +700,13 @@ fn samesite_allows(
     same_site: SameSite,
     same_site_request: bool,
     initiator_kind: InitiatorKind,
-    method: &Method,
+    method_is_safe: bool,
 ) -> bool {
     match same_site {
         SameSite::None => true,
         SameSite::Strict => same_site_request,
         SameSite::Lax | SameSite::Default => {
-            same_site_request || (initiator_kind == InitiatorKind::Navigation && method.is_safe())
+            same_site_request || (initiator_kind == InitiatorKind::Navigation && method_is_safe)
         }
     }
 }
@@ -611,14 +723,26 @@ impl CookieOp<'_> {
     }
 }
 
-pub(crate) fn schemeful_same_site(a: &Url, b: &Url) -> bool {
-    site_tuple(a) == site_tuple(b)
+/// Whether two URLs share a site: same scheme and registrable domain.
+///
+/// Follows the `SameSite` definition in
+/// <https://httpwg.org/http-extensions/draft-ietf-httpbis-rfc6265bis.html#name-same-site-and-cross-site>.
+/// The `ws` and `wss` schemes name the `http` and `https` sites, because a
+/// WebSocket handshake is an HTTP request. Opaque URLs, and schemes outside
+/// that family, are never same-site with anything.
+#[must_use]
+pub fn schemeful_same_site(a: &Url, b: &Url) -> bool {
+    match (site_tuple(a), site_tuple(b)) {
+        (Some(left), Some(right)) => left == right,
+        _ => false,
+    }
 }
 
 /// Site identity for renderer isolation: scheme plus registrable domain.
 ///
-/// [ADR 0011](../../../docs/adrs/0011-renderer-processes-per-site.md). `None`
-/// for opaque or non-HTTP(S) URLs; callers keep those in an opaque instance.
+/// Returns `None` for opaque URLs and for schemes outside the HTTP family;
+/// callers keep those in an opaque instance. The `ws` and `wss` schemes are
+/// the `http` and `https` sites.
 #[must_use]
 pub fn site(url: &Url) -> Option<String> {
     let (scheme, domain) = site_tuple(url)?;
@@ -626,8 +750,15 @@ pub fn site(url: &Url) -> Option<String> {
 }
 
 fn site_tuple(url: &Url) -> Option<(String, String)> {
+    // A WebSocket handshake is an HTTP request: `ws` and `wss` name the http
+    // and https sites, which is how a page and its socket compare same-site.
+    let scheme = match url.scheme() {
+        "http" | "ws" => "http",
+        "https" | "wss" => "https",
+        _ => return None,
+    };
     Some((
-        url.scheme().to_owned(),
+        scheme.to_owned(),
         registrable_domain(&canonicalize_host(url)?),
     ))
 }

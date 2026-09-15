@@ -1,6 +1,4 @@
 //! Named profile daemon: loopback CDP, runtime-dir registration, startup lock.
-//!
-//! [ADR 0009](../docs/adrs/0009-named-profile-daemon.md)
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};

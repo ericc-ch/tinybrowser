@@ -13,27 +13,21 @@ impl Document {
     /// The renderer loop owns all waiting: it sleeps until [`Document::next_deadline`]
     /// or until a dial completion, channel message, or stop wakes it, then calls
     /// this method again. That is why the page engine needs no private runtime.
-    pub(crate) fn pump_ready(&mut self) {
+    pub(crate) fn drain_ready(&mut self) {
         loop {
-            while let Ok(completed) = self.dial_rx.try_recv() {
-                self.in_flight_dials = self.in_flight_dials.saturating_sub(1);
-                match completed {
-                    Ok(done) => self.tasks.push_back(Task::DialFinished(done)),
-                    Err(fail) => self.tasks.push_back(Task::DialFailed(fail)),
-                }
-            }
+            self.adopt_dial_completions();
             while let Some(id) = self.due_timer() {
                 self.tasks.push_back(Task::Timer(id));
             }
             self.adopt_js_work();
             self.launch_queued_dials();
-            while let Some(task) = self.tasks.pop_front() {
+            self.adopt_dial_completions();
+            if let Some(task) = self.tasks.pop_front() {
                 self.run_task(task);
-                self.adopt_js_work();
-                self.launch_queued_dials();
                 if self.stopped() {
                     return;
                 }
+                continue;
             }
             if self.stopped() {
                 return;
@@ -46,6 +40,16 @@ impl Document {
                 continue;
             }
             return;
+        }
+    }
+
+    fn adopt_dial_completions(&mut self) {
+        while let Ok(completed) = self.dial_rx.try_recv() {
+            self.in_flight_dials = self.in_flight_dials.saturating_sub(1);
+            match completed {
+                Ok(done) => self.tasks.push_back(Task::DialFinished(done)),
+                Err(fail) => self.tasks.push_back(Task::DialFailed(fail)),
+            }
         }
     }
 
@@ -76,6 +80,7 @@ impl Document {
     pub(crate) fn release(&mut self) {
         self.queued_dials.clear();
         self.in_flight_dials = 0;
+        self.decoder = None;
         self.world.borrow_mut().forget_owned_documents();
     }
 
@@ -100,9 +105,10 @@ impl Document {
             let wake = Arc::clone(&self.wake);
             let stop = Arc::clone(&self.stop);
             let request = super::dial::request(&dial);
+            self.in_flight_dials = self.in_flight_dials.saturating_add(1);
             self.services.start_dial(
                 request,
-                Arc::new(move |outcome| {
+                Box::new(move |outcome| {
                     if stop.is_set() {
                         return;
                     }
@@ -111,7 +117,6 @@ impl Document {
                     wake.notify_one();
                 }),
             );
-            self.in_flight_dials = self.in_flight_dials.saturating_add(1);
         }
     }
 

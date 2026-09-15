@@ -424,7 +424,7 @@ pub(crate) struct PendingJsFetch {
 /// Several `QuickJS` contexts may share one runtime and its objects, "similar to
 /// frames of the same origin sharing JavaScript objects in a web browser"
 /// (<https://bellard.org/quickjs/quickjs.html>, JSRuntime): the same-site-frame
-/// model of [ADR 0014](../../../../docs/adrs/0014-frames-and-per-frame-realms.md).
+/// model.
 /// The creation result is cached so a heap that cannot start fails every realm
 /// the same way instead of retrying.
 #[derive(Clone, Default)]

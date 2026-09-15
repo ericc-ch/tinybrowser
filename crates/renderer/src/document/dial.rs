@@ -1,6 +1,11 @@
 use super::{CompletedDial, DialFail, QueuedDial};
 use crate::protocol::{DialKind, DialOutcome, DialRequest};
 
+/// Decodes a response body that may arrive in pieces.
+///
+/// The encoding can only be chosen once enough bytes have arrived, so this
+/// buffers until the sniffing rules can decide — see
+/// <https://html.spec.whatwg.org/multipage/parsing.html#encoding-sniffing-algorithm>.
 pub(crate) struct ResponseDecoder {
     content_type: Option<String>,
     pending: Vec<u8>,
@@ -143,22 +148,6 @@ pub(in crate::document) fn complete(
             epoch: *epoch,
         },
     })
-}
-
-// https://html.spec.whatwg.org/multipage/parsing.html#encoding-sniffing-algorithm
-// https://encoding.spec.whatwg.org/#concept-encoding-get
-pub(in crate::document) fn decode_html(body: &[u8], content_type: Option<&str>) -> String {
-    let bom = encoding_rs::Encoding::for_bom(body);
-    let header = content_type.and_then(charset_from_content_type);
-    let prescan = prescan_charset(body);
-    let (encoding, bom_len) = bom
-        .or_else(|| header.map(|encoding| (encoding, 0)))
-        .or_else(|| prescan.map(|encoding| (encoding, 0)))
-        .unwrap_or((encoding_rs::WINDOWS_1252, 0));
-    encoding
-        .decode_without_bom_handling(&body[bom_len..])
-        .0
-        .into_owned()
 }
 
 fn charset_from_content_type(content_type: &str) -> Option<&'static encoding_rs::Encoding> {

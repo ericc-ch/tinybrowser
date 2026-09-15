@@ -1,9 +1,8 @@
 //! `tinybrowser`: the smallest headless browser for AI agents.
 //!
 //! One executable. No separately shipped helper. Engine stops at DOM + JS.
-//! The same executable may self-spawn a profile daemon
-//! ([ADR 0009](../docs/adrs/0009-named-profile-daemon.md)) and renderer
-//! processes ([ADR 0011](../docs/adrs/0011-renderer-processes-per-site.md)).
+//! The same executable may self-spawn a profile daemon and renderer
+//! processes.
 //! The embeddable surface lives here; CDP is a peer crate.
 
 mod daemon;
@@ -98,7 +97,7 @@ fn main() -> ExitCode {
 
 fn run(cli: &Cli) -> ExitCode {
     match &cli.command {
-        Some(Command::Renderer) => match renderer::serve() {
+        Some(Command::Renderer) => match browser::child::serve() {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
                 logging::error!(target: "renderer", "{error}");

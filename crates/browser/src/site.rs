@@ -1,6 +1,4 @@
 //! Renderer identity: one site instance per scheme plus registrable domain.
-//!
-//! [ADR 0011](../../../docs/adrs/0011-renderer-processes-per-site.md).
 
 use url::Url;
 

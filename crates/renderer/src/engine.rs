@@ -1,9 +1,8 @@
 //! The page engine for one renderer process: the shared `QuickJS` heap, the Tokio
 //! waiter, and the frame registry.
 //!
-//! [ADR 0014](../../../docs/adrs/0014-frames-and-per-frame-realms.md): one
-//! `QuickJS` `Runtime` and one Tokio waiter per renderer process; `Document` is
-//! one frame. Child frames join the same engine sharing both.
+//! One `QuickJS` `Runtime` and one Tokio waiter per renderer process;
+//! `Document` is one frame. Child frames join the same engine sharing both.
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -13,6 +12,7 @@ use std::time::Duration;
 
 use tokio::sync::Notify;
 use tokio::time::Instant;
+use url::Url;
 
 use crate::RemoteValue;
 use crate::document::{Document, Stop};
@@ -27,7 +27,7 @@ const MAX_FRAMES: usize = 64;
 /// The main frame is the tab's top-level document; child frames share the
 /// engine's heap and wake handle, so same-site frames can pass JavaScript
 /// objects synchronously.
-pub(crate) struct Engine {
+pub struct Engine {
     js_runtime: SharedJsRuntime,
     wake: Arc<Notify>,
     /// Every frame's trees, shared across their realms.
@@ -43,11 +43,12 @@ pub(crate) struct Engine {
 }
 
 impl Engine {
-    pub(crate) fn new(
-        services: Arc<dyn BrowserServices>,
-        stop: Arc<Stop>,
-        wake: Arc<Notify>,
-    ) -> Self {
+    /// Builds an engine whose effects go through `services`.
+    ///
+    /// `stop` cancels every frame at once; `wake` is notified when a dial
+    /// completion or stop arrives, so a carrier can wait instead of polling.
+    #[must_use]
+    pub fn new(services: Arc<dyn BrowserServices>, stop: Arc<Stop>, wake: Arc<Notify>) -> Self {
         let js_runtime = SharedJsRuntime::default();
         let documents = Rc::new(RefCell::new(DocumentStore::default()));
         let registry = Rc::new(RefCell::new(RealmRegistry::default()));
@@ -99,42 +100,72 @@ impl Engine {
     /// # Errors
     ///
     /// [`TabError::UnknownFrame`] when the engine does not host `frame`.
-    pub(crate) fn mount_frame(&mut self, frame: FrameId, mount: &Mount) -> Result<(), TabError> {
+    pub fn mount_frame(&mut self, frame: FrameId, mount: &Mount) -> Result<(), TabError> {
+        let document = self
+            .frame_mut(frame)
+            .ok_or(TabError::UnknownFrame { frame: frame.get() })?;
+        document.mount(mount)?;
+        self.remove_descendants(frame);
+        self.reconcile_frames();
+        Ok(())
+    }
+
+    /// Opens a response body for `frame`, whose bytes arrive through
+    /// [`Engine::write_body`] until [`Engine::end_body`].
+    ///
+    /// # Errors
+    ///
+    /// [`TabError::UnknownFrame`] when the engine does not host the frame.
+    pub fn open_body(
+        &mut self,
+        frame: FrameId,
+        url: Option<&Url>,
+        content_type: Option<&str>,
+        content_language: Option<&str>,
+    ) -> Result<(), TabError> {
         self.remove_descendants(frame);
         let document = self
             .frame_mut(frame)
             .ok_or(TabError::UnknownFrame { frame: frame.get() })?;
-        document.mount(mount);
+        document.begin_response(url, content_type, content_language);
+        Ok(())
+    }
+
+    /// Feeds more response bytes to a frame opened by [`Engine::open_body`].
+    ///
+    /// # Errors
+    ///
+    /// [`TabError::UnknownFrame`] when the engine does not host the frame.
+    pub fn write_body(&mut self, frame: FrameId, bytes: &[u8]) -> Result<(), TabError> {
+        self.frame_mut(frame)
+            .ok_or(TabError::UnknownFrame { frame: frame.get() })?
+            .write_body(bytes);
         self.reconcile_frames();
         Ok(())
     }
 
-    pub(crate) fn open_response(
-        &mut self,
-        response: &crate::protocol::ResponseStart,
-    ) -> Result<(), TabError> {
-        self.remove_descendants(response.frame);
-        let document = self
-            .frame_mut(response.frame)
-            .ok_or(TabError::UnknownFrame {
-                frame: response.frame.get(),
-            })?;
-        document.open_response(response);
-        Ok(())
-    }
-
-    pub(crate) fn write_response(&mut self, frame: FrameId, html: String) -> Result<(), TabError> {
+    /// Ends a response body opened by [`Engine::open_body`].
+    ///
+    /// # Errors
+    ///
+    /// [`TabError::UnknownFrame`] when the engine does not host the frame.
+    pub fn end_body(&mut self, frame: FrameId) -> Result<(), TabError> {
         self.frame_mut(frame)
             .ok_or(TabError::UnknownFrame { frame: frame.get() })?
-            .write_response(html);
+            .end_body();
         self.reconcile_frames();
         Ok(())
     }
 
-    pub(crate) fn close_response(&mut self, frame: FrameId) -> Result<(), TabError> {
+    /// Abandons a response body that will not be finished.
+    ///
+    /// # Errors
+    ///
+    /// [`TabError::UnknownFrame`] when the engine does not host the frame.
+    pub fn abort_body(&mut self, frame: FrameId) -> Result<(), TabError> {
         self.frame_mut(frame)
             .ok_or(TabError::UnknownFrame { frame: frame.get() })?
-            .close_response();
+            .abort_body();
         self.reconcile_frames();
         Ok(())
     }
@@ -144,7 +175,7 @@ impl Engine {
     /// # Errors
     ///
     /// [`TabError::UnknownFrame`] or [`TabError::Script`].
-    pub(crate) fn eval_in(&mut self, frame: FrameId, source: &str) -> Result<String, TabError> {
+    pub fn eval_in(&mut self, frame: FrameId, source: &str) -> Result<String, TabError> {
         let result = self
             .frame_mut(frame)
             .ok_or(TabError::UnknownFrame { frame: frame.get() })?
@@ -158,7 +189,7 @@ impl Engine {
     /// # Errors
     ///
     /// [`TabError::UnknownFrame`] or [`TabError::Script`].
-    pub(crate) fn execute_remote_in(
+    pub fn execute_remote_in(
         &mut self,
         frame: FrameId,
         source: &str,
@@ -172,34 +203,40 @@ impl Engine {
         result
     }
 
-    pub(crate) fn take_events(&mut self) -> Result<Vec<(FrameId, TabEvent)>, ()> {
+    /// Removes and returns every pending event, with its frame.
+    ///
+    /// # Errors
+    ///
+    /// [`TabError::RendererUnavailable`] when a frame retained more events
+    /// than its limit; the queue empties and the excess is lost.
+    pub fn take_events(&mut self) -> Result<Vec<(FrameId, TabEvent)>, TabError> {
         let mut events = Vec::new();
         for (&frame, document) in &mut self.frames {
-            events.extend(
-                document
-                    .take_events()?
-                    .into_iter()
-                    .map(|event| (frame, event)),
-            );
+            let pending = document
+                .take_events()
+                .map_err(|()| TabError::RendererUnavailable {
+                    message: "the retained event limit was exceeded".into(),
+                })?;
+            events.extend(pending.into_iter().map(|event| (frame, event)));
         }
         Ok(events)
     }
 
     /// Runs every immediately ready task in every frame. Never blocks.
-    pub(crate) fn pump_ready(&mut self) {
+    pub fn drain_ready(&mut self) {
         let frames: Vec<FrameId> = self.frames.keys().copied().collect();
         for frame in frames {
             let Some(document) = self.frames.get_mut(&frame) else {
                 continue;
             };
-            document.pump_ready();
+            document.drain_ready();
             self.reconcile_frames();
         }
     }
 
     /// Earliest timer deadline across every frame.
     #[must_use]
-    pub(crate) fn next_deadline(&self) -> Option<Instant> {
+    pub fn next_deadline(&self) -> Option<Instant> {
         self.frames
             .values()
             .filter_map(Document::next_deadline)
@@ -386,13 +423,13 @@ impl Engine {
         !ready.is_empty()
     }
 
-    pub(crate) fn shutdown(&mut self) {
+    pub fn shutdown(&mut self) {
         for document in self.frames.values_mut() {
             document.shutdown();
         }
     }
 
-    pub(crate) fn release(&mut self) {
+    pub fn release(&mut self) {
         for document in self.frames.values_mut() {
             document.release();
         }

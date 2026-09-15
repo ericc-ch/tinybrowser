@@ -1,9 +1,8 @@
 //! Renderer process policy: soft budget, spare, and same-site reuse.
 //!
-//! [ADR 0019](../../../docs/adrs/0019-async-browser-runtime-and-io.md) and
-//! [ADR 0011](../../../docs/adrs/0011-renderer-processes-per-site.md): blank
-//! documents stay virtual, the manager keeps one unlocked spare, and under the
-//! soft limit each live site instance receives its own renderer process.
+//! Blank documents stay virtual, the manager keeps one unlocked spare, and
+//! under the soft limit each live site instance receives its own renderer
+//! process.
 
 use std::collections::HashMap;
 use std::io;
@@ -11,7 +10,7 @@ use std::sync::Weak;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, PoisonError};
 
-use renderer::RendererAssignmentId;
+use crate::wire::RendererAssignmentId;
 use tokio::sync::Semaphore;
 
 use crate::link::{RendererAssignment, RendererHandle, spawn_process};

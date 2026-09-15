@@ -1,8 +1,7 @@
 //! Durable profile backing: the cookie store and its file codec.
 //!
-//! [ADR 0019](../../../docs/adrs/0019-async-browser-runtime-and-io.md): the
-//! browser process persists one profile; `NetworkSession` holds the live jar
-//! and hands this store to the browser task for load and save.
+//! The browser process persists one profile; `NetworkSession` holds the live
+//! jar and hands this store to the browser task for load and save.
 
 use std::env;
 use std::fs::{self, File, OpenOptions};

@@ -20,7 +20,7 @@ const BROWSER_COMMAND_CAPACITY: usize = 256;
 ///
 /// Renderer processes are the current executable invoked with `renderer` as
 /// its first argument. An embedding executable must dispatch that invocation
-/// to [`renderer::serve`].
+/// to [`crate::child::serve`].
 pub struct Browser {
     handle: BrowserHandle,
 }
@@ -65,9 +65,7 @@ struct BrowserState {
 
 impl Browser {
     /// Opens a browser on `profile` with cookies under the process XDG data
-    /// home and renderer processes ([ADR 0011]).
-    ///
-    /// [ADR 0011]: ../../../docs/adrs/0011-renderer-processes-per-site.md
+    /// home and renderer processes.
     ///
     /// # Errors
     ///

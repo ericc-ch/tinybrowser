@@ -1,7 +1,7 @@
 # Server-stack probe
 
-Standalone crate for [ADR 0020](../../docs/adrs/0020-server-stack.md). Two
-binaries serve the same HTTP discovery endpoint and a WebSocket echo endpoint:
+Standalone crate for the axum-versus-hyper server-stack probe. Two binaries
+serve the same HTTP discovery endpoint and a WebSocket echo endpoint:
 `axum_server` uses `axum::extract::ws`, and `hyper_server` uses
 `hyper::upgrade::on` plus `tokio-tungstenite`.
 

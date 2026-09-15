@@ -1021,8 +1021,8 @@ impl Dom {
     /// pointer is updated. Endpoints must be container kinds, and draining
     /// the document root is refused. For non-document destinations the
     /// shape of the moved run stays unvalidated: the html5ever tree
-    /// builder's trusted internal flows (ADR 0002) never emit
-    /// content-model violations, and gated insertion paths make smuggling
+    /// builder's trusted internal flows never emit content-model
+    /// violations, and gated insertion paths make smuggling
     /// impossible (a doctype can only ever sit directly under the root,
     /// so none can appear in a moved run). When `to` **is** the document,
     /// the full document content model applies to the *resulting* sequence;
