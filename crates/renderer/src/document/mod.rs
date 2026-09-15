@@ -24,10 +24,10 @@ mod drain;
 mod intern;
 
 pub(crate) use crate::js::ScriptValue;
-#[cfg(not(target_os = "wasi"))]
-pub(crate) use dial::ResponseDecoder;
 
+/// Concurrent `fetch` jobs one document may keep in flight.
 const MAX_PENDING_JS_FETCHES: usize = 256;
+/// Retained events before a document reports overflow.
 const MAX_PENDING_EVENTS: usize = 2048;
 
 enum Task {
@@ -101,6 +101,9 @@ pub(crate) struct Document {
     js_epoch: u64,
     active_parser: Option<ActiveParser>,
     parser_eof: bool,
+    /// Decoder for a body that is still arriving; `None` when the markup is
+    /// already in hand.
+    decoder: Option<dial::ResponseDecoder>,
     classic_fetch_in_flight: bool,
     stop: Arc<Stop>,
     next_remote: u64,
@@ -152,6 +155,7 @@ impl Document {
             js_epoch: 0,
             active_parser: None,
             parser_eof: true,
+            decoder: None,
             classic_fetch_in_flight: false,
             stop,
             next_remote: 0,
@@ -251,57 +255,107 @@ impl Document {
         let url = Url::parse(&mount.url).map_err(|_| TabError::InvalidUrl {
             spec: mount.url.clone(),
         })?;
-        self.reset_js_realm();
-        let html = dial::decode_html(&mount.body, mount.content_type.as_deref());
-        self.url = url;
-        self.content_language.clone_from(&mount.content_language);
-        let mut world = self.world.borrow_mut();
-        world.document_url = self.url.clone();
-        drop(world);
-        self.start_document(&html);
+        self.begin_response(
+            Some(&url),
+            mount.content_type.as_deref(),
+            mount.content_language.as_deref(),
+        );
+        self.write_body(&mount.body);
+        self.end_body();
         Ok(())
     }
 
-    #[cfg(not(target_os = "wasi"))]
-    pub(crate) fn open_response(&mut self, response: &crate::protocol::ResponseStart) {
-        self.reset_js_realm();
-        if let Ok(url) = Url::parse(&response.final_url) {
-            self.url = url;
-        }
-        self.content_language.clone_from(&response.content_language);
-        let mut world = self.world.borrow_mut();
-        world.document_url = self.url.clone();
-        world.parser_active = true;
-        drop(world);
+    /// Opens a document body that will arrive in pieces.
+    ///
+    /// The realm is already new when this runs; this only opens the parser and
+    /// the decoder.
+    fn open_parser(&mut self, content_type: Option<&str>) {
+        self.world.borrow_mut().parser_active = true;
         self.parser_eof = false;
+        self.decoder = Some(dial::ResponseDecoder::new(content_type.map(str::to_owned)));
         self.active_parser = Some(ActiveParser::new(""));
     }
 
-    #[cfg(not(target_os = "wasi"))]
-    pub(crate) fn write_response(&mut self, html: String) {
-        if html.is_empty() {
+    /// Starts a document from a network response: a new realm, the response's
+    /// URL and language, and a body that may arrive in pieces.
+    ///
+    /// A URL that does not parse leaves the document on its previous URL, and
+    /// an absent language clears it, because both come from this response.
+    pub(crate) fn begin_response(
+        &mut self,
+        url: Option<&Url>,
+        content_type: Option<&str>,
+        content_language: Option<&str>,
+    ) {
+        self.reset_js_realm();
+        if let Some(url) = url {
+            self.url = url.clone();
+        }
+        self.content_language = content_language.map(str::to_owned);
+        let mut world = self.world.borrow_mut();
+        world.document_url = self.url.clone();
+        drop(world);
+        self.open_parser(content_type);
+    }
+
+    /// Feeds response bytes. The decoder holds them until the encoding is
+    /// known, then the parser sees the markup.
+    pub(crate) fn write_body(&mut self, bytes: &[u8]) {
+        let Some(decoder) = self.decoder.as_mut() else {
+            return;
+        };
+        let text = decoder.push(bytes);
+        self.write_text(&text);
+    }
+
+    /// Feeds markup that is already decoded, as a script's `document.write`
+    /// provides.
+    pub(crate) fn write_text(&mut self, text: &str) {
+        if text.is_empty() {
             return;
         }
         if let Some(parser) = &self.active_parser {
-            parser.append_html(html);
+            parser.append_html(text.to_owned());
+            // A pending parsing-blocking script stops the parser: advancing
+            // past it would run later scripts first. Appending is safe, so the
+            // markup is not lost.
+            // https://html.spec.whatwg.org/multipage/scripting.html#pending-parsing-blocking-script
             if !self.classic_fetch_in_flight {
                 self.advance_parser();
             }
         }
     }
 
-    #[cfg(not(target_os = "wasi"))]
-    pub(crate) fn close_response(&mut self) {
+    /// Ends a body: flushes the decoder and lets the parser finish.
+    pub(crate) fn end_body(&mut self) {
+        if let Some(decoder) = self.decoder.take() {
+            let text = decoder.finish();
+            self.write_text(&text);
+        }
         self.parser_eof = true;
         if !self.classic_fetch_in_flight {
             self.advance_parser();
         }
     }
 
+    /// A script's `document.open()`: a new realm over the same document and
+    /// URL, with a body the script will write.
+    pub(crate) fn reopen_document(&mut self) {
+        self.reset_js_realm();
+        self.open_parser(None);
+    }
+
     /// Parses `input` into this document and starts a new JS realm.
+    ///
+    /// The caller already holds the whole document, so the parser starts at
+    /// EOF with the markup in hand.
     pub(crate) fn load_html(&mut self, input: &str) {
         self.reset_js_realm();
-        self.start_document(input);
+        self.world.borrow_mut().parser_active = true;
+        self.parser_eof = true;
+        self.decoder = None;
+        self.active_parser = Some(ActiveParser::new(input));
+        self.advance_parser();
     }
 
     /// Records `document` as this realm's so wrappers resolve its owner.
@@ -350,31 +404,14 @@ impl Document {
         self.remote_by_node.clear();
     }
 
-    fn start_document(&mut self, html: &str) {
-        self.world.borrow_mut().parser_active = true;
-        self.parser_eof = true;
-        self.active_parser = Some(ActiveParser::new(html));
-        self.advance_parser();
-    }
-
+    /// `document.open()`, `document.write()`, and `document.close()` all land
+    /// on the same parser feed the network path uses, so a pending classic
+    /// script blocks them the same way.
     pub(crate) fn apply_document_stream(&mut self, command: DocumentStreamCommand) {
         match command {
-            DocumentStreamCommand::Open => {
-                self.reset_js_realm();
-                self.world.borrow_mut().parser_active = true;
-                self.parser_eof = false;
-                self.active_parser = Some(ActiveParser::new(""));
-            }
-            DocumentStreamCommand::Write(html) => {
-                if let Some(parser) = &self.active_parser {
-                    parser.append_html(html);
-                    self.advance_parser();
-                }
-            }
-            DocumentStreamCommand::Close => {
-                self.parser_eof = true;
-                self.advance_parser();
-            }
+            DocumentStreamCommand::Open => self.reopen_document(),
+            DocumentStreamCommand::Write(html) => self.write_text(&html),
+            DocumentStreamCommand::Close => self.end_body(),
         }
     }
 
@@ -632,8 +669,11 @@ impl From<crate::js::JsError> for TabError {
     }
 }
 
-/// Document-stop flag shared by the renderer loop, JS interrupt handler, and dials.
-pub(crate) struct Stop {
+/// Stop flag shared by a renderer loop, the JS interrupt handler, and dials.
+///
+/// Requesting a stop interrupts running script and marks the flag; every
+/// engine sharing it winds down at its next turn.
+pub struct Stop {
     flag: AtomicBool,
 }
 
@@ -646,20 +686,20 @@ impl Default for Stop {
 impl Stop {
     /// A fresh, unset stop flag.
     #[must_use]
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             flag: AtomicBool::new(false),
         }
     }
 
     /// Requests a stop: interrupts `QuickJS` and marks the flag.
-    pub(crate) fn request(&self) {
+    pub fn request(&self) {
         self.flag.store(true, Ordering::Relaxed);
     }
 
     /// Whether [`Stop::request`] has run.
     #[must_use]
-    pub(crate) fn is_set(&self) -> bool {
+    pub fn is_set(&self) -> bool {
         self.flag.load(Ordering::Relaxed)
     }
 }

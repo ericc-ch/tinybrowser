@@ -74,11 +74,7 @@ impl EmbeddedRenderer {
     ///
     /// The retained event limit was exceeded.
     pub fn take_events(&mut self) -> Result<Vec<(FrameId, TabEvent)>, TabError> {
-        self.engine
-            .take_events()
-            .map_err(|()| TabError::RendererUnavailable {
-                message: "embedded renderer event queue overflowed".into(),
-            })
+        self.engine.take_events()
     }
 
     /// Duration until the next page timer is ready.

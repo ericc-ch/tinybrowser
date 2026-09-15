@@ -43,11 +43,9 @@ pub use channel::{
     read_frame_async, write_body, write_body_async, write_control, write_control_async,
     write_frame, write_frame_async,
 };
-#[cfg(not(target_os = "wasi"))]
-use document::Stop;
+pub use document::Stop;
 pub use embedded::EmbeddedRenderer;
-#[cfg(not(target_os = "wasi"))]
-use engine::Engine;
+pub use engine::Engine;
 #[cfg(not(target_os = "wasi"))]
 pub use process::serve;
 pub use protocol::{
@@ -306,7 +304,6 @@ struct ActiveResponse {
     assignment: RendererAssignmentId,
     frame: FrameId,
     bytes: usize,
-    decoder: document::ResponseDecoder,
 }
 
 #[cfg(not(target_os = "wasi"))]
@@ -324,14 +321,13 @@ impl ResponseStreams {
         if self.0.contains_key(&id) {
             return Err(stream_error("duplicate response start"));
         }
-        engine.open_response(&response)?;
+        engine.open_body(&response)?;
         self.0.insert(
             id,
             ActiveResponse {
                 assignment: response.assignment,
                 frame: response.frame,
                 bytes: 0,
-                decoder: document::ResponseDecoder::new(response.content_type),
             },
         );
         Ok(())
@@ -354,7 +350,7 @@ impl ResponseStreams {
         engines
             .get_mut(&response.assignment)
             .ok_or_else(|| stream_error("response assignment is gone"))?
-            .write_response(response.frame, response.decoder.push(bytes))
+            .write_body(response.frame, bytes)
     }
 
     fn finish(
@@ -372,10 +368,7 @@ impl ResponseStreams {
         let result = engines
             .get_mut(&assignment)
             .ok_or_else(|| stream_error("response assignment is gone"))
-            .and_then(|engine| {
-                engine.write_response(response.frame, response.decoder.finish())?;
-                engine.close_response(response.frame)
-            });
+            .and_then(|engine| engine.end_body(response.frame));
         (assignment, result)
     }
 
