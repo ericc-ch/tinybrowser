@@ -109,10 +109,6 @@ impl RendererAssignment {
     pub(crate) fn subscribe(&self) -> mpsc::Receiver<(FrameId, TabEvent)> {
         self.process.subscribe(self.id)
     }
-
-    pub(crate) fn interrupt(&self) {
-        self.process.interrupt();
-    }
 }
 
 pub(crate) struct ResponseWriter {
@@ -480,7 +476,7 @@ pub(crate) async fn reader_task(
             }
             continue;
         }
-        if route(message, &context).is_err() {
+        if route(message, &context).await.is_err() {
             break;
         }
     }
@@ -491,7 +487,7 @@ pub(crate) async fn reader_task(
 }
 
 /// Routes one renderer message; a failure terminates the renderer.
-fn route(message: FromRenderer, context: &ReaderContext) -> Result<(), RendererViolation> {
+async fn route(message: FromRenderer, context: &ReaderContext) -> Result<(), RendererViolation> {
     match message {
         // Handled by the channel handshake; never routed.
         FromRenderer::Ready => {}
@@ -548,12 +544,12 @@ fn route(message: FromRenderer, context: &ReaderContext) -> Result<(), RendererV
             assignment,
             id,
             call,
-        } => route_service_call(context, assignment, id, call)?,
+        } => route_service_call(context, assignment, id, call).await?,
     }
     Ok(())
 }
 
-fn route_service_call(
+async fn route_service_call(
     context: &ReaderContext,
     assignment: RendererAssignmentId,
     id: u64,
@@ -565,7 +561,7 @@ fn route_service_call(
         // `document.cookie` caller cannot block forever, and keep the
         // process alive for its other assignments.
         if was_released(&context.released, assignment) {
-            return send_released_reply(&context.tx, id, &call);
+            return send_released_reply(&context.tx, id, &call).await;
         }
         return Err(RendererViolation);
     }
@@ -600,14 +596,14 @@ fn route_service_call(
                 return Err(RendererViolation);
             };
             let reply = ServiceReply::Cookie(context.fetch.cookies_for(&url));
-            send_reply(&context.tx, id, reply)?;
+            send_reply(&context.tx, id, reply).await?;
         }
         ServiceCall::CookieSet { value, url } => {
             let Some(url) = authorize(&context.site, &url) else {
                 return Err(RendererViolation);
             };
             context.fetch.set_cookie(&value, &url);
-            send_reply(&context.tx, id, ServiceReply::Unit)?;
+            send_reply(&context.tx, id, ServiceReply::Unit).await?;
         }
     }
     Ok(())
@@ -619,7 +615,7 @@ fn was_released(released: &AtomicU64, assignment: RendererAssignmentId) -> bool 
 
 /// Answers a late call from a released assignment so the renderer's blocking
 /// service path stays unblocked while its engine is torn down.
-fn send_released_reply(
+async fn send_released_reply(
     tx: &mpsc::Sender<Outbound>,
     id: u64,
     call: &ServiceCall,
@@ -629,7 +625,7 @@ fn send_released_reply(
         ServiceCall::CookieGet { .. } => ServiceReply::Cookie(String::new()),
         ServiceCall::CookieSet { .. } => ServiceReply::Unit,
     };
-    send_reply(tx, id, reply)
+    send_reply(tx, id, reply).await
 }
 
 fn has_assignment(subscribers: &EventSubscribers, assignment: RendererAssignmentId) -> bool {
@@ -646,12 +642,13 @@ fn authorize(site: &Mutex<Option<Site>>, spec: &str) -> Option<url::Url> {
         .and_then(|site| site.authorize(spec))
 }
 
-fn send_reply(
+async fn send_reply(
     tx: &mpsc::Sender<Outbound>,
     id: u64,
     reply: ServiceReply,
 ) -> Result<(), RendererViolation> {
-    tx.try_send(Outbound::Control(ToRenderer::ServiceReply { id, reply }))
+    tx.send(Outbound::Control(ToRenderer::ServiceReply { id, reply }))
+        .await
         .map_err(|_| RendererViolation)
 }
 

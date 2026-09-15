@@ -5,8 +5,7 @@
 
 use std::fmt;
 use std::future::pending;
-use std::sync::atomic::Ordering;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::Arc;
 use std::time::Duration;
 
 use renderer::{
@@ -110,7 +109,6 @@ enum Waiter {
 #[derive(Clone)]
 pub struct TabHandle {
     id: TabId,
-    current: Arc<Mutex<Option<Arc<RendererAssignment>>>>,
     tx: mpsc::Sender<Command>,
 }
 
@@ -267,18 +265,6 @@ impl TabHandle {
     /// can host several same-site assignments; killing it for one tab would
     /// take the others down. A shared process whose script is wedged is
     /// recovered by the process budget and renderer failure paths instead.
-    fn interrupt_renderer(&self) {
-        if let Some(renderer) = self
-            .current
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clone()
-            && renderer.process.assignments.load(Ordering::Relaxed) <= 1
-        {
-            renderer.interrupt();
-        }
-    }
-
     async fn send(&self, command: Command) -> Result<(), TabError> {
         self.tx
             .send(command)
@@ -304,13 +290,8 @@ impl TabTask {
         renderers: Arc<RendererProcessManager>,
     ) -> Self {
         let (tx, rx) = mpsc::channel(COMMAND_CAPACITY);
-        let current = Arc::new(Mutex::new(None));
-        let handle = TabHandle {
-            id,
-            current: Arc::clone(&current),
-            tx,
-        };
-        let tab = Tab::new(id, fetch, renderers, current);
+        let handle = TabHandle { id, tx };
+        let tab = Tab::new(id, fetch, renderers);
         let join = tokio::spawn(coordinator_loop(rx, tab));
         Self {
             handle,
@@ -319,7 +300,6 @@ impl TabTask {
     }
 
     pub(crate) async fn shutdown(&mut self) {
-        self.handle.interrupt_renderer();
         let (reply, rx) = oneshot::channel();
         let sent = timeout(
             SHUTDOWN_TIMEOUT,
@@ -340,7 +320,6 @@ impl TabTask {
 
 impl Drop for TabTask {
     fn drop(&mut self) {
-        self.handle.interrupt_renderer();
         if let Some(join) = self.join.take() {
             join.abort();
         }
@@ -359,7 +338,6 @@ struct Tab {
     id: TabId,
     renderers: Arc<RendererProcessManager>,
     fetch: FetchHandle,
-    current: Arc<Mutex<Option<Arc<RendererAssignment>>>>,
     renderer: Option<Arc<RendererAssignment>>,
     pending_mount: Option<Mount>,
     site: Option<Site>,
@@ -378,18 +356,12 @@ struct Tab {
 }
 
 impl Tab {
-    fn new(
-        id: TabId,
-        fetch: FetchHandle,
-        renderers: Arc<RendererProcessManager>,
-        current: Arc<Mutex<Option<Arc<RendererAssignment>>>>,
-    ) -> Self {
+    fn new(id: TabId, fetch: FetchHandle, renderers: Arc<RendererProcessManager>) -> Self {
         let (dial_tx, dial_rx) = mpsc::unbounded_channel();
         Self {
             id,
             renderers,
             fetch,
-            current,
             renderer: None,
             pending_mount: Some(blank_mount()),
             site: None,
@@ -462,7 +434,6 @@ impl Tab {
             .map_err(|error| renderer_unavailable(&error.to_string()))?;
         self.drop_renderer().await;
         self.events_rx = Some(handle.subscribe());
-        *self.current.lock().unwrap_or_else(PoisonError::into_inner) = Some(Arc::clone(&handle));
         self.site = Some(site.clone());
         self.renderer = Some(handle);
         Ok(())
@@ -532,7 +503,6 @@ impl Tab {
     }
 
     async fn drop_renderer(&mut self) {
-        *self.current.lock().unwrap_or_else(PoisonError::into_inner) = None;
         self.site = None;
         self.events_rx = None;
         if let Some(renderer) = self.renderer.take() {

@@ -648,7 +648,7 @@ daemon instead of failing one Tokio task. That is the cost of the 761 KB.
 Deferred levers, with measured or estimated cost:
 
 - CDP server on hyper-direct instead of axum: standalone probe measured
-  550,432 bytes (ADR 0020); needs the adapter rewrite and must re-pass every
+  525,608 bytes (ADR 0020); needs the adapter rewrite and must re-pass every
   protocol gate.
 - Hand-rolled CLI parsing instead of clap: 131.4 KiB `.text`; ADR 0012 picks
   clap, so this is a product decision.
