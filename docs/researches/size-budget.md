@@ -610,6 +610,22 @@ variants (`html/syntax/parsing/html5lib_write.html`); P10 changes no
 framing-level code, so its row shares the P9 binary and no separate size was
 recorded. The IPC ABI is version 3 in P11 after assignment ids landed.
 
+## Final gate: P14 (2026-09-15)
+
+The final binary is 7,414,144 bytes, 2,585,856 bytes (25.9%) under the
+10,000,000-byte cap. All P14 gates ran on the final HEAD:
+
+- `cargo test --workspace` (26 suites) and `cargo clippy --workspace
+  --all-targets`: green.
+- Playwright 4/4 and the promoted Blink CDP corpus case: green.
+- WPT `html/syntax/parsing/html5lib_write.html`,
+  `html5lib_url.html`, and `html5lib_write_single.html`: 173 tests ran as
+  expected, 0 unexpected, against the pinned WPT checkout `92054a74`.
+- E0: 101 targets, 3 processes, 10 threads, 33 file descriptors, 11.6 MB PSS,
+  0% idle CPU, 50 parallel requests in 21.0 ms.
+- `cargo tree`: no `ureq`, `native-tls`, or `reqwest`; `tungstenite` only
+  through `tokio-tungstenite`.
+
 ## Checkpoint: structural cleanup, P12 (2026-09-15)
 
 P12 split browser-owned persistence (`store.rs`), live networking
