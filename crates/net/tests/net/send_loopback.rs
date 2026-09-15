@@ -1,4 +1,6 @@
 use super::common::{TestServer, canned_ok, canned_redirect, scripted};
+use std::io::Read;
+use std::net::{TcpListener, TcpStream};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -726,4 +728,88 @@ async fn request_deadline_expires_with_a_typed_timeout() {
         matches!(error, NetError::Transport(TransportError::Timeout(_))),
         "unexpected error: {error}"
     );
+}
+
+#[tokio::test]
+async fn https_dials_offer_h2_before_http1_in_alpn() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let address = listener.local_addr().expect("addr");
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept");
+        let hello = read_client_hello(&mut stream);
+        let protocols = client_hello_alpn(&hello);
+        // Hold the connection so the request deadline is the visible failure.
+        std::thread::sleep(Duration::from_millis(600));
+        protocols
+    });
+
+    let url = url::Url::parse(&format!("https://{address}/")).expect("absolute url");
+    let error = Agent::new()
+        .request(Method::GET, url)
+        .deadline(Instant::now() + Duration::from_millis(80))
+        .send()
+        .await
+        .expect_err("the test listener never completes a TLS handshake");
+    assert!(
+        matches!(error, NetError::Transport(TransportError::Timeout(_))),
+        "unexpected error: {error}"
+    );
+    assert_eq!(
+        server.join().expect("server"),
+        vec!["h2".to_owned(), "http/1.1".to_owned()]
+    );
+}
+
+fn read_client_hello(stream: &mut TcpStream) -> Vec<u8> {
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("read timeout is settable");
+    let mut bytes = Vec::new();
+    let mut chunk = [0_u8; 4096];
+    loop {
+        if bytes.len() >= 5 {
+            let body = usize::from(u16::from_be_bytes([bytes[3], bytes[4]]));
+            if bytes.len() >= 5 + body {
+                bytes.truncate(5 + body);
+                return bytes;
+            }
+        }
+        let read = stream.read(&mut chunk).expect("client hello is readable");
+        assert_ne!(read, 0, "client closed before sending a full ClientHello");
+        bytes.extend_from_slice(&chunk[..read]);
+    }
+}
+
+fn client_hello_alpn(hello: &[u8]) -> Vec<String> {
+    assert_eq!(hello.first(), Some(&0x16), "not a TLS handshake record");
+    assert_eq!(hello.get(5), Some(&0x01), "not a ClientHello");
+    let mut at = 9;
+    at += 2 + 32;
+    at += 1 + usize::from(hello[at]);
+    let suites = usize::from(u16::from_be_bytes([hello[at], hello[at + 1]]));
+    at += 2 + suites;
+    at += 1 + usize::from(hello[at]);
+    let extensions = usize::from(u16::from_be_bytes([hello[at], hello[at + 1]]));
+    at += 2;
+    let end = at + extensions;
+    while at + 4 <= end {
+        let kind = u16::from_be_bytes([hello[at], hello[at + 1]]);
+        let length = usize::from(u16::from_be_bytes([hello[at + 2], hello[at + 3]]));
+        at += 4;
+        if kind == 16 {
+            let list = usize::from(u16::from_be_bytes([hello[at], hello[at + 1]]));
+            let mut entry = at + 2;
+            let mut protocols = Vec::new();
+            while entry < at + 2 + list {
+                let len = usize::from(hello[entry]);
+                entry += 1;
+                let name = String::from_utf8_lossy(&hello[entry..entry + len]).into_owned();
+                protocols.push(name);
+                entry += len;
+            }
+            return protocols;
+        }
+        at += length;
+    }
+    Vec::new()
 }
