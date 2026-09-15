@@ -610,6 +610,48 @@ variants (`html/syntax/parsing/html5lib_write.html`); P10 changes no
 framing-level code, so its row shares the P9 binary and no separate size was
 recorded. The IPC ABI is version 3 in P11 after assignment ids landed.
 
+## Size experiment: abort and ICF (2026-09-15)
+
+Post-P14 experiments measured size levers against the shipping binary
+(7,414,144 bytes). The two kept settings are `panic = "abort"` in
+`[profile.release]` and lld ICF (`--icf=all`) via a Linux target rustflag.
+Everything else in the table was measured and rejected or deferred.
+
+| Experiment | Bytes | Delta | Decision |
+| --- | ---: | ---: | --- |
+| Baseline (P14) | 7,414,144 | — | — |
+| `panic = "abort"` | 6,652,624 | **−761,520** | **keep** |
+| + lld `--icf=all` | 6,582,896 | **−69,728** | **keep** |
+| + `relocation-model=static` (non-PIE) | 6,091,208 | −490,568 | reject: loses ASLR |
+| `webpki-roots` fallback removed | 6,577,424 | −75,200 | reject: loses the root-store fallback |
+| TLS 1.3 only (`tls12` feature off) | 6,536,080 | −46,816 | reject: drops TLS 1.2 servers |
+| `opt-level = "s"` + abort + ICF | 6,962,144 | +379,248 | reject: `"z"` is smaller |
+
+Measured behavior with abort + ICF: `cargo test --workspace` (26 suites),
+Clippy, Playwright 4/4, Blink CDP 1/1, 173 html5lib WPT tests as expected, and
+E0 (101 targets, 3 processes, 10 threads, 33 descriptors, 11.0 MB PSS, 0% idle
+CPU, 50 parallel requests in 22.7 ms). JS `throw`/`catch`, promise rejection,
+and renderer recovery behave normally; `panic = "abort"` only changes what
+happens after a Rust panic (a renderer child aborts instead of unwinding, and
+the browser reaps it), and rquickjs never uses unwinding for JS exceptions.
+
+`panic = "abort"` also means a Rust panic in the browser process ends the
+daemon instead of failing one Tokio task. That is the cost of the 761 KB.
+`cargo test --release` still builds its test units with unwinding.
+
+Deferred levers, with measured or estimated cost:
+
+- CDP server on hyper-direct instead of axum: standalone probe measured
+  550,432 bytes (ADR 0020); needs the adapter rewrite and must re-pass every
+  protocol gate.
+- Hand-rolled CLI parsing instead of clap: 131.4 KiB `.text`; ADR 0012 picks
+  clap, so this is a product decision.
+- Feature-gating Intl: the ICU4X blob is 125,426 bytes plus code; removes the
+  Intl surface.
+- Dropping HTTP/2: h2 is 63.4 KiB `.text` plus hyper paths; loses HTTP/2.
+- `-Z build-std` with `panic_immediate_abort`: requires nightly; none is
+  installed and the workspace pins stable 1.98.
+
 ## Final gate: P14 (2026-09-15)
 
 The final binary is 7,414,144 bytes, 2,585,856 bytes (25.9%) under the
