@@ -218,25 +218,16 @@ impl CookieJar {
 
     /// Loads `records` into the live jar, replacing matching identities.
     ///
-    /// Expired records are dropped and the storage-model caps apply, so a
-    /// restored jar is indistinguishable from one built by `Set-Cookie`.
+    /// Records come from storage a caller controls, so each one is re-checked
+    /// against the rules [`CookieJar::store`] applies to a parsed line: a
+    /// rooted path, a canonical registrable domain, the prefix requirements,
+    /// `SameSite=None` needing `Secure`, and no weakening of a live cookie's
+    /// `Secure` flag. Expired records are dropped, expiry is capped, and the
+    /// storage-model caps apply.
     pub fn restore(&mut self, records: Vec<CookieRecord>, now: SystemTime) {
         for record in records {
-            if record.expiry.is_some_and(|expiry| expiry <= now) {
+            let Some(stored) = self.sanitize(record, now) else {
                 continue;
-            }
-            let stored = StoredCookie {
-                name: record.name,
-                value: record.value,
-                expiry: record.expiry,
-                domain: record.domain,
-                path: record.path,
-                created: record.created,
-                last_access: record.last_access,
-                host_only: record.host_only,
-                secure: record.secure,
-                http_only: record.http_only,
-                same_site: SameSite::from(record.same_site),
             };
             self.cookies
                 .retain(|old| !same_cookie_identity(old, &stored));
@@ -244,6 +235,60 @@ impl CookieJar {
         }
         self.evict_expired(now);
         self.evict_excess();
+    }
+
+    /// The stored form of a record, or `None` when the rules reject it.
+    fn sanitize(&self, record: CookieRecord, now: SystemTime) -> Option<StoredCookie> {
+        if record.expiry.is_some_and(|expiry| expiry <= now) {
+            return None;
+        }
+        if !record.path.starts_with('/') {
+            return None;
+        }
+        // The record names its own domain, so require the canonical form the
+        // jar writes rather than trusting a raw attribute.
+        let domain = canonicalize_domain_attr(&record.domain)?;
+        if record.domain != domain {
+            return None;
+        }
+        let same_site = SameSite::from(record.same_site);
+        if same_site == SameSite::None && !record.secure {
+            return None;
+        }
+        if !record.host_only && (is_ip(&domain) || is_public_suffix(&domain)) {
+            return None;
+        }
+        if !cookie_prefixes_ok(
+            &record.name,
+            &record.value,
+            record.secure,
+            record.host_only,
+            Some(&record.path),
+        ) {
+            return None;
+        }
+        if overlays_secure_cookie(
+            &self.cookies,
+            &record.name,
+            &domain,
+            &record.path,
+            record.secure,
+        ) {
+            return None;
+        }
+        Some(StoredCookie {
+            name: record.name,
+            value: record.value,
+            expiry: record.expiry.map(|expiry| expiry.min(now + MAX_LIFETIME)),
+            domain,
+            path: record.path,
+            created: record.created,
+            last_access: record.last_access,
+            host_only: record.host_only,
+            secure: record.secure,
+            http_only: record.http_only,
+            same_site,
+        })
     }
 }
 
@@ -480,7 +525,13 @@ fn receive_cookie(
     {
         return None;
     }
-    if !cookie_prefixes_ok(&parsed, secure, host_only, path_attr.as_deref()) {
+    if !cookie_prefixes_ok(
+        &parsed.name,
+        &parsed.value,
+        secure,
+        host_only,
+        path_attr.as_deref(),
+    ) {
         return None;
     }
     if let Some(old) = existing.iter().find(|old| {
@@ -586,17 +637,18 @@ fn overlays_secure_cookie(
 }
 
 fn cookie_prefixes_ok(
-    parsed: &ParsedSetCookie,
+    name: &str,
+    value: &str,
     secure: bool,
     host_only: bool,
     path_attr: Option<&str>,
 ) -> bool {
     // https://httpwg.org/http-extensions/draft-ietf-httpbis-rfc6265bis.html#name-storage-model
-    if parsed.name.is_empty() {
-        let lvalue = parsed.value.to_ascii_lowercase();
+    if name.is_empty() {
+        let lvalue = value.to_ascii_lowercase();
         return !lvalue.starts_with("__secure-") && !lvalue.starts_with("__host-");
     }
-    let prefix = parsed.name.to_ascii_lowercase();
+    let prefix = name.to_ascii_lowercase();
     if prefix.starts_with("__secure-") && !secure {
         return false;
     }
@@ -675,16 +727,22 @@ impl CookieOp<'_> {
 ///
 /// Follows the `SameSite` definition in
 /// <https://httpwg.org/http-extensions/draft-ietf-httpbis-rfc6265bis.html#name-same-site-and-cross-site>.
-/// Opaque or non-HTTP(S) URLs are never same-site with anything.
+/// The `ws` and `wss` schemes name the `http` and `https` sites, because a
+/// WebSocket handshake is an HTTP request. Opaque URLs, and schemes outside
+/// that family, are never same-site with anything.
 #[must_use]
 pub fn schemeful_same_site(a: &Url, b: &Url) -> bool {
-    site_tuple(a) == site_tuple(b)
+    match (site_tuple(a), site_tuple(b)) {
+        (Some(left), Some(right)) => left == right,
+        _ => false,
+    }
 }
 
 /// Site identity for renderer isolation: scheme plus registrable domain.
 ///
-/// Returns `None` for opaque or non-HTTP(S) URLs; callers keep those in an
-/// opaque instance.
+/// Returns `None` for opaque URLs and for schemes outside the HTTP family;
+/// callers keep those in an opaque instance. The `ws` and `wss` schemes are
+/// the `http` and `https` sites.
 #[must_use]
 pub fn site(url: &Url) -> Option<String> {
     let (scheme, domain) = site_tuple(url)?;
@@ -692,8 +750,15 @@ pub fn site(url: &Url) -> Option<String> {
 }
 
 fn site_tuple(url: &Url) -> Option<(String, String)> {
+    // A WebSocket handshake is an HTTP request: `ws` and `wss` name the http
+    // and https sites, which is how a page and its socket compare same-site.
+    let scheme = match url.scheme() {
+        "http" | "ws" => "http",
+        "https" | "wss" => "https",
+        _ => return None,
+    };
     Some((
-        url.scheme().to_owned(),
+        scheme.to_owned(),
         registrable_domain(&canonicalize_host(url)?),
     ))
 }
