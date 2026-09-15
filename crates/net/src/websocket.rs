@@ -16,9 +16,7 @@ use crate::protocol::{HeaderMap, Method};
 
 /// Open WebSocket. Dropping it closes the socket.
 pub struct WebSocket {
-    inner: tokio_tungstenite::WebSocketStream<
-        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-    >,
+    inner: tokio_tungstenite::WebSocketStream<crate::transport::BoxedStream>,
     budget: crate::transport::CallBudget,
 }
 
@@ -168,12 +166,17 @@ pub(crate) async fn connect(
             .map_err(|_| NetError::Protocol(ProtocolError::RejectedRequest))?;
         request.headers_mut().insert(header_name, header_value);
     }
-    let handshake = tokio_tungstenite::connect_async(request);
+    let handshake = async {
+        let stream = agent.engine.dial_websocket(url).await?;
+        tokio_tungstenite::client_async(request, stream)
+            .await
+            .map_err(ws_err)
+    };
     let (ws, response) = match budget.deadline() {
         Some(deadline) => {
             match tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), handshake).await
             {
-                Ok(result) => result.map_err(ws_err)?,
+                Ok(result) => result?,
                 Err(_) => {
                     return Err(NetError::Transport(TransportError::Timeout(
                         budget.timeout_kind(TimeoutKind::Connect),
@@ -181,7 +184,7 @@ pub(crate) async fn connect(
                 }
             }
         }
-        None => handshake.await.map_err(ws_err)?,
+        None => handshake.await?,
     };
     agent.store_set_cookie_lines(
         url,

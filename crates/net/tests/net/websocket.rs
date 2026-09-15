@@ -171,3 +171,73 @@ async fn websocket_transcript_covers_handshake_frames_control_and_cookie_reuse()
     assert_eq!(*requests.lock().expect("request count"), 2);
     server.assert_clean();
 }
+
+#[tokio::test]
+async fn websocket_dials_use_the_agent_resolve_map() {
+    let captured = Arc::new(Mutex::new(None));
+    let requests = Arc::new(Mutex::new(0_u8));
+    let server = start_websocket_server(Arc::clone(&captured), Arc::clone(&requests));
+    let port = server.local_addr().port();
+
+    let agent = AgentBuilder::new()
+        .resolve("ws.test=127.0.0.1")
+        .expect("resolve spec")
+        .build();
+    let url = url::Url::parse(&format!("ws://ws.test:{port}/socket")).expect("absolute url");
+    let mut socket = agent
+        .request(Method::GET, url)
+        .header("Sec-WebSocket-Protocol", "tinybrowser-test")
+        .expect("protocol")
+        .upgrade()
+        .await
+        .expect("upgrade through the resolve map");
+    socket
+        .send(WsMessage::Text("from-client".into()))
+        .await
+        .expect("client text");
+    assert_eq!(
+        socket.take_next_message().await.expect("fragmented text"),
+        WsEvent::Message(WsMessage::Text("hello".into()))
+    );
+    assert_eq!(
+        socket.take_next_message().await.expect("close after ping"),
+        WsEvent::Close {
+            code: 1000,
+            reason: "bye".into(),
+        }
+    );
+    server.assert_clean();
+}
+
+#[tokio::test]
+async fn wss_dials_use_the_connect_proxy() {
+    let proxy = TestServer::start(|connection| {
+        let request = connection.read_request();
+        assert_eq!(request.method, "CONNECT");
+        assert_eq!(request.target, "origin.test:443");
+        connection
+            .write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n")
+            .expect("connect denial");
+    });
+    let Err(error) = AgentBuilder::new()
+        .proxy(&format!("http://{}", proxy.local_addr()))
+        .expect("proxy")
+        .build()
+        .request(
+            Method::GET,
+            url::Url::parse("wss://origin.test/socket").expect("absolute url"),
+        )
+        .upgrade()
+        .await
+    else {
+        panic!("the proxy denied the tunnel");
+    };
+    assert!(
+        matches!(
+            error,
+            net::NetError::Transport(net::TransportError::Connect(_))
+        ),
+        "unexpected proxy error: {error:?}"
+    );
+    proxy.assert_clean();
+}

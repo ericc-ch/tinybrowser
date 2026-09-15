@@ -129,6 +129,25 @@ impl Service<Name> for HostResolver {
 
 type RequestBody = BoxBody<Bytes, Infallible>;
 
+/// Any agent-dialed stream: plain TCP, a CONNECT tunnel, or TLS over either.
+pub(crate) trait TransportStream:
+    tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send
+{
+}
+impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> TransportStream for T {}
+
+/// Boxed [`TransportStream`] for WebSocket handshakes, whose stream types
+/// differ per scheme and proxy path.
+pub(crate) type BoxedStream = Box<dyn TransportStream>;
+
+async fn connect_service<C>(connector: &mut C, uri: hyper::Uri) -> Result<C::Response, C::Error>
+where
+    C: tower_service::Service<hyper::Uri>,
+{
+    std::future::poll_fn(|cx| connector.poll_ready(cx)).await?;
+    connector.call(uri).await
+}
+
 #[derive(Clone)]
 pub(crate) struct HttpEngine {
     client: Client<HttpsConnector<HttpConnector<HostResolver>>, RequestBody>,
@@ -136,6 +155,8 @@ pub(crate) struct HttpEngine {
     pub(crate) timeout_global: Option<Duration>,
     pub(crate) timeout_per_call: Option<Duration>,
     proxied: Option<ProxiedClient>,
+    http: HttpConnector<HostResolver>,
+    ws_tls: tokio_native_tls::TlsConnector,
 }
 
 type ProxiedClient = Client<HttpsConnector<Tunnel<HttpConnector<HostResolver>>>, RequestBody>;
@@ -168,19 +189,88 @@ impl HttpEngine {
         let client = Client::builder(TokioExecutor::new()).build(connector);
         let proxied = proxy.as_deref().and_then(|proxy| {
             let (destination, auth) = proxy_destination(proxy).ok()?;
-            let mut tunnel = Tunnel::new(destination, http);
+            let mut tunnel = Tunnel::new(destination, http.clone());
             if let Some(auth) = auth {
                 tunnel = tunnel.with_auth(auth);
             }
             let connector = HttpsConnector::from((tunnel, tls));
             Some(Client::builder(TokioExecutor::new()).build(connector))
         });
+        // WebSocket upgrades are HTTP/1.1 only: asking for h2 here would let a
+        // server negotiate a protocol tungstenite cannot speak.
+        let ws_tls = native_tls::TlsConnector::builder()
+            .request_alpns(&["http/1.1"])
+            .build()
+            .expect("openssl tls connector");
         Self {
             client,
             proxy,
             timeout_global,
             timeout_per_call,
             proxied,
+            http,
+            ws_tls: tokio_native_tls::TlsConnector::from(ws_tls),
+        }
+    }
+
+    /// Dials a WebSocket origin through the agent transport: `--resolve`, a
+    /// configured CONNECT proxy, and for `wss` the same TLS backend with
+    /// `http/1.1` ALPN.
+    pub(crate) async fn dial_websocket(&self, url: &Url) -> Result<BoxedStream, NetError> {
+        let secure = match url.scheme() {
+            "ws" => false,
+            "wss" => true,
+            _ => {
+                return Err(NetError::Protocol(ProtocolError::Other(
+                    "unsupported websocket scheme".into(),
+                )));
+            }
+        };
+        let host = url
+            .host_str()
+            .ok_or_else(|| NetError::Protocol(ProtocolError::Other("missing host".into())))?;
+        let authority = match url.port() {
+            Some(port) => format!("{host}:{port}"),
+            None => host.to_owned(),
+        };
+        let mut target = format!(
+            "{}://{authority}{}",
+            if secure { "https" } else { "http" },
+            url.path()
+        );
+        if let Some(query) = url.query() {
+            target.push('?');
+            target.push_str(query);
+        }
+        let uri: hyper::Uri = target
+            .parse()
+            .map_err(|_| NetError::Protocol(ProtocolError::RejectedRequest))?;
+
+        let stream: BoxedStream = if let Some(proxy) = self.proxy.as_deref() {
+            let (destination, auth) = proxy_destination(proxy).map_err(|_| {
+                NetError::Transport(TransportError::Connect("invalid proxy".into()))
+            })?;
+            let mut tunnel = Tunnel::new(destination, self.http.clone());
+            if let Some(auth) = auth {
+                tunnel = tunnel.with_auth(auth);
+            }
+            let connected = connect_service(&mut tunnel, uri)
+                .await
+                .map_err(connect_failure)?;
+            Box::new(connected.into_inner())
+        } else {
+            let connected = connect_service(&mut self.http.clone(), uri)
+                .await
+                .map_err(connect_failure)?;
+            Box::new(connected.into_inner())
+        };
+        if secure {
+            let tls = self.ws_tls.connect(host, stream).await.map_err(|error| {
+                NetError::Transport(TransportError::Tls(error.to_string().into()))
+            })?;
+            Ok(Box::new(tls))
+        } else {
+            Ok(stream)
         }
     }
 
@@ -275,6 +365,10 @@ async fn wait_for<T>(budget: CallBudget, future: impl Future<Output = T>) -> Res
 
 fn timed_out(kind: TimeoutKind) -> NetError {
     NetError::Transport(TransportError::Timeout(kind))
+}
+
+fn connect_failure(error: impl std::fmt::Display) -> NetError {
+    NetError::Transport(TransportError::Connect(error.to_string().into()))
 }
 
 fn map_client_error(error: hyper_util::client::legacy::Error, host: &str) -> NetError {
