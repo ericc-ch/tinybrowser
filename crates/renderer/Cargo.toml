@@ -38,7 +38,6 @@ serde_json = "1"
 
 [target.'cfg(not(target_os = "wasi"))'.dependencies]
 logging = { workspace = true }
-tokio = { version = "1.53", default-features = false, features = ["net"] }
 
 [dev-dependencies]
 # Host services in renderer tests; the library itself never links `net`.
