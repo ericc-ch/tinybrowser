@@ -1,0 +1,45 @@
+[package]
+name = "tlsprobe"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+prev = ["dep:ureq"]
+current = ["dep:tokio", "dep:hyper", "dep:hyper-rustls", "dep:hyper-util", "dep:http-body-util"]
+chrome = ["dep:tokio", "dep:wreq", "dep:wreq-util"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ureq = { version = "=3.4.0", default-features = false, features = ["native-tls"], optional = true }
+wreq = { version = "=6.0.0-rc.31", features = ["json"], optional = true }
+wreq-util = { version = "=3.0.0-rc.14", optional = true }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time"], optional = true }
+hyper = { version = "1", features = ["client", "http1", "http2"], optional = true }
+hyper-rustls = { version = "0.27", default-features = false, features = ["ring", "native-tokio", "webpki-tokio", "http1", "http2", "tls12"], optional = true }
+hyper-util = { version = "0.1", features = ["client-legacy", "http1", "http2", "tokio"], optional = true }
+http-body-util = { version = "0.1", optional = true }
+
+[[bin]]
+name = "prev_native"
+path = "src/bin/prev_native.rs"
+required-features = ["prev"]
+
+[[bin]]
+name = "current_rustls"
+path = "src/bin/current_rustls.rs"
+required-features = ["current"]
+
+[[bin]]
+name = "chrome_wreq"
+path = "src/bin/chrome_wreq.rs"
+required-features = ["chrome"]
+
+[profile.release]
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+strip = true
+panic = "abort"
+
+[workspace]
