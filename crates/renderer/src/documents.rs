@@ -1,10 +1,9 @@
 //! Renderer-process document storage.
 //!
-//! Trees do not belong to a realm
-//! ([ADR 0014](../../../docs/adrs/0014-frames-and-per-frame-realms.md)): the
-//! renderer stores every document by its globally unique id, and realms refer
-//! to them by id. This mirrors the realm-agnostic C++ DOM layer of Blink and
-//! Gecko; only the JS wrappers are realm-associated.
+//! Trees do not belong to a realm: the renderer stores every document by its
+//! globally unique id, and realms refer to them by id. This mirrors the
+//! realm-agnostic C++ DOM layer of Blink and Gecko; only the JS wrappers are
+//! realm-associated.
 
 use std::collections::HashMap;
 

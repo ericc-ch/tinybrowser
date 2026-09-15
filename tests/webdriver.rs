@@ -349,7 +349,7 @@ fn one_session_delete_leaves_pages_close_last_window_invalidates() {
     assert_eq!(second["value"]["error"], json!("session not created"));
 
     request(&addr, "DELETE", &format!("/session/{id}"), None);
-    // ADR 0009: product DELETE /session detaches automation and leaves tabs.
+    // Product DELETE /session detaches automation and leaves tabs.
     let gone = request(&addr, "GET", &format!("/session/{id}/window"), None);
     assert_eq!(gone["value"]["error"], json!("invalid session id"));
 

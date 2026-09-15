@@ -1,7 +1,6 @@
 //! `renderer` child transport: length-prefixed frames over the platform channel.
 //!
-//! [ADR 0019](../../../docs/adrs/0019-async-browser-runtime-and-io.md): the
-//! child is the same executable. On Unix the browser passes one end of an
+//! The child is the same executable. On Unix the browser passes one end of an
 //! unnamed socket pair as file descriptor 0 and the child reads and writes that
 //! endpoint. Other platforms keep the stdin/stdout pipes until their platform
 //! channel lands. stderr stays for diagnostics.

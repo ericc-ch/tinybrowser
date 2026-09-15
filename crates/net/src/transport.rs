@@ -1,10 +1,10 @@
 //! Async HTTP transport: hyper client, native-tls (OpenSSL) TLS, tinybrowser deadlines.
 //!
-//! [ADR 0019](../../../docs/adrs/0019-async-browser-runtime-and-io.md): the
-//! browser process owns one Tokio runtime. `net` never implements HTTP framing;
-//! `hyper-util` supplies HTTP/1.1, HTTP/2, pooling, and the connector stack,
-//! while this module keeps tinybrowser's redirect, cookie, header, timeout, and
-//! error policy and applies `--resolve` rules ahead of system DNS.
+//! The browser process owns one Tokio runtime. `net` never implements HTTP
+//! framing; `hyper-util` supplies HTTP/1.1, HTTP/2, pooling, and the connector
+//! stack, while this module keeps tinybrowser's redirect, cookie, header,
+//! timeout, and error policy and applies `--resolve` rules ahead of system
+//! DNS.
 
 use std::convert::Infallible;
 use std::future::Future;

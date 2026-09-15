@@ -1,6 +1,6 @@
 //! One document: HTML tasks we own, browser services for dials and cookies. The
 //! renderer loop owns every wait; the browser process owns the tab and drives
-//! navigation ([ADR 0019](../../../../docs/adrs/0019-async-browser-runtime-and-io.md)).
+//! navigation.
 
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};

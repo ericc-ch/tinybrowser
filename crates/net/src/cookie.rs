@@ -617,8 +617,8 @@ pub(crate) fn schemeful_same_site(a: &Url, b: &Url) -> bool {
 
 /// Site identity for renderer isolation: scheme plus registrable domain.
 ///
-/// [ADR 0011](../../../docs/adrs/0011-renderer-processes-per-site.md). `None`
-/// for opaque or non-HTTP(S) URLs; callers keep those in an opaque instance.
+/// Returns `None` for opaque or non-HTTP(S) URLs; callers keep those in an
+/// opaque instance.
 #[must_use]
 pub fn site(url: &Url) -> Option<String> {
     let (scheme, domain) = site_tuple(url)?;

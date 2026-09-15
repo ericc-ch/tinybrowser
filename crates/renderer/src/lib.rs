@@ -1,9 +1,8 @@
 //! Renderer crate: the page engine for one document — HTML parser,
 //! `Dom`, `QuickJS` — behind the value-only browser seam.
 //!
-//! [ADR 0011](../../../docs/adrs/0011-renderer-processes-per-site.md): the
-//! renderer owns `Document` and never links `net`; the browser process owns `Tab`, the
-//! tab, navigation, network, and cookies.
+//! The renderer owns `Document` and never links `net`; the browser process
+//! owns `Tab`, the tab, navigation, network, and cookies.
 
 use std::borrow::Cow;
 use std::cell::{Cell, RefCell};

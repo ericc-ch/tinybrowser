@@ -1,8 +1,7 @@
 //! The value-only seam between browser process and renderer process.
 //!
-//! [ADR 0011](../../../docs/adrs/0011-renderer-processes-per-site.md): commands,
-//! request ids, events, script results, and explicit errors cross. DOM handles,
-//! `QuickJS` values, callbacks, and `net` types never do.
+//! Commands, request ids, events, script results, and explicit errors cross.
+//! DOM handles, `QuickJS` values, callbacks, and `net` types never do.
 
 use std::fmt;
 use std::sync::Arc;
@@ -41,8 +40,7 @@ impl RendererAssignmentId {
 
 /// Renderer-process identity of one frame.
 ///
-/// [ADR 0014](../../../docs/adrs/0014-frames-and-per-frame-realms.md): the
-/// renderer mints ids for the frames it hosts; the browser process routes
+/// The renderer mints ids for the frames it hosts; the browser process routes
 /// frame-addressed commands and events by it. The tab's main frame is
 /// [`FrameId::MAIN`] in every renderer.
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]

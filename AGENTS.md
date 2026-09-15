@@ -17,9 +17,8 @@ Do not test spec conformance in cargo tests. Never add, keep, or "fix" a cargo t
 - Breaking changes and full rewrites are always fine. When code fights you, assume it is wrong: zoom out, fix the design, don't patch around it.
 - Web-platform behavior comes from the WHATWG specs, not from our tests or guesses. Start every implementation and review of a conformance claim from the governing spec. Cite the spec at the implementation site with an anchor link, for example `dom.spec.whatwg.org/#concept-node-ensure-pre-insert-validity`. Follow the spec's exact algorithm order, even when our tests disagree. Fix the test, not the spec.
 - For how a browser actually behaves, read a shipped engine implementation. Start with Chromium, then read Firefox when Chromium does not cover the case. Do not clone these repositories. When the spec and a shipped browser disagree, state the disagreement in a code comment and follow the browser that matches the spec algorithm.
+- Decisions live in commit messages.
 
 ## Reference
 
-- Read [docs/CONTEXT.md](docs/CONTEXT.md) for domain terms.
-- Read [docs/adrs/](docs/adrs/) for architectural decisions.
 - Project notes live in the Obsidian vault at `~/Documents/obsidian/everything/projects/tinybrowser/`.

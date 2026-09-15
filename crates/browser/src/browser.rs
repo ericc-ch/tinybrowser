@@ -65,9 +65,7 @@ struct BrowserState {
 
 impl Browser {
     /// Opens a browser on `profile` with cookies under the process XDG data
-    /// home and renderer processes ([ADR 0011]).
-    ///
-    /// [ADR 0011]: ../../../docs/adrs/0011-renderer-processes-per-site.md
+    /// home and renderer processes.
     ///
     /// # Errors
     ///

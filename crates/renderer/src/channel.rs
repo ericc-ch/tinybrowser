@@ -1,8 +1,7 @@
 //! Length-prefixed frames for the renderer platform channel.
 //!
-//! [ADR 0019](../../../docs/adrs/0019-async-browser-runtime-and-io.md): one
-//! private full-duplex channel per renderer process. Every frame starts with a
-//! fixed 16-byte header:
+//! One private full-duplex channel per renderer process. Every frame starts
+//! with a fixed 16-byte header:
 //!
 //! ```text
 //! version: u8 | kind: u8 | flags: u16 (zero) | request id: u64 | length: u32

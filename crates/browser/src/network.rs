@@ -1,7 +1,6 @@
 //! Browser-owned live networking: one [`net::Agent`] behind a value-only handle.
 //!
-//! [ADR 0019](../../../docs/adrs/0019-async-browser-runtime-and-io.md): tab
-//! coordinators receive [`FetchHandle`]. They do not expose or own
+//! Tab coordinators receive [`FetchHandle`]. They do not expose or own
 //! [`net::Agent`].
 
 use std::io;

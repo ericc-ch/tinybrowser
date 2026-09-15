@@ -1,9 +1,8 @@
 //! The page engine for one renderer process: the shared `QuickJS` heap, the Tokio
 //! waiter, and the frame registry.
 //!
-//! [ADR 0014](../../../docs/adrs/0014-frames-and-per-frame-realms.md): one
-//! `QuickJS` `Runtime` and one Tokio waiter per renderer process; `Document` is
-//! one frame. Child frames join the same engine sharing both.
+//! One `QuickJS` `Runtime` and one Tokio waiter per renderer process;
+//! `Document` is one frame. Child frames join the same engine sharing both.
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet};

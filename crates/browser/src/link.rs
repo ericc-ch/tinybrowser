@@ -1,8 +1,7 @@
 //! Browser side of the renderer seam: factory, handles, and async routing.
 //!
-//! [ADR 0019](../../../docs/adrs/0019-async-browser-runtime-and-io.md): one
-//! private platform channel per renderer, length-prefixed frames, async reader
-//! and writer tasks, and oneshot replies. The handle stays value-only.
+//! One private platform channel per renderer, length-prefixed frames, async
+//! reader and writer tasks, and oneshot replies. The handle stays value-only.
 
 use std::collections::HashMap;
 use std::io;
@@ -671,7 +670,7 @@ fn fail_pending(pending: &Arc<Mutex<HashMap<u64, PendingReply>>>) {
 ///
 /// The child formats its own level and target; the browser only forwards the
 /// lines, so renderer records land in the daemon's console and file without a
-/// second file writer ([ADR 0015](../../../docs/adrs/0015-logging.md)).
+/// second file writer.
 pub(crate) async fn forward_stderr(stderr: tokio::process::ChildStderr) {
     let mut reader = tokio::io::BufReader::new(stderr);
     let mut bytes = Vec::new();

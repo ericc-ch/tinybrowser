@@ -1,6 +1,6 @@
 # Size Budget
 
-Goal: **sub-10MB stripped x86_64 binary** (raised from 5MB on 2026-09-10 by [ADR 0012](../adrs/0012-host-protocol-and-cli-stack.md); the 5MB columns below are historical, not targets). Measured 2026-08-21 and 2026-08-23, rustc 1.98.0, Linux.
+Goal: **sub-10MB stripped x86_64 binary** (raised from 5MB on 2026-09-10; the 5MB columns below are historical, not targets). Measured 2026-08-21 and 2026-08-23, rustc 1.98.0, Linux.
 
 Reproduce each dependency row with a probe binary that really exercises it
 (tokenize, dial, JS eval, parse+query). Marginal = binary delta vs an
@@ -58,10 +58,10 @@ there; they had never actually been added).
 | **url 2.x**, WHATWG parse incl. IDN host + join + serialize | — | +197 KB |
 | **tungstenite 0.30** (handshake feature only, no TLS), real loopback dial + frames + close | — | +184 KB |
 
-(url and tungstenite probed 2026-08-25 for the net-crate API effort
-([ADR 0006](../adrs/0006-net-transport.md)); same rustc 1.98.0, tuned profile,
-baseline re-measured at 290 KB — identical to the row above. In one binary
-they land +336 KB combined: ~53 KB shared-dependency overlap.)
+(url and tungstenite probed 2026-08-25 for the net-crate API effort; same
+rustc 1.98.0, tuned profile, baseline re-measured at 290 KB — identical to
+the row above. In one binary they land +336 KB combined: ~53 KB
+shared-dependency overlap.)
 
 btls knob verification (safe API, sync over `std::net`, no tokio):
 `set_permute_extensions` shuffles extension order per connection, JA3 hash
@@ -75,8 +75,8 @@ not risk.
 ### Live-gate matrix snapshot (2026-08-25)
 
 Sixteen real targets across vendors (Cloudflare, Akamai, HUMAN,
-PerimeterX, Kasada) driven by three throwaway client builds matching the
-option space in [ADR 0006](../adrs/0006-net-transport.md). Headline results:
+PerimeterX, Kasada) driven by three throwaway client builds matching the net
+v1 option space. Headline results:
 
 - Bare ureq+native-tls clears 9/16; the OpenSSL fingerprint (`t13d3011_…`,
   no ALPN) hard-fails tjx, bangkokair, stockx, zillow, bestbuy.
@@ -100,24 +100,22 @@ standing truth.
   budget with CDP and a11y still unaccounted. Its patched-BoringSSL fork
   survives independently as the `btls`/`btls-sys` crate family (0.5.6),
   which is what the probe above exercises.
-- **Transport direction closed** (maintainer decision, 2026-08-25,
-  [ADR 0006](../adrs/0006-net-transport.md)): net v1 ships as *bare ureq +
-  native-tls* (+490 KB net, ~2.5 MB stack, 9/16 gates). Stealth is deferred,
+- **Transport direction closed** (maintainer decision, 2026-08-25): net v1
+  ships as *bare ureq + native-tls* (+490 KB net, ~2.5 MB stack, 9/16
+  gates). Stealth is deferred,
   not dropped: canonical-Chrome wire behavior stays the target, owned by the
   later *hand-rolled h1/h2 on btls* milestone (≈1.3–1.7 MB net, the only
   shape reaching it within budget). The *ureq→btls bridge* shape (+1797 KB,
   h1-only ceiling) was declined — it buys neither ship-soonest nor
-  coherence. Full evidence and per-shape gate scores are in the ADR; the
-  sizes stay in the probe table above.
+  coherence. The sizes stay in the probe table above.
 - **ureq-over-btls bridging needs no vendoring**: ureq exposes
   `Agent::with_parts(config, connector, resolver)` for bespoke Connectors;
   the bridge is ~130 lines in our own crate. Fork/absorb becomes relevant
   only for internals (case-preserving headers, hosting an h2 stack inside
   ureq's transport model). Dormant now that the bridge shape is declined;
   relevant again only if the deferred stealth milestone wants it.
-- The earlier native-tls decision above is reinstated for net v1 by
-  [ADR 0006](../adrs/0006-net-transport.md), with the stealth objection to it
-  deferred alongside the goal itself (see the ADR).
+- The earlier native-tls decision above is reinstated for net v1, with the
+  stealth objection to it deferred alongside the goal itself.
 
 ## Milestone: net M1 dial (2026-08-26)
 
@@ -178,7 +176,7 @@ code on the old M1 connector. Accepted.
 
 - **html5ever over html5gum** (+~570 KB): buys the complete HTML5 tree-construction algorithm (insertion modes, foster parenting, adoption agency). html5gum is tokenizer-only; hand-rolling tree construction is weeks of fiddly spec work. Maturity wins under a 5MB budget.
 - **Tuned profile from day one**: default release costs +400–850KB for nothing. The flags are set once in the root Cargo.toml.
-- **native-tls, dynamically linked**: Net v1 used TLS from system `libssl.so.3` and shipped only glue (~482 KB tuned). [ADR 0019](../adrs/0019-async-browser-runtime-and-io.md) supersedes this choice with hyper-rustls for async net v2. The stealth milestone still replaces the private TLS connector with `btls`.
+- **native-tls, dynamically linked**: Net v1 used TLS from system `libssl.so.3` and shipped only glue (~482 KB tuned). Net v2 keeps native-tls (now with ALPN) behind the same private connector seam. The stealth milestone still replaces that connector with `btls`.
 - **panic = unwind kept**: abort saves only ~39 KB but kills `catch_unwind`, which every JS-exposed op needs so a Rust panic degrades to a JS error instead of unwinding through QuickJS's C frame.
 - **selectors later is cheap**, confirmed at the dom-v1 checkpoint: the whole dom layer (arena + selector engine + parser stack) measured +932 KB tuned, within ~2% of the html5ever+selectors estimates it subsumes (see Milestone section).
 - **Old servo stack (html5ever + selectors + cssparser as the _core_) was never the problem**: the old repo's total was bloat elsewhere. The parser swap alone does not hit 5MB; discipline at every milestone does.
@@ -186,13 +184,13 @@ code on the old M1 connector. Accepted.
 ## Watchlist (what can still blow the budget)
 
 - Children-representation collapse (inline/heap split → plain `Vec<NodeId>`,
-  2026-08-24, per ADR 0002): expected ≈0 binary impact (no dependency change);
-  confirm at the next parse+query probe.
+  2026-08-24): expected ≈0 binary impact (no dependency change); confirm at
+  the next parse+query probe.
 
 - DOM→JS binding glue: hundreds of rquickjs classes add up; keep dispatch tables data-driven.
-- Browser-process async I/O: [ADR 0019](../adrs/0019-async-browser-runtime-and-io.md) adds hyper-util and hyper-rustls for outbound networking and async platform-channel features to the current-thread renderer. Axum stays during the core migration, then a measured checkpoint compares it with direct hyper. The renderer still takes no web-server stack, HTTP client, CLI crate, or multi-thread runtime.
+- Browser-process async I/O: hyper-util provides outbound networking with native-tls behind the private connector seam, and the current-thread renderer gains async platform-channel features. Axum stays for the CDP/WebDriver server; a minimal hyper-direct probe saves 525,608 bytes but does not implement the CDP surface. The renderer still takes no web-server stack, HTTP client, CLI crate, or multi-thread runtime.
 - A11y walker (accname computation, role mapping): budget ~100–200 KB, fine, but measure.
-- When the deferred stealth milestone lands net on btls ([ADR 0006](../adrs/0006-net-transport.md)): pin the crate family like html5ever (its BoringSSL fork is wreq-ecosystem); impersonation presets go stale with every Chrome release — a stale preset is itself a detection signal, so bump discipline applies to persona tables, not just crates.
+- When the deferred stealth milestone lands net on btls: pin the crate family like html5ever (its BoringSSL fork is wreq-ecosystem); impersonation presets go stale with every Chrome release — a stale preset is itself a detection signal, so bump discipline applies to persona tables, not just crates.
 - Re-measure marginals at every milestone; regressions must justify themselves in bytes.
 
 ## Milestone: async runtime probes (2026-08-27)
@@ -214,9 +212,9 @@ not drop it. Empty `main` re-measured at 284 KB (290912 bytes).
 Tokio 1.53 default features are empty; `full` is the fat switch. Smol is not
 smaller than current-thread Tokio with timers. At this checkpoint the tab
 thread used Tokio current-thread `rt`+`time` (~+66 KB), and page tasks stayed in
-the engine queue. [ADR 0019](../adrs/0019-async-browser-runtime-and-io.md) later
-selected one multi-thread browser runtime and a current-thread renderer waiter
-with only the features needed for async platform-channel I/O.
+the engine queue. The async migration later selected one multi-thread browser
+runtime and a current-thread renderer waiter with only the features needed for
+async platform-channel I/O.
 
 ## Milestone: html5lib WPT browser path (2026-09-11)
 
@@ -317,9 +315,9 @@ below the hard limit.
 
 ## Milestone: axum + clap browser-process stack (2026-09-10)
 
-[ADR 0012](../adrs/0012-host-protocol-and-cli-stack.md) replaced the `http1`
-crate with axum (CDP HTTP + WebSocket, WebDriver REST) and the hand-rolled
-argument parser with clap; the size cap moved to 10 MB in the same decision.
+The browser-process stack moved from the `http1` crate to axum (CDP HTTP +
+WebSocket, WebDriver REST) and from the hand-rolled argument parser to clap;
+the size cap moved to 10 MB in the same decision.
 Command: `nix develop --command cargo build --release --example tab_probe --bin
 tinybrowser`; rustc 1.98.0, committed stripped x86_64 release profile.
 
@@ -338,9 +336,9 @@ and the renderer runtime stays current-thread.
 
 ## Milestone: renderer processes and per-site isolation (2026-09-10)
 
-[ADR 0011](../adrs/0011-renderer-processes-per-site.md) split the engine into
-the `renderer` crate (parser, `Dom`, QuickJS, value-only seam) and the `browser`
-browser side (Browser, tab `Tab`, navigation, `NetworkSession`, renderer factory).
+The per-site split put the engine into the `renderer` crate (parser, `Dom`,
+QuickJS, value-only seam) and the `browser` side into its own crate (Browser,
+tab `Tab`, navigation, `NetworkSession`, renderer factory).
 The browser process spawns one `--renderer` process per site instance. At this
 milestone, tests still used an in-process backend. Command: `nix develop --command cargo build --release
 --example tab_probe --bin tinybrowser`; rustc 1.98.0, committed stripped
@@ -394,10 +392,9 @@ baseline rather than an attribution of the full delta to this cleanup.
 
 ## Milestone: logging (2026-09-12)
 
-[ADR 0015](../adrs/0015-logging.md) adds the std-only `logging` crate (levels,
-stderr console, bounded async batched file sink with rotation), the
-`--log-level`/`--verbose` flags, per-profile daemon logs, and renderer stderr
-forwarding. Main had moved to `ccf16b8` (renderer code, not only the html5lib
+The std-only `logging` crate (levels, stderr console, bounded async batched
+file sink with rotation), the `--log-level`/`--verbose` flags, per-profile
+daemon logs, and renderer stderr forwarding land in this milestone. Main had moved to `ccf16b8` (renderer code, not only the html5lib
 move) after the row above, so the baseline was rebuilt at `ccf16b8` in a
 detached worktree with the same rustc 1.98.0 and committed stripped x86_64
 release profile; both sides ran plain `cargo build --release --bin tinybrowser
@@ -410,13 +407,13 @@ release profile; both sides ran plain `cargo build --release --bin tinybrowser
 
 The probe delta is the cleaner marginal for the crate and the browser/renderer
 wiring; the CLI delta adds the clap surface (level value parser, help text) and
-the per-process file config. Both numbers are recorded in ADR 0015.
+the per-process file config.
 
 ## Milestone: renderer reference monitor and bounded queues (2026-09-12)
 
-[ADR 0016](../adrs/0016-renderer-seam-reference-monitor.md) added browser-owned
-site-lock validation, an 8 MiB IPC frame limit, bounded command/event retention,
-and removed the unbounded idle-renderer pool. The row below was re-measured on
+This hardening added browser-owned site-lock validation, an 8 MiB IPC frame
+limit, bounded command/event retention, and removed the unbounded
+idle-renderer pool. The row below was re-measured on
 merged `main` (`44f957f`, after the logging merge). Command: `nix develop
 --command cargo build --release --offline --example tab_probe --bin
 tinybrowser`; rustc 1.98.0, stripped x86_64 release profile.
@@ -439,8 +436,8 @@ This bounded partial implementation adds `Intl.NumberFormat` and
 formatting covers decimal, percent, currency defaults, and exact `BigInt`
 transport. Date/time formatting is limited to the Gregorian calendar, UTC,
 styles, and the default numeric component shapes. Unsupported options and the
-merge target are recorded in [ADR 0017](../adrs/0017-intl-core-slice.md); this
-milestone does not claim full ECMA-402 conformance.
+merge target remain known gaps; this milestone does not claim full ECMA-402
+conformance.
 
 Command: `nix develop --command cargo build --release --bin tinybrowser`;
 rustc 1.98.0, stripped x86_64 release profile. The baseline is the immediately
@@ -565,10 +562,9 @@ rustls-native-certs, and webpki-roots. It also drops ureq and native-tls. The
 preflight predicted about 1.01 MB for TLS plus the HTTP-only hyper client; the
 rest is HTTP/2 framing, the native-root loader, and tokio-tungstenite.
 
-P6 defers two behaviors to P8 and the ledger records the gap: HTTP CONNECT
-proxy routing (the `proxy()` builder still validates and redacts, but requests
-do not tunnel yet) and `--resolve`-aware WebSocket dials (Tokio tungstenite
-resolves directly).
+P6 defers two behaviors to P8: HTTP CONNECT proxy routing (the `proxy()`
+builder still validates and redacts, but requests do not tunnel yet) and
+`--resolve`-aware WebSocket dials (Tokio tungstenite resolves directly).
 
 ## Milestone: CONNECT proxy, P8 (2026-09-15)
 
@@ -584,8 +580,8 @@ profile.
 | CLI (`target/release/tinybrowser`) | 7,287,200 | 7,349,216 | **+62,016** | 2,650,784 |
 
 Plain `http://` requests through a proxy use CONNECT rather than browser
-absolute-form proxying, and WebSocket dials ignore `--resolve`; both are
-recorded as open P8 follow-ups in the migration ledger.
+absolute-form proxying, and WebSocket dials ignore `--resolve`; both remain
+open P8 follow-ups.
 
 ## Milestone: streamed renderer responses, P9 (2026-09-15)
 
@@ -647,11 +643,11 @@ daemon instead of failing one Tokio task. That is the cost of the 761 KB.
 
 Deferred levers, with measured or estimated cost:
 
-- CDP server on hyper-direct instead of axum: standalone probe measured
-  525,608 bytes (ADR 0020); needs the adapter rewrite and must re-pass every
-  protocol gate.
-- Hand-rolled CLI parsing instead of clap: 131.4 KiB `.text`; ADR 0012 picks
-  clap, so this is a product decision.
+- CDP server on hyper-direct instead of axum: the hyper probe saves
+  525,608 bytes; needs the adapter rewrite and must re-pass every protocol
+  gate.
+- Hand-rolled CLI parsing instead of clap: 131.4 KiB `.text`; clap was chosen
+  deliberately, so this is a product decision.
 - Feature-gating Intl: the ICU4X blob is 125,426 bytes plus code; removes the
   Intl surface.
 - Dropping HTTP/2: h2 is 63.4 KiB `.text` plus hyper paths; loses HTTP/2.

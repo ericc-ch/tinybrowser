@@ -1,7 +1,7 @@
 //! One async browser-side tab coordinator: identity, navigation, and renderer link.
 //!
-//! [ADR 0019](../../../docs/adrs/0019-async-browser-runtime-and-io.md): the
-//! browser process owns tabs as Tokio tasks. The renderer owns each document.
+//! The browser process owns tabs as Tokio tasks. The renderer owns each
+//! document.
 
 use std::fmt;
 use std::future::pending;
