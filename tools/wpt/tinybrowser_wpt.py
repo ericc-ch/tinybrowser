@@ -1,9 +1,12 @@
 # tinybrowser wptrunner product. Install into the WPT venv:
 #   pip install -e tools/wpt
 # then:
-#   third_party/wpt/wpt run --binary /path/to/tinybrowser --ssl-type none tinybrowser [tests]
+#   third_party/wpt/wpt run --binary /path/to/tinybrowser tinybrowser [tests]
 # or: ./tools/wpt/run [tests]
-# ./tools/wpt/run skips the /etc/hosts check and this product passes --resolve.
+#
+# ./tools/wpt/run skips the /etc/hosts check, passes --resolve maps, runs
+# testharness + crashtest by default, and enables `--ssl-type=openssl` with
+# the generated wptserve CA handed to the product as `--tls-ca`.
 # Each WebDriver endpoint gets a fresh temporary XDG profile.
 
 from __future__ import annotations
