@@ -7,11 +7,11 @@
 # worktree is unnecessary. The pinned revision is checked before the run.
 #
 # Overrides:
-#   TINYBROWSER_WPT_ROOT            WPT checkout to run from
-#   TINYBROWSER_WPT_VENV            WPT virtualenv to use
-#   TINYBROWSER_BINARY              prebuilt tinybrowser to test (skips build)
-#   TINYBROWSER_WPT_NO_LOCK=1       skip the shared-venv lock
-#   TINYBROWSER_WPT_LOCK_TIMEOUT    seconds to wait for the lock (default 1800)
+#   TINYBROWSER_WPT_ROOT                  WPT checkout to run from
+#   TINYBROWSER_WPT_VENV                  existing WPT virtualenv to use
+#   TINYBROWSER_BINARY                    prebuilt tinybrowser to test
+#   TINYBROWSER_WPT_NO_LOCK=1             skip the shared-venv lock
+#   TINYBROWSER_WPT_LOCK_TIMEOUT          seconds to wait for the lock (default 1800)
 #   TINYBROWSER_WPT_ALLOW_PIN_MISMATCH=1  run a checkout at a different revision
 #
 # Skips WPT's /etc/hosts check: the product passes --resolve maps instead.
@@ -39,15 +39,28 @@ if [[ ! -f "$WPT/wpt" ]]; then
   echo "or point TINYBROWSER_WPT_ROOT at an initialized checkout." >&2
   exit 1
 fi
+# Canonicalize once and export it: launch.py resolves the same root for its
+# own imports, and a relative override must not pick up the changed cwd.
+WPT="$(cd "$WPT" && pwd -P)"
+export TINYBROWSER_WPT_ROOT="$WPT"
 
-# The suite the branch pins and the checkout being run must agree.
+# The suite the branch pins and the checkout being run must agree. A checkout
+# whose revision cannot be read is refused, not trusted.
 pinned="$(git -C "$ROOT" rev-parse HEAD:third_party/wpt 2>/dev/null || true)"
 actual="$(git -C "$WPT" rev-parse HEAD 2>/dev/null || true)"
-if [[ -n "$pinned" && -n "$actual" && "$pinned" != "$actual" &&
-  "${TINYBROWSER_WPT_ALLOW_PIN_MISMATCH:-0}" != 1 ]]; then
-  echo "WPT checkout at $WPT is $actual; this worktree pins $pinned" >&2
-  echo "Update the checkout, or set TINYBROWSER_WPT_ALLOW_PIN_MISMATCH=1." >&2
-  exit 1
+if [[ -n "$pinned" && "${TINYBROWSER_WPT_ALLOW_PIN_MISMATCH:-0}" != 1 ]]; then
+  if [[ -z "$actual" ]]; then
+    echo "cannot read the WPT revision at $WPT; it is not a git checkout" >&2
+    echo "Set TINYBROWSER_WPT_ALLOW_PIN_MISMATCH=1 to run it anyway." >&2
+    exit 1
+  fi
+  if [[ "$pinned" != "$actual" ]]; then
+    echo "WPT checkout at $WPT is $actual; this worktree pins $pinned" >&2
+    echo "Update the checkout, or set TINYBROWSER_WPT_ALLOW_PIN_MISMATCH=1." >&2
+    exit 1
+  fi
+elif [[ -n "$pinned" && "$pinned" != "${actual:-}" ]]; then
+  echo "WPT pin mismatch ignored: running ${actual:-an unknown revision}, worktree pins $pinned" >&2
 fi
 
 if ! command -v python3 >/dev/null 2>&1; then
@@ -84,21 +97,34 @@ echo "venv: $VENV" >&2
 echo "binary: $BINARY" >&2
 
 # One run at a time: the bootstrap and the editable install both mutate the
-# shared venv. The lock lives in /tmp so the checkout stays clean.
+# shared venv. The lock lives in the user cache and is keyed by the venv's
+# real path, so two spellings of one checkout serialize.
 if [[ "${TINYBROWSER_WPT_NO_LOCK:-0}" != 1 ]]; then
-  lock="/tmp/tinybrowser-wpt-$(printf '%s' "$WPT" | cksum | cut -d' ' -f1).lock"
+  lock_dir="${XDG_CACHE_HOME:-$HOME/.cache}/tinybrowser"
+  mkdir -p "$lock_dir"
+  lock="$lock_dir/wpt-$(realpath -m "$VENV" | cksum | cut -d' ' -f1).lock"
   exec 9>"$lock"
   if ! flock -n 9; then
+    lock_timeout="${TINYBROWSER_WPT_LOCK_TIMEOUT:-1800}"
+    [[ "$lock_timeout" =~ ^[0-9]+$ ]] || lock_timeout=1800
     echo "another WPT run holds $lock; waiting" >&2
-    flock -w "${TINYBROWSER_WPT_LOCK_TIMEOUT:-1800}" 9 || {
+    flock -w "$lock_timeout" 9 || {
       echo "timed out waiting for the WPT venv lock" >&2
       exit 1
     }
   fi
 fi
 
-# Create the venv when the checkout is fresh, then check the one in use.
-python3 "$WPT/wpt" run --help >/dev/null
+# A missing venv is created once by WPT itself. An existing one is never
+# handed back to that setup, which can rebuild a venv under a different
+# interpreter and delete one a run is using.
+if [[ ! -x "$VENV/bin/pip" ]]; then
+  if [[ -n "${TINYBROWSER_WPT_VENV:-}" ]]; then
+    echo "WPT virtualenv not found at $VENV; TINYBROWSER_WPT_VENV must name one" >&2
+    exit 1
+  fi
+  python3 "$WPT/wpt" run --help >/dev/null
+fi
 if [[ ! -x "$VENV/bin/pip" ]]; then
   echo "WPT virtualenv not found at $VENV" >&2
   echo "Bootstrap it with: python3 $WPT/wpt run --help" >&2
