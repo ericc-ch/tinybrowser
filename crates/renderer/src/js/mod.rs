@@ -34,7 +34,7 @@ const INSTALL_WEB_APIS_JS: &str = r"
 globalThis.__tb_timeouts = [];
 globalThis.__tb_fetchCbs = Object.create(null);
 globalThis.__tb_fetchSeq = 0;
-['__scheduleTimeout','__cancelTimeout','__queueFetch','__cookieGet','__cookieSet','__tbCreateObjectURL','__tbRevokeObjectURL','__tbResolveUrl','__tb_timeouts','__tb_fetchCbs'].forEach(function(k) {
+['__scheduleTimeout','__cancelTimeout','__queueFetch','__cookieGet','__cookieSet','__tbCreateObjectURL','__tbRevokeObjectURL','__tbResolveUrl','__tbParseUrl','__tb_timeouts','__tb_fetchCbs'].forEach(function(k) {
   Object.defineProperty(globalThis, k, { writable: false, configurable: false, enumerable: false });
 });
 globalThis.setTimeout = function(fn, ms) {
@@ -974,10 +974,11 @@ Object.defineProperty(globalThis.FileReader.prototype, Symbol.toStringTag, { val
 // https://w3c.github.io/FileAPI/#dfn-createObjectURL
 globalThis.URL = class URL {
   constructor(input, base) {
-    const href = globalThis.__tbResolveUrl(
-      String(input),
-      base === undefined ? undefined : String(base)
-    );
+    // No base means no document fallback: the input must parse absolutely
+    // (<https://url.spec.whatwg.org/#concept-url-parser>).
+    const href = base === undefined
+      ? globalThis.__tbParseUrl(String(input))
+      : globalThis.__tbResolveUrl(String(input), String(base));
     if (href === null) throw new TypeError('Invalid URL');
     this.href = href;
     this._searchParams = new URLSearchParams(this.search);
@@ -1260,9 +1261,12 @@ Object.defineProperty(globalThis.MessageEvent.prototype, Symbol.toStringTag, { v
 // A same-realm structured clone. Cross-thread workers will move this seam to
 // Rust; every messaging API already routes through it.
 const __tbTransferList = transfer => {
-  if (transfer === undefined || transfer === null) return [];
-  if (Array.isArray(transfer)) return transfer;
-  if (typeof transfer === 'object' && transfer.transfer !== undefined) return Array.from(transfer.transfer);
+  if (transfer === undefined) return [];
+  // `sequence<object>` conversion: an object with @@iterator, else TypeError
+  // (<https://webidl.spec.whatwg.org/#es-sequence>).
+  if (transfer === null || typeof transfer !== 'object' || typeof transfer[Symbol.iterator] !== 'function') {
+    throw new TypeError('The transfer list must be an iterable object');
+  }
   return Array.from(transfer);
 };
 const __tbStructuredClone = (value, transfer, sourcePort) => {
@@ -1348,13 +1352,19 @@ const __tbStructuredClone = (value, transfer, sourcePort) => {
       for (const entry of input) copy.add(clone(entry));
       return copy;
     }
+    if (Array.isArray(input)) {
+      const copy = [];
+      seen.set(input, copy);
+      for (const key of Object.keys(input)) copy[key] = clone(input[key]);
+      return copy;
+    }
     // Anything left with a platform @@toStringTag is a host object (nodes,
     // URL, events, ...) and is not serializable
     // (<https://html.spec.whatwg.org/multipage/structured-data.html#structuredserializeinternal>).
     if (Object.prototype.toString.call(input) !== '[object Object]') {
       throw new DOMException('The object could not be cloned.', 'DataCloneError');
     }
-    const copy = Array.isArray(input) ? [] : {};
+    const copy = {};
     seen.set(input, copy);
     for (const key of Object.keys(input)) copy[key] = clone(input[key]);
     return copy;
@@ -1438,6 +1448,57 @@ globalThis.MessageChannel = class MessageChannel {
   }
 };
 Object.defineProperty(globalThis.MessageChannel.prototype, Symbol.toStringTag, { value: 'MessageChannel', writable: false, enumerable: false, configurable: true });
+// https://html.spec.whatwg.org/multipage/webmessaging.html#dom-window-postmessage
+// Same-window delivery: `source` is this window. The spec order is kept:
+// resolve targetOrigin, then structured-serialize, then queue the task, and
+// the origin check runs inside the task. Deviation: the task is queued on the
+// timer task source; there is no posted-message task source yet.
+globalThis.postMessage = function(message, targetOrigin, transfer) {
+  if (arguments.length === 0) {
+    throw new TypeError(`Failed to execute 'postMessage' on 'Window': 1 argument required, but only 0 present.`);
+  }
+  const sourceOrigin = String(location.origin);
+  let checkedOrigin = targetOrigin === undefined ? '/' : String(targetOrigin);
+  if (checkedOrigin === '/') {
+    checkedOrigin = sourceOrigin;
+  } else if (checkedOrigin !== '*') {
+    let parsed;
+    try {
+      parsed = new URL(checkedOrigin);
+    } catch (error) {
+      throw new DOMException('Invalid target origin', 'SyntaxError');
+    }
+    checkedOrigin = parsed.origin;
+  }
+  const cloned = __tbStructuredClone(message, transfer, null);
+  const ports = cloned.ports;
+  setTimeout(function() {
+    if (checkedOrigin !== '*' && checkedOrigin !== sourceOrigin) return;
+    globalThis.dispatchEvent(new globalThis.MessageEvent('message', {
+      data: cloned.data,
+      origin: sourceOrigin,
+      source: globalThis,
+      ports: ports,
+    }));
+  }, 0);
+};
+// Event handler IDL attributes for the window's messaging events. The setter
+// replaces the previous listener, as an event handler attribute does; the
+// return-value and `this` semantics of event handlers are not modeled yet.
+['message', 'messageerror'].forEach(function(type) {
+  const slot = Symbol.for('tinybrowser.window.handler.' + type);
+  Object.defineProperty(globalThis, 'on' + type, {
+    get() { return this[slot] === undefined ? null : this[slot]; },
+    set(value) {
+      const previous = this[slot];
+      if (previous !== undefined && previous !== null) this.removeEventListener(type, previous);
+      this[slot] = value === undefined || value === null ? null : value;
+      if (this[slot] !== null) this.addEventListener(type, this[slot]);
+    },
+    configurable: true,
+    enumerable: true,
+  });
+});
 ";
 
 /// A value produced by script evaluation.
@@ -1861,6 +1922,15 @@ impl JsRealm {
                         .borrow()
                         .object_url_type(&url)
                         .map(|content_type| content_type.to_string())
+                }),
+            )
+            .map_err(JsError::engine)?;
+
+        ctx.globals()
+            .set(
+                "__tbParseUrl",
+                Func::from(|input: String| {
+                    url::Url::parse(&input).ok().map(|url| url.to_string())
                 }),
             )
             .map_err(JsError::engine)?;

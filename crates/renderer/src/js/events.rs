@@ -875,17 +875,6 @@ pub(crate) fn fire_trusted_with_related(
     Ok(())
 }
 
-/// Dispatches an already-trusted user-agent event without the
-/// `dispatchEvent()` step that clears `isTrusted`
-/// (<https://dom.spec.whatwg.org/#concept-event-dispatch>).
-pub(crate) fn dispatch_trusted<'js>(
-    ctx: &Ctx<'js>,
-    target: EventTargetKey,
-    event: &Class<'js, JsEvent>,
-) -> Result<bool> {
-    dispatch(ctx, target, event)
-}
-
 /// [Dispatch](https://dom.spec.whatwg.org/#concept-event-dispatch) an event.
 fn dispatch<'js>(
     ctx: &Ctx<'js>,
