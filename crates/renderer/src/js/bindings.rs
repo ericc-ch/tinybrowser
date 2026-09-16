@@ -5966,6 +5966,12 @@ const INSTALL_BRANDS_JS: &str = r"
     Object.defineProperty(ctor, 'name', { value: name, configurable: true });
     Object.defineProperty(proto, 'constructor', { value: ctor, writable: true, configurable: true });
     Object.defineProperty(ctor, 'prototype', { value: proto, writable: false });
+    // Interface prototypes carry @@toStringTag
+    // (<https://webidl.spec.whatwg.org/#es-interface>), so
+    // Object.prototype.toString says `[object HTMLDivElement]`.
+    Object.defineProperty(proto, Symbol.toStringTag, {
+      value: name, writable: false, enumerable: false, configurable: true,
+    });
     Object.defineProperty(globalThis, name, { value: ctor, writable: true, configurable: true });
     return ctor;
   }
@@ -6176,6 +6182,22 @@ const INSTALL_BRANDS_JS: &str = r"
     'date', 'month', 'week', 'time', 'datetime-local', 'number', 'range',
     'color', 'checkbox', 'radio', 'file', 'submit', 'image', 'reset', 'button',
   ]), 'text'));
+  // `<input type=file>` exposes a (possibly empty) FileList
+  // (<https://html.spec.whatwg.org/multipage/input.html#dom-input-files>).
+  Object.defineProperty(table.HTMLInputElement, 'files', {
+    get: function() {
+      let list = this.__tb_files;
+      if (list === undefined) {
+        list = globalThis.__tbCreateFileList([]);
+        Object.defineProperty(this, '__tb_files', {
+          value: list, writable: false, enumerable: false, configurable: false,
+        });
+      }
+      return list;
+    },
+    enumerable: true,
+    configurable: true,
+  });
   Object.defineProperty(table.HTMLButtonElement, 'type', reflectType(new Set([
     'submit', 'reset', 'button',
   ]), 'submit'));
@@ -6227,6 +6249,14 @@ const INSTALL_COLLECTIONS_JS: &str = r"
     writable: true,
     configurable: true,
   });
+  for (const [collectionName, collectionProto] of [
+    ['NodeList', native],
+    ['NamedNodeMap', globalThis.NamedNodeMap.prototype],
+  ]) {
+    Object.defineProperty(collectionProto, Symbol.toStringTag, {
+      value: collectionName, writable: false, enumerable: false, configurable: true,
+    });
+  }
   const ctor = function() { throw new TypeError('Illegal constructor'); };
   const proto = Object.create(Object.prototype);
   for (const member of ['length', 'item']) {
@@ -6240,6 +6270,9 @@ const INSTALL_COLLECTIONS_JS: &str = r"
     configurable: true,
   });
   Object.defineProperty(ctor, 'prototype', { value: proto, writable: false });
+  Object.defineProperty(proto, Symbol.toStringTag, {
+    value: 'HTMLCollection', writable: false, enumerable: false, configurable: true,
+  });
   Object.defineProperty(globalThis, 'HTMLCollection', { value: ctor, writable: true, configurable: true });
   Object.defineProperty(globalThis, '__tb_liveCollection', {
     enumerable: false,

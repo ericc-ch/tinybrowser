@@ -67,6 +67,15 @@ globalThis.cancelAnimationFrame = function(id) {
 if (!globalThis.document) {
   globalThis.document = {};
 }
+// A no-op console: enough for scripts that only log, without a logging pipe.
+if (typeof globalThis.console === 'undefined') {
+  const noop = function() {};
+  globalThis.console = {
+    log: noop, info: noop, warn: noop, error: noop, debug: noop,
+    trace: noop, dir: noop, group: noop, groupEnd: noop, table: noop,
+    assert: noop, time: noop, timeEnd: noop, count: noop,
+  };
+}
 Object.defineProperty(document, 'cookie', {
   get() { return globalThis.__cookieGet(); },
   set(v) { globalThis.__cookieSet(String(v)); }
@@ -87,39 +96,644 @@ globalThis.fetch = function(url) {
   });
 };
 // https://w3c.github.io/FileAPI/#blob
-const __tbBlobData = new WeakMap();
-const __tbUtf8Length = value => {
-  let bytes = 0;
-  for (const character of value) {
-    const code = character.codePointAt(0);
-    bytes += code <= 0x7f ? 1 : code <= 0x7ff ? 2 : code <= 0xffff ? 3 : 4;
-  }
-  return bytes;
+// Blob bytes live as a Uint8Array under a symbol key, so no IDL member is an
+// own property and a method called from another realm of the same runtime can
+// still recognize its receiver.
+const __tbBlobData = Symbol.for('tinybrowser.blob.data');
+const __tbFileData = Symbol.for('tinybrowser.file.data');
+const __tbFileListData = Symbol.for('tinybrowser.filelist.data');
+const __tbReaderData = Symbol.for('tinybrowser.filereader.data');
+const __tbProgressData = Symbol.for('tinybrowser.progress.data');
+const __tbDecoderData = Symbol.for('tinybrowser.textdecoder.data');
+const __tbStreamData = Symbol.for('tinybrowser.readablestream.data');
+const __tbBrand = (value, symbol, message) => {
+  const data = value === null || value === undefined ? undefined : value[symbol];
+  if (data === undefined) throw new TypeError(message === undefined ? 'Illegal invocation' : message);
+  return data;
 };
+// https://encoding.spec.whatwg.org/#utf-8-encoder, with lone surrogates
+// replaced as the standard requires.
+const __tbUtf8Encode = value => {
+  value = String(value);
+  const bytes = [];
+  for (let index = 0; index < value.length; index++) {
+    let code = value.charCodeAt(index);
+    if (code >= 0xd800 && code <= 0xdbff && index + 1 < value.length) {
+      const low = value.charCodeAt(index + 1);
+      if (low >= 0xdc00 && low <= 0xdfff) {
+        code = 0x10000 + ((code - 0xd800) << 10) + (low - 0xdc00);
+        index++;
+      }
+    }
+    if (code >= 0xd800 && code <= 0xdfff) code = 0xfffd;
+    if (code <= 0x7f) bytes.push(code);
+    else if (code <= 0x7ff) bytes.push(0xc0 | (code >> 6), 0x80 | (code & 0x3f));
+    else if (code <= 0xffff) bytes.push(0xe0 | (code >> 12), 0x80 | ((code >> 6) & 0x3f), 0x80 | (code & 0x3f));
+    else bytes.push(0xf0 | (code >> 18), 0x80 | ((code >> 12) & 0x3f), 0x80 | ((code >> 6) & 0x3f), 0x80 | (code & 0x3f));
+  }
+  return new Uint8Array(bytes);
+};
+// https://encoding.spec.whatwg.org/#utf-8-decoder. The trailing incomplete
+// sequence is returned so a streaming TextDecoder can carry it forward.
+const __tbUtf8Decode = (bytes, fatal, ignoreBOM) => {
+  let text = '';
+  let index = 0;
+  if (!ignoreBOM && bytes.length >= 3 && bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf) index = 3;
+  while (index < bytes.length) {
+    const first = bytes[index];
+    let needed = 0;
+    let code = 0;
+    if (first < 0x80) { text += String.fromCharCode(first); index++; continue; }
+    if (first >= 0xc2 && first <= 0xdf) { needed = 1; code = first & 0x1f; }
+    else if (first >= 0xe0 && first <= 0xef) { needed = 2; code = first & 0x0f; }
+    else if (first >= 0xf0 && first <= 0xf4) { needed = 3; code = first & 0x07; }
+    if (needed === 0) {
+      if (fatal) throw new TypeError('The encoded data was not valid.');
+      text += '\ufffd';
+      index++;
+      continue;
+    }
+    if (index + needed >= bytes.length) break;
+    let valid = true;
+    for (let offset = 1; offset <= needed; offset++) {
+      const next = bytes[index + offset];
+      if ((next & 0xc0) !== 0x80) { valid = false; break; }
+      code = (code << 6) | (next & 0x3f);
+    }
+    if (valid) {
+      const overlong = (needed === 1 && code < 0x80) || (needed === 2 && code < 0x800) || (needed === 3 && code < 0x10000);
+      if (overlong || code > 0x10ffff || (code >= 0xd800 && code <= 0xdfff)) valid = false;
+    }
+    if (!valid) {
+      if (fatal) throw new TypeError('The encoded data was not valid.');
+      text += '\ufffd';
+      index++;
+      continue;
+    }
+    text += String.fromCodePoint(code);
+    index += needed + 1;
+  }
+  return { text, remainder: bytes.slice(index) };
+};
+// https://encoding.spec.whatwg.org/#utf-16le-decoder
+const __tbUtf16Decode = (bytes, littleEndian, ignoreBOM) => {
+  let start = 0;
+  let swap = littleEndian;
+  if (!ignoreBOM && bytes.length >= 2) {
+    if (bytes[0] === 0xff && bytes[1] === 0xfe) { swap = true; start = 2; }
+    else if (bytes[0] === 0xfe && bytes[1] === 0xff) { swap = false; start = 2; }
+  }
+  let text = '';
+  for (let index = start; index + 1 < bytes.length; index += 2) {
+    const code = swap ? bytes[index] | (bytes[index + 1] << 8) : (bytes[index] << 8) | bytes[index + 1];
+    text += String.fromCharCode(code);
+  }
+  const consumed = bytes.length - ((bytes.length - start) & 1);
+  return { text, remainder: bytes.slice(consumed) };
+};
+// https://encoding.spec.whatwg.org/#windows-1252
+const __tbWindows1252 = bytes => {
+  const table = '\u20ac\u0081\u201a\u0192\u201e\u2026\u2020\u2021\u02c6\u2030\u0160\u2039\u0152\u008d\u017d\u008f\u0090\u2018\u2019\u201c\u201d\u2022\u2013\u2014\u02dc\u2122\u0161\u203a\u0153\u009d\u017e\u0178';
+  let text = '';
+  for (const byte of bytes) {
+    text += byte >= 0x80 && byte <= 0x9f ? table[byte - 0x80] : String.fromCharCode(byte);
+  }
+  return text;
+};
+const __tbEncoding = label => {
+  label = String(label).trim().toLowerCase();
+  if (label === 'utf-8' || label === 'utf8' || label === 'unicode-1-1-utf-8') return 'utf-8';
+  if (label === 'utf-16' || label === 'utf-16le') return 'utf-16le';
+  if (label === 'utf-16be') return 'utf-16be';
+  if (label === 'windows-1252' || label === 'cp1252' || label === 'x-cp1252') return 'windows-1252';
+  return null;
+};
+const __tbDecodeBytes = (bytes, encoding, fatal, ignoreBOM) => {
+  if (encoding === 'utf-16le' || encoding === 'utf-16be') {
+    return __tbUtf16Decode(bytes, encoding === 'utf-16le', ignoreBOM).text;
+  }
+  if (encoding === 'windows-1252') return __tbWindows1252(bytes);
+  const decoded = __tbUtf8Decode(bytes, fatal, ignoreBOM);
+  return decoded.text + (decoded.remainder.length ? '\ufffd' : '');
+};
+// https://w3c.github.io/FileAPI/#convert-line-endings-to-native: LF is the
+// native line ending on this platform, so CR and CRLF collapse to LF.
+const __tbNativeEndings = value => String(value).replace(/\r\n?|\n/g, '\n');
+// https://webidl.spec.whatwg.org/#Clamp: round to the nearest integer with
+// ties going to the even integer.
+const __tbClampRound = value => {
+  value = Number(value);
+  if (Number.isNaN(value) || value === 0) return 0;
+  if (value === Infinity) return Number.MAX_SAFE_INTEGER;
+  if (value === -Infinity) return Number.MIN_SAFE_INTEGER;
+  const floor = Math.floor(value);
+  const fraction = value - floor;
+  if (fraction < 0.5) return floor;
+  if (fraction > 0.5) return floor + 1;
+  return floor % 2 === 0 ? floor : floor + 1;
+};
+globalThis.TextEncoder = class TextEncoder {
+  constructor() {
+    Object.defineProperty(this, 'encoding', { value: 'utf-8', enumerable: true, configurable: true });
+  }
+  encode(input) {
+    return __tbUtf8Encode(input === undefined ? '' : input);
+  }
+  encodeInto(source, destination) {
+    if (!ArrayBuffer.isView(destination) || destination instanceof DataView) {
+      throw new TypeError('The destination argument must be a Uint8Array');
+    }
+    const bytes = __tbUtf8Encode(source === undefined ? '' : source);
+    const written = Math.min(bytes.length, destination.length);
+    destination.set(bytes.subarray(0, written));
+    return { read: String(source === undefined ? '' : source).length, written };
+  }
+};
+Object.defineProperty(globalThis.TextEncoder.prototype, Symbol.toStringTag, { value: 'TextEncoder', writable: false, enumerable: false, configurable: true });
+globalThis.TextDecoder = class TextDecoder {
+  constructor(label, options) {
+    const optionsObject = options === undefined ? {} : Object(options);
+    const encoding = label === undefined ? 'utf-8' : __tbEncoding(String(label));
+    if (encoding === null) throw new RangeError('The encoding label is not supported');
+    Object.defineProperty(this, __tbDecoderData, {
+      value: {
+        encoding,
+        fatal: optionsObject.fatal !== undefined && Boolean(optionsObject.fatal),
+        ignoreBOM: optionsObject.ignoreBOM !== undefined && Boolean(optionsObject.ignoreBOM),
+        pending: new Uint8Array(0),
+      },
+      writable: false, enumerable: false, configurable: false,
+    });
+  }
+  get encoding() { return __tbBrand(this, __tbDecoderData).encoding; }
+  get fatal() { return __tbBrand(this, __tbDecoderData).fatal; }
+  get ignoreBOM() { return __tbBrand(this, __tbDecoderData).ignoreBOM; }
+  decode(input, options) {
+    const data = __tbBrand(this, __tbDecoderData);
+    if (input !== undefined && input !== null) {
+      let bytes;
+      if (ArrayBuffer.isView(input)) bytes = new Uint8Array(input.buffer, input.byteOffset, input.byteLength);
+      else if (input instanceof ArrayBuffer) bytes = new Uint8Array(input);
+      else throw new TypeError('The input argument must be an ArrayBuffer or ArrayBufferView');
+      if (bytes.length > 0) {
+        const combined = new Uint8Array(data.pending.length + bytes.length);
+        combined.set(data.pending);
+        combined.set(bytes, data.pending.length);
+        data.pending = combined;
+      }
+    }
+    const stream = options !== undefined && options.stream === true;
+    let text;
+    if (data.encoding === 'utf-8') {
+      const decoded = __tbUtf8Decode(data.pending, data.fatal, data.ignoreBOM);
+      data.pending = stream ? decoded.remainder : new Uint8Array(0);
+      text = decoded.text + (!stream && decoded.remainder.length ? '\ufffd' : '');
+    } else if (data.encoding === 'windows-1252') {
+      text = __tbWindows1252(data.pending);
+      data.pending = new Uint8Array(0);
+    } else {
+      const decoded = __tbUtf16Decode(data.pending, data.encoding === 'utf-16le', data.ignoreBOM);
+      data.pending = stream ? decoded.remainder : new Uint8Array(0);
+      text = decoded.text;
+    }
+    return text;
+  }
+};
+Object.defineProperty(globalThis.TextDecoder.prototype, Symbol.toStringTag, { value: 'TextDecoder', writable: false, enumerable: false, configurable: true });
+// https://html.spec.whatwg.org/multipage/webappapis.html#atob
+const __tbBase64Table = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+const __tbBase64Encode = bytes => {
+  let text = '';
+  for (let index = 0; index < bytes.length; index += 3) {
+    const first = bytes[index];
+    const second = index + 1 < bytes.length ? bytes[index + 1] : null;
+    const third = index + 2 < bytes.length ? bytes[index + 2] : null;
+    text += __tbBase64Table[first >> 2];
+    text += __tbBase64Table[((first & 3) << 4) | (second === null ? 0 : second >> 4)];
+    text += second === null ? '=' : __tbBase64Table[((second & 15) << 2) | (third === null ? 0 : third >> 6)];
+    text += third === null ? '=' : __tbBase64Table[third & 63];
+  }
+  return text;
+};
+globalThis.btoa = function(input) {
+  input = String(input);
+  for (let index = 0; index < input.length; index++) {
+    if (input.charCodeAt(index) > 0xff) {
+      throw new DOMException('The string to be encoded contains characters outside of the Latin1 range.', 'InvalidCharacterError');
+    }
+  }
+  const bytes = new Uint8Array(input.length);
+  for (let index = 0; index < input.length; index++) bytes[index] = input.charCodeAt(index);
+  return __tbBase64Encode(bytes);
+};
+globalThis.atob = function(input) {
+  const cleaned = String(input).replace(/[\t\n\f\r ]/g, '');
+  let body = cleaned;
+  if (body.endsWith('==')) body = body.slice(0, -2);
+  else if (body.endsWith('=')) body = body.slice(0, -1);
+  if (/[^A-Za-z0-9+/]/.test(body) || body.length % 4 === 1) {
+    throw new DOMException('The string to be decoded is not correctly encoded.', 'InvalidCharacterError');
+  }
+  let text = '';
+  let buffer = 0;
+  let bits = 0;
+  for (const character of body) {
+    buffer = (buffer << 6) | __tbBase64Table.indexOf(character);
+    bits += 6;
+    if (bits >= 8) {
+      bits -= 8;
+      text += String.fromCharCode((buffer >> bits) & 0xff);
+    }
+  }
+  return text;
+};
+// A ReadableStream with a synchronous chunk queue: enough for Blob.stream()
+// and other producers that push all their chunks up front.
+const __tbStreamBrand = value => __tbBrand(value, __tbStreamData);
+globalThis.ReadableStream = class ReadableStream {
+  constructor(source, strategy) {
+    const sourceObject = source === undefined ? {} : Object(source);
+    const data = {
+      chunks: [], closed: false, errored: null, canceled: false, reader: null,
+      pull: typeof sourceObject.pull === 'function' ? sourceObject.pull : null,
+      cancel: typeof sourceObject.cancel === 'function' ? sourceObject.cancel : null,
+      controller: null,
+    };
+    Object.defineProperty(this, __tbStreamData, { value: data, writable: false, enumerable: false, configurable: false });
+    data.controller = {
+      enqueue(chunk) { if (!data.closed && data.errored === null && !data.canceled) data.chunks.push(chunk); },
+      close() { data.closed = true; },
+      error(error) { data.errored = error; },
+      get desiredSize() { return data.closed ? null : 1; },
+    };
+    if (typeof sourceObject.start === 'function') sourceObject.start(data.controller);
+  }
+  get locked() { return __tbStreamBrand(this).reader !== null; }
+  getReader() {
+    const data = __tbStreamBrand(this);
+    if (data.reader !== null) throw new TypeError('The stream is locked to a reader');
+    const reader = {
+      read: () => {
+        const step = () => {
+          if (data.errored !== null) return Promise.reject(data.errored);
+          if (data.chunks.length > 0) return Promise.resolve({ value: data.chunks.shift(), done: false });
+          if (data.closed || data.canceled) return Promise.resolve({ value: undefined, done: true });
+          if (data.pull !== null) return Promise.resolve(data.pull(data.controller)).then(step);
+          return Promise.resolve({ value: undefined, done: true });
+        };
+        return step();
+      },
+      cancel: reason => this.cancel(reason),
+      releaseLock: () => { data.reader = null; },
+      closed: Promise.resolve(),
+    };
+    data.reader = reader;
+    return reader;
+  }
+  cancel(reason) {
+    const data = __tbStreamBrand(this);
+    data.canceled = true;
+    if (data.cancel !== null) return Promise.resolve(data.cancel(reason));
+    return Promise.resolve();
+  }
+};
+Object.defineProperty(globalThis.ReadableStream.prototype, Symbol.toStringTag, { value: 'ReadableStream', writable: false, enumerable: false, configurable: true });
+// https://xhr.spec.whatwg.org/#interface-progressevent
+globalThis.ProgressEvent = class ProgressEvent extends Event {
+  constructor(type, init) {
+    const eventInit = init === undefined ? {} : Object(init);
+    super(String(type), eventInit);
+    Object.defineProperty(this, __tbProgressData, {
+      value: {
+        lengthComputable: eventInit.lengthComputable === undefined ? false : Boolean(eventInit.lengthComputable),
+        loaded: eventInit.loaded === undefined ? 0 : Number(eventInit.loaded),
+        total: eventInit.total === undefined ? 0 : Number(eventInit.total),
+      },
+      writable: false, enumerable: false, configurable: false,
+    });
+  }
+  get lengthComputable() { return __tbBrand(this, __tbProgressData).lengthComputable; }
+  get loaded() { return __tbBrand(this, __tbProgressData).loaded; }
+  get total() { return __tbBrand(this, __tbProgressData).total; }
+};
+Object.defineProperty(globalThis.ProgressEvent.prototype, Symbol.toStringTag, { value: 'ProgressEvent', writable: false, enumerable: false, configurable: true });
 globalThis.Blob = class Blob {
   constructor(blobParts, options) {
     const parts = blobParts === undefined ? [] : blobParts;
-    const contents = Array.from(parts, part =>
-      part instanceof Blob ? __tbBlobData.get(part).contents : String(part)
-    ).join('');
-    let type = options && options.type !== undefined ? String(options.type) : '';
+    // Web IDL: a sequence argument must be an object and iterable, and its
+    // elements convert left to right before the options dictionary is read
+    // (<https://webidl.spec.whatwg.org/#es-sequence>). Platform objects that
+    // support indexed properties convert through `length` and the index
+    // getters instead of @@iterator.
+    if (parts === null || (typeof parts !== 'object' && typeof parts !== 'function')) {
+      throw new TypeError('The blobParts argument must be a sequence');
+    }
+    const iteratorMethod = parts[Symbol.iterator];
+    const converted = [];
+    const convertPart = part => {
+      const fromBlob = part !== null && typeof part === 'object' ? part[__tbBlobData] : undefined;
+      if (fromBlob !== undefined) {
+        converted.push(fromBlob.bytes);
+      } else if (part instanceof ArrayBuffer || (typeof SharedArrayBuffer !== 'undefined' && part instanceof SharedArrayBuffer)) {
+        converted.push(new Uint8Array(part).slice());
+      } else if (ArrayBuffer.isView(part)) {
+        converted.push(new Uint8Array(part.buffer, part.byteOffset, part.byteLength).slice());
+      } else {
+        converted.push(String(part));
+      }
+    };
+    if (iteratorMethod !== undefined && iteratorMethod !== null) {
+      if (typeof iteratorMethod !== 'function') {
+        throw new TypeError('The blobParts argument must be iterable');
+      }
+      const iterator = iteratorMethod.call(parts);
+      while (true) {
+        const step = iterator.next();
+        if (step.done) break;
+        convertPart(step.value);
+      }
+    } else if (typeof parts.item === 'function' && typeof parts.length === 'number') {
+      const length = Number(parts.length);
+      for (let index = 0; index < length; index++) convertPart(parts[index]);
+    } else {
+      throw new TypeError('The blobParts argument must be iterable');
+    }
+    let endings = 'transparent';
+    let type = '';
+    if (options !== undefined && options !== null) {
+      if (typeof options !== 'object' && typeof options !== 'function') {
+        throw new TypeError('The options argument must be a property bag');
+      }
+      // Dictionary members are read in lexicographic order
+      // (<https://webidl.spec.whatwg.org/#es-dictionary>).
+      if (options.endings !== undefined) {
+        endings = String(options.endings);
+        if (endings !== 'transparent' && endings !== 'native') {
+          throw new TypeError('The endings option must be transparent or native');
+        }
+      }
+      if (options.type !== undefined) type = String(options.type);
+    }
     if ([...type].some(character => character < ' ' || character > '~')) type = '';
-    __tbBlobData.set(this, { contents, type: type.toLowerCase() });
+    const chunks = converted.map(part => typeof part === 'string'
+      ? __tbUtf8Encode(endings === 'native' ? __tbNativeEndings(part) : part)
+      : part);
+    let length = 0;
+    for (const chunk of chunks) length += chunk.length;
+    const bytes = new Uint8Array(length);
+    let offset = 0;
+    for (const chunk of chunks) {
+      bytes.set(chunk, offset);
+      offset += chunk.length;
+    }
+    Object.defineProperty(this, __tbBlobData, {
+      value: { bytes, type: type.toLowerCase() },
+      writable: false, enumerable: false, configurable: false,
+    });
   }
-  get size() { return __tbUtf8Length(__tbBlobData.get(this).contents); }
-  get type() { return __tbBlobData.get(this).type; }
-  text() { return Promise.resolve(__tbBlobData.get(this).contents); }
+  get size() { return __tbBrand(this, __tbBlobData).bytes.length; }
+  get type() { return __tbBrand(this, __tbBlobData).type; }
+  // https://w3c.github.io/FileAPI/#dom-blob-text
+  text() {
+    const bytes = __tbBrand(this, __tbBlobData).bytes;
+    return Promise.resolve(__tbUtf8Decode(bytes, false, false).text);
+  }
+  // https://w3c.github.io/FileAPI/#dom-blob-arraybuffer
+  arrayBuffer() {
+    const bytes = __tbBrand(this, __tbBlobData).bytes;
+    return Promise.resolve(bytes.slice().buffer);
+  }
+  // https://w3c.github.io/FileAPI/#dom-blob-bytes
+  bytes() {
+    const bytes = __tbBrand(this, __tbBlobData).bytes;
+    return Promise.resolve(bytes.slice());
+  }
+  // https://w3c.github.io/FileAPI/#dom-blob-slice
   slice(start, end, contentType) {
-    const contents = __tbBlobData.get(this).contents;
-    const size = contents.length;
-    start = start === undefined ? 0 : Number(start);
-    end = end === undefined ? size : Number(end);
-    const relativeStart = start < 0 ? Math.max(size + start, 0) : Math.min(start, size);
-    const relativeEnd = end < 0 ? Math.max(size + end, 0) : Math.min(end, size);
-    return new Blob([contents.slice(relativeStart, Math.max(relativeStart, relativeEnd))],
-      { type: contentType === undefined ? '' : contentType });
+    const data = __tbBrand(this, __tbBlobData);
+    const size = data.bytes.length;
+    const hasStart = arguments.length > 0 && start !== undefined;
+    const hasEnd = arguments.length > 1 && end !== undefined;
+    const hasContentType = arguments.length > 2 && contentType !== undefined;
+    let relativeStart = 0;
+    if (hasStart) {
+      relativeStart = __tbClampRound(start);
+      relativeStart = relativeStart < 0 ? Math.max(size + relativeStart, 0) : Math.min(relativeStart, size);
+    }
+    let relativeEnd = size;
+    if (hasEnd) {
+      relativeEnd = __tbClampRound(end);
+      relativeEnd = relativeEnd < 0 ? Math.max(size + relativeEnd, 0) : Math.min(relativeEnd, size);
+    }
+    const span = Math.max(relativeEnd - relativeStart, 0);
+    let type = '';
+    if (hasContentType) {
+      type = String(contentType);
+      if ([...type].some(character => character < ' ' || character > '~')) type = '';
+    }
+    return new Blob([data.bytes.subarray(relativeStart, relativeStart + span)], { type });
+  }
+  // https://w3c.github.io/FileAPI/#dom-blob-stream
+  stream() {
+    const bytes = __tbBrand(this, __tbBlobData).bytes.slice();
+    return new ReadableStream({
+      start(controller) {
+        if (bytes.length > 0) controller.enqueue(bytes);
+        controller.close();
+      },
+    });
+  }
+  // https://w3c.github.io/FileAPI/#dom-blob-textstream
+  textStream() {
+    const text = __tbUtf8Decode(__tbBrand(this, __tbBlobData).bytes, false, false).text;
+    return new ReadableStream({
+      start(controller) {
+        if (text.length > 0) controller.enqueue(text);
+        controller.close();
+      },
+    });
   }
 };
+Object.defineProperty(globalThis.Blob.prototype, Symbol.toStringTag, { value: 'Blob', writable: false, enumerable: false, configurable: true });
+// Web IDL constructor objects: `length` is the number of required arguments
+// (<https://webidl.spec.whatwg.org/#es-interface>).
+Object.defineProperty(globalThis.Blob, 'length', { value: 0, writable: false, enumerable: false, configurable: true });
+// https://w3c.github.io/FileAPI/#file-section
+globalThis.File = class File extends Blob {
+  constructor(fileBits, fileName, options) {
+    if (arguments.length < 2) throw new TypeError('The File constructor requires 2 arguments');
+    super(fileBits, options);
+    let lastModified = Date.now();
+    if (options !== undefined && options !== null && options.lastModified !== undefined) {
+      // A long long: ToInt64 maps NaN and infinities to 0
+      // (<https://webidl.spec.whatwg.org/#abstract-opdef-converttoint>).
+      lastModified = Number(options.lastModified);
+      lastModified = Number.isFinite(lastModified) ? Math.trunc(lastModified) : 0;
+    }
+    Object.defineProperty(this, __tbFileData, {
+      value: { name: String(fileName), lastModified },
+      writable: false, enumerable: false, configurable: false,
+    });
+  }
+  get name() { return __tbBrand(this, __tbFileData).name; }
+  get lastModified() { return __tbBrand(this, __tbFileData).lastModified; }
+  get webkitRelativePath() { __tbBrand(this, __tbFileData); return ''; }
+};
+Object.defineProperty(globalThis.File.prototype, Symbol.toStringTag, { value: 'File', writable: false, enumerable: false, configurable: true });
+Object.defineProperty(globalThis.File, 'length', { value: 2, writable: false, enumerable: false, configurable: true });
+// https://w3c.github.io/FileAPI/#filelist-section
+globalThis.FileList = class FileList {
+  constructor() { throw new TypeError('Illegal constructor'); }
+  get length() { return __tbBrand(this, __tbFileListData).files.length; }
+  item(index) {
+    const files = __tbBrand(this, __tbFileListData).files;
+    index = Number(index);
+    return index >= 0 && index < files.length ? files[index] : null;
+  }
+  [Symbol.iterator]() {
+    return __tbBrand(this, __tbFileListData).files[Symbol.iterator]();
+  }
+};
+Object.defineProperty(globalThis.FileList.prototype, Symbol.toStringTag, { value: 'FileList', writable: false, enumerable: false, configurable: true });
+globalThis.__tbCreateFileList = files => {
+  const list = Object.create(globalThis.FileList.prototype);
+  Object.defineProperty(list, __tbFileListData, {
+    value: { files: Array.from(files) },
+    writable: false, enumerable: false, configurable: false,
+  });
+  return list;
+};
+// https://w3c.github.io/FileAPI/#APIASynch
+globalThis.FileReader = class FileReader extends EventTarget {
+  constructor() {
+    super();
+    Object.defineProperty(this, __tbReaderData, {
+      value: { state: 0, result: null, error: null, generation: 0, handlers: {} },
+      writable: false, enumerable: false, configurable: false,
+    });
+  }
+  get readyState() { return __tbBrand(this, __tbReaderData).state; }
+  get result() { return __tbBrand(this, __tbReaderData).result; }
+  get error() { return __tbBrand(this, __tbReaderData).error; }
+  // https://w3c.github.io/FileAPI/#dfn-abort
+  abort() {
+    const data = __tbBrand(this, __tbReaderData);
+    if (data.state !== 1) return;
+    data.state = 2;
+    data.result = null;
+    const generation = ++data.generation;
+    this.dispatchEvent(new ProgressEvent('abort'));
+    // A read started by the abort handler suppresses the old loadend
+    // (<https://w3c.github.io/FileAPI/#fileReaderAbort>).
+    if (data.generation === generation) {
+      this.dispatchEvent(new ProgressEvent('loadend'));
+    }
+  }
+  readAsText(blob, encoding) { __tbFileReaderRead(this, blob, 'text', encoding); }
+  readAsArrayBuffer(blob) { __tbFileReaderRead(this, blob, 'arraybuffer', undefined); }
+  readAsDataURL(blob) { __tbFileReaderRead(this, blob, 'dataurl', undefined); }
+  readAsBinaryString(blob) { __tbFileReaderRead(this, blob, 'binarystring', undefined); }
+};
+for (const [name, value] of [['EMPTY', 0], ['LOADING', 1], ['DONE', 2]]) {
+  for (const target of [globalThis.FileReader, globalThis.FileReader.prototype]) {
+    Object.defineProperty(target, name, { value, writable: false, enumerable: true, configurable: false });
+  }
+}
+for (const name of ['onloadstart', 'onprogress', 'onload', 'onabort', 'onerror', 'onloadend']) {
+  Object.defineProperty(globalThis.FileReader.prototype, name, {
+    get() {
+      const handler = __tbBrand(this, __tbReaderData).handlers[name];
+      return handler === undefined ? null : handler;
+    },
+    set(value) { __tbBrand(this, __tbReaderData).handlers[name] = value; },
+    enumerable: true, configurable: true,
+  });
+}
+const __tbSniffBOM = bytes => {
+  if (bytes.length >= 3 && bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf) return 'utf-8';
+  if (bytes.length >= 2 && bytes[0] === 0xfe && bytes[1] === 0xff) return 'utf-16be';
+  if (bytes.length >= 2 && bytes[0] === 0xff && bytes[1] === 0xfe) return 'utf-16le';
+  return null;
+};
+const __tbFileReaderRead = (reader, blob, kind, argument) => {
+  const data = __tbBrand(reader, __tbReaderData);
+  if (data.state === 1) {
+    throw new DOMException('The FileReader is already reading.', 'InvalidStateError');
+  }
+  const source = __tbBrand(blob, __tbBlobData);
+  data.state = 1;
+  data.result = null;
+  data.error = null;
+  const generation = ++data.generation;
+  const total = source.bytes.length;
+  const fire = (type, loaded, lengthComputable) => reader.dispatchEvent(new ProgressEvent(type, {
+    lengthComputable, loaded, total,
+  }));
+  const stale = () => data.generation !== generation;
+  // Every event runs in its own task, so awaiting tests observe the order the
+  // spec queues and abort() can land between steps
+  // (<https://w3c.github.io/FileAPI/#readOperation>).
+  setTimeout(function() {
+    if (stale()) return;
+    fire('loadstart', 0, true);
+    setTimeout(function() {
+      if (stale()) return;
+      if (total > 0) fire('progress', total, true);
+      setTimeout(function() {
+        if (stale()) return;
+        let result = null;
+        let error = null;
+        try {
+          if (kind === 'text') {
+            // Encoding: explicit argument, else the blob type's charset, else
+            // UTF-8; a BOM overrides (<https://w3c.github.io/FileAPI/#readAsDataText>).
+            let encoding;
+            if (argument !== undefined) {
+              const label = __tbEncoding(String(argument));
+              if (label !== null) encoding = label;
+            }
+            if (encoding === undefined) {
+              const charset = /charset=['\u0022]?([^;\u0022\s]+)/i.exec(source.type);
+              if (charset) {
+                const label = __tbEncoding(charset[1]);
+                if (label !== null) encoding = label;
+              }
+            }
+            if (encoding === undefined) encoding = 'utf-8';
+            const bom = __tbSniffBOM(source.bytes);
+            result = __tbDecodeBytes(source.bytes, bom === null ? encoding : bom, false, false);
+          } else if (kind === 'dataurl') {
+            const type = source.type === '' ? 'application/octet-stream' : source.type;
+            result = 'data:' + type + ';base64,' + __tbBase64Encode(source.bytes);
+          } else if (kind === 'arraybuffer') {
+            result = source.bytes.slice().buffer;
+          } else {
+            result = '';
+            for (let index = 0; index < source.bytes.length; index++) {
+              result += String.fromCharCode(source.bytes[index]);
+            }
+          }
+        } catch (exception) {
+          error = exception;
+        }
+        if (stale()) return;
+        data.state = 2;
+        if (error !== null) {
+          data.error = error;
+          fire('error', 0, false);
+        } else {
+          data.result = result;
+          fire('load', total, true);
+        }
+        setTimeout(function() {
+          if (stale()) return;
+          fire('loadend', total, true);
+        }, 0);
+      }, 0);
+    }, 0);
+  }, 0);
+};
+Object.defineProperty(globalThis.FileReader.prototype, Symbol.toStringTag, { value: 'FileReader', writable: false, enumerable: false, configurable: true });
 // https://w3c.github.io/FileAPI/#dfn-createObjectURL
 globalThis.URL = class URL {
   constructor(input, base) {
@@ -157,8 +771,8 @@ globalThis.URL = class URL {
   get searchParams() { return this._searchParams; }
 };
 globalThis.URL.createObjectURL = function(blob) {
-  if (!(blob instanceof Blob)) throw new TypeError('value is not a Blob');
-  const url = globalThis.__tbCreateObjectURL(__tbBlobData.get(blob).contents);
+  const data = __tbBrand(blob, __tbBlobData, 'value is not a Blob');
+  const url = globalThis.__tbCreateObjectURL(__tbUtf8Decode(data.bytes, false, true).text);
   if (url == null) throw new RangeError('object URL budget exceeded');
   return url;
 };
