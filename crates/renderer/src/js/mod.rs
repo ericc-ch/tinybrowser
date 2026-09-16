@@ -1232,6 +1232,212 @@ globalThis.__tbMakeStyle = element => {
     }
   });
 };
+// https://html.spec.whatwg.org/multipage/webmessaging.html#messageevent
+const __tbMessageEventData = Symbol.for('tinybrowser.messageevent.data');
+globalThis.MessageEvent = class MessageEvent extends Event {
+  constructor(type, init) {
+    const eventInit = init === undefined ? {} : Object(init);
+    super(String(type), eventInit);
+    Object.defineProperty(this, __tbMessageEventData, {
+      value: {
+        data: eventInit.data === undefined ? null : eventInit.data,
+        origin: eventInit.origin === undefined ? '' : String(eventInit.origin),
+        lastEventId: eventInit.lastEventId === undefined ? '' : String(eventInit.lastEventId),
+        source: eventInit.source === undefined ? null : eventInit.source,
+        ports: eventInit.ports === undefined ? Object.freeze([]) : Object.freeze(Array.from(eventInit.ports)),
+      },
+      writable: false, enumerable: false, configurable: false,
+    });
+  }
+  get data() { return __tbBrand(this, __tbMessageEventData).data; }
+  get origin() { return __tbBrand(this, __tbMessageEventData).origin; }
+  get lastEventId() { return __tbBrand(this, __tbMessageEventData).lastEventId; }
+  get source() { return __tbBrand(this, __tbMessageEventData).source; }
+  get ports() { return __tbBrand(this, __tbMessageEventData).ports; }
+};
+Object.defineProperty(globalThis.MessageEvent.prototype, Symbol.toStringTag, { value: 'MessageEvent', writable: false, enumerable: false, configurable: true });
+// https://html.spec.whatwg.org/multipage/structured-data.html#structuredserializeinternal
+// A same-realm structured clone. Cross-thread workers will move this seam to
+// Rust; every messaging API already routes through it.
+const __tbTransferList = transfer => {
+  if (transfer === undefined || transfer === null) return [];
+  if (Array.isArray(transfer)) return transfer;
+  if (typeof transfer === 'object' && transfer.transfer !== undefined) return Array.from(transfer.transfer);
+  return Array.from(transfer);
+};
+const __tbStructuredClone = (value, transfer, sourcePort) => {
+  const buffers = new Map();
+  const ports = new Map();
+  const portList = [];
+  for (const item of __tbTransferList(transfer)) {
+    if (item instanceof ArrayBuffer) {
+      if (buffers.has(item)) throw new DOMException('Transfer list contains duplicate buffers', 'DataCloneError');
+      if (typeof item.transfer !== 'function') throw new DOMException('The buffer is not transferable', 'DataCloneError');
+      buffers.set(item, item.transfer());
+    } else if (item instanceof globalThis.MessagePort) {
+      if (item === sourcePort) {
+        throw new DOMException('Cannot transfer the source port', 'DataCloneError');
+      }
+      const itemData = __tbBrand(item, __tbPortData);
+      if (itemData.closed) throw new DOMException('Cannot transfer a detached MessagePort', 'DataCloneError');
+      if (ports.has(item)) throw new DOMException('Transfer list contains duplicate ports', 'DataCloneError');
+      const moved = __tbNewPort();
+      const movedData = __tbBrand(moved, __tbPortData);
+      movedData.peer = itemData.peer;
+      if (movedData.peer !== null) __tbBrand(movedData.peer, __tbPortData).peer = moved;
+      // The message queue moves with the port identity; the new port starts
+      // disabled and flushes when enabled
+      // (<https://html.spec.whatwg.org/multipage/webmessaging.html#message-ports>).
+      movedData.pending = itemData.pending;
+      itemData.pending = [];
+      itemData.peer = null;
+      itemData.closed = true;
+      itemData.started = false;
+      ports.set(item, moved);
+      portList.push(moved);
+    } else {
+      throw new DOMException('Value not transferable', 'DataCloneError');
+    }
+  }
+  const seen = new Map();
+  const clone = input => {
+    if (input === null || input === undefined) return input;
+    const kind = typeof input;
+    if (kind === 'function' || kind === 'symbol') {
+      throw new DOMException('The object could not be cloned.', 'DataCloneError');
+    }
+    if (kind !== 'object') return input;
+    if (buffers.has(input)) return buffers.get(input);
+    if (ports.has(input)) return ports.get(input);
+    if (seen.has(input)) return seen.get(input);
+    if (input === globalThis || input === globalThis.window) {
+      throw new DOMException('The object could not be cloned.', 'DataCloneError');
+    }
+    if (input instanceof ArrayBuffer) return input.slice(0);
+    if (typeof SharedArrayBuffer !== 'undefined' && input instanceof SharedArrayBuffer) return input;
+    if (ArrayBuffer.isView(input)) {
+      if (input instanceof DataView) {
+        return new DataView(clone(input.buffer), input.byteOffset, input.byteLength);
+      }
+      return new input.constructor(clone(input.buffer), input.byteOffset, input.length);
+    }
+    if (input instanceof Blob) {
+      const blob = input[__tbBlobData];
+      if (input instanceof globalThis.File) {
+        const file = input[__tbFileData];
+        return new globalThis.File([blob.bytes], file.name, { type: blob.type, lastModified: file.lastModified });
+      }
+      return new Blob([blob.bytes], { type: blob.type });
+    }
+    if (input instanceof Date) return new Date(input.getTime());
+    if (input instanceof RegExp) return new RegExp(input.source, input.flags);
+    if (input instanceof Error) {
+      const copy = new Error(input.message);
+      copy.name = input.name;
+      return copy;
+    }
+    if (input instanceof Map) {
+      const copy = new Map();
+      seen.set(input, copy);
+      for (const [key, entry] of input) copy.set(clone(key), clone(entry));
+      return copy;
+    }
+    if (input instanceof Set) {
+      const copy = new Set();
+      seen.set(input, copy);
+      for (const entry of input) copy.add(clone(entry));
+      return copy;
+    }
+    // Anything left with a platform @@toStringTag is a host object (nodes,
+    // URL, events, ...) and is not serializable
+    // (<https://html.spec.whatwg.org/multipage/structured-data.html#structuredserializeinternal>).
+    if (Object.prototype.toString.call(input) !== '[object Object]') {
+      throw new DOMException('The object could not be cloned.', 'DataCloneError');
+    }
+    const copy = Array.isArray(input) ? [] : {};
+    seen.set(input, copy);
+    for (const key of Object.keys(input)) copy[key] = clone(input[key]);
+    return copy;
+  };
+  return { data: clone(value), ports: portList };
+};
+// https://html.spec.whatwg.org/multipage/structured-data.html#dom-structuredclone
+globalThis.structuredClone = function(value, options) {
+  const transfer = options === undefined || options === null ? undefined : options.transfer;
+  return __tbStructuredClone(value, transfer, null).data;
+};
+// https://html.spec.whatwg.org/multipage/webmessaging.html#messageport
+const __tbPortData = Symbol.for('tinybrowser.messageport.data');
+const __tbNewPort = () => {
+  // Construct through the host EventTarget so the port carries the listener
+  // storage its addEventListener/dispatchEvent require.
+  const port = Reflect.construct(globalThis.EventTarget, [], globalThis.MessagePort);
+  Object.defineProperty(port, __tbPortData, {
+    value: { peer: null, started: false, closed: false, onmessage: null, onmessageerror: null, pending: [] },
+    writable: false, enumerable: false, configurable: false,
+  });
+  return port;
+};
+const __tbPortDeliver = (port, cloned) => {
+  const data = __tbBrand(port, __tbPortData);
+  if (data.closed || !data.started) return;
+  port.dispatchEvent(new globalThis.MessageEvent('message', { data: cloned.data, ports: cloned.ports }));
+};
+const __tbPortFlush = port => {
+  const data = __tbBrand(port, __tbPortData);
+  while (data.pending.length > 0) {
+    const cloned = data.pending.shift();
+    setTimeout(function() { __tbPortDeliver(port, cloned); }, 0);
+  }
+};
+const __tbPortEnqueue = (port, cloned) => {
+  const peer = __tbBrand(port, __tbPortData).peer;
+  if (peer === null) return;
+  const peerData = __tbBrand(peer, __tbPortData);
+  if (peerData.closed) return;
+  if (peerData.started) setTimeout(function() { __tbPortDeliver(peer, cloned); }, 0);
+  else peerData.pending.push(cloned);
+};
+globalThis.MessagePort = class MessagePort extends EventTarget {
+  constructor() { throw new TypeError('Illegal constructor'); }
+  postMessage(message, transfer) {
+    const data = __tbBrand(this, __tbPortData);
+    if (data.closed) return;
+    __tbPortEnqueue(this, __tbStructuredClone(message, transfer, this));
+  }
+  start() {
+    const data = __tbBrand(this, __tbPortData);
+    if (data.started) return;
+    data.started = true;
+    __tbPortFlush(this);
+  }
+  close() {
+    const data = __tbBrand(this, __tbPortData);
+    data.closed = true;
+    data.started = false;
+    data.pending.length = 0;
+  }
+  get onmessage() { return __tbBrand(this, __tbPortData).onmessage; }
+  set onmessage(value) {
+    __tbBrand(this, __tbPortData).onmessage = value;
+    if (value !== null && value !== undefined) this.start();
+  }
+  get onmessageerror() { return __tbBrand(this, __tbPortData).onmessageerror; }
+  set onmessageerror(value) { __tbBrand(this, __tbPortData).onmessageerror = value; }
+};
+Object.defineProperty(globalThis.MessagePort.prototype, Symbol.toStringTag, { value: 'MessagePort', writable: false, enumerable: false, configurable: true });
+// https://html.spec.whatwg.org/multipage/webmessaging.html#messagechannel
+globalThis.MessageChannel = class MessageChannel {
+  constructor() {
+    const port1 = __tbNewPort();
+    const port2 = __tbNewPort();
+    __tbBrand(port1, __tbPortData).peer = port2;
+    __tbBrand(port2, __tbPortData).peer = port1;
+    Object.defineProperty(this, 'port1', { value: port1, writable: false, enumerable: true, configurable: true });
+    Object.defineProperty(this, 'port2', { value: port2, writable: false, enumerable: true, configurable: true });
+  }
+};
+Object.defineProperty(globalThis.MessageChannel.prototype, Symbol.toStringTag, { value: 'MessageChannel', writable: false, enumerable: false, configurable: true });
 ";
 
 /// A value produced by script evaluation.
