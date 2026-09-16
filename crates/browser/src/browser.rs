@@ -64,7 +64,7 @@ enum Command {
     AddCookie {
         cookie: String,
         url: Url,
-        reply: oneshot::Sender<()>,
+        reply: oneshot::Sender<bool>,
     },
 }
 
@@ -239,12 +239,13 @@ impl BrowserHandle {
         rx.await.map_err(|_| BrowserError::Stopped)
     }
 
-    /// Stores one `Set-Cookie` line for `url`.
+    /// Stores one `Set-Cookie` line for `url` with HTTP-level rules,
+    /// returning whether the jar stored it.
     ///
     /// # Errors
     ///
     /// [`BrowserError::Stopped`] when the browser task has stopped.
-    pub async fn add_cookie(&self, cookie: &str, url: &Url) -> Result<(), BrowserError> {
+    pub async fn add_cookie(&self, cookie: &str, url: &Url) -> Result<bool, BrowserError> {
         let (reply, rx) = oneshot::channel();
         self.send(Command::AddCookie {
             cookie: cookie.to_owned(),
@@ -335,8 +336,7 @@ async fn browser_loop(mut commands: mpsc::Receiver<Command>, mut state: BrowserS
                 let _result = reply.send(());
             }
             Command::AddCookie { cookie, url, reply } => {
-                state.network.add_cookie(&cookie, &url);
-                let _result = reply.send(());
+                let _result = reply.send(state.network.add_cookie(&cookie, &url));
             }
             Command::Close { reply } => {
                 state.live = false;

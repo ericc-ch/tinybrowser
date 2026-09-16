@@ -16,7 +16,9 @@ use axum::body::Bytes;
 use axum::extract::State;
 use axum::http::{Method, StatusCode, Uri};
 use axum::response::{IntoResponse, Json, Response};
-use browser::{BrowserHandle, CookieRecord, CookieSameSite, RemoteValue, ScriptFailure, TabError, TabHandle};
+use browser::{
+    BrowserHandle, CookieRecord, CookieSameSite, RemoteValue, ScriptFailure, TabError, TabHandle,
+};
 use serde_json::{Value, json};
 use tokio::sync::Mutex;
 
@@ -87,9 +89,9 @@ struct Session {
     windows: HashMap<String, Window>,
     script_timeout: Duration,
     page_load_timeout: Duration,
-    /// CSS selector behind each element id returned by "Find Element".
-    elements: HashMap<String, String>,
-    next_element: u64,
+    /// Virtual window rectangle. The engine has no window system, so
+    /// `Set Window Rect` records the request and reports it back.
+    window_rect: [f64; 4],
 }
 
 struct Window {
@@ -123,8 +125,7 @@ impl Sessions {
                 windows: HashMap::from([(handle, window)]),
                 script_timeout: DEFAULT_SCRIPT_TIMEOUT,
                 page_load_timeout: DEFAULT_PAGE_LOAD_TIMEOUT,
-                elements: HashMap::new(),
-                next_element: 0,
+                window_rect: [0.0, 0.0, 800.0, 600.0],
             },
         );
         Ok(id)
@@ -163,18 +164,14 @@ async fn dispatch(method: &str, path: &str, body: &str, sessions: &mut Sessions)
         ("POST", ["session", session, "window"]) => switch_window(sessions, session, body),
         ("POST", ["session", session, "window", "new"]) => new_window(sessions, session).await,
         ("DELETE", ["session", session, "window"]) => close_window(sessions, session).await,
-        ("GET", ["session", _session, "window", "rect"]) => {
-            ok(window_rect())
-        }
-        ("POST", ["session", _session, "window", "rect"]) => {
-            ok(window_rect())
+        ("GET", ["session", session, "window", "rect"]) => window_rect(sessions, session),
+        ("POST", ["session", session, "window", "rect"]) => {
+            set_window_rect(sessions, session, body)
         }
         ("POST", ["session", session, "timeouts"]) => set_timeouts(sessions, session, body),
         ("GET", ["session", session, "timeouts"]) => get_timeouts(sessions, session),
         ("POST", ["session", session, "element"]) => find_element(sessions, session, body).await,
-        ("POST", ["session", session, "elements"]) => {
-            find_elements(sessions, session, body).await
-        }
+        ("POST", ["session", session, "elements"]) => find_elements(sessions, session, body).await,
         ("POST", ["session", session, "element", element, "click"]) => {
             element_click(sessions, session, element).await
         }
@@ -190,9 +187,11 @@ async fn dispatch(method: &str, path: &str, body: &str, sessions: &mut Sessions)
         }
         ("POST", ["session", session, "cookie"]) => add_cookie(sessions, session, body).await,
         ("DELETE", ["session", session, "cookie"]) => delete_cookies(sessions, session).await,
-        ("POST", ["session", _session, "window", "minimize"]) => ok(window_rect()),
-        ("POST", ["session", _session, "window", "maximize"]) => ok(window_rect()),
-        ("POST", ["session", _session, "window", "fullscreen"]) => ok(window_rect()),
+        ("POST", ["session", session, "window", op])
+            if matches!(*op, "minimize" | "maximize" | "fullscreen") =>
+        {
+            window_op(sessions, session)
+        }
         ("POST", ["session", _session, "actions"]) => {
             error(500, "unsupported operation", "actions")
         }
@@ -410,100 +409,105 @@ fn encode(value: &RemoteValue) -> Value {
     }
 }
 
-/// The shared body of "Find Element" and "Find Elements": parse a CSS
-/// selector, confirm something matches, and mint an element id for the first
-/// match.
-async fn find_match(
-    sessions: &mut Sessions,
+/// The shared body of "Find Element" and "Find Elements"
+/// (<https://w3c.github.io/webdriver/#find-elements>): validate the location
+/// strategy and return the engine id of every match.
+async fn find_matches(
+    sessions: &Sessions,
     session: &str,
     body: &str,
-) -> Result<Option<String>, (u16, Value)> {
-    let parsed: Value =
-        serde_json::from_str(body).map_err(|err| error(400, "invalid argument", &err.to_string()))?;
-    let using = parsed
-        .get("using")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    let selector = parsed
-        .get("value")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
+) -> Result<Vec<u64>, (u16, Value)> {
+    let parsed: Value = serde_json::from_str(body)
+        .map_err(|err| error(400, "invalid argument", &err.to_string()))?;
+    let Some(using) = parsed.get("using").and_then(Value::as_str) else {
+        return Err(error(400, "invalid argument", "using is required"));
+    };
+    let Some(selector) = parsed.get("value").and_then(Value::as_str) else {
+        return Err(error(400, "invalid argument", "value is required"));
+    };
     if using != "css selector" {
         return Err(error(
-            405,
-            "unsupported operation",
+            400,
+            "invalid argument",
             "only the css selector strategy is supported",
         ));
     }
     let Some(window) = current(sessions, session) else {
         return Err(error(404, "invalid session id", session));
     };
-    let script = format!("!!document.querySelector({})", json!(selector));
+    let script = format!(
+        "(function(){{try{{return Array.from(document.querySelectorAll({}))}}\
+         catch(e){{return 'invalid selector'}}}})()",
+        json!(selector)
+    );
     match window.tab.execute_script(&script).await {
-        Ok(RemoteValue::Bool(true)) => {
-            let Some(found) = sessions.open.get_mut(session) else {
-                return Err(error(404, "invalid session id", session));
-            };
-            found.next_element += 1;
-            let id = format!("e{}", found.next_element);
-            found.elements.insert(id.clone(), selector.to_owned());
-            Ok(Some(id))
-        }
-        Ok(_) => Ok(None),
+        Ok(RemoteValue::List(items)) => Ok(items
+            .into_iter()
+            .filter_map(|item| match item {
+                RemoteValue::Node(id) => Some(id),
+                _ => None,
+            })
+            .collect()),
+        Ok(RemoteValue::String(text)) if text == "invalid selector" => Err(error(
+            400,
+            "invalid selector",
+            "the selector is not a valid CSS selector",
+        )),
+        Ok(_) => Ok(Vec::new()),
         Err(err) => Err(error(500, "unknown error", &err.to_string())),
     }
 }
 
 /// `POST /session/{id}/element`: find the first element matching a CSS
 /// selector (<https://w3c.github.io/webdriver/#find-element>).
-async fn find_element(sessions: &mut Sessions, session: &str, body: &str) -> (u16, Value) {
-    match find_match(sessions, session, body).await {
-        Ok(Some(id)) => ok(json!({ ELEMENT_KEY: id })),
-        Ok(None) => error(404, "no such element", "no element matches the selector"),
+async fn find_element(sessions: &Sessions, session: &str, body: &str) -> (u16, Value) {
+    match find_matches(sessions, session, body).await {
+        Ok(matches) => match matches.first() {
+            Some(id) => ok(json!({ ELEMENT_KEY: id.to_string() })),
+            None => error(404, "no such element", "no element matches the selector"),
+        },
         Err(reply) => reply,
     }
 }
 
-/// `POST /session/{id}/elements`: the element list form
+/// `POST /session/{id}/elements`: every match
 /// (<https://w3c.github.io/webdriver/#find-elements>).
-///
-/// The element-id mapping only records the selector, so the list carries the
-/// first match; that is all any consumer in the harness uses.
-async fn find_elements(sessions: &mut Sessions, session: &str, body: &str) -> (u16, Value) {
-    match find_match(sessions, session, body).await {
-        Ok(Some(id)) => ok(json!([{ ELEMENT_KEY: id }])),
-        Ok(None) => ok(json!([])),
+async fn find_elements(sessions: &Sessions, session: &str, body: &str) -> (u16, Value) {
+    match find_matches(sessions, session, body).await {
+        Ok(matches) => ok(Value::Array(
+            matches
+                .iter()
+                .map(|id| json!({ ELEMENT_KEY: id.to_string() }))
+                .collect(),
+        )),
         Err(reply) => reply,
     }
 }
 
-/// The selector stored for an element id, or a `no such element` reply for an
-/// unknown or stale id.
-fn element_selector(sessions: &Sessions, session: &str, element: &str) -> Result<String, (u16, Value)> {
-    sessions
-        .open
-        .get(session)
-        .and_then(|found| found.elements.get(element))
-        .cloned()
-        .ok_or_else(|| error(404, "no such element", "unknown element id"))
+/// The engine-side id carried by a `WebDriver` element reference.
+fn element_remote(element: &str) -> Result<u64, (u16, Value)> {
+    element
+        .parse::<u64>()
+        .map_err(|_| error(404, "no such element", "unknown element id"))
 }
 
 /// `POST /session/{id}/element/{element id}/click`
 /// (<https://w3c.github.io/webdriver/#element-click>).
 async fn element_click(sessions: &Sessions, session: &str, element: &str) -> (u16, Value) {
-    let selector = match element_selector(sessions, session, element) {
-        Ok(selector) => selector,
-        Err(reply) => return reply,
-    };
     let Some(window) = current(sessions, session) else {
         return error(404, "invalid session id", session);
     };
+    let remote = match element_remote(element) {
+        Ok(remote) => remote,
+        Err(reply) => return reply,
+    };
     let script = format!(
-        "__tb_webdriver_click(document.querySelector({}))",
-        json!(selector)
+        "(function(){{const el=__tb_webdriver_element({remote});\
+         if(el===null)return false;__tb_webdriver_click(el);return true;}})()"
     );
     match window.tab.execute_script(&script).await {
-        Ok(_) => ok(Value::Null),
+        Ok(RemoteValue::Bool(true)) => ok(Value::Null),
+        Ok(_) => error(404, "no such element", "unknown element id"),
         Err(err) => script_error(&err),
     }
 }
@@ -522,26 +526,24 @@ async fn element_send_keys(
     };
     let text = match parsed.get("text") {
         Some(Value::String(text)) => text.clone(),
-        Some(Value::Array(items)) => items
-            .iter()
-            .filter_map(Value::as_str)
-            .collect::<String>(),
+        Some(Value::Array(items)) => items.iter().filter_map(Value::as_str).collect::<String>(),
         _ => return error(400, "invalid argument", "text is required"),
-    };
-    let selector = match element_selector(sessions, session, element) {
-        Ok(selector) => selector,
-        Err(reply) => return reply,
     };
     let Some(window) = current(sessions, session) else {
         return error(404, "invalid session id", session);
     };
+    let remote = match element_remote(element) {
+        Ok(remote) => remote,
+        Err(reply) => return reply,
+    };
     let script = format!(
-        "__tb_webdriver_send_keys(document.querySelector({}), {})",
-        json!(selector),
+        "(function(){{const el=__tb_webdriver_element({remote});\
+         if(el===null)return false;__tb_webdriver_send_keys(el, {});return true;}})()",
         json!(text)
     );
     match window.tab.execute_script(&script).await {
-        Ok(_) => ok(Value::Null),
+        Ok(RemoteValue::Bool(true)) => ok(Value::Null),
+        Ok(_) => error(404, "no such element", "unknown element id"),
         Err(err) => script_error(&err),
     }
 }
@@ -571,9 +573,11 @@ fn cookie_json(record: &CookieRecord) -> Value {
     map.insert("httpOnly".into(), json!(record.http_only));
     let same_site = match record.same_site {
         CookieSameSite::Strict => "Strict",
-        CookieSameSite::None => "None",
-        // No attribute means the default Lax-like behavior.
-        CookieSameSite::Lax | CookieSameSite::Default => "Lax",
+        CookieSameSite::Lax => "Lax",
+        // WebDriver serializes the storage model's default (no attribute) as
+        // "None"; the Lax-like request behavior is separate
+        // (<https://w3c.github.io/webdriver/#cookies>).
+        CookieSameSite::None | CookieSameSite::Default => "None",
     };
     map.insert("sameSite".into(), json!(same_site));
     if let Some(expiry) = record.expiry
@@ -613,37 +617,68 @@ async fn get_named_cookie(sessions: &Sessions, session: &str, name: &str) -> (u1
     }
 }
 
-/// Builds the `Set-Cookie` line for a `WebDriver` cookie object.
-fn set_cookie_line(cookie: &Value) -> Option<String> {
-    let name = cookie.get("name")?.as_str()?;
-    let value = cookie
-        .get("value")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
+/// Builds the `Set-Cookie` line for a `WebDriver` cookie object
+/// (<https://w3c.github.io/webdriver/#dfn-adding-a-cookie>).
+fn set_cookie_line(cookie: &Value) -> Result<String, (u16, Value)> {
+    let invalid = |message| error(400, "invalid argument", message);
+    let Some(name) = cookie.get("name").and_then(Value::as_str) else {
+        return Err(invalid("cookie name must be a string"));
+    };
+    let Some(value) = cookie.get("value").and_then(Value::as_str) else {
+        return Err(invalid("cookie value must be a string"));
+    };
     let mut line = format!("{name}={value}");
-    if let Some(path) = cookie.get("path").and_then(Value::as_str) {
+    if let Some(path) = cookie.get("path") {
+        let path = path
+            .as_str()
+            .ok_or_else(|| invalid("cookie path must be a string"))?;
         line.push_str("; Path=");
         line.push_str(path);
     }
-    if let Some(domain) = cookie.get("domain").and_then(Value::as_str) {
+    if let Some(domain) = cookie.get("domain") {
+        let domain = domain
+            .as_str()
+            .ok_or_else(|| invalid("cookie domain must be a string"))?;
         line.push_str("; Domain=");
         line.push_str(domain);
     }
-    if cookie.get("secure").and_then(Value::as_bool).unwrap_or(false) {
-        line.push_str("; Secure");
+    for (key, attribute) in [("secure", "; Secure"), ("httpOnly", "; HttpOnly")] {
+        if let Some(flag) = cookie.get(key)
+            && flag
+                .as_bool()
+                .ok_or_else(|| invalid("cookie flags must be booleans"))?
+        {
+            line.push_str(attribute);
+        }
     }
-    if cookie
-        .get("httpOnly")
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
-    {
-        line.push_str("; HttpOnly");
-    }
-    if let Some(same_site) = cookie.get("sameSite").and_then(Value::as_str) {
+    if let Some(same_site) = cookie.get("sameSite") {
+        let same_site = same_site
+            .as_str()
+            .ok_or_else(|| invalid("cookie sameSite must be a string"))?;
+        if !matches!(same_site, "None" | "Lax" | "Strict") {
+            return Err(invalid("cookie sameSite must be None, Lax, or Strict"));
+        }
         line.push_str("; SameSite=");
         line.push_str(same_site);
     }
-    Some(line)
+    if let Some(expiry) = cookie.get("expiry") {
+        let expiry = expiry
+            .as_u64()
+            .ok_or_else(|| invalid("cookie expiry must be a non-negative integer"))?;
+        // WebDriver caps expiry at 2^53 - 1.
+        if expiry > 9_007_199_254_740_991 {
+            return Err(invalid("cookie expiry is out of range"));
+        }
+        // The jar parses `Max-Age`; converting from the absolute expiry can
+        // drift by a second at a boundary, which only matters for exact
+        // expiry assertions.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |since| since.as_secs());
+        line.push_str("; Max-Age=");
+        line.push_str(&expiry.saturating_sub(now).to_string());
+    }
+    Ok(line)
 }
 
 /// `POST /session/{id}/cookie`
@@ -653,21 +688,42 @@ async fn add_cookie(sessions: &Sessions, session: &str, body: &str) -> (u16, Val
         Ok(value) => value,
         Err(err) => return error(400, "invalid argument", &err.to_string()),
     };
-    let Some(line) = parsed.get("cookie").and_then(set_cookie_line) else {
+    let Some(cookie) = parsed.get("cookie") else {
         return error(400, "invalid argument", "cookie is required");
+    };
+    let line = match set_cookie_line(cookie) {
+        Ok(line) => line,
+        Err(reply) => return reply,
     };
     let url = match context_url(sessions, session).await {
         Ok(url) => url,
         Err(reply) => return reply,
     };
+    // A domain attribute must domain-match the active document
+    // (<https://w3c.github.io/webdriver/#add-cookie>).
+    if let Some(domain) = cookie.get("domain").and_then(Value::as_str) {
+        let host = url.host_str().unwrap_or_default();
+        if host != domain && !host.ends_with(&format!(".{domain}")) {
+            return error(
+                400,
+                "invalid cookie domain",
+                "cookie domain does not match the current document",
+            );
+        }
+    }
     match sessions.browser.add_cookie(&line, &url).await {
-        Ok(()) => ok(Value::Null),
+        Ok(true) => ok(Value::Null),
+        Ok(false) => error(500, "unable to set cookie", "the cookie was rejected"),
         Err(err) => error(500, "unknown error", &err.to_string()),
     }
 }
 
 /// `DELETE /session/{id}/cookie`
 /// (<https://w3c.github.io/webdriver/#delete-all-cookies>).
+///
+/// The spec deletes only the active document's associated cookies; the live
+/// jar is profile-wide, and this empties it, matching Chrome's browser-scoped
+/// `clearBrowsingData("cookies")` behavior for a driver-managed profile.
 async fn delete_cookies(sessions: &Sessions, session: &str) -> (u16, Value) {
     if current(sessions, session).is_none() {
         return error(404, "invalid session id", session);
@@ -678,25 +734,71 @@ async fn delete_cookies(sessions: &Sessions, session: &str) -> (u16, Value) {
     }
 }
 
-/// The fixed virtual viewport, matching the engine's `innerWidth`/`innerHeight`
-/// and the element geometry stand-in.
-fn window_rect() -> Value {
-    json!({"x": 0, "y": 0, "width": 800, "height": 600})
+/// The session's virtual window rectangle, matching the engine's
+/// `innerWidth`/`innerHeight` and the element geometry stand-in.
+fn session_rect(found: &Session) -> Value {
+    json!({
+        "x": found.window_rect[0],
+        "y": found.window_rect[1],
+        "width": found.window_rect[2],
+        "height": found.window_rect[3],
+    })
+}
+
+/// `GET /session/{id}/window/rect`
+/// (<https://w3c.github.io/webdriver/#get-window-rect>), also the reply for
+/// minimize/maximize/fullscreen. The engine has no window system, so these
+/// change only the virtual rectangle.
+fn window_rect(sessions: &Sessions, session: &str) -> (u16, Value) {
+    match sessions.open.get(session) {
+        Some(found) => ok(session_rect(found)),
+        None => error(404, "invalid session id", session),
+    }
+}
+
+/// Minimize, maximize, and fullscreen report the virtual rectangle.
+fn window_op(sessions: &Sessions, session: &str) -> (u16, Value) {
+    window_rect(sessions, session)
+}
+
+/// `POST /session/{id}/window/rect`
+/// (<https://w3c.github.io/webdriver/#set-window-rect>).
+fn set_window_rect(sessions: &mut Sessions, session: &str, body: &str) -> (u16, Value) {
+    let Some(found) = sessions.open.get_mut(session) else {
+        return error(404, "invalid session id", session);
+    };
+    let parsed: Value = match serde_json::from_str(body) {
+        Ok(value) => value,
+        Err(err) => return error(400, "invalid argument", &err.to_string()),
+    };
+    for (key, index) in [("x", 0), ("y", 1), ("width", 2), ("height", 3)] {
+        if let Some(value) = parsed.get(key) {
+            let Some(number) = value.as_f64() else {
+                return error(
+                    400,
+                    "invalid argument",
+                    "window rect values must be numbers",
+                );
+            };
+            found.window_rect[index] = number;
+        }
+    }
+    ok(session_rect(found))
 }
 
 /// `GET /session/{id}/element/{element id}/rect`
 /// (<https://w3c.github.io/webdriver/#get-element-rect>).
 async fn element_rect(sessions: &Sessions, session: &str, element: &str) -> (u16, Value) {
-    let selector = match element_selector(sessions, session, element) {
-        Ok(selector) => selector,
-        Err(reply) => return reply,
-    };
     let Some(window) = current(sessions, session) else {
         return error(404, "invalid session id", session);
     };
+    let remote = match element_remote(element) {
+        Ok(remote) => remote,
+        Err(reply) => return reply,
+    };
     let script = format!(
-        "JSON.stringify(document.querySelector({}).getBoundingClientRect())",
-        json!(selector)
+        "(function(){{const el=__tb_webdriver_element({remote});\
+         if(el===null)return null;return JSON.stringify(el.getBoundingClientRect());}})()"
     );
     match window.tab.execute_script(&script).await {
         Ok(RemoteValue::String(text)) => match serde_json::from_str::<Value>(&text) {
@@ -708,7 +810,7 @@ async fn element_rect(sessions: &Sessions, session: &str, element: &str) -> (u16
             })),
             Err(err) => error(500, "unknown error", &err.to_string()),
         },
-        Ok(_) => error(404, "no such element", "element has no box"),
+        Ok(_) => error(404, "no such element", "unknown element id"),
         Err(err) => script_error(&err),
     }
 }

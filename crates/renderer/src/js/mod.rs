@@ -49,13 +49,19 @@ globalThis.clearTimeout = function(id) {
 };
 // The engine has no rendering pipeline; a frame callback is a 16ms timer
 // (<https://html.spec.whatwg.org/multipage/imagebitmap-and-animations.html#dom-animationframeprovider-requestanimationframe>).
+// Callbacks queued in the same frame do not share a timestamp, and handles
+// are offset because `setTimeout` ids start at zero while frame handles do
+// not.
 globalThis.requestAnimationFrame = function(fn) {
+  if (typeof fn !== 'function') {
+    throw new TypeError('requestAnimationFrame requires a callback');
+  }
   return globalThis.setTimeout(function() {
     fn(Date.now());
-  }, 16);
+  }, 16) + 1;
 };
 globalThis.cancelAnimationFrame = function(id) {
-  globalThis.clearTimeout(id);
+  globalThis.clearTimeout(Number(id) - 1);
 };
 if (!globalThis.document) {
   globalThis.document = {};

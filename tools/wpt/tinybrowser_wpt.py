@@ -140,20 +140,8 @@ class TinyBrowserTestharnessExecutor(WebDriverTestharnessExecutor):
     supports_testdriver = True
     protocol_cls = TinyBrowserProtocol
 
-    def create_test_window(self, protocol):
-        # WebDriverTestharnessExecutor.create_test_window clicks the root
-        # element to move focus to the new window. The click needs an element
-        # reference returned from execute_script, which the element-id mapping
-        # (Find Element only) does not mint, so keep the window's initial
-        # about:blank and skip the focus click.
-        test_window = protocol.base.create_window()
-        protocol.base.set_window(test_window)
-        protocol.base.execute_script(self.window_loaded_script, asynchronous=True)
-        return test_window
-
 
 class TinyBrowserCrashtestExecutor(WebDriverCrashtestExecutor):
     """Crashtests only need the page to load and settle without dying."""
 
-    supports_testdriver = True
     protocol_cls = TinyBrowserProtocol

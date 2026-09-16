@@ -9,9 +9,9 @@ use dom::NodeId;
 use rquickjs::{Object, Persistent, Value, class::Trace, function::Function};
 use url::Url;
 
-use crate::{Parsed, ReadyState};
 use crate::documents::DocumentStore;
 use crate::protocol::BrowserServices;
+use crate::{Parsed, ReadyState};
 
 /// Renderer-process realm bookkeeping shared by every frame.
 ///
@@ -28,6 +28,17 @@ pub(crate) struct RealmRegistry {
     wrappers: HashMap<NodeId, Persistent<Value<'static>>>,
     /// The active child document for each connected iframe container.
     frame_documents: HashMap<NodeId, NodeId>,
+    /// `WebDriver` element ids, allocated across every world and frame so a
+    /// reference cannot alias between browsing contexts.
+    next_remote: u64,
+}
+
+impl RealmRegistry {
+    /// The next process-unique `WebDriver` element id.
+    pub(crate) fn allocate_remote(&mut self) -> u64 {
+        self.next_remote = self.next_remote.saturating_add(1);
+        self.next_remote
+    }
 }
 
 #[derive(Default)]
@@ -227,6 +238,9 @@ pub(crate) struct World {
     /// The focused element of each document
     /// (<https://html.spec.whatwg.org/multipage/interaction.html#focused-area-of-the-document>).
     active_elements: HashMap<u32, NodeId>,
+    /// Elements whose `click()` is running, so a nested `click()` returns
+    /// (<https://html.spec.whatwg.org/multipage/interaction.html#dom-click>).
+    clicks_in_progress: HashSet<NodeId>,
     brands: HashMap<String, Persistent<Object<'static>>>,
     /// `Attr` platform-object identity, keyed by a per-realm id.
     pub(crate) attrs: HashMap<u64, AttrState>,
@@ -236,6 +250,9 @@ pub(crate) struct World {
     pub(crate) attr_values: HashMap<u64, String>,
     /// Wrapper object for each `Attr` id (identity is the id).
     pub(crate) attr_wrappers: HashMap<u64, Persistent<Value<'static>>>,
+    /// Stable `WebDriver` element ids for nodes, and the reverse lookup.
+    remote_ids: HashMap<NodeId, u64>,
+    remote_nodes: HashMap<u64, NodeId>,
     /// Attached attributes: (element, namespace, local) -> `Attr` id.
     pub(crate) attr_ids: HashMap<(NodeId, String, String), u64>,
     pub(crate) next_attr_id: u64,
@@ -300,11 +317,14 @@ impl World {
             datasets: HashMap::new(),
             implementations: HashMap::new(),
             active_elements: HashMap::new(),
+            clicks_in_progress: HashSet::new(),
             brands: HashMap::new(),
             attrs: HashMap::new(),
             attr_owners: HashMap::new(),
             attr_values: HashMap::new(),
             attr_wrappers: HashMap::new(),
+            remote_ids: HashMap::new(),
+            remote_nodes: HashMap::new(),
             attr_ids: HashMap::new(),
             next_attr_id: 0,
             observers: HashMap::new(),
@@ -398,6 +418,8 @@ impl World {
         self.active_elements.clear();
         self.clear_attributes();
         self.frame_navigations.clear();
+        self.remote_ids.clear();
+        self.remote_nodes.clear();
         let pending = self.take_document_stream();
         drop(pending);
         // A new realm owns fresh observers; navigation drops the old ones.
@@ -712,6 +734,32 @@ impl World {
         self.active_elements.get(&document).copied()
     }
 
+    /// The stable `WebDriver` element id for `node`, allocating one on first
+    /// use. Ids come from the process-wide registry so they cannot alias
+    /// between windows
+    /// (<https://w3c.github.io/webdriver/#elements>).
+    pub(crate) fn remote_id(&mut self, node: NodeId) -> u64 {
+        if let Some(&remote) = self.remote_ids.get(&node) {
+            return remote;
+        }
+        let remote = self.registry.borrow_mut().allocate_remote();
+        self.remote_ids.insert(node, remote);
+        self.remote_nodes.insert(remote, node);
+        remote
+    }
+
+    /// The node behind a `WebDriver` element id.
+    pub(crate) fn node_for_remote(&self, remote: u64) -> Option<NodeId> {
+        self.remote_nodes.get(&remote).copied()
+    }
+
+    /// Whether `node` is the realm's active document, which is what decides
+    /// `document.defaultView`
+    /// (<https://html.spec.whatwg.org/multipage/nav-history-apis.html#dom-document-defaultview>).
+    pub(crate) fn is_main_document(&self, node: NodeId) -> bool {
+        self.document == Some(node.document_id())
+    }
+
     pub(crate) fn set_active_element(&mut self, document: u32, node: Option<NodeId>) {
         match node {
             Some(node) => {
@@ -720,6 +768,20 @@ impl World {
             None => {
                 self.active_elements.remove(&document);
             }
+        }
+    }
+
+    /// Whether `node`'s `click()` is already running.
+    pub(crate) fn click_in_progress(&self, node: NodeId) -> bool {
+        self.clicks_in_progress.contains(&node)
+    }
+
+    /// Marks `node`'s `click()` as running; the caller clears it when done.
+    pub(crate) fn set_click_in_progress(&mut self, node: NodeId, running: bool) {
+        if running {
+            self.clicks_in_progress.insert(node);
+        } else {
+            self.clicks_in_progress.remove(&node);
         }
     }
 

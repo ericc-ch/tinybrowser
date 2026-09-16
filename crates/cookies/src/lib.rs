@@ -115,23 +115,24 @@ pub enum RetrievalKind {
 }
 
 impl CookieJar {
-    /// Stores one `Set-Cookie` line, ignoring it when the rules reject it.
+    /// Stores one `Set-Cookie` line, reporting whether it was stored.
     ///
     /// Rejection is not an error: a malformed line, a public-suffix domain, or
     /// a `SameSite` cookie set from a cross-site context all mean "keep the
     /// existing state".
-    pub fn store(&mut self, set_cookie: &str, op: CookieOp<'_>) {
+    pub fn store(&mut self, set_cookie: &str, op: CookieOp<'_>) -> bool {
         let Some(parsed) = parse_set_cookie(set_cookie) else {
-            return;
+            return false;
         };
         let Some(stored) = receive_cookie(parsed, &op, &self.cookies) else {
-            return;
+            return false;
         };
         self.cookies
             .retain(|old| !same_cookie_identity(old, &stored));
         self.cookies.push(stored);
         self.evict_expired(op.now);
         self.evict_excess();
+        true
     }
 
     /// The `Cookie` header value for `op`: matching cookies, longest path

@@ -147,7 +147,9 @@ if ! has_option --manifest "${args[@]}"; then
   args=(--manifest "$WPT/MANIFEST.json" "${args[@]}")
 fi
 if ! has_option --test-types "${args[@]}"; then
-  args=(--test-types testharness crashtest "${args[@]}")
+  # `--test-types` takes its values with `nargs="*"`, so it must be the last
+  # option: a following positional would be consumed as a test type.
+  args+=(--test-types testharness crashtest)
 fi
 if ! has_option --pause-after-test "${args[@]}" && ! has_option --no-pause-after-test "${args[@]}"; then
   args=(--no-pause-after-test "${args[@]}")

@@ -15,7 +15,7 @@ use rquickjs::{
     prelude::This,
 };
 
-use super::events::{self, JsEvent, JsEventTarget};
+use super::events::{self, EventTargetRef, JsEvent, JsEventTarget};
 use super::world::{
     AttrState, DocumentStreamCommand, EventTargetKey, FrameNavigation, Handle, Observation,
     ObserverOptions, ObserverState, RecordData, World,
@@ -2346,7 +2346,13 @@ impl JsNode {
     fn active_element<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
         let document = self.handle.0;
         let world = world(&ctx)?;
-        if let Some(node) = world.borrow().active_element(document.document_id()) {
+        let active = world.borrow().active_element(document.document_id());
+        if let Some(node) = active
+            && world
+                .borrow()
+                .document(node)
+                .is_some_and(|parsed| parsed.dom.is_connected(node))
+        {
             return wrap_node(&ctx, node);
         }
         let fallback = {
@@ -2354,12 +2360,22 @@ impl JsNode {
             let Some(parsed) = world.document(document) else {
                 return Ok(Value::new_null(ctx));
             };
-            parsed
-                .dom
-                .select_first(parsed.dom.document(), "body")
-                .ok()
-                .flatten()
-                .or_else(|| Some(parsed.dom.document()))
+            let root = parsed.dom.document();
+            let body = parsed.dom.select_first(root, "body").ok().flatten();
+            body.or_else(|| {
+                parsed
+                    .dom
+                    .children(root)
+                    .into_iter()
+                    .flatten()
+                    .copied()
+                    .find(|&id| {
+                        matches!(
+                            parsed.dom.get(id).map(|node| node.kind()),
+                            Some(NodeKind::Element { .. })
+                        )
+                    })
+            })
         };
         match fallback {
             Some(node) => wrap_node(&ctx, node),
@@ -2371,15 +2387,18 @@ impl JsNode {
     // `virtual_rect`).
     #[qjs(rename = "getBoundingClientRect")]
     fn get_bounding_client_rect<'js>(&self, ctx: Ctx<'js>) -> Result<Object<'js>> {
-        let index = element_index(&ctx, self.handle.0)?.unwrap_or(0.0);
-        virtual_rect_object(&ctx, index)
+        match element_index(&ctx, self.handle.0)? {
+            Some(index) => virtual_rect_object(&ctx, index),
+            None => rect_object(&ctx, 0.0, 0.0, 0.0, 0.0),
+        }
     }
 
     #[qjs(rename = "getClientRects")]
     fn get_client_rects<'js>(&self, ctx: Ctx<'js>) -> Result<Array<'js>> {
-        let index = element_index(&ctx, self.handle.0)?.unwrap_or(0.0);
         let array = Array::new(ctx.clone())?;
-        array.set(0, virtual_rect_object(&ctx, index)?)?;
+        if let Some(index) = element_index(&ctx, self.handle.0)? {
+            array.set(0, virtual_rect_object(&ctx, index)?)?;
+        }
         Ok(array)
     }
 
@@ -2390,12 +2409,21 @@ impl JsNode {
     // https://html.spec.whatwg.org/multipage/nav-history-apis.html#dom-document-defaultview
     #[qjs(get, rename = "defaultView")]
     fn default_view<'js>(&self, ctx: Ctx<'js>) -> Value<'js> {
-        ctx.globals().into_value()
+        // A document with no browsing context, such as one from DOMParser or
+        // `createDocument`, has no view.
+        let has_view =
+            world(&ctx).is_ok_and(|world| world.borrow().is_main_document(self.handle.0));
+        if has_view {
+            ctx.globals().into_value()
+        } else {
+            Value::new_null(ctx)
+        }
     }
 
     // The no-layout hit test: the deepest element whose virtual box contains
     // the point (see `element_at_point`).
-    #[qjs(rename = "elementsFromPoint")]    fn elements_from_point<'js>(&self, ctx: Ctx<'js>, x: f64, y: f64) -> Result<Array<'js>> {
+    #[qjs(rename = "elementsFromPoint")]
+    fn elements_from_point<'js>(&self, ctx: Ctx<'js>, x: f64, y: f64) -> Result<Array<'js>> {
         let array = Array::new(ctx.clone())?;
         if let Some(node) = element_at_point(&ctx, self.handle.0, x, y)? {
             array.set(0, wrap_node(&ctx, node)?)?;
@@ -4957,6 +4985,10 @@ pub(super) fn install(ctx: &Ctx<'_>, world: &Rc<RefCell<World>>) -> Result<()> {
         "__tb_webdriver_send_keys",
         rquickjs::prelude::Func::from(webdriver_send_keys),
     )?;
+    globals.set(
+        "__tb_webdriver_element",
+        rquickjs::prelude::Func::from(webdriver_element),
+    )?;
     globals.set("innerWidth", VIRTUAL_VIEWPORT_WIDTH)?;
     globals.set("innerHeight", VIRTUAL_VIEWPORT_HEIGHT)?;
     globals.set(
@@ -5119,7 +5151,8 @@ pub(super) fn host_node_id<'js>(ctx: &Ctx<'js>, value: &Value<'js>) -> Option<No
 /// (<https://html.spec.whatwg.org/multipage/interaction.html#focusable-area>).
 ///
 /// The engine has no layout, so visibility and being rendered cannot be part
-/// of the decision; the attribute and element-name rules are.
+/// of the decision; the element-name, disabled, and connection rules are
+/// (<https://html.spec.whatwg.org/multipage/interaction.html#focusable-area>).
 fn is_focusable(ctx: &Ctx<'_>, node: NodeId) -> Result<bool> {
     let world = world_for_node(ctx, node)?;
     let world = world.borrow();
@@ -5135,40 +5168,87 @@ fn is_focusable(ctx: &Ctx<'_>, node: NodeId) -> Result<bool> {
     if name.ns != html_namespace() {
         return Ok(false);
     }
-    if parsed.dom.attribute(node, "tabindex").is_some()
-        || parsed.dom.attribute(node, "contenteditable").is_some()
+    if !parsed.dom.is_connected(node) || is_actually_disabled(&parsed.dom, node) {
+        return Ok(false);
+    }
+    if let Some(value) = parsed.dom.attribute(node, "contenteditable")
+        && !value.eq_ignore_ascii_case("false")
     {
         return Ok(true);
     }
+    if parsed.dom.attribute(node, "tabindex").is_some() {
+        return Ok(true);
+    }
     Ok(match name.local.as_ref() {
-        "input" => parsed.dom.attribute(node, "type").as_deref() != Some("hidden"),
+        "input" => !is_hidden_input(&parsed.dom, node),
         "a" | "area" => parsed.dom.attribute(node, "href").is_some(),
         "button" | "iframe" | "select" | "textarea" => true,
         _ => false,
     })
 }
 
-/// Whether the element accepts typed text.
+/// The HTML "actually disabled" check for the form controls the engine
+/// supports (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#concept-fe-disabled>).
+fn is_actually_disabled(dom: &dom::Dom, node: NodeId) -> bool {
+    if dom.attribute(node, "disabled").is_none() {
+        return false;
+    }
+    matches!(
+        node_local_name(dom, node).as_deref(),
+        Some("button" | "input" | "select" | "textarea" | "optgroup" | "option" | "fieldset")
+    )
+}
+
+fn is_hidden_input(dom: &dom::Dom, node: NodeId) -> bool {
+    dom.attribute(node, "type")
+        .is_some_and(|kind| kind.eq_ignore_ascii_case("hidden"))
+}
+
+fn node_local_name(dom: &dom::Dom, node: NodeId) -> Option<String> {
+    match dom.get(node).map(|entry| entry.kind()) {
+        Some(NodeKind::Element { name, .. }) if name.ns == html_namespace() => {
+            Some(name.local.to_string())
+        }
+        _ => None,
+    }
+}
+
+/// Whether the element accepts typed text: an enabled, non-readonly text-like
+/// control. Checkboxes, radio buttons, and files do not take text input
+/// (<https://html.spec.whatwg.org/multipage/input.html#text-(type=text)-state-and-search-state-(type=search)>).
 fn is_text_control(ctx: &Ctx<'_>, node: NodeId) -> Result<bool> {
     let world = world_for_node(ctx, node)?;
     let world = world.borrow();
     let Some(parsed) = world.document(node) else {
         return Ok(false);
     };
-    let Some(entry) = parsed.dom.get(node) else {
-        return Ok(false);
-    };
-    let NodeKind::Element { name, .. } = entry.kind() else {
-        return Ok(false);
-    };
-    if name.ns != html_namespace() {
+    if parsed.dom.get(node).is_none() || is_actually_disabled(&parsed.dom, node) {
         return Ok(false);
     }
-    Ok(matches!(name.local.as_ref(), "input" | "textarea"))
+    if parsed.dom.attribute(node, "readonly").is_some() {
+        return Ok(false);
+    }
+    let Some(local) = node_local_name(&parsed.dom, node) else {
+        return Ok(false);
+    };
+    Ok(match local.as_str() {
+        "textarea" => true,
+        "input" => {
+            let kind = parsed
+                .dom
+                .attribute(node, "type")
+                .unwrap_or_else(|| "text".to_owned());
+            matches!(
+                kind.to_ascii_lowercase().as_str(),
+                "text" | "search" | "url" | "tel" | "email" | "password" | "number"
+            )
+        }
+        _ => false,
+    })
 }
 
-/// Moves focus to `node`, firing `blur`/`focusout` at the previously focused
-/// area and `focus`/`focusin` at the new one
+/// Moves focus to `node`. The previously focused area is cleared before the
+/// `blur`/`focusout` chain, and the new one installed before `focus`/`focusin`
 /// (<https://html.spec.whatwg.org/multipage/interaction.html#focus-update-steps>).
 fn focus_node(ctx: &Ctx<'_>, node: NodeId) -> Result<()> {
     let world = world_for_node(ctx, node)?;
@@ -5177,13 +5257,52 @@ fn focus_node(ctx: &Ctx<'_>, node: NodeId) -> Result<()> {
     if previous == Some(node) {
         return Ok(());
     }
-    world.borrow_mut().set_active_element(document, Some(node));
+    let target = |node| EventTargetRef {
+        key: EventTargetKey::Node(node),
+        world: Rc::clone(&world),
+    };
+    world.borrow_mut().set_active_element(document, None);
     if let Some(previous) = previous {
-        events::fire_trusted(ctx, EventTargetKey::Node(previous), "blur", false, false)?;
-        events::fire_trusted(ctx, EventTargetKey::Node(previous), "focusout", true, false)?;
+        events::fire_trusted_with_related(
+            ctx,
+            EventTargetKey::Node(previous),
+            "blur",
+            false,
+            false,
+            Some(target(node)),
+        )?;
+        events::fire_trusted_with_related(
+            ctx,
+            EventTargetKey::Node(previous),
+            "focusout",
+            true,
+            false,
+            Some(target(node)),
+        )?;
+        // A handler may have moved focus; the spec's focus update steps stop
+        // when the focused area changed during the blur chain.
+        if world.borrow().active_element(document).is_some() {
+            return Ok(());
+        }
     }
-    events::fire_trusted(ctx, EventTargetKey::Node(node), "focus", false, false)?;
-    events::fire_trusted(ctx, EventTargetKey::Node(node), "focusin", true, false)?;
+    world.borrow_mut().set_active_element(document, Some(node));
+    let related = previous.map(target);
+    events::fire_trusted_with_related(
+        ctx,
+        EventTargetKey::Node(node),
+        "focus",
+        false,
+        false,
+        related.clone(),
+    )?;
+    events::fire_trusted_with_related(
+        ctx,
+        EventTargetKey::Node(node),
+        "focusin",
+        true,
+        false,
+        related,
+    )?;
     Ok(())
 }
 
@@ -5204,10 +5323,25 @@ fn blur_node(ctx: &Ctx<'_>, node: NodeId) -> Result<()> {
 /// Dispatches a synthetic (untrusted) `click`
 /// (<https://html.spec.whatwg.org/multipage/interaction.html#dom-click>).
 fn element_click(ctx: &Ctx<'_>, node: NodeId) -> Result<()> {
-    let event = Class::instance(ctx.clone(), events::JsEvent::uninitialized())?;
-    event.borrow().initialize("click".to_owned(), true, true);
-    events::dispatch_event(ctx, EventTargetKey::Node(node), &event)?;
-    Ok(())
+    let world = world_for_node(ctx, node)?;
+    {
+        let world = world.borrow();
+        let Some(parsed) = world.document(node) else {
+            return Ok(());
+        };
+        if is_actually_disabled(&parsed.dom, node) || world.click_in_progress(node) {
+            return Ok(());
+        }
+    }
+    world.borrow_mut().set_click_in_progress(node, true);
+    let result = (|| {
+        let event = Class::instance(ctx.clone(), events::JsEvent::uninitialized())?;
+        event.borrow().initialize("click".to_owned(), true, true);
+        events::dispatch_event(ctx, EventTargetKey::Node(node), &event)?;
+        Ok(())
+    })();
+    world.borrow_mut().set_click_in_progress(node, false);
+    result
 }
 
 /// The `WebDriver` "element click" step: a trusted click at the element, with
@@ -5259,6 +5393,39 @@ fn webdriver_send_keys<'js>(ctx: Ctx<'js>, element: Value<'js>, text: String) ->
     Ok(())
 }
 
+/// Resolves a `WebDriver` element id to its wrapper, or `null` when no node
+/// owns the id. Element commands use this so references returned by
+/// `execute_script` work as well as Find Element results
+/// (<https://w3c.github.io/webdriver/#elements>).
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "rquickjs Func ABI passes arguments by value"
+)]
+fn webdriver_element(ctx: Ctx<'_>, remote_id: f64) -> Result<Value<'_>> {
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "WebDriver element ids are small non-negative integers"
+    )]
+    let remote = remote_id as u64;
+    let world = world(&ctx)?;
+    let Some(node) = world.borrow().node_for_remote(remote) else {
+        return Ok(Value::new_null(ctx));
+    };
+    // Only a live, connected element is a valid element reference.
+    let valid = world.borrow().document(node).is_some_and(|parsed| {
+        parsed.dom.is_connected(node)
+            && matches!(
+                parsed.dom.get(node).map(|entry| entry.kind()),
+                Some(NodeKind::Element { .. })
+            )
+    });
+    if !valid {
+        return Ok(Value::new_null(ctx));
+    }
+    wrap_node(&ctx, node)
+}
+
 /// `window.postMessage(message, targetOrigin)`. The engine has no
 /// browsing-context messaging yet, so the message is always delivered at this
 /// window with this window as its source
@@ -5276,13 +5443,18 @@ fn window_post_message<'js>(
         ctx.clone(),
         events::JsEvent::trusted("message", false, false),
     )?;
+    let origin = world(&ctx).ok().map_or_else(String::new, |world| {
+        world.borrow().document_url.origin().ascii_serialization()
+    });
     let value = Class::into_value(event.clone());
     if let Some(object) = value.as_object() {
         object.set("data", message)?;
-        object.set("origin", String::new())?;
+        object.set("origin", origin)?;
         object.set("source", ctx.globals())?;
     }
-    events::dispatch_event(&ctx, EventTargetKey::Window, &event)?;
+    // Synchronous delivery, no `targetOrigin` parsing, and no structured
+    // clone: the engine has no message queue yet.
+    events::dispatch_trusted(&ctx, EventTargetKey::Window, &event)?;
     Ok(())
 }
 
@@ -5297,12 +5469,12 @@ const VIRTUAL_VIEWPORT_WIDTH: f64 = 800.0;
 const VIRTUAL_VIEWPORT_HEIGHT: f64 = 600.0;
 const VIRTUAL_CELL: f64 = 10.0;
 const VIRTUAL_COLUMNS: f64 = 80.0;
-const VIRTUAL_ROWS: f64 = 60.0;
 
 /// The virtual box `(left, top, width, height)` for the element at `index`.
+/// Rows keep growing past the viewport so two elements never share a box.
 fn virtual_rect(index: f64) -> (f64, f64, f64, f64) {
     let column = index % VIRTUAL_COLUMNS;
-    let row = (index / VIRTUAL_COLUMNS) % VIRTUAL_ROWS;
+    let row = (index / VIRTUAL_COLUMNS).floor();
     let left = column * VIRTUAL_CELL + 1.0;
     let top = row * VIRTUAL_CELL + 1.0;
     let size = VIRTUAL_CELL - 2.0;
@@ -5321,17 +5493,19 @@ fn element_index(ctx: &Ctx<'_>, node: NodeId) -> Result<Option<f64>> {
     Ok(found.then_some(index))
 }
 
-fn walk_element_index(dom: &dom::Dom, current: NodeId, target: NodeId, index: &mut f64) -> bool {
-    if current == target {
-        return true;
-    }
-    if let Some(NodeKind::Element { .. }) = dom.get(current).map(|node| node.kind()) {
-        *index += 1.0;
-    }
-    if let Some(children) = dom.children(current) {
-        for child in children {
-            if walk_element_index(dom, *child, target, index) {
-                return true;
+fn walk_element_index(dom: &dom::Dom, root: NodeId, target: NodeId, index: &mut f64) -> bool {
+    // Iterative so a deeply nested document cannot overflow the stack.
+    let mut stack = vec![root];
+    while let Some(current) = stack.pop() {
+        if current == target {
+            return true;
+        }
+        if let Some(NodeKind::Element { .. }) = dom.get(current).map(|node| node.kind()) {
+            *index += 1.0;
+        }
+        if let Some(children) = dom.children(current) {
+            for child in children.rev() {
+                stack.push(*child);
             }
         }
     }
@@ -5340,12 +5514,7 @@ fn walk_element_index(dom: &dom::Dom, current: NodeId, target: NodeId, index: &m
 
 /// The deepest element whose virtual box contains the point, if any. This is
 /// the no-layout stand-in for hit testing.
-fn element_at_point(
-    ctx: &Ctx<'_>,
-    document: NodeId,
-    x: f64,
-    y: f64,
-) -> Result<Option<NodeId>> {
+fn element_at_point(ctx: &Ctx<'_>, document: NodeId, x: f64, y: f64) -> Result<Option<NodeId>> {
     let world = world_for_node(ctx, document)?;
     let world = world.borrow();
     let Some(parsed) = world.document(document) else {
@@ -5378,6 +5547,16 @@ fn element_at_point(
 
 fn virtual_rect_object<'js>(ctx: &Ctx<'js>, index: f64) -> Result<Object<'js>> {
     let (left, top, width, height) = virtual_rect(index);
+    rect_object(ctx, left, top, width, height)
+}
+
+fn rect_object<'js>(
+    ctx: &Ctx<'js>,
+    left: f64,
+    top: f64,
+    width: f64,
+    height: f64,
+) -> Result<Object<'js>> {
     let object = Object::new(ctx.clone())?;
     object.set("x", left)?;
     object.set("y", top)?;

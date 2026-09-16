@@ -2,19 +2,21 @@
 """Summarize a WPT run per directory.
 
 Runs the test set through `tools/wpt/run` and prints one row per directory
-with pass/unexpected buckets, subtests, and wall time. This is the
-conformance-grind instrument: a directory's row is the unit of work.
+with pass, expected-fail, and unexpected buckets plus subtest counts and test
+time. This is the conformance-grind instrument: a directory's row is the unit
+of work.
 
     tools/wpt/score dom/nodes/ | head
+    tools/wpt/score dom/nodes/ -- --processes 4
     tools/wpt/score --report report.json     # summarize an existing wptreport
-    tools/wpt/score --processes 4 dom/       # parallel run
 
-Any extra arguments after the paths are passed to `tools/wpt/run`.
+Runner arguments follow a literal `--`; everything before it is a test path
+(or `--report FILE`). A nonzero exit means the runner failed, not that tests
+failed: the run always passes `--no-fail-on-unexpected`.
 """
 
 from __future__ import annotations
 
-import argparse
 import json
 import os
 import subprocess
@@ -27,7 +29,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 RUNNER = ROOT / "tools" / "wpt" / "run"
 
-STATUSES = ("PASS", "FAIL", "TIMEOUT", "CRASH", "ERROR", "SKIP")
+# File-level statuses that get their own bucket.
+HARD_STATUSES = ("TIMEOUT", "CRASH", "ERROR", "PRECONDITION_FAILED", "NOTRUN")
+MAX_LISTED = 40
 
 
 def group_of(test: str) -> str:
@@ -38,7 +42,19 @@ def group_of(test: str) -> str:
     return "/".join(parts[:2])
 
 
-def run(paths: list[str], extra: list[str]) -> Path:
+def is_expected(entry: dict) -> bool:
+    """Whether a result or subtest matched its expectation.
+
+    mozlog only writes `expected` when the actual status differs from the
+    expected one, and `known_intermittent` lists statuses that are acceptable
+    for the test.
+    """
+    if entry.get("expected") is None:
+        return True
+    return entry.get("status") in (entry.get("known_intermittent") or [])
+
+
+def run(paths: list[str], extra: list[str]) -> tuple[Path, int]:
     handle, name = tempfile.mkstemp(prefix="wpt-report-", suffix=".json")
     os.close(handle)
     report = Path(name)
@@ -52,116 +68,198 @@ def run(paths: list[str], extra: list[str]) -> Path:
     ]
     print(f"$ {' '.join(command)}", file=sys.stderr)
     # The runner's progress goes to stderr; the table stays on stdout.
-    result = subprocess.run(command, cwd=ROOT, check=False, stdout=sys.stderr)
-    if result.returncode != 0:
-        print(
-            f"runner exited {result.returncode}; summarizing what it wrote",
-            file=sys.stderr,
-        )
-    return report
+    exit_code = subprocess.run(command, cwd=ROOT, check=False, stdout=sys.stderr).returncode
+    if exit_code != 0:
+        print(f"runner exited {exit_code}", file=sys.stderr)
+    return report, exit_code
 
 
 def summarize(report: Path) -> int:
-    data = json.loads(report.read_text())
-    results = data.get("results", [])
-    if not results:
-        print("no results in report", file=sys.stderr)
+    try:
+        data = json.loads(report.read_text())
+    except OSError as error:
+        print(f"cannot read report {report}: {error}", file=sys.stderr)
+        return 1
+    except json.JSONDecodeError as error:
+        print(
+            f"report {report} is not valid JSON ({error}); the runner probably "
+            "failed before writing results",
+            file=sys.stderr,
+        )
         return 1
 
-    buckets: dict[str, dict[str, int]] = defaultdict(
-        lambda: dict.fromkeys(STATUSES, 0)
+    results = data.get("results", [])
+    if not results:
+        print(f"no results in report {report}", file=sys.stderr)
+        return 1
+
+    buckets = (
+        "tests",
+        "pass",
+        "expected_fail",
+        "unexpected",
+        "timeout",
+        "crash",
+        "error",
+        "skip",
+        "subtests",
+        "subfail",
+        "time_ms",
     )
-    subtests: dict[str, dict[str, int]] = defaultdict(lambda: {"PASS": 0, "not PASS": 0})
-    unexpected: list[tuple[str, str, str]] = []
-    durations: dict[str, int] = defaultdict(int)
+    rows: dict[str, dict[str, int]] = defaultdict(lambda: dict.fromkeys(buckets, 0))
+    attention: list[tuple[str, str, str]] = []
 
     for result in results:
         test = result.get("test", "?")
+        row = rows[group_of(test)]
+        row["tests"] += 1
+        row["time_ms"] += result.get("duration") or 0
+
+        subtests = result.get("subtests") or []
+        sub_unexpected = [
+            subtest
+            for subtest in subtests
+            if subtest.get("status") not in ("PASS", "SKIP") and not is_expected(subtest)
+        ]
+        sub_failed = [
+            subtest for subtest in subtests if subtest.get("status") not in ("PASS", "SKIP")
+        ]
+        row["subtests"] += len(subtests)
+        row["subfail"] += len(sub_failed)
+
         status = result.get("status", "ERROR")
-        directory = group_of(test)
-        buckets[directory][status if status in STATUSES else "ERROR"] += 1
-        durations[directory] += result.get("duration") or 0
+        if status == "SKIP":
+            row["skip"] += 1
+        elif status in HARD_STATUSES:
+            row[status.lower()] += 1
+            message = (result.get("message") or "").strip()
+            attention.append((test, "", f"{status} {message}".strip()))
+        elif status in ("PASS", "OK"):
+            if sub_unexpected:
+                row["unexpected"] += 1
+                for subtest in sub_unexpected:
+                    attention.append(
+                        (test, subtest.get("name", "?"), subtest.get("status", "ERROR"))
+                    )
+            elif sub_failed:
+                row["expected_fail"] += 1
+            else:
+                row["pass"] += 1
+        elif is_expected(result):
+            row["expected_fail"] += 1
+        else:
+            row["unexpected"] += 1
+            message = (result.get("message") or "").strip()
+            attention.append((test, "", f"{status} {message}".strip()))
 
-        for subtest in result.get("subtests") or []:
-            sub_status = subtest.get("status", "ERROR")
-            key = "PASS" if sub_status == "PASS" else "not PASS"
-            subtests[directory][key] += 1
-            if key != "PASS":
-                unexpected.append((test, subtest.get("name", "?"), sub_status))
-        if status != "PASS":
-            message = result.get("message") or ""
-            unexpected.append((test, "", f"{status} {message}".strip()))
-
-    width = max(len(name) for name in buckets)
+    width = max(len(name) for name in rows)
     header = (
-        f"{'directory'.ljust(width)}  tests  pass  fail  timeout  crash  error  skip"
-        f"  subtests  subfail  time"
+        f"{'directory'.ljust(width)}  tests  pass  expfail  unexp  timeout  crash  error"
+        f"  skip  subtests  subfail  test time"
     )
     print(header)
     print("-" * len(header))
-    totals = dict.fromkeys(STATUSES, 0)
-    total_subtests = {"PASS": 0, "not PASS": 0}
-    total_ms = 0
-    for directory in sorted(buckets):
-        row = buckets[directory]
-        for status in STATUSES:
-            totals[status] += row[status]
-        subtotal = subtests[directory]
-        total_subtests["PASS"] += subtotal["PASS"]
-        total_subtests["not PASS"] += subtotal["not PASS"]
-        total_ms += durations[directory]
-        tests = sum(row.values())
-        print(
-            f"{directory.ljust(width)}  "
-            f"{tests:5}  {row['PASS']:4}  {row['FAIL']:4}  {row['TIMEOUT']:7}  "
-            f"{row['CRASH']:5}  {row['ERROR']:5}  {row['SKIP']:4}  "
-            f"{subtotal['PASS'] + subtotal['not PASS']:8}  {subtotal['not PASS']:7}  "
-            f"{durations[directory] / 1000:5.1f}s"
+
+    def line(name: str, row: dict[str, int]) -> str:
+        return (
+            f"{name.ljust(width)}  {row['tests']:5}  {row['pass']:4}  {row['expected_fail']:7}  "
+            f"{row['unexpected']:5}  {row['timeout']:7}  {row['crash']:5}  {row['error']:5}  "
+            f"{row['skip']:4}  {row['subtests']:8}  {row['subfail']:7}  "
+            f"{row['time_ms'] / 1000:8.1f}s"
         )
+
+    totals = dict.fromkeys(buckets, 0)
+    for directory in sorted(rows):
+        for key, value in rows[directory].items():
+            totals[key] += value
+        print(line(directory, rows[directory]))
     print("-" * len(header))
-    tests = sum(totals.values())
-    print(
-        f"{'TOTAL'.ljust(width)}  {tests:5}  {totals['PASS']:4}  {totals['FAIL']:4}  "
-        f"{totals['TIMEOUT']:7}  {totals['CRASH']:5}  {totals['ERROR']:5}  {totals['SKIP']:4}  "
-        f"{total_subtests['PASS'] + total_subtests['not PASS']:8}  "
-        f"{total_subtests['not PASS']:7}  {total_ms / 1000:5.1f}s"
-    )
+    print(line("TOTAL", totals))
 
     print()
-    print(f"unexpected results ({len(unexpected)}):")
-    for test, subtest, status in unexpected[:40]:
+    print(f"needs attention ({len(attention)} entries):")
+    for test, subtest, status in attention[:MAX_LISTED]:
         label = subtest or "(test)"
-        print(f"  {status:8} {test} :: {label}")
-    if len(unexpected) > 40:
-        print(f"  ... and {len(unexpected) - 40} more")
+        print(f"  {status:10} {test} :: {label}")
+    if len(attention) > MAX_LISTED:
+        print(f"  ... and {len(attention) - MAX_LISTED} more")
     return 0
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("paths", nargs="*", help="WPT test paths to run")
-    parser.add_argument(
-        "--report",
-        type=Path,
-        help="summarize an existing wptreport instead of running",
-    )
-    args, extra = parser.parse_known_args()
+def split_args(argv: list[str]) -> tuple[Path | None, list[str], list[str], str | None]:
+    """Split our arguments from the runner's.
 
-    if args.report:
-        return summarize(args.report)
-    if not args.paths:
-        parser.error("give test paths or --report")
+    Paths are the leading positionals; `--` starts the runner extras;
+    `--report FILE` is ours.
+    """
+    report: Path | None = None
+    paths: list[str] = []
+    for index, arg in enumerate(argv):
+        if arg == "--":
+            return report, paths, list(argv[index + 1 :]), None
+        if arg == "--report":
+            if index + 1 >= len(argv):
+                return report, paths, [], "--report needs a file"
+            report = Path(argv[index + 1])
+            return report, paths, list(argv[index + 2 :]), None
+        if arg.startswith("--report="):
+            return report, paths, list(argv[index + 1 :]), None
+        if arg.startswith("-"):
+            return (
+                report,
+                paths,
+                list(argv[index:]),
+                "runner options must follow the test paths (or a literal `--`)",
+            )
+        paths.append(arg)
+    return report, paths, [], None
+
+
+def main() -> int:
+    report, paths, extra, error = split_args(sys.argv[1:])
+    if error:
+        print(f"score: {error}", file=sys.stderr)
+        return 2
+    if report is not None:
+        if paths or extra:
+            print(
+                "score: --report summarizes an existing report; give no test paths",
+                file=sys.stderr,
+            )
+            return 2
+        return summarize(report)
+    if not paths:
+        print("score: give test paths or --report FILE", file=sys.stderr)
+        return 2
 
     started = time.monotonic()
-    report = run(args.paths, extra)
-    code = summarize(report)
     try:
-        os.unlink(report)
-    except OSError:
-        pass
-    print(f"wall time: {time.monotonic() - started:.1f}s", file=sys.stderr)
-    return code
+        report_path, runner_exit = run(paths, extra)
+    except OSError as error:
+        print(f"score: could not start the runner: {error}", file=sys.stderr)
+        return 1
+    try:
+        if runner_exit != 0:
+            print(
+                f"runner failed with exit {runner_exit}; report kept at {report_path}",
+                file=sys.stderr,
+            )
+            summarize(report_path)
+            return runner_exit
+        return summarize(report_path)
+    finally:
+        try:
+            os.unlink(report_path)
+        except OSError:
+            pass
+        print(f"wall time: {time.monotonic() - started:.1f}s", file=sys.stderr)
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except BrokenPipeError:
+        # `score ... | head` closes stdout early; exit quietly.
+        devnull = os.open(os.devnull, os.O_WRONLY)
+        os.dup2(devnull, sys.stdout.fileno())
+        raise SystemExit(0)

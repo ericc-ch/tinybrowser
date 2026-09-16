@@ -34,12 +34,7 @@ impl Document {
                     .collect(),
             ),
             ScriptValue::Node(id) => {
-                if let Some(&remote) = self.remote_by_node.get(&id) {
-                    return crate::RemoteValue::Node(remote);
-                }
-                self.next_remote = self.next_remote.saturating_add(1);
-                self.remote_by_node.insert(id, self.next_remote);
-                crate::RemoteValue::Node(self.next_remote)
+                crate::RemoteValue::Node(self.world.borrow_mut().remote_id(id))
             }
         }
     }

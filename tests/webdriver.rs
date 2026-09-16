@@ -364,6 +364,158 @@ fn one_session_delete_leaves_pages_close_last_window_invalidates() {
     assert_eq!(invalid["value"]["error"], json!("invalid session id"));
 }
 
+const ELEMENT_KEY: &str = "element-6066-11e4-a52e-4f735466cecf";
+
+/// Serves one page over HTTP for any request until the test process exits.
+fn spawn_page(html: &'static str) -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind page server");
+    let port = listener.local_addr().expect("page addr").port();
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { break };
+            let mut buf = [0u8; 1024];
+            let _received = stream.read(&mut buf);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                html.len(),
+                html
+            );
+            let _written = stream.write_all(response.as_bytes());
+        }
+    });
+    port
+}
+
+fn create_session(addr: &str) -> String {
+    let created = request(addr, "POST", "/session", Some("{}"));
+    created["value"]["sessionId"]
+        .as_str()
+        .expect("session id")
+        .to_owned()
+}
+
+fn navigate(addr: &str, id: &str, url: &str) {
+    let navigated = request(
+        addr,
+        "POST",
+        &format!("/session/{id}/url"),
+        Some(&json!({ "url": url }).to_string()),
+    );
+    assert_eq!(navigated["value"], Value::Null);
+}
+
+fn find(addr: &str, id: &str, selector: &str) -> String {
+    let body = json!({"using": "css selector", "value": selector}).to_string();
+    let found = request(addr, "POST", &format!("/session/{id}/element"), Some(&body));
+    found["value"][ELEMENT_KEY]
+        .as_str()
+        .expect("element id")
+        .to_owned()
+}
+
+#[test]
+fn element_roundtrip() {
+    let page_port = spawn_page("<!doctype html><button id=b>B</button><input id=i>");
+    let (addr, _fixture) = start(Vec::new());
+    let id = create_session(&addr);
+    navigate(&addr, &id, &format!("http://127.0.0.1:{page_port}/"));
+
+    // Hold the page objects, so their wrappers survive between calls, and
+    // record whether the driver click is trusted.
+    let held = request(
+        &addr,
+        "POST",
+        &format!("/session/{id}/execute/sync"),
+        Some(
+            r#"{"script":"window.__clicks=0; document.getElementById('b').addEventListener('click', e => { window.__clicks += e.isTrusted ? 10 : 1 }); window.__input = document.getElementById('i'); return 1","args":[]}"#,
+        ),
+    );
+    assert_eq!(held["value"].as_f64(), Some(1.0));
+
+    let button = find(&addr, &id, "#b");
+    let clicked = request(
+        &addr,
+        "POST",
+        &format!("/session/{id}/element/{button}/click"),
+        Some("{}"),
+    );
+    assert_eq!(clicked["value"], Value::Null);
+    let clicks = request(
+        &addr,
+        "POST",
+        &format!("/session/{id}/execute/sync"),
+        Some(r#"{"script":"return window.__clicks","args":[]}"#),
+    );
+    assert_eq!(clicks["value"].as_f64(), Some(10.0));
+
+    let input = find(&addr, &id, "#i");
+    let sent = request(
+        &addr,
+        "POST",
+        &format!("/session/{id}/element/{input}/value"),
+        Some(r#"{"text":"hi"}"#),
+    );
+    assert_eq!(sent["value"], Value::Null);
+    let value = request(
+        &addr,
+        "POST",
+        &format!("/session/{id}/execute/sync"),
+        Some(r#"{"script":"return window.__input.value","args":[]}"#),
+    );
+    assert_eq!(value["value"], json!("hi"));
+
+    // The virtual rectangle is present for any live element.
+    let rect = request(
+        &addr,
+        "GET",
+        &format!("/session/{id}/element/{button}/rect"),
+        None,
+    );
+    assert!(
+        rect["value"]["width"]
+            .as_f64()
+            .is_some_and(|width| width > 0.0)
+    );
+}
+
+#[test]
+fn cookie_roundtrip() {
+    let page_port = spawn_page("<!doctype html><title>cookies</title>");
+    let (addr, _fixture) = start(Vec::new());
+    let id = create_session(&addr);
+    navigate(&addr, &id, &format!("http://127.0.0.1:{page_port}/"));
+
+    let script_set = request(
+        &addr,
+        "POST",
+        &format!("/session/{id}/execute/sync"),
+        Some(r#"{"script":"document.cookie='a=1; path=/'; return document.cookie","args":[]}"#),
+    );
+    assert_eq!(script_set["value"], json!("a=1"));
+    let named = request(&addr, "GET", &format!("/session/{id}/cookie/a"), None);
+    assert_eq!(named["value"]["value"], json!("1"));
+    let added = request(
+        &addr,
+        "POST",
+        &format!("/session/{id}/cookie"),
+        Some(r#"{"cookie":{"name":"h","value":"2","path":"/","httpOnly":true}}"#),
+    );
+    assert_eq!(added["value"], Value::Null);
+    let http_only = request(&addr, "GET", &format!("/session/{id}/cookie/h"), None);
+    assert_eq!(http_only["value"]["httpOnly"], json!(true));
+    let all = request(&addr, "GET", &format!("/session/{id}/cookie"), None);
+    assert_eq!(all["value"].as_array().map(Vec::len), Some(2));
+    let cleared = request(&addr, "DELETE", &format!("/session/{id}/cookie"), None);
+    assert_eq!(cleared["value"], Value::Null);
+    let empty = request(
+        &addr,
+        "POST",
+        &format!("/session/{id}/execute/sync"),
+        Some(r#"{"script":"return document.cookie","args":[]}"#),
+    );
+    assert_eq!(empty["value"], json!(""));
+}
+
 #[test]
 fn execute_sync_interrupts_infinite_loop() {
     let (addr, _fixture) = start(Vec::new());
@@ -401,7 +553,8 @@ fn unknown_element_click_and_perform_actions_are_unsupported() {
         .as_str()
         .expect("session id")
         .to_owned();
-    // Element ids are minted by "Find Element"; an unissued id is stale.
+    // Element ids are minted by any node returned to the client; an id that
+    // was never issued fails the engine-side lookup as an unknown element.
     let click = request(
         &addr,
         "POST",

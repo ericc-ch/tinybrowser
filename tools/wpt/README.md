@@ -7,20 +7,21 @@ passes `--resolve` maps instead of editing `/etc/hosts`.
 
 ```sh
 nix develop --command ./tools/wpt/run dom/events/ --exclude=worker
-nix develop --command ./tools/wpt/score dom/nodes/ --processes 4
+nix develop --command ./tools/wpt/score dom/nodes/ -- --processes 4
 ```
 
-`tools/wpt/score` prints one row per directory with pass/unexpected buckets,
-subtest counts, and wall time, then lists the unexpected results. It is the
-grind instrument; `--report FILE` summarizes an existing `--log-wptreport`.
+`tools/wpt/score` prints one row per directory with pass, expected-fail, and
+unexpected buckets, subtest counts, and test time, then lists what needs
+attention. It is the grind instrument; `--report FILE` summarizes an existing
+`--log-wptreport`. Runner options follow a literal `--`.
 
 ## Enabled
 
 | Capability | Notes |
 |---|---|
-| testharness | Windows and same-site frames. |
+| testharness | Multiple windows and same-site frames. |
 | crashtest | Page must load and settle without killing the renderer. |
-| HTTPS / WSS | `--ssl-type=openssl`; the generated CA is passed as `--tls-ca`. |
+| HTTPS | `--ssl-type=openssl`; the generated CA is passed as `--tls-ca`. The same connector carries WSS, but no WSS test has been run yet. |
 | testdriver | `supports_testdriver = True`; click, send keys, cookies, window rect. |
 | Parallel processes | `--processes N` (each process gets its own browser and ports). |
 
@@ -34,8 +35,13 @@ These are visible in runs and fail honestly; they are not harness restrictions.
 | `Worker` | ~1,000 `.worker.js` files |
 | User activation (`test_driver.bless`) | ~340 files |
 | Permissions, BiDi, Web Bluetooth | ~350 files |
-| Reftests / print-reftest | Need layout and rendering |
-| wdspec | Needs pytest plus a wider WebDriver command surface |
+
+## Test types without an executor
+
+`reftest`, `print-reftest`, and `wdspec` are not registered for this product,
+so `wpt run` reports an unsupported test type and runs nothing for them.
+Reftests need layout and rendering; wdspec needs pytest plus a wider WebDriver
+command surface (element properties, frames, actions, screenshots).
 
 ## Conventions
 

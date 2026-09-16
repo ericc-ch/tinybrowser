@@ -97,11 +97,17 @@ impl NetworkSession {
     /// Drops every cookie from the live jar.
     pub(crate) fn clear_cookies(&self) {
         self.agent.clear_cookies();
+        self.store.mark_dirty();
     }
 
-    /// Stores one `Set-Cookie` line for `url`.
-    pub(crate) fn add_cookie(&self, cookie: &str, url: &Url) {
-        self.agent.set_cookie(cookie, url);
+    /// Stores one `Set-Cookie` line for `url` with HTTP-level rules,
+    /// returning whether it was stored.
+    pub(crate) fn add_cookie(&self, cookie: &str, url: &Url) -> bool {
+        let stored = self.agent.store_cookie_http(cookie, url);
+        if stored {
+            self.store.mark_dirty();
+        }
+        stored
     }
 }
 

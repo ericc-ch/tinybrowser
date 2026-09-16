@@ -187,8 +187,8 @@ fn resolve_builder(specs: &[String], tls_ca: &[PathBuf]) -> Result<AgentBuilder,
         builder = builder.resolve(spec).map_err(|error| error.to_string())?;
     }
     for path in tls_ca {
-        let pem = std::fs::read(path)
-            .map_err(|error| format!("--tls-ca {}: {error}", path.display()))?;
+        let pem =
+            std::fs::read(path).map_err(|error| format!("--tls-ca {}: {error}", path.display()))?;
         builder = builder
             .tls_ca_pem(&pem)
             .map_err(|error| format!("--tls-ca {}: {error}", path.display()))?;

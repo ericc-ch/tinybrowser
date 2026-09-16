@@ -72,6 +72,7 @@ pub(crate) struct EventState {
     pub(crate) time_stamp: f64,
     pub(crate) target: Option<EventTargetRef>,
     pub(crate) current_target: Option<EventTargetRef>,
+    pub(crate) related_target: Option<EventTargetRef>,
     pub(crate) phase: u16,
     pub(crate) stop_propagation: bool,
     pub(crate) stop_immediate: bool,
@@ -145,6 +146,7 @@ impl JsEvent {
         state.canceled = false;
         state.is_trusted = false;
         state.target = None;
+        state.related_target = None;
         state.typ = typ;
         state.bubbles = bubbles;
         state.cancelable = cancelable;
@@ -186,6 +188,12 @@ impl JsEvent {
     #[qjs(get, rename = "currentTarget")]
     fn get_current_target<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
         stored_target(&ctx, self.state().current_target.as_ref())
+    }
+
+    // https://w3c.github.io/uievents/#dom-focusevent-relatedtarget
+    #[qjs(get, rename = "relatedTarget")]
+    fn get_related_target<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
+        stored_target(&ctx, self.state().related_target.as_ref())
     }
 
     // https://dom.spec.whatwg.org/#dom-event-eventphase
@@ -469,10 +477,7 @@ pub(crate) fn create_event<'js>(ctx: &Ctx<'js>, interface: &str) -> Result<Value
     }
 }
 
-fn set_custom_event_prototype<'js>(
-    ctx: &Ctx<'js>,
-    class: &Class<'js, JsEvent>,
-) -> Result<()> {
+fn set_custom_event_prototype<'js>(ctx: &Ctx<'js>, class: &Class<'js, JsEvent>) -> Result<()> {
     let ctor: Object = ctx.globals().get("CustomEvent")?;
     let proto: Object = ctor.get("prototype")?;
     class.set_prototype(Some(&proto))
@@ -487,7 +492,10 @@ fn set_custom_event_prototype<'js>(
     clippy::needless_pass_by_value,
     reason = "rquickjs Func ABI passes arguments by value"
 )]
-pub(crate) fn construct_custom_event<'js>(ctx: Ctx<'js>, args: Rest<Value<'js>>) -> Result<Value<'js>> {
+pub(crate) fn construct_custom_event<'js>(
+    ctx: Ctx<'js>,
+    args: Rest<Value<'js>>,
+) -> Result<Value<'js>> {
     let (typ, init) = event_arguments(&ctx, args)?;
     let class = Class::instance(ctx.clone(), event_from_init(&ctx, typ, init.as_ref())?)?;
     set_custom_event_prototype(&ctx, &class)?;
@@ -585,9 +593,11 @@ fn event_arguments<'js>(
     let init = match args.next() {
         None => None,
         Some(value) if value.is_undefined() || value.is_null() => None,
-        Some(value) => Some(value.into_object().ok_or_else(|| {
-            Exception::throw_type(ctx, "eventInitDict must be an object")
-        })?),
+        Some(value) => Some(
+            value
+                .into_object()
+                .ok_or_else(|| Exception::throw_type(ctx, "eventInitDict must be an object"))?,
+        ),
     };
     Ok((typ, init))
 }
@@ -634,7 +644,11 @@ pub(crate) fn add_listener<'js>(
     let typ = bindings::webidl_to_string(ctx, typ)?;
     let callback = listener_callback(ctx, callback)?;
     let options = ListenerOptions::read(ctx, options)?;
-    if options.signal.as_ref().is_some_and(|signal| signal_aborted(ctx, signal)) {
+    if options
+        .signal
+        .as_ref()
+        .is_some_and(|signal| signal_aborted(ctx, signal))
+    {
         return Ok(());
     }
     // A null callback still flattens the options but is never added
@@ -741,9 +755,35 @@ pub(crate) fn fire_trusted(
     bubbles: bool,
     cancelable: bool,
 ) -> Result<()> {
+    fire_trusted_with_related(ctx, target, typ, bubbles, cancelable, None)
+}
+
+/// Creates and dispatches a trusted event with a `relatedTarget`, as the
+/// focus update steps require
+/// (<https://html.spec.whatwg.org/multipage/interaction.html#focus-update-steps>).
+pub(crate) fn fire_trusted_with_related(
+    ctx: &Ctx<'_>,
+    target: EventTargetKey,
+    typ: &str,
+    bubbles: bool,
+    cancelable: bool,
+    related: Option<EventTargetRef>,
+) -> Result<()> {
     let event = Class::instance(ctx.clone(), JsEvent::trusted(typ, bubbles, cancelable))?;
+    event.borrow().state_mut().related_target = related;
     dispatch(ctx, target, &event)?;
     Ok(())
+}
+
+/// Dispatches an already-trusted user-agent event without the
+/// `dispatchEvent()` step that clears `isTrusted`
+/// (<https://dom.spec.whatwg.org/#concept-event-dispatch>).
+pub(crate) fn dispatch_trusted<'js>(
+    ctx: &Ctx<'js>,
+    target: EventTargetKey,
+    event: &Class<'js, JsEvent>,
+) -> Result<bool> {
+    dispatch(ctx, target, event)
 }
 
 /// [Dispatch](https://dom.spec.whatwg.org/#concept-event-dispatch) an event.
@@ -928,7 +968,11 @@ fn invoke<'js>(
         state.phase = phase;
         state.current_target = Some(item.reference.clone());
     }
-    let listeners = item.reference.world.borrow().listener_snapshot(item.reference.key);
+    let listeners = item
+        .reference
+        .world
+        .borrow()
+        .listener_snapshot(item.reference.key);
     let event_value = Class::into_value(event.clone());
     for listener in listeners {
         if listener.removed.get() {
@@ -945,12 +989,18 @@ fn invoke<'js>(
             && signal_aborted(ctx, signal)
         {
             listener.removed.set(true);
-            item.reference.world.borrow_mut().remove_listener(item.reference.key, &listener);
+            item.reference
+                .world
+                .borrow_mut()
+                .remove_listener(item.reference.key, &listener);
             continue;
         }
         if listener.once {
             listener.removed.set(true);
-            item.reference.world.borrow_mut().remove_listener(item.reference.key, &listener);
+            item.reference
+                .world
+                .borrow_mut()
+                .remove_listener(item.reference.key, &listener);
         }
         if listener.passive {
             event.borrow().state_mut().in_passive = true;
@@ -1134,10 +1184,7 @@ fn target_world(ctx: &Ctx<'_>, target: EventTargetKey) -> Result<Rc<RefCell<Worl
     }
 }
 
-fn stored_target<'js>(
-    ctx: &Ctx<'js>,
-    reference: Option<&EventTargetRef>,
-) -> Result<Value<'js>> {
+fn stored_target<'js>(ctx: &Ctx<'js>, reference: Option<&EventTargetRef>) -> Result<Value<'js>> {
     match reference {
         Some(reference) => resolve_target(ctx, reference),
         None => Ok(Value::new_null(ctx.clone())),
@@ -1154,12 +1201,10 @@ fn resolve_target<'js>(ctx: &Ctx<'js>, reference: &EventTargetRef) -> Result<Val
             None => Ok(ctx.globals().into_value()),
         },
         EventTargetKey::Node(id) => bindings::wrap_node(ctx, id),
-        EventTargetKey::Standalone(id) => {
-            match reference.world.borrow().standalone_target(id) {
-                Some(saved) => Ok(saved.restore(ctx)?.into_value()),
-                None => Ok(Value::new_null(ctx.clone())),
-            }
-        }
+        EventTargetKey::Standalone(id) => match reference.world.borrow().standalone_target(id) {
+            Some(saved) => Ok(saved.restore(ctx)?.into_value()),
+            None => Ok(Value::new_null(ctx.clone())),
+        },
     }
 }
 

@@ -126,9 +126,8 @@ impl AgentBuilder {
     ///
     /// [`NetError::Transport`] when `pem` is not a certificate.
     pub fn tls_ca_pem(mut self, pem: &[u8]) -> Result<Self, NetError> {
-        let certificate = native_tls::Certificate::from_pem(pem).map_err(|error| {
-            NetError::Transport(TransportError::Tls(error.to_string().into()))
-        })?;
+        let certificate = native_tls::Certificate::from_pem(pem)
+            .map_err(|error| NetError::Transport(TransportError::Tls(error.to_string().into())))?;
         self.tls_cas.push(certificate);
         Ok(self)
     }
@@ -226,6 +225,28 @@ impl Agent {
                     cross_site_redirect: false,
                 },
             );
+    }
+
+    /// Stores one `Set-Cookie` line with HTTP-level rules, so an `HttpOnly`
+    /// cookie is allowed where `document.cookie` would refuse it. Returns
+    /// whether the jar stored the cookie
+    /// (<https://w3c.github.io/webdriver/#add-cookie>).
+    pub fn store_cookie_http(&self, value: &str, uri: &Url) -> bool {
+        self.jar
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .store(
+                value,
+                CookieOp {
+                    url: uri,
+                    now: (self.now)(),
+                    kind: RetrievalKind::Http,
+                    initiator_kind: InitiatorKind::Fetch,
+                    method_is_safe: true,
+                    initiator: Some(uri),
+                    cross_site_redirect: false,
+                },
+            )
     }
 
     /// Cookies visible to `uri`, including session and `HttpOnly` cookies.
