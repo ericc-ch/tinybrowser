@@ -131,7 +131,12 @@ Triage rules:
   still break a test.
 - Skip the docstring-coverage threshold. It is a bot metric, not a defect.
 - Defer out-of-scope work in a PR comment with a reason, not silently.
-- Reply to every addressed thread with `Addressed in <sha>: <what changed>`.
+- Reply to every addressed thread with the fixing commit:
+  ```sh
+  gh api --method POST "repos/$REPO/pulls/<pr>/comments" \
+    -f body="Addressed in <sha>: <what changed>" -F in_reply_to=<comment-id>
+  ```
+  The `/replies` route returns 404 on this repository.
 - Prefer the pass that covers the final head; when CodeRabbit does not
   re-review, the exit-2 fallback above applies.
 
