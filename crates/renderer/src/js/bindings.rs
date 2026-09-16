@@ -9,13 +9,13 @@ use dom::{
     svg_namespace,
 };
 use rquickjs::{
-    Class, Ctx, Exception, FromJs, Function, Object, Persistent, Result, Value,
+    Array, Class, Ctx, Exception, FromJs, Function, Object, Persistent, Result, Value,
     class::Trace,
     function::{Constructor, Opt, Rest},
     prelude::This,
 };
 
-use super::events::{self, JsEvent, JsEventTarget};
+use super::events::{self, EventTargetRef, JsEvent, JsEventTarget};
 use super::world::{
     AttrState, DocumentStreamCommand, EventTargetKey, FrameNavigation, Handle, Observation,
     ObserverOptions, ObserverState, RecordData, World,
@@ -2320,6 +2320,126 @@ impl JsNode {
         events::dispatch_event(&ctx, EventTargetKey::Node(self.handle.0), &event)
     }
 
+    // https://html.spec.whatwg.org/multipage/interaction.html#dom-click
+    #[qjs(rename = "click")]
+    fn click(&self, ctx: Ctx<'_>) -> Result<()> {
+        element_click(&ctx, self.handle.0)
+    }
+
+    // https://html.spec.whatwg.org/multipage/interaction.html#dom-focus
+    #[qjs(rename = "focus")]
+    fn focus(&self, ctx: Ctx<'_>) -> Result<()> {
+        if is_focusable(&ctx, self.handle.0)? {
+            focus_node(&ctx, self.handle.0)?;
+        }
+        Ok(())
+    }
+
+    // https://html.spec.whatwg.org/multipage/interaction.html#dom-blur
+    #[qjs(rename = "blur")]
+    fn blur(&self, ctx: Ctx<'_>) -> Result<()> {
+        blur_node(&ctx, self.handle.0)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-document-activeelement
+    #[qjs(get, rename = "activeElement")]
+    fn active_element<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
+        let document = self.handle.0;
+        let world = world(&ctx)?;
+        let active = world.borrow().active_element(document.document_id());
+        if let Some(node) = active
+            && world
+                .borrow()
+                .document(node)
+                .is_some_and(|parsed| parsed.dom.is_connected(node))
+        {
+            return wrap_node(&ctx, node);
+        }
+        let fallback = {
+            let world = world.borrow();
+            let Some(parsed) = world.document(document) else {
+                return Ok(Value::new_null(ctx));
+            };
+            let root = parsed.dom.document();
+            let body = parsed.dom.select_first(root, "body").ok().flatten();
+            body.or_else(|| {
+                parsed
+                    .dom
+                    .children(root)
+                    .into_iter()
+                    .flatten()
+                    .copied()
+                    .find(|&id| {
+                        matches!(
+                            parsed.dom.get(id).map(|node| node.kind()),
+                            Some(NodeKind::Element { .. })
+                        )
+                    })
+            })
+        };
+        match fallback {
+            Some(node) => wrap_node(&ctx, node),
+            None => Ok(Value::new_null(ctx)),
+        }
+    }
+
+    // The engine has no layout; element geometry is the virtual box (see
+    // `virtual_rect`).
+    #[qjs(rename = "getBoundingClientRect")]
+    fn get_bounding_client_rect<'js>(&self, ctx: Ctx<'js>) -> Result<Object<'js>> {
+        match element_index(&ctx, self.handle.0)? {
+            Some(index) => virtual_rect_object(&ctx, index),
+            None => rect_object(&ctx, 0.0, 0.0, 0.0, 0.0),
+        }
+    }
+
+    #[qjs(rename = "getClientRects")]
+    fn get_client_rects<'js>(&self, ctx: Ctx<'js>) -> Result<Array<'js>> {
+        let array = Array::new(ctx.clone())?;
+        if let Some(index) = element_index(&ctx, self.handle.0)? {
+            array.set(0, virtual_rect_object(&ctx, index)?)?;
+        }
+        Ok(array)
+    }
+
+    /// No layout means there is nothing to scroll.
+    #[qjs(rename = "scrollIntoView")]
+    fn scroll_into_view(&self) {}
+
+    // https://html.spec.whatwg.org/multipage/nav-history-apis.html#dom-document-defaultview
+    #[qjs(get, rename = "defaultView")]
+    fn default_view<'js>(&self, ctx: Ctx<'js>) -> Value<'js> {
+        // A document with no browsing context, such as one from DOMParser or
+        // `createDocument`, has no view.
+        let has_view =
+            world(&ctx).is_ok_and(|world| world.borrow().is_main_document(self.handle.0));
+        if has_view {
+            ctx.globals().into_value()
+        } else {
+            Value::new_null(ctx)
+        }
+    }
+
+    // The no-layout hit test: the deepest element whose virtual box contains
+    // the point (see `element_at_point`).
+    #[qjs(rename = "elementsFromPoint")]
+    fn elements_from_point<'js>(&self, ctx: Ctx<'js>, x: f64, y: f64) -> Result<Array<'js>> {
+        let array = Array::new(ctx.clone())?;
+        let Some(node) = element_at_point(&ctx, self.handle.0, x, y)? else {
+            return Ok(array);
+        };
+        // The hit-test stack: the element and its ancestors, topmost first.
+        let world = world_for_node(&ctx, node)?;
+        let mut index = 0;
+        let mut cursor = Some(node);
+        while let Some(current) = cursor {
+            array.set(index, wrap_node(&ctx, current)?)?;
+            index += 1;
+            cursor = world.borrow().node_parent(current);
+        }
+        Ok(array)
+    }
+
     // https://dom.spec.whatwg.org/#dom-document-createevent
     #[qjs(rename = "createEvent")]
     fn create_event<'js>(&self, ctx: Ctx<'js>, interface: Value<'js>) -> Result<Value<'js>> {
@@ -4477,6 +4597,7 @@ impl JsNode {
             .map_err(|err| throw_dom_error(&ctx, err))?;
         drop(parsed);
         drop(world);
+        fixup_focus_after_removal(&ctx, child)?;
         schedule_mutation_delivery(&ctx)?;
         wrap_node(&ctx, child)
     }
@@ -4514,6 +4635,7 @@ impl JsNode {
             .map_err(|err| throw_dom_error(&ctx, err))?;
         drop(parsed);
         drop(world);
+        fixup_focus_after_removal(&ctx, child)?;
         schedule_mutation_delivery(&ctx)?;
         wrap_node(&ctx, child)
     }
@@ -4577,6 +4699,7 @@ impl JsNode {
             .map_err(|err| throw_dom_error(&ctx, err))?;
         drop(parsed);
         drop(world);
+        fixup_focus_after_removal(&ctx, self.handle.0)?;
         schedule_mutation_delivery(&ctx)
     }
 
@@ -4742,16 +4865,10 @@ fn document_is_html_content(ctx: &Ctx<'_>, id: NodeId) -> bool {
         .is_some_and(|parsed| parsed.content_type == "text/html")
 }
 
-/// Whether `id` is the parser's main document (the one with a browsing
-/// context's URL); created documents report `about:blank`.
+/// Whether `id` is the realm's active document. See
+/// [`World::is_main_document`].
 fn is_main_document(ctx: &Ctx<'_>, id: NodeId) -> bool {
-    let Ok(world_rc) = world(ctx) else {
-        return false;
-    };
-    let world = world_rc.borrow();
-    world
-        .with_main_document(|parsed| parsed.dom.document_id() == id.document_id())
-        .unwrap_or(false)
+    world(ctx).is_ok_and(|world| world.borrow().is_main_document(id))
 }
 
 fn document_url_string(ctx: &Ctx<'_>, id: NodeId) -> String {
@@ -4862,6 +4979,27 @@ pub(super) fn install(ctx: &Ctx<'_>, world: &Rc<RefCell<World>>) -> Result<()> {
         .set_window(Persistent::save(ctx, globals.clone()));
     Class::<JsEvent>::define(&globals)?;
     ctx.eval::<(), _>(events::INSTALL_EVENT_CTOR_JS)?;
+    globals.set(
+        "postMessage",
+        rquickjs::prelude::Func::from(window_post_message),
+    )?;
+    // The WebDriver element bridge. It is visible to page script, which can
+    // therefore forge `isTrusted` events; gate it on a session-owned driver
+    // mode when the input model replaces this bridge.
+    globals.set(
+        "__tb_webdriver_click",
+        rquickjs::prelude::Func::from(webdriver_click),
+    )?;
+    globals.set(
+        "__tb_webdriver_send_keys",
+        rquickjs::prelude::Func::from(webdriver_send_keys),
+    )?;
+    globals.set(
+        "__tb_webdriver_element",
+        rquickjs::prelude::Func::from(webdriver_element),
+    )?;
+    globals.set("innerWidth", VIRTUAL_VIEWPORT_WIDTH)?;
+    globals.set("innerHeight", VIRTUAL_VIEWPORT_HEIGHT)?;
     globals.set(
         "__tb_new_custom_event",
         rquickjs::prelude::Func::from(events::construct_custom_event),
@@ -5012,10 +5150,531 @@ pub(super) fn fire_node_load(ctx: &Ctx<'_>, id: NodeId) -> Result<()> {
     events::fire_trusted(ctx, EventTargetKey::Node(id), "load", false, false)
 }
 
+/// The node-removal focus fixup: when the document's focused area is inside
+/// a removed subtree, clear it without firing events
+/// (<https://html.spec.whatwg.org/multipage/dom.html#node-remove-focus-fixup>).
+fn fixup_focus_after_removal(ctx: &Ctx<'_>, removed: NodeId) -> Result<()> {
+    let world = world_for_node(ctx, removed)?;
+    let document = removed.document_id();
+    let Some(active) = world.borrow().active_element(document) else {
+        return Ok(());
+    };
+    let mut cursor = Some(active);
+    while let Some(current) = cursor {
+        if current == removed {
+            world.borrow_mut().set_active_element(document, None);
+            return Ok(());
+        }
+        cursor = world.borrow().node_parent(current);
+    }
+    Ok(())
+}
+
 pub(super) fn host_node_id<'js>(ctx: &Ctx<'js>, value: &Value<'js>) -> Option<NodeId> {
     Class::<JsNode>::from_js(ctx, value.clone())
         .ok()
         .map(|node| node.borrow().node_id())
+}
+
+/// Whether an element is a focusable area
+/// (<https://html.spec.whatwg.org/multipage/interaction.html#focusable-area>).
+///
+/// The engine has no layout, so visibility and being rendered cannot be part
+/// of the decision; the element-name, disabled, and connection rules are
+/// (<https://html.spec.whatwg.org/multipage/interaction.html#focusable-area>).
+fn is_focusable(ctx: &Ctx<'_>, node: NodeId) -> Result<bool> {
+    let world = world_for_node(ctx, node)?;
+    let world = world.borrow();
+    let Some(parsed) = world.document(node) else {
+        return Ok(false);
+    };
+    let Some(entry) = parsed.dom.get(node) else {
+        return Ok(false);
+    };
+    let NodeKind::Element { name, .. } = entry.kind() else {
+        return Ok(false);
+    };
+    if !parsed.dom.is_connected(node) || is_actually_disabled(&parsed.dom, node) {
+        return Ok(false);
+    }
+    // `tabindex` and `contenteditable` apply to SVG elements too.
+    if parsed.dom.attribute(node, "tabindex").is_some() || is_editable(&parsed.dom, node) {
+        return Ok(true);
+    }
+    if name.ns != html_namespace() {
+        return Ok(false);
+    }
+    Ok(match name.local.as_ref() {
+        "input" => !is_hidden_input(&parsed.dom, node),
+        "a" | "area" => parsed.dom.attribute(node, "href").is_some(),
+        "button" | "iframe" | "select" | "textarea" => true,
+        _ => false,
+    })
+}
+
+/// The HTML "actually disabled" check for the form controls the engine
+/// supports, including descendants of a disabled `fieldset` that are not
+/// inside its first `legend`
+/// (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#concept-fe-disabled>).
+fn is_actually_disabled(dom: &dom::Dom, node: NodeId) -> bool {
+    if dom.attribute(node, "disabled").is_some()
+        && matches!(
+            node_local_name(dom, node).as_deref(),
+            Some("button" | "input" | "select" | "textarea" | "optgroup" | "option" | "fieldset")
+        )
+    {
+        return true;
+    }
+    let mut cursor = dom.parent(node);
+    while let Some(parent) = cursor {
+        if node_local_name(dom, parent).as_deref() == Some("fieldset")
+            && dom.attribute(parent, "disabled").is_some()
+        {
+            let first_legend = dom
+                .children(parent)
+                .into_iter()
+                .flatten()
+                .copied()
+                .find(|&child| node_local_name(dom, child).as_deref() == Some("legend"));
+            if let Some(legend) = first_legend {
+                let mut inner = Some(node);
+                while let Some(current) = inner {
+                    if current == legend {
+                        return false;
+                    }
+                    inner = dom.parent(current);
+                }
+            }
+            return true;
+        }
+        cursor = dom.parent(parent);
+    }
+    false
+}
+
+/// Whether the element is an editing host through `contenteditable`,
+/// inheriting the value from ancestors. Only `""`, `true`, and
+/// `plaintext-only` enable editing
+/// (<https://html.spec.whatwg.org/multipage/interaction.html#attr-contenteditable>).
+fn is_editable(dom: &dom::Dom, node: NodeId) -> bool {
+    let mut cursor = Some(node);
+    while let Some(current) = cursor {
+        if let Some(value) = dom.attribute(current, "contenteditable") {
+            if value.is_empty()
+                || value.eq_ignore_ascii_case("true")
+                || value.eq_ignore_ascii_case("plaintext-only")
+            {
+                return true;
+            }
+            if value.eq_ignore_ascii_case("false") {
+                return false;
+            }
+        }
+        cursor = dom.parent(current);
+    }
+    false
+}
+
+fn is_hidden_input(dom: &dom::Dom, node: NodeId) -> bool {
+    dom.attribute(node, "type")
+        .is_some_and(|kind| kind.eq_ignore_ascii_case("hidden"))
+}
+
+fn node_local_name(dom: &dom::Dom, node: NodeId) -> Option<String> {
+    match dom.get(node).map(|entry| entry.kind()) {
+        Some(NodeKind::Element { name, .. }) if name.ns == html_namespace() => {
+            Some(name.local.to_string())
+        }
+        _ => None,
+    }
+}
+
+/// Whether the element accepts typed text: an enabled, non-readonly text-like
+/// control. Checkboxes, radio buttons, and files do not take text input
+/// (<https://html.spec.whatwg.org/multipage/input.html#text-(type=text)-state-and-search-state-(type=search)>).
+fn is_text_control(ctx: &Ctx<'_>, node: NodeId) -> Result<bool> {
+    let world = world_for_node(ctx, node)?;
+    let world = world.borrow();
+    let Some(parsed) = world.document(node) else {
+        return Ok(false);
+    };
+    if parsed.dom.get(node).is_none() || is_actually_disabled(&parsed.dom, node) {
+        return Ok(false);
+    }
+    if parsed.dom.attribute(node, "readonly").is_some() {
+        return Ok(false);
+    }
+    let Some(local) = node_local_name(&parsed.dom, node) else {
+        return Ok(false);
+    };
+    Ok(match local.as_str() {
+        "textarea" => true,
+        "input" => {
+            let kind = parsed
+                .dom
+                .attribute(node, "type")
+                .unwrap_or_else(|| "text".to_owned())
+                .to_ascii_lowercase();
+            // An unknown or missing type is the Text state, so it takes keys
+            // (<https://html.spec.whatwg.org/multipage/input.html#attr-input-type>).
+            !matches!(
+                kind.as_str(),
+                "hidden"
+                    | "checkbox"
+                    | "radio"
+                    | "file"
+                    | "submit"
+                    | "reset"
+                    | "button"
+                    | "image"
+                    | "color"
+                    | "range"
+                    | "date"
+                    | "datetime-local"
+                    | "month"
+                    | "week"
+                    | "time"
+            )
+        }
+        _ => false,
+    })
+}
+
+/// Moves focus to `node`. The previously focused area is cleared before the
+/// `blur`/`focusout` chain, and the new one installed before `focus`/`focusin`
+/// (<https://html.spec.whatwg.org/multipage/interaction.html#focus-update-steps>).
+fn focus_node(ctx: &Ctx<'_>, node: NodeId) -> Result<()> {
+    let world = world_for_node(ctx, node)?;
+    let document = node.document_id();
+    let previous = world.borrow().active_element(document);
+    if previous == Some(node) {
+        return Ok(());
+    }
+    let target = |node| EventTargetRef {
+        key: EventTargetKey::Node(node),
+        world: Rc::clone(&world),
+    };
+    world.borrow_mut().set_active_element(document, None);
+    if let Some(previous) = previous {
+        events::fire_trusted_with_related(
+            ctx,
+            EventTargetKey::Node(previous),
+            "blur",
+            false,
+            false,
+            Some(target(node)),
+        )?;
+        // A handler may have moved focus; the spec's focus update steps stop
+        // when the focused area changed during the blur chain, and the
+        // abandoned target is no longer the related target.
+        if world.borrow().active_element(document).is_some() {
+            events::fire_trusted_with_related(
+                ctx,
+                EventTargetKey::Node(previous),
+                "focusout",
+                true,
+                false,
+                None,
+            )?;
+            return Ok(());
+        }
+        events::fire_trusted_with_related(
+            ctx,
+            EventTargetKey::Node(previous),
+            "focusout",
+            true,
+            false,
+            Some(target(node)),
+        )?;
+    }
+    // Handlers may have made the target unfocusable; browsers then do not
+    // designate or fire on it.
+    if !is_focusable(ctx, node)? {
+        return Ok(());
+    }
+    world.borrow_mut().set_active_element(document, Some(node));
+    let related = previous.map(target);
+    events::fire_trusted_with_related(
+        ctx,
+        EventTargetKey::Node(node),
+        "focus",
+        false,
+        false,
+        related.clone(),
+    )?;
+    events::fire_trusted_with_related(
+        ctx,
+        EventTargetKey::Node(node),
+        "focusin",
+        true,
+        false,
+        related,
+    )?;
+    Ok(())
+}
+
+/// Clears the focused area when `node` is it
+/// (<https://html.spec.whatwg.org/multipage/interaction.html#dom-blur>).
+fn blur_node(ctx: &Ctx<'_>, node: NodeId) -> Result<()> {
+    let world = world_for_node(ctx, node)?;
+    let document = node.document_id();
+    if world.borrow().active_element(document) != Some(node) {
+        return Ok(());
+    }
+    world.borrow_mut().set_active_element(document, None);
+    events::fire_trusted(ctx, EventTargetKey::Node(node), "blur", false, false)?;
+    events::fire_trusted(ctx, EventTargetKey::Node(node), "focusout", true, false)?;
+    Ok(())
+}
+
+/// Dispatches a synthetic (untrusted) `click`
+/// (<https://html.spec.whatwg.org/multipage/interaction.html#dom-click>).
+fn element_click(ctx: &Ctx<'_>, node: NodeId) -> Result<()> {
+    let world = world_for_node(ctx, node)?;
+    {
+        let world = world.borrow();
+        let Some(parsed) = world.document(node) else {
+            return Ok(());
+        };
+        if is_actually_disabled(&parsed.dom, node) || world.click_in_progress(node) {
+            return Ok(());
+        }
+    }
+    world.borrow_mut().set_click_in_progress(node, true);
+    let result = (|| {
+        let event = Class::instance(ctx.clone(), events::JsEvent::uninitialized())?;
+        event.borrow().initialize("click".to_owned(), true, true);
+        events::dispatch_event(ctx, EventTargetKey::Node(node), &event)?;
+        Ok(())
+    })();
+    world.borrow_mut().set_click_in_progress(node, false);
+    result
+}
+
+/// The `WebDriver` "element click" step: a trusted click at the element, with
+/// focus moved to it first when it is focusable.
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "rquickjs Func ABI passes arguments by value"
+)]
+fn webdriver_click<'js>(ctx: Ctx<'js>, element: Value<'js>) -> Result<()> {
+    let Some(node) = host_node_id(&ctx, &element) else {
+        return Err(Exception::throw_type(&ctx, "not an element"));
+    };
+    if is_focusable(&ctx, node)? {
+        focus_node(&ctx, node)?;
+    }
+    events::fire_trusted(&ctx, EventTargetKey::Node(node), "click", true, true)?;
+    Ok(())
+}
+
+/// The `WebDriver` "element send keys" step: focus the element and append
+/// `text` to its value, firing a trusted `input` event.
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "rquickjs Func ABI passes arguments by value"
+)]
+fn webdriver_send_keys<'js>(ctx: Ctx<'js>, element: Value<'js>, text: String) -> Result<()> {
+    let Some(node) = host_node_id(&ctx, &element) else {
+        return Err(Exception::throw_type(&ctx, "not an element"));
+    };
+    if is_focusable(&ctx, node)? {
+        focus_node(&ctx, node)?;
+    }
+    if !is_text_control(&ctx, node)? {
+        return Ok(());
+    }
+    let value = wrap_node(&ctx, node)?;
+    let Some(object) = value.as_object().cloned() else {
+        return Ok(());
+    };
+    let current = match object.get::<_, Value>("value")? {
+        value if value.is_undefined() || value.is_null() => String::new(),
+        value => value
+            .as_string()
+            .and_then(|string| string.to_string().ok())
+            .unwrap_or_default(),
+    };
+    object.set("value", format!("{current}{text}"))?;
+    events::fire_trusted(&ctx, EventTargetKey::Node(node), "input", true, false)?;
+    Ok(())
+}
+
+/// Resolves a `WebDriver` element id to its wrapper, or `null` when no node
+/// owns the id. Element commands use this so references returned by
+/// `execute_script` work as well as Find Element results
+/// (<https://w3c.github.io/webdriver/#elements>).
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "rquickjs Func ABI passes arguments by value"
+)]
+fn webdriver_element(ctx: Ctx<'_>, remote_id: f64) -> Result<Value<'_>> {
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "WebDriver element ids are small non-negative integers"
+    )]
+    let remote = remote_id as u64;
+    let world = world(&ctx)?;
+    let Some(node) = world.borrow().node_for_remote(remote) else {
+        return Ok(Value::new_null(ctx));
+    };
+    // Only a live, connected element is a valid element reference.
+    let valid = world.borrow().document(node).is_some_and(|parsed| {
+        parsed.dom.is_connected(node)
+            && matches!(
+                parsed.dom.get(node).map(|entry| entry.kind()),
+                Some(NodeKind::Element { .. })
+            )
+    });
+    if !valid {
+        return Ok(Value::new_null(ctx));
+    }
+    wrap_node(&ctx, node)
+}
+
+/// `window.postMessage(message, targetOrigin)`. The engine has no
+/// browsing-context messaging yet, so the message is always delivered at this
+/// window with this window as its source
+/// (<https://html.spec.whatwg.org/multipage/webappapis.html#dom-window-postmessage>).
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "rquickjs Func ABI passes arguments by value"
+)]
+fn window_post_message<'js>(
+    ctx: Ctx<'js>,
+    message: Value<'js>,
+    _target_origin: Opt<Value<'js>>,
+) -> Result<()> {
+    let event = Class::instance(
+        ctx.clone(),
+        events::JsEvent::trusted("message", false, false),
+    )?;
+    let origin = world(&ctx).ok().map_or_else(String::new, |world| {
+        world.borrow().document_url.origin().ascii_serialization()
+    });
+    let value = Class::into_value(event.clone());
+    if let Some(object) = value.as_object() {
+        object.set("data", message)?;
+        object.set("origin", origin)?;
+        object.set("source", ctx.globals())?;
+    }
+    // Deviations: delivery is synchronous, `targetOrigin` and the `transfer`
+    // argument are not validated, and the data is not structured-cloned. The
+    // engine has no message queue yet.
+    events::dispatch_trusted(&ctx, EventTargetKey::Window, &event)?;
+    Ok(())
+}
+
+/// Virtual viewport used for element geometry until the engine has layout.
+///
+/// The boxes are a deterministic stand-in, not a layout result: elements are
+/// placed on a 10px grid in document order inside an 800x600 viewport. They
+/// exist so `WebDriver` input targeting (`getClientRects`,
+/// `elementsFromPoint`, `scrollIntoView`) has coherent, unique geometry.
+/// Tests that assert real layout values still fail.
+const VIRTUAL_VIEWPORT_WIDTH: f64 = 800.0;
+const VIRTUAL_VIEWPORT_HEIGHT: f64 = 600.0;
+const VIRTUAL_CELL: f64 = 10.0;
+const VIRTUAL_COLUMNS: f64 = 80.0;
+
+/// The virtual box `(left, top, width, height)` for the element at `index`.
+/// Rows keep growing past the viewport so two elements never share a box.
+fn virtual_rect(index: f64) -> (f64, f64, f64, f64) {
+    let column = index % VIRTUAL_COLUMNS;
+    let row = (index / VIRTUAL_COLUMNS).floor();
+    let left = column * VIRTUAL_CELL + 1.0;
+    let top = row * VIRTUAL_CELL + 1.0;
+    let size = VIRTUAL_CELL - 2.0;
+    (left, top, size, size)
+}
+
+/// Document-order index of `node` among the document's elements.
+fn element_index(ctx: &Ctx<'_>, node: NodeId) -> Result<Option<f64>> {
+    let world = world_for_node(ctx, node)?;
+    let world = world.borrow();
+    let Some(parsed) = world.document(node) else {
+        return Ok(None);
+    };
+    let mut index = 0.0;
+    let found = walk_element_index(&parsed.dom, parsed.dom.document(), node, &mut index);
+    Ok(found.then_some(index))
+}
+
+fn walk_element_index(dom: &dom::Dom, root: NodeId, target: NodeId, index: &mut f64) -> bool {
+    // Iterative so a deeply nested document cannot overflow the stack.
+    let mut stack = vec![root];
+    while let Some(current) = stack.pop() {
+        if current == target {
+            return true;
+        }
+        if let Some(NodeKind::Element { .. }) = dom.get(current).map(|node| node.kind()) {
+            *index += 1.0;
+        }
+        if let Some(children) = dom.children(current) {
+            for child in children.rev() {
+                stack.push(*child);
+            }
+        }
+    }
+    false
+}
+
+/// The deepest element whose virtual box contains the point, if any. This is
+/// the no-layout stand-in for hit testing.
+fn element_at_point(ctx: &Ctx<'_>, document: NodeId, x: f64, y: f64) -> Result<Option<NodeId>> {
+    let world = world_for_node(ctx, document)?;
+    let world = world.borrow();
+    let Some(parsed) = world.document(document) else {
+        return Ok(None);
+    };
+    let mut index = 0.0;
+    let mut best: Option<(usize, NodeId)> = None;
+    let mut stack = vec![(parsed.dom.document(), 0usize)];
+    while let Some((current, depth)) = stack.pop() {
+        if let Some(NodeKind::Element { .. }) = parsed.dom.get(current).map(|node| node.kind()) {
+            let (left, top, width, height) = virtual_rect(index);
+            index += 1.0;
+            if x >= left
+                && x < left + width
+                && y >= top
+                && y < top + height
+                && best.is_none_or(|(best_depth, _)| depth > best_depth)
+            {
+                best = Some((depth, current));
+            }
+        }
+        if let Some(children) = parsed.dom.children(current) {
+            for child in children.rev() {
+                stack.push((*child, depth + 1));
+            }
+        }
+    }
+    Ok(best.map(|(_, node)| node))
+}
+
+fn virtual_rect_object<'js>(ctx: &Ctx<'js>, index: f64) -> Result<Object<'js>> {
+    let (left, top, width, height) = virtual_rect(index);
+    rect_object(ctx, left, top, width, height)
+}
+
+fn rect_object<'js>(
+    ctx: &Ctx<'js>,
+    left: f64,
+    top: f64,
+    width: f64,
+    height: f64,
+) -> Result<Object<'js>> {
+    let object = Object::new(ctx.clone())?;
+    object.set("x", left)?;
+    object.set("y", top)?;
+    object.set("width", width)?;
+    object.set("height", height)?;
+    object.set("top", top)?;
+    object.set("left", left)?;
+    object.set("right", left + width)?;
+    object.set("bottom", top + height)?;
+    Ok(object)
 }
 
 pub(super) fn wrap_node<'js>(ctx: &Ctx<'js>, id: NodeId) -> Result<Value<'js>> {
@@ -5314,7 +5973,8 @@ const INSTALL_BRANDS_JS: &str = r"
     'append', 'prepend', 'replaceChildren', 'querySelector', 'querySelectorAll',
     'URL', 'documentURI', 'location', 'characterSet', 'charset',
     'inputEncoding', 'contentType', 'compatMode', 'title',
-    'getElementsByName', 'importNode', 'currentScript'
+    'getElementsByName', 'importNode', 'currentScript', 'activeElement',
+    'elementsFromPoint', 'defaultView'
   ], true);
   const ElementInterface = define('Element', NodeInterface, [
     'getElementsByTagName', 'getElementsByTagNameNS', 'getElementsByClassName',
@@ -5330,7 +5990,7 @@ const INSTALL_BRANDS_JS: &str = r"
     'before', 'after', 'replaceWith', 'previousElementSibling',
     'nextElementSibling', 'tagName', 'localName', 'prefix', 'namespaceURI',
     'className', 'classList', 'dataset', 'id', 'src', 'href', 'name', 'content', 'outerHTML', 'innerHTML', 'style',
-    'remove'
+    'remove', 'getBoundingClientRect', 'getClientRects', 'scrollIntoView'
   ]);
   // classList is `[PutForwards=value]`: assigning to it sets `.value`
   // (<https://dom.spec.whatwg.org/#dom-element-classlist>).
@@ -5363,10 +6023,10 @@ const INSTALL_BRANDS_JS: &str = r"
     'append', 'prepend', 'replaceChildren', 'querySelector', 'querySelectorAll',
     'getElementById'
   ], true);
-  const HTMLElementInterface = define('HTMLElement', ElementInterface, []);
+  const HTMLElementInterface = define('HTMLElement', ElementInterface, ['click', 'focus', 'blur']);
   const HTMLUnknownElementInterface = define('HTMLUnknownElement', HTMLElementInterface, []);
   const HTMLMediaElementInterface = define('HTMLMediaElement', HTMLElementInterface, []);
-  const SVGElementInterface = define('SVGElement', ElementInterface, []);
+  const SVGElementInterface = define('SVGElement', ElementInterface, ['click', 'focus', 'blur']);
   const table = {
     Document: DocumentInterface.prototype,
     XMLDocument: XMLDocumentInterface.prototype,

@@ -115,23 +115,24 @@ pub enum RetrievalKind {
 }
 
 impl CookieJar {
-    /// Stores one `Set-Cookie` line, ignoring it when the rules reject it.
+    /// Stores one `Set-Cookie` line, reporting whether it was stored.
     ///
     /// Rejection is not an error: a malformed line, a public-suffix domain, or
     /// a `SameSite` cookie set from a cross-site context all mean "keep the
     /// existing state".
-    pub fn store(&mut self, set_cookie: &str, op: CookieOp<'_>) {
+    pub fn store(&mut self, set_cookie: &str, op: CookieOp<'_>) -> bool {
         let Some(parsed) = parse_set_cookie(set_cookie) else {
-            return;
+            return false;
         };
         let Some(stored) = receive_cookie(parsed, &op, &self.cookies) else {
-            return;
+            return false;
         };
         self.cookies
             .retain(|old| !same_cookie_identity(old, &stored));
         self.cookies.push(stored);
         self.evict_expired(op.now);
         self.evict_excess();
+        true
     }
 
     /// The `Cookie` header value for `op`: matching cookies, longest path
@@ -176,6 +177,28 @@ impl CookieJar {
         out
     }
 
+    /// Cookies that would be sent for `op`, including session and `HttpOnly`
+    /// cookies. This is the `WebDriver` view of the jar
+    /// (<https://w3c.github.io/webdriver/#get-all-cookies>).
+    pub fn records_for(&mut self, op: CookieOp<'_>) -> Vec<CookieRecord> {
+        self.evict_expired(op.now);
+        let Some(host) = canonicalize_host(op.url) else {
+            return Vec::new();
+        };
+        let path = op.url.path();
+        self.cookies
+            .iter()
+            .filter(|cookie| cookie.matches(&host, path, &op))
+            .map(StoredCookie::record)
+            .collect()
+    }
+
+    /// Drops every cookie, session or persistent
+    /// (<https://w3c.github.io/webdriver/#delete-all-cookies>).
+    pub fn clear(&mut self) {
+        self.cookies.clear();
+    }
+
     fn evict_expired(&mut self, now: SystemTime) {
         self.cookies
             .retain(|cookie| cookie.expiry.is_none_or(|exp| exp > now));
@@ -200,19 +223,7 @@ impl CookieJar {
         self.cookies
             .iter()
             .filter(|cookie| cookie.expiry.is_some())
-            .map(|cookie| CookieRecord {
-                name: cookie.name.clone(),
-                value: cookie.value.clone(),
-                expiry: cookie.expiry,
-                domain: cookie.domain.clone(),
-                path: cookie.path.clone(),
-                created: cookie.created,
-                last_access: cookie.last_access,
-                host_only: cookie.host_only,
-                secure: cookie.secure,
-                http_only: cookie.http_only,
-                same_site: CookieSameSite::from(cookie.same_site),
-            })
+            .map(StoredCookie::record)
             .collect()
     }
 
@@ -659,6 +670,23 @@ fn cookie_prefixes_ok(
 }
 
 impl StoredCookie {
+    /// The storage-model view of this cookie.
+    fn record(&self) -> CookieRecord {
+        CookieRecord {
+            name: self.name.clone(),
+            value: self.value.clone(),
+            expiry: self.expiry,
+            domain: self.domain.clone(),
+            path: self.path.clone(),
+            created: self.created,
+            last_access: self.last_access,
+            host_only: self.host_only,
+            secure: self.secure,
+            http_only: self.http_only,
+            same_site: CookieSameSite::from(self.same_site),
+        }
+    }
+
     fn matches(&self, host: &str, request_path: &str, op: &CookieOp<'_>) -> bool {
         let host_ok = if self.host_only {
             self.domain == host

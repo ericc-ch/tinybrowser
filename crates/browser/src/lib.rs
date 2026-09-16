@@ -24,7 +24,7 @@ mod wire;
 
 pub use actor::{TabHandle, TabId};
 pub use browser::{Browser, BrowserError, BrowserHandle};
-pub use net::{Agent, AgentBuilder};
+pub use net::{Agent, AgentBuilder, CookieRecord, CookieSameSite};
 pub use network::NetworkSession;
 pub use profile::{Profile, ProfileError, ProfileName};
 pub use renderer::{RemoteValue, ResourceLimit, ScriptFailure, TabError, TabEvent};

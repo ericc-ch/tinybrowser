@@ -167,6 +167,7 @@ impl HttpEngine {
         timeout_per_call: Option<Duration>,
         proxy: Option<String>,
         host_map: HostMap,
+        tls_cas: &[native_tls::Certificate],
     ) -> Self {
         let resolver = HostResolver {
             host_map,
@@ -180,7 +181,11 @@ impl HttpEngine {
         // reports the protocol the server picked. OpenSSL initialization
         // failure is unrecoverable for TLS in this process, and hyper-tls's
         // own constructors panic on it for the same reason.
-        let tls = native_tls::TlsConnector::builder()
+        let mut tls = native_tls::TlsConnector::builder();
+        for ca in tls_cas {
+            tls.add_root_certificate(ca.clone());
+        }
+        let tls = tls
             .request_alpns(&["h2", "http/1.1"])
             .build()
             .expect("openssl tls connector");
@@ -198,7 +203,11 @@ impl HttpEngine {
         });
         // WebSocket upgrades are HTTP/1.1 only: asking for h2 here would let a
         // server negotiate a protocol tungstenite cannot speak.
-        let ws_tls = native_tls::TlsConnector::builder()
+        let mut ws_tls = native_tls::TlsConnector::builder();
+        for ca in tls_cas {
+            ws_tls.add_root_certificate(ca.clone());
+        }
+        let ws_tls = ws_tls
             .request_alpns(&["http/1.1"])
             .build()
             .expect("openssl tls connector");

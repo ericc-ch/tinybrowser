@@ -15,12 +15,10 @@ use tokio::time::Instant;
 use url::Url;
 
 use crate::ActiveParser;
-use crate::documents::DocumentStore;
-use crate::js::{
-    DocumentStreamCommand, FrameNavigation, RealmRegistry, SharedJsRuntime, World,
-};
-use crate::protocol::{BrowserServices, Mount, ScriptFailure, TabError, TabEvent};
 use crate::ReadyState;
+use crate::documents::DocumentStore;
+use crate::js::{DocumentStreamCommand, FrameNavigation, RealmRegistry, SharedJsRuntime, World};
+use crate::protocol::{BrowserServices, Mount, ScriptFailure, TabError, TabEvent};
 
 mod dial;
 mod drain;
@@ -123,8 +121,6 @@ pub(crate) struct Document {
     decoder: Option<dial::ResponseDecoder>,
     classic_fetch_in_flight: bool,
     stop: Arc<Stop>,
-    next_remote: u64,
-    remote_by_node: HashMap<dom::NodeId, u64>,
 }
 
 impl Drop for Document {
@@ -176,8 +172,6 @@ impl Document {
             decoder: None,
             classic_fetch_in_flight: false,
             stop,
-            next_remote: 0,
-            remote_by_node: HashMap::new(),
         }
     }
 
@@ -446,7 +440,6 @@ impl Document {
         world.pending_html_writes.clear();
         world.release_stream_bytes(bytes);
         self.classic_fetch_in_flight = false;
-        self.remote_by_node.clear();
     }
 
     /// `document.open()`, `document.write()`, and `document.close()` all land

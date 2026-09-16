@@ -88,6 +88,27 @@ impl NetworkSession {
     pub(crate) fn profile_name(&self) -> ProfileName {
         self.store.profile_name().clone()
     }
+
+    /// Cookies visible to `url`, including session and `HttpOnly` cookies.
+    pub(crate) fn cookie_records(&self, url: &Url) -> Vec<net::CookieRecord> {
+        self.agent.cookie_records(url)
+    }
+
+    /// Drops every cookie from the live jar.
+    pub(crate) fn clear_cookies(&self) {
+        self.agent.clear_cookies();
+        self.store.mark_dirty();
+    }
+
+    /// Stores one `Set-Cookie` line for `url` with HTTP-level rules,
+    /// returning whether it was stored.
+    pub(crate) fn add_cookie(&self, cookie: &str, url: &Url) -> bool {
+        let stored = self.agent.store_cookie_http(cookie, url);
+        if stored {
+            self.store.mark_dirty();
+        }
+        stored
+    }
 }
 
 /// Limits for in-flight dials: browser-wide and per reserved class.

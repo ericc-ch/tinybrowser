@@ -1,9 +1,12 @@
 # tinybrowser wptrunner product. Install into the WPT venv:
 #   pip install -e tools/wpt
 # then:
-#   third_party/wpt/wpt run --binary /path/to/tinybrowser --ssl-type none tinybrowser [tests]
+#   third_party/wpt/wpt run --binary /path/to/tinybrowser tinybrowser [tests]
 # or: ./tools/wpt/run [tests]
-# ./tools/wpt/run skips the /etc/hosts check and this product passes --resolve.
+#
+# ./tools/wpt/run skips the /etc/hosts check, passes --resolve maps, runs
+# testharness + crashtest by default, and enables `--ssl-type=openssl` with
+# the generated wptserve CA handed to the product as `--tls-ca`.
 # Each WebDriver endpoint gets a fresh temporary XDG profile.
 
 from __future__ import annotations
@@ -16,6 +19,7 @@ import tempfile
 from wptrunner.browsers.base import WebDriverBrowser, get_timeout_multiplier, require_arg
 from wptrunner.executors import executor_kwargs as base_executor_kwargs
 from wptrunner.executors.executorwebdriver import (
+    WebDriverCrashtestExecutor,
     WebDriverProtocol,
     WebDriverTestharnessExecutor,
 )
@@ -27,6 +31,7 @@ __wptrunner__ = {
     "browser": "TinyBrowser",
     "executor": {
         "testharness": "TinyBrowserTestharnessExecutor",
+        "crashtest": "TinyBrowserCrashtestExecutor",
     },
     "browser_kwargs": "browser_kwargs",
     "executor_kwargs": "executor_kwargs",
@@ -45,10 +50,12 @@ def check_args(**kwargs):
 
 
 def browser_kwargs(logger, test_type, run_info_data, config, subsuite, **kwargs):
+    ssl_config = getattr(config, "ssl_config", None) or {}
     return {
         "binary": kwargs["binary"],
         "binary_args": kwargs.get("binary_args") or [],
         "webdriver_host": "127.0.0.1",
+        "ca_cert_path": ssl_config.get("ca_cert_path"),
     }
 
 
@@ -67,9 +74,10 @@ def env_options():
 
 
 class TinyBrowser(WebDriverBrowser):
-    def __init__(self, logger, binary, webdriver_host="127.0.0.1", binary_args=None, **kwargs):
+    def __init__(self, logger, binary, webdriver_host="127.0.0.1", binary_args=None, ca_cert_path=None, **kwargs):
         args = list(binary_args or [])
         self._profile_root = None
+        self._ca_cert_path = ca_cert_path
         super().__init__(
             logger,
             binary=binary,
@@ -82,14 +90,17 @@ class TinyBrowser(WebDriverBrowser):
 
     def make_command(self):
         self._ensure_profile()
-        return [
+        command = [
             self.webdriver_binary,
             "webdriver",
             f"--port={self.port}",
             "--resolve=nonexistent.*.test=fail",
             "--resolve=*.test=127.0.0.1",
             "--resolve=*.test.=127.0.0.1",
-        ] + self.webdriver_args
+        ]
+        if self._ca_cert_path:
+            command.append(f"--tls-ca={self._ca_cert_path}")
+        return command + self.webdriver_args
 
     def stop(self, force=False):
         try:
@@ -126,15 +137,11 @@ class TinyBrowserProtocol(WebDriverProtocol):
 
 
 class TinyBrowserTestharnessExecutor(WebDriverTestharnessExecutor):
-    supports_testdriver = False
+    supports_testdriver = True
     protocol_cls = TinyBrowserProtocol
 
-    def create_test_window(self, protocol):
-        # WebDriverTestharnessExecutor.create_test_window clicks the root
-        # element to move focus to the new window. Input is not modeled yet
-        # (Perform Actions is unsupported), so skip that click and keep the
-        # window's initial about:blank.
-        test_window = protocol.base.create_window()
-        protocol.base.set_window(test_window)
-        protocol.base.execute_script(self.window_loaded_script, asynchronous=True)
-        return test_window
+
+class TinyBrowserCrashtestExecutor(WebDriverCrashtestExecutor):
+    """Crashtests only need the page to load and settle without dying."""
+
+    protocol_cls = TinyBrowserProtocol

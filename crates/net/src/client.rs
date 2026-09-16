@@ -24,6 +24,7 @@ pub struct AgentBuilder {
     max_redirects: u32,
     proxy: Option<String>,
     host_map: HostMap,
+    tls_cas: Vec<native_tls::Certificate>,
 }
 
 impl std::fmt::Debug for AgentBuilder {
@@ -34,6 +35,7 @@ impl std::fmt::Debug for AgentBuilder {
             .field("timeout_per_call", &self.timeout_per_call)
             .field("max_redirects", &self.max_redirects)
             .field("has_host_map", &!self.host_map.is_empty())
+            .field("extra_tls_cas", &self.tls_cas.len())
             .finish_non_exhaustive()
     }
 }
@@ -55,6 +57,7 @@ impl AgentBuilder {
             max_redirects: DEFAULT_MAX_REDIRECTS,
             proxy: None,
             host_map: HostMap::default(),
+            tls_cas: Vec::new(),
         }
     }
 
@@ -114,6 +117,21 @@ impl AgentBuilder {
         Ok(self)
     }
 
+    /// Trust an additional PEM-encoded certificate authority.
+    ///
+    /// Used to trust a private test CA, such as the one `wptserve` generates
+    /// for `web-platform.test`. Repeatable for more than one CA.
+    ///
+    /// # Errors
+    ///
+    /// [`NetError::Transport`] when `pem` is not a certificate.
+    pub fn tls_ca_pem(mut self, pem: &[u8]) -> Result<Self, NetError> {
+        let certificate = native_tls::Certificate::from_pem(pem)
+            .map_err(|error| NetError::Transport(TransportError::Tls(error.to_string().into())))?;
+        self.tls_cas.push(certificate);
+        Ok(self)
+    }
+
     /// Builds an agent with a private cookie jar and the selected transport options.
     #[must_use]
     pub fn build(self) -> Agent {
@@ -123,6 +141,7 @@ impl AgentBuilder {
                 self.timeout_per_call,
                 self.proxy,
                 self.host_map,
+                &self.tls_cas,
             ),
             ua: self.user_agent,
             max_redirects: self.max_redirects,
@@ -206,6 +225,56 @@ impl Agent {
                     cross_site_redirect: false,
                 },
             );
+    }
+
+    /// Stores one `Set-Cookie` line with HTTP-level rules, so an `HttpOnly`
+    /// cookie is allowed where `document.cookie` would refuse it. Returns
+    /// whether the jar stored the cookie
+    /// (<https://w3c.github.io/webdriver/#add-cookie>).
+    pub fn store_cookie_http(&self, value: &str, uri: &Url) -> bool {
+        self.jar
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .store(
+                value,
+                CookieOp {
+                    url: uri,
+                    now: (self.now)(),
+                    kind: RetrievalKind::Http,
+                    initiator_kind: InitiatorKind::Fetch,
+                    method_is_safe: true,
+                    initiator: Some(uri),
+                    cross_site_redirect: false,
+                },
+            )
+    }
+
+    /// Cookies visible to `uri`, including session and `HttpOnly` cookies.
+    /// This is the `WebDriver` cookie view
+    /// (<https://w3c.github.io/webdriver/#get-all-cookies>).
+    #[must_use]
+    pub fn cookie_records(&self, uri: &Url) -> Vec<crate::CookieRecord> {
+        self.jar
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .records_for(CookieOp {
+                url: uri,
+                now: (self.now)(),
+                kind: RetrievalKind::Http,
+                initiator_kind: InitiatorKind::Fetch,
+                method_is_safe: true,
+                initiator: Some(uri),
+                cross_site_redirect: false,
+            })
+    }
+
+    /// Drops every cookie from the live jar
+    /// (<https://w3c.github.io/webdriver/#delete-all-cookies>).
+    pub fn clear_cookies(&self) {
+        self.jar
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
     }
 
     /// Persistent cookies from the live jar. Session cookies are omitted.
