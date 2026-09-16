@@ -1,0 +1,74 @@
+#!/usr/bin/env bash
+#
+# Wait until CodeRabbit finishes reviewing the pull request head, then say so.
+# Notification only: read the review yourself with `gh`.
+#
+# The bot edits one summary comment per pass. A finished pass leaves a
+# `final_review_risk_coverage` marker naming the commit it covered, so this
+# checks that marker against the PR head. The prose commit range is not a
+# signal: it lists the base as well, and a stale pass must not count while a
+# new one has not started.
+#
+# Usage: coderabbit-wait [PR] [TIMEOUT_SECONDS]   (defaults: branch PR, 1800)
+# Exit:  0 head reviewed  2 no finished pass covered the head in time
+set -euo pipefail
+
+bot='coderabbitai[bot]'
+marker='review in progress by coderabbit.ai'
+
+repo="${REPO:-$(gh repo view --json nameWithOwner -q .nameWithOwner)}"
+pr="${1:-${PR:-$(gh pr view --json number -q .number)}}"
+timeout="${2:-1800}"
+[[ "$timeout" =~ ^[1-9][0-9]*$ ]] || timeout=1800
+
+head="$(gh pr view "$pr" --json headRefOid -q .headRefOid 2>/dev/null || true)"
+if [[ -z "$head" || "$head" == null ]]; then
+  head="$(git rev-parse HEAD)"
+  echo "could not read the PR head; using local HEAD $head" >&2
+fi
+short="${head:0:7}"
+deadline=$(( $(date +%s) + 10#$timeout ))
+
+# A full or generously abbreviated covered id counts as this commit.
+covers_head() {
+  local covered="$1"
+  [[ -n "$covered" && ( "$covered" == "$head" ||
+    ( ${#covered} -ge 12 && "$head" == "$covered"* ) ) ]]
+}
+
+while :; do
+  covered=""
+  if body="$(gh api --paginate "repos/$repo/issues/$pr/comments" 2>/dev/null |
+      jq -rs --arg bot "$bot" \
+        '[.[][] | select(.user.login == $bot)] | sort_by(.updated_at) | last | .body // ""')"; then
+    covered="$(printf '%s' "$body" |
+      sed -n 's/.*"coveredCommitId": *"\([0-9a-f]\{7,40\}\)".*/\1/p' | tail -n 1)"
+    if [[ "$body" != *"$marker"* ]] && covers_head "$covered"; then
+      echo "CodeRabbit finished reviewing $short on $repo#$pr"
+      echo "https://github.com/$repo/pull/$pr"
+      exit 0
+    fi
+  else
+    body=""
+    echo "$(date +%H:%M:%S) could not read CodeRabbit comments; retrying" >&2
+  fi
+
+  if [[ "$(date +%s)" -ge "$deadline" ]]; then
+    if [[ -z "$body" ]]; then
+      echo "no readable CodeRabbit comment on $repo#$pr (waited ${SECONDS}s)"
+    elif [[ "$body" == *"$marker"* ]]; then
+      echo "CodeRabbit still reviewing $short after ${SECONDS}s"
+    else
+      echo "CodeRabbit's latest pass covers ${covered:-nothing}, not $short (waited ${SECONDS}s)"
+    fi
+    exit 2
+  fi
+
+  echo "$(date +%H:%M:%S) waiting for CodeRabbit on $short (${SECONDS}s)"
+  interval="${INTERVAL:-30}"
+  [[ "$interval" =~ ^[1-9][0-9]*$ ]] || interval=30
+  remaining=$(( deadline - $(date +%s) ))
+  [[ "$remaining" -lt 1 ]] && remaining=1
+  [[ "$interval" -gt "$remaining" ]] && interval="$remaining"
+  sleep "$interval"
+done
