@@ -4983,21 +4983,7 @@ pub(super) fn install(ctx: &Ctx<'_>, world: &Rc<RefCell<World>>) -> Result<()> {
         "postMessage",
         rquickjs::prelude::Func::from(window_post_message),
     )?;
-    // The WebDriver element bridge. It is visible to page script, which can
-    // therefore forge `isTrusted` events; gate it on a session-owned driver
-    // mode when the input model replaces this bridge.
-    globals.set(
-        "__tb_webdriver_click",
-        rquickjs::prelude::Func::from(webdriver_click),
-    )?;
-    globals.set(
-        "__tb_webdriver_send_keys",
-        rquickjs::prelude::Func::from(webdriver_send_keys),
-    )?;
-    globals.set(
-        "__tb_webdriver_element",
-        rquickjs::prelude::Func::from(webdriver_element),
-    )?;
+    install_webdriver_bridge(ctx, &globals)?;
     globals.set("innerWidth", VIRTUAL_VIEWPORT_WIDTH)?;
     globals.set("innerHeight", VIRTUAL_VIEWPORT_HEIGHT)?;
     globals.set(
@@ -5449,6 +5435,29 @@ fn element_click(ctx: &Ctx<'_>, node: NodeId) -> Result<()> {
     })();
     world.borrow_mut().set_click_in_progress(node, false);
     result
+}
+
+/// The `WebDriver` element bridge. Page script can still call it by name and
+/// forge `isTrusted` events; it is not enumerable, so `Window` enumeration
+/// and idlharness do not see it.
+fn install_webdriver_bridge(ctx: &Ctx<'_>, globals: &Object<'_>) -> Result<()> {
+    globals.set(
+        "__tb_webdriver_click",
+        rquickjs::prelude::Func::from(webdriver_click),
+    )?;
+    globals.set(
+        "__tb_webdriver_send_keys",
+        rquickjs::prelude::Func::from(webdriver_send_keys),
+    )?;
+    globals.set(
+        "__tb_webdriver_element",
+        rquickjs::prelude::Func::from(webdriver_element),
+    )?;
+    ctx.eval::<(), _>(
+        "['__tb_webdriver_click','__tb_webdriver_send_keys','__tb_webdriver_element']\
+         .forEach(function(k){Object.defineProperty(globalThis,k,{writable:false,configurable:false,enumerable:false});});",
+    )?;
+    Ok(())
 }
 
 /// The `WebDriver` "element click" step: a trusted click at the element, with

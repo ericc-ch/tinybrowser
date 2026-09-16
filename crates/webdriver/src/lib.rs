@@ -147,10 +147,7 @@ async fn dispatch(method: &str, path: &str, body: &str, sessions: &mut Sessions)
                 Err(err) => error(500, "session not created", &err),
             }
         }
-        ("DELETE", ["session", session]) => {
-            sessions.open.remove(*session);
-            ok(Value::Null)
-        }
+        ("DELETE", ["session", session]) => delete_session(sessions, session).await,
         ("POST", ["session", session, "url"]) => navigate(sessions, session, body).await,
         ("GET", ["session", session, "url"]) => current_url(sessions, session).await,
         ("POST", ["session", session, "execute", "sync"]) => {
@@ -346,15 +343,19 @@ fn script_error(err: &TabError) -> (u16, Value) {
     }
 }
 
+/// Script wait flags live on the realm so a later poll can read them, but
+/// they must not show up in `Object.keys(window)` / `for...in`.
+const WD_RESET: &str = "\
+(function(){\
+  var d=function(n,v){Object.defineProperty(globalThis,n,{value:v,writable:true,enumerable:false,configurable:true});};\
+  d('__wd_async',undefined);d('__wd_err',undefined);d('__wd_failed',false);d('__wd_done',false);d('__wd_wait',false);\
+})();";
+
 fn wrap_script(script: &str, args: &Value, asynchronous: bool) -> String {
     let args_json = args.to_string();
     if asynchronous {
         format!(
-            "globalThis.__wd_async = undefined;\n\
-             globalThis.__wd_err = undefined;\n\
-             globalThis.__wd_failed = false;\n\
-             globalThis.__wd_done = false;\n\
-             globalThis.__wd_wait = false;\n\
+            "{WD_RESET}\n\
              (function() {{ {script} }}).apply(null, {args_json}.concat([function(v) {{ \
                globalThis.__wd_async = v === undefined ? null : v; \
                globalThis.__wd_done = true; \
@@ -362,11 +363,7 @@ fn wrap_script(script: &str, args: &Value, asynchronous: bool) -> String {
         )
     } else {
         format!(
-            "globalThis.__wd_async = undefined;\n\
-             globalThis.__wd_err = undefined;\n\
-             globalThis.__wd_failed = false;\n\
-             globalThis.__wd_done = false;\n\
-             globalThis.__wd_wait = false;\n\
+            "{WD_RESET}\n\
              (function() {{\n\
                var result = (function() {{ {script} }}).apply(null, {args_json});\n\
                if (result && typeof result.then === 'function') {{\n\
@@ -1014,6 +1011,20 @@ async fn new_window(sessions: &mut Sessions, session: &str) -> (u16, Value) {
     };
     found.windows.insert(handle.clone(), window);
     ok(json!({"handle": handle, "type": "window"}))
+}
+
+/// `DELETE /session/{id}`
+/// (<https://w3c.github.io/webdriver/#delete-session>).
+///
+/// An unknown session is already gone, so this still succeeds.
+async fn delete_session(sessions: &mut Sessions, session: &str) -> (u16, Value) {
+    let Some(found) = sessions.open.remove(session) else {
+        return ok(Value::Null);
+    };
+    for window in found.windows.into_values() {
+        let _result = sessions.browser.close_tab(window.tab.id()).await;
+    }
+    ok(Value::Null)
 }
 
 /// `DELETE /session/{id}/window`

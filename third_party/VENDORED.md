@@ -15,7 +15,7 @@ the binary; it exists so tests are reproducible and offline-capable.
 - **Fresh clones**: `git submodule update --init --recursive`.
 - **Driver**: classic WebDriver on `tinybrowser webdriver --port=PORT` over
   `BrowserHandle`, with a fresh temporary XDG profile per endpoint.
-- **Runner**: `./tools/wpt/run [tests]` builds the debug binary, installs `tools/wpt` into the WPT venv, skips the `/etc/hosts` check, and passes `--ssl-type none` plus `--resolve`. Do not require a machine hosts file.
+- **Runner**: `./tools/wpt/run [tests]` builds the debug binary, installs `tools/wpt` into the WPT venv, skips the `/etc/hosts` check, and passes `--ssl-type=openssl` plus `--resolve`. Do not require a machine hosts file.
 - **Parser gate**: run
   `./tools/wpt/run 'html/syntax/parsing/html5lib_*.html'`.
   The official URL, `document.write`, and single-character `document.write`

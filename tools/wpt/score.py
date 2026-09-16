@@ -55,6 +55,66 @@ def is_expected(entry: dict) -> bool:
     return entry.get("status") in (entry.get("known_intermittent") or [])
 
 
+def unexpected_subs(subtests: list) -> list[dict]:
+    """Subtests whose status did not match the baseline, including PASS."""
+    return [
+        subtest
+        for subtest in subtests
+        if subtest.get("status") != "SKIP" and not is_expected(subtest)
+    ]
+
+
+def classify_results(
+    results: list[dict],
+) -> tuple[dict[str, dict[str, int]], list[tuple[str, str, str]]]:
+    """Bucket each file and collect rows that need attention.
+
+    A baselined FAIL that starts passing is unexpected, at file and subtest
+    level: that is the grind signal that a baseline should come out.
+    """
+    rows: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
+    attention: list[tuple[str, str, str]] = []
+
+    for result in results:
+        test = result.get("test", "?")
+        row = rows[group_of(test)]
+        row["tests"] += 1
+        row["time_ms"] += result.get("duration") or 0
+
+        subtests = result.get("subtests") or []
+        mismatched = unexpected_subs(subtests)
+        sub_failed = [
+            subtest for subtest in subtests if subtest.get("status") not in ("PASS", "SKIP")
+        ]
+        row["subtests"] += len(subtests)
+        row["subfail"] += len(sub_failed)
+
+        status = result.get("status", "ERROR")
+        if status == "SKIP":
+            row["skip"] += 1
+        elif status in HARD_STATUSES:
+            row[status.lower()] += 1
+            message = (result.get("message") or "").strip()
+            attention.append((test, "", f"{status} {message}".strip()))
+        elif not is_expected(result) or mismatched:
+            row["unexpected"] += 1
+            if not is_expected(result):
+                message = (result.get("message") or "").strip()
+                attention.append((test, "", f"{status} {message}".strip()))
+            for subtest in mismatched:
+                attention.append(
+                    (test, subtest.get("name", "?"), subtest.get("status", "ERROR"))
+                )
+        elif sub_failed:
+            row["expected_fail"] += 1
+        elif status in ("PASS", "OK"):
+            row["pass"] += 1
+        else:
+            row["expected_fail"] += 1
+
+    return rows, attention
+
+
 def run(paths: list[str], extra: list[str]) -> tuple[Path, int]:
     handle, name = tempfile.mkstemp(prefix="wpt-report-", suffix=".json")
     os.close(handle)
@@ -94,65 +154,7 @@ def summarize(report: Path) -> int:
         print(f"no results in report {report}", file=sys.stderr)
         return 1
 
-    buckets = (
-        "tests",
-        "pass",
-        "expected_fail",
-        "unexpected",
-        "timeout",
-        "crash",
-        "error",
-        "skip",
-        "subtests",
-        "subfail",
-        "time_ms",
-    )
-    rows: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
-    attention: list[tuple[str, str, str]] = []
-
-    for result in results:
-        test = result.get("test", "?")
-        row = rows[group_of(test)]
-        row["tests"] += 1
-        row["time_ms"] += result.get("duration") or 0
-
-        subtests = result.get("subtests") or []
-        sub_unexpected = [
-            subtest
-            for subtest in subtests
-            if subtest.get("status") not in ("PASS", "SKIP") and not is_expected(subtest)
-        ]
-        sub_failed = [
-            subtest for subtest in subtests if subtest.get("status") not in ("PASS", "SKIP")
-        ]
-        row["subtests"] += len(subtests)
-        row["subfail"] += len(sub_failed)
-
-        status = result.get("status", "ERROR")
-        if status == "SKIP":
-            row["skip"] += 1
-        elif status in HARD_STATUSES:
-            row[status.lower()] += 1
-            message = (result.get("message") or "").strip()
-            attention.append((test, "", f"{status} {message}".strip()))
-        elif status in ("PASS", "OK"):
-            if sub_unexpected:
-                row["unexpected"] += 1
-                for subtest in sub_unexpected:
-                    attention.append(
-                        (test, subtest.get("name", "?"), subtest.get("status", "ERROR"))
-                    )
-            elif sub_failed:
-                row["expected_fail"] += 1
-            else:
-                row["pass"] += 1
-        elif is_expected(result):
-            row["expected_fail"] += 1
-        else:
-            row["unexpected"] += 1
-            message = (result.get("message") or "").strip()
-            attention.append((test, "", f"{status} {message}".strip()))
-
+    rows, attention = classify_results(results)
     width = max(len(name) for name in rows)
     header = (
         f"{'directory'.ljust(width)}  tests  pass  expfail  unexp  timeout  crash  error"
@@ -217,7 +219,70 @@ def split_args(argv: list[str]) -> tuple[Path | None, list[str], list[str], str 
     return report, paths, [], None
 
 
+def _selftest() -> None:
+    rows, attention = classify_results(
+        [
+            {
+                "test": "/html/foo.html",
+                "status": "PASS",
+                "expected": "FAIL",
+                "subtests": [],
+                "duration": 0,
+            }
+        ]
+    )
+    assert rows["html/foo.html"]["unexpected"] == 1
+    assert rows["html/foo.html"]["pass"] == 0
+    assert attention == [("/html/foo.html", "", "PASS")]
+
+    rows, attention = classify_results(
+        [
+            {
+                "test": "/dom/bar.html",
+                "status": "OK",
+                "subtests": [
+                    {"name": "a", "status": "FAIL"},
+                    {"name": "b", "status": "PASS", "expected": "FAIL"},
+                ],
+                "duration": 0,
+            }
+        ]
+    )
+    assert rows["dom/bar.html"]["unexpected"] == 1
+    assert rows["dom/bar.html"]["pass"] == 0
+    assert attention == [("/dom/bar.html", "b", "PASS")]
+
+    rows, attention = classify_results(
+        [
+            {
+                "test": "/dom/ok.html",
+                "status": "OK",
+                "subtests": [{"name": "a", "status": "PASS"}],
+                "duration": 0,
+            }
+        ]
+    )
+    assert rows["dom/ok.html"]["pass"] == 1
+    assert attention == []
+
+    rows, attention = classify_results(
+        [
+            {
+                "test": "/dom/fail.html",
+                "status": "FAIL",
+                "subtests": [{"name": "a", "status": "FAIL"}],
+                "duration": 0,
+            }
+        ]
+    )
+    assert rows["dom/fail.html"]["expected_fail"] == 1
+    assert attention == []
+
+
 def main() -> int:
+    if sys.argv[1:] == ["--selftest"]:
+        _selftest()
+        return 0
     report, paths, extra, error = split_args(sys.argv[1:])
     if error:
         print(f"score: {error}", file=sys.stderr)

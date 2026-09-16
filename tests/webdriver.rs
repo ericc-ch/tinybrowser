@@ -110,6 +110,23 @@ fn session_execute_script_roundtrip() {
         Some(r#"{"script":"return NaN","args":[]}"#),
     );
     assert_eq!(nan["value"], json!(null));
+
+    let enumerated = request(
+        &addr,
+        "POST",
+        &format!("/session/{id}/execute/sync"),
+        Some(
+            r#"{"script":"return Object.keys(globalThis).filter(function(k){return k.indexOf('__tb_webdriver')===0||k.indexOf('__wd_')===0})","args":[]}"#,
+        ),
+    );
+    assert_eq!(enumerated["value"], json!([]));
+    let click_type = request(
+        &addr,
+        "POST",
+        &format!("/session/{id}/execute/sync"),
+        Some(r#"{"script":"return typeof __tb_webdriver_click","args":[]}"#),
+    );
+    assert_eq!(click_type["value"], json!("function"));
 }
 
 #[test]
@@ -337,7 +354,7 @@ fn new_window_uses_builder_resolve_map() {
 }
 
 #[test]
-fn one_session_delete_leaves_pages_close_last_window_invalidates() {
+fn one_session_delete_closes_tabs_close_last_window_invalidates() {
     let (addr, _fixture) = start(Vec::new());
 
     let created = request(&addr, "POST", "/session", Some("{}"));
@@ -348,8 +365,13 @@ fn one_session_delete_leaves_pages_close_last_window_invalidates() {
     let second = request(&addr, "POST", "/session", Some("{}"));
     assert_eq!(second["value"]["error"], json!("session not created"));
 
+    request(
+        &addr,
+        "POST",
+        &format!("/session/{id}/window/new"),
+        Some("{}"),
+    );
     request(&addr, "DELETE", &format!("/session/{id}"), None);
-    // Product DELETE /session detaches automation and leaves tabs.
     let gone = request(&addr, "GET", &format!("/session/{id}/window"), None);
     assert_eq!(gone["value"]["error"], json!("invalid session id"));
 
@@ -358,6 +380,12 @@ fn one_session_delete_leaves_pages_close_last_window_invalidates() {
         .as_str()
         .expect("session id")
         .to_owned();
+    let handles = request(&addr, "GET", &format!("/session/{id}/window/handles"), None);
+    assert_eq!(
+        handles["value"].as_array().map(Vec::len),
+        Some(1),
+        "a new session starts with one window after DELETE closed the old tabs"
+    );
     let closed = request(&addr, "DELETE", &format!("/session/{id}/window"), None);
     assert_eq!(closed["value"], json!([]));
     let invalid = request(&addr, "GET", &format!("/session/{id}/window"), None);
