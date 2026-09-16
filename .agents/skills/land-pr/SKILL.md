@@ -137,6 +137,9 @@ Triage rules:
 
 ## 6. Merge
 
+Merge only on an explicit go-ahead from the user. Opening a PR, or finishing a
+review, does not authorize the merge or the remote branch deletion.
+
 Use a merge commit. Do not squash or rebase.
 
 ```sh
