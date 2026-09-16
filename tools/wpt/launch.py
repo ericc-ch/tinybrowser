@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
@@ -45,7 +46,9 @@ def patch_wpt(wpt_root: Path) -> None:
 
 def main() -> object:
     root = Path(__file__).resolve().parents[2]
-    wpt_root = root / "third_party" / "wpt"
+    wpt_root = Path(
+        os.environ.get("TINYBROWSER_WPT_ROOT") or root / "third_party" / "wpt"
+    )
     patch_wpt(wpt_root)
     from tools.wpt import wpt
 
