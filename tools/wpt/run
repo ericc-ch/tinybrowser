@@ -87,6 +87,9 @@ if [[ ! -x "$BINARY" ]]; then
   echo "tinybrowser binary not found at $BINARY" >&2
   exit 1
 fi
+# The runner spawns the browser from the WPT checkout, so an override must be
+# absolute before the working directory changes.
+BINARY="$(realpath "$BINARY")"
 cd "$WPT"
 
 # The venv holds WPT's dependencies and the editable product adapter, so one
@@ -140,6 +143,43 @@ has_option() {
   done
   return 1
 }
+# `--test-types` takes its values with `nargs="*"`, so a following positional
+# would be consumed as a test type. Move a user-supplied option (and its
+# values) to the end of the argument list, where nothing follows it.
+if has_option --test-types "${args[@]}"; then
+  reordered=()
+  test_types=()
+  index=0
+  count=${#args[@]}
+  while (( index < count )); do
+    arg="${args[$index]}"
+    if [[ "$arg" == "--test-types" ]]; then
+      test_types+=("$arg")
+      index=$((index + 1))
+      while (( index < count )); do
+        case "${args[$index]}" in
+          testharness|crashtest|test262|wdspec|print-reftest|aamtest|reftest)
+            test_types+=("${args[$index]}")
+            index=$((index + 1))
+            ;;
+          *)
+            break
+            ;;
+        esac
+      done
+      continue
+    fi
+    reordered+=("$arg")
+    index=$((index + 1))
+  done
+  args=()
+  if (( ${#reordered[@]} )); then
+    args+=("${reordered[@]}")
+  fi
+  if (( ${#test_types[@]} )); then
+    args+=("${test_types[@]}")
+  fi
+fi
 if ! has_option --metadata "${args[@]}"; then
   args=(--metadata "$ROOT/tools/wpt/metadata" "${args[@]}")
 fi

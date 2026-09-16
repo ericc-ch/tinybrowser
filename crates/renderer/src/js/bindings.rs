@@ -2425,8 +2425,17 @@ impl JsNode {
     #[qjs(rename = "elementsFromPoint")]
     fn elements_from_point<'js>(&self, ctx: Ctx<'js>, x: f64, y: f64) -> Result<Array<'js>> {
         let array = Array::new(ctx.clone())?;
-        if let Some(node) = element_at_point(&ctx, self.handle.0, x, y)? {
-            array.set(0, wrap_node(&ctx, node)?)?;
+        let Some(node) = element_at_point(&ctx, self.handle.0, x, y)? else {
+            return Ok(array);
+        };
+        // The hit-test stack: the element and its ancestors, topmost first.
+        let world = world_for_node(&ctx, node)?;
+        let mut index = 0;
+        let mut cursor = Some(node);
+        while let Some(current) = cursor {
+            array.set(index, wrap_node(&ctx, current)?)?;
+            index += 1;
+            cursor = world.borrow().node_parent(current);
         }
         Ok(array)
     }
@@ -4588,6 +4597,7 @@ impl JsNode {
             .map_err(|err| throw_dom_error(&ctx, err))?;
         drop(parsed);
         drop(world);
+        fixup_focus_after_removal(&ctx, child)?;
         schedule_mutation_delivery(&ctx)?;
         wrap_node(&ctx, child)
     }
@@ -4625,6 +4635,7 @@ impl JsNode {
             .map_err(|err| throw_dom_error(&ctx, err))?;
         drop(parsed);
         drop(world);
+        fixup_focus_after_removal(&ctx, child)?;
         schedule_mutation_delivery(&ctx)?;
         wrap_node(&ctx, child)
     }
@@ -4688,6 +4699,7 @@ impl JsNode {
             .map_err(|err| throw_dom_error(&ctx, err))?;
         drop(parsed);
         drop(world);
+        fixup_focus_after_removal(&ctx, self.handle.0)?;
         schedule_mutation_delivery(&ctx)
     }
 
@@ -4853,16 +4865,10 @@ fn document_is_html_content(ctx: &Ctx<'_>, id: NodeId) -> bool {
         .is_some_and(|parsed| parsed.content_type == "text/html")
 }
 
-/// Whether `id` is the parser's main document (the one with a browsing
-/// context's URL); created documents report `about:blank`.
+/// Whether `id` is the realm's active document. See
+/// [`World::is_main_document`].
 fn is_main_document(ctx: &Ctx<'_>, id: NodeId) -> bool {
-    let Ok(world_rc) = world(ctx) else {
-        return false;
-    };
-    let world = world_rc.borrow();
-    world
-        .with_main_document(|parsed| parsed.dom.document_id() == id.document_id())
-        .unwrap_or(false)
+    world(ctx).is_ok_and(|world| world.borrow().is_main_document(id))
 }
 
 fn document_url_string(ctx: &Ctx<'_>, id: NodeId) -> String {
@@ -4977,6 +4983,9 @@ pub(super) fn install(ctx: &Ctx<'_>, world: &Rc<RefCell<World>>) -> Result<()> {
         "postMessage",
         rquickjs::prelude::Func::from(window_post_message),
     )?;
+    // The WebDriver element bridge. It is visible to page script, which can
+    // therefore forge `isTrusted` events; gate it on a session-owned driver
+    // mode when the input model replaces this bridge.
     globals.set(
         "__tb_webdriver_click",
         rquickjs::prelude::Func::from(webdriver_click),
@@ -5141,6 +5150,26 @@ pub(super) fn fire_node_load(ctx: &Ctx<'_>, id: NodeId) -> Result<()> {
     events::fire_trusted(ctx, EventTargetKey::Node(id), "load", false, false)
 }
 
+/// The node-removal focus fixup: when the document's focused area is inside
+/// a removed subtree, clear it without firing events
+/// (<https://html.spec.whatwg.org/multipage/dom.html#node-remove-focus-fixup>).
+fn fixup_focus_after_removal(ctx: &Ctx<'_>, removed: NodeId) -> Result<()> {
+    let world = world_for_node(ctx, removed)?;
+    let document = removed.document_id();
+    let Some(active) = world.borrow().active_element(document) else {
+        return Ok(());
+    };
+    let mut cursor = Some(active);
+    while let Some(current) = cursor {
+        if current == removed {
+            world.borrow_mut().set_active_element(document, None);
+            return Ok(());
+        }
+        cursor = world.borrow().node_parent(current);
+    }
+    Ok(())
+}
+
 pub(super) fn host_node_id<'js>(ctx: &Ctx<'js>, value: &Value<'js>) -> Option<NodeId> {
     Class::<JsNode>::from_js(ctx, value.clone())
         .ok()
@@ -5165,19 +5194,15 @@ fn is_focusable(ctx: &Ctx<'_>, node: NodeId) -> Result<bool> {
     let NodeKind::Element { name, .. } = entry.kind() else {
         return Ok(false);
     };
-    if name.ns != html_namespace() {
-        return Ok(false);
-    }
     if !parsed.dom.is_connected(node) || is_actually_disabled(&parsed.dom, node) {
         return Ok(false);
     }
-    if let Some(value) = parsed.dom.attribute(node, "contenteditable")
-        && !value.eq_ignore_ascii_case("false")
-    {
+    // `tabindex` and `contenteditable` apply to SVG elements too.
+    if parsed.dom.attribute(node, "tabindex").is_some() || is_editable(&parsed.dom, node) {
         return Ok(true);
     }
-    if parsed.dom.attribute(node, "tabindex").is_some() {
-        return Ok(true);
+    if name.ns != html_namespace() {
+        return Ok(false);
     }
     Ok(match name.local.as_ref() {
         "input" => !is_hidden_input(&parsed.dom, node),
@@ -5188,15 +5213,66 @@ fn is_focusable(ctx: &Ctx<'_>, node: NodeId) -> Result<bool> {
 }
 
 /// The HTML "actually disabled" check for the form controls the engine
-/// supports (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#concept-fe-disabled>).
+/// supports, including descendants of a disabled `fieldset` that are not
+/// inside its first `legend`
+/// (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#concept-fe-disabled>).
 fn is_actually_disabled(dom: &dom::Dom, node: NodeId) -> bool {
-    if dom.attribute(node, "disabled").is_none() {
-        return false;
+    if dom.attribute(node, "disabled").is_some()
+        && matches!(
+            node_local_name(dom, node).as_deref(),
+            Some("button" | "input" | "select" | "textarea" | "optgroup" | "option" | "fieldset")
+        )
+    {
+        return true;
     }
-    matches!(
-        node_local_name(dom, node).as_deref(),
-        Some("button" | "input" | "select" | "textarea" | "optgroup" | "option" | "fieldset")
-    )
+    let mut cursor = dom.parent(node);
+    while let Some(parent) = cursor {
+        if node_local_name(dom, parent).as_deref() == Some("fieldset")
+            && dom.attribute(parent, "disabled").is_some()
+        {
+            let first_legend = dom
+                .children(parent)
+                .into_iter()
+                .flatten()
+                .copied()
+                .find(|&child| node_local_name(dom, child).as_deref() == Some("legend"));
+            if let Some(legend) = first_legend {
+                let mut inner = Some(node);
+                while let Some(current) = inner {
+                    if current == legend {
+                        return false;
+                    }
+                    inner = dom.parent(current);
+                }
+            }
+            return true;
+        }
+        cursor = dom.parent(parent);
+    }
+    false
+}
+
+/// Whether the element is an editing host through `contenteditable`,
+/// inheriting the value from ancestors. Only `""`, `true`, and
+/// `plaintext-only` enable editing
+/// (<https://html.spec.whatwg.org/multipage/interaction.html#attr-contenteditable>).
+fn is_editable(dom: &dom::Dom, node: NodeId) -> bool {
+    let mut cursor = Some(node);
+    while let Some(current) = cursor {
+        if let Some(value) = dom.attribute(current, "contenteditable") {
+            if value.is_empty()
+                || value.eq_ignore_ascii_case("true")
+                || value.eq_ignore_ascii_case("plaintext-only")
+            {
+                return true;
+            }
+            if value.eq_ignore_ascii_case("false") {
+                return false;
+            }
+        }
+        cursor = dom.parent(current);
+    }
+    false
 }
 
 fn is_hidden_input(dom: &dom::Dom, node: NodeId) -> bool {
@@ -5237,10 +5313,27 @@ fn is_text_control(ctx: &Ctx<'_>, node: NodeId) -> Result<bool> {
             let kind = parsed
                 .dom
                 .attribute(node, "type")
-                .unwrap_or_else(|| "text".to_owned());
-            matches!(
-                kind.to_ascii_lowercase().as_str(),
-                "text" | "search" | "url" | "tel" | "email" | "password" | "number"
+                .unwrap_or_else(|| "text".to_owned())
+                .to_ascii_lowercase();
+            // An unknown or missing type is the Text state, so it takes keys
+            // (<https://html.spec.whatwg.org/multipage/input.html#attr-input-type>).
+            !matches!(
+                kind.as_str(),
+                "hidden"
+                    | "checkbox"
+                    | "radio"
+                    | "file"
+                    | "submit"
+                    | "reset"
+                    | "button"
+                    | "image"
+                    | "color"
+                    | "range"
+                    | "date"
+                    | "datetime-local"
+                    | "month"
+                    | "week"
+                    | "time"
             )
         }
         _ => false,
@@ -5271,6 +5364,20 @@ fn focus_node(ctx: &Ctx<'_>, node: NodeId) -> Result<()> {
             false,
             Some(target(node)),
         )?;
+        // A handler may have moved focus; the spec's focus update steps stop
+        // when the focused area changed during the blur chain, and the
+        // abandoned target is no longer the related target.
+        if world.borrow().active_element(document).is_some() {
+            events::fire_trusted_with_related(
+                ctx,
+                EventTargetKey::Node(previous),
+                "focusout",
+                true,
+                false,
+                None,
+            )?;
+            return Ok(());
+        }
         events::fire_trusted_with_related(
             ctx,
             EventTargetKey::Node(previous),
@@ -5279,11 +5386,11 @@ fn focus_node(ctx: &Ctx<'_>, node: NodeId) -> Result<()> {
             false,
             Some(target(node)),
         )?;
-        // A handler may have moved focus; the spec's focus update steps stop
-        // when the focused area changed during the blur chain.
-        if world.borrow().active_element(document).is_some() {
-            return Ok(());
-        }
+    }
+    // Handlers may have made the target unfocusable; browsers then do not
+    // designate or fire on it.
+    if !is_focusable(ctx, node)? {
+        return Ok(());
     }
     world.borrow_mut().set_active_element(document, Some(node));
     let related = previous.map(target);
@@ -5452,8 +5559,9 @@ fn window_post_message<'js>(
         object.set("origin", origin)?;
         object.set("source", ctx.globals())?;
     }
-    // Synchronous delivery, no `targetOrigin` parsing, and no structured
-    // clone: the engine has no message queue yet.
+    // Deviations: delivery is synchronous, `targetOrigin` and the `transfer`
+    // argument are not validated, and the data is not structured-cloned. The
+    // engine has no message queue yet.
     events::dispatch_trusted(&ctx, EventTargetKey::Window, &event)?;
     Ok(())
 }
@@ -5918,7 +6026,7 @@ const INSTALL_BRANDS_JS: &str = r"
   const HTMLElementInterface = define('HTMLElement', ElementInterface, ['click', 'focus', 'blur']);
   const HTMLUnknownElementInterface = define('HTMLUnknownElement', HTMLElementInterface, []);
   const HTMLMediaElementInterface = define('HTMLMediaElement', HTMLElementInterface, []);
-  const SVGElementInterface = define('SVGElement', ElementInterface, []);
+  const SVGElementInterface = define('SVGElement', ElementInterface, ['click', 'focus', 'blur']);
   const table = {
     Document: DocumentInterface.prototype,
     XMLDocument: XMLDocumentInterface.prototype,

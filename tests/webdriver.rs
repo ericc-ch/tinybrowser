@@ -464,6 +464,47 @@ fn element_roundtrip() {
     );
     assert_eq!(value["value"], json!("hi"));
 
+    // A reference returned by execute_script is a valid element reference.
+    let script_ref = request(
+        &addr,
+        "POST",
+        &format!("/session/{id}/execute/sync"),
+        Some(r#"{"script":"return document.getElementById('b')","args":[]}"#),
+    );
+    let script_ref = script_ref["value"][ELEMENT_KEY]
+        .as_str()
+        .expect("script element id")
+        .to_owned();
+    let clicked_again = request(
+        &addr,
+        "POST",
+        &format!("/session/{id}/element/{script_ref}/click"),
+        Some("{}"),
+    );
+    assert_eq!(clicked_again["value"], Value::Null);
+
+    // Find Elements returns every match, not just the first.
+    let many = request(
+        &addr,
+        "POST",
+        &format!("/session/{id}/elements"),
+        Some(r#"{"using":"css selector","value":"*"}"#),
+    );
+    assert!(
+        many["value"]
+            .as_array()
+            .is_some_and(|items| items.len() > 1)
+    );
+
+    // An invalid selector is `invalid selector`, not a javascript error.
+    let bad = request(
+        &addr,
+        "POST",
+        &format!("/session/{id}/element"),
+        Some(r#"{"using":"css selector","value":"??"}"#),
+    );
+    assert_eq!(bad["value"]["error"], json!("invalid selector"));
+
     // The virtual rectangle is present for any live element.
     let rect = request(
         &addr,
@@ -494,6 +535,8 @@ fn cookie_roundtrip() {
     assert_eq!(script_set["value"], json!("a=1"));
     let named = request(&addr, "GET", &format!("/session/{id}/cookie/a"), None);
     assert_eq!(named["value"]["value"], json!("1"));
+    // No SameSite attribute serializes as "None".
+    assert_eq!(named["value"]["sameSite"], json!("None"));
     let added = request(
         &addr,
         "POST",
@@ -514,6 +557,37 @@ fn cookie_roundtrip() {
         Some(r#"{"script":"return document.cookie","args":[]}"#),
     );
     assert_eq!(empty["value"], json!(""));
+}
+
+#[test]
+fn window_rect_roundtrip() {
+    let (addr, _fixture) = start(Vec::new());
+    let id = create_session(&addr);
+
+    let initial = request(&addr, "GET", &format!("/session/{id}/window/rect"), None);
+    assert_eq!(initial["value"]["width"], json!(800));
+    let set = request(
+        &addr,
+        "POST",
+        &format!("/session/{id}/window/rect"),
+        Some(r#"{"x":150,"y":175}"#),
+    );
+    assert_eq!(set["value"]["x"], json!(150));
+    assert_eq!(set["value"]["y"], json!(175));
+    let got = request(&addr, "GET", &format!("/session/{id}/window/rect"), None);
+    assert_eq!(got["value"]["x"], json!(150));
+    assert_eq!(got["value"]["y"], json!(175));
+
+    // An out-of-range value is rejected and does not partially mutate.
+    let bad = request(
+        &addr,
+        "POST",
+        &format!("/session/{id}/window/rect"),
+        Some(r#"{"width":-1}"#),
+    );
+    assert_eq!(bad["value"]["error"], json!("invalid argument"));
+    let unchanged = request(&addr, "GET", &format!("/session/{id}/window/rect"), None);
+    assert_eq!(unchanged["value"]["width"], json!(800));
 }
 
 #[test]

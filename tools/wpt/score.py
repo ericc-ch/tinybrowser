@@ -29,8 +29,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 RUNNER = ROOT / "tools" / "wpt" / "run"
 
-# File-level statuses that get their own bucket.
-HARD_STATUSES = ("TIMEOUT", "CRASH", "ERROR", "PRECONDITION_FAILED", "NOTRUN")
+# File-level statuses that get their own bucket; anything else that is not a
+# pass is classified by the report's `expected` field.
+HARD_STATUSES = ("TIMEOUT", "CRASH", "ERROR")
 MAX_LISTED = 40
 
 
@@ -106,7 +107,7 @@ def summarize(report: Path) -> int:
         "subfail",
         "time_ms",
     )
-    rows: dict[str, dict[str, int]] = defaultdict(lambda: dict.fromkeys(buckets, 0))
+    rows: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
     attention: list[tuple[str, str, str]] = []
 
     for result in results:
@@ -168,7 +169,7 @@ def summarize(report: Path) -> int:
             f"{row['time_ms'] / 1000:8.1f}s"
         )
 
-    totals = dict.fromkeys(buckets, 0)
+    totals: dict[str, int] = defaultdict(int)
     for directory in sorted(rows):
         for key, value in rows[directory].items():
             totals[key] += value
@@ -203,6 +204,7 @@ def split_args(argv: list[str]) -> tuple[Path | None, list[str], list[str], str 
             report = Path(argv[index + 1])
             return report, paths, list(argv[index + 2 :]), None
         if arg.startswith("--report="):
+            report = Path(arg.split("=", 1)[1])
             return report, paths, list(argv[index + 1 :]), None
         if arg.startswith("-"):
             return (
@@ -238,8 +240,9 @@ def main() -> int:
     except OSError as error:
         print(f"score: could not start the runner: {error}", file=sys.stderr)
         return 1
+    keep_report = runner_exit != 0
     try:
-        if runner_exit != 0:
+        if keep_report:
             print(
                 f"runner failed with exit {runner_exit}; report kept at {report_path}",
                 file=sys.stderr,
@@ -248,10 +251,11 @@ def main() -> int:
             return runner_exit
         return summarize(report_path)
     finally:
-        try:
-            os.unlink(report_path)
-        except OSError:
-            pass
+        if not keep_report:
+            try:
+                os.unlink(report_path)
+            except OSError:
+                pass
         print(f"wall time: {time.monotonic() - started:.1f}s", file=sys.stderr)
 
 
