@@ -36,13 +36,24 @@ fn now_millis() -> f64 {
     origin.elapsed().as_secs_f64() * 1000.0
 }
 
+/// One event target together with the world that owns it
+/// (<https://dom.spec.whatwg.org/#concept-event-target>).
+///
+/// The world is needed to resolve a `Window` target from a realm that is not
+/// the target's own: `ctx.globals()` is the caller's window.
+#[derive(Clone)]
+pub(crate) struct EventTargetRef {
+    pub(crate) key: EventTargetKey,
+    pub(crate) world: Rc<RefCell<World>>,
+}
+
 /// The mutable state of one `Event` object
 /// (<https://dom.spec.whatwg.org/#concept-event>).
 ///
-/// Targets and path items are held as `Persistent` values so getters and
-/// `composedPath()` need no world lookup after dispatch. The cells hold no
-/// GC-managed state, so their `Trace` impls stay empty; the persistents keep
-/// their own references.
+/// Targets and path entries are [`EventTargetRef`]s, not JS values: a
+/// `Persistent` stored inside a class instance pins the `QuickJS` context
+/// across realm teardown, which aborts the runtime at exit. References resolve
+/// to wrappers on demand and hold no JS reference.
 ///
 /// The booleans mirror the specification's event flags one-for-one; a bitmask
 /// would obscure that mapping.
@@ -59,15 +70,15 @@ pub(crate) struct EventState {
     pub(crate) is_trusted: bool,
     pub(crate) initialized: bool,
     pub(crate) time_stamp: f64,
-    pub(crate) target: Option<Persistent<Value<'static>>>,
-    pub(crate) current_target: Option<Persistent<Value<'static>>>,
+    pub(crate) target: Option<EventTargetRef>,
+    pub(crate) current_target: Option<EventTargetRef>,
     pub(crate) phase: u16,
     pub(crate) stop_propagation: bool,
     pub(crate) stop_immediate: bool,
     pub(crate) canceled: bool,
     pub(crate) in_passive: bool,
     pub(crate) dispatching: bool,
-    pub(crate) path: Vec<Persistent<Value<'static>>>,
+    pub(crate) path: Vec<EventTargetRef>,
 }
 
 pub(crate) struct EventStateCell(RefCell<EventState>);
@@ -76,19 +87,15 @@ impl<'js> Trace<'js> for EventStateCell {
     fn trace<'a>(&self, _tracer: Tracer<'a, 'js>) {}
 }
 
-/// The `detail` attribute of a `CustomEvent`
-/// (<https://dom.spec.whatwg.org/#dom-customevent-detail>).
-pub(crate) struct EventDetailCell(RefCell<Option<Persistent<Value<'static>>>>);
-
-impl<'js> Trace<'js> for EventDetailCell {
-    fn trace<'a>(&self, _tracer: Tracer<'a, 'js>) {}
-}
-
+/// The `CustomEvent` platform object.
+///
+/// `detail` is the one `any` attribute of the interface, so it lives as a
+/// symbol-keyed own property on the object (`INSTALL_CUSTOM_EVENT_JS`) rather
+/// than in this struct; every Rust-held JS value would pin the context.
 #[derive(Trace, rquickjs::JsLifetime)]
 #[rquickjs::class(rename = "Event")]
 pub struct JsEvent {
     pub(crate) state: EventStateCell,
-    pub(crate) detail: EventDetailCell,
 }
 
 impl JsEvent {
@@ -105,7 +112,6 @@ impl JsEvent {
                 time_stamp: now_millis(),
                 ..EventState::default()
             })),
-            detail: EventDetailCell(RefCell::new(None)),
         }
     }
 
@@ -118,7 +124,6 @@ impl JsEvent {
                 time_stamp: now_millis(),
                 ..EventState::default()
             })),
-            detail: EventDetailCell(RefCell::new(None)),
         }
     }
 
@@ -130,20 +135,9 @@ impl JsEvent {
         self.state.0.borrow_mut()
     }
 
-    pub(crate) fn set_detail(&self, value: Option<Persistent<Value<'static>>>) {
-        *self.detail.0.borrow_mut() = value;
-    }
-
-    pub(crate) fn detail_value<'js>(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
-        match self.detail.0.borrow().as_ref() {
-            Some(saved) => saved.clone().restore(ctx),
-            None => Ok(Value::new_null(ctx.clone())),
-        }
-    }
-
     /// [Initialize](https://dom.spec.whatwg.org/#concept-event-initialize) the
     /// event. `initEvent()` and `initCustomEvent()` both land here.
-    fn initialize(&self, typ: String, bubbles: bool, cancelable: bool) {
+    pub(crate) fn initialize(&self, typ: String, bubbles: bool, cancelable: bool) {
         let mut state = self.state_mut();
         state.initialized = true;
         state.stop_propagation = false;
@@ -167,7 +161,7 @@ impl JsEvent {
     #[qjs(constructor)]
     fn new<'js>(ctx: Ctx<'js>, args: Rest<Value<'js>>) -> Result<Self> {
         let (typ, init) = event_arguments(&ctx, args)?;
-        event_from_init(&ctx, typ, init.as_ref(), false)
+        event_from_init(&ctx, typ, init.as_ref())
     }
 
     // https://dom.spec.whatwg.org/#dom-event-type
@@ -243,8 +237,8 @@ impl JsEvent {
     }
 
     #[qjs(set, rename = "cancelBubble")]
-    fn set_cancel_bubble(&self, value: bool) {
-        if value {
+    fn set_cancel_bubble(&self, value: Value<'_>) {
+        if bindings::to_boolean(&value) {
             self.state_mut().stop_propagation = true;
         }
     }
@@ -256,8 +250,8 @@ impl JsEvent {
     }
 
     #[qjs(set, rename = "returnValue")]
-    fn set_return_value(&self, value: bool) {
-        if !value {
+    fn set_return_value(&self, value: Value<'_>) {
+        if !bindings::to_boolean(&value) {
             self.set_canceled_flag();
         }
     }
@@ -287,8 +281,8 @@ impl JsEvent {
     fn composed_path<'js>(&self, ctx: Ctx<'js>) -> Result<Array<'js>> {
         let state = self.state();
         let path = Array::new(ctx.clone())?;
-        for (index, saved) in state.path.iter().enumerate() {
-            path.set(index, saved.clone().restore(&ctx)?)?;
+        for (index, reference) in state.path.iter().enumerate() {
+            path.set(index, resolve_target(&ctx, reference)?)?;
         }
         Ok(path)
     }
@@ -296,16 +290,18 @@ impl JsEvent {
     // https://dom.spec.whatwg.org/#dom-event-initevent
     #[qjs(rename = "initEvent")]
     fn init_event<'js>(&self, ctx: Ctx<'js>, args: Rest<Value<'js>>) -> Result<()> {
-        if self.state().dispatching {
-            return Ok(());
-        }
+        // Web IDL converts the arguments before the algorithm runs, so a
+        // missing or throwing `type` fails even while dispatching.
         let mut args = args.0.into_iter();
         let Some(typ) = args.next() else {
             return Err(Exception::throw_type(&ctx, "type is required"));
         };
         let typ = bindings::webidl_to_string(&ctx, typ)?;
-        let bubbles = boolean_argument(&ctx, args.next())?;
-        let cancelable = boolean_argument(&ctx, args.next())?;
+        let bubbles = boolean_argument(args.next());
+        let cancelable = boolean_argument(args.next());
+        if self.state().dispatching {
+            return Ok(());
+        }
         self.initialize(typ, bubbles, cancelable);
         Ok(())
     }
@@ -425,6 +421,16 @@ pub(crate) const INSTALL_EVENT_CTOR_JS: &str = r"
     }
     return Reflect.construct(Native, arguments, new.target);
   }
+  // Constants are `{writable:false, enumerable:true, configurable:false}` on
+  // both the interface object and its prototype
+  // (<https://webidl.spec.whatwg.org/#define-the-constants>).
+  function defineConstant(target, name, value) {
+    Object.defineProperty(target, name, { value: value, writable: false, enumerable: true, configurable: false });
+  }
+  for (const [name, value] of [['NONE', 0], ['CAPTURING_PHASE', 1], ['AT_TARGET', 2], ['BUBBLING_PHASE', 3]]) {
+    defineConstant(Event, name, value);
+    defineConstant(Native.prototype, name, value);
+  }
   Object.defineProperty(Event, 'prototype', { value: Native.prototype, writable: false, configurable: false });
   Object.defineProperty(Native.prototype, 'constructor', { value: Event, writable: true, configurable: true });
   Object.defineProperty(globalThis, 'Event', { value: Event, writable: true, configurable: true });
@@ -442,13 +448,15 @@ fn register_standalone<'js>(ctx: &Ctx<'js>, id: u64, target: &Object<'js>) -> Re
 
 /// `document.createEvent(interface)`
 /// (<https://dom.spec.whatwg.org/#dom-document-createevent>).
+///
+/// The interface name matches ASCII case-insensitively.
 pub(crate) fn create_event<'js>(ctx: &Ctx<'js>, interface: &str) -> Result<Value<'js>> {
-    match interface {
-        "Event" | "Events" | "HTMLEvents" => Ok(Class::into_value(Class::instance(
+    match interface.to_ascii_lowercase().as_str() {
+        "event" | "events" | "htmlevents" => Ok(Class::into_value(Class::instance(
             ctx.clone(),
             JsEvent::uninitialized(),
         )?)),
-        "CustomEvent" => {
+        "customevent" => {
             let class = Class::instance(ctx.clone(), JsEvent::uninitialized())?;
             set_custom_event_prototype(ctx, &class)?;
             Ok(Class::into_value(class))
@@ -481,25 +489,22 @@ fn set_custom_event_prototype<'js>(
 )]
 pub(crate) fn construct_custom_event<'js>(ctx: Ctx<'js>, args: Rest<Value<'js>>) -> Result<Value<'js>> {
     let (typ, init) = event_arguments(&ctx, args)?;
-    let class = Class::instance(ctx.clone(), event_from_init(&ctx, typ, init.as_ref(), true)?)?;
+    let class = Class::instance(ctx.clone(), event_from_init(&ctx, typ, init.as_ref())?)?;
     set_custom_event_prototype(&ctx, &class)?;
     Ok(Class::into_value(class))
 }
 
+/// The initialization steps of `initCustomEvent`, without `detail`
+/// (<https://dom.spec.whatwg.org/#dom-customevent-initcustomevent>).
+///
+/// Returns false when the event is being dispatched, in which case the caller
+/// must not set `detail` either.
 #[allow(
     clippy::needless_pass_by_value,
     reason = "rquickjs Func ABI passes arguments by value"
 )]
-pub(crate) fn custom_event_detail<'js>(ctx: Ctx<'js>, event: Value<'js>) -> Result<Value<'js>> {
-    let class = Class::<JsEvent>::from_js(&ctx, event)?;
-    class.borrow().detail_value(&ctx)
-}
-
-#[allow(
-    clippy::needless_pass_by_value,
-    reason = "rquickjs Func ABI passes arguments by value"
-)]
-pub(crate) fn init_custom_event<'js>(ctx: Ctx<'js>, args: Rest<Value<'js>>) -> Result<()> {
+pub(crate) fn init_custom_event<'js>(ctx: Ctx<'js>, args: Rest<Value<'js>>) -> Result<bool> {
+    // Convert the arguments before the algorithm's dispatch-flag check.
     let mut args = args.0.into_iter();
     let Some(event) = args.next() else {
         return Err(Exception::throw_type(&ctx, "event is required"));
@@ -508,45 +513,55 @@ pub(crate) fn init_custom_event<'js>(ctx: Ctx<'js>, args: Rest<Value<'js>>) -> R
         return Err(Exception::throw_type(&ctx, "type is required"));
     };
     let class = Class::<JsEvent>::from_js(&ctx, event)?;
-    if class.borrow().state().dispatching {
-        return Ok(());
-    }
     let typ = bindings::webidl_to_string(&ctx, typ)?;
-    let bubbles = boolean_argument(&ctx, args.next())?;
-    let cancelable = boolean_argument(&ctx, args.next())?;
-    let detail = match args.next() {
-        Some(value) if !value.is_undefined() => value,
-        _ => Value::new_null(ctx.clone()),
-    };
-    // `initCustomEvent` initializes the event and then sets `detail`
-    // (<https://dom.spec.whatwg.org/#dom-customevent-initcustomevent>).
+    let bubbles = boolean_argument(args.next());
+    let cancelable = boolean_argument(args.next());
+    if class.borrow().state().dispatching {
+        return Ok(false);
+    }
     class.borrow().initialize(typ, bubbles, cancelable);
-    class.borrow().set_detail(Some(Persistent::save(&ctx, detail)));
-    Ok(())
+    Ok(true)
 }
 
 /// Registers the `CustomEvent` constructor and its prototype chain.
 pub(crate) const INSTALL_CUSTOM_EVENT_JS: &str = r"
 (function() {
+  const TB_DETAIL = Symbol('tb-custom-event-detail');
   function CustomEvent(type) {
     if (new.target === undefined) {
       throw new TypeError('Class constructor CustomEvent cannot be invoked without new');
     }
-    return globalThis.__tb_new_custom_event.apply(globalThis, arguments);
+    const event = globalThis.__tb_new_custom_event.apply(globalThis, arguments);
+    // A subclass constructor keeps its own prototype
+    // (<https://webidl.spec.whatwg.org/#interface-object>).
+    if (new.target !== CustomEvent) {
+      Object.setPrototypeOf(event, new.target.prototype);
+    }
+    // `detail` is read after the EventInit members and defaults to null
+    // (<https://dom.spec.whatwg.org/#dictdef-customeventinit>).
+    const init = arguments[1];
+    const detail = (init === undefined || init === null) ? null : init.detail;
+    event[TB_DETAIL] = detail === undefined ? null : detail;
+    return event;
   }
   const proto = Object.create(globalThis.Event.prototype);
   Object.defineProperty(proto, 'constructor', { value: CustomEvent, writable: true, configurable: true });
   Object.defineProperty(proto, 'detail', {
-    get: function() { return globalThis.__tb_custom_event_detail(this); },
+    get: function() {
+      const detail = this[TB_DETAIL];
+      return detail === undefined ? null : detail;
+    },
     enumerable: true,
     configurable: true,
   });
   Object.defineProperty(proto, 'initCustomEvent', {
-    value: function() {
+    value: function(type, bubbles, cancelable, detail) {
       if (arguments.length < 1) {
         throw new TypeError('initCustomEvent: at least 1 argument required');
       }
-      return globalThis.__tb_init_custom_event.apply(globalThis, [this].concat(Array.prototype.slice.call(arguments)));
+      if (globalThis.__tb_init_custom_event(this, type, bubbles, cancelable)) {
+        this[TB_DETAIL] = (arguments.length < 4 || arguments[3] === undefined) ? null : detail;
+      }
     },
     writable: true,
     configurable: true,
@@ -581,30 +596,18 @@ fn event_from_init<'js>(
     ctx: &Ctx<'js>,
     typ: Value<'js>,
     init: Option<&Object<'js>>,
-    custom: bool,
 ) -> Result<JsEvent> {
     let typ = bindings::webidl_to_string(ctx, typ)?;
     let mut bubbles = false;
     let mut cancelable = false;
     let mut composed = false;
-    let mut detail = None;
     if let Some(init) = init {
-        // Dictionary member order: `EventInit` then `CustomEventInit`
+        // `EventInit` member order; `CustomEventInit.detail` is read by the
+        // JavaScript wrapper afterwards
         // (<https://dom.spec.whatwg.org/#dictdef-eventinit>).
-        bubbles = bindings::option_truthy(ctx, init, "bubbles")?;
-        cancelable = bindings::option_truthy(ctx, init, "cancelable")?;
-        composed = bindings::option_truthy(ctx, init, "composed")?;
-        if custom {
-            let value: Value = init.get("detail")?;
-            let value = if value.is_undefined() {
-                Value::new_null(ctx.clone())
-            } else {
-                value
-            };
-            detail = Some(Persistent::save(ctx, value));
-        }
-    } else if custom {
-        detail = Some(Persistent::save(ctx, Value::new_null(ctx.clone())));
+        bubbles = bindings::option_truthy(init, "bubbles")?;
+        cancelable = bindings::option_truthy(init, "cancelable")?;
+        composed = bindings::option_truthy(init, "composed")?;
     }
     Ok(JsEvent {
         state: EventStateCell(RefCell::new(EventState {
@@ -616,7 +619,6 @@ fn event_from_init<'js>(
             time_stamp: now_millis(),
             ..EventState::default()
         })),
-        detail: EventDetailCell(RefCell::new(detail)),
     })
 }
 
@@ -645,13 +647,24 @@ pub(crate) fn add_listener<'js>(
         None => default_passive(ctx, &typ, target)?,
     };
     let world = target_world(ctx, target)?;
-    let duplicate = world.borrow().listener_snapshot(target).into_iter().any(|existing| {
-        existing.typ == typ
+    // Abort steps are lazy here: with no `AbortSignal` class, a listener whose
+    // signal reads as aborted is dropped whenever its list is touched.
+    let existing_listeners = world.borrow().listener_snapshot(target);
+    for existing in &existing_listeners {
+        if let Some(signal) = &existing.signal
+            && signal_aborted(ctx, signal)
+        {
+            existing.removed.set(true);
+            world.borrow_mut().remove_listener(target, existing);
+        }
+    }
+    for existing in &existing_listeners {
+        if existing.typ == typ
             && existing.capture == options.capture
-            && same_callback(ctx, existing.callback.as_ref(), Some(&callback)).unwrap_or(false)
-    });
-    if duplicate {
-        return Ok(());
+            && same_callback(ctx, existing.callback.as_ref(), Some(&callback))?
+        {
+            return Ok(());
+        }
     }
     world.borrow_mut().add_listener(
         target,
@@ -679,7 +692,7 @@ pub(crate) fn remove_listener<'js>(
 ) -> Result<()> {
     let typ = bindings::webidl_to_string(ctx, typ)?;
     let callback = listener_callback(ctx, callback)?;
-    let capture = ListenerOptions::read_capture(ctx, options)?;
+    let capture = ListenerOptions::read_capture(options)?;
     let world = target_world(ctx, target)?;
     let mut world = world.borrow_mut();
     let mut removed = Vec::new();
@@ -721,16 +734,16 @@ pub(crate) fn dispatch_event<'js>(
 }
 
 /// Creates and dispatches a user-agent event.
-pub(crate) fn fire_trusted<'js>(
-    ctx: &Ctx<'js>,
+pub(crate) fn fire_trusted(
+    ctx: &Ctx<'_>,
     target: EventTargetKey,
     typ: &str,
     bubbles: bool,
     cancelable: bool,
-) -> Result<Value<'js>> {
+) -> Result<()> {
     let event = Class::instance(ctx.clone(), JsEvent::trusted(typ, bubbles, cancelable))?;
     dispatch(ctx, target, &event)?;
-    Ok(Class::into_value(event))
+    Ok(())
 }
 
 /// [Dispatch](https://dom.spec.whatwg.org/#concept-event-dispatch) an event.
@@ -740,44 +753,41 @@ fn dispatch<'js>(
     event: &Class<'js, JsEvent>,
 ) -> Result<bool> {
     let path = build_path(ctx, target)?;
-    let target_value = path.first().map(|item| item.target.clone());
     {
         let class = event.borrow();
         let mut state = class.state_mut();
         state.dispatching = true;
-        state.target = target_value.map(|value| Persistent::save(ctx, value));
+        state.target = Some(EventTargetRef {
+            key: target,
+            world: Rc::clone(&path[0].reference.world),
+        });
         state.current_target = None;
         state.phase = NONE;
         // The stop flags are intentionally not cleared here: an event that was
         // stopped before dispatch must not reach any listener, and the end of
         // the algorithm unsets the flags
         // (<https://dom.spec.whatwg.org/#concept-event-dispatch>).
-        state.path = path
-            .iter()
-            .map(|item| Persistent::save(ctx, item.target.clone()))
-            .collect();
+        state.path = path.iter().map(|item| item.reference.clone()).collect();
     }
     let bubbles = event.borrow().state().bubbles;
-    // Capture phase: root to target.
-    for item in path.iter().rev() {
-        let phase = if item.key == target {
-            AT_TARGET
-        } else {
-            CAPTURING_PHASE
-        };
-        invoke(ctx, event, item, phase, true)?;
-    }
-    // Bubble phase: target to root.
-    for item in &path {
-        let phase = if item.key == target {
-            AT_TARGET
-        } else if bubbles {
-            BUBBLING_PHASE
-        } else {
-            continue;
-        };
-        invoke(ctx, event, item, phase, false)?;
-    }
+    let typ = event.borrow().state().typ.clone();
+    let result = run_invocations(ctx, event, &path, target, bubbles);
+    // Handler attributes (`onreadystatechange`, `onload`, …) act as listeners;
+    // the engine runs them after the listener list until it models the
+    // handler registration slot.
+    let handler = if result.is_ok() {
+        let event_value = Class::into_value(event.clone());
+        call_handler_attribute(
+            ctx,
+            path.first().map(|item| &item.target),
+            &typ,
+            &event_value,
+        )
+    } else {
+        Ok(())
+    };
+    // Clear the dispatch state on both paths, so a failed invocation cannot
+    // leave the event permanently undispatchable.
     let canceled = {
         let class = event.borrow();
         let mut state = class.state_mut();
@@ -789,13 +799,44 @@ fn dispatch<'js>(
         state.stop_immediate = false;
         state.canceled
     };
+    result?;
+    handler?;
     Ok(!canceled)
+}
+
+fn run_invocations<'js>(
+    ctx: &Ctx<'js>,
+    event: &Class<'js, JsEvent>,
+    path: &[PathItem<'js>],
+    target: EventTargetKey,
+    bubbles: bool,
+) -> Result<()> {
+    // Capture phase: root to target.
+    for item in path.iter().rev() {
+        let phase = if item.reference.key == target {
+            AT_TARGET
+        } else {
+            CAPTURING_PHASE
+        };
+        invoke(ctx, event, item, phase, true)?;
+    }
+    // Bubble phase: target to root.
+    for item in path {
+        let phase = if item.reference.key == target {
+            AT_TARGET
+        } else if bubbles {
+            BUBBLING_PHASE
+        } else {
+            continue;
+        };
+        invoke(ctx, event, item, phase, false)?;
+    }
+    Ok(())
 }
 
 /// One event path item (<https://dom.spec.whatwg.org/#event-path-item>).
 struct PathItem<'js> {
-    key: EventTargetKey,
-    world: Rc<RefCell<World>>,
+    reference: EventTargetRef,
     target: Value<'js>,
 }
 
@@ -804,25 +845,27 @@ struct PathItem<'js> {
 fn build_path<'js>(ctx: &Ctx<'js>, target: EventTargetKey) -> Result<Vec<PathItem<'js>>> {
     match target {
         EventTargetKey::Window => {
-            let world = bindings::world(ctx)?;
-            let value = ctx.globals().into_value();
-            Ok(vec![PathItem {
+            let reference = EventTargetRef {
                 key: target,
-                world,
+                world: bindings::world(ctx)?,
+            };
+            let value = resolve_target(ctx, &reference)?;
+            Ok(vec![PathItem {
+                reference,
                 target: value,
             }])
         }
         EventTargetKey::Standalone(id) => {
-            let world = bindings::world(ctx)?;
-            let value = world
-                .borrow()
-                .standalone_target(id)
-                .ok_or_else(|| Exception::throw_internal(ctx, "missing EventTarget"))?
-                .restore(ctx)?
-                .into_value();
-            Ok(vec![PathItem {
+            let reference = EventTargetRef {
                 key: target,
-                world,
+                world: bindings::world(ctx)?,
+            };
+            if reference.world.borrow().standalone_target(id).is_none() {
+                return Err(Exception::throw_internal(ctx, "missing EventTarget"));
+            }
+            let value = resolve_target(ctx, &reference)?;
+            Ok(vec![PathItem {
+                reference,
                 target: value,
             }])
         }
@@ -832,10 +875,14 @@ fn build_path<'js>(ctx: &Ctx<'js>, target: EventTargetKey) -> Result<Vec<PathIte
             let mut cursor = Some(id);
             let mut reached_document = false;
             while let Some(node) = cursor {
-                path.push(PathItem {
+                let reference = EventTargetRef {
                     key: EventTargetKey::Node(node),
                     world: Rc::clone(&world),
-                    target: bindings::wrap_node(ctx, node)?,
+                };
+                let value = resolve_target(ctx, &reference)?;
+                path.push(PathItem {
+                    reference,
+                    target: value,
                 });
                 let parent = world.borrow().node_parent(node);
                 if let Some(parent) = parent {
@@ -846,12 +893,16 @@ fn build_path<'js>(ctx: &Ctx<'js>, target: EventTargetKey) -> Result<Vec<PathIte
                 }
             }
             if reached_document {
-                // A document's parent is its window
-                // (<https://dom.spec.whatwg.org/#get-the-parent>).
-                path.push(PathItem {
+                // A document's parent is its own window, not the dispatching
+                // realm's (<https://dom.spec.whatwg.org/#get-the-parent>).
+                let reference = EventTargetRef {
                     key: EventTargetKey::Window,
                     world,
-                    target: ctx.globals().into_value(),
+                };
+                let value = resolve_target(ctx, &reference)?;
+                path.push(PathItem {
+                    reference,
+                    target: value,
                 });
             }
             Ok(path)
@@ -875,9 +926,9 @@ fn invoke<'js>(
         }
         let mut state = class.state_mut();
         state.phase = phase;
-        state.current_target = Some(Persistent::save(ctx, item.target.clone()));
+        state.current_target = Some(item.reference.clone());
     }
-    let listeners = item.world.borrow().listener_snapshot(item.key);
+    let listeners = item.reference.world.borrow().listener_snapshot(item.reference.key);
     let event_value = Class::into_value(event.clone());
     for listener in listeners {
         if listener.removed.get() {
@@ -894,12 +945,12 @@ fn invoke<'js>(
             && signal_aborted(ctx, signal)
         {
             listener.removed.set(true);
-            item.world.borrow_mut().remove_listener(item.key, &listener);
+            item.reference.world.borrow_mut().remove_listener(item.reference.key, &listener);
             continue;
         }
         if listener.once {
             listener.removed.set(true);
-            item.world.borrow_mut().remove_listener(item.key, &listener);
+            item.reference.world.borrow_mut().remove_listener(item.reference.key, &listener);
         }
         if listener.passive {
             event.borrow().state_mut().in_passive = true;
@@ -907,7 +958,7 @@ fn invoke<'js>(
         if let Some(callback) = &listener.callback {
             let value: Value<'js> = callback.clone().restore(ctx)?;
             if let Err(error) = call_listener(ctx, &value, &item.target, &event_value) {
-                report_exception(error);
+                report_exception(ctx, &error);
             }
         }
         event.borrow().state_mut().in_passive = false;
@@ -946,9 +997,13 @@ fn call_listener<'js>(
 ///
 /// The engine has no `ErrorEvent`/`window.onerror` plumbing yet, so the
 /// exception is dropped. Dropping it keeps a throwing listener from aborting
-/// the rest of the dispatch, which is the observable behavior the algorithm
-/// requires.
-fn report_exception(_error: rquickjs::Error) {}
+/// the rest of the dispatch, and consuming it keeps a later JavaScript
+/// operation from observing the stale pending exception.
+fn report_exception(ctx: &Ctx<'_>, error: &rquickjs::Error) {
+    if error.is_exception() {
+        let _caught = ctx.catch();
+    }
+}
 
 /// `EventListener?` conversion: null and undefined become a null callback and
 /// any object is a callback interface value, whose `handleEvent` is looked up
@@ -997,14 +1052,14 @@ impl ListenerOptions {
         }
         let Some(object) = value.as_object() else {
             // A non-object is the boolean form.
-            parsed.capture = bindings::to_boolean(ctx, value)?;
+            parsed.capture = bindings::to_boolean(&value);
             return Ok(parsed);
         };
-        parsed.capture = bindings::option_truthy(ctx, object, "capture")?;
-        parsed.once = bindings::option_truthy(ctx, object, "once")?;
+        parsed.capture = bindings::option_truthy(object, "capture")?;
+        parsed.once = bindings::option_truthy(object, "once")?;
         let passive: Value = object.get("passive")?;
         if !passive.is_undefined() {
-            parsed.passive = Some(bindings::to_boolean(ctx, passive)?);
+            parsed.passive = Some(bindings::to_boolean(&passive));
         }
         let signal: Value = object.get("signal")?;
         if let Some(signal) = signal.as_object() {
@@ -1013,7 +1068,7 @@ impl ListenerOptions {
         Ok(parsed)
     }
 
-    fn read_capture<'js>(ctx: &Ctx<'js>, options: Option<Value<'js>>) -> Result<bool> {
+    fn read_capture(options: Option<Value<'_>>) -> Result<bool> {
         // `removeEventListener` reads only `capture`; reading the other
         // members would run their getters
         // (<https://dom.spec.whatwg.org/#dom-eventtarget-removeeventlistener>).
@@ -1024,9 +1079,9 @@ impl ListenerOptions {
             return Ok(false);
         }
         let Some(object) = value.as_object() else {
-            return bindings::to_boolean(ctx, value);
+            return Ok(bindings::to_boolean(&value));
         };
-        bindings::option_truthy(ctx, object, "capture")
+        bindings::option_truthy(object, "capture")
     }
 }
 
@@ -1069,8 +1124,7 @@ fn signal_aborted(ctx: &Ctx<'_>, signal: &Persistent<Object<'static>>) -> bool {
         .restore(ctx)
         .ok()
         .and_then(|object| object.get::<_, Value>("aborted").ok())
-        .and_then(|value| bindings::to_boolean(ctx, value).ok())
-        .unwrap_or(false)
+        .is_some_and(|value| bindings::to_boolean(&value))
 }
 
 fn target_world(ctx: &Ctx<'_>, target: EventTargetKey) -> Result<Rc<RefCell<World>>> {
@@ -1082,20 +1136,63 @@ fn target_world(ctx: &Ctx<'_>, target: EventTargetKey) -> Result<Rc<RefCell<Worl
 
 fn stored_target<'js>(
     ctx: &Ctx<'js>,
-    saved: Option<&Persistent<Value<'static>>>,
+    reference: Option<&EventTargetRef>,
 ) -> Result<Value<'js>> {
-    match saved {
-        Some(saved) => saved.clone().restore(ctx),
+    match reference {
+        Some(reference) => resolve_target(ctx, reference),
         None => Ok(Value::new_null(ctx.clone())),
     }
 }
 
+/// Resolves an event target back to its platform object, using the world that
+/// owns it rather than the caller's
+/// (<https://dom.spec.whatwg.org/#concept-event-target>).
+fn resolve_target<'js>(ctx: &Ctx<'js>, reference: &EventTargetRef) -> Result<Value<'js>> {
+    match reference.key {
+        EventTargetKey::Window => match reference.world.borrow().window_object() {
+            Some(window) => Ok(window.restore(ctx)?.into_value()),
+            None => Ok(ctx.globals().into_value()),
+        },
+        EventTargetKey::Node(id) => bindings::wrap_node(ctx, id),
+        EventTargetKey::Standalone(id) => {
+            match reference.world.borrow().standalone_target(id) {
+                Some(saved) => Ok(saved.restore(ctx)?.into_value()),
+                None => Ok(Value::new_null(ctx.clone())),
+            }
+        }
+    }
+}
+
+/// Calls a target's `on<type>` handler attribute, if one is assigned
+/// (<https://html.spec.whatwg.org/multipage/webappapis.html#event-handlers>).
+///
+/// The engine does not model the handler registration slot yet, so this runs
+/// after the listener list instead of at the handler's registration position.
+fn call_handler_attribute<'js>(
+    ctx: &Ctx<'js>,
+    target: Option<&Value<'js>>,
+    typ: &str,
+    event: &Value<'js>,
+) -> Result<()> {
+    let Some(object) = target.and_then(|target| target.as_object()) else {
+        return Ok(());
+    };
+    let name = format!("on{typ}");
+    let handler: Value = object.get(name.as_str())?;
+    if let Some(function) = handler.as_function()
+        && let Err(error) = function.call::<_, ()>((This(object.clone()), event.clone()))
+    {
+        report_exception(ctx, &error);
+    }
+    Ok(())
+}
+
 /// `ToBoolean` for an optional argument; a missing or undefined argument is
 /// false (<https://webidl.spec.whatwg.org/#es-boolean>).
-fn boolean_argument<'js>(ctx: &Ctx<'js>, value: Option<Value<'js>>) -> Result<bool> {
+fn boolean_argument(value: Option<Value<'_>>) -> bool {
     match value {
-        Some(value) if !value.is_undefined() => bindings::to_boolean(ctx, value),
-        _ => Ok(false),
+        Some(value) if !value.is_undefined() => bindings::to_boolean(&value),
+        _ => false,
     }
 }
 

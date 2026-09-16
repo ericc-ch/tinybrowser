@@ -25,12 +25,7 @@ impl Document {
             self.run_task(task);
             return !self.stopped();
         }
-        if self.stopped() {
-            return false;
-        }
-        self.js
-            .as_ref()
-            .is_some_and(crate::js::JsRealm::has_pending_work)
+        false
     }
 
     fn adopt_dial_completions(&mut self) {
@@ -84,10 +79,7 @@ impl Document {
             QueuedDial::JsFetch { .. } => false,
         }) || self.classic_fetch_in_flight
             || self.active_parser.is_some()
-            || !matches!(
-                self.world.borrow().ready_state,
-                crate::js::ReadyState::Complete
-            )
+            || self.world.borrow().main_ready_state() != crate::ReadyState::Complete
     }
 
     fn launch_queued_dials(&mut self) {

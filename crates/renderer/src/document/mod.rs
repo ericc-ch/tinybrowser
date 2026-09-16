@@ -17,9 +17,10 @@ use url::Url;
 use crate::ActiveParser;
 use crate::documents::DocumentStore;
 use crate::js::{
-    DocumentStreamCommand, FrameNavigation, ReadyState, RealmRegistry, SharedJsRuntime, World,
+    DocumentStreamCommand, FrameNavigation, RealmRegistry, SharedJsRuntime, World,
 };
 use crate::protocol::{BrowserServices, Mount, ScriptFailure, TabError, TabEvent};
+use crate::ReadyState;
 
 mod dial;
 mod drain;
@@ -691,10 +692,17 @@ impl Document {
     /// `interactive`, fire `DOMContentLoaded`, then fire `load`
     /// (<https://html.spec.whatwg.org/multipage/parsing.html#the-end>).
     fn fire_document_end(&mut self) {
-        if self.world.borrow().ready_state != ReadyState::Loading {
+        if self.world.borrow().main_ready_state() != ReadyState::Loading {
             return;
         }
-        self.world.borrow_mut().ready_state = ReadyState::Interactive;
+        self.world
+            .borrow_mut()
+            .set_main_ready_state(ReadyState::Interactive);
+        if let Some(js) = &self.js
+            && js.fire_ready_state_change().is_err()
+        {
+            self.record_event(TabEvent::ScriptFailed);
+        }
         if let Some(js) = &self.js
             && js.fire_dom_content_loaded().is_err()
         {
@@ -705,10 +713,17 @@ impl Document {
     }
 
     fn fire_document_load(&mut self) {
-        if self.world.borrow().ready_state == ReadyState::Complete {
+        if self.world.borrow().main_ready_state() == ReadyState::Complete {
             return;
         }
-        self.world.borrow_mut().ready_state = ReadyState::Complete;
+        self.world
+            .borrow_mut()
+            .set_main_ready_state(ReadyState::Complete);
+        if let Some(js) = &self.js
+            && js.fire_ready_state_change().is_err()
+        {
+            self.record_event(TabEvent::ScriptFailed);
+        }
         self.record_event(TabEvent::Load);
         if let Some(js) = &self.js
             && js.fire_load().is_err()

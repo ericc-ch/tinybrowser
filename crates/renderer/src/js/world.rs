@@ -9,7 +9,7 @@ use dom::NodeId;
 use rquickjs::{Object, Persistent, Value, class::Trace, function::Function};
 use url::Url;
 
-use crate::Parsed;
+use crate::{Parsed, ReadyState};
 use crate::documents::DocumentStore;
 use crate::protocol::BrowserServices;
 
@@ -192,18 +192,6 @@ pub(crate) enum EventTargetKey {
     Standalone(u64),
 }
 
-/// The current document readiness
-/// (<https://html.spec.whatwg.org/multipage/dom.html#current-document-readiness>).
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ReadyState {
-    /// The parser is still running.
-    Loading,
-    /// Parsing finished; `DOMContentLoaded` has fired.
-    Interactive,
-    /// The document is completely loaded; the `load` event has fired.
-    Complete,
-}
-
 pub(crate) struct World {
     /// Every tree the renderer process holds, shared by all realms.
     documents: Rc<RefCell<DocumentStore>>,
@@ -224,7 +212,9 @@ pub(crate) struct World {
     next_object_url: u64,
     pub parser_active: bool,
     pub current_script: Option<NodeId>,
-    pub ready_state: ReadyState,
+    /// The realm's window object, for event targets that belong to this world
+    /// but are reached from another realm's call frame.
+    window: Option<Persistent<Object<'static>>>,
     listeners: HashMap<EventTargetKey, Vec<Rc<Listener>>>,
     /// The `EventTarget` object behind each `EventTargetKey::Standalone`.
     standalone_targets: HashMap<u64, Persistent<Object<'static>>>,
@@ -297,7 +287,7 @@ impl World {
             next_object_url: 0,
             parser_active: false,
             current_script: None,
-            ready_state: ReadyState::Loading,
+            window: None,
             listeners: HashMap::new(),
             standalone_targets: HashMap::new(),
             next_standalone_target: 0,
@@ -394,7 +384,6 @@ impl World {
         let id = self.documents.borrow_mut().insert(parsed);
         self.document = Some(id);
         self.owned.insert(id);
-        self.ready_state = ReadyState::Loading;
         self.current_script = None;
         self.listeners.clear();
         self.token_lists.clear();
@@ -647,6 +636,29 @@ impl World {
         self.standalone_targets.get(&id).cloned()
     }
 
+    /// The window object of this realm; event dispatch uses it when a target
+    /// from this world is reached from another realm's call frame.
+    pub(crate) fn set_window(&mut self, window: Persistent<Object<'static>>) {
+        self.window = Some(window);
+    }
+
+    pub(crate) fn window_object(&self) -> Option<Persistent<Object<'static>>> {
+        self.window.clone()
+    }
+
+    /// The active document's readiness
+    /// (<https://html.spec.whatwg.org/multipage/dom.html#current-document-readiness>).
+    pub(crate) fn main_ready_state(&self) -> ReadyState {
+        self.main_document()
+            .map_or(ReadyState::Complete, |parsed| parsed.ready_state)
+    }
+
+    pub(crate) fn set_main_ready_state(&mut self, state: ReadyState) {
+        if let Some(mut parsed) = self.main_document_mut() {
+            parsed.ready_state = state;
+        }
+    }
+
     /// The parent of `id` in its tree, if any.
     pub(crate) fn node_parent(&self, id: NodeId) -> Option<NodeId> {
         self.document(id).and_then(|parsed| parsed.dom.parent(id))
@@ -661,6 +673,7 @@ impl World {
     pub(crate) fn clear_listeners(&mut self) {
         self.listeners.clear();
         self.standalone_targets.clear();
+        self.window = None;
         self.next_standalone_target = 0;
         self.token_lists.clear();
         self.named_node_maps.clear();
