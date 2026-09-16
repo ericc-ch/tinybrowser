@@ -48,6 +48,11 @@ git diff --check
 
 The binary must stay under 10MB stripped. Report the size when it changes.
 
+Changes that add or change `unsafe` also run the UB tools and paste the output
+in the PR: `tools/ub miri <crate>` for unsafe in a pure-Rust crate,
+`tools/ub valgrind <crate>` for unsafe crossing FFI or renderer/net memory
+paths. Extend the crate lists in `tools/ub` when the unsafe code moves.
+
 Web-platform changes also run WPT:
 
 ```sh
