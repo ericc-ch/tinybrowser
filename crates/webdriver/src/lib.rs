@@ -16,7 +16,7 @@ use axum::body::Bytes;
 use axum::extract::State;
 use axum::http::{Method, StatusCode, Uri};
 use axum::response::{IntoResponse, Json, Response};
-use browser::{BrowserHandle, RemoteValue, ScriptFailure, TabError, TabHandle};
+use browser::{BrowserHandle, CookieRecord, CookieSameSite, RemoteValue, ScriptFailure, TabError, TabHandle};
 use serde_json::{Value, json};
 use tokio::sync::Mutex;
 
@@ -164,10 +164,10 @@ async fn dispatch(method: &str, path: &str, body: &str, sessions: &mut Sessions)
         ("POST", ["session", session, "window", "new"]) => new_window(sessions, session).await,
         ("DELETE", ["session", session, "window"]) => close_window(sessions, session).await,
         ("GET", ["session", _session, "window", "rect"]) => {
-            ok(json!({"x":0,"y":0,"width":800,"height":600}))
+            ok(window_rect())
         }
         ("POST", ["session", _session, "window", "rect"]) => {
-            ok(json!({"x":0,"y":0,"width":800,"height":600}))
+            ok(window_rect())
         }
         ("POST", ["session", session, "timeouts"]) => set_timeouts(sessions, session, body),
         ("GET", ["session", session, "timeouts"]) => get_timeouts(sessions, session),
@@ -181,7 +181,18 @@ async fn dispatch(method: &str, path: &str, body: &str, sessions: &mut Sessions)
         ("POST", ["session", session, "element", element, "value"]) => {
             element_send_keys(sessions, session, element, body).await
         }
-        ("POST", ["session", _session, "window", "minimize"]) => ok(Value::Null),
+        ("GET", ["session", session, "cookie"]) => get_cookies(sessions, session).await,
+        ("GET", ["session", session, "cookie", name]) => {
+            get_named_cookie(sessions, session, name).await
+        }
+        ("GET", ["session", session, "element", element, "rect"]) => {
+            element_rect(sessions, session, element).await
+        }
+        ("POST", ["session", session, "cookie"]) => add_cookie(sessions, session, body).await,
+        ("DELETE", ["session", session, "cookie"]) => delete_cookies(sessions, session).await,
+        ("POST", ["session", _session, "window", "minimize"]) => ok(window_rect()),
+        ("POST", ["session", _session, "window", "maximize"]) => ok(window_rect()),
+        ("POST", ["session", _session, "window", "fullscreen"]) => ok(window_rect()),
         ("POST", ["session", _session, "actions"]) => {
             error(500, "unsupported operation", "actions")
         }
@@ -531,6 +542,173 @@ async fn element_send_keys(
     );
     match window.tab.execute_script(&script).await {
         Ok(_) => ok(Value::Null),
+        Err(err) => script_error(&err),
+    }
+}
+
+/// The URL of the current top-level browsing context.
+async fn context_url(sessions: &Sessions, session: &str) -> Result<url::Url, (u16, Value)> {
+    let Some(window) = current(sessions, session) else {
+        return Err(error(404, "invalid session id", session));
+    };
+    let spec = window
+        .tab
+        .document_url()
+        .await
+        .map_err(|err| error(500, "unknown error", &err.to_string()))?;
+    url::Url::parse(&spec).map_err(|err| error(500, "unknown error", &err.to_string()))
+}
+
+/// One cookie in the `WebDriver` serialization
+/// (<https://w3c.github.io/webdriver/#cookie>).
+fn cookie_json(record: &CookieRecord) -> Value {
+    let mut map = serde_json::Map::new();
+    map.insert("name".into(), json!(record.name));
+    map.insert("value".into(), json!(record.value));
+    map.insert("path".into(), json!(record.path));
+    map.insert("domain".into(), json!(record.domain));
+    map.insert("secure".into(), json!(record.secure));
+    map.insert("httpOnly".into(), json!(record.http_only));
+    let same_site = match record.same_site {
+        CookieSameSite::Strict => "Strict",
+        CookieSameSite::None => "None",
+        // No attribute means the default Lax-like behavior.
+        CookieSameSite::Lax | CookieSameSite::Default => "Lax",
+    };
+    map.insert("sameSite".into(), json!(same_site));
+    if let Some(expiry) = record.expiry
+        && let Ok(since) = expiry.duration_since(std::time::UNIX_EPOCH)
+    {
+        map.insert("expiry".into(), json!(since.as_secs()));
+    }
+    Value::Object(map)
+}
+
+/// `GET /session/{id}/cookie`
+/// (<https://w3c.github.io/webdriver/#get-all-cookies>).
+async fn get_cookies(sessions: &Sessions, session: &str) -> (u16, Value) {
+    let url = match context_url(sessions, session).await {
+        Ok(url) => url,
+        Err(reply) => return reply,
+    };
+    match sessions.browser.cookie_records(&url).await {
+        Ok(records) => ok(json!(records.iter().map(cookie_json).collect::<Vec<_>>())),
+        Err(err) => error(500, "unknown error", &err.to_string()),
+    }
+}
+
+/// `GET /session/{id}/cookie/{name}`
+/// (<https://w3c.github.io/webdriver/#get-named-cookie>).
+async fn get_named_cookie(sessions: &Sessions, session: &str, name: &str) -> (u16, Value) {
+    let url = match context_url(sessions, session).await {
+        Ok(url) => url,
+        Err(reply) => return reply,
+    };
+    match sessions.browser.cookie_records(&url).await {
+        Ok(records) => match records.iter().find(|record| record.name == name) {
+            Some(record) => ok(cookie_json(record)),
+            None => error(404, "no such cookie", "no cookie with that name"),
+        },
+        Err(err) => error(500, "unknown error", &err.to_string()),
+    }
+}
+
+/// Builds the `Set-Cookie` line for a `WebDriver` cookie object.
+fn set_cookie_line(cookie: &Value) -> Option<String> {
+    let name = cookie.get("name")?.as_str()?;
+    let value = cookie
+        .get("value")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let mut line = format!("{name}={value}");
+    if let Some(path) = cookie.get("path").and_then(Value::as_str) {
+        line.push_str("; Path=");
+        line.push_str(path);
+    }
+    if let Some(domain) = cookie.get("domain").and_then(Value::as_str) {
+        line.push_str("; Domain=");
+        line.push_str(domain);
+    }
+    if cookie.get("secure").and_then(Value::as_bool).unwrap_or(false) {
+        line.push_str("; Secure");
+    }
+    if cookie
+        .get("httpOnly")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        line.push_str("; HttpOnly");
+    }
+    if let Some(same_site) = cookie.get("sameSite").and_then(Value::as_str) {
+        line.push_str("; SameSite=");
+        line.push_str(same_site);
+    }
+    Some(line)
+}
+
+/// `POST /session/{id}/cookie`
+/// (<https://w3c.github.io/webdriver/#add-cookie>).
+async fn add_cookie(sessions: &Sessions, session: &str, body: &str) -> (u16, Value) {
+    let parsed: Value = match serde_json::from_str(body) {
+        Ok(value) => value,
+        Err(err) => return error(400, "invalid argument", &err.to_string()),
+    };
+    let Some(line) = parsed.get("cookie").and_then(set_cookie_line) else {
+        return error(400, "invalid argument", "cookie is required");
+    };
+    let url = match context_url(sessions, session).await {
+        Ok(url) => url,
+        Err(reply) => return reply,
+    };
+    match sessions.browser.add_cookie(&line, &url).await {
+        Ok(()) => ok(Value::Null),
+        Err(err) => error(500, "unknown error", &err.to_string()),
+    }
+}
+
+/// `DELETE /session/{id}/cookie`
+/// (<https://w3c.github.io/webdriver/#delete-all-cookies>).
+async fn delete_cookies(sessions: &Sessions, session: &str) -> (u16, Value) {
+    if current(sessions, session).is_none() {
+        return error(404, "invalid session id", session);
+    }
+    match sessions.browser.clear_cookies().await {
+        Ok(()) => ok(Value::Null),
+        Err(err) => error(500, "unknown error", &err.to_string()),
+    }
+}
+
+/// The fixed virtual viewport, matching the engine's `innerWidth`/`innerHeight`
+/// and the element geometry stand-in.
+fn window_rect() -> Value {
+    json!({"x": 0, "y": 0, "width": 800, "height": 600})
+}
+
+/// `GET /session/{id}/element/{element id}/rect`
+/// (<https://w3c.github.io/webdriver/#get-element-rect>).
+async fn element_rect(sessions: &Sessions, session: &str, element: &str) -> (u16, Value) {
+    let selector = match element_selector(sessions, session, element) {
+        Ok(selector) => selector,
+        Err(reply) => return reply,
+    };
+    let Some(window) = current(sessions, session) else {
+        return error(404, "invalid session id", session);
+    };
+    let script = format!(
+        "JSON.stringify(document.querySelector({}).getBoundingClientRect())",
+        json!(selector)
+    );
+    match window.tab.execute_script(&script).await {
+        Ok(RemoteValue::String(text)) => match serde_json::from_str::<Value>(&text) {
+            Ok(rect) => ok(json!({
+                "x": rect.get("x").cloned().unwrap_or(json!(0)),
+                "y": rect.get("y").cloned().unwrap_or(json!(0)),
+                "width": rect.get("width").cloned().unwrap_or(json!(0)),
+                "height": rect.get("height").cloned().unwrap_or(json!(0)),
+            })),
+            Err(err) => error(500, "unknown error", &err.to_string()),
+        },
+        Ok(_) => error(404, "no such element", "element has no box"),
         Err(err) => script_error(&err),
     }
 }

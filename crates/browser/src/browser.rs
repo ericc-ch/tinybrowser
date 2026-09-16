@@ -7,6 +7,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use tokio::sync::{mpsc, oneshot};
+use url::Url;
 
 use crate::actor::{TabHandle, TabId, TabTask};
 use crate::manager::RendererProcessManager;
@@ -52,6 +53,18 @@ enum Command {
     },
     Close {
         reply: oneshot::Sender<io::Result<()>>,
+    },
+    CookieRecords {
+        url: Url,
+        reply: oneshot::Sender<Vec<net::CookieRecord>>,
+    },
+    ClearCookies {
+        reply: oneshot::Sender<()>,
+    },
+    AddCookie {
+        cookie: String,
+        url: Url,
+        reply: oneshot::Sender<()>,
     },
 }
 
@@ -200,6 +213,48 @@ impl BrowserHandle {
         rx.await.map_err(|_| BrowserError::Stopped)
     }
 
+    /// Cookies visible to `url`, including session and `HttpOnly` cookies.
+    ///
+    /// # Errors
+    ///
+    /// [`BrowserError::Stopped`] when the browser task has stopped.
+    pub async fn cookie_records(&self, url: &Url) -> Result<Vec<net::CookieRecord>, BrowserError> {
+        let (reply, rx) = oneshot::channel();
+        self.send(Command::CookieRecords {
+            url: url.clone(),
+            reply,
+        })
+        .await?;
+        rx.await.map_err(|_| BrowserError::Stopped)
+    }
+
+    /// Drops every cookie from the live jar.
+    ///
+    /// # Errors
+    ///
+    /// [`BrowserError::Stopped`] when the browser task has stopped.
+    pub async fn clear_cookies(&self) -> Result<(), BrowserError> {
+        let (reply, rx) = oneshot::channel();
+        self.send(Command::ClearCookies { reply }).await?;
+        rx.await.map_err(|_| BrowserError::Stopped)
+    }
+
+    /// Stores one `Set-Cookie` line for `url`.
+    ///
+    /// # Errors
+    ///
+    /// [`BrowserError::Stopped`] when the browser task has stopped.
+    pub async fn add_cookie(&self, cookie: &str, url: &Url) -> Result<(), BrowserError> {
+        let (reply, rx) = oneshot::channel();
+        self.send(Command::AddCookie {
+            cookie: cookie.to_owned(),
+            url: url.clone(),
+            reply,
+        })
+        .await?;
+        rx.await.map_err(|_| BrowserError::Stopped)
+    }
+
     /// Stops every tab, persists the profile, and refuses later commands.
     ///
     /// # Errors
@@ -271,6 +326,17 @@ async fn browser_loop(mut commands: mpsc::Receiver<Command>, mut state: BrowserS
             }
             Command::IsLive { reply } => {
                 let _result = reply.send(state.live);
+            }
+            Command::CookieRecords { url, reply } => {
+                let _result = reply.send(state.network.cookie_records(&url));
+            }
+            Command::ClearCookies { reply } => {
+                state.network.clear_cookies();
+                let _result = reply.send(());
+            }
+            Command::AddCookie { cookie, url, reply } => {
+                state.network.add_cookie(&cookie, &url);
+                let _result = reply.send(());
             }
             Command::Close { reply } => {
                 state.live = false;

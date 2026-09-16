@@ -228,6 +228,34 @@ impl Agent {
             );
     }
 
+    /// Cookies visible to `uri`, including session and `HttpOnly` cookies.
+    /// This is the `WebDriver` cookie view
+    /// (<https://w3c.github.io/webdriver/#get-all-cookies>).
+    #[must_use]
+    pub fn cookie_records(&self, uri: &Url) -> Vec<crate::CookieRecord> {
+        self.jar
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .records_for(CookieOp {
+                url: uri,
+                now: (self.now)(),
+                kind: RetrievalKind::Http,
+                initiator_kind: InitiatorKind::Fetch,
+                method_is_safe: true,
+                initiator: Some(uri),
+                cross_site_redirect: false,
+            })
+    }
+
+    /// Drops every cookie from the live jar
+    /// (<https://w3c.github.io/webdriver/#delete-all-cookies>).
+    pub fn clear_cookies(&self) {
+        self.jar
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+    }
+
     /// Persistent cookies from the live jar. Session cookies are omitted.
     #[must_use]
     pub fn export_cookies(&self) -> Vec<crate::CookieRecord> {
