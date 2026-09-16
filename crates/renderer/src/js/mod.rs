@@ -80,17 +80,157 @@ Object.defineProperty(document, 'cookie', {
   get() { return globalThis.__cookieGet(); },
   set(v) { globalThis.__cookieSet(String(v)); }
 });
-globalThis.fetch = function(url) {
+// https://fetch.spec.whatwg.org/#headers-class
+const __tbHeadersData = Symbol.for('tinybrowser.headers.data');
+const __tbResponseData = Symbol.for('tinybrowser.response.data');
+const __tbRequestData = Symbol.for('tinybrowser.request.data');
+// Blob URLs created in this realm, so fetch() can serve them without a hop
+// (<https://w3c.github.io/FileAPI/#blob-url>).
+const __tbObjectUrlData = Object.create(null);
+globalThis.Headers = class Headers {
+  constructor(init) {
+    const entries = [];
+    if (init !== undefined && init !== null) {
+      if (typeof init[Symbol.iterator] === 'function') {
+        for (const pair of init) {
+          const values = Array.from(pair);
+          if (values.length !== 2) throw new TypeError('Header pairs must contain two values');
+          entries.push([String(values[0]).toLowerCase(), String(values[1]).trim()]);
+        }
+      } else {
+        for (const name of Object.keys(init)) entries.push([name.toLowerCase(), String(init[name]).trim()]);
+      }
+    }
+    Object.defineProperty(this, __tbHeadersData, {
+      value: entries, writable: false, enumerable: false, configurable: false,
+    });
+  }
+  append(name, value) { __tbBrand(this, __tbHeadersData).push([String(name).toLowerCase(), String(value).trim()]); }
+  delete(name) {
+    const entries = __tbBrand(this, __tbHeadersData);
+    name = String(name).toLowerCase();
+    for (let index = entries.length - 1; index >= 0; index--) {
+      if (entries[index][0] === name) entries.splice(index, 1);
+    }
+  }
+  get(name) {
+    const entries = __tbBrand(this, __tbHeadersData);
+    name = String(name).toLowerCase();
+    for (const [header, value] of entries) {
+      if (header === name) return value;
+    }
+    return null;
+  }
+  has(name) { return this.get(name) !== null; }
+  set(name, value) {
+    this.delete(name);
+    __tbBrand(this, __tbHeadersData).push([String(name).toLowerCase(), String(value).trim()]);
+  }
+  forEach(callback, thisArg) {
+    for (const [name, value] of __tbBrand(this, __tbHeadersData)) callback.call(thisArg, value, name, this);
+  }
+  entries() { return __tbBrand(this, __tbHeadersData).map(entry => entry.slice())[Symbol.iterator](); }
+  keys() { return __tbBrand(this, __tbHeadersData).map(entry => entry[0])[Symbol.iterator](); }
+  values() { return __tbBrand(this, __tbHeadersData).map(entry => entry[1])[Symbol.iterator](); }
+  [Symbol.iterator]() { return this.entries(); }
+};
+Object.defineProperty(globalThis.Headers.prototype, Symbol.toStringTag, { value: 'Headers', writable: false, enumerable: false, configurable: true });
+// https://fetch.spec.whatwg.org/#response-class
+globalThis.Response = class Response {
+  constructor(body, init) {
+    const options = init === undefined ? {} : Object(init);
+    const text = body === undefined || body === null ? '' : String(body);
+    Object.defineProperty(this, __tbResponseData, {
+      value: {
+        text,
+        status: options.status === undefined ? 200 : Number(options.status),
+        statusText: options.statusText === undefined ? '' : String(options.statusText),
+        url: options.url === undefined ? '' : String(options.url),
+        headers: options.headers instanceof globalThis.Headers ? options.headers : new globalThis.Headers(options.headers),
+      },
+      writable: false, enumerable: false, configurable: false,
+    });
+  }
+  get status() { return __tbBrand(this, __tbResponseData).status; }
+  get statusText() { return __tbBrand(this, __tbResponseData).statusText; }
+  get url() { return __tbBrand(this, __tbResponseData).url; }
+  get headers() { return __tbBrand(this, __tbResponseData).headers; }
+  get ok() { const status = __tbBrand(this, __tbResponseData).status; return status >= 200 && status <= 299; }
+  get bodyUsed() { return false; }
+  text() { return Promise.resolve(__tbBrand(this, __tbResponseData).text); }
+  json() {
+    try { return Promise.resolve(JSON.parse(__tbBrand(this, __tbResponseData).text)); }
+    catch (error) { return Promise.reject(error); }
+  }
+  arrayBuffer() { return Promise.resolve(__tbUtf8Encode(__tbBrand(this, __tbResponseData).text).buffer); }
+  blob() {
+    const data = __tbBrand(this, __tbResponseData);
+    const type = data.headers.get('content-type');
+    return Promise.resolve(new Blob([data.text], { type: type === null ? '' : type }));
+  }
+  clone() {
+    const data = __tbBrand(this, __tbResponseData);
+    return new Response(data.text, { status: data.status, statusText: data.statusText, url: data.url, headers: data.headers });
+  }
+};
+Object.defineProperty(globalThis.Response.prototype, Symbol.toStringTag, { value: 'Response', writable: false, enumerable: false, configurable: true });
+globalThis.Request = class Request {
+  constructor(input, init) {
+    const options = init === undefined ? {} : Object(init);
+    let url;
+    let method = 'GET';
+    if (input instanceof globalThis.Request) {
+      url = input.url;
+      method = input.method;
+    } else {
+      const resolved = globalThis.__tbResolveUrl(String(input), undefined);
+      url = resolved === null ? String(input) : resolved;
+    }
+    if (options.method !== undefined) method = String(options.method).toUpperCase();
+    Object.defineProperty(this, __tbRequestData, {
+      value: { url, method }, writable: false, enumerable: false, configurable: false,
+    });
+  }
+  get url() { return __tbBrand(this, __tbRequestData).url; }
+  get method() { return __tbBrand(this, __tbRequestData).method; }
+};
+Object.defineProperty(globalThis.Request.prototype, Symbol.toStringTag, { value: 'Request', writable: false, enumerable: false, configurable: true });
+const __tbMakeResponse = (body, status, url, type) => {
+  const headers = new globalThis.Headers();
+  if (type) headers.set('content-type', type);
+  return new globalThis.Response(body, { status, url, headers });
+};
+globalThis.fetch = function(input, init) {
+  const options = init === undefined ? {} : Object(init);
+  let url;
+  let method = 'GET';
+  if (input instanceof globalThis.Request) {
+    url = input.url;
+    method = input.method;
+  } else {
+    const resolved = globalThis.__tbResolveUrl(String(input), undefined);
+    url = resolved === null ? String(input) : resolved;
+  }
+  if (options.method !== undefined) method = String(options.method).toUpperCase();
   return new Promise(function(resolve, reject) {
-    var id = ++globalThis.__tb_fetchSeq;
+    if (url.indexOf('blob:') === 0) {
+      const entry = __tbObjectUrlData[url];
+      if (entry === undefined || method !== 'GET') {
+        reject(new TypeError('Failed to fetch'));
+        return;
+      }
+      resolve(__tbMakeResponse(entry.text, 200, url, entry.type));
+      return;
+    }
+    if (method !== 'GET') {
+      reject(new TypeError('Failed to fetch'));
+      return;
+    }
+    const id = ++globalThis.__tb_fetchSeq;
     globalThis.__tb_fetchCbs[id] = function(ok, status, body) {
       delete globalThis.__tb_fetchCbs[id];
-      if (ok) resolve({
-        status: status,
-        ok: status >= 200 && status <= 299,
-        text: function() { return Promise.resolve(String(body)); }
-      });
-      else reject(new Error('fetch failed'));
+      if (ok) resolve(__tbMakeResponse(String(body), status, url, ''));
+      else reject(new TypeError('Failed to fetch'));
     };
     globalThis.__queueFetch(String(url), id);
   });
@@ -772,13 +912,27 @@ globalThis.URL = class URL {
 };
 globalThis.URL.createObjectURL = function(blob) {
   const data = __tbBrand(blob, __tbBlobData, 'value is not a Blob');
-  const url = globalThis.__tbCreateObjectURL(__tbUtf8Decode(data.bytes, false, true).text);
+  const text = __tbUtf8Decode(data.bytes, false, true).text;
+  const url = globalThis.__tbCreateObjectURL(text);
   if (url == null) throw new RangeError('object URL budget exceeded');
+  __tbObjectUrlData[url] = { text, type: data.type };
   return url;
 };
 // https://w3c.github.io/FileAPI/#dfn-revokeObjectURL
 globalThis.URL.revokeObjectURL = function(url) {
-  globalThis.__tbRevokeObjectURL(String(url));
+  url = String(url);
+  delete __tbObjectUrlData[url];
+  globalThis.__tbRevokeObjectURL(url);
+};
+Object.defineProperty(globalThis.URL.prototype, Symbol.toStringTag, { value: 'URL', writable: false, enumerable: false, configurable: true });
+// https://url.spec.whatwg.org/#dom-url-parse
+globalThis.URL.parse = function(input, base) {
+  try { return new globalThis.URL(input, base); }
+  catch (error) { return null; }
+};
+// https://url.spec.whatwg.org/#dom-url-canparse
+globalThis.URL.canParse = function(input, base) {
+  return globalThis.URL.parse(input, base) !== null;
 };
 // https://url.spec.whatwg.org/#interface-urlsearchparams
 globalThis.URLSearchParams = class URLSearchParams {
@@ -881,6 +1035,7 @@ globalThis.URLSearchParams = class URLSearchParams {
   }
   [Symbol.iterator]() { return this.entries(); }
 };
+Object.defineProperty(globalThis.URLSearchParams.prototype, Symbol.toStringTag, { value: 'URLSearchParams', writable: false, enumerable: false, configurable: true });
 
 globalThis.__tbMakeDataset = element => new Proxy(Object.create(null), {
   get(_target, property) {
