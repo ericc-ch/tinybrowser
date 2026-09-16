@@ -276,7 +276,7 @@ nix develop --command ./tools/wpt/score <directory> -- --exclude=worker
 | `webhid/` | unscored |
 | `webidl/` | unscored |
 | `webmcp/` | unscored |
-| `webmessaging/` | 19.1% |
+| `webmessaging/` | 39.7% |
 | `webmidi/` | unscored |
 | `webnn/` | unscored |
 | `webrtc/` | unscored |
