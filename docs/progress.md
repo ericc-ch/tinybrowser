@@ -105,7 +105,7 @@ nix develop --command ./tools/wpt/score <directory> -- --exclude=worker
 | `fenced-frame/` | unscored |
 | `fetch/` | unscored |
 | `file-system-access/` | unscored |
-| `FileAPI/` | 45.6% |
+| `FileAPI/` | 47.1% |
 | `focus/` | 7.3% |
 | `font-access/` | unscored |
 | `forced-colors-mode/` | unscored |
