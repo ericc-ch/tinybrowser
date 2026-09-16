@@ -17,6 +17,21 @@ unexpected buckets, subtest counts, and test time, then lists what needs
 attention. It is the grind instrument; `--report FILE` summarizes an existing
 `--log-wptreport`. Runner options follow a literal `--`.
 
+`--save-report FILE` keeps the wptreport for the tight loop:
+
+```sh
+# score a directory and keep the report
+nix develop --command ./tools/wpt/score FileAPI/ --save-report /tmp/fileapi.json -- \
+  --exclude=worker --processes 8 --fully-parallel
+# after a fix, re-run only the tests that needed attention
+nix develop --command ./tools/wpt/retest /tmp/fileapi.json -- --processes 8 --fully-parallel
+```
+
+`tools/wpt/retest REPORT.json` feeds the failures to `run --include-file`, so
+passing tests are not re-run. TIMEOUTs are excluded by default
+(`--include-timeout` adds them): they are usually blocked capabilities, and
+re-running them only pays the timeout. `--dry-run` lists the selection.
+
 In `docs/progress.md`, replace the latest total and scored groups only.
 
 ## Enabled

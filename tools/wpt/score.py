@@ -9,10 +9,14 @@ of work.
     tools/wpt/score dom/nodes/ | head
     tools/wpt/score dom/nodes/ -- --processes 4
     tools/wpt/score --report report.json     # summarize an existing wptreport
+    tools/wpt/score FileAPI/ --save-report /tmp/fileapi.json   # keep the report
+
+`--save-report FILE` keeps the wptreport a `tools/wpt/retest FILE` run needs.
+Without it the report is temporary and removed after a successful run.
 
 Runner arguments follow a literal `--`; everything before it is a test path
-(or `--report FILE`). A nonzero exit means the runner failed, not that tests
-failed: the run always passes `--no-fail-on-unexpected`.
+(or `--report FILE` / `--save-report FILE`). A nonzero exit means the runner
+failed, not that tests failed: the run always passes `--no-fail-on-unexpected`.
 """
 
 from __future__ import annotations
@@ -115,10 +119,14 @@ def classify_results(
     return rows, attention
 
 
-def run(paths: list[str], extra: list[str]) -> tuple[Path, int]:
-    handle, name = tempfile.mkstemp(prefix="wpt-report-", suffix=".json")
-    os.close(handle)
-    report = Path(name)
+def run(paths: list[str], extra: list[str], save_report: Path | None = None) -> tuple[Path, int]:
+    if save_report is not None:
+        report = save_report
+        report.parent.mkdir(parents=True, exist_ok=True)
+    else:
+        handle, name = tempfile.mkstemp(prefix="wpt-report-", suffix=".json")
+        os.close(handle)
+        report = Path(name)
     command = [
         str(RUNNER),
         *paths,
@@ -189,34 +197,54 @@ def summarize(report: Path) -> int:
     return 0
 
 
-def split_args(argv: list[str]) -> tuple[Path | None, list[str], list[str], str | None]:
+def split_args(
+    argv: list[str],
+) -> tuple[Path | None, Path | None, list[str], list[str], str | None]:
     """Split our arguments from the runner's.
 
     Paths are the leading positionals; `--` starts the runner extras;
-    `--report FILE` is ours.
+    `--report FILE` is ours (summarize only); `--save-report FILE` runs and
+    keeps the wptreport for `retest`.
     """
     report: Path | None = None
+    save_report: Path | None = None
     paths: list[str] = []
-    for index, arg in enumerate(argv):
+    index = 0
+    while index < len(argv):
+        arg = argv[index]
         if arg == "--":
-            return report, paths, list(argv[index + 1 :]), None
-        if arg == "--report":
-            if index + 1 >= len(argv):
-                return report, paths, [], "--report needs a file"
-            report = Path(argv[index + 1])
-            return report, paths, list(argv[index + 2 :]), None
-        if arg.startswith("--report="):
-            report = Path(arg.split("=", 1)[1])
-            return report, paths, list(argv[index + 1 :]), None
+            return report, save_report, paths, list(argv[index + 1 :]), None
+        if arg == "--report" or arg.startswith("--report="):
+            if arg == "--report":
+                if index + 1 >= len(argv):
+                    return report, save_report, paths, [], "--report needs a file"
+                report = Path(argv[index + 1])
+                index += 2
+            else:
+                report = Path(arg.split("=", 1)[1])
+                index += 1
+            return report, save_report, paths, list(argv[index:]), None
+        if arg == "--save-report" or arg.startswith("--save-report="):
+            if arg == "--save-report":
+                if index + 1 >= len(argv):
+                    return report, save_report, paths, [], "--save-report needs a file"
+                save_report = Path(argv[index + 1])
+                index += 2
+            else:
+                save_report = Path(arg.split("=", 1)[1])
+                index += 1
+            continue
         if arg.startswith("-"):
             return (
                 report,
+                save_report,
                 paths,
                 list(argv[index:]),
                 "runner options must follow the test paths (or a literal `--`)",
             )
         paths.append(arg)
-    return report, paths, [], None
+        index += 1
+    return report, save_report, paths, [], None
 
 
 def _selftest() -> None:
@@ -278,16 +306,46 @@ def _selftest() -> None:
     assert rows["dom/fail.html"]["expected_fail"] == 1
     assert attention == []
 
+    report, save_report, paths, extra, error = split_args(
+        ["FileAPI/", "--save-report", "/tmp/x.json", "--", "--exclude=worker"]
+    )
+    assert report is None
+    assert save_report == Path("/tmp/x.json")
+    assert paths == ["FileAPI/"]
+    assert extra == ["--exclude=worker"]
+    assert error is None
+
+    report, save_report, paths, extra, error = split_args(["--report", "r.json"])
+    assert report == Path("r.json")
+    assert save_report is None
+    assert not paths and not extra and error is None
+
+    report, save_report, paths, extra, error = split_args(["--save-report=x.json", "dom/"])
+    assert report is None
+    assert save_report == Path("x.json")
+    assert paths == ["dom/"]
+    assert error is None
+
+    assert split_args(["--save-report"])[4] == "--save-report needs a file"
+    assert split_args(["--bogus"])[4] is not None
+
 
 def main() -> int:
     if sys.argv[1:] == ["--selftest"]:
         _selftest()
         return 0
-    report, paths, extra, error = split_args(sys.argv[1:])
+    report, save_report, paths, extra, error = split_args(sys.argv[1:])
     if error:
         print(f"score: {error}", file=sys.stderr)
         return 2
     if report is not None:
+        if save_report is not None:
+            print(
+                "score: --report summarizes an existing report; do not combine "
+                "it with --save-report",
+                file=sys.stderr,
+            )
+            return 2
         if paths or extra:
             print(
                 "score: --report summarizes an existing report; give no test paths",
@@ -301,19 +359,21 @@ def main() -> int:
 
     started = time.monotonic()
     try:
-        report_path, runner_exit = run(paths, extra)
+        report_path, runner_exit = run(paths, extra, save_report)
     except OSError as error:
         print(f"score: could not start the runner: {error}", file=sys.stderr)
         return 1
-    keep_report = runner_exit != 0
+    keep_report = runner_exit != 0 or save_report is not None
     try:
-        if keep_report:
+        if runner_exit != 0:
             print(
                 f"runner failed with exit {runner_exit}; report kept at {report_path}",
                 file=sys.stderr,
             )
             summarize(report_path)
             return runner_exit
+        if keep_report:
+            print(f"report kept at {report_path}", file=sys.stderr)
         return summarize(report_path)
     finally:
         if not keep_report:
