@@ -1872,43 +1872,68 @@ pub(super) fn schedule_mutation_delivery(ctx: &Ctx<'_>) -> Result<()> {
     queue.call::<_, ()>((deliver,))
 }
 
-/// Cross-document insertion: a `DocumentType` is copied into the parent's
-/// document; anything else is refused until real adoption exists.
+/// Same-document insert returns `node`. Cross-document insert is refused:
+/// [adopt](https://dom.spec.whatwg.org/#concept-node-adopt) keeps the same
+/// node, and `NodeId` is document-scoped until the handle can retarget.
 fn adopt_across_documents(ctx: &Ctx<'_>, parent: NodeId, node: NodeId) -> Result<NodeId> {
     if node.document_id() == parent.document_id() {
         return Ok(node);
     }
+    // https://dom.spec.whatwg.org/#concept-node-adopt
+    Err(throw_dom(
+        ctx,
+        "HierarchyRequestError",
+        "nodes belong to different documents",
+    ))
+}
+
+/// [Clones](https://dom.spec.whatwg.org/#concept-node-clone) a document into a
+/// new tree in this world. `Dom::clone_node` refuses the document node because
+/// a document clone is a different document, not a node in the same arena.
+fn clone_document<'js>(ctx: &Ctx<'js>, id: NodeId, deep: bool) -> Result<Value<'js>> {
     let world_rc = world(ctx)?;
-    let tree = {
+    let (content_type, quirks_mode, children) = {
         let world = world_rc.borrow();
-        let Some(source) = world.document(node) else {
-            return Err(throw_dom(
-                ctx,
-                "HierarchyRequestError",
-                "nodes belong to different documents",
-            ));
+        let Some(parsed) = world.document(id) else {
+            return Err(Exception::throw_type(ctx, "no document"));
         };
-        match source.dom.get(node).map(|node| node.kind()) {
-            Some(NodeKind::Doctype { .. }) => import_snapshot(&source.dom, node, false),
-            _ => None,
-        }
+        let children = if deep {
+            parsed
+                .dom
+                .children(id)
+                .map(|kids| {
+                    kids.copied()
+                        .filter_map(|kid| import_snapshot(&parsed.dom, kid, true))
+                        .collect()
+                })
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        (parsed.content_type, parsed.quirks_mode, children)
     };
-    let Some(tree) = tree else {
-        return Err(throw_dom(
-            ctx,
-            "HierarchyRequestError",
-            "nodes belong to different documents",
-        ));
+    let mut parsed = crate::Parsed {
+        dom: dom::Dom::new(),
+        quirks_mode,
+        parse_errors: 0,
+        content_type,
+        ready_state: crate::ReadyState::Complete,
     };
-    let world = world_rc.borrow();
-    let Some(mut target) = world.document_mut(parent) else {
-        return Err(throw_dom(
-            ctx,
-            "HierarchyRequestError",
-            "nodes belong to different documents",
-        ));
-    };
-    materialize_import(&mut target.dom, &tree).map_err(|err| throw_dom_error(ctx, err))
+    let document = parsed.dom.document();
+    for child in children {
+        let child =
+            materialize_import(&mut parsed.dom, &child).map_err(|err| throw_dom_error(ctx, err))?;
+        parsed
+            .dom
+            .append(document, child)
+            .map_err(|err| throw_dom_error(ctx, err))?;
+    }
+    let root = world_rc.borrow_mut().add_document(parsed);
+    let registry = world_rc.borrow().registry();
+    registry
+        .borrow_mut()
+        .insert_document(root.document_id(), &world_rc);
+    wrap_node(ctx, root)
 }
 
 /// Owned snapshot of a subtree for cross-document `importNode`.
@@ -4518,21 +4543,25 @@ impl JsNode {
     // https://dom.spec.whatwg.org/#dom-node-clonenode
     #[qjs(rename = "cloneNode")]
     fn clone_node<'js>(&self, ctx: Ctx<'js>, deep: Opt<bool>) -> Result<Value<'js>> {
-        let world = world(&ctx)?;
-        let world = world.borrow();
+        let deep = deep.0.unwrap_or(false);
+        let world_rc = world(&ctx)?;
+        let is_document = {
+            let world = world_rc.borrow();
+            let Some(parsed) = world.document(self.handle.0) else {
+                return Err(Exception::throw_type(&ctx, "no document"));
+            };
+            self.handle.0 == parsed.dom.document()
+        };
+        if is_document {
+            return clone_document(&ctx, self.handle.0, deep);
+        }
+        let world = world_rc.borrow();
         let Some(mut parsed) = world.document_mut(self.handle.0) else {
             return Err(Exception::throw_type(&ctx, "no document"));
         };
-        if self.handle.0 == parsed.dom.document() {
-            return Err(throw_dom(
-                &ctx,
-                "NotSupportedError",
-                "cannot clone a document",
-            ));
-        }
         let clone = parsed
             .dom
-            .clone_node(self.handle.0, deep.0.unwrap_or(false))
+            .clone_node(self.handle.0, deep)
             .map_err(|err| throw_dom_error(&ctx, err))?;
         drop(parsed);
         drop(world);
@@ -5001,6 +5030,7 @@ pub(super) fn install(ctx: &Ctx<'_>, world: &Rc<RefCell<World>>) -> Result<()> {
     Class::<JsCollection>::define(&globals)?;
     Class::<JsDomException>::define(&globals)?;
     inherit_error_prototype(&globals)?;
+    ctx.eval::<(), _>(events::INSTALL_ABORT_JS)?;
     Class::<JsImplementation>::define(&globals)?;
     Class::<JsTokenList>::define(&globals)?;
     Class::<JsAttr>::define(&globals)?;
@@ -5042,6 +5072,8 @@ pub(super) fn install(ctx: &Ctx<'_>, world: &Rc<RefCell<World>>) -> Result<()> {
     globals.set("location", location)?;
     globals.set("window", globals.clone())?;
     globals.set("self", globals.clone())?;
+    // https://html.spec.whatwg.org/multipage/nav-history-apis.html#dom-window-event
+    globals.set("event", Value::new_undefined(ctx.clone()))?;
     // https://html.spec.whatwg.org/multipage/nav-history-apis.html#dom-frames
     globals.set("frames", globals.clone())?;
     // A top-level context has no child browsing contexts yet.
@@ -6122,6 +6154,31 @@ const INSTALL_BRANDS_JS: &str = r"
     const members = name === 'HTMLIFrameElement' ? ['contentDocument'] : [];
     table[name] = define(name, parent, members).prototype;
   }
+  // `type` reflects the content attribute, limited to only known values
+  // (<https://html.spec.whatwg.org/multipage/common-dom-interfaces.html#limited-to-only-known-values>,
+  // <https://html.spec.whatwg.org/multipage/input.html#dom-input-type>,
+  // <https://html.spec.whatwg.org/multipage/form-elements.html#dom-button-type>).
+  function reflectType(keywords, fallback) {
+    return {
+      get: function() {
+        const value = this.getAttribute('type');
+        if (value === null) return fallback;
+        const lowered = String(value).toLowerCase();
+        return keywords.has(lowered) ? lowered : fallback;
+      },
+      set: function(value) { this.setAttribute('type', String(value)); },
+      enumerable: true,
+      configurable: true,
+    };
+  }
+  Object.defineProperty(table.HTMLInputElement, 'type', reflectType(new Set([
+    'hidden', 'text', 'search', 'tel', 'url', 'email', 'password',
+    'date', 'month', 'week', 'time', 'datetime-local', 'number', 'range',
+    'color', 'checkbox', 'radio', 'file', 'submit', 'image', 'reset', 'button',
+  ]), 'text'));
+  Object.defineProperty(table.HTMLButtonElement, 'type', reflectType(new Set([
+    'submit', 'reset', 'button',
+  ]), 'submit'));
   Object.defineProperty(globalThis, '__tb_brandTable', {
     enumerable: false,
     configurable: true,

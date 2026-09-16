@@ -810,9 +810,6 @@ impl Dom {
     /// and reference membership
     /// (<https://dom.spec.whatwg.org/#concept-node-ensure-pre-insert-validity>).
     ///
-    /// The bindings run this before copying a cross-document node so the
-    /// observable error order matches the spec.
-    ///
     /// # Errors
     ///
     /// - [`DomError::HierarchyRequest`] when `parent` cannot contain children.
