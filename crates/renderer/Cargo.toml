@@ -32,7 +32,7 @@ writeable = "0.6"
 tokio = { version = "1.53", default-features = false, features = ["time", "sync", "macros"] }
 url = "2"
 # QuickJS-ng via rquickjs; `std` uses shipped linux bindings (no bindgen).
-rquickjs = { version = "0.12.2", default-features = false, features = ["std", "classes", "macro"] }
+rquickjs = { version = "0.13.0", default-features = false, features = ["std", "classes", "macro"] }
 # Value-only seam for script results crossing to a carrier.
 serde = { version = "1", features = ["derive"] }
 
