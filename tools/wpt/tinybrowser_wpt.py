@@ -45,10 +45,12 @@ def check_args(**kwargs):
 
 
 def browser_kwargs(logger, test_type, run_info_data, config, subsuite, **kwargs):
+    ssl_config = getattr(config, "ssl_config", None) or {}
     return {
         "binary": kwargs["binary"],
         "binary_args": kwargs.get("binary_args") or [],
         "webdriver_host": "127.0.0.1",
+        "ca_cert_path": ssl_config.get("ca_cert_path"),
     }
 
 
@@ -67,9 +69,10 @@ def env_options():
 
 
 class TinyBrowser(WebDriverBrowser):
-    def __init__(self, logger, binary, webdriver_host="127.0.0.1", binary_args=None, **kwargs):
+    def __init__(self, logger, binary, webdriver_host="127.0.0.1", binary_args=None, ca_cert_path=None, **kwargs):
         args = list(binary_args or [])
         self._profile_root = None
+        self._ca_cert_path = ca_cert_path
         super().__init__(
             logger,
             binary=binary,
@@ -82,14 +85,17 @@ class TinyBrowser(WebDriverBrowser):
 
     def make_command(self):
         self._ensure_profile()
-        return [
+        command = [
             self.webdriver_binary,
             "webdriver",
             f"--port={self.port}",
             "--resolve=nonexistent.*.test=fail",
             "--resolve=*.test=127.0.0.1",
             "--resolve=*.test.=127.0.0.1",
-        ] + self.webdriver_args
+        ]
+        if self._ca_cert_path:
+            command.append(f"--tls-ca={self._ca_cert_path}")
+        return command + self.webdriver_args
 
     def stop(self, force=False):
         try:

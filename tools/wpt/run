@@ -155,4 +155,7 @@ fi
 if ! has_option --no-restart-on-unexpected "${args[@]}" && ! has_option --restart-on-unexpected "${args[@]}"; then
   args=(--no-restart-on-unexpected "${args[@]}")
 fi
-exec "$VENV/bin/python" "$ROOT/tools/wpt/launch.py" --binary "$BINARY" --ssl-type none tinybrowser "${args[@]}"
+if ! has_option --ssl-type "${args[@]}"; then
+  args=(--ssl-type=openssl "${args[@]}")
+fi
+exec "$VENV/bin/python" "$ROOT/tools/wpt/launch.py" --binary "$BINARY" tinybrowser "${args[@]}"

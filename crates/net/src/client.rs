@@ -24,6 +24,7 @@ pub struct AgentBuilder {
     max_redirects: u32,
     proxy: Option<String>,
     host_map: HostMap,
+    tls_cas: Vec<native_tls::Certificate>,
 }
 
 impl std::fmt::Debug for AgentBuilder {
@@ -34,6 +35,7 @@ impl std::fmt::Debug for AgentBuilder {
             .field("timeout_per_call", &self.timeout_per_call)
             .field("max_redirects", &self.max_redirects)
             .field("has_host_map", &!self.host_map.is_empty())
+            .field("extra_tls_cas", &self.tls_cas.len())
             .finish_non_exhaustive()
     }
 }
@@ -55,6 +57,7 @@ impl AgentBuilder {
             max_redirects: DEFAULT_MAX_REDIRECTS,
             proxy: None,
             host_map: HostMap::default(),
+            tls_cas: Vec::new(),
         }
     }
 
@@ -114,6 +117,22 @@ impl AgentBuilder {
         Ok(self)
     }
 
+    /// Trust an additional PEM-encoded certificate authority.
+    ///
+    /// Used to trust a private test CA, such as the one `wptserve` generates
+    /// for `web-platform.test`. Repeatable for more than one CA.
+    ///
+    /// # Errors
+    ///
+    /// [`NetError::Transport`] when `pem` is not a certificate.
+    pub fn tls_ca_pem(mut self, pem: &[u8]) -> Result<Self, NetError> {
+        let certificate = native_tls::Certificate::from_pem(pem).map_err(|error| {
+            NetError::Transport(TransportError::Tls(error.to_string().into()))
+        })?;
+        self.tls_cas.push(certificate);
+        Ok(self)
+    }
+
     /// Builds an agent with a private cookie jar and the selected transport options.
     #[must_use]
     pub fn build(self) -> Agent {
@@ -123,6 +142,7 @@ impl AgentBuilder {
                 self.timeout_per_call,
                 self.proxy,
                 self.host_map,
+                &self.tls_cas,
             ),
             ua: self.user_agent,
             max_redirects: self.max_redirects,

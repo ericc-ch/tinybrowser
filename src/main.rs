@@ -82,6 +82,9 @@ enum Command {
         /// Rewrite a host to an address; repeatable
         #[arg(long = "resolve", value_name = "PATTERN=ADDR")]
         resolve: Vec<String>,
+        /// Trust an additional PEM certificate authority; repeatable
+        #[arg(long = "tls-ca", value_name = "PATH")]
+        tls_ca: Vec<PathBuf>,
     },
 }
 
@@ -112,8 +115,9 @@ fn run(cli: &Cli) -> ExitCode {
             port,
             profile,
             resolve,
+            tls_ca,
         }) => {
-            let builder = match resolve_builder(resolve) {
+            let builder = match resolve_builder(resolve, tls_ca) {
                 Ok(builder) => builder,
                 Err(error) => return usage_error(&error),
             };
@@ -177,10 +181,17 @@ fn parse_level(value: &str) -> Result<Level, String> {
         .map_err(|error: logging::ParseLevelError| error.to_string())
 }
 
-fn resolve_builder(specs: &[String]) -> Result<AgentBuilder, String> {
+fn resolve_builder(specs: &[String], tls_ca: &[PathBuf]) -> Result<AgentBuilder, String> {
     let mut builder = AgentBuilder::new();
     for spec in specs {
         builder = builder.resolve(spec).map_err(|error| error.to_string())?;
+    }
+    for path in tls_ca {
+        let pem = std::fs::read(path)
+            .map_err(|error| format!("--tls-ca {}: {error}", path.display()))?;
+        builder = builder
+            .tls_ca_pem(&pem)
+            .map_err(|error| format!("--tls-ca {}: {error}", path.display()))?;
     }
     Ok(builder)
 }
