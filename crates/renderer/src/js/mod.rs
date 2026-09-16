@@ -47,6 +47,16 @@ globalThis.clearTimeout = function(id) {
   globalThis.__tb_timeouts[id] = function() {};
   globalThis.__cancelTimeout(Number(id));
 };
+// The engine has no rendering pipeline; a frame callback is a 16ms timer
+// (<https://html.spec.whatwg.org/multipage/imagebitmap-and-animations.html#dom-animationframeprovider-requestanimationframe>).
+globalThis.requestAnimationFrame = function(fn) {
+  return globalThis.setTimeout(function() {
+    fn(Date.now());
+  }, 16);
+};
+globalThis.cancelAnimationFrame = function(id) {
+  globalThis.clearTimeout(id);
+};
 if (!globalThis.document) {
   globalThis.document = {};
 }

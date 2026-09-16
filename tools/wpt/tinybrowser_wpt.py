@@ -16,6 +16,7 @@ import tempfile
 from wptrunner.browsers.base import WebDriverBrowser, get_timeout_multiplier, require_arg
 from wptrunner.executors import executor_kwargs as base_executor_kwargs
 from wptrunner.executors.executorwebdriver import (
+    WebDriverCrashtestExecutor,
     WebDriverProtocol,
     WebDriverTestharnessExecutor,
 )
@@ -27,6 +28,7 @@ __wptrunner__ = {
     "browser": "TinyBrowser",
     "executor": {
         "testharness": "TinyBrowserTestharnessExecutor",
+        "crashtest": "TinyBrowserCrashtestExecutor",
     },
     "browser_kwargs": "browser_kwargs",
     "executor_kwargs": "executor_kwargs",
@@ -145,3 +147,10 @@ class TinyBrowserTestharnessExecutor(WebDriverTestharnessExecutor):
         protocol.base.set_window(test_window)
         protocol.base.execute_script(self.window_loaded_script, asynchronous=True)
         return test_window
+
+
+class TinyBrowserCrashtestExecutor(WebDriverCrashtestExecutor):
+    """Crashtests only need the page to load and settle without dying."""
+
+    supports_testdriver = True
+    protocol_cls = TinyBrowserProtocol
