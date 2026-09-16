@@ -22,6 +22,10 @@ One change, one branch, one draft PR, one merge. Follow the steps in order.
 
 ## 1. Branch
 
+Work in a worktree. The user creates it from the OpenCode interface and moves
+the session into it; `main` stays in the primary checkout. If you start in the
+primary checkout, ask before creating a branch there.
+
 ```sh
 git switch -c <type>/<slug>
 ```
@@ -67,8 +71,8 @@ gh pr create --draft --base main --title "<title>" --body "<body>"
 ```
 
 The body carries the summary, the verification commands with their results,
-and any known gap. Mark it ready with `gh pr ready` only when the user
-confirms or the review is done.
+and any known gap. Keep it draft while the adversarial review runs; CodeRabbit
+does not review drafts.
 
 ## 4. Adversarial review
 
@@ -91,13 +95,26 @@ Consolidate the reports, dedupe, and fix what holds up. Push the fixes.
 
 ## 5. CodeRabbit
 
-After each push, run the watcher in the background:
+CodeRabbit skips draft pull requests ("Draft PR not reviewed"). Mark the PR
+ready when the change is final:
+
+```sh
+gh pr ready <pr>
+```
+
+Then, after each push, run the watcher in the background:
 
 ```sh
 tools/dev/coderabbit-wait <pr>
 ```
 
-It notifies when the pass for the current head ends. Read the review yourself:
+The watcher follows the PR head captured at start, so kill and restart it
+after every push; a stale instance waits for the old commit. Exit 2 means no
+finished pass covered the head in time. Read the latest pass anyway, and if
+every finding is answered, record the covered commit in the PR before merging.
+Never merge claiming a review the bot did not deliver.
+
+Read the review yourself:
 
 ```sh
 REPO=ericc-ch/tinybrowser
@@ -110,11 +127,13 @@ Triage rules:
 
 - Dedupe findings that repeat across threads.
 - Fix only high-signal findings. Verify each one against the spec or the code
-  before applying it; one CodeRabbit fix broke an Intl test.
+  before applying it, then run the affected suite; a fix that reads well can
+  still break a test.
 - Skip the docstring-coverage threshold. It is a bot metric, not a defect.
 - Defer out-of-scope work in a PR comment with a reason, not silently.
 - Reply to every addressed thread with `Addressed in <sha>: <what changed>`.
-- Wait for the re-review of the new head before merging.
+- Prefer the pass that covers the final head; when CodeRabbit does not
+  re-review, the exit-2 fallback above applies.
 
 ## 6. Merge
 
@@ -124,16 +143,25 @@ Use a merge commit. Do not squash or rebase.
 gh pr merge <pr> --merge --delete-branch
 ```
 
-Run it from the primary checkout when it sits on `main`. From a worktree,
-merge without `--delete-branch`, then detach and delete the branch after the
-sync. Keep long-lived branches such as `refactor/v2-async-browser` and
-`spike/*`.
+`--delete-branch` deletes the remote branch. When the command runs from the
+branch's own worktree, `gh` skips the local delete and prints the commands for
+it; run those after the sync. Keep long-lived branches such as
+`refactor/v2-async-browser` and `spike/*`.
 
 ## 7. Sync
 
+`main` normally sits in the primary checkout. Fast-forward it there:
+
 ```sh
-git -C /home/erickc/projects/tinybrowser checkout main
 git -C /home/erickc/projects/tinybrowser pull --ff-only origin main
+```
+
+If the primary carries another branch or uncommitted work, do not move it.
+Advance `main` from a worktree instead, which works only while no worktree has
+it checked out:
+
+```sh
+git fetch origin main:main
 ```
 
 Then reset the session worktree:
@@ -141,7 +169,7 @@ Then reset the session worktree:
 ```sh
 git fetch --prune origin
 git switch --detach origin/main
-git branch -D <branch>    # once the remote branch is gone
+git branch -D <branch>
 ```
 
 ## Disk policy
@@ -151,7 +179,7 @@ gigabytes. Keep one build-heavy worktree at a time. After the merge:
 
 ```sh
 nix develop --command cargo clean
-git -C /home/erickc/projects/tinybrowser worktree remove <path>
+git -C /home/erickc/projects/tinybrowser worktree remove <path>   # --force with scratch files left
 ```
 
 Check `df -h` and `du -sh` before starting a fresh build. Do not add
@@ -162,4 +190,5 @@ Check `df -h` and `du -sh` before starting a fresh build. Do not add
 Commits sign through the SSH key and `~/.local/bin/ssh-sign-with-agent`. If
 the agent is locked, signing fails; use `git -c commit.gpgsign=false commit`
 for local commits and tell the user. Check a commit with
-`git log -1 --format='%G?'`; `G` means a good signature.
+`git log -1 --format='%G?'`; `G` means a good signature. GitHub-created merge
+commits report `N` here because gpg is absent, which is expected.
