@@ -19,6 +19,7 @@ marker='review in progress by coderabbit.ai'
 repo="${REPO:-$(gh repo view --json nameWithOwner -q .nameWithOwner)}"
 pr="${1:-${PR:-$(gh pr view --json number -q .number)}}"
 timeout="${2:-1800}"
+[[ "$timeout" =~ ^[1-9][0-9]*$ ]] || timeout=1800
 
 head="$(gh pr view "$pr" --json headRefOid -q .headRefOid 2>/dev/null || true)"
 if [[ -z "$head" || "$head" == null ]]; then
@@ -26,7 +27,7 @@ if [[ -z "$head" || "$head" == null ]]; then
   echo "could not read the PR head; using local HEAD $head" >&2
 fi
 short="${head:0:7}"
-deadline=$(( $(date +%s) + timeout ))
+deadline=$(( $(date +%s) + 10#$timeout ))
 
 # A full or generously abbreviated covered id counts as this commit.
 covers_head() {
@@ -37,8 +38,9 @@ covers_head() {
 
 while :; do
   covered=""
-  if body="$(gh api --paginate "repos/$repo/issues/$pr/comments" \
-      -q "[.[] | select(.user.login == \"$bot\")] | sort_by(.updated_at) | last | .body // \"\"" 2>/dev/null)"; then
+  if body="$(gh api --paginate "repos/$repo/issues/$pr/comments" 2>/dev/null |
+      jq -rs --arg bot "$bot" \
+        '[.[][] | select(.user.login == $bot)] | sort_by(.updated_at) | last | .body // ""')"; then
     covered="$(printf '%s' "$body" |
       sed -n 's/.*"coveredCommitId": *"\([0-9a-f]\{7,40\}\)".*/\1/p' | tail -n 1)"
     if [[ "$body" != *"$marker"* ]] && covers_head "$covered"; then
@@ -64,6 +66,7 @@ while :; do
 
   echo "$(date +%H:%M:%S) waiting for CodeRabbit on $short (${SECONDS}s)"
   interval="${INTERVAL:-30}"
+  [[ "$interval" =~ ^[1-9][0-9]*$ ]] || interval=30
   remaining=$(( deadline - $(date +%s) ))
   [[ "$remaining" -lt 1 ]] && remaining=1
   [[ "$interval" -gt "$remaining" ]] && interval="$remaining"
