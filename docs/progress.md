@@ -105,7 +105,7 @@ nix develop --command ./tools/wpt/score <directory> -- --exclude=worker
 | `fenced-frame/` | unscored |
 | `fetch/` | unscored |
 | `file-system-access/` | unscored |
-| `FileAPI/` | 47.1% |
+| `FileAPI/` | 48.5% |
 | `focus/` | 7.3% |
 | `font-access/` | unscored |
 | `forced-colors-mode/` | unscored |
@@ -276,7 +276,7 @@ nix develop --command ./tools/wpt/score <directory> -- --exclude=worker
 | `webhid/` | unscored |
 | `webidl/` | unscored |
 | `webmcp/` | unscored |
-| `webmessaging/` | unscored |
+| `webmessaging/` | 19.1% |
 | `webmidi/` | unscored |
 | `webnn/` | unscored |
 | `webrtc/` | unscored |
