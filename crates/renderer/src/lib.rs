@@ -38,6 +38,18 @@ pub use protocol::{
 };
 pub use remote::RemoteValue;
 
+/// The current document readiness
+/// (<https://html.spec.whatwg.org/multipage/dom.html#current-document-readiness>).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ReadyState {
+    /// The parser is still running.
+    Loading,
+    /// Parsing finished; `DOMContentLoaded` has fired.
+    Interactive,
+    /// The document is completely loaded; the `load` event has fired.
+    Complete,
+}
+
 /// The result of parsing one document.
 #[derive(Debug)]
 pub(crate) struct Parsed {
@@ -49,6 +61,10 @@ pub(crate) struct Parsed {
     pub parse_errors: u32,
     /// MIME type this document reports from `document.contentType`.
     pub content_type: &'static str,
+    /// The document's readiness; parsed documents start at [`ReadyState::Loading`]
+    /// while documents created by script start complete
+    /// (<https://html.spec.whatwg.org/multipage/dom.html#current-document-readiness>).
+    pub ready_state: ReadyState,
 }
 
 pub(crate) enum ParseProgress {
@@ -198,6 +214,7 @@ impl Sink {
             quirks_mode: self.quirks_mode.get(),
             parse_errors: self.parse_errors.get(),
             content_type: "text/html",
+            ready_state: ReadyState::Loading,
         }
     }
 
@@ -278,6 +295,7 @@ impl TreeSink for Sink {
             quirks_mode: self.quirks_mode.get(),
             parse_errors: self.parse_errors.get(),
             content_type: "text/html",
+            ready_state: ReadyState::Loading,
         }
     }
 

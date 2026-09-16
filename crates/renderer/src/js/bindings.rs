@@ -15,10 +15,12 @@ use rquickjs::{
     prelude::This,
 };
 
+use super::events::{self, JsEvent, JsEventTarget};
 use super::world::{
-    AttrState, DocumentStreamCommand, EventTargetKey, FrameNavigation, Handle, Listener,
-    Observation, ObserverOptions, ObserverState, RecordData, World,
+    AttrState, DocumentStreamCommand, EventTargetKey, FrameNavigation, Handle, Observation,
+    ObserverOptions, ObserverState, RecordData, World,
 };
+use crate::ReadyState;
 
 thread_local! {
     /// JS world per live realm, keyed by its QuickJS context pointer.
@@ -57,25 +59,6 @@ macro_rules! branded_node {
             handle: Handle,
         }
     };
-}
-
-#[derive(Trace, rquickjs::JsLifetime)]
-#[rquickjs::class(rename = "Event")]
-pub struct JsEvent {
-    typ: String,
-}
-
-#[rquickjs::methods]
-impl JsEvent {
-    #[qjs(constructor)]
-    fn new(typ: String) -> Self {
-        Self { typ }
-    }
-
-    #[qjs(get, rename = "type")]
-    fn event_type(&self) -> String {
-        self.typ.clone()
-    }
 }
 
 /// Legacy `DOMException` constants: name used to derive `code`.
@@ -257,6 +240,7 @@ impl JsImplementation {
             quirks_mode: markup5ever::interface::QuirksMode::NoQuirks,
             parse_errors: 0,
             content_type,
+            ready_state: crate::ReadyState::Complete,
         };
         let document = parsed.dom.document();
         if !doctype.is_null()
@@ -314,6 +298,7 @@ impl JsImplementation {
             quirks_mode: markup5ever::interface::QuirksMode::NoQuirks,
             parse_errors: 0,
             content_type: "text/html",
+            ready_state: crate::ReadyState::Complete,
         };
         let document = parsed.dom.document();
         let doctype = parsed.dom.create_doctype("html", "", "");
@@ -1384,6 +1369,7 @@ impl JsDomParser {
         let parsed = if content_type == "text/html" {
             let mut parsed = crate::parse_html(&source.0);
             parsed.content_type = content_type;
+            parsed.ready_state = crate::ReadyState::Complete;
             parsed
         } else {
             crate::xml::parse_document(&source.0, content_type)
@@ -1563,13 +1549,13 @@ impl JsMutationObserver {
     ) -> Result<()> {
         let target = required_node(&ctx, &target)?;
         let attributes_present = options.contains_key("attributes")?;
-        let attributes = option_truthy(&ctx, &options, "attributes")?;
+        let attributes = option_truthy(&options, "attributes")?;
         let attribute_old_value_present = options.contains_key("attributeOldValue")?;
-        let attribute_old_value = option_truthy(&ctx, &options, "attributeOldValue")?;
+        let attribute_old_value = option_truthy(&options, "attributeOldValue")?;
         let character_data_present = options.contains_key("characterData")?;
-        let character_data = option_truthy(&ctx, &options, "characterData")?;
+        let character_data = option_truthy(&options, "characterData")?;
         let character_data_old_value_present = options.contains_key("characterDataOldValue")?;
-        let character_data_old_value = option_truthy(&ctx, &options, "characterDataOldValue")?;
+        let character_data_old_value = option_truthy(&options, "characterDataOldValue")?;
         let attribute_filter = match options.get::<_, Value>("attributeFilter") {
             Ok(value) if !value.is_undefined() && !value.is_null() => {
                 let array = value.into_array().ok_or_else(|| {
@@ -1601,13 +1587,13 @@ impl JsMutationObserver {
             ));
         }
         let parsed = ObserverOptions {
-            child_list: option_truthy(&ctx, &options, "childList")?,
+            child_list: option_truthy(&options, "childList")?,
             attributes: attributes
                 || (!attributes_present
                     && (attribute_old_value_present || attribute_filter.is_some())),
             character_data: character_data
                 || (!character_data_present && character_data_old_value_present),
-            subtree: option_truthy(&ctx, &options, "subtree")?,
+            subtree: option_truthy(&options, "subtree")?,
             attribute_old_value,
             character_data_old_value,
             attribute_filter,
@@ -1688,13 +1674,33 @@ impl JsMutationObserver {
 }
 
 /// Dictionary member truthiness (`ToBoolean`, missing members are false).
-fn option_truthy<'js>(ctx: &Ctx<'js>, options: &Object<'js>, key: &str) -> Result<bool> {
+pub(super) fn option_truthy(options: &Object<'_>, key: &str) -> Result<bool> {
     let value: Value = options.get(key)?;
     if value.is_undefined() || value.is_null() {
         return Ok(false);
     }
-    let to_boolean: Function = ctx.globals().get("Boolean")?;
-    to_boolean.call((value,))
+    Ok(to_boolean(&value))
+}
+
+/// `WebIDL` `ToBoolean` (<https://webidl.spec.whatwg.org/#es-boolean>).
+///
+/// A direct ECMAScript conversion, not a call to the page's `Boolean`: the
+/// global can be replaced by page script.
+pub(super) fn to_boolean(value: &Value<'_>) -> bool {
+    if let Some(boolean) = value.as_bool() {
+        return boolean;
+    }
+    if value.is_null() || value.is_undefined() {
+        return false;
+    }
+    if let Some(number) = value.as_number() {
+        return number != 0.0 && !number.is_nan();
+    }
+    if let Some(string) = value.as_string() {
+        return !string.to_string().is_ok_and(|string| string.is_empty());
+    }
+    // Objects, symbols, and BigInts; `0n` is the one falsy BigInt.
+    true
 }
 
 /// Backs the constructible platform interfaces (`new Text(…)`); the current
@@ -1733,6 +1739,7 @@ fn construct_node<'js>(
                 quirks_mode: markup5ever::interface::QuirksMode::NoQuirks,
                 parse_errors: 0,
                 content_type: "application/xml",
+                ready_state: crate::ReadyState::Complete,
             };
             let world_rc = world(&ctx)?;
 
@@ -1751,6 +1758,7 @@ fn construct_node<'js>(
                 quirks_mode: markup5ever::interface::QuirksMode::NoQuirks,
                 parse_errors: 0,
                 content_type: "application/xml",
+                ready_state: crate::ReadyState::Complete,
             };
             let world_rc = world(&ctx)?;
 
@@ -2031,7 +2039,7 @@ fn materialize_import(
 
 /// Builds and throws a `DOMException` from Rust with a real prototype, so
 /// `instanceof DOMException` and `constructor` checks pass.
-fn throw_dom(ctx: &Ctx<'_>, name: &str, message: &str) -> rquickjs::Error {
+pub(super) fn throw_dom(ctx: &Ctx<'_>, name: &str, message: &str) -> rquickjs::Error {
     match Class::instance(
         ctx.clone(),
         JsDomException {
@@ -2277,16 +2285,46 @@ impl JsNode {
     fn add_event_listener<'js>(
         &self,
         ctx: Ctx<'js>,
-        typ: String,
-        callback: Function<'js>,
+        typ: Value<'js>,
+        callback: Value<'js>,
+        options: Opt<Value<'js>>,
     ) -> Result<()> {
-        add_listener(&ctx, EventTargetKey::Node(self.handle.0), typ, callback)
+        events::add_listener(
+            &ctx,
+            EventTargetKey::Node(self.handle.0),
+            typ,
+            callback,
+            options.0,
+        )
+    }
+
+    #[qjs(rename = "removeEventListener")]
+    fn remove_event_listener<'js>(
+        &self,
+        ctx: Ctx<'js>,
+        typ: Value<'js>,
+        callback: Value<'js>,
+        options: Opt<Value<'js>>,
+    ) -> Result<()> {
+        events::remove_listener(
+            &ctx,
+            EventTargetKey::Node(self.handle.0),
+            typ,
+            callback,
+            options.0,
+        )
     }
 
     #[qjs(rename = "dispatchEvent")]
     fn dispatch_event<'js>(&self, ctx: Ctx<'js>, event: Class<'js, JsEvent>) -> Result<bool> {
-        let typ = event.borrow().typ.clone();
-        fire(&ctx, EventTargetKey::Node(self.handle.0), &typ, &event)
+        events::dispatch_event(&ctx, EventTargetKey::Node(self.handle.0), &event)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-document-createevent
+    #[qjs(rename = "createEvent")]
+    fn create_event<'js>(&self, ctx: Ctx<'js>, interface: Value<'js>) -> Result<Value<'js>> {
+        let interface = webidl_to_string(&ctx, interface)?;
+        events::create_event(&ctx, &interface)
     }
 
     #[qjs(rename = "createElement")]
@@ -2553,6 +2591,23 @@ impl JsNode {
         }
     }
 
+    // https://html.spec.whatwg.org/multipage/dom.html#dom-document-head
+    #[qjs(get)]
+    fn head<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
+        let world = world(&ctx)?;
+        let found = world.borrow().document(self.handle.0).and_then(|parsed| {
+            parsed
+                .dom
+                .select_first(parsed.dom.document(), "head")
+                .ok()
+                .flatten()
+        });
+        match found {
+            Some(id) => wrap_node(&ctx, id),
+            None => Ok(Value::new_null(ctx)),
+        }
+    }
+
     // https://html.spec.whatwg.org/multipage/dom.html#dom-document-currentscript
     #[qjs(get, rename = "currentScript")]
     fn current_script<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
@@ -2624,16 +2679,16 @@ impl JsNode {
     fn ready_state(&self, ctx: Ctx<'_>) -> Result<String> {
         let world = world(&ctx)?;
         let world = world.borrow();
-        let is_document = world
-            .document(self.handle.0)
-            .is_some_and(|parsed| parsed.dom.document() == self.handle.0);
-        if !is_document {
+        let Some(parsed) = world.document(self.handle.0) else {
+            return Ok(String::new());
+        };
+        if parsed.dom.document() != self.handle.0 {
             return Ok(String::new());
         }
-        Ok(if world.document_ready {
-            "complete".into()
-        } else {
-            "loading".into()
+        Ok(match parsed.ready_state {
+            ReadyState::Loading => "loading".into(),
+            ReadyState::Interactive => "interactive".into(),
+            ReadyState::Complete => "complete".into(),
         })
     }
 
@@ -4670,7 +4725,7 @@ impl<'js> rquickjs::FromJs<'js> for WebIdlUnsignedLong {
 }
 
 /// `ToString` without a raw conversion API: call the global `String`.
-fn webidl_to_string<'js>(ctx: &Ctx<'js>, value: Value<'js>) -> Result<String> {
+pub(super) fn webidl_to_string<'js>(ctx: &Ctx<'js>, value: Value<'js>) -> Result<String> {
     let to_string: Function = ctx.globals().get("String")?;
     let text: rquickjs::String = to_string.call((value,))?;
     text.to_string()
@@ -4802,7 +4857,22 @@ fn webidl_unsigned_long(number: f64) -> u32 {
 pub(super) fn install(ctx: &Ctx<'_>, world: &Rc<RefCell<World>>) -> Result<()> {
     register_world(ctx, world);
     let globals = ctx.globals();
+    world
+        .borrow_mut()
+        .set_window(Persistent::save(ctx, globals.clone()));
     Class::<JsEvent>::define(&globals)?;
+    ctx.eval::<(), _>(events::INSTALL_EVENT_CTOR_JS)?;
+    globals.set(
+        "__tb_new_custom_event",
+        rquickjs::prelude::Func::from(events::construct_custom_event),
+    )?;
+    globals.set(
+        "__tb_init_custom_event",
+        rquickjs::prelude::Func::from(events::init_custom_event),
+    )?;
+    ctx.eval::<(), _>(events::INSTALL_CUSTOM_EVENT_JS)?;
+    Class::<JsEventTarget>::define(&globals)?;
+    ctx.eval::<(), _>(events::INSTALL_EVENT_TARGET_CTOR_JS)?;
     Class::<JsNode>::define(&globals)?;
     Class::<JsCollection>::define(&globals)?;
     Class::<JsDomException>::define(&globals)?;
@@ -4863,39 +4933,83 @@ pub(super) fn install(ctx: &Ctx<'_>, world: &Rc<RefCell<World>>) -> Result<()> {
         "addEventListener",
         rquickjs::prelude::Func::from(window_add_event_listener),
     )?;
+    globals.set(
+        "removeEventListener",
+        rquickjs::prelude::Func::from(window_remove_event_listener),
+    )?;
+    globals.set(
+        "dispatchEvent",
+        rquickjs::prelude::Func::from(window_dispatch_event),
+    )?;
     Ok(())
 }
 
 #[allow(
     clippy::needless_pass_by_value,
-    reason = "rquickjs Func ABI passes Ctx by value"
+    reason = "rquickjs Func ABI passes arguments by value"
 )]
 fn window_add_event_listener<'js>(
     ctx: Ctx<'js>,
-    typ: String,
-    callback: Function<'js>,
+    typ: Value<'js>,
+    callback: Value<'js>,
+    options: Opt<Value<'js>>,
 ) -> Result<()> {
-    add_listener(&ctx, EventTargetKey::Window, typ, callback)
+    events::add_listener(&ctx, EventTargetKey::Window, typ, callback, options.0)
+}
+
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "rquickjs Func ABI passes arguments by value"
+)]
+fn window_remove_event_listener<'js>(
+    ctx: Ctx<'js>,
+    typ: Value<'js>,
+    callback: Value<'js>,
+    options: Opt<Value<'js>>,
+) -> Result<()> {
+    events::remove_listener(&ctx, EventTargetKey::Window, typ, callback, options.0)
+}
+
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "rquickjs Func ABI passes arguments by value"
+)]
+fn window_dispatch_event<'js>(ctx: Ctx<'js>, event: Class<'js, JsEvent>) -> Result<bool> {
+    events::dispatch_event(&ctx, EventTargetKey::Window, &event)
+}
+
+pub(super) fn fire_dom_content_loaded(ctx: &Ctx<'_>) -> Result<()> {
+    let document = main_document(ctx)?;
+    events::fire_trusted(
+        ctx,
+        EventTargetKey::Node(document),
+        "DOMContentLoaded",
+        true,
+        false,
+    )?;
+    Ok(())
+}
+
+/// Fires `readystatechange` at the document after its readiness changed
+/// (<https://html.spec.whatwg.org/multipage/dom.html#current-document-readiness>).
+pub(super) fn fire_ready_state_change(ctx: &Ctx<'_>) -> Result<()> {
+    let document = main_document(ctx)?;
+    events::fire_trusted(
+        ctx,
+        EventTargetKey::Node(document),
+        "readystatechange",
+        false,
+        false,
+    )?;
+    Ok(())
 }
 
 pub(super) fn fire_window_load(ctx: &Ctx<'_>) -> Result<()> {
-    let event = Class::instance(ctx.clone(), JsEvent { typ: "load".into() })?;
-    fire(ctx, EventTargetKey::Window, "load", &event)?;
-    Ok(())
+    events::fire_trusted(ctx, EventTargetKey::Window, "load", false, false)
 }
 
 pub(super) fn fire_node_load(ctx: &Ctx<'_>, id: NodeId) -> Result<()> {
-    let event = Class::instance(ctx.clone(), JsEvent { typ: "load".into() })?;
-    fire(ctx, EventTargetKey::Node(id), "load", &event)?;
-    let value = wrap_node(ctx, id)?;
-    let Some(object) = value.as_object() else {
-        return Ok(());
-    };
-    let handler: Value = object.get("onload")?;
-    if let Some(handler) = handler.as_function() {
-        handler.call::<_, ()>((This(object.clone()), event))?;
-    }
-    Ok(())
+    events::fire_trusted(ctx, EventTargetKey::Node(id), "load", false, false)
 }
 
 pub(super) fn host_node_id<'js>(ctx: &Ctx<'js>, value: &Value<'js>) -> Option<NodeId> {
@@ -4904,7 +5018,7 @@ pub(super) fn host_node_id<'js>(ctx: &Ctx<'js>, value: &Value<'js>) -> Option<No
         .map(|node| node.borrow().node_id())
 }
 
-fn wrap_node<'js>(ctx: &Ctx<'js>, id: NodeId) -> Result<Value<'js>> {
+pub(super) fn wrap_node<'js>(ctx: &Ctx<'js>, id: NodeId) -> Result<Value<'js>> {
     let world_rc = world(ctx)?;
     if let Some(saved) = world_rc.borrow().shared_wrapper(id)
         && let Some(value) = deref_weak(ctx, saved)?
@@ -5149,15 +5263,15 @@ const INSTALL_BRANDS_JS: &str = r"
         Object.defineProperty(proto, member, descriptor);
       }
     }
+    Object.defineProperty(ctor, 'name', { value: name, configurable: true });
     Object.defineProperty(proto, 'constructor', { value: ctor, writable: true, configurable: true });
     Object.defineProperty(ctor, 'prototype', { value: proto, writable: false });
     Object.defineProperty(globalThis, name, { value: ctor, writable: true, configurable: true });
     return ctor;
   }
-  const EventTargetInterface = define('EventTarget', null, [
-    'addEventListener', 'dispatchEvent'
-  ]);
+  const EventTargetInterface = globalThis.EventTarget;
   const NodeInterface = define('Node', EventTargetInterface, [
+    'addEventListener', 'removeEventListener', 'dispatchEvent',
     'nodeType', 'nodeName', 'firstChild', 'lastChild', 'nextSibling',
     'previousSibling', 'parentNode', 'childNodes', 'appendChild',
     'ownerDocument', 'hasChildNodes', 'nodeValue', 'textContent', 'isSameNode',
@@ -5192,10 +5306,10 @@ const INSTALL_BRANDS_JS: &str = r"
   const DocumentInterface = define('Document', NodeInterface, [
     'createElement', 'createElementNS', 'createTextNode', 'createComment',
     'createProcessingInstruction', 'createCDATASection', 'createAttribute',
-    'createAttributeNS', 'createDocumentFragment', 'open', 'write', 'close',
+    'createAttributeNS', 'createDocumentFragment', 'createEvent', 'open', 'write', 'close',
     'getElementById', 'getElementsByTagName',
     'getElementsByTagNameNS', 'getElementsByClassName',
-    'body', 'documentElement', 'doctype', 'readyState', 'implementation',
+    'body', 'head', 'documentElement', 'doctype', 'readyState', 'implementation',
     'children', 'firstElementChild', 'lastElementChild', 'childElementCount',
     'append', 'prepend', 'replaceChildren', 'querySelector', 'querySelectorAll',
     'URL', 'documentURI', 'location', 'characterSet', 'charset',
@@ -5546,7 +5660,7 @@ fn install_dom_exception_codes(ctx: &Ctx<'_>) -> Result<()> {
     Ok(())
 }
 
-fn world(ctx: &Ctx<'_>) -> Result<Rc<RefCell<World>>> {
+pub(super) fn world(ctx: &Ctx<'_>) -> Result<Rc<RefCell<World>>> {
     REALM_WORLDS
         .with(|worlds| {
             worlds
@@ -5557,49 +5671,10 @@ fn world(ctx: &Ctx<'_>) -> Result<Rc<RefCell<World>>> {
         .ok_or_else(|| Exception::throw_internal(ctx, "missing JS world"))
 }
 
-fn world_for_node(ctx: &Ctx<'_>, id: NodeId) -> Result<Rc<RefCell<World>>> {
+pub(super) fn world_for_node(ctx: &Ctx<'_>, id: NodeId) -> Result<Rc<RefCell<World>>> {
     let current = world(ctx)?;
     let owner = current.borrow().owner_world(id);
     Ok(owner.unwrap_or(current))
-}
-
-fn add_listener<'js>(
-    ctx: &Ctx<'js>,
-    target: EventTargetKey,
-    typ: String,
-    callback: Function<'js>,
-) -> Result<()> {
-    let saved = Persistent::save(ctx, callback);
-    let owner = match target {
-        EventTargetKey::Node(id) => world_for_node(ctx, id)?,
-        EventTargetKey::Window => world(ctx)?,
-    };
-    owner.borrow_mut().add_listener(
-        target,
-        Listener {
-            typ,
-            callback: saved,
-        },
-    );
-    Ok(())
-}
-
-fn fire<'js>(
-    ctx: &Ctx<'js>,
-    target: EventTargetKey,
-    typ: &str,
-    event: &Class<'js, JsEvent>,
-) -> Result<bool> {
-    let owner = match target {
-        EventTargetKey::Node(id) => world_for_node(ctx, id)?,
-        EventTargetKey::Window => world(ctx)?,
-    };
-    let callbacks = owner.borrow().listeners(target, typ);
-    for callback in callbacks {
-        let func = callback.restore(ctx)?;
-        func.call::<_, ()>((event.clone(),))?;
-    }
-    Ok(true)
 }
 
 fn with_node_kind<T>(
@@ -6366,6 +6441,57 @@ mod realm_tests {
         let world = Rc::new(RefCell::new(world));
         registry.borrow_mut().insert_document(id, &world);
         world
+    }
+
+    /// A JS-reachable event must not pin its `QuickJS` context past realm
+    /// teardown. Before event state moved out of the class, this aborted the
+    /// runtime with `JS_FreeRuntime: Assertion 'list_empty(&rt->gc_obj_list)'`.
+    #[test]
+    fn teardown_with_retained_custom_event() {
+        let services: Arc<dyn BrowserServices> = Arc::new(NullServices);
+        let shared = SharedJsRuntime::default();
+        let stop = Arc::new(Stop::new());
+        let documents = Rc::new(RefCell::new(crate::documents::DocumentStore::default()));
+        let registry = Rc::new(RefCell::new(crate::js::RealmRegistry::default()));
+        let world = world_with_document(
+            &services,
+            &documents,
+            &registry,
+            "https://a.test/",
+            "<!doctype html><p></p>",
+        );
+        let realm = JsRealm::new(&shared, world, stop).expect("realm");
+        realm
+            .eval("window.ev = new CustomEvent('x', {detail: 1})")
+            .expect("eval");
+        drop(realm);
+        drop(shared);
+    }
+
+    #[test]
+    fn teardown_after_document_lifecycle() {
+        let services: Arc<dyn BrowserServices> = Arc::new(NullServices);
+        let shared = SharedJsRuntime::default();
+        let stop = Arc::new(Stop::new());
+        let documents = Rc::new(RefCell::new(crate::documents::DocumentStore::default()));
+        let registry = Rc::new(RefCell::new(crate::js::RealmRegistry::default()));
+        let world = world_with_document(
+            &services,
+            &documents,
+            &registry,
+            "https://a.test/",
+            "<!doctype html><p>hello</p>",
+        );
+        let realm = JsRealm::new(&shared, world, stop).expect("realm");
+        realm
+            .eval("window.onload = function(){}; document.onreadystatechange = function(){};")
+            .expect("eval");
+        realm.fire_ready_state_change().expect("readystatechange");
+        realm.fire_dom_content_loaded().expect("DOMContentLoaded");
+        realm.fire_ready_state_change().expect("readystatechange 2");
+        realm.fire_load().expect("load");
+        drop(realm);
+        drop(shared);
     }
 
     #[test]

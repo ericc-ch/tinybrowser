@@ -59,6 +59,7 @@ impl<'a> XmlParser<'a> {
             quirks_mode: markup5ever::interface::QuirksMode::NoQuirks,
             parse_errors: 0,
             content_type: self.content_type,
+            ready_state: crate::ReadyState::Complete,
         }
     }
 

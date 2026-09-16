@@ -16,8 +16,11 @@ use url::Url;
 
 use crate::ActiveParser;
 use crate::documents::DocumentStore;
-use crate::js::{DocumentStreamCommand, FrameNavigation, RealmRegistry, SharedJsRuntime, World};
+use crate::js::{
+    DocumentStreamCommand, FrameNavigation, RealmRegistry, SharedJsRuntime, World,
+};
 use crate::protocol::{BrowserServices, Mount, ScriptFailure, TabError, TabEvent};
+use crate::ReadyState;
 
 mod dial;
 mod drain;
@@ -566,9 +569,9 @@ impl Document {
                         self.register_document(document);
                     }
                     self.world.borrow_mut().parser_active = false;
-                    // Deliver parser mutations before the load event.
+                    // Deliver parser mutations before the document's events.
                     self.deliver_mutations();
-                    self.fire_document_load();
+                    self.fire_document_end();
                     return;
                 }
             }
@@ -685,11 +688,42 @@ impl Document {
         }
     }
 
-    fn fire_document_load(&mut self) {
-        if self.world.borrow().document_ready {
+    /// Runs the post-parsing steps of "the end": set readiness to
+    /// `interactive`, fire `DOMContentLoaded`, then fire `load`
+    /// (<https://html.spec.whatwg.org/multipage/parsing.html#the-end>).
+    fn fire_document_end(&mut self) {
+        if self.world.borrow().main_ready_state() != ReadyState::Loading {
             return;
         }
-        self.world.borrow_mut().document_ready = true;
+        self.world
+            .borrow_mut()
+            .set_main_ready_state(ReadyState::Interactive);
+        if let Some(js) = &self.js
+            && js.fire_ready_state_change().is_err()
+        {
+            self.record_event(TabEvent::ScriptFailed);
+        }
+        if let Some(js) = &self.js
+            && js.fire_dom_content_loaded().is_err()
+        {
+            self.record_event(TabEvent::ScriptFailed);
+        }
+        self.adopt_js_work();
+        self.fire_document_load();
+    }
+
+    fn fire_document_load(&mut self) {
+        if self.world.borrow().main_ready_state() == ReadyState::Complete {
+            return;
+        }
+        self.world
+            .borrow_mut()
+            .set_main_ready_state(ReadyState::Complete);
+        if let Some(js) = &self.js
+            && js.fire_ready_state_change().is_err()
+        {
+            self.record_event(TabEvent::ScriptFailed);
+        }
         self.record_event(TabEvent::Load);
         if let Some(js) = &self.js
             && js.fire_load().is_err()

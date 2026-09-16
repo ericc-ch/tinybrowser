@@ -5,6 +5,7 @@
 //! uses `Function::call` on the renderer thread.
 
 mod bindings;
+mod events;
 mod intl;
 mod world;
 
@@ -498,10 +499,6 @@ impl JsRealm {
         })
     }
 
-    pub(crate) fn has_pending_work(&self) -> bool {
-        !self.pending_timeouts.borrow().is_empty() || !self.pending_fetches.borrow().is_empty()
-    }
-
     pub(crate) fn take_pending_timeouts(&self) -> Vec<PendingTimeout> {
         std::mem::take(&mut *self.pending_timeouts.borrow_mut())
     }
@@ -561,6 +558,29 @@ impl JsRealm {
             let fired: Result<(), JsError> = self
                 .context
                 .with(|ctx| bindings::fire_window_load(&ctx).map_err(JsError::engine));
+            let jobs = self.run_jobs();
+            fired.and(jobs)
+        })
+    }
+
+    /// Fires `DOMContentLoaded` at the document
+    /// (<https://html.spec.whatwg.org/multipage/parsing.html#the-end>).
+    pub(crate) fn fire_dom_content_loaded(&self) -> Result<(), JsError> {
+        self.with_budget(None, || {
+            let fired: Result<(), JsError> = self
+                .context
+                .with(|ctx| bindings::fire_dom_content_loaded(&ctx).map_err(JsError::engine));
+            let jobs = self.run_jobs();
+            fired.and(jobs)
+        })
+    }
+
+    /// Fires `readystatechange` after a document readiness change.
+    pub(crate) fn fire_ready_state_change(&self) -> Result<(), JsError> {
+        self.with_budget(None, || {
+            let fired: Result<(), JsError> = self
+                .context
+                .with(|ctx| bindings::fire_ready_state_change(&ctx).map_err(JsError::engine));
             let jobs = self.run_jobs();
             fired.and(jobs)
         })
