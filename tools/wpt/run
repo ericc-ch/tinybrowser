@@ -158,6 +158,8 @@ if has_option --test-types "${args[@]}"; then
       index=$((index + 1))
       while (( index < count )); do
         case "${args[$index]}" in
+          # Keep in sync with wpttest.enabled_tests
+          # (tools/wptrunner/wptrunner/wpttest.py).
           testharness|crashtest|test262|wdspec|print-reftest|aamtest|reftest)
             test_types+=("${args[$index]}")
             index=$((index + 1))

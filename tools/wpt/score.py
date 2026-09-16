@@ -209,32 +209,27 @@ def split_args(
     report: Path | None = None
     save_report: Path | None = None
     paths: list[str] = []
+    extra: list[str] = []
     index = 0
     while index < len(argv):
         arg = argv[index]
         if arg == "--":
-            return report, save_report, paths, list(argv[index + 1 :]), None
-        if arg == "--report" or arg.startswith("--report="):
-            if arg == "--report":
+            extra = list(argv[index + 1 :])
+            break
+        if arg in ("--report", "--save-report") or arg.startswith(("--report=", "--save-report=")):
+            option, value = arg.split("=", 1) if "=" in arg else (arg, None)
+            if value is None:
                 if index + 1 >= len(argv):
-                    return report, save_report, paths, [], "--report needs a file"
-                report = Path(argv[index + 1])
-                index += 2
-            else:
-                report = Path(arg.split("=", 1)[1])
+                    return report, save_report, paths, [], f"{option} needs a file"
+                value = argv[index + 1]
                 index += 1
-            return report, save_report, paths, list(argv[index:]), None
-        if arg == "--save-report" or arg.startswith("--save-report="):
-            if arg == "--save-report":
-                if index + 1 >= len(argv):
-                    return report, save_report, paths, [], "--save-report needs a file"
-                save_report = Path(argv[index + 1])
-                index += 2
+            if not value:
+                return report, save_report, paths, [], f"{option} needs a file"
+            if option == "--report":
+                report = Path(value)
             else:
-                save_report = Path(arg.split("=", 1)[1])
-                index += 1
-            continue
-        if arg.startswith("-"):
+                save_report = Path(value)
+        elif arg.startswith("-"):
             return (
                 report,
                 save_report,
@@ -242,9 +237,10 @@ def split_args(
                 list(argv[index:]),
                 "runner options must follow the test paths (or a literal `--`)",
             )
-        paths.append(arg)
+        else:
+            paths.append(arg)
         index += 1
-    return report, save_report, paths, [], None
+    return report, save_report, paths, extra, None
 
 
 def _selftest() -> None:
@@ -329,6 +325,15 @@ def _selftest() -> None:
     assert split_args(["--save-report"])[4] == "--save-report needs a file"
     assert split_args(["--bogus"])[4] is not None
 
+    report, save_report, paths, extra, error = split_args(
+        ["--report", "a.json", "--save-report", "b.json"]
+    )
+    assert report == Path("a.json")
+    assert save_report == Path("b.json")
+    assert error is None
+    assert split_args(["--report="])[4] == "--report needs a file"
+    assert split_args(["--save-report="])[4] == "--save-report needs a file"
+
 
 def main() -> int:
     if sys.argv[1:] == ["--selftest"]:
@@ -338,14 +343,14 @@ def main() -> int:
     if error:
         print(f"score: {error}", file=sys.stderr)
         return 2
+    if report is not None and save_report is not None:
+        print(
+            "score: --report summarizes an existing report; do not combine "
+            "it with --save-report",
+            file=sys.stderr,
+        )
+        return 2
     if report is not None:
-        if save_report is not None:
-            print(
-                "score: --report summarizes an existing report; do not combine "
-                "it with --save-report",
-                file=sys.stderr,
-            )
-            return 2
         if paths or extra:
             print(
                 "score: --report summarizes an existing report; give no test paths",

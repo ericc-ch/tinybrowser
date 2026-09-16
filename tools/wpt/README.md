@@ -27,10 +27,19 @@ nix develop --command ./tools/wpt/score FileAPI/ --save-report /tmp/fileapi.json
 nix develop --command ./tools/wpt/retest /tmp/fileapi.json -- --processes 8 --fully-parallel
 ```
 
-`tools/wpt/retest REPORT.json` feeds the failures to `run --include-file`, so
-passing tests are not re-run. TIMEOUTs are excluded by default
-(`--include-timeout` adds them): they are usually blocked capabilities, and
-re-running them only pays the timeout. `--dry-run` lists the selection.
+`tools/wpt/retest REPORT.json` feeds the tests that need attention back to
+`run --include-file`, so passing tests are not re-run. TIMEOUTs are excluded
+by default (`--include-timeout` adds them): they are usually blocked
+capabilities, and re-running them only pays the timeout. A TIMEOUT that
+appears in a retest report is always reported and kept, even when the
+selection did not include TIMEOUTs. `--dry-run` lists the selection.
+
+A test262 report needs the test type repeated, because the default run
+selects testharness and crashtest only:
+
+```sh
+nix develop --command ./tools/wpt/retest /tmp/test262.json -- --test-types test262
+```
 
 In `docs/progress.md`, replace the latest total and scored groups only.
 

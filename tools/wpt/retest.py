@@ -13,7 +13,8 @@ seconds instead of re-scoring the whole directory.
 
 The new wptreport is kept when failures remain (printed to stderr) so retest
 can chain. Exit status: 0 when nothing needs retesting or everything selected
-passes, 1 when failures remain, 2 on usage or report errors.
+passes, 1 when failures remain, the runner's exit code when the run itself
+fails, 2 on usage or report errors.
 """
 
 from __future__ import annotations
@@ -33,19 +34,21 @@ import score  # noqa: E402
 ROOT = Path(__file__).resolve().parents[2]
 RUNNER = ROOT / "tools" / "wpt" / "run"
 USAGE = "retest REPORT [--include-timeout] [--dry-run] [--save-report FILE] [-- runner args...]"
+TIMEOUT_STATUSES = ("TIMEOUT", "EXTERNAL-TIMEOUT")
 
 
 def needs_retest(result: dict, include_timeout: bool) -> bool:
     """Whether a wptreport result is a failure worth re-running.
 
     Mirrors score.classify_results: hard statuses, unexplained statuses, and
-    mismatched subtests need attention. SKIP never does. TIMEOUT only counts
-    when asked, so blocked hangs do not dominate the loop.
+    mismatched subtests need attention. SKIP never does. TIMEOUT and
+    EXTERNAL-TIMEOUT only count when asked, so blocked hangs do not dominate
+    the loop.
     """
     status = result.get("status", "ERROR")
     if status == "SKIP":
         return False
-    if status == "TIMEOUT":
+    if status in TIMEOUT_STATUSES:
         return include_timeout
     if status in score.HARD_STATUSES:
         return True
@@ -72,6 +75,8 @@ def parse_args(argv: list[str]) -> tuple[Path | None, bool, bool, Path | None, l
     while index < len(argv):
         arg = argv[index]
         if arg == "--":
+            if report is None:
+                return None, include_timeout, dry_run, save_report, list(argv[index + 1 :]), USAGE
             return report, include_timeout, dry_run, save_report, list(argv[index + 1 :]), None
         if arg == "--include-timeout":
             include_timeout = True
@@ -84,7 +89,10 @@ def parse_args(argv: list[str]) -> tuple[Path | None, bool, bool, Path | None, l
                 save_report = Path(argv[index + 1])
                 index += 1
             else:
-                save_report = Path(arg.split("=", 1)[1])
+                value = arg.split("=", 1)[1]
+                if not value:
+                    return report, include_timeout, dry_run, None, [], "--save-report needs a file"
+                save_report = Path(value)
         elif arg.startswith("-"):
             return (
                 report,
@@ -126,14 +134,32 @@ def run(tests: list[str], extra: list[str], save_report: Path | None) -> tuple[P
         *extra,
     ]
     print(f"$ {' '.join(command)}", file=sys.stderr)
-    exit_code = subprocess.run(command, cwd=ROOT, check=False, stdout=sys.stderr).returncode
     try:
-        os.unlink(include_file)
-    except OSError:
-        pass
+        exit_code = subprocess.run(command, cwd=ROOT, check=False, stdout=sys.stderr).returncode
+    finally:
+        try:
+            os.unlink(include_file)
+        except OSError:
+            pass
     if exit_code != 0:
         print(f"runner exited {exit_code}", file=sys.stderr)
     return report, exit_code
+
+
+def retest_status(remaining: int, runner_exit: int) -> tuple[int, bool]:
+    """Exit code and whether the new report must be kept.
+
+    A runner failure keeps the report even when no selected test needs
+    retest: wptrunner writes `No tests ran` as an empty report with a
+    nonzero exit, and that has to stay visible. `remaining` is computed with
+    TIMEOUTs included, so a test the selection gate dropped that now hangs
+    is still reported.
+    """
+    if runner_exit != 0:
+        return runner_exit, True
+    if remaining:
+        return 1, True
+    return 0, False
 
 
 def _selftest() -> None:
@@ -183,6 +209,14 @@ def _selftest() -> None:
     assert parse_args([])[5] == USAGE
     assert parse_args(["r.json", "extra"])[5] is not None
     assert parse_args(["r.json", "--processes", "8"])[5] is not None
+    assert parse_args(["--", "--processes", "8"])[5] == USAGE
+    assert parse_args(["r.json", "--save-report="])[5] == "--save-report needs a file"
+
+    assert retest_status(0, 0) == (0, False)
+    assert retest_status(0, 64) == (64, True)
+    assert retest_status(2, 0) == (1, True)
+    # A test the selection gate dropped that now hangs still keeps the report.
+    assert retest_status(1, 0)[1] is True
 
 
 def main() -> int:
@@ -193,7 +227,9 @@ def main() -> int:
     if error:
         print(f"retest: {error}", file=sys.stderr)
         return 2
-    assert report is not None
+    if report is None:
+        print(f"retest: {USAGE}", file=sys.stderr)
+        return 2
     try:
         tests = failing_tests(report, include_timeout)
     except OSError as error:
@@ -217,22 +253,38 @@ def main() -> int:
     except OSError as error:
         print(f"retest: could not start the runner: {error}", file=sys.stderr)
         return 2
-    remaining = failing_tests(report_path, include_timeout)
     score.summarize(report_path)
+    try:
+        # The report holds only the selected tests, so a TIMEOUT here is a
+        # test the selection gate dropped that now hangs: new information.
+        remaining = failing_tests(report_path, include_timeout=True)
+    except OSError as error:
+        print(f"retest: no usable report at {report_path}: {error}", file=sys.stderr)
+        return runner_exit or 2
+    except json.JSONDecodeError as error:
+        print(f"retest: report {report_path} is not valid JSON ({error})", file=sys.stderr)
+        return runner_exit or 2
+    status, keep = retest_status(len(remaining), runner_exit)
     print(f"wall time: {time.monotonic() - started:.1f}s", file=sys.stderr)
     if runner_exit != 0:
-        print(f"runner exited {runner_exit}", file=sys.stderr)
-    if remaining:
+        print(f"runner exited {runner_exit}; report kept at {report_path}", file=sys.stderr)
+    elif remaining:
         print(f"{len(remaining)} tests still need retest; report at {report_path}", file=sys.stderr)
-        return 1
-    print("all selected tests pass", file=sys.stderr)
-    if save_report is None:
+    else:
+        print("all selected tests pass", file=sys.stderr)
+    if not keep:
         try:
             os.unlink(report_path)
         except OSError:
             pass
-    return runner_exit
+    return status
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except BrokenPipeError:
+        # `retest ... | head` closes stdout early; exit quietly.
+        devnull = os.open(os.devnull, os.O_WRONLY)
+        os.dup2(devnull, sys.stdout.fileno())
+        raise SystemExit(0)
