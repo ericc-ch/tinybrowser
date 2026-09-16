@@ -18,8 +18,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use rquickjs::{
-    Array, Coerced, Context, FromJs, Function, Object, Runtime, Value, context::EvalOptions,
-    prelude::Func,
+    Array, Coerced, Context, Ctx, FromJs, Function, Object, Runtime, Value,
+    context::EvalOptions, prelude::Func,
 };
 
 pub(crate) use world::World;
@@ -81,12 +81,16 @@ Object.defineProperty(document, 'cookie', {
   set(v) { globalThis.__cookieSet(String(v)); }
 });
 // https://fetch.spec.whatwg.org/#headers-class
+// The host dials GET only and response bodies are text, so fetch ignores
+// request bodies, headers, and credentials, and rejects other methods.
 const __tbHeadersData = Symbol.for('tinybrowser.headers.data');
 const __tbResponseData = Symbol.for('tinybrowser.response.data');
 const __tbRequestData = Symbol.for('tinybrowser.request.data');
-// Blob URLs created in this realm, so fetch() can serve them without a hop
-// (<https://w3c.github.io/FileAPI/#blob-url>).
-const __tbObjectUrlData = Object.create(null);
+const __tbBrand = (value, symbol, message) => {
+  const data = value === null || value === undefined ? undefined : value[symbol];
+  if (data === undefined) throw new TypeError(message === undefined ? 'Illegal invocation' : message);
+  return data;
+};
 globalThis.Headers = class Headers {
   constructor(init) {
     const entries = [];
@@ -174,25 +178,47 @@ globalThis.Response = class Response {
   }
 };
 Object.defineProperty(globalThis.Response.prototype, Symbol.toStringTag, { value: 'Response', writable: false, enumerable: false, configurable: true });
+const __tbLookupObjectUrl = url => {
+  const key = url.split('#')[0];
+  const contents = globalThis.__tbObjectUrlContents(key);
+  if (contents === null || contents === undefined) return null;
+  const content_type = globalThis.__tbObjectUrlType(key);
+  return { contents, type: content_type === null || content_type === undefined ? '' : content_type };
+};
 globalThis.Request = class Request {
   constructor(input, init) {
     const options = init === undefined ? {} : Object(init);
     let url;
     let method = 'GET';
+    let blob = null;
     if (input instanceof globalThis.Request) {
-      url = input.url;
-      method = input.method;
+      const source = __tbBrand(input, __tbRequestData);
+      url = source.url;
+      method = source.method;
+      blob = source.blob;
     } else {
       const resolved = globalThis.__tbResolveUrl(String(input), undefined);
       url = resolved === null ? String(input) : resolved;
     }
     if (options.method !== undefined) method = String(options.method).toUpperCase();
+    // A Request keeps a blob URL's data alive, so fetching it still works
+    // after revokeObjectURL (<https://w3c.github.io/FileAPI/#lifeTime>).
+    if (blob === null && url.indexOf('blob:') === 0) blob = __tbLookupObjectUrl(url);
     Object.defineProperty(this, __tbRequestData, {
-      value: { url, method }, writable: false, enumerable: false, configurable: false,
+      value: { url, method, blob }, writable: false, enumerable: false, configurable: false,
     });
   }
   get url() { return __tbBrand(this, __tbRequestData).url; }
   get method() { return __tbBrand(this, __tbRequestData).method; }
+  clone() {
+    const data = __tbBrand(this, __tbRequestData);
+    const copy = Object.create(globalThis.Request.prototype);
+    Object.defineProperty(copy, __tbRequestData, {
+      value: { url: data.url, method: data.method, blob: data.blob },
+      writable: false, enumerable: false, configurable: false,
+    });
+    return copy;
+  }
 };
 Object.defineProperty(globalThis.Request.prototype, Symbol.toStringTag, { value: 'Request', writable: false, enumerable: false, configurable: true });
 const __tbMakeResponse = (body, status, url, type) => {
@@ -204,9 +230,12 @@ globalThis.fetch = function(input, init) {
   const options = init === undefined ? {} : Object(init);
   let url;
   let method = 'GET';
+  let blob = null;
   if (input instanceof globalThis.Request) {
-    url = input.url;
-    method = input.method;
+    const source = __tbBrand(input, __tbRequestData);
+    url = source.url;
+    method = source.method;
+    blob = source.blob;
   } else {
     const resolved = globalThis.__tbResolveUrl(String(input), undefined);
     url = resolved === null ? String(input) : resolved;
@@ -214,12 +243,16 @@ globalThis.fetch = function(input, init) {
   if (options.method !== undefined) method = String(options.method).toUpperCase();
   return new Promise(function(resolve, reject) {
     if (url.indexOf('blob:') === 0) {
-      const entry = __tbObjectUrlData[url];
-      if (entry === undefined || method !== 'GET') {
+      if (method !== 'GET') {
         reject(new TypeError('Failed to fetch'));
         return;
       }
-      resolve(__tbMakeResponse(entry.text, 200, url, entry.type));
+      const entry = blob === null ? __tbLookupObjectUrl(url) : blob;
+      if (entry === null) {
+        reject(new TypeError('Failed to fetch'));
+        return;
+      }
+      resolve(__tbMakeResponse(entry.contents, 200, url, entry.type));
       return;
     }
     if (method !== 'GET') {
@@ -246,11 +279,6 @@ const __tbReaderData = Symbol.for('tinybrowser.filereader.data');
 const __tbProgressData = Symbol.for('tinybrowser.progress.data');
 const __tbDecoderData = Symbol.for('tinybrowser.textdecoder.data');
 const __tbStreamData = Symbol.for('tinybrowser.readablestream.data');
-const __tbBrand = (value, symbol, message) => {
-  const data = value === null || value === undefined ? undefined : value[symbol];
-  if (data === undefined) throw new TypeError(message === undefined ? 'Illegal invocation' : message);
-  return data;
-};
 // https://encoding.spec.whatwg.org/#utf-8-encoder, with lone surrogates
 // replaced as the standard requires.
 const __tbUtf8Encode = value => {
@@ -383,10 +411,43 @@ globalThis.TextEncoder = class TextEncoder {
     if (!ArrayBuffer.isView(destination) || destination instanceof DataView) {
       throw new TypeError('The destination argument must be a Uint8Array');
     }
-    const bytes = __tbUtf8Encode(source === undefined ? '' : source);
-    const written = Math.min(bytes.length, destination.length);
-    destination.set(bytes.subarray(0, written));
-    return { read: String(source === undefined ? '' : source).length, written };
+    source = String(source === undefined ? '' : source);
+    // Encode code point by code point so `read` can stop at the last code
+    // unit whose bytes fit in the destination
+    // (<https://encoding.spec.whatwg.org/#dom-textencoder-encodeinto>).
+    let read = 0;
+    let written = 0;
+    while (read < source.length) {
+      let code = source.charCodeAt(read);
+      let units = 1;
+      if (code >= 0xd800 && code <= 0xdbff && read + 1 < source.length) {
+        const low = source.charCodeAt(read + 1);
+        if (low >= 0xdc00 && low <= 0xdfff) {
+          code = 0x10000 + ((code - 0xd800) << 10) + (low - 0xdc00);
+          units = 2;
+        }
+      }
+      if (code >= 0xd800 && code <= 0xdfff) code = 0xfffd;
+      const size = code <= 0x7f ? 1 : code <= 0x7ff ? 2 : code <= 0xffff ? 3 : 4;
+      if (written + size > destination.length) break;
+      if (size === 1) {
+        destination[written++] = code;
+      } else if (size === 2) {
+        destination[written++] = 0xc0 | (code >> 6);
+        destination[written++] = 0x80 | (code & 0x3f);
+      } else if (size === 3) {
+        destination[written++] = 0xe0 | (code >> 12);
+        destination[written++] = 0x80 | ((code >> 6) & 0x3f);
+        destination[written++] = 0x80 | (code & 0x3f);
+      } else {
+        destination[written++] = 0xf0 | (code >> 18);
+        destination[written++] = 0x80 | ((code >> 12) & 0x3f);
+        destination[written++] = 0x80 | ((code >> 6) & 0x3f);
+        destination[written++] = 0x80 | (code & 0x3f);
+      }
+      read += units;
+    }
+    return { read, written };
   }
 };
 Object.defineProperty(globalThis.TextEncoder.prototype, Symbol.toStringTag, { value: 'TextEncoder', writable: false, enumerable: false, configurable: true });
@@ -427,7 +488,15 @@ globalThis.TextDecoder = class TextDecoder {
     if (data.encoding === 'utf-8') {
       const decoded = __tbUtf8Decode(data.pending, data.fatal, data.ignoreBOM);
       data.pending = stream ? decoded.remainder : new Uint8Array(0);
-      text = decoded.text + (!stream && decoded.remainder.length ? '\ufffd' : '');
+      if (!stream && decoded.remainder.length) {
+        // A truncated tail is a decode error; fatal turns it into a throw,
+        // otherwise it is one replacement character
+        // (<https://encoding.spec.whatwg.org/#utf-8-decoder>).
+        if (data.fatal) throw new TypeError('The encoded data was not valid.');
+        text = decoded.text + '\ufffd';
+      } else {
+        text = decoded.text;
+      }
     } else if (data.encoding === 'windows-1252') {
       text = __tbWindows1252(data.pending);
       data.pending = new Uint8Array(0);
@@ -557,75 +626,90 @@ globalThis.ProgressEvent = class ProgressEvent extends Event {
   get total() { return __tbBrand(this, __tbProgressData).total; }
 };
 Object.defineProperty(globalThis.ProgressEvent.prototype, Symbol.toStringTag, { value: 'ProgressEvent', writable: false, enumerable: false, configurable: true });
-globalThis.Blob = class Blob {
-  constructor(blobParts, options) {
-    const parts = blobParts === undefined ? [] : blobParts;
-    // Web IDL: a sequence argument must be an object and iterable, and its
-    // elements convert left to right before the options dictionary is read
-    // (<https://webidl.spec.whatwg.org/#es-sequence>). Platform objects that
-    // support indexed properties convert through `length` and the index
-    // getters instead of @@iterator.
-    if (parts === null || (typeof parts !== 'object' && typeof parts !== 'function')) {
-      throw new TypeError('The blobParts argument must be a sequence');
-    }
-    const iteratorMethod = parts[Symbol.iterator];
-    const converted = [];
-    const convertPart = part => {
-      const fromBlob = part !== null && typeof part === 'object' ? part[__tbBlobData] : undefined;
-      if (fromBlob !== undefined) {
-        converted.push(fromBlob.bytes);
-      } else if (part instanceof ArrayBuffer || (typeof SharedArrayBuffer !== 'undefined' && part instanceof SharedArrayBuffer)) {
-        converted.push(new Uint8Array(part).slice());
-      } else if (ArrayBuffer.isView(part)) {
-        converted.push(new Uint8Array(part.buffer, part.byteOffset, part.byteLength).slice());
-      } else {
-        converted.push(String(part));
-      }
-    };
-    if (iteratorMethod !== undefined && iteratorMethod !== null) {
-      if (typeof iteratorMethod !== 'function') {
-        throw new TypeError('The blobParts argument must be iterable');
-      }
-      const iterator = iteratorMethod.call(parts);
-      while (true) {
-        const step = iterator.next();
-        if (step.done) break;
-        convertPart(step.value);
-      }
-    } else if (typeof parts.item === 'function' && typeof parts.length === 'number') {
-      const length = Number(parts.length);
-      for (let index = 0; index < length; index++) convertPart(parts[index]);
+// Web IDL sequence conversion for blob parts: the sequence must be an object,
+// elements convert left to right, and platform objects with indexed
+// properties convert through `length` and the index getters
+// (<https://webidl.spec.whatwg.org/#es-sequence>).
+const __tbConvertBlobParts = blobParts => {
+  const parts = blobParts === undefined ? [] : blobParts;
+  if (parts === null || (typeof parts !== 'object' && typeof parts !== 'function')) {
+    throw new TypeError('The blobParts argument must be a sequence');
+  }
+  const iteratorMethod = parts[Symbol.iterator];
+  const converted = [];
+  const convertPart = part => {
+    const fromBlob = part !== null && typeof part === 'object' ? part[__tbBlobData] : undefined;
+    if (fromBlob !== undefined) {
+      converted.push(fromBlob.bytes);
+    } else if (part instanceof ArrayBuffer || (typeof SharedArrayBuffer !== 'undefined' && part instanceof SharedArrayBuffer)) {
+      converted.push(new Uint8Array(part).slice());
+    } else if (ArrayBuffer.isView(part)) {
+      converted.push(new Uint8Array(part.buffer, part.byteOffset, part.byteLength).slice());
     } else {
+      converted.push(String(part));
+    }
+  };
+  if (iteratorMethod !== undefined && iteratorMethod !== null) {
+    if (typeof iteratorMethod !== 'function') {
       throw new TypeError('The blobParts argument must be iterable');
     }
+    const iterator = iteratorMethod.call(parts);
+    while (true) {
+      const step = iterator.next();
+      if (step.done) break;
+      convertPart(step.value);
+    }
+  } else if (typeof parts.item === 'function' && typeof parts.length === 'number') {
+    const length = Number(parts.length);
+    for (let index = 0; index < length; index++) convertPart(parts[index]);
+  } else {
+    throw new TypeError('The blobParts argument must be iterable');
+  }
+  return converted;
+};
+// Dictionary members evaluate in lexicographic order, so each member gets a
+// helper the constructors call in IDL order
+// (<https://webidl.spec.whatwg.org/#es-dictionary>).
+const __tbEndings = value => {
+  if (value === undefined) return 'transparent';
+  value = String(value);
+  if (value !== 'transparent' && value !== 'native') {
+    throw new TypeError('The endings option must be transparent or native');
+  }
+  return value;
+};
+const __tbBlobType = value => {
+  if (value === undefined) return '';
+  value = String(value);
+  return [...value].some(character => character < ' ' || character > '~') ? '' : value;
+};
+const __tbBlobBytes = (converted, endings) => {
+  const chunks = converted.map(part => typeof part === 'string'
+    ? __tbUtf8Encode(endings === 'native' ? __tbNativeEndings(part) : part)
+    : part);
+  let length = 0;
+  for (const chunk of chunks) length += chunk.length;
+  const bytes = new Uint8Array(length);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.length;
+  }
+  return bytes;
+};
+globalThis.Blob = class Blob {
+  constructor(blobParts, options) {
+    const converted = __tbConvertBlobParts(blobParts);
     let endings = 'transparent';
     let type = '';
     if (options !== undefined && options !== null) {
       if (typeof options !== 'object' && typeof options !== 'function') {
         throw new TypeError('The options argument must be a property bag');
       }
-      // Dictionary members are read in lexicographic order
-      // (<https://webidl.spec.whatwg.org/#es-dictionary>).
-      if (options.endings !== undefined) {
-        endings = String(options.endings);
-        if (endings !== 'transparent' && endings !== 'native') {
-          throw new TypeError('The endings option must be transparent or native');
-        }
-      }
-      if (options.type !== undefined) type = String(options.type);
+      endings = __tbEndings(options.endings);
+      type = __tbBlobType(options.type);
     }
-    if ([...type].some(character => character < ' ' || character > '~')) type = '';
-    const chunks = converted.map(part => typeof part === 'string'
-      ? __tbUtf8Encode(endings === 'native' ? __tbNativeEndings(part) : part)
-      : part);
-    let length = 0;
-    for (const chunk of chunks) length += chunk.length;
-    const bytes = new Uint8Array(length);
-    let offset = 0;
-    for (const chunk of chunks) {
-      bytes.set(chunk, offset);
-      offset += chunk.length;
-    }
+    const bytes = __tbBlobBytes(converted, endings);
     Object.defineProperty(this, __tbBlobData, {
       value: { bytes, type: type.toLowerCase() },
       writable: false, enumerable: false, configurable: false,
@@ -636,7 +720,7 @@ globalThis.Blob = class Blob {
   // https://w3c.github.io/FileAPI/#dom-blob-text
   text() {
     const bytes = __tbBrand(this, __tbBlobData).bytes;
-    return Promise.resolve(__tbUtf8Decode(bytes, false, false).text);
+    return Promise.resolve(__tbDecodeBytes(bytes, 'utf-8', false, false));
   }
   // https://w3c.github.io/FileAPI/#dom-blob-arraybuffer
   arrayBuffer() {
@@ -685,7 +769,7 @@ globalThis.Blob = class Blob {
   }
   // https://w3c.github.io/FileAPI/#dom-blob-textstream
   textStream() {
-    const text = __tbUtf8Decode(__tbBrand(this, __tbBlobData).bytes, false, false).text;
+    const text = __tbDecodeBytes(__tbBrand(this, __tbBlobData).bytes, 'utf-8', false, false);
     return new ReadableStream({
       start(controller) {
         if (text.length > 0) controller.enqueue(text);
@@ -702,16 +786,29 @@ Object.defineProperty(globalThis.Blob, 'length', { value: 0, writable: false, en
 globalThis.File = class File extends Blob {
   constructor(fileBits, fileName, options) {
     if (arguments.length < 2) throw new TypeError('The File constructor requires 2 arguments');
-    super(fileBits, options);
+    // fileBits converts before the options dictionary, and FilePropertyBag
+    // members evaluate in lexicographic order: endings, lastModified, type.
+    const converted = __tbConvertBlobParts(fileBits);
+    const name = String(fileName);
+    let endings = 'transparent';
+    let type = '';
     let lastModified = Date.now();
-    if (options !== undefined && options !== null && options.lastModified !== undefined) {
-      // A long long: ToInt64 maps NaN and infinities to 0
-      // (<https://webidl.spec.whatwg.org/#abstract-opdef-converttoint>).
-      lastModified = Number(options.lastModified);
-      lastModified = Number.isFinite(lastModified) ? Math.trunc(lastModified) : 0;
+    if (options !== undefined && options !== null) {
+      if (typeof options !== 'object' && typeof options !== 'function') {
+        throw new TypeError('The options argument must be a property bag');
+      }
+      endings = __tbEndings(options.endings);
+      if (options.lastModified !== undefined) {
+        // A long long: ToInt64 maps NaN and infinities to 0
+        // (<https://webidl.spec.whatwg.org/#abstract-opdef-converttoint>).
+        lastModified = Number(options.lastModified);
+        lastModified = Number.isFinite(lastModified) ? Math.trunc(lastModified) : 0;
+      }
+      type = __tbBlobType(options.type);
     }
+    super([__tbBlobBytes(converted, endings)], { endings, type });
     Object.defineProperty(this, __tbFileData, {
-      value: { name: String(fileName), lastModified },
+      value: { name, lastModified },
       writable: false, enumerable: false, configurable: false,
     });
   }
@@ -913,16 +1010,13 @@ globalThis.URL = class URL {
 globalThis.URL.createObjectURL = function(blob) {
   const data = __tbBrand(blob, __tbBlobData, 'value is not a Blob');
   const text = __tbUtf8Decode(data.bytes, false, true).text;
-  const url = globalThis.__tbCreateObjectURL(text);
+  const url = globalThis.__tbCreateObjectURL(text, data.type);
   if (url == null) throw new RangeError('object URL budget exceeded');
-  __tbObjectUrlData[url] = { text, type: data.type };
   return url;
 };
 // https://w3c.github.io/FileAPI/#dfn-revokeObjectURL
 globalThis.URL.revokeObjectURL = function(url) {
-  url = String(url);
-  delete __tbObjectUrlData[url];
-  globalThis.__tbRevokeObjectURL(url);
+  globalThis.__tbRevokeObjectURL(String(url));
 };
 Object.defineProperty(globalThis.URL.prototype, Symbol.toStringTag, { value: 'URL', writable: false, enumerable: false, configurable: true });
 // https://url.spec.whatwg.org/#dom-url-parse
@@ -1434,109 +1528,155 @@ impl JsRealm {
     }
 
     fn install(&self) -> Result<(), JsError> {
-        let timeouts = self.pending_timeouts.clone();
-        let fetches = self.pending_fetches.clone();
         let world = self.world.clone();
-        let cookie_get = world.clone();
-        let cookie_set = world.clone();
-        let cancel_world = world.clone();
-        let object_url_create = world.clone();
-        let object_url_revoke = world.clone();
-        let url_resolve = world.clone();
         self.context.with(|ctx| {
             bindings::install(&ctx, &world).map_err(JsError::engine)?;
             intl::install(&ctx).map_err(JsError::engine)?;
-
-            ctx.globals()
-                .set(
-                    "__scheduleTimeout",
-                    Func::from(move |js_id: i32, delay: f64| {
-                        timeouts.borrow_mut().push(PendingTimeout {
-                            delay: Duration::from_millis(u64::from(millis(delay))),
-                            js_id,
-                        });
-                    }),
-                )
-                .map_err(JsError::engine)?;
-
-            ctx.globals()
-                .set(
-                    "__cancelTimeout",
-                    Func::from(move |js_id: i32| {
-                        cancel_world.borrow_mut().pending_cancels.push(js_id);
-                    }),
-                )
-                .map_err(JsError::engine)?;
-
-            ctx.globals()
-                .set(
-                    "__queueFetch",
-                    Func::from(move |url: String, js_id: i32| {
-                        fetches.borrow_mut().push(PendingJsFetch { url, js_id });
-                    }),
-                )
-                .map_err(JsError::engine)?;
-
-            ctx.globals()
-                .set(
-                    "__cookieGet",
-                    Func::from(move || {
-                        let world = cookie_get.borrow();
-                        world.services.cookies_for(&world.document_url)
-                    }),
-                )
-                .map_err(JsError::engine)?;
-
-            ctx.globals()
-                .set(
-                    "__cookieSet",
-                    Func::from(move |value: String| {
-                        let world = cookie_set.borrow();
-                        world.services.set_cookie(&value, &world.document_url);
-                    }),
-                )
-                .map_err(JsError::engine)?;
-
-            ctx.globals()
-                .set(
-                    "__tbCreateObjectURL",
-                    Func::from(move |contents: String| {
-                        object_url_create.borrow_mut().create_object_url(contents)
-                    }),
-                )
-                .map_err(JsError::engine)?;
-
-            ctx.globals()
-                .set(
-                    "__tbRevokeObjectURL",
-                    Func::from(move |url: String| {
-                        object_url_revoke.borrow_mut().revoke_object_url(&url);
-                    }),
-                )
-                .map_err(JsError::engine)?;
-
-            ctx.globals()
-                .set(
-                    "__tbResolveUrl",
-                    Func::from(move |input: String, base: Option<String>| {
-                        let fallback = url_resolve.borrow().document_url.clone();
-                        let resolved = match base {
-                            Some(base) => url::Url::parse(&base)
-                                .ok()
-                                .and_then(|base| base.join(&input).ok()),
-                            None => url::Url::parse(&input)
-                                .ok()
-                                .or_else(|| fallback.join(&input).ok()),
-                        };
-                        resolved.map(|url| url.to_string())
-                    }),
-                )
-                .map_err(JsError::engine)?;
-
+            self.install_task_host_functions(&ctx, &world)?;
+            Self::install_document_host_functions(&ctx, &world)?;
             ctx.eval::<(), _>(INSTALL_WEB_APIS_JS)
                 .map_err(JsError::engine)?;
             Ok(())
         })
+    }
+
+    /// Timer and fetch submission hooks the JS shim calls.
+    fn install_task_host_functions(
+        &self,
+        ctx: &Ctx<'_>,
+        world: &Rc<RefCell<World>>,
+    ) -> Result<(), JsError> {
+        let timeouts = self.pending_timeouts.clone();
+        let fetches = self.pending_fetches.clone();
+        let cancel_world = world.clone();
+
+        ctx.globals()
+            .set(
+                "__scheduleTimeout",
+                Func::from(move |js_id: i32, delay: f64| {
+                    timeouts.borrow_mut().push(PendingTimeout {
+                        delay: Duration::from_millis(u64::from(millis(delay))),
+                        js_id,
+                    });
+                }),
+            )
+            .map_err(JsError::engine)?;
+
+        ctx.globals()
+            .set(
+                "__cancelTimeout",
+                Func::from(move |js_id: i32| {
+                    cancel_world.borrow_mut().pending_cancels.push(js_id);
+                }),
+            )
+            .map_err(JsError::engine)?;
+
+        ctx.globals()
+            .set(
+                "__queueFetch",
+                Func::from(move |url: String, js_id: i32| {
+                    fetches.borrow_mut().push(PendingJsFetch { url, js_id });
+                }),
+            )
+            .map_err(JsError::engine)?;
+        Ok(())
+    }
+
+    /// Cookie, object URL, and URL resolution hooks the JS shim calls.
+    fn install_document_host_functions(
+        ctx: &Ctx<'_>,
+        world: &Rc<RefCell<World>>,
+    ) -> Result<(), JsError> {
+        let cookie_get = world.clone();
+        let cookie_set = world.clone();
+        let object_url_create = world.clone();
+        let object_url_revoke = world.clone();
+        let object_url_contents = world.clone();
+        let object_url_type = world.clone();
+        let url_resolve = world.clone();
+
+        ctx.globals()
+            .set(
+                "__cookieGet",
+                Func::from(move || {
+                    let world = cookie_get.borrow();
+                    world.services.cookies_for(&world.document_url)
+                }),
+            )
+            .map_err(JsError::engine)?;
+
+        ctx.globals()
+            .set(
+                "__cookieSet",
+                Func::from(move |value: String| {
+                    let world = cookie_set.borrow();
+                    world.services.set_cookie(&value, &world.document_url);
+                }),
+            )
+            .map_err(JsError::engine)?;
+
+        ctx.globals()
+            .set(
+                "__tbCreateObjectURL",
+                Func::from(move |contents: String, content_type: String| {
+                    object_url_create
+                        .borrow_mut()
+                        .create_object_url(contents, content_type)
+                }),
+            )
+            .map_err(JsError::engine)?;
+
+        ctx.globals()
+            .set(
+                "__tbRevokeObjectURL",
+                Func::from(move |url: String| {
+                    object_url_revoke.borrow_mut().revoke_object_url(&url);
+                }),
+            )
+            .map_err(JsError::engine)?;
+
+        ctx.globals()
+            .set(
+                "__tbObjectUrlContents",
+                Func::from(move |url: String| {
+                    object_url_contents
+                        .borrow()
+                        .object_url_contents(&url)
+                        .map(|contents| contents.to_string())
+                }),
+            )
+            .map_err(JsError::engine)?;
+
+        ctx.globals()
+            .set(
+                "__tbObjectUrlType",
+                Func::from(move |url: String| {
+                    object_url_type
+                        .borrow()
+                        .object_url_type(&url)
+                        .map(|content_type| content_type.to_string())
+                }),
+            )
+            .map_err(JsError::engine)?;
+
+        ctx.globals()
+            .set(
+                "__tbResolveUrl",
+                Func::from(move |input: String, base: Option<String>| {
+                    let fallback = url_resolve.borrow().document_url.clone();
+                    let resolved = match base {
+                        Some(base) => url::Url::parse(&base)
+                            .ok()
+                            .and_then(|base| base.join(&input).ok()),
+                        None => url::Url::parse(&input)
+                            .ok()
+                            .or_else(|| fallback.join(&input).ok()),
+                    };
+                    resolved.map(|url| url.to_string())
+                }),
+            )
+            .map_err(JsError::engine)?;
+        Ok(())
     }
 }
 

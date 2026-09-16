@@ -203,6 +203,14 @@ pub(crate) enum EventTargetKey {
     Standalone(u64),
 }
 
+/// One `blob:` URL's data and the `Blob.type` it was created from, so a
+/// fetch of the URL can carry a `Content-Type`
+/// (<https://w3c.github.io/FileAPI/#blob-url>).
+pub(crate) struct ObjectUrlEntry {
+    pub(crate) contents: Rc<str>,
+    pub(crate) content_type: Rc<str>,
+}
+
 pub(crate) struct World {
     /// Every tree the renderer process holds, shared by all realms.
     documents: Rc<RefCell<DocumentStore>>,
@@ -218,7 +226,7 @@ pub(crate) struct World {
     pub pending_html_writes: Vec<String>,
     frame_navigations: Vec<FrameNavigation>,
     document_stream: Vec<DocumentStreamCommand>,
-    object_urls: HashMap<String, Rc<str>>,
+    object_urls: HashMap<String, ObjectUrlEntry>,
     budget: Rc<RefCell<ResourceBudget>>,
     next_object_url: u64,
     pub parser_active: bool,
@@ -267,7 +275,7 @@ impl Drop for World {
         let object_bytes = self
             .object_urls
             .values()
-            .map(|value| value.len())
+            .map(|entry| entry.contents.len() + entry.content_type.len())
             .sum::<usize>();
         let mut budget = self.budget.borrow_mut();
         budget.object_url_bytes = budget.object_url_bytes.saturating_sub(object_bytes);
@@ -601,8 +609,12 @@ impl World {
         budget.pending_stream_bytes = budget.pending_stream_bytes.saturating_sub(bytes);
     }
 
-    pub(crate) fn create_object_url(&mut self, contents: String) -> Option<String> {
-        let length = contents.len();
+    pub(crate) fn create_object_url(
+        &mut self,
+        contents: String,
+        content_type: String,
+    ) -> Option<String> {
+        let length = contents.len() + content_type.len();
         let mut budget = self.budget.borrow_mut();
         let total = budget.object_url_bytes.checked_add(length)?;
         if total > MAX_OBJECT_URL_BYTES {
@@ -611,19 +623,35 @@ impl World {
         let id = self.next_object_url;
         self.next_object_url = self.next_object_url.wrapping_add(1);
         let url = format!("blob:tinybrowser/{id}");
-        self.object_urls.insert(url.clone(), Rc::from(contents));
+        self.object_urls.insert(
+            url.clone(),
+            ObjectUrlEntry {
+                contents: Rc::from(contents),
+                content_type: Rc::from(content_type),
+            },
+        );
         budget.object_url_bytes = total;
         Some(url)
     }
 
     pub(crate) fn object_url_contents(&self, url: &str) -> Option<Rc<str>> {
-        self.object_urls.get(url).cloned()
+        self.object_urls
+            .get(url)
+            .map(|entry| Rc::clone(&entry.contents))
+    }
+
+    pub(crate) fn object_url_type(&self, url: &str) -> Option<Rc<str>> {
+        self.object_urls
+            .get(url)
+            .map(|entry| Rc::clone(&entry.content_type))
     }
 
     pub(crate) fn revoke_object_url(&mut self, url: &str) {
-        if let Some(contents) = self.object_urls.remove(url) {
+        if let Some(entry) = self.object_urls.remove(url) {
             let mut budget = self.budget.borrow_mut();
-            budget.object_url_bytes = budget.object_url_bytes.saturating_sub(contents.len());
+            budget.object_url_bytes = budget
+                .object_url_bytes
+                .saturating_sub(entry.contents.len() + entry.content_type.len());
         }
     }
 

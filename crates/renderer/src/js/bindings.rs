@@ -5945,6 +5945,7 @@ fn deref_weak<'js>(
 const INSTALL_BRANDS_JS: &str = r"
 (function() {
   const native = globalThis.Node.prototype;
+  const inputFilesSymbol = Symbol.for('tinybrowser.input.files');
   function illegal() { throw new TypeError('Illegal constructor'); }
   function define(name, parent, members, constructible) {
     const ctor = constructible
@@ -6186,10 +6187,10 @@ const INSTALL_BRANDS_JS: &str = r"
   // (<https://html.spec.whatwg.org/multipage/input.html#dom-input-files>).
   Object.defineProperty(table.HTMLInputElement, 'files', {
     get: function() {
-      let list = this.__tb_files;
+      let list = this[inputFilesSymbol];
       if (list === undefined) {
         list = globalThis.__tbCreateFileList([]);
-        Object.defineProperty(this, '__tb_files', {
+        Object.defineProperty(this, inputFilesSymbol, {
           value: list, writable: false, enumerable: false, configurable: false,
         });
       }
