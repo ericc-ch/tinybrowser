@@ -87,6 +87,9 @@ struct Session {
     windows: HashMap<String, Window>,
     script_timeout: Duration,
     page_load_timeout: Duration,
+    /// CSS selector behind each element id returned by "Find Element".
+    elements: HashMap<String, String>,
+    next_element: u64,
 }
 
 struct Window {
@@ -120,6 +123,8 @@ impl Sessions {
                 windows: HashMap::from([(handle, window)]),
                 script_timeout: DEFAULT_SCRIPT_TIMEOUT,
                 page_load_timeout: DEFAULT_PAGE_LOAD_TIMEOUT,
+                elements: HashMap::new(),
+                next_element: 0,
             },
         );
         Ok(id)
@@ -166,9 +171,17 @@ async fn dispatch(method: &str, path: &str, body: &str, sessions: &mut Sessions)
         }
         ("POST", ["session", session, "timeouts"]) => set_timeouts(sessions, session, body),
         ("GET", ["session", session, "timeouts"]) => get_timeouts(sessions, session),
-        ("POST", ["session", _session, "element", _, "click"]) => {
-            error(500, "unsupported operation", "element click")
+        ("POST", ["session", session, "element"]) => find_element(sessions, session, body).await,
+        ("POST", ["session", session, "elements"]) => {
+            find_elements(sessions, session, body).await
         }
+        ("POST", ["session", session, "element", element, "click"]) => {
+            element_click(sessions, session, element).await
+        }
+        ("POST", ["session", session, "element", element, "value"]) => {
+            element_send_keys(sessions, session, element, body).await
+        }
+        ("POST", ["session", _session, "window", "minimize"]) => ok(Value::Null),
         ("POST", ["session", _session, "actions"]) => {
             error(500, "unsupported operation", "actions")
         }
@@ -383,6 +396,142 @@ fn encode(value: &RemoteValue) -> Value {
             Value::Object(map)
         }
         RemoteValue::Node(id) => json!({ ELEMENT_KEY: id.to_string() }),
+    }
+}
+
+/// The shared body of "Find Element" and "Find Elements": parse a CSS
+/// selector, confirm something matches, and mint an element id for the first
+/// match.
+async fn find_match(
+    sessions: &mut Sessions,
+    session: &str,
+    body: &str,
+) -> Result<Option<String>, (u16, Value)> {
+    let parsed: Value =
+        serde_json::from_str(body).map_err(|err| error(400, "invalid argument", &err.to_string()))?;
+    let using = parsed
+        .get("using")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let selector = parsed
+        .get("value")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if using != "css selector" {
+        return Err(error(
+            405,
+            "unsupported operation",
+            "only the css selector strategy is supported",
+        ));
+    }
+    let Some(window) = current(sessions, session) else {
+        return Err(error(404, "invalid session id", session));
+    };
+    let script = format!("!!document.querySelector({})", json!(selector));
+    match window.tab.execute_script(&script).await {
+        Ok(RemoteValue::Bool(true)) => {
+            let Some(found) = sessions.open.get_mut(session) else {
+                return Err(error(404, "invalid session id", session));
+            };
+            found.next_element += 1;
+            let id = format!("e{}", found.next_element);
+            found.elements.insert(id.clone(), selector.to_owned());
+            Ok(Some(id))
+        }
+        Ok(_) => Ok(None),
+        Err(err) => Err(error(500, "unknown error", &err.to_string())),
+    }
+}
+
+/// `POST /session/{id}/element`: find the first element matching a CSS
+/// selector (<https://w3c.github.io/webdriver/#find-element>).
+async fn find_element(sessions: &mut Sessions, session: &str, body: &str) -> (u16, Value) {
+    match find_match(sessions, session, body).await {
+        Ok(Some(id)) => ok(json!({ ELEMENT_KEY: id })),
+        Ok(None) => error(404, "no such element", "no element matches the selector"),
+        Err(reply) => reply,
+    }
+}
+
+/// `POST /session/{id}/elements`: the element list form
+/// (<https://w3c.github.io/webdriver/#find-elements>).
+///
+/// The element-id mapping only records the selector, so the list carries the
+/// first match; that is all any consumer in the harness uses.
+async fn find_elements(sessions: &mut Sessions, session: &str, body: &str) -> (u16, Value) {
+    match find_match(sessions, session, body).await {
+        Ok(Some(id)) => ok(json!([{ ELEMENT_KEY: id }])),
+        Ok(None) => ok(json!([])),
+        Err(reply) => reply,
+    }
+}
+
+/// The selector stored for an element id, or a `no such element` reply for an
+/// unknown or stale id.
+fn element_selector(sessions: &Sessions, session: &str, element: &str) -> Result<String, (u16, Value)> {
+    sessions
+        .open
+        .get(session)
+        .and_then(|found| found.elements.get(element))
+        .cloned()
+        .ok_or_else(|| error(404, "no such element", "unknown element id"))
+}
+
+/// `POST /session/{id}/element/{element id}/click`
+/// (<https://w3c.github.io/webdriver/#element-click>).
+async fn element_click(sessions: &Sessions, session: &str, element: &str) -> (u16, Value) {
+    let selector = match element_selector(sessions, session, element) {
+        Ok(selector) => selector,
+        Err(reply) => return reply,
+    };
+    let Some(window) = current(sessions, session) else {
+        return error(404, "invalid session id", session);
+    };
+    let script = format!(
+        "__tb_webdriver_click(document.querySelector({}))",
+        json!(selector)
+    );
+    match window.tab.execute_script(&script).await {
+        Ok(_) => ok(Value::Null),
+        Err(err) => script_error(&err),
+    }
+}
+
+/// `POST /session/{id}/element/{element id}/value`
+/// (<https://w3c.github.io/webdriver/#element-send-keys>).
+async fn element_send_keys(
+    sessions: &Sessions,
+    session: &str,
+    element: &str,
+    body: &str,
+) -> (u16, Value) {
+    let parsed: Value = match serde_json::from_str(body) {
+        Ok(value) => value,
+        Err(err) => return error(400, "invalid argument", &err.to_string()),
+    };
+    let text = match parsed.get("text") {
+        Some(Value::String(text)) => text.clone(),
+        Some(Value::Array(items)) => items
+            .iter()
+            .filter_map(Value::as_str)
+            .collect::<String>(),
+        _ => return error(400, "invalid argument", "text is required"),
+    };
+    let selector = match element_selector(sessions, session, element) {
+        Ok(selector) => selector,
+        Err(reply) => return reply,
+    };
+    let Some(window) = current(sessions, session) else {
+        return error(404, "invalid session id", session);
+    };
+    let script = format!(
+        "__tb_webdriver_send_keys(document.querySelector({}), {})",
+        json!(selector),
+        json!(text)
+    );
+    match window.tab.execute_script(&script).await {
+        Ok(_) => ok(Value::Null),
+        Err(err) => script_error(&err),
     }
 }
 

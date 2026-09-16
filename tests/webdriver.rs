@@ -394,20 +394,21 @@ fn execute_sync_interrupts_infinite_loop() {
 }
 
 #[test]
-fn click_and_perform_actions_are_unsupported_release_is_a_noop() {
+fn unknown_element_click_and_perform_actions_are_unsupported() {
     let (addr, _fixture) = start(Vec::new());
     let created = request(&addr, "POST", "/session", Some("{}"));
     let id = created["value"]["sessionId"]
         .as_str()
         .expect("session id")
         .to_owned();
+    // Element ids are minted by "Find Element"; an unissued id is stale.
     let click = request(
         &addr,
         "POST",
         &format!("/session/{id}/element/1/click"),
         Some("{}"),
     );
-    assert_eq!(click["value"]["error"], json!("unsupported operation"));
+    assert_eq!(click["value"]["error"], json!("no such element"));
     let actions = request(&addr, "POST", &format!("/session/{id}/actions"), Some("{}"));
     assert_eq!(actions["value"]["error"], json!("unsupported operation"));
     let released = request(&addr, "DELETE", &format!("/session/{id}/actions"), None);

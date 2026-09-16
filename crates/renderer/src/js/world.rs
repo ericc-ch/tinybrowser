@@ -224,6 +224,9 @@ pub(crate) struct World {
     style_declarations: HashMap<NodeId, Persistent<Value<'static>>>,
     datasets: HashMap<NodeId, Persistent<Value<'static>>>,
     implementations: HashMap<u32, Persistent<Value<'static>>>,
+    /// The focused element of each document
+    /// (<https://html.spec.whatwg.org/multipage/interaction.html#focused-area-of-the-document>).
+    active_elements: HashMap<u32, NodeId>,
     brands: HashMap<String, Persistent<Object<'static>>>,
     /// `Attr` platform-object identity, keyed by a per-realm id.
     pub(crate) attrs: HashMap<u64, AttrState>,
@@ -296,6 +299,7 @@ impl World {
             style_declarations: HashMap::new(),
             datasets: HashMap::new(),
             implementations: HashMap::new(),
+            active_elements: HashMap::new(),
             brands: HashMap::new(),
             attrs: HashMap::new(),
             attr_owners: HashMap::new(),
@@ -391,6 +395,7 @@ impl World {
         self.style_declarations.clear();
         self.datasets.clear();
         self.implementations.clear();
+        self.active_elements.clear();
         self.clear_attributes();
         self.frame_navigations.clear();
         let pending = self.take_document_stream();
@@ -700,6 +705,22 @@ impl World {
 
     pub(crate) fn intern_token_list(&mut self, id: NodeId, value: Persistent<Value<'static>>) {
         self.token_lists.insert(id, value);
+    }
+
+    /// The focused element of a document, if any.
+    pub(crate) fn active_element(&self, document: u32) -> Option<NodeId> {
+        self.active_elements.get(&document).copied()
+    }
+
+    pub(crate) fn set_active_element(&mut self, document: u32, node: Option<NodeId>) {
+        match node {
+            Some(node) => {
+                self.active_elements.insert(document, node);
+            }
+            None => {
+                self.active_elements.remove(&document);
+            }
+        }
     }
 
     pub(crate) fn named_node_map(&self, id: NodeId) -> Option<Persistent<Value<'static>>> {
