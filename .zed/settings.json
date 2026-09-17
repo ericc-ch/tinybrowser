@@ -1,0 +1,11 @@
+{
+  // Vendored trees: kept out of file scanning, project search, and the project
+  // panel. third_party/wpt is a submodule with ~165k files, blink-cdp ~3.6k.
+  // "..." expands to the inherited defaults (.git, .DS_Store, ...) so we don't
+  // drop those by overriding this array at the project layer.
+  "file_scan_exclusions": [
+    "**/third_party/wpt",
+    "**/third_party/blink-cdp",
+    "...",
+  ],
+}

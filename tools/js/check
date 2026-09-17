@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# Syntax-check the JavaScript embedded in the renderer with `include_str!`.
+#
+# These files never pass through a JS toolchain, so a syntax error would only
+# surface as a failed `ctx.eval` when a realm installs. `node --check` parses
+# without executing, catching it here instead.
+set -euo pipefail
+ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+cd "$ROOT"
+
+if ! command -v node >/dev/null 2>&1; then
+  echo "node is required to check the embedded JavaScript (nix develop)" >&2
+  exit 1
+fi
+
+checked=0
+status=0
+while IFS= read -r -d '' file; do
+  checked=$((checked + 1))
+  if ! output="$(node --check "$file" 2>&1)"; then
+    printf '%s\n' "$output" >&2
+    status=1
+  fi
+done < <(find crates/renderer/src/js -name '*.js' -print0)
+
+if [[ "$checked" -eq 0 ]]; then
+  echo "no embedded JavaScript found under crates/renderer/src/js" >&2
+  exit 1
+fi
+echo "js: checked $checked files"
+exit "$status"

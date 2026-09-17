@@ -113,6 +113,7 @@ pub(in crate::document) fn request(dial: &QueuedDial) -> DialRequest {
         QueuedDial::ClassicScript { url, initiator, .. } => {
             (url, DialKind::ClassicScript, initiator)
         }
+        QueuedDial::FrameLoad { url, initiator, .. } => (url, DialKind::FrameLoad, initiator),
     };
     DialRequest {
         kind,
@@ -132,6 +133,9 @@ pub(in crate::document) fn complete(
             epoch: *epoch,
         },
         QueuedDial::ClassicScript { epoch, .. } => DialFail::ClassicScript { epoch: *epoch },
+        QueuedDial::FrameLoad { sequence, .. } => DialFail::FrameLoad {
+            sequence: *sequence,
+        },
     };
     let outcome = outcome.map_err(|_| fail)?;
     Ok(match dial {
@@ -146,6 +150,13 @@ pub(in crate::document) fn complete(
             body: outcome.body,
             element: *element,
             epoch: *epoch,
+        },
+        QueuedDial::FrameLoad { sequence, .. } => CompletedDial::FrameLoad {
+            body: outcome.body,
+            content_type: outcome.content_type,
+            content_language: outcome.content_language,
+            final_url: outcome.final_url,
+            sequence: *sequence,
         },
     })
 }

@@ -66,6 +66,8 @@ impl Document {
         self.queued_dials.clear();
         self.in_flight_dials = 0;
         self.decoder = None;
+        self.frame_load_in_flight = false;
+        self.shared.borrow_mut().close_frame_ports(self.frame);
         self.world.borrow_mut().forget_owned_documents();
     }
 
@@ -76,8 +78,10 @@ impl Document {
     pub(crate) fn waiting_for_load(&self) -> bool {
         self.queued_dials.iter().any(|dial| match dial {
             QueuedDial::ClassicScript { epoch, .. } => *epoch == self.js_epoch,
+            QueuedDial::FrameLoad { sequence, .. } => *sequence == self.frame_load_sequence,
             QueuedDial::JsFetch { .. } => false,
         }) || self.classic_fetch_in_flight
+            || self.frame_load_in_flight
             || self.active_parser.is_some()
             || self.world.borrow().main_ready_state() != crate::ReadyState::Complete
     }
@@ -120,6 +124,13 @@ impl Document {
             }
             Task::DialFinished(done) => self.finish_dial(done),
             Task::DialFailed(fail) => self.fail_dial(fail),
+            Task::WindowMessage(message) => self.deliver_window_message(&message),
+            Task::PortMessage {
+                endpoint,
+                payload,
+                ports,
+            } => self.deliver_port_message(endpoint, &payload, &ports),
+            Task::PortClosed { endpoint } => self.deliver_port_close(endpoint),
         }
     }
 

@@ -24,6 +24,7 @@ mod documents;
 mod embedded;
 mod engine;
 mod js;
+mod messaging;
 mod protocol;
 mod remote;
 mod serialize;

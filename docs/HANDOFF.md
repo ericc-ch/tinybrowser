@@ -1,51 +1,95 @@
 # Handoff (2026-09-17)
 
-State: `main` at `01f175b`, clean, one worktree. #16 and #18 merged; the
-conformance loop and its slices are in. Gates green at `dd9ca8b`: clippy,
-`cargo test --workspace` (29 binaries), release binary 5,871,280 bytes.
+State: branch `chase/cross-frame-postmessage` (not pushed), working tree has
+the cross-frame work from `6e1df39` plus the review fixes and the bindings
+split. The user's `AGENTS.md` wording change and an untracked `.zed/` are
+untouched. Gates green: `tools/ub lint` (clippy), `cargo test --workspace`
+(29 binaries), `tools/js/check` (8 embedded scripts), release binary
+5,998,000 bytes. Webmessaging is 77.9% (106/136); the refactor run is
+`/tmp/wpt-suite/baseline/webmessaging-refactor.json`, identical to the
+pre-refactor fix run.
 
-Done (merged):
+Done in this slice:
 
-- WPT loop: `tools/wpt/score` + `retest`, uv-owned venv (`tools/wpt/run`),
-  docs in `tools/wpt/README.md`. `--test-types` must stay last; the `--`
-  separator is stripped.
-- rquickjs 0.13.0; unsafe exception in `AGENTS.md`; `tools/ub`
-  lint/miri/valgrind with the land-pr gate.
-- Messaging: `window.postMessage` per web-messaging.html (targetOrigin,
-  clone, transfer, async task, options overload), trusted message events
-  (`__tbDispatchTrusted`), MessageEvent/MessagePort/MessageChannel,
-  structuredClone identity/sharing/boxed primitives, engine-invoked
-  handler attributes that respect stop flags.
-- Scores in `docs/progress.md`: webmessaging 41.2% (56/136), FileAPI 48.5%.
-  Reports: `/tmp/wpt-suite/baseline/webmessaging4.json`, `wm-ports3.json`.
+- Cross-frame `postMessage` per web-messaging.html: WindowProxy per frame per
+  realm, stable across navigations, shared identity with `contentWindow`/
+  `window[i]`/`event.source`; Blink's `[CrossOrigin]` member policy;
+  delivery-time target-origin re-check; `messageerror`.
+- Rust-owned transport (`messaging.rs`): versioned `tb1:` payloads, sender
+  serialize / receiver decode, `MessagePort` endpoints with queue,
+  entanglement, transfer-in-transit, close events.
+- Child frames: sync browsing-context creation, deferred realm
+  materialization, `src` navigation (http(s)/data:/about:blank/javascript:/
+  blob:), iframe load events, delay-the-load-event, round-robin drains.
+- Review fixes:
+  - Port endpoints carry an intended recipient, set when a carrying message
+    is delivered; `adopt` rejects other realms and `post/start/close/peer`
+    require ownership. A child frame can no longer brute-force an endpoint id
+    to close or steal another frame's port (probe-verified: the foreign close
+    is rejected and the port still delivers).
+  - A stale frame-load response can no longer replace a newer document
+    (`reset_js_realm` bumps the frame-load sequence; synchronous
+    about:blank/data:/javascript: navigations invalidate in-flight dials).
+  - `is_initial_blank` is a document flag, not URL equality:
+    `<iframe src="/same-as-parent">` loads instead of being skipped.
+  - Frame load marks move with the parent document; `reset_js_realm` clears
+    them together with the pending-child counter.
+  - Same-document iframe moves reorder the frame tree (DOM mutation serial
+    drives the rescan).
+  - Closed endpoints are removed from the table (no unbounded growth), a
+    dropped message disentangles its ports and fires `close`, and a decoded
+    failure discards the transferred ports.
+  - `data:` URLs: case-insensitive `;base64`, forgiving-base64 failure leaves
+    the frame on its document.
+  - Clone fidelity: Promise/WeakMap/WeakSet/WeakRef/Proxy-ish internal-slot
+    objects throw DataCloneError instead of cloning as `{}`; detached buffers
+    throw DataCloneError; `DOMException` is serializable; `__proto__` decodes
+    as an own property; `__tbIsError` is not `Symbol.toStringTag`-spoofable.
+  - MessagePort: options-dictionary overload, transfers consumed on a closed
+    port, `onmessage = null` still enables the queue, `close` fires after the
+    carrying message dispatch.
+  - Handler properties: an explicit clear wins over the content attribute
+    until the attribute changes again; `DOMException.prototype[@@toStringTag]`
+    is set; `location` stringifies to its URL; duplicate `javascript:` frame
+    evaluation is gone.
+- Structure: `js/bindings.rs` (8,060 lines) split into
+  `js/bindings/{mod,node,attributes,mutation,parsing,collections,exceptions,
+  webidl,clone,messaging,window,document,focus}.rs`; `node.rs` (2,793) keeps
+  the class because `#[rquickjs::methods]` emits one `MethodImplementor` impl
+  per type. Embedded JS moved to `js/scripts/*.js` with `include_str!`;
+  `tools/js/check` runs `node --check` over them.
 
-Next:
+Deferred review findings (understood, not baselines):
 
-1. Cross-frame `postMessage`: `contentWindow`/WindowProxy, indexed frame
-   access (`window[0]`), and the Rust-owned cross-realm payload transport
-   (parent and child frames are separate realms, so the JS clone cannot
-   cross). Follow Chromium's shape: a stable outer proxy per frame reused
-   across navigations, serialize in the sender realm before any hop,
-   version the payload, re-check the origin match at delivery, dispatch
-   `messageerror` on decode failure.
-2. Verify with `nix develop --command ./tools/wpt/score
-   webmessaging/with-ports/ webmessaging/without-ports/ --save-report FILE
-   -- --exclude=worker --processes 8 --fully-parallel`, then the land-pr
-   gates.
-3. Then workers: agent-context split, dedicated worker thread, placement.
+- `FileList` is not serializable yet (DOMException is); `structuredClone`
+  refuses `SharedArrayBuffer` rather than sharing it.
+- Proxies are not detected as uncloneable (no JS-visible Proxy brand); a
+  proxy over an ordinary object clones its trap results.
+- WindowProxy `getOwnPropertyDescriptor` still returns undefined, and a
+  cross-origin `location` member throws instead of returning a restricted
+  Location.
+- Brand symbols are `Symbol.for`, so a page can forge them; with the new
+  ownership checks the impact is self-corruption only.
+- `frame-load` is a new wasm WIT variant; no host run in this repo yet.
 
-Accepted gaps (tracked on the closed PR #17, body lists them):
+Next, in order:
 
-- Object URLs are not binary-safe (bytes round-trip through a decoded
-  string); needs the response-body path to carry bytes.
-- `docs/progress.md` rows lack retained reports; rerun with
-  `--save-report` before quoting them.
-- Queue: `input.files` null, base64 padding, `location.origin`,
-  `TINYBROWSER_WPT_VENV`, `retest --save-report`, stale reports, Error
-  subclass fidelity.
+1. BroadcastChannel (origin-scoped channel table, same transport; unblocks
+   12 webmessaging tests plus `MessageEvent-trusted.any`).
+2. Workers (agent-context split, placement); four webmessaging tests.
+3. `location.reload()` and "fully active", `navigator.userActivation`,
+   `navigator`, WebCrypto (`postMessage_CryptoKey_insecure`).
+4. Remote-context helper tests (`close-event/*`, `multi-globals/*`) need
+   `document.write` window replacement.
+5. Canvas 2D + ImageData (`with/without-ports/011`, `without-ports/028`,
+   `postMessage_cross_domain_image_transfer_2d`).
 
 Gotchas:
 
-- Commits are unsigned while the keyring is locked; re-sign before merge.
 - One WPT run at a time: the wrapper locks the shared venv.
-- Never leave scratch tests in `third_party/wpt`.
+- `tools/js/check` requires node (present in `nix develop`).
+- The generated `bindings/` split keeps `use super::...` re-exports in
+  `mod.rs`; a new sibling needs its module declared before the macro and its
+  name re-exported, or imports fail.
+- Scratch WPT files must be deleted before committing; commits are unsigned
+  while the keyring is locked, so re-sign before merge.

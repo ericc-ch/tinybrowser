@@ -11,7 +11,7 @@ use std::sync::OnceLock;
 use std::time::Instant;
 
 use rquickjs::{
-    Array, Class, Ctx, Exception, FromJs, Object, Persistent, Result, Value,
+    Array, Class, Ctx, Exception, FromJs, Function, Object, Persistent, Result, Value,
     class::{Trace, Tracer},
     function::{Opt, Rest, This},
 };
@@ -415,148 +415,18 @@ impl JsEventTarget {
 /// Wraps the native `EventTarget` constructor so a call without `new` throws
 /// (<https://webidl.spec.whatwg.org/#interface-object>); the wrapper shares the
 /// native prototype so `Class::<JsEventTarget>` conversions keep working.
-pub(crate) const INSTALL_EVENT_TARGET_CTOR_JS: &str = r"
-(function() {
-  const Native = globalThis.EventTarget;
-  function EventTarget() {
-    if (new.target === undefined) {
-      throw new TypeError('Class constructor EventTarget cannot be invoked without new');
-    }
-    return Reflect.construct(Native, arguments, new.target);
-  }
-  Object.defineProperty(EventTarget, 'prototype', { value: Native.prototype, writable: false, configurable: false });
-  Object.defineProperty(Native.prototype, 'constructor', { value: EventTarget, writable: true, configurable: true });
-  Object.defineProperty(globalThis, 'EventTarget', { value: EventTarget, writable: true, configurable: true });
-})();
-";
+pub(crate) const INSTALL_EVENT_TARGET_CTOR_JS: &str =
+    include_str!("scripts/events/event_target_ctor.js");
 
 /// `AbortController` and `AbortSignal`
 /// (<https://dom.spec.whatwg.org/#interface-abortcontroller>,
 /// <https://dom.spec.whatwg.org/#abortsignal>).
-pub(crate) const INSTALL_ABORT_JS: &str = r"
-(function() {
-  const STATE = Symbol('abort-state');
-  function createSignal() {
-    const signal = Reflect.construct(globalThis.EventTarget, [], AbortSignal);
-    signal[STATE] = { aborted: false, reason: undefined };
-    return signal;
-  }
-  function signalAbort(signal, reason) {
-    const state = signal[STATE];
-    if (!state || state.aborted) {
-      return;
-    }
-    state.aborted = true;
-    state.reason = reason !== undefined
-      ? reason
-      : new DOMException('signal is aborted without reason', 'AbortError');
-    signal.dispatchEvent(new Event('abort'));
-  }
-  function AbortSignal() {
-    throw new TypeError('Illegal constructor');
-  }
-  const signalProto = Object.create(globalThis.EventTarget.prototype);
-  Object.defineProperty(signalProto, 'constructor', {
-    value: AbortSignal, writable: true, configurable: true,
-  });
-  Object.defineProperty(signalProto, 'aborted', {
-    get: function() { return !!(this[STATE] && this[STATE].aborted); },
-    enumerable: true, configurable: true,
-  });
-  Object.defineProperty(signalProto, 'reason', {
-    get: function() { return this[STATE] ? this[STATE].reason : undefined; },
-    enumerable: true, configurable: true,
-  });
-  Object.defineProperty(signalProto, 'throwIfAborted', {
-    value: function() {
-      if (this[STATE] && this[STATE].aborted) {
-        throw this[STATE].reason;
-      }
-    },
-    writable: true, enumerable: true, configurable: true,
-  });
-  Object.defineProperty(AbortSignal, 'prototype', {
-    value: signalProto, writable: false, configurable: false,
-  });
-  Object.defineProperty(AbortSignal, 'abort', {
-    value: function(reason) {
-      const signal = createSignal();
-      signalAbort(signal, reason);
-      return signal;
-    },
-    writable: true, enumerable: true, configurable: true,
-  });
-  Object.defineProperty(AbortSignal, 'timeout', {
-    value: function(milliseconds) {
-      const signal = createSignal();
-      globalThis.setTimeout(function() {
-        signalAbort(signal, new DOMException('The operation timed out.', 'TimeoutError'));
-      }, Number(milliseconds));
-      return signal;
-    },
-    writable: true, enumerable: true, configurable: true,
-  });
-  function AbortController() {
-    if (new.target === undefined) {
-      throw new TypeError('Class constructor AbortController cannot be invoked without new');
-    }
-    const signal = createSignal();
-    Object.defineProperty(this, 'signal', {
-      get: function() { return signal; },
-      enumerable: true, configurable: true,
-    });
-  }
-  Object.defineProperty(AbortController.prototype, 'abort', {
-    value: function(reason) { signalAbort(this.signal, reason); },
-    writable: true, enumerable: true, configurable: true,
-  });
-  Object.defineProperty(AbortController.prototype, 'constructor', {
-    value: AbortController, writable: true, configurable: true,
-  });
-  Object.defineProperty(globalThis, 'AbortSignal', {
-    value: AbortSignal, writable: true, configurable: true,
-  });
-  Object.defineProperty(globalThis, 'AbortController', {
-    value: AbortController, writable: true, configurable: true,
-  });
-})();
-";
+pub(crate) const INSTALL_ABORT_JS: &str = include_str!("scripts/events/abort.js");
 
 /// Wraps the native `Event` constructor so a call without `new` throws
 /// (<https://webidl.spec.whatwg.org/#interface-object>); the wrapper shares the
 /// native prototype so `Class::<JsEvent>` conversions keep working.
-pub(crate) const INSTALL_EVENT_CTOR_JS: &str = r"
-(function() {
-  const Native = globalThis.Event;
-  const isTrustedGet = Object.getOwnPropertyDescriptor(Native.prototype, 'isTrusted').get;
-  function Event() {
-    if (new.target === undefined) {
-      throw new TypeError('Class constructor Event cannot be invoked without new');
-    }
-    const event = Reflect.construct(Native, arguments, new.target);
-    // [LegacyUnforgeable] own getter
-    // (<https://dom.spec.whatwg.org/#dom-event-istrusted>,
-    // <https://webidl.spec.whatwg.org/#dfn-unforgeable>).
-    Object.defineProperty(event, 'isTrusted', {
-      get: isTrustedGet, enumerable: true, configurable: false,
-    });
-    return event;
-  }
-  // Constants are `{writable:false, enumerable:true, configurable:false}` on
-  // both the interface object and its prototype
-  // (<https://webidl.spec.whatwg.org/#define-the-constants>).
-  function defineConstant(target, name, value) {
-    Object.defineProperty(target, name, { value: value, writable: false, enumerable: true, configurable: false });
-  }
-  for (const [name, value] of [['NONE', 0], ['CAPTURING_PHASE', 1], ['AT_TARGET', 2], ['BUBBLING_PHASE', 3]]) {
-    defineConstant(Event, name, value);
-    defineConstant(Native.prototype, name, value);
-  }
-  Object.defineProperty(Event, 'prototype', { value: Native.prototype, writable: false, configurable: false });
-  Object.defineProperty(Native.prototype, 'constructor', { value: Event, writable: true, configurable: true });
-  Object.defineProperty(globalThis, 'Event', { value: Event, writable: true, configurable: true });
-})();
-";
+pub(crate) const INSTALL_EVENT_CTOR_JS: &str = include_str!("scripts/events/event_ctor.js");
 
 /// Keeps a constructible target's object reachable from its world, so dispatch
 /// can use it as `target`/`currentTarget`.
@@ -645,52 +515,7 @@ pub(crate) fn init_custom_event<'js>(ctx: Ctx<'js>, args: Rest<Value<'js>>) -> R
 }
 
 /// Registers the `CustomEvent` constructor and its prototype chain.
-pub(crate) const INSTALL_CUSTOM_EVENT_JS: &str = r"
-(function() {
-  const TB_DETAIL = Symbol('tb-custom-event-detail');
-  function CustomEvent(type) {
-    if (new.target === undefined) {
-      throw new TypeError('Class constructor CustomEvent cannot be invoked without new');
-    }
-    const event = globalThis.__tb_new_custom_event.apply(globalThis, arguments);
-    // A subclass constructor keeps its own prototype
-    // (<https://webidl.spec.whatwg.org/#interface-object>).
-    if (new.target !== CustomEvent) {
-      Object.setPrototypeOf(event, new.target.prototype);
-    }
-    // `detail` is read after the EventInit members and defaults to null
-    // (<https://dom.spec.whatwg.org/#dictdef-customeventinit>).
-    const init = arguments[1];
-    const detail = (init === undefined || init === null) ? null : init.detail;
-    event[TB_DETAIL] = detail === undefined ? null : detail;
-    return event;
-  }
-  const proto = Object.create(globalThis.Event.prototype);
-  Object.defineProperty(proto, 'constructor', { value: CustomEvent, writable: true, configurable: true });
-  Object.defineProperty(proto, 'detail', {
-    get: function() {
-      const detail = this[TB_DETAIL];
-      return detail === undefined ? null : detail;
-    },
-    enumerable: true,
-    configurable: true,
-  });
-  Object.defineProperty(proto, 'initCustomEvent', {
-    value: function(type, bubbles, cancelable, detail) {
-      if (arguments.length < 1) {
-        throw new TypeError('initCustomEvent: at least 1 argument required');
-      }
-      if (globalThis.__tb_init_custom_event(this, type, bubbles, cancelable)) {
-        this[TB_DETAIL] = (arguments.length < 4 || arguments[3] === undefined) ? null : detail;
-      }
-    },
-    writable: true,
-    configurable: true,
-  });
-  Object.defineProperty(CustomEvent, 'prototype', { value: proto, writable: false });
-  Object.defineProperty(globalThis, 'CustomEvent', { value: CustomEvent, writable: true, configurable: true });
-})();
-";
+pub(crate) const INSTALL_CUSTOM_EVENT_JS: &str = include_str!("scripts/events/custom_event.js");
 
 fn event_arguments<'js>(
     ctx: &Ctx<'js>,
@@ -1196,7 +1021,7 @@ fn call_listener<'js>(
 /// exception is dropped. Dropping it keeps a throwing listener from aborting
 /// the rest of the dispatch, and consuming it keeps a later JavaScript
 /// operation from observing the stale pending exception.
-fn report_exception(ctx: &Ctx<'_>, error: &rquickjs::Error) {
+pub(super) fn report_exception(ctx: &Ctx<'_>, error: &rquickjs::Error) {
     if error.is_exception() {
         let _caught = ctx.catch();
     }
@@ -1379,7 +1204,32 @@ fn call_handler_attribute<'js>(
         return Ok(());
     };
     let name = format!("on{typ}");
-    let handler: Value = object.get(name.as_str())?;
+    let mut handler: Value = object.get(name.as_str())?;
+    if handler.as_function().is_none()
+        && let Some(id) = bindings::host_node_id(ctx, &object.clone().into_value())
+        && !bindings::handler_cleared(ctx, id, &name)?
+        && let Some(body) = bindings::handler_attribute(ctx, id, &name)?
+        && !body.trim().is_empty()
+    {
+        // A handler content attribute compiles to a function whose body is
+        // the attribute value and whose `this` is the object
+        // (<https://html.spec.whatwg.org/multipage/webappapis.html#event-handler-content-attributes>).
+        let source = format!("(function(event) {{\n{body}\n}})");
+        match ctx.eval::<Function, _>(source) {
+            Ok(compiled) => {
+                object.set(name.as_str(), compiled.clone())?;
+                handler = compiled.into_value();
+            }
+            Err(error) => {
+                // A failed compilation reports the error and clears the
+                // handler; it must not abort the dispatch (or the attribute
+                // set) that triggered it.
+                report_exception(ctx, &error);
+                object.set(name.as_str(), Value::new_null(ctx.clone()))?;
+                return Ok(());
+            }
+        }
+    }
     if let Some(function) = handler.as_function()
         && let Err(error) = function.call::<_, ()>((This(object.clone()), event.clone()))
     {

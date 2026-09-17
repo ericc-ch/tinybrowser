@@ -3,7 +3,7 @@
 //! navigation.
 
 use std::cell::RefCell;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -18,7 +18,8 @@ use crate::ActiveParser;
 use crate::ReadyState;
 use crate::documents::DocumentStore;
 use crate::js::{DocumentStreamCommand, FrameNavigation, RealmRegistry, SharedJsRuntime, World};
-use crate::protocol::{BrowserServices, Mount, ScriptFailure, TabError, TabEvent};
+use crate::messaging::SharedHandle;
+use crate::protocol::{BrowserServices, FrameId, Mount, ScriptFailure, TabError, TabEvent};
 
 mod dial;
 mod drain;
@@ -35,6 +36,23 @@ enum Task {
     Timer(u32),
     DialFinished(CompletedDial),
     DialFailed(DialFail),
+    WindowMessage(WindowMessage),
+    PortMessage {
+        endpoint: u64,
+        payload: String,
+        ports: Vec<u64>,
+    },
+    PortClosed {
+        endpoint: u64,
+    },
+}
+
+/// One posted window message, ready for the target realm's task queue.
+pub(crate) struct WindowMessage {
+    pub(crate) source: FrameId,
+    pub(crate) origin: String,
+    pub(crate) payload: String,
+    pub(crate) ports: Vec<u64>,
 }
 
 #[derive(Clone)]
@@ -51,6 +69,15 @@ pub(crate) enum QueuedDial {
         element: dom::NodeId,
         epoch: u64,
     },
+    /// A child frame's own navigation
+    /// (<https://html.spec.whatwg.org/multipage/browsing-the-web.html#navigate>).
+    FrameLoad {
+        url: Url,
+        initiator: Url,
+        /// Identifies the frame's current navigation; a superseded load is
+        /// dropped when it completes.
+        sequence: u64,
+    },
 }
 
 pub(crate) enum CompletedDial {
@@ -65,6 +92,13 @@ pub(crate) enum CompletedDial {
         body: Vec<u8>,
         element: dom::NodeId,
         epoch: u64,
+    },
+    FrameLoad {
+        body: Vec<u8>,
+        content_type: Option<String>,
+        content_language: Option<String>,
+        final_url: String,
+        sequence: u64,
     },
 }
 
@@ -83,6 +117,7 @@ enum ParserOwner {
 pub(crate) enum DialFail {
     JsFetch { id: i32, epoch: u64 },
     ClassicScript { epoch: u64 },
+    FrameLoad { sequence: u64 },
 }
 
 struct Timer {
@@ -91,12 +126,33 @@ struct Timer {
     fired: bool,
 }
 
+/// The process-wide handles every frame document shares: services, the JS
+/// heap, the wake handle, the stop flag, and the cross-frame stores.
+#[derive(Clone)]
+pub(crate) struct FrameRuntime {
+    pub(crate) services: Arc<dyn BrowserServices>,
+    pub(crate) js_runtime: SharedJsRuntime,
+    pub(crate) wake: Arc<Notify>,
+    pub(crate) stop: Arc<Stop>,
+    pub(crate) documents: Rc<RefCell<DocumentStore>>,
+    pub(crate) registry: Rc<RefCell<RealmRegistry>>,
+    pub(crate) shared: SharedHandle,
+}
+
 /// One document: tree, task list, `QuickJS` realm, and browser services.
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "each bool mirrors an HTML document or parser flag"
+)]
 pub(crate) struct Document {
     services: Arc<dyn BrowserServices>,
     world: Rc<RefCell<World>>,
     js_runtime: SharedJsRuntime,
     wake: Arc<Notify>,
+    /// The browsing context this document belongs to.
+    frame: FrameId,
+    /// The renderer-process state every frame shares.
+    shared: SharedHandle,
     url: Url,
     content_language: Option<String>,
     tasks: VecDeque<Task>,
@@ -106,6 +162,29 @@ pub(crate) struct Document {
     dial_rx: Receiver<Result<CompletedDial, DialFail>>,
     in_flight_dials: usize,
     queued_dials: Vec<QueuedDial>,
+    /// Identifies the frame's current navigation; completions from superseded
+    /// loads are dropped.
+    frame_load_sequence: u64,
+    /// Whether the frame's own navigation is still in flight, which is what
+    /// keeps the container's `load` event from firing early.
+    frame_load_in_flight: bool,
+    /// Whether the frame is still on the `about:blank` document a browser
+    /// creates at insertion. A URL comparison cannot answer this: a frame
+    /// whose `src` resolves to the parent's own URL is still on that document
+    /// (<https://html.spec.whatwg.org/multipage/iframe-embed-object.html#process-the-iframe-attributes>).
+    initial_blank: bool,
+    /// Mutation serial the child frame order was last computed from, so a
+    /// same-document move of an `iframe` is noticed without walking the tree
+    /// every turn (<https://html.spec.whatwg.org/multipage/nav-history-apis.html#dom-length>).
+    frame_order_serial: u64,
+    /// Child browsing contexts whose load event has not fired yet; this
+    /// document's own `load` event is delayed until they all have
+    /// (<https://html.spec.whatwg.org/multipage/parsing.html#delay-the-load-event>).
+    pending_child_loads: u32,
+    /// The `iframe` containers awaiting their child's load event.
+    pending_frame_loads: HashSet<dom::NodeId>,
+    /// Whether this document's `load` event has fired.
+    load_fired: bool,
     events: Vec<TabEvent>,
     events_overflowed: bool,
     js: Option<crate::js::JsRealm>,
@@ -131,27 +210,23 @@ impl Drop for Document {
 
 impl Document {
     /// A document sharing its renderer process's `QuickJS` heap, wake handle,
-    /// document store, and realm registry.
-    pub(crate) fn with_shared(
-        services: Arc<dyn BrowserServices>,
-        js_runtime: SharedJsRuntime,
-        wake: Arc<Notify>,
-        documents: &Rc<RefCell<DocumentStore>>,
-        registry: &Rc<RefCell<RealmRegistry>>,
-        stop: Arc<Stop>,
-    ) -> Self {
+    /// document store, realm registry, and frame tree.
+    pub(crate) fn with_shared(frame: FrameId, runtime: &FrameRuntime) -> Self {
         let document_url = Url::parse("about:blank").expect("about:blank is a valid URL");
         let (dial_tx, dial_rx) = mpsc::channel();
+        let world = Rc::new(RefCell::new(World::new(
+            document_url.clone(),
+            frame,
+            runtime,
+        )));
+        runtime.registry.borrow_mut().insert_frame(frame, &world);
         Self {
-            world: Rc::new(RefCell::new(World::new(
-                Arc::clone(&services),
-                document_url.clone(),
-                Rc::clone(documents),
-                registry,
-            ))),
-            services,
-            js_runtime,
-            wake,
+            world,
+            services: Arc::clone(&runtime.services),
+            js_runtime: runtime.js_runtime.clone(),
+            wake: Arc::clone(&runtime.wake),
+            frame,
+            shared: Rc::clone(&runtime.shared),
             url: document_url,
             content_language: None,
             tasks: VecDeque::new(),
@@ -161,6 +236,13 @@ impl Document {
             dial_rx,
             in_flight_dials: 0,
             queued_dials: Vec::new(),
+            frame_load_sequence: 0,
+            frame_load_in_flight: false,
+            initial_blank: true,
+            frame_order_serial: u64::MAX,
+            pending_child_loads: 0,
+            pending_frame_loads: HashSet::new(),
+            load_fired: false,
             events: Vec::new(),
             events_overflowed: false,
             js: None,
@@ -171,14 +253,107 @@ impl Document {
             parser_owner: ParserOwner::Carrier,
             decoder: None,
             classic_fetch_in_flight: false,
-            stop,
+            stop: Arc::clone(&runtime.stop),
         }
     }
 
+    /// The world this document's realm belongs to.
+    pub(crate) fn world(&self) -> Rc<RefCell<World>> {
+        Rc::clone(&self.world)
+    }
+
+    /// The serialized origin of the frame's document.
+    #[must_use]
+    pub(crate) fn origin_string(&self) -> String {
+        self.url.origin().ascii_serialization()
+    }
+
+    /// The root node of the frame's active document.
     pub(crate) fn document_root(&self) -> Option<dom::NodeId> {
         self.world
             .borrow()
             .with_main_document(|parsed| parsed.dom.document())
+    }
+
+    /// The `iframe`'s `src` attribute value, when the element has a
+    /// non-empty one
+    /// (<https://html.spec.whatwg.org/multipage/iframe-embed-object.html#attr-iframe-src>).
+    #[must_use]
+    pub(crate) fn frame_src(&self, container: dom::NodeId) -> Option<String> {
+        let world = self.world.borrow();
+        let value = world
+            .document(container)
+            .and_then(|parsed| parsed.dom.attribute(container, "src"))?;
+        (!value.is_empty()).then_some(value)
+    }
+
+    /// Resolves one of the frame's URLs the way an attribute would: absolute
+    /// against the document, or joined with its base URL
+    /// (<https://html.spec.whatwg.org/multipage/urls-and-fetching.html#parse-a-url>).
+    #[must_use]
+    pub(crate) fn resolve_frame_url(&self, spec: &str) -> Option<Url> {
+        Url::parse(spec)
+            .or_else(|_| self.base_url().join(spec))
+            .ok()
+    }
+
+    /// An object URL's contents, created by this realm
+    /// (<https://w3c.github.io/FileAPI/#dfn-createObjectURL>).
+    #[must_use]
+    pub(crate) fn object_url_contents(&self, url: &str) -> Option<Rc<str>> {
+        self.world.borrow().object_url_contents(url)
+    }
+
+    /// The `Content-Type` an object URL was created from.
+    #[must_use]
+    pub(crate) fn object_url_type(&self, url: &str) -> Option<Rc<str>> {
+        self.world.borrow().object_url_type(url)
+    }
+
+    /// The frame's connected `iframe` containers in tree order, which is what
+    /// orders the frame's child browsing contexts
+    /// (<https://html.spec.whatwg.org/multipage/nav-history-apis.html#dom-length>).
+    #[must_use]
+    pub(crate) fn iframe_containers_in_order(&self) -> Vec<dom::NodeId> {
+        self.world.borrow().iframe_containers_in_order()
+    }
+
+    /// Creates the browsing context of every connected `iframe` that lacks
+    /// one, so a script sees it in the same task
+    /// (<https://html.spec.whatwg.org/multipage/iframe-embed-object.html#process-the-iframe-attributes>).
+    pub(crate) fn adopt_pending_frames(&mut self) {
+        let created = self.world.borrow_mut().adopt_pending_frames();
+        for container in created {
+            // The child is loading from this moment on, so this document's
+            // `load` event waits for it
+            // (<https://html.spec.whatwg.org/multipage/parsing.html#delay-the-load-event>).
+            self.mark_frame_load_pending(container);
+        }
+    }
+
+    /// Applies writes the realm stored on a child frame's `contentWindow`
+    /// before that frame's realm existed.
+    pub(crate) fn flush_frame_proxy_sets(&mut self, child: FrameId) {
+        if let Some(js) = &self.js
+            && js.flush_frame_sets(child.get()).is_err()
+        {
+            self.record_event(TabEvent::ScriptFailed);
+        }
+        self.adopt_js_work();
+    }
+
+    /// Takes the child frames this document's realm created for the engine to
+    /// adopt.
+    pub(crate) fn take_new_frames(&mut self) -> Vec<(FrameId, dom::NodeId, Document)> {
+        self.world.borrow_mut().take_new_frames()
+    }
+
+    /// The document URL used by `about:blank` frames, which inherit the
+    /// parent's origin and, in this engine, its URL
+    /// (<https://html.spec.whatwg.org/multipage/browsers.html#determining-the-origin>).
+    #[must_use]
+    pub(crate) fn inherited_url(&self) -> String {
+        self.url.as_str().to_owned()
     }
 
     pub(crate) fn take_lifecycle(&mut self) -> Vec<dom::Lifecycle> {
@@ -205,21 +380,220 @@ impl Document {
         self.adopt_js_work();
     }
 
+    /// Starts the frame's own navigation. The dial runs on this document, so
+    /// a navigation that replaces the frame cancels an unfinished one.
+    pub(crate) fn navigate_to(&mut self, url: Url, initiator: Url) {
+        self.frame_load_sequence = self.frame_load_sequence.wrapping_add(1);
+        self.frame_load_in_flight = true;
+        self.initial_blank = false;
+        self.queued_dials.push(QueuedDial::FrameLoad {
+            url,
+            initiator,
+            sequence: self.frame_load_sequence,
+        });
+    }
+
+    /// Loads the frame's initial `about:blank`, inheriting `inherited_url` as
+    /// the document URL when the parent supplies one
+    /// (<https://html.spec.whatwg.org/multipage/iframe-embed-object.html#process-the-iframe-attributes>).
+    pub(crate) fn load_about_blank(&mut self, inherited_url: Option<&str>) {
+        if let Some(url) = inherited_url {
+            self.apply_document_url(url);
+        }
+        self.load_html("");
+        self.initial_blank = true;
+        self.ensure_frame_js();
+    }
+
+    /// Whether the frame is still on the document created at insertion.
+    #[must_use]
+    pub(crate) fn is_initial_blank(&self) -> bool {
+        self.initial_blank
+    }
+
+    /// Whether the child frame order may have changed since the last scan.
+    ///
+    /// The DOM mutation serial is the cheap detector for a same-document
+    /// `iframe` move, which no connection lifecycle event reports
+    /// (<https://html.spec.whatwg.org/multipage/nav-history-apis.html#dom-length>).
+    pub(crate) fn frame_order_changed(&mut self) -> bool {
+        let serial = self
+            .world
+            .borrow()
+            .with_main_document(|parsed| parsed.dom.mutation_serial());
+        match serial {
+            Some(serial) if serial == self.frame_order_serial => false,
+            Some(serial) => {
+                self.frame_order_serial = serial;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Replaces this frame's document with a complete response, as the frame's
+    /// own `src` load delivers it.
+    pub(crate) fn load_frame_response(
+        &mut self,
+        url: &Url,
+        content_type: Option<&str>,
+        content_language: Option<&str>,
+        body: &[u8],
+    ) {
+        self.begin_response(Some(url), content_type, content_language);
+        self.write_body(body);
+        self.end_body();
+        self.ensure_frame_js();
+    }
+
+    /// Every frame has a window; make sure the realm exists even when the
+    /// document never runs a script, so a parent can set properties on it
+    /// (<https://html.spec.whatwg.org/multipage/window-object.html#the-window-object>).
+    fn ensure_frame_js(&mut self) {
+        if self.ensure_js().is_err() {
+            self.record_event(TabEvent::ScriptFailed);
+        }
+    }
+
+    /// Runs a `javascript:` frame URL's script in the frame's realm, replacing
+    /// the frame's document with the inherited blank first
+    /// (<https://html.spec.whatwg.org/multipage/browsing-the-web.html#javascript-protocol>).
+    pub(crate) fn load_javascript_frame(&mut self, inherited_url: Option<&str>, script: &str) {
+        self.load_about_blank(inherited_url);
+        self.eval_frame_script(script);
+    }
+
+    /// Runs one `javascript:` URL script in this frame's realm; a string
+    /// result would replace the document, which the engine does not model, so
+    /// the result is discarded.
+    pub(crate) fn eval_frame_script(&mut self, script: &str) {
+        if script.is_empty() {
+            return;
+        }
+        if self.eval(script).is_err() {
+            self.record_event(TabEvent::ScriptFailed);
+        }
+    }
+
+    fn apply_document_url(&mut self, url: &str) {
+        if let Ok(url) = Url::parse(url) {
+            self.url = url.clone();
+            self.world.borrow_mut().document_url = url;
+        }
+    }
+
+    /// Queues one posted window message as a task on this frame's task source
+    /// (<https://html.spec.whatwg.org/multipage/web-messaging.html#posted-message-task-source>).
+    pub(crate) fn push_window_message(&mut self, message: WindowMessage) {
+        self.tasks.push_back(Task::WindowMessage(message));
+    }
+
+    /// Queues one channel message as a task on this frame's task source.
+    pub(crate) fn push_port_message(&mut self, endpoint: u64, payload: String, ports: Vec<u64>) {
+        self.tasks.push_back(Task::PortMessage {
+            endpoint,
+            payload,
+            ports,
+        });
+    }
+
+    /// Queues a `close` event for one channel endpoint.
+    pub(crate) fn push_port_closed(&mut self, endpoint: u64) {
+        self.tasks.push_back(Task::PortClosed { endpoint });
+    }
+
+    fn deliver_window_message(&mut self, message: &WindowMessage) {
+        if self.ensure_js().is_err() {
+            self.record_event(TabEvent::ScriptFailed);
+            return;
+        }
+        let Some(js) = &self.js else {
+            return;
+        };
+        let delivered = js.deliver_window_message(
+            message.source.get(),
+            &message.origin,
+            &message.payload,
+            &message.ports,
+        );
+        match delivered {
+            Ok(true) => {}
+            Ok(false) => {
+                if js
+                    .deliver_window_message_error(message.source.get(), &message.origin)
+                    .is_err()
+                {
+                    self.record_event(TabEvent::ScriptFailed);
+                }
+            }
+            Err(_) => self.record_event(TabEvent::ScriptFailed),
+        }
+        self.adopt_js_work();
+    }
+
+    fn deliver_port_message(&mut self, endpoint: u64, payload: &str, ports: &[u64]) {
+        // The port may have moved to another realm between the message being
+        // queued and this task; it goes back on the port's queue, which the
+        // new realm flushes when the port is enabled there
+        // (<https://html.spec.whatwg.org/multipage/web-messaging.html#message-port-post-message-steps>).
+        if self.endpoint_moved(endpoint) {
+            let shared = self.shared.clone();
+            let mut shared = shared.borrow_mut();
+            shared.requeue_port_message(endpoint, payload.to_owned(), ports.to_vec());
+            return;
+        }
+        if self.ensure_js().is_err() {
+            self.record_event(TabEvent::ScriptFailed);
+            return;
+        }
+        let Some(js) = &self.js else {
+            return;
+        };
+        match js.deliver_port_message(endpoint, payload, ports) {
+            Ok(true) => {}
+            Ok(false) => {
+                if js.deliver_port_message_error(endpoint).is_err() {
+                    self.record_event(TabEvent::ScriptFailed);
+                }
+            }
+            Err(_) => self.record_event(TabEvent::ScriptFailed),
+        }
+        self.adopt_js_work();
+    }
+
+    fn deliver_port_close(&mut self, endpoint: u64) {
+        if self.endpoint_moved(endpoint) {
+            let shared = self.shared.clone();
+            shared.borrow_mut().requeue_port_close(endpoint);
+            return;
+        }
+        if self.ensure_js().is_err() {
+            self.record_event(TabEvent::ScriptFailed);
+            return;
+        }
+        if let Some(js) = &self.js
+            && js.deliver_port_close(endpoint).is_err()
+        {
+            self.record_event(TabEvent::ScriptFailed);
+        }
+        self.adopt_js_work();
+    }
+
+    /// Whether `endpoint` no longer belongs to this frame, either because it
+    /// moved to another realm or because it is in transit.
+    ///
+    /// A port can move between the moment a delivery is queued and the moment
+    /// its task runs; the delivery then belongs to the new owner's realm
+    /// (<https://html.spec.whatwg.org/multipage/web-messaging.html#transfer-receiving-steps>).
+    fn endpoint_moved(&self, endpoint: u64) -> bool {
+        let shared = self.shared.borrow();
+        shared.ports.owner(endpoint) != Some(self.frame)
+    }
+
     /// Document URL (cookie initiator and relative-URL base).
     #[must_use]
     pub(crate) fn document_url(&self) -> &str {
         self.url.as_str()
-    }
-
-    /// Sets the document URL used as cookie initiator and relative-URL base.
-    ///
-    /// # Errors
-    ///
-    /// [`TabError::InvalidUrl`] when `url` is not an absolute URL.
-    pub(crate) fn set_document_url(&mut self, url: &str) -> Result<(), TabError> {
-        self.url = Url::parse(url).map_err(|_| TabError::InvalidUrl { spec: url.into() })?;
-        self.world.borrow_mut().document_url = self.url.clone();
-        Ok(())
     }
 
     /// Evaluates `source` as classic script on this document's JS context.
@@ -228,6 +602,7 @@ impl Document {
     ///
     /// [`TabError::Script`] when the engine cannot start or the script throws.
     pub(crate) fn eval(&mut self, source: &str) -> Result<String, TabError> {
+        self.adopt_pending_frames();
         self.ensure_js()?;
         let Some(js) = self.js.as_ref() else {
             return Err(TabError::Script(ScriptFailure::HostMissing));
@@ -312,6 +687,7 @@ impl Document {
         if let Some(url) = url {
             self.url = url.clone();
         }
+        self.initial_blank = false;
         self.content_language = content_language.map(str::to_owned);
         let mut world = self.world.borrow_mut();
         world.document_url = self.url.clone();
@@ -418,6 +794,23 @@ impl Document {
     }
 
     fn reset_js_realm(&mut self) {
+        // The old realm's ports are gone with it; the peers fire `close`
+        // (<https://html.spec.whatwg.org/multipage/web-messaging.html#disentangle>).
+        // A navigation also destroys this frame's own children.
+        {
+            let mut shared = self.shared.borrow_mut();
+            shared.close_frame_ports(self.frame);
+            shared.detach_child_frames(self.frame);
+        }
+        self.frame_load_in_flight = false;
+        self.load_fired = false;
+        self.pending_child_loads = 0;
+        self.pending_frame_loads.clear();
+        // Any frame load that completes after this point belongs to the
+        // replaced document, even when it was started through a synchronous
+        // path that never bumped the sequence
+        // (<https://html.spec.whatwg.org/multipage/browsing-the-web.html#navigate>).
+        self.frame_load_sequence = self.frame_load_sequence.wrapping_add(1);
         self.js_epoch = self.js_epoch.saturating_add(1);
         // Every queued dial belongs to the old realm; drop them all.
         self.queued_dials.clear();
@@ -513,6 +906,9 @@ impl Document {
                             .dom
                             .set_document_language(self.content_language.clone());
                     }
+                    // A script may query a child frame's window; the browsing
+                    // context must exist by then.
+                    self.adopt_pending_frames();
                     // Microtask checkpoint before the script runs; parser
                     // mutations queued since the last script deliver now.
                     self.deliver_mutations();
@@ -626,6 +1022,27 @@ impl Document {
                     self.advance_parser();
                 }
             }
+            CompletedDial::FrameLoad {
+                body,
+                content_type,
+                content_language,
+                final_url,
+                sequence,
+            } => {
+                if sequence != self.frame_load_sequence {
+                    return;
+                }
+                self.frame_load_in_flight = false;
+                let Ok(url) = Url::parse(&final_url) else {
+                    return;
+                };
+                self.load_frame_response(
+                    &url,
+                    content_type.as_deref(),
+                    content_language.as_deref(),
+                    &body,
+                );
+            }
         }
         self.adopt_js_work();
     }
@@ -643,6 +1060,14 @@ impl Document {
                     self.classic_fetch_in_flight = false;
                     self.sync_parser_from_world();
                     self.advance_parser();
+                }
+            }
+            DialFail::FrameLoad { sequence } => {
+                if sequence == self.frame_load_sequence {
+                    // Keep the frame's current (about:blank) document; the
+                    // container's load event still fires because the frame is
+                    // no longer waiting.
+                    self.frame_load_in_flight = false;
                 }
             }
         }
@@ -702,6 +1127,10 @@ impl Document {
             self.record_event(TabEvent::ScriptFailed);
         }
         self.adopt_js_work();
+        // A script may have appended an iframe after the parser finished; its
+        // load must delay this document's own load event
+        // (<https://html.spec.whatwg.org/multipage/parsing.html#delay-the-load-event>).
+        self.adopt_pending_frames();
         self.fire_document_load();
     }
 
@@ -717,6 +1146,20 @@ impl Document {
         {
             self.record_event(TabEvent::ScriptFailed);
         }
+        self.maybe_fire_load();
+    }
+
+    /// Fires this document's `load` event once it and every child browsing
+    /// context have finished loading
+    /// (<https://html.spec.whatwg.org/multipage/parsing.html#delay-the-load-event>).
+    pub(crate) fn maybe_fire_load(&mut self) {
+        if self.load_fired
+            || self.pending_child_loads > 0
+            || self.world.borrow().main_ready_state() != ReadyState::Complete
+        {
+            return;
+        }
+        self.load_fired = true;
         self.record_event(TabEvent::Load);
         if let Some(js) = &self.js
             && js.fire_load().is_err()
@@ -724,6 +1167,39 @@ impl Document {
             self.record_event(TabEvent::ScriptFailed);
         }
         self.adopt_js_work();
+    }
+
+    /// A child browsing context started loading; this document's `load` event
+    /// waits for it, and the container is remembered until it finishes.
+    pub(crate) fn mark_frame_load_pending(&mut self, container: dom::NodeId) {
+        if self.pending_frame_loads.insert(container) {
+            self.pending_child_loads = self.pending_child_loads.saturating_add(1);
+        }
+    }
+
+    /// The containers whose child frames have not finished loading.
+    pub(crate) fn pending_frame_loads(&self) -> Vec<dom::NodeId> {
+        self.pending_frame_loads.iter().copied().collect()
+    }
+
+    /// Fires one container's `load` event and lets this document's own `load`
+    /// event proceed once no child is left loading.
+    pub(crate) fn finish_frame_load(&mut self, container: dom::NodeId) -> bool {
+        if !self.pending_frame_loads.remove(&container) {
+            return false;
+        }
+        self.pending_child_loads = self.pending_child_loads.saturating_sub(1);
+        self.fire_node_load(container);
+        self.maybe_fire_load();
+        true
+    }
+
+    /// Drops a container that went away before its child finished loading.
+    pub(crate) fn cancel_frame_load(&mut self, container: dom::NodeId) {
+        if self.pending_frame_loads.remove(&container) {
+            self.pending_child_loads = self.pending_child_loads.saturating_sub(1);
+            self.maybe_fire_load();
+        }
     }
 
     pub(in crate::document) fn record_event(&mut self, event: TabEvent) {
