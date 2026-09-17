@@ -48,6 +48,7 @@ tokio = { version = "1.53", default-features = false, features = ["rt-multi-thre
 # `restriction` lints are denied individually (blanket is banned by clippy).
 [workspace.lints.rust]
 unsafe_code = "deny"
+unsafe_op_in_unsafe_fn = "deny"
 warnings = { level = "deny", priority = -1 }
 
 [workspace.lints.clippy]

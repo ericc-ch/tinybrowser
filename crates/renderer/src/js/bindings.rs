@@ -5000,6 +5000,49 @@ fn webidl_unsigned_long(number: f64) -> u32 {
     modulo as u32
 }
 
+/// Installs the `Location` object. The engine has no navigation, so only the
+/// read-only URL components exist
+/// (<https://html.spec.whatwg.org/multipage/nav-history-apis.html#the-location-interface>).
+fn install_location<'js>(
+    ctx: &Ctx<'js>,
+    globals: &Object<'js>,
+    world: &Rc<RefCell<World>>,
+) -> Result<()> {
+    let (pathname, href, search, origin, protocol, host, hostname, port) = {
+        let world = world.borrow();
+        let url = &world.document_url;
+        let hostname = url.host_str().map_or_else(String::new, ToOwned::to_owned);
+        let port = url.port().map_or_else(String::new, |port| port.to_string());
+        let host = if port.is_empty() {
+            hostname.clone()
+        } else {
+            format!("{hostname}:{port}")
+        };
+        (
+            url.path().to_owned(),
+            url.as_str().to_owned(),
+            url.query()
+                .map_or_else(String::new, |query| format!("?{query}")),
+            url.origin().ascii_serialization(),
+            format!("{}:", url.scheme()),
+            host,
+            hostname,
+            port,
+        )
+    };
+    let location = Object::new(ctx.clone())?;
+    location.set("pathname", pathname)?;
+    location.set("href", href)?;
+    location.set("search", search)?;
+    location.set("origin", origin)?;
+    location.set("protocol", protocol)?;
+    location.set("host", host)?;
+    location.set("hostname", hostname)?;
+    location.set("port", port)?;
+    globals.set("location", location)?;
+    Ok(())
+}
+
 pub(super) fn install(ctx: &Ctx<'_>, world: &Rc<RefCell<World>>) -> Result<()> {
     register_world(ctx, world);
     let globals = ctx.globals();
@@ -5008,10 +5051,6 @@ pub(super) fn install(ctx: &Ctx<'_>, world: &Rc<RefCell<World>>) -> Result<()> {
         .set_window(Persistent::save(ctx, globals.clone()));
     Class::<JsEvent>::define(&globals)?;
     ctx.eval::<(), _>(events::INSTALL_EVENT_CTOR_JS)?;
-    globals.set(
-        "postMessage",
-        rquickjs::prelude::Func::from(window_post_message),
-    )?;
     install_webdriver_bridge(ctx, &globals)?;
     globals.set("innerWidth", VIRTUAL_VIEWPORT_WIDTH)?;
     globals.set("innerHeight", VIRTUAL_VIEWPORT_HEIGHT)?;
@@ -5058,18 +5097,7 @@ pub(super) fn install(ctx: &Ctx<'_>, world: &Rc<RefCell<World>>) -> Result<()> {
         globals.set("document", wrap_node(ctx, id)?)?;
     }
 
-    let pathname = world.borrow().document_url.path().to_owned();
-    let href = world.borrow().document_url.as_str().to_owned();
-    let search = world
-        .borrow()
-        .document_url
-        .query()
-        .map_or_else(String::new, |query| format!("?{query}"));
-    let location = Object::new(ctx.clone())?;
-    location.set("pathname", pathname)?;
-    location.set("href", href)?;
-    location.set("search", search)?;
-    globals.set("location", location)?;
+    install_location(ctx, &globals, world)?;
     globals.set("window", globals.clone())?;
     globals.set("self", globals.clone())?;
     // https://html.spec.whatwg.org/multipage/nav-history-apis.html#dom-window-event
@@ -5096,6 +5124,11 @@ pub(super) fn install(ctx: &Ctx<'_>, world: &Rc<RefCell<World>>) -> Result<()> {
     globals.set(
         "dispatchEvent",
         rquickjs::prelude::Func::from(window_dispatch_event),
+    )?;
+    // User-agent delivery for shim-fired events (window.postMessage).
+    globals.set(
+        "__tbDispatchTrusted",
+        rquickjs::prelude::Func::from(window_dispatch_trusted_event),
     )?;
     Ok(())
 }
@@ -5132,6 +5165,14 @@ fn window_remove_event_listener<'js>(
 )]
 fn window_dispatch_event<'js>(ctx: Ctx<'js>, event: Class<'js, JsEvent>) -> Result<bool> {
     events::dispatch_event(&ctx, EventTargetKey::Window, &event)
+}
+
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "rquickjs Func ABI passes arguments by value"
+)]
+fn window_dispatch_trusted_event<'js>(ctx: Ctx<'js>, event: Class<'js, JsEvent>) -> Result<bool> {
+    events::dispatch_trusted_event(&ctx, EventTargetKey::Window, &event)
 }
 
 pub(super) fn fire_dom_content_loaded(ctx: &Ctx<'_>) -> Result<()> {
@@ -5574,39 +5615,6 @@ fn webdriver_element(ctx: Ctx<'_>, remote_id: f64) -> Result<Value<'_>> {
     wrap_node(&ctx, node)
 }
 
-/// `window.postMessage(message, targetOrigin)`. The engine has no
-/// browsing-context messaging yet, so the message is always delivered at this
-/// window with this window as its source
-/// (<https://html.spec.whatwg.org/multipage/webappapis.html#dom-window-postmessage>).
-#[allow(
-    clippy::needless_pass_by_value,
-    reason = "rquickjs Func ABI passes arguments by value"
-)]
-fn window_post_message<'js>(
-    ctx: Ctx<'js>,
-    message: Value<'js>,
-    _target_origin: Opt<Value<'js>>,
-) -> Result<()> {
-    let event = Class::instance(
-        ctx.clone(),
-        events::JsEvent::trusted("message", false, false),
-    )?;
-    let origin = world(&ctx).ok().map_or_else(String::new, |world| {
-        world.borrow().document_url.origin().ascii_serialization()
-    });
-    let value = Class::into_value(event.clone());
-    if let Some(object) = value.as_object() {
-        object.set("data", message)?;
-        object.set("origin", origin)?;
-        object.set("source", ctx.globals())?;
-    }
-    // Deviations: delivery is synchronous, `targetOrigin` and the `transfer`
-    // argument are not validated, and the data is not structured-cloned. The
-    // engine has no message queue yet.
-    events::dispatch_trusted(&ctx, EventTargetKey::Window, &event)?;
-    Ok(())
-}
-
 /// Virtual viewport used for element geometry until the engine has layout.
 ///
 /// The boxes are a deterministic stand-in, not a layout result: elements are
@@ -5945,6 +5953,7 @@ fn deref_weak<'js>(
 const INSTALL_BRANDS_JS: &str = r"
 (function() {
   const native = globalThis.Node.prototype;
+  const inputFilesSymbol = Symbol.for('tinybrowser.input.files');
   function illegal() { throw new TypeError('Illegal constructor'); }
   function define(name, parent, members, constructible) {
     const ctor = constructible
@@ -5966,6 +5975,12 @@ const INSTALL_BRANDS_JS: &str = r"
     Object.defineProperty(ctor, 'name', { value: name, configurable: true });
     Object.defineProperty(proto, 'constructor', { value: ctor, writable: true, configurable: true });
     Object.defineProperty(ctor, 'prototype', { value: proto, writable: false });
+    // Interface prototypes carry @@toStringTag
+    // (<https://webidl.spec.whatwg.org/#es-interface>), so
+    // Object.prototype.toString says `[object HTMLDivElement]`.
+    Object.defineProperty(proto, Symbol.toStringTag, {
+      value: name, writable: false, enumerable: false, configurable: true,
+    });
     Object.defineProperty(globalThis, name, { value: ctor, writable: true, configurable: true });
     return ctor;
   }
@@ -6176,6 +6191,22 @@ const INSTALL_BRANDS_JS: &str = r"
     'date', 'month', 'week', 'time', 'datetime-local', 'number', 'range',
     'color', 'checkbox', 'radio', 'file', 'submit', 'image', 'reset', 'button',
   ]), 'text'));
+  // `<input type=file>` exposes a (possibly empty) FileList
+  // (<https://html.spec.whatwg.org/multipage/input.html#dom-input-files>).
+  Object.defineProperty(table.HTMLInputElement, 'files', {
+    get: function() {
+      let list = this[inputFilesSymbol];
+      if (list === undefined) {
+        list = globalThis.__tbCreateFileList([]);
+        Object.defineProperty(this, inputFilesSymbol, {
+          value: list, writable: false, enumerable: false, configurable: false,
+        });
+      }
+      return list;
+    },
+    enumerable: true,
+    configurable: true,
+  });
   Object.defineProperty(table.HTMLButtonElement, 'type', reflectType(new Set([
     'submit', 'reset', 'button',
   ]), 'submit'));
@@ -6227,6 +6258,14 @@ const INSTALL_COLLECTIONS_JS: &str = r"
     writable: true,
     configurable: true,
   });
+  for (const [collectionName, collectionProto] of [
+    ['NodeList', native],
+    ['NamedNodeMap', globalThis.NamedNodeMap.prototype],
+  ]) {
+    Object.defineProperty(collectionProto, Symbol.toStringTag, {
+      value: collectionName, writable: false, enumerable: false, configurable: true,
+    });
+  }
   const ctor = function() { throw new TypeError('Illegal constructor'); };
   const proto = Object.create(Object.prototype);
   for (const member of ['length', 'item']) {
@@ -6240,6 +6279,9 @@ const INSTALL_COLLECTIONS_JS: &str = r"
     configurable: true,
   });
   Object.defineProperty(ctor, 'prototype', { value: proto, writable: false });
+  Object.defineProperty(proto, Symbol.toStringTag, {
+    value: 'HTMLCollection', writable: false, enumerable: false, configurable: true,
+  });
   Object.defineProperty(globalThis, 'HTMLCollection', { value: ctor, writable: true, configurable: true });
   Object.defineProperty(globalThis, '__tb_liveCollection', {
     enumerable: false,

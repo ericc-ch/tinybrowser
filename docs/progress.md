@@ -7,7 +7,7 @@ Size research lives in [`docs/researches/size-budget.md`](researches/size-budget
 
 Target: under 10MB stripped on x86_64.
 
-5,792,032 bytes (2026-09-16)
+5,870,832 bytes (2026-09-17)
 
 ```sh
 nix develop --command cargo build --release --bin tinybrowser
@@ -67,7 +67,7 @@ nix develop --command ./tools/wpt/score <directory> -- --exclude=worker
 | `content-index/` | unscored |
 | `content-security-policy/` | unscored |
 | `contenteditable/` | unscored |
-| `cookies/` | unscored |
+| `cookies/` | 4.5% |
 | `cookiestore/` | unscored |
 | `core-aam/` | unscored |
 | `cors/` | unscored |
@@ -75,7 +75,7 @@ nix develop --command ./tools/wpt/score <directory> -- --exclude=worker
 | `credential-management/` | unscored |
 | `css/` | unscored |
 | `cssom/` | unscored |
-| `custom-elements/` | unscored |
+| `custom-elements/` | 2.6% |
 | `delegated-ink/` | unscored |
 | `density-size-correction/` | unscored |
 | `deprecation-reporting/` | unscored |
@@ -87,8 +87,8 @@ nix develop --command ./tools/wpt/score <directory> -- --exclude=worker
 | `document-picture-in-picture/` | unscored |
 | `document-policy/` | unscored |
 | `dom/` | unscored |
-| `domparsing/` | unscored |
-| `domxpath/` | unscored |
+| `domparsing/` | 21.6% |
+| `domxpath/` | 5.9% |
 | `dpub-aam/` | unscored |
 | `dpub-aria/` | unscored |
 | `ecmascript/` | unscored |
@@ -105,8 +105,8 @@ nix develop --command ./tools/wpt/score <directory> -- --exclude=worker
 | `fenced-frame/` | unscored |
 | `fetch/` | unscored |
 | `file-system-access/` | unscored |
-| `FileAPI/` | unscored |
-| `focus/` | unscored |
+| `FileAPI/` | 48.5% |
+| `focus/` | 7.3% |
 | `font-access/` | unscored |
 | `forced-colors-mode/` | unscored |
 | `fs/` | unscored |
@@ -221,11 +221,11 @@ nix develop --command ./tools/wpt/score <directory> -- --exclude=worker
 | `scroll-to-text-fragment/` | unscored |
 | `secure-contexts/` | unscored |
 | `secure-payment-confirmation/` | unscored |
-| `selection/` | unscored |
+| `selection/` | 19.0% |
 | `serial/` | unscored |
 | `server-timing/` | unscored |
 | `service-workers/` | unscored |
-| `shadow-dom/` | unscored |
+| `shadow-dom/` | 14.7% |
 | `shape-detection/` | unscored |
 | `signed-exchange/` | unscored |
 | `soft-navigation-heuristics/` | unscored |
@@ -247,8 +247,8 @@ nix develop --command ./tools/wpt/score <directory> -- --exclude=worker
 | `ua-client-hints/` | unscored |
 | `uievents/` | unscored |
 | `upgrade-insecure-requests/` | unscored |
-| `url/` | unscored |
-| `urlpattern/` | unscored |
+| `url/` | 14.3% |
+| `urlpattern/` | 0.0% |
 | `user-timing/` | unscored |
 | `vibration/` | unscored |
 | `video-rvfc/` | unscored |
@@ -276,7 +276,7 @@ nix develop --command ./tools/wpt/score <directory> -- --exclude=worker
 | `webhid/` | unscored |
 | `webidl/` | unscored |
 | `webmcp/` | unscored |
-| `webmessaging/` | unscored |
+| `webmessaging/` | 41.2% |
 | `webmidi/` | unscored |
 | `webnn/` | unscored |
 | `webrtc/` | unscored |
@@ -288,7 +288,7 @@ nix develop --command ./tools/wpt/score <directory> -- --exclude=worker
 | `webrtc-stats/` | unscored |
 | `webrtc-svc/` | unscored |
 | `websockets/` | unscored |
-| `webstorage/` | unscored |
+| `webstorage/` | 0.0% |
 | `webtransport/` | unscored |
 | `webusb/` | unscored |
 | `webvtt/` | unscored |

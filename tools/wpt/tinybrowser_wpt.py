@@ -32,6 +32,10 @@ __wptrunner__ = {
     "executor": {
         "testharness": "TinyBrowserTestharnessExecutor",
         "crashtest": "TinyBrowserCrashtestExecutor",
+        # test262 tests are served as generated .test262.html wrappers that
+        # report through testharness.js; Test262Test subclasses TestharnessTest
+        # (wptrunner/wpttest.py), so the testharness executor drives them too.
+        "test262": "TinyBrowserTestharnessExecutor",
     },
     "browser_kwargs": "browser_kwargs",
     "executor_kwargs": "executor_kwargs",

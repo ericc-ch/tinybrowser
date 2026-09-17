@@ -397,6 +397,19 @@ impl JsEventTarget {
         register_standalone(&ctx, self.id, &this.0)?;
         dispatch_event(&ctx, EventTargetKey::Standalone(self.id), &event)
     }
+
+    /// User-agent delivery for a shim-fired event: same as `dispatchEvent`
+    /// but the event keeps its trust bit.
+    #[qjs(rename = "__tbDispatchTrusted")]
+    fn dispatch_trusted<'js>(
+        &self,
+        ctx: Ctx<'js>,
+        this: This<Object<'js>>,
+        event: Class<'js, JsEvent>,
+    ) -> Result<bool> {
+        register_standalone(&ctx, self.id, &this.0)?;
+        dispatch_trusted_event(&ctx, EventTargetKey::Standalone(self.id), &event)
+    }
 }
 
 /// Wraps the native `EventTarget` constructor so a call without `new` throws
@@ -847,6 +860,29 @@ pub(crate) fn dispatch_event<'js>(
     dispatch(ctx, target, event)
 }
 
+/// Dispatches a user-agent event with the trust bit set, without the
+/// `dispatchEvent()` step that clears `isTrusted`
+/// (<https://dom.spec.whatwg.org/#concept-event-dispatch>).
+pub(crate) fn dispatch_trusted_event<'js>(
+    ctx: &Ctx<'js>,
+    target: EventTargetKey,
+    event: &Class<'js, JsEvent>,
+) -> Result<bool> {
+    {
+        let class = event.borrow();
+        let state = class.state();
+        if state.dispatching || !state.initialized {
+            return Err(bindings::throw_dom(
+                ctx,
+                "InvalidStateError",
+                "the event is already being dispatched or was never initialized",
+            ));
+        }
+    }
+    event.borrow().state_mut().is_trusted = true;
+    dispatch(ctx, target, event)
+}
+
 /// Creates and dispatches a user-agent event.
 pub(crate) fn fire_trusted(
     ctx: &Ctx<'_>,
@@ -873,17 +909,6 @@ pub(crate) fn fire_trusted_with_related(
     event.borrow().state_mut().related_target = related;
     dispatch(ctx, target, &event)?;
     Ok(())
-}
-
-/// Dispatches an already-trusted user-agent event without the
-/// `dispatchEvent()` step that clears `isTrusted`
-/// (<https://dom.spec.whatwg.org/#concept-event-dispatch>).
-pub(crate) fn dispatch_trusted<'js>(
-    ctx: &Ctx<'js>,
-    target: EventTargetKey,
-    event: &Class<'js, JsEvent>,
-) -> Result<bool> {
-    dispatch(ctx, target, event)
 }
 
 /// [Dispatch](https://dom.spec.whatwg.org/#concept-event-dispatch) an event.
@@ -918,8 +943,13 @@ fn dispatch<'js>(
     let result = run_invocations(ctx, event, &path, target, bubbles);
     // Handler attributes (`onreadystatechange`, `onload`, …) act as listeners;
     // the engine runs them after the listener list until it models the
-    // handler registration slot.
-    let handler = if result.is_ok() {
+    // handler registration slot. A stopped event never reaches them.
+    let stopped = {
+        let class = event.borrow();
+        let state = class.state();
+        state.stop_propagation || state.stop_immediate
+    };
+    let handler = if result.is_ok() && !stopped {
         let event_value = Class::into_value(event.clone());
         call_handler_attribute(
             ctx,

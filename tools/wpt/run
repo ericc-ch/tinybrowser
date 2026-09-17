@@ -118,23 +118,38 @@ if [[ "${TINYBROWSER_WPT_NO_LOCK:-0}" != 1 ]]; then
   fi
 fi
 
-# A missing venv is created once by WPT itself. An existing one is never
-# handed back to that setup, which can rebuild a venv under a different
-# interpreter and delete one a run is using.
-if [[ ! -x "$VENV/bin/pip" ]]; then
+# uv owns the venv: `uv venv` creates it, `uv pip` fills it. `--seed` installs
+# pip/setuptools so WPT's working-set check can run; the manifest and wptrunner
+# requirements are installed here so that check finds everything satisfied and
+# WPT never falls back to its own pip path. The editable product adapter is
+# reinstalled every run, so a checkout edit takes effect.
+if ! command -v uv >/dev/null 2>&1; then
+  echo "uv is required to bootstrap the WPT virtualenv" >&2
+  exit 1
+fi
+if [[ ! -x "$VENV/bin/python" ]]; then
   if [[ -n "${TINYBROWSER_WPT_VENV:-}" ]]; then
     echo "WPT virtualenv not found at $VENV; TINYBROWSER_WPT_VENV must name one" >&2
     exit 1
   fi
-  python3 "$WPT/wpt" run --help >/dev/null
+  uv venv --seed "$VENV" --python 3.12
 fi
-if [[ ! -x "$VENV/bin/pip" ]]; then
-  echo "WPT virtualenv not found at $VENV" >&2
-  echo "Bootstrap it with: python3 $WPT/wpt run --help" >&2
-  exit 1
-fi
-"$VENV/bin/pip" install -e "$ROOT/tools/wpt" >/dev/null
-args=("$@")
+uv pip install --python "$VENV/bin/python" -q \
+  -r "$WPT/tools/manifest/requirements.txt" \
+  -r "$WPT/tools/wptrunner/requirements.txt"
+uv pip install --python "$VENV/bin/python" -q -e "$ROOT/tools/wpt"
+# A standalone `--` separates test paths from wpt options in the documented
+# form. wpt does not need it, and forwarding it would make every later option
+# positional, including the --test-types appended below.
+args=()
+seen_separator=0
+for arg in "$@"; do
+  if [[ "$arg" == "--" && "$seen_separator" -eq 0 ]]; then
+    seen_separator=1
+    continue
+  fi
+  args+=("$arg")
+done
 has_option() {
   local option="$1" arg
   shift
@@ -158,6 +173,8 @@ if has_option --test-types "${args[@]}"; then
       index=$((index + 1))
       while (( index < count )); do
         case "${args[$index]}" in
+          # Keep in sync with wpttest.enabled_tests
+          # (tools/wptrunner/wptrunner/wpttest.py).
           testharness|crashtest|test262|wdspec|print-reftest|aamtest|reftest)
             test_types+=("${args[$index]}")
             index=$((index + 1))
