@@ -50,6 +50,14 @@ Decisions made:
   a cross-realm one.
 - Event handler attributes are invoked by the engine after the listener
   list; shims only define properties the engine reads.
+- Cross-frame shape follows Chromium's WindowProxy split: a stable outer
+  proxy object per frame (reused across navigations, `frames[0] === frames[0]`)
+  holding a frame identity, separate from the inner global
+  (bindings/core/v8/local_window_proxy.*, remote_window_proxy.*).
+- Serialize in the sender realm before any hop; version the payload format
+  (Chromium's kWireFormatVersion); re-check the origin match at delivery,
+  not only at call; dispatch `messageerror` when decode fails
+  (local_frame.cc DispatchMessageEventWithOriginCheck, PostMessageEvent::Run).
 
 Gotchas:
 
