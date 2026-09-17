@@ -5125,6 +5125,11 @@ pub(super) fn install(ctx: &Ctx<'_>, world: &Rc<RefCell<World>>) -> Result<()> {
         "dispatchEvent",
         rquickjs::prelude::Func::from(window_dispatch_event),
     )?;
+    // User-agent delivery for shim-fired events (window.postMessage).
+    globals.set(
+        "__tbDispatchTrusted",
+        rquickjs::prelude::Func::from(window_dispatch_trusted_event),
+    )?;
     Ok(())
 }
 
@@ -5160,6 +5165,14 @@ fn window_remove_event_listener<'js>(
 )]
 fn window_dispatch_event<'js>(ctx: Ctx<'js>, event: Class<'js, JsEvent>) -> Result<bool> {
     events::dispatch_event(&ctx, EventTargetKey::Window, &event)
+}
+
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "rquickjs Func ABI passes arguments by value"
+)]
+fn window_dispatch_trusted_event<'js>(ctx: Ctx<'js>, event: Class<'js, JsEvent>) -> Result<bool> {
+    events::dispatch_trusted_event(&ctx, EventTargetKey::Window, &event)
 }
 
 pub(super) fn fire_dom_content_loaded(ctx: &Ctx<'_>) -> Result<()> {

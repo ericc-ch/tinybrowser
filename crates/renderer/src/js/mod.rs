@@ -1391,7 +1391,7 @@ const __tbNewPort = () => {
 const __tbPortDeliver = (port, cloned) => {
   const data = __tbBrand(port, __tbPortData);
   if (data.closed || !data.started) return;
-  port.dispatchEvent(new globalThis.MessageEvent('message', { data: cloned.data, ports: cloned.ports }));
+  port.__tbDispatchTrusted(new globalThis.MessageEvent('message', { data: cloned.data, ports: cloned.ports }));
 };
 const __tbPortFlush = port => {
   const data = __tbBrand(port, __tbPortData);
@@ -1413,6 +1413,12 @@ globalThis.MessagePort = class MessagePort extends EventTarget {
   postMessage(message, transfer) {
     const data = __tbBrand(this, __tbPortData);
     if (data.closed) return;
+    // `postMessage(message, options)` dictionary overload
+    // (<https://html.spec.whatwg.org/multipage/web-messaging.html#dom-messageport-postmessage>).
+    if (transfer !== null && typeof transfer === 'object' && !Array.isArray(transfer)
+        && typeof transfer[Symbol.iterator] !== 'function' && 'transfer' in transfer) {
+      transfer = transfer.transfer;
+    }
     __tbPortEnqueue(this, __tbStructuredClone(message, transfer, this));
   }
   start() {
@@ -1457,6 +1463,12 @@ globalThis.postMessage = function(message, targetOrigin, transfer) {
   if (arguments.length === 0) {
     throw new TypeError(`Failed to execute 'postMessage' on 'Window': 1 argument required, but only 0 present.`);
   }
+  // `postMessage(message, options)` dictionary overload
+  // (<https://html.spec.whatwg.org/multipage/web-messaging.html#dom-window-postmessage>).
+  if (targetOrigin !== null && typeof targetOrigin === 'object') {
+    transfer = targetOrigin.transfer;
+    targetOrigin = targetOrigin.targetOrigin;
+  }
   const sourceOrigin = String(location.origin);
   let checkedOrigin = targetOrigin === undefined ? '/' : String(targetOrigin);
   if (checkedOrigin === '/') {
@@ -1474,7 +1486,7 @@ globalThis.postMessage = function(message, targetOrigin, transfer) {
   const ports = cloned.ports;
   setTimeout(function() {
     if (checkedOrigin !== '*' && checkedOrigin !== sourceOrigin) return;
-    globalThis.dispatchEvent(new globalThis.MessageEvent('message', {
+    globalThis.__tbDispatchTrusted(new globalThis.MessageEvent('message', {
       data: cloned.data,
       origin: sourceOrigin,
       source: globalThis,

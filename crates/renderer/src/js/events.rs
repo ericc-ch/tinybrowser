@@ -397,6 +397,19 @@ impl JsEventTarget {
         register_standalone(&ctx, self.id, &this.0)?;
         dispatch_event(&ctx, EventTargetKey::Standalone(self.id), &event)
     }
+
+    /// User-agent delivery for a shim-fired event: same as `dispatchEvent`
+    /// but the event keeps its trust bit.
+    #[qjs(rename = "__tbDispatchTrusted")]
+    fn dispatch_trusted<'js>(
+        &self,
+        ctx: Ctx<'js>,
+        this: This<Object<'js>>,
+        event: Class<'js, JsEvent>,
+    ) -> Result<bool> {
+        register_standalone(&ctx, self.id, &this.0)?;
+        dispatch_trusted_event(&ctx, EventTargetKey::Standalone(self.id), &event)
+    }
 }
 
 /// Wraps the native `EventTarget` constructor so a call without `new` throws
@@ -844,6 +857,29 @@ pub(crate) fn dispatch_event<'js>(
         }
     }
     event.borrow().state_mut().is_trusted = false;
+    dispatch(ctx, target, event)
+}
+
+/// Dispatches a user-agent event with the trust bit set, without the
+/// `dispatchEvent()` step that clears `isTrusted`
+/// (<https://dom.spec.whatwg.org/#concept-event-dispatch>).
+pub(crate) fn dispatch_trusted_event<'js>(
+    ctx: &Ctx<'js>,
+    target: EventTargetKey,
+    event: &Class<'js, JsEvent>,
+) -> Result<bool> {
+    {
+        let class = event.borrow();
+        let state = class.state();
+        if state.dispatching || !state.initialized {
+            return Err(bindings::throw_dom(
+                ctx,
+                "InvalidStateError",
+                "the event is already being dispatched or was never initialized",
+            ));
+        }
+    }
+    event.borrow().state_mut().is_trusted = true;
     dispatch(ctx, target, event)
 }
 
