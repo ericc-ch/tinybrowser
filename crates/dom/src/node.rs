@@ -12,38 +12,76 @@ pub use markup5ever::{LocalName, Namespace, Prefix, QualName};
 
 /// The HTML namespace URL.
 ///
-/// `markup5ever`'s `ns!(html)` wraps this same string; exposed as a plain
-/// function so callers never touch macro machinery. Selector matching and
-/// the future `TreeSink` adapter both key off it.
+/// The interned `markup5ever` atom, so namespace checks do not re-hash the URL.
 #[must_use]
 pub fn html_namespace() -> Namespace {
-    Namespace::from("http://www.w3.org/1999/xhtml")
+    markup5ever::ns!(html)
 }
 
 /// The XML namespace URL (`xml:lang` lives here).
 #[must_use]
 pub fn xml_namespace() -> Namespace {
-    Namespace::from("http://www.w3.org/XML/1998/namespace")
+    markup5ever::ns!(xml)
 }
 
 /// The SVG namespace URL.
 #[must_use]
 pub fn svg_namespace() -> Namespace {
-    Namespace::from("http://www.w3.org/2000/svg")
+    markup5ever::ns!(svg)
 }
 
 /// The `xmlns` declaration namespace URL
 /// (<https://www.w3.org/TR/xml-names/#ns-decl>).
 #[must_use]
 pub fn xmlns_namespace() -> Namespace {
-    Namespace::from("http://www.w3.org/2000/xmlns/")
+    markup5ever::ns!(xmlns)
 }
 
 /// The `xlink` namespace URL, used only by HTML serialization's attribute
 /// name rule (<https://html.spec.whatwg.org/multipage/parsing.html#attribute-s-serialized-name>).
 #[must_use]
 pub fn xlink_namespace() -> Namespace {
-    Namespace::from("http://www.w3.org/1999/xlink")
+    markup5ever::ns!(xlink)
+}
+
+/// Whether `name`'s serialization (`prefix:local` or `local`) equals `query`.
+#[must_use]
+pub fn qualified_name_eq(name: &QualName, query: &str) -> bool {
+    match name.prefix.as_ref() {
+        Some(prefix) if !prefix.is_empty() => {
+            let prefix = prefix.as_ref();
+            query.len() == prefix.len() + 1 + name.local.len()
+                && query.as_bytes().get(prefix.len()) == Some(&b':')
+                && &query[..prefix.len()] == prefix
+                && &query[prefix.len() + 1..] == name.local.as_ref()
+        }
+        _ => name.local.as_ref() == query,
+    }
+}
+
+/// HTML's get-an-attribute-by-name match: the query as if ASCII-lowercased,
+/// then an exact compare to the stored qualified name
+/// (<https://dom.spec.whatwg.org/#concept-element-attributes-get-by-name>).
+#[must_use]
+pub fn html_qualified_name_eq(name: &QualName, query: &str) -> bool {
+    match name.prefix.as_ref() {
+        Some(prefix) if !prefix.is_empty() => {
+            let prefix = prefix.as_ref();
+            query.len() == prefix.len() + 1 + name.local.len()
+                && query.as_bytes().get(prefix.len()) == Some(&b':')
+                && stored_eq_lowercased_query(prefix, &query[..prefix.len()])
+                && stored_eq_lowercased_query(name.local.as_ref(), &query[prefix.len() + 1..])
+        }
+        _ => stored_eq_lowercased_query(name.local.as_ref(), query),
+    }
+}
+
+fn stored_eq_lowercased_query(stored: &str, query: &str) -> bool {
+    stored.len() == query.len()
+        && stored
+            .bytes()
+            .zip(query.bytes())
+            .all(|(stored, query)| stored == query.to_ascii_lowercase())
 }
 
 /// One attribute: a qualified name and its value.

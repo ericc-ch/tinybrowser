@@ -26,7 +26,8 @@ mod state;
 pub use arena::{Dom, DomError, Lifecycle, Mutation, NodeRef, QuirksMode};
 pub use id::NodeId;
 pub use node::{
-    Attribute, LocalName, Namespace, NodeKind, Prefix, QualName, html_namespace, svg_namespace,
-    xlink_namespace, xml_namespace, xmlns_namespace,
+    Attribute, LocalName, Namespace, NodeKind, Prefix, QualName, html_namespace,
+    html_qualified_name_eq, qualified_name_eq, svg_namespace, xlink_namespace, xml_namespace,
+    xmlns_namespace,
 };
 pub use select::{ParseFail, ParseFailKind, SelectError};

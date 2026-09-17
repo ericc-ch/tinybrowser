@@ -244,11 +244,12 @@ impl Sink {
                 }),
         };
         if let Some(handle) = neighbor
-            && let Some(NodeKind::Text { data }) = dom.get(handle).map(|node| node.kind())
+            && matches!(
+                dom.get(handle).map(|node| node.kind()),
+                Some(NodeKind::Text { .. })
+            )
         {
-            let mut merged = data.clone();
-            merged.push_str(text);
-            let _ = dom.set_text(handle, merged);
+            let _ = dom.append_text(handle, text);
             return;
         }
         let fresh = dom.create_text(text);
@@ -327,7 +328,7 @@ impl TreeSink for Sink {
             .into_iter()
             .map(|attr| DomAttribute {
                 name: attr.name,
-                value: attr.value.to_string(),
+                value: String::from(attr.value),
             })
             .collect();
         let element = self.dom.borrow_mut().create_element(name, converted);
@@ -345,7 +346,7 @@ impl TreeSink for Sink {
     }
 
     fn create_comment(&self, text: StrTendril) -> Self::Handle {
-        self.dom.borrow_mut().create_comment(text.to_string())
+        self.dom.borrow_mut().create_comment(text)
     }
 
     /// Per the HTML spec, processing instructions become comments whose data
@@ -384,11 +385,7 @@ impl TreeSink for Sink {
         system_id: StrTendril,
     ) {
         let doc = self.get_document();
-        let doctype = self.dom.borrow_mut().create_doctype(
-            name.to_string(),
-            public_id.to_string(),
-            system_id.to_string(),
-        );
+        let doctype = self.dom.borrow_mut().create_doctype(name, public_id, system_id);
         let _ = self.dom.borrow_mut().append(doc, doctype);
     }
 
@@ -443,7 +440,7 @@ impl TreeSink for Sink {
             .into_iter()
             .map(|attr| DomAttribute {
                 name: attr.name,
-                value: attr.value.to_string(),
+                value: String::from(attr.value),
             })
             .collect();
         let _ = self

@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use crate::id::NodeId;
 use crate::node::{
     Attribute, LocalName, Namespace, Node, NodeKind, Prefix, QualName, html_namespace,
+    html_qualified_name_eq, qualified_name_eq,
 };
 
 /// Next document id for a freshly constructed [`Dom`]. Relaxed arithmetic is
@@ -385,15 +386,18 @@ impl Dom {
     #[must_use]
     pub fn sibling(&self, id: NodeId, forward: bool) -> Option<NodeId> {
         let parent = self.parent(id)?;
-        let kids: Vec<NodeId> = self.children(parent)?.copied().collect();
-        let position = kids.iter().position(|&kid| kid == id)?;
+        let kids = self.children(parent)?;
         if forward {
-            kids.get(position + 1).copied()
+            kids.copied().skip_while(|&kid| kid != id).nth(1)
         } else {
-            position
-                .checked_sub(1)
-                .and_then(|before| kids.get(before))
-                .copied()
+            let mut previous = None;
+            for &kid in kids {
+                if kid == id {
+                    return previous;
+                }
+                previous = Some(kid);
+            }
+            None
         }
     }
 
@@ -1206,7 +1210,7 @@ impl Dom {
         match self.get(id).map(|node| node.kind()) {
             Some(NodeKind::Element { attributes, .. }) => attributes
                 .iter()
-                .map(|attribute| Self::qualified_name(&attribute.name))
+            .map(|attribute| Self::serialize_qualified_name(&attribute.name))
                 .collect(),
             _ => Vec::new(),
         }
@@ -1233,17 +1237,12 @@ impl Dom {
         let NodeKind::Element { name, attributes } = &mut node.kind else {
             return Err(DomError::WrongNodeType);
         };
-        let local = if name.ns == html_namespace() {
-            local.to_ascii_lowercase()
-        } else {
-            local.to_owned()
-        };
         let mut removed = false;
         let mut removed_value = None;
         let mut recorded_name = String::new();
         let mut recorded_namespace = String::new();
         attributes.retain(|attribute| {
-            if !removed && Self::qualified_name(&attribute.name) == local {
+            if !removed && Self::attr_query_eq(&name.ns, &attribute.name, local) {
                 removed = true;
                 removed_value = Some(attribute.value.clone());
                 // `MutationRecord.attributeName` is the attribute's local
@@ -1500,15 +1499,11 @@ impl Dom {
         let NodeKind::Element { name, attributes } = &mut node.kind else {
             return Err(DomError::WrongNodeType);
         };
-        let local = if name.ns == html_namespace() {
-            local.to_ascii_lowercase()
-        } else {
-            local.to_owned()
-        };
+        let html = name.ns == html_namespace();
         let value = value.into();
         let existing = attributes
             .iter()
-            .position(|attribute| Self::qualified_name(&attribute.name) == local);
+            .position(|attribute| Self::attr_query_eq(&name.ns, &attribute.name, local));
         // A matched attribute can carry a namespace even though the query is
         // unnamespaced (`setAttribute("xlink:href", …)` on an SVG element);
         // the record reports the changed attribute's real name and namespace
@@ -1522,6 +1517,11 @@ impl Dom {
                 Some(old_value),
             )
         } else {
+            let local = if html {
+                local.to_ascii_lowercase()
+            } else {
+                local.to_owned()
+            };
             attributes.push(Attribute {
                 name: QualName::new(None, Namespace::from(""), LocalName::from(local.as_str())),
                 value,
@@ -1552,6 +1552,32 @@ impl Dom {
             },
             data.into(),
         )
+    }
+
+    /// Appends `extra` to the text node `id`.
+    ///
+    /// # Errors
+    ///
+    /// - [`DomError::StaleNode`] if `id` is stale.
+    /// - [`DomError::WrongNodeType`] if `id` is not a text node.
+    pub fn append_text(&mut self, id: NodeId, extra: &str) -> Result<(), DomError> {
+        let recording = self.record_mutations && !self.recording_suppressed;
+        let old_value = {
+            let node = self.node_mut(id).ok_or(DomError::StaleNode)?;
+            let NodeKind::Text { data } = &mut node.kind else {
+                return Err(DomError::WrongNodeType);
+            };
+            let old_value = recording.then(|| data.clone());
+            data.push_str(extra);
+            old_value
+        };
+        if let Some(old_value) = old_value {
+            self.record(Mutation::CharacterData {
+                target: id,
+                old_value,
+            });
+        }
+        Ok(())
     }
 
     /// Replaces the data of the comment node `id`.
@@ -1678,10 +1704,18 @@ impl Dom {
     }
 
     /// A qualified name's serialization: `prefix:local` or just `local`.
-    fn qualified_name(name: &QualName) -> String {
+    fn serialize_qualified_name(name: &QualName) -> String {
         match &name.prefix {
             Some(prefix) if !prefix.is_empty() => format!("{prefix}:{}", name.local),
             _ => name.local.to_string(),
+        }
+    }
+
+    fn attr_query_eq(element_ns: &Namespace, name: &QualName, query: &str) -> bool {
+        if *element_ns == html_namespace() {
+            html_qualified_name_eq(name, query)
+        } else {
+            qualified_name_eq(name, query)
         }
     }
 
@@ -1695,14 +1729,9 @@ impl Dom {
         let NodeKind::Element { name, attributes } = self.get(id)?.kind() else {
             return None;
         };
-        let local = if name.ns == html_namespace() {
-            local.to_ascii_lowercase()
-        } else {
-            local.to_owned()
-        };
         attributes
             .iter()
-            .find(|attribute| Self::qualified_name(&attribute.name) == local)
+            .find(|attribute| Self::attr_query_eq(&name.ns, &attribute.name, local))
     }
 
     fn is_html_template_element(&self, id: NodeId) -> bool {
@@ -1813,22 +1842,6 @@ impl Dom {
         let list = self
             .children_mut(parent)
             .expect("verified-live parent has no child list");
-        let (previous, next) = match before {
-            None => (list.last().copied(), None),
-            Some(sibling) => {
-                let position = list
-                    .iter()
-                    .position(|&entry| entry == sibling)
-                    .expect("live sibling missing from its own parent's list");
-                (
-                    position
-                        .checked_sub(1)
-                        .and_then(|index| list.get(index))
-                        .copied(),
-                    Some(sibling),
-                )
-            }
-        };
         let position = match before {
             None => list.len(),
             Some(sibling) => list
@@ -1836,9 +1849,17 @@ impl Dom {
                 .position(|&entry| entry == sibling)
                 .expect("live sibling missing from its own parent's list"),
         };
-        for (offset, id) in moved.iter().enumerate() {
-            list.insert(position + offset, *id);
-        }
+        let (previous, next) = match before {
+            None => (list.last().copied(), None),
+            Some(sibling) => (
+                position
+                    .checked_sub(1)
+                    .and_then(|index| list.get(index))
+                    .copied(),
+                Some(sibling),
+            ),
+        };
+        list.splice(position..position, moved.iter().copied());
         for id in &moved {
             if let Some(node) = self.node_mut(*id) {
                 node.parent = Some(parent);

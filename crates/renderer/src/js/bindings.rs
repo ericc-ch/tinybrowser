@@ -6,7 +6,7 @@ use std::rc::{Rc, Weak};
 
 use dom::{
     DomError, LocalName, Namespace, NodeId, NodeKind, Prefix, QualName, html_namespace,
-    svg_namespace,
+    qualified_name_eq, svg_namespace,
 };
 use rquickjs::{
     Array, Class, Ctx, Exception, FromJs, Function, Object, Persistent, Result, Value,
@@ -847,7 +847,7 @@ impl JsNamedNodeMap {
             };
             parsed.dom.attributes(self.element.0).and_then(|list| {
                 list.iter()
-                    .find(|attribute| qualified_name(&attribute.name) == name)
+                    .find(|attribute| qualified_name_eq(&attribute.name, &name))
                     .map(|attribute| {
                         (
                             attribute.name.ns.to_string(),
@@ -921,7 +921,7 @@ fn named_item<'js>(ctx: &Ctx<'js>, element: NodeId, name: &str) -> Result<Value<
         };
         parsed.dom.attributes(element).and_then(|list| {
             list.iter()
-                .find(|attribute| qualified_name(&attribute.name) == name)
+                .find(|attribute| qualified_name_eq(&attribute.name, &name))
                 .map(|attribute| {
                     (
                         attribute.name.ns.to_string(),
@@ -6998,9 +6998,9 @@ fn collect_by_tag(dom: &dom::Dom, scope: NodeId, name: &str) -> Vec<NodeId> {
     while let Some(id) = stack.pop() {
         if let Some(NodeKind::Element { name: qual, .. }) = dom.get(id).map(|node| node.kind()) {
             let matches = if qual.ns == html_namespace() {
-                qualified_name(qual) == lowered
+                qualified_name_eq(qual, &lowered)
             } else {
-                qualified_name(qual) == name
+                qualified_name_eq(qual, name)
             };
             if name == "*" || matches {
                 out.push(id);
