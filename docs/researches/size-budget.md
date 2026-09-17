@@ -102,3 +102,33 @@ fixed shared-library cost is accepted.
   costs in the rejected table. Product decisions, not free size.
 - Probe marginals belong here. Shipping binary size belongs in
   `docs/progress.md`.
+
+## Screenshot render stack (2026-09-18)
+
+Screenshots are always in: the shipping binary carries the render pipeline.
+The Blitz measurement above stands (lean layout alone was ~10.8 MB before
+paint), so the shipped shape is an in-tree CSS subset instead of an
+integrated engine: `crates/render` parses and cascades CSS, lays out block,
+inline, and flex formatting, paints with `tiny-skia`, rasterizes text with
+`fontdue`, and encodes PNG with `png`.
+
+Probe deltas on an empty binary with the tuned profile (rustc 1.98.1,
+x86_64-unknown-linux-gnu, lld `--icf=all`):
+
+| Crate | Stripped delta |
+| --- | ---: |
+| tiny-skia 0.12 | +213,360 |
+| fontdue 0.9 | +120,504 |
+| png 0.17 | +86,008 |
+| all three together | +393,880 |
+
+Shipping delta: 5,988,848 -> 6,600,448 bytes (+611,600), which includes the
+embedded subset faces (Liberation Sans Regular 29,680 + Bold 29,896 bytes,
+OFL-1.1, `crates/render/assets/OFL.txt`) and the crate's own style, layout,
+paint, and PNG code.
+
+Selector matching reuses `dom`'s pinned `selectors`/`cssparser` stack through
+a compile-once API (`Dom::compile_selectors`), so the cascade adds no second
+selector version. Deliberately not shipped: fontconfig/system fonts (one
+embedded subset instead), and any Blitz, Stylo, Taffy, Parley, or
+vello/anyrender dependency.
