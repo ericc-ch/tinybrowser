@@ -1241,7 +1241,7 @@ globalThis.MessageEvent = class MessageEvent extends Event {
     super(String(type), eventInit);
     Object.defineProperty(this, __tbMessageEventData, {
       value: {
-        data: eventInit.data === undefined ? null : eventInit.data,
+        data: Object.prototype.hasOwnProperty.call(eventInit, 'data') ? eventInit.data : null,
         origin: eventInit.origin === undefined ? '' : String(eventInit.origin),
         lastEventId: eventInit.lastEventId === undefined ? '' : String(eventInit.lastEventId),
         source: eventInit.source === undefined ? null : eventInit.source,
@@ -1482,23 +1482,6 @@ globalThis.postMessage = function(message, targetOrigin, transfer) {
     }));
   }, 0);
 };
-// Event handler IDL attributes for the window's messaging events. The setter
-// replaces the previous listener, as an event handler attribute does; the
-// return-value and `this` semantics of event handlers are not modeled yet.
-['message', 'messageerror'].forEach(function(type) {
-  const slot = Symbol.for('tinybrowser.window.handler.' + type);
-  Object.defineProperty(globalThis, 'on' + type, {
-    get() { return this[slot] === undefined ? null : this[slot]; },
-    set(value) {
-      const previous = this[slot];
-      if (previous !== undefined && previous !== null) this.removeEventListener(type, previous);
-      this[slot] = value === undefined || value === null ? null : value;
-      if (this[slot] !== null) this.addEventListener(type, this[slot]);
-    },
-    configurable: true,
-    enumerable: true,
-  });
-});
 ";
 
 /// A value produced by script evaluation.
