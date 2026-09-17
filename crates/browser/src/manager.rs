@@ -81,9 +81,8 @@ impl RendererProcessManager {
         let process = if let Some(spare) = state.spare.take() {
             spare.bind(site)?;
             spare
-        } else if let Ok(slot) = Arc::clone(&self.inner.slots).try_acquire_owned() {
-            let id = RendererId(self.inner.next.fetch_add(1, Ordering::Relaxed));
-            Arc::new(spawn_process(id, Some(site.clone()), self.inner.fetch.clone(), slot).await?)
+        } else if let Some(process) = spawn_slot(&self.inner, Some(site.clone())).await? {
+            process
         } else {
             let candidates = state.sites.entry(site.clone()).or_default();
             candidates.retain(|candidate| {
@@ -158,14 +157,10 @@ impl RendererProcessManager {
                 }
                 state.spawning_spare = true;
             }
-            let result = match Arc::clone(&inner.slots).try_acquire_owned() {
-                Ok(slot) => {
-                    let id = RendererId(inner.next.fetch_add(1, Ordering::Relaxed));
-                    spawn_process(id, None, inner.fetch.clone(), slot)
-                        .await
-                        .map(Arc::new)
-                }
-                Err(_) => Err(io::Error::other("renderer process budget exhausted")),
+            let result = match spawn_slot(&inner, None).await {
+                Ok(Some(spare)) => Ok(spare),
+                Ok(None) => Err(io::Error::other("renderer process budget exhausted")),
+                Err(error) => Err(error),
             };
             let mut state = inner.state.lock().await;
             state.spawning_spare = false;
@@ -174,6 +169,23 @@ impl RendererProcessManager {
             }
         });
     }
+}
+
+/// Takes one slot from the process budget and spawns a renderer into it.
+///
+/// `Ok(None)` means the budget is exhausted; the caller decides whether to
+/// reuse a live process or fail.
+async fn spawn_slot(
+    inner: &Arc<ManagerInner>,
+    site: Option<Site>,
+) -> io::Result<Option<Arc<RendererHandle>>> {
+    let Ok(slot) = Arc::clone(&inner.slots).try_acquire_owned() else {
+        return Ok(None);
+    };
+    let id = RendererId(inner.next.fetch_add(1, Ordering::Relaxed));
+    Ok(Some(Arc::new(
+        spawn_process(id, site, inner.fetch.clone(), slot).await?,
+    )))
 }
 
 fn renderer_process_limit() -> usize {

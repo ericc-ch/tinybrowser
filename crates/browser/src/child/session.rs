@@ -56,10 +56,6 @@ pub(super) async fn run(
                 }
                 Some(RendererInput::Control(ToRenderer::Request { id, assignment, command })) => {
                     let Some(engine) = engines.get_mut(&assignment) else {
-                        if matches!(command, Command::Shutdown) {
-                            stop.request();
-                            break;
-                        }
                         stop.request();
                         break;
                     };
@@ -201,17 +197,13 @@ impl ResponseStreams {
         id: u64,
         engines: &mut HashMap<RendererAssignmentId, Engine>,
     ) -> (RendererAssignmentId, Result<(), TabError>) {
-        let Some(response) = self.0.remove(&id) else {
-            return (
-                RendererAssignmentId::new(0),
-                Err(stream_error("response end without start")),
-            );
+        let response = match self.take(id, "response end without start") {
+            Ok(response) => response,
+            Err((assignment, error)) => return (assignment, Err(error)),
         };
         let assignment = response.assignment;
-        let result = engines
-            .get_mut(&assignment)
-            .ok_or_else(|| stream_error("response assignment is gone"))
-            .and_then(|engine| engine.end_body(response.frame));
+        let result =
+            engine_mut(engines, assignment).and_then(|engine| engine.end_body(response.frame));
         (assignment, result)
     }
 
@@ -221,15 +213,13 @@ impl ResponseStreams {
         failure: DialFailure,
         engines: &mut HashMap<RendererAssignmentId, Engine>,
     ) -> (RendererAssignmentId, Result<(), TabError>) {
-        let Some(response) = self.0.remove(&id) else {
-            return (
-                RendererAssignmentId::new(0),
-                Err(stream_error("response error without start")),
-            );
+        let response = match self.take(id, "response error without start") {
+            Ok(response) => response,
+            Err((assignment, error)) => return (assignment, Err(error)),
         };
         // Stop the frame's parser, or it waits for bytes that will never come
         // and the tab stays loading forever.
-        if let Some(engine) = engines.get_mut(&response.assignment) {
+        if let Ok(engine) = engine_mut(engines, response.assignment) {
             let _ = engine.abort_body(response.frame);
         }
         (
@@ -240,10 +230,31 @@ impl ResponseStreams {
         )
     }
 
+    /// Removes the stream for `id`, defaulting the assignment when the browser
+    /// sent no matching start.
+    fn take(
+        &mut self,
+        id: u64,
+        missing_start: &str,
+    ) -> Result<ActiveResponse, (RendererAssignmentId, TabError)> {
+        self.0
+            .remove(&id)
+            .ok_or_else(|| (RendererAssignmentId::new(0), stream_error(missing_start)))
+    }
+
     fn release(&mut self, assignment: RendererAssignmentId) {
         self.0
             .retain(|_, response| response.assignment != assignment);
     }
+}
+
+fn engine_mut(
+    engines: &mut HashMap<RendererAssignmentId, Engine>,
+    assignment: RendererAssignmentId,
+) -> Result<&mut Engine, TabError> {
+    engines
+        .get_mut(&assignment)
+        .ok_or_else(|| stream_error("response assignment is gone"))
 }
 
 fn stream_error(message: &str) -> TabError {

@@ -12,7 +12,7 @@ use url::Url;
 use crate::actor::{TabHandle, TabId, TabTask};
 use crate::manager::RendererProcessManager;
 use crate::network::NetworkSession;
-use crate::profile::{Profile, ProfileName};
+use crate::profile::Profile;
 use crate::store::ProfileStore;
 
 const BROWSER_COMMAND_CAPACITY: usize = 256;
@@ -29,7 +29,6 @@ pub struct Browser {
 /// Async value-only handle protocols use to drive [`Browser`].
 #[derive(Clone)]
 pub struct BrowserHandle {
-    profile: Profile,
     tx: mpsc::Sender<Command>,
 }
 
@@ -77,16 +76,6 @@ struct BrowserState {
 }
 
 impl Browser {
-    /// Opens a browser on `profile` with cookies under the process XDG data
-    /// home and renderer processes.
-    ///
-    /// # Errors
-    ///
-    /// Both `XDG_DATA_HOME` and `HOME` are unset or empty.
-    pub fn open(profile: &Profile) -> io::Result<Self> {
-        Self::open_in(&ProfileStore::data_home()?, profile)
-    }
-
     /// Opens a browser on `profile` with cookies under `data_home` and
     /// renderer processes.
     ///
@@ -110,7 +99,6 @@ impl Browser {
     pub fn open_with_network(network: NetworkSession) -> io::Result<Self> {
         let runtime = tokio::runtime::Handle::try_current()
             .map_err(|error| io::Error::other(format!("browser runtime unavailable: {error}")))?;
-        let profile = Profile::named(network.profile_name());
         let renderers = Arc::new(RendererProcessManager::new(network.fetch_handle()));
         let state = BrowserState {
             live: true,
@@ -122,7 +110,7 @@ impl Browser {
         let (tx, rx) = mpsc::channel(BROWSER_COMMAND_CAPACITY);
         runtime.spawn(browser_loop(rx, state));
         Ok(Self {
-            handle: BrowserHandle { profile, tx },
+            handle: BrowserHandle { tx },
         })
     }
 
@@ -130,12 +118,6 @@ impl Browser {
     #[must_use]
     pub fn handle(&self) -> BrowserHandle {
         self.handle.clone()
-    }
-
-    /// Profile this browser is bound to.
-    #[must_use]
-    pub fn profile_name(&self) -> ProfileName {
-        self.handle.profile_name()
     }
 }
 
@@ -146,18 +128,6 @@ impl Drop for Browser {
 }
 
 impl BrowserHandle {
-    /// Profile this browser is bound to.
-    #[must_use]
-    pub fn profile(&self) -> Profile {
-        self.profile.clone()
-    }
-
-    /// Profile name, same as [`BrowserHandle::profile`].
-    #[must_use]
-    pub fn profile_name(&self) -> ProfileName {
-        self.profile.name().clone()
-    }
-
     /// Starts a tab coordinator and returns its handle.
     ///
     /// # Errors

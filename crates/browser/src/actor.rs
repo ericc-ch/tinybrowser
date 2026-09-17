@@ -59,10 +59,6 @@ enum Command {
         url: String,
         reply: oneshot::Sender<Result<(), TabError>>,
     },
-    Eval {
-        source: String,
-        reply: oneshot::Sender<Result<String, TabError>>,
-    },
     Execute {
         source: String,
         timeout: Option<Duration>,
@@ -91,16 +87,12 @@ enum Command {
     },
 }
 
-enum Waiter {
-    LoadTimeout {
-        deadline: Instant,
-        reply: oneshot::Sender<Result<bool, TabError>>,
-    },
-    JsTrue {
-        source: String,
-        deadline: Instant,
-        reply: oneshot::Sender<Result<bool, TabError>>,
-    },
+/// One pending `RunUntilLoadTimeout` (`source` is `None`) or `RunUntilJsTrue`
+/// (`source` holds the predicate) wait.
+struct Waiter {
+    deadline: Instant,
+    source: Option<String>,
+    reply: oneshot::Sender<Result<bool, TabError>>,
 }
 
 /// Async value-only handle to one tab coordinator.
@@ -142,21 +134,6 @@ impl TabHandle {
         let (reply, rx) = oneshot::channel();
         self.send(Command::Goto {
             url: url.to_owned(),
-            reply,
-        })
-        .await?;
-        recv_result(rx).await
-    }
-
-    /// Evaluates `source` and returns its string coercion.
-    ///
-    /// # Errors
-    ///
-    /// [`TabError::Script`] or [`TabError::ActorStopped`].
-    pub async fn eval(&self, source: &str) -> Result<String, TabError> {
-        let (reply, rx) = oneshot::channel();
-        self.send(Command::Eval {
-            source: source.to_owned(),
             reply,
         })
         .await?;
@@ -258,11 +235,11 @@ impl TabHandle {
         rx.await.map_err(|_| TabError::ActorStopped)
     }
 
-    /// Kills the renderer to break a blocked script, but only when this tab is
-    /// the process's last assignment. Over the soft process budget a renderer
-    /// can host several same-site assignments; killing it for one tab would
-    /// take the others down. A shared process whose script is wedged is
-    /// recovered by the process budget and renderer failure paths instead.
+    /// Queues one command for the coordinator task.
+    ///
+    /// # Errors
+    ///
+    /// [`TabError::ActorStopped`] when the coordinator has stopped.
     async fn send(&self, command: Command) -> Result<(), TabError> {
         self.tx
             .send(command)
@@ -342,10 +319,10 @@ struct Tab {
     events_rx: Option<mpsc::Receiver<(FrameId, TabEvent)>>,
     document_url: Url,
     document_loaded: bool,
-    nav_epoch: u64,
-    nav_in_flight: Option<u64>,
     navigation_failed: bool,
     nav: Option<ActiveNavigation>,
+    /// Monotonic per tab, never derived from `nav`: see `goto`.
+    nav_epoch: u64,
     dial_tx: mpsc::UnboundedSender<(u64, Result<NavOutcome, DialFailure>)>,
     dial_rx: mpsc::UnboundedReceiver<(u64, Result<NavOutcome, DialFailure>)>,
     dial_cancel: Option<watch::Sender<bool>>,
@@ -366,10 +343,9 @@ impl Tab {
             events_rx: None,
             document_url: Url::parse("about:blank").expect("about:blank is a valid URL"),
             document_loaded: false,
-            nav_epoch: 0,
-            nav_in_flight: None,
             navigation_failed: false,
             nav: None,
+            nav_epoch: 0,
             dial_tx,
             dial_rx,
             dial_cancel: None,
@@ -399,13 +375,18 @@ impl Tab {
 
     fn goto(&mut self, spec: &str) -> Result<(), TabError> {
         let url = self.resolve_url(spec)?;
+        // Monotonic across the tab's life, never derived from the live
+        // navigation: `cancel_dial`'s abort is not a barrier, so a cancelled
+        // dial's completion can still be enqueued after its successor
+        // completes. A reused epoch would let that stale completion alias the
+        // new navigation.
         self.nav_epoch = self.nav_epoch.saturating_add(1);
+        let epoch = self.nav_epoch;
         self.navigation_failed = false;
-        self.nav_in_flight = None;
         self.nav = Some(ActiveNavigation {
             url,
             initiator: self.document_url.clone(),
-            epoch: self.nav_epoch,
+            epoch,
             submitted: false,
         });
         Ok(())
@@ -541,7 +522,6 @@ impl Tab {
         self.dial_guard = Some(guard);
         if let Some(nav) = self.nav.as_mut() {
             nav.submitted = true;
-            self.nav_in_flight = Some(epoch);
         }
     }
 
@@ -556,9 +536,6 @@ impl Tab {
     }
 
     async fn handle_navigation(&mut self, epoch: u64, result: Result<NavOutcome, DialFailure>) {
-        if self.nav_in_flight == Some(epoch) {
-            self.nav_in_flight = None;
-        }
         let active = self.nav.as_ref().is_some_and(|nav| nav.epoch == epoch);
         if !active {
             return;
@@ -706,12 +683,7 @@ async fn wait_for_deadline(deadline: Option<Instant>) {
 }
 
 fn next_waiter_deadline(waiters: &[Waiter]) -> Option<Instant> {
-    waiters
-        .iter()
-        .map(|waiter| match waiter {
-            Waiter::LoadTimeout { deadline, .. } | Waiter::JsTrue { deadline, .. } => *deadline,
-        })
-        .min()
+    waiters.iter().map(|waiter| waiter.deadline).min()
 }
 
 /// Handles one command. `true` means the coordinator returns.
@@ -722,16 +694,6 @@ async fn handle_command(tab: &mut Tab, command: Command, waiters: &mut Vec<Waite
         }
         Command::Goto { url, reply } => {
             let _result = reply.send(tab.goto(&url));
-        }
-        Command::Eval { source, reply } => {
-            let result = tab
-                .renderer_request(RendererCommand::Eval {
-                    frame: FrameId::MAIN,
-                    source,
-                })
-                .await
-                .and_then(reply_text);
-            let _result = reply.send(result);
         }
         Command::Execute {
             source,
@@ -751,8 +713,9 @@ async fn handle_command(tab: &mut Tab, command: Command, waiters: &mut Vec<Waite
         Command::RunUntilLoadTimeout { timeout, reply } => {
             retain_waiter(
                 waiters,
-                Waiter::LoadTimeout {
+                Waiter {
                     deadline: Instant::now() + timeout,
+                    source: None,
                     reply,
                 },
             );
@@ -764,9 +727,9 @@ async fn handle_command(tab: &mut Tab, command: Command, waiters: &mut Vec<Waite
         } => {
             retain_waiter(
                 waiters,
-                Waiter::JsTrue {
-                    source,
+                Waiter {
                     deadline: Instant::now() + timeout,
+                    source: Some(source),
                     reply,
                 },
             );
@@ -805,20 +768,12 @@ fn retain_waiter(waiters: &mut Vec<Waiter>, waiter: Waiter) {
     let error = TabError::ResourceLimit {
         resource: ResourceLimit::TabWaiters,
     };
-    match waiter {
-        Waiter::LoadTimeout { reply, .. } | Waiter::JsTrue { reply, .. } => {
-            let _result = reply.send(Err(error));
-        }
-    }
+    let _result = waiter.reply.send(Err(error));
 }
 
 fn fail_waiters(waiters: &mut Vec<Waiter>, error: &TabError) {
     for waiter in waiters.drain(..) {
-        match waiter {
-            Waiter::LoadTimeout { reply, .. } | Waiter::JsTrue { reply, .. } => {
-                let _result = reply.send(Err(error.clone()));
-            }
-        }
+        let _result = waiter.reply.send(Err(error.clone()));
     }
 }
 
@@ -826,39 +781,33 @@ async fn resolve_waiters(tab: &mut Tab, waiters: &mut Vec<Waiter>) {
     let now = Instant::now();
     let mut pending = Vec::new();
     for waiter in std::mem::take(waiters) {
-        match waiter {
-            Waiter::LoadTimeout { reply, .. } if !tab.waiting_for_load() => {
-                let _result = reply.send(Ok(true));
+        match waiter.source.clone() {
+            // A load wait finishes as soon as the tab stops waiting, before
+            // its deadline is considered.
+            None if !tab.waiting_for_load() => {
+                let _result = waiter.reply.send(Ok(true));
             }
-            Waiter::LoadTimeout { deadline, reply } if now >= deadline => {
-                let _result = reply.send(Ok(false));
+            None if now >= waiter.deadline => {
+                let _result = waiter.reply.send(Ok(false));
             }
-            Waiter::JsTrue {
-                source,
-                deadline,
-                reply,
-            } => {
-                if now >= deadline {
-                    let _result = reply.send(Ok(false));
+            None => pending.push(waiter),
+            Some(source) => {
+                if now >= waiter.deadline {
+                    let _result = waiter.reply.send(Ok(false));
                 } else if matches!(
                     tab.renderer_request(RendererCommand::ExecuteScript {
                         frame: FrameId::MAIN,
-                        source: source.clone(),
+                        source,
                         timeout_ms: None
                     })
                     .await,
                     Ok(Reply::Value(Ok(RemoteValue::Bool(true))))
                 ) {
-                    let _result = reply.send(Ok(true));
+                    let _result = waiter.reply.send(Ok(true));
                 } else {
-                    pending.push(Waiter::JsTrue {
-                        source,
-                        deadline,
-                        reply,
-                    });
+                    pending.push(waiter);
                 }
             }
-            other @ Waiter::LoadTimeout { .. } => pending.push(other),
         }
     }
     *waiters = pending;
@@ -873,13 +822,6 @@ fn renderer_unavailable(message: &str) -> TabError {
 fn reply_unit(reply: Reply) -> Result<(), TabError> {
     match reply {
         Reply::Unit(result) => result,
-        _ => Err(TabError::ActorStopped),
-    }
-}
-
-fn reply_text(reply: Reply) -> Result<String, TabError> {
-    match reply {
-        Reply::Text(result) => result,
         _ => Err(TabError::ActorStopped),
     }
 }

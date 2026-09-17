@@ -13,14 +13,13 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use net::{Agent, CookieRecord, CookieSameSite};
 
-use crate::profile::{Profile, ProfileName};
+use crate::profile::Profile;
 
 const COOKIES_VERSION: &str = "tinybrowser-cookies-v1";
 static COOKIE_TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// Durable backing for one Profile under `XDG_DATA_HOME`.
 pub struct ProfileStore {
-    name: ProfileName,
     root: PathBuf,
     _lock: File,
     disk: Mutex<()>,
@@ -46,15 +45,6 @@ impl ProfileStore {
         ))
     }
 
-    /// Opens the on-disk store for `profile` under the process XDG data home.
-    ///
-    /// # Errors
-    ///
-    /// Both `XDG_DATA_HOME` and `HOME` are unset or empty.
-    pub fn open(profile: &Profile) -> io::Result<Self> {
-        Self::open_in(&Self::data_home()?, profile)
-    }
-
     /// Opens and exclusively locks the on-disk store for `profile` under `data_home`.
     ///
     /// # Errors
@@ -66,7 +56,7 @@ impl ProfileStore {
             .join("profiles")
             .join(profile.name().as_str());
         fs::create_dir_all(&root)?;
-        restrict_dir(&root)?;
+        restrict(&root, 0o700)?;
         let lock = OpenOptions::new()
             .read(true)
             .write(true)
@@ -75,7 +65,6 @@ impl ProfileStore {
             .open(root.join("lock"))?;
         lock.try_lock().map_err(io::Error::from)?;
         Ok(Self {
-            name: profile.name().clone(),
             root,
             _lock: lock,
             disk: Mutex::new(()),
@@ -120,18 +109,18 @@ impl ProfileStore {
             return Ok(());
         }
         fs::create_dir_all(dir)?;
-        restrict_dir(dir)?;
+        restrict(dir, 0o700)?;
         let path = dir.join("cookies");
         let seq = COOKIE_TMP_SEQ.fetch_add(1, Ordering::Relaxed);
         let tmp = dir.join(format!("cookies.{}.{seq}.tmp", std::process::id()));
         let encoded = encode_cookies(&agent.export_cookies());
         let write_result = (|| {
             let mut file = OpenOptions::new().write(true).create_new(true).open(&tmp)?;
-            restrict_file(&tmp)?;
+            restrict(&tmp, 0o600)?;
             file.write_all(encoded.as_bytes())?;
             file.sync_all()?;
             fs::rename(&tmp, &path)?;
-            restrict_file(&path)?;
+            restrict(&path, 0o600)?;
             File::open(dir)?.sync_all()?;
             Ok(())
         })();
@@ -152,36 +141,18 @@ impl ProfileStore {
     fn cookies_path(&self) -> PathBuf {
         self.root.join("cookies")
     }
-
-    /// Profile this store belongs to.
-    #[must_use]
-    pub fn profile_name(&self) -> &ProfileName {
-        &self.name
-    }
 }
 
-fn restrict_dir(path: &Path) -> io::Result<()> {
+/// Restricts `path` to `mode` on Unix; a no-op elsewhere.
+fn restrict(path: &Path, mode: u32) -> io::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+        fs::set_permissions(path, fs::Permissions::from_mode(mode))?;
     }
     #[cfg(not(unix))]
     {
-        let _ = path;
-    }
-    Ok(())
-}
-
-fn restrict_file(path: &Path) -> io::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = path;
+        let _ = (path, mode);
     }
     Ok(())
 }

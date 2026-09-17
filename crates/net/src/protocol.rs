@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::fmt;
 
 #[must_use]
@@ -120,34 +121,22 @@ impl HeaderMap {
 #[error("invalid HTTP method: {0:?}")]
 pub struct InvalidMethod(Box<str>);
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-enum Token {
-    Get,
-    Head,
-    Post,
-    Put,
-    Delete,
-    Options,
-    Patch,
-    Extension(Box<str>),
-}
-
 /// HTTP request method.
 ///
 /// `GET`, `HEAD`, `POST`, `PUT`, `DELETE`, and `OPTIONS` are stored in
 /// canonical uppercase. `PATCH` stays uppercase only when the input was already
 /// `PATCH`. Any other valid token is kept as typed.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct Method(Token);
+pub struct Method(Cow<'static, str>);
 
 impl Method {
-    pub const GET: Self = Self(Token::Get);
-    pub const HEAD: Self = Self(Token::Head);
-    pub const POST: Self = Self(Token::Post);
-    pub const PUT: Self = Self(Token::Put);
-    pub const DELETE: Self = Self(Token::Delete);
-    pub const OPTIONS: Self = Self(Token::Options);
-    pub const PATCH: Self = Self(Token::Patch);
+    pub const GET: Self = Self(Cow::Borrowed("GET"));
+    pub const HEAD: Self = Self(Cow::Borrowed("HEAD"));
+    pub const POST: Self = Self(Cow::Borrowed("POST"));
+    pub const PUT: Self = Self(Cow::Borrowed("PUT"));
+    pub const DELETE: Self = Self(Cow::Borrowed("DELETE"));
+    pub const OPTIONS: Self = Self(Cow::Borrowed("OPTIONS"));
+    pub const PATCH: Self = Self(Cow::Borrowed("PATCH"));
 
     /// Parses an HTTP method token per [Fetch methods](https://fetch.spec.whatwg.org/#methods).
     ///
@@ -160,14 +149,14 @@ impl Method {
         }
         let uppercased = token.to_ascii_uppercase();
         let stored = match uppercased.as_str() {
-            "GET" => Token::Get,
-            "HEAD" => Token::Head,
-            "POST" => Token::Post,
-            "PUT" => Token::Put,
-            "DELETE" => Token::Delete,
-            "OPTIONS" => Token::Options,
-            "PATCH" if uppercased == token => Token::Patch,
-            _ => Token::Extension(token.into()),
+            "GET" => Cow::Borrowed("GET"),
+            "HEAD" => Cow::Borrowed("HEAD"),
+            "POST" => Cow::Borrowed("POST"),
+            "PUT" => Cow::Borrowed("PUT"),
+            "DELETE" => Cow::Borrowed("DELETE"),
+            "OPTIONS" => Cow::Borrowed("OPTIONS"),
+            "PATCH" if uppercased == token => Cow::Borrowed("PATCH"),
+            _ => Cow::Owned(token.to_owned()),
         };
         Ok(Self(stored))
     }
@@ -175,22 +164,13 @@ impl Method {
     /// Whether this is `GET`, `HEAD`, or `OPTIONS`.
     #[must_use]
     pub fn is_safe(&self) -> bool {
-        matches!(self.0, Token::Get | Token::Head | Token::Options)
+        matches!(self.0.as_ref(), "GET" | "HEAD" | "OPTIONS")
     }
 
     /// Wire spelling of this method.
     #[must_use]
     pub fn as_str(&self) -> &str {
-        match &self.0 {
-            Token::Get => "GET",
-            Token::Head => "HEAD",
-            Token::Post => "POST",
-            Token::Put => "PUT",
-            Token::Delete => "DELETE",
-            Token::Options => "OPTIONS",
-            Token::Patch => "PATCH",
-            Token::Extension(ext) => ext,
-        }
+        &self.0
     }
 }
 

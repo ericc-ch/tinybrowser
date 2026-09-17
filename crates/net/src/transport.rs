@@ -29,7 +29,7 @@ use url::Url;
 
 use crate::error::{NetError, ProtocolError, TimeoutKind, TransportError};
 use crate::protocol::{HeaderMap, Method};
-use crate::resolve::{HostMap, Mapped, ResolveFailure};
+use crate::resolve::{HostMap, ResolveFailure, Target};
 
 /// Absolute deadlines for one `send` / `upgrade` call.
 ///
@@ -109,11 +109,11 @@ impl Service<Name> for HostResolver {
 
     fn call(&mut self, name: Name) -> Self::Future {
         match self.host_map.lookup(name.as_str()) {
-            Some(Mapped::Addr(ip)) => Box::pin(async move {
+            Some(Target::Addr(ip)) => Box::pin(async move {
                 // The connector replaces port zero with the URI's port.
                 Ok(vec![SocketAddr::new(ip.into(), 0)].into_iter())
             }),
-            Some(Mapped::Fail) => Box::pin(async move { Err(ResolveFailure::Denied) }),
+            Some(Target::Fail) => Box::pin(async move { Err(ResolveFailure::Denied) }),
             None => {
                 let mut system = self.system.clone();
                 Box::pin(async move {
@@ -161,6 +161,27 @@ pub(crate) struct HttpEngine {
 
 type ProxiedClient = Client<HttpsConnector<Tunnel<HttpConnector<HostResolver>>>, RequestBody>;
 
+/// `native-tls` connector trusting `cas`, offering `alpns` in order.
+///
+/// ALPN is configured here, not by `hyper-tls`: its `alpn` feature only reports
+/// the protocol the server picked. OpenSSL initialization failure is
+/// unrecoverable for TLS in this process, and `hyper-tls`'s own constructors
+/// panic on it for the same reason.
+fn tls_connector(
+    cas: &[native_tls::Certificate],
+    alpns: &[&str],
+) -> tokio_native_tls::TlsConnector {
+    let mut tls = native_tls::TlsConnector::builder();
+    for ca in cas {
+        tls.add_root_certificate(ca.clone());
+    }
+    let tls = tls
+        .request_alpns(alpns)
+        .build()
+        .expect("openssl tls connector");
+    tokio_native_tls::TlsConnector::from(tls)
+}
+
 impl HttpEngine {
     pub(crate) fn new(
         timeout_global: Option<Duration>,
@@ -177,19 +198,7 @@ impl HttpEngine {
         // Eyeballs (300 ms default) when a name returns multiple addresses.
         let mut http = HttpConnector::new_with_resolver(resolver);
         http.enforce_http(false);
-        // ALPN is configured here, not by `hyper-tls`: its `alpn` feature only
-        // reports the protocol the server picked. OpenSSL initialization
-        // failure is unrecoverable for TLS in this process, and hyper-tls's
-        // own constructors panic on it for the same reason.
-        let mut tls = native_tls::TlsConnector::builder();
-        for ca in tls_cas {
-            tls.add_root_certificate(ca.clone());
-        }
-        let tls = tls
-            .request_alpns(&["h2", "http/1.1"])
-            .build()
-            .expect("openssl tls connector");
-        let tls = tokio_native_tls::TlsConnector::from(tls);
+        let tls = tls_connector(tls_cas, &["h2", "http/1.1"]);
         let connector = HttpsConnector::from((http.clone(), tls.clone()));
         let client = Client::builder(TokioExecutor::new()).build(connector);
         let proxied = proxy.as_deref().and_then(|proxy| {
@@ -198,19 +207,12 @@ impl HttpEngine {
             if let Some(auth) = auth {
                 tunnel = tunnel.with_auth(auth);
             }
-            let connector = HttpsConnector::from((tunnel, tls));
+            let connector = HttpsConnector::from((tunnel, tls.clone()));
             Some(Client::builder(TokioExecutor::new()).build(connector))
         });
         // WebSocket upgrades are HTTP/1.1 only: asking for h2 here would let a
         // server negotiate a protocol tungstenite cannot speak.
-        let mut ws_tls = native_tls::TlsConnector::builder();
-        for ca in tls_cas {
-            ws_tls.add_root_certificate(ca.clone());
-        }
-        let ws_tls = ws_tls
-            .request_alpns(&["http/1.1"])
-            .build()
-            .expect("openssl tls connector");
+        let ws_tls = tls_connector(tls_cas, &["http/1.1"]);
         Self {
             client,
             proxy,
@@ -218,7 +220,7 @@ impl HttpEngine {
             timeout_per_call,
             proxied,
             http,
-            ws_tls: tokio_native_tls::TlsConnector::from(ws_tls),
+            ws_tls,
         }
     }
 
@@ -341,31 +343,33 @@ impl HttpEngine {
             Some(proxied) => proxied.request(request),
             None => self.client.request(request),
         };
-        let response = match wait_for(budget, request_future).await {
+        let response = match within(budget, TimeoutKind::Global, request_future).await {
             Ok(Ok(response)) => response,
             Ok(Err(error)) => return Err(map_client_error(error, &host)),
             Err(error) => return Err(error),
         };
-        let status = response.status().as_u16();
         let mut mapped = HeaderMap::new();
         for (name, value) in response.headers() {
             mapped
                 .insert(name.as_str(), value.as_bytes())
                 .map_err(|_| NetError::Protocol(ProtocolError::UnrepresentableHeader))?;
         }
-        let _ = status;
         Ok((response.status().as_u16(), mapped, response.into_body()))
     }
 }
 
-/// Awaits `future` under the call deadline.
-async fn wait_for<T>(budget: CallBudget, future: impl Future<Output = T>) -> Result<T, NetError> {
+/// Awaits `future` under the call deadline. `fallback` names the phase when
+/// neither the global nor the per-call deadline is the one that expired.
+pub(crate) async fn within<T>(
+    budget: CallBudget,
+    fallback: TimeoutKind,
+    future: impl Future<Output = T>,
+) -> Result<T, NetError> {
     match budget.deadline() {
         Some(deadline) => {
-            let deadline = tokio::time::Instant::from_std(deadline);
-            match tokio::time::timeout_at(deadline, future).await {
+            match tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), future).await {
                 Ok(value) => Ok(value),
-                Err(_) => Err(timed_out(budget.timeout_kind(TimeoutKind::Global))),
+                Err(_) => Err(timed_out(budget.timeout_kind(fallback))),
             }
         }
         None => Ok(future.await),

@@ -68,11 +68,8 @@ async fn serve_async() -> io::Result<thread::JoinHandle<io::Result<()>>> {
         if result.is_err() {
             writer_stop.request();
             writer_wake.notify_one();
-            let _ = writer_commands.try_send(RendererInput::Control(ToRenderer::Request {
-                id: 0,
-                assignment: RendererAssignmentId::new(0),
-                command: Command::Shutdown,
-            }));
+            let shutdown = RendererInput::Control(ToRenderer::shutdown_request());
+            let _ = writer_commands.try_send(shutdown);
         }
         result
     });
@@ -153,21 +150,33 @@ fn read_messages(
                 break;
             }
         };
+        if !greeted {
+            match message {
+                ToRenderer::Hello => {
+                    greeted = true;
+                    continue;
+                }
+                ToRenderer::ServiceReply { id, reply } => {
+                    services.deliver(id, reply);
+                    continue;
+                }
+                ToRenderer::Assign { .. }
+                | ToRenderer::Release { .. }
+                | ToRenderer::Request { .. } => {
+                    logging::error!(target: "renderer::ipc", "request before handshake");
+                    break;
+                }
+                ToRenderer::ResponseStart { .. }
+                | ToRenderer::ResponseEnd { .. }
+                | ToRenderer::ResponseError { .. } => {
+                    logging::error!(target: "renderer::ipc", "response before handshake");
+                    break;
+                }
+            }
+        }
         match message {
-            ToRenderer::Hello if !greeted => greeted = true,
             ToRenderer::Hello => {
                 logging::error!(target: "renderer::ipc", "duplicate handshake");
-                break;
-            }
-            ToRenderer::Assign { .. }
-            | ToRenderer::Release { .. }
-            | ToRenderer::Request { .. }
-            | ToRenderer::ResponseStart { .. }
-            | ToRenderer::ResponseEnd { .. }
-            | ToRenderer::ResponseError { .. }
-                if !greeted =>
-            {
-                logging::error!(target: "renderer::ipc", "request before handshake");
                 break;
             }
             ToRenderer::Assign { .. } | ToRenderer::Release { .. } | ToRenderer::Request { .. } => {
@@ -188,21 +197,13 @@ fn read_messages(
             }
             ToRenderer::ResponseStart { .. }
             | ToRenderer::ResponseEnd { .. }
-            | ToRenderer::ResponseError { .. }
-                if greeted =>
-            {
+            | ToRenderer::ResponseError { .. } => {
                 if command_tx
                     .blocking_send(RendererInput::Control(message))
                     .is_err()
                 {
                     return;
                 }
-            }
-            ToRenderer::ResponseStart { .. }
-            | ToRenderer::ResponseEnd { .. }
-            | ToRenderer::ResponseError { .. } => {
-                logging::error!(target: "renderer::ipc", "response before handshake");
-                break;
             }
             ToRenderer::ServiceReply { id, reply } => services.deliver(id, reply),
         }
@@ -211,11 +212,7 @@ fn read_messages(
     // browser: interrupt in-flight work and stop the loop.
     stop.request();
     wake.notify_one();
-    let _ = command_tx.try_send(RendererInput::Control(ToRenderer::Request {
-        id: 0,
-        assignment: RendererAssignmentId::new(0),
-        command: Command::Shutdown,
-    }));
+    let _ = command_tx.try_send(RendererInput::Control(ToRenderer::shutdown_request()));
 }
 
 pub(crate) enum RendererInput {
@@ -254,13 +251,20 @@ impl ChannelServices {
         }
     }
 
-    fn call(&self, assignment: RendererAssignmentId, call: ServiceCall) -> Option<ServiceReply> {
+    /// Registers `pending` under a fresh id and queues one service call. On
+    /// queue failure the registration is rolled back and returned so the
+    /// caller can take its own failure path.
+    fn begin_service(
+        &self,
+        assignment: RendererAssignmentId,
+        call: ServiceCall,
+        pending: PendingService,
+    ) -> Result<(), PendingService> {
         let id = self.next.fetch_add(1, Ordering::Relaxed);
-        let (reply_tx, reply_rx) = std_mpsc::channel();
         self.pending
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .insert(id, PendingService::Blocking(reply_tx));
+            .insert(id, pending);
         if self
             .out
             .try_send(FromRenderer::ServiceCall {
@@ -268,14 +272,27 @@ impl ChannelServices {
                 id,
                 call,
             })
-            .is_err()
+            .is_ok()
         {
-            self.pending
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .remove(&id);
-            return None;
+            return Ok(());
         }
+        match self
+            .pending
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&id)
+        {
+            Some(pending) => Err(pending),
+            // `deliver` is the only other remover, and it cannot see an id the
+            // host never received, so this branch is unreachable.
+            None => Ok(()),
+        }
+    }
+
+    fn call(&self, assignment: RendererAssignmentId, call: ServiceCall) -> Option<ServiceReply> {
+        let (reply_tx, reply_rx) = std_mpsc::channel();
+        self.begin_service(assignment, call, PendingService::Blocking(reply_tx))
+            .ok()?;
         reply_rx.recv().ok()
     }
 
@@ -316,31 +333,13 @@ impl AssignmentServices {
 
 impl BrowserServices for AssignmentServices {
     fn start_dial(&self, request: DialRequest, completion: DialCompletion) {
-        let id = self.channel.next.fetch_add(1, Ordering::Relaxed);
-        self.channel
-            .pending
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .insert(id, PendingService::Dial(completion));
-        if self
-            .channel
-            .out
-            .try_send(FromRenderer::ServiceCall {
-                assignment: self.assignment,
-                id,
-                call: ServiceCall::Dial(request),
-            })
-            .is_err()
-        {
-            let pending = self
-                .channel
-                .pending
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .remove(&id);
-            if let Some(PendingService::Dial(completion)) = pending {
-                completion(Err(renderer::DialFailure::Connect));
-            }
+        let pending = self.channel.begin_service(
+            self.assignment,
+            ServiceCall::Dial(request),
+            PendingService::Dial(completion),
+        );
+        if let Err(PendingService::Dial(completion)) = pending {
+            completion(Err(renderer::DialFailure::Connect));
         }
     }
 

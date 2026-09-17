@@ -13,6 +13,7 @@ use crate::InitiatorKind;
 use crate::client::Agent;
 use crate::error::{NetError, ProtocolError, TimeoutKind, TransportError};
 use crate::protocol::{HeaderMap, Method};
+use crate::transport::within;
 
 /// Open WebSocket. Dropping it closes the socket.
 pub struct WebSocket {
@@ -76,22 +77,7 @@ impl WebSocket {
     /// frame stream is invalid.
     pub async fn take_next_message(&mut self) -> Result<WsEvent, NetError> {
         loop {
-            let next = match self.budget.deadline() {
-                Some(deadline) => match tokio::time::timeout_at(
-                    tokio::time::Instant::from_std(deadline),
-                    self.inner.next(),
-                )
-                .await
-                {
-                    Ok(next) => next,
-                    Err(_) => {
-                        return Err(NetError::Transport(TransportError::Timeout(
-                            self.budget.timeout_kind(TimeoutKind::RecvBody),
-                        )));
-                    }
-                },
-                None => self.inner.next().await,
-            };
+            let next = within(self.budget, TimeoutKind::RecvBody, self.inner.next()).await?;
             match next {
                 Some(Ok(Message::Text(text))) => {
                     return Ok(WsEvent::Message(WsMessage::Text(text.to_string())));
@@ -123,24 +109,13 @@ impl WebSocket {
     }
 
     async fn write(&mut self, message: Message) -> Result<(), NetError> {
-        match self.budget.deadline() {
-            Some(deadline) => match tokio::time::timeout_at(
-                tokio::time::Instant::from_std(deadline),
-                self.inner.send(message),
-            )
-            .await
-            {
-                Ok(result) => result.map_err(ws_err),
-                Err(_) => Err(NetError::Transport(TransportError::Timeout(
-                    self.budget.timeout_kind(TimeoutKind::SendBody),
-                ))),
-            },
-            None => self.inner.send(message).await.map_err(ws_err),
-        }
+        let result = within(self.budget, TimeoutKind::SendBody, self.inner.send(message)).await?;
+        result.map_err(ws_err)
     }
 }
 
-/// Polls one stream item without pulling in `futures-util`.
+/// Dials the WebSocket transport and runs the client handshake under the call
+/// deadline.
 pub(crate) async fn connect(
     agent: &Agent,
     url: &Url,
@@ -172,20 +147,7 @@ pub(crate) async fn connect(
             .await
             .map_err(ws_err)
     };
-    let (ws, response) = match budget.deadline() {
-        Some(deadline) => {
-            match tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), handshake).await
-            {
-                Ok(result) => result?,
-                Err(_) => {
-                    return Err(NetError::Transport(TransportError::Timeout(
-                        budget.timeout_kind(TimeoutKind::Connect),
-                    )));
-                }
-            }
-        }
-        None => handshake.await?,
-    };
+    let (ws, response) = within(budget, TimeoutKind::Connect, handshake).await??;
     agent.store_set_cookie_lines(
         url,
         initiator_kind,
