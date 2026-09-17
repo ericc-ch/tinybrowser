@@ -1,13 +1,13 @@
 # Handoff (2026-09-17)
 
-State: branch `chase/cross-frame-postmessage` (not pushed), working tree has
-the cross-frame work from `6e1df39` plus the review fixes and the bindings
-split. The user's `AGENTS.md` wording change and an untracked `.zed/` are
-untouched. Gates green: `tools/ub lint` (clippy), `cargo test --workspace`
-(29 binaries), `tools/js/check` (8 embedded scripts), release binary
-5,998,000 bytes. Webmessaging is 77.9% (106/136); the refactor run is
-`/tmp/wpt-suite/baseline/webmessaging-refactor.json`, identical to the
-pre-refactor fix run.
+State: merged. PR #19 (`chase/cross-frame-postmessage`) landed on `main` as
+`f5703e0`, after the CodeRabbit round; the six high-signal review findings
+are fixed in `aed1c6b` and the IDL-handler polish comments were left for the
+handler-attribute slice. Gates green on the merged tree: `tools/ub lint`
+(clippy), `cargo test --workspace` (29 binaries), `tools/js/check` (8
+embedded scripts), release binary 5,998,000 bytes. Webmessaging is 77.9%
+(106/136); reports under `/tmp/wpt-suite/baseline/` (`webmessaging-refactor.json`
+and `webmessaging-coderabbit.json`).
 
 Done in this slice:
 
