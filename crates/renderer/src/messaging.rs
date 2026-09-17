@@ -19,7 +19,8 @@ use crate::protocol::FrameId;
 /// Handle every realm holds to the renderer-process shared state.
 pub(crate) type SharedHandle = Rc<RefCell<Shared>>;
 
-/// Most frames one renderer process will host.
+/// Most child frames one renderer process will host; the main frame is
+/// not counted.
 pub(crate) const MAX_FRAMES: usize = 64;
 
 /// Prefix every payload carries; a payload from another build (or a future
@@ -148,6 +149,12 @@ pub(crate) struct PortEndpoint {
     /// Set while the endpoint is inside a transfer that has not been
     /// received yet; the object is unusable on the sending side.
     detached: bool,
+    /// The frame that may receive this endpoint, recorded when it is
+    /// detached for a transfer and re-aimed at delivery. Only that frame's
+    /// realm may materialize the port, so a hostile page cannot adopt an
+    /// endpoint by guessing its id
+    /// (<https://html.spec.whatwg.org/multipage/web-messaging.html#transfer-receiving-steps>).
+    recipient: Option<FrameId>,
     /// The peer disentangled while this endpoint was detached: the received
     /// port fires `close` as soon as it is materialized.
     close_pending: bool,
@@ -184,10 +191,23 @@ impl PortTable {
         let first = self.ports.get_mut(&port1).expect("fresh endpoint");
         first.peer = Some(port2);
         first.owner = Some(owner);
+        first.recipient = Some(owner);
         let second = self.ports.get_mut(&port2).expect("fresh endpoint");
         second.peer = Some(port1);
         second.owner = Some(owner);
+        second.recipient = Some(owner);
         (port1, port2)
+    }
+
+    /// Aims a detached endpoint at the frame whose realm will receive it. The
+    /// engine calls this when a message carrying the endpoint is delivered
+    /// (<https://html.spec.whatwg.org/multipage/web-messaging.html#transfer-receiving-steps>).
+    pub(crate) fn route(&mut self, endpoint: u64, recipient: FrameId) {
+        if let Some(port) = self.ports.get_mut(&endpoint)
+            && port.detached
+        {
+            port.recipient = Some(recipient);
+        }
     }
 
     /// Sends one payload through `from`; the receiving endpoint's queue either
@@ -302,25 +322,23 @@ impl PortTable {
         port.closed = true;
         port.enabled = false;
         port.queue.clear();
-        let Some(peer_id) = port.peer.take() else {
-            self.ports.remove(&endpoint);
-            return;
-        };
-        let Some(peer) = self.ports.get_mut(&peer_id) else {
-            self.ports.remove(&endpoint);
-            return;
-        };
-        peer.peer = None;
-        if peer.closed {
-            self.ports.remove(&endpoint);
-            return;
+        if let Some(peer_id) = port.peer.take()
+            && let Some(peer) = self.ports.get_mut(&peer_id)
+        {
+            peer.peer = None;
+            if !peer.closed {
+                if peer.detached {
+                    // In transit: the received port fires `close` when
+                    // materialized.
+                    peer.close_pending = true;
+                } else if peer.owner.is_some() {
+                    deliveries.push(Delivery::PortClosed { endpoint: peer_id });
+                }
+            }
         }
-        if peer.detached {
-            // In transit: the received port fires `close` when materialized.
-            peer.close_pending = true;
-        } else {
-            deliveries.push(Delivery::PortClosed { endpoint: peer_id });
-        }
+        // The row is done: the JS handle keeps its own `closed` flag, and an
+        // endpoint without a peer can never be addressed again.
+        self.ports.remove(&endpoint);
     }
 
     /// Takes `endpoint` out of its realm for a transfer. The sender may only
@@ -339,6 +357,10 @@ impl PortTable {
         }
         port.owner = None;
         port.detached = true;
+        // Until a message carries this endpoint, only the sender may
+        // re-adopt it (in-realm `structuredClone`); a post re-aims it at the
+        // message's target before the target realm can materialize it.
+        port.recipient = Some(frame);
         // The transferred port's queue stays, but the received port starts
         // disabled again
         // (<https://html.spec.whatwg.org/multipage/web-messaging.html#transfer-receiving-steps>).
@@ -347,14 +369,16 @@ impl PortTable {
     }
 
     /// Materializes a transferred `endpoint` in `frame`'s realm and reports
-    /// whether the received port must fire `close` immediately.
+    /// whether the received port must fire `close` immediately. Only the
+    /// frame the transfer is addressed to may receive it.
     pub(crate) fn adopt(&mut self, endpoint: u64, frame: FrameId) -> Option<bool> {
         let port = self.ports.get_mut(&endpoint)?;
-        if !port.detached {
+        if !port.detached || port.recipient != Some(frame) {
             return None;
         }
         port.detached = false;
         port.owner = Some(frame);
+        port.recipient = None;
         Some(std::mem::take(&mut port.close_pending))
     }
 
@@ -383,13 +407,27 @@ impl PortTable {
     }
 
     /// Drops an endpoint that no realm can ever receive again (its frame was
-    /// destroyed while it was in transit).
-    pub(crate) fn forget(&mut self, endpoint: u64) {
-        if let Some(port) = self.ports.remove(&endpoint)
-            && let Some(peer_id) = port.peer
-            && let Some(peer) = self.ports.get_mut(&peer_id)
-        {
-            peer.peer = None;
+    /// destroyed or the carrying message was dropped), disentangling its peer
+    /// so the surviving port fires `close`
+    /// (<https://html.spec.whatwg.org/multipage/web-messaging.html#disentangle>).
+    pub(crate) fn forget(&mut self, endpoint: u64, deliveries: &mut Vec<Delivery>) {
+        let Some(port) = self.ports.remove(&endpoint) else {
+            return;
+        };
+        let Some(peer_id) = port.peer else {
+            return;
+        };
+        let Some(peer) = self.ports.get_mut(&peer_id) else {
+            return;
+        };
+        peer.peer = None;
+        if peer.closed {
+            return;
+        }
+        if peer.detached {
+            peer.close_pending = true;
+        } else if peer.owner.is_some() {
+            deliveries.push(Delivery::PortClosed { endpoint: peer_id });
         }
     }
 }
@@ -472,10 +510,11 @@ impl Shared {
         self.ports.close_frame_ports(frame, &mut self.deliveries);
     }
 
-    /// Drops transferred endpoints whose message will never be delivered.
+    /// Drops transferred endpoints whose message will never be delivered,
+    /// firing `close` at their peers.
     pub(crate) fn forget_endpoints(&mut self, endpoints: &[u64]) {
         for endpoint in endpoints {
-            self.ports.forget(*endpoint);
+            self.ports.forget(*endpoint, &mut self.deliveries);
         }
     }
 
@@ -501,10 +540,7 @@ impl Shared {
             removed.push(child);
         }
         for child in &removed {
-            let container = self
-                .tree
-                .remove(*child)
-                .map(|(_, container)| container);
+            let container = self.tree.remove(*child).map(|(_, container)| container);
             self.close_frame_ports(*child);
             self.removed_frames.push((*child, container));
         }

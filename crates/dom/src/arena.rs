@@ -181,6 +181,8 @@ pub struct Dom {
     /// Connected `iframe` elements, so the renderer can tell whether a frame
     /// scan is needed at all.
     connected_iframes: u32,
+    /// Bumped by every mutation; see [`Dom::mutation_serial`].
+    mutation_serial: u64,
     /// `Cell<()>` is `Send` + `!Sync`; `PhantomData` makes `Dom` inherit
     /// exactly that split. Deleting this field would silently re-derive
     /// `Sync`, which is the point: that deletion has to be a conscious act.
@@ -219,6 +221,7 @@ impl Dom {
             recording_suppressed: false,
             lifecycle: Vec::new(),
             connected_iframes: 0,
+            mutation_serial: 0,
             _share_forbidden: PhantomData,
         }
     }
@@ -320,9 +323,21 @@ impl Dom {
     }
 
     fn record(&mut self, mutation: Mutation) {
+        // Bumped even while recording is suppressed: the tree changed, and
+        // the renderer's frame-order cache keys off this serial.
+        self.mutation_serial = self.mutation_serial.wrapping_add(1);
         if self.record_mutations && !self.recording_suppressed {
             self.mutations.push(mutation);
         }
+    }
+
+    /// A counter that changes on every recorded mutation.
+    ///
+    /// Consumers that must rescan the tree (frame order) compare this instead
+    /// of walking the whole document on every turn.
+    #[must_use]
+    pub fn mutation_serial(&self) -> u64 {
+        self.mutation_serial
     }
 
     /// Compatibility mode this document answers selector queries under.
@@ -1226,7 +1241,7 @@ impl Dom {
         match self.get(id).map(|node| node.kind()) {
             Some(NodeKind::Element { attributes, .. }) => attributes
                 .iter()
-            .map(|attribute| Self::serialize_qualified_name(&attribute.name))
+                .map(|attribute| Self::serialize_qualified_name(&attribute.name))
                 .collect(),
             _ => Vec::new(),
         }

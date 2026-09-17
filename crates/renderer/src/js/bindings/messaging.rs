@@ -1,0 +1,573 @@
+//! Frame-tree and cross-realm messaging host functions.
+
+use super::{handler_target, throw_dom, world, world_for_node, wrap_node};
+
+use std::cell::RefCell;
+
+use std::rc::Rc;
+
+use rquickjs::{Ctx, Object, Persistent, Result, Value};
+
+use crate::js::world::World;
+
+use crate::messaging::{Delivery, MAX_FRAMES, PAYLOAD_VERSION, Shared};
+
+use crate::protocol::FrameId;
+
+/// Installs the frame-tree and cross-realm messaging host functions the shim
+/// calls: posting window messages and channel messages, reading the frame
+/// tree, and moving channel endpoints between realms.
+///
+/// The calling realm's world comes from the realm registration, so every
+/// function is a plain item and its borrow of the world ends with the call.
+pub(crate) fn install_messaging(ctx: &Ctx<'_>) -> Result<()> {
+    let globals = ctx.globals();
+    let frame = world(ctx)?.borrow().frame();
+    globals.set("__tb_frameId", crate::js::js_number(frame.get()))?;
+    globals.set(
+        "__tb_maxFrames",
+        crate::js::js_number(u64::try_from(MAX_FRAMES).unwrap_or(u64::MAX)),
+    )?;
+
+    globals.set(
+        "__tbPostWindowMessage",
+        rquickjs::prelude::Func::from(post_window_message),
+    )?;
+    globals.set("__tbPortNew", rquickjs::prelude::Func::from(port_new))?;
+    globals.set("__tbPortPost", rquickjs::prelude::Func::from(port_post))?;
+    globals.set("__tbPortStart", rquickjs::prelude::Func::from(port_start))?;
+    globals.set("__tbPortClose", rquickjs::prelude::Func::from(port_close))?;
+    globals.set("__tbPortDetach", rquickjs::prelude::Func::from(port_detach))?;
+    globals.set("__tbPortAdopt", rquickjs::prelude::Func::from(port_adopt))?;
+    globals.set("__tbPortPeer", rquickjs::prelude::Func::from(port_peer))?;
+    globals.set(
+        "__tbFrameParent",
+        rquickjs::prelude::Func::from(frame_parent),
+    )?;
+    globals.set("__tbFrameTop", rquickjs::prelude::Func::from(frame_top))?;
+    globals.set(
+        "__tbFrameChildCount",
+        rquickjs::prelude::Func::from(frame_child_count),
+    )?;
+    globals.set("__tbFrameChild", rquickjs::prelude::Func::from(frame_child))?;
+    globals.set(
+        "__tbFrameGlobal",
+        rquickjs::prelude::Func::from(frame_global),
+    )?;
+    globals.set(
+        "__tbFrameDocument",
+        rquickjs::prelude::Func::from(frame_document),
+    )?;
+    globals.set(
+        "__tbFrameRegistered",
+        rquickjs::prelude::Func::from(frame_registered),
+    )?;
+    Ok(())
+}
+
+/// One window message: the target origin is recorded and re-checked at
+/// delivery
+/// (<https://html.spec.whatwg.org/multipage/web-messaging.html#window-post-message-steps>).
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "rquickjs Func ABI passes Ctx and owned arguments by value"
+)]
+fn post_window_message(
+    ctx: Ctx<'_>,
+    target: f64,
+    target_origin: String,
+    payload: String,
+    ports: Vec<f64>,
+) -> Result<()> {
+    let Some(target) = protocol_id(target) else {
+        return Ok(());
+    };
+    let Some(ports) = protocol_ids(ports) else {
+        return Ok(());
+    };
+    if !payload.starts_with(PAYLOAD_VERSION) {
+        return Ok(());
+    }
+    let world = world(&ctx)?;
+    let (source, origin, shared) = {
+        let world = world.borrow();
+        (world.frame(), world.origin_string(), world.shared())
+    };
+    shared
+        .borrow_mut()
+        .deliveries
+        .push(Delivery::WindowMessage {
+            target: FrameId::new(target),
+            source,
+            origin,
+            target_origin,
+            payload,
+            ports,
+        });
+    Ok(())
+}
+
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "rquickjs Func ABI passes Ctx and owned arguments by value"
+)]
+fn port_new(ctx: Ctx<'_>) -> Result<Vec<f64>> {
+    let world = world(&ctx)?;
+    let (frame, shared) = {
+        let world = world.borrow();
+        (world.frame(), world.shared())
+    };
+    let (first, second) = shared.borrow_mut().ports.new_pair(frame);
+    Ok(vec![
+        crate::js::js_number(first),
+        crate::js::js_number(second),
+    ])
+}
+
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "rquickjs Func ABI passes Ctx and owned arguments by value"
+)]
+fn port_post(ctx: Ctx<'_>, endpoint: f64, payload: String, ports: Vec<f64>) -> Result<()> {
+    let Some(endpoint) = protocol_id(endpoint) else {
+        return Ok(());
+    };
+    let Some(ports) = protocol_ids(ports) else {
+        return Ok(());
+    };
+    if !payload.starts_with(PAYLOAD_VERSION) {
+        return Ok(());
+    }
+    let world = world(&ctx)?;
+    if !endpoint_owned(&world, endpoint) {
+        return Ok(());
+    }
+    let shared = world.borrow().shared();
+    let mut shared = shared.borrow_mut();
+    let Shared {
+        ports: table,
+        deliveries,
+        ..
+    } = &mut *shared;
+    table.post(endpoint, payload, ports, deliveries);
+    Ok(())
+}
+
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "rquickjs Func ABI passes Ctx and owned arguments by value"
+)]
+fn port_start(ctx: Ctx<'_>, endpoint: f64) -> Result<()> {
+    let Some(endpoint) = protocol_id(endpoint) else {
+        return Ok(());
+    };
+    let world = world(&ctx)?;
+    if !endpoint_owned(&world, endpoint) {
+        return Ok(());
+    }
+    let shared = world.borrow().shared();
+    let mut shared = shared.borrow_mut();
+    let Shared {
+        ports: table,
+        deliveries,
+        ..
+    } = &mut *shared;
+    table.start(endpoint, deliveries);
+    Ok(())
+}
+
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "rquickjs Func ABI passes Ctx and owned arguments by value"
+)]
+fn port_close(ctx: Ctx<'_>, endpoint: f64) -> Result<()> {
+    let Some(endpoint) = protocol_id(endpoint) else {
+        return Ok(());
+    };
+    let world = world(&ctx)?;
+    if !endpoint_owned(&world, endpoint) {
+        return Ok(());
+    }
+    let shared = world.borrow().shared();
+    let mut shared = shared.borrow_mut();
+    let Shared {
+        ports: table,
+        deliveries,
+        ..
+    } = &mut *shared;
+    table.close(endpoint, deliveries);
+    Ok(())
+}
+
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "rquickjs Func ABI passes Ctx and owned arguments by value"
+)]
+fn port_detach(ctx: Ctx<'_>, endpoint: f64) -> Result<bool> {
+    let Some(endpoint) = protocol_id(endpoint) else {
+        return Ok(false);
+    };
+    let world = world(&ctx)?;
+    let (frame, shared) = {
+        let world = world.borrow();
+        (world.frame(), world.shared())
+    };
+    Ok(shared.borrow_mut().ports.detach(endpoint, frame))
+}
+
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "rquickjs Func ABI passes Ctx and owned arguments by value"
+)]
+fn port_adopt(ctx: Ctx<'_>, endpoint: f64) -> Result<Option<bool>> {
+    let Some(endpoint) = protocol_id(endpoint) else {
+        return Ok(None);
+    };
+    let world = world(&ctx)?;
+    let (frame, shared) = {
+        let world = world.borrow();
+        (world.frame(), world.shared())
+    };
+    Ok(shared.borrow_mut().ports.adopt(endpoint, frame))
+}
+
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "rquickjs Func ABI passes Ctx and owned arguments by value"
+)]
+fn port_peer(ctx: Ctx<'_>, endpoint: f64) -> Result<Option<f64>> {
+    let Some(endpoint) = protocol_id(endpoint) else {
+        return Ok(None);
+    };
+    let world = world(&ctx)?;
+    if !endpoint_owned(&world, endpoint) {
+        return Ok(None);
+    }
+    let shared = world.borrow().shared();
+    let Some(peer) = shared.borrow().ports.peer(endpoint) else {
+        return Ok(None);
+    };
+    Ok(Some(crate::js::js_number(peer)))
+}
+
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "rquickjs Func ABI passes Ctx and owned arguments by value"
+)]
+fn frame_parent(ctx: Ctx<'_>, frame: f64) -> Result<Option<f64>> {
+    let Some(frame) = protocol_id(frame) else {
+        return Ok(None);
+    };
+    let world = world(&ctx)?;
+    let shared = world.borrow().shared();
+    let Some(parent) = shared.borrow().tree.parent(FrameId::new(frame)) else {
+        return Ok(None);
+    };
+    Ok(Some(crate::js::js_number(parent.get())))
+}
+
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "rquickjs Func ABI passes Ctx and owned arguments by value"
+)]
+fn frame_top(ctx: Ctx<'_>, frame: f64) -> Result<Option<f64>> {
+    let Some(frame) = protocol_id(frame) else {
+        return Ok(None);
+    };
+    let mut frame = FrameId::new(frame);
+    let world = world(&ctx)?;
+    let shared = world.borrow().shared();
+    let shared = shared.borrow();
+    while let Some(parent) = shared.tree.parent(frame) {
+        frame = parent;
+    }
+    Ok(Some(crate::js::js_number(frame.get())))
+}
+
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "rquickjs Func ABI passes Ctx and owned arguments by value"
+)]
+fn frame_child_count(ctx: Ctx<'_>, frame: f64) -> Result<f64> {
+    let Some(frame) = protocol_id(frame) else {
+        return Ok(0.0);
+    };
+    let world = world(&ctx)?;
+    world.borrow_mut().register_pending_frames();
+    let shared = world.borrow().shared();
+    let count = shared.borrow().tree.children(FrameId::new(frame)).len();
+    Ok(crate::js::js_number(
+        u64::try_from(count).unwrap_or(u64::MAX),
+    ))
+}
+
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "rquickjs Func ABI passes Ctx and owned arguments by value"
+)]
+fn frame_child(ctx: Ctx<'_>, frame: f64, index: f64) -> Result<Option<f64>> {
+    let Some(frame) = protocol_id(frame) else {
+        return Ok(None);
+    };
+    let Some(index) = protocol_id(index).and_then(|index| usize::try_from(index).ok()) else {
+        return Ok(None);
+    };
+    let world = world(&ctx)?;
+    world.borrow_mut().register_pending_frames();
+    let shared = world.borrow().shared();
+    let Some(child) = shared
+        .borrow()
+        .tree
+        .children(FrameId::new(frame))
+        .get(index)
+        .copied()
+    else {
+        return Ok(None);
+    };
+    Ok(Some(crate::js::js_number(child.get())))
+}
+
+/// Same-origin members forward through the target realm's window; a null
+/// answer means the member is blocked cross-origin
+/// (<https://html.spec.whatwg.org/multipage/window-object.html#windowproxy-get>).
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "rquickjs Func ABI passes Ctx and owned arguments by value"
+)]
+fn frame_global(ctx: Ctx<'_>, frame: f64) -> Result<Option<Object<'_>>> {
+    let Some(frame) = protocol_id(frame) else {
+        return Ok(None);
+    };
+    let frame = FrameId::new(frame);
+    let current = world(&ctx)?;
+    current.borrow_mut().register_pending_frames();
+    if current.borrow().frame() == frame {
+        return Ok(Some(ctx.globals()));
+    }
+    let Some(target) = current.borrow().frame_world(frame) else {
+        return Ok(None);
+    };
+    let same_origin =
+        target.borrow().document_url.origin() == current.borrow().document_url.origin();
+    if !same_origin {
+        return Ok(None);
+    }
+    let Some(window) = target.borrow().window_object() else {
+        return Ok(None);
+    };
+    Ok(Some(window.restore(&ctx)?))
+}
+
+/// `document` on a same-origin proxy wraps the target frame's active document
+/// in this realm; cross-origin access throws
+/// (<https://html.spec.whatwg.org/multipage/iframe-embed-object.html#dom-iframe-contentdocument>).
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "rquickjs Func ABI passes Ctx and owned arguments by value"
+)]
+pub(crate) fn frame_document(ctx: Ctx<'_>, frame: f64) -> Result<Value<'_>> {
+    let Some(frame) = protocol_id(frame) else {
+        return Ok(Value::new_null(ctx));
+    };
+    let current = world(&ctx)?;
+    current.borrow_mut().register_pending_frames();
+    let Some(target) = current.borrow().frame_world(FrameId::new(frame)) else {
+        return Ok(Value::new_null(ctx));
+    };
+    let root = target.borrow().main_document_root();
+    let same_origin =
+        target.borrow().document_url.origin() == current.borrow().document_url.origin();
+    if !same_origin {
+        return Err(throw_dom(
+            &ctx,
+            "SecurityError",
+            "Blocked a frame from accessing a cross-origin frame.",
+        ));
+    }
+    match root {
+        Some(root) => wrap_node(&ctx, root),
+        None => Ok(Value::new_null(ctx)),
+    }
+}
+
+/// Whether `frame` has a browsing context, even when its realm is not
+/// materialized yet. A script that sets a member on a just-inserted iframe's
+/// `contentWindow` gets a stored write instead of a cross-origin error
+/// (<https://html.spec.whatwg.org/multipage/window-object.html#windowproxy-set>).
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "rquickjs Func ABI passes Ctx and owned arguments by value"
+)]
+fn frame_registered(ctx: Ctx<'_>, frame: f64) -> Result<bool> {
+    let Some(frame) = protocol_id(frame) else {
+        return Ok(false);
+    };
+    let world = world(&ctx)?;
+    let shared = world.borrow().shared();
+    Ok(shared.borrow().tree.contains(FrameId::new(frame)))
+}
+
+/// Event handler property names whose values live in the world, so a wrapper
+/// can be collected without losing `element.onload`
+/// (<https://html.spec.whatwg.org/multipage/webappapis.html#event-handler-idl-attributes>).
+pub(crate) const HANDLER_ATTRIBUTES: &[&str] = &[
+    "onabort",
+    "onblur",
+    "oncancel",
+    "onchange",
+    "onclick",
+    "onclose",
+    "oncontextmenu",
+    "oncopy",
+    "oncut",
+    "ondblclick",
+    "ondrag",
+    "ondragend",
+    "ondragenter",
+    "ondragleave",
+    "ondragover",
+    "ondragstart",
+    "ondrop",
+    "onerror",
+    "onfocus",
+    "oninput",
+    "oninvalid",
+    "onkeydown",
+    "onkeypress",
+    "onkeyup",
+    "onload",
+    "onloadeddata",
+    "onloadedmetadata",
+    "onloadstart",
+    "onmessage",
+    "onmessageerror",
+    "onmousedown",
+    "onmouseenter",
+    "onmouseleave",
+    "onmousemove",
+    "onmouseout",
+    "onmouseover",
+    "onmouseup",
+    "onpaste",
+    "onpause",
+    "onplay",
+    "onplaying",
+    "onprogress",
+    "onratechange",
+    "onreadystatechange",
+    "onreset",
+    "onresize",
+    "onscroll",
+    "onseeked",
+    "onseeking",
+    "onselect",
+    "onsubmit",
+    "onsuspend",
+    "ontimeupdate",
+    "ontoggle",
+    "onwheel",
+];
+
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "rquickjs Func ABI passes Ctx and owned arguments by value"
+)]
+pub(crate) fn get_node_handler<'js>(
+    ctx: Ctx<'js>,
+    node: Value<'js>,
+    name: String,
+) -> Result<Value<'js>> {
+    let id = handler_target(&ctx, &node)?;
+    let world = world_for_node(&ctx, id)?;
+    let saved = world.borrow().handler_attribute(Some(id), &name);
+    match saved {
+        Some(saved) => saved.restore(&ctx),
+        None => Ok(Value::new_null(ctx)),
+    }
+}
+
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "rquickjs Func ABI passes Ctx and owned arguments by value"
+)]
+pub(crate) fn set_node_handler<'js>(
+    ctx: Ctx<'js>,
+    node: Value<'js>,
+    name: String,
+    value: Value<'js>,
+) -> Result<()> {
+    let id = handler_target(&ctx, &node)?;
+    let world = world_for_node(&ctx, id)?;
+    let saved = if value.is_null() || value.is_undefined() {
+        None
+    } else {
+        Some(Persistent::save(&ctx, value))
+    };
+    world
+        .borrow_mut()
+        .set_handler_attribute(Some(id), &name, saved);
+    Ok(())
+}
+
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "rquickjs Func ABI passes Ctx and owned arguments by value"
+)]
+pub(crate) fn get_window_handler(ctx: Ctx<'_>, name: String) -> Result<Value<'_>> {
+    let world = world(&ctx)?;
+    let saved = world.borrow().handler_attribute(None, &name);
+    match saved {
+        Some(saved) => saved.restore(&ctx),
+        None => Ok(Value::new_null(ctx)),
+    }
+}
+
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "rquickjs Func ABI passes Ctx and owned arguments by value"
+)]
+pub(crate) fn set_window_handler<'js>(
+    ctx: Ctx<'js>,
+    name: String,
+    value: Value<'js>,
+) -> Result<()> {
+    let world = world(&ctx)?;
+    let saved = if value.is_null() || value.is_undefined() {
+        None
+    } else {
+        Some(Persistent::save(&ctx, value))
+    };
+    world.borrow_mut().set_handler_attribute(None, &name, saved);
+    Ok(())
+}
+
+/// Whether the calling realm's frame owns `endpoint`.
+///
+/// The `__tb*` host functions are reachable from page script, so every
+/// endpoint operation is checked against the caller's frame; otherwise a page
+/// could close or steal another frame's port by guessing its id
+/// (<https://html.spec.whatwg.org/multipage/web-messaging.html#transfer-receiving-steps>).
+fn endpoint_owned(world: &Rc<RefCell<World>>, endpoint: u64) -> bool {
+    let (frame, shared) = {
+        let world = world.borrow();
+        (world.frame(), world.shared())
+    };
+    shared.borrow().ports.owner(endpoint) == Some(frame)
+}
+
+/// A JS number naming a protocol id; ids are small non-negative integers.
+fn protocol_id(value: f64) -> Option<u64> {
+    if !value.is_finite() || value < 0.0 || value.fract() != 0.0 || value > f64::from(u32::MAX) {
+        return None;
+    }
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "the value is range-checked to a non-negative u32 above"
+    )]
+    Some(value as u64)
+}
+
+fn protocol_ids(values: Vec<f64>) -> Option<Vec<u64>> {
+    values.into_iter().map(protocol_id).collect()
+}

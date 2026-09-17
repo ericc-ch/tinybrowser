@@ -8,7 +8,7 @@
 //! ([`crate::messaging`]).
 
 use std::cell::RefCell;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
@@ -72,7 +72,11 @@ impl Engine {
             .create_frame_document(frame);
         document.load_about_blank(Some(&parent_url));
         self.frames.insert(frame, document);
-        self.runtime.shared.borrow_mut().tree.add(parent, frame, container);
+        self.runtime
+            .shared
+            .borrow_mut()
+            .tree
+            .add(parent, frame, container);
         frame
     }
 
@@ -292,7 +296,10 @@ impl Engine {
                 if let Some(container) = container {
                     self.runtime.registry.borrow_mut().forget_frame(*container);
                 }
-                self.runtime.registry.borrow_mut().forget_frame_world(*frame);
+                self.runtime
+                    .registry
+                    .borrow_mut()
+                    .forget_frame_world(*frame);
                 self.frames.remove(frame);
             }
             let frame_ids: Vec<FrameId> = self.frames.keys().copied().collect();
@@ -321,10 +328,10 @@ impl Engine {
                 || !navigations.is_empty()
                 || !streams.is_empty()
                 || !deliveries.is_empty();
-            let reordered = self.apply_lifecycle(lifecycle);
+            self.apply_lifecycle(lifecycle);
             self.apply_navigations(navigations);
             self.apply_streams(streams);
-            self.reorder_frames(&reordered);
+            self.reorder_frames();
             self.apply_deliveries(deliveries);
             let fired_load = self.fire_ready_frame_loads();
             if !had_work && !fired_load {
@@ -333,17 +340,22 @@ impl Engine {
         }
     }
 
-    /// Applies connection transitions and returns the parents whose child
-    /// order may have changed.
-    fn apply_lifecycle(&mut self, events: Vec<(FrameId, dom::Lifecycle)>) -> Vec<FrameId> {
-        let mut reordered = Vec::new();
+    /// Applies connection transitions.
+    fn apply_lifecycle(&mut self, events: Vec<(FrameId, dom::Lifecycle)>) {
         for (parent, event) in events {
             match event {
                 dom::Lifecycle::Inserted(container) => {
-                    if self.runtime.shared.borrow().tree.frame_for_container(container).is_some() {
+                    if self
+                        .runtime
+                        .shared
+                        .borrow()
+                        .tree
+                        .frame_for_container(container)
+                        .is_some()
+                    {
                         continue;
                     }
-                    if self.frames.len() >= MAX_FRAMES {
+                    if self.runtime.shared.borrow().tree.len() >= MAX_FRAMES {
                         continue;
                     }
                     let child = self.create_frame(parent, container);
@@ -353,15 +365,12 @@ impl Engine {
                         .and_then(|document| document.frame_src(container));
                     self.navigate_frame(child, container, src.as_deref().unwrap_or(""));
                     self.publish_frame_document(container, child);
-                    reordered.push(parent);
                 }
                 dom::Lifecycle::Removed(container) => {
                     self.remove_subtree(container);
-                    reordered.push(parent);
                 }
             }
         }
-        reordered
     }
 
     /// Removes a frame and every descendant it owns before the backing
@@ -370,7 +379,8 @@ impl Engine {
     /// avoid stale realms and pending loads.
     fn remove_subtree(&mut self, container: dom::NodeId) {
         let Some(child) = self
-            .runtime.shared
+            .runtime
+            .shared
             .borrow()
             .tree
             .frame_for_container(container)
@@ -378,7 +388,8 @@ impl Engine {
             return;
         };
         let descendants: Vec<dom::NodeId> = self
-            .runtime.shared
+            .runtime
+            .shared
             .borrow()
             .tree
             .children(child)
@@ -402,7 +413,8 @@ impl Engine {
 
     fn remove_descendants(&mut self, parent: FrameId) {
         let containers: Vec<dom::NodeId> = self
-            .runtime.shared
+            .runtime
+            .shared
             .borrow()
             .tree
             .children(parent)
@@ -418,7 +430,13 @@ impl Engine {
     /// document and dispatching on its scheme
     /// (<https://html.spec.whatwg.org/multipage/iframe-embed-object.html#process-the-iframe-attributes>).
     fn navigate_frame(&mut self, child: FrameId, container: dom::NodeId, spec: &str) {
-        let parent = self.runtime.shared.borrow().tree.parent(child).unwrap_or(child);
+        let parent = self
+            .runtime
+            .shared
+            .borrow()
+            .tree
+            .parent(child)
+            .unwrap_or(child);
         let parent_url = self
             .frames
             .get(&parent)
@@ -437,33 +455,44 @@ impl Engine {
             // A frame the engine just created is already on that document;
             // reloading it would throw away its realm and anything a script
             // has already set on it.
-            if !self.is_initial_blank(child, &parent_url)
-                && let Some(document) = self.frames.get_mut(&child)
-            {
-                document.load_about_blank(Some(&parent_url));
-            }
-            if let Some(document) = self.frames.get_mut(&parent) {
-                document.mark_frame_load_pending(container);
-            }
+            self.keep_initial_blank(child, &parent_url);
+            self.mark_frame_load_pending(container, parent);
             return;
         };
+        self.load_frame_url(child, url, parent, &parent_url);
+        self.mark_frame_load_pending(container, parent);
+    }
+
+    /// Keeps a frame's initial `about:blank` document while it still has one,
+    /// so a script-set realm survives; otherwise installs the inherited blank.
+    fn keep_initial_blank(&mut self, child: FrameId, parent_url: &str) {
+        if !self
+            .frames
+            .get(&child)
+            .is_some_and(Document::is_initial_blank)
+            && let Some(document) = self.frames.get_mut(&child)
+        {
+            document.load_about_blank(Some(parent_url));
+        }
+    }
+
+    /// Starts the load one resolved frame URL names, dispatching on its scheme
+    /// (<https://html.spec.whatwg.org/multipage/iframe-embed-object.html#process-the-iframe-attributes>).
+    fn load_frame_url(&mut self, child: FrameId, url: Url, parent: FrameId, parent_url: &str) {
         match url.scheme() {
-            "about" => {
-                if !self.is_initial_blank(child, &parent_url)
-                    && let Some(document) = self.frames.get_mut(&child)
-                {
-                    document.load_about_blank(Some(&parent_url));
-                }
-            }
+            "about" => self.keep_initial_blank(child, parent_url),
             "data" => {
-                let (content_type, body) = decode_data_url(url.as_str());
-                if let Some(document) = self.frames.get_mut(&child) {
-                    document.load_frame_response(
-                        &url,
-                        content_type.as_deref(),
-                        None,
-                        &body,
-                    );
+                if let Some((content_type, body)) = decode_data_url(url.as_str()) {
+                    if let Some(document) = self.frames.get_mut(&child) {
+                        document.load_frame_response(&url, content_type.as_deref(), None, &body);
+                    }
+                } else {
+                    // A malformed data URL fails the navigation; the frame
+                    // stays on its current document
+                    // (<https://fetch.spec.whatwg.org/#data-url-processor>).
+                    if let Some(document) = self.frames.get_mut(&child) {
+                        document.load_about_blank(None);
+                    }
                 }
             }
             "javascript" => {
@@ -472,14 +501,17 @@ impl Engine {
                     .strip_prefix("javascript:")
                     .unwrap_or(&script)
                     .to_owned();
-                let initial = self.is_initial_blank(child, &parent_url);
+                let initial = self
+                    .frames
+                    .get(&child)
+                    .is_some_and(Document::is_initial_blank);
                 if let Some(document) = self.frames.get_mut(&child) {
                     if initial {
                         // The script runs in the document the browser already
                         // created; its result is discarded.
                         document.eval_frame_script(&script);
                     } else {
-                        document.load_javascript_frame(Some(&parent_url), &script);
+                        document.load_javascript_frame(Some(parent_url), &script);
                     }
                 }
             }
@@ -517,6 +549,11 @@ impl Engine {
                 }
             }
         }
+    }
+
+    /// Records a frame load so the parent's `load` event waits for it
+    /// (<https://html.spec.whatwg.org/multipage/parsing.html#delay-the-load-event>).
+    fn mark_frame_load_pending(&mut self, container: dom::NodeId, parent: FrameId) {
         if let Some(document) = self.frames.get_mut(&parent) {
             document.mark_frame_load_pending(container);
         }
@@ -527,7 +564,8 @@ impl Engine {
             match navigation {
                 FrameNavigation::Src { container, spec } => {
                     let Some(child) = self
-                        .runtime.shared
+                        .runtime
+                        .shared
                         .borrow()
                         .tree
                         .frame_for_container(container)
@@ -563,18 +601,39 @@ impl Engine {
         }
     }
 
-    /// Reorders each parent's children to the tree order of their containers.
-    fn reorder_frames(&mut self, parents: &[FrameId]) {
-        let mut seen = HashSet::new();
-        for &parent in parents {
-            if !seen.insert(parent) {
-                continue;
-            }
-            let Some(document) = self.frames.get(&parent) else {
+    /// Reorders each frame's children to the tree order of their containers.
+    ///
+    /// A same-document `iframe` move is not a connection transition, so the
+    /// scan runs whenever the parent's document mutated since the last one
+    /// (<https://html.spec.whatwg.org/multipage/nav-history-apis.html#dom-length>).
+    fn reorder_frames(&mut self) {
+        let parents: Vec<FrameId> = self
+            .frames
+            .keys()
+            .copied()
+            .filter(|frame| {
+                !self
+                    .runtime
+                    .shared
+                    .borrow()
+                    .tree
+                    .children(*frame)
+                    .is_empty()
+            })
+            .collect();
+        for parent in parents {
+            let Some(document) = self.frames.get_mut(&parent) else {
                 continue;
             };
+            if !document.frame_order_changed() {
+                continue;
+            }
             let containers = document.iframe_containers_in_order();
-            self.runtime.shared.borrow_mut().tree.reorder(parent, &containers);
+            self.runtime
+                .shared
+                .borrow_mut()
+                .tree
+                .reorder(parent, &containers);
         }
     }
 
@@ -601,6 +660,12 @@ impl Engine {
                     // (LocalDOMWindow::DispatchMessageEventWithOriginCheck).
                     match (allowed, self.frames.get_mut(&target)) {
                         (true, Some(document)) => {
+                            {
+                                let mut shared = self.runtime.shared.borrow_mut();
+                                for port in &ports {
+                                    shared.ports.route(*port, target);
+                                }
+                            }
                             document.push_window_message(WindowMessage {
                                 source,
                                 origin,
@@ -619,6 +684,12 @@ impl Engine {
                     let owner = self.runtime.shared.borrow().ports.owner(endpoint);
                     match owner {
                         Some(frame) if self.frames.contains_key(&frame) => {
+                            {
+                                let mut shared = self.runtime.shared.borrow_mut();
+                                for port in &ports {
+                                    shared.ports.route(*port, frame);
+                                }
+                            }
                             if let Some(document) = self.frames.get_mut(&frame) {
                                 document.push_port_message(endpoint, payload, ports);
                             }
@@ -647,7 +718,11 @@ impl Engine {
                             }
                         }
                         Some(_) => {}
-                        None => self.runtime.shared.borrow_mut().requeue_port_close(endpoint),
+                        None => self
+                            .runtime
+                            .shared
+                            .borrow_mut()
+                            .requeue_port_close(endpoint),
                     }
                 }
             }
@@ -656,16 +731,11 @@ impl Engine {
 
     /// Whether `frame` is still on the `about:blank` document that inherits
     /// `parent_url`, which the browser creates at iframe insertion.
-    fn is_initial_blank(&self, frame: FrameId, parent_url: &str) -> bool {
-        self.frames
-            .get(&frame)
-            .is_some_and(|document| document.document_url() == parent_url)
-    }
-
     fn publish_frame_document(&mut self, container: dom::NodeId, frame: FrameId) {
         let document = self.frames.get(&frame).and_then(Document::document_root);
         if let Some(document) = document {
-            self.runtime.registry
+            self.runtime
+                .registry
                 .borrow_mut()
                 .set_frame_document(container, document);
         }
@@ -680,7 +750,13 @@ impl Engine {
             };
             let pending = document.pending_frame_loads();
             for container in pending {
-                let Some(child) = self.runtime.shared.borrow().tree.frame_for_container(container) else {
+                let Some(child) = self
+                    .runtime
+                    .shared
+                    .borrow()
+                    .tree
+                    .frame_for_container(container)
+                else {
                     if let Some(document) = self.frames.get_mut(&parent) {
                         document.cancel_frame_load(container);
                     }
@@ -715,26 +791,26 @@ impl Engine {
     }
 }
 
-/// Decodes a `data:` URL into its content type and body bytes
+/// Decodes a `data:` URL into its content type and body bytes, or `None` when
+/// the URL is malformed or its base64 payload is not decodable
 /// (<https://fetch.spec.whatwg.org/#data-url-processor>).
-fn decode_data_url(raw: &str) -> (Option<String>, Vec<u8>) {
-    let Some(rest) = raw.strip_prefix("data:") else {
-        return (None, Vec::new());
-    };
-    let Some((metadata, body)) = rest.split_once(',') else {
-        return (None, Vec::new());
-    };
-    let (content_type, is_base64) = match metadata.strip_suffix(";base64") {
-        Some(metadata) => (metadata, true),
+fn decode_data_url(raw: &str) -> Option<(Option<String>, Vec<u8>)> {
+    let rest = raw.strip_prefix("data:")?;
+    let (metadata, body) = rest.split_once(',')?;
+    let (content_type, is_base64) = match metadata
+        .get(metadata.len().saturating_sub(7)..)
+        .filter(|suffix| suffix.eq_ignore_ascii_case(";base64"))
+    {
+        Some(_) => (&metadata[..metadata.len() - 7], true),
         None => (metadata, false),
     };
     let decoded = if is_base64 {
-        decode_base64(body)
+        decode_base64(body)?
     } else {
         percent_decode_bytes(body)
     };
     let content_type = (!content_type.is_empty()).then(|| content_type.to_owned());
-    (content_type, decoded)
+    Some((content_type, decoded))
 }
 
 /// Percent-decodes an ASCII URL component; indices outside `%XX` are kept.
@@ -745,7 +821,8 @@ fn percent_decode_bytes(source: &str) -> Vec<u8> {
     while index < bytes.len() {
         if bytes[index] == b'%'
             && index + 2 < bytes.len()
-            && let (Some(high), Some(low)) = (hex_digit(bytes[index + 1]), hex_digit(bytes[index + 2]))
+            && let (Some(high), Some(low)) =
+                (hex_digit(bytes[index + 1]), hex_digit(bytes[index + 2]))
         {
             output.push((high << 4) | low);
             index += 3;
@@ -771,32 +848,44 @@ fn hex_digit(byte: u8) -> Option<u8> {
     }
 }
 
-/// Decodes standard base64, ignoring ASCII whitespace and padding errors.
-fn decode_base64(source: &str) -> Vec<u8> {
+/// Forgiving-base64 decode, the shape Fetch's data URL processor requires:
+/// whitespace is ignored, a length divisible by four drops trailing padding,
+/// a remainder of one is a failure, and any other character fails
+/// (<https://infra.spec.whatwg.org/#forgiving-base64-decode>).
+fn decode_base64(source: &str) -> Option<Vec<u8>> {
     const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut lookup = [0xff_u8; 256];
     for (value, byte) in TABLE.iter().enumerate() {
         lookup[*byte as usize] = u8::try_from(value).unwrap_or(0);
     }
-    let mut output = Vec::with_capacity(source.len() / 4 * 3);
+    let cleaned: Vec<u8> = source
+        .bytes()
+        .filter(|byte| !byte.is_ascii_whitespace())
+        .collect();
+    let body = if cleaned.len().is_multiple_of(4) {
+        let mut end = cleaned.len();
+        while end > 0 && cleaned[end - 1] == b'=' {
+            end -= 1;
+        }
+        &cleaned[..end]
+    } else {
+        &cleaned[..]
+    };
+    if body.len() % 4 == 1 || body.iter().any(|byte| lookup[*byte as usize] == 0xff) {
+        return None;
+    }
+    let mut output = Vec::with_capacity(body.len() / 4 * 3);
     let mut buffer = 0_u32;
     let mut bits = 0_u32;
-    for byte in source.bytes() {
-        let digit = lookup[byte as usize];
-        if digit == 0xff {
-            if byte == b'=' {
-                break;
-            }
-            continue;
-        }
-        buffer = (buffer << 6) | u32::from(digit);
+    for byte in body {
+        buffer = (buffer << 6) | u32::from(lookup[*byte as usize]);
         bits += 6;
         if bits >= 8 {
             bits -= 8;
             output.push(((buffer >> bits) & 0xff) as u8);
         }
     }
-    output
+    Some(output)
 }
 
 impl Drop for Engine {

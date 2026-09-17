@@ -131,10 +131,7 @@ impl RealmRegistry {
 pub(crate) enum FrameNavigation {
     /// The `iframe`'s `src` changed (or the element just connected): navigate
     /// the child frame to the spec, resolved against the parent document.
-    Src {
-        container: NodeId,
-        spec: String,
-    },
+    Src { container: NodeId, spec: String },
 }
 
 pub(crate) enum DocumentStreamCommand {
@@ -299,6 +296,10 @@ pub(crate) struct World {
     /// `(Some(node), name)` for an element
     /// (<https://html.spec.whatwg.org/multipage/webappapis.html#event-handlers>).
     handler_attributes: HashMap<(Option<NodeId>, String), Persistent<Value<'static>>>,
+    /// Handler properties explicitly set to null or undefined, so a dispatch
+    /// does not resurrect the element's content attribute
+    /// (<https://html.spec.whatwg.org/multipage/webappapis.html#event-handler-content-attributes>).
+    cleared_handlers: HashSet<(Option<NodeId>, String)>,
     /// Last known value, so a detached `Attr` keeps its data.
     pub(crate) attr_values: HashMap<u64, String>,
     /// Wrapper object for each `Attr` id (identity is the id).
@@ -377,6 +378,7 @@ impl World {
             attrs: HashMap::new(),
             attr_owners: HashMap::new(),
             handler_attributes: HashMap::new(),
+            cleared_handlers: HashSet::new(),
             attr_values: HashMap::new(),
             attr_wrappers: HashMap::new(),
             remote_ids: HashMap::new(),
@@ -521,6 +523,8 @@ impl World {
             self.registry.borrow_mut().forget_document(id);
             self.handler_attributes
                 .retain(|(node, _), _| node.is_none_or(|node| node.document_id() != id));
+            self.cleared_handlers
+                .retain(|(node, _)| node.is_none_or(|node| node.document_id() != id));
         }
         self.document = None;
     }
@@ -933,6 +937,7 @@ impl World {
         self.implementations.clear();
         self.brands.clear();
         self.handler_attributes.clear();
+        self.cleared_handlers.clear();
         self.clear_attributes();
         self.observers.clear();
     }
@@ -1003,14 +1008,19 @@ impl World {
         name: &str,
         value: Option<Persistent<Value<'static>>>,
     ) {
-        match value {
-            Some(value) => {
-                self.handler_attributes.insert((node, name.to_owned()), value);
-            }
-            None => {
-                self.handler_attributes.remove(&(node, name.to_owned()));
-            }
+        if let Some(value) = value {
+            self.cleared_handlers.remove(&(node, name.to_owned()));
+            self.handler_attributes
+                .insert((node, name.to_owned()), value);
+        } else {
+            self.handler_attributes.remove(&(node, name.to_owned()));
+            self.cleared_handlers.insert((node, name.to_owned()));
         }
+    }
+
+    /// Whether one handler property was explicitly cleared by script.
+    pub(crate) fn handler_cleared(&self, node: Option<NodeId>, name: &str) -> bool {
+        self.cleared_handlers.contains(&(node, name.to_owned()))
     }
 
     pub(crate) fn set_active_element(&mut self, document: u32, node: Option<NodeId>) {

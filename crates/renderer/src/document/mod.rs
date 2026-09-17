@@ -37,8 +37,14 @@ enum Task {
     DialFinished(CompletedDial),
     DialFailed(DialFail),
     WindowMessage(WindowMessage),
-    PortMessage { endpoint: u64, payload: String, ports: Vec<u64> },
-    PortClosed { endpoint: u64 },
+    PortMessage {
+        endpoint: u64,
+        payload: String,
+        ports: Vec<u64>,
+    },
+    PortClosed {
+        endpoint: u64,
+    },
 }
 
 /// One posted window message, ready for the target realm's task queue.
@@ -162,6 +168,15 @@ pub(crate) struct Document {
     /// Whether the frame's own navigation is still in flight, which is what
     /// keeps the container's `load` event from firing early.
     frame_load_in_flight: bool,
+    /// Whether the frame is still on the `about:blank` document a browser
+    /// creates at insertion. A URL comparison cannot answer this: a frame
+    /// whose `src` resolves to the parent's own URL is still on that document
+    /// (<https://html.spec.whatwg.org/multipage/iframe-embed-object.html#process-the-iframe-attributes>).
+    initial_blank: bool,
+    /// Mutation serial the child frame order was last computed from, so a
+    /// same-document move of an `iframe` is noticed without walking the tree
+    /// every turn (<https://html.spec.whatwg.org/multipage/nav-history-apis.html#dom-length>).
+    frame_order_serial: u64,
     /// Child browsing contexts whose load event has not fired yet; this
     /// document's own `load` event is delayed until they all have
     /// (<https://html.spec.whatwg.org/multipage/parsing.html#delay-the-load-event>).
@@ -223,6 +238,8 @@ impl Document {
             queued_dials: Vec::new(),
             frame_load_sequence: 0,
             frame_load_in_flight: false,
+            initial_blank: true,
+            frame_order_serial: u64::MAX,
             pending_child_loads: 0,
             pending_frame_loads: HashSet::new(),
             load_fired: false,
@@ -368,6 +385,7 @@ impl Document {
     pub(crate) fn navigate_to(&mut self, url: Url, initiator: Url) {
         self.frame_load_sequence = self.frame_load_sequence.wrapping_add(1);
         self.frame_load_in_flight = true;
+        self.initial_blank = false;
         self.queued_dials.push(QueuedDial::FrameLoad {
             url,
             initiator,
@@ -383,7 +401,34 @@ impl Document {
             self.apply_document_url(url);
         }
         self.load_html("");
+        self.initial_blank = true;
         self.ensure_frame_js();
+    }
+
+    /// Whether the frame is still on the document created at insertion.
+    #[must_use]
+    pub(crate) fn is_initial_blank(&self) -> bool {
+        self.initial_blank
+    }
+
+    /// Whether the child frame order may have changed since the last scan.
+    ///
+    /// The DOM mutation serial is the cheap detector for a same-document
+    /// `iframe` move, which no connection lifecycle event reports
+    /// (<https://html.spec.whatwg.org/multipage/nav-history-apis.html#dom-length>).
+    pub(crate) fn frame_order_changed(&mut self) -> bool {
+        let serial = self
+            .world
+            .borrow()
+            .with_main_document(|parsed| parsed.dom.mutation_serial());
+        match serial {
+            Some(serial) if serial == self.frame_order_serial => false,
+            Some(serial) => {
+                self.frame_order_serial = serial;
+                true
+            }
+            None => false,
+        }
     }
 
     /// Replaces this frame's document with a complete response, as the frame's
@@ -445,8 +490,11 @@ impl Document {
 
     /// Queues one channel message as a task on this frame's task source.
     pub(crate) fn push_port_message(&mut self, endpoint: u64, payload: String, ports: Vec<u64>) {
-        self.tasks
-            .push_back(Task::PortMessage { endpoint, payload, ports });
+        self.tasks.push_back(Task::PortMessage {
+            endpoint,
+            payload,
+            ports,
+        });
     }
 
     /// Queues a `close` event for one channel endpoint.
@@ -471,7 +519,10 @@ impl Document {
         match delivered {
             Ok(true) => {}
             Ok(false) => {
-                if js.deliver_window_message_error(message.source.get(), &message.origin).is_err() {
+                if js
+                    .deliver_window_message_error(message.source.get(), &message.origin)
+                    .is_err()
+                {
                     self.record_event(TabEvent::ScriptFailed);
                 }
             }
@@ -636,6 +687,7 @@ impl Document {
         if let Some(url) = url {
             self.url = url.clone();
         }
+        self.initial_blank = false;
         self.content_language = content_language.map(str::to_owned);
         let mut world = self.world.borrow_mut();
         world.document_url = self.url.clone();
@@ -753,6 +805,12 @@ impl Document {
         self.frame_load_in_flight = false;
         self.load_fired = false;
         self.pending_child_loads = 0;
+        self.pending_frame_loads.clear();
+        // Any frame load that completes after this point belongs to the
+        // replaced document, even when it was started through a synchronous
+        // path that never bumped the sequence
+        // (<https://html.spec.whatwg.org/multipage/browsing-the-web.html#navigate>).
+        self.frame_load_sequence = self.frame_load_sequence.wrapping_add(1);
         self.js_epoch = self.js_epoch.saturating_add(1);
         // Every queued dial belongs to the old realm; drop them all.
         self.queued_dials.clear();
