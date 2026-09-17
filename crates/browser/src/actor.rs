@@ -64,6 +64,10 @@ enum Command {
         timeout: Option<Duration>,
         reply: oneshot::Sender<Result<RemoteValue, TabError>>,
     },
+    Screenshot {
+        request: renderer::ScreenshotRequest,
+        reply: oneshot::Sender<Result<Vec<u8>, TabError>>,
+    },
     RunUntilLoadTimeout {
         timeout: Duration,
         reply: oneshot::Sender<Result<bool, TabError>>,
@@ -166,6 +170,21 @@ impl TabHandle {
             reply,
         })
         .await?;
+        recv_result(rx).await
+    }
+
+    /// Renders the tab's top-level document to a PNG.
+    ///
+    /// # Errors
+    ///
+    /// [`TabError::ActorStopped`], [`TabError::UnknownFrame`], or
+    /// [`TabError::Render`] when the pipeline refuses the document.
+    pub async fn screenshot(
+        &self,
+        request: renderer::ScreenshotRequest,
+    ) -> Result<Vec<u8>, TabError> {
+        let (reply, rx) = oneshot::channel();
+        self.send(Command::Screenshot { request, reply }).await?;
         recv_result(rx).await
     }
 
@@ -491,16 +510,33 @@ impl Tab {
 
     async fn renderer_request(&mut self, command: RendererCommand) -> Result<Reply, TabError> {
         if self.renderer.is_none() {
-            let mount = self.pending_mount.take().unwrap_or_else(blank_mount);
-            let site = Site::for_url(&self.document_url)
-                .or_else(|| self.site.clone())
-                .unwrap_or_else(|| Site::opaque(self.id));
-            self.mount(&site, 200, mount).await?;
+            self.mount_virtual().await?;
         }
         let Some(renderer) = self.renderer.clone() else {
             return Err(TabError::ActorStopped);
         };
         renderer.request(command).await
+    }
+
+    /// One streamed byte request (screenshots) against the tab's renderer,
+    /// mounting the virtual blank document when the tab has none.
+    async fn renderer_request_bytes(&mut self, command: RendererCommand) -> Result<Vec<u8>, TabError> {
+        if self.renderer.is_none() {
+            self.mount_virtual().await?;
+        }
+        let Some(renderer) = self.renderer.clone() else {
+            return Err(TabError::ActorStopped);
+        };
+        renderer.request_bytes(command).await
+    }
+
+    /// Mounts the virtual blank document this tab has been carrying.
+    async fn mount_virtual(&mut self) -> Result<(), TabError> {
+        let mount = self.pending_mount.take().unwrap_or_else(blank_mount);
+        let site = Site::for_url(&self.document_url)
+            .or_else(|| self.site.clone())
+            .unwrap_or_else(|| Site::opaque(self.id));
+        self.mount(&site, 200, mount).await
     }
 
     fn launch_navigation(&mut self) {
@@ -708,6 +744,15 @@ async fn handle_command(tab: &mut Tab, command: Command, waiters: &mut Vec<Waite
                 })
                 .await
                 .and_then(reply_value);
+            let _result = reply.send(result);
+        }
+        Command::Screenshot { request, reply } => {
+            let result = tab
+                .renderer_request_bytes(RendererCommand::Screenshot {
+                    frame: FrameId::MAIN,
+                    request,
+                })
+                .await;
             let _result = reply.send(result);
         }
         Command::RunUntilLoadTimeout { timeout, reply } => {

@@ -11,6 +11,8 @@ export interface Daemon {
   origin: string;
   /** Classic-script + fetch page served by the fixture. */
   pageUrl: string;
+  /** Deterministic layout page for screenshot assertions. */
+  shotUrl: string;
 }
 
 interface Fixtures {
@@ -18,6 +20,14 @@ interface Fixtures {
 }
 
 const PAGE = `<!doctype html><title>tiny</title><script src="/lib.js"></script><script>window.ready = false; fetch('/data').then(r => r.text()).then(t => { window.payload = t; window.ready = true; });</script>`;
+
+/** Fixed colors and positions the screenshot spec probes by pixel. */
+const SHOT = `<!doctype html><title>shot</title><style>
+html, body { margin: 0; padding: 0; }
+#red { background: #ff0000; width: 100px; height: 50px; }
+#blue { background: #0000ff; width: 50px; height: 50px; }
+p { margin: 16px 0 0 0; font-size: 20px; }
+</style><div id="red"></div><div id="blue"></div><p>Hello screenshot</p>`;
 
 async function waitForPort(jsonPath: string, timeoutMs: number): Promise<number> {
   const deadline = Date.now() + timeoutMs;
@@ -48,6 +58,9 @@ export const test = base.extend<Fixtures>({
       if (path === "/page") {
         response.writeHead(200, { "content-type": "text/html" });
         response.end(PAGE);
+      } else if (path === "/shot") {
+        response.writeHead(200, { "content-type": "text/html" });
+        response.end(SHOT);
       } else if (path === "/lib.js") {
         response.writeHead(200, { "content-type": "text/javascript" });
         response.end("window.fromLib = 7;");
@@ -79,6 +92,7 @@ export const test = base.extend<Fixtures>({
     await use({
       origin: `http://127.0.0.1:${port}`,
       pageUrl: `http://127.0.0.1:${httpPort}/page`,
+      shotUrl: `http://127.0.0.1:${httpPort}/shot`,
     });
 
     try {

@@ -1,0 +1,14 @@
+[package]
+name = "render"
+version = "0.1.0"
+edition = "2024"
+
+[lints]
+workspace = true
+
+[dependencies]
+dom = { workspace = true }
+cssparser = "=0.34.0"
+fontdue = "0.9"
+png = "0.17"
+tiny-skia = "0.12"

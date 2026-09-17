@@ -184,8 +184,8 @@ pub(crate) fn install(ctx: &Ctx<'_>, world: &Rc<RefCell<World>>) -> Result<()> {
     Class::<JsEvent>::define(&globals)?;
     ctx.eval::<(), _>(events::INSTALL_EVENT_CTOR_JS)?;
     install_webdriver_bridge(ctx, &globals)?;
-    globals.set("innerWidth", VIRTUAL_VIEWPORT_WIDTH)?;
-    globals.set("innerHeight", VIRTUAL_VIEWPORT_HEIGHT)?;
+    globals.set("innerWidth", f64::from(crate::engine::VIEWPORT_WIDTH))?;
+    globals.set("innerHeight", f64::from(crate::engine::VIEWPORT_HEIGHT))?;
     globals.set(
         "__tb_new_custom_event",
         rquickjs::prelude::Func::from(events::construct_custom_event),
@@ -357,10 +357,6 @@ pub(super) fn webdriver_element(ctx: Ctx<'_>, remote_id: f64) -> Result<Value<'_
 /// exist so `WebDriver` input targeting (`getClientRects`,
 /// `elementsFromPoint`, `scrollIntoView`) has coherent, unique geometry.
 /// Tests that assert real layout values still fail.
-const VIRTUAL_VIEWPORT_WIDTH: f64 = 800.0;
-
-const VIRTUAL_VIEWPORT_HEIGHT: f64 = 600.0;
-
 const VIRTUAL_CELL: f64 = 10.0;
 
 const VIRTUAL_COLUMNS: f64 = 80.0;

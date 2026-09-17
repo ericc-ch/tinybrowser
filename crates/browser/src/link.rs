@@ -52,6 +52,35 @@ pub(crate) struct PendingReply {
     reply: oneshot::Sender<Reply>,
 }
 
+/// A caller waiting for a streamed byte reply (screenshots).
+pub(crate) struct PendingBytes {
+    assignment: RendererAssignmentId,
+    reply: oneshot::Sender<Result<Vec<u8>, TabError>>,
+}
+
+/// One in-flight byte stream, established by the renderer's control reply and
+/// completed by body frames carrying the same request id.
+pub(crate) struct StreamState {
+    expected: usize,
+    buffer: Vec<u8>,
+    reply: oneshot::Sender<Result<Vec<u8>, TabError>>,
+}
+
+pub(crate) type PendingMap = Arc<Mutex<HashMap<u64, PendingReply>>>;
+pub(crate) type BytesMap = Arc<Mutex<HashMap<u64, PendingBytes>>>;
+pub(crate) type StreamMap = Arc<Mutex<HashMap<u64, StreamState>>>;
+
+/// Every reply-routing map, cloned into the tasks that complete waiters.
+#[derive(Clone)]
+pub(crate) struct Waiters {
+    /// Control reply waiters.
+    pub(crate) pending: PendingMap,
+    /// Byte-reply waiters still expecting their control reply.
+    pub(crate) byte_replies: BytesMap,
+    /// In-flight byte streams, established by the control reply.
+    pub(crate) streams: StreamMap,
+}
+
 pub(crate) enum Outbound {
     Control(ToRenderer),
     Body { request: u64, payload: Vec<u8> },
@@ -60,7 +89,7 @@ pub(crate) enum Outbound {
 /// Value-only handle to one renderer.
 pub(crate) struct RendererHandle {
     tx: mpsc::Sender<Outbound>,
-    pending: Arc<Mutex<HashMap<u64, PendingReply>>>,
+    waiters: Waiters,
     pub(crate) alive: Arc<AtomicBool>,
     subscribers: EventSubscribers,
     next_request: AtomicU64,
@@ -109,12 +138,20 @@ impl RendererAssignment {
     pub(crate) fn subscribe(&self) -> mpsc::Receiver<(FrameId, TabEvent)> {
         self.process.subscribe(self.id)
     }
+
+    /// Streams one request whose reply is bytes (screenshots).
+    pub(crate) async fn request_bytes(
+        &self,
+        command: RendererCommand,
+    ) -> Result<Vec<u8>, TabError> {
+        self.process.request_bytes(self.id, command).await
+    }
 }
 
 pub(crate) struct ResponseWriter {
     id: u64,
     tx: mpsc::Sender<Outbound>,
-    pending: Arc<Mutex<HashMap<u64, PendingReply>>>,
+    waiters: Waiters,
     reply: Option<oneshot::Receiver<Reply>>,
 }
 
@@ -152,7 +189,7 @@ impl ResponseWriter {
         let Some(reply) = self.reply.take() else {
             return Err(TabError::ActorStopped);
         };
-        await_reply(&self.pending, self.id, reply).await
+        await_reply(&self.waiters.pending, self.id, reply).await
     }
 }
 
@@ -161,7 +198,7 @@ impl Drop for ResponseWriter {
         if self.reply.is_none() {
             return;
         }
-        self.pending
+        self.waiters.pending
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .remove(&self.id);
@@ -266,7 +303,66 @@ impl RendererHandle {
             self.remove_pending(id);
             return Err(TabError::ActorStopped);
         }
-        await_reply(&self.pending, id, reply_rx).await
+        await_reply(&self.waiters.pending, id, reply_rx).await
+    }
+
+    /// Sends one command whose reply is a streamed byte payload and waits for
+    /// it to complete.
+    ///
+    /// # Errors
+    ///
+    /// [`TabError::ActorStopped`] when the renderer is gone, the stream is
+    /// incomplete when the process dies, or the reply times out.
+    async fn request_bytes(
+        &self,
+        assignment: RendererAssignmentId,
+        command: RendererCommand,
+    ) -> Result<Vec<u8>, TabError> {
+        let id = self.next_request.fetch_add(1, Ordering::Relaxed);
+        let (reply_tx, reply_rx) = oneshot::channel();
+        {
+            let mut waiters = self
+                .waiters.byte_replies
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if !self.alive.load(Ordering::Relaxed) {
+                return Err(TabError::ActorStopped);
+            }
+            waiters.insert(
+                id,
+                PendingBytes {
+                    assignment,
+                    reply: reply_tx,
+                },
+            );
+        }
+        if self
+            .tx
+            .send(Outbound::Control(ToRenderer::Request {
+                id,
+                assignment,
+                command,
+            }))
+            .await
+            .is_err()
+        {
+            self.remove_byte_waiter(id);
+            return Err(TabError::ActorStopped);
+        }
+        if let Ok(Ok(result)) = timeout(REQUEST_TIMEOUT, reply_rx).await {
+            result
+        } else {
+            self.remove_byte_waiter(id);
+            Err(TabError::ActorStopped)
+        }
+    }
+
+    fn remove_byte_waiter(&self, id: u64) {
+        let _removed = self
+            .waiters.byte_replies
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&id);
     }
 
     /// Registers the reply channel for request `id`.
@@ -278,7 +374,7 @@ impl RendererHandle {
         id: u64,
         assignment: RendererAssignmentId,
     ) -> Result<oneshot::Receiver<Reply>, TabError> {
-        let mut pending = self.pending.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut pending = self.waiters.pending.lock().unwrap_or_else(PoisonError::into_inner);
         if !self.alive.load(Ordering::Relaxed) {
             return Err(TabError::ActorStopped);
         }
@@ -346,7 +442,7 @@ impl RendererHandle {
         Ok(ResponseWriter {
             id,
             tx: self.tx.clone(),
-            pending: Arc::clone(&self.pending),
+            waiters: self.waiters.clone(),
             reply: Some(reply_rx),
         })
     }
@@ -390,7 +486,7 @@ impl RendererHandle {
 
     fn remove_pending(&self, id: u64) {
         let _removed = self
-            .pending
+            .waiters.pending
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .remove(&id);
@@ -411,7 +507,7 @@ struct RendererViolation;
 
 pub(crate) struct ReaderContext {
     tx: mpsc::Sender<Outbound>,
-    pending: Arc<Mutex<HashMap<u64, PendingReply>>>,
+    waiters: Waiters,
     pub(crate) alive: Arc<AtomicBool>,
     subscribers: EventSubscribers,
     fetch: FetchHandle,
@@ -424,7 +520,7 @@ pub(crate) async fn writer_task(
     mut rx: mpsc::Receiver<Outbound>,
     mut writer: Box<dyn AsyncWrite + Send + Unpin>,
     alive: Arc<AtomicBool>,
-    pending: Arc<Mutex<HashMap<u64, PendingReply>>>,
+    waiters: Waiters,
     kill: watch::Sender<bool>,
     mut kill_rx: watch::Receiver<bool>,
 ) {
@@ -445,7 +541,7 @@ pub(crate) async fn writer_task(
             }
         };
         if result.is_err() {
-            fail(&alive, &pending, &kill);
+            fail(&alive, &waiters, &kill);
             return;
         }
     }
@@ -459,14 +555,22 @@ pub(crate) async fn reader_task(
     let mut ready = ready;
     let mut buffer = Vec::new();
     loop {
-        let message = match crate::wire::channel::read_control_async::<FromRenderer, _>(
-            &mut *reader,
-            &mut buffer,
-        )
-        .await
-        {
-            Ok(Some(message)) => message,
+        let frame = match crate::wire::channel::read_frame_async(&mut *reader, &mut buffer).await {
+            Ok(Some(frame)) => frame,
             Ok(None) => break,
+            Err(error) => {
+                logging::error!(target: "browser::link", "bad renderer message: {error}");
+                break;
+            }
+        };
+        if frame.kind == crate::wire::channel::FrameKind::Body {
+            if route_body(frame.request, &buffer, &context).is_err() {
+                break;
+            }
+            continue;
+        }
+        let message = match crate::wire::channel::decode_control::<FromRenderer>(&buffer) {
+            Ok(message) => message,
             Err(error) => {
                 logging::error!(target: "browser::link", "bad renderer message: {error}");
                 break;
@@ -487,7 +591,7 @@ pub(crate) async fn reader_task(
     if let Some(ready_tx) = ready {
         let _ = ready_tx.send(false);
     }
-    fail(&context.alive, &context.pending, &context.kill);
+    fail(&context.alive, &context.waiters, &context.kill);
 }
 
 /// Routes one renderer message; a failure terminates the renderer.
@@ -500,8 +604,46 @@ async fn route(message: FromRenderer, context: &ReaderContext) -> Result<(), Ren
             assignment,
             reply,
         } => {
+            // A byte-streaming request answers with the payload length first;
+            // its body frames follow on the same request id.
+            if let Some(waiting) = context
+                .waiters.byte_replies
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .remove(&id)
+            {
+                if waiting.assignment != assignment {
+                    return Err(RendererViolation);
+                }
+                match reply {
+                    Reply::Screenshot { result: Ok(len) } => {
+                        let expected = usize::try_from(len).map_err(|_| RendererViolation)?;
+                        context
+                            .waiters.streams
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner)
+                            .insert(
+                                id,
+                                StreamState {
+                                    expected,
+                                    buffer: Vec::new(),
+                                    reply: waiting.reply,
+                                },
+                            );
+                    }
+                    Reply::Screenshot { result: Err(error) } => {
+                        let _ = waiting.reply.send(Err(error));
+                    }
+                    other => {
+                        let _ = waiting.reply.send(Err(TabError::RendererUnavailable {
+                            message: format!("unexpected reply for byte request: {other:?}"),
+                        }));
+                    }
+                }
+                return Ok(());
+            }
             if let Some(pending) = context
-                .pending
+                .waiters.pending
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .remove(&id)
@@ -553,6 +695,33 @@ async fn route(message: FromRenderer, context: &ReaderContext) -> Result<(), Ren
     Ok(())
 }
 
+/// Routes one raw body frame of a byte-streaming reply.
+///
+/// Body frames are only expected for a screenshot request whose control reply
+/// already carried the length; anything else is a protocol violation.
+fn route_body(
+    request: u64,
+    payload: &[u8],
+    context: &ReaderContext,
+) -> Result<(), RendererViolation> {
+    let mut streams = context
+        .waiters.streams
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    let Some(state) = streams.get_mut(&request) else {
+        return Err(RendererViolation);
+    };
+    state.buffer.extend_from_slice(payload);
+    if state.buffer.len() > state.expected {
+        return Err(RendererViolation);
+    }
+    if state.buffer.len() == state.expected {
+        let state = streams.remove(&request).ok_or(RendererViolation)?;
+        let _ = state.reply.send(Ok(state.buffer));
+    }
+    Ok(())
+}
+
 async fn route_service_call(
     context: &ReaderContext,
     assignment: RendererAssignmentId,
@@ -576,7 +745,7 @@ async fn route_service_call(
             };
             let worker_fetch = context.fetch.clone();
             let worker_tx = context.tx.clone();
-            let worker_pending = Arc::clone(&context.pending);
+            let worker_waiters = context.waiters.clone();
             let worker_alive = Arc::clone(&context.alive);
             let worker_kill = context.kill.clone();
             let cancel = context.kill.subscribe();
@@ -591,7 +760,7 @@ async fn route_service_call(
                     }))
                     .is_err()
                 {
-                    fail(&worker_alive, &worker_pending, &worker_kill);
+                    fail(&worker_alive, &worker_waiters, &worker_kill);
                 }
             });
         }
@@ -656,19 +825,24 @@ async fn send_reply(
         .map_err(|_| RendererViolation)
 }
 
-fn fail(
-    alive: &Arc<AtomicBool>,
-    pending: &Arc<Mutex<HashMap<u64, PendingReply>>>,
-    kill: &watch::Sender<bool>,
-) {
+fn fail(alive: &Arc<AtomicBool>, waiters: &Waiters, kill: &watch::Sender<bool>) {
     alive.store(false, Ordering::Relaxed);
-    fail_pending(pending);
+    waiters
+        .pending
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clear();
+    waiters
+        .byte_replies
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clear();
+    waiters
+        .streams
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clear();
     let _ = kill.send(true);
-}
-
-fn fail_pending(pending: &Arc<Mutex<HashMap<u64, PendingReply>>>) {
-    let mut pending = pending.lock().unwrap_or_else(PoisonError::into_inner);
-    pending.clear();
 }
 
 /// Forwards one renderer child's stderr into this process's logger.
@@ -760,7 +934,11 @@ pub(crate) async fn spawn_process(
     };
     let (tx, rx) = mpsc::channel::<Outbound>(COMMAND_CAPACITY);
     let (kill, kill_rx) = watch::channel(false);
-    let pending = Arc::new(Mutex::new(HashMap::new()));
+    let waiters = Waiters {
+        pending: Arc::new(Mutex::new(HashMap::new())),
+        byte_replies: Arc::new(Mutex::new(HashMap::new())),
+        streams: Arc::new(Mutex::new(HashMap::new())),
+    };
     let alive = Arc::new(AtomicBool::new(true));
     let subscribers = Arc::new(Mutex::new(HashMap::new()));
     let (ready_tx, ready_rx) = oneshot::channel();
@@ -768,7 +946,7 @@ pub(crate) async fn spawn_process(
         rx,
         writer,
         Arc::clone(&alive),
-        Arc::clone(&pending),
+        waiters.clone(),
         kill.clone(),
         kill_rx.clone(),
     ));
@@ -776,7 +954,7 @@ pub(crate) async fn spawn_process(
     let released = Arc::new(AtomicU64::new(0));
     let reader_context = ReaderContext {
         tx: tx.clone(),
-        pending: Arc::clone(&pending),
+        waiters: waiters.clone(),
         alive: Arc::clone(&alive),
         subscribers: Arc::clone(&subscribers),
         fetch: fetch.clone(),
@@ -805,7 +983,7 @@ pub(crate) async fn spawn_process(
     let tasks = vec![writer_task, reader_task, stderr_task];
     Ok(RendererHandle {
         tx,
-        pending,
+        waiters,
         alive,
         subscribers,
         next_request: AtomicU64::new(1),

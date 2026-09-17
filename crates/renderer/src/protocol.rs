@@ -66,6 +66,11 @@ pub enum TabError {
         /// The exhausted budget.
         resource: ResourceLimit,
     },
+    /// The screenshot render pipeline failed.
+    Render {
+        /// Diagnostics from style, layout, or paint.
+        message: String,
+    },
 }
 
 impl fmt::Display for TabError {
@@ -79,6 +84,7 @@ impl fmt::Display for TabError {
                 write!(f, "renderer unavailable: {message}")
             }
             Self::ResourceLimit { resource } => write!(f, "resource limit reached: {resource}"),
+            Self::Render { message } => write!(f, "render: {message}"),
         }
     }
 }
@@ -198,6 +204,31 @@ pub enum DialKind {
     ClassicScript,
     /// A child frame's navigation.
     FrameLoad,
+}
+
+/// One screenshot request: viewport size plus an optional crop window.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ScreenshotRequest {
+    /// Viewport width in CSS pixels.
+    pub viewport_width: f32,
+    /// Viewport height in CSS pixels.
+    pub viewport_height: f32,
+    /// Crop window in CSS pixels, when the caller wants less than the
+    /// viewport (Playwright's `clip`).
+    pub clip: Option<ScreenshotClip>,
+}
+
+/// A crop window for one screenshot.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ScreenshotClip {
+    /// Left edge in CSS pixels.
+    pub x: f32,
+    /// Top edge in CSS pixels.
+    pub y: f32,
+    /// Width in CSS pixels.
+    pub width: f32,
+    /// Height in CSS pixels.
+    pub height: f32,
 }
 
 /// One blocking GET the renderer asks the browser process to perform.

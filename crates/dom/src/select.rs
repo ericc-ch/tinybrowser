@@ -37,7 +37,7 @@ use selectors::{
         MatchingContext, MatchingForInvalidation, MatchingMode, NeedsSelectorFlags,
         QuirksMode as EngineQuirksMode, SelectorCaches,
     },
-    matching::matches_selector_list,
+    matching::{matches_selector, matches_selector_list},
     parser::{
         NonTSPseudoClass as NonTSPseudoClassTrait, ParseRelative, Parser as SelectorParser,
         PseudoElement as PseudoElementTrait, SelectorImpl, SelectorList, SelectorParseErrorKind,
@@ -1089,5 +1089,55 @@ impl Dom {
         let mut caches = SelectorCaches::default();
         let mut context = self.query_context(&mut caches);
         Ok(matches_selector_list(&list, &view, &mut context))
+    }
+
+    /// Compiles `selectors` once for repeated matching against elements.
+    ///
+    /// # Errors
+    ///
+    /// [`SelectError::Syntax`] if `selectors` does not parse.
+    pub fn compile_selectors(&self, selectors: &str) -> Result<CompiledSelectors, SelectError> {
+        Self::compile(selectors).map(CompiledSelectors)
+    }
+}
+
+/// A compiled selector list, reusable across many elements.
+///
+/// Style-rule matching tests one selector list against every element without
+/// recompiling; this wraps the engine's compiled form for that use.
+pub struct CompiledSelectors(SelectorList<Selectors>);
+
+impl CompiledSelectors {
+    /// The highest specificity among the list's matching selectors, or `None`
+    /// when no selector matches.
+    ///
+    /// CSS Cascade treats each selector of a list as a separate rule, so a
+    /// match carries the specificity of the selector that matched
+    /// (<https://drafts.csswg.org/css-cascade-5/#specificity-rules>).
+    #[must_use]
+    pub fn matching_specificity(&self, dom: &Dom, element: NodeId) -> Option<u32> {
+        let view = DomElement::new(dom, element)?;
+        let mut caches = SelectorCaches::default();
+        let mut context = dom.query_context(&mut caches);
+        let mut best: Option<u32> = None;
+        for selector in self.0.slice() {
+            if matches_selector(selector, 0, None, &view, &mut context) {
+                let specificity = selector.specificity();
+                best = Some(best.map_or(specificity, |current| current.max(specificity)));
+            }
+        }
+        best
+    }
+
+    /// How many selectors the list holds.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.0.slice().len()
+    }
+
+    /// Whether the list holds no selectors.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0.slice().is_empty()
     }
 }

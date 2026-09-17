@@ -30,9 +30,10 @@ use tungstenite::protocol::{Message, WebSocket as ClientSocket};
 
 mod dispatch;
 use dispatch::{
-    DispatchError, RUNTIME_HANDLE, RUNTIME_READ, RUNTIME_SCHEDULE, arguments_expression,
-    attach_session, exception_reply, exception_text_reply, json_io, json_string, open_url,
-    session_method, target_id, target_info, wait_for_navigation, ws_io,
+    DispatchError, RUNTIME_HANDLE, RUNTIME_HANDLE_READ, RUNTIME_HANDLE_SCHEDULE, RUNTIME_READ,
+    RUNTIME_SCHEDULE, arguments_expression, attach_session, capture_screenshot, exception_reply,
+    exception_text_reply, json_io, json_string, open_url, session_method, target_id, target_info,
+    wait_for_navigation, ws_io,
 };
 
 const PRODUCT: &str = "tinybrowser/0.1.0";
@@ -721,6 +722,7 @@ impl Conn {
                 Ok(json!({}))
             }
             "Page.navigate" => self.navigate_tab(params, tab).await,
+            "Page.captureScreenshot" => capture_screenshot(tab, params).await,
             "Runtime.enable" => {
                 self.push_session_event(
                     session,
@@ -839,6 +841,10 @@ impl Conn {
             .get("returnByValue")
             .and_then(Value::as_bool)
             .unwrap_or(false);
+        let await_promise = params
+            .get("awaitPromise")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         let source = if method == "Runtime.evaluate" {
             let expression = params
                 .get("expression")
@@ -861,9 +867,48 @@ impl Conn {
         };
         if return_by_value {
             Ok(Self::runtime_value(tab, &source).await)
+        } else if await_promise {
+            Ok(self.runtime_handle_awaited(tab, &source).await)
         } else {
             Ok(self.runtime_handle(tab, &source).await)
         }
+    }
+
+    /// Awaits a thenable and returns its CDP `RemoteObject`, storing objects
+    /// as handles: the `evaluateHandle` shape of
+    /// <https://chromedevtools.github.io/devtools-protocol/tot/Runtime/#method-callFunctionOn>.
+    async fn runtime_handle_awaited(&mut self, tab: &TabHandle, source: &str) -> Value {
+        let handle = self.next_handle;
+        self.next_handle = self.next_handle.saturating_add(1);
+        let schedule = RUNTIME_HANDLE_SCHEDULE.replace("__SOURCE__", source);
+        if let Err(error) = tab.execute_script(&schedule).await {
+            return exception_reply(&error);
+        }
+        match tab
+            .run_until_js_true(
+                "Boolean(globalThis.__tb_async_handle && globalThis.__tb_async_handle.done)",
+                Duration::from_secs(2),
+            )
+            .await
+        {
+            Ok(true) => {}
+            Ok(false) => return exception_text_reply("awaitPromise timed out"),
+            Err(error) => return exception_reply(&error),
+        }
+        let read = RUNTIME_HANDLE_READ.replace("__ID__", &json_string(&handle.to_string()));
+        let value = match tab.execute_script(&read).await {
+            Ok(value) => value,
+            Err(error) => return exception_reply(&error),
+        };
+        if let RemoteValue::String(text) = value
+            && let Ok(parsed) = serde_json::from_str::<Value>(&text)
+        {
+            if let Some(error) = parsed.get("error").and_then(Value::as_str) {
+                return exception_text_reply(error);
+            }
+            return json!({"result": parsed});
+        }
+        exception_text_reply("unexpected script result")
     }
 
     /// Stores the result in a page-side handle and returns its `objectId`;

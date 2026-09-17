@@ -35,7 +35,8 @@ pub use embedded::EmbeddedRenderer;
 pub use engine::Engine;
 pub use protocol::{
     BrowserServices, DialCompletion, DialFailure, DialKind, DialOutcome, DialRequest, FrameId,
-    MAX_RESPONSE_BODY_BYTES, Mount, ResourceLimit, ScriptFailure, TabError, TabEvent,
+    MAX_RESPONSE_BODY_BYTES, Mount, ResourceLimit, ScreenshotClip, ScreenshotRequest,
+    ScriptFailure, TabError, TabEvent,
 };
 pub use remote::RemoteValue;
 

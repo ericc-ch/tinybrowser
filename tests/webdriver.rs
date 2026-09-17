@@ -669,3 +669,23 @@ fn unknown_element_click_and_perform_actions_are_unsupported() {
     let released = request(&addr, "DELETE", &format!("/session/{id}/actions"), None);
     assert_eq!(released["value"], Value::Null);
 }
+
+#[test]
+fn take_screenshot_returns_base64_png() {
+    let (addr, _fixture) = start(Vec::new());
+    let created = request(&addr, "POST", "/session", Some("{}"));
+    let id = created["value"]["sessionId"]
+        .as_str()
+        .expect("session id")
+        .to_owned();
+    let shot = request(&addr, "GET", &format!("/session/{id}/screenshot"), None);
+    let data = shot["value"].as_str().expect("base64 string");
+    // PNG signature in base64: `89504e470d0a1a0a`.
+    assert!(
+        data.starts_with("iVBORw0KGgo"),
+        "not a PNG: {}",
+        &data[..12.min(data.len())]
+    );
+    // An 800x600 screenshot is far larger than the 8-byte signature.
+    assert!(data.len() > 200, "suspiciously small png: {} bytes", data.len());
+}

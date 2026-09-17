@@ -62,6 +62,13 @@ pub enum Command {
         /// Optional execution budget in milliseconds.
         timeout_ms: Option<u64>,
     },
+    /// Render one frame to a PNG and stream it back in body frames.
+    Screenshot {
+        /// Frame to render.
+        frame: FrameId,
+        /// Viewport and crop window.
+        request: renderer::ScreenshotRequest,
+    },
     /// Stop the renderer loop.
     Shutdown,
 }
@@ -75,6 +82,12 @@ pub enum Reply {
     Text(Result<String, TabError>),
     /// Value-only script result.
     Value(Result<RemoteValue, TabError>),
+    /// A PNG follows in body frames for this request id; `len` is its exact
+    /// byte length. The JSON control plane never carries the bytes.
+    Screenshot {
+        /// PNG byte length, or the failure that replaced it.
+        result: Result<u32, TabError>,
+    },
 }
 
 /// Host to renderer traffic.
@@ -278,6 +291,18 @@ mod tests {
                 },
             },
             ToRenderer::Request {
+                id: 4,
+                assignment: RendererAssignmentId::new(1),
+                command: Command::Screenshot {
+                    frame: FrameId::MAIN,
+                    request: renderer::ScreenshotRequest {
+                        viewport_width: 800.0,
+                        viewport_height: 600.0,
+                        clip: None,
+                    },
+                },
+            },
+            ToRenderer::Request {
                 id: 6,
                 assignment: RendererAssignmentId::new(1),
                 command: Command::Shutdown,
@@ -364,6 +389,11 @@ mod tests {
                 id: 5,
                 assignment: RendererAssignmentId::new(1),
                 reply: Reply::Value(Ok(RemoteValue::List(vec![RemoteValue::Number(1.0)]))),
+            },
+            FromRenderer::Reply {
+                id: 9,
+                assignment: RendererAssignmentId::new(1),
+                reply: Reply::Screenshot { result: Ok(3) },
             },
             FromRenderer::Event {
                 assignment: RendererAssignmentId::new(1),

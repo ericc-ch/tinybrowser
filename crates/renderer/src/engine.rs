@@ -19,6 +19,37 @@ use url::Url;
 
 use crate::RemoteValue;
 use crate::document::{Document, FrameRuntime, Stop, WindowMessage};
+
+/// The engine's virtual viewport in CSS pixels, shared with the JS bindings
+/// (`innerWidth`/`innerHeight`).
+pub(crate) const VIEWPORT_WIDTH: f32 = 800.0;
+/// See [`VIEWPORT_WIDTH`].
+pub(crate) const VIEWPORT_HEIGHT: f32 = 600.0;
+
+/// Every `<style>` element's CSS text, in document order.
+fn collect_stylesheets(dom: &dom::Dom) -> Vec<String> {
+    let mut sheets = Vec::new();
+    for node in dom.descendants(dom.document()) {
+        let Some(dom::NodeKind::Element { name, .. }) = dom.kind(node) else {
+            continue;
+        };
+        if name.ns != dom::html_namespace() || name.local.as_ref() != "style" {
+            continue;
+        }
+        let mut css = String::new();
+        if let Some(children) = dom.children(node) {
+            for &child in children {
+                if let Some(dom::NodeKind::Text { data }) = dom.kind(child) {
+                    css.push_str(data);
+                }
+            }
+        }
+        if !css.trim().is_empty() {
+            sheets.push(css);
+        }
+    }
+    sheets
+}
 use crate::documents::DocumentStore;
 use crate::js::{DocumentStreamCommand, FrameNavigation, RealmRegistry, SharedJsRuntime};
 use crate::messaging::{Delivery, MAX_FRAMES, SharedHandle};
@@ -216,6 +247,58 @@ impl Engine {
         let result = self.frame_mut(frame)?.execute_remote(source, timeout);
         self.reconcile_frames();
         result
+    }
+
+    /// Renders one frame to a PNG.
+    ///
+    /// The document's `<style>` sheets are applied. The viewport and crop
+    /// window come from the caller (Playwright's `clip`); the base viewport
+    /// is the shared 800x600 virtual size.
+    ///
+    /// # Errors
+    ///
+    /// [`TabError::UnknownFrame`] when the frame is not mounted and
+    /// [`TabError::Render`] when the pipeline refuses the document.
+    pub fn screenshot_frame(
+        &mut self,
+        frame: FrameId,
+        request: &crate::ScreenshotRequest,
+    ) -> Result<Vec<u8>, TabError> {
+        let document = self
+            .frames
+            .get(&frame)
+            .ok_or(TabError::UnknownFrame { frame: frame.get() })?;
+        let world = document.world();
+        let world = world.borrow();
+        let sheets = world
+            .with_main_document(|parsed| collect_stylesheets(&parsed.dom))
+            .ok_or_else(|| TabError::RendererUnavailable {
+                message: "no document to render".into(),
+            })?;
+        let options = render::RenderOptions {
+            width: request.viewport_width,
+            height: request.viewport_height,
+            scale: 1.0,
+        };
+        let image = world
+            .with_main_document(|parsed| render::render(&parsed.dom, &sheets, &options))
+            .ok_or_else(|| TabError::RendererUnavailable {
+                message: "no document to render".into(),
+            })?
+            .map_err(|error| TabError::Render {
+                message: error.to_string(),
+            })?;
+        let image = match request.clip {
+            Some(clip) => image
+                .crop(clip.x, clip.y, clip.width, clip.height)
+                .map_err(|error| TabError::Render {
+                    message: error.to_string(),
+                })?,
+            None => image,
+        };
+        render::encode_png(&image).map_err(|error| TabError::Render {
+            message: error.to_string(),
+        })
     }
 
     /// Removes and returns every pending event, with its frame.

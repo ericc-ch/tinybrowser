@@ -13,13 +13,24 @@ use renderer::{DialFailure, Engine, FrameId, MAX_RESPONSE_BODY_BYTES, Stop, TabE
 use tokio::sync::Notify;
 use url::Url;
 
-use super::{AssignmentServices, ChannelServices, RendererInput};
+use super::{AssignmentServices, ChannelServices, Outgoing, RendererInput};
+use crate::wire::channel::MAX_BODY_CHUNK_BYTES;
 use crate::wire::{Command, FromRenderer, RendererAssignmentId, Reply, ResponseStart, ToRenderer};
+
+/// What one host command produced.
+enum Handled {
+    /// A control-plane reply.
+    Reply(Reply),
+    /// A PNG to stream in body frames.
+    Screenshot(Vec<u8>),
+    /// The renderer should stop after answering.
+    Shutdown,
+}
 
 /// Runs the renderer loop until `Shutdown`, channel close, or stop.
 pub(super) async fn run(
     mut inbox: tokio::sync::mpsc::Receiver<RendererInput>,
-    outbox: &SyncSender<FromRenderer>,
+    outbox: &SyncSender<Outgoing>,
     services: Arc<ChannelServices>,
     stop: &Arc<Stop>,
     wake: Arc<Notify>,
@@ -27,8 +38,7 @@ pub(super) async fn run(
     let mut engines = HashMap::<RendererAssignmentId, Engine>::new();
     let mut responses = ResponseStreams::default();
     loop {
-        if !drain_engines(&mut engines, outbox) || stop.is_set() {
-            stop.request();
+        if !drain_engines(&mut engines, outbox) || stop.is_set() {            stop.request();
             break;
         }
         let deadline = engines.values().filter_map(Engine::next_deadline).min();
@@ -59,13 +69,20 @@ pub(super) async fn run(
                         stop.request();
                         break;
                     };
-                    let (reply, shutdown) = handle_command(engine, command, stop);
-                    if !send_to_browser(outbox, FromRenderer::Reply { id, assignment, reply }) {
-                        stop.request();
-                        break;
-                    }
-                    if shutdown {
-                        break;
+                    match handle_command(engine, command, stop) {
+                        Handled::Reply(reply) => {
+                            if !send_to_browser(outbox, FromRenderer::Reply { id, assignment, reply }) {
+                                stop.request();
+                                break;
+                            }
+                        }
+                        Handled::Screenshot(png) => {
+                            if !stream_screenshot(outbox, id, assignment, &png) {
+                                stop.request();
+                                break;
+                            }
+                        }
+                        Handled::Shutdown => break,
                     }
                 }
                 Some(RendererInput::Control(ToRenderer::ResponseStart { id, response })) => {
@@ -121,7 +138,7 @@ pub(super) async fn run(
 /// Runs every engine's ready work and publishes what it produced.
 fn drain_engines(
     engines: &mut HashMap<RendererAssignmentId, Engine>,
-    outbox: &SyncSender<FromRenderer>,
+    outbox: &SyncSender<Outgoing>,
 ) -> bool {
     for (assignment, engine) in engines {
         engine.drain_ready();
@@ -270,10 +287,14 @@ async fn wait_for_deadline(deadline: Option<tokio::time::Instant>) {
     }
 }
 
-fn handle_command(engine: &mut Engine, command: Command, stop: &Arc<Stop>) -> (Reply, bool) {
+fn handle_command(engine: &mut Engine, command: Command, stop: &Arc<Stop>) -> Handled {
     match command {
-        Command::Mount { frame, mount } => (Reply::Unit(engine.mount_frame(frame, &mount)), false),
-        Command::Eval { frame, source } => (Reply::Text(engine.eval_in(frame, &source)), false),
+        Command::Mount { frame, mount } => {
+            Handled::Reply(Reply::Unit(engine.mount_frame(frame, &mount)))
+        }
+        Command::Eval { frame, source } => {
+            Handled::Reply(Reply::Text(engine.eval_in(frame, &source)))
+        }
         Command::ExecuteScript {
             frame,
             source,
@@ -281,20 +302,67 @@ fn handle_command(engine: &mut Engine, command: Command, stop: &Arc<Stop>) -> (R
         } => {
             let timeout = timeout_ms.map(Duration::from_millis);
             let value = engine.execute_remote_in(frame, &source, timeout);
-            (Reply::Value(value), false)
+            Handled::Reply(Reply::Value(value))
         }
+        Command::Screenshot { frame, request } => match engine.screenshot_frame(frame, &request) {
+            Ok(png) => Handled::Screenshot(png),
+            Err(error) => Handled::Reply(Reply::Screenshot { result: Err(error) }),
+        },
         Command::Shutdown => {
             stop.request();
-            (Reply::Unit(Ok(())), true)
+            Handled::Shutdown
         }
     }
+}
+
+/// Announces a PNG and writes it as bounded body frames on the request id.
+fn stream_screenshot(
+    outbox: &SyncSender<Outgoing>,
+    id: u64,
+    assignment: RendererAssignmentId,
+    png: &[u8],
+) -> bool {
+    let Ok(len) = u32::try_from(png.len()) else {
+        return send_to_browser(
+            outbox,
+            FromRenderer::Reply {
+                id,
+                assignment,
+                reply: Reply::Screenshot {
+                    result: Err(stream_error("screenshot exceeds the IPC length cap")),
+                },
+            },
+        );
+    };
+    if !send_to_browser(
+        outbox,
+        FromRenderer::Reply {
+            id,
+            assignment,
+            reply: Reply::Screenshot { result: Ok(len) },
+        },
+    ) {
+        return false;
+    }
+    for chunk in png.chunks(MAX_BODY_CHUNK_BYTES) {
+        if outbox
+            .try_send(Outgoing::Body {
+                request: id,
+                payload: chunk.to_vec(),
+            })
+            .is_err()
+        {
+            return false;
+        }
+    }
+    true
 }
 
 /// Sends every event one engine produced, returning false when the host is gone.
 fn publish(
     assignment: RendererAssignmentId,
     engine: &mut Engine,
-    outbox: &SyncSender<FromRenderer>,
+    outbox: &SyncSender<Outgoing>,
 ) -> bool {
     let Ok(events) = engine.take_events() else {
         return false;
@@ -314,8 +382,8 @@ fn publish(
     true
 }
 
-fn send_to_browser(outbox: &SyncSender<FromRenderer>, message: FromRenderer) -> bool {
-    match outbox.try_send(message) {
+fn send_to_browser(outbox: &SyncSender<Outgoing>, message: FromRenderer) -> bool {
+    match outbox.try_send(Outgoing::Message(message)) {
         Ok(()) => true,
         Err(
             std::sync::mpsc::TrySendError::Full(_) | std::sync::mpsc::TrySendError::Disconnected(_),

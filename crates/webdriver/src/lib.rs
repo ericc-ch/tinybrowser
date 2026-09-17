@@ -16,13 +16,21 @@ use axum::body::Bytes;
 use axum::extract::State;
 use axum::http::{Method, StatusCode, Uri};
 use axum::response::{IntoResponse, Json, Response};
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use browser::{
-    BrowserHandle, CookieRecord, CookieSameSite, RemoteValue, ScriptFailure, TabError, TabHandle,
+    BrowserHandle, CookieRecord, CookieSameSite, RemoteValue, ScreenshotRequest, ScriptFailure,
+    TabError, TabHandle,
 };
 use serde_json::{Value, json};
 use tokio::sync::Mutex;
 
 pub use browser::AgentBuilder;
+
+/// Virtual viewport for screenshots, matching the renderer's `innerWidth`.
+const VIEWPORT_WIDTH: f32 = 800.0;
+/// See [`VIEWPORT_WIDTH`].
+const VIEWPORT_HEIGHT: f32 = 600.0;
 
 const ELEMENT_KEY: &str = "element-6066-11e4-a52e-4f735466cecf";
 const DEFAULT_SCRIPT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -150,6 +158,7 @@ async fn dispatch(method: &str, path: &str, body: &str, sessions: &mut Sessions)
         ("DELETE", ["session", session]) => delete_session(sessions, session).await,
         ("POST", ["session", session, "url"]) => navigate(sessions, session, body).await,
         ("GET", ["session", session, "url"]) => current_url(sessions, session).await,
+        ("GET", ["session", session, "screenshot"]) => take_screenshot(sessions, session).await,
         ("POST", ["session", session, "execute", "sync"]) => {
             execute(sessions, session, body, false).await
         }
@@ -243,6 +252,25 @@ async fn current_url(sessions: &Sessions, session: &str) -> (u16, Value) {
             Ok(url) => ok(json!(url)),
             Err(err) => error(500, "unknown error", &err.to_string()),
         },
+        None => error(404, "invalid session id", session),
+    }
+}
+
+/// W3C Take Screenshot: the value is a base64 PNG of the viewport
+/// (<https://w3c.github.io/webdriver/#take-screenshot>).
+async fn take_screenshot(sessions: &Sessions, session: &str) -> (u16, Value) {
+    match current(sessions, session) {
+        Some(window) => {
+            let request = ScreenshotRequest {
+                viewport_width: crate::VIEWPORT_WIDTH,
+                viewport_height: crate::VIEWPORT_HEIGHT,
+                clip: None,
+            };
+            match window.tab.screenshot(request).await {
+                Ok(png) => ok(json!(BASE64_STANDARD.encode(&png))),
+                Err(err) => error(500, "unable to capture screen", &err.to_string()),
+            }
+        }
         None => error(404, "invalid session id", session),
     }
 }
