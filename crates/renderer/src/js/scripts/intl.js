@@ -661,60 +661,54 @@
   });
 
   // https://402.ecma-international.org/#sup-number.prototype.tolocalestring
-  const numberLocaleMethods = {
-    toLocaleString() {
-      const value = call(numberValueOf, this);
-      return new NumberFormat(arguments[0], arguments[1]).format(value);
-    },
-  };
+  // https://402.ecma-international.org/#sup-date.prototype.tolocalestring
+  function localeMethod(name, compute) {
+    const method = function() { return compute(this, arguments[0], arguments[1]); };
+    Object.defineProperty(method, 'name', { value: name, configurable: true });
+    return method;
+  }
+
   // Firefox likewise keeps BigInt as an exact mathematical value until the
   // backend boundary instead of coercing it through Number.
   // https://searchfox.org/firefox-main/source/js/src/builtin/intl/NumberFormat.cpp#2023
-  const bigintLocaleMethods = {
-    toLocaleString() {
-      const value = call(bigintValueOf, this);
-      return new NumberFormat(arguments[0], arguments[1]).format(value);
-    },
-  };
-  // https://402.ecma-international.org/#sup-date.prototype.tolocalestring
-  const dateLocaleMethods = {
-    toLocaleString() {
-      const value = call(dateValueOf, this);
+  function numberLocaleMethod(unbox) {
+    // The receiver is validated before the formatter is built, so an invalid
+    // receiver neither reads option getters nor throws a locale error
+    // (<https://402.ecma-international.org/#sec-formatnumeric>).
+    return localeMethod('toLocaleString', (receiver, locales, options) => {
+      const value = call(unbox, receiver);
+      return new NumberFormat(locales, options).format(value);
+    });
+  }
+
+  function dateLocaleMethod(name, dateStyle, timeStyle) {
+    return localeMethod(name, (receiver, locales, options) => {
+      const value = call(dateValueOf, receiver);
       if (!numberIsFinite(value)) return 'Invalid Date';
       const formatter = objectCreate(DateTimeFormat.prototype);
-      initializeDateTimeFormat(formatter, arguments[0], arguments[1], 'any', 'all');
+      initializeDateTimeFormat(formatter, locales, options, dateStyle, timeStyle);
       return formatter.format(value);
-    },
-    toLocaleDateString() {
-      const value = call(dateValueOf, this);
-      if (!numberIsFinite(value)) return 'Invalid Date';
-      const formatter = objectCreate(DateTimeFormat.prototype);
-      initializeDateTimeFormat(formatter, arguments[0], arguments[1], 'date', 'date');
-      return formatter.format(value);
-    },
-    toLocaleTimeString() {
-      const value = call(dateValueOf, this);
-      if (!numberIsFinite(value)) return 'Invalid Date';
-      const formatter = objectCreate(DateTimeFormat.prototype);
-      initializeDateTimeFormat(formatter, arguments[0], arguments[1], 'time', 'time');
-      return formatter.format(value);
-    },
-  };
+    });
+  }
+
   Object.defineProperty(Number.prototype, 'toLocaleString', {
-    value: numberLocaleMethods.toLocaleString, writable: true, configurable: true,
+    value: numberLocaleMethod(numberValueOf), writable: true, configurable: true,
   });
   Object.defineProperty(BigInt.prototype, 'toLocaleString', {
-    value: bigintLocaleMethods.toLocaleString, writable: true, configurable: true,
+    value: numberLocaleMethod(bigintValueOf), writable: true, configurable: true,
   });
   Object.defineProperties(Date.prototype, {
     toLocaleString: {
-      value: dateLocaleMethods.toLocaleString, writable: true, configurable: true,
+      value: dateLocaleMethod('toLocaleString', 'any', 'all'),
+      writable: true, configurable: true,
     },
     toLocaleDateString: {
-      value: dateLocaleMethods.toLocaleDateString, writable: true, configurable: true,
+      value: dateLocaleMethod('toLocaleDateString', 'date', 'date'),
+      writable: true, configurable: true,
     },
     toLocaleTimeString: {
-      value: dateLocaleMethods.toLocaleTimeString, writable: true, configurable: true,
+      value: dateLocaleMethod('toLocaleTimeString', 'time', 'time'),
+      writable: true, configurable: true,
     },
   });
 

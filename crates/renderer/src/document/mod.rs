@@ -15,11 +15,14 @@ use tokio::time::Instant;
 use url::Url;
 
 use crate::ActiveParser;
+use crate::Parsed;
 use crate::ReadyState;
 use crate::documents::DocumentStore;
 use crate::js::{DocumentStreamCommand, FrameNavigation, RealmRegistry, SharedJsRuntime, World};
 use crate::messaging::SharedHandle;
-use crate::protocol::{BrowserServices, FrameId, Mount, ScriptFailure, TabError, TabEvent};
+use crate::protocol::{
+    BrowserServices, DialOutcome, FrameId, Mount, ScriptFailure, TabError, TabEvent,
+};
 
 mod dial;
 mod drain;
@@ -35,7 +38,7 @@ const MAX_PENDING_EVENTS: usize = 2048;
 enum Task {
     Timer(u32),
     DialFinished(CompletedDial),
-    DialFailed(DialFail),
+    DialFailed(DialContext),
     WindowMessage(WindowMessage),
     PortMessage {
         endpoint: u64,
@@ -55,51 +58,38 @@ pub(crate) struct WindowMessage {
     pub(crate) ports: Vec<u64>,
 }
 
-#[derive(Clone)]
-pub(crate) enum QueuedDial {
+/// The identity of one outstanding dial, shared by its request and its
+/// completion so the frame knows which operation the response belongs to.
+#[derive(Clone, Copy)]
+pub(crate) enum DialContext {
     JsFetch {
-        url: Url,
-        initiator: Url,
         id: i32,
         epoch: u64,
     },
     ClassicScript {
-        url: Url,
-        initiator: Url,
         element: dom::NodeId,
         epoch: u64,
     },
     /// A child frame's own navigation
-    /// (<https://html.spec.whatwg.org/multipage/browsing-the-web.html#navigate>).
+    /// (<https://html.spec.whatwg.org/multipage/browsing-the-web.html#navigate>);
+    /// a superseded load is dropped when it completes.
     FrameLoad {
-        url: Url,
-        initiator: Url,
-        /// Identifies the frame's current navigation; a superseded load is
-        /// dropped when it completes.
         sequence: u64,
     },
 }
 
-pub(crate) enum CompletedDial {
-    JsFetch {
-        status: u16,
-        body: Vec<u8>,
-        id: i32,
-        epoch: u64,
-    },
-    ClassicScript {
-        status: u16,
-        body: Vec<u8>,
-        element: dom::NodeId,
-        epoch: u64,
-    },
-    FrameLoad {
-        body: Vec<u8>,
-        content_type: Option<String>,
-        content_language: Option<String>,
-        final_url: String,
-        sequence: u64,
-    },
+/// One dial waiting to start, with the URL and initiator it runs under.
+#[derive(Clone)]
+pub(crate) struct QueuedDial {
+    pub(crate) context: DialContext,
+    pub(crate) url: Url,
+    pub(crate) initiator: Url,
+}
+
+/// One finished dial with the response it produced.
+pub(crate) struct CompletedDial {
+    pub(crate) context: DialContext,
+    pub(crate) outcome: DialOutcome,
 }
 
 /// Who feeds the active parser, and therefore who may end it.
@@ -111,13 +101,6 @@ enum ParserOwner {
     /// A script's `document.open()`: it writes text, and `document.close()`
     /// ends the parser.
     Script,
-}
-
-#[derive(Clone, Copy)]
-pub(crate) enum DialFail {
-    JsFetch { id: i32, epoch: u64 },
-    ClassicScript { epoch: u64 },
-    FrameLoad { sequence: u64 },
 }
 
 struct Timer {
@@ -158,8 +141,8 @@ pub(crate) struct Document {
     tasks: VecDeque<Task>,
     timers: Vec<Timer>,
     next_timer_id: u32,
-    dial_tx: Sender<Result<CompletedDial, DialFail>>,
-    dial_rx: Receiver<Result<CompletedDial, DialFail>>,
+    dial_tx: Sender<Result<CompletedDial, DialContext>>,
+    dial_rx: Receiver<Result<CompletedDial, DialContext>>,
     in_flight_dials: usize,
     queued_dials: Vec<QueuedDial>,
     /// Identifies the frame's current navigation; completions from superseded
@@ -177,11 +160,9 @@ pub(crate) struct Document {
     /// same-document move of an `iframe` is noticed without walking the tree
     /// every turn (<https://html.spec.whatwg.org/multipage/nav-history-apis.html#dom-length>).
     frame_order_serial: u64,
-    /// Child browsing contexts whose load event has not fired yet; this
+    /// The `iframe` containers awaiting their child's load event; this
     /// document's own `load` event is delayed until they all have
     /// (<https://html.spec.whatwg.org/multipage/parsing.html#delay-the-load-event>).
-    pending_child_loads: u32,
-    /// The `iframe` containers awaiting their child's load event.
     pending_frame_loads: HashSet<dom::NodeId>,
     /// Whether this document's `load` event has fired.
     load_fired: bool,
@@ -240,7 +221,6 @@ impl Document {
             frame_load_in_flight: false,
             initial_blank: true,
             frame_order_serial: u64::MAX,
-            pending_child_loads: 0,
             pending_frame_loads: HashSet::new(),
             load_fired: false,
             events: Vec::new(),
@@ -334,11 +314,7 @@ impl Document {
     /// Applies writes the realm stored on a child frame's `contentWindow`
     /// before that frame's realm existed.
     pub(crate) fn flush_frame_proxy_sets(&mut self, child: FrameId) {
-        if let Some(js) = &self.js
-            && js.flush_frame_sets(child.get()).is_err()
-        {
-            self.record_event(TabEvent::ScriptFailed);
-        }
+        self.fire_js(|js| js.flush_frame_sets(child.get()));
         self.adopt_js_work();
     }
 
@@ -372,11 +348,7 @@ impl Document {
     }
 
     pub(crate) fn fire_node_load(&mut self, id: dom::NodeId) {
-        if let Some(js) = &self.js
-            && js.fire_node_load(id).is_err()
-        {
-            self.record_event(TabEvent::ScriptFailed);
-        }
+        self.fire_js(|js| js.fire_node_load(id));
         self.adopt_js_work();
     }
 
@@ -386,10 +358,12 @@ impl Document {
         self.frame_load_sequence = self.frame_load_sequence.wrapping_add(1);
         self.frame_load_in_flight = true;
         self.initial_blank = false;
-        self.queued_dials.push(QueuedDial::FrameLoad {
+        self.queued_dials.push(QueuedDial {
+            context: DialContext::FrameLoad {
+                sequence: self.frame_load_sequence,
+            },
             url,
             initiator,
-            sequence: self.frame_load_sequence,
         });
     }
 
@@ -402,7 +376,7 @@ impl Document {
         }
         self.load_html("");
         self.initial_blank = true;
-        self.ensure_frame_js();
+        self.ensure_js_ok();
     }
 
     /// Whether the frame is still on the document created at insertion.
@@ -440,19 +414,11 @@ impl Document {
         content_language: Option<&str>,
         body: &[u8],
     ) {
-        self.begin_response(Some(url), content_type, content_language);
-        self.write_body(body);
-        self.end_body();
-        self.ensure_frame_js();
-    }
-
-    /// Every frame has a window; make sure the realm exists even when the
-    /// document never runs a script, so a parent can set properties on it
-    /// (<https://html.spec.whatwg.org/multipage/window-object.html#the-window-object>).
-    fn ensure_frame_js(&mut self) {
-        if self.ensure_js().is_err() {
-            self.record_event(TabEvent::ScriptFailed);
-        }
+        self.load_response_body(url, content_type, content_language, body);
+        // Every frame has a window; make sure the realm exists even when the
+        // document never runs a script, so a parent can set properties on it
+        // (<https://html.spec.whatwg.org/multipage/window-object.html#the-window-object>).
+        self.ensure_js_ok();
     }
 
     /// Runs a `javascript:` frame URL's script in the frame's realm, replacing
@@ -503,29 +469,23 @@ impl Document {
     }
 
     fn deliver_window_message(&mut self, message: &WindowMessage) {
-        if self.ensure_js().is_err() {
-            self.record_event(TabEvent::ScriptFailed);
+        if !self.ensure_js_ok() {
             return;
         }
-        let Some(js) = &self.js else {
-            return;
+        let delivered = match &self.js {
+            Some(js) => js.deliver_window_message(
+                message.source.get(),
+                &message.origin,
+                &message.payload,
+                &message.ports,
+            ),
+            None => return,
         };
-        let delivered = js.deliver_window_message(
-            message.source.get(),
-            &message.origin,
-            &message.payload,
-            &message.ports,
-        );
         match delivered {
             Ok(true) => {}
-            Ok(false) => {
-                if js
-                    .deliver_window_message_error(message.source.get(), &message.origin)
-                    .is_err()
-                {
-                    self.record_event(TabEvent::ScriptFailed);
-                }
-            }
+            Ok(false) => self.fire_js(|js| {
+                js.deliver_window_message_error(message.source.get(), &message.origin)
+            }),
             Err(_) => self.record_event(TabEvent::ScriptFailed),
         }
         self.adopt_js_work();
@@ -542,20 +502,16 @@ impl Document {
             shared.requeue_port_message(endpoint, payload.to_owned(), ports.to_vec());
             return;
         }
-        if self.ensure_js().is_err() {
-            self.record_event(TabEvent::ScriptFailed);
+        if !self.ensure_js_ok() {
             return;
         }
-        let Some(js) = &self.js else {
-            return;
+        let delivered = match &self.js {
+            Some(js) => js.deliver_port_message(endpoint, payload, ports),
+            None => return,
         };
-        match js.deliver_port_message(endpoint, payload, ports) {
+        match delivered {
             Ok(true) => {}
-            Ok(false) => {
-                if js.deliver_port_message_error(endpoint).is_err() {
-                    self.record_event(TabEvent::ScriptFailed);
-                }
-            }
+            Ok(false) => self.fire_js(|js| js.deliver_port_message_error(endpoint)),
             Err(_) => self.record_event(TabEvent::ScriptFailed),
         }
         self.adopt_js_work();
@@ -567,15 +523,10 @@ impl Document {
             shared.borrow_mut().requeue_port_close(endpoint);
             return;
         }
-        if self.ensure_js().is_err() {
-            self.record_event(TabEvent::ScriptFailed);
+        if !self.ensure_js_ok() {
             return;
         }
-        if let Some(js) = &self.js
-            && js.deliver_port_close(endpoint).is_err()
-        {
-            self.record_event(TabEvent::ScriptFailed);
-        }
+        self.fire_js(|js| js.deliver_port_close(endpoint));
         self.adopt_js_work();
     }
 
@@ -642,34 +593,31 @@ impl Document {
         let url = Url::parse(&mount.url).map_err(|_| TabError::InvalidUrl {
             spec: mount.url.clone(),
         })?;
-        self.begin_response(
-            Some(&url),
+        self.load_response_body(
+            &url,
             mount.content_type.as_deref(),
             mount.content_language.as_deref(),
+            &mount.body,
         );
-        self.write_body(&mount.body);
-        self.end_body();
         Ok(())
     }
 
-    /// Opens a document body that will arrive in pieces.
+    /// Opens a parser on `input`, taking ownership of the input stream.
     ///
-    /// The realm is already new when this runs; this opens the parser and,
-    /// when a response feeds it, the decoder for that response.
-    fn open_parser(&mut self, content_type: Option<&str>, owner: ParserOwner) {
+    /// `decoder` is set exactly when bytes still arrive from the carrier; a
+    /// script's `document.write` feeds text directly instead.
+    fn start_parser(
+        &mut self,
+        input: &str,
+        eof: bool,
+        owner: ParserOwner,
+        decoder: Option<dial::ResponseDecoder>,
+    ) {
         self.world.borrow_mut().parser_active = true;
-        self.parser_eof = false;
-        // A script writes text, not bytes, and it takes the input stream away
-        // from any live response: dropping the decoder ignores the rest of
-        // that body instead of decoding it with the wrong charset.
-        self.decoder = match owner {
-            ParserOwner::Carrier => {
-                Some(dial::ResponseDecoder::new(content_type.map(str::to_owned)))
-            }
-            ParserOwner::Script => None,
-        };
+        self.parser_eof = eof;
+        self.decoder = decoder;
         self.parser_owner = owner;
-        self.active_parser = Some(ActiveParser::new(""));
+        self.active_parser = Some(ActiveParser::new(input));
     }
 
     /// Starts a document from a network response: a new realm, the response's
@@ -692,7 +640,28 @@ impl Document {
         let mut world = self.world.borrow_mut();
         world.document_url = self.url.clone();
         drop(world);
-        self.open_parser(content_type, ParserOwner::Carrier);
+        // The realm is already new when this runs; this opens the parser and
+        // the decoder for the response that will feed it.
+        self.start_parser(
+            "",
+            false,
+            ParserOwner::Carrier,
+            Some(dial::ResponseDecoder::new(content_type.map(str::to_owned))),
+        );
+    }
+
+    /// Starts a document from a complete response: new realm, the response's
+    /// URL and language, and the whole body.
+    fn load_response_body(
+        &mut self,
+        url: &Url,
+        content_type: Option<&str>,
+        content_language: Option<&str>,
+        body: &[u8],
+    ) {
+        self.begin_response(Some(url), content_type, content_language);
+        self.write_body(body);
+        self.end_body();
     }
 
     /// Feeds response bytes. The decoder holds them until the encoding is
@@ -754,22 +723,20 @@ impl Document {
     /// <https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#document-open-steps>
     pub(crate) fn reopen_document(&mut self) {
         self.reset_js_realm();
-        self.open_parser(None, ParserOwner::Script);
+        // A script writes text, not bytes, and it takes the input stream away
+        // from any live response: dropping the decoder ignores the rest of
+        // that body instead of decoding it with the wrong charset.
+        self.start_parser("", false, ParserOwner::Script, None);
     }
 
     /// Parses `input` into this document and starts a new JS realm.
     ///
     /// The caller already holds the whole document, so the parser starts at
-    /// EOF with the markup in hand.
+    /// EOF with the markup in hand and no decoder, but the carrier owns this
+    /// parser: `document.close()` must not end it.
     pub(crate) fn load_html(&mut self, input: &str) {
         self.reset_js_realm();
-        self.world.borrow_mut().parser_active = true;
-        self.parser_eof = true;
-        // The markup is in hand, so no decoder is involved, but the carrier
-        // owns this parser: `document.close()` must not end it.
-        self.decoder = None;
-        self.parser_owner = ParserOwner::Carrier;
-        self.active_parser = Some(ActiveParser::new(input));
+        self.start_parser(input, true, ParserOwner::Carrier, None);
         self.advance_parser();
     }
 
@@ -777,6 +744,27 @@ impl Document {
     fn register_document(&self, document: u32) {
         let registry = self.world.borrow().registry();
         registry.borrow_mut().insert_document(document, &self.world);
+    }
+
+    /// Runs one realm operation and records a failed script when it throws.
+    fn fire_js(
+        &mut self,
+        operation: impl FnOnce(&crate::js::JsRealm) -> Result<(), crate::js::JsError>,
+    ) {
+        let failed = self.js.as_ref().is_some_and(|js| operation(js).is_err());
+        if failed {
+            self.record_event(TabEvent::ScriptFailed);
+        }
+    }
+
+    /// Ensures the frame's realm exists, recording a failed script when it
+    /// cannot be created.
+    fn ensure_js_ok(&mut self) -> bool {
+        if self.ensure_js().is_err() {
+            self.record_event(TabEvent::ScriptFailed);
+            return false;
+        }
+        true
     }
 
     fn ensure_js(&mut self) -> Result<(), TabError> {
@@ -804,7 +792,6 @@ impl Document {
         }
         self.frame_load_in_flight = false;
         self.load_fired = false;
-        self.pending_child_loads = 0;
         self.pending_frame_loads.clear();
         // Any frame load that completes after this point belongs to the
         // replaced document, even when it was started through a synchronous
@@ -857,11 +844,7 @@ impl Document {
         // https://html.spec.whatwg.org/multipage/webappapis.html#run-a-classic-script
         let previous = self.world.borrow().current_script;
         self.world.borrow_mut().current_script = element;
-        if let Some(js) = &self.js
-            && js.eval(source).is_err()
-        {
-            self.record_event(TabEvent::ScriptFailed);
-        }
+        self.fire_js(|js| js.eval(source).map(|_| ()));
         self.world.borrow_mut().current_script = previous;
         self.adopt_js_work();
     }
@@ -872,10 +855,23 @@ impl Document {
     /// the document's `MutationObserver`s would otherwise not fire until the
     /// next scripted mutation.
     fn deliver_mutations(&mut self) {
-        if let Some(js) = &self.js
-            && js.deliver_mutations().is_err()
-        {
-            self.record_event(TabEvent::ScriptFailed);
+        self.fire_js(crate::js::JsRealm::deliver_mutations);
+    }
+
+    /// Installs `parsed` as the active document and registers it, reporting
+    /// whether a realm owns it afterwards.
+    fn install_parsed(&mut self, mut parsed: Parsed) -> bool {
+        parsed
+            .dom
+            .set_document_language(self.content_language.clone());
+        if self.js.is_none() {
+            let document = self.world.borrow_mut().replace_document(parsed);
+            self.register_document(document);
+            self.ensure_js().is_ok()
+        } else {
+            let document = self.world.borrow_mut().set_document(parsed);
+            self.register_document(document);
+            true
         }
     }
 
@@ -889,22 +885,10 @@ impl Document {
             match parser.advance() {
                 crate::ParseProgress::Script(id) => {
                     let parsed = parser.take_state();
-                    if self.js.is_none() {
-                        let document = self.world.borrow_mut().replace_document(parsed);
-                        self.register_document(document);
-                        if self.ensure_js().is_err() {
-                            self.record_event(TabEvent::ScriptFailed);
-                            self.sync_parser_from_world();
-                            continue;
-                        }
-                    } else {
-                        let document = self.world.borrow_mut().set_document(parsed);
-                        self.register_document(document);
-                    }
-                    if let Some(mut parsed) = self.world.borrow().main_document_mut() {
-                        parsed
-                            .dom
-                            .set_document_language(self.content_language.clone());
+                    if !self.install_parsed(parsed) {
+                        self.record_event(TabEvent::ScriptFailed);
+                        self.sync_parser_from_world();
+                        continue;
                     }
                     // A script may query a child frame's window; the browsing
                     // context must exist by then.
@@ -922,11 +906,13 @@ impl Document {
                             if let Ok(url) = self.resolve_dial_url(&src) {
                                 self.classic_fetch_in_flight = true;
                                 let initiator = self.url.clone();
-                                self.queued_dials.push(QueuedDial::ClassicScript {
+                                self.queued_dials.push(QueuedDial {
+                                    context: DialContext::ClassicScript {
+                                        element: id,
+                                        epoch: self.js_epoch,
+                                    },
                                     url,
                                     initiator,
-                                    element: id,
-                                    epoch: self.js_epoch,
                                 });
                                 return;
                             }
@@ -942,20 +928,10 @@ impl Document {
                     let Some(parser) = self.active_parser.take() else {
                         return;
                     };
-                    let mut parsed = parser.finish();
-                    parsed
-                        .dom
-                        .set_document_language(self.content_language.clone());
-                    if self.js.is_none() {
-                        let document = self.world.borrow_mut().replace_document(parsed);
-                        self.register_document(document);
-                        if self.ensure_js().is_err() {
-                            self.record_event(TabEvent::ScriptFailed);
-                            return;
-                        }
-                    } else {
-                        let document = self.world.borrow_mut().set_document(parsed);
-                        self.register_document(document);
+                    let parsed = parser.finish();
+                    if !self.install_parsed(parsed) {
+                        self.record_event(TabEvent::ScriptFailed);
+                        return;
                     }
                     self.world.borrow_mut().parser_active = false;
                     // Deliver parser mutations before the document's events.
@@ -968,9 +944,9 @@ impl Document {
     }
 
     pub(in crate::document) fn resolve_dial_url(&self, spec: &str) -> Result<Url, TabError> {
-        let url = Url::parse(spec)
-            .or_else(|_| self.base_url().join(spec))
-            .map_err(|_| TabError::InvalidUrl { spec: spec.into() })?;
+        let url = self
+            .resolve_frame_url(spec)
+            .ok_or_else(|| TabError::InvalidUrl { spec: spec.into() })?;
         if url.scheme() != "http" && url.scheme() != "https" {
             return Err(TabError::InvalidUrl { spec: spec.into() });
         }
@@ -992,77 +968,68 @@ impl Document {
     }
 
     pub(in crate::document) fn finish_dial(&mut self, done: CompletedDial) {
-        match done {
-            CompletedDial::JsFetch {
-                status,
-                body,
-                id,
-                epoch,
-            } => {
-                self.record_event(TabEvent::Fetch { status });
+        let CompletedDial { context, outcome } = done;
+        match context {
+            DialContext::JsFetch { id, epoch } => {
+                self.record_event(TabEvent::Fetch {
+                    status: outcome.status,
+                });
                 if epoch == self.js_epoch {
-                    let body = String::from_utf8_lossy(&body);
-                    self.settle_js_fetch(id, true, i32::from(status), &body);
+                    let body = String::from_utf8_lossy(&outcome.body);
+                    self.settle_js_fetch(id, true, i32::from(outcome.status), &body);
                 }
             }
-            CompletedDial::ClassicScript {
-                status,
-                body,
-                element,
-                epoch,
-            } => {
-                self.record_event(TabEvent::Fetch { status });
+            DialContext::ClassicScript { element, epoch } => {
+                self.record_event(TabEvent::Fetch {
+                    status: outcome.status,
+                });
                 if epoch == self.js_epoch {
                     self.classic_fetch_in_flight = false;
-                    if (200..300).contains(&status) {
-                        let source = String::from_utf8_lossy(&body);
+                    if (200..300).contains(&outcome.status) {
+                        let source = String::from_utf8_lossy(&outcome.body);
                         self.eval_classic(&source, Some(element));
                     }
                     self.sync_parser_from_world();
                     self.advance_parser();
                 }
             }
-            CompletedDial::FrameLoad {
-                body,
-                content_type,
-                content_language,
-                final_url,
-                sequence,
-            } => {
+            DialContext::FrameLoad { sequence } => {
+                // The superseded-load early return deliberately skips the
+                // trailing `adopt_js_work()` below.
                 if sequence != self.frame_load_sequence {
                     return;
                 }
                 self.frame_load_in_flight = false;
-                let Ok(url) = Url::parse(&final_url) else {
+                let Ok(url) = Url::parse(&outcome.final_url) else {
                     return;
                 };
                 self.load_frame_response(
                     &url,
-                    content_type.as_deref(),
-                    content_language.as_deref(),
-                    &body,
+                    outcome.content_type.as_deref(),
+                    outcome.content_language.as_deref(),
+                    &outcome.body,
                 );
             }
         }
         self.adopt_js_work();
     }
 
-    pub(in crate::document) fn fail_dial(&mut self, fail: DialFail) {
+    pub(in crate::document) fn fail_dial(&mut self, fail: DialContext) {
         self.record_event(TabEvent::FetchFailed);
         match fail {
-            DialFail::JsFetch { id, epoch } => {
+            DialContext::JsFetch { id, epoch } => {
                 if epoch == self.js_epoch {
                     self.settle_js_fetch(id, false, 0, "");
                 }
             }
-            DialFail::ClassicScript { epoch } => {
+            DialContext::ClassicScript { epoch, .. } => {
                 if epoch == self.js_epoch {
                     self.classic_fetch_in_flight = false;
                     self.sync_parser_from_world();
                     self.advance_parser();
                 }
             }
-            DialFail::FrameLoad { sequence } => {
+            DialContext::FrameLoad { sequence } => {
                 if sequence == self.frame_load_sequence {
                     // Keep the frame's current (about:blank) document; the
                     // container's load event still fires because the frame is
@@ -1081,11 +1048,7 @@ impl Document {
         status: i32,
         body: &str,
     ) {
-        if let Some(js) = &self.js
-            && js.finish_js_fetch(id, ok, status, body).is_err()
-        {
-            self.record_event(TabEvent::ScriptFailed);
-        }
+        self.fire_js(|js| js.finish_js_fetch(id, ok, status, body));
     }
 
     fn sync_parser_from_world(&self) {
@@ -1116,16 +1079,8 @@ impl Document {
         self.world
             .borrow_mut()
             .set_main_ready_state(ReadyState::Interactive);
-        if let Some(js) = &self.js
-            && js.fire_ready_state_change().is_err()
-        {
-            self.record_event(TabEvent::ScriptFailed);
-        }
-        if let Some(js) = &self.js
-            && js.fire_dom_content_loaded().is_err()
-        {
-            self.record_event(TabEvent::ScriptFailed);
-        }
+        self.fire_js(crate::js::JsRealm::fire_ready_state_change);
+        self.fire_js(crate::js::JsRealm::fire_dom_content_loaded);
         self.adopt_js_work();
         // A script may have appended an iframe after the parser finished; its
         // load must delay this document's own load event
@@ -1141,11 +1096,7 @@ impl Document {
         self.world
             .borrow_mut()
             .set_main_ready_state(ReadyState::Complete);
-        if let Some(js) = &self.js
-            && js.fire_ready_state_change().is_err()
-        {
-            self.record_event(TabEvent::ScriptFailed);
-        }
+        self.fire_js(crate::js::JsRealm::fire_ready_state_change);
         self.maybe_fire_load();
     }
 
@@ -1154,27 +1105,21 @@ impl Document {
     /// (<https://html.spec.whatwg.org/multipage/parsing.html#delay-the-load-event>).
     pub(crate) fn maybe_fire_load(&mut self) {
         if self.load_fired
-            || self.pending_child_loads > 0
+            || !self.pending_frame_loads.is_empty()
             || self.world.borrow().main_ready_state() != ReadyState::Complete
         {
             return;
         }
         self.load_fired = true;
         self.record_event(TabEvent::Load);
-        if let Some(js) = &self.js
-            && js.fire_load().is_err()
-        {
-            self.record_event(TabEvent::ScriptFailed);
-        }
+        self.fire_js(crate::js::JsRealm::fire_load);
         self.adopt_js_work();
     }
 
     /// A child browsing context started loading; this document's `load` event
     /// waits for it, and the container is remembered until it finishes.
     pub(crate) fn mark_frame_load_pending(&mut self, container: dom::NodeId) {
-        if self.pending_frame_loads.insert(container) {
-            self.pending_child_loads = self.pending_child_loads.saturating_add(1);
-        }
+        self.pending_frame_loads.insert(container);
     }
 
     /// The containers whose child frames have not finished loading.
@@ -1188,7 +1133,6 @@ impl Document {
         if !self.pending_frame_loads.remove(&container) {
             return false;
         }
-        self.pending_child_loads = self.pending_child_loads.saturating_sub(1);
         self.fire_node_load(container);
         self.maybe_fire_load();
         true
@@ -1197,7 +1141,6 @@ impl Document {
     /// Drops a container that went away before its child finished loading.
     pub(crate) fn cancel_frame_load(&mut self, container: dom::NodeId) {
         if self.pending_frame_loads.remove(&container) {
-            self.pending_child_loads = self.pending_child_loads.saturating_sub(1);
             self.maybe_fire_load();
         }
     }

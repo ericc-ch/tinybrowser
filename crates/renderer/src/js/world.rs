@@ -3,20 +3,15 @@
 use std::cell::{Cell, Ref, RefCell, RefMut};
 use std::collections::{HashMap, HashSet};
 use std::rc::{Rc, Weak};
-use std::sync::Arc;
 
 use dom::NodeId;
 use rquickjs::{Object, Persistent, Value, class::Trace, function::Function};
-use tokio::sync::Notify;
 use url::Url;
 
-use crate::document::{Document, FrameRuntime, Stop};
-use crate::documents::DocumentStore;
+use crate::document::{Document, FrameRuntime};
 use crate::messaging::{MAX_FRAMES, SharedHandle};
-use crate::protocol::{BrowserServices, FrameId};
+use crate::protocol::FrameId;
 use crate::{Parsed, ReadyState};
-
-use super::SharedJsRuntime;
 
 /// Renderer-process realm bookkeeping shared by every frame.
 ///
@@ -185,6 +180,24 @@ pub(crate) struct RecordData {
     pub old_value: Option<String>,
 }
 
+impl RecordData {
+    /// A record of one mutation type on one target, with every payload
+    /// collection empty.
+    pub(crate) fn new(typ: &str, target: Handle) -> Self {
+        Self {
+            typ: typ.to_owned(),
+            target,
+            added: Vec::new(),
+            removed: Vec::new(),
+            previous: None,
+            next: None,
+            attribute_name: None,
+            attribute_namespace: None,
+            old_value: None,
+        }
+    }
+}
+
 pub(crate) struct ObserverState {
     pub callback: Persistent<Function<'static>>,
     /// The observer platform object, for the callback's `this` value and
@@ -234,19 +247,11 @@ pub(crate) struct ObjectUrlEntry {
 }
 
 pub(crate) struct World {
-    /// Every tree the renderer process holds, shared by all realms.
-    documents: Rc<RefCell<DocumentStore>>,
-    /// Document ownership and the shared wrapper cache for this process.
-    registry: Rc<RefCell<RealmRegistry>>,
-    /// The browsing context tree, port endpoints, and cross-realm deliveries.
-    shared: SharedHandle,
+    /// The handles every frame of this renderer process shares: trees,
+    /// registry and wrapper cache, ports, JS heap, wake handle, and stop flag.
+    pub(crate) runtime: FrameRuntime,
     /// The frame this realm belongs to.
     frame: FrameId,
-    /// The process's JS heap, wake handle, and stop flag, so a child frame
-    /// created from inside a script shares them.
-    js_runtime: SharedJsRuntime,
-    wake: Arc<Notify>,
-    stop: Arc<Stop>,
     /// Frames whose browsing context was registered inside a script but whose
     /// realm cannot be created until JS execution has stopped.
     pending_frames: Vec<(FrameId, NodeId)>,
@@ -257,7 +262,6 @@ pub(crate) struct World {
     /// Document ids this realm created; only these feed its observers.
     owned: HashSet<u32>,
     pub document_url: Url,
-    pub services: Arc<dyn BrowserServices>,
     pub pending_cancels: Vec<i32>,
     pub pending_html_writes: Vec<String>,
     frame_navigations: Vec<FrameNavigation>,
@@ -341,19 +345,13 @@ impl Drop for World {
 impl World {
     pub(crate) fn new(document_url: Url, frame: FrameId, runtime: &FrameRuntime) -> Self {
         Self {
-            documents: Rc::clone(&runtime.documents),
-            registry: Rc::clone(&runtime.registry),
-            shared: Rc::clone(&runtime.shared),
+            runtime: runtime.clone(),
             frame,
-            js_runtime: runtime.js_runtime.clone(),
-            wake: Arc::clone(&runtime.wake),
-            stop: Arc::clone(&runtime.stop),
             pending_frames: Vec::new(),
             new_frames: Vec::new(),
             document: None,
             owned: HashSet::new(),
             document_url,
-            services: Arc::clone(&runtime.services),
             pending_cancels: Vec::new(),
             pending_html_writes: Vec::new(),
             frame_navigations: Vec::new(),
@@ -393,7 +391,7 @@ impl World {
 
     /// Turns mutation recording on for this realm's documents.
     pub(crate) fn set_recording(&mut self, recording: bool) {
-        let mut documents = self.documents.borrow_mut();
+        let mut documents = self.runtime.documents.borrow_mut();
         for id in &self.owned {
             if let Some(parsed) = documents.get_mut(*id) {
                 parsed.dom.set_record_mutations(recording);
@@ -404,23 +402,17 @@ impl World {
     /// Drains this realm's documents' mutation logs and matches the mutations
     /// against all registered observers, appending to their queues.
     pub(crate) fn drain_mutations(&mut self) {
-        let World {
-            documents,
-            owned,
-            observers,
-            ..
-        } = self;
-        let mut documents = documents.borrow_mut();
-        for id in owned.iter() {
+        let mut documents = self.runtime.documents.borrow_mut();
+        for id in &self.owned {
             let Some(parsed) = documents.get_mut(*id) else {
                 continue;
             };
             let mutations = parsed.dom.take_mutations();
-            if mutations.is_empty() || observers.is_empty() {
+            if mutations.is_empty() || self.observers.is_empty() {
                 continue;
             }
             for mutation in mutations {
-                for observer in observers.values_mut() {
+                for observer in self.observers.values_mut() {
                     if let Some(record) = match_observation(&parsed.dom, observer, &mutation) {
                         observer.queue.push(record);
                     }
@@ -463,7 +455,7 @@ impl World {
     /// Installs `parsed` as the active document and returns its id.
     pub(crate) fn replace_document(&mut self, parsed: Parsed) -> u32 {
         self.drop_active_document();
-        let id = self.documents.borrow_mut().insert(parsed);
+        let id = self.runtime.documents.borrow_mut().insert(parsed);
         self.document = Some(id);
         self.owned.insert(id);
         self.current_script = None;
@@ -495,12 +487,12 @@ impl World {
     pub(crate) fn set_document(&mut self, parsed: Parsed) -> u32 {
         let id = parsed.dom.document_id();
         if self.document == Some(id) {
-            self.documents.borrow_mut().insert(parsed);
+            self.runtime.documents.borrow_mut().insert(parsed);
             self.current_script = None;
             return id;
         }
         self.drop_active_document();
-        let id = self.documents.borrow_mut().insert(parsed);
+        let id = self.runtime.documents.borrow_mut().insert(parsed);
         self.document = Some(id);
         self.owned.insert(id);
         self.current_script = None;
@@ -510,8 +502,8 @@ impl World {
     fn drop_active_document(&mut self) {
         if let Some(old) = self.document.take() {
             self.owned.remove(&old);
-            self.documents.borrow_mut().remove(old);
-            self.registry.borrow_mut().forget_document(old);
+            self.runtime.documents.borrow_mut().remove(old);
+            self.runtime.registry.borrow_mut().forget_document(old);
         }
     }
 
@@ -519,8 +511,8 @@ impl World {
     /// owns; called when the frame goes away.
     pub(crate) fn forget_owned_documents(&mut self) {
         for id in self.owned.drain() {
-            self.documents.borrow_mut().remove(id);
-            self.registry.borrow_mut().forget_document(id);
+            self.runtime.documents.borrow_mut().remove(id);
+            self.runtime.registry.borrow_mut().forget_document(id);
             self.handler_attributes
                 .retain(|(node, _), _| node.is_none_or(|node| node.document_id() != id));
             self.cleared_handlers
@@ -531,41 +523,44 @@ impl World {
 
     /// The registry every realm of this renderer process shares.
     pub(crate) fn registry(&self) -> Rc<RefCell<RealmRegistry>> {
-        Rc::clone(&self.registry)
+        Rc::clone(&self.runtime.registry)
     }
 
     /// The realm that owns the document `id` points into, when alive.
     pub(crate) fn owner_world(&self, id: NodeId) -> Option<Rc<RefCell<World>>> {
-        self.registry.borrow().owner_world(id)
+        self.runtime.registry.borrow().owner_world(id)
     }
 
     /// The shared wrapper cached for `id`, when one exists.
     pub(crate) fn shared_wrapper(&self, id: NodeId) -> Option<Persistent<Value<'static>>> {
-        self.registry.borrow().wrapper(id)
+        self.runtime.registry.borrow().wrapper(id)
     }
 
     /// Publishes the shared wrapper cached for `id`.
     pub(crate) fn intern_shared_wrapper(&self, id: NodeId, value: Persistent<Value<'static>>) {
-        self.registry.borrow_mut().intern_wrapper(id, value);
+        self.runtime.registry.borrow_mut().intern_wrapper(id, value);
     }
 
     /// The active document of the frame this realm belongs to.
     pub(crate) fn main_document(&self) -> Option<Ref<'_, Parsed>> {
         let id = self.document?;
-        Ref::filter_map(self.documents.borrow(), |store| store.get(id)).ok()
+        Ref::filter_map(self.runtime.documents.borrow(), |store| store.get(id)).ok()
     }
 
     /// Mutable access to the active document.
     pub(crate) fn main_document_mut(&self) -> Option<RefMut<'_, Parsed>> {
         let id = self.document?;
-        RefMut::filter_map(self.documents.borrow_mut(), |store| store.get_mut(id)).ok()
+        RefMut::filter_map(self.runtime.documents.borrow_mut(), |store| {
+            store.get_mut(id)
+        })
+        .ok()
     }
 
     /// Removes the active document from the store, for the parser to own.
     pub(crate) fn take_main_document(&mut self) -> Option<Parsed> {
         let id = self.document.take()?;
         self.owned.remove(&id);
-        self.documents.borrow_mut().remove(id)
+        self.runtime.documents.borrow_mut().remove(id)
     }
 
     /// One `DOMImplementation` object per document, for identity.
@@ -579,7 +574,10 @@ impl World {
 
     /// The document tree that owns `id`.
     pub(crate) fn document(&self, id: NodeId) -> Option<Ref<'_, Parsed>> {
-        Ref::filter_map(self.documents.borrow(), |store| store.get(id.document_id())).ok()
+        Ref::filter_map(self.runtime.documents.borrow(), |store| {
+            store.get(id.document_id())
+        })
+        .ok()
     }
 
     /// Runs `reader` against the tree owning `id`.
@@ -591,20 +589,20 @@ impl World {
         id: NodeId,
         reader: impl FnOnce(&Parsed) -> R,
     ) -> Option<R> {
-        let store = self.documents.borrow();
+        let store = self.runtime.documents.borrow();
         store.get(id.document_id()).map(reader)
     }
 
     /// Runs `reader` against the frame's active document.
     pub(crate) fn with_main_document<R>(&self, reader: impl FnOnce(&Parsed) -> R) -> Option<R> {
         let id = self.document?;
-        let store = self.documents.borrow();
+        let store = self.runtime.documents.borrow();
         store.get(id).map(reader)
     }
 
     /// Mutable version of [`World::document`].
     pub(crate) fn document_mut(&self, id: NodeId) -> Option<RefMut<'_, Parsed>> {
-        RefMut::filter_map(self.documents.borrow_mut(), |store| {
+        RefMut::filter_map(self.runtime.documents.borrow_mut(), |store| {
             store.get_mut(id.document_id())
         })
         .ok()
@@ -613,13 +611,13 @@ impl World {
     /// Stores a secondary document and returns its root id.
     pub(crate) fn add_document(&mut self, parsed: Parsed) -> NodeId {
         let root = parsed.dom.document();
-        let id = self.documents.borrow_mut().insert(parsed);
+        let id = self.runtime.documents.borrow_mut().insert(parsed);
         self.owned.insert(id);
         root
     }
 
     pub(crate) fn frame_document(&self, container: NodeId) -> Option<NodeId> {
-        self.registry.borrow().frame_document(container)
+        self.runtime.registry.borrow().frame_document(container)
     }
 
     /// The frame this realm belongs to.
@@ -629,22 +627,13 @@ impl World {
 
     /// The renderer-process state shared by every realm.
     pub(crate) fn shared(&self) -> SharedHandle {
-        Rc::clone(&self.shared)
+        Rc::clone(&self.runtime.shared)
     }
 
     /// Creates a frame's document sharing this realm's runtime, services, and
     /// stores; used for child frames created from inside a script.
     pub(crate) fn create_frame_document(&self, frame: FrameId) -> Document {
-        let runtime = FrameRuntime {
-            services: Arc::clone(&self.services),
-            js_runtime: self.js_runtime.clone(),
-            wake: Arc::clone(&self.wake),
-            stop: Arc::clone(&self.stop),
-            documents: Rc::clone(&self.documents),
-            registry: Rc::clone(&self.registry),
-            shared: Rc::clone(&self.shared),
-        };
-        Document::with_shared(frame, &runtime)
+        Document::with_shared(frame, &self.runtime)
     }
 
     /// Registers a browsing context for every connected `iframe` in this
@@ -665,6 +654,7 @@ impl World {
         let containers = self.iframe_containers_in_order();
         for container in containers {
             if self
+                .runtime
                 .shared
                 .borrow()
                 .tree
@@ -673,11 +663,11 @@ impl World {
             {
                 continue;
             }
-            if self.shared.borrow().tree.len() >= MAX_FRAMES {
+            if self.runtime.shared.borrow().tree.len() >= MAX_FRAMES {
                 return created;
             }
             let frame = {
-                let mut shared = self.shared.borrow_mut();
+                let mut shared = self.runtime.shared.borrow_mut();
                 let frame = shared.allocate_frame();
                 shared.tree.add(self.frame, frame, container);
                 frame
@@ -738,13 +728,17 @@ impl World {
 
     /// The realm of `frame`, while it is alive.
     pub(crate) fn frame_world(&self, frame: FrameId) -> Option<Rc<RefCell<World>>> {
-        self.registry.borrow().frame_world(frame)
+        self.runtime.registry.borrow().frame_world(frame)
     }
 
     /// The child frame owned by `container`, when its browsing context
     /// exists (<https://html.spec.whatwg.org/multipage/iframe-embed-object.html#dom-iframe-contentwindow>).
     pub(crate) fn frame_for_container(&self, container: NodeId) -> Option<FrameId> {
-        self.shared.borrow().tree.frame_for_container(container)
+        self.runtime
+            .shared
+            .borrow()
+            .tree
+            .frame_for_container(container)
     }
 
     /// The serialized origin of this realm's document
@@ -972,7 +966,7 @@ impl World {
         if let Some(&remote) = self.remote_ids.get(&node) {
             return remote;
         }
-        let remote = self.registry.borrow_mut().allocate_remote();
+        let remote = self.runtime.registry.borrow_mut().allocate_remote();
         self.remote_ids.insert(node, remote);
         self.remote_nodes.insert(remote, node);
         remote
@@ -1164,15 +1158,11 @@ fn record(
             previous,
             next,
         } => RecordData {
-            typ: "childList".into(),
-            target: Handle(*target),
             added: added.iter().copied().map(Handle).collect(),
             removed: removed.iter().copied().map(Handle).collect(),
             previous: previous.map(Handle),
             next: next.map(Handle),
-            attribute_name: None,
-            attribute_namespace: None,
-            old_value: None,
+            ..RecordData::new("childList", Handle(*target))
         },
         dom::Mutation::Attributes {
             target,
@@ -1180,28 +1170,16 @@ fn record(
             namespace,
             old_value,
         } => RecordData {
-            typ: "attributes".into(),
-            target: Handle(*target),
-            added: Vec::new(),
-            removed: Vec::new(),
-            previous: None,
-            next: None,
             attribute_name: Some(name.clone()),
             attribute_namespace: (!namespace.is_empty()).then(|| namespace.clone()),
             old_value: want_attribute_old_value
                 .then(|| old_value.clone())
                 .flatten(),
+            ..RecordData::new("attributes", Handle(*target))
         },
         dom::Mutation::CharacterData { target, old_value } => RecordData {
-            typ: "characterData".into(),
-            target: Handle(*target),
-            added: Vec::new(),
-            removed: Vec::new(),
-            previous: None,
-            next: None,
-            attribute_name: None,
-            attribute_namespace: None,
             old_value: want_character_data_old_value.then(|| old_value.clone()),
+            ..RecordData::new("characterData", Handle(*target))
         },
     }
 }

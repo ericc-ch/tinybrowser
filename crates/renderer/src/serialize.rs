@@ -264,12 +264,9 @@ pub(crate) fn serialize_xml(
     node: NodeId,
     require_well_formed: bool,
 ) -> Result<String, XmlSerializeError> {
-    let mut serializer = XmlSerializer::new(dom, require_well_formed);
-    let mut map = PrefixMap::default();
-    map.add(Some(XML_NS), "xml");
-    let mut output = String::new();
-    serializer.node(node, None, &map, &mut output)?;
-    Ok(output)
+    serialize_in_context(dom, require_well_formed, |serializer, map, output| {
+        serializer.node(node, None, map, output)
+    })
 }
 
 /// XML-serializes the children of `parent` with no namespace in scope,
@@ -279,13 +276,27 @@ pub(crate) fn serialize_xml_children(
     parent: NodeId,
     require_well_formed: bool,
 ) -> Result<String, XmlSerializeError> {
+    serialize_in_context(dom, require_well_formed, |serializer, map, output| {
+        for child in children(dom, parent) {
+            serializer.node(child, None, map, output)?;
+        }
+        Ok(())
+    })
+}
+
+/// Runs one XML serialization with the reserved `xml` prefix bound, the
+/// initial prefix map of every entry point
+/// (<https://w3c.github.io/DOM-Parsing/#dfn-xml-serialization-algorithm>).
+fn serialize_in_context(
+    dom: &Dom,
+    require_well_formed: bool,
+    write: impl FnOnce(&mut XmlSerializer<'_>, &PrefixMap, &mut String) -> Result<(), XmlSerializeError>,
+) -> Result<String, XmlSerializeError> {
     let mut serializer = XmlSerializer::new(dom, require_well_formed);
     let mut map = PrefixMap::default();
     map.add(Some(XML_NS), "xml");
     let mut output = String::new();
-    for child in children(dom, parent) {
-        serializer.node(child, None, &map, &mut output)?;
-    }
+    write(&mut serializer, &map, &mut output)?;
     Ok(output)
 }
 
@@ -501,11 +512,7 @@ impl<'a> XmlSerializer<'a> {
                         }
                         qualified = format!("{resolved}:{}", name.local);
                         output.push_str(&qualified);
-                        output.push_str(" xmlns:");
-                        output.push_str(&resolved);
-                        output.push_str("=\"");
-                        push_escaped_xml_attribute(output, ns.unwrap_or(""));
-                        output.push('"');
+                        push_xmlns(output, Some(&resolved), ns.unwrap_or(""));
                         if let Some(value) = &local_default {
                             child_context = inherit_default(value);
                         }
@@ -518,9 +525,7 @@ impl<'a> XmlSerializer<'a> {
                         if declared {
                             child_context = ns.map(str::to_owned);
                         } else {
-                            output.push_str(" xmlns=\"");
-                            push_escaped_xml_attribute(output, ns.unwrap_or(""));
-                            output.push('"');
+                            push_xmlns(output, None, ns.unwrap_or(""));
                             child_context = ns.map(str::to_owned);
                             defaults = DefaultDeclarationHandling::Replace;
                         }
@@ -576,9 +581,7 @@ impl<'a> XmlSerializer<'a> {
                 if dropped {
                     continue;
                 }
-                output.push_str(" xmlns=\"");
-                push_escaped_xml_attribute(output, &attribute.value);
-                output.push('"');
+                push_xmlns(output, None, &attribute.value);
                 continue;
             }
 
@@ -635,11 +638,7 @@ impl<'a> XmlSerializer<'a> {
                 scope
                     .local_prefixes
                     .push((generated.clone(), Some(attribute_ns.to_owned())));
-                output.push_str(" xmlns:");
-                output.push_str(&generated);
-                output.push_str("=\"");
-                push_escaped_xml_attribute(output, attribute_ns);
-                output.push('"');
+                push_xmlns(output, Some(&generated), attribute_ns);
                 candidate = Some(generated);
             }
             output.push(' ');
@@ -782,6 +781,20 @@ fn push_escaped_xml_text(output: &mut String, text: &str) {
     }
 }
 
+/// Appends one namespace declaration, `xmlns="value"` or
+/// `xmlns:prefix="value"`
+/// (<https://w3c.github.io/DOM-Parsing/#dfn-xml-serializing-an-element-node>).
+fn push_xmlns(output: &mut String, prefix: Option<&str>, value: &str) {
+    output.push_str(" xmlns");
+    if let Some(prefix) = prefix {
+        output.push(':');
+        output.push_str(prefix);
+    }
+    output.push_str("=\"");
+    push_escaped_xml_attribute(output, value);
+    output.push('"');
+}
+
 fn push_escaped_xml_attribute(output: &mut String, value: &str) {
     for character in value.chars() {
         match character {
@@ -807,12 +820,9 @@ fn push_xml_identifier(output: &mut String, identifier: &str) {
 }
 
 fn has_document_element(dom: &Dom, document: NodeId) -> bool {
-    children(dom, document).into_iter().any(|child| {
-        matches!(
-            dom.kind(child),
-            Some(NodeKind::Element { .. })
-        )
-    })
+    children(dom, document)
+        .into_iter()
+        .any(|child| matches!(dom.kind(child), Some(NodeKind::Element { .. })))
 }
 
 fn children(dom: &Dom, parent: NodeId) -> Vec<NodeId> {

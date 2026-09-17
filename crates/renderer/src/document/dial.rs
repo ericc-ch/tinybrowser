@@ -1,4 +1,4 @@
-use super::{CompletedDial, DialFail, QueuedDial};
+use super::{CompletedDial, DialContext, QueuedDial};
 use crate::protocol::{DialKind, DialOutcome, DialRequest};
 
 /// Decodes a response body that may arrive in pieces.
@@ -108,17 +108,15 @@ fn bom_prefix(bytes: &[u8]) -> bool {
 }
 
 pub(in crate::document) fn request(dial: &QueuedDial) -> DialRequest {
-    let (url, kind, initiator) = match dial {
-        QueuedDial::JsFetch { url, initiator, .. } => (url, DialKind::JsFetch, initiator),
-        QueuedDial::ClassicScript { url, initiator, .. } => {
-            (url, DialKind::ClassicScript, initiator)
-        }
-        QueuedDial::FrameLoad { url, initiator, .. } => (url, DialKind::FrameLoad, initiator),
+    let kind = match dial.context {
+        DialContext::JsFetch { .. } => DialKind::JsFetch,
+        DialContext::ClassicScript { .. } => DialKind::ClassicScript,
+        DialContext::FrameLoad { .. } => DialKind::FrameLoad,
     };
     DialRequest {
         kind,
-        url: url.to_string(),
-        initiator: initiator.to_string(),
+        url: dial.url.to_string(),
+        initiator: dial.initiator.to_string(),
         read_body: true,
     }
 }
@@ -126,39 +124,10 @@ pub(in crate::document) fn request(dial: &QueuedDial) -> DialRequest {
 pub(in crate::document) fn complete(
     dial: &QueuedDial,
     outcome: Result<DialOutcome, crate::protocol::DialFailure>,
-) -> Result<CompletedDial, DialFail> {
-    let fail = match dial {
-        QueuedDial::JsFetch { id, epoch, .. } => DialFail::JsFetch {
-            id: *id,
-            epoch: *epoch,
-        },
-        QueuedDial::ClassicScript { epoch, .. } => DialFail::ClassicScript { epoch: *epoch },
-        QueuedDial::FrameLoad { sequence, .. } => DialFail::FrameLoad {
-            sequence: *sequence,
-        },
-    };
-    let outcome = outcome.map_err(|_| fail)?;
-    Ok(match dial {
-        QueuedDial::JsFetch { id, epoch, .. } => CompletedDial::JsFetch {
-            status: outcome.status,
-            body: outcome.body,
-            id: *id,
-            epoch: *epoch,
-        },
-        QueuedDial::ClassicScript { element, epoch, .. } => CompletedDial::ClassicScript {
-            status: outcome.status,
-            body: outcome.body,
-            element: *element,
-            epoch: *epoch,
-        },
-        QueuedDial::FrameLoad { sequence, .. } => CompletedDial::FrameLoad {
-            body: outcome.body,
-            content_type: outcome.content_type,
-            content_language: outcome.content_language,
-            final_url: outcome.final_url,
-            sequence: *sequence,
-        },
-    })
+) -> Result<CompletedDial, DialContext> {
+    let context = dial.context;
+    let outcome = outcome.map_err(|_| context)?;
+    Ok(CompletedDial { context, outcome })
 }
 
 fn charset_from_content_type(content_type: &str) -> Option<&'static encoding_rs::Encoding> {

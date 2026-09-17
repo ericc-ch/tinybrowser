@@ -21,7 +21,7 @@ use crate::RemoteValue;
 use crate::document::{Document, FrameRuntime, Stop, WindowMessage};
 use crate::documents::DocumentStore;
 use crate::js::{DocumentStreamCommand, FrameNavigation, RealmRegistry, SharedJsRuntime};
-use crate::messaging::{Delivery, MAX_FRAMES};
+use crate::messaging::{Delivery, MAX_FRAMES, SharedHandle};
 use crate::protocol::{BrowserServices, FrameId, Mount, TabError, TabEvent};
 
 /// One renderer process's page engine.
@@ -59,13 +59,10 @@ impl Engine {
 
     fn create_frame(&mut self, parent: FrameId, container: dom::NodeId) -> FrameId {
         let frame = self.runtime.shared.borrow_mut().allocate_frame();
-        let parent_url = self
-            .frames
-            .get(&parent)
-            .map_or_else(|| String::from("about:blank"), Document::inherited_url);
         let Some(parent_document) = self.frames.get(&parent) else {
             return frame;
         };
+        let parent_url = parent_document.inherited_url();
         let mut document = parent_document
             .world()
             .borrow()
@@ -119,8 +116,15 @@ impl Engine {
         }
     }
 
-    fn frame_mut(&mut self, frame: FrameId) -> Option<&mut Document> {
-        self.frames.get_mut(&frame)
+    /// The document of one frame.
+    ///
+    /// # Errors
+    ///
+    /// [`TabError::UnknownFrame`] when the engine does not host `frame`.
+    fn frame_mut(&mut self, frame: FrameId) -> Result<&mut Document, TabError> {
+        self.frames
+            .get_mut(&frame)
+            .ok_or(TabError::UnknownFrame { frame: frame.get() })
     }
 
     /// Replaces one frame's document from a host mount.
@@ -130,10 +134,7 @@ impl Engine {
     /// [`TabError::UnknownFrame`] when the engine does not host `frame`.
     pub fn mount_frame(&mut self, frame: FrameId, mount: &Mount) -> Result<(), TabError> {
         self.remove_descendants(frame);
-        let document = self
-            .frame_mut(frame)
-            .ok_or(TabError::UnknownFrame { frame: frame.get() })?;
-        document.mount(mount)?;
+        self.frame_mut(frame)?.mount(mount)?;
         self.reconcile_frames();
         Ok(())
     }
@@ -152,10 +153,8 @@ impl Engine {
         content_language: Option<&str>,
     ) -> Result<(), TabError> {
         self.remove_descendants(frame);
-        let document = self
-            .frame_mut(frame)
-            .ok_or(TabError::UnknownFrame { frame: frame.get() })?;
-        document.begin_response(url, content_type, content_language);
+        self.frame_mut(frame)?
+            .begin_response(url, content_type, content_language);
         Ok(())
     }
 
@@ -165,9 +164,7 @@ impl Engine {
     ///
     /// [`TabError::UnknownFrame`] when the engine does not host the frame.
     pub fn write_body(&mut self, frame: FrameId, bytes: &[u8]) -> Result<(), TabError> {
-        self.frame_mut(frame)
-            .ok_or(TabError::UnknownFrame { frame: frame.get() })?
-            .write_body(bytes);
+        self.frame_mut(frame)?.write_body(bytes);
         self.reconcile_frames();
         Ok(())
     }
@@ -178,9 +175,7 @@ impl Engine {
     ///
     /// [`TabError::UnknownFrame`] when the engine does not host the frame.
     pub fn end_body(&mut self, frame: FrameId) -> Result<(), TabError> {
-        self.frame_mut(frame)
-            .ok_or(TabError::UnknownFrame { frame: frame.get() })?
-            .end_body();
+        self.frame_mut(frame)?.end_body();
         self.reconcile_frames();
         Ok(())
     }
@@ -191,9 +186,7 @@ impl Engine {
     ///
     /// [`TabError::UnknownFrame`] when the engine does not host the frame.
     pub fn abort_body(&mut self, frame: FrameId) -> Result<(), TabError> {
-        self.frame_mut(frame)
-            .ok_or(TabError::UnknownFrame { frame: frame.get() })?
-            .abort_body();
+        self.frame_mut(frame)?.abort_body();
         self.reconcile_frames();
         Ok(())
     }
@@ -204,10 +197,7 @@ impl Engine {
     ///
     /// [`TabError::UnknownFrame`] or [`TabError::Script`].
     pub fn eval_in(&mut self, frame: FrameId, source: &str) -> Result<String, TabError> {
-        let result = self
-            .frame_mut(frame)
-            .ok_or(TabError::UnknownFrame { frame: frame.get() })?
-            .eval(source);
+        let result = self.frame_mut(frame)?.eval(source);
         self.reconcile_frames();
         result
     }
@@ -223,10 +213,7 @@ impl Engine {
         source: &str,
         timeout: Option<Duration>,
     ) -> Result<RemoteValue, TabError> {
-        let result = self
-            .frame_mut(frame)
-            .ok_or(TabError::UnknownFrame { frame: frame.get() })?
-            .execute_remote(source, timeout);
+        let result = self.frame_mut(frame)?.execute_remote(source, timeout);
         self.reconcile_frames();
         result
     }
@@ -662,12 +649,7 @@ impl Engine {
                     // (LocalDOMWindow::DispatchMessageEventWithOriginCheck).
                     match (allowed, self.frames.get_mut(&target)) {
                         (true, Some(document)) => {
-                            {
-                                let mut shared = self.runtime.shared.borrow_mut();
-                                for port in &ports {
-                                    shared.ports.route(*port, target);
-                                }
-                            }
+                            Self::route_endpoints(&self.runtime.shared, &ports, target);
                             document.push_window_message(WindowMessage {
                                 source,
                                 origin,
@@ -686,12 +668,7 @@ impl Engine {
                     let owner = self.runtime.shared.borrow().ports.owner(endpoint);
                     match owner {
                         Some(frame) if self.frames.contains_key(&frame) => {
-                            {
-                                let mut shared = self.runtime.shared.borrow_mut();
-                                for port in &ports {
-                                    shared.ports.route(*port, frame);
-                                }
-                            }
+                            Self::route_endpoints(&self.runtime.shared, &ports, frame);
                             if let Some(document) = self.frames.get_mut(&frame) {
                                 document.push_port_message(endpoint, payload, ports);
                             }
@@ -731,8 +708,19 @@ impl Engine {
         }
     }
 
-    /// Whether `frame` is still on the `about:blank` document that inherits
-    /// `parent_url`, which the browser creates at iframe insertion.
+    /// Aims every transferred endpoint at `target`, whose realm materializes
+    /// it when the carrying message is delivered
+    /// (<https://html.spec.whatwg.org/multipage/web-messaging.html#transfer-receiving-steps>).
+    fn route_endpoints(shared: &SharedHandle, endpoints: &[u64], target: FrameId) {
+        let mut shared = shared.borrow_mut();
+        for endpoint in endpoints {
+            shared.ports.route(*endpoint, target);
+        }
+    }
+
+    /// Publishes `frame`'s document root as the active document of
+    /// `container`, which is what `contentDocument` resolves through
+    /// (<https://html.spec.whatwg.org/multipage/iframe-embed-object.html#dom-iframe-contentdocument>).
     fn publish_frame_document(&mut self, container: dom::NodeId, frame: FrameId) {
         let document = self.frames.get(&frame).and_then(Document::document_root);
         if let Some(document) = document {

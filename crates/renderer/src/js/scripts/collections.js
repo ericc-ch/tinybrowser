@@ -1,4 +1,5 @@
 (function() {
+  const canonicalIndex = /^(0|[1-9][0-9]*)$/;
   const native = globalThis.NodeList.prototype;
   function values() {
     let index = 0;
@@ -65,7 +66,7 @@
       }
       return new Proxy(target, {
         get: function(inner, property) {
-          if (typeof property === 'string' && /^(0|[1-9][0-9]*)$/.test(property)) {
+          if (typeof property === 'string' && canonicalIndex.test(property)) {
             const index = Number(property);
             return index < inner.length ? inner.item(index) : undefined;
           }
@@ -76,7 +77,7 @@
           return value;
         },
         has: function(inner, property) {
-          if (typeof property === 'string' && /^(0|[1-9][0-9]*)$/.test(property)) {
+          if (typeof property === 'string' && canonicalIndex.test(property)) {
             return Number(property) < inner.length;
           }
           return Reflect.has(inner, property);
@@ -89,7 +90,7 @@
           return keys;
         },
         getOwnPropertyDescriptor: function(inner, property) {
-          if (typeof property === 'string' && /^(0|[1-9][0-9]*)$/.test(property)) {
+          if (typeof property === 'string' && canonicalIndex.test(property)) {
             const index = Number(property);
             if (index < inner.length) {
               return {
@@ -103,7 +104,7 @@
           return Reflect.getOwnPropertyDescriptor(inner, property);
         },
         set: function(inner, property, value) {
-          if (typeof property === 'string' && /^(0|[1-9][0-9]*)$/.test(property)) {
+          if (typeof property === 'string' && canonicalIndex.test(property)) {
             return true;
           }
           return Reflect.set(inner, property, value, inner);

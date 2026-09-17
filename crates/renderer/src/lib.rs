@@ -77,16 +77,32 @@ pub(crate) struct ActiveParser {
     parser: html5ever::Parser<Sink>,
 }
 
+/// The parser options every document parse shares; `scripting_enabled` is the
+/// document's scripting flag
+/// (<https://html.spec.whatwg.org/multipage/parsing.html#scripting-flag>).
+fn parse_opts(scripting_enabled: bool) -> html5ever::ParseOpts {
+    html5ever::ParseOpts {
+        tree_builder: html5ever::tree_builder::TreeBuilderOpts {
+            scripting_enabled,
+            ..html5ever::tree_builder::TreeBuilderOpts::default()
+        },
+        ..html5ever::ParseOpts::default()
+    }
+}
+
+fn convert_attrs(attrs: Vec<markup5ever::Attribute>) -> Vec<DomAttribute> {
+    attrs
+        .into_iter()
+        .map(|attr| DomAttribute {
+            name: attr.name,
+            value: String::from(attr.value),
+        })
+        .collect()
+}
+
 impl ActiveParser {
     pub(crate) fn new(input: &str) -> Self {
-        let opts = html5ever::ParseOpts {
-            tree_builder: html5ever::tree_builder::TreeBuilderOpts {
-                scripting_enabled: true,
-                ..html5ever::tree_builder::TreeBuilderOpts::default()
-            },
-            ..html5ever::ParseOpts::default()
-        };
-        let parser = html5ever::parse_document(Sink::new(), opts);
+        let parser = html5ever::parse_document(Sink::new(), parse_opts(true));
         parser.input_buffer.push_back(StrTendril::from(input));
         Self { parser }
     }
@@ -129,15 +145,8 @@ impl ActiveParser {
 /// every browser, mandates; that recovery is html5ever's job, not ours.
 #[must_use]
 pub(crate) fn parse_html(input: &str) -> Parsed {
-    let opts = html5ever::ParseOpts {
-        tree_builder: html5ever::tree_builder::TreeBuilderOpts {
-            scripting_enabled: true,
-            ..html5ever::tree_builder::TreeBuilderOpts::default()
-        },
-        ..html5ever::ParseOpts::default()
-    };
     let sink = Sink::new();
-    html5ever::parse_document(sink, opts).one(input)
+    html5ever::parse_document(sink, parse_opts(true)).one(input)
 }
 
 /// Parses an HTML fragment with `context` as the
@@ -147,17 +156,10 @@ pub(crate) fn parse_html(input: &str) -> Parsed {
 /// the fragment's nodes (html5ever's fragment root).
 #[must_use]
 pub(crate) fn parse_html_fragment(input: &str, context: &str, scripting_enabled: bool) -> Parsed {
-    let opts = html5ever::ParseOpts {
-        tree_builder: html5ever::tree_builder::TreeBuilderOpts {
-            scripting_enabled,
-            ..html5ever::tree_builder::TreeBuilderOpts::default()
-        },
-        ..html5ever::ParseOpts::default()
-    };
     let sink = Sink::new();
     html5ever::parse_fragment(
         sink,
-        opts,
+        parse_opts(scripting_enabled),
         fragment_context_name(context),
         Vec::new(),
         scripting_enabled,
@@ -245,10 +247,7 @@ impl Sink {
                 }),
         };
         if let Some(handle) = neighbor
-            && matches!(
-                dom.kind(handle),
-                Some(NodeKind::Text { .. })
-            )
+            && matches!(dom.kind(handle), Some(NodeKind::Text { .. }))
         {
             let _ = dom.append_text(handle, text);
             return;
@@ -325,14 +324,10 @@ impl TreeSink for Sink {
         attrs: Vec<markup5ever::Attribute>,
         flags: ElementFlags,
     ) -> Self::Handle {
-        let converted: Vec<DomAttribute> = attrs
-            .into_iter()
-            .map(|attr| DomAttribute {
-                name: attr.name,
-                value: String::from(attr.value),
-            })
-            .collect();
-        let element = self.dom.borrow_mut().create_element(name, converted);
+        let element = self
+            .dom
+            .borrow_mut()
+            .create_element(name, convert_attrs(attrs));
         if flags.template {
             let contents = self.dom.borrow_mut().create_fragment();
             self.dom
@@ -386,7 +381,10 @@ impl TreeSink for Sink {
         system_id: StrTendril,
     ) {
         let doc = self.get_document();
-        let doctype = self.dom.borrow_mut().create_doctype(name, public_id, system_id);
+        let doctype = self
+            .dom
+            .borrow_mut()
+            .create_doctype(name, public_id, system_id);
         let _ = self.dom.borrow_mut().append(doc, doctype);
     }
 
@@ -437,17 +435,10 @@ impl TreeSink for Sink {
     }
 
     fn add_attrs_if_missing(&self, target: &Self::Handle, attrs: Vec<markup5ever::Attribute>) {
-        let converted: Vec<DomAttribute> = attrs
-            .into_iter()
-            .map(|attr| DomAttribute {
-                name: attr.name,
-                value: String::from(attr.value),
-            })
-            .collect();
         let _ = self
             .dom
             .borrow_mut()
-            .add_attrs_if_missing(*target, converted);
+            .add_attrs_if_missing(*target, convert_attrs(attrs));
     }
 
     fn remove_from_parent(&self, target: &Self::Handle) {

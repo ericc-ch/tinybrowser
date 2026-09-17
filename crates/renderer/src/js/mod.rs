@@ -87,6 +87,12 @@ impl fmt::Display for JsError {
 
 impl std::error::Error for JsError {}
 
+impl From<rquickjs::Error> for JsError {
+    fn from(err: rquickjs::Error) -> Self {
+        Self::Engine(err.to_string().into_boxed_str())
+    }
+}
+
 pub(crate) struct PendingTimeout {
     pub delay: Duration,
     pub js_id: i32,
@@ -137,7 +143,7 @@ impl JsRealm {
         let runtime = shared.get()?.clone();
         runtime.set_memory_limit(MAX_RUNTIME_MEMORY);
         runtime.set_max_stack_size(MAX_RUNTIME_STACK);
-        let context = Context::full(&runtime).map_err(JsError::engine)?;
+        let context = Context::full(&runtime)?;
         let host = Self {
             runtime,
             context,
@@ -152,13 +158,10 @@ impl JsRealm {
 
     pub(crate) fn eval(&self, source: &str) -> Result<String, JsError> {
         self.with_budget(None, || {
-            let rendered: Result<String, JsError> = self.context.with(|ctx| {
+            self.context.with(|ctx| {
                 let value: Value = eval_classic(&ctx, source)?;
                 render_eval_result(&ctx, value)
-            });
-            // https://html.spec.whatwg.org/multipage/webappapis.html#clean-up-after-running-script
-            let jobs = self.run_jobs();
-            rendered.and_then(|out| jobs.map(|()| out))
+            })
         })
     }
 
@@ -168,12 +171,10 @@ impl JsRealm {
         deadline: Option<Instant>,
     ) -> Result<crate::js::ScriptValue, JsError> {
         self.with_budget(deadline, || {
-            let decoded: Result<ScriptValue, JsError> = self.context.with(|ctx| {
+            self.context.with(|ctx| {
                 let value: Value = eval_classic(&ctx, source)?;
                 decode_value(&ctx, value)
-            });
-            let jobs = self.run_jobs();
-            decoded.and_then(|value| jobs.map(|()| value))
+            })
         })
     }
 
@@ -191,21 +192,14 @@ impl JsRealm {
 
     pub(crate) fn fire_timer(&self, js_id: i32) -> Result<(), JsError> {
         self.with_budget(None, || {
-            let called: Result<(), JsError> = self.context.with(|ctx| {
-                let timeouts: Array = ctx
-                    .globals()
-                    .get("__tb_timeouts")
-                    .map_err(JsError::engine)?;
+            self.context.with(|ctx| {
+                let timeouts: Array = ctx.globals().get("__tb_timeouts")?;
                 let idx = usize::try_from(js_id).map_err(|_| JsError::BadTimerId)?;
-                let func: Function = timeouts.get(idx).map_err(JsError::engine)?;
-                timeouts
-                    .as_object()
-                    .remove(js_id)
-                    .map_err(JsError::engine)?;
-                func.call(()).map_err(JsError::engine)
-            });
-            let jobs = self.run_jobs();
-            called.and(jobs)
+                let func: Function = timeouts.get(idx)?;
+                timeouts.as_object().remove(js_id)?;
+                func.call::<_, ()>(())?;
+                Ok(())
+            })
         })
     }
 
@@ -218,26 +212,21 @@ impl JsRealm {
     ) -> Result<(), JsError> {
         self.with_budget(None, || {
             let body = body.to_owned();
-            let called: Result<(), JsError> = self.context.with(|ctx| {
-                let cbs: Object = ctx
-                    .globals()
-                    .get("__tb_fetchCbs")
-                    .map_err(JsError::engine)?;
-                let func: Function = cbs.get(js_id).map_err(JsError::engine)?;
-                func.call((ok, status, body)).map_err(JsError::engine)
-            });
-            let jobs = self.run_jobs();
-            called.and(jobs)
+            self.context.with(|ctx| {
+                let cbs: Object = ctx.globals().get("__tb_fetchCbs")?;
+                let func: Function = cbs.get(js_id)?;
+                func.call::<_, ()>((ok, status, body))?;
+                Ok(())
+            })
         })
     }
 
     pub(crate) fn fire_load(&self) -> Result<(), JsError> {
         self.with_budget(None, || {
-            let fired: Result<(), JsError> = self
-                .context
-                .with(|ctx| bindings::fire_window_load(&ctx).map_err(JsError::engine));
-            let jobs = self.run_jobs();
-            fired.and(jobs)
+            self.context.with(|ctx| {
+                bindings::fire_window_load(&ctx)?;
+                Ok(())
+            })
         })
     }
 
@@ -245,32 +234,29 @@ impl JsRealm {
     /// (<https://html.spec.whatwg.org/multipage/parsing.html#the-end>).
     pub(crate) fn fire_dom_content_loaded(&self) -> Result<(), JsError> {
         self.with_budget(None, || {
-            let fired: Result<(), JsError> = self
-                .context
-                .with(|ctx| bindings::fire_dom_content_loaded(&ctx).map_err(JsError::engine));
-            let jobs = self.run_jobs();
-            fired.and(jobs)
+            self.context.with(|ctx| {
+                bindings::fire_dom_content_loaded(&ctx)?;
+                Ok(())
+            })
         })
     }
 
     /// Fires `readystatechange` after a document readiness change.
     pub(crate) fn fire_ready_state_change(&self) -> Result<(), JsError> {
         self.with_budget(None, || {
-            let fired: Result<(), JsError> = self
-                .context
-                .with(|ctx| bindings::fire_ready_state_change(&ctx).map_err(JsError::engine));
-            let jobs = self.run_jobs();
-            fired.and(jobs)
+            self.context.with(|ctx| {
+                bindings::fire_ready_state_change(&ctx)?;
+                Ok(())
+            })
         })
     }
 
     pub(crate) fn fire_node_load(&self, id: dom::NodeId) -> Result<(), JsError> {
         self.with_budget(None, || {
-            let fired: Result<(), JsError> = self
-                .context
-                .with(|ctx| bindings::fire_node_load(&ctx, id).map_err(JsError::engine));
-            let jobs = self.run_jobs();
-            fired.and(jobs)
+            self.context.with(|ctx| {
+                bindings::fire_node_load(&ctx, id)?;
+                Ok(())
+            })
         })
     }
 
@@ -291,17 +277,10 @@ impl JsRealm {
             let origin = origin.to_owned();
             let ports: Vec<f64> = ports.iter().map(|port| js_number(*port)).collect();
             let source = js_number(source);
-            let delivered: Result<bool, JsError> = self.context.with(|ctx| {
-                let deliver: Function = ctx
-                    .globals()
-                    .get("__tbDeliverMessage")
-                    .map_err(JsError::engine)?;
-                deliver
-                    .call((payload, source, origin, ports))
-                    .map_err(JsError::engine)
-            });
-            let jobs = self.run_jobs();
-            delivered.and_then(|delivered| jobs.map(|()| delivered))
+            self.context.with(|ctx| {
+                let deliver: Function = ctx.globals().get("__tbDeliverMessage")?;
+                Ok(deliver.call((payload, source, origin, ports))?)
+            })
         })
     }
 
@@ -314,17 +293,11 @@ impl JsRealm {
         self.with_budget(None, || {
             let origin = origin.to_owned();
             let source = js_number(source);
-            let delivered: Result<(), JsError> = self.context.with(|ctx| {
-                let deliver: Function = ctx
-                    .globals()
-                    .get("__tbDeliverMessageError")
-                    .map_err(JsError::engine)?;
-                deliver
-                    .call::<_, ()>((source, origin))
-                    .map_err(JsError::engine)
-            });
-            let jobs = self.run_jobs();
-            delivered.and(jobs)
+            self.context.with(|ctx| {
+                let deliver: Function = ctx.globals().get("__tbDeliverMessageError")?;
+                deliver.call::<_, ()>((source, origin))?;
+                Ok(())
+            })
         })
     }
 
@@ -339,17 +312,10 @@ impl JsRealm {
             let payload = payload.to_owned();
             let ports: Vec<f64> = ports.iter().map(|port| js_number(*port)).collect();
             let endpoint = js_number(endpoint);
-            let delivered: Result<bool, JsError> = self.context.with(|ctx| {
-                let deliver: Function = ctx
-                    .globals()
-                    .get("__tbDeliverPortMessage")
-                    .map_err(JsError::engine)?;
-                deliver
-                    .call((endpoint, payload, ports))
-                    .map_err(JsError::engine)
-            });
-            let jobs = self.run_jobs();
-            delivered.and_then(|delivered| jobs.map(|()| delivered))
+            self.context.with(|ctx| {
+                let deliver: Function = ctx.globals().get("__tbDeliverPortMessage")?;
+                Ok(deliver.call((endpoint, payload, ports))?)
+            })
         })
     }
 
@@ -357,15 +323,11 @@ impl JsRealm {
     pub(crate) fn deliver_port_message_error(&self, endpoint: u64) -> Result<(), JsError> {
         self.with_budget(None, || {
             let endpoint = js_number(endpoint);
-            let delivered: Result<(), JsError> = self.context.with(|ctx| {
-                let deliver: Function = ctx
-                    .globals()
-                    .get("__tbDeliverPortMessageError")
-                    .map_err(JsError::engine)?;
-                deliver.call::<_, ()>((endpoint,)).map_err(JsError::engine)
-            });
-            let jobs = self.run_jobs();
-            delivered.and(jobs)
+            self.context.with(|ctx| {
+                let deliver: Function = ctx.globals().get("__tbDeliverPortMessageError")?;
+                deliver.call::<_, ()>((endpoint,))?;
+                Ok(())
+            })
         })
     }
 
@@ -374,15 +336,11 @@ impl JsRealm {
     pub(crate) fn flush_frame_sets(&self, frame: u64) -> Result<(), JsError> {
         self.with_budget(None, || {
             let frame = js_number(frame);
-            let flushed: Result<(), JsError> = self.context.with(|ctx| {
-                let flush: Function = ctx
-                    .globals()
-                    .get("__tbFlushFrameSets")
-                    .map_err(JsError::engine)?;
-                flush.call::<_, ()>((frame,)).map_err(JsError::engine)
-            });
-            let jobs = self.run_jobs();
-            flushed.and(jobs)
+            self.context.with(|ctx| {
+                let flush: Function = ctx.globals().get("__tbFlushFrameSets")?;
+                flush.call::<_, ()>((frame,))?;
+                Ok(())
+            })
         })
     }
 
@@ -391,15 +349,11 @@ impl JsRealm {
     pub(crate) fn deliver_port_close(&self, endpoint: u64) -> Result<(), JsError> {
         self.with_budget(None, || {
             let endpoint = js_number(endpoint);
-            let delivered: Result<(), JsError> = self.context.with(|ctx| {
-                let deliver: Function = ctx
-                    .globals()
-                    .get("__tbDeliverPortClose")
-                    .map_err(JsError::engine)?;
-                deliver.call::<_, ()>((endpoint,)).map_err(JsError::engine)
-            });
-            let jobs = self.run_jobs();
-            delivered.and(jobs)
+            self.context.with(|ctx| {
+                let deliver: Function = ctx.globals().get("__tbDeliverPortClose")?;
+                deliver.call::<_, ()>((endpoint,))?;
+                Ok(())
+            })
         })
     }
 
@@ -411,14 +365,19 @@ impl JsRealm {
     /// the spec drains microtasks before the next script runs.
     pub(crate) fn deliver_mutations(&self) -> Result<(), JsError> {
         self.with_budget(None, || {
-            let scheduled: Result<(), JsError> = self
-                .context
-                .with(|ctx| bindings::schedule_mutation_delivery(&ctx).map_err(JsError::engine));
-            let jobs = self.run_jobs();
-            scheduled.and(jobs)
+            self.context.with(|ctx| {
+                bindings::schedule_mutation_delivery(&ctx)?;
+                Ok(())
+            })
         })
     }
 
+    /// Runs `operation` under the script deadline and interrupt handler, then
+    /// drains the job queue and clears the interrupt handler.
+    ///
+    /// The job drain always runs so a scheduled microtask cannot outlive the
+    /// operation that scheduled it; the operation's error wins over a job
+    /// error, and an interrupt wins over both.
     fn with_budget<T>(
         &self,
         deadline: Option<Instant>,
@@ -437,10 +396,12 @@ impl JsRealm {
             runtime: &self.runtime,
         };
         let result = operation();
+        // https://html.spec.whatwg.org/multipage/webappapis.html#clean-up-after-running-script
+        let jobs = self.run_jobs();
         if interrupted.get() {
             Err(JsError::Interrupted)
         } else {
-            result
+            result.and_then(|value| jobs.map(|()| value))
         }
     }
 
@@ -457,13 +418,12 @@ impl JsRealm {
     fn install(&self) -> Result<(), JsError> {
         let world = self.world.clone();
         self.context.with(|ctx| {
-            bindings::install(&ctx, &world).map_err(JsError::engine)?;
-            intl::install(&ctx).map_err(JsError::engine)?;
+            bindings::install(&ctx, &world)?;
+            intl::install(&ctx)?;
             self.install_task_host_functions(&ctx, &world)?;
             Self::install_document_host_functions(&ctx, &world)?;
-            bindings::install_messaging(&ctx).map_err(JsError::engine)?;
-            ctx.eval::<(), _>(INSTALL_WEB_APIS_JS)
-                .map_err(JsError::engine)?;
+            bindings::install_messaging(&ctx)?;
+            ctx.eval::<(), _>(INSTALL_WEB_APIS_JS)?;
             Ok(())
         })
     }
@@ -478,35 +438,29 @@ impl JsRealm {
         let fetches = self.pending_fetches.clone();
         let cancel_world = world.clone();
 
-        ctx.globals()
-            .set(
-                "__scheduleTimeout",
-                Func::from(move |js_id: i32, delay: f64| {
-                    timeouts.borrow_mut().push(PendingTimeout {
-                        delay: Duration::from_millis(u64::from(millis(delay))),
-                        js_id,
-                    });
-                }),
-            )
-            .map_err(JsError::engine)?;
+        ctx.globals().set(
+            "__scheduleTimeout",
+            Func::from(move |js_id: i32, delay: f64| {
+                timeouts.borrow_mut().push(PendingTimeout {
+                    delay: Duration::from_millis(u64::from(millis(delay))),
+                    js_id,
+                });
+            }),
+        )?;
 
-        ctx.globals()
-            .set(
-                "__cancelTimeout",
-                Func::from(move |js_id: i32| {
-                    cancel_world.borrow_mut().pending_cancels.push(js_id);
-                }),
-            )
-            .map_err(JsError::engine)?;
+        ctx.globals().set(
+            "__cancelTimeout",
+            Func::from(move |js_id: i32| {
+                cancel_world.borrow_mut().pending_cancels.push(js_id);
+            }),
+        )?;
 
-        ctx.globals()
-            .set(
-                "__queueFetch",
-                Func::from(move |url: String, js_id: i32| {
-                    fetches.borrow_mut().push(PendingJsFetch { url, js_id });
-                }),
-            )
-            .map_err(JsError::engine)?;
+        ctx.globals().set(
+            "__queueFetch",
+            Func::from(move |url: String, js_id: i32| {
+                fetches.borrow_mut().push(PendingJsFetch { url, js_id });
+            }),
+        )?;
         Ok(())
     }
 
@@ -523,94 +477,81 @@ impl JsRealm {
         let object_url_type = world.clone();
         let url_resolve = world.clone();
 
-        ctx.globals()
-            .set(
-                "__cookieGet",
-                Func::from(move || {
-                    let world = cookie_get.borrow();
-                    world.services.cookies_for(&world.document_url)
-                }),
-            )
-            .map_err(JsError::engine)?;
+        ctx.globals().set(
+            "__cookieGet",
+            Func::from(move || {
+                let world = cookie_get.borrow();
+                world.runtime.services.cookies_for(&world.document_url)
+            }),
+        )?;
 
-        ctx.globals()
-            .set(
-                "__cookieSet",
-                Func::from(move |value: String| {
-                    let world = cookie_set.borrow();
-                    world.services.set_cookie(&value, &world.document_url);
-                }),
-            )
-            .map_err(JsError::engine)?;
+        ctx.globals().set(
+            "__cookieSet",
+            Func::from(move |value: String| {
+                let world = cookie_set.borrow();
+                world
+                    .runtime
+                    .services
+                    .set_cookie(&value, &world.document_url);
+            }),
+        )?;
 
-        ctx.globals()
-            .set(
-                "__tbCreateObjectURL",
-                Func::from(move |contents: String, content_type: String| {
-                    object_url_create
-                        .borrow_mut()
-                        .create_object_url(contents, content_type)
-                }),
-            )
-            .map_err(JsError::engine)?;
+        ctx.globals().set(
+            "__tbCreateObjectURL",
+            Func::from(move |contents: String, content_type: String| {
+                object_url_create
+                    .borrow_mut()
+                    .create_object_url(contents, content_type)
+            }),
+        )?;
 
-        ctx.globals()
-            .set(
-                "__tbRevokeObjectURL",
-                Func::from(move |url: String| {
-                    object_url_revoke.borrow_mut().revoke_object_url(&url);
-                }),
-            )
-            .map_err(JsError::engine)?;
+        ctx.globals().set(
+            "__tbRevokeObjectURL",
+            Func::from(move |url: String| {
+                object_url_revoke.borrow_mut().revoke_object_url(&url);
+            }),
+        )?;
 
-        ctx.globals()
-            .set(
-                "__tbObjectUrlContents",
-                Func::from(move |url: String| {
-                    object_url_contents
-                        .borrow()
-                        .object_url_contents(&url)
-                        .map(|contents| contents.to_string())
-                }),
-            )
-            .map_err(JsError::engine)?;
+        ctx.globals().set(
+            "__tbObjectUrlContents",
+            Func::from(move |url: String| {
+                object_url_contents
+                    .borrow()
+                    .object_url_contents(&url)
+                    .map(|contents| contents.to_string())
+            }),
+        )?;
 
-        ctx.globals()
-            .set(
-                "__tbObjectUrlType",
-                Func::from(move |url: String| {
-                    object_url_type
-                        .borrow()
-                        .object_url_type(&url)
-                        .map(|content_type| content_type.to_string())
-                }),
-            )
-            .map_err(JsError::engine)?;
+        ctx.globals().set(
+            "__tbObjectUrlType",
+            Func::from(move |url: String| {
+                object_url_type
+                    .borrow()
+                    .object_url_type(&url)
+                    .map(|content_type| content_type.to_string())
+            }),
+        )?;
 
-        ctx.globals()
-            .set(
-                "__tbParseUrl",
-                Func::from(|input: String| url::Url::parse(&input).ok().map(|url| url.to_string())),
-            )
-            .map_err(JsError::engine)?;
+        ctx.globals().set(
+            "__tbParseUrl",
+            Func::from(|input: String| url::Url::parse(&input).ok().map(|url| url.to_string())),
+        )?;
 
-        ctx.globals()
-            .set(
-                "__tbResolveUrl",
-                Func::from(move |input: String, base: Option<String>| {
-                    let fallback = url_resolve.borrow().document_url.clone();
-                    let resolved = match base {
-                        Some(base) => url::Url::parse(&base)
-                            .ok()
-                            .and_then(|base| base.join(&input).ok()),
-                        None => url::Url::parse(&input)
-                            .ok()
-                            .or_else(|| fallback.join(&input).ok()),
-                    };
-                    resolved.map(|url| url.to_string())
-                }),
-            )
-            .map_err(JsError::engine)?;
+        ctx.globals().set(
+            "__tbResolveUrl",
+            Func::from(move |input: String, base: Option<String>| {
+                let fallback = url_resolve.borrow().document_url.clone();
+                let resolved = match base {
+                    Some(base) => url::Url::parse(&base)
+                        .ok()
+                        .and_then(|base| base.join(&input).ok()),
+                    None => url::Url::parse(&input)
+                        .ok()
+                        .or_else(|| fallback.join(&input).ok()),
+                };
+                resolved.map(|url| url.to_string())
+            }),
+        )?;
         Ok(())
     }
 }
@@ -768,7 +709,7 @@ fn decode_value_inner<'js>(
     if let Some(array) = value.as_array() {
         let mut items = Vec::with_capacity(array.len());
         for index in 0..array.len() {
-            let item: Value = array.get(index).map_err(JsError::engine)?;
+            let item: Value = array.get(index)?;
             items.push(decode_value_inner(ctx, item, depth.saturating_add(1))?);
         }
         return Ok(ScriptValue::List(items));
@@ -779,8 +720,8 @@ fn decode_value_inner<'js>(
     if let Some(object) = value.as_object() {
         let mut map = Vec::new();
         for key in object.keys::<String>() {
-            let key = key.map_err(JsError::engine)?;
-            let nested: Value = object.get(key.as_str()).map_err(JsError::engine)?;
+            let key = key?;
+            let nested: Value = object.get(key.as_str())?;
             map.push((
                 key,
                 decode_value_inner(ctx, nested, depth.saturating_add(1))?,
@@ -788,18 +729,16 @@ fn decode_value_inner<'js>(
         }
         return Ok(ScriptValue::Map(map));
     }
-    Coerced::<String>::from_js(ctx, value)
-        .map(|coerced| ScriptValue::String(coerced.0))
-        .map_err(JsError::engine)
+    Ok(ScriptValue::String(
+        Coerced::<String>::from_js(ctx, value)?.0,
+    ))
 }
 
 fn render_eval_result<'js>(ctx: &rquickjs::Ctx<'js>, value: Value<'js>) -> Result<String, JsError> {
     if value.is_undefined() || value.is_null() {
         return Ok(String::new());
     }
-    Coerced::<String>::from_js(ctx, value)
-        .map(|coerced| coerced.0)
-        .map_err(JsError::engine)
+    Ok(Coerced::<String>::from_js(ctx, value)?.0)
 }
 
 fn millis(delay: f64) -> u32 {
