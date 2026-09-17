@@ -118,9 +118,10 @@ if [[ "${TINYBROWSER_WPT_NO_LOCK:-0}" != 1 ]]; then
   fi
 fi
 
-# uv owns the venv: `uv venv` creates it, `uv pip` fills it. WPT's own
-# install_requirements checks the working set before calling pip, so a venv
-# uv populated never reaches WPT's pip path. The editable product adapter is
+# uv owns the venv: `uv venv` creates it, `uv pip` fills it. `--seed` installs
+# pip/setuptools so WPT's working-set check can run; the manifest and wptrunner
+# requirements are installed here so that check finds everything satisfied and
+# WPT never falls back to its own pip path. The editable product adapter is
 # reinstalled every run, so a checkout edit takes effect.
 if ! command -v uv >/dev/null 2>&1; then
   echo "uv is required to bootstrap the WPT virtualenv" >&2
@@ -131,9 +132,10 @@ if [[ ! -x "$VENV/bin/python" ]]; then
     echo "WPT virtualenv not found at $VENV; TINYBROWSER_WPT_VENV must name one" >&2
     exit 1
   fi
-  uv venv "$VENV" --python 3.12
+  uv venv --seed "$VENV" --python 3.12
 fi
 uv pip install --python "$VENV/bin/python" -q \
+  -r "$WPT/tools/manifest/requirements.txt" \
   -r "$WPT/tools/wptrunner/requirements.txt"
 uv pip install --python "$VENV/bin/python" -q -e "$ROOT/tools/wpt"
 # A standalone `--` separates test paths from wpt options in the documented
