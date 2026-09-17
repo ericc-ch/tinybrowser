@@ -29,7 +29,7 @@ Never maintain handwritten `unsafe`: no `unsafe {}`, `unsafe fn`, `unsafe trait`
   The workspace otherwise `deny`s `unsafe_code`.
 
 - Never silence the compiler or a lint to make an error go away. When a check fires, find the design flaw it points at and fix that. An `#[allow]`/`unwrap`-style escape needs a written justification at the same spot and is a last resort.
-- Breaking changes and full rewrites are always fine. When code fights you, assume it is wrong: zoom out, fix the design, don't patch around it.
+- No need to care about breaking changes, full rewrites, churns, etc. they are always fine. When code fights you, assume it is wrong: zoom out, fix the design, don't patch around it.
 - Web-platform behavior comes from the WHATWG specs, not from our tests or guesses. Start every implementation and review of a conformance claim from the governing spec. Cite the spec at the implementation site with an anchor link, for example `dom.spec.whatwg.org/#concept-node-ensure-pre-insert-validity`. Follow the spec's exact algorithm order, even when our tests disagree. Fix the test, not the spec.
 - For how a browser actually behaves, read a shipped engine implementation. Start with Chromium, then read Firefox when Chromium does not cover the case. Do not clone these repositories. When the spec and a shipped browser disagree, state the disagreement in a code comment and follow the browser that matches the spec algorithm.
 - Decisions live in commit messages.
