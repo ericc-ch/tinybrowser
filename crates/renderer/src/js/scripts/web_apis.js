@@ -1344,19 +1344,17 @@ const __tbTransferList = transfer => {
 // buffer and endpoint as it does so
 // (<https://html.spec.whatwg.org/multipage/structured-data.html#structuredserializewithtransfer>).
 const __tbEncode = (value, transfer, sourcePort) => {
-  const detached = new Map();
-  const transferred = new Map();
+  // Validate the transfer list first: nothing is transferred until the value
+  // graph serializes, because transferring has side effects and
+  // StructuredSerializeInternal must be able to throw first
+  // (<https://html.spec.whatwg.org/multipage/structured-data.html#structuredserializewithtransfer>).
+  const buffers = new Map();     // ArrayBuffer -> node slot, or -1 once listed
+  const transferred = new Map(); // MessagePort -> endpoint id
   for (const item of __tbTransferList(transfer)) {
     if (item instanceof ArrayBuffer) {
-      if (detached.has(item)) throw new globalThis.DOMException('Transfer list contains duplicate buffers', 'DataCloneError');
+      if (buffers.has(item)) throw new globalThis.DOMException('Transfer list contains duplicate buffers', 'DataCloneError');
       if (typeof item.transfer !== 'function') throw new globalThis.DOMException('The buffer is not transferable', 'DataCloneError');
-      let moved;
-      try {
-        moved = item.transfer();
-      } catch (error) {
-        throw new globalThis.DOMException('The buffer is already detached', 'DataCloneError');
-      }
-      detached.set(item, new Uint8Array(moved));
+      buffers.set(item, -1);
     } else if (item instanceof globalThis.MessagePort) {
       if (item === sourcePort) throw new globalThis.DOMException('Cannot transfer the source port', 'DataCloneError');
       const itemData = __tbBrand(item, __tbPortData);
@@ -1366,14 +1364,6 @@ const __tbEncode = (value, transfer, sourcePort) => {
     } else {
       throw new globalThis.DOMException('Value not transferable', 'DataCloneError');
     }
-  }
-  const ports = [];
-  for (const [port, id] of transferred) {
-    if (!__tbPortDetach(id)) throw new globalThis.DOMException('Cannot transfer a detached MessagePort', 'DataCloneError');
-    __tbBrand(port, __tbPortData).closed = true;
-    // The received port is a new object; the sender's is detached.
-    delete __tbPorts[id];
-    ports.push(id);
   }
   const nodes = [];
   const seen = new Map();
@@ -1400,9 +1390,11 @@ const __tbEncode = (value, transfer, sourcePort) => {
       seen.set(input, index);
       return index;
     }
-    if (detached.has(input)) {
-      const index = slot(['buffer', __tbBase64Encode(detached.get(input))]);
+    if (buffers.has(input)) {
+      // The bytes are captured by the transfer step, after the graph is done.
+      const index = slot(null);
       seen.set(input, index);
+      buffers.set(input, index);
       return index;
     }
     if (input[__tbBlobData] !== undefined) {
@@ -1503,6 +1495,27 @@ const __tbEncode = (value, transfer, sourcePort) => {
     return index;
   };
   const root = encode(value);
+  // Serialization succeeded, so the transfer steps run now
+  // (<https://html.spec.whatwg.org/multipage/structured-data.html#structuredserializewithtransfer>).
+  for (const [buffer, index] of buffers) {
+    let moved;
+    try {
+      moved = buffer.transfer();
+    } catch (error) {
+      throw new globalThis.DOMException('The buffer is already detached', 'DataCloneError');
+    }
+    if (index !== -1) {
+      nodes[index] = ['buffer', __tbBase64Encode(new Uint8Array(moved))];
+    }
+  }
+  const ports = [];
+  for (const [port, id] of transferred) {
+    if (!__tbPortDetach(id)) throw new globalThis.DOMException('Cannot transfer a detached MessagePort', 'DataCloneError');
+    __tbBrand(port, __tbPortData).closed = true;
+    // The received port is a new object; the sender's is detached.
+    delete __tbPorts[id];
+    ports.push(id);
+  }
   return { payload: __tbPayloadVersion + JSON.stringify({ root: root, nodes: nodes }), ports: ports };
 };
 

@@ -11,6 +11,7 @@ use dom::{NodeId, NodeKind, html_namespace, qualified_name_eq};
 
 use rquickjs::{Class, Ctx, Exception, Function, Persistent, Result, Value, class::Trace};
 
+use crate::js::events::report_exception;
 use crate::js::world::{AttrState, FrameNavigation, Handle};
 
 /// `DOMTokenList` for `Element.classList`
@@ -887,10 +888,24 @@ fn compile_handler_attribute(ctx: &Ctx<'_>, element: NodeId, typ: &str) -> Resul
     match body {
         Some(body) if !body.trim().is_empty() => {
             let source = format!("(function(event) {{\n{body}\n}})");
-            let compiled: Function = ctx.eval(source)?;
-            object.set(name.as_str(), compiled.clone())?;
-            if forwarded {
-                ctx.globals().set(name.as_str(), compiled)?;
+            match ctx.eval::<Function, _>(source) {
+                Ok(compiled) => {
+                    object.set(name.as_str(), compiled.clone())?;
+                    if forwarded {
+                        ctx.globals().set(name.as_str(), compiled)?;
+                    }
+                }
+                Err(error) => {
+                    // A malformed handler reports the error and clears the
+                    // slot; setting the attribute must not throw
+                    // (<https://html.spec.whatwg.org/multipage/webappapis.html#event-handler-content-attributes>).
+                    report_exception(ctx, &error);
+                    object.set(name.as_str(), Value::new_null(ctx.clone()))?;
+                    if forwarded {
+                        ctx.globals()
+                            .set(name.as_str(), Value::new_null(ctx.clone()))?;
+                    }
+                }
             }
         }
         _ => {

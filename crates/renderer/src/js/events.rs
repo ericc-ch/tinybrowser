@@ -1021,7 +1021,7 @@ fn call_listener<'js>(
 /// exception is dropped. Dropping it keeps a throwing listener from aborting
 /// the rest of the dispatch, and consuming it keeps a later JavaScript
 /// operation from observing the stale pending exception.
-fn report_exception(ctx: &Ctx<'_>, error: &rquickjs::Error) {
+pub(super) fn report_exception(ctx: &Ctx<'_>, error: &rquickjs::Error) {
     if error.is_exception() {
         let _caught = ctx.catch();
     }
@@ -1215,9 +1215,20 @@ fn call_handler_attribute<'js>(
         // the attribute value and whose `this` is the object
         // (<https://html.spec.whatwg.org/multipage/webappapis.html#event-handler-content-attributes>).
         let source = format!("(function(event) {{\n{body}\n}})");
-        let compiled: Function = ctx.eval(source)?;
-        object.set(name.as_str(), compiled.clone())?;
-        handler = compiled.into_value();
+        match ctx.eval::<Function, _>(source) {
+            Ok(compiled) => {
+                object.set(name.as_str(), compiled.clone())?;
+                handler = compiled.into_value();
+            }
+            Err(error) => {
+                // A failed compilation reports the error and clears the
+                // handler; it must not abort the dispatch (or the attribute
+                // set) that triggered it.
+                report_exception(ctx, &error);
+                object.set(name.as_str(), Value::new_null(ctx.clone()))?;
+                return Ok(());
+            }
+        }
     }
     if let Some(function) = handler.as_function()
         && let Err(error) = function.call::<_, ()>((This(object.clone()), event.clone()))

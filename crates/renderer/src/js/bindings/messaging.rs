@@ -93,6 +93,16 @@ fn post_window_message(
         let world = world.borrow();
         (world.frame(), world.origin_string(), world.shared())
     };
+    {
+        // A page can call this host function directly, so every transferred
+        // endpoint must be one this frame detached; otherwise a hostile frame
+        // could hand another frame's in-transit port to a target of its
+        // choosing (<https://html.spec.whatwg.org/multipage/web-messaging.html#transfer-receiving-steps>).
+        let shared = shared.borrow();
+        if !shared.ports.all_in_transit_from(&ports, source) {
+            return Ok(());
+        }
+    }
     shared
         .borrow_mut()
         .deliveries
@@ -142,7 +152,18 @@ fn port_post(ctx: Ctx<'_>, endpoint: f64, payload: String, ports: Vec<f64>) -> R
     if !endpoint_owned(&world, endpoint) {
         return Ok(());
     }
-    let shared = world.borrow().shared();
+    let (frame, shared) = {
+        let world = world.borrow();
+        (world.frame(), world.shared())
+    };
+    {
+        // Every transferred endpoint must be one this frame detached
+        // (<https://html.spec.whatwg.org/multipage/web-messaging.html#message-port-post-message-steps>).
+        let shared = shared.borrow();
+        if !shared.ports.all_in_transit_from(&ports, frame) {
+            return Ok(());
+        }
+    }
     let mut shared = shared.borrow_mut();
     let Shared {
         ports: table,

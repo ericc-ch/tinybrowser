@@ -89,6 +89,7 @@ impl Engine {
         for document in self.frames.values_mut() {
             document.adopt_pending_frames();
         }
+        let mut adopted = false;
         let mut batch = Vec::new();
         loop {
             for (&parent, document) in &mut self.frames {
@@ -97,8 +98,9 @@ impl Engine {
                 }
             }
             if batch.is_empty() {
-                return false;
+                return adopted;
             }
+            adopted = true;
             for (parent, child, container, document) in batch.drain(..) {
                 self.frames.insert(child, document);
                 let src = self
@@ -796,21 +798,39 @@ impl Engine {
 /// (<https://fetch.spec.whatwg.org/#data-url-processor>).
 fn decode_data_url(raw: &str) -> Option<(Option<String>, Vec<u8>)> {
     let rest = raw.strip_prefix("data:")?;
-    let (metadata, body) = rest.split_once(',')?;
-    let (content_type, is_base64) = match metadata
-        .get(metadata.len().saturating_sub(7)..)
-        .filter(|suffix| suffix.eq_ignore_ascii_case(";base64"))
-    {
-        Some(_) => (&metadata[..metadata.len() - 7], true),
+    let (metadata, encoded_body) = rest.split_once(',')?;
+    // The body is percent-decoded first; the base64 step then decodes the
+    // isomorphic (byte-per-code-point) view of those bytes
+    // (<https://fetch.spec.whatwg.org/#data-urls>).
+    let body = percent_decode_bytes(encoded_body);
+    let (content_type, is_base64) = match metadata_without_base64(metadata) {
+        Some(content_type) => (content_type, true),
         None => (metadata, false),
     };
     let decoded = if is_base64 {
-        decode_base64(body)?
+        decode_base64(&isomorphic_decode(&body))?
     } else {
-        percent_decode_bytes(body)
+        body
     };
     let content_type = (!content_type.is_empty()).then(|| content_type.to_owned());
     Some((content_type, decoded))
+}
+
+/// The metadata without a trailing `;base64` marker (ASCII case-insensitive,
+/// spaces allowed before it), when present
+/// (<https://fetch.spec.whatwg.org/#data-urls>).
+fn metadata_without_base64(metadata: &str) -> Option<&str> {
+    let (prefix, name) = metadata.split_at(metadata.len().checked_sub(6)?);
+    if !name.eq_ignore_ascii_case("base64") {
+        return None;
+    }
+    prefix.trim_end_matches(' ').strip_suffix(';')
+}
+
+/// Isomorphic decode: each byte becomes the code point with the same value
+/// (<https://infra.spec.whatwg.org/#isomorphic-decode>).
+fn isomorphic_decode(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| char::from(*byte)).collect()
 }
 
 /// Percent-decodes an ASCII URL component; indices outside `%XX` are kept.

@@ -261,7 +261,10 @@ impl PortTable {
         if port.closed {
             return;
         }
-        port.queue.push_back(QueuedPortMessage { payload, ports });
+        // The requeued message was posted before whatever is already queued
+        // while the endpoint was in transit, so it goes back at the front
+        // (<https://html.spec.whatwg.org/multipage/web-messaging.html#port-message-queue>).
+        port.queue.push_front(QueuedPortMessage { payload, ports });
         if port.enabled && !port.detached {
             while let Some(message) = port.queue.pop_front() {
                 deliveries.push(Delivery::PortMessage {
@@ -385,6 +388,26 @@ impl PortTable {
     /// The peer of `endpoint`, for the shim's "posted to itself" check.
     pub(crate) fn peer(&self, endpoint: u64) -> Option<u64> {
         self.ports.get(&endpoint).and_then(|port| port.peer)
+    }
+
+    /// Whether `frame` is the endpoint's recorded sender and may still hand
+    /// it on in a transfer list.
+    ///
+    /// The post host functions are reachable from page script, so a transfer
+    /// list must name only endpoints the caller detached; otherwise a hostile
+    /// frame could aim another frame's in-transit port at a target it chooses
+    /// (<https://html.spec.whatwg.org/multipage/web-messaging.html#transfer-receiving-steps>).
+    pub(crate) fn in_transit_from(&self, endpoint: u64, frame: FrameId) -> bool {
+        self.ports.get(&endpoint).is_some_and(|port| {
+            port.detached && !port.closed && port.recipient == Some(frame)
+        })
+    }
+
+    /// Whether every endpoint in `endpoints` may be handed on by `frame`.
+    pub(crate) fn all_in_transit_from(&self, endpoints: &[u64], frame: FrameId) -> bool {
+        endpoints
+            .iter()
+            .all(|endpoint| self.in_transit_from(*endpoint, frame))
     }
 
     /// The frame whose realm holds `endpoint`'s port object, when it is
