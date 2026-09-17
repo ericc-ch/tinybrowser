@@ -979,7 +979,7 @@ globalThis.URL = class URL {
     const href = base === undefined
       ? globalThis.__tbParseUrl(String(input))
       : globalThis.__tbResolveUrl(String(input), String(base));
-    if (href === null) throw new TypeError('Invalid URL');
+    if (href == null) throw new TypeError('Invalid URL');
     this.href = href;
     this._searchParams = new URLSearchParams(this.search);
     this._searchParams._sync = value => {
@@ -1020,6 +1020,15 @@ globalThis.URL.revokeObjectURL = function(url) {
   globalThis.__tbRevokeObjectURL(String(url));
 };
 Object.defineProperty(globalThis.URL.prototype, Symbol.toStringTag, { value: 'URL', writable: false, enumerable: false, configurable: true });
+// `location` stringifies to its URL, which is what `new URL(input, location)`
+// and other base-taking APIs expect
+// (<https://html.spec.whatwg.org/multipage/nav-history-apis.html#dom-location-href>).
+if (globalThis.location !== undefined && globalThis.location !== null) {
+  Object.defineProperty(globalThis.location, 'toString', {
+    value: function() { return String(this.href); },
+    writable: true, enumerable: false, configurable: true,
+  });
+}
 // https://url.spec.whatwg.org/#dom-url-parse
 globalThis.URL.parse = function(input, base) {
   try { return new globalThis.URL(input, base); }
@@ -1257,198 +1266,358 @@ globalThis.MessageEvent = class MessageEvent extends Event {
   get ports() { return __tbBrand(this, __tbMessageEventData).ports; }
 };
 Object.defineProperty(globalThis.MessageEvent.prototype, Symbol.toStringTag, { value: 'MessageEvent', writable: false, enumerable: false, configurable: true });
-// https://html.spec.whatwg.org/multipage/structured-data.html#structuredserializeinternal
-// A same-realm structured clone. Cross-thread workers will move this seam to
-// Rust; every messaging API already routes through it.
+// ── cross-realm structured serialization ───────────────────────────────
+// Values cannot cross realms, so the sender's realm encodes a message into a
+// versioned payload string and the receiver's realm decodes it
+// (<https://html.spec.whatwg.org/multipage/structured-data.html#structuredserializeinternal>).
+// Rust carries payloads between frames, owns the frame tree, and owns the
+// channel endpoints, so a port survives being transferred to another realm.
+const __tbPayloadVersion = 'tb1:';
+const __tbPlatform = Symbol.for('tinybrowser.platform');
+const __tbWindowProxyData = Symbol.for('tinybrowser.windowproxy.data');
+const __tbPortData = Symbol.for('tinybrowser.messageport.data');
+const __tbFrameId = globalThis.__tb_frameId;
+const __tbFrameProxies = Object.create(null);
+// Writes made through a proxy whose target realm does not exist yet: a
+// browsing context registered inside a script gets its realm at the next
+// non-JS turn, and the engine then flushes these through
+// `__tbFlushFrameSets` (<https://html.spec.whatwg.org/multipage/window-object.html#windowproxy-set>).
+const __tbFramePendingSets = Object.create(null);
+const __tbFramePending = frame => {
+  let pending = __tbFramePendingSets[frame];
+  if (pending === undefined) {
+    pending = Object.create(null);
+    __tbFramePendingSets[frame] = pending;
+  }
+  return pending;
+};
+globalThis.__tbFlushFrameSets = function(frame) {
+  const pending = __tbFramePendingSets[frame];
+  if (pending === undefined) return;
+  delete __tbFramePendingSets[frame];
+  const target = __tbFrameGlobal(frame);
+  if (target == null) return;
+  for (const key of Object.keys(pending)) target[key] = pending[key];
+};
+
+const __tbCloneFailure = () => new globalThis.DOMException('The object could not be cloned.', 'DataCloneError');
+const __tbBase64Bytes = text => {
+  const binary = globalThis.atob(text);
+  const bytes = new Uint8Array(binary.length);
+  for (let index = 0; index < binary.length; index++) bytes[index] = binary.charCodeAt(index);
+  return bytes;
+};
+// Cross-realm brand probes: an intrinsic from this realm accepts an object
+// from any realm, and throws when the internal slot is missing.
+const __tbProbe = (read, value) => {
+  try { read(value); return true; } catch (error) { return false; }
+};
+const __tbIsDate = value => __tbProbe(candidate => Date.prototype.getTime.call(candidate), value);
+const __tbIsRegExp = value => __tbProbe(candidate => Object.getOwnPropertyDescriptor(RegExp.prototype, 'source').get.call(candidate), value);
+const __tbIsMap = value => __tbProbe(candidate => Object.getOwnPropertyDescriptor(Map.prototype, 'size').get.call(candidate), value);
+const __tbIsSet = value => __tbProbe(candidate => Object.getOwnPropertyDescriptor(Set.prototype, 'size').get.call(candidate), value);
+const __tbIsArrayBuffer = value => __tbProbe(candidate => Object.getOwnPropertyDescriptor(ArrayBuffer.prototype, 'byteLength').get.call(candidate), value);
+const __tbIsDataView = value => __tbProbe(candidate => Object.getOwnPropertyDescriptor(DataView.prototype, 'byteLength').get.call(candidate), value);
+const __tbTypedArrayPrototype = Object.getPrototypeOf(Uint8Array.prototype);
+const __tbIsTypedArray = value => __tbProbe(candidate => Object.getOwnPropertyDescriptor(__tbTypedArrayPrototype, 'length').get.call(candidate), value);
+const __tbIsBoxedBoolean = value => __tbProbe(candidate => Boolean.prototype.valueOf.call(candidate), value);
+const __tbIsBoxedNumber = value => __tbProbe(candidate => Number.prototype.valueOf.call(candidate), value);
+const __tbIsBoxedString = value => __tbProbe(candidate => String.prototype.valueOf.call(candidate), value);
+const __tbIsError = value => Object.prototype.toString.call(value) === '[object Error]';
+
+// `[[NumberData]]` specials have no JSON spelling.
+const __tbNumberWire = value => {
+  if (value !== value) return 'NaN';
+  if (value === Infinity) return 'Infinity';
+  if (value === -Infinity) return '-Infinity';
+  if (value === 0 && 1 / value === -Infinity) return '-0';
+  return value;
+};
+const __tbNumberValue = wire => wire === 'NaN' ? NaN
+  : wire === 'Infinity' ? Infinity
+  : wire === '-Infinity' ? -Infinity
+  : wire === '-0' ? -0
+  : wire;
+
+// https://webidl.spec.whatwg.org/#es-sequence
 const __tbTransferList = transfer => {
   if (transfer === undefined) return [];
-  // `sequence<object>` conversion: an object with @@iterator, else TypeError
-  // (<https://webidl.spec.whatwg.org/#es-sequence>).
   if (transfer === null || typeof transfer !== 'object' || typeof transfer[Symbol.iterator] !== 'function') {
     throw new TypeError('The transfer list must be an iterable object');
   }
   return Array.from(transfer);
 };
-const __tbStructuredClone = (value, transfer, sourcePort) => {
-  const buffers = new Map();
-  const ports = new Map();
-  const portList = [];
+
+// Serializes `value` into { payload, ports }, detaching every transferred
+// buffer and endpoint as it does so
+// (<https://html.spec.whatwg.org/multipage/structured-data.html#structuredserializewithtransfer>).
+const __tbEncode = (value, transfer, sourcePort) => {
+  const detached = new Map();
+  const transferred = new Map();
   for (const item of __tbTransferList(transfer)) {
     if (item instanceof ArrayBuffer) {
-      if (buffers.has(item)) throw new DOMException('Transfer list contains duplicate buffers', 'DataCloneError');
-      if (typeof item.transfer !== 'function') throw new DOMException('The buffer is not transferable', 'DataCloneError');
+      if (detached.has(item)) throw new globalThis.DOMException('Transfer list contains duplicate buffers', 'DataCloneError');
+      if (typeof item.transfer !== 'function') throw new globalThis.DOMException('The buffer is not transferable', 'DataCloneError');
       let moved;
       try {
         moved = item.transfer();
       } catch (error) {
-        throw new DOMException('The buffer is already detached', 'DataCloneError');
+        throw new globalThis.DOMException('The buffer is already detached', 'DataCloneError');
       }
-      buffers.set(item, moved);
+      detached.set(item, new Uint8Array(moved));
     } else if (item instanceof globalThis.MessagePort) {
-      if (item === sourcePort) {
-        throw new DOMException('Cannot transfer the source port', 'DataCloneError');
-      }
+      if (item === sourcePort) throw new globalThis.DOMException('Cannot transfer the source port', 'DataCloneError');
       const itemData = __tbBrand(item, __tbPortData);
-      if (itemData.closed) throw new DOMException('Cannot transfer a detached MessagePort', 'DataCloneError');
-      if (ports.has(item)) throw new DOMException('Transfer list contains duplicate ports', 'DataCloneError');
-      const moved = __tbNewPort();
-      const movedData = __tbBrand(moved, __tbPortData);
-      movedData.peer = itemData.peer;
-      if (movedData.peer !== null) __tbBrand(movedData.peer, __tbPortData).peer = moved;
-      // The message queue moves with the port identity; the new port starts
-      // disabled and flushes when enabled
-      // (<https://html.spec.whatwg.org/multipage/web-messaging.html#message-ports>).
-      movedData.pending = itemData.pending;
-      itemData.pending = [];
-      itemData.peer = null;
-      itemData.closed = true;
-      itemData.started = false;
-      ports.set(item, moved);
-      portList.push(moved);
+      if (itemData.closed) throw new globalThis.DOMException('Cannot transfer a detached MessagePort', 'DataCloneError');
+      if (transferred.has(item)) throw new globalThis.DOMException('Transfer list contains duplicate ports', 'DataCloneError');
+      transferred.set(item, itemData.id);
     } else {
-      throw new DOMException('Value not transferable', 'DataCloneError');
+      throw new globalThis.DOMException('Value not transferable', 'DataCloneError');
     }
   }
+  const ports = [];
+  for (const [port, id] of transferred) {
+    if (!__tbPortDetach(id)) throw new globalThis.DOMException('Cannot transfer a detached MessagePort', 'DataCloneError');
+    __tbBrand(port, __tbPortData).closed = true;
+    // The received port is a new object; the sender's is detached.
+    delete __tbPorts[id];
+    ports.push(id);
+  }
+  const nodes = [];
   const seen = new Map();
-  const clone = input => {
-    if (input === null || input === undefined) return input;
+  const slot = descriptor => {
+    const index = nodes.length;
+    nodes.push(descriptor);
+    return index;
+  };
+  const encode = input => {
+    if (input === null) return slot(['null']);
     const kind = typeof input;
-    if (kind === 'function' || kind === 'symbol') {
-      throw new DOMException('The object could not be cloned.', 'DataCloneError');
-    }
-    if (kind !== 'object') return input;
-    if (buffers.has(input)) return buffers.get(input);
-    if (ports.has(input)) return ports.get(input);
+    if (kind === 'undefined') return slot(['undefined']);
+    if (kind === 'boolean') return slot(['boolean', input]);
+    if (kind === 'number') return slot(['number', __tbNumberWire(input)]);
+    if (kind === 'string') return slot(['string', input]);
+    if (kind === 'bigint') return slot(['bigint', String(input)]);
+    if (kind === 'function' || kind === 'symbol') throw __tbCloneFailure();
     if (seen.has(input)) return seen.get(input);
-    if (input === globalThis || input === globalThis.window) {
-      throw new DOMException('The object could not be cloned.', 'DataCloneError');
-    }
-    if (input instanceof ArrayBuffer) {
-      const copy = input.slice(0);
-      seen.set(input, copy);
-      return copy;
-    }
-    if (typeof SharedArrayBuffer !== 'undefined' && input instanceof SharedArrayBuffer) return input;
-    if (ArrayBuffer.isView(input)) {
-      const buffer = clone(input.buffer);
-      const copy = input instanceof DataView
-        ? new DataView(buffer, input.byteOffset, input.byteLength)
-        : new input.constructor(buffer, input.byteOffset, input.length);
-      seen.set(input, copy);
-      return copy;
-    }
-    // Boxed primitives clone to boxed copies with the same value
+    // Window proxies are never serializable
     // (<https://html.spec.whatwg.org/multipage/structured-data.html#structuredserializeinternal>).
-    if (input instanceof Boolean || input instanceof Number || input instanceof String) {
-      const copy = new input.constructor(input.valueOf());
-      seen.set(input, copy);
-      return copy;
+    if (input[__tbWindowProxyData] !== undefined) throw __tbCloneFailure();
+    if (transferred.has(input)) {
+      const index = slot(['port', transferred.get(input)]);
+      seen.set(input, index);
+      return index;
     }
-    if (input instanceof Blob) {
+    if (detached.has(input)) {
+      const index = slot(['buffer', __tbBase64Encode(detached.get(input))]);
+      seen.set(input, index);
+      return index;
+    }
+    if (input[__tbBlobData] !== undefined) {
       const blob = input[__tbBlobData];
-      let copy;
-      if (input instanceof globalThis.File) {
+      const bytes = __tbBase64Encode(new Uint8Array(blob.bytes));
+      let descriptor;
+      if (input[__tbFileData] !== undefined) {
         const file = input[__tbFileData];
-        copy = new globalThis.File([blob.bytes], file.name, { type: blob.type, lastModified: file.lastModified });
+        descriptor = ['file', file.name, file.lastModified, blob.type, bytes];
       } else {
-        copy = new Blob([blob.bytes], { type: blob.type });
+        descriptor = ['blob', blob.type, bytes];
       }
-      seen.set(input, copy);
-      return copy;
+      const index = slot(descriptor);
+      seen.set(input, index);
+      return index;
     }
-    if (input instanceof Date) {
-      const copy = new Date(input.getTime());
-      seen.set(input, copy);
-      return copy;
+    if (__tbIsArrayBuffer(input)) {
+      const index = slot(['buffer', __tbBase64Encode(new Uint8Array(input))]);
+      seen.set(input, index);
+      return index;
     }
-    if (input instanceof RegExp) {
-      const copy = new RegExp(input.source, input.flags);
-      seen.set(input, copy);
-      return copy;
+    if (__tbIsTypedArray(input) || __tbIsDataView(input)) {
+      const buffer = encode(input.buffer);
+      const descriptor = __tbIsDataView(input)
+        ? ['view', buffer, 'DataView', input.byteOffset, input.byteLength]
+        : ['view', buffer, input.constructor.name, input.byteOffset, input.length];
+      const index = slot(descriptor);
+      seen.set(input, index);
+      return index;
     }
-    if (input instanceof Error) {
-      const copy = new Error(input.message);
-      copy.name = input.name;
-      seen.set(input, copy);
-      return copy;
+    // Platform objects (nodes, events, ports, ...) are not serializable.
+    if (input[__tbPlatform] !== undefined || input[__tbPortData] !== undefined) throw __tbCloneFailure();
+    if (__tbIsDate(input)) return slot(['date', __tbNumberWire(input.getTime())]);
+    if (__tbIsRegExp(input)) return slot(['regexp', input.source, input.flags]);
+    if (__tbIsError(input)) {
+      const index = slot(null);
+      seen.set(input, index);
+      nodes[index] = ['error', String(input.name), String(input.message)];
+      return index;
     }
-    if (input instanceof Map) {
-      const copy = new Map();
-      seen.set(input, copy);
-      for (const [key, entry] of input) copy.set(clone(key), clone(entry));
-      return copy;
+    if (__tbIsBoxedBoolean(input)) return slot(['boxed', 'Boolean', input.valueOf()]);
+    if (__tbIsBoxedNumber(input)) return slot(['boxed', 'Number', __tbNumberWire(input.valueOf())]);
+    if (__tbIsBoxedString(input)) return slot(['boxed', 'String', input.valueOf()]);
+    if (__tbIsMap(input)) {
+      const index = slot(null);
+      seen.set(input, index);
+      const entries = [];
+      for (const [key, entry] of input) entries.push([encode(key), encode(entry)]);
+      nodes[index] = ['map', entries];
+      return index;
     }
-    if (input instanceof Set) {
-      const copy = new Set();
-      seen.set(input, copy);
-      for (const entry of input) copy.add(clone(entry));
-      return copy;
+    if (__tbIsSet(input)) {
+      const index = slot(null);
+      seen.set(input, index);
+      const entries = [];
+      for (const entry of input) entries.push(encode(entry));
+      nodes[index] = ['set', entries];
+      return index;
     }
     if (Array.isArray(input)) {
-      // Arrays carry their length and only their index properties
-      // (<https://html.spec.whatwg.org/multipage/structured-data.html#structuredserializeinternal>).
-      const copy = new Array(input.length);
-      seen.set(input, copy);
-      for (const key of Object.keys(input)) {
-        const index = Number(key);
-        if (Number.isInteger(index) && index >= 0 && index < input.length && String(index) === key) {
-          copy[index] = clone(input[key]);
-        }
-      }
-      return copy;
+      const index = slot(null);
+      seen.set(input, index);
+      const items = [];
+      for (let item = 0; item < input.length; item++) items.push(encode(input[item]));
+      nodes[index] = ['array', items];
+      return index;
     }
-    // Anything left is a host object unless it is a plain object: Rust class
-    // instances (events, nodes, URL, ...) carry a platform prototype and are
-    // not serializable
+    // Anything else clones as an object with its own enumerable properties,
+    // whatever its prototype chain says
     // (<https://html.spec.whatwg.org/multipage/structured-data.html#structuredserializeinternal>).
-    const proto = Object.getPrototypeOf(input);
-    if (proto !== Object.prototype && proto !== null) {
-      throw new DOMException('The object could not be cloned.', 'DataCloneError');
-    }
-    const copy = {};
-    seen.set(input, copy);
-    for (const key of Object.keys(input)) copy[key] = clone(input[key]);
-    return copy;
+    const index = slot(null);
+    seen.set(input, index);
+    const entries = [];
+    for (const key of Object.keys(input)) entries.push([key, encode(input[key])]);
+    nodes[index] = ['object', entries];
+    return index;
   };
-  return { data: clone(value), ports: portList };
+  const root = encode(value);
+  return { payload: __tbPayloadVersion + JSON.stringify({ root: root, nodes: nodes }), ports: ports };
+};
+
+// Deserializes a payload in this realm; `ports` maps transferred endpoint ids
+// to the port objects that were already materialized for them.
+const __tbDecode = (payload, ports) => {
+  const text = String(payload);
+  if (text.indexOf(__tbPayloadVersion) !== 0) throw new Error('structured clone payload mismatch');
+  const wire = JSON.parse(text.slice(__tbPayloadVersion.length));
+  const nodes = wire.nodes;
+  const values = new Array(nodes.length);
+  for (let index = 0; index < nodes.length; index++) {
+    switch (nodes[index][0]) {
+      case 'buffer': values[index] = __tbBase64Bytes(nodes[index][1]).buffer; break;
+      case 'object': values[index] = {}; break;
+      case 'array': values[index] = new Array(nodes[index][1].length); break;
+      case 'map': values[index] = new Map(); break;
+      case 'set': values[index] = new Set(); break;
+      default: values[index] = undefined; break;
+    }
+  }
+  for (let index = 0; index < nodes.length; index++) {
+    const descriptor = nodes[index];
+    switch (descriptor[0]) {
+      case 'view': {
+        const buffer = values[descriptor[1]];
+        values[index] = descriptor[2] === 'DataView'
+          ? new DataView(buffer, descriptor[3], descriptor[4])
+          : new globalThis[descriptor[2]](buffer, descriptor[3], descriptor[4]);
+        break;
+      }
+      case 'undefined': values[index] = undefined; break;
+      case 'null': values[index] = null; break;
+      case 'boolean': values[index] = descriptor[1]; break;
+      case 'number': values[index] = __tbNumberValue(descriptor[1]); break;
+      case 'string': values[index] = descriptor[1]; break;
+      case 'bigint': values[index] = BigInt(descriptor[1]); break;
+      case 'date': values[index] = new Date(__tbNumberValue(descriptor[1])); break;
+      case 'regexp': values[index] = new RegExp(descriptor[1], descriptor[2]); break;
+      case 'error': {
+        const name = descriptor[1];
+        const ctor = globalThis[name];
+        values[index] = typeof ctor === 'function' && ctor.prototype instanceof Error
+          ? new ctor(descriptor[2])
+          : new Error(descriptor[2]);
+        values[index].name = name;
+        break;
+      }
+      case 'boxed': {
+        const ctor = globalThis[descriptor[1]];
+        values[index] = new ctor(__tbNumberValue(descriptor[2]));
+        break;
+      }
+      case 'blob': values[index] = new Blob([__tbBase64Bytes(descriptor[2])], { type: descriptor[1] }); break;
+      case 'file': values[index] = new File([__tbBase64Bytes(descriptor[4])], descriptor[1], { type: descriptor[2], lastModified: descriptor[3] }); break;
+      case 'port': {
+        const port = ports[descriptor[1]];
+        if (port === undefined) throw new Error('missing transferred MessagePort');
+        values[index] = port;
+        break;
+      }
+    }
+  }
+  for (let index = 0; index < nodes.length; index++) {
+    const descriptor = nodes[index];
+    switch (descriptor[0]) {
+      case 'object': {
+        const target = values[index];
+        for (const [key, slot] of descriptor[1]) target[key] = values[slot];
+        break;
+      }
+      case 'array': {
+        const target = values[index];
+        for (let item = 0; item < descriptor[1].length; item++) target[item] = values[descriptor[1][item]];
+        break;
+      }
+      case 'map': {
+        const target = values[index];
+        for (const [key, entry] of descriptor[1]) target.set(values[key], values[entry]);
+        break;
+      }
+      case 'set': {
+        const target = values[index];
+        for (const slot of descriptor[1]) target.add(values[slot]);
+        break;
+      }
+    }
+  }
+  return values[wire.root];
 };
 // https://html.spec.whatwg.org/multipage/structured-data.html#dom-structuredclone
 globalThis.structuredClone = function(value, options) {
   const transfer = options === undefined || options === null ? undefined : options.transfer;
-  return __tbStructuredClone(value, transfer, null).data;
+  const encoded = __tbEncode(value, transfer, null);
+  return __tbDecode(encoded.payload, __tbMaterializePorts(encoded.ports));
 };
-// https://html.spec.whatwg.org/multipage/web-messaging.html#messageport
-const __tbPortData = Symbol.for('tinybrowser.messageport.data');
-const __tbNewPort = () => {
-  // Construct through the host EventTarget so the port carries the listener
-  // storage its addEventListener/dispatchEvent require.
+
+// ── message ports ──────────────────────────────────────────────────────
+// The endpoint (id, queue, entanglement) lives in Rust; the JS object is the
+// realm's handle on it, registered in `__tbPorts` so deliveries can find it.
+const __tbPorts = Object.create(null);
+
+const __tbMaterializePorts = ids => {
+  const ports = {};
+  for (const id of ids) {
+    const pendingClose = __tbPortAdopt(id);
+    if (pendingClose == null) throw new Error('missing transferred MessagePort');
+    ports[id] = __tbMaterializePort(id, pendingClose);
+  }
+  return ports;
+};
+const __tbMaterializePort = (id, pendingClose) => {
+  if (__tbPorts[id] !== undefined) return __tbPorts[id];
   const port = Reflect.construct(globalThis.EventTarget, [], globalThis.MessagePort);
   Object.defineProperty(port, __tbPortData, {
-    value: { peer: null, started: false, closed: false, onmessage: null, onmessageerror: null, pending: [] },
+    value: { id: id, closed: false, onmessage: null, onclose: null },
     writable: false, enumerable: false, configurable: false,
   });
+  __tbPorts[id] = port;
+  if (pendingClose) {
+    port.__tbDispatchTrusted(new globalThis.Event('close'));
+  }
   return port;
 };
-const __tbPortDeliver = (port, cloned) => {
-  const data = __tbBrand(port, __tbPortData);
-  if (data.closed || !data.started) return;
-  port.__tbDispatchTrusted(new globalThis.MessageEvent('message', { data: cloned.data, ports: cloned.ports }));
+const __tbPortLookup = id => {
+  const port = __tbPorts[id];
+  return port === undefined ? null : port;
 };
-const __tbPortFlush = port => {
-  const data = __tbBrand(port, __tbPortData);
-  while (data.pending.length > 0) {
-    const cloned = data.pending.shift();
-    setTimeout(function() { __tbPortDeliver(port, cloned); }, 0);
-  }
-};
-const __tbPortEnqueue = (port, cloned) => {
-  const peer = __tbBrand(port, __tbPortData).peer;
-  if (peer === null) return;
-  const peerData = __tbBrand(peer, __tbPortData);
-  if (peerData.closed) return;
-  if (peerData.started) setTimeout(function() { __tbPortDeliver(peer, cloned); }, 0);
-  else peerData.pending.push(cloned);
-};
+// https://html.spec.whatwg.org/multipage/web-messaging.html#messageport
 globalThis.MessagePort = class MessagePort extends EventTarget {
   constructor() { throw new TypeError('Illegal constructor'); }
   postMessage(message, transfer) {
@@ -1460,19 +1629,23 @@ globalThis.MessagePort = class MessagePort extends EventTarget {
         && typeof transfer[Symbol.iterator] !== 'function' && 'transfer' in transfer) {
       transfer = transfer.transfer;
     }
-    __tbPortEnqueue(this, __tbStructuredClone(message, transfer, this));
+    const encoded = __tbEncode(message, transfer, this);
+    // A port posted to its own entangled port loses the channel
+    // (<https://html.spec.whatwg.org/multipage/web-messaging.html#message-port-post-message-steps>).
+    const peer = __tbPortPeer(data.id);
+    if (peer != null && encoded.ports.indexOf(peer) !== -1) return;
+    __tbPortPost(data.id, encoded.payload, encoded.ports);
   }
   start() {
     const data = __tbBrand(this, __tbPortData);
-    if (data.started) return;
-    data.started = true;
-    __tbPortFlush(this);
+    if (data.closed) return;
+    __tbPortStart(data.id);
   }
   close() {
     const data = __tbBrand(this, __tbPortData);
+    if (data.closed) return;
     data.closed = true;
-    data.started = false;
-    data.pending.length = 0;
+    __tbPortClose(data.id);
   }
   get onmessage() { return __tbBrand(this, __tbPortData).onmessage; }
   set onmessage(value) {
@@ -1481,28 +1654,127 @@ globalThis.MessagePort = class MessagePort extends EventTarget {
   }
   get onmessageerror() { return __tbBrand(this, __tbPortData).onmessageerror; }
   set onmessageerror(value) { __tbBrand(this, __tbPortData).onmessageerror = value; }
+  get onclose() { return __tbBrand(this, __tbPortData).onclose; }
+  set onclose(value) { __tbBrand(this, __tbPortData).onclose = value; }
 };
 Object.defineProperty(globalThis.MessagePort.prototype, Symbol.toStringTag, { value: 'MessagePort', writable: false, enumerable: false, configurable: true });
 // https://html.spec.whatwg.org/multipage/web-messaging.html#messagechannel
 globalThis.MessageChannel = class MessageChannel {
   constructor() {
-    const port1 = __tbNewPort();
-    const port2 = __tbNewPort();
-    __tbBrand(port1, __tbPortData).peer = port2;
-    __tbBrand(port2, __tbPortData).peer = port1;
+    const pair = __tbPortNew();
+    const port1 = __tbMaterializePort(pair[0], false);
+    const port2 = __tbMaterializePort(pair[1], false);
     Object.defineProperty(this, 'port1', { value: port1, writable: false, enumerable: true, configurable: true });
     Object.defineProperty(this, 'port2', { value: port2, writable: false, enumerable: true, configurable: true });
   }
 };
 Object.defineProperty(globalThis.MessageChannel.prototype, Symbol.toStringTag, { value: 'MessageChannel', writable: false, enumerable: false, configurable: true });
+
+// ── window proxies ─────────────────────────────────────────────────────
+// One proxy per frame per realm, stable across the frame's navigations. It
+// carries the cross-origin whitelist; same-origin members forward through the
+// target realm's window
+// (<https://html.spec.whatwg.org/multipage/window-object.html#the-windowproxy-exotic-object>).
+// The cross-origin member set follows Blink's `[CrossOrigin]` IDL attributes
+// and Firefox's `sCrossOriginProperties`: postMessage, window, self, frames,
+// length, top, parent, closed, and the indexed getter.
+const __tbFrameProxy = frame => {
+  if (frame == null) return undefined;
+  if (frame === __tbFrameId) return globalThis;
+  if (__tbFrameProxies[frame] !== undefined) return __tbFrameProxies[frame];
+  let proxy;
+  const crossOrigin = () => {
+    throw new globalThis.DOMException('Blocked a frame from accessing a cross-origin frame.', 'SecurityError');
+  };
+  const handler = {
+    get(target, property) {
+      if (property === __tbWindowProxyData) return { frame: frame };
+      switch (property) {
+        case 'postMessage':
+          return function(message, targetOrigin, transfer) {
+            try {
+              return __tbPostMessage(frame, arguments.length, message, targetOrigin, transfer);
+            } catch (error) {
+              // Exceptions from a proxy's postMessage come from the target
+              // window's realm, the way a shipped engine throws them.
+              if (error instanceof globalThis.DOMException) {
+                const global = __tbFrameGlobal(frame);
+                const constructor = global == null ? undefined : global.DOMException;
+                if (typeof constructor === 'function' && error.constructor !== constructor) {
+                  throw new constructor(error.message, error.name);
+                }
+              }
+              throw error;
+            }
+          };
+        case 'parent': {
+          const parent = __tbFrameParent(frame);
+          return parent == null ? proxy : __tbFrameProxy(parent);
+        }
+        case 'top': {
+          const top = __tbFrameTop(frame);
+          return top == null || top === frame ? proxy : __tbFrameProxy(top);
+        }
+        case 'window': case 'self': case 'frames': return proxy;
+        case 'length': return __tbFrameChildCount(frame);
+        case 'closed': return false;
+        case Symbol.toStringTag: return 'Window';
+        case 'document': return __tbFrameDocument(frame);
+      }
+      const sameOrigin = __tbFrameGlobal(frame);
+      if (sameOrigin == null) {
+        if (__tbFrameRegistered(frame)) {
+          const pending = __tbFramePendingSets[frame];
+          if (pending !== undefined && Object.prototype.hasOwnProperty.call(pending, property)) {
+            return pending[property];
+          }
+          return undefined;
+        }
+        crossOrigin();
+      }
+      return sameOrigin[property];
+    },
+    set(target, property, value) {
+      const sameOrigin = __tbFrameGlobal(frame);
+      if (sameOrigin == null) {
+        if (__tbFrameRegistered(frame)) {
+          __tbFramePending(frame)[property] = value;
+          return true;
+        }
+        crossOrigin();
+      }
+      sameOrigin[property] = value;
+      return true;
+    },
+    has(target, property) {
+      switch (property) {
+        case 'postMessage': case 'parent': case 'top': case 'window': case 'self':
+        case 'frames': case 'length': case 'closed': case 'document':
+          return true;
+      }
+      const sameOrigin = __tbFrameGlobal(frame);
+      if (sameOrigin != null) return property in sameOrigin;
+      const pending = __tbFramePendingSets[frame];
+      return pending !== undefined && property in pending;
+    },
+    getPrototypeOf() { return globalThis.Object.prototype; },
+    ownKeys() { return []; },
+    getOwnPropertyDescriptor() { return undefined; },
+  };
+  proxy = new Proxy({}, handler);
+  __tbFrameProxies[frame] = proxy;
+  return proxy;
+};
+globalThis.__tbFrameProxy = __tbFrameProxy;
+
+// ── posting and delivery ───────────────────────────────────────────────
 // https://html.spec.whatwg.org/multipage/web-messaging.html#dom-window-postmessage
-// Same-window delivery: `source` is this window. The spec order is kept:
-// resolve targetOrigin, then structured-serialize, then queue the task, and
-// the origin check runs inside the task. Deviation: the task is queued on the
-// timer task source; there is no posted-message task source yet.
-globalThis.postMessage = function(message, targetOrigin, transfer) {
-  if (arguments.length === 0) {
+function __tbPostMessage(targetFrame, argumentCount, message, targetOrigin, transfer) {
+  if (argumentCount === 0) {
     throw new TypeError(`Failed to execute 'postMessage' on 'Window': 1 argument required, but only 0 present.`);
+  }
+  if (targetFrame == null) {
+    throw new TypeError(`Failed to execute 'postMessage' on 'Window': the target window is missing.`);
   }
   // `postMessage(message, options)` dictionary overload
   // (<https://html.spec.whatwg.org/multipage/web-messaging.html#dom-window-postmessage>).
@@ -1517,24 +1789,154 @@ globalThis.postMessage = function(message, targetOrigin, transfer) {
   } else if (checkedOrigin !== '*') {
     let parsed;
     try {
-      parsed = new URL(checkedOrigin);
+      parsed = new globalThis.URL(checkedOrigin);
     } catch (error) {
-      throw new DOMException('Invalid target origin', 'SyntaxError');
+      throw new globalThis.DOMException('Invalid target origin', 'SyntaxError');
     }
     checkedOrigin = parsed.origin;
   }
-  const cloned = __tbStructuredClone(message, transfer, null);
-  const ports = cloned.ports;
-  setTimeout(function() {
-    if (checkedOrigin !== '*' && checkedOrigin !== sourceOrigin) return;
-    globalThis.__tbDispatchTrusted(new globalThis.MessageEvent('message', {
-      data: cloned.data,
-      origin: sourceOrigin,
-      source: globalThis,
-      ports: ports,
-    }));
-  }, 0);
+  const encoded = __tbEncode(message, transfer, null);
+  __tbPostWindowMessage(targetFrame, checkedOrigin, encoded.payload, encoded.ports);
+}
+globalThis.postMessage = function(message, targetOrigin, transfer) {
+  return __tbPostMessage(__tbFrameId, arguments.length, message, targetOrigin, transfer);
 };
+// Runs in the target realm: decode, then dispatch a trusted message event, or
+// report the failure so the engine dispatches `messageerror`
+// (<https://html.spec.whatwg.org/multipage/web-messaging.html#window-post-message-steps>).
+globalThis.__tbDeliverMessage = function(payload, sourceFrame, origin, portIds) {
+  if (String(payload).indexOf(__tbPayloadVersion) !== 0) return false;
+  const ports = __tbMaterializePorts(portIds);
+  let data;
+  try {
+    data = __tbDecode(payload, ports);
+  } catch (error) {
+    return false;
+  }
+  const portArray = portIds.map(id => ports[id]);
+  globalThis.__tbDispatchTrusted(new globalThis.MessageEvent('message', {
+    data: data, origin: origin, source: __tbFrameProxy(sourceFrame), ports: Object.freeze(portArray),
+  }));
+  return true;
+};
+globalThis.__tbDeliverMessageError = function(sourceFrame, origin) {
+  globalThis.__tbDispatchTrusted(new globalThis.MessageEvent('messageerror', {
+    data: null, origin: origin, source: __tbFrameProxy(sourceFrame),
+  }));
+};
+globalThis.__tbDeliverPortMessage = function(endpoint, payload, portIds) {
+  const port = __tbPortLookup(endpoint);
+  if (port === null) return true;
+  const data = __tbBrand(port, __tbPortData);
+  if (data.closed) return true;
+  if (String(payload).indexOf(__tbPayloadVersion) !== 0) return false;
+  const ports = __tbMaterializePorts(portIds);
+  let value;
+  try {
+    value = __tbDecode(payload, ports);
+  } catch (error) {
+    return false;
+  }
+  const portArray = portIds.map(id => ports[id]);
+  port.__tbDispatchTrusted(new globalThis.MessageEvent('message', {
+    data: value, ports: Object.freeze(portArray),
+  }));
+  return true;
+};
+globalThis.__tbDeliverPortMessageError = function(endpoint) {
+  const port = __tbPortLookup(endpoint);
+  if (port === null) return;
+  port.__tbDispatchTrusted(new globalThis.MessageEvent('messageerror'));
+};
+globalThis.__tbDeliverPortClose = function(endpoint) {
+  const port = __tbPortLookup(endpoint);
+  if (port === null) return;
+  const data = __tbBrand(port, __tbPortData);
+  if (data.closed) return;
+  port.__tbDispatchTrusted(new globalThis.Event('close'));
+};
+
+// ── the window's own indexed and browsing-context members ──────────────
+// https://html.spec.whatwg.org/multipage/nav-history-apis.html#dom-length
+Object.defineProperty(globalThis, 'length', {
+  get() { return __tbFrameChildCount(__tbFrameId); },
+  configurable: true, enumerable: false,
+});
+// https://html.spec.whatwg.org/multipage/nav-history-apis.html#dom-window-item
+for (let index = 0; index < __tb_maxFrames; index++) {
+  Object.defineProperty(globalThis, String(index), {
+    get() {
+      const child = __tbFrameChild(__tbFrameId, index);
+      return child == null ? undefined : __tbFrameProxy(child);
+    },
+    configurable: true, enumerable: false,
+  });
+}
+// https://html.spec.whatwg.org/multipage/nav-history-apis.html#dom-parent
+Object.defineProperty(globalThis, 'parent', {
+  get() {
+    const parent = __tbFrameParent(__tbFrameId);
+    return parent == null ? globalThis : __tbFrameProxy(parent);
+  },
+  configurable: true, enumerable: true,
+});
+// https://html.spec.whatwg.org/multipage/nav-history-apis.html#dom-top
+Object.defineProperty(globalThis, 'top', {
+  get() {
+    const top = __tbFrameTop(__tbFrameId);
+    return top === __tbFrameId ? globalThis : __tbFrameProxy(top);
+  },
+  configurable: true, enumerable: true,
+});
+
+// Event handler properties live in the world rather than on the wrapper, so
+// a collected wrapper cannot lose `element.onload`
+// (<https://html.spec.whatwg.org/multipage/webappapis.html#event-handlers>).
+(function() {
+  const names = globalThis.__tb_handlerNames;
+  if (names === undefined) return;
+  for (const name of names) {
+    Object.defineProperty(globalThis, name, {
+      get() { return globalThis.__tbGetWindowHandler(name); },
+      set(value) { globalThis.__tbSetWindowHandler(name, value); },
+      enumerable: true, configurable: true,
+    });
+    for (const proto of [globalThis.HTMLElement.prototype, globalThis.SVGElement.prototype]) {
+      Object.defineProperty(proto, name, {
+        get() { return globalThis.__tbGetNodeHandler(this, name); },
+        set(value) { globalThis.__tbSetNodeHandler(this, name, value); },
+        enumerable: true, configurable: true,
+      });
+    }
+  }
+})();
+
+// Platform objects and globals are not serializable; the marker travels with
+// the prototype, so it identifies an object from another realm too
+// (<https://html.spec.whatwg.org/multipage/structured-data.html#serializable-objects>).
+(function() {
+  const names = [
+    'Event', 'EventTarget', 'Node', 'DOMException', 'Attr', 'NamedNodeMap',
+    'TokenList', 'Implementation', 'DOMParser', 'XMLSerializer', 'MutationObserver',
+    'MutationRecord', 'MessageEvent', 'MessagePort', 'MessageChannel', 'Headers',
+    'Request', 'Response', 'Blob', 'File', 'FileList', 'FileReader', 'ProgressEvent',
+    'ReadableStream', 'TextDecoder', 'TextEncoder', 'URL', 'URLSearchParams',
+    'AbortController', 'AbortSignal', 'CustomEvent', 'Document',
+  ];
+  for (const name of names) {
+    const ctor = globalThis[name];
+    if (typeof ctor === 'function' && ctor.prototype !== undefined) {
+      try {
+        Object.defineProperty(ctor.prototype, __tbPlatform, {
+          value: true, writable: false, enumerable: false, configurable: true,
+        });
+      } catch (error) {}
+    }
+  }
+  Object.defineProperty(globalThis, __tbPlatform, {
+    value: true, writable: false, enumerable: false, configurable: true,
+  });
+})();
 ";
 
 /// A value produced by script evaluation.
@@ -1779,6 +2181,139 @@ impl JsRealm {
         })
     }
 
+    /// Decodes and dispatches one posted window message in this realm.
+    ///
+    /// Returns `false` when the payload cannot be decoded, which the engine
+    /// turns into a `messageerror`
+    /// (<https://html.spec.whatwg.org/multipage/web-messaging.html#window-post-message-steps>).
+    pub(crate) fn deliver_window_message(
+        &self,
+        source: u64,
+        origin: &str,
+        payload: &str,
+        ports: &[u64],
+    ) -> Result<bool, JsError> {
+        self.with_budget(None, || {
+            let payload = payload.to_owned();
+            let origin = origin.to_owned();
+            let ports: Vec<f64> = ports.iter().map(|port| js_number(*port)).collect();
+            let source = js_number(source);
+            let delivered: Result<bool, JsError> = self.context.with(|ctx| {
+                let deliver: Function = ctx
+                    .globals()
+                    .get("__tbDeliverMessage")
+                    .map_err(JsError::engine)?;
+                deliver
+                    .call((payload, source, origin, ports))
+                    .map_err(JsError::engine)
+            });
+            let jobs = self.run_jobs();
+            delivered.and_then(|delivered| jobs.map(|()| delivered))
+        })
+    }
+
+    /// Dispatches `messageerror` for a payload this realm could not decode.
+    pub(crate) fn deliver_window_message_error(
+        &self,
+        source: u64,
+        origin: &str,
+    ) -> Result<(), JsError> {
+        self.with_budget(None, || {
+            let origin = origin.to_owned();
+            let source = js_number(source);
+            let delivered: Result<(), JsError> = self.context.with(|ctx| {
+                let deliver: Function = ctx
+                    .globals()
+                    .get("__tbDeliverMessageError")
+                    .map_err(JsError::engine)?;
+                deliver
+                    .call::<_, ()>((source, origin))
+                    .map_err(JsError::engine)
+            });
+            let jobs = self.run_jobs();
+            delivered.and(jobs)
+        })
+    }
+
+    /// Decodes and dispatches one channel message in this realm.
+    pub(crate) fn deliver_port_message(
+        &self,
+        endpoint: u64,
+        payload: &str,
+        ports: &[u64],
+    ) -> Result<bool, JsError> {
+        self.with_budget(None, || {
+            let payload = payload.to_owned();
+            let ports: Vec<f64> = ports.iter().map(|port| js_number(*port)).collect();
+            let endpoint = js_number(endpoint);
+            let delivered: Result<bool, JsError> = self.context.with(|ctx| {
+                let deliver: Function = ctx
+                    .globals()
+                    .get("__tbDeliverPortMessage")
+                    .map_err(JsError::engine)?;
+                deliver
+                    .call((endpoint, payload, ports))
+                    .map_err(JsError::engine)
+            });
+            let jobs = self.run_jobs();
+            delivered.and_then(|delivered| jobs.map(|()| delivered))
+        })
+    }
+
+    /// Dispatches `messageerror` at a port whose payload failed to decode.
+    pub(crate) fn deliver_port_message_error(&self, endpoint: u64) -> Result<(), JsError> {
+        self.with_budget(None, || {
+            let endpoint = js_number(endpoint);
+            let delivered: Result<(), JsError> = self.context.with(|ctx| {
+                let deliver: Function = ctx
+                    .globals()
+                    .get("__tbDeliverPortMessageError")
+                    .map_err(JsError::engine)?;
+                deliver
+                    .call::<_, ()>((endpoint,))
+                    .map_err(JsError::engine)
+            });
+            let jobs = self.run_jobs();
+            delivered.and(jobs)
+        })
+    }
+
+    /// Applies the proxy writes this realm stored for `frame` before its
+    /// realm existed.
+    pub(crate) fn flush_frame_sets(&self, frame: u64) -> Result<(), JsError> {
+        self.with_budget(None, || {
+            let frame = js_number(frame);
+            let flushed: Result<(), JsError> = self.context.with(|ctx| {
+                let flush: Function = ctx
+                    .globals()
+                    .get("__tbFlushFrameSets")
+                    .map_err(JsError::engine)?;
+                flush.call::<_, ()>((frame,)).map_err(JsError::engine)
+            });
+            let jobs = self.run_jobs();
+            flushed.and(jobs)
+        })
+    }
+
+    /// Fires `close` at one channel endpoint
+    /// (<https://html.spec.whatwg.org/multipage/web-messaging.html#disentangle>).
+    pub(crate) fn deliver_port_close(&self, endpoint: u64) -> Result<(), JsError> {
+        self.with_budget(None, || {
+            let endpoint = js_number(endpoint);
+            let delivered: Result<(), JsError> = self.context.with(|ctx| {
+                let deliver: Function = ctx
+                    .globals()
+                    .get("__tbDeliverPortClose")
+                    .map_err(JsError::engine)?;
+                deliver
+                    .call::<_, ()>((endpoint,))
+                    .map_err(JsError::engine)
+            });
+            let jobs = self.run_jobs();
+            delivered.and(jobs)
+        })
+    }
+
     /// Microtask checkpoint for parser-driven mutations: schedules the
     /// delivery microtask when records are pending and runs the job queue.
     ///
@@ -1837,6 +2372,7 @@ impl JsRealm {
             intl::install(&ctx).map_err(JsError::engine)?;
             self.install_task_host_functions(&ctx, &world)?;
             Self::install_document_host_functions(&ctx, &world)?;
+            bindings::install_messaging(&ctx).map_err(JsError::engine)?;
             ctx.eval::<(), _>(INSTALL_WEB_APIS_JS)
                 .map_err(JsError::engine)?;
             Ok(())
@@ -2185,4 +2721,10 @@ fn millis(delay: f64) -> u32 {
     }
     let duration = Duration::from_secs_f64((delay / 1000.0).clamp(0.0, 86_400.0));
     u32::try_from(duration.as_millis()).unwrap_or(u32::MAX)
+}
+
+/// A protocol id as the JS number the shim exchanges; ids are small counters,
+/// so a value that cannot be numbered exactly is not addressable at all.
+pub(crate) fn js_number(id: u64) -> f64 {
+    u32::try_from(id).map_or(f64::NAN, f64::from)
 }

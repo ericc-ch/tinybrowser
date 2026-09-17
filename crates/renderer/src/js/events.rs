@@ -11,7 +11,7 @@ use std::sync::OnceLock;
 use std::time::Instant;
 
 use rquickjs::{
-    Array, Class, Ctx, Exception, FromJs, Object, Persistent, Result, Value,
+    Array, Class, Ctx, Exception, FromJs, Function, Object, Persistent, Result, Value,
     class::{Trace, Tracer},
     function::{Opt, Rest, This},
 };
@@ -1379,7 +1379,20 @@ fn call_handler_attribute<'js>(
         return Ok(());
     };
     let name = format!("on{typ}");
-    let handler: Value = object.get(name.as_str())?;
+    let mut handler: Value = object.get(name.as_str())?;
+    if handler.as_function().is_none()
+        && let Some(id) = bindings::host_node_id(ctx, &object.clone().into_value())
+        && let Some(body) = bindings::handler_attribute(ctx, id, &name)?
+        && !body.trim().is_empty()
+    {
+        // A handler content attribute compiles to a function whose body is
+        // the attribute value and whose `this` is the object
+        // (<https://html.spec.whatwg.org/multipage/webappapis.html#event-handler-content-attributes>).
+        let source = format!("(function(event) {{\n{body}\n}})");
+        let compiled: Function = ctx.eval(source)?;
+        object.set(name.as_str(), compiled.clone())?;
+        handler = compiled.into_value();
+    }
     if let Some(function) = handler.as_function()
         && let Err(error) = function.call::<_, ()>((This(object.clone()), event.clone()))
     {

@@ -178,6 +178,9 @@ pub struct Dom {
     /// Connection transitions in order; never suppressed, because the
     /// renderer's frame lifetime hangs off them, not off observers.
     lifecycle: Vec<Lifecycle>,
+    /// Connected `iframe` elements, so the renderer can tell whether a frame
+    /// scan is needed at all.
+    connected_iframes: u32,
     /// `Cell<()>` is `Send` + `!Sync`; `PhantomData` makes `Dom` inherit
     /// exactly that split. Deleting this field would silently re-derive
     /// `Sync`, which is the point: that deletion has to be a conscious act.
@@ -215,6 +218,7 @@ impl Dom {
             record_mutations: false,
             recording_suppressed: false,
             lifecycle: Vec::new(),
+            connected_iframes: 0,
             _share_forbidden: PhantomData,
         }
     }
@@ -250,6 +254,11 @@ impl Dom {
         }
         let connected = self.is_connected(id);
         if connected != was_connected {
+            if connected {
+                self.connected_iframes = self.connected_iframes.saturating_add(1);
+            } else {
+                self.connected_iframes = self.connected_iframes.saturating_sub(1);
+            }
             self.lifecycle.push(if connected {
                 Lifecycle::Inserted(id)
             } else {
@@ -258,8 +267,15 @@ impl Dom {
         }
     }
 
+    /// How many `iframe` elements are connected in this document.
+    #[must_use]
+    pub fn connected_iframe_count(&self) -> u32 {
+        self.connected_iframes
+    }
+
     /// Whether `id` is an HTML `iframe` element.
-    fn is_iframe_element(&self, id: NodeId) -> bool {
+    #[must_use]
+    pub fn is_iframe_element(&self, id: NodeId) -> bool {
         matches!(
             self.get(id).map(|view| view.kind()),
             Some(NodeKind::Element { name, .. })

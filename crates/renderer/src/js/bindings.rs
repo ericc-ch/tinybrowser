@@ -21,6 +21,8 @@ use super::world::{
     ObserverOptions, ObserverState, RecordData, World,
 };
 use crate::ReadyState;
+use crate::messaging::{Delivery, MAX_FRAMES, PAYLOAD_VERSION, Shared};
+use crate::protocol::FrameId;
 
 thread_local! {
     /// JS world per live realm, keyed by its QuickJS context pointer.
@@ -1202,6 +1204,116 @@ fn touch_attr(
     schedule_mutation_delivery(ctx)
 }
 
+/// Event handler attribute names that the `<body>` element forwards to the
+/// window ([WindowEventHandlers](https://html.spec.whatwg.org/multipage/webappapis.html#windoweventhandlers)).
+const WINDOW_HANDLER_ATTRIBUTES: &[&str] = &[
+    "onafterprint",
+    "onbeforeprint",
+    "onbeforeunload",
+    "onhashchange",
+    "onlanguagechange",
+    "onmessage",
+    "onmessageerror",
+    "onoffline",
+    "ononline",
+    "onpagehide",
+    "onpageshow",
+    "onpopstate",
+    "onrejectionhandled",
+    "onstorage",
+    "onunhandledrejection",
+    "onunload",
+];
+
+/// Compiles or clears one element's event handler content attribute.
+fn compile_handler_attribute(ctx: &Ctx<'_>, element: NodeId, typ: &str) -> Result<()> {
+    let name = format!("on{typ}");
+    let body = world(ctx)?
+        .borrow()
+        .document(element)
+        .and_then(|parsed| parsed.dom.attribute(element, &name));
+    let Some(object) = wrap_node(ctx, element)?.as_object().cloned() else {
+        return Ok(());
+    };
+    // A `body` element's window event handler attributes register on the
+    // window itself
+    // (<https://html.spec.whatwg.org/multipage/dom.html#body-element-event-handlers>).
+    let forwarded = WINDOW_HANDLER_ATTRIBUTES.contains(&name.as_str())
+        && with_node_kind(ctx, element, |kind| {
+            matches!(
+                kind,
+                Some(NodeKind::Element { name, .. })
+                    if name.ns == html_namespace() && name.local.as_ref() == "body"
+            )
+        })?;
+    match body {
+        Some(body) if !body.trim().is_empty() => {
+            let source = format!("(function(event) {{\n{body}\n}})");
+            let compiled: Function = ctx.eval(source)?;
+            object.set(name.as_str(), compiled.clone())?;
+            if forwarded {
+                ctx.globals().set(name.as_str(), compiled)?;
+            }
+        }
+        _ => {
+            object.set(name.as_str(), Value::new_null(ctx.clone()))?;
+            if forwarded {
+                ctx.globals().set(name.as_str(), Value::new_null(ctx.clone()))?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// After an attribute change, runs the element's attribute-change hooks: an
+/// `iframe`'s `src` drives its browsing context's navigation
+/// (<https://html.spec.whatwg.org/multipage/iframe-embed-object.html#process-the-iframe-attributes>),
+/// and an event handler content attribute compiles into its handler property
+/// (<https://html.spec.whatwg.org/multipage/webappapis.html#event-handler-content-attributes>).
+fn after_attribute_change(ctx: &Ctx<'_>, element: NodeId, local: &str) -> Result<()> {
+    if let Some(typ) = local.strip_prefix("on")
+        && !typ.is_empty()
+        && typ
+            .chars()
+            .all(|character| character.is_ascii_lowercase() || character.is_ascii_digit())
+    {
+        compile_handler_attribute(ctx, element, typ)?;
+    }
+    if local != "src" {
+        return Ok(());
+    }
+    let is_iframe = with_node_kind(ctx, element, |kind| {
+        matches!(
+            kind,
+            Some(NodeKind::Element { name, .. })
+                if name.ns == html_namespace() && name.local.as_ref() == "iframe"
+        )
+    })?;
+    if !is_iframe {
+        return Ok(());
+    }
+    let world = world(ctx)?;
+    let spec = world
+        .borrow()
+        .document(element)
+        .and_then(|parsed| parsed.dom.attribute(element, "src"))
+        .unwrap_or_default();
+    world.borrow_mut().queue_frame_navigation(FrameNavigation::Src {
+        container: element,
+        spec,
+    });
+    Ok(())
+}
+
+/// The value of one event handler content attribute, when the element has it.
+pub(super) fn handler_attribute(ctx: &Ctx<'_>, id: NodeId, name: &str) -> Result<Option<String>> {
+    let world = world(ctx)?;
+    Ok(world
+        .borrow()
+        .document(id)
+        .and_then(|parsed| parsed.dom.attribute(id, name)))
+}
+
 /// Removes the DOM attribute identified by `(namespace, local)` and syncs
 /// the registry; used by `removeAttributeNode` and `NamedNodeMap.remove*`.
 fn remove_attribute_sync(
@@ -1239,6 +1351,7 @@ fn remove_attribute_sync(
         }
     }
     touch_named_node_map(ctx, element)?;
+    after_attribute_change(ctx, element, local)?;
     schedule_mutation_delivery(ctx)
 }
 
@@ -1316,9 +1429,10 @@ fn set_attribute_node<'js>(
         world.attr_owners.insert(id, Some(element));
         world
             .attr_ids
-            .insert((element, state.namespace.clone(), state.local), id);
+            .insert((element, state.namespace.clone(), state.local.clone()), id);
     }
     touch_named_node_map(ctx, element)?;
+    after_attribute_change(ctx, element, &state.local)?;
     schedule_mutation_delivery(ctx)?;
     match previous {
         Some(previous) => attr_wrapper(ctx, element, previous),
@@ -2937,6 +3051,7 @@ impl JsNode {
                 .map_err(|err| throw_dom_error(&ctx, err))?;
         }
         touch_attr(&ctx, self.handle.0, "", &local, &value.0)?;
+        after_attribute_change(&ctx, self.handle.0, &local)?;
         schedule_mutation_delivery(&ctx)
     }
 
@@ -2967,36 +3082,7 @@ impl JsNode {
 
     #[qjs(set, rename = "src")]
     fn set_src(&self, ctx: Ctx<'_>, value: WebIdlString) -> Result<()> {
-        let source = value.0.clone();
-        self.set_attribute(
-            ctx.clone(),
-            WebIdlString("src".into()),
-            WebIdlString(value.0),
-        )?;
-
-        let is_iframe = with_node_kind(&ctx, self.handle.0, |kind| {
-            matches!(
-                kind,
-                Some(NodeKind::Element { name, .. })
-                    if name.ns == html_namespace() && name.local.as_ref() == "iframe"
-            )
-        })?;
-        if !is_iframe {
-            return Ok(());
-        }
-
-        let world_rc = world(&ctx)?;
-        let contents = world_rc.borrow().object_url_contents(&source);
-        let Some(contents) = contents else {
-            return Ok(());
-        };
-        world_rc
-            .borrow_mut()
-            .queue_frame_navigation(FrameNavigation::ObjectUrl {
-                container: self.handle.0,
-                contents,
-            });
-        Ok(())
+        self.set_attribute(ctx, WebIdlString("src".into()), value)
     }
 
     // https://html.spec.whatwg.org/multipage/iframe-embed-object.html#dom-iframe-contentdocument
@@ -3012,6 +3098,14 @@ impl JsNode {
         if !is_iframe {
             return Ok(Value::new_null(ctx));
         }
+        // A script may have appended an iframe in this same task, so the
+        // browsing context is registered before it can be looked up; its
+        // realm follows at the next non-JS turn
+        // (<https://html.spec.whatwg.org/multipage/iframe-embed-object.html#process-the-iframe-attributes>).
+        {
+            let world = world(&ctx)?;
+            world.borrow_mut().register_pending_frames();
+        }
         let world = world(&ctx)?;
         let root = world.borrow().frame_document(self.handle.0);
         match root {
@@ -3026,6 +3120,35 @@ impl JsNode {
                 } else {
                     Ok(Value::new_null(ctx))
                 }
+            }
+            None => Ok(Value::new_null(ctx)),
+        }
+    }
+
+    // https://html.spec.whatwg.org/multipage/iframe-embed-object.html#dom-iframe-contentwindow
+    #[qjs(get, rename = "contentWindow")]
+    fn content_window<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
+        let is_iframe = with_node_kind(&ctx, self.handle.0, |kind| {
+            matches!(
+                kind,
+                Some(NodeKind::Element { name, .. })
+                    if name.ns == html_namespace() && name.local.as_ref() == "iframe"
+            )
+        })?;
+        if !is_iframe {
+            return Ok(Value::new_null(ctx));
+        }
+        {
+            let world = world(&ctx)?;
+            world.borrow_mut().register_pending_frames();
+        }
+        let frame = world(&ctx)?
+            .borrow()
+            .frame_for_container(self.handle.0);
+        match frame {
+            Some(frame) => {
+                let proxy: Function = ctx.globals().get("__tbFrameProxy")?;
+                proxy.call((super::js_number(frame.get()),))
             }
             None => Ok(Value::new_null(ctx)),
         }
@@ -5043,6 +5166,513 @@ fn install_location<'js>(
     Ok(())
 }
 
+/// Installs the frame-tree and cross-realm messaging host functions the shim
+/// calls: posting window messages and channel messages, reading the frame
+/// tree, and moving channel endpoints between realms.
+/// Installs the frame-tree and cross-realm messaging host functions the shim
+/// calls: posting window messages and channel messages, reading the frame
+/// tree, and moving channel endpoints between realms.
+///
+/// The calling realm's world comes from the realm registration, so every
+/// function is a plain item and its borrow of the world ends with the call.
+pub(super) fn install_messaging(ctx: &Ctx<'_>) -> Result<()> {
+    let globals = ctx.globals();
+    let frame = world(ctx)?.borrow().frame();
+    globals.set("__tb_frameId", super::js_number(frame.get()))?;
+    globals.set(
+        "__tb_maxFrames",
+        super::js_number(u64::try_from(MAX_FRAMES).unwrap_or(u64::MAX)),
+    )?;
+
+    globals.set(
+        "__tbPostWindowMessage",
+        rquickjs::prelude::Func::from(post_window_message),
+    )?;
+    globals.set(
+        "__tbPortNew",
+        rquickjs::prelude::Func::from(port_new),
+    )?;
+    globals.set(
+        "__tbPortPost",
+        rquickjs::prelude::Func::from(port_post),
+    )?;
+    globals.set(
+        "__tbPortStart",
+        rquickjs::prelude::Func::from(port_start),
+    )?;
+    globals.set(
+        "__tbPortClose",
+        rquickjs::prelude::Func::from(port_close),
+    )?;
+    globals.set(
+        "__tbPortDetach",
+        rquickjs::prelude::Func::from(port_detach),
+    )?;
+    globals.set(
+        "__tbPortAdopt",
+        rquickjs::prelude::Func::from(port_adopt),
+    )?;
+    globals.set(
+        "__tbPortPeer",
+        rquickjs::prelude::Func::from(port_peer),
+    )?;
+    globals.set(
+        "__tbFrameParent",
+        rquickjs::prelude::Func::from(frame_parent),
+    )?;
+    globals.set(
+        "__tbFrameTop",
+        rquickjs::prelude::Func::from(frame_top),
+    )?;
+    globals.set(
+        "__tbFrameChildCount",
+        rquickjs::prelude::Func::from(frame_child_count),
+    )?;
+    globals.set(
+        "__tbFrameChild",
+        rquickjs::prelude::Func::from(frame_child),
+    )?;
+    globals.set(
+        "__tbFrameGlobal",
+        rquickjs::prelude::Func::from(frame_global),
+    )?;
+    globals.set(
+        "__tbFrameDocument",
+        rquickjs::prelude::Func::from(frame_document),
+    )?;
+    globals.set(
+        "__tbFrameRegistered",
+        rquickjs::prelude::Func::from(frame_registered),
+    )?;
+    Ok(())
+}
+
+/// One window message: the target origin is recorded and re-checked at
+/// delivery
+/// (<https://html.spec.whatwg.org/multipage/web-messaging.html#window-post-message-steps>).
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "rquickjs Func ABI passes Ctx and owned arguments by value"
+)]
+fn post_window_message(
+    ctx: Ctx<'_>,
+    target: f64,
+    target_origin: String,
+    payload: String,
+    ports: Vec<f64>,
+) -> Result<()> {
+    let Some(target) = protocol_id(target) else {
+        return Ok(());
+    };
+    let Some(ports) = protocol_ids(ports) else {
+        return Ok(());
+    };
+    if !payload.starts_with(PAYLOAD_VERSION) {
+        return Ok(());
+    }
+    let world = world(&ctx)?;
+    let (source, origin, shared) = {
+        let world = world.borrow();
+        (world.frame(), world.origin_string(), world.shared())
+    };
+    shared.borrow_mut().deliveries.push(Delivery::WindowMessage {
+        target: FrameId::new(target),
+        source,
+        origin,
+        target_origin,
+        payload,
+        ports,
+    });
+    Ok(())
+}
+
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "rquickjs Func ABI passes Ctx and owned arguments by value"
+)]
+fn port_new(ctx: Ctx<'_>) -> Result<Vec<f64>> {
+    let world = world(&ctx)?;
+    let (frame, shared) = {
+        let world = world.borrow();
+        (world.frame(), world.shared())
+    };
+    let (first, second) = shared.borrow_mut().ports.new_pair(frame);
+    Ok(vec![
+        super::js_number(first),
+        super::js_number(second),
+    ])
+}
+
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "rquickjs Func ABI passes Ctx and owned arguments by value"
+)]
+fn port_post(
+    ctx: Ctx<'_>,
+    endpoint: f64,
+    payload: String,
+    ports: Vec<f64>,
+) -> Result<()> {
+    let Some(endpoint) = protocol_id(endpoint) else {
+        return Ok(());
+    };
+    let Some(ports) = protocol_ids(ports) else {
+        return Ok(());
+    };
+    if !payload.starts_with(PAYLOAD_VERSION) {
+        return Ok(());
+    }
+    let world = world(&ctx)?;
+    let shared = world.borrow().shared();
+    let mut shared = shared.borrow_mut();
+    let Shared {
+        ports: table,
+        deliveries,
+        ..
+    } = &mut *shared;
+    table.post(endpoint, payload, ports, deliveries);
+    Ok(())
+}
+
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "rquickjs Func ABI passes Ctx and owned arguments by value"
+)]
+fn port_start(ctx: Ctx<'_>, endpoint: f64) -> Result<()> {
+    let Some(endpoint) = protocol_id(endpoint) else {
+        return Ok(());
+    };
+    let world = world(&ctx)?;
+    let shared = world.borrow().shared();
+    let mut shared = shared.borrow_mut();
+    let Shared {
+        ports: table,
+        deliveries,
+        ..
+    } = &mut *shared;
+    table.start(endpoint, deliveries);
+    Ok(())
+}
+
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "rquickjs Func ABI passes Ctx and owned arguments by value"
+)]
+fn port_close(ctx: Ctx<'_>, endpoint: f64) -> Result<()> {
+    let Some(endpoint) = protocol_id(endpoint) else {
+        return Ok(());
+    };
+    let world = world(&ctx)?;
+    let shared = world.borrow().shared();
+    let mut shared = shared.borrow_mut();
+    let Shared {
+        ports: table,
+        deliveries,
+        ..
+    } = &mut *shared;
+    table.close(endpoint, deliveries);
+    Ok(())
+}
+
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "rquickjs Func ABI passes Ctx and owned arguments by value"
+)]
+fn port_detach(ctx: Ctx<'_>, endpoint: f64) -> Result<bool> {
+    let Some(endpoint) = protocol_id(endpoint) else {
+        return Ok(false);
+    };
+    let world = world(&ctx)?;
+    let (frame, shared) = {
+        let world = world.borrow();
+        (world.frame(), world.shared())
+    };
+    Ok(shared.borrow_mut().ports.detach(endpoint, frame))
+}
+
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "rquickjs Func ABI passes Ctx and owned arguments by value"
+)]
+fn port_adopt(ctx: Ctx<'_>, endpoint: f64) -> Result<Option<bool>> {
+    let Some(endpoint) = protocol_id(endpoint) else {
+        return Ok(None);
+    };
+    let world = world(&ctx)?;
+    let (frame, shared) = {
+        let world = world.borrow();
+        (world.frame(), world.shared())
+    };
+    Ok(shared.borrow_mut().ports.adopt(endpoint, frame))
+}
+
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "rquickjs Func ABI passes Ctx and owned arguments by value"
+)]
+fn port_peer(ctx: Ctx<'_>, endpoint: f64) -> Result<Option<f64>> {
+    let Some(endpoint) = protocol_id(endpoint) else {
+        return Ok(None);
+    };
+    let world = world(&ctx)?;
+    let shared = world.borrow().shared();
+    let Some(peer) = shared.borrow().ports.peer(endpoint) else {
+        return Ok(None);
+    };
+    Ok(Some(super::js_number(peer)))
+}
+
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "rquickjs Func ABI passes Ctx and owned arguments by value"
+)]
+fn frame_parent(ctx: Ctx<'_>, frame: f64) -> Result<Option<f64>> {
+    let Some(frame) = protocol_id(frame) else {
+        return Ok(None);
+    };
+    let world = world(&ctx)?;
+    let shared = world.borrow().shared();
+    let Some(parent) = shared.borrow().tree.parent(FrameId::new(frame)) else {
+        return Ok(None);
+    };
+    Ok(Some(super::js_number(parent.get())))
+}
+
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "rquickjs Func ABI passes Ctx and owned arguments by value"
+)]
+fn frame_top(ctx: Ctx<'_>, frame: f64) -> Result<Option<f64>> {
+    let Some(frame) = protocol_id(frame) else {
+        return Ok(None);
+    };
+    let mut frame = FrameId::new(frame);
+    let world = world(&ctx)?;
+    let shared = world.borrow().shared();
+    let shared = shared.borrow();
+    while let Some(parent) = shared.tree.parent(frame) {
+        frame = parent;
+    }
+    Ok(Some(super::js_number(frame.get())))
+}
+
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "rquickjs Func ABI passes Ctx and owned arguments by value"
+)]
+fn frame_child_count(ctx: Ctx<'_>, frame: f64) -> Result<f64> {
+    let Some(frame) = protocol_id(frame) else {
+        return Ok(0.0);
+    };
+    let world = world(&ctx)?;
+    world.borrow_mut().register_pending_frames();
+    let shared = world.borrow().shared();
+    let count = shared.borrow().tree.children(FrameId::new(frame)).len();
+    Ok(super::js_number(
+        u64::try_from(count).unwrap_or(u64::MAX),
+    ))
+}
+
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "rquickjs Func ABI passes Ctx and owned arguments by value"
+)]
+fn frame_child(ctx: Ctx<'_>, frame: f64, index: f64) -> Result<Option<f64>> {
+    let Some(frame) = protocol_id(frame) else {
+        return Ok(None);
+    };
+    let Some(index) = protocol_id(index).and_then(|index| usize::try_from(index).ok()) else {
+        return Ok(None);
+    };
+    let world = world(&ctx)?;
+    world.borrow_mut().register_pending_frames();
+    let shared = world.borrow().shared();
+    let Some(child) = shared.borrow().tree.children(FrameId::new(frame)).get(index).copied()
+    else {
+        return Ok(None);
+    };
+    Ok(Some(super::js_number(child.get())))
+}
+
+/// Same-origin members forward through the target realm's window; a null
+/// answer means the member is blocked cross-origin
+/// (<https://html.spec.whatwg.org/multipage/window-object.html#windowproxy-get>).
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "rquickjs Func ABI passes Ctx and owned arguments by value"
+)]
+fn frame_global(ctx: Ctx<'_>, frame: f64) -> Result<Option<Object<'_>>> {
+    let Some(frame) = protocol_id(frame) else {
+        return Ok(None);
+    };
+    let frame = FrameId::new(frame);
+    let current = world(&ctx)?;
+    current.borrow_mut().register_pending_frames();
+    if current.borrow().frame() == frame {
+        return Ok(Some(ctx.globals()));
+    }
+    let Some(target) = current.borrow().frame_world(frame) else {
+        return Ok(None);
+    };
+    let same_origin = target.borrow().document_url.origin() == current.borrow().document_url.origin();
+    if !same_origin {
+        return Ok(None);
+    }
+    let Some(window) = target.borrow().window_object() else {
+        return Ok(None);
+    };
+    Ok(Some(window.restore(&ctx)?))
+}
+
+/// `document` on a same-origin proxy wraps the target frame's active document
+/// in this realm; cross-origin access throws
+/// (<https://html.spec.whatwg.org/multipage/iframe-embed-object.html#dom-iframe-contentdocument>).
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "rquickjs Func ABI passes Ctx and owned arguments by value"
+)]
+fn frame_document(ctx: Ctx<'_>, frame: f64) -> Result<Value<'_>> {
+    let Some(frame) = protocol_id(frame) else {
+        return Ok(Value::new_null(ctx));
+    };
+    let current = world(&ctx)?;
+    current.borrow_mut().register_pending_frames();
+    let Some(target) = current.borrow().frame_world(FrameId::new(frame)) else {
+        return Ok(Value::new_null(ctx));
+    };
+    let root = target.borrow().main_document_root();
+    let same_origin =
+        target.borrow().document_url.origin() == current.borrow().document_url.origin();
+    if !same_origin {
+        return Err(throw_dom(
+            &ctx,
+            "SecurityError",
+            "Blocked a frame from accessing a cross-origin frame.",
+        ));
+    }
+    match root {
+        Some(root) => wrap_node(&ctx, root),
+        None => Ok(Value::new_null(ctx)),
+    }
+}
+
+/// Whether `frame` has a browsing context, even when its realm is not
+/// materialized yet. A script that sets a member on a just-inserted iframe's
+/// `contentWindow` gets a stored write instead of a cross-origin error
+/// (<https://html.spec.whatwg.org/multipage/window-object.html#windowproxy-set>).
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "rquickjs Func ABI passes Ctx and owned arguments by value"
+)]
+fn frame_registered(ctx: Ctx<'_>, frame: f64) -> Result<bool> {
+    let Some(frame) = protocol_id(frame) else {
+        return Ok(false);
+    };
+    let world = world(&ctx)?;
+    let shared = world.borrow().shared();
+    Ok(shared.borrow().tree.contains(FrameId::new(frame)))
+}
+
+/// Event handler property names whose values live in the world, so a wrapper
+/// can be collected without losing `element.onload`
+/// (<https://html.spec.whatwg.org/multipage/webappapis.html#event-handler-idl-attributes>).
+pub(super) const HANDLER_ATTRIBUTES: &[&str] = &[
+    "onabort", "onblur", "oncancel", "onchange", "onclick", "onclose", "oncontextmenu",
+    "oncopy", "oncut", "ondblclick", "ondrag", "ondragend", "ondragenter", "ondragleave",
+    "ondragover", "ondragstart", "ondrop", "onerror", "onfocus", "oninput", "oninvalid",
+    "onkeydown", "onkeypress", "onkeyup", "onload", "onloadeddata", "onloadedmetadata",
+    "onloadstart", "onmessage", "onmessageerror", "onmousedown", "onmouseenter",
+    "onmouseleave", "onmousemove", "onmouseout", "onmouseover", "onmouseup", "onpaste",
+    "onpause", "onplay", "onplaying", "onprogress", "onratechange", "onreadystatechange",
+    "onreset", "onresize", "onscroll", "onseeked", "onseeking", "onselect", "onsubmit",
+    "onsuspend", "ontimeupdate", "ontoggle", "onwheel",
+];
+
+fn handler_target<'js>(ctx: &Ctx<'js>, node: &Value<'js>) -> Result<NodeId> {
+    host_node_id(ctx, node)
+        .ok_or_else(|| Exception::throw_type(ctx, "event handler target is not a node"))
+}
+
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "rquickjs Func ABI passes Ctx and owned arguments by value"
+)]
+fn get_node_handler<'js>(ctx: Ctx<'js>, node: Value<'js>, name: String) -> Result<Value<'js>> {
+    let id = handler_target(&ctx, &node)?;
+    let world = world_for_node(&ctx, id)?;
+    let saved = world.borrow().handler_attribute(Some(id), &name);
+    match saved {
+        Some(saved) => saved.restore(&ctx),
+        None => Ok(Value::new_null(ctx)),
+    }
+}
+
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "rquickjs Func ABI passes Ctx and owned arguments by value"
+)]
+fn set_node_handler<'js>(
+    ctx: Ctx<'js>,
+    node: Value<'js>,
+    name: String,
+    value: Value<'js>,
+) -> Result<()> {
+    let id = handler_target(&ctx, &node)?;
+    let world = world_for_node(&ctx, id)?;
+    let saved = if value.is_null() || value.is_undefined() {
+        None
+    } else {
+        Some(Persistent::save(&ctx, value))
+    };
+    world.borrow_mut().set_handler_attribute(Some(id), &name, saved);
+    Ok(())
+}
+
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "rquickjs Func ABI passes Ctx and owned arguments by value"
+)]
+fn get_window_handler(ctx: Ctx<'_>, name: String) -> Result<Value<'_>> {
+    let world = world(&ctx)?;
+    let saved = world.borrow().handler_attribute(None, &name);
+    match saved {
+        Some(saved) => saved.restore(&ctx),
+        None => Ok(Value::new_null(ctx)),
+    }
+}
+
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "rquickjs Func ABI passes Ctx and owned arguments by value"
+)]
+fn set_window_handler<'js>(ctx: Ctx<'js>, name: String, value: Value<'js>) -> Result<()> {
+    let world = world(&ctx)?;
+    let saved = if value.is_null() || value.is_undefined() {
+        None
+    } else {
+        Some(Persistent::save(&ctx, value))
+    };
+    world.borrow_mut().set_handler_attribute(None, &name, saved);
+    Ok(())
+}
+
+/// A JS number naming a protocol id; ids are small non-negative integers.
+fn protocol_id(value: f64) -> Option<u64> {
+    if !value.is_finite() || value < 0.0 || value.fract() != 0.0 || value > f64::from(u32::MAX) {
+        return None;
+    }
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "the value is range-checked to a non-negative u32 above"
+    )]
+    Some(value as u64)
+}
+
+fn protocol_ids(values: Vec<f64>) -> Option<Vec<u64>> {
+    values.into_iter().map(protocol_id).collect()
+}
+
 pub(super) fn install(ctx: &Ctx<'_>, world: &Rc<RefCell<World>>) -> Result<()> {
     register_world(ctx, world);
     let globals = ctx.globals();
@@ -5086,6 +5716,23 @@ pub(super) fn install(ctx: &Ctx<'_>, world: &Rc<RefCell<World>>) -> Result<()> {
         "__tb_construct",
         rquickjs::prelude::Func::from(construct_node),
     )?;
+    globals.set("__tb_handlerNames", HANDLER_ATTRIBUTES.to_vec())?;
+    globals.set(
+        "__tbGetNodeHandler",
+        rquickjs::prelude::Func::from(get_node_handler),
+    )?;
+    globals.set(
+        "__tbSetNodeHandler",
+        rquickjs::prelude::Func::from(set_node_handler),
+    )?;
+    globals.set(
+        "__tbGetWindowHandler",
+        rquickjs::prelude::Func::from(get_window_handler),
+    )?;
+    globals.set(
+        "__tbSetWindowHandler",
+        rquickjs::prelude::Func::from(set_window_handler),
+    )?;
     install_brands(ctx)?;
     install_collection_brand(ctx)?;
     install_dom_exception_codes(ctx)?;
@@ -5104,13 +5751,6 @@ pub(super) fn install(ctx: &Ctx<'_>, world: &Rc<RefCell<World>>) -> Result<()> {
     globals.set("event", Value::new_undefined(ctx.clone()))?;
     // https://html.spec.whatwg.org/multipage/nav-history-apis.html#dom-frames
     globals.set("frames", globals.clone())?;
-    // A top-level context has no child browsing contexts yet.
-    // https://html.spec.whatwg.org/multipage/nav-history-apis.html#dom-length
-    globals.set("length", 0_i32)?;
-    // https://html.spec.whatwg.org/multipage/nav-history-apis.html#dom-parent
-    globals.set("parent", globals.clone())?;
-    // https://html.spec.whatwg.org/multipage/nav-history-apis.html#dom-top
-    globals.set("top", globals.clone())?;
     globals.set("opener", Value::new_null(ctx.clone()))?;
 
     globals.set(
@@ -6166,7 +6806,7 @@ const INSTALL_BRANDS_JS: &str = r"
     ['HTMLUListElement', HTMLElementInterface],
     ['HTMLVideoElement', HTMLMediaElementInterface],
   ]) {
-    const members = name === 'HTMLIFrameElement' ? ['contentDocument'] : [];
+    const members = name === 'HTMLIFrameElement' ? ['contentDocument', 'contentWindow'] : [];
     table[name] = define(name, parent, members).prototype;
   }
   // `type` reflects the content attribute, limited to only known values
@@ -7176,7 +7816,8 @@ mod realm_tests {
     use super::{world, wrap_node};
     use crate::document::Stop;
     use crate::js::{JsRealm, SharedJsRuntime, World};
-    use crate::protocol::{BrowserServices, DialCompletion, DialRequest};
+    use crate::messaging::Shared;
+    use crate::protocol::{BrowserServices, DialCompletion, DialRequest, FrameId};
 
     struct NullServices;
 
@@ -7199,15 +7840,20 @@ mod realm_tests {
         url: &str,
         html: &str,
     ) -> Rc<RefCell<World>> {
-        let mut world = World::new(
-            Arc::clone(services),
-            Url::parse(url).expect("test url"),
-            Rc::clone(documents),
-            registry,
-        );
+        let runtime = crate::document::FrameRuntime {
+            services: Arc::clone(services),
+            js_runtime: SharedJsRuntime::default(),
+            wake: Arc::new(tokio::sync::Notify::new()),
+            stop: Arc::new(Stop::new()),
+            documents: Rc::clone(documents),
+            registry: Rc::clone(registry),
+            shared: Rc::new(RefCell::new(Shared::default())),
+        };
+        let mut world = World::new(Url::parse(url).expect("test url"), FrameId::MAIN, &runtime);
         let id = world.replace_document(crate::parse_html(html));
         let world = Rc::new(RefCell::new(world));
         registry.borrow_mut().insert_document(id, &world);
+        registry.borrow_mut().insert_frame(FrameId::MAIN, &world);
         world
     }
 

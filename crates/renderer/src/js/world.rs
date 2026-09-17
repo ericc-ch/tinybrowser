@@ -7,11 +7,16 @@ use std::sync::Arc;
 
 use dom::NodeId;
 use rquickjs::{Object, Persistent, Value, class::Trace, function::Function};
+use tokio::sync::Notify;
 use url::Url;
 
+use crate::document::{Document, FrameRuntime, Stop};
 use crate::documents::DocumentStore;
-use crate::protocol::BrowserServices;
+use crate::messaging::{MAX_FRAMES, SharedHandle};
+use crate::protocol::{BrowserServices, FrameId};
 use crate::{Parsed, ReadyState};
+
+use super::SharedJsRuntime;
 
 /// Renderer-process realm bookkeeping shared by every frame.
 ///
@@ -22,6 +27,8 @@ pub(crate) struct RealmRegistry {
     budget: Rc<RefCell<ResourceBudget>>,
     /// The World that owns each document id, for wrapper realm resolution.
     documents: HashMap<u32, Weak<RefCell<World>>>,
+    /// The World that owns each frame, for `window.parent` and `event.source`.
+    frames: HashMap<FrameId, Weak<RefCell<World>>>,
     /// One wrapper per node, shared by every realm in this renderer process.
     /// The persistent holds a `WeakRef`, so an unreferenced wrapper can still
     /// be collected.
@@ -54,6 +61,21 @@ impl RealmRegistry {
     /// Remembers that `world` owns the document `id`.
     pub(crate) fn insert_document(&mut self, id: u32, world: &Rc<RefCell<World>>) {
         self.documents.insert(id, Rc::downgrade(world));
+    }
+
+    /// Remembers that `world` is the realm of `frame`.
+    pub(crate) fn insert_frame(&mut self, frame: FrameId, world: &Rc<RefCell<World>>) {
+        self.frames.insert(frame, Rc::downgrade(world));
+    }
+
+    /// The realm of `frame`, while it is alive.
+    pub(crate) fn frame_world(&self, frame: FrameId) -> Option<Rc<RefCell<World>>> {
+        self.frames.get(&frame).and_then(Weak::upgrade)
+    }
+
+    /// Drops the realm association for a frame that is gone.
+    pub(crate) fn forget_frame_world(&mut self, frame: FrameId) {
+        self.frames.remove(&frame);
     }
 
     /// The realm that owns the document `id` points into, if still alive.
@@ -96,6 +118,7 @@ impl RealmRegistry {
     /// Drops every cached wrapper; called while the runtime is still alive.
     pub(crate) fn clear(&mut self) {
         self.documents.clear();
+        self.frames.clear();
         self.wrappers.clear();
         self.frame_documents.clear();
     }
@@ -106,9 +129,11 @@ impl RealmRegistry {
 }
 
 pub(crate) enum FrameNavigation {
-    ObjectUrl {
+    /// The `iframe`'s `src` changed (or the element just connected): navigate
+    /// the child frame to the spec, resolved against the parent document.
+    Src {
         container: NodeId,
-        contents: Rc<str>,
+        spec: String,
     },
 }
 
@@ -216,6 +241,20 @@ pub(crate) struct World {
     documents: Rc<RefCell<DocumentStore>>,
     /// Document ownership and the shared wrapper cache for this process.
     registry: Rc<RefCell<RealmRegistry>>,
+    /// The browsing context tree, port endpoints, and cross-realm deliveries.
+    shared: SharedHandle,
+    /// The frame this realm belongs to.
+    frame: FrameId,
+    /// The process's JS heap, wake handle, and stop flag, so a child frame
+    /// created from inside a script shares them.
+    js_runtime: SharedJsRuntime,
+    wake: Arc<Notify>,
+    stop: Arc<Stop>,
+    /// Frames whose browsing context was registered inside a script but whose
+    /// realm cannot be created until JS execution has stopped.
+    pending_frames: Vec<(FrameId, NodeId)>,
+    /// Child frames this realm created for the engine to adopt.
+    new_frames: Vec<(FrameId, NodeId, Document)>,
     /// The active document of the frame this realm belongs to.
     document: Option<u32>,
     /// Document ids this realm created; only these feed its observers.
@@ -254,6 +293,12 @@ pub(crate) struct World {
     pub(crate) attrs: HashMap<u64, AttrState>,
     /// Owner element for each `Attr` id; `None` while detached.
     pub(crate) attr_owners: HashMap<u64, Option<NodeId>>,
+    /// Event handler properties (`element.onload`, `window.onmessage`) live
+    /// here rather than on the wrapper, which may be collected while the node
+    /// stays alive. Keyed by `(None, name)` for the window and
+    /// `(Some(node), name)` for an element
+    /// (<https://html.spec.whatwg.org/multipage/webappapis.html#event-handlers>).
+    handler_attributes: HashMap<(Option<NodeId>, String), Persistent<Value<'static>>>,
     /// Last known value, so a detached `Attr` keeps its data.
     pub(crate) attr_values: HashMap<u64, String>,
     /// Wrapper object for each `Attr` id (identity is the id).
@@ -293,25 +338,27 @@ impl Drop for World {
 }
 
 impl World {
-    pub(crate) fn new(
-        services: Arc<dyn BrowserServices>,
-        document_url: Url,
-        documents: Rc<RefCell<DocumentStore>>,
-        registry: &Rc<RefCell<RealmRegistry>>,
-    ) -> Self {
+    pub(crate) fn new(document_url: Url, frame: FrameId, runtime: &FrameRuntime) -> Self {
         Self {
-            documents,
-            registry: Rc::clone(registry),
+            documents: Rc::clone(&runtime.documents),
+            registry: Rc::clone(&runtime.registry),
+            shared: Rc::clone(&runtime.shared),
+            frame,
+            js_runtime: runtime.js_runtime.clone(),
+            wake: Arc::clone(&runtime.wake),
+            stop: Arc::clone(&runtime.stop),
+            pending_frames: Vec::new(),
+            new_frames: Vec::new(),
             document: None,
             owned: HashSet::new(),
             document_url,
-            services,
+            services: Arc::clone(&runtime.services),
             pending_cancels: Vec::new(),
             pending_html_writes: Vec::new(),
             frame_navigations: Vec::new(),
             document_stream: Vec::new(),
             object_urls: HashMap::new(),
-            budget: registry.borrow().budget(),
+            budget: runtime.registry.borrow().budget(),
             next_object_url: 0,
             parser_active: false,
             current_script: None,
@@ -329,6 +376,7 @@ impl World {
             brands: HashMap::new(),
             attrs: HashMap::new(),
             attr_owners: HashMap::new(),
+            handler_attributes: HashMap::new(),
             attr_values: HashMap::new(),
             attr_wrappers: HashMap::new(),
             remote_ids: HashMap::new(),
@@ -438,7 +486,17 @@ impl World {
 
     /// Installs the frame's active document without clearing realm caches;
     /// the parser owns the tree mid-parse. Returns the new document id.
+    ///
+    /// The parser hands the same tree back at every script boundary, so the
+    /// document, its wrappers, and its realm keep their identity while the
+    /// object is replaced in the store.
     pub(crate) fn set_document(&mut self, parsed: Parsed) -> u32 {
+        let id = parsed.dom.document_id();
+        if self.document == Some(id) {
+            self.documents.borrow_mut().insert(parsed);
+            self.current_script = None;
+            return id;
+        }
         self.drop_active_document();
         let id = self.documents.borrow_mut().insert(parsed);
         self.document = Some(id);
@@ -461,6 +519,8 @@ impl World {
         for id in self.owned.drain() {
             self.documents.borrow_mut().remove(id);
             self.registry.borrow_mut().forget_document(id);
+            self.handler_attributes
+                .retain(|(node, _), _| node.is_none_or(|node| node.document_id() != id));
         }
         self.document = None;
     }
@@ -556,6 +616,142 @@ impl World {
 
     pub(crate) fn frame_document(&self, container: NodeId) -> Option<NodeId> {
         self.registry.borrow().frame_document(container)
+    }
+
+    /// The frame this realm belongs to.
+    pub(crate) fn frame(&self) -> FrameId {
+        self.frame
+    }
+
+    /// The renderer-process state shared by every realm.
+    pub(crate) fn shared(&self) -> SharedHandle {
+        Rc::clone(&self.shared)
+    }
+
+    /// Creates a frame's document sharing this realm's runtime, services, and
+    /// stores; used for child frames created from inside a script.
+    pub(crate) fn create_frame_document(&self, frame: FrameId) -> Document {
+        let runtime = FrameRuntime {
+            services: Arc::clone(&self.services),
+            js_runtime: self.js_runtime.clone(),
+            wake: Arc::clone(&self.wake),
+            stop: Arc::clone(&self.stop),
+            documents: Rc::clone(&self.documents),
+            registry: Rc::clone(&self.registry),
+            shared: Rc::clone(&self.shared),
+        };
+        Document::with_shared(frame, &runtime)
+    }
+
+    /// Registers a browsing context for every connected `iframe` in this
+    /// frame's document that does not have one yet.
+    ///
+    /// Safe to call while a script runs: it allocates frame identities and
+    /// tree entries only. The document and its realm are created later, by
+    /// [`World::materialize_frames`], because `QuickJS` forbids entering a new
+    /// realm while another realm executes.
+    pub(crate) fn register_pending_frames(&mut self) -> Vec<NodeId> {
+        let mut created = Vec::new();
+        let has_iframes = self
+            .with_main_document(|parsed| parsed.dom.connected_iframe_count() > 0)
+            .unwrap_or(false);
+        if !has_iframes {
+            return created;
+        }
+        let containers = self.iframe_containers_in_order();
+        for container in containers {
+            if self
+                .shared
+                .borrow()
+                .tree
+                .frame_for_container(container)
+                .is_some()
+            {
+                continue;
+            }
+            if self.shared.borrow().tree.len() >= MAX_FRAMES {
+                return created;
+            }
+            let frame = {
+                let mut shared = self.shared.borrow_mut();
+                let frame = shared.allocate_frame();
+                shared.tree.add(self.frame, frame, container);
+                frame
+            };
+            self.pending_frames.push((frame, container));
+            created.push(container);
+        }
+        created
+    }
+
+    /// Creates the documents and realms for every registered frame.
+    ///
+    /// Must not run while a `QuickJS` realm is executing; every caller is a
+    /// renderer-loop entry point or a bindings path that runs outside JS.
+    pub(crate) fn materialize_frames(&mut self) -> Vec<NodeId> {
+        let mut created = Vec::new();
+        for (frame, container) in std::mem::take(&mut self.pending_frames) {
+            let mut document = self.create_frame_document(frame);
+            document.load_about_blank(Some(self.document_url.as_str()));
+            self.new_frames.push((frame, container, document));
+            created.push(container);
+        }
+        created
+    }
+
+    /// Registers and materializes frames; safe only outside JS execution.
+    pub(crate) fn adopt_pending_frames(&mut self) -> Vec<NodeId> {
+        let mut created = self.register_pending_frames();
+        created.extend(self.materialize_frames());
+        created
+    }
+
+    /// Takes the child frames this realm created for the engine to adopt.
+    pub(crate) fn take_new_frames(&mut self) -> Vec<(FrameId, NodeId, Document)> {
+        std::mem::take(&mut self.new_frames)
+    }
+
+    /// The frame's connected `iframe` containers in tree order, which is what
+    /// orders the frame's child browsing contexts
+    /// (<https://html.spec.whatwg.org/multipage/nav-history-apis.html#dom-length>).
+    #[must_use]
+    pub(crate) fn iframe_containers_in_order(&self) -> Vec<NodeId> {
+        self.with_main_document(|parsed| {
+            let mut containers = Vec::new();
+            let mut stack = vec![parsed.dom.document()];
+            while let Some(id) = stack.pop() {
+                if parsed.dom.is_iframe_element(id) && parsed.dom.is_connected(id) {
+                    containers.push(id);
+                }
+                if let Some(children) = parsed.dom.children(id) {
+                    stack.extend(children.rev().copied());
+                }
+            }
+            containers
+        })
+        .unwrap_or_default()
+    }
+
+    /// The realm of `frame`, while it is alive.
+    pub(crate) fn frame_world(&self, frame: FrameId) -> Option<Rc<RefCell<World>>> {
+        self.registry.borrow().frame_world(frame)
+    }
+
+    /// The child frame owned by `container`, when its browsing context
+    /// exists (<https://html.spec.whatwg.org/multipage/iframe-embed-object.html#dom-iframe-contentwindow>).
+    pub(crate) fn frame_for_container(&self, container: NodeId) -> Option<FrameId> {
+        self.shared.borrow().tree.frame_for_container(container)
+    }
+
+    /// The serialized origin of this realm's document
+    /// (<https://html.spec.whatwg.org/multipage/browsers.html#concept-origin>).
+    pub(crate) fn origin_string(&self) -> String {
+        self.document_url.origin().ascii_serialization()
+    }
+
+    /// The root node of the frame's active document.
+    pub(crate) fn main_document_root(&self) -> Option<NodeId> {
+        self.main_document().map(|parsed| parsed.dom.document())
     }
 
     pub(crate) fn queue_frame_navigation(&mut self, navigation: FrameNavigation) {
@@ -736,6 +932,7 @@ impl World {
         self.datasets.clear();
         self.implementations.clear();
         self.brands.clear();
+        self.handler_attributes.clear();
         self.clear_attributes();
         self.observers.clear();
     }
@@ -786,6 +983,34 @@ impl World {
     /// (<https://html.spec.whatwg.org/multipage/nav-history-apis.html#dom-document-defaultview>).
     pub(crate) fn is_main_document(&self, node: NodeId) -> bool {
         self.document == Some(node.document_id())
+    }
+
+    /// One event handler property, when set.
+    pub(crate) fn handler_attribute(
+        &self,
+        node: Option<NodeId>,
+        name: &str,
+    ) -> Option<Persistent<Value<'static>>> {
+        self.handler_attributes
+            .get(&(node, name.to_owned()))
+            .cloned()
+    }
+
+    /// Sets or clears one event handler property.
+    pub(crate) fn set_handler_attribute(
+        &mut self,
+        node: Option<NodeId>,
+        name: &str,
+        value: Option<Persistent<Value<'static>>>,
+    ) {
+        match value {
+            Some(value) => {
+                self.handler_attributes.insert((node, name.to_owned()), value);
+            }
+            None => {
+                self.handler_attributes.remove(&(node, name.to_owned()));
+            }
+        }
     }
 
     pub(crate) fn set_active_element(&mut self, document: u32, node: Option<NodeId>) {

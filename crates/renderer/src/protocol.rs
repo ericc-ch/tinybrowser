@@ -196,6 +196,8 @@ pub enum DialKind {
     JsFetch,
     /// A classic `<script src>` load.
     ClassicScript,
+    /// A child frame's navigation.
+    FrameLoad,
 }
 
 /// One blocking GET the renderer asks the browser process to perform.

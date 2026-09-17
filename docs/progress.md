@@ -7,7 +7,7 @@ Size research lives in [`docs/researches/size-budget.md`](researches/size-budget
 
 Target: under 10MB stripped on x86_64.
 
-5,870,832 bytes (2026-09-17)
+5,987,760 bytes (2026-09-17)
 
 ```sh
 nix develop --command cargo build --release --bin tinybrowser
@@ -276,7 +276,7 @@ nix develop --command ./tools/wpt/score <directory> -- --exclude=worker
 | `webhid/` | unscored |
 | `webidl/` | unscored |
 | `webmcp/` | unscored |
-| `webmessaging/` | 41.2% |
+| `webmessaging/` | 77.9% |
 | `webmidi/` | unscored |
 | `webnn/` | unscored |
 | `webrtc/` | unscored |
