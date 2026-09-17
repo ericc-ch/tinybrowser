@@ -9,7 +9,7 @@
 /// stops a handle from document A from naming a live node in document B that
 /// happens to share slot and generation.
 ///
-/// Copy it freely, store it anywhere, hand it to JavaScript later. The only
+/// Copy it freely, store it anywhere, hand it to JavaScript. The only
 /// thing you can do with it is pass it back to the [`crate::Dom`] it came from.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct NodeId {

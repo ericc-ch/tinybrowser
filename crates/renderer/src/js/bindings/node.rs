@@ -151,7 +151,7 @@ fn parse_html_fragment_snapshots(
         .and_then(|children| {
             children.copied().find(|&id| {
                 matches!(
-                    parsed_fragment.dom.get(id).map(|node| node.kind()),
+                    parsed_fragment.dom.kind(id),
                     Some(NodeKind::Element { name, .. })
                         if name.ns == html_namespace() && name.local.as_ref() == "html"
                 )
@@ -374,7 +374,7 @@ impl JsNode {
                     .copied()
                     .find(|&id| {
                         matches!(
-                            parsed.dom.get(id).map(|node| node.kind()),
+                            parsed.dom.kind(id),
                             Some(NodeKind::Element { .. })
                         )
                     })
@@ -758,7 +758,7 @@ impl JsNode {
                 .copied()
                 .find(|&id| {
                     matches!(
-                        parsed.dom.get(id).map(|node| node.kind()),
+                        parsed.dom.kind(id),
                         Some(NodeKind::Element { .. })
                     )
                 })
@@ -786,7 +786,7 @@ impl JsNode {
                 .copied()
                 .find(|&id| {
                     matches!(
-                        parsed.dom.get(id).map(|node| node.kind()),
+                        parsed.dom.kind(id),
                         Some(NodeKind::Doctype { .. })
                     )
                 })
@@ -1023,7 +1023,7 @@ impl JsNode {
             .borrow()
             .document(self.handle.0)
             .map_or(String::new(), |parsed| {
-                match parsed.dom.get(self.handle.0).map(|node| node.kind()) {
+                match parsed.dom.kind(self.handle.0) {
                     Some(NodeKind::Doctype { name, .. }) => name.clone(),
                     _ => parsed
                         .dom
@@ -1041,7 +1041,7 @@ impl JsNode {
             .borrow()
             .document(self.handle.0)
             .map_or(String::new(), |parsed| {
-                match parsed.dom.get(self.handle.0).map(|node| node.kind()) {
+                match parsed.dom.kind(self.handle.0) {
                     Some(NodeKind::Doctype { public_id, .. }) => public_id.clone(),
                     _ => String::new(),
                 }
@@ -1056,7 +1056,7 @@ impl JsNode {
             .borrow()
             .document(self.handle.0)
             .map_or(String::new(), |parsed| {
-                match parsed.dom.get(self.handle.0).map(|node| node.kind()) {
+                match parsed.dom.kind(self.handle.0) {
                     Some(NodeKind::Doctype { system_id, .. }) => system_id.clone(),
                     _ => String::new(),
                 }
@@ -1075,7 +1075,7 @@ impl JsNode {
             let world = world.borrow();
             world.document(self.handle.0).and_then(|parsed| {
                 let is_template = matches!(
-                    parsed.dom.get(self.handle.0).map(|node| node.kind()),
+                    parsed.dom.kind(self.handle.0),
                     Some(NodeKind::Element { name, .. })
                         if name.ns == html_namespace() && name.local.as_ref() == "template"
                 );
@@ -1129,7 +1129,7 @@ impl JsNode {
             return Err(Exception::throw_type(&ctx, "no document"));
         };
         let Some(NodeKind::Element { name, attributes }) =
-            parsed.dom.get(self.handle.0).map(|node| node.kind())
+            parsed.dom.kind(self.handle.0)
         else {
             return Err(Exception::throw_type(&ctx, "outerHTML requires an element"));
         };
@@ -1213,7 +1213,7 @@ impl JsNode {
                 // A parentless element has nothing to replace.
                 return Ok(());
             };
-            let Some(kind) = parsed.dom.get(parent).map(|node| node.kind().clone()) else {
+            let Some(kind) = parsed.dom.kind(parent).cloned() else {
                 return Err(Exception::throw_type(&ctx, "no document"));
             };
             match kind {
@@ -1375,7 +1375,7 @@ impl JsNode {
         let Some(parsed) = parsed.document(self.handle.0) else {
             return Ok(Value::new_null(ctx));
         };
-        match parsed.dom.get(self.handle.0).map(|node| node.kind()) {
+        match parsed.dom.kind(self.handle.0) {
             Some(
                 NodeKind::Text { data }
                 | NodeKind::CDataSection { data }
@@ -1399,7 +1399,7 @@ impl JsNode {
         let Some(parsed) = parsed.document(self.handle.0) else {
             return Ok(Value::new_null(ctx));
         };
-        match parsed.dom.get(self.handle.0).map(|node| node.kind()) {
+        match parsed.dom.kind(self.handle.0) {
             Some(NodeKind::Element { .. } | NodeKind::Fragment) => {
                 let text = descendant_text(&parsed.dom, self.handle.0);
                 string_value(&ctx, &text)
@@ -1423,7 +1423,7 @@ impl JsNode {
             return Ok(());
         };
         let dom = &mut parsed.dom;
-        match dom.get(self.handle.0).map(|node| node.kind()) {
+        match dom.kind(self.handle.0) {
             Some(NodeKind::Text { .. }) => {
                 dom.set_text(self.handle.0, text)
                     .map_err(|err| throw_dom_error(&ctx, err))?;
@@ -2334,7 +2334,7 @@ impl JsNode {
         let dom = &mut parsed.dom;
         // A Text node normalizes only itself; containers merge adjacent
         // Text children and drop empty ones.
-        if let Some(NodeKind::Text { data }) = dom.get(self.handle.0).map(|node| node.kind()) {
+        if let Some(NodeKind::Text { data }) = dom.kind(self.handle.0) {
             if data.is_empty() {
                 dom.detach(self.handle.0)
                     .map_err(|err| throw_dom_error(&ctx, err))?;
@@ -2347,7 +2347,7 @@ impl JsNode {
             if let Some(kids) = dom.children(id) {
                 for &kid in kids {
                     if matches!(
-                        dom.get(kid).map(|node| node.kind()),
+                        dom.kind(kid),
                         Some(NodeKind::Element { .. })
                     ) {
                         containers.push(kid);
@@ -2366,7 +2366,7 @@ impl JsNode {
             // (<https://dom.spec.whatwg.org/#dom-node-normalize>).
             let mut merged: Option<NodeId> = None;
             for kid in kids {
-                match dom.get(kid).map(|node| node.kind()) {
+                match dom.kind(kid) {
                     Some(NodeKind::Text { data }) if data.is_empty() => {
                         dom.detach(kid).map_err(|err| throw_dom_error(&ctx, err))?;
                     }
@@ -2374,7 +2374,7 @@ impl JsNode {
                         if let Some(previous) = merged {
                             let joined = format!(
                                 "{}{data}",
-                                match dom.get(previous).map(|node| node.kind()) {
+                                match dom.kind(previous) {
                                     Some(NodeKind::Text { data }) => data.clone(),
                                     _ => String::new(),
                                 }

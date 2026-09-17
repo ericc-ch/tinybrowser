@@ -340,7 +340,7 @@ pub(super) fn webdriver_element(ctx: Ctx<'_>, remote_id: f64) -> Result<Value<'_
     let valid = world.borrow().document(node).is_some_and(|parsed| {
         parsed.dom.is_connected(node)
             && matches!(
-                parsed.dom.get(node).map(|entry| entry.kind()),
+                parsed.dom.kind(node),
                 Some(NodeKind::Element { .. })
             )
     });
@@ -395,7 +395,7 @@ fn walk_element_index(dom: &dom::Dom, root: NodeId, target: NodeId, index: &mut 
         if current == target {
             return true;
         }
-        if let Some(NodeKind::Element { .. }) = dom.get(current).map(|node| node.kind()) {
+        if let Some(NodeKind::Element { .. }) = dom.kind(current) {
             *index += 1.0;
         }
         if let Some(children) = dom.children(current) {
@@ -424,7 +424,7 @@ pub(super) fn element_at_point(
     let mut best: Option<(usize, NodeId)> = None;
     let mut stack = vec![(parsed.dom.document(), 0usize)];
     while let Some((current, depth)) = stack.pop() {
-        if let Some(NodeKind::Element { .. }) = parsed.dom.get(current).map(|node| node.kind()) {
+        if let Some(NodeKind::Element { .. }) = parsed.dom.kind(current) {
             let (left, top, width, height) = virtual_rect(index);
             index += 1.0;
             if x >= left
@@ -781,7 +781,7 @@ pub(super) fn with_node_kind<T>(
     let Some(parsed) = parsed.document(id) else {
         return Err(Exception::throw_type(ctx, "no document"));
     };
-    Ok(read(parsed.dom.get(id).map(|node| node.kind())))
+    Ok(read(parsed.dom.kind(id)))
 }
 
 pub(crate) fn character_data(ctx: &Ctx<'_>, id: NodeId) -> Result<String> {
@@ -804,7 +804,7 @@ pub(super) fn set_character_data(ctx: &Ctx<'_>, id: NodeId, data: String) -> Res
     let Some(mut parsed) = world.document_mut(id) else {
         return Ok(());
     };
-    match parsed.dom.get(id).map(|node| node.kind()) {
+    match parsed.dom.kind(id) {
         Some(NodeKind::Text { .. }) => {
             parsed
                 .dom
@@ -918,7 +918,7 @@ pub(super) fn descendant_text(dom: &dom::Dom, id: NodeId) -> String {
         .unwrap_or_default();
     stack.reverse();
     while let Some(current) = stack.pop() {
-        match dom.get(current).map(|node| node.kind()) {
+        match dom.kind(current) {
             Some(NodeKind::Text { data } | NodeKind::CDataSection { data }) => text.push_str(data),
             Some(NodeKind::Element { .. } | NodeKind::Fragment) => {
                 if let Some(kids) = dom.children(current) {
@@ -939,10 +939,10 @@ pub(super) fn nodes_equal(dom: &dom::Dom, a: NodeId, b: NodeId) -> bool {
     if a == b {
         return true;
     }
-    let (Some(first), Some(second)) = (dom.get(a), dom.get(b)) else {
+    let (Some(first), Some(second)) = (dom.kind(a), dom.kind(b)) else {
         return false;
     };
-    let equal = match (first.kind(), second.kind()) {
+    let equal = match (first, second) {
         (NodeKind::Document, NodeKind::Document) | (NodeKind::Fragment, NodeKind::Fragment) => true,
         (
             NodeKind::Doctype {
@@ -992,18 +992,11 @@ pub(super) fn nodes_equal(dom: &dom::Dom, a: NodeId, b: NodeId) -> bool {
     if !equal {
         return false;
     }
-    let kids_a: Vec<NodeId> = dom
-        .children(a)
-        .map(|kids| kids.copied().collect())
-        .unwrap_or_default();
-    let kids_b: Vec<NodeId> = dom
-        .children(b)
-        .map(|kids| kids.copied().collect())
-        .unwrap_or_default();
+    let kids_a = dom.children(a).expect("live node has no child list");
+    let kids_b = dom.children(b).expect("live node has no child list");
     kids_a.len() == kids_b.len()
         && kids_a
-            .iter()
-            .zip(&kids_b)
+            .zip(kids_b)
             .all(|(&first, &second)| nodes_equal(dom, first, second))
 }
 
@@ -1016,7 +1009,7 @@ pub(super) fn locate_namespace(
 ) -> Option<Namespace> {
     let mut cursor = Some(cursor);
     while let Some(id) = cursor {
-        if let Some(NodeKind::Element { name, .. }) = dom.get(id).map(|node| node.kind()) {
+        if let Some(NodeKind::Element { name, .. }) = dom.kind(id) {
             let actual = name
                 .prefix
                 .as_ref()
@@ -1036,7 +1029,7 @@ pub(super) fn locate_namespace(
 pub(super) fn locate_prefix(dom: &dom::Dom, cursor: NodeId, namespace: &str) -> Option<String> {
     let mut cursor = Some(cursor);
     while let Some(id) = cursor {
-        if let Some(NodeKind::Element { name, attributes }) = dom.get(id).map(|node| node.kind()) {
+        if let Some(NodeKind::Element { name, attributes }) = dom.kind(id) {
             if name.ns.as_ref() == namespace
                 && let Some(prefix) = name.prefix.as_ref().filter(|prefix| !prefix.is_empty())
             {
@@ -1342,7 +1335,7 @@ fn collect_by_tag(dom: &dom::Dom, scope: NodeId, name: &str) -> Vec<NodeId> {
         .unwrap_or_default();
     stack.reverse();
     while let Some(id) = stack.pop() {
-        if let Some(NodeKind::Element { name: qual, .. }) = dom.get(id).map(|node| node.kind()) {
+        if let Some(NodeKind::Element { name: qual, .. }) = dom.kind(id) {
             let matches = if qual.ns == html_namespace() {
                 qualified_name_eq(qual, &lowered)
             } else {
@@ -1389,7 +1382,7 @@ fn collect_by_tag_ns(dom: &dom::Dom, scope: NodeId, namespace: &str, local: &str
         .unwrap_or_default();
     stack.reverse();
     while let Some(id) = stack.pop() {
-        if let Some(NodeKind::Element { name, .. }) = dom.get(id).map(|node| node.kind())
+        if let Some(NodeKind::Element { name, .. }) = dom.kind(id)
             && (namespace == "*" || name.ns.as_ref() == namespace)
             && (local == "*" || name.local.as_ref() == local)
         {
@@ -1413,7 +1406,7 @@ fn collect_by_class(dom: &dom::Dom, scope: NodeId, names: &str) -> Vec<NodeId> {
         .unwrap_or_default();
     stack.reverse();
     while let Some(id) = stack.pop() {
-        if let Some(NodeKind::Element { .. }) = dom.get(id).map(|node| node.kind()) {
+        if let Some(NodeKind::Element { .. }) = dom.kind(id) {
             let classes = dom.attribute(id, "class").unwrap_or_default();
             let tokens: Vec<&str> = classes.split_ascii_whitespace().collect();
             if wanted.iter().all(|want| tokens.contains(want)) {
@@ -1431,7 +1424,7 @@ fn collect_by_class(dom: &dom::Dom, scope: NodeId, names: &str) -> Vec<NodeId> {
 
 pub(super) fn is_element(dom: &dom::Dom, id: NodeId) -> bool {
     matches!(
-        dom.get(id).map(|node| node.kind()),
+        dom.kind(id),
         Some(NodeKind::Element { .. })
     )
 }
@@ -1495,7 +1488,7 @@ pub(super) fn find_element_by_id(dom: &dom::Dom, scope: NodeId, id: &str) -> Opt
     stack.reverse();
     while let Some(node) = stack.pop() {
         if matches!(
-            dom.get(node).map(|item| item.kind()),
+            dom.kind(node),
             Some(NodeKind::Element { .. })
         ) && dom.attribute(node, "id").as_deref() == Some(id)
         {

@@ -162,7 +162,7 @@ impl AsRef<str> for AttrValue {
 impl ToCss for AttrValue {
     fn to_css<W: fmt::Write>(&self, dest: &mut W) -> fmt::Result {
         // Values are echoed only when serializing selectors back to CSS,
-        // which dom v1 never does; quoting keeps the output honest anyway.
+        // which never happens in practice; quoting keeps the output honest anyway.
         write!(
             dest,
             "\"{}\"",
@@ -239,40 +239,58 @@ enum PseudoClass {
     Autofill,
 }
 
+/// Generates [`PseudoClass::from_keyword`] and the simple half of
+/// [`PseudoClass::keyword`] from one spelling table, so the two directions
+/// cannot drift apart. The data-carrying variants are written out in
+/// `keyword` below.
+macro_rules! pseudo_class_keywords {
+    ($($variant:ident => $name:literal),* $(,)?) => {
+        /// Parses one non-functional pseudo-class keyword (CSS keywords are
+        /// case-insensitive). Functional ones (`:lang()`, `:dir()`) arrive
+        /// through the parser's functional hook below.
+        fn from_keyword(name: &str) -> Option<Self> {
+            $(if name.eq_ignore_ascii_case($name) {
+                return Some(Self::$variant);
+            })*
+            None
+        }
+
+        /// The canonical lowercase keyword, for CSS serialization.
+        fn keyword(&self) -> std::borrow::Cow<'static, str> {
+            match self {
+                $(Self::$variant => $name.into(),)*
+                Self::Lang(ranges) => format!("lang({})", ranges.join(",")).into(),
+                Self::Dir(direction) => format!("dir({direction})").into(),
+            }
+        }
+    };
+}
+
 impl PseudoClass {
-    /// Parses one non-functional pseudo-class keyword (CSS keywords are
-    /// case-insensitive). Functional ones (`:lang()`, `:dir()`) arrive
-    /// through the parser's functional hook below.
-    fn from_keyword(name: &str) -> Option<Self> {
-        const KEYWORDS: &[(&str, PseudoClass)] = &[
-            ("any-link", PseudoClass::AnyLink),
-            ("link", PseudoClass::Link),
-            ("enabled", PseudoClass::Enabled),
-            ("disabled", PseudoClass::Disabled),
-            ("checked", PseudoClass::Checked),
-            ("required", PseudoClass::Required),
-            ("optional", PseudoClass::Optional),
-            ("read-only", PseudoClass::ReadOnly),
-            ("read-write", PseudoClass::ReadWrite),
-            ("placeholder-shown", PseudoClass::PlaceholderShown),
-            ("defined", PseudoClass::Defined),
-            ("visited", PseudoClass::Visited),
-            ("hover", PseudoClass::Hover),
-            ("active", PseudoClass::Active),
-            ("focus", PseudoClass::Focus),
-            ("focus-within", PseudoClass::FocusWithin),
-            ("focus-visible", PseudoClass::FocusVisible),
-            ("target", PseudoClass::Target),
-            ("indeterminate", PseudoClass::Indeterminate),
-            ("default", PseudoClass::Default),
-            ("in-range", PseudoClass::InRange),
-            ("out-of-range", PseudoClass::OutOfRange),
-            ("autofill", PseudoClass::Autofill),
-        ];
-        KEYWORDS
-            .iter()
-            .find(|(keyword, _)| name.eq_ignore_ascii_case(keyword))
-            .map(|(_, class)| class.clone())
+    pseudo_class_keywords! {
+        AnyLink => "any-link",
+        Link => "link",
+        Enabled => "enabled",
+        Disabled => "disabled",
+        Checked => "checked",
+        Required => "required",
+        Optional => "optional",
+        ReadOnly => "read-only",
+        ReadWrite => "read-write",
+        PlaceholderShown => "placeholder-shown",
+        Defined => "defined",
+        Visited => "visited",
+        Hover => "hover",
+        Active => "active",
+        Focus => "focus",
+        FocusWithin => "focus-within",
+        FocusVisible => "focus-visible",
+        Target => "target",
+        Indeterminate => "indeterminate",
+        Default => "default",
+        InRange => "in-range",
+        OutOfRange => "out-of-range",
+        Autofill => "autofill",
     }
 
     /// Parses one functional pseudo-class argument out of an already-opened
@@ -359,37 +377,6 @@ impl PseudoClass {
             )
         }
     }
-
-    /// The canonical lowercase keyword, for CSS serialization.
-    fn keyword(&self) -> std::borrow::Cow<'static, str> {
-        match self {
-            Self::AnyLink => "any-link".into(),
-            Self::Link => "link".into(),
-            Self::Enabled => "enabled".into(),
-            Self::Disabled => "disabled".into(),
-            Self::Checked => "checked".into(),
-            Self::Required => "required".into(),
-            Self::Optional => "optional".into(),
-            Self::ReadOnly => "read-only".into(),
-            Self::ReadWrite => "read-write".into(),
-            Self::PlaceholderShown => "placeholder-shown".into(),
-            Self::Defined => "defined".into(),
-            Self::Lang(ranges) => format!("lang({})", ranges.join(",")).into(),
-            Self::Dir(direction) => format!("dir({direction})").into(),
-            Self::Visited => "visited".into(),
-            Self::Hover => "hover".into(),
-            Self::Active => "active".into(),
-            Self::Focus => "focus".into(),
-            Self::FocusWithin => "focus-within".into(),
-            Self::FocusVisible => "focus-visible".into(),
-            Self::Target => "target".into(),
-            Self::Indeterminate => "indeterminate".into(),
-            Self::Default => "default".into(),
-            Self::InRange => "in-range".into(),
-            Self::OutOfRange => "out-of-range".into(),
-            Self::Autofill => "autofill".into(),
-        }
-    }
 }
 
 impl NonTSPseudoClassTrait for PseudoClass {
@@ -420,47 +407,25 @@ impl ToCss for PseudoClass {
 /// generated content), so every variant refuses to match. Unknown names are
 /// still refused at parse time, exactly as browsers refuse them.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum PseudoElement {
-    Before,
-    After,
-    FirstLine,
-    FirstLetter,
-    Selection,
-    Placeholder,
-    Marker,
-    Backdrop,
-}
+struct PseudoElement(&'static str);
 
 impl PseudoElement {
     /// Parses one known pseudo-element name (case-insensitive per CSS).
     fn from_keyword(name: &str) -> Option<Self> {
-        const KEYWORDS: &[(&str, PseudoElement)] = &[
-            ("before", PseudoElement::Before),
-            ("after", PseudoElement::After),
-            ("first-line", PseudoElement::FirstLine),
-            ("first-letter", PseudoElement::FirstLetter),
-            ("selection", PseudoElement::Selection),
-            ("placeholder", PseudoElement::Placeholder),
-            ("marker", PseudoElement::Marker),
-            ("backdrop", PseudoElement::Backdrop),
+        const NAMES: &[&str] = &[
+            "before",
+            "after",
+            "first-line",
+            "first-letter",
+            "selection",
+            "placeholder",
+            "marker",
+            "backdrop",
         ];
-        KEYWORDS
+        NAMES
             .iter()
-            .find(|(keyword, _)| name.eq_ignore_ascii_case(keyword))
-            .map(|(_, element)| *element)
-    }
-
-    fn keyword(self) -> &'static str {
-        match self {
-            Self::Before => "before",
-            Self::After => "after",
-            Self::FirstLine => "first-line",
-            Self::FirstLetter => "first-letter",
-            Self::Selection => "selection",
-            Self::Placeholder => "placeholder",
-            Self::Marker => "marker",
-            Self::Backdrop => "backdrop",
-        }
+            .find(|known| name.eq_ignore_ascii_case(known))
+            .map(|&known| Self(known))
     }
 }
 
@@ -470,7 +435,7 @@ impl PseudoElementTrait for PseudoElement {
 
 impl ToCss for PseudoElement {
     fn to_css<W: fmt::Write>(&self, dest: &mut W) -> fmt::Result {
-        write!(dest, "::{}", self.keyword())
+        write!(dest, "::{}", self.0)
     }
 }
 
@@ -556,7 +521,7 @@ impl<'i> SelectorParser<'i> for SelectorLanguage {
 }
 
 /// The class of a selector-parse failure, stable enough for programmatic
-/// handling (`DOMException` mapping at the future js layer) without parsing
+/// handling (`DOMException` mapping at the js layer) without parsing
 /// text back.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ParseFailKind {
@@ -693,26 +658,17 @@ struct DomElement<'a> {
 
 impl<'a> DomElement<'a> {
     fn new(dom: &'a Dom, id: NodeId) -> Option<Self> {
-        matches!(dom.get(id)?.kind(), NodeKind::Element { .. }).then_some(Self { dom, id })
+        matches!(dom.kind(id)?, NodeKind::Element { .. }).then_some(Self { dom, id })
     }
 
     /// This element's qualified name, or `None` if it stopped being an
     /// element (impossible mid-query: the borrow freezes mutation).
     fn qual_name(&self) -> Option<&'a markup5ever::QualName> {
-        match self.dom.get(self.id)?.kind() {
-            NodeKind::Element { name, .. } => Some(name),
-            _ => None,
-        }
+        self.dom.element(self.id).map(|(name, _)| name)
     }
 
     fn attributes(&self) -> &'a [Attribute] {
-        match self.dom.get(self.id) {
-            Some(node) => match node.kind() {
-                NodeKind::Element { attributes, .. } => attributes,
-                _ => &[],
-            },
-            None => &[],
-        }
+        self.dom.attributes(self.id).unwrap_or_default()
     }
 
     /// First no-namespace attribute named `local`, under the element's case
@@ -720,14 +676,6 @@ impl<'a> DomElement<'a> {
     /// `:link` share one lookup.
     fn attr_value(&self, local: &str) -> Option<&'a str> {
         state::attr_value(self.dom, self.id, local)
-    }
-
-    /// Whether this element lives in the HTML namespace.
-    ///
-    /// This is the engine's switch for case handling: when true it asks us
-    /// about lowercased tag/attribute names, which is what the tree stores.
-    fn is_html_in_html_document(&self) -> bool {
-        state::is_html(self.dom, self.id)
     }
 }
 
@@ -746,20 +694,14 @@ impl Element for DomElement<'_> {
     }
 
     fn parent_element(&self) -> Option<Self> {
-        let mut cursor = self.dom.parent(self.id)?;
-        loop {
-            if matches!(self.dom.get(cursor)?.kind(), NodeKind::Element { .. }) {
-                return Some(Self {
-                    dom: self.dom,
-                    id: cursor,
-                });
-            }
-            cursor = self.dom.parent(cursor)?;
-        }
+        self.dom
+            .ancestors(self.id)
+            .find(|&ancestor| matches!(self.dom.kind(ancestor), Some(NodeKind::Element { .. })))
+            .map(|id| Self { dom: self.dom, id })
     }
 
     fn parent_node_is_shadow_root(&self) -> bool {
-        false // no shadow trees in dom v1
+        false // no shadow trees exist here
     }
 
     fn containing_shadow_host(&self) -> Option<Self> {
@@ -811,7 +753,7 @@ impl Element for DomElement<'_> {
     }
 
     fn is_html_element_in_html_document(&self) -> bool {
-        self.is_html_in_html_document()
+        state::is_html(self.dom, self.id)
     }
 
     /// The engine pre-selects which spelling to ask about (lowercased for
@@ -833,7 +775,7 @@ impl Element for DomElement<'_> {
             (Some(a), Some(b)) => {
                 let (a_name, b_name): (&str, &str) = (&a.local, &b.local);
                 a.ns == b.ns
-                    && if self.is_html_in_html_document() {
+                    && if state::is_html(self.dom, self.id) {
                         a_name.eq_ignore_ascii_case(b_name)
                     } else {
                         a_name == b_name
@@ -861,7 +803,7 @@ impl Element for DomElement<'_> {
             // `has_local_name`); value case handling rides inside `operation`.
             let stored = attribute.name.local.as_ref();
             let wanted: &str = &local_name.0;
-            let named = if self.is_html_in_html_document() {
+            let named = if state::is_html(self.dom, self.id) {
                 stored.eq_ignore_ascii_case(wanted)
             } else {
                 stored == wanted
@@ -905,12 +847,11 @@ impl Element for DomElement<'_> {
 
     fn match_pseudo_element(
         &self,
-        pe: &PseudoElement,
+        _pe: &PseudoElement,
         _context: &mut MatchingContext<Selectors>,
     ) -> bool {
         // Known pseudo-elements parse like browsers' and never match: no
         // layout, no boxes, no generated content exists in this tree.
-        let _ = pe;
         false
     }
 
@@ -960,7 +901,7 @@ impl Element for DomElement<'_> {
                 "selector matching walks live nodes; children() is None only for stale handles"
             );
         };
-        kids.all(|&kid| match self.dom.get(kid).map(|node| node.kind()) {
+        kids.all(|&kid| match self.dom.kind(kid) {
             Some(NodeKind::Text { data }) => data.is_empty(),
             Some(NodeKind::Element { .. }) => false,
             _ => true,
@@ -971,10 +912,7 @@ impl Element for DomElement<'_> {
     fn is_root(&self) -> bool {
         matches!(
             self.dom.parent(self.id),
-            Some(parent) if matches!(
-                self.dom.get(parent).map(|node| node.kind()),
-                Some(NodeKind::Document)
-            )
+            Some(parent) if matches!(self.dom.kind(parent), Some(NodeKind::Document))
         )
     }
 
@@ -997,10 +935,7 @@ impl<'a> Descendants<'a> {
     fn new(dom: &'a Dom, scope: NodeId) -> Self {
         Self {
             dom,
-            stack: dom
-                .children(scope)
-                .map(|kids| vec![kids])
-                .unwrap_or_default(),
+            stack: dom.children(scope).into_iter().collect(),
         }
     }
 }
@@ -1027,6 +962,12 @@ impl Iterator for Descendants<'_> {
 }
 
 impl Dom {
+    /// Every descendant of `scope` in document order, `scope` excluded:
+    /// the candidate set of a scoped query.
+    pub fn descendants(&self, scope: NodeId) -> impl Iterator<Item = NodeId> + '_ {
+        Descendants::new(self, scope)
+    }
+
     /// Compiles a selector list once per query.
     fn compile(selectors: &str) -> Result<SelectorList<Selectors>, SelectError> {
         let mut input = ParserInput::new(selectors);
@@ -1046,6 +987,33 @@ impl Dom {
         })
     }
 
+    /// Compiles `selectors` and checks that `scope` is live; syntax errors
+    /// win over staleness, in that order.
+    fn compile_scoped(
+        &self,
+        scope: NodeId,
+        selectors: &str,
+    ) -> Result<SelectorList<Selectors>, SelectError> {
+        let list = Self::compile(selectors)?;
+        if !self.contains(scope) {
+            return Err(SelectError::StaleNode);
+        }
+        Ok(list)
+    }
+
+    /// One matching context (and its caches) for a query: matching is a
+    /// read, so nothing here can invalidate the arena underneath it.
+    fn query_context<'a>(&self, caches: &'a mut SelectorCaches) -> MatchingContext<'a, Selectors> {
+        MatchingContext::new(
+            MatchingMode::Normal,
+            None,
+            caches,
+            self.quirks_mode().engine(),
+            NeedsSelectorFlags::No,
+            MatchingForInvalidation::No,
+        )
+    }
+
     /// Shared scan behind [`Dom::select_all`] and [`Dom::select_first`]:
     /// walks candidates in document order, stopping after `limit` hits.
     fn find_matches(
@@ -1055,16 +1023,7 @@ impl Dom {
         limit: Option<usize>,
     ) -> Vec<NodeId> {
         let mut caches = SelectorCaches::default();
-        // One context (and its caches) serves the whole scan; matching is a
-        // read, so nothing here can invalidate the arena underneath it.
-        let mut context = MatchingContext::new(
-            MatchingMode::Normal,
-            None,
-            &mut caches,
-            self.quirks_mode().engine(),
-            NeedsSelectorFlags::No,
-            MatchingForInvalidation::No,
-        );
+        let mut context = self.query_context(&mut caches);
         let mut hits = Vec::new();
         for candidate in Descendants::new(self, scope) {
             let Some(element) = DomElement::new(self, candidate) else {
@@ -1090,10 +1049,7 @@ impl Dom {
     /// - [`SelectError::StaleNode`] if `scope` names a destroyed node.
     /// - [`SelectError::Syntax`] if `selectors` does not parse.
     pub fn select_all(&self, scope: NodeId, selectors: &str) -> Result<Vec<NodeId>, SelectError> {
-        let list = Self::compile(selectors)?;
-        if !self.contains(scope) {
-            return Err(SelectError::StaleNode);
-        }
+        let list = self.compile_scoped(scope, selectors)?;
         Ok(self.find_matches(&list, scope, None))
     }
 
@@ -1108,10 +1064,7 @@ impl Dom {
         scope: NodeId,
         selectors: &str,
     ) -> Result<Option<NodeId>, SelectError> {
-        let list = Self::compile(selectors)?;
-        if !self.contains(scope) {
-            return Err(SelectError::StaleNode);
-        }
+        let list = self.compile_scoped(scope, selectors)?;
         Ok(self.find_matches(&list, scope, Some(1)).into_iter().next())
     }
 
@@ -1134,14 +1087,7 @@ impl Dom {
             });
         };
         let mut caches = SelectorCaches::default();
-        let mut context = MatchingContext::new(
-            MatchingMode::Normal,
-            None,
-            &mut caches,
-            self.quirks_mode().engine(),
-            NeedsSelectorFlags::No,
-            MatchingForInvalidation::No,
-        );
+        let mut context = self.query_context(&mut caches);
         Ok(matches_selector_list(&list, &view, &mut context))
     }
 }

@@ -281,10 +281,10 @@ impl<'a> XmlParser<'a> {
         let Some(&top) = self.stack.last() else {
             return Err(());
         };
-        let matches = self.dom.get(top).is_some_and(|node| match node.kind() {
-            dom::NodeKind::Element { name: element, .. } => qualified_equals(element, name),
-            _ => false,
-        });
+        let matches = matches!(
+            self.dom.kind(top),
+            Some(dom::NodeKind::Element { name: element, .. }) if qualified_equals(element, name)
+        );
         if !matches {
             return Err(());
         }

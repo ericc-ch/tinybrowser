@@ -639,7 +639,7 @@ pub(crate) fn classic_script_at(world: &World, id: dom::NodeId) -> Option<Classi
 }
 
 fn is_classic_script(tree: &dom::Dom, id: dom::NodeId) -> bool {
-    match tree.get(id).map(|node| node.kind()) {
+    match tree.kind(id) {
         Some(dom::NodeKind::Element { name, .. })
             if name.ns == dom::html_namespace()
                 && name.local.as_ref().eq_ignore_ascii_case("script") =>
@@ -690,7 +690,7 @@ fn element_text(tree: &dom::Dom, id: dom::NodeId) -> String {
         .unwrap_or_default();
     stack.reverse();
     while let Some(child) = stack.pop() {
-        match tree.get(child).map(|node| node.kind()) {
+        match tree.kind(child) {
             Some(dom::NodeKind::Text { data }) => text.push_str(data),
             Some(dom::NodeKind::Element { .. }) => {
                 if let Some(kids) = tree.children(child) {

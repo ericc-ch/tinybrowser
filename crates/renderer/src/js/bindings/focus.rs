@@ -44,10 +44,10 @@ pub(crate) fn is_focusable(ctx: &Ctx<'_>, node: NodeId) -> Result<bool> {
     let Some(parsed) = world.document(node) else {
         return Ok(false);
     };
-    let Some(entry) = parsed.dom.get(node) else {
+    let Some(kind) = parsed.dom.kind(node) else {
         return Ok(false);
     };
-    let NodeKind::Element { name, .. } = entry.kind() else {
+    let NodeKind::Element { name, .. } = kind else {
         return Ok(false);
     };
     if !parsed.dom.is_connected(node) || is_actually_disabled(&parsed.dom, node) {
@@ -137,7 +137,7 @@ fn is_hidden_input(dom: &dom::Dom, node: NodeId) -> bool {
 }
 
 fn node_local_name(dom: &dom::Dom, node: NodeId) -> Option<String> {
-    match dom.get(node).map(|entry| entry.kind()) {
+    match dom.kind(node) {
         Some(NodeKind::Element { name, .. }) if name.ns == html_namespace() => {
             Some(name.local.to_string())
         }
@@ -154,7 +154,7 @@ pub(crate) fn is_text_control(ctx: &Ctx<'_>, node: NodeId) -> Result<bool> {
     let Some(parsed) = world.document(node) else {
         return Ok(false);
     };
-    if parsed.dom.get(node).is_none() || is_actually_disabled(&parsed.dom, node) {
+    if parsed.dom.kind(node).is_none() || is_actually_disabled(&parsed.dom, node) {
         return Ok(false);
     }
     if parsed.dom.attribute(node, "readonly").is_some() {

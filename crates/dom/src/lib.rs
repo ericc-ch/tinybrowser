@@ -7,8 +7,8 @@
 //!
 //! Everything crosses boundaries as [`NodeId`] handles. A handle outliving
 //! its node is harmless (lookups report absence, never a different node),
-//! which is what will let the `QuickJS` binding layer hold handles across GC
-//! cycles without borrowing anything.
+//! which lets the `QuickJS` binding layer hold handles across GC cycles
+//! without borrowing anything.
 //!
 //! # Seam map
 //!
@@ -23,7 +23,7 @@ mod node;
 mod select;
 mod state;
 
-pub use arena::{Dom, DomError, Lifecycle, Mutation, NodeRef, QuirksMode};
+pub use arena::{Dom, DomError, Lifecycle, Mutation, QuirksMode};
 pub use id::NodeId;
 pub use node::{
     Attribute, LocalName, Namespace, NodeKind, Prefix, QualName, html_namespace,

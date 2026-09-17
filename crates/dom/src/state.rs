@@ -19,16 +19,13 @@
 
 use crate::arena::Dom;
 use crate::id::NodeId;
-use crate::node::{NodeKind, QualName, html_namespace, xml_namespace};
+use crate::node::{NodeKind, QualName, html_namespace, svg_namespace, xml_namespace};
 
 // ── shared lookups ──────────────────────────────────────────────────────────
 
 /// Qualified name of a live element, else `None`.
 fn qual_name(dom: &Dom, id: NodeId) -> Option<&QualName> {
-    match dom.get(id)?.kind() {
-        NodeKind::Element { name, .. } => Some(name),
-        _ => None,
-    }
+    dom.element(id).map(|(name, _)| name)
 }
 
 /// Whether the element lives in the HTML namespace: the case-regime switch
@@ -63,9 +60,7 @@ pub(crate) fn local_is(dom: &Dom, id: NodeId, names: &[&str]) -> bool {
 /// dropped it, and one lookup policy keeps `[href]` and `:link` answers
 /// consistent).
 pub(crate) fn attr_value<'a>(dom: &'a Dom, id: NodeId, name: &str) -> Option<&'a str> {
-    let NodeKind::Element { attributes, .. } = dom.get(id)?.kind() else {
-        return None;
-    };
+    let (_, attributes) = dom.element(id)?;
     let html = is_html(dom, id);
     attributes.iter().find_map(|attribute| {
         if !attribute.name.ns.is_empty() {
@@ -83,24 +78,19 @@ pub(crate) fn attr_value<'a>(dom: &'a Dom, id: NodeId, name: &str) -> Option<&'a
 
 /// First `xml:lang` in the XML namespace.
 fn xml_lang_value(dom: &Dom, id: NodeId) -> Option<&str> {
-    let NodeKind::Element { attributes, .. } = dom.get(id)?.kind() else {
-        return None;
-    };
+    let (_, attributes) = dom.element(id)?;
     attributes.iter().find_map(|attribute| {
         (attribute.name.ns == xml_namespace() && attribute.name.local.as_ref() == "lang")
             .then_some(attribute.value.as_str())
     })
 }
 
-fn eq_ignore_case(a: &str, b: &str) -> bool {
-    a.eq_ignore_ascii_case(b)
-}
-
-/// One RFC 4647 §3.3.2 *extended filtering* comparison, lowercased on both
-/// sides: range subtags correspond positionally to tag subtags, `*` matches
-/// exactly one subtag, and tag subtags beyond the range's length are free
-/// specificity. Compares whole subtags only (no byte slicing anywhere),
-/// so arbitrary (even malformed) markup cannot panic this matcher.
+/// One RFC 4647 §3.3.2 *extended filtering* comparison: range subtags
+/// correspond positionally to tag subtags, with ASCII-case-insensitive
+/// subtag equality, `*` matches exactly one subtag, and tag subtags beyond
+/// the range's length are free specificity. Compares whole subtags only (no
+/// byte slicing anywhere), so arbitrary (even malformed) markup cannot panic
+/// this matcher.
 ///
 /// ```text
 /// range "en"      matches "en", "en-US", "en-Latn-US"
@@ -108,18 +98,13 @@ fn eq_ignore_case(a: &str, b: &str) -> bool {
 /// range "*-Cyrl"  matches "sr-Cyrl"; not "sr" (`*` consumes exactly one)
 /// ```
 fn lang_range_matches(range: &str, tag: &str) -> bool {
-    let range = range.to_ascii_lowercase();
-    if range == "*" {
-        return true;
-    }
-    let tag = tag.to_ascii_lowercase();
     let mut tag_subtags = tag.split('-');
     for range_subtag in range.split('-') {
         match tag_subtags.next() {
             // Tag ran out first: it is less specific than the range demands.
             None => return false, // tag less specific than the range
             Some(tag_subtag) => {
-                if range_subtag != "*" && range_subtag != tag_subtag {
+                if range_subtag != "*" && !range_subtag.eq_ignore_ascii_case(tag_subtag) {
                     return false;
                 }
             }
@@ -174,17 +159,11 @@ pub(crate) fn is_disabled(dom: &Dom, id: NodeId) -> bool {
     if attr_value(dom, id, "disabled").is_some() {
         return true;
     }
-    if local_is(dom, id, &["option", "optgroup"]) {
-        let mut cursor = dom.parent(id);
-        while let Some(ancestor) = cursor {
-            if local_is(dom, ancestor, &["select"]) {
-                if attr_value(dom, ancestor, "disabled").is_some() {
-                    return true;
-                }
-                break;
-            }
-            cursor = dom.parent(ancestor);
-        }
+    if local_is(dom, id, &["option", "optgroup"])
+        && owning_select(dom, id)
+            .is_some_and(|select| attr_value(dom, select, "disabled").is_some())
+    {
+        return true;
     }
     if local_is(dom, id, &["option"])
         && dom.parent(id).is_some_and(|group| {
@@ -197,14 +176,7 @@ pub(crate) fn is_disabled(dom: &Dom, id: NodeId) -> bool {
 }
 
 fn is_descendant_of(dom: &Dom, id: NodeId, ancestor: NodeId) -> bool {
-    let mut cursor = dom.parent(id);
-    while let Some(current) = cursor {
-        if current == ancestor {
-            return true;
-        }
-        cursor = dom.parent(current);
-    }
-    false
+    dom.ancestors(id).any(|current| current == ancestor)
 }
 
 fn first_legend_child(dom: &Dom, fieldset: NodeId) -> Option<NodeId> {
@@ -213,19 +185,12 @@ fn first_legend_child(dom: &Dom, fieldset: NodeId) -> Option<NodeId> {
 }
 
 fn disabled_by_fieldset(dom: &Dom, id: NodeId) -> bool {
-    let mut cursor = dom.parent(id);
-    while let Some(ancestor) = cursor {
-        if local_is(dom, ancestor, &["fieldset"]) && attr_value(dom, ancestor, "disabled").is_some()
-        {
-            let in_first_legend = first_legend_child(dom, ancestor)
-                .is_some_and(|legend| is_descendant_of(dom, id, legend));
-            if !in_first_legend {
-                return true;
-            }
-        }
-        cursor = dom.parent(ancestor);
-    }
-    false
+    dom.ancestors(id).any(|ancestor| {
+        local_is(dom, ancestor, &["fieldset"])
+            && attr_value(dom, ancestor, "disabled").is_some()
+            && first_legend_child(dom, ancestor)
+                .is_none_or(|legend| !is_descendant_of(dom, id, legend))
+    })
 }
 
 /// `:enabled`, the negation of [`is_disabled`] *among disableable
@@ -247,28 +212,19 @@ fn has_selected_attribute(dom: &Dom, id: NodeId) -> bool {
 /// options decides default selectedness (`id` is an `option` here, never
 /// the select itself).
 fn owning_select(dom: &Dom, id: NodeId) -> Option<NodeId> {
-    let mut cursor = dom.parent(id);
-    while let Some(ancestor) = cursor {
-        if local_is(dom, ancestor, &["select"]) {
-            return Some(ancestor);
-        }
-        cursor = dom.parent(ancestor);
-    }
-    None
+    dom.ancestors(id)
+        .find(|&ancestor| local_is(dom, ancestor, &["select"]))
 }
 
-/// Every descendant `option` of `root`, in tree order: HTML's "list of
-/// options", within which `optgroup`s (and anything else wrapping them)
-/// are transparent containers.
-fn collect_descendant_options(dom: &Dom, root: NodeId, options: &mut Vec<NodeId>) {
-    if let Some(kids) = dom.children(root) {
-        for kid in kids {
-            if local_is(dom, *kid, &["option"]) {
-                options.push(*kid);
-            }
-            collect_descendant_options(dom, *kid, options);
-        }
+/// Whether `id` is a checkbox/radio input whose checkedness is true
+/// (statically, those carrying `checked`).
+fn checked_input(dom: &Dom, id: NodeId) -> bool {
+    if !local_is(dom, id, &["input"]) {
+        return false;
     }
+    let ty = attr_value(dom, id, "type").unwrap_or("text");
+    (ty.eq_ignore_ascii_case("checkbox") || ty.eq_ignore_ascii_case("radio"))
+        && attr_value(dom, id, "checked").is_some()
 }
 
 /// `:checked` per HTML §4.16.3 (<https://html.spec.whatwg.org/#selector-checked>):
@@ -279,10 +235,8 @@ fn collect_descendant_options(dom: &Dom, root: NodeId, options: &mut Vec<NodeId>
 /// `selected`, and the list flattens `optgroup`s), so fresh parsed pages
 /// answer as browsers do.
 pub(crate) fn is_checked(dom: &Dom, id: NodeId) -> bool {
-    if local_is(dom, id, &["input"]) {
-        let ty = attr_value(dom, id, "type").unwrap_or("text");
-        return (eq_ignore_case(ty, "checkbox") || eq_ignore_case(ty, "radio"))
-            && attr_value(dom, id, "checked").is_some();
+    if checked_input(dom, id) {
+        return true;
     }
     if local_is(dom, id, &["option"]) {
         if has_selected_attribute(dom, id) {
@@ -294,8 +248,12 @@ pub(crate) fn is_checked(dom: &Dom, id: NodeId) -> bool {
         if attr_value(dom, select, "multiple").is_some() {
             return false;
         }
-        let mut options = Vec::new();
-        collect_descendant_options(dom, select, &mut options);
+        // HTML's "list of options", within which `optgroup`s (and anything
+        // else wrapping them) are transparent containers.
+        let options: Vec<NodeId> = dom
+            .descendants(select)
+            .filter(|&option| local_is(dom, option, &["option"]))
+            .collect();
         let Some((first, rest)) = options.split_first() else {
             return false;
         };
@@ -348,10 +306,9 @@ pub(crate) fn is_read_write(dom: &Dom, id: NodeId) -> bool {
 /// numeric-entry types only; a checkbox shows nothing).
 fn placeholder_capable_type(dom: &Dom, id: NodeId) -> bool {
     let ty = attr_value(dom, id, "type").unwrap_or("text");
-    matches!(
-        ty.to_ascii_lowercase().as_str(),
-        "text" | "search" | "url" | "tel" | "email" | "password" | "number"
-    )
+    ["text", "search", "url", "tel", "email", "password", "number"]
+        .iter()
+        .any(|capable| ty.eq_ignore_ascii_case(capable))
 }
 
 /// `:placeholder-shown`: a placeholder is *shown* only while the control's
@@ -373,7 +330,7 @@ pub(crate) fn is_placeholder_shown(dom: &Dom, id: NodeId) -> bool {
         let mut empty = true;
         if let Some(kids) = dom.children(id) {
             for kid in kids {
-                if let Some(NodeKind::Text { data }) = dom.get(*kid).map(|view| view.kind()) {
+                if let Some(NodeKind::Text { data }) = dom.kind(*kid) {
                     empty &= data.is_empty();
                 }
             }
@@ -387,12 +344,7 @@ pub(crate) fn is_placeholder_shown(dom: &Dom, id: NodeId) -> bool {
 /// checkbox/radio inputs with `checked`, options with `selected`. Form
 /// default-submit buttons are not represented (no form-owner association).
 pub(crate) fn is_default(dom: &Dom, id: NodeId) -> bool {
-    if local_is(dom, id, &["input"]) {
-        let ty = attr_value(dom, id, "type").unwrap_or("text");
-        return (eq_ignore_case(ty, "checkbox") || eq_ignore_case(ty, "radio"))
-            && attr_value(dom, id, "checked").is_some();
-    }
-    local_is(dom, id, &["option"]) && has_selected_attribute(dom, id)
+    checked_input(dom, id) || (local_is(dom, id, &["option"]) && has_selected_attribute(dom, id))
 }
 
 /// `:indeterminate`, static subset: a `progress` without a `value`
@@ -445,22 +397,16 @@ pub(crate) fn is_defined(dom: &Dom, id: NodeId) -> bool {
 /// `Content-Language` default
 /// (<https://html.spec.whatwg.org/multipage/dom.html#language>).
 pub(crate) fn lang_matches(dom: &Dom, id: NodeId, ranges: &[Box<str>]) -> bool {
-    let mut found: Option<&str> = None;
-    let mut cursor = Some(id);
-    while let Some(current) = cursor {
-        if let Some(value) = xml_lang_value(dom, current) {
-            found = Some(value);
-            break;
-        }
-        if let Some(NodeKind::Element { name, .. }) = dom.get(current).map(|node| node.kind())
-            && (name.ns == html_namespace() || name.ns.as_ref() == "http://www.w3.org/2000/svg")
-            && let Some(value) = attr_value(dom, current, "lang")
-        {
-            found = Some(value);
-            break;
-        }
-        cursor = dom.parent(current);
-    }
+    let found = std::iter::once(id)
+        .chain(dom.ancestors(id))
+        .find_map(|current| {
+            xml_lang_value(dom, current).or_else(|| {
+                let (name, _) = dom.element(current)?;
+                (name.ns == html_namespace() || name.ns == svg_namespace())
+                    .then(|| attr_value(dom, current, "lang"))
+                    .flatten()
+            })
+        });
     let tag = found.or_else(|| dom.document_language());
     let Some(tag) = tag else {
         return false;
@@ -477,7 +423,7 @@ fn dir_attr(dom: &Dom, id: NodeId) -> Option<&str> {
         return None;
     }
     attr_value(dom, id, "dir")
-        .filter(|value| eq_ignore_case(value, "ltr") || eq_ignore_case(value, "rtl"))
+        .filter(|value| value.eq_ignore_ascii_case("ltr") || value.eq_ignore_ascii_case("rtl"))
 }
 
 /// `:dir(direction)`: nearest HTML ancestor-or-self with a `dir` attribute
@@ -485,12 +431,11 @@ fn dir_attr(dom: &Dom, id: NodeId) -> Option<&str> {
 /// Defaults to `ltr`. `dir="auto"` is not classified (needs first-strong
 /// bidi); invalid values inherit, per Undefined direction.
 pub(crate) fn direction_is(dom: &Dom, id: NodeId, want: &str) -> bool {
-    let mut cursor = Some(id);
-    while let Some(current) = cursor {
-        if let Some(found) = dir_attr(dom, current) {
-            return eq_ignore_case(found, want);
-        }
-        cursor = dom.parent(current);
-    }
-    eq_ignore_case(want, "ltr")
+    std::iter::once(id)
+        .chain(dom.ancestors(id))
+        .find_map(|current| dir_attr(dom, current))
+        .map_or_else(
+            || want.eq_ignore_ascii_case("ltr"),
+            |found| found.eq_ignore_ascii_case(want),
+        )
 }

@@ -246,7 +246,7 @@ impl Sink {
         };
         if let Some(handle) = neighbor
             && matches!(
-                dom.get(handle).map(|node| node.kind()),
+                dom.kind(handle),
                 Some(NodeKind::Text { .. })
             )
         {
@@ -310,7 +310,7 @@ impl TreeSink for Sink {
     }
 
     fn elem_name<'a>(&'a self, target: &'a Self::Handle) -> Self::ElemName<'a> {
-        match self.dom.borrow().get(*target).map(|node| node.kind()) {
+        match self.dom.borrow().kind(*target) {
             Some(NodeKind::Element { name, .. }) => OwnedElemName {
                 ns: name.ns.clone(),
                 local: name.local.clone(),
@@ -475,7 +475,7 @@ impl TreeSink for Sink {
 }
 
 fn is_html_named(dom: &dom::Dom, id: Handle, local: &str) -> bool {
-    match dom.get(id).map(|node| node.kind()) {
+    match dom.kind(id) {
         Some(NodeKind::Element { name, .. }) => {
             name.ns == html_namespace() && name.local.as_ref().eq_ignore_ascii_case(local)
         }
@@ -484,7 +484,7 @@ fn is_html_named(dom: &dom::Dom, id: Handle, local: &str) -> bool {
 }
 
 fn html_bool_attr(dom: &dom::Dom, id: Handle, local: &str) -> bool {
-    match dom.get(id).map(|node| node.kind()) {
+    match dom.kind(id) {
         Some(NodeKind::Element { attributes, .. }) => attributes.iter().any(|attribute| {
             attribute.name.ns.is_empty()
                 && attribute.name.local.as_ref().eq_ignore_ascii_case(local)
@@ -494,7 +494,7 @@ fn html_bool_attr(dom: &dom::Dom, id: Handle, local: &str) -> bool {
 }
 
 fn html_attr_value(dom: &dom::Dom, id: Handle, local: &str) -> Option<String> {
-    match dom.get(id).map(|node| node.kind()) {
+    match dom.kind(id) {
         Some(NodeKind::Element { attributes, .. }) => attributes.iter().find_map(|attribute| {
             (attribute.name.ns.is_empty()
                 && attribute.name.local.as_ref().eq_ignore_ascii_case(local))

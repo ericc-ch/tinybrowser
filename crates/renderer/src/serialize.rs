@@ -36,7 +36,7 @@ const MATHML_NS: &str = "http://www.w3.org/1998/Math/MathML";
 /// <https://html.spec.whatwg.org/multipage/parsing.html#serialising-html-fragments>
 pub(crate) fn serialize_html_fragment(dom: &Dom, element: NodeId) -> String {
     let root = dom.template_contents(element).unwrap_or(element);
-    let parent = match dom.get(element).map(|node| node.kind()) {
+    let parent = match dom.kind(element) {
         Some(NodeKind::Element { name, .. }) => Some((name.ns.clone(), name.local.clone())),
         _ => None,
     };
@@ -90,7 +90,7 @@ fn serialize_html_node(
     parent: Option<(&Namespace, &LocalName)>,
     output: &mut String,
 ) {
-    let Some(kind) = dom.get(id).map(|node| node.kind().clone()) else {
+    let Some(kind) = dom.kind(id).cloned() else {
         return;
     };
     match kind {
@@ -328,7 +328,7 @@ impl<'a> XmlSerializer<'a> {
         map: &PrefixMap,
         output: &mut String,
     ) -> Result<(), XmlSerializeError> {
-        let Some(kind) = self.dom.get(id).map(|node| node.kind().clone()) else {
+        let Some(kind) = self.dom.kind(id).cloned() else {
             return Err(XmlSerializeError);
         };
         match kind {
@@ -809,7 +809,7 @@ fn push_xml_identifier(output: &mut String, identifier: &str) {
 fn has_document_element(dom: &Dom, document: NodeId) -> bool {
     children(dom, document).into_iter().any(|child| {
         matches!(
-            dom.get(child).map(|node| node.kind()),
+            dom.kind(child),
             Some(NodeKind::Element { .. })
         )
     })

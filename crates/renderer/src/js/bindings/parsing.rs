@@ -206,7 +206,7 @@ fn doctype_fields(ctx: &Ctx<'_>, id: NodeId) -> Option<(String, String, String)>
     let world_rc = world(ctx).ok()?;
     let world = world_rc.borrow();
     let parsed = world.document(id)?;
-    match parsed.dom.get(id).map(|node| node.kind()) {
+    match parsed.dom.kind(id) {
         Some(NodeKind::Doctype {
             name,
             public_id,

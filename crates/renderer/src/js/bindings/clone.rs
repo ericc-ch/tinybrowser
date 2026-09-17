@@ -110,7 +110,7 @@ pub(crate) fn import_snapshot(dom: &dom::Dom, id: NodeId, deep: bool) -> Option<
             })
             .unwrap_or_default()
     };
-    match dom.get(id)?.kind() {
+    match dom.kind(id)? {
         NodeKind::Element { name, attributes } => Some(ImportSnapshot::Element {
             name: name.clone(),
             attributes: attributes.clone(),
