@@ -1233,7 +1233,7 @@ globalThis.__tbMakeStyle = element => {
     }
   });
 };
-// https://html.spec.whatwg.org/multipage/webmessaging.html#messageevent
+// https://html.spec.whatwg.org/multipage/web-messaging.html#messageevent
 const __tbMessageEventData = Symbol.for('tinybrowser.messageevent.data');
 globalThis.MessageEvent = class MessageEvent extends Event {
   constructor(type, init) {
@@ -1291,7 +1291,7 @@ const __tbStructuredClone = (value, transfer, sourcePort) => {
       if (movedData.peer !== null) __tbBrand(movedData.peer, __tbPortData).peer = moved;
       // The message queue moves with the port identity; the new port starts
       // disabled and flushes when enabled
-      // (<https://html.spec.whatwg.org/multipage/webmessaging.html#message-ports>).
+      // (<https://html.spec.whatwg.org/multipage/web-messaging.html#message-ports>).
       movedData.pending = itemData.pending;
       itemData.pending = [];
       itemData.peer = null;
@@ -1376,7 +1376,7 @@ globalThis.structuredClone = function(value, options) {
   const transfer = options === undefined || options === null ? undefined : options.transfer;
   return __tbStructuredClone(value, transfer, null).data;
 };
-// https://html.spec.whatwg.org/multipage/webmessaging.html#messageport
+// https://html.spec.whatwg.org/multipage/web-messaging.html#messageport
 const __tbPortData = Symbol.for('tinybrowser.messageport.data');
 const __tbNewPort = () => {
   // Construct through the host EventTarget so the port carries the listener
@@ -1436,7 +1436,7 @@ globalThis.MessagePort = class MessagePort extends EventTarget {
   set onmessageerror(value) { __tbBrand(this, __tbPortData).onmessageerror = value; }
 };
 Object.defineProperty(globalThis.MessagePort.prototype, Symbol.toStringTag, { value: 'MessagePort', writable: false, enumerable: false, configurable: true });
-// https://html.spec.whatwg.org/multipage/webmessaging.html#messagechannel
+// https://html.spec.whatwg.org/multipage/web-messaging.html#messagechannel
 globalThis.MessageChannel = class MessageChannel {
   constructor() {
     const port1 = __tbNewPort();
@@ -1448,7 +1448,7 @@ globalThis.MessageChannel = class MessageChannel {
   }
 };
 Object.defineProperty(globalThis.MessageChannel.prototype, Symbol.toStringTag, { value: 'MessageChannel', writable: false, enumerable: false, configurable: true });
-// https://html.spec.whatwg.org/multipage/webmessaging.html#dom-window-postmessage
+// https://html.spec.whatwg.org/multipage/web-messaging.html#dom-window-postmessage
 // Same-window delivery: `source` is this window. The spec order is kept:
 // resolve targetOrigin, then structured-serialize, then queue the task, and
 // the origin check runs inside the task. Deviation: the task is queued on the

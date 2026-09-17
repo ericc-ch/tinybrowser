@@ -13,7 +13,7 @@ Done:
   is stripped by `tools/wpt/run`; `--test-types` must stay last.
 - rquickjs 0.13.0 (`fcd94be`); unsafe exception in `AGENTS.md` (`6e091c1`);
   `tools/ub` lint/miri/valgrind (`c86add1`) and its land-pr gate (`ca6a0f1`).
-- `window.postMessage` per html.spec.whatwg.org/multipage/webmessaging.html
+- `window.postMessage` per html.spec.whatwg.org/multipage/web-messaging.html
   (`199be80`): targetOrigin, structured clone, transfer, async task, zero-arg
   TypeError. Handler attributes are engine-invoked; the shim must not also
   register them as listeners (`dd3baaf`).
