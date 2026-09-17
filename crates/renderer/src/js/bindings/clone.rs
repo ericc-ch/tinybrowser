@@ -1,6 +1,6 @@
 //! Node adoption, cloning, and document import.
 
-use super::{throw_dom, throw_dom_error, world, wrap_node};
+use super::{throw_dom, throw_dom_error, world, wrap_new_document};
 
 use dom::{NodeId, NodeKind, QualName};
 
@@ -50,13 +50,8 @@ pub(crate) fn clone_document<'js>(ctx: &Ctx<'js>, id: NodeId, deep: bool) -> Res
         };
         (parsed.content_type, parsed.quirks_mode, children)
     };
-    let mut parsed = crate::Parsed {
-        dom: dom::Dom::new(),
-        quirks_mode,
-        parse_errors: 0,
-        content_type,
-        ready_state: crate::ReadyState::Complete,
-    };
+    let mut parsed = crate::Parsed::empty(content_type);
+    parsed.quirks_mode = quirks_mode;
     let document = parsed.dom.document();
     for child in children {
         let child =
@@ -66,12 +61,7 @@ pub(crate) fn clone_document<'js>(ctx: &Ctx<'js>, id: NodeId, deep: bool) -> Res
             .append(document, child)
             .map_err(|err| throw_dom_error(ctx, err))?;
     }
-    let root = world_rc.borrow_mut().add_document(parsed);
-    let registry = world_rc.borrow().registry();
-    registry
-        .borrow_mut()
-        .insert_document(root.document_id(), &world_rc);
-    wrap_node(ctx, root)
+    wrap_new_document(ctx, parsed)
 }
 
 /// Owned snapshot of a subtree for cross-document `importNode`.
@@ -169,11 +159,7 @@ pub(crate) fn materialize_import(
                 dom.append(id, child)?;
             }
             if let Some(contents) = template_contents {
-                let fragment = dom.create_fragment();
-                for child in contents {
-                    let child = materialize_import(dom, child)?;
-                    dom.append(fragment, child)?;
-                }
+                let fragment = materialize_children(dom, contents)?;
                 dom.set_template_contents(id, fragment)?;
             }
             Ok(id)
@@ -189,13 +175,19 @@ pub(crate) fn materialize_import(
             public_id,
             system_id,
         } => Ok(dom.create_doctype(name.clone(), public_id.clone(), system_id.clone())),
-        ImportSnapshot::Fragment(children) => {
-            let id = dom.create_fragment();
-            for child in children {
-                let child = materialize_import(dom, child)?;
-                dom.append(id, child)?;
-            }
-            Ok(id)
-        }
+        ImportSnapshot::Fragment(children) => materialize_children(dom, children),
     }
+}
+
+/// Materializes `snapshots` into a fresh fragment in tree order.
+pub(crate) fn materialize_children(
+    dom: &mut dom::Dom,
+    snapshots: &[ImportSnapshot],
+) -> std::result::Result<NodeId, dom::DomError> {
+    let fragment = dom.create_fragment();
+    for snapshot in snapshots {
+        let child = materialize_import(dom, snapshot)?;
+        dom.append(fragment, child)?;
+    }
+    Ok(fragment)
 }

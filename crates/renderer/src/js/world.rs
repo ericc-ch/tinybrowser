@@ -1218,6 +1218,7 @@ fn inclusive_descendant(dom: &dom::Dom, ancestor: NodeId, node: NodeId) -> bool 
 }
 
 /// Identity of one `Attr` platform object.
+#[derive(Clone)]
 pub(crate) struct AttrState {
     pub namespace: String,
     pub prefix: Option<String>,

@@ -2,7 +2,8 @@
 
 use super::{
     FromJs, JsAttr, LegacyNullString, NodeContext, OptString, OptionalTitle, WebIdlString,
-    host_node_id, throw_dom, throw_dom_error, validate_and_extract, world, wrap_node,
+    create_kind, host_node_id, throw_dom, throw_dom_error, validate_and_extract, world,
+    wrap_new_document,
 };
 use rquickjs::function::{Opt, Rest};
 
@@ -54,15 +55,9 @@ impl JsImplementation {
                 "doctype name contains invalid characters",
             ));
         }
-        let world = world(&ctx)?;
-        let world = world.borrow();
-        let Some(mut parsed) = world.document_mut(self.document.0) else {
-            return Err(Exception::throw_type(&ctx, "no document"));
-        };
-        let id = parsed.dom.create_doctype(name, public_id, system_id);
-        drop(parsed);
-        drop(world);
-        wrap_node(&ctx, id)
+        create_kind(&ctx, self.document.0, |dom| {
+            dom.create_doctype(name, public_id, system_id)
+        })
     }
 
     /// Creating a second document needs the renderer's World to own several
@@ -82,17 +77,11 @@ impl JsImplementation {
             "http://www.w3.org/2000/svg" => "image/svg+xml",
             _ => "application/xml",
         };
-        let mut parsed = crate::Parsed {
-            dom: dom::Dom::new(),
-            quirks_mode: markup5ever::interface::QuirksMode::NoQuirks,
-            parse_errors: 0,
-            content_type,
-            ready_state: crate::ReadyState::Complete,
-        };
+        let mut parsed = crate::Parsed::empty(content_type);
         let document = parsed.dom.document();
         if !doctype.is_null()
             && !doctype.is_undefined()
-            && doctype_fields(&ctx, host_node_id(&ctx, &doctype).unwrap_or(document)).is_none()
+            && doctype_fields_for(&ctx, host_node_id(&ctx, &doctype).unwrap_or(document)).is_none()
         {
             return Err(Exception::throw_type(
                 &ctx,
@@ -100,7 +89,7 @@ impl JsImplementation {
             ));
         }
         if let Some(doctype) = host_node_id(&ctx, &doctype)
-            && let Some((name, public_id, system_id)) = doctype_fields(&ctx, doctype)
+            && let Some((name, public_id, system_id)) = doctype_fields_for(&ctx, doctype)
         {
             let node = parsed.dom.create_doctype(name, public_id, system_id);
             parsed
@@ -121,16 +110,7 @@ impl JsImplementation {
                 .append(document, element)
                 .map_err(|err| throw_dom_error(&ctx, err))?;
         }
-        let world_rc = world(&ctx)?;
-
-        let root = world_rc.borrow_mut().add_document(parsed);
-
-        let registry = world_rc.borrow().registry();
-
-        registry
-            .borrow_mut()
-            .insert_document(root.document_id(), &world_rc);
-        wrap_node(&ctx, root)
+        wrap_new_document(&ctx, parsed)
     }
 
     // https://dom.spec.whatwg.org/#dom-domimplementation-createhtmldocument
@@ -140,13 +120,7 @@ impl JsImplementation {
         ctx: Ctx<'js>,
         title: Opt<OptionalTitle>,
     ) -> Result<Value<'js>> {
-        let mut parsed = crate::Parsed {
-            dom: dom::Dom::new(),
-            quirks_mode: markup5ever::interface::QuirksMode::NoQuirks,
-            parse_errors: 0,
-            content_type: "text/html",
-            ready_state: crate::ReadyState::Complete,
-        };
+        let mut parsed = crate::Parsed::empty("text/html");
         let document = parsed.dom.document();
         let doctype = parsed.dom.create_doctype("html", "", "");
         parsed
@@ -188,24 +162,15 @@ impl JsImplementation {
             .dom
             .append(html, body)
             .map_err(|err| throw_dom_error(&ctx, err))?;
-        let world_rc = world(&ctx)?;
-
-        let root = world_rc.borrow_mut().add_document(parsed);
-
-        let registry = world_rc.borrow().registry();
-
-        registry
-            .borrow_mut()
-            .insert_document(root.document_id(), &world_rc);
-        wrap_node(&ctx, root)
+        wrap_new_document(&ctx, parsed)
     }
 }
 
-/// The doctype's name, public id, and system id, from its own document.
-fn doctype_fields(ctx: &Ctx<'_>, id: NodeId) -> Option<(String, String, String)> {
-    let world_rc = world(ctx).ok()?;
-    let world = world_rc.borrow();
-    let parsed = world.document(id)?;
+/// The doctype's name, public id, and system id, when `parsed` holds `id`.
+pub(super) fn doctype_fields(
+    parsed: &crate::Parsed,
+    id: NodeId,
+) -> Option<(String, String, String)> {
     match parsed.dom.kind(id) {
         Some(NodeKind::Doctype {
             name,
@@ -214,6 +179,14 @@ fn doctype_fields(ctx: &Ctx<'_>, id: NodeId) -> Option<(String, String, String)>
         }) => Some((name.clone(), public_id.clone(), system_id.clone())),
         _ => None,
     }
+}
+
+/// [`doctype_fields`] for `id` in the current realm's world.
+fn doctype_fields_for(ctx: &Ctx<'_>, id: NodeId) -> Option<(String, String, String)> {
+    let world_rc = world(ctx).ok()?;
+    let world = world_rc.borrow();
+    let parsed = world.document(id)?;
+    doctype_fields(&parsed, id)
 }
 
 /// An HTML-namespace qualified name for document construction.
@@ -256,19 +229,16 @@ impl JsDomParser {
         source: WebIdlString,
         type_: WebIdlString,
     ) -> Result<Value<'js>> {
-        let content_type = match type_.0.as_str() {
-            "text/html" => "text/html",
-            "text/xml" => "text/xml",
-            "application/xml" => "application/xml",
-            "application/xhtml+xml" => "application/xhtml+xml",
-            "image/svg+xml" => "image/svg+xml",
-            other => {
-                return Err(Exception::throw_message(
+        let content_type = CONTENT_TYPES
+            .iter()
+            .copied()
+            .find(|valid| *valid == type_.0.as_str())
+            .ok_or_else(|| {
+                Exception::throw_message(
                     &ctx,
-                    &format!("The provided value '{other}' is not a valid enum value"),
-                ));
-            }
-        };
+                    &format!("The provided value '{}' is not a valid enum value", type_.0),
+                )
+            })?;
         let parsed = if content_type == "text/html" {
             let mut parsed = crate::parse_html(&source.0);
             parsed.content_type = content_type;
@@ -277,18 +247,19 @@ impl JsDomParser {
         } else {
             crate::xml::parse_document(&source.0, content_type)
         };
-        let world_rc = world(&ctx)?;
-
-        let root = world_rc.borrow_mut().add_document(parsed);
-
-        let registry = world_rc.borrow().registry();
-
-        registry
-            .borrow_mut()
-            .insert_document(root.document_id(), &world_rc);
-        wrap_node(&ctx, root)
+        wrap_new_document(&ctx, parsed)
     }
 }
+
+/// The `DOMParser` `parseFromString` `SupportedType` values
+/// (<https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-domparser-parsefromstring>).
+const CONTENT_TYPES: [&str; 5] = [
+    "text/html",
+    "text/xml",
+    "application/xml",
+    "application/xhtml+xml",
+    "image/svg+xml",
+];
 
 /// `XMLSerializer` (<https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#xmlserializer>).
 #[derive(Trace, rquickjs::JsLifetime)]
