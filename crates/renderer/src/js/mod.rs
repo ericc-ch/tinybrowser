@@ -1277,7 +1277,13 @@ const __tbStructuredClone = (value, transfer, sourcePort) => {
     if (item instanceof ArrayBuffer) {
       if (buffers.has(item)) throw new DOMException('Transfer list contains duplicate buffers', 'DataCloneError');
       if (typeof item.transfer !== 'function') throw new DOMException('The buffer is not transferable', 'DataCloneError');
-      buffers.set(item, item.transfer());
+      let moved;
+      try {
+        moved = item.transfer();
+      } catch (error) {
+        throw new DOMException('The buffer is already detached', 'DataCloneError');
+      }
+      buffers.set(item, moved);
     } else if (item instanceof globalThis.MessagePort) {
       if (item === sourcePort) {
         throw new DOMException('Cannot transfer the source port', 'DataCloneError');
@@ -1317,27 +1323,53 @@ const __tbStructuredClone = (value, transfer, sourcePort) => {
     if (input === globalThis || input === globalThis.window) {
       throw new DOMException('The object could not be cloned.', 'DataCloneError');
     }
-    if (input instanceof ArrayBuffer) return input.slice(0);
+    if (input instanceof ArrayBuffer) {
+      const copy = input.slice(0);
+      seen.set(input, copy);
+      return copy;
+    }
     if (typeof SharedArrayBuffer !== 'undefined' && input instanceof SharedArrayBuffer) return input;
     if (ArrayBuffer.isView(input)) {
-      if (input instanceof DataView) {
-        return new DataView(clone(input.buffer), input.byteOffset, input.byteLength);
-      }
-      return new input.constructor(clone(input.buffer), input.byteOffset, input.length);
+      const buffer = clone(input.buffer);
+      const copy = input instanceof DataView
+        ? new DataView(buffer, input.byteOffset, input.byteLength)
+        : new input.constructor(buffer, input.byteOffset, input.length);
+      seen.set(input, copy);
+      return copy;
+    }
+    // Boxed primitives clone to boxed copies with the same value
+    // (<https://html.spec.whatwg.org/multipage/structured-data.html#structuredserializeinternal>).
+    if (input instanceof Boolean || input instanceof Number || input instanceof String) {
+      const copy = new input.constructor(input.valueOf());
+      seen.set(input, copy);
+      return copy;
     }
     if (input instanceof Blob) {
       const blob = input[__tbBlobData];
+      let copy;
       if (input instanceof globalThis.File) {
         const file = input[__tbFileData];
-        return new globalThis.File([blob.bytes], file.name, { type: blob.type, lastModified: file.lastModified });
+        copy = new globalThis.File([blob.bytes], file.name, { type: blob.type, lastModified: file.lastModified });
+      } else {
+        copy = new Blob([blob.bytes], { type: blob.type });
       }
-      return new Blob([blob.bytes], { type: blob.type });
+      seen.set(input, copy);
+      return copy;
     }
-    if (input instanceof Date) return new Date(input.getTime());
-    if (input instanceof RegExp) return new RegExp(input.source, input.flags);
+    if (input instanceof Date) {
+      const copy = new Date(input.getTime());
+      seen.set(input, copy);
+      return copy;
+    }
+    if (input instanceof RegExp) {
+      const copy = new RegExp(input.source, input.flags);
+      seen.set(input, copy);
+      return copy;
+    }
     if (input instanceof Error) {
       const copy = new Error(input.message);
       copy.name = input.name;
+      seen.set(input, copy);
       return copy;
     }
     if (input instanceof Map) {
@@ -1353,15 +1385,24 @@ const __tbStructuredClone = (value, transfer, sourcePort) => {
       return copy;
     }
     if (Array.isArray(input)) {
-      const copy = [];
+      // Arrays carry their length and only their index properties
+      // (<https://html.spec.whatwg.org/multipage/structured-data.html#structuredserializeinternal>).
+      const copy = new Array(input.length);
       seen.set(input, copy);
-      for (const key of Object.keys(input)) copy[key] = clone(input[key]);
+      for (const key of Object.keys(input)) {
+        const index = Number(key);
+        if (Number.isInteger(index) && index >= 0 && index < input.length && String(index) === key) {
+          copy[index] = clone(input[key]);
+        }
+      }
       return copy;
     }
-    // Anything left with a platform @@toStringTag is a host object (nodes,
-    // URL, events, ...) and is not serializable
+    // Anything left is a host object unless it is a plain object: Rust class
+    // instances (events, nodes, URL, ...) carry a platform prototype and are
+    // not serializable
     // (<https://html.spec.whatwg.org/multipage/structured-data.html#structuredserializeinternal>).
-    if (Object.prototype.toString.call(input) !== '[object Object]') {
+    const proto = Object.getPrototypeOf(input);
+    if (proto !== Object.prototype && proto !== null) {
       throw new DOMException('The object could not be cloned.', 'DataCloneError');
     }
     const copy = {};

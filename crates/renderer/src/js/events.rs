@@ -943,8 +943,13 @@ fn dispatch<'js>(
     let result = run_invocations(ctx, event, &path, target, bubbles);
     // Handler attributes (`onreadystatechange`, `onload`, …) act as listeners;
     // the engine runs them after the listener list until it models the
-    // handler registration slot.
-    let handler = if result.is_ok() {
+    // handler registration slot. A stopped event never reaches them.
+    let stopped = {
+        let class = event.borrow();
+        let state = class.state();
+        state.stop_propagation || state.stop_immediate
+    };
+    let handler = if result.is_ok() && !stopped {
         let event_value = Class::into_value(event.clone());
         call_handler_attribute(
             ctx,
