@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use tokio::time::Instant;
 
-use super::{Document, MAX_PENDING_JS_FETCHES, QueuedDial, Task, Timer};
+use super::{DialContext, Document, MAX_PENDING_JS_FETCHES, QueuedDial, Task, Timer};
 use crate::protocol::TabEvent;
 
 impl Document {
@@ -23,7 +23,7 @@ impl Document {
         self.adopt_dial_completions();
         if let Some(task) = self.tasks.pop_front() {
             self.run_task(task);
-            return !self.stopped();
+            return !self.stop.is_set();
         }
         false
     }
@@ -41,7 +41,11 @@ impl Document {
     /// Earliest timer deadline this document waits for.
     #[must_use]
     pub(crate) fn next_deadline(&self) -> Option<Instant> {
-        self.next_timer_deadline()
+        self.timers
+            .iter()
+            .filter(|timer| !timer.fired)
+            .map(|timer| timer.when)
+            .min()
     }
 
     fn schedule_timer(&mut self, delay: Duration) -> u32 {
@@ -71,15 +75,11 @@ impl Document {
         self.world.borrow_mut().forget_owned_documents();
     }
 
-    fn stopped(&self) -> bool {
-        self.stop.is_set()
-    }
-
     pub(crate) fn waiting_for_load(&self) -> bool {
-        self.queued_dials.iter().any(|dial| match dial {
-            QueuedDial::ClassicScript { epoch, .. } => *epoch == self.js_epoch,
-            QueuedDial::FrameLoad { sequence, .. } => *sequence == self.frame_load_sequence,
-            QueuedDial::JsFetch { .. } => false,
+        self.queued_dials.iter().any(|dial| match &dial.context {
+            DialContext::ClassicScript { epoch, .. } => *epoch == self.js_epoch,
+            DialContext::FrameLoad { sequence, .. } => *sequence == self.frame_load_sequence,
+            DialContext::JsFetch { .. } => false,
         }) || self.classic_fetch_in_flight
             || self.frame_load_in_flight
             || self.active_parser.is_some()
@@ -113,11 +113,8 @@ impl Document {
         match task {
             Task::Timer(id) => {
                 self.record_event(TabEvent::Timer(id));
-                if let Some(js_id) = self.js_timer_slots.remove(&id)
-                    && let Some(js) = &self.js
-                    && js.fire_timer(js_id).is_err()
-                {
-                    self.record_event(TabEvent::ScriptFailed);
+                if let Some(js_id) = self.js_timer_slots.remove(&id) {
+                    self.fire_js(|js| js.fire_timer(js_id));
                 }
                 self.timers.retain(|timer| timer.id != id);
                 self.adopt_js_work();
@@ -173,7 +170,7 @@ impl Document {
             let pending_js_fetches = self.in_flight_dials.saturating_add(
                 self.queued_dials
                     .iter()
-                    .filter(|dial| matches!(dial, QueuedDial::JsFetch { .. }))
+                    .filter(|dial| matches!(&dial.context, DialContext::JsFetch { .. }))
                     .count(),
             );
             if pending_js_fetches >= MAX_PENDING_JS_FETCHES {
@@ -183,25 +180,19 @@ impl Document {
             }
             if let Ok(url) = self.resolve_dial_url(&fetch.url) {
                 let initiator = self.url.clone();
-                self.queued_dials.push(QueuedDial::JsFetch {
+                self.queued_dials.push(QueuedDial {
+                    context: DialContext::JsFetch {
+                        id: fetch.js_id,
+                        epoch: self.js_epoch,
+                    },
                     url,
                     initiator,
-                    id: fetch.js_id,
-                    epoch: self.js_epoch,
                 });
             } else {
                 self.record_event(TabEvent::FetchFailed);
                 self.settle_js_fetch(fetch.js_id, false, 0, "");
             }
         }
-    }
-
-    fn next_timer_deadline(&self) -> Option<Instant> {
-        self.timers
-            .iter()
-            .filter(|timer| !timer.fired)
-            .map(|timer| timer.when)
-            .min()
     }
 
     fn due_timer(&mut self) -> Option<u32> {

@@ -2,8 +2,8 @@
 //!
 //! Name types (`QualName`, `Namespace`, `LocalName`, `Prefix`) are
 //! `markup5ever`'s, re-exported here so callers never touch that crate
-//! directly. Sharing them means the future `TreeSink` adapter passes parser
-//! names straight through with no conversion, and element names are interned
+//! directly. Sharing them lets the `TreeSink` adapter pass parser names
+//! straight through with no conversion, and element names are interned
 //! rather than copied per node.
 
 use crate::id::NodeId;
@@ -47,16 +47,7 @@ pub fn xlink_namespace() -> Namespace {
 /// Whether `name`'s serialization (`prefix:local` or `local`) equals `query`.
 #[must_use]
 pub fn qualified_name_eq(name: &QualName, query: &str) -> bool {
-    match name.prefix.as_ref() {
-        Some(prefix) if !prefix.is_empty() => {
-            let prefix = prefix.as_ref();
-            query.len() == prefix.len() + 1 + name.local.len()
-                && query.as_bytes().get(prefix.len()) == Some(&b':')
-                && &query[..prefix.len()] == prefix
-                && &query[prefix.len() + 1..] == name.local.as_ref()
-        }
-        _ => name.local.as_ref() == query,
-    }
+    qualified_name_eq_by(name, query, str::eq)
 }
 
 /// HTML's get-an-attribute-by-name match: the query as if ASCII-lowercased,
@@ -64,24 +55,28 @@ pub fn qualified_name_eq(name: &QualName, query: &str) -> bool {
 /// (<https://dom.spec.whatwg.org/#concept-element-attributes-get-by-name>).
 #[must_use]
 pub fn html_qualified_name_eq(name: &QualName, query: &str) -> bool {
+    qualified_name_eq_by(name, query, |stored, query| {
+        stored.len() == query.len()
+            && stored
+                .bytes()
+                .zip(query.bytes())
+                .all(|(stored, query)| stored == query.to_ascii_lowercase())
+    })
+}
+
+/// The shared qualified-name comparison. Length and `:` position are checked
+/// before slicing, so a multi-byte `query` can never hit a non-boundary slice.
+fn qualified_name_eq_by(name: &QualName, query: &str, eq: impl Fn(&str, &str) -> bool) -> bool {
     match name.prefix.as_ref() {
         Some(prefix) if !prefix.is_empty() => {
             let prefix = prefix.as_ref();
             query.len() == prefix.len() + 1 + name.local.len()
                 && query.as_bytes().get(prefix.len()) == Some(&b':')
-                && stored_eq_lowercased_query(prefix, &query[..prefix.len()])
-                && stored_eq_lowercased_query(name.local.as_ref(), &query[prefix.len() + 1..])
+                && eq(prefix, &query[..prefix.len()])
+                && eq(name.local.as_ref(), &query[prefix.len() + 1..])
         }
-        _ => stored_eq_lowercased_query(name.local.as_ref(), query),
+        _ => eq(name.local.as_ref(), query),
     }
-}
-
-fn stored_eq_lowercased_query(stored: &str, query: &str) -> bool {
-    stored.len() == query.len()
-        && stored
-            .bytes()
-            .zip(query.bytes())
-            .all(|(stored, query)| stored == query.to_ascii_lowercase())
 }
 
 /// One attribute: a qualified name and its value.
@@ -112,8 +107,8 @@ pub enum NodeKind {
         attributes: Vec<Attribute>,
     },
     /// A document fragment: a container outside the main tree. Serves as the
-    /// contents root of `<template>` elements today, and as the context root
-    /// for fragment parsing (`innerHTML`) later.
+    /// contents root of `<template>` elements and as the destination of
+    /// `innerHTML`-style fragment parsing.
     Fragment,
     /// Character data; adjacent runs are *not* merged by dom itself.
     Text { data: String },

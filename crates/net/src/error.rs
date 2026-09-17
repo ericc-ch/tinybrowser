@@ -5,21 +5,12 @@ pub enum TimeoutKind {
     Global,
     #[error("per-call")]
     PerCall,
-    #[error("resolve")]
-    Resolve,
     #[error("connect")]
     Connect,
-    #[error("send-request")]
-    SendRequest,
     #[error("send-body")]
     SendBody,
-    #[error("recv-response")]
-    RecvResponse,
     #[error("recv-body")]
     RecvBody,
-    /// A backend timeout name this crate does not map.
-    #[error("unknown ({0})")]
-    Unknown(Box<str>),
 }
 
 /// Failure to dial, complete TLS, or transfer bytes.

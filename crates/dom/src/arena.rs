@@ -125,45 +125,24 @@ pub(crate) struct Slot {
     node: Option<Node>,
 }
 
-/// A borrowed view of one live node, returned by [`Dom::get`].
-///
-/// The borrow keeps the arena frozen against mutation for its lifetime, which
-/// is exactly the guarantee callers want when reading.
-#[derive(Clone, Copy, Debug)]
-pub struct NodeRef<'a> {
-    node: &'a Node,
-}
-
-impl<'a> NodeRef<'a> {
-    /// What kind of node this is, with its kind-specific data.
-    ///
-    /// The returned reference lives as long as the [`Dom`] borrow behind
-    /// this view, not as long as the view itself.
-    #[must_use]
-    pub fn kind(&self) -> &'a NodeKind {
-        &self.node.kind
-    }
-}
-
 /// A document: every node lives inside one flat slot array.
 ///
 /// All access goes through [`NodeId`] handles. Handles outliving their node
-/// are harmless (lookups report absence), which is what will let the `QuickJS`
-/// binding layer hold handles across garbage-collection cycles without
-/// borrowing anything.
+/// are harmless (lookups report absence), which lets the `QuickJS` binding
+/// layer hold handles across garbage-collection cycles without borrowing
+/// anything.
 ///
 /// [`Send`] but deliberately not [`Sync`]: a `Dom` may be handed between
 /// workers, but two threads can never touch one simultaneously (one worker
-/// per document; see the dom-layer wayfinding tickets). The marker field below is
-/// what suppresses the otherwise-auto-derived `Sync`.
+/// per document). The marker field below is what suppresses the
+/// otherwise-auto-derived `Sync`.
 #[derive(Debug)]
 pub struct Dom {
     slots: Vec<Slot>,
     free: Vec<u32>,
     document: NodeId,
-    document_id: u32,
     quirks_mode: QuirksMode,
-    /// HTTP `Content-Language` (and later `document` language) default for
+    /// HTTP `Content-Language` and parsed `document` language default for
     /// `:lang()` when no `lang` / `xml:lang` is on the ancestor chain.
     document_language: Option<String>,
     /// `<template>` element → its contents fragment. Contents live outside
@@ -212,7 +191,6 @@ impl Dom {
             }],
             free: Vec::new(),
             document: NodeId::new(document_id, 0, 0),
-            document_id,
             quirks_mode: QuirksMode::NoQuirks,
             document_language: None,
             template_contents: HashMap::new(),
@@ -245,28 +223,27 @@ impl Dom {
         std::mem::take(&mut self.lifecycle)
     }
 
-    /// Records an element's transition from its previous connected state.
-    ///
-    /// Only `iframe` elements are tracked for now: they are the sole consumer
-    /// of connection transitions (content-navigable creation and destruction),
-    /// and filtering here keeps the parser's hot path free of per-element
-    /// bookkeeping. Custom elements will need an opt-in form of this hook.
-    fn record_transition(&mut self, id: NodeId, was_connected: bool) {
-        if !self.is_iframe_element(id) {
-            return;
-        }
-        let connected = self.is_connected(id);
-        if connected != was_connected {
-            if connected {
-                self.connected_iframes = self.connected_iframes.saturating_add(1);
-            } else {
-                self.connected_iframes = self.connected_iframes.saturating_sub(1);
+    /// Records every `iframe` connection transition in a snapshot taken
+    /// before an operation. Snapshots only ever carry iframe elements (see
+    /// [`Dom::connection_snapshot`]): they are the sole consumer of
+    /// connection transitions, and filtering in the snapshot keeps the
+    /// parser's hot path free of per-element bookkeeping. Custom elements
+    /// will need an opt-in form of this hook.
+    fn record_snapshot(&mut self, snapshot: Vec<(NodeId, bool)>) {
+        for (id, was_connected) in snapshot {
+            let connected = self.is_connected(id);
+            if connected != was_connected {
+                if connected {
+                    self.connected_iframes = self.connected_iframes.saturating_add(1);
+                } else {
+                    self.connected_iframes = self.connected_iframes.saturating_sub(1);
+                }
+                self.lifecycle.push(if connected {
+                    Lifecycle::Inserted(id)
+                } else {
+                    Lifecycle::Removed(id)
+                });
             }
-            self.lifecycle.push(if connected {
-                Lifecycle::Inserted(id)
-            } else {
-                Lifecycle::Removed(id)
-            });
         }
     }
 
@@ -280,7 +257,7 @@ impl Dom {
     #[must_use]
     pub fn is_iframe_element(&self, id: NodeId) -> bool {
         matches!(
-            self.get(id).map(|view| view.kind()),
+            self.kind(id),
             Some(NodeKind::Element { name, .. })
                 if name.ns == html_namespace() && name.local.as_ref() == "iframe"
         )
@@ -302,24 +279,15 @@ impl Dom {
         snapshot
     }
 
-    /// Records every transition in a snapshot taken before an operation.
-    fn record_snapshot(&mut self, snapshot: Vec<(NodeId, bool)>) {
-        for (id, was_connected) in snapshot {
-            self.record_transition(id, was_connected);
-        }
-    }
-
     /// Whether `id`'s ancestor chain reaches the document root.
     #[must_use]
     pub fn is_connected(&self, id: NodeId) -> bool {
-        let mut cursor = Some(id);
-        while let Some(node) = cursor {
-            if node == self.document {
-                return true;
-            }
-            cursor = self.parent(node);
-        }
-        false
+        id == self.document || self.ancestors(id).any(|ancestor| ancestor == self.document)
+    }
+
+    /// `id`'s ancestors, nearest first, `id` excluded.
+    pub fn ancestors(&self, id: NodeId) -> impl Iterator<Item = NodeId> + '_ {
+        std::iter::successors(self.parent(id), |&node| self.parent(node))
     }
 
     fn record(&mut self, mutation: Mutation) {
@@ -374,7 +342,7 @@ impl Dom {
     /// This document's arena id, for per-document renderer lookups.
     #[must_use]
     pub fn document_id(&self) -> u32 {
-        self.document_id
+        self.document.document_id()
     }
 
     /// Whether `id` names a currently live node.
@@ -386,12 +354,10 @@ impl Dom {
         self.live_slot(id).is_some()
     }
 
-    /// Borrows the live node `id` names, or `None` for a stale handle.
+    /// What kind of node `id` names, or `None` for a stale handle.
     #[must_use]
-    pub fn get(&self, id: NodeId) -> Option<NodeRef<'_>> {
-        self.live_slot(id)
-            .and_then(|slot| slot.node.as_ref())
-            .map(|node| NodeRef { node })
+    pub fn kind(&self, id: NodeId) -> Option<&NodeKind> {
+        Some(&self.live_slot(id)?.node.as_ref()?.kind)
     }
 
     /// The parent of `id`, or `None` if it is unparented or `id` is stale.
@@ -460,11 +426,7 @@ impl Dom {
     /// reachable runtime condition; the bound guards the handle width.
     pub fn create_element(&mut self, name: QualName, attributes: Vec<Attribute>) -> NodeId {
         let mut unique: Vec<Attribute> = Vec::with_capacity(attributes.len());
-        for attribute in attributes {
-            if !unique.iter().any(|kept| kept.name == attribute.name) {
-                unique.push(attribute);
-            }
-        }
+        merge_attrs(&mut unique, attributes);
         self.alloc(NodeKind::Element {
             name,
             attributes: unique,
@@ -535,8 +497,8 @@ impl Dom {
     /// Creates an empty document fragment, unattached like every fresh node.
     ///
     /// Fragments are containers outside the main tree: the contents root of
-    /// `<template>` elements (associated with [`Dom::set_template_contents`]) and,
-    /// later, the context node for `innerHTML`-style fragment parsing.
+    /// `<template>` elements (associated with [`Dom::set_template_contents`]) and
+    /// the context node for `innerHTML`-style fragment parsing.
     ///
     /// # Panics
     ///
@@ -559,7 +521,7 @@ impl Dom {
         if id == self.document {
             return Err(DomError::WrongNodeType);
         }
-        let copy = self.alloc(self.get(id).ok_or(DomError::StaleNode)?.kind().clone());
+        let copy = self.alloc(self.kind(id).ok_or(DomError::StaleNode)?.clone());
         let mut pending = vec![(id, copy)];
         while let Some((source, target)) = pending.pop() {
             // https://html.spec.whatwg.org/multipage/scripting.html#the-template-element:cloning-steps
@@ -577,8 +539,7 @@ impl Dom {
                     .copied()
                     .collect();
                 for kid in kids {
-                    let child =
-                        self.alloc(self.get(kid).ok_or(DomError::StaleNode)?.kind().clone());
+                    let child = self.alloc(self.kind(kid).ok_or(DomError::StaleNode)?.clone());
                     self.append(target, child)?;
                     pending.push((kid, child));
                 }
@@ -745,10 +706,7 @@ impl Dom {
         self.require_live(parent)?;
         self.require_live(node)?;
         self.require_live(child)?;
-        if !matches!(
-            self.get(parent).map(|view| view.kind()),
-            Some(NodeKind::Document | NodeKind::Element { .. } | NodeKind::Fragment)
-        ) {
+        if !self.can_contain_children(parent) {
             return Err(DomError::HierarchyRequest);
         }
         if self.would_cycle(node, parent) {
@@ -759,35 +717,13 @@ impl Dom {
         }
         // Same insertability gate as pre-insert
         // (<https://dom.spec.whatwg.org/#concept-node-ensure-pre-insert-validity>).
-        if !matches!(
-            self.get(node).map(|view| view.kind()),
-            Some(
-                NodeKind::Fragment
-                    | NodeKind::Doctype { .. }
-                    | NodeKind::Element { .. }
-                    | NodeKind::Text { .. }
-                    | NodeKind::CDataSection { .. }
-                    | NodeKind::ProcessingInstruction { .. }
-                    | NodeKind::Comment { .. }
-            )
-        ) {
+        if !self.is_insertable(node) {
             return Err(DomError::HierarchyRequest);
         }
-        if !matches!(
-            self.get(parent).map(|view| view.kind()),
-            Some(NodeKind::Document)
-        ) && !self.is_fragment(node)
-            && matches!(
-                self.get(node).map(|view| view.kind()),
-                Some(NodeKind::Doctype { .. })
-            )
-        {
+        if !self.is_document(parent) && !self.is_fragment(node) && self.is_doctype(node) {
             return Err(DomError::HierarchyRequest);
         }
-        if matches!(
-            self.get(parent).map(|view| view.kind()),
-            Some(NodeKind::Document)
-        ) {
+        if self.is_document(parent) {
             let incoming = self.incoming_nodes(node);
             let mut sequence: Vec<NodeId> = Vec::new();
             for &existing in self.children(parent).into_iter().flatten() {
@@ -856,10 +792,7 @@ impl Dom {
         node: NodeId,
         reference: Option<NodeId>,
     ) -> Result<(), DomError> {
-        if !matches!(
-            self.get(parent).map(|view| view.kind()),
-            Some(NodeKind::Document | NodeKind::Element { .. } | NodeKind::Fragment)
-        ) {
+        if !self.can_contain_children(parent) {
             return Err(DomError::HierarchyRequest);
         }
         if self.would_cycle(node, parent) {
@@ -896,10 +829,7 @@ impl Dom {
         reference: Option<NodeId>,
     ) -> Result<(), DomError> {
         self.ensure_alive(parent, node)?;
-        if !matches!(
-            self.get(parent).map(|view| view.kind()),
-            Some(NodeKind::Document | NodeKind::Element { .. } | NodeKind::Fragment)
-        ) {
+        if !self.can_contain_children(parent) {
             return Err(DomError::HierarchyRequest);
         }
         if self.would_cycle(node, parent) {
@@ -947,27 +877,13 @@ impl Dom {
     ) -> Result<(), DomError> {
         // Container kinds only. Leaves with a child list would be arena corruption.
         // Kind stays borrowed: this gate is on the parse hot path.
-        if !matches!(
-            self.get(parent).map(|view| view.kind()),
-            Some(NodeKind::Document | NodeKind::Element { .. } | NodeKind::Fragment)
-        ) {
+        if !self.can_contain_children(parent) {
             return Err(DomError::HierarchyRequest);
         }
         // Only DocumentFragment, DocumentType, Element, and CharacterData
         // nodes are insertable; a Document node is refused here
         // (<https://dom.spec.whatwg.org/#concept-node-ensure-pre-insert-validity> step 4).
-        if !matches!(
-            self.get(node).map(|view| view.kind()),
-            Some(
-                NodeKind::Fragment
-                    | NodeKind::Doctype { .. }
-                    | NodeKind::Element { .. }
-                    | NodeKind::Text { .. }
-                    | NodeKind::CDataSection { .. }
-                    | NodeKind::ProcessingInstruction { .. }
-                    | NodeKind::Comment { .. }
-            )
-        ) {
+        if !self.is_insertable(node) {
             return Err(DomError::HierarchyRequest);
         }
         // Reference-child membership (the reference belongs to `parent`) is
@@ -986,16 +902,8 @@ impl Dom {
         // inserted node is never welcome; a fragment's children are not
         // checked here (the spec returns after the doctype-on-node
         // test: <https://dom.spec.whatwg.org/#concept-node-ensure-pre-insert-validity>).
-        if !matches!(
-            self.get(parent).map(|view| view.kind()),
-            Some(NodeKind::Document)
-        ) {
-            if !self.is_fragment(node)
-                && matches!(
-                    self.get(node).map(|view| view.kind()),
-                    Some(NodeKind::Doctype { .. })
-                )
-            {
+        if !self.is_document(parent) {
+            if !self.is_fragment(node) && self.is_doctype(node) {
                 return Err(DomError::HierarchyRequest);
             }
             return Ok(());
@@ -1082,10 +990,7 @@ impl Dom {
         }
         // Both endpoints accept children, or the move would strand nodes under leaves.
         for endpoint in [from, to] {
-            if !matches!(
-                self.get(endpoint).map(|view| view.kind()),
-                Some(NodeKind::Document | NodeKind::Element { .. } | NodeKind::Fragment)
-            ) {
+            if !self.can_contain_children(endpoint) {
                 return Err(DomError::HierarchyRequest);
             }
         }
@@ -1097,10 +1002,7 @@ impl Dom {
         if self.would_cycle(from, to) {
             return Err(DomError::CycleForbidden);
         }
-        if matches!(
-            self.get(to).map(|view| view.kind()),
-            Some(NodeKind::Document)
-        ) {
+        if self.is_document(to) {
             // The model sees the whole *resulting sequence*: the document's
             // standing children followed by the moved run.
             let mut sequence: Vec<NodeId> = Vec::new();
@@ -1156,7 +1058,7 @@ impl Dom {
         let mut element_seen = false;
         let mut doctype_seen = false;
         for &id in sequence {
-            match self.get(id).map(|view| view.kind()) {
+            match self.kind(id) {
                 Some(NodeKind::Element { .. }) => {
                     if element_seen {
                         return Err(DomError::HierarchyRequest);
@@ -1191,15 +1093,8 @@ impl Dom {
         id: NodeId,
         attrs: Vec<Attribute>,
     ) -> Result<(), DomError> {
-        let node = self.node_mut(id).ok_or(DomError::StaleNode)?;
-        let NodeKind::Element { attributes, .. } = &mut node.kind else {
-            return Err(DomError::WrongNodeType);
-        };
-        for attr in attrs {
-            if !attributes.iter().any(|existing| existing.name == attr.name) {
-                attributes.push(attr);
-            }
-        }
+        let (_, attributes) = self.element_mut(id)?;
+        merge_attrs(attributes, attrs);
         Ok(())
     }
 
@@ -1225,36 +1120,31 @@ impl Dom {
     /// exact namespace and local-name match, prefix ignored.
     #[must_use]
     pub fn attribute_ns(&self, id: NodeId, ns: &str, local: &str) -> Option<String> {
-        match self.get(id).map(|node| node.kind()) {
-            Some(NodeKind::Element { attributes, .. }) => attributes.iter().find_map(|attribute| {
-                (attribute.name.ns.as_ref() == ns && attribute.name.local.as_ref() == local)
-                    .then(|| attribute.value.clone())
-            }),
-            _ => None,
-        }
+        self.element(id)?.1.iter().find_map(|attribute| {
+            (attribute.name.ns.as_ref() == ns && attribute.name.local.as_ref() == local)
+                .then(|| attribute.value.clone())
+        })
     }
 
     /// [Element.getAttributeNames](https://dom.spec.whatwg.org/#dom-element-getattributenames):
     /// qualified names in attribute order.
     #[must_use]
     pub fn attribute_names(&self, id: NodeId) -> Vec<String> {
-        match self.get(id).map(|node| node.kind()) {
-            Some(NodeKind::Element { attributes, .. }) => attributes
-                .iter()
-                .map(|attribute| Self::serialize_qualified_name(&attribute.name))
-                .collect(),
-            _ => Vec::new(),
-        }
+        self.element(id)
+            .map(|(_, attributes)| {
+                attributes
+                    .iter()
+                    .map(|attribute| Self::serialize_qualified_name(&attribute.name))
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     /// The element's attribute list, or `None` when `id` is stale or not an
     /// element. Used by the `NamedNodeMap` platform object.
     #[must_use]
     pub fn attributes(&self, id: NodeId) -> Option<&[Attribute]> {
-        match self.get(id).map(|node| node.kind()) {
-            Some(NodeKind::Element { attributes, .. }) => Some(attributes),
-            _ => None,
-        }
+        self.element(id).map(|(_, attributes)| attributes)
     }
 
     /// [Element.removeAttribute](https://dom.spec.whatwg.org/#dom-element-removeattribute).
@@ -1264,36 +1154,24 @@ impl Dom {
     /// - [`DomError::StaleNode`] if `id` is stale.
     /// - [`DomError::WrongNodeType`] if `id` is not an element.
     pub fn remove_attribute(&mut self, id: NodeId, local: &str) -> Result<(), DomError> {
-        let node = self.node_mut(id).ok_or(DomError::StaleNode)?;
-        let NodeKind::Element { name, attributes } = &mut node.kind else {
-            return Err(DomError::WrongNodeType);
+        let (name, attributes) = self.element_mut(id)?;
+        let Some(index) = attributes
+            .iter()
+            .position(|attribute| Self::attr_query_eq(&name.ns, &attribute.name, local))
+        else {
+            return Ok(());
         };
-        let mut removed = false;
-        let mut removed_value = None;
-        let mut recorded_name = String::new();
-        let mut recorded_namespace = String::new();
-        attributes.retain(|attribute| {
-            if !removed && Self::attr_query_eq(&name.ns, &attribute.name, local) {
-                removed = true;
-                removed_value = Some(attribute.value.clone());
-                // `MutationRecord.attributeName` is the attribute's local
-                // name and `attributeNamespace` its namespace, not the
-                // queried qualified name
-                // (<https://dom.spec.whatwg.org/#dom-mutationrecord-attributename>).
-                recorded_name = attribute.name.local.to_string();
-                recorded_namespace = attribute.name.ns.to_string();
-                return false;
-            }
-            true
+        let removed = attributes.remove(index);
+        // `MutationRecord.attributeName` is the attribute's local
+        // name and `attributeNamespace` its namespace, not the
+        // queried qualified name
+        // (<https://dom.spec.whatwg.org/#dom-mutationrecord-attributename>).
+        self.record(Mutation::Attributes {
+            target: id,
+            name: removed.name.local.to_string(),
+            namespace: removed.name.ns.to_string(),
+            old_value: Some(removed.value),
         });
-        if removed {
-            self.record(Mutation::Attributes {
-                target: id,
-                name: recorded_name,
-                namespace: recorded_namespace,
-                old_value: removed_value,
-            });
-        }
         Ok(())
     }
 
@@ -1309,29 +1187,19 @@ impl Dom {
         ns: &str,
         local: &str,
     ) -> Result<(), DomError> {
-        let removed_value = {
-            let node = self.node_mut(id).ok_or(DomError::StaleNode)?;
-            let NodeKind::Element { attributes, .. } = &mut node.kind else {
-                return Err(DomError::WrongNodeType);
-            };
-            let mut removed = None;
-            attributes.retain(|attribute| {
-                if attribute.name.ns.as_ref() == ns && attribute.name.local.as_ref() == local {
-                    removed = Some(attribute.value.clone());
-                    return false;
-                }
-                true
-            });
-            removed
+        let (_, attributes) = self.element_mut(id)?;
+        let Some(index) = attributes.iter().position(|attribute| {
+            attribute.name.ns.as_ref() == ns && attribute.name.local.as_ref() == local
+        }) else {
+            return Ok(());
         };
-        if removed_value.is_some() {
-            self.record(Mutation::Attributes {
-                target: id,
-                name: local.to_owned(),
-                namespace: ns.to_owned(),
-                old_value: removed_value,
-            });
-        }
+        let removed = attributes.remove(index);
+        self.record(Mutation::Attributes {
+            target: id,
+            name: local.to_owned(),
+            namespace: ns.to_owned(),
+            old_value: Some(removed.value),
+        });
         Ok(())
     }
 
@@ -1348,27 +1216,16 @@ impl Dom {
     /// - [`DomError::CycleForbidden`] if `node` is an ancestor of `parent`.
     pub fn replace_all(&mut self, parent: NodeId, node: NodeId) -> Result<(), DomError> {
         self.ensure_alive(parent, node)?;
-        if !matches!(
-            self.get(parent).map(|view| view.kind()),
-            Some(NodeKind::Document | NodeKind::Element { .. } | NodeKind::Fragment)
-        ) {
+        if !self.can_contain_children(parent) {
             return Err(DomError::HierarchyRequest);
         }
         if self.would_cycle(node, parent) {
             return Err(DomError::CycleForbidden);
         }
-        if matches!(
-            self.get(parent).map(|view| view.kind()),
-            Some(NodeKind::Document)
-        ) {
+        if self.is_document(parent) {
             let incoming = self.incoming_nodes(node);
             self.ensure_document_content_model(&incoming)?;
-        } else if !self.is_fragment(node)
-            && matches!(
-                self.get(node).map(|view| view.kind()),
-                Some(NodeKind::Doctype { .. })
-            )
-        {
+        } else if !self.is_fragment(node) && self.is_doctype(node) {
             return Err(DomError::HierarchyRequest);
         }
         let parent_connected = self.is_connected(parent);
@@ -1434,21 +1291,13 @@ impl Dom {
         local: &str,
         value: impl Into<String>,
     ) -> Result<(), DomError> {
-        let node = self.node_mut(id).ok_or(DomError::StaleNode)?;
-        let NodeKind::Element { attributes, .. } = &mut node.kind else {
-            return Err(DomError::WrongNodeType);
-        };
         let value = value.into();
-        let old_value = attributes
-            .iter()
-            .find(|attribute| {
-                attribute.name.ns.as_ref() == namespace && attribute.name.local.as_ref() == local
-            })
-            .map(|attribute| attribute.value.clone());
-        if let Some(existing) = attributes.iter_mut().find(|attribute| {
+        let (_, attributes) = self.element_mut(id)?;
+        let index = attributes.iter().position(|attribute| {
             attribute.name.ns.as_ref() == namespace && attribute.name.local.as_ref() == local
-        }) {
-            existing.value = value;
+        });
+        let old_value = if let Some(index) = index {
+            Some(std::mem::replace(&mut attributes[index].value, value))
         } else {
             attributes.push(Attribute {
                 name: QualName::new(
@@ -1458,7 +1307,8 @@ impl Dom {
                 ),
                 value,
             });
-        }
+            None
+        };
         self.record(Mutation::Attributes {
             target: id,
             name: local.to_owned(),
@@ -1483,25 +1333,19 @@ impl Dom {
         name: QualName,
         value: impl Into<String>,
     ) -> Result<(), DomError> {
-        let node = self.node_mut(id).ok_or(DomError::StaleNode)?;
-        let NodeKind::Element { attributes, .. } = &mut node.kind else {
-            return Err(DomError::WrongNodeType);
-        };
         let value = value.into();
         let recorded_name = name.local.to_string();
         let recorded_namespace = name.ns.to_string();
-        let old_value = attributes
+        let (_, attributes) = self.element_mut(id)?;
+        let index = attributes
             .iter()
-            .find(|attribute| attribute.name == name)
-            .map(|attribute| attribute.value.clone());
-        if let Some(existing) = attributes
-            .iter_mut()
-            .find(|attribute| attribute.name == name)
-        {
-            existing.value = value;
+            .position(|attribute| attribute.name == name);
+        let old_value = if let Some(index) = index {
+            Some(std::mem::replace(&mut attributes[index].value, value))
         } else {
             attributes.push(Attribute { name, value });
-        }
+            None
+        };
         self.record(Mutation::Attributes {
             target: id,
             name: recorded_name,
@@ -1526,12 +1370,9 @@ impl Dom {
         local: &str,
         value: impl Into<String>,
     ) -> Result<(), DomError> {
-        let node = self.node_mut(id).ok_or(DomError::StaleNode)?;
-        let NodeKind::Element { name, attributes } = &mut node.kind else {
-            return Err(DomError::WrongNodeType);
-        };
-        let html = name.ns == html_namespace();
         let value = value.into();
+        let (name, attributes) = self.element_mut(id)?;
+        let html = name.ns == html_namespace();
         let existing = attributes
             .iter()
             .position(|attribute| Self::attr_query_eq(&name.ns, &attribute.name, local));
@@ -1709,7 +1550,7 @@ impl Dom {
     // ── internals ────────────────────────────────────────────────────────
 
     fn live_slot(&self, id: NodeId) -> Option<&Slot> {
-        if id.document != self.document_id {
+        if id.document != self.document.document {
             return None;
         }
         self.slots
@@ -1718,7 +1559,7 @@ impl Dom {
     }
 
     fn node_mut(&mut self, id: NodeId) -> Option<&mut Node> {
-        if id.document != self.document_id {
+        if id.document != self.document.document {
             return None;
         }
         self.slots
@@ -1727,11 +1568,59 @@ impl Dom {
             .and_then(|slot| slot.node.as_mut())
     }
 
-    fn is_fragment(&self, id: NodeId) -> bool {
+    /// Whether `id` is one of the container kinds that may hold children.
+    fn can_contain_children(&self, id: NodeId) -> bool {
         matches!(
-            self.get(id).map(|view| view.kind()),
-            Some(NodeKind::Fragment)
+            self.kind(id),
+            Some(NodeKind::Document | NodeKind::Element { .. } | NodeKind::Fragment)
         )
+    }
+
+    /// The kinds DOM's *ensure pre-insert validity* accepts as an inserted
+    /// node: everything but a document
+    /// (<https://dom.spec.whatwg.org/#concept-node-ensure-pre-insert-validity>).
+    fn is_insertable(&self, id: NodeId) -> bool {
+        matches!(
+            self.kind(id),
+            Some(
+                NodeKind::Fragment
+                    | NodeKind::Doctype { .. }
+                    | NodeKind::Element { .. }
+                    | NodeKind::Text { .. }
+                    | NodeKind::CDataSection { .. }
+                    | NodeKind::ProcessingInstruction { .. }
+                    | NodeKind::Comment { .. }
+            )
+        )
+    }
+
+    fn is_document(&self, id: NodeId) -> bool {
+        matches!(self.kind(id), Some(NodeKind::Document))
+    }
+
+    fn is_doctype(&self, id: NodeId) -> bool {
+        matches!(self.kind(id), Some(NodeKind::Doctype { .. }))
+    }
+
+    fn is_fragment(&self, id: NodeId) -> bool {
+        matches!(self.kind(id), Some(NodeKind::Fragment))
+    }
+
+    /// The element's qualified name and attribute list, or `None` when `id`
+    /// is stale or not an element.
+    pub(crate) fn element(&self, id: NodeId) -> Option<(&QualName, &[Attribute])> {
+        match self.kind(id)? {
+            NodeKind::Element { name, attributes } => Some((name, attributes)),
+            _ => None,
+        }
+    }
+
+    /// Mutable variant of [`Dom::element`] for the attribute mutators.
+    fn element_mut(&mut self, id: NodeId) -> Result<(&QualName, &mut Vec<Attribute>), DomError> {
+        match &mut self.node_mut(id).ok_or(DomError::StaleNode)?.kind {
+            NodeKind::Element { name, attributes } => Ok((name, attributes)),
+            _ => Err(DomError::WrongNodeType),
+        }
     }
 
     /// A qualified name's serialization: `prefix:local` or just `local`.
@@ -1750,23 +1639,19 @@ impl Dom {
         }
     }
 
-    /// The element's own unnamespaced attribute whose local name matches
-    /// `local`; HTML elements ASCII-lowercase the queried name first
-    /// ([DOM has-attribute](https://dom.spec.whatwg.org/#concept-element-attribute-has)).
-    /// The first attribute on `id` whose **qualified name** is `local`; HTML
-    /// elements ASCII-lowercase the queried name first
+    /// The first attribute on `id` whose **qualified name** matches `local`
+    /// under the element's case regime; HTML elements ASCII-lowercase the
+    /// queried name first
     /// ([DOM get-an-attribute-by-name](https://dom.spec.whatwg.org/#concept-element-attributes-get-by-name)).
     fn find_attribute<'a>(&'a self, id: NodeId, local: &str) -> Option<&'a Attribute> {
-        let NodeKind::Element { name, attributes } = self.get(id)?.kind() else {
-            return None;
-        };
+        let (name, attributes) = self.element(id)?;
         attributes
             .iter()
             .find(|attribute| Self::attr_query_eq(&name.ns, &attribute.name, local))
     }
 
     fn is_html_template_element(&self, id: NodeId) -> bool {
-        match self.get(id).map(|view| view.kind()) {
+        match self.kind(id) {
             Some(NodeKind::Element { name, .. }) => {
                 name.ns == html_namespace() && name.local.as_ref().eq_ignore_ascii_case("template")
             }
@@ -1793,9 +1678,8 @@ impl Dom {
         let tracked = self.connection_snapshot(node);
         self.unlink_from_current_parent(node);
         // Insertion index; `None` appends. The sibling references for the
-        // mutation record are computed only while recording: the child-list
-        // copy this used to do was per-insert overhead on the parse path,
-        // where no observer exists.
+        // mutation record are computed only while recording: no observer
+        // exists on the parse path, so the lookup stays off it.
         let position = before.map(|sibling| {
             self.children(parent)
                 .expect("verified-live parent has no child list")
@@ -1911,11 +1795,8 @@ impl Dom {
     }
 
     fn ensure_alive(&self, a: NodeId, b: NodeId) -> Result<(), DomError> {
-        if self.contains(a) && self.contains(b) {
-            Ok(())
-        } else {
-            Err(DomError::StaleNode)
-        }
+        self.require_live(a)?;
+        self.require_live(b)
     }
 
     /// Single-handle variant of [`Dom::ensure_alive`].
@@ -2056,7 +1937,7 @@ impl Dom {
                 generation,
                 node: Some(node),
             };
-            return NodeId::new(self.document_id, slot, generation);
+            return NodeId::new(self.document.document, slot, generation);
         }
         // The bound is the `u32` handle width itself; exhausting it requires
         // >4 billion slots (hundreds of GB of arena), an impossible runtime
@@ -2070,6 +1951,17 @@ impl Dom {
             generation: 0,
             node: Some(node),
         });
-        NodeId::new(self.document_id, slot, 0)
+        NodeId::new(self.document.document, slot, 0)
+    }
+}
+
+/// Adds each attribute whose qualified name is not already present; the
+/// first occurrence wins, matching the DOM's name-keyed attribute list
+/// (<https://dom.spec.whatwg.org/#concept-attribute>).
+fn merge_attrs(attributes: &mut Vec<Attribute>, attrs: impl IntoIterator<Item = Attribute>) {
+    for attr in attrs {
+        if !attributes.iter().any(|existing| existing.name == attr.name) {
+            attributes.push(attr);
+        }
     }
 }

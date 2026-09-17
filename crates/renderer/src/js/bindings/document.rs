@@ -52,7 +52,7 @@ pub(crate) fn element_is_html(ctx: &Ctx<'_>, id: NodeId) -> bool {
     let parsed = world.borrow();
     parsed.with_document(id, |parsed| {
         matches!(
-            parsed.dom.get(id).map(|node| node.kind()),
+            parsed.dom.kind(id),
             Some(NodeKind::Element { name, .. }) if name.ns == html_namespace()
         )
     }) == Some(true)

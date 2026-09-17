@@ -6,6 +6,8 @@ use std::cell::RefCell;
 
 use std::rc::Rc;
 
+use dom::NodeId;
+
 use rquickjs::{Ctx, Object, Persistent, Result, Value};
 
 use crate::js::world::World;
@@ -499,12 +501,7 @@ pub(crate) fn get_node_handler<'js>(
     name: String,
 ) -> Result<Value<'js>> {
     let id = handler_target(&ctx, &node)?;
-    let world = world_for_node(&ctx, id)?;
-    let saved = world.borrow().handler_attribute(Some(id), &name);
-    match saved {
-        Some(saved) => saved.restore(&ctx),
-        None => Ok(Value::new_null(ctx)),
-    }
+    get_handler(&ctx, Some(id), &name)
 }
 
 #[allow(
@@ -518,16 +515,7 @@ pub(crate) fn set_node_handler<'js>(
     value: Value<'js>,
 ) -> Result<()> {
     let id = handler_target(&ctx, &node)?;
-    let world = world_for_node(&ctx, id)?;
-    let saved = if value.is_null() || value.is_undefined() {
-        None
-    } else {
-        Some(Persistent::save(&ctx, value))
-    };
-    world
-        .borrow_mut()
-        .set_handler_attribute(Some(id), &name, saved);
-    Ok(())
+    set_handler(&ctx, Some(id), &name, value)
 }
 
 #[allow(
@@ -535,12 +523,7 @@ pub(crate) fn set_node_handler<'js>(
     reason = "rquickjs Func ABI passes Ctx and owned arguments by value"
 )]
 pub(crate) fn get_window_handler(ctx: Ctx<'_>, name: String) -> Result<Value<'_>> {
-    let world = world(&ctx)?;
-    let saved = world.borrow().handler_attribute(None, &name);
-    match saved {
-        Some(saved) => saved.restore(&ctx),
-        None => Ok(Value::new_null(ctx)),
-    }
+    get_handler(&ctx, None, &name)
 }
 
 #[allow(
@@ -552,13 +535,44 @@ pub(crate) fn set_window_handler<'js>(
     name: String,
     value: Value<'js>,
 ) -> Result<()> {
-    let world = world(&ctx)?;
+    set_handler(&ctx, None, &name, value)
+}
+
+/// The stored value of the handler property `name` on the window (`None`
+/// target) or on `target`.
+fn get_handler<'js>(
+    ctx: &Ctx<'js>,
+    target: Option<NodeId>,
+    name: &str,
+) -> Result<Value<'js>> {
+    let world = match target {
+        Some(id) => world_for_node(ctx, id)?,
+        None => world(ctx)?,
+    };
+    match world.borrow().handler_attribute(target, name) {
+        Some(saved) => saved.restore(ctx),
+        None => Ok(Value::new_null(ctx.clone())),
+    }
+}
+
+/// Stores the handler property `name` on the window (`None` target) or on
+/// `target`; `null` and `undefined` clear it.
+fn set_handler<'js>(
+    ctx: &Ctx<'js>,
+    target: Option<NodeId>,
+    name: &str,
+    value: Value<'js>,
+) -> Result<()> {
+    let world = match target {
+        Some(id) => world_for_node(ctx, id)?,
+        None => world(ctx)?,
+    };
     let saved = if value.is_null() || value.is_undefined() {
         None
     } else {
-        Some(Persistent::save(&ctx, value))
+        Some(Persistent::save(ctx, value))
     };
-    world.borrow_mut().set_handler_attribute(None, &name, saved);
+    world.borrow_mut().set_handler_attribute(target, name, saved);
     Ok(())
 }
 

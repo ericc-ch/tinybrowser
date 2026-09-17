@@ -340,7 +340,7 @@ pub(super) fn webdriver_element(ctx: Ctx<'_>, remote_id: f64) -> Result<Value<'_
     let valid = world.borrow().document(node).is_some_and(|parsed| {
         parsed.dom.is_connected(node)
             && matches!(
-                parsed.dom.get(node).map(|entry| entry.kind()),
+                parsed.dom.kind(node),
                 Some(NodeKind::Element { .. })
             )
     });
@@ -383,28 +383,19 @@ pub(super) fn element_index(ctx: &Ctx<'_>, node: NodeId) -> Result<Option<f64>> 
     let Some(parsed) = world.document(node) else {
         return Ok(None);
     };
+    let root = parsed.dom.document();
     let mut index = 0.0;
-    let found = walk_element_index(&parsed.dom, parsed.dom.document(), node, &mut index);
-    Ok(found.then_some(index))
-}
-
-fn walk_element_index(dom: &dom::Dom, root: NodeId, target: NodeId, index: &mut f64) -> bool {
-    // Iterative so a deeply nested document cannot overflow the stack.
-    let mut stack = vec![root];
-    while let Some(current) = stack.pop() {
-        if current == target {
-            return true;
+    // The root itself is a candidate: `element_index` answers for any node,
+    // and `descendants` excludes its scope.
+    for current in std::iter::once(root).chain(parsed.dom.descendants(root)) {
+        if current == node {
+            return Ok(Some(index));
         }
-        if let Some(NodeKind::Element { .. }) = dom.get(current).map(|node| node.kind()) {
-            *index += 1.0;
-        }
-        if let Some(children) = dom.children(current) {
-            for child in children.rev() {
-                stack.push(*child);
-            }
+        if is_element(&parsed.dom, current) {
+            index += 1.0;
         }
     }
-    false
+    Ok(None)
 }
 
 /// The deepest element whose virtual box contains the point, if any. This is
@@ -424,7 +415,7 @@ pub(super) fn element_at_point(
     let mut best: Option<(usize, NodeId)> = None;
     let mut stack = vec![(parsed.dom.document(), 0usize)];
     while let Some((current, depth)) = stack.pop() {
-        if let Some(NodeKind::Element { .. }) = parsed.dom.get(current).map(|node| node.kind()) {
+        if let Some(NodeKind::Element { .. }) = parsed.dom.kind(current) {
             let (left, top, width, height) = virtual_rect(index);
             index += 1.0;
             if x >= left
@@ -482,6 +473,21 @@ pub(crate) fn wrap_node<'js>(ctx: &Ctx<'js>, id: NodeId) -> Result<Value<'js>> {
         .borrow()
         .intern_shared_wrapper(id, Persistent::save(ctx, weak));
     Ok(value)
+}
+
+/// Publishes `parsed` as a new document of this realm's world and wraps its
+/// root.
+pub(super) fn wrap_new_document<'js>(
+    ctx: &Ctx<'js>,
+    parsed: crate::Parsed,
+) -> Result<Value<'js>> {
+    let world_rc = world(ctx)?;
+    let root = world_rc.borrow_mut().add_document(parsed);
+    let registry = world_rc.borrow().registry();
+    registry
+        .borrow_mut()
+        .insert_document(root.document_id(), &world_rc);
+    wrap_node(ctx, root)
 }
 
 fn instantiate_node<'js>(ctx: &Ctx<'js>, id: NodeId) -> Result<Value<'js>> {
@@ -747,7 +753,7 @@ fn install_dom_exception_codes(ctx: &Ctx<'_>) -> Result<()> {
     )?;
     let ctor: Object = ctx.globals().get("DOMException")?;
     let proto: Object = ctor.get("prototype")?;
-    for (name, code) in DOM_EXCEPTION_CODES {
+    for (name, _, code) in DOM_EXCEPTION_CODES {
         ctor.set(name, code)?;
         proto.set(name, code)?;
     }
@@ -781,7 +787,7 @@ pub(super) fn with_node_kind<T>(
     let Some(parsed) = parsed.document(id) else {
         return Err(Exception::throw_type(ctx, "no document"));
     };
-    Ok(read(parsed.dom.get(id).map(|node| node.kind())))
+    Ok(read(parsed.dom.kind(id)))
 }
 
 pub(crate) fn character_data(ctx: &Ctx<'_>, id: NodeId) -> Result<String> {
@@ -796,6 +802,16 @@ pub(crate) fn character_data(ctx: &Ctx<'_>, id: NodeId) -> Result<String> {
     })
 }
 
+/// The value of `id`'s attribute `local`, or the empty string.
+pub(super) fn attribute_value(ctx: &Ctx<'_>, id: NodeId, local: &str) -> Result<String> {
+    let world = world(ctx)?;
+    Ok(world
+        .borrow()
+        .document(id)
+        .and_then(|parsed| parsed.dom.attribute(id, local))
+        .unwrap_or_default())
+}
+
 /// [Replaces data](https://dom.spec.whatwg.org/#concept-cd-replace) on a
 /// `CharacterData` node; other kinds are a silent no-op (`nodeValue` setter).
 pub(super) fn set_character_data(ctx: &Ctx<'_>, id: NodeId, data: String) -> Result<()> {
@@ -804,7 +820,7 @@ pub(super) fn set_character_data(ctx: &Ctx<'_>, id: NodeId, data: String) -> Res
     let Some(mut parsed) = world.document_mut(id) else {
         return Ok(());
     };
-    match parsed.dom.get(id).map(|node| node.kind()) {
+    match parsed.dom.kind(id) {
         Some(NodeKind::Text { .. }) => {
             parsed
                 .dom
@@ -910,6 +926,9 @@ pub(super) fn string_value<'js>(ctx: &Ctx<'js>, text: &str) -> Result<Value<'js>
 
 /// [Descendant text content](https://dom.spec.whatwg.org/#concept-descendant-text-content):
 /// the data of all `Text` descendants in tree order.
+///
+/// Descends only into elements and fragments: a `Document` or other
+/// non-container child contributes nothing, so its subtree is not entered.
 pub(super) fn descendant_text(dom: &dom::Dom, id: NodeId) -> String {
     let mut text = String::new();
     let mut stack: Vec<NodeId> = dom
@@ -918,7 +937,7 @@ pub(super) fn descendant_text(dom: &dom::Dom, id: NodeId) -> String {
         .unwrap_or_default();
     stack.reverse();
     while let Some(current) = stack.pop() {
-        match dom.get(current).map(|node| node.kind()) {
+        match dom.kind(current) {
             Some(NodeKind::Text { data } | NodeKind::CDataSection { data }) => text.push_str(data),
             Some(NodeKind::Element { .. } | NodeKind::Fragment) => {
                 if let Some(kids) = dom.children(current) {
@@ -939,10 +958,10 @@ pub(super) fn nodes_equal(dom: &dom::Dom, a: NodeId, b: NodeId) -> bool {
     if a == b {
         return true;
     }
-    let (Some(first), Some(second)) = (dom.get(a), dom.get(b)) else {
+    let (Some(first), Some(second)) = (dom.kind(a), dom.kind(b)) else {
         return false;
     };
-    let equal = match (first.kind(), second.kind()) {
+    let equal = match (first, second) {
         (NodeKind::Document, NodeKind::Document) | (NodeKind::Fragment, NodeKind::Fragment) => true,
         (
             NodeKind::Doctype {
@@ -992,18 +1011,11 @@ pub(super) fn nodes_equal(dom: &dom::Dom, a: NodeId, b: NodeId) -> bool {
     if !equal {
         return false;
     }
-    let kids_a: Vec<NodeId> = dom
-        .children(a)
-        .map(|kids| kids.copied().collect())
-        .unwrap_or_default();
-    let kids_b: Vec<NodeId> = dom
-        .children(b)
-        .map(|kids| kids.copied().collect())
-        .unwrap_or_default();
+    let kids_a = dom.children(a).expect("live node has no child list");
+    let kids_b = dom.children(b).expect("live node has no child list");
     kids_a.len() == kids_b.len()
         && kids_a
-            .iter()
-            .zip(&kids_b)
+            .zip(kids_b)
             .all(|(&first, &second)| nodes_equal(dom, first, second))
 }
 
@@ -1016,7 +1028,7 @@ pub(super) fn locate_namespace(
 ) -> Option<Namespace> {
     let mut cursor = Some(cursor);
     while let Some(id) = cursor {
-        if let Some(NodeKind::Element { name, .. }) = dom.get(id).map(|node| node.kind()) {
+        if let Some(NodeKind::Element { name, .. }) = dom.kind(id) {
             let actual = name
                 .prefix
                 .as_ref()
@@ -1036,7 +1048,7 @@ pub(super) fn locate_namespace(
 pub(super) fn locate_prefix(dom: &dom::Dom, cursor: NodeId, namespace: &str) -> Option<String> {
     let mut cursor = Some(cursor);
     while let Some(id) = cursor {
-        if let Some(NodeKind::Element { name, attributes }) = dom.get(id).map(|node| node.kind()) {
+        if let Some(NodeKind::Element { name, attributes }) = dom.kind(id) {
             if name.ns.as_ref() == namespace
                 && let Some(prefix) = name.prefix.as_ref().filter(|prefix| !prefix.is_empty())
             {
@@ -1095,7 +1107,7 @@ pub(super) fn create_element_named<'js>(
     document: NodeId,
     name: QualName,
 ) -> Result<Value<'js>> {
-    let is_template = name.ns == html_namespace() && name.local.as_ref() == "template";
+    let is_template = is_html_name(&name, "template");
     let world = world(ctx)?;
     let world = world.borrow();
     let Some(mut parsed) = world.document_mut(document) else {
@@ -1335,105 +1347,78 @@ fn collect_by_tag(dom: &dom::Dom, scope: NodeId, name: &str) -> Vec<NodeId> {
     // name ASCII-lowercased; other elements match the name exactly
     // (<https://dom.spec.whatwg.org/#concept-getelementsbytagname>).
     let lowered = name.to_ascii_lowercase();
-    let mut out = Vec::new();
-    let mut stack: Vec<NodeId> = dom
-        .children(scope)
-        .map(|kids| kids.copied().collect())
-        .unwrap_or_default();
-    stack.reverse();
-    while let Some(id) = stack.pop() {
-        if let Some(NodeKind::Element { name: qual, .. }) = dom.get(id).map(|node| node.kind()) {
-            let matches = if qual.ns == html_namespace() {
-                qualified_name_eq(qual, &lowered)
-            } else {
-                qualified_name_eq(qual, name)
+    dom.descendants(scope)
+        .filter(|&id| {
+            let Some(NodeKind::Element { name: qual, .. }) = dom.kind(id) else {
+                return false;
             };
-            if name == "*" || matches {
-                out.push(id);
-            }
-        }
-        if let Some(kids) = dom.children(id) {
-            let mut kids: Vec<_> = kids.copied().collect();
-            kids.reverse();
-            stack.extend(kids);
-        }
-    }
-    out
+            name == "*"
+                || if qual.ns == html_namespace() {
+                    qualified_name_eq(qual, &lowered)
+                } else {
+                    qualified_name_eq(qual, name)
+                }
+        })
+        .collect()
 }
 
 fn collect_by_name(dom: &dom::Dom, scope: NodeId, name: &str) -> Vec<NodeId> {
-    let mut out = Vec::new();
-    let mut stack: Vec<NodeId> = dom
-        .children(scope)
-        .map(|kids| kids.copied().collect())
-        .unwrap_or_default();
-    stack.reverse();
-    while let Some(id) = stack.pop() {
-        if is_element(dom, id) && dom.attribute(id, "name").as_deref() == Some(name) {
-            out.push(id);
-        }
-        if let Some(kids) = dom.children(id) {
-            let mut kids: Vec<_> = kids.copied().collect();
-            kids.reverse();
-            stack.extend(kids);
-        }
-    }
-    out
+    dom.descendants(scope)
+        .filter(|&id| is_element(dom, id) && dom.attribute(id, "name").as_deref() == Some(name))
+        .collect()
 }
 
 fn collect_by_tag_ns(dom: &dom::Dom, scope: NodeId, namespace: &str, local: &str) -> Vec<NodeId> {
-    let mut out = Vec::new();
-    let mut stack: Vec<NodeId> = dom
-        .children(scope)
-        .map(|kids| kids.copied().collect())
-        .unwrap_or_default();
-    stack.reverse();
-    while let Some(id) = stack.pop() {
-        if let Some(NodeKind::Element { name, .. }) = dom.get(id).map(|node| node.kind())
-            && (namespace == "*" || name.ns.as_ref() == namespace)
-            && (local == "*" || name.local.as_ref() == local)
-        {
-            out.push(id);
-        }
-        if let Some(kids) = dom.children(id) {
-            let mut kids: Vec<_> = kids.copied().collect();
-            kids.reverse();
-            stack.extend(kids);
-        }
-    }
-    out
+    dom.descendants(scope)
+        .filter(|&id| {
+            matches!(
+                dom.kind(id),
+                Some(NodeKind::Element { name, .. })
+                    if (namespace == "*" || name.ns.as_ref() == namespace)
+                        && (local == "*" || name.local.as_ref() == local)
+            )
+        })
+        .collect()
 }
 
 fn collect_by_class(dom: &dom::Dom, scope: NodeId, names: &str) -> Vec<NodeId> {
     let wanted: Vec<&str> = names.split_ascii_whitespace().collect();
-    let mut out = Vec::new();
-    let mut stack: Vec<NodeId> = dom
-        .children(scope)
-        .map(|kids| kids.copied().collect())
-        .unwrap_or_default();
-    stack.reverse();
-    while let Some(id) = stack.pop() {
-        if let Some(NodeKind::Element { .. }) = dom.get(id).map(|node| node.kind()) {
+    dom.descendants(scope)
+        .filter(|&id| {
+            if !is_element(dom, id) {
+                return false;
+            }
             let classes = dom.attribute(id, "class").unwrap_or_default();
             let tokens: Vec<&str> = classes.split_ascii_whitespace().collect();
-            if wanted.iter().all(|want| tokens.contains(want)) {
-                out.push(id);
-            }
-        }
-        if let Some(kids) = dom.children(id) {
-            let mut kids: Vec<_> = kids.copied().collect();
-            kids.reverse();
-            stack.extend(kids);
-        }
-    }
-    out
+            wanted.iter().all(|want| tokens.contains(want))
+        })
+        .collect()
 }
 
 pub(super) fn is_element(dom: &dom::Dom, id: NodeId) -> bool {
     matches!(
-        dom.get(id).map(|node| node.kind()),
+        dom.kind(id),
         Some(NodeKind::Element { .. })
     )
+}
+
+/// Whether `name` is an element in the HTML namespace with local name
+/// `local`.
+pub(super) fn is_html_name(name: &QualName, local: &str) -> bool {
+    name.ns == html_namespace() && name.local.as_ref() == local
+}
+
+/// Whether `kind` is an element in the HTML namespace with local name `local`.
+pub(super) fn is_html_element(kind: Option<&NodeKind>, local: &str) -> bool {
+    matches!(
+        kind,
+        Some(NodeKind::Element { name, .. }) if is_html_name(name, local)
+    )
+}
+
+/// Whether `kind` is an HTML `<template>` element.
+pub(super) fn is_template_element(kind: Option<&NodeKind>) -> bool {
+    is_html_element(kind, "template")
 }
 
 /// The root of the tree `id` participates in (itself when detached).
@@ -1488,26 +1473,8 @@ pub(super) fn tree_order(dom: &dom::Dom, a: NodeId, b: NodeId) -> std::cmp::Orde
 }
 
 pub(super) fn find_element_by_id(dom: &dom::Dom, scope: NodeId, id: &str) -> Option<NodeId> {
-    let mut stack: Vec<NodeId> = dom
-        .children(scope)
-        .map(|kids| kids.copied().collect())
-        .unwrap_or_default();
-    stack.reverse();
-    while let Some(node) = stack.pop() {
-        if matches!(
-            dom.get(node).map(|item| item.kind()),
-            Some(NodeKind::Element { .. })
-        ) && dom.attribute(node, "id").as_deref() == Some(id)
-        {
-            return Some(node);
-        }
-        if let Some(kids) = dom.children(node) {
-            let mut kids: Vec<_> = kids.copied().collect();
-            kids.reverse();
-            stack.extend(kids);
-        }
-    }
-    None
+    dom.descendants(scope)
+        .find(|&node| is_element(dom, node) && dom.attribute(node, "id").as_deref() == Some(id))
 }
 
 #[cfg(test)]

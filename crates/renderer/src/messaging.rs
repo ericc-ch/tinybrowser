@@ -42,15 +42,13 @@ pub(crate) struct FrameTree {
     containers: HashMap<FrameId, NodeId>,
     /// Reverse of `containers`, for `contentWindow`.
     owners: HashMap<NodeId, FrameId>,
-    /// How many frames the tree holds, so spawns can respect the cap without
-    /// walking it.
-    len: usize,
 }
 
 impl FrameTree {
-    /// How many frames the tree holds.
+    /// How many frames the tree holds, so spawns can respect the cap without
+    /// walking it.
     pub(crate) fn len(&self) -> usize {
-        self.len
+        self.containers.len()
     }
 
     /// Adds `child` under `parent`, owned by `container`.
@@ -59,7 +57,6 @@ impl FrameTree {
         self.containers.insert(child, container);
         self.owners.insert(container, child);
         self.children.entry(parent).or_default().push(child);
-        self.len = self.len.saturating_add(1);
     }
 
     /// Removes one frame and returns its `(parent, container)`.
@@ -71,7 +68,6 @@ impl FrameTree {
         self.children.remove(&child);
         let container = self.containers.remove(&child)?;
         self.owners.remove(&container);
-        self.len = self.len.saturating_sub(1);
         Some((parent, container))
     }
 
@@ -398,9 +394,9 @@ impl PortTable {
     /// frame could aim another frame's in-transit port at a target it chooses
     /// (<https://html.spec.whatwg.org/multipage/web-messaging.html#transfer-receiving-steps>).
     pub(crate) fn in_transit_from(&self, endpoint: u64, frame: FrameId) -> bool {
-        self.ports.get(&endpoint).is_some_and(|port| {
-            port.detached && !port.closed && port.recipient == Some(frame)
-        })
+        self.ports
+            .get(&endpoint)
+            .is_some_and(|port| port.detached && !port.closed && port.recipient == Some(frame))
     }
 
     /// Whether every endpoint in `endpoints` may be handed on by `frame`.

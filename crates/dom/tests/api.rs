@@ -104,7 +104,7 @@ fn assert_matches(dom: &Dom, document: NodeId, handles: &[NodeId], model: &Model
     for (index, &handle) in handles.iter().enumerate() {
         assert_eq!(dom.contains(handle), model.alive[index], "liveness {index}");
         if !model.alive[index] {
-            assert!(dom.get(handle).is_none(), "dead node {index} resolves");
+            assert!(dom.kind(handle).is_none(), "dead node {index} resolves");
             assert!(
                 dom.children(handle).is_none(),
                 "dead node {index} has children"
@@ -279,7 +279,7 @@ fn document_fragments_templates_and_clones_keep_their_contracts() {
     assert!(!dom.contains(contents));
     assert!(!dom.contains(inner));
     assert!(matches!(
-        dom.get(first).map(|node| node.kind()),
+        dom.kind(first),
         Some(NodeKind::Element { attributes, .. }) if attributes[0].value == "first"
     ));
 

@@ -41,7 +41,7 @@ struct Rule {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum Target {
+pub(crate) enum Target {
     Addr(Ipv4Addr),
     Fail,
 }
@@ -65,26 +65,18 @@ impl HostMap {
         })
     }
 
-    pub(crate) fn lookup(&self, host: &str) -> Option<Mapped> {
+    pub(crate) fn lookup(&self, host: &str) -> Option<Target> {
         if self.rules.is_empty() {
             return None;
         }
         let host = host.to_ascii_lowercase();
         for rule in self.rules.iter() {
             if glob_match(&rule.pattern, &host) {
-                return Some(match rule.target {
-                    Target::Fail => Mapped::Fail,
-                    Target::Addr(ip) => Mapped::Addr(ip),
-                });
+                return Some(rule.target);
             }
         }
         None
     }
-}
-
-pub(crate) enum Mapped {
-    Addr(Ipv4Addr),
-    Fail,
 }
 
 fn parse_rule(spec: &str) -> Result<Rule, NetError> {

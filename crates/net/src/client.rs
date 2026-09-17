@@ -1,11 +1,11 @@
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant, SystemTime};
 
 use crate::InitiatorKind;
 use crate::error::{LimitExceeded, NetError, ProtocolError, TimeoutKind, TransportError};
 use crate::protocol::{HeaderError, HeaderMap, Method};
 use crate::resolve::HostMap;
-use crate::transport::{CallBudget, HttpEngine, basic_authorization};
+use crate::transport::{CallBudget, HttpEngine, basic_authorization, within};
 use crate::websocket::{self, WebSocket};
 use cookies::{CookieJar, CookieOp, RetrievalKind};
 use http_body_util::BodyExt as _;
@@ -191,40 +191,35 @@ impl Agent {
         RequestBuilder::new(self.clone(), method, url)
     }
 
+    /// Borrows the live jar, recovering from a poisoned lock.
+    fn jar(&self) -> MutexGuard<'_, CookieJar> {
+        self.jar.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Operation for a `document.cookie` or `WebDriver` view of `url`.
+    fn fetch_op<'a>(&self, url: &'a Url, kind: RetrievalKind) -> CookieOp<'a> {
+        CookieOp {
+            url,
+            now: (self.now)(),
+            kind,
+            initiator_kind: InitiatorKind::Fetch,
+            method_is_safe: true,
+            initiator: Some(url),
+            cross_site_redirect: false,
+        }
+    }
+
     /// `document.cookie` getter for `uri`: non-HTTP cookies, semicolon-separated.
     #[must_use]
     pub fn cookies_for(&self, uri: &Url) -> String {
-        self.jar
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .cookie_string(CookieOp {
-                url: uri,
-                now: (self.now)(),
-                kind: RetrievalKind::NonHttp,
-                initiator_kind: InitiatorKind::Fetch,
-                method_is_safe: true,
-                initiator: Some(uri),
-                cross_site_redirect: false,
-            })
+        self.jar()
+            .cookie_string(self.fetch_op(uri, RetrievalKind::NonHttp))
     }
 
     /// `document.cookie` setter for `uri`. Invalid `Set-Cookie` lines are ignored.
     pub fn set_cookie(&self, value: &str, uri: &Url) {
-        self.jar
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .store(
-                value,
-                CookieOp {
-                    url: uri,
-                    now: (self.now)(),
-                    kind: RetrievalKind::NonHttp,
-                    initiator_kind: InitiatorKind::Fetch,
-                    method_is_safe: true,
-                    initiator: Some(uri),
-                    cross_site_redirect: false,
-                },
-            );
+        self.jar()
+            .store(value, self.fetch_op(uri, RetrievalKind::NonHttp));
     }
 
     /// Stores one `Set-Cookie` line with HTTP-level rules, so an `HttpOnly`
@@ -232,21 +227,8 @@ impl Agent {
     /// whether the jar stored the cookie
     /// (<https://w3c.github.io/webdriver/#add-cookie>).
     pub fn store_cookie_http(&self, value: &str, uri: &Url) -> bool {
-        self.jar
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .store(
-                value,
-                CookieOp {
-                    url: uri,
-                    now: (self.now)(),
-                    kind: RetrievalKind::Http,
-                    initiator_kind: InitiatorKind::Fetch,
-                    method_is_safe: true,
-                    initiator: Some(uri),
-                    cross_site_redirect: false,
-                },
-            )
+        self.jar()
+            .store(value, self.fetch_op(uri, RetrievalKind::Http))
     }
 
     /// Cookies visible to `uri`, including session and `HttpOnly` cookies.
@@ -254,44 +236,25 @@ impl Agent {
     /// (<https://w3c.github.io/webdriver/#get-all-cookies>).
     #[must_use]
     pub fn cookie_records(&self, uri: &Url) -> Vec<crate::CookieRecord> {
-        self.jar
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .records_for(CookieOp {
-                url: uri,
-                now: (self.now)(),
-                kind: RetrievalKind::Http,
-                initiator_kind: InitiatorKind::Fetch,
-                method_is_safe: true,
-                initiator: Some(uri),
-                cross_site_redirect: false,
-            })
+        self.jar()
+            .records_for(self.fetch_op(uri, RetrievalKind::Http))
     }
 
     /// Drops every cookie from the live jar
     /// (<https://w3c.github.io/webdriver/#delete-all-cookies>).
     pub fn clear_cookies(&self) {
-        self.jar
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clear();
+        self.jar().clear();
     }
 
     /// Persistent cookies from the live jar. Session cookies are omitted.
     #[must_use]
     pub fn export_cookies(&self) -> Vec<crate::CookieRecord> {
-        self.jar
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .snapshot()
+        self.jar().snapshot()
     }
 
     /// Loads `records` into the live jar, replacing matching identities.
     pub fn import_cookies(&self, records: Vec<crate::CookieRecord>) {
-        self.jar
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .restore(records, (self.now)());
+        self.jar().restore(records, (self.now)());
     }
 
     pub(crate) fn prepare_outbound(
@@ -303,19 +266,15 @@ impl Agent {
         initiator: Option<&Url>,
         cross_site_redirect: bool,
     ) {
-        let cookie = self
-            .jar
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .cookie_string(CookieOp {
-                url,
-                now: (self.now)(),
-                kind: RetrievalKind::Http,
-                initiator_kind,
-                method_is_safe: method.is_safe(),
-                initiator,
-                cross_site_redirect,
-            });
+        let cookie = self.jar().cookie_string(CookieOp {
+            url,
+            now: (self.now)(),
+            kind: RetrievalKind::Http,
+            initiator_kind,
+            method_is_safe: method.is_safe(),
+            initiator,
+            cross_site_redirect,
+        });
         if !cookie.is_empty() {
             if let Some(existing) = headers.get("cookie") {
                 let merged = format!("{}; {cookie}", String::from_utf8_lossy(existing));
@@ -349,10 +308,7 @@ impl Agent {
         lines: impl IntoIterator<Item = impl AsRef<str>>,
     ) {
         let now = (self.now)();
-        let mut jar = self
-            .jar
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut jar = self.jar();
         for line in lines {
             jar.store(
                 line.as_ref(),
@@ -444,12 +400,6 @@ impl RequestBuilder {
         self
     }
 
-    /// Initiator class for this request.
-    #[must_use]
-    pub fn initiator_kind(&self) -> InitiatorKind {
-        self.initiator_kind
-    }
-
     /// Sends the request and follows HTTP redirects per
     /// [HTTP redirect fetch](https://fetch.spec.whatwg.org/#http-redirect-fetch).
     ///
@@ -502,14 +452,8 @@ impl RequestBuilder {
                 .engine
                 .send(&method, &wire, &hop_headers, body.as_deref(), budget)
                 .await?;
-            let response = Response::from_parts(
-                status,
-                response_headers,
-                reader,
-                initiator_kind,
-                url.clone(),
-                budget,
-            );
+            let response =
+                Response::from_parts(status, response_headers, reader, url.clone(), budget);
             agent.store_set_cookie_lines(
                 &url,
                 initiator_kind,
@@ -673,22 +617,7 @@ impl Body {
     /// expires.
     pub async fn read_chunk(&mut self) -> Result<Option<Vec<u8>>, NetError> {
         loop {
-            let frame = match self.budget.deadline() {
-                Some(deadline) => match tokio::time::timeout_at(
-                    tokio::time::Instant::from_std(deadline),
-                    self.inner.frame(),
-                )
-                .await
-                {
-                    Ok(frame) => frame,
-                    Err(_) => {
-                        return Err(NetError::Transport(TransportError::Timeout(
-                            self.budget.timeout_kind(TimeoutKind::RecvBody),
-                        )));
-                    }
-                },
-                None => self.inner.frame().await,
-            };
+            let frame = within(self.budget, TimeoutKind::RecvBody, self.inner.frame()).await?;
             match frame {
                 Some(Ok(frame)) => {
                     if let Ok(data) = frame.into_data() {
@@ -721,17 +650,6 @@ impl Body {
         }
         Ok(out)
     }
-
-    /// Entire body as lossy UTF-8, with the same `limit` as [`Body::bytes`].
-    ///
-    /// # Errors
-    ///
-    /// Same as [`Body::bytes`].
-    pub async fn text(self, limit: usize) -> Result<String, NetError> {
-        self.bytes(limit)
-            .await
-            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
-    }
 }
 
 /// HTTP response after redirects. Status codes are data, including 4xx and 5xx.
@@ -740,7 +658,6 @@ pub struct Response {
     status: u16,
     headers: HeaderMap,
     final_url: Url,
-    initiator_kind: InitiatorKind,
     body: Body,
 }
 
@@ -749,7 +666,6 @@ impl Response {
         status: u16,
         headers: HeaderMap,
         body: hyper::body::Incoming,
-        initiator_kind: InitiatorKind,
         final_url: Url,
         budget: CallBudget,
     ) -> Self {
@@ -757,7 +673,6 @@ impl Response {
             status,
             headers,
             final_url,
-            initiator_kind,
             body: Body::from_incoming(body, budget),
         }
     }
@@ -778,12 +693,6 @@ impl Response {
     #[must_use]
     pub fn final_url(&self) -> &Url {
         &self.final_url
-    }
-
-    /// Initiator class that produced this response.
-    #[must_use]
-    pub fn initiator_kind(&self) -> InitiatorKind {
-        self.initiator_kind
     }
 
     /// Consumes the response and returns its body stream.

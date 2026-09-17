@@ -1,10 +1,8 @@
-//! The value-only seam between browser process and renderer process.
-//!
-//! Commands, request ids, events, script results, and explicit errors cross.
-//! DOM handles, `QuickJS` values, callbacks, and `net` types never do.
-
 //! The renderer wire: what the browser process and a `renderer` child send
 //! each other, and the frame codec that carries it.
+//!
+//! Only value-only messages cross; DOM handles, `QuickJS` values, callbacks,
+//! and `net` types never do.
 //!
 //! Both ends of this conversation live in this crate — the host end in
 //! [`crate::link`], the child end in [`crate::child`] — so the message
@@ -130,6 +128,17 @@ pub enum ToRenderer {
         /// The answer.
         reply: ServiceReply,
     },
+}
+
+impl ToRenderer {
+    /// The sentinel request that stops the renderer loop.
+    pub(crate) fn shutdown_request() -> Self {
+        Self::Request {
+            id: 0,
+            assignment: RendererAssignmentId::new(0),
+            command: Command::Shutdown,
+        }
+    }
 }
 
 /// Metadata sent before the raw bytes of a top-level response.

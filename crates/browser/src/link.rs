@@ -152,15 +152,7 @@ impl ResponseWriter {
         let Some(reply) = self.reply.take() else {
             return Err(TabError::ActorStopped);
         };
-        if let Ok(Ok(reply)) = timeout(REQUEST_TIMEOUT, reply).await {
-            Ok(reply)
-        } else {
-            self.pending
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .remove(&self.id);
-            Err(TabError::ActorStopped)
-        }
+        await_reply(&self.pending, self.id, reply).await
     }
 }
 
@@ -179,6 +171,24 @@ impl Drop for ResponseWriter {
                 id: self.id,
                 failure: renderer::DialFailure::Cancelled,
             }));
+    }
+}
+
+/// Waits for one registered reply under [`REQUEST_TIMEOUT`], removing the
+/// registration when it never arrives.
+async fn await_reply(
+    pending: &Mutex<HashMap<u64, PendingReply>>,
+    id: u64,
+    reply: oneshot::Receiver<Reply>,
+) -> Result<Reply, TabError> {
+    if let Ok(Ok(reply)) = timeout(REQUEST_TIMEOUT, reply).await {
+        Ok(reply)
+    } else {
+        let _removed = pending
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&id);
+        Err(TabError::ActorStopped)
     }
 }
 
@@ -242,20 +252,7 @@ impl RendererHandle {
         command: RendererCommand,
     ) -> Result<Reply, TabError> {
         let id = self.next_request.fetch_add(1, Ordering::Relaxed);
-        let (reply_tx, reply_rx) = oneshot::channel();
-        {
-            let mut pending = self.pending.lock().unwrap_or_else(PoisonError::into_inner);
-            if !self.alive.load(Ordering::Relaxed) {
-                return Err(TabError::ActorStopped);
-            }
-            pending.insert(
-                id,
-                PendingReply {
-                    assignment,
-                    reply: reply_tx,
-                },
-            );
-        }
+        let reply_rx = self.register_pending(id, assignment)?;
         if self
             .tx
             .send(Outbound::Control(ToRenderer::Request {
@@ -269,12 +266,31 @@ impl RendererHandle {
             self.remove_pending(id);
             return Err(TabError::ActorStopped);
         }
-        if let Ok(Ok(reply)) = timeout(REQUEST_TIMEOUT, reply_rx).await {
-            Ok(reply)
-        } else {
-            self.remove_pending(id);
-            Err(TabError::ActorStopped)
+        await_reply(&self.pending, id, reply_rx).await
+    }
+
+    /// Registers the reply channel for request `id`.
+    ///
+    /// The `alive` check runs under the same lock as the registration, so a
+    /// dying renderer cannot leave one behind.
+    fn register_pending(
+        &self,
+        id: u64,
+        assignment: RendererAssignmentId,
+    ) -> Result<oneshot::Receiver<Reply>, TabError> {
+        let mut pending = self.pending.lock().unwrap_or_else(PoisonError::into_inner);
+        if !self.alive.load(Ordering::Relaxed) {
+            return Err(TabError::ActorStopped);
         }
+        let (reply_tx, reply_rx) = oneshot::channel();
+        pending.insert(
+            id,
+            PendingReply {
+                assignment,
+                reply: reply_tx,
+            },
+        );
+        Ok(reply_rx)
     }
 
     /// Streams one top-level response to the renderer and waits for its mount
@@ -306,20 +322,7 @@ impl RendererHandle {
         mount: &Mount,
     ) -> Result<ResponseWriter, TabError> {
         let id = self.next_request.fetch_add(1, Ordering::Relaxed);
-        let (reply_tx, reply_rx) = oneshot::channel();
-        {
-            let mut pending = self.pending.lock().unwrap_or_else(PoisonError::into_inner);
-            if !self.alive.load(Ordering::Relaxed) {
-                return Err(TabError::ActorStopped);
-            }
-            pending.insert(
-                id,
-                PendingReply {
-                    assignment,
-                    reply: reply_tx,
-                },
-            );
-        }
+        let reply_rx = self.register_pending(id, assignment)?;
         let start = ResponseStart {
             assignment,
             frame,
@@ -367,11 +370,9 @@ impl RendererHandle {
 
     /// Asks the renderer loop to stop without waiting.
     pub(crate) fn request_shutdown(&self) {
-        let _ = self.tx.try_send(Outbound::Control(ToRenderer::Request {
-            id: 0,
-            assignment: RendererAssignmentId::new(0),
-            command: RendererCommand::Shutdown,
-        }));
+        let _ = self
+            .tx
+            .try_send(Outbound::Control(ToRenderer::shutdown_request()));
     }
 
     /// Stops the renderer and waits for its transport tasks.
@@ -686,6 +687,7 @@ pub(crate) async fn forward_stderr(stderr: tokio::process::ChildStderr) {
         }
     }
 }
+
 /// One spawned child and its host-side channel endpoints.
 struct SpawnedRenderer {
     child: Child,

@@ -404,6 +404,32 @@ fn currency_digits(ctx: &Ctx<'_>, provider: &IntlProvider, currency: &str) -> Re
     Ok(fractions.get().resolve(currency).digits)
 }
 
+/// Formats `decimal` with one currency formatter construction.
+macro_rules! format_currency_value {
+    ($formatter:expr, $decimal:expr) => {
+        $formatter.map(|formatter| {
+            formatter
+                .format_fixed_decimal($decimal)
+                .write_to_string()
+                .into_owned()
+        })
+    };
+}
+
+/// Builds one fixed-calendar formatter for the locale, formats `value` with
+/// it, and maps a provider failure to the realm's internal exception.
+macro_rules! format_fixed_calendar {
+    ($ctx:expr, $provider:expr, $locale:expr, $fieldset:expr, $value:expr) => {
+        FixedCalendarDateTimeFormatter::<Gregorian, _>::try_new_with_buffer_provider(
+            $provider,
+            $locale.into(),
+            $fieldset,
+        )
+        .map(|formatter| formatter.format($value).write_to_string().into_owned())
+        .map_err(|err| Exception::throw_internal($ctx, &err.to_string()))
+    };
+}
+
 fn format_currency(
     ctx: &Ctx<'_>,
     provider: &IntlProvider,
@@ -423,55 +449,40 @@ fn format_currency(
         CurrencyUsage::Standard
     };
     let preferences = CurrencyFormatterPreferences::from(locale);
-    let formatted = match display {
-        "code" => CurrencyFormatter::try_new_code_with_buffer_provider(
-            provider,
-            preferences,
-            currency,
-            options,
-        )
-        .map(|formatter| {
-            formatter
-                .format_fixed_decimal(decimal)
-                .write_to_string()
-                .into_owned()
-        }),
-        "name" => {
-            CurrencyFormatter::try_new_name_with_buffer_provider(provider, preferences, currency)
-                .map(|formatter| {
-                    formatter
-                        .format_fixed_decimal(decimal)
-                        .write_to_string()
-                        .into_owned()
-                })
-        }
-        "narrowSymbol" => CurrencyFormatter::try_new_symbol_narrow_with_buffer_provider(
-            provider,
-            preferences,
-            currency,
-            options,
-        )
-        .map(|formatter| {
-            formatter
-                .format_fixed_decimal(decimal)
-                .write_to_string()
-                .into_owned()
-        }),
-        _ => CurrencyFormatter::try_new_symbol_with_buffer_provider(
-            provider,
-            preferences,
-            currency,
-            options,
-        )
-        .map(|formatter| {
-            formatter
-                .format_fixed_decimal(decimal)
-                .write_to_string()
-                .into_owned()
-        }),
+    match display {
+        "code" => format_currency_value!(
+            CurrencyFormatter::try_new_code_with_buffer_provider(
+                provider,
+                preferences,
+                currency,
+                options
+            ),
+            decimal
+        ),
+        "name" => format_currency_value!(
+            CurrencyFormatter::try_new_name_with_buffer_provider(provider, preferences, currency),
+            decimal
+        ),
+        "narrowSymbol" => format_currency_value!(
+            CurrencyFormatter::try_new_symbol_narrow_with_buffer_provider(
+                provider,
+                preferences,
+                currency,
+                options
+            ),
+            decimal
+        ),
+        _ => format_currency_value!(
+            CurrencyFormatter::try_new_symbol_with_buffer_provider(
+                provider,
+                preferences,
+                currency,
+                options
+            ),
+            decimal
+        ),
     }
-    .map_err(|err| Exception::throw_internal(ctx, &err.to_string()))?;
-    Ok(formatted)
+    .map_err(|err| Exception::throw_internal(ctx, &err.to_string()))
 }
 
 fn format_date_time(
@@ -505,15 +516,10 @@ fn format_time(
     time: Time,
     style: u8,
 ) -> Result<String> {
-    let output = if style == 1 {
-        NoCalendarFormatter::try_new_with_buffer_provider(provider, locale.into(), T::hm())
-            .map(|formatter| formatter.format(&time).write_to_string().into_owned())
-    } else {
-        NoCalendarFormatter::try_new_with_buffer_provider(provider, locale.into(), T::hms())
-            .map(|formatter| formatter.format(&time).write_to_string().into_owned())
-    }
-    .map_err(|err| Exception::throw_internal(ctx, &err.to_string()))?;
-    Ok(output)
+    let fieldset = if style == 1 { T::hm() } else { T::hms() };
+    NoCalendarFormatter::try_new_with_buffer_provider(provider, locale.into(), fieldset)
+        .map(|formatter| formatter.format(&time).write_to_string().into_owned())
+        .map_err(|err| Exception::throw_internal(ctx, &err.to_string()))
 }
 
 fn format_date(
@@ -523,40 +529,19 @@ fn format_date(
     date: Date<Gregorian>,
     style: u8,
 ) -> Result<String> {
-    let output = match style {
-        1 => FixedCalendarDateTimeFormatter::<Gregorian, _>::try_new_with_buffer_provider(
+    match style {
+        1 => format_fixed_calendar!(ctx, provider, locale, YMD::short(), &date),
+        2 => format_fixed_calendar!(ctx, provider, locale, YMD::medium(), &date),
+        3 => format_fixed_calendar!(ctx, provider, locale, YMD::long(), &date),
+        5 => format_fixed_calendar!(
+            ctx,
             provider,
-            locale.into(),
-            YMD::short(),
-        )
-        .map(|formatter| formatter.format(&date).write_to_string().into_owned()),
-        2 => FixedCalendarDateTimeFormatter::<Gregorian, _>::try_new_with_buffer_provider(
-            provider,
-            locale.into(),
-            YMD::medium(),
-        )
-        .map(|formatter| formatter.format(&date).write_to_string().into_owned()),
-        3 => FixedCalendarDateTimeFormatter::<Gregorian, _>::try_new_with_buffer_provider(
-            provider,
-            locale.into(),
-            YMD::long(),
-        )
-        .map(|formatter| formatter.format(&date).write_to_string().into_owned()),
-        5 => FixedCalendarDateTimeFormatter::<Gregorian, _>::try_new_with_buffer_provider(
-            provider,
-            locale.into(),
+            locale,
             YMD::short().with_year_style(YearStyle::Full),
-        )
-        .map(|formatter| formatter.format(&date).write_to_string().into_owned()),
-        _ => FixedCalendarDateTimeFormatter::<Gregorian, _>::try_new_with_buffer_provider(
-            provider,
-            locale.into(),
-            YMDE::long(),
-        )
-        .map(|formatter| formatter.format(&date).write_to_string().into_owned()),
+            &date
+        ),
+        _ => format_fixed_calendar!(ctx, provider, locale, YMDE::long(), &date),
     }
-    .map_err(|err| Exception::throw_internal(ctx, &err.to_string()))?;
-    Ok(output)
 }
 
 fn format_combined(
@@ -567,74 +552,62 @@ fn format_combined(
     date_style: u8,
     time_style: u8,
 ) -> Result<String> {
-    let output = match (date_style, time_style) {
-        (5, 1) => FixedCalendarDateTimeFormatter::<Gregorian, _>::try_new_with_buffer_provider(
+    match (date_style, time_style) {
+        (5, 1) => format_fixed_calendar!(
+            ctx,
             provider,
-            locale.into(),
+            locale,
             YMD::short().with_year_style(YearStyle::Full).with_time_hm(),
-        )
-        .map(|formatter| formatter.format(datetime).write_to_string().into_owned()),
-        (5, _) => FixedCalendarDateTimeFormatter::<Gregorian, _>::try_new_with_buffer_provider(
+            datetime
+        ),
+        (5, _) => format_fixed_calendar!(
+            ctx,
             provider,
-            locale.into(),
+            locale,
             YMD::short()
                 .with_year_style(YearStyle::Full)
                 .with_time_hms(),
-        )
-        .map(|formatter| formatter.format(datetime).write_to_string().into_owned()),
+            datetime
+        ),
         (4..=u8::MAX, 1) => {
-            FixedCalendarDateTimeFormatter::<Gregorian, _>::try_new_with_buffer_provider(
-                provider,
-                locale.into(),
-                YMDE::long().with_time_hm(),
-            )
-            .map(|formatter| formatter.format(datetime).write_to_string().into_owned())
+            format_fixed_calendar!(ctx, provider, locale, YMDE::long().with_time_hm(), datetime)
         }
-        (4..=u8::MAX, _) => {
-            FixedCalendarDateTimeFormatter::<Gregorian, _>::try_new_with_buffer_provider(
-                provider,
-                locale.into(),
-                YMDE::long().with_time_hms(),
-            )
-            .map(|formatter| formatter.format(datetime).write_to_string().into_owned())
+        (4..=u8::MAX, _) => format_fixed_calendar!(
+            ctx,
+            provider,
+            locale,
+            YMDE::long().with_time_hms(),
+            datetime
+        ),
+        (3, 1) => {
+            format_fixed_calendar!(ctx, provider, locale, YMD::long().with_time_hm(), datetime)
         }
-        (3, 1) => FixedCalendarDateTimeFormatter::<Gregorian, _>::try_new_with_buffer_provider(
+        (3, _) => {
+            format_fixed_calendar!(ctx, provider, locale, YMD::long().with_time_hms(), datetime)
+        }
+        (2, 1) => format_fixed_calendar!(
+            ctx,
             provider,
-            locale.into(),
-            YMD::long().with_time_hm(),
-        )
-        .map(|formatter| formatter.format(datetime).write_to_string().into_owned()),
-        (3, _) => FixedCalendarDateTimeFormatter::<Gregorian, _>::try_new_with_buffer_provider(
-            provider,
-            locale.into(),
-            YMD::long().with_time_hms(),
-        )
-        .map(|formatter| formatter.format(datetime).write_to_string().into_owned()),
-        (2, 1) => FixedCalendarDateTimeFormatter::<Gregorian, _>::try_new_with_buffer_provider(
-            provider,
-            locale.into(),
+            locale,
             YMD::medium().with_time_hm(),
-        )
-        .map(|formatter| formatter.format(datetime).write_to_string().into_owned()),
-        (2, _) => FixedCalendarDateTimeFormatter::<Gregorian, _>::try_new_with_buffer_provider(
+            datetime
+        ),
+        (2, _) => format_fixed_calendar!(
+            ctx,
             provider,
-            locale.into(),
+            locale,
             YMD::medium().with_time_hms(),
-        )
-        .map(|formatter| formatter.format(datetime).write_to_string().into_owned()),
-        (1, 1) => FixedCalendarDateTimeFormatter::<Gregorian, _>::try_new_with_buffer_provider(
+            datetime
+        ),
+        (1, 1) => {
+            format_fixed_calendar!(ctx, provider, locale, YMD::short().with_time_hm(), datetime)
+        }
+        _ => format_fixed_calendar!(
+            ctx,
             provider,
-            locale.into(),
-            YMD::short().with_time_hm(),
-        )
-        .map(|formatter| formatter.format(datetime).write_to_string().into_owned()),
-        _ => FixedCalendarDateTimeFormatter::<Gregorian, _>::try_new_with_buffer_provider(
-            provider,
-            locale.into(),
+            locale,
             YMD::short().with_time_hms(),
-        )
-        .map(|formatter| formatter.format(datetime).write_to_string().into_owned()),
+            datetime
+        ),
     }
-    .map_err(|err| Exception::throw_internal(ctx, &err.to_string()))?;
-    Ok(output)
 }

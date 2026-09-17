@@ -13,7 +13,6 @@ use tokio::sync::Semaphore;
 use tokio::sync::mpsc::UnboundedSender;
 use url::Url;
 
-use crate::profile::ProfileName;
 use crate::store::ProfileStore;
 
 /// Default per-call fetch timeout on a [`FetchHandle`].
@@ -57,7 +56,7 @@ impl NetworkSession {
     /// # Errors
     ///
     /// Stored profile data could not be read or quarantined.
-    pub fn from_agent(agent: Agent, store: ProfileStore) -> io::Result<Self> {
+    fn from_agent(agent: Agent, store: ProfileStore) -> io::Result<Self> {
         store.load_into(&agent)?;
         Ok(Self {
             agent,
@@ -83,10 +82,6 @@ impl NetworkSession {
         tokio::task::spawn_blocking(move || store.save_from(&agent))
             .await
             .map_err(io::Error::other)?
-    }
-
-    pub(crate) fn profile_name(&self) -> ProfileName {
-        self.store.profile_name().clone()
     }
 
     /// Cookies visible to `url`, including session and `HttpOnly` cookies.
@@ -195,16 +190,7 @@ impl FetchHandle {
         self.store.mark_dirty();
         let status = response.status();
         let final_url = response.final_url().clone();
-        let content_language = response
-            .headers()
-            .get("content-language")
-            .and_then(|bytes| std::str::from_utf8(bytes).ok())
-            .and_then(content_language_tag);
-        let content_type = response
-            .headers()
-            .get("content-type")
-            .and_then(|bytes| std::str::from_utf8(bytes).ok())
-            .map(str::to_owned);
+        let (content_type, content_language) = response_meta(response.headers());
         let body = response.into_body();
         Ok(NavOutcome {
             status,
@@ -240,30 +226,16 @@ impl FetchHandle {
             self.store.mark_dirty();
             let status = response.status();
             let final_url = response.final_url().to_string();
-            let content_language = response
-                .headers()
-                .get("content-language")
-                .and_then(|bytes| std::str::from_utf8(bytes).ok())
-                .and_then(content_language_tag);
-            let content_type = response
-                .headers()
-                .get("content-type")
-                .and_then(|bytes| std::str::from_utf8(bytes).ok())
-                .map(str::to_owned);
-            let mut body = Vec::new();
-            if request.read_body {
-                let mut response_body = response.into_body();
-                while let Some(chunk) = response_body
-                    .read_chunk()
+            let (content_type, content_language) = response_meta(response.headers());
+            let body = if request.read_body {
+                response
+                    .into_body()
+                    .bytes(NAV_BODY_LIMIT)
                     .await
                     .map_err(|error| dial_failure(&error))?
-                {
-                    if body.len().saturating_add(chunk.len()) > NAV_BODY_LIMIT {
-                        return Err(DialFailure::Limit);
-                    }
-                    body.extend_from_slice(&chunk);
-                }
-            }
+            } else {
+                Vec::new()
+            };
             Ok(DialOutcome {
                 status,
                 final_url,
@@ -306,6 +278,19 @@ pub(crate) fn dial_failure(error: &net::NetError) -> DialFailure {
         NetError::Transport(TransportError::Connect(_) | TransportError::Io(_))
         | NetError::Protocol(_) => DialFailure::Connect,
     }
+}
+
+/// `Content-Type` and single `Content-Language` tag from response `headers`.
+fn response_meta(headers: &net::HeaderMap) -> (Option<String>, Option<String>) {
+    let content_language = headers
+        .get("content-language")
+        .and_then(|bytes| std::str::from_utf8(bytes).ok())
+        .and_then(content_language_tag);
+    let content_type = headers
+        .get("content-type")
+        .and_then(|bytes| std::str::from_utf8(bytes).ok())
+        .map(str::to_owned);
+    (content_type, content_language)
 }
 
 /// One `Content-Language` tag, or `None` when the header lists several

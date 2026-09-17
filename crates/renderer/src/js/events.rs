@@ -670,19 +670,7 @@ pub(crate) fn dispatch_event<'js>(
     target: EventTargetKey,
     event: &Class<'js, JsEvent>,
 ) -> Result<bool> {
-    {
-        let class = event.borrow();
-        let state = class.state();
-        if state.dispatching || !state.initialized {
-            return Err(bindings::throw_dom(
-                ctx,
-                "InvalidStateError",
-                "the event is already being dispatched or was never initialized",
-            ));
-        }
-    }
-    event.borrow().state_mut().is_trusted = false;
-    dispatch(ctx, target, event)
+    dispatch_checked(ctx, target, event, false)
 }
 
 /// Dispatches a user-agent event with the trust bit set, without the
@@ -692,6 +680,17 @@ pub(crate) fn dispatch_trusted_event<'js>(
     ctx: &Ctx<'js>,
     target: EventTargetKey,
     event: &Class<'js, JsEvent>,
+) -> Result<bool> {
+    dispatch_checked(ctx, target, event, true)
+}
+
+/// Checks the event's dispatch flags and sets `isTrusted` before dispatch:
+/// script dispatch clears the trust bit, user-agent delivery keeps it.
+fn dispatch_checked<'js>(
+    ctx: &Ctx<'js>,
+    target: EventTargetKey,
+    event: &Class<'js, JsEvent>,
+    trusted: bool,
 ) -> Result<bool> {
     {
         let class = event.borrow();
@@ -704,7 +703,7 @@ pub(crate) fn dispatch_trusted_event<'js>(
             ));
         }
     }
-    event.borrow().state_mut().is_trusted = true;
+    event.borrow().state_mut().is_trusted = trusted;
     dispatch(ctx, target, event)
 }
 
@@ -1066,19 +1065,17 @@ impl ListenerOptions {
             passive: None,
             signal: None,
         };
-        let Some(value) = options else {
-            return Ok(parsed);
+        let object = match listener_options_argument(options) {
+            ListenerOptionsArgument::Absent => return Ok(parsed),
+            ListenerOptionsArgument::Boolean(capture) => {
+                // A non-object is the boolean form.
+                parsed.capture = capture;
+                return Ok(parsed);
+            }
+            ListenerOptionsArgument::Object(object) => object,
         };
-        if value.is_undefined() || value.is_null() {
-            return Ok(parsed);
-        }
-        let Some(object) = value.as_object() else {
-            // A non-object is the boolean form.
-            parsed.capture = bindings::to_boolean(&value);
-            return Ok(parsed);
-        };
-        parsed.capture = bindings::option_truthy(object, "capture")?;
-        parsed.once = bindings::option_truthy(object, "once")?;
+        parsed.capture = bindings::option_truthy(&object, "capture")?;
+        parsed.once = bindings::option_truthy(&object, "once")?;
         let passive: Value = object.get("passive")?;
         if !passive.is_undefined() {
             parsed.passive = Some(bindings::to_boolean(&passive));
@@ -1103,16 +1100,35 @@ impl ListenerOptions {
         // `removeEventListener` reads only `capture`; reading the other
         // members would run their getters
         // (<https://dom.spec.whatwg.org/#dom-eventtarget-removeeventlistener>).
-        let Some(value) = options else {
-            return Ok(false);
-        };
-        if value.is_undefined() || value.is_null() {
-            return Ok(false);
+        match listener_options_argument(options) {
+            ListenerOptionsArgument::Absent => Ok(false),
+            ListenerOptionsArgument::Boolean(capture) => Ok(capture),
+            ListenerOptionsArgument::Object(object) => bindings::option_truthy(&object, "capture"),
         }
-        let Some(object) = value.as_object() else {
-            return Ok(bindings::to_boolean(&value));
-        };
-        bindings::option_truthy(object, "capture")
+    }
+}
+
+/// The options argument of `addEventListener` / `removeEventListener`: a
+/// dictionary, the boolean shorthand, or nothing
+/// (<https://dom.spec.whatwg.org/#dictdef-eventlisteneroptions>).
+enum ListenerOptionsArgument<'js> {
+    /// The argument was absent, `undefined`, or `null`.
+    Absent,
+    /// The boolean form, with its converted value.
+    Boolean(bool),
+    Object(Object<'js>),
+}
+
+fn listener_options_argument(options: Option<Value<'_>>) -> ListenerOptionsArgument<'_> {
+    let Some(value) = options else {
+        return ListenerOptionsArgument::Absent;
+    };
+    if value.is_undefined() || value.is_null() {
+        return ListenerOptionsArgument::Absent;
+    }
+    match value.as_object() {
+        Some(object) => ListenerOptionsArgument::Object(object.clone()),
+        None => ListenerOptionsArgument::Boolean(bindings::to_boolean(&value)),
     }
 }
 

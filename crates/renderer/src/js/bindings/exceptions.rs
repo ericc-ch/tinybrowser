@@ -4,35 +4,35 @@ use super::OptString;
 
 use rquickjs::class::Trace;
 
-/// Legacy `DOMException` constants: name used to derive `code`.
+/// Legacy `DOMException` constants: constant suffix, public name, and code.
 ///
 /// <https://webidl.spec.whatwg.org/#idl-DOMException>
-pub(crate) const DOM_EXCEPTION_CODES: [(&str, i32); 25] = [
-    ("INDEX_SIZE_ERR", 1),
-    ("DOMSTRING_SIZE_ERR", 2),
-    ("HIERARCHY_REQUEST_ERR", 3),
-    ("WRONG_DOCUMENT_ERR", 4),
-    ("INVALID_CHARACTER_ERR", 5),
-    ("NO_DATA_ALLOWED_ERR", 6),
-    ("NO_MODIFICATION_ALLOWED_ERR", 7),
-    ("NOT_FOUND_ERR", 8),
-    ("NOT_SUPPORTED_ERR", 9),
-    ("INUSE_ATTRIBUTE_ERR", 10),
-    ("INVALID_STATE_ERR", 11),
-    ("SYNTAX_ERR", 12),
-    ("INVALID_MODIFICATION_ERR", 13),
-    ("NAMESPACE_ERR", 14),
-    ("INVALID_ACCESS_ERR", 15),
-    ("VALIDATION_ERR", 16),
-    ("TYPE_MISMATCH_ERR", 17),
-    ("SECURITY_ERR", 18),
-    ("NETWORK_ERR", 19),
-    ("ABORT_ERR", 20),
-    ("URL_MISMATCH_ERR", 21),
-    ("QUOTA_EXCEEDED_ERR", 22),
-    ("TIMEOUT_ERR", 23),
-    ("INVALID_NODE_TYPE_ERR", 24),
-    ("DATA_CLONE_ERR", 25),
+pub(crate) const DOM_EXCEPTION_CODES: [(&str, &str, i32); 25] = [
+    ("INDEX_SIZE_ERR", "IndexSizeError", 1),
+    ("DOMSTRING_SIZE_ERR", "DOMStringSizeError", 2),
+    ("HIERARCHY_REQUEST_ERR", "HierarchyRequestError", 3),
+    ("WRONG_DOCUMENT_ERR", "WrongDocumentError", 4),
+    ("INVALID_CHARACTER_ERR", "InvalidCharacterError", 5),
+    ("NO_DATA_ALLOWED_ERR", "NoDataAllowedError", 6),
+    ("NO_MODIFICATION_ALLOWED_ERR", "NoModificationAllowedError", 7),
+    ("NOT_FOUND_ERR", "NotFoundError", 8),
+    ("NOT_SUPPORTED_ERR", "NotSupportedError", 9),
+    ("INUSE_ATTRIBUTE_ERR", "InUseAttributeError", 10),
+    ("INVALID_STATE_ERR", "InvalidStateError", 11),
+    ("SYNTAX_ERR", "SyntaxError", 12),
+    ("INVALID_MODIFICATION_ERR", "InvalidModificationError", 13),
+    ("NAMESPACE_ERR", "NamespaceError", 14),
+    ("INVALID_ACCESS_ERR", "InvalidAccessError", 15),
+    ("VALIDATION_ERR", "ValidationError", 16),
+    ("TYPE_MISMATCH_ERR", "TypeMismatchError", 17),
+    ("SECURITY_ERR", "SecurityError", 18),
+    ("NETWORK_ERR", "NetworkError", 19),
+    ("ABORT_ERR", "AbortError", 20),
+    ("URL_MISMATCH_ERR", "URLMismatchError", 21),
+    ("QUOTA_EXCEEDED_ERR", "QuotaExceededError", 22),
+    ("TIMEOUT_ERR", "TimeoutError", 23),
+    ("INVALID_NODE_TYPE_ERR", "InvalidNodeTypeError", 24),
+    ("DATA_CLONE_ERR", "DataCloneError", 25),
 ];
 
 /// `DOMException` as a hand-written Rust platform object
@@ -78,32 +78,8 @@ impl JsDomException {
 fn dom_exception_code(name: &str) -> i32 {
     // https://webidl.spec.whatwg.org/#dom-domexception-code: legacy names
     // map to their constant's value; anything else is 0.
-    match name {
-        "IndexSizeError" => 1,
-        "DOMStringSizeError" => 2,
-        "HierarchyRequestError" => 3,
-        "WrongDocumentError" => 4,
-        "InvalidCharacterError" => 5,
-        "NoDataAllowedError" => 6,
-        "NoModificationAllowedError" => 7,
-        "NotFoundError" => 8,
-        "NotSupportedError" => 9,
-        "InUseAttributeError" => 10,
-        "InvalidStateError" => 11,
-        "SyntaxError" => 12,
-        "InvalidModificationError" => 13,
-        "NamespaceError" => 14,
-        "InvalidAccessError" => 15,
-        "ValidationError" => 16,
-        "TypeMismatchError" => 17,
-        "SecurityError" => 18,
-        "NetworkError" => 19,
-        "AbortError" => 20,
-        "URLMismatchError" => 21,
-        "QuotaExceededError" => 22,
-        "TimeoutError" => 23,
-        "InvalidNodeTypeError" => 24,
-        "DataCloneError" => 25,
-        _ => 0,
-    }
+    DOM_EXCEPTION_CODES
+        .iter()
+        .find(|&&(_, public, _)| public == name)
+        .map_or(0, |&(_, _, code)| code)
 }
