@@ -134,6 +134,13 @@ impl BorderSide {
         color: Color::BLACK,
     };
 
+    /// An absent border: zero width, no style.
+    pub(crate) const NONE: Self = Self {
+        width: 0.0,
+        style: BorderStyle::None,
+        color: Color::BLACK,
+    };
+
     /// Whether anything paints.
     pub(crate) fn paints(self) -> bool {
         self.style != BorderStyle::None && self.width > 0.0

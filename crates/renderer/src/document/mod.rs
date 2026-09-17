@@ -70,6 +70,11 @@ pub(crate) enum DialContext {
         element: dom::NodeId,
         epoch: u64,
     },
+    /// A `<link rel=stylesheet>` sheet; loading sheets delay the load event.
+    Stylesheet {
+        element: dom::NodeId,
+        epoch: u64,
+    },
     /// A child frame's own navigation
     /// (<https://html.spec.whatwg.org/multipage/browsing-the-web.html#navigate>);
     /// a superseded load is dropped when it completes.
@@ -145,6 +150,15 @@ pub(crate) struct Document {
     dial_rx: Receiver<Result<CompletedDial, DialContext>>,
     in_flight_dials: usize,
     queued_dials: Vec<QueuedDial>,
+    /// Loaded `<link rel=stylesheet>` sheets, keyed by their link element so
+    /// the renderer can splice them into the cascade at the right position.
+    stylesheets: HashMap<dom::NodeId, String>,
+    /// Every stylesheet URL already queued or loaded, so re-scans do not
+    /// refetch.
+    stylesheet_urls: HashSet<String>,
+    /// Stylesheet dials queued or in flight; the load event waits for them
+    /// (<https://html.spec.whatwg.org/multipage/links.html#link-type-stylesheet>).
+    pending_stylesheets: usize,
     /// Identifies the frame's current navigation; completions from superseded
     /// loads are dropped.
     frame_load_sequence: u64,
@@ -217,6 +231,9 @@ impl Document {
             dial_rx,
             in_flight_dials: 0,
             queued_dials: Vec::new(),
+            stylesheets: HashMap::new(),
+            stylesheet_urls: HashSet::new(),
+            pending_stylesheets: 0,
             frame_load_sequence: 0,
             frame_load_in_flight: false,
             initial_blank: true,
@@ -801,6 +818,10 @@ impl Document {
         self.js_epoch = self.js_epoch.saturating_add(1);
         // Every queued dial belongs to the old realm; drop them all.
         self.queued_dials.clear();
+        // Sheets belong to the replaced document; the new parse re-scans.
+        self.stylesheets.clear();
+        self.stylesheet_urls.clear();
+        self.pending_stylesheets = 0;
         let js_timer_ids: std::collections::HashSet<u32> =
             self.js_timer_slots.keys().copied().collect();
         self.timers
@@ -934,6 +955,9 @@ impl Document {
                         return;
                     }
                     self.world.borrow_mut().parser_active = false;
+                    // Style sheets delay the load event, so queue them before
+                    // the document's end events.
+                    self.load_stylesheets();
                     // Deliver parser mutations before the document's events.
                     self.deliver_mutations();
                     self.fire_document_end();
@@ -993,6 +1017,17 @@ impl Document {
                     self.advance_parser();
                 }
             }
+            DialContext::Stylesheet { element, epoch } => {
+                self.record_event(TabEvent::Fetch {
+                    status: outcome.status,
+                });
+                self.pending_stylesheets = self.pending_stylesheets.saturating_sub(1);
+                if epoch == self.js_epoch && (200..300).contains(&outcome.status) {
+                    self.stylesheets
+                        .insert(element, String::from_utf8_lossy(&outcome.body).into_owned());
+                }
+                self.fire_document_load();
+            }
             DialContext::FrameLoad { sequence } => {
                 // The superseded-load early return deliberately skips the
                 // trailing `adopt_js_work()` below.
@@ -1028,6 +1063,11 @@ impl Document {
                     self.sync_parser_from_world();
                     self.advance_parser();
                 }
+            }
+            DialContext::Stylesheet { .. } => {
+                // A failed sheet is simply absent; the load event proceeds.
+                self.pending_stylesheets = self.pending_stylesheets.saturating_sub(1);
+                self.fire_document_load();
             }
             DialContext::FrameLoad { sequence } => {
                 if sequence == self.frame_load_sequence {
@@ -1093,11 +1133,72 @@ impl Document {
         if self.world.borrow().main_ready_state() == ReadyState::Complete {
             return;
         }
+        // Style sheets that are still loading hold the load event
+        // (<https://html.spec.whatwg.org/multipage/links.html#link-type-stylesheet>).
+        if self.pending_stylesheets > 0 {
+            return;
+        }
         self.world
             .borrow_mut()
             .set_main_ready_state(ReadyState::Complete);
         self.fire_js(crate::js::JsRealm::fire_ready_state_change);
         self.maybe_fire_load();
+    }
+
+    /// Queues every `<link rel=stylesheet>` whose URL has not been requested
+    /// yet. Sheets delay the load event, so this runs before the document end
+    /// events.
+    fn load_stylesheets(&mut self) {
+        let links: Vec<(dom::NodeId, String)> = {
+            let world = self.world.borrow();
+            let Some(parsed) = world.main_document() else {
+                return;
+            };
+            let document = parsed.dom.document();
+            let Ok(links) = parsed
+                .dom
+                .select_all(document, "link[rel~=\"stylesheet\"]")
+            else {
+                return;
+            };
+            links
+                .into_iter()
+                .filter_map(|link| {
+                    parsed
+                        .dom
+                        .attribute(link, "href")
+                        .map(|href| (link, href))
+                })
+                .collect()
+        };
+        let initiator = self.url.clone();
+        let mut queued = 0usize;
+        for (element, href) in links {
+            let Ok(url) = self.resolve_dial_url(&href) else {
+                continue;
+            };
+            if !self.stylesheet_urls.insert(url.as_str().to_owned()) {
+                continue;
+            }
+            self.queued_dials.push(QueuedDial {
+                context: DialContext::Stylesheet {
+                    element,
+                    epoch: self.js_epoch,
+                },
+                url,
+                initiator: initiator.clone(),
+            });
+            self.pending_stylesheets = self.pending_stylesheets.saturating_add(1);
+            queued += 1;
+        }
+        if queued > 0 {
+            self.launch_queued_dials();
+        }
+    }
+
+    /// The loaded CSS of one `<link rel=stylesheet>`, if it arrived.
+    pub(crate) fn stylesheet_for(&self, element: dom::NodeId) -> Option<&str> {
+        self.stylesheets.get(&element).map(String::as_str)
     }
 
     /// Fires this document's `load` event once it and every child browsing

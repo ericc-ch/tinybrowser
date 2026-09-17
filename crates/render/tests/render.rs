@@ -116,3 +116,4 @@ fn encodes_png() {
     let png = render::encode_png(&image).expect("encode");
     assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n");
 }
+

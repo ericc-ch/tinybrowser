@@ -13,7 +13,7 @@ use dom::{Dom, NodeId};
 
 use crate::color::Color;
 use crate::geometry::Edges;
-use crate::style::{BorderSide, BorderStyle, Dimension, Display, Length, Style};
+use crate::style::{BorderSide, Dimension, Display, Length, Style};
 
 /// What kind of box a node generated.
 pub(crate) enum BoxKind {
@@ -50,6 +50,12 @@ pub(crate) fn build(dom: &Dom, styles: &HashMap<NodeId, Style>) -> BoxNode {
     let document = dom.document();
     let root_style = Style {
         display: Display::Block,
+        border: Edges::new(
+            BorderSide::NONE,
+            BorderSide::NONE,
+            BorderSide::NONE,
+            BorderSide::NONE,
+        ),
         ..Style::INITIAL
     };
     let children = build_children(dom, styles, document, &root_style);
@@ -177,26 +183,10 @@ fn wrap_anonymous(children: Vec<BoxNode>, parent_style: &Style) -> Vec<BoxNode> 
             Length::Px(0.0),
         ),
         border: Edges::new(
-            BorderSide {
-                width: 0.0,
-                style: BorderStyle::None,
-                color: Color::BLACK,
-            },
-            BorderSide {
-                width: 0.0,
-                style: BorderStyle::None,
-                color: Color::BLACK,
-            },
-            BorderSide {
-                width: 0.0,
-                style: BorderStyle::None,
-                color: Color::BLACK,
-            },
-            BorderSide {
-                width: 0.0,
-                style: BorderStyle::None,
-                color: Color::BLACK,
-            },
+            BorderSide::NONE,
+            BorderSide::NONE,
+            BorderSide::NONE,
+            BorderSide::NONE,
         ),
         background: Color::TRANSPARENT,
         ..*parent_style

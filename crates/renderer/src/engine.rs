@@ -26,26 +26,45 @@ pub(crate) const VIEWPORT_WIDTH: f32 = 800.0;
 /// See [`VIEWPORT_WIDTH`].
 pub(crate) const VIEWPORT_HEIGHT: f32 = 600.0;
 
-/// Every `<style>` element's CSS text, in document order.
-fn collect_stylesheets(dom: &dom::Dom) -> Vec<String> {
+/// Every stylesheet that applies to the document, in document order:
+/// `<style>` text and loaded `<link rel=stylesheet>` sheets, spliced at
+/// their element positions.
+fn collect_stylesheets(dom: &dom::Dom, document: &Document) -> Vec<String> {
     let mut sheets = Vec::new();
     for node in dom.descendants(dom.document()) {
         let Some(dom::NodeKind::Element { name, .. }) = dom.kind(node) else {
             continue;
         };
-        if name.ns != dom::html_namespace() || name.local.as_ref() != "style" {
+        if name.ns != dom::html_namespace() {
             continue;
         }
-        let mut css = String::new();
-        if let Some(children) = dom.children(node) {
-            for &child in children {
-                if let Some(dom::NodeKind::Text { data }) = dom.kind(child) {
-                    css.push_str(data);
+        match name.local.as_ref() {
+            "style" => {
+                let mut css = String::new();
+                if let Some(children) = dom.children(node) {
+                    for &child in children {
+                        if let Some(dom::NodeKind::Text { data }) = dom.kind(child) {
+                            css.push_str(data);
+                        }
+                    }
+                }
+                if !css.trim().is_empty() {
+                    sheets.push(css);
                 }
             }
-        }
-        if !css.trim().is_empty() {
-            sheets.push(css);
+            "link" => {
+                let rel = dom.attribute(node, "rel").unwrap_or_default();
+                if !rel
+                    .split_ascii_whitespace()
+                    .any(|token| token.eq_ignore_ascii_case("stylesheet"))
+                {
+                    continue;
+                }
+                if let Some(css) = document.stylesheet_for(node) {
+                    sheets.push(css.to_owned());
+                }
+            }
+            _ => {}
         }
     }
     sheets
@@ -271,7 +290,7 @@ impl Engine {
         let world = document.world();
         let world = world.borrow();
         let sheets = world
-            .with_main_document(|parsed| collect_stylesheets(&parsed.dom))
+            .with_main_document(|parsed| collect_stylesheets(&parsed.dom, document))
             .ok_or_else(|| TabError::RendererUnavailable {
                 message: "no document to render".into(),
             })?;

@@ -281,12 +281,15 @@ fn layout_children(
                 child_font_size,
                 root,
             );
-            cursor_y += previous_margin_bottom.max(child_margin_top);
+            let gap = previous_margin_bottom.max(child_margin_top);
             let child_containing = Containing {
                 width: content_width,
                 height: child_containing_height,
                 x: content_x,
-                y: cursor_y,
+                // `layout_block` positions the border box at `containing.y`
+                // plus the child's own top margin, so hand it the margin edge
+                // the parent already collapsed.
+                y: cursor_y + gap - child_margin_top,
             };
             let child_layout = if matches!(child.kind, BoxKind::Flex) {
                 crate::flex::layout_flex(child, ctx, child_containing)
@@ -695,7 +698,23 @@ pub(crate) fn max_content_width(node: &BoxNode, ctx: &Ctx<'_>) -> f32 {
             .iter()
             .map(|child| max_content_width(child, ctx))
             .sum(),
-        BoxKind::InlineBlock | BoxKind::InlineFlex | BoxKind::Flex => node
+        BoxKind::Flex | BoxKind::InlineFlex => {
+            let row = matches!(
+                style.flex_direction,
+                crate::style::FlexDirection::Row
+                    | crate::style::FlexDirection::RowReverse
+            );
+            let widths = node
+                .children
+                .iter()
+                .map(|child| max_content_width(child, ctx));
+            if row {
+                widths.sum()
+            } else {
+                widths.fold(0.0, f32::max)
+            }
+        }
+        BoxKind::InlineBlock => node
             .children
             .iter()
             .map(|child| max_content_width(child, ctx))

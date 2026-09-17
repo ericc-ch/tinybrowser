@@ -122,7 +122,7 @@ x86_64-unknown-linux-gnu, lld `--icf=all`):
 | png 0.17 | +86,008 |
 | all three together | +393,880 |
 
-Shipping delta: 5,988,848 -> 6,600,448 bytes (+611,600), which includes the
+Shipping delta: 5,988,848 -> 6,606,240 bytes (+617,392), which includes the
 embedded subset faces (Liberation Sans Regular 29,680 + Bold 29,896 bytes,
 OFL-1.1, `crates/render/assets/OFL.txt`) and the crate's own style, layout,
 paint, and PNG code.

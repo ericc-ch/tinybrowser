@@ -13,6 +13,12 @@ export interface Daemon {
   pageUrl: string;
   /** Deterministic layout page for screenshot assertions. */
   shotUrl: string;
+  /** Page styled only by an external sheet. */
+  styledUrl: string;
+  /** Page whose external sheet 404s. */
+  brokenUrl: string;
+  /** The same inline-styled box without any link element. */
+  plainUrl: string;
 }
 
 interface Fixtures {
@@ -28,6 +34,22 @@ html, body { margin: 0; padding: 0; }
 #blue { background: #0000ff; width: 50px; height: 50px; }
 p { margin: 16px 0 0 0; font-size: 20px; }
 </style><div id="red"></div><div id="blue"></div><p>Hello screenshot</p>`;
+
+/** Styled only by an external sheet, so the load event must wait for it. */
+const STYLED = `<!doctype html><title>styled</title>
+<link rel="stylesheet" href="/styles.css">
+<div class="hot"></div>`;
+
+/** A link that 404s must not hold the load event forever. */
+const BROKEN = `<!doctype html><title>broken</title>
+<link rel="stylesheet" href="/missing.css">
+<div style="background:#123456;width:20px;height:20px"></div>`;
+
+/** The same box without the link, to isolate the offset. */
+const PLAIN = `<!doctype html><title>plain</title>
+<div style="background:#123456;width:20px;height:20px"></div>`;
+
+const STYLES = ".hot { background: #00ff00; width: 60px; height: 60px; }";
 
 async function waitForPort(jsonPath: string, timeoutMs: number): Promise<number> {
   const deadline = Date.now() + timeoutMs;
@@ -61,6 +83,18 @@ export const test = base.extend<Fixtures>({
       } else if (path === "/shot") {
         response.writeHead(200, { "content-type": "text/html" });
         response.end(SHOT);
+      } else if (path === "/styled") {
+        response.writeHead(200, { "content-type": "text/html" });
+        response.end(STYLED);
+      } else if (path === "/broken") {
+        response.writeHead(200, { "content-type": "text/html" });
+        response.end(BROKEN);
+      } else if (path === "/plain") {
+        response.writeHead(200, { "content-type": "text/html" });
+        response.end(PLAIN);
+      } else if (path === "/styles.css") {
+        response.writeHead(200, { "content-type": "text/css" });
+        response.end(STYLES);
       } else if (path === "/lib.js") {
         response.writeHead(200, { "content-type": "text/javascript" });
         response.end("window.fromLib = 7;");
@@ -93,6 +127,9 @@ export const test = base.extend<Fixtures>({
       origin: `http://127.0.0.1:${port}`,
       pageUrl: `http://127.0.0.1:${httpPort}/page`,
       shotUrl: `http://127.0.0.1:${httpPort}/shot`,
+      styledUrl: `http://127.0.0.1:${httpPort}/styled`,
+      brokenUrl: `http://127.0.0.1:${httpPort}/broken`,
+      plainUrl: `http://127.0.0.1:${httpPort}/plain`,
     });
 
     try {

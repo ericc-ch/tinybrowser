@@ -247,6 +247,7 @@ fn start_hop(owner: u64, chain: Chain, completion: DialCompletion) {
         kind: match chain.kind {
             DialKind::JsFetch => FetchKind::JsFetch,
             DialKind::ClassicScript => FetchKind::ClassicScript,
+            DialKind::Stylesheet => FetchKind::Stylesheet,
             DialKind::FrameLoad => FetchKind::FrameLoad,
         },
         url: chain.url.to_string(),
