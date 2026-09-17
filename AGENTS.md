@@ -1,7 +1,7 @@
 # tinybrowser
 
 We are building the smallest and lightest headless browser for AI agents.
-The target binary size is under 10MB stripped on x86_64. Measure binary size at milestones.
+The target binary size is under 10MB stripped on x86_64. In `docs/progress.md`, replace the latest binary size, the latest total, and scored groups only.
 
 ## Testing and conformance
 
@@ -18,6 +18,7 @@ Do not test spec conformance in cargo tests. Never add, keep, or "fix" a cargo t
 - Web-platform behavior comes from the WHATWG specs, not from our tests or guesses. Start every implementation and review of a conformance claim from the governing spec. Cite the spec at the implementation site with an anchor link, for example `dom.spec.whatwg.org/#concept-node-ensure-pre-insert-validity`. Follow the spec's exact algorithm order, even when our tests disagree. Fix the test, not the spec.
 - For how a browser actually behaves, read a shipped engine implementation. Start with Chromium, then read Firefox when Chromium does not cover the case. Do not clone these repositories. When the spec and a shipped browser disagree, state the disagreement in a code comment and follow the browser that matches the spec algorithm.
 - Decisions live in commit messages.
+- If you wanna do experimentations, just do in `/tmp/`. Scratch builds, size probes, throwaway JS/Rust experiments, and measurement binaries go under `/tmp`. Do not leave experiment artifacts in the repo.
 
 ## Reference
 

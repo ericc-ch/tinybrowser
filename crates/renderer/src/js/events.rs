@@ -417,17 +417,117 @@ pub(crate) const INSTALL_EVENT_TARGET_CTOR_JS: &str = r"
 })();
 ";
 
+/// `AbortController` and `AbortSignal`
+/// (<https://dom.spec.whatwg.org/#interface-abortcontroller>,
+/// <https://dom.spec.whatwg.org/#abortsignal>).
+pub(crate) const INSTALL_ABORT_JS: &str = r"
+(function() {
+  const STATE = Symbol('abort-state');
+  function createSignal() {
+    const signal = Reflect.construct(globalThis.EventTarget, [], AbortSignal);
+    signal[STATE] = { aborted: false, reason: undefined };
+    return signal;
+  }
+  function signalAbort(signal, reason) {
+    const state = signal[STATE];
+    if (!state || state.aborted) {
+      return;
+    }
+    state.aborted = true;
+    state.reason = reason !== undefined
+      ? reason
+      : new DOMException('signal is aborted without reason', 'AbortError');
+    signal.dispatchEvent(new Event('abort'));
+  }
+  function AbortSignal() {
+    throw new TypeError('Illegal constructor');
+  }
+  const signalProto = Object.create(globalThis.EventTarget.prototype);
+  Object.defineProperty(signalProto, 'constructor', {
+    value: AbortSignal, writable: true, configurable: true,
+  });
+  Object.defineProperty(signalProto, 'aborted', {
+    get: function() { return !!(this[STATE] && this[STATE].aborted); },
+    enumerable: true, configurable: true,
+  });
+  Object.defineProperty(signalProto, 'reason', {
+    get: function() { return this[STATE] ? this[STATE].reason : undefined; },
+    enumerable: true, configurable: true,
+  });
+  Object.defineProperty(signalProto, 'throwIfAborted', {
+    value: function() {
+      if (this[STATE] && this[STATE].aborted) {
+        throw this[STATE].reason;
+      }
+    },
+    writable: true, enumerable: true, configurable: true,
+  });
+  Object.defineProperty(AbortSignal, 'prototype', {
+    value: signalProto, writable: false, configurable: false,
+  });
+  Object.defineProperty(AbortSignal, 'abort', {
+    value: function(reason) {
+      const signal = createSignal();
+      signalAbort(signal, reason);
+      return signal;
+    },
+    writable: true, enumerable: true, configurable: true,
+  });
+  Object.defineProperty(AbortSignal, 'timeout', {
+    value: function(milliseconds) {
+      const signal = createSignal();
+      globalThis.setTimeout(function() {
+        signalAbort(signal, new DOMException('The operation timed out.', 'TimeoutError'));
+      }, Number(milliseconds));
+      return signal;
+    },
+    writable: true, enumerable: true, configurable: true,
+  });
+  function AbortController() {
+    if (new.target === undefined) {
+      throw new TypeError('Class constructor AbortController cannot be invoked without new');
+    }
+    const signal = createSignal();
+    Object.defineProperty(this, 'signal', {
+      get: function() { return signal; },
+      enumerable: true, configurable: true,
+    });
+  }
+  Object.defineProperty(AbortController.prototype, 'abort', {
+    value: function(reason) { signalAbort(this.signal, reason); },
+    writable: true, enumerable: true, configurable: true,
+  });
+  Object.defineProperty(AbortController.prototype, 'constructor', {
+    value: AbortController, writable: true, configurable: true,
+  });
+  Object.defineProperty(globalThis, 'AbortSignal', {
+    value: AbortSignal, writable: true, configurable: true,
+  });
+  Object.defineProperty(globalThis, 'AbortController', {
+    value: AbortController, writable: true, configurable: true,
+  });
+})();
+";
+
 /// Wraps the native `Event` constructor so a call without `new` throws
 /// (<https://webidl.spec.whatwg.org/#interface-object>); the wrapper shares the
 /// native prototype so `Class::<JsEvent>` conversions keep working.
 pub(crate) const INSTALL_EVENT_CTOR_JS: &str = r"
 (function() {
   const Native = globalThis.Event;
+  const isTrustedGet = Object.getOwnPropertyDescriptor(Native.prototype, 'isTrusted').get;
   function Event() {
     if (new.target === undefined) {
       throw new TypeError('Class constructor Event cannot be invoked without new');
     }
-    return Reflect.construct(Native, arguments, new.target);
+    const event = Reflect.construct(Native, arguments, new.target);
+    // [LegacyUnforgeable] own getter
+    // (<https://dom.spec.whatwg.org/#dom-event-istrusted>,
+    // <https://webidl.spec.whatwg.org/#dfn-unforgeable>).
+    Object.defineProperty(event, 'isTrusted', {
+      get: isTrustedGet, enumerable: true, configurable: false,
+    });
+    return event;
   }
   // Constants are `{writable:false, enumerable:true, configurable:false}` on
   // both the interface object and its prototype
@@ -661,8 +761,8 @@ pub(crate) fn add_listener<'js>(
         None => default_passive(ctx, &typ, target)?,
     };
     let world = target_world(ctx, target)?;
-    // Abort steps are lazy here: with no `AbortSignal` class, a listener whose
-    // signal reads as aborted is dropped whenever its list is touched.
+    // Abort steps run when the list is touched or a listener is about to be
+    // invoked (<https://dom.spec.whatwg.org/#add-an-event-listener>).
     let existing_listeners = world.borrow().listener_snapshot(target);
     for existing in &existing_listeners {
         if let Some(signal) = &existing.signal
@@ -811,6 +911,10 @@ fn dispatch<'js>(
     }
     let bubbles = event.borrow().state().bubbles;
     let typ = event.borrow().state().typ.clone();
+    let window = current_event_window(ctx, &path)?;
+    // https://html.spec.whatwg.org/multipage/webappapis.html#set-the-current-event
+    let previous: Value<'js> = window.get("event")?;
+    window.set("event", Class::into_value(event.clone()))?;
     let result = run_invocations(ctx, event, &path, target, bubbles);
     // Handler attributes (`onreadystatechange`, `onload`, …) act as listeners;
     // the engine runs them after the listener list until it models the
@@ -839,9 +943,22 @@ fn dispatch<'js>(
         state.stop_immediate = false;
         state.canceled
     };
+    let restored = window.set("event", previous);
     result?;
     handler?;
+    restored?;
     Ok(!canceled)
+}
+
+/// The `Window` whose [current event](https://html.spec.whatwg.org/multipage/nav-history-apis.html#dom-window-event)
+/// this dispatch updates: the target's realm window, else the caller's.
+fn current_event_window<'js>(ctx: &Ctx<'js>, path: &[PathItem<'js>]) -> Result<Object<'js>> {
+    if let Some(item) = path.first()
+        && let Some(window) = item.reference.world.borrow().window_object()
+    {
+        return window.restore(ctx);
+    }
+    Ok(ctx.globals())
 }
 
 fn run_invocations<'js>(
@@ -1112,7 +1229,16 @@ impl ListenerOptions {
             parsed.passive = Some(bindings::to_boolean(&passive));
         }
         let signal: Value = object.get("signal")?;
-        if let Some(signal) = signal.as_object() {
+        if !signal.is_undefined() {
+            // `AbortSignal signal` is not nullable
+            // (<https://dom.spec.whatwg.org/#dictdef-addeventlisteneroptions>,
+            // <https://webidl.spec.whatwg.org/#es-interface>).
+            let Some(signal) = signal.as_object() else {
+                return Err(Exception::throw_type(
+                    ctx,
+                    "Failed to convert 'signal' to AbortSignal",
+                ));
+            };
             parsed.signal = Some(Persistent::save(ctx, signal.clone()));
         }
         Ok(parsed)
@@ -1166,8 +1292,8 @@ fn default_passive(ctx: &Ctx<'_>, typ: &str, target: EventTargetKey) -> Result<b
     }
 }
 
-/// Whether an `AbortSignal` has its aborted flag set. The engine has no
-/// `AbortSignal` class yet, so the flag is read off the object.
+/// Whether an `AbortSignal` has its aborted flag set
+/// (<https://dom.spec.whatwg.org/#abortsignal-aborted>).
 fn signal_aborted(ctx: &Ctx<'_>, signal: &Persistent<Object<'static>>) -> bool {
     signal
         .clone()
