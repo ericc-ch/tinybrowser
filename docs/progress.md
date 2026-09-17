@@ -7,7 +7,7 @@ Size research lives in [`docs/researches/size-budget.md`](researches/size-budget
 
 Target: under 10MB stripped on x86_64.
 
-5,998,000 bytes (2026-09-17)
+5,988,848 bytes (2026-09-17)
 
 ```sh
 nix develop --command cargo build --release --bin tinybrowser
@@ -67,7 +67,7 @@ nix develop --command ./tools/wpt/score <directory> -- --exclude=worker
 | `content-index/` | unscored |
 | `content-security-policy/` | unscored |
 | `contenteditable/` | unscored |
-| `cookies/` | 4.5% |
+| `cookies/` | 23.9% |
 | `cookiestore/` | unscored |
 | `core-aam/` | unscored |
 | `cors/` | unscored |
@@ -105,7 +105,7 @@ nix develop --command ./tools/wpt/score <directory> -- --exclude=worker
 | `fenced-frame/` | unscored |
 | `fetch/` | unscored |
 | `file-system-access/` | unscored |
-| `FileAPI/` | 48.5% |
+| `FileAPI/` | 47.1% |
 | `focus/` | 7.3% |
 | `font-access/` | unscored |
 | `forced-colors-mode/` | unscored |
