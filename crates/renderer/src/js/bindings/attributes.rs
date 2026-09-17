@@ -941,12 +941,10 @@ pub(crate) fn after_attribute_change(ctx: &Ctx<'_>, element: NodeId, local: &str
         .document(element)
         .is_some_and(|parsed| parsed.dom.is_connected(element));
     if connected {
-        world
-            .borrow_mut()
-            .queue_frame_navigation(FrameNavigation::Src {
-                container: element,
-                spec,
-            });
+        world.borrow_mut().queue_frame_navigation(FrameNavigation {
+            container: element,
+            spec,
+        });
     }
     Ok(())
 }

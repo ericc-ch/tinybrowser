@@ -58,14 +58,25 @@ pub(crate) struct Parsed {
     pub dom: dom::Dom,
     /// Compatibility mode selected by the doctype (or its absence).
     pub quirks_mode: QuirksMode,
-    /// How many spec parse errors the tokenizer/tree builder reported.
-    pub parse_errors: u32,
     /// MIME type this document reports from `document.contentType`.
     pub content_type: &'static str,
     /// The document's readiness; parsed documents start at [`ReadyState::Loading`]
     /// while documents created by script start complete
     /// (<https://html.spec.whatwg.org/multipage/dom.html#current-document-readiness>).
     pub ready_state: ReadyState,
+}
+
+impl Parsed {
+    /// An empty document of `content_type` that is already fully loaded,
+    /// like the ones script constructors create.
+    pub(crate) fn empty(content_type: &'static str) -> Self {
+        Self {
+            dom: dom::Dom::new(),
+            quirks_mode: QuirksMode::NoQuirks,
+            content_type,
+            ready_state: ReadyState::Complete,
+        }
+    }
 }
 
 pub(crate) enum ParseProgress {
@@ -190,7 +201,6 @@ struct Sink {
     // `RefCell` panics loudly rather than corrupting the tree.
     dom: RefCell<dom::Dom>,
     quirks_mode: Cell<QuirksMode>,
-    parse_errors: Cell<u32>,
     /// Elements the tree builder flagged as
     /// [HTML integration points](https://html.spec.whatwg.org/multipage/parsing.html#html-integration-point):
     /// `MathML` `annotation-xml` whose `encoding` makes HTML content parse
@@ -206,7 +216,6 @@ impl Sink {
         Self {
             dom: RefCell::new(dom::Dom::new()),
             quirks_mode: Cell::new(QuirksMode::NoQuirks),
-            parse_errors: Cell::new(0),
             integration_points: RefCell::new(HashSet::new()),
         }
     }
@@ -215,7 +224,6 @@ impl Sink {
         Parsed {
             dom: std::mem::replace(&mut *self.dom.borrow_mut(), dom::Dom::new()),
             quirks_mode: self.quirks_mode.get(),
-            parse_errors: self.parse_errors.get(),
             content_type: "text/html",
             ready_state: ReadyState::Loading,
         }
@@ -224,7 +232,6 @@ impl Sink {
     fn restore(&self, parsed: Parsed) {
         *self.dom.borrow_mut() = parsed.dom;
         self.quirks_mode.set(parsed.quirks_mode);
-        self.parse_errors.set(parsed.parse_errors);
     }
 
     /// Places character data under `parent`, coalescing with the neighbor
@@ -294,15 +301,14 @@ impl TreeSink for Sink {
         Parsed {
             dom: self.dom.into_inner(),
             quirks_mode: self.quirks_mode.get(),
-            parse_errors: self.parse_errors.get(),
             content_type: "text/html",
             ready_state: ReadyState::Loading,
         }
     }
 
-    fn parse_error(&self, _msg: Cow<'static, str>) {
-        self.parse_errors.set(self.parse_errors.get() + 1);
-    }
+    /// Part of the `TreeSink` contract; parsing recovery is the point, and no
+    /// consumer reads a parse-error count.
+    fn parse_error(&self, _msg: Cow<'static, str>) {}
 
     fn get_document(&self) -> Self::Handle {
         self.dom.borrow().document()

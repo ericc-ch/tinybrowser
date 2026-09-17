@@ -549,22 +549,18 @@ impl Engine {
     }
 
     fn apply_navigations(&mut self, navigations: Vec<FrameNavigation>) {
-        for navigation in navigations {
-            match navigation {
-                FrameNavigation::Src { container, spec } => {
-                    let Some(child) = self
-                        .runtime
-                        .shared
-                        .borrow()
-                        .tree
-                        .frame_for_container(container)
-                    else {
-                        continue;
-                    };
-                    self.navigate_frame(child, container, &spec);
-                    self.publish_frame_document(container, child);
-                }
-            }
+        for FrameNavigation { container, spec } in navigations {
+            let Some(child) = self
+                .runtime
+                .shared
+                .borrow()
+                .tree
+                .frame_for_container(container)
+            else {
+                continue;
+            };
+            self.navigate_frame(child, container, &spec);
+            self.publish_frame_document(container, child);
         }
     }
 

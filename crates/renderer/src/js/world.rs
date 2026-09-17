@@ -123,10 +123,13 @@ impl RealmRegistry {
     }
 }
 
-pub(crate) enum FrameNavigation {
-    /// The `iframe`'s `src` changed (or the element just connected): navigate
-    /// the child frame to the spec, resolved against the parent document.
-    Src { container: NodeId, spec: String },
+/// A child frame navigation queued from inside a script, applied after it
+/// stops: the `iframe`'s `src` changed (or the element just connected).
+pub(crate) struct FrameNavigation {
+    /// The `iframe` container whose frame should navigate.
+    pub(crate) container: NodeId,
+    /// The spec to navigate to, resolved against the parent document.
+    pub(crate) spec: String,
 }
 
 pub(crate) enum DocumentStreamCommand {

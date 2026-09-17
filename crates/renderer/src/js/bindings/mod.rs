@@ -475,22 +475,6 @@ pub(crate) fn wrap_node<'js>(ctx: &Ctx<'js>, id: NodeId) -> Result<Value<'js>> {
     Ok(value)
 }
 
-impl crate::Parsed {
-    /// A complete, empty document of `content_type` with no parse errors; the
-    /// starting point for the `Document` constructors and the
-    /// `DOMImplementation` document factories
-    /// (<https://dom.spec.whatwg.org/#dom-implementation-createdocument>).
-    pub(super) fn empty(content_type: &'static str) -> Self {
-        Self {
-            dom: dom::Dom::new(),
-            quirks_mode: markup5ever::interface::QuirksMode::NoQuirks,
-            parse_errors: 0,
-            content_type,
-            ready_state: crate::ReadyState::Complete,
-        }
-    }
-}
-
 /// Publishes `parsed` as a new document of this realm's world and wraps its
 /// root.
 pub(super) fn wrap_new_document<'js>(
