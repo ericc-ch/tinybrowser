@@ -27,7 +27,7 @@ use rquickjs::{Array, Class, Ctx, Exception, Function, Object, Persistent, Resul
 
 use crate::js::events::{self, JsEvent};
 
-use crate::js::world::{DocumentStreamCommand, EventTargetKey, Handle};
+use crate::js::world::{DocumentStreamCommand, EventTargetKey, Handle, Wrapper};
 
 use crate::ReadyState;
 
@@ -1147,7 +1147,9 @@ impl JsNode {
     #[qjs(get, rename = "style")]
     fn style<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
         let world_rc = world_for_node(&ctx, self.handle.0)?;
-        if let Some(saved) = world_rc.borrow().style_declaration(self.handle.0)
+        if let Some(saved) = world_rc
+            .borrow()
+            .wrapper(self.handle.0, Wrapper::StyleDeclaration)
             && let Some(value) = deref_weak(&ctx, saved)?
         {
             return Ok(value);
@@ -1156,9 +1158,11 @@ impl JsNode {
         let element = wrap_node(&ctx, self.handle.0)?;
         let value: Value = factory.call((element,))?;
         let weak = make_weak(&ctx, value.clone())?;
-        world_rc
-            .borrow_mut()
-            .intern_style_declaration(self.handle.0, Persistent::save(&ctx, weak));
+        world_rc.borrow_mut().intern_wrapper(
+            self.handle.0,
+            Wrapper::StyleDeclaration,
+            Persistent::save(&ctx, weak),
+        );
         Ok(value)
     }
 
@@ -1809,7 +1813,7 @@ impl JsNode {
     #[qjs(get, rename = "classList")]
     fn class_list<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
         let world_rc = world(&ctx)?;
-        if let Some(saved) = world_rc.borrow().token_list(self.handle.0)
+        if let Some(saved) = world_rc.borrow().wrapper(self.handle.0, Wrapper::TokenList)
             && let Some(value) = deref_weak(&ctx, saved)?
         {
             return Ok(value);
@@ -1825,9 +1829,11 @@ impl JsNode {
         let proxy: Function = ctx.globals().get("__tb_liveCollection")?;
         let value: Value = proxy.call((raw,))?;
         let weak = make_weak(&ctx, value.clone())?;
-        world_rc
-            .borrow_mut()
-            .intern_token_list(self.handle.0, Persistent::save(&ctx, weak));
+        world_rc.borrow_mut().intern_wrapper(
+            self.handle.0,
+            Wrapper::TokenList,
+            Persistent::save(&ctx, weak),
+        );
         Ok(value)
     }
 
@@ -1835,7 +1841,7 @@ impl JsNode {
     #[qjs(get)]
     fn dataset<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
         let world_rc = world_for_node(&ctx, self.handle.0)?;
-        if let Some(saved) = world_rc.borrow().dataset(self.handle.0)
+        if let Some(saved) = world_rc.borrow().wrapper(self.handle.0, Wrapper::Dataset)
             && let Some(value) = deref_weak(&ctx, saved)?
         {
             return Ok(value);
@@ -1844,9 +1850,11 @@ impl JsNode {
         let element = wrap_node(&ctx, self.handle.0)?;
         let value: Value = factory.call((element,))?;
         let weak = make_weak(&ctx, value.clone())?;
-        world_rc
-            .borrow_mut()
-            .intern_dataset(self.handle.0, Persistent::save(&ctx, weak));
+        world_rc.borrow_mut().intern_wrapper(
+            self.handle.0,
+            Wrapper::Dataset,
+            Persistent::save(&ctx, weak),
+        );
         Ok(value)
     }
 
@@ -2010,7 +2018,9 @@ impl JsNode {
     #[qjs(get)]
     fn attributes<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
         let world_rc = world_for_node(&ctx, self.handle.0)?;
-        if let Some(saved) = world_rc.borrow().named_node_map(self.handle.0)
+        if let Some(saved) = world_rc
+            .borrow()
+            .wrapper(self.handle.0, Wrapper::NamedNodeMap)
             && let Some(value) = deref_weak(&ctx, saved)?
         {
             refresh_named_node_map(&ctx, self.handle.0, &value)?;
@@ -2025,9 +2035,11 @@ impl JsNode {
         let value = Class::into_value(class);
         refresh_named_node_map(&ctx, self.handle.0, &value)?;
         let weak = make_weak(&ctx, value.clone())?;
-        world_rc
-            .borrow_mut()
-            .intern_named_node_map(self.handle.0, Persistent::save(&ctx, weak));
+        world_rc.borrow_mut().intern_wrapper(
+            self.handle.0,
+            Wrapper::NamedNodeMap,
+            Persistent::save(&ctx, weak),
+        );
         Ok(value)
     }
 

@@ -16,7 +16,7 @@ use dom::{NodeId, qualified_name_eq};
 use rquickjs::{Class, Ctx, Exception, Function, Persistent, Result, Value, class::Trace};
 
 use crate::js::events::report_exception;
-use crate::js::world::{AttrState, FrameNavigation, Handle, World};
+use crate::js::world::{AttrState, FrameNavigation, Handle, World, Wrapper};
 
 /// `DOMTokenList` for `Element.classList`
 /// (<https://dom.spec.whatwg.org/#interface-domtokenlist>).
@@ -668,7 +668,7 @@ pub(crate) fn refresh_named_node_map<'js>(
 /// Refreshes the cached `NamedNodeMap` after a mutation, when one exists.
 fn touch_named_node_map(ctx: &Ctx<'_>, element: NodeId) -> Result<()> {
     let world_rc = world_for_node(ctx, element)?;
-    let Some(saved) = world_rc.borrow().named_node_map(element) else {
+    let Some(saved) = world_rc.borrow().wrapper(element, Wrapper::NamedNodeMap) else {
         return Ok(());
     };
     if let Some(value) = deref_weak(ctx, saved)? {

@@ -249,6 +249,23 @@ pub(crate) struct ObjectUrlEntry {
     pub(crate) content_type: Rc<str>,
 }
 
+/// One lazily-created sub-object cached per node.
+///
+/// Each interface creates its platform object once per element, so
+/// `element.classList === element.classList`; the cache is keyed by node and
+/// interface and cleared whenever the realm's wrappers are invalidated.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum Wrapper {
+    /// `Element.classList`.
+    TokenList,
+    /// `Element.attributes`.
+    NamedNodeMap,
+    /// `HTMLElement.style`.
+    StyleDeclaration,
+    /// `HTMLElement.dataset`.
+    Dataset,
+}
+
 pub(crate) struct World {
     /// The handles every frame of this renderer process shares: trees,
     /// registry and wrapper cache, ports, JS heap, wake handle, and stop flag.
@@ -281,10 +298,9 @@ pub(crate) struct World {
     /// The `EventTarget` object behind each `EventTargetKey::Standalone`.
     standalone_targets: HashMap<u64, Persistent<Object<'static>>>,
     next_standalone_target: u64,
-    token_lists: HashMap<NodeId, Persistent<Value<'static>>>,
-    named_node_maps: HashMap<NodeId, Persistent<Value<'static>>>,
-    style_declarations: HashMap<NodeId, Persistent<Value<'static>>>,
-    datasets: HashMap<NodeId, Persistent<Value<'static>>>,
+    /// Lazily-created platform objects whose identity is one per (node,
+    /// interface), so `element.classList === element.classList` and friends.
+    wrappers: HashMap<(NodeId, Wrapper), Persistent<Value<'static>>>,
     implementations: HashMap<u32, Persistent<Value<'static>>>,
     /// The focused element of each document
     /// (<https://html.spec.whatwg.org/multipage/interaction.html#focused-area-of-the-document>).
@@ -368,10 +384,7 @@ impl World {
             listeners: HashMap::new(),
             standalone_targets: HashMap::new(),
             next_standalone_target: 0,
-            token_lists: HashMap::new(),
-            named_node_maps: HashMap::new(),
-            style_declarations: HashMap::new(),
-            datasets: HashMap::new(),
+            wrappers: HashMap::new(),
             implementations: HashMap::new(),
             active_elements: HashMap::new(),
             clicks_in_progress: HashSet::new(),
@@ -463,10 +476,7 @@ impl World {
         self.owned.insert(id);
         self.current_script = None;
         self.listeners.clear();
-        self.token_lists.clear();
-        self.named_node_maps.clear();
-        self.style_declarations.clear();
-        self.datasets.clear();
+        self.wrappers.clear();
         self.implementations.clear();
         self.active_elements.clear();
         self.clear_attributes();
@@ -927,10 +937,7 @@ impl World {
         self.standalone_targets.clear();
         self.window = None;
         self.next_standalone_target = 0;
-        self.token_lists.clear();
-        self.named_node_maps.clear();
-        self.style_declarations.clear();
-        self.datasets.clear();
+        self.wrappers.clear();
         self.implementations.clear();
         self.brands.clear();
         self.handler_attributes.clear();
@@ -948,12 +955,19 @@ impl World {
         self.next_attr_id = 0;
     }
 
-    pub(crate) fn token_list(&self, id: NodeId) -> Option<Persistent<Value<'static>>> {
-        self.token_lists.get(&id).cloned()
+    /// One cached platform object, if this realm created it.
+    pub(crate) fn wrapper(&self, id: NodeId, kind: Wrapper) -> Option<Persistent<Value<'static>>> {
+        self.wrappers.get(&(id, kind)).cloned()
     }
 
-    pub(crate) fn intern_token_list(&mut self, id: NodeId, value: Persistent<Value<'static>>) {
-        self.token_lists.insert(id, value);
+    /// Caches one platform object for the node and interface.
+    pub(crate) fn intern_wrapper(
+        &mut self,
+        id: NodeId,
+        kind: Wrapper,
+        value: Persistent<Value<'static>>,
+    ) {
+        self.wrappers.insert((id, kind), value);
     }
 
     /// The focused element of a document, if any.
@@ -1043,34 +1057,6 @@ impl World {
         } else {
             self.clicks_in_progress.remove(&node);
         }
-    }
-
-    pub(crate) fn named_node_map(&self, id: NodeId) -> Option<Persistent<Value<'static>>> {
-        self.named_node_maps.get(&id).cloned()
-    }
-
-    pub(crate) fn intern_named_node_map(&mut self, id: NodeId, value: Persistent<Value<'static>>) {
-        self.named_node_maps.insert(id, value);
-    }
-
-    pub(crate) fn style_declaration(&self, id: NodeId) -> Option<Persistent<Value<'static>>> {
-        self.style_declarations.get(&id).cloned()
-    }
-
-    pub(crate) fn intern_style_declaration(
-        &mut self,
-        id: NodeId,
-        value: Persistent<Value<'static>>,
-    ) {
-        self.style_declarations.insert(id, value);
-    }
-
-    pub(crate) fn dataset(&self, id: NodeId) -> Option<Persistent<Value<'static>>> {
-        self.datasets.get(&id).cloned()
-    }
-
-    pub(crate) fn intern_dataset(&mut self, id: NodeId, value: Persistent<Value<'static>>) {
-        self.datasets.insert(id, value);
     }
 
     pub(crate) fn intern_brand(
