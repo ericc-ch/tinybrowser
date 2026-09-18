@@ -251,8 +251,8 @@ Two real savings landed while fitting it:
 Rebased onto `chase/size-flags` (7,603,520 bytes), the Stylo slice landed at
 9,416,800 bytes; dropping the shared `--no-eh-frame-hdr` (see above; it broke
 dev/test unwinding) costs 113,968 and the shipping binary is now
-**9,530,704 bytes**: 1,927,184 over the size-flags base, 469,296 under the
-cap. The pre-rebase clap feature trimming is gone with clap itself.
+**9,534,096 bytes** after the review fixes: 1,930,576 over the size-flags
+base, 465,904 under the cap. The pre-rebase clap feature trimming is gone with clap itself.
 
 ## Full Blitz adoption (2026-09-18)
 
@@ -276,7 +276,7 @@ vello_cpu rasterizer.
 
 Net swap, pricing our side with a stub of the `render` API (stub tinybrowser
 = 5,539,584 bytes, everything else identical): the shipped pipeline costs
-3,991,120 bytes (9,530,704 - 5,539,584; the probe stub also carried the pre-review
+3,994,512 bytes (9,534,096 - 5,539,584; the probe stub also carried the pre-review
 flag set, so both sides move together). Replacing it with the Blitz stack is
 5,539,584 + 6,749,248 = **~12.29 MB**, i.e. +2.87 MB over today and about
 2.3 MB over the cap.

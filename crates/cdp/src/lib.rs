@@ -74,6 +74,9 @@ pub async fn serve(listener: &TcpListener, browser: &BrowserHandle) -> io::Resul
     };
     let mut tasks = JoinSet::new();
     loop {
+        // Reap finished connections; they would otherwise stay in the set for
+        // the server's lifetime.
+        while tasks.try_join_next().is_some() {}
         tokio::select! {
             _ = stopping.wait_for(|stopping| *stopping) => break,
             accepted = listener.accept() => {
@@ -1079,14 +1082,17 @@ impl Conn {
             .and_then(Value::as_bool)
             .unwrap_or(false);
         // `Runtime.evaluate` carries an optional `timeout` in milliseconds;
-        // `Runtime.callFunctionOn` has none, so the fallback applies.
-        let await_timeout = params
+        // `Runtime.callFunctionOn` has none, so the fallback applies. An
+        // out-of-range value is a CDP error, not a panic in the server task.
+        let await_timeout = match params
             .get("timeout")
             .and_then(Value::as_f64)
             .filter(|millis| *millis > 0.0)
-            .map_or(AWAIT_PROMISE_TIMEOUT, |millis| {
-                Duration::from_secs_f64(millis / 1000.0)
-            });
+        {
+            Some(millis) => Duration::try_from_secs_f64(millis / 1000.0)
+                .map_err(|_| DispatchError::Failed("timeout is out of range".into()))?,
+            None => AWAIT_PROMISE_TIMEOUT,
+        };
         let source = if method == "Runtime.evaluate" {
             let expression = params
                 .get("expression")
@@ -1108,7 +1114,9 @@ impl Conn {
             format!("({declaration}).apply({receiver}, {arguments})")
         };
         if return_by_value {
-            Ok(Self::runtime_value(tab, &source, await_timeout).await)
+            let id = self.next_handle;
+            self.next_handle = self.next_handle.saturating_add(1);
+            Ok(Self::runtime_value(tab, &source, await_timeout, id).await)
         } else if await_promise {
             Ok(self
                 .runtime_handle_awaited(tab, &source, await_timeout)
@@ -1129,22 +1137,31 @@ impl Conn {
     ) -> Value {
         let handle = self.next_handle;
         self.next_handle = self.next_handle.saturating_add(1);
-        let schedule = RUNTIME_HANDLE_SCHEDULE.replace("__SOURCE__", source);
+        let id = json_string(&handle.to_string());
+        let schedule = RUNTIME_HANDLE_SCHEDULE
+            .replace("__ID__", &id)
+            .replace("__SOURCE__", source);
         if let Err(error) = tab.execute_script(&schedule).await {
             return exception_reply(&error);
         }
-        match tab
-            .run_until_js_true(
-                "Boolean(globalThis.__tb_async_handle && globalThis.__tb_async_handle.done)",
-                timeout,
-            )
-            .await
-        {
+        let ready = format!(
+            "Boolean(globalThis.__tb_async_handles && globalThis.__tb_async_handles[{id}] && globalThis.__tb_async_handles[{id}].done)"
+        );
+        match tab.run_until_js_true(&ready, timeout).await {
             Ok(true) => {}
-            Ok(false) => return exception_text_reply("awaitPromise timed out"),
+            Ok(false) => {
+                // Drop the slot so a late settle cannot pile up results; the
+                // promise closure keeps its own reference to the slot.
+                let _ = tab
+                    .execute_script(&format!(
+                        "if (globalThis.__tb_async_handles) delete globalThis.__tb_async_handles[{id}]; undefined"
+                    ))
+                    .await;
+                return exception_text_reply("awaitPromise timed out");
+            }
             Err(error) => return exception_reply(&error),
         }
-        let read = RUNTIME_HANDLE_READ.replace("__ID__", &json_string(&handle.to_string()));
+        let read = RUNTIME_HANDLE_READ.replace("__ID__", &id);
         let value = match tab.execute_script(&read).await {
             Ok(value) => value,
             Err(error) => return exception_reply(&error),
@@ -1182,23 +1199,35 @@ impl Conn {
 
     /// Resolves the value (awaiting a thenable via the waiter) and serializes
     /// it to a CDP `RemoteObject`.
-    async fn runtime_value(tab: &TabHandle, source: &str, timeout: Duration) -> Value {
-        let schedule = RUNTIME_SCHEDULE.replace("__SOURCE__", source);
+    async fn runtime_value(tab: &TabHandle, source: &str, timeout: Duration, id: u64) -> Value {
+        let id = json_string(&id.to_string());
+        let schedule = RUNTIME_SCHEDULE
+            .replace("__ID__", &id)
+            .replace("__SOURCE__", source);
         if let Err(error) = tab.execute_script(&schedule).await {
             return exception_reply(&error);
         }
-        match tab
-            .run_until_js_true(
-                "Boolean(globalThis.__tb_async && globalThis.__tb_async.done)",
-                timeout,
-            )
-            .await
-        {
+        let ready = format!(
+            "Boolean(globalThis.__tb_async && globalThis.__tb_async[{id}] && globalThis.__tb_async[{id}].done)"
+        );
+        match tab.run_until_js_true(&ready, timeout).await {
             Ok(true) => {}
-            Ok(false) => return exception_text_reply("awaitPromise timed out"),
+            Ok(false) => {
+                // Drop the slot so a late settle cannot pile up results; the
+                // promise closure keeps its own reference to the slot.
+                let _ = tab
+                    .execute_script(&format!(
+                        "if (globalThis.__tb_async) delete globalThis.__tb_async[{id}]; undefined"
+                    ))
+                    .await;
+                return exception_text_reply("awaitPromise timed out");
+            }
             Err(error) => return exception_reply(&error),
         }
-        let value = match tab.execute_script(RUNTIME_READ).await {
+        let value = match tab
+            .execute_script(&RUNTIME_READ.replace("__ID__", &id))
+            .await
+        {
             Ok(value) => value,
             Err(error) => return exception_reply(&error),
         };

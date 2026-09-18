@@ -115,8 +115,18 @@ pub(crate) fn layout_inline_run(
     let mut preserve = false;
     // Wrapping is disabled only when every text node refuses to wrap.
     let mut wrap = false;
+    // Collapsible whitespace belongs to the whole run: a space at the end of
+    // one text box waits for a following token instead of vanishing.
+    let mut pending_space = false;
     for node in run {
-        collect_token(node, ctx, &mut raw, &mut preserve, &mut wrap);
+        collect_token(
+            node,
+            ctx,
+            &mut raw,
+            &mut preserve,
+            &mut wrap,
+            &mut pending_space,
+        );
     }
     if raw.is_empty() {
         return InlineResult {
@@ -235,28 +245,40 @@ fn collect_token<'a>(
     out: &mut Vec<RawToken<'a>>,
     preserve: &mut bool,
     wrap: &mut bool,
+    pending_space: &mut bool,
 ) {
     match &node.kind {
         BoxKind::Text(text) => {
-            let (processed, keeps_space) = process_text(text, &node.style);
-            if processed.is_empty() {
-                return;
-            }
-            *preserve |= keeps_space;
+            let processed = process_text(text, &node.style);
+            *preserve |= processed.preserve;
             *wrap |= allows_wrap(&node.style);
-            out.push(RawToken::Text(
-                processed,
-                SegmentStyle::from_style(&node.style),
-            ));
+            if !processed.text.is_empty() {
+                if *pending_space || processed.leading_space {
+                    // Parley trims the leading whitespace of every style span,
+                    // so a separating space only survives on the previous
+                    // token's trailing edge
+                    // (<https://drafts.csswg.org/css-text-3/#white-space-processing>).
+                    if let Some(RawToken::Text(previous, _)) = out.last_mut() {
+                        previous.push(' ');
+                    }
+                }
+                out.push(RawToken::Text(
+                    processed.text,
+                    SegmentStyle::from_style(&node.style),
+                ));
+            }
+            *pending_space = processed.trailing_space;
         }
         BoxKind::Inline => {
             for child in &node.children {
-                collect_token(child, ctx, out, preserve, wrap);
+                collect_token(child, ctx, out, preserve, wrap, pending_space);
             }
         }
         // `<br>` always breaks, in every whitespace mode. It splits the run
-        // into separate Parley layouts below.
+        // into separate Parley layouts below; a pending space is trailing
+        // whitespace at the break and collapses away.
         BoxKind::Break => {
+            *pending_space = false;
             *wrap = true;
             out.push(RawToken::Break);
         }
@@ -267,6 +289,14 @@ fn collect_token<'a>(
         | BoxKind::Flex
         | BoxKind::Grid
         | BoxKind::ListItem => {
+            // A space before an inline atomic still paints; keep it on the
+            // preceding text token.
+            if *pending_space {
+                if let Some(RawToken::Text(previous, _)) = out.last_mut() {
+                    previous.push(' ');
+                }
+                *pending_space = false;
+            }
             let measurement = measure_atomic(node, ctx);
             out.push(RawToken::Atomic { node, measurement });
         }
@@ -274,37 +304,69 @@ fn collect_token<'a>(
 }
 
 /// Whether text with this style wraps at soft opportunities.
+///
+/// `nowrap` and `pre` only break where the markup does; `pre-wrap` wraps while
+/// preserving spaces
+/// (<https://drafts.csswg.org/css-text-3/#white-space-property>).
 fn allows_wrap(style: &Style) -> bool {
-    !matches!(style.white_space, WhiteSpace::Nowrap)
+    matches!(style.white_space, WhiteSpace::Normal | WhiteSpace::PreWrap)
+}
+
+/// One text box after case mapping and whitespace processing.
+struct ProcessedText {
+    /// Text with leading and trailing collapsible runs removed.
+    text: String,
+    /// The box began with collapsible whitespace.
+    leading_space: bool,
+    /// The box ended with collapsible whitespace.
+    trailing_space: bool,
+    /// The box preserves whitespace (`white-space: pre` or `pre-wrap`).
+    preserve: bool,
 }
 
 /// Pre-processes text for Parley: case mapping, then whitespace handling per
 /// `white-space`. Collapsing runs are squeezed here so the builder can run in
-/// preserve mode; returns the text and whether it keeps spacing.
-fn process_text(text: &str, style: &Style) -> (String, bool) {
-    let mapped = match style.text_transform {
+/// preserve mode; leading and trailing runs are reported so the caller can
+/// collapse them across text boxes.
+fn process_text(text: &str, style: &Style) -> ProcessedText {
+    let text = match style.text_transform {
         crate::style::TextTransform::None => text.to_owned(),
         crate::style::TextTransform::Uppercase => text.to_uppercase(),
         crate::style::TextTransform::Lowercase => text.to_lowercase(),
     };
     let preserve = matches!(style.white_space, WhiteSpace::Pre | WhiteSpace::PreWrap);
     if preserve {
-        return (mapped, true);
+        return ProcessedText {
+            text,
+            leading_space: false,
+            trailing_space: false,
+            preserve: true,
+        };
     }
-    let mut out = String::with_capacity(mapped.len());
-    let mut pending_space = false;
-    for ch in mapped.chars() {
+    let mut out = String::with_capacity(text.len());
+    let mut leading_space = false;
+    let mut pending = false;
+    for ch in text.chars() {
         if matches!(ch, ' ' | '\t' | '\n' | '\r' | '\u{c}') {
-            pending_space = true;
+            pending = true;
         } else {
-            if pending_space {
-                out.push(' ');
-                pending_space = false;
+            if pending {
+                if out.is_empty() {
+                    leading_space = true;
+                } else {
+                    out.push(' ');
+                }
+                pending = false;
             }
             out.push(ch);
         }
     }
-    (out, false)
+    ProcessedText {
+        text: out,
+        leading_space,
+        trailing_space: pending,
+        preserve: false,
+    }
 }
 /// tree rooted at the atomic.
 fn measure_atomic(node: &BoxNode, ctx: &Ctx<'_>) -> Atomic {
@@ -428,13 +490,16 @@ pub(crate) fn max_content_width(node: &BoxNode, ctx: &Ctx<'_>) -> f32 {
                 size: style.font_size,
                 weight: style.font_weight,
             };
+            // Max-content is the whole unwrapped line, so accumulate the line
+            // and take the widest one at forced breaks; `process_text` applies
+            // the same case mapping and whitespace collapsing as shaping.
+            let mapped = process_text(text, style).text;
             let mut width = 0.0_f32;
             let mut current = 0.0_f32;
-            for ch in text.chars() {
-                if matches!(ch, ' ' | '\t' | '\n' | '\r' | '\u{c}') {
+            for ch in mapped.chars() {
+                if ch == '\n' {
                     width = width.max(current);
                     current = 0.0;
-                    width += measure(" ", font, style.letter_spacing, ctx.fonts);
                 } else {
                     current += measure(&ch.to_string(), font, style.letter_spacing, ctx.fonts);
                 }

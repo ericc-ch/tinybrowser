@@ -119,7 +119,7 @@ fn build_children(
                 });
             }
             Some(dom::NodeKind::Text { data } | dom::NodeKind::CDataSection { data }) => {
-                if data.is_empty() || (collapses(parent_style) && is_all_collapsible(data)) {
+                if data.is_empty() {
                     continue;
                 }
                 boxes.push(BoxNode {
@@ -135,20 +135,6 @@ fn build_children(
         }
     }
     boxes
-}
-
-/// Whether a style collapses whitespace.
-fn collapses(style: &Style) -> bool {
-    matches!(
-        style.white_space,
-        crate::style::WhiteSpace::Normal | crate::style::WhiteSpace::Nowrap
-    )
-}
-
-/// Whether text is entirely collapsible whitespace.
-fn is_all_collapsible(text: &str) -> bool {
-    text.chars()
-        .all(|ch| matches!(ch, ' ' | '\t' | '\n' | '\r' | '\u{c}'))
 }
 
 /// Whether a box participates in block flow.
@@ -194,24 +180,43 @@ fn wrap_anonymous(children: Vec<BoxNode>, parent_style: &Style) -> Vec<BoxNode> 
     let mut pending: Vec<BoxNode> = Vec::new();
     for child in children {
         if is_block_level(&child) {
-            if !pending.is_empty() {
-                out.push(BoxNode {
-                    kind: BoxKind::Block,
-                    style: anonymous_style.clone(),
-                    children: std::mem::take(&mut pending),
-                });
-            }
+            push_anonymous(&mut out, &anonymous_style, &mut pending);
             out.push(child);
         } else {
             pending.push(child);
         }
     }
-    if !pending.is_empty() {
+    push_anonymous(&mut out, &anonymous_style, &mut pending);
+    out
+}
+
+/// Pushes one pending inline run as an anonymous block, unless it holds
+/// nothing that could paint: a run of collapsed whitespace between block-level
+/// boxes generates no box at all
+/// (<https://drafts.csswg.org/css-display-3/#anonymous>), and wrapping it
+/// would break margin collapsing between its neighbors.
+fn push_anonymous(out: &mut Vec<BoxNode>, style: &Style, pending: &mut Vec<BoxNode>) {
+    if pending.is_empty() {
+        return;
+    }
+    if pending.iter().any(could_paint) {
         out.push(BoxNode {
             kind: BoxKind::Block,
-            style: anonymous_style,
-            children: pending,
+            style: style.clone(),
+            children: std::mem::take(pending),
         });
+    } else {
+        pending.clear();
     }
-    out
+}
+
+/// Whether a box could paint anything: text with visible characters, or any
+/// inline element, atomic, or break (their own box may paint).
+fn could_paint(node: &BoxNode) -> bool {
+    match &node.kind {
+        BoxKind::Text(text) => text
+            .chars()
+            .any(|ch| !matches!(ch, ' ' | '\t' | '\n' | '\r' | '\u{c}')),
+        _ => true,
+    }
 }

@@ -223,12 +223,16 @@ pub(crate) fn exception_text_reply(text: &str) -> Value {
     })
 }
 
-/// Schedules `__SOURCE__` and captures its settled value.
+/// Schedules `__SOURCE__` and captures its settled value. Results key by
+/// evaluation ID; a single shared slot would let overlapping evaluations
+/// overwrite each other.
 pub(crate) const RUNTIME_SCHEDULE: &str = r#"(() => {
-  globalThis.__tb_async = { done: false };
+  globalThis.__tb_async = globalThis.__tb_async || {};
+  const slot = { done: false };
+  globalThis.__tb_async[__ID__] = slot;
   Promise.resolve((__SOURCE__)).then(
-    (v) => { globalThis.__tb_async.done = true; globalThis.__tb_async.value = v; },
-    (e) => { globalThis.__tb_async.done = true; globalThis.__tb_async.error = String((e && e.message) || e); }
+    (v) => { slot.done = true; slot.value = v; },
+    (e) => { slot.done = true; slot.error = String((e && e.message) || e); }
   );
   return "scheduled";
 })()"#;
@@ -252,20 +256,24 @@ pub(crate) const RUNTIME_HANDLE: &str = r#"(() => {
 
 /// Schedules an awaited evaluate whose result becomes a handle (or an inline
 /// primitive), the `evaluateHandle` shape: `awaitPromise` with
-/// `returnByValue: false`.
+/// `returnByValue: false`. Results key by evaluation ID; a single shared slot
+/// would let overlapping evaluations overwrite each other.
 pub(crate) const RUNTIME_HANDLE_SCHEDULE: &str = r#"(() => {
-  globalThis.__tb_async_handle = null;
+  globalThis.__tb_async_handles = globalThis.__tb_async_handles || {};
+  const slot = { done: false };
+  globalThis.__tb_async_handles[__ID__] = slot;
   Promise.resolve((__SOURCE__)).then(
-    (v) => { globalThis.__tb_async_handle = { done: true, value: v }; },
-    (e) => { globalThis.__tb_async_handle = { done: true, error: String((e && e.message) || e) }; }
+    (v) => { slot.done = true; slot.value = v; },
+    (e) => { slot.done = true; slot.error = String((e && e.message) || e); }
   );
   return "scheduled";
 })()"#;
 
 /// Reads the awaited handle result and serializes it as a CDP `RemoteObject`.
 pub(crate) const RUNTIME_HANDLE_READ: &str = r#"(() => {
-  const slot = globalThis.__tb_async_handle;
+  const slot = globalThis.__tb_async_handles && globalThis.__tb_async_handles[__ID__];
   if (!slot || !slot.done) return JSON.stringify({ pending: true });
+  delete globalThis.__tb_async_handles[__ID__];
   if (slot.error !== undefined) return JSON.stringify({ error: slot.error });
   globalThis.__tb_handles = globalThis.__tb_handles || {};
   const v = slot.value;
@@ -283,8 +291,9 @@ pub(crate) const RUNTIME_HANDLE_READ: &str = r#"(() => {
 
 /// Reads the captured async result and serializes it as a CDP `RemoteObject`.
 pub(crate) const RUNTIME_READ: &str = r#"(() => {
-  const s = globalThis.__tb_async;
+  const s = globalThis.__tb_async && globalThis.__tb_async[__ID__];
   if (!s || !s.done) return JSON.stringify({ pending: true });
+  delete globalThis.__tb_async[__ID__];
   if (s.error !== undefined) return JSON.stringify({ error: s.error });
   const v = s.value;
   if (v === null) return JSON.stringify({ type: "object", subtype: "null", value: null });
