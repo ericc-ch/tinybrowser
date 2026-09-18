@@ -598,25 +598,45 @@ fn install_window_host_functions(ctx: &Ctx<'_>, world: &Rc<RefCell<World>>) -> R
     let window_open = world.clone();
     ctx.globals().set(
         "__tbWindowOpen",
-        Func::from(move |url: String, name: String, features: String| {
-            let spec = if url.is_empty() {
-                Some(String::new())
-            } else {
-                window_open
-                    .borrow()
-                    .document_url
-                    .join(&url)
-                    .ok()
-                    .map(|url| url.to_string())
-            };
-            spec.and_then(|spec| {
-                window_open
-                    .borrow()
-                    .runtime
-                    .services
-                    .window_open(&spec, &name, &features)
-            })
-        }),
+        Func::from(
+            move |url: String,
+                  name: String,
+                  features: String,
+                  seed_origin: String,
+                  seed_entries: Vec<String>| {
+                let spec = if url.is_empty() {
+                    Some(String::new())
+                } else {
+                    window_open
+                        .borrow()
+                        .document_url
+                        .join(&url)
+                        .ok()
+                        .map(|url| url.to_string())
+                };
+                let seed = if seed_origin.is_empty() {
+                    None
+                } else {
+                    Some(crate::protocol::StorageSeed {
+                        origin: seed_origin,
+                        entries: seed_entries
+                            .as_chunks::<2>()
+                            .0
+                            .iter()
+                            .map(|pair| (pair[0].clone(), pair[1].clone()))
+                            .collect(),
+                    })
+                };
+                spec.and_then(|spec| {
+                    window_open.borrow().runtime.services.window_open(
+                        &spec,
+                        &name,
+                        &features,
+                        seed.as_ref(),
+                    )
+                })
+            },
+        ),
     )?;
 
     let window_close = world.clone();
@@ -642,6 +662,20 @@ fn install_window_host_functions(ctx: &Ctx<'_>, world: &Rc<RefCell<World>>) -> R
                 .runtime
                 .services
                 .window_post_message(tab, &payload);
+        }),
+    )?;
+
+    let remote_session = world.clone();
+    ctx.globals().set(
+        "__tbRemoteSessionGet",
+        Func::from(move |tab: u64, key: String| {
+            let world = remote_session.borrow();
+            world.storage_origin().and_then(|origin| {
+                world
+                    .runtime
+                    .services
+                    .remote_session_get(tab, &origin, &key)
+            })
         }),
     )?;
     Ok(())

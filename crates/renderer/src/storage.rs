@@ -123,6 +123,17 @@ impl SessionStorage {
             new_value: None,
         })
     }
+
+    /// Replaces `origin`'s entries with a copy of another browsing context's
+    /// area
+    /// (<https://html.spec.whatwg.org/multipage/document-sequences.html#copy-session-storage>).
+    pub(crate) fn import(&mut self, origin: &str, entries: Vec<(String, String)>) {
+        let area = self.areas.entry(origin.to_owned()).or_default();
+        area.clear();
+        for (key, value) in entries {
+            area.insert(key, value);
+        }
+    }
 }
 
 /// Whether storing `key = value` keeps `area` within [`STORAGE_QUOTA_BYTES`],

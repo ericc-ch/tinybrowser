@@ -803,7 +803,8 @@ async fn route_service_call(
         call @ (ServiceCall::WindowOpen { .. }
         | ServiceCall::WindowClose { .. }
         | ServiceCall::Opener
-        | ServiceCall::WindowMessage { .. }) => {
+        | ServiceCall::WindowMessage { .. }
+        | ServiceCall::RemoteSessionGet { .. }) => {
             return route_window_call(context, assignment, id, call).await;
         }
     }
@@ -820,7 +821,12 @@ async fn route_window_call(
     call: ServiceCall,
 ) -> Result<(), RendererViolation> {
     match call {
-        ServiceCall::WindowOpen { url, features, .. } => {
+        ServiceCall::WindowOpen {
+            url,
+            features,
+            seed,
+            ..
+        } => {
             let spec = if url.is_empty() || url == "about:blank" {
                 Some(String::new())
             } else {
@@ -844,7 +850,7 @@ async fn route_window_call(
             let tab = match spec {
                 Some(spec) => context
                     .browser
-                    .open_window(spec, source, noopener)
+                    .open_window(spec, source, noopener, seed)
                     .await
                     .ok()
                     .map(TabId::get),
@@ -872,6 +878,15 @@ async fn route_window_call(
                 .window_message(TabId::new(tab), payload)
                 .await;
             send_reply(&context.tx, id, ServiceReply::Unit).await?;
+        }
+        ServiceCall::RemoteSessionGet { tab, origin, key } => {
+            let value = context
+                .browser
+                .remote_session_get(TabId::new(tab), origin, key)
+                .await
+                .ok()
+                .flatten();
+            send_reply(&context.tx, id, ServiceReply::StorageValue(value)).await?;
         }
         ServiceCall::Dial(_)
         | ServiceCall::CookieGet { .. }
@@ -969,7 +984,8 @@ async fn route_storage_call(
         | ServiceCall::WindowOpen { .. }
         | ServiceCall::WindowClose { .. }
         | ServiceCall::Opener
-        | ServiceCall::WindowMessage { .. } => {
+        | ServiceCall::WindowMessage { .. }
+        | ServiceCall::RemoteSessionGet { .. } => {
             // `route_service_call` dispatches the other service families.
             return Err(RendererViolation);
         }
@@ -994,7 +1010,9 @@ async fn send_released_reply(
         ServiceCall::CookieSet { .. }
         | ServiceCall::WindowClose { .. }
         | ServiceCall::WindowMessage { .. } => ServiceReply::Unit,
-        ServiceCall::StorageGet { .. } => ServiceReply::StorageValue(None),
+        ServiceCall::StorageGet { .. } | ServiceCall::RemoteSessionGet { .. } => {
+            ServiceReply::StorageValue(None)
+        }
         ServiceCall::StorageKeys { .. } => ServiceReply::StorageKeys(Vec::new()),
         ServiceCall::StorageSet { .. }
         | ServiceCall::StorageRemove { .. }

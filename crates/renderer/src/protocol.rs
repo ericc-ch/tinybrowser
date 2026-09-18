@@ -193,6 +193,17 @@ pub enum StorageKind {
 /// (<https://html.spec.whatwg.org/multipage/webstorage.html#dom-storage-setitem>).
 pub const STORAGE_QUOTA_BYTES: usize = 5 * 1024 * 1024;
 
+/// One `sessionStorage` copy for a newly opened auxiliary browsing context
+/// (<https://html.spec.whatwg.org/multipage/document-sequences.html#copy-session-storage>).
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct StorageSeed {
+    /// Serialized origin whose session area is copied.
+    pub origin: String,
+    /// Encoded `(key, value)` pairs, exactly as the storage service stores
+    /// them (the JS shim JSON-escapes strings at the seam).
+    pub entries: Vec<(String, String)>,
+}
+
 /// Why a storage mutation failed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StorageError {
@@ -371,8 +382,15 @@ pub trait BrowserServices: Send + Sync + 'static {
     fn storage_clear(&self, origin: &str, url: &str, source: FrameId) -> Option<StorageChange>;
 
     /// `window.open(url, target, features)`; `None` when the browser refused
-    /// to open a window. `url` is absolute, or empty for `about:blank`.
-    fn window_open(&self, url: &str, name: &str, features: &str) -> Option<u64>;
+    /// to open a window. `url` is absolute, or empty for `about:blank`. `seed`
+    /// is the opener's session copy for the new tab, when there is one.
+    fn window_open(
+        &self,
+        url: &str,
+        name: &str,
+        features: &str,
+        seed: Option<&StorageSeed>,
+    ) -> Option<u64>;
 
     /// `window.close()` on a window this realm opened.
     fn window_close(&self, tab: u64);
@@ -383,6 +401,10 @@ pub trait BrowserServices: Send + Sync + 'static {
     /// `postMessage` to a window this realm opened, encoded by the caller's
     /// realm.
     fn window_post_message(&self, tab: u64, payload: &str);
+
+    /// `sessionStorage.getItem` on another window's area, for a same-origin
+    /// opener or opened window.
+    fn remote_session_get(&self, tab: u64, origin: &str, key: &str) -> Option<String>;
 }
 
 #[cfg(test)]

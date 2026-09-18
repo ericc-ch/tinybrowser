@@ -6,6 +6,7 @@ use std::io;
 use std::path::Path;
 use std::sync::Arc;
 
+use renderer::StorageSeed;
 use tokio::sync::{mpsc, oneshot};
 use url::Url;
 
@@ -72,6 +73,8 @@ enum Command {
         source: Option<TabId>,
         /// The caller asked for `noopener`/`noreferrer`; no opener link.
         noopener: bool,
+        /// Session copy for the new tab, when the opener sent one.
+        seed: Option<StorageSeed>,
         reply: oneshot::Sender<Result<TabId, BrowserError>>,
     },
     /// Records which tab owns one renderer assignment.
@@ -94,6 +97,13 @@ enum Command {
         target: TabId,
         payload: String,
         reply: oneshot::Sender<Result<(), BrowserError>>,
+    },
+    /// Reads one key of a live tab's session area for `origin`.
+    RemoteSessionGet {
+        target: TabId,
+        origin: String,
+        key: String,
+        reply: oneshot::Sender<Result<Option<String>, BrowserError>>,
     },
 }
 
@@ -280,11 +290,13 @@ impl BrowserHandle {
         url: String,
         source: Option<TabId>,
         noopener: bool,
+        seed: Option<StorageSeed>,
     ) -> Result<TabId, BrowserError> {
         self.request(move |reply| Command::OpenWindow {
             url,
             source,
             noopener,
+            seed,
             reply,
         })
         .await
@@ -334,6 +346,27 @@ impl BrowserHandle {
         self.request(move |reply| Command::WindowMessage {
             target,
             payload,
+            reply,
+        })
+        .await
+        .and_then(|result| result)
+    }
+
+    /// Reads one key of `target`'s session area for `origin`.
+    ///
+    /// # Errors
+    ///
+    /// [`BrowserError::UnknownTab`] when the target is gone.
+    pub async fn remote_session_get(
+        &self,
+        target: TabId,
+        origin: String,
+        key: String,
+    ) -> Result<Option<String>, BrowserError> {
+        self.request(move |reply| Command::RemoteSessionGet {
+            target,
+            origin,
+            key,
             reply,
         })
         .await
@@ -404,13 +437,24 @@ fn open_window(
     url: String,
     source: Option<TabId>,
     noopener: bool,
+    seed: Option<StorageSeed>,
 ) -> Result<TabId, BrowserError> {
     let handle = create_tab(state)?;
     let id = handle.id();
     if let (Some(source), false) = (source, noopener) {
         state.openers.insert(id, source);
     }
-    if !url.is_empty() && url != "about:blank" {
+    let navigate = !url.is_empty() && url != "about:blank";
+    if let Some(seed) = seed {
+        // The seed must land before the first navigation runs the new
+        // document's scripts, so one task performs both in order.
+        tokio::spawn(async move {
+            let _result = handle.seed_session(seed).await;
+            if navigate {
+                let _result = handle.goto(&url).await;
+            }
+        });
+    } else if navigate {
         // The tab starts on about:blank; the first real navigation runs in
         // the background so one slow load cannot stall the command loop.
         tokio::spawn(async move {
@@ -430,6 +474,23 @@ async fn route_window_message(
         Some(task) => task
             .handle
             .window_message(payload)
+            .await
+            .map_err(|_| BrowserError::UnknownTab),
+        None => Err(BrowserError::UnknownTab),
+    }
+}
+
+/// Reads one key of a live tab's session area.
+async fn route_remote_session(
+    state: &BrowserState,
+    target: TabId,
+    origin: String,
+    key: String,
+) -> Result<Option<String>, BrowserError> {
+    match state.tabs.get(&target) {
+        Some(task) => task
+            .handle
+            .remote_session_get(origin, key)
             .await
             .map_err(|_| BrowserError::UnknownTab),
         None => Err(BrowserError::UnknownTab),
@@ -456,9 +517,10 @@ async fn browser_loop(mut commands: mpsc::Receiver<Command>, mut state: BrowserS
                 url,
                 source,
                 noopener,
+                seed,
                 reply,
             } => {
-                let result = open_window(&mut state, url, source, noopener);
+                let result = open_window(&mut state, url, source, noopener, seed);
                 let _result = reply.send(result);
             }
             Command::RegisterAssignment { assignment, tab } => {
@@ -476,6 +538,15 @@ async fn browser_loop(mut commands: mpsc::Receiver<Command>, mut state: BrowserS
                 reply,
             } => {
                 let result = route_window_message(&state, target, payload).await;
+                let _result = reply.send(result);
+            }
+            Command::RemoteSessionGet {
+                target,
+                origin,
+                key,
+                reply,
+            } => {
+                let result = route_remote_session(&state, target, origin, key).await;
                 let _result = reply.send(result);
             }
             Command::Tabs { reply } => {

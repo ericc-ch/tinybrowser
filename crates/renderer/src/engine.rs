@@ -86,7 +86,7 @@ fn strip_cdata(css: &str) -> &str {
 use crate::documents::DocumentStore;
 use crate::js::{DocumentStreamCommand, FrameNavigation, RealmRegistry, SharedJsRuntime};
 use crate::messaging::{Delivery, MAX_FRAMES, SharedHandle};
-use crate::protocol::{BrowserServices, FrameId, Mount, TabError, TabEvent};
+use crate::protocol::{BrowserServices, FrameId, Mount, StorageSeed, TabError, TabEvent};
 use crate::storage::PendingStorageEvent;
 
 /// One renderer process's page engine.
@@ -395,6 +395,27 @@ impl Engine {
         if let Some(document) = self.frames.get_mut(&FrameId::MAIN) {
             document.push_remote_message(payload);
         }
+    }
+
+    /// Copies one `sessionStorage` seed into this engine's session area
+    /// (<https://html.spec.whatwg.org/multipage/document-sequences.html#copy-session-storage>).
+    ///
+    /// # Errors
+    ///
+    /// [`TabError::RendererUnavailable`] when the seed JSON is malformed.
+    pub fn seed_session(&mut self, seed: StorageSeed) -> Result<(), TabError> {
+        let StorageSeed { origin, entries } = seed;
+        self.runtime
+            .session_storage
+            .borrow_mut()
+            .import(&origin, entries);
+        Ok(())
+    }
+
+    /// Reads one key of this engine's session area for `origin`.
+    #[must_use]
+    pub fn session_get(&self, origin: &str, key: &str) -> Option<String> {
+        self.runtime.session_storage.borrow().get(origin, key)
     }
 
     /// Queues one `localStorage` change that the browser broadcast. The source

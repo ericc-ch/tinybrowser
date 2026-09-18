@@ -2017,12 +2017,15 @@ Object.defineProperty(globalThis, 'top', {
 })();
 
 // ── auxiliary windows ──────────────────────────────────────────────────
-// `window.open` creates a browser tab. Step 1 exposes `close()` and
-// `closed`; messaging (`postMessage`), `opener`, session copy, and named
-// windows land with the messaging slice
+// `window.open` creates a browser tab; the returned remote-window object
+// exposes `close`, `postMessage`, and the same-origin storage areas. A named
+// window is one browsing context, so reopening a live name returns the same
+// object without a session copy
 // (<https://html.spec.whatwg.org/multipage/window-object.html#dom-open>).
 (function() {
   const remoteWindows = new Map();
+  const namedWindows = new Map();
+  const remoteSessions = new Map();
 
   function remoteWindow(tab) {
     const existing = remoteWindows.get(tab);
@@ -2037,7 +2040,7 @@ Object.defineProperty(globalThis, 'top', {
             __tbWindowPostMessage(tab, encoded.payload);
           };
           case 'localStorage': return globalThis.__tbStorageArea('local');
-          case 'sessionStorage': return globalThis.__tbStorageArea('session');
+          case 'sessionStorage': return remoteSession(tab);
           case Symbol.toStringTag: return 'Window';
           default: return undefined;
         }
@@ -2058,14 +2061,60 @@ Object.defineProperty(globalThis, 'top', {
     return proxy;
   }
 
+  // A live read of another window's session area, for same-origin openers and
+  // opened windows. The response carries the storage seam's encoded strings.
+  function remoteSession(tab) {
+    const existing = remoteSessions.get(tab);
+    if (existing !== undefined) return existing;
+    const session = {
+      getItem(key) {
+        if (arguments.length < 1) {
+          throw new TypeError("Failed to execute 'getItem' on 'Storage': 1 argument required, but only 0 present.");
+        }
+        const value = __tbRemoteSessionGet(tab, globalThis.__tbStorageEncode(String(key)));
+        return value === undefined ? null : globalThis.__tbStorageDecode(value);
+      },
+    };
+    remoteSessions.set(tab, session);
+    return session;
+  }
+
+  function requestsNoOpener(features) {
+    return features
+      .split(/[\s,]+/)
+      .some(token => token.toLowerCase() === 'noopener' || token.toLowerCase() === 'noreferrer');
+  }
+
+  // A new auxiliary browsing context gets a copy of this window's session
+  // area (<https://html.spec.whatwg.org/multipage/document-sequences.html#copy-session-storage>).
+  // The storage seam stores JSON-escaped strings, so the seed carries the
+  // encoded keys and values unchanged.
+  function sessionSeed() {
+    const origin = __tbStorageOrigin();
+    if (origin === null || origin === undefined) return null;
+    const entries = [];
+    for (const key of __tbStorageKeys('session')) {
+      entries.push(key, __tbStorageGet('session', key));
+    }
+    return { origin: origin, entries: entries };
+  }
+
   globalThis.open = function(url, target, features) {
     if (arguments.length < 1 || url === undefined || url === null) url = '';
     const spec = url === '' ? '' : __tbResolveUrl(String(url), undefined);
     if (spec === null || spec === undefined) return null;
     const name = target === undefined || target === null ? '' : String(target);
     const featureString = features === undefined || features === null ? '' : String(features);
-    const tab = __tbWindowOpen(spec, name, featureString);
-    return tab === null || tab === undefined ? null : remoteWindow(tab);
+    if (name !== '' && namedWindows.has(name)) return namedWindows.get(name);
+    const seed = requestsNoOpener(featureString) ? null : sessionSeed();
+    const tab = __tbWindowOpen(
+      spec, name, featureString,
+      seed === null ? '' : seed.origin,
+      seed === null ? [] : seed.entries);
+    if (tab === null || tab === undefined) return null;
+    const proxy = remoteWindow(tab);
+    if (name !== '') namedWindows.set(name, proxy);
+    return proxy;
   };
 
   // https://html.spec.whatwg.org/multipage/window-object.html#dom-opener
@@ -2293,6 +2342,8 @@ Object.defineProperty(globalThis, 'top', {
   });
   // Remote-window proxies share these areas for same-origin openers.
   globalThis.__tbStorageArea = area;
+  globalThis.__tbStorageEncode = encode;
+  globalThis.__tbStorageDecode = decode;
 })();
 
 // Platform objects and globals are not serializable; the marker travels with

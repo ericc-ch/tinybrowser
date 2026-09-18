@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 
 use renderer::{
     DialFailure, DialOutcome, DialRequest, FrameId, Mount, RemoteValue, StorageChange,
-    StorageError, StorageKind, TabError, TabEvent,
+    StorageError, StorageKind, StorageSeed, TabError, TabEvent,
 };
 
 /// Browser-minted identity of one top-level document hosted by a renderer.
@@ -77,6 +77,18 @@ pub enum Command {
         /// `__tbEncode` payload from the posting window.
         payload: String,
     },
+    /// Copies one `sessionStorage` seed into the engine.
+    SeedSession {
+        /// The opener's session area for one origin.
+        seed: StorageSeed,
+    },
+    /// Reads one key of this engine's session area for `origin`.
+    RemoteSessionGet {
+        /// Serialized origin of the calling document.
+        origin: String,
+        /// Item key, encoded by the calling realm.
+        key: String,
+    },
 }
 
 /// Renderer reply to one [`Command`].
@@ -88,6 +100,8 @@ pub enum Reply {
     Text(Result<String, TabError>),
     /// Value-only script result.
     Value(Result<RemoteValue, TabError>),
+    /// Optional string result (`RemoteSessionGet`).
+    Optional(Option<String>),
     /// A PNG follows in body frames for this request id; `len` is its exact
     /// byte length. The JSON control plane never carries the bytes.
     Screenshot {
@@ -302,6 +316,8 @@ pub enum ServiceCall {
         name: String,
         /// Feature string from the caller.
         features: String,
+        /// Session copy for the new tab, when the opener sent one.
+        seed: Option<StorageSeed>,
     },
     /// `window.close()` on a window this renderer opened.
     WindowClose {
@@ -316,6 +332,15 @@ pub enum ServiceCall {
         tab: u64,
         /// `__tbEncode` payload from the sender's realm.
         payload: String,
+    },
+    /// Reads one key of another tab's session area for `origin`.
+    RemoteSessionGet {
+        /// Target tab identity.
+        tab: u64,
+        /// Serialized origin of the calling document.
+        origin: String,
+        /// Item key, encoded by the calling realm.
+        key: String,
     },
 }
 
@@ -500,6 +525,44 @@ mod tests {
     }
 
     #[test]
+    fn host_to_renderer_session_commands_round_trip() {
+        let messages = [
+            ToRenderer::Request {
+                id: 20,
+                assignment: RendererAssignmentId::new(1),
+                command: Command::WindowMessage {
+                    payload: "tb1:null".into(),
+                },
+            },
+            ToRenderer::Request {
+                id: 21,
+                assignment: RendererAssignmentId::new(1),
+                command: Command::SeedSession {
+                    seed: StorageSeed {
+                        origin: "http://example.test".into(),
+                        entries: vec![("\"k\"".into(), "\"v\"".into())],
+                    },
+                },
+            },
+            ToRenderer::Request {
+                id: 22,
+                assignment: RendererAssignmentId::new(1),
+                command: Command::RemoteSessionGet {
+                    origin: "http://example.test".into(),
+                    key: "\"k\"".into(),
+                },
+            },
+            ToRenderer::ServiceReply {
+                id: 23,
+                reply: ServiceReply::StorageValue(Some("\"v\"".into())),
+            },
+        ];
+        for message in messages {
+            round_trip(&message);
+        }
+    }
+
+    #[test]
     fn mount_body_is_not_part_of_control_json() {
         let message = ToRenderer::Request {
             id: 1,
@@ -656,6 +719,10 @@ mod tests {
                     url: "http://example.test/".into(),
                     name: "popup".into(),
                     features: "noopener".into(),
+                    seed: Some(StorageSeed {
+                        origin: "http://example.test".into(),
+                        entries: vec![("\"k\"".into(), "\"v\"".into())],
+                    }),
                 },
             },
             FromRenderer::ServiceCall {
@@ -674,6 +741,15 @@ mod tests {
                 call: ServiceCall::WindowMessage {
                     tab: 3,
                     payload: "tb1:null".into(),
+                },
+            },
+            FromRenderer::ServiceCall {
+                assignment: RendererAssignmentId::new(1),
+                id: 19,
+                call: ServiceCall::RemoteSessionGet {
+                    tab: 3,
+                    origin: "http://example.test".into(),
+                    key: "\"k\"".into(),
                 },
             },
         ];

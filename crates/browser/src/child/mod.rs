@@ -32,6 +32,7 @@ use std::thread;
 
 use renderer::{
     BrowserServices, DialCompletion, DialRequest, FrameId, Stop, StorageChange, StorageError,
+    StorageSeed,
 };
 use tokio::sync::{Notify, mpsc};
 use url::Url;
@@ -490,13 +491,20 @@ impl BrowserServices for AssignmentServices {
         }
     }
 
-    fn window_open(&self, url: &str, name: &str, features: &str) -> Option<u64> {
+    fn window_open(
+        &self,
+        url: &str,
+        name: &str,
+        features: &str,
+        seed: Option<&StorageSeed>,
+    ) -> Option<u64> {
         match self.channel.call(
             self.assignment,
             ServiceCall::WindowOpen {
                 url: url.to_owned(),
                 name: name.to_owned(),
                 features: features.to_owned(),
+                seed: seed.cloned(),
             },
         ) {
             Some(ServiceReply::Window(tab)) => tab,
@@ -525,5 +533,19 @@ impl BrowserServices for AssignmentServices {
                 payload: payload.to_owned(),
             },
         );
+    }
+
+    fn remote_session_get(&self, tab: u64, origin: &str, key: &str) -> Option<String> {
+        match self.channel.call(
+            self.assignment,
+            ServiceCall::RemoteSessionGet {
+                tab,
+                origin: origin.to_owned(),
+                key: key.to_owned(),
+            },
+        ) {
+            Some(ServiceReply::StorageValue(value)) => value,
+            _ => None,
+        }
     }
 }

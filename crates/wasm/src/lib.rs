@@ -530,7 +530,13 @@ impl BrowserServices for WasmServices {
         })
     }
 
-    fn window_open(&self, _url: &str, _name: &str, _features: &str) -> Option<u64> {
+    fn window_open(
+        &self,
+        _url: &str,
+        _name: &str,
+        _features: &str,
+        _seed: Option<&renderer::StorageSeed>,
+    ) -> Option<u64> {
         None
     }
 
@@ -541,6 +547,10 @@ impl BrowserServices for WasmServices {
     }
 
     fn window_post_message(&self, _tab: u64, _payload: &str) {}
+
+    fn remote_session_get(&self, _tab: u64, _origin: &str, _key: &str) -> Option<String> {
+        None
+    }
 }
 
 impl Drop for WasmServices {

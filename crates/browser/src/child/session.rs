@@ -370,6 +370,10 @@ fn handle_command(engine: &mut Engine, command: Command, stop: &Arc<Stop>) -> Ha
             engine.receive_remote_window_message(payload);
             Handled::Reply(Reply::Unit(Ok(())))
         }
+        Command::SeedSession { seed } => Handled::Reply(Reply::Unit(engine.seed_session(seed))),
+        Command::RemoteSessionGet { origin, key } => {
+            Handled::Reply(Reply::Optional(engine.session_get(&origin, &key)))
+        }
         Command::Shutdown => {
             stop.request();
             Handled::Shutdown

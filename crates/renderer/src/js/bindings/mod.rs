@@ -1534,7 +1534,13 @@ mod realm_tests {
             None
         }
 
-        fn window_open(&self, _url: &str, _name: &str, _features: &str) -> Option<u64> {
+        fn window_open(
+            &self,
+            _url: &str,
+            _name: &str,
+            _features: &str,
+            _seed: Option<&crate::protocol::StorageSeed>,
+        ) -> Option<u64> {
             None
         }
 
@@ -1545,6 +1551,10 @@ mod realm_tests {
         }
 
         fn window_post_message(&self, _tab: u64, _payload: &str) {}
+
+        fn remote_session_get(&self, _tab: u64, _origin: &str, _key: &str) -> Option<String> {
+            None
+        }
     }
 
     fn world_with_document(

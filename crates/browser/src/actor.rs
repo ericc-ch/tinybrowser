@@ -9,7 +9,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::wire::{Command as RendererCommand, Reply};
-use renderer::{DialFailure, FrameId, Mount, RemoteValue, ResourceLimit, TabError, TabEvent};
+use renderer::{
+    DialFailure, FrameId, Mount, RemoteValue, ResourceLimit, StorageSeed, TabError, TabEvent,
+};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, sleep_until, timeout};
@@ -81,6 +83,17 @@ enum Command {
     WindowMessage {
         payload: String,
         reply: oneshot::Sender<Result<(), TabError>>,
+    },
+    /// Copies one `sessionStorage` seed into this tab's engine.
+    SeedSession {
+        seed: StorageSeed,
+        reply: oneshot::Sender<Result<(), TabError>>,
+    },
+    /// Reads one key of this tab's session area for `origin`.
+    RemoteSessionGet {
+        origin: String,
+        key: String,
+        reply: oneshot::Sender<Result<Option<String>, TabError>>,
     },
     DocumentUrl {
         reply: oneshot::Sender<String>,
@@ -253,6 +266,32 @@ impl TabHandle {
             .and_then(|result| result)
     }
 
+    /// Copies one `sessionStorage` seed into this tab's engine.
+    ///
+    /// # Errors
+    ///
+    /// [`TabError::ActorStopped`] when the coordinator or renderer is gone.
+    pub async fn seed_session(&self, seed: renderer::StorageSeed) -> Result<(), TabError> {
+        self.request(|reply| Command::SeedSession { seed, reply })
+            .await
+            .and_then(|result| result)
+    }
+
+    /// Reads one key of this tab's session area for `origin`.
+    ///
+    /// # Errors
+    ///
+    /// [`TabError::ActorStopped`] when the coordinator or renderer is gone.
+    pub async fn remote_session_get(
+        &self,
+        origin: String,
+        key: String,
+    ) -> Result<Option<String>, TabError> {
+        self.request(|reply| Command::RemoteSessionGet { origin, key, reply })
+            .await
+            .and_then(|result| result)
+    }
+
     /// Sends one command and waits for its reply.
     async fn request<T>(
         &self,
@@ -357,6 +396,8 @@ struct Tab {
     nav: Option<ActiveNavigation>,
     /// Monotonic per tab, never derived from `nav`: see `goto`.
     nav_epoch: u64,
+    /// Opener session copy waiting for the tab's final renderer.
+    pending_seed: Option<StorageSeed>,
     dial_tx: mpsc::UnboundedSender<(u64, Result<NavOutcome, DialFailure>)>,
     dial_rx: mpsc::UnboundedReceiver<(u64, Result<NavOutcome, DialFailure>)>,
     dial_cancel: Option<watch::Sender<bool>>,
@@ -386,6 +427,7 @@ impl Tab {
             navigation_failed: false,
             nav: None,
             nav_epoch: 0,
+            pending_seed: None,
             dial_tx,
             dial_rx,
             dial_cancel: None,
@@ -463,6 +505,7 @@ impl Tab {
 
     async fn mount(&mut self, site: &Site, status: u16, mount: Mount) -> Result<(), TabError> {
         self.ensure_renderer(site).await?;
+        self.apply_pending_seed().await?;
         self.pending_mount = None;
         self.document_loaded = false;
         let result = self
@@ -486,6 +529,7 @@ impl Tab {
         mut body: net::Body,
     ) -> Result<(), TabError> {
         self.ensure_renderer(site).await?;
+        self.apply_pending_seed().await?;
         self.pending_mount = None;
         self.document_loaded = false;
         let renderer = self.renderer.as_ref().ok_or(TabError::ActorStopped)?;
@@ -542,6 +586,42 @@ impl Tab {
             .await?
         {
             Reply::Unit(result) => result,
+            _ => Err(TabError::ActorStopped),
+        }
+    }
+
+    /// Copies one `sessionStorage` seed into this tab's engine.
+    async fn apply_pending_seed(&mut self) -> Result<(), TabError> {
+        let Some(seed) = self.pending_seed.take() else {
+            return Ok(());
+        };
+        let Some(renderer) = self.renderer.clone() else {
+            self.pending_seed = Some(seed);
+            return Ok(());
+        };
+        match renderer
+            .request(RendererCommand::SeedSession { seed })
+            .await?
+        {
+            Reply::Unit(result) => result,
+            _ => Err(TabError::ActorStopped),
+        }
+    }
+
+    /// Reads one key of this tab's session area for `origin`.
+    async fn remote_session_get(
+        &mut self,
+        origin: String,
+        key: String,
+    ) -> Result<Option<String>, TabError> {
+        if self.renderer.is_none() {
+            self.mount_virtual().await?;
+        }
+        match self
+            .renderer_request(RendererCommand::RemoteSessionGet { origin, key })
+            .await?
+        {
+            Reply::Optional(value) => Ok(value),
             _ => Err(TabError::ActorStopped),
         }
     }
@@ -839,6 +919,16 @@ async fn handle_command(tab: &mut Tab, command: Command, waiters: &mut Vec<Waite
         }
         Command::WindowMessage { payload, reply } => {
             let result = tab.deliver_window_message(payload).await;
+            let _result = reply.send(result);
+        }
+        Command::SeedSession { seed, reply } => {
+            // Keep the copy until a renderer exists for the tab's final site:
+            // an about:blank engine is discarded by the first navigation.
+            tab.pending_seed = Some(seed);
+            let _result = reply.send(Ok(()));
+        }
+        Command::RemoteSessionGet { origin, key, reply } => {
+            let result = tab.remote_session_get(origin, key).await;
             let _result = reply.send(result);
         }
         Command::Shutdown { reply } => {
