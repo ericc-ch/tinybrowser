@@ -65,6 +65,11 @@ enum Command {
         url: Url,
         reply: oneshot::Sender<bool>,
     },
+    /// Opens one auxiliary browsing context for `window.open`.
+    OpenWindow {
+        url: String,
+        reply: oneshot::Sender<Result<TabId, BrowserError>>,
+    },
 }
 
 struct BrowserState {
@@ -113,7 +118,14 @@ impl Browser {
     pub fn open_with_network(network: NetworkSession) -> io::Result<Self> {
         let runtime = tokio::runtime::Handle::try_current()
             .map_err(|error| io::Error::other(format!("browser runtime unavailable: {error}")))?;
-        let renderers = Arc::new(RendererProcessManager::new(network.fetch_handle()));
+        let (tx, rx) = mpsc::channel(BROWSER_COMMAND_CAPACITY);
+        let handle = BrowserHandle { tx };
+        // Renderer links create tabs for `window.open`, so they get the same
+        // command handle the adapters use.
+        let renderers = Arc::new(RendererProcessManager::new(
+            network.fetch_handle(),
+            handle.clone(),
+        ));
         let state = BrowserState {
             live: true,
             network,
@@ -121,11 +133,8 @@ impl Browser {
             tabs: HashMap::new(),
             next_tab: 1,
         };
-        let (tx, rx) = mpsc::channel(BROWSER_COMMAND_CAPACITY);
         runtime.spawn(browser_loop(rx, state));
-        Ok(Self {
-            handle: BrowserHandle { tx },
-        })
+        Ok(Self { handle })
     }
 
     /// Value-only handle for this browser.
@@ -226,6 +235,18 @@ impl BrowserHandle {
             .await
     }
 
+    /// Opens one auxiliary browsing context for `window.open`; an empty `url`
+    /// leaves the new tab on `about:blank`.
+    ///
+    /// # Errors
+    ///
+    /// [`BrowserError::Stopped`] when the browser task has stopped.
+    pub async fn open_window(&self, url: String) -> Result<TabId, BrowserError> {
+        self.request(move |reply| Command::OpenWindow { url, reply })
+            .await
+            .and_then(|result| result)
+    }
+
     /// Stops every tab, persists the profile, and refuses later commands.
     ///
     /// # Errors
@@ -279,6 +300,31 @@ async fn browser_loop(mut commands: mpsc::Receiver<Command>, mut state: BrowserS
                     let handle = task.handle.clone();
                     state.tabs.insert(id, task);
                     Ok(handle)
+                } else {
+                    Err(BrowserError::Stopped)
+                };
+                let _result = reply.send(result);
+            }
+            Command::OpenWindow { url, reply } => {
+                let result = if state.live {
+                    let id = TabId::new(state.next_tab);
+                    state.next_tab = state.next_tab.saturating_add(1);
+                    let task = TabTask::spawn(
+                        id,
+                        state.network.fetch_handle(),
+                        Arc::clone(&state.renderers),
+                    );
+                    let handle = task.handle.clone();
+                    state.tabs.insert(id, task);
+                    if !url.is_empty() && url != "about:blank" {
+                        // The tab starts on about:blank; the first real
+                        // navigation runs in the background so one slow load
+                        // cannot stall the browser command loop.
+                        tokio::spawn(async move {
+                            let _result = handle.goto(&url).await;
+                        });
+                    }
+                    Ok(id)
                 } else {
                     Err(BrowserError::Stopped)
                 };

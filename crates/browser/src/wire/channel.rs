@@ -25,8 +25,8 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 /// Framing and message ABI version for the renderer channel.
 ///
 /// Version 5 added the storage service calls and the browser-broadcast
-/// `storage` event.
-pub const PROTOCOL_VERSION: u8 = 5;
+/// `storage` event. Version 6 added `window.open`/`window.close`.
+pub const PROTOCOL_VERSION: u8 = 6;
 
 /// Fixed frame header size in bytes.
 pub const HEADER_BYTES: usize = 16;

@@ -1533,6 +1533,12 @@ mod realm_tests {
         ) -> Option<crate::protocol::StorageChange> {
             None
         }
+
+        fn window_open(&self, _url: &str, _name: &str, _features: &str) -> Option<u64> {
+            None
+        }
+
+        fn window_close(&self, _tab: u64) {}
     }
 
     fn world_with_document(

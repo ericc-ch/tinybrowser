@@ -11,6 +11,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 use tokio::process::Child;
 
+use crate::actor::TabId;
 use crate::manager::RendererId;
 use crate::network::FetchHandle;
 use crate::site::Site;
@@ -522,6 +523,8 @@ pub(crate) struct ReaderContext {
     site: Arc<Mutex<Option<Site>>>,
     released: Arc<AtomicU64>,
     kill: watch::Sender<bool>,
+    /// Browser command handle: renderer links create tabs for `window.open`.
+    browser: crate::browser::BrowserHandle,
 }
 
 pub(crate) async fn writer_task(
@@ -797,6 +800,52 @@ async fn route_service_call(
         | ServiceCall::StorageClear { .. }) => {
             return route_storage_call(context, assignment, id, call).await;
         }
+        call @ (ServiceCall::WindowOpen { .. } | ServiceCall::WindowClose { .. }) => {
+            return route_window_call(context, id, call).await;
+        }
+    }
+    Ok(())
+}
+
+/// Routes one `window.open`/`window.close` service call. Step 1 creates the
+/// tab and starts its first navigation; names, opener relationships,
+/// `noopener`, and session copy land with the messaging slice.
+async fn route_window_call(
+    context: &ReaderContext,
+    id: u64,
+    call: ServiceCall,
+) -> Result<(), RendererViolation> {
+    match call {
+        ServiceCall::WindowOpen { url, .. } => {
+            let spec = if url.is_empty() || url == "about:blank" {
+                Some(String::new())
+            } else {
+                url::Url::parse(&url)
+                    .ok()
+                    .filter(|url| matches!(url.scheme(), "http" | "https"))
+                    .map(|url| url.to_string())
+            };
+            let tab = match spec {
+                Some(spec) => context.browser.open_window(spec).await.ok().map(TabId::get),
+                None => None,
+            };
+            send_reply(&context.tx, id, ServiceReply::Window(tab)).await?;
+        }
+        ServiceCall::WindowClose { tab } => {
+            let _result = context.browser.close_tab(TabId::new(tab)).await;
+            send_reply(&context.tx, id, ServiceReply::Unit).await?;
+        }
+        ServiceCall::Dial(_)
+        | ServiceCall::CookieGet { .. }
+        | ServiceCall::CookieSet { .. }
+        | ServiceCall::StorageGet { .. }
+        | ServiceCall::StorageKeys { .. }
+        | ServiceCall::StorageSet { .. }
+        | ServiceCall::StorageRemove { .. }
+        | ServiceCall::StorageClear { .. } => {
+            // `route_service_call` dispatches the other service families.
+            return Err(RendererViolation);
+        }
     }
     Ok(())
 }
@@ -876,7 +925,11 @@ async fn route_storage_call(
                 .storage_clear(&origin, &url, (assignment, source));
             send_reply(&context.tx, id, ServiceReply::StorageChanged(Ok(change))).await?;
         }
-        ServiceCall::Dial(_) | ServiceCall::CookieGet { .. } | ServiceCall::CookieSet { .. } => {
+        ServiceCall::Dial(_)
+        | ServiceCall::CookieGet { .. }
+        | ServiceCall::CookieSet { .. }
+        | ServiceCall::WindowOpen { .. }
+        | ServiceCall::WindowClose { .. } => {
             // `route_service_call` dispatches the other service families.
             return Err(RendererViolation);
         }
@@ -898,12 +951,13 @@ async fn send_released_reply(
     let reply = match call {
         ServiceCall::Dial(_) => ServiceReply::Dial(Err(renderer::DialFailure::Cancelled)),
         ServiceCall::CookieGet { .. } => ServiceReply::Cookie(String::new()),
-        ServiceCall::CookieSet { .. } => ServiceReply::Unit,
+        ServiceCall::CookieSet { .. } | ServiceCall::WindowClose { .. } => ServiceReply::Unit,
         ServiceCall::StorageGet { .. } => ServiceReply::StorageValue(None),
         ServiceCall::StorageKeys { .. } => ServiceReply::StorageKeys(Vec::new()),
         ServiceCall::StorageSet { .. }
         | ServiceCall::StorageRemove { .. }
         | ServiceCall::StorageClear { .. } => ServiceReply::StorageChanged(Ok(None)),
+        ServiceCall::WindowOpen { .. } => ServiceReply::Window(None),
     };
     send_reply(tx, id, reply).await
 }
@@ -1023,6 +1077,7 @@ pub(crate) async fn spawn_process(
     id: RendererId,
     site: Option<Site>,
     fetch: FetchHandle,
+    browser: crate::browser::BrowserHandle,
     slot: tokio::sync::OwnedSemaphorePermit,
 ) -> io::Result<RendererHandle> {
     let mut command = Command::new(std::env::current_exe()?);
@@ -1086,6 +1141,7 @@ pub(crate) async fn spawn_process(
         site: Arc::clone(&site),
         released: Arc::clone(&released),
         kill: kill.clone(),
+        browser,
     };
     let reader_task = tokio::spawn(reader_task(reader, reader_context, Some(ready_tx)));
     let stderr_task = tokio::spawn(forward_stderr(stderr));

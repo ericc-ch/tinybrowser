@@ -529,6 +529,12 @@ impl BrowserServices for WasmServices {
             new_value: None,
         })
     }
+
+    fn window_open(&self, _url: &str, _name: &str, _features: &str) -> Option<u64> {
+        None
+    }
+
+    fn window_close(&self, _tab: u64) {}
 }
 
 impl Drop for WasmServices {

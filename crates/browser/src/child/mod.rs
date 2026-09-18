@@ -349,6 +349,7 @@ impl ChannelServices {
                 | ServiceReply::StorageValue(_)
                 | ServiceReply::StorageKeys(_)
                 | ServiceReply::StorageChanged(_)
+                | ServiceReply::Window(_)
                 | ServiceReply::Unit => {
                     completion(Err(renderer::DialFailure::Connect));
                 }
@@ -487,5 +488,25 @@ impl BrowserServices for AssignmentServices {
             Some(ServiceReply::StorageChanged(Ok(change))) => change,
             _ => None,
         }
+    }
+
+    fn window_open(&self, url: &str, name: &str, features: &str) -> Option<u64> {
+        match self.channel.call(
+            self.assignment,
+            ServiceCall::WindowOpen {
+                url: url.to_owned(),
+                name: name.to_owned(),
+                features: features.to_owned(),
+            },
+        ) {
+            Some(ServiceReply::Window(tab)) => tab,
+            _ => None,
+        }
+    }
+
+    fn window_close(&self, tab: u64) {
+        let _result = self
+            .channel
+            .call(self.assignment, ServiceCall::WindowClose { tab });
     }
 }

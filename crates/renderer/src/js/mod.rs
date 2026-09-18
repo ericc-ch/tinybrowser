@@ -444,6 +444,7 @@ impl JsRealm {
             self.install_task_host_functions(&ctx, &world)?;
             Self::install_document_host_functions(&ctx, &world)?;
             install_storage_host_functions(&ctx, &world)?;
+            install_window_host_functions(&ctx, &world)?;
             bindings::install_messaging(&ctx)?;
             ctx.eval::<(), _>(INSTALL_WEB_APIS_JS)?;
             Ok(())
@@ -576,6 +577,42 @@ impl JsRealm {
         )?;
         Ok(())
     }
+}
+
+/// `window.open`/`window.close` hooks the JS shim calls.
+fn install_window_host_functions(ctx: &Ctx<'_>, world: &Rc<RefCell<World>>) -> Result<(), JsError> {
+    let window_open = world.clone();
+    ctx.globals().set(
+        "__tbWindowOpen",
+        Func::from(move |url: String, name: String, features: String| {
+            let spec = if url.is_empty() {
+                Some(String::new())
+            } else {
+                window_open
+                    .borrow()
+                    .document_url
+                    .join(&url)
+                    .ok()
+                    .map(|url| url.to_string())
+            };
+            spec.and_then(|spec| {
+                window_open
+                    .borrow()
+                    .runtime
+                    .services
+                    .window_open(&spec, &name, &features)
+            })
+        }),
+    )?;
+
+    let window_close = world.clone();
+    ctx.globals().set(
+        "__tbWindowClose",
+        Func::from(move |tab: u64| {
+            window_close.borrow().runtime.services.window_close(tab);
+        }),
+    )?;
+    Ok(())
 }
 
 /// `localStorage`/`sessionStorage` hooks the JS shim calls. The session area

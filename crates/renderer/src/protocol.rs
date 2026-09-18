@@ -369,6 +369,13 @@ pub trait BrowserServices: Send + Sync + 'static {
 
     /// `localStorage.clear()`; `None` means the area was empty.
     fn storage_clear(&self, origin: &str, url: &str, source: FrameId) -> Option<StorageChange>;
+
+    /// `window.open(url, target, features)`; `None` when the browser refused
+    /// to open a window. `url` is absolute, or empty for `about:blank`.
+    fn window_open(&self, url: &str, name: &str, features: &str) -> Option<u64>;
+
+    /// `window.close()` on a window this realm opened.
+    fn window_close(&self, tab: u64);
 }
 
 #[cfg(test)]

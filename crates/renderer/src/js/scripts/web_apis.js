@@ -2001,6 +2001,48 @@ Object.defineProperty(globalThis, 'top', {
   }
 })();
 
+// ── auxiliary windows ──────────────────────────────────────────────────
+// `window.open` creates a browser tab. Step 1 exposes `close()` and
+// `closed`; messaging (`postMessage`), `opener`, session copy, and named
+// windows land with the messaging slice
+// (<https://html.spec.whatwg.org/multipage/window-object.html#dom-open>).
+(function() {
+  const remoteWindows = new Map();
+
+  function remoteWindow(tab) {
+    const existing = remoteWindows.get(tab);
+    if (existing !== undefined) return existing;
+    const handler = {
+      get(target, property) {
+        switch (property) {
+          case 'close': return () => { __tbWindowClose(tab); };
+          case 'closed': return false;
+          case Symbol.toStringTag: return 'Window';
+          default: return undefined;
+        }
+      },
+      has(target, property) {
+        return property === 'close' || property === 'closed';
+      },
+      getOwnPropertyDescriptor() { return undefined; },
+      ownKeys() { return []; },
+    };
+    const proxy = new Proxy({}, handler);
+    remoteWindows.set(tab, proxy);
+    return proxy;
+  }
+
+  globalThis.open = function(url, target, features) {
+    if (arguments.length < 1 || url === undefined || url === null) url = '';
+    const spec = url === '' ? '' : __tbResolveUrl(String(url), undefined);
+    if (spec === null || spec === undefined) return null;
+    const name = target === undefined || target === null ? '' : String(target);
+    const featureString = features === undefined || features === null ? '' : String(features);
+    const tab = __tbWindowOpen(spec, name, featureString);
+    return tab === null || tab === undefined ? null : remoteWindow(tab);
+  };
+})();
+
 // ── web storage ─────────────────────────────────────────────────────────
 // `localStorage` and `sessionStorage` are one interface over two areas: the
 // browser process owns the local area (shared by every tab, persisted with

@@ -289,6 +289,20 @@ pub enum ServiceCall {
         /// Frame whose script made the change.
         source: FrameId,
     },
+    /// `window.open(url, target, features)`.
+    WindowOpen {
+        /// Absolute URL to load, or empty for `about:blank`.
+        url: String,
+        /// Browsing context name.
+        name: String,
+        /// Feature string from the caller.
+        features: String,
+    },
+    /// `window.close()` on a window this renderer opened.
+    WindowClose {
+        /// Browser-minted tab identity.
+        tab: u64,
+    },
 }
 
 /// Answer to a [`ServiceCall`].
@@ -304,6 +318,8 @@ pub enum ServiceReply {
     StorageKeys(Vec<String>),
     /// Local storage mutation result; `Ok(None)` means nothing changed.
     StorageChanged(Result<Option<StorageChange>, StorageError>),
+    /// `window.open` result: the new tab, or `None` when it was refused.
+    Window(Option<u64>),
     /// No payload (`CookieSet`).
     Unit,
 }
@@ -428,6 +444,10 @@ mod tests {
             ToRenderer::ServiceReply {
                 id: 15,
                 reply: ServiceReply::StorageChanged(Err(StorageError::QuotaExceeded)),
+            },
+            ToRenderer::ServiceReply {
+                id: 17,
+                reply: ServiceReply::Window(Some(3)),
             },
             ToRenderer::StorageEvent {
                 origin: "http://example.test".into(),
@@ -589,6 +609,20 @@ mod tests {
                     url: "http://example.test/".into(),
                     source: FrameId::MAIN,
                 },
+            },
+            FromRenderer::ServiceCall {
+                assignment: RendererAssignmentId::new(1),
+                id: 15,
+                call: ServiceCall::WindowOpen {
+                    url: "http://example.test/".into(),
+                    name: "popup".into(),
+                    features: "noopener".into(),
+                },
+            },
+            FromRenderer::ServiceCall {
+                assignment: RendererAssignmentId::new(1),
+                id: 16,
+                call: ServiceCall::WindowClose { tab: 3 },
             },
         ];
         for message in messages {
