@@ -535,6 +535,12 @@ impl BrowserServices for WasmServices {
     }
 
     fn window_close(&self, _tab: u64) {}
+
+    fn window_opener(&self) -> Option<u64> {
+        None
+    }
+
+    fn window_post_message(&self, _tab: u64, _payload: &str) {}
 }
 
 impl Drop for WasmServices {

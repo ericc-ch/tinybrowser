@@ -72,6 +72,11 @@ pub enum Command {
     },
     /// Stop the renderer loop.
     Shutdown,
+    /// Delivers one remote `message` event, encoded by the sender's realm.
+    WindowMessage {
+        /// `__tbEncode` payload from the posting window.
+        payload: String,
+    },
 }
 
 /// Renderer reply to one [`Command`].
@@ -303,6 +308,15 @@ pub enum ServiceCall {
         /// Browser-minted tab identity.
         tab: u64,
     },
+    /// `window.opener` for this assignment's tab.
+    Opener,
+    /// `postMessage` to a window this renderer opened.
+    WindowMessage {
+        /// Target tab identity.
+        tab: u64,
+        /// `__tbEncode` payload from the sender's realm.
+        payload: String,
+    },
 }
 
 /// Answer to a [`ServiceCall`].
@@ -395,6 +409,13 @@ mod tests {
                 id: 6,
                 assignment: RendererAssignmentId::new(1),
                 command: Command::Shutdown,
+            },
+            ToRenderer::Request {
+                id: 7,
+                assignment: RendererAssignmentId::new(1),
+                command: Command::WindowMessage {
+                    payload: "tb1:null".into(),
+                },
             },
             ToRenderer::ResponseStart {
                 id: 10,
@@ -565,6 +586,15 @@ mod tests {
                     url: "http://example.test/".into(),
                 },
             },
+        ];
+        for message in messages {
+            round_trip(&message);
+        }
+    }
+
+    #[test]
+    fn renderer_to_host_storage_calls_round_trip() {
+        let messages = [
             FromRenderer::ServiceCall {
                 assignment: RendererAssignmentId::new(1),
                 id: 10,
@@ -610,6 +640,15 @@ mod tests {
                     source: FrameId::MAIN,
                 },
             },
+        ];
+        for message in messages {
+            round_trip(&message);
+        }
+    }
+
+    #[test]
+    fn renderer_to_host_window_calls_round_trip() {
+        let messages = [
             FromRenderer::ServiceCall {
                 assignment: RendererAssignmentId::new(1),
                 id: 15,
@@ -623,6 +662,19 @@ mod tests {
                 assignment: RendererAssignmentId::new(1),
                 id: 16,
                 call: ServiceCall::WindowClose { tab: 3 },
+            },
+            FromRenderer::ServiceCall {
+                assignment: RendererAssignmentId::new(1),
+                id: 17,
+                call: ServiceCall::Opener,
+            },
+            FromRenderer::ServiceCall {
+                assignment: RendererAssignmentId::new(1),
+                id: 18,
+                call: ServiceCall::WindowMessage {
+                    tab: 3,
+                    payload: "tb1:null".into(),
+                },
             },
         ];
         for message in messages {

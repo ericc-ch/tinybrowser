@@ -509,4 +509,21 @@ impl BrowserServices for AssignmentServices {
             .channel
             .call(self.assignment, ServiceCall::WindowClose { tab });
     }
+
+    fn window_opener(&self) -> Option<u64> {
+        match self.channel.call(self.assignment, ServiceCall::Opener) {
+            Some(ServiceReply::Window(tab)) => tab,
+            _ => None,
+        }
+    }
+
+    fn window_post_message(&self, tab: u64, payload: &str) {
+        let _result = self.channel.call(
+            self.assignment,
+            ServiceCall::WindowMessage {
+                tab,
+                payload: payload.to_owned(),
+            },
+        );
+    }
 }

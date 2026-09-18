@@ -388,6 +388,15 @@ impl Engine {
         }
     }
 
+    /// Queues one remote `postMessage` payload on the main frame's task
+    /// source; the frame dispatches a trusted `message` event with a null
+    /// source.
+    pub fn receive_remote_window_message(&mut self, payload: String) {
+        if let Some(document) = self.frames.get_mut(&FrameId::MAIN) {
+            document.push_remote_message(payload);
+        }
+    }
+
     /// Queues one `localStorage` change that the browser broadcast. The source
     /// frame is set only when the change came from this same assignment;
     /// other renderers and assignments pass `None`.

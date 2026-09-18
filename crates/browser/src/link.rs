@@ -800,23 +800,27 @@ async fn route_service_call(
         | ServiceCall::StorageClear { .. }) => {
             return route_storage_call(context, assignment, id, call).await;
         }
-        call @ (ServiceCall::WindowOpen { .. } | ServiceCall::WindowClose { .. }) => {
-            return route_window_call(context, id, call).await;
+        call @ (ServiceCall::WindowOpen { .. }
+        | ServiceCall::WindowClose { .. }
+        | ServiceCall::Opener
+        | ServiceCall::WindowMessage { .. }) => {
+            return route_window_call(context, assignment, id, call).await;
         }
     }
     Ok(())
 }
 
-/// Routes one `window.open`/`window.close` service call. Step 1 creates the
-/// tab and starts its first navigation; names, opener relationships,
-/// `noopener`, and session copy land with the messaging slice.
+/// Routes one `window.open`/`window.close`/`postMessage` service call. Step 1
+/// created the tab and its first navigation; step 2 adds the opener link and
+/// cross-tab messaging.
 async fn route_window_call(
     context: &ReaderContext,
+    assignment: RendererAssignmentId,
     id: u64,
     call: ServiceCall,
 ) -> Result<(), RendererViolation> {
     match call {
-        ServiceCall::WindowOpen { url, .. } => {
+        ServiceCall::WindowOpen { url, features, .. } => {
             let spec = if url.is_empty() || url == "about:blank" {
                 Some(String::new())
             } else {
@@ -825,14 +829,48 @@ async fn route_window_call(
                     .filter(|url| matches!(url.scheme(), "http" | "https"))
                     .map(|url| url.to_string())
             };
+            let source = context
+                .browser
+                .assignment_tab(assignment.get())
+                .await
+                .ok()
+                .flatten();
+            let noopener = features
+                .split(|character: char| character.is_ascii_whitespace() || character == ',')
+                .any(|feature| {
+                    feature.eq_ignore_ascii_case("noopener")
+                        || feature.eq_ignore_ascii_case("noreferrer")
+                });
             let tab = match spec {
-                Some(spec) => context.browser.open_window(spec).await.ok().map(TabId::get),
+                Some(spec) => context
+                    .browser
+                    .open_window(spec, source, noopener)
+                    .await
+                    .ok()
+                    .map(TabId::get),
                 None => None,
             };
             send_reply(&context.tx, id, ServiceReply::Window(tab)).await?;
         }
         ServiceCall::WindowClose { tab } => {
             let _result = context.browser.close_tab(TabId::new(tab)).await;
+            send_reply(&context.tx, id, ServiceReply::Unit).await?;
+        }
+        ServiceCall::Opener => {
+            let opener = context
+                .browser
+                .opener_tab(assignment.get())
+                .await
+                .ok()
+                .flatten()
+                .map(TabId::get);
+            send_reply(&context.tx, id, ServiceReply::Window(opener)).await?;
+        }
+        ServiceCall::WindowMessage { tab, payload } => {
+            let _result = context
+                .browser
+                .window_message(TabId::new(tab), payload)
+                .await;
             send_reply(&context.tx, id, ServiceReply::Unit).await?;
         }
         ServiceCall::Dial(_)
@@ -929,7 +967,9 @@ async fn route_storage_call(
         | ServiceCall::CookieGet { .. }
         | ServiceCall::CookieSet { .. }
         | ServiceCall::WindowOpen { .. }
-        | ServiceCall::WindowClose { .. } => {
+        | ServiceCall::WindowClose { .. }
+        | ServiceCall::Opener
+        | ServiceCall::WindowMessage { .. } => {
             // `route_service_call` dispatches the other service families.
             return Err(RendererViolation);
         }
@@ -951,13 +991,15 @@ async fn send_released_reply(
     let reply = match call {
         ServiceCall::Dial(_) => ServiceReply::Dial(Err(renderer::DialFailure::Cancelled)),
         ServiceCall::CookieGet { .. } => ServiceReply::Cookie(String::new()),
-        ServiceCall::CookieSet { .. } | ServiceCall::WindowClose { .. } => ServiceReply::Unit,
+        ServiceCall::CookieSet { .. }
+        | ServiceCall::WindowClose { .. }
+        | ServiceCall::WindowMessage { .. } => ServiceReply::Unit,
         ServiceCall::StorageGet { .. } => ServiceReply::StorageValue(None),
         ServiceCall::StorageKeys { .. } => ServiceReply::StorageKeys(Vec::new()),
         ServiceCall::StorageSet { .. }
         | ServiceCall::StorageRemove { .. }
         | ServiceCall::StorageClear { .. } => ServiceReply::StorageChanged(Ok(None)),
-        ServiceCall::WindowOpen { .. } => ServiceReply::Window(None),
+        ServiceCall::WindowOpen { .. } | ServiceCall::Opener => ServiceReply::Window(None),
     };
     send_reply(tx, id, reply).await
 }

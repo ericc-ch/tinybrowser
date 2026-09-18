@@ -376,6 +376,13 @@ pub trait BrowserServices: Send + Sync + 'static {
 
     /// `window.close()` on a window this realm opened.
     fn window_close(&self, tab: u64);
+
+    /// `window.opener` for this realm's tab; `None` when there is none.
+    fn window_opener(&self) -> Option<u64>;
+
+    /// `postMessage` to a window this realm opened, encoded by the caller's
+    /// realm.
+    fn window_post_message(&self, tab: u64, payload: &str);
 }
 
 #[cfg(test)]

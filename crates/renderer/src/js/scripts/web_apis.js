@@ -1912,6 +1912,21 @@ globalThis.__tbDeliverMessageError = function(sourceFrame, origin) {
     data: null, origin: origin, source: __tbFrameProxy(sourceFrame),
   }));
 };
+// A message from another tab cannot name a frame in this renderer, so its
+// source is `null`
+// (<https://html.spec.whatwg.org/multipage/web-messaging.html#window-post-message-steps>).
+globalThis.__tbDeliverRemoteMessage = function(payload) {
+  if (String(payload).indexOf(__tbPayloadVersion) !== 0) return;
+  let data;
+  try {
+    data = __tbDecode(payload, []);
+  } catch (error) {
+    return;
+  }
+  globalThis.__tbDispatchTrusted(new globalThis.MessageEvent('message', {
+    data: data, origin: '', source: null, ports: Object.freeze([]),
+  }));
+};
 globalThis.__tbDeliverPortMessage = function(endpoint, payload, portIds) {
   const port = __tbPortLookup(endpoint);
   if (port === null) return true;
@@ -2017,12 +2032,23 @@ Object.defineProperty(globalThis, 'top', {
         switch (property) {
           case 'close': return () => { __tbWindowClose(tab); };
           case 'closed': return false;
+          case 'postMessage': return (message, targetOrigin, transfer) => {
+            const encoded = __tbEncode(message, transfer ?? [], null);
+            __tbWindowPostMessage(tab, encoded.payload);
+          };
+          case 'localStorage': return globalThis.__tbStorageArea('local');
+          case 'sessionStorage': return globalThis.__tbStorageArea('session');
           case Symbol.toStringTag: return 'Window';
           default: return undefined;
         }
       },
       has(target, property) {
-        return property === 'close' || property === 'closed';
+        switch (property) {
+          case 'close': case 'closed': case 'postMessage':
+          case 'localStorage': case 'sessionStorage':
+            return true;
+        }
+        return false;
       },
       getOwnPropertyDescriptor() { return undefined; },
       ownKeys() { return []; },
@@ -2041,6 +2067,15 @@ Object.defineProperty(globalThis, 'top', {
     const tab = __tbWindowOpen(spec, name, featureString);
     return tab === null || tab === undefined ? null : remoteWindow(tab);
   };
+
+  // https://html.spec.whatwg.org/multipage/window-object.html#dom-opener
+  Object.defineProperty(globalThis, 'opener', {
+    get() {
+      const tab = __tbWindowOpener();
+      return tab === null || tab === undefined ? null : remoteWindow(tab);
+    },
+    configurable: true,
+  });
 })();
 
 // ── web storage ─────────────────────────────────────────────────────────
@@ -2256,6 +2291,8 @@ Object.defineProperty(globalThis, 'top', {
   Object.defineProperty(globalThis, 'sessionStorage', {
     get() { return area('session'); }, configurable: true,
   });
+  // Remote-window proxies share these areas for same-origin openers.
+  globalThis.__tbStorageArea = area;
 })();
 
 // Platform objects and globals are not serializable; the marker travels with

@@ -322,6 +322,20 @@ impl JsRealm {
         })
     }
 
+    /// Dispatches one cross-tab `message` event in this realm; the source is
+    /// `null` because the posting window lives in another renderer.
+    /// (<https://html.spec.whatwg.org/multipage/web-messaging.html#window-post-message-steps>)
+    pub(crate) fn deliver_remote_message(&self, payload: &str) -> Result<(), JsError> {
+        let payload = payload.to_owned();
+        self.with_budget(None, || {
+            self.context.with(|ctx| {
+                let deliver: Function = ctx.globals().get("__tbDeliverRemoteMessage")?;
+                deliver.call::<_, ()>((payload,))?;
+                Ok(())
+            })
+        })
+    }
+
     /// Decodes and dispatches one channel message in this realm.
     pub(crate) fn deliver_port_message(
         &self,
@@ -610,6 +624,24 @@ fn install_window_host_functions(ctx: &Ctx<'_>, world: &Rc<RefCell<World>>) -> R
         "__tbWindowClose",
         Func::from(move |tab: u64| {
             window_close.borrow().runtime.services.window_close(tab);
+        }),
+    )?;
+
+    let opener = world.clone();
+    ctx.globals().set(
+        "__tbWindowOpener",
+        Func::from(move || opener.borrow().runtime.services.window_opener()),
+    )?;
+
+    let post_message = world.clone();
+    ctx.globals().set(
+        "__tbWindowPostMessage",
+        Func::from(move |tab: u64, payload: String| {
+            post_message
+                .borrow()
+                .runtime
+                .services
+                .window_post_message(tab, &payload);
         }),
     )?;
     Ok(())

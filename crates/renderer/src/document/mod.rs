@@ -41,6 +41,8 @@ enum Task {
     DialFailed(DialContext),
     WindowMessage(WindowMessage),
     StorageEvent(crate::storage::PendingStorageEvent),
+    /// One cross-tab `message` payload from another renderer.
+    RemoteMessage(String),
     PortMessage {
         endpoint: u64,
         payload: String,
@@ -485,6 +487,12 @@ impl Document {
         self.tasks.push_back(Task::StorageEvent(event));
     }
 
+    /// Queues one cross-tab `message` as a task on this frame's task source
+    /// (<https://html.spec.whatwg.org/multipage/web-messaging.html#posted-message-task-source>).
+    pub(crate) fn push_remote_message(&mut self, payload: String) {
+        self.tasks.push_back(Task::RemoteMessage(payload));
+    }
+
     /// Queues one channel message as a task on this frame's task source.
     pub(crate) fn push_port_message(&mut self, endpoint: u64, payload: String, ports: Vec<u64>) {
         self.tasks.push_back(Task::PortMessage {
@@ -497,6 +505,15 @@ impl Document {
     /// Queues a `close` event for one channel endpoint.
     pub(crate) fn push_port_closed(&mut self, endpoint: u64) {
         self.tasks.push_back(Task::PortClosed { endpoint });
+    }
+
+    /// Dispatches one cross-tab `message` event at this frame's window.
+    fn deliver_remote_message(&mut self, payload: &str) {
+        if !self.ensure_js_ok() {
+            return;
+        }
+        self.fire_js(|js| js.deliver_remote_message(payload));
+        self.adopt_js_work();
     }
 
     /// Fires one `storage` event at this frame's window

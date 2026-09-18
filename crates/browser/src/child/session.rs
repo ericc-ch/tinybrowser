@@ -366,6 +366,10 @@ fn handle_command(engine: &mut Engine, command: Command, stop: &Arc<Stop>) -> Ha
             Ok(png) => Handled::Screenshot(png),
             Err(error) => Handled::Reply(Reply::Screenshot { result: Err(error) }),
         },
+        Command::WindowMessage { payload } => {
+            engine.receive_remote_window_message(payload);
+            Handled::Reply(Reply::Unit(Ok(())))
+        }
         Command::Shutdown => {
             stop.request();
             Handled::Shutdown

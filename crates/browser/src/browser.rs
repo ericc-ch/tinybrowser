@@ -68,7 +68,32 @@ enum Command {
     /// Opens one auxiliary browsing context for `window.open`.
     OpenWindow {
         url: String,
+        /// Tab that called `window.open`, when the link could resolve it.
+        source: Option<TabId>,
+        /// The caller asked for `noopener`/`noreferrer`; no opener link.
+        noopener: bool,
         reply: oneshot::Sender<Result<TabId, BrowserError>>,
+    },
+    /// Records which tab owns one renderer assignment.
+    RegisterAssignment {
+        assignment: u64,
+        tab: TabId,
+    },
+    /// The tab that owns one renderer assignment.
+    AssignmentTab {
+        assignment: u64,
+        reply: oneshot::Sender<Option<TabId>>,
+    },
+    /// `window.opener` for one assignment's tab.
+    OpenerTab {
+        assignment: u64,
+        reply: oneshot::Sender<Option<TabId>>,
+    },
+    /// Routes one `postMessage` to a live tab.
+    WindowMessage {
+        target: TabId,
+        payload: String,
+        reply: oneshot::Sender<Result<(), BrowserError>>,
     },
 }
 
@@ -76,8 +101,13 @@ struct BrowserState {
     live: bool,
     network: NetworkSession,
     renderers: Arc<RendererProcessManager>,
+    browser: BrowserHandle,
     tabs: HashMap<TabId, TabTask>,
     next_tab: u64,
+    /// Which tab owns each renderer assignment.
+    assignments: HashMap<u64, TabId>,
+    /// Auxiliary browsing context relationships: openee -> opener.
+    openers: HashMap<TabId, TabId>,
 }
 
 impl Browser {
@@ -130,8 +160,11 @@ impl Browser {
             live: true,
             network,
             renderers,
+            browser: handle.clone(),
             tabs: HashMap::new(),
             next_tab: 1,
+            assignments: HashMap::new(),
+            openers: HashMap::new(),
         };
         runtime.spawn(browser_loop(rx, state));
         Ok(Self { handle })
@@ -236,15 +269,75 @@ impl BrowserHandle {
     }
 
     /// Opens one auxiliary browsing context for `window.open`; an empty `url`
-    /// leaves the new tab on `about:blank`.
+    /// leaves the new tab on `about:blank`. `source` records the opener
+    /// relationship unless `noopener` is set.
     ///
     /// # Errors
     ///
     /// [`BrowserError::Stopped`] when the browser task has stopped.
-    pub async fn open_window(&self, url: String) -> Result<TabId, BrowserError> {
-        self.request(move |reply| Command::OpenWindow { url, reply })
+    pub async fn open_window(
+        &self,
+        url: String,
+        source: Option<TabId>,
+        noopener: bool,
+    ) -> Result<TabId, BrowserError> {
+        self.request(move |reply| Command::OpenWindow {
+            url,
+            source,
+            noopener,
+            reply,
+        })
+        .await
+        .and_then(|result| result)
+    }
+
+    /// Records which tab owns one renderer assignment.
+    ///
+    /// # Errors
+    ///
+    /// [`BrowserError::Stopped`] when the browser task has stopped.
+    pub async fn register_assignment(
+        &self,
+        assignment: u64,
+        tab: TabId,
+    ) -> Result<(), BrowserError> {
+        self.send(Command::RegisterAssignment { assignment, tab })
             .await
-            .and_then(|result| result)
+    }
+
+    /// The tab that owns one renderer assignment.
+    ///
+    /// # Errors
+    ///
+    /// [`BrowserError::Stopped`] when the browser task has stopped.
+    pub async fn assignment_tab(&self, assignment: u64) -> Result<Option<TabId>, BrowserError> {
+        self.request(move |reply| Command::AssignmentTab { assignment, reply })
+            .await
+    }
+
+    /// `window.opener` for one assignment's tab.
+    ///
+    /// # Errors
+    ///
+    /// [`BrowserError::Stopped`] when the browser task has stopped.
+    pub async fn opener_tab(&self, assignment: u64) -> Result<Option<TabId>, BrowserError> {
+        self.request(move |reply| Command::OpenerTab { assignment, reply })
+            .await
+    }
+
+    /// Routes one `postMessage` payload to `target`.
+    ///
+    /// # Errors
+    ///
+    /// [`BrowserError::UnknownTab`] when the target is gone.
+    pub async fn window_message(&self, target: TabId, payload: String) -> Result<(), BrowserError> {
+        self.request(move |reply| Command::WindowMessage {
+            target,
+            payload,
+            reply,
+        })
+        .await
+        .and_then(|result| result)
     }
 
     /// Stops every tab, persists the profile, and refuses later commands.
@@ -285,49 +378,104 @@ fn stopped() -> io::Error {
     io::Error::new(io::ErrorKind::BrokenPipe, "browser stopped")
 }
 
+/// Creates one tab coordinator; `window.open` and `Target.createTarget` both
+/// land here.
+fn create_tab(state: &mut BrowserState) -> Result<TabHandle, BrowserError> {
+    if !state.live {
+        return Err(BrowserError::Stopped);
+    }
+    let id = TabId::new(state.next_tab);
+    state.next_tab = state.next_tab.saturating_add(1);
+    let task = TabTask::spawn(
+        id,
+        state.network.fetch_handle(),
+        Arc::clone(&state.renderers),
+        state.browser.clone(),
+    );
+    let handle = task.handle.clone();
+    state.tabs.insert(id, task);
+    Ok(handle)
+}
+
+/// Opens one auxiliary browsing context and starts its first navigation in
+/// the background.
+fn open_window(
+    state: &mut BrowserState,
+    url: String,
+    source: Option<TabId>,
+    noopener: bool,
+) -> Result<TabId, BrowserError> {
+    let handle = create_tab(state)?;
+    let id = handle.id();
+    if let (Some(source), false) = (source, noopener) {
+        state.openers.insert(id, source);
+    }
+    if !url.is_empty() && url != "about:blank" {
+        // The tab starts on about:blank; the first real navigation runs in
+        // the background so one slow load cannot stall the command loop.
+        tokio::spawn(async move {
+            let _result = handle.goto(&url).await;
+        });
+    }
+    Ok(id)
+}
+
+/// Routes one `postMessage` payload to a live tab's main frame.
+async fn route_window_message(
+    state: &BrowserState,
+    target: TabId,
+    payload: String,
+) -> Result<(), BrowserError> {
+    match state.tabs.get(&target) {
+        Some(task) => task
+            .handle
+            .window_message(payload)
+            .await
+            .map_err(|_| BrowserError::UnknownTab),
+        None => Err(BrowserError::UnknownTab),
+    }
+}
+
+/// `window.opener` for one renderer assignment.
+fn opener_tab(state: &BrowserState, assignment: u64) -> Option<TabId> {
+    state
+        .assignments
+        .get(&assignment)
+        .and_then(|tab| state.openers.get(tab))
+        .copied()
+}
+
 async fn browser_loop(mut commands: mpsc::Receiver<Command>, mut state: BrowserState) {
     while let Some(command) = commands.recv().await {
         match command {
             Command::CreateTab { reply } => {
-                let result = if state.live {
-                    let id = TabId::new(state.next_tab);
-                    state.next_tab = state.next_tab.saturating_add(1);
-                    let task = TabTask::spawn(
-                        id,
-                        state.network.fetch_handle(),
-                        Arc::clone(&state.renderers),
-                    );
-                    let handle = task.handle.clone();
-                    state.tabs.insert(id, task);
-                    Ok(handle)
-                } else {
-                    Err(BrowserError::Stopped)
-                };
+                let result = create_tab(&mut state);
                 let _result = reply.send(result);
             }
-            Command::OpenWindow { url, reply } => {
-                let result = if state.live {
-                    let id = TabId::new(state.next_tab);
-                    state.next_tab = state.next_tab.saturating_add(1);
-                    let task = TabTask::spawn(
-                        id,
-                        state.network.fetch_handle(),
-                        Arc::clone(&state.renderers),
-                    );
-                    let handle = task.handle.clone();
-                    state.tabs.insert(id, task);
-                    if !url.is_empty() && url != "about:blank" {
-                        // The tab starts on about:blank; the first real
-                        // navigation runs in the background so one slow load
-                        // cannot stall the browser command loop.
-                        tokio::spawn(async move {
-                            let _result = handle.goto(&url).await;
-                        });
-                    }
-                    Ok(id)
-                } else {
-                    Err(BrowserError::Stopped)
-                };
+            Command::OpenWindow {
+                url,
+                source,
+                noopener,
+                reply,
+            } => {
+                let result = open_window(&mut state, url, source, noopener);
+                let _result = reply.send(result);
+            }
+            Command::RegisterAssignment { assignment, tab } => {
+                state.assignments.insert(assignment, tab);
+            }
+            Command::AssignmentTab { assignment, reply } => {
+                let _result = reply.send(state.assignments.get(&assignment).copied());
+            }
+            Command::OpenerTab { assignment, reply } => {
+                let _result = reply.send(opener_tab(&state, assignment));
+            }
+            Command::WindowMessage {
+                target,
+                payload,
+                reply,
+            } => {
+                let result = route_window_message(&state, target, payload).await;
                 let _result = reply.send(result);
             }
             Command::Tabs { reply } => {
@@ -344,6 +492,8 @@ async fn browser_loop(mut commands: mpsc::Receiver<Command>, mut state: BrowserS
             }
             Command::CloseTab { id, reply } => {
                 let result = if let Some(mut task) = state.tabs.remove(&id) {
+                    state.assignments.retain(|_, tab| *tab != id);
+                    state.openers.remove(&id);
                     task.shutdown().await;
                     Ok(())
                 } else {

@@ -77,6 +77,11 @@ enum Command {
         timeout: Duration,
         reply: oneshot::Sender<Result<bool, TabError>>,
     },
+    /// Routes one `postMessage` from another tab into this tab's window.
+    WindowMessage {
+        payload: String,
+        reply: oneshot::Sender<Result<(), TabError>>,
+    },
     DocumentUrl {
         reply: oneshot::Sender<String>,
     },
@@ -237,6 +242,17 @@ impl TabHandle {
             .await
     }
 
+    /// Delivers one remote `window` `message` payload into this tab.
+    ///
+    /// # Errors
+    ///
+    /// [`TabError::ActorStopped`] when the coordinator or renderer is gone.
+    pub async fn window_message(&self, payload: String) -> Result<(), TabError> {
+        self.request(|reply| Command::WindowMessage { payload, reply })
+            .await
+            .and_then(|result| result)
+    }
+
     /// Sends one command and waits for its reply.
     async fn request<T>(
         &self,
@@ -279,10 +295,11 @@ impl TabTask {
         id: TabId,
         fetch: FetchHandle,
         renderers: Arc<RendererProcessManager>,
+        browser: crate::browser::BrowserHandle,
     ) -> Self {
         let (tx, rx) = mpsc::channel(COMMAND_CAPACITY);
         let handle = TabHandle { id, tx };
-        let tab = Tab::new(id, fetch, renderers);
+        let tab = Tab::new(id, fetch, renderers, browser);
         let join = tokio::spawn(coordinator_loop(rx, tab));
         Self {
             handle,
@@ -329,6 +346,7 @@ struct Tab {
     id: TabId,
     renderers: Arc<RendererProcessManager>,
     fetch: FetchHandle,
+    browser: crate::browser::BrowserHandle,
     renderer: Option<Arc<RendererAssignment>>,
     pending_mount: Option<Mount>,
     site: Option<Site>,
@@ -347,12 +365,18 @@ struct Tab {
 }
 
 impl Tab {
-    fn new(id: TabId, fetch: FetchHandle, renderers: Arc<RendererProcessManager>) -> Self {
+    fn new(
+        id: TabId,
+        fetch: FetchHandle,
+        renderers: Arc<RendererProcessManager>,
+        browser: crate::browser::BrowserHandle,
+    ) -> Self {
         let (dial_tx, dial_rx) = mpsc::unbounded_channel();
         Self {
             id,
             renderers,
             fetch,
+            browser,
             renderer: None,
             pending_mount: Some(blank_mount()),
             site: None,
@@ -430,7 +454,10 @@ impl Tab {
         self.drop_renderer().await;
         self.events_rx = Some(handle.subscribe());
         self.site = Some(site.clone());
+        let assignment = handle.id.get();
         self.renderer = Some(handle);
+        // `window.opener` and cross-tab messaging resolve through this map.
+        let _result = self.browser.register_assignment(assignment, self.id).await;
         Ok(())
     }
 
@@ -502,6 +529,20 @@ impl Tab {
         self.events_rx = None;
         if let Some(renderer) = self.renderer.take() {
             self.renderers.release(renderer).await;
+        }
+    }
+
+    /// Routes one remote `postMessage` payload into this tab's main frame.
+    async fn deliver_window_message(&mut self, payload: String) -> Result<(), TabError> {
+        if self.renderer.is_none() {
+            self.mount_virtual().await?;
+        }
+        match self
+            .renderer_request(RendererCommand::WindowMessage { payload })
+            .await?
+        {
+            Reply::Unit(result) => result,
+            _ => Err(TabError::ActorStopped),
         }
     }
 
@@ -795,6 +836,10 @@ async fn handle_command(tab: &mut Tab, command: Command, waiters: &mut Vec<Waite
         }
         Command::LastNavigationFailed { reply } => {
             let _result = reply.send(tab.navigation_failed);
+        }
+        Command::WindowMessage { payload, reply } => {
+            let result = tab.deliver_window_message(payload).await;
+            let _result = reply.send(result);
         }
         Command::Shutdown { reply } => {
             tab.stop_renderer().await;

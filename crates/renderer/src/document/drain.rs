@@ -125,6 +125,7 @@ impl Document {
             Task::DialFailed(fail) => self.fail_dial(fail),
             Task::WindowMessage(message) => self.deliver_window_message(&message),
             Task::StorageEvent(event) => self.deliver_storage_event(&event),
+            Task::RemoteMessage(payload) => self.deliver_remote_message(&payload),
             Task::PortMessage {
                 endpoint,
                 payload,
