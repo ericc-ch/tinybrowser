@@ -11,4 +11,5 @@ dom = { workspace = true }
 cssparser = "=0.34.0"
 fontdue = "0.9"
 png = "0.17"
+taffy = "0.14"
 tiny-skia = "0.12"

@@ -4,14 +4,16 @@ State: working tree on `main` adds always-in screenshot rendering. Gates on
 this tree: `tools/ub lint` (clippy, workspace, all targets), `cargo test
 --workspace` (30 suites), `tools/playwright/run` (7 passed), `tools/cdp/run`
 (Blink corpus 1/1), `tools/wpt/score webmessaging/` (106/136, unchanged), and
-release binary **6,606,240 bytes** (3.4 MB under the cap). Screenshots ride
+release binary **7,034,176 bytes** (3.0 MB under the cap). Screenshots ride
 CDP `Page.captureScreenshot` and WebDriver `GET /session/{id}/screenshot`.
 
 ## What shipped
 
 - **`crates/render`**: one-shot pipeline from `dom::Dom` to PNG. CSS parse and
   cascade (`cssparser` through the DOM's selector engine), UA stylesheet,
-  `@media` width queries, block/inline/flex formatting, `tiny-skia` paint,
+  `@media` width queries, Taffy 0.14 box layout (block flow with margin
+  collapsing, flex, floats, absolute positioning) with inline formatting
+  contexts measured through Taffy's measure hooks, `tiny-skia` paint,
   `fontdue` text over an embedded Liberation Sans subset (OFL-1.1), `png`
   encode. Module docs cite the specs; the README lists the prior art
   (`NetSurf`, Dillo, Obscura, Blitz, Kitesurf) and the non-goals.
@@ -45,22 +47,22 @@ CDP `Page.captureScreenshot` and WebDriver `GET /session/{id}/screenshot`.
 
 ## Limits (deliberate, documented in the crate)
 
-No images, no floats/absolute positioning/grid/tables, no complex-script text
-shaping, no per-element or `fullPage` layout metrics (`contentSize` reports
-the viewport), no device scale factor. Screenshots capture the viewport at
-800x600 unless the caller's clip asks for a larger one. Vertical margin
-collapsing is sibling-only, and `getComputedStyle`-style queries do not exist
-yet.
+No images, no grid/tables, no complex-script text shaping, text does not wrap
+around floats yet, no per-element or `fullPage` layout metrics (`contentSize`
+reports the viewport), no device scale factor. Screenshots capture the
+viewport at 800x600 unless the caller's clip asks for a larger one.
+`getComputedStyle`-style queries do not exist yet.
 
 ## Next, in order
 
-1. Images: PNG decode via the `png` crate (already shipped) painted into
+1. Grid: `grid-template-columns/rows` track parsing plus item placement
+   mapping onto Taffy (already a dependency).
+2. Images: PNG decode via the `png` crate (already shipped) painted into
    `LayoutBox` replaced boxes; JPEG later.
-2. Absolute/relative positioning and `border-radius`/opacity, then more CSS
-   (grid, tables) as real fixtures demand.
-3. `Page.getLayoutMetrics.contentSize` from the real layout height so
+3. `border-radius`/opacity, then more CSS as real fixtures demand.
+4. `Page.getLayoutMetrics.contentSize` from the real layout height so
    `fullPage` screenshots capture the document.
-4. Element screenshots (`Page.captureScreenshot` with a node clip) once
+5. Element screenshots (`Page.captureScreenshot` with a node clip) once
    layout rects are queryable through the protocol.
 
 ## Gotchas

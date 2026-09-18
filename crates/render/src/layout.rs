@@ -14,7 +14,7 @@ use crate::font::{Fonts, Weight};
 use crate::geometry::{Edges, Rect};
 use crate::style::{BoxSizing, Dimension, Style, TextAlign, TextDecoration, WhiteSpace};
 use crate::text::FontStyle;
-use crate::tree::{BoxKind, BoxNode, is_block_level};
+use crate::tree::{BoxKind, BoxNode};
 
 /// One line of text ready to paint.
 #[derive(Clone, Debug)]
@@ -88,245 +88,15 @@ pub(crate) struct Ctx<'a> {
     pub(crate) fonts: &'a Fonts,
     /// Root element font size for `rem`.
     pub(crate) root_font_size: f32,
-    /// Viewport height for percentage heights against the initial containing
-    /// block.
-    pub(crate) viewport_height: f32,
 }
 
-/// The containing block passed down to one layout call.
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct Containing {
-    /// Content width in pixels.
-    pub(crate) width: f32,
-    /// Content height when definite.
-    pub(crate) height: Option<f32>,
-    /// Border-box left edge.
-    pub(crate) x: f32,
-    /// Border-box top edge.
-    pub(crate) y: f32,
-}
-
-/// Lays out the root wrapper.
-pub(crate) fn layout_root(
-    root: &BoxNode,
-    fonts: &Fonts,
-    viewport_width: f32,
-    viewport_height: f32,
-) -> LayoutBox {
-    let ctx = Ctx {
-        fonts,
-        root_font_size: root.style.font_size,
-        viewport_height,
-    };
-    let containing = Containing {
-        width: viewport_width,
-        height: Some(viewport_height),
-        x: 0.0,
-        y: 0.0,
-    };
-    layout_block(root, &ctx, containing, None)
-}
-
-/// Builds a layout box for `b`, positioned at its containing block's origin
-/// plus its own margins.
-pub(crate) fn layout_block(
-    b: &BoxNode,
-    ctx: &Ctx<'_>,
-    containing: Containing,
-    forced_content_width: Option<f32>,
-) -> LayoutBox {
-    layout_block_sized(b, ctx, containing, forced_content_width, None)
-}
-
-/// [`layout_block`] with an optional forced content height, used by flex
-/// stretch and grow.
-pub(crate) fn layout_block_sized(
-    b: &BoxNode,
-    ctx: &Ctx<'_>,
-    containing: Containing,
-    forced_content_width: Option<f32>,
-    forced_content_height: Option<f32>,
-) -> LayoutBox {
-    let style = b.style;
-    let font_size = style.font_size;
-    let basis = containing.width;
-    let root = ctx.root_font_size;
-
-    let BoxMetrics {
-        margin,
-        padding,
-        border,
-        extras,
-    } = box_metrics(&style, basis, font_size, root);
-
-    let specified = forced_content_width.or(dimension_value(style.width, basis, font_size, root));
-    let content_width = if let Some(width) = specified {
-        let content = if style.box_sizing == BoxSizing::BorderBox {
-            (width - extras).max(0.0)
-        } else {
-            width
-        };
-        clamp_dimension(
-            content,
-            style.min_width,
-            style.max_width,
-            basis,
-            font_size,
-            root,
-        )
-    } else {
-        let available = (basis - margin.left - margin.right - extras).max(0.0);
-        clamp_dimension(
-            available,
-            style.min_width,
-            style.max_width,
-            basis,
-            font_size,
-            root,
-        )
-    };
-    let (margin_left, _margin_right) = if forced_content_width.is_some() {
-        (margin.left, margin.right)
-    } else {
-        resolve_auto_margins(
-            style.margin,
-            margin,
-            style.width,
-            basis,
-            content_width + extras,
-        )
-    };
-
-    let border_x = containing.x + margin_left;
-    let border_y = containing.y + margin.top;
-    let content_x = border_x + border.left + padding.left;
-    let content_y = border_y + border.top + padding.top;
-
-    let specified_height = dimension_value(
-        style.height,
-        containing.height.unwrap_or(ctx.viewport_height),
-        font_size,
-        root,
-    );
-    let content_height_limit = specified_height.map(|height| {
-        if style.box_sizing == BoxSizing::BorderBox {
-            (height - padding.vertical() - border.vertical()).max(0.0)
-        } else {
-            height
-        }
-    });
-    let content_height_limit = forced_content_height.or(content_height_limit);
-
-    let (items, cursor_y) = layout_children(
-        b,
-        ctx,
-        content_x,
-        content_y,
-        content_width,
-        content_height_limit.or(containing.height),
-        style.text_align,
-    );
-
-    let content_height = match content_height_limit {
-        Some(height) => height,
-        None => (cursor_y - content_y).max(0.0),
-    };
-    let content_height = clamp_dimension(
-        content_height,
-        style.min_height,
-        style.max_height,
-        containing.height.unwrap_or(ctx.viewport_height),
-        font_size,
-        root,
-    );
-
-    LayoutBox {
-        style,
-        rect: Rect::new(
-            border_x,
-            border_y,
-            content_width + extras,
-            content_height + padding.vertical() + border.vertical(),
-        ),
-        padding,
-        items,
-    }
-}
-
-/// Lays out the in-flow children of a block container, stacking block-level
-/// children and collecting inline runs into lines.
-///
-/// Returns the paint items in order and the cursor after the last child.
-fn layout_children(
-    b: &BoxNode,
-    ctx: &Ctx<'_>,
-    content_x: f32,
-    content_y: f32,
-    content_width: f32,
-    child_containing_height: Option<f32>,
-    text_align: TextAlign,
-) -> (Vec<PaintItem>, f32) {
-    let root = ctx.root_font_size;
-    let mut items: Vec<PaintItem> = Vec::new();
-    let mut cursor_y = content_y;
-    let mut previous_margin_bottom = 0.0_f32;
-    let mut index = 0;
-    while index < b.children.len() {
-        let child = &b.children[index];
-        if is_block_level(child) {
-            let child_font_size = child.style.font_size;
-            let child_margin_top = dimension_or_zero(
-                child.style.margin.top,
-                content_width,
-                child_font_size,
-                root,
-            );
-            let gap = previous_margin_bottom.max(child_margin_top);
-            let child_containing = Containing {
-                width: content_width,
-                height: child_containing_height,
-                x: content_x,
-                // `layout_block` positions the border box at `containing.y`
-                // plus the child's own top margin, so hand it the margin edge
-                // the parent already collapsed.
-                y: cursor_y + gap - child_margin_top,
-            };
-            let child_layout = if matches!(child.kind, BoxKind::Flex) {
-                crate::flex::layout_flex(child, ctx, child_containing)
-            } else {
-                layout_block(child, ctx, child_containing, None)
-            };
-            cursor_y = child_layout.rect.bottom();
-            previous_margin_bottom = dimension_or_zero(
-                child.style.margin.bottom,
-                content_width,
-                child_font_size,
-                root,
-            );
-            items.push(PaintItem::Box(Box::new(child_layout)));
-            index += 1;
-        } else {
-            let start = index;
-            while index < b.children.len() && !is_block_level(&b.children[index]) {
-                index += 1;
-            }
-            let run = &b.children[start..index];
-            let inline =
-                layout_inline_run(run, ctx, content_x, cursor_y, content_width, text_align);
-            cursor_y += inline.height;
-            previous_margin_bottom = 0.0;
-            items.extend(inline.items);
-        }
-    }
-    (items, cursor_y)
-}
 
 /// The result of laying out one run of inline-level children.
-struct InlineResult {
+pub(crate) struct InlineResult {
     /// Total height of the line boxes.
-    height: f32,
+    pub(crate) height: f32,
     /// Text runs and atomic boxes in paint order.
-    items: Vec<PaintItem>,
+    pub(crate) items: Vec<PaintItem>,
 }
 
 /// One inline-level item collected before line breaking.
@@ -360,7 +130,7 @@ struct Atomic {
 }
 
 /// Lays out `run` into line boxes starting at `(x, y)`.
-fn layout_inline_run(
+pub(crate) fn layout_inline_run(
     run: &[BoxNode],
     ctx: &Ctx<'_>,
     x: f32,
@@ -498,7 +268,10 @@ fn flush_line(
         return 0.0;
     }
     // A trailing space does not count toward the line or its alignment.
-    if let Some(LineItem::Space { width }) = line.items.pop() {
+    // (`pop` in the scrutinee would discard a trailing word, so check first.)
+    if matches!(line.items.last(), Some(LineItem::Space { .. }))
+        && let Some(LineItem::Space { width }) = line.items.pop()
+    {
         line.width -= width;
     }
     if line.items.is_empty() {
@@ -536,13 +309,9 @@ fn flush_line(
             }
             LineItem::Space { width } => cursor += width,
             LineItem::Atomic { node, measurement } => {
-                let containing = Containing {
-                    width: measurement.content_width,
-                    height: None,
-                    x: cursor,
-                    y: baseline - measurement.height,
-                };
-                let layout = layout_block(node, ctx, containing, Some(measurement.content_width));
+                let mut layout =
+                    crate::boxes::layout_subtree(node, ctx, measurement.content_width);
+                shift_layout(&mut layout, cursor, baseline - measurement.height);
                 painted.push(PaintItem::Box(Box::new(layout)));
                 cursor += measurement.outer_width;
             }
@@ -632,30 +401,97 @@ fn measure(text: &str, font: FontStyle, letter_spacing: f32, fonts: &Fonts) -> f
     }
 }
 
-/// Measures an atomic box at its max-content width.
+/// Measures an atomic box at its max-content width, through a nested Taffy
+/// tree rooted at the atomic.
 fn measure_atomic(node: &BoxNode, ctx: &Ctx<'_>) -> Atomic {
     let preferred = max_content_width(node, ctx);
-    let layout = layout_block(
-        node,
-        ctx,
-        Containing {
-            width: preferred,
-            height: None,
-            x: 0.0,
-            y: 0.0,
-        },
-        Some((preferred - outer_extras(node, ctx)).max(0.0)),
-    );
-    let margin = resolve_margins(
-        node.style.margin,
-        preferred,
-        node.style.font_size,
-        ctx.root_font_size,
-    );
+    let layout = crate::boxes::layout_subtree(node, ctx, preferred);
+    let margin = node.style.margin.map(|dimension| match dimension {
+        Dimension::Auto => 0.0,
+        Dimension::Length(length) => {
+            length.resolve(preferred, node.style.font_size, ctx.root_font_size)
+        }
+    });
     Atomic {
         content_width: layout.content_box().width,
         height: layout.rect.height,
         outer_width: layout.rect.width + margin.left + margin.right,
+    }
+}
+
+/// Shifts a laid-out subtree by `(dx, dy)`, used to place atomic boxes laid
+/// out at the origin onto the line.
+pub(crate) fn shift_layout(layout: &mut LayoutBox, dx: f32, dy: f32) {
+    if dx == 0.0 && dy == 0.0 {
+        return;
+    }
+    layout.rect.x += dx;
+    layout.rect.y += dy;
+    shift_items(&mut layout.items, dx, dy);
+}
+
+/// Shifts paint items by `(dx, dy)`.
+pub(crate) fn shift_items(items: &mut Vec<PaintItem>, dx: f32, dy: f32) {
+    if dx == 0.0 && dy == 0.0 {
+        return;
+    }
+    for item in items {
+        match item {
+            PaintItem::Box(child) => shift_layout(child, dx, dy),
+            PaintItem::Text(run) => {
+                run.x += dx;
+                run.baseline += dy;
+            }
+        }
+    }
+}
+
+/// Min-content width of one inline run: the longest unbreakable word
+/// (<https://drafts.csswg.org/css-sizing-3/#min-content>).
+pub(crate) fn min_content_width(run: &[BoxNode], ctx: &Ctx<'_>) -> f32 {
+    let mut longest = 0.0_f32;
+    for node in run {
+        longest = longest.max(min_content_node(node, ctx));
+    }
+    longest
+}
+
+/// Min-content contribution of one inline-level box.
+fn min_content_node(node: &BoxNode, ctx: &Ctx<'_>) -> f32 {
+    let style = node.style;
+    let font = FontStyle {
+        size: style.font_size,
+        weight: style.font_weight,
+    };
+    match &node.kind {
+        BoxKind::Text(text) => {
+            let mut longest = 0.0_f32;
+            let mut current = String::new();
+            let mut flush = |current: &mut String| {
+                if !current.is_empty() {
+                    longest = longest.max(measure(current, font, style.letter_spacing, ctx.fonts));
+                    current.clear();
+                }
+            };
+            for ch in text.chars() {
+                if matches!(ch, ' ' | '\t' | '\n' | '\r' | '\u{c}') {
+                    flush(&mut current);
+                } else {
+                    current.push(ch);
+                }
+            }
+            flush(&mut current);
+            longest
+        }
+        BoxKind::Inline => node
+            .children
+            .iter()
+            .map(|child| min_content_node(child, ctx))
+            .sum(),
+        BoxKind::Break => 0.0,
+        // Atomics contribute their max-content size as a unit.
+        BoxKind::InlineBlock | BoxKind::InlineFlex | BoxKind::Block | BoxKind::Flex
+        | BoxKind::ListItem => max_content_width(node, ctx),
     }
 }
 
@@ -738,98 +574,3 @@ pub(crate) fn max_content_width(node: &BoxNode, ctx: &Ctx<'_>) -> f32 {
     }
 }
 
-/// Resolves margins, treating `auto` as zero.
-fn resolve_margins(margin: Edges<Dimension>, basis: f32, font_size: f32, root: f32) -> Edges<f32> {
-    margin.map(|dimension| dimension_or_zero(dimension, basis, font_size, root))
-}
-
-/// One box's resolved outer and inner spacing.
-struct BoxMetrics {
-    /// Resolved margins (`auto` as zero).
-    margin: Edges<f32>,
-    /// Resolved padding.
-    padding: Edges<f32>,
-    /// Border widths.
-    border: Edges<f32>,
-    /// Horizontal padding plus border.
-    extras: f32,
-}
-
-/// Resolves margin, padding, and border widths for one style.
-fn box_metrics(style: &Style, basis: f32, font_size: f32, root: f32) -> BoxMetrics {
-    let margin = resolve_margins(style.margin, basis, font_size, root);
-    let padding = style
-        .padding
-        .map(|length| length.resolve(basis, font_size, root));
-    let border = Edges::new(
-        style.border.top.width,
-        style.border.right.width,
-        style.border.bottom.width,
-        style.border.left.width,
-    );
-    BoxMetrics {
-        margin,
-        padding,
-        border,
-        extras: padding.horizontal() + border.horizontal(),
-    }
-}
-
-fn dimension_or_zero(dimension: Dimension, basis: f32, font_size: f32, root: f32) -> f32 {
-    dimension_value(dimension, basis, font_size, root).unwrap_or(0.0)
-}
-
-/// Resolves a dimension, treating `auto` as absent.
-fn dimension_value(
-    dimension: Dimension,
-    basis: f32,
-    font_size: f32,
-    root: f32,
-) -> Option<f32> {
-    match dimension {
-        Dimension::Auto => None,
-        Dimension::Length(length) => Some(length.resolve(basis, font_size, root)),
-    }
-}
-
-/// Horizontal auto margins, per CSS 2.1 10.3.3.
-fn resolve_auto_margins(
-    declared: Edges<Dimension>,
-    resolved: Edges<f32>,
-    width: Dimension,
-    basis: f32,
-    outer_width: f32,
-) -> (f32, f32) {
-    let auto_left = declared.left == Dimension::Auto;
-    let auto_right = declared.right == Dimension::Auto;
-    let slack = basis - outer_width;
-    match (width, auto_left, auto_right) {
-        (Dimension::Length(_), true, true) => {
-            let half = (slack / 2.0).max(0.0);
-            (half, half)
-        }
-        (Dimension::Length(_), true, false) => (slack.max(0.0), resolved.right),
-        (Dimension::Length(_), false, true) => (resolved.left, slack.max(0.0)),
-        _ => (resolved.left, resolved.right),
-    }
-}
-
-/// Applies min/max constraints to a content-box dimension.
-fn clamp_dimension(
-    value: f32,
-    min: Dimension,
-    max: Dimension,
-    basis: f32,
-    font_size: f32,
-    root: f32,
-) -> f32 {
-    let min = match min {
-        Dimension::Auto => 0.0,
-        Dimension::Length(length) => length.resolve(basis, font_size, root).max(0.0),
-    };
-    let max = match max {
-        Dimension::Auto => f32::INFINITY,
-        Dimension::Length(length) => length.resolve(basis, font_size, root).max(0.0),
-    };
-    value.max(min).min(max)
-}

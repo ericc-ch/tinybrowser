@@ -117,3 +117,102 @@ fn encodes_png() {
     assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n");
 }
 
+
+#[test]
+fn paints_every_word_on_the_line() {
+    // Regression test: the trailing-space trim used to discard a line-final
+    // word, so only the first word painted.
+    let dom = document(|dom, body| {
+        let paragraph = dom.create_element(html_name("p"), Vec::new());
+        dom.append(body, paragraph).expect("append p");
+        let text = dom.create_text("Hello screenshot");
+        dom.append(paragraph, text).expect("append text");
+    });
+    let image = render::render(&dom, &[], &render::RenderOptions {
+        width: 400.0,
+        height: 100.0,
+        scale: 1.0,
+    })
+    .expect("render");
+    let mut min_x = u32::MAX;
+    let mut max_x = 0u32;
+    let mut count = 0u32;
+    for y in 0..image.height {
+        for x in 0..image.width {
+            let p = pixel(&image, x, y);
+            if p[0] < 128 && p[1] < 128 && p[2] < 128 {
+                count += 1;
+                min_x = min_x.min(x);
+                max_x = max_x.max(x);
+            }
+        }
+    }
+    assert!(count > 200, "both words paint: {count} dark pixels");
+    assert!(
+        max_x - min_x > 100,
+        "text spans both words: {min_x}..{max_x}"
+    );
+}
+
+#[test]
+fn floats_place_and_clear() {
+    // Regression test: childless boxes routed through Taffy's measure path
+    // once reported zero size, so floats vanished entirely.
+    let dom = document(|dom, body| {
+        let wrap = dom.create_element(
+            html_name("div"),
+            vec![attr("style", "width:360px;background:#eeeeee")],
+        );
+        dom.append(body, wrap).expect("append");
+        let left = dom.create_element(
+            html_name("div"),
+            vec![attr("style", "float:left;width:100px;height:80px;background:#ff0000")],
+        );
+        let right = dom.create_element(
+            html_name("div"),
+            vec![attr("style", "float:right;width:100px;height:80px;background:#0000ff")],
+        );
+        let clear = dom.create_element(
+            html_name("div"),
+            vec![attr("style", "clear:both;height:20px;background:#00aa00")],
+        );
+        dom.append(wrap, left).expect("append");
+        dom.append(wrap, right).expect("append");
+        dom.append(wrap, clear).expect("append");
+    });
+    let sheet = "html, body { margin: 0; padding: 0; }".to_owned();
+    let image = render::render(&dom, &[sheet], &render::RenderOptions {
+        width: 400.0,
+        height: 300.0,
+        scale: 1.0,
+    })
+    .expect("render");
+    let mut red = (u32::MAX, u32::MAX, 0u32, 0u32, 0u32);
+    let mut blue = (u32::MAX, u32::MAX, 0u32, 0u32, 0u32);
+    let mut green = (u32::MAX, u32::MAX, 0u32, 0u32, 0u32);
+    for y in 0..image.height {
+        for x in 0..image.width {
+            let p = pixel(&image, x, y);
+            let slot = if p[0] > 200 && p[1] < 80 && p[2] < 80 {
+                Some(&mut red)
+            } else if p[2] > 200 && p[0] < 80 && p[1] < 80 {
+                Some(&mut blue)
+            } else if p[1] > 100 && p[0] < 100 && p[2] < 100 {
+                Some(&mut green)
+            } else {
+                None
+            };
+            if let Some(s) = slot {
+                s.4 += 1;
+                s.0 = s.0.min(x);
+                s.1 = s.1.min(y);
+                s.2 = s.2.max(x);
+                s.3 = s.3.max(y);
+            }
+        }
+    }
+    println!("red {red:?} blue {blue:?} green {green:?}");
+    assert_eq!((red.0, red.1, red.2, red.3), (0, 0, 99, 79));
+    assert_eq!((blue.0, blue.1, blue.2, blue.3), (260, 0, 359, 79));
+    assert_eq!((green.0, green.1, green.2, green.3), (0, 80, 359, 99));
+}

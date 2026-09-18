@@ -106,6 +106,32 @@ pub(crate) enum Overflow {
     Hidden,
 }
 
+/// `float`, which blockifies the box and takes it out of flow
+/// (<https://drafts.csswg.org/css-floats-3/#float-property>).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Float {
+    /// In flow.
+    None,
+    /// Shifted left, content flows around it.
+    Left,
+    /// Shifted right, content flows around it.
+    Right,
+}
+
+/// `clear`, which pushes the box below earlier floats
+/// (<https://drafts.csswg.org/css-floats-3/#clear-property>).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Clear {
+    /// No clearance.
+    None,
+    /// Below earlier left floats.
+    Left,
+    /// Below earlier right floats.
+    Right,
+    /// Below all earlier floats.
+    Both,
+}
+
 /// `border-style`, with non-solid styles painted as solid for now.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum BorderStyle {
@@ -356,6 +382,10 @@ pub(crate) struct Style {
     pub box_sizing: BoxSizing,
     /// Clipping.
     pub overflow: Overflow,
+    /// Float placement.
+    pub float: Float,
+    /// Float clearance.
+    pub clear: Clear,
     /// Text color.
     pub color: Color,
     /// Background fill.
@@ -442,6 +472,8 @@ impl Style {
         ),
         box_sizing: BoxSizing::ContentBox,
         overflow: Overflow::Visible,
+        float: Float::None,
+        clear: Clear::None,
         color: Color::BLACK,
         background: Color::TRANSPARENT,
         font_size: 16.0,
@@ -561,6 +593,10 @@ pub(crate) enum Decl {
     BoxSizing(BoxSizing),
     /// `overflow`.
     Overflow(Overflow),
+    /// `float`.
+    Float(Float),
+    /// `clear`.
+    Clear(Clear),
     /// `color`.
     Color(Color),
     /// `background-color`.
@@ -1033,6 +1069,31 @@ pub(crate) fn parse_declaration(name: &str, value: &str) -> Vec<Decl> {
                 out.push(Decl::Overflow(overflow));
             }
         }
+        "float" => {
+            if let Some(float) = with_value(value, |input| {
+                let name = input.expect_ident_cloned()?;
+                Ok(match name.to_ascii_lowercase().as_str() {
+                    "left" => Float::Left,
+                    "right" => Float::Right,
+                    _ => Float::None,
+                })
+            }) {
+                out.push(Decl::Float(float));
+            }
+        }
+        "clear" => {
+            if let Some(clear) = with_value(value, |input| {
+                let name = input.expect_ident_cloned()?;
+                Ok(match name.to_ascii_lowercase().as_str() {
+                    "left" => Clear::Left,
+                    "right" => Clear::Right,
+                    "both" => Clear::Both,
+                    _ => Clear::None,
+                })
+            }) {
+                out.push(Decl::Clear(clear));
+            }
+        }
         "color" => {
             if let Some(color) = with_value(value, parse_color) {
                 out.push(Decl::Color(color.resolve(Color::BLACK)));
@@ -1439,6 +1500,8 @@ pub(crate) fn apply(decl: Decl, style: &mut Style, root_font_size: f32) {
         }
         Decl::BoxSizing(sizing) => style.box_sizing = sizing,
         Decl::Overflow(overflow) => style.overflow = overflow,
+        Decl::Float(float) => style.float = float,
+        Decl::Clear(clear) => style.clear = clear,
         Decl::Color(color) => style.color = color,
         Decl::Background(color) => style.background = color,
         Decl::FontWeight(weight) => style.font_weight = weight,

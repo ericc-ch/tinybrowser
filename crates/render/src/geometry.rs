@@ -35,18 +35,6 @@ impl<T> Edges<T> {
     }
 }
 
-impl Edges<f32> {
-    /// Sum of the left and right sides.
-    pub(crate) fn horizontal(self) -> f32 {
-        self.left + self.right
-    }
-
-    /// Sum of the top and bottom sides.
-    pub(crate) fn vertical(self) -> f32 {
-        self.top + self.bottom
-    }
-}
-
 /// An axis-aligned rectangle in device pixels.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct Rect {

@@ -7,7 +7,7 @@ use dom::{Dom, NodeId};
 
 use crate::font::Fonts;
 use crate::geometry::Rect;
-use crate::layout::{self, LayoutBox, PaintItem};
+use crate::layout::{LayoutBox, PaintItem};
 use crate::paint::Painter;
 use crate::style::{
     Decl, Declared, Origin, Rule, Style, UA_STYLESHEET, parse_inline_style, parse_stylesheet,
@@ -84,9 +84,9 @@ pub(crate) fn render(
     let fonts = Fonts::load()?;
     let styles = compute_styles(dom, &rules);
 
-    // 3. Build and lay out the box tree.
+    // 3. Build and lay out the box tree through Taffy.
     let root = tree::build(dom, &styles);
-    let layout = layout::layout_root(&root, &fonts, viewport_width, viewport_height);
+    let layout = crate::boxes::layout_root(&root, &fonts, viewport_width, viewport_height);
 
     // 4. Paint once, then encode from the caller.
     let width = crate::device_pixels((viewport_width * options.scale).round().max(1.0));

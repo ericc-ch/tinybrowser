@@ -132,3 +132,15 @@ a compile-once API (`Dom::compile_selectors`), so the cascade adds no second
 selector version. Deliberately not shipped: fontconfig/system fonts (one
 embedded subset instead), and any Blitz, Stylo, Taffy, Parley, or
 vello/anyrender dependency.
+
+## Taffy box layout (2026-09-18)
+
+The hand-rolled block/flex engine (`layout.rs` block flow, `flex.rs`) is
+replaced by Taffy 0.14 (`crates/render/src/boxes.rs`): block flow with margin
+collapsing, flex, floats, and absolute positioning. Inline formatting stays
+in-tree, measured through Taffy's measure hooks. Isolated probe on an empty
+tuned binary: +303,848 bytes. Shipping delta: 6,606,240 -> 7,034,176 bytes
+(+427,936), which includes the `boxes.rs` conversion and measure glue minus
+the deleted `flex.rs`. Taffy 0.14 dropped the CSS `order` property, so flex
+children are stable-sorted by `order` at tree-build time. Grid is the next
+slice (template properties first, then placement mapping).

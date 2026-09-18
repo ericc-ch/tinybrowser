@@ -16,8 +16,10 @@ rasterizer.
    Cascade, CSS Values, and CSS Color.
 2. **Box tree** (`tree.rs`) — anonymous block and inline boxes per CSS
    Display, `display: none` pruned.
-3. **Layout** (`layout.rs`, `flex.rs`) — block containers, inline formatting
-   with line boxes, and flex containers.
+3. **Layout** (`layout.rs`, `boxes.rs`) — inline formatting with line boxes
+   in `layout.rs`; all box-level layout (block flow with margin collapsing,
+   flex, floats, absolute positioning) through Taffy 0.14 in `boxes.rs`, with
+   inline formatting contexts measured through Taffy's measure hooks.
 4. **Paint** (`paint.rs`) — backgrounds, borders, and text into a
    `tiny-skia` pixmap.
 5. **Encode** (`png.rs`) — one PNG per call.
