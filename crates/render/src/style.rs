@@ -634,17 +634,6 @@ impl Style {
         }
     }
 
-    /// The used line height in pixels for this style's font.
-    ///
-    /// `normal` uses the face's own metrics, which is what browsers do when
-    /// the font supplies them.
-    pub(crate) fn used_line_height(&self, metrics: crate::text::LineMetrics) -> f32 {
-        match self.line_height {
-            LineHeight::Normal => metrics.ascent + metrics.descent + metrics.line_gap,
-            LineHeight::Number(factor) => self.font_size * factor,
-            LineHeight::Px(value) => value,
-        }
-    }
 }
 
 // ── Declaration model ───────────────────────────────────────────────────────

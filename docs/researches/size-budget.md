@@ -152,3 +152,15 @@ slice (template properties first, then placement mapping).
 existing Taffy dependency: no new crates. Shipping delta: 7,034,176 ->
 7,051,360 bytes (+17,184). Dropping `Copy` from `Style` (grid templates own
 a `Vec`) cost nothing measurable.
+
+## Parley text shaping (2026-09-18)
+
+The `fontdue` bitmap path and the hand-rolled line breaker are replaced by
+Parley 0.11 (shaping, bidi, UAX#14 breaking, alignment) with `skrifa`
+outlines filled by `tiny-skia`. No system fonts: the embedded subset is
+registered from memory, and `parley`/`fontique` build with default features
+off plus `libm`. Isolated probe on an empty tuned binary: +882,768 bytes.
+Shipping delta: 7,051,360 -> 8,118,512 bytes (+1,067,152), the difference
+being the shaping driver, the skrifa-direct outline path, and feature
+unification across the workspace. `fontdue` stays for intrinsic width
+measurement only.

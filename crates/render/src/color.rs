@@ -38,18 +38,6 @@ impl Color {
         Self { r, g, b, a }
     }
 
-    /// Premultiplied `[r, g, b, a]` for blending into a premultiplied buffer.
-    #[must_use]
-    pub(crate) fn premultiplied(self) -> [u8; 4] {
-        let alpha = u32::from(self.a);
-        [
-            u8_from((u32::from(self.r) * alpha + 127) / 255),
-            u8_from((u32::from(self.g) * alpha + 127) / 255),
-            u8_from((u32::from(self.b) * alpha + 127) / 255),
-            self.a,
-        ]
-    }
-
     /// Parses one CSS color value.
     ///
     /// `None` means the token is not a color this subset implements (including

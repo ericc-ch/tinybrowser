@@ -10,6 +10,9 @@ workspace = true
 dom = { workspace = true }
 cssparser = "=0.34.0"
 fontdue = "0.9"
+fontique = { version = "0.11", default-features = false }
+parley = { version = "0.11", default-features = false, features = ["libm"] }
 png = "0.17"
+skrifa = "0.44"
 taffy = "0.14"
 tiny-skia = "0.12"

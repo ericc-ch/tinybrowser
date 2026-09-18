@@ -264,3 +264,60 @@ fn grid_places_columns_gaps_and_spans() {
     let gap = pixel(&image, 104, 60);
     assert_eq!(gap, [255, 255, 255, 255], "gap: {gap:?}");
 }
+
+
+#[test]
+fn paints_bold_and_underline() {
+    let dom = document(|dom, body| {
+        let para = dom.create_element(html_name("p"), Vec::new());
+        dom.append(body, para).expect("append");
+        let bold = dom.create_element(html_name("b"), Vec::new());
+        dom.append(para, bold).expect("append");
+        let text = dom.create_text("bold words here");
+        dom.append(bold, text).expect("append");
+        let para = dom.create_element(html_name("p"), Vec::new());
+        dom.append(body, para).expect("append");
+        let underlined = dom.create_element(
+            html_name("span"),
+            vec![attr("style", "text-decoration: underline")],
+        );
+        dom.append(para, underlined).expect("append");
+        let text = dom.create_text("underlined words here");
+        dom.append(underlined, text).expect("append");
+    });
+    let sheet = "html, body { margin: 0; padding: 0; }".to_owned();
+    let image = render::render(&dom, &[sheet], &render::RenderOptions {
+        width: 400.0,
+        height: 200.0,
+        scale: 1.0,
+    })
+    .expect("render");
+    let dark = |x: u32, y: u32| {
+        let p = pixel(&image, x, y);
+        p[0] < 128 && p[1] < 128 && p[2] < 128
+    };
+    // Bold block paints in the first line band.
+    let mut bold = 0;
+    for y in 0..25 {
+        for x in 0..200 {
+            if dark(x, y) {
+                bold += 1;
+            }
+        }
+    }
+    assert!(bold > 100, "bold paints: {bold}");
+    // The underline is a continuous dark run below the second line's text.
+    let mut best = 0;
+    for y in 30..120 {
+        let mut run = 0;
+        for x in 0..250 {
+            if dark(x, y) {
+                run += 1;
+                best = best.max(run);
+            } else {
+                run = 0;
+            }
+        }
+    }
+    assert!(best >= 30, "underline spans the line: {best}");
+}

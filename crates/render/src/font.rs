@@ -5,6 +5,15 @@
 //! metric-compatible with Arial and OFL-1.1 licensed; the subset covers
 //! Latin plus the punctuation and symbols web pages actually use, and its
 //! license text ships next to the faces (`assets/OFL.txt`).
+//!
+//! Two consumers share the faces: `fontdue` answers intrinsic width queries,
+//! and Parley shapes and breaks real lines over a `fontique` collection with
+//! the same bytes registered from memory. Glyph pixels come from `skrifa`
+//! outlines filled by `tiny-skia`, so shaped glyph IDs paint exactly as the
+//! shaper positioned them.
+
+use std::cell::RefCell;
+use std::sync::Arc;
 
 use fontdue::{Font, FontSettings};
 
@@ -25,10 +34,45 @@ pub(crate) enum Weight {
     Bold,
 }
 
+/// Parley's font and layout contexts over the embedded faces.
+///
+/// One per render: shaping borrows it mutably, and the borrow discipline in
+/// the measure path keeps borrows strictly sequential (atomic measurement
+/// finishes before line shaping starts), so a shared `RefCell` never nests.
+pub(crate) struct ParleyFonts {
+    /// Font collection with both faces registered from memory.
+    pub(crate) font_context: parley::FontContext,
+    /// Layout context with warm shaping caches across one render.
+    pub(crate) layout_context: parley::LayoutContext<[u8; 4]>,
+}
+
+impl ParleyFonts {
+    /// Registers the embedded faces with no system font discovery.
+    fn load() -> Self {
+        let mut font_context = parley::FontContext {
+            collection: fontique::Collection::default(),
+            source_cache: fontique::SourceCache::default(),
+        };
+        for face in [REGULAR, BOLD] {
+            font_context
+                .collection
+                .register_fonts(fontique::Blob::new(Arc::new(face.to_vec())), None);
+        }
+        Self {
+            font_context,
+            layout_context: parley::LayoutContext::new(),
+        }
+    }
+}
+
 /// The parsed faces of one render.
 pub(crate) struct Fonts {
     regular: Font,
     bold: Font,
+    /// Parley shaping state, shared by every text leaf of one render.
+    pub(crate) parley: RefCell<ParleyFonts>,
+    skrifa_regular: skrifa::FontRef<'static>,
+    skrifa_bold: skrifa::FontRef<'static>,
 }
 
 impl Fonts {
@@ -46,14 +90,25 @@ impl Fonts {
             regular: Font::from_bytes(REGULAR, FontSettings::default())
                 .map_err(|_| RenderError::Font)?,
             bold: Font::from_bytes(BOLD, FontSettings::default()).map_err(|_| RenderError::Font)?,
+            parley: RefCell::new(ParleyFonts::load()),
+            skrifa_regular: skrifa::FontRef::new(REGULAR).map_err(|_| RenderError::Font)?,
+            skrifa_bold: skrifa::FontRef::new(BOLD).map_err(|_| RenderError::Font)?,
         })
     }
 
-    /// The face for `weight`.
+    /// The fontdue face for `weight`, used for intrinsic measurements.
     pub(crate) fn face(&self, weight: Weight) -> &Font {
         match weight {
             Weight::Normal => &self.regular,
             Weight::Bold => &self.bold,
+        }
+    }
+
+    /// The skrifa face for `weight`, used to draw shaped glyph outlines.
+    pub(crate) fn outline_face(&self, weight: Weight) -> skrifa::FontRef<'static> {
+        match weight {
+            Weight::Normal => self.skrifa_regular.clone(),
+            Weight::Bold => self.skrifa_bold.clone(),
         }
     }
 }

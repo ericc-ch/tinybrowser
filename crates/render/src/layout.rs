@@ -1,48 +1,21 @@
-//! Box layout: block containers, inline formatting, and atomic inline boxes.
+//! Inline formatting through Parley, atomic boxes through nested subtrees.
 //!
-//! The formatting model follows CSS 2.1's visual formatting model
-//! (<https://drafts.csswg.org/css2/#visuren>) and CSS Text for whitespace and
-//! line breaking (<https://drafts.csswg.org/css-text-3/#text-formatting>).
-//! Flex containers are dispatched to `flex.rs`.
-//!
-//! Coordinates are CSS pixels with the origin at the viewport's top-left;
-//! every `LayoutBox.rect` is the border box in absolute coordinates. Paint
-//! walks the tree and blits text runs in order.
+//! One inline run becomes one Parley layout: text segments keep their styles,
+//! atomic boxes become inline boxes at byte offsets, and Parley breaks,
+//! shapes, and aligns. Paint receives positioned glyph runs, never strings.
 
-use crate::color::Color;
-use crate::font::{Fonts, Weight};
+use crate::font::Fonts;
 use crate::geometry::{Edges, Rect};
-use crate::style::{BoxSizing, Dimension, Style, TextAlign, TextDecoration, WhiteSpace};
-use crate::text::FontStyle;
+use crate::style::{BoxSizing, Dimension, Style, TextAlign, WhiteSpace};
+use crate::text::{FontStyle, PlacedRun, Segment, SegmentStyle};
 use crate::tree::{BoxKind, BoxNode};
-
-/// One line of text ready to paint.
-#[derive(Clone, Debug)]
-pub(crate) struct TextRun {
-    /// The run text.
-    pub(crate) text: String,
-    /// Left edge.
-    pub(crate) x: f32,
-    /// Alphabetic baseline.
-    pub(crate) baseline: f32,
-    /// Advance width.
-    pub(crate) width: f32,
-    /// Font size in pixels.
-    pub(crate) font_size: f32,
-    /// Font weight.
-    pub(crate) weight: Weight,
-    /// Text color.
-    pub(crate) color: Color,
-    /// Decoration line.
-    pub(crate) decoration: TextDecoration,
-}
 
 /// One painted child in tree order.
 pub(crate) enum PaintItem {
     /// A nested box.
     Box(Box<LayoutBox>),
-    /// A run of text.
-    Text(TextRun),
+    /// A shaped glyph run.
+    Glyphs(PlacedRun),
 }
 
 /// A laid-out box.
@@ -95,41 +68,38 @@ pub(crate) struct Ctx<'a> {
 pub(crate) struct InlineResult {
     /// Total height of the line boxes.
     pub(crate) height: f32,
-    /// Text runs and atomic boxes in paint order.
+    /// Glyph runs and atomic boxes in paint order.
     pub(crate) items: Vec<PaintItem>,
-}
-
-/// One inline-level item collected before line breaking.
-#[expect(
-    clippy::large_enum_variant,
-    reason = "styles stay inline cloned data; boxing every word would allocate per token"
-)]
-enum InlineItem<'a> {
-    /// A word.
-    Word { text: String, style: Style },
-    /// A space between items.
-    Space { width: f32 },
-    /// A forced line break.
-    Break,
-    /// An atomic inline-level box.
-    Atomic {
-        node: &'a BoxNode,
-        measurement: Atomic,
-    },
 }
 
 /// Measured atomic box.
 #[derive(Clone, Copy, Debug)]
 struct Atomic {
-    /// Forced content width used to lay the box out.
-    content_width: f32,
     /// Border-box height.
     height: f32,
     /// Outer width including margins.
     outer_width: f32,
+    /// Content width used to lay the box out.
+    content_width: f32,
 }
 
-/// Lays out `run` into line boxes starting at `(x, y)`.
+/// One collected input token in document order.
+enum RawToken<'a> {
+    /// Text with its segment style.
+    Text(String, SegmentStyle),
+    /// An atomic box with its measurements.
+    Atomic {
+        node: &'a BoxNode,
+        measurement: Atomic,
+    },
+    /// A forced line break (`<br>`).
+    Break,
+}
+
+/// Lays out `run` into lines starting at `(x, y)`.
+///
+/// Text is shaped by Parley; atomic boxes are laid out in nested subtrees
+/// and placed at Parley's inline-box positions.
 pub(crate) fn layout_inline_run(
     run: &[BoxNode],
     ctx: &Ctx<'_>,
@@ -138,270 +108,204 @@ pub(crate) fn layout_inline_run(
     available: f32,
     text_align: TextAlign,
 ) -> InlineResult {
-    let mut items: Vec<InlineItem<'_>> = Vec::new();
+    let mut raw: Vec<RawToken<'_>> = Vec::new();
+    // Parley has one whitespace mode per layout; preserve wins and collapsing
+    // runs are pre-collapsed below, so mixed modes stay exact.
+    let mut preserve = false;
+    // Wrapping is disabled only when every text node refuses to wrap.
+    let mut wrap = false;
     for node in run {
-        collect_inline(node, ctx, &mut items);
+        collect_token(node, ctx, &mut raw, &mut preserve, &mut wrap);
     }
-
-    let mut painted: Vec<PaintItem> = Vec::new();
-    let mut line = Line::default();
-    let mut cursor_y = y;
-    let line_box = LineBox {
-        x,
-        available,
-        text_align,
-    };
-
-    for item in items {
-        match item {
-            InlineItem::Word { text, style } => {
-                let font = FontStyle {
-                    size: style.font_size,
-                    weight: style.font_weight,
-                };
-                let width = measure(&text, font, style.letter_spacing, ctx.fonts);
-                let wrap = matches!(style.white_space, WhiteSpace::Normal | WhiteSpace::PreWrap);
-                if wrap && !line.is_empty() && line.width + width > available {
-                    cursor_y += flush_line(&mut line, &mut painted, &line_box, cursor_y, ctx);
-                }
-                line.width += width;
-                line.update_metrics(&style, ctx);
-                line.items.push(LineItem::Word { text, style, width });
-            }
-            InlineItem::Space { width } => {
-                if !line.is_empty() {
-                    line.width += width;
-                    line.items.push(LineItem::Space { width });
-                }
-            }
-            InlineItem::Break => {
-                cursor_y += flush_line(&mut line, &mut painted, &line_box, cursor_y, ctx);
-            }
-            InlineItem::Atomic { node, measurement } => {
-                if !line.is_empty() && line.width + measurement.outer_width > available {
-                    cursor_y += flush_line(&mut line, &mut painted, &line_box, cursor_y, ctx);
-                }
-                line.width += measurement.outer_width;
-                line.ascent = line.ascent.max(measurement.height);
-                line.height = line.height.max(measurement.height);
-                line.items.push(LineItem::Atomic { node, measurement });
-            }
-        }
-    }
-    cursor_y += flush_line(&mut line, &mut painted, &line_box, cursor_y, ctx);
-
-    InlineResult {
-        height: cursor_y - y,
-        items: painted,
-    }
-}
-
-/// One item inside a line under construction.
-#[expect(
-    clippy::large_enum_variant,
-    reason = "styles stay inline cloned data; boxing line items would allocate per word"
-)]
-enum LineItem<'a> {
-    /// A word.
-    Word {
-        text: String,
-        style: Style,
-        width: f32,
-    },
-    /// A space between items.
-    Space { width: f32 },
-    /// An atomic box.
-    Atomic {
-        node: &'a BoxNode,
-        measurement: Atomic,
-    },
-}
-
-/// A line box under construction.
-#[derive(Default)]
-struct Line<'a> {
-    items: Vec<LineItem<'a>>,
-    width: f32,
-    ascent: f32,
-    descent: f32,
-    height: f32,
-}
-
-impl Line<'_> {
-    fn is_empty(&self) -> bool {
-        self.items.is_empty()
-    }
-
-    fn update_metrics(&mut self, style: &Style, ctx: &Ctx<'_>) {
-        let font = FontStyle {
-            size: style.font_size,
-            weight: style.font_weight,
+    if raw.is_empty() {
+        return InlineResult {
+            height: 0.0,
+            items: Vec::new(),
         };
-        let metrics = ctx.fonts.line_metrics(font);
-        let line_height = style.used_line_height(metrics);
-        let half_leading = (line_height - (metrics.ascent + metrics.descent)) / 2.0;
-        self.ascent = self.ascent.max(metrics.ascent + half_leading);
-        self.descent = self.descent.max(metrics.descent + half_leading);
-        self.height = self.height.max(line_height);
     }
+    let mut raw: Vec<RawToken<'_>> = Vec::new();
+    // Parley has one whitespace mode per layout; preserve wins and collapsing
+    // runs are pre-collapsed below, so mixed modes stay exact.
+    let mut preserve = false;
+    // Wrapping is disabled only when every text node refuses to wrap.
+    let mut wrap = false;
+    for node in run {
+        collect_token(node, ctx, &mut raw, &mut preserve, &mut wrap);
+    }
+    if raw.is_empty() {
+        return InlineResult {
+            height: 0.0,
+            items: Vec::new(),
+        };
+    }
+    // Forced breaks split the run into separate layouts; each stacks below
+    // the last. An empty group still occupies a strut line.
+    let mut items: Vec<PaintItem> = Vec::new();
+    let mut height = 0.0_f32;
+    let mut group: Vec<&RawToken<'_>> = Vec::new();
+    let mut strut = 0.0_f32;
+    for token in raw.iter().chain(std::iter::once(&BREAK_SENTINEL)) {
+        if matches!(token, RawToken::Break) {
+            height += shape_group(&group, ctx, x, y + height, available, text_align, preserve, wrap, strut, &mut items);
+            group.clear();
+            continue;
+        }
+        if let RawToken::Text(_, style) = token {
+            strut = strut.max(style.size);
+        }
+        group.push(token);
+    }
+    InlineResult { height, items }
 }
 
-/// The line box geometry shared by every line of one inline run.
-struct LineBox {
-    /// Left edge of the content area.
-    x: f32,
-    /// Available width for one line.
-    available: f32,
-    /// Horizontal alignment of short lines.
-    text_align: TextAlign,
-}
+/// Sentinel that flushes the final group.
+const BREAK_SENTINEL: RawToken<'static> = RawToken::Break;
 
-/// Places the pending line and returns the height it occupied.
-fn flush_line(
-    line: &mut Line<'_>,
-    painted: &mut Vec<PaintItem>,
-    line_box: &LineBox,
-    y: f32,
+/// Shapes one break-free group and appends its items; returns its height.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one group carries the leaf's full shaping context; the parameters are the leaf's own"
+)]
+fn shape_group(
+    group: &[&RawToken<'_>],
     ctx: &Ctx<'_>,
+    x: f32,
+    y: f32,
+    available: f32,
+    text_align: TextAlign,
+    preserve: bool,
+    wrap: bool,
+    strut: f32,
+    items: &mut Vec<PaintItem>,
 ) -> f32 {
-    if line.is_empty() {
-        return 0.0;
+    if group.is_empty() {
+        return strut * 1.2;
     }
-    // A trailing space does not count toward the line or its alignment.
-    // (`pop` in the scrutinee would discard a trailing word, so check first.)
-    if matches!(line.items.last(), Some(LineItem::Space { .. }))
-        && let Some(LineItem::Space { width }) = line.items.pop()
-    {
-        line.width -= width;
-    }
-    if line.items.is_empty() {
-        *line = Line::default();
-        return 0.0;
-    }
-
-    let line_height = line.height.max(line.ascent + line.descent);
-    let baseline = y + (line_height - line.ascent - line.descent).max(0.0) / 2.0 + line.ascent;
-    let slack = (line_box.available - line.width).max(0.0);
-    let align = match line_box.text_align {
-        TextAlign::Left => 0.0,
-        TextAlign::Right => slack,
-        TextAlign::Center => slack / 2.0,
-    };
-    let mut cursor = line_box.x + align;
-    for item in line.items.drain(..) {
-        match item {
-            LineItem::Word {
-                text,
-                style,
-                width,
-            } => {
-                painted.push(PaintItem::Text(TextRun {
-                    text,
-                    x: cursor,
-                    baseline,
-                    width,
-                    font_size: style.font_size,
-                    weight: style.font_weight,
-                    color: style.color,
-                    decoration: style.text_decoration,
-                }));
-                cursor += width;
+    let mut tokens: Vec<Segment<'_>> = Vec::new();
+    let mut atomics: Vec<(&BoxNode, Atomic)> = Vec::new();
+    for token in group {
+        match token {
+            RawToken::Text(text, style) => {
+                tokens.push(Segment::Text(text, *style));
             }
-            LineItem::Space { width } => cursor += width,
-            LineItem::Atomic { node, measurement } => {
-                let mut layout =
-                    crate::boxes::layout_subtree(node, ctx, measurement.content_width);
-                shift_layout(&mut layout, cursor, baseline - measurement.height);
-                painted.push(PaintItem::Box(Box::new(layout)));
-                cursor += measurement.outer_width;
+            RawToken::Atomic { node, measurement } => {
+                let index = atomics.len();
+                atomics.push((*node, *measurement));
+                tokens.push(Segment::Atomic(index));
             }
+            RawToken::Break => {}
         }
     }
-    line.width = 0.0;
-    line.ascent = 0.0;
-    line.descent = 0.0;
-    line.height = 0.0;
-    line_height
+    let sizes: Vec<(f32, f32)> = atomics
+        .iter()
+        .map(|(_, measurement)| (measurement.outer_width, measurement.height))
+        .collect();
+    let width = if wrap { Some(available.max(0.0)) } else { None };
+    let lines = crate::text::shape_lines(ctx.fonts, &tokens, &sizes, width, text_align, preserve);
+    let mut height = 0.0_f32;
+    for line in &lines {
+        for atomic in &line.atomics {
+            let (node, measurement) = atomics[atomic.index];
+            let mut layout = crate::boxes::layout_subtree(node, ctx, measurement.content_width);
+            shift_layout(&mut layout, x + atomic.x, y + height + atomic.y);
+            items.push(PaintItem::Box(Box::new(layout)));
+        }
+        for glyph_run in &line.runs {
+            let mut shifted = glyph_run.clone();
+            shift_glyph_run(&mut shifted, x, y + height);
+            items.push(PaintItem::Glyphs(shifted));
+        }
+        height += line.height;
+    }
+    height
 }
 
-/// Recursively flattens inline-level boxes into items.
-fn collect_inline<'a>(node: &'a BoxNode, ctx: &Ctx<'_>, out: &mut Vec<InlineItem<'a>>) {
+/// Shifts one shaped run by `(dx, dy)`.
+fn shift_glyph_run(run: &mut PlacedRun, dx: f32, dy: f32) {
+    run.x += dx;
+    run.baseline += dy;
+    for glyph in &mut run.glyphs {
+        glyph.x += dx;
+        glyph.y += dy;
+    }
+}
+
+/// Collects one box's text and atomics; `preserve` and `wrap` accumulate the
+/// run's Parley modes.
+fn collect_token<'a>(
+    node: &'a BoxNode,
+    ctx: &Ctx<'_>,
+    out: &mut Vec<RawToken<'a>>,
+    preserve: &mut bool,
+    wrap: &mut bool,
+) {
     match &node.kind {
-        BoxKind::Text(text) => tokenize(text, &node.style, ctx, out),
-        BoxKind::Break => out.push(InlineItem::Break),
+        BoxKind::Text(text) => {
+            let (processed, keeps_space) = process_text(text, &node.style);
+            if processed.is_empty() {
+                return;
+            }
+            *preserve |= keeps_space;
+            *wrap |= allows_wrap(&node.style);
+            out.push(RawToken::Text(processed, SegmentStyle::from_style(
+                &node.style,
+            )));
+        }
         BoxKind::Inline => {
             for child in &node.children {
-                collect_inline(child, ctx, out);
+                collect_token(child, ctx, out, preserve, wrap);
             }
+        }
+        // `<br>` always breaks, in every whitespace mode. It splits the run
+        // into separate Parley layouts below.
+        BoxKind::Break => {
+            *wrap = true;
+            out.push(RawToken::Break);
         }
         BoxKind::InlineBlock | BoxKind::InlineFlex | BoxKind::InlineGrid | BoxKind::Block
         | BoxKind::Flex | BoxKind::Grid | BoxKind::ListItem => {
             let measurement = measure_atomic(node, ctx);
-            out.push(InlineItem::Atomic { node, measurement });
+            out.push(RawToken::Atomic { node, measurement });
         }
     }
 }
 
-/// Splits text into words, spaces, and breaks per `white-space`
-/// (<https://drafts.csswg.org/css-text-3/#white-space-processing>).
-fn tokenize<'a>(text: &str, style: &Style, ctx: &Ctx<'_>, out: &mut Vec<InlineItem<'a>>) {
-    let font = FontStyle {
-        size: style.font_size,
-        weight: style.font_weight,
-    };
-    let space_width = measure(" ", font, style.letter_spacing, ctx.fonts);
-    let collapse = matches!(style.white_space, WhiteSpace::Normal | WhiteSpace::Nowrap);
+/// Whether text with this style wraps at soft opportunities.
+fn allows_wrap(style: &Style) -> bool {
+    !matches!(style.white_space, WhiteSpace::Nowrap)
+}
 
-    let mut word = String::new();
+/// Pre-processes text for Parley: case mapping, then whitespace handling per
+/// `white-space`. Collapsing runs are squeezed here so the builder can run in
+/// preserve mode; returns the text and whether it keeps spacing.
+fn process_text(text: &str, style: &Style) -> (String, bool) {
+    let mapped = match style.text_transform {
+        crate::style::TextTransform::None => text.to_owned(),
+        crate::style::TextTransform::Uppercase => text.to_uppercase(),
+        crate::style::TextTransform::Lowercase => text.to_lowercase(),
+    };
+    let preserve = matches!(
+        style.white_space,
+        WhiteSpace::Pre | WhiteSpace::PreWrap
+    );
+    if preserve {
+        return (mapped, true);
+    }
+    let mut out = String::with_capacity(mapped.len());
     let mut pending_space = false;
-
-    let flush_word = |word: &mut String, out: &mut Vec<InlineItem<'a>>| {
-        if !word.is_empty() {
-            out.push(InlineItem::Word {
-                text: std::mem::take(word),
-                style: style.clone(),
-            });
-        }
-    };
-
-    for ch in text.chars() {
-        let is_collapsible = matches!(ch, ' ' | '\t' | '\n' | '\r' | '\u{c}');
-        if is_collapsible {
-            if ch == '\n' && !collapse {
-                flush_word(&mut word, out);
-                out.push(InlineItem::Break);
-                continue;
+    for ch in mapped.chars() {
+        if matches!(ch, ' ' | '\t' | '\n' | '\r' | '\u{c}') {
+            pending_space = true;
+        } else {
+            if pending_space {
+                out.push(' ');
+                pending_space = false;
             }
-            if collapse {
-                flush_word(&mut word, out);
-                pending_space = true;
-            } else {
-                flush_word(&mut word, out);
-                out.push(InlineItem::Space { width: space_width });
-            }
-            continue;
+            out.push(ch);
         }
-        if pending_space {
-            out.push(InlineItem::Space { width: space_width });
-            pending_space = false;
-        }
-        // Non-breaking spaces stay inside words and never break.
-        word.push(if ch == '\u{a0}' { ' ' } else { ch });
     }
-    flush_word(&mut word, out);
+    (out, false)
 }
-
-/// Measures text with optional letter spacing.
-fn measure(text: &str, font: FontStyle, letter_spacing: f32, fonts: &Fonts) -> f32 {
-    let base = fonts.measure(text, font);
-    if letter_spacing == 0.0 {
-        base
-    } else {
-        base + letter_spacing * crate::count(text.chars().count())
-    }
-}
-
-/// Measures an atomic box at its max-content width, through a nested Taffy
 /// tree rooted at the atomic.
 fn measure_atomic(node: &BoxNode, ctx: &Ctx<'_>) -> Atomic {
     let preferred = max_content_width(node, ctx);
@@ -438,11 +342,18 @@ pub(crate) fn shift_items(items: &mut Vec<PaintItem>, dx: f32, dy: f32) {
     for item in items {
         match item {
             PaintItem::Box(child) => shift_layout(child, dx, dy),
-            PaintItem::Text(run) => {
-                run.x += dx;
-                run.baseline += dy;
-            }
+            PaintItem::Glyphs(run) => shift_glyph_run(run, dx, dy),
         }
+    }
+}
+
+/// Measures text with optional letter spacing, for intrinsic widths.
+fn measure(text: &str, font: FontStyle, letter_spacing: f32, fonts: &Fonts) -> f32 {
+    let base = fonts.measure(text, font);
+    if letter_spacing == 0.0 {
+        base
+    } else {
+        base + letter_spacing * crate::count(text.chars().count())
     }
 }
 

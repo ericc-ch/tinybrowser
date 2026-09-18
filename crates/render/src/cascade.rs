@@ -12,7 +12,6 @@ use crate::paint::Painter;
 use crate::style::{
     Decl, Declared, Origin, Rule, Style, UA_STYLESHEET, parse_inline_style, parse_stylesheet,
 };
-use crate::text::FontStyle;
 use crate::tree;
 use crate::{RenderError, RenderOptions, RgbaImage};
 
@@ -91,8 +90,8 @@ pub(crate) fn render(
     // 4. Paint once, then encode from the caller.
     let width = crate::device_pixels((viewport_width * options.scale).round().max(1.0));
     let height = crate::device_pixels((viewport_height * options.scale).round().max(1.0));
-    let mut painter = Painter::new(width, height, fonts)?;
-    paint(&mut painter, &layout);
+    let mut painter = Painter::new(width, height)?;
+    paint(&mut painter, &layout, &fonts);
     Ok(painter.into_image())
 }
 
@@ -225,7 +224,7 @@ fn valid_dimension(value: f32) -> bool {
 
 /// Paints a laid-out tree in CSS paint order: background, border, then
 /// content (<https://drafts.csswg.org/css2/#painting-order>).
-fn paint(painter: &mut Painter, layout: &LayoutBox) {
+fn paint(painter: &mut Painter, layout: &LayoutBox, fonts: &Fonts) {
     if layout.style.visibility != crate::style::Visibility::Visible {
         return;
     }
@@ -282,16 +281,12 @@ fn paint(painter: &mut Painter, layout: &LayoutBox) {
     }
     for item in &layout.items {
         match item {
-            PaintItem::Box(child) => paint(painter, child),
-            PaintItem::Text(run) => {
-                painter.draw_text(
-                    &run.text,
-                    run.x,
-                    run.baseline,
-                    FontStyle {
-                        size: run.font_size,
-                        weight: run.weight,
-                    },
+            PaintItem::Box(child) => paint(painter, child, fonts),
+            PaintItem::Glyphs(run) => {
+                painter.draw_glyphs(
+                    &run.glyphs,
+                    &fonts.outline_face(run.weight),
+                    run.size,
                     run.color,
                 );
                 match run.decoration {
@@ -300,9 +295,9 @@ fn paint(painter: &mut Painter, layout: &LayoutBox) {
                         painter.fill_rect(
                             Rect::new(
                                 run.x,
-                                run.baseline + run.font_size * 0.1,
+                                run.baseline + run.size * 0.1,
                                 run.width,
-                                (run.font_size * 0.06).max(1.0),
+                                (run.size * 0.06).max(1.0),
                             ),
                             run.color,
                         );
@@ -311,9 +306,9 @@ fn paint(painter: &mut Painter, layout: &LayoutBox) {
                         painter.fill_rect(
                             Rect::new(
                                 run.x,
-                                run.baseline - run.font_size * 0.3,
+                                run.baseline - run.size * 0.3,
                                 run.width,
-                                (run.font_size * 0.06).max(1.0),
+                                (run.size * 0.06).max(1.0),
                             ),
                             run.color,
                         );
