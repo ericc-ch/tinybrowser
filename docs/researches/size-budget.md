@@ -252,3 +252,38 @@ Two real savings landed while fitting it:
 Rebased onto `chase/size-flags` (7,603,520 bytes), the Stylo slice lands at
 **9,416,800 bytes**: 1,813,280 over the size-flags base, 583,200 under the
 cap. The pre-rebase clap feature trimming is gone with clap itself.
+
+## Full Blitz adoption (2026-09-18)
+
+Priced to settle the paint question: keep building on tiny-skia, or take
+Blitz's painters. All probes use the shipping profile (rustc 1.98.1, lld
+`--icf=all`); each delta is stripped size minus the same-folder empty binary
+(293,312 bytes).
+
+| Probe | Bytes | Delta |
+| --- | ---: | ---: |
+| anyrender scene recorder only (null backend) | 296,720 | +3,408 |
+| tiny-skia (rect, circle, gradient, transform) | 508,088 | +214,776 |
+| anyrender + anyrender_vello_cpu (rounded rect, gradient, clip, layer alpha) | 1,774,352 | +1,481,040 |
+| blitz-dom + blitz-paint + anyrender_vello_cpu, 300x200 document rendered | 7,042,560 | +6,749,248 |
+
+`blitz-paint::paint_scene` accepts only a `blitz_dom::BaseDocument`, and
+anyrender has no tiny-skia backend (vello, vello_cpu, vello_hybrid, skia,
+svg, null), so "Blitz's paint into tiny-skia" is not a configuration that
+exists; adopting Blitz's paint means adopting its DOM/layout stack and the
+vello_cpu rasterizer.
+
+Net swap, pricing our side with a stub of the `render` API (stub tinybrowser
+= 5,539,584 bytes, everything else identical): the shipped pipeline costs
+3,877,216 bytes (9,416,800 - 5,539,584). Replacing it with the Blitz stack is
+5,539,584 + 6,749,248 = **~12.29 MB**, i.e. +2.87 MB over today and about
+2.3 MB over the cap.
+
+Caveats: the Blitz probe runs with `default-features = false` (no system
+fonts, accessibility, SVG, WOFF, custom widgets, scrollbars, floats, complex
+scripts), so the figure is a floor; system-fonts additionally wants
+fontconfig, which the dev shell does not carry. The probe also keeps our
+`dom`/JS bindings in place; adopting Blitz's DOM in its place is a separate
+refactor whose size is not counted. The extra budget does buy feature
+surface we lack (tables, replaced content, gradients/radii/shadows,
+stacking contexts), so this is a price for capability, not pure overhead.
