@@ -76,7 +76,7 @@ Rejected or deferred:
 | Drop `webpki-roots` fallback | −75,200 | Loses the root-store fallback. |
 | TLS 1.3 only | −46,816 | Drops TLS 1.2 servers. |
 | `opt-level = "s"` + abort + ICF | +379,248 | `"z"` is smaller. |
-| CDP on hyper-direct, not axum | −525,608 (probe) | Needs the adapter rewrite. |
+| CDP on hyper-direct, not axum | −179,568 shipped (see the knobs section) | Shipped 2026-09-18. |
 | Hand-rolled CLI, not clap | −184,912 shipped (see the knobs section) | Shipped 2026-09-18. |
 | Feature-gate Intl | 125,426 blob plus code | Removes the Intl surface. |
 | Drop HTTP/2 | 63.4 KiB `.text` plus hyper paths | Loses HTTP/2. |
@@ -183,6 +183,7 @@ Kept (shipping delta 8,118,576 -> 7,965,408 bytes, −153,168):
 | `-Wl,--build-id=none` | −192 | drops the GNU build-ID note; coredumps lose debuginfod matching |
 | `-Wl,--gc-sections` | −96 | explicit next to LTO; proves LTO already collects |
 | Hand-rolled CLI, not clap (`src/cli.rs`) | −184,912 | five flags and three subcommands; contract pinned by `tests/modes.rs` |
+| Hyper-direct servers, not axum (cdp, webdriver) | −179,568 | hyper-util server-auto + tokio-tungstenite upgrade; direct base64 deps unified on 0.23 |
 
 Nothing unwinds at runtime under `panic = "abort"` (QuickJS uses
 setjmp/longjmp), so the unwind index and the C tables are dead weight.

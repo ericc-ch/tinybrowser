@@ -11,17 +11,20 @@ use std::net::TcpListener;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use axum::Router;
-use axum::body::Bytes;
-use axum::extract::State;
-use axum::http::{Method, StatusCode, Uri};
-use axum::response::{IntoResponse, Json, Response};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use browser::{
     BrowserHandle, CookieRecord, CookieSameSite, RemoteValue, ScreenshotRequest, ScriptFailure,
     TabError, TabHandle,
 };
+use bytes::Bytes;
+use http::{HeaderValue, StatusCode, header};
+use http_body_util::{BodyExt as _, Full};
+use hyper::body::Incoming;
+use hyper::service::service_fn;
+use hyper::{Request, Response};
+use hyper_util::rt::{TokioExecutor, TokioIo};
+use hyper_util::server::conn::auto::Builder;
 use serde_json::{Value, json};
 use tokio::sync::Mutex;
 
@@ -53,10 +56,21 @@ pub async fn serve(listener: &TcpListener, browser: BrowserHandle) -> std::io::R
         open: HashMap::new(),
     }));
     let listener = tokio::net::TcpListener::from_std(std_listener)?;
-    let app = Router::new()
-        .fallback(dispatch_request)
-        .with_state(AppState { sessions });
-    axum::serve(listener, app).await
+    let state = AppState { sessions };
+    loop {
+        let (stream, _) = listener.accept().await?;
+        let state = state.clone();
+        tokio::spawn(async move {
+            let service = service_fn(move |request| {
+                let state = state.clone();
+                async move { Ok::<_, std::convert::Infallible>(serve_request(request, state).await) }
+            });
+            let mut auto = Builder::new(TokioExecutor::new());
+            auto.http2().enable_connect_protocol();
+            let connection = auto.serve_connection_with_upgrades(TokioIo::new(stream), service);
+            let _result = connection.await;
+        });
+    }
 }
 
 #[derive(Clone)]
@@ -64,23 +78,37 @@ struct AppState {
     sessions: Arc<Mutex<Sessions>>,
 }
 
-async fn dispatch_request(
-    State(state): State<AppState>,
-    method: Method,
-    uri: Uri,
-    body: Bytes,
-) -> Response {
-    let method = method.as_str().to_owned();
-    let path = uri.path().to_owned();
+/// Axum's `Bytes` extractor caps bodies at 2 MiB; the same cap keeps the
+/// status surface identical.
+const MAX_BODY_BYTES: usize = 2 * 1024 * 1024;
+
+async fn serve_request(request: Request<Incoming>, state: AppState) -> Response<Full<Bytes>> {
+    let method = request.method().as_str().to_owned();
+    let path = request.uri().path().to_owned();
+    let body = match request.into_body().collect().await {
+        Ok(collected) => collected.to_bytes(),
+        Err(_) => return json_response(StatusCode::BAD_REQUEST, &json!("invalid request body")),
+    };
+    if body.len() > MAX_BODY_BYTES {
+        return json_response(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            &json!("request body too large"),
+        );
+    }
     let body = String::from_utf8_lossy(&body).into_owned();
     let mut sessions = state.sessions.lock().await;
     let (status, payload) = dispatch(&method, &path, &body, &mut sessions).await;
     let status = StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-    let mut response = (status, Json(payload)).into_response();
-    // W3C WebDriver JSON is UTF-8; keep the charset the old adapter wrote.
+    json_response(status, &payload)
+}
+
+fn json_response(status: StatusCode, payload: &Value) -> Response<Full<Bytes>> {
+    let mut response = Response::new(Full::new(Bytes::from(payload.to_string())));
+    *response.status_mut() = status;
+    // W3C WebDriver JSON is UTF-8; the charset is part of the wire surface.
     response.headers_mut().insert(
-        axum::http::header::CONTENT_TYPE,
-        axum::http::HeaderValue::from_static("application/json; charset=utf-8"),
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json; charset=utf-8"),
     );
     response
 }

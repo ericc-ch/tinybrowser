@@ -3,7 +3,7 @@
 //! Honest first subsets of Browser, Target, Page, and Runtime. Unsupported
 //! methods return method-not-found. Flattened `sessionId` routing on the
 //! browser socket.
-//! Axum serves the loopback HTTP and WebSocket endpoints. The synchronous
+//! Hyper serves the loopback HTTP and WebSocket endpoints. The synchronous
 //! [`Client`] used by the CLI and tests stays on tungstenite.
 //!
 //! Names: the wire object is a CDP **page target** (`"type": "page"`,
@@ -15,18 +15,26 @@ use std::io;
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::time::{Duration, Instant};
 
-use axum::Router;
-use axum::extract::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade};
-use axum::extract::{Path, State};
-use axum::http::StatusCode;
-use axum::response::{IntoResponse, Json, Response};
-use axum::routing::get;
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use browser::{BrowserHandle, RemoteValue, TabEvent, TabHandle, TabId};
+use bytes::Bytes;
+use futures_util::{SinkExt as _, StreamExt as _};
+use http::{HeaderValue, Method, Request, Response, StatusCode, header};
+use http_body_util::Full;
+use hyper::body::Incoming;
+use hyper::service::service_fn;
+use hyper::upgrade::Upgraded;
+use hyper_util::rt::{TokioExecutor, TokioIo};
+use hyper_util::server::conn::auto::Builder;
 use serde_json::{Value, json};
+use sha1::{Digest as _, Sha1};
 use tokio::sync::{mpsc, watch};
-use tokio::task::JoinHandle;
+use tokio::task::{JoinHandle, JoinSet};
+use tokio_tungstenite::WebSocketStream;
+use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tungstenite::client::IntoClientRequest;
-use tungstenite::protocol::{Message, WebSocket as ClientSocket};
+use tungstenite::protocol::{Message, Role, WebSocket as ClientSocket};
 
 mod dispatch;
 use dispatch::{
@@ -60,45 +68,187 @@ pub async fn serve(listener: &TcpListener, browser: &BrowserHandle) -> io::Resul
         bound,
         stop: stop.clone(),
     };
-    let version = get(|State(state): State<AppState>| async move { Json(version_json(&state)) });
-    let discovery = get(discovery);
-    let browser_socket = get(
-        |ws: WebSocketUpgrade, State(state): State<AppState>| async move {
-            ws.on_upgrade(move |socket| run_socket(socket, state, None))
-        },
-    );
-    let page_socket = get(
-        |Path(raw): Path<String>, ws: WebSocketUpgrade, State(state): State<AppState>| async move {
-            let Ok(id) = raw.parse::<u64>() else {
-                return (StatusCode::BAD_REQUEST, "invalid page target").into_response();
-            };
-            match state.browser.tab(TabId::new(id)).await {
-                Ok(tab) => ws.on_upgrade(move |socket| run_socket(socket, state, Some(tab))),
-                Err(_) => (StatusCode::NOT_FOUND, "unknown page target").into_response(),
+    let mut tasks = JoinSet::new();
+    loop {
+        tokio::select! {
+            _ = stopping.wait_for(|stopping| *stopping) => break,
+            accepted = listener.accept() => {
+                let (stream, _) = accepted?;
+                tasks.spawn(connection(stream, state.clone(), stop.subscribe()));
             }
+        }
+    }
+    while tasks.join_next().await.is_some() {}
+    Ok(())
+}
+
+async fn connection(
+    stream: tokio::net::TcpStream,
+    state: AppState,
+    mut stop: watch::Receiver<bool>,
+) {
+    let service = service_fn(move |request| {
+        let state = state.clone();
+        async move { Ok::<_, std::convert::Infallible>(serve_request(request, state).await) }
+    });
+    let mut auto = Builder::new(TokioExecutor::new());
+    // CONNECT protocol needed for HTTP/2 websockets, as axum enabled it.
+    auto.http2().enable_connect_protocol();
+    let conn = auto.serve_connection_with_upgrades(TokioIo::new(stream), service);
+    tokio::pin!(conn);
+    tokio::select! {
+        _result = conn.as_mut() => {}
+        _ = stop.changed() => {
+            conn.as_mut().graceful_shutdown();
+            let _drained = conn.as_mut().await;
+        }
+    }
+}
+
+async fn serve_request(request: Request<Incoming>, state: AppState) -> Response<Full<Bytes>> {
+    if request.method() != Method::GET && request.method() != Method::HEAD {
+        return status_response(StatusCode::METHOD_NOT_ALLOWED, "method not allowed");
+    }
+    let path = request.uri().path().to_owned();
+    let route = route_path(&path);
+    let mut response = match route {
+        "/json/version" => json_response(StatusCode::OK, &version_json(&state)),
+        "/json" | "/json/list" => json_response(StatusCode::OK, &list_json(&state).await),
+        "/devtools/browser" => return serve_browser_socket(request, state),
+        _ => match route.strip_prefix("/devtools/page/") {
+            Some(raw) => return serve_page_socket(request, state, raw).await,
+            None => status_response(StatusCode::NOT_FOUND, "not found"),
         },
-    );
-    // Legacy CDP clients (Playwright included) append a trailing slash to
-    // discovery URLs; register both spellings rather than relying on a
-    // middleware layer, which axum does not apply to fallbacks.
-    let app = Router::new()
-        .route("/json/version", version.clone())
-        .route("/json/version/", version)
-        .route("/json", discovery.clone())
-        .route("/json/", discovery.clone())
-        .route("/json/list", discovery.clone())
-        .route("/json/list/", discovery)
-        .route("/devtools/browser", browser_socket.clone())
-        .route("/devtools/browser/", browser_socket)
-        .route("/devtools/page/{id}", page_socket.clone())
-        .route("/devtools/page/{id}/", page_socket)
-        .fallback(|| async { (StatusCode::NOT_FOUND, "not found") })
-        .with_state(state);
-    axum::serve(listener, app)
-        .with_graceful_shutdown(async move {
-            let _result = stopping.wait_for(|stopping| *stopping).await;
+    };
+    if request.method() == Method::HEAD {
+        *response.body_mut() = Full::new(Bytes::new());
+    }
+    response
+}
+
+/// Legacy CDP clients (Playwright included) append a trailing slash to
+/// discovery URLs; both spellings route the same way.
+fn route_path(path: &str) -> &str {
+    if path.len() > 1
+        && let Some(stripped) = path.strip_suffix('/')
+    {
+        return stripped;
+    }
+    path
+}
+
+fn serve_browser_socket(
+    request: Request<Incoming>,
+    state: AppState,
+) -> Response<Full<Bytes>> {
+    let Some(key) = upgrade_key(&request) else {
+        return status_response(StatusCode::BAD_REQUEST, "not a websocket request");
+    };
+    serve_upgraded(request, &key, state, None)
+}
+
+async fn serve_page_socket(
+    request: Request<Incoming>,
+    state: AppState,
+    raw: &str,
+) -> Response<Full<Bytes>> {
+    let Some(key) = upgrade_key(&request) else {
+        return status_response(StatusCode::BAD_REQUEST, "not a websocket request");
+    };
+    let Ok(id) = raw.parse::<u64>() else {
+        return status_response(StatusCode::BAD_REQUEST, "invalid page target");
+    };
+    let Ok(tab) = state.browser.tab(TabId::new(id)).await else {
+        return status_response(StatusCode::NOT_FOUND, "unknown page target");
+    };
+    serve_upgraded(request, &key, state, Some(tab))
+}
+
+fn upgrade_key(request: &Request<Incoming>) -> Option<String> {
+    let headers = request.headers();
+    let upgrade = headers
+        .get(header::UPGRADE)
+        .is_some_and(|value| value.as_bytes().eq_ignore_ascii_case(b"websocket"));
+    let connection = headers.get(header::CONNECTION).is_some_and(|value| {
+        value.to_str().is_ok_and(|text| {
+            text.split(',')
+                .any(|token| token.trim().eq_ignore_ascii_case("upgrade"))
         })
-        .await
+    });
+    if !upgrade || !connection {
+        return None;
+    }
+    headers
+        .get(header::SEC_WEBSOCKET_KEY)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned)
+}
+
+fn serve_upgraded(
+    request: Request<Incoming>,
+    key: &str,
+    state: AppState,
+    tab: Option<TabHandle>,
+) -> Response<Full<Bytes>> {
+    let accept = accept_key(key);
+    let upgraded = hyper::upgrade::on(request);
+    tokio::spawn(async move {
+        let Ok(io) = upgraded.await else { return };
+        let socket = WebSocketStream::from_raw_socket(TokioIo::new(io), Role::Server, None).await;
+        run_socket(socket, state, tab).await;
+    });
+    switching_protocols(&accept)
+}
+
+fn switching_protocols(accept: &str) -> Response<Full<Bytes>> {
+    let mut response = Response::new(Full::new(Bytes::new()));
+    *response.status_mut() = StatusCode::SWITCHING_PROTOCOLS;
+    response
+        .headers_mut()
+        .insert(header::UPGRADE, HeaderValue::from_static("websocket"));
+    response
+        .headers_mut()
+        .insert(header::CONNECTION, HeaderValue::from_static("Upgrade"));
+    match HeaderValue::from_str(accept) {
+        Ok(value) => {
+            response
+                .headers_mut()
+                .insert(header::SEC_WEBSOCKET_ACCEPT, value);
+        }
+        Err(_) => {
+            *response.status_mut() = StatusCode::BAD_REQUEST;
+        }
+    }
+    response
+}
+
+const WS_GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+
+fn accept_key(key: &str) -> String {
+    let mut hasher = Sha1::new();
+    hasher.update(key.as_bytes());
+    hasher.update(WS_GUID.as_bytes());
+    BASE64_STANDARD.encode(hasher.finalize())
+}
+
+fn status_response(status: StatusCode, message: &'static str) -> Response<Full<Bytes>> {
+    let mut response = Response::new(Full::new(Bytes::from(message)));
+    *response.status_mut() = status;
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/plain; charset=utf-8"),
+    );
+    response
+}
+
+fn json_response(status: StatusCode, payload: &Value) -> Response<Full<Bytes>> {
+    let mut response = Response::new(Full::new(Bytes::from(payload.to_string())));
+    *response.status_mut() = status;
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    response
 }
 
 #[derive(Clone)]
@@ -106,10 +256,6 @@ struct AppState {
     browser: BrowserHandle,
     bound: SocketAddr,
     stop: watch::Sender<bool>,
-}
-
-async fn discovery(State(state): State<AppState>) -> Response {
-    Json(list_json(&state).await).into_response()
 }
 
 fn version_json(state: &AppState) -> Value {
@@ -1047,7 +1193,11 @@ impl Conn {
     }
 }
 
-async fn run_socket(mut socket: WebSocket, state: AppState, tab: Option<TabHandle>) {
+async fn run_socket(
+    mut socket: WebSocketStream<TokioIo<Upgraded>>,
+    state: AppState,
+    tab: Option<TabHandle>,
+) {
     let (tab_events_tx, tab_events_rx) = mpsc::channel(256);
     let mut conn = Conn {
         browser: state.browser,
@@ -1070,7 +1220,7 @@ async fn run_socket(mut socket: WebSocket, state: AppState, tab: Option<TabHandl
     loop {
         let wake = tokio::select! {
             event = conn.tab_events_rx.recv() => SocketWake::Event(event),
-            incoming = socket.recv() => SocketWake::Incoming(incoming),
+            incoming = socket.next() => SocketWake::Incoming(incoming),
         };
         match wake {
             SocketWake::Event(Some(event)) => {
@@ -1111,10 +1261,13 @@ async fn run_socket(mut socket: WebSocket, state: AppState, tab: Option<TabHandl
 
 enum SocketWake {
     Event(Option<ConnEvent>),
-    Incoming(Option<Result<WsMessage, axum::Error>>),
+    Incoming(Option<Result<WsMessage, tungstenite::Error>>),
 }
 
-async fn send_messages(socket: &mut WebSocket, messages: Vec<Value>) -> Result<(), axum::Error> {
+async fn send_messages(
+    socket: &mut WebSocketStream<TokioIo<Upgraded>>,
+    messages: Vec<Value>,
+) -> Result<(), tungstenite::Error> {
     for message in messages {
         socket.send(WsMessage::text(message.to_string())).await?;
     }
