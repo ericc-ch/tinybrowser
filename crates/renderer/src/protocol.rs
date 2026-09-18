@@ -405,6 +405,9 @@ pub trait BrowserServices: Send + Sync + 'static {
     /// `sessionStorage.getItem` on another window's area, for a same-origin
     /// opener or opened window.
     fn remote_session_get(&self, tab: u64, origin: &str, key: &str) -> Option<String>;
+
+    /// `BroadcastChannel.postMessage` for every same-origin channel.
+    fn broadcast_post(&self, origin: &str, name: &str, payload: &str, channel: u64);
 }
 
 #[cfg(test)]

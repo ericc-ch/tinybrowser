@@ -182,6 +182,18 @@ pub enum ToRenderer {
         /// assignments see a change with no local source.
         source: Option<(RendererAssignmentId, FrameId)>,
     },
+    /// One same-origin `BroadcastChannel` message.
+    BroadcastMessage {
+        /// Serialized origin whose channels receive it.
+        origin: String,
+        /// Channel name.
+        name: String,
+        /// `__tbEncode` payload from the posting realm.
+        payload: String,
+        /// The posting assignment and channel; the matching assignment skips
+        /// that channel.
+        source: Option<(RendererAssignmentId, u64)>,
+    },
 }
 
 impl ToRenderer {
@@ -341,6 +353,17 @@ pub enum ServiceCall {
         origin: String,
         /// Item key, encoded by the calling realm.
         key: String,
+    },
+    /// One `BroadcastChannel.postMessage` for every same-origin channel.
+    BroadcastPost {
+        /// Serialized origin of the posting document.
+        origin: String,
+        /// Channel name.
+        name: String,
+        /// `__tbEncode` payload from the posting realm.
+        payload: String,
+        /// Posting realm's channel id, so the sender is skipped.
+        channel: u64,
     },
 }
 
@@ -556,6 +579,12 @@ mod tests {
                 id: 23,
                 reply: ServiceReply::StorageValue(Some("\"v\"".into())),
             },
+            ToRenderer::BroadcastMessage {
+                origin: "http://example.test".into(),
+                name: "chan".into(),
+                payload: "tb1:null".into(),
+                source: Some((RendererAssignmentId::new(1), 4)),
+            },
         ];
         for message in messages {
             round_trip(&message);
@@ -750,6 +779,16 @@ mod tests {
                     tab: 3,
                     origin: "http://example.test".into(),
                     key: "\"k\"".into(),
+                },
+            },
+            FromRenderer::ServiceCall {
+                assignment: RendererAssignmentId::new(1),
+                id: 20,
+                call: ServiceCall::BroadcastPost {
+                    origin: "http://example.test".into(),
+                    name: "chan".into(),
+                    payload: "tb1:null".into(),
+                    channel: 4,
                 },
             },
         ];

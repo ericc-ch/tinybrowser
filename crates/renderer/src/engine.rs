@@ -397,6 +397,32 @@ impl Engine {
         }
     }
 
+    /// Queues one `BroadcastChannel` message on every same-origin frame of
+    /// this engine
+    /// (<https://html.spec.whatwg.org/multipage/web-messaging.html#broadcasting-to-other-browsing-contexts>).
+    pub fn receive_broadcast_message(
+        &mut self,
+        origin: &str,
+        name: &str,
+        payload: &str,
+        source: Option<u64>,
+    ) {
+        for document in self.frames.values_mut() {
+            if document.origin_string() != origin {
+                continue;
+            }
+            if !document.world().borrow().is_attached() {
+                continue;
+            }
+            document.push_broadcast_message(
+                origin.to_owned(),
+                name.to_owned(),
+                payload.to_owned(),
+                source,
+            );
+        }
+    }
+
     /// Copies one `sessionStorage` seed into this engine's session area
     /// (<https://html.spec.whatwg.org/multipage/document-sequences.html#copy-session-storage>).
     ///

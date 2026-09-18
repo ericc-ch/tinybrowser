@@ -639,6 +639,25 @@ impl World {
         self.frame
     }
 
+    /// Whether this realm's frame is still attached to its document. A
+    /// removed iframe's frame may still sit in the tree until the engine
+    /// reconciles, so the container's connectedness decides.
+    pub(crate) fn is_attached(&self) -> bool {
+        if self.frame == FrameId::MAIN {
+            return true;
+        }
+        let container = self.runtime.shared.borrow().tree.container(self.frame);
+        let Some(container) = container else {
+            return false;
+        };
+        self.owner_world(container).is_some_and(|owner| {
+            owner
+                .borrow()
+                .main_document()
+                .is_some_and(|parsed| parsed.dom.is_connected(container))
+        })
+    }
+
     /// The renderer-process state shared by every realm.
     pub(crate) fn shared(&self) -> SharedHandle {
         Rc::clone(&self.runtime.shared)

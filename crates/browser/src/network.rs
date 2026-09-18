@@ -13,9 +13,9 @@ use tokio::sync::Semaphore;
 use tokio::sync::mpsc::UnboundedSender;
 use url::Url;
 
+use crate::broadcast::{BroadcastBus, BroadcastMessage, BroadcastSink};
 use crate::storage::LocalStorage;
 use crate::store::ProfileStore;
-
 /// Default per-call fetch timeout on a [`FetchHandle`].
 pub(crate) const PAGE_FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -40,6 +40,7 @@ pub struct NetworkSession {
     agent: Agent,
     store: Arc<ProfileStore>,
     storage: Arc<LocalStorage>,
+    broadcast: Arc<BroadcastBus>,
     permits: NetworkPermits,
 }
 
@@ -66,6 +67,7 @@ impl NetworkSession {
             agent,
             store: Arc::new(store),
             storage,
+            broadcast: Arc::new(BroadcastBus::default()),
             permits: NetworkPermits::new(),
         })
     }
@@ -77,6 +79,7 @@ impl NetworkSession {
             agent: self.agent.clone(),
             store: Arc::clone(&self.store),
             storage: Arc::clone(&self.storage),
+            broadcast: Arc::clone(&self.broadcast),
             permits: self.permits.clone(),
             tab: Arc::new(Semaphore::new(MAX_TAB_DIALS)),
         }
@@ -144,6 +147,7 @@ pub(crate) struct FetchHandle {
     agent: Agent,
     store: Arc<ProfileStore>,
     storage: Arc<LocalStorage>,
+    broadcast: Arc<BroadcastBus>,
     permits: NetworkPermits,
     tab: Arc<Semaphore>,
 }
@@ -174,6 +178,16 @@ impl FetchHandle {
     /// Registers `sink` as this renderer's `storage`-event delivery hook.
     pub(crate) fn subscribe_storage(&self, sink: crate::storage::StorageSink) {
         self.storage.subscribe(sink);
+    }
+
+    /// Registers `sink` as this renderer's `BroadcastChannel` hook.
+    pub(crate) fn subscribe_broadcast(&self, sink: BroadcastSink) {
+        self.broadcast.subscribe(sink);
+    }
+
+    /// Fans one `BroadcastChannel` message out to every renderer.
+    pub(crate) fn post_broadcast(&self, message: &BroadcastMessage) {
+        self.broadcast.broadcast(message);
     }
 
     /// `localStorage.setItem(key, value)`; `Ok(None)` means no change.

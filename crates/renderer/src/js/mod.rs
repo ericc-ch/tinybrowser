@@ -336,6 +336,28 @@ impl JsRealm {
         })
     }
 
+    /// Dispatches one `BroadcastChannel` message in this realm.
+    /// (<https://html.spec.whatwg.org/multipage/web-messaging.html#broadcasting-to-other-browsing-contexts>)
+    pub(crate) fn deliver_broadcast_message(
+        &self,
+        origin: &str,
+        name: &str,
+        payload: &str,
+        source: Option<u64>,
+    ) -> Result<(), JsError> {
+        let origin = origin.to_owned();
+        let name = name.to_owned();
+        let payload = payload.to_owned();
+        let source = source.map(crate::js::js_number);
+        self.with_budget(None, || {
+            self.context.with(|ctx| {
+                let deliver: Function = ctx.globals().get("__tbDeliverBroadcast")?;
+                deliver.call::<_, ()>((name, payload, origin, source))?;
+                Ok(())
+            })
+        })
+    }
+
     /// Decodes and dispatches one channel message in this realm.
     pub(crate) fn deliver_port_message(
         &self,
@@ -677,6 +699,25 @@ fn install_window_host_functions(ctx: &Ctx<'_>, world: &Rc<RefCell<World>>) -> R
                     .remote_session_get(tab, &origin, &key)
             })
         }),
+    )?;
+
+    let broadcast = world.clone();
+    ctx.globals().set(
+        "__tbBroadcastPost",
+        Func::from(
+            move |origin: String, name: String, payload: String, channel: u64| {
+                let world = broadcast.borrow();
+                // A channel in a detached iframe must not reach live contexts
+                // (<https://html.spec.whatwg.org/multipage/web-messaging.html#broadcasting-to-other-browsing-contexts>).
+                if !world.is_attached() {
+                    return;
+                }
+                world
+                    .runtime
+                    .services
+                    .broadcast_post(&origin, &name, &payload, channel);
+            },
+        ),
     )?;
     Ok(())
 }

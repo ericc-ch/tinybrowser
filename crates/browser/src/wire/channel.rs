@@ -27,7 +27,8 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 /// Version 5 added the storage service calls and the browser-broadcast
 /// `storage` event. Version 6 added `window.open`/`window.close`. Version 7
 /// added cross-tab messaging, session copies, and remote session reads.
-pub const PROTOCOL_VERSION: u8 = 7;
+/// Version 8 added `BroadcastChannel`.
+pub const PROTOCOL_VERSION: u8 = 8;
 
 /// Fixed frame header size in bytes.
 pub const HEADER_BYTES: usize = 16;

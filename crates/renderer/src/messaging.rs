@@ -75,7 +75,6 @@ impl FrameTree {
     pub(crate) fn contains(&self, frame: FrameId) -> bool {
         self.containers.contains_key(&frame)
     }
-
     /// The parent browsing context of `frame`, when it is a child frame.
     pub(crate) fn parent(&self, frame: FrameId) -> Option<FrameId> {
         self.parents.get(&frame).copied()

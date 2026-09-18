@@ -188,6 +188,10 @@ fn read_messages(
                     logging::error!(target: "renderer::ipc", "storage event before handshake");
                     break;
                 }
+                ToRenderer::BroadcastMessage { .. } => {
+                    logging::error!(target: "renderer::ipc", "broadcast before handshake");
+                    break;
+                }
             }
         }
         if !route_message(message, command_tx, services) {
@@ -234,6 +238,13 @@ fn route_message(
             // Storage events are best-effort, like the spec's task queue. The
             // engine may be blocked in a synchronous service call, so blocking
             // here would stall the service reply it waits on.
+            match command_tx.try_send(RendererInput::Control(message)) {
+                Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => true,
+                Err(mpsc::error::TrySendError::Closed(_)) => false,
+            }
+        }
+        ToRenderer::BroadcastMessage { .. } => {
+            // Same best-effort rule as storage events.
             match command_tx.try_send(RendererInput::Control(message)) {
                 Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => true,
                 Err(mpsc::error::TrySendError::Closed(_)) => false,
@@ -547,5 +558,17 @@ impl BrowserServices for AssignmentServices {
             Some(ServiceReply::StorageValue(value)) => value,
             _ => None,
         }
+    }
+
+    fn broadcast_post(&self, origin: &str, name: &str, payload: &str, channel: u64) {
+        let _result = self.channel.call(
+            self.assignment,
+            ServiceCall::BroadcastPost {
+                origin: origin.to_owned(),
+                name: name.to_owned(),
+                payload: payload.to_owned(),
+                channel,
+            },
+        );
     }
 }

@@ -46,18 +46,10 @@ pub(super) async fn run(
         tokio::select! {
             received = inbox.recv() => match received {
                 Some(RendererInput::Control(ToRenderer::Assign { assignment })) => {
-                    if engines.contains_key(&assignment) {
+                    if !assign_engine(&mut engines, assignment, &services, stop, &wake) {
                         stop.request();
                         break;
                     }
-                    let assignment_services = Arc::new(AssignmentServices::new(
-                        assignment,
-                        Arc::clone(&services),
-                    ));
-                    engines.insert(
-                        assignment,
-                        Engine::new(assignment_services, Arc::clone(stop), Arc::clone(&wake)),
-                    );
                 }
                 Some(RendererInput::Control(ToRenderer::Release { assignment })) => {
                     responses.release(assignment);
@@ -116,6 +108,12 @@ pub(super) async fn run(
                     ),
                     source,
                 ),
+                Some(RendererInput::Control(ToRenderer::BroadcastMessage {
+                    origin,
+                    name,
+                    payload,
+                    source,
+                })) => queue_broadcast_message(&mut engines, &origin, &name, &payload, source),
                 // The transport consumes the handshake, response stream, and
                 // service replies; none reaches this loop.
                 Some(
@@ -174,6 +172,42 @@ fn reply_result(
             reply: Reply::Unit(result),
         },
     )
+}
+
+/// Creates one engine for `assignment`; `false` stops the loop on a duplicate.
+fn assign_engine(
+    engines: &mut HashMap<RendererAssignmentId, Engine>,
+    assignment: RendererAssignmentId,
+    services: &Arc<ChannelServices>,
+    stop: &Arc<Stop>,
+    wake: &Arc<Notify>,
+) -> bool {
+    if engines.contains_key(&assignment) {
+        return false;
+    }
+    let assignment_services = Arc::new(AssignmentServices::new(assignment, Arc::clone(services)));
+    engines.insert(
+        assignment,
+        Engine::new(assignment_services, Arc::clone(stop), Arc::clone(wake)),
+    );
+    true
+}
+
+/// Queues one browser-broadcast `BroadcastChannel` message on every engine;
+/// only the posting assignment skips the source channel.
+fn queue_broadcast_message(
+    engines: &mut HashMap<RendererAssignmentId, Engine>,
+    origin: &str,
+    name: &str,
+    payload: &str,
+    source: Option<(RendererAssignmentId, u64)>,
+) {
+    for (assignment, engine) in engines {
+        let source_channel = source.and_then(|(source_assignment, channel)| {
+            (source_assignment == *assignment).then_some(channel)
+        });
+        engine.receive_broadcast_message(origin, name, payload, source_channel);
+    }
 }
 
 /// Queues one browser-broadcast `localStorage` change on every engine. Only

@@ -277,6 +277,7 @@ nix develop --command ./tools/wpt/score <directory> -- --exclude=worker
 | `webidl/` | unscored |
 | `webmcp/` | unscored |
 | `webmessaging/` | 77.9% |
+| `webmessaging/broadcastchannel/` | 41.7% |
 | `webmidi/` | unscored |
 | `webnn/` | unscored |
 | `webrtc/` | unscored |
@@ -288,7 +289,7 @@ nix develop --command ./tools/wpt/score <directory> -- --exclude=worker
 | `webrtc-stats/` | unscored |
 | `webrtc-svc/` | unscored |
 | `websockets/` | unscored |
-| `webstorage/` | 85.2% |
+| `webstorage/` | 87.0% |
 | `webtransport/` | unscored |
 | `webusb/` | unscored |
 | `webvtt/` | unscored |

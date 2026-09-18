@@ -43,6 +43,13 @@ enum Task {
     StorageEvent(crate::storage::PendingStorageEvent),
     /// One cross-tab `message` payload from another renderer.
     RemoteMessage(String),
+    /// One `BroadcastChannel` message for this frame's channels.
+    BroadcastMessage {
+        origin: String,
+        name: String,
+        payload: String,
+        source: Option<u64>,
+    },
     PortMessage {
         endpoint: u64,
         payload: String,
@@ -493,6 +500,23 @@ impl Document {
         self.tasks.push_back(Task::RemoteMessage(payload));
     }
 
+    /// Queues one `BroadcastChannel` message on this frame's task source
+    /// (<https://html.spec.whatwg.org/multipage/web-messaging.html#broadcasting-to-other-browsing-contexts>).
+    pub(crate) fn push_broadcast_message(
+        &mut self,
+        origin: String,
+        name: String,
+        payload: String,
+        source: Option<u64>,
+    ) {
+        self.tasks.push_back(Task::BroadcastMessage {
+            origin,
+            name,
+            payload,
+            source,
+        });
+    }
+
     /// Queues one channel message as a task on this frame's task source.
     pub(crate) fn push_port_message(&mut self, endpoint: u64, payload: String, ports: Vec<u64>) {
         self.tasks.push_back(Task::PortMessage {
@@ -513,6 +537,21 @@ impl Document {
             return;
         }
         self.fire_js(|js| js.deliver_remote_message(payload));
+        self.adopt_js_work();
+    }
+
+    /// Dispatches one `BroadcastChannel` message to this frame's channels.
+    fn deliver_broadcast_message(
+        &mut self,
+        origin: &str,
+        name: &str,
+        payload: &str,
+        source: Option<u64>,
+    ) {
+        if !self.ensure_js_ok() {
+            return;
+        }
+        self.fire_js(|js| js.deliver_broadcast_message(origin, name, payload, source));
         self.adopt_js_work();
     }
 

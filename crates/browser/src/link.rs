@@ -793,6 +793,22 @@ async fn route_service_call(
             context.fetch.set_cookie(&value, &url);
             send_reply(&context.tx, id, ServiceReply::Unit).await?;
         }
+        ServiceCall::BroadcastPost {
+            origin,
+            name,
+            payload,
+            channel,
+        } => {
+            context
+                .fetch
+                .post_broadcast(&crate::broadcast::BroadcastMessage {
+                    origin,
+                    name,
+                    payload,
+                    source: (assignment, channel),
+                });
+            send_reply(&context.tx, id, ServiceReply::Unit).await?;
+        }
         call @ (ServiceCall::StorageGet { .. }
         | ServiceCall::StorageKeys { .. }
         | ServiceCall::StorageSet { .. }
@@ -895,7 +911,8 @@ async fn route_window_call(
         | ServiceCall::StorageKeys { .. }
         | ServiceCall::StorageSet { .. }
         | ServiceCall::StorageRemove { .. }
-        | ServiceCall::StorageClear { .. } => {
+        | ServiceCall::StorageClear { .. }
+        | ServiceCall::BroadcastPost { .. } => {
             // `route_service_call` dispatches the other service families.
             return Err(RendererViolation);
         }
@@ -985,7 +1002,8 @@ async fn route_storage_call(
         | ServiceCall::WindowClose { .. }
         | ServiceCall::Opener
         | ServiceCall::WindowMessage { .. }
-        | ServiceCall::RemoteSessionGet { .. } => {
+        | ServiceCall::RemoteSessionGet { .. }
+        | ServiceCall::BroadcastPost { .. } => {
             // `route_service_call` dispatches the other service families.
             return Err(RendererViolation);
         }
@@ -1009,7 +1027,8 @@ async fn send_released_reply(
         ServiceCall::CookieGet { .. } => ServiceReply::Cookie(String::new()),
         ServiceCall::CookieSet { .. }
         | ServiceCall::WindowClose { .. }
-        | ServiceCall::WindowMessage { .. } => ServiceReply::Unit,
+        | ServiceCall::WindowMessage { .. }
+        | ServiceCall::BroadcastPost { .. } => ServiceReply::Unit,
         ServiceCall::StorageGet { .. } | ServiceCall::RemoteSessionGet { .. } => {
             ServiceReply::StorageValue(None)
         }
@@ -1133,6 +1152,39 @@ fn spawn_transport(command: &mut Command) -> io::Result<SpawnedRenderer> {
     })
 }
 
+/// Registers the one-way browser-to-renderer subscriptions: storage events
+/// and `BroadcastChannel` messages. Both are best-effort; a full queue drops
+/// the message instead of stalling the browser.
+fn subscribe_renderer_events(fetch: &FetchHandle, tx: &mpsc::Sender<Outbound>) {
+    let storage_tx = tx.clone();
+    fetch.subscribe_storage(Box::new(move |event| {
+        match storage_tx.try_send(Outbound::Control(ToRenderer::StorageEvent {
+            origin: event.origin,
+            kind: event.kind,
+            key: event.key,
+            old_value: event.old_value,
+            new_value: event.new_value,
+            url: event.url,
+            source: Some(event.source),
+        })) {
+            Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => true,
+            Err(mpsc::error::TrySendError::Closed(_)) => false,
+        }
+    }));
+    let broadcast_tx = tx.clone();
+    fetch.subscribe_broadcast(Box::new(move |message| {
+        match broadcast_tx.try_send(Outbound::Control(ToRenderer::BroadcastMessage {
+            origin: message.origin.clone(),
+            name: message.name.clone(),
+            payload: message.payload.clone(),
+            source: Some(message.source),
+        })) {
+            Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => true,
+            Err(mpsc::error::TrySendError::Closed(_)) => false,
+        }
+    }));
+}
+
 pub(crate) async fn spawn_process(
     id: RendererId,
     site: Option<Site>,
@@ -1155,24 +1207,7 @@ pub(crate) async fn spawn_process(
         return Err(io::Error::other("renderer stderr missing"));
     };
     let (tx, rx) = mpsc::channel::<Outbound>(COMMAND_CAPACITY);
-    // This renderer receives every `localStorage` broadcast, including its own
-    // changes; its session loop excludes the mutating window. Same-renderer
-    // tabs are separate assignments and still get the event.
-    let storage_tx = tx.clone();
-    fetch.subscribe_storage(Box::new(move |event| {
-        match storage_tx.try_send(Outbound::Control(ToRenderer::StorageEvent {
-            origin: event.origin,
-            kind: event.kind,
-            key: event.key,
-            old_value: event.old_value,
-            new_value: event.new_value,
-            url: event.url,
-            source: Some(event.source),
-        })) {
-            Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => true,
-            Err(mpsc::error::TrySendError::Closed(_)) => false,
-        }
-    }));
+    subscribe_renderer_events(&fetch, &tx);
     let (kill, kill_rx) = watch::channel(false);
     let waiters = Waiters {
         pending: Arc::new(Mutex::new(HashMap::new())),

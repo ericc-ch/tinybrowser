@@ -1927,6 +1927,75 @@ globalThis.__tbDeliverRemoteMessage = function(payload) {
     data: data, origin: '', source: null, ports: Object.freeze([]),
   }));
 };
+
+// ── broadcast channels ─────────────────────────────────────────────────
+// https://html.spec.whatwg.org/multipage/web-messaging.html#broadcastchannel
+const __tbBroadcastData = Symbol.for('tinybrowser.broadcastchannel.data');
+const __tbBroadcastChannels = new Set();
+let __tbNextBroadcastChannel = 1;
+
+globalThis.BroadcastChannel = class BroadcastChannel extends EventTarget {
+  constructor(name) {
+    if (arguments.length < 1) {
+      throw new TypeError("Failed to construct 'BroadcastChannel': 1 argument required, but only 0 present.");
+    }
+    super();
+    Object.defineProperty(this, __tbBroadcastData, {
+      value: {
+        id: __tbNextBroadcastChannel++, name: String(name), closed: false,
+        onmessage: null, onmessageerror: null,
+      },
+      writable: false, enumerable: false, configurable: false,
+    });
+    __tbBroadcastChannels.add(this);
+  }
+  get name() { return __tbBrand(this, __tbBroadcastData).name; }
+  postMessage(message) {
+    if (arguments.length < 1) {
+      throw new TypeError("Failed to execute 'postMessage' on 'BroadcastChannel': 1 argument required, but only 0 present.");
+    }
+    const data = __tbBrand(this, __tbBroadcastData);
+    if (data.closed) {
+      throw new globalThis.DOMException('The channel is closed.', 'InvalidStateError');
+    }
+    const encoded = __tbEncode(message, [], null);
+    const origin = __tbStorageOrigin();
+    if (origin === null || origin === undefined) return;
+    __tbBroadcastPost(origin, data.name, encoded.payload, data.id);
+  }
+  close() {
+    const data = __tbBrand(this, __tbBroadcastData);
+    if (data.closed) return;
+    data.closed = true;
+    __tbBroadcastChannels.delete(this);
+  }
+  get onmessage() { return __tbBrand(this, __tbBroadcastData).onmessage; }
+  set onmessage(value) { __tbBrand(this, __tbBroadcastData).onmessage = value; }
+  get onmessageerror() { return __tbBrand(this, __tbBroadcastData).onmessageerror; }
+  set onmessageerror(value) { __tbBrand(this, __tbBroadcastData).onmessageerror = value; }
+};
+Object.defineProperty(globalThis.BroadcastChannel.prototype, Symbol.toStringTag, {
+  value: 'BroadcastChannel', writable: false, enumerable: false, configurable: true,
+});
+
+globalThis.__tbDeliverBroadcast = function(name, payload, origin, sourceChannel) {
+  for (const channel of __tbBroadcastChannels) {
+    const data = channel[__tbBroadcastData];
+    if (data === undefined || data.closed || data.name !== name) continue;
+    if (sourceChannel !== null && sourceChannel !== undefined && data.id === sourceChannel) continue;
+    let event;
+    try {
+      event = new globalThis.MessageEvent('message', {
+        data: __tbDecode(payload, []), origin: origin, source: null, ports: Object.freeze([]),
+      });
+    } catch (error) {
+      event = new globalThis.MessageEvent('messageerror', {
+        data: null, origin: origin, source: null, ports: Object.freeze([]),
+      });
+    }
+    channel.__tbDispatchTrusted(event);
+  }
+};
 globalThis.__tbDeliverPortMessage = function(endpoint, payload, portIds) {
   const port = __tbPortLookup(endpoint);
   if (port === null) return true;
@@ -1966,6 +2035,14 @@ globalThis.__tbDeliverPortClose = function(endpoint) {
 Object.defineProperty(globalThis, 'length', {
   get() { return __tbFrameChildCount(__tbFrameId); },
   configurable: true, enumerable: false,
+});
+// https://html.spec.whatwg.org/multipage/window-object.html#dom-origin
+Object.defineProperty(globalThis, 'origin', {
+  get() {
+    const value = __tbStorageOrigin();
+    return value === null || value === undefined ? 'null' : value;
+  },
+  configurable: true, enumerable: true,
 });
 // https://html.spec.whatwg.org/multipage/nav-history-apis.html#dom-window-item
 for (let index = 0; index < __tb_maxFrames; index++) {

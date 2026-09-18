@@ -551,6 +551,8 @@ impl BrowserServices for WasmServices {
     fn remote_session_get(&self, _tab: u64, _origin: &str, _key: &str) -> Option<String> {
         None
     }
+
+    fn broadcast_post(&self, _origin: &str, _name: &str, _payload: &str, _channel: u64) {}
 }
 
 impl Drop for WasmServices {
