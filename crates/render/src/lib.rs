@@ -27,15 +27,15 @@
 #![doc = include_str!("../README.md")]
 
 mod cascade;
+mod color;
 mod stylo;
 mod stylo_map;
 mod stylo_view;
-mod color;
 
+mod boxes;
 mod font;
 mod geometry;
 mod layout;
-mod boxes;
 mod paint;
 mod png;
 mod style;

@@ -81,7 +81,12 @@ struct Builder<'a> {
 }
 
 /// Lays out the root wrapper through Taffy.
-pub(crate) fn layout_root(root: &BoxNode, fonts: &Fonts, viewport_width: f32, viewport_height: f32) -> LayoutBox {
+pub(crate) fn layout_root(
+    root: &BoxNode,
+    fonts: &Fonts,
+    viewport_width: f32,
+    viewport_height: f32,
+) -> LayoutBox {
     let ctx = Ctx { fonts };
     let mut builder = Builder::new(&ctx);
     let root_id = builder.build_node(root);
@@ -170,20 +175,17 @@ fn measure_leaf(
 /// Percentages resolve against the parent size when Taffy supplies one.
 fn styled_size(style: &Style, input: &LayoutInput) -> (f32, f32) {
     let basis = |axis: Option<f32>, available: TaffyAvailableSpace| {
-        axis
-            .or(match available {
-                TaffyAvailableSpace::Definite(value) => Some(value),
-                TaffyAvailableSpace::MinContent | TaffyAvailableSpace::MaxContent => None,
-            })
-            .unwrap_or(0.0)
+        axis.or(match available {
+            TaffyAvailableSpace::Definite(value) => Some(value),
+            TaffyAvailableSpace::MinContent | TaffyAvailableSpace::MaxContent => None,
+        })
+        .unwrap_or(0.0)
     };
     let basis_w = basis(input.parent_size.width, input.available_space.width);
     let basis_h = basis(input.parent_size.height, input.available_space.height);
     let resolve = |dimension: Dimension, basis: f32| match dimension {
         Dimension::Auto => None,
-        Dimension::Length(length) => {
-            Some(length.resolve(basis))
-        }
+        Dimension::Length(length) => Some(length.resolve(basis)),
     };
     let width = input
         .known_dimensions
@@ -357,12 +359,7 @@ impl<'a> Builder<'a> {
     }
 
     /// Applies one grid item's placement and self-alignment.
-    fn apply_grid_placement(
-        &mut self,
-        id: taffy::NodeId,
-        item: &Style,
-        container: &Style,
-    ) {
+    fn apply_grid_placement(&mut self, id: taffy::NodeId, item: &Style, container: &Style) {
         let Ok(mut converted) = self.tree.style(id).cloned() else {
             return;
         };
@@ -406,7 +403,10 @@ impl<'a> Builder<'a> {
         style: &Style,
     ) -> taffy::NodeId {
         let run_index = self.runs.len();
-        self.runs.push(InlineRun { nodes: run, text_align });
+        self.runs.push(InlineRun {
+            nodes: run,
+            text_align,
+        });
         let mut converted = convert_style(style);
         converted.display = TaffyDisplay::Block;
         let id = self
@@ -436,9 +436,10 @@ impl<'a> Builder<'a> {
     ) -> LayoutBox {
         let layout = *self.tree.layout(node).expect("computed layout");
         let data = self.data.remove(&node).expect("node data");
-        let padding = data.style.padding.map(|length| {
-            length.resolve(parent_content_width)
-        });
+        let padding = data
+            .style
+            .padding
+            .map(|length| length.resolve(parent_content_width));
         let rect = Rect::new(
             x + layout.location.x,
             y + layout.location.y,
@@ -448,13 +449,14 @@ impl<'a> Builder<'a> {
         // The containing width for percentage padding below is this box's
         // content width.
         let border = data.style.border;
-        let content_width = (rect.width
-            - border.left.width
-            - border.right.width
-            - padding.left
-            - padding.right)
-            .max(0.0);
+        let content_width =
+            (rect.width - border.left.width - border.right.width - padding.left - padding.right)
+                .max(0.0);
         let mut items = Vec::new();
+        // Inline content starts at the content box: padding and border are
+        // painted around it, not under it.
+        let content_x = rect.x + border.left.width + padding.left;
+        let content_y = rect.y + border.top.width + padding.top;
         if let Some(run_index) = data.leaf {
             let run = &self.runs[run_index];
             // The measure pass usually laid this run out at the final width;
@@ -462,10 +464,8 @@ impl<'a> Builder<'a> {
             // inline engine when the widths disagree.
             let cached = self.cache.remove(&node);
             let fresh = match cached {
-                Some((width, mut items))
-                    if (width - content_width).abs() < 0.5 =>
-                {
-                    crate::layout::shift_items(&mut items, rect.x, rect.y);
+                Some((width, mut items)) if (width - content_width).abs() < 0.5 => {
+                    crate::layout::shift_items(&mut items, content_x, content_y);
                     Some(items)
                 }
                 _ => None,
@@ -474,8 +474,8 @@ impl<'a> Builder<'a> {
                 layout_inline_run(
                     run.nodes,
                     self.ctx,
-                    rect.x,
-                    rect.y,
+                    content_x,
+                    content_y,
                     content_width,
                     run.text_align,
                 )
@@ -672,10 +672,12 @@ fn push_track(track: &GridTrack, out: &mut Vec<GridTemplateComponent<String>>) {
         GridTrack::Single(size) => out.push(GridTemplateComponent::<String>::Single(
             map_track_size(size),
         )),
-        GridTrack::MinMax(min, max) => out.push(GridTemplateComponent::<String>::Single(TrackSizingFunction {
-            min: map_min_size(min),
-            max: map_max_size(max),
-        })),
+        GridTrack::MinMax(min, max) => out.push(GridTemplateComponent::<String>::Single(
+            TrackSizingFunction {
+                min: map_min_size(min),
+                max: map_max_size(max),
+            },
+        )),
         GridTrack::Repeat(count, tracks) => {
             let mut repeated = Vec::with_capacity(tracks.len());
             for track in tracks {
@@ -689,11 +691,13 @@ fn push_track(track: &GridTrack, out: &mut Vec<GridTemplateComponent<String>>) {
                     GridTrack::Repeat(_, _) => {}
                 }
             }
-            out.push(GridTemplateComponent::<String>::Repeat(GridTemplateRepetition {
-                count: RepetitionCount::Count(*count),
-                tracks: repeated,
-                line_names: Vec::new(),
-            }));
+            out.push(GridTemplateComponent::<String>::Repeat(
+                GridTemplateRepetition {
+                    count: RepetitionCount::Count(*count),
+                    tracks: repeated,
+                    line_names: Vec::new(),
+                },
+            ));
         }
     }
 }
@@ -702,9 +706,7 @@ fn push_track(track: &GridTrack, out: &mut Vec<GridTemplateComponent<String>>) {
 fn map_track_size(size: &TrackSize) -> TrackSizingFunction {
     match size {
         TrackSize::Auto => TrackSizingFunction::AUTO,
-        TrackSize::Length(length) => {
-            TrackSizingFunction::from(to_length(*length))
-        }
+        TrackSize::Length(length) => TrackSizingFunction::from(to_length(*length)),
         TrackSize::Flex(flex) => TrackSizingFunction::from_fr(*flex),
     }
 }
@@ -714,9 +716,7 @@ fn map_track_size(size: &TrackSize) -> TrackSizingFunction {
 fn map_min_size(size: &TrackSize) -> MinTrackSizingFunction {
     match size {
         TrackSize::Auto | TrackSize::Flex(_) => MinTrackSizingFunction::AUTO,
-        TrackSize::Length(length) => {
-            MinTrackSizingFunction::from(to_length(*length))
-        }
+        TrackSize::Length(length) => MinTrackSizingFunction::from(to_length(*length)),
     }
 }
 
@@ -724,9 +724,7 @@ fn map_min_size(size: &TrackSize) -> MinTrackSizingFunction {
 fn map_max_size(size: &TrackSize) -> MaxTrackSizingFunction {
     match size {
         TrackSize::Auto => MaxTrackSizingFunction::AUTO,
-        TrackSize::Length(length) => {
-            MaxTrackSizingFunction::from(to_length(*length))
-        }
+        TrackSize::Length(length) => MaxTrackSizingFunction::from(to_length(*length)),
         TrackSize::Flex(flex) => MaxTrackSizingFunction::from_fr(*flex),
     }
 }

@@ -43,6 +43,9 @@ logging = { workspace = true }
 serde_json = "1"
 tokio = { version = "1.53", default-features = false, features = ["rt-multi-thread", "net", "sync", "time"] }
 
+[dev-dependencies]
+base64 = "0.23"
+
 # ─── Lints ────────────────────────────────────────────────────────────────────
 # Strict (not strict-strict): `all` is error, `pedantic`/`cargo` are warnings.
 # No `nursery` (experimental). No `allow` list: fix code instead of silencing.

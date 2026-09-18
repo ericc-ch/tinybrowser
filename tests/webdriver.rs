@@ -4,6 +4,7 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use base64::Engine as _;
 use common::Fixture;
 use serde_json::{Value, json};
 
@@ -680,12 +681,13 @@ fn take_screenshot_returns_base64_png() {
         .to_owned();
     let shot = request(&addr, "GET", &format!("/session/{id}/screenshot"), None);
     let data = shot["value"].as_str().expect("base64 string");
-    // PNG signature in base64: `89504e470d0a1a0a`.
-    assert!(
-        data.starts_with("iVBORw0KGgo"),
-        "not a PNG: {}",
-        &data[..12.min(data.len())]
-    );
-    // An 800x600 screenshot is far larger than the 8-byte signature.
-    assert!(data.len() > 200, "suspiciously small png: {} bytes", data.len());
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(data)
+        .expect("base64 png");
+    // PNG signature, then the IHDR dimensions (big-endian after the 8-byte
+    // length/type prefix).
+    assert_eq!(&bytes[..8], b"\x89PNG\r\n\x1a\n", "not a PNG");
+    let width = u32::from_be_bytes(bytes[16..20].try_into().expect("width"));
+    let height = u32::from_be_bytes(bytes[20..24].try_into().expect("height"));
+    assert_eq!((width, height), (800, 600), "unexpected viewport capture");
 }

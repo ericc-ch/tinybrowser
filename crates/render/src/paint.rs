@@ -12,12 +12,14 @@
 //! glyphs fully outside the clip are skipped, partially overlapping ones are
 //! not masked (masking every text leaf would allocate per leaf).
 
-use tiny_skia::{Color as SkiaColor, FillRule, Paint, PathBuilder, Pixmap, Rect as SkiaRect, Transform};
+use tiny_skia::{
+    Color as SkiaColor, FillRule, Paint, PathBuilder, Pixmap, Rect as SkiaRect, Transform,
+};
 
-use skrifa::instance::{LocationRef, NormalizedCoord, Size};
-use skrifa::outline::OutlinePen;
 use skrifa::GlyphId;
 use skrifa::MetadataProvider as _;
+use skrifa::instance::{LocationRef, NormalizedCoord, Size};
+use skrifa::outline::OutlinePen;
 
 use crate::color::Color;
 use crate::geometry::Rect;
@@ -32,7 +34,8 @@ const MAX_PIXELS: u64 = 4096 * 4096;
 /// Blends text glyphs and fills rectangles into one pixmap.
 pub(crate) struct Painter {
     pixmap: Pixmap,
-    clip: Option<Rect>,
+    /// Active clip rectangles, innermost last; empty means the whole canvas.
+    clips: Vec<Rect>,
 }
 
 impl Painter {
@@ -47,20 +50,29 @@ impl Painter {
         }
         let mut pixmap = Pixmap::new(width, height).ok_or(RenderError::TooLarge)?;
         pixmap.fill(SkiaColor::WHITE);
-        Ok(Self { pixmap, clip: None })
+        Ok(Self {
+            pixmap,
+            clips: Vec::new(),
+        })
     }
 
     /// Intersects the current clip with `rect`.
     pub(crate) fn push_clip(&mut self, rect: Rect) {
-        self.clip = Some(match self.clip {
+        let clip = match self.clips.last() {
             Some(current) => current.intersect(rect),
             None => rect,
-        });
+        };
+        self.clips.push(clip);
     }
 
-    /// Restores the clip to the whole canvas.
+    /// Restores the clip to the enclosing one.
     pub(crate) fn pop_clip(&mut self) {
-        self.clip = None;
+        self.clips.pop();
+    }
+
+    /// The effective clip: the innermost push, or `None` for the canvas.
+    fn current_clip(&self) -> Option<Rect> {
+        self.clips.last().copied()
     }
 
     /// Fills a solid rectangle.
@@ -69,9 +81,7 @@ impl Painter {
             return;
         };
         let mut paint = Paint::default();
-        paint.set_color(SkiaColor::from_rgba8(
-            color.r, color.g, color.b, color.a,
-        ));
+        paint.set_color(SkiaColor::from_rgba8(color.r, color.g, color.b, color.a));
         if let Some(skia) = SkiaRect::from_xywh(visible.x, visible.y, visible.width, visible.height)
         {
             self.pixmap
@@ -95,9 +105,7 @@ impl Painter {
         }
         let outlines = face.outline_glyphs();
         let mut paint = Paint::default();
-        paint.set_color(SkiaColor::from_rgba8(
-            color.r, color.g, color.b, color.a,
-        ));
+        paint.set_color(SkiaColor::from_rgba8(color.r, color.g, color.b, color.a));
         paint.anti_alias = true;
         for glyph in glyphs {
             if !self.glyph_visible(glyph) {
@@ -107,10 +115,8 @@ impl Painter {
                 continue;
             };
             let coords: &[NormalizedCoord] = &[];
-            let settings = skrifa::outline::DrawSettings::unhinted(
-                Size::new(size),
-                LocationRef::from(coords),
-            );
+            let settings =
+                skrifa::outline::DrawSettings::unhinted(Size::new(size), LocationRef::from(coords));
             let mut pen = PathPen::new(glyph.x, glyph.y);
             if outline.draw(settings, &mut pen).is_err() {
                 continue;
@@ -130,7 +136,7 @@ impl Painter {
 
     /// Whether any part of a glyph run entry can paint inside the clip.
     fn glyph_visible(&self, glyph: &PlacedGlyph) -> bool {
-        let Some(clip) = self.clip else {
+        let Some(clip) = self.current_clip() else {
             return true;
         };
         // Glyph extents are unknown before outlining; test the pen point
@@ -153,7 +159,7 @@ impl Painter {
     /// `rect` clipped to the current clip and canvas, or `None` when nothing
     /// would be painted.
     fn visible(&self, rect: Rect) -> Option<Rect> {
-        let rect = match self.clip {
+        let rect = match self.current_clip() {
             Some(clip) => rect.intersect(clip),
             None => rect,
         };

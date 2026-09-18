@@ -48,6 +48,10 @@ const PRODUCT: &str = "tinybrowser/0.1.0";
 /// One default browser context; Playwright requires `browserContextId` on
 /// attached targets.
 const DEFAULT_BROWSER_CONTEXT_ID: &str = "tinybrowser-default";
+/// Fallback wait for `awaitPromise` when the client sends no `timeout`
+/// (<https://chromedevtools.github.io/devtools-protocol/tot/Runtime/#method-evaluate>).
+/// The protocol's own `timeout` parameter, when present, wins.
+const AWAIT_PROMISE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Serves CDP HTTP discovery and WebSocket endpoints on `listener`.
 ///
@@ -1074,6 +1078,15 @@ impl Conn {
             .get("awaitPromise")
             .and_then(Value::as_bool)
             .unwrap_or(false);
+        // `Runtime.evaluate` carries an optional `timeout` in milliseconds;
+        // `Runtime.callFunctionOn` has none, so the fallback applies.
+        let await_timeout = params
+            .get("timeout")
+            .and_then(Value::as_f64)
+            .filter(|millis| *millis > 0.0)
+            .map_or(AWAIT_PROMISE_TIMEOUT, |millis| {
+                Duration::from_secs_f64(millis / 1000.0)
+            });
         let source = if method == "Runtime.evaluate" {
             let expression = params
                 .get("expression")
@@ -1095,9 +1108,11 @@ impl Conn {
             format!("({declaration}).apply({receiver}, {arguments})")
         };
         if return_by_value {
-            Ok(Self::runtime_value(tab, &source).await)
+            Ok(Self::runtime_value(tab, &source, await_timeout).await)
         } else if await_promise {
-            Ok(self.runtime_handle_awaited(tab, &source).await)
+            Ok(self
+                .runtime_handle_awaited(tab, &source, await_timeout)
+                .await)
         } else {
             Ok(self.runtime_handle(tab, &source).await)
         }
@@ -1106,7 +1121,12 @@ impl Conn {
     /// Awaits a thenable and returns its CDP `RemoteObject`, storing objects
     /// as handles: the `evaluateHandle` shape of
     /// <https://chromedevtools.github.io/devtools-protocol/tot/Runtime/#method-callFunctionOn>.
-    async fn runtime_handle_awaited(&mut self, tab: &TabHandle, source: &str) -> Value {
+    async fn runtime_handle_awaited(
+        &mut self,
+        tab: &TabHandle,
+        source: &str,
+        timeout: Duration,
+    ) -> Value {
         let handle = self.next_handle;
         self.next_handle = self.next_handle.saturating_add(1);
         let schedule = RUNTIME_HANDLE_SCHEDULE.replace("__SOURCE__", source);
@@ -1116,7 +1136,7 @@ impl Conn {
         match tab
             .run_until_js_true(
                 "Boolean(globalThis.__tb_async_handle && globalThis.__tb_async_handle.done)",
-                Duration::from_secs(2),
+                timeout,
             )
             .await
         {
@@ -1162,7 +1182,7 @@ impl Conn {
 
     /// Resolves the value (awaiting a thenable via the waiter) and serializes
     /// it to a CDP `RemoteObject`.
-    async fn runtime_value(tab: &TabHandle, source: &str) -> Value {
+    async fn runtime_value(tab: &TabHandle, source: &str, timeout: Duration) -> Value {
         let schedule = RUNTIME_SCHEDULE.replace("__SOURCE__", source);
         if let Err(error) = tab.execute_script(&schedule).await {
             return exception_reply(&error);
@@ -1170,7 +1190,7 @@ impl Conn {
         match tab
             .run_until_js_true(
                 "Boolean(globalThis.__tb_async && globalThis.__tb_async.done)",
-                Duration::from_secs(2),
+                timeout,
             )
             .await
         {

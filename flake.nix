@@ -68,6 +68,7 @@
             pkgs.pkg-config
             pkgs.nodejs_24
             pkgs.valgrind
+            (pkgs.python3.withPackages (ps: [ ps.mako ]))
           ];
           buildInputs = [
             pkgs.openssl

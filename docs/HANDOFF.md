@@ -4,11 +4,12 @@ State: branch `chase/screenshot`, rebased onto `chase/size-flags`. The size
 slice underneath brought the hand-rolled CLI (no clap), hyper-direct servers
 (no axum), and linker/C-flag knobs; this branch adds the Stylo cascade and
 the WPT reftest executor. Gates on this tree: `tools/ub lint` (clippy,
-workspace, all targets), `cargo test --workspace` (32 suites),
+workspace, all targets), `cargo test --workspace` (the workspace suite is green),
 `tools/playwright/run` (7 passed), `tools/wpt/score css/css-color/ --
---test-types reftest` (266/307), and release binary **9,416,736 bytes**
-(583 KB under the cap). Screenshots ride CDP `Page.captureScreenshot` and
-WebDriver `GET /session/{id}/screenshot`.
+--test-types reftest` (266/307), `tools/ub valgrind render` (0 errors; the
+only leaks are Stylo's intentionally leaked thread-local caches), and release
+binary **9,530,768 bytes** (469 KB under the cap). Screenshots ride CDP
+`Page.captureScreenshot` and WebDriver `GET /session/{id}/screenshot`.
 
 ## What shipped
 
@@ -63,8 +64,9 @@ WebDriver `GET /session/{id}/screenshot`.
 
 No images, no tables, no complex-script verification yet (shaping runs, but
 only Latin coverage is tested), no `@font-face` web fonts (the embedded
-subset is the only family), text does not wrap around floats yet, no
-per-element or `fullPage` layout metrics (`contentSize` reports the
+subset is the only family), `media` attributes on `<link>`/`<style>` are
+ignored (every sheet applies as screen), text does not wrap around floats
+yet, no per-element or `fullPage` layout metrics (`contentSize` reports the
 viewport), no device scale factor. Screenshots capture the viewport at
 800x600 unless the caller's clip asks for a larger one.
 `getComputedStyle`-style queries do not exist yet. The cascade is Stylo's
@@ -92,7 +94,7 @@ box tree, Taffy, Parley, and paint implement.
 ## Gotchas
 
 - One WPT run at a time: the wrapper locks the shared venv.
-- The clipboard/IPC version is 4; a mismatched renderer child fails the
+- The child/IPC version is 4; a mismatched renderer child fails the
   handshake, not serde.
 - Playwright always sends `clip` with `scale`; the renderer crops but ignores
   non-unit scale.

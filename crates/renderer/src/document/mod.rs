@@ -1018,11 +1018,18 @@ impl Document {
                 }
             }
             DialContext::Stylesheet { element, epoch } => {
+                // A navigation supersedes this dial: the counter and the
+                // stylesheet map now belong to the new document, so a stale
+                // completion must not decrement them or fire its load event
+                // early.
+                if epoch != self.js_epoch {
+                    return;
+                }
                 self.record_event(TabEvent::Fetch {
                     status: outcome.status,
                 });
                 self.pending_stylesheets = self.pending_stylesheets.saturating_sub(1);
-                if epoch == self.js_epoch && (200..300).contains(&outcome.status) {
+                if (200..300).contains(&outcome.status) {
                     self.stylesheets
                         .insert(element, String::from_utf8_lossy(&outcome.body).into_owned());
                 }
@@ -1064,10 +1071,13 @@ impl Document {
                     self.advance_parser();
                 }
             }
-            DialContext::Stylesheet { .. } => {
+            DialContext::Stylesheet { epoch, .. } => {
                 // A failed sheet is simply absent; the load event proceeds.
-                self.pending_stylesheets = self.pending_stylesheets.saturating_sub(1);
-                self.fire_document_load();
+                // Stale dials from a superseded navigation are ignored.
+                if epoch == self.js_epoch {
+                    self.pending_stylesheets = self.pending_stylesheets.saturating_sub(1);
+                    self.fire_document_load();
+                }
             }
             DialContext::FrameLoad { sequence } => {
                 if sequence == self.frame_load_sequence {
@@ -1155,20 +1165,12 @@ impl Document {
                 return;
             };
             let document = parsed.dom.document();
-            let Ok(links) = parsed
-                .dom
-                .select_all(document, "link[rel~=\"stylesheet\"]")
-            else {
+            let Ok(links) = parsed.dom.select_all(document, "link[rel~=\"stylesheet\"]") else {
                 return;
             };
             links
                 .into_iter()
-                .filter_map(|link| {
-                    parsed
-                        .dom
-                        .attribute(link, "href")
-                        .map(|href| (link, href))
-                })
+                .filter_map(|link| parsed.dom.attribute(link, "href").map(|href| (link, href)))
                 .collect()
         };
         let initiator = self.url.clone();

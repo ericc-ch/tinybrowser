@@ -198,7 +198,8 @@ impl Drop for ResponseWriter {
         if self.reply.is_none() {
             return;
         }
-        self.waiters.pending
+        self.waiters
+            .pending
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .remove(&self.id);
@@ -322,7 +323,8 @@ impl RendererHandle {
         let (reply_tx, reply_rx) = oneshot::channel();
         {
             let mut waiters = self
-                .waiters.byte_replies
+                .waiters
+                .byte_replies
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
             if !self.alive.load(Ordering::Relaxed) {
@@ -359,7 +361,8 @@ impl RendererHandle {
 
     fn remove_byte_waiter(&self, id: u64) {
         let _removed = self
-            .waiters.byte_replies
+            .waiters
+            .byte_replies
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .remove(&id);
@@ -374,7 +377,11 @@ impl RendererHandle {
         id: u64,
         assignment: RendererAssignmentId,
     ) -> Result<oneshot::Receiver<Reply>, TabError> {
-        let mut pending = self.waiters.pending.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut pending = self
+            .waiters
+            .pending
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         if !self.alive.load(Ordering::Relaxed) {
             return Err(TabError::ActorStopped);
         }
@@ -486,7 +493,8 @@ impl RendererHandle {
 
     fn remove_pending(&self, id: u64) {
         let _removed = self
-            .waiters.pending
+            .waiters
+            .pending
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .remove(&id);
@@ -607,7 +615,8 @@ async fn route(message: FromRenderer, context: &ReaderContext) -> Result<(), Ren
             // A byte-streaming request answers with the payload length first;
             // its body frames follow on the same request id.
             if let Some(waiting) = context
-                .waiters.byte_replies
+                .waiters
+                .byte_replies
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .remove(&id)
@@ -619,7 +628,8 @@ async fn route(message: FromRenderer, context: &ReaderContext) -> Result<(), Ren
                     Reply::Screenshot { result: Ok(len) } => {
                         let expected = usize::try_from(len).map_err(|_| RendererViolation)?;
                         context
-                            .waiters.streams
+                            .waiters
+                            .streams
                             .lock()
                             .unwrap_or_else(PoisonError::into_inner)
                             .insert(
@@ -643,7 +653,8 @@ async fn route(message: FromRenderer, context: &ReaderContext) -> Result<(), Ren
                 return Ok(());
             }
             if let Some(pending) = context
-                .waiters.pending
+                .waiters
+                .pending
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .remove(&id)
@@ -705,7 +716,8 @@ fn route_body(
     context: &ReaderContext,
 ) -> Result<(), RendererViolation> {
     let mut streams = context
-        .waiters.streams
+        .waiters
+        .streams
         .lock()
         .unwrap_or_else(PoisonError::into_inner);
     let Some(state) = streams.get_mut(&request) else {

@@ -540,11 +540,7 @@ pub(crate) fn set_window_handler<'js>(
 
 /// The stored value of the handler property `name` on the window (`None`
 /// target) or on `target`.
-fn get_handler<'js>(
-    ctx: &Ctx<'js>,
-    target: Option<NodeId>,
-    name: &str,
-) -> Result<Value<'js>> {
+fn get_handler<'js>(ctx: &Ctx<'js>, target: Option<NodeId>, name: &str) -> Result<Value<'js>> {
     let world = match target {
         Some(id) => world_for_node(ctx, id)?,
         None => world(ctx)?,
@@ -572,7 +568,9 @@ fn set_handler<'js>(
     } else {
         Some(Persistent::save(ctx, value))
     };
-    world.borrow_mut().set_handler_attribute(target, name, saved);
+    world
+        .borrow_mut()
+        .set_handler_attribute(target, name, saved);
     Ok(())
 }
 

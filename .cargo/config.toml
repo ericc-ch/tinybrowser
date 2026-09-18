@@ -9,13 +9,16 @@ CFLAGS = "-fno-unwind-tables -fno-asynchronous-unwind-tables"
 
 # `--icf=all` folds identical code sections and saves about 64 KB in the
 # release binary. GNU ld.bfd rejects the flag, so select rustc's bundled LLD.
-# `--no-eh-frame-hdr` drops the runtime unwind index (98,348 bytes on the
-# screenshot stack). Nothing unwinds at runtime under panic = "abort", so the
-# index is dead weight; backtraces through our frames lose symbolization.
 # `--build-id=none` drops the GNU build-ID note (about 0.2 KB); coredumps can
 # no longer be matched to builds via debuginfod. `--gc-sections` keeps section
 # GC explicit next to LTO (about 0.1 KB). `-O2` lets lld merge strings and fold
 # harder (about 2 KB).
+#
+# `--no-eh-frame-hdr` (the 98 KB unwind index) is deliberately absent: these
+# flags apply to every profile, and without the index no Rust panic can unwind
+# in dev or test builds, which aborts the test binary instead of reporting the
+# failing test. The release binary runs with `panic = "abort"` and does not
+# need the index anyway; paying 98 KB in release keeps `cargo test` usable.
 [target.x86_64-unknown-linux-gnu]
-rustflags = ["-C", "link-arg=-fuse-ld=lld", "-C", "link-arg=-Wl,--icf=all", "-C", "link-arg=-Wl,--no-eh-frame-hdr", "-C", "link-arg=-Wl,--build-id=none", "-C", "link-arg=-Wl,--gc-sections", "-C", "link-arg=-Wl,-O2"]
+rustflags = ["-C", "link-arg=-fuse-ld=lld", "-C", "link-arg=-Wl,--icf=all", "-C", "link-arg=-Wl,--build-id=none", "-C", "link-arg=-Wl,--gc-sections", "-C", "link-arg=-Wl,-O2"]
 

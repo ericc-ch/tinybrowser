@@ -45,6 +45,9 @@ pub(crate) struct SegmentStyle {
     pub letter_spacing: f32,
     /// Line height.
     pub line_height: LineHeight,
+    /// Whether the text paints; `visibility: hidden` text still shapes and
+    /// occupies space but must not be drawn.
+    pub visible: bool,
 }
 
 impl SegmentStyle {
@@ -57,6 +60,7 @@ impl SegmentStyle {
             decoration: style.text_decoration,
             letter_spacing: style.letter_spacing,
             line_height: style.line_height,
+            visible: style.visibility == crate::style::Visibility::Visible,
         }
     }
 }
@@ -130,13 +134,16 @@ impl Fonts {
     /// Intrinsic widths only; painted text is shaped by Parley, which applies
     /// kerning and ligatures itself.
     pub(crate) fn measure(&self, text: &str, style: FontStyle) -> f32 {
-        use skrifa::instance::{LocationRef, NormalizedCoord, Size};
         use skrifa::MetadataProvider as _;
+        use skrifa::instance::{LocationRef, NormalizedCoord, Size};
         let face = self.outline_face(style.weight);
         let charmap = face.charmap();
         let coords: &[NormalizedCoord] = &[];
-        let metrics =
-            skrifa::metrics::GlyphMetrics::new(&face, Size::new(style.size), LocationRef::from(coords));
+        let metrics = skrifa::metrics::GlyphMetrics::new(
+            &face,
+            Size::new(style.size),
+            LocationRef::from(coords),
+        );
         text.chars()
             .filter_map(|ch| charmap.map(ch))
             .filter_map(|glyph| metrics.advance_width(glyph))
@@ -161,12 +168,10 @@ pub(crate) fn shape_lines(
     let mut shaped = fonts.parley.borrow_mut();
     let shaped = &mut *shaped;
     let root = root_style();
-    let mut builder = shaped.layout_context.tree_builder(
-        &mut shaped.font_context,
-        1.0,
-        true,
-        &root,
-    );
+    let mut builder =
+        shaped
+            .layout_context
+            .tree_builder(&mut shaped.font_context, 1.0, true, &root);
     builder.set_white_space_mode(if preserve_space {
         WhiteSpaceCollapse::Preserve
     } else {
@@ -256,7 +261,13 @@ fn text_style(style: &SegmentStyle) -> TextStyle<'static, 'static, [u8; 4]> {
             Weight::Normal => FontWeight::NORMAL,
             Weight::Bold => FontWeight::BOLD,
         },
-        brush: [style.color.r, style.color.g, style.color.b, style.color.a],
+        // `visibility: hidden` rides the brush alpha: the glyphs keep their
+        // metrics and positions, and every painter path skips alpha 0.
+        brush: if style.visible {
+            [style.color.r, style.color.g, style.color.b, style.color.a]
+        } else {
+            [style.color.r, style.color.g, style.color.b, 0]
+        },
         has_underline: style.decoration == TextDecoration::Underline,
         has_strikethrough: style.decoration == TextDecoration::LineThrough,
         letter_spacing: style.letter_spacing,
@@ -325,4 +336,3 @@ fn brush_color(brush: [u8; 4]) -> Color {
         a: brush[3],
     }
 }
-

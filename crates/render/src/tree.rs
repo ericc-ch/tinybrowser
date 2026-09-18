@@ -11,9 +11,8 @@ use std::collections::HashMap;
 
 use dom::{Dom, NodeId};
 
-use crate::color::Color;
 use crate::geometry::Edges;
-use crate::style::{BorderSide, Dimension, Display, Length, Style};
+use crate::style::{BorderSide, Display, Style};
 
 /// What kind of box a node generated.
 pub(crate) enum BoxKind {
@@ -174,28 +173,21 @@ fn wrap_anonymous(children: Vec<BoxNode>, parent_style: &Style) -> Vec<BoxNode> 
     if !has_block || !has_inline {
         return children;
     }
+    // Anonymous boxes inherit inherited properties (font, color, alignment)
+    // and start with initial values for everything else. `text-decoration` is
+    // not an inherited property, but it propagates into anonymous boxes from
+    // the box that established it
+    // (<https://drafts.csswg.org/css-text-decor-3/#line-decoration>).
     let anonymous_style = Style {
         display: Display::Block,
-        margin: Edges::new(
-            Dimension::Length(Length::Px(0.0)),
-            Dimension::Length(Length::Px(0.0)),
-            Dimension::Length(Length::Px(0.0)),
-            Dimension::Length(Length::Px(0.0)),
-        ),
-        padding: Edges::new(
-            Length::Px(0.0),
-            Length::Px(0.0),
-            Length::Px(0.0),
-            Length::Px(0.0),
-        ),
+        text_decoration: parent_style.text_decoration,
         border: Edges::new(
             BorderSide::NONE,
             BorderSide::NONE,
             BorderSide::NONE,
             BorderSide::NONE,
         ),
-        background: Color::TRANSPARENT,
-        ..parent_style.clone()
+        ..Style::inherited_from(parent_style)
     };
 
     let mut out = Vec::with_capacity(children.len());

@@ -26,24 +26,26 @@
 use std::collections::{HashMap, VecDeque};
 
 use dom::{Dom, NodeId};
+use style::Atom;
 use style::animation::DocumentAnimationSet;
 use style::context::{
-    QuirksMode, RegisteredSpeculativePainter, RegisteredSpeculativePainters,
-    SharedStyleContext, StyleContext, StyleSystemOptions, ThreadLocalStyleContext,
+    QuirksMode, RegisteredSpeculativePainter, RegisteredSpeculativePainters, SharedStyleContext,
+    StyleContext, StyleSystemOptions, ThreadLocalStyleContext,
 };
 use style::device::Device;
-use style::dom::{TElement, TNode};
 use style::dom::NodeInfo;
+use style::dom::{TElement, TNode};
 use style::media_queries::MediaType;
 use style::properties::ComputedValues;
 use style::selector_parser::SnapshotMap;
 use style::servo_arc::Arc;
 use style::shared_lock::StylesheetGuards;
-use style::stylesheets::{AllowImportRules, CssRuleType, DocumentStyleSheet, Origin, Stylesheet, UrlExtraData};
+use style::stylesheets::{
+    AllowImportRules, CssRuleType, DocumentStyleSheet, Origin, Stylesheet, UrlExtraData,
+};
 use style::stylist::Stylist;
 use style::traversal::{DomTraversal, PerLevelTraversalData, recalc_style_at};
 use style::traversal_flags::TraversalFlags;
-use style::Atom;
 
 use crate::style::Style;
 use crate::stylo_map::map_style;
@@ -119,7 +121,13 @@ pub(crate) fn style_document(
         make_device(viewport_width, viewport_height),
         QuirksMode::NoQuirks,
     );
-    append_sheet(&mut stylist, &tables, &url, UA_STYLESHEET, Origin::UserAgent);
+    append_sheet(
+        &mut stylist,
+        &tables,
+        &url,
+        UA_STYLESHEET,
+        Origin::UserAgent,
+    );
     for sheet in sheets {
         append_sheet(&mut stylist, &tables, &url, sheet, Origin::Author);
     }
@@ -345,7 +353,9 @@ fn run_traversal(
 fn root_font_size(dom: &Dom, computed: &HashMap<NodeId, Arc<ComputedValues>>) -> f32 {
     root_element(dom)
         .and_then(|root| computed.get(&root))
-        .map_or(16.0, |values| values.get_font().font_size.computed_size.px())
+        .map_or(16.0, |values| {
+            values.get_font().font_size.computed_size.px()
+        })
 }
 
 /// The root element's computed values, if styled.
@@ -388,7 +398,14 @@ impl<'dom> DomTraversal<&'dom StyloNode<'dom>> for SingleTraversal<'_> {
         // SAFETY: single-threaded walk; no other borrow of this element's
         // pre-populated wrapper is live.
         let mut data = unsafe { element.ensure_data() };
-        recalc_style_at(self, traversal_data, context, element, &mut data, note_child);
+        recalc_style_at(
+            self,
+            traversal_data,
+            context,
+            element,
+            &mut data,
+            note_child,
+        );
         // SAFETY: same exclusive access as above.
         unsafe { element.unset_dirty_descendants() };
     }

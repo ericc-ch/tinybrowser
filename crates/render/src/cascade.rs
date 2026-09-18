@@ -55,55 +55,60 @@ fn valid_dimension(value: f32) -> bool {
 
 /// Paints a laid-out tree in CSS paint order: background, border, then
 /// content (<https://drafts.csswg.org/css2/#painting-order>).
+///
+/// A hidden box skips its own background, border, and text, but its
+/// descendants still paint: `visibility` is inherited and a descendant may
+/// set `visible` again (`<https://drafts.csswg.org/css2/#propdef-visibility>`;
+/// hidden text already carries an alpha-0 brush from the cascade).
 fn paint(painter: &mut Painter, layout: &LayoutBox, fonts: &Fonts) {
-    if layout.style.visibility != crate::style::Visibility::Visible {
-        return;
-    }
+    let visible = layout.style.visibility == crate::style::Visibility::Visible;
     let style = &layout.style;
     let rect = layout.rect;
-    if style.background.a > 0 {
+    if visible && style.background.a > 0 {
         painter.fill_rect(rect, style.background);
     }
 
     let border = style.border;
-    if border.top.paints() {
-        painter.fill_rect(
-            Rect::new(rect.x, rect.y, rect.width, border.top.width),
-            border.top.color,
-        );
-    }
-    if border.right.paints() {
-        painter.fill_rect(
-            Rect::new(
-                rect.right() - border.right.width,
-                rect.y + border.top.width,
-                border.right.width,
-                rect.height - border.top.width - border.bottom.width,
-            ),
-            border.right.color,
-        );
-    }
-    if border.bottom.paints() {
-        painter.fill_rect(
-            Rect::new(
-                rect.x,
-                rect.bottom() - border.bottom.width,
-                rect.width,
-                border.bottom.width,
-            ),
-            border.bottom.color,
-        );
-    }
-    if border.left.paints() {
-        painter.fill_rect(
-            Rect::new(
-                rect.x,
-                rect.y + border.top.width,
-                border.left.width,
-                rect.height - border.top.width - border.bottom.width,
-            ),
-            border.left.color,
-        );
+    if visible {
+        if border.top.paints() {
+            painter.fill_rect(
+                Rect::new(rect.x, rect.y, rect.width, border.top.width),
+                border.top.color,
+            );
+        }
+        if border.right.paints() {
+            painter.fill_rect(
+                Rect::new(
+                    rect.right() - border.right.width,
+                    rect.y + border.top.width,
+                    border.right.width,
+                    rect.height - border.top.width - border.bottom.width,
+                ),
+                border.right.color,
+            );
+        }
+        if border.bottom.paints() {
+            painter.fill_rect(
+                Rect::new(
+                    rect.x,
+                    rect.bottom() - border.bottom.width,
+                    rect.width,
+                    border.bottom.width,
+                ),
+                border.bottom.color,
+            );
+        }
+        if border.left.paints() {
+            painter.fill_rect(
+                Rect::new(
+                    rect.x,
+                    rect.y + border.top.width,
+                    border.left.width,
+                    rect.height - border.top.width - border.bottom.width,
+                ),
+                border.left.color,
+            );
+        }
     }
 
     let clipped = style.overflow == crate::style::Overflow::Hidden;

@@ -175,14 +175,17 @@ impl<'a> StyloNode<'a> {
     {
         self.parent
             .set(node_at(nodes, self.tables, self.dom.parent(self.id)));
-        if let Some(mut kids) = self.dom.children(self.id) {
-            let first = kids.next().copied();
-            let last = kids.next_back().copied();
+        if let Some(kids) = self.dom.children(self.id) {
+            let first = kids.clone().next().copied();
+            let last = kids.clone().next_back().copied();
             self.first_child.set(node_at(nodes, self.tables, first));
             self.last_child.set(node_at(nodes, self.tables, last));
         }
-        self.prev_sibling
-            .set(node_at(nodes, self.tables, self.dom.sibling(self.id, false)));
+        self.prev_sibling.set(node_at(
+            nodes,
+            self.tables,
+            self.dom.sibling(self.id, false),
+        ));
         self.next_sibling
             .set(node_at(nodes, self.tables, self.dom.sibling(self.id, true)));
         let mut root = self.id;
@@ -271,7 +274,9 @@ impl<'a> TNode for &'a StyloNode<'a> {
     }
 
     fn owner_doc(&self) -> Self::ConcreteDocument {
-        self.owner_doc.get().expect("every record knows its document")
+        self.owner_doc
+            .get()
+            .expect("every record knows its document")
     }
 
     fn is_in_document(&self) -> bool {
@@ -745,7 +750,10 @@ impl<'a> TElement for &'a StyloNode<'a> {
     }
 
     fn borrow_data(&self) -> Option<ElementDataRef<'_>> {
-        self.tables.data.get(&self.id).map(ElementDataWrapper::borrow)
+        self.tables
+            .data
+            .get(&self.id)
+            .map(ElementDataWrapper::borrow)
     }
 
     fn mutate_data(&self) -> Option<ElementDataMut<'_>> {
@@ -884,12 +892,9 @@ impl<'a> TElement for &'a StyloNode<'a> {
     fn get_attr(&self, attr: &style::LocalName, namespace: &style::Namespace) -> Option<String> {
         let wanted_ns: &str = &namespace.0;
         let wanted: &str = &attr.0;
-        self.dom
-            .attributes(self.id)?
-            .iter()
-            .find_map(|attribute| {
-                (attribute.name.ns.as_ref() == wanted_ns && attribute.name.local.as_ref() == wanted)
-                    .then(|| attribute.value.clone())
-            })
+        self.dom.attributes(self.id)?.iter().find_map(|attribute| {
+            (attribute.name.ns.as_ref() == wanted_ns && attribute.name.local.as_ref() == wanted)
+                .then(|| attribute.value.clone())
+        })
     }
 }

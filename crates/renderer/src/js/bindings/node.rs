@@ -3,9 +3,9 @@
 use super::{
     CollectionKind, FromJs, ImportSnapshot, JsAttr, JsImplementation, JsNamedNodeMap, JsTokenList,
     LegacyNullString, NodeContext, OptString, Trace, WebIdlString, WebIdlUnsignedLong,
-    adopt_across_documents, after_attribute_change, ancestor_chain, attached_attr_id,
-    attribute_local_name, attribute_value, attr_owner, attr_state, attr_wrapper, blur_node,
-    character_data, character_data_offset, child_value, clone_document, convert_nodes_into_node,
+    adopt_across_documents, after_attribute_change, ancestor_chain, attached_attr_id, attr_owner,
+    attr_state, attr_wrapper, attribute_local_name, attribute_value, blur_node, character_data,
+    character_data_offset, child_value, clone_document, convert_nodes_into_node,
     create_element_named, create_html_element, create_kind, deref_weak, descendant_text,
     detach_attr, doctype_fields, document_is_html, document_is_html_content, document_url_string,
     element_at_point, element_click, element_index, element_node_name, element_sibling_value,
@@ -917,7 +917,10 @@ impl JsNode {
         };
         match doctype_fields(&parsed, self.handle.0) {
             Some((name, _, _)) => Ok(name),
-            None => Ok(parsed.dom.attribute(self.handle.0, "name").unwrap_or_default()),
+            None => Ok(parsed
+                .dom
+                .attribute(self.handle.0, "name")
+                .unwrap_or_default()),
         }
     }
 
@@ -929,7 +932,8 @@ impl JsNode {
         let Some(parsed) = world.document(self.handle.0) else {
             return Ok(String::new());
         };
-        Ok(doctype_fields(&parsed, self.handle.0).map_or(String::new(), |(_, public_id, _)| public_id))
+        Ok(doctype_fields(&parsed, self.handle.0)
+            .map_or(String::new(), |(_, public_id, _)| public_id))
     }
 
     // https://dom.spec.whatwg.org/#dom-documenttype-systemid
@@ -940,7 +944,8 @@ impl JsNode {
         let Some(parsed) = world.document(self.handle.0) else {
             return Ok(String::new());
         };
-        Ok(doctype_fields(&parsed, self.handle.0).map_or(String::new(), |(_, _, system_id)| system_id))
+        Ok(doctype_fields(&parsed, self.handle.0)
+            .map_or(String::new(), |(_, _, system_id)| system_id))
     }
 
     #[qjs(set, rename = "name")]
@@ -1003,9 +1008,7 @@ impl JsNode {
         let Some(parsed) = parsed.document(self.handle.0) else {
             return Err(Exception::throw_type(&ctx, "no document"));
         };
-        let Some(NodeKind::Element { name, attributes }) =
-            parsed.dom.kind(self.handle.0)
-        else {
+        let Some(NodeKind::Element { name, attributes }) = parsed.dom.kind(self.handle.0) else {
             return Err(Exception::throw_type(&ctx, "outerHTML requires an element"));
         };
         if parsed.content_type == "text/html" {
@@ -2177,10 +2180,7 @@ impl JsNode {
         while let Some(id) = stack.pop() {
             if let Some(kids) = dom.children(id) {
                 for &kid in kids {
-                    if matches!(
-                        dom.kind(kid),
-                        Some(NodeKind::Element { .. })
-                    ) {
+                    if matches!(dom.kind(kid), Some(NodeKind::Element { .. })) {
                         containers.push(kid);
                         stack.push(kid);
                     }

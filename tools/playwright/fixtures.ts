@@ -93,8 +93,12 @@ export const test = base.extend<Fixtures>({
         response.writeHead(200, { "content-type": "text/html" });
         response.end(PLAIN);
       } else if (path === "/styles.css") {
-        response.writeHead(200, { "content-type": "text/css" });
-        response.end(STYLES);
+        // Delay the sheet so the load-delay spec discriminates: a browser
+        // that fires load without waiting would screenshot white.
+        setTimeout(() => {
+          response.writeHead(200, { "content-type": "text/css" });
+          response.end(STYLES);
+        }, 300);
       } else if (path === "/lib.js") {
         response.writeHead(200, { "content-type": "text/javascript" });
         response.end("window.fromLib = 7;");

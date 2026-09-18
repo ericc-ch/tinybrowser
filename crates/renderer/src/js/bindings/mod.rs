@@ -343,10 +343,7 @@ pub(super) fn webdriver_element(ctx: Ctx<'_>, remote_id: f64) -> Result<Value<'_
     // Only a live, connected element is a valid element reference.
     let valid = world.borrow().document(node).is_some_and(|parsed| {
         parsed.dom.is_connected(node)
-            && matches!(
-                parsed.dom.kind(node),
-                Some(NodeKind::Element { .. })
-            )
+            && matches!(parsed.dom.kind(node), Some(NodeKind::Element { .. }))
     });
     if !valid {
         return Ok(Value::new_null(ctx));
@@ -477,10 +474,7 @@ pub(crate) fn wrap_node<'js>(ctx: &Ctx<'js>, id: NodeId) -> Result<Value<'js>> {
 
 /// Publishes `parsed` as a new document of this realm's world and wraps its
 /// root.
-pub(super) fn wrap_new_document<'js>(
-    ctx: &Ctx<'js>,
-    parsed: crate::Parsed,
-) -> Result<Value<'js>> {
+pub(super) fn wrap_new_document<'js>(ctx: &Ctx<'js>, parsed: crate::Parsed) -> Result<Value<'js>> {
     let world_rc = world(ctx)?;
     let root = world_rc.borrow_mut().add_document(parsed);
     let registry = world_rc.borrow().registry();
@@ -1396,10 +1390,7 @@ fn collect_by_class(dom: &dom::Dom, scope: NodeId, names: &str) -> Vec<NodeId> {
 }
 
 pub(super) fn is_element(dom: &dom::Dom, id: NodeId) -> bool {
-    matches!(
-        dom.kind(id),
-        Some(NodeKind::Element { .. })
-    )
+    matches!(dom.kind(id), Some(NodeKind::Element { .. }))
 }
 
 /// Whether `name` is an element in the HTML namespace with local name

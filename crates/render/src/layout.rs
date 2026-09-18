@@ -50,7 +50,11 @@ impl LayoutBox {
             self.rect.x + border.left.width + padding.left,
             self.rect.y + border.top.width + padding.top,
             self.rect.width - border.left.width - border.right.width - padding.left - padding.right,
-            self.rect.height - border.top.width - border.bottom.width - padding.top - padding.bottom,
+            self.rect.height
+                - border.top.width
+                - border.bottom.width
+                - padding.top
+                - padding.bottom,
         )
     }
 }
@@ -60,7 +64,6 @@ pub(crate) struct Ctx<'a> {
     /// Embedded faces.
     pub(crate) fonts: &'a Fonts,
 }
-
 
 /// The result of laying out one run of inline-level children.
 pub(crate) struct InlineResult {
@@ -121,21 +124,6 @@ pub(crate) fn layout_inline_run(
             items: Vec::new(),
         };
     }
-    let mut raw: Vec<RawToken<'_>> = Vec::new();
-    // Parley has one whitespace mode per layout; preserve wins and collapsing
-    // runs are pre-collapsed below, so mixed modes stay exact.
-    let mut preserve = false;
-    // Wrapping is disabled only when every text node refuses to wrap.
-    let mut wrap = false;
-    for node in run {
-        collect_token(node, ctx, &mut raw, &mut preserve, &mut wrap);
-    }
-    if raw.is_empty() {
-        return InlineResult {
-            height: 0.0,
-            items: Vec::new(),
-        };
-    }
     // Forced breaks split the run into separate layouts; each stacks below
     // the last. An empty group still occupies a strut line.
     let mut items: Vec<PaintItem> = Vec::new();
@@ -144,7 +132,18 @@ pub(crate) fn layout_inline_run(
     let mut strut = 0.0_f32;
     for token in raw.iter().chain(std::iter::once(&BREAK_SENTINEL)) {
         if matches!(token, RawToken::Break) {
-            height += shape_group(&group, ctx, x, y + height, available, text_align, preserve, wrap, strut, &mut items);
+            height += shape_group(
+                &group,
+                ctx,
+                x,
+                y + height,
+                available,
+                text_align,
+                preserve,
+                wrap,
+                strut,
+                &mut items,
+            );
             group.clear();
             continue;
         }
@@ -245,9 +244,10 @@ fn collect_token<'a>(
             }
             *preserve |= keeps_space;
             *wrap |= allows_wrap(&node.style);
-            out.push(RawToken::Text(processed, SegmentStyle::from_style(
-                &node.style,
-            )));
+            out.push(RawToken::Text(
+                processed,
+                SegmentStyle::from_style(&node.style),
+            ));
         }
         BoxKind::Inline => {
             for child in &node.children {
@@ -260,8 +260,13 @@ fn collect_token<'a>(
             *wrap = true;
             out.push(RawToken::Break);
         }
-        BoxKind::InlineBlock | BoxKind::InlineFlex | BoxKind::InlineGrid | BoxKind::Block
-        | BoxKind::Flex | BoxKind::Grid | BoxKind::ListItem => {
+        BoxKind::InlineBlock
+        | BoxKind::InlineFlex
+        | BoxKind::InlineGrid
+        | BoxKind::Block
+        | BoxKind::Flex
+        | BoxKind::Grid
+        | BoxKind::ListItem => {
             let measurement = measure_atomic(node, ctx);
             out.push(RawToken::Atomic { node, measurement });
         }
@@ -282,10 +287,7 @@ fn process_text(text: &str, style: &Style) -> (String, bool) {
         crate::style::TextTransform::Uppercase => text.to_uppercase(),
         crate::style::TextTransform::Lowercase => text.to_lowercase(),
     };
-    let preserve = matches!(
-        style.white_space,
-        WhiteSpace::Pre | WhiteSpace::PreWrap
-    );
+    let preserve = matches!(style.white_space, WhiteSpace::Pre | WhiteSpace::PreWrap);
     if preserve {
         return (mapped, true);
     }
@@ -310,9 +312,7 @@ fn measure_atomic(node: &BoxNode, ctx: &Ctx<'_>) -> Atomic {
     let layout = crate::boxes::layout_subtree(node, ctx, preferred);
     let margin = node.style.margin.map(|dimension| match dimension {
         Dimension::Auto => 0.0,
-        Dimension::Length(length) => {
-            length.resolve(preferred)
-        }
+        Dimension::Length(length) => length.resolve(preferred),
     });
     Atomic {
         content_width: layout.content_box().width,
@@ -399,8 +399,13 @@ fn min_content_node(node: &BoxNode, ctx: &Ctx<'_>) -> f32 {
             .sum(),
         BoxKind::Break => 0.0,
         // Atomics contribute their max-content size as a unit.
-        BoxKind::InlineBlock | BoxKind::InlineFlex | BoxKind::InlineGrid | BoxKind::Block
-        | BoxKind::Flex | BoxKind::Grid | BoxKind::ListItem => max_content_width(node, ctx),
+        BoxKind::InlineBlock
+        | BoxKind::InlineFlex
+        | BoxKind::InlineGrid
+        | BoxKind::Block
+        | BoxKind::Flex
+        | BoxKind::Grid
+        | BoxKind::ListItem => max_content_width(node, ctx),
     }
 }
 
@@ -408,8 +413,7 @@ fn min_content_node(node: &BoxNode, ctx: &Ctx<'_>) -> f32 {
 /// box.
 fn outer_extras(node: &BoxNode) -> f32 {
     let style = &node.style;
-    let padding = style.padding.left.resolve(0.0)
-        + style.padding.right.resolve(0.0);
+    let padding = style.padding.left.resolve(0.0) + style.padding.right.resolve(0.0);
     padding + style.border.left.width + style.border.right.width
 }
 
@@ -446,8 +450,7 @@ pub(crate) fn max_content_width(node: &BoxNode, ctx: &Ctx<'_>) -> f32 {
         BoxKind::Flex | BoxKind::InlineFlex => {
             let row = matches!(
                 style.flex_direction,
-                crate::style::FlexDirection::Row
-                    | crate::style::FlexDirection::RowReverse
+                crate::style::FlexDirection::Row | crate::style::FlexDirection::RowReverse
             );
             let widths = node
                 .children
@@ -489,4 +492,3 @@ pub(crate) fn max_content_width(node: &BoxNode, ctx: &Ctx<'_>) -> f32 {
         Dimension::Auto => content + extras,
     }
 }
-

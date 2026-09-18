@@ -520,7 +520,10 @@ impl Tab {
 
     /// One streamed byte request (screenshots) against the tab's renderer,
     /// mounting the virtual blank document when the tab has none.
-    async fn renderer_request_bytes(&mut self, command: RendererCommand) -> Result<Vec<u8>, TabError> {
+    async fn renderer_request_bytes(
+        &mut self,
+        command: RendererCommand,
+    ) -> Result<Vec<u8>, TabError> {
         if self.renderer.is_none() {
             self.mount_virtual().await?;
         }

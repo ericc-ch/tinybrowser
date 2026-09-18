@@ -72,7 +72,6 @@ test("a failed stylesheet does not hold the load event", async ({ daemon }) => {
   };
   const plain = await boundsOf(daemon.plainUrl);
   const broken = await boundsOf(daemon.brokenUrl);
-  console.log("plain", JSON.stringify(plain), "broken", JSON.stringify(broken));
   expect(plain.count).toBe(400);
   expect(broken.count).toBe(400);
   // Body's 8px UA margin places the box; the anonymous root adds nothing.

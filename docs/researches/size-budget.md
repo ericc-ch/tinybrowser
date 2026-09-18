@@ -67,12 +67,14 @@ Kept, measured against the P14 shipping binary (7,414,144 bytes):
 A Rust panic ends the daemon. A renderer child aborts and the browser
 reaps it. rquickjs never uses unwinding for JS exceptions.
 
-The knob set below includes `--no-eh-frame-hdr` and C `-fno-unwind-tables`,
-so unwind profiles (dev, tests) also abort on panic instead of unwinding:
-`catch_unwind`-based recovery and `#[should_panic]` no longer work in tests.
-The shipping binary is unaffected: it is built with `panic = "abort"`, and
-nothing in the graph unwinds through foreign code (QuickJS uses setjmp and
-longjmp).
+The C `-fno-unwind-tables` knob below stays. The `--no-eh-frame-hdr` knob was
+measured at −98,348 bytes but removed after review: the same flags apply to
+dev and test builds, where it made every panic abort (`failed to initiate
+panic`) and killed the test binary instead of reporting the failing test; the
+cost of keeping the unwind index in release is 114,352 bytes (the linker also
+re-adds `.eh_frame_hdr` padding). `catch_unwind` and `#[should_panic]` work
+again. Nothing unwinds at runtime under `panic = "abort"` (QuickJS uses
+setjmp/longjmp), so only the shipping binary pays for the index.
 
 Rejected or deferred:
 
@@ -187,7 +189,6 @@ Kept flags (section deltas measured against the pre-knob baseline):
 
 | Lever | Bytes | Section |
 | --- | ---: | --- |
-| `-Wl,--no-eh-frame-hdr` | −98,348 | deletes `.eh_frame_hdr` outright |
 | `CFLAGS="-fno-unwind-tables -fno-asynchronous-unwind-tables"` | −53,032 | deletes QuickJS-ng's `.eh_frame` (the only C compiled in the graph) |
 | lld `-O2` | −1,856 | `.rodata` string merging |
 
@@ -214,12 +215,10 @@ anyway. Behavior parity with the old axum stack is re-verified by raw probes
 plus the Blink CDP and Playwright gates.
 
 Nothing unwinds at runtime under `panic = "abort"` (QuickJS uses
-setjmp/longjmp), so the unwind index and the C tables are dead weight.
-Backtraces through our frames lose symbolization, and the flags also disable
-panic recovery in dev and test binaries (the flag set lives in
-`.cargo/config.toml` for every profile). The full workspace test suite (32
-suites) passes with the complete flag set, and a live daemon (renderer child
-spawn, CDP `/json/version` + `/json/list`) is clean.
+setjmp/longjmp), so the C unwind tables are dead weight. Backtraces through
+our frames lose symbolization. The workspace test suite passes with the
+remaining flag set, and a live daemon (renderer child spawn, CDP
+`/json/version` + `/json/list`) is clean.
 
 Dead ends: `-C force-unwind-tables=no` (−128; sync tables are already gone
 via `panic = "abort"`, `.gcc_except_table` is 6.8 KiB — the remaining
@@ -249,8 +248,10 @@ Two real savings landed while fitting it:
 | Drop `fontdue`; intrinsic advances from `skrifa` | −73,000 | one font stack instead of two; `Fonts::measure` reads `hmtx` directly |
 | `skrifa` without `autohint_shaping` | −224 | outlines are drawn unhinted |
 
-Rebased onto `chase/size-flags` (7,603,520 bytes), the Stylo slice lands at
-**9,416,800 bytes**: 1,813,280 over the size-flags base, 583,200 under the
+Rebased onto `chase/size-flags` (7,603,520 bytes), the Stylo slice landed at
+9,416,800 bytes; dropping the shared `--no-eh-frame-hdr` (see above; it broke
+dev/test unwinding) costs 114,032 and the shipping binary is now
+**9,530,768 bytes**: 1,927,248 over the size-flags base, 469,232 under the
 cap. The pre-rebase clap feature trimming is gone with clap itself.
 
 ## Full Blitz adoption (2026-09-18)
@@ -275,7 +276,8 @@ vello_cpu rasterizer.
 
 Net swap, pricing our side with a stub of the `render` API (stub tinybrowser
 = 5,539,584 bytes, everything else identical): the shipped pipeline costs
-3,877,216 bytes (9,416,800 - 5,539,584). Replacing it with the Blitz stack is
+3,991,184 bytes (9,530,768 - 5,539,584; the probe stub also carried the pre-review
+flag set, so both sides move together). Replacing it with the Blitz stack is
 5,539,584 + 6,749,248 = **~12.29 MB**, i.e. +2.87 MB over today and about
 2.3 MB over the cap.
 

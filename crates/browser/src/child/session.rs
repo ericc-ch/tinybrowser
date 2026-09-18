@@ -38,7 +38,8 @@ pub(super) async fn run(
     let mut engines = HashMap::<RendererAssignmentId, Engine>::new();
     let mut responses = ResponseStreams::default();
     loop {
-        if !drain_engines(&mut engines, outbox) || stop.is_set() {            stop.request();
+        if !drain_engines(&mut engines, outbox) || stop.is_set() {
+            stop.request();
             break;
         }
         let deadline = engines.values().filter_map(Engine::next_deadline).min();

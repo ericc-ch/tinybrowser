@@ -11,7 +11,7 @@ nix develop --command ./tools/wpt/score dom/nodes/ -- --processes 4
 nix develop --command ./tools/wpt/score css/css-color/ -- --test-types reftest --processes 4
 ```
 
-`--exclude=worker` also skips Worker variants (`.any.worker.html`, `.worker.html`), not only URL prefix `/worker`. Those tests are omitted, not run to a fail. Prove the filter with `python3 tools/wpt/launch.py --selftest`.
+`--exclude=worker` also skips Worker variants (`.any.worker.html`, `.worker.html`), not only URL prefix `/worker`. Those tests are omitted, not run to a fail. Prove the filter with `nix develop --command python3 tools/wpt/launch.py --selftest`.
 
 `tools/wpt/score` prints one row per directory with pass, expected-fail, and
 unexpected buckets, subtest counts, and test time, then lists what needs
@@ -67,10 +67,10 @@ These are visible in runs and fail honestly; they are not harness restrictions.
 
 ## Test types without an executor
 
-`print-reftest` and `wdspec` are not registered for this product, so `wpt run`
-reports an unsupported test type and runs nothing for them. `wdspec` needs
-pytest plus a wider WebDriver command surface (element properties, frames,
-actions, screenshots).
+`aamtest`, `print-reftest`, and `wdspec` are not registered for this product,
+so `wpt run` reports an unsupported test type and runs nothing for them.
+`wdspec` needs pytest plus a wider WebDriver command surface (element
+properties, frames, actions).
 
 ## Conventions
 

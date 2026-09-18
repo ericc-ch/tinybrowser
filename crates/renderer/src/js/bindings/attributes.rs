@@ -564,10 +564,7 @@ fn named_attribute_id(
     let Some((namespace, local)) = found else {
         return Ok(None);
     };
-    Ok(
-        attached_attr_id(ctx, element, &namespace, &local)?
-            .map(|id| (namespace, local, id)),
-    )
+    Ok(attached_attr_id(ctx, element, &namespace, &local)?.map(|id| (namespace, local, id)))
 }
 
 // ── Attr registry helpers ────────────────────────────────────────────────

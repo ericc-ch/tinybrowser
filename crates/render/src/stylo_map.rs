@@ -23,15 +23,15 @@ use style::values::computed::LengthPercentage;
 use style::values::computed::length_percentage::Unpacked as UnpackedLp;
 use style::values::specified::align::AlignFlags;
 
+use crate::color::Color;
+use crate::font::Weight;
+use crate::geometry::Edges;
 use crate::style::{
     AlignContent, AlignItems, AlignSelf, BorderSide, BorderStyle, BoxSizing, Clear, Dimension,
     Display, FlexDirection, FlexWrap, GridLine, GridPlacement, GridTrack, JustifyContent, Length,
     LineHeight, Overflow, Position, Style, TextAlign, TextDecoration, TextTransform, VerticalAlign,
     Visibility, WhiteSpace,
 };
-use crate::color::Color;
-use crate::font::Weight;
-use crate::geometry::Edges;
 
 /// Translates one element's computed values into our layout style.
 ///
@@ -160,8 +160,7 @@ fn map_box_model(values: &ComputedValues, style: &mut Style) {
         ComputedClear::Both => Clear::Both,
         ComputedClear::None => Clear::None,
     };
-    style.background =
-        map_color(&values.get_background().background_color, current_color);
+    style.background = map_color(&values.get_background().background_color, current_color);
 }
 
 /// Maps fonts, text, and inherited paint: the properties paint and Parley
@@ -189,9 +188,9 @@ fn map_text(values: &ComputedValues, style: &mut Style) {
         | ComputedTextAlign::MozLeft
         | ComputedTextAlign::Start
         | ComputedTextAlign::Justify => TextAlign::Left,
-        ComputedTextAlign::Right
-        | ComputedTextAlign::MozRight
-        | ComputedTextAlign::End => TextAlign::Right,
+        ComputedTextAlign::Right | ComputedTextAlign::MozRight | ComputedTextAlign::End => {
+            TextAlign::Right
+        }
         ComputedTextAlign::Center | ComputedTextAlign::MozCenter => TextAlign::Center,
     };
     style.white_space = map_white_space(text.white_space_collapse, text.text_wrap_mode);
@@ -217,15 +216,14 @@ fn map_text(values: &ComputedValues, style: &mut Style) {
     style.vertical_align = map_vertical_align(values);
 
     let decorated = values.get_text().text_decoration_line;
-    style.text_decoration = if decorated
-        .contains(style::values::specified::TextDecorationLine::UNDERLINE)
-    {
-        TextDecoration::Underline
-    } else if decorated.contains(style::values::specified::TextDecorationLine::LINE_THROUGH) {
-        TextDecoration::LineThrough
-    } else {
-        TextDecoration::None
-    };
+    style.text_decoration =
+        if decorated.contains(style::values::specified::TextDecorationLine::UNDERLINE) {
+            TextDecoration::Underline
+        } else if decorated.contains(style::values::specified::TextDecorationLine::LINE_THROUGH) {
+            TextDecoration::LineThrough
+        } else {
+            TextDecoration::None
+        };
 }
 
 /// Maps flex and grid properties, the containers Taffy lays out.
@@ -290,16 +288,15 @@ fn map_display(display: style::values::computed::Display) -> Display {
         // the old initial value. `TableCaption` maps inline like an anonymous
         // caption wrapper did before, and `None` is unreachable here because
         // `is_none` returned above.
-        (
-            DisplayOutside::Inline | DisplayOutside::TableCaption | DisplayOutside::None,
-            _,
-        ) => Display::Inline,
+        (DisplayOutside::Inline | DisplayOutside::TableCaption | DisplayOutside::None, _) => {
+            Display::Inline
+        }
     }
 }
 
 /// Maps an inset (`top`/`right`/`bottom`/`left`).
 fn map_inset(inset: &style::values::computed::Inset) -> Dimension {
-    use style::values::computed::Inset as Inset;
+    use style::values::computed::Inset;
     match inset {
         Inset::LengthPercentage(length) => {
             map_length_percentage(length).map_or(Dimension::Auto, Dimension::Length)
@@ -311,10 +308,11 @@ fn map_inset(inset: &style::values::computed::Inset) -> Dimension {
 
 /// Maps `width`/`height`/`min-width`/`min-height`.
 fn map_size(size: &style::values::computed::Size) -> Dimension {
-    use style::values::computed::Size as Size;
+    use style::values::computed::Size;
     match size {
-        Size::LengthPercentage(length) => map_length_percentage(&length.0)
-            .map_or(Dimension::Auto, Dimension::Length),
+        Size::LengthPercentage(length) => {
+            map_length_percentage(&length.0).map_or(Dimension::Auto, Dimension::Length)
+        }
         // `auto` and intrinsic sizes all mean automatic sizing, as before.
         _ => Dimension::Auto,
     }
@@ -322,10 +320,11 @@ fn map_size(size: &style::values::computed::Size) -> Dimension {
 
 /// Maps `max-width`/`max-height`; `none` is our `auto`.
 fn map_max_size(size: &style::values::computed::MaxSize) -> Dimension {
-    use style::values::computed::MaxSize as MaxSize;
+    use style::values::computed::MaxSize;
     match size {
-        MaxSize::LengthPercentage(length) => map_length_percentage(&length.0)
-            .map_or(Dimension::Auto, Dimension::Length),
+        MaxSize::LengthPercentage(length) => {
+            map_length_percentage(&length.0).map_or(Dimension::Auto, Dimension::Length)
+        }
         // `none` and intrinsic sizes all mean unconstrained, as before.
         _ => Dimension::Auto,
     }
@@ -333,11 +332,10 @@ fn map_max_size(size: &style::values::computed::MaxSize) -> Dimension {
 
 /// Maps `margin-*`; `auto` survives, `calc()` falls back to initial zero.
 fn map_margin(margin: &style::values::computed::Margin) -> Dimension {
-    use style::values::computed::Margin as Margin;
+    use style::values::computed::Margin;
     match margin {
-        Margin::LengthPercentage(length) => {
-            map_length_percentage(length).map_or(Dimension::Length(Length::Px(0.0)), Dimension::Length)
-        }
+        Margin::LengthPercentage(length) => map_length_percentage(length)
+            .map_or(Dimension::Length(Length::Px(0.0)), Dimension::Length),
         Margin::Auto => Dimension::Auto,
         // Anchor functions have no model; the old parser dropped them to zero.
         _ => Dimension::Length(Length::Px(0.0)),
@@ -447,9 +445,7 @@ fn map_flex_basis(basis: &style::values::computed::FlexBasis) -> Dimension {
 }
 
 /// Maps `gap`; `normal` is zero spacing.
-fn map_gap(
-    gap: &style::values::computed::length::NonNegativeLengthPercentageOrNormal,
-) -> Length {
+fn map_gap(gap: &style::values::computed::length::NonNegativeLengthPercentageOrNormal) -> Length {
     match gap {
         style::values::computed::length::NonNegativeLengthPercentageOrNormal::LengthPercentage(
             length,
@@ -480,9 +476,7 @@ fn map_template(
             TrackListValue::TrackSize(size) => out.push(map_track_size(size)?),
             TrackListValue::TrackRepeat(repeat) => {
                 let count = match repeat.count {
-                    RepeatCount::Number(count) => {
-                        u16::try_from(count).map_err(|_| ()).ok()?
-                    }
+                    RepeatCount::Number(count) => u16::try_from(count).map_err(|_| ()).ok()?,
                     RepeatCount::AutoFill | RepeatCount::AutoFit => return None,
                 };
                 let mut tracks = Vec::with_capacity(repeat.track_sizes.len());
@@ -501,16 +495,15 @@ fn map_track_size(
     size: &style::values::generics::grid::TrackSize<style::values::computed::LengthPercentage>,
 ) -> Option<GridTrack> {
     use style::values::generics::grid::{TrackBreadth, TrackSize as Generic};
-    let convert = |breadth: &TrackBreadth<style::values::computed::LengthPercentage>| {
-        match breadth {
-            TrackBreadth::Breadth(length) => {
-                Some(crate::style::TrackSize::Length(map_length_percentage(length)?))
-            }
-            TrackBreadth::Flex(flex) => Some(crate::style::TrackSize::Flex(flex.0)),
-            TrackBreadth::Auto => Some(crate::style::TrackSize::Auto),
-            TrackBreadth::MinContent | TrackBreadth::MaxContent => {
-                Some(crate::style::TrackSize::Auto)
-            }
+    let convert = |breadth: &TrackBreadth<style::values::computed::LengthPercentage>| match breadth
+    {
+        TrackBreadth::Breadth(length) => Some(crate::style::TrackSize::Length(
+            map_length_percentage(length)?,
+        )),
+        TrackBreadth::Flex(flex) => Some(crate::style::TrackSize::Flex(flex.0)),
+        // Intrinsic sizes approximate as `auto`, as before.
+        TrackBreadth::Auto | TrackBreadth::MinContent | TrackBreadth::MaxContent => {
+            Some(crate::style::TrackSize::Auto)
         }
     };
     match size {
@@ -564,7 +557,10 @@ fn map_length_percentage(length: &LengthPercentage) -> Option<Length> {
 /// Maps a computed color, resolving `currentcolor`, `color-mix()`, relative
 /// color syntax, and `contrast-color()` against the element's own `color`
 /// (<https://drafts.csswg.org/css-color-5/#resolving-color-values>).
-fn map_color(color: &style::values::computed::Color, current: style::color::AbsoluteColor) -> Color {
+fn map_color(
+    color: &style::values::computed::Color,
+    current: style::color::AbsoluteColor,
+) -> Color {
     map_absolute(color.resolve_to_absolute(&current))
 }
 
@@ -572,12 +568,7 @@ fn map_color(color: &style::values::computed::Color, current: style::color::Abso
 fn map_absolute(absolute: style::color::AbsoluteColor) -> Color {
     let srgb = absolute.into_srgb_legacy();
     let [red, green, blue, alpha] = *srgb.raw_components();
-    Color::rgba(
-        channel(red),
-        channel(green),
-        channel(blue),
-        channel(alpha),
-    )
+    Color::rgba(channel(red), channel(green), channel(blue), channel(alpha))
 }
 
 /// Converts one 0-1 channel to a byte.
@@ -630,10 +621,9 @@ impl AlignItems {
             | AlignFlags::START
             | AlignFlags::SELF_START
             | AlignFlags::LEFT => Self::FlexStart,
-            AlignFlags::FLEX_END
-            | AlignFlags::END
-            | AlignFlags::SELF_END
-            | AlignFlags::RIGHT => Self::FlexEnd,
+            AlignFlags::FLEX_END | AlignFlags::END | AlignFlags::SELF_END | AlignFlags::RIGHT => {
+                Self::FlexEnd
+            }
             AlignFlags::CENTER => Self::Center,
             AlignFlags::BASELINE | AlignFlags::LAST_BASELINE => Self::Baseline,
             _ => return None,
@@ -651,10 +641,9 @@ impl AlignSelf {
             | AlignFlags::START
             | AlignFlags::SELF_START
             | AlignFlags::LEFT => Self::FlexStart,
-            AlignFlags::FLEX_END
-            | AlignFlags::END
-            | AlignFlags::SELF_END
-            | AlignFlags::RIGHT => Self::FlexEnd,
+            AlignFlags::FLEX_END | AlignFlags::END | AlignFlags::SELF_END | AlignFlags::RIGHT => {
+                Self::FlexEnd
+            }
             AlignFlags::CENTER => Self::Center,
             AlignFlags::BASELINE | AlignFlags::LAST_BASELINE => Self::Baseline,
             _ => return None,

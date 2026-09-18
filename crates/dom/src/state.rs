@@ -317,9 +317,11 @@ pub fn is_read_write(dom: &Dom, id: NodeId) -> bool {
 /// numeric-entry types only; a checkbox shows nothing).
 fn placeholder_capable_type(dom: &Dom, id: NodeId) -> bool {
     let ty = attr_value(dom, id, "type").unwrap_or("text");
-    ["text", "search", "url", "tel", "email", "password", "number"]
-        .iter()
-        .any(|capable| ty.eq_ignore_ascii_case(capable))
+    [
+        "text", "search", "url", "tel", "email", "password", "number",
+    ]
+    .iter()
+    .any(|capable| ty.eq_ignore_ascii_case(capable))
 }
 
 /// `:placeholder-shown`: a placeholder is *shown* only while the control's
