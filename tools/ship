@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+# Build the shipping binary.
+#
+# `cargo build --release` already links with lld + ICF, RELR relative
+# relocations, and no `.eh_frame_hdr` (see `build.rs`). This step removes the
+# `.eh_frame` body, which nothing reads once the header is gone: the release
+# profile is `panic = "abort"` and QuickJS-ng uses setjmp/longjmp, so no
+# unwinder ever runs. Debug and test binaries are untouched.
+#
+# The replacement is atomic: objcopy and the `--version` smoke test run on a
+# copy, and only a copy that both succeeds and runs replaces the artifact.
+# There is no compression, stub, or self-extractor here, just section removal.
+#
+# Run inside `nix develop` (cargo + binutils).
+set -euo pipefail
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$ROOT"
+
+cargo build --release --bin tinybrowser
+BIN="$(tools/bin --release)"
+
+sections=()
+if readelf -S --wide "$BIN" | grep -qw "\.eh_frame_hdr"; then
+  sections+=(--remove-section=.eh_frame_hdr)
+fi
+if readelf -S --wide "$BIN" | grep -qw "\.eh_frame"; then
+  sections+=(--remove-section=.eh_frame)
+fi
+
+before=$(stat -c%s "$BIN")
+if ((${#sections[@]} == 0)); then
+  printf '%s: %s bytes (nothing to remove)\n' "$BIN" "$before"
+  exit 0
+fi
+
+tmp="$BIN.ship.$$"
+trap 'rm -f "$tmp"' EXIT
+cp -p "$BIN" "$tmp"
+objcopy "${sections[@]}" "$tmp"
+"$tmp" --version >/dev/null
+mv -f "$tmp" "$BIN"
+after=$(stat -c%s "$BIN")
+printf '%s: %s -> %s bytes\n' "$BIN" "$before" "$after"
