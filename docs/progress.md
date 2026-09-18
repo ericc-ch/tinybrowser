@@ -288,7 +288,7 @@ nix develop --command ./tools/wpt/score <directory> -- --exclude=worker
 | `webrtc-stats/` | unscored |
 | `webrtc-svc/` | unscored |
 | `websockets/` | unscored |
-| `webstorage/` | 0.0% |
+| `webstorage/` | 75.9% |
 | `webtransport/` | unscored |
 | `webusb/` | unscored |
 | `webvtt/` | unscored |
