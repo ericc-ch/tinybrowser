@@ -144,3 +144,11 @@ tuned binary: +303,848 bytes. Shipping delta: 6,606,240 -> 7,034,176 bytes
 the deleted `flex.rs`. Taffy 0.14 dropped the CSS `order` property, so flex
 children are stable-sorted by `order` at tree-build time. Grid is the next
 slice (template properties first, then placement mapping).
+
+## Grid track parsing (2026-09-18)
+
+`grid-template-columns/rows` (lengths, `fr`, `auto`, `minmax()`,
+`repeat()`), `grid-column/row` line placement, and `justify-items` ride the
+existing Taffy dependency: no new crates. Shipping delta: 7,034,176 ->
+7,051,360 bytes (+17,184). Dropping `Copy` from `Style` (grid templates own
+a `Vec`) cost nothing measurable.

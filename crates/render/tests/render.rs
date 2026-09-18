@@ -216,3 +216,51 @@ fn floats_place_and_clear() {
     assert_eq!((blue.0, blue.1, blue.2, blue.3), (260, 0, 359, 79));
     assert_eq!((green.0, green.1, green.2, green.3), (0, 80, 359, 99));
 }
+
+#[test]
+fn grid_places_columns_gaps_and_spans() {
+    let dom = document(|dom, body| {
+        let grid = dom.create_element(
+            html_name("div"),
+            vec![attr(
+                "style",
+                "display:grid;grid-template-columns:100px 1fr;gap:8px;width:308px",
+            )],
+        );
+        dom.append(body, grid).expect("append");
+        let cell = |dom: &mut Dom, color: &str, style: &str| {
+            dom.create_element(
+                html_name("div"),
+                vec![attr(
+                    "style",
+                    &format!("background:{color};height:40px;{style}"),
+                )],
+            )
+        };
+        // Spanning item first in tree order exercises placement + span.
+        let span = cell(dom, "#ff0000", "grid-column: span 2;");
+        let green = cell(dom, "#00aa00", "");
+        let blue = cell(dom, "#0000ff", "");
+        dom.append(grid, span).expect("append");
+        dom.append(grid, green).expect("append");
+        dom.append(grid, blue).expect("append");
+    });
+    let sheet = "html, body { margin: 0; padding: 0; }".to_owned();
+    let image = render::render(&dom, &[sheet], &render::RenderOptions {
+        width: 400.0,
+        height: 200.0,
+        scale: 1.0,
+    })
+    .expect("render");
+    // Row 1: red spans both columns (0..308). Row 2: green in column 1
+    // (0..100), blue in column 2 (108..308).
+    let red = pixel(&image, 150, 20);
+    assert!(red[0] > 200 && red[1] < 80, "span covers row 1: {red:?}");
+    let green = pixel(&image, 50, 60);
+    assert!(green[1] > 100 && green[0] < 100, "column 1 row 2: {green:?}");
+    let blue = pixel(&image, 200, 60);
+    assert!(blue[2] > 200 && blue[0] < 80, "column 2 row 2: {blue:?}");
+    // The 8px gap stays background-free between the columns.
+    let gap = pixel(&image, 104, 60);
+    assert_eq!(gap, [255, 255, 255, 255], "gap: {gap:?}");
+}

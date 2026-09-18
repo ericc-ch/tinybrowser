@@ -27,6 +27,10 @@ pub(crate) enum BoxKind {
     Flex,
     /// Inline-level flex container.
     InlineFlex,
+    /// Block-level grid container.
+    Grid,
+    /// Inline-level grid container.
+    InlineGrid,
     /// Block-level list item.
     ListItem,
     /// A text box.
@@ -56,12 +60,12 @@ pub(crate) fn build(dom: &Dom, styles: &HashMap<NodeId, Style>) -> BoxNode {
             BorderSide::NONE,
             BorderSide::NONE,
         ),
-        ..Style::INITIAL
+        ..Style::initial()
     };
     let children = build_children(dom, styles, document, &root_style);
     BoxNode {
         kind: BoxKind::Block,
-        style: root_style,
+        style: root_style.clone(),
         children: wrap_anonymous(children, &root_style),
     }
 }
@@ -82,7 +86,7 @@ fn build_children(
             Some(dom::NodeKind::Element { name, .. }) => {
                 let style = styles
                     .get(&child)
-                    .copied()
+                    .cloned()
                     .unwrap_or_else(|| Style::inherited_from(parent_style));
                 if style.display == Display::None {
                     continue;
@@ -97,6 +101,8 @@ fn build_children(
                         Display::InlineBlock => BoxKind::InlineBlock,
                         Display::Flex => BoxKind::Flex,
                         Display::InlineFlex => BoxKind::InlineFlex,
+                        Display::Grid => BoxKind::Grid,
+                        Display::InlineGrid => BoxKind::InlineGrid,
                         Display::ListItem => BoxKind::ListItem,
                         Display::None => continue,
                     }
@@ -119,7 +125,7 @@ fn build_children(
                 }
                 boxes.push(BoxNode {
                     kind: BoxKind::Text(data.clone()),
-                    style: *parent_style,
+                    style: parent_style.clone(),
                     children: Vec::new(),
                 });
             }
@@ -150,7 +156,7 @@ fn is_all_collapsible(text: &str) -> bool {
 pub(crate) fn is_block_level(node: &BoxNode) -> bool {
     matches!(
         node.kind,
-        BoxKind::Block | BoxKind::Flex | BoxKind::ListItem
+        BoxKind::Block | BoxKind::Flex | BoxKind::Grid | BoxKind::ListItem
     )
 }
 
@@ -189,7 +195,7 @@ fn wrap_anonymous(children: Vec<BoxNode>, parent_style: &Style) -> Vec<BoxNode> 
             BorderSide::NONE,
         ),
         background: Color::TRANSPARENT,
-        ..*parent_style
+        ..parent_style.clone()
     };
 
     let mut out = Vec::with_capacity(children.len());
@@ -199,7 +205,7 @@ fn wrap_anonymous(children: Vec<BoxNode>, parent_style: &Style) -> Vec<BoxNode> 
             if !pending.is_empty() {
                 out.push(BoxNode {
                     kind: BoxKind::Block,
-                    style: anonymous_style,
+                    style: anonymous_style.clone(),
                     children: std::mem::take(&mut pending),
                 });
             }

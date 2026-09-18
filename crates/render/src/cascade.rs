@@ -106,7 +106,7 @@ fn compute_styles(dom: &Dom, rules: &[Rule]) -> HashMap<NodeId, Style> {
             continue;
         }
         let parent = dom.parent(node).filter(|&parent| parent != document);
-        let parent_style = parent.and_then(|parent| styles.get(&parent).copied());
+        let parent_style = parent.and_then(|parent| styles.get(&parent).cloned());
         let is_root = parent.is_none();
         let style = compute_style(
             dom,
@@ -147,7 +147,7 @@ fn compute_style(
                     order: rule.order,
                     index: u32::try_from(index).unwrap_or(u32::MAX),
                 },
-                declared: *declared,
+                declared: declared.clone(),
             });
         }
     }
@@ -173,7 +173,7 @@ fn compute_style(
 
     let mut style = match parent {
         Some(parent) => Style::inherited_from(parent),
-        None => Style::INITIAL,
+        None => Style::initial(),
     };
 
     // font-size resolves before other properties so `em` is final
@@ -183,7 +183,7 @@ fn compute_style(
         .iter()
         .rev()
         .find(|entry| matches!(entry.declared.decl, Decl::FontSize(_)))
-        && let Decl::FontSize(length) = entry.declared.decl
+        && let Decl::FontSize(length) = &entry.declared.decl
     {
         style.font_size = length
             .resolve(parent_font_size, parent_font_size, root_font_size)
@@ -191,7 +191,7 @@ fn compute_style(
     }
 
     for entry in &collected {
-        crate::style::apply(entry.declared.decl, &mut style, root_font_size);
+        crate::style::apply(entry.declared.decl.clone(), &mut style, root_font_size);
     }
 
     // `border-width` computes to zero when the style is none
@@ -229,7 +229,7 @@ fn paint(painter: &mut Painter, layout: &LayoutBox) {
     if layout.style.visibility != crate::style::Visibility::Visible {
         return;
     }
-    let style = layout.style;
+    let style = &layout.style;
     let rect = layout.rect;
     if style.background.a > 0 {
         painter.fill_rect(rect, style.background);

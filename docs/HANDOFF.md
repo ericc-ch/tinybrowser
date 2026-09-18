@@ -4,7 +4,7 @@ State: working tree on `main` adds always-in screenshot rendering. Gates on
 this tree: `tools/ub lint` (clippy, workspace, all targets), `cargo test
 --workspace` (30 suites), `tools/playwright/run` (7 passed), `tools/cdp/run`
 (Blink corpus 1/1), `tools/wpt/score webmessaging/` (106/136, unchanged), and
-release binary **7,034,176 bytes** (3.0 MB under the cap). Screenshots ride
+release binary **7,051,360 bytes** (2.9 MB under the cap). Screenshots ride
 CDP `Page.captureScreenshot` and WebDriver `GET /session/{id}/screenshot`.
 
 ## What shipped
@@ -55,9 +55,7 @@ viewport at 800x600 unless the caller's clip asks for a larger one.
 
 ## Next, in order
 
-1. Grid: `grid-template-columns/rows` track parsing plus item placement
-   mapping onto Taffy (already a dependency).
-2. Images: PNG decode via the `png` crate (already shipped) painted into
+1. Images: PNG decode via the `png` crate (already shipped) painted into
    `LayoutBox` replaced boxes; JPEG later.
 3. `border-radius`/opacity, then more CSS as real fixtures demand.
 4. `Page.getLayoutMetrics.contentSize` from the real layout height so

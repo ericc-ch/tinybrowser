@@ -35,6 +35,10 @@ pub(crate) enum Display {
     Flex,
     /// Inline-level flex container.
     InlineFlex,
+    /// Block-level grid container.
+    Grid,
+    /// Inline-level grid container.
+    InlineGrid,
     /// Block-level list item (markers are not generated yet).
     ListItem,
 }
@@ -342,11 +346,65 @@ pub(crate) enum AlignContent {
     SpaceAround,
 }
 
+/// One grid track sizing function, without line names
+/// (<https://drafts.csswg.org/css-grid-1/#track-sizing>).
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum TrackSize {
+    /// `auto`.
+    Auto,
+    /// A fixed length or percentage.
+    Length(Length),
+    /// A flexible fraction.
+    Flex(f32),
+}
+
+/// One `grid-template` track: a single size, a minmax, or a repeat.
+/// Nested `repeat()` is rejected; `minmax()` may appear inside `repeat()`.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum GridTrack {
+    /// One track.
+    Single(TrackSize),
+    /// `minmax(min, max)`.
+    MinMax(TrackSize, TrackSize),
+    /// `repeat(count, tracks)`.
+    Repeat(u16, Vec<GridTrack>),
+}
+
+/// One grid line placement
+/// (<https://drafts.csswg.org/css-grid-1/#line-placement>). Named lines are
+/// not supported.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum GridPlacement {
+    /// Automatic placement.
+    Auto,
+    /// An explicit line number (negative counts from the end).
+    Line(i32),
+    /// A span of tracks.
+    Span(u16),
+}
+
+/// Grid placement on one axis: `start / end`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct GridLine {
+    /// Start line.
+    pub start: GridPlacement,
+    /// End line.
+    pub end: GridPlacement,
+}
+
+impl GridLine {
+    /// Automatic placement on both sides.
+    pub(crate) const AUTO: Self = Self {
+        start: GridPlacement::Auto,
+        end: GridPlacement::Auto,
+    };
+}
+
 /// One computed style.
 ///
 /// Lengths are resolved except percentages, which need layout-time bases
 /// (<https://drafts.csswg.org/css-cascade-5/#computed-value>).
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Style {
     /// Box generation.
     pub display: Display,
@@ -434,12 +492,23 @@ pub(crate) struct Style {
     pub row_gap: Length,
     /// Cross-axis gap.
     pub column_gap: Length,
+    /// Grid column tracks (`none` is the empty list).
+    pub grid_template_columns: Vec<GridTrack>,
+    /// Grid row tracks (`none` is the empty list).
+    pub grid_template_rows: Vec<GridTrack>,
+    /// Grid column placement.
+    pub grid_column: GridLine,
+    /// Grid row placement.
+    pub grid_row: GridLine,
+    /// Default cross-axis alignment for grid items.
+    pub justify_items: AlignItems,
 }
 
 impl Style {
     /// The initial value of every property
     /// (<https://drafts.csswg.org/css-cascade-5/#initial-values>).
-    pub(crate) const INITIAL: Self = Self {
+    pub(crate) fn initial() -> Self {
+        Self {
         display: Display::Inline,
         position: Position::Static,
         inset_top: Dimension::Auto,
@@ -498,7 +567,54 @@ impl Style {
         order: 0,
         row_gap: Length::Px(0.0),
         column_gap: Length::Px(0.0),
-    };
+        grid_template_columns: Vec::new(),
+        grid_template_rows: Vec::new(),
+        grid_column: GridLine::AUTO,
+        grid_row: GridLine::AUTO,
+        justify_items: AlignItems::Stretch,
+    }
+}
+
+    /// Applies one text declaration to a draft style.
+    fn apply_text(text: &Decl, style: &mut Style, font_size: f32, root_font_size: f32) {
+        match text {
+            Decl::TextAlign(align) => style.text_align = *align,
+            Decl::WhiteSpace(space) => style.white_space = *space,
+            Decl::TextDecoration(decoration) => style.text_decoration = *decoration,
+            Decl::TextTransform(transform) => style.text_transform = *transform,
+            Decl::LetterSpacing(length) => {
+                style.letter_spacing = length.resolve(font_size, font_size, root_font_size);
+            }
+            Decl::Visibility(visibility) => style.visibility = *visibility,
+            Decl::VerticalAlign(align) => style.vertical_align = *align,
+            _ => {}
+        }
+    }
+
+    /// Applies one flex declaration to a draft style.
+    fn apply_flex(flex: &Decl, style: &mut Style) {
+        match flex {
+            Decl::FlexGrow(grow) => style.flex_grow = *grow,
+            Decl::FlexShrink(shrink) => style.flex_shrink = *shrink,
+            Decl::FlexBasis(basis) => style.flex_basis = *basis,
+            Decl::Order(order) => style.order = *order,
+            Decl::RowGap(gap) => style.row_gap = *gap,
+            Decl::ColumnGap(gap) => style.column_gap = *gap,
+            _ => {}
+        }
+    }
+
+    /// Applies one grid declaration to a draft style.
+    fn apply_grid(grid: &Decl, style: &mut Style) {
+        match grid {
+            Decl::GridTemplateColumns(tracks) => style.grid_template_columns.clone_from(tracks),
+            Decl::GridTemplateRows(tracks) => style.grid_template_rows.clone_from(tracks),
+            Decl::GridColumn(line) => style.grid_column = *line,
+            Decl::GridRow(line) => style.grid_row = *line,
+            Decl::JustifyItems(align) => style.justify_items = *align,
+            _ => {}
+        }
+    }
 
     /// A style that inherits every inherited property from `parent` and
     /// resets the rest to initial values
@@ -514,7 +630,7 @@ impl Style {
             text_transform: parent.text_transform,
             letter_spacing: parent.letter_spacing,
             visibility: parent.visibility,
-            ..Self::INITIAL
+            ..Self::initial()
         }
     }
 
@@ -553,7 +669,7 @@ impl SpecColor {
 }
 
 /// One parsed declaration in cascade order.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) enum Decl {
     /// `display`.
     Display(Display),
@@ -645,6 +761,16 @@ pub(crate) enum Decl {
     RowGap(Length),
     /// `column-gap`.
     ColumnGap(Length),
+    /// `grid-template-columns`.
+    GridTemplateColumns(Vec<GridTrack>),
+    /// `grid-template-rows`.
+    GridTemplateRows(Vec<GridTrack>),
+    /// `grid-column`.
+    GridColumn(GridLine),
+    /// `grid-row`.
+    GridRow(GridLine),
+    /// `justify-items`.
+    JustifyItems(AlignItems),
 }
 
 /// A box side for per-side declarations.
@@ -799,8 +925,7 @@ fn parse_border_style<'i>(input: &mut Parser<'i, '_>) -> Result<BorderStyle, Par
 /// A `border`/`border-top` shorthand: any of width, style, color in any
 /// order (<https://drafts.csswg.org/css-backgrounds-3/#border-shorthands>).
 #[derive(Clone, Copy, Debug, Default)]
-struct BorderShorthand {
-    width: Option<f32>,
+struct BorderShorthand {    width: Option<f32>,
     style: Option<BorderStyle>,
     color: Option<SpecColor>,
 }
@@ -895,9 +1020,159 @@ fn parse_integer<'i>(input: &mut Parser<'i, '_>) -> Result<i32, ParseError<'i, (
     }
 }
 
+/// One track size: `auto`, a length, or a flexible fraction
+/// (<https://drafts.csswg.org/css-grid-1/#track-sizing>).
+fn parse_track_size<'i>(input: &mut Parser<'i, '_>) -> Result<TrackSize, ParseError<'i, ()>> {
+    if let Ok(name) = input.try_parse(|input: &mut Parser<'i, '_>| input.expect_ident_cloned()) {
+        if name.eq_ignore_ascii_case("auto") {
+            return Ok(TrackSize::Auto);
+        }
+        return Err(input.new_custom_error(()));
+    }
+    if let Ok(flex) = input.try_parse(
+        |input: &mut Parser<'i, '_>| -> Result<f32, ParseError<'i, ()>> {
+            match input.next()?.clone() {
+                Token::Dimension { value, ref unit, .. }
+                    if unit.eq_ignore_ascii_case("fr") =>
+                {
+                    Ok(value)
+                }
+                _ => Err(input.new_custom_error(())),
+            }
+        },
+    ) {
+        return Ok(TrackSize::Flex(flex.max(0.0)));
+    }
+    Ok(TrackSize::Length(parse_length(input)?))
+}
+
+/// One `grid-template` track: a single size, `minmax()`, or `repeat()`.
+/// Nested `repeat()` is rejected, as the spec forbids it.
+fn parse_grid_track<'i>(input: &mut Parser<'i, '_>) -> Result<GridTrack, ParseError<'i, ()>> {
+    if let Ok(track) = input.try_parse(|input: &mut Parser<'i, '_>| {
+        let location = input.current_source_location();
+        let name = match input.next()?.clone() {
+            Token::Function(name) => name.to_string(),
+            token => return Err(location.new_unexpected_token_error(token)),
+        };
+        if name.eq_ignore_ascii_case("minmax") {
+            let (min, max) = input.parse_nested_block(|input| {
+                let min = parse_track_size(input)?;
+                input.expect_comma()?;
+                let max = parse_track_size(input)?;
+                Ok((min, max))
+            })?;
+            return Ok(GridTrack::MinMax(min, max));
+        }
+        if name.eq_ignore_ascii_case("repeat") {
+            let (count, tracks) = input.parse_nested_block(|input| {
+                let count = parse_integer(input)?;
+                input.expect_comma()?;
+                let mut tracks = Vec::new();
+                while !input.is_exhausted() {
+                    tracks.push(parse_repeat_track(input)?);
+                }
+                Ok((count, tracks))
+            })?;
+            let count = u16::try_from(count).map_err(|_| input.new_custom_error(()))?;
+            if count == 0 || tracks.is_empty() {
+                return Err(input.new_custom_error(()));
+            }
+            return Ok(GridTrack::Repeat(count, tracks));
+        }
+        Err(input.new_custom_error(()))
+    }) {
+        return Ok(track);
+    }
+    Ok(GridTrack::Single(parse_track_size(input)?))
+}
+
+/// One track inside `repeat()`: a single size or `minmax()`.
+fn parse_repeat_track<'i>(input: &mut Parser<'i, '_>) -> Result<GridTrack, ParseError<'i, ()>> {
+    if let Ok((min, max)) = input.try_parse(|input: &mut Parser<'i, '_>| {
+        let location = input.current_source_location();
+        match input.next()?.clone() {
+            Token::Function(name) if name.eq_ignore_ascii_case("minmax") => {
+                input.parse_nested_block(|input| {
+                    let min = parse_track_size(input)?;
+                    input.expect_comma()?;
+                    let max = parse_track_size(input)?;
+                    Ok((min, max))
+                })
+            }
+            token => Err(location.new_unexpected_token_error(token)),
+        }
+    }) {
+        return Ok(GridTrack::MinMax(min, max));
+    }
+    Ok(GridTrack::Single(parse_track_size(input)?))
+}
+
+/// A `grid-template-columns/rows` track list, or `none` for no tracks.
+fn parse_track_list<'i>(input: &mut Parser<'i, '_>) -> Result<Vec<GridTrack>, ParseError<'i, ()>> {
+    if let Ok(name) = input.try_parse(|input: &mut Parser<'i, '_>| input.expect_ident_cloned()) {
+        if name.eq_ignore_ascii_case("none") {
+            return Ok(Vec::new());
+        }
+        return Err(input.new_custom_error(()));
+    }
+    let mut tracks = Vec::new();
+    while !input.is_exhausted() {
+        tracks.push(parse_grid_track(input)?);
+    }
+    if tracks.is_empty() {
+        return Err(input.new_custom_error(()));
+    }
+    Ok(tracks)
+}
+
+/// One grid line placement: `auto`, a line number, or `span N`.
+fn parse_grid_placement<'i>(
+    input: &mut Parser<'i, '_>,
+) -> Result<GridPlacement, ParseError<'i, ()>> {
+    if let Ok(name) = input.try_parse(|input: &mut Parser<'i, '_>| input.expect_ident_cloned()) {
+        if name.eq_ignore_ascii_case("auto") {
+            return Ok(GridPlacement::Auto);
+        }
+        if name.eq_ignore_ascii_case("span") {
+            let count = parse_integer(input)?;
+            return u16::try_from(count)
+                .map(GridPlacement::Span)
+                .map_err(|_| input.new_custom_error(()));
+        }
+        return Err(input.new_custom_error(()));
+    }
+    parse_integer(input).map(GridPlacement::Line)
+}
+
+/// A `grid-column/row` value: `start / end`, with a lone `span` belonging to
+/// the end (<https://drafts.csswg.org/css-grid-1/#line-placement>).
+fn parse_grid_line<'i>(input: &mut Parser<'i, '_>) -> Result<GridLine, ParseError<'i, ()>> {
+    let first = parse_grid_placement(input)?;
+    if input
+        .try_parse(|input: &mut Parser<'i, '_>| input.expect_delim('/'))
+        .is_ok()
+    {
+        return Ok(GridLine {
+            start: first,
+            end: parse_grid_placement(input)?,
+        });
+    }
+    if matches!(first, GridPlacement::Span(_)) {
+        Ok(GridLine {
+            start: GridPlacement::Auto,
+            end: first,
+        })
+    } else {
+        Ok(GridLine {
+            start: first,
+            end: GridPlacement::Auto,
+        })
+    }
+}
+
 /// `font-size`: keywords, lengths, and percentages.
-fn parse_font_size<'i>(input: &mut Parser<'i, '_>) -> Result<Length, ParseError<'i, ()>> {
-    if let Ok(name) = input.try_parse(Parser::expect_ident_cloned) {
+fn parse_font_size<'i>(input: &mut Parser<'i, '_>) -> Result<Length, ParseError<'i, ()>> {    if let Ok(name) = input.try_parse(Parser::expect_ident_cloned) {
         if let Some(px) = font_size_keyword(&name) {
             return Ok(Length::Px(px));
         }
@@ -946,6 +1221,8 @@ pub(crate) fn parse_declaration(name: &str, value: &str) -> Vec<Decl> {
                     "inline-block" => Display::InlineBlock,
                     "flex" => Display::Flex,
                     "inline-flex" => Display::InlineFlex,
+                    "grid" => Display::Grid,
+                    "inline-grid" => Display::InlineGrid,
                     "list-item" => Display::ListItem,
                     _ => return Err(input.new_custom_error(())),
                 })
@@ -967,85 +1244,21 @@ pub(crate) fn parse_declaration(name: &str, value: &str) -> Vec<Decl> {
                 out.push(Decl::Position(position));
             }
         }
-        "top" => push_dimension(&mut out, value, Decl::InsetTop),
-        "right" => push_dimension(&mut out, value, Decl::InsetRight),
-        "bottom" => push_dimension(&mut out, value, Decl::InsetBottom),
-        "left" => push_dimension(&mut out, value, Decl::InsetLeft),
+        "top" | "right" | "bottom" | "left" => {
+            push_inset_declaration(&mut out, name, value);
+        }
         "width" => push_dimension(&mut out, value, Decl::Width),
         "height" => push_dimension(&mut out, value, Decl::Height),
         "min-width" => push_dimension(&mut out, value, Decl::MinWidth),
         "min-height" => push_dimension(&mut out, value, Decl::MinHeight),
         "max-width" => push_dimension(&mut out, value, Decl::MaxWidth),
         "max-height" => push_dimension(&mut out, value, Decl::MaxHeight),
-        "margin" => {
-            if let Some(edges) = with_value(value, parse_margins) {
-                for (side, dimension) in side_values(edges) {
-                    out.push(Decl::MarginSide(side, dimension));
-                }
-            }
+        "margin" | "margin-top" | "margin-right" | "margin-bottom" | "margin-left" | "padding" | "padding-top" | "padding-right" | "padding-bottom" | "padding-left" => {
+            push_spacing_declaration(&mut out, name, value);
         }
-        "margin-top" => push_dimension(&mut out, value, |d| Decl::MarginSide(Side::Top, d)),
-        "margin-right" => push_dimension(&mut out, value, |d| Decl::MarginSide(Side::Right, d)),
-        "margin-bottom" => push_dimension(&mut out, value, |d| Decl::MarginSide(Side::Bottom, d)),
-        "margin-left" => push_dimension(&mut out, value, |d| Decl::MarginSide(Side::Left, d)),
-        "padding" => {
-            if let Some(edges) = with_value(value, parse_paddings) {
-                for (side, length) in side_values(edges) {
-                    out.push(Decl::PaddingSide(side, length));
-                }
-            }
+        "border" | "border-top" | "border-right" | "border-bottom" | "border-left" | "border-width" | "border-style" | "border-color" | "border-top-width" | "border-right-width" | "border-bottom-width" | "border-left-width" | "border-top-style" | "border-right-style" | "border-bottom-style" | "border-left-style" | "border-top-color" | "border-right-color" | "border-bottom-color" | "border-left-color" => {
+            push_border_declaration(&mut out, name, value);
         }
-        "padding-top" => push_length(&mut out, value, |l| Decl::PaddingSide(Side::Top, l)),
-        "padding-right" => push_length(&mut out, value, |l| Decl::PaddingSide(Side::Right, l)),
-        "padding-bottom" => push_length(&mut out, value, |l| Decl::PaddingSide(Side::Bottom, l)),
-        "padding-left" => push_length(&mut out, value, |l| Decl::PaddingSide(Side::Left, l)),
-        "border" => {
-            if let Some(shorthand) = with_value(value, parse_border_shorthand) {
-                for side in [Side::Top, Side::Right, Side::Bottom, Side::Left] {
-                    push_border_shorthand(&mut out, side, shorthand);
-                }
-            }
-        }
-        "border-top" | "border-right" | "border-bottom" | "border-left" => {
-            if let Some(side) = side_from_name(name)
-                && let Some(shorthand) = with_value(value, parse_border_shorthand)
-            {
-                push_border_shorthand(&mut out, side, shorthand);
-            }
-        }
-        "border-width" => {
-            if let Some(edges) = with_value(value, parse_border_widths) {
-                for (side, width) in side_values(edges) {
-                    out.push(Decl::BorderWidth(side, width));
-                }
-            }
-        }
-        "border-style" => {
-            if let Some(edges) = with_value(value, parse_border_styles) {
-                for (side, style) in side_values(edges) {
-                    out.push(Decl::BorderStyleValue(side, style));
-                }
-            }
-        }
-        "border-color" => {
-            if let Some(edges) = with_value(value, parse_border_colors) {
-                for (side, color) in side_values(edges) {
-                    out.push(Decl::BorderColor(side, color));
-                }
-            }
-        }
-        "border-top-width" => push_border_width(&mut out, value, Side::Top),
-        "border-right-width" => push_border_width(&mut out, value, Side::Right),
-        "border-bottom-width" => push_border_width(&mut out, value, Side::Bottom),
-        "border-left-width" => push_border_width(&mut out, value, Side::Left),
-        "border-top-style" => push_border_style(&mut out, value, Side::Top),
-        "border-right-style" => push_border_style(&mut out, value, Side::Right),
-        "border-bottom-style" => push_border_style(&mut out, value, Side::Bottom),
-        "border-left-style" => push_border_style(&mut out, value, Side::Left),
-        "border-top-color" => push_border_color(&mut out, value, Side::Top),
-        "border-right-color" => push_border_color(&mut out, value, Side::Right),
-        "border-bottom-color" => push_border_color(&mut out, value, Side::Bottom),
-        "border-left-color" => push_border_color(&mut out, value, Side::Left),
         "box-sizing" => {
             if let Some(sizing) = with_value(value, |input| {
                 let name = input.expect_ident_cloned()?;
@@ -1069,30 +1282,8 @@ pub(crate) fn parse_declaration(name: &str, value: &str) -> Vec<Decl> {
                 out.push(Decl::Overflow(overflow));
             }
         }
-        "float" => {
-            if let Some(float) = with_value(value, |input| {
-                let name = input.expect_ident_cloned()?;
-                Ok(match name.to_ascii_lowercase().as_str() {
-                    "left" => Float::Left,
-                    "right" => Float::Right,
-                    _ => Float::None,
-                })
-            }) {
-                out.push(Decl::Float(float));
-            }
-        }
-        "clear" => {
-            if let Some(clear) = with_value(value, |input| {
-                let name = input.expect_ident_cloned()?;
-                Ok(match name.to_ascii_lowercase().as_str() {
-                    "left" => Clear::Left,
-                    "right" => Clear::Right,
-                    "both" => Clear::Both,
-                    _ => Clear::None,
-                })
-            }) {
-                out.push(Decl::Clear(clear));
-            }
+        "float" | "clear" => {
+            push_float_declaration(&mut out, name, value);
         }
         "color" => {
             if let Some(color) = with_value(value, parse_color) {
@@ -1259,6 +1450,11 @@ pub(crate) fn parse_declaration(name: &str, value: &str) -> Vec<Decl> {
                 out.push(Decl::AlignItems(align));
             }
         }
+        "justify-items" => {
+            if let Some(align) = with_value(value, parse_align_items) {
+                out.push(Decl::JustifyItems(align));
+            }
+        }
         "align-self" => {
             if let Some(align) = with_value(value, |input| {
                 let name = input.expect_ident_cloned()?;
@@ -1321,11 +1517,167 @@ pub(crate) fn parse_declaration(name: &str, value: &str) -> Vec<Decl> {
                 out.push(Decl::ColumnGap(edges.left));
             }
         }
+        "grid-template-columns" | "grid-template-rows" | "grid-column" | "grid-row" => {
+            push_grid_declaration(&mut out, name, value);
+        }
         "row-gap" => push_length(&mut out, value, Decl::RowGap),
         "column-gap" => push_length(&mut out, value, Decl::ColumnGap),
         _ => {}
     }
     out
+}
+
+/// Parses any `margin*`/`padding*` property into declarations.
+fn push_spacing_declaration(out: &mut Vec<Decl>, name: &str, value: &str) {
+    match name {
+        "margin" => {
+            if let Some(edges) = with_value(value, parse_margins) {
+                for (side, dimension) in side_values(edges) {
+                    out.push(Decl::MarginSide(side, dimension));
+                }
+            }
+        }
+        "margin-top" => push_dimension(out, value, |d| Decl::MarginSide(Side::Top, d)),
+        "margin-right" => push_dimension(out, value, |d| Decl::MarginSide(Side::Right, d)),
+        "margin-bottom" => push_dimension(out, value, |d| Decl::MarginSide(Side::Bottom, d)),
+        "margin-left" => push_dimension(out, value, |d| Decl::MarginSide(Side::Left, d)),
+        "padding" => {
+            if let Some(edges) = with_value(value, parse_paddings) {
+                for (side, length) in side_values(edges) {
+                    out.push(Decl::PaddingSide(side, length));
+                }
+            }
+        }
+        "padding-top" => push_length(out, value, |l| Decl::PaddingSide(Side::Top, l)),
+        "padding-right" => push_length(out, value, |l| Decl::PaddingSide(Side::Right, l)),
+        "padding-bottom" => push_length(out, value, |l| Decl::PaddingSide(Side::Bottom, l)),
+        "padding-left" => push_length(out, value, |l| Decl::PaddingSide(Side::Left, l)),
+        _ => {}
+    }
+}
+
+/// Parses any `border*` property into declarations.
+fn push_border_declaration(out: &mut Vec<Decl>, name: &str, value: &str) {
+    match name {
+        "border" => {
+            if let Some(shorthand) = with_value(value, parse_border_shorthand) {
+                for side in [Side::Top, Side::Right, Side::Bottom, Side::Left] {
+                    push_border_shorthand(out, side, shorthand);
+                }
+            }
+        }
+        "border-top" | "border-right" | "border-bottom" | "border-left" => {
+            if let Some(side) = side_from_name(name)
+                && let Some(shorthand) = with_value(value, parse_border_shorthand)
+            {
+                push_border_shorthand(out, side, shorthand);
+            }
+        }
+        "border-width" => {
+            if let Some(edges) = with_value(value, parse_border_widths) {
+                for (side, width) in side_values(edges) {
+                    out.push(Decl::BorderWidth(side, width));
+                }
+            }
+        }
+        "border-style" => {
+            if let Some(edges) = with_value(value, parse_border_styles) {
+                for (side, style) in side_values(edges) {
+                    out.push(Decl::BorderStyleValue(side, style));
+                }
+            }
+        }
+        "border-color" => {
+            if let Some(edges) = with_value(value, parse_border_colors) {
+                for (side, color) in side_values(edges) {
+                    out.push(Decl::BorderColor(side, color));
+                }
+            }
+        }
+        "border-top-width" => push_border_width(out, value, Side::Top),
+        "border-right-width" => push_border_width(out, value, Side::Right),
+        "border-bottom-width" => push_border_width(out, value, Side::Bottom),
+        "border-left-width" => push_border_width(out, value, Side::Left),
+        "border-top-style" => push_border_style(out, value, Side::Top),
+        "border-right-style" => push_border_style(out, value, Side::Right),
+        "border-bottom-style" => push_border_style(out, value, Side::Bottom),
+        "border-left-style" => push_border_style(out, value, Side::Left),
+        "border-top-color" => push_border_color(out, value, Side::Top),
+        "border-right-color" => push_border_color(out, value, Side::Right),
+        "border-bottom-color" => push_border_color(out, value, Side::Bottom),
+        "border-left-color" => push_border_color(out, value, Side::Left),
+        _ => {}
+    }
+}
+
+/// Parses `top`/`right`/`bottom`/`left` into a declaration.
+fn push_inset_declaration(out: &mut Vec<Decl>, name: &str, value: &str) {
+    match name {
+        "top" => push_dimension(out, value, Decl::InsetTop),
+        "right" => push_dimension(out, value, Decl::InsetRight),
+        "bottom" => push_dimension(out, value, Decl::InsetBottom),
+        "left" => push_dimension(out, value, Decl::InsetLeft),
+        _ => {}
+    }
+}
+
+/// Parses `float`/`clear` into a declaration.
+fn push_float_declaration(out: &mut Vec<Decl>, name: &str, value: &str) {
+    match name {
+        "float" => {
+            if let Some(float) = with_value(value, |input| {
+                let name = input.expect_ident_cloned()?;
+                Ok(match name.to_ascii_lowercase().as_str() {
+                    "left" => Float::Left,
+                    "right" => Float::Right,
+                    _ => Float::None,
+                })
+            }) {
+                out.push(Decl::Float(float));
+            }
+        }
+        "clear" => {
+            if let Some(clear) = with_value(value, |input| {
+                let name = input.expect_ident_cloned()?;
+                Ok(match name.to_ascii_lowercase().as_str() {
+                    "left" => Clear::Left,
+                    "right" => Clear::Right,
+                    "both" => Clear::Both,
+                    _ => Clear::None,
+                })
+            }) {
+                out.push(Decl::Clear(clear));
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Parses one grid longhand into a declaration.
+fn push_grid_declaration(out: &mut Vec<Decl>, name: &str, value: &str) {
+    match name {
+        "grid-template-columns" => {
+            if let Some(tracks) = with_value(value, parse_track_list) {
+                out.push(Decl::GridTemplateColumns(tracks));
+            }
+        }
+        "grid-template-rows" => {
+            if let Some(tracks) = with_value(value, parse_track_list) {
+                out.push(Decl::GridTemplateRows(tracks));
+            }
+        }
+        "grid-column" => {
+            if let Some(line) = with_value(value, parse_grid_line) {
+                out.push(Decl::GridColumn(line));
+            }
+        }
+        "grid-row" => {
+            if let Some(line) = with_value(value, parse_grid_line) {
+                out.push(Decl::GridRow(line));
+            }
+        }
+        _ => {}
+    }
 }
 
 /// `align-items` parser shared by `align-items`.
@@ -1514,27 +1866,30 @@ pub(crate) fn apply(decl: Decl, style: &mut Style, root_font_size: f32) {
                 ),
             };
         }
-        Decl::TextAlign(align) => style.text_align = align,
-        Decl::WhiteSpace(space) => style.white_space = space,
-        Decl::TextDecoration(decoration) => style.text_decoration = decoration,
-        Decl::TextTransform(transform) => style.text_transform = transform,
-        Decl::LetterSpacing(length) => {
-            style.letter_spacing = length.resolve(font_size, font_size, root_font_size);
-        }
-        Decl::Visibility(visibility) => style.visibility = visibility,
-        Decl::VerticalAlign(align) => style.vertical_align = align,
+        text @ (Decl::TextAlign(_)
+        | Decl::WhiteSpace(_)
+        | Decl::TextDecoration(_)
+        | Decl::TextTransform(_)
+        | Decl::LetterSpacing(_)
+        | Decl::Visibility(_)
+        | Decl::VerticalAlign(_)) => Style::apply_text(&text, style, font_size, root_font_size),
         Decl::FlexDirection(direction) => style.flex_direction = direction,
         Decl::FlexWrap(wrap) => style.flex_wrap = wrap,
         Decl::JustifyContent(justify) => style.justify_content = justify,
         Decl::AlignItems(align) => style.align_items = align,
         Decl::AlignSelf(align) => style.align_self = align,
         Decl::AlignContent(align) => style.align_content = align,
-        Decl::FlexGrow(grow) => style.flex_grow = grow,
-        Decl::FlexShrink(shrink) => style.flex_shrink = shrink,
-        Decl::FlexBasis(basis) => style.flex_basis = basis,
-        Decl::Order(order) => style.order = order,
-        Decl::RowGap(gap) => style.row_gap = gap,
-        Decl::ColumnGap(gap) => style.column_gap = gap,
+        flex @ (Decl::FlexGrow(_)
+        | Decl::FlexShrink(_)
+        | Decl::FlexBasis(_)
+        | Decl::Order(_)
+        | Decl::RowGap(_)
+        | Decl::ColumnGap(_)) => Style::apply_flex(&flex, style),
+        grid @ (Decl::GridTemplateColumns(_)
+        | Decl::GridTemplateRows(_)
+        | Decl::GridColumn(_)
+        | Decl::GridRow(_)
+        | Decl::JustifyItems(_)) => Style::apply_grid(&grid, style),
         // `font-size` is resolved before the other declarations apply.
         Decl::FontSize(_) => {}
     }
@@ -1552,7 +1907,7 @@ pub(crate) enum Origin {
 }
 
 /// One parsed declaration with its `!important` flag.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Declared {
     /// The declaration.
     pub(crate) decl: Decl,
@@ -1999,7 +2354,7 @@ mod tests {
 
     #[test]
     fn applies_em_after_font_size() {
-        let mut style = Style::INITIAL;
+        let mut style = Style::initial();
         style.font_size = 20.0;
         super::apply(Decl::MarginSide(super::Side::Top, super::Dimension::Length(Length::Em(2.0))), &mut style, 16.0);
         assert_eq!(

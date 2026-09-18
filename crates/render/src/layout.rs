@@ -102,7 +102,7 @@ pub(crate) struct InlineResult {
 /// One inline-level item collected before line breaking.
 #[expect(
     clippy::large_enum_variant,
-    reason = "styles stay inline Copy data; boxing every word would allocate per token"
+    reason = "styles stay inline cloned data; boxing every word would allocate per token"
 )]
 enum InlineItem<'a> {
     /// A word.
@@ -199,7 +199,7 @@ pub(crate) fn layout_inline_run(
 /// One item inside a line under construction.
 #[expect(
     clippy::large_enum_variant,
-    reason = "styles stay inline Copy data; boxing line items would allocate per word"
+    reason = "styles stay inline cloned data; boxing line items would allocate per word"
 )]
 enum LineItem<'a> {
     /// A word.
@@ -334,8 +334,8 @@ fn collect_inline<'a>(node: &'a BoxNode, ctx: &Ctx<'_>, out: &mut Vec<InlineItem
                 collect_inline(child, ctx, out);
             }
         }
-        BoxKind::InlineBlock | BoxKind::InlineFlex | BoxKind::Block | BoxKind::Flex
-        | BoxKind::ListItem => {
+        BoxKind::InlineBlock | BoxKind::InlineFlex | BoxKind::InlineGrid | BoxKind::Block
+        | BoxKind::Flex | BoxKind::Grid | BoxKind::ListItem => {
             let measurement = measure_atomic(node, ctx);
             out.push(InlineItem::Atomic { node, measurement });
         }
@@ -359,7 +359,7 @@ fn tokenize<'a>(text: &str, style: &Style, ctx: &Ctx<'_>, out: &mut Vec<InlineIt
         if !word.is_empty() {
             out.push(InlineItem::Word {
                 text: std::mem::take(word),
-                style: *style,
+                style: style.clone(),
             });
         }
     };
@@ -458,7 +458,7 @@ pub(crate) fn min_content_width(run: &[BoxNode], ctx: &Ctx<'_>) -> f32 {
 
 /// Min-content contribution of one inline-level box.
 fn min_content_node(node: &BoxNode, ctx: &Ctx<'_>) -> f32 {
-    let style = node.style;
+    let style = &node.style;
     let font = FontStyle {
         size: style.font_size,
         weight: style.font_weight,
@@ -490,15 +490,15 @@ fn min_content_node(node: &BoxNode, ctx: &Ctx<'_>) -> f32 {
             .sum(),
         BoxKind::Break => 0.0,
         // Atomics contribute their max-content size as a unit.
-        BoxKind::InlineBlock | BoxKind::InlineFlex | BoxKind::Block | BoxKind::Flex
-        | BoxKind::ListItem => max_content_width(node, ctx),
+        BoxKind::InlineBlock | BoxKind::InlineFlex | BoxKind::InlineGrid | BoxKind::Block
+        | BoxKind::Flex | BoxKind::Grid | BoxKind::ListItem => max_content_width(node, ctx),
     }
 }
 
 /// Padding plus border of a box: the difference between content and border
 /// box.
 fn outer_extras(node: &BoxNode, ctx: &Ctx<'_>) -> f32 {
-    let style = node.style;
+    let style = &node.style;
     let padding = style.padding.left.resolve(0.0, style.font_size, ctx.root_font_size)
         + style.padding.right.resolve(0.0, style.font_size, ctx.root_font_size);
     padding + style.border.left.width + style.border.right.width
@@ -507,7 +507,7 @@ fn outer_extras(node: &BoxNode, ctx: &Ctx<'_>) -> f32 {
 /// Max-content width of a box
 /// (<https://drafts.csswg.org/css-sizing-3/#max-content>).
 pub(crate) fn max_content_width(node: &BoxNode, ctx: &Ctx<'_>) -> f32 {
-    let style = node.style;
+    let style = &node.style;
     let extras = outer_extras(node, ctx);
     let content = match &node.kind {
         BoxKind::Text(text) => {
@@ -550,7 +550,14 @@ pub(crate) fn max_content_width(node: &BoxNode, ctx: &Ctx<'_>) -> f32 {
                 widths.fold(0.0, f32::max)
             }
         }
-        BoxKind::InlineBlock => node
+        BoxKind::InlineBlock | BoxKind::InlineGrid => node
+            .children
+            .iter()
+            .map(|child| max_content_width(child, ctx))
+            .fold(0.0, f32::max),
+        // Grid max-content is approximated like flex rows; Taffy resolves
+        // the exact intrinsic sizes during layout.
+        BoxKind::Grid => node
             .children
             .iter()
             .map(|child| max_content_width(child, ctx))

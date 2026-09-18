@@ -20,14 +20,16 @@
 
 use std::collections::HashMap;
 
-use taffy::style_helpers::{FromLength as _, FromPercent as _, TaffyAuto as _};
+use taffy::style_helpers::{FromFr as _, FromLength as _, FromPercent as _, TaffyAuto as _};
 use taffy::tree::{LayoutInput, LayoutOutput};
 use taffy::{
     AlignContent as TaffyAlignContent, AlignItems as TaffyAlignItems,
     AvailableSpace as TaffyAvailableSpace, Display as TaffyDisplay,
     FlexDirection as TaffyFlexDirection, FlexWrap as TaffyFlexWrap, Float as TaffyFloat,
-    JustifyContent as TaffyJustifyContent, Overflow as TaffyOverflow, Position as TaffyPosition,
-    Rect as TaffyRect, Size as TaffySize, Style as TaffyStyle, TaffyTree,
+    GridTemplateComponent, GridTemplateRepetition, JustifyContent as TaffyJustifyContent,
+    MaxTrackSizingFunction, MinTrackSizingFunction, Overflow as TaffyOverflow,
+    Position as TaffyPosition, Rect as TaffyRect, RepetitionCount, Size as TaffySize,
+    Style as TaffyStyle, TaffyTree, TrackSizingFunction,
 };
 
 use crate::font::Fonts;
@@ -35,7 +37,8 @@ use crate::geometry::{Edges, Rect};
 use crate::layout::{Ctx, LayoutBox, PaintItem, layout_inline_run, min_content_width};
 use crate::style::{
     AlignContent, AlignItems, AlignSelf, BoxSizing, Clear, Dimension, Display, FlexDirection,
-    FlexWrap, Float, JustifyContent, Length, Overflow, Position, Style, TextAlign,
+    FlexWrap, Float, GridLine, GridPlacement, GridTrack, JustifyContent, Length, Overflow,
+    Position, Style, TextAlign, TrackSize,
 };
 use crate::tree::{BoxKind, BoxNode, is_block_level};
 
@@ -107,11 +110,18 @@ pub(crate) fn layout_root(root: &BoxNode, fonts: &Fonts, viewport_width: f32, vi
     Builder::finish_root(layout, viewport_height)
 }
 
-/// Lays out one atomic subtree (an inline-block/flex) at a fixed available
-/// width, for inline-level measurement and placement.
+/// Lays out one atomic subtree (an inline-block/flex/grid) at a fixed
+/// available width, for inline-level measurement and placement.
 pub(crate) fn layout_subtree(node: &BoxNode, ctx: &Ctx<'_>, available: f32) -> LayoutBox {
     let mut builder = Builder::new(ctx);
-    let root_id = builder.build_node(node);
+    // Atomic roots lay out as containers, never as text leaves: routing them
+    // through `build_node` would wrap them in a leaf and recurse forever.
+    let root_id = match &node.kind {
+        BoxKind::InlineBlock => builder.build_block(node),
+        BoxKind::InlineFlex => builder.build_flex(node),
+        BoxKind::InlineGrid => builder.build_grid(node),
+        _ => builder.build_node(node),
+    };
     let space = TaffySize {
         width: TaffyAvailableSpace::Definite(available.max(0.0)),
         height: TaffyAvailableSpace::MaxContent,
@@ -248,79 +258,128 @@ impl<'a> Builder<'a> {
     /// Adds `node` and its subtree, returning the Taffy node.
     fn build_node(&mut self, node: &'a BoxNode) -> taffy::NodeId {
         match &node.kind {
-            BoxKind::Flex => {
-                let style = convert_style(&node.style, self.ctx.root_font_size);
-                // Flex items are blockified: every child becomes its own item
-                // (<https://drafts.csswg.org/css-flexbox-1/#flex-items>), in
-                // `order` (<https://drafts.csswg.org/css-flexbox-1/#order-property>).
-                let default_align = map_align(node.style.align_items);
-                let mut children: Vec<&BoxNode> = node.children.iter().collect();
-                children.sort_by_key(|child| child.style.order);
-                let mut ids = Vec::with_capacity(children.len());
-                for child in children {
-                    let id = if is_block_level(child) && child.style.float == Float::None {
-                        self.build_node(child)
-                    } else if matches!(
-                        child.kind,
-                        BoxKind::InlineBlock | BoxKind::InlineFlex
-                    ) {
-                        // Blockified, keeping the item's own box properties.
-                        self.build_leaf(
-                            std::slice::from_ref(child),
-                            node.style.text_align,
-                            &child.style,
-                        )
-                    } else {
-                        // Bare text and spans: neutral box, inherited text.
-                        // The leaf style is a local; `build_leaf` copies it.
-                        let neutral = neutral_item_style(&node.style);
-                        self.build_leaf(
-                            std::slice::from_ref(child),
-                            node.style.text_align,
-                            &neutral,
-                        )
-                    };
-                    // `align-self` resolves per item; `auto` inherits.
-                    if child.style.align_self != AlignSelf::Auto {
-                        let resolved = resolve_align_self(child.style.align_self, default_align);
-                        if let Ok(mut item) = self.tree.style(id).cloned() {
-                            item.align_self = Some(resolved);
-                            let _ = self.tree.set_style(id, item);
-                        }
-                    }
-                    ids.push(id);
-                }
-                self.parent_node(style, &node.style, &ids)
-            }
-            BoxKind::Block | BoxKind::ListItem => {
-                let inline_only = !node.children.is_empty()
-                    && node.children.iter().all(|child| {
-                        !is_block_level(child) || child.style.float != Float::None
-                    });
-                if inline_only {
-                    // An inline formatting context: one measured leaf.
-                    self.build_leaf(&node.children, node.style.text_align, &node.style)
-                } else {
-                    let style = convert_style(&node.style, self.ctx.root_font_size);
-                    let mut ids = Vec::with_capacity(node.children.len());
-                    for child in &node.children {
-                        ids.push(self.build_node(child));
-                    }
-                    self.parent_node(style, &node.style, &ids)
-                }
-            }
-            // Inline-level boxes only reach the builder as flex items or
+            BoxKind::Flex => self.build_flex(node),
+            BoxKind::Grid => self.build_grid(node),
+            BoxKind::Block | BoxKind::ListItem => self.build_block(node),
+            // Inline-level boxes only reach the builder as flex/grid items or
             // defensive fallbacks; either way they form one run.
             BoxKind::Text(_)
             | BoxKind::Inline
             | BoxKind::InlineBlock
             | BoxKind::InlineFlex
+            | BoxKind::InlineGrid
             | BoxKind::Break => self.build_leaf(
                 std::slice::from_ref(node),
                 node.style.text_align,
                 &node.style,
             ),
         }
+    }
+
+    /// Adds one flex container and its blockified items.
+    fn build_flex(&mut self, node: &'a BoxNode) -> taffy::NodeId {
+        let style = convert_style(&node.style, self.ctx.root_font_size);
+        // Flex items are blockified: every child becomes its own item
+        // (<https://drafts.csswg.org/css-flexbox-1/#flex-items>), in
+        // `order` (<https://drafts.csswg.org/css-flexbox-1/#order-property>).
+        let default_align = map_align(node.style.align_items);
+        let mut children: Vec<&BoxNode> = node.children.iter().collect();
+        children.sort_by_key(|child| child.style.order);
+        let mut ids = Vec::with_capacity(children.len());
+        for child in children {
+            let id = self.build_item(child, &node.style);
+            // `align-self` resolves per item; `auto` inherits.
+            if child.style.align_self != AlignSelf::Auto {
+                let resolved = resolve_align_self(child.style.align_self, default_align);
+                if let Ok(mut item) = self.tree.style(id).cloned() {
+                    item.align_self = Some(resolved);
+                    let _ = self.tree.set_style(id, item);
+                }
+            }
+            ids.push(id);
+        }
+        self.parent_node(style, &node.style, &ids)
+    }
+
+    /// Adds one grid container and its blockified items.
+    fn build_grid(&mut self, node: &'a BoxNode) -> taffy::NodeId {
+        let style = convert_style(&node.style, self.ctx.root_font_size);
+        // Grid items are blockified like flex items
+        // (<https://drafts.csswg.org/css-grid-1/#grid-items>).
+        let mut children: Vec<&BoxNode> = node.children.iter().collect();
+        children.sort_by_key(|child| child.style.order);
+        let mut ids = Vec::with_capacity(children.len());
+        for child in children {
+            let id = self.build_item(child, &node.style);
+            self.apply_grid_placement(id, &child.style, &node.style);
+            ids.push(id);
+        }
+        self.parent_node(style, &node.style, &ids)
+    }
+
+    /// Adds one block container, or one measured leaf when it holds only
+    /// inline content.
+    fn build_block(&mut self, node: &'a BoxNode) -> taffy::NodeId {
+        let inline_only = !node.children.is_empty()
+            && node
+                .children
+                .iter()
+                .all(|child| !is_block_level(child) || child.style.float != Float::None);
+        if inline_only {
+            // An inline formatting context: one measured leaf.
+            self.build_leaf(&node.children, node.style.text_align, &node.style)
+        } else {
+            let style = convert_style(&node.style, self.ctx.root_font_size);
+            let mut ids = Vec::with_capacity(node.children.len());
+            for child in &node.children {
+                ids.push(self.build_node(child));
+            }
+            self.parent_node(style, &node.style, &ids)
+        }
+    }
+
+    /// Adds one flex/grid item: block-level children recurse, everything else
+    /// becomes a measured leaf.
+    fn build_item(&mut self, child: &'a BoxNode, container: &Style) -> taffy::NodeId {
+        if is_block_level(child) && child.style.float == Float::None {
+            self.build_node(child)
+        } else if matches!(
+            child.kind,
+            BoxKind::InlineBlock | BoxKind::InlineFlex | BoxKind::InlineGrid
+        ) {
+            // Blockified, keeping the item's own box properties.
+            self.build_leaf(
+                std::slice::from_ref(child),
+                container.text_align,
+                &child.style,
+            )
+        } else {
+            // Bare text and spans: neutral box, inherited text.
+            // The leaf style is a local; `build_leaf` copies it.
+            let neutral = neutral_item_style(container);
+            self.build_leaf(std::slice::from_ref(child), container.text_align, &neutral)
+        }
+    }
+
+    /// Applies one grid item's placement and self-alignment.
+    fn apply_grid_placement(
+        &mut self,
+        id: taffy::NodeId,
+        item: &Style,
+        container: &Style,
+    ) {
+        let Ok(mut converted) = self.tree.style(id).cloned() else {
+            return;
+        };
+        converted.grid_column = map_grid_line(item.grid_column);
+        converted.grid_row = map_grid_line(item.grid_row);
+        if item.align_self != AlignSelf::Auto {
+            converted.align_self = Some(resolve_align_self(
+                item.align_self,
+                map_align(container.align_items),
+            ));
+        }
+        let _ = self.tree.set_style(id, converted);
     }
 
     /// Adds one parent node with converted style.
@@ -337,7 +396,7 @@ impl<'a> Builder<'a> {
         self.data.insert(
             id,
             NodeData {
-                style: *ours,
+                style: ours.clone(),
                 leaf: None,
             },
         );
@@ -365,7 +424,7 @@ impl<'a> Builder<'a> {
         self.data.insert(
             id,
             NodeData {
-                style: *style,
+                style: style.clone(),
                 leaf: Some(run_index),
             },
         );
@@ -474,6 +533,7 @@ fn convert_style(style: &Style, root_font_size: f32) -> TaffyStyle {
                 TaffyDisplay::Block
             }
             Display::Flex | Display::InlineFlex => TaffyDisplay::Flex,
+            Display::Grid | Display::InlineGrid => TaffyDisplay::Grid,
         },
         position: match style.position {
             Position::Static | Position::Relative => TaffyPosition::Relative,
@@ -571,7 +631,124 @@ fn convert_style(style: &Style, root_font_size: f32) -> TaffyStyle {
             width: to_length(style.column_gap, font_size, root_font_size),
             height: to_length(style.row_gap, font_size, root_font_size),
         },
+        grid_template_columns: map_tracks(&style.grid_template_columns, font_size, root_font_size),
+        grid_template_rows: map_tracks(&style.grid_template_rows, font_size, root_font_size),
+        justify_items: Some(map_align(style.justify_items)),
         ..TaffyStyle::default()
+    }
+}
+
+/// Maps one axis placement.
+fn map_grid_line(line: GridLine) -> taffy::Line<taffy::GridPlacement> {
+    taffy::Line {
+        start: map_placement(line.start),
+        end: map_placement(line.end),
+    }
+}
+
+/// Maps one line placement; negative lines count from the end.
+fn map_placement(placement: GridPlacement) -> taffy::GridPlacement {
+    match placement {
+        GridPlacement::Auto => taffy::GridPlacement::Auto,
+        GridPlacement::Line(number) => {
+            let narrowed = number.clamp(i32::from(i16::MIN), i32::from(i16::MAX));
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "clamped to i16 range above; the cast is infallible"
+            )]
+            let narrowed = narrowed as i16;
+            taffy::GridPlacement::Line(narrowed.into())
+        }
+        GridPlacement::Span(count) => taffy::GridPlacement::Span(count),
+    }
+}
+
+/// Maps a template track list.
+fn map_tracks(
+    tracks: &[GridTrack],
+    font_size: f32,
+    root_font_size: f32,
+) -> Vec<GridTemplateComponent<String>> {
+    let mut out = Vec::new();
+    for track in tracks {
+        push_track(track, &mut out, font_size, root_font_size);
+    }
+    out
+}
+
+/// Appends one track, expanding repeats.
+fn push_track(
+    track: &GridTrack,
+    out: &mut Vec<GridTemplateComponent<String>>,
+    font_size: f32,
+    root_font_size: f32,
+) {
+    match track {
+        GridTrack::Single(size) => out.push(GridTemplateComponent::<String>::Single(map_track_size(
+            size,
+            font_size,
+            root_font_size,
+        ))),
+        GridTrack::MinMax(min, max) => out.push(GridTemplateComponent::<String>::Single(TrackSizingFunction {
+            min: map_min_size(min, font_size, root_font_size),
+            max: map_max_size(max, font_size, root_font_size),
+        })),
+        GridTrack::Repeat(count, tracks) => {
+            let mut repeated = Vec::with_capacity(tracks.len());
+            for track in tracks {
+                // Nested repeats are rejected at parse time; skip defensively.
+                match track {
+                    GridTrack::Single(size) => repeated.push(map_track_size(
+                        size,
+                        font_size,
+                        root_font_size,
+                    )),
+                    GridTrack::MinMax(min, max) => repeated.push(TrackSizingFunction {
+                        min: map_min_size(min, font_size, root_font_size),
+                        max: map_max_size(max, font_size, root_font_size),
+                    }),
+                    GridTrack::Repeat(_, _) => {}
+                }
+            }
+            out.push(GridTemplateComponent::<String>::Repeat(GridTemplateRepetition {
+                count: RepetitionCount::Count(*count),
+                tracks: repeated,
+                line_names: Vec::new(),
+            }));
+        }
+    }
+}
+
+/// Maps one track size.
+fn map_track_size(size: &TrackSize, font_size: f32, root_font_size: f32) -> TrackSizingFunction {
+    match size {
+        TrackSize::Auto => TrackSizingFunction::AUTO,
+        TrackSize::Length(length) => {
+            TrackSizingFunction::from(to_length(*length, font_size, root_font_size))
+        }
+        TrackSize::Flex(flex) => TrackSizingFunction::from_fr(*flex),
+    }
+}
+
+/// Maps a min-track size; flexible fractions are invalid here and fall back
+/// to `auto`.
+fn map_min_size(size: &TrackSize, font_size: f32, root_font_size: f32) -> MinTrackSizingFunction {
+    match size {
+        TrackSize::Auto | TrackSize::Flex(_) => MinTrackSizingFunction::AUTO,
+        TrackSize::Length(length) => {
+            MinTrackSizingFunction::from(to_length(*length, font_size, root_font_size))
+        }
+    }
+}
+
+/// Maps a max-track size.
+fn map_max_size(size: &TrackSize, font_size: f32, root_font_size: f32) -> MaxTrackSizingFunction {
+    match size {
+        TrackSize::Auto => MaxTrackSizingFunction::AUTO,
+        TrackSize::Length(length) => {
+            MaxTrackSizingFunction::from(to_length(*length, font_size, root_font_size))
+        }
+        TrackSize::Flex(flex) => MaxTrackSizingFunction::from_fr(*flex),
     }
 }
 
