@@ -73,7 +73,16 @@ pub async fn serve(listener: &TcpListener, browser: &BrowserHandle) -> io::Resul
         tokio::select! {
             _ = stopping.wait_for(|stopping| *stopping) => break,
             accepted = listener.accept() => {
-                let (stream, _) = accepted?;
+                let (stream, _) = match accepted {
+                    Ok(accepted) => accepted,
+                    Err(error) => {
+                        // axum retried transient accept failures (EMFILE and
+                        // friends) instead of dropping the listener.
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        let _ = error;
+                        continue;
+                    }
+                };
                 tasks.spawn(connection(stream, state.clone(), stop.subscribe()));
             }
         }
@@ -92,38 +101,53 @@ async fn connection(
         async move { Ok::<_, std::convert::Infallible>(serve_request(request, state).await) }
     });
     let mut auto = Builder::new(TokioExecutor::new());
-    // CONNECT protocol needed for HTTP/2 websockets, as axum enabled it.
+    // CONNECT protocol for HTTP/2 websockets. The old axum build was h1-only,
+    // so this is an intentional widening of the loopback listener.
     auto.http2().enable_connect_protocol();
     let conn = auto.serve_connection_with_upgrades(TokioIo::new(stream), service);
     tokio::pin!(conn);
-    tokio::select! {
-        _result = conn.as_mut() => {}
-        _ = stop.changed() => {
-            conn.as_mut().graceful_shutdown();
-            let _drained = conn.as_mut().await;
+    // `subscribe()` marks the current value seen, so a receiver made after the
+    // stop send would never fire `changed()`. Check the current value first.
+    if !*stop.borrow() {
+        tokio::select! {
+            _result = conn.as_mut() => return,
+            _ = stop.changed() => {}
         }
     }
+    conn.as_mut().graceful_shutdown();
+    let _drained = conn.as_mut().await;
 }
 
 async fn serve_request(request: Request<Incoming>, state: AppState) -> Response<Full<Bytes>> {
-    if request.method() != Method::GET && request.method() != Method::HEAD {
-        return status_response(StatusCode::METHOD_NOT_ALLOWED, "method not allowed");
-    }
     let path = request.uri().path().to_owned();
     let route = route_path(&path);
-    let mut response = match route {
-        "/json/version" => json_response(StatusCode::OK, &version_json(&state)),
-        "/json" | "/json/list" => json_response(StatusCode::OK, &list_json(&state).await),
-        "/devtools/browser" => return serve_browser_socket(request, state),
+    match route {
+        "/json/version" => get_only(&request, json_route(&version_json(&state))),
+        "/json" | "/json/list" => get_only(&request, json_route(&list_json(&state).await)),
+        "/devtools/browser" => upgrade_route(request, state, None).await,
         _ => match route.strip_prefix("/devtools/page/") {
-            Some(raw) => return serve_page_socket(request, state, raw).await,
+            Some(raw) => upgrade_route(request, state, Some(raw.to_owned())).await,
             None => status_response(StatusCode::NOT_FOUND, "not found"),
         },
-    };
-    if request.method() == Method::HEAD {
-        *response.body_mut() = Full::new(Bytes::new());
     }
+}
+
+/// Axum's method router answered a known path with 405 + `Allow: GET,HEAD`
+/// and an empty body; HEAD bodies are hyper's job to strip.
+fn get_only(request: &Request<Incoming>, response: Response<Full<Bytes>>) -> Response<Full<Bytes>> {
+    if request.method() == Method::GET || request.method() == Method::HEAD {
+        return response;
+    }
+    let mut response = Response::new(Full::new(Bytes::new()));
+    *response.status_mut() = StatusCode::METHOD_NOT_ALLOWED;
     response
+        .headers_mut()
+        .insert(header::ALLOW, HeaderValue::from_static("GET,HEAD"));
+    response
+}
+
+fn json_route(payload: &Value) -> Response<Full<Bytes>> {
+    json_response(StatusCode::OK, payload)
 }
 
 /// Legacy CDP clients (Playwright included) append a trailing slash to
@@ -137,34 +161,52 @@ fn route_path(path: &str) -> &str {
     path
 }
 
-fn serve_browser_socket(
+/// Routes a websocket request: validates the handshake per RFC 6455
+/// (<https://www.rfc-editor.org/rfc/rfc6455#section-4.2.1>), resolves a page
+/// target when `raw` carries one, then answers the 101 and runs the socket.
+async fn upgrade_route(
     request: Request<Incoming>,
     state: AppState,
+    raw: Option<String>,
 ) -> Response<Full<Bytes>> {
-    let Some(key) = upgrade_key(&request) else {
-        return status_response(StatusCode::BAD_REQUEST, "not a websocket request");
+    let key = match upgrade_key(&request) {
+        Ok(key) => key,
+        Err(rejection) => return rejection_response(rejection),
     };
+    if let Some(raw) = raw {
+        let Ok(id) = raw.parse::<u64>() else {
+            return status_response(StatusCode::BAD_REQUEST, "invalid page target");
+        };
+        let Ok(tab) = state.browser.tab(TabId::new(id)).await else {
+            return status_response(StatusCode::NOT_FOUND, "unknown page target");
+        };
+        return serve_upgraded(request, &key, state, Some(tab));
+    }
     serve_upgraded(request, &key, state, None)
 }
 
-async fn serve_page_socket(
-    request: Request<Incoming>,
-    state: AppState,
-    raw: &str,
-) -> Response<Full<Bytes>> {
-    let Some(key) = upgrade_key(&request) else {
-        return status_response(StatusCode::BAD_REQUEST, "not a websocket request");
-    };
-    let Ok(id) = raw.parse::<u64>() else {
-        return status_response(StatusCode::BAD_REQUEST, "invalid page target");
-    };
-    let Ok(tab) = state.browser.tab(TabId::new(id)).await else {
-        return status_response(StatusCode::NOT_FOUND, "unknown page target");
-    };
-    serve_upgraded(request, &key, state, Some(tab))
+/// Why a websocket upgrade was refused, with the response it maps to.
+#[derive(Clone, Copy)]
+enum HandshakeRejection {
+    /// Not an HTTP/1.1 request.
+    HttpVersion,
+    /// Not a GET request.
+    Method,
+    /// Missing or non-websocket `Upgrade`/`Connection` headers.
+    NotWebsocket,
+    /// Missing `Sec-WebSocket-Key`.
+    MissingKey,
+    /// `Sec-WebSocket-Version` is absent or not 13.
+    VersionUnsupported,
 }
 
-fn upgrade_key(request: &Request<Incoming>) -> Option<String> {
+fn upgrade_key(request: &Request<Incoming>) -> Result<String, HandshakeRejection> {
+    if request.version() != http::Version::HTTP_11 {
+        return Err(HandshakeRejection::HttpVersion);
+    }
+    if request.method() != Method::GET {
+        return Err(HandshakeRejection::Method);
+    }
     let headers = request.headers();
     let upgrade = headers
         .get(header::UPGRADE)
@@ -176,12 +218,53 @@ fn upgrade_key(request: &Request<Incoming>) -> Option<String> {
         })
     });
     if !upgrade || !connection {
-        return None;
+        return Err(HandshakeRejection::NotWebsocket);
+    }
+    let version_ok = headers
+        .get(header::SEC_WEBSOCKET_VERSION)
+        .is_some_and(|value| value.as_bytes() == b"13");
+    if !version_ok {
+        return Err(HandshakeRejection::VersionUnsupported);
     }
     headers
         .get(header::SEC_WEBSOCKET_KEY)
         .and_then(|value| value.to_str().ok())
         .map(str::to_owned)
+        .ok_or(HandshakeRejection::MissingKey)
+}
+
+fn rejection_response(rejection: HandshakeRejection) -> Response<Full<Bytes>> {
+    match rejection {
+        HandshakeRejection::HttpVersion => {
+            status_response(StatusCode::UPGRADE_REQUIRED, "upgrade requires HTTP/1.1")
+        }
+        HandshakeRejection::Method => status_response(
+            StatusCode::METHOD_NOT_ALLOWED,
+            "websocket upgrade requires GET",
+        ),
+        HandshakeRejection::NotWebsocket => {
+            status_response(StatusCode::BAD_REQUEST, "not a websocket request")
+        }
+        HandshakeRejection::MissingKey => {
+            status_response(StatusCode::BAD_REQUEST, "missing websocket key")
+        }
+        // RFC 6455 §4.4: a supported-version server answers a version
+        // mismatch with 426 and its own `Sec-WebSocket-Version`.
+        HandshakeRejection::VersionUnsupported => {
+            let mut response = status_response(
+                StatusCode::UPGRADE_REQUIRED,
+                "unsupported websocket version",
+            );
+            response.headers_mut().insert(
+                header::SEC_WEBSOCKET_VERSION,
+                HeaderValue::from_static("13"),
+            );
+            response
+                .headers_mut()
+                .insert(header::CONNECTION, HeaderValue::from_static("close"));
+            response
+        }
+    }
 }
 
 fn serve_upgraded(

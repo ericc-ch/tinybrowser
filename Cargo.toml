@@ -59,11 +59,13 @@ cargo = { level = "deny", priority = -1 }
 # Private single-binary repo, never published to crates.io; the metadata
 # requirements (readme/keywords/categories/license) don't apply.
 cargo_common_metadata = { level = "allow", priority = 1 }
-# The servo selector stack (cssparser + selectors: phf 0.11, syn 2) and the
-# html5ever name stack (web_atoms via markup5ever =0.39.0: phf 0.13) are each
-# pinned deliberately (see docs/researches/size-budget.md). Their transitive
-# overlap cannot be deduped without breaking a pin; measured, not guessed, at
-# every size checkpoint.
+# Duplicate crate versions come from deliberate dependency pins (the servo
+# selector stack: cssparser + selectors with phf 0.11 and syn 2; the html5ever
+# name stack: web_atoms via markup5ever =0.39.0 with phf 0.13; hyper-util
+# keeping upstream base64 0.22 next to the direct 0.23) plus upstream
+# transitive splits (bitflags, hashbrown, png, rand, syn 2/3) that no bump
+# removes without breaking a pin. Measured, not guessed, at every size
+# checkpoint; see docs/researches/size-budget.md.
 multiple_crate_versions = { level = "allow", priority = 1 }
 
 # restriction: explicit, no blanket

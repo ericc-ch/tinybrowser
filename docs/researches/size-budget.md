@@ -2,7 +2,7 @@
 
 Research: why the binary stays small, how to measure a dependency, and what
 was kept or rejected. Shipping binary size lives in
-[`docs/progress.md`](../progress.md). Last stripped size: 5,621,760 bytes.
+[`docs/progress.md`](../progress.md).
 Target: under 10MB stripped on x86_64.
 
 ## Method
@@ -66,7 +66,13 @@ Kept, measured against the P14 shipping binary (7,414,144 bytes):
 
 A Rust panic ends the daemon. A renderer child aborts and the browser
 reaps it. rquickjs never uses unwinding for JS exceptions.
-`cargo test --release` still unwinds test units.
+
+The knob set below includes `--no-eh-frame-hdr` and C `-fno-unwind-tables`,
+so unwind profiles (dev, tests) also abort on panic instead of unwinding:
+`catch_unwind`-based recovery and `#[should_panic]` no longer work in tests.
+The shipping binary is unaffected: it is built with `panic = "abort"`, and
+nothing in the graph unwinds through foreign code (QuickJS uses setjmp and
+longjmp).
 
 Rejected or deferred:
 
@@ -160,37 +166,60 @@ Parley 0.11 (shaping, bidi, UAX#14 breaking, alignment) with `skrifa`
 outlines filled by `tiny-skia`. No system fonts: the embedded subset is
 registered from memory, and `parley`/`fontique` build with default features
 off plus `libm`. Isolated probe on an empty tuned binary: +882,768 bytes.
-Shipping delta: 7,051,360 -> 8,118,512 bytes (+1,067,152), the difference
+Shipping delta: 7,051,360 -> 8,118,512 bytes (+1,067,152, rustc 1.98.0), the difference
 being the shaping driver, the skrifa-direct outline path, and feature
 unification across the workspace. `fontdue` stays for intrinsic width
 measurement only.
 
 ## Linker and C-flag knobs (2026-09-18)
 
-Measured on the screenshot stack (rustc 1.98.1, shipping binary 8,118,576
-bytes). Each probe builds the exact tuned profile with one change; the kept
-set was re-verified through the committed `.cargo/config.toml` (a rebuild
-with config-delivered flags finished fresh in about a second, byte-identical
-output).
+Measured on the screenshot stack. The pre-knob baseline
+(`8,118,576` bytes here; shipping recorded `8,118,512` at Parley head;
+64 bytes are data-layout noise) was built with rustc 1.98.0; every other
+number in this section is rustc 1.98.1, so the knob row carries a small
+toolchain term (the same tree is `7,607,136` bytes under 1.98.1, −511,440 of
+which is not the flags). Each probe builds the exact tuned profile with one
+change; the kept set was re-verified through the committed
+`.cargo/config.toml` (a rebuild with config-delivered flags finished fresh in
+about a second, byte-identical output).
 
-Kept (shipping delta 8,118,576 -> 7,965,408 bytes, −153,168):
+Kept flags (section deltas measured against the pre-knob baseline):
 
 | Lever | Bytes | Section |
 | --- | ---: | --- |
 | `-Wl,--no-eh-frame-hdr` | −98,348 | deletes `.eh_frame_hdr` outright |
 | `CFLAGS="-fno-unwind-tables -fno-asynchronous-unwind-tables"` | −53,032 | deletes QuickJS-ng's `.eh_frame` (the only C compiled in the graph) |
 | lld `-O2` | −1,856 | `.rodata` string merging |
-| `-Wl,--build-id=none` | −192 | drops the GNU build-ID note; coredumps lose debuginfod matching |
-| `-Wl,--gc-sections` | −96 | explicit next to LTO; proves LTO already collects |
-| Hand-rolled CLI, not clap (`src/cli.rs`) | −184,912 | five flags and three subcommands; contract pinned by `tests/modes.rs` |
-| Hyper-direct servers, not axum (cdp, webdriver) | −179,568 | hyper-util server-auto + tokio-tungstenite upgrade; direct base64 deps unified on 0.23 |
+
+Within layout noise: `-Wl,--build-id=none` and `-Wl,--gc-sections`. The
+baseline already carried no GNU build-ID note, and LTO already collected
+unused sections, so those two rows are intent pins, not measured wins.
+
+Then, measured within rustc 1.98.1:
+
+| Lever | Bytes | Section |
+| --- | ---: | --- |
+| Hand-rolled CLI, not clap (`src/cli.rs`) | −184,912 | four global flags and three subcommands; parity pinned by `tests/modes.rs` |
+| Hyper-direct servers, not axum (cdp, webdriver) | −173,360 | hyper-util server-auto + tokio-tungstenite upgrade; direct base64 deps unified on 0.23 |
+
+The hyper-direct port briefly regressed behavior; the parity fixes landed on
+top (shutdown race check, 404/405 routing, HEAD kept to hyper, RFC 6455
+version validation, a size-limited WebDriver body, accept retry with
+backoff) and cost 2,592 bytes. Real breakage the reviewers measured in the
+first cut: a `watch` receiver created after the stop signal never fired, so
+`serve` could hang; the WebDriver cap was applied after buffering the whole
+body; `POST` to unknown paths answered 405 instead of 404; HEAD lost
+`Content-Length`; and a missing or wrong `Sec-WebSocket-Version` upgraded
+anyway. Behavior parity with the old axum stack is re-verified by raw probes
+plus the Blink CDP and Playwright gates.
 
 Nothing unwinds at runtime under `panic = "abort"` (QuickJS uses
 setjmp/longjmp), so the unwind index and the C tables are dead weight.
-Backtraces through our frames lose symbolization; debug builds are
-unaffected. The full workspace test suite (32 suites) passes with the
-complete flag set, and a live daemon (renderer child spawn, CDP
-`/json/version` + `/json/list`) is clean.
+Backtraces through our frames lose symbolization, and the flags also disable
+panic recovery in dev and test binaries (the flag set lives in
+`.cargo/config.toml` for every profile). The full workspace test suite (32
+suites) passes with the complete flag set, and a live daemon (renderer child
+spawn, CDP `/json/version` + `/json/list`) is clean.
 
 Dead ends: `-C force-unwind-tables=no` (−128; sync tables are already gone
 via `panic = "abort"`, `.gcc_except_table` is 6.8 KiB — the remaining

@@ -64,7 +64,8 @@ pub(crate) async fn session_method(method: &str, tab: &TabHandle) -> Result<Valu
             },
             "cssContentSize": {"x": 0, "y": 0, "width": VIEWPORT_WIDTH, "height": VIEWPORT_HEIGHT},
         })),
-        "Page.addScriptToEvaluateOnNewDocument" => Ok(json!({"identifier": "1"})),        "Runtime.disable"
+        "Page.addScriptToEvaluateOnNewDocument" => Ok(json!({"identifier": "1"})),
+        "Runtime.disable"
         | "Target.setAutoAttach"
         | "Runtime.runIfWaitingForDebugger"
         | "Log.enable"

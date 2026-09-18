@@ -1,9 +1,9 @@
-//! Command-line boundary: five flags, three subcommands, hand-scanned.
+//! Command-line boundary: four global flags, three subcommands, hand-scanned.
 //!
-//! The observable contract (exit codes, output streams, the `Commands:`
-//! help table) is pinned by `tests/modes.rs`. Tokens scan once, left to
-//! right, so `--version` and `--help` short-circuit where they appear and
-//! value errors surface in order.
+//! Tokens scan once, left to right, so `--version` and `--help` short-circuit
+//! where they appear and value errors surface in order. Behavior parity with
+//! the removed clap surface (exit codes, streams, rejected forms) is pinned by
+//! `tests/modes.rs`.
 
 use std::ffi::OsString;
 use std::iter::Peekable;
@@ -101,6 +101,7 @@ enum Partial {
         profile: Option<Profile>,
     },
     Renderer,
+    Help,
     Webdriver {
         port: Option<u16>,
         profile: Option<Profile>,
@@ -134,7 +135,9 @@ impl<I: Iterator<Item = OsString>> Scanner<I> {
 
     fn token(&mut self, text: &str) -> Result<Option<Outcome>, String> {
         if self.end_of_flags {
-            return self.positional(text);
+            // clap treats tokens after `--` as positional values; there are
+            // none, so even a subcommand name is an error.
+            return Err(format!("unexpected argument '{text}' found"));
         }
         if text == "--" {
             self.end_of_flags = true;
@@ -173,6 +176,9 @@ impl<I: Iterator<Item = OsString>> Scanner<I> {
             "verbose" => {
                 if inline.is_some() {
                     return Err("unexpected value for '--verbose'".into());
+                }
+                if self.verbose {
+                    return Err("the argument '--verbose' was provided more than once".into());
                 }
                 self.verbose = true;
                 Ok(None)
@@ -260,6 +266,12 @@ impl<I: Iterator<Item = OsString>> Scanner<I> {
     }
 
     fn positional(&mut self, text: &str) -> Result<Option<Outcome>, String> {
+        if let Some(Partial::Help) = self.command {
+            return match text {
+                "daemon" | "renderer" | "webdriver" | "help" => Ok(Some(Outcome::Help)),
+                _ => Err(format!("unrecognized subcommand '{text}'")),
+            };
+        }
         if self.command.is_some() {
             return Err(format!("unexpected argument '{text}' found"));
         }
@@ -281,7 +293,10 @@ impl<I: Iterator<Item = OsString>> Scanner<I> {
                 });
                 Ok(None)
             }
-            "help" => Ok(Some(Outcome::Help)),
+            "help" => {
+                self.command = Some(Partial::Help);
+                Ok(None)
+            }
             _ => Err(format!("unrecognized subcommand '{text}'")),
         }
     }
@@ -317,6 +332,7 @@ impl<I: Iterator<Item = OsString>> Scanner<I> {
     fn finish(self) -> Result<Outcome, String> {
         let command = match self.command {
             None => None,
+            Some(Partial::Help) => return Ok(Outcome::Help),
             Some(Partial::Daemon { profile }) => Some(Command::Daemon {
                 profile: profile.unwrap_or_default(),
             }),

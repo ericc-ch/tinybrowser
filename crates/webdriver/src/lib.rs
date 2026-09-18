@@ -58,7 +58,16 @@ pub async fn serve(listener: &TcpListener, browser: BrowserHandle) -> std::io::R
     let listener = tokio::net::TcpListener::from_std(std_listener)?;
     let state = AppState { sessions };
     loop {
-        let (stream, _) = listener.accept().await?;
+        let (stream, _) = match listener.accept().await {
+            Ok(accepted) => accepted,
+            Err(error) => {
+                // axum retried transient accept failures (EMFILE and friends)
+                // instead of dropping the listener; mirror that with backoff.
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                let _ = error;
+                continue;
+            }
+        };
         let state = state.clone();
         tokio::spawn(async move {
             let service = service_fn(move |request| {
@@ -66,6 +75,8 @@ pub async fn serve(listener: &TcpListener, browser: BrowserHandle) -> std::io::R
                 async move { Ok::<_, std::convert::Infallible>(serve_request(request, state).await) }
             });
             let mut auto = Builder::new(TokioExecutor::new());
+            // CONNECT protocol for HTTP/2 websockets; the old axum build was
+            // h1-only, so this widens the loopback listener.
             auto.http2().enable_connect_protocol();
             let connection = auto.serve_connection_with_upgrades(TokioIo::new(stream), service);
             let _result = connection.await;
@@ -78,28 +89,41 @@ struct AppState {
     sessions: Arc<Mutex<Sessions>>,
 }
 
-/// Axum's `Bytes` extractor caps bodies at 2 MiB; the same cap keeps the
-/// status surface identical.
+/// Axum's `Bytes` extractor caps bodies at 2 MiB while reading; the same cap
+/// is enforced during collection here.
 const MAX_BODY_BYTES: usize = 2 * 1024 * 1024;
 
 async fn serve_request(request: Request<Incoming>, state: AppState) -> Response<Full<Bytes>> {
     let method = request.method().as_str().to_owned();
     let path = request.uri().path().to_owned();
-    let body = match request.into_body().collect().await {
+    let limited = http_body_util::Limited::new(request.into_body(), MAX_BODY_BYTES);
+    let body = match limited.collect().await {
         Ok(collected) => collected.to_bytes(),
-        Err(_) => return json_response(StatusCode::BAD_REQUEST, &json!("invalid request body")),
+        Err(error) => {
+            if error
+                .downcast_ref::<http_body_util::LengthLimitError>()
+                .is_some()
+            {
+                return status_response(StatusCode::PAYLOAD_TOO_LARGE, "request body too large");
+            }
+            return status_response(StatusCode::BAD_REQUEST, "invalid request body");
+        }
     };
-    if body.len() > MAX_BODY_BYTES {
-        return json_response(
-            StatusCode::PAYLOAD_TOO_LARGE,
-            &json!("request body too large"),
-        );
-    }
     let body = String::from_utf8_lossy(&body).into_owned();
     let mut sessions = state.sessions.lock().await;
     let (status, payload) = dispatch(&method, &path, &body, &mut sessions).await;
     let status = StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
     json_response(status, &payload)
+}
+
+fn status_response(status: StatusCode, message: &'static str) -> Response<Full<Bytes>> {
+    let mut response = Response::new(Full::new(Bytes::from(message)));
+    *response.status_mut() = status;
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/plain; charset=utf-8"),
+    );
+    response
 }
 
 fn json_response(status: StatusCode, payload: &Value) -> Response<Full<Bytes>> {

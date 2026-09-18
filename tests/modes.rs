@@ -87,6 +87,45 @@ fn old_mode_flags_are_rejected() {
 }
 
 #[test]
+fn double_dash_rejects_positionals() {
+    let fixture = Fixture::new("tinybrowser-double-dash");
+    for args in [&["--", "daemon"][..], &["--", "nonsense"]] {
+        let output = run(&fixture, args);
+        assert_eq!(output.status.code(), Some(2), "{args:?}");
+    }
+}
+
+#[test]
+fn repeated_global_flags_are_rejected() {
+    let fixture = Fixture::new("tinybrowser-repeated-flags");
+    for args in [
+        &["--verbose", "--verbose", "daemon"][..],
+        &["--log-level=info", "--log-level=debug", "daemon"],
+    ] {
+        let output = run(&fixture, args);
+        assert_eq!(output.status.code(), Some(2), "{args:?}");
+    }
+}
+
+#[test]
+fn help_with_unknown_subcommand_is_rejected() {
+    let fixture = Fixture::new("tinybrowser-help-bogus");
+    let output = run(&fixture, &["help", "bogus"]);
+    assert_eq!(output.status.code(), Some(2));
+}
+
+#[test]
+fn help_with_known_subcommand_prints_help() {
+    let fixture = Fixture::new("tinybrowser-help-known");
+    for args in [&["help"][..], &["help", "webdriver"], &["daemon", "--help"]] {
+        let output = run(&fixture, args);
+        assert!(output.status.success(), "{args:?}");
+        let out = String::from_utf8_lossy(&output.stdout);
+        assert!(out.contains("daemon"), "{args:?}: {out}");
+    }
+}
+
+#[test]
 fn webdriver_requires_port() {
     let fixture = Fixture::new("tinybrowser-webdriver-port");
     let output = run(&fixture, &["webdriver"]);
