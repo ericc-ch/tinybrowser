@@ -81,7 +81,7 @@ if [[ -n "${TINYBROWSER_BINARY:-}" ]]; then
   BINARY="$TINYBROWSER_BINARY"
 else
   cargo build -q --offline 2>/dev/null || cargo build -q
-  BINARY="$ROOT/target/debug/tinybrowser"
+  BINARY="$("$ROOT/tools/bin")"
 fi
 if [[ ! -x "$BINARY" ]]; then
   echo "tinybrowser binary not found at $BINARY" >&2

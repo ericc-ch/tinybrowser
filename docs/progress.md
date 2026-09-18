@@ -11,7 +11,7 @@ Target: under 10MB stripped on x86_64.
 
 ```sh
 nix develop --command cargo build --release --bin tinybrowser
-stat --format='%n %s' target/release/tinybrowser
+stat --format='%n %s' "$(tools/bin --release)"
 ```
 
 ## WPT
