@@ -33,8 +33,6 @@ pub enum InitiatorKind {
     Navigation,
     /// Scripted `fetch()`.
     Fetch,
-    /// Scripted `XMLHttpRequest`.
-    Xhr,
     /// WebSocket handshake.
     WsHandshake,
 }

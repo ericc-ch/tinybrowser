@@ -4,6 +4,7 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use base64::Engine as _;
 use common::Fixture;
 use serde_json::{Value, json};
 
@@ -668,4 +669,25 @@ fn unknown_element_click_and_perform_actions_are_unsupported() {
     assert_eq!(actions["value"]["error"], json!("unsupported operation"));
     let released = request(&addr, "DELETE", &format!("/session/{id}/actions"), None);
     assert_eq!(released["value"], Value::Null);
+}
+
+#[test]
+fn take_screenshot_returns_base64_png() {
+    let (addr, _fixture) = start(Vec::new());
+    let created = request(&addr, "POST", "/session", Some("{}"));
+    let id = created["value"]["sessionId"]
+        .as_str()
+        .expect("session id")
+        .to_owned();
+    let shot = request(&addr, "GET", &format!("/session/{id}/screenshot"), None);
+    let data = shot["value"].as_str().expect("base64 string");
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(data)
+        .expect("base64 png");
+    // PNG signature, then the IHDR dimensions (big-endian after the 8-byte
+    // length/type prefix).
+    assert_eq!(&bytes[..8], b"\x89PNG\r\n\x1a\n", "not a PNG");
+    let width = u32::from_be_bytes(bytes[16..20].try_into().expect("width"));
+    let height = u32::from_be_bytes(bytes[20..24].try_into().expect("height"));
+    assert_eq!((width, height), (800, 600), "unexpected viewport capture");
 }

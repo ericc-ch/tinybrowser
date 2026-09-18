@@ -7,11 +7,11 @@ Size research lives in [`docs/researches/size-budget.md`](researches/size-budget
 
 Target: under 10MB stripped on x86_64.
 
-5,988,848 bytes (2026-09-17)
+9,534,096 bytes (2026-09-18)
 
 ```sh
 nix develop --command cargo build --release --bin tinybrowser
-stat --format='%n %s' target/release/tinybrowser
+stat --format='%n %s' "$(tools/bin --release)"
 ```
 
 ## WPT
@@ -20,7 +20,7 @@ WPT has many test groups (html, css, dom, and more). Each percentage is the pass
 
 The total percentage is the pass count over all WPT. Total stays unscored until a real all-WPT score exists.
 
-Slices, not full-group percentages: html5lib (`html/syntax/parsing/html5lib_*.html`, 173 as expected on 2026-09-15) and `dom/events/`.
+Slices, not full-group percentages: html5lib (`html/syntax/parsing/html5lib_*.html`, 173 as expected on 2026-09-15), `dom/events/`, and the CSS reftest slice `css/css-color/` (266/307 on 2026-09-18 with `--test-types reftest`).
 
 ```sh
 nix develop --command ./tools/wpt/score <directory> -- --exclude=worker

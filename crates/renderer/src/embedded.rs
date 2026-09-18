@@ -13,7 +13,6 @@ use crate::{BrowserServices, FrameId, Mount, RemoteValue, TabError, TabEvent};
 pub struct EmbeddedRenderer {
     engine: Engine,
     stop: Arc<Stop>,
-    wake: Arc<Notify>,
 }
 
 impl EmbeddedRenderer {
@@ -21,11 +20,9 @@ impl EmbeddedRenderer {
     #[must_use]
     pub fn new(host: Arc<dyn BrowserServices>) -> Self {
         let stop = Arc::new(Stop::new());
-        let wake = Arc::new(Notify::new());
         Self {
-            engine: Engine::new(host, Arc::clone(&stop), Arc::clone(&wake)),
+            engine: Engine::new(host, Arc::clone(&stop), Arc::new(Notify::new())),
             stop,
-            wake,
         }
     }
 
@@ -83,19 +80,6 @@ impl EmbeddedRenderer {
         self.engine
             .next_deadline()
             .map(|deadline| deadline.saturating_duration_since(tokio::time::Instant::now()))
-    }
-
-    /// Waits until a host completion or page timer gives the engine work.
-    pub async fn wait_until_ready(&self) {
-        match self.engine.next_deadline() {
-            Some(deadline) => {
-                tokio::select! {
-                    () = self.wake.notified() => {}
-                    () = tokio::time::sleep_until(deadline) => {}
-                }
-            }
-            None => self.wake.notified().await,
-        }
     }
 }
 

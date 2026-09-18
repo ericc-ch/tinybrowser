@@ -23,7 +23,7 @@ use serde::{Serialize, de::DeserializeOwned};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// Framing and message ABI version for the renderer channel.
-pub const PROTOCOL_VERSION: u8 = 3;
+pub const PROTOCOL_VERSION: u8 = 4;
 
 /// Fixed frame header size in bytes.
 pub const HEADER_BYTES: usize = 16;
@@ -243,20 +243,6 @@ pub async fn read_frame_async<R: AsyncRead + Unpin + ?Sized>(
 /// # Errors
 ///
 /// I/O failure, a body frame, invalid JSON, or a protocol violation.
-pub async fn read_control_async<T: DeserializeOwned, R: AsyncRead + Unpin + ?Sized>(
-    reader: &mut R,
-    buffer: &mut Vec<u8>,
-) -> io::Result<Option<T>> {
-    match read_frame_async(reader, buffer).await? {
-        None => Ok(None),
-        Some(Frame {
-            kind: FrameKind::Control,
-            ..
-        }) => decode_control(buffer).map(Some),
-        Some(_) => Err(invalid("expected a control frame")),
-    }
-}
-
 /// Reads one control message.
 ///
 /// # Errors

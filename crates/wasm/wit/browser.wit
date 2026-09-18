@@ -13,6 +13,8 @@ interface types {
         js-fetch,
         /// A classic `<script src>` load.
         classic-script,
+        /// A `<link rel=stylesheet>` sheet.
+        stylesheet,
         /// A child frame's navigation.
         frame-load,
     }

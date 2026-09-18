@@ -14,7 +14,11 @@ pub(crate) const DOM_EXCEPTION_CODES: [(&str, &str, i32); 25] = [
     ("WRONG_DOCUMENT_ERR", "WrongDocumentError", 4),
     ("INVALID_CHARACTER_ERR", "InvalidCharacterError", 5),
     ("NO_DATA_ALLOWED_ERR", "NoDataAllowedError", 6),
-    ("NO_MODIFICATION_ALLOWED_ERR", "NoModificationAllowedError", 7),
+    (
+        "NO_MODIFICATION_ALLOWED_ERR",
+        "NoModificationAllowedError",
+        7,
+    ),
     ("NOT_FOUND_ERR", "NotFoundError", 8),
     ("NOT_SUPPORTED_ERR", "NotSupportedError", 9),
     ("INUSE_ATTRIBUTE_ERR", "InUseAttributeError", 10),

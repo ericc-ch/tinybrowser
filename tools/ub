@@ -30,8 +30,10 @@ cd "$ROOT"
 
 # Pure-Rust crates with tests. Extend when unsafe logic moves into a new one.
 miri_crates=(logging)
-# Crates whose tests are cheap enough to run under Valgrind today.
-valgrind_crates=(logging)
+# Crates whose tests are cheap enough to run under Valgrind today. `render`
+# is here because its Stylo bridge is where the workspace's only `unsafe fn`
+# hooks live; the tests are a handful of small renders.
+valgrind_crates=(logging render)
 
 usage() {
   echo "usage: tools/ub [lint|miri [crate...]|valgrind [crate...]]" >&2

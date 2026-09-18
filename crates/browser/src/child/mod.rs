@@ -34,10 +34,19 @@ use renderer::{BrowserServices, DialCompletion, DialRequest, Stop};
 use tokio::sync::{Notify, mpsc};
 use url::Url;
 
-use crate::wire::channel::{FrameKind, decode_control, read_frame};
+use crate::wire::channel::{FrameKind, decode_control, read_frame, write_frame};
 use crate::wire::{
     Command, FromRenderer, RendererAssignmentId, ServiceCall, ServiceReply, ToRenderer,
 };
+
+/// One message the renderer writes to the browser: control JSON or a raw body
+/// chunk of a streamed reply.
+pub(crate) enum Outgoing {
+    /// A control message.
+    Message(FromRenderer),
+    /// Raw bytes for one request id.
+    Body { request: u64, payload: Vec<u8> },
+}
 
 /// Runs the renderer child until `Shutdown` or the channel closes.
 ///
@@ -57,7 +66,7 @@ pub fn serve() -> io::Result<()> {
 async fn serve_async() -> io::Result<thread::JoinHandle<io::Result<()>>> {
     let (input, output) = endpoint()?;
     let (command_tx, command_rx) = mpsc::channel::<RendererInput>(INBOX_CAPACITY);
-    let (out_tx, out_rx) = std_mpsc::sync_channel::<FromRenderer>(OUTBOX_CAPACITY);
+    let (out_tx, out_rx) = std_mpsc::sync_channel::<Outgoing>(OUTBOX_CAPACITY);
     let stop = Arc::new(Stop::new());
     let wake = Arc::new(Notify::new());
     let writer_stop = Arc::clone(&stop);
@@ -74,7 +83,7 @@ async fn serve_async() -> io::Result<thread::JoinHandle<io::Result<()>>> {
         result
     });
     let services = Arc::new(ChannelServices::new(out_tx.clone()));
-    let _ready = out_tx.try_send(FromRenderer::Ready);
+    let _ready = out_tx.try_send(Outgoing::Message(FromRenderer::Ready));
     logging::info!(target: "renderer", "ready");
     let reader_services = Arc::clone(&services);
     let reader_stop = Arc::clone(&stop);
@@ -221,18 +230,25 @@ pub(crate) enum RendererInput {
 }
 
 fn write_messages(
-    rx: &std_mpsc::Receiver<FromRenderer>,
+    rx: &std_mpsc::Receiver<Outgoing>,
     mut output: Box<dyn Write + Send>,
 ) -> io::Result<()> {
     for message in rx {
-        crate::wire::channel::write_control(&mut output, &message)?;
+        match message {
+            Outgoing::Message(message) => {
+                crate::wire::channel::write_control(&mut output, &message)?;
+            }
+            Outgoing::Body { request, payload } => {
+                write_frame(&mut output, FrameKind::Body, request, &payload)?;
+            }
+        }
     }
     Ok(())
 }
 
 /// [`BrowserServices`] proxy that asks the browser process over the channel.
 pub(crate) struct ChannelServices {
-    out: SyncSender<FromRenderer>,
+    out: SyncSender<Outgoing>,
     pending: Mutex<HashMap<u64, PendingService>>,
     next: AtomicU64,
 }
@@ -243,7 +259,7 @@ enum PendingService {
 }
 
 impl ChannelServices {
-    fn new(out: SyncSender<FromRenderer>) -> Self {
+    fn new(out: SyncSender<Outgoing>) -> Self {
         Self {
             out,
             pending: Mutex::new(HashMap::new()),
@@ -267,11 +283,11 @@ impl ChannelServices {
             .insert(id, pending);
         if self
             .out
-            .try_send(FromRenderer::ServiceCall {
+            .try_send(Outgoing::Message(FromRenderer::ServiceCall {
                 assignment,
                 id,
                 call,
-            })
+            }))
             .is_ok()
         {
             return Ok(());

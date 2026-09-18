@@ -77,7 +77,9 @@ impl Document {
 
     pub(crate) fn waiting_for_load(&self) -> bool {
         self.queued_dials.iter().any(|dial| match &dial.context {
-            DialContext::ClassicScript { epoch, .. } => *epoch == self.js_epoch,
+            DialContext::ClassicScript { epoch, .. } | DialContext::Stylesheet { epoch, .. } => {
+                *epoch == self.js_epoch
+            }
             DialContext::FrameLoad { sequence, .. } => *sequence == self.frame_load_sequence,
             DialContext::JsFetch { .. } => false,
         }) || self.classic_fetch_in_flight
@@ -86,7 +88,7 @@ impl Document {
             || self.world.borrow().main_ready_state() != crate::ReadyState::Complete
     }
 
-    fn launch_queued_dials(&mut self) {
+    pub(in crate::document) fn launch_queued_dials(&mut self) {
         let queued = std::mem::take(&mut self.queued_dials);
         for dial in queued {
             let task_dial = dial.clone();

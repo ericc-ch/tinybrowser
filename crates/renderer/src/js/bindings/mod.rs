@@ -184,8 +184,12 @@ pub(crate) fn install(ctx: &Ctx<'_>, world: &Rc<RefCell<World>>) -> Result<()> {
     Class::<JsEvent>::define(&globals)?;
     ctx.eval::<(), _>(events::INSTALL_EVENT_CTOR_JS)?;
     install_webdriver_bridge(ctx, &globals)?;
-    globals.set("innerWidth", VIRTUAL_VIEWPORT_WIDTH)?;
-    globals.set("innerHeight", VIRTUAL_VIEWPORT_HEIGHT)?;
+    globals.set("innerWidth", f64::from(crate::engine::VIEWPORT_WIDTH))?;
+    globals.set("innerHeight", f64::from(crate::engine::VIEWPORT_HEIGHT))?;
+    // No browser chrome exists, so the outer window equals the inner viewport
+    // (<https://drafts.csswg.org/cssom-view/#dom-window-outerwidth>).
+    globals.set("outerWidth", f64::from(crate::engine::VIEWPORT_WIDTH))?;
+    globals.set("outerHeight", f64::from(crate::engine::VIEWPORT_HEIGHT))?;
     globals.set(
         "__tb_new_custom_event",
         rquickjs::prelude::Func::from(events::construct_custom_event),
@@ -339,10 +343,7 @@ pub(super) fn webdriver_element(ctx: Ctx<'_>, remote_id: f64) -> Result<Value<'_
     // Only a live, connected element is a valid element reference.
     let valid = world.borrow().document(node).is_some_and(|parsed| {
         parsed.dom.is_connected(node)
-            && matches!(
-                parsed.dom.kind(node),
-                Some(NodeKind::Element { .. })
-            )
+            && matches!(parsed.dom.kind(node), Some(NodeKind::Element { .. }))
     });
     if !valid {
         return Ok(Value::new_null(ctx));
@@ -357,10 +358,6 @@ pub(super) fn webdriver_element(ctx: Ctx<'_>, remote_id: f64) -> Result<Value<'_
 /// exist so `WebDriver` input targeting (`getClientRects`,
 /// `elementsFromPoint`, `scrollIntoView`) has coherent, unique geometry.
 /// Tests that assert real layout values still fail.
-const VIRTUAL_VIEWPORT_WIDTH: f64 = 800.0;
-
-const VIRTUAL_VIEWPORT_HEIGHT: f64 = 600.0;
-
 const VIRTUAL_CELL: f64 = 10.0;
 
 const VIRTUAL_COLUMNS: f64 = 80.0;
@@ -477,10 +474,7 @@ pub(crate) fn wrap_node<'js>(ctx: &Ctx<'js>, id: NodeId) -> Result<Value<'js>> {
 
 /// Publishes `parsed` as a new document of this realm's world and wraps its
 /// root.
-pub(super) fn wrap_new_document<'js>(
-    ctx: &Ctx<'js>,
-    parsed: crate::Parsed,
-) -> Result<Value<'js>> {
+pub(super) fn wrap_new_document<'js>(ctx: &Ctx<'js>, parsed: crate::Parsed) -> Result<Value<'js>> {
     let world_rc = world(ctx)?;
     let root = world_rc.borrow_mut().add_document(parsed);
     let registry = world_rc.borrow().registry();
@@ -1396,10 +1390,7 @@ fn collect_by_class(dom: &dom::Dom, scope: NodeId, names: &str) -> Vec<NodeId> {
 }
 
 pub(super) fn is_element(dom: &dom::Dom, id: NodeId) -> bool {
-    matches!(
-        dom.kind(id),
-        Some(NodeKind::Element { .. })
-    )
+    matches!(dom.kind(id), Some(NodeKind::Element { .. }))
 }
 
 /// Whether `name` is an element in the HTML namespace with local name

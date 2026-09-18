@@ -21,6 +21,7 @@ from wptrunner.executors import executor_kwargs as base_executor_kwargs
 from wptrunner.executors.executorwebdriver import (
     WebDriverCrashtestExecutor,
     WebDriverProtocol,
+    WebDriverRefTestExecutor,
     WebDriverTestharnessExecutor,
 )
 from wptrunner.products import Product
@@ -32,6 +33,7 @@ __wptrunner__ = {
     "executor": {
         "testharness": "TinyBrowserTestharnessExecutor",
         "crashtest": "TinyBrowserCrashtestExecutor",
+        "reftest": "TinyBrowserRefTestExecutor",
         # test262 tests are served as generated .test262.html wrappers that
         # report through testharness.js; Test262Test subclasses TestharnessTest
         # (wptrunner/wpttest.py), so the testharness executor drives them too.
@@ -147,5 +149,16 @@ class TinyBrowserTestharnessExecutor(WebDriverTestharnessExecutor):
 
 class TinyBrowserCrashtestExecutor(WebDriverCrashtestExecutor):
     """Crashtests only need the page to load and settle without dying."""
+
+    protocol_cls = TinyBrowserProtocol
+
+
+class TinyBrowserRefTestExecutor(WebDriverRefTestExecutor):
+    """Reftests compare the screenshot against the test's reference image.
+
+    The engine has no window chrome, so the outer window equals the inner
+    viewport; the virtual window rectangle is accepted but the render size
+    stays the shared 800x600 viewport.
+    """
 
     protocol_cls = TinyBrowserProtocol

@@ -111,6 +111,7 @@ pub(in crate::document) fn request(dial: &QueuedDial) -> DialRequest {
     let kind = match dial.context {
         DialContext::JsFetch { .. } => DialKind::JsFetch,
         DialContext::ClassicScript { .. } => DialKind::ClassicScript,
+        DialContext::Stylesheet { .. } => DialKind::Stylesheet,
         DialContext::FrameLoad { .. } => DialKind::FrameLoad,
     };
     DialRequest {

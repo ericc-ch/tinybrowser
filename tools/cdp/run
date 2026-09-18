@@ -11,6 +11,6 @@ fi
 
 cd "$ROOT"
 cargo build -q --offline 2>/dev/null || cargo build -q
-export TINYBROWSER_BIN="$ROOT/target/debug/tinybrowser"
+export TINYBROWSER_BIN="$("$ROOT/tools/bin")"
 node --test "$ROOT/tools/cdp/runner.test.mjs"
 exec node --experimental-vm-modules "$ROOT/tools/cdp/runner.mjs" "$@"
