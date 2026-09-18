@@ -9,10 +9,11 @@
 //!
 //! ```text
 //! main → {browser, cdp, webdriver}
-//!        cdp → {browser, axum}
-//!        webdriver → {browser, axum}
+//!        cdp → {browser, server}
+//!        webdriver → {browser, server}
 //!        browser → {net, renderer}
-//!        renderer → {dom}
+//!        renderer → {dom, render}
+//!        render → {dom}
 //! ```
 
 pub use browser::{

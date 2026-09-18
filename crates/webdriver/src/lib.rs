@@ -17,18 +17,10 @@ use browser::{
     BrowserHandle, CookieRecord, CookieSameSite, RemoteValue, ScreenshotRequest, ScriptFailure,
     TabError, TabHandle,
 };
-use bytes::Bytes;
-use http::{HeaderValue, StatusCode, header};
-use http_body_util::{BodyExt as _, Full};
-use hyper::body::Incoming;
-use hyper::service::service_fn;
-use hyper::{Request, Response};
-use hyper_util::rt::{TokioExecutor, TokioIo};
-use hyper_util::server::conn::auto::Builder;
+use http::StatusCode;
 use serde_json::{Value, json};
+use server::{Request, Response, Shutdown};
 use tokio::sync::Mutex;
-
-pub use browser::AgentBuilder;
 
 /// Virtual viewport for screenshots, matching the renderer's `innerWidth`.
 const VIEWPORT_WIDTH: f32 = 800.0;
@@ -46,42 +38,15 @@ const DEFAULT_PAGE_LOAD_TIMEOUT: Duration = Duration::from_secs(300);
 /// # Errors
 ///
 /// Returns when the listener cannot be converted or serving fails.
-pub async fn serve(listener: &TcpListener, browser: BrowserHandle) -> std::io::Result<()> {
-    let std_listener = listener.try_clone()?;
-    std_listener.set_nonblocking(true)?;
+pub async fn serve(listener: &TcpListener, browser: &BrowserHandle) -> std::io::Result<()> {
     let sessions = Arc::new(Mutex::new(Sessions {
-        browser,
+        browser: browser.clone(),
         next_session: 0,
         next_window: 0,
         open: HashMap::new(),
     }));
-    let listener = tokio::net::TcpListener::from_std(std_listener)?;
     let state = AppState { sessions };
-    loop {
-        let (stream, _) = match listener.accept().await {
-            Ok(accepted) => accepted,
-            Err(error) => {
-                // axum retried transient accept failures (EMFILE and friends)
-                // instead of dropping the listener; mirror that with backoff.
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                let _ = error;
-                continue;
-            }
-        };
-        let state = state.clone();
-        tokio::spawn(async move {
-            let service = service_fn(move |request| {
-                let state = state.clone();
-                async move { Ok::<_, std::convert::Infallible>(serve_request(request, state).await) }
-            });
-            let mut auto = Builder::new(TokioExecutor::new());
-            // CONNECT protocol for HTTP/2 websockets; the old axum build was
-            // h1-only, so this widens the loopback listener.
-            auto.http2().enable_connect_protocol();
-            let connection = auto.serve_connection_with_upgrades(TokioIo::new(stream), service);
-            let _result = connection.await;
-        });
-    }
+    server::serve(listener, Shutdown::new(), state, serve_request).await
 }
 
 #[derive(Clone)]
@@ -89,52 +54,25 @@ struct AppState {
     sessions: Arc<Mutex<Sessions>>,
 }
 
-/// Axum's `Bytes` extractor caps bodies at 2 MiB while reading; the same cap
-/// is enforced during collection here.
+/// The body cap the served endpoints accept before answering 413.
 const MAX_BODY_BYTES: usize = 2 * 1024 * 1024;
 
-async fn serve_request(request: Request<Incoming>, state: AppState) -> Response<Full<Bytes>> {
+async fn serve_request(request: Request, state: AppState) -> Response {
     let method = request.method().as_str().to_owned();
     let path = request.uri().path().to_owned();
-    let limited = http_body_util::Limited::new(request.into_body(), MAX_BODY_BYTES);
-    let body = match limited.collect().await {
-        Ok(collected) => collected.to_bytes(),
-        Err(error) => {
-            if error
-                .downcast_ref::<http_body_util::LengthLimitError>()
-                .is_some()
-            {
-                return status_response(StatusCode::PAYLOAD_TOO_LARGE, "request body too large");
-            }
-            return status_response(StatusCode::BAD_REQUEST, "invalid request body");
+    let body = match server::read_body(request.into_body(), MAX_BODY_BYTES).await {
+        Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+        Err(server::BodyError::TooLarge) => {
+            return server::text(StatusCode::PAYLOAD_TOO_LARGE, "request body too large");
+        }
+        Err(server::BodyError::Read) => {
+            return server::text(StatusCode::BAD_REQUEST, "invalid request body");
         }
     };
-    let body = String::from_utf8_lossy(&body).into_owned();
     let mut sessions = state.sessions.lock().await;
     let (status, payload) = dispatch(&method, &path, &body, &mut sessions).await;
     let status = StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-    json_response(status, &payload)
-}
-
-fn status_response(status: StatusCode, message: &'static str) -> Response<Full<Bytes>> {
-    let mut response = Response::new(Full::new(Bytes::from(message)));
-    *response.status_mut() = status;
-    response.headers_mut().insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static("text/plain; charset=utf-8"),
-    );
-    response
-}
-
-fn json_response(status: StatusCode, payload: &Value) -> Response<Full<Bytes>> {
-    let mut response = Response::new(Full::new(Bytes::from(payload.to_string())));
-    *response.status_mut() = status;
-    // W3C WebDriver JSON is UTF-8; the charset is part of the wire surface.
-    response.headers_mut().insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static("application/json; charset=utf-8"),
-    );
-    response
+    server::json(status, &payload)
 }
 
 struct Sessions {

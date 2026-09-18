@@ -14,7 +14,7 @@ use std::net::TcpListener;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use browser::{AgentBuilder, Browser, NetworkSession, Profile, ProfileStore};
+use browser::{AgentBuilder, Browser, Profile};
 use cli::{Cli, Command};
 use logging::{Config, Level, Logger};
 
@@ -163,15 +163,8 @@ async fn serve_webdriver(port: u16, builder: AgentBuilder, profile: &Profile) ->
     let data_home = daemon::data_home()?;
     let listener = TcpListener::bind(("127.0.0.1", port))
         .map_err(|error| io::Error::new(error.kind(), format!("bind failed: {error}")))?;
-    let network = match ProfileStore::open_in(&data_home, profile)
-        .and_then(|store| NetworkSession::from_builder(builder, store))
-    {
-        Ok(network) => network,
-        Err(error) => {
-            return Err(io::Error::other(format!("profile failed: {error}")));
-        }
-    };
-    let browser = Browser::open_with_network(network)?;
-    let result = webdriver::serve(&listener, browser.handle()).await;
+    let browser = Browser::open_in_with(&data_home, profile, builder)
+        .map_err(|error| io::Error::other(format!("profile failed: {error}")))?;
+    let result = webdriver::serve(&listener, &browser.handle()).await;
     result.and(browser.handle().close().await)
 }
