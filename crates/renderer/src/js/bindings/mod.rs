@@ -186,6 +186,10 @@ pub(crate) fn install(ctx: &Ctx<'_>, world: &Rc<RefCell<World>>) -> Result<()> {
     install_webdriver_bridge(ctx, &globals)?;
     globals.set("innerWidth", f64::from(crate::engine::VIEWPORT_WIDTH))?;
     globals.set("innerHeight", f64::from(crate::engine::VIEWPORT_HEIGHT))?;
+    // No browser chrome exists, so the outer window equals the inner viewport
+    // (<https://drafts.csswg.org/cssom-view/#dom-window-outerwidth>).
+    globals.set("outerWidth", f64::from(crate::engine::VIEWPORT_WIDTH))?;
+    globals.set("outerHeight", f64::from(crate::engine::VIEWPORT_HEIGHT))?;
     globals.set(
         "__tb_new_custom_event",
         rquickjs::prelude::Func::from(events::construct_custom_event),

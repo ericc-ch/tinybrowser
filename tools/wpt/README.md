@@ -8,6 +8,7 @@ passes `--resolve` maps instead of editing `/etc/hosts`.
 ```sh
 nix develop --command ./tools/wpt/run dom/events/ --exclude=worker
 nix develop --command ./tools/wpt/score dom/nodes/ -- --processes 4
+nix develop --command ./tools/wpt/score css/css-color/ -- --test-types reftest --processes 4
 ```
 
 `--exclude=worker` also skips Worker variants (`.any.worker.html`, `.worker.html`), not only URL prefix `/worker`. Those tests are omitted, not run to a fail. Prove the filter with `python3 tools/wpt/launch.py --selftest`.
@@ -49,6 +50,7 @@ In `docs/progress.md`, replace the latest total and scored groups only.
 |---|---|
 | testharness | Multiple windows and same-site frames. |
 | crashtest | Page must load and settle without killing the renderer. |
+| reftest | Screenshot comparison through the WebDriver screenshot route; the engine has no chrome, so the outer window equals the inner 800x600 viewport. |
 | HTTPS | `--ssl-type=openssl`; the generated CA is passed as `--tls-ca`. The same connector carries WSS, but no WSS test has been run yet. |
 | testdriver | `supports_testdriver = True`; click, send keys, cookies, window rect. |
 | Parallel processes | `--processes N` (each process gets its own browser and ports). |
@@ -65,10 +67,10 @@ These are visible in runs and fail honestly; they are not harness restrictions.
 
 ## Test types without an executor
 
-`reftest`, `print-reftest`, and `wdspec` are not registered for this product,
-so `wpt run` reports an unsupported test type and runs nothing for them.
-Reftests need layout and rendering; wdspec needs pytest plus a wider WebDriver
-command surface (element properties, frames, actions, screenshots).
+`print-reftest` and `wdspec` are not registered for this product, so `wpt run`
+reports an unsupported test type and runs nothing for them. `wdspec` needs
+pytest plus a wider WebDriver command surface (element properties, frames,
+actions, screenshots).
 
 ## Conventions
 

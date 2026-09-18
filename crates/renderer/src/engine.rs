@@ -48,8 +48,9 @@ fn collect_stylesheets(dom: &dom::Dom, document: &Document) -> Vec<String> {
                         }
                     }
                 }
+                let css = strip_cdata(&css);
                 if !css.trim().is_empty() {
-                    sheets.push(css);
+                    sheets.push(css.to_owned());
                 }
             }
             "link" => {
@@ -68,6 +69,19 @@ fn collect_stylesheets(dom: &dom::Dom, document: &Document) -> Vec<String> {
         }
     }
     sheets
+}
+
+/// Strips the `<![CDATA[` / `]]>` wrapper a `<style>` element carries when
+/// the document is XML-flavored (WPT serves `.xht` as
+/// `application/xhtml+xml`). In the XML tree those markers delimit a CDATA
+/// section, so they are not part of the CSS; without an XML parser they
+/// arrive inside the raw text.
+fn strip_cdata(css: &str) -> &str {
+    let trimmed = css.trim();
+    trimmed
+        .strip_prefix("<![CDATA[")
+        .and_then(|rest| rest.strip_suffix("]]>"))
+        .unwrap_or(css)
 }
 use crate::documents::DocumentStore;
 use crate::js::{DocumentStreamCommand, FrameNavigation, RealmRegistry, SharedJsRuntime};

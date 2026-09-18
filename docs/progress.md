@@ -20,7 +20,7 @@ WPT has many test groups (html, css, dom, and more). Each percentage is the pass
 
 The total percentage is the pass count over all WPT. Total stays unscored until a real all-WPT score exists.
 
-Slices, not full-group percentages: html5lib (`html/syntax/parsing/html5lib_*.html`, 173 as expected on 2026-09-15) and `dom/events/`.
+Slices, not full-group percentages: html5lib (`html/syntax/parsing/html5lib_*.html`, 173 as expected on 2026-09-15), `dom/events/`, and the CSS reftest slice `css/css-color/` (266/307 on 2026-09-18 with `--test-types reftest`).
 
 ```sh
 nix develop --command ./tools/wpt/score <directory> -- --exclude=worker

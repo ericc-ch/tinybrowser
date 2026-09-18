@@ -103,32 +103,33 @@ fn map_box_model(values: &ComputedValues, style: &mut Style) {
         map_padding(&padding.padding_left),
     );
 
-    style.color = map_absolute(values.get_inherited_text().color);
+    let current_color = values.get_inherited_text().color;
+    style.color = map_absolute(current_color);
     let border = values.get_border();
     style.border = Edges::new(
         map_border_side(
             &border.border_top_width,
             border.border_top_style,
             &border.border_top_color,
-            style.color,
+            current_color,
         ),
         map_border_side(
             &border.border_right_width,
             border.border_right_style,
             &border.border_right_color,
-            style.color,
+            current_color,
         ),
         map_border_side(
             &border.border_bottom_width,
             border.border_bottom_style,
             &border.border_bottom_color,
-            style.color,
+            current_color,
         ),
         map_border_side(
             &border.border_left_width,
             border.border_left_style,
             &border.border_left_color,
-            style.color,
+            current_color,
         ),
     );
     style.box_sizing = match position.box_sizing {
@@ -160,7 +161,7 @@ fn map_box_model(values: &ComputedValues, style: &mut Style) {
         ComputedClear::None => Clear::None,
     };
     style.background =
-        map_color(&values.get_background().background_color, Color::TRANSPARENT);
+        map_color(&values.get_background().background_color, current_color);
 }
 
 /// Maps fonts, text, and inherited paint: the properties paint and Parley
@@ -348,12 +349,13 @@ fn map_padding(padding: &style::values::computed::NonNegativeLengthPercentage) -
     map_length_percentage(&padding.0).unwrap_or(Length::Px(0.0))
 }
 
-/// Maps one border side; unitless color keywords resolve against `current`.
+/// Maps one border side; keyword colors resolve against the element's own
+/// `color`.
 fn map_border_side(
     width: &style::values::computed::BorderSideWidth,
     style: style::values::computed::BorderStyle,
     color: &style::values::computed::Color,
-    current: Color,
+    current: style::color::AbsoluteColor,
 ) -> BorderSide {
     BorderSide {
         width: width.0.to_f32_px(),
@@ -559,14 +561,11 @@ fn map_length_percentage(length: &LengthPercentage) -> Option<Length> {
     }
 }
 
-/// Maps a computed color; unresolvable functions fall back per property.
-fn map_color(color: &style::values::computed::Color, fallback: Color) -> Color {
-    match color {
-        style::values::computed::Color::Absolute(absolute) => map_absolute(*absolute),
-        // `currentcolor` on non-`color` properties means the element's color,
-        // which the caller passes as the fallback.
-        _ => fallback,
-    }
+/// Maps a computed color, resolving `currentcolor`, `color-mix()`, relative
+/// color syntax, and `contrast-color()` against the element's own `color`
+/// (<https://drafts.csswg.org/css-color-5/#resolving-color-values>).
+fn map_color(color: &style::values::computed::Color, current: style::color::AbsoluteColor) -> Color {
+    map_absolute(color.resolve_to_absolute(&current))
 }
 
 /// Converts one absolute color through legacy sRGB into our RGBA bytes.

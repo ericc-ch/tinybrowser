@@ -2,11 +2,13 @@
 
 State: branch `chase/screenshot`, rebased onto `chase/size-flags`. The size
 slice underneath brought the hand-rolled CLI (no clap), hyper-direct servers
-(no axum), and linker/C-flag knobs; this branch adds the Stylo cascade.
-Gates on this tree: `tools/ub lint` (clippy, workspace, all targets), `cargo
-test --workspace` (32 suites), `tools/playwright/run` (7 passed), and release
-binary **9,416,800 bytes** (583 KB under the cap). Screenshots ride CDP
-`Page.captureScreenshot` and WebDriver `GET /session/{id}/screenshot`.
+(no axum), and linker/C-flag knobs; this branch adds the Stylo cascade and
+the WPT reftest executor. Gates on this tree: `tools/ub lint` (clippy,
+workspace, all targets), `cargo test --workspace` (32 suites),
+`tools/playwright/run` (7 passed), `tools/wpt/score css/css-color/ --
+--test-types reftest` (266/307), and release binary **9,416,736 bytes**
+(583 KB under the cap). Screenshots ride CDP `Page.captureScreenshot` and
+WebDriver `GET /session/{id}/screenshot`.
 
 ## What shipped
 
@@ -22,6 +24,16 @@ binary **9,416,800 bytes** (583 KB under the cap). Screenshots ride CDP
 - **`dom`**: the selector engine (`crates/dom/src/select.rs`, `cssparser` +
   `selectors`) now serves only the JS `querySelector`/`matches` bindings; the
   render cascade no longer uses it.
+- **WPT**: the product registers a `reftest` executor
+  (`tools/wpt/tinybrowser_wpt.py`), so CSS reftests compare screenshots
+  through WebDriver. Two renderer fixes came out of the first run:
+  `stylo_map` resolves `currentcolor`, `color-mix()`, relative color syntax,
+  and `contrast-color()` against the element's own color
+  (<https://drafts.csswg.org/css-color-5/#resolving-color-values>), and
+  `collect_stylesheets` strips the `<![CDATA[` / `]]>` wrapper of XHTML
+  `<style>` elements (WPT serves `.xht` as XML). The JS globals gained
+  `outerWidth`/`outerHeight` (no chrome, so they equal the 800x600 viewport),
+  which the reftest executor reads.
 - **IPC**: `Command::Screenshot { frame, request }` and `Reply::Screenshot`;
   the PNG streams browser-ward as bounded body frames on the same request id
   (no base64 through the control plane). `PROTOCOL_VERSION` is 4. The three
@@ -50,7 +62,8 @@ binary **9,416,800 bytes** (583 KB under the cap). Screenshots ride CDP
 ## Limits (deliberate, documented in the crate)
 
 No images, no tables, no complex-script verification yet (shaping runs, but
-only Latin coverage is tested), text does not wrap around floats yet, no
+only Latin coverage is tested), no `@font-face` web fonts (the embedded
+subset is the only family), text does not wrap around floats yet, no
 per-element or `fullPage` layout metrics (`contentSize` reports the
 viewport), no device scale factor. Screenshots capture the viewport at
 800x600 unless the caller's clip asks for a larger one.
@@ -60,14 +73,20 @@ box tree, Taffy, Parley, and paint implement.
 
 ## Next, in order
 
-1. CSS conformance: run a WPT `css/` group to measure the Stylo cascade, and
-   fold the misses into the `stylo_map` subset notes.
-2. Images: PNG decode via the `png` crate (already shipped) painted into
-   `LayoutBox` replaced boxes; JPEG later.
-3. `border-radius`/opacity, then more CSS as real fixtures demand.
-4. `Page.getLayoutMetrics.contentSize` from the real layout height so
+1. `opacity` (paint layers): the biggest `css/css-color` cluster (~11 tests)
+   and the base for filters and stacking contexts later.
+2. CSS conformance: widen the reftest baseline (`css/css-backgrounds/`,
+   `css/css-display/`, `css/css-text/`) and fix clusters as they appear.
+   Known color clusters: out-of-gamut clamping (`lch-009/010`,
+   `oklch-009/010`), `hsla()` compositing, `@color-profile`, `color-mix()`.
+3. Web fonts (`@font-face`): WPT text reftests rely on the Ahem test font,
+   which is a `@font-face` resource today never fetched or registered.
+4. Images: PNG decode painted into `LayoutBox` replaced boxes; JPEG later.
+5. `border-radius`/gradients/stacking order, then more CSS as real fixtures
+   demand.
+6. `Page.getLayoutMetrics.contentSize` from the real layout height so
    `fullPage` screenshots capture the document.
-5. Element screenshots (`Page.captureScreenshot` with a node clip) once
+7. Element screenshots (`Page.captureScreenshot` with a node clip) once
    layout rects are queryable through the protocol.
 
 ## Gotchas
@@ -83,4 +102,9 @@ box tree, Taffy, Parley, and paint implement.
   notice, which this repo does not carry yet.
 - Stylo gates `display: grid` behind `layout.grid.enabled`; the cascade sets
   that pref (and `layout.unimplemented`) before building the `Stylist`.
+- Reftests run at the fixed 800x600 virtual viewport: the engine has no
+  chrome, so `outerWidth`/`outerHeight` equal the inner size and
+  `set window rect` only moves the stored rectangle.
+- `.xht` pages are parsed as HTML; `collect_stylesheets` strips the CDATA
+  wrapper so their `<style>` text still parses.
 
