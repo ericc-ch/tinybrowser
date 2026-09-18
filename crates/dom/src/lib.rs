@@ -36,4 +36,4 @@ pub use node::{
     html_qualified_name_eq, qualified_name_eq, svg_namespace, xlink_namespace, xml_namespace,
     xmlns_namespace,
 };
-pub use select::{CompiledSelectors, ParseFail, ParseFailKind, SelectError};
+pub use select::{ParseFail, ParseFailKind, SelectError};

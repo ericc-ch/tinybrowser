@@ -1318,43 +1318,6 @@ impl Dom {
         Ok(())
     }
 
-    /// Sets the attribute `name` on element `id`, replacing an attribute with
-    /// the same qualified name.
-    ///
-    /// [DOM setAttributeNS](https://dom.spec.whatwg.org/#dom-element-setattributens)
-    ///
-    /// # Errors
-    ///
-    /// - [`DomError::StaleNode`] if `id` is stale.
-    /// - [`DomError::WrongNodeType`] if `id` is not an element.
-    pub fn set_attribute_named(
-        &mut self,
-        id: NodeId,
-        name: QualName,
-        value: impl Into<String>,
-    ) -> Result<(), DomError> {
-        let value = value.into();
-        let recorded_name = name.local.to_string();
-        let recorded_namespace = name.ns.to_string();
-        let (_, attributes) = self.element_mut(id)?;
-        let index = attributes
-            .iter()
-            .position(|attribute| attribute.name == name);
-        let old_value = if let Some(index) = index {
-            Some(std::mem::replace(&mut attributes[index].value, value))
-        } else {
-            attributes.push(Attribute { name, value });
-            None
-        };
-        self.record(Mutation::Attributes {
-            target: id,
-            name: recorded_name,
-            namespace: recorded_namespace,
-            old_value,
-        });
-        Ok(())
-    }
-
     /// Sets the unnamespaced attribute `local` on element `id`, replacing a
     /// same-name attribute if one exists.
     ///

@@ -8,7 +8,7 @@ workspace, all targets), `cargo test --workspace` (the workspace suite is green)
 `tools/playwright/run` (7 passed), `tools/wpt/score css/css-color/ --
 --test-types reftest` (266/307), `tools/ub valgrind render` (0 errors; the
 only leaks are Stylo's intentionally leaked thread-local caches), and release
-binary **9,530,768 bytes** (469 KB under the cap). Screenshots ride CDP
+binary **9,530,704 bytes** (469 KB under the cap). Screenshots ride CDP
 `Page.captureScreenshot` and WebDriver `GET /session/{id}/screenshot`.
 
 ## What shipped
