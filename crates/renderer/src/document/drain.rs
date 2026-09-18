@@ -124,6 +124,7 @@ impl Document {
             Task::DialFinished(done) => self.finish_dial(done),
             Task::DialFailed(fail) => self.fail_dial(fail),
             Task::WindowMessage(message) => self.deliver_window_message(&message),
+            Task::StorageEvent(event) => self.deliver_storage_event(&event),
             Task::PortMessage {
                 endpoint,
                 payload,

@@ -2001,6 +2001,221 @@ Object.defineProperty(globalThis, 'top', {
   }
 })();
 
+// ── web storage ─────────────────────────────────────────────────────────
+// `localStorage` and `sessionStorage` are one interface over two areas: the
+// browser process owns the local area (shared by every tab, persisted with
+// the profile), the engine owns the session area (one per top-level browsing
+// context). Items are named properties per the legacy platform-object rules:
+// a stored item is hidden by a member of the prototype chain, and every
+// string-keyed write stores
+// (<https://html.spec.whatwg.org/multipage/webstorage.html#the-storage-interface>,
+// <https://webidl.spec.whatwg.org/#legacy-platform-object>).
+(function() {
+  const kindSlot = Symbol('storageKind');
+  const holders = new Map();
+
+  function kindOf(storage) {
+    const kind = storage == null ? undefined : storage[kindSlot];
+    if (kind !== 'local' && kind !== 'session') {
+      throw new TypeError('Illegal invocation');
+    }
+    return kind;
+  }
+
+  const quotaError = key => new globalThis.QuotaExceededError(
+    "Failed to execute 'setItem' on 'Storage': Setting the value of '" + key +
+    "' exceeded the quota.");
+
+  // JavaScript strings may hold lone surrogates; DOMString preserves them but
+  // the UTF-8 host seam cannot. JSON escaping round-trips them exactly
+  // (<https://webidl.spec.whatwg.org/#idl-DOMString>).
+  const encode = value => JSON.stringify(value);
+  const decode = value => (value === null || value === undefined ? null : JSON.parse(value));
+
+  // https://storage.spec.whatwg.org/#quotaexceedederror
+  globalThis.QuotaExceededError = class QuotaExceededError extends globalThis.DOMException {
+    constructor(message = '') {
+      super(message, 'QuotaExceededError');
+    }
+  };
+  Object.defineProperty(globalThis.QuotaExceededError.prototype, Symbol.toStringTag, {
+    value: 'QuotaExceededError', writable: false, enumerable: false, configurable: true,
+  });
+
+  class Storage {
+    constructor(kind) {
+      Object.defineProperty(this, kindSlot, {
+        value: kind, writable: false, enumerable: false, configurable: false,
+      });
+    }
+    get length() {
+      return __tbStorageKeys(kindOf(this)).length;
+    }
+    key(index) {
+      if (arguments.length < 1) {
+        throw new TypeError("Failed to execute 'key' on 'Storage': 1 argument required, but only 0 present.");
+      }
+      const keys = __tbStorageKeys(kindOf(this));
+      const n = Number(index) >>> 0;
+      return n < keys.length ? decode(keys[n]) : null;
+    }
+    getItem(key) {
+      if (arguments.length < 1) {
+        throw new TypeError("Failed to execute 'getItem' on 'Storage': 1 argument required, but only 0 present.");
+      }
+      const item = __tbStorageGet(kindOf(this), encode(String(key)));
+      return item === undefined ? null : decode(item);
+    }
+    setItem(key, value) {
+      if (arguments.length < 2) {
+        throw new TypeError("Failed to execute 'setItem' on 'Storage': 2 arguments required.");
+      }
+      key = String(key);
+      if (!__tbStorageSet(kindOf(this), encode(key), encode(String(value)))) {
+        throw quotaError(key);
+      }
+    }
+    removeItem(key) {
+      if (arguments.length < 1) {
+        throw new TypeError("Failed to execute 'removeItem' on 'Storage': 1 argument required, but only 0 present.");
+      }
+      __tbStorageRemove(kindOf(this), encode(String(key)));
+    }
+    clear() {
+      __tbStorageClear(kindOf(this));
+    }
+  }
+  globalThis.Storage = Storage;
+  Object.defineProperty(Storage.prototype, Symbol.toStringTag, {
+    value: 'Storage', writable: false, enumerable: false, configurable: true,
+  });
+
+  function area(kind) {
+    const existing = holders.get(kind);
+    if (existing !== undefined) return existing;
+    const origin = __tbStorageOrigin();
+    if (origin === null || origin === undefined) {
+      throw new globalThis.DOMException(
+        "Failed to read the '" + (kind === 'session' ? 'sessionStorage' : 'localStorage') +
+        "' property from 'Window': Storage is unavailable for opaque origins.", 'SecurityError');
+    }
+    const target = new Storage(kind);
+    const handler = {
+      get(t, property, receiver) {
+        if (typeof property === 'symbol' || property in t) {
+          return Reflect.get(t, property, receiver);
+        }
+        const item = __tbStorageGet(kind, encode(property));
+        return item === null || item === undefined ? undefined : decode(item);
+      },
+      set(t, property, value) {
+        if (typeof property === 'symbol') return Reflect.set(t, property, value);
+        if (!__tbStorageSet(kind, encode(property), encode(String(value)))) {
+          throw quotaError(property);
+        }
+        return true;
+      },
+      has(t, property) {
+        if (typeof property === 'symbol' || property in t) return true;
+        const item = __tbStorageGet(kind, encode(property));
+        return item !== null && item !== undefined;
+      },
+      deleteProperty(t, property) {
+        if (typeof property === 'symbol') return Reflect.deleteProperty(t, property);
+        __tbStorageRemove(kind, encode(property));
+        return true;
+      },
+      defineProperty(t, property, descriptor) {
+        if (typeof property === 'symbol') return Reflect.defineProperty(t, property, descriptor);
+        const value = 'value' in descriptor ? String(descriptor.value) : 'undefined';
+        if (!__tbStorageSet(kind, encode(property), encode(value))) throw quotaError(property);
+        return true;
+      },
+      getOwnPropertyDescriptor(t, property) {
+        if (typeof property === 'symbol') return Reflect.getOwnPropertyDescriptor(t, property);
+        if (property in t) return undefined;
+        const item = __tbStorageGet(kind, encode(property));
+        if (item === null || item === undefined) return undefined;
+        return { value: decode(item), writable: true, enumerable: true, configurable: true };
+      },
+      ownKeys(t) {
+        const names = __tbStorageKeys(kind).map(decode).filter(key => !(key in t));
+        return Reflect.ownKeys(t).concat(names);
+      },
+    };
+    const proxy = new Proxy(target, handler);
+    holders.set(kind, proxy);
+    return proxy;
+  }
+
+  // https://html.spec.whatwg.org/multipage/webstorage.html#the-storageevent-interface
+  const eventData = Symbol.for('tinybrowser.storageevent.data');
+  function dataOf(event) {
+    const data = event == null ? undefined : event[eventData];
+    if (data === undefined) throw new TypeError('Illegal invocation');
+    return data;
+  }
+  function nullableString(value) {
+    return value === undefined || value === null ? null : String(value);
+  }
+  globalThis.StorageEvent = class StorageEvent extends Event {
+    constructor(type, init = undefined) {
+      if (arguments.length < 1) {
+        throw new TypeError("Failed to construct 'StorageEvent': 1 argument required, but only 0 present.");
+      }
+      const eventInit = init === undefined ? {} : Object(init);
+      super(String(type), eventInit);
+      Object.defineProperty(this, eventData, {
+        value: {
+          key: nullableString(eventInit.key),
+          oldValue: nullableString(eventInit.oldValue),
+          newValue: nullableString(eventInit.newValue),
+          url: eventInit.url === undefined ? '' : String(eventInit.url),
+          storageArea: eventInit.storageArea === undefined ? null : eventInit.storageArea,
+        },
+        writable: false, enumerable: false, configurable: false,
+      });
+    }
+    get key() { return dataOf(this).key; }
+    get oldValue() { return dataOf(this).oldValue; }
+    get newValue() { return dataOf(this).newValue; }
+    get url() { return dataOf(this).url; }
+    get storageArea() { return dataOf(this).storageArea; }
+    initStorageEvent(type, bubbles = false, cancelable = false, key = null, oldValue = null, newValue = null, url = '', storageArea = null) {
+      if (arguments.length < 1) {
+        throw new TypeError("Failed to execute 'initStorageEvent' on 'StorageEvent': 1 argument required, but only 0 present.");
+      }
+      Event.prototype.initEvent.call(this, String(type), Boolean(bubbles), Boolean(cancelable));
+      const data = dataOf(this);
+      data.key = key === null ? null : String(key);
+      data.oldValue = oldValue === null ? null : String(oldValue);
+      data.newValue = newValue === null ? null : String(newValue);
+      data.url = String(url);
+      data.storageArea = storageArea;
+    }
+  };
+  Object.defineProperty(globalThis.StorageEvent.prototype, Symbol.toStringTag, {
+    value: 'StorageEvent', writable: false, enumerable: false, configurable: true,
+  });
+
+  /// Fires one storage event in this realm, with this realm's area as
+  /// `storageArea`
+  /// (<https://html.spec.whatwg.org/multipage/webstorage.html#concept-storage-broadcast>).
+  globalThis.__tbFireStorageEvent = function(kind, key, oldValue, newValue, url) {
+    globalThis.__tbDispatchTrusted(new globalThis.StorageEvent('storage', {
+      key: decode(key), oldValue: decode(oldValue), newValue: decode(newValue),
+      url: url, storageArea: area(kind),
+    }));
+  };
+
+  Object.defineProperty(globalThis, 'localStorage', {
+    get() { return area('local'); }, configurable: true,
+  });
+  Object.defineProperty(globalThis, 'sessionStorage', {
+    get() { return area('session'); }, configurable: true,
+  });
+})();
+
 // Platform objects and globals are not serializable; the marker travels with
 // the prototype, so it identifies an object from another realm too
 // (<https://html.spec.whatwg.org/multipage/structured-data.html#serializable-objects>).
@@ -2012,6 +2227,7 @@ Object.defineProperty(globalThis, 'top', {
     'Request', 'Response', 'Blob', 'File', 'FileList', 'FileReader', 'ProgressEvent',
     'ReadableStream', 'TextDecoder', 'TextEncoder', 'URL', 'URLSearchParams',
     'AbortController', 'AbortSignal', 'CustomEvent', 'Document',
+    'Storage', 'StorageEvent', 'QuotaExceededError',
   ];
   for (const name of names) {
     const ctor = globalThis[name];

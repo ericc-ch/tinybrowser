@@ -1495,6 +1495,44 @@ mod realm_tests {
         }
 
         fn set_cookie(&self, _value: &str, _url: &Url) {}
+
+        fn storage_get(&self, _origin: &str, _key: &str) -> Option<String> {
+            None
+        }
+
+        fn storage_keys(&self, _origin: &str) -> Vec<String> {
+            Vec::new()
+        }
+
+        fn storage_set(
+            &self,
+            _origin: &str,
+            _url: &str,
+            _key: &str,
+            _value: &str,
+            _source: FrameId,
+        ) -> Result<Option<crate::protocol::StorageChange>, crate::protocol::StorageError> {
+            Ok(None)
+        }
+
+        fn storage_remove(
+            &self,
+            _origin: &str,
+            _url: &str,
+            _key: &str,
+            _source: FrameId,
+        ) -> Option<crate::protocol::StorageChange> {
+            None
+        }
+
+        fn storage_clear(
+            &self,
+            _origin: &str,
+            _url: &str,
+            _source: FrameId,
+        ) -> Option<crate::protocol::StorageChange> {
+            None
+        }
     }
 
     fn world_with_document(
@@ -1512,6 +1550,8 @@ mod realm_tests {
             documents: Rc::clone(documents),
             registry: Rc::clone(registry),
             shared: Rc::new(RefCell::new(Shared::default())),
+            session_storage: Rc::new(RefCell::new(crate::storage::SessionStorage::default())),
+            pending_storage: Rc::new(RefCell::new(Vec::new())),
         };
         let mut world = World::new(Url::parse(url).expect("test url"), FrameId::MAIN, &runtime);
         let id = world.replace_document(crate::parse_html(html));

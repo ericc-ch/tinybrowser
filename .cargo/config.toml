@@ -7,9 +7,11 @@ RUST_TEST_THREADS = "1"
 # force, so an ambient CFLAGS still wins.
 CFLAGS = "-fno-unwind-tables -fno-asynchronous-unwind-tables"
 
-# Link-time size flags (lld, `--icf=all`, RELR, no `.eh_frame_hdr`) live in
-# `build.rs` scoped to the release binary. They only shrink the shipping
-# artifact, and keeping them off debug/test links avoids forcing LLD onto
-# DWARF rustc 1.98.1 does not always emit LLD-compatible relocations for.
-# See `docs/researches/size-budget.md`.
+# Dev and test links use GNU bfd. The pinned toolchain defaults to rust-lld,
+# which rejects a DWARF relocation rustc itself emits in some code shapes
+# (`unknown relocation (1875)`, see build.rs); bfd ignores it. The release
+# binary's size flags in build.rs select lld later on the command line, and
+# the later `-fuse-ld` wins.
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "link-arg=-fuse-ld=bfd"]
 

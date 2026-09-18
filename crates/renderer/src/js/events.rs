@@ -1222,15 +1222,12 @@ fn call_handler_attribute<'js>(
     let name = format!("on{typ}");
     let mut handler: Value = object.get(name.as_str())?;
     if handler.as_function().is_none()
-        && let Some(id) = bindings::host_node_id(ctx, &object.clone().into_value())
-        && !bindings::handler_cleared(ctx, id, &name)?
-        && let Some(body) = bindings::handler_attribute(ctx, id, &name)?
-        && !body.trim().is_empty()
+        && let Some(source) = handler_attribute_source(ctx, object, &name)?
     {
         // A handler content attribute compiles to a function whose body is
         // the attribute value and whose `this` is the object
         // (<https://html.spec.whatwg.org/multipage/webappapis.html#event-handler-content-attributes>).
-        let source = format!("(function(event) {{\n{body}\n}})");
+        let source = format!("(function(event) {{\n{source}\n}})");
         match ctx.eval::<Function, _>(source) {
             Ok(compiled) => {
                 object.set(name.as_str(), compiled.clone())?;
@@ -1252,6 +1249,43 @@ fn call_handler_attribute<'js>(
         report_exception(ctx, &error);
     }
     Ok(())
+}
+
+/// The content-attribute source for one handler: the target node's own
+/// attribute, or for a window target the active document body's attribute,
+/// which forwards window handlers to the window
+/// (<https://html.spec.whatwg.org/multipage/dom.html#body-element-event-handlers>).
+fn handler_attribute_source<'js>(
+    ctx: &Ctx<'js>,
+    target: &Object<'js>,
+    name: &str,
+) -> Result<Option<String>> {
+    if let Some(id) = bindings::host_node_id(ctx, &target.clone().into_value()) {
+        if bindings::handler_cleared(ctx, id, name)? {
+            return Ok(None);
+        }
+        let body = bindings::handler_attribute(ctx, id, name)?;
+        return Ok(body.filter(|source| !source.trim().is_empty()));
+    }
+    let Some(body) = active_body(ctx) else {
+        return Ok(None);
+    };
+    if bindings::handler_cleared(ctx, body, name)? {
+        return Ok(None);
+    }
+    Ok(bindings::handler_attribute(ctx, body, name)?.filter(|source| !source.trim().is_empty()))
+}
+
+/// The body element of the current realm's active document, when it has one.
+fn active_body(ctx: &Ctx<'_>) -> Option<dom::NodeId> {
+    let world = bindings::world(ctx).ok()?;
+    let world = world.borrow();
+    let parsed = world.main_document()?;
+    parsed
+        .dom
+        .select_first(parsed.dom.document(), "body")
+        .ok()
+        .flatten()
 }
 
 /// `ToBoolean` for an optional argument; a missing or undefined argument is

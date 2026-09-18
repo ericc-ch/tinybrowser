@@ -28,6 +28,7 @@ mod messaging;
 mod protocol;
 mod remote;
 mod serialize;
+mod storage;
 mod xml;
 
 pub use document::Stop;
@@ -35,10 +36,11 @@ pub use embedded::EmbeddedRenderer;
 pub use engine::Engine;
 pub use protocol::{
     BrowserServices, DialCompletion, DialFailure, DialKind, DialOutcome, DialRequest, FrameId,
-    MAX_RESPONSE_BODY_BYTES, Mount, ResourceLimit, ScreenshotClip, ScreenshotRequest,
-    ScriptFailure, TabError, TabEvent,
+    MAX_RESPONSE_BODY_BYTES, Mount, ResourceLimit, STORAGE_QUOTA_BYTES, ScreenshotClip,
+    ScreenshotRequest, ScriptFailure, StorageChange, StorageError, StorageKind, TabError, TabEvent,
 };
 pub use remote::RemoteValue;
+pub use storage::PendingStorageEvent;
 
 /// The current document readiness
 /// (<https://html.spec.whatwg.org/multipage/dom.html#current-document-readiness>).

@@ -301,6 +301,27 @@ impl JsRealm {
         })
     }
 
+    /// Fires one `storage` event in this realm; `storageArea` is this realm's
+    /// own area, per the spec's broadcast steps
+    /// (<https://html.spec.whatwg.org/multipage/webstorage.html#concept-storage-broadcast>).
+    pub(crate) fn fire_storage_event(
+        &self,
+        event: &crate::storage::PendingStorageEvent,
+    ) -> Result<(), JsError> {
+        let kind = event.kind.as_str();
+        let key = event.key.clone();
+        let old_value = event.old_value.clone();
+        let new_value = event.new_value.clone();
+        let url = event.url.clone();
+        self.with_budget(None, || {
+            self.context.with(|ctx| {
+                let fire: Function = ctx.globals().get("__tbFireStorageEvent")?;
+                fire.call::<_, ()>((kind, key, old_value, new_value, url))?;
+                Ok(())
+            })
+        })
+    }
+
     /// Decodes and dispatches one channel message in this realm.
     pub(crate) fn deliver_port_message(
         &self,
@@ -422,6 +443,7 @@ impl JsRealm {
             intl::install(&ctx)?;
             self.install_task_host_functions(&ctx, &world)?;
             Self::install_document_host_functions(&ctx, &world)?;
+            install_storage_host_functions(&ctx, &world)?;
             bindings::install_messaging(&ctx)?;
             ctx.eval::<(), _>(INSTALL_WEB_APIS_JS)?;
             Ok(())
@@ -554,6 +576,54 @@ impl JsRealm {
         )?;
         Ok(())
     }
+}
+
+/// `localStorage`/`sessionStorage` hooks the JS shim calls. The session area
+/// lives in the engine; the local area crosses the service seam.
+fn install_storage_host_functions(
+    ctx: &Ctx<'_>,
+    world: &Rc<RefCell<World>>,
+) -> Result<(), JsError> {
+    let origin = world.clone();
+    ctx.globals().set(
+        "__tbStorageOrigin",
+        Func::from(move || origin.borrow().storage_origin()),
+    )?;
+
+    let get = world.clone();
+    ctx.globals().set(
+        "__tbStorageGet",
+        Func::from(move |kind: String, key: String| get.borrow().storage_get(&kind, &key)),
+    )?;
+
+    let keys = world.clone();
+    ctx.globals().set(
+        "__tbStorageKeys",
+        Func::from(move |kind: String| keys.borrow().storage_keys(&kind)),
+    )?;
+
+    let set = world.clone();
+    ctx.globals().set(
+        "__tbStorageSet",
+        Func::from(move |kind: String, key: String, value: String| {
+            set.borrow().storage_set(&kind, &key, &value).is_ok()
+        }),
+    )?;
+
+    let remove = world.clone();
+    ctx.globals().set(
+        "__tbStorageRemove",
+        Func::from(move |kind: String, key: String| {
+            remove.borrow().storage_remove(&kind, &key).is_some()
+        }),
+    )?;
+
+    let clear = world.clone();
+    ctx.globals().set(
+        "__tbStorageClear",
+        Func::from(move |kind: String| clear.borrow().storage_clear(&kind).is_some()),
+    )?;
+    Ok(())
 }
 
 impl Drop for JsRealm {

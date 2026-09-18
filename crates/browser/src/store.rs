@@ -14,8 +14,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use net::{Agent, CookieRecord, CookieSameSite};
 
 use crate::profile::Profile;
+use crate::storage::LocalStorage;
 
 const COOKIES_VERSION: &str = "tinybrowser-cookies-v1";
+const LOCAL_STORAGE_VERSION: &str = "tinybrowser-localstorage-v1";
 static COOKIE_TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// Durable backing for one Profile under `XDG_DATA_HOME`.
@@ -138,8 +140,78 @@ impl ProfileStore {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
+    /// Loads the profile's local storage areas into `storage`.
+    ///
+    /// # Errors
+    ///
+    /// The file exists but cannot be read or moved aside when corrupt.
+    pub(crate) fn load_local_storage(&self, storage: &LocalStorage) -> io::Result<()> {
+        let path = self.local_storage_path();
+        let _disk = self.lock_disk();
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        let rows = std::str::from_utf8(&bytes)
+            .ok()
+            .and_then(|text| parse_local_storage(text).ok());
+        if let Some(rows) = rows {
+            storage.import(rows);
+            return Ok(());
+        }
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+        fs::rename(
+            &path,
+            path.with_file_name(format!("localstorage.corrupt.{stamp}")),
+        )?;
+        Ok(())
+    }
+
+    /// Persists every dirty local storage area.
+    ///
+    /// # Errors
+    ///
+    /// The file cannot be written or the directory cannot be synced.
+    pub(crate) fn save_local_storage(&self, storage: &LocalStorage) -> io::Result<()> {
+        let dir = &self.root;
+        let _disk = self.lock_disk();
+        if !storage.is_dirty() {
+            return Ok(());
+        }
+        fs::create_dir_all(dir)?;
+        restrict(dir, 0o700)?;
+        let path = dir.join("localstorage");
+        let seq = COOKIE_TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let tmp = dir.join(format!("localstorage.{}.{seq}.tmp", std::process::id()));
+        let encoded = encode_local_storage(&storage.export());
+        let write_result = (|| {
+            let mut file = OpenOptions::new().write(true).create_new(true).open(&tmp)?;
+            restrict(&tmp, 0o600)?;
+            file.write_all(encoded.as_bytes())?;
+            file.sync_all()?;
+            fs::rename(&tmp, &path)?;
+            restrict(&path, 0o600)?;
+            File::open(dir)?.sync_all()?;
+            Ok(())
+        })();
+        if let Err(error) = write_result {
+            let _remove_result = fs::remove_file(&tmp);
+            return Err(error);
+        }
+        storage.mark_clean();
+        Ok(())
+    }
+
     fn cookies_path(&self) -> PathBuf {
         self.root.join("cookies")
+    }
+
+    fn local_storage_path(&self) -> PathBuf {
+        self.root.join("localstorage")
     }
 }
 
@@ -343,4 +415,55 @@ fn parse_same_site(raw: &str) -> io::Result<CookieSameSite> {
             "cookie same-site",
         )),
     }
+}
+
+/// One `origin \t key \t value` row per local storage entry.
+fn encode_local_storage(rows: &[(String, String, String)]) -> String {
+    let mut out = String::from(LOCAL_STORAGE_VERSION);
+    out.push('\n');
+    for (origin, key, value) in rows {
+        push_escaped(&mut out, origin);
+        out.push('\t');
+        push_escaped(&mut out, key);
+        out.push('\t');
+        push_escaped(&mut out, value);
+        out.push('\n');
+    }
+    out
+}
+
+fn parse_local_storage(text: &str) -> io::Result<Vec<(String, String, String)>> {
+    let mut lines = text.lines();
+    let Some(version) = lines.next() else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "empty local storage file",
+        ));
+    };
+    if version != LOCAL_STORAGE_VERSION {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "unsupported local storage file",
+        ));
+    }
+    let mut rows = Vec::new();
+    for line in lines {
+        if line.is_empty() {
+            continue;
+        }
+        let mut parts = line.split('\t');
+        let mut field = |name: &str| {
+            parts.next().map(unescape).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("missing local storage field {name}"),
+                )
+            })
+        };
+        let origin = field("origin")?;
+        let key = field("key")?;
+        let value = field("value")?;
+        rows.push((origin, key, value));
+    }
+    Ok(rows)
 }

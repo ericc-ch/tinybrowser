@@ -40,6 +40,7 @@ enum Task {
     DialFinished(CompletedDial),
     DialFailed(DialContext),
     WindowMessage(WindowMessage),
+    StorageEvent(crate::storage::PendingStorageEvent),
     PortMessage {
         endpoint: u64,
         payload: String,
@@ -125,6 +126,13 @@ pub(crate) struct FrameRuntime {
     pub(crate) documents: Rc<RefCell<DocumentStore>>,
     pub(crate) registry: Rc<RefCell<RealmRegistry>>,
     pub(crate) shared: SharedHandle,
+    /// Session storage areas for this top-level browsing context; every frame
+    /// of the engine shares them
+    /// (<https://html.spec.whatwg.org/multipage/webstorage.html#the-sessionstorage-attribute>).
+    pub(crate) session_storage: Rc<RefCell<crate::storage::SessionStorage>>,
+    /// Storage changes waiting for the `storage`-event task in their receiving
+    /// frames.
+    pub(crate) pending_storage: Rc<RefCell<Vec<crate::storage::PendingStorageEvent>>>,
 }
 
 /// One document: tree, task list, `QuickJS` realm, and browser services.
@@ -471,6 +479,12 @@ impl Document {
         self.tasks.push_back(Task::WindowMessage(message));
     }
 
+    /// Queues one `storage` event as a task on this frame's task source
+    /// (<https://html.spec.whatwg.org/multipage/webstorage.html#concept-storage-broadcast>).
+    pub(crate) fn push_storage_event(&mut self, event: crate::storage::PendingStorageEvent) {
+        self.tasks.push_back(Task::StorageEvent(event));
+    }
+
     /// Queues one channel message as a task on this frame's task source.
     pub(crate) fn push_port_message(&mut self, endpoint: u64, payload: String, ports: Vec<u64>) {
         self.tasks.push_back(Task::PortMessage {
@@ -483,6 +497,16 @@ impl Document {
     /// Queues a `close` event for one channel endpoint.
     pub(crate) fn push_port_closed(&mut self, endpoint: u64) {
         self.tasks.push_back(Task::PortClosed { endpoint });
+    }
+
+    /// Fires one `storage` event at this frame's window
+    /// (<https://html.spec.whatwg.org/multipage/webstorage.html#concept-storage-broadcast>).
+    fn deliver_storage_event(&mut self, event: &crate::storage::PendingStorageEvent) {
+        if !self.ensure_js_ok() {
+            return;
+        }
+        self.fire_js(|js| js.fire_storage_event(event));
+        self.adopt_js_work();
     }
 
     fn deliver_window_message(&mut self, message: &WindowMessage) {

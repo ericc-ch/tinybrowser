@@ -66,24 +66,9 @@ pub(super) async fn run(
                     }
                 }
                 Some(RendererInput::Control(ToRenderer::Request { id, assignment, command })) => {
-                    let Some(engine) = engines.get_mut(&assignment) else {
+                    if !handle_request(&mut engines, outbox, stop, id, assignment, command) {
                         stop.request();
                         break;
-                    };
-                    match handle_command(engine, command, stop) {
-                        Handled::Reply(reply) => {
-                            if !send_to_browser(outbox, FromRenderer::Reply { id, assignment, reply }) {
-                                stop.request();
-                                break;
-                            }
-                        }
-                        Handled::Screenshot(png) => {
-                            if !stream_screenshot(outbox, id, assignment, &png) {
-                                stop.request();
-                                break;
-                            }
-                        }
-                        Handled::Shutdown => break,
                     }
                 }
                 Some(RendererInput::Control(ToRenderer::ResponseStart { id, response })) => {
@@ -103,21 +88,34 @@ pub(super) async fn run(
                     }
                 }
                 Some(RendererInput::Control(ToRenderer::ResponseEnd { id })) => {
-                    let (assignment, result) = responses.finish(id, &mut engines);
-                    let reply = Reply::Unit(result);
-                    if !send_to_browser(outbox, FromRenderer::Reply { id, assignment, reply }) {
+                    let result = responses.finish(id, &mut engines);
+                    if !reply_result(outbox, id, result) {
                         stop.request();
                         break;
                     }
                 }
                 Some(RendererInput::Control(ToRenderer::ResponseError { id, failure })) => {
-                    let (assignment, result) = responses.abort(id, failure, &mut engines);
-                    let reply = Reply::Unit(result);
-                    if !send_to_browser(outbox, FromRenderer::Reply { id, assignment, reply }) {
+                    let result = responses.abort(id, failure, &mut engines);
+                    if !reply_result(outbox, id, result) {
                         stop.request();
                         break;
                     }
                 }
+                Some(RendererInput::Control(ToRenderer::StorageEvent {
+                    origin,
+                    kind,
+                    key,
+                    old_value,
+                    new_value,
+                    url,
+                    source,
+                })) => queue_storage_event(
+                    &mut engines,
+                    &renderer::PendingStorageEvent::broadcast(
+                        origin, kind, key, old_value, new_value, url,
+                    ),
+                    source,
+                ),
                 // The transport consumes the handshake, response stream, and
                 // service replies; none reaches this loop.
                 Some(
@@ -133,6 +131,65 @@ pub(super) async fn run(
     }
     for (_, mut engine) in engines {
         engine.shutdown();
+    }
+}
+
+/// Handles one host command for one assignment; `false` stops the loop.
+fn handle_request(
+    engines: &mut HashMap<RendererAssignmentId, Engine>,
+    outbox: &SyncSender<Outgoing>,
+    stop: &Arc<Stop>,
+    id: u64,
+    assignment: RendererAssignmentId,
+    command: Command,
+) -> bool {
+    let Some(engine) = engines.get_mut(&assignment) else {
+        return false;
+    };
+    match handle_command(engine, command, stop) {
+        Handled::Reply(reply) => send_to_browser(
+            outbox,
+            FromRenderer::Reply {
+                id,
+                assignment,
+                reply,
+            },
+        ),
+        Handled::Screenshot(png) => stream_screenshot(outbox, id, assignment, &png),
+        Handled::Shutdown => false,
+    }
+}
+
+/// Answers a finished or aborted response stream with its unit reply.
+fn reply_result(
+    outbox: &SyncSender<Outgoing>,
+    id: u64,
+    (assignment, result): (RendererAssignmentId, Result<(), TabError>),
+) -> bool {
+    send_to_browser(
+        outbox,
+        FromRenderer::Reply {
+            id,
+            assignment,
+            reply: Reply::Unit(result),
+        },
+    )
+}
+
+/// Queues one browser-broadcast `localStorage` change on every engine. Only
+/// the assignment that made the change excludes the source window; other
+/// assignments and renderers fire in every matching frame.
+fn queue_storage_event(
+    engines: &mut HashMap<RendererAssignmentId, Engine>,
+    event: &renderer::PendingStorageEvent,
+    source: Option<(RendererAssignmentId, FrameId)>,
+) {
+    for (assignment, engine) in engines {
+        let mut event = event.clone();
+        event.source = source.and_then(|(source_assignment, frame)| {
+            (source_assignment == *assignment).then_some(frame)
+        });
+        engine.receive_storage_event(event);
     }
 }
 

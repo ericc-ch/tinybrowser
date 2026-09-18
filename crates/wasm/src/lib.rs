@@ -14,7 +14,7 @@ use std::time::SystemTime;
 use cookies::{CookieJar, CookieOp, InitiatorKind, RetrievalKind, schemeful_same_site};
 use renderer::{
     BrowserServices, DialCompletion, DialFailure, DialKind, DialOutcome, DialRequest,
-    EmbeddedRenderer, MAX_RESPONSE_BODY_BYTES, Mount, TabEvent as RendererEvent,
+    EmbeddedRenderer, MAX_RESPONSE_BODY_BYTES, Mount, StorageChange, TabEvent as RendererEvent,
 };
 use url::Url;
 
@@ -224,6 +224,13 @@ fn pending_fetches() -> &'static Mutex<HashMap<u64, PendingFetch>> {
 fn cookie_jar() -> &'static Mutex<CookieJar> {
     static JAR: OnceLock<Mutex<CookieJar>> = OnceLock::new();
     JAR.get_or_init(|| Mutex::new(CookieJar::default()))
+}
+
+/// The component's local storage areas, keyed by origin. A browser tab has no
+/// profile on disk, so the areas die with the component.
+fn local_storage() -> &'static Mutex<HashMap<String, HashMap<String, String>>> {
+    static AREAS: OnceLock<Mutex<HashMap<String, HashMap<String, String>>>> = OnceLock::new();
+    AREAS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 /// Locks a shared map or jar, recovering from a panicking holder.
@@ -449,6 +456,78 @@ impl BrowserServices for WasmServices {
                 cross_site_redirect: false,
             },
         );
+    }
+
+    fn storage_get(&self, origin: &str, key: &str) -> Option<String> {
+        lock(local_storage())
+            .get(origin)
+            .and_then(|area| area.get(key))
+            .cloned()
+    }
+
+    fn storage_keys(&self, origin: &str) -> Vec<String> {
+        lock(local_storage())
+            .get(origin)
+            .map(|area| area.keys().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    fn storage_set(
+        &self,
+        origin: &str,
+        _url: &str,
+        key: &str,
+        value: &str,
+        _source: renderer::FrameId,
+    ) -> Result<Option<StorageChange>, renderer::StorageError> {
+        let mut areas = lock(local_storage());
+        let area = areas.entry(origin.to_owned()).or_default();
+        let old = area.get(key).cloned();
+        if old.as_deref() == Some(value) {
+            return Ok(None);
+        }
+        area.insert(key.to_owned(), value.to_owned());
+        Ok(Some(StorageChange {
+            key: Some(key.to_owned()),
+            old_value: old,
+            new_value: Some(value.to_owned()),
+        }))
+    }
+
+    fn storage_remove(
+        &self,
+        origin: &str,
+        _url: &str,
+        key: &str,
+        _source: renderer::FrameId,
+    ) -> Option<StorageChange> {
+        let old = lock(local_storage())
+            .get_mut(origin)
+            .and_then(|area| area.remove(key))?;
+        Some(StorageChange {
+            key: Some(key.to_owned()),
+            old_value: Some(old),
+            new_value: None,
+        })
+    }
+
+    fn storage_clear(
+        &self,
+        origin: &str,
+        _url: &str,
+        _source: renderer::FrameId,
+    ) -> Option<StorageChange> {
+        let mut areas = lock(local_storage());
+        let area = areas.get_mut(origin)?;
+        if area.is_empty() {
+            return None;
+        }
+        area.clear();
+        Some(StorageChange {
+            key: None,
+            old_value: None,
+            new_value: None,
+        })
     }
 }
 

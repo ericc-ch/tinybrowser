@@ -1,6 +1,6 @@
 //! Document predicates and URL helpers.
 
-use super::world;
+use super::{world, world_for_node};
 
 use dom::{NodeId, NodeKind, html_namespace};
 
@@ -24,10 +24,12 @@ pub(crate) fn is_main_document(ctx: &Ctx<'_>, id: NodeId) -> bool {
 }
 
 pub(crate) fn document_url_string(ctx: &Ctx<'_>, id: NodeId) -> String {
-    if is_main_document(ctx, id) {
-        return world(ctx)
-            .map(|world| world.borrow().document_url.as_str().to_owned())
-            .unwrap_or_default();
+    let Ok(owner) = world_for_node(ctx, id) else {
+        return "about:blank".to_owned();
+    };
+    let world = owner.borrow();
+    if world.is_main_document(id) {
+        return world.document_url.as_str().to_owned();
     }
     "about:blank".to_owned()
 }

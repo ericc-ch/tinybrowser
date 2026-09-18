@@ -87,6 +87,7 @@ use crate::documents::DocumentStore;
 use crate::js::{DocumentStreamCommand, FrameNavigation, RealmRegistry, SharedJsRuntime};
 use crate::messaging::{Delivery, MAX_FRAMES, SharedHandle};
 use crate::protocol::{BrowserServices, FrameId, Mount, TabError, TabEvent};
+use crate::storage::PendingStorageEvent;
 
 /// One renderer process's page engine.
 ///
@@ -114,6 +115,8 @@ impl Engine {
             documents: Rc::new(RefCell::new(DocumentStore::default())),
             registry: Rc::new(RefCell::new(RealmRegistry::default())),
             shared: Rc::new(RefCell::new(crate::messaging::Shared::default())),
+            session_storage: Rc::new(RefCell::new(crate::storage::SessionStorage::default())),
+            pending_storage: Rc::new(RefCell::new(Vec::new())),
         };
         let main = Document::with_shared(FrameId::MAIN, &runtime);
         let mut frames = BTreeMap::new();
@@ -366,6 +369,7 @@ impl Engine {
         // (<https://html.spec.whatwg.org/multipage/webappapis.html#task-queue>).
         self.reconcile_frames();
         loop {
+            self.drain_storage_events();
             let mut ran = false;
             let frames: Vec<FrameId> = self.frames.keys().copied().collect();
             for frame in frames {
@@ -381,6 +385,42 @@ impl Engine {
             if !ran {
                 break;
             }
+        }
+    }
+
+    /// Queues one `localStorage` change that the browser broadcast. The source
+    /// frame is set only when the change came from this same assignment;
+    /// other renderers and assignments pass `None`.
+    pub fn receive_storage_event(&mut self, event: PendingStorageEvent) {
+        self.runtime.pending_storage.borrow_mut().push(event);
+    }
+
+    /// Moves changes queued by this engine's own script onto the
+    /// `storage`-event task of every receiving frame.
+    fn drain_storage_events(&mut self) {
+        let pending: Vec<PendingStorageEvent> =
+            std::mem::take(&mut *self.runtime.pending_storage.borrow_mut());
+        for event in pending {
+            self.queue_storage_event(&event);
+        }
+    }
+
+    /// Queues one change on every frame of `event.origin`, excluding the
+    /// window whose script made it
+    /// (<https://html.spec.whatwg.org/multipage/webstorage.html#concept-storage-broadcast>).
+    fn queue_storage_event(&mut self, event: &PendingStorageEvent) {
+        let frames: Vec<FrameId> = self.frames.keys().copied().collect();
+        for frame in frames {
+            if event.source == Some(frame) {
+                continue;
+            }
+            let Some(document) = self.frames.get_mut(&frame) else {
+                continue;
+            };
+            if document.origin_string() != event.origin {
+                continue;
+            }
+            document.push_storage_event(event.clone());
         }
     }
 

@@ -162,6 +162,56 @@ pub enum TabEvent {
     ScriptFailed,
 }
 
+/// What one storage mutation changed, ready for a `storage` event.
+///
+/// The three fields are the spec's `key`, `oldValue`, and `newValue`
+/// (<https://html.spec.whatwg.org/multipage/webstorage.html#concept-storage-broadcast>);
+/// `None` serializes to `null`. A mutation that changes nothing produces no
+/// [`StorageChange`] at all.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StorageChange {
+    /// The key that changed; `None` for `clear()`.
+    pub key: Option<String>,
+    /// The value before the change; `None` when the key did not exist.
+    pub old_value: Option<String>,
+    /// The value after the change; `None` when the key was removed.
+    pub new_value: Option<String>,
+}
+
+/// Which of the two storage areas a change belongs to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum StorageKind {
+    /// `localStorage`: one area per origin in the profile.
+    Local,
+    /// `sessionStorage`: one area per origin in a top-level browsing context.
+    Session,
+}
+
+/// Upper bound on one origin's stored bytes per storage area. The spec leaves
+/// the number to the user agent; 5 MiB is the common shape and keeps one
+/// origin from exhausting the profile
+/// (<https://html.spec.whatwg.org/multipage/webstorage.html#dom-storage-setitem>).
+pub const STORAGE_QUOTA_BYTES: usize = 5 * 1024 * 1024;
+
+/// Why a storage mutation failed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum StorageError {
+    /// The area refused the write because its quota would be exceeded
+    /// (<https://html.spec.whatwg.org/multipage/webstorage.html#dom-storage-setitem>).
+    QuotaExceeded,
+}
+
+impl StorageKind {
+    /// The token the JavaScript shim uses to name the area.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Local => "local",
+            Self::Session => "session",
+        }
+    }
+}
+
 /// One document to mount.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Mount {
@@ -283,6 +333,42 @@ pub trait BrowserServices: Send + Sync + 'static {
 
     /// `document.cookie` setter for `url`.
     fn set_cookie(&self, value: &str, url: &Url);
+
+    /// `localStorage.getItem(key)`
+    /// (<https://html.spec.whatwg.org/multipage/webstorage.html#dom-storage-getitem>).
+    fn storage_get(&self, origin: &str, key: &str) -> Option<String>;
+
+    /// The keys of `origin`'s local storage area, in the area's iteration
+    /// order (<https://html.spec.whatwg.org/multipage/webstorage.html#dom-storage-key>).
+    fn storage_keys(&self, origin: &str) -> Vec<String>;
+
+    /// `localStorage.setItem(key, value)`. `url` is the mutating document's
+    /// URL and `source` its frame; the browser excludes it from the broadcast.
+    ///
+    /// # Errors
+    ///
+    /// [`StorageError::QuotaExceeded`] when the write would exceed the area's
+    /// quota. `Ok(None)` means the value was unchanged.
+    fn storage_set(
+        &self,
+        origin: &str,
+        url: &str,
+        key: &str,
+        value: &str,
+        source: FrameId,
+    ) -> Result<Option<StorageChange>, StorageError>;
+
+    /// `localStorage.removeItem(key)`; `None` means the key was absent.
+    fn storage_remove(
+        &self,
+        origin: &str,
+        url: &str,
+        key: &str,
+        source: FrameId,
+    ) -> Option<StorageChange>;
+
+    /// `localStorage.clear()`; `None` means the area was empty.
+    fn storage_clear(&self, origin: &str, url: &str, source: FrameId) -> Option<StorageChange>;
 }
 
 #[cfg(test)]

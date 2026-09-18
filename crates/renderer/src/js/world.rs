@@ -10,7 +10,8 @@ use url::Url;
 
 use crate::document::{Document, FrameRuntime};
 use crate::messaging::{MAX_FRAMES, SharedHandle};
-use crate::protocol::FrameId;
+use crate::protocol::{FrameId, StorageChange, StorageError, StorageKind};
+use crate::storage::PendingStorageEvent;
 use crate::{Parsed, ReadyState};
 
 /// Renderer-process realm bookkeeping shared by every frame.
@@ -758,6 +759,141 @@ impl World {
     /// (<https://html.spec.whatwg.org/multipage/browsers.html#concept-origin>).
     pub(crate) fn origin_string(&self) -> String {
         self.document_url.origin().ascii_serialization()
+    }
+
+    /// The origin scoping this realm's storage areas, or `None` for an opaque
+    /// origin, where the storage getters must throw `SecurityError`
+    /// (<https://html.spec.whatwg.org/multipage/webstorage.html#the-localstorage-attribute>).
+    pub(crate) fn storage_origin(&self) -> Option<String> {
+        match self.document_url.origin() {
+            url::Origin::Tuple(..) => Some(self.origin_string()),
+            url::Origin::Opaque(_) => None,
+        }
+    }
+
+    /// `Storage.getItem(key)` for the `"local"` or `"session"` area. The
+    /// renderer owns the session area; the browser owns the local one.
+    pub(crate) fn storage_get(&self, kind: &str, key: &str) -> Option<String> {
+        let origin = self.storage_origin()?;
+        match kind {
+            "session" => self.runtime.session_storage.borrow().get(&origin, key),
+            _ => self.runtime.services.storage_get(&origin, key),
+        }
+    }
+
+    /// The keys of one storage area, in the area's iteration order.
+    pub(crate) fn storage_keys(&self, kind: &str) -> Vec<String> {
+        let Some(origin) = self.storage_origin() else {
+            return Vec::new();
+        };
+        match kind {
+            "session" => self.runtime.session_storage.borrow().keys(&origin),
+            _ => self.runtime.services.storage_keys(&origin),
+        }
+    }
+
+    /// `Storage.setItem(key, value)`; `Ok(None)` means no change and the error
+    /// is a refused write. A change queues the `storage` event for every other
+    /// same-origin frame of the engine
+    /// (<https://html.spec.whatwg.org/multipage/webstorage.html#concept-storage-broadcast>).
+    pub(crate) fn storage_set(
+        &self,
+        kind: &str,
+        key: &str,
+        value: &str,
+    ) -> Result<Option<StorageChange>, StorageError> {
+        let Some(origin) = self.storage_origin() else {
+            return Ok(None);
+        };
+        let kind = Self::storage_kind(kind);
+        let change = match kind {
+            StorageKind::Session => self
+                .runtime
+                .session_storage
+                .borrow_mut()
+                .set(&origin, key, value),
+            StorageKind::Local => self.runtime.services.storage_set(
+                &origin,
+                self.document_url.as_str(),
+                key,
+                value,
+                self.frame,
+            ),
+        }?;
+        if let Some(change) = &change {
+            self.queue_storage_event(kind, &origin, change);
+        }
+        Ok(change)
+    }
+
+    /// `Storage.removeItem(key)`; `None` means the key was absent.
+    pub(crate) fn storage_remove(&self, kind: &str, key: &str) -> Option<StorageChange> {
+        let origin = self.storage_origin()?;
+        let kind = Self::storage_kind(kind);
+        let change = match kind {
+            StorageKind::Session => self
+                .runtime
+                .session_storage
+                .borrow_mut()
+                .remove(&origin, key),
+            StorageKind::Local => self.runtime.services.storage_remove(
+                &origin,
+                self.document_url.as_str(),
+                key,
+                self.frame,
+            ),
+        };
+        if let Some(change) = &change {
+            self.queue_storage_event(kind, &origin, change);
+        }
+        change
+    }
+
+    /// `Storage.clear()`; `None` means the area was empty.
+    pub(crate) fn storage_clear(&self, kind: &str) -> Option<StorageChange> {
+        let origin = self.storage_origin()?;
+        let kind = Self::storage_kind(kind);
+        let change = match kind {
+            StorageKind::Session => self.runtime.session_storage.borrow_mut().clear(&origin),
+            StorageKind::Local => {
+                self.runtime
+                    .services
+                    .storage_clear(&origin, self.document_url.as_str(), self.frame)
+            }
+        };
+        if let Some(change) = &change {
+            self.queue_storage_event(kind, &origin, change);
+        }
+        change
+    }
+
+    fn storage_kind(kind: &str) -> StorageKind {
+        if kind == "session" {
+            StorageKind::Session
+        } else {
+            StorageKind::Local
+        }
+    }
+
+    /// Queues the event for a change this engine made. Only `sessionStorage`
+    /// needs it: `localStorage` changes return as a browser broadcast, which
+    /// excludes the source frame.
+    fn queue_storage_event(&self, kind: StorageKind, origin: &str, change: &StorageChange) {
+        if kind != StorageKind::Session {
+            return;
+        }
+        self.runtime
+            .pending_storage
+            .borrow_mut()
+            .push(PendingStorageEvent {
+                source: Some(self.frame),
+                origin: origin.to_owned(),
+                kind,
+                key: change.key.clone(),
+                old_value: change.old_value.clone(),
+                new_value: change.new_value.clone(),
+                url: self.document_url.to_string(),
+            });
     }
 
     /// The root node of the frame's active document.

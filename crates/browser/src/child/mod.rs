@@ -30,7 +30,9 @@ use std::sync::mpsc::{self as std_mpsc, Sender, SyncSender};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
 
-use renderer::{BrowserServices, DialCompletion, DialRequest, Stop};
+use renderer::{
+    BrowserServices, DialCompletion, DialRequest, FrameId, Stop, StorageChange, StorageError,
+};
 use tokio::sync::{Notify, mpsc};
 use url::Url;
 
@@ -181,40 +183,14 @@ fn read_messages(
                     logging::error!(target: "renderer::ipc", "response before handshake");
                     break;
                 }
+                ToRenderer::StorageEvent { .. } => {
+                    logging::error!(target: "renderer::ipc", "storage event before handshake");
+                    break;
+                }
             }
         }
-        match message {
-            ToRenderer::Hello => {
-                logging::error!(target: "renderer::ipc", "duplicate handshake");
-                break;
-            }
-            ToRenderer::Assign { .. } | ToRenderer::Release { .. } | ToRenderer::Request { .. } => {
-                let shutdown = matches!(
-                    &message,
-                    ToRenderer::Request {
-                        command: Command::Shutdown,
-                        ..
-                    }
-                );
-                if command_tx
-                    .blocking_send(RendererInput::Control(message))
-                    .is_err()
-                    || shutdown
-                {
-                    return;
-                }
-            }
-            ToRenderer::ResponseStart { .. }
-            | ToRenderer::ResponseEnd { .. }
-            | ToRenderer::ResponseError { .. } => {
-                if command_tx
-                    .blocking_send(RendererInput::Control(message))
-                    .is_err()
-                {
-                    return;
-                }
-            }
-            ToRenderer::ServiceReply { id, reply } => services.deliver(id, reply),
+        if !route_message(message, command_tx, services) {
+            return;
         }
     }
     // The host is gone (EOF or a broken pipe). A renderer must not outlive its
@@ -222,6 +198,51 @@ fn read_messages(
     stop.request();
     wake.notify_one();
     let _ = command_tx.try_send(RendererInput::Control(ToRenderer::shutdown_request()));
+}
+
+/// Routes one post-handshake host message; `false` stops the read loop.
+fn route_message(
+    message: ToRenderer,
+    command_tx: &mpsc::Sender<RendererInput>,
+    services: &ChannelServices,
+) -> bool {
+    match message {
+        ToRenderer::Hello => {
+            logging::error!(target: "renderer::ipc", "duplicate handshake");
+            false
+        }
+        ToRenderer::Assign { .. } | ToRenderer::Release { .. } | ToRenderer::Request { .. } => {
+            let shutdown = matches!(
+                &message,
+                ToRenderer::Request {
+                    command: Command::Shutdown,
+                    ..
+                }
+            );
+            command_tx
+                .blocking_send(RendererInput::Control(message))
+                .is_ok()
+                && !shutdown
+        }
+        ToRenderer::ResponseStart { .. }
+        | ToRenderer::ResponseEnd { .. }
+        | ToRenderer::ResponseError { .. } => command_tx
+            .blocking_send(RendererInput::Control(message))
+            .is_ok(),
+        ToRenderer::StorageEvent { .. } => {
+            // Storage events are best-effort, like the spec's task queue. The
+            // engine may be blocked in a synchronous service call, so blocking
+            // here would stall the service reply it waits on.
+            match command_tx.try_send(RendererInput::Control(message)) {
+                Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => true,
+                Err(mpsc::error::TrySendError::Closed(_)) => false,
+            }
+        }
+        ToRenderer::ServiceReply { id, reply } => {
+            services.deliver(id, reply);
+            true
+        }
+    }
 }
 
 pub(crate) enum RendererInput {
@@ -324,7 +345,11 @@ impl ChannelServices {
             }
             Some(PendingService::Dial(completion)) => match reply {
                 ServiceReply::Dial(outcome) => completion(outcome),
-                ServiceReply::Cookie(_) | ServiceReply::Unit => {
+                ServiceReply::Cookie(_)
+                | ServiceReply::StorageValue(_)
+                | ServiceReply::StorageKeys(_)
+                | ServiceReply::StorageChanged(_)
+                | ServiceReply::Unit => {
                     completion(Err(renderer::DialFailure::Connect));
                 }
             },
@@ -379,5 +404,88 @@ impl BrowserServices for AssignmentServices {
                 url: url.to_string(),
             },
         );
+    }
+
+    fn storage_get(&self, origin: &str, key: &str) -> Option<String> {
+        match self.channel.call(
+            self.assignment,
+            ServiceCall::StorageGet {
+                origin: origin.to_owned(),
+                key: key.to_owned(),
+            },
+        ) {
+            Some(ServiceReply::StorageValue(value)) => value,
+            _ => None,
+        }
+    }
+
+    fn storage_keys(&self, origin: &str) -> Vec<String> {
+        match self.channel.call(
+            self.assignment,
+            ServiceCall::StorageKeys {
+                origin: origin.to_owned(),
+            },
+        ) {
+            Some(ServiceReply::StorageKeys(keys)) => keys,
+            _ => Vec::new(),
+        }
+    }
+
+    fn storage_set(
+        &self,
+        origin: &str,
+        url: &str,
+        key: &str,
+        value: &str,
+        source: FrameId,
+    ) -> Result<Option<StorageChange>, StorageError> {
+        match self.channel.call(
+            self.assignment,
+            ServiceCall::StorageSet {
+                origin: origin.to_owned(),
+                url: url.to_owned(),
+                key: key.to_owned(),
+                value: value.to_owned(),
+                source,
+            },
+        ) {
+            Some(ServiceReply::StorageChanged(change)) => change,
+            _ => Ok(None),
+        }
+    }
+
+    fn storage_remove(
+        &self,
+        origin: &str,
+        url: &str,
+        key: &str,
+        source: FrameId,
+    ) -> Option<StorageChange> {
+        match self.channel.call(
+            self.assignment,
+            ServiceCall::StorageRemove {
+                origin: origin.to_owned(),
+                url: url.to_owned(),
+                key: key.to_owned(),
+                source,
+            },
+        ) {
+            Some(ServiceReply::StorageChanged(Ok(change))) => change,
+            _ => None,
+        }
+    }
+
+    fn storage_clear(&self, origin: &str, url: &str, source: FrameId) -> Option<StorageChange> {
+        match self.channel.call(
+            self.assignment,
+            ServiceCall::StorageClear {
+                origin: origin.to_owned(),
+                url: url.to_owned(),
+                source,
+            },
+        ) {
+            Some(ServiceReply::StorageChanged(Ok(change))) => change,
+            _ => None,
+        }
     }
 }

@@ -19,6 +19,7 @@ mod manager;
 mod network;
 mod profile;
 mod site;
+mod storage;
 mod store;
 mod wire;
 

@@ -4,10 +4,12 @@
 //! to the release binary instead: they only shrink the shipping artifact, and
 //! applying them to every debug/test link forces LLD onto objects whose DWARF
 //! rustc 1.98.1 does not always compile to something LLD accepts (`unknown
-//! relocation (1875)` on `icu_experimental`); the default bfd linker ignores
-//! it. Nothing unwinds in release (`panic = "abort"`, QuickJS-ng uses
-//! setjmp/longjmp), so the shipping binary needs neither the unwind index
-//! (dropped here) nor the `.eh_frame` body (`tools/ship` removes it).
+//! relocation (1875)` on `icu_experimental` and `browser`); dev/test links use
+//! bfd, selected in `.cargo/config.toml` because this toolchain otherwise
+//! defaults to rust-lld. Nothing unwinds in release (`panic = "abort"`,
+//! QuickJS-ng uses setjmp/longjmp), so the shipping binary needs neither the
+//! unwind index (dropped here) nor the `.eh_frame` body (`tools/ship` removes
+//! it).
 //!
 //! Sizes and method: `docs/researches/size-budget.md`.
 
