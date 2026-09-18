@@ -76,17 +76,31 @@ struct BrowserState {
 }
 
 impl Browser {
-    /// Opens a browser on `profile` with cookies under `data_home` and
-    /// renderer processes.
+    /// Opens a browser on `profile` with cookies under `data_home`, renderer
+    /// processes, and default transport settings.
     ///
     /// # Errors
     ///
     /// The profile directory cannot be created, read, or exclusively locked.
     pub fn open_in(data_home: &Path, profile: &Profile) -> io::Result<Self> {
-        let network = NetworkSession::from_builder(
-            net::AgentBuilder::new(),
-            ProfileStore::open_in(data_home, profile)?,
-        )?;
+        Self::open_in_with(data_home, profile, net::AgentBuilder::new())
+    }
+
+    /// Opens a browser on `profile` with cookies under `data_home`, renderer
+    /// processes, and `builder`'s transport settings.
+    ///
+    /// # Errors
+    ///
+    /// The profile directory cannot be created, read, or exclusively locked;
+    /// stored profile data cannot be loaded; or the caller is not running
+    /// inside the executable-owned Tokio runtime.
+    pub fn open_in_with(
+        data_home: &Path,
+        profile: &Profile,
+        builder: net::AgentBuilder,
+    ) -> io::Result<Self> {
+        let network =
+            NetworkSession::from_builder(builder, ProfileStore::open_in(data_home, profile)?)?;
         Self::open_with_network(network)
     }
 
@@ -134,9 +148,9 @@ impl BrowserHandle {
     ///
     /// [`BrowserError::Stopped`] when the owning [`Browser`] has closed.
     pub async fn create_tab(&self) -> Result<TabHandle, BrowserError> {
-        let (reply, rx) = oneshot::channel();
-        self.send(Command::CreateTab { reply }).await?;
-        rx.await.unwrap_or(Err(BrowserError::Stopped))
+        self.request(|reply| Command::CreateTab { reply })
+            .await
+            .and_then(|result| result)
     }
 
     /// Live tab identities.
@@ -145,9 +159,7 @@ impl BrowserHandle {
     ///
     /// [`BrowserError::Stopped`] when the browser task has stopped.
     pub async fn tabs(&self) -> Result<Vec<TabId>, BrowserError> {
-        let (reply, rx) = oneshot::channel();
-        self.send(Command::Tabs { reply }).await?;
-        rx.await.map_err(|_| BrowserError::Stopped)
+        self.request(|reply| Command::Tabs { reply }).await
     }
 
     /// Handle for a live tab.
@@ -156,9 +168,9 @@ impl BrowserHandle {
     ///
     /// [`BrowserError::UnknownTab`] when `id` is not in the registry.
     pub async fn tab(&self, id: TabId) -> Result<TabHandle, BrowserError> {
-        let (reply, rx) = oneshot::channel();
-        self.send(Command::Tab { id, reply }).await?;
-        rx.await.unwrap_or(Err(BrowserError::Stopped))
+        self.request(|reply| Command::Tab { id, reply })
+            .await
+            .and_then(|result| result)
     }
 
     /// Stops `id` and waits for its coordinator task.
@@ -167,9 +179,9 @@ impl BrowserHandle {
     ///
     /// [`BrowserError::UnknownTab`] when `id` is not in the registry.
     pub async fn close_tab(&self, id: TabId) -> Result<(), BrowserError> {
-        let (reply, rx) = oneshot::channel();
-        self.send(Command::CloseTab { id, reply }).await?;
-        rx.await.unwrap_or(Err(BrowserError::Stopped))
+        self.request(|reply| Command::CloseTab { id, reply })
+            .await
+            .and_then(|result| result)
     }
 
     /// Whether this browser still accepts commands.
@@ -178,9 +190,7 @@ impl BrowserHandle {
     ///
     /// [`BrowserError::Stopped`] when the browser task has stopped.
     pub async fn is_live(&self) -> Result<bool, BrowserError> {
-        let (reply, rx) = oneshot::channel();
-        self.send(Command::IsLive { reply }).await?;
-        rx.await.map_err(|_| BrowserError::Stopped)
+        self.request(|reply| Command::IsLive { reply }).await
     }
 
     /// Cookies visible to `url`, including session and `HttpOnly` cookies.
@@ -189,13 +199,9 @@ impl BrowserHandle {
     ///
     /// [`BrowserError::Stopped`] when the browser task has stopped.
     pub async fn cookie_records(&self, url: &Url) -> Result<Vec<net::CookieRecord>, BrowserError> {
-        let (reply, rx) = oneshot::channel();
-        self.send(Command::CookieRecords {
-            url: url.clone(),
-            reply,
-        })
-        .await?;
-        rx.await.map_err(|_| BrowserError::Stopped)
+        let url = url.clone();
+        self.request(move |reply| Command::CookieRecords { url, reply })
+            .await
     }
 
     /// Drops every cookie from the live jar.
@@ -204,9 +210,7 @@ impl BrowserHandle {
     ///
     /// [`BrowserError::Stopped`] when the browser task has stopped.
     pub async fn clear_cookies(&self) -> Result<(), BrowserError> {
-        let (reply, rx) = oneshot::channel();
-        self.send(Command::ClearCookies { reply }).await?;
-        rx.await.map_err(|_| BrowserError::Stopped)
+        self.request(|reply| Command::ClearCookies { reply }).await
     }
 
     /// Stores one `Set-Cookie` line for `url` with HTTP-level rules,
@@ -216,14 +220,10 @@ impl BrowserHandle {
     ///
     /// [`BrowserError::Stopped`] when the browser task has stopped.
     pub async fn add_cookie(&self, cookie: &str, url: &Url) -> Result<bool, BrowserError> {
-        let (reply, rx) = oneshot::channel();
-        self.send(Command::AddCookie {
-            cookie: cookie.to_owned(),
-            url: url.clone(),
-            reply,
-        })
-        .await?;
-        rx.await.map_err(|_| BrowserError::Stopped)
+        let cookie = cookie.to_owned();
+        let url = url.clone();
+        self.request(move |reply| Command::AddCookie { cookie, url, reply })
+            .await
     }
 
     /// Stops every tab, persists the profile, and refuses later commands.
@@ -232,13 +232,19 @@ impl BrowserHandle {
     ///
     /// The final durable profile write failed or the browser task stopped.
     pub async fn close(&self) -> io::Result<()> {
-        let (reply, rx) = oneshot::channel();
-        self.tx
-            .send(Command::Close { reply })
+        self.request(|reply| Command::Close { reply })
             .await
-            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "browser stopped"))?;
-        rx.await
-            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "browser stopped"))?
+            .map_err(|_| stopped())?
+    }
+
+    /// Sends one command and waits for its reply.
+    async fn request<T>(
+        &self,
+        command: impl FnOnce(oneshot::Sender<T>) -> Command,
+    ) -> Result<T, BrowserError> {
+        let (reply, rx) = oneshot::channel();
+        self.send(command(reply)).await?;
+        rx.await.map_err(|_| BrowserError::Stopped)
     }
 
     async fn send(&self, command: Command) -> Result<(), BrowserError> {
@@ -252,6 +258,10 @@ impl BrowserHandle {
         let (reply, _rx) = oneshot::channel();
         let _result = self.tx.try_send(Command::Close { reply });
     }
+}
+
+fn stopped() -> io::Error {
+    io::Error::new(io::ErrorKind::BrokenPipe, "browser stopped")
 }
 
 async fn browser_loop(mut commands: mpsc::Receiver<Command>, mut state: BrowserState) {

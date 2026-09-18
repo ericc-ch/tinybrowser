@@ -119,13 +119,9 @@ impl TabHandle {
     ///
     /// [`TabError::ActorStopped`] when the tab or its renderer has shut down.
     pub async fn load_html(&self, html: &str) -> Result<(), TabError> {
-        let (reply, rx) = oneshot::channel();
-        self.send(Command::LoadHtml {
-            html: html.to_owned(),
-            reply,
-        })
-        .await?;
-        recv_result(rx).await
+        let html = html.to_owned();
+        self.request_fallible(move |reply| Command::LoadHtml { html, reply })
+            .await
     }
 
     /// Starts navigation. The tab continues independently; call
@@ -135,13 +131,9 @@ impl TabHandle {
     ///
     /// [`TabError::InvalidUrl`] or [`TabError::ActorStopped`].
     pub async fn goto(&self, url: &str) -> Result<(), TabError> {
-        let (reply, rx) = oneshot::channel();
-        self.send(Command::Goto {
-            url: url.to_owned(),
-            reply,
-        })
-        .await?;
-        recv_result(rx).await
+        let url = url.to_owned();
+        self.request_fallible(move |reply| Command::Goto { url, reply })
+            .await
     }
 
     /// Evaluates `source` and returns a value-only script result.
@@ -163,14 +155,13 @@ impl TabHandle {
         source: &str,
         timeout: Option<Duration>,
     ) -> Result<RemoteValue, TabError> {
-        let (reply, rx) = oneshot::channel();
-        self.send(Command::Execute {
-            source: source.to_owned(),
+        let source = source.to_owned();
+        self.request_fallible(move |reply| Command::Execute {
+            source,
             timeout,
             reply,
         })
-        .await?;
-        recv_result(rx).await
+        .await
     }
 
     /// Renders the tab's top-level document to a PNG.
@@ -183,9 +174,8 @@ impl TabHandle {
         &self,
         request: renderer::ScreenshotRequest,
     ) -> Result<Vec<u8>, TabError> {
-        let (reply, rx) = oneshot::channel();
-        self.send(Command::Screenshot { request, reply }).await?;
-        recv_result(rx).await
+        self.request_fallible(move |reply| Command::Screenshot { request, reply })
+            .await
     }
 
     /// Waits until the current navigation has fired `load`, returning `false`
@@ -195,10 +185,8 @@ impl TabHandle {
     ///
     /// [`TabError::ActorStopped`].
     pub async fn run_until_load_timeout(&self, timeout: Duration) -> Result<bool, TabError> {
-        let (reply, rx) = oneshot::channel();
-        self.send(Command::RunUntilLoadTimeout { timeout, reply })
-            .await?;
-        recv_result(rx).await
+        self.request_fallible(move |reply| Command::RunUntilLoadTimeout { timeout, reply })
+            .await
     }
 
     /// Waits until `source` evaluates to JS `true`, returning `false` on timeout.
@@ -211,14 +199,13 @@ impl TabHandle {
         source: &str,
         timeout: Duration,
     ) -> Result<bool, TabError> {
-        let (reply, rx) = oneshot::channel();
-        self.send(Command::RunUntilJsTrue {
-            source: source.to_owned(),
+        let source = source.to_owned();
+        self.request_fallible(move |reply| Command::RunUntilJsTrue {
+            source,
             timeout,
             reply,
         })
-        .await?;
-        recv_result(rx).await
+        .await
     }
 
     /// Document URL after navigation.
@@ -227,9 +214,7 @@ impl TabHandle {
     ///
     /// [`TabError::ActorStopped`].
     pub async fn document_url(&self) -> Result<String, TabError> {
-        let (reply, rx) = oneshot::channel();
-        self.send(Command::DocumentUrl { reply }).await?;
-        rx.await.map_err(|_| TabError::ActorStopped)
+        self.request(|reply| Command::DocumentUrl { reply }).await
     }
 
     /// Subscribes to tab events emitted after this call.
@@ -238,9 +223,8 @@ impl TabHandle {
     ///
     /// [`TabError::ActorStopped`] when the coordinator has shut down.
     pub async fn subscribe(&self) -> Result<mpsc::Receiver<TabEvent>, TabError> {
-        let (reply, rx) = oneshot::channel();
-        self.send(Command::Subscribe { reply }).await?;
-        recv_result(rx).await
+        self.request_fallible(|reply| Command::Subscribe { reply })
+            .await
     }
 
     /// True when the last navigation dial failed.
@@ -249,9 +233,26 @@ impl TabHandle {
     ///
     /// [`TabError::ActorStopped`].
     pub async fn last_navigation_failed(&self) -> Result<bool, TabError> {
+        self.request(|reply| Command::LastNavigationFailed { reply })
+            .await
+    }
+
+    /// Sends one command and waits for its reply.
+    async fn request<T>(
+        &self,
+        command: impl FnOnce(oneshot::Sender<T>) -> Command,
+    ) -> Result<T, TabError> {
         let (reply, rx) = oneshot::channel();
-        self.send(Command::LastNavigationFailed { reply }).await?;
+        self.send(command(reply)).await?;
         rx.await.map_err(|_| TabError::ActorStopped)
+    }
+
+    /// Sends one command whose reply carries its own failure.
+    async fn request_fallible<T>(
+        &self,
+        command: impl FnOnce(oneshot::Sender<Result<T, TabError>>) -> Command,
+    ) -> Result<T, TabError> {
+        self.request(command).await.and_then(|result| result)
     }
 
     /// Queues one command for the coordinator task.
@@ -265,10 +266,6 @@ impl TabHandle {
             .await
             .map_err(|_| TabError::ActorStopped)
     }
-}
-
-async fn recv_result<T>(rx: oneshot::Receiver<Result<T, TabError>>) -> Result<T, TabError> {
-    rx.await.unwrap_or(Err(TabError::ActorStopped))
 }
 
 /// Join handle and command sender for one tab coordinator task.
