@@ -1,25 +1,27 @@
 # Handoff (2026-09-18)
 
-State: working tree on `main` adds always-in screenshot rendering. Gates on
-this tree: `tools/ub lint` (clippy, workspace, all targets), `cargo test
---workspace` (30 suites), `tools/playwright/run` (7 passed), `tools/cdp/run`
-(Blink corpus 1/1), `tools/wpt/score webmessaging/` (106/136, unchanged), and
-release binary **8,118,512 bytes** (1.9 MB under the cap). Screenshots ride
-CDP `Page.captureScreenshot` and WebDriver `GET /session/{id}/screenshot`.
+State: branch `chase/screenshot`, rebased onto `chase/size-flags`. The size
+slice underneath brought the hand-rolled CLI (no clap), hyper-direct servers
+(no axum), and linker/C-flag knobs; this branch adds the Stylo cascade.
+Gates on this tree: `tools/ub lint` (clippy, workspace, all targets), `cargo
+test --workspace` (32 suites), `tools/playwright/run` (7 passed), and release
+binary **9,416,800 bytes** (583 KB under the cap). Screenshots ride CDP
+`Page.captureScreenshot` and WebDriver `GET /session/{id}/screenshot`.
 
 ## What shipped
 
-- **`crates/render`**: one-shot pipeline from `dom::Dom` to PNG. CSS parse and
-  cascade (`cssparser` through the DOM's selector engine), UA stylesheet,
-  `@media` width queries, Taffy 0.14 box layout (block flow with margin
-  collapsing, flex, grid, floats, absolute positioning) with inline
-  formatting contexts measured through Taffy's measure hooks, Parley text
-  shaping with `skrifa` outlines painted by `tiny-skia`, `png` encode. Module
-  docs cite the specs; the README lists the prior art (`NetSurf`, Dillo,
-  Obscura, Blitz, Kitesurf) and the non-goals.
-- **`dom`**: `Dom::compile_selectors` + `CompiledSelectors::matching_specificity`
-  compile a style rule once and match many elements without recompiling
-  (`crates/dom/src/select.rs`).
+- **`crates/render`**: one-shot pipeline from `dom::Dom` to PNG. Styling runs
+  through Servo's Stylo (`stylo.rs`, `stylo_view.rs`, `stylo_map.rs`):
+  selector matching, inheritance, and the full property database, mapped to
+  the layout model the engine implements. Taffy 0.14 box layout (block flow
+  with margin collapsing, flex, grid, floats, absolute positioning) with
+  inline formatting contexts measured through Taffy's measure hooks, Parley
+  text shaping with `skrifa` outlines painted by `tiny-skia`, `png` encode.
+  Module docs cite the specs; the README lists the prior art (`NetSurf`,
+  Dillo, Obscura, Blitz, Kitesurf) and the non-goals.
+- **`dom`**: the selector engine (`crates/dom/src/select.rs`, `cssparser` +
+  `selectors`) now serves only the JS `querySelector`/`matches` bindings; the
+  render cascade no longer uses it.
 - **IPC**: `Command::Screenshot { frame, request }` and `Reply::Screenshot`;
   the PNG streams browser-ward as bounded body frames on the same request id
   (no base64 through the control plane). `PROTOCOL_VERSION` is 4. The three
@@ -52,12 +54,14 @@ only Latin coverage is tested), text does not wrap around floats yet, no
 per-element or `fullPage` layout metrics (`contentSize` reports the
 viewport), no device scale factor. Screenshots capture the viewport at
 800x600 unless the caller's clip asks for a larger one.
-`getComputedStyle`-style queries do not exist yet.
+`getComputedStyle`-style queries do not exist yet. The cascade is Stylo's
+full property database, but `stylo_map` only forwards the properties the
+box tree, Taffy, Parley, and paint implement.
 
 ## Next, in order
 
-1. Stylo: full property database and cascade (needs python3+mako in the
-   flake, a LICENSE file for MPL-2.0, and the `TElement` impl).
+1. CSS conformance: run a WPT `css/` group to measure the Stylo cascade, and
+   fold the misses into the `stylo_map` subset notes.
 2. Images: PNG decode via the `png` crate (already shipped) painted into
    `LayoutBox` replaced boxes; JPEG later.
 3. `border-radius`/opacity, then more CSS as real fixtures demand.
@@ -73,4 +77,10 @@ viewport), no device scale factor. Screenshots capture the viewport at
   handshake, not serde.
 - Playwright always sends `clip` with `scale`; the renderer crops but ignores
   non-unit scale.
-- Scratch WPT files must be deleted before committing; commits are unsigned.
+- Scratch WPT files must be deleted before committing. Commits before the
+  Stylo slice are unsigned; this branch's new commits are signed.
+- Stylo is MPL-2.0: distributing binaries needs the license and source
+  notice, which this repo does not carry yet.
+- Stylo gates `display: grid` behind `layout.grid.enabled`; the cascade sets
+  that pref (and `layout.unimplemented`) before building the `Stylist`.
+

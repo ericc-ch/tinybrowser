@@ -30,7 +30,8 @@ fn qual_name(dom: &Dom, id: NodeId) -> Option<&QualName> {
 
 /// Whether the element lives in the HTML namespace: the case-regime switch
 /// shared with selector name matching in `select.rs`.
-pub(crate) fn is_html(dom: &Dom, id: NodeId) -> bool {
+#[must_use]
+pub fn is_html(dom: &Dom, id: NodeId) -> bool {
     qual_name(dom, id).is_some_and(|name| name.ns == html_namespace())
 }
 
@@ -38,7 +39,8 @@ pub(crate) fn is_html(dom: &Dom, id: NodeId) -> bool {
 /// ASCII-insensitive for HTML elements, exact elsewhere, so hand-built
 /// `<INPUT>` behaves like tokenized `<input>`. This is the single
 /// definition of that policy; selector-side name checks route here too.
-pub(crate) fn local_is(dom: &Dom, id: NodeId, names: &[&str]) -> bool {
+#[must_use]
+pub fn local_is(dom: &Dom, id: NodeId, names: &[&str]) -> bool {
     let Some(name) = qual_name(dom, id) else {
         return false;
     };
@@ -59,7 +61,8 @@ pub(crate) fn local_is(dom: &Dom, id: NodeId, names: &[&str]) -> bool {
 /// namespace (legacy `xlink:href` deliberately does not count; modern SVG2
 /// dropped it, and one lookup policy keeps `[href]` and `:link` answers
 /// consistent).
-pub(crate) fn attr_value<'a>(dom: &'a Dom, id: NodeId, name: &str) -> Option<&'a str> {
+#[must_use]
+pub fn attr_value<'a>(dom: &'a Dom, id: NodeId, name: &str) -> Option<&'a str> {
     let (_, attributes) = dom.element(id)?;
     let html = is_html(dom, id);
     attributes.iter().find_map(|attribute| {
@@ -123,7 +126,8 @@ fn lang_range_matches(range: &str, tag: &str) -> bool {
 /// hyperlink status the same way
 /// (<https://svgwg.org/svg2-draft/struct.html#__svg__SVGElementElement>),
 /// which is why HTML-only matching would miss SVG `<a href>`.
-pub(crate) fn is_hyperlink(dom: &Dom, id: NodeId) -> bool {
+#[must_use]
+pub fn is_hyperlink(dom: &Dom, id: NodeId) -> bool {
     local_is(dom, id, &["a", "area", "link"]) && attr_value(dom, id, "href").is_some()
 }
 
@@ -152,7 +156,8 @@ fn is_form_control(dom: &Dom, id: NodeId) -> bool {
 /// `option`/`optgroup`, when its nearest ancestor `select` is disabled; or,
 /// for an `option`, when its direct parent `optgroup` is disabled
 /// (§4.10.11).
-pub(crate) fn is_disabled(dom: &Dom, id: NodeId) -> bool {
+#[must_use]
+pub fn is_disabled(dom: &Dom, id: NodeId) -> bool {
     if !is_form_control(dom, id) {
         return false;
     }
@@ -196,7 +201,8 @@ fn disabled_by_fieldset(dom: &Dom, id: NodeId) -> bool {
 /// `:enabled`, the negation of [`is_disabled`] *among disableable
 /// elements* (<https://html.spec.whatwg.org/#selector-enabled>): a `div`
 /// without `disabled` is not "enabled", it is out of scope.
-pub(crate) fn is_enabled(dom: &Dom, id: NodeId) -> bool {
+#[must_use]
+pub fn is_enabled(dom: &Dom, id: NodeId) -> bool {
     is_form_control(dom, id) && !is_disabled(dom, id)
 }
 
@@ -234,7 +240,8 @@ fn checked_input(dom: &Dom, id: NodeId) -> bool {
 /// of its list of options is selected when nothing in that list carries
 /// `selected`, and the list flattens `optgroup`s), so fresh parsed pages
 /// answer as browsers do.
-pub(crate) fn is_checked(dom: &Dom, id: NodeId) -> bool {
+#[must_use]
+pub fn is_checked(dom: &Dom, id: NodeId) -> bool {
     if checked_input(dom, id) {
         return true;
     }
@@ -272,12 +279,14 @@ fn constraint_target(dom: &Dom, id: NodeId) -> bool {
 }
 
 /// `:required` (<https://html.spec.whatwg.org/#selector-required>).
-pub(crate) fn is_required(dom: &Dom, id: NodeId) -> bool {
+#[must_use]
+pub fn is_required(dom: &Dom, id: NodeId) -> bool {
     constraint_target(dom, id) && attr_value(dom, id, "required").is_some()
 }
 
 /// `:optional`: the same population without `required`.
-pub(crate) fn is_optional(dom: &Dom, id: NodeId) -> bool {
+#[must_use]
+pub fn is_optional(dom: &Dom, id: NodeId) -> bool {
     constraint_target(dom, id) && attr_value(dom, id, "required").is_none()
 }
 
@@ -287,7 +296,8 @@ pub(crate) fn is_optional(dom: &Dom, id: NodeId) -> bool {
 /// reading, Firefox makes *all* non-editable elements `:read-only`, is
 /// the documented counter-engine; `contenteditable` hosts have no
 /// representation in this tree yet.)
-pub(crate) fn is_read_only(dom: &Dom, id: NodeId) -> bool {
+#[must_use]
+pub fn is_read_only(dom: &Dom, id: NodeId) -> bool {
     if !local_is(dom, id, &["input", "textarea"]) {
         return false;
     }
@@ -297,7 +307,8 @@ pub(crate) fn is_read_only(dom: &Dom, id: NodeId) -> bool {
 /// `:read-write`, an editable control: the same `input`/`textarea`
 /// population that is not [`is_read_only`]. Non-form elements match neither
 /// state, following the Chrome reading above.
-pub(crate) fn is_read_write(dom: &Dom, id: NodeId) -> bool {
+#[must_use]
+pub fn is_read_write(dom: &Dom, id: NodeId) -> bool {
     local_is(dom, id, &["input", "textarea"]) && !is_read_only(dom, id)
 }
 
@@ -316,7 +327,8 @@ fn placeholder_capable_type(dom: &Dom, id: NodeId) -> bool {
 /// For an `input` that means a placeholder-capable type with an absent or
 /// empty `value`; for a `textarea` the value *is* its text content, so any
 /// non-empty text hides it.
-pub(crate) fn is_placeholder_shown(dom: &Dom, id: NodeId) -> bool {
+#[must_use]
+pub fn is_placeholder_shown(dom: &Dom, id: NodeId) -> bool {
     if attr_value(dom, id, "placeholder").is_none() {
         return false;
     }
@@ -343,14 +355,16 @@ pub(crate) fn is_placeholder_shown(dom: &Dom, id: NodeId) -> bool {
 /// `:default`, static subset of <https://html.spec.whatwg.org/#selector-default>:
 /// checkbox/radio inputs with `checked`, options with `selected`. Form
 /// default-submit buttons are not represented (no form-owner association).
-pub(crate) fn is_default(dom: &Dom, id: NodeId) -> bool {
+#[must_use]
+pub fn is_default(dom: &Dom, id: NodeId) -> bool {
     checked_input(dom, id) || (local_is(dom, id, &["option"]) && has_selected_attribute(dom, id))
 }
 
 /// `:indeterminate`, static subset: a `progress` without a `value`
 /// attribute (<https://html.spec.whatwg.org/#the-progress-element>). Radio
 /// groups are not represented (no form-owner association).
-pub(crate) fn is_indeterminate(dom: &Dom, id: NodeId) -> bool {
+#[must_use]
+pub fn is_indeterminate(dom: &Dom, id: NodeId) -> bool {
     local_is(dom, id, &["progress"]) && attr_value(dom, id, "value").is_none()
 }
 
@@ -359,7 +373,8 @@ pub(crate) fn is_indeterminate(dom: &Dom, id: NodeId) -> bool {
 /// element*, an HTML-ns name containing `-` that is not one of the
 /// reserved hyphenated names. No custom-element registry exists here, so
 /// every other hyphenated HTML name is undefined.
-pub(crate) fn is_defined(dom: &Dom, id: NodeId) -> bool {
+#[must_use]
+pub fn is_defined(dom: &Dom, id: NodeId) -> bool {
     const RESERVED: &[&str] = &[
         "annotation-xml",
         "font-face",
@@ -396,7 +411,8 @@ pub(crate) fn is_defined(dom: &Dom, id: NodeId) -> bool {
 /// `xml:lang` takes precedence over `lang`, then the document
 /// `Content-Language` default
 /// (<https://html.spec.whatwg.org/multipage/dom.html#language>).
-pub(crate) fn lang_matches(dom: &Dom, id: NodeId, ranges: &[Box<str>]) -> bool {
+#[must_use]
+pub fn lang_matches(dom: &Dom, id: NodeId, ranges: &[Box<str>]) -> bool {
     let found = std::iter::once(id)
         .chain(dom.ancestors(id))
         .find_map(|current| {
@@ -430,7 +446,8 @@ fn dir_attr(dom: &Dom, id: NodeId) -> Option<&str> {
 /// of `ltr`/`rtl` (<https://drafts.csswg.org/selectors-4/#dir-pseudo>).
 /// Defaults to `ltr`. `dir="auto"` is not classified (needs first-strong
 /// bidi); invalid values inherit, per Undefined direction.
-pub(crate) fn direction_is(dom: &Dom, id: NodeId, want: &str) -> bool {
+#[must_use]
+pub fn direction_is(dom: &Dom, id: NodeId, want: &str) -> bool {
     std::iter::once(id)
         .chain(dom.ancestors(id))
         .find_map(|current| dir_attr(dom, current))

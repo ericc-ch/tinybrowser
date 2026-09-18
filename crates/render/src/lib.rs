@@ -6,9 +6,10 @@
 //! tree, lay it out, paint a display list into an RGBA buffer, encode once.
 //! Nothing here is incremental; a screenshot runs the whole pipeline per call.
 //!
-//! Scope is deliberately a CSS subset: the milestone is one bitmap that shows
-//! real page structure, not a compositor. Every algorithm follows the CSS
-//! specs and browser behavior within what the subset implements, and the
+//! Scope on the cascade side is the whole CSS cascade: Stylo owns selector
+//! matching, inheritance, and computed values. What stays a deliberate subset
+//! is layout and paint — the property mappings in `stylo_map.rs` feed only
+//! what the box tree, Taffy, Parley, and the CPU painter implement, and the
 //! unsupported cases are documented instead of approximated silently.
 //!
 //! Layout is split the way the CSS formatting model is:
@@ -26,6 +27,9 @@
 #![doc = include_str!("../README.md")]
 
 mod cascade;
+mod stylo;
+mod stylo_map;
+mod stylo_view;
 mod color;
 
 mod font;

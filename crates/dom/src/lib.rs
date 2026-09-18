@@ -23,6 +23,12 @@ mod node;
 mod select;
 mod state;
 
+pub use state::{
+    attr_value, direction_is, is_checked, is_default, is_defined, is_disabled, is_enabled,
+    is_html, is_hyperlink, is_indeterminate, is_optional, is_placeholder_shown, is_read_only,
+    is_read_write, is_required, lang_matches, local_is,
+};
+
 pub use arena::{Dom, DomError, Lifecycle, Mutation, QuirksMode};
 pub use id::NodeId;
 pub use node::{

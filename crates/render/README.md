@@ -10,18 +10,22 @@ rasterizer.
 
 ## Pipeline
 
-1. **Style** (`style.rs`, `cascade.rs`) — parse `<style>` text and fetched
-   sheets with `cssparser`, match selectors through the DOM's `selectors`
-   integration, cascade to a computed `Style` per element. Follows CSS
-   Cascade, CSS Values, and CSS Color.
+1. **Style** (`stylo.rs`, `stylo_view.rs`, `stylo_map.rs`, `style.rs`) —
+   one-shot styling through Servo's Stylo engine: parse `<style>` text and
+   fetched sheets, match selectors, cascade and inherit to a
+   `ComputedValues` per element, then map the properties the layout engine
+   implements into the small computed `Style` in `style.rs`. Cascade,
+   selector matching, and the property database follow the CSS specs; the
+   mapping keeps the documented subset behavior.
 2. **Box tree** (`tree.rs`) — anonymous block and inline boxes per CSS
    Display, `display: none` pruned.
-3. **Layout** (`layout.rs`, `boxes.rs`) — inline formatting with line boxes
-   in `layout.rs`; all box-level layout (block flow with margin collapsing,
-   flex, floats, absolute positioning) through Taffy 0.14 in `boxes.rs`, with
-   inline formatting contexts measured through Taffy's measure hooks.
-4. **Paint** (`paint.rs`) — backgrounds, borders, and text into a
-   `tiny-skia` pixmap.
+3. **Layout** (`layout.rs`, `boxes.rs`) — inline formatting with Parley
+   shaping and UAX#14 line breaking in `layout.rs`; all box-level layout
+   (block flow with margin collapsing, flex, grid, floats, absolute
+   positioning) through Taffy 0.14 in `boxes.rs`, with inline formatting
+   contexts measured through Taffy's measure hooks.
+4. **Paint** (`paint.rs`) — backgrounds and borders into a `tiny-skia`
+   pixmap; shaped glyph IDs rasterize through `skrifa` outlines.
 5. **Encode** (`png.rs`) — one PNG per call.
 
 ## Prior art

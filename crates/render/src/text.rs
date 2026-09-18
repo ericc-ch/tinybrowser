@@ -6,10 +6,10 @@
 //! (UAX#14), and alignment; this module translates our styles in and painted
 //! runs back out.
 //!
-//! Intrinsic widths (`measure`, `min_content_width`) stay on `fontdue`
-//! advances: they answer per-word questions Parley is not asked. Paint reads
-//! glyph IDs and positions from here and rasterizes through `skrifa`
-//! outlines, so shaped text paints exactly as positioned.
+//! Intrinsic widths (`measure`, `min_content_width`) read `skrifa` advance
+//! widths directly: they answer per-word questions Parley is not asked.
+//! Paint reads glyph IDs and positions from here and rasterizes through
+//! `skrifa` outlines, so shaped text paints exactly as positioned.
 
 use parley::layout::PositionedLayoutItem;
 use parley::style::{
@@ -124,16 +124,23 @@ pub(crate) struct PlacedLine {
 }
 
 impl Fonts {
-    /// The advance width of one character.
-    pub(crate) fn advance(&self, ch: char, style: FontStyle) -> f32 {
-        self.face(style.weight).metrics(ch, style.size).advance_width
-    }
-
-    /// The advance width of a string with no shaping or kerning.
+    /// The advance width of a string with no shaping or kerning, from the
+    /// face's own `hmtx` table.
     ///
-    /// Intrinsic widths only; painted text is shaped by Parley.
+    /// Intrinsic widths only; painted text is shaped by Parley, which applies
+    /// kerning and ligatures itself.
     pub(crate) fn measure(&self, text: &str, style: FontStyle) -> f32 {
-        text.chars().map(|ch| self.advance(ch, style)).sum()
+        use skrifa::instance::{LocationRef, NormalizedCoord, Size};
+        use skrifa::MetadataProvider as _;
+        let face = self.outline_face(style.weight);
+        let charmap = face.charmap();
+        let coords: &[NormalizedCoord] = &[];
+        let metrics =
+            skrifa::metrics::GlyphMetrics::new(&face, Size::new(style.size), LocationRef::from(coords));
+        text.chars()
+            .filter_map(|ch| charmap.map(ch))
+            .filter_map(|glyph| metrics.advance_width(glyph))
+            .sum()
     }
 }
 

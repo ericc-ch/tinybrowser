@@ -82,30 +82,14 @@ struct Builder<'a> {
 
 /// Lays out the root wrapper through Taffy.
 pub(crate) fn layout_root(root: &BoxNode, fonts: &Fonts, viewport_width: f32, viewport_height: f32) -> LayoutBox {
-    let ctx = Ctx {
-        fonts,
-        root_font_size: root.style.font_size,
-    };
+    let ctx = Ctx { fonts };
     let mut builder = Builder::new(&ctx);
     let root_id = builder.build_node(root);
     let available = TaffySize {
         width: TaffyAvailableSpace::Definite(viewport_width),
         height: TaffyAvailableSpace::MaxContent,
     };
-    // The measure closure borrows only runs/cache/ctx, disjoint from the
-    // tree it measures into.
-    let Builder {
-        tree,
-        runs,
-        cache,
-        data,
-        ctx,
-        ..
-    } = &mut builder;
-    tree.compute_layout_with_measure(root_id, available, |input, node, context, _| {
-        measure_leaf(runs, cache, data, ctx, input, node, context)
-    })
-    .expect("taffy layout cannot fail on a tree we built");
+    builder.run_layout(root_id, available);
     let layout = builder.convert(root_id, 0.0, 0.0, viewport_width);
     Builder::finish_root(layout, viewport_height)
 }
@@ -126,18 +110,7 @@ pub(crate) fn layout_subtree(node: &BoxNode, ctx: &Ctx<'_>, available: f32) -> L
         width: TaffyAvailableSpace::Definite(available.max(0.0)),
         height: TaffyAvailableSpace::MaxContent,
     };
-    let Builder {
-        tree,
-        runs,
-        cache,
-        data,
-        ctx,
-        ..
-    } = &mut builder;
-    tree.compute_layout_with_measure(root_id, space, |input, id, context, _| {
-        measure_leaf(runs, cache, data, ctx, input, id, context)
-    })
-    .expect("taffy layout cannot fail on a tree we built");
+    builder.run_layout(root_id, space);
     builder.convert(root_id, 0.0, 0.0, available)
 }
 
@@ -181,7 +154,7 @@ fn measure_leaf(
             // routes these through measure, so resolve the style size here
             // instead of reporting zero.
             if let Some(known) = data.get(&node) {
-                styled_size(&known.style, ctx, &input)
+                styled_size(&known.style, &input)
             } else {
                 (
                     input.known_dimensions.width.unwrap_or(0.0),
@@ -195,7 +168,7 @@ fn measure_leaf(
 
 /// Resolves an empty element box's style size for the measure fallback.
 /// Percentages resolve against the parent size when Taffy supplies one.
-fn styled_size(style: &Style, ctx: &Ctx<'_>, input: &LayoutInput) -> (f32, f32) {
+fn styled_size(style: &Style, input: &LayoutInput) -> (f32, f32) {
     let basis = |axis: Option<f32>, available: TaffyAvailableSpace| {
         axis
             .or(match available {
@@ -209,7 +182,7 @@ fn styled_size(style: &Style, ctx: &Ctx<'_>, input: &LayoutInput) -> (f32, f32) 
     let resolve = |dimension: Dimension, basis: f32| match dimension {
         Dimension::Auto => None,
         Dimension::Length(length) => {
-            Some(length.resolve(basis, style.font_size, ctx.root_font_size))
+            Some(length.resolve(basis))
         }
     };
     let width = input
@@ -255,6 +228,28 @@ impl<'a> Builder<'a> {
         }
     }
 
+    /// Runs Taffy's layout over the built tree.
+    ///
+    /// One method owns the measure closure so both entry points instantiate
+    /// Taffy's generic compute machinery exactly once (the closure type is
+    /// part of that instantiation; two closures would double its code).
+    fn run_layout(&mut self, root: taffy::NodeId, available: TaffySize<TaffyAvailableSpace>) {
+        // The measure closure borrows only runs/cache/data/ctx, disjoint from
+        // the tree it measures into.
+        let Builder {
+            tree,
+            runs,
+            cache,
+            data,
+            ctx,
+            ..
+        } = self;
+        tree.compute_layout_with_measure(root, available, |input, node, context, _| {
+            measure_leaf(runs, cache, data, ctx, input, node, context)
+        })
+        .expect("taffy layout cannot fail on a tree we built");
+    }
+
     /// Adds `node` and its subtree, returning the Taffy node.
     fn build_node(&mut self, node: &'a BoxNode) -> taffy::NodeId {
         match &node.kind {
@@ -278,7 +273,7 @@ impl<'a> Builder<'a> {
 
     /// Adds one flex container and its blockified items.
     fn build_flex(&mut self, node: &'a BoxNode) -> taffy::NodeId {
-        let style = convert_style(&node.style, self.ctx.root_font_size);
+        let style = convert_style(&node.style);
         // Flex items are blockified: every child becomes its own item
         // (<https://drafts.csswg.org/css-flexbox-1/#flex-items>), in
         // `order` (<https://drafts.csswg.org/css-flexbox-1/#order-property>).
@@ -303,7 +298,7 @@ impl<'a> Builder<'a> {
 
     /// Adds one grid container and its blockified items.
     fn build_grid(&mut self, node: &'a BoxNode) -> taffy::NodeId {
-        let style = convert_style(&node.style, self.ctx.root_font_size);
+        let style = convert_style(&node.style);
         // Grid items are blockified like flex items
         // (<https://drafts.csswg.org/css-grid-1/#grid-items>).
         let mut children: Vec<&BoxNode> = node.children.iter().collect();
@@ -329,7 +324,7 @@ impl<'a> Builder<'a> {
             // An inline formatting context: one measured leaf.
             self.build_leaf(&node.children, node.style.text_align, &node.style)
         } else {
-            let style = convert_style(&node.style, self.ctx.root_font_size);
+            let style = convert_style(&node.style);
             let mut ids = Vec::with_capacity(node.children.len());
             for child in &node.children {
                 ids.push(self.build_node(child));
@@ -412,7 +407,7 @@ impl<'a> Builder<'a> {
     ) -> taffy::NodeId {
         let run_index = self.runs.len();
         self.runs.push(InlineRun { nodes: run, text_align });
-        let mut converted = convert_style(style, self.ctx.root_font_size);
+        let mut converted = convert_style(style);
         converted.display = TaffyDisplay::Block;
         let id = self
             .tree
@@ -442,7 +437,7 @@ impl<'a> Builder<'a> {
         let layout = *self.tree.layout(node).expect("computed layout");
         let data = self.data.remove(&node).expect("node data");
         let padding = data.style.padding.map(|length| {
-            length.resolve(parent_content_width, data.style.font_size, self.ctx.root_font_size)
+            length.resolve(parent_content_width)
         });
         let rect = Rect::new(
             x + layout.location.x,
@@ -524,8 +519,7 @@ impl<'a> Builder<'a> {
     clippy::too_many_lines,
     reason = "the style conversion table: one arm per mapped CSS longhand keeps the mapping auditable in one place"
 )]
-fn convert_style(style: &Style, root_font_size: f32) -> TaffyStyle {
-    let font_size = style.font_size;
+fn convert_style(style: &Style) -> TaffyStyle {
     TaffyStyle {
         display: match style.display {
             Display::None => TaffyDisplay::None,
@@ -542,34 +536,34 @@ fn convert_style(style: &Style, root_font_size: f32) -> TaffyStyle {
             Position::Absolute | Position::Fixed => TaffyPosition::Absolute,
         },
         inset: TaffyRect {
-            left: to_auto(style.inset_left, font_size, root_font_size),
-            right: to_auto(style.inset_right, font_size, root_font_size),
-            top: to_auto(style.inset_top, font_size, root_font_size),
-            bottom: to_auto(style.inset_bottom, font_size, root_font_size),
+            left: to_auto(style.inset_left),
+            right: to_auto(style.inset_right),
+            top: to_auto(style.inset_top),
+            bottom: to_auto(style.inset_bottom),
         },
         size: TaffySize {
-            width: to_dimension(style.width, font_size, root_font_size),
-            height: to_dimension(style.height, font_size, root_font_size),
+            width: to_dimension(style.width),
+            height: to_dimension(style.height),
         },
         min_size: TaffySize {
-            width: to_auto(style.min_width, font_size, root_font_size),
-            height: to_auto(style.min_height, font_size, root_font_size),
+            width: to_auto(style.min_width),
+            height: to_auto(style.min_height),
         },
         max_size: TaffySize {
-            width: to_auto(style.max_width, font_size, root_font_size),
-            height: to_auto(style.max_height, font_size, root_font_size),
+            width: to_auto(style.max_width),
+            height: to_auto(style.max_height),
         },
         margin: TaffyRect {
-            left: to_auto(style.margin.left, font_size, root_font_size),
-            right: to_auto(style.margin.right, font_size, root_font_size),
-            top: to_auto(style.margin.top, font_size, root_font_size),
-            bottom: to_auto(style.margin.bottom, font_size, root_font_size),
+            left: to_auto(style.margin.left),
+            right: to_auto(style.margin.right),
+            top: to_auto(style.margin.top),
+            bottom: to_auto(style.margin.bottom),
         },
         padding: TaffyRect {
-            left: to_length(style.padding.left, font_size, root_font_size),
-            right: to_length(style.padding.right, font_size, root_font_size),
-            top: to_length(style.padding.top, font_size, root_font_size),
-            bottom: to_length(style.padding.bottom, font_size, root_font_size),
+            left: to_length(style.padding.left),
+            right: to_length(style.padding.right),
+            top: to_length(style.padding.top),
+            bottom: to_length(style.padding.bottom),
         },
         border: TaffyRect {
             left: border_width(style.border.left.width),
@@ -609,7 +603,7 @@ fn convert_style(style: &Style, root_font_size: f32) -> TaffyStyle {
         },
         flex_grow: style.flex_grow,
         flex_shrink: style.flex_shrink,
-        flex_basis: to_dimension(style.flex_basis, font_size, root_font_size),
+        flex_basis: to_dimension(style.flex_basis),
         justify_content: Some(match style.justify_content {
             JustifyContent::FlexStart => TaffyJustifyContent::FLEX_START,
             JustifyContent::FlexEnd => TaffyJustifyContent::FLEX_END,
@@ -628,11 +622,11 @@ fn convert_style(style: &Style, root_font_size: f32) -> TaffyStyle {
             AlignContent::SpaceAround => TaffyAlignContent::SPACE_AROUND,
         }),
         gap: TaffySize {
-            width: to_length(style.column_gap, font_size, root_font_size),
-            height: to_length(style.row_gap, font_size, root_font_size),
+            width: to_length(style.column_gap),
+            height: to_length(style.row_gap),
         },
-        grid_template_columns: map_tracks(&style.grid_template_columns, font_size, root_font_size),
-        grid_template_rows: map_tracks(&style.grid_template_rows, font_size, root_font_size),
+        grid_template_columns: map_tracks(&style.grid_template_columns),
+        grid_template_rows: map_tracks(&style.grid_template_rows),
         justify_items: Some(map_align(style.justify_items)),
         ..TaffyStyle::default()
     }
@@ -664,48 +658,33 @@ fn map_placement(placement: GridPlacement) -> taffy::GridPlacement {
 }
 
 /// Maps a template track list.
-fn map_tracks(
-    tracks: &[GridTrack],
-    font_size: f32,
-    root_font_size: f32,
-) -> Vec<GridTemplateComponent<String>> {
+fn map_tracks(tracks: &[GridTrack]) -> Vec<GridTemplateComponent<String>> {
     let mut out = Vec::new();
     for track in tracks {
-        push_track(track, &mut out, font_size, root_font_size);
+        push_track(track, &mut out);
     }
     out
 }
 
 /// Appends one track, expanding repeats.
-fn push_track(
-    track: &GridTrack,
-    out: &mut Vec<GridTemplateComponent<String>>,
-    font_size: f32,
-    root_font_size: f32,
-) {
+fn push_track(track: &GridTrack, out: &mut Vec<GridTemplateComponent<String>>) {
     match track {
-        GridTrack::Single(size) => out.push(GridTemplateComponent::<String>::Single(map_track_size(
-            size,
-            font_size,
-            root_font_size,
-        ))),
+        GridTrack::Single(size) => out.push(GridTemplateComponent::<String>::Single(
+            map_track_size(size),
+        )),
         GridTrack::MinMax(min, max) => out.push(GridTemplateComponent::<String>::Single(TrackSizingFunction {
-            min: map_min_size(min, font_size, root_font_size),
-            max: map_max_size(max, font_size, root_font_size),
+            min: map_min_size(min),
+            max: map_max_size(max),
         })),
         GridTrack::Repeat(count, tracks) => {
             let mut repeated = Vec::with_capacity(tracks.len());
             for track in tracks {
                 // Nested repeats are rejected at parse time; skip defensively.
                 match track {
-                    GridTrack::Single(size) => repeated.push(map_track_size(
-                        size,
-                        font_size,
-                        root_font_size,
-                    )),
+                    GridTrack::Single(size) => repeated.push(map_track_size(size)),
                     GridTrack::MinMax(min, max) => repeated.push(TrackSizingFunction {
-                        min: map_min_size(min, font_size, root_font_size),
-                        max: map_max_size(max, font_size, root_font_size),
+                        min: map_min_size(min),
+                        max: map_max_size(max),
                     }),
                     GridTrack::Repeat(_, _) => {}
                 }
@@ -720,11 +699,11 @@ fn push_track(
 }
 
 /// Maps one track size.
-fn map_track_size(size: &TrackSize, font_size: f32, root_font_size: f32) -> TrackSizingFunction {
+fn map_track_size(size: &TrackSize) -> TrackSizingFunction {
     match size {
         TrackSize::Auto => TrackSizingFunction::AUTO,
         TrackSize::Length(length) => {
-            TrackSizingFunction::from(to_length(*length, font_size, root_font_size))
+            TrackSizingFunction::from(to_length(*length))
         }
         TrackSize::Flex(flex) => TrackSizingFunction::from_fr(*flex),
     }
@@ -732,21 +711,21 @@ fn map_track_size(size: &TrackSize, font_size: f32, root_font_size: f32) -> Trac
 
 /// Maps a min-track size; flexible fractions are invalid here and fall back
 /// to `auto`.
-fn map_min_size(size: &TrackSize, font_size: f32, root_font_size: f32) -> MinTrackSizingFunction {
+fn map_min_size(size: &TrackSize) -> MinTrackSizingFunction {
     match size {
         TrackSize::Auto | TrackSize::Flex(_) => MinTrackSizingFunction::AUTO,
         TrackSize::Length(length) => {
-            MinTrackSizingFunction::from(to_length(*length, font_size, root_font_size))
+            MinTrackSizingFunction::from(to_length(*length))
         }
     }
 }
 
 /// Maps a max-track size.
-fn map_max_size(size: &TrackSize, font_size: f32, root_font_size: f32) -> MaxTrackSizingFunction {
+fn map_max_size(size: &TrackSize) -> MaxTrackSizingFunction {
     match size {
         TrackSize::Auto => MaxTrackSizingFunction::AUTO,
         TrackSize::Length(length) => {
-            MaxTrackSizingFunction::from(to_length(*length, font_size, root_font_size))
+            MaxTrackSizingFunction::from(to_length(*length))
         }
         TrackSize::Flex(flex) => MaxTrackSizingFunction::from_fr(*flex),
     }
@@ -792,44 +771,31 @@ fn resolve_align_self(value: AlignSelf, default: TaffyAlignItems) -> TaffyAlignI
     }
 }
 
-/// Converts a length, resolving font-relative units now. Percentages use
-/// Taffy's 0..=1 range.
-fn to_length(length: Length, font_size: f32, root_font_size: f32) -> taffy::LengthPercentage {
+/// Converts a length. Percentages use Taffy's 0..=1 range; font-relative
+/// units were already resolved by the cascade.
+fn to_length(length: Length) -> taffy::LengthPercentage {
     match length {
         Length::Px(value) => taffy::LengthPercentage::length(value),
         Length::Percent(value) => taffy::LengthPercentage::percent(value / 100.0),
-        Length::Em(value) => taffy::LengthPercentage::length(value * font_size),
-        Length::Rem(value) => taffy::LengthPercentage::length(value * root_font_size),
     }
 }
 
 /// Converts a dimension; `auto` stays symbolic.
-fn to_dimension(dimension: Dimension, font_size: f32, root_font_size: f32) -> taffy::Dimension {
+fn to_dimension(dimension: Dimension) -> taffy::Dimension {
     match dimension {
         Dimension::Auto => taffy::Dimension::AUTO,
-        Dimension::Length(length) => {
-            taffy::Dimension::from(to_length(length, font_size, root_font_size))
-        }
+        Dimension::Length(length) => taffy::Dimension::from(to_length(length)),
     }
 }
 
 /// Converts a margin or inset side; `auto` stays symbolic.
-fn to_auto(
-    dimension: Dimension,
-    font_size: f32,
-    root_font_size: f32,
-) -> taffy::LengthPercentageAuto {
+fn to_auto(dimension: Dimension) -> taffy::LengthPercentageAuto {
     match dimension {
         Dimension::Auto => taffy::LengthPercentageAuto::AUTO,
-        Dimension::Length(Length::Px(value)) => {
-            taffy::LengthPercentageAuto::from_length(value)
-        }
+        Dimension::Length(Length::Px(value)) => taffy::LengthPercentageAuto::from_length(value),
         Dimension::Length(Length::Percent(value)) => {
             taffy::LengthPercentageAuto::from_percent(value / 100.0)
         }
-        Dimension::Length(length) => taffy::LengthPercentageAuto::from_length(
-            length.resolve(0.0, font_size, root_font_size),
-        ),
     }
 }
 

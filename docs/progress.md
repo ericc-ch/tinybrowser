@@ -7,7 +7,7 @@ Size research lives in [`docs/researches/size-budget.md`](researches/size-budget
 
 Target: under 10MB stripped on x86_64.
 
-7,603,520 bytes (2026-09-18)
+9,416,800 bytes (2026-09-18)
 
 ```sh
 nix develop --command cargo build --release --bin tinybrowser

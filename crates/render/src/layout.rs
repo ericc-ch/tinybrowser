@@ -55,12 +55,10 @@ impl LayoutBox {
     }
 }
 
-/// Per-layout context: fonts and the root font size.
+/// Per-layout context: the embedded faces.
 pub(crate) struct Ctx<'a> {
     /// Embedded faces.
     pub(crate) fonts: &'a Fonts,
-    /// Root element font size for `rem`.
-    pub(crate) root_font_size: f32,
 }
 
 
@@ -313,7 +311,7 @@ fn measure_atomic(node: &BoxNode, ctx: &Ctx<'_>) -> Atomic {
     let margin = node.style.margin.map(|dimension| match dimension {
         Dimension::Auto => 0.0,
         Dimension::Length(length) => {
-            length.resolve(preferred, node.style.font_size, ctx.root_font_size)
+            length.resolve(preferred)
         }
     });
     Atomic {
@@ -408,10 +406,10 @@ fn min_content_node(node: &BoxNode, ctx: &Ctx<'_>) -> f32 {
 
 /// Padding plus border of a box: the difference between content and border
 /// box.
-fn outer_extras(node: &BoxNode, ctx: &Ctx<'_>) -> f32 {
+fn outer_extras(node: &BoxNode) -> f32 {
     let style = &node.style;
-    let padding = style.padding.left.resolve(0.0, style.font_size, ctx.root_font_size)
-        + style.padding.right.resolve(0.0, style.font_size, ctx.root_font_size);
+    let padding = style.padding.left.resolve(0.0)
+        + style.padding.right.resolve(0.0);
     padding + style.border.left.width + style.border.right.width
 }
 
@@ -419,7 +417,7 @@ fn outer_extras(node: &BoxNode, ctx: &Ctx<'_>) -> f32 {
 /// (<https://drafts.csswg.org/css-sizing-3/#max-content>).
 pub(crate) fn max_content_width(node: &BoxNode, ctx: &Ctx<'_>) -> f32 {
     let style = &node.style;
-    let extras = outer_extras(node, ctx);
+    let extras = outer_extras(node);
     let content = match &node.kind {
         BoxKind::Text(text) => {
             let font = FontStyle {
@@ -481,7 +479,7 @@ pub(crate) fn max_content_width(node: &BoxNode, ctx: &Ctx<'_>) -> f32 {
     };
     match style.width {
         Dimension::Length(length) => {
-            let value = length.resolve(0.0, style.font_size, ctx.root_font_size);
+            let value = length.resolve(0.0);
             if style.box_sizing == BoxSizing::BorderBox {
                 value
             } else {

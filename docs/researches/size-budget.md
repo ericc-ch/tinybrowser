@@ -229,3 +229,26 @@ via `panic = "abort"`, `.gcc_except_table` is 6.8 KiB — the remaining
 the flag; stable has no handle on async tables). The remaining Rust async
 unwind tables (about 625 KiB here, including precompiled `std`) still need
 nightly `-Z build-std`.
+
+## Stylo cascade (2026-09-18)
+
+The isolated probe said stylo costs +1.33 MB; the realized delta on top of
+the Parley tree was +2.00 MB (8,118,512 -> 10,123,008 at the time), because
+the probe never instantiated the full cascade and property database. The
+breakdown at 10,123,008: `.text` +1.51 MB, `.eh_frame` +263 KB, `.rela.dyn`
++67 KB, `.rodata` +88 KB. `-C force-unwind-tables=no` is a no-op here with
+fat LTO (std's bitcode carries the uwtable module flag), and no stable knob
+reaches the async unwind tables, so the Stylo frame data is part of the
+price.
+
+Two real savings landed while fitting it:
+
+| Change | Bytes | Why |
+| --- | ---: | --- |
+| One Taffy measure closure (`Builder::run_layout`) | −155,000 | the closure type is part of Taffy's generic instantiation; two entry points meant two copies of grid/flex/block compute code |
+| Drop `fontdue`; intrinsic advances from `skrifa` | −73,000 | one font stack instead of two; `Fonts::measure` reads `hmtx` directly |
+| `skrifa` without `autohint_shaping` | −224 | outlines are drawn unhinted |
+
+Rebased onto `chase/size-flags` (7,603,520 bytes), the Stylo slice lands at
+**9,416,800 bytes**: 1,813,280 over the size-flags base, 583,200 under the
+cap. The pre-rebase clap feature trimming is gone with clap itself.

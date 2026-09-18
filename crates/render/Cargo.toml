@@ -8,11 +8,18 @@ workspace = true
 
 [dependencies]
 dom = { workspace = true }
-cssparser = "=0.34.0"
-fontdue = "0.9"
+app_units = "0.7"
+euclid = "0.22"
 fontique = { version = "0.11", default-features = false }
 parley = { version = "0.11", default-features = false, features = ["libm"] }
 png = "0.17"
-skrifa = "0.44"
+selectors = "0.40"
+skrifa = { version = "0.44", default-features = false, features = ["std"] }
+web_atoms = "0.2"
+style = { package = "stylo", version = "0.21" }
+stylo_dom = "0.21"
+stylo_static_prefs = "0.21"
+style_traits = { package = "stylo_traits", version = "0.21" }
 taffy = "0.14"
 tiny-skia = "0.12"
+url = "2"
