@@ -5,6 +5,7 @@
 //! processes.
 //! The embeddable surface lives here; CDP is a peer crate.
 
+mod cli;
 mod daemon;
 
 use std::future::Future;
@@ -14,88 +15,32 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use browser::{AgentBuilder, Browser, NetworkSession, Profile, ProfileStore};
-use clap::{Parser, Subcommand};
+use cli::{Cli, Command};
 use logging::{Config, Level, Logger};
 
-#[derive(Parser)]
-#[command(
-    name = "tinybrowser",
-    version,
-    propagate_version = true,
-    disable_version_flag = true,
-    about = "The smallest headless browser for AI agents"
-)]
-struct Cli {
-    /// Minimum log level: error, warn, info, debug, or trace [default: info]
-    ///
-    /// A running daemon keeps its start-up level; `--verbose` is shorthand for
-    /// `--log-level=debug`.
-    #[arg(long, global = true, value_name = "LEVEL", value_parser = parse_level)]
-    log_level: Option<Level>,
-
-    /// Shorthand for --log-level=debug
-    #[arg(long, global = true)]
-    verbose: bool,
-
-    /// Print version
-    #[arg(
-        short = 'v',
-        long = "version",
-        short_alias = 'V',
-        global = true,
-        action = clap::ArgAction::Version
-    )]
-    version: (),
-
-    #[command(subcommand)]
-    command: Option<Command>,
-}
-
-#[derive(Subcommand)]
-enum Command {
-    /// Run the profile daemon until the process exits
-    Daemon {
-        /// Named profile (implicit name: `default`)
-        #[arg(
-            long,
-            value_name = "NAME",
-            value_parser = parse_profile,
-            default_value = "default"
-        )]
-        profile: Profile,
-    },
-    /// Run a renderer worker on its private platform channel
-    Renderer,
-    /// Serve classic `WebDriver` on this loopback port
-    Webdriver {
-        /// Loopback port
-        #[arg(long, value_name = "PORT")]
-        port: u16,
-        /// Named profile (implicit name: `default`)
-        #[arg(
-            long,
-            value_name = "NAME",
-            value_parser = parse_profile,
-            default_value = "default"
-        )]
-        profile: Profile,
-        /// Rewrite a host to an address; repeatable
-        #[arg(long = "resolve", value_name = "PATTERN=ADDR")]
-        resolve: Vec<String>,
-        /// Trust an additional PEM certificate authority; repeatable
-        #[arg(long = "tls-ca", value_name = "PATH")]
-        tls_ca: Vec<PathBuf>,
-    },
-}
-
 fn main() -> ExitCode {
-    let cli = Cli::parse();
-    install_logger(&cli);
-    let code = run(&cli);
-    if !logging::flush() {
-        logging::error!(target: "logging", "file log did not flush before exit");
+    match cli::parse(std::env::args_os().skip(1)) {
+        Ok(cli::Outcome::Version) => {
+            println!("tinybrowser {}", env!("CARGO_PKG_VERSION"));
+            ExitCode::SUCCESS
+        }
+        Ok(cli::Outcome::Help) => {
+            print!("{}", cli::HELP);
+            ExitCode::SUCCESS
+        }
+        Ok(cli::Outcome::Run(cli)) => {
+            install_logger(&cli);
+            let code = run(&cli);
+            if !logging::flush() {
+                logging::error!(target: "logging", "file log did not flush before exit");
+            }
+            code
+        }
+        Err(message) => {
+            eprintln!("error: {message}");
+            ExitCode::from(2)
+        }
     }
-    code
 }
 
 fn run(cli: &Cli) -> ExitCode {
@@ -124,8 +69,7 @@ fn run(cli: &Cli) -> ExitCode {
             run_browser_process("webdriver", serve_webdriver(*port, builder, profile))
         }
         None => {
-            let mut command = <Cli as clap::CommandFactory>::command();
-            let _result = command.print_help();
+            print!("{}", cli::HELP);
             ExitCode::from(2)
         }
     }
@@ -169,16 +113,6 @@ fn profile_log_file(profile: &Profile) -> Option<PathBuf> {
             .join("logs")
             .join(format!("{}.log", profile.name().as_str())),
     )
-}
-
-fn parse_profile(value: &str) -> Result<Profile, String> {
-    Profile::parse(value).map_err(|error| error.to_string())
-}
-
-fn parse_level(value: &str) -> Result<Level, String> {
-    value
-        .parse()
-        .map_err(|error: logging::ParseLevelError| error.to_string())
 }
 
 fn resolve_builder(specs: &[String], tls_ca: &[PathBuf]) -> Result<AgentBuilder, String> {

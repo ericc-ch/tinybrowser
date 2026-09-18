@@ -77,7 +77,7 @@ Rejected or deferred:
 | TLS 1.3 only | −46,816 | Drops TLS 1.2 servers. |
 | `opt-level = "s"` + abort + ICF | +379,248 | `"z"` is smaller. |
 | CDP on hyper-direct, not axum | −525,608 (probe) | Needs the adapter rewrite. |
-| Hand-rolled CLI, not clap | 131.4 KiB `.text` | Product decision. |
+| Hand-rolled CLI, not clap | −184,912 shipped (see the knobs section) | Shipped 2026-09-18. |
 | Feature-gate Intl | 125,426 blob plus code | Removes the Intl surface. |
 | Drop HTTP/2 | 63.4 KiB `.text` plus hyper paths | Loses HTTP/2. |
 | `-Z build-std` + `panic_immediate_abort` | about 625 KiB of Rust async unwind tables (see the knobs section) | Nightly. Workspace pins stable 1.98. |
@@ -182,6 +182,7 @@ Kept (shipping delta 8,118,576 -> 7,965,408 bytes, −153,168):
 | lld `-O2` | −1,856 | `.rodata` string merging |
 | `-Wl,--build-id=none` | −192 | drops the GNU build-ID note; coredumps lose debuginfod matching |
 | `-Wl,--gc-sections` | −96 | explicit next to LTO; proves LTO already collects |
+| Hand-rolled CLI, not clap (`src/cli.rs`) | −184,912 | five flags and three subcommands; contract pinned by `tests/modes.rs` |
 
 Nothing unwinds at runtime under `panic = "abort"` (QuickJS uses
 setjmp/longjmp), so the unwind index and the C tables are dead weight.
