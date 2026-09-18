@@ -1,8 +1,9 @@
 # Handoff (2026-09-19)
 
-State: `main` clean and green at `9632e92`; `webstorage/` scores 41/54
-(75.9%). `tools/ub lint`, `cargo test --workspace` (34 suites), and
-Playwright 7/7 are green. The next cut is `window.open`; nothing is in flight.
+State: `main` clean and green at `b0d2863`; `webstorage/` scores 42/54
+(77.8%). `tools/ub lint`, `cargo test --workspace` (34 suites), and
+Playwright 7/7 are green. `window.open` step 1 shipped; step 2 (cross-tab
+messaging) is next and unstarted.
 
 Done:
 
@@ -12,29 +13,35 @@ Done:
   `StorageEvent`; cross-renderer broadcast; `PROTOCOL_VERSION` 5. Verified by
   `tools/wpt/score webstorage/ -- --exclude=worker --processes 4` (41/54).
 - `9632e92 progress: score webstorage at 75.9% (41/54)`.
+- `b0d2863 feat(browser): window.open creates a tab, window.close closes it`:
+  renderer links carry a `BrowserHandle`; `window.open` resolves its URL in
+  the calling realm, the browser opens a tab (about:blank first, navigation
+  in the background), and the renderer gets a per-tab proxy with `close()`.
+  `PROTOCOL_VERSION` 6. Verified by `tools/wpt/score webstorage/` (42/54) and
+  `event_local_window_open_oldvalue.html` passing.
 - Also in `5808bad`: subframe `Document.URL`/`documentURI` no longer return
   `about:blank`; parser-authored `<body onstorage>` forwards to the window.
 - `.cargo/config.toml` uses GNU bfd for dev/test links (this rustc defaults
   to rust-lld, which rejects a rustc 1.98.1 DWARF relocation); release bins
   still use lld via `build.rs`.
 
-In flight: nothing uncommitted; `window.open` not started.
+In flight: nothing uncommitted.
 
 Next:
 
-1. Step 1: `window.open` creates a tab and returns a proxy with `close()`
-   (passes `event_local_window_open_oldvalue`). The link forwards
-   `ServiceCall::WindowOpen` to the owning tab actor through the
-   per-assignment `EventSubscribers` with the service id; `TabTask::spawn`
-   gains a `BrowserHandle`; the actor replies `ToRenderer::WindowOpened
-   { id, tab }`, which `ChannelServices` delivers to the blocked caller.
-2. Step 2: cross-tab `postMessage` via `ToRenderer::WindowMessage`, plus
-   `window.opener` as a remote window object. Unlocks
-   `event_session_window_open_scope`, `storage_local_window_open`.
-3. Step 3: session snapshot (`Command::SessionSnapshot`) seeded into the new
+1. Step 2: cross-tab `postMessage` and `window.opener`. Track the calling tab
+   in the browser (actors register assignment -> tab) so `open_window` knows
+   the opener, add a browser-routed `ToRenderer::WindowMessage`, and let the
+   new tab's renderer expose `globalThis.opener` as a remote window object
+   whose `postMessage` encodes with the existing `__tbEncode` payload.
+   Unlocks `event_session_window_open_scope` and `storage_local_window_open`.
+2. Step 3: session snapshot (`Command::SessionSnapshot`) seeded into the new
    tab before navigation, and a (opener tab, name) registry for named
    windows; `opener.sessionStorage` can serve the open-time snapshot.
    Unlocks `storage_session_window_open`, `storage_session_window_reopen`.
+3. Still blocked on engine work, not window.open: `document-domain` and
+   `event_no_duplicates` (synchronous child Window), window named access
+   (`testDiv`), `BroadcastChannel`, storage partitioning.
 
 Decisions made:
 
