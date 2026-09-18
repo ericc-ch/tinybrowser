@@ -80,7 +80,7 @@ Rejected or deferred:
 | Hand-rolled CLI, not clap | 131.4 KiB `.text` | Product decision. |
 | Feature-gate Intl | 125,426 blob plus code | Removes the Intl surface. |
 | Drop HTTP/2 | 63.4 KiB `.text` plus hyper paths | Loses HTTP/2. |
-| `-Z build-std` + `panic_immediate_abort` | unknown | Nightly. Workspace pins stable 1.98. |
+| `-Z build-std` + `panic_immediate_abort` | about 625 KiB of Rust async unwind tables (see the knobs section) | Nightly. Workspace pins stable 1.98. |
 
 ## Perf: process cost
 
@@ -164,3 +164,37 @@ Shipping delta: 7,051,360 -> 8,118,512 bytes (+1,067,152), the difference
 being the shaping driver, the skrifa-direct outline path, and feature
 unification across the workspace. `fontdue` stays for intrinsic width
 measurement only.
+
+## Linker and C-flag knobs (2026-09-18)
+
+Measured on the screenshot stack (rustc 1.98.1, shipping binary 8,118,576
+bytes). Each probe builds the exact tuned profile with one change; the kept
+set was re-verified through the committed `.cargo/config.toml` (a rebuild
+with config-delivered flags finished fresh in about a second, byte-identical
+output).
+
+Kept (shipping delta 8,118,576 -> 7,965,408 bytes, −153,168):
+
+| Lever | Bytes | Section |
+| --- | ---: | --- |
+| `-Wl,--no-eh-frame-hdr` | −98,348 | deletes `.eh_frame_hdr` outright |
+| `CFLAGS="-fno-unwind-tables -fno-asynchronous-unwind-tables"` | −53,032 | deletes QuickJS-ng's `.eh_frame` (the only C compiled in the graph) |
+| lld `-O2` | −1,856 | `.rodata` string merging |
+| `-Wl,--build-id=none` | −192 | drops the GNU build-ID note; coredumps lose debuginfod matching |
+| `-Wl,--gc-sections` | −96 | explicit next to LTO; proves LTO already collects |
+
+Nothing unwinds at runtime under `panic = "abort"` (QuickJS uses
+setjmp/longjmp), so the unwind index and the C tables are dead weight.
+Backtraces through our frames lose symbolization; debug builds are
+unaffected. The full workspace test suite (32 suites) passes with the
+complete flag set, and a live daemon (renderer child spawn, CDP
+`/json/version` + `/json/list`) is clean.
+
+Dead ends: `-C force-unwind-tables=no` (−128; sync tables are already gone
+via `panic = "abort"`, `.gcc_except_table` is 6.8 KiB — the remaining
+`.eh_frame` is async unwind data, which the flag does not govern),
+`-z norelro` (−112; writable GOT, rejected), `strip = "symbols"`
+(identical to `true` on ELF), `-C llvm-args=-unwind-tables=0` (LLVM rejects
+the flag; stable has no handle on async tables). The remaining Rust async
+unwind tables (about 625 KiB here, including precompiled `std`) still need
+nightly `-Z build-std`.
