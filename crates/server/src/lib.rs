@@ -14,6 +14,10 @@ use std::io;
 use std::net::TcpListener;
 use std::time::Duration;
 
+/// How long graceful shutdown waits for in-flight connections before
+/// aborting them.
+const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+
 use bytes::Bytes;
 use http::{HeaderValue, Request as HttpRequest, Response as HttpResponse, StatusCode, header};
 use http_body_util::{BodyExt as _, Full, LengthLimitError, Limited};
@@ -126,7 +130,18 @@ where
             }
         }
     }
-    while tasks.join_next().await.is_some() {}
+    // Graceful shutdown lets in-flight requests finish, but a stalled client
+    // must not hold `serve` forever: after the drain period the remaining
+    // tasks abort.
+    if tokio::time::timeout(DRAIN_TIMEOUT, async {
+        while tasks.join_next().await.is_some() {}
+    })
+    .await
+    .is_err()
+    {
+        tasks.abort_all();
+        while tasks.join_next().await.is_some() {}
+    }
     Ok(())
 }
 

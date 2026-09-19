@@ -228,7 +228,7 @@
     };
     const hrefValue = function() {
       const value = this.getAttribute('href');
-      return value === null ? '' : globalThis.__tbUSVString(value);
+      return value === null ? null : globalThis.__tbUSVString(value);
     };
     const base = function() { return globalThis.__tbUSVString(document.baseURI); };
     for (const proto of [table.HTMLAnchorElement, table.HTMLAreaElement]) {
@@ -236,7 +236,11 @@
         const index = parts[name];
         const descriptor = {
           get: function() {
-            const values = __tbUrlParts(hrefValue.call(this), base.call(this));
+            // An absent `href` reports the URL-decomposition defaults, not
+            // the document URL.
+            const href = hrefValue.call(this);
+            if (href === null) return name === 'protocol' ? ':' : '';
+            const values = __tbUrlParts(href, base.call(this));
             if (values === null || values === undefined) {
               return name === 'protocol' ? ':' : '';
             }
@@ -247,8 +251,11 @@
         };
         if (name !== 'origin') {
           descriptor.set = function(value) {
+            // Setting a component with no `href` attribute is a no-op.
+            const href = hrefValue.call(this);
+            if (href === null) return;
             const result = __tbUrlSetPart(
-              hrefValue.call(this), base.call(this), index, globalThis.__tbUSVString(value));
+              href, base.call(this), index, globalThis.__tbUSVString(value));
             if (result !== null && result !== undefined) this.setAttribute('href', result);
           };
         }

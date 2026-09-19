@@ -122,6 +122,9 @@ pub struct NodeBox {
     pub y: f32,
     pub width: f32,
     pub height: f32,
+    /// Whether the originating style is visible. Hidden boxes still report
+    /// geometry, but hit testing skips them (descendants override).
+    pub visible: bool,
 }
 
 /// Lays `dom` out without painting and returns every box in tree order, for

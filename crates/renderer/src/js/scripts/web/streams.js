@@ -43,7 +43,11 @@ globalThis.ReadableStream = class ReadableStream {
   }
   cancel(reason) {
     const data = __tbStreamBrand(this);
+    // Canceling resets the queue: a later `read()` resolves done, it does
+    // not drain what was queued
+    // (<https://streams.spec.whatwg.org/#readable-stream-cancel>).
     data.canceled = true;
+    data.chunks.length = 0;
     if (data.cancel !== null) return Promise.resolve(data.cancel(reason));
     return Promise.resolve();
   }

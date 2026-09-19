@@ -1287,7 +1287,9 @@ fn handler_attribute_source<'js>(
     let Some(body) = active_body(ctx) else {
         return Ok(None);
     };
-    if bindings::handler_cleared(ctx, body, name)? {
+    if bindings::handler_cleared(ctx, body, name)?
+        || bindings::window_handler_cleared(ctx, body, name)?
+    {
         return Ok(None);
     }
     Ok(bindings::handler_attribute(ctx, body, name)?.filter(|source| !source.trim().is_empty()))

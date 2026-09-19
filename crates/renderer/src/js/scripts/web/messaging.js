@@ -892,6 +892,10 @@ Object.defineProperty(globalThis, 'top', {
   const remoteWindows = new Map();
   const namedWindows = new Map();
   const remoteSessions = new Map();
+  // Tabs closed through `close()`: reported by `closed` and evicted from
+  // `namedWindows` so a later `open(url, name)` opens a fresh tab.
+  const closedTabs = new Set();
+  const tabNames = new Map();
 
   function remoteWindow(tab) {
     const existing = remoteWindows.get(tab);
@@ -899,8 +903,16 @@ Object.defineProperty(globalThis, 'top', {
     const handler = {
       get(target, property) {
         switch (property) {
-          case 'close': return () => { __tbWindowClose(tab); };
-          case 'closed': return false;
+          case 'close': return () => {
+            __tbWindowClose(tab);
+            closedTabs.add(tab);
+            const name = tabNames.get(tab);
+            if (name !== undefined) {
+              namedWindows.delete(name);
+              tabNames.delete(tab);
+            }
+          };
+          case 'closed': return closedTabs.has(tab);
           case 'postMessage': return (message, targetOrigin, transfer) => {
             const encoded = __tbEncode(message, transfer ?? [], null);
             __tbWindowPostMessage(tab, encoded.payload);
@@ -979,7 +991,10 @@ Object.defineProperty(globalThis, 'top', {
       seed === null ? [] : seed.entries);
     if (tab === null || tab === undefined) return null;
     const proxy = remoteWindow(tab);
-    if (name !== '') namedWindows.set(name, proxy);
+    if (name !== '') {
+      namedWindows.set(name, proxy);
+      tabNames.set(tab, name);
+    }
     return proxy;
   };
 
@@ -1025,10 +1040,15 @@ Object.defineProperty(globalThis, 'top', {
   const decode = value => (value === null || value === undefined ? null : JSON.parse(value));
 
   // https://storage.spec.whatwg.org/#quotaexceedederror
+  // This user agent names no requested size, so both members are `null`;
+  // they live on the subclass so a plain `DOMException` named
+  // `QuotaExceededError` does not grow them.
   globalThis.QuotaExceededError = class QuotaExceededError extends globalThis.DOMException {
     constructor(message = '') {
       super(message, 'QuotaExceededError');
     }
+    get requested() { return null; }
+    get quota() { return null; }
   };
   Object.defineProperty(globalThis.QuotaExceededError.prototype, Symbol.toStringTag, {
     value: 'QuotaExceededError', writable: false, enumerable: false, configurable: true,

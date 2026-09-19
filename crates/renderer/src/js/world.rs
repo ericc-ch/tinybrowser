@@ -511,11 +511,14 @@ impl World {
         self.frame_navigations.clear();
         self.remote_ids.clear();
         self.remote_nodes.clear();
-        // Navigation replaces the window's event handlers with it: the old
-        // document's `onload` must not fire in the new document
+        // Navigation replaces the document's element handlers with it, but the
+        // realm keeps its window object, so window-scoped handlers survive:
+        // the old document's `onload` must not fire in the new document
         // (<https://html.spec.whatwg.org/multipage/webappapis.html#event-handlers>).
-        self.handler_attributes.clear();
-        self.cleared_handlers.clear();
+        self.handler_attributes
+            .retain(|(node, _), _| node.is_none());
+        self.cleared_handlers
+            .retain(|(node, _)| node.is_none());
         let pending = self.take_document_stream();
         drop(pending);
         // A new realm owns fresh observers; navigation drops the old ones.

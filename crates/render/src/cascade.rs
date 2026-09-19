@@ -78,6 +78,7 @@ fn collect_boxes(layout: &crate::layout::LayoutBox, out: &mut Vec<crate::NodeBox
         y: layout.rect.y,
         width: layout.rect.width,
         height: layout.rect.height,
+        visible: layout.style.visibility == crate::style::Visibility::Visible,
     });
     for item in &layout.items {
         if let crate::layout::PaintItem::Box(child) = item {

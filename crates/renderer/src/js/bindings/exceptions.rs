@@ -3,7 +3,6 @@
 use super::OptString;
 
 use rquickjs::class::Trace;
-use rquickjs::{Ctx, Value};
 
 /// Legacy `DOMException` constants: constant suffix, public name, and code.
 ///
@@ -77,29 +76,6 @@ impl JsDomException {
     #[qjs(get, rename = "code")]
     fn get_code(&self) -> i32 {
         dom_exception_code(&self.name)
-    }
-
-    /// `QuotaExceededError.requested`; this user agent does not name a
-    /// requested size, so the value is `null` for that name and absent
-    /// (undefined) for every other exception
-    /// (<https://storage.spec.whatwg.org/#quotaexceedederror>).
-    #[qjs(get, rename = "requested")]
-    fn get_requested<'js>(&self, ctx: Ctx<'js>) -> Value<'js> {
-        if self.name == "QuotaExceededError" {
-            Value::new_null(ctx)
-        } else {
-            Value::new_undefined(ctx)
-        }
-    }
-
-    /// `QuotaExceededError.quota`; see [`Self::get_requested`].
-    #[qjs(get, rename = "quota")]
-    fn get_quota<'js>(&self, ctx: Ctx<'js>) -> Value<'js> {
-        if self.name == "QuotaExceededError" {
-            Value::new_null(ctx)
-        } else {
-            Value::new_undefined(ctx)
-        }
     }
 }
 

@@ -94,12 +94,20 @@ pub(crate) fn convert_nodes_into_node<'js>(
         Node(NodeId),
         Text(String),
     }
+    // Phase one, throwing conversions only: every string converts before any
+    // node moves, so a throwing `ToString` leaves no half-adopted tree behind.
     let mut pieces = Vec::with_capacity(nodes.0.len());
     for value in nodes.0 {
         if let Some(id) = host_node_id(ctx, &value) {
-            pieces.push(Piece::Node(adopt_across_documents(ctx, document, id)?));
+            pieces.push(Piece::Node(id));
         } else {
             pieces.push(Piece::Text(webidl_to_string(ctx, value)?));
+        }
+    }
+    // Phase two, adoptions.
+    for piece in &mut pieces {
+        if let Piece::Node(id) = piece {
+            *id = adopt_across_documents(ctx, document, *id)?;
         }
     }
     let world = world(ctx)?;

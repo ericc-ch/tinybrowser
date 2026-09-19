@@ -165,16 +165,15 @@ impl<'js> rquickjs::FromJs<'js> for OptionalTitle {
 impl<'js> rquickjs::FromJs<'js> for WebIdlUnsignedLong {
     fn from_js(ctx: &Ctx<'js>, value: Value<'js>) -> Result<Self> {
         // The pristine `Number`, captured at install: a page-assigned global
-        // must not hijack `unsigned long` conversion.
-        let pristine = (|| {
-            let world_rc = world(ctx).ok()?;
-            let to_number: Function = world_rc.borrow().pristine_number.clone()?.restore(ctx).ok()?;
-            to_number.call::<_, f64>((value.clone(),)).ok()
-        })();
-        if let Some(number) = pristine {
+        // must not hijack `unsigned long` conversion. Conversion errors
+        // propagate; the clobberable global is only a fallback when install
+        // predates the capture.
+        let pristine = world(ctx)?.borrow().pristine_number.clone();
+        if let Some(pristine) = pristine {
+            let to_number: Function = pristine.restore(ctx)?;
+            let number: f64 = to_number.call((value.clone(),))?;
             return Ok(Self(webidl_unsigned_long(number)));
         }
-        // Install predates the capture: fall back to the (clobberable) global.
         let to_number: Function = ctx.globals().get("Number")?;
         let number: f64 = to_number.call((value,))?;
         Ok(Self(webidl_unsigned_long(number)))
@@ -489,6 +488,11 @@ pub(super) fn element_at_point(
         let Some(node) = item.node else {
             continue;
         };
+        // Hidden boxes keep their geometry but never win hit testing; the
+        // flat pre-order walk still reaches visible descendants.
+        if !item.visible {
+            continue;
+        }
         if x >= f64::from(item.x)
             && x < f64::from(item.x + item.width)
             && y >= f64::from(item.y)

@@ -38,10 +38,10 @@ globalThis.Headers = class Headers {
   get(name) {
     const entries = __tbBrand(this, __tbHeadersData);
     name = String(name).toLowerCase();
-    for (const [header, value] of entries) {
-      if (header === name) return value;
-    }
-    return null;
+    // Duplicate values combine with ', '
+    // (<https://fetch.spec.whatwg.org/#dom-headers-get>).
+    const values = entries.filter(entry => entry[0] === name).map(entry => entry[1]);
+    return values.length === 0 ? null : values.join(', ');
   }
   has(name) { return this.get(name) !== null; }
   set(name, value) {

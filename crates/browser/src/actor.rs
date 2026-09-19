@@ -572,7 +572,9 @@ impl Tab {
         self.site = None;
         self.events_rx = None;
         if let Some(renderer) = self.renderer.take() {
+            let assignment = renderer.id.get();
             self.renderers.release(renderer).await;
+            let _result = self.browser.unregister_assignment(assignment).await;
         }
     }
 
@@ -925,7 +927,15 @@ async fn handle_command(tab: &mut Tab, command: Command, waiters: &mut Vec<Waite
             // Keep the copy until a renderer exists for the tab's final site:
             // an about:blank engine is discarded by the first navigation.
             tab.pending_seed = Some(seed);
-            let _result = reply.send(Ok(()));
+            // With no navigation in flight the current renderer is final, so
+            // a seed arriving after its mount would otherwise wait forever
+            // for a mount that never comes.
+            let result = if tab.nav.is_none() {
+                tab.apply_pending_seed().await
+            } else {
+                Ok(())
+            };
+            let _result = reply.send(result);
         }
         Command::RemoteSessionGet { origin, key, reply } => {
             let result = tab.remote_session_get(origin, key).await;

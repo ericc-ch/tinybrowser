@@ -179,7 +179,11 @@ pub(crate) fn stubbed_domain(method: &str) -> bool {
         "SystemInfo",
         "CrashReportContext",
     ];
-    DOMAINS.iter().any(|domain| method.starts_with(domain))
+    DOMAINS.iter().any(|domain| {
+        method
+            .strip_prefix(domain)
+            .is_some_and(|suffix| suffix.starts_with('.'))
+    })
 }
 
 /// Methods the protocol surface accepts without a behavior change: domains the

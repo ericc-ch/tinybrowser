@@ -90,6 +90,9 @@ struct Session {
     /// Virtual window rectangle. The engine has no window system, so
     /// `Set Window Rect` records the request and reports it back.
     window_rect: [f64; 4],
+    /// Recorded permission states by descriptor name. Nothing enforces them
+    /// yet; recording makes success mean the state was stored.
+    permissions: HashMap<String, String>,
 }
 
 struct Window {
@@ -124,6 +127,7 @@ impl Sessions {
                 script_timeout: DEFAULT_SCRIPT_TIMEOUT,
                 page_load_timeout: DEFAULT_PAGE_LOAD_TIMEOUT,
                 window_rect: [0.0, 0.0, 800.0, 600.0],
+                permissions: HashMap::new(),
             },
         );
         Ok(id)
@@ -166,7 +170,7 @@ async fn dispatch(method: &str, path: &str, body: &str, sessions: &mut Sessions)
         }
         ("POST", ["session", session, "timeouts"]) => set_timeouts(sessions, session, body),
         ("GET", ["session", session, "timeouts"]) => get_timeouts(sessions, session),
-        ("POST", ["session", session, "permissions"]) => set_permission(sessions, session),
+        ("POST", ["session", session, "permissions"]) => set_permission(sessions, session, body),
         ("POST", ["session", session, "element"]) => find_element(sessions, session, body).await,
         ("POST", ["session", session, "elements"]) => find_elements(sessions, session, body).await,
         ("POST", ["session", session, "element", element, "click"]) => {
@@ -618,15 +622,35 @@ async fn element_send_keys(
 }
 
 /// `POST /session/{id}/permissions` (`WebDriver` permissions extension).
-/// The engine has no permission store yet, so state changes are accepted and
-/// ignored rather than leaving the command unimplemented
+///
+/// Validates the descriptor and state, then records the state on the session.
+/// Nothing enforces permissions yet; success means the state was stored, not
+/// that it takes effect
 /// (<https://w3c.github.io/permissions/#webdriver-command-set-permission>).
-fn set_permission(sessions: &Sessions, session: &str) -> (u16, Value) {
-    if sessions.open.contains_key(session) {
-        ok(Value::Null)
-    } else {
-        error(404, "invalid session id", session)
+fn set_permission(sessions: &mut Sessions, session: &str, body: &str) -> (u16, Value) {
+    let parsed: Value = match serde_json::from_str(body) {
+        Ok(value) => value,
+        Err(err) => return error(400, "invalid argument", &err.to_string()),
+    };
+    let Some(name) = parsed
+        .get("descriptor")
+        .and_then(|descriptor| descriptor.get("name"))
+        .and_then(Value::as_str)
+        .filter(|name| !name.is_empty())
+    else {
+        return error(400, "invalid argument", "descriptor.name is required");
+    };
+    let Some(state) = parsed.get("state").and_then(Value::as_str) else {
+        return error(400, "invalid argument", "state is required");
+    };
+    if !matches!(state, "granted" | "denied" | "prompt") {
+        return error(400, "invalid argument", "unknown permission state");
     }
+    let Some(entry) = sessions.open.get_mut(session) else {
+        return error(404, "invalid session id", session);
+    };
+    entry.permissions.insert(name.to_owned(), state.to_owned());
+    ok(Value::Null)
 }
 
 /// `POST /session/{id}/actions` (Perform Actions)

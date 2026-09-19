@@ -226,11 +226,23 @@ fn cookie_jar() -> &'static Mutex<CookieJar> {
     JAR.get_or_init(|| Mutex::new(CookieJar::default()))
 }
 
-/// The component's local storage areas, keyed by origin. A browser tab has no
-/// profile on disk, so the areas die with the component.
-fn local_storage() -> &'static Mutex<HashMap<String, HashMap<String, String>>> {
-    static AREAS: OnceLock<Mutex<HashMap<String, HashMap<String, String>>>> = OnceLock::new();
+/// One origin's storage area: keys in insertion order.
+type StorageArea = Vec<(String, String)>;
+
+/// The component's local storage areas, keyed by origin. Entries keep
+/// insertion order in a vector: the storage proxy exposes enumeration and
+/// `key(index)` directly, and a `HashMap` would make both unstable.
+/// A browser tab has no profile on disk, so the areas die with the component.
+fn local_storage() -> &'static Mutex<HashMap<String, StorageArea>> {
+    static AREAS: OnceLock<Mutex<HashMap<String, StorageArea>>> = OnceLock::new();
     AREAS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// The value stored under `key`, if any.
+fn area_get(area: &[(String, String)], key: &str) -> Option<String> {
+    area.iter()
+        .find(|(entry, _)| entry == key)
+        .map(|(_, value)| value.clone())
 }
 
 /// Locks a shared map or jar, recovering from a panicking holder.
@@ -461,14 +473,13 @@ impl BrowserServices for WasmServices {
     fn storage_get(&self, origin: &str, key: &str) -> Option<String> {
         lock(local_storage())
             .get(origin)
-            .and_then(|area| area.get(key))
-            .cloned()
+            .and_then(|area| area_get(area, key))
     }
 
     fn storage_keys(&self, origin: &str) -> Vec<String> {
         lock(local_storage())
             .get(origin)
-            .map(|area| area.keys().cloned().collect())
+            .map(|area| area.iter().map(|(key, _)| key.clone()).collect())
             .unwrap_or_default()
     }
 
@@ -482,11 +493,16 @@ impl BrowserServices for WasmServices {
     ) -> Result<Option<StorageChange>, renderer::StorageError> {
         let mut areas = lock(local_storage());
         let area = areas.entry(origin.to_owned()).or_default();
-        let old = area.get(key).cloned();
+        let old = area_get(area, key);
         if old.as_deref() == Some(value) {
             return Ok(None);
         }
-        area.insert(key.to_owned(), value.to_owned());
+        // Rewriting a key keeps its original position; only new keys append.
+        if let Some(slot) = area.iter_mut().find(|(entry, _)| entry == key) {
+            value.clone_into(&mut slot.1);
+        } else {
+            area.push((key.to_owned(), value.to_owned()));
+        }
         Ok(Some(StorageChange {
             key: Some(key.to_owned()),
             old_value: old,
@@ -501,9 +517,10 @@ impl BrowserServices for WasmServices {
         key: &str,
         _source: renderer::FrameId,
     ) -> Option<StorageChange> {
-        let old = lock(local_storage())
-            .get_mut(origin)
-            .and_then(|area| area.remove(key))?;
+        let old = lock(local_storage()).get_mut(origin).and_then(|area| {
+            let index = area.iter().position(|(entry, _)| entry == key)?;
+            Some(area.remove(index).1)
+        })?;
         Some(StorageChange {
             key: Some(key.to_owned()),
             old_value: Some(old),

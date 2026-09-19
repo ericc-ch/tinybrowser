@@ -36,7 +36,7 @@
       pointerId: 1, isPrimary: true, pointerType: state.pointerType,
     });
   };
-  const fire = (node, event) => { if (node) node.dispatchEvent(event); };
+  const fire = (node, event) => node ? node.dispatchEvent(event) : false;
   const pointerItem = (state, item) => {
     if (item.type === 'pointerMove') {
       const center = centerOf(item.origin);
@@ -145,10 +145,13 @@
     const x = item.x || 0;
     const y = item.y || 0;
     const node = at(x, y);
+    if (!node) return;
+    // A canceled `wheel` event performs no scroll
+    // (<https://w3c.github.io/uievents/#events-wheel>).
     const accepted = fire(node, new WheelEvent('wheel', mouseInit(x, y, 0, {
       deltaX: item.deltaX || 0, deltaY: item.deltaY || 0,
     })));
-    if (typeof node.scrollBy === 'function') node.scrollBy(item.deltaX || 0, item.deltaY || 0);
+    if (accepted && typeof node.scrollBy === 'function') node.scrollBy(item.deltaX || 0, item.deltaY || 0);
   };
   globalThis.__tbWebDriverActions = function(actions) {
     let ticks = 0;

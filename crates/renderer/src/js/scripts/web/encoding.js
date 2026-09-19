@@ -266,9 +266,14 @@ globalThis.btoa = function(input) {
 };
 globalThis.atob = function(input) {
   const cleaned = String(input).replace(/[\t\n\f\r ]/g, '');
+  // Forgiving-base64 strips padding only when the stripped length is a
+  // multiple of four; `ab=` is an error, not `ab`
+  // (<https://infra.spec.whatwg.org/#forgiving-base64-decode>).
   let body = cleaned;
-  if (body.endsWith('==')) body = body.slice(0, -2);
-  else if (body.endsWith('=')) body = body.slice(0, -1);
+  if (body.length % 4 === 0) {
+    if (body.endsWith('==')) body = body.slice(0, -2);
+    else if (body.endsWith('=')) body = body.slice(0, -1);
+  }
   if (/[^A-Za-z0-9+/]/.test(body) || body.length % 4 === 1) {
     throw new DOMException('The string to be decoded is not correctly encoded.', 'InvalidCharacterError');
   }

@@ -82,6 +82,9 @@ enum Command {
         assignment: u64,
         tab: TabId,
     },
+    /// Forgets a released renderer assignment, so cross-site navigation does
+    /// not accumulate stale entries for the tab's lifetime.
+    UnregisterAssignment { assignment: u64 },
     /// The tab that owns one renderer assignment.
     AssignmentTab {
         assignment: u64,
@@ -317,6 +320,16 @@ impl BrowserHandle {
             .await
     }
 
+    /// Forgets a released renderer assignment.
+    ///
+    /// # Errors
+    ///
+    /// [`BrowserError::Stopped`] when the browser task has stopped.
+    pub async fn unregister_assignment(&self, assignment: u64) -> Result<(), BrowserError> {
+        self.send(Command::UnregisterAssignment { assignment })
+            .await
+    }
+
     /// The tab that owns one renderer assignment.
     ///
     /// # Errors
@@ -506,9 +519,64 @@ fn opener_tab(state: &BrowserState, assignment: u64) -> Option<TabId> {
         .copied()
 }
 
+/// Answers one assignment lookup without growing the command loop.
+fn route_assignment_tab(
+    state: &BrowserState,
+    assignment: u64,
+    reply: oneshot::Sender<Option<TabId>>,
+) {
+    let _result = reply.send(state.assignments.get(&assignment).copied());
+}
+
+/// Synchronous state queries; returns the command back when it needs awaits.
+fn route_sync(state: &mut BrowserState, command: Command) -> Option<Command> {
+    match command {
+        Command::Tabs { reply } => {
+            let tabs = state.tabs.keys().copied().collect();
+            let _result = reply.send(tabs);
+        }
+        Command::Tab { id, reply } => {
+            let tab = state
+                .tabs
+                .get(&id)
+                .map(|task| task.handle.clone())
+                .ok_or(BrowserError::UnknownTab);
+            let _result = reply.send(tab);
+        }
+        Command::IsLive { reply } => {
+            let _result = reply.send(state.live);
+        }
+        Command::CookieRecords { url, reply } => {
+            let _result = reply.send(state.network.cookie_records(&url));
+        }
+        Command::ClearCookies { reply } => {
+            state.network.clear_cookies();
+            let _result = reply.send(());
+        }
+        Command::AddCookie { cookie, url, reply } => {
+            let _result = reply.send(state.network.add_cookie(&cookie, &url));
+        }
+        command => return Some(command),
+    }
+    None
+}
+
 async fn browser_loop(mut commands: mpsc::Receiver<Command>, mut state: BrowserState) {
     while let Some(command) = commands.recv().await {
+        let Some(command) = route_sync(&mut state, command) else {
+            continue;
+        };
         match command {
+            // Synchronous queries never reach the loop; `route_sync` answers
+            // them above.
+            Command::Tabs { .. }
+            | Command::Tab { .. }
+            | Command::IsLive { .. }
+            | Command::CookieRecords { .. }
+            | Command::ClearCookies { .. }
+            | Command::AddCookie { .. } => {
+                unreachable!("route_sync answers every synchronous query")
+            }
             Command::CreateTab { reply } => {
                 let result = create_tab(&mut state);
                 let _result = reply.send(result);
@@ -526,8 +594,11 @@ async fn browser_loop(mut commands: mpsc::Receiver<Command>, mut state: BrowserS
             Command::RegisterAssignment { assignment, tab } => {
                 state.assignments.insert(assignment, tab);
             }
+            Command::UnregisterAssignment { assignment } => {
+                state.assignments.remove(&assignment);
+            }
             Command::AssignmentTab { assignment, reply } => {
-                let _result = reply.send(state.assignments.get(&assignment).copied());
+                route_assignment_tab(&state, assignment, reply);
             }
             Command::OpenerTab { assignment, reply } => {
                 let _result = reply.send(opener_tab(&state, assignment));
@@ -549,18 +620,6 @@ async fn browser_loop(mut commands: mpsc::Receiver<Command>, mut state: BrowserS
                 let result = route_remote_session(&state, target, origin, key).await;
                 let _result = reply.send(result);
             }
-            Command::Tabs { reply } => {
-                let tabs = state.tabs.keys().copied().collect();
-                let _result = reply.send(tabs);
-            }
-            Command::Tab { id, reply } => {
-                let tab = state
-                    .tabs
-                    .get(&id)
-                    .map(|task| task.handle.clone())
-                    .ok_or(BrowserError::UnknownTab);
-                let _result = reply.send(tab);
-            }
             Command::CloseTab { id, reply } => {
                 let result = if let Some(mut task) = state.tabs.remove(&id) {
                     state.assignments.retain(|_, tab| *tab != id);
@@ -571,19 +630,6 @@ async fn browser_loop(mut commands: mpsc::Receiver<Command>, mut state: BrowserS
                     Err(BrowserError::UnknownTab)
                 };
                 let _result = reply.send(result);
-            }
-            Command::IsLive { reply } => {
-                let _result = reply.send(state.live);
-            }
-            Command::CookieRecords { url, reply } => {
-                let _result = reply.send(state.network.cookie_records(&url));
-            }
-            Command::ClearCookies { reply } => {
-                state.network.clear_cookies();
-                let _result = reply.send(());
-            }
-            Command::AddCookie { cookie, url, reply } => {
-                let _result = reply.send(state.network.add_cookie(&cookie, &url));
             }
             Command::Close { reply } => {
                 state.live = false;

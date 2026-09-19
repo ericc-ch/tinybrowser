@@ -33,7 +33,13 @@ const DEFAULT_SCRIPT_BUDGET: Duration = Duration::from_secs(5);
 
 /// Web-platform JS shims, one spec area per file, evaluated in order as a
 /// single script so top-level bindings are shared across areas.
+///
+/// The whole concatenation runs inside one function scope: top-level
+/// `const`/`function` bindings stay visible to every shim file but invisible
+/// to page script, which shares the global lexical scope. Only explicit
+/// `globalThis` assignments publish names outward.
 const INSTALL_WEB_APIS_JS: &str = concat!(
+    "(function(){",
     include_str!("scripts/web/timers.js"),
     include_str!("scripts/web/fetch.js"),
     include_str!("scripts/web/encoding.js"),
@@ -44,6 +50,7 @@ const INSTALL_WEB_APIS_JS: &str = concat!(
     include_str!("scripts/web/messaging.js"),
     include_str!("scripts/web/ui_events.js"),
     include_str!("scripts/web/input.js"),
+    "})();",
 );
 
 /// A value produced by script evaluation.

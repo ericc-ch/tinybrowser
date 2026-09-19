@@ -30,10 +30,10 @@ globalThis.MouseEvent = class MouseEvent extends UIEvent {
     }
     init = init || {};
     super(type, init);
-    const button = init.button === undefined ? 0 : init.button;
     // `long` members convert with `ToNumber`, not truthiness: `"5"` is 5
     // (<https://w3c.github.io/uievents/#dom-mouseevent-clientx>).
     const toLong = value => { const n = Number(value); return Number.isNaN(n) ? 0 : Math.trunc(n); };
+    const button = init.button === undefined ? 0 : toLong(init.button);
     Object.defineProperty(this, __tbMouseEventData, {
       value: {
         screenX: init.screenX === undefined ? 0 : toLong(init.screenX),
@@ -42,7 +42,7 @@ globalThis.MouseEvent = class MouseEvent extends UIEvent {
         clientY: init.clientY === undefined ? 0 : toLong(init.clientY),
         ctrlKey: !!init.ctrlKey, shiftKey: !!init.shiftKey,
         altKey: !!init.altKey, metaKey: !!init.metaKey,
-        button: button, buttons: init.buttons === undefined ? 0 : init.buttons,
+        button: button, buttons: init.buttons === undefined ? 0 : toLong(init.buttons),
         relatedTarget: init.relatedTarget || null,
       },
       writable: false, enumerable: false, configurable: false,
@@ -142,7 +142,7 @@ globalThis.KeyboardEvent = class KeyboardEvent extends UIEvent {
         ctrlKey: !!init.ctrlKey, shiftKey: !!init.shiftKey,
         altKey: !!init.altKey, metaKey: !!init.metaKey,
         repeat: !!init.repeat, isComposing: !!init.isComposing,
-        keyCode: init.keyCode === undefined ? (key ? key.charCodeAt(0) : 0) : init.keyCode,
+        keyCode: init.keyCode === undefined ? (key.length === 1 ? key.charCodeAt(0) : 0) : init.keyCode,
         charCode: init.charCode || 0,
       },
       writable: false, enumerable: false, configurable: false,

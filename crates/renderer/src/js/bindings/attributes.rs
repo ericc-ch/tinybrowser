@@ -962,6 +962,15 @@ pub(crate) fn handler_cleared(ctx: &Ctx<'_>, id: NodeId, name: &str) -> Result<b
     Ok(world.borrow().handler_cleared(Some(id), name))
 }
 
+/// Whether script cleared the window-scoped handler property. Body `on*`
+/// content attributes forward to the window, so a cleared window flag
+/// suppresses the body attribute too
+/// (<https://html.spec.whatwg.org/multipage/dom.html#body-element-event-handlers>).
+pub(crate) fn window_handler_cleared(ctx: &Ctx<'_>, id: NodeId, name: &str) -> Result<bool> {
+    let world = world_for_node(ctx, id)?;
+    Ok(world.borrow().handler_cleared(None, name))
+}
+
 /// Removes the DOM attribute identified by `(namespace, local)` and syncs
 /// the registry; used by `removeAttributeNode` and `NamedNodeMap.remove*`.
 pub(crate) fn remove_attribute_sync(
