@@ -352,91 +352,91 @@ pub(super) fn webdriver_element(ctx: Ctx<'_>, remote_id: f64) -> Result<Value<'_
     wrap_node(&ctx, node)
 }
 
-/// Virtual viewport used for element geometry until the engine has layout.
-///
-/// The boxes are a deterministic stand-in, not a layout result: elements are
-/// placed on a 10px grid in document order inside an 800x600 viewport. They
-/// exist so `WebDriver` input targeting (`getClientRects`,
-/// `elementsFromPoint`, `scrollIntoView`) has coherent, unique geometry.
-/// Tests that assert real layout values still fail.
-const VIRTUAL_CELL: f64 = 10.0;
-
-const VIRTUAL_COLUMNS: f64 = 80.0;
-
-/// The virtual box `(left, top, width, height)` for the element at `index`.
-/// Rows keep growing past the viewport so two elements never share a box.
-pub(super) fn virtual_rect(index: f64) -> (f64, f64, f64, f64) {
-    let column = index % VIRTUAL_COLUMNS;
-    let row = (index / VIRTUAL_COLUMNS).floor();
-    let left = column * VIRTUAL_CELL + 1.0;
-    let top = row * VIRTUAL_CELL + 1.0;
-    let size = VIRTUAL_CELL - 2.0;
-    (left, top, size, size)
+/// Every element's border box from the render pipeline's layout, in tree
+/// order. Anonymous boxes carry `node: None`.
+pub(super) fn layout_boxes(ctx: &Ctx<'_>, document: NodeId) -> Result<Vec<render::NodeBox>> {
+    let world = world_for_node(ctx, document)?;
+    let world = world.borrow();
+    let Some(parsed) = world.document(document) else {
+        return Ok(Vec::new());
+    };
+    let sheets = inline_stylesheets(&parsed.dom);
+    let options = render::RenderOptions {
+        width: crate::engine::VIEWPORT_WIDTH,
+        height: crate::engine::VIEWPORT_HEIGHT,
+        scale: 1.0,
+    };
+    Ok(render::layout_boxes(&parsed.dom, &sheets, &options).unwrap_or_default())
 }
 
-/// Document-order index of `node` among the document's elements.
-pub(super) fn element_index(ctx: &Ctx<'_>, node: NodeId) -> Result<Option<f64>> {
-    let world = world_for_node(ctx, node)?;
-    let world = world.borrow();
-    let Some(parsed) = world.document(node) else {
-        return Ok(None);
-    };
-    let root = parsed.dom.document();
-    let mut index = 0.0;
-    // The root itself is a candidate: `element_index` answers for any node,
-    // and `descendants` excludes its scope.
-    for current in std::iter::once(root).chain(parsed.dom.descendants(root)) {
-        if current == node {
-            return Ok(Some(index));
+/// Inline `<style>` text in document order. External sheets are not mirrored
+/// into script geometry yet, so a page styled only by `<link>` lays out
+/// without the author rules.
+fn inline_stylesheets(dom: &dom::Dom) -> Vec<String> {
+    let mut sheets = Vec::new();
+    for node in dom.descendants(dom.document()) {
+        let Some(NodeKind::Element { name, .. }) = dom.kind(node) else {
+            continue;
+        };
+        if name.ns != dom::html_namespace() || name.local.as_ref() != "style" {
+            continue;
         }
-        if is_element(&parsed.dom, current) {
-            index += 1.0;
+        let mut css = String::new();
+        if let Some(children) = dom.children(node) {
+            for &child in children {
+                if let Some(NodeKind::Text { data }) = dom.kind(child) {
+                    css.push_str(data);
+                }
+            }
+        }
+        if !css.trim().is_empty() {
+            sheets.push(css);
         }
     }
-    Ok(None)
+    sheets
 }
 
-/// The deepest element whose virtual box contains the point, if any. This is
-/// the no-layout stand-in for hit testing.
+/// `node`'s border box `(left, top, width, height)` from the current layout,
+/// if it has one.
+pub(super) fn element_box(ctx: &Ctx<'_>, node: NodeId) -> Result<Option<(f64, f64, f64, f64)>> {
+    let boxes = layout_boxes(ctx, node)?;
+    Ok(boxes
+        .into_iter()
+        .find(|item| item.node == Some(node))
+        .map(|item| {
+            (
+                f64::from(item.x),
+                f64::from(item.y),
+                f64::from(item.width),
+                f64::from(item.height),
+            )
+        }))
+}
+
+/// The deepest element whose laid-out border box contains the point, if any.
 pub(super) fn element_at_point(
     ctx: &Ctx<'_>,
     document: NodeId,
     x: f64,
     y: f64,
 ) -> Result<Option<NodeId>> {
-    let world = world_for_node(ctx, document)?;
-    let world = world.borrow();
-    let Some(parsed) = world.document(document) else {
-        return Ok(None);
-    };
-    let mut index = 0.0;
-    let mut best: Option<(usize, NodeId)> = None;
-    let mut stack = vec![(parsed.dom.document(), 0usize)];
-    while let Some((current, depth)) = stack.pop() {
-        if let Some(NodeKind::Element { .. }) = parsed.dom.kind(current) {
-            let (left, top, width, height) = virtual_rect(index);
-            index += 1.0;
-            if x >= left
-                && x < left + width
-                && y >= top
-                && y < top + height
-                && best.is_none_or(|(best_depth, _)| depth > best_depth)
-            {
-                best = Some((depth, current));
-            }
-        }
-        if let Some(children) = parsed.dom.children(current) {
-            for child in children.rev() {
-                stack.push((*child, depth + 1));
-            }
+    let boxes = layout_boxes(ctx, document)?;
+    let mut best = None;
+    for item in boxes {
+        let Some(node) = item.node else {
+            continue;
+        };
+        if x >= f64::from(item.x)
+            && x < f64::from(item.x + item.width)
+            && y >= f64::from(item.y)
+            && y < f64::from(item.y + item.height)
+        {
+            // Tree order is pre-order, so the last containing box is the
+            // deepest one.
+            best = Some(node);
         }
     }
-    Ok(best.map(|(_, node)| node))
-}
-
-pub(super) fn virtual_rect_object<'js>(ctx: &Ctx<'js>, index: f64) -> Result<Object<'js>> {
-    let (left, top, width, height) = virtual_rect(index);
-    rect_object(ctx, left, top, width, height)
+    Ok(best)
 }
 
 pub(super) fn rect_object<'js>(

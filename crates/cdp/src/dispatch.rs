@@ -438,9 +438,12 @@ pub(crate) async fn input_emulate_touch_from_mouse(
 
 /// Runs a page-side action sequence and reports the CDP-shaped reply.
 async fn run_actions(tab: &TabHandle, actions: &Value) -> Result<Value, DispatchError> {
+    // The page performer takes the source array; callers may pass either the
+    // array itself or a `{"actions": [...]}` envelope.
+    let sources = actions.get("actions").unwrap_or(actions);
     let script = format!(
         "(function(){{return globalThis.__tbWebDriverActions({});}})()",
-        serde_json::to_string(actions).unwrap_or_else(|_| "[]".to_owned())
+        serde_json::to_string(sources).unwrap_or_else(|_| "[]".to_owned())
     );
     tab.execute_script(&script)
         .await

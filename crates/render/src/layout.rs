@@ -4,6 +4,8 @@
 //! atomic boxes become inline boxes at byte offsets, and Parley breaks,
 //! shapes, and aligns. Paint receives positioned glyph runs, never strings.
 
+use dom::NodeId;
+
 use crate::font::Fonts;
 use crate::geometry::{Edges, Rect};
 use crate::style::{BoxSizing, Dimension, Style, TextAlign, WhiteSpace};
@@ -22,6 +24,8 @@ pub(crate) enum PaintItem {
 pub(crate) struct LayoutBox {
     /// Computed style of the originating element (or the anonymous box).
     pub(crate) style: Style,
+    /// The DOM element this box was generated for, when it has one.
+    pub(crate) node: Option<NodeId>,
     /// Border box in absolute coordinates.
     pub(crate) rect: Rect,
     /// Resolved padding in pixels.

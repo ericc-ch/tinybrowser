@@ -48,6 +48,44 @@ pub(crate) fn render(
     Ok(painter.into_image())
 }
 
+/// Lays `dom` out without painting and returns every box in tree order, for
+/// script geometry (`getBoundingClientRect`, hit testing).
+pub(crate) fn boxes(
+    dom: &Dom,
+    stylesheets: &[String],
+    options: &RenderOptions,
+) -> Result<Vec<crate::NodeBox>, RenderError> {
+    if !valid_dimension(options.width)
+        || !valid_dimension(options.height)
+        || !valid_dimension(options.scale)
+    {
+        return Err(RenderError::InvalidViewport);
+    }
+    let fonts = Fonts::load()?;
+    let styles = style_document(dom, stylesheets, options.width, options.height);
+    let root = tree::build(dom, &styles);
+    let layout = crate::boxes::layout_root(&root, &fonts, options.width, options.height);
+    let mut out = Vec::new();
+    collect_boxes(&layout, &mut out);
+    Ok(out)
+}
+
+/// Flattens a laid-out tree into [`crate::NodeBox`] values.
+fn collect_boxes(layout: &crate::layout::LayoutBox, out: &mut Vec<crate::NodeBox>) {
+    out.push(crate::NodeBox {
+        node: layout.node,
+        x: layout.rect.x,
+        y: layout.rect.y,
+        width: layout.rect.width,
+        height: layout.rect.height,
+    });
+    for item in &layout.items {
+        if let crate::layout::PaintItem::Box(child) = item {
+            collect_boxes(child, out);
+        }
+    }
+}
+
 /// Whether a viewport or scale value is usable.
 fn valid_dimension(value: f32) -> bool {
     value.is_finite() && value > 0.0

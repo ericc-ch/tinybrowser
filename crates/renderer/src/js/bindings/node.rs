@@ -8,7 +8,7 @@ use super::{
     character_data_offset, child_value, clone_document, convert_nodes_into_node,
     create_element_named, create_html_element, create_kind, deref_weak, descendant_text,
     detach_attr, doctype_fields, document_base_url_string, document_is_html,
-    document_is_html_content, document_url_string, element_at_point, element_click, element_index,
+    document_is_html_content, document_url_string, element_at_point, element_box, element_click,
     element_node_name, element_sibling_value, elements_by_tag, find_element_by_id,
     fixup_focus_after_removal, focus_node, host_node_id, import_snapshot, is_element, is_focusable,
     is_html_element, is_main_document, is_template_element, live_collection, locate_namespace,
@@ -17,7 +17,7 @@ use super::{
     refresh_named_node_map, remove_attribute_sync, required_node, root_of,
     schedule_mutation_delivery, select_error, set_attribute_node, set_character_data,
     sibling_value, string_value, throw_dom, throw_dom_error, touch_attr, tree_order,
-    valid_attribute_local_name, validate_and_extract, virtual_rect_object, webidl_to_string,
+    valid_attribute_local_name, validate_and_extract, webidl_to_string,
     with_node_kind, world, world_for_node, wrap_new_document, wrap_node,
 };
 use rquickjs::function::{Opt, Rest};
@@ -381,12 +381,12 @@ impl JsNode {
         }
     }
 
-    // The engine has no layout; element geometry is the virtual box (see
-    // `virtual_rect`).
+    // The element's border box from the render pipeline's layout; zero when
+    // the element generates no box (for example `display: none`).
     #[qjs(rename = "getBoundingClientRect")]
     fn get_bounding_client_rect<'js>(&self, ctx: Ctx<'js>) -> Result<Object<'js>> {
-        match element_index(&ctx, self.handle.0)? {
-            Some(index) => virtual_rect_object(&ctx, index),
+        match element_box(&ctx, self.handle.0)? {
+            Some((left, top, width, height)) => rect_object(&ctx, left, top, width, height),
             None => rect_object(&ctx, 0.0, 0.0, 0.0, 0.0),
         }
     }
@@ -394,8 +394,8 @@ impl JsNode {
     #[qjs(rename = "getClientRects")]
     fn get_client_rects<'js>(&self, ctx: Ctx<'js>) -> Result<Array<'js>> {
         let array = Array::new(ctx.clone())?;
-        if let Some(index) = element_index(&ctx, self.handle.0)? {
-            array.set(0, virtual_rect_object(&ctx, index)?)?;
+        if let Some((left, top, width, height)) = element_box(&ctx, self.handle.0)? {
+            array.set(0, rect_object(&ctx, left, top, width, height)?)?;
         }
         Ok(array)
     }
