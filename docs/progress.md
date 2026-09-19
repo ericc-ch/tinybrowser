@@ -7,7 +7,7 @@ Size research lives in [`docs/researches/size-budget.md`](researches/size-budget
 
 Target: under 10MB stripped on x86_64.
 
-8,221,624 bytes (2026-09-19)
+8,223,096 bytes (2026-09-19)
 
 ```sh
 nix develop --command ./tools/ship
@@ -87,7 +87,7 @@ nix develop --command ./tools/wpt/score <directory> -- --exclude=worker
 | `document-picture-in-picture/` | unscored |
 | `document-policy/` | unscored |
 | `dom/` | unscored |
-| `domparsing/` | 21.6% |
+| `domparsing/` | 28.4% |
 | `domxpath/` | 5.9% |
 | `dpub-aam/` | unscored |
 | `dpub-aria/` | unscored |
