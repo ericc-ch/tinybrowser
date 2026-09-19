@@ -5,7 +5,11 @@ this branch: `webstorage/` 47/54 (87.0%), `url/` 25/49 (51.0%),
 `webmessaging/` 106/124 (85.5%, broadcastchannel excluded),
 `webmessaging/broadcastchannel/` 5/12 (41.7%), `focus/` 3/41 (7.3%),
 `domparsing/` 21/74 (28.4%), `FileAPI/` 32/68 (47.1%). Shipping binary
-8,300,088 bytes (cap 10,485,760). CDP `--all`: PASS 33, no missing methods
+8,300,088 bytes (cap 10,485,760). CDP `--all` re-run post-fix: PASS 33
+(unchanged), UNSUPPORTED_METHOD 1, TIMEOUT 423 (+4), PROTOCOL_FAILURE 505
+(-4); the shift is input-dispatch tests proceeding past the fixed envelope
+bug into waits for unimplemented async domains (`Debugger.paused`,
+`lifecycleEvent`, late `styleSheetAdded`), verified in isolation.
 (one intentional `Domain.NotExistingCommand` test). `tools/ub lint`,
 `cargo test --workspace` (34 suites), and `tools/ship` are green at
 `4cfbca2`.
