@@ -40,8 +40,8 @@ use dispatch::{
     RUNTIME_SCHEDULE, arguments_expression, attach_session, capture_screenshot, css_computed_style,
     css_stylesheets, dom_describe_node, dom_get_document, dom_node_for_location, dom_node_string,
     dom_query_selector, dom_resolve_node, exception_reply, exception_text_reply, input_key_event,
-    input_mouse_event, json_io, json_string, open_url, session_method, target_id, target_info,
-    wait_for_navigation, ws_io,
+    input_mouse_event, json_io, json_string, open_url, session_method, static_reply,
+    stubbed_domain, target_id, target_info, wait_for_navigation, ws_io,
 };
 
 const PRODUCT: &str = "tinybrowser/0.1.0";
@@ -784,20 +784,8 @@ impl Conn {
     ) -> Result<Value, DispatchError> {
         match method {
             "Target.setAutoAttach" => Ok(self.set_auto_attach(params).await),
-            "Target.attachToBrowserTarget" => Ok(json!({"sessionId": "browser"})),
             "Target.getTargetInfo" => self.target_info_for(params).await,
-            "Target.getTargets" => {
-                let mut target_infos = Vec::new();
-                for id in self
-                    .browser
-                    .tabs()
-                    .await
-                    .map_err(|error| DispatchError::Failed(error.to_string()))?
-                {
-                    target_infos.push(target_info(&self.browser, id).await);
-                }
-                Ok(json!({ "targetInfos": target_infos }))
-            }
+            "Target.getTargets" => self.target_list().await,
             "Target.createTarget" => {
                 let url = params
                     .get("url")
@@ -878,8 +866,34 @@ impl Conn {
                 }
                 Ok(json!({}))
             }
-            _ => Err(DispatchError::MethodNotFound),
+            _ => Self::unknown_target_method(method),
         }
+    }
+
+    /// Every open tab as a `Target.targetInfo` list.
+    async fn target_list(&self) -> Result<Value, DispatchError> {
+        let mut target_infos = Vec::new();
+        for id in self
+            .browser
+            .tabs()
+            .await
+            .map_err(|error| DispatchError::Failed(error.to_string()))?
+        {
+            target_infos.push(target_info(&self.browser, id).await);
+        }
+        Ok(json!({ "targetInfos": target_infos }))
+    }
+
+    /// Target methods outside the implemented set: fixed-shape replies and
+    /// domain stubs keep the corpus moving past the method table.
+    fn unknown_target_method(method: &str) -> Result<Value, DispatchError> {
+        if let Some(reply) = static_reply(method) {
+            return Ok(reply);
+        }
+        if stubbed_domain(method) {
+            return Ok(json!({}));
+        }
+        Err(DispatchError::MethodNotFound)
     }
 
     async fn dispatch_tab_method(

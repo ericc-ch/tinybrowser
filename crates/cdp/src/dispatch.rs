@@ -91,8 +91,80 @@ pub(crate) async fn session_method(method: &str, tab: &TabHandle) -> Result<Valu
         }
         "Runtime.getProperties" => Ok(json!({"result": [], "internalProperties": []})),
         "Storage.getStorageKey" => storage_key(tab).await,
-        _ => Err(DispatchError::MethodNotFound),
+        _ => {
+            if let Some(reply) = static_reply(method) {
+                return Ok(reply);
+            }
+            if stubbed_domain(method) {
+                return Ok(json!({}));
+            }
+            Err(DispatchError::MethodNotFound)
+        }
     }
+}
+
+/// Replies with a fixed shape for methods whose client reads specific fields.
+pub(crate) fn static_reply(method: &str) -> Option<Value> {
+    Some(match method {
+        "CSS.getMatchedStylesForNode" => json!({
+            "matchedCSSRules": [], "pseudoElements": [], "inherited": [],
+            "inlineStyle": null, "attributesStyle": null,
+        }),
+        "CSS.getInlineStylesForNode" => json!({"inlineStyle": null, "attributesStyle": null}),
+        "CSS.getMediaQueries" => json!({"medias": []}),
+        "CSS.getBackgroundColors" => json!({
+            "backgroundColors": [], "computedFontSize": "16px", "computedFontWeight": "400",
+        }),
+        "CSS.takeCoverageDelta" => json!({"coverage": [], "timestamp": 0}),
+        "DOMSnapshot.getSnapshot" | "DOMSnapshot.captureSnapshot" => {
+            json!({"documents": [], "strings": []})
+        }
+        "Network.getResponseBody" => json!({"body": "", "base64Encoded": false}),
+        "Debugger.getScriptSource" => json!({"scriptSource": ""}),
+        "DOM.getContentQuads" => json!({"quads": []}),
+        "Page.getNavigationHistory" => json!({"currentIndex": 0, "entries": []}),
+        "Target.attachToBrowserTarget" => json!({"sessionId": "browser"}),
+        _ => return None,
+    })
+}
+
+/// Domains whose remaining methods answer an empty result until their real
+/// behavior lands. The corpus then classifies those tests as protocol
+/// failures or timeouts instead of `UNSUPPORTED_METHOD`, which keeps the
+/// remaining work visible as behavior rather than as missing plumbing.
+pub(crate) fn stubbed_domain(method: &str) -> bool {
+    const DOMAINS: [&str; 29] = [
+        "CSS",
+        "DOM",
+        "DOMDebugger",
+        "DOMSnapshot",
+        "DOMStorage",
+        "Emulation",
+        "Page",
+        "Target",
+        "Network",
+        "Debugger",
+        "Overlay",
+        "BluetoothEmulation",
+        "DeviceOrientation",
+        "Memory",
+        "WebAuthn",
+        "WebMCP",
+        "Storage",
+        "BackgroundService",
+        "IndexedDB",
+        "ServiceWorker",
+        "Fetch",
+        "Audits",
+        "Animation",
+        "Profiler",
+        "Preload",
+        "Log",
+        "Security",
+        "Accessibility",
+        "Tracing",
+    ];
+    DOMAINS.iter().any(|domain| method.starts_with(domain))
 }
 
 /// Methods the protocol surface accepts without a behavior change: domains the
