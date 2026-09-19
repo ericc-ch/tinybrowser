@@ -173,10 +173,42 @@ verification against code+spec:
   skipped (new `intl.spec.ts` gate), WPT `domparsing` 21/74 (matches
   pre-fix baseline), MutationObserver subset matches baseline, CDP `--all`
   re-run pending.
-- Should-fix backlog (~40) untouched: `importNode`/`getRootNode`/`Attr.value`
-  IDL defaults, keypress/wheel ordering, contentEditable insert, URL brand
-  checks, collection proxy traps, custom-event cross-realm symbols,
-  abort-signal strictness, `window.onerror`, storage `SecurityError`, timer
-  clamping, intl option validation, `js_number` NaN ids, deep-JSON nulling.
+- Should-fix backlog (untouched except where noted), grouped by area:
+  DOM core: `importNode` missing-`deep` must throw `TypeError`
+  (`node.rs:585`); `Attr.value`/`nodeValue` need `LegacyNullToEmptyString`
+  (`attributes.rs:314`); `getRootNode` ignores `composed` (`node.rs:2357`);
+  `elementsFromPoint` must list all elements at the point, not the ancestor
+  chain (`node.rs:433`); `setAttributeNS` skips `after_attribute_change`
+  (`node.rs:1974`); `className` setter bypasses attr refresh, staling `Attr`
+  wrappers (`node.rs:1816`); `set_attr_value` writes the registry before the
+  DOM write succeeds (`attributes.rs:620`); `contains`/`isSameNode` must throw
+  `TypeError` for non-`Node` (`node.rs:2337/2316).
+  Document/window/focus: removal focus fixup should move toward parent/body,
+  not `None` (`focus.rs:18`); `blur_node` needs a focus-chain check
+  (`focus.rs:274`). (Disabled-click guard, click-focuses-first, and
+  `observe` presence/`null` were fixed with the must-fix batch.)
+  Web APIs: legacy `keypress` order (`input.js`, old `:2845`); canceled
+  `wheel` must not scroll (`input.js`, old `:2856`); contentEditable insert
+  must respect the caret, not append to `textContent` (`input.js`, old
+  `:2836`); `URLSearchParams` percent-decoding of split UTF-8 (`url.js`, old
+  `:1107`); `URL` brand checks (`url.js`, old `:1014`); `pointerType: ""`
+  coercion (`ui_events.js`, old `:2617`); `InputEvent.data` string conversion
+  (`ui_events.js`, old `:2709`); swallowed focus error in the performer
+  (`input.js`, old `:2788`).
+  IDL/infra: `DOMException` name mapping for `null`/`""`
+  (`exceptions.rs:57`); `unsigned long` precision above 2^53
+  (`webidl.rs:122`); silent `Ok(())` on bad message wire data
+  (`messaging.rs:84`); `HTMLCollection` `ownKeys`/`deleteProperty`/method
+  identity/indexed-`set` traps (`collections.js:85/74/106`); cross-realm
+  `CustomEvent.detail` symbol (`events/custom_event.js:2`); `signalAbort`
+  trust + `timeout` clamp (`events/abort.js:17`); script geometry ignores
+  stacking/`pointer-events` and external sheets (`bindings/mod.rs:357`).
+  Engine glue: `Drop for JsRealm` can panic inside `Drop` (`js/mod.rs:775`);
+  timer clamp should be >2^31-1 to 1ms (`js/mod.rs:960`); unaddressable u64
+  ids become silent `NaN` (`js/mod.rs:970`); listener exceptions never reach
+  `window.onerror` (`events.rs:1023`); refused opaque-origin storage writes
+  report success (`world.rs:823`); `timeStyle`/`useGrouping` validation
+  timing (`intl.js:576/312`); deep WebDriver JSON silently nulls past depth
+  32 (`js/mod.rs:904`).
 - Note: `tools/intl/test262` runner is stale (binary CLI lost
   `create`/`eval`/`close --profile`); Intl is verified via `intl.spec.ts`.
