@@ -39,7 +39,16 @@ Next (ordered by expected file yield):
    post-processing if `url/` is worth more than the other groups.
 4. `webstorage/` needs storage partitioning (3 files), the cross-origin
    dispatcher (1), and synchronous child-`Window` materialization (2).
-5. `domparsing/` and whole-tree probes hang past 25 minutes; score subsets
+5. `FileAPI/` (32/68, 47.1%) clusters on Blob URLs: the renderer mints
+   `blob:tinybrowser/<id>`, an opaque-origin shape, while the spec embeds the
+   creator's origin and a UUID; the hand-written JS `URL` class has no
+   `host`/`port`/`pathname` getters or blob-origin handling; and
+   `window.open`/iframe loads of a `blob:` URL need a browser-side blob
+   registry (the object-URL table is renderer-local). `Blob-methods-*`
+   failures ("emptyDocumentIframe is not defined") look like page-setup
+   fallout, and `idlharness`/workers/`historical.https` need workers or
+   WebIDL introspection.
+6. `domparsing/` and whole-tree probes hang past 25 minutes; score subsets
    (or one directory at a time) and keep `--save-report`.
 
 Decisions made:
