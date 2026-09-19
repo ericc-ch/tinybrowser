@@ -226,19 +226,26 @@ fn valid_doctype_name(name: &str) -> bool {
 #[derive(Trace, rquickjs::JsLifetime)]
 #[rquickjs::class(rename = "DOMParser")]
 pub struct JsDomParser {
-    pub(crate) _reserved: Option<Handle>,
+    /// The constructing realm's document URL. `parseFromString` parses with
+    /// the context object's environment settings, not the caller's, so the
+    /// instance remembers it; a directly-reached native cannot forge another
+    /// document's URL either
+    /// (<https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-domparser-parsefromstring>).
+    url: String,
 }
 
 #[rquickjs::methods]
 #[allow(
     clippy::needless_pass_by_value,
     clippy::unused_self,
-    reason = "rquickjs method ABI passes Ctx by value; DOMParser is a stateless constructor"
+    reason = "rquickjs method ABI passes Ctx by value"
 )]
 impl JsDomParser {
     #[qjs(constructor)]
-    fn new() -> Self {
-        Self { _reserved: None }
+    fn new(ctx: Ctx<'_>) -> Result<Self> {
+        Ok(Self {
+            url: world(&ctx)?.borrow().document_url.as_str().to_owned(),
+        })
     }
 
     // https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-domparser-parsefromstring
@@ -248,7 +255,6 @@ impl JsDomParser {
         ctx: Ctx<'js>,
         source: WebIdlString,
         type_: WebIdlString,
-        url: Opt<WebIdlString>,
     ) -> Result<Value<'js>> {
         let content_type = CONTENT_TYPES
             .iter()
@@ -270,21 +276,11 @@ impl JsDomParser {
         } else {
             crate::xml::parse_document(&source.0, content_type)
         };
-        // The JS wrapper passes the constructing realm's URL. A direct call
-        // on the reachable native (`parser.__tbParser`) must not forge
-        // another document's URL: only the calling realm's own URL parses.
-        let realm_url = world(&ctx)?.borrow().document_url.as_str().to_owned();
-        let url = match url.0 {
-            Some(url) if url.0 == realm_url => url.0,
-            Some(_) => {
-                return Err(Exception::throw_type(
-                    &ctx,
-                    "parseFromString URL must be the realm's document URL",
-                ));
-            }
-            None => realm_url,
-        };
-        parsed.url = Some(url);
+        // The instance's constructing realm decides the URL, never the
+        // caller and never a forged argument: cross-realm method calls parse
+        // with the parser's environment, and the reachable native takes no
+        // URL from script at all.
+        parsed.url = Some(self.url.clone());
         wrap_new_document(&ctx, parsed)
     }
 }

@@ -1,20 +1,18 @@
 // DOMParser wrapper
 // (<https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-domparser-parsefromstring>).
 //
-// The native class cannot know which realm constructed an instance once the
-// method is invoked from another realm, and parsed documents must take the
-// constructing realm's URL. This wrapper captures `document.URL` in the
-// constructor — running in the constructor's realm — and hands it to the
-// native method.
+// The native instance remembers its constructing realm's URL, so parsed
+// documents take that URL even when the method runs in another realm. This
+// wrapper only exists to keep `new.target` branding and argument validation
+// on the JS side.
 (function() {
   const Native = globalThis.DOMParser;
   class DOMParser {
     constructor() {
       Object.defineProperty(this, '__tbParser', { value: new Native() });
-      Object.defineProperty(this, '__tbUrl', { value: globalThis.document.URL });
     }
     parseFromString(source, type) {
-      return this.__tbParser.parseFromString(source, type, this.__tbUrl);
+      return this.__tbParser.parseFromString(source, type);
     }
   }
   Object.defineProperty(globalThis, 'DOMParser', {
