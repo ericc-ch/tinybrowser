@@ -9,7 +9,8 @@ use std::time::Duration;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use browser::{
-    BrowserHandle, ScreenshotClip, ScreenshotRequest, TabError, TabEvent, TabHandle, TabId,
+    BrowserHandle, RemoteValue, ScreenshotClip, ScreenshotRequest, TabError, TabEvent, TabHandle,
+    TabId,
 };
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
@@ -25,6 +26,9 @@ pub(crate) const VIEWPORT_HEIGHT: f64 = 600.0;
 const MAX_SCREENSHOT_DIM: f64 = 4096.0;
 
 pub(crate) async fn session_method(method: &str, tab: &TabHandle) -> Result<Value, DispatchError> {
+    if noop_method(method) {
+        return Ok(json!({}));
+    }
     match method {
         "Page.getFrameTree" => {
             let url = tab
@@ -85,46 +89,185 @@ pub(crate) async fn session_method(method: &str, tab: &TabHandle) -> Result<Valu
                 "mimeType": "text/html",
             }}}))
         }
-        "Runtime.disable"
-        | "Target.setAutoAttach"
-        | "Runtime.runIfWaitingForDebugger"
-        | "Log.enable"
-        | "Page.setLifecycleEventsEnabled"
-        | "Network.enable"
-        | "Emulation.setFocusEmulationEnabled"
-        | "Emulation.setDeviceMetricsOverride"
-        | "Emulation.clearDeviceMetricsOverride"
-        | "Emulation.setTouchEmulationEnabled"
-        | "Emulation.setEmulatedMedia"
-        | "Emulation.setScriptExecutionDisabled"
-        | "Emulation.setPressureSourceOverrideEnabled"
-        | "Runtime.addBinding"
-        | "Security.setIgnoreCertificateErrors"
-        | "Page.setBypassCSP"
-        | "DOM.enable"
-        | "DOM.disable"
-        | "DOMSnapshot.enable"
-        | "Debugger.enable"
-        | "Debugger.disable"
-        | "Fetch.enable"
-        | "Fetch.disable"
-        | "Audits.enable"
-        | "Audits.disable"
-        | "Animation.enable"
-        | "Animation.disable"
-        | "BluetoothEmulation.enable"
-        | "BluetoothEmulation.disable"
-        | "IndexedDB.enable"
-        | "WebMCP.enable"
-        | "Accessibility.enable"
-        | "ServiceWorker.enable"
-        | "Tracing.start"
-        | "Tracing.end"
-        | "Network.clearBrowserCookies"
-        | "Network.clearBrowserCache"
-        | "Network.setCacheDisabled" => Ok(json!({})),
+        "Runtime.getProperties" => Ok(json!({"result": [], "internalProperties": []})),
+        "Storage.getStorageKey" => storage_key(tab).await,
         _ => Err(DispatchError::MethodNotFound),
     }
+}
+
+/// Methods the protocol surface accepts without a behavior change: domains the
+/// engine does not implement yet. Accepting them keeps the corpus classifying
+/// tests as protocol failures or timeouts instead of `UNSUPPORTED_METHOD`.
+fn noop_method(method: &str) -> bool {
+    matches!(
+        method,
+        "Runtime.disable"
+            | "Target.setAutoAttach"
+            | "Runtime.runIfWaitingForDebugger"
+            | "Log.enable"
+            | "Page.setLifecycleEventsEnabled"
+            | "Network.enable"
+            | "Emulation.setFocusEmulationEnabled"
+            | "Emulation.setDeviceMetricsOverride"
+            | "Emulation.clearDeviceMetricsOverride"
+            | "Emulation.setTouchEmulationEnabled"
+            | "Emulation.setEmulatedMedia"
+            | "Emulation.setScriptExecutionDisabled"
+            | "Emulation.setPressureSourceOverrideEnabled"
+            | "Emulation.setPressureStateOverride"
+            | "Runtime.addBinding"
+            | "Security.setIgnoreCertificateErrors"
+            | "Page.setBypassCSP"
+            | "Page.startScreenRecording"
+            | "DOM.enable"
+            | "DOM.disable"
+            | "DOMSnapshot.enable"
+            | "Debugger.enable"
+            | "Debugger.disable"
+            | "Fetch.enable"
+            | "Fetch.disable"
+            | "Audits.enable"
+            | "Audits.disable"
+            | "Animation.enable"
+            | "Animation.disable"
+            | "BluetoothEmulation.enable"
+            | "BluetoothEmulation.disable"
+            | "IndexedDB.enable"
+            | "WebMCP.enable"
+            | "Accessibility.enable"
+            | "ServiceWorker.enable"
+            | "Tracing.start"
+            | "Network.clearBrowserCookies"
+            | "Network.clearBrowserCache"
+            | "Network.setCacheDisabled"
+            | "Network.setExtraHTTPHeaders"
+            | "Network.emulateNetworkConditionsByRule"
+            | "CSS.enable"
+            | "CSS.disable"
+            | "Overlay.enable"
+            | "Overlay.disable"
+            | "DOMDebugger.enable"
+            | "Profiler.enable"
+            | "Profiler.disable"
+            | "Preload.enable"
+            | "Target.setDiscoverTargets"
+            | "Browser.grantPermissions"
+            | "Browser.resetPermissions"
+    )
+}
+
+/// `Storage.getStorageKey`: the tab's origin.
+async fn storage_key(tab: &TabHandle) -> Result<Value, DispatchError> {
+    let value = tab
+        .execute_script("String(location.origin)")
+        .await
+        .map_err(|error| DispatchError::Failed(error.to_string()))?;
+    let key = match value {
+        RemoteValue::String(key) => key,
+        _ => String::new(),
+    };
+    Ok(json!({"storageKey": key}))
+}
+
+/// `DOM.getDocument`: serialize the live tree, remembering each node so later
+/// DOM calls can look it up by `nodeId`.
+pub(crate) async fn dom_get_document(tab: &TabHandle) -> Result<Value, DispatchError> {
+    const SCRIPT: &str = r#"(function(){
+      globalThis.__tb_dom_nodes = [];
+      let next = 1;
+      const walk = node => {
+        const id = next++;
+        globalThis.__tb_dom_nodes[id] = node;
+        const entry = { nodeId: id, backendNodeId: id, nodeType: node.nodeType, nodeName: node.nodeName };
+        if (node.nodeType === 1) { entry.localName = node.localName; entry.nodeValue = ""; entry.attributes = []; }
+        else if (node.nodeType === 9) {
+          entry.nodeValue = ""; entry.documentURL = node.URL; entry.baseURL = node.baseURI;
+          entry.compatibilityMode = "NoQuirks";
+        } else { entry.nodeValue = node.nodeValue || ""; }
+        const children = [];
+        for (let child = node.firstChild; child; child = child.nextSibling) children.push(walk(child));
+        if (children.length) entry.children = children;
+        entry.childNodeCount = children.length;
+        return entry;
+      };
+      return JSON.stringify(walk(document));
+    })()"#;
+    let value = tab
+        .execute_script(SCRIPT)
+        .await
+        .map_err(|error| DispatchError::Failed(error.to_string()))?;
+    let RemoteValue::String(text) = value else {
+        return Err(DispatchError::Failed(
+            "DOM.getDocument could not serialize the document".into(),
+        ));
+    };
+    let root: Value = serde_json::from_str(&text)
+        .map_err(|error| DispatchError::Failed(error.to_string()))?;
+    Ok(json!({"root": root}))
+}
+
+/// `Input.dispatchMouseEvent`: one pointer step through the page-side
+/// performer, preceded by a move so press/release land on the right target.
+pub(crate) async fn input_mouse_event(tab: &TabHandle, params: &Value) -> Result<Value, DispatchError> {
+    let kind = params.get("type").and_then(Value::as_str).unwrap_or("");
+    let x = params.get("x").and_then(Value::as_f64).unwrap_or(0.0);
+    let y = params.get("y").and_then(Value::as_f64).unwrap_or(0.0);
+    let button = match params.get("button").and_then(Value::as_str).unwrap_or("left") {
+        "middle" => 1,
+        "right" => 2,
+        "back" => 3,
+        "forward" => 4,
+        _ => 0,
+    };
+    if kind == "mouseWheel" {
+        let actions = json!({"actions": [{"type": "wheel", "id": "wheel", "actions": [{
+            "type": "scroll", "x": x, "y": y,
+            "deltaX": params.get("deltaX").and_then(Value::as_f64).unwrap_or(0.0),
+            "deltaY": params.get("deltaY").and_then(Value::as_f64).unwrap_or(0.0),
+        }]}]});
+        return run_actions(tab, &actions).await;
+    }
+    let mut items = vec![json!({"type": "pointerMove", "origin": "viewport", "x": x, "y": y})];
+    match kind {
+        "mousePressed" => items.push(json!({"type": "pointerDown", "button": button})),
+        "mouseReleased" => items.push(json!({"type": "pointerUp", "button": button})),
+        _ => {}
+    }
+    let actions = json!({"actions": [{
+        "type": "pointer", "id": "mouse", "parameters": {"pointerType": "mouse"},
+        "actions": items,
+    }]});
+    run_actions(tab, &actions).await
+}
+
+/// `Input.dispatchKeyEvent`: one key step through the page-side performer.
+/// `char` events carry their text in `text`.
+pub(crate) async fn input_key_event(tab: &TabHandle, params: &Value) -> Result<Value, DispatchError> {
+    let kind = params.get("type").and_then(Value::as_str).unwrap_or("");
+    let key = params.get("key").and_then(Value::as_str).unwrap_or("");
+    let text = params.get("text").and_then(Value::as_str).unwrap_or("");
+    let value = if kind == "char" { text } else { key };
+    if value.is_empty() {
+        return Ok(json!({}));
+    }
+    let down = kind != "keyUp";
+    let actions = json!({"actions": [{"type": "key", "id": "keyboard", "actions": [{
+        "type": if down { "keyDown" } else { "keyUp" },
+        "value": value,
+    }]}]});
+    run_actions(tab, &actions).await
+}
+
+/// Runs a page-side action sequence and reports the CDP-shaped reply.
+async fn run_actions(tab: &TabHandle, actions: &Value) -> Result<Value, DispatchError> {
+    let script = format!(
+        "(function(){{return globalThis.__tbWebDriverActions({});}})()",
+        serde_json::to_string(actions).unwrap_or_else(|_| "[]".to_owned())
+    );
+    tab.execute_script(&script)
+        .await
+        .map_err(|error| DispatchError::Failed(error.to_string()))?;
+    Ok(json!({}))
 }
 
 /// One viewport rectangle for [`Page.getLayoutMetrics`].

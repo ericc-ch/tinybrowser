@@ -37,8 +37,9 @@ use tungstenite::protocol::{Message, Role, WebSocket as ClientSocket};
 mod dispatch;
 use dispatch::{
     DispatchError, RUNTIME_HANDLE, RUNTIME_HANDLE_READ, RUNTIME_HANDLE_SCHEDULE, RUNTIME_READ,
-    RUNTIME_SCHEDULE, arguments_expression, attach_session, capture_screenshot, exception_reply,
-    exception_text_reply, json_io, json_string, open_url, session_method, target_id, target_info,
+    RUNTIME_SCHEDULE, arguments_expression, attach_session, capture_screenshot, dom_get_document,
+    exception_reply, exception_text_reply, input_key_event, input_mouse_event, json_io, json_string,
+    open_url, session_method, target_id, target_info,
     wait_for_navigation, ws_io,
 };
 
@@ -943,6 +944,17 @@ impl Conn {
             }
             "Runtime.evaluate" | "Runtime.callFunctionOn" => {
                 self.dispatch_runtime(method, params, tab).await
+            }
+            "DOM.getDocument" => dom_get_document(tab).await,
+            "Input.dispatchMouseEvent" => input_mouse_event(tab, params).await,
+            "Input.dispatchKeyEvent" => input_key_event(tab, params).await,
+            "Tracing.end" => {
+                self.push_session_event(
+                    session,
+                    "Tracing.tracingComplete",
+                    &json!({"dataLossOccurred": false}),
+                );
+                Ok(json!({}))
             }
             _ => session_method(method, tab).await,
         }
