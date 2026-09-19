@@ -37,9 +37,10 @@ use tungstenite::protocol::{Message, Role, WebSocket as ClientSocket};
 mod dispatch;
 use dispatch::{
     DispatchError, RUNTIME_HANDLE, RUNTIME_HANDLE_READ, RUNTIME_HANDLE_SCHEDULE, RUNTIME_READ,
-    RUNTIME_SCHEDULE, arguments_expression, attach_session, capture_screenshot, dom_get_document,
-    exception_reply, exception_text_reply, input_key_event, input_mouse_event, json_io, json_string,
-    open_url, session_method, target_id, target_info,
+    RUNTIME_SCHEDULE, arguments_expression, attach_session, capture_screenshot, css_stylesheets,
+    dom_describe_node, dom_get_document, dom_node_for_location, dom_node_string, dom_query_selector,
+    dom_resolve_node, exception_reply, exception_text_reply, input_key_event, input_mouse_event,
+    json_io, json_string, open_url, session_method, target_id, target_info,
     wait_for_navigation, ws_io,
 };
 
@@ -740,7 +741,23 @@ impl Conn {
             "Browser.setDownloadBehavior"
             | "Browser.grantPermissions"
             | "Browser.resetPermissions"
-            | "Target.setDiscoverTargets" => Ok(json!({})),
+            | "Target.setDiscoverTargets"
+            | "Target.activateTarget"
+            | "BluetoothEmulation.enable"
+            | "BluetoothEmulation.disable"
+            | "Storage.setStorageBucketTracking"
+            | "BackgroundService.startObserving"
+            | "Memory.startSampling"
+            | "Emulation.setSensorOverrideEnabled"
+            | "Emulation.setDevicePostureOverride"
+            | "Debugger.setAsyncCallStackDepth"
+            | "DOMDebugger.setInstrumentationBreakpoint"
+            | "DOMStorage.enable"
+            | "Page.stopScreenRecording"
+            | "Fetch.enable"
+            | "Fetch.disable"
+            | "CSS.enable"
+            | "CSS.disable" => Ok(json!({})),
             "Browser.getWindowForTarget" => Ok(json!({
                 "windowId": 1,
                 "bounds": {"left": 0, "top": 0, "width": 1280, "height": 720, "windowState": "normal"},
@@ -872,6 +889,12 @@ impl Conn {
         tab: &TabHandle,
         session: Option<&str>,
     ) -> Result<Value, DispatchError> {
+        if let Some(value) = self
+            .dispatch_document_method(method, params, tab, session)
+            .await?
+        {
+            return Ok(value);
+        }
         match method {
             "Page.enable" => {
                 self.subscribe_tab(tab, session).await?;
@@ -945,19 +968,62 @@ impl Conn {
             "Runtime.evaluate" | "Runtime.callFunctionOn" => {
                 self.dispatch_runtime(method, params, tab).await
             }
-            "DOM.getDocument" => dom_get_document(tab).await,
-            "Input.dispatchMouseEvent" => input_mouse_event(tab, params).await,
-            "Input.dispatchKeyEvent" => input_key_event(tab, params).await,
+            _ => session_method(method, tab).await,
+        }
+    }
+
+    /// Document, input, CSS, and trace methods. Returns `None` when the method
+    /// belongs to another table.
+    async fn dispatch_document_method(
+        &mut self,
+        method: &str,
+        params: &Value,
+        tab: &TabHandle,
+        session: Option<&str>,
+    ) -> Result<Option<Value>, DispatchError> {
+        let value = match method {
+            "DOM.getDocument" => dom_get_document(tab).await?,
+            "DOM.querySelector" => dom_query_selector(tab, params, false).await?,
+            "DOM.querySelectorAll" => dom_query_selector(tab, params, true).await?,
+            "DOM.describeNode" => dom_describe_node(tab, params).await?,
+            "DOM.getOuterHTML" => dom_node_string(tab, params, "outerHTML").await?,
+            "DOM.getAttributes" => dom_node_string(tab, params, "attributes").await?,
+            "DOM.resolveNode" => dom_resolve_node(tab, params).await?,
+            "DOM.getNodeForLocation" => dom_node_for_location(tab, params).await?,
+            "Input.dispatchMouseEvent" => input_mouse_event(tab, params).await?,
+            "Input.dispatchKeyEvent" => input_key_event(tab, params).await?,
+            "CSS.enable" => {
+                for mut header in css_stylesheets(tab).await? {
+                    if let Some(object) = header.as_object_mut() {
+                        object.insert("frameId".into(), json!(tab.id().to_string()));
+                    }
+                    self.push_session_event(
+                        session,
+                        "CSS.styleSheetAdded",
+                        &json!({"header": header}),
+                    );
+                }
+                json!({})
+            }
             "Tracing.end" => {
+                self.push_session_event(
+                    session,
+                    "Tracing.dataCollected",
+                    &json!({"value": [{
+                        "name": "process_name", "ph": "M",
+                        "args": {"name": "tinybrowser"},
+                    }]}),
+                );
                 self.push_session_event(
                     session,
                     "Tracing.tracingComplete",
                     &json!({"dataLossOccurred": false}),
                 );
-                Ok(json!({}))
+                json!({})
             }
-            _ => session_method(method, tab).await,
-        }
+            _ => return Ok(None),
+        };
+        Ok(Some(value))
     }
 
     async fn navigate_tab(

@@ -142,7 +142,6 @@ fn noop_method(method: &str) -> bool {
             | "Network.setCacheDisabled"
             | "Network.setExtraHTTPHeaders"
             | "Network.emulateNetworkConditionsByRule"
-            | "CSS.enable"
             | "CSS.disable"
             | "Overlay.enable"
             | "Overlay.disable"
@@ -190,7 +189,9 @@ pub(crate) async fn dom_get_document(tab: &TabHandle) -> Result<Value, DispatchE
         entry.childNodeCount = children.length;
         return entry;
       };
-      return JSON.stringify(walk(document));
+      const root = walk(document);
+      globalThis.__tb_dom_id = next - 1;
+      return JSON.stringify(root);
     })()"#;
     let value = tab
         .execute_script(SCRIPT)
@@ -268,6 +269,166 @@ async fn run_actions(tab: &TabHandle, actions: &Value) -> Result<Value, Dispatch
         .await
         .map_err(|error| DispatchError::Failed(error.to_string()))?;
     Ok(json!({}))
+}
+
+/// Runs a DOM helper script that returns a JSON string and parses the reply.
+async fn dom_eval(tab: &TabHandle, script: &str) -> Result<Value, DispatchError> {
+    let value = tab
+        .execute_script(script)
+        .await
+        .map_err(|error| DispatchError::Failed(error.to_string()))?;
+    let RemoteValue::String(text) = value else {
+        return Err(DispatchError::Failed(
+            "the DOM helper did not return JSON".into(),
+        ));
+    };
+    serde_json::from_str(&text).map_err(|error| DispatchError::Failed(error.to_string()))
+}
+
+/// The `nodeId` a DOM method targets, defaulting to the document node.
+fn requested_node(params: &Value) -> u64 {
+    params.get("nodeId").and_then(Value::as_u64).unwrap_or(1)
+}
+
+/// `DOM.querySelector`/`DOM.querySelectorAll`: register the matches in the
+/// page's node table and answer with their ids.
+pub(crate) async fn dom_query_selector(
+    tab: &TabHandle,
+    params: &Value,
+    all: bool,
+) -> Result<Value, DispatchError> {
+    const SINGLE: &str = r"(function(){
+      const n = globalThis.__tb_dom_nodes[__NODE__];
+      if (!n || !n.querySelector) return JSON.stringify({nodeId: 0});
+      const found = n.querySelector(__SELECTOR__);
+      if (!found) return JSON.stringify({nodeId: 0});
+      const id = ++globalThis.__tb_dom_id;
+      globalThis.__tb_dom_nodes[id] = found;
+      return JSON.stringify({nodeId: id});
+    })()";
+    const ALL: &str = r"(function(){
+      const n = globalThis.__tb_dom_nodes[__NODE__];
+      if (!n || !n.querySelectorAll) return JSON.stringify({nodeIds: []});
+      const nodeIds = [];
+      for (const found of n.querySelectorAll(__SELECTOR__)) {
+        const id = ++globalThis.__tb_dom_id;
+        globalThis.__tb_dom_nodes[id] = found;
+        nodeIds.push(id);
+      }
+      return JSON.stringify({nodeIds: nodeIds});
+    })()";
+    let selector = serde_json::to_string(
+        params.get("selector").and_then(Value::as_str).unwrap_or(""),
+    )
+    .unwrap_or_else(|_| "\"\"".to_owned());
+    let script = (if all { ALL } else { SINGLE })
+        .replace("__NODE__", &requested_node(params).to_string())
+        .replace("__SELECTOR__", &selector);
+    dom_eval(tab, &script).await
+}
+
+/// `DOM.describeNode`: the stored node's shape, optionally with children.
+pub(crate) async fn dom_describe_node(
+    tab: &TabHandle,
+    params: &Value,
+) -> Result<Value, DispatchError> {
+    const TEMPLATE: &str = r"(function(){
+      const n = globalThis.__tb_dom_nodes[__NODE__];
+      if (!n) return JSON.stringify({node: null});
+      const entry = {
+        nodeId: __NODE__, backendNodeId: __NODE__,
+        nodeType: n.nodeType, nodeName: n.nodeName,
+        childNodeCount: n.childNodes ? n.childNodes.length : 0,
+      };
+      if (n.nodeType === 1) { entry.localName = n.localName; entry.attributes = []; }
+      return JSON.stringify({node: entry});
+    })()";
+    let script = TEMPLATE.replace("__NODE__", &requested_node(params).to_string());
+    dom_eval(tab, &script).await
+}
+
+/// `DOM.getOuterHTML` and `DOM.getAttributes` share the stored-node lookup.
+pub(crate) async fn dom_node_string(
+    tab: &TabHandle,
+    params: &Value,
+    field: &str,
+) -> Result<Value, DispatchError> {
+    const TEMPLATE: &str = r#"(function(){
+      const n = globalThis.__tb_dom_nodes[__NODE__];
+      if (!n) return JSON.stringify({__FIELD__: null});
+      if ("__FIELD__" === "outerHTML") return JSON.stringify({outerHTML: n.outerHTML === undefined ? "" : n.outerHTML});
+      const attributes = [];
+      if (n.attributes) for (const a of n.attributes) { attributes.push(a.name, a.value); }
+      return JSON.stringify({attributes: attributes});
+    })()"#;
+    let script = TEMPLATE
+        .replace("__NODE__", &requested_node(params).to_string())
+        .replace("__FIELD__", field);
+    dom_eval(tab, &script).await
+}
+
+/// `DOM.resolveNode`: intern the node in the runtime handle table.
+pub(crate) async fn dom_resolve_node(
+    tab: &TabHandle,
+    params: &Value,
+) -> Result<Value, DispatchError> {
+    const TEMPLATE: &str = r#"(function(){
+      const n = globalThis.__tb_dom_nodes[__NODE__];
+      if (!n) return JSON.stringify({object: {type: "undefined"}});
+      const objectId = "dom-__NODE__";
+      globalThis.__tb_handles = globalThis.__tb_handles || {};
+      globalThis.__tb_handles[objectId] = n;
+      return JSON.stringify({object: {
+        type: "object", subtype: "node", objectId: objectId,
+        className: n.constructor ? n.constructor.name : "Node",
+        description: n.nodeName,
+      }});
+    })()"#;
+    let script = TEMPLATE.replace("__NODE__", &requested_node(params).to_string());
+    dom_eval(tab, &script).await
+}
+
+/// `DOM.getNodeForLocation`: hit-test the viewport point.
+pub(crate) async fn dom_node_for_location(
+    tab: &TabHandle,
+    params: &Value,
+) -> Result<Value, DispatchError> {
+    const TEMPLATE: &str = r"(function(){
+      const x = __X__, y = __Y__;
+      const found = document.elementFromPoint ? document.elementFromPoint(x, y) : null;
+      if (!found) return JSON.stringify({nodeId: 0});
+      const id = ++globalThis.__tb_dom_id;
+      globalThis.__tb_dom_nodes[id] = found;
+      return JSON.stringify({nodeId: id});
+    })()";
+    let script = TEMPLATE
+        .replace("__X__", &params.get("x").and_then(Value::as_f64).unwrap_or(0.0).to_string())
+        .replace("__Y__", &params.get("y").and_then(Value::as_f64).unwrap_or(0.0).to_string());
+    dom_eval(tab, &script).await
+}
+
+/// `CSS.enable`: one `CSS.styleSheetAdded` per document stylesheet.
+pub(crate) async fn css_stylesheets(tab: &TabHandle) -> Result<Vec<Value>, DispatchError> {
+    const SCRIPT: &str = r#"(function(){
+      globalThis.__tb_css_id = globalThis.__tb_css_id || 0;
+      const out = [];
+      for (const sheet of document.styleSheets) {
+        const id = String(++globalThis.__tb_css_id);
+        out.push({
+          styleSheetId: id,
+          sourceURL: sheet.href || "",
+          origin: "regular",
+          title: sheet.title || "",
+          disabled: !!sheet.disabled,
+          isInline: !sheet.href,
+          startLine: 0, startColumn: 0, endLine: 0, endColumn: 0,
+          length: sheet.cssRules ? sheet.cssRules.length : 0,
+        });
+      }
+      return JSON.stringify(out);
+    })()"#;
+    let value = dom_eval(tab, SCRIPT).await?;
+    Ok(value.as_array().cloned().unwrap_or_default())
 }
 
 /// One viewport rectangle for [`Page.getLayoutMetrics`].
