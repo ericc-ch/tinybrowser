@@ -212,3 +212,33 @@ verification against code+spec:
   32 (`js/mod.rs:904`).
 - Note: `tools/intl/test262` runner is stale (binary CLI lost
   `create`/`eval`/`close --profile`); Intl is verified via `intl.spec.ts`.
+
+## CodeRabbit pass on PR #22 (2026-09-19)
+
+30 comments triaged; 23 fixed in `17ec522`, 1 declined, 6 deferred.
+
+Fixed: IIFE-wrapped web shims (page-visible `__tbHostToken` and helpers were
+the critical hole), pristine-`Number` error propagation, two-pass node
+conversion, quota getters on the JS subclass, window-cleared handler flags,
+absent-`href` decomposition, `atob` padding order, header combining, stream
+cancel reset, wheel cancel + null guard, `button`/`buttons`/`keyCode`
+conversions, visibility-aware hit testing, window-handler retention on
+document cleanup, CDP domain separator, assignment unregister (+ `route_sync`
+split the over-long command loop), immediate seed application, auxiliary
+window closed/name tracking, wasm insertion-ordered storage, server drain
+timeout, honest permission storage.
+
+Declined with reason: `world.rs:563` (retain window handlers at frame
+teardown) — `handler_attributes` pins JS values that must die with the
+realm; `cleared_handlers` is plain data and safe to keep. Reverting would
+reintroduce the teardown leak fixed in `1da7633`.
+
+Deferred as one "browser boundary trust" design batch (all Heavy lifts in
+code this branch did not build, none covered by a conformance harness):
+`link.rs:906` (renderer auth checks), `link.rs:1186` (cross-site event
+filtering), `messaging.js:907` (`targetOrigin` needs target-origin plumbing
+through three crates), `browser.rs:549` (command-loop round trips),
+`child/mod.rs:250` (full-queue event loss), `store.rs:205` (shutdown join
+ordering). Deferred as architecture: `boxes.rs:332` (per-element inline
+fragments need Parley fragment mapping), `clone.rs:58` + `parsing.rs:123`
+(cross-arena node identity needs a unified arena).
