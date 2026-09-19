@@ -527,14 +527,17 @@ impl JsRealm {
             bindings::install_messaging(&ctx)?;
             ctx.eval::<(), _>(INSTALL_WEB_APIS_JS)?;
             // The shims captured the host token; page script must never see
-            // it. Host plumbing is then frozen: `__tb*` bindings become
-            // non-writable and non-configurable, so a page cannot clobber the
-            // functions Rust looks up by name (already-frozen ones allow the
-            // redundant define as a no-op).
+            // it. Host plumbing is then frozen: function-valued `__tb*`
+            // bindings become non-writable and non-configurable, so a page
+            // cannot clobber the functions Rust looks up by name
+            // (already-frozen ones allow the redundant define as a no-op).
+            // Data-carrying `__tb*` globals stay writable: our own shims
+            // rebind counters such as `__tb_fetchSeq` after install.
             ctx.eval::<(), _>(
                 "delete globalThis.__tbHostToken;\
                  for (const k of Object.getOwnPropertyNames(globalThis)) {\
-                   if (k.startsWith('__tb')) Object.defineProperty(globalThis, k, {writable:false, configurable:false});\
+                   if (k.startsWith('__tb') && typeof globalThis[k] === 'function')\
+                     Object.defineProperty(globalThis, k, {writable:false, configurable:false});\
                  }",
             )?;
             Ok(())
@@ -833,6 +836,7 @@ impl Drop for JsRealm {
         // before its QuickJS context goes away; sibling realms keep theirs.
         world.forget_owned_documents();
         world.clear_listeners();
+        world.release_host_primitives();
     }
 }
 

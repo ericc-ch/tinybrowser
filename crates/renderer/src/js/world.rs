@@ -1133,6 +1133,20 @@ impl World {
         self.observers.clear();
     }
 
+    /// Drops the captured host primitives. Like every other JS-holding field,
+    /// they must go before the realm's context does: a `Persistent` keeps its
+    /// context alive, and a live context keeps the globals (which own
+    /// `Rc<World>` closures) alive, so an unreleased primitive deadlocks
+    /// teardown and trips `JS_FreeRuntime`'s live-object assertion.
+    pub(crate) fn release_host_primitives(&mut self) {
+        self.pristine_string = None;
+        self.pristine_number = None;
+        self.pristine_boolean = None;
+        self.pristine_queue_microtask = None;
+        self.deliver_mutations_fn = None;
+        self.host_token = None;
+    }
+
     fn clear_attributes(&mut self) {
         self.attrs.clear();
         self.attr_owners.clear();
