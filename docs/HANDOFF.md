@@ -64,16 +64,18 @@ Next:
 
 1. CDP and WebDriver are the active workstream (the user asked to unblock
    them fully). Current state:
-   - CDP `--all` after two batches: PASS 13, `UNSUPPORTED_METHOD` 579 (was
-     831), `MISSING_FIXTURE` 500, `TIMEOUT` 279, `PROTOCOL_FAILURE` 116.
-     `DOM.getDocument` and `Input.dispatch*` are real; CSS/Overlay/Debugger/
-     Fetch/Audits/Tracing/Animation/Profile/Network/Permissions are stubs.
-     Next layers: `CSS.getComputedStyleForNode`/`CSS.getMatchedStyles*`,
-     `DOM.describeNode`/`querySelector`/`resolveNode` (node ids already live
-     on `globalThis.__tb_dom_nodes`), `DOMSnapshot.*`, `Network` request and
-     response events (`Network.requestWillBeSent` waits: 23), `Tracing` data
-     events (22), `Fetch.requestPaused` (11), `Runtime.getProperties` with
-     real handles, and `Target.attachedToTarget` for workers (53 waits).
+   - CDP `--all` measured PASS 17, `UNSUPPORTED_METHOD` 385 (from 831),
+     `MISSING_FIXTURE` 507, `TIMEOUT` 342, `PROTOCOL_FAILURE` 236 after the
+     DOM query/CSS/Tracing batch; the computed-style and static/config-surface
+     batches are measuring now. `DOM.getDocument`/queries, `Input.*`,
+     `CSS.enable` + `getComputedStyleForNode`, `Tracing.end`, and
+     `Storage.getStorageKey` are real; the stub layer answers fixed shapes or
+     empty results for the CSS/DOM/Emulation/Page/Target/Network/Debugger/etc.
+     configuration surface. What remains is behavior, not plumbing:
+     `Target.attachedToTarget` for workers (59 waits), `Debugger.paused` (31),
+     late `CSS.styleSheetAdded` (27), `Network.requestWillBeSent`/
+     `responseReceived` (33), `Audits.issueAdded` (15), `Fetch.requestPaused`
+     (12), Animation events (17), Storage bucket events (8), ServiceWorker (7).
    - WebDriver `POST /session/{id}/actions` works for pointer move/down/up/
      cancel, key down/up with text entry, and wheel; `permissions` accepts
      requests but the engine has no permission store. Remaining: touch
