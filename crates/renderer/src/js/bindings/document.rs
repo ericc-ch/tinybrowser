@@ -28,6 +28,11 @@ pub(crate) fn document_url_string(ctx: &Ctx<'_>, id: NodeId) -> String {
         return "about:blank".to_owned();
     };
     let world = owner.borrow();
+    // Script-created documents carry their own URL (a DOMParser result takes
+    // the realm's URL); everything else falls back to the world's document.
+    if let Some(url) = world.document(id).and_then(|parsed| parsed.url.clone()) {
+        return url;
+    }
     if world.is_main_document(id) {
         return world.document_url.as_str().to_owned();
     }

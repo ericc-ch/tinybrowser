@@ -211,6 +211,7 @@ pub(crate) fn install(ctx: &Ctx<'_>, world: &Rc<RefCell<World>>) -> Result<()> {
     Class::<JsAttr>::define(&globals)?;
     Class::<JsNamedNodeMap>::define(&globals)?;
     Class::<JsDomParser>::define(&globals)?;
+    ctx.eval::<(), _>(parsing::INSTALL_DOMPARSER_CTOR_JS)?;
     Class::<JsXmlSerializer>::define(&globals)?;
     Class::<JsMutationObserver>::define(&globals)?;
     Class::<JsMutationRecord>::define(&globals)?;

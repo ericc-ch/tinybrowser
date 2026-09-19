@@ -68,6 +68,10 @@ pub(crate) struct Parsed {
     /// while documents created by script start complete
     /// (<https://html.spec.whatwg.org/multipage/dom.html#current-document-readiness>).
     pub ready_state: ReadyState,
+    /// The document's URL when it differs from the world's active document,
+    /// such as a `DOMParser` result
+    /// (<https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-domparser-parsefromstring>).
+    pub url: Option<String>,
 }
 
 impl Parsed {
@@ -79,6 +83,7 @@ impl Parsed {
             quirks_mode: QuirksMode::NoQuirks,
             content_type,
             ready_state: ReadyState::Complete,
+            url: None,
         }
     }
 }
@@ -158,10 +163,20 @@ impl ActiveParser {
 ///
 /// Broken markup is recovered exactly the way the HTML spec, and therefore
 /// every browser, mandates; that recovery is html5ever's job, not ours.
+#[cfg(test)]
 #[must_use]
 pub(crate) fn parse_html(input: &str) -> Parsed {
     let sink = Sink::new();
     html5ever::parse_document(sink, parse_opts(true)).one(input)
+}
+
+/// Parses a full HTML document with scripting disabled, the mode `DOMParser`
+/// uses
+/// (<https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-domparser-parsefromstring>).
+#[must_use]
+pub(crate) fn parse_html_without_scripting(input: &str) -> Parsed {
+    let sink = Sink::new();
+    html5ever::parse_document(sink, parse_opts(false)).one(input)
 }
 
 /// Parses an HTML fragment with `context` as the
@@ -230,6 +245,7 @@ impl Sink {
             quirks_mode: self.quirks_mode.get(),
             content_type: "text/html",
             ready_state: ReadyState::Loading,
+            url: None,
         }
     }
 
@@ -307,6 +323,7 @@ impl TreeSink for Sink {
             quirks_mode: self.quirks_mode.get(),
             content_type: "text/html",
             ready_state: ReadyState::Loading,
+            url: None,
         }
     }
 

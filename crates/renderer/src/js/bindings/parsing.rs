@@ -228,28 +228,44 @@ impl JsDomParser {
         ctx: Ctx<'js>,
         source: WebIdlString,
         type_: WebIdlString,
+        url: Opt<WebIdlString>,
     ) -> Result<Value<'js>> {
         let content_type = CONTENT_TYPES
             .iter()
             .copied()
             .find(|valid| *valid == type_.0.as_str())
             .ok_or_else(|| {
-                Exception::throw_message(
+                Exception::throw_type(
                     &ctx,
                     &format!("The provided value '{}' is not a valid enum value", type_.0),
                 )
             })?;
-        let parsed = if content_type == "text/html" {
-            let mut parsed = crate::parse_html(&source.0);
+        // `DOMParser` parses with scripting disabled
+        // (<https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-domparser-parsefromstring>).
+        let mut parsed = if content_type == "text/html" {
+            let mut parsed = crate::parse_html_without_scripting(&source.0);
             parsed.content_type = content_type;
             parsed.ready_state = crate::ReadyState::Complete;
             parsed
         } else {
             crate::xml::parse_document(&source.0, content_type)
         };
+        // The JS wrapper passes the constructing realm's URL; the fallback
+        // covers direct calls on the native object.
+        let url = match url.0 {
+            Some(url) => url.0,
+            None => world(&ctx)?.borrow().document_url.as_str().to_owned(),
+        };
+        parsed.url = Some(url);
         wrap_new_document(&ctx, parsed)
     }
 }
+
+/// Wraps the native `DOMParser` so every instance remembers the URL of the
+/// realm that constructed it; the parsed document takes that URL
+/// (<https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-domparser-parsefromstring>).
+pub(crate) const INSTALL_DOMPARSER_CTOR_JS: &str =
+    include_str!("../scripts/parsing/dom_parser_ctor.js");
 
 /// The `DOMParser` `parseFromString` `SupportedType` values
 /// (<https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-domparser-parsefromstring>).
