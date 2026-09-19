@@ -12,7 +12,7 @@ app_units = "0.7"
 euclid = "0.22"
 fontique = { version = "0.11", default-features = false }
 parley = { version = "0.11", default-features = false, features = ["libm"] }
-png = "0.17"
+png = "0.18"
 selectors = "0.40"
 skrifa = { version = "0.44", default-features = false, features = ["std"] }
 web_atoms = "0.2"

@@ -17,8 +17,8 @@ hyper = { version = "1", features = ["http1", "http2", "server"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 serde_json = "1"
 server = { workspace = true }
-sha1 = "0.10"
+sha1 = "0.11"
 tokio = { version = "1.53", default-features = false, features = ["rt", "net", "sync", "time", "macros"] }
-tokio-tungstenite = { version = "0.29", default-features = false }
+tokio-tungstenite = { version = "0.30", default-features = false }
 # Sync client (Client) plus server message types; async server I/O is tokio-tungstenite.
-tungstenite = { version = "0.29", default-features = false, features = ["handshake"] }
+tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
