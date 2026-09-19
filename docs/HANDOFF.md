@@ -90,14 +90,27 @@ Next:
      sources, duration interpolation, real permission state, and the engine
      gaps the smoke tests exposed (`window.getSelection`, range inputs,
      canvas selection).
-   - Usability blockers found by the Playwright probe
-     (`tools/playwright/interaction.spec.ts`, marked `fixme`): geometry
-     queries return stale boxes (`getBoundingClientRect()` reports the default
-     8x8 box until a render pass forces layout), so Playwright's actionability
-     check never passes and `page.click` times out; fix by syncing layout in
-     geometry queries and hit tests. The WebDriver conformance suite
-     (`webdriver/`, 898 wdspec tests) cannot run yet: the product declares no
-     `wdspec` executor and the shared venv has no pytest.
+   - Usability blocker 1, real layout: JS geometry is a virtual stand-in
+     (`virtual_rect`), not the Taffy layout the renderer paints with. The fix
+     is a render-crate refactor: carry the DOM `NodeId` into `tree::BoxNode`
+     and `layout::LayoutBox` (neither has it today), add
+     `render::layout_boxes(dom, sheets, options) -> Vec<NodeBox>` that runs
+     the style/tree/layout steps without painting, cache it per document in
+     the renderer, and serve `getBoundingClientRect`/`getClientRects`/
+     `elementFromPoint`/`elementsFromPoint`/`element_at_point` from it. The
+     Playwright probe (`tools/playwright/interaction.spec.ts`, `fixme`) flips
+     to a gate when this lands: `page.click` currently times out because the
+     probe's div reports `[41, 1, 8, 8]`.
+   - Usability blocker 2, WebDriver conformance: the vendored WPT checkout
+     defines the `wdspec` test type but ships no wdspec executor (no
+     `tools/wptrunner/wptrunner/executors/executorwdspec.py`, no pytest in
+     `_venv3`), so `wpt run --test-types wdspec` dies with `'NoneType' object
+     has no attribute 'test_queue'`. Options: add the upstream wdspec
+     executor + pytest to the product/venv, or run the 898 `webdriver/` tests
+     through upstream WPT tooling against a product that declares wdspec.
+   - Usability blocker 3, feature depth: workers (66 CDP timeouts, and the
+     largest WPT pool), then `window.getSelection`/range inputs, W3C touch
+     action sources, and action durations.
 2. `focus/` needs the cross-frame focus subsystem (`window.focus()`,
    `document.hasFocus()`, ancestor `activeElement` chain, exact focus event
    order); 30 of 41 files time out waiting for it.
