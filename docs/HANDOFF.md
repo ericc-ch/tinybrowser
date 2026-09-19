@@ -90,25 +90,29 @@ Next:
      sources, duration interpolation, real permission state, and the engine
      gaps the smoke tests exposed (`window.getSelection`, range inputs,
      canvas selection).
-   - Usability blocker 1, real layout: JS geometry is a virtual stand-in
-     (`virtual_rect`), not the Taffy layout the renderer paints with. The fix
-     is a render-crate refactor: carry the DOM `NodeId` into `tree::BoxNode`
-     and `layout::LayoutBox` (neither has it today), add
-     `render::layout_boxes(dom, sheets, options) -> Vec<NodeBox>` that runs
-     the style/tree/layout steps without painting, cache it per document in
-     the renderer, and serve `getBoundingClientRect`/`getClientRects`/
-     `elementFromPoint`/`elementsFromPoint`/`element_at_point` from it. The
-     Playwright probe (`tools/playwright/interaction.spec.ts`, `fixme`) flips
-     to a gate when this lands: `page.click` currently times out because the
-     probe's div reports `[41, 1, 8, 8]`.
-   - Usability blocker 2, WebDriver conformance: the vendored WPT checkout
+   - Real layout is wired (`78f3c6e`): `tree::BoxNode`/`layout::LayoutBox`
+     carry the DOM `NodeId` (element boxes and measured leaves for
+     inline-only blocks), `render::layout_boxes` runs style/box/Taffy without
+     painting, and `getBoundingClientRect`/`getClientRects`/
+     `elementFromPoint`/`elementsFromPoint`/`element_at_point` serve it. The
+     virtual stand-in is gone; the Playwright click gate passes. Inline
+     elements still fold into measured leaves, so `<span>`/`<a>` rects are
+     zeros until inline fragments carry node ids. External stylesheets are
+     not mirrored into script geometry yet (inline `<style>` and style
+     attributes are).
+   - Usability blocker 2, form controls: textarea/input lay out as zero boxes
+     (no UA intrinsic size) and the engine does not expose their `value`, so
+     Playwright `locator.focus()`/`fill()`/typing fail. The committed
+     `tools/playwright/interaction.spec.ts` typing test is `fixme` until UA
+     sizing and value reflection land.
+   - Usability blocker 3, WebDriver conformance: the vendored WPT checkout
      defines the `wdspec` test type but ships no wdspec executor (no
      `tools/wptrunner/wptrunner/executors/executorwdspec.py`, no pytest in
      `_venv3`), so `wpt run --test-types wdspec` dies with `'NoneType' object
      has no attribute 'test_queue'`. Options: add the upstream wdspec
      executor + pytest to the product/venv, or run the 898 `webdriver/` tests
      through upstream WPT tooling against a product that declares wdspec.
-   - Usability blocker 3, feature depth: workers (66 CDP timeouts, and the
+   - Usability blocker 4, feature depth: workers (66 CDP timeouts, and the
      largest WPT pool), then `window.getSelection`/range inputs, W3C touch
      action sources, and action durations.
 2. `focus/` needs the cross-frame focus subsystem (`window.focus()`,
