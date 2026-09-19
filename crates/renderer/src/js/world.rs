@@ -292,6 +292,9 @@ pub(crate) struct World {
     next_object_url: u64,
     pub parser_active: bool,
     pub current_script: Option<NodeId>,
+    /// Existing elements being synchronously upgraded by a custom-element
+    /// constructor. `HTMLElement()` consumes the top candidate.
+    pub(crate) custom_construction: Vec<NodeId>,
     /// The realm's window object, for event targets that belong to this world
     /// but are reached from another realm's call frame.
     window: Option<Persistent<Object<'static>>>,
@@ -397,6 +400,7 @@ impl World {
             next_object_url: 0,
             parser_active: false,
             current_script: None,
+            custom_construction: Vec::new(),
             window: None,
             listeners: HashMap::new(),
             standalone_targets: HashMap::new(),
@@ -503,6 +507,7 @@ impl World {
         self.document = Some(id);
         self.owned.insert(id);
         self.current_script = None;
+        self.custom_construction.clear();
         self.listeners.clear();
         self.wrappers.clear();
         self.implementations.clear();
@@ -785,9 +790,16 @@ impl World {
                 if parsed.dom.is_iframe_element(id) && parsed.dom.is_connected(id) {
                     containers.push(id);
                 }
-                if let Some(children) = parsed.dom.children(id) {
-                    stack.extend(children.rev().copied());
+                let mut children: Vec<NodeId> = parsed
+                    .dom
+                    .children(id)
+                    .map(|kids| kids.copied().collect())
+                    .unwrap_or_default();
+                if let Some(root) = parsed.dom.shadow_root(id) {
+                    children.push(root);
                 }
+                children.reverse();
+                stack.extend(children);
             }
             containers
         })

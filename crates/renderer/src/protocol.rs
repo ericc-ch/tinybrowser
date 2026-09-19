@@ -263,6 +263,8 @@ pub enum DialKind {
     JsFetch,
     /// A classic `<script src>` load.
     ClassicScript,
+    /// A JavaScript module graph fetch.
+    ModuleScript,
     /// A `<link rel=stylesheet>` sheet, which delays the load event
     /// (<https://html.spec.whatwg.org/multipage/links.html#link-type-stylesheet>).
     Stylesheet,

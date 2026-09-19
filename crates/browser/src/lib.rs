@@ -30,7 +30,7 @@ pub use net::{Agent, AgentBuilder, CookieRecord, CookieSameSite};
 pub use network::NetworkSession;
 pub use profile::{Profile, ProfileError, ProfileName};
 pub use renderer::{
-    RemoteValue, ResourceLimit, ScreenshotClip, ScreenshotRequest, ScriptFailure, TabError,
-    TabEvent,
+    FrameId, RemoteValue, ResourceLimit, ScreenshotClip, ScreenshotRequest, ScriptFailure,
+    TabError, TabEvent,
 };
 pub use store::ProfileStore;

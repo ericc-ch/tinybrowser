@@ -15,6 +15,8 @@ markup5ever = "=0.39.0"
 html5ever = "=0.39.0"
 tendril = "0.5"
 encoding_rs = "0.8"
+# Web Crypto entropy must come from the operating system, never the JS PRNG.
+getrandom = "0.4"
 # ECMA-402 formatting uses a locale-filtered ICU4X blob generated for the
 # supported locale set; compiled_data would retain every CLDR locale.
 fixed_decimal = { version = "0.7.2", features = ["ryu"] }
@@ -33,7 +35,7 @@ writeable = "0.6"
 tokio = { version = "1.53", default-features = false, features = ["time", "sync", "macros"] }
 url = "2"
 # QuickJS-ng via rquickjs; `std` uses shipped linux bindings (no bindgen).
-rquickjs = { version = "0.14.0", default-features = false, features = ["std", "classes", "macro"] }
+rquickjs = { version = "0.14.0", default-features = false, features = ["std", "classes", "loader", "macro"] }
 # Value-only seam for script results crossing to a carrier.
 serde = { version = "1", features = ["derive"] }
 

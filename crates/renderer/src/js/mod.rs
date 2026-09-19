@@ -7,6 +7,7 @@
 mod bindings;
 mod events;
 mod intl;
+mod modules;
 mod url_parts;
 mod world;
 
@@ -19,8 +20,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use rquickjs::{
-    Array, Coerced, Context, Ctx, FromJs, Function, Object, Runtime, Value, context::EvalOptions,
-    prelude::Func,
+    Array, Coerced, Context, Ctx, Exception, FromJs, Function, Module, Object, Runtime, TypedArray,
+    Value, context::EvalOptions, prelude::Func,
 };
 
 pub(crate) use world::World;
@@ -43,10 +44,16 @@ const INSTALL_WEB_APIS_JS: &str = concat!(
     include_str!("scripts/web/timers.js"),
     include_str!("scripts/web/fetch.js"),
     include_str!("scripts/web/encoding.js"),
+    include_str!("scripts/web/crypto.js"),
     include_str!("scripts/web/streams.js"),
     include_str!("scripts/web/file.js"),
     include_str!("scripts/web/url.js"),
     include_str!("scripts/web/dom.js"),
+    include_str!("scripts/web/cssom.js"),
+    include_str!("scripts/web/navigator.js"),
+    include_str!("scripts/web/tree_walker.js"),
+    include_str!("scripts/web/custom_elements.js"),
+    include_str!("scripts/web/observers.js"),
     include_str!("scripts/web/messaging.js"),
     include_str!("scripts/web/ui_events.js"),
     include_str!("scripts/web/input.js"),
@@ -74,11 +81,17 @@ pub enum ScriptValue {
     Map(Vec<(String, ScriptValue)>),
 }
 
-/// A classic `<script>` in document order.
+/// A `<script>` in document order.
 ///
 /// [HTML prepare the script element](https://html.spec.whatwg.org/multipage/webappapis.html#prepare-the-script-element)
 #[derive(Clone)]
-pub(crate) enum ClassicScript {
+pub(crate) enum Script {
+    Classic(ScriptSource),
+    Module(ScriptSource),
+}
+
+#[derive(Clone)]
+pub(crate) enum ScriptSource {
     Inline(String),
     Src(String),
 }
@@ -138,9 +151,11 @@ pub(crate) struct SharedJsRuntime(Rc<OnceCell<Result<Runtime, Box<str>>>>);
 
 impl SharedJsRuntime {
     pub(crate) fn get(&self) -> Result<&Runtime, JsError> {
-        let slot = self
-            .0
-            .get_or_init(|| Runtime::new().map_err(|err| err.to_string().into_boxed_str()));
+        let slot = self.0.get_or_init(|| {
+            let runtime = Runtime::new().map_err(|err| err.to_string().into_boxed_str())?;
+            runtime.set_loader(modules::WebModuleResolver, modules::WebModuleLoader);
+            Ok(runtime)
+        });
         slot.as_ref()
             .map_err(|message| JsError::Engine(message.clone()))
     }
@@ -186,6 +201,27 @@ impl JsRealm {
             self.context.with(|ctx| {
                 let value: Value = eval_classic(&ctx, source)?;
                 render_eval_result(&ctx, value)
+            })
+        })
+    }
+
+    pub(crate) fn eval_inline_module(&self, name: &str, source: &str) -> Result<(), JsError> {
+        self.with_budget(None, || {
+            self.context.with(|ctx| {
+                let promise = Module::evaluate(ctx, name, source)?;
+                promise.finish::<()>()?;
+                Ok(())
+            })
+        })
+    }
+
+    pub(crate) fn eval_external_module(&self, url: &str) -> Result<(), JsError> {
+        self.with_budget(None, || {
+            self.context.with(|ctx| {
+                let module = modules::load_module(&ctx, url)?;
+                let (_, promise) = module.eval()?;
+                promise.finish::<()>()?;
+                Ok(())
             })
         })
     }
@@ -528,6 +564,7 @@ impl JsRealm {
             intl::install(&ctx)?;
             self.install_task_host_functions(&ctx, &world)?;
             Self::install_document_host_functions(&ctx, &world)?;
+            Self::install_crypto_host_functions(&ctx)?;
             install_storage_host_functions(&ctx, &world)?;
             install_window_host_functions(&ctx, &world)?;
             url_parts::install(&ctx)?;
@@ -549,6 +586,12 @@ impl JsRealm {
             )?;
             Ok(())
         })
+    }
+
+    fn install_crypto_host_functions(ctx: &Ctx<'_>) -> Result<(), JsError> {
+        ctx.globals()
+            .set("__tbRandomBytes", Func::from(random_bytes))?;
+        Ok(())
     }
 
     /// Timer and fetch submission hooks the JS shim calls.
@@ -677,6 +720,18 @@ impl JsRealm {
         )?;
         Ok(())
     }
+}
+
+/// Produces the cryptographically strong bytes required by
+/// [`Crypto.getRandomValues`](https://w3c.github.io/webcrypto/#Crypto-method-getRandomValues).
+fn random_bytes(ctx: Ctx<'_>, length: usize) -> rquickjs::Result<TypedArray<'_, u8>> {
+    if length > 65_536 {
+        return Err(Exception::throw_range(&ctx, "random byte quota exceeded"));
+    }
+    let mut bytes = vec![0; length];
+    getrandom::fill(&mut bytes)
+        .map_err(|error| Exception::throw_internal(&ctx, &error.to_string()))?;
+    TypedArray::new(ctx, bytes)
 }
 
 /// `window.open`/`window.close` hooks the JS shim calls.
@@ -847,27 +902,34 @@ impl Drop for JsRealm {
     }
 }
 
-pub(crate) fn classic_script_at(world: &World, id: dom::NodeId) -> Option<ClassicScript> {
+pub(crate) fn script_at(world: &World, id: dom::NodeId) -> Option<Script> {
     let parsed = world.document(id)?;
-    if !is_classic_script(&parsed.dom, id) {
+    let Some(dom::NodeKind::Element { name, .. }) = parsed.dom.kind(id) else {
+        return None;
+    };
+    if name.ns != dom::html_namespace() || !name.local.as_ref().eq_ignore_ascii_case("script") {
         return None;
     }
-    match parsed.dom.attribute(id, "src") {
-        Some(src) if !src.trim().is_empty() => Some(ClassicScript::Src(src)),
-        _ => Some(ClassicScript::Inline(element_text(&parsed.dom, id))),
+    let source = match parsed.dom.attribute(id, "src") {
+        Some(src) if !src.trim().is_empty() => ScriptSource::Src(src),
+        _ => ScriptSource::Inline(element_text(&parsed.dom, id)),
+    };
+    let typ = parsed.dom.attribute(id, "type");
+    if typ
+        .as_deref()
+        .is_some_and(|typ| typ.trim().eq_ignore_ascii_case("module"))
+    {
+        Some(Script::Module(source))
+    } else {
+        javascript_mime(typ.as_deref()).then_some(Script::Classic(source))
     }
 }
 
-fn is_classic_script(tree: &dom::Dom, id: dom::NodeId) -> bool {
-    match tree.kind(id) {
-        Some(dom::NodeKind::Element { name, .. })
-            if name.ns == dom::html_namespace()
-                && name.local.as_ref().eq_ignore_ascii_case("script") =>
-        {
-            javascript_mime(tree.attribute(id, "type").as_deref())
-        }
-        _ => false,
-    }
+pub(super) fn javascript_module_mime(typ: Option<&str>) -> bool {
+    let Some(typ) = typ.map(str::trim).filter(|typ| !typ.is_empty()) else {
+        return false;
+    };
+    javascript_mime(Some(typ))
 }
 
 fn javascript_mime(typ: Option<&str>) -> bool {

@@ -89,6 +89,9 @@ td, th { padding: 1px; }
 th { font-weight: bold; text-align: center; }
 img { display: inline-block; }
 input, textarea, select, button { display: inline-block; }
+input { width: 180px; height: 24px; padding: 2px 4px; border: 1px solid #767676; background-color: white; color: black; }
+input[type=hidden] { display: none; }
+input[type=submit], input[type=reset], input[type=button] { width: 96px; background-color: #efefef; }
 textarea { white-space: pre-wrap; }
 ";
 
@@ -167,7 +170,7 @@ pub(crate) fn style_document(
 fn register_elements(dom: &Dom, tables: &mut StyloTables) {
     let document = dom.document();
     tables.register(document);
-    for node in dom.descendants(document) {
+    for node in dom.rendered_descendants(document) {
         tables.register(node);
         if matches!(dom.kind(node), Some(dom::NodeKind::Element { .. })) {
             tables
@@ -180,7 +183,7 @@ fn register_elements(dom: &Dom, tables: &mut StyloTables) {
 /// Re-inserts fresh element data after a `rem` second pass clears the table.
 fn register_data(dom: &Dom, tables: &mut StyloTables) {
     let document = dom.document();
-    for node in dom.descendants(document) {
+    for node in dom.rendered_descendants(document) {
         if matches!(dom.kind(node), Some(dom::NodeKind::Element { .. })) {
             tables
                 .data
@@ -196,7 +199,7 @@ fn parse_attributes(dom: &Dom, tables: &mut StyloTables) {
         url::Url::parse("about:blank").expect("about:blank parses"),
     ));
     let document = dom.document();
-    for node in dom.descendants(document) {
+    for node in dom.rendered_descendants(document) {
         if !matches!(dom.kind(node), Some(dom::NodeKind::Element { .. })) {
             continue;
         }

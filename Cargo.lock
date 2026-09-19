@@ -1859,6 +1859,7 @@ dependencies = [
  "dom",
  "encoding_rs",
  "fixed_decimal",
+ "getrandom",
  "html5ever",
  "icu_calendar",
  "icu_datetime",
