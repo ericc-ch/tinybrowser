@@ -418,6 +418,15 @@ impl JsNode {
         }
     }
 
+    // https://drafts.csswg.org/cssom-view/#dom-document-elementfrompoint
+    #[qjs(rename = "elementFromPoint")]
+    fn element_from_point<'js>(&self, ctx: Ctx<'js>, x: f64, y: f64) -> Result<Value<'js>> {
+        let Some(node) = element_at_point(&ctx, self.handle.0, x, y)? else {
+            return Ok(Value::new_null(ctx));
+        };
+        wrap_node(&ctx, node)
+    }
+
     // The no-layout hit test: the deepest element whose virtual box contains
     // the point (see `element_at_point`).
     #[qjs(rename = "elementsFromPoint")]

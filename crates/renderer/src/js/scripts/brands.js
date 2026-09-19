@@ -77,7 +77,7 @@
     'URL', 'documentURI', 'baseURI', 'location', 'characterSet', 'charset',
     'inputEncoding', 'contentType', 'compatMode', 'title',
     'getElementsByName', 'importNode', 'currentScript', 'activeElement',
-    'elementsFromPoint', 'defaultView'
+    'elementFromPoint', 'elementsFromPoint', 'defaultView'
   ], true);
   const ElementInterface = define('Element', NodeInterface, [
     'getElementsByTagName', 'getElementsByTagNameNS', 'getElementsByClassName',

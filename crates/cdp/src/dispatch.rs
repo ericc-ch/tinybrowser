@@ -270,10 +270,16 @@ async fn storage_key(tab: &TabHandle) -> Result<Value, DispatchError> {
 pub(crate) async fn dom_get_document(tab: &TabHandle) -> Result<Value, DispatchError> {
     const SCRIPT: &str = r#"(function(){
       globalThis.__tb_dom_nodes = [];
-      let next = 1;
+      globalThis.__tb_dom_id = 0;
+      const register = node => {
+        const nodes = globalThis.__tb_dom_nodes;
+        for (let id = 1; id < nodes.length; id++) { if (nodes[id] === node) return id; }
+        const id = ++globalThis.__tb_dom_id;
+        nodes[id] = node;
+        return id;
+      };
       const walk = node => {
-        const id = next++;
-        globalThis.__tb_dom_nodes[id] = node;
+        const id = register(node);
         const entry = { nodeId: id, backendNodeId: id, nodeType: node.nodeType, nodeName: node.nodeName };
         if (node.nodeType === 1) { entry.localName = node.localName; entry.nodeValue = ""; entry.attributes = []; }
         else if (node.nodeType === 9) {
@@ -287,7 +293,6 @@ pub(crate) async fn dom_get_document(tab: &TabHandle) -> Result<Value, DispatchE
         return entry;
       };
       const root = walk(document);
-      globalThis.__tb_dom_id = next - 1;
       return JSON.stringify(root);
     })()"#;
     let value = tab
@@ -470,23 +475,31 @@ pub(crate) async fn dom_query_selector(
     all: bool,
 ) -> Result<Value, DispatchError> {
     const SINGLE: &str = r"(function(){
+      const register = node => {
+        const nodes = globalThis.__tb_dom_nodes;
+        for (let id = 1; id < nodes.length; id++) { if (nodes[id] === node) return id; }
+        const id = ++globalThis.__tb_dom_id;
+        nodes[id] = node;
+        return id;
+      };
       const n = globalThis.__tb_dom_nodes[__NODE__];
       if (!n || !n.querySelector) return JSON.stringify({nodeId: 0});
       const found = n.querySelector(__SELECTOR__);
       if (!found) return JSON.stringify({nodeId: 0});
-      const id = ++globalThis.__tb_dom_id;
-      globalThis.__tb_dom_nodes[id] = found;
-      return JSON.stringify({nodeId: id});
+      return JSON.stringify({nodeId: register(found)});
     })()";
     const ALL: &str = r"(function(){
+      const register = node => {
+        const nodes = globalThis.__tb_dom_nodes;
+        for (let id = 1; id < nodes.length; id++) { if (nodes[id] === node) return id; }
+        const id = ++globalThis.__tb_dom_id;
+        nodes[id] = node;
+        return id;
+      };
       const n = globalThis.__tb_dom_nodes[__NODE__];
       if (!n || !n.querySelectorAll) return JSON.stringify({nodeIds: []});
       const nodeIds = [];
-      for (const found of n.querySelectorAll(__SELECTOR__)) {
-        const id = ++globalThis.__tb_dom_id;
-        globalThis.__tb_dom_nodes[id] = found;
-        nodeIds.push(id);
-      }
+      for (const found of n.querySelectorAll(__SELECTOR__)) nodeIds.push(register(found));
       return JSON.stringify({nodeIds: nodeIds});
     })()";
     let selector =
@@ -565,12 +578,17 @@ pub(crate) async fn dom_node_for_location(
     params: &Value,
 ) -> Result<Value, DispatchError> {
     const TEMPLATE: &str = r"(function(){
+      const register = node => {
+        const nodes = globalThis.__tb_dom_nodes;
+        for (let id = 1; id < nodes.length; id++) { if (nodes[id] === node) return id; }
+        const id = ++globalThis.__tb_dom_id;
+        nodes[id] = node;
+        return id;
+      };
       const x = __X__, y = __Y__;
       const found = document.elementFromPoint ? document.elementFromPoint(x, y) : null;
       if (!found) return JSON.stringify({nodeId: 0});
-      const id = ++globalThis.__tb_dom_id;
-      globalThis.__tb_dom_nodes[id] = found;
-      return JSON.stringify({nodeId: id});
+      return JSON.stringify({nodeId: register(found)});
     })()";
     let script = TEMPLATE
         .replace(
@@ -614,6 +632,41 @@ pub(crate) async fn css_stylesheets(tab: &TabHandle) -> Result<Vec<Value>, Dispa
     })()"#;
     let value = dom_eval(tab, SCRIPT).await?;
     Ok(value.as_array().cloned().unwrap_or_default())
+}
+
+/// `DOM.getBoxModel`: the node's border box as content/padding/border/margin
+/// quads (the engine has no separate boxes, so all four are the border box).
+pub(crate) async fn dom_box_model(tab: &TabHandle, params: &Value) -> Result<Value, DispatchError> {
+    const TEMPLATE: &str = r"(function(){
+      const n = globalThis.__tb_dom_nodes[__NODE__];
+      if (!n || !n.getBoundingClientRect) return JSON.stringify({model: null});
+      const r = n.getBoundingClientRect();
+      const quad = [r.left, r.top, r.right, r.top, r.right, r.bottom, r.left, r.bottom];
+      return JSON.stringify({model: {
+        content: quad, padding: quad, border: quad, margin: quad,
+        width: Math.round(r.width), height: Math.round(r.height),
+      }});
+    })()";
+    let script = TEMPLATE.replace("__NODE__", &requested_node(params).to_string());
+    dom_eval(tab, &script).await
+}
+
+/// `DOM.getContentQuads`: one quad per client rect of the node.
+pub(crate) async fn dom_content_quads(
+    tab: &TabHandle,
+    params: &Value,
+) -> Result<Value, DispatchError> {
+    const TEMPLATE: &str = r"(function(){
+      const n = globalThis.__tb_dom_nodes[__NODE__];
+      if (!n || !n.getClientRects) return JSON.stringify({quads: []});
+      const quads = [];
+      for (const r of n.getClientRects()) {
+        quads.push([r.left, r.top, r.right, r.top, r.right, r.bottom, r.left, r.bottom]);
+      }
+      return JSON.stringify({quads: quads});
+    })()";
+    let script = TEMPLATE.replace("__NODE__", &requested_node(params).to_string());
+    dom_eval(tab, &script).await
 }
 
 /// `CSS.getComputedStyleForNode`: the resolved style as name/value pairs.

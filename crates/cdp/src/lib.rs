@@ -38,11 +38,11 @@ mod dispatch;
 use dispatch::{
     DispatchError, RUNTIME_HANDLE, RUNTIME_HANDLE_READ, RUNTIME_HANDLE_SCHEDULE, RUNTIME_READ,
     RUNTIME_SCHEDULE, arguments_expression, attach_session, capture_screenshot, css_computed_style,
-    css_stylesheets, dom_describe_node, dom_get_document, dom_node_for_location, dom_node_string,
-    dom_query_selector, dom_resolve_node, exception_reply, exception_text_reply,
-    input_emulate_touch_from_mouse, input_insert_text, input_key_event, input_mouse_event,
-    input_touch_event, json_io, json_string, open_url, session_method, static_reply,
-    stubbed_domain, target_id, target_info, wait_for_navigation, ws_io,
+    css_stylesheets, dom_box_model, dom_content_quads, dom_describe_node, dom_get_document,
+    dom_node_for_location, dom_node_string, dom_query_selector, dom_resolve_node, exception_reply,
+    exception_text_reply, input_emulate_touch_from_mouse, input_insert_text, input_key_event,
+    input_mouse_event, input_touch_event, json_io, json_string, open_url, session_method,
+    static_reply, stubbed_domain, target_id, target_info, wait_for_navigation, ws_io,
 };
 
 const PRODUCT: &str = "tinybrowser/0.1.0";
@@ -1005,6 +1005,8 @@ impl Conn {
             "DOM.getAttributes" => dom_node_string(tab, params, "attributes").await?,
             "DOM.resolveNode" => dom_resolve_node(tab, params).await?,
             "DOM.getNodeForLocation" => dom_node_for_location(tab, params).await?,
+            "DOM.getBoxModel" => dom_box_model(tab, params).await?,
+            "DOM.getContentQuads" => dom_content_quads(tab, params).await?,
             "Input.dispatchMouseEvent" => input_mouse_event(tab, params).await?,
             "Input.dispatchKeyEvent" => input_key_event(tab, params).await?,
             "Input.insertText" => input_insert_text(tab, params).await?,
