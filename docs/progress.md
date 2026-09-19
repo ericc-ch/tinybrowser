@@ -247,7 +247,7 @@ nix develop --command ./tools/wpt/score <directory> -- --exclude=worker
 | `ua-client-hints/` | unscored |
 | `uievents/` | unscored |
 | `upgrade-insecure-requests/` | unscored |
-| `url/` | 14.3% |
+| `url/` | 28.6% |
 | `urlpattern/` | 0.0% |
 | `user-timing/` | unscored |
 | `vibration/` | unscored |
