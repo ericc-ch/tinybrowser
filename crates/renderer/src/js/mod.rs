@@ -31,7 +31,20 @@ const MAX_RUNTIME_MEMORY: usize = 32 * 1024 * 1024;
 const MAX_RUNTIME_STACK: usize = 512 * 1024;
 const DEFAULT_SCRIPT_BUDGET: Duration = Duration::from_secs(5);
 
-const INSTALL_WEB_APIS_JS: &str = include_str!("scripts/web_apis.js");
+/// Web-platform JS shims, one spec area per file, evaluated in order as a
+/// single script so top-level bindings are shared across areas.
+const INSTALL_WEB_APIS_JS: &str = concat!(
+    include_str!("scripts/web/timers.js"),
+    include_str!("scripts/web/fetch.js"),
+    include_str!("scripts/web/encoding.js"),
+    include_str!("scripts/web/streams.js"),
+    include_str!("scripts/web/file.js"),
+    include_str!("scripts/web/url.js"),
+    include_str!("scripts/web/dom.js"),
+    include_str!("scripts/web/messaging.js"),
+    include_str!("scripts/web/ui_events.js"),
+    include_str!("scripts/web/input.js"),
+);
 
 /// A value produced by script evaluation.
 #[derive(Clone, Debug, PartialEq)]
