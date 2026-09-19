@@ -62,13 +62,29 @@ browser-side channel registry keyed by (assignment, channel id).
 
 Next:
 
-1. `focus/` needs the cross-frame focus subsystem (`window.focus()`,
+1. CDP and WebDriver are the active workstream (the user asked to unblock
+   them fully). Current state:
+   - CDP `--all` after two batches: PASS 13, `UNSUPPORTED_METHOD` 579 (was
+     831), `MISSING_FIXTURE` 500, `TIMEOUT` 279, `PROTOCOL_FAILURE` 116.
+     `DOM.getDocument` and `Input.dispatch*` are real; CSS/Overlay/Debugger/
+     Fetch/Audits/Tracing/Animation/Profile/Network/Permissions are stubs.
+     Next layers: `CSS.getComputedStyleForNode`/`CSS.getMatchedStyles*`,
+     `DOM.describeNode`/`querySelector`/`resolveNode` (node ids already live
+     on `globalThis.__tb_dom_nodes`), `DOMSnapshot.*`, `Network` request and
+     response events (`Network.requestWillBeSent` waits: 23), `Tracing` data
+     events (22), `Fetch.requestPaused` (11), `Runtime.getProperties` with
+     real handles, and `Target.attachedToTarget` for workers (53 waits).
+   - WebDriver `POST /session/{id}/actions` works for pointer move/down/up/
+     cancel, key down/up with text entry, and wheel; `permissions` accepts
+     requests but the engine has no permission store. Remaining: touch
+     sources, duration interpolation, real permission state, and the engine
+     gaps the smoke tests exposed (`window.getSelection`, range inputs,
+     canvas selection).
+2. `focus/` needs the cross-frame focus subsystem (`window.focus()`,
    `document.hasFocus()`, ancestor `activeElement` chain, exact focus event
    order); 30 of 41 files time out waiting for it.
-2. `webstorage/` endgame: storage partitioning (3 files), cross-origin
+3. `webstorage/` endgame: storage partitioning (3 files), cross-origin
    dispatcher (1), synchronous child `Window` materialization (2).
-3. `custom-elements/` (~180 files at ~3%) and `cookies/` (~80 files at 24%)
-   are the biggest untouched pools.
 4. `domparsing/` is scored at 28.4% (21/74). The rest is: the tentative
    streaming API (`Element.streamHTML`, `streamPositionalHTML`,
    `document.createParserOptions`; dozens of files, never started), a missing
