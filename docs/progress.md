@@ -7,7 +7,7 @@ Size research lives in [`docs/researches/size-budget.md`](researches/size-budget
 
 Target: under 10MB stripped on x86_64.
 
-8,282,776 bytes (2026-09-19)
+8,288,568 bytes (2026-09-19)
 
 ```sh
 nix develop --command ./tools/ship
