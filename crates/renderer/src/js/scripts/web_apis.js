@@ -2728,8 +2728,10 @@ Object.defineProperty(globalThis.InputEvent.prototype, Symbol.toStringTag, { val
 // per-frame interpolation yet.
 (function() {
   const pointerStates = new Map();
-  const pointerState = id => {
-    if (!pointerStates.has(id)) pointerStates.set(id, { x: 0, y: 0, buttons: 0, target: null });
+  const pointerState = (id, pointerType) => {
+    if (!pointerStates.has(id)) {
+      pointerStates.set(id, { x: 0, y: 0, buttons: 0, target: null, pointerType: pointerType || 'mouse' });
+    }
     return pointerStates.get(id);
   };
   const at = (x, y) => {
@@ -2747,6 +2749,15 @@ Object.defineProperty(globalThis.InputEvent.prototype, Symbol.toStringTag, { val
     bubbles: true, cancelable: true, composed: true, view: globalThis,
     clientX: x, clientY: y, screenX: x, screenY: y, buttons: buttons || 0,
   }, extra || {});
+  // Pointer events carry the source's pointer type; the extra argument can be
+  // either a buttons value (ignored) or an init object, matching how the
+  // mouse init is called above.
+  const pointerInit = (state, x, y, buttonsOrExtra, maybeExtra) => {
+    const extra = maybeExtra === undefined ? null : maybeExtra;
+    return Object.assign(mouseInit(x, y, state.buttons, extra), {
+      pointerId: 1, isPrimary: true, pointerType: state.pointerType,
+    });
+  };
   const fire = (node, event) => { if (node) node.dispatchEvent(event); };
   const pointerItem = (state, item) => {
     if (item.type === 'pointerMove') {
@@ -2757,17 +2768,17 @@ Object.defineProperty(globalThis.InputEvent.prototype, Symbol.toStringTag, { val
       else { x = item.x || 0; y = item.y || 0; }
       const next = at(x, y);
       if (state.target && state.target !== next) {
-        fire(state.target, new PointerEvent('pointerout', mouseInit(state.x, state.y, state.buttons)));
-        fire(state.target, new PointerEvent('pointerleave', mouseInit(state.x, state.y, state.buttons)));
+        fire(state.target, new PointerEvent('pointerout', pointerInit(state, state.x, state.y, state.buttons)));
+        fire(state.target, new PointerEvent('pointerleave', pointerInit(state, state.x, state.y, state.buttons)));
         fire(state.target, new MouseEvent('mouseout', mouseInit(state.x, state.y, state.buttons)));
         fire(state.target, new MouseEvent('mouseleave', mouseInit(state.x, state.y, state.buttons)));
-        fire(next, new PointerEvent('pointerover', mouseInit(x, y, state.buttons)));
-        fire(next, new PointerEvent('pointerenter', mouseInit(x, y, state.buttons)));
+        fire(next, new PointerEvent('pointerover', pointerInit(state, x, y, state.buttons)));
+        fire(next, new PointerEvent('pointerenter', pointerInit(state, x, y, state.buttons)));
         fire(next, new MouseEvent('mouseover', mouseInit(x, y, state.buttons)));
         fire(next, new MouseEvent('mouseenter', mouseInit(x, y, state.buttons)));
       }
       state.x = x; state.y = y; state.target = next;
-      fire(next, new PointerEvent('pointermove', mouseInit(x, y, state.buttons)));
+      fire(next, new PointerEvent('pointermove', pointerInit(state, x, y, state.buttons)));
       fire(next, new MouseEvent('mousemove', mouseInit(x, y, state.buttons)));
     } else if (item.type === 'pointerDown') {
       const button = item.button || 0;
@@ -2775,17 +2786,17 @@ Object.defineProperty(globalThis.InputEvent.prototype, Symbol.toStringTag, { val
       const node = at(state.x, state.y);
       state.target = node;
       if (node && typeof node.focus === 'function') { try { node.focus(); } catch (error) {} }
-      fire(node, new PointerEvent('pointerdown', mouseInit(state.x, state.y, state.buttons, { button: button })));
+      fire(node, new PointerEvent('pointerdown', pointerInit(state, state.x, state.y, state.buttons, { button: button })));
       fire(node, new MouseEvent('mousedown', mouseInit(state.x, state.y, state.buttons, { button: button })));
     } else if (item.type === 'pointerUp') {
       const button = item.button || 0;
       const node = at(state.x, state.y);
-      fire(node, new PointerEvent('pointerup', mouseInit(state.x, state.y, state.buttons, { button: button })));
+      fire(node, new PointerEvent('pointerup', pointerInit(state, state.x, state.y, state.buttons, { button: button })));
       fire(node, new MouseEvent('mouseup', mouseInit(state.x, state.y, state.buttons, { button: button })));
       if (button === 0) fire(node, new MouseEvent('click', mouseInit(state.x, state.y, 0, { button: 0 })));
       state.buttons &= ~(1 << button);
     } else if (item.type === 'pointerCancel') {
-      fire(at(state.x, state.y), new PointerEvent('pointercancel', mouseInit(state.x, state.y, state.buttons)));
+      fire(at(state.x, state.y), new PointerEvent('pointercancel', pointerInit(state, state.x, state.y, state.buttons)));
       state.buttons = 0;
     }
   };
@@ -2857,9 +2868,13 @@ Object.defineProperty(globalThis.InputEvent.prototype, Symbol.toStringTag, { val
       for (const source of actions) {
         const item = source.actions ? source.actions[tick] : null;
         if (!item || item.type === 'pause') continue;
-        if (source.type === 'pointer') pointerItem(pointerState(source.id), item);
-        else if (source.type === 'key') keyItem(item, item.type === 'keyDown');
-        else if (source.type === 'wheel') wheelItem(item);
+        if (source.type === 'pointer') {
+          const parameters = source.parameters || {};
+          pointerItem(pointerState(source.id, parameters.pointerType), item);
+        } else if (source.type === 'key') {
+          if (item.type === 'insertText') insertText(String(item.value === undefined ? '' : item.value));
+          else keyItem(item, item.type === 'keyDown');
+        } else if (source.type === 'wheel') wheelItem(item);
       }
     }
     return true;

@@ -133,7 +133,7 @@ pub(crate) fn static_reply(method: &str) -> Option<Value> {
 /// failures or timeouts instead of `UNSUPPORTED_METHOD`, which keeps the
 /// remaining work visible as behavior rather than as missing plumbing.
 pub(crate) fn stubbed_domain(method: &str) -> bool {
-    const DOMAINS: [&str; 29] = [
+    const DOMAINS: [&str; 44] = [
         "CSS",
         "DOM",
         "DOMDebugger",
@@ -163,6 +163,21 @@ pub(crate) fn stubbed_domain(method: &str) -> bool {
         "Security",
         "Accessibility",
         "Tracing",
+        "Input",
+        "Browser",
+        "Runtime",
+        "DeviceAccess",
+        "WebAudio",
+        "Performance",
+        "PerformanceTimeline",
+        "LayerTree",
+        "IO",
+        "HeapProfiler",
+        "Timeline",
+        "Media",
+        "EventBreakpoints",
+        "SystemInfo",
+        "CrashReportContext",
     ];
     DOMAINS.iter().any(|domain| method.starts_with(domain))
 }
@@ -348,6 +363,71 @@ pub(crate) async fn input_key_event(
         "type": if down { "keyDown" } else { "keyUp" },
         "value": value,
     }]}]});
+    run_actions(tab, &actions).await
+}
+
+/// `Input.insertText`: type into the focused element.
+pub(crate) async fn input_insert_text(
+    tab: &TabHandle,
+    params: &Value,
+) -> Result<Value, DispatchError> {
+    let text = params.get("text").and_then(Value::as_str).unwrap_or("");
+    if text.is_empty() {
+        return Ok(json!({}));
+    }
+    let actions = json!({"actions": [{"type": "key", "id": "keyboard", "actions": [
+        {"type": "insertText", "value": text},
+    ]}]});
+    run_actions(tab, &actions).await
+}
+
+/// `Input.dispatchTouchEvent`: the first touch point as a touch pointer.
+pub(crate) async fn input_touch_event(
+    tab: &TabHandle,
+    params: &Value,
+) -> Result<Value, DispatchError> {
+    let kind = params.get("type").and_then(Value::as_str).unwrap_or("");
+    let Some(point) = params
+        .get("touchPoints")
+        .and_then(Value::as_array)
+        .and_then(|points| points.first())
+    else {
+        return Ok(json!({}));
+    };
+    let x = point.get("x").and_then(Value::as_f64).unwrap_or(0.0);
+    let y = point.get("y").and_then(Value::as_f64).unwrap_or(0.0);
+    let mut items = vec![json!({"type": "pointerMove", "origin": "viewport", "x": x, "y": y})];
+    match kind {
+        "touchStart" => items.push(json!({"type": "pointerDown", "button": 0})),
+        "touchEnd" => items.push(json!({"type": "pointerUp", "button": 0})),
+        "touchCancel" => items.push(json!({"type": "pointerCancel"})),
+        _ => {}
+    }
+    let actions = json!({"actions": [{
+        "type": "pointer", "id": "touch", "parameters": {"pointerType": "touch"},
+        "actions": items,
+    }]});
+    run_actions(tab, &actions).await
+}
+
+/// `Input.emulateTouchFromMouseEvent`: the mouse shape, touch-typed.
+pub(crate) async fn input_emulate_touch_from_mouse(
+    tab: &TabHandle,
+    params: &Value,
+) -> Result<Value, DispatchError> {
+    let kind = params.get("type").and_then(Value::as_str).unwrap_or("");
+    let x = params.get("x").and_then(Value::as_f64).unwrap_or(0.0);
+    let y = params.get("y").and_then(Value::as_f64).unwrap_or(0.0);
+    let mut items = vec![json!({"type": "pointerMove", "origin": "viewport", "x": x, "y": y})];
+    match kind {
+        "mousePressed" => items.push(json!({"type": "pointerDown", "button": 0})),
+        "mouseReleased" => items.push(json!({"type": "pointerUp", "button": 0})),
+        _ => {}
+    }
+    let actions = json!({"actions": [{
+        "type": "pointer", "id": "touch", "parameters": {"pointerType": "touch"},
+        "actions": items,
+    }]});
     run_actions(tab, &actions).await
 }
 
