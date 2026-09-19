@@ -5,7 +5,7 @@ this branch: `webstorage/` 47/54 (87.0%), `url/` 25/49 (51.0%),
 `webmessaging/` 106/124 (85.5%, broadcastchannel excluded),
 `webmessaging/broadcastchannel/` 5/12 (41.7%), `focus/` 3/41 (7.3%),
 `domparsing/` 21/74 (28.4%), `FileAPI/` 32/68 (47.1%). Shipping binary
-8,288,568 bytes (cap 10,485,760). CDP `--all`: PASS 33, no missing methods
+8,300,088 bytes (cap 10,485,760). CDP `--all`: PASS 33, no missing methods
 (one intentional `Domain.NotExistingCommand` test). `tools/ub lint`,
 `cargo test --workspace` (34 suites), and `tools/ship` are green at
 `4cfbca2`.
@@ -140,3 +140,39 @@ Gotchas:
   `TINYBROWSER_WPT_NO_LOCK=1` when alone.
 - `tests/wpt/metadata` is unchanged; scores are file-level, so partial
   subtest wins do not move a group until a whole file passes.
+
+## Adversarial review pass (2026-09-19)
+
+Five reviewers covered all web API/bindings areas (`69bcecf`, `1da7633`,
+`ba1b4d7`). All 42 must-fix findings are closed except 6 downgraded after
+verification against code+spec:
+
+- Fixed: pristine-intrinsic conversions, trusted-bridge token gate,
+  `__tb*` freeze, parser instance-realm URL, real cross-document adoption,
+  mutation delivery/options, observer lifecycle, focus/click guards, six DOM
+  core fixes, base URL, location hash, createDocument, budget nesting,
+  window.event restore, cancelled timers, locale gate, IPv6 host, Intl exact
+  decimals, input performer (5), UI event conversions (3).
+- Downgraded (verified safe, no change): cross-realm `wrap_node` cache (cache
+  is per-World, no global registry exists), `REALM_WORLDS` raw-pointer keys
+  (insert overwrites stales, drop removes while owned), `frame_global`
+  (same-origin gate present; same-origin direct access is per-spec),
+  `document_url_string` fallback (returns `about:blank`, not the parent URL),
+  `post_window_message` silent drops (host-internal wire, JS wrapper
+  validates), `blur_node` null relatedTarget (correct for blur-to-nothing).
+- Regressions caught by gates during the fix and repaired: realm-teardown
+  GC abort (new `Persistent`s needed `release_host_primitives` in
+  `JsRealm::drop`), frozen `__tb_fetchSeq` breaking `fetch` (freeze is
+  function-valued only), cross-realm DOMParser URL check (instance realm
+  wins, not calling realm).
+- Verification: clippy clean, 34 cargo suites, Playwright 9 passed + 1
+  skipped (new `intl.spec.ts` gate), WPT `domparsing` 21/74 (matches
+  pre-fix baseline), MutationObserver subset matches baseline, CDP `--all`
+  re-run pending.
+- Should-fix backlog (~40) untouched: `importNode`/`getRootNode`/`Attr.value`
+  IDL defaults, keypress/wheel ordering, contentEditable insert, URL brand
+  checks, collection proxy traps, custom-event cross-realm symbols,
+  abort-signal strictness, `window.onerror`, storage `SecurityError`, timer
+  clamping, intl option validation, `js_number` NaN ids, deep-JSON nulling.
+- Note: `tools/intl/test262` runner is stale (binary CLI lost
+  `create`/`eval`/`close --profile`); Intl is verified via `intl.spec.ts`.
