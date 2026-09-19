@@ -1,12 +1,12 @@
 # Handoff (2026-09-19)
 
-State: branch `chase/wpt-grind` (not pushed), tip `17ae39c`, clean. Scores on
+State: branch `chase/wpt-grind` (not pushed), tip `51c2656`, clean. Scores on
 this branch: `webstorage/` 47/54 (87.0%), `url/` 25/49 (51.0%),
 `webmessaging/` 106/124 (85.5%, broadcastchannel excluded),
 `webmessaging/broadcastchannel/` 5/12 (41.7%), `focus/` 3/41 (7.3%),
-`FileAPI/` 32/68 (47.1%). Shipping binary 8,221,624 bytes (cap 10,485,760).
-`tools/ub lint`, `cargo test --workspace` (34 suites), and `tools/ship` are
-green at `17ae39c`.
+`domparsing/` 21/74 (28.4%), `FileAPI/` 32/68 (47.1%). Shipping binary
+8,223,096 bytes (cap 10,485,760). `tools/ub lint`, `cargo test --workspace`
+(34 suites), and `tools/ship` are green at `51c2656`.
 
 Done (this branch):
 
@@ -21,6 +21,11 @@ Done (this branch):
 - `258bda8` full JS `URL` IDL (all getters/setters, parsing `href`, live
   `searchParams`, USVString conversion) and browser-grade component writes
   via `url::quirks` plus tab/newline stripping.
+- `a8096aa` DOMParser documents take the constructing realm's URL, parse
+  with scripting disabled, and throw `TypeError` for a bad enum. The native
+  class gains a JS wrapper (`scripts/parsing/dom_parser_ctor.js`) because
+  QuickJS runs methods in the object's realm, which the native class cannot
+  observe; `Parsed` grew a script-document URL.
 
 url/ remains (24 files), by cluster:
 
@@ -64,8 +69,16 @@ Next:
    dispatcher (1), synchronous child `Window` materialization (2).
 3. `custom-elements/` (~180 files at ~3%) and `cookies/` (~80 files at 24%)
    are the biggest untouched pools.
-4. `domparsing/` probe is running (`/tmp/opencode/domparsing-1.*`), its old
-   21.6% predates the serializer work.
+4. `domparsing/` is scored at 28.4% (21/74). The rest is: the tentative
+   streaming API (`Element.streamHTML`, `streamPositionalHTML`,
+   `document.createParserOptions`; dozens of files, never started), a missing
+   `Range.createContextualFragment` (35 subtests), `insertAdjacentHTML` gaps
+   (`insert-adjacent`, `insert_adjacent_html`), XHTML `innerHTML`,
+   `parsed-document-origin` (needs `Document.parseHTMLUnsafe`,
+   `Document.parseHTML`, and `implementation.createDocument` arity), and
+   `DOMParser-parseFromString-url-moretests` crossing-navigation cases
+   (a realm's world is dropped on navigation; browsers keep the old realm
+   usable).
 
 Gotchas:
 
