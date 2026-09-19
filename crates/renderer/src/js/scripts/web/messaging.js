@@ -444,7 +444,7 @@ const __tbFirePortCloses = ids => {
     const data = __tbBrand(port, __tbPortData);
     data.closed = true;
     __tbPortClose(id);
-    port.__tbDispatchTrusted(new globalThis.Event('close'));
+    port.__tbDispatchTrusted(__tbHostToken, new globalThis.Event('close'));
   }
 };
 // Drops ports a delivery could not decode; the spec loses them with the
@@ -690,14 +690,14 @@ globalThis.__tbDeliverMessage = function(payload, sourceFrame, origin, portIds) 
     return false;
   }
   const portArray = portIds.map(id => materialized.ports[id]);
-  globalThis.__tbDispatchTrusted(new globalThis.MessageEvent('message', {
+  globalThis.__tbDispatchTrusted(__tbHostToken, new globalThis.MessageEvent('message', {
     data: data, origin: origin, source: __tbFrameProxy(sourceFrame), ports: Object.freeze(portArray),
   }));
   __tbFirePortCloses(materialized.closes);
   return true;
 };
 globalThis.__tbDeliverMessageError = function(sourceFrame, origin) {
-  globalThis.__tbDispatchTrusted(new globalThis.MessageEvent('messageerror', {
+  globalThis.__tbDispatchTrusted(__tbHostToken, new globalThis.MessageEvent('messageerror', {
     data: null, origin: origin, source: __tbFrameProxy(sourceFrame),
   }));
 };
@@ -712,7 +712,7 @@ globalThis.__tbDeliverRemoteMessage = function(payload) {
   } catch (error) {
     return;
   }
-  globalThis.__tbDispatchTrusted(new globalThis.MessageEvent('message', {
+  globalThis.__tbDispatchTrusted(__tbHostToken, new globalThis.MessageEvent('message', {
     data: data, origin: '', source: null, ports: Object.freeze([]),
   }));
 };
@@ -782,7 +782,7 @@ globalThis.__tbDeliverBroadcast = function(name, payload, origin, sourceChannel)
         data: null, origin: origin, source: null, ports: Object.freeze([]),
       });
     }
-    channel.__tbDispatchTrusted(event);
+    channel.__tbDispatchTrusted(__tbHostToken, event);
   }
 };
 globalThis.__tbDeliverPortMessage = function(endpoint, payload, portIds) {
@@ -800,7 +800,7 @@ globalThis.__tbDeliverPortMessage = function(endpoint, payload, portIds) {
     return false;
   }
   const portArray = portIds.map(id => materialized.ports[id]);
-  port.__tbDispatchTrusted(new globalThis.MessageEvent('message', {
+  port.__tbDispatchTrusted(__tbHostToken, new globalThis.MessageEvent('message', {
     data: value, ports: Object.freeze(portArray),
   }));
   __tbFirePortCloses(materialized.closes);
@@ -809,14 +809,14 @@ globalThis.__tbDeliverPortMessage = function(endpoint, payload, portIds) {
 globalThis.__tbDeliverPortMessageError = function(endpoint) {
   const port = __tbPortLookup(endpoint);
   if (port === null) return;
-  port.__tbDispatchTrusted(new globalThis.MessageEvent('messageerror'));
+  port.__tbDispatchTrusted(__tbHostToken, new globalThis.MessageEvent('messageerror'));
 };
 globalThis.__tbDeliverPortClose = function(endpoint) {
   const port = __tbPortLookup(endpoint);
   if (port === null) return;
   const data = __tbBrand(port, __tbPortData);
   if (data.closed) return;
-  port.__tbDispatchTrusted(new globalThis.Event('close'));
+  port.__tbDispatchTrusted(__tbHostToken, new globalThis.Event('close'));
 };
 
 // ── the window's own indexed and browsing-context members ──────────────
@@ -1194,7 +1194,7 @@ Object.defineProperty(globalThis, 'top', {
   /// `storageArea`
   /// (<https://html.spec.whatwg.org/multipage/webstorage.html#concept-storage-broadcast>).
   globalThis.__tbFireStorageEvent = function(kind, key, oldValue, newValue, url) {
-    globalThis.__tbDispatchTrusted(new globalThis.StorageEvent('storage', {
+    globalThis.__tbDispatchTrusted(__tbHostToken, new globalThis.StorageEvent('storage', {
       key: decode(key), oldValue: decode(oldValue), newValue: decode(newValue),
       url: url, storageArea: area(kind),
     }));

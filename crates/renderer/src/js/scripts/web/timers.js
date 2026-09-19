@@ -1,3 +1,6 @@
+// Unforgeable host token, captured before install deletes the global. Our
+// shims pass it to the trusted-event bridge; page script cannot name it.
+const __tbHostToken = globalThis.__tbHostToken;
 globalThis.__tb_timeouts = [];
 globalThis.__tb_fetchCbs = Object.create(null);
 globalThis.__tb_fetchSeq = 0;

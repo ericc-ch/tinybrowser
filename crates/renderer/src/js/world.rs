@@ -338,6 +338,22 @@ pub(crate) struct World {
     pub(crate) observers: HashMap<u64, ObserverState>,
     pub(crate) next_observer_id: u64,
     pub(crate) delivery_scheduled: bool,
+    /// Pristine intrinsics captured at install, before page script runs.
+    /// `WebIDL` conversions and scheduling must use these, never
+    /// `ctx.globals()`: a page that replaces `String`/`Number`/`Boolean` (or
+    /// deletes `queueMicrotask`) must not change conversion behavior, which
+    /// follows the realm's original intrinsics.
+    pub(crate) pristine_string: Option<Persistent<Function<'static>>>,
+    pub(crate) pristine_number: Option<Persistent<Function<'static>>>,
+    pub(crate) pristine_boolean: Option<Persistent<Function<'static>>>,
+    pub(crate) pristine_queue_microtask: Option<Persistent<Function<'static>>>,
+    /// The realm's own mutation-delivery entry point, so scheduling never
+    /// depends on a page-deletable global.
+    pub(crate) deliver_mutations_fn: Option<Persistent<Function<'static>>>,
+    /// Unforgeable token for the trusted-event bridge: our shims close over
+    /// a copy, page script cannot name it, and the bridge rejects calls made
+    /// without it.
+    pub(crate) host_token: Option<Persistent<Value<'static>>>,
 }
 
 impl Drop for World {
@@ -403,6 +419,12 @@ impl World {
             observers: HashMap::new(),
             next_observer_id: 0,
             delivery_scheduled: false,
+            pristine_string: None,
+            pristine_number: None,
+            pristine_boolean: None,
+            pristine_queue_microtask: None,
+            deliver_mutations_fn: None,
+            host_token: None,
         }
     }
 
@@ -454,16 +476,21 @@ impl World {
     pub(crate) fn take_ready(&mut self) -> Vec<ReadyObserver> {
         let mut ready = Vec::new();
         for (&id, state) in &mut self.observers {
-            if !state.queue.is_empty()
-                && let Some(object) = &state.object
-            {
-                ready.push(ReadyObserver {
-                    id,
-                    callback: state.callback.clone(),
-                    object: object.clone(),
-                    records: std::mem::take(&mut state.queue),
-                });
+            if state.queue.is_empty() {
+                continue;
             }
+            // Drain regardless: an observer whose wrapper is gone can never
+            // fire, and its queue must not grow forever.
+            let records = std::mem::take(&mut state.queue);
+            let Some(object) = &state.object else {
+                continue;
+            };
+            ready.push(ReadyObserver {
+                id,
+                callback: state.callback.clone(),
+                object: object.clone(),
+                records,
+            });
         }
         ready.sort_by_key(|observer| observer.id);
         ready
@@ -484,6 +511,11 @@ impl World {
         self.frame_navigations.clear();
         self.remote_ids.clear();
         self.remote_nodes.clear();
+        // Navigation replaces the window's event handlers with it: the old
+        // document's `onload` must not fire in the new document
+        // (<https://html.spec.whatwg.org/multipage/webappapis.html#event-handlers>).
+        self.handler_attributes.clear();
+        self.cleared_handlers.clear();
         let pending = self.take_document_stream();
         drop(pending);
         // A new realm owns fresh observers; navigation drops the old ones.
@@ -528,7 +560,7 @@ impl World {
             self.runtime.documents.borrow_mut().remove(id);
             self.runtime.registry.borrow_mut().forget_document(id);
             self.handler_attributes
-                .retain(|(node, _), _| node.is_none_or(|node| node.document_id() != id));
+                .retain(|(node, _), _| node.is_some_and(|node| node.document_id() != id));
             self.cleared_handlers
                 .retain(|(node, _)| node.is_none_or(|node| node.document_id() != id));
         }

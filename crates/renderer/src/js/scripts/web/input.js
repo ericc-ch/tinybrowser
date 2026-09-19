@@ -43,7 +43,11 @@
       let x, y;
       if (center) { x = center.x + (item.x || 0); y = center.y + (item.y || 0); }
       else if (item.origin === 'pointer') { x = state.x + (item.x || 0); y = state.y + (item.y || 0); }
-      else { x = item.x || 0; y = item.y || 0; }
+      else if (item.origin === undefined || item.origin === 'viewport') { x = item.x || 0; y = item.y || 0; }
+      // An element origin that resolves to nothing is gone: the WebDriver
+      // behavior is a stale element error, never a silent viewport move
+      // (<https://w3c.github.io/webdriver/#dfn-pointer-move>).
+      else throw new Error('stale element reference: pointer origin did not resolve');
       const next = at(x, y);
       if (state.target && state.target !== next) {
         fire(state.target, new PointerEvent('pointerout', pointerInit(state, state.x, state.y, state.buttons)));
@@ -68,20 +72,26 @@
       fire(node, new MouseEvent('mousedown', mouseInit(state.x, state.y, state.buttons, { button: button })));
     } else if (item.type === 'pointerUp') {
       const button = item.button || 0;
+      // The released button clears before the events fire: `mouseup` and
+      // `pointerup` report the buttons still held
+      // (<https://w3c.github.io/uievents/#dom-mouseevent-buttons>).
+      state.buttons &= ~(1 << button);
       const node = at(state.x, state.y);
       fire(node, new PointerEvent('pointerup', pointerInit(state, state.x, state.y, state.buttons, { button: button })));
       fire(node, new MouseEvent('mouseup', mouseInit(state.x, state.y, state.buttons, { button: button })));
       if (button === 0) fire(node, new MouseEvent('click', mouseInit(state.x, state.y, 0, { button: 0 })));
-      state.buttons &= ~(1 << button);
     } else if (item.type === 'pointerCancel') {
       fire(at(state.x, state.y), new PointerEvent('pointercancel', pointerInit(state, state.x, state.y, state.buttons)));
       state.buttons = 0;
-    }
+    } else throw new TypeError('unknown pointer action type: ' + item.type);
   };
   const specialKeys = {
-    '\uE003': ['Backspace', 'Backspace'], '\uE004': ['Tab', 'Tab'],
+    // No key state is tracked, so NULL has no keys to release; it fires like
+    // any other non-printable key instead of leaking the PUA codepoint.
+    '\uE000': ['Unidentified', ''], '\uE003': ['Backspace', 'Backspace'], '\uE004': ['Tab', 'Tab'],
     '\uE006': ['Enter', 'Enter'], '\uE007': ['Enter', 'Enter'],
-    '\uE008': ['Shift', 'ShiftLeft'], '\uE00C': ['Escape', 'Escape'],
+    '\uE008': ['Shift', 'ShiftLeft'], '\uE009': ['Control', 'ControlLeft'],
+    '\uE00A': ['Alt', 'AltLeft'], '\uE00C': ['Escape', 'Escape'],
     '\uE00D': [' ', 'Space'], '\uE00E': ['PageUp', 'PageUp'], '\uE00F': ['PageDown', 'PageDown'],
     '\uE010': ['End', 'End'], '\uE011': ['Home', 'Home'],
     '\uE012': ['ArrowLeft', 'ArrowLeft'], '\uE013': ['ArrowUp', 'ArrowUp'],
@@ -104,11 +114,15 @@
     if (!element) return;
     const tag = element.tagName;
     if (tag === 'INPUT' || tag === 'TEXTAREA') {
+      // `beforeinput` is cancelable and runs first: a canceled edit writes
+      // nothing and fires no `input`
+      // (<https://w3c.github.io/uievents/#events-inputevents>).
+      const before = new InputEvent('beforeinput', { bubbles: true, cancelable: true, inputType: 'insertText', data: text });
+      if (!element.dispatchEvent(before)) return;
       const start = element.selectionStart === undefined || element.selectionStart === null ? element.value.length : element.selectionStart;
       const end = element.selectionEnd === undefined || element.selectionEnd === null ? start : element.selectionEnd;
       if (typeof element.setRangeText === 'function') element.setRangeText(text, start, end, 'end');
       else element.value = element.value.slice(0, start) + text + element.value.slice(end);
-      fire(element, new InputEvent('beforeinput', { bubbles: true, cancelable: true, inputType: 'insertText', data: text }));
       fire(element, new InputEvent('input', { bubbles: true, inputType: 'insertText', data: text }));
     } else if (element.isContentEditable) {
       element.textContent = (element.textContent || '') + text;
@@ -150,9 +164,14 @@
           const parameters = source.parameters || {};
           pointerItem(pointerState(source.id, parameters.pointerType), item);
         } else if (source.type === 'key') {
-          if (item.type === 'insertText') insertText(String(item.value === undefined ? '' : item.value));
-          else keyItem(item, item.type === 'keyDown');
-        } else if (source.type === 'wheel') wheelItem(item);
+          if (item.type === 'keyDown') keyItem(item, true);
+          else if (item.type === 'keyUp') keyItem(item, false);
+          else if (item.type === 'insertText') insertText(String(item.value === undefined ? '' : item.value));
+          else throw new TypeError('unknown key action type: ' + item.type);
+        } else if (source.type === 'wheel') {
+          if (item.type !== 'scroll') throw new TypeError('unknown wheel action type: ' + item.type);
+          wheelItem(item);
+        } else throw new TypeError('unknown action source type: ' + source.type);
       }
     }
     return true;

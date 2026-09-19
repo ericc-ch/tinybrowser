@@ -2,8 +2,9 @@
 
 use super::{
     FromJs, JsAttr, LegacyNullString, NodeContext, OptString, OptionalTitle, WebIdlString,
+    clone::{import_snapshot, materialize_import},
     create_kind, host_node_id, throw_dom, throw_dom_error, validate_and_extract, world,
-    wrap_new_document,
+    world_for_node, wrap_new_document,
 };
 use rquickjs::function::{Opt, Rest};
 
@@ -77,6 +78,18 @@ impl JsImplementation {
             "http://www.w3.org/2000/svg" => "image/svg+xml",
             _ => "application/xml",
         };
+        // `qualifiedName` validates before the doctype steps run
+        // (<https://dom.spec.whatwg.org/#dom-domimplementation-createdocument>).
+        let root = if qualified.0.is_empty() {
+            None
+        } else {
+            Some(validate_and_extract(
+                &ctx,
+                (!namespace.is_empty()).then_some(namespace.as_str()),
+                &qualified.0,
+                NodeContext::Element,
+            )?)
+        };
         let mut parsed = crate::Parsed::empty(content_type);
         let document = parsed.dom.document();
         if !doctype.is_null()
@@ -88,22 +101,29 @@ impl JsImplementation {
                 "doctype argument is not a DocumentType",
             ));
         }
+        // The argument node itself appends (adopted across arenas), keeping
+        // wrapper identity with the passed doctype.
         if let Some(doctype) = host_node_id(&ctx, &doctype)
-            && let Some((name, public_id, system_id)) = doctype_fields_for(&ctx, doctype)
+            && doctype_fields_for(&ctx, doctype).is_some()
         {
-            let node = parsed.dom.create_doctype(name, public_id, system_id);
-            parsed
-                .dom
-                .append(document, node)
-                .map_err(|err| throw_dom_error(&ctx, err))?;
+            let owner_rc = world_for_node(&ctx, doctype)?;
+            let snapshot = {
+                let owner = owner_rc.borrow();
+                let Some(source) = owner.document(doctype) else {
+                    return Err(Exception::throw_type(&ctx, "no document"));
+                };
+                import_snapshot(&source.dom, doctype, true)
+            };
+            if let Some(snapshot) = snapshot {
+                let node = materialize_import(&mut parsed.dom, &snapshot)
+                    .map_err(|err| throw_dom_error(&ctx, err))?;
+                parsed
+                    .dom
+                    .append(document, node)
+                    .map_err(|err| throw_dom_error(&ctx, err))?;
+            }
         }
-        if !qualified.0.is_empty() {
-            let name = validate_and_extract(
-                &ctx,
-                (!namespace.is_empty()).then_some(namespace.as_str()),
-                &qualified.0,
-                NodeContext::Element,
-            )?;
+        if let Some(name) = root {
             let element = parsed.dom.create_element(name, Vec::new());
             parsed
                 .dom
@@ -250,11 +270,19 @@ impl JsDomParser {
         } else {
             crate::xml::parse_document(&source.0, content_type)
         };
-        // The JS wrapper passes the constructing realm's URL; the fallback
-        // covers direct calls on the native object.
+        // The JS wrapper passes the constructing realm's URL. A direct call
+        // on the reachable native (`parser.__tbParser`) must not forge
+        // another document's URL: only the calling realm's own URL parses.
+        let realm_url = world(&ctx)?.borrow().document_url.as_str().to_owned();
         let url = match url.0 {
-            Some(url) => url.0,
-            None => world(&ctx)?.borrow().document_url.as_str().to_owned(),
+            Some(url) if url.0 == realm_url => url.0,
+            Some(_) => {
+                return Err(Exception::throw_type(
+                    &ctx,
+                    "parseFromString URL must be the realm's document URL",
+                ));
+            }
+            None => realm_url,
         };
         parsed.url = Some(url);
         wrap_new_document(&ctx, parsed)

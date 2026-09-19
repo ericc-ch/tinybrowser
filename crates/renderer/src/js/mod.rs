@@ -146,6 +146,9 @@ pub(crate) struct JsRealm {
     stop: Arc<Stop>,
     pending_timeouts: Rc<RefCell<Vec<PendingTimeout>>>,
     pending_fetches: Rc<RefCell<Vec<PendingJsFetch>>>,
+    /// Nesting depth of [`JsRealm::with_budget`]; reentrant evaluations run
+    /// under the outer frame instead of installing their own budget.
+    budget_depth: Cell<usize>,
 }
 
 impl JsRealm {
@@ -165,6 +168,7 @@ impl JsRealm {
             stop,
             pending_timeouts: Rc::new(RefCell::new(Vec::new())),
             pending_fetches: Rc::new(RefCell::new(Vec::new())),
+            budget_depth: Cell::new(0),
         };
         host.install()?;
         Ok(host)
@@ -209,9 +213,14 @@ impl JsRealm {
             self.context.with(|ctx| {
                 let timeouts: Array = ctx.globals().get("__tb_timeouts")?;
                 let idx = usize::try_from(js_id).map_err(|_| JsError::BadTimerId)?;
-                let func: Function = timeouts.get(idx)?;
+                // A cancelled timer already left the queue: firing is a
+                // no-op, not a `TypeError`
+                // (<https://html.spec.whatwg.org/multipage/timers-and-user-prompts.html#timers>).
+                let func: Option<Function> = timeouts.get(idx)?;
                 timeouts.as_object().remove(js_id)?;
-                func.call::<_, ()>(())?;
+                if let Some(func) = func {
+                    func.call::<_, ()>(())?;
+                }
                 Ok(())
             })
         })
@@ -449,7 +458,26 @@ impl JsRealm {
     /// The job drain always runs so a scheduled microtask cannot outlive the
     /// operation that scheduled it; the operation's error wins over a job
     /// error, and an interrupt wins over both.
+    ///
+    /// Reentrant calls (script evaluated while an outer script runs) execute
+    /// under the outer frame: the outer handler, deadline, and job drain own
+    /// the nesting, so an inner frame cannot overwrite and clear the outer
+    /// budget.
     fn with_budget<T>(
+        &self,
+        deadline: Option<Instant>,
+        operation: impl FnOnce() -> Result<T, JsError>,
+    ) -> Result<T, JsError> {
+        if self.budget_depth.get() > 0 {
+            return operation();
+        }
+        self.budget_depth.set(1);
+        let outcome = self.with_budget_outer(deadline, operation);
+        self.budget_depth.set(0);
+        outcome
+    }
+
+    fn with_budget_outer<T>(
         &self,
         deadline: Option<Instant>,
         operation: impl FnOnce() -> Result<T, JsError>,
@@ -498,6 +526,17 @@ impl JsRealm {
             url_parts::install(&ctx)?;
             bindings::install_messaging(&ctx)?;
             ctx.eval::<(), _>(INSTALL_WEB_APIS_JS)?;
+            // The shims captured the host token; page script must never see
+            // it. Host plumbing is then frozen: `__tb*` bindings become
+            // non-writable and non-configurable, so a page cannot clobber the
+            // functions Rust looks up by name (already-frozen ones allow the
+            // redundant define as a no-op).
+            ctx.eval::<(), _>(
+                "delete globalThis.__tbHostToken;\
+                 for (const k of Object.getOwnPropertyNames(globalThis)) {\
+                   if (k.startsWith('__tb')) Object.defineProperty(globalThis, k, {writable:false, configurable:false});\
+                 }",
+            )?;
             Ok(())
         })
     }

@@ -498,6 +498,15 @@ impl JsNode {
                 "target does not match the XML Name production",
             ));
         }
+        // `xml`, ASCII case-insensitive, is reserved
+        // (<https://dom.spec.whatwg.org/#dom-document-createprocessinginstruction>).
+        if target.0.eq_ignore_ascii_case("xml") {
+            return Err(throw_dom(
+                &ctx,
+                "InvalidCharacterError",
+                "target must not be xml",
+            ));
+        }
         if data.0.contains("?>") {
             return Err(throw_dom(&ctx, "InvalidCharacterError", "data contains ?>"));
         }
@@ -509,6 +518,15 @@ impl JsNode {
     // https://dom.spec.whatwg.org/#dom-document-createcdatasection
     #[qjs(rename = "createCDATASection")]
     fn create_cdata_section<'js>(&self, ctx: Ctx<'js>, data: WebIdlString) -> Result<Value<'js>> {
+        // CDATA sections cannot exist in HTML documents
+        // (<https://dom.spec.whatwg.org/#dom-document-createcdatasection>).
+        if document_is_html(&ctx, self.handle.0) {
+            return Err(throw_dom(
+                &ctx,
+                "NotSupportedError",
+                "CDATA sections are not supported in HTML documents",
+            ));
+        }
         if data.0.contains("]]>") {
             return Err(throw_dom(
                 &ctx,
@@ -626,20 +644,23 @@ impl JsNode {
 
     // https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#document-write-steps
     #[qjs(rename = "write")]
-    fn write(&self, ctx: Ctx<'_>, html: WebIdlString) -> Result<()> {
+    fn write(&self, ctx: Ctx<'_>, text: Rest<WebIdlString>) -> Result<()> {
+        // Every argument stringifies and concatenates in order
+        // (<https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-document-write>).
+        let html: String = text.0.iter().map(|part| part.0.as_str()).collect();
         let world = world_for_node(&ctx, self.handle.0)?;
         let mut world = world.borrow_mut();
         if world.parser_active {
-            if !world.reserve_stream_bytes(html.0.len()) {
+            if !world.reserve_stream_bytes(html.len()) {
                 return Err(Exception::throw_range(
                     &ctx,
                     "document stream budget exceeded",
                 ));
             }
-            world.pending_html_writes.push(html.0);
+            world.pending_html_writes.push(html);
         } else {
             world
-                .queue_document_stream(DocumentStreamCommand::Write(html.0))
+                .queue_document_stream(DocumentStreamCommand::Write(html))
                 .map_err(|()| Exception::throw_range(&ctx, "document stream budget exceeded"))?;
         }
         Ok(())
@@ -826,11 +847,14 @@ impl JsNode {
         if !valid_attribute_local_name(&name.0) {
             return Ok(Value::new_null(ctx));
         }
+        // HTML elements match ASCII-lowercased
+        // (<https://dom.spec.whatwg.org/#concept-element-attributes-get-by-name>).
+        let local = attribute_local_name(&ctx, self.handle.0, &name.0);
         let world = world(&ctx)?;
         let found = world
             .borrow()
             .document(self.handle.0)
-            .and_then(|parsed| parsed.dom.attribute(self.handle.0, &name.0));
+            .and_then(|parsed| parsed.dom.attribute(self.handle.0, &local));
         match found {
             Some(value) => string_value(&ctx, &value),
             None => Ok(Value::new_null(ctx)),
@@ -1153,13 +1177,9 @@ impl JsNode {
 
     #[qjs(set, rename = "href")]
     fn set_href(&self, ctx: Ctx<'_>, value: WebIdlString) -> Result<()> {
-        let base = document_base_url_string(&ctx, self.handle.0);
-        let resolved = url::Url::parse(&base)
-            .ok()
-            .and_then(|base| base.join(&value.0).ok())
-            .or_else(|| url::Url::parse(&value.0).ok())
-            .map_or_else(|| value.0.clone(), |url| url.to_string());
-        self.set_attribute(ctx, WebIdlString("href".into()), WebIdlString(resolved))
+        // URL reflection stores the given value; resolution happens on get
+        // (<https://html.spec.whatwg.org/multipage/urls-and-fetching.html#reflecting-content-attributes-in-idl-attributes>).
+        self.set_attribute(ctx, WebIdlString("href".into()), value)
     }
 
     #[qjs(get, rename = "style")]
@@ -1495,13 +1515,18 @@ impl JsNode {
         let world = world(&ctx)?;
         let ids = {
             let parsed = world.borrow();
-            let Some(parsed) = parsed.document(self.handle.0) else {
-                return Ok(Value::new_null(ctx));
-            };
+            // A missing document answers with an empty list, not null
+            // (<https://dom.spec.whatwg.org/#dom-parentnode-queryselectorall>).
             parsed
-                .dom
-                .select_all(self.handle.0, &selectors.0)
-                .map_err(|err| select_error(&ctx, &err))?
+                .document(self.handle.0)
+                .map(|parsed| {
+                    parsed
+                        .dom
+                        .select_all(self.handle.0, &selectors.0)
+                        .map_err(|err| select_error(&ctx, &err))
+                })
+                .transpose()?
+                .unwrap_or_default()
         };
         let handles = ids.into_iter().map(Handle).collect();
         live_collection(&ctx, self.handle.0, CollectionKind::Static(handles), None)
@@ -1882,12 +1907,14 @@ impl JsNode {
         if !valid_attribute_local_name(&name.0) {
             return Ok(false);
         }
+        // HTML elements match ASCII-lowercased, like `getAttribute`.
+        let local = attribute_local_name(&ctx, self.handle.0, &name.0);
         let world = world(&ctx)?;
         let parsed = world.borrow();
         let Some(parsed) = parsed.document(self.handle.0) else {
             return Ok(false);
         };
-        Ok(parsed.dom.has_attribute(self.handle.0, &name.0))
+        Ok(parsed.dom.has_attribute(self.handle.0, &local))
     }
 
     // https://dom.spec.whatwg.org/#dom-element-getattributens

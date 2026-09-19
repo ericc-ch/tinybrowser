@@ -134,16 +134,30 @@ impl JsMutationObserver {
         options: Object<'js>,
     ) -> Result<()> {
         let target = required_node(&ctx, &target)?;
-        let attributes_present = options.contains_key("attributes")?;
-        let attributes = option_truthy(&options, "attributes")?;
-        let attribute_old_value_present = options.contains_key("attributeOldValue")?;
-        let attribute_old_value = option_truthy(&options, "attributeOldValue")?;
-        let character_data_present = options.contains_key("characterData")?;
-        let character_data = option_truthy(&options, "characterData")?;
-        let character_data_old_value_present = options.contains_key("characterDataOldValue")?;
-        let character_data_old_value = option_truthy(&options, "characterDataOldValue")?;
+        // Dictionary presence ignores explicit `undefined`: `{attributes:
+        // undefined}` behaves as absent
+        // (<https://webidl.spec.whatwg.org/#es-dictionary>).
+        let attributes_present = !options.get::<_, Value>("attributes")?.is_undefined();
+        let attributes = option_truthy(&ctx, &options, "attributes")?;
+        let attribute_old_value_present =
+            !options.get::<_, Value>("attributeOldValue")?.is_undefined();
+        let attribute_old_value = option_truthy(&ctx, &options, "attributeOldValue")?;
+        let character_data_present = !options.get::<_, Value>("characterData")?.is_undefined();
+        let character_data = option_truthy(&ctx, &options, "characterData")?;
+        let character_data_old_value_present =
+            !options.get::<_, Value>("characterDataOldValue")?.is_undefined();
+        let character_data_old_value = option_truthy(&ctx, &options, "characterDataOldValue")?;
         let attribute_filter = match options.get::<_, Value>("attributeFilter") {
-            Ok(value) if !value.is_undefined() && !value.is_null() => {
+            // `sequence<DOMString>` is not nullable: explicit `null` throws
+            // instead of vanishing
+            // (<https://dom.spec.whatwg.org/#dom-mutationobserver-observe>).
+            Ok(value) if value.is_null() => {
+                return Err(Exception::throw_type(
+                    &ctx,
+                    "attributeFilter must be a sequence",
+                ));
+            }
+            Ok(value) if !value.is_undefined() => {
                 let array = value.into_array().ok_or_else(|| {
                     Exception::throw_type(&ctx, "attributeFilter must be a sequence")
                 })?;
@@ -173,13 +187,13 @@ impl JsMutationObserver {
             ));
         }
         let parsed = ObserverOptions {
-            child_list: option_truthy(&options, "childList")?,
+            child_list: option_truthy(&ctx, &options, "childList")?,
             attributes: attributes
                 || (!attributes_present
                     && (attribute_old_value_present || attribute_filter.is_some())),
             character_data: character_data
                 || (!character_data_present && character_data_old_value_present),
-            subtree: option_truthy(&options, "subtree")?,
+            subtree: option_truthy(&ctx, &options, "subtree")?,
             attribute_old_value,
             character_data_old_value,
             attribute_filter,
@@ -289,19 +303,30 @@ fn deliver_ready(ctx: &Ctx<'_>) -> Result<()> {
             break;
         }
         for observer in ready {
-            let array = rquickjs::Array::new(ctx.clone())?;
-            for (index, record) in observer.records.into_iter().enumerate() {
-                array.set(
-                    index,
-                    Class::instance(ctx.clone(), JsMutationRecord { record })?.into_value(),
-                )?;
-            }
-            let object = observer.object.restore(ctx)?;
-            let callback = observer.callback.restore(ctx)?;
-            // The callback's `this` value and second argument are the
-            // observer object. A throwing callback is reported and does not
-            // stop the remaining observers.
-            if let Err(error) = callback.call::<_, ()>((This(object.clone()), array, object))
+            // One observer's broken wrapper must not discard the records
+            // already dequeued for the rest: setup failures skip that
+            // observer and are reported at the end with callback errors.
+            let step: Result<()> = (|| {
+                let array = rquickjs::Array::new(ctx.clone())?;
+                for (index, record) in observer.records.into_iter().enumerate() {
+                    array.set(
+                        index,
+                        Class::instance(ctx.clone(), JsMutationRecord { record })?.into_value(),
+                    )?;
+                }
+                let object = observer.object.restore(ctx)?;
+                let callback = observer.callback.restore(ctx)?;
+                // The callback's `this` value and second argument are the
+                // observer object. A throwing callback is reported and does not
+                // stop the remaining observers.
+                if let Err(error) = callback.call::<_, ()>((This(object.clone()), array, object))
+                    && first_error.is_none()
+                {
+                    first_error = Some(error);
+                }
+                Ok(())
+            })();
+            if let Err(error) = step
                 && first_error.is_none()
             {
                 first_error = Some(error);
@@ -329,8 +354,20 @@ pub(crate) fn schedule_mutation_delivery(ctx: &Ctx<'_>) -> Result<()> {
         return Ok(());
     }
     world.delivery_scheduled = true;
+    // The pristine entry points, captured at install: a page that deleted
+    // `__tb_deliver_mutations` or `queueMicrotask` must not turn every DOM
+    // mutation into an exception.
+    let deliver = world.deliver_mutations_fn.clone();
+    let queue = world.pristine_queue_microtask.clone();
     drop(world);
+    if let (Some(deliver), Some(queue)) = (deliver, queue) {
+        let deliver: Function = deliver.restore(ctx)?;
+        let queue: Function = queue.restore(ctx)?;
+        queue.call::<_, ()>((deliver,))?;
+        return Ok(());
+    }
     let deliver: Function = ctx.globals().get("__tb_deliver_mutations")?;
     let queue: Function = ctx.globals().get("queueMicrotask")?;
-    queue.call::<_, ()>((deliver,))
+    queue.call::<_, ()>((deliver,))?;
+    Ok(())
 }

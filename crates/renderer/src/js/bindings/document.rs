@@ -53,9 +53,15 @@ pub(crate) fn document_base_url_string(ctx: &Ctx<'_>, id: NodeId) -> String {
     };
     let Some(base) = parsed
         .dom
-        .select_first(parsed.dom.document(), "base")
+        .select_all(parsed.dom.document(), "base")
         .ok()
-        .flatten()
+        // Frozen base URL: the first `base` element *with* an `href`
+        // (<https://html.spec.whatwg.org/multipage/urls-and-fetching.html#document-base-url>).
+        .and_then(|candidates| {
+            candidates
+                .into_iter()
+                .find(|candidate| parsed.dom.attribute(*candidate, "href").is_some())
+        })
     else {
         return fallback;
     };

@@ -54,7 +54,7 @@ use dom::{
 };
 
 use rquickjs::{
-    Class, Ctx, Exception, FromJs, Function, Object, Persistent, Result, Value, class::Trace,
+    Class, Ctx, Exception, FromJs, Function, Object, Persistent, Result, Symbol, Value, class::Trace,
     prelude::This,
 };
 
@@ -164,6 +164,17 @@ impl<'js> rquickjs::FromJs<'js> for OptionalTitle {
 
 impl<'js> rquickjs::FromJs<'js> for WebIdlUnsignedLong {
     fn from_js(ctx: &Ctx<'js>, value: Value<'js>) -> Result<Self> {
+        // The pristine `Number`, captured at install: a page-assigned global
+        // must not hijack `unsigned long` conversion.
+        let pristine = (|| {
+            let world_rc = world(ctx).ok()?;
+            let to_number: Function = world_rc.borrow().pristine_number.clone()?.restore(ctx).ok()?;
+            to_number.call::<_, f64>((value.clone(),)).ok()
+        })();
+        if let Some(number) = pristine {
+            return Ok(Self(webidl_unsigned_long(number)));
+        }
+        // Install predates the capture: fall back to the (clobberable) global.
         let to_number: Function = ctx.globals().get("Number")?;
         let number: f64 = to_number.call((value,))?;
         Ok(Self(webidl_unsigned_long(number)))
@@ -272,11 +283,43 @@ pub(crate) fn install(ctx: &Ctx<'_>, world: &Rc<RefCell<World>>) -> Result<()> {
         "dispatchEvent",
         rquickjs::prelude::Func::from(window_dispatch_event),
     )?;
-    // User-agent delivery for shim-fired events (window.postMessage).
+    // User-agent delivery for shim-fired events (window.postMessage). Page
+    // script must pass the host token our shims close over; without it the
+    // bridge throws instead of forging a trusted event.
     globals.set(
         "__tbDispatchTrusted",
         rquickjs::prelude::Func::from(window_dispatch_trusted_event),
     )?;
+    // Capture pristine intrinsics and the host token before any page script
+    // runs. Conversions and scheduling use these, never `ctx.globals()`,
+    // which page script can clobber.
+    capture_host_primitives(ctx, &globals, world)?;
+    Ok(())
+}
+
+/// Captures the pristine intrinsics and host entry points every later lookup
+/// must use instead of `ctx.globals()`.
+fn capture_host_primitives<'js>(
+    ctx: &Ctx<'js>,
+    globals: &Object<'js>,
+    world: &Rc<RefCell<World>>,
+) -> Result<()> {
+    let string: Function = globals.get("String")?;
+    let number: Function = globals.get("Number")?;
+    let boolean: Function = globals.get("Boolean")?;
+    let deliver: Function = globals.get("__tb_deliver_mutations")?;
+    let token = Symbol::new(ctx.clone())?.into_value();
+    globals.set("__tbHostToken", token.clone())?;
+    let mut world = world.borrow_mut();
+    world.pristine_string = Some(Persistent::save(ctx, string));
+    world.pristine_number = Some(Persistent::save(ctx, number));
+    world.pristine_boolean = Some(Persistent::save(ctx, boolean));
+    world.pristine_queue_microtask = globals
+        .get::<_, Function>("queueMicrotask")
+        .ok()
+        .map(|queue| Persistent::save(ctx, queue));
+    world.deliver_mutations_fn = Some(Persistent::save(ctx, deliver));
+    world.host_token = Some(Persistent::save(ctx, token));
     Ok(())
 }
 
@@ -284,6 +327,26 @@ pub(crate) fn host_node_id<'js>(ctx: &Ctx<'js>, value: &Value<'js>) -> Option<No
     Class::<JsNode>::from_js(ctx, value.clone())
         .ok()
         .map(|node| node.borrow().node_id())
+}
+
+/// Rejects trusted-bridge calls that do not carry the host token our shims
+/// close over. Page script cannot name the token (install deletes the global
+/// after the shims capture it), so only our shims can ask for trusted
+/// dispatch; Rust never goes through the global.
+pub(crate) fn check_host_token<'js>(ctx: &Ctx<'js>, token: &Value<'js>) -> Result<()> {
+    let world_rc = world(ctx)?;
+    let owned = world_rc.borrow().host_token.clone();
+    match owned {
+        Some(expected) => {
+            let expected: Value = expected.restore(ctx)?;
+            if token == &expected {
+                return Ok(());
+            }
+            Err(Exception::throw_type(ctx, "illegal invocation"))
+        }
+        // Install predates the token: accept (yesterday's behavior).
+        None => Ok(()),
+    }
 }
 
 /// The `WebDriver` "element send keys" step: focus the element and append

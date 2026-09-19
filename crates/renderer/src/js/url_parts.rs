@@ -151,10 +151,14 @@ fn resolve(spec: &str, base: &str) -> Option<url::Url> {
         .or_else(|| url::Url::parse(spec).ok())
 }
 
-/// `host` serialization: host plus a non-default port
-/// (<https://url.spec.whatwg.org/#concept-url-host>).
+/// `host` serialization: host plus a non-default port, with IPv6 literals in
+/// brackets (<https://url.spec.whatwg.org/#concept-url-host>).
 fn host(url: &url::Url) -> String {
-    let mut host = url.host_str().unwrap_or_default().to_owned();
+    // `host_str` strips the brackets; serialization puts them back.
+    let mut host = match url.host() {
+        Some(url::Host::Ipv6(address)) => format!("[{address}]"),
+        _ => url.host_str().unwrap_or_default().to_owned(),
+    };
     if let Some(port) = url.port() {
         host.push(':');
         host.push_str(&port.to_string());

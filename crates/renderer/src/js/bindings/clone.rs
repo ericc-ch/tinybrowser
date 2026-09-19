@@ -6,9 +6,14 @@ use dom::{NodeId, NodeKind, QualName};
 
 use rquickjs::{Ctx, Exception, Result, Value};
 
-/// Same-document insert returns `node`. Cross-document insert is refused:
-/// [adopt](https://dom.spec.whatwg.org/#concept-node-adopt) keeps the same
-/// node, and `NodeId` is document-scoped until the handle can retarget.
+/// Same-document insert returns `node`. A node from another document adopts
+/// into the parent's document: the subtree snapshots, the original detaches,
+/// and an equivalent subtree materializes in the target
+/// ([adopt](https://dom.spec.whatwg.org/#concept-node-adopt)).
+///
+/// The known deviation is wrapper identity: `NodeId` is arena-scoped, so
+/// pre-existing wrappers still point at the detached original instead of
+/// following the adoption the way a single-arena engine would.
 pub(crate) fn adopt_across_documents(
     ctx: &Ctx<'_>,
     parent: NodeId,
@@ -18,11 +23,39 @@ pub(crate) fn adopt_across_documents(
         return Ok(node);
     }
     // https://dom.spec.whatwg.org/#concept-node-adopt
-    Err(throw_dom(
-        ctx,
-        "HierarchyRequestError",
-        "nodes belong to different documents",
-    ))
+    let world_rc = world(ctx)?;
+    let snapshot = {
+        let owner = world_rc
+            .borrow()
+            .owner_world(node)
+            .ok_or_else(|| Exception::throw_type(ctx, "no document"))?;
+        let owner = owner.borrow();
+        let Some(parsed) = owner.document(node) else {
+            return Err(Exception::throw_type(ctx, "no document"));
+        };
+        import_snapshot(&parsed.dom, node, true).ok_or_else(|| {
+            throw_dom(ctx, "HierarchyRequestError", "node cannot be adopted")
+        })?
+    };
+    {
+        let owner = world_rc
+            .borrow()
+            .owner_world(node)
+            .ok_or_else(|| Exception::throw_type(ctx, "no document"))?;
+        let owner = owner.borrow_mut();
+        let Some(mut parsed) = owner.document_mut(node) else {
+            return Err(Exception::throw_type(ctx, "no document"));
+        };
+        parsed
+            .dom
+            .detach(node)
+            .map_err(|err| throw_dom_error(ctx, err))?;
+    }
+    let world = world_rc.borrow_mut();
+    let Some(mut parsed) = world.document_mut(parent) else {
+        return Err(Exception::throw_type(ctx, "no document"));
+    };
+    materialize_import(&mut parsed.dom, &snapshot).map_err(|err| throw_dom_error(ctx, err))
 }
 
 /// [Clones](https://dom.spec.whatwg.org/#concept-node-clone) a document into a

@@ -31,10 +31,15 @@ globalThis.MouseEvent = class MouseEvent extends UIEvent {
     init = init || {};
     super(type, init);
     const button = init.button === undefined ? 0 : init.button;
+    // `long` members convert with `ToNumber`, not truthiness: `"5"` is 5
+    // (<https://w3c.github.io/uievents/#dom-mouseevent-clientx>).
+    const toLong = value => { const n = Number(value); return Number.isNaN(n) ? 0 : Math.trunc(n); };
     Object.defineProperty(this, __tbMouseEventData, {
       value: {
-        screenX: init.screenX || 0, screenY: init.screenY || 0,
-        clientX: init.clientX || 0, clientY: init.clientY || 0,
+        screenX: init.screenX === undefined ? 0 : toLong(init.screenX),
+        screenY: init.screenY === undefined ? 0 : toLong(init.screenY),
+        clientX: init.clientX === undefined ? 0 : toLong(init.clientX),
+        clientY: init.clientY === undefined ? 0 : toLong(init.clientY),
         ctrlKey: !!init.ctrlKey, shiftKey: !!init.shiftKey,
         altKey: !!init.altKey, metaKey: !!init.metaKey,
         button: button, buttons: init.buttons === undefined ? 0 : init.buttons,
@@ -71,7 +76,10 @@ globalThis.PointerEvent = class PointerEvent extends MouseEvent {
     Object.defineProperty(this, __tbPointerEventData, {
       value: {
         pointerId: init.pointerId === undefined ? 1 : init.pointerId,
-        width: init.width || 1, height: init.height || 1,
+        // An explicit 0 is a valid width, not a missing one
+        // (<https://w3c.github.io/pointerevents/#dom-pointerevent-width>).
+        width: init.width === undefined ? 1 : Number(init.width),
+        height: init.height === undefined ? 1 : Number(init.height),
         pressure: init.pressure === undefined ? 0 : init.pressure,
         tangentialPressure: init.tangentialPressure || 0,
         tiltX: init.tiltX || 0, tiltY: init.tiltY || 0, twist: init.twist || 0,
@@ -134,7 +142,7 @@ globalThis.KeyboardEvent = class KeyboardEvent extends UIEvent {
         ctrlKey: !!init.ctrlKey, shiftKey: !!init.shiftKey,
         altKey: !!init.altKey, metaKey: !!init.metaKey,
         repeat: !!init.repeat, isComposing: !!init.isComposing,
-        keyCode: init.keyCode === undefined ? key.charCodeAt(0) : init.keyCode,
+        keyCode: init.keyCode === undefined ? (key ? key.charCodeAt(0) : 0) : init.keyCode,
         charCode: init.charCode || 0,
       },
       writable: false, enumerable: false, configurable: false,
