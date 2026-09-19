@@ -177,6 +177,12 @@ fn rendered_input_text(dom: &Dom, id: NodeId) -> Option<String> {
                 .filter(|value| !value.is_empty())
                 .unwrap_or_else(|| "Reset".into()),
         ),
+        // https://html.spec.whatwg.org/multipage/rendering.html#the-input-element-as-a-text-entry-widget
+        "password" => Some(
+            dom.input_value(id)
+                .map(|value| "\u{2022}".repeat(value.chars().count()))
+                .unwrap_or_default(),
+        ),
         _ => dom.input_value(id),
     }
 }

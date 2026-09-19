@@ -20,19 +20,24 @@
 
     nextNode() {
       let node = this.currentNode;
+      let skipChildren = false;
       while (node) {
-        if (node.firstChild) {
+        if (!skipChildren && node.firstChild) {
           node = node.firstChild;
         } else {
+          skipChildren = false;
           while (node && node !== this.root && !node.nextSibling) node = node.parentNode;
           if (!node || node === this.root) return null;
           node = node.nextSibling;
         }
         const shown = (this.whatToShow & (1 << (node.nodeType - 1))) !== 0;
-        if (shown && filterResult(this.filter, node) === FILTER_ACCEPT) {
+        if (!shown) continue;
+        const result = filterResult(this.filter, node);
+        if (result === FILTER_ACCEPT) {
           this.currentNode = node;
           return node;
         }
+        if (result === FILTER_REJECT) skipChildren = true;
       }
       return null;
     }

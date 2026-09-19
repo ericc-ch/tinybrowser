@@ -790,7 +790,14 @@ impl World {
                 if parsed.dom.is_iframe_element(id) && parsed.dom.is_connected(id) {
                     containers.push(id);
                 }
-                let mut children = parsed.dom.rendered_children(id);
+                let mut children: Vec<NodeId> = parsed
+                    .dom
+                    .children(id)
+                    .map(|kids| kids.copied().collect())
+                    .unwrap_or_default();
+                if let Some(root) = parsed.dom.shadow_root(id) {
+                    children.push(root);
+                }
                 children.reverse();
                 stack.extend(children);
             }

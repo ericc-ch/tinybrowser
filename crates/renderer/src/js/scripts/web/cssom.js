@@ -20,9 +20,37 @@
   });
   Object.defineProperty(globalThis, 'CSS', {
     value: Object.freeze({
+      // https://drafts.csswg.org/cssom/#dom-css-escape
       escape(value) {
-        return String(value).replace(/[^a-zA-Z0-9_-]/g, character =>
-          `\\${character.codePointAt(0).toString(16)} `);
+        if (arguments.length < 1) throw new TypeError('CSS.escape requires 1 argument');
+        const string = String(value);
+        let result = '';
+        for (let index = 0; index < string.length; index++) {
+          const code = string.charCodeAt(index);
+          if (code === 0) {
+            result += '\uFFFD';
+            continue;
+          }
+          if (
+            (code >= 1 && code <= 0x1F) || code === 0x7F ||
+            (index === 0 && code >= 0x30 && code <= 0x39) ||
+            (index === 1 && code >= 0x30 && code <= 0x39 && string.charCodeAt(0) === 0x2D)
+          ) {
+            result += `\\${code.toString(16)} `;
+            continue;
+          }
+          if (
+            code >= 0x80 || code === 0x2D || code === 0x5F ||
+            (code >= 0x30 && code <= 0x39) ||
+            (code >= 0x41 && code <= 0x5A) ||
+            (code >= 0x61 && code <= 0x7A)
+          ) {
+            result += string[index];
+            continue;
+          }
+          result += `\\${string[index]}`;
+        }
+        return result;
       },
       supports() { return false; },
     }),

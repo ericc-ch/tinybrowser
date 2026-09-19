@@ -62,9 +62,10 @@ globalThis.Response = class Response {
   constructor(body, init) {
     const options = init === undefined ? {} : Object(init);
     const storedBody = body === undefined || body === null ? '' : body;
-    Object.defineProperty(this, __tbResponseData, {
+        Object.defineProperty(this, __tbResponseData, {
       value: {
         body: storedBody,
+        bodyUsed: false,
         status: options.status === undefined ? 200 : Number(options.status),
         statusText: options.statusText === undefined ? '' : String(options.statusText),
         url: options.url === undefined ? '' : String(options.url),
@@ -78,19 +79,26 @@ globalThis.Response = class Response {
   get url() { return __tbBrand(this, __tbResponseData).url; }
   get headers() { return __tbBrand(this, __tbResponseData).headers; }
   get ok() { const status = __tbBrand(this, __tbResponseData).status; return status >= 200 && status <= 299; }
-  get bodyUsed() { return false; }
-  text() { return __tbResponseBytes(__tbBrand(this, __tbResponseData).body).then(bytes => __tbDecodeBytes(bytes, 'utf-8', false, false)); }
+  get bodyUsed() { return __tbBrand(this, __tbResponseData).bodyUsed; }
+  consume() {
+    const data = __tbBrand(this, __tbResponseData);
+    if (data.bodyUsed) return Promise.reject(new TypeError('body already used'));
+    data.bodyUsed = true;
+    return __tbResponseBytes(data.body);
+  }
+  text() { return this.consume().then(bytes => __tbDecodeBytes(bytes, 'utf-8', false, false)); }
   json() {
     return this.text().then(JSON.parse);
   }
-  arrayBuffer() { return __tbResponseBytes(__tbBrand(this, __tbResponseData).body).then(bytes => bytes.buffer); }
+  arrayBuffer() { return this.consume().then(bytes => bytes.buffer); }
   blob() {
     const data = __tbBrand(this, __tbResponseData);
     const type = data.headers.get('content-type');
-    return __tbResponseBytes(data.body).then(bytes => new Blob([bytes], { type: type === null ? '' : type }));
+    return this.consume().then(bytes => new Blob([bytes], { type: type === null ? '' : type }));
   }
   clone() {
     const data = __tbBrand(this, __tbResponseData);
+    if (data.bodyUsed) throw new TypeError('body already used');
     return new Response(data.body, { status: data.status, statusText: data.statusText, url: data.url, headers: data.headers });
   }
 };

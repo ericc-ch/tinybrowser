@@ -30,7 +30,7 @@ use crate::document::Stop;
 
 const MAX_RUNTIME_MEMORY: usize = 32 * 1024 * 1024;
 const MAX_RUNTIME_STACK: usize = 512 * 1024;
-const DEFAULT_SCRIPT_BUDGET: Duration = Duration::from_secs(30);
+const DEFAULT_SCRIPT_BUDGET: Duration = Duration::from_secs(5);
 
 /// Web-platform JS shims, one spec area per file, evaluated in order as a
 /// single script so top-level bindings are shared across areas.
@@ -923,6 +923,13 @@ pub(crate) fn script_at(world: &World, id: dom::NodeId) -> Option<Script> {
     } else {
         javascript_mime(typ.as_deref()).then_some(Script::Classic(source))
     }
+}
+
+pub(super) fn javascript_module_mime(typ: Option<&str>) -> bool {
+    let Some(typ) = typ.map(str::trim).filter(|typ| !typ.is_empty()) else {
+        return false;
+    };
+    javascript_mime(Some(typ))
 }
 
 fn javascript_mime(typ: Option<&str>) -> bool {

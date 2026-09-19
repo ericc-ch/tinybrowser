@@ -300,6 +300,80 @@ impl Dom {
         )
     }
 
+    fn is_html_slot(&self, id: NodeId) -> bool {
+        matches!(
+            self.kind(id),
+            Some(NodeKind::Element { name, .. })
+                if name.ns == html_namespace() && name.local.as_ref() == "slot"
+        )
+    }
+
+    fn slottable_name(&self, id: NodeId) -> Option<String> {
+        match self.kind(id) {
+            Some(NodeKind::Element { .. }) => Some(self.attribute(id, "slot").unwrap_or_default()),
+            Some(NodeKind::Text { .. }) => Some(String::new()),
+            _ => None,
+        }
+    }
+
+    fn containing_shadow_root(&self, id: NodeId) -> Option<NodeId> {
+        let mut current = Some(id);
+        while let Some(node) = current {
+            if self.shadow_host(node).is_some() {
+                return Some(node);
+            }
+            current = self.parent(node);
+        }
+        None
+    }
+
+    fn first_slot(&self, root: NodeId, name: &str) -> Option<NodeId> {
+        let mut stack = self
+            .children(root)
+            .map(|children| children.copied().collect::<Vec<_>>())
+            .unwrap_or_default();
+        stack.reverse();
+        while let Some(node) = stack.pop() {
+            if self.is_html_slot(node) && self.attribute(node, "name").unwrap_or_default() == name {
+                return Some(node);
+            }
+            if self.shadow_root(node).is_some() {
+                continue;
+            }
+            if let Some(children) = self.children(node) {
+                stack.extend(children.rev().copied());
+            }
+        }
+        None
+    }
+
+    fn assigned_nodes(&self, slot: NodeId) -> Vec<NodeId> {
+        let Some(root) = self.containing_shadow_root(slot) else {
+            return Vec::new();
+        };
+        let Some(host) = self.shadow_host(root) else {
+            return Vec::new();
+        };
+        let name = self.attribute(slot, "name").unwrap_or_default();
+        if self.first_slot(root, &name) != Some(slot) {
+            return Vec::new();
+        }
+        self.children(host)
+            .into_iter()
+            .flatten()
+            .copied()
+            .filter(|&child| self.slottable_name(child).as_deref() == Some(name.as_str()))
+            .collect()
+    }
+
+    fn assigned_slot(&self, id: NodeId) -> Option<NodeId> {
+        let host = self.parent(id)?;
+        let root = self.shadow_root(host)?;
+        let name = self.slottable_name(id)?;
+        let slot = self.first_slot(root, &name)?;
+        Some(slot).filter(|&slot| self.assigned_nodes(slot).contains(&id))
+    }
+
     /// The iframe elements in `id`'s inclusive subtree with their
     /// connectivity, for a post-connection/removing step pass.
     fn connection_snapshot(&self, id: NodeId) -> Vec<(NodeId, bool)> {
@@ -445,22 +519,36 @@ impl Dom {
         }
     }
 
-    /// Children in the rendered, shadow-including tree. A shadow host renders
-    /// its shadow root instead of its light-DOM children.
+    /// Children in the flattened tree used for style and box construction.
+    /// A shadow host yields its shadow tree, and a slot yields its assigned
+    /// nodes when any exist
+    /// (<https://drafts.csswg.org/css-scoping/#flattening>).
     #[must_use]
     pub fn rendered_children(&self, id: NodeId) -> Vec<NodeId> {
         if let Some(root) = self.shadow_root(id) {
-            return vec![root];
+            return self.rendered_children(root);
+        }
+        if self.is_html_slot(id) {
+            let assigned = self.assigned_nodes(id);
+            if !assigned.is_empty() {
+                return assigned;
+            }
         }
         self.children(id)
             .map(|children| children.copied().collect())
             .unwrap_or_default()
     }
 
-    /// Parent in the rendered, shadow-including tree.
+    /// Parent in the flattened tree used for style and box construction.
     #[must_use]
     pub fn rendered_parent(&self, id: NodeId) -> Option<NodeId> {
-        self.parent(id).or_else(|| self.shadow_host(id))
+        if let Some(slot) = self.assigned_slot(id) {
+            return Some(slot);
+        }
+        match self.parent(id) {
+            Some(parent) => self.shadow_host(parent).or(Some(parent)),
+            None => self.shadow_host(id),
+        }
     }
 
     /// Adjacent sibling in the rendered, shadow-including tree.
@@ -2013,9 +2101,11 @@ impl Dom {
             }
             cursor = self.parent(id).or_else(|| {
                 if self.is_fragment(id) {
-                    self.template_contents
-                        .iter()
-                        .find_map(|(&host, &contents)| (contents == id).then_some(host))
+                    self.shadow_hosts.get(&id).copied().or_else(|| {
+                        self.template_contents
+                            .iter()
+                            .find_map(|(&host, &contents)| (contents == id).then_some(host))
+                    })
                 } else {
                     None
                 }

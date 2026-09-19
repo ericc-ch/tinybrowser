@@ -73,7 +73,7 @@ pub(super) fn load_module<'js>(ctx: &Ctx<'js>, name: &str) -> Result<Module<'js,
         .map_err(|_| Error::new_loading(name))?
         .map_err(|_| Error::new_loading(name))?;
     if !(200..300).contains(&outcome.status)
-        || !super::javascript_mime(outcome.content_type.as_deref())
+        || !super::javascript_module_mime(outcome.content_type.as_deref())
     {
         return Err(Error::new_loading(name));
     }
