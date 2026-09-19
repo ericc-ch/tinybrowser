@@ -11,6 +11,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 use tokio::process::Child;
 
+use crate::actor::TabId;
 use crate::manager::RendererId;
 use crate::network::FetchHandle;
 use crate::site::Site;
@@ -522,6 +523,8 @@ pub(crate) struct ReaderContext {
     site: Arc<Mutex<Option<Site>>>,
     released: Arc<AtomicU64>,
     kill: watch::Sender<bool>,
+    /// Browser command handle: renderer links create tabs for `window.open`.
+    browser: crate::browser::BrowserHandle,
 }
 
 pub(crate) async fn writer_task(
@@ -790,6 +793,220 @@ async fn route_service_call(
             context.fetch.set_cookie(&value, &url);
             send_reply(&context.tx, id, ServiceReply::Unit).await?;
         }
+        ServiceCall::BroadcastPost {
+            origin,
+            name,
+            payload,
+            channel,
+        } => {
+            context
+                .fetch
+                .post_broadcast(&crate::broadcast::BroadcastMessage {
+                    origin,
+                    name,
+                    payload,
+                    source: (assignment, channel),
+                });
+            send_reply(&context.tx, id, ServiceReply::Unit).await?;
+        }
+        call @ (ServiceCall::StorageGet { .. }
+        | ServiceCall::StorageKeys { .. }
+        | ServiceCall::StorageSet { .. }
+        | ServiceCall::StorageRemove { .. }
+        | ServiceCall::StorageClear { .. }) => {
+            return route_storage_call(context, assignment, id, call).await;
+        }
+        call @ (ServiceCall::WindowOpen { .. }
+        | ServiceCall::WindowClose { .. }
+        | ServiceCall::Opener
+        | ServiceCall::WindowMessage { .. }
+        | ServiceCall::RemoteSessionGet { .. }) => {
+            return route_window_call(context, assignment, id, call).await;
+        }
+    }
+    Ok(())
+}
+
+/// Routes one `window.open`/`window.close`/`postMessage` service call. Step 1
+/// created the tab and its first navigation; step 2 adds the opener link and
+/// cross-tab messaging.
+async fn route_window_call(
+    context: &ReaderContext,
+    assignment: RendererAssignmentId,
+    id: u64,
+    call: ServiceCall,
+) -> Result<(), RendererViolation> {
+    match call {
+        ServiceCall::WindowOpen {
+            url,
+            features,
+            seed,
+            ..
+        } => {
+            let spec = if url.is_empty() || url == "about:blank" {
+                Some(String::new())
+            } else {
+                url::Url::parse(&url)
+                    .ok()
+                    .filter(|url| matches!(url.scheme(), "http" | "https"))
+                    .map(|url| url.to_string())
+            };
+            let source = context
+                .browser
+                .assignment_tab(assignment.get())
+                .await
+                .ok()
+                .flatten();
+            let noopener = features
+                .split(|character: char| character.is_ascii_whitespace() || character == ',')
+                .any(|feature| {
+                    feature.eq_ignore_ascii_case("noopener")
+                        || feature.eq_ignore_ascii_case("noreferrer")
+                });
+            let tab = match spec {
+                Some(spec) => context
+                    .browser
+                    .open_window(spec, source, noopener, seed)
+                    .await
+                    .ok()
+                    .map(TabId::get),
+                None => None,
+            };
+            send_reply(&context.tx, id, ServiceReply::Window(tab)).await?;
+        }
+        ServiceCall::WindowClose { tab } => {
+            let _result = context.browser.close_tab(TabId::new(tab)).await;
+            send_reply(&context.tx, id, ServiceReply::Unit).await?;
+        }
+        ServiceCall::Opener => {
+            let opener = context
+                .browser
+                .opener_tab(assignment.get())
+                .await
+                .ok()
+                .flatten()
+                .map(TabId::get);
+            send_reply(&context.tx, id, ServiceReply::Window(opener)).await?;
+        }
+        ServiceCall::WindowMessage { tab, payload } => {
+            let _result = context
+                .browser
+                .window_message(TabId::new(tab), payload)
+                .await;
+            send_reply(&context.tx, id, ServiceReply::Unit).await?;
+        }
+        ServiceCall::RemoteSessionGet { tab, origin, key } => {
+            let value = context
+                .browser
+                .remote_session_get(TabId::new(tab), origin, key)
+                .await
+                .ok()
+                .flatten();
+            send_reply(&context.tx, id, ServiceReply::StorageValue(value)).await?;
+        }
+        ServiceCall::Dial(_)
+        | ServiceCall::CookieGet { .. }
+        | ServiceCall::CookieSet { .. }
+        | ServiceCall::StorageGet { .. }
+        | ServiceCall::StorageKeys { .. }
+        | ServiceCall::StorageSet { .. }
+        | ServiceCall::StorageRemove { .. }
+        | ServiceCall::StorageClear { .. }
+        | ServiceCall::BroadcastPost { .. } => {
+            // `route_service_call` dispatches the other service families.
+            return Err(RendererViolation);
+        }
+    }
+    Ok(())
+}
+
+/// Routes one `localStorage` service call. The origin and the calling URL are
+/// both checked against the renderer's site lock before the area is touched.
+async fn route_storage_call(
+    context: &ReaderContext,
+    assignment: RendererAssignmentId,
+    id: u64,
+    call: ServiceCall,
+) -> Result<(), RendererViolation> {
+    match call {
+        ServiceCall::StorageGet { origin, key } => {
+            let Some(_origin) = authorize(&context.site, &origin) else {
+                return Err(RendererViolation);
+            };
+            let value = context.fetch.storage_get(&origin, &key);
+            send_reply(&context.tx, id, ServiceReply::StorageValue(value)).await?;
+        }
+        ServiceCall::StorageKeys { origin } => {
+            let Some(_origin) = authorize(&context.site, &origin) else {
+                return Err(RendererViolation);
+            };
+            let keys = context.fetch.storage_keys(&origin);
+            send_reply(&context.tx, id, ServiceReply::StorageKeys(keys)).await?;
+        }
+        ServiceCall::StorageSet {
+            origin,
+            url,
+            key,
+            value,
+            source,
+        } => {
+            let Some(_origin) = authorize(&context.site, &origin) else {
+                return Err(RendererViolation);
+            };
+            if authorize(&context.site, &url).is_none() {
+                return Err(RendererViolation);
+            }
+            let change =
+                context
+                    .fetch
+                    .storage_set(&origin, &url, &key, &value, (assignment, source));
+            send_reply(&context.tx, id, ServiceReply::StorageChanged(change)).await?;
+        }
+        ServiceCall::StorageRemove {
+            origin,
+            url,
+            key,
+            source,
+        } => {
+            let Some(_origin) = authorize(&context.site, &origin) else {
+                return Err(RendererViolation);
+            };
+            if authorize(&context.site, &url).is_none() {
+                return Err(RendererViolation);
+            }
+            let change = context
+                .fetch
+                .storage_remove(&origin, &url, &key, (assignment, source));
+            send_reply(&context.tx, id, ServiceReply::StorageChanged(Ok(change))).await?;
+        }
+        ServiceCall::StorageClear {
+            origin,
+            url,
+            source,
+        } => {
+            let Some(_origin) = authorize(&context.site, &origin) else {
+                return Err(RendererViolation);
+            };
+            if authorize(&context.site, &url).is_none() {
+                return Err(RendererViolation);
+            }
+            let change = context
+                .fetch
+                .storage_clear(&origin, &url, (assignment, source));
+            send_reply(&context.tx, id, ServiceReply::StorageChanged(Ok(change))).await?;
+        }
+        ServiceCall::Dial(_)
+        | ServiceCall::CookieGet { .. }
+        | ServiceCall::CookieSet { .. }
+        | ServiceCall::WindowOpen { .. }
+        | ServiceCall::WindowClose { .. }
+        | ServiceCall::Opener
+        | ServiceCall::WindowMessage { .. }
+        | ServiceCall::RemoteSessionGet { .. }
+        | ServiceCall::BroadcastPost { .. } => {
+            // `route_service_call` dispatches the other service families.
+            return Err(RendererViolation);
+        }
     }
     Ok(())
 }
@@ -808,7 +1025,18 @@ async fn send_released_reply(
     let reply = match call {
         ServiceCall::Dial(_) => ServiceReply::Dial(Err(renderer::DialFailure::Cancelled)),
         ServiceCall::CookieGet { .. } => ServiceReply::Cookie(String::new()),
-        ServiceCall::CookieSet { .. } => ServiceReply::Unit,
+        ServiceCall::CookieSet { .. }
+        | ServiceCall::WindowClose { .. }
+        | ServiceCall::WindowMessage { .. }
+        | ServiceCall::BroadcastPost { .. } => ServiceReply::Unit,
+        ServiceCall::StorageGet { .. } | ServiceCall::RemoteSessionGet { .. } => {
+            ServiceReply::StorageValue(None)
+        }
+        ServiceCall::StorageKeys { .. } => ServiceReply::StorageKeys(Vec::new()),
+        ServiceCall::StorageSet { .. }
+        | ServiceCall::StorageRemove { .. }
+        | ServiceCall::StorageClear { .. } => ServiceReply::StorageChanged(Ok(None)),
+        ServiceCall::WindowOpen { .. } | ServiceCall::Opener => ServiceReply::Window(None),
     };
     send_reply(tx, id, reply).await
 }
@@ -924,10 +1152,44 @@ fn spawn_transport(command: &mut Command) -> io::Result<SpawnedRenderer> {
     })
 }
 
+/// Registers the one-way browser-to-renderer subscriptions: storage events
+/// and `BroadcastChannel` messages. Both are best-effort; a full queue drops
+/// the message instead of stalling the browser.
+fn subscribe_renderer_events(fetch: &FetchHandle, tx: &mpsc::Sender<Outbound>) {
+    let storage_tx = tx.clone();
+    fetch.subscribe_storage(Box::new(move |event| {
+        match storage_tx.try_send(Outbound::Control(ToRenderer::StorageEvent {
+            origin: event.origin,
+            kind: event.kind,
+            key: event.key,
+            old_value: event.old_value,
+            new_value: event.new_value,
+            url: event.url,
+            source: Some(event.source),
+        })) {
+            Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => true,
+            Err(mpsc::error::TrySendError::Closed(_)) => false,
+        }
+    }));
+    let broadcast_tx = tx.clone();
+    fetch.subscribe_broadcast(Box::new(move |message| {
+        match broadcast_tx.try_send(Outbound::Control(ToRenderer::BroadcastMessage {
+            origin: message.origin.clone(),
+            name: message.name.clone(),
+            payload: message.payload.clone(),
+            source: Some(message.source),
+        })) {
+            Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => true,
+            Err(mpsc::error::TrySendError::Closed(_)) => false,
+        }
+    }));
+}
+
 pub(crate) async fn spawn_process(
     id: RendererId,
     site: Option<Site>,
     fetch: FetchHandle,
+    browser: crate::browser::BrowserHandle,
     slot: tokio::sync::OwnedSemaphorePermit,
 ) -> io::Result<RendererHandle> {
     let mut command = Command::new(std::env::current_exe()?);
@@ -945,6 +1207,7 @@ pub(crate) async fn spawn_process(
         return Err(io::Error::other("renderer stderr missing"));
     };
     let (tx, rx) = mpsc::channel::<Outbound>(COMMAND_CAPACITY);
+    subscribe_renderer_events(&fetch, &tx);
     let (kill, kill_rx) = watch::channel(false);
     let waiters = Waiters {
         pending: Arc::new(Mutex::new(HashMap::new())),
@@ -973,6 +1236,7 @@ pub(crate) async fn spawn_process(
         site: Arc::clone(&site),
         released: Arc::clone(&released),
         kill: kill.clone(),
+        browser,
     };
     let reader_task = tokio::spawn(reader_task(reader, reader_context, Some(ready_tx)));
     let stderr_task = tokio::spawn(forward_stderr(stderr));

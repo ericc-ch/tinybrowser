@@ -7,18 +7,11 @@ RUST_TEST_THREADS = "1"
 # force, so an ambient CFLAGS still wins.
 CFLAGS = "-fno-unwind-tables -fno-asynchronous-unwind-tables"
 
-# `--icf=all` folds identical code sections and saves about 64 KB in the
-# release binary. GNU ld.bfd rejects the flag, so select rustc's bundled LLD.
-# `--build-id=none` drops the GNU build-ID note (about 0.2 KB); coredumps can
-# no longer be matched to builds via debuginfod. `--gc-sections` keeps section
-# GC explicit next to LTO (about 0.1 KB). `-O2` lets lld merge strings and fold
-# harder (about 2 KB).
-#
-# `--no-eh-frame-hdr` (the 98 KB unwind index) is deliberately absent: these
-# flags apply to every profile, and without the index no Rust panic can unwind
-# in dev or test builds, which aborts the test binary instead of reporting the
-# failing test. The release binary runs with `panic = "abort"` and does not
-# need the index anyway; paying 98 KB in release keeps `cargo test` usable.
+# Dev and test links use GNU bfd. The pinned toolchain defaults to rust-lld,
+# which rejects a DWARF relocation rustc itself emits in some code shapes
+# (`unknown relocation (1875)`, see build.rs); bfd ignores it. The release
+# binary's size flags in build.rs select lld later on the command line, and
+# the later `-fuse-ld` wins.
 [target.x86_64-unknown-linux-gnu]
-rustflags = ["-C", "link-arg=-fuse-ld=lld", "-C", "link-arg=-Wl,--icf=all", "-C", "link-arg=-Wl,--build-id=none", "-C", "link-arg=-Wl,--gc-sections", "-C", "link-arg=-Wl,-O2"]
+rustflags = ["-C", "link-arg=-fuse-ld=bfd"]
 

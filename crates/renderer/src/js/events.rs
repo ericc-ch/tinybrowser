@@ -245,10 +245,11 @@ impl JsEvent {
     }
 
     #[qjs(set, rename = "cancelBubble")]
-    fn set_cancel_bubble(&self, value: Value<'_>) {
-        if bindings::to_boolean(&value) {
+    fn set_cancel_bubble<'js>(&self, ctx: Ctx<'js>, value: Value<'js>) -> Result<()> {
+        if bindings::to_boolean(&ctx, &value)? {
             self.state_mut().stop_propagation = true;
         }
+        Ok(())
     }
 
     // https://dom.spec.whatwg.org/#dom-event-returnvalue
@@ -258,10 +259,11 @@ impl JsEvent {
     }
 
     #[qjs(set, rename = "returnValue")]
-    fn set_return_value(&self, value: Value<'_>) {
-        if !bindings::to_boolean(&value) {
+    fn set_return_value<'js>(&self, ctx: Ctx<'js>, value: Value<'js>) -> Result<()> {
+        if !bindings::to_boolean(&ctx, &value)? {
             self.set_canceled_flag();
         }
+        Ok(())
     }
 
     // https://dom.spec.whatwg.org/#dom-event-stoppropagation
@@ -305,8 +307,8 @@ impl JsEvent {
             return Err(Exception::throw_type(&ctx, "type is required"));
         };
         let typ = bindings::webidl_to_string(&ctx, typ)?;
-        let bubbles = boolean_argument(args.next());
-        let cancelable = boolean_argument(args.next());
+        let bubbles = boolean_argument(&ctx, args.next())?;
+        let cancelable = boolean_argument(&ctx, args.next())?;
         if self.state().dispatching {
             return Ok(());
         }
@@ -399,14 +401,18 @@ impl JsEventTarget {
     }
 
     /// User-agent delivery for a shim-fired event: same as `dispatchEvent`
-    /// but the event keeps its trust bit.
+    /// but the event keeps its trust bit. The first argument is the host
+    /// token our shims close over; calls without it throw instead of forging
+    /// a trusted event.
     #[qjs(rename = "__tbDispatchTrusted")]
     fn dispatch_trusted<'js>(
         &self,
         ctx: Ctx<'js>,
         this: This<Object<'js>>,
+        token: Value<'js>,
         event: Class<'js, JsEvent>,
     ) -> Result<bool> {
+        bindings::check_host_token(&ctx, &token)?;
         register_standalone(&ctx, self.id, &this.0)?;
         dispatch_trusted_event(&ctx, EventTargetKey::Standalone(self.id), &event)
     }
@@ -505,8 +511,8 @@ pub(crate) fn init_custom_event<'js>(ctx: Ctx<'js>, args: Rest<Value<'js>>) -> R
     };
     let class = Class::<JsEvent>::from_js(&ctx, event)?;
     let typ = bindings::webidl_to_string(&ctx, typ)?;
-    let bubbles = boolean_argument(args.next());
-    let cancelable = boolean_argument(args.next());
+    let bubbles = boolean_argument(&ctx, args.next())?;
+    let cancelable = boolean_argument(&ctx, args.next())?;
     if class.borrow().state().dispatching {
         return Ok(false);
     }
@@ -553,9 +559,9 @@ fn event_from_init<'js>(
         // `EventInit` member order; `CustomEventInit.detail` is read by the
         // JavaScript wrapper afterwards
         // (<https://dom.spec.whatwg.org/#dictdef-eventinit>).
-        bubbles = bindings::option_truthy(init, "bubbles")?;
-        cancelable = bindings::option_truthy(init, "cancelable")?;
-        composed = bindings::option_truthy(init, "composed")?;
+        bubbles = bindings::option_truthy(ctx, init, "bubbles")?;
+        cancelable = bindings::option_truthy(ctx, init, "cancelable")?;
+        composed = bindings::option_truthy(ctx, init, "composed")?;
     }
     Ok(JsEvent {
         state: EventStateCell(RefCell::new(EventState {
@@ -644,7 +650,7 @@ pub(crate) fn remove_listener<'js>(
 ) -> Result<()> {
     let typ = bindings::webidl_to_string(ctx, typ)?;
     let callback = listener_callback(ctx, callback)?;
-    let capture = ListenerOptions::read_capture(options)?;
+    let capture = ListenerOptions::read_capture(ctx, options)?;
     let world = target_world(ctx, target)?;
     let mut world = world.borrow_mut();
     let mut removed = Vec::new();
@@ -798,10 +804,14 @@ fn dispatch<'js>(
         state.canceled
     };
     let restored = window.set("event", previous);
-    result?;
-    handler?;
-    restored?;
-    Ok(!canceled)
+    let outcome = result.and(handler);
+    // The current event restores even when dispatch threw; the dispatch
+    // error wins over a restore error, so a failed invocation cannot leak a
+    // stale current event into the next dispatch.
+    match (outcome, restored) {
+        (Ok(()), Ok(())) => Ok(!canceled),
+        (Err(error), _) | (Ok(()), Err(error)) => Err(error),
+    }
 }
 
 /// The `Window` whose [current event](https://html.spec.whatwg.org/multipage/nav-history-apis.html#dom-window-event)
@@ -1065,7 +1075,7 @@ impl ListenerOptions {
             passive: None,
             signal: None,
         };
-        let object = match listener_options_argument(options) {
+        let object = match listener_options_argument(ctx, options)? {
             ListenerOptionsArgument::Absent => return Ok(parsed),
             ListenerOptionsArgument::Boolean(capture) => {
                 // A non-object is the boolean form.
@@ -1074,11 +1084,11 @@ impl ListenerOptions {
             }
             ListenerOptionsArgument::Object(object) => object,
         };
-        parsed.capture = bindings::option_truthy(&object, "capture")?;
-        parsed.once = bindings::option_truthy(&object, "once")?;
+        parsed.capture = bindings::option_truthy(ctx, &object, "capture")?;
+        parsed.once = bindings::option_truthy(ctx, &object, "once")?;
         let passive: Value = object.get("passive")?;
         if !passive.is_undefined() {
-            parsed.passive = Some(bindings::to_boolean(&passive));
+            parsed.passive = Some(bindings::to_boolean(ctx, &passive)?);
         }
         let signal: Value = object.get("signal")?;
         if !signal.is_undefined() {
@@ -1096,14 +1106,14 @@ impl ListenerOptions {
         Ok(parsed)
     }
 
-    fn read_capture(options: Option<Value<'_>>) -> Result<bool> {
+    fn read_capture<'js>(ctx: &Ctx<'js>, options: Option<Value<'js>>) -> Result<bool> {
         // `removeEventListener` reads only `capture`; reading the other
         // members would run their getters
         // (<https://dom.spec.whatwg.org/#dom-eventtarget-removeeventlistener>).
-        match listener_options_argument(options) {
+        match listener_options_argument(ctx, options)? {
             ListenerOptionsArgument::Absent => Ok(false),
             ListenerOptionsArgument::Boolean(capture) => Ok(capture),
-            ListenerOptionsArgument::Object(object) => bindings::option_truthy(&object, "capture"),
+            ListenerOptionsArgument::Object(object) => bindings::option_truthy(ctx, &object, "capture"),
         }
     }
 }
@@ -1119,16 +1129,21 @@ enum ListenerOptionsArgument<'js> {
     Object(Object<'js>),
 }
 
-fn listener_options_argument(options: Option<Value<'_>>) -> ListenerOptionsArgument<'_> {
+fn listener_options_argument<'js>(
+    ctx: &Ctx<'js>,
+    options: Option<Value<'js>>,
+) -> Result<ListenerOptionsArgument<'js>> {
     let Some(value) = options else {
-        return ListenerOptionsArgument::Absent;
+        return Ok(ListenerOptionsArgument::Absent);
     };
     if value.is_undefined() || value.is_null() {
-        return ListenerOptionsArgument::Absent;
+        return Ok(ListenerOptionsArgument::Absent);
     }
     match value.as_object() {
-        Some(object) => ListenerOptionsArgument::Object(object.clone()),
-        None => ListenerOptionsArgument::Boolean(bindings::to_boolean(&value)),
+        Some(object) => Ok(ListenerOptionsArgument::Object(object.clone())),
+        None => Ok(ListenerOptionsArgument::Boolean(bindings::to_boolean(
+            ctx, &value,
+        )?)),
     }
 }
 
@@ -1171,7 +1186,9 @@ fn signal_aborted(ctx: &Ctx<'_>, signal: &Persistent<Object<'static>>) -> bool {
         .restore(ctx)
         .ok()
         .and_then(|object| object.get::<_, Value>("aborted").ok())
-        .is_some_and(|value| bindings::to_boolean(&value))
+        // The pristine conversion cannot throw; a broken realm reads as
+        // not-aborted rather than failing the dispatch.
+        .is_some_and(|value| bindings::to_boolean(ctx, &value).unwrap_or(false))
 }
 
 fn target_world(ctx: &Ctx<'_>, target: EventTargetKey) -> Result<Rc<RefCell<World>>> {
@@ -1222,15 +1239,12 @@ fn call_handler_attribute<'js>(
     let name = format!("on{typ}");
     let mut handler: Value = object.get(name.as_str())?;
     if handler.as_function().is_none()
-        && let Some(id) = bindings::host_node_id(ctx, &object.clone().into_value())
-        && !bindings::handler_cleared(ctx, id, &name)?
-        && let Some(body) = bindings::handler_attribute(ctx, id, &name)?
-        && !body.trim().is_empty()
+        && let Some(source) = handler_attribute_source(ctx, object, &name)?
     {
         // A handler content attribute compiles to a function whose body is
         // the attribute value and whose `this` is the object
         // (<https://html.spec.whatwg.org/multipage/webappapis.html#event-handler-content-attributes>).
-        let source = format!("(function(event) {{\n{body}\n}})");
+        let source = format!("(function(event) {{\n{source}\n}})");
         match ctx.eval::<Function, _>(source) {
             Ok(compiled) => {
                 object.set(name.as_str(), compiled.clone())?;
@@ -1254,12 +1268,51 @@ fn call_handler_attribute<'js>(
     Ok(())
 }
 
+/// The content-attribute source for one handler: the target node's own
+/// attribute, or for a window target the active document body's attribute,
+/// which forwards window handlers to the window
+/// (<https://html.spec.whatwg.org/multipage/dom.html#body-element-event-handlers>).
+fn handler_attribute_source<'js>(
+    ctx: &Ctx<'js>,
+    target: &Object<'js>,
+    name: &str,
+) -> Result<Option<String>> {
+    if let Some(id) = bindings::host_node_id(ctx, &target.clone().into_value()) {
+        if bindings::handler_cleared(ctx, id, name)? {
+            return Ok(None);
+        }
+        let body = bindings::handler_attribute(ctx, id, name)?;
+        return Ok(body.filter(|source| !source.trim().is_empty()));
+    }
+    let Some(body) = active_body(ctx) else {
+        return Ok(None);
+    };
+    if bindings::handler_cleared(ctx, body, name)?
+        || bindings::window_handler_cleared(ctx, body, name)?
+    {
+        return Ok(None);
+    }
+    Ok(bindings::handler_attribute(ctx, body, name)?.filter(|source| !source.trim().is_empty()))
+}
+
+/// The body element of the current realm's active document, when it has one.
+fn active_body(ctx: &Ctx<'_>) -> Option<dom::NodeId> {
+    let world = bindings::world(ctx).ok()?;
+    let world = world.borrow();
+    let parsed = world.main_document()?;
+    parsed
+        .dom
+        .select_first(parsed.dom.document(), "body")
+        .ok()
+        .flatten()
+}
+
 /// `ToBoolean` for an optional argument; a missing or undefined argument is
 /// false (<https://webidl.spec.whatwg.org/#es-boolean>).
-fn boolean_argument(value: Option<Value<'_>>) -> bool {
+fn boolean_argument<'js>(ctx: &Ctx<'js>, value: Option<Value<'js>>) -> Result<bool> {
     match value {
-        Some(value) if !value.is_undefined() => bindings::to_boolean(&value),
-        _ => false,
+        Some(value) if !value.is_undefined() => bindings::to_boolean(ctx, &value),
+        _ => Ok(false),
     }
 }
 

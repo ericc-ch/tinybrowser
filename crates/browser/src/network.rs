@@ -8,13 +8,14 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use net::{Agent, AgentBuilder, InitiatorKind, Method};
-use renderer::{DialFailure, DialOutcome, DialRequest};
+use renderer::{DialFailure, DialOutcome, DialRequest, StorageChange, StorageError};
 use tokio::sync::Semaphore;
 use tokio::sync::mpsc::UnboundedSender;
 use url::Url;
 
+use crate::broadcast::{BroadcastBus, BroadcastMessage, BroadcastSink};
+use crate::storage::LocalStorage;
 use crate::store::ProfileStore;
-
 /// Default per-call fetch timeout on a [`FetchHandle`].
 pub(crate) const PAGE_FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -38,6 +39,8 @@ pub(crate) struct NavOutcome {
 pub struct NetworkSession {
     agent: Agent,
     store: Arc<ProfileStore>,
+    storage: Arc<LocalStorage>,
+    broadcast: Arc<BroadcastBus>,
     permits: NetworkPermits,
 }
 
@@ -58,9 +61,13 @@ impl NetworkSession {
     /// Stored profile data could not be read or quarantined.
     fn from_agent(agent: Agent, store: ProfileStore) -> io::Result<Self> {
         store.load_into(&agent)?;
+        let storage = Arc::new(LocalStorage::default());
+        store.load_local_storage(&storage)?;
         Ok(Self {
             agent,
             store: Arc::new(store),
+            storage,
+            broadcast: Arc::new(BroadcastBus::default()),
             permits: NetworkPermits::new(),
         })
     }
@@ -71,6 +78,8 @@ impl NetworkSession {
         FetchHandle {
             agent: self.agent.clone(),
             store: Arc::clone(&self.store),
+            storage: Arc::clone(&self.storage),
+            broadcast: Arc::clone(&self.broadcast),
             permits: self.permits.clone(),
             tab: Arc::new(Semaphore::new(MAX_TAB_DIALS)),
         }
@@ -79,9 +88,13 @@ impl NetworkSession {
     pub(crate) async fn persist(&self) -> io::Result<()> {
         let store = Arc::clone(&self.store);
         let agent = self.agent.clone();
-        tokio::task::spawn_blocking(move || store.save_from(&agent))
-            .await
-            .map_err(io::Error::other)?
+        let storage = Arc::clone(&self.storage);
+        tokio::task::spawn_blocking(move || {
+            store.save_from(&agent)?;
+            store.save_local_storage(&storage)
+        })
+        .await
+        .map_err(io::Error::other)?
     }
 
     /// Cookies visible to `url`, including session and `HttpOnly` cookies.
@@ -133,6 +146,8 @@ const MAX_TAB_DIALS: usize = 8;
 pub(crate) struct FetchHandle {
     agent: Agent,
     store: Arc<ProfileStore>,
+    storage: Arc<LocalStorage>,
+    broadcast: Arc<BroadcastBus>,
     permits: NetworkPermits,
     tab: Arc<Semaphore>,
 }
@@ -148,6 +163,64 @@ impl FetchHandle {
     pub(crate) fn set_cookie(&self, value: &str, url: &Url) {
         self.agent.set_cookie(value, url);
         self.store.mark_dirty();
+    }
+
+    /// `localStorage.getItem(key)` for `origin`.
+    pub(crate) fn storage_get(&self, origin: &str, key: &str) -> Option<String> {
+        self.storage.get(origin, key)
+    }
+
+    /// The keys of `origin`'s local storage area, in iteration order.
+    pub(crate) fn storage_keys(&self, origin: &str) -> Vec<String> {
+        self.storage.keys(origin)
+    }
+
+    /// Registers `sink` as this renderer's `storage`-event delivery hook.
+    pub(crate) fn subscribe_storage(&self, sink: crate::storage::StorageSink) {
+        self.storage.subscribe(sink);
+    }
+
+    /// Registers `sink` as this renderer's `BroadcastChannel` hook.
+    pub(crate) fn subscribe_broadcast(&self, sink: BroadcastSink) {
+        self.broadcast.subscribe(sink);
+    }
+
+    /// Fans one `BroadcastChannel` message out to every renderer.
+    pub(crate) fn post_broadcast(&self, message: &BroadcastMessage) {
+        self.broadcast.broadcast(message);
+    }
+
+    /// `localStorage.setItem(key, value)`; `Ok(None)` means no change.
+    pub(crate) fn storage_set(
+        &self,
+        origin: &str,
+        url: &str,
+        key: &str,
+        value: &str,
+        source: crate::storage::StorageSource,
+    ) -> Result<Option<StorageChange>, StorageError> {
+        self.storage.set(origin, key, value, url, source)
+    }
+
+    /// `localStorage.removeItem(key)`; `None` means the key was absent.
+    pub(crate) fn storage_remove(
+        &self,
+        origin: &str,
+        url: &str,
+        key: &str,
+        source: crate::storage::StorageSource,
+    ) -> Option<StorageChange> {
+        self.storage.remove(origin, key, url, source)
+    }
+
+    /// `localStorage.clear()`; `None` means the area was empty.
+    pub(crate) fn storage_clear(
+        &self,
+        origin: &str,
+        url: &str,
+        source: crate::storage::StorageSource,
+    ) -> Option<StorageChange> {
+        self.storage.clear(origin, url, source)
     }
 
     pub(crate) fn request(&self, method: Method, url: Url) -> net::RequestBuilder {

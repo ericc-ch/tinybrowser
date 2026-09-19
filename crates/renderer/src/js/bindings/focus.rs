@@ -221,16 +221,16 @@ pub(crate) fn focus_node(ctx: &Ctx<'_>, node: NodeId) -> Result<()> {
             Some(target(node)),
         )?;
         // A handler may have moved focus; the spec's focus update steps stop
-        // when the focused area changed during the blur chain, and the
-        // abandoned target is no longer the related target.
-        if world.borrow().active_element(document).is_some() {
+        // when the focused area changed during the blur chain, and `focusout`
+        // carries the new area as its related target.
+        if let Some(moved) = world.borrow().active_element(document) {
             events::fire_trusted_with_related(
                 ctx,
                 EventTargetKey::Node(previous),
                 "focusout",
                 true,
                 false,
-                None,
+                Some(target(moved)),
             )?;
             return Ok(());
         }
@@ -298,6 +298,11 @@ pub(crate) fn element_click(ctx: &Ctx<'_>, node: NodeId) -> Result<()> {
     }
     world.borrow_mut().set_click_in_progress(node, true);
     let result = (|| {
+        // `HTMLElement.click()` focuses a focusable target before dispatching
+        // (<https://html.spec.whatwg.org/multipage/interaction.html#dom-click>).
+        if is_focusable(ctx, node)? {
+            focus_node(ctx, node)?;
+        }
         let event = Class::instance(ctx.clone(), events::JsEvent::uninitialized())?;
         event.borrow().initialize("click".to_owned(), true, true);
         events::dispatch_event(ctx, EventTargetKey::Node(node), &event)?;
@@ -340,6 +345,17 @@ fn webdriver_click<'js>(ctx: Ctx<'js>, element: Value<'js>) -> Result<()> {
     let Some(node) = host_node_id(&ctx, &element) else {
         return Err(Exception::throw_type(&ctx, "not an element"));
     };
+    // A disabled control eats the click: no focus move, no event
+    // (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#concept-fe-disabled>).
+    {
+        let world = world_for_node(&ctx, node)?;
+        let world = world.borrow();
+        if let Some(parsed) = world.document(node)
+            && is_actually_disabled(&parsed.dom, node)
+        {
+            return Ok(());
+        }
+    }
     if is_focusable(&ctx, node)? {
         focus_node(&ctx, node)?;
     }

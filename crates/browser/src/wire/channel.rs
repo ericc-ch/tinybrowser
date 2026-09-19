@@ -23,7 +23,12 @@ use serde::{Serialize, de::DeserializeOwned};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// Framing and message ABI version for the renderer channel.
-pub const PROTOCOL_VERSION: u8 = 4;
+///
+/// Version 5 added the storage service calls and the browser-broadcast
+/// `storage` event. Version 6 added `window.open`/`window.close`. Version 7
+/// added cross-tab messaging, session copies, and remote session reads.
+/// Version 8 added `BroadcastChannel`.
+pub const PROTOCOL_VERSION: u8 = 8;
 
 /// Fixed frame header size in bytes.
 pub const HEADER_BYTES: usize = 16;

@@ -16,7 +16,7 @@ use dom::{NodeId, qualified_name_eq};
 use rquickjs::{Class, Ctx, Exception, Function, Persistent, Result, Value, class::Trace};
 
 use crate::js::events::report_exception;
-use crate::js::world::{AttrState, FrameNavigation, Handle, World};
+use crate::js::world::{AttrState, FrameNavigation, Handle, World, Wrapper};
 
 /// `DOMTokenList` for `Element.classList`
 /// (<https://dom.spec.whatwg.org/#interface-domtokenlist>).
@@ -668,7 +668,7 @@ pub(crate) fn refresh_named_node_map<'js>(
 /// Refreshes the cached `NamedNodeMap` after a mutation, when one exists.
 fn touch_named_node_map(ctx: &Ctx<'_>, element: NodeId) -> Result<()> {
     let world_rc = world_for_node(ctx, element)?;
-    let Some(saved) = world_rc.borrow().named_node_map(element) else {
+    let Some(saved) = world_rc.borrow().wrapper(element, Wrapper::NamedNodeMap) else {
         return Ok(());
     };
     if let Some(value) = deref_weak(ctx, saved)? {
@@ -960,6 +960,15 @@ pub(crate) fn handler_attribute(ctx: &Ctx<'_>, id: NodeId, name: &str) -> Result
 pub(crate) fn handler_cleared(ctx: &Ctx<'_>, id: NodeId, name: &str) -> Result<bool> {
     let world = world_for_node(ctx, id)?;
     Ok(world.borrow().handler_cleared(Some(id), name))
+}
+
+/// Whether script cleared the window-scoped handler property. Body `on*`
+/// content attributes forward to the window, so a cleared window flag
+/// suppresses the body attribute too
+/// (<https://html.spec.whatwg.org/multipage/dom.html#body-element-event-handlers>).
+pub(crate) fn window_handler_cleared(ctx: &Ctx<'_>, id: NodeId, name: &str) -> Result<bool> {
+    let world = world_for_node(ctx, id)?;
+    Ok(world.borrow().handler_cleared(None, name))
 }
 
 /// Removes the DOM attribute identified by `(namespace, local)` and syncs

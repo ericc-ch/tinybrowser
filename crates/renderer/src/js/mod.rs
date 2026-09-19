@@ -7,6 +7,7 @@
 mod bindings;
 mod events;
 mod intl;
+mod url_parts;
 mod world;
 
 pub(crate) use world::{DocumentStreamCommand, FrameNavigation, RealmRegistry};
@@ -30,7 +31,27 @@ const MAX_RUNTIME_MEMORY: usize = 32 * 1024 * 1024;
 const MAX_RUNTIME_STACK: usize = 512 * 1024;
 const DEFAULT_SCRIPT_BUDGET: Duration = Duration::from_secs(5);
 
-const INSTALL_WEB_APIS_JS: &str = include_str!("scripts/web_apis.js");
+/// Web-platform JS shims, one spec area per file, evaluated in order as a
+/// single script so top-level bindings are shared across areas.
+///
+/// The whole concatenation runs inside one function scope: top-level
+/// `const`/`function` bindings stay visible to every shim file but invisible
+/// to page script, which shares the global lexical scope. Only explicit
+/// `globalThis` assignments publish names outward.
+const INSTALL_WEB_APIS_JS: &str = concat!(
+    "(function(){",
+    include_str!("scripts/web/timers.js"),
+    include_str!("scripts/web/fetch.js"),
+    include_str!("scripts/web/encoding.js"),
+    include_str!("scripts/web/streams.js"),
+    include_str!("scripts/web/file.js"),
+    include_str!("scripts/web/url.js"),
+    include_str!("scripts/web/dom.js"),
+    include_str!("scripts/web/messaging.js"),
+    include_str!("scripts/web/ui_events.js"),
+    include_str!("scripts/web/input.js"),
+    "})();",
+);
 
 /// A value produced by script evaluation.
 #[derive(Clone, Debug, PartialEq)]
@@ -132,6 +153,9 @@ pub(crate) struct JsRealm {
     stop: Arc<Stop>,
     pending_timeouts: Rc<RefCell<Vec<PendingTimeout>>>,
     pending_fetches: Rc<RefCell<Vec<PendingJsFetch>>>,
+    /// Nesting depth of [`JsRealm::with_budget`]; reentrant evaluations run
+    /// under the outer frame instead of installing their own budget.
+    budget_depth: Cell<usize>,
 }
 
 impl JsRealm {
@@ -151,6 +175,7 @@ impl JsRealm {
             stop,
             pending_timeouts: Rc::new(RefCell::new(Vec::new())),
             pending_fetches: Rc::new(RefCell::new(Vec::new())),
+            budget_depth: Cell::new(0),
         };
         host.install()?;
         Ok(host)
@@ -195,9 +220,14 @@ impl JsRealm {
             self.context.with(|ctx| {
                 let timeouts: Array = ctx.globals().get("__tb_timeouts")?;
                 let idx = usize::try_from(js_id).map_err(|_| JsError::BadTimerId)?;
-                let func: Function = timeouts.get(idx)?;
+                // A cancelled timer already left the queue: firing is a
+                // no-op, not a `TypeError`
+                // (<https://html.spec.whatwg.org/multipage/timers-and-user-prompts.html#timers>).
+                let func: Option<Function> = timeouts.get(idx)?;
                 timeouts.as_object().remove(js_id)?;
-                func.call::<_, ()>(())?;
+                if let Some(func) = func {
+                    func.call::<_, ()>(())?;
+                }
                 Ok(())
             })
         })
@@ -301,6 +331,63 @@ impl JsRealm {
         })
     }
 
+    /// Fires one `storage` event in this realm; `storageArea` is this realm's
+    /// own area, per the spec's broadcast steps
+    /// (<https://html.spec.whatwg.org/multipage/webstorage.html#concept-storage-broadcast>).
+    pub(crate) fn fire_storage_event(
+        &self,
+        event: &crate::storage::PendingStorageEvent,
+    ) -> Result<(), JsError> {
+        let kind = event.kind.as_str();
+        let key = event.key.clone();
+        let old_value = event.old_value.clone();
+        let new_value = event.new_value.clone();
+        let url = event.url.clone();
+        self.with_budget(None, || {
+            self.context.with(|ctx| {
+                let fire: Function = ctx.globals().get("__tbFireStorageEvent")?;
+                fire.call::<_, ()>((kind, key, old_value, new_value, url))?;
+                Ok(())
+            })
+        })
+    }
+
+    /// Dispatches one cross-tab `message` event in this realm; the source is
+    /// `null` because the posting window lives in another renderer.
+    /// (<https://html.spec.whatwg.org/multipage/web-messaging.html#window-post-message-steps>)
+    pub(crate) fn deliver_remote_message(&self, payload: &str) -> Result<(), JsError> {
+        let payload = payload.to_owned();
+        self.with_budget(None, || {
+            self.context.with(|ctx| {
+                let deliver: Function = ctx.globals().get("__tbDeliverRemoteMessage")?;
+                deliver.call::<_, ()>((payload,))?;
+                Ok(())
+            })
+        })
+    }
+
+    /// Dispatches one `BroadcastChannel` message in this realm.
+    /// (<https://html.spec.whatwg.org/multipage/web-messaging.html#broadcasting-to-other-browsing-contexts>)
+    pub(crate) fn deliver_broadcast_message(
+        &self,
+        origin: &str,
+        name: &str,
+        payload: &str,
+        source: Option<u64>,
+    ) -> Result<(), JsError> {
+        let origin = origin.to_owned();
+        let name = name.to_owned();
+        let payload = payload.to_owned();
+        let source = source.map(crate::js::js_number);
+        self.with_budget(None, || {
+            self.context.with(|ctx| {
+                let deliver: Function = ctx.globals().get("__tbDeliverBroadcast")?;
+                deliver.call::<_, ()>((name, payload, origin, source))?;
+                Ok(())
+            })
+        })
+    }
+
     /// Decodes and dispatches one channel message in this realm.
     pub(crate) fn deliver_port_message(
         &self,
@@ -378,7 +465,26 @@ impl JsRealm {
     /// The job drain always runs so a scheduled microtask cannot outlive the
     /// operation that scheduled it; the operation's error wins over a job
     /// error, and an interrupt wins over both.
+    ///
+    /// Reentrant calls (script evaluated while an outer script runs) execute
+    /// under the outer frame: the outer handler, deadline, and job drain own
+    /// the nesting, so an inner frame cannot overwrite and clear the outer
+    /// budget.
     fn with_budget<T>(
+        &self,
+        deadline: Option<Instant>,
+        operation: impl FnOnce() -> Result<T, JsError>,
+    ) -> Result<T, JsError> {
+        if self.budget_depth.get() > 0 {
+            return operation();
+        }
+        self.budget_depth.set(1);
+        let outcome = self.with_budget_outer(deadline, operation);
+        self.budget_depth.set(0);
+        outcome
+    }
+
+    fn with_budget_outer<T>(
         &self,
         deadline: Option<Instant>,
         operation: impl FnOnce() -> Result<T, JsError>,
@@ -422,8 +528,25 @@ impl JsRealm {
             intl::install(&ctx)?;
             self.install_task_host_functions(&ctx, &world)?;
             Self::install_document_host_functions(&ctx, &world)?;
+            install_storage_host_functions(&ctx, &world)?;
+            install_window_host_functions(&ctx, &world)?;
+            url_parts::install(&ctx)?;
             bindings::install_messaging(&ctx)?;
             ctx.eval::<(), _>(INSTALL_WEB_APIS_JS)?;
+            // The shims captured the host token; page script must never see
+            // it. Host plumbing is then frozen: function-valued `__tb*`
+            // bindings become non-writable and non-configurable, so a page
+            // cannot clobber the functions Rust looks up by name
+            // (already-frozen ones allow the redundant define as a no-op).
+            // Data-carrying `__tb*` globals stay writable: our own shims
+            // rebind counters such as `__tb_fetchSeq` after install.
+            ctx.eval::<(), _>(
+                "delete globalThis.__tbHostToken;\
+                 for (const k of Object.getOwnPropertyNames(globalThis)) {\
+                   if (k.startsWith('__tb') && typeof globalThis[k] === 'function')\
+                     Object.defineProperty(globalThis, k, {writable:false, configurable:false});\
+                 }",
+            )?;
             Ok(())
         })
     }
@@ -556,6 +679,161 @@ impl JsRealm {
     }
 }
 
+/// `window.open`/`window.close` hooks the JS shim calls.
+fn install_window_host_functions(ctx: &Ctx<'_>, world: &Rc<RefCell<World>>) -> Result<(), JsError> {
+    let window_open = world.clone();
+    ctx.globals().set(
+        "__tbWindowOpen",
+        Func::from(
+            move |url: String,
+                  name: String,
+                  features: String,
+                  seed_origin: String,
+                  seed_entries: Vec<String>| {
+                let spec = if url.is_empty() {
+                    Some(String::new())
+                } else {
+                    window_open
+                        .borrow()
+                        .document_url
+                        .join(&url)
+                        .ok()
+                        .map(|url| url.to_string())
+                };
+                let seed = if seed_origin.is_empty() {
+                    None
+                } else {
+                    Some(crate::protocol::StorageSeed {
+                        origin: seed_origin,
+                        entries: seed_entries
+                            .as_chunks::<2>()
+                            .0
+                            .iter()
+                            .map(|pair| (pair[0].clone(), pair[1].clone()))
+                            .collect(),
+                    })
+                };
+                spec.and_then(|spec| {
+                    window_open.borrow().runtime.services.window_open(
+                        &spec,
+                        &name,
+                        &features,
+                        seed.as_ref(),
+                    )
+                })
+            },
+        ),
+    )?;
+
+    let window_close = world.clone();
+    ctx.globals().set(
+        "__tbWindowClose",
+        Func::from(move |tab: u64| {
+            window_close.borrow().runtime.services.window_close(tab);
+        }),
+    )?;
+
+    let opener = world.clone();
+    ctx.globals().set(
+        "__tbWindowOpener",
+        Func::from(move || opener.borrow().runtime.services.window_opener()),
+    )?;
+
+    let post_message = world.clone();
+    ctx.globals().set(
+        "__tbWindowPostMessage",
+        Func::from(move |tab: u64, payload: String| {
+            post_message
+                .borrow()
+                .runtime
+                .services
+                .window_post_message(tab, &payload);
+        }),
+    )?;
+
+    let remote_session = world.clone();
+    ctx.globals().set(
+        "__tbRemoteSessionGet",
+        Func::from(move |tab: u64, key: String| {
+            let world = remote_session.borrow();
+            world.storage_origin().and_then(|origin| {
+                world
+                    .runtime
+                    .services
+                    .remote_session_get(tab, &origin, &key)
+            })
+        }),
+    )?;
+
+    let broadcast = world.clone();
+    ctx.globals().set(
+        "__tbBroadcastPost",
+        Func::from(
+            move |origin: String, name: String, payload: String, channel: u64| {
+                let world = broadcast.borrow();
+                // A channel in a detached iframe must not reach live contexts
+                // (<https://html.spec.whatwg.org/multipage/web-messaging.html#broadcasting-to-other-browsing-contexts>).
+                if !world.is_attached() {
+                    return;
+                }
+                world
+                    .runtime
+                    .services
+                    .broadcast_post(&origin, &name, &payload, channel);
+            },
+        ),
+    )?;
+    Ok(())
+}
+
+/// `localStorage`/`sessionStorage` hooks the JS shim calls. The session area
+/// lives in the engine; the local area crosses the service seam.
+fn install_storage_host_functions(
+    ctx: &Ctx<'_>,
+    world: &Rc<RefCell<World>>,
+) -> Result<(), JsError> {
+    let origin = world.clone();
+    ctx.globals().set(
+        "__tbStorageOrigin",
+        Func::from(move || origin.borrow().storage_origin()),
+    )?;
+
+    let get = world.clone();
+    ctx.globals().set(
+        "__tbStorageGet",
+        Func::from(move |kind: String, key: String| get.borrow().storage_get(&kind, &key)),
+    )?;
+
+    let keys = world.clone();
+    ctx.globals().set(
+        "__tbStorageKeys",
+        Func::from(move |kind: String| keys.borrow().storage_keys(&kind)),
+    )?;
+
+    let set = world.clone();
+    ctx.globals().set(
+        "__tbStorageSet",
+        Func::from(move |kind: String, key: String, value: String| {
+            set.borrow().storage_set(&kind, &key, &value).is_ok()
+        }),
+    )?;
+
+    let remove = world.clone();
+    ctx.globals().set(
+        "__tbStorageRemove",
+        Func::from(move |kind: String, key: String| {
+            remove.borrow().storage_remove(&kind, &key).is_some()
+        }),
+    )?;
+
+    let clear = world.clone();
+    ctx.globals().set(
+        "__tbStorageClear",
+        Func::from(move |kind: String| clear.borrow().storage_clear(&kind).is_some()),
+    )?;
+    Ok(())
+}
+
 impl Drop for JsRealm {
     fn drop(&mut self) {
         bindings::forget_world(&self.context);
@@ -565,6 +843,7 @@ impl Drop for JsRealm {
         // before its QuickJS context goes away; sibling realms keep theirs.
         world.forget_owned_documents();
         world.clear_listeners();
+        world.release_host_primitives();
     }
 }
 

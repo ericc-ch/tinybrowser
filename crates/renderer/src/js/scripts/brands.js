@@ -74,10 +74,10 @@
     'body', 'head', 'documentElement', 'doctype', 'readyState', 'implementation',
     'children', 'firstElementChild', 'lastElementChild', 'childElementCount',
     'append', 'prepend', 'replaceChildren', 'querySelector', 'querySelectorAll',
-    'URL', 'documentURI', 'location', 'characterSet', 'charset',
+    'URL', 'documentURI', 'baseURI', 'location', 'characterSet', 'charset',
     'inputEncoding', 'contentType', 'compatMode', 'title',
     'getElementsByName', 'importNode', 'currentScript', 'activeElement',
-    'elementsFromPoint', 'defaultView'
+    'elementFromPoint', 'elementsFromPoint', 'defaultView'
   ], true);
   const ElementInterface = define('Element', NodeInterface, [
     'getElementsByTagName', 'getElementsByTagNameNS', 'getElementsByClassName',
@@ -215,6 +215,53 @@
   ]) {
     const members = name === 'HTMLIFrameElement' ? ['contentDocument', 'contentWindow'] : [];
     table[name] = define(name, parent, members).prototype;
+  }
+  // URL decomposition IDL attributes
+  // (<https://html.spec.whatwg.org/multipage/links.html#url-decomposition-idl-attributes>).
+  // A href that fails to parse makes `protocol` ":" and every other getter
+  // empty; setting a component that the parse or the component rejects
+  // leaves the attribute untouched.
+  {
+    const parts = {
+      protocol: 0, username: 1, password: 2, host: 3, hostname: 4,
+      port: 5, pathname: 6, search: 7, hash: 8, origin: 9,
+    };
+    const hrefValue = function() {
+      const value = this.getAttribute('href');
+      return value === null ? null : globalThis.__tbUSVString(value);
+    };
+    const base = function() { return globalThis.__tbUSVString(document.baseURI); };
+    for (const proto of [table.HTMLAnchorElement, table.HTMLAreaElement]) {
+      for (const name of Object.keys(parts)) {
+        const index = parts[name];
+        const descriptor = {
+          get: function() {
+            // An absent `href` reports the URL-decomposition defaults, not
+            // the document URL.
+            const href = hrefValue.call(this);
+            if (href === null) return name === 'protocol' ? ':' : '';
+            const values = __tbUrlParts(href, base.call(this));
+            if (values === null || values === undefined) {
+              return name === 'protocol' ? ':' : '';
+            }
+            return values[index];
+          },
+          enumerable: true,
+          configurable: true,
+        };
+        if (name !== 'origin') {
+          descriptor.set = function(value) {
+            // Setting a component with no `href` attribute is a no-op.
+            const href = hrefValue.call(this);
+            if (href === null) return;
+            const result = __tbUrlSetPart(
+              href, base.call(this), index, globalThis.__tbUSVString(value));
+            if (result !== null && result !== undefined) this.setAttribute('href', result);
+          };
+        }
+        Object.defineProperty(proto, name, descriptor);
+      }
+    }
   }
   // `type` reflects the content attribute, limited to only known values
   // (<https://html.spec.whatwg.org/multipage/common-dom-interfaces.html#limited-to-only-known-values>,

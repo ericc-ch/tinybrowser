@@ -2,8 +2,9 @@
 
 use super::{
     FromJs, JsAttr, LegacyNullString, NodeContext, OptString, OptionalTitle, WebIdlString,
+    clone::{import_snapshot, materialize_import},
     create_kind, host_node_id, throw_dom, throw_dom_error, validate_and_extract, world,
-    wrap_new_document,
+    world_for_node, wrap_new_document,
 };
 use rquickjs::function::{Opt, Rest};
 
@@ -77,6 +78,18 @@ impl JsImplementation {
             "http://www.w3.org/2000/svg" => "image/svg+xml",
             _ => "application/xml",
         };
+        // `qualifiedName` validates before the doctype steps run
+        // (<https://dom.spec.whatwg.org/#dom-domimplementation-createdocument>).
+        let root = if qualified.0.is_empty() {
+            None
+        } else {
+            Some(validate_and_extract(
+                &ctx,
+                (!namespace.is_empty()).then_some(namespace.as_str()),
+                &qualified.0,
+                NodeContext::Element,
+            )?)
+        };
         let mut parsed = crate::Parsed::empty(content_type);
         let document = parsed.dom.document();
         if !doctype.is_null()
@@ -88,22 +101,29 @@ impl JsImplementation {
                 "doctype argument is not a DocumentType",
             ));
         }
+        // The argument node itself appends (adopted across arenas), keeping
+        // wrapper identity with the passed doctype.
         if let Some(doctype) = host_node_id(&ctx, &doctype)
-            && let Some((name, public_id, system_id)) = doctype_fields_for(&ctx, doctype)
+            && doctype_fields_for(&ctx, doctype).is_some()
         {
-            let node = parsed.dom.create_doctype(name, public_id, system_id);
-            parsed
-                .dom
-                .append(document, node)
-                .map_err(|err| throw_dom_error(&ctx, err))?;
+            let owner_rc = world_for_node(&ctx, doctype)?;
+            let snapshot = {
+                let owner = owner_rc.borrow();
+                let Some(source) = owner.document(doctype) else {
+                    return Err(Exception::throw_type(&ctx, "no document"));
+                };
+                import_snapshot(&source.dom, doctype, true)
+            };
+            if let Some(snapshot) = snapshot {
+                let node = materialize_import(&mut parsed.dom, &snapshot)
+                    .map_err(|err| throw_dom_error(&ctx, err))?;
+                parsed
+                    .dom
+                    .append(document, node)
+                    .map_err(|err| throw_dom_error(&ctx, err))?;
+            }
         }
-        if !qualified.0.is_empty() {
-            let name = validate_and_extract(
-                &ctx,
-                (!namespace.is_empty()).then_some(namespace.as_str()),
-                &qualified.0,
-                NodeContext::Element,
-            )?;
+        if let Some(name) = root {
             let element = parsed.dom.create_element(name, Vec::new());
             parsed
                 .dom
@@ -206,19 +226,26 @@ fn valid_doctype_name(name: &str) -> bool {
 #[derive(Trace, rquickjs::JsLifetime)]
 #[rquickjs::class(rename = "DOMParser")]
 pub struct JsDomParser {
-    pub(crate) _reserved: Option<Handle>,
+    /// The constructing realm's document URL. `parseFromString` parses with
+    /// the context object's environment settings, not the caller's, so the
+    /// instance remembers it; a directly-reached native cannot forge another
+    /// document's URL either
+    /// (<https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-domparser-parsefromstring>).
+    url: String,
 }
 
 #[rquickjs::methods]
 #[allow(
     clippy::needless_pass_by_value,
     clippy::unused_self,
-    reason = "rquickjs method ABI passes Ctx by value; DOMParser is a stateless constructor"
+    reason = "rquickjs method ABI passes Ctx by value"
 )]
 impl JsDomParser {
     #[qjs(constructor)]
-    fn new() -> Self {
-        Self { _reserved: None }
+    fn new(ctx: Ctx<'_>) -> Result<Self> {
+        Ok(Self {
+            url: world(&ctx)?.borrow().document_url.as_str().to_owned(),
+        })
     }
 
     // https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-domparser-parsefromstring
@@ -234,22 +261,35 @@ impl JsDomParser {
             .copied()
             .find(|valid| *valid == type_.0.as_str())
             .ok_or_else(|| {
-                Exception::throw_message(
+                Exception::throw_type(
                     &ctx,
                     &format!("The provided value '{}' is not a valid enum value", type_.0),
                 )
             })?;
-        let parsed = if content_type == "text/html" {
-            let mut parsed = crate::parse_html(&source.0);
+        // `DOMParser` parses with scripting disabled
+        // (<https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-domparser-parsefromstring>).
+        let mut parsed = if content_type == "text/html" {
+            let mut parsed = crate::parse_html_without_scripting(&source.0);
             parsed.content_type = content_type;
             parsed.ready_state = crate::ReadyState::Complete;
             parsed
         } else {
             crate::xml::parse_document(&source.0, content_type)
         };
+        // The instance's constructing realm decides the URL, never the
+        // caller and never a forged argument: cross-realm method calls parse
+        // with the parser's environment, and the reachable native takes no
+        // URL from script at all.
+        parsed.url = Some(self.url.clone());
         wrap_new_document(&ctx, parsed)
     }
 }
+
+/// Wraps the native `DOMParser` so every instance remembers the URL of the
+/// realm that constructed it; the parsed document takes that URL
+/// (<https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-domparser-parsefromstring>).
+pub(crate) const INSTALL_DOMPARSER_CTOR_JS: &str =
+    include_str!("../scripts/parsing/dom_parser_ctor.js");
 
 /// The `DOMParser` `parseFromString` `SupportedType` values
 /// (<https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-domparser-parsefromstring>).

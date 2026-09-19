@@ -32,6 +32,8 @@ use taffy::{
     Style as TaffyStyle, TaffyTree, TrackSizingFunction,
 };
 
+use dom::NodeId;
+
 use crate::font::Fonts;
 use crate::geometry::{Edges, Rect};
 use crate::layout::{Ctx, LayoutBox, PaintItem, layout_inline_run, min_content_width};
@@ -61,6 +63,8 @@ struct InlineRun<'a> {
 struct NodeData {
     /// Computed style of the originating box.
     style: Style,
+    /// DOM node for this box, when it is an element box.
+    node: Option<NodeId>,
     /// Inline run when this node is a measured leaf.
     leaf: Option<usize>,
 }
@@ -269,6 +273,7 @@ impl<'a> Builder<'a> {
                 std::slice::from_ref(node),
                 node.style.text_align,
                 &node.style,
+                node.node,
             ),
         }
     }
@@ -295,7 +300,7 @@ impl<'a> Builder<'a> {
             }
             ids.push(id);
         }
-        self.parent_node(style, &node.style, &ids)
+        self.parent_node(style, &node.style, &ids, node.node)
     }
 
     /// Adds one grid container and its blockified items.
@@ -311,7 +316,7 @@ impl<'a> Builder<'a> {
             self.apply_grid_placement(id, &child.style, &node.style);
             ids.push(id);
         }
-        self.parent_node(style, &node.style, &ids)
+        self.parent_node(style, &node.style, &ids, node.node)
     }
 
     /// Adds one block container, or one measured leaf when it holds only
@@ -324,14 +329,14 @@ impl<'a> Builder<'a> {
                 .all(|child| !is_block_level(child) || child.style.float != Float::None);
         if inline_only {
             // An inline formatting context: one measured leaf.
-            self.build_leaf(&node.children, node.style.text_align, &node.style)
+            self.build_leaf(&node.children, node.style.text_align, &node.style, node.node)
         } else {
             let style = convert_style(&node.style);
             let mut ids = Vec::with_capacity(node.children.len());
             for child in &node.children {
                 ids.push(self.build_node(child));
             }
-            self.parent_node(style, &node.style, &ids)
+            self.parent_node(style, &node.style, &ids, node.node)
         }
     }
 
@@ -349,12 +354,18 @@ impl<'a> Builder<'a> {
                 std::slice::from_ref(child),
                 container.text_align,
                 &child.style,
+                child.node,
             )
         } else {
             // Bare text and spans: neutral box, inherited text.
             // The leaf style is a local; `build_leaf` copies it.
             let neutral = neutral_item_style(container);
-            self.build_leaf(std::slice::from_ref(child), container.text_align, &neutral)
+            self.build_leaf(
+                std::slice::from_ref(child),
+                container.text_align,
+                &neutral,
+                child.node,
+            )
         }
     }
 
@@ -380,6 +391,7 @@ impl<'a> Builder<'a> {
         style: TaffyStyle,
         ours: &Style,
         children: &[taffy::NodeId],
+        node: Option<NodeId>,
     ) -> taffy::NodeId {
         let id = self
             .tree
@@ -389,6 +401,7 @@ impl<'a> Builder<'a> {
             id,
             NodeData {
                 style: ours.clone(),
+                node,
                 leaf: None,
             },
         );
@@ -401,6 +414,7 @@ impl<'a> Builder<'a> {
         run: &'a [BoxNode],
         text_align: TextAlign,
         style: &Style,
+        node: Option<NodeId>,
     ) -> taffy::NodeId {
         let run_index = self.runs.len();
         self.runs.push(InlineRun {
@@ -420,6 +434,7 @@ impl<'a> Builder<'a> {
             id,
             NodeData {
                 style: style.clone(),
+                node,
                 leaf: Some(run_index),
             },
         );
@@ -494,6 +509,7 @@ impl<'a> Builder<'a> {
         }
         LayoutBox {
             style: data.style,
+            node: data.node,
             rect,
             padding,
             items,

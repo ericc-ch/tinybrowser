@@ -14,8 +14,10 @@ says otherwise.
 
 The tuned profile is `opt-level = "z"`, `lto = "fat"`,
 `codegen-units = 1`, stripped, `panic = "abort"`, plus lld `--icf=all`.
-Those flags live in the root `Cargo.toml` and `.cargo/config.toml` so
-`cargo build --release` matches this research.
+The profile lives in the root `Cargo.toml`; the lld, RELR, and unwind-index
+flags live in `build.rs`, scoped to release binaries, and `tools/ship`
+removes the `.eh_frame` body after the link. `tools/ship` reproduces this
+research.
 
 ## Binding and JS size
 
@@ -74,7 +76,8 @@ panic`) and killed the test binary instead of reporting the failing test; the
 cost of keeping the unwind index in release is 114,352 bytes (the linker also
 re-adds `.eh_frame_hdr` padding). `catch_unwind` and `#[should_panic]` work
 again. Nothing unwinds at runtime under `panic = "abort"` (QuickJS uses
-setjmp/longjmp), so only the shipping binary pays for the index.
+setjmp/longjmp), so only the shipping binary pays for the index. The
+ship-time section below resolves this: the flags are now release-bin only.
 
 Rejected or deferred:
 
@@ -289,3 +292,44 @@ fontconfig, which the dev shell does not carry. The probe also keeps our
 refactor whose size is not counted. The extra budget does buy feature
 surface we lack (tables, replaced content, gradients/radii/shadows,
 stacking contexts), so this is a price for capability, not pure overhead.
+
+## Release-only unwind stripping (2026-09-18)
+
+Stable toolchain, no feature loss, ASLR intact. Measured on the current tree
+(rustc 1.98.1, the tuned profile); the pre-strip binary was 9,547,536
+bytes.
+
+| Lever | Bytes | Delta | Where |
+| --- | ---: | ---: | --- |
+| RELR relative relocations | 8,986,200 | −561,336 | `build.rs` |
+| + release-bin `--no-eh-frame-hdr` | 8,872,168 | −114,032 | `build.rs` |
+| + `tools/ship` drops `.eh_frame` | **8,044,696** | −827,472 | `tools/ship` |
+
+RELR bitmaps the 23,749 `R_X86_64_RELATIVE` entries: `.rela.dyn` 575,496 ->
+5,520 plus 8,040 in `.relr.dyn`. The loader must understand `DT_RELR`
+(glibc 2.36+). This supersedes the rejected `relocation-model=static`
+(−490,568) with a larger win and ASLR intact.
+
+`.eh_frame` is dead weight under `panic = "abort"`: nothing unwinds and
+QuickJS-ng uses setjmp/longjmp. Both unwind levers were previously rejected
+as global flags because they broke dev/test panic reporting; they now apply
+only to the shipping binary. `build.rs` emits lld, `--icf=all`, RELR, and
+`--no-eh-frame-hdr` for release bins, and `tools/ship` removes the
+`.eh_frame` body after linking (checking the section exists, then running
+`--version` on a copy before replacing the artifact).
+
+The flags are release-bin scoped rather than global because rustc 1.98.1
+emits a DWARF relocation (`0x753`) in `icu_experimental` that rust-lld
+rejects; with lld forced onto every link, one cache-invalidating flag change
+broke every debug/test link. The release binary has no `.debug_info`, so it
+is unaffected, and debug/test links stay on the default bfd linker. That
+toolchain coupling is the only one in the set; RELR and the section removal
+are ELF-level and either work or fail loudly at build time.
+
+Validated on the packed binary: daemon plus `/json/version` and `/json/list`,
+Playwright 7/7 including screenshot rendering, and `cargo test --workspace`
+green on the bfd debug path.
+
+Dead end: QuickJS-ng C flags (`-ffunction-sections -fdata-sections
+-fvisibility=hidden -fmerge-all-constants`) grew the binary by 15,616 bytes.
+The C is already `-Os`.

@@ -28,6 +28,7 @@ pub(crate) struct RendererProcessManager {
 
 struct ManagerInner {
     fetch: FetchHandle,
+    browser: crate::browser::BrowserHandle,
     next: AtomicU64,
     next_assignment: AtomicU64,
     slots: Arc<Semaphore>,
@@ -42,10 +43,11 @@ struct ManagerState {
 }
 
 impl RendererProcessManager {
-    pub(crate) fn new(fetch: FetchHandle) -> Self {
+    pub(crate) fn new(fetch: FetchHandle, browser: crate::browser::BrowserHandle) -> Self {
         let manager = Self {
             inner: Arc::new(ManagerInner {
                 fetch,
+                browser,
                 next: AtomicU64::new(1),
                 next_assignment: AtomicU64::new(1),
                 slots: Arc::new(Semaphore::new(renderer_process_limit())),
@@ -184,7 +186,7 @@ async fn spawn_slot(
     };
     let id = RendererId(inner.next.fetch_add(1, Ordering::Relaxed));
     Ok(Some(Arc::new(
-        spawn_process(id, site, inner.fetch.clone(), slot).await?,
+        spawn_process(id, site, inner.fetch.clone(), inner.browser.clone(), slot).await?,
     )))
 }
 

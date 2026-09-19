@@ -54,7 +54,7 @@ use dom::{
 };
 
 use rquickjs::{
-    Class, Ctx, Exception, FromJs, Function, Object, Persistent, Result, Value, class::Trace,
+    Class, Ctx, Exception, FromJs, Function, Object, Persistent, Result, Symbol, Value, class::Trace,
     prelude::This,
 };
 
@@ -164,6 +164,16 @@ impl<'js> rquickjs::FromJs<'js> for OptionalTitle {
 
 impl<'js> rquickjs::FromJs<'js> for WebIdlUnsignedLong {
     fn from_js(ctx: &Ctx<'js>, value: Value<'js>) -> Result<Self> {
+        // The pristine `Number`, captured at install: a page-assigned global
+        // must not hijack `unsigned long` conversion. Conversion errors
+        // propagate; the clobberable global is only a fallback when install
+        // predates the capture.
+        let pristine = world(ctx)?.borrow().pristine_number.clone();
+        if let Some(pristine) = pristine {
+            let to_number: Function = pristine.restore(ctx)?;
+            let number: f64 = to_number.call((value.clone(),))?;
+            return Ok(Self(webidl_unsigned_long(number)));
+        }
         let to_number: Function = ctx.globals().get("Number")?;
         let number: f64 = to_number.call((value,))?;
         Ok(Self(webidl_unsigned_long(number)))
@@ -211,6 +221,7 @@ pub(crate) fn install(ctx: &Ctx<'_>, world: &Rc<RefCell<World>>) -> Result<()> {
     Class::<JsAttr>::define(&globals)?;
     Class::<JsNamedNodeMap>::define(&globals)?;
     Class::<JsDomParser>::define(&globals)?;
+    ctx.eval::<(), _>(parsing::INSTALL_DOMPARSER_CTOR_JS)?;
     Class::<JsXmlSerializer>::define(&globals)?;
     Class::<JsMutationObserver>::define(&globals)?;
     Class::<JsMutationRecord>::define(&globals)?;
@@ -271,11 +282,43 @@ pub(crate) fn install(ctx: &Ctx<'_>, world: &Rc<RefCell<World>>) -> Result<()> {
         "dispatchEvent",
         rquickjs::prelude::Func::from(window_dispatch_event),
     )?;
-    // User-agent delivery for shim-fired events (window.postMessage).
+    // User-agent delivery for shim-fired events (window.postMessage). Page
+    // script must pass the host token our shims close over; without it the
+    // bridge throws instead of forging a trusted event.
     globals.set(
         "__tbDispatchTrusted",
         rquickjs::prelude::Func::from(window_dispatch_trusted_event),
     )?;
+    // Capture pristine intrinsics and the host token before any page script
+    // runs. Conversions and scheduling use these, never `ctx.globals()`,
+    // which page script can clobber.
+    capture_host_primitives(ctx, &globals, world)?;
+    Ok(())
+}
+
+/// Captures the pristine intrinsics and host entry points every later lookup
+/// must use instead of `ctx.globals()`.
+fn capture_host_primitives<'js>(
+    ctx: &Ctx<'js>,
+    globals: &Object<'js>,
+    world: &Rc<RefCell<World>>,
+) -> Result<()> {
+    let string: Function = globals.get("String")?;
+    let number: Function = globals.get("Number")?;
+    let boolean: Function = globals.get("Boolean")?;
+    let deliver: Function = globals.get("__tb_deliver_mutations")?;
+    let token = Symbol::new(ctx.clone())?.into_value();
+    globals.set("__tbHostToken", token.clone())?;
+    let mut world = world.borrow_mut();
+    world.pristine_string = Some(Persistent::save(ctx, string));
+    world.pristine_number = Some(Persistent::save(ctx, number));
+    world.pristine_boolean = Some(Persistent::save(ctx, boolean));
+    world.pristine_queue_microtask = globals
+        .get::<_, Function>("queueMicrotask")
+        .ok()
+        .map(|queue| Persistent::save(ctx, queue));
+    world.deliver_mutations_fn = Some(Persistent::save(ctx, deliver));
+    world.host_token = Some(Persistent::save(ctx, token));
     Ok(())
 }
 
@@ -283,6 +326,26 @@ pub(crate) fn host_node_id<'js>(ctx: &Ctx<'js>, value: &Value<'js>) -> Option<No
     Class::<JsNode>::from_js(ctx, value.clone())
         .ok()
         .map(|node| node.borrow().node_id())
+}
+
+/// Rejects trusted-bridge calls that do not carry the host token our shims
+/// close over. Page script cannot name the token (install deletes the global
+/// after the shims capture it), so only our shims can ask for trusted
+/// dispatch; Rust never goes through the global.
+pub(crate) fn check_host_token<'js>(ctx: &Ctx<'js>, token: &Value<'js>) -> Result<()> {
+    let world_rc = world(ctx)?;
+    let owned = world_rc.borrow().host_token.clone();
+    match owned {
+        Some(expected) => {
+            let expected: Value = expected.restore(ctx)?;
+            if token == &expected {
+                return Ok(());
+            }
+            Err(Exception::throw_type(ctx, "illegal invocation"))
+        }
+        // Install predates the token: accept (yesterday's behavior).
+        None => Ok(()),
+    }
 }
 
 /// The `WebDriver` "element send keys" step: focus the element and append
@@ -351,91 +414,96 @@ pub(super) fn webdriver_element(ctx: Ctx<'_>, remote_id: f64) -> Result<Value<'_
     wrap_node(&ctx, node)
 }
 
-/// Virtual viewport used for element geometry until the engine has layout.
-///
-/// The boxes are a deterministic stand-in, not a layout result: elements are
-/// placed on a 10px grid in document order inside an 800x600 viewport. They
-/// exist so `WebDriver` input targeting (`getClientRects`,
-/// `elementsFromPoint`, `scrollIntoView`) has coherent, unique geometry.
-/// Tests that assert real layout values still fail.
-const VIRTUAL_CELL: f64 = 10.0;
-
-const VIRTUAL_COLUMNS: f64 = 80.0;
-
-/// The virtual box `(left, top, width, height)` for the element at `index`.
-/// Rows keep growing past the viewport so two elements never share a box.
-pub(super) fn virtual_rect(index: f64) -> (f64, f64, f64, f64) {
-    let column = index % VIRTUAL_COLUMNS;
-    let row = (index / VIRTUAL_COLUMNS).floor();
-    let left = column * VIRTUAL_CELL + 1.0;
-    let top = row * VIRTUAL_CELL + 1.0;
-    let size = VIRTUAL_CELL - 2.0;
-    (left, top, size, size)
+/// Every element's border box from the render pipeline's layout, in tree
+/// order. Anonymous boxes carry `node: None`.
+pub(super) fn layout_boxes(ctx: &Ctx<'_>, document: NodeId) -> Result<Vec<render::NodeBox>> {
+    let world = world_for_node(ctx, document)?;
+    let world = world.borrow();
+    let Some(parsed) = world.document(document) else {
+        return Ok(Vec::new());
+    };
+    let sheets = inline_stylesheets(&parsed.dom);
+    let options = render::RenderOptions {
+        width: crate::engine::VIEWPORT_WIDTH,
+        height: crate::engine::VIEWPORT_HEIGHT,
+        scale: 1.0,
+    };
+    Ok(render::layout_boxes(&parsed.dom, &sheets, &options).unwrap_or_default())
 }
 
-/// Document-order index of `node` among the document's elements.
-pub(super) fn element_index(ctx: &Ctx<'_>, node: NodeId) -> Result<Option<f64>> {
-    let world = world_for_node(ctx, node)?;
-    let world = world.borrow();
-    let Some(parsed) = world.document(node) else {
-        return Ok(None);
-    };
-    let root = parsed.dom.document();
-    let mut index = 0.0;
-    // The root itself is a candidate: `element_index` answers for any node,
-    // and `descendants` excludes its scope.
-    for current in std::iter::once(root).chain(parsed.dom.descendants(root)) {
-        if current == node {
-            return Ok(Some(index));
+/// Inline `<style>` text in document order. External sheets are not mirrored
+/// into script geometry yet, so a page styled only by `<link>` lays out
+/// without the author rules.
+fn inline_stylesheets(dom: &dom::Dom) -> Vec<String> {
+    let mut sheets = Vec::new();
+    for node in dom.descendants(dom.document()) {
+        let Some(NodeKind::Element { name, .. }) = dom.kind(node) else {
+            continue;
+        };
+        if name.ns != dom::html_namespace() || name.local.as_ref() != "style" {
+            continue;
         }
-        if is_element(&parsed.dom, current) {
-            index += 1.0;
+        let mut css = String::new();
+        if let Some(children) = dom.children(node) {
+            for &child in children {
+                if let Some(NodeKind::Text { data }) = dom.kind(child) {
+                    css.push_str(data);
+                }
+            }
+        }
+        if !css.trim().is_empty() {
+            sheets.push(css);
         }
     }
-    Ok(None)
+    sheets
 }
 
-/// The deepest element whose virtual box contains the point, if any. This is
-/// the no-layout stand-in for hit testing.
+/// `node`'s border box `(left, top, width, height)` from the current layout,
+/// if it has one.
+pub(super) fn element_box(ctx: &Ctx<'_>, node: NodeId) -> Result<Option<(f64, f64, f64, f64)>> {
+    let boxes = layout_boxes(ctx, node)?;
+    Ok(boxes
+        .into_iter()
+        .find(|item| item.node == Some(node))
+        .map(|item| {
+            (
+                f64::from(item.x),
+                f64::from(item.y),
+                f64::from(item.width),
+                f64::from(item.height),
+            )
+        }))
+}
+
+/// The deepest element whose laid-out border box contains the point, if any.
 pub(super) fn element_at_point(
     ctx: &Ctx<'_>,
     document: NodeId,
     x: f64,
     y: f64,
 ) -> Result<Option<NodeId>> {
-    let world = world_for_node(ctx, document)?;
-    let world = world.borrow();
-    let Some(parsed) = world.document(document) else {
-        return Ok(None);
-    };
-    let mut index = 0.0;
-    let mut best: Option<(usize, NodeId)> = None;
-    let mut stack = vec![(parsed.dom.document(), 0usize)];
-    while let Some((current, depth)) = stack.pop() {
-        if let Some(NodeKind::Element { .. }) = parsed.dom.kind(current) {
-            let (left, top, width, height) = virtual_rect(index);
-            index += 1.0;
-            if x >= left
-                && x < left + width
-                && y >= top
-                && y < top + height
-                && best.is_none_or(|(best_depth, _)| depth > best_depth)
-            {
-                best = Some((depth, current));
-            }
+    let boxes = layout_boxes(ctx, document)?;
+    let mut best = None;
+    for item in boxes {
+        let Some(node) = item.node else {
+            continue;
+        };
+        // Hidden boxes keep their geometry but never win hit testing; the
+        // flat pre-order walk still reaches visible descendants.
+        if !item.visible {
+            continue;
         }
-        if let Some(children) = parsed.dom.children(current) {
-            for child in children.rev() {
-                stack.push((*child, depth + 1));
-            }
+        if x >= f64::from(item.x)
+            && x < f64::from(item.x + item.width)
+            && y >= f64::from(item.y)
+            && y < f64::from(item.y + item.height)
+        {
+            // Tree order is pre-order, so the last containing box is the
+            // deepest one.
+            best = Some(node);
         }
     }
-    Ok(best.map(|(_, node)| node))
-}
-
-pub(super) fn virtual_rect_object<'js>(ctx: &Ctx<'js>, index: f64) -> Result<Object<'js>> {
-    let (left, top, width, height) = virtual_rect(index);
-    rect_object(ctx, left, top, width, height)
+    Ok(best)
 }
 
 pub(super) fn rect_object<'js>(
@@ -1495,6 +1563,68 @@ mod realm_tests {
         }
 
         fn set_cookie(&self, _value: &str, _url: &Url) {}
+
+        fn storage_get(&self, _origin: &str, _key: &str) -> Option<String> {
+            None
+        }
+
+        fn storage_keys(&self, _origin: &str) -> Vec<String> {
+            Vec::new()
+        }
+
+        fn storage_set(
+            &self,
+            _origin: &str,
+            _url: &str,
+            _key: &str,
+            _value: &str,
+            _source: FrameId,
+        ) -> Result<Option<crate::protocol::StorageChange>, crate::protocol::StorageError> {
+            Ok(None)
+        }
+
+        fn storage_remove(
+            &self,
+            _origin: &str,
+            _url: &str,
+            _key: &str,
+            _source: FrameId,
+        ) -> Option<crate::protocol::StorageChange> {
+            None
+        }
+
+        fn storage_clear(
+            &self,
+            _origin: &str,
+            _url: &str,
+            _source: FrameId,
+        ) -> Option<crate::protocol::StorageChange> {
+            None
+        }
+
+        fn window_open(
+            &self,
+            _url: &str,
+            _name: &str,
+            _features: &str,
+            _seed: Option<&crate::protocol::StorageSeed>,
+        ) -> Option<u64> {
+            None
+        }
+
+        fn window_close(&self, _tab: u64) {}
+
+        fn window_opener(&self) -> Option<u64> {
+            None
+        }
+
+        fn window_post_message(&self, _tab: u64, _payload: &str) {}
+
+        fn remote_session_get(&self, _tab: u64, _origin: &str, _key: &str) -> Option<String> {
+            None
+        }
+
+        fn broadcast_post(&self, _origin: &str, _name: &str, _payload: &str, _channel: u64) {}
     }
 
     fn world_with_document(
@@ -1512,6 +1642,8 @@ mod realm_tests {
             documents: Rc::clone(documents),
             registry: Rc::clone(registry),
             shared: Rc::new(RefCell::new(Shared::default())),
+            session_storage: Rc::new(RefCell::new(crate::storage::SessionStorage::default())),
+            pending_storage: Rc::new(RefCell::new(Vec::new())),
         };
         let mut world = World::new(Url::parse(url).expect("test url"), FrameId::MAIN, &runtime);
         let id = world.replace_document(crate::parse_html(html));

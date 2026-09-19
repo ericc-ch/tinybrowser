@@ -7,10 +7,10 @@ Size research lives in [`docs/researches/size-budget.md`](researches/size-budget
 
 Target: under 10MB stripped on x86_64.
 
-9,534,096 bytes (2026-09-18)
+8,300,088 bytes (2026-09-19)
 
 ```sh
-nix develop --command cargo build --release --bin tinybrowser
+nix develop --command ./tools/ship
 stat --format='%n %s' "$(tools/bin --release)"
 ```
 
@@ -87,7 +87,7 @@ nix develop --command ./tools/wpt/score <directory> -- --exclude=worker
 | `document-picture-in-picture/` | unscored |
 | `document-policy/` | unscored |
 | `dom/` | unscored |
-| `domparsing/` | 21.6% |
+| `domparsing/` | 28.4% |
 | `domxpath/` | 5.9% |
 | `dpub-aam/` | unscored |
 | `dpub-aria/` | unscored |
@@ -247,7 +247,7 @@ nix develop --command ./tools/wpt/score <directory> -- --exclude=worker
 | `ua-client-hints/` | unscored |
 | `uievents/` | unscored |
 | `upgrade-insecure-requests/` | unscored |
-| `url/` | 14.3% |
+| `url/` | 51.0% |
 | `urlpattern/` | 0.0% |
 | `user-timing/` | unscored |
 | `vibration/` | unscored |
@@ -276,7 +276,8 @@ nix develop --command ./tools/wpt/score <directory> -- --exclude=worker
 | `webhid/` | unscored |
 | `webidl/` | unscored |
 | `webmcp/` | unscored |
-| `webmessaging/` | 77.9% |
+| `webmessaging/` | 85.5% |
+| `webmessaging/broadcastchannel/` | 41.7% |
 | `webmidi/` | unscored |
 | `webnn/` | unscored |
 | `webrtc/` | unscored |
@@ -288,7 +289,7 @@ nix develop --command ./tools/wpt/score <directory> -- --exclude=worker
 | `webrtc-stats/` | unscored |
 | `webrtc-svc/` | unscored |
 | `websockets/` | unscored |
-| `webstorage/` | 0.0% |
+| `webstorage/` | 87.0% |
 | `webtransport/` | unscored |
 | `webusb/` | unscored |
 | `webvtt/` | unscored |

@@ -1,6 +1,6 @@
 //! `WebIDL` argument conversion helpers.
 
-use super::{host_node_id, throw_dom, throw_dom_error, world};
+use super::{adopt_across_documents, host_node_id, throw_dom, throw_dom_error, world};
 use rquickjs::function::Rest;
 
 use dom::NodeId;
@@ -8,33 +8,41 @@ use dom::NodeId;
 use rquickjs::{Ctx, Exception, Function, Object, Result, Value};
 
 /// Dictionary member truthiness (`ToBoolean`, missing members are false).
-pub(crate) fn option_truthy(options: &Object<'_>, key: &str) -> Result<bool> {
+pub(crate) fn option_truthy<'js>(ctx: &Ctx<'js>, options: &Object<'js>, key: &str) -> Result<bool> {
     let value: Value = options.get(key)?;
     if value.is_undefined() || value.is_null() {
         return Ok(false);
     }
-    Ok(to_boolean(&value))
+    to_boolean(ctx, &value)
 }
 
 /// `WebIDL` `ToBoolean` (<https://webidl.spec.whatwg.org/#es-boolean>).
 ///
-/// A direct ECMAScript conversion, not a call to the page's `Boolean`: the
-/// global can be replaced by page script.
-pub(crate) fn to_boolean(value: &Value<'_>) -> bool {
+/// Primitives convert directly (no user code can run for them); anything else
+/// goes through the pristine `Boolean`, captured at install. A page-assigned
+/// `Boolean` global must not change the answer, and `0n` is the one falsy
+/// bigint.
+pub(crate) fn to_boolean<'js>(ctx: &Ctx<'js>, value: &Value<'js>) -> Result<bool> {
     if let Some(boolean) = value.as_bool() {
-        return boolean;
+        return Ok(boolean);
     }
     if value.is_null() || value.is_undefined() {
-        return false;
+        return Ok(false);
     }
     if let Some(number) = value.as_number() {
-        return number != 0.0 && !number.is_nan();
+        return Ok(number != 0.0 && !number.is_nan());
     }
     if let Some(string) = value.as_string() {
-        return !string.to_string().is_ok_and(|string| string.is_empty());
+        return Ok(!string.to_string().is_ok_and(|string| string.is_empty()));
     }
-    // Objects, symbols, and BigInts; `0n` is the one falsy BigInt.
-    true
+    let world_rc = world(ctx)?;
+    if let Some(boolean) = world_rc.borrow().pristine_boolean.clone() {
+        let boolean: Function = boolean.restore(ctx)?;
+        return boolean.call((value.clone(),));
+    }
+    // Install predates the capture: fall back to the (clobberable) global.
+    let boolean: Function = ctx.globals().get("Boolean")?;
+    boolean.call((value.clone(),))
 }
 
 pub(crate) struct OptString(pub(crate) Option<String>);
@@ -55,8 +63,18 @@ pub(crate) struct OptionalTitle(pub(crate) Option<String>);
 /// (<https://webidl.spec.whatwg.org/#es-unsigned-long>).
 pub(crate) struct WebIdlUnsignedLong(pub(crate) u32);
 
-/// `ToString` without a raw conversion API: call the global `String`.
+/// `ToString` through the pristine `String`, captured at install: a
+/// page-assigned global must not hijack `DOMString` conversion or re-enter
+/// Rust through it.
 pub(crate) fn webidl_to_string<'js>(ctx: &Ctx<'js>, value: Value<'js>) -> Result<String> {
+    if let Ok(world_rc) = world(ctx)
+        && let Some(to_string) = world_rc.borrow().pristine_string.clone()
+    {
+        let to_string: Function = to_string.restore(ctx)?;
+        let text: rquickjs::String = to_string.call((value,))?;
+        return text.to_string();
+    }
+    // Install predates the capture: fall back to the (clobberable) global.
     let to_string: Function = ctx.globals().get("String")?;
     let text: rquickjs::String = to_string.call((value,))?;
     text.to_string()
@@ -64,38 +82,53 @@ pub(crate) fn webidl_to_string<'js>(ctx: &Ctx<'js>, value: Value<'js>) -> Result
 
 /// [Converting nodes into a node](https://dom.spec.whatwg.org/#convert-nodes-into-a-node):
 /// strings become `Text`, one node stays itself, several become a fragment.
+/// Cross-document nodes adopt into the target document instead of throwing.
+/// Strings convert before any DOM borrow is held: `ToString` runs page code,
+/// which must not observe or re-enter a half-built fragment.
 pub(crate) fn convert_nodes_into_node<'js>(
     ctx: &Ctx<'js>,
     document: NodeId,
     nodes: Rest<Value<'js>>,
 ) -> Result<NodeId> {
+    enum Piece {
+        Node(NodeId),
+        Text(String),
+    }
+    // Phase one, throwing conversions only: every string converts before any
+    // node moves, so a throwing `ToString` leaves no half-adopted tree behind.
+    let mut pieces = Vec::with_capacity(nodes.0.len());
+    for value in nodes.0 {
+        if let Some(id) = host_node_id(ctx, &value) {
+            pieces.push(Piece::Node(id));
+        } else {
+            pieces.push(Piece::Text(webidl_to_string(ctx, value)?));
+        }
+    }
+    // Phase two, adoptions.
+    for piece in &mut pieces {
+        if let Piece::Node(id) = piece {
+            *id = adopt_across_documents(ctx, document, *id)?;
+        }
+    }
     let world = world(ctx)?;
     let world = world.borrow();
     let Some(mut parsed) = world.document_mut(document) else {
         return Err(Exception::throw_type(ctx, "no document"));
     };
     let dom = &mut parsed.dom;
-    let mut ids: Vec<NodeId> = Vec::with_capacity(nodes.0.len());
-    for value in nodes.0 {
-        if let Some(id) = host_node_id(ctx, &value) {
-            if id.document_id() != document.document_id() {
-                return Err(throw_dom(
-                    ctx,
-                    "HierarchyRequestError",
-                    "nodes belong to different documents",
-                ));
-            }
-            ids.push(id);
-        } else {
-            let text = webidl_to_string(ctx, value)?;
-            ids.push(dom.create_text(text));
-        }
-    }
-    if ids.len() == 1 {
-        return Ok(ids[0]);
+    if pieces.len() == 1 {
+        return match pieces.pop() {
+            Some(Piece::Node(id)) => Ok(id),
+            Some(Piece::Text(text)) => Ok(dom.create_text(text)),
+            None => Err(Exception::throw_internal(ctx, "empty node list")),
+        };
     }
     let fragment = dom.create_fragment();
-    for id in ids {
+    for piece in pieces {
+        let id = match piece {
+            Piece::Node(id) => id,
+            Piece::Text(text) => dom.create_text(text),
+        };
         dom.append(fragment, id)
             .map_err(|err| throw_dom_error(ctx, err))?;
     }

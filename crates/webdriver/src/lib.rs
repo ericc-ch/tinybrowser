@@ -17,18 +17,10 @@ use browser::{
     BrowserHandle, CookieRecord, CookieSameSite, RemoteValue, ScreenshotRequest, ScriptFailure,
     TabError, TabHandle,
 };
-use bytes::Bytes;
-use http::{HeaderValue, StatusCode, header};
-use http_body_util::{BodyExt as _, Full};
-use hyper::body::Incoming;
-use hyper::service::service_fn;
-use hyper::{Request, Response};
-use hyper_util::rt::{TokioExecutor, TokioIo};
-use hyper_util::server::conn::auto::Builder;
+use http::StatusCode;
 use serde_json::{Value, json};
+use server::{Request, Response, Shutdown};
 use tokio::sync::Mutex;
-
-pub use browser::AgentBuilder;
 
 /// Virtual viewport for screenshots, matching the renderer's `innerWidth`.
 const VIEWPORT_WIDTH: f32 = 800.0;
@@ -46,42 +38,15 @@ const DEFAULT_PAGE_LOAD_TIMEOUT: Duration = Duration::from_secs(300);
 /// # Errors
 ///
 /// Returns when the listener cannot be converted or serving fails.
-pub async fn serve(listener: &TcpListener, browser: BrowserHandle) -> std::io::Result<()> {
-    let std_listener = listener.try_clone()?;
-    std_listener.set_nonblocking(true)?;
+pub async fn serve(listener: &TcpListener, browser: &BrowserHandle) -> std::io::Result<()> {
     let sessions = Arc::new(Mutex::new(Sessions {
-        browser,
+        browser: browser.clone(),
         next_session: 0,
         next_window: 0,
         open: HashMap::new(),
     }));
-    let listener = tokio::net::TcpListener::from_std(std_listener)?;
     let state = AppState { sessions };
-    loop {
-        let (stream, _) = match listener.accept().await {
-            Ok(accepted) => accepted,
-            Err(error) => {
-                // axum retried transient accept failures (EMFILE and friends)
-                // instead of dropping the listener; mirror that with backoff.
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                let _ = error;
-                continue;
-            }
-        };
-        let state = state.clone();
-        tokio::spawn(async move {
-            let service = service_fn(move |request| {
-                let state = state.clone();
-                async move { Ok::<_, std::convert::Infallible>(serve_request(request, state).await) }
-            });
-            let mut auto = Builder::new(TokioExecutor::new());
-            // CONNECT protocol for HTTP/2 websockets; the old axum build was
-            // h1-only, so this widens the loopback listener.
-            auto.http2().enable_connect_protocol();
-            let connection = auto.serve_connection_with_upgrades(TokioIo::new(stream), service);
-            let _result = connection.await;
-        });
-    }
+    server::serve(listener, Shutdown::new(), state, serve_request).await
 }
 
 #[derive(Clone)]
@@ -89,52 +54,25 @@ struct AppState {
     sessions: Arc<Mutex<Sessions>>,
 }
 
-/// Axum's `Bytes` extractor caps bodies at 2 MiB while reading; the same cap
-/// is enforced during collection here.
+/// The body cap the served endpoints accept before answering 413.
 const MAX_BODY_BYTES: usize = 2 * 1024 * 1024;
 
-async fn serve_request(request: Request<Incoming>, state: AppState) -> Response<Full<Bytes>> {
+async fn serve_request(request: Request, state: AppState) -> Response {
     let method = request.method().as_str().to_owned();
     let path = request.uri().path().to_owned();
-    let limited = http_body_util::Limited::new(request.into_body(), MAX_BODY_BYTES);
-    let body = match limited.collect().await {
-        Ok(collected) => collected.to_bytes(),
-        Err(error) => {
-            if error
-                .downcast_ref::<http_body_util::LengthLimitError>()
-                .is_some()
-            {
-                return status_response(StatusCode::PAYLOAD_TOO_LARGE, "request body too large");
-            }
-            return status_response(StatusCode::BAD_REQUEST, "invalid request body");
+    let body = match server::read_body(request.into_body(), MAX_BODY_BYTES).await {
+        Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+        Err(server::BodyError::TooLarge) => {
+            return server::text(StatusCode::PAYLOAD_TOO_LARGE, "request body too large");
+        }
+        Err(server::BodyError::Read) => {
+            return server::text(StatusCode::BAD_REQUEST, "invalid request body");
         }
     };
-    let body = String::from_utf8_lossy(&body).into_owned();
     let mut sessions = state.sessions.lock().await;
     let (status, payload) = dispatch(&method, &path, &body, &mut sessions).await;
     let status = StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-    json_response(status, &payload)
-}
-
-fn status_response(status: StatusCode, message: &'static str) -> Response<Full<Bytes>> {
-    let mut response = Response::new(Full::new(Bytes::from(message)));
-    *response.status_mut() = status;
-    response.headers_mut().insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static("text/plain; charset=utf-8"),
-    );
-    response
-}
-
-fn json_response(status: StatusCode, payload: &Value) -> Response<Full<Bytes>> {
-    let mut response = Response::new(Full::new(Bytes::from(payload.to_string())));
-    *response.status_mut() = status;
-    // W3C WebDriver JSON is UTF-8; the charset is part of the wire surface.
-    response.headers_mut().insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static("application/json; charset=utf-8"),
-    );
-    response
+    server::json(status, &payload)
 }
 
 struct Sessions {
@@ -152,6 +90,9 @@ struct Session {
     /// Virtual window rectangle. The engine has no window system, so
     /// `Set Window Rect` records the request and reports it back.
     window_rect: [f64; 4],
+    /// Recorded permission states by descriptor name. Nothing enforces them
+    /// yet; recording makes success mean the state was stored.
+    permissions: HashMap<String, String>,
 }
 
 struct Window {
@@ -186,6 +127,7 @@ impl Sessions {
                 script_timeout: DEFAULT_SCRIPT_TIMEOUT,
                 page_load_timeout: DEFAULT_PAGE_LOAD_TIMEOUT,
                 window_rect: [0.0, 0.0, 800.0, 600.0],
+                permissions: HashMap::new(),
             },
         );
         Ok(id)
@@ -228,6 +170,7 @@ async fn dispatch(method: &str, path: &str, body: &str, sessions: &mut Sessions)
         }
         ("POST", ["session", session, "timeouts"]) => set_timeouts(sessions, session, body),
         ("GET", ["session", session, "timeouts"]) => get_timeouts(sessions, session),
+        ("POST", ["session", session, "permissions"]) => set_permission(sessions, session, body),
         ("POST", ["session", session, "element"]) => find_element(sessions, session, body).await,
         ("POST", ["session", session, "elements"]) => find_elements(sessions, session, body).await,
         ("POST", ["session", session, "element", element, "click"]) => {
@@ -250,9 +193,7 @@ async fn dispatch(method: &str, path: &str, body: &str, sessions: &mut Sessions)
         {
             window_op(sessions, session)
         }
-        ("POST", ["session", _session, "actions"]) => {
-            error(500, "unsupported operation", "actions")
-        }
+        ("POST", ["session", session, "actions"]) => perform_actions(sessions, session, body).await,
         // Release Actions ([WebDriver] release-actions). No input state can
         // exist while Perform Actions is unsupported, so releasing is a no-op.
         ("DELETE", ["session", session, "actions"]) => {
@@ -676,6 +617,89 @@ async fn element_send_keys(
     match window.tab.execute_script(&script).await {
         Ok(RemoteValue::Bool(true)) => ok(Value::Null),
         Ok(_) => error(404, "no such element", "unknown element id"),
+        Err(err) => script_error(&err),
+    }
+}
+
+/// `POST /session/{id}/permissions` (`WebDriver` permissions extension).
+///
+/// Validates the descriptor and state, then records the state on the session.
+/// Nothing enforces permissions yet; success means the state was stored, not
+/// that it takes effect
+/// (<https://w3c.github.io/permissions/#webdriver-command-set-permission>).
+fn set_permission(sessions: &mut Sessions, session: &str, body: &str) -> (u16, Value) {
+    let parsed: Value = match serde_json::from_str(body) {
+        Ok(value) => value,
+        Err(err) => return error(400, "invalid argument", &err.to_string()),
+    };
+    let Some(name) = parsed
+        .get("descriptor")
+        .and_then(|descriptor| descriptor.get("name"))
+        .and_then(Value::as_str)
+        .filter(|name| !name.is_empty())
+    else {
+        return error(400, "invalid argument", "descriptor.name is required");
+    };
+    let Some(state) = parsed.get("state").and_then(Value::as_str) else {
+        return error(400, "invalid argument", "state is required");
+    };
+    if !matches!(state, "granted" | "denied" | "prompt") {
+        return error(400, "invalid argument", "unknown permission state");
+    }
+    let Some(entry) = sessions.open.get_mut(session) else {
+        return error(404, "invalid session id", session);
+    };
+    entry.permissions.insert(name.to_owned(), state.to_owned());
+    ok(Value::Null)
+}
+
+/// `POST /session/{id}/actions` (Perform Actions)
+/// (<https://w3c.github.io/webdriver/#perform-actions>).
+///
+/// Element origins are resolved against the current window and rewritten to
+/// the engine's remote element number; the page-side performer then runs the
+/// tick sequence.
+async fn perform_actions(sessions: &Sessions, session: &str, body: &str) -> (u16, Value) {
+    let parsed: Value = match serde_json::from_str(body) {
+        Ok(value) => value,
+        Err(err) => return error(400, "invalid argument", &err.to_string()),
+    };
+    let Some(sources) = parsed.get("actions").and_then(Value::as_array) else {
+        return error(400, "invalid argument", "actions is required");
+    };
+    let Some(window) = current(sessions, session) else {
+        return error(404, "invalid session id", session);
+    };
+    let mut resolved = Vec::with_capacity(sources.len());
+    for source in sources {
+        let mut source = source.clone();
+        if let Some(items) = source.get_mut("actions").and_then(Value::as_array_mut) {
+            for item in items {
+                let Some(origin) = item.get_mut("origin") else {
+                    continue;
+                };
+                let Some(element) = origin.get(ELEMENT_KEY).and_then(Value::as_str) else {
+                    continue;
+                };
+                let (handle, remote) = match element_remote(element) {
+                    Ok(remote) => remote,
+                    Err(reply) => return reply,
+                };
+                if !is_current_handle(sessions, session, handle) {
+                    return error(404, "no such element", "element belongs to another window");
+                }
+                *origin = json!({"__tbRemote": remote});
+            }
+        }
+        resolved.push(source);
+    }
+    let script = format!(
+        "(function(){{return globalThis.__tbWebDriverActions({});}})()",
+        serde_json::to_string(&Value::Array(resolved)).unwrap_or_else(|_| "[]".to_owned())
+    );
+    match window.tab.execute_script(&script).await {
+        Ok(RemoteValue::Bool(true)) => ok(Value::Null),
+        Ok(_) => error(500, "unknown error", "actions were not performed"),
         Err(err) => script_error(&err),
     }
 }

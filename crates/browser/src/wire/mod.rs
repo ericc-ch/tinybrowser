@@ -15,7 +15,8 @@ pub mod channel;
 use serde::{Deserialize, Serialize};
 
 use renderer::{
-    DialFailure, DialOutcome, DialRequest, FrameId, Mount, RemoteValue, TabError, TabEvent,
+    DialFailure, DialOutcome, DialRequest, FrameId, Mount, RemoteValue, StorageChange,
+    StorageError, StorageKind, StorageSeed, TabError, TabEvent,
 };
 
 /// Browser-minted identity of one top-level document hosted by a renderer.
@@ -71,6 +72,23 @@ pub enum Command {
     },
     /// Stop the renderer loop.
     Shutdown,
+    /// Delivers one remote `message` event, encoded by the sender's realm.
+    WindowMessage {
+        /// `__tbEncode` payload from the posting window.
+        payload: String,
+    },
+    /// Copies one `sessionStorage` seed into the engine.
+    SeedSession {
+        /// The opener's session area for one origin.
+        seed: StorageSeed,
+    },
+    /// Reads one key of this engine's session area for `origin`.
+    RemoteSessionGet {
+        /// Serialized origin of the calling document.
+        origin: String,
+        /// Item key, encoded by the calling realm.
+        key: String,
+    },
 }
 
 /// Renderer reply to one [`Command`].
@@ -82,6 +100,8 @@ pub enum Reply {
     Text(Result<String, TabError>),
     /// Value-only script result.
     Value(Result<RemoteValue, TabError>),
+    /// Optional string result (`RemoteSessionGet`).
+    Optional(Option<String>),
     /// A PNG follows in body frames for this request id; `len` is its exact
     /// byte length. The JSON control plane never carries the bytes.
     Screenshot {
@@ -140,6 +160,39 @@ pub enum ToRenderer {
         id: u64,
         /// The answer.
         reply: ServiceReply,
+    },
+    /// One `localStorage` change another renderer made; every frame of
+    /// `origin` except the source window fires a `storage` event
+    /// (<https://html.spec.whatwg.org/multipage/webstorage.html#concept-storage-broadcast>).
+    StorageEvent {
+        /// Serialized origin whose area changed.
+        origin: String,
+        /// Which area changed.
+        kind: StorageKind,
+        /// The changed key, or `None` for `clear()`.
+        key: Option<String>,
+        /// The value before the change.
+        old_value: Option<String>,
+        /// The value after the change.
+        new_value: Option<String>,
+        /// URL of the document whose script made the change.
+        url: String,
+        /// The assignment and frame whose script made the change. Only the
+        /// matching assignment excludes the frame; other renderers and
+        /// assignments see a change with no local source.
+        source: Option<(RendererAssignmentId, FrameId)>,
+    },
+    /// One same-origin `BroadcastChannel` message.
+    BroadcastMessage {
+        /// Serialized origin whose channels receive it.
+        origin: String,
+        /// Channel name.
+        name: String,
+        /// `__tbEncode` payload from the posting realm.
+        payload: String,
+        /// The posting assignment and channel; the matching assignment skips
+        /// that channel.
+        source: Option<(RendererAssignmentId, u64)>,
     },
 }
 
@@ -222,6 +275,96 @@ pub enum ServiceCall {
         /// Document URL.
         url: String,
     },
+    /// `localStorage.getItem(key)`.
+    StorageGet {
+        /// Serialized origin of the calling document.
+        origin: String,
+        /// Item key.
+        key: String,
+    },
+    /// Every key of one origin's local storage area.
+    StorageKeys {
+        /// Serialized origin of the calling document.
+        origin: String,
+    },
+    /// `localStorage.setItem(key, value)`.
+    StorageSet {
+        /// Serialized origin of the calling document.
+        origin: String,
+        /// Calling document URL; the `storage` event reports it.
+        url: String,
+        /// Item key.
+        key: String,
+        /// Item value.
+        value: String,
+        /// Frame whose script made the change.
+        source: FrameId,
+    },
+    /// `localStorage.removeItem(key)`.
+    StorageRemove {
+        /// Serialized origin of the calling document.
+        origin: String,
+        /// Calling document URL.
+        url: String,
+        /// Item key.
+        key: String,
+        /// Frame whose script made the change.
+        source: FrameId,
+    },
+    /// `localStorage.clear()`.
+    StorageClear {
+        /// Serialized origin of the calling document.
+        origin: String,
+        /// Calling document URL.
+        url: String,
+        /// Frame whose script made the change.
+        source: FrameId,
+    },
+    /// `window.open(url, target, features)`.
+    WindowOpen {
+        /// Absolute URL to load, or empty for `about:blank`.
+        url: String,
+        /// Browsing context name.
+        name: String,
+        /// Feature string from the caller.
+        features: String,
+        /// Session copy for the new tab, when the opener sent one.
+        seed: Option<StorageSeed>,
+    },
+    /// `window.close()` on a window this renderer opened.
+    WindowClose {
+        /// Browser-minted tab identity.
+        tab: u64,
+    },
+    /// `window.opener` for this assignment's tab.
+    Opener,
+    /// `postMessage` to a window this renderer opened.
+    WindowMessage {
+        /// Target tab identity.
+        tab: u64,
+        /// `__tbEncode` payload from the sender's realm.
+        payload: String,
+    },
+    /// Reads one key of another tab's session area for `origin`.
+    RemoteSessionGet {
+        /// Target tab identity.
+        tab: u64,
+        /// Serialized origin of the calling document.
+        origin: String,
+        /// Item key, encoded by the calling realm.
+        key: String,
+    },
+    /// One `BroadcastChannel.postMessage` for every same-origin channel.
+    BroadcastPost {
+        /// Serialized origin of the posting document.
+        origin: String,
+        /// Channel name.
+        name: String,
+        /// `__tbEncode` payload from the posting realm.
+        payload: String,
+        /// Posting realm's channel id, so the sender is skipped.
+        channel: u64,
+    },
 }
 
 /// Answer to a [`ServiceCall`].
@@ -231,6 +374,14 @@ pub enum ServiceReply {
     Dial(Result<DialOutcome, DialFailure>),
     /// Cookie getter result.
     Cookie(String),
+    /// Local storage getter result.
+    StorageValue(Option<String>),
+    /// Local storage key list, in iteration order.
+    StorageKeys(Vec<String>),
+    /// Local storage mutation result; `Ok(None)` means nothing changed.
+    StorageChanged(Result<Option<StorageChange>, StorageError>),
+    /// `window.open` result: the new tab, or `None` when it was refused.
+    Window(Option<u64>),
     /// No payload (`CookieSet`).
     Unit,
 }
@@ -307,6 +458,13 @@ mod tests {
                 assignment: RendererAssignmentId::new(1),
                 command: Command::Shutdown,
             },
+            ToRenderer::Request {
+                id: 7,
+                assignment: RendererAssignmentId::new(1),
+                command: Command::WindowMessage {
+                    payload: "tb1:null".into(),
+                },
+            },
             ToRenderer::ResponseStart {
                 id: 10,
                 response: ResponseStart {
@@ -323,9 +481,51 @@ mod tests {
                 id: 11,
                 failure: DialFailure::Timeout,
             },
+        ];
+        for message in messages {
+            round_trip(&message);
+        }
+    }
+
+    #[test]
+    fn host_to_renderer_service_messages_round_trip() {
+        let messages = [
             ToRenderer::ServiceReply {
                 id: 7,
                 reply: ServiceReply::Cookie("a=1".into()),
+            },
+            ToRenderer::ServiceReply {
+                id: 12,
+                reply: ServiceReply::StorageValue(Some("v".into())),
+            },
+            ToRenderer::ServiceReply {
+                id: 13,
+                reply: ServiceReply::StorageKeys(vec!["k".into()]),
+            },
+            ToRenderer::ServiceReply {
+                id: 14,
+                reply: ServiceReply::StorageChanged(Ok(Some(StorageChange {
+                    key: Some("k".into()),
+                    old_value: None,
+                    new_value: Some("v".into()),
+                }))),
+            },
+            ToRenderer::ServiceReply {
+                id: 15,
+                reply: ServiceReply::StorageChanged(Err(StorageError::QuotaExceeded)),
+            },
+            ToRenderer::ServiceReply {
+                id: 17,
+                reply: ServiceReply::Window(Some(3)),
+            },
+            ToRenderer::StorageEvent {
+                origin: "http://example.test".into(),
+                kind: StorageKind::Local,
+                key: Some("k".into()),
+                old_value: None,
+                new_value: Some("v".into()),
+                url: "http://example.test/".into(),
+                source: Some((RendererAssignmentId::new(1), FrameId::MAIN)),
             },
             ToRenderer::ServiceReply {
                 id: 8,
@@ -340,6 +540,50 @@ mod tests {
             ToRenderer::ServiceReply {
                 id: 9,
                 reply: ServiceReply::Unit,
+            },
+        ];
+        for message in messages {
+            round_trip(&message);
+        }
+    }
+
+    #[test]
+    fn host_to_renderer_session_commands_round_trip() {
+        let messages = [
+            ToRenderer::Request {
+                id: 20,
+                assignment: RendererAssignmentId::new(1),
+                command: Command::WindowMessage {
+                    payload: "tb1:null".into(),
+                },
+            },
+            ToRenderer::Request {
+                id: 21,
+                assignment: RendererAssignmentId::new(1),
+                command: Command::SeedSession {
+                    seed: StorageSeed {
+                        origin: "http://example.test".into(),
+                        entries: vec![("\"k\"".into(), "\"v\"".into())],
+                    },
+                },
+            },
+            ToRenderer::Request {
+                id: 22,
+                assignment: RendererAssignmentId::new(1),
+                command: Command::RemoteSessionGet {
+                    origin: "http://example.test".into(),
+                    key: "\"k\"".into(),
+                },
+            },
+            ToRenderer::ServiceReply {
+                id: 23,
+                reply: ServiceReply::StorageValue(Some("\"v\"".into())),
+            },
+            ToRenderer::BroadcastMessage {
+                origin: "http://example.test".into(),
+                name: "chan".into(),
+                payload: "tb1:null".into(),
+                source: Some((RendererAssignmentId::new(1), 4)),
             },
         ];
         for message in messages {
@@ -400,6 +644,15 @@ mod tests {
                 frame: FrameId::MAIN,
                 event: TabEvent::Fetch { status: 404 },
             },
+        ];
+        for message in messages {
+            round_trip(&message);
+        }
+    }
+
+    #[test]
+    fn renderer_to_host_service_calls_round_trip() {
+        let messages = [
             FromRenderer::ServiceCall {
                 assignment: RendererAssignmentId::new(1),
                 id: 6,
@@ -423,6 +676,119 @@ mod tests {
                 call: ServiceCall::CookieSet {
                     value: "a=1".into(),
                     url: "http://example.test/".into(),
+                },
+            },
+        ];
+        for message in messages {
+            round_trip(&message);
+        }
+    }
+
+    #[test]
+    fn renderer_to_host_storage_calls_round_trip() {
+        let messages = [
+            FromRenderer::ServiceCall {
+                assignment: RendererAssignmentId::new(1),
+                id: 10,
+                call: ServiceCall::StorageGet {
+                    origin: "http://example.test".into(),
+                    key: "k".into(),
+                },
+            },
+            FromRenderer::ServiceCall {
+                assignment: RendererAssignmentId::new(1),
+                id: 11,
+                call: ServiceCall::StorageKeys {
+                    origin: "http://example.test".into(),
+                },
+            },
+            FromRenderer::ServiceCall {
+                assignment: RendererAssignmentId::new(1),
+                id: 12,
+                call: ServiceCall::StorageSet {
+                    origin: "http://example.test".into(),
+                    url: "http://example.test/".into(),
+                    key: "k".into(),
+                    value: "v".into(),
+                    source: FrameId::MAIN,
+                },
+            },
+            FromRenderer::ServiceCall {
+                assignment: RendererAssignmentId::new(1),
+                id: 13,
+                call: ServiceCall::StorageRemove {
+                    origin: "http://example.test".into(),
+                    url: "http://example.test/".into(),
+                    key: "k".into(),
+                    source: FrameId::MAIN,
+                },
+            },
+            FromRenderer::ServiceCall {
+                assignment: RendererAssignmentId::new(1),
+                id: 14,
+                call: ServiceCall::StorageClear {
+                    origin: "http://example.test".into(),
+                    url: "http://example.test/".into(),
+                    source: FrameId::MAIN,
+                },
+            },
+        ];
+        for message in messages {
+            round_trip(&message);
+        }
+    }
+
+    #[test]
+    fn renderer_to_host_window_calls_round_trip() {
+        let messages = [
+            FromRenderer::ServiceCall {
+                assignment: RendererAssignmentId::new(1),
+                id: 15,
+                call: ServiceCall::WindowOpen {
+                    url: "http://example.test/".into(),
+                    name: "popup".into(),
+                    features: "noopener".into(),
+                    seed: Some(StorageSeed {
+                        origin: "http://example.test".into(),
+                        entries: vec![("\"k\"".into(), "\"v\"".into())],
+                    }),
+                },
+            },
+            FromRenderer::ServiceCall {
+                assignment: RendererAssignmentId::new(1),
+                id: 16,
+                call: ServiceCall::WindowClose { tab: 3 },
+            },
+            FromRenderer::ServiceCall {
+                assignment: RendererAssignmentId::new(1),
+                id: 17,
+                call: ServiceCall::Opener,
+            },
+            FromRenderer::ServiceCall {
+                assignment: RendererAssignmentId::new(1),
+                id: 18,
+                call: ServiceCall::WindowMessage {
+                    tab: 3,
+                    payload: "tb1:null".into(),
+                },
+            },
+            FromRenderer::ServiceCall {
+                assignment: RendererAssignmentId::new(1),
+                id: 19,
+                call: ServiceCall::RemoteSessionGet {
+                    tab: 3,
+                    origin: "http://example.test".into(),
+                    key: "\"k\"".into(),
+                },
+            },
+            FromRenderer::ServiceCall {
+                assignment: RendererAssignmentId::new(1),
+                id: 20,
+                call: ServiceCall::BroadcastPost {
+                    origin: "http://example.test".into(),
+                    name: "chan".into(),
+                    payload: "tb1:null".into(),
+                    channel: 4,
                 },
             },
         ];

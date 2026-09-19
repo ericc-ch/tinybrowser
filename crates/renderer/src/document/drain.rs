@@ -124,6 +124,14 @@ impl Document {
             Task::DialFinished(done) => self.finish_dial(done),
             Task::DialFailed(fail) => self.fail_dial(fail),
             Task::WindowMessage(message) => self.deliver_window_message(&message),
+            Task::StorageEvent(event) => self.deliver_storage_event(&event),
+            Task::RemoteMessage(payload) => self.deliver_remote_message(&payload),
+            Task::BroadcastMessage {
+                origin,
+                name,
+                payload,
+                source,
+            } => self.deliver_broadcast_message(&origin, &name, &payload, source),
             Task::PortMessage {
                 endpoint,
                 payload,

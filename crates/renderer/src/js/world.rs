@@ -10,7 +10,8 @@ use url::Url;
 
 use crate::document::{Document, FrameRuntime};
 use crate::messaging::{MAX_FRAMES, SharedHandle};
-use crate::protocol::FrameId;
+use crate::protocol::{FrameId, StorageChange, StorageError, StorageKind};
+use crate::storage::PendingStorageEvent;
 use crate::{Parsed, ReadyState};
 
 /// Renderer-process realm bookkeeping shared by every frame.
@@ -249,6 +250,23 @@ pub(crate) struct ObjectUrlEntry {
     pub(crate) content_type: Rc<str>,
 }
 
+/// One lazily-created sub-object cached per node.
+///
+/// Each interface creates its platform object once per element, so
+/// `element.classList === element.classList`; the cache is keyed by node and
+/// interface and cleared whenever the realm's wrappers are invalidated.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum Wrapper {
+    /// `Element.classList`.
+    TokenList,
+    /// `Element.attributes`.
+    NamedNodeMap,
+    /// `HTMLElement.style`.
+    StyleDeclaration,
+    /// `HTMLElement.dataset`.
+    Dataset,
+}
+
 pub(crate) struct World {
     /// The handles every frame of this renderer process shares: trees,
     /// registry and wrapper cache, ports, JS heap, wake handle, and stop flag.
@@ -281,10 +299,9 @@ pub(crate) struct World {
     /// The `EventTarget` object behind each `EventTargetKey::Standalone`.
     standalone_targets: HashMap<u64, Persistent<Object<'static>>>,
     next_standalone_target: u64,
-    token_lists: HashMap<NodeId, Persistent<Value<'static>>>,
-    named_node_maps: HashMap<NodeId, Persistent<Value<'static>>>,
-    style_declarations: HashMap<NodeId, Persistent<Value<'static>>>,
-    datasets: HashMap<NodeId, Persistent<Value<'static>>>,
+    /// Lazily-created platform objects whose identity is one per (node,
+    /// interface), so `element.classList === element.classList` and friends.
+    wrappers: HashMap<(NodeId, Wrapper), Persistent<Value<'static>>>,
     implementations: HashMap<u32, Persistent<Value<'static>>>,
     /// The focused element of each document
     /// (<https://html.spec.whatwg.org/multipage/interaction.html#focused-area-of-the-document>).
@@ -321,6 +338,22 @@ pub(crate) struct World {
     pub(crate) observers: HashMap<u64, ObserverState>,
     pub(crate) next_observer_id: u64,
     pub(crate) delivery_scheduled: bool,
+    /// Pristine intrinsics captured at install, before page script runs.
+    /// `WebIDL` conversions and scheduling must use these, never
+    /// `ctx.globals()`: a page that replaces `String`/`Number`/`Boolean` (or
+    /// deletes `queueMicrotask`) must not change conversion behavior, which
+    /// follows the realm's original intrinsics.
+    pub(crate) pristine_string: Option<Persistent<Function<'static>>>,
+    pub(crate) pristine_number: Option<Persistent<Function<'static>>>,
+    pub(crate) pristine_boolean: Option<Persistent<Function<'static>>>,
+    pub(crate) pristine_queue_microtask: Option<Persistent<Function<'static>>>,
+    /// The realm's own mutation-delivery entry point, so scheduling never
+    /// depends on a page-deletable global.
+    pub(crate) deliver_mutations_fn: Option<Persistent<Function<'static>>>,
+    /// Unforgeable token for the trusted-event bridge: our shims close over
+    /// a copy, page script cannot name it, and the bridge rejects calls made
+    /// without it.
+    pub(crate) host_token: Option<Persistent<Value<'static>>>,
 }
 
 impl Drop for World {
@@ -368,10 +401,7 @@ impl World {
             listeners: HashMap::new(),
             standalone_targets: HashMap::new(),
             next_standalone_target: 0,
-            token_lists: HashMap::new(),
-            named_node_maps: HashMap::new(),
-            style_declarations: HashMap::new(),
-            datasets: HashMap::new(),
+            wrappers: HashMap::new(),
             implementations: HashMap::new(),
             active_elements: HashMap::new(),
             clicks_in_progress: HashSet::new(),
@@ -389,6 +419,12 @@ impl World {
             observers: HashMap::new(),
             next_observer_id: 0,
             delivery_scheduled: false,
+            pristine_string: None,
+            pristine_number: None,
+            pristine_boolean: None,
+            pristine_queue_microtask: None,
+            deliver_mutations_fn: None,
+            host_token: None,
         }
     }
 
@@ -440,16 +476,21 @@ impl World {
     pub(crate) fn take_ready(&mut self) -> Vec<ReadyObserver> {
         let mut ready = Vec::new();
         for (&id, state) in &mut self.observers {
-            if !state.queue.is_empty()
-                && let Some(object) = &state.object
-            {
-                ready.push(ReadyObserver {
-                    id,
-                    callback: state.callback.clone(),
-                    object: object.clone(),
-                    records: std::mem::take(&mut state.queue),
-                });
+            if state.queue.is_empty() {
+                continue;
             }
+            // Drain regardless: an observer whose wrapper is gone can never
+            // fire, and its queue must not grow forever.
+            let records = std::mem::take(&mut state.queue);
+            let Some(object) = &state.object else {
+                continue;
+            };
+            ready.push(ReadyObserver {
+                id,
+                callback: state.callback.clone(),
+                object: object.clone(),
+                records,
+            });
         }
         ready.sort_by_key(|observer| observer.id);
         ready
@@ -463,16 +504,21 @@ impl World {
         self.owned.insert(id);
         self.current_script = None;
         self.listeners.clear();
-        self.token_lists.clear();
-        self.named_node_maps.clear();
-        self.style_declarations.clear();
-        self.datasets.clear();
+        self.wrappers.clear();
         self.implementations.clear();
         self.active_elements.clear();
         self.clear_attributes();
         self.frame_navigations.clear();
         self.remote_ids.clear();
         self.remote_nodes.clear();
+        // Navigation replaces the document's element handlers with it, but the
+        // realm keeps its window object, so window-scoped handlers survive:
+        // the old document's `onload` must not fire in the new document
+        // (<https://html.spec.whatwg.org/multipage/webappapis.html#event-handlers>).
+        self.handler_attributes
+            .retain(|(node, _), _| node.is_none());
+        self.cleared_handlers
+            .retain(|(node, _)| node.is_none());
         let pending = self.take_document_stream();
         drop(pending);
         // A new realm owns fresh observers; navigation drops the old ones.
@@ -517,7 +563,7 @@ impl World {
             self.runtime.documents.borrow_mut().remove(id);
             self.runtime.registry.borrow_mut().forget_document(id);
             self.handler_attributes
-                .retain(|(node, _), _| node.is_none_or(|node| node.document_id() != id));
+                .retain(|(node, _), _| node.is_some_and(|node| node.document_id() != id));
             self.cleared_handlers
                 .retain(|(node, _)| node.is_none_or(|node| node.document_id() != id));
         }
@@ -626,6 +672,25 @@ impl World {
     /// The frame this realm belongs to.
     pub(crate) fn frame(&self) -> FrameId {
         self.frame
+    }
+
+    /// Whether this realm's frame is still attached to its document. A
+    /// removed iframe's frame may still sit in the tree until the engine
+    /// reconciles, so the container's connectedness decides.
+    pub(crate) fn is_attached(&self) -> bool {
+        if self.frame == FrameId::MAIN {
+            return true;
+        }
+        let container = self.runtime.shared.borrow().tree.container(self.frame);
+        let Some(container) = container else {
+            return false;
+        };
+        self.owner_world(container).is_some_and(|owner| {
+            owner
+                .borrow()
+                .main_document()
+                .is_some_and(|parsed| parsed.dom.is_connected(container))
+        })
     }
 
     /// The renderer-process state shared by every realm.
@@ -748,6 +813,141 @@ impl World {
     /// (<https://html.spec.whatwg.org/multipage/browsers.html#concept-origin>).
     pub(crate) fn origin_string(&self) -> String {
         self.document_url.origin().ascii_serialization()
+    }
+
+    /// The origin scoping this realm's storage areas, or `None` for an opaque
+    /// origin, where the storage getters must throw `SecurityError`
+    /// (<https://html.spec.whatwg.org/multipage/webstorage.html#the-localstorage-attribute>).
+    pub(crate) fn storage_origin(&self) -> Option<String> {
+        match self.document_url.origin() {
+            url::Origin::Tuple(..) => Some(self.origin_string()),
+            url::Origin::Opaque(_) => None,
+        }
+    }
+
+    /// `Storage.getItem(key)` for the `"local"` or `"session"` area. The
+    /// renderer owns the session area; the browser owns the local one.
+    pub(crate) fn storage_get(&self, kind: &str, key: &str) -> Option<String> {
+        let origin = self.storage_origin()?;
+        match kind {
+            "session" => self.runtime.session_storage.borrow().get(&origin, key),
+            _ => self.runtime.services.storage_get(&origin, key),
+        }
+    }
+
+    /// The keys of one storage area, in the area's iteration order.
+    pub(crate) fn storage_keys(&self, kind: &str) -> Vec<String> {
+        let Some(origin) = self.storage_origin() else {
+            return Vec::new();
+        };
+        match kind {
+            "session" => self.runtime.session_storage.borrow().keys(&origin),
+            _ => self.runtime.services.storage_keys(&origin),
+        }
+    }
+
+    /// `Storage.setItem(key, value)`; `Ok(None)` means no change and the error
+    /// is a refused write. A change queues the `storage` event for every other
+    /// same-origin frame of the engine
+    /// (<https://html.spec.whatwg.org/multipage/webstorage.html#concept-storage-broadcast>).
+    pub(crate) fn storage_set(
+        &self,
+        kind: &str,
+        key: &str,
+        value: &str,
+    ) -> Result<Option<StorageChange>, StorageError> {
+        let Some(origin) = self.storage_origin() else {
+            return Ok(None);
+        };
+        let kind = Self::storage_kind(kind);
+        let change = match kind {
+            StorageKind::Session => self
+                .runtime
+                .session_storage
+                .borrow_mut()
+                .set(&origin, key, value),
+            StorageKind::Local => self.runtime.services.storage_set(
+                &origin,
+                self.document_url.as_str(),
+                key,
+                value,
+                self.frame,
+            ),
+        }?;
+        if let Some(change) = &change {
+            self.queue_storage_event(kind, &origin, change);
+        }
+        Ok(change)
+    }
+
+    /// `Storage.removeItem(key)`; `None` means the key was absent.
+    pub(crate) fn storage_remove(&self, kind: &str, key: &str) -> Option<StorageChange> {
+        let origin = self.storage_origin()?;
+        let kind = Self::storage_kind(kind);
+        let change = match kind {
+            StorageKind::Session => self
+                .runtime
+                .session_storage
+                .borrow_mut()
+                .remove(&origin, key),
+            StorageKind::Local => self.runtime.services.storage_remove(
+                &origin,
+                self.document_url.as_str(),
+                key,
+                self.frame,
+            ),
+        };
+        if let Some(change) = &change {
+            self.queue_storage_event(kind, &origin, change);
+        }
+        change
+    }
+
+    /// `Storage.clear()`; `None` means the area was empty.
+    pub(crate) fn storage_clear(&self, kind: &str) -> Option<StorageChange> {
+        let origin = self.storage_origin()?;
+        let kind = Self::storage_kind(kind);
+        let change = match kind {
+            StorageKind::Session => self.runtime.session_storage.borrow_mut().clear(&origin),
+            StorageKind::Local => {
+                self.runtime
+                    .services
+                    .storage_clear(&origin, self.document_url.as_str(), self.frame)
+            }
+        };
+        if let Some(change) = &change {
+            self.queue_storage_event(kind, &origin, change);
+        }
+        change
+    }
+
+    fn storage_kind(kind: &str) -> StorageKind {
+        if kind == "session" {
+            StorageKind::Session
+        } else {
+            StorageKind::Local
+        }
+    }
+
+    /// Queues the event for a change this engine made. Only `sessionStorage`
+    /// needs it: `localStorage` changes return as a browser broadcast, which
+    /// excludes the source frame.
+    fn queue_storage_event(&self, kind: StorageKind, origin: &str, change: &StorageChange) {
+        if kind != StorageKind::Session {
+            return;
+        }
+        self.runtime
+            .pending_storage
+            .borrow_mut()
+            .push(PendingStorageEvent {
+                source: Some(self.frame),
+                origin: origin.to_owned(),
+                kind,
+                key: change.key.clone(),
+                old_value: change.old_value.clone(),
+                new_value: change.new_value.clone(),
+                url: self.document_url.to_string(),
+            });
     }
 
     /// The root node of the frame's active document.
@@ -927,16 +1127,27 @@ impl World {
         self.standalone_targets.clear();
         self.window = None;
         self.next_standalone_target = 0;
-        self.token_lists.clear();
-        self.named_node_maps.clear();
-        self.style_declarations.clear();
-        self.datasets.clear();
+        self.wrappers.clear();
         self.implementations.clear();
         self.brands.clear();
         self.handler_attributes.clear();
         self.cleared_handlers.clear();
         self.clear_attributes();
         self.observers.clear();
+    }
+
+    /// Drops the captured host primitives. Like every other JS-holding field,
+    /// they must go before the realm's context does: a `Persistent` keeps its
+    /// context alive, and a live context keeps the globals (which own
+    /// `Rc<World>` closures) alive, so an unreleased primitive deadlocks
+    /// teardown and trips `JS_FreeRuntime`'s live-object assertion.
+    pub(crate) fn release_host_primitives(&mut self) {
+        self.pristine_string = None;
+        self.pristine_number = None;
+        self.pristine_boolean = None;
+        self.pristine_queue_microtask = None;
+        self.deliver_mutations_fn = None;
+        self.host_token = None;
     }
 
     fn clear_attributes(&mut self) {
@@ -948,12 +1159,19 @@ impl World {
         self.next_attr_id = 0;
     }
 
-    pub(crate) fn token_list(&self, id: NodeId) -> Option<Persistent<Value<'static>>> {
-        self.token_lists.get(&id).cloned()
+    /// One cached platform object, if this realm created it.
+    pub(crate) fn wrapper(&self, id: NodeId, kind: Wrapper) -> Option<Persistent<Value<'static>>> {
+        self.wrappers.get(&(id, kind)).cloned()
     }
 
-    pub(crate) fn intern_token_list(&mut self, id: NodeId, value: Persistent<Value<'static>>) {
-        self.token_lists.insert(id, value);
+    /// Caches one platform object for the node and interface.
+    pub(crate) fn intern_wrapper(
+        &mut self,
+        id: NodeId,
+        kind: Wrapper,
+        value: Persistent<Value<'static>>,
+    ) {
+        self.wrappers.insert((id, kind), value);
     }
 
     /// The focused element of a document, if any.
@@ -1043,34 +1261,6 @@ impl World {
         } else {
             self.clicks_in_progress.remove(&node);
         }
-    }
-
-    pub(crate) fn named_node_map(&self, id: NodeId) -> Option<Persistent<Value<'static>>> {
-        self.named_node_maps.get(&id).cloned()
-    }
-
-    pub(crate) fn intern_named_node_map(&mut self, id: NodeId, value: Persistent<Value<'static>>) {
-        self.named_node_maps.insert(id, value);
-    }
-
-    pub(crate) fn style_declaration(&self, id: NodeId) -> Option<Persistent<Value<'static>>> {
-        self.style_declarations.get(&id).cloned()
-    }
-
-    pub(crate) fn intern_style_declaration(
-        &mut self,
-        id: NodeId,
-        value: Persistent<Value<'static>>,
-    ) {
-        self.style_declarations.insert(id, value);
-    }
-
-    pub(crate) fn dataset(&self, id: NodeId) -> Option<Persistent<Value<'static>>> {
-        self.datasets.get(&id).cloned()
-    }
-
-    pub(crate) fn intern_dataset(&mut self, id: NodeId, value: Persistent<Value<'static>>) {
-        self.datasets.insert(id, value);
     }
 
     pub(crate) fn intern_brand(

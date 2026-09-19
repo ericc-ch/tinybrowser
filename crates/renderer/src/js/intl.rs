@@ -155,20 +155,13 @@ pub(super) fn install(ctx: &Ctx<'_>) -> Result<()> {
 }
 
 fn resolve_locale(tag: &str) -> String {
-    let Ok(locale) = tag.parse::<Locale>() else {
-        return "!".to_owned();
-    };
-    match locale.id.language.as_str() {
-        "en" => "en-US",
-        "es" => "es-ES",
-        "de" => "de-DE",
-        "ja" => "ja-JP",
-        "fr" => "fr-FR",
-        "zh" => "zh-CN",
-        "ko" => "ko-KR",
-        _ => "",
-    }
-    .to_owned()
+    // `BestAvailableMatcher` gate and match in one: the provider carries full
+    // ICU data with fallback, so every well-formed tag is available and
+    // matches itself. Structurally invalid tags match nothing (the wrapper
+    // falls back to the default locale).
+    tag.parse::<Locale>()
+        .map(|locale| locale.to_string())
+        .unwrap_or_default()
 }
 
 fn canonicalize_locale(canonicalizer: &LocaleCanonicalizer, tag: &str) -> String {

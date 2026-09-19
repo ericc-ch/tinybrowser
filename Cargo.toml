@@ -8,6 +8,7 @@ members = [
     "crates/net",
     "crates/render",
     "crates/renderer",
+    "crates/server",
     "crates/wasm",
     "crates/webdriver",
 ]
@@ -25,6 +26,7 @@ logging = { path = "crates/logging" }
 net = { path = "crates/net" }
 render = { path = "crates/render" }
 renderer = { path = "crates/renderer" }
+server = { path = "crates/server" }
 webdriver = { path = "crates/webdriver" }
 
 [package]

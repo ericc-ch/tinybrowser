@@ -86,7 +86,8 @@ fn strip_cdata(css: &str) -> &str {
 use crate::documents::DocumentStore;
 use crate::js::{DocumentStreamCommand, FrameNavigation, RealmRegistry, SharedJsRuntime};
 use crate::messaging::{Delivery, MAX_FRAMES, SharedHandle};
-use crate::protocol::{BrowserServices, FrameId, Mount, TabError, TabEvent};
+use crate::protocol::{BrowserServices, FrameId, Mount, StorageSeed, TabError, TabEvent};
+use crate::storage::PendingStorageEvent;
 
 /// One renderer process's page engine.
 ///
@@ -114,6 +115,8 @@ impl Engine {
             documents: Rc::new(RefCell::new(DocumentStore::default())),
             registry: Rc::new(RefCell::new(RealmRegistry::default())),
             shared: Rc::new(RefCell::new(crate::messaging::Shared::default())),
+            session_storage: Rc::new(RefCell::new(crate::storage::SessionStorage::default())),
+            pending_storage: Rc::new(RefCell::new(Vec::new())),
         };
         let main = Document::with_shared(FrameId::MAIN, &runtime);
         let mut frames = BTreeMap::new();
@@ -366,6 +369,7 @@ impl Engine {
         // (<https://html.spec.whatwg.org/multipage/webappapis.html#task-queue>).
         self.reconcile_frames();
         loop {
+            self.drain_storage_events();
             let mut ran = false;
             let frames: Vec<FrameId> = self.frames.keys().copied().collect();
             for frame in frames {
@@ -381,6 +385,98 @@ impl Engine {
             if !ran {
                 break;
             }
+        }
+    }
+
+    /// Queues one remote `postMessage` payload on the main frame's task
+    /// source; the frame dispatches a trusted `message` event with a null
+    /// source.
+    pub fn receive_remote_window_message(&mut self, payload: String) {
+        if let Some(document) = self.frames.get_mut(&FrameId::MAIN) {
+            document.push_remote_message(payload);
+        }
+    }
+
+    /// Queues one `BroadcastChannel` message on every same-origin frame of
+    /// this engine
+    /// (<https://html.spec.whatwg.org/multipage/web-messaging.html#broadcasting-to-other-browsing-contexts>).
+    pub fn receive_broadcast_message(
+        &mut self,
+        origin: &str,
+        name: &str,
+        payload: &str,
+        source: Option<u64>,
+    ) {
+        for document in self.frames.values_mut() {
+            if document.origin_string() != origin {
+                continue;
+            }
+            if !document.world().borrow().is_attached() {
+                continue;
+            }
+            document.push_broadcast_message(
+                origin.to_owned(),
+                name.to_owned(),
+                payload.to_owned(),
+                source,
+            );
+        }
+    }
+
+    /// Copies one `sessionStorage` seed into this engine's session area
+    /// (<https://html.spec.whatwg.org/multipage/document-sequences.html#copy-session-storage>).
+    ///
+    /// # Errors
+    ///
+    /// [`TabError::RendererUnavailable`] when the seed JSON is malformed.
+    pub fn seed_session(&mut self, seed: StorageSeed) -> Result<(), TabError> {
+        let StorageSeed { origin, entries } = seed;
+        self.runtime
+            .session_storage
+            .borrow_mut()
+            .import(&origin, entries);
+        Ok(())
+    }
+
+    /// Reads one key of this engine's session area for `origin`.
+    #[must_use]
+    pub fn session_get(&self, origin: &str, key: &str) -> Option<String> {
+        self.runtime.session_storage.borrow().get(origin, key)
+    }
+
+    /// Queues one `localStorage` change that the browser broadcast. The source
+    /// frame is set only when the change came from this same assignment;
+    /// other renderers and assignments pass `None`.
+    pub fn receive_storage_event(&mut self, event: PendingStorageEvent) {
+        self.runtime.pending_storage.borrow_mut().push(event);
+    }
+
+    /// Moves changes queued by this engine's own script onto the
+    /// `storage`-event task of every receiving frame.
+    fn drain_storage_events(&mut self) {
+        let pending: Vec<PendingStorageEvent> =
+            std::mem::take(&mut *self.runtime.pending_storage.borrow_mut());
+        for event in pending {
+            self.queue_storage_event(&event);
+        }
+    }
+
+    /// Queues one change on every frame of `event.origin`, excluding the
+    /// window whose script made it
+    /// (<https://html.spec.whatwg.org/multipage/webstorage.html#concept-storage-broadcast>).
+    fn queue_storage_event(&mut self, event: &PendingStorageEvent) {
+        let frames: Vec<FrameId> = self.frames.keys().copied().collect();
+        for frame in frames {
+            if event.source == Some(frame) {
+                continue;
+            }
+            let Some(document) = self.frames.get_mut(&frame) else {
+                continue;
+            };
+            if document.origin_string() != event.origin {
+                continue;
+            }
+            document.push_storage_event(event.clone());
         }
     }
 

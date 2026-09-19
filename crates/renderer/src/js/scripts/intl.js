@@ -28,6 +28,11 @@
   const arrayPush = Function.prototype.call.bind(Array.prototype.push);
   const arrayConcat = Function.prototype.call.bind(Array.prototype.concat);
   const regexpTest = Function.prototype.call.bind(RegExp.prototype.test);
+  const stringSlice = Function.prototype.call.bind(String.prototype.slice);
+  const stringIndexOf = Function.prototype.call.bind(String.prototype.indexOf);
+  const stringCharCodeAt = Function.prototype.call.bind(String.prototype.charCodeAt);
+  const stringRepeat = Function.prototype.call.bind(String.prototype.repeat);
+  const bigintConstructor = BigInt;
   const mathFloor = Math.floor;
   const mathMax = Math.max;
   const mathMin = Math.min;
@@ -155,6 +160,69 @@
     throw new TypeError('cannot convert object to a primitive value');
   }
 
+  // A `StringNumericLiteral` in exact plain-decimal form, or null when
+  // `text` is not one. Decimal exponents expand (`"1e30"`), and
+  // hexadecimal/binary/octal integers convert through `BigInt`, so split
+  // UTF-8 tails and huge magnitudes keep every digit instead of taking the
+  // lossy `Number` path
+  // (https://402.ecma-international.org/#sec-tointlmathematicalvalue,
+  // https://262.ecma-international.org/#sec-stringnumericliteral).
+  function expandDecimalLiteral(text) {
+    if (text.length > 2 && text[0] === '0') {
+      const prefix = text[1] === 'x' || text[1] === 'X' ? [16, /^[0-9a-fA-F]+$/]
+        : text[1] === 'b' || text[1] === 'B' ? [2, /^[01]+$/]
+        : text[1] === 'o' || text[1] === 'O' ? [8, /^[0-7]+$/] : null;
+      if (prefix) {
+        if (!regexpTest(prefix[1], stringSlice(text, 2))) return null;
+        // `BigInt` accepts the `0x`/`0b`/`0o` prefixes exactly.
+        return stringConstructor(bigintConstructor('0' + stringToLowerCase(text[1]) + stringSlice(text, 2)));
+      }
+    }
+    const lower = stringIndexOf(text, 'e');
+    const upper = stringIndexOf(text, 'E');
+    const marker = lower < 0 ? upper : upper < 0 ? lower : mathMin(lower, upper);
+    if (marker < 0) return null;
+    const mantissa = stringSlice(text, 0, marker);
+    if (!regexpTest(/^[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)$/, mantissa)) return null;
+    const exponent = parseDecimalExponent(stringSlice(text, marker + 1));
+    // Absurd magnitudes stay on the lossy path rather than materializing a
+    // ten-thousand-digit string for the formatter.
+    if (exponent === null || exponent > 9999 || exponent < -9999) return null;
+    return expandDecimalExponent(mantissa, exponent);
+  }
+
+  function parseDecimalExponent(text) {
+    let sign = 1;
+    let rest = text;
+    if (rest[0] === '+') rest = stringSlice(rest, 1);
+    else if (rest[0] === '-') { sign = -1; rest = stringSlice(rest, 1); }
+    if (!regexpTest(/^[0-9]+$/, rest)) return null;
+    let value = 0;
+    for (let index = 0; index < rest.length; index += 1) {
+      value = value * 10 + (stringCharCodeAt(rest, index) - 48);
+    }
+    return sign * value;
+  }
+
+  function expandDecimalExponent(mantissa, exponent) {
+    let sign = '';
+    if (mantissa[0] === '+' || mantissa[0] === '-') {
+      if (mantissa[0] === '-') sign = '-';
+      mantissa = stringSlice(mantissa, 1);
+    }
+    const dot = stringIndexOf(mantissa, '.');
+    const intPart = dot < 0 ? mantissa : stringSlice(mantissa, 0, dot);
+    const fracPart = dot < 0 ? '' : stringSlice(mantissa, dot + 1);
+    const digits = intPart + fracPart;
+    let head = 0;
+    while (head + 1 < digits.length && digits[head] === '0') head += 1;
+    const clean = stringSlice(digits, head);
+    const point = intPart.length - (digits.length - clean.length) + exponent;
+    if (point <= 0) return sign + '0.' + stringRepeat('0', -point) + clean;
+    if (point >= clean.length) return sign + clean + stringRepeat('0', point - clean.length);
+    return sign + stringSlice(clean, 0, point) + '.' + stringSlice(clean, point);
+  }
+
   // https://402.ecma-international.org/#sec-tointlmathematicalvalue
   function intlMathematicalValue(value) {
     const primitive = primitiveNumberHint(value);
@@ -165,6 +233,10 @@
       const text = stringTrim(primitive);
       if (regexpTest(/^[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)$/, text)) {
         return { number: 0, exact: text };
+      }
+      const expanded = expandDecimalLiteral(text);
+      if (expanded !== null) {
+        return { number: 0, exact: expanded };
       }
     }
     return { number: +primitive, exact: '' };

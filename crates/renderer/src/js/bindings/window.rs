@@ -23,7 +23,7 @@ pub(crate) fn install_location<'js>(
     globals: &Object<'js>,
     world: &Rc<RefCell<World>>,
 ) -> Result<()> {
-    let (pathname, href, search, origin, protocol, host, hostname, port) = {
+    let (pathname, href, search, hash, origin, protocol, host, hostname, port) = {
         let world = world.borrow();
         let url = &world.document_url;
         let hostname = url.host_str().map_or_else(String::new, ToOwned::to_owned);
@@ -38,6 +38,8 @@ pub(crate) fn install_location<'js>(
             url.as_str().to_owned(),
             url.query()
                 .map_or_else(String::new, |query| format!("?{query}")),
+            url.fragment()
+                .map_or_else(String::new, |fragment| format!("#{fragment}")),
             url.origin().ascii_serialization(),
             format!("{}:", url.scheme()),
             host,
@@ -49,6 +51,7 @@ pub(crate) fn install_location<'js>(
     location.set("pathname", pathname)?;
     location.set("href", href)?;
     location.set("search", search)?;
+    location.set("hash", hash)?;
     location.set("origin", origin)?;
     location.set("protocol", protocol)?;
     location.set("host", host)?;
@@ -101,8 +104,10 @@ pub(crate) fn window_dispatch_event<'js>(
 )]
 pub(crate) fn window_dispatch_trusted_event<'js>(
     ctx: Ctx<'js>,
+    token: Value<'js>,
     event: Class<'js, JsEvent>,
 ) -> Result<bool> {
+    crate::js::bindings::check_host_token(&ctx, &token)?;
     events::dispatch_trusted_event(&ctx, EventTargetKey::Window, &event)
 }
 

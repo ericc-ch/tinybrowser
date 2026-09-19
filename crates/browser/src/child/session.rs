@@ -46,18 +46,10 @@ pub(super) async fn run(
         tokio::select! {
             received = inbox.recv() => match received {
                 Some(RendererInput::Control(ToRenderer::Assign { assignment })) => {
-                    if engines.contains_key(&assignment) {
+                    if !assign_engine(&mut engines, assignment, &services, stop, &wake) {
                         stop.request();
                         break;
                     }
-                    let assignment_services = Arc::new(AssignmentServices::new(
-                        assignment,
-                        Arc::clone(&services),
-                    ));
-                    engines.insert(
-                        assignment,
-                        Engine::new(assignment_services, Arc::clone(stop), Arc::clone(&wake)),
-                    );
                 }
                 Some(RendererInput::Control(ToRenderer::Release { assignment })) => {
                     responses.release(assignment);
@@ -66,24 +58,9 @@ pub(super) async fn run(
                     }
                 }
                 Some(RendererInput::Control(ToRenderer::Request { id, assignment, command })) => {
-                    let Some(engine) = engines.get_mut(&assignment) else {
+                    if !handle_request(&mut engines, outbox, stop, id, assignment, command) {
                         stop.request();
                         break;
-                    };
-                    match handle_command(engine, command, stop) {
-                        Handled::Reply(reply) => {
-                            if !send_to_browser(outbox, FromRenderer::Reply { id, assignment, reply }) {
-                                stop.request();
-                                break;
-                            }
-                        }
-                        Handled::Screenshot(png) => {
-                            if !stream_screenshot(outbox, id, assignment, &png) {
-                                stop.request();
-                                break;
-                            }
-                        }
-                        Handled::Shutdown => break,
                     }
                 }
                 Some(RendererInput::Control(ToRenderer::ResponseStart { id, response })) => {
@@ -103,21 +80,40 @@ pub(super) async fn run(
                     }
                 }
                 Some(RendererInput::Control(ToRenderer::ResponseEnd { id })) => {
-                    let (assignment, result) = responses.finish(id, &mut engines);
-                    let reply = Reply::Unit(result);
-                    if !send_to_browser(outbox, FromRenderer::Reply { id, assignment, reply }) {
+                    let result = responses.finish(id, &mut engines);
+                    if !reply_result(outbox, id, result) {
                         stop.request();
                         break;
                     }
                 }
                 Some(RendererInput::Control(ToRenderer::ResponseError { id, failure })) => {
-                    let (assignment, result) = responses.abort(id, failure, &mut engines);
-                    let reply = Reply::Unit(result);
-                    if !send_to_browser(outbox, FromRenderer::Reply { id, assignment, reply }) {
+                    let result = responses.abort(id, failure, &mut engines);
+                    if !reply_result(outbox, id, result) {
                         stop.request();
                         break;
                     }
                 }
+                Some(RendererInput::Control(ToRenderer::StorageEvent {
+                    origin,
+                    kind,
+                    key,
+                    old_value,
+                    new_value,
+                    url,
+                    source,
+                })) => queue_storage_event(
+                    &mut engines,
+                    &renderer::PendingStorageEvent::broadcast(
+                        origin, kind, key, old_value, new_value, url,
+                    ),
+                    source,
+                ),
+                Some(RendererInput::Control(ToRenderer::BroadcastMessage {
+                    origin,
+                    name,
+                    payload,
+                    source,
+                })) => queue_broadcast_message(&mut engines, &origin, &name, &payload, source),
                 // The transport consumes the handshake, response stream, and
                 // service replies; none reaches this loop.
                 Some(
@@ -133,6 +129,101 @@ pub(super) async fn run(
     }
     for (_, mut engine) in engines {
         engine.shutdown();
+    }
+}
+
+/// Handles one host command for one assignment; `false` stops the loop.
+fn handle_request(
+    engines: &mut HashMap<RendererAssignmentId, Engine>,
+    outbox: &SyncSender<Outgoing>,
+    stop: &Arc<Stop>,
+    id: u64,
+    assignment: RendererAssignmentId,
+    command: Command,
+) -> bool {
+    let Some(engine) = engines.get_mut(&assignment) else {
+        return false;
+    };
+    match handle_command(engine, command, stop) {
+        Handled::Reply(reply) => send_to_browser(
+            outbox,
+            FromRenderer::Reply {
+                id,
+                assignment,
+                reply,
+            },
+        ),
+        Handled::Screenshot(png) => stream_screenshot(outbox, id, assignment, &png),
+        Handled::Shutdown => false,
+    }
+}
+
+/// Answers a finished or aborted response stream with its unit reply.
+fn reply_result(
+    outbox: &SyncSender<Outgoing>,
+    id: u64,
+    (assignment, result): (RendererAssignmentId, Result<(), TabError>),
+) -> bool {
+    send_to_browser(
+        outbox,
+        FromRenderer::Reply {
+            id,
+            assignment,
+            reply: Reply::Unit(result),
+        },
+    )
+}
+
+/// Creates one engine for `assignment`; `false` stops the loop on a duplicate.
+fn assign_engine(
+    engines: &mut HashMap<RendererAssignmentId, Engine>,
+    assignment: RendererAssignmentId,
+    services: &Arc<ChannelServices>,
+    stop: &Arc<Stop>,
+    wake: &Arc<Notify>,
+) -> bool {
+    if engines.contains_key(&assignment) {
+        return false;
+    }
+    let assignment_services = Arc::new(AssignmentServices::new(assignment, Arc::clone(services)));
+    engines.insert(
+        assignment,
+        Engine::new(assignment_services, Arc::clone(stop), Arc::clone(wake)),
+    );
+    true
+}
+
+/// Queues one browser-broadcast `BroadcastChannel` message on every engine;
+/// only the posting assignment skips the source channel.
+fn queue_broadcast_message(
+    engines: &mut HashMap<RendererAssignmentId, Engine>,
+    origin: &str,
+    name: &str,
+    payload: &str,
+    source: Option<(RendererAssignmentId, u64)>,
+) {
+    for (assignment, engine) in engines {
+        let source_channel = source.and_then(|(source_assignment, channel)| {
+            (source_assignment == *assignment).then_some(channel)
+        });
+        engine.receive_broadcast_message(origin, name, payload, source_channel);
+    }
+}
+
+/// Queues one browser-broadcast `localStorage` change on every engine. Only
+/// the assignment that made the change excludes the source window; other
+/// assignments and renderers fire in every matching frame.
+fn queue_storage_event(
+    engines: &mut HashMap<RendererAssignmentId, Engine>,
+    event: &renderer::PendingStorageEvent,
+    source: Option<(RendererAssignmentId, FrameId)>,
+) {
+    for (assignment, engine) in engines {
+        let mut event = event.clone();
+        event.source = source.and_then(|(source_assignment, frame)| {
+            (source_assignment == *assignment).then_some(frame)
+        });
+        engine.receive_storage_event(event);
     }
 }
 
@@ -309,6 +400,14 @@ fn handle_command(engine: &mut Engine, command: Command, stop: &Arc<Stop>) -> Ha
             Ok(png) => Handled::Screenshot(png),
             Err(error) => Handled::Reply(Reply::Screenshot { result: Err(error) }),
         },
+        Command::WindowMessage { payload } => {
+            engine.receive_remote_window_message(payload);
+            Handled::Reply(Reply::Unit(Ok(())))
+        }
+        Command::SeedSession { seed } => Handled::Reply(Reply::Unit(engine.seed_session(seed))),
+        Command::RemoteSessionGet { origin, key } => {
+            Handled::Reply(Reply::Optional(engine.session_get(&origin, &key)))
+        }
         Command::Shutdown => {
             stop.request();
             Handled::Shutdown

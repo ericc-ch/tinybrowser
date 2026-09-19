@@ -112,6 +112,36 @@ pub fn render(
     cascade::render(dom, stylesheets, options)
 }
 
+/// One laid-out box in CSS pixels, keyed by its DOM element when it has one.
+#[derive(Clone, Copy, Debug)]
+pub struct NodeBox {
+    /// The element the box was generated for; `None` for anonymous boxes.
+    pub node: Option<dom::NodeId>,
+    /// Border box in CSS pixels.
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+    /// Whether the originating style is visible. Hidden boxes still report
+    /// geometry, but hit testing skips them (descendants override).
+    pub visible: bool,
+}
+
+/// Lays `dom` out without painting and returns every box in tree order, for
+/// script geometry (`getBoundingClientRect`, hit testing).
+///
+/// # Errors
+///
+/// Returns [`RenderError`] when a stylesheet cannot be parsed or the viewport
+/// is unusable.
+pub fn layout_boxes(
+    dom: &dom::Dom,
+    stylesheets: &[String],
+    options: &RenderOptions,
+) -> Result<Vec<NodeBox>, RenderError> {
+    cascade::boxes(dom, stylesheets, options)
+}
+
 /// Viewport and device parameters for one render.
 #[derive(Clone, Copy, Debug)]
 pub struct RenderOptions {

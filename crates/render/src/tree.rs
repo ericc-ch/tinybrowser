@@ -42,6 +42,8 @@ pub(crate) enum BoxKind {
 pub(crate) struct BoxNode {
     /// Box kind.
     pub(crate) kind: BoxKind,
+    /// The DOM node this box was generated for, when it is an element box.
+    pub(crate) node: Option<NodeId>,
     /// Computed style (for text boxes, the parent element's style).
     pub(crate) style: Style,
     /// Children in tree order.
@@ -64,6 +66,7 @@ pub(crate) fn build(dom: &Dom, styles: &HashMap<NodeId, Style>) -> BoxNode {
     let children = build_children(dom, styles, document, &root_style);
     BoxNode {
         kind: BoxKind::Block,
+        node: None,
         style: root_style.clone(),
         children: wrap_anonymous(children, &root_style),
     }
@@ -114,6 +117,7 @@ fn build_children(
                 };
                 boxes.push(BoxNode {
                     kind,
+                    node: Some(child),
                     style,
                     children,
                 });
@@ -124,6 +128,7 @@ fn build_children(
                 }
                 boxes.push(BoxNode {
                     kind: BoxKind::Text(data.clone()),
+                    node: None,
                     style: parent_style.clone(),
                     children: Vec::new(),
                 });
@@ -202,6 +207,7 @@ fn push_anonymous(out: &mut Vec<BoxNode>, style: &Style, pending: &mut Vec<BoxNo
     if pending.iter().any(could_paint) {
         out.push(BoxNode {
             kind: BoxKind::Block,
+            node: None,
             style: style.clone(),
             children: std::mem::take(pending),
         });

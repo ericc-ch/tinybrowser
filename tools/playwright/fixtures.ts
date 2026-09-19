@@ -19,6 +19,8 @@ export interface Daemon {
   brokenUrl: string;
   /** The same inline-styled box without any link element. */
   plainUrl: string;
+  /** Page with a button and an input for click/type automation. */
+  interactiveUrl: string;
 }
 
 interface Fixtures {
@@ -48,6 +50,17 @@ const BROKEN = `<!doctype html><title>broken</title>
 /** The same box without the link, to isolate the offset. */
 const PLAIN = `<!doctype html><title>plain</title>
 <div style="background:#123456;width:20px;height:20px"></div>`;
+
+/** Interactive controls for click/type/selector automation. */
+const INTERACTIVE = `<!doctype html><title>interactive</title>
+<div id="go" style="width:80px;height:30px" onclick="document.getElementById('out').textContent = 'clicked'">Go</div>
+<textarea id="name"></textarea>
+<div id="out">idle</div>
+<script>
+document.getElementById('name').addEventListener('input', function (event) {
+  document.getElementById('out').textContent = 'typed:' + event.target.value;
+});
+</script>`;
 
 const STYLES = ".hot { background: #00ff00; width: 60px; height: 60px; }";
 
@@ -92,6 +105,9 @@ export const test = base.extend<Fixtures>({
       } else if (path === "/plain") {
         response.writeHead(200, { "content-type": "text/html" });
         response.end(PLAIN);
+      } else if (path === "/interactive") {
+        response.writeHead(200, { "content-type": "text/html" });
+        response.end(INTERACTIVE);
       } else if (path === "/styles.css") {
         // Delay the sheet so the load-delay spec discriminates: a browser
         // that fires load without waiting would screenshot white.
@@ -134,6 +150,7 @@ export const test = base.extend<Fixtures>({
       styledUrl: `http://127.0.0.1:${httpPort}/styled`,
       brokenUrl: `http://127.0.0.1:${httpPort}/broken`,
       plainUrl: `http://127.0.0.1:${httpPort}/plain`,
+      interactiveUrl: `http://127.0.0.1:${httpPort}/interactive`,
     });
 
     try {

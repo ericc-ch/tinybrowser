@@ -20,17 +20,15 @@ use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use browser::{BrowserHandle, RemoteValue, TabEvent, TabHandle, TabId};
 use bytes::Bytes;
 use futures_util::{SinkExt as _, StreamExt as _};
-use http::{HeaderValue, Method, Request, Response, StatusCode, header};
+use http::{HeaderValue, Method, StatusCode, header};
 use http_body_util::Full;
-use hyper::body::Incoming;
-use hyper::service::service_fn;
 use hyper::upgrade::Upgraded;
-use hyper_util::rt::{TokioExecutor, TokioIo};
-use hyper_util::server::conn::auto::Builder;
+use hyper_util::rt::TokioIo;
 use serde_json::{Value, json};
+use server::{Request, Response, Shutdown};
 use sha1::{Digest as _, Sha1};
-use tokio::sync::{mpsc, watch};
-use tokio::task::{JoinHandle, JoinSet};
+use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tungstenite::client::IntoClientRequest;
@@ -39,9 +37,12 @@ use tungstenite::protocol::{Message, Role, WebSocket as ClientSocket};
 mod dispatch;
 use dispatch::{
     DispatchError, RUNTIME_HANDLE, RUNTIME_HANDLE_READ, RUNTIME_HANDLE_SCHEDULE, RUNTIME_READ,
-    RUNTIME_SCHEDULE, arguments_expression, attach_session, capture_screenshot, exception_reply,
-    exception_text_reply, json_io, json_string, open_url, session_method, target_id, target_info,
-    wait_for_navigation, ws_io,
+    RUNTIME_SCHEDULE, arguments_expression, attach_session, capture_screenshot, css_computed_style,
+    css_stylesheets, dom_box_model, dom_content_quads, dom_describe_node, dom_get_document,
+    dom_node_for_location, dom_node_string, dom_query_selector, dom_resolve_node, exception_reply,
+    exception_text_reply, input_emulate_touch_from_mouse, input_insert_text, input_key_event,
+    input_mouse_event, input_touch_event, json_io, json_string, open_url, session_method,
+    static_reply, stubbed_domain, target_id, target_info, wait_for_navigation, ws_io,
 };
 
 const PRODUCT: &str = "tinybrowser/0.1.0";
@@ -62,70 +63,16 @@ const AWAIT_PROMISE_TIMEOUT: Duration = Duration::from_secs(30);
 /// Returns when the listener cannot be converted or serving fails.
 pub async fn serve(listener: &TcpListener, browser: &BrowserHandle) -> io::Result<()> {
     let bound = listener.local_addr()?;
-    let std_listener = listener.try_clone()?;
-    std_listener.set_nonblocking(true)?;
-    let browser = browser.clone();
-    let listener = tokio::net::TcpListener::from_std(std_listener)?;
-    let (stop, mut stopping) = watch::channel(false);
+    let shutdown = Shutdown::new();
     let state = AppState {
-        browser,
+        browser: browser.clone(),
         bound,
-        stop: stop.clone(),
+        stop: shutdown.clone(),
     };
-    let mut tasks = JoinSet::new();
-    loop {
-        // Reap finished connections; they would otherwise stay in the set for
-        // the server's lifetime.
-        while tasks.try_join_next().is_some() {}
-        tokio::select! {
-            _ = stopping.wait_for(|stopping| *stopping) => break,
-            accepted = listener.accept() => {
-                let (stream, _) = match accepted {
-                    Ok(accepted) => accepted,
-                    Err(error) => {
-                        // axum retried transient accept failures (EMFILE and
-                        // friends) instead of dropping the listener.
-                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                        let _ = error;
-                        continue;
-                    }
-                };
-                tasks.spawn(connection(stream, state.clone(), stop.subscribe()));
-            }
-        }
-    }
-    while tasks.join_next().await.is_some() {}
-    Ok(())
+    server::serve(listener, shutdown, state, serve_request).await
 }
 
-async fn connection(
-    stream: tokio::net::TcpStream,
-    state: AppState,
-    mut stop: watch::Receiver<bool>,
-) {
-    let service = service_fn(move |request| {
-        let state = state.clone();
-        async move { Ok::<_, std::convert::Infallible>(serve_request(request, state).await) }
-    });
-    let mut auto = Builder::new(TokioExecutor::new());
-    // CONNECT protocol for HTTP/2 websockets. The old axum build was h1-only,
-    // so this is an intentional widening of the loopback listener.
-    auto.http2().enable_connect_protocol();
-    let conn = auto.serve_connection_with_upgrades(TokioIo::new(stream), service);
-    tokio::pin!(conn);
-    // `subscribe()` marks the current value seen, so a receiver made after the
-    // stop send would never fire `changed()`. Check the current value first.
-    if !*stop.borrow() {
-        tokio::select! {
-            _result = conn.as_mut() => return,
-            _ = stop.changed() => {}
-        }
-    }
-    conn.as_mut().graceful_shutdown();
-    let _drained = conn.as_mut().await;
-}
-
-async fn serve_request(request: Request<Incoming>, state: AppState) -> Response<Full<Bytes>> {
+async fn serve_request(request: Request, state: AppState) -> Response {
     let path = request.uri().path().to_owned();
     let route = route_path(&path);
     match route {
@@ -139,22 +86,17 @@ async fn serve_request(request: Request<Incoming>, state: AppState) -> Response<
     }
 }
 
-/// Axum's method router answered a known path with 405 + `Allow: GET,HEAD`
-/// and an empty body; HEAD bodies are hyper's job to strip.
-fn get_only(request: &Request<Incoming>, response: Response<Full<Bytes>>) -> Response<Full<Bytes>> {
+/// A known path answers a method it does not accept with 405 + `Allow:
+/// GET,HEAD` and an empty body; HEAD bodies are hyper's job to strip.
+fn get_only(request: &Request, response: Response) -> Response {
     if request.method() == Method::GET || request.method() == Method::HEAD {
         return response;
     }
-    let mut response = Response::new(Full::new(Bytes::new()));
-    *response.status_mut() = StatusCode::METHOD_NOT_ALLOWED;
-    response
-        .headers_mut()
-        .insert(header::ALLOW, HeaderValue::from_static("GET,HEAD"));
-    response
+    server::method_not_allowed("GET,HEAD")
 }
 
-fn json_route(payload: &Value) -> Response<Full<Bytes>> {
-    json_response(StatusCode::OK, payload)
+fn json_route(payload: &Value) -> Response {
+    server::json(StatusCode::OK, payload)
 }
 
 /// Legacy CDP clients (Playwright included) append a trailing slash to
@@ -171,11 +113,7 @@ fn route_path(path: &str) -> &str {
 /// Routes a websocket request: validates the handshake per RFC 6455
 /// (<https://www.rfc-editor.org/rfc/rfc6455#section-4.2.1>), resolves a page
 /// target when `raw` carries one, then answers the 101 and runs the socket.
-async fn upgrade_route(
-    request: Request<Incoming>,
-    state: AppState,
-    raw: Option<String>,
-) -> Response<Full<Bytes>> {
+async fn upgrade_route(request: Request, state: AppState, raw: Option<String>) -> Response {
     let key = match upgrade_key(&request) {
         Ok(key) => key,
         Err(rejection) => return rejection_response(rejection),
@@ -207,7 +145,7 @@ enum HandshakeRejection {
     VersionUnsupported,
 }
 
-fn upgrade_key(request: &Request<Incoming>) -> Result<String, HandshakeRejection> {
+fn upgrade_key(request: &Request) -> Result<String, HandshakeRejection> {
     if request.version() != http::Version::HTTP_11 {
         return Err(HandshakeRejection::HttpVersion);
     }
@@ -240,7 +178,7 @@ fn upgrade_key(request: &Request<Incoming>) -> Result<String, HandshakeRejection
         .ok_or(HandshakeRejection::MissingKey)
 }
 
-fn rejection_response(rejection: HandshakeRejection) -> Response<Full<Bytes>> {
+fn rejection_response(rejection: HandshakeRejection) -> Response {
     match rejection {
         HandshakeRejection::HttpVersion => {
             status_response(StatusCode::UPGRADE_REQUIRED, "upgrade requires HTTP/1.1")
@@ -275,11 +213,11 @@ fn rejection_response(rejection: HandshakeRejection) -> Response<Full<Bytes>> {
 }
 
 fn serve_upgraded(
-    request: Request<Incoming>,
+    request: Request,
     key: &str,
     state: AppState,
     tab: Option<TabHandle>,
-) -> Response<Full<Bytes>> {
+) -> Response {
     let accept = accept_key(key);
     let upgraded = hyper::upgrade::on(request);
     tokio::spawn(async move {
@@ -290,7 +228,7 @@ fn serve_upgraded(
     switching_protocols(&accept)
 }
 
-fn switching_protocols(accept: &str) -> Response<Full<Bytes>> {
+fn switching_protocols(accept: &str) -> Response {
     let mut response = Response::new(Full::new(Bytes::new()));
     *response.status_mut() = StatusCode::SWITCHING_PROTOCOLS;
     response
@@ -321,31 +259,15 @@ fn accept_key(key: &str) -> String {
     BASE64_STANDARD.encode(hasher.finalize())
 }
 
-fn status_response(status: StatusCode, message: &'static str) -> Response<Full<Bytes>> {
-    let mut response = Response::new(Full::new(Bytes::from(message)));
-    *response.status_mut() = status;
-    response.headers_mut().insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static("text/plain; charset=utf-8"),
-    );
-    response
-}
-
-fn json_response(status: StatusCode, payload: &Value) -> Response<Full<Bytes>> {
-    let mut response = Response::new(Full::new(Bytes::from(payload.to_string())));
-    *response.status_mut() = status;
-    response.headers_mut().insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static("application/json"),
-    );
-    response
+fn status_response(status: StatusCode, message: &'static str) -> Response {
+    server::text(status, message)
 }
 
 #[derive(Clone)]
 struct AppState {
     browser: BrowserHandle,
     bound: SocketAddr,
-    stop: watch::Sender<bool>,
+    stop: Shutdown,
 }
 
 fn version_json(state: &AppState) -> Value {
@@ -523,7 +445,7 @@ struct Conn {
     sessions: HashMap<String, TabHandle>,
     next_session: u64,
     tab: Option<TabHandle>,
-    stop: watch::Sender<bool>,
+    stop: Shutdown,
     subscriptions: Vec<TabSubscription>,
     tab_events_tx: mpsc::Sender<ConnEvent>,
     tab_events_rx: mpsc::Receiver<ConnEvent>,
@@ -817,7 +739,26 @@ impl Conn {
                 "userAgent": PRODUCT,
                 "jsVersion": "QuickJS",
             })),
-            "Browser.setDownloadBehavior" => Ok(json!({})),
+            "Browser.setDownloadBehavior"
+            | "Browser.grantPermissions"
+            | "Browser.resetPermissions"
+            | "Target.setDiscoverTargets"
+            | "Target.activateTarget"
+            | "BluetoothEmulation.enable"
+            | "BluetoothEmulation.disable"
+            | "Storage.setStorageBucketTracking"
+            | "BackgroundService.startObserving"
+            | "Memory.startSampling"
+            | "Emulation.setSensorOverrideEnabled"
+            | "Emulation.setDevicePostureOverride"
+            | "Debugger.setAsyncCallStackDepth"
+            | "DOMDebugger.setInstrumentationBreakpoint"
+            | "DOMStorage.enable"
+            | "Page.stopScreenRecording"
+            | "Fetch.enable"
+            | "Fetch.disable"
+            | "CSS.enable"
+            | "CSS.disable" => Ok(json!({})),
             "Browser.getWindowForTarget" => Ok(json!({
                 "windowId": 1,
                 "bounds": {"left": 0, "top": 0, "width": 1280, "height": 720, "windowState": "normal"},
@@ -830,7 +771,7 @@ impl Conn {
                 self.sessions.clear();
                 self.stop_subscriptions();
                 self.tab = None;
-                let _result = self.stop.send(true);
+                self.stop.request();
                 Ok(json!({}))
             }
             _ => self.dispatch_target(method, params).await,
@@ -845,18 +786,7 @@ impl Conn {
         match method {
             "Target.setAutoAttach" => Ok(self.set_auto_attach(params).await),
             "Target.getTargetInfo" => self.target_info_for(params).await,
-            "Target.getTargets" => {
-                let mut target_infos = Vec::new();
-                for id in self
-                    .browser
-                    .tabs()
-                    .await
-                    .map_err(|error| DispatchError::Failed(error.to_string()))?
-                {
-                    target_infos.push(target_info(&self.browser, id).await);
-                }
-                Ok(json!({ "targetInfos": target_infos }))
-            }
+            "Target.getTargets" => self.target_list().await,
             "Target.createTarget" => {
                 let url = params
                     .get("url")
@@ -937,8 +867,34 @@ impl Conn {
                 }
                 Ok(json!({}))
             }
-            _ => Err(DispatchError::MethodNotFound),
+            _ => Self::unknown_target_method(method),
         }
+    }
+
+    /// Every open tab as a `Target.targetInfo` list.
+    async fn target_list(&self) -> Result<Value, DispatchError> {
+        let mut target_infos = Vec::new();
+        for id in self
+            .browser
+            .tabs()
+            .await
+            .map_err(|error| DispatchError::Failed(error.to_string()))?
+        {
+            target_infos.push(target_info(&self.browser, id).await);
+        }
+        Ok(json!({ "targetInfos": target_infos }))
+    }
+
+    /// Target methods outside the implemented set: fixed-shape replies and
+    /// domain stubs keep the corpus moving past the method table.
+    fn unknown_target_method(method: &str) -> Result<Value, DispatchError> {
+        if let Some(reply) = static_reply(method) {
+            return Ok(reply);
+        }
+        if stubbed_domain(method) {
+            return Ok(json!({}));
+        }
+        Err(DispatchError::MethodNotFound)
     }
 
     async fn dispatch_tab_method(
@@ -948,6 +904,12 @@ impl Conn {
         tab: &TabHandle,
         session: Option<&str>,
     ) -> Result<Value, DispatchError> {
+        if let Some(value) = self
+            .dispatch_document_method(method, params, tab, session)
+            .await?
+        {
+            return Ok(value);
+        }
         match method {
             "Page.enable" => {
                 self.subscribe_tab(tab, session).await?;
@@ -1023,6 +985,68 @@ impl Conn {
             }
             _ => session_method(method, tab).await,
         }
+    }
+
+    /// Document, input, CSS, and trace methods. Returns `None` when the method
+    /// belongs to another table.
+    async fn dispatch_document_method(
+        &mut self,
+        method: &str,
+        params: &Value,
+        tab: &TabHandle,
+        session: Option<&str>,
+    ) -> Result<Option<Value>, DispatchError> {
+        let value = match method {
+            "DOM.getDocument" => dom_get_document(tab).await?,
+            "DOM.querySelector" => dom_query_selector(tab, params, false).await?,
+            "DOM.querySelectorAll" => dom_query_selector(tab, params, true).await?,
+            "DOM.describeNode" => dom_describe_node(tab, params).await?,
+            "DOM.getOuterHTML" => dom_node_string(tab, params, "outerHTML").await?,
+            "DOM.getAttributes" => dom_node_string(tab, params, "attributes").await?,
+            "DOM.resolveNode" => dom_resolve_node(tab, params).await?,
+            "DOM.getNodeForLocation" => dom_node_for_location(tab, params).await?,
+            "DOM.getBoxModel" => dom_box_model(tab, params).await?,
+            "DOM.getContentQuads" => dom_content_quads(tab, params).await?,
+            "Input.dispatchMouseEvent" => input_mouse_event(tab, params).await?,
+            "Input.dispatchKeyEvent" => input_key_event(tab, params).await?,
+            "Input.insertText" => input_insert_text(tab, params).await?,
+            "Input.dispatchTouchEvent" => input_touch_event(tab, params).await?,
+            "Input.emulateTouchFromMouseEvent" => {
+                input_emulate_touch_from_mouse(tab, params).await?
+            }
+            "CSS.enable" => {
+                for mut header in css_stylesheets(tab).await? {
+                    if let Some(object) = header.as_object_mut() {
+                        object.insert("frameId".into(), json!(tab.id().to_string()));
+                    }
+                    self.push_session_event(
+                        session,
+                        "CSS.styleSheetAdded",
+                        &json!({"header": header}),
+                    );
+                }
+                json!({})
+            }
+            "CSS.getComputedStyleForNode" => css_computed_style(tab, params).await?,
+            "Tracing.end" => {
+                self.push_session_event(
+                    session,
+                    "Tracing.dataCollected",
+                    &json!({"value": [{
+                        "name": "process_name", "ph": "M",
+                        "args": {"name": "tinybrowser"},
+                    }]}),
+                );
+                self.push_session_event(
+                    session,
+                    "Tracing.tracingComplete",
+                    &json!({"dataLossOccurred": false}),
+                );
+                json!({})
+            }
+            _ => return Ok(None),
+        };
+        Ok(Some(value))
     }
 
     async fn navigate_tab(
