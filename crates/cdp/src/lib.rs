@@ -736,7 +736,10 @@ impl Conn {
                 "userAgent": PRODUCT,
                 "jsVersion": "QuickJS",
             })),
-            "Browser.setDownloadBehavior" => Ok(json!({})),
+            "Browser.setDownloadBehavior"
+            | "Browser.grantPermissions"
+            | "Browser.resetPermissions"
+            | "Target.setDiscoverTargets" => Ok(json!({})),
             "Browser.getWindowForTarget" => Ok(json!({
                 "windowId": 1,
                 "bounds": {"left": 0, "top": 0, "width": 1280, "height": 720, "windowState": "normal"},
@@ -763,6 +766,7 @@ impl Conn {
     ) -> Result<Value, DispatchError> {
         match method {
             "Target.setAutoAttach" => Ok(self.set_auto_attach(params).await),
+            "Target.attachToBrowserTarget" => Ok(json!({"sessionId": "browser"})),
             "Target.getTargetInfo" => self.target_info_for(params).await,
             "Target.getTargets" => {
                 let mut target_infos = Vec::new();

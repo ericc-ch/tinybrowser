@@ -65,6 +65,26 @@ pub(crate) async fn session_method(method: &str, tab: &TabHandle) -> Result<Valu
             "cssContentSize": {"x": 0, "y": 0, "width": VIEWPORT_WIDTH, "height": VIEWPORT_HEIGHT},
         })),
         "Page.addScriptToEvaluateOnNewDocument" => Ok(json!({"identifier": "1"})),
+        "Page.reload" => {
+            let url = tab
+                .document_url()
+                .await
+                .map_err(|error| DispatchError::Failed(error.to_string()))?;
+            open_url(tab, &url).await?;
+            Ok(json!({}))
+        }
+        "Page.getResourceTree" => {
+            let url = tab
+                .document_url()
+                .await
+                .map_err(|error| DispatchError::Failed(error.to_string()))?;
+            Ok(json!({"frameTree": {"frame": {
+                "id": tab.id().to_string(),
+                "loaderId": "",
+                "url": url,
+                "mimeType": "text/html",
+            }}}))
+        }
         "Runtime.disable"
         | "Target.setAutoAttach"
         | "Runtime.runIfWaitingForDebugger"
@@ -77,9 +97,32 @@ pub(crate) async fn session_method(method: &str, tab: &TabHandle) -> Result<Valu
         | "Emulation.setTouchEmulationEnabled"
         | "Emulation.setEmulatedMedia"
         | "Emulation.setScriptExecutionDisabled"
+        | "Emulation.setPressureSourceOverrideEnabled"
         | "Runtime.addBinding"
         | "Security.setIgnoreCertificateErrors"
-        | "Page.setBypassCSP" => Ok(json!({})),
+        | "Page.setBypassCSP"
+        | "DOM.enable"
+        | "DOM.disable"
+        | "DOMSnapshot.enable"
+        | "Debugger.enable"
+        | "Debugger.disable"
+        | "Fetch.enable"
+        | "Fetch.disable"
+        | "Audits.enable"
+        | "Audits.disable"
+        | "Animation.enable"
+        | "Animation.disable"
+        | "BluetoothEmulation.enable"
+        | "BluetoothEmulation.disable"
+        | "IndexedDB.enable"
+        | "WebMCP.enable"
+        | "Accessibility.enable"
+        | "ServiceWorker.enable"
+        | "Tracing.start"
+        | "Tracing.end"
+        | "Network.clearBrowserCookies"
+        | "Network.clearBrowserCache"
+        | "Network.setCacheDisabled" => Ok(json!({})),
         _ => Err(DispatchError::MethodNotFound),
     }
 }

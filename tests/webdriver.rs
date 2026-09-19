@@ -649,7 +649,7 @@ fn execute_sync_interrupts_infinite_loop() {
 }
 
 #[test]
-fn unknown_element_click_and_perform_actions_are_unsupported() {
+fn unknown_element_click_and_perform_actions_validation() {
     let (addr, _fixture) = start(Vec::new());
     let created = request(&addr, "POST", "/session", Some("{}"));
     let id = created["value"]["sessionId"]
@@ -665,8 +665,17 @@ fn unknown_element_click_and_perform_actions_are_unsupported() {
         Some("{}"),
     );
     assert_eq!(click["value"]["error"], json!("no such element"));
+    // Perform Actions requires the actions array; a missing one is an invalid
+    // argument, an empty sequence succeeds.
     let actions = request(&addr, "POST", &format!("/session/{id}/actions"), Some("{}"));
-    assert_eq!(actions["value"]["error"], json!("unsupported operation"));
+    assert_eq!(actions["value"]["error"], json!("invalid argument"));
+    let empty = request(
+        &addr,
+        "POST",
+        &format!("/session/{id}/actions"),
+        Some(r#"{"actions":[]}"#),
+    );
+    assert_eq!(empty["value"], Value::Null);
     let released = request(&addr, "DELETE", &format!("/session/{id}/actions"), None);
     assert_eq!(released["value"], Value::Null);
 }

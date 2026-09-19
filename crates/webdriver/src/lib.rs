@@ -166,6 +166,7 @@ async fn dispatch(method: &str, path: &str, body: &str, sessions: &mut Sessions)
         }
         ("POST", ["session", session, "timeouts"]) => set_timeouts(sessions, session, body),
         ("GET", ["session", session, "timeouts"]) => get_timeouts(sessions, session),
+        ("POST", ["session", session, "permissions"]) => set_permission(sessions, session),
         ("POST", ["session", session, "element"]) => find_element(sessions, session, body).await,
         ("POST", ["session", session, "elements"]) => find_elements(sessions, session, body).await,
         ("POST", ["session", session, "element", element, "click"]) => {
@@ -188,8 +189,8 @@ async fn dispatch(method: &str, path: &str, body: &str, sessions: &mut Sessions)
         {
             window_op(sessions, session)
         }
-        ("POST", ["session", _session, "actions"]) => {
-            error(500, "unsupported operation", "actions")
+        ("POST", ["session", session, "actions"]) => {
+            perform_actions(sessions, session, body).await
         }
         // Release Actions ([WebDriver] release-actions). No input state can
         // exist while Perform Actions is unsupported, so releasing is a no-op.
@@ -614,6 +615,69 @@ async fn element_send_keys(
     match window.tab.execute_script(&script).await {
         Ok(RemoteValue::Bool(true)) => ok(Value::Null),
         Ok(_) => error(404, "no such element", "unknown element id"),
+        Err(err) => script_error(&err),
+    }
+}
+
+/// `POST /session/{id}/permissions` (`WebDriver` permissions extension).
+/// The engine has no permission store yet, so state changes are accepted and
+/// ignored rather than leaving the command unimplemented
+/// (<https://w3c.github.io/permissions/#webdriver-command-set-permission>).
+fn set_permission(sessions: &Sessions, session: &str) -> (u16, Value) {
+    if sessions.open.contains_key(session) {
+        ok(Value::Null)
+    } else {
+        error(404, "invalid session id", session)
+    }
+}
+
+/// `POST /session/{id}/actions` (Perform Actions)
+/// (<https://w3c.github.io/webdriver/#perform-actions>).
+///
+/// Element origins are resolved against the current window and rewritten to
+/// the engine's remote element number; the page-side performer then runs the
+/// tick sequence.
+async fn perform_actions(sessions: &Sessions, session: &str, body: &str) -> (u16, Value) {
+    let parsed: Value = match serde_json::from_str(body) {
+        Ok(value) => value,
+        Err(err) => return error(400, "invalid argument", &err.to_string()),
+    };
+    let Some(sources) = parsed.get("actions").and_then(Value::as_array) else {
+        return error(400, "invalid argument", "actions is required");
+    };
+    let Some(window) = current(sessions, session) else {
+        return error(404, "invalid session id", session);
+    };
+    let mut resolved = Vec::with_capacity(sources.len());
+    for source in sources {
+        let mut source = source.clone();
+        if let Some(items) = source.get_mut("actions").and_then(Value::as_array_mut) {
+            for item in items {
+                let Some(origin) = item.get_mut("origin") else {
+                    continue;
+                };
+                let Some(element) = origin.get(ELEMENT_KEY).and_then(Value::as_str) else {
+                    continue;
+                };
+                let (handle, remote) = match element_remote(element) {
+                    Ok(remote) => remote,
+                    Err(reply) => return reply,
+                };
+                if !is_current_handle(sessions, session, handle) {
+                    return error(404, "no such element", "element belongs to another window");
+                }
+                *origin = json!({"__tbRemote": remote});
+            }
+        }
+        resolved.push(source);
+    }
+    let script = format!(
+        "(function(){{return globalThis.__tbWebDriverActions({});}})()",
+        serde_json::to_string(&Value::Array(resolved)).unwrap_or_else(|_| "[]".to_owned())
+    );
+    match window.tab.execute_script(&script).await {
+        Ok(RemoteValue::Bool(true)) => ok(Value::Null),
+        Ok(_) => error(500, "unknown error", "actions were not performed"),
         Err(err) => script_error(&err),
     }
 }
