@@ -1,12 +1,14 @@
 # Handoff (2026-09-19)
 
-State: branch `chase/wpt-grind` (not pushed), tip `51c2656`, clean. Scores on
+State: branch `chase/wpt-grind` (not pushed), tip `4cfbca2`, clean. Scores on
 this branch: `webstorage/` 47/54 (87.0%), `url/` 25/49 (51.0%),
 `webmessaging/` 106/124 (85.5%, broadcastchannel excluded),
 `webmessaging/broadcastchannel/` 5/12 (41.7%), `focus/` 3/41 (7.3%),
 `domparsing/` 21/74 (28.4%), `FileAPI/` 32/68 (47.1%). Shipping binary
-8,223,096 bytes (cap 10,485,760). `tools/ub lint`, `cargo test --workspace`
-(34 suites), and `tools/ship` are green at `51c2656`.
+8,282,776 bytes (cap 10,485,760). CDP `--all`: PASS 33, no missing methods
+(one intentional `Domain.NotExistingCommand` test). `tools/ub lint`,
+`cargo test --workspace` (34 suites), and `tools/ship` are green at
+`4cfbca2`.
 
 Done (this branch):
 
@@ -64,18 +66,24 @@ Next:
 
 1. CDP and WebDriver are the active workstream (the user asked to unblock
    them fully). Current state:
-   - CDP `--all` measured PASS 17, `UNSUPPORTED_METHOD` 385 (from 831),
-     `MISSING_FIXTURE` 507, `TIMEOUT` 342, `PROTOCOL_FAILURE` 236 after the
-     DOM query/CSS/Tracing batch; the computed-style and static/config-surface
-     batches are measuring now. `DOM.getDocument`/queries, `Input.*`,
-     `CSS.enable` + `getComputedStyleForNode`, `Tracing.end`, and
-     `Storage.getStorageKey` are real; the stub layer answers fixed shapes or
-     empty results for the CSS/DOM/Emulation/Page/Target/Network/Debugger/etc.
-     configuration surface. What remains is behavior, not plumbing:
-     `Target.attachedToTarget` for workers (59 waits), `Debugger.paused` (31),
-     late `CSS.styleSheetAdded` (27), `Network.requestWillBeSent`/
-     `responseReceived` (33), `Audits.issueAdded` (15), `Fetch.requestPaused`
-     (12), Animation events (17), Storage bucket events (8), ServiceWorker (7).
+   - CDP `--all` after the method-table campaign: PASS 33,
+     `UNSUPPORTED_METHOD` **1** (down from 831; the one left is a test that
+     deliberately calls `Domain.NotExistingCommand` and expects an error),
+     `PROTOCOL_FAILURE` 509, `TIMEOUT` 419, `MISSING_FIXTURE` 525,
+     `HARNESS_UNSUPPORTED` 7. Every CDP method call is now answered; the
+     remainder is behavior, not plumbing. `DOM.getDocument`/queries,
+     `Input.*`, `CSS.enable` + `getComputedStyleForNode`, `Tracing.end`,
+     `Storage.getStorageKey`, and the fixed-shape replies are real; the rest
+     of the CSS/DOM/Emulation/Page/Target/Network/Debugger/Input/etc. surface
+     answers empty results.
+   - The next CDP investment is behavior: workers via
+     `Target.attachedToTarget` (59 waits), `Debugger.paused` (40), late
+     `CSS.styleSheetAdded` (27), Network request/response events (35),
+     `Audits.issueAdded` (16), `Fetch.requestPaused` (13), storage-bucket/
+     service-worker/animation events (~35), and the 509 protocol failures
+     concentrated in CSS (98), Emulation (73), DOM (64), Page (25).
+     `MISSING_FIXTURE` (525) is a runner limitation: the static fixture server
+     cannot serve Chromium's `*.test` hosts, HTTPS certificates, or PHP.
    - WebDriver `POST /session/{id}/actions` works for pointer move/down/up/
      cancel, key down/up with text entry, and wheel; `permissions` accepts
      requests but the engine has no permission store. Remaining: touch
