@@ -37,10 +37,10 @@ use tungstenite::protocol::{Message, Role, WebSocket as ClientSocket};
 mod dispatch;
 use dispatch::{
     DispatchError, RUNTIME_HANDLE, RUNTIME_HANDLE_READ, RUNTIME_HANDLE_SCHEDULE, RUNTIME_READ,
-    RUNTIME_SCHEDULE, arguments_expression, attach_session, capture_screenshot, css_stylesheets,
-    dom_describe_node, dom_get_document, dom_node_for_location, dom_node_string, dom_query_selector,
-    dom_resolve_node, exception_reply, exception_text_reply, input_key_event, input_mouse_event,
-    json_io, json_string, open_url, session_method, target_id, target_info,
+    RUNTIME_SCHEDULE, arguments_expression, attach_session, capture_screenshot, css_computed_style,
+    css_stylesheets, dom_describe_node, dom_get_document, dom_node_for_location, dom_node_string,
+    dom_query_selector, dom_resolve_node, exception_reply, exception_text_reply, input_key_event,
+    input_mouse_event, json_io, json_string, open_url, session_method, target_id, target_info,
     wait_for_navigation, ws_io,
 };
 
@@ -1005,6 +1005,7 @@ impl Conn {
                 }
                 json!({})
             }
+            "CSS.getComputedStyleForNode" => css_computed_style(tab, params).await?,
             "Tracing.end" => {
                 self.push_session_event(
                     session,

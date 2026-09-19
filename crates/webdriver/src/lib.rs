@@ -189,9 +189,7 @@ async fn dispatch(method: &str, path: &str, body: &str, sessions: &mut Sessions)
         {
             window_op(sessions, session)
         }
-        ("POST", ["session", session, "actions"]) => {
-            perform_actions(sessions, session, body).await
-        }
+        ("POST", ["session", session, "actions"]) => perform_actions(sessions, session, body).await,
         // Release Actions ([WebDriver] release-actions). No input state can
         // exist while Perform Actions is unsupported, so releasing is a no-op.
         ("DELETE", ["session", session, "actions"]) => {

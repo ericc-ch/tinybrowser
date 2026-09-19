@@ -143,6 +143,16 @@ fn noop_method(method: &str) -> bool {
             | "Network.setExtraHTTPHeaders"
             | "Network.emulateNetworkConditionsByRule"
             | "CSS.disable"
+            | "Emulation.setSensorOverrideEnabled"
+            | "Emulation.setDevicePostureOverride"
+            | "Memory.startSampling"
+            | "BackgroundService.startObserving"
+            | "Storage.setStorageBucketTracking"
+            | "DOMStorage.enable"
+            | "Debugger.setAsyncCallStackDepth"
+            | "DOMDebugger.setInstrumentationBreakpoint"
+            | "Target.activateTarget"
+            | "Page.stopScreenRecording"
             | "Overlay.enable"
             | "Overlay.disable"
             | "DOMDebugger.enable"
@@ -202,18 +212,25 @@ pub(crate) async fn dom_get_document(tab: &TabHandle) -> Result<Value, DispatchE
             "DOM.getDocument could not serialize the document".into(),
         ));
     };
-    let root: Value = serde_json::from_str(&text)
-        .map_err(|error| DispatchError::Failed(error.to_string()))?;
+    let root: Value =
+        serde_json::from_str(&text).map_err(|error| DispatchError::Failed(error.to_string()))?;
     Ok(json!({"root": root}))
 }
 
 /// `Input.dispatchMouseEvent`: one pointer step through the page-side
 /// performer, preceded by a move so press/release land on the right target.
-pub(crate) async fn input_mouse_event(tab: &TabHandle, params: &Value) -> Result<Value, DispatchError> {
+pub(crate) async fn input_mouse_event(
+    tab: &TabHandle,
+    params: &Value,
+) -> Result<Value, DispatchError> {
     let kind = params.get("type").and_then(Value::as_str).unwrap_or("");
     let x = params.get("x").and_then(Value::as_f64).unwrap_or(0.0);
     let y = params.get("y").and_then(Value::as_f64).unwrap_or(0.0);
-    let button = match params.get("button").and_then(Value::as_str).unwrap_or("left") {
+    let button = match params
+        .get("button")
+        .and_then(Value::as_str)
+        .unwrap_or("left")
+    {
         "middle" => 1,
         "right" => 2,
         "back" => 3,
@@ -243,7 +260,10 @@ pub(crate) async fn input_mouse_event(tab: &TabHandle, params: &Value) -> Result
 
 /// `Input.dispatchKeyEvent`: one key step through the page-side performer.
 /// `char` events carry their text in `text`.
-pub(crate) async fn input_key_event(tab: &TabHandle, params: &Value) -> Result<Value, DispatchError> {
+pub(crate) async fn input_key_event(
+    tab: &TabHandle,
+    params: &Value,
+) -> Result<Value, DispatchError> {
     let kind = params.get("type").and_then(Value::as_str).unwrap_or("");
     let key = params.get("key").and_then(Value::as_str).unwrap_or("");
     let text = params.get("text").and_then(Value::as_str).unwrap_or("");
@@ -317,10 +337,9 @@ pub(crate) async fn dom_query_selector(
       }
       return JSON.stringify({nodeIds: nodeIds});
     })()";
-    let selector = serde_json::to_string(
-        params.get("selector").and_then(Value::as_str).unwrap_or(""),
-    )
-    .unwrap_or_else(|_| "\"\"".to_owned());
+    let selector =
+        serde_json::to_string(params.get("selector").and_then(Value::as_str).unwrap_or(""))
+            .unwrap_or_else(|_| "\"\"".to_owned());
     let script = (if all { ALL } else { SINGLE })
         .replace("__NODE__", &requested_node(params).to_string())
         .replace("__SELECTOR__", &selector);
@@ -402,8 +421,22 @@ pub(crate) async fn dom_node_for_location(
       return JSON.stringify({nodeId: id});
     })()";
     let script = TEMPLATE
-        .replace("__X__", &params.get("x").and_then(Value::as_f64).unwrap_or(0.0).to_string())
-        .replace("__Y__", &params.get("y").and_then(Value::as_f64).unwrap_or(0.0).to_string());
+        .replace(
+            "__X__",
+            &params
+                .get("x")
+                .and_then(Value::as_f64)
+                .unwrap_or(0.0)
+                .to_string(),
+        )
+        .replace(
+            "__Y__",
+            &params
+                .get("y")
+                .and_then(Value::as_f64)
+                .unwrap_or(0.0)
+                .to_string(),
+        );
     dom_eval(tab, &script).await
 }
 
@@ -429,6 +462,26 @@ pub(crate) async fn css_stylesheets(tab: &TabHandle) -> Result<Vec<Value>, Dispa
     })()"#;
     let value = dom_eval(tab, SCRIPT).await?;
     Ok(value.as_array().cloned().unwrap_or_default())
+}
+
+/// `CSS.getComputedStyleForNode`: the resolved style as name/value pairs.
+pub(crate) async fn css_computed_style(
+    tab: &TabHandle,
+    params: &Value,
+) -> Result<Value, DispatchError> {
+    const TEMPLATE: &str = r"(function(){
+      const n = globalThis.__tb_dom_nodes[__NODE__];
+      if (!n || !globalThis.getComputedStyle) return JSON.stringify({computedStyle: []});
+      const style = globalThis.getComputedStyle(n);
+      const computedStyle = [];
+      for (let i = 0; i < style.length; i++) {
+        const name = style.item(i);
+        computedStyle.push({name: name, value: style.getPropertyValue(name)});
+      }
+      return JSON.stringify({computedStyle: computedStyle});
+    })()";
+    let script = TEMPLATE.replace("__NODE__", &requested_node(params).to_string());
+    dom_eval(tab, &script).await
 }
 
 /// One viewport rectangle for [`Page.getLayoutMetrics`].
