@@ -18,6 +18,31 @@ use crate::node::{
 /// wrap).
 static NEXT_DOCUMENT_ID: AtomicU32 = AtomicU32::new(0);
 
+const INPUT_TYPES: &[&str] = &[
+    "hidden",
+    "text",
+    "search",
+    "tel",
+    "url",
+    "email",
+    "password",
+    "date",
+    "month",
+    "week",
+    "time",
+    "datetime-local",
+    "number",
+    "range",
+    "color",
+    "checkbox",
+    "radio",
+    "file",
+    "submit",
+    "image",
+    "reset",
+    "button",
+];
+
 /// The document-compatibility mode a query runs under: what html5ever's
 /// tree builder reports and parsed pages carry.
 ///
@@ -149,6 +174,15 @@ pub struct Dom {
     /// the element's child list
     /// (<https://html.spec.whatwg.org/multipage/scripting.html#the-template-element>).
     template_contents: HashMap<NodeId, NodeId>,
+    /// Shadow host → (shadow root, open mode). Shadow roots are detached
+    /// fragments in the node tree and cross to their host only for the
+    /// shadow-including tree algorithms.
+    shadow_roots: HashMap<NodeId, (NodeId, bool)>,
+    /// Shadow root → host, the inverse of `shadow_roots`.
+    shadow_hosts: HashMap<NodeId, NodeId>,
+    /// Dirty value state for text-like `input` elements. Absence means the
+    /// live value still follows the `value` content attribute.
+    input_values: HashMap<NodeId, String>,
     /// Recorded mutations, drained by the renderer's `MutationObserver`
     /// plumbing; empty and unrecorded unless someone observes the document.
     mutations: Vec<Mutation>,
@@ -194,6 +228,9 @@ impl Dom {
             quirks_mode: QuirksMode::NoQuirks,
             document_language: None,
             template_contents: HashMap::new(),
+            shadow_roots: HashMap::new(),
+            shadow_hosts: HashMap::new(),
+            input_values: HashMap::new(),
             mutations: Vec::new(),
             record_mutations: false,
             recording_suppressed: false,
@@ -275,6 +312,9 @@ impl Dom {
             if let Some(children) = self.children(current) {
                 stack.extend(children.copied());
             }
+            if let Some(root) = self.shadow_root(current) {
+                stack.push(root);
+            }
         }
         snapshot
     }
@@ -282,7 +322,14 @@ impl Dom {
     /// Whether `id`'s ancestor chain reaches the document root.
     #[must_use]
     pub fn is_connected(&self, id: NodeId) -> bool {
-        id == self.document || self.ancestors(id).any(|ancestor| ancestor == self.document)
+        let mut current = Some(id);
+        while let Some(node) = current {
+            if node == self.document {
+                return true;
+            }
+            current = self.parent(node).or_else(|| self.shadow_host(node));
+        }
+        false
     }
 
     /// `id`'s ancestors, nearest first, `id` excluded.
@@ -396,6 +443,54 @@ impl Dom {
             }
             None
         }
+    }
+
+    /// Children in the rendered, shadow-including tree. A shadow host renders
+    /// its shadow root instead of its light-DOM children.
+    #[must_use]
+    pub fn rendered_children(&self, id: NodeId) -> Vec<NodeId> {
+        if let Some(root) = self.shadow_root(id) {
+            return vec![root];
+        }
+        self.children(id)
+            .map(|children| children.copied().collect())
+            .unwrap_or_default()
+    }
+
+    /// Parent in the rendered, shadow-including tree.
+    #[must_use]
+    pub fn rendered_parent(&self, id: NodeId) -> Option<NodeId> {
+        self.parent(id).or_else(|| self.shadow_host(id))
+    }
+
+    /// Adjacent sibling in the rendered, shadow-including tree.
+    #[must_use]
+    pub fn rendered_sibling(&self, id: NodeId, forward: bool) -> Option<NodeId> {
+        let parent = self.rendered_parent(id)?;
+        let children = self.rendered_children(parent);
+        let position = children.iter().position(|&child| child == id)?;
+        if forward {
+            children.get(position + 1).copied()
+        } else {
+            position
+                .checked_sub(1)
+                .and_then(|index| children.get(index).copied())
+        }
+    }
+
+    /// Descendants in pre-order through rendered shadow trees.
+    #[must_use]
+    pub fn rendered_descendants(&self, id: NodeId) -> Vec<NodeId> {
+        let mut descendants = Vec::new();
+        let mut stack = self.rendered_children(id);
+        stack.reverse();
+        while let Some(node) = stack.pop() {
+            descendants.push(node);
+            let mut children = self.rendered_children(node);
+            children.reverse();
+            stack.extend(children);
+        }
+        descendants
     }
 
     /// A stable identity token for `id`, for selector-engine caches.
@@ -603,6 +698,62 @@ impl Dom {
     pub fn template_contents(&self, template: NodeId) -> Option<NodeId> {
         let contents = self.template_contents.get(&template).copied()?;
         self.contains(contents).then_some(contents)
+    }
+
+    /// Attaches a new shadow root to `host`.
+    ///
+    /// Implements the tree association from the DOM "attach a shadow root"
+    /// algorithm; policy checks such as the HTML element safelist remain at
+    /// the binding boundary.
+    /// <https://dom.spec.whatwg.org/#concept-attach-a-shadow-root>
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DomError::HierarchyRequest`] if the host already has a
+    /// shadow root, and [`DomError::WrongNodeType`] for a non-element host.
+    pub fn attach_shadow(&mut self, host: NodeId, open: bool) -> Result<NodeId, DomError> {
+        self.require_live(host)?;
+        if !matches!(self.kind(host), Some(NodeKind::Element { .. })) {
+            return Err(DomError::WrongNodeType);
+        }
+        if self.shadow_roots.contains_key(&host) {
+            return Err(DomError::HierarchyRequest);
+        }
+        let root = self.create_fragment();
+        self.shadow_roots.insert(host, (root, open));
+        self.shadow_hosts.insert(root, host);
+        self.mutation_serial = self.mutation_serial.wrapping_add(1);
+        Ok(root)
+    }
+
+    /// The shadow root associated with `host`, including a closed root.
+    #[must_use]
+    pub fn shadow_root(&self, host: NodeId) -> Option<NodeId> {
+        let (root, _) = self.shadow_roots.get(&host).copied()?;
+        self.contains(root).then_some(root)
+    }
+
+    /// The open shadow root associated with `host`.
+    #[must_use]
+    pub fn open_shadow_root(&self, host: NodeId) -> Option<NodeId> {
+        let (root, open) = self.shadow_roots.get(&host).copied()?;
+        (open && self.contains(root)).then_some(root)
+    }
+
+    /// The host of a shadow-root fragment.
+    #[must_use]
+    pub fn shadow_host(&self, root: NodeId) -> Option<NodeId> {
+        let host = self.shadow_hosts.get(&root).copied()?;
+        self.contains(host).then_some(host)
+    }
+
+    /// Whether `root` is an open shadow root.
+    #[must_use]
+    pub fn shadow_root_is_open(&self, root: NodeId) -> Option<bool> {
+        let host = self.shadow_host(root)?;
+        self.shadow_roots
+            .get(&host)
+            .and_then(|&(candidate, open)| (candidate == root).then_some(open))
     }
 
     /// Appends `child` as the last child of `parent`.
@@ -1109,6 +1260,79 @@ impl Dom {
             .map(|attribute| attribute.value.clone())
     }
 
+    /// The live value of an HTML `input` element.
+    ///
+    /// Before the dirty value flag is set, the value follows the content
+    /// attribute; setting the IDL value stores an independent value
+    /// (<https://html.spec.whatwg.org/multipage/input.html#dom-input-value>).
+    #[must_use]
+    pub fn input_value(&self, id: NodeId) -> Option<String> {
+        let (name, _) = self.element(id)?;
+        if name.ns != html_namespace() || name.local.as_ref() != "input" {
+            return None;
+        }
+        let value = self
+            .input_values
+            .get(&id)
+            .cloned()
+            .or_else(|| self.attribute(id, "value"))
+            .unwrap_or_default();
+        Some(self.sanitize_input_value(id, value))
+    }
+
+    /// Sets an HTML `input` element's live value and its dirty value flag.
+    ///
+    /// <https://html.spec.whatwg.org/multipage/input.html#dom-input-value>
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DomError::WrongNodeType`] when `id` is not an HTML `input`.
+    pub fn set_input_value(&mut self, id: NodeId, value: String) -> Result<(), DomError> {
+        let (name, _) = self.element(id).ok_or(DomError::WrongNodeType)?;
+        if name.ns != html_namespace() || name.local.as_ref() != "input" {
+            return Err(DomError::WrongNodeType);
+        }
+        let value = self.sanitize_input_value(id, value);
+        self.input_values.insert(id, value);
+        Ok(())
+    }
+
+    /// The normalized type state of an HTML `input` element.
+    #[must_use]
+    pub fn input_type(&self, id: NodeId) -> Option<String> {
+        self.input_value_element(id)?;
+        let value = self
+            .attribute(id, "type")
+            .unwrap_or_else(|| "text".into())
+            .to_ascii_lowercase();
+        Some(if INPUT_TYPES.contains(&value.as_str()) {
+            value
+        } else {
+            "text".into()
+        })
+    }
+
+    fn input_value_element(&self, id: NodeId) -> Option<()> {
+        let (name, _) = self.element(id)?;
+        (name.ns == html_namespace() && name.local.as_ref() == "input").then_some(())
+    }
+
+    /// Applies the value sanitization algorithm for the input states needed
+    /// by text entry. Other states retain their string until their dedicated
+    /// state algorithms are implemented.
+    /// <https://html.spec.whatwg.org/multipage/input.html#value-sanitization-algorithm>
+    fn sanitize_input_value(&self, id: NodeId, value: String) -> String {
+        let typ = self.input_type(id).unwrap_or_else(|| "text".into());
+        match typ.as_str() {
+            "text" | "search" | "tel" | "password" => value.replace(['\r', '\n'], ""),
+            "url" | "email" => value
+                .replace(['\r', '\n'], "")
+                .trim_matches(|character: char| character.is_ascii_whitespace())
+                .to_owned(),
+            _ => value,
+        }
+    }
+
     /// [Element.hasAttribute](https://dom.spec.whatwg.org/#dom-element-hasattribute):
     /// exact local-name match; HTML elements lowercase the queried name.
     #[must_use]
@@ -1492,8 +1716,16 @@ impl Dom {
 
         let mut pending = vec![id];
         while let Some(current) = pending.pop() {
+            self.input_values.remove(&current);
             if let Some(contents) = self.template_contents.remove(&current) {
                 pending.push(contents);
+            }
+            if let Some((root, _)) = self.shadow_roots.remove(&current) {
+                self.shadow_hosts.remove(&root);
+                pending.push(root);
+            }
+            if let Some(host) = self.shadow_hosts.remove(&current) {
+                self.shadow_roots.remove(&host);
             }
             self.template_contents
                 .retain(|_, contents| *contents != current);

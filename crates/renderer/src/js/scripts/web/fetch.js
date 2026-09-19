@@ -61,10 +61,10 @@ Object.defineProperty(globalThis.Headers.prototype, Symbol.toStringTag, { value:
 globalThis.Response = class Response {
   constructor(body, init) {
     const options = init === undefined ? {} : Object(init);
-    const text = body === undefined || body === null ? '' : String(body);
+    const storedBody = body === undefined || body === null ? '' : body;
     Object.defineProperty(this, __tbResponseData, {
       value: {
-        text,
+        body: storedBody,
         status: options.status === undefined ? 200 : Number(options.status),
         statusText: options.statusText === undefined ? '' : String(options.statusText),
         url: options.url === undefined ? '' : String(options.url),
@@ -79,21 +79,46 @@ globalThis.Response = class Response {
   get headers() { return __tbBrand(this, __tbResponseData).headers; }
   get ok() { const status = __tbBrand(this, __tbResponseData).status; return status >= 200 && status <= 299; }
   get bodyUsed() { return false; }
-  text() { return Promise.resolve(__tbBrand(this, __tbResponseData).text); }
+  text() { return __tbResponseBytes(__tbBrand(this, __tbResponseData).body).then(bytes => __tbDecodeBytes(bytes, 'utf-8', false, false)); }
   json() {
-    try { return Promise.resolve(JSON.parse(__tbBrand(this, __tbResponseData).text)); }
-    catch (error) { return Promise.reject(error); }
+    return this.text().then(JSON.parse);
   }
-  arrayBuffer() { return Promise.resolve(__tbUtf8Encode(__tbBrand(this, __tbResponseData).text).buffer); }
+  arrayBuffer() { return __tbResponseBytes(__tbBrand(this, __tbResponseData).body).then(bytes => bytes.buffer); }
   blob() {
     const data = __tbBrand(this, __tbResponseData);
     const type = data.headers.get('content-type');
-    return Promise.resolve(new Blob([data.text], { type: type === null ? '' : type }));
+    return __tbResponseBytes(data.body).then(bytes => new Blob([bytes], { type: type === null ? '' : type }));
   }
   clone() {
     const data = __tbBrand(this, __tbResponseData);
-    return new Response(data.text, { status: data.status, statusText: data.statusText, url: data.url, headers: data.headers });
+    return new Response(data.body, { status: data.status, statusText: data.statusText, url: data.url, headers: data.headers });
   }
+};
+const __tbResponseBytes = async body => {
+  if (body instanceof ReadableStream) {
+    const chunks = [];
+    let length = 0;
+    const reader = body.getReader();
+    while (true) {
+      const step = await reader.read();
+      if (step.done) break;
+      const chunk = typeof step.value === 'string' ? __tbUtf8Encode(step.value)
+        : step.value instanceof Uint8Array ? step.value
+        : ArrayBuffer.isView(step.value) ? new Uint8Array(step.value.buffer, step.value.byteOffset, step.value.byteLength)
+        : step.value instanceof ArrayBuffer ? new Uint8Array(step.value)
+        : __tbUtf8Encode(String(step.value));
+      chunks.push(chunk);
+      length += chunk.length;
+    }
+    const bytes = new Uint8Array(length);
+    let offset = 0;
+    for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.length; }
+    return bytes;
+  }
+  if (body instanceof Blob) return new Uint8Array(await body.arrayBuffer());
+  if (body instanceof ArrayBuffer) return new Uint8Array(body.slice(0));
+  if (ArrayBuffer.isView(body)) return new Uint8Array(body.buffer, body.byteOffset, body.byteLength).slice();
+  return __tbUtf8Encode(String(body));
 };
 Object.defineProperty(globalThis.Response.prototype, Symbol.toStringTag, { value: 'Response', writable: false, enumerable: false, configurable: true });
 const __tbLookupObjectUrl = url => {

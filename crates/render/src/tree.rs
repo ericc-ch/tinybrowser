@@ -79,11 +79,9 @@ fn build_children(
     parent: NodeId,
     parent_style: &Style,
 ) -> Vec<BoxNode> {
-    let Some(children) = dom.children(parent) else {
-        return Vec::new();
-    };
+    let children = dom.rendered_children(parent);
     let mut boxes = Vec::new();
-    for &child in children {
+    for child in children {
         match dom.kind(child) {
             Some(dom::NodeKind::Element { name, .. }) => {
                 let style = styles
@@ -111,6 +109,17 @@ fn build_children(
                 };
                 let children = if is_break {
                     Vec::new()
+                } else if let Some(value) = rendered_input_text(dom, child) {
+                    if value.is_empty() {
+                        Vec::new()
+                    } else {
+                        vec![BoxNode {
+                            kind: BoxKind::Text(value),
+                            node: None,
+                            style: style.clone(),
+                            children: Vec::new(),
+                        }]
+                    }
                 } else {
                     let kids = build_children(dom, styles, child, &style);
                     wrap_anonymous(kids, &style)
@@ -140,6 +149,36 @@ fn build_children(
         }
     }
     boxes
+}
+
+/// Text painted inside the UA widget for the input states whose value is
+/// textual. Form-control appearance is UA-defined; the value itself comes
+/// from HTML's live value state
+/// (<https://html.spec.whatwg.org/multipage/input.html#dom-input-value>).
+fn rendered_input_text(dom: &Dom, id: NodeId) -> Option<String> {
+    let dom::NodeKind::Element { name, .. } = dom.kind(id)? else {
+        return None;
+    };
+    if name.ns != dom::html_namespace() || name.local.as_ref() != "input" {
+        return None;
+    }
+    let input_type = dom.input_type(id).unwrap_or_else(|| "text".into());
+    match input_type.as_str() {
+        "hidden" | "checkbox" | "radio" | "file" | "image" | "range" | "color" => {
+            Some(String::new())
+        }
+        "submit" => Some(
+            dom.input_value(id)
+                .filter(|value| !value.is_empty())
+                .unwrap_or_else(|| "Submit".into()),
+        ),
+        "reset" => Some(
+            dom.input_value(id)
+                .filter(|value| !value.is_empty())
+                .unwrap_or_else(|| "Reset".into()),
+        ),
+        _ => dom.input_value(id),
+    }
 }
 
 /// Whether a box participates in block flow.

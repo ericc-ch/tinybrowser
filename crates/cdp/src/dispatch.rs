@@ -9,8 +9,8 @@ use std::time::Duration;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use browser::{
-    BrowserHandle, RemoteValue, ScreenshotClip, ScreenshotRequest, TabError, TabEvent, TabHandle,
-    TabId,
+    BrowserHandle, FrameId, RemoteValue, ScreenshotClip, ScreenshotRequest, TabError, TabEvent,
+    TabHandle, TabId,
 };
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
@@ -734,11 +734,38 @@ pub(crate) async fn capture_screenshot(
         viewport_height: narrow(viewport_height),
         clip,
     };
+    let frame = requested_frame(tab, params)?;
     let png = tab
-        .screenshot(request)
+        .screenshot_frame(frame, request)
         .await
         .map_err(|error| DispatchError::Failed(error.to_string()))?;
     Ok(json!({"data": BASE64_STANDARD.encode(&png)}))
+}
+
+/// Resolves the optional renderer-frame extension used by automation clients
+/// that need to address a child realm directly. Standard CDP calls omit it
+/// and therefore address the main frame.
+pub(crate) fn requested_frame(tab: &TabHandle, params: &Value) -> Result<FrameId, DispatchError> {
+    let Some(raw) = params.get("frameId").and_then(Value::as_str) else {
+        return Ok(FrameId::MAIN);
+    };
+    let target_id = tab.id().to_string();
+    if raw == target_id || raw == "main" {
+        return Ok(FrameId::MAIN);
+    }
+    let (_, renderer_frame) = raw
+        .split_once('.')
+        .filter(|(target, renderer_frame)| {
+            *target == target_id && !renderer_frame.is_empty() && !renderer_frame.contains('.')
+        })
+        .ok_or_else(|| DispatchError::Failed("invalid frameId".into()))?;
+    let renderer_frame = renderer_frame
+        .parse::<u64>()
+        .map_err(|_| DispatchError::Failed("invalid frameId".into()))?;
+    if renderer_frame == FrameId::MAIN.get() {
+        return Err(DispatchError::Failed("invalid frameId".into()));
+    }
+    Ok(FrameId::new(renderer_frame))
 }
 
 /// Narrows a clipped CDP coordinate to the renderer's `f32` viewport.

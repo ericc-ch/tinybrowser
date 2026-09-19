@@ -149,8 +149,9 @@ impl<'a> StyloNode<'a> {
     /// can point at other records.
     pub(crate) fn build_all(dom: &'a Dom, tables: &'a StyloTables) -> Vec<StyloNode<'a>> {
         let document = dom.document();
+        let descendants = dom.rendered_descendants(document);
         std::iter::once(document)
-            .chain(dom.descendants(document))
+            .chain(descendants)
             .map(|id| StyloNode {
                 dom,
                 id,
@@ -173,23 +174,28 @@ impl<'a> StyloNode<'a> {
     where
         'b: 'a,
     {
-        self.parent
-            .set(node_at(nodes, self.tables, self.dom.parent(self.id)));
-        if let Some(kids) = self.dom.children(self.id) {
-            let first = kids.clone().next().copied();
-            let last = kids.clone().next_back().copied();
-            self.first_child.set(node_at(nodes, self.tables, first));
-            self.last_child.set(node_at(nodes, self.tables, last));
-        }
+        self.parent.set(node_at(
+            nodes,
+            self.tables,
+            self.dom.rendered_parent(self.id),
+        ));
+        let kids = self.dom.rendered_children(self.id);
+        self.first_child
+            .set(node_at(nodes, self.tables, kids.first().copied()));
+        self.last_child
+            .set(node_at(nodes, self.tables, kids.last().copied()));
         self.prev_sibling.set(node_at(
             nodes,
             self.tables,
-            self.dom.sibling(self.id, false),
+            self.dom.rendered_sibling(self.id, false),
         ));
-        self.next_sibling
-            .set(node_at(nodes, self.tables, self.dom.sibling(self.id, true)));
+        self.next_sibling.set(node_at(
+            nodes,
+            self.tables,
+            self.dom.rendered_sibling(self.id, true),
+        ));
         let mut root = self.id;
-        while let Some(parent) = self.dom.parent(root) {
+        while let Some(parent) = self.dom.rendered_parent(root) {
             root = parent;
         }
         self.owner_doc.set(node_at(nodes, self.tables, Some(root)));
@@ -300,7 +306,6 @@ impl<'a> TNode for &'a StyloNode<'a> {
     }
 
     fn as_shadow_root(&self) -> Option<Self::ConcreteShadowRoot> {
-        // No shadow trees exist here.
         None
     }
 }
@@ -343,9 +348,7 @@ impl<'a> TShadowRoot for &'a StyloNode<'a> {
     }
 
     fn host(&self) -> <Self::ConcreteNode as TNode>::ConcreteElement {
-        // Unreachable: `as_shadow_root` always returns `None`, so no shadow
-        // root handle ever exists to call this on.
-        unreachable!("no shadow trees exist in this DOM")
+        unreachable!("shadow-root styling is not exposed to Stylo")
     }
 
     fn style_data<'b>(&self) -> Option<&'b style::stylist::CascadeData>

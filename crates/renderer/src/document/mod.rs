@@ -211,6 +211,7 @@ pub(crate) struct Document {
     /// already in hand.
     decoder: Option<dial::ResponseDecoder>,
     classic_fetch_in_flight: bool,
+    deferred_modules: Vec<(dom::NodeId, crate::js::ScriptSource)>,
     stop: Arc<Stop>,
 }
 
@@ -267,6 +268,7 @@ impl Document {
             parser_owner: ParserOwner::Carrier,
             decoder: None,
             classic_fetch_in_flight: false,
+            deferred_modules: Vec::new(),
             stop: Arc::clone(&runtime.stop),
         }
     }
@@ -921,6 +923,7 @@ impl Document {
         world.pending_html_writes.clear();
         world.release_stream_bytes(bytes);
         self.classic_fetch_in_flight = false;
+        self.deferred_modules.clear();
     }
 
     /// `document.open()`, `document.write()`, and `document.close()` all land
@@ -997,13 +1000,15 @@ impl Document {
                     // Microtask checkpoint before the script runs; parser
                     // mutations queued since the last script deliver now.
                     self.deliver_mutations();
-                    let script = crate::js::classic_script_at(&self.world.borrow(), id);
+                    let script = crate::js::script_at(&self.world.borrow(), id);
                     match script {
-                        Some(crate::js::ClassicScript::Inline(source)) => {
+                        Some(crate::js::Script::Classic(crate::js::ScriptSource::Inline(
+                            source,
+                        ))) => {
                             self.eval_classic(&source, Some(id));
                             self.sync_parser_from_world();
                         }
-                        Some(crate::js::ClassicScript::Src(src)) => {
+                        Some(crate::js::Script::Classic(crate::js::ScriptSource::Src(src))) => {
                             if let Ok(url) = self.resolve_dial_url(&src) {
                                 self.classic_fetch_in_flight = true;
                                 let initiator = self.url.clone();
@@ -1017,6 +1022,14 @@ impl Document {
                                 });
                                 return;
                             }
+                            self.sync_parser_from_world();
+                        }
+                        Some(crate::js::Script::Module(source)) => {
+                            // Module scripts are deferred by default: parsing
+                            // continues, then the queue runs in document order
+                            // before `DOMContentLoaded`
+                            // (<https://html.spec.whatwg.org/multipage/scripting.html#attr-script-defer>).
+                            self.deferred_modules.push((id, source));
                             self.sync_parser_from_world();
                         }
                         None => self.sync_parser_from_world(),
@@ -1210,6 +1223,7 @@ impl Document {
             .borrow_mut()
             .set_main_ready_state(ReadyState::Interactive);
         self.fire_js(crate::js::JsRealm::fire_ready_state_change);
+        self.run_deferred_modules();
         self.fire_js(crate::js::JsRealm::fire_dom_content_loaded);
         self.adopt_js_work();
         // A script may have appended an iframe after the parser finished; its
@@ -1217,6 +1231,35 @@ impl Document {
         // (<https://html.spec.whatwg.org/multipage/parsing.html#delay-the-load-event>).
         self.adopt_pending_frames();
         self.fire_document_load();
+    }
+
+    fn run_deferred_modules(&mut self) {
+        let modules = std::mem::take(&mut self.deferred_modules);
+        for (index, (element, source)) in modules.into_iter().enumerate() {
+            let result = match source {
+                crate::js::ScriptSource::Inline(source) => {
+                    let name = format!("{}#inline-module-{index}", self.url);
+                    self.js
+                        .as_ref()
+                        .map_or(Ok(()), |js| js.eval_inline_module(&name, &source))
+                }
+                crate::js::ScriptSource::Src(src) => match self.resolve_dial_url(&src) {
+                    Ok(url) => self
+                        .js
+                        .as_ref()
+                        .map_or(Ok(()), |js| js.eval_external_module(url.as_str())),
+                    Err(_) => Err(crate::js::JsError::Engine(
+                        "invalid module script URL".into(),
+                    )),
+                },
+            };
+            if result.is_err() {
+                self.record_event(TabEvent::ScriptFailed);
+            } else {
+                self.fire_js(|js| js.fire_node_load(element));
+            }
+            self.adopt_js_work();
+        }
     }
 
     fn fire_document_load(&mut self) {

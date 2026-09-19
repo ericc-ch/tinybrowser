@@ -22,6 +22,11 @@
     writable: true,
     configurable: true,
   });
+  Object.defineProperty(globalThis.DOMTokenList.prototype, Symbol.iterator, {
+    value: values,
+    writable: true,
+    configurable: true,
+  });
   for (const [collectionName, collectionProto] of [
     ['NodeList', native],
     ['NamedNodeMap', globalThis.NamedNodeMap.prototype],

@@ -62,11 +62,13 @@ enum Command {
         reply: oneshot::Sender<Result<(), TabError>>,
     },
     Execute {
+        frame: FrameId,
         source: String,
         timeout: Option<Duration>,
         reply: oneshot::Sender<Result<RemoteValue, TabError>>,
     },
     Screenshot {
+        frame: FrameId,
         request: renderer::ScreenshotRequest,
         reply: oneshot::Sender<Result<Vec<u8>, TabError>>,
     },
@@ -75,6 +77,7 @@ enum Command {
         reply: oneshot::Sender<Result<bool, TabError>>,
     },
     RunUntilJsTrue {
+        frame: FrameId,
         source: String,
         timeout: Duration,
         reply: oneshot::Sender<Result<bool, TabError>>,
@@ -113,7 +116,7 @@ enum Command {
 /// (`source` holds the predicate) wait.
 struct Waiter {
     deadline: Instant,
-    source: Option<String>,
+    source: Option<(FrameId, String)>,
     reply: oneshot::Sender<Result<bool, TabError>>,
 }
 
@@ -173,8 +176,25 @@ impl TabHandle {
         source: &str,
         timeout: Option<Duration>,
     ) -> Result<RemoteValue, TabError> {
+        self.execute_script_in(FrameId::MAIN, source, timeout).await
+    }
+
+    /// Evaluates `source` in one frame, interrupting `QuickJS` if `timeout`
+    /// elapses.
+    ///
+    /// # Errors
+    ///
+    /// [`TabError::UnknownFrame`], [`TabError::Script`], or
+    /// [`TabError::ActorStopped`].
+    pub async fn execute_script_in(
+        &self,
+        frame: FrameId,
+        source: &str,
+        timeout: Option<Duration>,
+    ) -> Result<RemoteValue, TabError> {
         let source = source.to_owned();
         self.request_fallible(move |reply| Command::Execute {
+            frame,
             source,
             timeout,
             reply,
@@ -192,8 +212,26 @@ impl TabHandle {
         &self,
         request: renderer::ScreenshotRequest,
     ) -> Result<Vec<u8>, TabError> {
-        self.request_fallible(move |reply| Command::Screenshot { request, reply })
-            .await
+        self.screenshot_frame(FrameId::MAIN, request).await
+    }
+
+    /// Renders one frame to a PNG.
+    ///
+    /// # Errors
+    ///
+    /// [`TabError::ActorStopped`], [`TabError::UnknownFrame`], or
+    /// [`TabError::Render`] when the pipeline refuses the document.
+    pub async fn screenshot_frame(
+        &self,
+        frame: FrameId,
+        request: renderer::ScreenshotRequest,
+    ) -> Result<Vec<u8>, TabError> {
+        self.request_fallible(move |reply| Command::Screenshot {
+            frame,
+            request,
+            reply,
+        })
+        .await
     }
 
     /// Waits until the current navigation has fired `load`, returning `false`
@@ -217,8 +255,25 @@ impl TabHandle {
         source: &str,
         timeout: Duration,
     ) -> Result<bool, TabError> {
+        self.run_until_js_true_in(FrameId::MAIN, source, timeout)
+            .await
+    }
+
+    /// Waits until `source` evaluates to JS `true` in `frame`, returning
+    /// `false` on timeout.
+    ///
+    /// # Errors
+    ///
+    /// [`TabError::UnknownFrame`] or [`TabError::ActorStopped`].
+    pub async fn run_until_js_true_in(
+        &self,
+        frame: FrameId,
+        source: &str,
+        timeout: Duration,
+    ) -> Result<bool, TabError> {
         let source = source.to_owned();
         self.request_fallible(move |reply| Command::RunUntilJsTrue {
+            frame,
             source,
             timeout,
             reply,
@@ -855,13 +910,14 @@ async fn handle_command(tab: &mut Tab, command: Command, waiters: &mut Vec<Waite
             let _result = reply.send(tab.goto(&url));
         }
         Command::Execute {
+            frame,
             source,
             timeout,
             reply,
         } => {
             let result = tab
                 .renderer_request(RendererCommand::ExecuteScript {
-                    frame: FrameId::MAIN,
+                    frame,
                     source,
                     timeout_ms: timeout.map(millis),
                 })
@@ -869,14 +925,12 @@ async fn handle_command(tab: &mut Tab, command: Command, waiters: &mut Vec<Waite
                 .and_then(reply_value);
             let _result = reply.send(result);
         }
-        Command::Screenshot { request, reply } => {
-            let result = tab
-                .renderer_request_bytes(RendererCommand::Screenshot {
-                    frame: FrameId::MAIN,
-                    request,
-                })
-                .await;
-            let _result = reply.send(result);
+        Command::Screenshot {
+            frame,
+            request,
+            reply,
+        } => {
+            let _result = reply.send(screenshot_frame(tab, frame, request).await);
         }
         Command::RunUntilLoadTimeout { timeout, reply } => {
             retain_waiter(
@@ -889,6 +943,7 @@ async fn handle_command(tab: &mut Tab, command: Command, waiters: &mut Vec<Waite
             );
         }
         Command::RunUntilJsTrue {
+            frame,
             source,
             timeout,
             reply,
@@ -897,7 +952,7 @@ async fn handle_command(tab: &mut Tab, command: Command, waiters: &mut Vec<Waite
                 waiters,
                 Waiter {
                     deadline: Instant::now() + timeout,
-                    source: Some(source),
+                    source: Some((frame, source)),
                     reply,
                 },
             );
@@ -950,6 +1005,15 @@ async fn handle_command(tab: &mut Tab, command: Command, waiters: &mut Vec<Waite
     false
 }
 
+async fn screenshot_frame(
+    tab: &mut Tab,
+    frame: FrameId,
+    request: renderer::ScreenshotRequest,
+) -> Result<Vec<u8>, TabError> {
+    tab.renderer_request_bytes(RendererCommand::Screenshot { frame, request })
+        .await
+}
+
 fn retain_waiter(waiters: &mut Vec<Waiter>, waiter: Waiter) {
     if waiters.len() < MAX_WAITERS {
         waiters.push(waiter);
@@ -981,12 +1045,12 @@ async fn resolve_waiters(tab: &mut Tab, waiters: &mut Vec<Waiter>) {
                 let _result = waiter.reply.send(Ok(false));
             }
             None => pending.push(waiter),
-            Some(source) => {
+            Some((frame, source)) => {
                 if now >= waiter.deadline {
                     let _result = waiter.reply.send(Ok(false));
                 } else if matches!(
                     tab.renderer_request(RendererCommand::ExecuteScript {
-                        frame: FrameId::MAIN,
+                        frame,
                         source,
                         timeout_ms: None
                     })

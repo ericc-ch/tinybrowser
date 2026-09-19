@@ -5,10 +5,14 @@
   function define(name, parent, members, constructible) {
     const ctor = constructible
       ? function() {
-          return globalThis.__tb_construct.apply(
+          const value = globalThis.__tb_construct.apply(
             globalThis,
             [name].concat(Array.prototype.slice.call(arguments))
           );
+          if (name === 'HTMLElement' && new.target && new.target.prototype) {
+            Object.setPrototypeOf(value, new.target.prototype);
+          }
+          return value;
         }
       : function() { return illegal(); };
     const proto = Object.create(parent ? parent.prototype : Object.prototype);
@@ -77,7 +81,7 @@
     'URL', 'documentURI', 'baseURI', 'location', 'characterSet', 'charset',
     'inputEncoding', 'contentType', 'compatMode', 'title',
     'getElementsByName', 'importNode', 'currentScript', 'activeElement',
-    'elementFromPoint', 'elementsFromPoint', 'defaultView'
+    'elementFromPoint', 'elementsFromPoint', 'defaultView', 'hasFocus'
   ], true);
   const ElementInterface = define('Element', NodeInterface, [
     'getElementsByTagName', 'getElementsByTagNameNS', 'getElementsByClassName',
@@ -93,7 +97,8 @@
     'before', 'after', 'replaceWith', 'previousElementSibling',
     'nextElementSibling', 'tagName', 'localName', 'prefix', 'namespaceURI',
     'className', 'classList', 'dataset', 'id', 'src', 'href', 'name', 'content', 'outerHTML', 'innerHTML', 'style',
-    'remove', 'getBoundingClientRect', 'getClientRects', 'scrollIntoView'
+    'remove', 'getBoundingClientRect', 'getClientRects', 'scrollIntoView',
+    'attachShadow', 'shadowRoot'
   ]);
   // classList is `[PutForwards=value]`: assigning to it sets `.value`
   // (<https://dom.spec.whatwg.org/#dom-element-classlist>).
@@ -126,7 +131,10 @@
     'append', 'prepend', 'replaceChildren', 'querySelector', 'querySelectorAll',
     'getElementById'
   ], true);
-  const HTMLElementInterface = define('HTMLElement', ElementInterface, ['click', 'focus', 'blur']);
+  const ShadowRootInterface = define('ShadowRoot', DocumentFragmentInterface, [
+    'host', 'mode', 'innerHTML', 'activeElement'
+  ]);
+  const HTMLElementInterface = define('HTMLElement', ElementInterface, ['click', 'focus', 'blur'], true);
   const HTMLUnknownElementInterface = define('HTMLUnknownElement', HTMLElementInterface, []);
   const HTMLMediaElementInterface = define('HTMLMediaElement', HTMLElementInterface, []);
   const SVGElementInterface = define('SVGElement', ElementInterface, ['click', 'focus', 'blur']);
@@ -141,6 +149,7 @@
     Comment: CommentInterface.prototype,
     DocumentType: DocumentTypeInterface.prototype,
     DocumentFragment: DocumentFragmentInterface.prototype,
+    ShadowRoot: ShadowRootInterface.prototype,
     HTMLElement: HTMLElementInterface.prototype,
     HTMLUnknownElement: HTMLUnknownElementInterface.prototype,
     HTMLMediaElement: HTMLMediaElementInterface.prototype,
@@ -197,6 +206,7 @@
     ['HTMLScriptElement', HTMLElementInterface],
     ['HTMLSelectElement', HTMLElementInterface],
     ['HTMLSourceElement', HTMLElementInterface],
+    ['HTMLSlotElement', HTMLElementInterface],
     ['HTMLSpanElement', HTMLElementInterface],
     ['HTMLStyleElement', HTMLElementInterface],
     ['HTMLTableCaptionElement', HTMLElementInterface],
@@ -213,7 +223,9 @@
     ['HTMLUListElement', HTMLElementInterface],
     ['HTMLVideoElement', HTMLMediaElementInterface],
   ]) {
-    const members = name === 'HTMLIFrameElement' ? ['contentDocument', 'contentWindow'] : [];
+    const members = name === 'HTMLIFrameElement'
+      ? ['contentDocument', 'contentWindow']
+      : name === 'HTMLInputElement' ? ['value'] : [];
     table[name] = define(name, parent, members).prototype;
   }
   // URL decomposition IDL attributes
@@ -304,6 +316,22 @@
   Object.defineProperty(table.HTMLButtonElement, 'type', reflectType(new Set([
     'submit', 'reset', 'button',
   ]), 'submit'));
+  Object.defineProperties(table.HTMLSlotElement, {
+    assignedNodes: {
+      value: function() {
+        const host = this.getRootNode()?.host;
+        if (!host) return [];
+        const name = this.getAttribute('name') || '';
+        return Array.from(host.childNodes).filter(node =>
+          node.nodeType !== 1 ? name === '' : (node.getAttribute('slot') || '') === name);
+      },
+      writable: true, configurable: true, enumerable: true,
+    },
+    assignedElements: {
+      value: function() { return this.assignedNodes().filter(node => node.nodeType === 1); },
+      writable: true, configurable: true, enumerable: true,
+    },
+  });
   Object.defineProperty(globalThis, '__tb_brandTable', {
     enumerable: false,
     configurable: true,

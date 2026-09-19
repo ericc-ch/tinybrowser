@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
-use browser::{BrowserHandle, RemoteValue, TabEvent, TabHandle, TabId};
+use browser::{BrowserHandle, FrameId, RemoteValue, TabEvent, TabHandle, TabId};
 use bytes::Bytes;
 use futures_util::{SinkExt as _, StreamExt as _};
 use http::{HeaderValue, Method, StatusCode, header};
@@ -41,8 +41,9 @@ use dispatch::{
     css_stylesheets, dom_box_model, dom_content_quads, dom_describe_node, dom_get_document,
     dom_node_for_location, dom_node_string, dom_query_selector, dom_resolve_node, exception_reply,
     exception_text_reply, input_emulate_touch_from_mouse, input_insert_text, input_key_event,
-    input_mouse_event, input_touch_event, json_io, json_string, open_url, session_method,
-    static_reply, stubbed_domain, target_id, target_info, wait_for_navigation, ws_io,
+    input_mouse_event, input_touch_event, json_io, json_string, open_url, requested_frame,
+    session_method, static_reply, stubbed_domain, target_id, target_info, wait_for_navigation,
+    ws_io,
 };
 
 const PRODUCT: &str = "tinybrowser/0.1.0";
@@ -1097,6 +1098,7 @@ impl Conn {
         params: &Value,
         tab: &TabHandle,
     ) -> Result<Value, DispatchError> {
+        let frame = requested_frame(tab, params)?;
         let return_by_value = params
             .get("returnByValue")
             .and_then(Value::as_bool)
@@ -1140,13 +1142,13 @@ impl Conn {
         if return_by_value {
             let id = self.next_handle;
             self.next_handle = self.next_handle.saturating_add(1);
-            Ok(Self::runtime_value(tab, &source, await_timeout, id).await)
+            Ok(Self::runtime_value(tab, frame, &source, await_timeout, id).await)
         } else if await_promise {
             Ok(self
-                .runtime_handle_awaited(tab, &source, await_timeout)
+                .runtime_handle_awaited(tab, frame, &source, await_timeout)
                 .await)
         } else {
-            Ok(self.runtime_handle(tab, &source).await)
+            Ok(self.runtime_handle(tab, frame, &source).await)
         }
     }
 
@@ -1156,6 +1158,7 @@ impl Conn {
     async fn runtime_handle_awaited(
         &mut self,
         tab: &TabHandle,
+        frame: FrameId,
         source: &str,
         timeout: Duration,
     ) -> Value {
@@ -1165,28 +1168,28 @@ impl Conn {
         let schedule = RUNTIME_HANDLE_SCHEDULE
             .replace("__ID__", &id)
             .replace("__SOURCE__", source);
-        if let Err(error) = tab.execute_script(&schedule).await {
+        if let Err(error) = tab.execute_script_in(frame, &schedule, None).await {
             return exception_reply(&error);
         }
         let ready = format!(
             "Boolean(globalThis.__tb_async_handles && globalThis.__tb_async_handles[{id}] && globalThis.__tb_async_handles[{id}].done)"
         );
-        match tab.run_until_js_true(&ready, timeout).await {
+        match tab.run_until_js_true_in(frame, &ready, timeout).await {
             Ok(true) => {}
             Ok(false) => {
                 // Drop the slot so a late settle cannot pile up results; the
                 // promise closure keeps its own reference to the slot.
                 let _ = tab
-                    .execute_script(&format!(
+                    .execute_script_in(frame, &format!(
                         "if (globalThis.__tb_async_handles) delete globalThis.__tb_async_handles[{id}]; undefined"
-                    ))
+                    ), None)
                     .await;
                 return exception_text_reply("awaitPromise timed out");
             }
             Err(error) => return exception_reply(&error),
         }
         let read = RUNTIME_HANDLE_READ.replace("__ID__", &id);
-        let value = match tab.execute_script(&read).await {
+        let value = match tab.execute_script_in(frame, &read, None).await {
             Ok(value) => value,
             Err(error) => return exception_reply(&error),
         };
@@ -1203,13 +1206,13 @@ impl Conn {
 
     /// Stores the result in a page-side handle and returns its `objectId`;
     /// primitives are serializable and returned inline.
-    async fn runtime_handle(&mut self, tab: &TabHandle, source: &str) -> Value {
+    async fn runtime_handle(&mut self, tab: &TabHandle, frame: FrameId, source: &str) -> Value {
         let handle = self.next_handle;
         self.next_handle = self.next_handle.saturating_add(1);
         let script = RUNTIME_HANDLE
             .replace("__ID__", &json_string(&handle.to_string()))
             .replace("__SOURCE__", source);
-        let value = match tab.execute_script(&script).await {
+        let value = match tab.execute_script_in(frame, &script, None).await {
             Ok(value) => value,
             Err(error) => return exception_reply(&error),
         };
@@ -1223,33 +1226,39 @@ impl Conn {
 
     /// Resolves the value (awaiting a thenable via the waiter) and serializes
     /// it to a CDP `RemoteObject`.
-    async fn runtime_value(tab: &TabHandle, source: &str, timeout: Duration, id: u64) -> Value {
+    async fn runtime_value(
+        tab: &TabHandle,
+        frame: FrameId,
+        source: &str,
+        timeout: Duration,
+        id: u64,
+    ) -> Value {
         let id = json_string(&id.to_string());
         let schedule = RUNTIME_SCHEDULE
             .replace("__ID__", &id)
             .replace("__SOURCE__", source);
-        if let Err(error) = tab.execute_script(&schedule).await {
+        if let Err(error) = tab.execute_script_in(frame, &schedule, None).await {
             return exception_reply(&error);
         }
         let ready = format!(
             "Boolean(globalThis.__tb_async && globalThis.__tb_async[{id}] && globalThis.__tb_async[{id}].done)"
         );
-        match tab.run_until_js_true(&ready, timeout).await {
+        match tab.run_until_js_true_in(frame, &ready, timeout).await {
             Ok(true) => {}
             Ok(false) => {
                 // Drop the slot so a late settle cannot pile up results; the
                 // promise closure keeps its own reference to the slot.
                 let _ = tab
-                    .execute_script(&format!(
+                    .execute_script_in(frame, &format!(
                         "if (globalThis.__tb_async) delete globalThis.__tb_async[{id}]; undefined"
-                    ))
+                    ), None)
                     .await;
                 return exception_text_reply("awaitPromise timed out");
             }
             Err(error) => return exception_reply(&error),
         }
         let value = match tab
-            .execute_script(&RUNTIME_READ.replace("__ID__", &id))
+            .execute_script_in(frame, &RUNTIME_READ.replace("__ID__", &id), None)
             .await
         {
             Ok(value) => value,

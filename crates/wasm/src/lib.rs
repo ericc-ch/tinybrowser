@@ -266,6 +266,7 @@ fn start_hop(owner: u64, chain: Chain, completion: DialCompletion) {
         kind: match chain.kind {
             DialKind::JsFetch => FetchKind::JsFetch,
             DialKind::ClassicScript => FetchKind::ClassicScript,
+            DialKind::ModuleScript => FetchKind::ModuleScript,
             DialKind::Stylesheet => FetchKind::Stylesheet,
             DialKind::FrameLoad => FetchKind::FrameLoad,
         },

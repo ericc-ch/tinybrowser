@@ -54,8 +54,8 @@ use dom::{
 };
 
 use rquickjs::{
-    Class, Ctx, Exception, FromJs, Function, Object, Persistent, Result, Symbol, Value, class::Trace,
-    prelude::This,
+    Class, Ctx, Exception, FromJs, Function, Object, Persistent, Result, Symbol, Value,
+    class::Trace, prelude::This,
 };
 
 use super::events::{self, JsEvent, JsEventTarget};
@@ -233,6 +233,7 @@ pub(crate) fn install(ctx: &Ctx<'_>, world: &Rc<RefCell<World>>) -> Result<()> {
         "__tb_construct",
         rquickjs::prelude::Func::from(construct_node),
     )?;
+    node::install_custom_construction(ctx)?;
     globals.set("__tb_handlerNames", HANDLER_ATTRIBUTES.to_vec())?;
     globals.set(
         "__tbGetNodeHandler",
@@ -553,6 +554,10 @@ pub(super) fn wrap_new_document<'js>(ctx: &Ctx<'js>, parsed: crate::Parsed) -> R
 }
 
 fn instantiate_node<'js>(ctx: &Ctx<'js>, id: NodeId) -> Result<Value<'js>> {
+    let is_shadow_root = world(ctx)?
+        .borrow()
+        .document(id)
+        .is_some_and(|parsed| parsed.dom.shadow_host(id).is_some());
     let brand = with_node_kind(ctx, id, |kind| match kind {
         Some(NodeKind::Document) => Some(if document_is_html_content(ctx, id) {
             "Document"
@@ -565,7 +570,11 @@ fn instantiate_node<'js>(ctx: &Ctx<'js>, id: NodeId) -> Result<Value<'js>> {
         Some(NodeKind::ProcessingInstruction { .. }) => Some("ProcessingInstruction"),
         Some(NodeKind::Comment { .. }) => Some("Comment"),
         Some(NodeKind::Doctype { .. }) => Some("DocumentType"),
-        Some(NodeKind::Fragment) => Some("DocumentFragment"),
+        Some(NodeKind::Fragment) => Some(if is_shadow_root {
+            "ShadowRoot"
+        } else {
+            "DocumentFragment"
+        }),
         None => None,
     })?;
     let Some(brand) = brand else {
@@ -701,6 +710,7 @@ const ELEMENT_INTERFACES: &[(&str, &str)] = &[
     ("select", "HTMLSelectElement"),
     ("small", "HTMLElement"),
     ("source", "HTMLSourceElement"),
+    ("slot", "HTMLSlotElement"),
     ("spacer", "HTMLElement"),
     ("span", "HTMLSpanElement"),
     ("strike", "HTMLElement"),

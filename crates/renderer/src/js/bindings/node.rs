@@ -17,8 +17,8 @@ use super::{
     refresh_named_node_map, remove_attribute_sync, required_node, root_of,
     schedule_mutation_delivery, select_error, set_attribute_node, set_character_data,
     sibling_value, string_value, throw_dom, throw_dom_error, touch_attr, tree_order,
-    valid_attribute_local_name, validate_and_extract, webidl_to_string,
-    with_node_kind, world, world_for_node, wrap_new_document, wrap_node,
+    valid_attribute_local_name, validate_and_extract, webidl_to_string, with_node_kind, world,
+    world_for_node, wrap_new_document, wrap_node,
 };
 use rquickjs::function::{Opt, Rest};
 
@@ -65,11 +65,71 @@ pub(crate) fn construct_node<'js>(
             // (<https://dom.spec.whatwg.org/#dom-document-document>).
             wrap_new_document(&ctx, crate::Parsed::empty("application/xml"))
         }
+        "HTMLElement" => {
+            // https://html.spec.whatwg.org/multipage/custom-elements.html#html-element-constructors
+            // During upgrade, the construction stack supplies the existing
+            // element rather than allocating a second wrapper.
+            let id = world(&ctx)?
+                .borrow_mut()
+                .custom_construction
+                .pop()
+                .ok_or_else(|| Exception::throw_type(&ctx, "Illegal constructor"))?;
+            wrap_node(&ctx, id)
+        }
         other => Err(Exception::throw_type(
             &ctx,
             &format!("{other} is not a constructor"),
         )),
     }
+}
+
+pub(super) fn install_custom_construction(ctx: &Ctx<'_>) -> Result<()> {
+    let globals = ctx.globals();
+    globals.set(
+        "__tbPushCustomConstruction",
+        rquickjs::prelude::Func::from(push_custom_construction),
+    )?;
+    globals.set(
+        "__tbDiscardCustomConstruction",
+        rquickjs::prelude::Func::from(discard_custom_construction),
+    )?;
+    Ok(())
+}
+
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "rquickjs Func ABI passes Ctx and Value by value"
+)]
+fn push_custom_construction<'js>(ctx: Ctx<'js>, value: Value<'js>) -> Result<()> {
+    let id = host_node_id(&ctx, &value)
+        .ok_or_else(|| Exception::throw_type(&ctx, "custom element candidate is not an element"))?;
+    let is_element = with_node_kind(&ctx, id, |kind| {
+        matches!(kind, Some(NodeKind::Element { .. }))
+    })?;
+    if !is_element {
+        return Err(Exception::throw_type(
+            &ctx,
+            "custom element candidate is not an element",
+        ));
+    }
+    world(&ctx)?.borrow_mut().custom_construction.push(id);
+    Ok(())
+}
+
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "rquickjs Func ABI passes Ctx and Value by value"
+)]
+fn discard_custom_construction<'js>(ctx: Ctx<'js>, value: Value<'js>) -> Result<()> {
+    let Some(id) = host_node_id(&ctx, &value) else {
+        return Ok(());
+    };
+    let world = world(&ctx)?;
+    let mut world = world.borrow_mut();
+    if world.custom_construction.last() == Some(&id) {
+        world.custom_construction.pop();
+    }
+    Ok(())
 }
 
 /// Constructor `DOMString` with the IDL default: missing and `undefined` are
@@ -416,6 +476,12 @@ impl JsNode {
         } else {
             Value::new_null(ctx)
         }
+    }
+
+    // https://html.spec.whatwg.org/multipage/interaction.html#dom-document-hasfocus
+    #[qjs(rename = "hasFocus")]
+    fn has_focus(&self, ctx: Ctx<'_>) -> bool {
+        is_main_document(&ctx, self.handle.0)
     }
 
     // https://drafts.csswg.org/cssom-view/#dom-document-elementfrompoint
@@ -897,6 +963,32 @@ impl JsNode {
         self.set_attribute(ctx, WebIdlString("id".into()), value)
     }
 
+    // https://html.spec.whatwg.org/multipage/input.html#dom-input-value
+    #[qjs(get)]
+    fn value(&self, ctx: Ctx<'_>) -> Result<String> {
+        let world = world(&ctx)?;
+        let world = world.borrow();
+        let Some(parsed) = world.document(self.handle.0) else {
+            return Err(Exception::throw_type(&ctx, "no document"));
+        };
+        Ok(parsed.dom.input_value(self.handle.0).unwrap_or_default())
+    }
+
+    // https://html.spec.whatwg.org/multipage/input.html#dom-input-value
+    #[qjs(set, rename = "value")]
+    fn set_value(&self, ctx: Ctx<'_>, value: WebIdlString) -> Result<()> {
+        let world = world(&ctx)?;
+        let world = world.borrow();
+        let Some(mut parsed) = world.document_mut(self.handle.0) else {
+            return Err(Exception::throw_type(&ctx, "no document"));
+        };
+        parsed
+            .dom
+            .set_input_value(self.handle.0, value.0)
+            .map_err(|err| throw_dom_error(&ctx, err))?;
+        Ok(())
+    }
+
     #[qjs(get)]
     fn src(&self, ctx: Ctx<'_>) -> Result<String> {
         attribute_value(&ctx, self.handle.0, "src")
@@ -1021,6 +1113,118 @@ impl JsNode {
         self.set_attribute(ctx, WebIdlString("content".into()), value)
     }
 
+    // https://dom.spec.whatwg.org/#dom-element-attachshadow
+    #[qjs(rename = "attachShadow")]
+    fn attach_shadow<'js>(&self, ctx: Ctx<'js>, init: Object<'js>) -> Result<Value<'js>> {
+        let mode: String = init.get("mode")?;
+        let open = match mode.as_str() {
+            "open" => true,
+            "closed" => false,
+            _ => {
+                return Err(Exception::throw_type(
+                    &ctx,
+                    "mode must be 'open' or 'closed'",
+                ));
+            }
+        };
+        let local = with_node_kind(&ctx, self.handle.0, |kind| match kind {
+            Some(NodeKind::Element { name, .. }) if name.ns == html_namespace() => {
+                Some(name.local.to_string())
+            }
+            _ => None,
+        })?;
+        let Some(local) = local else {
+            return Err(throw_dom(
+                &ctx,
+                "NotSupportedError",
+                "element cannot host a shadow root",
+            ));
+        };
+        let allowed = local.contains('-')
+            || matches!(
+                local.as_str(),
+                "article"
+                    | "aside"
+                    | "blockquote"
+                    | "body"
+                    | "div"
+                    | "footer"
+                    | "h1"
+                    | "h2"
+                    | "h3"
+                    | "h4"
+                    | "h5"
+                    | "h6"
+                    | "header"
+                    | "main"
+                    | "nav"
+                    | "p"
+                    | "section"
+                    | "span"
+            );
+        if !allowed {
+            return Err(throw_dom(
+                &ctx,
+                "NotSupportedError",
+                "element cannot host a shadow root",
+            ));
+        }
+
+        let world = world(&ctx)?;
+        let world_ref = world.borrow();
+        let Some(mut parsed) = world_ref.document_mut(self.handle.0) else {
+            return Err(Exception::throw_type(&ctx, "no document"));
+        };
+        if parsed.dom.shadow_root(self.handle.0).is_some() {
+            return Err(throw_dom(
+                &ctx,
+                "NotSupportedError",
+                "element already hosts a shadow root",
+            ));
+        }
+        let root = parsed
+            .dom
+            .attach_shadow(self.handle.0, open)
+            .map_err(|err| throw_dom_error(&ctx, err))?;
+        drop(parsed);
+        drop(world_ref);
+        wrap_node(&ctx, root)
+    }
+
+    #[qjs(get, rename = "shadowRoot")]
+    fn shadow_root<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
+        let world = world(&ctx)?;
+        let root = world
+            .borrow()
+            .document(self.handle.0)
+            .and_then(|parsed| parsed.dom.open_shadow_root(self.handle.0));
+        child_value(&ctx, root)
+    }
+
+    #[qjs(get)]
+    fn host<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
+        let world = world(&ctx)?;
+        let host = world
+            .borrow()
+            .document(self.handle.0)
+            .and_then(|parsed| parsed.dom.shadow_host(self.handle.0));
+        match host {
+            Some(host) => wrap_node(&ctx, host),
+            None => Err(Exception::throw_type(&ctx, "not a shadow root")),
+        }
+    }
+
+    #[qjs(get)]
+    fn mode(&self, ctx: Ctx<'_>) -> Result<String> {
+        let world = world(&ctx)?;
+        let open = world
+            .borrow()
+            .document(self.handle.0)
+            .and_then(|parsed| parsed.dom.shadow_root_is_open(self.handle.0))
+            .ok_or_else(|| Exception::throw_type(&ctx, "not a shadow root"))?;
+        Ok(if open { "open" } else { "closed" }.into())
+    }
+
     // https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-element-innerhtml
     #[qjs(get, rename = "innerHTML")]
     fn inner_html(&self, ctx: Ctx<'_>) -> Result<String> {
@@ -1076,7 +1280,19 @@ impl JsNode {
             }
             _ => None,
         })?
-        .ok_or_else(|| Exception::throw_type(&ctx, "innerHTML requires an element"))?;
+        .or_else(|| {
+            let world = world(&ctx).ok()?;
+            let world = world.borrow();
+            let parsed = world.document(self.handle.0)?;
+            let host = parsed.dom.shadow_host(self.handle.0)?;
+            let Some(NodeKind::Element { name, .. }) = parsed.dom.kind(host) else {
+                return None;
+            };
+            Some((html_fragment_context(name), false))
+        })
+        .ok_or_else(|| {
+            Exception::throw_type(&ctx, "innerHTML requires an element or shadow root")
+        })?;
 
         let snapshots = parse_html_fragment_snapshots(&ctx, &value.0, &context)?;
 
@@ -2404,11 +2620,7 @@ impl JsNode {
         let Some(parsed) = parsed.document(self.handle.0) else {
             return Ok(false);
         };
-        let mut root = self.handle.0;
-        while let Some(parent) = parsed.dom.parent(root) {
-            root = parent;
-        }
-        Ok(root == parsed.dom.document())
+        Ok(parsed.dom.is_connected(self.handle.0))
     }
 
     // https://dom.spec.whatwg.org/#dom-node-clonenode
