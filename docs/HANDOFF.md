@@ -90,6 +90,14 @@ Next:
      sources, duration interpolation, real permission state, and the engine
      gaps the smoke tests exposed (`window.getSelection`, range inputs,
      canvas selection).
+   - Usability blockers found by the Playwright probe
+     (`tools/playwright/interaction.spec.ts`, marked `fixme`): geometry
+     queries return stale boxes (`getBoundingClientRect()` reports the default
+     8x8 box until a render pass forces layout), so Playwright's actionability
+     check never passes and `page.click` times out; fix by syncing layout in
+     geometry queries and hit tests. The WebDriver conformance suite
+     (`webdriver/`, 898 wdspec tests) cannot run yet: the product declares no
+     `wdspec` executor and the shared venv has no pytest.
 2. `focus/` needs the cross-frame focus subsystem (`window.focus()`,
    `document.hasFocus()`, ancestor `activeElement` chain, exact focus event
    order); 30 of 41 files time out waiting for it.
