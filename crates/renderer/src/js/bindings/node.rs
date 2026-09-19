@@ -7,17 +7,18 @@ use super::{
     attr_state, attr_wrapper, attribute_local_name, attribute_value, blur_node, character_data,
     character_data_offset, child_value, clone_document, convert_nodes_into_node,
     create_element_named, create_html_element, create_kind, deref_weak, descendant_text,
-    detach_attr, doctype_fields, document_is_html, document_is_html_content, document_url_string,
-    element_at_point, element_click, element_index, element_node_name, element_sibling_value,
-    elements_by_tag, find_element_by_id, fixup_focus_after_removal, focus_node, host_node_id,
-    import_snapshot, is_element, is_focusable, is_html_element, is_main_document,
-    is_template_element, live_collection, locate_namespace, locate_prefix, main_document,
-    make_weak, materialize_children, materialize_import, new_detached_attr, nodes_equal,
-    optional_node, qualified_name, rect_object, refresh_named_node_map, remove_attribute_sync,
-    required_node, root_of, schedule_mutation_delivery, select_error, set_attribute_node,
-    set_character_data, sibling_value, string_value, throw_dom, throw_dom_error, touch_attr,
-    tree_order, valid_attribute_local_name, validate_and_extract, virtual_rect_object,
-    webidl_to_string, with_node_kind, world, world_for_node, wrap_new_document, wrap_node,
+    detach_attr, doctype_fields, document_base_url_string, document_is_html,
+    document_is_html_content, document_url_string, element_at_point, element_click, element_index,
+    element_node_name, element_sibling_value, elements_by_tag, find_element_by_id,
+    fixup_focus_after_removal, focus_node, host_node_id, import_snapshot, is_element, is_focusable,
+    is_html_element, is_main_document, is_template_element, live_collection, locate_namespace,
+    locate_prefix, main_document, make_weak, materialize_children, materialize_import,
+    new_detached_attr, nodes_equal, optional_node, qualified_name, rect_object,
+    refresh_named_node_map, remove_attribute_sync, required_node, root_of,
+    schedule_mutation_delivery, select_error, set_attribute_node, set_character_data,
+    sibling_value, string_value, throw_dom, throw_dom_error, touch_attr, tree_order,
+    valid_attribute_local_name, validate_and_extract, virtual_rect_object, webidl_to_string,
+    with_node_kind, world, world_for_node, wrap_new_document, wrap_node,
 };
 use rquickjs::function::{Opt, Rest};
 
@@ -759,6 +760,12 @@ impl JsNode {
         document_url_string(&ctx, self.handle.0)
     }
 
+    // https://html.spec.whatwg.org/multipage/urls-and-fetching.html#dom-document-baseuri
+    #[qjs(get, rename = "baseURI")]
+    fn base_uri(&self, ctx: Ctx<'_>) -> String {
+        document_base_url_string(&ctx, self.handle.0)
+    }
+
     // https://html.spec.whatwg.org/multipage/nav-history-apis.html#dom-document-location
     #[qjs(get)]
     fn location<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
@@ -1128,7 +1135,7 @@ impl JsNode {
             .document(self.handle.0)
             .and_then(|parsed| parsed.dom.attribute(self.handle.0, "href"))
             .unwrap_or_default();
-        let base = document_url_string(&ctx, self.handle.0);
+        let base = document_base_url_string(&ctx, self.handle.0);
         Ok(url::Url::parse(&base)
             .ok()
             .and_then(|base| base.join(&raw).ok())
@@ -1137,10 +1144,12 @@ impl JsNode {
 
     #[qjs(set, rename = "href")]
     fn set_href(&self, ctx: Ctx<'_>, value: WebIdlString) -> Result<()> {
-        let base = document_url_string(&ctx, self.handle.0);
-        let resolved = url::Url::parse(&value.0)
-            .or_else(|_| url::Url::parse(&base).and_then(|base| base.join(&value.0)))
-            .map_or_else(|_| value.0, |url| url.to_string());
+        let base = document_base_url_string(&ctx, self.handle.0);
+        let resolved = url::Url::parse(&base)
+            .ok()
+            .and_then(|base| base.join(&value.0).ok())
+            .or_else(|| url::Url::parse(&value.0).ok())
+            .map_or_else(|| value.0.clone(), |url| url.to_string());
         self.set_attribute(ctx, WebIdlString("href".into()), WebIdlString(resolved))
     }
 

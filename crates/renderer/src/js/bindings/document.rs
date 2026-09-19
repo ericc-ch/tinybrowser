@@ -34,6 +34,35 @@ pub(crate) fn document_url_string(ctx: &Ctx<'_>, id: NodeId) -> String {
     "about:blank".to_owned()
 }
 
+/// The document's base URL: the first `base` element's `href` resolved
+/// against the document URL, or the document URL itself
+/// (<https://html.spec.whatwg.org/multipage/urls-and-fetching.html#document-base-url>).
+pub(crate) fn document_base_url_string(ctx: &Ctx<'_>, id: NodeId) -> String {
+    let fallback = document_url_string(ctx, id);
+    let Ok(owner) = world_for_node(ctx, id) else {
+        return fallback;
+    };
+    let world = owner.borrow();
+    let Some(parsed) = world.document(id) else {
+        return fallback;
+    };
+    let Some(base) = parsed
+        .dom
+        .select_first(parsed.dom.document(), "base")
+        .ok()
+        .flatten()
+    else {
+        return fallback;
+    };
+    let Some(href) = parsed.dom.attribute(base, "href") else {
+        return fallback;
+    };
+    url::Url::parse(&fallback)
+        .ok()
+        .and_then(|url| url.join(&href).ok())
+        .map_or(fallback, |url| url.to_string())
+}
+
 /// Whether the document that owns `id` is an HTML document
 /// (`text/html` or `application/xhtml+xml`).
 pub(crate) fn document_is_html(ctx: &Ctx<'_>, id: NodeId) -> bool {

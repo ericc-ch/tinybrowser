@@ -7,6 +7,7 @@
 mod bindings;
 mod events;
 mod intl;
+mod url_parts;
 mod world;
 
 pub(crate) use world::{DocumentStreamCommand, FrameNavigation, RealmRegistry};
@@ -481,6 +482,7 @@ impl JsRealm {
             Self::install_document_host_functions(&ctx, &world)?;
             install_storage_host_functions(&ctx, &world)?;
             install_window_host_functions(&ctx, &world)?;
+            url_parts::install(&ctx)?;
             bindings::install_messaging(&ctx)?;
             ctx.eval::<(), _>(INSTALL_WEB_APIS_JS)?;
             Ok(())
