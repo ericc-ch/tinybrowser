@@ -228,9 +228,9 @@
     };
     const hrefValue = function() {
       const value = this.getAttribute('href');
-      return value === null ? '' : String(value);
+      return value === null ? '' : globalThis.__tbUSVString(value);
     };
-    const base = function() { return document.baseURI; };
+    const base = function() { return globalThis.__tbUSVString(document.baseURI); };
     for (const proto of [table.HTMLAnchorElement, table.HTMLAreaElement]) {
       for (const name of Object.keys(parts)) {
         const index = parts[name];
@@ -248,7 +248,7 @@
         if (name !== 'origin') {
           descriptor.set = function(value) {
             const result = __tbUrlSetPart(
-              hrefValue.call(this), base.call(this), index, String(value));
+              hrefValue.call(this), base.call(this), index, globalThis.__tbUSVString(value));
             if (result !== null && result !== undefined) this.setAttribute('href', result);
           };
         }

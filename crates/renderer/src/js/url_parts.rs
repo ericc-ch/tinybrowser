@@ -9,6 +9,10 @@
 
 use rquickjs::{Ctx, Result, prelude::Func};
 
+use std::borrow::Cow;
+
+use url::quirks;
+
 /// Component indexes shared with the JavaScript accessors.
 const PROTOCOL: u32 = 0;
 const USERNAME: u32 = 1;
@@ -47,9 +51,14 @@ fn parts(spec: &str, base: &str) -> Option<Vec<String>> {
         url.host_str().unwrap_or_default().to_owned(),
         url.port().map_or_else(String::new, |port| port.to_string()),
         url.path().to_owned(),
+        // An empty query or fragment is still `null`/`""` in the
+        // serialization but reads back as the empty string
+        // (<https://url.spec.whatwg.org/#dom-url-search>).
         url.query()
+            .filter(|query| !query.is_empty())
             .map_or_else(String::new, |query| format!("?{query}")),
         url.fragment()
+            .filter(|fragment| !fragment.is_empty())
             .map_or_else(String::new, |fragment| format!("#{fragment}")),
         url.origin().ascii_serialization(),
     ])
@@ -59,47 +68,76 @@ fn parts(spec: &str, base: &str) -> Option<Vec<String>> {
 /// serialization; `None` leaves the caller's attribute untouched.
 fn set_part(spec: &str, base: &str, part: u32, value: &str) -> Option<String> {
     let mut url = resolve(spec, base)?;
+    // Setters run the basic URL parser on their input, which drops ASCII tab
+    // and newline; `username` and `password` instead percent-encode the value
+    // as-is (<https://url.spec.whatwg.org/#concept-basic-url-parser>).
+    let stripped = strip_ascii_tab_newline(value);
     let changed = match part {
-        PROTOCOL => url.set_scheme(value.trim_end_matches(':')).is_ok(),
-        USERNAME => url.set_username(value).is_ok(),
-        PASSWORD => url
-            .set_password(if value.is_empty() { None } else { Some(value) })
-            .is_ok(),
-        HOST | HOSTNAME => url
-            .set_host(if value.is_empty() { None } else { Some(value) })
-            .is_ok(),
+        PROTOCOL => quirks::set_protocol(&mut url, &stripped).is_ok(),
+        USERNAME => quirks::set_username(&mut url, value).is_ok(),
+        PASSWORD => quirks::set_password(&mut url, value).is_ok(),
+        HOST => set_host(&mut url, &stripped, true),
+        HOSTNAME => set_host(&mut url, &stripped, false),
         PORT => {
-            if value.is_empty() {
-                url.set_port(None).is_ok()
-            } else if let Ok(port) = value.parse::<u16>() {
-                url.set_port(Some(port)).is_ok()
-            } else {
+            // A value that is non-empty but loses everything to tab/newline
+            // stripping leaves the port untouched; browsers do not clear it
+            // (<https://url.spec.whatwg.org/#dom-url-port>).
+            if !value.is_empty() && stripped.is_empty() {
                 false
+            } else {
+                quirks::set_port(&mut url, &stripped).is_ok()
             }
         }
         PATHNAME => {
-            url.set_path(value);
+            quirks::set_pathname(&mut url, &stripped);
             true
         }
         SEARCH => {
-            url.set_query(if value.is_empty() {
-                None
-            } else {
-                Some(value.strip_prefix('?').unwrap_or(value))
-            });
+            quirks::set_search(&mut url, &stripped);
             true
         }
         HASH => {
-            url.set_fragment(if value.is_empty() {
-                None
-            } else {
-                Some(value.strip_prefix('#').unwrap_or(value))
-            });
+            quirks::set_hash(&mut url, &stripped);
             true
         }
         _ => false,
     };
     changed.then(|| url.to_string())
+}
+
+/// The browser `host`/`hostname` setters: a `file:` URL rejects a port and
+/// maps a `localhost` host to the empty host
+/// (<https://url.spec.whatwg.org/#concept-host-setter>).
+fn set_host(url: &mut url::Url, value: &str, with_port: bool) -> bool {
+    if url.scheme() == "file" && with_port && value.contains(':') {
+        return false;
+    }
+    let changed = if with_port {
+        quirks::set_host(url, value)
+    } else {
+        quirks::set_hostname(url, value)
+    };
+    if changed.is_err() {
+        return false;
+    }
+    if url.scheme() == "file" && url.host_str() == Some("localhost") {
+        return quirks::set_host(url, "").is_ok();
+    }
+    true
+}
+
+/// Removes ASCII tab and newline, as the basic URL parser does before every
+/// setter parse (<https://url.spec.whatwg.org/#concept-basic-url-parser>).
+fn strip_ascii_tab_newline(value: &str) -> Cow<'_, str> {
+    if !value.contains(['\t', '\n', '\r']) {
+        return Cow::Borrowed(value);
+    }
+    Cow::Owned(
+        value
+            .chars()
+            .filter(|character| !matches!(character, '\t' | '\n' | '\r'))
+            .collect(),
+    )
 }
 
 /// Parses `spec` relative to `base`, falling back to an absolute parse
