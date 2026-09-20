@@ -28,10 +28,12 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
-# Pure-Rust crates with tests. Extend when unsafe logic moves into a new one.
+# Pure-Rust crates with tests. Miri cannot execute FFI, so `renderer` (QuickJS)
+# is excluded even though Stylo's `unsafe fn` hooks live there. Valgrind covers
+# those hooks via `renderer::render` tests; do not add `renderer` to Miri.
 miri_crates=(logging)
-# Default Valgrind: logging plus `renderer::render` (Stylo `unsafe fn` hooks;
-# a handful of small renders, not the full QuickJS renderer suite).
+# Default Valgrind: logging, then the `render` module tests (Stylo hooks plus
+# empty-document smokes). Not the full QuickJS renderer suite.
 
 usage() {
   echo "usage: tools/ub [lint|miri [crate...]|valgrind [crate...]]" >&2

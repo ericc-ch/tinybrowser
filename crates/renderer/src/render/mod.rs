@@ -224,8 +224,18 @@ impl std::error::Error for RenderError {}
 
 #[cfg(test)]
 mod tests {
-    use super::{RenderOptions, encode_png, render};
-    use dom::Dom;
+    use super::{RenderOptions, encode_png, layout_boxes, render};
+    use dom::{Dom, LocalName, QualName, html_namespace};
+
+    fn html_name(local: &str) -> QualName {
+        QualName::new(None, html_namespace(), LocalName::from(local))
+    }
+
+    fn append_html_element(dom: &mut Dom, parent: dom::NodeId, local: &str) -> dom::NodeId {
+        let element = dom.create_element(html_name(local), Vec::new());
+        dom.append(parent, element).expect("append");
+        element
+    }
 
     #[test]
     fn renders_requested_viewport() {
@@ -263,5 +273,28 @@ mod tests {
         .expect("render");
         let png = encode_png(&image).expect("encode");
         assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n");
+    }
+
+    #[test]
+    fn styles_a_tree_of_elements() {
+        let mut dom = Dom::new();
+        let document = dom.document();
+        let html = append_html_element(&mut dom, document, "html");
+        let body = append_html_element(&mut dom, html, "body");
+        let div = append_html_element(&mut dom, body, "div");
+        let boxes = layout_boxes(
+            &dom,
+            &[],
+            &RenderOptions {
+                width: 200.0,
+                height: 120.0,
+                scale: 1.0,
+            },
+        )
+        .expect("layout");
+        assert!(
+            boxes.iter().any(|laid_out| laid_out.node == Some(div)),
+            "Stylo traversal must style the element so layout emits its box"
+        );
     }
 }
