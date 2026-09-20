@@ -4,7 +4,7 @@
 //! one binary, no fontconfig, deterministic output. Liberation Sans is
 //! metric-compatible with Arial and OFL-1.1 licensed; the subset covers
 //! Latin plus the punctuation and symbols web pages actually use, and its
-//! license text ships next to the faces (`assets/OFL.txt`).
+//! license text ships next to the faces (`crates/renderer/assets/OFL.txt`).
 //!
 //! Parley shapes and breaks real lines over a `fontique` collection with the
 //! face bytes registered from memory. Glyph pixels and intrinsic advances
@@ -15,13 +15,13 @@
 use std::cell::RefCell;
 use std::sync::Arc;
 
-use crate::RenderError;
+use crate::render::RenderError;
 
 /// Regular-weight face bytes, embedded at compile time.
-const REGULAR: &[u8] = include_bytes!("../assets/LiberationSans-Regular.ttf");
+const REGULAR: &[u8] = include_bytes!("../../assets/LiberationSans-Regular.ttf");
 
 /// Bold-weight face bytes, embedded at compile time.
-const BOLD: &[u8] = include_bytes!("../assets/LiberationSans-Bold.ttf");
+const BOLD: &[u8] = include_bytes!("../../assets/LiberationSans-Bold.ttf");
 
 /// Regular-weight face bytes for consumers outside [`Fonts`], like Stylo's
 /// font-metrics provider.

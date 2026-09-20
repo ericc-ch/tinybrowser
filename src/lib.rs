@@ -12,8 +12,7 @@
 //!        cdp → {browser, server}
 //!        webdriver → {browser, server}
 //!        browser → {net, renderer}
-//!        renderer → {dom, render}
-//!        render → {dom}
+//!        renderer → {dom}
 //! ```
 
 pub use browser::{

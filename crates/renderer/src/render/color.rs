@@ -23,8 +23,6 @@ pub struct Color {
 impl Color {
     /// Opaque black, the initial value of `color`.
     pub const BLACK: Self = Self::rgb(0, 0, 0);
-    /// Opaque white, the canvas background in the absence of a page color.
-    pub const WHITE: Self = Self::rgb(255, 255, 255);
     /// Fully transparent.
     pub const TRANSPARENT: Self = Self::rgba(0, 0, 0, 0);
 

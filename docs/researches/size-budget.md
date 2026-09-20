@@ -119,7 +119,7 @@ fixed shared-library cost is accepted.
 Screenshots are always in: the shipping binary carries the render pipeline.
 The Blitz measurement above stands (lean layout alone was ~10.8 MB before
 paint), so the shipped shape is an in-tree CSS subset instead of an
-integrated engine: `crates/render` parses and cascades CSS, lays out block,
+integrated engine: `crates/renderer/src/render` parses and cascades CSS, lays out block,
 inline, and flex formatting, paints with `tiny-skia`, rasterizes text with
 `fontdue`, and encodes PNG with `png`.
 
@@ -135,7 +135,7 @@ x86_64-unknown-linux-gnu, lld `--icf=all`):
 
 Shipping delta: 5,988,848 -> 6,606,240 bytes (+617,392), which includes the
 embedded subset faces (Liberation Sans Regular 29,680 + Bold 29,896 bytes,
-OFL-1.1, `crates/render/assets/OFL.txt`) and the crate's own style, layout,
+OFL-1.1, `crates/renderer/assets/OFL.txt`) and the crate's own style, layout,
 paint, and PNG code.
 
 Selector matching reuses `dom`'s pinned `selectors`/`cssparser` stack through
@@ -147,7 +147,7 @@ vello/anyrender dependency.
 ## Taffy box layout (2026-09-18)
 
 The hand-rolled block/flex engine (`layout.rs` block flow, `flex.rs`) is
-replaced by Taffy 0.14 (`crates/render/src/boxes.rs`): block flow with margin
+replaced by Taffy 0.14 (`crates/renderer/src/render/boxes.rs`): block flow with margin
 collapsing, flex, floats, and absolute positioning. Inline formatting stays
 in-tree, measured through Taffy's measure hooks. Isolated probe on an empty
 tuned binary: +303,848 bytes. Shipping delta: 6,606,240 -> 7,034,176 bytes

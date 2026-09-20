@@ -30,10 +30,8 @@ cd "$ROOT"
 
 # Pure-Rust crates with tests. Extend when unsafe logic moves into a new one.
 miri_crates=(logging)
-# Crates whose tests are cheap enough to run under Valgrind today. `render`
-# is here because its Stylo bridge is where the workspace's only `unsafe fn`
-# hooks live; the tests are a handful of small renders.
-valgrind_crates=(logging render)
+# Default Valgrind: logging plus `renderer::render` (Stylo `unsafe fn` hooks;
+# a handful of small renders, not the full QuickJS renderer suite).
 
 usage() {
   echo "usage: tools/ub [lint|miri [crate...]|valgrind [crate...]]" >&2
@@ -68,7 +66,9 @@ case "${1:-lint}" in
     shift
     crates=("$@")
     if [ ${#crates[@]} -eq 0 ]; then
-      crates=("${valgrind_crates[@]}")
+      exec nix develop .#ub --command env \
+        CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER="valgrind --error-exitcode=1 --track-origins=yes" \
+        cargo test --target x86_64-unknown-linux-gnu -p logging -p renderer render::
     fi
     mapfile -t args < <(crate_args "${crates[@]}")
     exec nix develop .#ub --command env \

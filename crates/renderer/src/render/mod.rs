@@ -24,7 +24,7 @@
 //! The DOM arrives as an immutable [`dom::Dom`]; the output is a
 //! [`RgbaImage`] ready for PNG encoding in [`png`].
 
-#![doc = include_str!("../README.md")]
+#![doc = include_str!("README.md")]
 
 mod cascade;
 mod color;
@@ -42,7 +42,6 @@ mod style;
 mod text;
 mod tree;
 
-pub use color::Color;
 pub use png::encode_png;
 
 /// One rendered viewport, 8 bits per channel, straight (non-premultiplied)
@@ -222,3 +221,47 @@ impl std::fmt::Display for RenderError {
 }
 
 impl std::error::Error for RenderError {}
+
+#[cfg(test)]
+mod tests {
+    use super::{RenderOptions, encode_png, render};
+    use dom::Dom;
+
+    #[test]
+    fn renders_requested_viewport() {
+        let dom = Dom::new();
+        let image = render(
+            &dom,
+            &[],
+            &RenderOptions {
+                width: 200.0,
+                height: 120.0,
+                scale: 1.0,
+            },
+        )
+        .expect("render");
+        assert_eq!((image.width, image.height), (200, 120));
+        assert_eq!(image.data.len(), 200 * 120 * 4);
+        assert!(
+            image.data.iter().all(|byte| *byte == 255),
+            "an empty document paints an opaque white viewport"
+        );
+    }
+
+    #[test]
+    fn encodes_png() {
+        let dom = Dom::new();
+        let image = render(
+            &dom,
+            &[],
+            &RenderOptions {
+                width: 16.0,
+                height: 8.0,
+                scale: 1.0,
+            },
+        )
+        .expect("render");
+        let png = encode_png(&image).expect("encode");
+        assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n");
+    }
+}

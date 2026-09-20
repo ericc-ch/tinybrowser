@@ -3,13 +3,13 @@
 
 use dom::Dom;
 
-use crate::font::Fonts;
-use crate::geometry::Rect;
-use crate::layout::{LayoutBox, PaintItem};
-use crate::paint::Painter;
-use crate::stylo::style_document;
-use crate::tree;
-use crate::{RenderError, RenderOptions, RgbaImage};
+use crate::render::font::Fonts;
+use crate::render::geometry::Rect;
+use crate::render::layout::{LayoutBox, PaintItem};
+use crate::render::paint::Painter;
+use crate::render::stylo::style_document;
+use crate::render::tree;
+use crate::render::{RenderError, RenderOptions, RgbaImage};
 
 /// Renders `dom` into one image.
 ///
@@ -38,11 +38,11 @@ pub(crate) fn render(
 
     // 3. Build and lay out the box tree through Taffy.
     let root = tree::build(dom, &styles);
-    let layout = crate::boxes::layout_root(&root, &fonts, viewport_width, viewport_height);
+    let layout = crate::render::boxes::layout_root(&root, &fonts, viewport_width, viewport_height);
 
     // 4. Paint once, then encode from the caller.
-    let width = crate::device_pixels((viewport_width * options.scale).round().max(1.0));
-    let height = crate::device_pixels((viewport_height * options.scale).round().max(1.0));
+    let width = crate::render::device_pixels((viewport_width * options.scale).round().max(1.0));
+    let height = crate::render::device_pixels((viewport_height * options.scale).round().max(1.0));
     let mut painter = Painter::new(width, height)?;
     paint(&mut painter, &layout, &fonts);
     Ok(painter.into_image())
@@ -54,7 +54,7 @@ pub(crate) fn boxes(
     dom: &Dom,
     stylesheets: &[String],
     options: &RenderOptions,
-) -> Result<Vec<crate::NodeBox>, RenderError> {
+) -> Result<Vec<crate::render::NodeBox>, RenderError> {
     if !valid_dimension(options.width)
         || !valid_dimension(options.height)
         || !valid_dimension(options.scale)
@@ -64,24 +64,24 @@ pub(crate) fn boxes(
     let fonts = Fonts::load()?;
     let styles = style_document(dom, stylesheets, options.width, options.height);
     let root = tree::build(dom, &styles);
-    let layout = crate::boxes::layout_root(&root, &fonts, options.width, options.height);
+    let layout = crate::render::boxes::layout_root(&root, &fonts, options.width, options.height);
     let mut out = Vec::new();
     collect_boxes(&layout, &mut out);
     Ok(out)
 }
 
-/// Flattens a laid-out tree into [`crate::NodeBox`] values.
-fn collect_boxes(layout: &crate::layout::LayoutBox, out: &mut Vec<crate::NodeBox>) {
-    out.push(crate::NodeBox {
+/// Flattens a laid-out tree into [`crate::render::NodeBox`] values.
+fn collect_boxes(layout: &crate::render::layout::LayoutBox, out: &mut Vec<crate::render::NodeBox>) {
+    out.push(crate::render::NodeBox {
         node: layout.node,
         x: layout.rect.x,
         y: layout.rect.y,
         width: layout.rect.width,
         height: layout.rect.height,
-        visible: layout.style.visibility == crate::style::Visibility::Visible,
+        visible: layout.style.visibility == crate::render::style::Visibility::Visible,
     });
     for item in &layout.items {
-        if let crate::layout::PaintItem::Box(child) = item {
+        if let crate::render::layout::PaintItem::Box(child) = item {
             collect_boxes(child, out);
         }
     }
@@ -100,7 +100,7 @@ fn valid_dimension(value: f32) -> bool {
 /// set `visible` again (`<https://drafts.csswg.org/css2/#propdef-visibility>`;
 /// hidden text already carries an alpha-0 brush from the cascade).
 fn paint(painter: &mut Painter, layout: &LayoutBox, fonts: &Fonts) {
-    let visible = layout.style.visibility == crate::style::Visibility::Visible;
+    let visible = layout.style.visibility == crate::render::style::Visibility::Visible;
     let style = &layout.style;
     let rect = layout.rect;
     if visible && style.background.a > 0 {
@@ -150,7 +150,7 @@ fn paint(painter: &mut Painter, layout: &LayoutBox, fonts: &Fonts) {
         }
     }
 
-    let clipped = style.overflow == crate::style::Overflow::Hidden;
+    let clipped = style.overflow == crate::render::style::Overflow::Hidden;
     if clipped {
         painter.push_clip(layout.padding_box());
     }
@@ -165,8 +165,8 @@ fn paint(painter: &mut Painter, layout: &LayoutBox, fonts: &Fonts) {
                     run.color,
                 );
                 match run.decoration {
-                    crate::style::TextDecoration::None => {}
-                    crate::style::TextDecoration::Underline => {
+                    crate::render::style::TextDecoration::None => {}
+                    crate::render::style::TextDecoration::Underline => {
                         painter.fill_rect(
                             Rect::new(
                                 run.x,
@@ -177,7 +177,7 @@ fn paint(painter: &mut Painter, layout: &LayoutBox, fonts: &Fonts) {
                             run.color,
                         );
                     }
-                    crate::style::TextDecoration::LineThrough => {
+                    crate::render::style::TextDecoration::LineThrough => {
                         painter.fill_rect(
                             Rect::new(
                                 run.x,

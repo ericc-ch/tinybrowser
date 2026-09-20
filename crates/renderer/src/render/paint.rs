@@ -21,10 +21,10 @@ use skrifa::MetadataProvider as _;
 use skrifa::instance::{LocationRef, NormalizedCoord, Size};
 use skrifa::outline::OutlinePen;
 
-use crate::color::Color;
-use crate::geometry::Rect;
-use crate::text::PlacedGlyph;
-use crate::{RenderError, RgbaImage};
+use crate::render::color::Color;
+use crate::render::geometry::Rect;
+use crate::render::text::PlacedGlyph;
+use crate::render::{RenderError, RgbaImage};
 
 /// Output cap in device pixels; a 4x-scaled 800x600 viewport is well under
 /// this, and the cap keeps a hostile viewport from allocating unbounded
@@ -166,8 +166,8 @@ impl Painter {
         let canvas = Rect::new(
             0.0,
             0.0,
-            crate::pixels(self.pixmap.width()),
-            crate::pixels(self.pixmap.height()),
+            crate::render::pixels(self.pixmap.width()),
+            crate::render::pixels(self.pixmap.height()),
         );
         let rect = rect.intersect(canvas);
         if rect.is_empty() { None } else { Some(rect) }

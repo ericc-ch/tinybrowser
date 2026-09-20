@@ -2,7 +2,7 @@
 
 use png::{BitDepth, ColorType, Encoder};
 
-use crate::{RenderError, RgbaImage};
+use crate::render::{RenderError, RgbaImage};
 
 /// Encodes one RGBA image as a PNG.
 ///

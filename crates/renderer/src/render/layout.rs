@@ -6,11 +6,11 @@
 
 use dom::NodeId;
 
-use crate::font::Fonts;
-use crate::geometry::{Edges, Rect};
-use crate::style::{BoxSizing, Dimension, Style, TextAlign, WhiteSpace};
-use crate::text::{FontStyle, PlacedRun, Segment, SegmentStyle};
-use crate::tree::{BoxKind, BoxNode};
+use crate::render::font::Fonts;
+use crate::render::geometry::{Edges, Rect};
+use crate::render::style::{BoxSizing, Dimension, Style, TextAlign, WhiteSpace};
+use crate::render::text::{FontStyle, PlacedRun, Segment, SegmentStyle};
+use crate::render::tree::{BoxKind, BoxNode};
 
 /// One painted child in tree order.
 pub(crate) enum PaintItem {
@@ -212,12 +212,14 @@ fn shape_group(
         .map(|(_, measurement)| (measurement.outer_width, measurement.height))
         .collect();
     let width = if wrap { Some(available.max(0.0)) } else { None };
-    let lines = crate::text::shape_lines(ctx.fonts, &tokens, &sizes, width, text_align, preserve);
+    let lines =
+        crate::render::text::shape_lines(ctx.fonts, &tokens, &sizes, width, text_align, preserve);
     let mut height = 0.0_f32;
     for line in &lines {
         for atomic in &line.atomics {
             let (node, measurement) = atomics[atomic.index];
-            let mut layout = crate::boxes::layout_subtree(node, ctx, measurement.content_width);
+            let mut layout =
+                crate::render::boxes::layout_subtree(node, ctx, measurement.content_width);
             shift_layout(&mut layout, x + atomic.x, y + height + atomic.y);
             items.push(PaintItem::Box(Box::new(layout)));
         }
@@ -334,9 +336,9 @@ struct ProcessedText {
 /// collapse them across text boxes.
 fn process_text(text: &str, style: &Style) -> ProcessedText {
     let text = match style.text_transform {
-        crate::style::TextTransform::None => text.to_owned(),
-        crate::style::TextTransform::Uppercase => text.to_uppercase(),
-        crate::style::TextTransform::Lowercase => text.to_lowercase(),
+        crate::render::style::TextTransform::None => text.to_owned(),
+        crate::render::style::TextTransform::Uppercase => text.to_uppercase(),
+        crate::render::style::TextTransform::Lowercase => text.to_lowercase(),
     };
     let preserve = matches!(style.white_space, WhiteSpace::Pre | WhiteSpace::PreWrap);
     if preserve {
@@ -375,7 +377,7 @@ fn process_text(text: &str, style: &Style) -> ProcessedText {
 /// tree rooted at the atomic.
 fn measure_atomic(node: &BoxNode, ctx: &Ctx<'_>) -> Atomic {
     let preferred = max_content_width(node, ctx);
-    let layout = crate::boxes::layout_subtree(node, ctx, preferred);
+    let layout = crate::render::boxes::layout_subtree(node, ctx, preferred);
     let margin = node.style.margin.map(|dimension| match dimension {
         Dimension::Auto => 0.0,
         Dimension::Length(length) => length.resolve(preferred),
@@ -417,7 +419,7 @@ fn measure(text: &str, font: FontStyle, letter_spacing: f32, fonts: &Fonts) -> f
     if letter_spacing == 0.0 {
         base
     } else {
-        base + letter_spacing * crate::count(text.chars().count())
+        base + letter_spacing * crate::render::count(text.chars().count())
     }
 }
 
@@ -519,7 +521,8 @@ pub(crate) fn max_content_width(node: &BoxNode, ctx: &Ctx<'_>) -> f32 {
         BoxKind::Flex | BoxKind::InlineFlex => {
             let row = matches!(
                 style.flex_direction,
-                crate::style::FlexDirection::Row | crate::style::FlexDirection::RowReverse
+                crate::render::style::FlexDirection::Row
+                    | crate::render::style::FlexDirection::RowReverse
             );
             let widths = node
                 .children
