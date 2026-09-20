@@ -2,6 +2,9 @@
 # Run WPT against tinybrowser. Builds the debug binary, installs the
 # wptrunner product into WPT's venv, then execs ./wpt run.
 #
+# `tools/wpt/run --score` runs the suite then prints pass rates (`score.py`).
+# `--report FILE` on that path summarizes an existing wptreport without running.
+#
 # Runs from any worktree. A worktree without its own submodule checkout uses
 # the primary worktree's third_party/wpt and venv, so a 1.2GB copy per
 # worktree is unnecessary. The pinned revision is checked before the run.
@@ -18,6 +21,33 @@
 # Defaults --no-pause-after-test so a single file does not wait for a keypress.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+
+# ` --score` is the grind wrapper (`score.py`): run, then print pass rates.
+# Strip it here so a recursive `run` from the scorer does not loop.
+score=0
+pass=()
+for arg in "$@"; do
+  if [[ "$arg" == "--score" ]]; then
+    score=1
+    continue
+  fi
+  pass+=("$arg")
+done
+if ((score)); then
+  if ! command -v python3 >/dev/null 2>&1; then
+    if command -v uv >/dev/null 2>&1; then
+      UV_PY="$(uv python find 3.12 2>/dev/null || true)"
+      if [[ -n "${UV_PY}" ]]; then
+        PATH="$(dirname "${UV_PY}"):${PATH}"
+      fi
+    fi
+  fi
+  if ! command -v python3 >/dev/null 2>&1; then
+    echo "python3 is required to score WPT runs" >&2
+    exit 1
+  fi
+  exec python3 "$ROOT/tools/wpt/score.py" "${pass[@]}"
+fi
 
 # WPT checkout: an explicit root wins, then this worktree's submodule, then
 # the primary worktree's checkout. `git submodule status` marks an
@@ -81,7 +111,7 @@ if [[ -n "${TINYBROWSER_BINARY:-}" ]]; then
   BINARY="$TINYBROWSER_BINARY"
 else
   cargo build -q --offline 2>/dev/null || cargo build -q
-  BINARY="$("$ROOT/tools/bin")"
+  BINARY="$("$ROOT/tools/binary-path")"
 fi
 if [[ ! -x "$BINARY" ]]; then
   echo "tinybrowser binary not found at $BINARY" >&2

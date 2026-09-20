@@ -417,19 +417,19 @@ pub(super) fn webdriver_element(ctx: Ctx<'_>, remote_id: f64) -> Result<Value<'_
 
 /// Every element's border box from the render pipeline's layout, in tree
 /// order. Anonymous boxes carry `node: None`.
-pub(super) fn layout_boxes(ctx: &Ctx<'_>, document: NodeId) -> Result<Vec<render::NodeBox>> {
+pub(super) fn layout_boxes(ctx: &Ctx<'_>, document: NodeId) -> Result<Vec<crate::render::NodeBox>> {
     let world = world_for_node(ctx, document)?;
     let world = world.borrow();
     let Some(parsed) = world.document(document) else {
         return Ok(Vec::new());
     };
     let sheets = inline_stylesheets(&parsed.dom);
-    let options = render::RenderOptions {
+    let options = crate::render::RenderOptions {
         width: crate::engine::VIEWPORT_WIDTH,
         height: crate::engine::VIEWPORT_HEIGHT,
         scale: 1.0,
     };
-    Ok(render::layout_boxes(&parsed.dom, &sheets, &options).unwrap_or_default())
+    Ok(crate::render::layout_boxes(&parsed.dom, &sheets, &options).unwrap_or_default())
 }
 
 /// Inline `<style>` text in document order. External sheets are not mirrored

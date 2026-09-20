@@ -1,12 +1,13 @@
-# render
+# layout and paint
 
 One-shot HTML/CSS rendering for screenshots: style, layout, paint, PNG.
 
-This crate exists because the measured Blitz stack costs +6.6 MB against the
-shipping binary (`docs/researches/size-budget.md`), which does not fit the
-10 MB ceiling. The alternative shape is the one small browsers have always
-used: a CSS subset over the DOM we already have, a box tree, and a CPU
-rasterizer.
+This module lives in `renderer` because only the page engine calls it. It
+exists as an in-tree pipeline because the measured Blitz stack costs +6.6 MB
+against the shipping binary (`docs/researches/size-budget.md`), which does
+not fit the 10 MB ceiling. The alternative shape is the one small browsers
+have always used: a CSS subset over the DOM we already have, a box tree, and
+a CPU rasterizer.
 
 ## Pipeline
 

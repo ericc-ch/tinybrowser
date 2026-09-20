@@ -36,8 +36,8 @@ the binary; it exists so tests are reproducible and offline-capable.
 - **Size**: about 20 MB across 3,609 files; test input only, never compiled
   into the binary.
 - **Update**: change `third_party/blink-cdp/REVISION`, update the pin recorded
-  here, then run `./tools/cdp/update`. The updater stages both archives and
+  here, then run `./tools/cdp-tests/update`. The updater stages both archives and
   refuses to swap in a tree that is empty or contains anything but regular
   files and directories.
-- **Runner**: `./tools/cdp/run` for promoted passing tests;
-  `./tools/cdp/run --all` for the complete exploratory scoreboard.
+- **Runner**: `./tools/cdp-tests/run` for promoted passing tests;
+  `./tools/cdp-tests/run --all` for the complete exploratory scoreboard.

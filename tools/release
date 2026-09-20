@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build the shipping binary.
+# Build the release binary and drop `.eh_frame`.
 #
 # `cargo build --release` already links with lld + ICF, RELR relative
 # relocations, and no `.eh_frame_hdr` (see `build.rs`). This step removes the
@@ -17,7 +17,7 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
 cargo build --release --bin tinybrowser
-BIN="$(tools/bin --release)"
+BIN="$(tools/binary-path --release)"
 
 sections=()
 if readelf -S --wide "$BIN" | grep -qw "\.eh_frame_hdr"; then
@@ -33,7 +33,7 @@ if ((${#sections[@]} == 0)); then
   exit 0
 fi
 
-tmp="$BIN.ship.$$"
+tmp="$BIN.release.$$"
 trap 'rm -f "$tmp"' EXIT
 cp -p "$BIN" "$tmp"
 objcopy "${sections[@]}" "$tmp"

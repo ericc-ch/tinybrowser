@@ -8,7 +8,6 @@ workspace = true
 
 [dependencies]
 dom = { workspace = true }
-render = { workspace = true }
 # Exactly html5ever 0.39's own markup5ever; same pin as dom's charter, so
 # parser QualNames flow into dom as one type, no conversion layer.
 markup5ever = "=0.39.0"
@@ -38,6 +37,22 @@ url = "2"
 rquickjs = { version = "0.14.0", default-features = false, features = ["std", "classes", "loader", "macro"] }
 # Value-only seam for script results crossing to a carrier.
 serde = { version = "1", features = ["derive"] }
+# Style / layout / paint.
+
+app_units = "0.7"
+euclid = "0.22"
+fontique = { version = "0.11", default-features = false }
+parley = { version = "0.11", default-features = false, features = ["libm"] }
+png = "0.18"
+selectors = "0.40"
+skrifa = { version = "0.44", default-features = false, features = ["std"] }
+web_atoms = "0.2"
+style = { package = "stylo", version = "0.21" }
+stylo_dom = "0.21"
+stylo_static_prefs = "0.21"
+style_traits = { package = "stylo_traits", version = "0.21" }
+taffy = "0.14"
+tiny-skia = "0.12"
 
 [dev-dependencies]
 # The value seam's non-finite encoding is asserted in protocol tests.

@@ -34,15 +34,15 @@ use taffy::{
 
 use dom::NodeId;
 
-use crate::font::Fonts;
-use crate::geometry::{Edges, Rect};
-use crate::layout::{Ctx, LayoutBox, PaintItem, layout_inline_run, min_content_width};
-use crate::style::{
+use crate::render::font::Fonts;
+use crate::render::geometry::{Edges, Rect};
+use crate::render::layout::{Ctx, LayoutBox, PaintItem, layout_inline_run, min_content_width};
+use crate::render::style::{
     AlignContent, AlignItems, AlignSelf, BoxSizing, Clear, Dimension, Display, FlexDirection,
     FlexWrap, Float, GridLine, GridPlacement, GridTrack, JustifyContent, Length, Overflow,
     Position, Style, TextAlign, TrackSize,
 };
-use crate::tree::{BoxKind, BoxNode, is_block_level};
+use crate::render::tree::{BoxKind, BoxNode, is_block_level};
 
 /// One inline formatting context owned by a Taffy leaf.
 #[derive(Clone, Copy)]
@@ -329,7 +329,12 @@ impl<'a> Builder<'a> {
                 .all(|child| !is_block_level(child) || child.style.float != Float::None);
         if inline_only {
             // An inline formatting context: one measured leaf.
-            self.build_leaf(&node.children, node.style.text_align, &node.style, node.node)
+            self.build_leaf(
+                &node.children,
+                node.style.text_align,
+                &node.style,
+                node.node,
+            )
         } else {
             let style = convert_style(&node.style);
             let mut ids = Vec::with_capacity(node.children.len());
@@ -480,7 +485,7 @@ impl<'a> Builder<'a> {
             let cached = self.cache.remove(&node);
             let fresh = match cached {
                 Some((width, mut items)) if (width - content_width).abs() < 0.5 => {
-                    crate::layout::shift_items(&mut items, content_x, content_y);
+                    crate::render::layout::shift_items(&mut items, content_x, content_y);
                     Some(items)
                 }
                 _ => None,
@@ -748,7 +753,7 @@ fn map_max_size(size: &TrackSize) -> MaxTrackSizingFunction {
 /// A neutral flex-item style for bare text and spans: no box of its own,
 /// text properties inherited from the container.
 fn neutral_item_style(parent: &Style) -> Style {
-    use crate::style::BorderSide;
+    use crate::render::style::BorderSide;
     let mut style = Style::inherited_from(parent);
     style.display = Display::Block;
     style.border = Edges::new(
@@ -830,6 +835,6 @@ fn to_overflow(overflow: Overflow) -> TaffyOverflow {
 fn run_max_content(nodes: &[BoxNode], ctx: &Ctx<'_>) -> f32 {
     nodes
         .iter()
-        .map(|node| crate::layout::max_content_width(node, ctx))
+        .map(|node| crate::render::layout::max_content_width(node, ctx))
         .sum()
 }

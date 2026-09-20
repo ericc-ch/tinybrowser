@@ -2,10 +2,12 @@
 //! value-only browser seam.
 //!
 //! The engine owns `Document` and never links `net`; the browser process owns
-//! the tab, navigation, the network, and cookies. A carrier drives this crate:
-//! the browser's child transport on a native build, the WebAssembly component
-//! on a wasm build. Both feed the same [`Engine`], and both implement
-//! [`BrowserServices`] to supply effects.
+//! the tab, navigation, the network, and cookies. Style, layout, and paint live
+//! in the `render` module: one-shot screenshot and geometry (Blink `core/css`,
+//! `core/layout`, `core/paint`). A carrier drives this crate: the browser's
+//! child transport on a native build, the WebAssembly component on a wasm
+//! build. Both feed the same [`Engine`], and both implement [`BrowserServices`]
+//! to supply effects.
 
 use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
@@ -27,6 +29,7 @@ mod js;
 mod messaging;
 mod protocol;
 mod remote;
+mod render;
 mod serialize;
 mod storage;
 mod xml;

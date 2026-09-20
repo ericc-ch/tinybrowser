@@ -8,15 +8,15 @@ In `docs/progress.md`, replace the latest binary size, the latest total, and sco
 ## Testing and conformance
 
 - Cargo tests cover tinybrowser-specific behavior only (`cargo test --workspace`).
-- Web-platform conformance is WPT (`tools/wpt/run`, `score`, `retest`).
-- Extra runners: Blink CDP (`tools/cdp/run`), Playwright (`tools/playwright/run`), test262 (`tools/intl/test262`).
+- Web-platform conformance is WPT (`tools/wpt/run`, `tools/wpt/run --score`, `retest`).
+- Extra runners: Blink CDP (`tools/cdp-tests/run`), Playwright (`tools/playwright/run`), test262 (`tools/intl/test262`).
 
 Do not test spec conformance in cargo tests. Never add, keep, or "fix" a cargo test that asserts web-platform behavior or duplicates a WPT case. If a spec regression would only be caught by a cargo test, the missing WPT run is the bug.
 
 ## Checks
 
-- clippy (`tools/ub lint`), `cargo test --workspace`.
-- When adding or changing `unsafe`: `tools/ub miri` (pure-Rust) and `tools/ub valgrind` (FFI / renderer / net).
+- clippy and embedded JS (`tools/check`), `cargo test --workspace`.
+- When adding or changing `unsafe`: `tools/check miri` (pure-Rust) and `tools/check valgrind` (FFI / renderer / net).
 
 ## Working rules
 

@@ -47,9 +47,9 @@ use style::stylist::Stylist;
 use style::traversal::{DomTraversal, PerLevelTraversalData, recalc_style_at};
 use style::traversal_flags::TraversalFlags;
 
-use crate::style::Style;
-use crate::stylo_map::map_style;
-use crate::stylo_view::{StyloElement, StyloNode, StyloTables, node_at};
+use crate::render::style::Style;
+use crate::render::stylo_map::map_style;
+use crate::render::stylo_view::{StyloElement, StyloNode, StyloTables, node_at};
 
 /// Our UA stylesheet: the same rules every browser ships
 /// (<https://html.spec.whatwg.org/#rendering>), trimmed to what we paint.
@@ -454,12 +454,13 @@ impl style::device::servo::FontMetricsProvider for EmbeddedFontMetrics {
     ) -> style::font_metrics::FontMetrics {
         use skrifa::instance::{LocationRef, NormalizedCoord};
         let bytes = if font.font_weight >= style::values::computed::font::FontWeight::BOLD {
-            crate::font::BOLD_BYTES
+            crate::render::font::BOLD_BYTES
         } else {
-            crate::font::REGULAR_BYTES
+            crate::render::font::REGULAR_BYTES
         };
         let coords: &[NormalizedCoord] = &[];
-        let empty = crate::font::metrics_for(bytes, base_size.px(), LocationRef::from(coords));
+        let empty =
+            crate::render::font::metrics_for(bytes, base_size.px(), LocationRef::from(coords));
         let to_length = |px: Option<f32>| {
             px.filter(|px| *px != 0.0)
                 .map(style::values::computed::Length::new)

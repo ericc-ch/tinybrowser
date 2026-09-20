@@ -7,11 +7,10 @@ Size research lives in [`docs/researches/size-budget.md`](researches/size-budget
 
 Target: under 10MB stripped on x86_64.
 
-8,300,088 bytes (2026-09-19)
+8,323,400 bytes (2026-09-20)
 
 ```sh
-nix develop --command ./tools/ship
-stat --format='%n %s' "$(tools/bin --release)"
+nix develop --command ./tools/release
 ```
 
 ## WPT
@@ -23,7 +22,7 @@ The total percentage is the pass count over all WPT. Total stays unscored until 
 Slices, not full-group percentages: html5lib (`html/syntax/parsing/html5lib_*.html`, 173 as expected on 2026-09-15), `dom/events/`, and the CSS reftest slice `css/css-color/` (266/307 on 2026-09-18 with `--test-types reftest`).
 
 ```sh
-nix develop --command ./tools/wpt/score <directory> -- --exclude=worker
+nix develop --command ./tools/wpt/run --score <directory> -- --exclude=worker
 ```
 
 | directory | percentage |

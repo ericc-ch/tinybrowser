@@ -15,8 +15,8 @@ says otherwise.
 The tuned profile is `opt-level = "z"`, `lto = "fat"`,
 `codegen-units = 1`, stripped, `panic = "abort"`, plus lld `--icf=all`.
 The profile lives in the root `Cargo.toml`; the lld, RELR, and unwind-index
-flags live in `build.rs`, scoped to release binaries, and `tools/ship`
-removes the `.eh_frame` body after the link. `tools/ship` reproduces this
+flags live in `build.rs`, scoped to release binaries, and `tools/release`
+removes the `.eh_frame` body after the link. `tools/release` reproduces this
 research.
 
 ## Binding and JS size
@@ -119,7 +119,7 @@ fixed shared-library cost is accepted.
 Screenshots are always in: the shipping binary carries the render pipeline.
 The Blitz measurement above stands (lean layout alone was ~10.8 MB before
 paint), so the shipped shape is an in-tree CSS subset instead of an
-integrated engine: `crates/render` parses and cascades CSS, lays out block,
+integrated engine: `crates/renderer/src/render` parses and cascades CSS, lays out block,
 inline, and flex formatting, paints with `tiny-skia`, rasterizes text with
 `fontdue`, and encodes PNG with `png`.
 
@@ -135,7 +135,7 @@ x86_64-unknown-linux-gnu, lld `--icf=all`):
 
 Shipping delta: 5,988,848 -> 6,606,240 bytes (+617,392), which includes the
 embedded subset faces (Liberation Sans Regular 29,680 + Bold 29,896 bytes,
-OFL-1.1, `crates/render/assets/OFL.txt`) and the crate's own style, layout,
+OFL-1.1, `crates/renderer/assets/OFL.txt`) and the crate's own style, layout,
 paint, and PNG code.
 
 Selector matching reuses `dom`'s pinned `selectors`/`cssparser` stack through
@@ -147,7 +147,7 @@ vello/anyrender dependency.
 ## Taffy box layout (2026-09-18)
 
 The hand-rolled block/flex engine (`layout.rs` block flow, `flex.rs`) is
-replaced by Taffy 0.14 (`crates/render/src/boxes.rs`): block flow with margin
+replaced by Taffy 0.14 (`crates/renderer/src/render/boxes.rs`): block flow with margin
 collapsing, flex, floats, and absolute positioning. Inline formatting stays
 in-tree, measured through Taffy's measure hooks. Isolated probe on an empty
 tuned binary: +303,848 bytes. Shipping delta: 6,606,240 -> 7,034,176 bytes
@@ -303,7 +303,7 @@ bytes.
 | --- | ---: | ---: | --- |
 | RELR relative relocations | 8,986,200 | −561,336 | `build.rs` |
 | + release-bin `--no-eh-frame-hdr` | 8,872,168 | −114,032 | `build.rs` |
-| + `tools/ship` drops `.eh_frame` | **8,044,696** | −827,472 | `tools/ship` |
+| + `tools/release` drops `.eh_frame` | **8,044,696** | −827,472 | `tools/release` |
 
 RELR bitmaps the 23,749 `R_X86_64_RELATIVE` entries: `.rela.dyn` 575,496 ->
 5,520 plus 8,040 in `.relr.dyn`. The loader must understand `DT_RELR`
@@ -314,7 +314,7 @@ RELR bitmaps the 23,749 `R_X86_64_RELATIVE` entries: `.rela.dyn` 575,496 ->
 QuickJS-ng uses setjmp/longjmp. Both unwind levers were previously rejected
 as global flags because they broke dev/test panic reporting; they now apply
 only to the shipping binary. `build.rs` emits lld, `--icf=all`, RELR, and
-`--no-eh-frame-hdr` for release bins, and `tools/ship` removes the
+`--no-eh-frame-hdr` for release bins, and `tools/release` removes the
 `.eh_frame` body after linking (checking the section exists, then running
 `--version` on a copy before replacing the artifact).
 

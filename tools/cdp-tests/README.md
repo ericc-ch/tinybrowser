@@ -6,13 +6,13 @@ WebSocket; they do not execute inside the page being tested.
 
 ```bash
 # Tests promoted to the required passing set.
-./tools/cdp/run
+./tools/cdp-tests/run
 
 # One test or glob.
-./tools/cdp/run 'plain/sessions/runtime-evaluate.js'
+./tools/cdp-tests/run 'plain/sessions/runtime-evaluate.js'
 
 # The complete exploratory scoreboard.
-./tools/cdp/run --all
+./tools/cdp-tests/run --all
 ```
 
 Each test runs in its own Node worker process with a fresh temporary profile
@@ -29,8 +29,8 @@ as one of:
   feature such as `DevToolsAPI`
 - `TIMEOUT`, `CRASH`, `HARNESS_FAILURE`
 
-Results are written to `target/cdp-results.json`. `./tools/cdp/run` also runs
-`node --test tools/cdp/runner.test.mjs`, which proves the parent deadline,
+Results are written to `target/cdp-results.json`. `./tools/cdp-tests/run` also runs
+`node --test tools/cdp-tests/runner.test.mjs`, which proves the parent deadline,
 crash continuation, and cleanup with a fake worker. Those are tinybrowser-owned
 runner invariants, not browser conformance.
 
@@ -44,5 +44,5 @@ resolve the same way they do upstream.
 
 The complete upstream snapshot is under `third_party/blink-cdp`. Change its
 `REVISION`, update the pin in `third_party/VENDORED.md`, then run
-`./tools/cdp/update` to update it. Never edit the vendored test files or
+`./tools/cdp-tests/update` to update it. Never edit the vendored test files or
 expected output.

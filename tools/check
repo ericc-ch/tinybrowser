@@ -1,0 +1,112 @@
+#!/usr/bin/env bash
+# Workspace checks: clippy, embedded JS syntax, Miri, Valgrind.
+#
+#   clippy    stable shell. Workspace lints, then `node --check` on JavaScript
+#            `include_str!`'d into the renderer. Always run this.
+#   miri     nightly shell. Miri over pure-Rust crates. It CANNOT execute
+#            FFI, so crates linking rquickjs or native-tls are excluded; put
+#            unsafe logic in a pure-Rust module with tests to get Miri
+#            coverage. No tests, no coverage: it only checks what runs.
+#            Isolation is disabled because these crates touch the filesystem;
+#            that only gates host syscalls, not Miri's Rust-level UB checks.
+#   valgrind nightly shell. Runs test binaries under Valgrind's memcheck,
+#            including the C QuickJS build. It sees heap misuse and
+#            uninitialized reads across the FFI boundary but does NOT model
+#            Rust aliasing rules (Miri does), and it is slow.
+#
+# With no subcommand, clippy (including embedded JS). AddressSanitizer is not wired:
+# `-Zsanitizer=address` makes rustc reject the sanitizer-built rquickjs-macro
+# proc-macro artifacts ("can't find crate"), and neither
+# `-Ztarget-applies-to-host` nor a separate host config fixed it. Valgrind
+# covers the same C-side ground until that is solved.
+#
+# Miri and Valgrind are not proofs: they falsify. The written `// SAFETY:`
+# invariant plus review is what the AGENTS.md exception requires.
+set -euo pipefail
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$ROOT"
+
+# Pure-Rust crates with tests. Miri cannot execute FFI, so `renderer` (QuickJS)
+# is excluded even though Stylo's `unsafe fn` hooks live there. Valgrind covers
+# those hooks via `renderer::render` tests; do not add `renderer` to Miri.
+miri_crates=(logging)
+# Default Valgrind: logging, then the `render` module tests (Stylo hooks plus
+# empty-document smokes). Not the full QuickJS renderer suite.
+
+usage() {
+  echo "usage: tools/check [clippy|miri [crate...]|valgrind [crate...]]" >&2
+  exit 2
+}
+
+crate_args() {
+  local crates=("$@")
+  local args=()
+  for crate in "${crates[@]}"; do
+    args+=(-p "$crate")
+  done
+  printf '%s\n' "${args[@]}"
+}
+
+run_clippy() {
+  nix develop --command cargo clippy --workspace --all-targets -- -D warnings
+}
+
+run_js() {
+  if ! command -v node >/dev/null 2>&1; then
+    echo "node is required to check the embedded JavaScript (nix develop)" >&2
+    exit 1
+  fi
+  local checked=0 status=0 file output
+  while IFS= read -r -d '' file; do
+    checked=$((checked + 1))
+    if ! output="$(node --check "$file" 2>&1)"; then
+      printf '%s\n' "$output" >&2
+      status=1
+    fi
+  done < <(find crates/renderer/src/js -name '*.js' -print0)
+  if [[ "$checked" -eq 0 ]]; then
+    echo "no embedded JavaScript found under crates/renderer/src/js" >&2
+    exit 1
+  fi
+  echo "js: checked $checked files"
+  return "$status"
+}
+
+valgrind_test() {
+  nix develop .#check --command env \
+    CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER="valgrind --error-exitcode=1 --track-origins=yes" \
+    cargo test --target x86_64-unknown-linux-gnu "$@"
+}
+
+case "${1:-clippy}" in
+  clippy)
+    run_clippy
+    run_js
+    ;;
+  miri)
+    shift
+    crates=("$@")
+    if [ ${#crates[@]} -eq 0 ]; then
+      crates=("${miri_crates[@]}")
+    fi
+    mapfile -t args < <(crate_args "${crates[@]}")
+    exec nix develop .#check --command env \
+      MIRIFLAGS="-Zmiri-disable-isolation" \
+      cargo miri test "${args[@]}"
+    ;;
+  valgrind)
+    shift
+    if [ "$#" -eq 0 ]; then
+      # Two invocations: a filter after `-p logging -p renderer` would skip
+      # logging. Keep the renderer filter so QuickJS tests stay off the default.
+      valgrind_test -p logging
+      valgrind_test -p renderer render::
+      exit 0
+    fi
+    mapfile -t args < <(crate_args "$@")
+    valgrind_test "${args[@]}"
+    ;;
+  *)
+    usage
+    ;;
+esac

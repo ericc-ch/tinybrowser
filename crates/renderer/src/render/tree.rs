@@ -11,8 +11,8 @@ use std::collections::HashMap;
 
 use dom::{Dom, NodeId};
 
-use crate::geometry::Edges;
-use crate::style::{BorderSide, Display, Style};
+use crate::render::geometry::Edges;
+use crate::render::style::{BorderSide, Display, Style};
 
 /// What kind of box a node generated.
 pub(crate) enum BoxKind {

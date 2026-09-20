@@ -8,7 +8,7 @@
 //! bfd, selected in `.cargo/config.toml` because this toolchain otherwise
 //! defaults to rust-lld. Nothing unwinds in release (`panic = "abort"`,
 //! QuickJS-ng uses setjmp/longjmp), so the shipping binary needs neither the
-//! unwind index (dropped here) nor the `.eh_frame` body (`tools/ship` removes
+//! unwind index (dropped here) nor the `.eh_frame` body (`tools/release` removes
 //! it).
 //!
 //! Sizes and method: `docs/researches/size-budget.md`.

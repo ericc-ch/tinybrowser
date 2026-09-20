@@ -1,5 +1,5 @@
 //! Computed values to our style model: Stylo's cascade output translated to
-//! the [`Style`](crate::style::Style) the layout engine consumes.
+//! the [`Style`](crate::render::style::Style) the layout engine consumes.
 //!
 //! The mapping starts from [`Style::initial`] and overwrites every property
 //! the layout engine reads. Anything our model cannot represent keeps its
@@ -23,10 +23,10 @@ use style::values::computed::LengthPercentage;
 use style::values::computed::length_percentage::Unpacked as UnpackedLp;
 use style::values::specified::align::AlignFlags;
 
-use crate::color::Color;
-use crate::font::Weight;
-use crate::geometry::Edges;
-use crate::style::{
+use crate::render::color::Color;
+use crate::render::font::Weight;
+use crate::render::geometry::Edges;
+use crate::render::style::{
     AlignContent, AlignItems, AlignSelf, BorderSide, BorderStyle, BoxSizing, Clear, Dimension,
     Display, FlexDirection, FlexWrap, GridLine, GridPlacement, GridTrack, JustifyContent, Length,
     LineHeight, Overflow, Position, Style, TextAlign, TextDecoration, TextTransform, VerticalAlign,
@@ -150,9 +150,9 @@ fn map_box_model(values: &ComputedValues, style: &mut Style) {
     };
     style.float = match boxy.float {
         // Logical floats resolve physically; the tree is always left-to-right.
-        ComputedFloat::Left | ComputedFloat::InlineStart => crate::style::Float::Left,
-        ComputedFloat::Right | ComputedFloat::InlineEnd => crate::style::Float::Right,
-        ComputedFloat::None => crate::style::Float::None,
+        ComputedFloat::Left | ComputedFloat::InlineStart => crate::render::style::Float::Left,
+        ComputedFloat::Right | ComputedFloat::InlineEnd => crate::render::style::Float::Right,
+        ComputedFloat::None => crate::render::style::Float::None,
     };
     style.clear = match boxy.clear {
         ComputedClear::Left | ComputedClear::InlineStart => Clear::Left,
@@ -497,13 +497,13 @@ fn map_track_size(
     use style::values::generics::grid::{TrackBreadth, TrackSize as Generic};
     let convert = |breadth: &TrackBreadth<style::values::computed::LengthPercentage>| match breadth
     {
-        TrackBreadth::Breadth(length) => Some(crate::style::TrackSize::Length(
+        TrackBreadth::Breadth(length) => Some(crate::render::style::TrackSize::Length(
             map_length_percentage(length)?,
         )),
-        TrackBreadth::Flex(flex) => Some(crate::style::TrackSize::Flex(flex.0)),
+        TrackBreadth::Flex(flex) => Some(crate::render::style::TrackSize::Flex(flex.0)),
         // Intrinsic sizes approximate as `auto`, as before.
         TrackBreadth::Auto | TrackBreadth::MinContent | TrackBreadth::MaxContent => {
-            Some(crate::style::TrackSize::Auto)
+            Some(crate::render::style::TrackSize::Auto)
         }
     };
     match size {
@@ -511,13 +511,13 @@ fn map_track_size(
         Generic::Minmax(min, max) => {
             let min = match min {
                 // Flexible minimums are invalid; fall back like the old code.
-                TrackBreadth::Flex(_) => crate::style::TrackSize::Auto,
+                TrackBreadth::Flex(_) => crate::render::style::TrackSize::Auto,
                 _ => convert(min)?,
             };
             Some(GridTrack::MinMax(min, convert(max)?))
         }
         // `fit-content()` has no model; `auto` sizes by content loosely.
-        Generic::FitContent(_) => Some(GridTrack::Single(crate::style::TrackSize::Auto)),
+        Generic::FitContent(_) => Some(GridTrack::Single(crate::render::style::TrackSize::Auto)),
     }
 }
 

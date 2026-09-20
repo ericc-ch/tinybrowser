@@ -311,13 +311,13 @@ impl Engine {
             .ok_or_else(|| TabError::RendererUnavailable {
                 message: "no document to render".into(),
             })?;
-        let options = render::RenderOptions {
+        let options = crate::render::RenderOptions {
             width: request.viewport_width,
             height: request.viewport_height,
             scale: 1.0,
         };
         let image = world
-            .with_main_document(|parsed| render::render(&parsed.dom, &sheets, &options))
+            .with_main_document(|parsed| crate::render::render(&parsed.dom, &sheets, &options))
             .ok_or_else(|| TabError::RendererUnavailable {
                 message: "no document to render".into(),
             })?
@@ -332,7 +332,7 @@ impl Engine {
                 })?,
             None => image,
         };
-        render::encode_png(&image).map_err(|error| TabError::Render {
+        crate::render::encode_png(&image).map_err(|error| TabError::Render {
             message: error.to_string(),
         })
     }

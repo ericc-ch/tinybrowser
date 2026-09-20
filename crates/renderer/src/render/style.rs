@@ -1,13 +1,13 @@
 //! The computed style model the layout engine consumes.
 //!
-//! Cascading and property parsing live in [`crate::stylo`] — Servo's engine.
+//! Cascading and property parsing live in [`crate::render::stylo`] — Servo's engine.
 //! This module holds only the small resolved-value types the box tree, Taffy
 //! bridge, and paint step read, plus the initial values every mapping starts
 //! from (`stylo_map`).
 
-use crate::color::Color;
-use crate::font::Weight;
-use crate::geometry::Edges;
+use crate::render::color::Color;
+use crate::render::font::Weight;
+use crate::render::geometry::Edges;
 
 // ── Computed value types ────────────────────────────────────────────────────
 

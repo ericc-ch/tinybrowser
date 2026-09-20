@@ -17,9 +17,9 @@ use parley::style::{
 };
 use parley::{Alignment, AlignmentOptions};
 
-use crate::color::Color;
-use crate::font::{Fonts, Weight};
-use crate::style::{LineHeight, TextAlign, TextDecoration};
+use crate::render::color::Color;
+use crate::render::font::{Fonts, Weight};
+use crate::render::style::{LineHeight, TextAlign, TextDecoration};
 
 /// The font properties for intrinsic measurement.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -52,7 +52,7 @@ pub(crate) struct SegmentStyle {
 
 impl SegmentStyle {
     /// Builds a segment style from a computed style.
-    pub(crate) fn from_style(style: &crate::style::Style) -> Self {
+    pub(crate) fn from_style(style: &crate::render::style::Style) -> Self {
         Self {
             size: style.font_size,
             weight: style.font_weight,
@@ -60,7 +60,7 @@ impl SegmentStyle {
             decoration: style.text_decoration,
             letter_spacing: style.letter_spacing,
             line_height: style.line_height,
-            visible: style.visibility == crate::style::Visibility::Visible,
+            visible: style.visibility == crate::render::style::Visibility::Visible,
         }
     }
 }

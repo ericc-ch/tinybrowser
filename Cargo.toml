@@ -6,7 +6,6 @@ members = [
     "crates/dom",
     "crates/logging",
     "crates/net",
-    "crates/render",
     "crates/renderer",
     "crates/server",
     "crates/wasm",
@@ -24,7 +23,6 @@ cookies = { path = "crates/cookies" }
 dom = { path = "crates/dom" }
 logging = { path = "crates/logging" }
 net = { path = "crates/net" }
-render = { path = "crates/render" }
 renderer = { path = "crates/renderer" }
 server = { path = "crates/server" }
 webdriver = { path = "crates/webdriver" }

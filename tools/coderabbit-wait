@@ -9,7 +9,7 @@
 # signal: it lists the base as well, and a stale pass must not count while a
 # new one has not started.
 #
-# Usage: coderabbit-wait [PR] [TIMEOUT_SECONDS]   (defaults: branch PR, 1800)
+# Usage: tools/coderabbit-wait [PR] [TIMEOUT_SECONDS]   (defaults: branch PR, 1800)
 # Exit:  0 head reviewed  2 no finished pass covered the head in time
 set -euo pipefail
 

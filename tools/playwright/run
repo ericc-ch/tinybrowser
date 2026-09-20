@@ -14,7 +14,7 @@ fi
 
 cd "$ROOT"
 cargo build -q --offline 2>/dev/null || cargo build -q
-export TINYBROWSER_BIN="$("$ROOT/tools/bin")"
+export TINYBROWSER_BIN="$("$ROOT/tools/binary-path")"
 
 cd "$ROOT/tools/playwright"
 if [ ! -d node_modules ]; then

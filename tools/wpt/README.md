@@ -7,13 +7,13 @@ passes `--resolve` maps instead of editing `/etc/hosts`.
 
 ```sh
 nix develop --command ./tools/wpt/run dom/events/ --exclude=worker
-nix develop --command ./tools/wpt/score dom/nodes/ -- --processes 4
-nix develop --command ./tools/wpt/score css/css-color/ -- --test-types reftest --processes 4
+nix develop --command ./tools/wpt/run --score dom/nodes/ -- --processes 4
+nix develop --command ./tools/wpt/run --score css/css-color/ -- --test-types reftest --processes 4
 ```
 
 `--exclude=worker` also skips Worker variants (`.any.worker.html`, `.worker.html`), not only URL prefix `/worker`. Those tests are omitted, not run to a fail. Prove the filter with `nix develop --command python3 tools/wpt/launch.py --selftest`.
 
-`tools/wpt/score` prints one row per directory with pass, expected-fail, and
+`tools/wpt/run --score` prints one row per directory with pass, expected-fail, and
 unexpected buckets, subtest counts, and test time, then lists what needs
 attention. It is the grind instrument; `--report FILE` summarizes an existing
 `--log-wptreport`. Runner options follow a literal `--`.
@@ -22,7 +22,7 @@ attention. It is the grind instrument; `--report FILE` summarizes an existing
 
 ```sh
 # score a directory and keep the report
-nix develop --command ./tools/wpt/score FileAPI/ --save-report /tmp/fileapi.json -- \
+nix develop --command ./tools/wpt/run --score FileAPI/ --save-report /tmp/fileapi.json -- \
   --exclude=worker --processes 8 --fully-parallel
 # after a fix, re-run only the tests that needed attention
 nix develop --command ./tools/wpt/retest /tmp/fileapi.json -- --processes 8 --fully-parallel

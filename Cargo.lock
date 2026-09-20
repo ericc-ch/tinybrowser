@@ -1831,34 +1831,15 @@ dependencies = [
 ]
 
 [[package]]
-name = "render"
+name = "renderer"
 version = "0.1.0"
 dependencies = [
  "app_units",
  "dom",
- "euclid",
- "fontique",
- "parley",
- "png",
- "selectors",
- "skrifa",
- "stylo",
- "stylo_dom",
- "stylo_static_prefs",
- "stylo_traits",
- "taffy",
- "tiny-skia",
- "url",
- "web_atoms",
-]
-
-[[package]]
-name = "renderer"
-version = "0.1.0"
-dependencies = [
- "dom",
  "encoding_rs",
+ "euclid",
  "fixed_decimal",
+ "fontique",
  "getrandom",
  "html5ever",
  "icu_calendar",
@@ -1871,13 +1852,23 @@ dependencies = [
  "icu_provider_adapters",
  "icu_provider_blob",
  "markup5ever",
- "render",
+ "parley",
+ "png",
  "rquickjs",
+ "selectors",
  "serde",
  "serde_json",
+ "skrifa",
+ "stylo",
+ "stylo_dom",
+ "stylo_static_prefs",
+ "stylo_traits",
+ "taffy",
  "tendril",
+ "tiny-skia",
  "tokio",
  "url",
+ "web_atoms",
  "writeable",
 ]
 
