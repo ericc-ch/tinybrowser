@@ -39,10 +39,20 @@ mod layout;
 mod paint;
 mod png;
 mod style;
+mod svg;
 mod text;
 mod tree;
 
+pub(crate) use png::decode_png;
 pub use png::encode_png;
+
+/// One decoded image in premultiplied RGBA form, ready for `tiny-skia`.
+#[derive(Clone, Debug)]
+pub(crate) struct RasterImage {
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+    pub(crate) data: Vec<u8>,
+}
 
 /// One rendered viewport, 8 bits per channel, straight (non-premultiplied)
 /// alpha, row-major RGBA.
@@ -103,12 +113,13 @@ impl RgbaImage {
 ///
 /// Returns [`RenderError`] when a stylesheet cannot be parsed or the pipeline
 /// refuses a document it cannot lay out.
-pub fn render(
+pub(crate) fn render(
     dom: &dom::Dom,
     stylesheets: &[String],
     options: &RenderOptions,
+    images: &std::collections::HashMap<dom::NodeId, RasterImage>,
 ) -> Result<RgbaImage, RenderError> {
-    cascade::render(dom, stylesheets, options)
+    cascade::render(dom, stylesheets, options, images)
 }
 
 /// One laid-out box in CSS pixels, keyed by its DOM element when it has one.
@@ -137,8 +148,9 @@ pub fn layout_boxes(
     dom: &dom::Dom,
     stylesheets: &[String],
     options: &RenderOptions,
+    images: &std::collections::HashMap<dom::NodeId, RasterImage>,
 ) -> Result<Vec<NodeBox>, RenderError> {
-    cascade::boxes(dom, stylesheets, options)
+    cascade::boxes(dom, stylesheets, options, images)
 }
 
 /// Viewport and device parameters for one render.
@@ -226,6 +238,7 @@ impl std::error::Error for RenderError {}
 mod tests {
     use super::{RenderOptions, encode_png, layout_boxes, render};
     use dom::{Dom, LocalName, QualName, html_namespace};
+    use std::collections::HashMap;
 
     fn html_name(local: &str) -> QualName {
         QualName::new(None, html_namespace(), LocalName::from(local))
@@ -248,6 +261,7 @@ mod tests {
                 height: 120.0,
                 scale: 1.0,
             },
+            &HashMap::new(),
         )
         .expect("render");
         assert_eq!((image.width, image.height), (200, 120));
@@ -269,6 +283,7 @@ mod tests {
                 height: 8.0,
                 scale: 1.0,
             },
+            &HashMap::new(),
         )
         .expect("render");
         let png = encode_png(&image).expect("encode");
@@ -290,6 +305,7 @@ mod tests {
                 height: 120.0,
                 scale: 1.0,
             },
+            &HashMap::new(),
         )
         .expect("layout");
         assert!(

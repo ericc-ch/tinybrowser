@@ -77,9 +77,9 @@ impl Document {
 
     pub(crate) fn waiting_for_load(&self) -> bool {
         self.queued_dials.iter().any(|dial| match &dial.context {
-            DialContext::ClassicScript { epoch, .. } | DialContext::Stylesheet { epoch, .. } => {
-                *epoch == self.js_epoch
-            }
+            DialContext::ClassicScript { epoch, .. }
+            | DialContext::Stylesheet { epoch, .. }
+            | DialContext::Image { epoch, .. } => *epoch == self.js_epoch,
             DialContext::FrameLoad { sequence, .. } => *sequence == self.frame_load_sequence,
             DialContext::JsFetch { .. } => false,
         }) || self.classic_fetch_in_flight

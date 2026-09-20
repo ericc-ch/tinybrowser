@@ -357,6 +357,9 @@ pub(crate) struct World {
     /// a copy, page script cannot name it, and the bridge rejects calls made
     /// without it.
     pub(crate) host_token: Option<Persistent<Value<'static>>>,
+    /// Decoded `<img>` bitmaps for this document, used by both paint and
+    /// script geometry.
+    pub(crate) images: HashMap<NodeId, crate::render::RasterImage>,
 }
 
 impl Drop for World {
@@ -429,6 +432,7 @@ impl World {
             pristine_queue_microtask: None,
             deliver_mutations_fn: None,
             host_token: None,
+            images: HashMap::new(),
         }
     }
 
@@ -522,8 +526,7 @@ impl World {
         // (<https://html.spec.whatwg.org/multipage/webappapis.html#event-handlers>).
         self.handler_attributes
             .retain(|(node, _), _| node.is_none());
-        self.cleared_handlers
-            .retain(|(node, _)| node.is_none());
+        self.cleared_handlers.retain(|(node, _)| node.is_none());
         let pending = self.take_document_stream();
         drop(pending);
         // A new realm owns fresh observers; navigation drops the old ones.

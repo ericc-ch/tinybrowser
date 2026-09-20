@@ -268,6 +268,8 @@ pub enum DialKind {
     /// A `<link rel=stylesheet>` sheet, which delays the load event
     /// (<https://html.spec.whatwg.org/multipage/links.html#link-type-stylesheet>).
     Stylesheet,
+    /// An `<img>` resource.
+    Image,
     /// A child frame's navigation.
     FrameLoad,
 }

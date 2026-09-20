@@ -33,9 +33,8 @@ pub(crate) fn adopt_across_documents(
         let Some(parsed) = owner.document(node) else {
             return Err(Exception::throw_type(ctx, "no document"));
         };
-        import_snapshot(&parsed.dom, node, true).ok_or_else(|| {
-            throw_dom(ctx, "HierarchyRequestError", "node cannot be adopted")
-        })?
+        import_snapshot(&parsed.dom, node, true)
+            .ok_or_else(|| throw_dom(ctx, "HierarchyRequestError", "node cannot be adopted"))?
     };
     {
         let owner = world_rc

@@ -34,3 +34,23 @@ pub use renderer::{
     TabError, TabEvent,
 };
 pub use store::ProfileStore;
+
+/// Chrome-compatible identity sent by the browser and exposed through CDP.
+/// TLS fingerprinting is a separate transport concern and is not changed here.
+pub const USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36";
+
+/// Low-entropy `Sec-CH-UA` brands, kept in lockstep with `navigator.userAgentData`
+/// (<https://wicg.github.io/ua-client-hints/#sec-ch-ua>).
+pub const SEC_CH_UA: &str = r#""Not_A Brand";v="99", "Chromium";v="152", "Google Chrome";v="152""#;
+
+/// Desktop Chrome `Sec-CH-UA-Mobile` boolean
+/// (<https://wicg.github.io/ua-client-hints/#sec-ch-ua-mobile>).
+pub const SEC_CH_UA_MOBILE: &str = "?0";
+
+/// Linux `Sec-CH-UA-Platform` brand
+/// (<https://wicg.github.io/ua-client-hints/#sec-ch-ua-platform>).
+pub const SEC_CH_UA_PLATFORM: &str = r#""Linux""#;
+
+/// Dark `Sec-CH-Prefers-Color-Scheme`, kept in lockstep with Stylo and `matchMedia`
+/// (<https://wicg.github.io/user-preference-media-features-headers/#sec-ch-prefers-color-scheme>).
+pub const SEC_CH_PREFERS_COLOR_SCHEME: &str = "dark";

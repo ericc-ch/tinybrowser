@@ -21,7 +21,7 @@
 use std::collections::HashMap;
 
 use taffy::style_helpers::{FromFr as _, FromLength as _, FromPercent as _, TaffyAuto as _};
-use taffy::tree::{LayoutInput, LayoutOutput};
+use taffy::tree::LayoutInput;
 use taffy::{
     AlignContent as TaffyAlignContent, AlignItems as TaffyAlignItems,
     AvailableSpace as TaffyAvailableSpace, Display as TaffyDisplay,
@@ -94,9 +94,18 @@ pub(crate) fn layout_root(
     let ctx = Ctx { fonts };
     let mut builder = Builder::new(&ctx);
     let root_id = builder.build_node(root);
+    // `root_id` is the synthetic box around the document element. It models
+    // the initial containing block, whose continuous-media dimensions are
+    // the viewport; making its block size definite lets the document
+    // element resolve percentage heights against it.
+    // https://www.w3.org/TR/CSS22/visudet.html#containing-block-details
+    if let Ok(mut initial_containing_block) = builder.tree.style(root_id).cloned() {
+        initial_containing_block.size.height = taffy::Dimension::length(viewport_height);
+        let _ = builder.tree.set_style(root_id, initial_containing_block);
+    }
     let available = TaffySize {
         width: TaffyAvailableSpace::Definite(viewport_width),
-        height: TaffyAvailableSpace::MaxContent,
+        height: TaffyAvailableSpace::Definite(viewport_height),
     };
     builder.run_layout(root_id, available);
     let layout = builder.convert(root_id, 0.0, 0.0, viewport_width);
@@ -120,106 +129,69 @@ pub(crate) fn layout_subtree(node: &BoxNode, ctx: &Ctx<'_>, available: f32) -> L
         height: TaffyAvailableSpace::MaxContent,
     };
     builder.run_layout(root_id, space);
-    builder.convert(root_id, 0.0, 0.0, available)
+    let mut layout = builder.convert(root_id, 0.0, 0.0, available);
+    if layout.rect.height == 0.0
+        && node.children.is_empty()
+        && let Some(ratio) = node.style.aspect_ratio
+        && ratio > 0.0
+    {
+        // Replaced leaves with only an intrinsic ratio get their block size
+        // from the resolved inline size.
+        // https://drafts.csswg.org/css-images-3/#default-sizing
+        layout.rect.height = layout.rect.width / ratio;
+    }
+    layout
 }
 
 /// Measures one text leaf with our inline engine.
-fn measure_leaf(
+///
+/// The returned size is the **content** box. [`taffy::compute_leaf_layout`]
+/// adds this node's padding and border.
+fn measure_content(
     runs: &[InlineRun<'_>],
     cache: &mut HashMap<taffy::NodeId, (f32, Vec<PaintItem>)>,
-    data: &HashMap<taffy::NodeId, NodeData>,
     ctx: &Ctx<'_>,
     input: LayoutInput,
     node: taffy::NodeId,
     context: Option<&mut TextLeaf>,
-) -> LayoutOutput {
-    let (width, height) = match context {
-        Some(leaf) => {
-            let run = &runs[leaf.run];
-            let width = if let Some(width) = input.known_dimensions.width {
-                width
-            } else {
-                match input.available_space.width {
-                    TaffyAvailableSpace::Definite(width) => width,
-                    TaffyAvailableSpace::MinContent => {
-                        return output(min_content_width(run.nodes, ctx), 0.0);
-                    }
-                    TaffyAvailableSpace::MaxContent => {
-                        return output(run_max_content(run.nodes, ctx), 0.0);
-                    }
-                }
-            };
-            let result =
-                layout_inline_run(run.nodes, ctx, 0.0, 0.0, width.max(0.0), run.text_align);
-            let height = match input.known_dimensions.height {
-                Some(height) => height,
-                None => result.height,
-            };
-            cache.insert(node, (width, result.items));
-            (width, height)
-        }
-        None => {
-            // A childless element box (empty divs, floats): Taffy still
-            // routes these through measure, so resolve the style size here
-            // instead of reporting zero.
-            if let Some(known) = data.get(&node) {
-                styled_size(&known.style, &input)
-            } else {
-                (
-                    input.known_dimensions.width.unwrap_or(0.0),
-                    input.known_dimensions.height.unwrap_or(0.0),
-                )
+) -> TaffySize<f32> {
+    let Some(leaf) = context else {
+        return TaffySize {
+            width: 0.0,
+            height: 0.0,
+        };
+    };
+    let run = &runs[leaf.run];
+    let width = if let Some(width) = input.known_dimensions.width {
+        width
+    } else {
+        match input.available_space.width {
+            // A non-stretched grid item supplies a definite area but
+            // no known width. Its auto inline size is fit-content,
+            // not the whole grid area.
+            // https://drafts.csswg.org/css-grid-2/#grid-item-sizing
+            TaffyAvailableSpace::Definite(width) => run_max_content(run.nodes, ctx).min(width),
+            TaffyAvailableSpace::MinContent => {
+                return TaffySize {
+                    width: min_content_width(run.nodes, ctx),
+                    height: 0.0,
+                };
+            }
+            TaffyAvailableSpace::MaxContent => {
+                return TaffySize {
+                    width: run_max_content(run.nodes, ctx),
+                    height: 0.0,
+                };
             }
         }
     };
-    output(width, height)
-}
-
-/// Resolves an empty element box's style size for the measure fallback.
-/// Percentages resolve against the parent size when Taffy supplies one.
-fn styled_size(style: &Style, input: &LayoutInput) -> (f32, f32) {
-    let basis = |axis: Option<f32>, available: TaffyAvailableSpace| {
-        axis.or(match available {
-            TaffyAvailableSpace::Definite(value) => Some(value),
-            TaffyAvailableSpace::MinContent | TaffyAvailableSpace::MaxContent => None,
-        })
-        .unwrap_or(0.0)
+    let result = layout_inline_run(run.nodes, ctx, 0.0, 0.0, width.max(0.0), run.text_align);
+    let height = match input.known_dimensions.height {
+        Some(height) => height,
+        None => result.height,
     };
-    let basis_w = basis(input.parent_size.width, input.available_space.width);
-    let basis_h = basis(input.parent_size.height, input.available_space.height);
-    let resolve = |dimension: Dimension, basis: f32| match dimension {
-        Dimension::Auto => None,
-        Dimension::Length(length) => Some(length.resolve(basis)),
-    };
-    let width = input
-        .known_dimensions
-        .width
-        .or_else(|| resolve(style.width, basis_w))
-        .or(match input.available_space.width {
-            TaffyAvailableSpace::Definite(width) => Some(width),
-            TaffyAvailableSpace::MinContent | TaffyAvailableSpace::MaxContent => None,
-        })
-        .unwrap_or(0.0);
-    let height = input
-        .known_dimensions
-        .height
-        .or_else(|| resolve(style.height, basis_h))
-        .unwrap_or(0.0);
-    (width.max(0.0), height.max(0.0))
-}
-
-/// A [`LayoutOutput`] with the content rect covering the size. Leaves carry
-/// no collapsible margins of their own.
-fn output(width: f32, height: f32) -> LayoutOutput {
-    LayoutOutput::from_sizes(
-        TaffySize { width, height },
-        TaffyRect {
-            left: 0.0,
-            top: 0.0,
-            right: width,
-            bottom: height,
-        },
-    )
+    cache.insert(node, (width, result.items));
+    TaffySize { width, height }
 }
 
 impl<'a> Builder<'a> {
@@ -246,12 +218,24 @@ impl<'a> Builder<'a> {
             tree,
             runs,
             cache,
-            data,
             ctx,
             ..
         } = self;
-        tree.compute_layout_with_measure(root, available, |input, node, context, _| {
-            measure_leaf(runs, cache, data, ctx, input, node, context)
+        // `compute_leaf_layout` adds padding, border, min/max, and
+        // aspect-ratio on top of the content size the measure closure
+        // returns (<https://docs.rs/taffy/0.14.0/taffy/fn.compute_leaf_layout.html>).
+        tree.compute_layout_with_measure(root, available, |input, node, context, style| {
+            taffy::compute_leaf_layout(
+                input,
+                style,
+                |_, _| 0.0,
+                |known, available_space| {
+                    let mut nested = input;
+                    nested.known_dimensions = known;
+                    nested.available_space = available_space;
+                    measure_content(runs, cache, ctx, nested, node, context)
+                },
+            )
         })
         .expect("taffy layout cannot fail on a tree we built");
     }
@@ -350,17 +334,15 @@ impl<'a> Builder<'a> {
     fn build_item(&mut self, child: &'a BoxNode, container: &Style) -> taffy::NodeId {
         if is_block_level(child) && child.style.float == Float::None {
             self.build_node(child)
-        } else if matches!(
-            child.kind,
-            BoxKind::InlineBlock | BoxKind::InlineFlex | BoxKind::InlineGrid
-        ) {
-            // Blockified, keeping the item's own box properties.
-            self.build_leaf(
-                std::slice::from_ref(child),
-                container.text_align,
-                &child.style,
-                child.node,
-            )
+        } else if matches!(child.kind, BoxKind::InlineBlock) {
+            // Flex/grid items are blockified, so an `inline-block` item is a
+            // block container, not an atomic inside a padded leaf.
+            // https://drafts.csswg.org/css-flexbox-1/#flex-items
+            self.build_block(child)
+        } else if matches!(child.kind, BoxKind::InlineFlex) {
+            self.build_flex(child)
+        } else if matches!(child.kind, BoxKind::InlineGrid) {
+            self.build_grid(child)
         } else {
             // Bare text and spans: neutral box, inherited text.
             // The leaf style is a local; `build_leaf` copies it.
@@ -381,6 +363,9 @@ impl<'a> Builder<'a> {
         };
         converted.grid_column = map_grid_line(item.grid_column);
         converted.grid_row = map_grid_line(item.grid_row);
+        // Our style model does not expose `justify-self` yet, so resolve its
+        // `auto` value from the grid container's `justify-items` explicitly.
+        converted.justify_self = Some(map_align(container.justify_items));
         if item.align_self != AlignSelf::Auto {
             converted.align_self = Some(resolve_align_self(
                 item.align_self,
@@ -566,6 +551,7 @@ fn convert_style(style: &Style) -> TaffyStyle {
             width: to_dimension(style.width),
             height: to_dimension(style.height),
         },
+        aspect_ratio: style.aspect_ratio,
         min_size: TaffySize {
             width: to_auto(style.min_width),
             height: to_auto(style.min_height),
@@ -626,6 +612,7 @@ fn convert_style(style: &Style) -> TaffyStyle {
         flex_shrink: style.flex_shrink,
         flex_basis: to_dimension(style.flex_basis),
         justify_content: Some(match style.justify_content {
+            JustifyContent::Stretch => TaffyJustifyContent::STRETCH,
             JustifyContent::FlexStart => TaffyJustifyContent::FLEX_START,
             JustifyContent::FlexEnd => TaffyJustifyContent::FLEX_END,
             JustifyContent::Center => TaffyJustifyContent::CENTER,

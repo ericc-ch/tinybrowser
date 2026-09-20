@@ -68,6 +68,15 @@ impl AgentBuilder {
         self
     }
 
+    /// Sets a fallback `User-Agent` while preserving an explicit caller value.
+    #[must_use]
+    pub fn default_user_agent(mut self, value: &str) -> Self {
+        if self.user_agent.is_none() {
+            self.user_agent = Some(value.to_owned());
+        }
+        self
+    }
+
     /// Cap on the whole call, including redirects.
     #[must_use]
     pub fn timeout_global(mut self, timeout: Duration) -> Self {
@@ -579,6 +588,24 @@ fn apply_redirect_policy(
         headers.remove("authorization");
         headers.remove("cookie");
         headers.remove("host");
+    }
+    if next.scheme() != "https" && !loopback_http(next) {
+        headers.remove("sec-ch-ua");
+        headers.remove("sec-ch-ua-mobile");
+        headers.remove("sec-ch-ua-platform");
+        headers.remove("sec-ch-prefers-color-scheme");
+    }
+}
+
+fn loopback_http(url: &Url) -> bool {
+    match url.host() {
+        Some(url::Host::Ipv4(addr)) => addr.is_loopback(),
+        Some(url::Host::Ipv6(addr)) => addr.is_loopback(),
+        Some(url::Host::Domain(host)) => {
+            let host = host.to_ascii_lowercase();
+            host == "localhost" || host.ends_with(".localhost")
+        }
+        None => false,
     }
 }
 

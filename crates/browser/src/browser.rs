@@ -84,7 +84,9 @@ enum Command {
     },
     /// Forgets a released renderer assignment, so cross-site navigation does
     /// not accumulate stale entries for the tab's lifetime.
-    UnregisterAssignment { assignment: u64 },
+    UnregisterAssignment {
+        assignment: u64,
+    },
     /// The tab that owns one renderer assignment.
     AssignmentTab {
         assignment: u64,

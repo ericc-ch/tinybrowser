@@ -46,7 +46,7 @@ use dispatch::{
     ws_io,
 };
 
-const PRODUCT: &str = "tinybrowser/0.1.0";
+const PRODUCT: &str = "Chrome/152.0.7977.82";
 /// One default browser context; Playwright requires `browserContextId` on
 /// attached targets.
 const DEFAULT_BROWSER_CONTEXT_ID: &str = "tinybrowser-default";
@@ -737,7 +737,7 @@ impl Conn {
                 "protocolVersion": "1.3",
                 "product": PRODUCT,
                 "revision": "0",
-                "userAgent": PRODUCT,
+                "userAgent": browser::USER_AGENT,
                 "jsVersion": "QuickJS",
             })),
             "Browser.setDownloadBehavior"

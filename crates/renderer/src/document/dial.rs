@@ -112,6 +112,7 @@ pub(in crate::document) fn request(dial: &QueuedDial) -> DialRequest {
         DialContext::JsFetch { .. } => DialKind::JsFetch,
         DialContext::ClassicScript { .. } => DialKind::ClassicScript,
         DialContext::Stylesheet { .. } => DialKind::Stylesheet,
+        DialContext::Image { .. } => DialKind::Image,
         DialContext::FrameLoad { .. } => DialKind::FrameLoad,
     };
     DialRequest {

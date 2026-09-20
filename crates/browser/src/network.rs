@@ -51,7 +51,13 @@ impl NetworkSession {
     ///
     /// Stored profile data could not be read or quarantined.
     pub fn from_builder(builder: AgentBuilder, store: ProfileStore) -> io::Result<Self> {
-        Self::from_agent(builder.timeout_per_call(PAGE_FETCH_TIMEOUT).build(), store)
+        Self::from_agent(
+            builder
+                .default_user_agent(crate::USER_AGENT)
+                .timeout_per_call(PAGE_FETCH_TIMEOUT)
+                .build(),
+            store,
+        )
     }
 
     /// Session that shares `agent` (and therefore its cookie jar).
@@ -252,8 +258,7 @@ impl FetchHandle {
     async fn navigate(&self, url: &Url, initiator: &Url) -> Result<NavOutcome, DialFailure> {
         let deadline = Instant::now() + PAGE_FETCH_TIMEOUT;
         let permits = Self::acquire(&self.permits.navigation, deadline).await?;
-        let response = self
-            .request(Method::GET, url.clone())
+        let response = chrome_navigation_request(self.request(Method::GET, url.clone()), url)
             .with_initiator_kind(InitiatorKind::Navigation)
             .with_initiator(initiator.clone())
             .deadline(deadline)
@@ -353,6 +358,64 @@ pub(crate) fn dial_failure(error: &net::NetError) -> DialFailure {
     }
 }
 
+/// Navigation identity headers for Chrome emulation.
+///
+/// `Upgrade-Insecure-Requests` is the document navigation preference
+/// (<https://www.w3.org/TR/upgrade-insecure-requests/#preference>).
+/// `Accept` and Fetch Metadata (`Sec-Fetch-*`) match Chrome's document
+/// navigation request
+/// (<https://w3c.github.io/webappsec-fetch-metadata/>).
+/// Low-entropy UA client hints are sent only to potentially trustworthy URLs
+/// (<https://wicg.github.io/ua-client-hints/#sec-ch-ua>,
+/// <https://w3c.github.io/webappsec-secure-contexts/#is-url-trustworthy>).
+fn chrome_navigation_request(mut request: net::RequestBuilder, url: &Url) -> net::RequestBuilder {
+    request = identity_header(request, "Upgrade-Insecure-Requests", "1");
+    request = identity_header(
+        request,
+        "Accept",
+        "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+    );
+    request = identity_header(request, "Sec-Fetch-Site", "none");
+    request = identity_header(request, "Sec-Fetch-Mode", "navigate");
+    request = identity_header(request, "Sec-Fetch-User", "?1");
+    request = identity_header(request, "Sec-Fetch-Dest", "document");
+    if sends_default_ua_client_hints(url) {
+        for (name, value) in [
+            ("Sec-CH-UA", crate::SEC_CH_UA),
+            ("Sec-CH-UA-Mobile", crate::SEC_CH_UA_MOBILE),
+            ("Sec-CH-UA-Platform", crate::SEC_CH_UA_PLATFORM),
+            (
+                "Sec-CH-Prefers-Color-Scheme",
+                crate::SEC_CH_PREFERS_COLOR_SCHEME,
+            ),
+        ] {
+            request = identity_header(request, name, value);
+        }
+    }
+    request
+}
+
+fn identity_header(request: net::RequestBuilder, name: &str, value: &str) -> net::RequestBuilder {
+    request
+        .header(name, value)
+        .expect("Chrome navigation identity headers are static HTTP tokens with no CTL bytes")
+}
+
+fn sends_default_ua_client_hints(url: &Url) -> bool {
+    if url.scheme() == "https" {
+        return true;
+    }
+    match url.host() {
+        Some(url::Host::Ipv4(addr)) => addr.is_loopback(),
+        Some(url::Host::Ipv6(addr)) => addr.is_loopback(),
+        Some(url::Host::Domain(host)) => {
+            let host = host.to_ascii_lowercase();
+            host == "localhost" || host.ends_with(".localhost")
+        }
+        None => false,
+    }
+}
+
 /// `Content-Type` and single `Content-Language` tag from response `headers`.
 fn response_meta(headers: &net::HeaderMap) -> (Option<String>, Option<String>) {
     let content_language = headers
@@ -409,5 +472,21 @@ mod tests {
         let _again = FetchHandle::acquire(&permits, Instant::now() + Duration::from_millis(50))
             .await
             .expect("permit after release");
+    }
+
+    #[test]
+    fn default_ua_client_hints_are_limited_to_trustworthy_urls() {
+        assert!(sends_default_ua_client_hints(
+            &Url::parse("https://example.com/").expect("https")
+        ));
+        assert!(!sends_default_ua_client_hints(
+            &Url::parse("http://example.com/").expect("http")
+        ));
+        assert!(sends_default_ua_client_hints(
+            &Url::parse("http://127.0.0.1/").expect("loopback")
+        ));
+        assert!(sends_default_ua_client_hints(
+            &Url::parse("http://localhost/").expect("localhost")
+        ));
     }
 }

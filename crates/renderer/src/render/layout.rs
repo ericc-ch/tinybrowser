@@ -10,7 +10,7 @@ use crate::render::font::Fonts;
 use crate::render::geometry::{Edges, Rect};
 use crate::render::style::{BoxSizing, Dimension, Style, TextAlign, WhiteSpace};
 use crate::render::text::{FontStyle, PlacedRun, Segment, SegmentStyle};
-use crate::render::tree::{BoxKind, BoxNode};
+use crate::render::tree::{BoxKind, BoxNode, is_block_level};
 
 /// One painted child in tree order.
 pub(crate) enum PaintItem {
@@ -113,6 +113,30 @@ pub(crate) fn layout_inline_run(
     available: f32,
     text_align: TextAlign,
 ) -> InlineResult {
+    layout_inline_run_wrap(run, ctx, x, y, available, text_align, true)
+}
+
+/// Lays out `run` without soft wraps, for max-content.
+fn layout_inline_run_nowrap(
+    run: &[BoxNode],
+    ctx: &Ctx<'_>,
+    x: f32,
+    y: f32,
+    available: f32,
+    text_align: TextAlign,
+) -> InlineResult {
+    layout_inline_run_wrap(run, ctx, x, y, available, text_align, false)
+}
+
+fn layout_inline_run_wrap(
+    run: &[BoxNode],
+    ctx: &Ctx<'_>,
+    x: f32,
+    y: f32,
+    available: f32,
+    text_align: TextAlign,
+    allow_wrap: bool,
+) -> InlineResult {
     let mut raw: Vec<RawToken<'_>> = Vec::new();
     // Parley has one whitespace mode per layout; preserve wins and collapsing
     // runs are pre-collapsed below, so mixed modes stay exact.
@@ -126,11 +150,15 @@ pub(crate) fn layout_inline_run(
         collect_token(
             node,
             ctx,
+            available,
             &mut raw,
             &mut preserve,
             &mut wrap,
             &mut pending_space,
         );
+    }
+    if !allow_wrap {
+        wrap = false;
     }
     if raw.is_empty() {
         return InlineResult {
@@ -211,9 +239,18 @@ fn shape_group(
         .iter()
         .map(|(_, measurement)| (measurement.outer_width, measurement.height))
         .collect();
-    let width = if wrap { Some(available.max(0.0)) } else { None };
-    let lines =
-        crate::render::text::shape_lines(ctx.fonts, &tokens, &sizes, width, text_align, preserve);
+    // Always break against the IFC width so `text-align` has a line box,
+    // even when the run cannot wrap (a single `inline-block` atomic).
+    // https://drafts.csswg.org/css-text-3/#text-align-property
+    let lines = crate::render::text::shape_lines(
+        ctx.fonts,
+        &tokens,
+        &sizes,
+        available.max(0.0),
+        wrap,
+        text_align,
+        preserve,
+    );
     let mut height = 0.0_f32;
     for line in &lines {
         for atomic in &line.atomics {
@@ -248,6 +285,7 @@ fn shift_glyph_run(run: &mut PlacedRun, dx: f32, dy: f32) {
 fn collect_token<'a>(
     node: &'a BoxNode,
     ctx: &Ctx<'_>,
+    available: f32,
     out: &mut Vec<RawToken<'a>>,
     preserve: &mut bool,
     wrap: &mut bool,
@@ -277,7 +315,7 @@ fn collect_token<'a>(
         }
         BoxKind::Inline => {
             for child in &node.children {
-                collect_token(child, ctx, out, preserve, wrap, pending_space);
+                collect_token(child, ctx, available, out, preserve, wrap, pending_space);
             }
         }
         // `<br>` always breaks, in every whitespace mode. It splits the run
@@ -303,7 +341,7 @@ fn collect_token<'a>(
                 }
                 *pending_space = false;
             }
-            let measurement = measure_atomic(node, ctx);
+            let measurement = measure_atomic(node, ctx, available);
             out.push(RawToken::Atomic { node, measurement });
         }
     }
@@ -375,8 +413,18 @@ fn process_text(text: &str, style: &Style) -> ProcessedText {
     }
 }
 /// tree rooted at the atomic.
-fn measure_atomic(node: &BoxNode, ctx: &Ctx<'_>) -> Atomic {
-    let preferred = max_content_width(node, ctx);
+fn measure_atomic(node: &BoxNode, ctx: &Ctx<'_>, available: f32) -> Atomic {
+    let mut preferred = max_content_width(node, ctx).ceil();
+    if preferred == 0.0
+        && node.style.width == Dimension::Auto
+        && node.style.height == Dimension::Auto
+        && let Some(ratio) = node.style.aspect_ratio
+    {
+        // Replaced content with only an intrinsic ratio uses the 300x150
+        // default object size, contained by the available inline size.
+        // https://drafts.csswg.org/css-images-3/#default-sizing
+        preferred = (150.0 * ratio).min(300.0).min(available);
+    }
     let layout = crate::render::boxes::layout_subtree(node, ctx, preferred);
     let margin = node.style.margin.map(|dimension| match dimension {
         Dimension::Auto => 0.0,
@@ -435,6 +483,13 @@ pub(crate) fn min_content_width(run: &[BoxNode], ctx: &Ctx<'_>) -> f32 {
 
 /// Min-content contribution of one inline-level box.
 fn min_content_node(node: &BoxNode, ctx: &Ctx<'_>) -> f32 {
+    // No wrap opportunities means min-content equals max-content: spaces
+    // are not break points under `nowrap`/`pre`.
+    // https://drafts.csswg.org/css-text-3/#min-content-inline-size
+    // https://drafts.csswg.org/css-sizing-3/#min-content
+    if !allows_wrap(&node.style) {
+        return max_content_width(node, ctx);
+    }
     let style = &node.style;
     let font = FontStyle {
         size: style.font_size,
@@ -513,11 +568,7 @@ pub(crate) fn max_content_width(node: &BoxNode, ctx: &Ctx<'_>) -> f32 {
             width.max(current)
         }
         BoxKind::Break => 0.0,
-        BoxKind::Inline => node
-            .children
-            .iter()
-            .map(|child| max_content_width(child, ctx))
-            .sum(),
+        BoxKind::Inline | BoxKind::InlineBlock => ifc_max_content_width(&node.children, ctx),
         BoxKind::Flex | BoxKind::InlineFlex => {
             let row = matches!(
                 style.flex_direction,
@@ -534,7 +585,7 @@ pub(crate) fn max_content_width(node: &BoxNode, ctx: &Ctx<'_>) -> f32 {
                 widths.fold(0.0, f32::max)
             }
         }
-        BoxKind::InlineBlock | BoxKind::InlineGrid => node
+        BoxKind::InlineGrid => node
             .children
             .iter()
             .map(|child| max_content_width(child, ctx))
@@ -546,11 +597,16 @@ pub(crate) fn max_content_width(node: &BoxNode, ctx: &Ctx<'_>) -> f32 {
             .iter()
             .map(|child| max_content_width(child, ctx))
             .fold(0.0, f32::max),
-        BoxKind::Block | BoxKind::ListItem => node
-            .children
-            .iter()
-            .map(|child| max_content_width(child, ctx))
-            .fold(0.0, f32::max),
+        BoxKind::Block | BoxKind::ListItem => {
+            if node.children.iter().any(is_block_level) {
+                node.children
+                    .iter()
+                    .map(|child| max_content_width(child, ctx))
+                    .fold(0.0, f32::max)
+            } else {
+                ifc_max_content_width(&node.children, ctx)
+            }
+        }
     };
     match style.width {
         Dimension::Length(length) => {
@@ -563,4 +619,27 @@ pub(crate) fn max_content_width(node: &BoxNode, ctx: &Ctx<'_>) -> f32 {
         }
         Dimension::Auto => content + extras,
     }
+}
+
+/// Longest unwrapped line in an inline formatting context, measured with
+/// the same Parley layout that paints so shrink-to-fit matches ink
+/// (<https://drafts.csswg.org/css-sizing-3/#max-content>).
+fn ifc_max_content_width(children: &[BoxNode], ctx: &Ctx<'_>) -> f32 {
+    paint_items_width(
+        &layout_inline_run_nowrap(children, ctx, 0.0, 0.0, f32::MAX, TextAlign::Left).items,
+    )
+}
+
+fn paint_items_width(items: &[PaintItem]) -> f32 {
+    let mut right = 0.0_f32;
+    for item in items {
+        match item {
+            PaintItem::Box(child) => {
+                right = right.max(child.rect.right());
+                right = right.max(paint_items_width(&child.items));
+            }
+            PaintItem::Glyphs(run) => right = right.max(run.x + run.width),
+        }
+    }
+    right
 }

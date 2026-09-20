@@ -317,7 +317,9 @@ impl Engine {
             scale: 1.0,
         };
         let image = world
-            .with_main_document(|parsed| crate::render::render(&parsed.dom, &sheets, &options))
+            .with_main_document(|parsed| {
+                crate::render::render(&parsed.dom, &sheets, &options, &world.images)
+            })
             .ok_or_else(|| TabError::RendererUnavailable {
                 message: "no document to render".into(),
             })?
