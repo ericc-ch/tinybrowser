@@ -69,6 +69,9 @@ pub(crate) fn rasterize(dom: &Dom, root: NodeId) -> Option<RasterImage> {
         .unwrap_or(150.0);
     let width_px = device_side(width)?;
     let height_px = device_side(height)?;
+    if !crate::render::decoded_rgba_fits(width_px, height_px) {
+        return None;
+    }
     let mut painter =
         Painter::with_background(width_px, height_px, tiny_skia::Color::TRANSPARENT).ok()?;
     paint(
@@ -103,7 +106,7 @@ fn device_side(value: f32) -> Option<u32> {
         return None;
     }
     let rounded = value.round();
-    if rounded > 4096.0 {
+    if rounded > f32::from(crate::render::MAX_DECODED_SIDE) {
         return None;
     }
     #[expect(

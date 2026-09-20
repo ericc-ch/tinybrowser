@@ -11,6 +11,7 @@ use url::Url;
 use crate::document::{Document, FrameRuntime};
 use crate::messaging::{MAX_FRAMES, SharedHandle};
 use crate::protocol::{FrameId, StorageChange, StorageError, StorageKind};
+use crate::render::MAX_DECODED_IMAGE_BYTES;
 use crate::storage::PendingStorageEvent;
 use crate::{Parsed, ReadyState};
 
@@ -53,8 +54,6 @@ struct ResourceBudget {
 
 const MAX_PENDING_STREAM_BYTES: usize = 8 * 1024 * 1024;
 const MAX_OBJECT_URL_BYTES: usize = 8 * 1024 * 1024;
-/// Aggregate retained decoded image pixels across every realm in this renderer.
-const MAX_DECODED_IMAGE_BYTES: usize = 32 * 1024 * 1024;
 
 impl RealmRegistry {
     /// Remembers that `world` owns the document `id`.
@@ -365,12 +364,16 @@ pub(crate) struct World {
     /// Decoded `<img>` bitmaps for this document, used by both paint and
     /// script geometry.
     pub(crate) images: HashMap<NodeId, crate::render::RasterImage>,
-    /// `<img>` elements whose current request has not finished
+    /// `<img>` elements whose current request has not finished, including a
+    /// `src` mutation waiting for `update the image data`
     /// (<https://html.spec.whatwg.org/multipage/embedded-content.html#dom-img-complete>).
     pub(crate) image_loading: HashSet<NodeId>,
     /// Selected URL for each `<img>` current request
     /// (<https://html.spec.whatwg.org/multipage/embedded-content.html#dom-img-currentsrc>).
     pub(crate) image_current_src: HashMap<NodeId, String>,
+    /// Current request is broken and there is no pending request
+    /// (<https://html.spec.whatwg.org/multipage/images.html#img-error>).
+    pub(crate) image_broken: HashSet<NodeId>,
 }
 
 impl Drop for World {
@@ -453,6 +456,7 @@ impl World {
             images: HashMap::new(),
             image_loading: HashSet::new(),
             image_current_src: HashMap::new(),
+            image_broken: HashSet::new(),
         }
     }
 
@@ -1001,7 +1005,14 @@ impl World {
     }
 
     pub(crate) fn queue_image_update(&mut self, element: NodeId) {
-        self.image_updates.push(element);
+        // Keep `currentSrc` and decoded pixels until the new request starts.
+        // Mark unavailable now so `complete` is false while the update waits
+        // (<https://html.spec.whatwg.org/multipage/images.html#updating-the-image-data>,
+        // <https://html.spec.whatwg.org/multipage/embedded-content.html#dom-img-complete>).
+        self.image_loading.insert(element);
+        if !self.image_updates.contains(&element) {
+            self.image_updates.push(element);
+        }
     }
 
     pub(crate) fn take_image_updates(&mut self) -> Vec<NodeId> {
@@ -1010,7 +1021,8 @@ impl World {
 
     /// Marks `element` as having an in-flight image request at `url`.
     pub(crate) fn begin_image(&mut self, element: NodeId, url: String) {
-        self.forget_image(element);
+        self.forget_decoded_pixels(element);
+        self.image_broken.remove(&element);
         self.image_loading.insert(element);
         self.image_current_src.insert(element, url);
     }
@@ -1022,14 +1034,15 @@ impl World {
         image: crate::render::RasterImage,
         url: String,
     ) -> bool {
-        self.forget_image(element);
+        self.image_loading.remove(&element);
+        self.image_broken.remove(&element);
+        self.forget_decoded_pixels(element);
+        self.image_current_src.insert(element, url);
         let bytes = image.data.len();
         if !self.reserve_decoded_image_bytes(bytes) {
-            self.image_current_src.insert(element, url);
             return false;
         }
         self.images.insert(element, image);
-        self.image_current_src.insert(element, url);
         true
     }
 
@@ -1037,11 +1050,13 @@ impl World {
     pub(crate) fn fail_image(&mut self, element: NodeId) {
         self.image_loading.remove(&element);
         self.forget_decoded_pixels(element);
+        self.image_broken.insert(element);
     }
 
     pub(crate) fn forget_image(&mut self, element: NodeId) {
         self.image_loading.remove(&element);
         self.image_current_src.remove(&element);
+        self.image_broken.remove(&element);
         self.forget_decoded_pixels(element);
     }
 
@@ -1060,6 +1075,7 @@ impl World {
         self.images.clear();
         self.image_loading.clear();
         self.image_current_src.clear();
+        self.image_broken.clear();
         self.release_decoded_image_bytes(bytes);
     }
 

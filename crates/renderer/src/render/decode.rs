@@ -15,10 +15,8 @@ use zune_core::options::DecoderOptions;
 use zune_jpeg::JpegDecoder;
 
 use crate::render::png::{decode_png, push_premultiplied};
-use crate::render::{RasterImage, svg};
-
-/// Maximum width or height of a decoded page image.
-const MAX_SIDE: u32 = 4096;
+use crate::render::png::{decode_png, push_premultiplied};
+use crate::render::{MAX_DECODED_SIDE, RasterImage, decoded_rgba_fits, svg};
 
 /// Sniffed raster type from the MIME sniff image-pattern table.
 enum RasterKind {
@@ -80,20 +78,25 @@ fn decode_jpeg(bytes: &[u8]) -> Option<RasterImage> {
     let options = DecoderOptions::default()
         .set_use_unsafe(false)
         .jpeg_set_out_colorspace(ColorSpace::RGBA)
-        .set_max_width(4096)
-        .set_max_height(4096);
+        .set_max_width(usize::try_from(MAX_DECODED_SIDE).ok()?)
+        .set_max_height(usize::try_from(MAX_DECODED_SIDE).ok()?);
     let mut decoder = JpegDecoder::new_with_options(Cursor::new(bytes), options);
     decoder.decode_headers().ok()?;
     let info = decoder.info()?;
+    let width = u32::from(info.width);
+    let height = u32::from(info.height);
+    if !decoded_rgba_fits(width, height) {
+        return None;
+    }
     let pixels = decoder.decode().ok()?;
-    rgba_bytes(&pixels, u32::from(info.width), u32::from(info.height))
+    rgba_bytes(&pixels, width, height)
 }
 
 fn decode_webp(bytes: &[u8]) -> Option<RasterImage> {
     let mut decoder = WebPDecoder::new(Cursor::new(bytes)).ok()?;
-    decoder.set_memory_limit(32 * 1024 * 1024);
+    decoder.set_memory_limit(crate::render::MAX_DECODED_IMAGE_BYTES);
     let (width, height) = decoder.dimensions();
-    if width == 0 || height == 0 || width > MAX_SIDE || height > MAX_SIDE {
+    if !decoded_rgba_fits(width, height) {
         return None;
     }
     let size = decoder.output_buffer_size()?;
@@ -197,5 +200,13 @@ mod tests {
     #[test]
     fn rejects_unknown_bytes() {
         assert!(decode_image(b"not an image").is_none());
+    }
+
+    #[test]
+    fn decoded_rgba_fits_store_budget() {
+        assert!(crate::render::decoded_rgba_fits(8, 8));
+        assert!(crate::render::decoded_rgba_fits(4096, 2048));
+        assert!(!crate::render::decoded_rgba_fits(4096, 4096));
+        assert!(!crate::render::decoded_rgba_fits(0, 8));
     }
 }

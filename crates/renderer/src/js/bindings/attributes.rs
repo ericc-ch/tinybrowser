@@ -950,7 +950,6 @@ pub(crate) fn after_attribute_change(ctx: &Ctx<'_>, element: NodeId, local: &str
             spec,
         });
     } else {
-        world.borrow_mut().forget_image(element);
         world.borrow_mut().queue_image_update(element);
     }
     Ok(())

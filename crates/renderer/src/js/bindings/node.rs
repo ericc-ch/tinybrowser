@@ -1034,7 +1034,16 @@ impl JsNode {
         if world.image_loading.contains(&self.handle.0) {
             return Ok(false);
         }
-        Ok(true)
+        if world.images.contains_key(&self.handle.0) {
+            return Ok(true);
+        }
+        let src = world
+            .document(self.handle.0)
+            .and_then(|parsed| parsed.dom.attribute(self.handle.0, "src"));
+        if src.as_deref().is_none_or(|src| src.is_empty()) {
+            return Ok(true);
+        }
+        Ok(world.image_broken.contains(&self.handle.0))
     }
 
     // https://html.spec.whatwg.org/multipage/embedded-content.html#dom-img-currentsrc

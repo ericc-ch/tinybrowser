@@ -4,10 +4,9 @@ use std::io::Cursor;
 
 use png::{BitDepth, ColorType, Decoder, Encoder, Limits, Transformations};
 
-use crate::render::{RasterImage, RenderError, RgbaImage};
-
-/// Maximum temporary decoder allocation for one page image.
-const MAX_DECODE_BYTES: usize = 32 * 1024 * 1024;
+use crate::render::{
+    MAX_DECODED_IMAGE_BYTES, RasterImage, RenderError, RgbaImage, decoded_rgba_fits,
+};
 
 /// Decodes the first PNG frame to premultiplied 8-bit RGBA.
 pub(crate) fn decode_png(bytes: &[u8]) -> Option<RasterImage> {
@@ -16,9 +15,15 @@ pub(crate) fn decode_png(bytes: &[u8]) -> Option<RasterImage> {
         Transformations::EXPAND | Transformations::ALPHA | Transformations::normalize_to_color8(),
     );
     decoder.set_limits(Limits {
-        bytes: MAX_DECODE_BYTES,
+        bytes: MAX_DECODED_IMAGE_BYTES,
     });
     let mut reader = decoder.read_info().ok()?;
+    {
+        let info = reader.info();
+        if !decoded_rgba_fits(info.width, info.height) {
+            return None;
+        }
+    }
     let mut source = vec![0; reader.output_buffer_size()?];
     let info = reader.next_frame(&mut source).ok()?;
     let source = &source[..info.buffer_size()];

@@ -1455,7 +1455,6 @@ impl Document {
         }
         let generation = self.bump_image_generation(element);
         self.in_flight_images.insert(element);
-        self.world.borrow_mut().forget_image(element);
         let src = self.world.borrow().document(element).and_then(|parsed| {
             parsed
                 .dom
@@ -1465,11 +1464,13 @@ impl Document {
         });
         let Some(src) = src.filter(|src| !src.is_empty()) else {
             self.in_flight_images.remove(&element);
+            self.world.borrow_mut().forget_image(element);
             self.fire_js(|js| js.fire_node_error(element));
             return;
         };
         let Ok(url) = self.resolve_dial_url(&src) else {
             self.in_flight_images.remove(&element);
+            self.world.borrow_mut().fail_image(element);
             self.fire_js(|js| js.fire_node_error(element));
             return;
         };
