@@ -4,19 +4,26 @@ use std::io::Cursor;
 
 use png::{BitDepth, ColorType, Decoder, Encoder, Limits, Transformations};
 
-use crate::render::{RasterImage, RenderError, RgbaImage};
-
-/// Maximum temporary decoder allocation for one page image.
-const MAX_DECODE_BYTES: usize = 32 * 1024 * 1024;
+use crate::render::{
+    MAX_DECODED_IMAGE_BYTES, RasterImage, RenderError, RgbaImage, decoded_rgba_fits,
+};
 
 /// Decodes the first PNG frame to premultiplied 8-bit RGBA.
 pub(crate) fn decode_png(bytes: &[u8]) -> Option<RasterImage> {
     let mut decoder = Decoder::new(Cursor::new(bytes));
-    decoder.set_transformations(Transformations::ALPHA | Transformations::normalize_to_color8());
+    decoder.set_transformations(
+        Transformations::EXPAND | Transformations::ALPHA | Transformations::normalize_to_color8(),
+    );
     decoder.set_limits(Limits {
-        bytes: MAX_DECODE_BYTES,
+        bytes: MAX_DECODED_IMAGE_BYTES,
     });
     let mut reader = decoder.read_info().ok()?;
+    {
+        let info = reader.info();
+        if !decoded_rgba_fits(info.width, info.height) {
+            return None;
+        }
+    }
     let mut source = vec![0; reader.output_buffer_size()?];
     let info = reader.next_frame(&mut source).ok()?;
     let source = &source[..info.buffer_size()];
@@ -45,7 +52,7 @@ pub(crate) fn decode_png(bytes: &[u8]) -> Option<RasterImage> {
                 data.extend_from_slice(&[value, value, value, 255]);
             }
         }
-        ColorType::Indexed => return None,
+        ColorType::Indexed => return None, // EXPAND should have rewritten this.
     }
     (data.len() == pixels * 4).then_some(RasterImage {
         width: info.width,
@@ -54,7 +61,7 @@ pub(crate) fn decode_png(bytes: &[u8]) -> Option<RasterImage> {
     })
 }
 
-fn push_premultiplied(out: &mut Vec<u8>, r: u8, g: u8, b: u8, a: u8) {
+pub(super) fn push_premultiplied(out: &mut Vec<u8>, r: u8, g: u8, b: u8, a: u8) {
     let premultiply = |channel: u8| {
         let product = u16::from(channel) * u16::from(a) + 127;
         u8::try_from(product / 255).unwrap_or(255)

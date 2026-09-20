@@ -241,6 +241,18 @@ fn iframe_frame(ctx: &Ctx<'_>, id: NodeId) -> Result<bool> {
     Ok(is_iframe)
 }
 
+fn img_size(ctx: &Ctx<'_>, id: NodeId) -> Result<Option<(u32, u32)>> {
+    if !with_node_kind(ctx, id, |kind| is_html_element(kind, "img"))? {
+        return Ok(None);
+    }
+    let world = world(ctx)?;
+    Ok(world
+        .borrow()
+        .images
+        .get(&id)
+        .map(|image| (image.width, image.height)))
+}
+
 #[rquickjs::methods]
 #[allow(
     clippy::needless_pass_by_value,
@@ -997,6 +1009,56 @@ impl JsNode {
     #[qjs(set, rename = "src")]
     fn set_src(&self, ctx: Ctx<'_>, value: WebIdlString) -> Result<()> {
         self.set_attribute(ctx, WebIdlString("src".into()), value)
+    }
+
+    // https://html.spec.whatwg.org/multipage/embedded-content.html#dom-img-naturalwidth
+    #[qjs(get, rename = "naturalWidth")]
+    fn natural_width(&self, ctx: Ctx<'_>) -> Result<u32> {
+        Ok(img_size(&ctx, self.handle.0)?.map_or(0, |(width, _)| width))
+    }
+
+    // https://html.spec.whatwg.org/multipage/embedded-content.html#dom-img-naturalheight
+    #[qjs(get, rename = "naturalHeight")]
+    fn natural_height(&self, ctx: Ctx<'_>) -> Result<u32> {
+        Ok(img_size(&ctx, self.handle.0)?.map_or(0, |(_, height)| height))
+    }
+
+    // https://html.spec.whatwg.org/multipage/embedded-content.html#dom-img-complete
+    #[qjs(get)]
+    fn complete(&self, ctx: Ctx<'_>) -> Result<bool> {
+        if !with_node_kind(&ctx, self.handle.0, |kind| is_html_element(kind, "img"))? {
+            return Ok(false);
+        }
+        let world = world(&ctx)?;
+        let world = world.borrow();
+        if world.image_loading.contains(&self.handle.0) {
+            return Ok(false);
+        }
+        if world.images.contains_key(&self.handle.0) {
+            return Ok(true);
+        }
+        let src = world
+            .document(self.handle.0)
+            .and_then(|parsed| parsed.dom.attribute(self.handle.0, "src"));
+        if src.as_deref().is_none_or(str::is_empty) {
+            return Ok(true);
+        }
+        Ok(world.image_broken.contains(&self.handle.0))
+    }
+
+    // https://html.spec.whatwg.org/multipage/embedded-content.html#dom-img-currentsrc
+    #[qjs(get, rename = "currentSrc")]
+    fn current_src(&self, ctx: Ctx<'_>) -> Result<String> {
+        if !with_node_kind(&ctx, self.handle.0, |kind| is_html_element(kind, "img"))? {
+            return Ok(String::new());
+        }
+        let world = world(&ctx)?;
+        Ok(world
+            .borrow()
+            .image_current_src
+            .get(&self.handle.0)
+            .cloned()
+            .unwrap_or_default())
     }
 
     // https://html.spec.whatwg.org/multipage/iframe-embed-object.html#dom-iframe-contentdocument

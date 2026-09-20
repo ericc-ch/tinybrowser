@@ -225,6 +225,8 @@
   ]) {
     const members = name === 'HTMLIFrameElement'
       ? ['contentDocument', 'contentWindow']
+      : name === 'HTMLImageElement'
+        ? ['naturalWidth', 'naturalHeight', 'complete', 'currentSrc']
       : name === 'HTMLInputElement' ? ['value'] : [];
     table[name] = define(name, parent, members).prototype;
   }

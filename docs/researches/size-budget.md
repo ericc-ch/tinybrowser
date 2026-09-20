@@ -333,3 +333,28 @@ green on the bfd debug path.
 Dead end: QuickJS-ng C flags (`-ffunction-sections -fdata-sections
 -fvisibility=hidden -fmerge-all-constants`) grew the binary by 15,616 bytes.
 The C is already `-Os`.
+
+## JPEG / PNG / WebP decode (2026-09-20)
+
+`<img>` decode is JPEG, PNG, WebP, and SVG. PNG stays the `png` crate
+(screenshot encode already pays for it). JPEG is `zune-jpeg` with default
+features off (no x86 SIMD). WebP is `image-webp`. SVG `<img src>` reuses
+in-tree XML parse and path/rect paint; no extra crate.
+
+Isolated tuned probes (empty `main`, rustc 1.98.1, `opt-level = "z"`, fat
+LTO, lld `--icf=all`). Empty binary 284,112 bytes:
+
+| Probe | Stripped | Delta |
+| --- | ---: | ---: |
+| `png` 0.18 decode+encode | 454,856 | +170,744 |
+| `zune-jpeg` 0.5, no SIMD | 405,032 | +120,920 |
+| `jpeg-decoder` 0.3, no rayon | 411,280 | +127,168 |
+| `image-webp` 0.2.4 | 446,928 | +162,816 |
+| those three Rust crates in one binary | 682,712 | +398,600 |
+| `image` 0.25 `jpeg`+`png`+`webp` | 767,080 | +482,968 |
+| png + C `libjpeg` + C `libwebpdecoder` dynlink | 407,720 | +123,608 |
+
+`image` is the same three codecs plus ~84 KB of wrapper/`moxcms`. Dynlink
+wins our ELF and needs host `.so`s (`libjpeg.so.8` 535 KB,
+`libwebpdecoder.so.3` 252 KB); wasm cannot use them. JPEG `jpeglib`
+is not a small `unsafe` surface. Shipping stays the Rust stack.

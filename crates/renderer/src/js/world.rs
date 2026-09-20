@@ -11,6 +11,7 @@ use url::Url;
 use crate::document::{Document, FrameRuntime};
 use crate::messaging::{MAX_FRAMES, SharedHandle};
 use crate::protocol::{FrameId, StorageChange, StorageError, StorageKind};
+use crate::render::MAX_DECODED_IMAGE_BYTES;
 use crate::storage::PendingStorageEvent;
 use crate::{Parsed, ReadyState};
 
@@ -53,8 +54,6 @@ struct ResourceBudget {
 
 const MAX_PENDING_STREAM_BYTES: usize = 8 * 1024 * 1024;
 const MAX_OBJECT_URL_BYTES: usize = 8 * 1024 * 1024;
-/// Aggregate retained decoded image pixels across every realm in this renderer.
-const MAX_DECODED_IMAGE_BYTES: usize = 32 * 1024 * 1024;
 
 impl RealmRegistry {
     /// Remembers that `world` owns the document `id`.
@@ -365,6 +364,16 @@ pub(crate) struct World {
     /// Decoded `<img>` bitmaps for this document, used by both paint and
     /// script geometry.
     pub(crate) images: HashMap<NodeId, crate::render::RasterImage>,
+    /// `<img>` elements whose current request has not finished, including a
+    /// `src` mutation waiting for `update the image data`
+    /// (<https://html.spec.whatwg.org/multipage/embedded-content.html#dom-img-complete>).
+    pub(crate) image_loading: HashSet<NodeId>,
+    /// Selected URL for each `<img>` current request
+    /// (<https://html.spec.whatwg.org/multipage/embedded-content.html#dom-img-currentsrc>).
+    pub(crate) image_current_src: HashMap<NodeId, String>,
+    /// Current request is broken and there is no pending request
+    /// (<https://html.spec.whatwg.org/multipage/images.html#img-error>).
+    pub(crate) image_broken: HashSet<NodeId>,
 }
 
 impl Drop for World {
@@ -445,6 +454,9 @@ impl World {
             deliver_mutations_fn: None,
             host_token: None,
             images: HashMap::new(),
+            image_loading: HashSet::new(),
+            image_current_src: HashMap::new(),
+            image_broken: HashSet::new(),
         }
     }
 
@@ -993,11 +1005,29 @@ impl World {
     }
 
     pub(crate) fn queue_image_update(&mut self, element: NodeId) {
-        self.image_updates.push(element);
+        // Keep `currentSrc` and decoded pixels until the new request starts.
+        // Mark unavailable now so `complete` is false while the update waits
+        // (<https://html.spec.whatwg.org/multipage/images.html#updating-the-image-data>,
+        // <https://html.spec.whatwg.org/multipage/embedded-content.html#dom-img-complete>).
+        self.image_loading.insert(element);
+        if !self.image_updates.contains(&element) {
+            self.image_updates.push(element);
+        }
     }
 
     pub(crate) fn take_image_updates(&mut self) -> Vec<NodeId> {
         std::mem::take(&mut self.image_updates)
+    }
+
+    /// Starts a fetch for `url`. If the current request is still available,
+    /// keep its pixels and `currentSrc` until this request commits
+    /// (<https://html.spec.whatwg.org/multipage/images.html#updating-the-image-data>).
+    pub(crate) fn begin_image(&mut self, element: NodeId, url: String) {
+        self.image_loading.insert(element);
+        self.image_broken.remove(&element);
+        if !self.images.contains_key(&element) {
+            self.image_current_src.insert(element, url);
+        }
     }
 
     /// Retains `image` if the shared decoded-image budget still has room.
@@ -1005,8 +1035,12 @@ impl World {
         &mut self,
         element: NodeId,
         image: crate::render::RasterImage,
+        url: String,
     ) -> bool {
-        self.forget_image(element);
+        self.image_loading.remove(&element);
+        self.image_broken.remove(&element);
+        self.forget_decoded_pixels(element);
+        self.image_current_src.insert(element, url);
         let bytes = image.data.len();
         if !self.reserve_decoded_image_bytes(bytes) {
             return false;
@@ -1015,7 +1049,24 @@ impl World {
         true
     }
 
+    /// The current request finished without usable pixels. `url` is the
+    /// selected source, or the selected source string when URL parsing failed
+    /// (<https://html.spec.whatwg.org/multipage/images.html#updating-the-image-data>).
+    pub(crate) fn fail_image(&mut self, element: NodeId, url: String) {
+        self.image_loading.remove(&element);
+        self.forget_decoded_pixels(element);
+        self.image_current_src.insert(element, url);
+        self.image_broken.insert(element);
+    }
+
     pub(crate) fn forget_image(&mut self, element: NodeId) {
+        self.image_loading.remove(&element);
+        self.image_current_src.remove(&element);
+        self.image_broken.remove(&element);
+        self.forget_decoded_pixels(element);
+    }
+
+    fn forget_decoded_pixels(&mut self, element: NodeId) {
         if let Some(image) = self.images.remove(&element) {
             self.release_decoded_image_bytes(image.data.len());
         }
@@ -1028,6 +1079,9 @@ impl World {
             .map(|image| image.data.len())
             .sum::<usize>();
         self.images.clear();
+        self.image_loading.clear();
+        self.image_current_src.clear();
+        self.image_broken.clear();
         self.release_decoded_image_bytes(bytes);
     }
 
