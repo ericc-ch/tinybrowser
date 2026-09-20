@@ -1,13 +1,8 @@
 #!/usr/bin/env bash
 # Workspace checks: clippy, embedded JS syntax, Miri, Valgrind.
 #
-#   clippy    stable shell. The workspace lints: `unsafe_code = deny`,
-#            `unsafe_op_in_unsafe_fn = deny`, and the clippy UB set
-#            (undocumented_unsafe_blocks, multiple_unsafe_ops_per_block,
-#            unnecessary_safety_comment, not_unsafe_ptr_arg_deref, pointer
-#            casts, mem_forget) plus pedantic/all/cargo. Always run this.
-#   js       stable shell. `node --check` on JavaScript `include_str!`'d
-#            into the renderer. Those files never pass through a JS toolchain.
+#   clippy    stable shell. Workspace lints, then `node --check` on JavaScript
+#            `include_str!`'d into the renderer. Always run this.
 #   miri     nightly shell. Miri over pure-Rust crates. It CANNOT execute
 #            FFI, so crates linking rquickjs or native-tls are excluded; put
 #            unsafe logic in a pure-Rust module with tests to get Miri
@@ -19,7 +14,7 @@
 #            uninitialized reads across the FFI boundary but does NOT model
 #            Rust aliasing rules (Miri does), and it is slow.
 #
-# With no subcommand, clippy then js. AddressSanitizer is not wired:
+# With no subcommand, clippy (including embedded JS). AddressSanitizer is not wired:
 # `-Zsanitizer=address` makes rustc reject the sanitizer-built rquickjs-macro
 # proc-macro artifacts ("can't find crate"), and neither
 # `-Ztarget-applies-to-host` nor a separate host config fixed it. Valgrind
@@ -39,7 +34,7 @@ miri_crates=(logging)
 # empty-document smokes). Not the full QuickJS renderer suite.
 
 usage() {
-  echo "usage: tools/check [clippy|js|miri [crate...]|valgrind [crate...]]" >&2
+  echo "usage: tools/check [clippy|miri [crate...]|valgrind [crate...]]" >&2
   exit 2
 }
 
@@ -83,15 +78,9 @@ valgrind_test() {
     cargo test --target x86_64-unknown-linux-gnu "$@"
 }
 
-case "${1:-}" in
-  "")
-    run_clippy
-    run_js
-    ;;
+case "${1:-clippy}" in
   clippy)
     run_clippy
-    ;;
-  js)
     run_js
     ;;
   miri)
