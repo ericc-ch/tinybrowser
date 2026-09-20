@@ -47,6 +47,12 @@ crate_args() {
   printf '%s\n' "${args[@]}"
 }
 
+valgrind_test() {
+  nix develop .#ub --command env \
+    CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER="valgrind --error-exitcode=1 --track-origins=yes" \
+    cargo test --target x86_64-unknown-linux-gnu "$@"
+}
+
 case "${1:-lint}" in
   lint)
     exec nix develop --command cargo clippy --workspace --all-targets -- -D warnings
@@ -64,16 +70,15 @@ case "${1:-lint}" in
     ;;
   valgrind)
     shift
-    crates=("$@")
-    if [ ${#crates[@]} -eq 0 ]; then
-      exec nix develop .#ub --command env \
-        CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER="valgrind --error-exitcode=1 --track-origins=yes" \
-        cargo test --target x86_64-unknown-linux-gnu -p logging -p renderer render::
+    if [ "$#" -eq 0 ]; then
+      # Two invocations: a filter after `-p logging -p renderer` would skip
+      # logging. Keep the renderer filter so QuickJS tests stay off the default.
+      valgrind_test -p logging
+      valgrind_test -p renderer render::
+      exit 0
     fi
-    mapfile -t args < <(crate_args "${crates[@]}")
-    exec nix develop .#ub --command env \
-      CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER="valgrind --error-exitcode=1 --track-origins=yes" \
-      cargo test --target x86_64-unknown-linux-gnu "${args[@]}"
+    mapfile -t args < <(crate_args "$@")
+    valgrind_test "${args[@]}"
     ;;
   *)
     usage

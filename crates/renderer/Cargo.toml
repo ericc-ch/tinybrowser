@@ -37,7 +37,8 @@ url = "2"
 rquickjs = { version = "0.14.0", default-features = false, features = ["std", "classes", "loader", "macro"] }
 # Value-only seam for script results crossing to a carrier.
 serde = { version = "1", features = ["derive"] }
-# Style / layout / paint (the former `render` crate).
+# Style / layout / paint.
+
 app_units = "0.7"
 euclid = "0.22"
 fontique = { version = "0.11", default-features = false }

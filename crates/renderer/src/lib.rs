@@ -3,7 +3,7 @@
 //!
 //! The engine owns `Document` and never links `net`; the browser process owns
 //! the tab, navigation, the network, and cookies. Style, layout, and paint live
-//! in [`render`]: one-shot screenshot and geometry (Blink `core/css`,
+//! in the `render` module: one-shot screenshot and geometry (Blink `core/css`,
 //! `core/layout`, `core/paint`). A carrier drives this crate: the browser's
 //! child transport on a native build, the WebAssembly component on a wasm
 //! build. Both feed the same [`Engine`], and both implement [`BrowserServices`]
