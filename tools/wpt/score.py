@@ -6,10 +6,10 @@ with pass, expected-fail, and unexpected buckets plus subtest counts and test
 time. This is the conformance-grind instrument: a directory's row is the unit
 of work.
 
-    tools/wpt/score dom/nodes/ | head
-    tools/wpt/score dom/nodes/ -- --processes 4
-    tools/wpt/score --report report.json     # summarize an existing wptreport
-    tools/wpt/score FileAPI/ --save-report /tmp/fileapi.json   # keep the report
+    tools/wpt/run --score dom/nodes/ | head
+    tools/wpt/run --score dom/nodes/ -- --processes 4
+    tools/wpt/run --score --report report.json     # summarize an existing wptreport
+    tools/wpt/run --score FileAPI/ --save-report /tmp/fileapi.json   # keep the report
 
 `--save-report FILE` keeps the wptreport a `tools/wpt/retest FILE` run needs.
 Without it the report is temporary and removed after a successful run.
@@ -341,11 +341,11 @@ def main() -> int:
         return 0
     report, save_report, paths, extra, error = split_args(sys.argv[1:])
     if error:
-        print(f"score: {error}", file=sys.stderr)
+        print(f"run --score: {error}", file=sys.stderr)
         return 2
     if report is not None and save_report is not None:
         print(
-            "score: --report summarizes an existing report; do not combine "
+            "run --score: --report summarizes an existing report; do not combine "
             "it with --save-report",
             file=sys.stderr,
         )
@@ -353,20 +353,20 @@ def main() -> int:
     if report is not None:
         if paths or extra:
             print(
-                "score: --report summarizes an existing report; give no test paths",
+                "run --score: --report summarizes an existing report; give no test paths",
                 file=sys.stderr,
             )
             return 2
         return summarize(report)
     if not paths:
-        print("score: give test paths or --report FILE", file=sys.stderr)
+        print("run --score: give test paths or --report FILE", file=sys.stderr)
         return 2
 
     started = time.monotonic()
     try:
         report_path, runner_exit = run(paths, extra, save_report)
     except OSError as error:
-        print(f"score: could not start the runner: {error}", file=sys.stderr)
+        print(f"run --score: could not start the runner: {error}", file=sys.stderr)
         return 1
     keep_report = runner_exit != 0 or save_report is not None
     try:
@@ -393,7 +393,7 @@ if __name__ == "__main__":
     try:
         raise SystemExit(main())
     except BrokenPipeError:
-        # `score ... | head` closes stdout early; exit quietly.
+        # `run --score ... | head` closes stdout early; exit quietly.
         devnull = os.open(os.devnull, os.O_WRONLY)
         os.dup2(devnull, sys.stdout.fileno())
         raise SystemExit(0)

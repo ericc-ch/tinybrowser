@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Undefined-behavior tooling. What each mode sees, and what it cannot:
+# Workspace checks: clippy, Miri, Valgrind.
 #
-#   lint     stable shell. The workspace lints: `unsafe_code = deny`,
+#   clippy    stable shell. The workspace lints: `unsafe_code = deny`,
 #            `unsafe_op_in_unsafe_fn = deny`, and the clippy UB set
 #            (undocumented_unsafe_blocks, multiple_unsafe_ops_per_block,
 #            unnecessary_safety_comment, not_unsafe_ptr_arg_deref, pointer
@@ -36,7 +36,7 @@ miri_crates=(logging)
 # empty-document smokes). Not the full QuickJS renderer suite.
 
 usage() {
-  echo "usage: tools/ub [lint|miri [crate...]|valgrind [crate...]]" >&2
+  echo "usage: tools/check [clippy|miri [crate...]|valgrind [crate...]]" >&2
   exit 2
 }
 
@@ -55,8 +55,8 @@ valgrind_test() {
     cargo test --target x86_64-unknown-linux-gnu "$@"
 }
 
-case "${1:-lint}" in
-  lint)
+case "${1:-clippy}" in
+  clippy)
     exec nix develop --command cargo clippy --workspace --all-targets -- -D warnings
     ;;
   miri)

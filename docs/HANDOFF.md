@@ -2,7 +2,7 @@
 
 State: the MDN form dogfood slice is verified on this working tree and ready to land.
 The exact MDN page fills, and `/tmp/tinybrowser-mdn-filled.png` shows `Tiny Browser` in the name input.
-Repo-local checks are green: `tools/ub lint` and `cargo test --workspace` passed.
+Repo-local checks are green: `tools/check` and `cargo test --workspace` passed.
 
 Done:
 

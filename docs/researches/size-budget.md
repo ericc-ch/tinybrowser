@@ -15,8 +15,8 @@ says otherwise.
 The tuned profile is `opt-level = "z"`, `lto = "fat"`,
 `codegen-units = 1`, stripped, `panic = "abort"`, plus lld `--icf=all`.
 The profile lives in the root `Cargo.toml`; the lld, RELR, and unwind-index
-flags live in `build.rs`, scoped to release binaries, and `tools/ship`
-removes the `.eh_frame` body after the link. `tools/ship` reproduces this
+flags live in `build.rs`, scoped to release binaries, and `tools/release`
+removes the `.eh_frame` body after the link. `tools/release` reproduces this
 research.
 
 ## Binding and JS size
@@ -303,7 +303,7 @@ bytes.
 | --- | ---: | ---: | --- |
 | RELR relative relocations | 8,986,200 | −561,336 | `build.rs` |
 | + release-bin `--no-eh-frame-hdr` | 8,872,168 | −114,032 | `build.rs` |
-| + `tools/ship` drops `.eh_frame` | **8,044,696** | −827,472 | `tools/ship` |
+| + `tools/release` drops `.eh_frame` | **8,044,696** | −827,472 | `tools/release` |
 
 RELR bitmaps the 23,749 `R_X86_64_RELATIVE` entries: `.rela.dyn` 575,496 ->
 5,520 plus 8,040 in `.relr.dyn`. The loader must understand `DT_RELR`
@@ -314,7 +314,7 @@ RELR bitmaps the 23,749 `R_X86_64_RELATIVE` entries: `.rela.dyn` 575,496 ->
 QuickJS-ng uses setjmp/longjmp. Both unwind levers were previously rejected
 as global flags because they broke dev/test panic reporting; they now apply
 only to the shipping binary. `build.rs` emits lld, `--icf=all`, RELR, and
-`--no-eh-frame-hdr` for release bins, and `tools/ship` removes the
+`--no-eh-frame-hdr` for release bins, and `tools/release` removes the
 `.eh_frame` body after linking (checking the section exists, then running
 `--version` on a copy before replacing the artifact).
 
