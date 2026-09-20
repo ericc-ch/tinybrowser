@@ -1019,12 +1019,15 @@ impl World {
         std::mem::take(&mut self.image_updates)
     }
 
-    /// Marks `element` as having an in-flight image request at `url`.
+    /// Starts a fetch for `url`. If the current request is still available,
+    /// keep its pixels and `currentSrc` until this request commits
+    /// (<https://html.spec.whatwg.org/multipage/images.html#updating-the-image-data>).
     pub(crate) fn begin_image(&mut self, element: NodeId, url: String) {
-        self.forget_decoded_pixels(element);
-        self.image_broken.remove(&element);
         self.image_loading.insert(element);
-        self.image_current_src.insert(element, url);
+        self.image_broken.remove(&element);
+        if !self.images.contains_key(&element) {
+            self.image_current_src.insert(element, url);
+        }
     }
 
     /// Retains `image` if the shared decoded-image budget still has room.
@@ -1046,10 +1049,13 @@ impl World {
         true
     }
 
-    /// The current request finished without usable pixels.
-    pub(crate) fn fail_image(&mut self, element: NodeId) {
+    /// The current request finished without usable pixels. `url` is the
+    /// selected source, or the selected source string when URL parsing failed
+    /// (<https://html.spec.whatwg.org/multipage/images.html#updating-the-image-data>).
+    pub(crate) fn fail_image(&mut self, element: NodeId, url: String) {
         self.image_loading.remove(&element);
         self.forget_decoded_pixels(element);
+        self.image_current_src.insert(element, url);
         self.image_broken.insert(element);
     }
 

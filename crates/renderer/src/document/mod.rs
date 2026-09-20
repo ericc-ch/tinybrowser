@@ -186,6 +186,9 @@ pub(crate) struct Document {
     pending_images: usize,
     /// Per-element fetch generation so a superseded `src` completion is ignored.
     image_generations: HashMap<dom::NodeId, u64>,
+    /// Selected source URL for the current generation
+    /// (<https://html.spec.whatwg.org/multipage/images.html#updating-the-image-data>).
+    image_selected_src: HashMap<dom::NodeId, String>,
     /// Elements with an in-flight image fetch for the current generation.
     in_flight_images: HashSet<dom::NodeId>,
     /// Identifies the frame's current navigation; completions from superseded
@@ -266,6 +269,7 @@ impl Document {
             pending_stylesheets: 0,
             pending_images: 0,
             image_generations: HashMap::new(),
+            image_selected_src: HashMap::new(),
             in_flight_images: HashSet::new(),
             frame_load_sequence: 0,
             frame_load_in_flight: false,
@@ -422,6 +426,7 @@ impl Document {
     pub(crate) fn disconnect_image(&mut self, element: dom::NodeId) {
         self.bump_image_generation(element);
         self.in_flight_images.remove(&element);
+        self.image_selected_src.remove(&element);
         self.world.borrow_mut().forget_image(element);
     }
 
@@ -945,6 +950,7 @@ impl Document {
         self.world.borrow_mut().take_image_updates();
         self.pending_images = 0;
         self.image_generations.clear();
+        self.image_selected_src.clear();
         self.in_flight_images.clear();
         let js_timer_ids: std::collections::HashSet<u32> =
             self.js_timer_slots.keys().copied().collect();
@@ -1185,18 +1191,17 @@ impl Document {
                 self.pending_images = self.pending_images.saturating_sub(1);
                 if self.image_generation(element) == generation {
                     self.in_flight_images.remove(&element);
+                    let selected = self.image_selected_src.remove(&element).unwrap_or_default();
                     let loaded = (200..300).contains(&outcome.status)
                         && crate::render::decode_image(&outcome.body).is_some_and(|image| {
-                            self.world.borrow_mut().store_image(
-                                element,
-                                image,
-                                outcome.final_url.clone(),
-                            )
+                            self.world
+                                .borrow_mut()
+                                .store_image(element, image, selected.clone())
                         });
                     if loaded {
                         self.fire_js(|js| js.fire_node_load(element));
                     } else {
-                        self.world.borrow_mut().fail_image(element);
+                        self.world.borrow_mut().fail_image(element, selected);
                         self.fire_js(|js| js.fire_node_error(element));
                     }
                     self.adopt_js_work();
@@ -1256,7 +1261,8 @@ impl Document {
                     self.pending_images = self.pending_images.saturating_sub(1);
                     if self.image_generation(element) == generation {
                         self.in_flight_images.remove(&element);
-                        self.world.borrow_mut().fail_image(element);
+                        let selected = self.image_selected_src.remove(&element).unwrap_or_default();
+                        self.world.borrow_mut().fail_image(element, selected);
                         self.fire_js(|js| js.fire_node_error(element));
                         self.adopt_js_work();
                     }
@@ -1464,20 +1470,22 @@ impl Document {
         });
         let Some(src) = src.filter(|src| !src.is_empty()) else {
             self.in_flight_images.remove(&element);
+            self.image_selected_src.remove(&element);
             self.world.borrow_mut().forget_image(element);
             self.fire_js(|js| js.fire_node_error(element));
             return;
         };
         let Ok(url) = self.resolve_dial_url(&src) else {
             self.in_flight_images.remove(&element);
-            self.world.borrow_mut().fail_image(element);
+            self.image_selected_src.remove(&element);
+            self.world.borrow_mut().fail_image(element, src);
             self.fire_js(|js| js.fire_node_error(element));
             return;
         };
         let initiator = self.url.clone();
-        self.world
-            .borrow_mut()
-            .begin_image(element, url.as_str().to_owned());
+        let selected = url.as_str().to_owned();
+        self.image_selected_src.insert(element, selected.clone());
+        self.world.borrow_mut().begin_image(element, selected);
         self.queued_dials.push(QueuedDial {
             context: DialContext::Image {
                 element,

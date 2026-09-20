@@ -51,22 +51,18 @@ pub(crate) fn apply_dimensions(dom: &Dom, node: NodeId, style: &mut Style) {
 
 /// Rasterizes one outer SVG into a transparent bitmap for `<img src>`.
 ///
-/// Script does not run. Missing width/height fall back to the viewBox, then
-/// to the CSS replaced-element default of 300×150
+/// Script does not run. Missing sides are resolved from the intrinsic ratio
+/// and the CSS default object size 300×150
 /// (<https://svgwg.org/svg2-draft/coords.html#SizingSVGInCSS>,
 /// <https://drafts.csswg.org/css-images-3/#default-sizing>).
 pub(crate) fn rasterize(dom: &Dom, root: NodeId) -> Option<RasterImage> {
     let mut style = Style::initial();
     apply_dimensions(dom, root, &mut style);
-    let viewport = view_box(dom, root);
-    let width = dimension_px(style.width)
-        .or_else(|| viewport.map(|viewport| viewport.width))
-        .filter(|value| *value > 0.0)
-        .unwrap_or(300.0);
-    let height = dimension_px(style.height)
-        .or_else(|| viewport.map(|viewport| viewport.height))
-        .filter(|value| *value > 0.0)
-        .unwrap_or(150.0);
+    let (width, height) = replaced_natural_size(
+        dimension_px(style.width),
+        dimension_px(style.height),
+        style.aspect_ratio,
+    );
     let width_px = device_side(width)?;
     let height_px = device_side(height)?;
     if !crate::render::decoded_rgba_fits(width_px, height_px) {
@@ -92,6 +88,36 @@ pub(crate) fn rasterize(dom: &Dom, root: NodeId) -> Option<RasterImage> {
         height: image.height,
         data: image.data,
     })
+}
+
+/// CSS default sizing for SVG as a replaced image: specified sides first,
+/// then the missing side from the intrinsic ratio, otherwise contain the
+/// 300×150 default object size
+/// (<https://drafts.csswg.org/css-images-3/#default-sizing>).
+fn replaced_natural_size(
+    width: Option<f32>,
+    height: Option<f32>,
+    ratio: Option<f32>,
+) -> (f32, f32) {
+    const DEFAULT_WIDTH: f32 = 300.0;
+    const DEFAULT_HEIGHT: f32 = 150.0;
+    let ratio = ratio.filter(|ratio| ratio.is_finite() && *ratio > 0.0);
+    match (width, height, ratio) {
+        (Some(width), Some(height), _) => (width, height),
+        (Some(width), None, Some(ratio)) => (width, width / ratio),
+        (Some(width), None, None) => (width, DEFAULT_HEIGHT),
+        (None, Some(height), Some(ratio)) => (height * ratio, height),
+        (None, Some(height), None) => (DEFAULT_WIDTH, height),
+        (None, None, Some(ratio)) => {
+            let height_at_default_width = DEFAULT_WIDTH / ratio;
+            if height_at_default_width <= DEFAULT_HEIGHT {
+                (DEFAULT_WIDTH, height_at_default_width)
+            } else {
+                (DEFAULT_HEIGHT * ratio, DEFAULT_HEIGHT)
+            }
+        }
+        (None, None, None) => (DEFAULT_WIDTH, DEFAULT_HEIGHT),
+    }
 }
 
 fn dimension_px(value: Dimension) -> Option<f32> {
