@@ -22,9 +22,9 @@
         overlays = [ rust-overlay.overlays.default ];
       };
       rustToolchain = pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
-      # Nightly carries Miri and the sanitizer flags; builds and lint still use
-      # the pinned stable toolchain above. Enter with `nix develop .#ub`.
-      ubToolchain = pkgs.rust-bin.nightly.latest.default.override {
+      # Nightly carries Miri and the sanitizer flags; builds and clippy still use
+      # the pinned stable toolchain above. Enter with `nix develop .#check`.
+      checkToolchain = pkgs.rust-bin.nightly.latest.default.override {
         extensions = [ "miri" "rust-src" ];
       };
       runtimeLibs = pkgs.lib.makeLibraryPath [
@@ -59,12 +59,12 @@
           inherit shellHook;
         };
 
-        # Undefined-behavior tooling: Miri, sanitizers. Same build deps as the
-        # default shell, nightly toolchain instead of the pinned stable one.
-        ub = pkgs.mkShell {
+        # Nightly checks: Miri, Valgrind. Same build deps as the default shell,
+        # nightly toolchain instead of the pinned stable one.
+        check = pkgs.mkShell {
           strictDeps = true;
           nativeBuildInputs = [
-            ubToolchain
+            checkToolchain
             pkgs.pkg-config
             pkgs.nodejs_24
             pkgs.valgrind
