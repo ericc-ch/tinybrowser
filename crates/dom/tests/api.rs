@@ -321,3 +321,22 @@ fn connection_transitions_record_lifecycle_events() {
     dom.detach(nested).expect("detach");
     assert_eq!(dom.take_lifecycle(), vec![Lifecycle::Removed(nested)]);
 }
+
+#[test]
+fn img_connection_transitions_record_lifecycle_events() {
+    let mut dom = Dom::new();
+    let root = dom.document();
+    let html = dom.create_element(qn("html"), Vec::new());
+    let body = dom.create_element(qn("body"), Vec::new());
+    let img = dom.create_element(qn("img"), Vec::new());
+
+    dom.append(root, html).expect("html");
+    dom.append(html, body).expect("body");
+    assert!(dom.take_lifecycle().is_empty());
+
+    dom.append(body, img).expect("img");
+    assert_eq!(dom.take_lifecycle(), vec![Lifecycle::Inserted(img)]);
+
+    dom.detach(img).expect("detach");
+    assert_eq!(dom.take_lifecycle(), vec![Lifecycle::Removed(img)]);
+}

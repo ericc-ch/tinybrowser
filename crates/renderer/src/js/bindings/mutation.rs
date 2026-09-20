@@ -144,8 +144,9 @@ impl JsMutationObserver {
         let attribute_old_value = option_truthy(&ctx, &options, "attributeOldValue")?;
         let character_data_present = !options.get::<_, Value>("characterData")?.is_undefined();
         let character_data = option_truthy(&ctx, &options, "characterData")?;
-        let character_data_old_value_present =
-            !options.get::<_, Value>("characterDataOldValue")?.is_undefined();
+        let character_data_old_value_present = !options
+            .get::<_, Value>("characterDataOldValue")?
+            .is_undefined();
         let character_data_old_value = option_truthy(&ctx, &options, "characterDataOldValue")?;
         let attribute_filter = match options.get::<_, Value>("attributeFilter") {
             // `sequence<DOMString>` is not nullable: explicit `null` throws

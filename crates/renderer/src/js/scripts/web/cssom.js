@@ -66,10 +66,111 @@
     },
     writable: true, configurable: true,
   });
+  // Viewport and color-scheme queries used by pages and by CSSOM tests.
+  // Color scheme must match Stylo's Device `PrefersColorScheme::Dark`.
+  // https://drafts.csswg.org/cssom-view/#dom-window-matchmedia
+  // https://drafts.csswg.org/mediaqueries-5/#mq-syntax
+  const __tbColorScheme = 'dark';
+  const __tbSplitMedia = (text, separator) => {
+    const parts = [];
+    let current = '';
+    let depth = 0;
+    for (let index = 0; index < text.length; index++) {
+      const ch = text[index];
+      if (ch === '(') depth++;
+      if (ch === ')') depth = Math.max(0, depth - 1);
+      if (depth === 0 && text.slice(index, index + separator.length).toLowerCase() === separator) {
+        parts.push(current);
+        current = '';
+        index += separator.length - 1;
+        continue;
+      }
+      current += ch;
+    }
+    parts.push(current);
+    return parts;
+  };
+  const __tbPx = (raw) => {
+    const value = String(raw).trim().toLowerCase();
+    if (value.endsWith('px')) return Number(value.slice(0, -2));
+    if (value.endsWith('em')) return Number(value.slice(0, -2)) * 16;
+    return Number(value);
+  };
+  const __tbFeature = (raw) => {
+    const inner = raw.trim().replace(/^\(/, '').replace(/\)$/, '').trim();
+    if (!inner) return 'unknown';
+    const colon = inner.indexOf(':');
+    const name = (colon < 0 ? inner : inner.slice(0, colon)).trim().toLowerCase();
+    const value = colon < 0 ? '' : inner.slice(colon + 1).trim().toLowerCase();
+    if (name === 'prefers-color-scheme') {
+      if (value === '') return true;
+      if (value === 'dark' || value === 'light') return value === __tbColorScheme;
+      if (value === 'no-preference') return false;
+      return 'unknown';
+    }
+    const width = Number(globalThis.innerWidth);
+    const height = Number(globalThis.innerHeight);
+    if (name === 'width' || name === 'min-width' || name === 'max-width') {
+      const px = __tbPx(value);
+      if (!Number.isFinite(px)) return 'unknown';
+      if (name === 'min-width') return width >= px;
+      if (name === 'max-width') return width <= px;
+      return width === px;
+    }
+    if (name === 'height' || name === 'min-height' || name === 'max-height') {
+      const px = __tbPx(value);
+      if (!Number.isFinite(px)) return 'unknown';
+      if (name === 'min-height') return height >= px;
+      if (name === 'max-height') return height <= px;
+      return height === px;
+    }
+    if (name === 'hover') {
+      if (value === '' || value === 'hover') return true;
+      if (value === 'none') return false;
+      return 'unknown';
+    }
+    if (name === 'pointer') {
+      if (value === '' || value === 'fine') return true;
+      if (value === 'coarse' || value === 'none') return false;
+      return 'unknown';
+    }
+    return 'unknown';
+  };
+  const __tbMediaQuery = (text) => {
+    text = String(text).trim().toLowerCase();
+    if (!text) return true;
+    let negated = false;
+    if (text.startsWith('only ')) text = text.slice(5).trim();
+    if (text.startsWith('not ')) {
+      negated = true;
+      text = text.slice(4).trim();
+    }
+    const parts = __tbSplitMedia(text, ' and ').map(part => part.trim()).filter(part => part);
+    let known = true;
+    let matches = true;
+    for (const part of parts) {
+      if (part.startsWith('(')) {
+        const feature = __tbFeature(part);
+        if (feature === 'unknown') {
+          known = false;
+          matches = false;
+        } else if (!feature) {
+          matches = false;
+        }
+      } else if (part !== 'all' && part !== 'screen') {
+        matches = false;
+      }
+    }
+    // Unknown features stay false under `not`
+    // (<https://drafts.csswg.org/mediaqueries-5/#error-handling>).
+    if (!known) return false;
+    return negated ? !matches : matches;
+  };
+  const __tbMediaQueryList = (text) => __tbSplitMedia(String(text), ',').some(__tbMediaQuery);
   Object.defineProperty(globalThis, 'matchMedia', {
     value: function(media) {
       return {
-        media: String(media), matches: false, onchange: null,
+        media: String(media), matches: __tbMediaQueryList(media), onchange: null,
         addEventListener() {}, removeEventListener() {},
         addListener() {}, removeListener() {}, dispatchEvent() { return true; },
       };

@@ -2,9 +2,8 @@
 //!
 //! One inline formatting context becomes one Parley layout: text segments
 //! with their styles, atomic boxes as inline boxes, one break pass at the
-//! leaf width. Parley owns shaping (ligatures, kerning, bidi), line breaking
-//! (UAX#14), and alignment; this module translates our styles in and painted
-//! runs back out.
+//! IFC width so `text-align` has a line box. `white-space` that cannot wrap
+//! uses Parley's `NoWrap` mode so that width does not invent soft breaks.
 //!
 //! Intrinsic widths (`measure`, `min_content_width`) read `skrifa` advance
 //! widths directly: they answer per-word questions Parley is not asked.
@@ -13,7 +12,8 @@
 
 use parley::layout::PositionedLayoutItem;
 use parley::style::{
-    FontFamily, FontWeight, LineHeight as ParleyLineHeight, TextStyle, WhiteSpaceCollapse,
+    FontFamily, FontWeight, LineHeight as ParleyLineHeight, TextStyle, TextWrapMode,
+    WhiteSpaceCollapse,
 };
 use parley::{Alignment, AlignmentOptions};
 
@@ -151,23 +151,25 @@ impl Fonts {
     }
 }
 
-/// Shapes `segments` into lines at `width` (`None` disables wrapping).
+/// Shapes `segments` into lines in an IFC of width `available`.
 ///
-/// Atomic sizes come pre-measured from the caller; each [`Segment::Atomic`]
-/// carries the index into `atomics`. `preserve_space` selects Parley's
-/// whitespace mode for the whole leaf; callers pre-collapse collapsing runs
-/// themselves so mixed modes stay exact.
+/// `wrap` is CSS wrapping; it is independent of the IFC width used for
+/// `text-align`. Atomic sizes come pre-measured from the caller; each
+/// [`Segment::Atomic`] carries the index into `atomics`. `preserve_space`
+/// selects Parley's whitespace mode for the whole leaf; callers pre-collapse
+/// collapsing runs themselves so mixed modes stay exact.
 pub(crate) fn shape_lines(
     fonts: &Fonts,
     segments: &[Segment<'_>],
     atomics: &[(f32, f32)],
-    width: Option<f32>,
+    available: f32,
+    wrap: bool,
     align: TextAlign,
     preserve_space: bool,
 ) -> Vec<PlacedLine> {
     let mut shaped = fonts.parley.borrow_mut();
     let shaped = &mut *shaped;
-    let root = root_style();
+    let root = root_style(wrap);
     let mut builder =
         shaped
             .layout_context
@@ -181,7 +183,7 @@ pub(crate) fn shape_lines(
     for segment in segments {
         match segment {
             Segment::Text(text, style) => {
-                builder.push_style_span(text_style(style));
+                builder.push_style_span(text_style(style, wrap));
                 builder.push_text(text);
                 bytes += text.len();
             }
@@ -198,10 +200,7 @@ pub(crate) fn shape_lines(
         }
     }
     let (mut layout, _) = builder.build();
-    match width {
-        Some(width) => layout.break_all_lines(Some(width.max(0.0))),
-        None => layout.break_all_lines(None),
-    }
+    layout.break_all_lines(Some(available.max(0.0)));
     layout.align(
         match align {
             TextAlign::Left => Alignment::Start,
@@ -243,17 +242,26 @@ pub(crate) fn shape_lines(
     lines
 }
 
+fn wrap_mode(wrap: bool) -> TextWrapMode {
+    if wrap {
+        TextWrapMode::Wrap
+    } else {
+        TextWrapMode::NoWrap
+    }
+}
+
 /// The root style: our single family at a neutral size; spans cover all
 /// pushed text.
-fn root_style() -> TextStyle<'static, 'static, [u8; 4]> {
+fn root_style(wrap: bool) -> TextStyle<'static, 'static, [u8; 4]> {
     TextStyle {
         font_family: FontFamily::named("Liberation Sans"),
+        text_wrap_mode: wrap_mode(wrap),
         ..Default::default()
     }
 }
 
 /// Translates one segment style to Parley's.
-fn text_style(style: &SegmentStyle) -> TextStyle<'static, 'static, [u8; 4]> {
+fn text_style(style: &SegmentStyle, wrap: bool) -> TextStyle<'static, 'static, [u8; 4]> {
     TextStyle {
         font_family: FontFamily::named("Liberation Sans"),
         font_size: style.size,
@@ -276,6 +284,7 @@ fn text_style(style: &SegmentStyle) -> TextStyle<'static, 'static, [u8; 4]> {
             LineHeight::Number(factor) => ParleyLineHeight::FontSizeRelative(factor),
             LineHeight::Px(px) => ParleyLineHeight::Absolute(px),
         },
+        text_wrap_mode: wrap_mode(wrap),
         ..Default::default()
     }
 }

@@ -269,6 +269,8 @@ pub(crate) enum FlexWrap {
 /// `justify-content`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum JustifyContent {
+    /// Stretch auto-sized grid tracks to fill the container.
+    Stretch,
     /// Pack at the start.
     FlexStart,
     /// Pack at the end.
@@ -408,6 +410,8 @@ pub(crate) struct Style {
     pub width: Dimension,
     /// Preferred content height.
     pub height: Dimension,
+    /// Preferred width divided by height for replaced content.
+    pub aspect_ratio: Option<f32>,
     /// Lower width bound.
     pub min_width: Dimension,
     /// Lower height bound.
@@ -422,6 +426,8 @@ pub(crate) struct Style {
     pub padding: Edges<Length>,
     /// Border sides.
     pub border: Edges<BorderSide>,
+    /// Corner radii in top-left, top-right, bottom-right, bottom-left order.
+    pub border_radius: [Length; 4],
     /// Width interpretation.
     pub box_sizing: BoxSizing,
     /// Clipping.
@@ -452,6 +458,8 @@ pub(crate) struct Style {
     pub letter_spacing: f32,
     /// Painted or not.
     pub visibility: Visibility,
+    /// Group opacity. Zero suppresses the element's complete paint subtree.
+    pub opacity: f32,
     /// Baseline alignment for inline-level boxes.
     pub vertical_align: VerticalAlign,
     /// Flex main axis.
@@ -503,6 +511,7 @@ impl Style {
             inset_left: Dimension::Auto,
             width: Dimension::Auto,
             height: Dimension::Auto,
+            aspect_ratio: None,
             min_width: Dimension::Auto,
             min_height: Dimension::Auto,
             max_width: Dimension::Auto,
@@ -525,6 +534,7 @@ impl Style {
                 BorderSide::INITIAL,
                 BorderSide::INITIAL,
             ),
+            border_radius: [Length::Px(0.0); 4],
             box_sizing: BoxSizing::ContentBox,
             overflow: Overflow::Visible,
             float: Float::None,
@@ -540,6 +550,7 @@ impl Style {
             text_transform: TextTransform::None,
             letter_spacing: 0.0,
             visibility: Visibility::Visible,
+            opacity: 1.0,
             vertical_align: VerticalAlign::Baseline,
             flex_direction: FlexDirection::Row,
             flex_wrap: FlexWrap::Nowrap,

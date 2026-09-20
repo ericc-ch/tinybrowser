@@ -87,11 +87,15 @@ center { text-align: center; }
 table { border-collapse: separate; }
 td, th { padding: 1px; }
 th { font-weight: bold; text-align: center; }
-img { display: inline-block; }
+img, svg { display: inline-block; }
 input, textarea, select, button { display: inline-block; }
+input[type=submit], input[type=reset], input[type=button], button { white-space: pre; }
 input { width: 180px; height: 24px; padding: 2px 4px; border: 1px solid #767676; background-color: white; color: black; }
 input[type=hidden] { display: none; }
-input[type=submit], input[type=reset], input[type=button] { width: 96px; background-color: #efefef; }
+/* Submit controls shrink-to-fit their label; Chromium's html.css does not
+   assign a definite width
+   (https://source.chromium.org/chromium/chromium/src/+/main:third_party/blink/renderer/core/html/resources/html.css). */
+input[type=submit], input[type=reset], input[type=button] { width: auto; height: auto; background-color: #efefef; }
 textarea { white-space: pre-wrap; }
 ";
 
@@ -238,7 +242,10 @@ fn make_device(width: f32, height: f32) -> Device {
         ComputedValues::initial_values_with_font_override(
             style::properties::style_structs::Font::initial_values(),
         ),
-        style::queries::values::PrefersColorScheme::Light,
+        // Keep in lockstep with `matchMedia('(prefers-color-scheme')` in
+        // `cssom.js`. This stays a fixed preference until CDP emulation
+        // can override it.
+        style::queries::values::PrefersColorScheme::Dark,
         style::servo::media_features::PointerCapabilities::default(),
         style::servo::media_features::PointerCapabilities::default(),
     )

@@ -144,3 +144,7 @@ pub(crate) fn fire_window_load(ctx: &Ctx<'_>) -> Result<()> {
 pub(crate) fn fire_node_load(ctx: &Ctx<'_>, id: NodeId) -> Result<()> {
     events::fire_trusted(ctx, EventTargetKey::Node(id), "load", false, false)
 }
+
+pub(crate) fn fire_node_error(ctx: &Ctx<'_>, id: NodeId) -> Result<()> {
+    events::fire_trusted(ctx, EventTargetKey::Node(id), "error", false, false)
+}

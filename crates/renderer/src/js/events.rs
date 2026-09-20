@@ -1113,7 +1113,9 @@ impl ListenerOptions {
         match listener_options_argument(ctx, options)? {
             ListenerOptionsArgument::Absent => Ok(false),
             ListenerOptionsArgument::Boolean(capture) => Ok(capture),
-            ListenerOptionsArgument::Object(object) => bindings::option_truthy(ctx, &object, "capture"),
+            ListenerOptionsArgument::Object(object) => {
+                bindings::option_truthy(ctx, &object, "capture")
+            }
         }
     }
 }

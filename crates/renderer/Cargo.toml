@@ -53,6 +53,9 @@ stylo_static_prefs = "0.21"
 style_traits = { package = "stylo_traits", version = "0.21" }
 taffy = "0.14"
 tiny-skia = "0.12"
+# Already retained by Parley; used directly to parse SVG path data without a
+# second SVG geometry implementation.
+kurbo = "0.13"
 
 [dev-dependencies]
 # The value seam's non-finite encoding is asserted in protocol tests.

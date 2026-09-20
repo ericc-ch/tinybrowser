@@ -268,6 +268,7 @@ fn start_hop(owner: u64, chain: Chain, completion: DialCompletion) {
             DialKind::ClassicScript => FetchKind::ClassicScript,
             DialKind::ModuleScript => FetchKind::ModuleScript,
             DialKind::Stylesheet => FetchKind::Stylesheet,
+            DialKind::Image => FetchKind::Image,
             DialKind::FrameLoad => FetchKind::FrameLoad,
         },
         url: chain.url.to_string(),

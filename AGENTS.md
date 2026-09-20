@@ -13,6 +13,17 @@ In `docs/progress.md`, replace the latest binary size, the latest total, and sco
 
 Do not test spec conformance in cargo tests. Never add, keep, or "fix" a cargo test that asserts web-platform behavior or duplicates a WPT case. If a spec regression would only be caught by a cargo test, the missing WPT run is the bug.
 
+### Visual rendering work
+
+- Capture tinybrowser and Chromium with the same viewport and a fresh logged-out profile. Keep baseline images and browser-driving scripts in `/tmp/`.
+- Record the User-Agent with each live-site baseline. Google serves legacy markup when the request has no browser User-Agent, while Chromium receives the modern page.
+- Keep the default HTTP, JavaScript `navigator`, and CDP identities aligned when emulating Chrome. TLS fingerprinting is separate work.
+- Record `prefers-color-scheme` with live-site baselines. Google changes its logo, canvas, controls, and footer together when Chromium reports dark mode.
+- The render tree has a synthetic box above the document element. That box models the initial containing block. Give it the viewport as a definite size before resolving root percentage sizes.
+- Paint the propagated `html` or `body` background on the canvas. Stretching the root box after layout does not implement canvas background propagation.
+- A reftest can pass when both the test and reference omit the same unsupported feature. For image work, use a reference that paints with CSS instead of another image.
+- Format touched Rust files directly. A workspace-wide format check can report unrelated formatter drift in untouched files.
+
 ## Checks
 
 - clippy and embedded JS (`tools/check`), `cargo test --workspace`.

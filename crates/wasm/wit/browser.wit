@@ -17,6 +17,8 @@ interface types {
         module-script,
         /// A `<link rel=stylesheet>` sheet.
         stylesheet,
+        /// An `<img src>` resource.
+        image,
         /// A child frame's navigation.
         frame-load,
     }

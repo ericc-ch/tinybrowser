@@ -85,6 +85,12 @@ pub(crate) enum DialContext {
         element: dom::NodeId,
         epoch: u64,
     },
+    /// An `<img>` resource selected by its `src` attribute.
+    Image {
+        element: dom::NodeId,
+        epoch: u64,
+        generation: u64,
+    },
     /// A child frame's own navigation
     /// (<https://html.spec.whatwg.org/multipage/browsing-the-web.html#navigate>);
     /// a superseded load is dropped when it completes.
@@ -176,6 +182,12 @@ pub(crate) struct Document {
     /// Stylesheet dials queued or in flight; the load event waits for them
     /// (<https://html.spec.whatwg.org/multipage/links.html#link-type-stylesheet>).
     pending_stylesheets: usize,
+    /// Image fetches queued or in flight. They delay the document load event.
+    pending_images: usize,
+    /// Per-element fetch generation so a superseded `src` completion is ignored.
+    image_generations: HashMap<dom::NodeId, u64>,
+    /// Elements with an in-flight image fetch for the current generation.
+    in_flight_images: HashSet<dom::NodeId>,
     /// Identifies the frame's current navigation; completions from superseded
     /// loads are dropped.
     frame_load_sequence: u64,
@@ -252,6 +264,9 @@ impl Document {
             stylesheets: HashMap::new(),
             stylesheet_urls: HashSet::new(),
             pending_stylesheets: 0,
+            pending_images: 0,
+            image_generations: HashMap::new(),
+            in_flight_images: HashSet::new(),
             frame_load_sequence: 0,
             frame_load_in_flight: false,
             initial_blank: true,
@@ -386,6 +401,28 @@ impl Document {
     pub(crate) fn fire_node_load(&mut self, id: dom::NodeId) {
         self.fire_js(|js| js.fire_node_load(id));
         self.adopt_js_work();
+    }
+
+    /// Whether `id` is an HTML `iframe` in this document.
+    #[must_use]
+    pub(crate) fn is_iframe_element(&self, id: dom::NodeId) -> bool {
+        self.world
+            .borrow()
+            .document(id)
+            .is_some_and(|parsed| parsed.dom.is_iframe_element(id))
+    }
+
+    /// Queues the image fetch for a newly connected `<img>`, if it still needs one
+    /// (<https://html.spec.whatwg.org/multipage/images.html#updating-the-image-data>).
+    pub(crate) fn queue_connected_image(&mut self, element: dom::NodeId) {
+        self.queue_image(element, false);
+    }
+
+    /// Drops a disconnected `<img>`'s decoded pixels and ignores in-flight fetches.
+    pub(crate) fn disconnect_image(&mut self, element: dom::NodeId) {
+        self.bump_image_generation(element);
+        self.in_flight_images.remove(&element);
+        self.world.borrow_mut().forget_image(element);
     }
 
     /// Starts the frame's own navigation. The dial runs on this document, so
@@ -904,6 +941,11 @@ impl Document {
         self.stylesheets.clear();
         self.stylesheet_urls.clear();
         self.pending_stylesheets = 0;
+        self.world.borrow_mut().clear_images();
+        self.world.borrow_mut().take_image_updates();
+        self.pending_images = 0;
+        self.image_generations.clear();
+        self.in_flight_images.clear();
         let js_timer_ids: std::collections::HashSet<u32> =
             self.js_timer_slots.keys().copied().collect();
         self.timers
@@ -1051,6 +1093,7 @@ impl Document {
                     // Style sheets delay the load event, so queue them before
                     // the document's end events.
                     self.load_stylesheets();
+                    self.load_images();
                     // Deliver parser mutations before the document's events.
                     self.deliver_mutations();
                     self.fire_document_end();
@@ -1128,6 +1171,33 @@ impl Document {
                 }
                 self.fire_document_load();
             }
+            DialContext::Image {
+                element,
+                epoch,
+                generation,
+            } => {
+                if epoch != self.js_epoch {
+                    return;
+                }
+                self.record_event(TabEvent::Fetch {
+                    status: outcome.status,
+                });
+                self.pending_images = self.pending_images.saturating_sub(1);
+                if self.image_generation(element) == generation {
+                    self.in_flight_images.remove(&element);
+                    let loaded = (200..300).contains(&outcome.status)
+                        && crate::render::decode_png(&outcome.body).is_some_and(|image| {
+                            self.world.borrow_mut().store_image(element, image)
+                        });
+                    if loaded {
+                        self.fire_js(|js| js.fire_node_load(element));
+                    } else {
+                        self.fire_js(|js| js.fire_node_error(element));
+                    }
+                    self.adopt_js_work();
+                }
+                self.fire_document_load();
+            }
             DialContext::FrameLoad { sequence } => {
                 // The superseded-load early return deliberately skips the
                 // trailing `adopt_js_work()` below.
@@ -1169,6 +1239,21 @@ impl Document {
                 // Stale dials from a superseded navigation are ignored.
                 if epoch == self.js_epoch {
                     self.pending_stylesheets = self.pending_stylesheets.saturating_sub(1);
+                    self.fire_document_load();
+                }
+            }
+            DialContext::Image {
+                element,
+                epoch,
+                generation,
+            } => {
+                if epoch == self.js_epoch {
+                    self.pending_images = self.pending_images.saturating_sub(1);
+                    if self.image_generation(element) == generation {
+                        self.in_flight_images.remove(&element);
+                        self.fire_js(|js| js.fire_node_error(element));
+                        self.adopt_js_work();
+                    }
                     self.fire_document_load();
                 }
             }
@@ -1268,7 +1353,7 @@ impl Document {
         }
         // Style sheets that are still loading hold the load event
         // (<https://html.spec.whatwg.org/multipage/links.html#link-type-stylesheet>).
-        if self.pending_stylesheets > 0 {
+        if self.pending_stylesheets > 0 || self.pending_images > 0 {
             return;
         }
         self.world
@@ -1319,6 +1404,81 @@ impl Document {
         if queued > 0 {
             self.launch_queued_dials();
         }
+    }
+
+    /// Queues the current document's `<img src>` resources. Image requests
+    /// delay the load event until they succeed or fail
+    /// (<https://html.spec.whatwg.org/multipage/images.html#updating-the-image-data>).
+    fn load_images(&mut self) {
+        let images: Vec<dom::NodeId> = {
+            let world = self.world.borrow();
+            let Some(parsed) = world.main_document() else {
+                return;
+            };
+            let document = parsed.dom.document();
+            parsed
+                .dom
+                .select_all(document, "img[src]")
+                .unwrap_or_default()
+        };
+        for element in images {
+            self.queue_image(element, false);
+        }
+    }
+
+    fn image_generation(&self, element: dom::NodeId) -> u64 {
+        self.image_generations.get(&element).copied().unwrap_or(0)
+    }
+
+    fn bump_image_generation(&mut self, element: dom::NodeId) -> u64 {
+        let generation = self.image_generations.entry(element).or_insert(0);
+        *generation = generation.wrapping_add(1);
+        *generation
+    }
+
+    /// Starts or replaces the fetch for one `<img>`.
+    ///
+    /// `force` is a `src` mutation: a connected insert skips work when a fetch
+    /// or decoded image is already current.
+    pub(in crate::document) fn queue_image(&mut self, element: dom::NodeId, force: bool) {
+        if !force
+            && (self.in_flight_images.contains(&element)
+                || self.world.borrow().images.contains_key(&element))
+        {
+            return;
+        }
+        let generation = self.bump_image_generation(element);
+        self.in_flight_images.insert(element);
+        self.world.borrow_mut().forget_image(element);
+        let src = self.world.borrow().document(element).and_then(|parsed| {
+            parsed
+                .dom
+                .is_img_element(element)
+                .then(|| parsed.dom.attribute(element, "src"))
+                .flatten()
+        });
+        let Some(src) = src.filter(|src| !src.is_empty()) else {
+            self.in_flight_images.remove(&element);
+            self.fire_js(|js| js.fire_node_error(element));
+            return;
+        };
+        let Ok(url) = self.resolve_dial_url(&src) else {
+            self.in_flight_images.remove(&element);
+            self.fire_js(|js| js.fire_node_error(element));
+            return;
+        };
+        let initiator = self.url.clone();
+        self.queued_dials.push(QueuedDial {
+            context: DialContext::Image {
+                element,
+                epoch: self.js_epoch,
+                generation,
+            },
+            url,
+            initiator,
+        });
+        self.pending_images = self.pending_images.saturating_add(1);
+        self.launch_queued_dials();
     }
 
     /// The loaded CSS of one `<link rel=stylesheet>`, if it arrived.

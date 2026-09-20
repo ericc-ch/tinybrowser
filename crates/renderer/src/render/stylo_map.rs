@@ -105,33 +105,7 @@ fn map_box_model(values: &ComputedValues, style: &mut Style) {
 
     let current_color = values.get_inherited_text().color;
     style.color = map_absolute(current_color);
-    let border = values.get_border();
-    style.border = Edges::new(
-        map_border_side(
-            &border.border_top_width,
-            border.border_top_style,
-            &border.border_top_color,
-            current_color,
-        ),
-        map_border_side(
-            &border.border_right_width,
-            border.border_right_style,
-            &border.border_right_color,
-            current_color,
-        ),
-        map_border_side(
-            &border.border_bottom_width,
-            border.border_bottom_style,
-            &border.border_bottom_color,
-            current_color,
-        ),
-        map_border_side(
-            &border.border_left_width,
-            border.border_left_style,
-            &border.border_left_color,
-            current_color,
-        ),
-    );
+    map_border(values, style, current_color);
     style.box_sizing = match position.box_sizing {
         style::properties::longhands::box_sizing::computed_value::T::ContentBox => {
             BoxSizing::ContentBox
@@ -161,6 +135,49 @@ fn map_box_model(values: &ComputedValues, style: &mut Style) {
         ComputedClear::None => Clear::None,
     };
     style.background = map_color(&values.get_background().background_color, current_color);
+    style.opacity = values.get_effects().opacity;
+}
+
+fn map_border(
+    values: &ComputedValues,
+    style: &mut Style,
+    current_color: style::color::AbsoluteColor,
+) {
+    let border = values.get_border();
+    style.border = Edges::new(
+        map_border_side(
+            &border.border_top_width,
+            border.border_top_style,
+            &border.border_top_color,
+            current_color,
+        ),
+        map_border_side(
+            &border.border_right_width,
+            border.border_right_style,
+            &border.border_right_color,
+            current_color,
+        ),
+        map_border_side(
+            &border.border_bottom_width,
+            border.border_bottom_style,
+            &border.border_bottom_color,
+            current_color,
+        ),
+        map_border_side(
+            &border.border_left_width,
+            border.border_left_style,
+            &border.border_left_color,
+            current_color,
+        ),
+    );
+    style.border_radius = [
+        map_length_percentage(&border.border_top_left_radius.0.width.0).unwrap_or(Length::Px(0.0)),
+        map_length_percentage(&border.border_top_right_radius.0.width.0).unwrap_or(Length::Px(0.0)),
+        map_length_percentage(&border.border_bottom_right_radius.0.width.0)
+            .unwrap_or(Length::Px(0.0)),
+        map_length_percentage(&border.border_bottom_left_radius.0.width.0)
+            .unwrap_or(Length::Px(0.0)),
+    ];
 }
 
 /// Maps fonts, text, and inherited paint: the properties paint and Parley
@@ -245,8 +262,15 @@ fn map_flex_and_grid(values: &ComputedValues, style: &mut Style) {
         ComputedFlexWrap::Wrap => FlexWrap::Wrap,
         ComputedFlexWrap::WrapReverse => FlexWrap::WrapReverse,
     };
-    style.justify_content =
-        map_content_distribution(position.justify_content, JustifyContent::FlexStart);
+    // `normal` is layout-mode dependent: start packing in flex layout and
+    // stretching auto tracks in grid layout.
+    // https://drafts.csswg.org/css-align-3/#valdef-justify-content-normal
+    let normal_justify = if matches!(style.display, Display::Grid | Display::InlineGrid) {
+        JustifyContent::Stretch
+    } else {
+        JustifyContent::FlexStart
+    };
+    style.justify_content = map_content_distribution(position.justify_content, normal_justify);
     style.align_items = map_item_placement(position.align_items);
     style.align_self = map_self_alignment(position.align_self);
     style.align_content = map_align_content(position.align_content);
@@ -601,6 +625,7 @@ impl JustifyContent {
     /// model (`stretch`, baselines, overflow positions ride the initial).
     fn from_flag(flag: AlignFlags) -> Option<Self> {
         Some(match flag.value() {
+            AlignFlags::STRETCH => Self::Stretch,
             AlignFlags::FLEX_START | AlignFlags::START | AlignFlags::LEFT => Self::FlexStart,
             AlignFlags::FLEX_END | AlignFlags::END | AlignFlags::RIGHT => Self::FlexEnd,
             AlignFlags::CENTER => Self::Center,

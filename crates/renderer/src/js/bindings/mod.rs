@@ -429,7 +429,10 @@ pub(super) fn layout_boxes(ctx: &Ctx<'_>, document: NodeId) -> Result<Vec<crate:
         height: crate::engine::VIEWPORT_HEIGHT,
         scale: 1.0,
     };
-    Ok(crate::render::layout_boxes(&parsed.dom, &sheets, &options).unwrap_or_default())
+    Ok(
+        crate::render::layout_boxes(&parsed.dom, &sheets, &options, &world.images)
+            .unwrap_or_default(),
+    )
 }
 
 /// Inline `<style>` text in document order. External sheets are not mirrored

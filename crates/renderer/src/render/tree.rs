@@ -11,8 +11,10 @@ use std::collections::HashMap;
 
 use dom::{Dom, NodeId};
 
+use crate::render::RasterImage;
 use crate::render::geometry::Edges;
-use crate::render::style::{BorderSide, Display, Style};
+use crate::render::style::{BorderSide, Dimension, Display, Length, Style};
+use crate::render::svg;
 
 /// What kind of box a node generated.
 pub(crate) enum BoxKind {
@@ -51,7 +53,11 @@ pub(crate) struct BoxNode {
 }
 
 /// Builds the box tree for one document.
-pub(crate) fn build(dom: &Dom, styles: &HashMap<NodeId, Style>) -> BoxNode {
+pub(crate) fn build(
+    dom: &Dom,
+    styles: &HashMap<NodeId, Style>,
+    images: &HashMap<NodeId, RasterImage>,
+) -> BoxNode {
     let document = dom.document();
     let root_style = Style {
         display: Display::Block,
@@ -63,7 +69,7 @@ pub(crate) fn build(dom: &Dom, styles: &HashMap<NodeId, Style>) -> BoxNode {
         ),
         ..Style::initial()
     };
-    let children = build_children(dom, styles, document, &root_style);
+    let children = build_children(dom, styles, images, document, &root_style);
     BoxNode {
         kind: BoxKind::Block,
         node: None,
@@ -76,6 +82,7 @@ pub(crate) fn build(dom: &Dom, styles: &HashMap<NodeId, Style>) -> BoxNode {
 fn build_children(
     dom: &Dom,
     styles: &HashMap<NodeId, Style>,
+    images: &HashMap<NodeId, RasterImage>,
     parent: NodeId,
     parent_style: &Style,
 ) -> Vec<BoxNode> {
@@ -84,10 +91,20 @@ fn build_children(
     for child in children {
         match dom.kind(child) {
             Some(dom::NodeKind::Element { name, .. }) => {
-                let style = styles
+                let mut style = styles
                     .get(&child)
                     .cloned()
                     .unwrap_or_else(|| Style::inherited_from(parent_style));
+                // `opacity` forms a group for the complete descendant paint
+                // subtree. Carry the effective value through inline boxes,
+                // which our layout flattens away.
+                // https://drafts.csswg.org/css-color-4/#transparency
+                style.opacity *= parent_style.opacity;
+                if let Some(image) = images.get(&child) {
+                    apply_image_dimensions(dom, child, image, &mut style);
+                } else if svg::is_outer_svg(dom, child) {
+                    svg::apply_dimensions(dom, child, &mut style);
+                }
                 if style.display == Display::None {
                     continue;
                 }
@@ -107,7 +124,7 @@ fn build_children(
                         Display::None => continue,
                     }
                 };
-                let children = if is_break {
+                let children = if is_break || svg::is_outer_svg(dom, child) {
                     Vec::new()
                 } else if let Some(value) = rendered_input_text(dom, child) {
                     if value.is_empty() {
@@ -121,7 +138,7 @@ fn build_children(
                         }]
                     }
                 } else {
-                    let kids = build_children(dom, styles, child, &style);
+                    let kids = build_children(dom, styles, images, child, &style);
                     wrap_anonymous(kids, &style)
                 };
                 boxes.push(BoxNode {
@@ -143,12 +160,50 @@ fn build_children(
                 });
             }
             Some(dom::NodeKind::Document | dom::NodeKind::Fragment) => {
-                boxes.extend(build_children(dom, styles, child, parent_style));
+                boxes.extend(build_children(dom, styles, images, child, parent_style));
             }
             _ => {}
         }
     }
     boxes
+}
+
+/// Applies a decoded image's natural dimensions and aspect ratio to its
+/// replaced box. The HTML `width` and `height` attributes are presentational
+/// hints; authored CSS wins because it has already cascaded into non-auto
+/// dimensions
+/// (<https://html.spec.whatwg.org/multipage/rendering.html#attributes-for-embedded-content-and-images>,
+/// <https://drafts.csswg.org/css-images-3/#sizing>).
+fn apply_image_dimensions(dom: &Dom, id: NodeId, image: &RasterImage, style: &mut Style) {
+    if image.width == 0 || image.height == 0 {
+        return;
+    }
+    style.aspect_ratio =
+        Some(crate::render::pixels(image.width) / crate::render::pixels(image.height));
+
+    if style.width == Dimension::Auto {
+        style.width = image_dimension_attribute(dom, id, "width").unwrap_or(Dimension::Auto);
+    }
+    if style.height == Dimension::Auto {
+        style.height = image_dimension_attribute(dom, id, "height").unwrap_or(Dimension::Auto);
+    }
+    if style.width == Dimension::Auto && style.height == Dimension::Auto {
+        style.width = Dimension::Length(Length::Px(crate::render::pixels(image.width)));
+    }
+}
+
+/// Parses the non-negative integer or legacy percentage syntax accepted by
+/// image dimension presentational hints.
+fn image_dimension_attribute(dom: &Dom, id: NodeId, name: &str) -> Option<Dimension> {
+    let value = dom.attribute(id, name)?;
+    let value = value.trim();
+    if let Some(percent) = value.strip_suffix('%') {
+        let number = percent.trim().parse::<f32>().ok()?;
+        return (number.is_finite() && number >= 0.0)
+            .then_some(Dimension::Length(Length::Percent(number)));
+    }
+    let number = value.parse::<u32>().ok()?;
+    Some(Dimension::Length(Length::Px(crate::render::pixels(number))))
 }
 
 /// Text painted inside the UA widget for the input states whose value is

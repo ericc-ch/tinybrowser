@@ -260,20 +260,20 @@ impl Dom {
         std::mem::take(&mut self.lifecycle)
     }
 
-    /// Records every `iframe` connection transition in a snapshot taken
-    /// before an operation. Snapshots only ever carry iframe elements (see
-    /// [`Dom::connection_snapshot`]): they are the sole consumer of
-    /// connection transitions, and filtering in the snapshot keeps the
-    /// parser's hot path free of per-element bookkeeping. Custom elements
-    /// will need an opt-in form of this hook.
+    /// Records every `iframe` and `img` connection transition in a snapshot
+    /// taken before an operation. Snapshots only ever carry those elements
+    /// (see [`Dom::connection_snapshot`]): filtering in the snapshot keeps
+    /// the parser's hot path free of per-element bookkeeping.
     fn record_snapshot(&mut self, snapshot: Vec<(NodeId, bool)>) {
         for (id, was_connected) in snapshot {
             let connected = self.is_connected(id);
             if connected != was_connected {
-                if connected {
-                    self.connected_iframes = self.connected_iframes.saturating_add(1);
-                } else {
-                    self.connected_iframes = self.connected_iframes.saturating_sub(1);
+                if self.is_iframe_element(id) {
+                    if connected {
+                        self.connected_iframes = self.connected_iframes.saturating_add(1);
+                    } else {
+                        self.connected_iframes = self.connected_iframes.saturating_sub(1);
+                    }
                 }
                 self.lifecycle.push(if connected {
                     Lifecycle::Inserted(id)
@@ -297,6 +297,16 @@ impl Dom {
             self.kind(id),
             Some(NodeKind::Element { name, .. })
                 if name.ns == html_namespace() && name.local.as_ref() == "iframe"
+        )
+    }
+
+    /// Whether `id` is an HTML `img` element.
+    #[must_use]
+    pub fn is_img_element(&self, id: NodeId) -> bool {
+        matches!(
+            self.kind(id),
+            Some(NodeKind::Element { name, .. })
+                if name.ns == html_namespace() && name.local.as_ref() == "img"
         )
     }
 
@@ -374,13 +384,13 @@ impl Dom {
         Some(slot).filter(|&slot| self.assigned_nodes(slot).contains(&id))
     }
 
-    /// The iframe elements in `id`'s inclusive subtree with their
+    /// The iframe and img elements in `id`'s inclusive subtree with their
     /// connectivity, for a post-connection/removing step pass.
     fn connection_snapshot(&self, id: NodeId) -> Vec<(NodeId, bool)> {
         let mut snapshot = Vec::new();
         let mut stack = vec![id];
         while let Some(current) = stack.pop() {
-            if self.is_iframe_element(current) {
+            if self.is_iframe_element(current) || self.is_img_element(current) {
                 snapshot.push((current, self.is_connected(current)));
             }
             if let Some(children) = self.children(current) {
