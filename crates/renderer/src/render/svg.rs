@@ -10,6 +10,7 @@ use dom::{Dom, NodeId};
 use kurbo::{BezPath, PathEl};
 use tiny_skia::{PathBuilder, Transform};
 
+use crate::render::RasterImage;
 use crate::render::color::Color;
 use crate::render::geometry::Rect;
 use crate::render::paint::Painter;
@@ -46,6 +47,72 @@ pub(crate) fn apply_dimensions(dom: &Dom, node: NodeId, style: &mut Style) {
             Dimension::Length(Length::Px(value))
         });
     }
+}
+
+/// Rasterizes one outer SVG into a transparent bitmap for `<img src>`.
+///
+/// Script does not run. Missing width/height fall back to the viewBox, then
+/// to the CSS replaced-element default of 300×150
+/// (<https://svgwg.org/svg2-draft/coords.html#SizingSVGInCSS>,
+/// <https://drafts.csswg.org/css-images-3/#default-sizing>).
+pub(crate) fn rasterize(dom: &Dom, root: NodeId) -> Option<RasterImage> {
+    let mut style = Style::initial();
+    apply_dimensions(dom, root, &mut style);
+    let viewport = view_box(dom, root);
+    let width = dimension_px(style.width)
+        .or_else(|| viewport.map(|viewport| viewport.width))
+        .filter(|value| *value > 0.0)
+        .unwrap_or(300.0);
+    let height = dimension_px(style.height)
+        .or_else(|| viewport.map(|viewport| viewport.height))
+        .filter(|value| *value > 0.0)
+        .unwrap_or(150.0);
+    let width_px = device_side(width)?;
+    let height_px = device_side(height)?;
+    let mut painter =
+        Painter::with_background(width_px, height_px, tiny_skia::Color::TRANSPARENT).ok()?;
+    paint(
+        &mut painter,
+        dom,
+        &HashMap::new(),
+        root,
+        Rect::new(
+            0.0,
+            0.0,
+            crate::render::pixels(width_px),
+            crate::render::pixels(height_px),
+        ),
+    );
+    let image = painter.into_image();
+    Some(RasterImage {
+        width: image.width,
+        height: image.height,
+        data: image.data,
+    })
+}
+
+fn dimension_px(value: Dimension) -> Option<f32> {
+    match value {
+        Dimension::Length(Length::Px(value)) if value > 0.0 => Some(value),
+        _ => None,
+    }
+}
+
+fn device_side(value: f32) -> Option<u32> {
+    if !value.is_finite() || value <= 0.0 {
+        return None;
+    }
+    let rounded = value.round();
+    if rounded > 4096.0 {
+        return None;
+    }
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "SVG intrinsic size is clamped to a bounded pixel side"
+    )]
+    let side = rounded as u32;
+    (side > 0).then_some(side)
 }
 
 /// Paints supported SVG geometry into the outer SVG content box

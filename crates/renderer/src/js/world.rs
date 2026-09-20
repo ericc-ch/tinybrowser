@@ -365,6 +365,12 @@ pub(crate) struct World {
     /// Decoded `<img>` bitmaps for this document, used by both paint and
     /// script geometry.
     pub(crate) images: HashMap<NodeId, crate::render::RasterImage>,
+    /// `<img>` elements whose current request has not finished
+    /// (<https://html.spec.whatwg.org/multipage/embedded-content.html#dom-img-complete>).
+    pub(crate) image_loading: HashSet<NodeId>,
+    /// Selected URL for each `<img>` current request
+    /// (<https://html.spec.whatwg.org/multipage/embedded-content.html#dom-img-currentsrc>).
+    pub(crate) image_current_src: HashMap<NodeId, String>,
 }
 
 impl Drop for World {
@@ -445,6 +451,8 @@ impl World {
             deliver_mutations_fn: None,
             host_token: None,
             images: HashMap::new(),
+            image_loading: HashSet::new(),
+            image_current_src: HashMap::new(),
         }
     }
 
@@ -1000,22 +1008,44 @@ impl World {
         std::mem::take(&mut self.image_updates)
     }
 
+    /// Marks `element` as having an in-flight image request at `url`.
+    pub(crate) fn begin_image(&mut self, element: NodeId, url: String) {
+        self.forget_image(element);
+        self.image_loading.insert(element);
+        self.image_current_src.insert(element, url);
+    }
+
     /// Retains `image` if the shared decoded-image budget still has room.
     pub(crate) fn store_image(
         &mut self,
         element: NodeId,
         image: crate::render::RasterImage,
+        url: String,
     ) -> bool {
         self.forget_image(element);
         let bytes = image.data.len();
         if !self.reserve_decoded_image_bytes(bytes) {
+            self.image_current_src.insert(element, url);
             return false;
         }
         self.images.insert(element, image);
+        self.image_current_src.insert(element, url);
         true
     }
 
+    /// The current request finished without usable pixels.
+    pub(crate) fn fail_image(&mut self, element: NodeId) {
+        self.image_loading.remove(&element);
+        self.forget_decoded_pixels(element);
+    }
+
     pub(crate) fn forget_image(&mut self, element: NodeId) {
+        self.image_loading.remove(&element);
+        self.image_current_src.remove(&element);
+        self.forget_decoded_pixels(element);
+    }
+
+    fn forget_decoded_pixels(&mut self, element: NodeId) {
         if let Some(image) = self.images.remove(&element) {
             self.release_decoded_image_bytes(image.data.len());
         }
@@ -1028,6 +1058,8 @@ impl World {
             .map(|image| image.data.len())
             .sum::<usize>();
         self.images.clear();
+        self.image_loading.clear();
+        self.image_current_src.clear();
         self.release_decoded_image_bytes(bytes);
     }
 

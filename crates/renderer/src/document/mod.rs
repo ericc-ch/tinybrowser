@@ -1186,12 +1186,17 @@ impl Document {
                 if self.image_generation(element) == generation {
                     self.in_flight_images.remove(&element);
                     let loaded = (200..300).contains(&outcome.status)
-                        && crate::render::decode_png(&outcome.body).is_some_and(|image| {
-                            self.world.borrow_mut().store_image(element, image)
+                        && crate::render::decode_image(&outcome.body).is_some_and(|image| {
+                            self.world.borrow_mut().store_image(
+                                element,
+                                image,
+                                outcome.final_url.clone(),
+                            )
                         });
                     if loaded {
                         self.fire_js(|js| js.fire_node_load(element));
                     } else {
+                        self.world.borrow_mut().fail_image(element);
                         self.fire_js(|js| js.fire_node_error(element));
                     }
                     self.adopt_js_work();
@@ -1251,6 +1256,7 @@ impl Document {
                     self.pending_images = self.pending_images.saturating_sub(1);
                     if self.image_generation(element) == generation {
                         self.in_flight_images.remove(&element);
+                        self.world.borrow_mut().fail_image(element);
                         self.fire_js(|js| js.fire_node_error(element));
                         self.adopt_js_work();
                     }
@@ -1468,6 +1474,9 @@ impl Document {
             return;
         };
         let initiator = self.url.clone();
+        self.world
+            .borrow_mut()
+            .begin_image(element, url.as_str().to_owned());
         self.queued_dials.push(QueuedDial {
             context: DialContext::Image {
                 element,

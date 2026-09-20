@@ -44,6 +44,12 @@ euclid = "0.22"
 fontique = { version = "0.11", default-features = false }
 parley = { version = "0.11", default-features = false, features = ["libm"] }
 png = "0.18"
+# JPEG/WebP stay pure Rust: the workspace denies `unsafe_code`, and C codecs
+# (libjpeg/libwebp) need FFI. native-tls already dynlinks libssl; jpeg/webp
+# are not a given on the host, and the wasm crate cannot use those .so files.
+zune-jpeg = { version = "0.5.15", default-features = false, features = ["std"] }
+zune-core = { version = "0.5.3", default-features = false, features = ["std"] }
+image-webp = "0.2.4"
 selectors = "0.40"
 skrifa = { version = "0.44", default-features = false, features = ["std"] }
 web_atoms = "0.2"

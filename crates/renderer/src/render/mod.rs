@@ -33,6 +33,7 @@ mod stylo_map;
 mod stylo_view;
 
 mod boxes;
+mod decode;
 mod font;
 mod geometry;
 mod layout;
@@ -43,7 +44,7 @@ mod svg;
 mod text;
 mod tree;
 
-pub(crate) use png::decode_png;
+pub(crate) use decode::decode_image;
 pub use png::encode_png;
 
 /// One decoded image in premultiplied RGBA form, ready for `tiny-skia`.

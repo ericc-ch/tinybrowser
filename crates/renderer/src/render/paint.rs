@@ -46,11 +46,24 @@ impl Painter {
     ///
     /// [`RenderError::TooLarge`] when the viewport exceeds the pixel cap.
     pub(crate) fn new(width: u32, height: u32) -> Result<Self, RenderError> {
+        Self::with_background(width, height, SkiaColor::WHITE)
+    }
+
+    /// Creates a `width` x `height` painter, filled with `background`.
+    ///
+    /// # Errors
+    ///
+    /// [`RenderError::TooLarge`] when the viewport exceeds the pixel cap.
+    pub(crate) fn with_background(
+        width: u32,
+        height: u32,
+        background: SkiaColor,
+    ) -> Result<Self, RenderError> {
         if u64::from(width) * u64::from(height) > MAX_PIXELS {
             return Err(RenderError::TooLarge);
         }
         let mut pixmap = Pixmap::new(width, height).ok_or(RenderError::TooLarge)?;
-        pixmap.fill(SkiaColor::WHITE);
+        pixmap.fill(background);
         Ok(Self {
             pixmap,
             clips: Vec::new(),
