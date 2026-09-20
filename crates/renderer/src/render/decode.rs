@@ -15,7 +15,6 @@ use zune_core::options::DecoderOptions;
 use zune_jpeg::JpegDecoder;
 
 use crate::render::png::{decode_png, push_premultiplied};
-use crate::render::png::{decode_png, push_premultiplied};
 use crate::render::{MAX_DECODED_SIDE, RasterImage, decoded_rgba_fits, svg};
 
 /// Sniffed raster type from the MIME sniff image-pattern table.

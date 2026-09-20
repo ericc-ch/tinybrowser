@@ -106,16 +106,13 @@ fn device_side(value: f32) -> Option<u32> {
         return None;
     }
     let rounded = value.round();
-    if rounded > f32::from(crate::render::MAX_DECODED_SIDE) {
-        return None;
-    }
     #[expect(
         clippy::cast_possible_truncation,
         clippy::cast_sign_loss,
         reason = "SVG intrinsic size is clamped to a bounded pixel side"
     )]
     let side = rounded as u32;
-    (side > 0).then_some(side)
+    (side > 0 && side <= crate::render::MAX_DECODED_SIDE).then_some(side)
 }
 
 /// Paints supported SVG geometry into the outer SVG content box

@@ -1040,7 +1040,7 @@ impl JsNode {
         let src = world
             .document(self.handle.0)
             .and_then(|parsed| parsed.dom.attribute(self.handle.0, "src"));
-        if src.as_deref().is_none_or(|src| src.is_empty()) {
+        if src.as_deref().is_none_or(str::is_empty) {
             return Ok(true);
         }
         Ok(world.image_broken.contains(&self.handle.0))
