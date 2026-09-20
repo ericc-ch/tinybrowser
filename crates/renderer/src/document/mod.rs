@@ -89,6 +89,7 @@ pub(crate) enum DialContext {
     Image {
         element: dom::NodeId,
         epoch: u64,
+        generation: u64,
     },
     /// A child frame's own navigation
     /// (<https://html.spec.whatwg.org/multipage/browsing-the-web.html#navigate>);
@@ -183,6 +184,10 @@ pub(crate) struct Document {
     pending_stylesheets: usize,
     /// Image fetches queued or in flight. They delay the document load event.
     pending_images: usize,
+    /// Per-element fetch generation so a superseded `src` completion is ignored.
+    image_generations: HashMap<dom::NodeId, u64>,
+    /// Elements with an in-flight image fetch for the current generation.
+    in_flight_images: HashSet<dom::NodeId>,
     /// Identifies the frame's current navigation; completions from superseded
     /// loads are dropped.
     frame_load_sequence: u64,
@@ -260,6 +265,8 @@ impl Document {
             stylesheet_urls: HashSet::new(),
             pending_stylesheets: 0,
             pending_images: 0,
+            image_generations: HashMap::new(),
+            in_flight_images: HashSet::new(),
             frame_load_sequence: 0,
             frame_load_in_flight: false,
             initial_blank: true,
@@ -394,6 +401,28 @@ impl Document {
     pub(crate) fn fire_node_load(&mut self, id: dom::NodeId) {
         self.fire_js(|js| js.fire_node_load(id));
         self.adopt_js_work();
+    }
+
+    /// Whether `id` is an HTML `iframe` in this document.
+    #[must_use]
+    pub(crate) fn is_iframe_element(&self, id: dom::NodeId) -> bool {
+        self.world
+            .borrow()
+            .document(id)
+            .is_some_and(|parsed| parsed.dom.is_iframe_element(id))
+    }
+
+    /// Queues the image fetch for a newly connected `<img>`, if it still needs one
+    /// (<https://html.spec.whatwg.org/multipage/images.html#updating-the-image-data>).
+    pub(crate) fn queue_connected_image(&mut self, element: dom::NodeId) {
+        self.queue_image(element, false);
+    }
+
+    /// Drops a disconnected `<img>`'s decoded pixels and ignores in-flight fetches.
+    pub(crate) fn disconnect_image(&mut self, element: dom::NodeId) {
+        self.bump_image_generation(element);
+        self.in_flight_images.remove(&element);
+        self.world.borrow_mut().forget_image(element);
     }
 
     /// Starts the frame's own navigation. The dial runs on this document, so
@@ -912,8 +941,11 @@ impl Document {
         self.stylesheets.clear();
         self.stylesheet_urls.clear();
         self.pending_stylesheets = 0;
-        self.world.borrow_mut().images.clear();
+        self.world.borrow_mut().clear_images();
+        self.world.borrow_mut().take_image_updates();
         self.pending_images = 0;
+        self.image_generations.clear();
+        self.in_flight_images.clear();
         let js_timer_ids: std::collections::HashSet<u32> =
             self.js_timer_slots.keys().copied().collect();
         self.timers
@@ -1139,7 +1171,11 @@ impl Document {
                 }
                 self.fire_document_load();
             }
-            DialContext::Image { element, epoch } => {
+            DialContext::Image {
+                element,
+                epoch,
+                generation,
+            } => {
                 if epoch != self.js_epoch {
                     return;
                 }
@@ -1147,10 +1183,18 @@ impl Document {
                     status: outcome.status,
                 });
                 self.pending_images = self.pending_images.saturating_sub(1);
-                if (200..300).contains(&outcome.status)
-                    && let Some(image) = crate::render::decode_png(&outcome.body)
-                {
-                    self.world.borrow_mut().images.insert(element, image);
+                if self.image_generation(element) == generation {
+                    self.in_flight_images.remove(&element);
+                    let loaded = (200..300).contains(&outcome.status)
+                        && crate::render::decode_png(&outcome.body).is_some_and(|image| {
+                            self.world.borrow_mut().store_image(element, image)
+                        });
+                    if loaded {
+                        self.fire_js(|js| js.fire_node_load(element));
+                    } else {
+                        self.fire_js(|js| js.fire_node_error(element));
+                    }
+                    self.adopt_js_work();
                 }
                 self.fire_document_load();
             }
@@ -1198,9 +1242,18 @@ impl Document {
                     self.fire_document_load();
                 }
             }
-            DialContext::Image { epoch, .. } => {
+            DialContext::Image {
+                element,
+                epoch,
+                generation,
+            } => {
                 if epoch == self.js_epoch {
                     self.pending_images = self.pending_images.saturating_sub(1);
+                    if self.image_generation(element) == generation {
+                        self.in_flight_images.remove(&element);
+                        self.fire_js(|js| js.fire_node_error(element));
+                        self.adopt_js_work();
+                    }
                     self.fire_document_load();
                 }
             }
@@ -1357,38 +1410,75 @@ impl Document {
     /// delay the load event until they succeed or fail
     /// (<https://html.spec.whatwg.org/multipage/images.html#updating-the-image-data>).
     fn load_images(&mut self) {
-        let sources: Vec<(dom::NodeId, String)> = {
+        let images: Vec<dom::NodeId> = {
             let world = self.world.borrow();
             let Some(parsed) = world.main_document() else {
                 return;
             };
             let document = parsed.dom.document();
-            let Ok(images) = parsed.dom.select_all(document, "img[src]") else {
-                return;
-            };
-            images
-                .into_iter()
-                .filter_map(|image| parsed.dom.attribute(image, "src").map(|src| (image, src)))
-                .collect()
+            parsed
+                .dom
+                .select_all(document, "img[src]")
+                .unwrap_or_default()
+        };
+        for element in images {
+            self.queue_image(element, false);
+        }
+    }
+
+    fn image_generation(&self, element: dom::NodeId) -> u64 {
+        self.image_generations.get(&element).copied().unwrap_or(0)
+    }
+
+    fn bump_image_generation(&mut self, element: dom::NodeId) -> u64 {
+        let generation = self.image_generations.entry(element).or_insert(0);
+        *generation = generation.wrapping_add(1);
+        *generation
+    }
+
+    /// Starts or replaces the fetch for one `<img>`.
+    ///
+    /// `force` is a `src` mutation: a connected insert skips work when a fetch
+    /// or decoded image is already current.
+    pub(in crate::document) fn queue_image(&mut self, element: dom::NodeId, force: bool) {
+        if !force
+            && (self.in_flight_images.contains(&element)
+                || self.world.borrow().images.contains_key(&element))
+        {
+            return;
+        }
+        let generation = self.bump_image_generation(element);
+        self.in_flight_images.insert(element);
+        self.world.borrow_mut().forget_image(element);
+        let src = self.world.borrow().document(element).and_then(|parsed| {
+            parsed
+                .dom
+                .is_img_element(element)
+                .then(|| parsed.dom.attribute(element, "src"))
+                .flatten()
+        });
+        let Some(src) = src.filter(|src| !src.is_empty()) else {
+            self.in_flight_images.remove(&element);
+            self.fire_js(|js| js.fire_node_error(element));
+            return;
+        };
+        let Ok(url) = self.resolve_dial_url(&src) else {
+            self.in_flight_images.remove(&element);
+            self.fire_js(|js| js.fire_node_error(element));
+            return;
         };
         let initiator = self.url.clone();
-        for (element, src) in sources {
-            let Ok(url) = self.resolve_dial_url(&src) else {
-                continue;
-            };
-            self.queued_dials.push(QueuedDial {
-                context: DialContext::Image {
-                    element,
-                    epoch: self.js_epoch,
-                },
-                url,
-                initiator: initiator.clone(),
-            });
-            self.pending_images = self.pending_images.saturating_add(1);
-        }
-        if self.pending_images > 0 {
-            self.launch_queued_dials();
-        }
+        self.queued_dials.push(QueuedDial {
+            context: DialContext::Image {
+                element,
+                epoch: self.js_epoch,
+                generation,
+            },
+            url,
+            initiator,
+        });
+        self.pending_images = self.pending_images.saturating_add(1);
+        self.launch_queued_dials();
     }
 
     /// The loaded CSS of one `<link rel=stylesheet>`, if it arrived.

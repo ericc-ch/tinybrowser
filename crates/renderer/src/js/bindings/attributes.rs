@@ -907,6 +907,8 @@ fn compile_handler_attribute(ctx: &Ctx<'_>, element: NodeId, typ: &str) -> Resul
 /// After an attribute change, runs the element's attribute-change hooks: an
 /// `iframe`'s `src` drives its browsing context's navigation
 /// (<https://html.spec.whatwg.org/multipage/iframe-embed-object.html#process-the-iframe-attributes>),
+/// an `<img>` `src` updates the image data
+/// (<https://html.spec.whatwg.org/multipage/images.html#updating-the-image-data>),
 /// and an event handler content attribute compiles into its handler property
 /// (<https://html.spec.whatwg.org/multipage/webappapis.html#event-handler-content-attributes>).
 pub(crate) fn after_attribute_change(ctx: &Ctx<'_>, element: NodeId, local: &str) -> Result<()> {
@@ -922,7 +924,8 @@ pub(crate) fn after_attribute_change(ctx: &Ctx<'_>, element: NodeId, local: &str
         return Ok(());
     }
     let is_iframe = with_node_kind(ctx, element, |kind| is_html_element(kind, "iframe"))?;
-    if !is_iframe {
+    let is_img = with_node_kind(ctx, element, |kind| is_html_element(kind, "img"))?;
+    if !is_iframe && !is_img {
         return Ok(());
     }
     let world = world(ctx)?;
@@ -932,16 +935,23 @@ pub(crate) fn after_attribute_change(ctx: &Ctx<'_>, element: NodeId, local: &str
         .and_then(|parsed| parsed.dom.attribute(element, "src"))
         .unwrap_or_default();
     // A detached `iframe` has no browsing context yet; insertion reads the
-    // current attribute, so queueing here would navigate it twice.
+    // current attribute, so queueing here would navigate it twice. The same
+    // is true of `<img>`: connection starts the fetch.
     let connected = world
         .borrow()
         .document(element)
         .is_some_and(|parsed| parsed.dom.is_connected(element));
-    if connected {
+    if !connected {
+        return Ok(());
+    }
+    if is_iframe {
         world.borrow_mut().queue_frame_navigation(FrameNavigation {
             container: element,
             spec,
         });
+    } else {
+        world.borrow_mut().forget_image(element);
+        world.borrow_mut().queue_image_update(element);
     }
     Ok(())
 }

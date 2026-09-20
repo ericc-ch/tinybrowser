@@ -12,7 +12,7 @@
 
 use tiny_skia::{
     Color as SkiaColor, FillRule, FilterQuality, Mask, Paint, Path, PathBuilder, Pixmap,
-    PixmapPaint, PixmapRef, Rect as SkiaRect, Stroke, Transform,
+    PixmapPaint, PixmapRef, Rect as SkiaRect, Transform,
 };
 
 use skrifa::GlyphId;
@@ -126,8 +126,14 @@ impl Painter {
         self.fill_vector_path(&path, color, Transform::identity());
     }
 
-    /// Strokes a rounded rectangle for a uniform border.
-    pub(crate) fn stroke_rounded_rect(
+    /// Fills a rounded border ring whose outer edge is the border box.
+    ///
+    /// CSS paints the border inside the border box. A centered stroke would
+    /// sit half outside that box, and a radius smaller than half the width
+    /// would miter. Even-odd fill of the outer path minus an inner path inset
+    /// by the full width keeps the outer edge on the box
+    /// (<https://drafts.csswg.org/css-backgrounds-3/#border-radius>).
+    pub(crate) fn fill_rounded_border(
         &mut self,
         rect: Rect,
         radii: [f32; 4],
@@ -137,20 +143,16 @@ impl Painter {
         if width <= 0.0 || self.visible(rect).is_none() {
             return;
         }
-        let Some(path) = rounded_rect_path(rect, radii) else {
+        let Some(path) = rounded_border_ring(rect, radii, width) else {
             return;
         };
         let mut paint = Paint::default();
         paint.set_color(SkiaColor::from_rgba8(color.r, color.g, color.b, color.a));
         paint.anti_alias = true;
-        let stroke = Stroke {
-            width,
-            ..Stroke::default()
-        };
-        self.pixmap.stroke_path(
+        self.pixmap.fill_path(
             &path,
             &paint,
-            &stroke,
+            FillRule::EvenOdd,
             Transform::identity(),
             self.mask.as_ref(),
         );
@@ -298,7 +300,34 @@ fn clip_path(rect: Rect, radii: [f32; 4]) -> Option<Path> {
 
 /// Builds a clockwise rounded rectangle. CSS scales overlarge radii down so
 /// adjacent corners never overlap.
-fn rounded_rect_path(rect: Rect, mut radii: [f32; 4]) -> Option<Path> {
+fn rounded_rect_path(rect: Rect, radii: [f32; 4]) -> Option<Path> {
+    let mut path = PathBuilder::new();
+    append_rounded_rect(&mut path, rect, radii, true)?;
+    path.finish()
+}
+
+fn rounded_border_ring(rect: Rect, radii: [f32; 4], width: f32) -> Option<Path> {
+    let mut path = PathBuilder::new();
+    append_rounded_rect(&mut path, rect, radii, true)?;
+    let inner = Rect::new(
+        rect.x + width,
+        rect.y + width,
+        rect.width - width * 2.0,
+        rect.height - width * 2.0,
+    );
+    if !inner.is_empty() {
+        let inner_radii = radii.map(|radius| (radius - width).max(0.0));
+        append_rounded_rect(&mut path, inner, inner_radii, false)?;
+    }
+    path.finish()
+}
+
+fn append_rounded_rect(
+    path: &mut PathBuilder,
+    rect: Rect,
+    mut radii: [f32; 4],
+    clockwise: bool,
+) -> Option<()> {
     if rect.is_empty() {
         return None;
     }
@@ -307,23 +336,39 @@ fn rounded_rect_path(rect: Rect, mut radii: [f32; 4]) -> Option<Path> {
         *radius = radius.clamp(0.0, max);
     }
     let [top_left, top_right, bottom_right, bottom_left] = radii;
-    let mut path = PathBuilder::new();
-    path.move_to(rect.x + top_left, rect.y);
-    path.line_to(rect.right() - top_right, rect.y);
-    path.quad_to(rect.right(), rect.y, rect.right(), rect.y + top_right);
-    path.line_to(rect.right(), rect.bottom() - bottom_right);
-    path.quad_to(
-        rect.right(),
-        rect.bottom(),
-        rect.right() - bottom_right,
-        rect.bottom(),
-    );
-    path.line_to(rect.x + bottom_left, rect.bottom());
-    path.quad_to(rect.x, rect.bottom(), rect.x, rect.bottom() - bottom_left);
-    path.line_to(rect.x, rect.y + top_left);
-    path.quad_to(rect.x, rect.y, rect.x + top_left, rect.y);
+    if clockwise {
+        path.move_to(rect.x + top_left, rect.y);
+        path.line_to(rect.right() - top_right, rect.y);
+        path.quad_to(rect.right(), rect.y, rect.right(), rect.y + top_right);
+        path.line_to(rect.right(), rect.bottom() - bottom_right);
+        path.quad_to(
+            rect.right(),
+            rect.bottom(),
+            rect.right() - bottom_right,
+            rect.bottom(),
+        );
+        path.line_to(rect.x + bottom_left, rect.bottom());
+        path.quad_to(rect.x, rect.bottom(), rect.x, rect.bottom() - bottom_left);
+        path.line_to(rect.x, rect.y + top_left);
+        path.quad_to(rect.x, rect.y, rect.x + top_left, rect.y);
+    } else {
+        path.move_to(rect.x + top_left, rect.y);
+        path.quad_to(rect.x, rect.y, rect.x, rect.y + top_left);
+        path.line_to(rect.x, rect.bottom() - bottom_left);
+        path.quad_to(rect.x, rect.bottom(), rect.x + bottom_left, rect.bottom());
+        path.line_to(rect.right() - bottom_right, rect.bottom());
+        path.quad_to(
+            rect.right(),
+            rect.bottom(),
+            rect.right(),
+            rect.bottom() - bottom_right,
+        );
+        path.line_to(rect.right(), rect.y + top_right);
+        path.quad_to(rect.right(), rect.y, rect.right() - top_right, rect.y);
+        path.line_to(rect.x + top_left, rect.y);
+    }
     path.close();
-    path.finish()
+    Some(())
 }
 
 /// Collects one glyph outline into a `tiny-skia` path, flipping font
@@ -380,5 +425,40 @@ impl OutlinePen for PathPen {
 
     fn close(&mut self) {
         self.builder.close();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rounded_border_stays_inside_the_border_box() {
+        let mut painter = Painter::new(20, 20).expect("painter");
+        painter.fill_rounded_border(
+            Rect::new(0.0, 0.0, 20.0, 20.0),
+            [2.0; 4],
+            4.0,
+            Color::rgb(255, 0, 0),
+        );
+        let data = painter.pixmap.data();
+        let pixel = |x: u32, y: u32| {
+            let index = ((y * 20 + x) * 4) as usize;
+            [
+                data[index],
+                data[index + 1],
+                data[index + 2],
+                data[index + 3],
+            ]
+        };
+        // Outer edge of the border box is painted.
+        assert!(pixel(10, 0)[0] > 200, "top edge is inside the border box");
+        // Center is the canvas, not a centered stroke filling the box.
+        assert_eq!(pixel(10, 10), [255, 255, 255, 255]);
+        // A 4px border must not paint outside x=20.
+        assert!(
+            pixel(19, 10)[0] > 200,
+            "right edge is inside the border box"
+        );
     }
 }

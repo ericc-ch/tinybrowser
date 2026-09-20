@@ -548,29 +548,40 @@ impl Engine {
         for (parent, event) in events {
             match event {
                 dom::Lifecycle::Inserted(container) => {
-                    if self
-                        .runtime
-                        .shared
-                        .borrow()
-                        .tree
-                        .frame_for_container(container)
-                        .is_some()
-                    {
-                        continue;
-                    }
-                    if self.runtime.shared.borrow().tree.len() >= MAX_FRAMES {
-                        continue;
-                    }
-                    let child = self.create_frame(parent, container);
-                    let src = self
+                    let is_iframe = self
                         .frames
                         .get(&parent)
-                        .and_then(|document| document.frame_src(container));
-                    self.navigate_frame(child, container, src.as_deref().unwrap_or(""));
-                    self.publish_frame_document(container, child);
+                        .is_some_and(|document| document.is_iframe_element(container));
+                    if is_iframe {
+                        if self
+                            .runtime
+                            .shared
+                            .borrow()
+                            .tree
+                            .frame_for_container(container)
+                            .is_some()
+                        {
+                            continue;
+                        }
+                        if self.runtime.shared.borrow().tree.len() >= MAX_FRAMES {
+                            continue;
+                        }
+                        let child = self.create_frame(parent, container);
+                        let src = self
+                            .frames
+                            .get(&parent)
+                            .and_then(|document| document.frame_src(container));
+                        self.navigate_frame(child, container, src.as_deref().unwrap_or(""));
+                        self.publish_frame_document(container, child);
+                    } else if let Some(document) = self.frames.get_mut(&parent) {
+                        document.queue_connected_image(container);
+                    }
                 }
                 dom::Lifecycle::Removed(container) => {
                     self.remove_subtree(container);
+                    if let Some(document) = self.frames.get_mut(&parent) {
+                        document.disconnect_image(container);
+                    }
                 }
             }
         }

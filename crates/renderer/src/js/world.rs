@@ -48,10 +48,13 @@ impl RealmRegistry {
 struct ResourceBudget {
     pending_stream_bytes: usize,
     object_url_bytes: usize,
+    decoded_images: usize,
 }
 
 const MAX_PENDING_STREAM_BYTES: usize = 8 * 1024 * 1024;
 const MAX_OBJECT_URL_BYTES: usize = 8 * 1024 * 1024;
+/// Aggregate retained decoded image pixels across every realm in this renderer.
+const MAX_DECODED_IMAGE_BYTES: usize = 32 * 1024 * 1024;
 
 impl RealmRegistry {
     /// Remembers that `world` owns the document `id`.
@@ -286,6 +289,8 @@ pub(crate) struct World {
     pub pending_cancels: Vec<i32>,
     pub pending_html_writes: Vec<String>,
     frame_navigations: Vec<FrameNavigation>,
+    /// Connected `<img>` elements whose `src` changed inside script.
+    image_updates: Vec<NodeId>,
     document_stream: Vec<DocumentStreamCommand>,
     object_urls: HashMap<String, ObjectUrlEntry>,
     budget: Rc<RefCell<ResourceBudget>>,
@@ -369,8 +374,14 @@ impl Drop for World {
             .values()
             .map(|entry| entry.contents.len() + entry.content_type.len())
             .sum::<usize>();
+        let image_bytes = self
+            .images
+            .values()
+            .map(|image| image.data.len())
+            .sum::<usize>();
         let mut budget = self.budget.borrow_mut();
         budget.object_url_bytes = budget.object_url_bytes.saturating_sub(object_bytes);
+        budget.decoded_images = budget.decoded_images.saturating_sub(image_bytes);
         let stream_bytes = self
             .document_stream
             .iter()
@@ -397,6 +408,7 @@ impl World {
             pending_cancels: Vec::new(),
             pending_html_writes: Vec::new(),
             frame_navigations: Vec::new(),
+            image_updates: Vec::new(),
             document_stream: Vec::new(),
             object_urls: HashMap::new(),
             budget: runtime.registry.borrow().budget(),
@@ -518,6 +530,8 @@ impl World {
         self.active_elements.clear();
         self.clear_attributes();
         self.frame_navigations.clear();
+        self.image_updates.clear();
+        self.clear_images();
         self.remote_ids.clear();
         self.remote_nodes.clear();
         // Navigation replaces the document's element handlers with it, but the
@@ -976,6 +990,62 @@ impl World {
 
     pub(crate) fn take_frame_navigations(&mut self) -> Vec<FrameNavigation> {
         std::mem::take(&mut self.frame_navigations)
+    }
+
+    pub(crate) fn queue_image_update(&mut self, element: NodeId) {
+        self.image_updates.push(element);
+    }
+
+    pub(crate) fn take_image_updates(&mut self) -> Vec<NodeId> {
+        std::mem::take(&mut self.image_updates)
+    }
+
+    /// Retains `image` if the shared decoded-image budget still has room.
+    pub(crate) fn store_image(
+        &mut self,
+        element: NodeId,
+        image: crate::render::RasterImage,
+    ) -> bool {
+        self.forget_image(element);
+        let bytes = image.data.len();
+        if !self.reserve_decoded_image_bytes(bytes) {
+            return false;
+        }
+        self.images.insert(element, image);
+        true
+    }
+
+    pub(crate) fn forget_image(&mut self, element: NodeId) {
+        if let Some(image) = self.images.remove(&element) {
+            self.release_decoded_image_bytes(image.data.len());
+        }
+    }
+
+    pub(crate) fn clear_images(&mut self) {
+        let bytes = self
+            .images
+            .values()
+            .map(|image| image.data.len())
+            .sum::<usize>();
+        self.images.clear();
+        self.release_decoded_image_bytes(bytes);
+    }
+
+    fn reserve_decoded_image_bytes(&self, bytes: usize) -> bool {
+        let mut budget = self.budget.borrow_mut();
+        let Some(total) = budget.decoded_images.checked_add(bytes) else {
+            return false;
+        };
+        if total > MAX_DECODED_IMAGE_BYTES {
+            return false;
+        }
+        budget.decoded_images = total;
+        true
+    }
+
+    fn release_decoded_image_bytes(&self, bytes: usize) {
+        let mut budget = self.budget.borrow_mut();
+        budget.decoded_images = budget.decoded_images.saturating_sub(bytes);
     }
 
     pub(crate) fn queue_document_stream(

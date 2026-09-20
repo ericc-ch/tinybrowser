@@ -218,7 +218,7 @@ fn paint_border(
         && border.top == border.bottom
         && border.top == border.left;
     if uniform_rounded {
-        painter.stroke_rounded_rect(rect, radii, border.top.width, border.top.color);
+        painter.fill_rounded_border(rect, radii, border.top.width, border.top.color);
         return;
     }
     if border.top.paints() {

@@ -203,6 +203,10 @@ impl Document {
                 self.settle_js_fetch(fetch.js_id, false, 0, "");
             }
         }
+        let images = self.world.borrow_mut().take_image_updates();
+        for element in images {
+            self.queue_image(element, true);
+        }
     }
 
     fn due_timer(&mut self) -> Option<u32> {

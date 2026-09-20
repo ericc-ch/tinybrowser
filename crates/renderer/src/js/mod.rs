@@ -326,6 +326,15 @@ impl JsRealm {
         })
     }
 
+    pub(crate) fn fire_node_error(&self, id: dom::NodeId) -> Result<(), JsError> {
+        self.with_budget(None, || {
+            self.context.with(|ctx| {
+                bindings::fire_node_error(&ctx, id)?;
+                Ok(())
+            })
+        })
+    }
+
     /// Decodes and dispatches one posted window message in this realm.
     ///
     /// Returns `false` when the payload cannot be decoded, which the engine
