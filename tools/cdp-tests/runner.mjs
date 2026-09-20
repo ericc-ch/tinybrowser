@@ -166,7 +166,7 @@ function selectTests(tests, options) {
   if (options.all && options.patterns.length === 0) return tests;
   const patterns = options.patterns.length ? options.patterns : passingTests();
   if (patterns.length === 0) {
-    throw new Error("tools/cdp/passing.txt is empty; use --all or provide a path pattern");
+    throw new Error("tools/cdp-tests/passing.txt is empty; use --all or provide a path pattern");
   }
   const matchers = patterns.map(globPattern);
   const selected = tests.filter((test) => matchers.some((matcher) => matcher.test(test.id)));
@@ -308,7 +308,7 @@ async function main() {
   }
 
   const binary = process.env.TINYBROWSER_BIN;
-  if (!binary) throw new Error("TINYBROWSER_BIN is not set; run ./tools/cdp/run");
+  if (!binary) throw new Error("TINYBROWSER_BIN is not set; run ./tools/cdp-tests/run");
   console.log(`Running ${selected.length} of ${tests.length} Blink CDP tests using ${options.jobs} worker(s)`);
   const temporaryRoot = join(ROOT, "target/cdp-tmp");
   runTemporaryRoot = temporaryRoot;

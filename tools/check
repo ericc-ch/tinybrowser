@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
-# Workspace checks: clippy, Miri, Valgrind.
+# Workspace checks: clippy, embedded JS syntax, Miri, Valgrind.
 #
 #   clippy    stable shell. The workspace lints: `unsafe_code = deny`,
 #            `unsafe_op_in_unsafe_fn = deny`, and the clippy UB set
 #            (undocumented_unsafe_blocks, multiple_unsafe_ops_per_block,
 #            unnecessary_safety_comment, not_unsafe_ptr_arg_deref, pointer
 #            casts, mem_forget) plus pedantic/all/cargo. Always run this.
+#   js       stable shell. `node --check` on JavaScript `include_str!`'d
+#            into the renderer. Those files never pass through a JS toolchain.
 #   miri     nightly shell. Miri over pure-Rust crates. It CANNOT execute
 #            FFI, so crates linking rquickjs or native-tls are excluded; put
 #            unsafe logic in a pure-Rust module with tests to get Miri
@@ -17,10 +19,11 @@
 #            uninitialized reads across the FFI boundary but does NOT model
 #            Rust aliasing rules (Miri does), and it is slow.
 #
-# AddressSanitizer is not wired: `-Zsanitizer=address` makes rustc reject the
-# sanitizer-built rquickjs-macro proc-macro artifacts ("can't find crate"),
-# and neither `-Ztarget-applies-to-host` nor a separate host config fixed it.
-# Valgrind covers the same C-side ground until that is solved.
+# With no subcommand, clippy then js. AddressSanitizer is not wired:
+# `-Zsanitizer=address` makes rustc reject the sanitizer-built rquickjs-macro
+# proc-macro artifacts ("can't find crate"), and neither
+# `-Ztarget-applies-to-host` nor a separate host config fixed it. Valgrind
+# covers the same C-side ground until that is solved.
 #
 # Miri and Valgrind are not proofs: they falsify. The written `// SAFETY:`
 # invariant plus review is what the AGENTS.md exception requires.
@@ -36,7 +39,7 @@ miri_crates=(logging)
 # empty-document smokes). Not the full QuickJS renderer suite.
 
 usage() {
-  echo "usage: tools/check [clippy|miri [crate...]|valgrind [crate...]]" >&2
+  echo "usage: tools/check [clippy|js|miri [crate...]|valgrind [crate...]]" >&2
   exit 2
 }
 
@@ -49,15 +52,47 @@ crate_args() {
   printf '%s\n' "${args[@]}"
 }
 
+run_clippy() {
+  nix develop --command cargo clippy --workspace --all-targets -- -D warnings
+}
+
+run_js() {
+  if ! command -v node >/dev/null 2>&1; then
+    echo "node is required to check the embedded JavaScript (nix develop)" >&2
+    exit 1
+  fi
+  local checked=0 status=0 file output
+  while IFS= read -r -d '' file; do
+    checked=$((checked + 1))
+    if ! output="$(node --check "$file" 2>&1)"; then
+      printf '%s\n' "$output" >&2
+      status=1
+    fi
+  done < <(find crates/renderer/src/js -name '*.js' -print0)
+  if [[ "$checked" -eq 0 ]]; then
+    echo "no embedded JavaScript found under crates/renderer/src/js" >&2
+    exit 1
+  fi
+  echo "js: checked $checked files"
+  return "$status"
+}
+
 valgrind_test() {
   nix develop .#check --command env \
     CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER="valgrind --error-exitcode=1 --track-origins=yes" \
     cargo test --target x86_64-unknown-linux-gnu "$@"
 }
 
-case "${1:-clippy}" in
+case "${1:-}" in
+  "")
+    run_clippy
+    run_js
+    ;;
   clippy)
-    exec nix develop --command cargo clippy --workspace --all-targets -- -D warnings
+    run_clippy
+    ;;
+  js)
+    run_js
     ;;
   miri)
     shift
