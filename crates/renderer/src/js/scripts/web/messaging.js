@@ -565,12 +565,6 @@ const __tbFrameProxy = frame => {
       throw error;
     }
   };
-  // Methods taken off the target window must run with that window as `this`.
-  // A raw `sameOrigin[property]` call would bind `this` to the proxy object,
-  // so `contentWindow.addEventListener` would not hear events dispatched on
-  // the frame's window
-  // (<https://html.spec.whatwg.org/multipage/window-object.html#windowproxy-get>).
-  const methods = Object.create(null);
   const handler = {
     get(target, property) {
       if (property === __tbWindowProxyData) return { frame: frame };
@@ -602,19 +596,7 @@ const __tbFrameProxy = frame => {
         }
         crossOrigin();
       }
-      const value = sameOrigin[property];
-      if (typeof value !== 'function' || typeof property === 'symbol') {
-        return value;
-      }
-      if (methods[property] === undefined) {
-        const name = property;
-        methods[name] = function(...args) {
-          const global = __tbFrameGlobal(frame);
-          if (global == null) crossOrigin();
-          return global[name](...args);
-        };
-      }
-      return methods[property];
+      return sameOrigin[property];
     },
     set(target, property, value) {
       const sameOrigin = __tbFrameGlobal(frame);

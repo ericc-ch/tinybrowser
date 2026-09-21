@@ -1096,8 +1096,11 @@ fn spawn_transport(command: &mut Command) -> io::Result<SpawnedRenderer> {
     })
 }
 
-/// Registers reliable browser-to-renderer notifications. Queue saturation
-/// disconnects the renderer rather than silently losing observable events.
+/// Registers browser-to-renderer notifications. A saturated command inbox
+/// drops storage and broadcast notices instead of disconnecting the renderer;
+/// the renderer may be blocked in a synchronous service call, and losing an
+/// observable event is better than killing the page. A closed client removes
+/// the subscription and stops the renderer.
 fn subscribe_renderer_events(
     partition: &PartitionServices,
     client: &RendererClient,
@@ -1108,7 +1111,6 @@ fn subscribe_renderer_events(
     partition.events.subscribe(Box::new(move |event| {
         let notice = match event {
             ContextEvent::Storage(event) => HostNotice::StorageEvent {
-                target: None,
                 origin: event.origin.clone(),
                 kind: event.kind,
                 key: event.key.clone(),

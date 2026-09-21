@@ -112,9 +112,6 @@ pub enum HostNotice {
     /// `origin` except the source window fires a `storage` event
     /// (<https://html.spec.whatwg.org/multipage/webstorage.html#concept-storage-broadcast>).
     StorageEvent {
-        /// Assignment receiving a session-storage event; `None` broadcasts a
-        /// local-storage event to every assignment.
-        target: Option<RendererAssignmentId>,
         /// Serialized origin whose area changed.
         origin: String,
         /// Which area changed.
@@ -427,7 +424,6 @@ mod tests {
                 }))),
             },
             Frame::Notify(HostNotice::StorageEvent {
-                target: None,
                 origin: "http://example.test".into(),
                 kind: StorageKind::Local,
                 key: Some("k".into()),

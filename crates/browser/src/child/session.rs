@@ -140,7 +140,6 @@ fn handle_host(
             }
         }
         Some(Frame::Notify(HostNotice::StorageEvent {
-            target,
             origin,
             kind,
             key,
@@ -154,7 +153,6 @@ fn handle_host(
                 &renderer::PendingStorageEvent::broadcast(
                     origin, kind, key, old_value, new_value, url,
                 ),
-                target,
                 source,
             );
             true
@@ -277,13 +275,9 @@ fn queue_broadcast_message(
 fn queue_storage_event(
     engines: &mut HashMap<RendererAssignmentId, Engine>,
     event: &renderer::PendingStorageEvent,
-    target: Option<RendererAssignmentId>,
     source: Option<(RendererAssignmentId, FrameId)>,
 ) {
     for (assignment, engine) in engines {
-        if target.is_some_and(|target| target != *assignment) {
-            continue;
-        }
         let mut event = event.clone();
         event.source = source.and_then(|(source_assignment, frame)| {
             (source_assignment == *assignment).then_some(frame)

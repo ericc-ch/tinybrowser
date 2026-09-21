@@ -384,12 +384,7 @@ impl Engine {
                 }
             }
             if !ran {
-                // A `storage` broadcast queued during this turn still needs a
-                // task on every other same-origin frame
-                // (<https://html.spec.whatwg.org/multipage/webstorage.html#concept-storage-broadcast>).
-                if self.runtime.pending_storage.borrow().is_empty() {
-                    break;
-                }
+                break;
             }
         }
     }

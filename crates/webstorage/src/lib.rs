@@ -31,21 +31,6 @@ pub struct StorageArea {
 }
 
 impl StorageArea {
-    /// Builds an area from entries in iteration order. A later duplicate value
-    /// replaces the earlier value without changing the key's position.
-    #[must_use]
-    pub fn from_entries(entries: impl IntoIterator<Item = (String, String)>) -> Self {
-        let mut area = Self::default();
-        for (key, value) in entries {
-            if let Some((_, stored)) = area.entries.iter_mut().find(|(stored, _)| stored == &key) {
-                *stored = value;
-            } else {
-                area.entries.push((key, value));
-            }
-        }
-        area
-    }
-
     /// Returns the value stored under `key`
     /// (<https://html.spec.whatwg.org/multipage/webstorage.html#dom-storage-getitem>).
     #[must_use]
@@ -128,11 +113,5 @@ impl StorageArea {
             old_value: None,
             new_value: None,
         })
-    }
-
-    /// Whether this area has no entries.
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
     }
 }

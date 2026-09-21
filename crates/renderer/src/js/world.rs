@@ -953,6 +953,9 @@ impl World {
         }
     }
 
+    /// Queues the event for a change this engine made. Only `sessionStorage`
+    /// needs it: `localStorage` changes return as a browser broadcast, which
+    /// excludes the source frame.
     fn queue_storage_event(&self, kind: StorageKind, origin: &str, change: &StorageChange) {
         if kind != StorageKind::Session {
             return;
