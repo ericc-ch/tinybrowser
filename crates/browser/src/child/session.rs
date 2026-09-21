@@ -4,7 +4,7 @@
 //! completion, or a message from the browser. Commands become engine calls;
 //! engine events and replies become wire messages.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -82,7 +82,7 @@ fn handle_host(
             assign_engine(engines, assignment, services, stop, wake)
         }
         Some(Frame::Notify(HostNotice::Release { assignment })) => {
-            responses.release(assignment);
+            responses.release(assignment, engines);
             if let Some(mut engine) = engines.remove(&assignment) {
                 engine.release();
             }
@@ -101,18 +101,34 @@ fn handle_host(
             body: RendererCall::Response { response },
         }) => {
             let Some(engine) = engines.get_mut(&response.assignment) else {
-                return false;
+                return true;
             };
-            responses.start(id, &response, engine).is_ok()
+            match responses.start(id, &response, engine) {
+                Ok(()) => true,
+                Err(error) => reply_result(outbox, id, (response.assignment, Err(error))),
+            }
         }
-        Some(Frame::RequestChunk { id, bytes }) => responses.push(id, &bytes, engines).is_ok(),
+        Some(Frame::RequestChunk { id, bytes }) => match responses.push(id, &bytes, engines) {
+            Ok(()) => true,
+            Err((assignment, error)) => reply_result(outbox, id, (assignment, Err(error))),
+        },
         Some(Frame::RequestEnd { id, error: None }) => {
-            reply_result(outbox, id, responses.finish(id, engines))
+            if responses.is_cancelled(id) {
+                true
+            } else {
+                reply_result(outbox, id, responses.finish(id, engines))
+            }
         }
         Some(Frame::RequestEnd {
             id,
             error: Some(error),
-        }) => reply_result(outbox, id, responses.abort(id, &error, engines)),
+        }) => {
+            if responses.is_cancelled(id) {
+                true
+            } else {
+                reply_result(outbox, id, responses.abort(id, &error, engines))
+            }
+        }
         Some(Frame::Notify(HostNotice::StorageEvent {
             origin,
             kind,
@@ -144,8 +160,12 @@ fn handle_host(
             responses.cancel(id, engines);
             true
         }
-        Some(Frame::Notify(HostNotice::Hello) | Frame::Reply { .. }) => true,
-        Some(Frame::Notify(HostNotice::Shutdown) | Frame::ResponseChunk { .. }) | None => false,
+        Some(
+            Frame::Notify(HostNotice::Hello | HostNotice::Shutdown)
+            | Frame::Reply { .. }
+            | Frame::ResponseChunk { .. },
+        )
+        | None => false,
     }
 }
 
@@ -158,7 +178,23 @@ fn handle_request(
     command: Command,
 ) -> bool {
     let Some(engine) = engines.get_mut(&assignment) else {
-        return false;
+        let reply = match command {
+            Command::ExecuteScript { .. } => Reply::Value(Err(stream_error("unknown assignment"))),
+            Command::Screenshot { .. } => Reply::Screenshot {
+                result: Err(stream_error("unknown assignment")),
+            },
+            Command::RemoteSessionGet { .. } => Reply::Optional(None),
+            Command::WindowMessage { .. } | Command::SeedSession { .. } => {
+                Reply::Unit(Err(stream_error("unknown assignment")))
+            }
+        };
+        return send_to_browser(
+            outbox,
+            Frame::Reply {
+                id,
+                body: RendererReply { assignment, reply },
+            },
+        );
     };
     match handle_command(engine, command) {
         Handled::Reply(reply) => send_to_browser(
@@ -267,16 +303,26 @@ struct ActiveResponse {
 
 /// Streamed responses in flight, keyed by request id.
 #[derive(Default)]
-struct ResponseStreams(HashMap<RequestId, ActiveResponse>);
+struct ResponseStreams {
+    active: HashMap<RequestId, ActiveResponse>,
+    cancelled: HashSet<RequestId>,
+}
 
 impl ResponseStreams {
+    fn is_cancelled(&self, id: RequestId) -> bool {
+        self.cancelled.contains(&id)
+    }
+
     fn start(
         &mut self,
         id: RequestId,
         response: &ResponseStart,
         engine: &mut Engine,
     ) -> Result<(), TabError> {
-        if self.0.contains_key(&id) {
+        if self.cancelled.contains(&id) {
+            return Ok(());
+        }
+        if self.active.contains_key(&id) {
             return Err(stream_error("duplicate response start"));
         }
         let url = Url::parse(&response.final_url).ok();
@@ -286,7 +332,7 @@ impl ResponseStreams {
             response.content_type.as_deref(),
             response.content_language.as_deref(),
         )?;
-        self.0.insert(
+        self.active.insert(
             id,
             ActiveResponse {
                 assignment: response.assignment,
@@ -302,19 +348,35 @@ impl ResponseStreams {
         id: RequestId,
         bytes: &[u8],
         engines: &mut HashMap<RendererAssignmentId, Engine>,
-    ) -> Result<(), TabError> {
-        let response = self
-            .0
-            .get_mut(&id)
-            .ok_or_else(|| stream_error("body frame without response start"))?;
+    ) -> Result<(), (RendererAssignmentId, TabError)> {
+        if self.cancelled.contains(&id) {
+            return Ok(());
+        }
+        let Some(response) = self.active.get_mut(&id) else {
+            return Ok(());
+        };
         response.bytes = response.bytes.saturating_add(bytes.len());
         if response.bytes > MAX_RESPONSE_BODY_BYTES {
-            return Err(stream_error("streamed response exceeds body limit"));
+            let assignment = response.assignment;
+            let frame = response.frame;
+            self.active.remove(&id);
+            self.cancelled.insert(id);
+            if let Some(engine) = engines.get_mut(&assignment) {
+                let _result = engine.abort_body(frame);
+            }
+            return Err((
+                assignment,
+                stream_error("streamed response exceeds body limit"),
+            ));
         }
-        engines
-            .get_mut(&response.assignment)
-            .ok_or_else(|| stream_error("response assignment is gone"))?
-            .write_body(response.frame, bytes)
+        let assignment = response.assignment;
+        let frame = response.frame;
+        match engines.get_mut(&assignment) {
+            Some(engine) => engine
+                .write_body(frame, bytes)
+                .map_err(|error| (assignment, error)),
+            None => Err((assignment, stream_error("response assignment is gone"))),
+        }
     }
 
     fn finish(
@@ -342,8 +404,6 @@ impl ResponseStreams {
             Ok(response) => response,
             Err((assignment, error)) => return (assignment, Err(error)),
         };
-        // Stop the frame's parser, or it waits for bytes that will never come
-        // and the tab stays loading forever.
         if let Ok(engine) = engine_mut(engines, response.assignment) {
             let _ = engine.abort_body(response.frame);
         }
@@ -356,12 +416,12 @@ impl ResponseStreams {
     }
 
     fn cancel(&mut self, id: RequestId, engines: &mut HashMap<RendererAssignmentId, Engine>) {
-        let Some(response) = self.0.remove(&id) else {
-            return;
-        };
-        if let Some(engine) = engines.get_mut(&response.assignment) {
+        if let Some(response) = self.active.remove(&id)
+            && let Some(engine) = engines.get_mut(&response.assignment)
+        {
             let _result = engine.abort_body(response.frame);
         }
+        self.cancelled.insert(id);
     }
 
     /// Removes the stream for `id`, defaulting the assignment when the browser
@@ -371,14 +431,29 @@ impl ResponseStreams {
         id: RequestId,
         missing_start: &str,
     ) -> Result<ActiveResponse, (RendererAssignmentId, TabError)> {
-        self.0
+        self.active
             .remove(&id)
             .ok_or_else(|| (RendererAssignmentId::new(0), stream_error(missing_start)))
     }
 
-    fn release(&mut self, assignment: RendererAssignmentId) {
-        self.0
-            .retain(|_, response| response.assignment != assignment);
+    fn release(
+        &mut self,
+        assignment: RendererAssignmentId,
+        engines: &mut HashMap<RendererAssignmentId, Engine>,
+    ) {
+        let stale: Vec<_> = self
+            .active
+            .iter()
+            .filter(|(_, response)| response.assignment == assignment)
+            .map(|(&id, response)| (id, response.frame))
+            .collect();
+        for (id, frame) in stale {
+            self.active.remove(&id);
+            self.cancelled.insert(id);
+            if let Some(engine) = engines.get_mut(&assignment) {
+                let _result = engine.abort_body(frame);
+            }
+        }
     }
 }
 
@@ -500,4 +575,28 @@ fn publish(
 
 fn send_to_browser(outbox: &exchange::BlockingSender<FromRenderer>, message: FromRenderer) -> bool {
     outbox.try_send(message).is_ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn leftover_chunks_after_cancel_are_ignored() {
+        let mut streams = ResponseStreams::default();
+        let mut engines = HashMap::new();
+        let id = RequestId::new(1);
+        streams.cancel(id, &mut engines);
+        assert!(streams.push(id, b"leftover", &mut engines).is_ok());
+        assert!(streams.is_cancelled(id));
+    }
+
+    #[test]
+    fn cancel_before_start_ignores_later_chunks() {
+        let mut streams = ResponseStreams::default();
+        let mut engines = HashMap::new();
+        let id = RequestId::new(7);
+        streams.cancel(id, &mut engines);
+        assert!(streams.push(id, b"early", &mut engines).is_ok());
+    }
 }

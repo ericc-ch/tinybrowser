@@ -3,10 +3,10 @@
 //! One private platform channel per renderer, length-prefixed frames, async
 //! reader and writer tasks, and oneshot replies. The handle stays value-only.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::process::Stdio;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 use tokio::process::Child;
@@ -36,7 +36,7 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_RENDERER_STREAM_BYTES: usize = 64 * 1024 * 1024;
 
 /// How long a `renderer` child has to send [`RendererNotice::Ready`].
-pub(crate) const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// How long teardown waits for transport tasks to finish.
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
@@ -47,7 +47,7 @@ const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 const EVENT_SUBSCRIBER_CAPACITY: usize = 4096;
 
 /// Bounded browser-to-renderer command queue.
-pub(crate) const COMMAND_CAPACITY: usize = 256;
+const COMMAND_CAPACITY: usize = 256;
 
 /// Live subscribers to one renderer's frame-tagged document events.
 type EventSubscribers =
@@ -70,9 +70,9 @@ pub(crate) struct RendererHandle {
     tasks: Mutex<Vec<JoinHandle<()>>>,
     pub(crate) site: Arc<Mutex<Option<Site>>>,
     pub(crate) assignments: AtomicUsize,
-    /// Highest released assignment id. Assignment ids increase, so any
-    /// unassigned id at or below this watermark was released, not forged.
-    released: Arc<AtomicU64>,
+    /// Assignment ids this process has released. A call for an id that was
+    /// never assigned here is a protocol violation, not a late release.
+    released: Arc<Mutex<HashSet<RendererAssignmentId>>>,
     _slot: tokio::sync::OwnedSemaphorePermit,
 }
 
@@ -200,7 +200,10 @@ impl RendererHandle {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .remove(&assignment);
-        self.released.fetch_max(assignment.get(), Ordering::Relaxed);
+        self.released
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(assignment);
         let _result = self.client.notify(HostNotice::Release { assignment }).await;
         self.assignments.fetch_sub(1, Ordering::Relaxed);
     }
@@ -374,24 +377,24 @@ impl Drop for RendererHandle {
 
 struct RendererViolation;
 
-pub(crate) struct ReaderContext {
+struct ReaderContext {
     router: RendererRouter,
-    pub(crate) alive: Arc<AtomicBool>,
+    alive: Arc<AtomicBool>,
     kill: watch::Sender<bool>,
 }
 
-pub(crate) struct ServiceContext {
+struct ServiceContext {
     responder: BrowserServiceResponder,
     subscribers: EventSubscribers,
     fetch: FetchHandle,
     site: Arc<Mutex<Option<Site>>>,
-    released: Arc<AtomicU64>,
+    released: Arc<Mutex<HashSet<RendererAssignmentId>>>,
     kill: watch::Sender<bool>,
     /// Browser command handle: renderer links create tabs for `window.open`.
     browser: crate::browser::BrowserHandle,
 }
 
-pub(crate) async fn writer_task(
+async fn writer_task(
     mut rx: exchange::Receiver<ToRenderer>,
     mut writer: Box<dyn AsyncWrite + Send + Unpin>,
     alive: Arc<AtomicBool>,
@@ -399,8 +402,12 @@ pub(crate) async fn writer_task(
     kill: watch::Sender<bool>,
     mut kill_rx: watch::Receiver<bool>,
 ) {
+    if *kill_rx.borrow() {
+        return;
+    }
     loop {
         let message = tokio::select! {
+            biased;
             message = rx.recv() => match message {
                 Some(message) => message,
                 None => return,
@@ -442,7 +449,7 @@ where
     }
 }
 
-pub(crate) async fn reader_task(
+async fn reader_task(
     mut reader: Box<dyn AsyncRead + Send + Unpin>,
     context: ReaderContext,
     ready: Option<oneshot::Sender<bool>>,
@@ -510,8 +517,8 @@ async fn service_task(mut server: BrowserServiceServer, context: ServiceContext)
                 event,
             }) => route_event(&context, assignment, frame, event),
             ServerInput::Notify(RendererNotice::Ready)
-            | ServerInput::RequestChunk
-            | ServerInput::RequestEnd
+            | ServerInput::RequestChunk { .. }
+            | ServerInput::RequestEnd { .. }
             | ServerInput::Cancel { .. } => Err(RendererViolation),
         };
         if result.is_err() {
@@ -834,8 +841,14 @@ async fn route_storage_call(
     Ok(())
 }
 
-fn was_released(released: &AtomicU64, assignment: RendererAssignmentId) -> bool {
-    assignment.get() <= released.load(Ordering::Relaxed)
+fn was_released(
+    released: &Mutex<HashSet<RendererAssignmentId>>,
+    assignment: RendererAssignmentId,
+) -> bool {
+    released
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .contains(&assignment)
 }
 
 /// Answers a late call from a released assignment so the renderer's blocking
@@ -900,7 +913,7 @@ fn fail(alive: &Arc<AtomicBool>, router: &RendererRouter, kill: &watch::Sender<b
 /// The child formats its own level and target; the browser only forwards the
 /// lines, so renderer records land in the daemon's console and file without a
 /// second file writer.
-pub(crate) async fn forward_stderr(stderr: tokio::process::ChildStderr) {
+async fn forward_stderr(stderr: tokio::process::ChildStderr) {
     let mut reader = tokio::io::BufReader::new(stderr);
     let mut bytes = Vec::new();
     loop {
@@ -1047,7 +1060,7 @@ pub(crate) async fn spawn_process(
         kill_rx.clone(),
     ));
     let site = Arc::new(Mutex::new(site));
-    let released = Arc::new(AtomicU64::new(0));
+    let released = Arc::new(Mutex::new(HashSet::new()));
     let reader_context = ReaderContext {
         router: router.clone(),
         alive: Arc::clone(&alive),
@@ -1097,6 +1110,11 @@ pub(crate) async fn spawn_process(
 }
 
 async fn child_task(mut child: Child, mut kill: watch::Receiver<bool>) {
+    if *kill.borrow() {
+        let _ = child.start_kill();
+        let _ = child.wait().await;
+        return;
+    }
     tokio::select! {
         _ = kill.changed() => {
             let _ = child.start_kill();

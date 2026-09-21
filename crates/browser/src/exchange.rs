@@ -6,6 +6,10 @@
 //! reply cannot overtake its own chunks. Awaiting a lane waits for capacity.
 //! `try_send` never drops a message while the peer stays connected: a full lane
 //! disconnects.
+//!
+//! `recv` prefers the control lane, so a `Cancel` can overtake its own `Call`.
+//! Receivers treat a Cancel for an unknown id as a negative cache: drop the
+//! later Call and ignore leftover chunks instead of failing the conversation.
 
 use std::collections::HashMap;
 use std::convert::Infallible;
@@ -188,18 +192,6 @@ impl<T> Sender<T> {
             }
             () = wait_closed(&mut closed) => Err(Error::Closed),
         }
-    }
-
-    pub(crate) fn blocking_send(&self, value: T) -> Result<(), Error>
-    where
-        T: Lane,
-    {
-        if self.is_closed() {
-            return Err(Error::Closed);
-        }
-        self.channel(value.queue())
-            .blocking_send(value)
-            .map_err(|_| Error::Closed)
     }
 }
 
@@ -481,6 +473,9 @@ where
         capacity: usize,
         limit: usize,
     ) -> Result<mpsc::Receiver<IN>, Error> {
+        if self.tx.is_closed() {
+            return Err(Error::Closed);
+        }
         let (tx, rx) = mpsc::channel(capacity);
         let mut subscribers = self
             .subscribers
@@ -615,8 +610,8 @@ impl<C, R, N, IR> Drop for Upload<C, R, N, IR> {
 pub(crate) enum ServerInput<C, N> {
     Call { id: RequestId, body: C },
     Notify(N),
-    RequestChunk,
-    RequestEnd,
+    RequestChunk { id: RequestId },
+    RequestEnd { id: RequestId },
     Cancel { id: RequestId },
 }
 
@@ -624,9 +619,10 @@ impl<C, N> Lane for ServerInput<C, N> {
     fn queue(&self) -> Queue {
         match self {
             Self::Cancel { .. } => Queue::Control,
-            Self::Call { .. } | Self::Notify(_) | Self::RequestChunk | Self::RequestEnd => {
-                Queue::Data
-            }
+            Self::Call { .. }
+            | Self::Notify(_)
+            | Self::RequestChunk { .. }
+            | Self::RequestEnd { .. } => Queue::Data,
         }
     }
 }
@@ -734,32 +730,10 @@ where
                     Err(error) => Err(error),
                 }
             }
-            Frame::RequestChunk { .. } => self.send_server(ServerInput::RequestChunk),
-            Frame::RequestEnd { .. } => self.send_server(ServerInput::RequestEnd),
+            Frame::RequestChunk { id, .. } => self.send_server(ServerInput::RequestChunk { id }),
+            Frame::RequestEnd { id, .. } => self.send_server(ServerInput::RequestEnd { id }),
             Frame::ResponseChunk { id, bytes } => route_chunk(&self.pending, id, &bytes),
             Frame::Cancel { id } => self.send_server(ServerInput::Cancel { id }),
-        }
-    }
-
-    async fn route_async(&self, frame: Frame<IC, IR, IN>) -> Result<(), Error> {
-        match frame {
-            Frame::Call { id, body } => self.server.send(ServerInput::Call { id, body }).await,
-            Frame::Reply { id, body } => {
-                route_reply(&self.pending, id, body);
-                Ok(())
-            }
-            Frame::Notify(notice) => {
-                route_notice(&self.subscribers, notice.clone());
-                if self.server.is_closed() {
-                    Ok(())
-                } else {
-                    self.server.try_send(ServerInput::Notify(notice))
-                }
-            }
-            Frame::RequestChunk { .. } => self.server.try_send(ServerInput::RequestChunk),
-            Frame::RequestEnd { .. } => self.server.try_send(ServerInput::RequestEnd),
-            Frame::ResponseChunk { id, bytes } => route_chunk(&self.pending, id, &bytes),
-            Frame::Cancel { id } => self.server.send(ServerInput::Cancel { id }).await,
         }
     }
 
@@ -831,7 +805,7 @@ where
             let Some(frame) = rx.recv().await else {
                 break;
             };
-            if router.route_async(frame).await.is_err() {
+            if router.route(frame).is_err() {
                 break;
             }
         }
@@ -1140,6 +1114,14 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn try_send_on_a_full_data_lane_disconnects() {
+        let (tx, mut rx) = pair::<Frame<u8, u8, u8>>(8, 1);
+        tx.try_send(Frame::Notify(1)).expect("fill data");
+        assert_eq!(tx.try_send(Frame::Notify(2)), Err(Error::Closed));
+        assert!(rx.recv().await.is_none());
+    }
+
+    #[tokio::test]
     async fn cancel_is_delivered_while_the_data_lane_is_full() {
         let (client, mut server) = local_lanes::<u8, u16, u8, Infallible>(4, 2);
         let upload = client.begin_upload(4).await.expect("upload");
@@ -1165,5 +1147,57 @@ mod tests {
         }
         assert_eq!(subscriber.recv().await, Some(0));
         assert_eq!(subscriber.recv().await, None);
+    }
+
+    #[tokio::test]
+    async fn cancel_can_arrive_before_its_call() {
+        let (tx, mut rx) = pair::<Frame<u8, u8, u8>>(1, 1);
+        tx.send(Frame::Call {
+            id: RequestId::new(1),
+            body: 4,
+        })
+        .await
+        .expect("call");
+        tx.try_send(Frame::Cancel {
+            id: RequestId::new(1),
+        })
+        .expect("cancel");
+        let Some(Frame::Cancel { id }) = rx.recv().await else {
+            unreachable!("cancel first");
+        };
+        assert_eq!(id.get(), 1);
+        let Some(Frame::Call { id, body }) = rx.recv().await else {
+            unreachable!("call after cancel");
+        };
+        assert_eq!(id.get(), 1);
+        assert_eq!(body, 4);
+    }
+
+    #[tokio::test]
+    async fn wait_closed_returns_when_the_flag_is_true() {
+        let (tx, mut rx) = watch::channel(false);
+        tx.send(true).expect("set closed");
+        tokio::time::timeout(std::time::Duration::from_millis(20), wait_closed(&mut rx))
+            .await
+            .expect("wait_closed should return");
+    }
+
+    #[tokio::test]
+    async fn subscribe_fails_when_the_peer_is_gone() {
+        let (tx, rx) = pair::<Frame<Infallible, Infallible, u8>>(2, 2);
+        let (client, _server, _router) =
+            endpoint::<Infallible, Infallible, u8, Infallible, Infallible, u8>(tx, 2);
+        drop(rx);
+        assert!(matches!(client.subscribe(1, 4), Err(Error::Closed)));
+    }
+
+    #[tokio::test]
+    async fn subscribe_fails_at_the_subscriber_limit() {
+        let (client, _server) = local::<Infallible, Infallible, Infallible, u8>(2);
+        let _first = client.subscribe(1, 1).expect("first");
+        assert!(matches!(
+            client.subscribe(1, 1),
+            Err(Error::SubscriberLimit)
+        ));
     }
 }

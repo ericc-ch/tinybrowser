@@ -25,7 +25,10 @@ fn daemon_registers_loopback_and_second_start_reuses_it() {
     let version = client
         .call("Browser.getVersion", &serde_json::json!({}), None)
         .expect("version");
-    assert_eq!(version["product"], serde_json::json!("Chrome/152.0.7977.82"));
+    assert_eq!(
+        version["product"],
+        serde_json::json!("Chrome/152.0.7977.82")
+    );
 
     fixture.spawn_daemon();
     let status = fixture

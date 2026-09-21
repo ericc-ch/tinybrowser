@@ -3,6 +3,7 @@
 //! The browser process owns tabs as Tokio tasks. The renderer owns each
 //! document.
 
+use std::collections::HashSet;
 use std::convert::Infallible;
 use std::fmt;
 use std::future::pending;
@@ -330,11 +331,15 @@ impl TabHandle {
     /// # Errors
     ///
     /// [`TabError::ActorStopped`] when the coordinator has shut down.
+    /// [`TabError::ResourceLimit`] when too many subscribers are already live.
     pub fn subscribe(&self) -> Result<mpsc::Receiver<TabEvent>, TabError> {
         self.client
             .subscribe(EVENT_SUBSCRIBER_CAPACITY, MAX_SUBSCRIBERS)
-            .map_err(|_| TabError::ResourceLimit {
-                resource: ResourceLimit::TabSubscribers,
+            .map_err(|error| match error {
+                exchange::Error::SubscriberLimit => TabError::ResourceLimit {
+                    resource: ResourceLimit::TabSubscribers,
+                },
+                exchange::Error::Closed | exchange::Error::Protocol => TabError::ActorStopped,
             })
     }
 
@@ -850,6 +855,7 @@ enum Wake {
 
 async fn coordinator_loop(mut server: TabServer, mut tab: Tab) {
     let mut waiters = Vec::new();
+    let mut cancelled = HashSet::new();
     loop {
         tab.launch_navigation();
         let deadline = next_waiter_deadline(&waiters);
@@ -865,17 +871,29 @@ async fn coordinator_loop(mut server: TabServer, mut tab: Tab) {
         };
         match wake {
             Wake::Command(Some(ServerInput::Call { id, body })) => {
+                if cancelled.remove(&id) {
+                    continue;
+                }
                 if handle_command(&mut tab, &server, id, body, &mut waiters).await {
                     return;
                 }
             }
             Wake::Command(Some(ServerInput::Cancel { id })) => {
+                let before = waiters.len();
                 waiters.retain(|waiter| waiter.id != id);
+                if waiters.len() == before {
+                    cancelled.insert(id);
+                    if cancelled.len() > MAX_WAITERS {
+                        break;
+                    }
+                }
             }
-            Wake::Command(
-                Some(ServerInput::Notify(_) | ServerInput::RequestChunk | ServerInput::RequestEnd)
-                | None,
-            ) => break,
+            Wake::Command(Some(
+                ServerInput::RequestChunk { id } | ServerInput::RequestEnd { id },
+            )) => {
+                cancelled.remove(&id);
+            }
+            Wake::Command(Some(ServerInput::Notify(_)) | None) => break,
             Wake::Navigation(Some((epoch, result))) => {
                 tab.handle_navigation(epoch, result).await;
             }

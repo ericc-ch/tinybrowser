@@ -13,17 +13,18 @@
 //! The loop runs as a future on one current-thread Tokio runtime and owns every
 //! wait: commands, dial completions, timer deadlines, and shutdown. The reader
 //! and writer stay blocking threads because synchronous browser-service calls
-//! (`document.cookie`) must make progress while the page engine runs.
+//! (`document.cookie`) must make progress while the page engine runs. The
+//! reader never waits for inbox capacity: a full inbox disconnects.
 
 mod session;
 
 /// Bounded command channel: one renderer's inbound messages.
 const INBOX_CAPACITY: usize = 256;
 
-/// Bounded outbox control lane: replies, reverse calls, cancellation.
+/// Bounded outbox control lane: cancellation.
 const OUTBOX_CONTROL_CAPACITY: usize = 256;
 
-/// Bounded outbox data lane: events and screenshot chunks.
+/// Bounded outbox data lane: replies, reverse calls, events, and screenshot chunks.
 const OUTBOX_DATA_CAPACITY: usize = 4096;
 
 use std::io::{self, Read, Write};
@@ -170,7 +171,7 @@ fn read_messages(
             }
         }
         if !route_message(message, command_tx, services) {
-            return;
+            break;
         }
     }
     // The host is gone (EOF or a broken pipe). A renderer must not outlive its
@@ -193,14 +194,14 @@ fn route_message(
             false
         }
         Frame::Notify(HostNotice::Shutdown) => {
-            let _result = command_tx.blocking_send(message);
+            let _result = command_tx.try_send(message);
             false
         }
         Frame::Reply { id, body } => {
             services.deliver(id, body);
             true
         }
-        _ => command_tx.blocking_send(message).is_ok(),
+        _ => command_tx.try_send(message).is_ok(),
     }
 }
 

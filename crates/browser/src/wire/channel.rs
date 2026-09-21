@@ -236,11 +236,6 @@ pub async fn read_frame_async<R: AsyncRead + Unpin + ?Sized>(
     Ok(Some(Frame { kind, request }))
 }
 
-/// Reads one control message on an async reader.
-///
-/// # Errors
-///
-/// I/O failure, a body frame, invalid JSON, or a protocol violation.
 /// Reads one control message.
 ///
 /// # Errors
