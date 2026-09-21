@@ -39,9 +39,9 @@ pub use embedded::EmbeddedRenderer;
 pub use engine::Engine;
 pub use protocol::{
     BrowserServices, DialCompletion, DialFailure, DialKind, DialOutcome, DialRequest, FrameId,
-    MAX_RESPONSE_BODY_BYTES, Mount, ResourceLimit, STORAGE_QUOTA_BYTES, ScreenshotClip,
-    ScreenshotRequest, ScriptFailure, StorageChange, StorageError, StorageKind, StorageSeed,
-    TabError, TabEvent,
+    MAX_RESPONSE_BODY_BYTES, Mount, RendererEvent, ResourceLimit, STORAGE_QUOTA_BYTES,
+    ScreenshotClip, ScreenshotRequest, ScriptFailure, StorageChange, StorageError, StorageKind,
+    StorageSeed, TabError,
 };
 pub use remote::RemoteValue;
 pub use storage::PendingStorageEvent;

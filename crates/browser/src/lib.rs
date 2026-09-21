@@ -15,6 +15,7 @@ mod actor;
 mod broadcast;
 mod browser;
 pub mod child;
+mod exchange;
 mod link;
 mod manager;
 mod network;
@@ -24,14 +25,13 @@ mod storage;
 mod store;
 mod wire;
 
-pub use actor::{TabHandle, TabId};
+pub use actor::{TabEvent, TabHandle, TabId};
 pub use browser::{Browser, BrowserError, BrowserHandle};
 pub use net::{Agent, AgentBuilder, CookieRecord, CookieSameSite};
 pub use network::NetworkSession;
 pub use profile::{Profile, ProfileError, ProfileName};
 pub use renderer::{
-    FrameId, RemoteValue, ResourceLimit, ScreenshotClip, ScreenshotRequest, ScriptFailure,
-    TabError, TabEvent,
+    FrameId, RemoteValue, ResourceLimit, ScreenshotClip, ScreenshotRequest, ScriptFailure, TabError,
 };
 pub use store::ProfileStore;
 

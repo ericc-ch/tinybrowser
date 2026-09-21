@@ -796,7 +796,7 @@ pub(crate) async fn wait_for_navigation(
         loop {
             match events.recv().await {
                 Some(TabEvent::Navigated) => return Ok(()),
-                Some(TabEvent::NavigationFailed | TabEvent::FetchFailed) => {
+                Some(TabEvent::NavigationFailed) => {
                     return Err("net::ERR_FAILED");
                 }
                 Some(_) => {}
