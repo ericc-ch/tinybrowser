@@ -8,6 +8,7 @@ members = [
     "crates/net",
     "crates/renderer",
     "crates/server",
+    "crates/webstorage",
     "crates/wasm",
     "crates/webdriver",
 ]
@@ -26,6 +27,7 @@ net = { path = "crates/net" }
 renderer = { path = "crates/renderer" }
 server = { path = "crates/server" }
 webdriver = { path = "crates/webdriver" }
+webstorage = { path = "crates/webstorage" }
 
 [package]
 name = "tinybrowser"

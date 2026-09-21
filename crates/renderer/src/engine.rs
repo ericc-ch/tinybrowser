@@ -86,7 +86,7 @@ fn strip_cdata(css: &str) -> &str {
 use crate::documents::DocumentStore;
 use crate::js::{DocumentStreamCommand, FrameNavigation, RealmRegistry, SharedJsRuntime};
 use crate::messaging::{Delivery, MAX_FRAMES, SharedHandle};
-use crate::protocol::{BrowserServices, FrameId, Mount, RendererEvent, StorageSeed, TabError};
+use crate::protocol::{BrowserServices, FrameId, Mount, RendererEvent, TabError};
 use crate::storage::PendingStorageEvent;
 
 /// One renderer process's page engine.
@@ -115,7 +115,6 @@ impl Engine {
             documents: Rc::new(RefCell::new(DocumentStore::default())),
             registry: Rc::new(RefCell::new(RealmRegistry::default())),
             shared: Rc::new(RefCell::new(crate::messaging::Shared::default())),
-            session_storage: Rc::new(RefCell::new(crate::storage::SessionStorage::default())),
             pending_storage: Rc::new(RefCell::new(Vec::new())),
         };
         let main = Document::with_shared(FrameId::MAIN, &runtime);
@@ -385,7 +384,12 @@ impl Engine {
                 }
             }
             if !ran {
-                break;
+                // A `storage` broadcast queued during this turn still needs a
+                // task on every other same-origin frame
+                // (<https://html.spec.whatwg.org/multipage/webstorage.html#concept-storage-broadcast>).
+                if self.runtime.pending_storage.borrow().is_empty() {
+                    break;
+                }
             }
         }
     }
@@ -423,27 +427,6 @@ impl Engine {
                 source,
             );
         }
-    }
-
-    /// Copies one `sessionStorage` seed into this engine's session area
-    /// (<https://html.spec.whatwg.org/multipage/document-sequences.html#copy-session-storage>).
-    ///
-    /// # Errors
-    ///
-    /// [`TabError::RendererUnavailable`] when the seed JSON is malformed.
-    pub fn seed_session(&mut self, seed: StorageSeed) -> Result<(), TabError> {
-        let StorageSeed { origin, entries } = seed;
-        self.runtime
-            .session_storage
-            .borrow_mut()
-            .import(&origin, entries);
-        Ok(())
-    }
-
-    /// Reads one key of this engine's session area for `origin`.
-    #[must_use]
-    pub fn session_get(&self, origin: &str, key: &str) -> Option<String> {
-        self.runtime.session_storage.borrow().get(origin, key)
     }
 
     /// Queues one `localStorage` change that the browser broadcast. The source

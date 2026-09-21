@@ -12,16 +12,19 @@ use std::time::Duration;
 use tokio::process::Child;
 
 use crate::actor::TabId;
+use crate::broadcast::{BroadcastMessage, ContextEvent, StorageBroadcast};
+use crate::context::PartitionServices;
 use crate::exchange::{self, Frame, RequestId, ServerInput};
 use crate::manager::RendererId;
-use crate::network::FetchHandle;
+use crate::network::TabNetworkHandle;
 use crate::site::Site;
+use crate::storage::SessionStorage;
 use crate::wire::{
-    BrowserCall, Command as RendererCommand, FromRenderer, HostNotice, RendererAssignmentId,
-    RendererCall, RendererNotice, RendererReply, Reply, ResponseStart, ServiceCall, ServiceReply,
-    ToRenderer,
+    BrowserCall, BrowsingContextCall, Command as RendererCommand, FromRenderer, HostNotice,
+    MessagingCall, NetworkCall, RendererAssignmentId, RendererCall, RendererNotice, RendererReply,
+    Reply, ResponseStart, ServiceCall, ServiceReply, StorageCall, ToRenderer,
 };
-use renderer::{FrameId, Mount, RendererEvent, TabError};
+use renderer::{FrameId, Mount, RendererEvent, StorageChange, StorageKind, TabError};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite};
 use tokio::process::Command;
 use tokio::sync::{mpsc, oneshot, watch};
@@ -53,6 +56,8 @@ const COMMAND_CAPACITY: usize = 256;
 type EventSubscribers =
     Arc<Mutex<HashMap<RendererAssignmentId, Vec<mpsc::Sender<(FrameId, RendererEvent)>>>>>;
 
+type AssignmentContexts = Arc<Mutex<HashMap<RendererAssignmentId, AssignmentContext>>>;
+
 type RendererClient =
     exchange::Client<RendererCall, ServiceReply, HostNotice, RendererReply, RendererNotice>;
 type BrowserServiceServer =
@@ -66,6 +71,7 @@ pub(crate) struct RendererHandle {
     client: RendererClient,
     pub(crate) alive: Arc<AtomicBool>,
     subscribers: EventSubscribers,
+    contexts: AssignmentContexts,
     kill: watch::Sender<bool>,
     tasks: Mutex<Vec<JoinHandle<()>>>,
     pub(crate) site: Arc<Mutex<Option<Site>>>,
@@ -80,6 +86,14 @@ pub(crate) struct RendererHandle {
 pub(crate) struct RendererAssignment {
     pub(crate) id: RendererAssignmentId,
     pub(crate) process: Arc<RendererHandle>,
+}
+
+/// Browser-owned authority attached to one renderer assignment.
+#[derive(Clone)]
+pub(crate) struct AssignmentContext {
+    pub(crate) tab: TabId,
+    pub(crate) site: Site,
+    pub(crate) network: TabNetworkHandle,
 }
 
 impl RendererAssignment {
@@ -188,15 +202,35 @@ impl RendererHandle {
         self.assignments.fetch_sub(1, Ordering::Relaxed);
     }
 
-    pub(crate) async fn assign(&self, assignment: RendererAssignmentId) -> io::Result<()> {
-        self.client
+    pub(crate) async fn assign(
+        &self,
+        assignment: RendererAssignmentId,
+        context: AssignmentContext,
+    ) -> io::Result<()> {
+        self.contexts
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(assignment, context);
+        let result = self
+            .client
             .notify(HostNotice::Assign { assignment })
             .await
-            .map_err(|_| io::Error::other("renderer stopped"))
+            .map_err(|_| io::Error::other("renderer stopped"));
+        if result.is_err() {
+            self.contexts
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .remove(&assignment);
+        }
+        result
     }
 
     pub(crate) async fn release(&self, assignment: RendererAssignmentId) {
         self.subscribers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&assignment);
+        self.contexts
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .remove(&assignment);
@@ -386,8 +420,9 @@ struct ReaderContext {
 struct ServiceContext {
     responder: BrowserServiceResponder,
     subscribers: EventSubscribers,
-    fetch: FetchHandle,
-    site: Arc<Mutex<Option<Site>>>,
+    assignments: AssignmentContexts,
+    partition: PartitionServices,
+    sessions: Arc<SessionStorage>,
     released: Arc<Mutex<HashSet<RendererAssignmentId>>>,
     kill: watch::Sender<bool>,
     /// Browser command handle: renderer links create tabs for `window.open`.
@@ -567,7 +602,13 @@ async fn route_service_call(
     assignment: RendererAssignmentId,
     call: ServiceCall,
 ) -> Result<(), RendererViolation> {
-    if !has_assignment(&context.subscribers, assignment) {
+    let assignment_context = context
+        .assignments
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .get(&assignment)
+        .cloned();
+    let Some(assignment_context) = assignment_context else {
         // The renderer may have queued the call before it processed
         // `Release`. Answer with a benign failure so a synchronous
         // `document.cookie` caller cannot block forever, and keep the
@@ -576,18 +617,18 @@ async fn route_service_call(
             return send_released_reply(&context.responder, id, &call).await;
         }
         return Err(RendererViolation);
-    }
+    };
     match call {
-        ServiceCall::Dial(request) => {
-            let Some(initiator) = authorize(&context.site, &request.initiator) else {
+        ServiceCall::Network(NetworkCall::Dial(request)) => {
+            let Some(initiator) = assignment_context.site.authorize(&request.initiator) else {
                 return Err(RendererViolation);
             };
-            let worker_fetch = context.fetch.clone();
+            let worker_network = assignment_context.network.clone();
             let responder = context.responder.clone();
             let worker_kill = context.kill.clone();
             let cancel = context.kill.subscribe();
             tokio::spawn(async move {
-                let outcome = worker_fetch
+                let outcome = worker_network
                     .dial_request(&request, &initiator, cancel)
                     .await;
                 if responder
@@ -599,49 +640,42 @@ async fn route_service_call(
                 }
             });
         }
-        ServiceCall::CookieGet { url } => {
-            let Some(url) = authorize(&context.site, &url) else {
+        ServiceCall::Network(NetworkCall::CookieGet { url }) => {
+            let Some(url) = assignment_context.site.authorize(&url) else {
                 return Err(RendererViolation);
             };
-            let reply = ServiceReply::Cookie(context.fetch.cookies_for(&url));
+            let reply = ServiceReply::Cookie(assignment_context.network.cookies_for(&url));
             send_reply(&context.responder, id, reply).await?;
         }
-        ServiceCall::CookieSet { value, url } => {
-            let Some(url) = authorize(&context.site, &url) else {
+        ServiceCall::Network(NetworkCall::CookieSet { value, url }) => {
+            let Some(url) = assignment_context.site.authorize(&url) else {
                 return Err(RendererViolation);
             };
-            context.fetch.set_cookie(&value, &url);
+            assignment_context.network.set_cookie(&value, &url);
             send_reply(&context.responder, id, ServiceReply::Unit).await?;
         }
-        ServiceCall::BroadcastPost {
+        ServiceCall::Messaging(MessagingCall::BroadcastPost {
             origin,
             name,
             payload,
             channel,
-        } => {
+        }) => {
             context
-                .fetch
-                .post_broadcast(&crate::broadcast::BroadcastMessage {
+                .partition
+                .events
+                .broadcast(&ContextEvent::Broadcast(BroadcastMessage {
                     origin,
                     name,
                     payload,
                     source: (assignment, channel),
-                });
+                }));
             send_reply(&context.responder, id, ServiceReply::Unit).await?;
         }
-        call @ (ServiceCall::StorageGet { .. }
-        | ServiceCall::StorageKeys { .. }
-        | ServiceCall::StorageSet { .. }
-        | ServiceCall::StorageRemove { .. }
-        | ServiceCall::StorageClear { .. }) => {
-            return route_storage_call(context, assignment, id, call).await;
+        ServiceCall::Storage(call) => {
+            return route_storage_call(context, assignment, &assignment_context, id, call).await;
         }
-        call @ (ServiceCall::WindowOpen { .. }
-        | ServiceCall::WindowClose { .. }
-        | ServiceCall::Opener
-        | ServiceCall::WindowMessage { .. }
-        | ServiceCall::RemoteSessionGet { .. }) => {
-            return route_window_call(context, assignment, id, call).await;
+        ServiceCall::BrowsingContext(call) => {
+            return route_window_call(context, &assignment_context, id, call).await;
         }
     }
     Ok(())
@@ -652,17 +686,12 @@ async fn route_service_call(
 /// cross-tab messaging.
 async fn route_window_call(
     context: &ServiceContext,
-    assignment: RendererAssignmentId,
+    assignment: &AssignmentContext,
     id: RequestId,
-    call: ServiceCall,
+    call: BrowsingContextCall,
 ) -> Result<(), RendererViolation> {
     match call {
-        ServiceCall::WindowOpen {
-            url,
-            features,
-            seed,
-            ..
-        } => {
+        BrowsingContextCall::WindowOpen { url, features, .. } => {
             let spec = if url.is_empty() || url == "about:blank" {
                 Some(String::new())
             } else {
@@ -671,12 +700,7 @@ async fn route_window_call(
                     .filter(|url| matches!(url.scheme(), "http" | "https"))
                     .map(|url| url.to_string())
             };
-            let source = context
-                .browser
-                .assignment_tab(assignment.get())
-                .await
-                .ok()
-                .flatten();
+            let source = Some(assignment.tab);
             let noopener = features
                 .split(|character: char| character.is_ascii_whitespace() || character == ',')
                 .any(|feature| {
@@ -686,7 +710,7 @@ async fn route_window_call(
             let tab = match spec {
                 Some(spec) => context
                     .browser
-                    .open_window(spec, source, noopener, seed)
+                    .open_window(spec, source, noopener)
                     .await
                     .ok()
                     .map(TabId::get),
@@ -694,151 +718,256 @@ async fn route_window_call(
             };
             send_reply(&context.responder, id, ServiceReply::Window(tab)).await?;
         }
-        ServiceCall::WindowClose { tab } => {
+        BrowsingContextCall::WindowClose { tab } => {
             let _result = context.browser.close_tab(TabId::new(tab)).await;
             send_reply(&context.responder, id, ServiceReply::Unit).await?;
         }
-        ServiceCall::Opener => {
+        BrowsingContextCall::Opener => {
             let opener = context
                 .browser
-                .opener_tab(assignment.get())
+                .opener_tab(assignment.tab)
                 .await
                 .ok()
                 .flatten()
                 .map(TabId::get);
             send_reply(&context.responder, id, ServiceReply::Window(opener)).await?;
         }
-        ServiceCall::WindowMessage { tab, payload } => {
+        BrowsingContextCall::WindowMessage { tab, payload } => {
             let _result = context
                 .browser
                 .window_message(TabId::new(tab), payload)
                 .await;
             send_reply(&context.responder, id, ServiceReply::Unit).await?;
         }
-        ServiceCall::RemoteSessionGet { tab, origin, key } => {
-            let value = context
-                .browser
-                .remote_session_get(TabId::new(tab), origin, key)
-                .await
-                .ok()
-                .flatten();
+        BrowsingContextCall::RemoteSessionGet { tab, origin, key } => {
+            if assignment.site.authorize(&origin).is_none() {
+                return Err(RendererViolation);
+            }
+            let value = context.sessions.get(TabId::new(tab), &origin, &key);
             send_reply(&context.responder, id, ServiceReply::StorageValue(value)).await?;
-        }
-        ServiceCall::Dial(_)
-        | ServiceCall::CookieGet { .. }
-        | ServiceCall::CookieSet { .. }
-        | ServiceCall::StorageGet { .. }
-        | ServiceCall::StorageKeys { .. }
-        | ServiceCall::StorageSet { .. }
-        | ServiceCall::StorageRemove { .. }
-        | ServiceCall::StorageClear { .. }
-        | ServiceCall::BroadcastPost { .. } => {
-            // `route_service_call` dispatches the other service families.
-            return Err(RendererViolation);
         }
     }
     Ok(())
 }
 
-/// Routes one `localStorage` service call. The origin and the calling URL are
-/// both checked against the renderer's site lock before the area is touched.
+struct StorageRouter<'a> {
+    context: &'a ServiceContext,
+    assignment: RendererAssignmentId,
+    authority: &'a AssignmentContext,
+    request: RequestId,
+}
+
+impl StorageRouter<'_> {
+    async fn route(&self, call: StorageCall) -> Result<(), RendererViolation> {
+        match call {
+            StorageCall::Get { kind, origin, key } => self.get(kind, &origin, &key).await,
+            StorageCall::Keys { kind, origin } => self.keys(kind, &origin).await,
+            StorageCall::Set {
+                kind,
+                origin,
+                url,
+                key,
+                value,
+                source,
+            } => self.set(kind, &origin, &url, &key, &value, source).await,
+            StorageCall::Remove {
+                kind,
+                origin,
+                url,
+                key,
+                source,
+            } => self.remove(kind, &origin, &url, &key, source).await,
+            StorageCall::Clear {
+                kind,
+                origin,
+                url,
+                source,
+            } => self.clear(kind, &origin, &url, source).await,
+        }
+    }
+
+    async fn get(
+        &self,
+        kind: StorageKind,
+        origin: &str,
+        key: &str,
+    ) -> Result<(), RendererViolation> {
+        self.authorize(origin, None)?;
+        let value = match kind {
+            StorageKind::Local => self.context.partition.local_storage.get(origin, key),
+            StorageKind::Session => self.context.sessions.get(self.authority.tab, origin, key),
+        };
+        send_reply(
+            &self.context.responder,
+            self.request,
+            ServiceReply::StorageValue(value),
+        )
+        .await
+    }
+
+    async fn keys(&self, kind: StorageKind, origin: &str) -> Result<(), RendererViolation> {
+        self.authorize(origin, None)?;
+        let keys = match kind {
+            StorageKind::Local => self.context.partition.local_storage.keys(origin),
+            StorageKind::Session => self.context.sessions.keys(self.authority.tab, origin),
+        };
+        send_reply(
+            &self.context.responder,
+            self.request,
+            ServiceReply::StorageKeys(keys),
+        )
+        .await
+    }
+
+    async fn set(
+        &self,
+        kind: StorageKind,
+        origin: &str,
+        url: &str,
+        key: &str,
+        value: &str,
+        source: FrameId,
+    ) -> Result<(), RendererViolation> {
+        self.authorize(origin, Some(url))?;
+        let change = match kind {
+            StorageKind::Local => self.context.partition.local_storage.set(origin, key, value),
+            StorageKind::Session => {
+                self.context
+                    .sessions
+                    .set(self.authority.tab, origin, key, value)
+            }
+        };
+        self.publish(
+            source,
+            kind,
+            origin,
+            url,
+            change.as_ref().ok().and_then(Option::as_ref),
+        );
+        send_reply(
+            &self.context.responder,
+            self.request,
+            ServiceReply::StorageChanged(change),
+        )
+        .await
+    }
+
+    async fn remove(
+        &self,
+        kind: StorageKind,
+        origin: &str,
+        url: &str,
+        key: &str,
+        source: FrameId,
+    ) -> Result<(), RendererViolation> {
+        self.authorize(origin, Some(url))?;
+        let change = match kind {
+            StorageKind::Local => self.context.partition.local_storage.remove(origin, key),
+            StorageKind::Session => self
+                .context
+                .sessions
+                .remove(self.authority.tab, origin, key),
+        };
+        self.publish(source, kind, origin, url, change.as_ref());
+        send_reply(
+            &self.context.responder,
+            self.request,
+            ServiceReply::StorageChanged(Ok(change)),
+        )
+        .await
+    }
+
+    async fn clear(
+        &self,
+        kind: StorageKind,
+        origin: &str,
+        url: &str,
+        source: FrameId,
+    ) -> Result<(), RendererViolation> {
+        self.authorize(origin, Some(url))?;
+        let change = match kind {
+            StorageKind::Local => self.context.partition.local_storage.clear(origin),
+            StorageKind::Session => self.context.sessions.clear(self.authority.tab, origin),
+        };
+        self.publish(source, kind, origin, url, change.as_ref());
+        send_reply(
+            &self.context.responder,
+            self.request,
+            ServiceReply::StorageChanged(Ok(change)),
+        )
+        .await
+    }
+
+    fn authorize(&self, origin: &str, url: Option<&str>) -> Result<(), RendererViolation> {
+        if self.authority.site.authorize(origin).is_none()
+            || url.is_some_and(|url| self.authority.site.authorize(url).is_none())
+        {
+            return Err(RendererViolation);
+        }
+        Ok(())
+    }
+
+    fn publish(
+        &self,
+        source: FrameId,
+        kind: StorageKind,
+        origin: &str,
+        url: &str,
+        change: Option<&StorageChange>,
+    ) {
+        let Some(change) = change else {
+            return;
+        };
+        if kind == StorageKind::Local {
+            broadcast_local_storage_event(
+                self.context,
+                self.assignment,
+                source,
+                origin,
+                url,
+                change,
+            );
+        }
+    }
+}
+
 async fn route_storage_call(
     context: &ServiceContext,
     assignment: RendererAssignmentId,
+    assignment_context: &AssignmentContext,
     id: RequestId,
-    call: ServiceCall,
+    call: StorageCall,
 ) -> Result<(), RendererViolation> {
-    match call {
-        ServiceCall::StorageGet { origin, key } => {
-            let Some(_origin) = authorize(&context.site, &origin) else {
-                return Err(RendererViolation);
-            };
-            let value = context.fetch.storage_get(&origin, &key);
-            send_reply(&context.responder, id, ServiceReply::StorageValue(value)).await?;
-        }
-        ServiceCall::StorageKeys { origin } => {
-            let Some(_origin) = authorize(&context.site, &origin) else {
-                return Err(RendererViolation);
-            };
-            let keys = context.fetch.storage_keys(&origin);
-            send_reply(&context.responder, id, ServiceReply::StorageKeys(keys)).await?;
-        }
-        ServiceCall::StorageSet {
-            origin,
-            url,
-            key,
-            value,
-            source,
-        } => {
-            let Some(_origin) = authorize(&context.site, &origin) else {
-                return Err(RendererViolation);
-            };
-            if authorize(&context.site, &url).is_none() {
-                return Err(RendererViolation);
-            }
-            let change =
-                context
-                    .fetch
-                    .storage_set(&origin, &url, &key, &value, (assignment, source));
-            send_reply(&context.responder, id, ServiceReply::StorageChanged(change)).await?;
-        }
-        ServiceCall::StorageRemove {
-            origin,
-            url,
-            key,
-            source,
-        } => {
-            let Some(_origin) = authorize(&context.site, &origin) else {
-                return Err(RendererViolation);
-            };
-            if authorize(&context.site, &url).is_none() {
-                return Err(RendererViolation);
-            }
-            let change = context
-                .fetch
-                .storage_remove(&origin, &url, &key, (assignment, source));
-            send_reply(
-                &context.responder,
-                id,
-                ServiceReply::StorageChanged(Ok(change)),
-            )
-            .await?;
-        }
-        ServiceCall::StorageClear {
-            origin,
-            url,
-            source,
-        } => {
-            let Some(_origin) = authorize(&context.site, &origin) else {
-                return Err(RendererViolation);
-            };
-            if authorize(&context.site, &url).is_none() {
-                return Err(RendererViolation);
-            }
-            let change = context
-                .fetch
-                .storage_clear(&origin, &url, (assignment, source));
-            send_reply(
-                &context.responder,
-                id,
-                ServiceReply::StorageChanged(Ok(change)),
-            )
-            .await?;
-        }
-        ServiceCall::Dial(_)
-        | ServiceCall::CookieGet { .. }
-        | ServiceCall::CookieSet { .. }
-        | ServiceCall::WindowOpen { .. }
-        | ServiceCall::WindowClose { .. }
-        | ServiceCall::Opener
-        | ServiceCall::WindowMessage { .. }
-        | ServiceCall::RemoteSessionGet { .. }
-        | ServiceCall::BroadcastPost { .. } => {
-            // `route_service_call` dispatches the other service families.
-            return Err(RendererViolation);
-        }
+    StorageRouter {
+        context,
+        assignment,
+        authority: assignment_context,
+        request: id,
     }
-    Ok(())
+    .route(call)
+    .await
+}
+
+fn broadcast_local_storage_event(
+    context: &ServiceContext,
+    assignment: RendererAssignmentId,
+    source: FrameId,
+    origin: &str,
+    url: &str,
+    change: &StorageChange,
+) {
+    context
+        .partition
+        .events
+        .broadcast(&ContextEvent::Storage(StorageBroadcast {
+            origin: origin.to_owned(),
+            kind: StorageKind::Local,
+            key: change.key.clone(),
+            old_value: change.old_value.clone(),
+            new_value: change.new_value.clone(),
+            url: url.to_owned(),
+            source: (assignment, source),
+        }));
 }
 
 fn was_released(
@@ -859,36 +988,28 @@ async fn send_released_reply(
     call: &ServiceCall,
 ) -> Result<(), RendererViolation> {
     let reply = match call {
-        ServiceCall::Dial(_) => ServiceReply::Dial(Err(renderer::DialFailure::Cancelled)),
-        ServiceCall::CookieGet { .. } => ServiceReply::Cookie(String::new()),
-        ServiceCall::CookieSet { .. }
-        | ServiceCall::WindowClose { .. }
-        | ServiceCall::WindowMessage { .. }
-        | ServiceCall::BroadcastPost { .. } => ServiceReply::Unit,
-        ServiceCall::StorageGet { .. } | ServiceCall::RemoteSessionGet { .. } => {
+        ServiceCall::Network(NetworkCall::Dial(_)) => {
+            ServiceReply::Dial(Err(renderer::DialFailure::Cancelled))
+        }
+        ServiceCall::Network(NetworkCall::CookieGet { .. }) => ServiceReply::Cookie(String::new()),
+        ServiceCall::Network(NetworkCall::CookieSet { .. })
+        | ServiceCall::Messaging(MessagingCall::BroadcastPost { .. })
+        | ServiceCall::BrowsingContext(
+            BrowsingContextCall::WindowClose { .. } | BrowsingContextCall::WindowMessage { .. },
+        ) => ServiceReply::Unit,
+        ServiceCall::Storage(StorageCall::Get { .. })
+        | ServiceCall::BrowsingContext(BrowsingContextCall::RemoteSessionGet { .. }) => {
             ServiceReply::StorageValue(None)
         }
-        ServiceCall::StorageKeys { .. } => ServiceReply::StorageKeys(Vec::new()),
-        ServiceCall::StorageSet { .. }
-        | ServiceCall::StorageRemove { .. }
-        | ServiceCall::StorageClear { .. } => ServiceReply::StorageChanged(Ok(None)),
-        ServiceCall::WindowOpen { .. } | ServiceCall::Opener => ServiceReply::Window(None),
+        ServiceCall::Storage(StorageCall::Keys { .. }) => ServiceReply::StorageKeys(Vec::new()),
+        ServiceCall::Storage(
+            StorageCall::Set { .. } | StorageCall::Remove { .. } | StorageCall::Clear { .. },
+        ) => ServiceReply::StorageChanged(Ok(None)),
+        ServiceCall::BrowsingContext(
+            BrowsingContextCall::WindowOpen { .. } | BrowsingContextCall::Opener,
+        ) => ServiceReply::Window(None),
     };
     send_reply(responder, id, reply).await
-}
-
-fn has_assignment(subscribers: &EventSubscribers, assignment: RendererAssignmentId) -> bool {
-    subscribers
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .contains_key(&assignment)
-}
-
-fn authorize(site: &Mutex<Option<Site>>, spec: &str) -> Option<url::Url> {
-    site.lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .as_ref()
-        .and_then(|site| site.authorize(spec))
 }
 
 async fn send_reply(
@@ -978,46 +1099,35 @@ fn spawn_transport(command: &mut Command) -> io::Result<SpawnedRenderer> {
 /// Registers reliable browser-to-renderer notifications. Queue saturation
 /// disconnects the renderer rather than silently losing observable events.
 fn subscribe_renderer_events(
-    fetch: &FetchHandle,
+    partition: &PartitionServices,
     client: &RendererClient,
     kill: &watch::Sender<bool>,
 ) {
-    let storage_client = client.clone();
-    let storage_kill = kill.clone();
-    fetch.subscribe_storage(Box::new(move |event| {
-        if storage_client
-            .try_notify(HostNotice::StorageEvent {
-                origin: event.origin,
+    let client = client.clone();
+    let kill = kill.clone();
+    partition.events.subscribe(Box::new(move |event| {
+        let notice = match event {
+            ContextEvent::Storage(event) => HostNotice::StorageEvent {
+                target: None,
+                origin: event.origin.clone(),
                 kind: event.kind,
-                key: event.key,
-                old_value: event.old_value,
-                new_value: event.new_value,
-                url: event.url,
+                key: event.key.clone(),
+                old_value: event.old_value.clone(),
+                new_value: event.new_value.clone(),
+                url: event.url.clone(),
                 source: Some(event.source),
-            })
-            .is_ok()
-        {
-            true
-        } else {
-            let _result = storage_kill.send(true);
-            false
-        }
-    }));
-    let broadcast_client = client.clone();
-    let broadcast_kill = kill.clone();
-    fetch.subscribe_broadcast(Box::new(move |message| {
-        if broadcast_client
-            .try_notify(HostNotice::BroadcastMessage {
+            },
+            ContextEvent::Broadcast(message) => HostNotice::BroadcastMessage {
                 origin: message.origin.clone(),
                 name: message.name.clone(),
                 payload: message.payload.clone(),
                 source: Some(message.source),
-            })
-            .is_ok()
-        {
+            },
+        };
+        if client.try_notify_lossy(notice).is_ok() {
             true
         } else {
-            let _result = broadcast_kill.send(true);
+            let _result = kill.send(true);
             false
         }
     }));
@@ -1026,7 +1136,8 @@ fn subscribe_renderer_events(
 pub(crate) async fn spawn_process(
     id: RendererId,
     site: Option<Site>,
-    fetch: FetchHandle,
+    partition: PartitionServices,
+    sessions: Arc<SessionStorage>,
     browser: crate::browser::BrowserHandle,
     slot: tokio::sync::OwnedSemaphorePermit,
 ) -> io::Result<RendererHandle> {
@@ -1047,9 +1158,10 @@ pub(crate) async fn spawn_process(
     let (tx, rx) = exchange::pair(COMMAND_CAPACITY, COMMAND_CAPACITY);
     let (client, server, router) = exchange::endpoint(tx, COMMAND_CAPACITY);
     let (kill, kill_rx) = watch::channel(false);
-    subscribe_renderer_events(&fetch, &client, &kill);
+    subscribe_renderer_events(&partition, &client, &kill);
     let alive = Arc::new(AtomicBool::new(true));
     let subscribers = Arc::new(Mutex::new(HashMap::new()));
+    let contexts = Arc::new(Mutex::new(HashMap::new()));
     let (ready_tx, ready_rx) = oneshot::channel();
     let writer_task = tokio::spawn(writer_task(
         rx,
@@ -1069,8 +1181,9 @@ pub(crate) async fn spawn_process(
     let service_context = ServiceContext {
         responder: server.responder(),
         subscribers: Arc::clone(&subscribers),
-        fetch: fetch.clone(),
-        site: Arc::clone(&site),
+        assignments: Arc::clone(&contexts),
+        partition,
+        sessions,
         released: Arc::clone(&released),
         kill: kill.clone(),
         browser,
@@ -1100,6 +1213,7 @@ pub(crate) async fn spawn_process(
         client,
         alive,
         subscribers,
+        contexts,
         kill,
         tasks: Mutex::new(tasks),
         site,

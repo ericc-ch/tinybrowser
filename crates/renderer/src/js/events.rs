@@ -585,6 +585,27 @@ pub(crate) fn add_listener<'js>(
     callback: Value<'js>,
     options: Option<Value<'js>>,
 ) -> Result<()> {
+    add_listener_in(
+        ctx,
+        &target_world(ctx, target)?,
+        target,
+        typ,
+        callback,
+        options,
+    )
+}
+
+/// [`add_listener`] on a chosen realm. `contentWindow.addEventListener` runs
+/// in the caller's realm and must still register on the frame's window
+/// (<https://html.spec.whatwg.org/multipage/window-object.html#windowproxy-get>).
+pub(crate) fn add_listener_in<'js>(
+    ctx: &Ctx<'js>,
+    world: &Rc<RefCell<World>>,
+    target: EventTargetKey,
+    typ: Value<'js>,
+    callback: Value<'js>,
+    options: Option<Value<'js>>,
+) -> Result<()> {
     let typ = bindings::webidl_to_string(ctx, typ)?;
     let callback = listener_callback(ctx, callback)?;
     let options = ListenerOptions::read(ctx, options)?;
@@ -604,7 +625,6 @@ pub(crate) fn add_listener<'js>(
         Some(passive) => passive,
         None => default_passive(ctx, &typ, target)?,
     };
-    let world = target_world(ctx, target)?;
     // Abort steps run when the list is touched or a listener is about to be
     // invoked (<https://dom.spec.whatwg.org/#add-an-event-listener>).
     let existing_listeners = world.borrow().listener_snapshot(target);
@@ -648,10 +668,27 @@ pub(crate) fn remove_listener<'js>(
     callback: Value<'js>,
     options: Option<Value<'js>>,
 ) -> Result<()> {
+    remove_listener_in(
+        ctx,
+        &target_world(ctx, target)?,
+        target,
+        typ,
+        callback,
+        options,
+    )
+}
+
+pub(crate) fn remove_listener_in<'js>(
+    ctx: &Ctx<'js>,
+    world: &Rc<RefCell<World>>,
+    target: EventTargetKey,
+    typ: Value<'js>,
+    callback: Value<'js>,
+    options: Option<Value<'js>>,
+) -> Result<()> {
     let typ = bindings::webidl_to_string(ctx, typ)?;
     let callback = listener_callback(ctx, callback)?;
     let capture = ListenerOptions::read_capture(ctx, options)?;
-    let world = target_world(ctx, target)?;
     let mut world = world.borrow_mut();
     let mut removed = Vec::new();
     for existing in world.listener_snapshot(target) {

@@ -163,7 +163,7 @@ async fn serve_webdriver(port: u16, builder: AgentBuilder, profile: &Profile) ->
     let data_home = daemon::data_home()?;
     let listener = TcpListener::bind(("127.0.0.1", port))
         .map_err(|error| io::Error::new(error.kind(), format!("bind failed: {error}")))?;
-    let browser = Browser::open_in_with(&data_home, profile, builder)
+    let browser = Browser::open_in_with_network(&data_home, profile, builder)
         .map_err(|error| io::Error::other(format!("profile failed: {error}")))?;
     let result = webdriver::serve(&listener, &browser.handle()).await;
     result.and(browser.handle().close().await)

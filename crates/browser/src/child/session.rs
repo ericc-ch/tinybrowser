@@ -140,6 +140,7 @@ fn handle_host(
             }
         }
         Some(Frame::Notify(HostNotice::StorageEvent {
+            target,
             origin,
             kind,
             key,
@@ -153,6 +154,7 @@ fn handle_host(
                 &renderer::PendingStorageEvent::broadcast(
                     origin, kind, key, old_value, new_value, url,
                 ),
+                target,
                 source,
             );
             true
@@ -193,10 +195,7 @@ fn handle_request(
             Command::Screenshot { .. } => Reply::Screenshot {
                 result: Err(stream_error("unknown assignment")),
             },
-            Command::RemoteSessionGet { .. } => Reply::Optional(None),
-            Command::WindowMessage { .. } | Command::SeedSession { .. } => {
-                Reply::Unit(Err(stream_error("unknown assignment")))
-            }
+            Command::WindowMessage { .. } => Reply::Unit(Err(stream_error("unknown assignment"))),
         };
         return send_to_browser(
             outbox,
@@ -278,9 +277,13 @@ fn queue_broadcast_message(
 fn queue_storage_event(
     engines: &mut HashMap<RendererAssignmentId, Engine>,
     event: &renderer::PendingStorageEvent,
+    target: Option<RendererAssignmentId>,
     source: Option<(RendererAssignmentId, FrameId)>,
 ) {
     for (assignment, engine) in engines {
+        if target.is_some_and(|target| target != *assignment) {
+            continue;
+        }
         let mut event = event.clone();
         event.source = source.and_then(|(source_assignment, frame)| {
             (source_assignment == *assignment).then_some(frame)
@@ -528,10 +531,6 @@ fn handle_command(engine: &mut Engine, command: Command) -> Handled {
         Command::WindowMessage { payload } => {
             engine.receive_remote_window_message(payload);
             Handled::Reply(Reply::Unit(Ok(())))
-        }
-        Command::SeedSession { seed } => Handled::Reply(Reply::Unit(engine.seed_session(seed))),
-        Command::RemoteSessionGet { origin, key } => {
-            Handled::Reply(Reply::Optional(engine.session_get(&origin, &key)))
         }
     }
 }

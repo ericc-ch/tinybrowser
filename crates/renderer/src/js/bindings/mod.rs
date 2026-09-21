@@ -1562,11 +1562,14 @@ mod realm_tests {
     use crate::document::Stop;
     use crate::js::{JsRealm, SharedJsRuntime, World};
     use crate::messaging::Shared;
-    use crate::protocol::{BrowserServices, DialCompletion, DialRequest, FrameId};
+    use crate::protocol::{
+        BrowserServices, BrowsingContextHost, DialCompletion, DialRequest, FrameId, MessagingHost,
+        NetworkHost, StorageHost, StorageKind,
+    };
 
     struct NullServices;
 
-    impl BrowserServices for NullServices {
+    impl NetworkHost for NullServices {
         fn start_dial(&self, _request: DialRequest, completion: DialCompletion) {
             completion(Err(crate::protocol::DialFailure::Connect));
         }
@@ -1576,17 +1579,20 @@ mod realm_tests {
         }
 
         fn set_cookie(&self, _value: &str, _url: &Url) {}
+    }
 
-        fn storage_get(&self, _origin: &str, _key: &str) -> Option<String> {
+    impl StorageHost for NullServices {
+        fn storage_get(&self, _kind: StorageKind, _origin: &str, _key: &str) -> Option<String> {
             None
         }
 
-        fn storage_keys(&self, _origin: &str) -> Vec<String> {
+        fn storage_keys(&self, _kind: StorageKind, _origin: &str) -> Vec<String> {
             Vec::new()
         }
 
         fn storage_set(
             &self,
+            _kind: StorageKind,
             _origin: &str,
             _url: &str,
             _key: &str,
@@ -1598,6 +1604,7 @@ mod realm_tests {
 
         fn storage_remove(
             &self,
+            _kind: StorageKind,
             _origin: &str,
             _url: &str,
             _key: &str,
@@ -1608,20 +1615,17 @@ mod realm_tests {
 
         fn storage_clear(
             &self,
+            _kind: StorageKind,
             _origin: &str,
             _url: &str,
             _source: FrameId,
         ) -> Option<crate::protocol::StorageChange> {
             None
         }
+    }
 
-        fn window_open(
-            &self,
-            _url: &str,
-            _name: &str,
-            _features: &str,
-            _seed: Option<&crate::protocol::StorageSeed>,
-        ) -> Option<u64> {
+    impl BrowsingContextHost for NullServices {
+        fn window_open(&self, _url: &str, _name: &str, _features: &str) -> Option<u64> {
             None
         }
 
@@ -1636,7 +1640,9 @@ mod realm_tests {
         fn remote_session_get(&self, _tab: u64, _origin: &str, _key: &str) -> Option<String> {
             None
         }
+    }
 
+    impl MessagingHost for NullServices {
         fn broadcast_post(&self, _origin: &str, _name: &str, _payload: &str, _channel: u64) {}
     }
 
@@ -1655,7 +1661,6 @@ mod realm_tests {
             documents: Rc::clone(documents),
             registry: Rc::clone(registry),
             shared: Rc::new(RefCell::new(Shared::default())),
-            session_storage: Rc::new(RefCell::new(crate::storage::SessionStorage::default())),
             pending_storage: Rc::new(RefCell::new(Vec::new())),
         };
         let mut world = World::new(Url::parse(url).expect("test url"), FrameId::MAIN, &runtime);

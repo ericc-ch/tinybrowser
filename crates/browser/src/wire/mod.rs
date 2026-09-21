@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use crate::exchange::Frame;
 use renderer::{
     DialFailure, DialOutcome, DialRequest, FrameId, RemoteValue, RendererEvent, StorageChange,
-    StorageError, StorageKind, StorageSeed, TabError,
+    StorageError, StorageKind, TabError,
 };
 
 /// Browser-minted identity of one top-level document hosted by a renderer.
@@ -29,12 +29,6 @@ impl RendererAssignmentId {
     #[must_use]
     pub fn new(raw: u64) -> Self {
         Self(raw)
-    }
-
-    /// Stable numeric identity for protocol messages.
-    #[must_use]
-    pub fn get(self) -> u64 {
-        self.0
     }
 }
 
@@ -62,18 +56,6 @@ pub enum Command {
         /// `__tbEncode` payload from the posting window.
         payload: String,
     },
-    /// Copies one `sessionStorage` seed into the engine.
-    SeedSession {
-        /// The opener's session area for one origin.
-        seed: StorageSeed,
-    },
-    /// Reads one key of this engine's session area for `origin`.
-    RemoteSessionGet {
-        /// Serialized origin of the calling document.
-        origin: String,
-        /// Item key, encoded by the calling realm.
-        key: String,
-    },
 }
 
 /// Renderer reply to one [`Command`].
@@ -83,8 +65,6 @@ pub enum Reply {
     Unit(Result<(), TabError>),
     /// Value-only script result.
     Value(Result<RemoteValue, TabError>),
-    /// Optional string result (`RemoteSessionGet`).
-    Optional(Option<String>),
     /// A PNG follows in body frames for this request id; `len` is its exact
     /// byte length. The JSON control plane never carries the bytes.
     Screenshot {
@@ -132,6 +112,9 @@ pub enum HostNotice {
     /// `origin` except the source window fires a `storage` event
     /// (<https://html.spec.whatwg.org/multipage/webstorage.html#concept-storage-broadcast>).
     StorageEvent {
+        /// Assignment receiving a session-storage event; `None` broadcasts a
+        /// local-storage event to every assignment.
+        target: Option<RendererAssignmentId>,
         /// Serialized origin whose area changed.
         origin: String,
         /// Which area changed.
@@ -223,6 +206,19 @@ pub(crate) type FromRenderer = Frame<BrowserCall, RendererReply, RendererNotice>
 /// What the renderer needs the browser process to do.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum ServiceCall {
+    /// Network and cookie operation.
+    Network(NetworkCall),
+    /// Web Storage operation.
+    Storage(StorageCall),
+    /// Browsing-context operation.
+    BrowsingContext(BrowsingContextCall),
+    /// Cross-context messaging operation.
+    Messaging(MessagingCall),
+}
+
+/// Network and cookie operation requested by a renderer.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum NetworkCall {
     /// HTTP GET submitted to the browser-owned network executor.
     Dial(DialRequest),
     /// `document.cookie` getter.
@@ -237,20 +233,31 @@ pub enum ServiceCall {
         /// Document URL.
         url: String,
     },
+}
+
+/// Web Storage operation requested by a renderer.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum StorageCall {
     /// `localStorage.getItem(key)`.
-    StorageGet {
+    Get {
+        /// Storage area kind.
+        kind: StorageKind,
         /// Serialized origin of the calling document.
         origin: String,
         /// Item key.
         key: String,
     },
     /// Every key of one origin's local storage area.
-    StorageKeys {
+    Keys {
+        /// Storage area kind.
+        kind: StorageKind,
         /// Serialized origin of the calling document.
         origin: String,
     },
     /// `localStorage.setItem(key, value)`.
-    StorageSet {
+    Set {
+        /// Storage area kind.
+        kind: StorageKind,
         /// Serialized origin of the calling document.
         origin: String,
         /// Calling document URL; the `storage` event reports it.
@@ -263,7 +270,9 @@ pub enum ServiceCall {
         source: FrameId,
     },
     /// `localStorage.removeItem(key)`.
-    StorageRemove {
+    Remove {
+        /// Storage area kind.
+        kind: StorageKind,
         /// Serialized origin of the calling document.
         origin: String,
         /// Calling document URL.
@@ -274,7 +283,9 @@ pub enum ServiceCall {
         source: FrameId,
     },
     /// `localStorage.clear()`.
-    StorageClear {
+    Clear {
+        /// Storage area kind.
+        kind: StorageKind,
         /// Serialized origin of the calling document.
         origin: String,
         /// Calling document URL.
@@ -282,6 +293,11 @@ pub enum ServiceCall {
         /// Frame whose script made the change.
         source: FrameId,
     },
+}
+
+/// Browsing-context operation requested by a renderer.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum BrowsingContextCall {
     /// `window.open(url, target, features)`.
     WindowOpen {
         /// Absolute URL to load, or empty for `about:blank`.
@@ -290,8 +306,6 @@ pub enum ServiceCall {
         name: String,
         /// Feature string from the caller.
         features: String,
-        /// Session copy for the new tab, when the opener sent one.
-        seed: Option<StorageSeed>,
     },
     /// `window.close()` on a window this renderer opened.
     WindowClose {
@@ -307,15 +321,20 @@ pub enum ServiceCall {
         /// `__tbEncode` payload from the sender's realm.
         payload: String,
     },
-    /// Reads one key of another tab's session area for `origin`.
+    /// Reads one key from another tab's session area.
     RemoteSessionGet {
         /// Target tab identity.
         tab: u64,
         /// Serialized origin of the calling document.
         origin: String,
-        /// Item key, encoded by the calling realm.
+        /// Encoded item key.
         key: String,
     },
+}
+
+/// Cross-context messaging operation requested by a renderer.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum MessagingCall {
     /// One `BroadcastChannel.postMessage` for every same-origin channel.
     BroadcastPost {
         /// Serialized origin of the posting document.
@@ -408,6 +427,7 @@ mod tests {
                 }))),
             },
             Frame::Notify(HostNotice::StorageEvent {
+                target: None,
                 origin: "http://example.test".into(),
                 kind: StorageKind::Local,
                 key: Some("k".into()),
@@ -451,12 +471,12 @@ mod tests {
                 id: RequestId::new(2),
                 body: BrowserCall {
                     assignment,
-                    call: ServiceCall::Dial(DialRequest {
+                    call: ServiceCall::Network(NetworkCall::Dial(DialRequest {
                         kind: DialKind::JsFetch,
                         url: "http://example.test/a".into(),
                         initiator: "http://example.test/".into(),
                         read_body: true,
-                    }),
+                    })),
                 },
             },
             Frame::Cancel {
@@ -472,64 +492,65 @@ mod tests {
     fn browser_service_calls_round_trip() {
         let assignment = RendererAssignmentId::new(1);
         let calls = vec![
-            ServiceCall::CookieGet {
+            ServiceCall::Network(NetworkCall::CookieGet {
                 url: "http://example.test/".into(),
-            },
-            ServiceCall::CookieSet {
+            }),
+            ServiceCall::Network(NetworkCall::CookieSet {
                 value: "a=1".into(),
                 url: "http://example.test/".into(),
-            },
-            ServiceCall::StorageGet {
+            }),
+            ServiceCall::Storage(StorageCall::Get {
+                kind: StorageKind::Local,
                 origin: "http://example.test".into(),
                 key: "k".into(),
-            },
-            ServiceCall::StorageKeys {
+            }),
+            ServiceCall::Storage(StorageCall::Keys {
+                kind: StorageKind::Local,
                 origin: "http://example.test".into(),
-            },
-            ServiceCall::StorageSet {
+            }),
+            ServiceCall::Storage(StorageCall::Set {
+                kind: StorageKind::Local,
                 origin: "http://example.test".into(),
                 url: "http://example.test/".into(),
                 key: "k".into(),
                 value: "v".into(),
                 source: FrameId::MAIN,
-            },
-            ServiceCall::StorageRemove {
+            }),
+            ServiceCall::Storage(StorageCall::Remove {
+                kind: StorageKind::Local,
                 origin: "http://example.test".into(),
                 url: "http://example.test/".into(),
                 key: "k".into(),
                 source: FrameId::MAIN,
-            },
-            ServiceCall::StorageClear {
+            }),
+            ServiceCall::Storage(StorageCall::Clear {
+                kind: StorageKind::Local,
                 origin: "http://example.test".into(),
                 url: "http://example.test/".into(),
                 source: FrameId::MAIN,
-            },
-            ServiceCall::WindowOpen {
+            }),
+            ServiceCall::BrowsingContext(BrowsingContextCall::WindowOpen {
                 url: "http://example.test/".into(),
                 name: "popup".into(),
                 features: "noopener".into(),
-                seed: Some(StorageSeed {
-                    origin: "http://example.test".into(),
-                    entries: vec![("k".into(), "v".into())],
-                }),
-            },
-            ServiceCall::WindowClose { tab: 3 },
-            ServiceCall::Opener,
-            ServiceCall::WindowMessage {
+            }),
+            ServiceCall::BrowsingContext(BrowsingContextCall::WindowClose { tab: 3 }),
+            ServiceCall::BrowsingContext(BrowsingContextCall::Opener),
+            ServiceCall::BrowsingContext(BrowsingContextCall::WindowMessage {
                 tab: 3,
                 payload: "tb1:null".into(),
-            },
-            ServiceCall::RemoteSessionGet {
+            }),
+            ServiceCall::BrowsingContext(BrowsingContextCall::RemoteSessionGet {
                 tab: 3,
                 origin: "http://example.test".into(),
                 key: "k".into(),
-            },
-            ServiceCall::BroadcastPost {
+            }),
+            ServiceCall::Messaging(MessagingCall::BroadcastPost {
                 origin: "http://example.test".into(),
                 name: "chan".into(),
                 payload: "tb1:null".into(),
                 channel: 4,
-            },
+            }),
         ];
         for (raw_id, call) in (1_u64..).zip(calls) {
             let message: FromRenderer = Frame::Call {

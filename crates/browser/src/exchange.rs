@@ -180,6 +180,21 @@ impl<T> Sender<T> {
         }
     }
 
+    /// Sends `value`, or drops it when the lane is full. Unlike [`try_send`],
+    /// a full lane does not disconnect the peer.
+    pub(crate) fn try_send_lossy(&self, value: T) -> Result<(), Error>
+    where
+        T: Lane,
+    {
+        if self.is_closed() {
+            return Err(Error::Closed);
+        }
+        match self.channel(value.queue()).try_send(value) {
+            Err(mpsc::error::TrySendError::Closed(_)) => Err(Error::Closed),
+            Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => Ok(()),
+        }
+    }
+
     async fn reserve(&self, queue: Queue) -> Result<mpsc::OwnedPermit<T>, Error> {
         let mut closed = self.closed.subscribe();
         if *closed.borrow() {
@@ -462,6 +477,10 @@ where
 
     pub(crate) fn try_notify(&self, notice: ON) -> Result<(), Error> {
         self.tx.try_send(Frame::Notify(notice))
+    }
+
+    pub(crate) fn try_notify_lossy(&self, notice: ON) -> Result<(), Error> {
+        self.tx.try_send_lossy(Frame::Notify(notice))
     }
 
     pub(crate) async fn notify(&self, notice: ON) -> Result<(), Error> {
@@ -1158,6 +1177,21 @@ mod tests {
         tx.try_send(Frame::Notify(1)).expect("fill data");
         assert_eq!(tx.try_send(Frame::Notify(2)), Err(Error::Closed));
         assert!(rx.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn try_send_lossy_on_a_full_data_lane_keeps_the_peer() {
+        let (tx, mut rx) = pair::<Frame<u8, u8, u8>>(8, 1);
+        tx.try_send(Frame::Notify(1)).expect("fill data");
+        tx.try_send_lossy(Frame::Notify(2))
+            .expect("drop instead of disconnect");
+        let Some(Frame::Notify(1)) = rx.recv().await else {
+            unreachable!("queued notice stays");
+        };
+        tx.try_send(Frame::Notify(3)).expect("lane drained");
+        let Some(Frame::Notify(3)) = rx.recv().await else {
+            unreachable!("lossy send did not close the lane");
+        };
     }
 
     #[tokio::test]

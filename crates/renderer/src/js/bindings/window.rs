@@ -1,7 +1,7 @@
 //! Window-level listeners, location, and load events.
 
-use super::{events, main_document};
-use rquickjs::function::Opt;
+use super::{events, main_document, world};
+use rquickjs::function::{Opt, This};
 
 use std::cell::RefCell;
 
@@ -12,8 +12,29 @@ use dom::NodeId;
 use rquickjs::{Class, Ctx, Object, Result, Value};
 
 use crate::js::events::JsEvent;
-
 use crate::js::world::{EventTargetKey, World};
+use crate::protocol::FrameId;
+
+/// The window `this` belongs to. A `WindowProxy` method call from another realm
+/// still registers on that frame's window
+/// (<https://html.spec.whatwg.org/multipage/window-object.html#windowproxy-get>).
+fn world_for_window_this<'js>(ctx: &Ctx<'js>, this: &Object<'js>) -> Result<Rc<RefCell<World>>> {
+    let current = world(ctx)?;
+    let Ok(frame) = this.get::<_, f64>("__tb_frameId") else {
+        return Ok(current);
+    };
+    if !frame.is_finite() || frame < 0.0 || frame.fract() != 0.0 || frame > f64::from(u32::MAX) {
+        return Ok(current);
+    }
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "the value is range-checked to a non-negative u32 above"
+    )]
+    let frame = FrameId::new(frame as u64);
+    let target = current.borrow().frame_world(frame);
+    Ok(target.unwrap_or(current))
+}
 
 /// Installs the `Location` object. The engine has no navigation, so only the
 /// read-only URL components exist
@@ -67,11 +88,20 @@ pub(crate) fn install_location<'js>(
 )]
 pub(crate) fn window_add_event_listener<'js>(
     ctx: Ctx<'js>,
+    this: This<Object<'js>>,
     typ: Value<'js>,
     callback: Value<'js>,
     options: Opt<Value<'js>>,
 ) -> Result<()> {
-    events::add_listener(&ctx, EventTargetKey::Window, typ, callback, options.0)
+    let world = world_for_window_this(&ctx, &this.0)?;
+    events::add_listener_in(
+        &ctx,
+        &world,
+        EventTargetKey::Window,
+        typ,
+        callback,
+        options.0,
+    )
 }
 
 #[allow(
@@ -80,11 +110,20 @@ pub(crate) fn window_add_event_listener<'js>(
 )]
 pub(crate) fn window_remove_event_listener<'js>(
     ctx: Ctx<'js>,
+    this: This<Object<'js>>,
     typ: Value<'js>,
     callback: Value<'js>,
     options: Opt<Value<'js>>,
 ) -> Result<()> {
-    events::remove_listener(&ctx, EventTargetKey::Window, typ, callback, options.0)
+    let world = world_for_window_this(&ctx, &this.0)?;
+    events::remove_listener_in(
+        &ctx,
+        &world,
+        EventTargetKey::Window,
+        typ,
+        callback,
+        options.0,
+    )
 }
 
 #[allow(

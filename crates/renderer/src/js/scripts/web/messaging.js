@@ -565,6 +565,12 @@ const __tbFrameProxy = frame => {
       throw error;
     }
   };
+  // Methods taken off the target window must run with that window as `this`.
+  // A raw `sameOrigin[property]` call would bind `this` to the proxy object,
+  // so `contentWindow.addEventListener` would not hear events dispatched on
+  // the frame's window
+  // (<https://html.spec.whatwg.org/multipage/window-object.html#windowproxy-get>).
+  const methods = Object.create(null);
   const handler = {
     get(target, property) {
       if (property === __tbWindowProxyData) return { frame: frame };
@@ -596,7 +602,19 @@ const __tbFrameProxy = frame => {
         }
         crossOrigin();
       }
-      return sameOrigin[property];
+      const value = sameOrigin[property];
+      if (typeof value !== 'function' || typeof property === 'symbol') {
+        return value;
+      }
+      if (methods[property] === undefined) {
+        const name = property;
+        methods[name] = function(...args) {
+          const global = __tbFrameGlobal(frame);
+          if (global == null) crossOrigin();
+          return global[name](...args);
+        };
+      }
+      return methods[property];
     },
     set(target, property, value) {
       const sameOrigin = __tbFrameGlobal(frame);
@@ -957,26 +975,6 @@ Object.defineProperty(globalThis, 'top', {
     return session;
   }
 
-  function requestsNoOpener(features) {
-    return features
-      .split(/[\s,]+/)
-      .some(token => token.toLowerCase() === 'noopener' || token.toLowerCase() === 'noreferrer');
-  }
-
-  // A new auxiliary browsing context gets a copy of this window's session
-  // area (<https://html.spec.whatwg.org/multipage/document-sequences.html#copy-session-storage>).
-  // The storage seam stores JSON-escaped strings, so the seed carries the
-  // encoded keys and values unchanged.
-  function sessionSeed() {
-    const origin = __tbStorageOrigin();
-    if (origin === null || origin === undefined) return null;
-    const entries = [];
-    for (const key of __tbStorageKeys('session')) {
-      entries.push(key, __tbStorageGet('session', key));
-    }
-    return { origin: origin, entries: entries };
-  }
-
   globalThis.open = function(url, target, features) {
     if (arguments.length < 1 || url === undefined || url === null) url = '';
     const spec = url === '' ? '' : __tbResolveUrl(String(url), undefined);
@@ -984,11 +982,7 @@ Object.defineProperty(globalThis, 'top', {
     const name = target === undefined || target === null ? '' : String(target);
     const featureString = features === undefined || features === null ? '' : String(features);
     if (name !== '' && namedWindows.has(name)) return namedWindows.get(name);
-    const seed = requestsNoOpener(featureString) ? null : sessionSeed();
-    const tab = __tbWindowOpen(
-      spec, name, featureString,
-      seed === null ? '' : seed.origin,
-      seed === null ? [] : seed.entries);
+    const tab = __tbWindowOpen(spec, name, featureString);
     if (tab === null || tab === undefined) return null;
     const proxy = remoteWindow(tab);
     if (name !== '') {

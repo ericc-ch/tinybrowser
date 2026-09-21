@@ -1,0 +1,10 @@
+[package]
+name = "webstorage"
+version.workspace = true
+edition.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }

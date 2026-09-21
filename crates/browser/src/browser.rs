@@ -7,13 +7,12 @@ use std::io;
 use std::path::Path;
 use std::sync::Arc;
 
-use renderer::StorageSeed;
 use url::Url;
 
 use crate::actor::{TabHandle, TabId, TabTask};
+use crate::context::BrowserContext;
 use crate::exchange::{self, ServerInput};
 use crate::manager::RendererProcessManager;
-use crate::network::NetworkSession;
 use crate::profile::Profile;
 use crate::store::ProfileStore;
 
@@ -60,37 +59,15 @@ enum Command {
         source: Option<TabId>,
         /// The caller asked for `noopener`/`noreferrer`; no opener link.
         noopener: bool,
-        /// Session copy for the new tab, when the opener sent one.
-        seed: Option<StorageSeed>,
     },
-    /// Records which tab owns one renderer assignment.
-    RegisterAssignment {
-        assignment: u64,
-        tab: TabId,
-    },
-    /// Forgets a released renderer assignment, so cross-site navigation does
-    /// not accumulate stale entries for the tab's lifetime.
-    UnregisterAssignment {
-        assignment: u64,
-    },
-    /// The tab that owns one renderer assignment.
-    AssignmentTab {
-        assignment: u64,
-    },
-    /// `window.opener` for one assignment's tab.
+    /// `window.opener` for one tab.
     OpenerTab {
-        assignment: u64,
+        tab: TabId,
     },
     /// Routes one `postMessage` to a live tab.
     WindowMessage {
         target: TabId,
         payload: String,
-    },
-    /// Reads one key of a live tab's session area for `origin`.
-    RemoteSessionGet {
-        target: TabId,
-        origin: String,
-        key: String,
     },
 }
 
@@ -105,12 +82,8 @@ enum Reply {
     ClearCookies,
     AddCookie(bool),
     OpenWindow(Result<TabId, BrowserError>),
-    RegisterAssignment,
-    UnregisterAssignment,
-    AssignmentTab(Option<TabId>),
     OpenerTab(Option<TabId>),
     WindowMessage(Result<(), BrowserError>),
-    RemoteSessionGet(Result<Option<String>, BrowserError>),
 }
 
 #[derive(Clone)]
@@ -123,13 +96,10 @@ type BrowserServer = exchange::Server<Infallible, Reply, Infallible, Command, No
 
 struct BrowserState {
     live: bool,
-    network: NetworkSession,
+    context: BrowserContext,
     renderers: Arc<RendererProcessManager>,
-    browser: BrowserHandle,
     tabs: HashMap<TabId, TabTask>,
     next_tab: u64,
-    /// Which tab owns each renderer assignment.
-    assignments: HashMap<u64, TabId>,
     /// Auxiliary browsing context relationships: openee -> opener.
     openers: HashMap<TabId, TabId>,
 }
@@ -142,7 +112,7 @@ impl Browser {
     ///
     /// The profile directory cannot be created, read, or exclusively locked.
     pub fn open_in(data_home: &Path, profile: &Profile) -> io::Result<Self> {
-        Self::open_in_with(data_home, profile, net::AgentBuilder::new())
+        Self::open_in_with_network(data_home, profile, net::AgentBuilder::new())
     }
 
     /// Opens a browser on `profile` with cookies under `data_home`, renderer
@@ -153,23 +123,12 @@ impl Browser {
     /// The profile directory cannot be created, read, or exclusively locked;
     /// stored profile data cannot be loaded; or the caller is not running
     /// inside the executable-owned Tokio runtime.
-    pub fn open_in_with(
+    pub fn open_in_with_network(
         data_home: &Path,
         profile: &Profile,
         builder: net::AgentBuilder,
     ) -> io::Result<Self> {
-        let network =
-            NetworkSession::from_builder(builder, ProfileStore::open_in(data_home, profile)?)?;
-        Self::open_with_network(network)
-    }
-
-    /// Opens a browser that shares `network` and its cookie jar with renderer
-    /// processes.
-    ///
-    /// # Errors
-    ///
-    /// The caller is not running inside the executable-owned Tokio runtime.
-    pub fn open_with_network(network: NetworkSession) -> io::Result<Self> {
+        let context = BrowserContext::open(ProfileStore::open_in(data_home, profile)?, builder)?;
         let runtime = tokio::runtime::Handle::try_current()
             .map_err(|error| io::Error::other(format!("browser runtime unavailable: {error}")))?;
         let (client, server) = exchange::local(BROWSER_COMMAND_CAPACITY);
@@ -177,17 +136,16 @@ impl Browser {
         // Renderer links create tabs for `window.open`, so they get the same
         // command handle the adapters use.
         let renderers = Arc::new(RendererProcessManager::new(
-            network.fetch_handle(),
+            context.partition_services(),
+            context.session_storage(),
             handle.clone(),
         ));
         let state = BrowserState {
             live: true,
-            network,
+            context,
             renderers,
-            browser: handle.clone(),
             tabs: HashMap::new(),
             next_tab: 1,
-            assignments: HashMap::new(),
             openers: HashMap::new(),
         };
         runtime.spawn(browser_loop(server, state));
@@ -326,14 +284,12 @@ impl BrowserHandle {
         url: String,
         source: Option<TabId>,
         noopener: bool,
-        seed: Option<StorageSeed>,
     ) -> Result<TabId, BrowserError> {
         match self
             .call(Command::OpenWindow {
                 url,
                 source,
                 noopener,
-                seed,
             })
             .await?
         {
@@ -342,62 +298,13 @@ impl BrowserHandle {
         }
     }
 
-    /// Records which tab owns one renderer assignment.
+    /// `window.opener` for one tab.
     ///
     /// # Errors
     ///
     /// [`BrowserError::Stopped`] when the browser task has stopped.
-    pub(crate) async fn register_assignment(
-        &self,
-        assignment: u64,
-        tab: TabId,
-    ) -> Result<(), BrowserError> {
-        match self
-            .call(Command::RegisterAssignment { assignment, tab })
-            .await?
-        {
-            Reply::RegisterAssignment => Ok(()),
-            _ => Err(BrowserError::Protocol),
-        }
-    }
-
-    /// Forgets a released renderer assignment.
-    ///
-    /// # Errors
-    ///
-    /// [`BrowserError::Stopped`] when the browser task has stopped.
-    pub(crate) async fn unregister_assignment(&self, assignment: u64) -> Result<(), BrowserError> {
-        match self
-            .call(Command::UnregisterAssignment { assignment })
-            .await?
-        {
-            Reply::UnregisterAssignment => Ok(()),
-            _ => Err(BrowserError::Protocol),
-        }
-    }
-
-    /// The tab that owns one renderer assignment.
-    ///
-    /// # Errors
-    ///
-    /// [`BrowserError::Stopped`] when the browser task has stopped.
-    pub(crate) async fn assignment_tab(
-        &self,
-        assignment: u64,
-    ) -> Result<Option<TabId>, BrowserError> {
-        match self.call(Command::AssignmentTab { assignment }).await? {
-            Reply::AssignmentTab(tab) => Ok(tab),
-            _ => Err(BrowserError::Protocol),
-        }
-    }
-
-    /// `window.opener` for one assignment's tab.
-    ///
-    /// # Errors
-    ///
-    /// [`BrowserError::Stopped`] when the browser task has stopped.
-    pub(crate) async fn opener_tab(&self, assignment: u64) -> Result<Option<TabId>, BrowserError> {
-        match self.call(Command::OpenerTab { assignment }).await? {
+    pub(crate) async fn opener_tab(&self, tab: TabId) -> Result<Option<TabId>, BrowserError> {
+        match self.call(Command::OpenerTab { tab }).await? {
             Reply::OpenerTab(tab) => Ok(tab),
             _ => Err(BrowserError::Protocol),
         }
@@ -418,30 +325,6 @@ impl BrowserHandle {
             .await?
         {
             Reply::WindowMessage(result) => result,
-            _ => Err(BrowserError::Protocol),
-        }
-    }
-
-    /// Reads one key of `target`'s session area for `origin`.
-    ///
-    /// # Errors
-    ///
-    /// [`BrowserError::UnknownTab`] when the target is gone.
-    pub(crate) async fn remote_session_get(
-        &self,
-        target: TabId,
-        origin: String,
-        key: String,
-    ) -> Result<Option<String>, BrowserError> {
-        match self
-            .call(Command::RemoteSessionGet {
-                target,
-                origin,
-                key,
-            })
-            .await?
-        {
-            Reply::RemoteSessionGet(result) => result,
             _ => Err(BrowserError::Protocol),
         }
     }
@@ -482,11 +365,11 @@ fn create_tab(state: &mut BrowserState) -> Result<TabHandle, BrowserError> {
     }
     let id = TabId::new(state.next_tab);
     state.next_tab = state.next_tab.saturating_add(1);
+    state.context.create_tab(id);
     let task = TabTask::spawn(
         id,
-        state.network.fetch_handle(),
+        state.context.tab_network(),
         Arc::clone(&state.renderers),
-        state.browser.clone(),
     );
     let handle = task.handle.clone();
     state.tabs.insert(id, task);
@@ -500,24 +383,15 @@ fn open_window(
     url: String,
     source: Option<TabId>,
     noopener: bool,
-    seed: Option<StorageSeed>,
 ) -> Result<TabId, BrowserError> {
     let handle = create_tab(state)?;
     let id = handle.id();
     if let (Some(source), false) = (source, noopener) {
         state.openers.insert(id, source);
+        state.context.copy_session(source, id);
     }
     let navigate = !url.is_empty() && url != "about:blank";
-    if let Some(seed) = seed {
-        // The seed must land before the first navigation runs the new
-        // document's scripts, so one task performs both in order.
-        tokio::spawn(async move {
-            let _result = handle.seed_session(seed).await;
-            if navigate {
-                let _result = handle.goto(&url).await;
-            }
-        });
-    } else if navigate {
+    if navigate {
         // The tab starts on about:blank; the first real navigation runs in
         // the background so one slow load cannot stall the command loop.
         tokio::spawn(async move {
@@ -543,30 +417,9 @@ async fn route_window_message(
     }
 }
 
-/// Reads one key of a live tab's session area.
-async fn route_remote_session(
-    state: &BrowserState,
-    target: TabId,
-    origin: String,
-    key: String,
-) -> Result<Option<String>, BrowserError> {
-    match state.tabs.get(&target) {
-        Some(task) => task
-            .handle
-            .remote_session_get(origin, key)
-            .await
-            .map_err(|_| BrowserError::UnknownTab),
-        None => Err(BrowserError::UnknownTab),
-    }
-}
-
-/// `window.opener` for one renderer assignment.
-fn opener_tab(state: &BrowserState, assignment: u64) -> Option<TabId> {
-    state
-        .assignments
-        .get(&assignment)
-        .and_then(|tab| state.openers.get(tab))
-        .copied()
+/// `window.opener` for one tab.
+fn opener_tab(state: &BrowserState, tab: TabId) -> Option<TabId> {
+    state.openers.get(&tab).copied()
 }
 
 /// Synchronous state queries; returns the command back when it needs awaits.
@@ -583,14 +436,14 @@ fn route_sync(state: &mut BrowserState, command: Command) -> Result<Reply, Comma
         }
         Command::IsLive => Ok(Reply::IsLive(state.live)),
         Command::CookieRecords { url } => {
-            Ok(Reply::CookieRecords(state.network.cookie_records(&url)))
+            Ok(Reply::CookieRecords(state.context.cookie_records(&url)))
         }
         Command::ClearCookies => {
-            state.network.clear_cookies();
+            state.context.clear_cookies();
             Ok(Reply::ClearCookies)
         }
         Command::AddCookie { cookie, url } => {
-            Ok(Reply::AddCookie(state.network.add_cookie(&cookie, &url)))
+            Ok(Reply::AddCookie(state.context.add_cookie(&cookie, &url)))
         }
         command => Err(command),
     }
@@ -602,7 +455,7 @@ async fn browser_loop(mut server: BrowserServer, mut state: BrowserState) {
             if matches!(input, ServerInput::Notify(Notice::Close)) {
                 state.live = false;
                 close_all(&mut state.tabs).await;
-                let _result = state.network.persist().await;
+                let _result = state.context.persist().await;
                 return;
             }
             continue;
@@ -625,36 +478,15 @@ async fn browser_loop(mut server: BrowserServer, mut state: BrowserState) {
                     url,
                     source,
                     noopener,
-                    seed,
-                } => Reply::OpenWindow(open_window(&mut state, url, source, noopener, seed)),
-                Command::RegisterAssignment { assignment, tab } => {
-                    state.assignments.insert(assignment, tab);
-                    Reply::RegisterAssignment
-                }
-                Command::UnregisterAssignment { assignment } => {
-                    state.assignments.remove(&assignment);
-                    Reply::UnregisterAssignment
-                }
-                Command::AssignmentTab { assignment } => {
-                    Reply::AssignmentTab(state.assignments.get(&assignment).copied())
-                }
-                Command::OpenerTab { assignment } => {
-                    Reply::OpenerTab(opener_tab(&state, assignment))
-                }
+                } => Reply::OpenWindow(open_window(&mut state, url, source, noopener)),
+                Command::OpenerTab { tab } => Reply::OpenerTab(opener_tab(&state, tab)),
                 Command::WindowMessage { target, payload } => {
                     Reply::WindowMessage(route_window_message(&state, target, payload).await)
                 }
-                Command::RemoteSessionGet {
-                    target,
-                    origin,
-                    key,
-                } => {
-                    Reply::RemoteSessionGet(route_remote_session(&state, target, origin, key).await)
-                }
                 Command::CloseTab { id } => {
                     let result = if let Some(mut task) = state.tabs.remove(&id) {
-                        state.assignments.retain(|_, tab| *tab != id);
                         state.openers.remove(&id);
+                        state.context.close_tab(id);
                         task.shutdown().await;
                         Ok(())
                     } else {
@@ -665,7 +497,7 @@ async fn browser_loop(mut server: BrowserServer, mut state: BrowserState) {
                 Command::Close => {
                     state.live = false;
                     close_all(&mut state.tabs).await;
-                    Reply::Close(state.network.persist().await)
+                    Reply::Close(state.context.persist().await)
                 }
             },
         };
@@ -680,7 +512,7 @@ async fn browser_loop(mut server: BrowserServer, mut state: BrowserState) {
     close_all(&mut state.tabs).await;
     if state.live {
         state.live = false;
-        let _result = state.network.persist().await;
+        let _result = state.context.persist().await;
     }
 }
 
