@@ -86,7 +86,7 @@ fn strip_cdata(css: &str) -> &str {
 use crate::documents::DocumentStore;
 use crate::js::{DocumentStreamCommand, FrameNavigation, RealmRegistry, SharedJsRuntime};
 use crate::messaging::{Delivery, MAX_FRAMES, SharedHandle};
-use crate::protocol::{BrowserServices, FrameId, Mount, StorageSeed, TabError, TabEvent};
+use crate::protocol::{BrowserServices, FrameId, Mount, RendererEvent, StorageSeed, TabError};
 use crate::storage::PendingStorageEvent;
 
 /// One renderer process's page engine.
@@ -345,7 +345,7 @@ impl Engine {
     ///
     /// [`TabError::RendererUnavailable`] when a frame retained more events
     /// than its limit; the queue empties and the excess is lost.
-    pub fn take_events(&mut self) -> Result<Vec<(FrameId, TabEvent)>, TabError> {
+    pub fn take_events(&mut self) -> Result<Vec<(FrameId, RendererEvent)>, TabError> {
         let mut events = Vec::new();
         for (&frame, document) in &mut self.frames {
             let pending = document

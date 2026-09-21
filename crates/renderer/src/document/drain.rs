@@ -5,7 +5,7 @@ use std::time::Duration;
 use tokio::time::Instant;
 
 use super::{DialContext, Document, MAX_PENDING_JS_FETCHES, QueuedDial, Task, Timer};
-use crate::protocol::TabEvent;
+use crate::protocol::RendererEvent;
 
 impl Document {
     /// Runs one batch of ready work and reports whether more may follow.
@@ -114,7 +114,7 @@ impl Document {
     fn run_task(&mut self, task: Task) {
         match task {
             Task::Timer(id) => {
-                self.record_event(TabEvent::Timer(id));
+                self.record_event(RendererEvent::Timer(id));
                 if let Some(js_id) = self.js_timer_slots.remove(&id) {
                     self.fire_js(|js| js.fire_timer(js_id));
                 }
@@ -184,7 +184,7 @@ impl Document {
                     .count(),
             );
             if pending_js_fetches >= MAX_PENDING_JS_FETCHES {
-                self.record_event(TabEvent::FetchFailed);
+                self.record_event(RendererEvent::FetchFailed);
                 self.settle_js_fetch(fetch.js_id, false, 0, "");
                 continue;
             }
@@ -199,7 +199,7 @@ impl Document {
                     initiator,
                 });
             } else {
-                self.record_event(TabEvent::FetchFailed);
+                self.record_event(RendererEvent::FetchFailed);
                 self.settle_js_fetch(fetch.js_id, false, 0, "");
             }
         }

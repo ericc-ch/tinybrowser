@@ -8,14 +8,14 @@
 //! ```
 //!
 //! The version byte is [`PROTOCOL_VERSION`]; a mismatch fails closed. Control
-//! payloads are JSON and capped at [`MAX_CONTROL_BYTES`]. Body chunks are raw
+//! payloads are JSON and capped at [`MAX_CONTROL_BYTES`]. Stream chunks are raw
 //! bytes and capped at [`MAX_BODY_CHUNK_BYTES`]. Readers validate the header and
 //! length before they allocate or read the payload, so a corrupt or hostile
 //! peer cannot force an unbounded allocation.
 //!
 //! The first frame in each direction is the handshake: the browser sends
-//! [`ToRenderer::Hello`](crate::wire::ToRenderer::Hello) and the renderer replies
-//! [`FromRenderer::Ready`](crate::wire::FromRenderer::Ready).
+//! [`HostNotice::Hello`](crate::wire::HostNotice::Hello) and the renderer replies
+//! [`RendererNotice::Ready`](crate::wire::RendererNotice::Ready).
 
 use std::io::{self, Read, Write};
 
@@ -27,8 +27,9 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 /// Version 5 added the storage service calls and the browser-broadcast
 /// `storage` event. Version 6 added `window.open`/`window.close`. Version 7
 /// added cross-tab messaging, session copies, and remote session reads.
-/// Version 8 added `BroadcastChannel`.
-pub const PROTOCOL_VERSION: u8 = 8;
+/// Version 8 added `BroadcastChannel`. Version 9 replaced operation-specific
+/// body messages with directional exchange stream chunks.
+pub const PROTOCOL_VERSION: u8 = 9;
 
 /// Fixed frame header size in bytes.
 pub const HEADER_BYTES: usize = 16;
@@ -40,29 +41,34 @@ pub const MAX_CONTROL_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_BODY_CHUNK_BYTES: usize = 64 * 1024;
 
 const KIND_CONTROL: u8 = 0;
-const KIND_BODY: u8 = 1;
+const KIND_REQUEST_CHUNK: u8 = 1;
+const KIND_RESPONSE_CHUNK: u8 = 2;
 
 /// Payload class of one frame.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FrameKind {
     /// JSON control message.
     Control,
-    /// Raw response-body chunk.
-    Body,
+    /// Raw bytes uploaded with a request.
+    RequestChunk,
+    /// Raw bytes downloaded with a response.
+    ResponseChunk,
 }
 
 impl FrameKind {
     fn wire(self) -> u8 {
         match self {
             Self::Control => KIND_CONTROL,
-            Self::Body => KIND_BODY,
+            Self::RequestChunk => KIND_REQUEST_CHUNK,
+            Self::ResponseChunk => KIND_RESPONSE_CHUNK,
         }
     }
 
     fn from_wire(byte: u8) -> Option<Self> {
         match byte {
             KIND_CONTROL => Some(Self::Control),
-            KIND_BODY => Some(Self::Body),
+            KIND_REQUEST_CHUNK => Some(Self::RequestChunk),
+            KIND_RESPONSE_CHUNK => Some(Self::ResponseChunk),
             _ => None,
         }
     }
@@ -70,7 +76,7 @@ impl FrameKind {
     fn max_payload(self) -> usize {
         match self {
             Self::Control => MAX_CONTROL_BYTES,
-            Self::Body => MAX_BODY_CHUNK_BYTES,
+            Self::RequestChunk | Self::ResponseChunk => MAX_BODY_CHUNK_BYTES,
         }
     }
 }
@@ -101,7 +107,7 @@ pub fn write_control<T: Serialize>(writer: &mut impl Write, message: &T) -> io::
 /// A payload larger than [`MAX_BODY_CHUNK_BYTES`] or write failure.
 #[cfg(test)]
 pub fn write_body(writer: &mut impl Write, request: u64, payload: &[u8]) -> io::Result<()> {
-    write_frame(writer, FrameKind::Body, request, payload)
+    write_frame(writer, FrameKind::ResponseChunk, request, payload)
 }
 
 /// Writes one frame with the fixed header.
@@ -132,19 +138,6 @@ pub async fn write_control_async<W: AsyncWrite + Unpin + ?Sized>(
 ) -> io::Result<()> {
     let payload = serde_json::to_vec(message).map_err(io::Error::other)?;
     write_frame_async(writer, FrameKind::Control, 0, &payload).await
-}
-
-/// Writes one raw body chunk for `request` on an async writer.
-///
-/// # Errors
-///
-/// A payload larger than [`MAX_BODY_CHUNK_BYTES`] or write failure.
-pub async fn write_body_async<W: AsyncWrite + Unpin + ?Sized>(
-    writer: &mut W,
-    request: u64,
-    payload: &[u8],
-) -> io::Result<()> {
-    write_frame_async(writer, FrameKind::Body, request, payload).await
 }
 
 /// Writes one frame with the fixed header on an async writer.
@@ -278,7 +271,7 @@ pub fn read_body(reader: &mut impl Read, buffer: &mut Vec<u8>) -> io::Result<Opt
     match read_frame(reader, buffer)? {
         None => Ok(None),
         Some(Frame {
-            kind: FrameKind::Body,
+            kind: FrameKind::ResponseChunk,
             request,
         }) => Ok(Some(request)),
         Some(_) => Err(invalid("expected a body frame")),
@@ -340,12 +333,15 @@ mod tests {
 
     #[test]
     fn control_frames_round_trip() {
-        let message = crate::wire::ToRenderer::Request {
-            id: 7,
-            assignment: crate::wire::RendererAssignmentId::new(1),
-            command: crate::wire::Command::Eval {
-                frame: renderer::FrameId::MAIN,
-                source: "1+1".into(),
+        let message: crate::wire::ToRenderer = crate::exchange::Frame::Call {
+            id: crate::exchange::RequestId::new(7),
+            body: crate::wire::RendererCall::Command {
+                assignment: crate::wire::RendererAssignmentId::new(1),
+                command: crate::wire::Command::ExecuteScript {
+                    frame: renderer::FrameId::MAIN,
+                    source: "1+1".into(),
+                    timeout_ms: None,
+                },
             },
         };
         let mut bytes = Vec::new();
@@ -357,7 +353,7 @@ mod tests {
             .expect("one frame");
         assert!(matches!(
             back,
-            crate::wire::ToRenderer::Request { id: 7, .. }
+            crate::exchange::Frame::Call { id, .. } if id.get() == 7
         ));
     }
 
@@ -386,12 +382,15 @@ mod tests {
             .expect_err("oversized body");
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
 
-        let message = crate::wire::ToRenderer::Request {
-            id: 1,
-            assignment: crate::wire::RendererAssignmentId::new(1),
-            command: crate::wire::Command::Eval {
-                frame: renderer::FrameId::MAIN,
-                source: "x".repeat(MAX_CONTROL_BYTES),
+        let message: crate::wire::ToRenderer = crate::exchange::Frame::Call {
+            id: crate::exchange::RequestId::new(1),
+            body: crate::wire::RendererCall::Command {
+                assignment: crate::wire::RendererAssignmentId::new(1),
+                command: crate::wire::Command::ExecuteScript {
+                    frame: renderer::FrameId::MAIN,
+                    source: "x".repeat(MAX_CONTROL_BYTES),
+                    timeout_ms: None,
+                },
             },
         };
         let error = write_control(&mut Vec::new(), &message).expect_err("oversized control");
@@ -406,7 +405,7 @@ mod tests {
                 u32::try_from(MAX_CONTROL_BYTES + 1).expect("fits"),
             ),
             (
-                KIND_BODY,
+                KIND_REQUEST_CHUNK,
                 u32::try_from(MAX_BODY_CHUNK_BYTES + 1).expect("fits"),
             ),
         ] {
@@ -430,7 +429,7 @@ mod tests {
 
         assert!(
             read_control::<serde_json::Value>(
-                &mut Cursor::new(header(KIND_BODY, 0, 1, 0)),
+                &mut Cursor::new(header(KIND_RESPONSE_CHUNK, 0, 1, 0)),
                 &mut buffer
             )
             .is_err()

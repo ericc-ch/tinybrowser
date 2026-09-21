@@ -21,7 +21,7 @@ use crate::documents::DocumentStore;
 use crate::js::{DocumentStreamCommand, FrameNavigation, RealmRegistry, SharedJsRuntime, World};
 use crate::messaging::SharedHandle;
 use crate::protocol::{
-    BrowserServices, DialOutcome, FrameId, Mount, ScriptFailure, TabError, TabEvent,
+    BrowserServices, DialOutcome, FrameId, Mount, RendererEvent, ScriptFailure, TabError,
 };
 
 mod dial;
@@ -212,7 +212,7 @@ pub(crate) struct Document {
     pending_frame_loads: HashSet<dom::NodeId>,
     /// Whether this document's `load` event has fired.
     load_fired: bool,
-    events: Vec<TabEvent>,
+    events: Vec<RendererEvent>,
     events_overflowed: bool,
     js: Option<crate::js::JsRealm>,
     js_timer_slots: HashMap<u32, i32>,
@@ -515,7 +515,7 @@ impl Document {
             return;
         }
         if self.eval(script).is_err() {
-            self.record_event(TabEvent::ScriptFailed);
+            self.record_event(RendererEvent::ScriptFailed);
         }
     }
 
@@ -627,7 +627,7 @@ impl Document {
             Ok(false) => self.fire_js(|js| {
                 js.deliver_window_message_error(message.source.get(), &message.origin)
             }),
-            Err(_) => self.record_event(TabEvent::ScriptFailed),
+            Err(_) => self.record_event(RendererEvent::ScriptFailed),
         }
         self.adopt_js_work();
     }
@@ -653,7 +653,7 @@ impl Document {
         match delivered {
             Ok(true) => {}
             Ok(false) => self.fire_js(|js| js.deliver_port_message_error(endpoint)),
-            Err(_) => self.record_event(TabEvent::ScriptFailed),
+            Err(_) => self.record_event(RendererEvent::ScriptFailed),
         }
         self.adopt_js_work();
     }
@@ -720,7 +720,7 @@ impl Document {
         out
     }
 
-    pub(crate) fn take_events(&mut self) -> Result<Vec<TabEvent>, ()> {
+    pub(crate) fn take_events(&mut self) -> Result<Vec<RendererEvent>, ()> {
         if std::mem::take(&mut self.events_overflowed) {
             self.events.clear();
             return Err(());
@@ -894,7 +894,7 @@ impl Document {
     ) {
         let failed = self.js.as_ref().is_some_and(|js| operation(js).is_err());
         if failed {
-            self.record_event(TabEvent::ScriptFailed);
+            self.record_event(RendererEvent::ScriptFailed);
         }
     }
 
@@ -902,7 +902,7 @@ impl Document {
     /// cannot be created.
     fn ensure_js_ok(&mut self) -> bool {
         if self.ensure_js().is_err() {
-            self.record_event(TabEvent::ScriptFailed);
+            self.record_event(RendererEvent::ScriptFailed);
             return false;
         }
         true
@@ -1038,7 +1038,7 @@ impl Document {
                 crate::ParseProgress::Script(id) => {
                     let parsed = parser.take_state();
                     if !self.install_parsed(parsed) {
-                        self.record_event(TabEvent::ScriptFailed);
+                        self.record_event(RendererEvent::ScriptFailed);
                         self.sync_parser_from_world();
                         continue;
                     }
@@ -1092,7 +1092,7 @@ impl Document {
                     };
                     let parsed = parser.finish();
                     if !self.install_parsed(parsed) {
-                        self.record_event(TabEvent::ScriptFailed);
+                        self.record_event(RendererEvent::ScriptFailed);
                         return;
                     }
                     self.world.borrow_mut().parser_active = false;
@@ -1137,7 +1137,7 @@ impl Document {
         let CompletedDial { context, outcome } = done;
         match context {
             DialContext::JsFetch { id, epoch } => {
-                self.record_event(TabEvent::Fetch {
+                self.record_event(RendererEvent::Fetch {
                     status: outcome.status,
                 });
                 if epoch == self.js_epoch {
@@ -1146,7 +1146,7 @@ impl Document {
                 }
             }
             DialContext::ClassicScript { element, epoch } => {
-                self.record_event(TabEvent::Fetch {
+                self.record_event(RendererEvent::Fetch {
                     status: outcome.status,
                 });
                 if epoch == self.js_epoch {
@@ -1167,7 +1167,7 @@ impl Document {
                 if epoch != self.js_epoch {
                     return;
                 }
-                self.record_event(TabEvent::Fetch {
+                self.record_event(RendererEvent::Fetch {
                     status: outcome.status,
                 });
                 self.pending_stylesheets = self.pending_stylesheets.saturating_sub(1);
@@ -1185,7 +1185,7 @@ impl Document {
                 if epoch != self.js_epoch {
                     return;
                 }
-                self.record_event(TabEvent::Fetch {
+                self.record_event(RendererEvent::Fetch {
                     status: outcome.status,
                 });
                 self.pending_images = self.pending_images.saturating_sub(1);
@@ -1230,7 +1230,7 @@ impl Document {
     }
 
     pub(in crate::document) fn fail_dial(&mut self, fail: DialContext) {
-        self.record_event(TabEvent::FetchFailed);
+        self.record_event(RendererEvent::FetchFailed);
         match fail {
             DialContext::JsFetch { id, epoch } => {
                 if epoch == self.js_epoch {
@@ -1351,7 +1351,7 @@ impl Document {
                 },
             };
             if result.is_err() {
-                self.record_event(TabEvent::ScriptFailed);
+                self.record_event(RendererEvent::ScriptFailed);
             } else {
                 self.fire_js(|js| js.fire_node_load(element));
             }
@@ -1515,7 +1515,7 @@ impl Document {
             return;
         }
         self.load_fired = true;
-        self.record_event(TabEvent::Load);
+        self.record_event(RendererEvent::Load);
         self.fire_js(crate::js::JsRealm::fire_load);
         self.adopt_js_work();
     }
@@ -1549,7 +1549,7 @@ impl Document {
         }
     }
 
-    pub(in crate::document) fn record_event(&mut self, event: TabEvent) {
+    pub(in crate::document) fn record_event(&mut self, event: RendererEvent) {
         if self.events.len() == MAX_PENDING_EVENTS {
             self.events_overflowed = true;
             return;

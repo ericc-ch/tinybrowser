@@ -14,7 +14,7 @@ use std::time::SystemTime;
 use cookies::{CookieJar, CookieOp, InitiatorKind, RetrievalKind, schemeful_same_site};
 use renderer::{
     BrowserServices, DialCompletion, DialFailure, DialKind, DialOutcome, DialRequest,
-    EmbeddedRenderer, MAX_RESPONSE_BODY_BYTES, Mount, StorageChange, TabEvent as RendererEvent,
+    EmbeddedRenderer, MAX_RESPONSE_BODY_BYTES, Mount, RendererEvent, StorageChange,
 };
 use url::Url;
 
@@ -140,11 +140,9 @@ impl GuestTab for Tab {
             .map(|events| {
                 events
                     .into_iter()
-                    .filter_map(|(frame, event)| {
-                        Some(FrameEvent {
-                            frame: frame.get(),
-                            event: to_event(event)?,
-                        })
+                    .map(|(frame, event)| FrameEvent {
+                        frame: frame.get(),
+                        event: to_event(event),
                     })
                     .collect()
             })
@@ -172,20 +170,13 @@ impl Tab {
 }
 
 /// The renderer's event vocabulary, restricted to what this component emits.
-fn to_event(event: RendererEvent) -> Option<Event> {
+fn to_event(event: RendererEvent) -> Event {
     match event {
-        RendererEvent::Load => Some(Event::Load),
-        RendererEvent::Timer(id) => Some(Event::Timer(id)),
-        RendererEvent::Fetch { status } => Some(Event::Fetch(status)),
-        RendererEvent::FetchFailed => Some(Event::FetchFailed),
-        RendererEvent::ScriptFailed => Some(Event::ScriptFailed),
-        // Reserved for a browser process that commits host-driven
-        // navigations. This component does not drive navigation yet, so a
-        // host cannot observe them; a child frame's load arrives as `Load`
-        // with a nonzero frame instead.
-        RendererEvent::ChildLoad | RendererEvent::Navigated | RendererEvent::NavigationFailed => {
-            None
-        }
+        RendererEvent::Load => Event::Load,
+        RendererEvent::Timer(id) => Event::Timer(id),
+        RendererEvent::Fetch { status } => Event::Fetch(status),
+        RendererEvent::FetchFailed => Event::FetchFailed,
+        RendererEvent::ScriptFailed => Event::ScriptFailed,
     }
 }
 

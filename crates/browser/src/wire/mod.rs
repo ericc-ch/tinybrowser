@@ -7,16 +7,17 @@
 //! Both ends of this conversation live in this crate — the host end in
 //! [`crate::link`], the child end in [`crate::child`] — so the message
 //! vocabulary and the framing sit next to both. Payloads that describe a page
-//! ([`FrameId`], [`Mount`], [`TabEvent`], [`DialRequest`]) come from the
+//! ([`FrameId`], [`Mount`], [`RendererEvent`], [`DialRequest`]) come from the
 //! engine crate and stay there; this module only carries them.
 
 pub mod channel;
 
 use serde::{Deserialize, Serialize};
 
+use crate::exchange::Frame;
 use renderer::{
-    DialFailure, DialOutcome, DialRequest, FrameId, Mount, RemoteValue, StorageChange,
-    StorageError, StorageKind, StorageSeed, TabError, TabEvent,
+    DialFailure, DialOutcome, DialRequest, FrameId, RemoteValue, RendererEvent, StorageChange,
+    StorageError, StorageKind, StorageSeed, TabError,
 };
 
 /// Browser-minted identity of one top-level document hosted by a renderer.
@@ -40,20 +41,6 @@ impl RendererAssignmentId {
 /// Host command to a renderer.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Command {
-    /// Replace one frame's document: decode, reset the realm, parse, run to load.
-    Mount {
-        /// Frame to replace.
-        frame: FrameId,
-        /// The document to mount.
-        mount: Mount,
-    },
-    /// Evaluate `source` in one frame and return its string coercion.
-    Eval {
-        /// Frame to evaluate in.
-        frame: FrameId,
-        /// Script source.
-        source: String,
-    },
     /// Evaluate `source` in one frame and return a value-only result.
     ExecuteScript {
         /// Frame to evaluate in.
@@ -70,8 +57,6 @@ pub enum Command {
         /// Viewport and crop window.
         request: renderer::ScreenshotRequest,
     },
-    /// Stop the renderer loop.
-    Shutdown,
     /// Delivers one remote `message` event, encoded by the sender's realm.
     WindowMessage {
         /// `__tbEncode` payload from the posting window.
@@ -96,8 +81,6 @@ pub enum Command {
 pub enum Reply {
     /// Unit result.
     Unit(Result<(), TabError>),
-    /// String result.
-    Text(Result<String, TabError>),
     /// Value-only script result.
     Value(Result<RemoteValue, TabError>),
     /// Optional string result (`RemoteSessionGet`).
@@ -110,11 +93,31 @@ pub enum Reply {
     },
 }
 
-/// Host to renderer traffic.
+/// One browser-originated renderer call.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub enum ToRenderer {
+pub enum RendererCall {
+    /// One operation on an assigned page engine.
+    Command {
+        /// Top-level document that owns the command.
+        assignment: RendererAssignmentId,
+        /// The command.
+        command: Command,
+    },
+    /// Starts a streamed top-level response. Request chunks follow before the
+    /// exchange's request-stream terminator.
+    Response {
+        /// Response metadata needed to mount the completed body.
+        response: ResponseStart,
+    },
+}
+
+/// Browser-originated notifications that do not have replies.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum HostNotice {
     /// First frame from the browser process: protocol handshake.
     Hello,
+    /// Stops the renderer process.
+    Shutdown,
     /// Creates an isolated page engine inside this renderer process.
     Assign {
         /// Browser-minted assignment identity.
@@ -124,42 +127,6 @@ pub enum ToRenderer {
     Release {
         /// Browser-minted assignment identity.
         assignment: RendererAssignmentId,
-    },
-    /// One command with its correlation id.
-    Request {
-        /// Request id chosen by the browser process.
-        id: u64,
-        /// Top-level document that owns the command.
-        assignment: RendererAssignmentId,
-        /// The command.
-        command: Command,
-    },
-    /// Starts a streamed top-level response. Raw body frames with the same id
-    /// follow before [`ToRenderer::ResponseEnd`].
-    ResponseStart {
-        /// Request id chosen by the browser process.
-        id: u64,
-        /// Response metadata needed to mount the completed body.
-        response: ResponseStart,
-    },
-    /// Completes a streamed top-level response.
-    ResponseEnd {
-        /// Request id from [`ToRenderer::ResponseStart`].
-        id: u64,
-    },
-    /// Aborts a streamed top-level response.
-    ResponseError {
-        /// Request id from [`ToRenderer::ResponseStart`].
-        id: u64,
-        /// Typed transport failure.
-        failure: DialFailure,
-    },
-    /// Answer to a [`ServiceCall`].
-    ServiceReply {
-        /// Service-call id chosen by the renderer.
-        id: u64,
-        /// The answer.
-        reply: ServiceReply,
     },
     /// One `localStorage` change another renderer made; every frame of
     /// `origin` except the source window fires a `storage` event
@@ -196,17 +163,6 @@ pub enum ToRenderer {
     },
 }
 
-impl ToRenderer {
-    /// The sentinel request that stops the renderer loop.
-    pub(crate) fn shutdown_request() -> Self {
-        Self::Request {
-            id: 0,
-            assignment: RendererAssignmentId::new(0),
-            command: Command::Shutdown,
-        }
-    }
-}
-
 /// Metadata sent before the raw bytes of a top-level response.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ResponseStart {
@@ -224,39 +180,45 @@ pub struct ResponseStart {
     pub content_language: Option<String>,
 }
 
-/// Renderer to host traffic.
+/// One renderer-originated browser-service call.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub enum FromRenderer {
+pub struct BrowserCall {
+    /// Top-level document requesting the browser service.
+    pub assignment: RendererAssignmentId,
+    /// The call.
+    pub call: ServiceCall,
+}
+
+/// Answer from a renderer, including the assignment used for authorization.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RendererReply {
+    /// Top-level document that produced the reply.
+    pub assignment: RendererAssignmentId,
+    /// The answer.
+    pub reply: Reply,
+}
+
+/// Renderer-originated notifications that do not have replies.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum RendererNotice {
     /// First message from a `renderer` child: protocol handshake.
     Ready,
-    /// Answer to a request.
-    Reply {
-        /// Request id from [`ToRenderer::Request`].
-        id: u64,
-        /// Top-level document that produced the reply.
-        assignment: RendererAssignmentId,
-        /// The answer.
-        reply: Reply,
-    },
     /// Unsolicited document event.
     Event {
-        /// Top-level document that emitted the event.
+        /// Top-level document that produced the reply.
         assignment: RendererAssignmentId,
         /// Frame that emitted the event.
         frame: FrameId,
         /// The event.
-        event: TabEvent,
-    },
-    /// A browser service the renderer cannot perform itself.
-    ServiceCall {
-        /// Top-level document requesting the browser service.
-        assignment: RendererAssignmentId,
-        /// Service-call id chosen by the renderer.
-        id: u64,
-        /// The call.
-        call: ServiceCall,
+        event: RendererEvent,
     },
 }
+
+/// Decoded browser-to-renderer exchange messages.
+pub(crate) type ToRenderer = Frame<RendererCall, ServiceReply, HostNotice>;
+
+/// Decoded renderer-to-browser exchange messages.
+pub(crate) type FromRenderer = Frame<BrowserCall, RendererReply, RendererNotice>;
 
 /// What the renderer needs the browser process to do.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -389,7 +351,8 @@ pub enum ServiceReply {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use renderer::{DialKind, ScriptFailure};
+    use crate::exchange::RequestId;
+    use renderer::DialKind;
 
     fn round_trip<T>(message: &T)
     where
@@ -403,70 +366,185 @@ mod tests {
     }
 
     #[test]
-    fn host_to_renderer_messages_round_trip() {
-        let messages = [
-            ToRenderer::Assign {
-                assignment: RendererAssignmentId::new(1),
+    fn host_to_renderer_control_messages_round_trip() {
+        let assignment = RendererAssignmentId::new(1);
+        let messages: Vec<ToRenderer> = vec![
+            Frame::Notify(HostNotice::Hello),
+            Frame::Notify(HostNotice::Assign { assignment }),
+            Frame::Call {
+                id: RequestId::new(1),
+                body: RendererCall::Command {
+                    assignment,
+                    command: Command::ExecuteScript {
+                        frame: FrameId::MAIN,
+                        source: "1 + 1".into(),
+                        timeout_ms: Some(50),
+                    },
+                },
             },
-            ToRenderer::Release {
-                assignment: RendererAssignmentId::new(1),
-            },
-            ToRenderer::Request {
-                id: 1,
-                assignment: RendererAssignmentId::new(1),
-                command: Command::Mount {
-                    frame: FrameId::MAIN,
-                    mount: Mount {
-                        url: "about:blank".into(),
-                        content_type: None,
+            Frame::Call {
+                id: RequestId::new(2),
+                body: RendererCall::Response {
+                    response: ResponseStart {
+                        assignment,
+                        frame: FrameId::MAIN,
+                        status: 200,
+                        final_url: "http://example.test/".into(),
+                        content_type: Some("text/html".into()),
                         content_language: None,
-                        body: vec![1, 2, 3],
                     },
                 },
             },
-            ToRenderer::Request {
-                id: 2,
-                assignment: RendererAssignmentId::new(1),
-                command: Command::Eval {
-                    frame: FrameId::new(3),
-                    source: "1+1".into(),
+            Frame::RequestEnd {
+                id: RequestId::new(2),
+                error: None,
+            },
+            Frame::Reply {
+                id: RequestId::new(3),
+                body: ServiceReply::StorageChanged(Ok(Some(StorageChange {
+                    key: Some("k".into()),
+                    old_value: None,
+                    new_value: Some("v".into()),
+                }))),
+            },
+            Frame::Notify(HostNotice::StorageEvent {
+                origin: "http://example.test".into(),
+                kind: StorageKind::Local,
+                key: Some("k".into()),
+                old_value: None,
+                new_value: Some("v".into()),
+                url: "http://example.test/".into(),
+                source: Some((assignment, FrameId::MAIN)),
+            }),
+            Frame::Notify(HostNotice::BroadcastMessage {
+                origin: "http://example.test".into(),
+                name: "chan".into(),
+                payload: "tb1:null".into(),
+                source: Some((assignment, 4)),
+            }),
+            Frame::Notify(HostNotice::Release { assignment }),
+            Frame::Notify(HostNotice::Shutdown),
+        ];
+        for message in messages {
+            round_trip(&message);
+        }
+    }
+
+    #[test]
+    fn renderer_to_host_control_messages_round_trip() {
+        let assignment = RendererAssignmentId::new(1);
+        let messages: Vec<FromRenderer> = vec![
+            Frame::Notify(RendererNotice::Ready),
+            Frame::Reply {
+                id: RequestId::new(1),
+                body: RendererReply {
+                    assignment,
+                    reply: Reply::Value(Ok(RemoteValue::List(vec![RemoteValue::Number(1.0)]))),
                 },
             },
-            ToRenderer::Request {
-                id: 3,
-                assignment: RendererAssignmentId::new(1),
-                command: Command::ExecuteScript {
-                    frame: FrameId::MAIN,
-                    source: "x".into(),
-                    timeout_ms: Some(50),
+            Frame::Notify(RendererNotice::Event {
+                assignment,
+                frame: FrameId::MAIN,
+                event: RendererEvent::Fetch { status: 404 },
+            }),
+            Frame::Call {
+                id: RequestId::new(2),
+                body: BrowserCall {
+                    assignment,
+                    call: ServiceCall::Dial(DialRequest {
+                        kind: DialKind::JsFetch,
+                        url: "http://example.test/a".into(),
+                        initiator: "http://example.test/".into(),
+                        read_body: true,
+                    }),
                 },
             },
-            ToRenderer::Request {
-                id: 4,
-                assignment: RendererAssignmentId::new(1),
-                command: Command::Screenshot {
-                    frame: FrameId::MAIN,
-                    request: renderer::ScreenshotRequest {
-                        viewport_width: 800.0,
-                        viewport_height: 600.0,
-                        clip: None,
-                    },
-                },
+            Frame::Cancel {
+                id: RequestId::new(2),
             },
-            ToRenderer::Request {
-                id: 6,
-                assignment: RendererAssignmentId::new(1),
-                command: Command::Shutdown,
+        ];
+        for message in messages {
+            round_trip(&message);
+        }
+    }
+
+    #[test]
+    fn browser_service_calls_round_trip() {
+        let assignment = RendererAssignmentId::new(1);
+        let calls = vec![
+            ServiceCall::CookieGet {
+                url: "http://example.test/".into(),
             },
-            ToRenderer::Request {
-                id: 7,
-                assignment: RendererAssignmentId::new(1),
-                command: Command::WindowMessage {
-                    payload: "tb1:null".into(),
-                },
+            ServiceCall::CookieSet {
+                value: "a=1".into(),
+                url: "http://example.test/".into(),
             },
-            ToRenderer::ResponseStart {
-                id: 10,
+            ServiceCall::StorageGet {
+                origin: "http://example.test".into(),
+                key: "k".into(),
+            },
+            ServiceCall::StorageKeys {
+                origin: "http://example.test".into(),
+            },
+            ServiceCall::StorageSet {
+                origin: "http://example.test".into(),
+                url: "http://example.test/".into(),
+                key: "k".into(),
+                value: "v".into(),
+                source: FrameId::MAIN,
+            },
+            ServiceCall::StorageRemove {
+                origin: "http://example.test".into(),
+                url: "http://example.test/".into(),
+                key: "k".into(),
+                source: FrameId::MAIN,
+            },
+            ServiceCall::StorageClear {
+                origin: "http://example.test".into(),
+                url: "http://example.test/".into(),
+                source: FrameId::MAIN,
+            },
+            ServiceCall::WindowOpen {
+                url: "http://example.test/".into(),
+                name: "popup".into(),
+                features: "noopener".into(),
+                seed: Some(StorageSeed {
+                    origin: "http://example.test".into(),
+                    entries: vec![("k".into(), "v".into())],
+                }),
+            },
+            ServiceCall::WindowClose { tab: 3 },
+            ServiceCall::Opener,
+            ServiceCall::WindowMessage {
+                tab: 3,
+                payload: "tb1:null".into(),
+            },
+            ServiceCall::RemoteSessionGet {
+                tab: 3,
+                origin: "http://example.test".into(),
+                key: "k".into(),
+            },
+            ServiceCall::BroadcastPost {
+                origin: "http://example.test".into(),
+                name: "chan".into(),
+                payload: "tb1:null".into(),
+                channel: 4,
+            },
+        ];
+        for (raw_id, call) in (1_u64..).zip(calls) {
+            let message: FromRenderer = Frame::Call {
+                id: RequestId::new(raw_id),
+                body: BrowserCall { assignment, call },
+            };
+            round_trip(&message);
+        }
+    }
+
+    #[test]
+    fn response_metadata_has_no_body_bytes() {
+        let message: ToRenderer = Frame::Call {
+            id: RequestId::new(1),
+            body: RendererCall::Response {
                 response: ResponseStart {
                     assignment: RendererAssignmentId::new(1),
                     frame: FrameId::MAIN,
@@ -476,324 +554,11 @@ mod tests {
                     content_language: None,
                 },
             },
-            ToRenderer::ResponseEnd { id: 10 },
-            ToRenderer::ResponseError {
-                id: 11,
-                failure: DialFailure::Timeout,
-            },
-        ];
-        for message in messages {
-            round_trip(&message);
-        }
-    }
-
-    #[test]
-    fn host_to_renderer_service_messages_round_trip() {
-        let messages = [
-            ToRenderer::ServiceReply {
-                id: 7,
-                reply: ServiceReply::Cookie("a=1".into()),
-            },
-            ToRenderer::ServiceReply {
-                id: 12,
-                reply: ServiceReply::StorageValue(Some("v".into())),
-            },
-            ToRenderer::ServiceReply {
-                id: 13,
-                reply: ServiceReply::StorageKeys(vec!["k".into()]),
-            },
-            ToRenderer::ServiceReply {
-                id: 14,
-                reply: ServiceReply::StorageChanged(Ok(Some(StorageChange {
-                    key: Some("k".into()),
-                    old_value: None,
-                    new_value: Some("v".into()),
-                }))),
-            },
-            ToRenderer::ServiceReply {
-                id: 15,
-                reply: ServiceReply::StorageChanged(Err(StorageError::QuotaExceeded)),
-            },
-            ToRenderer::ServiceReply {
-                id: 17,
-                reply: ServiceReply::Window(Some(3)),
-            },
-            ToRenderer::StorageEvent {
-                origin: "http://example.test".into(),
-                kind: StorageKind::Local,
-                key: Some("k".into()),
-                old_value: None,
-                new_value: Some("v".into()),
-                url: "http://example.test/".into(),
-                source: Some((RendererAssignmentId::new(1), FrameId::MAIN)),
-            },
-            ToRenderer::ServiceReply {
-                id: 8,
-                reply: ServiceReply::Dial(Ok(DialOutcome {
-                    status: 200,
-                    final_url: "http://example.test/".into(),
-                    content_type: Some("text/html".into()),
-                    content_language: None,
-                    body: vec![1],
-                })),
-            },
-            ToRenderer::ServiceReply {
-                id: 9,
-                reply: ServiceReply::Unit,
-            },
-        ];
-        for message in messages {
-            round_trip(&message);
-        }
-    }
-
-    #[test]
-    fn host_to_renderer_session_commands_round_trip() {
-        let messages = [
-            ToRenderer::Request {
-                id: 20,
-                assignment: RendererAssignmentId::new(1),
-                command: Command::WindowMessage {
-                    payload: "tb1:null".into(),
-                },
-            },
-            ToRenderer::Request {
-                id: 21,
-                assignment: RendererAssignmentId::new(1),
-                command: Command::SeedSession {
-                    seed: StorageSeed {
-                        origin: "http://example.test".into(),
-                        entries: vec![("\"k\"".into(), "\"v\"".into())],
-                    },
-                },
-            },
-            ToRenderer::Request {
-                id: 22,
-                assignment: RendererAssignmentId::new(1),
-                command: Command::RemoteSessionGet {
-                    origin: "http://example.test".into(),
-                    key: "\"k\"".into(),
-                },
-            },
-            ToRenderer::ServiceReply {
-                id: 23,
-                reply: ServiceReply::StorageValue(Some("\"v\"".into())),
-            },
-            ToRenderer::BroadcastMessage {
-                origin: "http://example.test".into(),
-                name: "chan".into(),
-                payload: "tb1:null".into(),
-                source: Some((RendererAssignmentId::new(1), 4)),
-            },
-        ];
-        for message in messages {
-            round_trip(&message);
-        }
-    }
-
-    #[test]
-    fn mount_body_is_not_part_of_control_json() {
-        let message = ToRenderer::Request {
-            id: 1,
-            assignment: RendererAssignmentId::new(1),
-            command: Command::Mount {
-                frame: FrameId::MAIN,
-                mount: Mount {
-                    url: "http://example.test/".into(),
-                    content_type: Some("text/html".into()),
-                    content_language: None,
-                    body: vec![1, 2, 3],
-                },
-            },
         };
         let value = serde_json::to_value(message).expect("serialize");
-        assert!(value.pointer("/Request/command/Mount/mount/body").is_none());
-    }
-
-    #[test]
-    fn renderer_to_host_messages_round_trip() {
-        let messages = [
-            FromRenderer::Ready,
-            FromRenderer::Reply {
-                id: 1,
-                assignment: RendererAssignmentId::new(1),
-                reply: Reply::Unit(Ok(())),
-            },
-            FromRenderer::Reply {
-                id: 2,
-                assignment: RendererAssignmentId::new(1),
-                reply: Reply::Unit(Err(TabError::Script(ScriptFailure::Interrupted))),
-            },
-            FromRenderer::Reply {
-                id: 3,
-                assignment: RendererAssignmentId::new(1),
-                reply: Reply::Text(Ok("ok".into())),
-            },
-            FromRenderer::Reply {
-                id: 5,
-                assignment: RendererAssignmentId::new(1),
-                reply: Reply::Value(Ok(RemoteValue::List(vec![RemoteValue::Number(1.0)]))),
-            },
-            FromRenderer::Reply {
-                id: 9,
-                assignment: RendererAssignmentId::new(1),
-                reply: Reply::Screenshot { result: Ok(3) },
-            },
-            FromRenderer::Event {
-                assignment: RendererAssignmentId::new(1),
-                frame: FrameId::MAIN,
-                event: TabEvent::Fetch { status: 404 },
-            },
-        ];
-        for message in messages {
-            round_trip(&message);
-        }
-    }
-
-    #[test]
-    fn renderer_to_host_service_calls_round_trip() {
-        let messages = [
-            FromRenderer::ServiceCall {
-                assignment: RendererAssignmentId::new(1),
-                id: 6,
-                call: ServiceCall::Dial(DialRequest {
-                    kind: DialKind::JsFetch,
-                    url: "http://example.test/a".into(),
-                    initiator: "http://example.test/".into(),
-                    read_body: true,
-                }),
-            },
-            FromRenderer::ServiceCall {
-                assignment: RendererAssignmentId::new(1),
-                id: 7,
-                call: ServiceCall::CookieGet {
-                    url: "http://example.test/".into(),
-                },
-            },
-            FromRenderer::ServiceCall {
-                assignment: RendererAssignmentId::new(1),
-                id: 8,
-                call: ServiceCall::CookieSet {
-                    value: "a=1".into(),
-                    url: "http://example.test/".into(),
-                },
-            },
-        ];
-        for message in messages {
-            round_trip(&message);
-        }
-    }
-
-    #[test]
-    fn renderer_to_host_storage_calls_round_trip() {
-        let messages = [
-            FromRenderer::ServiceCall {
-                assignment: RendererAssignmentId::new(1),
-                id: 10,
-                call: ServiceCall::StorageGet {
-                    origin: "http://example.test".into(),
-                    key: "k".into(),
-                },
-            },
-            FromRenderer::ServiceCall {
-                assignment: RendererAssignmentId::new(1),
-                id: 11,
-                call: ServiceCall::StorageKeys {
-                    origin: "http://example.test".into(),
-                },
-            },
-            FromRenderer::ServiceCall {
-                assignment: RendererAssignmentId::new(1),
-                id: 12,
-                call: ServiceCall::StorageSet {
-                    origin: "http://example.test".into(),
-                    url: "http://example.test/".into(),
-                    key: "k".into(),
-                    value: "v".into(),
-                    source: FrameId::MAIN,
-                },
-            },
-            FromRenderer::ServiceCall {
-                assignment: RendererAssignmentId::new(1),
-                id: 13,
-                call: ServiceCall::StorageRemove {
-                    origin: "http://example.test".into(),
-                    url: "http://example.test/".into(),
-                    key: "k".into(),
-                    source: FrameId::MAIN,
-                },
-            },
-            FromRenderer::ServiceCall {
-                assignment: RendererAssignmentId::new(1),
-                id: 14,
-                call: ServiceCall::StorageClear {
-                    origin: "http://example.test".into(),
-                    url: "http://example.test/".into(),
-                    source: FrameId::MAIN,
-                },
-            },
-        ];
-        for message in messages {
-            round_trip(&message);
-        }
-    }
-
-    #[test]
-    fn renderer_to_host_window_calls_round_trip() {
-        let messages = [
-            FromRenderer::ServiceCall {
-                assignment: RendererAssignmentId::new(1),
-                id: 15,
-                call: ServiceCall::WindowOpen {
-                    url: "http://example.test/".into(),
-                    name: "popup".into(),
-                    features: "noopener".into(),
-                    seed: Some(StorageSeed {
-                        origin: "http://example.test".into(),
-                        entries: vec![("\"k\"".into(), "\"v\"".into())],
-                    }),
-                },
-            },
-            FromRenderer::ServiceCall {
-                assignment: RendererAssignmentId::new(1),
-                id: 16,
-                call: ServiceCall::WindowClose { tab: 3 },
-            },
-            FromRenderer::ServiceCall {
-                assignment: RendererAssignmentId::new(1),
-                id: 17,
-                call: ServiceCall::Opener,
-            },
-            FromRenderer::ServiceCall {
-                assignment: RendererAssignmentId::new(1),
-                id: 18,
-                call: ServiceCall::WindowMessage {
-                    tab: 3,
-                    payload: "tb1:null".into(),
-                },
-            },
-            FromRenderer::ServiceCall {
-                assignment: RendererAssignmentId::new(1),
-                id: 19,
-                call: ServiceCall::RemoteSessionGet {
-                    tab: 3,
-                    origin: "http://example.test".into(),
-                    key: "\"k\"".into(),
-                },
-            },
-            FromRenderer::ServiceCall {
-                assignment: RendererAssignmentId::new(1),
-                id: 20,
-                call: ServiceCall::BroadcastPost {
-                    origin: "http://example.test".into(),
-                    name: "chan".into(),
-                    payload: "tb1:null".into(),
-                    channel: 4,
-                },
-            },
-        ];
-        for message in messages {
-            round_trip(&message);
-        }
+        let response = value
+            .pointer("/Call/body/Response/response")
+            .expect("response metadata");
+        assert!(response.get("body").is_none());
     }
 }

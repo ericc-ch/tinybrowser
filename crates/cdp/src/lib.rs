@@ -514,7 +514,7 @@ impl Conn {
                 attach_session(&mut load, session.as_deref());
                 messages.push(load);
             }
-            _ => {}
+            TabEvent::NavigationFailed => {}
         }
         messages
     }
@@ -913,7 +913,7 @@ impl Conn {
         }
         match method {
             "Page.enable" => {
-                self.subscribe_tab(tab, session).await?;
+                self.subscribe_tab(tab, session)?;
                 Ok(json!({}))
             }
             "Page.disable" => {
@@ -1069,7 +1069,6 @@ impl Conn {
         }
         let events = tab
             .subscribe()
-            .await
             .map_err(|error| DispatchError::Failed(error.to_string()))?;
         open_url(tab, url).await?;
         match wait_for_navigation(events, Duration::from_secs(30)).await {
@@ -1275,7 +1274,7 @@ impl Conn {
         exception_text_reply("unexpected script result")
     }
 
-    async fn subscribe_tab(
+    fn subscribe_tab(
         &mut self,
         tab: &TabHandle,
         session: Option<&str>,
@@ -1289,7 +1288,6 @@ impl Conn {
         }
         let events = tab
             .subscribe()
-            .await
             .map_err(|error| DispatchError::Failed(error.to_string()))?;
         let tab_for_events = tab.clone();
         let session_for_events = session.map(str::to_owned);

@@ -7,7 +7,7 @@ use tokio::sync::Notify;
 
 use crate::document::Stop;
 use crate::engine::Engine;
-use crate::{BrowserServices, FrameId, Mount, RemoteValue, TabError, TabEvent};
+use crate::{BrowserServices, FrameId, Mount, RemoteValue, RendererEvent, TabError};
 
 /// One renderer hosted directly in its caller's process.
 pub struct EmbeddedRenderer {
@@ -70,7 +70,7 @@ impl EmbeddedRenderer {
     /// # Errors
     ///
     /// The retained event limit was exceeded.
-    pub fn take_events(&mut self) -> Result<Vec<(FrameId, TabEvent)>, TabError> {
+    pub fn take_events(&mut self) -> Result<Vec<(FrameId, RendererEvent)>, TabError> {
         self.engine.take_events()
     }
 

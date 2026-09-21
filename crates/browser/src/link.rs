@@ -12,14 +12,16 @@ use std::time::Duration;
 use tokio::process::Child;
 
 use crate::actor::TabId;
+use crate::exchange::{self, Frame, RequestId, ServerInput};
 use crate::manager::RendererId;
 use crate::network::FetchHandle;
 use crate::site::Site;
 use crate::wire::{
-    Command as RendererCommand, FromRenderer, RendererAssignmentId, Reply, ResponseStart,
-    ServiceCall, ServiceReply, ToRenderer,
+    BrowserCall, Command as RendererCommand, FromRenderer, HostNotice, RendererAssignmentId,
+    RendererCall, RendererNotice, RendererReply, Reply, ResponseStart, ServiceCall, ServiceReply,
+    ToRenderer,
 };
-use renderer::{FrameId, Mount, TabError, TabEvent};
+use renderer::{FrameId, Mount, RendererEvent, TabError};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite};
 use tokio::process::Command;
 use tokio::sync::{mpsc, oneshot, watch};
@@ -30,7 +32,10 @@ use tokio::time::timeout;
 /// this is a last-resort wake-up if its reply path dies silently.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// How long a `renderer` child has to say [`FromRenderer::Ready`].
+/// Upper bound for one downloaded renderer payload such as a PNG.
+const MAX_RENDERER_STREAM_BYTES: usize = 64 * 1024 * 1024;
+
+/// How long a `renderer` child has to send [`RendererNotice::Ready`].
 pub(crate) const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// How long teardown waits for transport tasks to finish.
@@ -46,54 +51,21 @@ pub(crate) const COMMAND_CAPACITY: usize = 256;
 
 /// Live subscribers to one renderer's frame-tagged document events.
 type EventSubscribers =
-    Arc<Mutex<HashMap<RendererAssignmentId, Vec<mpsc::Sender<(FrameId, TabEvent)>>>>>;
+    Arc<Mutex<HashMap<RendererAssignmentId, Vec<mpsc::Sender<(FrameId, RendererEvent)>>>>>;
 
-pub(crate) struct PendingReply {
-    assignment: RendererAssignmentId,
-    reply: oneshot::Sender<Reply>,
-}
-
-/// A caller waiting for a streamed byte reply (screenshots).
-pub(crate) struct PendingBytes {
-    assignment: RendererAssignmentId,
-    reply: oneshot::Sender<Result<Vec<u8>, TabError>>,
-}
-
-/// One in-flight byte stream, established by the renderer's control reply and
-/// completed by body frames carrying the same request id.
-pub(crate) struct StreamState {
-    expected: usize,
-    buffer: Vec<u8>,
-    reply: oneshot::Sender<Result<Vec<u8>, TabError>>,
-}
-
-pub(crate) type PendingMap = Arc<Mutex<HashMap<u64, PendingReply>>>;
-pub(crate) type BytesMap = Arc<Mutex<HashMap<u64, PendingBytes>>>;
-pub(crate) type StreamMap = Arc<Mutex<HashMap<u64, StreamState>>>;
-
-/// Every reply-routing map, cloned into the tasks that complete waiters.
-#[derive(Clone)]
-pub(crate) struct Waiters {
-    /// Control reply waiters.
-    pub(crate) pending: PendingMap,
-    /// Byte-reply waiters still expecting their control reply.
-    pub(crate) byte_replies: BytesMap,
-    /// In-flight byte streams, established by the control reply.
-    pub(crate) streams: StreamMap,
-}
-
-pub(crate) enum Outbound {
-    Control(ToRenderer),
-    Body { request: u64, payload: Vec<u8> },
-}
+type RendererClient =
+    exchange::Client<RendererCall, ServiceReply, HostNotice, RendererReply, RendererNotice>;
+type BrowserServiceServer =
+    exchange::Server<RendererCall, ServiceReply, HostNotice, BrowserCall, RendererNotice>;
+type BrowserServiceResponder = exchange::Responder<RendererCall, ServiceReply, HostNotice>;
+type RendererRouter = exchange::Router<BrowserCall, RendererReply, RendererNotice>;
+type ResponseUpload = exchange::Upload<RendererCall, ServiceReply, HostNotice, RendererReply>;
 
 /// Value-only handle to one renderer.
 pub(crate) struct RendererHandle {
-    tx: mpsc::Sender<Outbound>,
-    waiters: Waiters,
+    client: RendererClient,
     pub(crate) alive: Arc<AtomicBool>,
     subscribers: EventSubscribers,
-    next_request: AtomicU64,
     kill: watch::Sender<bool>,
     tasks: Mutex<Vec<JoinHandle<()>>>,
     pub(crate) site: Arc<Mutex<Option<Site>>>,
@@ -136,7 +108,7 @@ impl RendererAssignment {
     }
 
     #[must_use]
-    pub(crate) fn subscribe(&self) -> mpsc::Receiver<(FrameId, TabEvent)> {
+    pub(crate) fn subscribe(&self) -> mpsc::Receiver<(FrameId, RendererEvent)> {
         self.process.subscribe(self.id)
     }
 
@@ -150,10 +122,8 @@ impl RendererAssignment {
 }
 
 pub(crate) struct ResponseWriter {
-    id: u64,
-    tx: mpsc::Sender<Outbound>,
-    waiters: Waiters,
-    reply: Option<oneshot::Receiver<Reply>>,
+    assignment: RendererAssignmentId,
+    upload: ResponseUpload,
 }
 
 impl ResponseWriter {
@@ -163,71 +133,30 @@ impl ResponseWriter {
                 message: "response chunk exceeds IPC limit".into(),
             });
         }
-        self.tx
-            .send(Outbound::Body {
-                request: self.id,
-                payload,
-            })
+        self.upload
+            .write(payload)
             .await
             .map_err(|_| TabError::ActorStopped)
     }
 
     pub(crate) async fn finish(self) -> Result<Reply, TabError> {
-        let id = self.id;
-        self.terminate(ToRenderer::ResponseEnd { id }).await
+        let assignment = self.assignment;
+        let response = self
+            .upload
+            .finish()
+            .await
+            .map_err(|_| TabError::ActorStopped)?;
+        decode_reply(assignment, response)
     }
 
     pub(crate) async fn abort(self, failure: renderer::DialFailure) -> Result<Reply, TabError> {
-        let id = self.id;
-        self.terminate(ToRenderer::ResponseError { id, failure })
+        let assignment = self.assignment;
+        let response = self
+            .upload
+            .abort(format!("{failure:?}"))
             .await
-    }
-
-    async fn terminate(mut self, message: ToRenderer) -> Result<Reply, TabError> {
-        if self.tx.send(Outbound::Control(message)).await.is_err() {
-            return Err(TabError::ActorStopped);
-        }
-        let Some(reply) = self.reply.take() else {
-            return Err(TabError::ActorStopped);
-        };
-        await_reply(&self.waiters.pending, self.id, reply).await
-    }
-}
-
-impl Drop for ResponseWriter {
-    fn drop(&mut self) {
-        if self.reply.is_none() {
-            return;
-        }
-        self.waiters
-            .pending
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .remove(&self.id);
-        let _ = self
-            .tx
-            .try_send(Outbound::Control(ToRenderer::ResponseError {
-                id: self.id,
-                failure: renderer::DialFailure::Cancelled,
-            }));
-    }
-}
-
-/// Waits for one registered reply under [`REQUEST_TIMEOUT`], removing the
-/// registration when it never arrives.
-async fn await_reply(
-    pending: &Mutex<HashMap<u64, PendingReply>>,
-    id: u64,
-    reply: oneshot::Receiver<Reply>,
-) -> Result<Reply, TabError> {
-    if let Ok(Ok(reply)) = timeout(REQUEST_TIMEOUT, reply).await {
-        Ok(reply)
-    } else {
-        let _removed = pending
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .remove(&id);
-        Err(TabError::ActorStopped)
+            .map_err(|_| TabError::ActorStopped)?;
+        decode_reply(assignment, response)
     }
 }
 
@@ -260,8 +189,8 @@ impl RendererHandle {
     }
 
     pub(crate) async fn assign(&self, assignment: RendererAssignmentId) -> io::Result<()> {
-        self.tx
-            .send(Outbound::Control(ToRenderer::Assign { assignment }))
+        self.client
+            .notify(HostNotice::Assign { assignment })
             .await
             .map_err(|_| io::Error::other("renderer stopped"))
     }
@@ -272,10 +201,7 @@ impl RendererHandle {
             .unwrap_or_else(PoisonError::into_inner)
             .remove(&assignment);
         self.released.fetch_max(assignment.get(), Ordering::Relaxed);
-        let _ = self
-            .tx
-            .send(Outbound::Control(ToRenderer::Release { assignment }))
-            .await;
+        let _result = self.client.notify(HostNotice::Release { assignment }).await;
         self.assignments.fetch_sub(1, Ordering::Relaxed);
     }
 
@@ -290,22 +216,17 @@ impl RendererHandle {
         assignment: RendererAssignmentId,
         command: RendererCommand,
     ) -> Result<Reply, TabError> {
-        let id = self.next_request.fetch_add(1, Ordering::Relaxed);
-        let reply_rx = self.register_pending(id, assignment)?;
-        if self
-            .tx
-            .send(Outbound::Control(ToRenderer::Request {
-                id,
+        let response = timeout(
+            REQUEST_TIMEOUT,
+            self.client.call(RendererCall::Command {
                 assignment,
                 command,
-            }))
-            .await
-            .is_err()
-        {
-            self.remove_pending(id);
-            return Err(TabError::ActorStopped);
-        }
-        await_reply(&self.waiters.pending, id, reply_rx).await
+            }),
+        )
+        .await
+        .map_err(|_| TabError::ActorStopped)?
+        .map_err(|_| TabError::ActorStopped)?;
+        decode_reply(assignment, response)
     }
 
     /// Sends one command whose reply is a streamed byte payload and waits for
@@ -320,81 +241,31 @@ impl RendererHandle {
         assignment: RendererAssignmentId,
         command: RendererCommand,
     ) -> Result<Vec<u8>, TabError> {
-        let id = self.next_request.fetch_add(1, Ordering::Relaxed);
-        let (reply_tx, reply_rx) = oneshot::channel();
-        {
-            let mut waiters = self
-                .waiters
-                .byte_replies
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
-            if !self.alive.load(Ordering::Relaxed) {
-                return Err(TabError::ActorStopped);
-            }
-            waiters.insert(
-                id,
-                PendingBytes {
+        let (response, bytes) = timeout(
+            REQUEST_TIMEOUT,
+            self.client.call_download(
+                RendererCall::Command {
                     assignment,
-                    reply: reply_tx,
+                    command,
                 },
-            );
+                MAX_RENDERER_STREAM_BYTES,
+            ),
+        )
+        .await
+        .map_err(|_| TabError::ActorStopped)?
+        .map_err(|_| TabError::ActorStopped)?;
+        match decode_reply(assignment, response)? {
+            Reply::Screenshot {
+                result: Ok(expected),
+            } if usize::try_from(expected).ok() == Some(bytes.len()) => Ok(bytes),
+            Reply::Screenshot { result: Ok(_) } => Err(TabError::RendererUnavailable {
+                message: "screenshot stream length mismatch".into(),
+            }),
+            Reply::Screenshot { result: Err(error) } => Err(error),
+            other => Err(TabError::RendererUnavailable {
+                message: format!("unexpected reply for byte request: {other:?}"),
+            }),
         }
-        if self
-            .tx
-            .send(Outbound::Control(ToRenderer::Request {
-                id,
-                assignment,
-                command,
-            }))
-            .await
-            .is_err()
-        {
-            self.remove_byte_waiter(id);
-            return Err(TabError::ActorStopped);
-        }
-        if let Ok(Ok(result)) = timeout(REQUEST_TIMEOUT, reply_rx).await {
-            result
-        } else {
-            self.remove_byte_waiter(id);
-            Err(TabError::ActorStopped)
-        }
-    }
-
-    fn remove_byte_waiter(&self, id: u64) {
-        let _removed = self
-            .waiters
-            .byte_replies
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .remove(&id);
-    }
-
-    /// Registers the reply channel for request `id`.
-    ///
-    /// The `alive` check runs under the same lock as the registration, so a
-    /// dying renderer cannot leave one behind.
-    fn register_pending(
-        &self,
-        id: u64,
-        assignment: RendererAssignmentId,
-    ) -> Result<oneshot::Receiver<Reply>, TabError> {
-        let mut pending = self
-            .waiters
-            .pending
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        if !self.alive.load(Ordering::Relaxed) {
-            return Err(TabError::ActorStopped);
-        }
-        let (reply_tx, reply_rx) = oneshot::channel();
-        pending.insert(
-            id,
-            PendingReply {
-                assignment,
-                reply: reply_tx,
-            },
-        );
-        Ok(reply_rx)
     }
 
     /// Streams one top-level response to the renderer and waits for its mount
@@ -425,8 +296,6 @@ impl RendererHandle {
         status: u16,
         mount: &Mount,
     ) -> Result<ResponseWriter, TabError> {
-        let id = self.next_request.fetch_add(1, Ordering::Relaxed);
-        let reply_rx = self.register_pending(id, assignment)?;
         let start = ResponseStart {
             assignment,
             frame,
@@ -435,28 +304,19 @@ impl RendererHandle {
             content_type: mount.content_type.clone(),
             content_language: mount.content_language.clone(),
         };
-        if self
-            .tx
-            .send(Outbound::Control(ToRenderer::ResponseStart {
-                id,
-                response: start,
-            }))
+        let upload = self
+            .client
+            .begin_upload(RendererCall::Response { response: start })
             .await
-            .is_err()
-        {
-            self.remove_pending(id);
-            return Err(TabError::ActorStopped);
-        }
-        Ok(ResponseWriter {
-            id,
-            tx: self.tx.clone(),
-            waiters: self.waiters.clone(),
-            reply: Some(reply_rx),
-        })
+            .map_err(|_| TabError::ActorStopped)?;
+        Ok(ResponseWriter { assignment, upload })
     }
     /// Subscribes to renderer document events after this call.
     #[must_use]
-    fn subscribe(&self, assignment: RendererAssignmentId) -> mpsc::Receiver<(FrameId, TabEvent)> {
+    fn subscribe(
+        &self,
+        assignment: RendererAssignmentId,
+    ) -> mpsc::Receiver<(FrameId, RendererEvent)> {
         let (tx, rx) = mpsc::channel(EVENT_SUBSCRIBER_CAPACITY);
         self.subscribers
             .lock()
@@ -474,9 +334,7 @@ impl RendererHandle {
 
     /// Asks the renderer loop to stop without waiting.
     pub(crate) fn request_shutdown(&self) {
-        let _ = self
-            .tx
-            .try_send(Outbound::Control(ToRenderer::shutdown_request()));
+        let _result = self.client.try_notify(HostNotice::Shutdown);
     }
 
     /// Stops the renderer and waits for its transport tasks.
@@ -491,14 +349,16 @@ impl RendererHandle {
             }
         }
     }
+}
 
-    fn remove_pending(&self, id: u64) {
-        let _removed = self
-            .waiters
-            .pending
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .remove(&id);
+fn decode_reply(
+    assignment: RendererAssignmentId,
+    response: RendererReply,
+) -> Result<Reply, TabError> {
+    if response.assignment == assignment {
+        Ok(response.reply)
+    } else {
+        Err(TabError::ActorStopped)
     }
 }
 
@@ -515,9 +375,13 @@ impl Drop for RendererHandle {
 struct RendererViolation;
 
 pub(crate) struct ReaderContext {
-    tx: mpsc::Sender<Outbound>,
-    waiters: Waiters,
+    router: RendererRouter,
     pub(crate) alive: Arc<AtomicBool>,
+    kill: watch::Sender<bool>,
+}
+
+pub(crate) struct ServiceContext {
+    responder: BrowserServiceResponder,
     subscribers: EventSubscribers,
     fetch: FetchHandle,
     site: Arc<Mutex<Option<Site>>>,
@@ -528,10 +392,10 @@ pub(crate) struct ReaderContext {
 }
 
 pub(crate) async fn writer_task(
-    mut rx: mpsc::Receiver<Outbound>,
+    mut rx: exchange::Receiver<ToRenderer>,
     mut writer: Box<dyn AsyncWrite + Send + Unpin>,
     alive: Arc<AtomicBool>,
-    waiters: Waiters,
+    router: RendererRouter,
     kill: watch::Sender<bool>,
     mut kill_rx: watch::Receiver<bool>,
 ) {
@@ -543,18 +407,38 @@ pub(crate) async fn writer_task(
             },
             _ = kill_rx.changed() => return,
         };
-        let result = match message {
-            Outbound::Control(message) => {
-                crate::wire::channel::write_control_async(&mut *writer, &message).await
-            }
-            Outbound::Body { request, payload } => {
-                crate::wire::channel::write_body_async(&mut *writer, request, &payload).await
-            }
-        };
+        let result = write_to_renderer(&mut *writer, &message).await;
         if result.is_err() {
-            fail(&alive, &waiters, &kill);
+            fail(&alive, &router, &kill);
             return;
         }
+    }
+}
+
+async fn write_to_renderer<W>(writer: &mut W, message: &ToRenderer) -> io::Result<()>
+where
+    W: AsyncWrite + Unpin + ?Sized,
+{
+    match message {
+        Frame::RequestChunk { id, bytes } => {
+            crate::wire::channel::write_frame_async(
+                writer,
+                crate::wire::channel::FrameKind::RequestChunk,
+                id.get(),
+                bytes,
+            )
+            .await
+        }
+        Frame::ResponseChunk { id, bytes } => {
+            crate::wire::channel::write_frame_async(
+                writer,
+                crate::wire::channel::FrameKind::ResponseChunk,
+                id.get(),
+                bytes,
+            )
+            .await
+        }
+        _ => crate::wire::channel::write_control_async(writer, message).await,
     }
 }
 
@@ -574,173 +458,106 @@ pub(crate) async fn reader_task(
                 break;
             }
         };
-        if frame.kind == crate::wire::channel::FrameKind::Body {
-            if route_body(frame.request, &buffer, &context).is_err() {
-                break;
+        let message = match frame.kind {
+            crate::wire::channel::FrameKind::Control => {
+                match crate::wire::channel::decode_control::<FromRenderer>(&buffer) {
+                    Ok(message) => message,
+                    Err(error) => {
+                        logging::error!(target: "browser::link", "bad renderer message: {error}");
+                        break;
+                    }
+                }
             }
-            continue;
-        }
-        let message = match crate::wire::channel::decode_control::<FromRenderer>(&buffer) {
-            Ok(message) => message,
-            Err(error) => {
-                logging::error!(target: "browser::link", "bad renderer message: {error}");
-                break;
-            }
+            crate::wire::channel::FrameKind::RequestChunk => Frame::RequestChunk {
+                id: RequestId::new(frame.request),
+                bytes: buffer.clone(),
+            },
+            crate::wire::channel::FrameKind::ResponseChunk => Frame::ResponseChunk {
+                id: RequestId::new(frame.request),
+                bytes: buffer.clone(),
+            },
         };
         if let Some(ready_tx) = ready.take() {
-            let ok = matches!(message, FromRenderer::Ready);
+            let ok = matches!(message, Frame::Notify(RendererNotice::Ready));
             let _ = ready_tx.send(ok);
             if !ok {
                 break;
             }
             continue;
         }
-        if route(message, &context).await.is_err() {
+        if context.router.route(message).is_err() {
             break;
         }
     }
     if let Some(ready_tx) = ready {
         let _ = ready_tx.send(false);
     }
-    fail(&context.alive, &context.waiters, &context.kill);
+    fail(&context.alive, &context.router, &context.kill);
 }
 
-/// Routes one renderer message; a failure terminates the renderer.
-async fn route(message: FromRenderer, context: &ReaderContext) -> Result<(), RendererViolation> {
-    match message {
-        // Handled by the channel handshake; never routed.
-        FromRenderer::Ready => {}
-        FromRenderer::Reply {
-            id,
-            assignment,
-            reply,
-        } => {
-            // A byte-streaming request answers with the payload length first;
-            // its body frames follow on the same request id.
-            if let Some(waiting) = context
-                .waiters
-                .byte_replies
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .remove(&id)
-            {
-                if waiting.assignment != assignment {
-                    return Err(RendererViolation);
-                }
-                match reply {
-                    Reply::Screenshot { result: Ok(len) } => {
-                        let expected = usize::try_from(len).map_err(|_| RendererViolation)?;
-                        context
-                            .waiters
-                            .streams
-                            .lock()
-                            .unwrap_or_else(PoisonError::into_inner)
-                            .insert(
-                                id,
-                                StreamState {
-                                    expected,
-                                    buffer: Vec::new(),
-                                    reply: waiting.reply,
-                                },
-                            );
-                    }
-                    Reply::Screenshot { result: Err(error) } => {
-                        let _ = waiting.reply.send(Err(error));
-                    }
-                    other => {
-                        let _ = waiting.reply.send(Err(TabError::RendererUnavailable {
-                            message: format!("unexpected reply for byte request: {other:?}"),
-                        }));
-                    }
-                }
-                return Ok(());
-            }
-            if let Some(pending) = context
-                .waiters
-                .pending
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .remove(&id)
-            {
-                if pending.assignment != assignment {
-                    return Err(RendererViolation);
-                }
-                let _ = pending.reply.send(reply);
-            }
+/// Runs browser services and renderer notifications after the exchange router
+/// has separated them from replies and stream chunks.
+async fn service_task(mut server: BrowserServiceServer, context: ServiceContext) {
+    while let Some(input) = server.recv().await {
+        let result = match input {
+            ServerInput::Call {
+                id,
+                body: BrowserCall { assignment, call },
+            } => route_service_call(&context, id, assignment, call).await,
+            ServerInput::Notify(RendererNotice::Event {
+                assignment,
+                frame,
+                event,
+            }) => route_event(&context, assignment, frame, event),
+            ServerInput::Notify(RendererNotice::Ready)
+            | ServerInput::RequestChunk
+            | ServerInput::RequestEnd
+            | ServerInput::Cancel { .. } => Err(RendererViolation),
+        };
+        if result.is_err() {
+            let _result = context.kill.send(true);
+            return;
         }
-        FromRenderer::Event {
-            assignment,
-            frame,
-            event,
-        } => {
-            let mut saturated = false;
-            let mut subscribers = context
-                .subscribers
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
-            let Some(assignment_subscribers) = subscribers.get_mut(&assignment) else {
-                // A released assignment still had messages in flight when the
-                // renderer processed `Release`; drop them instead of failing
-                // the process, which may host other assignments.
-                return if was_released(&context.released, assignment) {
-                    Ok(())
-                } else {
-                    Err(RendererViolation)
-                };
-            };
-            assignment_subscribers.retain(|subscriber| match subscriber.try_send((frame, event)) {
-                Ok(()) => true,
-                Err(mpsc::error::TrySendError::Closed(_)) => false,
-                Err(mpsc::error::TrySendError::Full(_)) => {
-                    saturated = true;
-                    false
-                }
-            });
-            if saturated {
-                return Err(RendererViolation);
-            }
-        }
-        FromRenderer::ServiceCall {
-            assignment,
-            id,
-            call,
-        } => route_service_call(context, assignment, id, call).await?,
     }
-    Ok(())
 }
 
-/// Routes one raw body frame of a byte-streaming reply.
-///
-/// Body frames are only expected for a screenshot request whose control reply
-/// already carried the length; anything else is a protocol violation.
-fn route_body(
-    request: u64,
-    payload: &[u8],
-    context: &ReaderContext,
+fn route_event(
+    context: &ServiceContext,
+    assignment: RendererAssignmentId,
+    frame: FrameId,
+    event: RendererEvent,
 ) -> Result<(), RendererViolation> {
-    let mut streams = context
-        .waiters
-        .streams
+    let mut saturated = false;
+    let mut subscribers = context
+        .subscribers
         .lock()
         .unwrap_or_else(PoisonError::into_inner);
-    let Some(state) = streams.get_mut(&request) else {
-        return Err(RendererViolation);
+    let Some(assignment_subscribers) = subscribers.get_mut(&assignment) else {
+        return if was_released(&context.released, assignment) {
+            Ok(())
+        } else {
+            Err(RendererViolation)
+        };
     };
-    state.buffer.extend_from_slice(payload);
-    if state.buffer.len() > state.expected {
-        return Err(RendererViolation);
+    assignment_subscribers.retain(|subscriber| match subscriber.try_send((frame, event)) {
+        Ok(()) => true,
+        Err(mpsc::error::TrySendError::Closed(_)) => false,
+        Err(mpsc::error::TrySendError::Full(_)) => {
+            saturated = true;
+            false
+        }
+    });
+    if saturated {
+        Err(RendererViolation)
+    } else {
+        Ok(())
     }
-    if state.buffer.len() == state.expected {
-        let state = streams.remove(&request).ok_or(RendererViolation)?;
-        let _ = state.reply.send(Ok(state.buffer));
-    }
-    Ok(())
 }
 
 async fn route_service_call(
-    context: &ReaderContext,
+    context: &ServiceContext,
+    id: RequestId,
     assignment: RendererAssignmentId,
-    id: u64,
     call: ServiceCall,
 ) -> Result<(), RendererViolation> {
     if !has_assignment(&context.subscribers, assignment) {
@@ -749,7 +566,7 @@ async fn route_service_call(
         // `document.cookie` caller cannot block forever, and keep the
         // process alive for its other assignments.
         if was_released(&context.released, assignment) {
-            return send_released_reply(&context.tx, id, &call).await;
+            return send_released_reply(&context.responder, id, &call).await;
         }
         return Err(RendererViolation);
     }
@@ -759,23 +576,19 @@ async fn route_service_call(
                 return Err(RendererViolation);
             };
             let worker_fetch = context.fetch.clone();
-            let worker_tx = context.tx.clone();
-            let worker_waiters = context.waiters.clone();
-            let worker_alive = Arc::clone(&context.alive);
+            let responder = context.responder.clone();
             let worker_kill = context.kill.clone();
             let cancel = context.kill.subscribe();
             tokio::spawn(async move {
                 let outcome = worker_fetch
                     .dial_request(&request, &initiator, cancel)
                     .await;
-                if worker_tx
-                    .try_send(Outbound::Control(ToRenderer::ServiceReply {
-                        id,
-                        reply: ServiceReply::Dial(outcome),
-                    }))
+                if responder
+                    .reply(id, ServiceReply::Dial(outcome))
+                    .await
                     .is_err()
                 {
-                    fail(&worker_alive, &worker_waiters, &worker_kill);
+                    let _result = worker_kill.send(true);
                 }
             });
         }
@@ -784,14 +597,14 @@ async fn route_service_call(
                 return Err(RendererViolation);
             };
             let reply = ServiceReply::Cookie(context.fetch.cookies_for(&url));
-            send_reply(&context.tx, id, reply).await?;
+            send_reply(&context.responder, id, reply).await?;
         }
         ServiceCall::CookieSet { value, url } => {
             let Some(url) = authorize(&context.site, &url) else {
                 return Err(RendererViolation);
             };
             context.fetch.set_cookie(&value, &url);
-            send_reply(&context.tx, id, ServiceReply::Unit).await?;
+            send_reply(&context.responder, id, ServiceReply::Unit).await?;
         }
         ServiceCall::BroadcastPost {
             origin,
@@ -807,7 +620,7 @@ async fn route_service_call(
                     payload,
                     source: (assignment, channel),
                 });
-            send_reply(&context.tx, id, ServiceReply::Unit).await?;
+            send_reply(&context.responder, id, ServiceReply::Unit).await?;
         }
         call @ (ServiceCall::StorageGet { .. }
         | ServiceCall::StorageKeys { .. }
@@ -831,9 +644,9 @@ async fn route_service_call(
 /// created the tab and its first navigation; step 2 adds the opener link and
 /// cross-tab messaging.
 async fn route_window_call(
-    context: &ReaderContext,
+    context: &ServiceContext,
     assignment: RendererAssignmentId,
-    id: u64,
+    id: RequestId,
     call: ServiceCall,
 ) -> Result<(), RendererViolation> {
     match call {
@@ -872,11 +685,11 @@ async fn route_window_call(
                     .map(TabId::get),
                 None => None,
             };
-            send_reply(&context.tx, id, ServiceReply::Window(tab)).await?;
+            send_reply(&context.responder, id, ServiceReply::Window(tab)).await?;
         }
         ServiceCall::WindowClose { tab } => {
             let _result = context.browser.close_tab(TabId::new(tab)).await;
-            send_reply(&context.tx, id, ServiceReply::Unit).await?;
+            send_reply(&context.responder, id, ServiceReply::Unit).await?;
         }
         ServiceCall::Opener => {
             let opener = context
@@ -886,14 +699,14 @@ async fn route_window_call(
                 .ok()
                 .flatten()
                 .map(TabId::get);
-            send_reply(&context.tx, id, ServiceReply::Window(opener)).await?;
+            send_reply(&context.responder, id, ServiceReply::Window(opener)).await?;
         }
         ServiceCall::WindowMessage { tab, payload } => {
             let _result = context
                 .browser
                 .window_message(TabId::new(tab), payload)
                 .await;
-            send_reply(&context.tx, id, ServiceReply::Unit).await?;
+            send_reply(&context.responder, id, ServiceReply::Unit).await?;
         }
         ServiceCall::RemoteSessionGet { tab, origin, key } => {
             let value = context
@@ -902,7 +715,7 @@ async fn route_window_call(
                 .await
                 .ok()
                 .flatten();
-            send_reply(&context.tx, id, ServiceReply::StorageValue(value)).await?;
+            send_reply(&context.responder, id, ServiceReply::StorageValue(value)).await?;
         }
         ServiceCall::Dial(_)
         | ServiceCall::CookieGet { .. }
@@ -923,9 +736,9 @@ async fn route_window_call(
 /// Routes one `localStorage` service call. The origin and the calling URL are
 /// both checked against the renderer's site lock before the area is touched.
 async fn route_storage_call(
-    context: &ReaderContext,
+    context: &ServiceContext,
     assignment: RendererAssignmentId,
-    id: u64,
+    id: RequestId,
     call: ServiceCall,
 ) -> Result<(), RendererViolation> {
     match call {
@@ -934,14 +747,14 @@ async fn route_storage_call(
                 return Err(RendererViolation);
             };
             let value = context.fetch.storage_get(&origin, &key);
-            send_reply(&context.tx, id, ServiceReply::StorageValue(value)).await?;
+            send_reply(&context.responder, id, ServiceReply::StorageValue(value)).await?;
         }
         ServiceCall::StorageKeys { origin } => {
             let Some(_origin) = authorize(&context.site, &origin) else {
                 return Err(RendererViolation);
             };
             let keys = context.fetch.storage_keys(&origin);
-            send_reply(&context.tx, id, ServiceReply::StorageKeys(keys)).await?;
+            send_reply(&context.responder, id, ServiceReply::StorageKeys(keys)).await?;
         }
         ServiceCall::StorageSet {
             origin,
@@ -960,7 +773,7 @@ async fn route_storage_call(
                 context
                     .fetch
                     .storage_set(&origin, &url, &key, &value, (assignment, source));
-            send_reply(&context.tx, id, ServiceReply::StorageChanged(change)).await?;
+            send_reply(&context.responder, id, ServiceReply::StorageChanged(change)).await?;
         }
         ServiceCall::StorageRemove {
             origin,
@@ -977,7 +790,12 @@ async fn route_storage_call(
             let change = context
                 .fetch
                 .storage_remove(&origin, &url, &key, (assignment, source));
-            send_reply(&context.tx, id, ServiceReply::StorageChanged(Ok(change))).await?;
+            send_reply(
+                &context.responder,
+                id,
+                ServiceReply::StorageChanged(Ok(change)),
+            )
+            .await?;
         }
         ServiceCall::StorageClear {
             origin,
@@ -993,7 +811,12 @@ async fn route_storage_call(
             let change = context
                 .fetch
                 .storage_clear(&origin, &url, (assignment, source));
-            send_reply(&context.tx, id, ServiceReply::StorageChanged(Ok(change))).await?;
+            send_reply(
+                &context.responder,
+                id,
+                ServiceReply::StorageChanged(Ok(change)),
+            )
+            .await?;
         }
         ServiceCall::Dial(_)
         | ServiceCall::CookieGet { .. }
@@ -1018,8 +841,8 @@ fn was_released(released: &AtomicU64, assignment: RendererAssignmentId) -> bool 
 /// Answers a late call from a released assignment so the renderer's blocking
 /// service path stays unblocked while its engine is torn down.
 async fn send_released_reply(
-    tx: &mpsc::Sender<Outbound>,
-    id: u64,
+    responder: &BrowserServiceResponder,
+    id: RequestId,
     call: &ServiceCall,
 ) -> Result<(), RendererViolation> {
     let reply = match call {
@@ -1038,7 +861,7 @@ async fn send_released_reply(
         | ServiceCall::StorageClear { .. } => ServiceReply::StorageChanged(Ok(None)),
         ServiceCall::WindowOpen { .. } | ServiceCall::Opener => ServiceReply::Window(None),
     };
-    send_reply(tx, id, reply).await
+    send_reply(responder, id, reply).await
 }
 
 fn has_assignment(subscribers: &EventSubscribers, assignment: RendererAssignmentId) -> bool {
@@ -1056,32 +879,19 @@ fn authorize(site: &Mutex<Option<Site>>, spec: &str) -> Option<url::Url> {
 }
 
 async fn send_reply(
-    tx: &mpsc::Sender<Outbound>,
-    id: u64,
+    responder: &BrowserServiceResponder,
+    id: RequestId,
     reply: ServiceReply,
 ) -> Result<(), RendererViolation> {
-    tx.send(Outbound::Control(ToRenderer::ServiceReply { id, reply }))
+    responder
+        .reply(id, reply)
         .await
         .map_err(|_| RendererViolation)
 }
 
-fn fail(alive: &Arc<AtomicBool>, waiters: &Waiters, kill: &watch::Sender<bool>) {
+fn fail(alive: &Arc<AtomicBool>, router: &RendererRouter, kill: &watch::Sender<bool>) {
     alive.store(false, Ordering::Relaxed);
-    waiters
-        .pending
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .clear();
-    waiters
-        .byte_replies
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .clear();
-    waiters
-        .streams
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .clear();
+    router.close();
     let _ = kill.send(true);
 }
 
@@ -1152,35 +962,50 @@ fn spawn_transport(command: &mut Command) -> io::Result<SpawnedRenderer> {
     })
 }
 
-/// Registers the one-way browser-to-renderer subscriptions: storage events
-/// and `BroadcastChannel` messages. Both are best-effort; a full queue drops
-/// the message instead of stalling the browser.
-fn subscribe_renderer_events(fetch: &FetchHandle, tx: &mpsc::Sender<Outbound>) {
-    let storage_tx = tx.clone();
+/// Registers reliable browser-to-renderer notifications. Queue saturation
+/// disconnects the renderer rather than silently losing observable events.
+fn subscribe_renderer_events(
+    fetch: &FetchHandle,
+    client: &RendererClient,
+    kill: &watch::Sender<bool>,
+) {
+    let storage_client = client.clone();
+    let storage_kill = kill.clone();
     fetch.subscribe_storage(Box::new(move |event| {
-        match storage_tx.try_send(Outbound::Control(ToRenderer::StorageEvent {
-            origin: event.origin,
-            kind: event.kind,
-            key: event.key,
-            old_value: event.old_value,
-            new_value: event.new_value,
-            url: event.url,
-            source: Some(event.source),
-        })) {
-            Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => true,
-            Err(mpsc::error::TrySendError::Closed(_)) => false,
+        if storage_client
+            .try_notify(HostNotice::StorageEvent {
+                origin: event.origin,
+                kind: event.kind,
+                key: event.key,
+                old_value: event.old_value,
+                new_value: event.new_value,
+                url: event.url,
+                source: Some(event.source),
+            })
+            .is_ok()
+        {
+            true
+        } else {
+            let _result = storage_kill.send(true);
+            false
         }
     }));
-    let broadcast_tx = tx.clone();
+    let broadcast_client = client.clone();
+    let broadcast_kill = kill.clone();
     fetch.subscribe_broadcast(Box::new(move |message| {
-        match broadcast_tx.try_send(Outbound::Control(ToRenderer::BroadcastMessage {
-            origin: message.origin.clone(),
-            name: message.name.clone(),
-            payload: message.payload.clone(),
-            source: Some(message.source),
-        })) {
-            Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => true,
-            Err(mpsc::error::TrySendError::Closed(_)) => false,
+        if broadcast_client
+            .try_notify(HostNotice::BroadcastMessage {
+                origin: message.origin.clone(),
+                name: message.name.clone(),
+                payload: message.payload.clone(),
+                source: Some(message.source),
+            })
+            .is_ok()
+        {
+            true
+        } else {
+            let _result = broadcast_kill.send(true);
+            false
         }
     }));
 }
@@ -1206,14 +1031,10 @@ pub(crate) async fn spawn_process(
         let _ = child.start_kill();
         return Err(io::Error::other("renderer stderr missing"));
     };
-    let (tx, rx) = mpsc::channel::<Outbound>(COMMAND_CAPACITY);
-    subscribe_renderer_events(&fetch, &tx);
+    let (tx, rx) = exchange::pair(COMMAND_CAPACITY, COMMAND_CAPACITY);
+    let (client, server, router) = exchange::endpoint(tx, COMMAND_CAPACITY);
     let (kill, kill_rx) = watch::channel(false);
-    let waiters = Waiters {
-        pending: Arc::new(Mutex::new(HashMap::new())),
-        byte_replies: Arc::new(Mutex::new(HashMap::new())),
-        streams: Arc::new(Mutex::new(HashMap::new())),
-    };
+    subscribe_renderer_events(&fetch, &client, &kill);
     let alive = Arc::new(AtomicBool::new(true));
     let subscribers = Arc::new(Mutex::new(HashMap::new()));
     let (ready_tx, ready_rx) = oneshot::channel();
@@ -1221,16 +1042,19 @@ pub(crate) async fn spawn_process(
         rx,
         writer,
         Arc::clone(&alive),
-        waiters.clone(),
+        router.clone(),
         kill.clone(),
         kill_rx.clone(),
     ));
     let site = Arc::new(Mutex::new(site));
     let released = Arc::new(AtomicU64::new(0));
     let reader_context = ReaderContext {
-        tx: tx.clone(),
-        waiters: waiters.clone(),
+        router: router.clone(),
         alive: Arc::clone(&alive),
+        kill: kill.clone(),
+    };
+    let service_context = ServiceContext {
+        responder: server.responder(),
         subscribers: Arc::clone(&subscribers),
         fetch: fetch.clone(),
         site: Arc::clone(&site),
@@ -1239,16 +1063,18 @@ pub(crate) async fn spawn_process(
         browser,
     };
     let reader_task = tokio::spawn(reader_task(reader, reader_context, Some(ready_tx)));
+    let service_task = tokio::spawn(service_task(server, service_context));
     let stderr_task = tokio::spawn(forward_stderr(stderr));
     // Detached child task: it reaps the child when the channel closes or the
     // handle signals a kill. Dropping every kill sender also stops it.
     let _reaper = tokio::spawn(child_task(child, kill_rx));
-    if tx.send(Outbound::Control(ToRenderer::Hello)).await.is_err()
+    if client.notify(HostNotice::Hello).await.is_err()
         || timeout(HANDSHAKE_TIMEOUT, ready_rx).await != Ok(Ok(true))
     {
         let _ = kill.send(true);
         let _result = writer_task.await;
         let _result = reader_task.await;
+        let _result = service_task.await;
         let _result = stderr_task.await;
         return Err(io::Error::other("renderer handshake failed"));
     }
@@ -1256,13 +1082,11 @@ pub(crate) async fn spawn_process(
         target: "browser::link",
         "renderer {id:?} ready for site lock {site:?}"
     );
-    let tasks = vec![writer_task, reader_task, stderr_task];
+    let tasks = vec![writer_task, reader_task, service_task, stderr_task];
     Ok(RendererHandle {
-        tx,
-        waiters,
+        client,
         alive,
         subscribers,
-        next_request: AtomicU64::new(1),
         kill,
         tasks: Mutex::new(tasks),
         site,

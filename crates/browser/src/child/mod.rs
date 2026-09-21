@@ -20,36 +20,29 @@ mod session;
 /// Bounded command channel: one renderer's inbound messages.
 const INBOX_CAPACITY: usize = 256;
 
-/// Bounded outbox: messages waiting to be written to the host.
-const OUTBOX_CAPACITY: usize = 4096;
+/// Bounded outbox control lane: replies, reverse calls, cancellation.
+const OUTBOX_CONTROL_CAPACITY: usize = 256;
 
-use std::collections::HashMap;
+/// Bounded outbox data lane: events and screenshot chunks.
+const OUTBOX_DATA_CAPACITY: usize = 4096;
+
 use std::io::{self, Read, Write};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{self as std_mpsc, Sender, SyncSender};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::Arc;
 use std::thread;
 
 use renderer::{
     BrowserServices, DialCompletion, DialRequest, FrameId, Stop, StorageChange, StorageError,
     StorageSeed,
 };
-use tokio::sync::{Notify, mpsc};
+use tokio::sync::Notify;
 use url::Url;
 
+use crate::exchange::{self, BlockingClient, Frame, RequestId};
 use crate::wire::channel::{FrameKind, decode_control, read_frame, write_frame};
 use crate::wire::{
-    Command, FromRenderer, RendererAssignmentId, ServiceCall, ServiceReply, ToRenderer,
+    BrowserCall, FromRenderer, HostNotice, RendererAssignmentId, RendererNotice, RendererReply,
+    ServiceCall, ServiceReply, ToRenderer,
 };
-
-/// One message the renderer writes to the browser: control JSON or a raw body
-/// chunk of a streamed reply.
-pub(crate) enum Outgoing {
-    /// A control message.
-    Message(FromRenderer),
-    /// Raw bytes for one request id.
-    Body { request: u64, payload: Vec<u8> },
-}
 
 /// Runs the renderer child until `Shutdown` or the channel closes.
 ///
@@ -68,8 +61,8 @@ pub fn serve() -> io::Result<()> {
 
 async fn serve_async() -> io::Result<thread::JoinHandle<io::Result<()>>> {
     let (input, output) = endpoint()?;
-    let (command_tx, command_rx) = mpsc::channel::<RendererInput>(INBOX_CAPACITY);
-    let (out_tx, out_rx) = std_mpsc::sync_channel::<Outgoing>(OUTBOX_CAPACITY);
+    let (command_tx, command_rx) = exchange::pair(INBOX_CAPACITY, INBOX_CAPACITY);
+    let (out_tx, out_rx) = exchange::blocking_pair(OUTBOX_CONTROL_CAPACITY, OUTBOX_DATA_CAPACITY);
     let stop = Arc::new(Stop::new());
     let wake = Arc::new(Notify::new());
     let writer_stop = Arc::clone(&stop);
@@ -80,13 +73,13 @@ async fn serve_async() -> io::Result<thread::JoinHandle<io::Result<()>>> {
         if result.is_err() {
             writer_stop.request();
             writer_wake.notify_one();
-            let shutdown = RendererInput::Control(ToRenderer::shutdown_request());
+            let shutdown = Frame::Notify(HostNotice::Shutdown);
             let _ = writer_commands.try_send(shutdown);
         }
         result
     });
     let services = Arc::new(ChannelServices::new(out_tx.clone()));
-    let _ready = out_tx.try_send(Outgoing::Message(FromRenderer::Ready));
+    let _ready = out_tx.try_send(Frame::Notify(RendererNotice::Ready));
     logging::info!(target: "renderer", "ready");
     let reader_services = Arc::clone(&services);
     let reader_stop = Arc::clone(&stop);
@@ -127,7 +120,7 @@ fn endpoint() -> io::Result<(Box<dyn Read + Send>, Box<dyn Write + Send>)> {
 
 fn read_messages(
     mut input: Box<dyn Read + Send>,
-    command_tx: &mpsc::Sender<RendererInput>,
+    command_tx: &exchange::Sender<ToRenderer>,
     services: &ChannelServices,
     stop: &Arc<Stop>,
     wake: &Arc<Notify>,
@@ -143,53 +136,35 @@ fn read_messages(
                 break;
             }
         };
-        if frame.kind == FrameKind::Body {
-            if command_tx
-                .blocking_send(RendererInput::Body {
-                    request: frame.request,
-                    bytes: buffer.clone(),
-                })
-                .is_err()
-            {
-                break;
-            }
-            continue;
-        }
-        let message = match decode_control::<ToRenderer>(&buffer) {
-            Ok(message) => message,
-            Err(error) => {
-                logging::error!(target: "renderer::ipc", "bad host message: {error}");
-                break;
-            }
+        let message = match frame.kind {
+            FrameKind::Control => match decode_control::<ToRenderer>(&buffer) {
+                Ok(message) => message,
+                Err(error) => {
+                    logging::error!(target: "renderer::ipc", "bad host message: {error}");
+                    break;
+                }
+            },
+            FrameKind::RequestChunk => Frame::RequestChunk {
+                id: RequestId::new(frame.request),
+                bytes: buffer.clone(),
+            },
+            FrameKind::ResponseChunk => Frame::ResponseChunk {
+                id: RequestId::new(frame.request),
+                bytes: buffer.clone(),
+            },
         };
         if !greeted {
             match message {
-                ToRenderer::Hello => {
+                Frame::Notify(HostNotice::Hello) => {
                     greeted = true;
                     continue;
                 }
-                ToRenderer::ServiceReply { id, reply } => {
-                    services.deliver(id, reply);
+                Frame::Reply { id, body } => {
+                    services.deliver(id, body);
                     continue;
                 }
-                ToRenderer::Assign { .. }
-                | ToRenderer::Release { .. }
-                | ToRenderer::Request { .. } => {
-                    logging::error!(target: "renderer::ipc", "request before handshake");
-                    break;
-                }
-                ToRenderer::ResponseStart { .. }
-                | ToRenderer::ResponseEnd { .. }
-                | ToRenderer::ResponseError { .. } => {
-                    logging::error!(target: "renderer::ipc", "response before handshake");
-                    break;
-                }
-                ToRenderer::StorageEvent { .. } => {
-                    logging::error!(target: "renderer::ipc", "storage event before handshake");
-                    break;
-                }
-                ToRenderer::BroadcastMessage { .. } => {
-                    logging::error!(target: "renderer::ipc", "broadcast before handshake");
+                _ => {
+                    logging::error!(target: "renderer::ipc", "message before handshake");
                     break;
                 }
             }
@@ -202,78 +177,46 @@ fn read_messages(
     // browser: interrupt in-flight work and stop the loop.
     stop.request();
     wake.notify_one();
-    let _ = command_tx.try_send(RendererInput::Control(ToRenderer::shutdown_request()));
+    services.close();
+    let _result = command_tx.try_send(Frame::Notify(HostNotice::Shutdown));
 }
 
 /// Routes one post-handshake host message; `false` stops the read loop.
 fn route_message(
     message: ToRenderer,
-    command_tx: &mpsc::Sender<RendererInput>,
+    command_tx: &exchange::Sender<ToRenderer>,
     services: &ChannelServices,
 ) -> bool {
     match message {
-        ToRenderer::Hello => {
+        Frame::Notify(HostNotice::Hello) => {
             logging::error!(target: "renderer::ipc", "duplicate handshake");
             false
         }
-        ToRenderer::Assign { .. } | ToRenderer::Release { .. } | ToRenderer::Request { .. } => {
-            let shutdown = matches!(
-                &message,
-                ToRenderer::Request {
-                    command: Command::Shutdown,
-                    ..
-                }
-            );
-            command_tx
-                .blocking_send(RendererInput::Control(message))
-                .is_ok()
-                && !shutdown
+        Frame::Notify(HostNotice::Shutdown) => {
+            let _result = command_tx.blocking_send(message);
+            false
         }
-        ToRenderer::ResponseStart { .. }
-        | ToRenderer::ResponseEnd { .. }
-        | ToRenderer::ResponseError { .. } => command_tx
-            .blocking_send(RendererInput::Control(message))
-            .is_ok(),
-        ToRenderer::StorageEvent { .. } => {
-            // Storage events are best-effort, like the spec's task queue. The
-            // engine may be blocked in a synchronous service call, so blocking
-            // here would stall the service reply it waits on.
-            match command_tx.try_send(RendererInput::Control(message)) {
-                Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => true,
-                Err(mpsc::error::TrySendError::Closed(_)) => false,
-            }
-        }
-        ToRenderer::BroadcastMessage { .. } => {
-            // Same best-effort rule as storage events.
-            match command_tx.try_send(RendererInput::Control(message)) {
-                Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => true,
-                Err(mpsc::error::TrySendError::Closed(_)) => false,
-            }
-        }
-        ToRenderer::ServiceReply { id, reply } => {
-            services.deliver(id, reply);
+        Frame::Reply { id, body } => {
+            services.deliver(id, body);
             true
         }
+        _ => command_tx.blocking_send(message).is_ok(),
     }
 }
 
-pub(crate) enum RendererInput {
-    Control(ToRenderer),
-    Body { request: u64, bytes: Vec<u8> },
-}
-
 fn write_messages(
-    rx: &std_mpsc::Receiver<Outgoing>,
+    rx: &exchange::BlockingReceiver<FromRenderer>,
     mut output: Box<dyn Write + Send>,
 ) -> io::Result<()> {
-    for message in rx {
+    while let Some(message) = rx.recv() {
         match message {
-            Outgoing::Message(message) => {
-                crate::wire::channel::write_control(&mut output, &message)?;
+            Frame::RequestChunk { id, bytes } => {
+                write_frame(&mut output, FrameKind::RequestChunk, id.get(), &bytes)?;
             }
-            Outgoing::Body { request, payload } => {
-                write_frame(&mut output, FrameKind::Body, request, &payload)?;
+            Frame::ResponseChunk { id, bytes } => {
+                write_frame(&mut output, FrameKind::ResponseChunk, id.get(), &bytes)?;
             }
+            _ => crate::wire::channel::write_control(&mut output, &message)?,
         }
     }
     Ok(())
@@ -281,93 +224,52 @@ fn write_messages(
 
 /// [`BrowserServices`] proxy that asks the browser process over the channel.
 pub(crate) struct ChannelServices {
-    out: SyncSender<Outgoing>,
-    pending: Mutex<HashMap<u64, PendingService>>,
-    next: AtomicU64,
-}
-
-enum PendingService {
-    Blocking(Sender<ServiceReply>),
-    Dial(DialCompletion),
+    client: BlockingClient<BrowserCall, RendererReply, RendererNotice, ServiceReply>,
 }
 
 impl ChannelServices {
-    fn new(out: SyncSender<Outgoing>) -> Self {
+    fn new(out: exchange::BlockingSender<FromRenderer>) -> Self {
         Self {
-            out,
-            pending: Mutex::new(HashMap::new()),
-            next: AtomicU64::new(1),
-        }
-    }
-
-    /// Registers `pending` under a fresh id and queues one service call. On
-    /// queue failure the registration is rolled back and returned so the
-    /// caller can take its own failure path.
-    fn begin_service(
-        &self,
-        assignment: RendererAssignmentId,
-        call: ServiceCall,
-        pending: PendingService,
-    ) -> Result<(), PendingService> {
-        let id = self.next.fetch_add(1, Ordering::Relaxed);
-        self.pending
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .insert(id, pending);
-        if self
-            .out
-            .try_send(Outgoing::Message(FromRenderer::ServiceCall {
-                assignment,
-                id,
-                call,
-            }))
-            .is_ok()
-        {
-            return Ok(());
-        }
-        match self
-            .pending
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .remove(&id)
-        {
-            Some(pending) => Err(pending),
-            // `deliver` is the only other remover, and it cannot see an id the
-            // host never received, so this branch is unreachable.
-            None => Ok(()),
+            client: BlockingClient::new(out),
         }
     }
 
     fn call(&self, assignment: RendererAssignmentId, call: ServiceCall) -> Option<ServiceReply> {
-        let (reply_tx, reply_rx) = std_mpsc::channel();
-        self.begin_service(assignment, call, PendingService::Blocking(reply_tx))
-            .ok()?;
-        reply_rx.recv().ok()
+        self.client.call(BrowserCall { assignment, call }).ok()
     }
 
-    fn deliver(&self, id: u64, reply: ServiceReply) {
-        let pending = self
-            .pending
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .remove(&id);
-        match pending {
-            Some(PendingService::Blocking(reply_tx)) => {
-                let _ = reply_tx.send(reply);
-            }
-            Some(PendingService::Dial(completion)) => match reply {
-                ServiceReply::Dial(outcome) => completion(outcome),
-                ServiceReply::Cookie(_)
-                | ServiceReply::StorageValue(_)
-                | ServiceReply::StorageKeys(_)
-                | ServiceReply::StorageChanged(_)
-                | ServiceReply::Window(_)
-                | ServiceReply::Unit => {
-                    completion(Err(renderer::DialFailure::Connect));
-                }
+    fn start_dial(
+        &self,
+        assignment: RendererAssignmentId,
+        request: DialRequest,
+        completion: DialCompletion,
+    ) {
+        self.client.call_with(
+            BrowserCall {
+                assignment,
+                call: ServiceCall::Dial(request),
             },
-            None => {}
-        }
+            move |reply| match reply {
+                Ok(ServiceReply::Dial(outcome)) => completion(outcome),
+                Ok(
+                    ServiceReply::Cookie(_)
+                    | ServiceReply::StorageValue(_)
+                    | ServiceReply::StorageKeys(_)
+                    | ServiceReply::StorageChanged(_)
+                    | ServiceReply::Window(_)
+                    | ServiceReply::Unit,
+                )
+                | Err(_) => completion(Err(renderer::DialFailure::Connect)),
+            },
+        );
+    }
+
+    fn deliver(&self, id: RequestId, reply: ServiceReply) {
+        self.client.deliver(id, reply);
+    }
+
+    fn close(&self) {
+        self.client.close();
     }
 }
 
@@ -387,14 +289,8 @@ impl AssignmentServices {
 
 impl BrowserServices for AssignmentServices {
     fn start_dial(&self, request: DialRequest, completion: DialCompletion) {
-        let pending = self.channel.begin_service(
-            self.assignment,
-            ServiceCall::Dial(request),
-            PendingService::Dial(completion),
-        );
-        if let Err(PendingService::Dial(completion)) = pending {
-            completion(Err(renderer::DialFailure::Connect));
-        }
+        self.channel
+            .start_dial(self.assignment, request, completion);
     }
 
     fn cookies_for(&self, url: &Url) -> String {
