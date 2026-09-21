@@ -3,7 +3,7 @@
 //! The browser process owns tabs as Tokio tasks. The renderer owns each
 //! document.
 
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::convert::Infallible;
 use std::fmt;
 use std::future::pending;
@@ -856,6 +856,7 @@ enum Wake {
 async fn coordinator_loop(mut server: TabServer, mut tab: Tab) {
     let mut waiters = Vec::new();
     let mut cancelled = HashSet::new();
+    let mut cancelled_order = VecDeque::new();
     loop {
         tab.launch_navigation();
         let deadline = next_waiter_deadline(&waiters);
@@ -882,10 +883,7 @@ async fn coordinator_loop(mut server: TabServer, mut tab: Tab) {
                 let before = waiters.len();
                 waiters.retain(|waiter| waiter.id != id);
                 if waiters.len() == before {
-                    cancelled.insert(id);
-                    if cancelled.len() > MAX_WAITERS {
-                        break;
-                    }
+                    remember_cancelled(&mut cancelled, &mut cancelled_order, id);
                 }
             }
             Wake::Command(Some(
@@ -927,6 +925,22 @@ async fn wait_for_deadline(deadline: Option<Instant>) {
 
 fn next_waiter_deadline(waiters: &[Waiter]) -> Option<Instant> {
     waiters.iter().map(|waiter| waiter.deadline).min()
+}
+
+fn remember_cancelled(
+    cancelled: &mut HashSet<RequestId>,
+    order: &mut VecDeque<RequestId>,
+    id: RequestId,
+) {
+    if cancelled.insert(id) {
+        order.push_back(id);
+    }
+    while cancelled.len() > MAX_WAITERS {
+        let Some(oldest) = order.pop_front() else {
+            break;
+        };
+        cancelled.remove(&oldest);
+    }
 }
 
 /// Handles one command. `true` means the coordinator returns.

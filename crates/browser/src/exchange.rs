@@ -964,7 +964,8 @@ fn route_chunk<R>(
             buffer.extend_from_slice(bytes);
             Ok(())
         }
-        Some(Pending::Unary(_)) | None => Err(Error::Protocol),
+        Some(Pending::Unary(_)) => Err(Error::Protocol),
+        None => Ok(()),
     }
 }
 
@@ -1065,6 +1066,44 @@ mod tests {
         let (reply, bytes) = pending.await.expect("join").expect("download");
         assert_eq!(reply, 5);
         assert_eq!(bytes, [1, 2, 3]);
+    }
+
+    #[tokio::test]
+    async fn leftover_response_chunks_after_cancel_are_ignored() {
+        let (to_peer, mut peer_rx) = pair(2, 2);
+        let (from_peer, from_peer_rx) = pair(2, 2);
+        let (client, _server) = bind::<u8, Infallible, Infallible, Infallible, u16, Infallible>(
+            to_peer,
+            from_peer_rx,
+            2,
+        );
+        let client = client.clone();
+        let pending = tokio::spawn({
+            let client = client.clone();
+            async move { client.call_download(4, 8).await }
+        });
+        let Some(Frame::Call { id, .. }) = peer_rx.recv().await else {
+            panic!("peer expected call");
+        };
+        pending.abort();
+        let _result = pending.await;
+        let Some(Frame::Cancel { id: cancelled }) = peer_rx.recv().await else {
+            panic!("expected cancel");
+        };
+        assert_eq!(cancelled, id);
+        from_peer
+            .send(Frame::ResponseChunk { id, bytes: vec![1] })
+            .await
+            .expect("leftover chunk");
+        let pending = tokio::spawn(async move { client.call(9).await });
+        let received = tokio::time::timeout(std::time::Duration::from_secs(1), peer_rx.recv())
+            .await
+            .expect("second call timed out");
+        let Some(Frame::Call { body, .. }) = received else {
+            panic!("peer expected second call, got {received:?}");
+        };
+        assert_eq!(body, 9);
+        pending.abort();
     }
 
     #[tokio::test]

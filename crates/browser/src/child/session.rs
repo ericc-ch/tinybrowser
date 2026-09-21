@@ -4,7 +4,7 @@
 //! completion, or a message from the browser. Commands become engine calls;
 //! engine events and replies become wire messages.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -19,6 +19,8 @@ use crate::wire::{
     Command, FromRenderer, HostNotice, RendererAssignmentId, RendererCall, RendererNotice,
     RendererReply, Reply, ResponseStart, ToRenderer,
 };
+
+const MAX_CANCELLED_STREAMS: usize = 256;
 
 /// What one host command produced.
 enum Handled {
@@ -101,7 +103,15 @@ fn handle_host(
             body: RendererCall::Response { response },
         }) => {
             let Some(engine) = engines.get_mut(&response.assignment) else {
-                return true;
+                responses.cancel(id, engines);
+                return reply_result(
+                    outbox,
+                    id,
+                    (
+                        response.assignment,
+                        Err(stream_error("response assignment is gone")),
+                    ),
+                );
             };
             match responses.start(id, &response, engine) {
                 Ok(()) => true,
@@ -306,11 +316,24 @@ struct ActiveResponse {
 struct ResponseStreams {
     active: HashMap<RequestId, ActiveResponse>,
     cancelled: HashSet<RequestId>,
+    cancelled_order: VecDeque<RequestId>,
 }
 
 impl ResponseStreams {
     fn is_cancelled(&self, id: RequestId) -> bool {
         self.cancelled.contains(&id)
+    }
+
+    fn tombstone(&mut self, id: RequestId) {
+        if self.cancelled.insert(id) {
+            self.cancelled_order.push_back(id);
+        }
+        while self.cancelled.len() > MAX_CANCELLED_STREAMS {
+            let Some(oldest) = self.cancelled_order.pop_front() else {
+                break;
+            };
+            self.cancelled.remove(&oldest);
+        }
     }
 
     fn start(
@@ -360,7 +383,7 @@ impl ResponseStreams {
             let assignment = response.assignment;
             let frame = response.frame;
             self.active.remove(&id);
-            self.cancelled.insert(id);
+            self.tombstone(id);
             if let Some(engine) = engines.get_mut(&assignment) {
                 let _result = engine.abort_body(frame);
             }
@@ -371,12 +394,20 @@ impl ResponseStreams {
         }
         let assignment = response.assignment;
         let frame = response.frame;
-        match engines.get_mut(&assignment) {
+        let result = match engines.get_mut(&assignment) {
             Some(engine) => engine
                 .write_body(frame, bytes)
                 .map_err(|error| (assignment, error)),
             None => Err((assignment, stream_error("response assignment is gone"))),
+        };
+        if result.is_err() {
+            self.active.remove(&id);
+            self.tombstone(id);
+            if let Some(engine) = engines.get_mut(&assignment) {
+                let _result = engine.abort_body(frame);
+            }
         }
+        result
     }
 
     fn finish(
@@ -421,7 +452,7 @@ impl ResponseStreams {
         {
             let _result = engine.abort_body(response.frame);
         }
-        self.cancelled.insert(id);
+        self.tombstone(id);
     }
 
     /// Removes the stream for `id`, defaulting the assignment when the browser
@@ -449,7 +480,7 @@ impl ResponseStreams {
             .collect();
         for (id, frame) in stale {
             self.active.remove(&id);
-            self.cancelled.insert(id);
+            self.tombstone(id);
             if let Some(engine) = engines.get_mut(&assignment) {
                 let _result = engine.abort_body(frame);
             }
