@@ -38,10 +38,10 @@ pub use document::Stop;
 pub use embedded::EmbeddedRenderer;
 pub use engine::Engine;
 pub use protocol::{
-    BrowserServices, DialCompletion, DialFailure, DialKind, DialOutcome, DialRequest, FrameId,
-    MAX_RESPONSE_BODY_BYTES, Mount, RendererEvent, ResourceLimit, STORAGE_QUOTA_BYTES,
-    ScreenshotClip, ScreenshotRequest, ScriptFailure, StorageChange, StorageError, StorageKind,
-    StorageSeed, TabError,
+    BrowserServices, BrowsingContextHost, DialCompletion, DialFailure, DialKind, DialOutcome,
+    DialRequest, FrameId, MAX_RESPONSE_BODY_BYTES, MessagingHost, Mount, NetworkHost,
+    RendererEvent, ResourceLimit, STORAGE_QUOTA_BYTES, ScreenshotClip, ScreenshotRequest,
+    ScriptFailure, StorageChange, StorageError, StorageHost, StorageKind, TabError,
 };
 pub use remote::RemoteValue;
 pub use storage::PendingStorageEvent;

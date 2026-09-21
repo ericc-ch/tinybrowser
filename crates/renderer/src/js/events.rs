@@ -585,6 +585,27 @@ pub(crate) fn add_listener<'js>(
     callback: Value<'js>,
     options: Option<Value<'js>>,
 ) -> Result<()> {
+    add_listener_in(
+        ctx,
+        &target_world(ctx, target)?,
+        target,
+        typ,
+        callback,
+        options,
+    )
+}
+
+/// [`add_listener`] on a chosen realm. `contentWindow.addEventListener` runs
+/// in the caller's realm and must still register on the frame's window
+/// (<https://html.spec.whatwg.org/multipage/window-object.html#windowproxy-get>).
+pub(crate) fn add_listener_in<'js>(
+    ctx: &Ctx<'js>,
+    world: &Rc<RefCell<World>>,
+    target: EventTargetKey,
+    typ: Value<'js>,
+    callback: Value<'js>,
+    options: Option<Value<'js>>,
+) -> Result<()> {
     let typ = bindings::webidl_to_string(ctx, typ)?;
     let callback = listener_callback(ctx, callback)?;
     let options = ListenerOptions::read(ctx, options)?;
@@ -604,7 +625,6 @@ pub(crate) fn add_listener<'js>(
         Some(passive) => passive,
         None => default_passive(ctx, &typ, target)?,
     };
-    let world = target_world(ctx, target)?;
     // Abort steps run when the list is touched or a listener is about to be
     // invoked (<https://dom.spec.whatwg.org/#add-an-event-listener>).
     let existing_listeners = world.borrow().listener_snapshot(target);
@@ -648,10 +668,27 @@ pub(crate) fn remove_listener<'js>(
     callback: Value<'js>,
     options: Option<Value<'js>>,
 ) -> Result<()> {
+    remove_listener_in(
+        ctx,
+        &target_world(ctx, target)?,
+        target,
+        typ,
+        callback,
+        options,
+    )
+}
+
+pub(crate) fn remove_listener_in<'js>(
+    ctx: &Ctx<'js>,
+    world: &Rc<RefCell<World>>,
+    target: EventTargetKey,
+    typ: Value<'js>,
+    callback: Value<'js>,
+    options: Option<Value<'js>>,
+) -> Result<()> {
     let typ = bindings::webidl_to_string(ctx, typ)?;
     let callback = listener_callback(ctx, callback)?;
     let capture = ListenerOptions::read_capture(ctx, options)?;
-    let world = target_world(ctx, target)?;
     let mut world = world.borrow_mut();
     let mut removed = Vec::new();
     for existing in world.listener_snapshot(target) {
@@ -676,7 +713,18 @@ pub(crate) fn dispatch_event<'js>(
     target: EventTargetKey,
     event: &Class<'js, JsEvent>,
 ) -> Result<bool> {
-    dispatch_checked(ctx, target, event, false)
+    dispatch_checked(ctx, target, event, false, None)
+}
+
+/// `dispatchEvent()` on a chosen realm's window, so a call through another
+/// realm's `WindowProxy` dispatches on the frame's window
+/// (<https://html.spec.whatwg.org/multipage/window-object.html#windowproxy-get>).
+pub(crate) fn dispatch_event_for_window<'js>(
+    ctx: &Ctx<'js>,
+    world: &Rc<RefCell<World>>,
+    event: &Class<'js, JsEvent>,
+) -> Result<bool> {
+    dispatch_checked(ctx, EventTargetKey::Window, event, false, Some(world))
 }
 
 /// Dispatches a user-agent event with the trust bit set, without the
@@ -687,7 +735,7 @@ pub(crate) fn dispatch_trusted_event<'js>(
     target: EventTargetKey,
     event: &Class<'js, JsEvent>,
 ) -> Result<bool> {
-    dispatch_checked(ctx, target, event, true)
+    dispatch_checked(ctx, target, event, true, None)
 }
 
 /// Checks the event's dispatch flags and sets `isTrusted` before dispatch:
@@ -697,6 +745,7 @@ fn dispatch_checked<'js>(
     target: EventTargetKey,
     event: &Class<'js, JsEvent>,
     trusted: bool,
+    window: Option<&Rc<RefCell<World>>>,
 ) -> Result<bool> {
     {
         let class = event.borrow();
@@ -710,7 +759,7 @@ fn dispatch_checked<'js>(
         }
     }
     event.borrow().state_mut().is_trusted = trusted;
-    dispatch(ctx, target, event)
+    dispatch(ctx, target, event, window)
 }
 
 /// Creates and dispatches a user-agent event.
@@ -737,7 +786,7 @@ pub(crate) fn fire_trusted_with_related(
 ) -> Result<()> {
     let event = Class::instance(ctx.clone(), JsEvent::trusted(typ, bubbles, cancelable))?;
     event.borrow().state_mut().related_target = related;
-    dispatch(ctx, target, &event)?;
+    dispatch(ctx, target, &event, None)?;
     Ok(())
 }
 
@@ -746,8 +795,9 @@ fn dispatch<'js>(
     ctx: &Ctx<'js>,
     target: EventTargetKey,
     event: &Class<'js, JsEvent>,
+    window: Option<&Rc<RefCell<World>>>,
 ) -> Result<bool> {
-    let path = build_path(ctx, target)?;
+    let path = build_path(ctx, target, window)?;
     {
         let class = event.borrow();
         let mut state = class.state_mut();
@@ -863,13 +913,18 @@ struct PathItem<'js> {
 
 /// Builds the event path: the target, its ancestors, and the window
 /// (<https://dom.spec.whatwg.org/#concept-event-path-append>).
-fn build_path<'js>(ctx: &Ctx<'js>, target: EventTargetKey) -> Result<Vec<PathItem<'js>>> {
+fn build_path<'js>(
+    ctx: &Ctx<'js>,
+    target: EventTargetKey,
+    window: Option<&Rc<RefCell<World>>>,
+) -> Result<Vec<PathItem<'js>>> {
     match target {
         EventTargetKey::Window => {
-            let reference = EventTargetRef {
-                key: target,
-                world: bindings::world(ctx)?,
+            let world = match window {
+                Some(world) => Rc::clone(world),
+                None => bindings::world(ctx)?,
             };
+            let reference = EventTargetRef { key: target, world };
             let value = resolve_target(ctx, &reference)?;
             Ok(vec![PathItem {
                 reference,

@@ -98,6 +98,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "url",
+ "webstorage",
 ]
 
 [[package]]
@@ -1914,6 +1915,7 @@ dependencies = [
  "tokio",
  "url",
  "web_atoms",
+ "webstorage",
  "writeable",
  "zune-core",
  "zune-jpeg",
@@ -2599,6 +2601,7 @@ dependencies = [
  "cookies",
  "renderer",
  "url",
+ "webstorage",
  "wit-bindgen",
 ]
 
@@ -2950,6 +2953,13 @@ dependencies = [
  "server",
  "tokio",
  "url",
+]
+
+[[package]]
+name = "webstorage"
+version = "0.1.0"
+dependencies = [
+ "serde",
 ]
 
 [[package]]

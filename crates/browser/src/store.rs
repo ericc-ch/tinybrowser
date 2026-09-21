@@ -1,14 +1,14 @@
 //! Durable profile backing: the cookie store and its file codec.
 //!
-//! The browser process persists one profile; `NetworkSession` holds the live
-//! jar and hands this store to the browser task for load and save.
+//! The browser context owns live state and uses this store only at open and
+//! persistence boundaries.
 
 use std::env;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use net::{Agent, CookieRecord, CookieSameSite};
@@ -25,7 +25,6 @@ pub struct ProfileStore {
     root: PathBuf,
     _lock: File,
     disk: Mutex<()>,
-    dirty: AtomicBool,
 }
 
 impl ProfileStore {
@@ -70,7 +69,6 @@ impl ProfileStore {
             root,
             _lock: lock,
             disk: Mutex::new(()),
-            dirty: AtomicBool::new(false),
         })
     }
 
@@ -100,16 +98,9 @@ impl ProfileStore {
         Ok(())
     }
 
-    pub(crate) fn mark_dirty(&self) {
-        self.dirty.store(true, Ordering::SeqCst);
-    }
-
     pub(crate) fn save_from(&self, agent: &Agent) -> io::Result<()> {
         let dir = &self.root;
         let _disk = self.lock_disk();
-        if !self.dirty.load(Ordering::SeqCst) {
-            return Ok(());
-        }
         fs::create_dir_all(dir)?;
         restrict(dir, 0o700)?;
         let path = dir.join("cookies");
@@ -130,7 +121,6 @@ impl ProfileStore {
             let _remove_result = fs::remove_file(&tmp);
             return Err(error);
         }
-        self.dirty.store(false, Ordering::SeqCst);
         Ok(())
     }
 

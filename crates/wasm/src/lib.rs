@@ -13,10 +13,12 @@ use std::time::SystemTime;
 
 use cookies::{CookieJar, CookieOp, InitiatorKind, RetrievalKind, schemeful_same_site};
 use renderer::{
-    BrowserServices, DialCompletion, DialFailure, DialKind, DialOutcome, DialRequest,
-    EmbeddedRenderer, MAX_RESPONSE_BODY_BYTES, Mount, RendererEvent, StorageChange,
+    BrowsingContextHost, DialCompletion, DialFailure, DialKind, DialOutcome, DialRequest,
+    EmbeddedRenderer, MAX_RESPONSE_BODY_BYTES, MessagingHost, Mount, NetworkHost, RendererEvent,
+    StorageChange, StorageHost, StorageKind,
 };
 use url::Url;
+use webstorage::StorageArea;
 
 #[expect(
     unsafe_code,
@@ -217,23 +219,20 @@ fn cookie_jar() -> &'static Mutex<CookieJar> {
     JAR.get_or_init(|| Mutex::new(CookieJar::default()))
 }
 
-/// One origin's storage area: keys in insertion order.
-type StorageArea = Vec<(String, String)>;
-
 /// The component's local storage areas, keyed by origin. Entries keep
-/// insertion order in a vector: the storage proxy exposes enumeration and
-/// `key(index)` directly, and a `HashMap` would make both unstable.
+/// insertion order: the storage proxy exposes enumeration and `key(index)`
+/// directly, and a `HashMap` would make both unstable.
 /// A browser tab has no profile on disk, so the areas die with the component.
 fn local_storage() -> &'static Mutex<HashMap<String, StorageArea>> {
     static AREAS: OnceLock<Mutex<HashMap<String, StorageArea>>> = OnceLock::new();
     AREAS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// The value stored under `key`, if any.
-fn area_get(area: &[(String, String)], key: &str) -> Option<String> {
-    area.iter()
-        .find(|(entry, _)| entry == key)
-        .map(|(_, value)| value.clone())
+/// Session storage namespaces keyed by component tab owner.
+fn session_storage() -> &'static Mutex<HashMap<u64, HashMap<String, StorageArea>>> {
+    static NAMESPACES: OnceLock<Mutex<HashMap<u64, HashMap<String, StorageArea>>>> =
+        OnceLock::new();
+    NAMESPACES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 /// Locks a shared map or jar, recovering from a panicking holder.
@@ -411,7 +410,7 @@ impl WasmServices {
     }
 }
 
-impl BrowserServices for WasmServices {
+impl NetworkHost for WasmServices {
     fn start_dial(&self, request: DialRequest, completion: DialCompletion) {
         // A dial the component cannot shape is not a transport question, so it
         // never reaches the host.
@@ -462,91 +461,94 @@ impl BrowserServices for WasmServices {
             },
         );
     }
+}
 
-    fn storage_get(&self, origin: &str, key: &str) -> Option<String> {
-        lock(local_storage())
-            .get(origin)
-            .and_then(|area| area_get(area, key))
+impl StorageHost for WasmServices {
+    fn storage_get(&self, kind: StorageKind, origin: &str, key: &str) -> Option<String> {
+        match kind {
+            StorageKind::Local => lock(local_storage())
+                .get(origin)
+                .and_then(|area| area.get(key)),
+            StorageKind::Session => lock(session_storage())
+                .get(&self.owner)
+                .and_then(|namespace| namespace.get(origin))
+                .and_then(|area| area.get(key)),
+        }
     }
 
-    fn storage_keys(&self, origin: &str) -> Vec<String> {
-        lock(local_storage())
-            .get(origin)
-            .map(|area| area.iter().map(|(key, _)| key.clone()).collect())
-            .unwrap_or_default()
+    fn storage_keys(&self, kind: StorageKind, origin: &str) -> Vec<String> {
+        match kind {
+            StorageKind::Local => lock(local_storage())
+                .get(origin)
+                .map(StorageArea::keys)
+                .unwrap_or_default(),
+            StorageKind::Session => lock(session_storage())
+                .get(&self.owner)
+                .and_then(|namespace| namespace.get(origin))
+                .map(StorageArea::keys)
+                .unwrap_or_default(),
+        }
     }
 
     fn storage_set(
         &self,
+        kind: StorageKind,
         origin: &str,
         _url: &str,
         key: &str,
         value: &str,
         _source: renderer::FrameId,
     ) -> Result<Option<StorageChange>, renderer::StorageError> {
-        let mut areas = lock(local_storage());
-        let area = areas.entry(origin.to_owned()).or_default();
-        let old = area_get(area, key);
-        if old.as_deref() == Some(value) {
-            return Ok(None);
+        match kind {
+            StorageKind::Local => lock(local_storage())
+                .entry(origin.to_owned())
+                .or_default()
+                .set(key, value),
+            StorageKind::Session => lock(session_storage())
+                .entry(self.owner)
+                .or_default()
+                .entry(origin.to_owned())
+                .or_default()
+                .set(key, value),
         }
-        // Rewriting a key keeps its original position; only new keys append.
-        if let Some(slot) = area.iter_mut().find(|(entry, _)| entry == key) {
-            value.clone_into(&mut slot.1);
-        } else {
-            area.push((key.to_owned(), value.to_owned()));
-        }
-        Ok(Some(StorageChange {
-            key: Some(key.to_owned()),
-            old_value: old,
-            new_value: Some(value.to_owned()),
-        }))
     }
 
     fn storage_remove(
         &self,
+        kind: StorageKind,
         origin: &str,
         _url: &str,
         key: &str,
         _source: renderer::FrameId,
     ) -> Option<StorageChange> {
-        let old = lock(local_storage()).get_mut(origin).and_then(|area| {
-            let index = area.iter().position(|(entry, _)| entry == key)?;
-            Some(area.remove(index).1)
-        })?;
-        Some(StorageChange {
-            key: Some(key.to_owned()),
-            old_value: Some(old),
-            new_value: None,
-        })
+        match kind {
+            StorageKind::Local => lock(local_storage()).get_mut(origin)?.remove(key),
+            StorageKind::Session => lock(session_storage())
+                .get_mut(&self.owner)?
+                .get_mut(origin)?
+                .remove(key),
+        }
     }
 
     fn storage_clear(
         &self,
+        kind: StorageKind,
         origin: &str,
         _url: &str,
         _source: renderer::FrameId,
     ) -> Option<StorageChange> {
-        let mut areas = lock(local_storage());
-        let area = areas.get_mut(origin)?;
-        if area.is_empty() {
-            return None;
+        match kind {
+            StorageKind::Local => lock(local_storage()).get_mut(origin)?.clear(),
+            StorageKind::Session => lock(session_storage())
+                .get_mut(&self.owner)?
+                .get_mut(origin)?
+                .clear(),
         }
-        area.clear();
-        Some(StorageChange {
-            key: None,
-            old_value: None,
-            new_value: None,
-        })
     }
+}
 
-    fn window_open(
-        &self,
-        _url: &str,
-        _name: &str,
-        _features: &str,
-        _seed: Option<&renderer::StorageSeed>,
-    ) -> Option<u64> {
+impl BrowsingContextHost for WasmServices {
+    fn window_open(&self, _url: &str, _name: &str, _features: &str) -> Option<u64> {
         None
     }
 
@@ -561,7 +563,9 @@ impl BrowserServices for WasmServices {
     fn remote_session_get(&self, _tab: u64, _origin: &str, _key: &str) -> Option<String> {
         None
     }
+}
 
+impl MessagingHost for WasmServices {
     fn broadcast_post(&self, _origin: &str, _name: &str, _payload: &str, _channel: u64) {}
 }
 
@@ -581,6 +585,7 @@ impl Drop for WasmServices {
             bindings::tinybrowser::browser::host::cancel_fetch(id);
             completion(Err(DialFailure::Cancelled));
         }
+        lock(session_storage()).remove(&self.owner);
     }
 }
 

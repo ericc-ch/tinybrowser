@@ -957,26 +957,6 @@ Object.defineProperty(globalThis, 'top', {
     return session;
   }
 
-  function requestsNoOpener(features) {
-    return features
-      .split(/[\s,]+/)
-      .some(token => token.toLowerCase() === 'noopener' || token.toLowerCase() === 'noreferrer');
-  }
-
-  // A new auxiliary browsing context gets a copy of this window's session
-  // area (<https://html.spec.whatwg.org/multipage/document-sequences.html#copy-session-storage>).
-  // The storage seam stores JSON-escaped strings, so the seed carries the
-  // encoded keys and values unchanged.
-  function sessionSeed() {
-    const origin = __tbStorageOrigin();
-    if (origin === null || origin === undefined) return null;
-    const entries = [];
-    for (const key of __tbStorageKeys('session')) {
-      entries.push(key, __tbStorageGet('session', key));
-    }
-    return { origin: origin, entries: entries };
-  }
-
   globalThis.open = function(url, target, features) {
     if (arguments.length < 1 || url === undefined || url === null) url = '';
     const spec = url === '' ? '' : __tbResolveUrl(String(url), undefined);
@@ -984,11 +964,7 @@ Object.defineProperty(globalThis, 'top', {
     const name = target === undefined || target === null ? '' : String(target);
     const featureString = features === undefined || features === null ? '' : String(features);
     if (name !== '' && namedWindows.has(name)) return namedWindows.get(name);
-    const seed = requestsNoOpener(featureString) ? null : sessionSeed();
-    const tab = __tbWindowOpen(
-      spec, name, featureString,
-      seed === null ? '' : seed.origin,
-      seed === null ? [] : seed.entries);
+    const tab = __tbWindowOpen(spec, name, featureString);
     if (tab === null || tab === undefined) return null;
     const proxy = remoteWindow(tab);
     if (name !== '') {

@@ -141,10 +141,6 @@ pub(crate) struct FrameRuntime {
     pub(crate) documents: Rc<RefCell<DocumentStore>>,
     pub(crate) registry: Rc<RefCell<RealmRegistry>>,
     pub(crate) shared: SharedHandle,
-    /// Session storage areas for this top-level browsing context; every frame
-    /// of the engine shares them
-    /// (<https://html.spec.whatwg.org/multipage/webstorage.html#the-sessionstorage-attribute>).
-    pub(crate) session_storage: Rc<RefCell<crate::storage::SessionStorage>>,
     /// Storage changes waiting for the `storage`-event task in their receiving
     /// frames.
     pub(crate) pending_storage: Rc<RefCell<Vec<crate::storage::PendingStorageEvent>>>,

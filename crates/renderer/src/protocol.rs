@@ -11,6 +11,8 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 use url::Url;
 
+pub use webstorage::{STORAGE_QUOTA_BYTES, StorageChange, StorageError};
+
 /// Maximum aggregate bytes retained for one streamed response.
 pub const MAX_RESPONSE_BODY_BYTES: usize = 1_048_576;
 
@@ -156,22 +158,6 @@ pub enum RendererEvent {
     ScriptFailed,
 }
 
-/// What one storage mutation changed, ready for a `storage` event.
-///
-/// The three fields are the spec's `key`, `oldValue`, and `newValue`
-/// (<https://html.spec.whatwg.org/multipage/webstorage.html#concept-storage-broadcast>);
-/// `None` serializes to `null`. A mutation that changes nothing produces no
-/// [`StorageChange`] at all.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct StorageChange {
-    /// The key that changed; `None` for `clear()`.
-    pub key: Option<String>,
-    /// The value before the change; `None` when the key did not exist.
-    pub old_value: Option<String>,
-    /// The value after the change; `None` when the key was removed.
-    pub new_value: Option<String>,
-}
-
 /// Which of the two storage areas a change belongs to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StorageKind {
@@ -179,31 +165,6 @@ pub enum StorageKind {
     Local,
     /// `sessionStorage`: one area per origin in a top-level browsing context.
     Session,
-}
-
-/// Upper bound on one origin's stored bytes per storage area. The spec leaves
-/// the number to the user agent; 5 MiB is the common shape and keeps one
-/// origin from exhausting the profile
-/// (<https://html.spec.whatwg.org/multipage/webstorage.html#dom-storage-setitem>).
-pub const STORAGE_QUOTA_BYTES: usize = 5 * 1024 * 1024;
-
-/// One `sessionStorage` copy for a newly opened auxiliary browsing context
-/// (<https://html.spec.whatwg.org/multipage/document-sequences.html#copy-session-storage>).
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-pub struct StorageSeed {
-    /// Serialized origin whose session area is copied.
-    pub origin: String,
-    /// Encoded `(key, value)` pairs, exactly as the storage service stores
-    /// them (the JS shim JSON-escapes strings at the seam).
-    pub entries: Vec<(String, String)>,
-}
-
-/// Why a storage mutation failed.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum StorageError {
-    /// The area refused the write because its quota would be exceeded
-    /// (<https://html.spec.whatwg.org/multipage/webstorage.html#dom-storage-setitem>).
-    QuotaExceeded,
 }
 
 impl StorageKind {
@@ -324,12 +285,8 @@ pub struct DialOutcome {
 /// Completion for a dial submitted to the browser process.
 pub type DialCompletion = Box<dyn FnOnce(Result<DialOutcome, DialFailure>) + Send + 'static>;
 
-/// Effects the page engine asks its host to perform.
-///
-/// A native renderer process receives an implementation that forwards calls
-/// to the browser process. An embedded renderer receives an implementation
-/// from its caller. Renderer code never names `net`.
-pub trait BrowserServices: Send + Sync + 'static {
+/// Network effects the page engine asks its host to perform.
+pub trait NetworkHost: Send + Sync + 'static {
     /// Submits one GET without blocking the renderer thread. The completion
     /// receives [`DialFailure`] for transport, timeout, queue, body-limit, or
     /// cancellation failure.
@@ -342,14 +299,17 @@ pub trait BrowserServices: Send + Sync + 'static {
 
     /// `document.cookie` setter for `url`.
     fn set_cookie(&self, value: &str, url: &Url);
+}
 
-    /// `localStorage.getItem(key)`
+/// Web Storage effects the page engine asks its host to perform.
+pub trait StorageHost: Send + Sync + 'static {
+    /// `Storage.getItem(key)`
     /// (<https://html.spec.whatwg.org/multipage/webstorage.html#dom-storage-getitem>).
-    fn storage_get(&self, origin: &str, key: &str) -> Option<String>;
+    fn storage_get(&self, kind: StorageKind, origin: &str, key: &str) -> Option<String>;
 
     /// The keys of `origin`'s local storage area, in the area's iteration
     /// order (<https://html.spec.whatwg.org/multipage/webstorage.html#dom-storage-key>).
-    fn storage_keys(&self, origin: &str) -> Vec<String>;
+    fn storage_keys(&self, kind: StorageKind, origin: &str) -> Vec<String>;
 
     /// `localStorage.setItem(key, value)`. `url` is the mutating document's
     /// URL and `source` its frame; the browser excludes it from the broadcast.
@@ -360,6 +320,7 @@ pub trait BrowserServices: Send + Sync + 'static {
     /// quota. `Ok(None)` means the value was unchanged.
     fn storage_set(
         &self,
+        kind: StorageKind,
         origin: &str,
         url: &str,
         key: &str,
@@ -370,6 +331,7 @@ pub trait BrowserServices: Send + Sync + 'static {
     /// `localStorage.removeItem(key)`; `None` means the key was absent.
     fn storage_remove(
         &self,
+        kind: StorageKind,
         origin: &str,
         url: &str,
         key: &str,
@@ -377,18 +339,21 @@ pub trait BrowserServices: Send + Sync + 'static {
     ) -> Option<StorageChange>;
 
     /// `localStorage.clear()`; `None` means the area was empty.
-    fn storage_clear(&self, origin: &str, url: &str, source: FrameId) -> Option<StorageChange>;
+    fn storage_clear(
+        &self,
+        kind: StorageKind,
+        origin: &str,
+        url: &str,
+        source: FrameId,
+    ) -> Option<StorageChange>;
+}
 
+/// Browsing-context effects the page engine asks its host to perform.
+pub trait BrowsingContextHost: Send + Sync + 'static {
     /// `window.open(url, target, features)`; `None` when the browser refused
     /// to open a window. `url` is absolute, or empty for `about:blank`. `seed`
     /// is the opener's session copy for the new tab, when there is one.
-    fn window_open(
-        &self,
-        url: &str,
-        name: &str,
-        features: &str,
-        seed: Option<&StorageSeed>,
-    ) -> Option<u64>;
+    fn window_open(&self, url: &str, name: &str, features: &str) -> Option<u64>;
 
     /// `window.close()` on a window this realm opened.
     fn window_close(&self, tab: u64);
@@ -400,12 +365,22 @@ pub trait BrowserServices: Send + Sync + 'static {
     /// realm.
     fn window_post_message(&self, tab: u64, payload: &str);
 
-    /// `sessionStorage.getItem` on another window's area, for a same-origin
-    /// opener or opened window.
+    /// Reads one key from another tab's same-origin session area.
     fn remote_session_get(&self, tab: u64, origin: &str, key: &str) -> Option<String>;
+}
 
+/// Cross-context messaging effects the page engine asks its host to perform.
+pub trait MessagingHost: Send + Sync + 'static {
     /// `BroadcastChannel.postMessage` for every same-origin channel.
     fn broadcast_post(&self, origin: &str, name: &str, payload: &str, channel: u64);
+}
+
+/// Complete host capability set used by an engine.
+pub trait BrowserServices: NetworkHost + StorageHost + BrowsingContextHost + MessagingHost {}
+
+impl<T> BrowserServices for T where
+    T: NetworkHost + StorageHost + BrowsingContextHost + MessagingHost
+{
 }
 
 #[cfg(test)]

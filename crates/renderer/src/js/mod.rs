@@ -748,45 +748,25 @@ fn install_window_host_functions(ctx: &Ctx<'_>, world: &Rc<RefCell<World>>) -> R
     let window_open = world.clone();
     ctx.globals().set(
         "__tbWindowOpen",
-        Func::from(
-            move |url: String,
-                  name: String,
-                  features: String,
-                  seed_origin: String,
-                  seed_entries: Vec<String>| {
-                let spec = if url.is_empty() {
-                    Some(String::new())
-                } else {
-                    window_open
-                        .borrow()
-                        .document_url
-                        .join(&url)
-                        .ok()
-                        .map(|url| url.to_string())
-                };
-                let seed = if seed_origin.is_empty() {
-                    None
-                } else {
-                    Some(crate::protocol::StorageSeed {
-                        origin: seed_origin,
-                        entries: seed_entries
-                            .as_chunks::<2>()
-                            .0
-                            .iter()
-                            .map(|pair| (pair[0].clone(), pair[1].clone()))
-                            .collect(),
-                    })
-                };
-                spec.and_then(|spec| {
-                    window_open.borrow().runtime.services.window_open(
-                        &spec,
-                        &name,
-                        &features,
-                        seed.as_ref(),
-                    )
-                })
-            },
-        ),
+        Func::from(move |url: String, name: String, features: String| {
+            let spec = if url.is_empty() {
+                Some(String::new())
+            } else {
+                window_open
+                    .borrow()
+                    .document_url
+                    .join(&url)
+                    .ok()
+                    .map(|url| url.to_string())
+            };
+            spec.and_then(|spec| {
+                window_open
+                    .borrow()
+                    .runtime
+                    .services
+                    .window_open(&spec, &name, &features)
+            })
+        }),
     )?;
 
     let window_close = world.clone();

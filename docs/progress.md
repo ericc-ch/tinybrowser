@@ -7,7 +7,7 @@ Size research lives in [`docs/researches/size-budget.md`](researches/size-budget
 
 Target: under 10MB stripped on x86_64.
 
-8,323,400 bytes (2026-09-20)
+8,679,320 bytes (2026-09-21)
 
 ```sh
 nix develop --command ./tools/release
@@ -288,7 +288,7 @@ nix develop --command ./tools/wpt/run --score <directory> -- --exclude=worker
 | `webrtc-stats/` | unscored |
 | `webrtc-svc/` | unscored |
 | `websockets/` | unscored |
-| `webstorage/` | 87.0% |
+| `webstorage/` | 90.7% |
 | `webtransport/` | unscored |
 | `webusb/` | unscored |
 | `webvtt/` | unscored |

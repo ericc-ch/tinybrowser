@@ -7,6 +7,7 @@ edition.workspace = true
 workspace = true
 
 [dependencies]
+webstorage = { workspace = true }
 dom = { workspace = true }
 # Exactly html5ever 0.39's own markup5ever; same pin as dom's charter, so
 # parser QualNames flow into dom as one type, no conversion layer.

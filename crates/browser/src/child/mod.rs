@@ -14,7 +14,10 @@
 //! wait: commands, dial completions, timer deadlines, and shutdown. The reader
 //! and writer stay blocking threads because synchronous browser-service calls
 //! (`document.cookie`) must make progress while the page engine runs. The
-//! reader never waits for inbox capacity: a full inbox disconnects.
+//! reader never waits for inbox capacity: a full command inbox disconnects.
+//! Storage and broadcast notices are best-effort, like the spec's task queue:
+//! the engine may be blocked in a synchronous service call, so dropping them
+//! on a full inbox keeps the service reply path alive.
 
 mod session;
 
@@ -32,8 +35,8 @@ use std::sync::Arc;
 use std::thread;
 
 use renderer::{
-    BrowserServices, DialCompletion, DialRequest, FrameId, Stop, StorageChange, StorageError,
-    StorageSeed,
+    BrowsingContextHost, DialCompletion, DialRequest, FrameId, MessagingHost, NetworkHost, Stop,
+    StorageChange, StorageError, StorageHost, StorageKind,
 };
 use tokio::sync::Notify;
 use url::Url;
@@ -41,8 +44,9 @@ use url::Url;
 use crate::exchange::{self, BlockingClient, Frame, RequestId};
 use crate::wire::channel::{FrameKind, decode_control, read_frame, write_frame};
 use crate::wire::{
-    BrowserCall, FromRenderer, HostNotice, RendererAssignmentId, RendererNotice, RendererReply,
-    ServiceCall, ServiceReply, ToRenderer,
+    BrowserCall, BrowsingContextCall, FromRenderer, HostNotice, MessagingCall, NetworkCall,
+    RendererAssignmentId, RendererNotice, RendererReply, ServiceCall, ServiceReply, StorageCall,
+    ToRenderer,
 };
 
 /// Runs the renderer child until `Shutdown` or the channel closes.
@@ -201,6 +205,9 @@ fn route_message(
             services.deliver(id, body);
             true
         }
+        Frame::Notify(HostNotice::StorageEvent { .. } | HostNotice::BroadcastMessage { .. }) => {
+            command_tx.try_send_lossy(message).is_ok()
+        }
         _ => command_tx.try_send(message).is_ok(),
     }
 }
@@ -223,7 +230,7 @@ fn write_messages(
     Ok(())
 }
 
-/// [`BrowserServices`] proxy that asks the browser process over the channel.
+/// Renderer host-capability proxy that asks the browser process over the channel.
 pub(crate) struct ChannelServices {
     client: BlockingClient<BrowserCall, RendererReply, RendererNotice, ServiceReply>,
 }
@@ -248,7 +255,7 @@ impl ChannelServices {
         self.client.call_with(
             BrowserCall {
                 assignment,
-                call: ServiceCall::Dial(request),
+                call: ServiceCall::Network(NetworkCall::Dial(request)),
             },
             move |reply| match reply {
                 Ok(ServiceReply::Dial(outcome)) => completion(outcome),
@@ -288,7 +295,7 @@ impl AssignmentServices {
     }
 }
 
-impl BrowserServices for AssignmentServices {
+impl NetworkHost for AssignmentServices {
     fn start_dial(&self, request: DialRequest, completion: DialCompletion) {
         self.channel
             .start_dial(self.assignment, request, completion);
@@ -297,9 +304,9 @@ impl BrowserServices for AssignmentServices {
     fn cookies_for(&self, url: &Url) -> String {
         match self.channel.call(
             self.assignment,
-            ServiceCall::CookieGet {
+            ServiceCall::Network(NetworkCall::CookieGet {
                 url: url.to_string(),
-            },
+            }),
         ) {
             Some(ServiceReply::Cookie(value)) => value,
             _ => String::new(),
@@ -309,32 +316,36 @@ impl BrowserServices for AssignmentServices {
     fn set_cookie(&self, value: &str, url: &Url) {
         let _result = self.channel.call(
             self.assignment,
-            ServiceCall::CookieSet {
+            ServiceCall::Network(NetworkCall::CookieSet {
                 value: value.to_owned(),
                 url: url.to_string(),
-            },
+            }),
         );
     }
+}
 
-    fn storage_get(&self, origin: &str, key: &str) -> Option<String> {
+impl StorageHost for AssignmentServices {
+    fn storage_get(&self, kind: StorageKind, origin: &str, key: &str) -> Option<String> {
         match self.channel.call(
             self.assignment,
-            ServiceCall::StorageGet {
+            ServiceCall::Storage(StorageCall::Get {
+                kind,
                 origin: origin.to_owned(),
                 key: key.to_owned(),
-            },
+            }),
         ) {
             Some(ServiceReply::StorageValue(value)) => value,
             _ => None,
         }
     }
 
-    fn storage_keys(&self, origin: &str) -> Vec<String> {
+    fn storage_keys(&self, kind: StorageKind, origin: &str) -> Vec<String> {
         match self.channel.call(
             self.assignment,
-            ServiceCall::StorageKeys {
+            ServiceCall::Storage(StorageCall::Keys {
+                kind,
                 origin: origin.to_owned(),
-            },
+            }),
         ) {
             Some(ServiceReply::StorageKeys(keys)) => keys,
             _ => Vec::new(),
@@ -343,6 +354,7 @@ impl BrowserServices for AssignmentServices {
 
     fn storage_set(
         &self,
+        kind: StorageKind,
         origin: &str,
         url: &str,
         key: &str,
@@ -351,13 +363,14 @@ impl BrowserServices for AssignmentServices {
     ) -> Result<Option<StorageChange>, StorageError> {
         match self.channel.call(
             self.assignment,
-            ServiceCall::StorageSet {
+            ServiceCall::Storage(StorageCall::Set {
+                kind,
                 origin: origin.to_owned(),
                 url: url.to_owned(),
                 key: key.to_owned(),
                 value: value.to_owned(),
                 source,
-            },
+            }),
         ) {
             Some(ServiceReply::StorageChanged(change)) => change,
             _ => Ok(None),
@@ -366,6 +379,7 @@ impl BrowserServices for AssignmentServices {
 
     fn storage_remove(
         &self,
+        kind: StorageKind,
         origin: &str,
         url: &str,
         key: &str,
@@ -373,47 +387,50 @@ impl BrowserServices for AssignmentServices {
     ) -> Option<StorageChange> {
         match self.channel.call(
             self.assignment,
-            ServiceCall::StorageRemove {
+            ServiceCall::Storage(StorageCall::Remove {
+                kind,
                 origin: origin.to_owned(),
                 url: url.to_owned(),
                 key: key.to_owned(),
                 source,
-            },
+            }),
         ) {
             Some(ServiceReply::StorageChanged(Ok(change))) => change,
             _ => None,
         }
     }
 
-    fn storage_clear(&self, origin: &str, url: &str, source: FrameId) -> Option<StorageChange> {
+    fn storage_clear(
+        &self,
+        kind: StorageKind,
+        origin: &str,
+        url: &str,
+        source: FrameId,
+    ) -> Option<StorageChange> {
         match self.channel.call(
             self.assignment,
-            ServiceCall::StorageClear {
+            ServiceCall::Storage(StorageCall::Clear {
+                kind,
                 origin: origin.to_owned(),
                 url: url.to_owned(),
                 source,
-            },
+            }),
         ) {
             Some(ServiceReply::StorageChanged(Ok(change))) => change,
             _ => None,
         }
     }
+}
 
-    fn window_open(
-        &self,
-        url: &str,
-        name: &str,
-        features: &str,
-        seed: Option<&StorageSeed>,
-    ) -> Option<u64> {
+impl BrowsingContextHost for AssignmentServices {
+    fn window_open(&self, url: &str, name: &str, features: &str) -> Option<u64> {
         match self.channel.call(
             self.assignment,
-            ServiceCall::WindowOpen {
+            ServiceCall::BrowsingContext(BrowsingContextCall::WindowOpen {
                 url: url.to_owned(),
                 name: name.to_owned(),
                 features: features.to_owned(),
-                seed: seed.cloned(),
-            },
+            }),
         ) {
             Some(ServiceReply::Window(tab)) => tab,
             _ => None,
@@ -421,13 +438,17 @@ impl BrowserServices for AssignmentServices {
     }
 
     fn window_close(&self, tab: u64) {
-        let _result = self
-            .channel
-            .call(self.assignment, ServiceCall::WindowClose { tab });
+        let _result = self.channel.call(
+            self.assignment,
+            ServiceCall::BrowsingContext(BrowsingContextCall::WindowClose { tab }),
+        );
     }
 
     fn window_opener(&self) -> Option<u64> {
-        match self.channel.call(self.assignment, ServiceCall::Opener) {
+        match self.channel.call(
+            self.assignment,
+            ServiceCall::BrowsingContext(BrowsingContextCall::Opener),
+        ) {
             Some(ServiceReply::Window(tab)) => tab,
             _ => None,
         }
@@ -436,36 +457,38 @@ impl BrowserServices for AssignmentServices {
     fn window_post_message(&self, tab: u64, payload: &str) {
         let _result = self.channel.call(
             self.assignment,
-            ServiceCall::WindowMessage {
+            ServiceCall::BrowsingContext(BrowsingContextCall::WindowMessage {
                 tab,
                 payload: payload.to_owned(),
-            },
+            }),
         );
     }
 
     fn remote_session_get(&self, tab: u64, origin: &str, key: &str) -> Option<String> {
         match self.channel.call(
             self.assignment,
-            ServiceCall::RemoteSessionGet {
+            ServiceCall::BrowsingContext(BrowsingContextCall::RemoteSessionGet {
                 tab,
                 origin: origin.to_owned(),
                 key: key.to_owned(),
-            },
+            }),
         ) {
             Some(ServiceReply::StorageValue(value)) => value,
             _ => None,
         }
     }
+}
 
+impl MessagingHost for AssignmentServices {
     fn broadcast_post(&self, origin: &str, name: &str, payload: &str, channel: u64) {
         let _result = self.channel.call(
             self.assignment,
-            ServiceCall::BroadcastPost {
+            ServiceCall::Messaging(MessagingCall::BroadcastPost {
                 origin: origin.to_owned(),
                 name: name.to_owned(),
                 payload: payload.to_owned(),
                 channel,
-            },
+            }),
         );
     }
 }
