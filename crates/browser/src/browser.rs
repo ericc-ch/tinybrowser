@@ -486,8 +486,8 @@ async fn browser_loop(mut server: BrowserServer, mut state: BrowserState) {
                 Command::CloseTab { id } => {
                     let result = if let Some(mut task) = state.tabs.remove(&id) {
                         state.openers.remove(&id);
-                        state.context.close_tab(id);
                         task.shutdown().await;
+                        state.context.close_tab(id);
                         Ok(())
                     } else {
                         Err(BrowserError::UnknownTab)

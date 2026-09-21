@@ -743,7 +743,19 @@ async fn route_window_call(
             if assignment.site.authorize(&origin).is_none() {
                 return Err(RendererViolation);
             }
-            let value = context.sessions.get(TabId::new(tab), &origin, &key);
+            let target = TabId::new(tab);
+            let related = target == assignment.tab
+                || context.browser.opener_tab(target).await.ok().flatten() == Some(assignment.tab)
+                || context
+                    .browser
+                    .opener_tab(assignment.tab)
+                    .await
+                    .ok()
+                    .flatten()
+                    == Some(target);
+            let value = related
+                .then(|| context.sessions.get(target, &origin, &key))
+                .flatten();
             send_reply(&context.responder, id, ServiceReply::StorageValue(value)).await?;
         }
     }

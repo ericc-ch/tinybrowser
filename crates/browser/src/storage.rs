@@ -85,11 +85,14 @@ impl SessionStorage {
         key: &str,
         value: &str,
     ) -> Result<Option<StorageChange>, StorageError> {
-        self.namespaces
+        let mut namespaces = self
+            .namespaces
             .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .entry(tab)
-            .or_default()
+            .unwrap_or_else(PoisonError::into_inner);
+        let Some(namespace) = namespaces.get_mut(&tab) else {
+            return Ok(None);
+        };
+        namespace
             .entry(origin.to_owned())
             .or_default()
             .set(key, value)

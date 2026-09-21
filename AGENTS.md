@@ -27,6 +27,7 @@ Do not test spec conformance in cargo tests. Never add, keep, or "fix" a cargo t
 ## Checks
 
 - clippy and embedded JS (`tools/check`), `cargo test --workspace`.
+- Unless already inside the dev shell, run direct Cargo commands and runners that build the browser through `nix develop --command`; the host shell may not expose `pkg-config` or OpenSSL. `tools/check` already enters the Nix shell for clippy.
 - When adding or changing `unsafe`: `tools/check miri` (pure-Rust) and `tools/check valgrind` (FFI / renderer / net).
 
 ## Working rules
