@@ -113,7 +113,7 @@ pub enum DomError {
     /// a document gaining a second root or a misplaced doctype, character
     /// data under a document, a leaf node asked to parent children, the
     /// document root asked to gain a parent. (Maps to
-    /// `HierarchyRequestError`; see [`Dom::ensure_pre_insert_validity`].)
+    /// `HierarchyRequestError`; see `Dom::ensure_pre_insert_validity`.)
     HierarchyRequest,
     /// The operation does not apply to that kind of node (setting text data
     /// on an element, attributes on a text node). (Maps to a type error at
@@ -906,7 +906,7 @@ impl Dom {
     /// - [`DomError::NoParent`] if `sibling` has no parent to insert beside
     ///   (`NotFoundError`, including the detached-sibling case).
     /// - [`DomError::HierarchyRequest`] / [`DomError::CycleForbidden`] as
-    ///   from [`Dom::ensure_pre_insert_validity`].
+    ///   from `Dom::ensure_pre_insert_validity`.
     pub fn insert_before(&mut self, sibling: NodeId, node: NodeId) -> Result<(), DomError> {
         self.ensure_alive(sibling, node)?;
         // The reference child must sit under some parent to be inserted
@@ -945,7 +945,7 @@ impl Dom {
     /// - [`DomError::NoParent`] if `child` is not a child of `parent`
     ///   (`NotFoundError`).
     /// - [`DomError::HierarchyRequest`] / [`DomError::CycleForbidden`] as
-    ///   from [`Dom::ensure_pre_insert_validity`].
+    ///   from `Dom::ensure_pre_insert_validity`.
     pub fn replace_child(
         &mut self,
         parent: NodeId,
@@ -1215,7 +1215,7 @@ impl Dom {
     /// impossible (a doctype can only ever sit directly under the root,
     /// so none can appear in a moved run). When `to` **is** the document,
     /// the full document content model applies to the *resulting* sequence;
-    /// see [`Dom::ensure_document_content_model`]. A bulk move is one
+    /// see `Dom::ensure_document_content_model`. A bulk move is one
     /// operation: `[html, main]` into an empty document would pass
     /// per-child and fail as a pair.
     ///
@@ -1300,7 +1300,7 @@ impl Dom {
     /// doctype placed strictly ahead of that element; comments may sit
     /// anywhere, and fragments stay opaque containers. Deliberately the *only* encoding of the model:
     /// incremental insertions arrive as their resulting sequence from
-    /// [`Dom::ensure_pre_insert_validity`], bulk moves as the document's
+    /// `Dom::ensure_pre_insert_validity`, bulk moves as the document's
     /// standing children followed by the moved run. Per-child checks cannot
     /// see a violating pair like `[html, main]`.
     fn ensure_document_content_model(&self, sequence: &[NodeId]) -> Result<(), DomError> {

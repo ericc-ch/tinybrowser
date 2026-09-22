@@ -3,7 +3,7 @@
 //! Speaks the W3C HTTP protocol
 //! ([WebDriver](https://w3c.github.io/webdriver/)) enough for testharness:
 //! session, navigate, execute script, windows. Adapter over
-//! [`BrowserHandle`](browser::BrowserHandle); it does not own Browser, tabs,
+//! [`BrowserHandle`]; it does not own Browser, tabs,
 //! or the cookie jar.
 
 use std::collections::HashMap;

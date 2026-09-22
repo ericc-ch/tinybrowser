@@ -408,7 +408,7 @@ pub fn is_defined(dom: &Dom, id: NodeId) -> bool {
 /// <https://html.spec.whatwg.org/#the-lang-attribute>); each comma-separated
 /// range matches under RFC 4647 §3.3.2 extended filtering
 /// (<https://drafts.csswg.org/selectors-4/#lang-pseudo>); see
-/// [`lang_range_matches`] for the exact algorithm, including wildcards.
+/// `lang_range_matches` for the exact algorithm, including wildcards.
 ///
 /// `xml:lang` takes precedence over `lang`, then the document
 /// `Content-Language` default
