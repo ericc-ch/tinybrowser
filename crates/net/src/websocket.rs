@@ -114,8 +114,8 @@ impl WebSocket {
     }
 }
 
-/// Dials the WebSocket transport and runs the client handshake under the call
-/// deadline.
+/// Dials the WebSocket transport and runs the client handshake under the
+/// agent budget and the caller's `deadline`, whichever expires first.
 pub(crate) async fn connect(
     agent: &Agent,
     url: &Url,
@@ -123,9 +123,15 @@ pub(crate) async fn connect(
     initiator_kind: InitiatorKind,
     method: &Method,
     initiator: Option<&Url>,
+    deadline: Option<Instant>,
 ) -> Result<WebSocket, NetError> {
     let started = Instant::now();
-    let budget = agent.engine.budget_at(started);
+    let mut budget = agent.engine.budget_at(started);
+    // Mirrors `Agent::send`: an explicit caller deadline overrides the
+    // agent-level start budget for this call (transport.rs `CallBudget`).
+    if let Some(deadline) = deadline {
+        budget.global = Some(deadline);
+    }
     let mut request = url
         .as_str()
         .into_client_request()

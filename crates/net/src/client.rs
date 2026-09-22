@@ -428,6 +428,7 @@ impl Agent {
             initiator_kind,
             &method,
             request.initiator.as_ref(),
+            request.deadline,
         )
         .await
     }
@@ -443,8 +444,8 @@ pub struct Request {
     pub method: Method,
     /// Absolute URL.
     pub url: Url,
-    /// Outbound headers. Appends do not replace earlier values of the same
-    /// name (RFC 9110 §5.2); use [`HeaderMap::insert`] or [`HeaderMap::remove`].
+    /// Outbound headers. [`HeaderMap::insert`] appends values with the same
+    /// name (RFC 9110 §5.2); call [`HeaderMap::remove`] first to replace.
     pub headers: HeaderMap,
     /// Initiator class used for `SameSite` and (later) `Sec-Fetch-*`.
     pub initiator_kind: InitiatorKind,

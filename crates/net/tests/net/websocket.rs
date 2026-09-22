@@ -1,5 +1,6 @@
 use super::common::TestServer;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use net::{Agent, AgentOptions, Method, Request, WsEvent, WsMessage};
 use tungstenite::protocol::frame::Frame;
@@ -248,4 +249,32 @@ async fn wss_dials_use_the_connect_proxy() {
         "unexpected proxy error: {error:?}"
     );
     proxy.assert_clean();
+}
+
+/// `Request::deadline` is honored by `Agent::upgrade` too: a stalled
+/// handshake must fail with a typed timeout rather than outlive the caller's
+/// absolute budget. `deadline` is our own Rust API, so WPT cannot reach it.
+#[tokio::test]
+async fn upgrade_applies_the_request_deadline_to_the_handshake() {
+    let server = TestServer::start(|connection| {
+        connection.read_request();
+        // Never answer the upgrade; the caller's absolute deadline must fire.
+        std::thread::sleep(Duration::from_millis(600));
+    });
+    let mut request = Request::new(Method::GET, server.ws_url("/stall"));
+    request.deadline = Some(Instant::now() + Duration::from_millis(80));
+    let Err(error) = Agent::new(AgentOptions::default())
+        .expect("default options are valid")
+        .upgrade(request)
+        .await
+    else {
+        panic!("the handshake must not outlive the caller's deadline");
+    };
+    assert!(
+        matches!(
+            error,
+            net::NetError::Transport(net::TransportError::Timeout(_))
+        ),
+        "unexpected error: {error:?}"
+    );
 }
