@@ -3,7 +3,6 @@
 //! Tab coordinators receive [`TabNetworkHandle`]. They do not expose or own
 //! [`net::Agent`].
 
-use std::io;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -43,17 +42,14 @@ impl NetworkContext {
     /// # Errors
     ///
     /// [`Agent::new`] rejects a proxy, resolve spec, or TLS CA value.
-    pub(crate) fn new(mut options: AgentOptions) -> io::Result<Self> {
+    pub(crate) fn new(mut options: AgentOptions) -> Result<Self, net::NetError> {
         if options.user_agent.is_none() {
             options.user_agent = Some(crate::USER_AGENT.to_string());
         }
         if options.timeout_per_call.is_none() {
             options.timeout_per_call = Some(PAGE_FETCH_TIMEOUT);
         }
-        // `InvalidInput` marks deferred flag validation; the `NetError` stays
-        // in the chain so callers can name the offending option.
-        let agent = Agent::new(options)
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+        let agent = Agent::new(options)?;
         Ok(Self {
             agent,
             permits: NetworkPermits::new(),

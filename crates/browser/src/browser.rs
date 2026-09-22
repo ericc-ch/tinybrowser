@@ -1,24 +1,64 @@
-//! One async Browser bound to one named Profile.
+//! Public browser facade and its private command protocol.
 
-use std::collections::HashMap;
+mod task;
+
 use std::convert::Infallible;
 use std::fmt;
 use std::io;
-use std::path::Path;
-use std::sync::Arc;
+use std::path::PathBuf;
 
 use url::Url;
 
-use crate::actor::{TabHandle, TabId, TabTask};
+use self::task::BrowserTask;
+use crate::actor::{TabHandle, TabId};
 use crate::context::BrowserContext;
-use crate::exchange::{self, ServerInput};
-use crate::manager::RendererProcessManager;
+use crate::exchange;
+use crate::network::NetworkContext;
 use crate::profile::Profile;
-use crate::store::ProfileStore;
+use crate::profile::default_data_home;
 
 const BROWSER_COMMAND_CAPACITY: usize = 256;
 
-/// Process-owned engine for one profile.
+/// Inputs for opening one [`Browser`].
+///
+/// The default options use the platform data home, the `default` profile, and
+/// the browser's default network configuration. Set [`Self::data_home`] to
+/// isolate a browser in a caller-selected directory.
+///
+/// # Examples
+///
+/// ```no_run
+/// use browser::{AgentOptions, Browser, BrowserOptions, Profile};
+///
+/// #[tokio::main(flavor = "current_thread")]
+/// async fn main() -> Result<(), Box<dyn std::error::Error>> {
+///     let browser = Browser::new(BrowserOptions {
+///         data_home: Some("/tmp/tinybrowser-example".into()),
+///         profile: Profile::default(),
+///         network: AgentOptions::default(),
+///     })?;
+///     browser.close().await?;
+///     Ok(())
+/// }
+/// ```
+#[derive(Clone, Debug, Default)]
+pub struct BrowserOptions {
+    /// Root below which tinybrowser stores profiles, or `None` to use
+    /// `XDG_DATA_HOME` and then `$HOME/.local/share`.
+    pub data_home: Option<PathBuf>,
+    /// Durable profile to open exclusively.
+    pub profile: Profile,
+    /// HTTP, proxy, resolver, timeout, and TLS configuration.
+    pub network: net::AgentOptions,
+}
+
+/// Running browser owner for one durable profile.
+///
+/// Construction restores profile state and starts one owner task that
+/// serializes browser commands. Use [`Browser::handle`] for temporary access
+/// to the cloneable command handle. Dropping `Browser` requests background
+/// shutdown; use [`Browser::close`] when the caller must wait for tab shutdown
+/// and profile persistence.
 ///
 /// Renderer processes are the current executable invoked with `renderer` as
 /// its first argument. An embedding executable must dispatch that invocation
@@ -27,13 +67,19 @@ pub struct Browser {
     handle: BrowserHandle,
 }
 
-/// Async value-only handle protocols use to drive [`Browser`].
+/// Cloneable command handle for a running [`Browser`].
+///
+/// Every method sends a typed command through the browser exchange. Cloning
+/// this handle creates another sender for the same browser; it does not copy
+/// browser or profile state. Borrow the handle through [`Browser::handle`] for
+/// immediate calls, and clone it only when another task or service must retain
+/// its own sender.
 #[derive(Clone)]
 pub struct BrowserHandle {
     client: BrowserClient,
 }
 
-enum Command {
+pub(super) enum Command {
     CreateTab,
     Tabs,
     Tab {
@@ -42,7 +88,6 @@ enum Command {
     CloseTab {
         id: TabId,
     },
-    IsLive,
     Close,
     CookieRecords {
         url: Url,
@@ -52,31 +97,25 @@ enum Command {
         cookie: String,
         url: Url,
     },
-    /// Opens one auxiliary browsing context for `window.open`.
     OpenWindow {
         url: String,
-        /// Tab that called `window.open`, when the link could resolve it.
         source: Option<TabId>,
-        /// The caller asked for `noopener`/`noreferrer`; no opener link.
         noopener: bool,
     },
-    /// `window.opener` for one tab.
     OpenerTab {
         tab: TabId,
     },
-    /// Routes one `postMessage` to a live tab.
     WindowMessage {
         target: TabId,
         payload: String,
     },
 }
 
-enum Reply {
+pub(super) enum Reply {
     CreateTab(Result<TabHandle, BrowserError>),
     Tabs(Vec<TabId>),
     Tab(Result<TabHandle, BrowserError>),
     CloseTab(Result<(), BrowserError>),
-    IsLive(bool),
     Close(io::Result<()>),
     CookieRecords(Vec<net::CookieRecord>),
     ClearCookies,
@@ -87,80 +126,103 @@ enum Reply {
 }
 
 #[derive(Clone)]
-enum Notice {
+pub(super) enum Notice {
     Close,
 }
 
-type BrowserClient = exchange::Client<Command, Infallible, Notice, Reply, Infallible>;
-type BrowserServer = exchange::Server<Infallible, Reply, Infallible, Command, Notice>;
-
-struct BrowserState {
-    live: bool,
-    context: BrowserContext,
-    renderers: Arc<RendererProcessManager>,
-    tabs: HashMap<TabId, TabTask>,
-    next_tab: u64,
-    /// Auxiliary browsing context relationships: openee -> opener.
-    openers: HashMap<TabId, TabId>,
-}
+pub(super) type BrowserClient = exchange::Client<Command, Infallible, Notice, Reply, Infallible>;
+pub(super) type BrowserServer = exchange::Server<Infallible, Reply, Infallible, Command, Notice>;
 
 impl Browser {
-    /// Opens a browser on `profile` with cookies under `data_home`, renderer
-    /// processes, and default transport settings.
+    /// Opens the selected profile and starts its browser owner task.
+    ///
+    /// This function validates network options, exclusively locks and restores
+    /// the profile, and starts renderer-process management. It must run inside
+    /// an active Tokio runtime. No tab is created automatically.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use std::io;
+    /// use browser::{Browser, BrowserOptions};
+    ///
+    /// #[tokio::main(flavor = "current_thread")]
+    /// async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    ///     let browser = Browser::new(BrowserOptions::default())?;
+    ///     let tab = browser.handle().create_tab().await?;
+    ///     tab.load_html("<!doctype html><title>Example</title>").await?;
+    ///     browser.close().await?;
+    ///     Ok(())
+    /// }
+    /// ```
     ///
     /// # Errors
     ///
-    /// The profile directory cannot be created, read, or exclusively locked;
-    /// stored profile data cannot be loaded; or the caller is not running
-    /// inside the executable-owned Tokio runtime.
-    pub fn open_in(data_home: &Path, profile: &Profile) -> io::Result<Self> {
-        Self::open_in_with_network(data_home, profile, net::AgentOptions::default())
-    }
-
-    /// Opens a browser on `profile` with cookies under `data_home`, renderer
-    /// processes, and `options`' transport settings. Browser defaults fill
-    /// only where `options` leaves a field `None`: caller wins on `user_agent`
-    /// and `timeout_per_call`.
-    ///
-    /// # Errors
-    ///
-    /// The profile directory cannot be created, read, or exclusively locked;
-    /// stored profile data cannot be loaded; the caller is not running inside
-    /// the executable-owned Tokio runtime; or `options` fail validation
-    /// (bad `--resolve` spec, proxy URI, or TLS CA).
-    pub fn open_in_with_network(
-        data_home: &Path,
-        profile: &Profile,
-        options: net::AgentOptions,
-    ) -> io::Result<Self> {
-        let context = BrowserContext::open(ProfileStore::open_in(data_home, profile)?, options)?;
+    /// Returns [`BrowserOpenError::RuntimeUnavailable`] outside a Tokio
+    /// runtime, [`BrowserOpenError::InvalidNetwork`] when a proxy, resolver, or
+    /// TLS option is invalid, or [`BrowserOpenError::Profile`] when the data
+    /// home or profile cannot be created, locked, restored, or quarantined.
+    pub fn new(options: BrowserOptions) -> Result<Self, BrowserOpenError> {
         let runtime = tokio::runtime::Handle::try_current()
-            .map_err(|error| io::Error::other(format!("browser runtime unavailable: {error}")))?;
+            .map_err(|_| BrowserOpenError::RuntimeUnavailable)?;
+        let network =
+            NetworkContext::new(options.network).map_err(BrowserOpenError::InvalidNetwork)?;
+        let data_home = match options.data_home {
+            Some(data_home) => data_home,
+            None => default_data_home().map_err(BrowserOpenError::Profile)?,
+        };
+        let context = BrowserContext::open(&data_home, &options.profile, network)
+            .map_err(BrowserOpenError::Profile)?;
         let (client, server) = exchange::local(BROWSER_COMMAND_CAPACITY);
         let handle = BrowserHandle { client };
-        // Renderer links create tabs for `window.open`, so they get the same
-        // command handle the adapters use.
-        let renderers = Arc::new(RendererProcessManager::new(
-            context.partition_services(),
-            context.session_storage(),
-            handle.clone(),
-        ));
-        let state = BrowserState {
-            live: true,
-            context,
-            renderers,
-            tabs: HashMap::new(),
-            next_tab: 1,
-            openers: HashMap::new(),
-        };
-        runtime.spawn(browser_loop(server, state));
+        let task = BrowserTask::new(server, context, handle.clone());
+        runtime.spawn(task.run());
         Ok(Self { handle })
     }
 
-    /// Value-only handle for this browser.
+    /// Borrows the command handle for this browser.
+    ///
+    /// The returned reference is suitable for immediate calls and for APIs
+    /// that clone a handle internally. Call `.clone()` explicitly before
+    /// moving a handle into an independently running task.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use browser::{Browser, BrowserOptions};
+    /// # async fn use_browser(browser: &Browser) -> Result<(), browser::BrowserError> {
+    /// let tab = browser.handle().create_tab().await?;
+    /// # let _ = tab;
+    /// # Ok(())
+    /// # }
+    /// ```
     #[must_use]
-    pub fn handle(&self) -> BrowserHandle {
-        self.handle.clone()
+    pub fn handle(&self) -> &BrowserHandle {
+        &self.handle
+    }
+
+    /// Stops every tab, persists profile state, and waits for owner shutdown.
+    ///
+    /// The browser task terminates even when persistence fails. The returned
+    /// error reports that final persistence failure.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use browser::{Browser, BrowserOptions};
+    /// # async fn close_browser() -> Result<(), Box<dyn std::error::Error>> {
+    /// let browser = Browser::new(BrowserOptions::default())?;
+    /// browser.close().await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns when the browser task has stopped before receiving the close
+    /// command or when cookies or local storage cannot be persisted.
+    pub async fn close(self) -> io::Result<()> {
+        self.handle.close().await
     }
 }
 
@@ -175,7 +237,9 @@ impl BrowserHandle {
     ///
     /// # Errors
     ///
-    /// [`BrowserError::Stopped`] when the owning [`Browser`] has closed.
+    /// [`BrowserError::Stopped`] when the owning [`Browser`] has closed, or
+    /// [`BrowserError::TabIdExhausted`] after every supported tab identity is
+    /// consumed.
     pub async fn create_tab(&self) -> Result<TabHandle, BrowserError> {
         match self.call(Command::CreateTab).await? {
             Reply::CreateTab(result) => result,
@@ -183,7 +247,7 @@ impl BrowserHandle {
         }
     }
 
-    /// Live tab identities.
+    /// Returns the identities of every live tab.
     ///
     /// # Errors
     ///
@@ -195,11 +259,12 @@ impl BrowserHandle {
         }
     }
 
-    /// Handle for a live tab.
+    /// Returns the command handle for live tab `id`.
     ///
     /// # Errors
     ///
-    /// [`BrowserError::UnknownTab`] when `id` is not in the registry.
+    /// [`BrowserError::UnknownTab`] when `id` is not live, or
+    /// [`BrowserError::Stopped`] when the browser task has stopped.
     pub async fn tab(&self, id: TabId) -> Result<TabHandle, BrowserError> {
         match self.call(Command::Tab { id }).await? {
             Reply::Tab(result) => result,
@@ -207,11 +272,12 @@ impl BrowserHandle {
         }
     }
 
-    /// Stops `id` and waits for its coordinator task.
+    /// Stops and unregisters tab `id`.
     ///
     /// # Errors
     ///
-    /// [`BrowserError::UnknownTab`] when `id` is not in the registry.
+    /// [`BrowserError::UnknownTab`] when `id` is not live, or
+    /// [`BrowserError::Stopped`] when the browser task has stopped.
     pub async fn close_tab(&self, id: TabId) -> Result<(), BrowserError> {
         match self.call(Command::CloseTab { id }).await? {
             Reply::CloseTab(result) => result,
@@ -219,19 +285,18 @@ impl BrowserHandle {
         }
     }
 
-    /// Whether this browser still accepts commands.
+    /// Returns whether the browser exchange has disconnected.
     ///
-    /// # Errors
-    ///
-    /// [`BrowserError::Stopped`] when the browser task has stopped.
-    pub async fn is_live(&self) -> Result<bool, BrowserError> {
-        match self.call(Command::IsLive).await? {
-            Reply::IsLive(live) => Ok(live),
-            _ => Err(BrowserError::Protocol),
-        }
+    /// This is a local observation and performs no browser round trip. Another
+    /// task may begin shutdown immediately after this method returns `false`,
+    /// so callers must still handle [`BrowserError::Stopped`] from operations.
+    #[must_use]
+    pub fn is_closed(&self) -> bool {
+        self.client.is_closed()
     }
 
-    /// Cookies visible to `url`, including session and `HttpOnly` cookies.
+    /// Returns cookies visible to `url`, including session and `HttpOnly`
+    /// cookies.
     ///
     /// # Errors
     ///
@@ -246,7 +311,7 @@ impl BrowserHandle {
         }
     }
 
-    /// Drops every cookie from the live jar.
+    /// Removes every cookie from the live profile.
     ///
     /// # Errors
     ///
@@ -258,8 +323,10 @@ impl BrowserHandle {
         }
     }
 
-    /// Stores one `Set-Cookie` line for `url` with HTTP-level rules,
-    /// returning whether the jar stored it.
+    /// Stores one `Set-Cookie` line for `url` using HTTP cookie rules.
+    ///
+    /// Returns `true` when the cookie was accepted and stored, and `false`
+    /// when cookie parsing or policy rejected it.
     ///
     /// # Errors
     ///
@@ -277,13 +344,6 @@ impl BrowserHandle {
         }
     }
 
-    /// Opens one auxiliary browsing context for `window.open`; an empty `url`
-    /// leaves the new tab on `about:blank`. `source` records the opener
-    /// relationship unless `noopener` is set.
-    ///
-    /// # Errors
-    ///
-    /// [`BrowserError::Stopped`] when the browser task has stopped.
     pub(crate) async fn open_window(
         &self,
         url: String,
@@ -303,11 +363,6 @@ impl BrowserHandle {
         }
     }
 
-    /// `window.opener` for one tab.
-    ///
-    /// # Errors
-    ///
-    /// [`BrowserError::Stopped`] when the browser task has stopped.
     pub(crate) async fn opener_tab(&self, tab: TabId) -> Result<Option<TabId>, BrowserError> {
         match self.call(Command::OpenerTab { tab }).await? {
             Reply::OpenerTab(tab) => Ok(tab),
@@ -315,11 +370,6 @@ impl BrowserHandle {
         }
     }
 
-    /// Routes one `postMessage` payload to `target`.
-    ///
-    /// # Errors
-    ///
-    /// [`BrowserError::UnknownTab`] when the target is gone.
     pub(crate) async fn window_message(
         &self,
         target: TabId,
@@ -334,14 +384,22 @@ impl BrowserHandle {
         }
     }
 
-    /// Stops every tab, persists the profile, and refuses later commands.
+    /// Stops every tab and persists profile state.
+    ///
+    /// The browser task terminates after replying, including when persistence
+    /// fails. Later calls through any cloned handle return
+    /// [`BrowserError::Stopped`].
     ///
     /// # Errors
     ///
-    /// The final durable profile write failed or the browser task stopped.
+    /// Returns when the browser task has already stopped or when cookies or
+    /// local storage cannot be persisted.
     pub async fn close(&self) -> io::Result<()> {
         match self.call(Command::Close).await.map_err(|_| stopped())? {
-            Reply::Close(result) => result,
+            Reply::Close(result) => {
+                self.client.wait_closed().await;
+                result
+            }
             _ => Err(io::Error::other("browser protocol mismatch")),
         }
     }
@@ -362,188 +420,70 @@ fn stopped() -> io::Error {
     io::Error::new(io::ErrorKind::BrokenPipe, "browser stopped")
 }
 
-/// Creates one tab coordinator; `window.open` and `Target.createTarget` both
-/// land here.
-fn create_tab(state: &mut BrowserState) -> Result<TabHandle, BrowserError> {
-    if !state.live {
-        return Err(BrowserError::Stopped);
-    }
-    let id = TabId::new(state.next_tab);
-    state.next_tab = state.next_tab.saturating_add(1);
-    state.context.create_tab(id);
-    let task = TabTask::spawn(
-        id,
-        state.context.tab_network(),
-        Arc::clone(&state.renderers),
-    );
-    let handle = task.handle.clone();
-    state.tabs.insert(id, task);
-    Ok(handle)
+/// Failure while opening a [`Browser`].
+#[derive(Debug)]
+pub enum BrowserOpenError {
+    /// The data home or profile could not be created, locked, read, or
+    /// quarantined.
+    Profile(io::Error),
+    /// Network options failed validation.
+    InvalidNetwork(net::NetError),
+    /// No Tokio runtime was active on the calling thread.
+    RuntimeUnavailable,
 }
 
-/// Opens one auxiliary browsing context and starts its first navigation in
-/// the background.
-fn open_window(
-    state: &mut BrowserState,
-    url: String,
-    source: Option<TabId>,
-    noopener: bool,
-) -> Result<TabId, BrowserError> {
-    let handle = create_tab(state)?;
-    let id = handle.id();
-    if let (Some(source), false) = (source, noopener) {
-        state.openers.insert(id, source);
-        state.context.copy_session(source, id);
-    }
-    let navigate = !url.is_empty() && url != "about:blank";
-    if navigate {
-        // The tab starts on about:blank; the first real navigation runs in
-        // the background so one slow load cannot stall the command loop.
-        tokio::spawn(async move {
-            let _result = handle.goto(&url).await;
-        });
-    }
-    Ok(id)
-}
-
-/// Routes one `postMessage` payload to a live tab's main frame.
-async fn route_window_message(
-    state: &BrowserState,
-    target: TabId,
-    payload: String,
-) -> Result<(), BrowserError> {
-    match state.tabs.get(&target) {
-        Some(task) => task
-            .handle
-            .window_message(payload)
-            .await
-            .map_err(|_| BrowserError::UnknownTab),
-        None => Err(BrowserError::UnknownTab),
-    }
-}
-
-/// `window.opener` for one tab.
-fn opener_tab(state: &BrowserState, tab: TabId) -> Option<TabId> {
-    state.openers.get(&tab).copied()
-}
-
-/// Synchronous state queries; returns the command back when it needs awaits.
-fn route_sync(state: &mut BrowserState, command: Command) -> Result<Reply, Command> {
-    match command {
-        Command::Tabs => Ok(Reply::Tabs(state.tabs.keys().copied().collect())),
-        Command::Tab { id } => {
-            let tab = state
-                .tabs
-                .get(&id)
-                .map(|task| task.handle.clone())
-                .ok_or(BrowserError::UnknownTab);
-            Ok(Reply::Tab(tab))
+impl fmt::Display for BrowserOpenError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Profile(error) => write!(formatter, "profile failed: {error}"),
+            Self::InvalidNetwork(error) => write!(formatter, "invalid network options: {error}"),
+            Self::RuntimeUnavailable => formatter.write_str("browser runtime unavailable"),
         }
-        Command::IsLive => Ok(Reply::IsLive(state.live)),
-        Command::CookieRecords { url } => {
-            Ok(Reply::CookieRecords(state.context.cookie_records(&url)))
-        }
-        Command::ClearCookies => {
-            state.context.clear_cookies();
-            Ok(Reply::ClearCookies)
-        }
-        Command::AddCookie { cookie, url } => {
-            Ok(Reply::AddCookie(state.context.add_cookie(&cookie, &url)))
-        }
-        command => Err(command),
     }
 }
 
-async fn browser_loop(mut server: BrowserServer, mut state: BrowserState) {
-    while let Some(input) = server.recv().await {
-        let ServerInput::Call { id, body: command } = input else {
-            if matches!(input, ServerInput::Notify(Notice::Close)) {
-                state.live = false;
-                close_all(&mut state.tabs).await;
-                let _result = state.context.persist().await;
-                return;
+impl std::error::Error for BrowserOpenError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Profile(error) => Some(error),
+            Self::InvalidNetwork(error) => Some(error),
+            Self::RuntimeUnavailable => None,
+        }
+    }
+}
+
+impl From<BrowserOpenError> for io::Error {
+    fn from(error: BrowserOpenError) -> Self {
+        match error {
+            BrowserOpenError::Profile(error) => error,
+            BrowserOpenError::InvalidNetwork(error) => {
+                Self::new(io::ErrorKind::InvalidInput, error)
             }
-            continue;
-        };
-        let reply = match route_sync(&mut state, command) {
-            Ok(reply) => reply,
-            Err(command) => match command {
-                // Synchronous queries never reach the loop; `route_sync` answers
-                // them above.
-                Command::Tabs
-                | Command::Tab { .. }
-                | Command::IsLive
-                | Command::CookieRecords { .. }
-                | Command::ClearCookies
-                | Command::AddCookie { .. } => {
-                    unreachable!("route_sync answers every synchronous query")
-                }
-                Command::CreateTab => Reply::CreateTab(create_tab(&mut state)),
-                Command::OpenWindow {
-                    url,
-                    source,
-                    noopener,
-                } => Reply::OpenWindow(open_window(&mut state, url, source, noopener)),
-                Command::OpenerTab { tab } => Reply::OpenerTab(opener_tab(&state, tab)),
-                Command::WindowMessage { target, payload } => {
-                    Reply::WindowMessage(route_window_message(&state, target, payload).await)
-                }
-                Command::CloseTab { id } => {
-                    let result = if let Some(mut task) = state.tabs.remove(&id) {
-                        state.openers.remove(&id);
-                        task.shutdown().await;
-                        state.context.close_tab(id);
-                        Ok(())
-                    } else {
-                        Err(BrowserError::UnknownTab)
-                    };
-                    Reply::CloseTab(result)
-                }
-                Command::Close => {
-                    state.live = false;
-                    close_all(&mut state.tabs).await;
-                    Reply::Close(state.context.persist().await)
-                }
-            },
-        };
-        let closes = matches!(reply, Reply::Close(Ok(())));
-        if server.reply(id, reply).await.is_err() || closes {
-            return;
+            BrowserOpenError::RuntimeUnavailable => Self::other("browser runtime unavailable"),
         }
     }
-    // Every command sender is gone: this is the drop path when
-    // `Browser::drop` could not queue `Command::Close`. Persist so a
-    // full channel never loses the profile's cookies.
-    close_all(&mut state.tabs).await;
-    if state.live {
-        state.live = false;
-        let _result = state.context.persist().await;
-    }
 }
 
-async fn close_all(tabs: &mut HashMap<TabId, TabTask>) {
-    for mut task in tabs.drain().map(|(_, task)| task) {
-        task.shutdown().await;
-    }
-}
-
-/// Why a browser handle call was refused.
+/// Failure while sending a command to the browser owner task.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BrowserError {
-    /// No tab with that id is live.
+    /// No live tab has the requested identity.
     UnknownTab,
-    /// The owning [`Browser`] has stopped.
+    /// Every supported tab identity has been consumed.
+    TabIdExhausted,
+    /// The browser owner task has stopped.
     Stopped,
     /// The owner returned a reply for a different operation.
     Protocol,
 }
 
 impl fmt::Display for BrowserError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::UnknownTab => f.write_str("unknown tab"),
-            Self::Stopped => f.write_str("browser stopped"),
-            Self::Protocol => f.write_str("browser protocol mismatch"),
+            Self::UnknownTab => formatter.write_str("unknown tab"),
+            Self::TabIdExhausted => formatter.write_str("tab identity space exhausted"),
+            Self::Stopped => formatter.write_str("browser stopped"),
+            Self::Protocol => formatter.write_str("browser protocol mismatch"),
         }
     }
 }

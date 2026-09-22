@@ -708,7 +708,7 @@ impl Conn {
         params: &Value,
         session: Option<&str>,
     ) -> Result<Value, DispatchError> {
-        if method != "Browser.close" && !self.browser.is_live().await.unwrap_or(false) {
+        if method != "Browser.close" && self.browser.is_closed() {
             return Err(DispatchError::Failed("browser closed".into()));
         }
         if let Some(session) = session {
@@ -765,14 +765,12 @@ impl Conn {
                 "bounds": {"left": 0, "top": 0, "width": 1280, "height": 720, "windowState": "normal"},
             })),
             "Browser.close" => {
-                self.browser
-                    .close()
-                    .await
-                    .map_err(|error| DispatchError::Failed(error.to_string()))?;
+                let result = self.browser.close().await;
                 self.sessions.clear();
                 self.stop_subscriptions();
                 self.tab = None;
                 self.stop.request();
+                result.map_err(|error| DispatchError::Failed(error.to_string()))?;
                 Ok(json!({}))
             }
             _ => self.dispatch_target(method, params).await,

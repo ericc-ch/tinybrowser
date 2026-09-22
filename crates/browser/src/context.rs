@@ -1,16 +1,17 @@
 //! Live browser context and its default storage partition.
 
 use std::io;
+use std::path::Path;
 use std::sync::Arc;
 
-use net::AgentOptions;
 use url::Url;
 
 use crate::actor::TabId;
 use crate::broadcast::RendererEventHub;
 use crate::network::{NetworkContext, TabNetworkHandle};
+use crate::profile::Profile;
+use crate::profile::store::ProfileStore;
 use crate::storage::{LocalStorage, SessionStorage};
-use crate::store::ProfileStore;
 
 /// Services shared by renderer assignments in one storage partition.
 #[derive(Clone)]
@@ -38,9 +39,15 @@ impl BrowserContext {
     ///
     /// # Errors
     ///
-    /// Stored profile data or the supplied network options could not be used.
-    pub(crate) fn open(store: ProfileStore, options: AgentOptions) -> io::Result<Self> {
-        let network = NetworkContext::new(options)?;
+    /// The profile directory cannot be created or exclusively locked, or stored
+    /// profile data could not be read or quarantined.
+    pub(crate) fn open(
+        data_home: &Path,
+        profile: &Profile,
+        network: NetworkContext,
+    ) -> io::Result<Self> {
+        let store = ProfileStore::open_in(data_home, profile)?;
+        store.load_into(&network.agent())?;
         store.load_into(&network.agent())?;
         let local_storage = Arc::new(LocalStorage::default());
         store.load_local_storage(&local_storage)?;

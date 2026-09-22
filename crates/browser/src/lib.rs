@@ -22,17 +22,15 @@ mod network;
 mod profile;
 mod site;
 mod storage;
-mod store;
 mod wire;
 
 pub use actor::{TabEvent, TabHandle, TabId};
-pub use browser::{Browser, BrowserError, BrowserHandle};
+pub use browser::{Browser, BrowserError, BrowserHandle, BrowserOpenError, BrowserOptions};
 pub use net::{Agent, AgentOptions, CookieRecord, CookieSameSite};
-pub use profile::{Profile, ProfileError, ProfileName};
+pub use profile::{Profile, ProfileError, ProfileName, default_data_home};
 pub use renderer::{
     FrameId, RemoteValue, ResourceLimit, ScreenshotClip, ScreenshotRequest, ScriptFailure, TabError,
 };
-pub use store::ProfileStore;
 
 /// Chrome-compatible identity sent by the browser and exposed through CDP.
 /// TLS fingerprinting is a separate transport concern and is not changed here.
