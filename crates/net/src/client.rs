@@ -13,6 +13,58 @@ use url::Url;
 
 const DEFAULT_MAX_REDIRECTS: u32 = 20;
 
+/// Constructor inputs for [`Agent::new`]. Every field is raw and validated at
+/// construction: `proxy` must be an `http://` URI with a host, each `resolve`
+/// entry must be `PATTERN=ADDR`, and each `tls_cas` entry must be PEM.
+///
+/// Debug output records whether a proxy is configured, not its URI or credentials.
+#[derive(Clone)]
+pub struct AgentOptions {
+    /// Default `User-Agent` for requests that do not set that header themselves.
+    pub user_agent: Option<String>,
+    /// Cap on the whole call, including redirects.
+    pub timeout_global: Option<Duration>,
+    /// Cap on a single hop.
+    pub timeout_per_call: Option<Duration>,
+    /// Maximum redirect hops. `0` returns the redirect response without following.
+    pub max_redirects: u32,
+    /// HTTP CONNECT proxy authority: an `http://` URI with a host.
+    pub proxy: Option<String>,
+    /// `--resolve=PATTERN=ADDR` rewrites, first match wins. `PATTERN` is an
+    /// exact host or a `*` glob; `ADDR` is an IPv4 literal or `fail`.
+    pub resolve: Vec<String>,
+    /// PEM-encoded certificate authorities to trust in addition to the
+    /// platform's, e.g. a private test CA. Repeatable.
+    pub tls_cas: Vec<Vec<u8>>,
+}
+
+impl std::fmt::Debug for AgentOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AgentOptions")
+            .field("has_proxy", &self.proxy.is_some())
+            .field("timeout_global", &self.timeout_global)
+            .field("timeout_per_call", &self.timeout_per_call)
+            .field("max_redirects", &self.max_redirects)
+            .field("has_resolve", &!self.resolve.is_empty())
+            .field("extra_tls_cas", &self.tls_cas.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl Default for AgentOptions {
+    fn default() -> Self {
+        Self {
+            user_agent: None,
+            timeout_global: None,
+            timeout_per_call: None,
+            max_redirects: DEFAULT_MAX_REDIRECTS,
+            proxy: None,
+            resolve: Vec::new(),
+            tls_cas: Vec::new(),
+        }
+    }
+}
+
 /// Builds an [`Agent`].
 ///
 /// Debug output records whether a proxy is configured, not its URI or credentials.
@@ -104,11 +156,7 @@ impl AgentBuilder {
     ///
     /// [`ProtocolError::InvalidProxy`] when `authority` is not an `http://` URI with a host.
     pub fn proxy(mut self, authority: &str) -> Result<Self, NetError> {
-        let parsed = Url::parse(authority).map_err(|_| invalid_proxy())?;
-        if parsed.scheme() != "http" || parsed.host_str().is_none() {
-            return Err(invalid_proxy());
-        }
-        self.proxy = Some(authority.to_owned());
+        self.proxy = Some(parse_proxy(authority)?);
         Ok(self)
     }
 
@@ -144,6 +192,33 @@ impl AgentBuilder {
     /// Builds an agent with a private cookie jar and the selected transport options.
     #[must_use]
     pub fn build(self) -> Agent {
+        AgentParts {
+            user_agent: self.user_agent,
+            timeout_global: self.timeout_global,
+            timeout_per_call: self.timeout_per_call,
+            max_redirects: self.max_redirects,
+            proxy: self.proxy,
+            host_map: self.host_map,
+            tls_cas: self.tls_cas,
+        }
+        .assemble()
+    }
+}
+
+/// Validated constructor inputs: proxy, resolve map, and TLS CAs are already
+/// parsed, so assembly cannot fail.
+struct AgentParts {
+    user_agent: Option<String>,
+    timeout_global: Option<Duration>,
+    timeout_per_call: Option<Duration>,
+    max_redirects: u32,
+    proxy: Option<String>,
+    host_map: HostMap,
+    tls_cas: Vec<native_tls::Certificate>,
+}
+
+impl AgentParts {
+    fn assemble(self) -> Agent {
         Agent {
             engine: HttpEngine::new(
                 self.timeout_global,
@@ -158,6 +233,41 @@ impl AgentBuilder {
             now: SystemTime::now,
         }
     }
+}
+
+impl AgentOptions {
+    /// Parses every raw field, reporting the first invalid value.
+    fn into_parts(self) -> Result<AgentParts, NetError> {
+        let proxy = self.proxy.as_deref().map(parse_proxy).transpose()?;
+        let mut host_map = HostMap::default();
+        for spec in &self.resolve {
+            host_map = host_map.with_spec(spec)?;
+        }
+        let mut tls_cas = Vec::with_capacity(self.tls_cas.len());
+        for pem in &self.tls_cas {
+            tls_cas.push(
+                native_tls::Certificate::from_pem(pem)
+                    .map_err(|error| NetError::Transport(TransportError::Tls(error.to_string().into())))?,
+            );
+        }
+        Ok(AgentParts {
+            user_agent: self.user_agent,
+            timeout_global: self.timeout_global,
+            timeout_per_call: self.timeout_per_call,
+            max_redirects: self.max_redirects,
+            proxy,
+            host_map,
+            tls_cas,
+        })
+    }
+}
+
+fn parse_proxy(authority: &str) -> Result<String, NetError> {
+    let parsed = Url::parse(authority).map_err(|_| invalid_proxy())?;
+    if parsed.scheme() != "http" || parsed.host_str().is_none() {
+        return Err(invalid_proxy());
+    }
+    Ok(authority.to_owned())
 }
 
 fn invalid_proxy() -> NetError {
@@ -187,14 +297,21 @@ impl std::fmt::Debug for Agent {
 }
 
 impl Agent {
-    /// Agent with default builder settings.
-    #[must_use]
-    pub fn new() -> Self {
-        AgentBuilder::new().build()
+    /// Builds an agent from `options`, the only constructor. The raw `proxy`,
+    /// `resolve`, and `tls_cas` values are validated here before assembly.
+    ///
+    /// # Errors
+    ///
+    /// [`ProtocolError::InvalidProxy`] when `proxy` is not an `http://` URI with
+    /// a host, [`ProtocolError::InvalidResolve`] when a `resolve` entry is not
+    /// `PATTERN=ADDR`, or [`NetError::Transport`] when a `tls_cas` entry is not
+    /// a PEM certificate.
+    pub fn new(options: AgentOptions) -> Result<Agent, NetError> {
+        Ok(options.into_parts()?.assemble())
     }
 
-    /// Starts a request. `url` must be absolute; [`RequestBuilder::send`] requires
-    /// `http`/`https`, and [`RequestBuilder::upgrade`] requires `ws`/`wss`.
+    /// Starts a request. `url` must be absolute; [`Agent::send`] requires
+    /// `http`/`https`, and [`Agent::upgrade`] requires `ws`/`wss`.
     #[must_use]
     pub fn request(&self, method: Method, url: Url) -> RequestBuilder {
         RequestBuilder::new(self.clone(), method, url)
@@ -333,15 +450,176 @@ impl Agent {
             );
         }
     }
-}
 
-impl Default for Agent {
-    fn default() -> Self {
-        Self::new()
+    /// Sends `request` and follows HTTP redirects per
+    /// [HTTP redirect fetch](https://fetch.spec.whatwg.org/#http-redirect-fetch).
+    ///
+    /// Status codes are response data, not errors. The URL must be `http` or `https`.
+    ///
+    /// # Errors
+    ///
+    /// [`NetError::Protocol`] for a non-`http`/`https` URL, a rejected request, or an
+    /// unusable `Location`. [`NetError::Limit`] when the redirect cap is exceeded.
+    /// [`NetError::Transport`] when a hop fails.
+    pub async fn send(&self, request: Request) -> Result<Response, NetError> {
+        if !matches!(request.url.scheme(), "http" | "https") {
+            return Err(NetError::Protocol(ProtocolError::RejectedRequest));
+        }
+        let mut method = request.method;
+        let mut url = request.url;
+        let mut headers = request.headers;
+        let mut body = request.body;
+        let mut followed = 0u32;
+        let initiator_kind = request.initiator_kind;
+        let initiator = request.initiator;
+        let mut cross_site_redirect = false;
+        let started = Instant::now();
+        let mut budget = self.engine.budget_at(started);
+        if let Some(deadline) = request.deadline {
+            budget.global = Some(deadline);
+        }
+
+        loop {
+            if budget.is_expired() {
+                return Err(NetError::Transport(TransportError::Timeout(
+                    budget.timeout_kind(TimeoutKind::Global),
+                )));
+            }
+            budget = budget.with_hop_start(self.engine.timeout_per_call, Instant::now());
+            let mut wire = url.clone();
+            wire.set_fragment(None);
+            let mut hop_headers = headers.clone();
+            self.prepare_outbound(
+                &mut hop_headers,
+                &url,
+                initiator_kind,
+                &method,
+                initiator.as_ref(),
+                cross_site_redirect,
+            );
+            apply_url_credentials(&mut hop_headers, &url);
+            let (status, response_headers, reader) = self
+                .engine
+                .send(&method, &wire, &hop_headers, body.as_deref(), budget)
+                .await?;
+            let response =
+                Response::from_parts(status, response_headers, reader, url.clone(), budget);
+            self.store_set_cookie_lines(
+                &url,
+                initiator_kind,
+                &method,
+                initiator.as_ref(),
+                cross_site_redirect,
+                response
+                    .headers()
+                    .get_all("set-cookie")
+                    .filter_map(|v| std::str::from_utf8(v).ok()),
+            );
+
+            let Some(location) = followable_location(response.status(), response.headers())? else {
+                return Ok(response);
+            };
+
+            if self.max_redirects == 0 {
+                return Ok(response);
+            }
+            if followed == self.max_redirects {
+                return Err(NetError::Limit(LimitExceeded::Redirect));
+            }
+
+            let next = resolve_location(&url, location)?;
+            cross_site_redirect |= !cookies::schemeful_same_site(&url, &next);
+            apply_redirect_policy(
+                response.status(),
+                &url,
+                &next,
+                &mut method,
+                &mut headers,
+                &mut body,
+            );
+            url = next;
+            followed += 1;
+            drop(response);
+        }
+    }
+
+    /// WebSocket handshake for `request`. The URL must be `ws` or `wss`.
+    ///
+    /// # Errors
+    ///
+    /// [`NetError::Protocol`] for a non-WebSocket URL or a failed handshake.
+    /// [`NetError::Transport`] when the dial or TLS handshake fails.
+    pub async fn upgrade(&self, request: Request) -> Result<WebSocket, NetError> {
+        if !matches!(request.url.scheme(), "ws" | "wss") {
+            return Err(NetError::Protocol(ProtocolError::RejectedRequest));
+        }
+        let method = Method::GET;
+        let initiator_kind = InitiatorKind::WsHandshake;
+        let mut headers = request.headers;
+        self.prepare_outbound(
+            &mut headers,
+            &request.url,
+            initiator_kind,
+            &method,
+            request.initiator.as_ref(),
+            false,
+        );
+        websocket::connect(
+            self,
+            &request.url,
+            &headers,
+            initiator_kind,
+            &method,
+            request.initiator.as_ref(),
+        )
+        .await
     }
 }
 
-/// One outbound request. Default [`InitiatorKind`] is [`InitiatorKind::Navigation`].
+/// One outbound request as plain data. Set fields directly, then hand it to
+/// [`Agent::send`] (`http`/`https`) or [`Agent::upgrade`] (`ws`/`wss`).
+///
+/// Default [`InitiatorKind`] is [`InitiatorKind::Navigation`].
+#[derive(Debug)]
+pub struct Request {
+    /// Request method.
+    pub method: Method,
+    /// Absolute URL.
+    pub url: Url,
+    /// Outbound headers. Appends do not replace earlier values of the same
+    /// name (RFC 9110 §5.2); use [`HeaderMap::insert`] or [`HeaderMap::remove`].
+    pub headers: HeaderMap,
+    /// Initiator class used for `SameSite` and (later) `Sec-Fetch-*`.
+    pub initiator_kind: InitiatorKind,
+    /// Document URL used as the `SameSite` initiator and WebSocket `Origin`.
+    pub initiator: Option<Url>,
+    /// Request body bytes. Redirects that convert to GET drop this.
+    pub body: Option<Vec<u8>>,
+    /// Absolute deadline for this call, covering every redirect hop.
+    /// Overrides [`AgentOptions::timeout_global`]; the per-call timeout still
+    /// applies hop by hop.
+    pub deadline: Option<Instant>,
+}
+
+impl Request {
+    /// A request for `method` and absolute `url` with no headers, body,
+    /// initiator, or deadline.
+    #[must_use]
+    pub fn new(method: Method, url: Url) -> Self {
+        Self {
+            method,
+            url,
+            headers: HeaderMap::new(),
+            initiator_kind: InitiatorKind::default(),
+            initiator: None,
+            body: None,
+            deadline: None,
+        }
+    }
+}
+
+/// One outbound request behind the builder interface kept for the browser
+/// crate. New code should use [`Request`] with [`Agent::send`] instead.
 #[derive(Debug)]
 pub struct RequestBuilder {
     agent: Agent,
@@ -401,7 +679,7 @@ impl RequestBuilder {
 
     /// Sets the absolute deadline for this call, covering every redirect hop.
     ///
-    /// Overrides [`AgentBuilder::timeout_global`] for this request. The per-call
+    /// Overrides [`AgentOptions::timeout_global`] for this request. The per-call
     /// timeout still applies hop by hop.
     #[must_use]
     pub fn deadline(mut self, deadline: Instant) -> Self {
@@ -409,129 +687,40 @@ impl RequestBuilder {
         self
     }
 
-    /// Sends the request and follows HTTP redirects per
-    /// [HTTP redirect fetch](https://fetch.spec.whatwg.org/#http-redirect-fetch).
-    ///
-    /// Status codes are response data, not errors. The URL must be `http` or `https`.
+    /// Sends the request. Delegates to [`Agent::send`].
     ///
     /// # Errors
     ///
-    /// [`NetError::Protocol`] for a non-`http`/`https` URL, a rejected request, or an
-    /// unusable `Location`. [`NetError::Limit`] when the redirect cap is exceeded.
-    /// [`NetError::Transport`] when a hop fails.
+    /// See [`Agent::send`].
     pub async fn send(self) -> Result<Response, NetError> {
-        if !matches!(self.url.scheme(), "http" | "https") {
-            return Err(NetError::Protocol(ProtocolError::RejectedRequest));
-        }
-        let mut method = self.method;
-        let mut url = self.url;
-        let mut headers = self.headers;
-        let mut body = self.body;
-        let mut followed = 0u32;
-        let agent = self.agent;
-        let initiator_kind = self.initiator_kind;
-        let initiator = self.initiator;
-        let mut cross_site_redirect = false;
-        let started = Instant::now();
-        let mut budget = agent.engine.budget_at(started);
-        if let Some(deadline) = self.deadline {
-            budget.global = Some(deadline);
-        }
-
-        loop {
-            if budget.is_expired() {
-                return Err(NetError::Transport(TransportError::Timeout(
-                    budget.timeout_kind(TimeoutKind::Global),
-                )));
-            }
-            budget = budget.with_hop_start(agent.engine.timeout_per_call, Instant::now());
-            let mut wire = url.clone();
-            wire.set_fragment(None);
-            let mut hop_headers = headers.clone();
-            agent.prepare_outbound(
-                &mut hop_headers,
-                &url,
-                initiator_kind,
-                &method,
-                initiator.as_ref(),
-                cross_site_redirect,
-            );
-            apply_url_credentials(&mut hop_headers, &url);
-            let (status, response_headers, reader) = agent
-                .engine
-                .send(&method, &wire, &hop_headers, body.as_deref(), budget)
-                .await?;
-            let response =
-                Response::from_parts(status, response_headers, reader, url.clone(), budget);
-            agent.store_set_cookie_lines(
-                &url,
-                initiator_kind,
-                &method,
-                initiator.as_ref(),
-                cross_site_redirect,
-                response
-                    .headers()
-                    .get_all("set-cookie")
-                    .filter_map(|v| std::str::from_utf8(v).ok()),
-            );
-
-            let Some(location) = followable_location(response.status(), response.headers())? else {
-                return Ok(response);
-            };
-
-            if agent.max_redirects == 0 {
-                return Ok(response);
-            }
-            if followed == agent.max_redirects {
-                return Err(NetError::Limit(LimitExceeded::Redirect));
-            }
-
-            let next = resolve_location(&url, location)?;
-            cross_site_redirect |= !cookies::schemeful_same_site(&url, &next);
-            apply_redirect_policy(
-                response.status(),
-                &url,
-                &next,
-                &mut method,
-                &mut headers,
-                &mut body,
-            );
-            url = next;
-            followed += 1;
-            drop(response);
-        }
+        let (agent, request) = self.split();
+        agent.send(request).await
     }
 
-    /// WebSocket handshake. The URL must be `ws` or `wss`.
+    /// WebSocket handshake. Delegates to [`Agent::upgrade`].
     ///
     /// # Errors
     ///
-    /// [`NetError::Protocol`] for a non-WebSocket URL or a failed handshake.
-    /// [`NetError::Transport`] when the dial or TLS handshake fails.
+    /// See [`Agent::upgrade`].
     pub async fn upgrade(self) -> Result<WebSocket, NetError> {
-        if !matches!(self.url.scheme(), "ws" | "wss") {
-            return Err(NetError::Protocol(ProtocolError::RejectedRequest));
-        }
-        let method = Method::GET;
-        let initiator_kind = InitiatorKind::WsHandshake;
-        let mut headers = self.headers;
-        self.agent.prepare_outbound(
-            &mut headers,
-            &self.url,
-            initiator_kind,
-            &method,
-            self.initiator.as_ref(),
-            false,
-        );
-        websocket::connect(
-            &self.agent,
-            &self.url,
-            &headers,
-            initiator_kind,
-            &method,
-            self.initiator.as_ref(),
+        let (agent, request) = self.split();
+        agent.upgrade(request).await
+    }
+
+    /// Splits into the agent that sends and the data that describes the call.
+    fn split(self) -> (Agent, Request) {
+        (
+            self.agent,
+            Request {
+                method: self.method,
+                url: self.url,
+                headers: self.headers,
+                initiator_kind: self.initiator_kind,
+                initiator: self.initiator,
+                body: self.body,
+                deadline: self.deadline,
+            },
         )
-        .await
     }
 }
 

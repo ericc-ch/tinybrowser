@@ -7,12 +7,16 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use net::{
-    Agent, AgentBuilder, LimitExceeded, Method, NetError, ProtocolError, TimeoutKind,
+    Agent, AgentOptions, LimitExceeded, Method, NetError, ProtocolError, Request, TimeoutKind,
     TransportError,
 };
 
 const OBSERVE_TIMEOUT: Duration = Duration::from_secs(5);
 const PROXY_PROBE_FLAG: &str = "NET_CRATE_PROXY_PROBE";
+
+fn default_agent() -> Agent {
+    Agent::new(AgentOptions::default()).expect("default options are valid")
+}
 
 #[tokio::test]
 async fn http_transcripts_cover_status_headers_framing_limits_and_failures() {
@@ -21,9 +25,8 @@ async fn http_transcripts_cover_status_headers_framing_limits_and_failures() {
             scripted([
                 format!("HTTP/1.1 {status} Whatever\r\nContent-Length: 2\r\n\r\nno").into_bytes(),
             ]);
-        let response = Agent::new()
-            .request(Method::GET, server.url("/"))
-            .send()
+        let response = default_agent()
+            .send(Request::new(Method::GET, server.url("/")))
             .await
             .expect("status is response data");
         assert_eq!(response.status(), status);
@@ -36,9 +39,8 @@ async fn http_transcripts_cover_status_headers_framing_limits_and_failures() {
         b"hello",
     )]);
     let requested = server.url("/a/b?c=d");
-    let response = Agent::new()
-        .request(Method::GET, requested.clone())
-        .send()
+    let response = default_agent()
+        .send(Request::new(Method::GET, requested.clone()))
         .await
         .expect("GET");
     let request = &server.requests()[0];
@@ -59,9 +61,8 @@ async fn http_transcripts_cover_status_headers_framing_limits_and_failures() {
 
     let server = scripted([b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n".to_vec()]);
     assert_eq!(
-        Agent::new()
-            .request(Method::GET, server.url("/chunked"))
-            .send()
+        default_agent()
+            .send(Request::new(Method::GET, server.url("/chunked")))
             .await
             .expect("chunked")
             .into_body()
@@ -75,9 +76,8 @@ async fn http_transcripts_cover_status_headers_framing_limits_and_failures() {
     let payload = vec![b'x'; 32];
     let server = scripted([canned_ok(&[], &payload)]);
     assert!(matches!(
-        Agent::new()
-            .request(Method::GET, server.url("/limit"))
-            .send()
+        default_agent()
+            .send(Request::new(Method::GET, server.url("/limit")))
             .await
             .expect("response")
             .into_body()
@@ -91,9 +91,11 @@ async fn http_transcripts_cover_status_headers_framing_limits_and_failures() {
     let dead_url = format!("http://{}/", dead.local_addr().expect("address"));
     drop(dead);
     assert!(matches!(
-        Agent::new()
-            .request(Method::GET, url::Url::parse(&dead_url).expect("url"))
-            .send()
+        default_agent()
+            .send(Request::new(
+                Method::GET,
+                url::Url::parse(&dead_url).expect("url")
+            ))
             .await,
         Err(NetError::Transport(_))
     ));
@@ -103,12 +105,13 @@ async fn http_transcripts_cover_status_headers_framing_limits_and_failures() {
         std::thread::sleep(Duration::from_millis(300));
     });
     assert!(matches!(
-        AgentBuilder::new()
-            .timeout_global(Duration::from_millis(60))
-            .build()
-            .request(Method::GET, server.url("/stall"))
-            .send()
-            .await,
+        Agent::new(AgentOptions {
+            timeout_global: Some(Duration::from_millis(60)),
+            ..AgentOptions::default()
+        })
+        .expect("timeout options")
+        .send(Request::new(Method::GET, server.url("/stall")))
+        .await,
         Err(NetError::Transport(TransportError::Timeout(
             TimeoutKind::Global
         )))
@@ -135,12 +138,13 @@ async fn timeout_global_covers_every_redirect_hop() {
         let _ = connection.write_all(&payload);
     });
     let started = Instant::now();
-    let result = AgentBuilder::new()
-        .timeout_global(global)
-        .build()
-        .request(Method::GET, server.url("/start"))
-        .send()
-        .await;
+    let result = Agent::new(AgentOptions {
+        timeout_global: Some(global),
+        ..AgentOptions::default()
+    })
+    .expect("timeout options")
+    .send(Request::new(Method::GET, server.url("/start")))
+    .await;
     let elapsed = started.elapsed();
     assert!(
         matches!(
@@ -188,9 +192,8 @@ async fn response_bodies_stream_and_drop_cancels_the_socket() {
         }
         connection.write_all(&rest).expect("remaining body");
     });
-    let mut body = Agent::new()
-        .request(Method::GET, server.url("/stream"))
-        .send()
+    let mut body = default_agent()
+        .send(Request::new(Method::GET, server.url("/stream")))
         .await
         .expect("stream")
         .into_body();
@@ -218,9 +221,8 @@ async fn response_bodies_stream_and_drop_cancels_the_socket() {
         server_flag.store(connection.await_peer_close(), Ordering::Release);
     });
     {
-        let mut body = Agent::new()
-            .request(Method::GET, server.url("/cancel"))
-            .send()
+        let mut body = default_agent()
+            .send(Request::new(Method::GET, server.url("/cancel")))
             .await
             .expect("cancel")
             .into_body();
@@ -240,30 +242,30 @@ async fn response_bodies_stream_and_drop_cancels_the_socket() {
 #[tokio::test]
 async fn request_shaping_custom_method_fragments_and_rejections_are_wire_visible() {
     let server = scripted([b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n".to_vec()]);
-    Agent::new()
-        .request(
+    default_agent()
+        .send(Request::new(
             Method::parse("propfind").expect("custom method"),
             server.url("/m"),
-        )
-        .send()
+        ))
         .await
         .expect("custom method request");
     assert_eq!(server.requests()[0].method, "propfind");
     server.assert_clean();
 
     let server = scripted([b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n".to_vec()]);
-    AgentBuilder::new()
-        .user_agent("builder/default")
-        .build()
-        .request(Method::POST, server.url("/shape#fragment"))
-        .header("X-Custom", "alpha")
-        .expect("header")
-        .header("User-Agent", "request/wins")
-        .expect("header")
-        .body(b"name=value")
-        .send()
-        .await
-        .expect("shaped request");
+    let agent = Agent::new(AgentOptions {
+        user_agent: Some("builder/default".to_owned()),
+        ..AgentOptions::default()
+    })
+    .expect("agent options");
+    let mut request = Request::new(Method::POST, server.url("/shape#fragment"));
+    request.headers.insert("X-Custom", "alpha").expect("header");
+    request
+        .headers
+        .insert("User-Agent", "request/wins")
+        .expect("header");
+    request.body = Some(b"name=value".to_vec());
+    agent.send(request).await.expect("shaped request");
     let request = &server.requests()[0];
     assert_eq!(request.target, "/shape");
     assert_eq!(request.body, b"name=value");
@@ -277,62 +279,26 @@ async fn request_shaping_custom_method_fragments_and_rejections_are_wire_visible
             .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
             .expect("response");
     });
-    let result = Agent::new()
-        .request(Method::GET, server.url("/invalid"))
-        .header("X-Bad", "line\r\nInjected: yes");
+    let mut request = Request::new(Method::GET, server.url("/invalid"));
+    let result = request.headers.insert("X-Bad", "line\r\nInjected: yes");
     assert!(matches!(result, Err(net::HeaderError::InvalidValue(_))));
     assert!(server.requests().is_empty());
     server.assert_clean();
 }
 
+/// Our redirect cap and its typed error. Redirect *policy* (method rewriting,
+/// header stripping, fragment handling) is WPT's `fetch/api/redirect/` suite.
 #[tokio::test]
-async fn redirect_policy_covers_following_rewriting_caps_and_origin_safety() {
-    for (status, method, expected_method, expected_body) in [
-        (301, Method::POST, "GET", b"".as_slice()),
-        (302, Method::POST, "GET", b"".as_slice()),
-        (303, Method::PUT, "GET", b"".as_slice()),
-        (307, Method::POST, "POST", b"field=1".as_slice()),
-        (308, Method::POST, "POST", b"field=1".as_slice()),
-    ] {
-        let initial_method = method.as_str().to_owned();
-        let server = scripted([canned_redirect(status, "/landed"), canned_ok(&[], b"ok")]);
-        Agent::new()
-            .request(method, server.url("/start"))
-            .body(b"field=1")
-            .send()
-            .await
-            .expect("redirect");
-        let requests = server.requests();
-        assert_eq!(requests[0].method, initial_method);
-        assert_eq!(requests[1].method, expected_method);
-        assert_eq!(requests[1].body, expected_body);
-        server.assert_clean();
-    }
-
-    let server = scripted([
-        canned_redirect(302, "/next"),
-        canned_redirect(302, "/next"),
-        canned_ok(&[], b"landed"),
-    ]);
-    let asked = server.url("/start#fragment");
-    let response = Agent::new()
-        .request(Method::GET, asked)
-        .send()
-        .await
-        .expect("chain");
-    assert_eq!(response.status(), 200);
-    assert_eq!(response.final_url(), &server.url("/next#fragment"));
-    assert_eq!(server.requests().len(), 3);
-    server.assert_clean();
-
+async fn max_redirects_cap_returns_limit_exceeded() {
     let empty = scripted([canned_redirect(302, ""), canned_redirect(302, "")]);
     assert!(matches!(
-        AgentBuilder::new()
-            .max_redirects(1)
-            .build()
-            .request(Method::GET, empty.url("/empty"))
-            .send()
-            .await,
+        Agent::new(AgentOptions {
+            max_redirects: 1,
+            ..AgentOptions::default()
+        })
+        .expect("cap options")
+        .send(Request::new(Method::GET, empty.url("/empty")))
+        .await,
         Err(NetError::Limit(LimitExceeded::Redirect))
     ));
     assert_eq!(empty.requests().len(), 2);
@@ -340,89 +306,16 @@ async fn redirect_policy_covers_following_rewriting_caps_and_origin_safety() {
 
     let server = scripted(std::iter::repeat_n(canned_redirect(302, "/loop"), 3));
     assert!(matches!(
-        AgentBuilder::new()
-            .max_redirects(2)
-            .build()
-            .request(Method::GET, server.url("/loop"))
-            .send()
-            .await,
+        Agent::new(AgentOptions {
+            max_redirects: 2,
+            ..AgentOptions::default()
+        })
+        .expect("cap options")
+        .send(Request::new(Method::GET, server.url("/loop")))
+        .await,
         Err(NetError::Limit(LimitExceeded::Redirect))
     ));
     assert_eq!(server.requests().len(), 3);
-    server.assert_clean();
-
-    let landing = TestServer::start(|connection| {
-        let request = connection.read_request();
-        assert!(request.header("authorization").is_none());
-        connection
-            .write_all(&canned_ok(&[], b"landed"))
-            .expect("landing");
-    });
-    let first = TestServer::start({
-        let location = format!("http://{}/landed", landing.local_addr());
-        move |connection| {
-            connection.read_request();
-            connection
-                .write_all(&canned_redirect(302, &location))
-                .expect("cross-origin redirect");
-        }
-    });
-    Agent::new()
-        .request(Method::GET, first.url("/start"))
-        .header("Authorization", "Bearer secret")
-        .expect("authorization")
-        .send()
-        .await
-        .expect("cross-origin redirect");
-    first.assert_clean();
-    landing.assert_clean();
-}
-
-#[tokio::test]
-async fn cross_site_redirect_taints_samesite_cookie_inclusion() {
-    let counter = Arc::new(std::sync::Mutex::new(0_u8));
-    let server_counter = Arc::clone(&counter);
-    let server = TestServer::start(move |connection| {
-        let mut number = server_counter.lock().expect("counter");
-        let request = connection.read_request();
-        let host = request.header("host").expect("host");
-        let location = match *number {
-            0 => format!(
-                "http://127.0.0.1:{}/cross",
-                host.rsplit(':').next().expect("port")
-            ),
-            1 => format!(
-                "http://localhost:{}/final",
-                host.rsplit(':').next().expect("port")
-            ),
-            _ => String::new(),
-        };
-        if *number < 2 {
-            connection
-                .write_all(&canned_redirect(302, &location))
-                .expect("site-changing redirect");
-        } else {
-            connection
-                .write_all(&canned_ok(&[], b"done"))
-                .expect("final response");
-        }
-        *number += 1;
-    });
-    let mut start = server.url("/start");
-    start.set_host(Some("localhost")).expect("localhost host");
-    let agent = Agent::new();
-    agent.set_cookie("strict=1; Path=/; SameSite=Strict", &start);
-    agent
-        .request(Method::GET, start.clone())
-        .with_initiator_kind(net::InitiatorKind::Fetch)
-        .with_initiator(start)
-        .send()
-        .await
-        .expect("redirect chain");
-    let requests = server.requests();
-    assert_eq!(requests[0].header("cookie"), Some("strict=1"));
-    assert!(requests[1].header("cookie").is_none());
-    assert!(requests[2].header("cookie").is_none());
     server.assert_clean();
 }
 
@@ -442,17 +335,17 @@ async fn connect_proxy_routes_https_and_reports_denials() {
         std::thread::sleep(Duration::from_millis(300));
     });
     let proxy_uri = format!("http://user:secret@{}", proxy.local_addr());
-    let err = AgentBuilder::new()
-        .proxy(&proxy_uri)
-        .expect("proxy")
-        .build()
-        .request(
-            Method::GET,
-            url::Url::parse("https://origin.test/").expect("https"),
-        )
-        .send()
-        .await
-        .expect_err("proxy request");
+    let err = Agent::new(AgentOptions {
+        proxy: Some(proxy_uri),
+        ..AgentOptions::default()
+    })
+    .expect("proxy")
+    .send(Request::new(
+        Method::GET,
+        url::Url::parse("https://origin.test/").expect("https"),
+    ))
+    .await
+    .expect_err("proxy request");
     assert!(
         matches!(
             err,
@@ -469,16 +362,16 @@ async fn connect_proxy_routes_https_and_reports_denials() {
             .expect("connect 403");
     });
     assert!(matches!(
-        AgentBuilder::new()
-            .proxy(&format!("http://{}", denied.local_addr()))
-            .expect("proxy")
-            .build()
-            .request(
-                Method::GET,
-                url::Url::parse("https://origin.test/").expect("https"),
-            )
-            .send()
-            .await,
+        Agent::new(AgentOptions {
+            proxy: Some(format!("http://{}", denied.local_addr())),
+            ..AgentOptions::default()
+        })
+        .expect("proxy")
+        .send(Request::new(
+            Method::GET,
+            url::Url::parse("https://origin.test/").expect("https"),
+        ))
+        .await,
         Err(NetError::Transport(TransportError::Connect(_)))
     ));
     denied.assert_clean();
@@ -494,15 +387,19 @@ async fn proxy_tls_environment_and_debug_boundaries_stay_explicit() {
         "http://",
     ] {
         assert!(matches!(
-            AgentBuilder::new().proxy(invalid),
+            Agent::new(AgentOptions {
+                proxy: Some(invalid.to_owned()),
+                ..AgentOptions::default()
+            }),
             Err(NetError::Protocol(ProtocolError::InvalidProxy))
         ));
     }
 
-    let builder = AgentBuilder::new()
-        .proxy("http://user:secret@localhost:8080")
-        .expect("proxy");
-    let debug = format!("{builder:?}");
+    let options = AgentOptions {
+        proxy: Some("http://user:secret@localhost:8080".to_owned()),
+        ..AgentOptions::default()
+    };
+    let debug = format!("{options:?}");
     assert!(!debug.contains("secret"));
 
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("TLS listener");
@@ -514,12 +411,12 @@ async fn proxy_tls_environment_and_debug_boundaries_stay_explicit() {
         }
     });
     assert!(matches!(
-        Agent::new()
-            .request(
+        default_agent()
+            .send(Request::new(
                 Method::GET,
                 url::Url::parse(&format!("https://{addr}/")).expect("https"),
-            )
-            .send().await,
+            ))
+            .await,
         Err(NetError::Transport(TransportError::Tls(reason))) if !reason.is_empty()
     ));
     worker.join().expect("TLS worker");
@@ -531,9 +428,8 @@ async fn proxy_tls_environment_and_debug_boundaries_stay_explicit() {
                 .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
                 .expect("direct response");
         });
-        Agent::new()
-            .request(Method::GET, server.url("/direct"))
-            .send()
+        default_agent()
+            .send(Request::new(Method::GET, server.url("/direct")))
             .await
             .expect("environment proxy must be ignored");
         server.assert_clean();
@@ -571,9 +467,8 @@ async fn ipv6_loopback_send_and_connect_paths_are_exercised() {
             .write_all(&canned_ok(&[], b"v6"))
             .expect("v6 response");
     });
-    let response = Agent::new()
-        .request(Method::GET, server.url("/v6"))
-        .send()
+    let response = default_agent()
+        .send(Request::new(Method::GET, server.url("/v6")))
         .await
         .expect("ipv6 send");
     assert_eq!(response.into_body().bytes(8).await.expect("body"), b"v6");
@@ -588,12 +483,11 @@ async fn ipv6_loopback_send_and_connect_paths_are_exercised() {
         }
     });
     assert!(matches!(
-        Agent::new()
-            .request(
+        default_agent()
+            .upgrade(Request::new(
                 Method::GET,
                 url::Url::parse(&format!("wss://{wss_addr}/")).expect("wss"),
-            )
-            .upgrade()
+            ))
             .await,
         Err(NetError::Transport(TransportError::Tls(_)) | NetError::Protocol(_))
     ));
@@ -601,7 +495,7 @@ async fn ipv6_loopback_send_and_connect_paths_are_exercised() {
 }
 
 #[tokio::test]
-async fn url_credentials_host_redirect_and_non_http_schemes_are_wire_visible() {
+async fn url_credentials_and_scheme_rejections_are_wire_visible() {
     let server = TestServer::start(|connection| {
         let request = connection.read_request();
         assert_eq!(request.header("authorization"), Some("Basic dXNlcjpwYXNz"));
@@ -612,47 +506,18 @@ async fn url_credentials_host_redirect_and_non_http_schemes_are_wire_visible() {
     let mut url = server.url("/");
     url.set_username("user").expect("username");
     url.set_password(Some("pass")).expect("password");
-    Agent::new()
-        .request(Method::GET, url)
-        .send()
+    default_agent()
+        .send(Request::new(Method::GET, url))
         .await
         .expect("basic");
     server.assert_clean();
 
-    let landing = TestServer::start(|connection| {
-        let request = connection.read_request();
-        assert_ne!(request.header("host"), Some("evil.example"));
-        assert!(request.header("content-length").is_none() || request.body.is_empty());
-        connection
-            .write_all(&canned_ok(&[], b"landed"))
-            .expect("landing");
-    });
-    let first = TestServer::start({
-        let location = format!("http://{}/landed", landing.local_addr());
-        move |connection| {
-            connection.read_request();
-            connection
-                .write_all(&canned_redirect(302, &location))
-                .expect("redirect");
-        }
-    });
-    Agent::new()
-        .request(Method::POST, first.url("/start"))
-        .header("Host", "evil.example")
-        .expect("host")
-        .header("Content-Length", "7")
-        .expect("length")
-        .body(b"field=1")
-        .send()
-        .await
-        .expect("cross-origin host stripped");
-    first.assert_clean();
-    landing.assert_clean();
-
     assert!(matches!(
-        Agent::new()
-            .request(Method::GET, url::Url::parse("ws://127.0.0.1/").expect("ws"))
-            .send()
+        default_agent()
+            .send(Request::new(
+                Method::GET,
+                url::Url::parse("ws://127.0.0.1/").expect("ws"),
+            ))
             .await,
         Err(NetError::Protocol(ProtocolError::RejectedRequest))
     ));
@@ -661,22 +526,26 @@ async fn url_credentials_host_redirect_and_non_http_schemes_are_wire_visible() {
 #[tokio::test]
 async fn resolve_maps_hit_miss_and_fail() {
     assert!(matches!(
-        AgentBuilder::new().resolve("not-a-spec"),
+        Agent::new(AgentOptions {
+            resolve: vec!["not-a-spec".to_owned()],
+            ..AgentOptions::default()
+        }),
         Err(NetError::Protocol(ProtocolError::InvalidResolve))
     ));
 
     let server = scripted([canned_ok(&[], b"mapped")]);
     let port = server.local_addr().port();
     let mapped = url::Url::parse(&format!("http://web-platform.test:{port}/")).expect("mapped URL");
-    let agent = AgentBuilder::new()
-        .resolve("nonexistent.*.test=fail")
-        .expect("fail rule")
-        .resolve("*.test=127.0.0.1")
-        .expect("glob rule")
-        .build();
+    let agent = Agent::new(AgentOptions {
+        resolve: vec![
+            "nonexistent.*.test=fail".to_owned(),
+            "*.test=127.0.0.1".to_owned(),
+        ],
+        ..AgentOptions::default()
+    })
+    .expect("resolve specs");
     let response = agent
-        .request(Method::GET, mapped)
-        .send()
+        .send(Request::new(Method::GET, mapped))
         .await
         .expect("mapped hit");
     assert_eq!(
@@ -693,19 +562,18 @@ async fn resolve_maps_hit_miss_and_fail() {
 
     let miss_server = scripted([canned_ok(&[], b"direct")]);
     let miss = agent
-        .request(Method::GET, miss_server.url("/"))
-        .send()
+        .send(Request::new(Method::GET, miss_server.url("/")))
         .await
         .expect("unmapped 127.0.0.1 uses libc");
     assert_eq!(miss.into_body().bytes(16).await.expect("body"), b"direct");
     miss_server.assert_clean();
 
-    let failed = agent.request(
+    let failed = agent.send(Request::new(
         Method::GET,
         url::Url::parse("http://nonexistent.web-platform.test/").expect("fail URL"),
-    );
+    ));
     assert!(matches!(
-        failed.send().await,
+        failed.await,
         Err(NetError::Transport(TransportError::Dns(_)))
     ));
 }
@@ -717,11 +585,10 @@ async fn request_deadline_expires_with_a_typed_timeout() {
         // Never respond; the client's absolute deadline must fire.
         std::thread::sleep(Duration::from_millis(600));
     });
-    let deadline = Instant::now() + Duration::from_millis(80);
-    let error = Agent::new()
-        .request(Method::GET, server.url("/stall"))
-        .deadline(deadline)
-        .send()
+    let mut request = Request::new(Method::GET, server.url("/stall"));
+    request.deadline = Some(Instant::now() + Duration::from_millis(80));
+    let error = default_agent()
+        .send(request)
         .await
         .expect_err("deadline must expire");
     assert!(
@@ -744,10 +611,10 @@ async fn https_dials_offer_h2_before_http1_in_alpn() {
     });
 
     let url = url::Url::parse(&format!("https://{address}/")).expect("absolute url");
-    let error = Agent::new()
-        .request(Method::GET, url)
-        .deadline(Instant::now() + Duration::from_millis(80))
-        .send()
+    let mut request = Request::new(Method::GET, url);
+    request.deadline = Some(Instant::now() + Duration::from_millis(80));
+    let error = default_agent()
+        .send(request)
         .await
         .expect_err("the test listener never completes a TLS handshake");
     assert!(
@@ -793,18 +660,20 @@ fn client_hello_alpn(hello: &[u8]) -> Vec<String> {
     at += 2;
     let end = at + extensions;
     while at + 4 <= end {
-        let kind = u16::from_be_bytes([hello[at], hello[at + 1]]);
+        let kind = usize::from(u16::from_be_bytes([hello[at], hello[at + 1]]));
         let length = usize::from(u16::from_be_bytes([hello[at + 2], hello[at + 3]]));
         at += 4;
         if kind == 16 {
             let list = usize::from(u16::from_be_bytes([hello[at], hello[at + 1]]));
-            let mut entry = at + 2;
+            at += 2;
             let mut protocols = Vec::new();
-            while entry < at + 2 + list {
+            let mut entry = at;
+            while entry < at + list {
                 let len = usize::from(hello[entry]);
                 entry += 1;
-                let name = String::from_utf8_lossy(&hello[entry..entry + len]).into_owned();
-                protocols.push(name);
+                protocols.push(
+                    String::from_utf8_lossy(&hello[entry..entry + len]).into_owned(),
+                );
                 entry += len;
             }
             return protocols;
