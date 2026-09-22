@@ -286,8 +286,10 @@ async fn request_shaping_custom_method_fragments_and_rejections_are_wire_visible
     server.assert_clean();
 }
 
-/// Our redirect cap and its typed error. Redirect *policy* (method rewriting,
-/// header stripping, fragment handling) is WPT's `fetch/api/redirect/` suite.
+/// Our redirect cap and its typed error. Redirect policy for 301-303 and
+/// 307 (rewrites, following) is WPT's `fetch/api/redirect/`; the 308 row,
+/// `Location` fragments, and forbidden-header stripping on origin change
+/// have no WPT coverage and are asserted below.
 #[tokio::test]
 async fn max_redirects_cap_returns_limit_exceeded() {
     let empty = scripted([canned_redirect(302, ""), canned_redirect(302, "")]);
@@ -317,6 +319,76 @@ async fn max_redirects_cap_returns_limit_exceeded() {
     ));
     assert_eq!(server.requests().len(), 3);
     server.assert_clean();
+}
+
+/// WPT's `fetch/api/redirect/` never sends 308 (`redirect-method.any.js`
+/// covers 301-303 and 307 only) and never puts a fragment in `Location`.
+#[tokio::test]
+async fn redirect_308_keeps_post_and_fragments_survive_location() {
+    let server = scripted([canned_redirect(308, "/landed"), canned_ok(&[], b"ok")]);
+    let mut post = Request::new(Method::POST, server.url("/start"));
+    post.body = Some(b"field=1".to_vec());
+    default_agent().send(post).await.expect("308");
+    let requests = server.requests();
+    assert_eq!(requests[0].method, "POST");
+    assert_eq!(requests[1].method, "POST");
+    assert_eq!(requests[1].body, b"field=1");
+    server.assert_clean();
+
+    let server = scripted([
+        canned_redirect(302, "/next"),
+        canned_redirect(302, "/next"),
+        canned_ok(&[], b"landed"),
+    ]);
+    let asked = server.url("/start#fragment");
+    let response = default_agent()
+        .send(Request::new(Method::GET, asked))
+        .await
+        .expect("chain");
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.final_url(), &server.url("/next#fragment"));
+    assert_eq!(server.requests().len(), 3);
+    server.assert_clean();
+}
+
+/// On origin change the redirect loop drops caller-set forbidden headers
+/// (`Host`, `Content-Length`). JS cannot set forbidden header names
+/// (<https://fetch.spec.whatwg.org/#forbidden-header-name>), so WPT cannot
+/// observe this wire behavior.
+#[tokio::test]
+async fn cross_origin_redirect_drops_caller_forbidden_headers() {
+    let landing = TestServer::start(|connection| {
+        let request = connection.read_request();
+        assert_ne!(request.header("host"), Some("evil.example"));
+        assert!(
+            request.header("content-length").is_none() || request.body.is_empty()
+        );
+        connection
+            .write_all(&canned_ok(&[], b"landed"))
+            .expect("landing");
+    });
+    let first = TestServer::start({
+        let location = format!("http://{}/landed", landing.local_addr());
+        move |connection| {
+            connection.read_request();
+            connection
+                .write_all(&canned_redirect(302, &location))
+                .expect("redirect");
+        }
+    });
+    let mut request = Request::new(Method::POST, first.url("/start"));
+    request.headers.insert("Host", "evil.example").expect("host");
+    request
+        .headers
+        .insert("Content-Length", "7")
+        .expect("length");
+    request.body = Some(b"field=1".to_vec());
+    default_agent()
+        .send(request)
+        .await
+        .expect("cross-origin host stripped");
+    first.assert_clean();
+    landing.assert_clean();
 }
 
 #[tokio::test]
@@ -530,7 +602,8 @@ async fn resolve_maps_hit_miss_and_fail() {
             resolve: vec!["not-a-spec".to_owned()],
             ..AgentOptions::default()
         }),
-        Err(NetError::Protocol(ProtocolError::InvalidResolve))
+        Err(NetError::Protocol(ProtocolError::InvalidResolve(spec)))
+            if spec.as_ref() == "not-a-spec"
     ));
 
     let server = scripted([canned_ok(&[], b"mapped")]);

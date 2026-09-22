@@ -115,7 +115,7 @@ fn profile_log_file(profile: &Profile) -> Option<PathBuf> {
     )
 }
 
-/// Raw `--resolve` specs and `--tls-ca` PEM bytes for [`Agent::new`], which
+/// Raw `--resolve` specs and `--tls-ca` PEM bytes for [`browser::Agent::new`], which
 /// validates them when the browser opens. Only file-read errors fail here.
 fn resolve_config(specs: &[String], tls_ca: &[PathBuf]) -> Result<AgentOptions, String> {
     let mut options = AgentOptions {
@@ -154,17 +154,34 @@ fn run_browser_process(
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             logging::error!(target: target, "{error}");
-            ExitCode::from(1)
+            // Flag *content* is validated when the profile opens (deferred to
+            // `Agent::new`), so it exits like a usage error. Nothing else in
+            // the workspace produces `InvalidInput`.
+            if error.kind() == io::ErrorKind::InvalidInput {
+                ExitCode::from(2)
+            } else {
+                ExitCode::from(1)
+            }
         }
     }
 }
 
 async fn serve_webdriver(port: u16, options: AgentOptions, profile: &Profile) -> io::Result<()> {
     let data_home = daemon::data_home()?;
+    // Open before binding: option content is validated here, so a bad value
+    // surfaces as a usage error before the port is taken.
+    let browser = Browser::open_in_with_network(&data_home, profile, options).map_err(|error| {
+        if error.kind() == io::ErrorKind::InvalidInput {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("invalid network option (--resolve/--tls-ca): {error}"),
+            )
+        } else {
+            io::Error::other(format!("profile failed: {error}"))
+        }
+    })?;
     let listener = TcpListener::bind(("127.0.0.1", port))
         .map_err(|error| io::Error::new(error.kind(), format!("bind failed: {error}")))?;
-    let browser = Browser::open_in_with_network(&data_home, profile, options)
-        .map_err(|error| io::Error::other(format!("profile failed: {error}")))?;
     let result = webdriver::serve(&listener, &browser.handle()).await;
     result.and(browser.handle().close().await)
 }

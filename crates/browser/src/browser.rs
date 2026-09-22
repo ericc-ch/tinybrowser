@@ -110,13 +110,17 @@ impl Browser {
     ///
     /// # Errors
     ///
-    /// The profile directory cannot be created, read, or exclusively locked.
+    /// The profile directory cannot be created, read, or exclusively locked;
+    /// stored profile data cannot be loaded; or the caller is not running
+    /// inside the executable-owned Tokio runtime.
     pub fn open_in(data_home: &Path, profile: &Profile) -> io::Result<Self> {
         Self::open_in_with_network(data_home, profile, net::AgentOptions::default())
     }
 
     /// Opens a browser on `profile` with cookies under `data_home`, renderer
-    /// processes, and `options`' transport settings.
+    /// processes, and `options`' transport settings. Browser defaults fill
+    /// only where `options` leaves a field `None`: caller wins on `user_agent`
+    /// and `timeout_per_call`.
     ///
     /// # Errors
     ///

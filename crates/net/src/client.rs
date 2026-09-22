@@ -34,7 +34,8 @@ pub struct AgentOptions {
     /// exact host or a `*` glob; `ADDR` is an IPv4 literal or `fail`.
     pub resolve: Vec<String>,
     /// PEM-encoded certificate authorities to trust in addition to the
-    /// platform's, e.g. a private test CA. Repeatable.
+    /// platform's, e.g. a private test CA. Repeatable. A bad entry is
+    /// reported as `CA #n`, counting from 1.
     pub tls_cas: Vec<Vec<u8>>,
 }
 
@@ -104,11 +105,14 @@ impl AgentOptions {
             host_map = host_map.with_spec(spec)?;
         }
         let mut tls_cas = Vec::with_capacity(self.tls_cas.len());
-        for pem in &self.tls_cas {
-            tls_cas.push(
-                native_tls::Certificate::from_pem(pem)
-                    .map_err(|error| NetError::Transport(TransportError::Tls(error.to_string().into())))?,
-            );
+        for (index, pem) in self.tls_cas.iter().enumerate() {
+            tls_cas.push(native_tls::Certificate::from_pem(pem).map_err(|error| {
+                // 1-based: it matches the Nth `tls_cas` (or `--tls-ca`) entry,
+                // so the caller can point at the bad file.
+                NetError::Transport(TransportError::Tls(
+                    format!("CA #{}: {error}", index + 1).into(),
+                ))
+            })?);
         }
         Ok(AgentParts {
             user_agent: self.user_agent,

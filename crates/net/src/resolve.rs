@@ -77,16 +77,16 @@ impl HostMap {
 
 fn parse_rule(spec: &str) -> Result<Rule, NetError> {
     let Some((pattern, addr)) = spec.split_once('=') else {
-        return Err(invalid_resolve());
+        return Err(invalid_resolve(spec));
     };
     if pattern.is_empty() || addr.is_empty() {
-        return Err(invalid_resolve());
+        return Err(invalid_resolve(spec));
     }
     let pattern = pattern.to_ascii_lowercase().into_boxed_str();
     let target = if addr.eq_ignore_ascii_case("fail") {
         Target::Fail
     } else {
-        let ip = addr.parse::<Ipv4Addr>().map_err(|_| invalid_resolve())?;
+        let ip = addr.parse::<Ipv4Addr>().map_err(|_| invalid_resolve(spec))?;
         Target::Addr(ip)
     };
     Ok(Rule { pattern, target })
@@ -115,6 +115,8 @@ fn glob_match(pattern: &str, host: &str) -> bool {
     true
 }
 
-fn invalid_resolve() -> NetError {
-    NetError::Protocol(ProtocolError::InvalidResolve)
+fn invalid_resolve(spec: &str) -> NetError {
+    NetError::Protocol(ProtocolError::InvalidResolve(
+        spec.to_owned().into_boxed_str(),
+    ))
 }

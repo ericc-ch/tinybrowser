@@ -50,8 +50,10 @@ impl NetworkContext {
         if options.timeout_per_call.is_none() {
             options.timeout_per_call = Some(PAGE_FETCH_TIMEOUT);
         }
+        // `InvalidInput` marks deferred flag validation; the `NetError` stays
+        // in the chain so callers can name the offending option.
         let agent = Agent::new(options)
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
         Ok(Self {
             agent,
             permits: NetworkPermits::new(),
