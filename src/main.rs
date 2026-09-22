@@ -14,7 +14,7 @@ use std::net::TcpListener;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use browser::{AgentBuilder, Browser, Profile};
+use browser::{AgentOptions, Browser, Profile};
 use cli::{Cli, Command};
 use logging::{Config, Level, Logger};
 
@@ -62,11 +62,11 @@ fn run(cli: &Cli) -> ExitCode {
             resolve,
             tls_ca,
         }) => {
-            let builder = match resolve_builder(resolve, tls_ca) {
-                Ok(builder) => builder,
+            let options = match resolve_config(resolve, tls_ca) {
+                Ok(options) => options,
                 Err(error) => return usage_error(&error),
             };
-            run_browser_process("webdriver", serve_webdriver(*port, builder, profile))
+            run_browser_process("webdriver", serve_webdriver(*port, options, profile))
         }
         None => {
             print!("{}", cli::HELP);
@@ -115,19 +115,19 @@ fn profile_log_file(profile: &Profile) -> Option<PathBuf> {
     )
 }
 
-fn resolve_builder(specs: &[String], tls_ca: &[PathBuf]) -> Result<AgentBuilder, String> {
-    let mut builder = AgentBuilder::new();
-    for spec in specs {
-        builder = builder.resolve(spec).map_err(|error| error.to_string())?;
-    }
+/// Raw `--resolve` specs and `--tls-ca` PEM bytes for [`Agent::new`], which
+/// validates them when the browser opens. Only file-read errors fail here.
+fn resolve_config(specs: &[String], tls_ca: &[PathBuf]) -> Result<AgentOptions, String> {
+    let mut options = AgentOptions {
+        resolve: specs.to_vec(),
+        ..AgentOptions::default()
+    };
     for path in tls_ca {
         let pem =
             std::fs::read(path).map_err(|error| format!("--tls-ca {}: {error}", path.display()))?;
-        builder = builder
-            .tls_ca_pem(&pem)
-            .map_err(|error| format!("--tls-ca {}: {error}", path.display()))?;
+        options.tls_cas.push(pem);
     }
-    Ok(builder)
+    Ok(options)
 }
 
 fn usage_error(message: &str) -> ExitCode {
@@ -159,11 +159,11 @@ fn run_browser_process(
     }
 }
 
-async fn serve_webdriver(port: u16, builder: AgentBuilder, profile: &Profile) -> io::Result<()> {
+async fn serve_webdriver(port: u16, options: AgentOptions, profile: &Profile) -> io::Result<()> {
     let data_home = daemon::data_home()?;
     let listener = TcpListener::bind(("127.0.0.1", port))
         .map_err(|error| io::Error::new(error.kind(), format!("bind failed: {error}")))?;
-    let browser = Browser::open_in_with_network(&data_home, profile, builder)
+    let browser = Browser::open_in_with_network(&data_home, profile, options)
         .map_err(|error| io::Error::other(format!("profile failed: {error}")))?;
     let result = webdriver::serve(&listener, &browser.handle()).await;
     result.and(browser.handle().close().await)

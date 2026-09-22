@@ -27,7 +27,7 @@ mod wire;
 
 pub use actor::{TabEvent, TabHandle, TabId};
 pub use browser::{Browser, BrowserError, BrowserHandle};
-pub use net::{Agent, AgentBuilder, CookieRecord, CookieSameSite};
+pub use net::{Agent, AgentOptions, CookieRecord, CookieSameSite};
 pub use profile::{Profile, ProfileError, ProfileName};
 pub use renderer::{
     FrameId, RemoteValue, ResourceLimit, ScreenshotClip, ScreenshotRequest, ScriptFailure, TabError,

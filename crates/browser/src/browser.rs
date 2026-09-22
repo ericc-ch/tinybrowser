@@ -112,23 +112,24 @@ impl Browser {
     ///
     /// The profile directory cannot be created, read, or exclusively locked.
     pub fn open_in(data_home: &Path, profile: &Profile) -> io::Result<Self> {
-        Self::open_in_with_network(data_home, profile, net::AgentBuilder::new())
+        Self::open_in_with_network(data_home, profile, net::AgentOptions::default())
     }
 
     /// Opens a browser on `profile` with cookies under `data_home`, renderer
-    /// processes, and `builder`'s transport settings.
+    /// processes, and `options`' transport settings.
     ///
     /// # Errors
     ///
     /// The profile directory cannot be created, read, or exclusively locked;
-    /// stored profile data cannot be loaded; or the caller is not running
-    /// inside the executable-owned Tokio runtime.
+    /// stored profile data cannot be loaded; the caller is not running inside
+    /// the executable-owned Tokio runtime; or `options` fail validation
+    /// (bad `--resolve` spec, proxy URI, or TLS CA).
     pub fn open_in_with_network(
         data_home: &Path,
         profile: &Profile,
-        builder: net::AgentBuilder,
+        options: net::AgentOptions,
     ) -> io::Result<Self> {
-        let context = BrowserContext::open(ProfileStore::open_in(data_home, profile)?, builder)?;
+        let context = BrowserContext::open(ProfileStore::open_in(data_home, profile)?, options)?;
         let runtime = tokio::runtime::Handle::try_current()
             .map_err(|error| io::Error::other(format!("browser runtime unavailable: {error}")))?;
         let (client, server) = exchange::local(BROWSER_COMMAND_CAPACITY);
