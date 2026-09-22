@@ -53,10 +53,6 @@ pub struct HostMap {
 }
 
 impl HostMap {
-    pub(crate) fn is_empty(&self) -> bool {
-        self.rules.is_empty()
-    }
-
     pub(crate) fn with_spec(&self, spec: &str) -> Result<Self, NetError> {
         let mut rules = (*self.rules).clone();
         rules.push(parse_rule(spec)?);

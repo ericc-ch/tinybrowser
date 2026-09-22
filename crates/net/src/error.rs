@@ -34,7 +34,7 @@ pub enum TransportError {
 /// A configured cap was exceeded.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum LimitExceeded {
-    /// Redirect hop count reached [`AgentBuilder::max_redirects`].
+    /// Redirect hop count reached [`AgentOptions::max_redirects`].
     #[error("redirect cap exceeded")]
     Redirect,
     /// Response body would exceed the caller-supplied byte cap.
@@ -62,7 +62,7 @@ pub enum ProtocolError {
     Other(Box<str>),
 }
 
-/// Failure from [`RequestBuilder::send`], [`RequestBuilder::upgrade`], or body reads.
+/// Failure from [`Agent::send`], [`Agent::upgrade`], or body reads.
 #[derive(Debug, thiserror::Error)]
 pub enum NetError {
     #[error("transport: {0}")]

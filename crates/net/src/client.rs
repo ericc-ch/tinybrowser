@@ -3,7 +3,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use crate::InitiatorKind;
 use crate::error::{LimitExceeded, NetError, ProtocolError, TimeoutKind, TransportError};
-use crate::protocol::{HeaderError, HeaderMap, Method};
+use crate::protocol::{HeaderMap, Method};
 use crate::resolve::HostMap;
 use crate::transport::{CallBudget, HttpEngine, basic_authorization, within};
 use crate::websocket::{self, WebSocket};
@@ -62,146 +62,6 @@ impl Default for AgentOptions {
             resolve: Vec::new(),
             tls_cas: Vec::new(),
         }
-    }
-}
-
-/// Builds an [`Agent`].
-///
-/// Debug output records whether a proxy is configured, not its URI or credentials.
-#[derive(Clone)]
-pub struct AgentBuilder {
-    user_agent: Option<String>,
-    timeout_global: Option<Duration>,
-    timeout_per_call: Option<Duration>,
-    max_redirects: u32,
-    proxy: Option<String>,
-    host_map: HostMap,
-    tls_cas: Vec<native_tls::Certificate>,
-}
-
-impl std::fmt::Debug for AgentBuilder {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("AgentBuilder")
-            .field("has_proxy", &self.proxy.is_some())
-            .field("timeout_global", &self.timeout_global)
-            .field("timeout_per_call", &self.timeout_per_call)
-            .field("max_redirects", &self.max_redirects)
-            .field("has_host_map", &!self.host_map.is_empty())
-            .field("extra_tls_cas", &self.tls_cas.len())
-            .finish_non_exhaustive()
-    }
-}
-
-impl Default for AgentBuilder {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl AgentBuilder {
-    /// Agent with default redirect cap 20 and no proxy, timeout, or User-Agent.
-    #[must_use]
-    pub fn new() -> Self {
-        Self {
-            user_agent: None,
-            timeout_global: None,
-            timeout_per_call: None,
-            max_redirects: DEFAULT_MAX_REDIRECTS,
-            proxy: None,
-            host_map: HostMap::default(),
-            tls_cas: Vec::new(),
-        }
-    }
-
-    /// Default `User-Agent` for requests that do not set that header themselves.
-    #[must_use]
-    pub fn user_agent(mut self, value: &str) -> Self {
-        self.user_agent = Some(value.to_owned());
-        self
-    }
-
-    /// Sets a fallback `User-Agent` while preserving an explicit caller value.
-    #[must_use]
-    pub fn default_user_agent(mut self, value: &str) -> Self {
-        if self.user_agent.is_none() {
-            self.user_agent = Some(value.to_owned());
-        }
-        self
-    }
-
-    /// Cap on the whole call, including redirects.
-    #[must_use]
-    pub fn timeout_global(mut self, timeout: Duration) -> Self {
-        self.timeout_global = Some(timeout);
-        self
-    }
-
-    /// Cap on a single hop.
-    #[must_use]
-    pub fn timeout_per_call(mut self, timeout: Duration) -> Self {
-        self.timeout_per_call = Some(timeout);
-        self
-    }
-
-    /// Maximum redirect hops. `0` returns the redirect response without following.
-    #[must_use]
-    pub fn max_redirects(mut self, max_redirects: u32) -> Self {
-        self.max_redirects = max_redirects;
-        self
-    }
-
-    /// HTTP CONNECT proxy. `authority` must be an `http://` URI with a host.
-    ///
-    /// # Errors
-    ///
-    /// [`ProtocolError::InvalidProxy`] when `authority` is not an `http://` URI with a host.
-    pub fn proxy(mut self, authority: &str) -> Result<Self, NetError> {
-        self.proxy = Some(parse_proxy(authority)?);
-        Ok(self)
-    }
-
-    /// Append a `--resolve=PATTERN=ADDR` rewrite. First match wins.
-    ///
-    /// `PATTERN` is an exact host or a `*` glob (`*.test`, `nonexistent.*.test`).
-    /// `ADDR` is an IPv4 literal or `fail` (lookup error, no libc DNS).
-    ///
-    /// # Errors
-    ///
-    /// [`ProtocolError::InvalidResolve`] when `spec` is not `PATTERN=IPv4` or
-    /// `PATTERN=fail`.
-    pub fn resolve(mut self, spec: &str) -> Result<Self, NetError> {
-        self.host_map = self.host_map.with_spec(spec)?;
-        Ok(self)
-    }
-
-    /// Trust an additional PEM-encoded certificate authority.
-    ///
-    /// Used to trust a private test CA, such as the one `wptserve` generates
-    /// for `web-platform.test`. Repeatable for more than one CA.
-    ///
-    /// # Errors
-    ///
-    /// [`NetError::Transport`] when `pem` is not a certificate.
-    pub fn tls_ca_pem(mut self, pem: &[u8]) -> Result<Self, NetError> {
-        let certificate = native_tls::Certificate::from_pem(pem)
-            .map_err(|error| NetError::Transport(TransportError::Tls(error.to_string().into())))?;
-        self.tls_cas.push(certificate);
-        Ok(self)
-    }
-
-    /// Builds an agent with a private cookie jar and the selected transport options.
-    #[must_use]
-    pub fn build(self) -> Agent {
-        AgentParts {
-            user_agent: self.user_agent,
-            timeout_global: self.timeout_global,
-            timeout_per_call: self.timeout_per_call,
-            max_redirects: self.max_redirects,
-            proxy: self.proxy,
-            host_map: self.host_map,
-            tls_cas: self.tls_cas,
-        }
-        .assemble()
     }
 }
 
@@ -308,13 +168,6 @@ impl Agent {
     /// a PEM certificate.
     pub fn new(options: AgentOptions) -> Result<Agent, NetError> {
         Ok(options.into_parts()?.assemble())
-    }
-
-    /// Starts a request. `url` must be absolute; [`Agent::send`] requires
-    /// `http`/`https`, and [`Agent::upgrade`] requires `ws`/`wss`.
-    #[must_use]
-    pub fn request(&self, method: Method, url: Url) -> RequestBuilder {
-        RequestBuilder::new(self.clone(), method, url)
     }
 
     /// Borrows the live jar, recovering from a poisoned lock.
@@ -615,112 +468,6 @@ impl Request {
             body: None,
             deadline: None,
         }
-    }
-}
-
-/// One outbound request behind the builder interface kept for the browser
-/// crate. New code should use [`Request`] with [`Agent::send`] instead.
-#[derive(Debug)]
-pub struct RequestBuilder {
-    agent: Agent,
-    method: Method,
-    url: Url,
-    headers: HeaderMap,
-    initiator_kind: InitiatorKind,
-    initiator: Option<Url>,
-    body: Option<Vec<u8>>,
-    deadline: Option<Instant>,
-}
-
-impl RequestBuilder {
-    fn new(agent: Agent, method: Method, url: Url) -> Self {
-        Self {
-            agent,
-            method,
-            url,
-            headers: HeaderMap::new(),
-            initiator_kind: InitiatorKind::default(),
-            initiator: None,
-            body: None,
-            deadline: None,
-        }
-    }
-
-    /// Appends a request header. Does not replace earlier values of the same name.
-    ///
-    /// # Errors
-    ///
-    /// [`HeaderError`] when `name` or `value` is not a valid HTTP header field.
-    pub fn header(mut self, name: &str, value: &str) -> Result<Self, HeaderError> {
-        self.headers.insert(name, value.as_bytes())?;
-        Ok(self)
-    }
-
-    /// Sets the initiator class used for `SameSite` and (later) `Sec-Fetch-*`.
-    #[must_use]
-    pub fn with_initiator_kind(mut self, initiator_kind: InitiatorKind) -> Self {
-        self.initiator_kind = initiator_kind;
-        self
-    }
-
-    /// Document URL used as the `SameSite` initiator and WebSocket `Origin`.
-    #[must_use]
-    pub fn with_initiator(mut self, initiator: Url) -> Self {
-        self.initiator = Some(initiator);
-        self
-    }
-
-    /// Request body bytes. Redirects that convert to GET drop this.
-    #[must_use]
-    pub fn body(mut self, bytes: impl Into<Vec<u8>>) -> Self {
-        self.body = Some(bytes.into());
-        self
-    }
-
-    /// Sets the absolute deadline for this call, covering every redirect hop.
-    ///
-    /// Overrides [`AgentOptions::timeout_global`] for this request. The per-call
-    /// timeout still applies hop by hop.
-    #[must_use]
-    pub fn deadline(mut self, deadline: Instant) -> Self {
-        self.deadline = Some(deadline);
-        self
-    }
-
-    /// Sends the request. Delegates to [`Agent::send`].
-    ///
-    /// # Errors
-    ///
-    /// See [`Agent::send`].
-    pub async fn send(self) -> Result<Response, NetError> {
-        let (agent, request) = self.split();
-        agent.send(request).await
-    }
-
-    /// WebSocket handshake. Delegates to [`Agent::upgrade`].
-    ///
-    /// # Errors
-    ///
-    /// See [`Agent::upgrade`].
-    pub async fn upgrade(self) -> Result<WebSocket, NetError> {
-        let (agent, request) = self.split();
-        agent.upgrade(request).await
-    }
-
-    /// Splits into the agent that sends and the data that describes the call.
-    fn split(self) -> (Agent, Request) {
-        (
-            self.agent,
-            Request {
-                method: self.method,
-                url: self.url,
-                headers: self.headers,
-                initiator_kind: self.initiator_kind,
-                initiator: self.initiator,
-                body: self.body,
-                deadline: self.deadline,
-            },
-        )
     }
 }
 
