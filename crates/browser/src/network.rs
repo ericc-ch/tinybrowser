@@ -3,10 +3,11 @@
 //! Tab coordinators receive [`TabNetworkHandle`]. They do not expose or own
 //! [`net::Agent`].
 
+use std::io;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use net::{Agent, AgentBuilder, InitiatorKind, Method};
+use net::{Agent, AgentOptions, InitiatorKind, Method, Request};
 use renderer::{DialFailure, DialOutcome, DialRequest};
 use tokio::sync::Semaphore;
 use tokio::sync::mpsc::UnboundedSender;
@@ -35,14 +36,28 @@ pub(crate) struct NetworkContext {
 }
 
 impl NetworkContext {
-    pub(crate) fn new(builder: AgentBuilder) -> Self {
-        Self {
-            agent: builder
-                .default_user_agent(crate::USER_AGENT)
-                .timeout_per_call(PAGE_FETCH_TIMEOUT)
-                .build(),
-            permits: NetworkPermits::new(),
+    /// Builds the partition network from caller `options`. Defaults fill only
+    /// where the caller left a field `None`: caller wins on `user_agent` and
+    /// `timeout_per_call`.
+    ///
+    /// # Errors
+    ///
+    /// [`Agent::new`] rejects a proxy, resolve spec, or TLS CA value.
+    pub(crate) fn new(mut options: AgentOptions) -> io::Result<Self> {
+        if options.user_agent.is_none() {
+            options.user_agent = Some(crate::USER_AGENT.to_string());
         }
+        if options.timeout_per_call.is_none() {
+            options.timeout_per_call = Some(PAGE_FETCH_TIMEOUT);
+        }
+        // `InvalidInput` marks deferred flag validation; the `NetError` stays
+        // in the chain so callers can name the offending option.
+        let agent = Agent::new(options)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+        Ok(Self {
+            agent,
+            permits: NetworkPermits::new(),
+        })
     }
 
     /// Network capability for one tab, with its own per-tab cap.
@@ -118,10 +133,6 @@ impl TabNetworkHandle {
         self.agent.set_cookie(value, url);
     }
 
-    pub(crate) fn request(&self, method: Method, url: Url) -> net::RequestBuilder {
-        self.agent.request(method, url)
-    }
-
     /// Spawns one navigation dial and returns its task handle. The caller
     /// aborts the handle to cancel the request. The completion returns on
     /// `reply` tagged with `epoch`.
@@ -147,11 +158,14 @@ impl TabNetworkHandle {
     async fn navigate(&self, url: &Url, initiator: &Url) -> Result<NavOutcome, DialFailure> {
         let deadline = Instant::now() + PAGE_FETCH_TIMEOUT;
         let permits = Self::acquire(&self.permits.navigation, deadline).await?;
-        let response = chrome_navigation_request(self.request(Method::GET, url.clone()), url)
-            .with_initiator_kind(InitiatorKind::Navigation)
-            .with_initiator(initiator.clone())
-            .deadline(deadline)
-            .send()
+        let mut request = Request::new(Method::GET, url.clone());
+        chrome_navigation_request(&mut request, url);
+        request.initiator_kind = InitiatorKind::Navigation;
+        request.initiator = Some(initiator.clone());
+        request.deadline = Some(deadline);
+        let response = self
+            .agent
+            .send(request)
             .await
             .map_err(|error| dial_failure(&error))?;
         let status = response.status();
@@ -181,12 +195,13 @@ impl TabNetworkHandle {
             let _global = Self::acquire(&self.permits.global, deadline).await?;
             let _tab = Self::acquire(&self.tab, deadline).await?;
             let url = Url::parse(&request.url).map_err(|_| DialFailure::Connect)?;
+            let mut outbound = Request::new(Method::GET, url);
+            outbound.initiator_kind = InitiatorKind::Fetch;
+            outbound.initiator = Some(initiator.clone());
+            outbound.deadline = Some(deadline);
             let response = self
-                .request(Method::GET, url)
-                .with_initiator_kind(InitiatorKind::Fetch)
-                .with_initiator(initiator.clone())
-                .deadline(deadline)
-                .send()
+                .agent
+                .send(outbound)
                 .await
                 .map_err(|error| dial_failure(&error))?;
             let status = response.status();
@@ -255,17 +270,17 @@ pub(crate) fn dial_failure(error: &net::NetError) -> DialFailure {
 /// Low-entropy UA client hints are sent only to potentially trustworthy URLs
 /// (<https://wicg.github.io/ua-client-hints/#sec-ch-ua>,
 /// <https://w3c.github.io/webappsec-secure-contexts/#is-url-trustworthy>).
-fn chrome_navigation_request(mut request: net::RequestBuilder, url: &Url) -> net::RequestBuilder {
-    request = identity_header(request, "Upgrade-Insecure-Requests", "1");
-    request = identity_header(
+fn chrome_navigation_request(request: &mut Request, url: &Url) {
+    identity_header(request, "Upgrade-Insecure-Requests", "1");
+    identity_header(
         request,
         "Accept",
         "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
     );
-    request = identity_header(request, "Sec-Fetch-Site", "none");
-    request = identity_header(request, "Sec-Fetch-Mode", "navigate");
-    request = identity_header(request, "Sec-Fetch-User", "?1");
-    request = identity_header(request, "Sec-Fetch-Dest", "document");
+    identity_header(request, "Sec-Fetch-Site", "none");
+    identity_header(request, "Sec-Fetch-Mode", "navigate");
+    identity_header(request, "Sec-Fetch-User", "?1");
+    identity_header(request, "Sec-Fetch-Dest", "document");
     if sends_default_ua_client_hints(url) {
         for (name, value) in [
             ("Sec-CH-UA", crate::SEC_CH_UA),
@@ -276,16 +291,16 @@ fn chrome_navigation_request(mut request: net::RequestBuilder, url: &Url) -> net
                 crate::SEC_CH_PREFERS_COLOR_SCHEME,
             ),
         ] {
-            request = identity_header(request, name, value);
+            identity_header(request, name, value);
         }
     }
-    request
 }
 
-fn identity_header(request: net::RequestBuilder, name: &str, value: &str) -> net::RequestBuilder {
+fn identity_header(request: &mut Request, name: &str, value: &str) {
     request
-        .header(name, value)
-        .expect("Chrome navigation identity headers are static HTTP tokens with no CTL bytes")
+        .headers
+        .insert(name, value)
+        .expect("Chrome navigation identity headers are static HTTP tokens with no CTL bytes");
 }
 
 fn sends_default_ua_client_hints(url: &Url) -> bool {

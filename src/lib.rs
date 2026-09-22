@@ -16,6 +16,6 @@
 //! ```
 
 pub use browser::{
-    AgentBuilder, Browser, BrowserError, BrowserHandle, Profile, ProfileError, ProfileName,
+    AgentOptions, Browser, BrowserError, BrowserHandle, Profile, ProfileError, ProfileName,
     RemoteValue, ScriptFailure, TabError, TabEvent, TabHandle, TabId,
 };

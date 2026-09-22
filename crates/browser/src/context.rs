@@ -3,7 +3,7 @@
 use std::io;
 use std::sync::Arc;
 
-use net::AgentBuilder;
+use net::AgentOptions;
 use url::Url;
 
 use crate::actor::TabId;
@@ -38,9 +38,9 @@ impl BrowserContext {
     ///
     /// # Errors
     ///
-    /// Stored profile data could not be read or quarantined.
-    pub(crate) fn open(store: ProfileStore, builder: AgentBuilder) -> io::Result<Self> {
-        let network = NetworkContext::new(builder);
+    /// Stored profile data or the supplied network options could not be used.
+    pub(crate) fn open(store: ProfileStore, options: AgentOptions) -> io::Result<Self> {
+        let network = NetworkContext::new(options)?;
         store.load_into(&network.agent())?;
         let local_storage = Arc::new(LocalStorage::default());
         store.load_local_storage(&local_storage)?;

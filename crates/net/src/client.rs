@@ -3,7 +3,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use crate::InitiatorKind;
 use crate::error::{LimitExceeded, NetError, ProtocolError, TimeoutKind, TransportError};
-use crate::protocol::{HeaderError, HeaderMap, Method};
+use crate::protocol::{HeaderMap, Method};
 use crate::resolve::HostMap;
 use crate::transport::{CallBudget, HttpEngine, basic_authorization, within};
 use crate::websocket::{self, WebSocket};
@@ -13,11 +13,62 @@ use url::Url;
 
 const DEFAULT_MAX_REDIRECTS: u32 = 20;
 
-/// Builds an [`Agent`].
+/// Constructor inputs for [`Agent::new`]. Every field is raw and validated at
+/// construction: `proxy` must be an `http://` URI with a host, each `resolve`
+/// entry must be `PATTERN=ADDR`, and each `tls_cas` entry must be PEM.
 ///
 /// Debug output records whether a proxy is configured, not its URI or credentials.
 #[derive(Clone)]
-pub struct AgentBuilder {
+pub struct AgentOptions {
+    /// Default `User-Agent` for requests that do not set that header themselves.
+    pub user_agent: Option<String>,
+    /// Cap on the whole call, including redirects.
+    pub timeout_global: Option<Duration>,
+    /// Cap on a single hop.
+    pub timeout_per_call: Option<Duration>,
+    /// Maximum redirect hops. `0` returns the redirect response without following.
+    pub max_redirects: u32,
+    /// HTTP CONNECT proxy authority: an `http://` URI with a host.
+    pub proxy: Option<String>,
+    /// `--resolve=PATTERN=ADDR` rewrites, first match wins. `PATTERN` is an
+    /// exact host or a `*` glob; `ADDR` is an IPv4 literal or `fail`.
+    pub resolve: Vec<String>,
+    /// PEM-encoded certificate authorities to trust in addition to the
+    /// platform's, e.g. a private test CA. Repeatable. A bad entry is
+    /// reported as `CA #n`, counting from 1.
+    pub tls_cas: Vec<Vec<u8>>,
+}
+
+impl std::fmt::Debug for AgentOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AgentOptions")
+            .field("has_proxy", &self.proxy.is_some())
+            .field("timeout_global", &self.timeout_global)
+            .field("timeout_per_call", &self.timeout_per_call)
+            .field("max_redirects", &self.max_redirects)
+            .field("has_resolve", &!self.resolve.is_empty())
+            .field("extra_tls_cas", &self.tls_cas.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl Default for AgentOptions {
+    fn default() -> Self {
+        Self {
+            user_agent: None,
+            timeout_global: None,
+            timeout_per_call: None,
+            max_redirects: DEFAULT_MAX_REDIRECTS,
+            proxy: None,
+            resolve: Vec::new(),
+            tls_cas: Vec::new(),
+        }
+    }
+}
+
+/// Validated constructor inputs: proxy, resolve map, and TLS CAs are already
+/// parsed, so assembly cannot fail.
+struct AgentParts {
     user_agent: Option<String>,
     timeout_global: Option<Duration>,
     timeout_per_call: Option<Duration>,
@@ -27,123 +78,8 @@ pub struct AgentBuilder {
     tls_cas: Vec<native_tls::Certificate>,
 }
 
-impl std::fmt::Debug for AgentBuilder {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("AgentBuilder")
-            .field("has_proxy", &self.proxy.is_some())
-            .field("timeout_global", &self.timeout_global)
-            .field("timeout_per_call", &self.timeout_per_call)
-            .field("max_redirects", &self.max_redirects)
-            .field("has_host_map", &!self.host_map.is_empty())
-            .field("extra_tls_cas", &self.tls_cas.len())
-            .finish_non_exhaustive()
-    }
-}
-
-impl Default for AgentBuilder {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl AgentBuilder {
-    /// Agent with default redirect cap 20 and no proxy, timeout, or User-Agent.
-    #[must_use]
-    pub fn new() -> Self {
-        Self {
-            user_agent: None,
-            timeout_global: None,
-            timeout_per_call: None,
-            max_redirects: DEFAULT_MAX_REDIRECTS,
-            proxy: None,
-            host_map: HostMap::default(),
-            tls_cas: Vec::new(),
-        }
-    }
-
-    /// Default `User-Agent` for requests that do not set that header themselves.
-    #[must_use]
-    pub fn user_agent(mut self, value: &str) -> Self {
-        self.user_agent = Some(value.to_owned());
-        self
-    }
-
-    /// Sets a fallback `User-Agent` while preserving an explicit caller value.
-    #[must_use]
-    pub fn default_user_agent(mut self, value: &str) -> Self {
-        if self.user_agent.is_none() {
-            self.user_agent = Some(value.to_owned());
-        }
-        self
-    }
-
-    /// Cap on the whole call, including redirects.
-    #[must_use]
-    pub fn timeout_global(mut self, timeout: Duration) -> Self {
-        self.timeout_global = Some(timeout);
-        self
-    }
-
-    /// Cap on a single hop.
-    #[must_use]
-    pub fn timeout_per_call(mut self, timeout: Duration) -> Self {
-        self.timeout_per_call = Some(timeout);
-        self
-    }
-
-    /// Maximum redirect hops. `0` returns the redirect response without following.
-    #[must_use]
-    pub fn max_redirects(mut self, max_redirects: u32) -> Self {
-        self.max_redirects = max_redirects;
-        self
-    }
-
-    /// HTTP CONNECT proxy. `authority` must be an `http://` URI with a host.
-    ///
-    /// # Errors
-    ///
-    /// [`ProtocolError::InvalidProxy`] when `authority` is not an `http://` URI with a host.
-    pub fn proxy(mut self, authority: &str) -> Result<Self, NetError> {
-        let parsed = Url::parse(authority).map_err(|_| invalid_proxy())?;
-        if parsed.scheme() != "http" || parsed.host_str().is_none() {
-            return Err(invalid_proxy());
-        }
-        self.proxy = Some(authority.to_owned());
-        Ok(self)
-    }
-
-    /// Append a `--resolve=PATTERN=ADDR` rewrite. First match wins.
-    ///
-    /// `PATTERN` is an exact host or a `*` glob (`*.test`, `nonexistent.*.test`).
-    /// `ADDR` is an IPv4 literal or `fail` (lookup error, no libc DNS).
-    ///
-    /// # Errors
-    ///
-    /// [`ProtocolError::InvalidResolve`] when `spec` is not `PATTERN=IPv4` or
-    /// `PATTERN=fail`.
-    pub fn resolve(mut self, spec: &str) -> Result<Self, NetError> {
-        self.host_map = self.host_map.with_spec(spec)?;
-        Ok(self)
-    }
-
-    /// Trust an additional PEM-encoded certificate authority.
-    ///
-    /// Used to trust a private test CA, such as the one `wptserve` generates
-    /// for `web-platform.test`. Repeatable for more than one CA.
-    ///
-    /// # Errors
-    ///
-    /// [`NetError::Transport`] when `pem` is not a certificate.
-    pub fn tls_ca_pem(mut self, pem: &[u8]) -> Result<Self, NetError> {
-        let certificate = native_tls::Certificate::from_pem(pem)
-            .map_err(|error| NetError::Transport(TransportError::Tls(error.to_string().into())))?;
-        self.tls_cas.push(certificate);
-        Ok(self)
-    }
-
-    /// Builds an agent with a private cookie jar and the selected transport options.
-    #[must_use]
-    pub fn build(self) -> Agent {
+impl AgentParts {
+    fn assemble(self) -> Agent {
         Agent {
             engine: HttpEngine::new(
                 self.timeout_global,
@@ -158,6 +94,44 @@ impl AgentBuilder {
             now: SystemTime::now,
         }
     }
+}
+
+impl AgentOptions {
+    /// Parses every raw field, reporting the first invalid value.
+    fn into_parts(self) -> Result<AgentParts, NetError> {
+        let proxy = self.proxy.as_deref().map(parse_proxy).transpose()?;
+        let mut host_map = HostMap::default();
+        for spec in &self.resolve {
+            host_map = host_map.with_spec(spec)?;
+        }
+        let mut tls_cas = Vec::with_capacity(self.tls_cas.len());
+        for (index, pem) in self.tls_cas.iter().enumerate() {
+            tls_cas.push(native_tls::Certificate::from_pem(pem).map_err(|error| {
+                // 1-based: it matches the Nth `tls_cas` (or `--tls-ca`) entry,
+                // so the caller can point at the bad file.
+                NetError::Transport(TransportError::Tls(
+                    format!("CA #{}: {error}", index + 1).into(),
+                ))
+            })?);
+        }
+        Ok(AgentParts {
+            user_agent: self.user_agent,
+            timeout_global: self.timeout_global,
+            timeout_per_call: self.timeout_per_call,
+            max_redirects: self.max_redirects,
+            proxy,
+            host_map,
+            tls_cas,
+        })
+    }
+}
+
+fn parse_proxy(authority: &str) -> Result<String, NetError> {
+    let parsed = Url::parse(authority).map_err(|_| invalid_proxy())?;
+    if parsed.scheme() != "http" || parsed.host_str().is_none() {
+        return Err(invalid_proxy());
+    }
+    Ok(authority.to_owned())
 }
 
 fn invalid_proxy() -> NetError {
@@ -187,17 +161,17 @@ impl std::fmt::Debug for Agent {
 }
 
 impl Agent {
-    /// Agent with default builder settings.
-    #[must_use]
-    pub fn new() -> Self {
-        AgentBuilder::new().build()
-    }
-
-    /// Starts a request. `url` must be absolute; [`RequestBuilder::send`] requires
-    /// `http`/`https`, and [`RequestBuilder::upgrade`] requires `ws`/`wss`.
-    #[must_use]
-    pub fn request(&self, method: Method, url: Url) -> RequestBuilder {
-        RequestBuilder::new(self.clone(), method, url)
+    /// Builds an agent from `options`, the only constructor. The raw `proxy`,
+    /// `resolve`, and `tls_cas` values are validated here before assembly.
+    ///
+    /// # Errors
+    ///
+    /// [`ProtocolError::InvalidProxy`] when `proxy` is not an `http://` URI with
+    /// a host, [`ProtocolError::InvalidResolve`] when a `resolve` entry is not
+    /// `PATTERN=ADDR`, or [`NetError::Transport`] when a `tls_cas` entry is not
+    /// a PEM certificate.
+    pub fn new(options: AgentOptions) -> Result<Agent, NetError> {
+        Ok(options.into_parts()?.assemble())
     }
 
     /// Borrows the live jar, recovering from a poisoned lock.
@@ -333,83 +307,8 @@ impl Agent {
             );
         }
     }
-}
 
-impl Default for Agent {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-/// One outbound request. Default [`InitiatorKind`] is [`InitiatorKind::Navigation`].
-#[derive(Debug)]
-pub struct RequestBuilder {
-    agent: Agent,
-    method: Method,
-    url: Url,
-    headers: HeaderMap,
-    initiator_kind: InitiatorKind,
-    initiator: Option<Url>,
-    body: Option<Vec<u8>>,
-    deadline: Option<Instant>,
-}
-
-impl RequestBuilder {
-    fn new(agent: Agent, method: Method, url: Url) -> Self {
-        Self {
-            agent,
-            method,
-            url,
-            headers: HeaderMap::new(),
-            initiator_kind: InitiatorKind::default(),
-            initiator: None,
-            body: None,
-            deadline: None,
-        }
-    }
-
-    /// Appends a request header. Does not replace earlier values of the same name.
-    ///
-    /// # Errors
-    ///
-    /// [`HeaderError`] when `name` or `value` is not a valid HTTP header field.
-    pub fn header(mut self, name: &str, value: &str) -> Result<Self, HeaderError> {
-        self.headers.insert(name, value.as_bytes())?;
-        Ok(self)
-    }
-
-    /// Sets the initiator class used for `SameSite` and (later) `Sec-Fetch-*`.
-    #[must_use]
-    pub fn with_initiator_kind(mut self, initiator_kind: InitiatorKind) -> Self {
-        self.initiator_kind = initiator_kind;
-        self
-    }
-
-    /// Document URL used as the `SameSite` initiator and WebSocket `Origin`.
-    #[must_use]
-    pub fn with_initiator(mut self, initiator: Url) -> Self {
-        self.initiator = Some(initiator);
-        self
-    }
-
-    /// Request body bytes. Redirects that convert to GET drop this.
-    #[must_use]
-    pub fn body(mut self, bytes: impl Into<Vec<u8>>) -> Self {
-        self.body = Some(bytes.into());
-        self
-    }
-
-    /// Sets the absolute deadline for this call, covering every redirect hop.
-    ///
-    /// Overrides [`AgentBuilder::timeout_global`] for this request. The per-call
-    /// timeout still applies hop by hop.
-    #[must_use]
-    pub fn deadline(mut self, deadline: Instant) -> Self {
-        self.deadline = Some(deadline);
-        self
-    }
-
-    /// Sends the request and follows HTTP redirects per
+    /// Sends `request` and follows HTTP redirects per
     /// [HTTP redirect fetch](https://fetch.spec.whatwg.org/#http-redirect-fetch).
     ///
     /// Status codes are response data, not errors. The URL must be `http` or `https`.
@@ -419,22 +318,21 @@ impl RequestBuilder {
     /// [`NetError::Protocol`] for a non-`http`/`https` URL, a rejected request, or an
     /// unusable `Location`. [`NetError::Limit`] when the redirect cap is exceeded.
     /// [`NetError::Transport`] when a hop fails.
-    pub async fn send(self) -> Result<Response, NetError> {
-        if !matches!(self.url.scheme(), "http" | "https") {
+    pub async fn send(&self, request: Request) -> Result<Response, NetError> {
+        if !matches!(request.url.scheme(), "http" | "https") {
             return Err(NetError::Protocol(ProtocolError::RejectedRequest));
         }
-        let mut method = self.method;
-        let mut url = self.url;
-        let mut headers = self.headers;
-        let mut body = self.body;
+        let mut method = request.method;
+        let mut url = request.url;
+        let mut headers = request.headers;
+        let mut body = request.body;
         let mut followed = 0u32;
-        let agent = self.agent;
-        let initiator_kind = self.initiator_kind;
-        let initiator = self.initiator;
+        let initiator_kind = request.initiator_kind;
+        let initiator = request.initiator;
         let mut cross_site_redirect = false;
         let started = Instant::now();
-        let mut budget = agent.engine.budget_at(started);
-        if let Some(deadline) = self.deadline {
+        let mut budget = self.engine.budget_at(started);
+        if let Some(deadline) = request.deadline {
             budget.global = Some(deadline);
         }
 
@@ -444,11 +342,11 @@ impl RequestBuilder {
                     budget.timeout_kind(TimeoutKind::Global),
                 )));
             }
-            budget = budget.with_hop_start(agent.engine.timeout_per_call, Instant::now());
+            budget = budget.with_hop_start(self.engine.timeout_per_call, Instant::now());
             let mut wire = url.clone();
             wire.set_fragment(None);
             let mut hop_headers = headers.clone();
-            agent.prepare_outbound(
+            self.prepare_outbound(
                 &mut hop_headers,
                 &url,
                 initiator_kind,
@@ -457,13 +355,13 @@ impl RequestBuilder {
                 cross_site_redirect,
             );
             apply_url_credentials(&mut hop_headers, &url);
-            let (status, response_headers, reader) = agent
+            let (status, response_headers, reader) = self
                 .engine
                 .send(&method, &wire, &hop_headers, body.as_deref(), budget)
                 .await?;
             let response =
                 Response::from_parts(status, response_headers, reader, url.clone(), budget);
-            agent.store_set_cookie_lines(
+            self.store_set_cookie_lines(
                 &url,
                 initiator_kind,
                 &method,
@@ -479,10 +377,10 @@ impl RequestBuilder {
                 return Ok(response);
             };
 
-            if agent.max_redirects == 0 {
+            if self.max_redirects == 0 {
                 return Ok(response);
             }
-            if followed == agent.max_redirects {
+            if followed == self.max_redirects {
                 return Err(NetError::Limit(LimitExceeded::Redirect));
             }
 
@@ -502,36 +400,79 @@ impl RequestBuilder {
         }
     }
 
-    /// WebSocket handshake. The URL must be `ws` or `wss`.
+    /// WebSocket handshake for `request`. The URL must be `ws` or `wss`.
     ///
     /// # Errors
     ///
     /// [`NetError::Protocol`] for a non-WebSocket URL or a failed handshake.
     /// [`NetError::Transport`] when the dial or TLS handshake fails.
-    pub async fn upgrade(self) -> Result<WebSocket, NetError> {
-        if !matches!(self.url.scheme(), "ws" | "wss") {
+    pub async fn upgrade(&self, request: Request) -> Result<WebSocket, NetError> {
+        if !matches!(request.url.scheme(), "ws" | "wss") {
             return Err(NetError::Protocol(ProtocolError::RejectedRequest));
         }
         let method = Method::GET;
         let initiator_kind = InitiatorKind::WsHandshake;
-        let mut headers = self.headers;
-        self.agent.prepare_outbound(
+        let mut headers = request.headers;
+        self.prepare_outbound(
             &mut headers,
-            &self.url,
+            &request.url,
             initiator_kind,
             &method,
-            self.initiator.as_ref(),
+            request.initiator.as_ref(),
             false,
         );
         websocket::connect(
-            &self.agent,
-            &self.url,
+            self,
+            &request.url,
             &headers,
             initiator_kind,
             &method,
-            self.initiator.as_ref(),
+            request.initiator.as_ref(),
+            request.deadline,
         )
         .await
+    }
+}
+
+/// One outbound request as plain data. Set fields directly, then hand it to
+/// [`Agent::send`] (`http`/`https`) or [`Agent::upgrade`] (`ws`/`wss`).
+///
+/// Default [`InitiatorKind`] is [`InitiatorKind::Navigation`].
+#[derive(Debug)]
+pub struct Request {
+    /// Request method.
+    pub method: Method,
+    /// Absolute URL.
+    pub url: Url,
+    /// Outbound headers. [`HeaderMap::insert`] appends values with the same
+    /// name (RFC 9110 §5.2); call [`HeaderMap::remove`] first to replace.
+    pub headers: HeaderMap,
+    /// Initiator class used for `SameSite` and (later) `Sec-Fetch-*`.
+    pub initiator_kind: InitiatorKind,
+    /// Document URL used as the `SameSite` initiator and WebSocket `Origin`.
+    pub initiator: Option<Url>,
+    /// Request body bytes. Redirects that convert to GET drop this.
+    pub body: Option<Vec<u8>>,
+    /// Absolute deadline for this call, covering every redirect hop.
+    /// Overrides [`AgentOptions::timeout_global`]; the per-call timeout still
+    /// applies hop by hop.
+    pub deadline: Option<Instant>,
+}
+
+impl Request {
+    /// A request for `method` and absolute `url` with no headers, body,
+    /// initiator, or deadline.
+    #[must_use]
+    pub fn new(method: Method, url: Url) -> Self {
+        Self {
+            method,
+            url,
+            headers: HeaderMap::new(),
+            initiator_kind: InitiatorKind::default(),
+            initiator: None,
+            body: None,
+            deadline: None,
+        }
     }
 }
 

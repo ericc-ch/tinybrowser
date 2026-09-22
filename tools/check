@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
-# Workspace checks: clippy, embedded JS syntax, Miri, Valgrind.
+# Workspace checks: clippy, embedded JS syntax, rustdoc, Miri, Valgrind.
 #
 #   clippy    stable shell. Workspace lints, then `node --check` on JavaScript
-#            `include_str!`'d into the renderer. Always run this.
+#            `include_str!`'d into the renderer, then `cargo doc --no-deps`
+#            (intra-doc link lints are denied workspace-wide, so a bare or
+#            stale path fails here instead of shipping). Always run this.
 #   miri     nightly shell. Miri over pure-Rust crates. It CANNOT execute
 #            FFI, so crates linking rquickjs or native-tls are excluded; put
 #            unsafe logic in a pure-Rust module with tests to get Miri
@@ -72,6 +74,12 @@ run_js() {
   return "$status"
 }
 
+run_docs() {
+  # Workspace `warnings` (deny) covers rustdoc's intra-doc link lints, so
+  # broken or stale doc paths fail the gate instead of shipping.
+  nix develop --command cargo doc --workspace --no-deps
+}
+
 valgrind_test() {
   nix develop .#check --command env \
     CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER="valgrind --error-exitcode=1 --track-origins=yes" \
@@ -82,6 +90,7 @@ case "${1:-clippy}" in
   clippy)
     run_clippy
     run_js
+    run_docs
     ;;
   miri)
     shift

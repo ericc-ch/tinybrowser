@@ -11,7 +11,7 @@ mod resolve;
 mod transport;
 mod websocket;
 
-pub use client::{Agent, AgentBuilder, Body, RequestBuilder, Response};
+pub use client::{Agent, AgentOptions, Body, Request, Response};
 pub use cookies::{CookieRecord, CookieSameSite, InitiatorKind, site};
 pub use error::{LimitExceeded, NetError, ProtocolError, TimeoutKind, TransportError};
 pub use protocol::{HeaderError, HeaderMap, InvalidMethod, Method};

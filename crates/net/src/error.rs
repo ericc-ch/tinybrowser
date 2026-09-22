@@ -34,7 +34,7 @@ pub enum TransportError {
 /// A configured cap was exceeded.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum LimitExceeded {
-    /// Redirect hop count reached [`AgentBuilder::max_redirects`].
+    /// Redirect hop count reached [`crate::AgentOptions::max_redirects`].
     #[error("redirect cap exceeded")]
     Redirect,
     /// Response body would exceed the caller-supplied byte cap.
@@ -55,14 +55,15 @@ pub enum ProtocolError {
     #[error("proxy URI must be an http:// HTTP CONNECT authority")]
     InvalidProxy,
     /// `--resolve=PATTERN=ADDR` is not `PATTERN=IPv4` or `PATTERN=fail`.
-    #[error("resolve spec must be PATTERN=IPv4 or PATTERN=fail")]
-    InvalidResolve,
+    /// The payload is the offending raw spec, so callers can echo it.
+    #[error("resolve spec {0:?} must be PATTERN=IPv4 or PATTERN=fail")]
+    InvalidResolve(Box<str>),
     /// Another protocol failure, with the backend's wording.
     #[error("{0}")]
     Other(Box<str>),
 }
 
-/// Failure from [`RequestBuilder::send`], [`RequestBuilder::upgrade`], or body reads.
+/// Failure from [`crate::Agent::send`], [`crate::Agent::upgrade`], or body reads.
 #[derive(Debug, thiserror::Error)]
 pub enum NetError {
     #[error("transport: {0}")]

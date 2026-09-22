@@ -1,7 +1,8 @@
 use super::common::TestServer;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
-use net::{AgentBuilder, Method, WsEvent, WsMessage};
+use net::{Agent, AgentOptions, Method, Request, WsEvent, WsMessage};
 use tungstenite::protocol::frame::Frame;
 use tungstenite::protocol::frame::coding::{CloseCode, Data, OpCode};
 use tungstenite::{Message, accept_hdr};
@@ -121,23 +122,29 @@ fn start_websocket_server(
     })
 }
 
+/// Frame-level behavior (fragment reassembly, auto-pong, close-code mapping)
+/// has no WPT coverage: the JS `WebSocket` API cannot observe frames, so this
+/// transcript is the only signal for our client-side protocol handling.
 #[tokio::test]
 async fn websocket_transcript_covers_handshake_frames_control_and_cookie_reuse() {
     let captured = Arc::new(Mutex::new(None));
     let requests = Arc::new(Mutex::new(0_u8));
     let server = start_websocket_server(Arc::clone(&captured), Arc::clone(&requests));
 
-    let agent = AgentBuilder::new().user_agent("tinybrowser-test/1").build();
+    let agent = Agent::new(AgentOptions {
+        user_agent: Some("tinybrowser-test/1".to_owned()),
+        ..AgentOptions::default()
+    })
+    .expect("agent options");
     let document =
         url::Url::parse(&format!("ws://{}/page", server.local_addr())).expect("document");
-    let mut socket = agent
-        .request(Method::GET, server.ws_url("/socket"))
-        .header("Sec-WebSocket-Protocol", "tinybrowser-test")
-        .expect("protocol")
-        .with_initiator(document)
-        .upgrade()
-        .await
-        .expect("upgrade");
+    let mut request = Request::new(Method::GET, server.ws_url("/socket"));
+    request
+        .headers
+        .insert("Sec-WebSocket-Protocol", "tinybrowser-test")
+        .expect("protocol");
+    request.initiator = Some(document);
+    let mut socket = agent.upgrade(request).await.expect("upgrade");
     socket
         .send(WsMessage::Text("from-client".into()))
         .await
@@ -164,8 +171,7 @@ async fn websocket_transcript_covers_handshake_frames_control_and_cookie_reuse()
     assert_eq!(protocol, "tinybrowser-test");
 
     agent
-        .request(Method::GET, server.url("/after"))
-        .send()
+        .send(Request::new(Method::GET, server.url("/after")))
         .await
         .expect("cookie follow-up");
     assert_eq!(*requests.lock().expect("request count"), 2);
@@ -179,16 +185,19 @@ async fn websocket_dials_use_the_agent_resolve_map() {
     let server = start_websocket_server(Arc::clone(&captured), Arc::clone(&requests));
     let port = server.local_addr().port();
 
-    let agent = AgentBuilder::new()
-        .resolve("ws.test=127.0.0.1")
-        .expect("resolve spec")
-        .build();
+    let agent = Agent::new(AgentOptions {
+        resolve: vec!["ws.test=127.0.0.1".to_owned()],
+        ..AgentOptions::default()
+    })
+    .expect("resolve spec");
     let url = url::Url::parse(&format!("ws://ws.test:{port}/socket")).expect("absolute url");
+    let mut request = Request::new(Method::GET, url);
+    request
+        .headers
+        .insert("Sec-WebSocket-Protocol", "tinybrowser-test")
+        .expect("protocol");
     let mut socket = agent
-        .request(Method::GET, url)
-        .header("Sec-WebSocket-Protocol", "tinybrowser-test")
-        .expect("protocol")
-        .upgrade()
+        .upgrade(request)
         .await
         .expect("upgrade through the resolve map");
     socket
@@ -219,16 +228,16 @@ async fn wss_dials_use_the_connect_proxy() {
             .write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n")
             .expect("connect denial");
     });
-    let Err(error) = AgentBuilder::new()
-        .proxy(&format!("http://{}", proxy.local_addr()))
-        .expect("proxy")
-        .build()
-        .request(
-            Method::GET,
-            url::Url::parse("wss://origin.test/socket").expect("absolute url"),
-        )
-        .upgrade()
-        .await
+    let Err(error) = Agent::new(AgentOptions {
+        proxy: Some(format!("http://{}", proxy.local_addr())),
+        ..AgentOptions::default()
+    })
+    .expect("proxy")
+    .upgrade(Request::new(
+        Method::GET,
+        url::Url::parse("wss://origin.test/socket").expect("absolute url"),
+    ))
+    .await
     else {
         panic!("the proxy denied the tunnel");
     };
@@ -240,4 +249,32 @@ async fn wss_dials_use_the_connect_proxy() {
         "unexpected proxy error: {error:?}"
     );
     proxy.assert_clean();
+}
+
+/// `Request::deadline` is honored by `Agent::upgrade` too: a stalled
+/// handshake must fail with a typed timeout rather than outlive the caller's
+/// absolute budget. `deadline` is our own Rust API, so WPT cannot reach it.
+#[tokio::test]
+async fn upgrade_applies_the_request_deadline_to_the_handshake() {
+    let server = TestServer::start(|connection| {
+        connection.read_request();
+        // Never answer the upgrade; the caller's absolute deadline must fire.
+        std::thread::sleep(Duration::from_millis(600));
+    });
+    let mut request = Request::new(Method::GET, server.ws_url("/stall"));
+    request.deadline = Some(Instant::now() + Duration::from_millis(80));
+    let Err(error) = Agent::new(AgentOptions::default())
+        .expect("default options are valid")
+        .upgrade(request)
+        .await
+    else {
+        panic!("the handshake must not outlive the caller's deadline");
+    };
+    assert!(
+        matches!(
+            error,
+            net::NetError::Transport(net::TransportError::Timeout(_))
+        ),
+        "unexpected error: {error:?}"
+    );
 }
