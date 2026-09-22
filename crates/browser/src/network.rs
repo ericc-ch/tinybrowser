@@ -298,7 +298,7 @@ fn identity_header(request: &mut Request, name: &str, value: &str) {
     request
         .headers
         .insert(name, value)
-        .expect("Chrome navigation identity headers are static HTTP tokens with no CTL bytes")
+        .expect("Chrome navigation identity headers are static HTTP tokens with no CTL bytes");
 }
 
 fn sends_default_ua_client_hints(url: &Url) -> bool {
