@@ -31,13 +31,23 @@ enum Handled {
 }
 
 /// Runs the renderer loop until `Shutdown`, channel close, or stop.
-pub(super) async fn run(
-    mut inbox: exchange::Receiver<ToRenderer>,
-    outbox: &exchange::BlockingSender<FromRenderer>,
-    services: Arc<ChannelServices>,
-    stop: &Arc<Stop>,
-    wake: Arc<Notify>,
-) {
+pub(crate) struct RunOptions<'a> {
+    pub(crate) inbox: exchange::Receiver<ToRenderer>,
+    pub(crate) outbox: &'a exchange::BlockingSender<FromRenderer>,
+    pub(crate) services: Arc<ChannelServices>,
+    pub(crate) stop: &'a Arc<Stop>,
+    pub(crate) wake: Arc<Notify>,
+}
+
+/// Runs the renderer loop until `Shutdown`, channel close, or stop.
+pub(super) async fn run(options: RunOptions<'_>) {
+    let RunOptions {
+        mut inbox,
+        outbox,
+        services,
+        stop,
+        wake,
+    } = options;
     let mut engines = HashMap::<RendererAssignmentId, Engine>::new();
     let mut responses = ResponseStreams::default();
     loop {
@@ -48,15 +58,15 @@ pub(super) async fn run(
         let deadline = engines.values().filter_map(Engine::next_deadline).min();
         tokio::select! {
             received = inbox.recv() => {
-                if !handle_host(
+                if !handle_host(HandleHostOptions {
                     received,
-                    &mut engines,
-                    &mut responses,
+                    engines: &mut engines,
+                    responses: &mut responses,
                     outbox,
-                    &services,
+                    services: &services,
                     stop,
-                    &wake,
-                ) {
+                    wake: &wake,
+                }) {
                     stop.request();
                     break;
                 }
@@ -70,18 +80,41 @@ pub(super) async fn run(
     }
 }
 
-fn handle_host(
+struct HandleHostOptions<'a> {
     received: Option<ToRenderer>,
-    engines: &mut HashMap<RendererAssignmentId, Engine>,
-    responses: &mut ResponseStreams,
-    outbox: &exchange::BlockingSender<FromRenderer>,
-    services: &Arc<ChannelServices>,
-    stop: &Arc<Stop>,
-    wake: &Arc<Notify>,
-) -> bool {
+    engines: &'a mut HashMap<RendererAssignmentId, Engine>,
+    responses: &'a mut ResponseStreams,
+    outbox: &'a exchange::BlockingSender<FromRenderer>,
+    services: &'a Arc<ChannelServices>,
+    stop: &'a Arc<Stop>,
+    wake: &'a Arc<Notify>,
+}
+
+/// Handles one host-side message. This is a dispatch table over the
+/// renderer's host protocol: each arm validates and forwards one message.
+#[expect(
+    clippy::too_many_lines,
+    reason = "dispatch table over host messages; each arm is one validation plus one forward"
+)]
+fn handle_host(options: HandleHostOptions<'_>) -> bool {
+    let HandleHostOptions {
+        received,
+        engines,
+        responses,
+        outbox,
+        services,
+        stop,
+        wake,
+    } = options;
     match received {
         Some(Frame::Notify(HostNotice::Assign { assignment })) => {
-            assign_engine(engines, assignment, services, stop, wake)
+            assign_engine(AssignEngineOptions {
+                engines,
+                assignment,
+                services,
+                stop,
+                wake,
+            })
         }
         Some(Frame::Notify(HostNotice::Release { assignment })) => {
             responses.release(assignment, engines);
@@ -97,36 +130,64 @@ fn handle_host(
                     assignment,
                     command,
                 },
-        }) => handle_request(engines, outbox, id, assignment, command),
+        }) => handle_request(HandleRequestOptions {
+            engines,
+            outbox,
+            id,
+            assignment,
+            command,
+        }),
         Some(Frame::Call {
             id,
             body: RendererCall::Response { response },
         }) => {
             let Some(engine) = engines.get_mut(&response.assignment) else {
                 responses.cancel(id, engines);
-                return reply_result(
+                return reply_result(ReplyResultOptions {
                     outbox,
                     id,
-                    (
-                        response.assignment,
-                        Err(stream_error("response assignment is gone")),
-                    ),
-                );
+                    assignment: response.assignment,
+                    result: Err(stream_error("response assignment is gone")),
+                });
             };
-            match responses.start(id, &response, engine) {
+            match responses.start(StartOptions {
+                id,
+                response: &response,
+                engine,
+            }) {
                 Ok(()) => true,
-                Err(error) => reply_result(outbox, id, (response.assignment, Err(error))),
+                Err(error) => reply_result(ReplyResultOptions {
+                    outbox,
+                    id,
+                    assignment: response.assignment,
+                    result: Err(error),
+                }),
             }
         }
-        Some(Frame::RequestChunk { id, bytes }) => match responses.push(id, &bytes, engines) {
+        Some(Frame::RequestChunk { id, bytes }) => match responses.push(PushOptions {
+            id,
+            bytes: &bytes,
+            engines,
+        }) {
             Ok(()) => true,
-            Err((assignment, error)) => reply_result(outbox, id, (assignment, Err(error))),
+            Err((assignment, error)) => reply_result(ReplyResultOptions {
+                outbox,
+                id,
+                assignment,
+                result: Err(error),
+            }),
         },
         Some(Frame::RequestEnd { id, error: None }) => {
             if responses.is_cancelled(id) {
                 true
             } else {
-                reply_result(outbox, id, responses.finish(id, engines))
+                let (assignment, result) = responses.finish(id, engines);
+                reply_result(ReplyResultOptions {
+                    outbox,
+                    id,
+                    assignment,
+                    result,
+                })
             }
         }
         Some(Frame::RequestEnd {
@@ -136,7 +197,17 @@ fn handle_host(
             if responses.is_cancelled(id) {
                 true
             } else {
-                reply_result(outbox, id, responses.abort(id, &error, engines))
+                let (assignment, result) = responses.abort(AbortOptions {
+                    id,
+                    failure: &error,
+                    engines,
+                });
+                reply_result(ReplyResultOptions {
+                    outbox,
+                    id,
+                    assignment,
+                    result,
+                })
             }
         }
         Some(Frame::Notify(HostNotice::StorageEvent {
@@ -148,13 +219,13 @@ fn handle_host(
             url,
             source,
         })) => {
-            queue_storage_event(
+            queue_storage_event(QueueStorageEventOptions {
                 engines,
-                &renderer::PendingStorageEvent::broadcast(
+                event: &renderer::PendingStorageEvent::broadcast(
                     origin, kind, key, old_value, new_value, url,
                 ),
                 source,
-            );
+            });
             true
         }
         Some(Frame::Notify(HostNotice::BroadcastMessage {
@@ -163,7 +234,13 @@ fn handle_host(
             payload,
             source,
         })) => {
-            queue_broadcast_message(engines, &origin, &name, &payload, source);
+            queue_broadcast_message(QueueBroadcastMessageOptions {
+                engines,
+                origin: &origin,
+                name: &name,
+                payload: &payload,
+                source,
+            });
             true
         }
         Some(Frame::Cancel { id }) => {
@@ -180,13 +257,23 @@ fn handle_host(
 }
 
 /// Handles one host command for one assignment; `false` stops the loop.
-fn handle_request(
-    engines: &mut HashMap<RendererAssignmentId, Engine>,
-    outbox: &exchange::BlockingSender<FromRenderer>,
+struct HandleRequestOptions<'a> {
+    engines: &'a mut HashMap<RendererAssignmentId, Engine>,
+    outbox: &'a exchange::BlockingSender<FromRenderer>,
     id: RequestId,
     assignment: RendererAssignmentId,
     command: Command,
-) -> bool {
+}
+
+/// Handles one host command for one assignment; `false` stops the loop.
+fn handle_request(options: HandleRequestOptions<'_>) -> bool {
+    let HandleRequestOptions {
+        engines,
+        outbox,
+        id,
+        assignment,
+        command,
+    } = options;
     let Some(engine) = engines.get_mut(&assignment) else {
         let reply = match command {
             Command::ExecuteScript { .. } => Reply::Value(Err(stream_error("unknown assignment"))),
@@ -211,16 +298,31 @@ fn handle_request(
                 body: RendererReply { assignment, reply },
             },
         ),
-        Handled::Screenshot(png) => stream_screenshot(outbox, id, assignment, &png),
+        Handled::Screenshot(png) => stream_screenshot(StreamScreenshotOptions {
+            outbox,
+            id,
+            assignment,
+            png: &png,
+        }),
     }
 }
 
 /// Answers a finished or aborted response stream with its unit reply.
-fn reply_result(
-    outbox: &exchange::BlockingSender<FromRenderer>,
+struct ReplyResultOptions<'a> {
+    outbox: &'a exchange::BlockingSender<FromRenderer>,
     id: RequestId,
-    (assignment, result): (RendererAssignmentId, Result<(), TabError>),
-) -> bool {
+    assignment: RendererAssignmentId,
+    result: Result<(), TabError>,
+}
+
+/// Answers a finished or aborted response stream with its unit reply.
+fn reply_result(options: ReplyResultOptions<'_>) -> bool {
+    let ReplyResultOptions {
+        outbox,
+        id,
+        assignment,
+        result,
+    } = options;
     send_to_browser(
         outbox,
         Frame::Reply {
@@ -234,13 +336,23 @@ fn reply_result(
 }
 
 /// Creates one engine for `assignment`; `false` stops the loop on a duplicate.
-fn assign_engine(
-    engines: &mut HashMap<RendererAssignmentId, Engine>,
+struct AssignEngineOptions<'a> {
+    engines: &'a mut HashMap<RendererAssignmentId, Engine>,
     assignment: RendererAssignmentId,
-    services: &Arc<ChannelServices>,
-    stop: &Arc<Stop>,
-    wake: &Arc<Notify>,
-) -> bool {
+    services: &'a Arc<ChannelServices>,
+    stop: &'a Arc<Stop>,
+    wake: &'a Arc<Notify>,
+}
+
+/// Creates one engine for `assignment`; `false` stops the loop on a duplicate.
+fn assign_engine(options: AssignEngineOptions<'_>) -> bool {
+    let AssignEngineOptions {
+        engines,
+        assignment,
+        services,
+        stop,
+        wake,
+    } = options;
     if engines.contains_key(&assignment) {
         return false;
     }
@@ -254,13 +366,24 @@ fn assign_engine(
 
 /// Queues one browser-broadcast `BroadcastChannel` message on every engine;
 /// only the posting assignment skips the source channel.
-fn queue_broadcast_message(
-    engines: &mut HashMap<RendererAssignmentId, Engine>,
-    origin: &str,
-    name: &str,
-    payload: &str,
+struct QueueBroadcastMessageOptions<'a> {
+    engines: &'a mut HashMap<RendererAssignmentId, Engine>,
+    origin: &'a str,
+    name: &'a str,
+    payload: &'a str,
     source: Option<(RendererAssignmentId, u64)>,
-) {
+}
+
+/// Queues one browser-broadcast `BroadcastChannel` message on every engine;
+/// only the posting assignment skips the source channel.
+fn queue_broadcast_message(options: QueueBroadcastMessageOptions<'_>) {
+    let QueueBroadcastMessageOptions {
+        engines,
+        origin,
+        name,
+        payload,
+        source,
+    } = options;
     for (assignment, engine) in engines {
         let source_channel = source.and_then(|(source_assignment, channel)| {
             (source_assignment == *assignment).then_some(channel)
@@ -272,11 +395,21 @@ fn queue_broadcast_message(
 /// Queues one browser-broadcast `localStorage` change on every engine. Only
 /// the assignment that made the change excludes the source window; other
 /// assignments and renderers fire in every matching frame.
-fn queue_storage_event(
-    engines: &mut HashMap<RendererAssignmentId, Engine>,
-    event: &renderer::PendingStorageEvent,
+struct QueueStorageEventOptions<'a> {
+    engines: &'a mut HashMap<RendererAssignmentId, Engine>,
+    event: &'a renderer::PendingStorageEvent,
     source: Option<(RendererAssignmentId, FrameId)>,
-) {
+}
+
+/// Queues one browser-broadcast `localStorage` change on every engine. Only
+/// the assignment that made the change excludes the source window; other
+/// assignments and renderers fire in every matching frame.
+fn queue_storage_event(options: QueueStorageEventOptions<'_>) {
+    let QueueStorageEventOptions {
+        engines,
+        event,
+        source,
+    } = options;
     for (assignment, engine) in engines {
         let mut event = event.clone();
         event.source = source.and_then(|(source_assignment, frame)| {
@@ -293,7 +426,11 @@ fn drain_engines(
 ) -> bool {
     for (assignment, engine) in engines {
         engine.drain_ready();
-        if !publish(*assignment, engine, outbox) {
+        if !publish(PublishOptions {
+            assignment: *assignment,
+            engine,
+            outbox,
+        }) {
             return false;
         }
     }
@@ -316,6 +453,24 @@ struct ResponseStreams {
     cancelled_order: VecDeque<RequestId>,
 }
 
+struct StartOptions<'a> {
+    id: RequestId,
+    response: &'a ResponseStart,
+    engine: &'a mut Engine,
+}
+
+struct PushOptions<'a> {
+    id: RequestId,
+    bytes: &'a [u8],
+    engines: &'a mut HashMap<RendererAssignmentId, Engine>,
+}
+
+struct AbortOptions<'a> {
+    id: RequestId,
+    failure: &'a str,
+    engines: &'a mut HashMap<RendererAssignmentId, Engine>,
+}
+
 impl ResponseStreams {
     fn is_cancelled(&self, id: RequestId) -> bool {
         self.cancelled.contains(&id)
@@ -333,12 +488,12 @@ impl ResponseStreams {
         }
     }
 
-    fn start(
-        &mut self,
-        id: RequestId,
-        response: &ResponseStart,
-        engine: &mut Engine,
-    ) -> Result<(), TabError> {
+    fn start(&mut self, options: StartOptions<'_>) -> Result<(), TabError> {
+        let StartOptions {
+            id,
+            response,
+            engine,
+        } = options;
         if self.cancelled.contains(&id) {
             return Ok(());
         }
@@ -363,12 +518,8 @@ impl ResponseStreams {
         Ok(())
     }
 
-    fn push(
-        &mut self,
-        id: RequestId,
-        bytes: &[u8],
-        engines: &mut HashMap<RendererAssignmentId, Engine>,
-    ) -> Result<(), (RendererAssignmentId, TabError)> {
+    fn push(&mut self, options: PushOptions<'_>) -> Result<(), (RendererAssignmentId, TabError)> {
+        let PushOptions { id, bytes, engines } = options;
         if self.cancelled.contains(&id) {
             return Ok(());
         }
@@ -422,12 +573,12 @@ impl ResponseStreams {
         (assignment, result)
     }
 
-    fn abort(
-        &mut self,
-        id: RequestId,
-        failure: &str,
-        engines: &mut HashMap<RendererAssignmentId, Engine>,
-    ) -> (RendererAssignmentId, Result<(), TabError>) {
+    fn abort(&mut self, options: AbortOptions<'_>) -> (RendererAssignmentId, Result<(), TabError>) {
+        let AbortOptions {
+            id,
+            failure,
+            engines,
+        } = options;
         let response = match self.take(id, "response error without start") {
             Ok(response) => response,
             Err((assignment, error)) => return (assignment, Err(error)),
@@ -530,12 +681,22 @@ fn handle_command(engine: &mut Engine, command: Command) -> Handled {
 }
 
 /// Writes a PNG as response chunks followed by its terminal reply.
-fn stream_screenshot(
-    outbox: &exchange::BlockingSender<FromRenderer>,
+#[derive(Clone, Copy)]
+struct StreamScreenshotOptions<'a> {
+    outbox: &'a exchange::BlockingSender<FromRenderer>,
     id: RequestId,
     assignment: RendererAssignmentId,
-    png: &[u8],
-) -> bool {
+    png: &'a [u8],
+}
+
+/// Writes a PNG as response chunks followed by its terminal reply.
+fn stream_screenshot(options: StreamScreenshotOptions<'_>) -> bool {
+    let StreamScreenshotOptions {
+        outbox,
+        id,
+        assignment,
+        png,
+    } = options;
     let Ok(len) = u32::try_from(png.len()) else {
         return send_to_browser(
             outbox,
@@ -574,11 +735,19 @@ fn stream_screenshot(
 }
 
 /// Sends every event one engine produced, returning false when the host is gone.
-fn publish(
+struct PublishOptions<'a> {
     assignment: RendererAssignmentId,
-    engine: &mut Engine,
-    outbox: &exchange::BlockingSender<FromRenderer>,
-) -> bool {
+    engine: &'a mut Engine,
+    outbox: &'a exchange::BlockingSender<FromRenderer>,
+}
+
+/// Sends every event one engine produced, returning false when the host is gone.
+fn publish(options: PublishOptions<'_>) -> bool {
+    let PublishOptions {
+        assignment,
+        engine,
+        outbox,
+    } = options;
     let Ok(events) = engine.take_events() else {
         return false;
     };
@@ -611,7 +780,15 @@ mod tests {
         let mut engines = HashMap::new();
         let id = RequestId::new(1);
         streams.cancel(id, &mut engines);
-        assert!(streams.push(id, b"leftover", &mut engines).is_ok());
+        assert!(
+            streams
+                .push(PushOptions {
+                    id,
+                    bytes: b"leftover",
+                    engines: &mut engines,
+                })
+                .is_ok()
+        );
         assert!(streams.is_cancelled(id));
     }
 
@@ -621,6 +798,14 @@ mod tests {
         let mut engines = HashMap::new();
         let id = RequestId::new(7);
         streams.cancel(id, &mut engines);
-        assert!(streams.push(id, b"early", &mut engines).is_ok());
+        assert!(
+            streams
+                .push(PushOptions {
+                    id,
+                    bytes: b"early",
+                    engines: &mut engines,
+                })
+                .is_ok()
+        );
     }
 }

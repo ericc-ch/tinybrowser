@@ -1,0 +1,5 @@
+# Browser-crate clippy config: keep functions to at most two parameters that
+# are not the receiver. Clippy counts `self`, so a limit of 3 enforces three
+# non-receiver parameters on methods but four on free functions; the remaining
+# three-parameter free functions are held to the rule by review.
+too-many-arguments-threshold = 3

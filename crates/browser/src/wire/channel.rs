@@ -90,6 +90,25 @@ pub struct Frame {
     pub request: u64,
 }
 
+/// One outgoing frame: its payload class, request tag, and bytes.
+#[derive(Clone, Copy, Debug)]
+pub struct WriteFrameOptions<'a> {
+    /// Payload class.
+    pub kind: FrameKind,
+    /// Request this frame belongs to; zero for control frames.
+    pub request: u64,
+    /// Frame payload bytes.
+    pub payload: &'a [u8],
+}
+
+/// Header fields for one outgoing frame.
+#[derive(Clone, Copy, Debug)]
+struct EncodeHeaderOptions {
+    kind: FrameKind,
+    request: u64,
+    length: usize,
+}
+
 /// Writes one control message as a JSON frame.
 ///
 /// # Errors
@@ -97,7 +116,14 @@ pub struct Frame {
 /// Serialization failure or a payload larger than [`MAX_CONTROL_BYTES`].
 pub fn write_control<T: Serialize>(writer: &mut impl Write, message: &T) -> io::Result<()> {
     let payload = serde_json::to_vec(message).map_err(io::Error::other)?;
-    write_frame(writer, FrameKind::Control, 0, &payload)
+    write_frame(
+        writer,
+        WriteFrameOptions {
+            kind: FrameKind::Control,
+            request: 0,
+            payload: &payload,
+        },
+    )
 }
 
 /// Writes one raw body chunk for `request`.
@@ -107,7 +133,14 @@ pub fn write_control<T: Serialize>(writer: &mut impl Write, message: &T) -> io::
 /// A payload larger than [`MAX_BODY_CHUNK_BYTES`] or write failure.
 #[cfg(test)]
 pub fn write_body(writer: &mut impl Write, request: u64, payload: &[u8]) -> io::Result<()> {
-    write_frame(writer, FrameKind::ResponseChunk, request, payload)
+    write_frame(
+        writer,
+        WriteFrameOptions {
+            kind: FrameKind::ResponseChunk,
+            request,
+            payload,
+        },
+    )
 }
 
 /// Writes one frame with the fixed header.
@@ -115,15 +148,14 @@ pub fn write_body(writer: &mut impl Write, request: u64, payload: &[u8]) -> io::
 /// # Errors
 ///
 /// A payload larger than the kind limit or write failure.
-pub fn write_frame(
-    writer: &mut impl Write,
-    kind: FrameKind,
-    request: u64,
-    payload: &[u8],
-) -> io::Result<()> {
-    let header = encode_header(kind, request, payload.len())?;
+pub fn write_frame(writer: &mut impl Write, frame: WriteFrameOptions<'_>) -> io::Result<()> {
+    let header = encode_header(EncodeHeaderOptions {
+        kind: frame.kind,
+        request: frame.request,
+        length: frame.payload.len(),
+    })?;
     writer.write_all(&header)?;
-    writer.write_all(payload)?;
+    writer.write_all(frame.payload)?;
     writer.flush()
 }
 
@@ -137,7 +169,15 @@ pub async fn write_control_async<W: AsyncWrite + Unpin + ?Sized>(
     message: &impl Serialize,
 ) -> io::Result<()> {
     let payload = serde_json::to_vec(message).map_err(io::Error::other)?;
-    write_frame_async(writer, FrameKind::Control, 0, &payload).await
+    write_frame_async(
+        writer,
+        WriteFrameOptions {
+            kind: FrameKind::Control,
+            request: 0,
+            payload: &payload,
+        },
+    )
+    .await
 }
 
 /// Writes one frame with the fixed header on an async writer.
@@ -147,17 +187,24 @@ pub async fn write_control_async<W: AsyncWrite + Unpin + ?Sized>(
 /// A payload larger than the kind limit or write failure.
 pub async fn write_frame_async<W: AsyncWrite + Unpin + ?Sized>(
     writer: &mut W,
-    kind: FrameKind,
-    request: u64,
-    payload: &[u8],
+    frame: WriteFrameOptions<'_>,
 ) -> io::Result<()> {
-    let header = encode_header(kind, request, payload.len())?;
+    let header = encode_header(EncodeHeaderOptions {
+        kind: frame.kind,
+        request: frame.request,
+        length: frame.payload.len(),
+    })?;
     writer.write_all(&header).await?;
-    writer.write_all(payload).await?;
+    writer.write_all(frame.payload).await?;
     writer.flush().await
 }
 
-fn encode_header(kind: FrameKind, request: u64, length: usize) -> io::Result<[u8; HEADER_BYTES]> {
+fn encode_header(header: EncodeHeaderOptions) -> io::Result<[u8; HEADER_BYTES]> {
+    let EncodeHeaderOptions {
+        kind,
+        request,
+        length,
+    } = header;
     if length > kind.max_payload() {
         return Err(invalid("renderer IPC payload exceeds limit"));
     }

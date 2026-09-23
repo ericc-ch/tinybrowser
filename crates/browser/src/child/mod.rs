@@ -42,7 +42,7 @@ use tokio::sync::Notify;
 use url::Url;
 
 use crate::exchange::{self, BlockingClient, Frame, RequestId};
-use crate::wire::channel::{FrameKind, decode_control, read_frame, write_frame};
+use crate::wire::channel::{FrameKind, WriteFrameOptions, decode_control, read_frame, write_frame};
 use crate::wire::{
     BrowserCall, BrowsingContextCall, FromRenderer, HostNotice, MessagingCall, NetworkCall,
     RendererAssignmentId, RendererNotice, RendererReply, ServiceCall, ServiceReply, StorageCall,
@@ -90,15 +90,22 @@ async fn serve_async() -> io::Result<thread::JoinHandle<io::Result<()>>> {
     let reader_stop = Arc::clone(&stop);
     let reader_wake = Arc::clone(&wake);
     thread::spawn(move || {
-        read_messages(
+        read_messages(ReadMessagesOptions {
             input,
-            &command_tx,
-            &reader_services,
-            &reader_stop,
-            &reader_wake,
-        );
+            command_tx: &command_tx,
+            services: &reader_services,
+            stop: &reader_stop,
+            wake: &reader_wake,
+        });
     });
-    session::run(command_rx, &out_tx, services, &stop, Arc::clone(&wake)).await;
+    session::run(session::RunOptions {
+        inbox: command_rx,
+        outbox: &out_tx,
+        services,
+        stop: &stop,
+        wake: Arc::clone(&wake),
+    })
+    .await;
     // The reader returns on `Shutdown`, dropping its `ChannelServices` clone, so
     // the writer channel closes and the child can exit.
     drop(out_tx);
@@ -123,13 +130,22 @@ fn endpoint() -> io::Result<(Box<dyn Read + Send>, Box<dyn Write + Send>)> {
     Ok((Box::new(std::io::stdin()), Box::new(std::io::stdout())))
 }
 
-fn read_messages(
-    mut input: Box<dyn Read + Send>,
-    command_tx: &exchange::Sender<ToRenderer>,
-    services: &ChannelServices,
-    stop: &Arc<Stop>,
-    wake: &Arc<Notify>,
-) {
+struct ReadMessagesOptions<'a> {
+    input: Box<dyn Read + Send>,
+    command_tx: &'a exchange::Sender<ToRenderer>,
+    services: &'a ChannelServices,
+    stop: &'a Arc<Stop>,
+    wake: &'a Arc<Notify>,
+}
+
+fn read_messages(options: ReadMessagesOptions<'_>) {
+    let ReadMessagesOptions {
+        mut input,
+        command_tx,
+        services,
+        stop,
+        wake,
+    } = options;
     let mut buffer = Vec::new();
     let mut greeted = false;
     loop {
@@ -174,7 +190,11 @@ fn read_messages(
                 }
             }
         }
-        if !route_message(message, command_tx, services) {
+        if !route_message(RouteMessageOptions {
+            message,
+            command_tx,
+            services,
+        }) {
             break;
         }
     }
@@ -186,12 +206,19 @@ fn read_messages(
     let _result = command_tx.try_send(Frame::Notify(HostNotice::Shutdown));
 }
 
-/// Routes one post-handshake host message; `false` stops the read loop.
-fn route_message(
+struct RouteMessageOptions<'a> {
     message: ToRenderer,
-    command_tx: &exchange::Sender<ToRenderer>,
-    services: &ChannelServices,
-) -> bool {
+    command_tx: &'a exchange::Sender<ToRenderer>,
+    services: &'a ChannelServices,
+}
+
+/// Routes one post-handshake host message; `false` stops the read loop.
+fn route_message(options: RouteMessageOptions<'_>) -> bool {
+    let RouteMessageOptions {
+        message,
+        command_tx,
+        services,
+    } = options;
     match message {
         Frame::Notify(HostNotice::Hello) => {
             logging::error!(target: "renderer::ipc", "duplicate handshake");
@@ -219,10 +246,24 @@ fn write_messages(
     while let Some(message) = rx.recv() {
         match message {
             Frame::RequestChunk { id, bytes } => {
-                write_frame(&mut output, FrameKind::RequestChunk, id.get(), &bytes)?;
+                write_frame(
+                    &mut output,
+                    WriteFrameOptions {
+                        kind: FrameKind::RequestChunk,
+                        request: id.get(),
+                        payload: &bytes,
+                    },
+                )?;
             }
             Frame::ResponseChunk { id, bytes } => {
-                write_frame(&mut output, FrameKind::ResponseChunk, id.get(), &bytes)?;
+                write_frame(
+                    &mut output,
+                    WriteFrameOptions {
+                        kind: FrameKind::ResponseChunk,
+                        request: id.get(),
+                        payload: &bytes,
+                    },
+                )?;
             }
             _ => crate::wire::channel::write_control(&mut output, &message)?,
         }
@@ -233,6 +274,12 @@ fn write_messages(
 /// Renderer host-capability proxy that asks the browser process over the channel.
 pub(crate) struct ChannelServices {
     client: BlockingClient<BrowserCall, RendererReply, RendererNotice, ServiceReply>,
+}
+
+struct StartDialOptions {
+    assignment: RendererAssignmentId,
+    request: DialRequest,
+    completion: DialCompletion,
 }
 
 impl ChannelServices {
@@ -246,12 +293,12 @@ impl ChannelServices {
         self.client.call(BrowserCall { assignment, call }).ok()
     }
 
-    fn start_dial(
-        &self,
-        assignment: RendererAssignmentId,
-        request: DialRequest,
-        completion: DialCompletion,
-    ) {
+    fn start_dial(&self, options: StartDialOptions) {
+        let StartDialOptions {
+            assignment,
+            request,
+            completion,
+        } = options;
         self.client.call_with(
             BrowserCall {
                 assignment,
@@ -297,8 +344,11 @@ impl AssignmentServices {
 
 impl NetworkHost for AssignmentServices {
     fn start_dial(&self, request: DialRequest, completion: DialCompletion) {
-        self.channel
-            .start_dial(self.assignment, request, completion);
+        self.channel.start_dial(StartDialOptions {
+            assignment: self.assignment,
+            request,
+            completion,
+        });
     }
 
     fn cookies_for(&self, url: &Url) -> String {

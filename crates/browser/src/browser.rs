@@ -9,9 +9,9 @@ use std::path::PathBuf;
 
 use url::Url;
 
-use self::task::BrowserTask;
+use self::task::{BrowserTask, BrowserTaskOptions};
 use crate::actor::{TabHandle, TabId};
-use crate::context::BrowserContext;
+use crate::context::{BrowserContext, BrowserContextOptions};
 use crate::exchange;
 use crate::network::NetworkContext;
 use crate::profile::Profile;
@@ -79,36 +79,28 @@ pub struct BrowserHandle {
     client: BrowserClient,
 }
 
+/// Parameters for a renderer-initiated `window.open`.
+pub(crate) struct OpenWindowOptions {
+    /// Requested URL, already filtered to a navigable scheme or empty.
+    pub(crate) url: String,
+    /// Tab that called `window.open`, when it has one.
+    pub(crate) source: Option<TabId>,
+    /// Whether the new context must not receive an opener.
+    pub(crate) noopener: bool,
+}
+
 pub(super) enum Command {
     CreateTab,
     Tabs,
-    Tab {
-        id: TabId,
-    },
-    CloseTab {
-        id: TabId,
-    },
+    Tab { id: TabId },
+    CloseTab { id: TabId },
     Close,
-    CookieRecords {
-        url: Url,
-    },
+    CookieRecords { url: Url },
     ClearCookies,
-    AddCookie {
-        cookie: String,
-        url: Url,
-    },
-    OpenWindow {
-        url: String,
-        source: Option<TabId>,
-        noopener: bool,
-    },
-    OpenerTab {
-        tab: TabId,
-    },
-    WindowMessage {
-        target: TabId,
-        payload: String,
-    },
+    AddCookie { cookie: String, url: Url },
+    OpenWindow(OpenWindowOptions),
+    OpenerTab { tab: TabId },
+    WindowMessage { target: TabId, payload: String },
 }
 
 pub(super) enum Reply {
@@ -171,11 +163,19 @@ impl Browser {
             Some(data_home) => data_home,
             None => default_data_home().map_err(BrowserOpenError::Profile)?,
         };
-        let context = BrowserContext::open(&data_home, &options.profile, network)
-            .map_err(BrowserOpenError::Profile)?;
+        let context = BrowserContext::new(BrowserContextOptions {
+            data_home: &data_home,
+            profile: &options.profile,
+            network,
+        })
+        .map_err(BrowserOpenError::Profile)?;
         let (client, server) = exchange::local(BROWSER_COMMAND_CAPACITY);
         let handle = BrowserHandle { client };
-        let task = BrowserTask::new(server, context, handle.clone());
+        let task = BrowserTask::new(BrowserTaskOptions {
+            server,
+            context,
+            browser: handle.clone(),
+        });
         runtime.spawn(task.run());
         Ok(Self { handle })
     }
@@ -346,18 +346,9 @@ impl BrowserHandle {
 
     pub(crate) async fn open_window(
         &self,
-        url: String,
-        source: Option<TabId>,
-        noopener: bool,
+        request: OpenWindowOptions,
     ) -> Result<TabId, BrowserError> {
-        match self
-            .call(Command::OpenWindow {
-                url,
-                source,
-                noopener,
-            })
-            .await?
-        {
+        match self.call(Command::OpenWindow(request)).await? {
             Reply::OpenWindow(result) => result,
             _ => Err(BrowserError::Protocol),
         }

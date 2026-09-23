@@ -4,9 +4,11 @@ use std::sync::Arc;
 use crate::actor::{TabHandle, TabId, TabTask};
 use crate::context::BrowserContext;
 use crate::exchange::ServerInput;
-use crate::manager::RendererProcessManager;
+use crate::manager::{RendererProcessManager, RendererProcessManagerOptions};
 
-use super::{BrowserError, BrowserHandle, BrowserServer, Command, Notice, Reply};
+use super::{
+    BrowserError, BrowserHandle, BrowserServer, Command, Notice, OpenWindowOptions, Reply,
+};
 
 pub(super) struct BrowserTask {
     server: BrowserServer,
@@ -17,21 +19,34 @@ pub(super) struct BrowserTask {
     openers: HashMap<TabId, TabId>,
 }
 
+/// Dependencies one [`BrowserTask`] starts with.
+pub(super) struct BrowserTaskOptions {
+    /// Server end of the browser exchange.
+    pub(super) server: BrowserServer,
+    /// Live profile context.
+    pub(super) context: BrowserContext,
+    /// Handle cloned into the renderer manager for `window.open` callbacks.
+    pub(super) browser: BrowserHandle,
+}
+
 enum DispatchOutcome {
     Continue(Reply),
     Stop(Reply),
 }
 
 impl BrowserTask {
-    pub(super) fn new(
-        server: BrowserServer,
-        context: BrowserContext,
-        browser: BrowserHandle,
-    ) -> Self {
-        let renderers = Arc::new(RendererProcessManager::new(
-            context.partition_services(),
-            context.session_storage(),
+    pub(super) fn new(parts: BrowserTaskOptions) -> Self {
+        let BrowserTaskOptions {
+            server,
+            context,
             browser,
+        } = parts;
+        let renderers = Arc::new(RendererProcessManager::new(
+            browser,
+            RendererProcessManagerOptions {
+                partition: context.partition_services(),
+                sessions: context.session_storage(),
+            },
         ));
         Self {
             server,
@@ -90,11 +105,7 @@ impl BrowserTask {
             Command::AddCookie { cookie, url } => {
                 Reply::AddCookie(self.context.add_cookie(&cookie, &url))
             }
-            Command::OpenWindow {
-                url,
-                source,
-                noopener,
-            } => Reply::OpenWindow(self.open_window(url, source, noopener)),
+            Command::OpenWindow(request) => Reply::OpenWindow(self.open_window(request)),
             Command::OpenerTab { tab } => Reply::OpenerTab(self.openers.get(&tab).copied()),
             Command::WindowMessage { target, payload } => {
                 let handle = self.tabs.get(&target).map(|task| task.handle.clone());
@@ -120,7 +131,11 @@ impl BrowserTask {
         self.next_tab = raw.checked_add(1);
         let id = TabId::new(raw);
         self.context.create_tab(id);
-        let task = TabTask::spawn(id, self.context.tab_network(), Arc::clone(&self.renderers));
+        let task = TabTask::spawn(crate::actor::SpawnOptions {
+            id,
+            network: self.context.tab_network(),
+            renderers: Arc::clone(&self.renderers),
+        });
         let handle = task.handle.clone();
         self.tabs.insert(id, task);
         Ok(handle)
@@ -136,12 +151,12 @@ impl BrowserTask {
         Ok(())
     }
 
-    fn open_window(
-        &mut self,
-        url: String,
-        source: Option<TabId>,
-        noopener: bool,
-    ) -> Result<TabId, BrowserError> {
+    fn open_window(&mut self, request: OpenWindowOptions) -> Result<TabId, BrowserError> {
+        let OpenWindowOptions {
+            url,
+            source,
+            noopener,
+        } = request;
         let handle = self.create_tab()?;
         let id = handle.id();
         if let (Some(source), false) = (source, noopener) {

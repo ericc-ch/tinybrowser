@@ -10,6 +10,11 @@
 //! on each other, `dom`, `net`, or `renderer`.
 //! Browser and tab state live in bounded Tokio owner tasks.
 
+// Test harnesses are throwaway scaffolding, not shipped API: they stay
+// positional while non-test code follows the two-parameter convention in
+// `clippy.toml`.
+#![cfg_attr(test, allow(clippy::too_many_arguments))]
+
 mod actor;
 mod broadcast;
 mod browser;
@@ -24,7 +29,7 @@ mod site;
 mod storage;
 mod wire;
 
-pub use actor::{TabEvent, TabHandle, TabId};
+pub use actor::{ExecuteScriptInOptions, RunUntilJsTrueInOptions, TabEvent, TabHandle, TabId};
 pub use browser::{Browser, BrowserError, BrowserHandle, BrowserOpenError, BrowserOptions};
 pub use net::{Agent, AgentOptions, CookieRecord, CookieSameSite};
 pub use profile::{Profile, ProfileError, ProfileName, default_data_home};

@@ -13,10 +13,10 @@ use std::sync::{Arc, PoisonError};
 use crate::wire::RendererAssignmentId;
 use tokio::sync::Semaphore;
 
-use crate::actor::TabId;
 use crate::context::PartitionServices;
-use crate::link::{AssignmentContext, RendererAssignment, RendererHandle, spawn_process};
-use crate::network::TabNetworkHandle;
+use crate::link::{
+    AssignmentContext, RendererAssignment, RendererHandle, SpawnProcessOptions, spawn_process,
+};
 use crate::site::Site;
 use crate::storage::SessionStorage;
 
@@ -46,12 +46,23 @@ struct ManagerState {
     spawning_spare: bool,
 }
 
+/// Browser-owned dependencies one renderer manager runs with.
+pub(crate) struct RendererProcessManagerOptions {
+    /// Services shared by renderer assignments in the partition.
+    pub(crate) partition: PartitionServices,
+    /// Session storage owned by the browser.
+    pub(crate) sessions: Arc<SessionStorage>,
+}
+
 impl RendererProcessManager {
     pub(crate) fn new(
-        partition: PartitionServices,
-        sessions: Arc<SessionStorage>,
         browser: crate::browser::BrowserHandle,
+        services: RendererProcessManagerOptions,
     ) -> Self {
+        let RendererProcessManagerOptions {
+            partition,
+            sessions,
+        } = services;
         let manager = Self {
             inner: Arc::new(ManagerInner {
                 partition,
@@ -74,18 +85,11 @@ impl RendererProcessManager {
     /// Process spawn failure or a failed protocol handshake.
     pub(crate) async fn acquire(
         &self,
-        tab: TabId,
-        site: &Site,
-        network: TabNetworkHandle,
+        context: AssignmentContext,
     ) -> io::Result<Arc<RendererAssignment>> {
-        let process = self.acquire_process(site).await?;
+        let process = self.acquire_process(&context.site).await?;
         let assignment =
             RendererAssignmentId::new(self.inner.next_assignment.fetch_add(1, Ordering::Relaxed));
-        let context = AssignmentContext {
-            tab,
-            site: site.clone(),
-            network,
-        };
         if let Err(error) = process.assign(assignment, context).await {
             process.unreserve_assignment();
             return Err(error);
@@ -205,14 +209,14 @@ async fn spawn_slot(
     };
     let id = RendererId(inner.next.fetch_add(1, Ordering::Relaxed));
     Ok(Some(Arc::new(
-        spawn_process(
+        spawn_process(SpawnProcessOptions {
             id,
             site,
-            inner.partition.clone(),
-            Arc::clone(&inner.sessions),
-            inner.browser.clone(),
+            partition: inner.partition.clone(),
+            sessions: Arc::clone(&inner.sessions),
+            browser: inner.browser.clone(),
             slot,
-        )
+        })
         .await?,
     )))
 }

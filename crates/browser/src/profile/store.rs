@@ -32,7 +32,7 @@ impl ProfileStore {
     /// # Errors
     ///
     /// The directory cannot be created or another process owns the profile.
-    pub(crate) fn open_in(data_home: &Path, profile: &Profile) -> io::Result<Self> {
+    pub(crate) fn new(data_home: &Path, profile: &Profile) -> io::Result<Self> {
         let root = data_home
             .join("tinybrowser")
             .join("profiles")

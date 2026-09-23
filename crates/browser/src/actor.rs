@@ -18,7 +18,9 @@ use tokio::time::{Instant, sleep_until, timeout};
 use url::Url;
 
 use crate::exchange::{self, RequestId, ServerInput};
-use crate::link::RendererAssignment;
+use crate::link::{
+    AssignmentContext, AssignmentMountOptions, AssignmentStartResponseOptions, RendererAssignment,
+};
 use crate::manager::RendererProcessManager;
 use crate::network::{NAV_BODY_LIMIT, NavOutcome, TabNetworkHandle, dial_failure};
 use crate::site::Site;
@@ -129,6 +131,26 @@ pub struct TabHandle {
     client: TabClient,
 }
 
+/// One framed script evaluation requested through a [`TabHandle`].
+pub struct ExecuteScriptInOptions<'a> {
+    /// Frame to evaluate in.
+    pub frame: FrameId,
+    /// Script source.
+    pub source: &'a str,
+    /// Optional `QuickJS` interruption timeout.
+    pub timeout: Option<Duration>,
+}
+
+/// One framed JS-truth wait requested through a [`TabHandle`].
+pub struct RunUntilJsTrueInOptions<'a> {
+    /// Frame to evaluate in.
+    pub frame: FrameId,
+    /// Predicate source; waits until it evaluates to JS `true`.
+    pub source: &'a str,
+    /// Maximum time to wait.
+    pub timeout: Duration,
+}
+
 impl TabHandle {
     /// Tab identity in the owning browser.
     #[must_use]
@@ -190,7 +212,12 @@ impl TabHandle {
         source: &str,
         timeout: Option<Duration>,
     ) -> Result<RemoteValue, TabError> {
-        self.execute_script_in(FrameId::MAIN, source, timeout).await
+        self.execute_script_in(ExecuteScriptInOptions {
+            frame: FrameId::MAIN,
+            source,
+            timeout,
+        })
+        .await
     }
 
     /// Evaluates `source` in one frame, interrupting `QuickJS` if `timeout`
@@ -202,10 +229,13 @@ impl TabHandle {
     /// [`TabError::ActorStopped`].
     pub async fn execute_script_in(
         &self,
-        frame: FrameId,
-        source: &str,
-        timeout: Option<Duration>,
+        options: ExecuteScriptInOptions<'_>,
     ) -> Result<RemoteValue, TabError> {
+        let ExecuteScriptInOptions {
+            frame,
+            source,
+            timeout,
+        } = options;
         match self
             .call(Command::Execute {
                 frame,
@@ -272,8 +302,12 @@ impl TabHandle {
         source: &str,
         timeout: Duration,
     ) -> Result<bool, TabError> {
-        self.run_until_js_true_in(FrameId::MAIN, source, timeout)
-            .await
+        self.run_until_js_true_in(RunUntilJsTrueInOptions {
+            frame: FrameId::MAIN,
+            source,
+            timeout,
+        })
+        .await
     }
 
     /// Waits until `source` evaluates to JS `true` in `frame`, returning
@@ -284,10 +318,13 @@ impl TabHandle {
     /// [`TabError::UnknownFrame`] or [`TabError::ActorStopped`].
     pub async fn run_until_js_true_in(
         &self,
-        frame: FrameId,
-        source: &str,
-        timeout: Duration,
+        options: RunUntilJsTrueInOptions<'_>,
     ) -> Result<bool, TabError> {
+        let RunUntilJsTrueInOptions {
+            frame,
+            source,
+            timeout,
+        } = options;
         match self
             .call(Command::RunUntilJsTrue {
                 frame,
@@ -368,15 +405,31 @@ pub(crate) struct TabTask {
     join: Option<JoinHandle<()>>,
 }
 
+/// Dependencies one [`TabTask`] coordinator starts with.
+pub(crate) struct SpawnOptions {
+    /// Tab identity to coordinate.
+    pub(crate) id: TabId,
+    /// Network capability for the tab.
+    pub(crate) network: TabNetworkHandle,
+    /// Renderer pool the tab acquires from.
+    pub(crate) renderers: Arc<RendererProcessManager>,
+}
+
 impl TabTask {
-    pub(crate) fn spawn(
-        id: TabId,
-        network: TabNetworkHandle,
-        renderers: Arc<RendererProcessManager>,
-    ) -> Self {
+    pub(crate) fn spawn(options: SpawnOptions) -> Self {
+        let SpawnOptions {
+            id,
+            network,
+            renderers,
+        } = options;
         let (client, server) = exchange::local(COMMAND_CAPACITY);
         let handle = TabHandle { id, client };
-        let tab = Tab::new(id, network, renderers, server.notifier());
+        let tab = Tab::new(TabOptions {
+            id,
+            network,
+            renderers,
+            events: server.notifier(),
+        });
         let join = tokio::spawn(coordinator_loop(server, tab));
         Self {
             handle,
@@ -432,13 +485,37 @@ struct Tab {
     events: TabNotifier,
 }
 
+/// Inputs for constructing one [`Tab`].
+struct TabOptions {
+    id: TabId,
+    network: TabNetworkHandle,
+    renderers: Arc<RendererProcessManager>,
+    events: TabNotifier,
+}
+
+/// One completed document mount into the tab's renderer.
+struct MountOptions<'a> {
+    site: &'a Site,
+    status: u16,
+    mount: Mount,
+}
+
+/// One streamed response mount into the tab's renderer.
+struct MountStreamOptions<'a> {
+    site: &'a Site,
+    status: u16,
+    mount: Mount,
+    body: net::Body,
+}
+
 impl Tab {
-    fn new(
-        id: TabId,
-        network: TabNetworkHandle,
-        renderers: Arc<RendererProcessManager>,
-        events: TabNotifier,
-    ) -> Self {
+    fn new(options: TabOptions) -> Self {
+        let TabOptions {
+            id,
+            network,
+            renderers,
+            events,
+        } = options;
         let (dial_tx, dial_rx) = mpsc::unbounded_channel();
         Self {
             id,
@@ -477,7 +554,12 @@ impl Tab {
             self.record_event(TabEvent::Load).await;
             return Ok(());
         }
-        self.mount(&site, 200, mount).await
+        self.mount(MountOptions {
+            site: &site,
+            status: 200,
+            mount,
+        })
+        .await
     }
 
     fn goto(&mut self, spec: &str) -> Result<(), TabError> {
@@ -515,7 +597,11 @@ impl Tab {
         }
         let handle = self
             .renderers
-            .acquire(self.id, site, self.network.clone())
+            .acquire(AssignmentContext {
+                tab: self.id,
+                site: site.clone(),
+                network: self.network.clone(),
+            })
             .await
             .map_err(|error| renderer_unavailable(&error.to_string()))?;
         self.drop_renderer().await;
@@ -525,7 +611,12 @@ impl Tab {
         Ok(())
     }
 
-    async fn mount(&mut self, site: &Site, status: u16, mount: Mount) -> Result<(), TabError> {
+    async fn mount(&mut self, options: MountOptions<'_>) -> Result<(), TabError> {
+        let MountOptions {
+            site,
+            status,
+            mount,
+        } = options;
         self.ensure_renderer(site).await?;
         self.pending_mount = None;
         self.document_loaded = false;
@@ -533,7 +624,11 @@ impl Tab {
             .renderer
             .as_ref()
             .ok_or(TabError::ActorStopped)?
-            .mount(FrameId::MAIN, status, mount)
+            .mount(AssignmentMountOptions {
+                frame: FrameId::MAIN,
+                status,
+                mount,
+            })
             .await
             .and_then(reply_unit);
         if result.is_err() {
@@ -542,19 +637,24 @@ impl Tab {
         result
     }
 
-    async fn mount_stream(
-        &mut self,
-        site: &Site,
-        status: u16,
-        mount: Mount,
-        mut body: net::Body,
-    ) -> Result<(), TabError> {
+    async fn mount_stream(&mut self, options: MountStreamOptions<'_>) -> Result<(), TabError> {
+        let MountStreamOptions {
+            site,
+            status,
+            mount,
+            mut body,
+        } = options;
+        self.ensure_renderer(site).await?;
         self.ensure_renderer(site).await?;
         self.pending_mount = None;
         self.document_loaded = false;
         let renderer = self.renderer.as_ref().ok_or(TabError::ActorStopped)?;
         let stream = renderer
-            .start_response(FrameId::MAIN, status, &mount)
+            .start_response(AssignmentStartResponseOptions {
+                frame: FrameId::MAIN,
+                status,
+                mount: &mount,
+            })
             .await?;
         let mut received = 0usize;
         loop {
@@ -641,7 +741,12 @@ impl Tab {
         let site = Site::for_url(&self.document_url)
             .or_else(|| self.site.clone())
             .unwrap_or_else(|| Site::opaque(self.id));
-        self.mount(&site, 200, mount).await
+        self.mount(MountOptions {
+            site: &site,
+            status: 200,
+            mount,
+        })
+        .await
     }
 
     fn launch_navigation(&mut self) {
@@ -656,9 +761,15 @@ impl Tab {
         let initiator = nav.initiator.clone();
         self.cancel_dial();
         let (cancel, cancel_rx) = watch::channel(false);
-        let guard =
-            self.network
-                .dial_navigation(epoch, url, initiator, self.dial_tx.clone(), cancel_rx);
+        let guard = self
+            .network
+            .dial_navigation(crate::network::DialNavigationOptions {
+                epoch,
+                url,
+                initiator,
+                reply: self.dial_tx.clone(),
+                cancel: cancel_rx,
+            });
         self.dial_cancel = Some(cancel);
         self.dial_guard = Some(guard);
         if let Some(nav) = self.nav.as_mut() {
@@ -709,7 +820,12 @@ impl Tab {
             body: Vec::new(),
         };
         if self
-            .mount_stream(&site, outcome.status, mount, outcome.body)
+            .mount_stream(MountStreamOptions {
+                site: &site,
+                status: outcome.status,
+                mount,
+                body: outcome.body,
+            })
             .await
             .is_err()
         {
@@ -784,7 +900,15 @@ async fn coordinator_loop(mut server: TabServer, mut tab: Tab) {
                 if cancelled.remove(&id) {
                     continue;
                 }
-                if handle_command(&mut tab, &server, id, body, &mut waiters).await {
+                if handle_command(HandleCommandOptions {
+                    tab: &mut tab,
+                    server: &server,
+                    id,
+                    command: body,
+                    waiters: &mut waiters,
+                })
+                .await
+                {
                     return;
                 }
             }
@@ -792,7 +916,11 @@ async fn coordinator_loop(mut server: TabServer, mut tab: Tab) {
                 let before = waiters.len();
                 waiters.retain(|waiter| waiter.id != id);
                 if waiters.len() == before {
-                    remember_cancelled(&mut cancelled, &mut cancelled_order, id);
+                    remember_cancelled(RememberCancelledOptions {
+                        cancelled: &mut cancelled,
+                        order: &mut cancelled_order,
+                        id,
+                    });
                 }
             }
             Wake::Command(Some(
@@ -808,10 +936,20 @@ async fn coordinator_loop(mut server: TabServer, mut tab: Tab) {
             Wake::Renderer(Some((frame, event))) => tab.handle_renderer_event(frame, event).await,
             Wake::Renderer(None) => {
                 tab.drop_renderer().await;
-                fail_waiters(&server, &mut waiters, &TabError::ActorStopped).await;
+                fail_waiters(FailWaitersOptions {
+                    server: &server,
+                    waiters: &mut waiters,
+                    error: &TabError::ActorStopped,
+                })
+                .await;
             }
         }
-        resolve_waiters(&mut tab, &server, &mut waiters).await;
+        resolve_waiters(ResolveWaitersOptions {
+            tab: &mut tab,
+            server: &server,
+            waiters: &mut waiters,
+        })
+        .await;
     }
     tab.stop_renderer().await;
 }
@@ -836,11 +974,56 @@ fn next_waiter_deadline(waiters: &[Waiter]) -> Option<Instant> {
     waiters.iter().map(|waiter| waiter.deadline).min()
 }
 
-fn remember_cancelled(
-    cancelled: &mut HashSet<RequestId>,
-    order: &mut VecDeque<RequestId>,
+/// Bounded record of cancelled waiter ids.
+struct RememberCancelledOptions<'a> {
+    cancelled: &'a mut HashSet<RequestId>,
+    order: &'a mut VecDeque<RequestId>,
     id: RequestId,
-) {
+}
+
+/// One coordinator command with its routing context.
+struct HandleCommandOptions<'a> {
+    tab: &'a mut Tab,
+    server: &'a TabServer,
+    id: RequestId,
+    command: Command,
+    waiters: &'a mut Vec<Waiter>,
+}
+
+/// One frame screenshot of the tab's live renderer.
+struct ScreenshotFrameOptions<'a> {
+    tab: &'a mut Tab,
+    frame: FrameId,
+    request: renderer::ScreenshotRequest,
+}
+
+/// One waiter registration.
+struct RetainWaiterOptions<'a> {
+    waiters: &'a mut Vec<Waiter>,
+    waiter: Waiter,
+    server: &'a TabServer,
+}
+
+/// One waiter failure broadcast.
+struct FailWaitersOptions<'a> {
+    server: &'a TabServer,
+    waiters: &'a mut Vec<Waiter>,
+    error: &'a TabError,
+}
+
+/// One waiter resolution pass over live tab state.
+struct ResolveWaitersOptions<'a> {
+    tab: &'a mut Tab,
+    server: &'a TabServer,
+    waiters: &'a mut Vec<Waiter>,
+}
+
+fn remember_cancelled(options: RememberCancelledOptions<'_>) {
+    let RememberCancelledOptions {
+        cancelled,
+        order,
+        id,
+    } = options;
     if cancelled.insert(id) {
         order.push_back(id);
     }
@@ -853,13 +1036,14 @@ fn remember_cancelled(
 }
 
 /// Handles one command. `true` means the coordinator returns.
-async fn handle_command(
-    tab: &mut Tab,
-    server: &TabServer,
-    id: RequestId,
-    command: Command,
-    waiters: &mut Vec<Waiter>,
-) -> bool {
+async fn handle_command(options: HandleCommandOptions<'_>) -> bool {
+    let HandleCommandOptions {
+        tab,
+        server,
+        id,
+        command,
+        waiters,
+    } = options;
     match command {
         Command::LoadHtml { html } => {
             let _result = server
@@ -885,19 +1069,24 @@ async fn handle_command(
             let _result = server.reply(id, TabReply::Execute(result)).await;
         }
         Command::Screenshot { frame, request } => {
-            let result = screenshot_frame(tab, frame, request).await;
+            let result = screenshot_frame(ScreenshotFrameOptions {
+                tab,
+                frame,
+                request,
+            })
+            .await;
             let _result = server.reply(id, TabReply::Screenshot(result)).await;
         }
         Command::RunUntilLoadTimeout { timeout } => {
-            retain_waiter(
+            retain_waiter(RetainWaiterOptions {
                 waiters,
-                Waiter {
+                waiter: Waiter {
                     id,
                     deadline: Instant::now() + timeout,
                     source: None,
                 },
                 server,
-            )
+            })
             .await;
         }
         Command::RunUntilJsTrue {
@@ -905,15 +1094,15 @@ async fn handle_command(
             source,
             timeout,
         } => {
-            retain_waiter(
+            retain_waiter(RetainWaiterOptions {
                 waiters,
-                Waiter {
+                waiter: Waiter {
                     id,
                     deadline: Instant::now() + timeout,
                     source: Some((frame, source)),
                 },
                 server,
-            )
+            })
             .await;
         }
         Command::DocumentUrl => {
@@ -939,16 +1128,22 @@ async fn handle_command(
     false
 }
 
-async fn screenshot_frame(
-    tab: &mut Tab,
-    frame: FrameId,
-    request: renderer::ScreenshotRequest,
-) -> Result<Vec<u8>, TabError> {
+async fn screenshot_frame(options: ScreenshotFrameOptions<'_>) -> Result<Vec<u8>, TabError> {
+    let ScreenshotFrameOptions {
+        tab,
+        frame,
+        request,
+    } = options;
     tab.renderer_request_bytes(RendererCommand::Screenshot { frame, request })
         .await
 }
 
-async fn retain_waiter(waiters: &mut Vec<Waiter>, waiter: Waiter, server: &TabServer) {
+async fn retain_waiter(options: RetainWaiterOptions<'_>) {
+    let RetainWaiterOptions {
+        waiters,
+        waiter,
+        server,
+    } = options;
     if waiters.len() < MAX_WAITERS {
         waiters.push(waiter);
         return;
@@ -960,14 +1155,24 @@ async fn retain_waiter(waiters: &mut Vec<Waiter>, waiter: Waiter, server: &TabSe
     let _result = server.reply(waiter.id, reply).await;
 }
 
-async fn fail_waiters(server: &TabServer, waiters: &mut Vec<Waiter>, error: &TabError) {
+async fn fail_waiters(options: FailWaitersOptions<'_>) {
+    let FailWaitersOptions {
+        server,
+        waiters,
+        error,
+    } = options;
     for waiter in waiters.drain(..) {
         let reply = waiter_reply(&waiter, Err(error.clone()));
         let _result = server.reply(waiter.id, reply).await;
     }
 }
 
-async fn resolve_waiters(tab: &mut Tab, server: &TabServer, waiters: &mut Vec<Waiter>) {
+async fn resolve_waiters(options: ResolveWaitersOptions<'_>) {
+    let ResolveWaitersOptions {
+        tab,
+        server,
+        waiters,
+    } = options;
     let now = Instant::now();
     let mut pending = Vec::new();
     for waiter in std::mem::take(waiters) {
