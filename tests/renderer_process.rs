@@ -538,6 +538,58 @@ fn window_messages_are_limited_to_related_tabs() {
     server.join().expect("server");
 }
 
+#[test]
+fn legal_storage_values_do_not_kill_the_renderer() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let address = listener.local_addr().expect("address");
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept");
+        let mut request = [0_u8; 1024];
+        let _ = stream.read(&mut request).expect("read request");
+        let body = b"<!doctype html><title>storage</title>";
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .expect("write head");
+        stream.write_all(body).expect("write body");
+    });
+
+    let mut fixture = Fixture::new("tinybrowser-renderer-storage");
+    fixture.spawn_daemon();
+    let _ = fixture.wait_json();
+    let mut client = fixture.connect();
+    let target = create(&mut client);
+    let session = attach(&mut client, &target);
+    client
+        .call("Page.enable", &json!({}), Some(&session))
+        .expect("enable");
+    client
+        .call(
+            "Page.navigate",
+            &json!({"url": format!("http://{address}/")}),
+            Some(&session),
+        )
+        .expect("navigate");
+    wait_for_load(&mut client, Duration::from_secs(5));
+
+    // 2,500,000 quotes encode to 5,000,002 bytes: inside the 5 MiB storage
+    // quota, but ~10 MiB on the wire once the control JSON escapes the
+    // encoded text. That frame must not stop the renderer.
+    assert_eq!(
+        eval(
+            &mut client,
+            &target,
+            "localStorage.setItem('big', '\"'.repeat(2500000)); localStorage.getItem('big').length"
+        )
+        .unwrap(),
+        "2500000"
+    );
+    assert_eq!(eval(&mut client, &target, "2+2").unwrap(), "4");
+    server.join().expect("server");
+}
+
 fn wait_for_load(client: &mut cdp::Client, timeout: Duration) {
     let deadline = Instant::now() + timeout;
     loop {
