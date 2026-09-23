@@ -15,6 +15,7 @@ use std::sync::{Arc, PoisonError};
 use tokio::sync::{Semaphore, mpsc};
 
 use crate::assignment::{Assignment, AssignmentOptions, AssignmentRegistry};
+use crate::browser::TabRegistry;
 use crate::context::PartitionServices;
 use crate::link::{RendererHandle, SpawnProcessOptions, spawn_process};
 use crate::site::Site;
@@ -33,6 +34,7 @@ struct ManagerInner {
     partition: PartitionServices,
     sessions: Arc<SessionStorage>,
     browser: crate::browser::BrowserHandle,
+    tabs: TabRegistry,
     next: AtomicU64,
     slots: Arc<Semaphore>,
     registry: Arc<AssignmentRegistry>,
@@ -52,6 +54,8 @@ pub(crate) struct RendererProcessManagerOptions {
     pub(crate) partition: PartitionServices,
     /// Session storage owned by the browser.
     pub(crate) sessions: Arc<SessionStorage>,
+    /// Tab registry handed to every renderer service task.
+    pub(crate) tabs: TabRegistry,
 }
 
 impl RendererProcessManager {
@@ -62,12 +66,14 @@ impl RendererProcessManager {
         let RendererProcessManagerOptions {
             partition,
             sessions,
+            tabs,
         } = services;
         let (releases, release_rx) = mpsc::unbounded_channel();
         let inner = Arc::new(ManagerInner {
             partition,
             sessions,
             browser,
+            tabs,
             next: AtomicU64::new(1),
             slots: Arc::new(Semaphore::new(renderer_process_limit())),
             registry: Arc::new(AssignmentRegistry::new(releases)),
@@ -225,6 +231,7 @@ async fn spawn_slot(
             sessions: Arc::clone(&inner.sessions),
             browser: inner.browser.clone(),
             registry: Arc::clone(&inner.registry),
+            tabs: inner.tabs.clone(),
             slot,
         })
         .await?,

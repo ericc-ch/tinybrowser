@@ -13,6 +13,7 @@ use tokio::process::Child;
 use crate::actor::TabId;
 use crate::assignment::{Assignment, AssignmentRegistry};
 use crate::broadcast::{BroadcastMessage, ContextEvent, StorageBroadcast};
+use crate::browser::TabRegistry;
 use crate::context::PartitionServices;
 use crate::exchange::{self, Frame, RequestId, ServerInput};
 use crate::manager::RendererId;
@@ -375,6 +376,9 @@ struct ReaderContext {
 struct ServiceContext {
     responder: BrowserServiceResponder,
     registry: Arc<AssignmentRegistry>,
+    /// Cross-tab calls resolve through this registry, never through the
+    /// browser owner task: the wait-for graph stays acyclic.
+    tabs: TabRegistry,
     partition: PartitionServices,
     sessions: Arc<SessionStorage>,
     kill: watch::Sender<bool>,
@@ -478,6 +482,8 @@ pub(crate) struct SpawnProcessOptions {
     pub(crate) browser: crate::browser::BrowserHandle,
     /// Assignment registry shared by every renderer of this browser context.
     pub(crate) registry: Arc<AssignmentRegistry>,
+    /// Tab registry for cross-tab calls from renderer service tasks.
+    pub(crate) tabs: TabRegistry,
     /// Process budget slot held for the renderer's life.
     pub(crate) slot: tokio::sync::OwnedSemaphorePermit,
 }
@@ -800,11 +806,7 @@ async fn route_service_call(options: RouteServiceCallOptions<'_>) -> Result<(), 
 
 /// Routes one `window.open`/`window.close`/`postMessage` service call. Step 1
 /// created the tab and its first navigation; step 2 adds the opener link and
-/// cross-tab messaging. This is a dispatch table over `BrowsingContextCall`.
-#[expect(
-    clippy::too_many_lines,
-    reason = "dispatch table over BrowsingContextCall; each arm is one validation plus one forward"
-)]
+/// cross-tab messaging.
 async fn route_window_call(options: RouteWindowCallOptions<'_>) -> Result<(), RendererViolation> {
     let RouteWindowCallOptions {
         context,
@@ -859,13 +861,7 @@ async fn route_window_call(options: RouteWindowCallOptions<'_>) -> Result<(), Re
             .await?;
         }
         BrowsingContextCall::Opener => {
-            let opener = context
-                .browser
-                .opener_tab(assignment.tab)
-                .await
-                .ok()
-                .flatten()
-                .map(TabId::get);
+            let opener = context.tabs.opener(assignment.tab).map(TabId::get);
             send_reply(SendReplyOptions {
                 responder: &context.responder,
                 id,
@@ -874,10 +870,10 @@ async fn route_window_call(options: RouteWindowCallOptions<'_>) -> Result<(), Re
             .await?;
         }
         BrowsingContextCall::WindowMessage { tab, payload } => {
-            let _result = context
-                .browser
-                .window_message(TabId::new(tab), payload)
-                .await;
+            // Enqueue on the target's mailbox and return: the spec's
+            // `postMessage` is asynchronous, and waiting here would let a
+            // busy target block this renderer.
+            let _queued = context.tabs.deliver(TabId::new(tab), payload).await;
             send_reply(SendReplyOptions {
                 responder: &context.responder,
                 id,
@@ -891,14 +887,8 @@ async fn route_window_call(options: RouteWindowCallOptions<'_>) -> Result<(), Re
             }
             let target = TabId::new(tab);
             let related = target == assignment.tab
-                || context.browser.opener_tab(target).await.ok().flatten() == Some(assignment.tab)
-                || context
-                    .browser
-                    .opener_tab(assignment.tab)
-                    .await
-                    .ok()
-                    .flatten()
-                    == Some(target);
+                || context.tabs.opener(target) == Some(assignment.tab)
+                || context.tabs.opener(assignment.tab) == Some(target);
             let value = related
                 .then(|| {
                     context.sessions.get(SessionKeyOptions {
@@ -1420,6 +1410,7 @@ pub(crate) async fn spawn_process(options: SpawnProcessOptions) -> io::Result<Re
         sessions,
         browser,
         registry,
+        tabs,
         slot,
     } = options;
     let mut command = Command::new(std::env::current_exe()?);
@@ -1463,6 +1454,7 @@ pub(crate) async fn spawn_process(options: SpawnProcessOptions) -> io::Result<Re
     let service_context = ServiceContext {
         responder: server.responder(),
         registry,
+        tabs,
         partition,
         sessions,
         kill: kill.clone(),

@@ -2,6 +2,8 @@
 
 mod task;
 
+pub(crate) use self::task::TabRegistry;
+
 use std::convert::Infallible;
 use std::fmt;
 use std::io;
@@ -99,8 +101,6 @@ pub(super) enum Command {
     ClearCookies,
     AddCookie { cookie: String, url: Url },
     OpenWindow(OpenWindowOptions),
-    OpenerTab { tab: TabId },
-    WindowMessage { target: TabId, payload: String },
 }
 
 pub(super) enum Reply {
@@ -113,8 +113,6 @@ pub(super) enum Reply {
     ClearCookies,
     AddCookie(bool),
     OpenWindow(Result<TabId, BrowserError>),
-    OpenerTab(Option<TabId>),
-    WindowMessage(Result<(), BrowserError>),
 }
 
 #[derive(Clone)]
@@ -177,20 +175,6 @@ pub(super) struct AddCookie {
     pub(super) cookie: String,
     /// URL the cookie belongs to.
     pub(super) url: Url,
-}
-
-/// Returns the opener of one tab, if it has one.
-pub(super) struct OpenerTab {
-    /// Tab whose opener to return.
-    pub(super) tab: TabId,
-}
-
-/// Routes one `postMessage` into its target tab.
-pub(super) struct WindowMessage {
-    /// Tab receiving the message.
-    pub(super) target: TabId,
-    /// Encoded message payload.
-    pub(super) payload: String,
 }
 
 impl Browser {
@@ -391,18 +375,6 @@ impl BrowserHandle {
         request: OpenWindowOptions,
     ) -> Result<TabId, BrowserError> {
         self.ask(request).await?
-    }
-
-    pub(crate) async fn opener_tab(&self, tab: TabId) -> Result<Option<TabId>, BrowserError> {
-        self.ask(OpenerTab { tab }).await
-    }
-
-    pub(crate) async fn window_message(
-        &self,
-        target: TabId,
-        payload: String,
-    ) -> Result<(), BrowserError> {
-        self.ask(WindowMessage { target, payload }).await?
     }
 
     /// Stops every tab and persists profile state.

@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 
 use crate::actor::{TabHandle, TabId, TabTask};
 use crate::context::BrowserContext;
@@ -9,16 +9,124 @@ use crate::manager::{RendererProcessManager, RendererProcessManagerOptions};
 use super::{
     AddCookie, BrowserError, BrowserHandle, BrowserOperation, BrowserServer, ClearCookies,
     CloseTab, Command, CookieRecords, CreateTab, GetTab, ListTabs, Notice, OpenWindowOptions,
-    OpenerTab, Reply, WindowMessage,
+    Reply,
 };
+
+/// The browser's tab table, shared with renderer service tasks.
+///
+/// Service tasks resolve cross-tab calls through this registry, so the browser
+/// owner task never waits on a tab coordinator and the wait-for graph stays
+/// acyclic. `postMessage` enqueues on the target tab's delivery mailbox and
+/// returns; a busy target cannot block the sender's renderer.
+#[derive(Clone)]
+pub(crate) struct TabRegistry {
+    tabs: Arc<Mutex<HashMap<TabId, TabTask>>>,
+    openers: Arc<Mutex<HashMap<TabId, TabId>>>,
+}
+
+impl TabRegistry {
+    fn new() -> Self {
+        Self {
+            tabs: Arc::new(Mutex::new(HashMap::new())),
+            openers: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// The handle of one live tab.
+    pub(crate) fn tab(&self, id: TabId) -> Option<TabHandle> {
+        self.tabs
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&id)
+            .map(|task| task.handle.clone())
+    }
+
+    /// The opener of one live tab.
+    pub(crate) fn opener(&self, id: TabId) -> Option<TabId> {
+        self.openers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&id)
+            .copied()
+    }
+
+    /// Queues one `postMessage` payload on the target tab's mailbox. Returns
+    /// false when the tab is gone or its coordinator stopped.
+    pub(crate) async fn deliver(&self, id: TabId, payload: String) -> bool {
+        let sender = self
+            .tabs
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&id)
+            .map(TabTask::deliveries);
+        match sender {
+            Some(sender) => {
+                let queued = sender.send(payload).await.is_ok();
+                if queued {
+                    logging::debug!(
+                        target: "browser::tabs",
+                        "window message queued for tab {id}"
+                    );
+                }
+                queued
+            }
+            None => false,
+        }
+    }
+
+    fn ids(&self) -> Vec<TabId> {
+        self.tabs
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .keys()
+            .copied()
+            .collect()
+    }
+
+    fn insert(&self, id: TabId, task: TabTask) {
+        self.tabs
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(id, task);
+    }
+
+    fn remove(&self, id: TabId) -> Option<TabTask> {
+        self.tabs
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&id)
+    }
+
+    fn drain(&self) -> Vec<TabTask> {
+        self.tabs
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .drain()
+            .map(|(_, task)| task)
+            .collect()
+    }
+
+    fn set_opener(&self, id: TabId, opener: TabId) {
+        self.openers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(id, opener);
+    }
+
+    fn remove_opener(&self, id: TabId) {
+        self.openers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&id);
+    }
+}
 
 pub(crate) struct BrowserTask {
     server: BrowserServer,
     context: BrowserContext,
     renderers: Arc<RendererProcessManager>,
-    tabs: HashMap<TabId, TabTask>,
+    tabs: TabRegistry,
     next_tab: Option<u64>,
-    openers: HashMap<TabId, TabId>,
 }
 
 /// Dependencies one [`BrowserTask`] starts with.
@@ -43,20 +151,21 @@ impl BrowserTask {
             context,
             browser,
         } = parts;
+        let tabs = TabRegistry::new();
         let renderers = Arc::new(RendererProcessManager::new(
             browser,
             RendererProcessManagerOptions {
                 partition: context.partition_services(),
                 sessions: context.session_storage(),
+                tabs: tabs.clone(),
             },
         ));
         Self {
             server,
             context,
             renderers,
-            tabs: HashMap::new(),
+            tabs,
             next_tab: Some(1),
-            openers: HashMap::new(),
         }
     }
 
@@ -96,10 +205,6 @@ impl BrowserTask {
             Command::ClearCookies => ClearCookies.serve(self).await,
             Command::AddCookie { cookie, url } => AddCookie { cookie, url }.serve(self).await,
             Command::OpenWindow(request) => request.serve(self).await,
-            Command::OpenerTab { tab } => OpenerTab { tab }.serve(self).await,
-            Command::WindowMessage { target, payload } => {
-                WindowMessage { target, payload }.serve(self).await
-            }
             Command::Close => {
                 let result = self.shutdown().await;
                 return DispatchOutcome::Stop(Reply::Close(result));
@@ -123,12 +228,15 @@ impl BrowserTask {
         Ok(handle)
     }
 
-    async fn close_tab(&mut self, id: TabId) -> Result<(), BrowserError> {
-        let Some(mut task) = self.tabs.remove(&id) else {
+    fn close_tab(&mut self, id: TabId) -> Result<(), BrowserError> {
+        let Some(mut task) = self.tabs.remove(id) else {
             return Err(BrowserError::UnknownTab);
         };
-        self.openers.remove(&id);
-        task.shutdown().await;
+        self.tabs.remove_opener(id);
+        // Never wait on the tab coordinator here: the browser owner task must
+        // not join a wait-for cycle with a renderer that needs it. The task
+        // keeps its own lifecycle and reaps itself.
+        tokio::spawn(async move { task.shutdown().await });
         self.context.close_tab(id);
         Ok(())
     }
@@ -142,7 +250,7 @@ impl BrowserTask {
         let handle = self.create_tab()?;
         let id = handle.id();
         if let (Some(source), false) = (source, noopener) {
-            self.openers.insert(id, source);
+            self.tabs.set_opener(id, source);
             self.context.copy_session(source, id);
         }
         if !url.is_empty() && url != "about:blank" {
@@ -154,7 +262,7 @@ impl BrowserTask {
     }
 
     async fn shutdown(&mut self) -> std::io::Result<()> {
-        for mut task in self.tabs.drain().map(|(_, task)| task) {
+        for mut task in self.tabs.drain() {
             task.shutdown().await;
         }
         self.context.persist().await
@@ -203,7 +311,7 @@ impl BrowserOperation for ListTabs {
         reason = "serve is async by BrowserOperation contract; this op resolves synchronously"
     )]
     async fn serve(self, task: &mut BrowserTask) -> Reply {
-        Reply::Tabs(task.tabs.keys().copied().collect())
+        Reply::Tabs(task.tabs.ids())
     }
 }
 
@@ -226,12 +334,7 @@ impl BrowserOperation for GetTab {
         reason = "serve is async by BrowserOperation contract; this op resolves synchronously"
     )]
     async fn serve(self, task: &mut BrowserTask) -> Reply {
-        Reply::Tab(
-            task.tabs
-                .get(&self.id)
-                .map(|task| task.handle.clone())
-                .ok_or(BrowserError::UnknownTab),
-        )
+        Reply::Tab(task.tabs.tab(self.id).ok_or(BrowserError::UnknownTab))
     }
 }
 
@@ -249,8 +352,12 @@ impl BrowserOperation for CloseTab {
         }
     }
 
+    #[expect(
+        clippy::unused_async_trait_impl,
+        reason = "serve is async by BrowserOperation contract; this op resolves synchronously"
+    )]
     async fn serve(self, task: &mut BrowserTask) -> Reply {
-        Reply::CloseTab(task.close_tab(self.id).await)
+        Reply::CloseTab(task.close_tab(self.id))
     }
 }
 
@@ -347,58 +454,5 @@ impl BrowserOperation for OpenWindowOptions {
     )]
     async fn serve(self, task: &mut BrowserTask) -> Reply {
         Reply::OpenWindow(task.open_window(self))
-    }
-}
-
-impl BrowserOperation for OpenerTab {
-    type Output = Option<TabId>;
-
-    fn into_command(self) -> Command {
-        Command::OpenerTab { tab: self.tab }
-    }
-
-    fn unwrap(reply: Reply) -> Option<Self::Output> {
-        match reply {
-            Reply::OpenerTab(tab) => Some(tab),
-            _ => None,
-        }
-    }
-
-    #[expect(
-        clippy::unused_async_trait_impl,
-        reason = "serve is async by BrowserOperation contract; this op resolves synchronously"
-    )]
-    async fn serve(self, task: &mut BrowserTask) -> Reply {
-        Reply::OpenerTab(task.openers.get(&self.tab).copied())
-    }
-}
-
-impl BrowserOperation for WindowMessage {
-    type Output = Result<(), BrowserError>;
-
-    fn into_command(self) -> Command {
-        Command::WindowMessage {
-            target: self.target,
-            payload: self.payload,
-        }
-    }
-
-    fn unwrap(reply: Reply) -> Option<Self::Output> {
-        match reply {
-            Reply::WindowMessage(result) => Some(result),
-            _ => None,
-        }
-    }
-
-    async fn serve(self, task: &mut BrowserTask) -> Reply {
-        let handle = task.tabs.get(&self.target).map(|task| task.handle.clone());
-        let result = match handle {
-            Some(handle) => handle
-                .window_message(self.payload)
-                .await
-                .map_err(|_| BrowserError::UnknownTab),
-            None => Err(BrowserError::UnknownTab),
-        };
-        Reply::WindowMessage(result)
     }
 }

@@ -322,8 +322,13 @@ fn a_wedged_renderer_is_interrupted_and_the_tab_recovers() {
     // A blocking script must time out, interrupt the renderer, and return
     // instead of holding the tab for the full request budget.
     let started = Instant::now();
-    let blocked = eval(&mut client, &target, "while(true){}");
+    let blocked = eval(&mut client, &target, "(() => { while(true){} })()");
     assert!(blocked.is_err(), "wedged eval must fail: {blocked:?}");
+    assert!(
+        started.elapsed() >= Duration::from_millis(400),
+        "eval returned before the request deadline: {:?}",
+        started.elapsed()
+    );
     assert!(
         started.elapsed() < Duration::from_secs(5),
         "wedged eval did not time out: {:?}",
@@ -337,6 +342,118 @@ fn a_wedged_renderer_is_interrupted_and_the_tab_recovers() {
         .expect("renavigate");
     wait_for_load(&mut client, Duration::from_secs(10));
     assert_eq!(eval(&mut client, &target, "2+2").unwrap(), "4");
+    server.join().expect("server");
+}
+
+#[test]
+fn post_message_to_a_busy_tab_does_not_block_the_sender() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let address = listener.local_addr().expect("address");
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept");
+        let mut request = [0_u8; 1024];
+        let _ = stream.read(&mut request).expect("read request");
+        let body = b"<!doctype html><title>sender</title>";
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .expect("write head");
+        stream.write_all(body).expect("write body");
+    });
+
+    let mut fixture = Fixture::new("tinybrowser-renderer-messaging");
+    fixture.spawn_daemon_with_env("TINYBROWSER_LOG", "debug");
+    let _ = fixture.wait_json();
+    let mut client = fixture.connect();
+    let initial = target_ids(&mut client);
+    let sender = create(&mut client);
+    let session = attach(&mut client, &sender);
+    client
+        .call("Page.enable", &json!({}), Some(&session))
+        .expect("enable");
+    client
+        .call(
+            "Page.navigate",
+            &json!({"url": format!("http://{address}/")}),
+            Some(&session),
+        )
+        .expect("navigate");
+    wait_for_load(&mut client, Duration::from_secs(5));
+    assert_eq!(
+        eval(
+            &mut client,
+            &sender,
+            "window.__peer = window.open('about:blank', 'peer'); !!window.__peer"
+        )
+        .unwrap(),
+        "true"
+    );
+    let receiver = target_ids(&mut client)
+        .into_iter()
+        .find(|target| *target != sender && !initial.contains(target))
+        .expect("opened target");
+
+    // Wedge the receiving tab's coordinator inside a renderer request.
+    let endpoint = fixture.endpoint();
+    let blocked_target = receiver.clone();
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let blocking_thread = std::thread::spawn(move || {
+        let mut runner = cdp::Client::connect(endpoint).expect("runner connect");
+        let result = eval(&mut runner, &blocked_target, "(() => { while(true){} })()");
+        let _ = done_tx.send(result);
+    });
+    std::thread::sleep(Duration::from_millis(300));
+    // A second command to the wedged tab must not answer: that is what makes
+    // the sender's postMessage a real test.
+    let endpoint = fixture.endpoint();
+    let probed_target = receiver.clone();
+    let (probe_tx, probe_rx) = std::sync::mpsc::channel();
+    let probing_thread = std::thread::spawn(move || {
+        let mut runner = cdp::Client::connect(endpoint).expect("runner connect");
+        let result = eval(&mut runner, &probed_target, "1");
+        let _ = probe_tx.send(result);
+    });
+    assert!(
+        probe_rx.recv_timeout(Duration::from_millis(500)).is_err(),
+        "receiver answered while wedged"
+    );
+
+    // postMessage is asynchronous: it must return while the receiver is busy.
+    let started = Instant::now();
+    let sent = eval(&mut client, &sender, "window.__peer.postMessage('ping')");
+    assert!(sent.is_ok(), "postMessage failed: {sent:?}");
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "postMessage blocked on the busy receiver: {:?}",
+        started.elapsed()
+    );
+
+    // The message reached the target's delivery mailbox.
+    let path = fixture.data.join("tinybrowser/logs/default.log");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let text = std::fs::read_to_string(&path).unwrap_or_default();
+        if text.contains("window message queued for tab") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "delivery never reached the mailbox: {text}"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+
+    // The sender's renderer is still responsive.
+    assert_eq!(eval(&mut client, &sender, "2+2").unwrap(), "4");
+
+    close(&mut client, &receiver);
+    close(&mut client, &sender);
+    let _ = done_rx.recv_timeout(Duration::from_secs(5));
+    blocking_thread.join().expect("blocking thread");
+    let _ = probe_rx.recv_timeout(Duration::from_secs(5));
+    probing_thread.join().expect("probing thread");
     server.join().expect("server");
 }
 

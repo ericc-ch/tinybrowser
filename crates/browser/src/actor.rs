@@ -27,6 +27,9 @@ use crate::site::Site;
 
 const EVENT_SUBSCRIBER_CAPACITY: usize = 256;
 const COMMAND_CAPACITY: usize = 256;
+/// Bounded `postMessage` mailbox per tab. Senders wait for capacity instead of
+/// dropping messages; the coordinator drains it in order.
+const DELIVERY_CAPACITY: usize = 256;
 const MAX_WAITERS: usize = 256;
 const MAX_SUBSCRIBERS: usize = 256;
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
@@ -90,10 +93,6 @@ enum Command {
         source: String,
         timeout: Duration,
     },
-    /// Routes one `postMessage` from another tab into this tab's window.
-    WindowMessage {
-        payload: String,
-    },
     DocumentUrl,
     LastNavigationFailed,
     Shutdown,
@@ -106,7 +105,6 @@ enum TabReply {
     Screenshot(Result<Vec<u8>, TabError>),
     RunUntilLoad(Result<bool, TabError>),
     RunUntilJs(Result<bool, TabError>),
-    WindowMessage(Result<(), TabError>),
     DocumentUrl(String),
     LastNavigationFailed(bool),
     Shutdown,
@@ -192,12 +190,6 @@ struct RunUntilJs {
     source: String,
     /// Maximum time to wait.
     timeout: Duration,
-}
-
-/// Delivers one remote `window` `message` payload into the tab.
-struct WindowMessage {
-    /// Encoded message payload.
-    payload: String,
 }
 
 /// Returns the document URL after navigation.
@@ -430,15 +422,6 @@ impl TabHandle {
         self.ask(LastNavigationFailed).await
     }
 
-    /// Delivers one remote `window` `message` payload into this tab.
-    ///
-    /// # Errors
-    ///
-    /// [`TabError::ActorStopped`] when the coordinator or renderer is gone.
-    pub async fn window_message(&self, payload: String) -> Result<(), TabError> {
-        self.ask(WindowMessage { payload }).await?
-    }
-
     async fn call(&self, command: Command) -> Result<TabReply, TabError> {
         self.client
             .call(command)
@@ -451,9 +434,13 @@ impl TabHandle {
     }
 }
 
-/// Join handle and command sender for one tab coordinator task.
+/// Join handle and delivery mailbox for one tab coordinator task.
 pub(crate) struct TabTask {
     pub handle: TabHandle,
+    /// Ordered `postMessage` deliveries for this tab. Senders wait for
+    /// capacity; the coordinator drains it in order, so a busy target never
+    /// blocks the sender's renderer or the browser owner task.
+    deliveries: mpsc::Sender<String>,
     join: Option<JoinHandle<()>>,
 }
 
@@ -482,11 +469,18 @@ impl TabTask {
             renderers,
             events: server.notifier(),
         });
-        let join = tokio::spawn(coordinator_loop(server, tab));
+        let (deliveries, delivery_rx) = mpsc::channel(DELIVERY_CAPACITY);
+        let join = tokio::spawn(coordinator_loop(server, tab, delivery_rx));
         Self {
             handle,
+            deliveries,
             join: Some(join),
         }
+    }
+
+    /// The tab's `postMessage` mailbox.
+    pub(crate) fn deliveries(&self) -> mpsc::Sender<String> {
+        self.deliveries.clone()
     }
 
     pub(crate) async fn shutdown(&mut self) {
@@ -937,13 +931,19 @@ enum Wake {
     Command(Option<ServerInput<Command, Infallible>>),
     Navigation(Option<(u64, Result<NavOutcome, DialFailure>)>),
     Renderer(Option<(FrameId, RendererEvent)>),
+    Delivery(Option<String>),
     WaiterDeadline,
 }
 
-async fn coordinator_loop(mut server: TabServer, mut tab: Tab) {
+async fn coordinator_loop(
+    mut server: TabServer,
+    mut tab: Tab,
+    delivery_rx: mpsc::Receiver<String>,
+) {
     let mut waiters = Vec::new();
     let mut cancelled = HashSet::new();
     let mut cancelled_order = VecDeque::new();
+    let mut delivery_rx = Some(delivery_rx);
     loop {
         tab.launch_navigation();
         let deadline = next_waiter_deadline(&waiters);
@@ -954,6 +954,7 @@ async fn coordinator_loop(mut server: TabServer, mut tab: Tab) {
                 command = server.recv() => Wake::Command(command),
                 navigation = dial_rx.recv() => Wake::Navigation(navigation),
                 event = next_renderer_event(events_rx) => Wake::Renderer(event),
+                delivery = next_delivery(&mut delivery_rx) => Wake::Delivery(delivery),
                 () = wait_for_deadline(deadline) => Wake::WaiterDeadline,
             }
         };
@@ -1005,6 +1006,13 @@ async fn coordinator_loop(mut server: TabServer, mut tab: Tab) {
                 })
                 .await;
             }
+            Wake::Delivery(Some(payload)) => {
+                let _result = tab.deliver_window_message(payload).await;
+            }
+            Wake::Delivery(None) => {
+                // Every delivery sender is gone; stop selecting on the lane.
+                delivery_rx = None;
+            }
         }
         resolve_waiters(ResolveWaitersOptions {
             tab: &mut tab,
@@ -1020,6 +1028,13 @@ async fn next_renderer_event(
     events: &mut Option<mpsc::Receiver<(FrameId, RendererEvent)>>,
 ) -> Option<(FrameId, RendererEvent)> {
     match events {
+        Some(receiver) => receiver.recv().await,
+        None => pending().await,
+    }
+}
+
+async fn next_delivery(deliveries: &mut Option<mpsc::Receiver<String>>) -> Option<String> {
+    match deliveries {
         Some(receiver) => receiver.recv().await,
         None => pending().await,
     }
@@ -1147,7 +1162,6 @@ async fn handle_command(options: HandleCommandOptions<'_>) -> bool {
         }
         Command::DocumentUrl => DocumentUrl.serve(ctx).await,
         Command::LastNavigationFailed => LastNavigationFailed.serve(ctx).await,
-        Command::WindowMessage { payload } => WindowMessage { payload }.serve(ctx).await,
         Command::Shutdown => Shutdown.serve(ctx).await,
     };
     match outcome {
@@ -1389,29 +1403,6 @@ impl TabOperation for LastNavigationFailed {
     async fn serve(self, ctx: ServeContext<'_>) -> TabOutcome {
         let ServeContext { tab, .. } = ctx;
         TabOutcome::Reply(TabReply::LastNavigationFailed(tab.navigation_failed))
-    }
-}
-
-impl TabOperation for WindowMessage {
-    type Output = Result<(), TabError>;
-
-    fn into_command(self) -> Command {
-        Command::WindowMessage {
-            payload: self.payload,
-        }
-    }
-
-    fn unwrap(reply: TabReply) -> Option<Self::Output> {
-        match reply {
-            TabReply::WindowMessage(result) => Some(result),
-            _ => None,
-        }
-    }
-
-    async fn serve(self, ctx: ServeContext<'_>) -> TabOutcome {
-        let ServeContext { tab, .. } = ctx;
-        let result = tab.deliver_window_message(self.payload).await;
-        TabOutcome::Reply(TabReply::WindowMessage(result))
     }
 }
 
