@@ -666,6 +666,7 @@ impl Tab {
         self.ensure_renderer(site).await?;
         self.pending_mount = None;
         self.document_loaded = false;
+        let document_url = mount.url.clone();
         let result = self
             .renderer
             .as_ref()
@@ -679,6 +680,8 @@ impl Tab {
             .and_then(reply_unit);
         if result.is_err() {
             self.drop_renderer();
+        } else {
+            self.record_committed_origin(&document_url);
         }
         result
     }
@@ -693,6 +696,7 @@ impl Tab {
         self.ensure_renderer(site).await?;
         self.pending_mount = None;
         self.document_loaded = false;
+        let document_url = mount.url.clone();
         let renderer = self.renderer.as_ref().ok_or(TabError::ActorStopped)?;
         let stream = renderer
             .start_response(AssignmentStartResponseOptions {
@@ -729,8 +733,19 @@ impl Tab {
         let result = stream.finish().await.and_then(reply_unit);
         if result.is_err() {
             self.drop_renderer();
+        } else {
+            self.record_committed_origin(&document_url);
         }
         result
+    }
+
+    /// Records the browser-owned origin of the document the renderer mounted.
+    fn record_committed_origin(&self, url: &str) {
+        if let Some(renderer) = self.renderer.as_ref()
+            && let Ok(url) = Url::parse(url)
+        {
+            renderer.set_committed_origin(url.origin());
+        }
     }
 
     fn drop_renderer(&mut self) {

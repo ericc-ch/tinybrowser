@@ -13,6 +13,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, Weak};
 
 use tokio::sync::mpsc;
+use url::{Origin, Url};
 
 use crate::actor::TabId;
 use crate::link::{
@@ -49,6 +50,10 @@ pub(crate) struct Assignment {
     pub(crate) site: Site,
     /// Network handle for the tab's dials and cookies.
     pub(crate) network: TabNetworkHandle,
+    /// Origin of the top-level document the browser last mounted, recorded by
+    /// the browser, never by the renderer. `None` before the first mount;
+    /// opaque for `about:blank` and friends.
+    committed_origin: Mutex<Option<Origin>>,
     subscribers: Mutex<Vec<mpsc::Sender<(FrameId, RendererEvent)>>>,
 }
 
@@ -77,6 +82,37 @@ impl Assignment {
     #[must_use]
     pub(crate) fn id(&self) -> RendererAssignmentId {
         self.id
+    }
+
+    /// Records the origin the browser mounted for this top-level document.
+    pub(crate) fn set_committed_origin(&self, origin: Origin) {
+        *self
+            .committed_origin
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(origin);
+    }
+
+    /// The browser-owned committed origin of this top-level document.
+    #[must_use]
+    pub(crate) fn committed_origin(&self) -> Option<Origin> {
+        self.committed_origin
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Authorizes a renderer-supplied origin string for a top-level claim: a
+    /// committed document must match its origin exactly; opaque documents
+    /// fall back to the process site lock.
+    #[must_use]
+    pub(crate) fn authorize_origin(&self, spec: &str) -> bool {
+        let Ok(url) = Url::parse(spec) else {
+            return false;
+        };
+        match self.committed_origin() {
+            Some(origin) if origin.is_tuple() => url.origin() == origin,
+            _ => self.site.authorize(spec).is_some(),
+        }
     }
 
     pub(crate) async fn request(&self, command: RendererCommand) -> Result<Reply, TabError> {
@@ -226,6 +262,7 @@ impl AssignmentRegistry {
             tab: options.tab,
             site: options.site,
             network: options.network,
+            committed_origin: Mutex::new(None),
             subscribers: Mutex::new(Vec::new()),
         });
         self.live

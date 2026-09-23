@@ -428,6 +428,19 @@ struct RouteWindowCallOptions<'a> {
     call: BrowsingContextCall,
 }
 
+/// Whether a page may close `target`: itself or a tab it opened.
+fn close_related(context: &ServiceContext, assignment: &Assignment, target: TabId) -> bool {
+    target == assignment.tab || context.tabs.opener(target) == Some(assignment.tab)
+}
+
+/// Whether a page may address `target` with `postMessage`: itself, its
+/// opener, or a tab it opened.
+fn message_related(context: &ServiceContext, assignment: &Assignment, target: TabId) -> bool {
+    target == assignment.tab
+        || context.tabs.opener(target) == Some(assignment.tab)
+        || context.tabs.opener(assignment.tab) == Some(target)
+}
+
 /// One storage service call from a renderer.
 struct RouteStorageCallOptions<'a> {
     context: &'a ServiceContext,
@@ -765,6 +778,11 @@ async fn route_service_call(options: RouteServiceCallOptions<'_>) -> Result<(), 
             payload,
             channel,
         }) => {
+            // `BroadcastChannel` is origin-scoped; a frame's origin is the
+            // frame's, so the browser bound is the process site lock.
+            if assignment.site.authorize(&origin).is_none() {
+                return Err(RendererViolation);
+            }
             context
                 .partition
                 .events
@@ -805,8 +823,13 @@ async fn route_service_call(options: RouteServiceCallOptions<'_>) -> Result<(), 
 }
 
 /// Routes one `window.open`/`window.close`/`postMessage` service call. Step 1
-/// created the tab and its first navigation; step 2 adds the opener link and
-/// cross-tab messaging.
+/// created the tab and its first navigation; step 2 adds the opener link,
+/// cross-tab messaging, and the relatedness gates. This is a dispatch table
+/// over `BrowsingContextCall`.
+#[expect(
+    clippy::too_many_lines,
+    reason = "dispatch table over BrowsingContextCall; each arm is one validation plus one forward"
+)]
 async fn route_window_call(options: RouteWindowCallOptions<'_>) -> Result<(), RendererViolation> {
     let RouteWindowCallOptions {
         context,
@@ -852,7 +875,12 @@ async fn route_window_call(options: RouteWindowCallOptions<'_>) -> Result<(), Re
             .await?;
         }
         BrowsingContextCall::WindowClose { tab } => {
-            let _result = context.browser.close_tab(TabId::new(tab)).await;
+            let target = TabId::new(tab);
+            // A page may close itself or a tab it opened; anything else is a
+            // forged target.
+            if close_related(context, assignment, target) {
+                let _result = context.browser.close_tab(target).await;
+            }
             send_reply(SendReplyOptions {
                 responder: &context.responder,
                 id,
@@ -870,10 +898,16 @@ async fn route_window_call(options: RouteWindowCallOptions<'_>) -> Result<(), Re
             .await?;
         }
         BrowsingContextCall::WindowMessage { tab, payload } => {
-            // Enqueue on the target's mailbox and return: the spec's
-            // `postMessage` is asynchronous, and waiting here would let a
-            // busy target block this renderer.
-            let _queued = context.tabs.deliver(TabId::new(tab), payload).await;
+            // A page can only hold a `WindowProxy` for a related window: its
+            // own, its opener, or a tab it opened. An unrelated target is a
+            // forged call and is ignored.
+            let target = TabId::new(tab);
+            if message_related(context, assignment, target) {
+                // Enqueue on the target's mailbox and return: the spec's
+                // `postMessage` is asynchronous, and waiting here would let a
+                // busy target block this renderer.
+                let _queued = context.tabs.deliver(target, payload).await;
+            }
             send_reply(SendReplyOptions {
                 responder: &context.responder,
                 id,
@@ -882,7 +916,7 @@ async fn route_window_call(options: RouteWindowCallOptions<'_>) -> Result<(), Re
             .await?;
         }
         BrowsingContextCall::RemoteSessionGet { tab, origin, key } => {
-            if assignment.site.authorize(&origin).is_none() {
+            if !assignment.authorize_origin(&origin) {
                 return Err(RendererViolation);
             }
             let target = TabId::new(tab);

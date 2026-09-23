@@ -457,6 +457,87 @@ fn post_message_to_a_busy_tab_does_not_block_the_sender() {
     server.join().expect("server");
 }
 
+#[test]
+fn window_messages_are_limited_to_related_tabs() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let address = listener.local_addr().expect("address");
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept");
+        let mut request = [0_u8; 1024];
+        let _ = stream.read(&mut request).expect("read request");
+        let body = b"<!doctype html><title>related</title>";
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .expect("write head");
+        stream.write_all(body).expect("write body");
+    });
+
+    let mut fixture = Fixture::new("tinybrowser-renderer-related");
+    fixture.spawn_daemon_with_env("TINYBROWSER_LOG", "debug");
+    let _ = fixture.wait_json();
+    let mut client = fixture.connect();
+    let initial = target_ids(&mut client);
+    let unrelated: u64 = initial[0].parse().expect("numeric target id");
+    let sender = create(&mut client);
+    let session = attach(&mut client, &sender);
+    client
+        .call("Page.enable", &json!({}), Some(&session))
+        .expect("enable");
+    client
+        .call(
+            "Page.navigate",
+            &json!({"url": format!("http://{address}/")}),
+            Some(&session),
+        )
+        .expect("navigate");
+    wait_for_load(&mut client, Duration::from_secs(5));
+
+    // Forged: the host entry point names a tab this document never opened.
+    let forged = eval(
+        &mut client,
+        &sender,
+        &format!("__tbWindowPostMessage({unrelated}, '{{}}'); true"),
+    )
+    .unwrap();
+    assert_eq!(forged, "true");
+    std::thread::sleep(Duration::from_millis(300));
+    let path = fixture.data.join("tinybrowser/logs/default.log");
+    let log = std::fs::read_to_string(&path).unwrap_or_default();
+    assert!(
+        !log.contains("window message queued"),
+        "an unrelated target received a message: {log}"
+    );
+    assert_eq!(eval(&mut client, &sender, "2+2").unwrap(), "4");
+
+    // Legit: a tab this document opened is related and receives the message.
+    assert_eq!(
+        eval(
+            &mut client,
+            &sender,
+            "window.__peer = window.open('about:blank', 'peer'); !!window.__peer"
+        )
+        .unwrap(),
+        "true"
+    );
+    eval(&mut client, &sender, "window.__peer.postMessage('ping')").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let text = std::fs::read_to_string(&path).unwrap_or_default();
+        if text.contains("window message queued") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "related delivery never reached the mailbox: {text}"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    server.join().expect("server");
+}
+
 fn wait_for_load(client: &mut cdp::Client, timeout: Duration) {
     let deadline = Instant::now() + timeout;
     loop {
