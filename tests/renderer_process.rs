@@ -285,6 +285,76 @@ fn aborted_tab_releases_its_assignment() {
 }
 
 #[test]
+fn a_wedged_renderer_is_interrupted_and_the_tab_recovers() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let address = listener.local_addr().expect("address");
+    let server = std::thread::spawn(move || {
+        for _ in 0..2 {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut request = [0_u8; 1024];
+            let _ = stream.read(&mut request).expect("read request");
+            let body = b"<!doctype html><title>timeout</title>";
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .expect("write head");
+            stream.write_all(body).expect("write body");
+        }
+    });
+
+    let mut fixture = Fixture::new("tinybrowser-renderer-timeout");
+    fixture.spawn_daemon_with_env("TINYBROWSER_RENDERER_REQUEST_TIMEOUT_MS", "500");
+    let _ = fixture.wait_json();
+    let mut client = fixture.connect();
+    let target = create(&mut client);
+    let session = attach(&mut client, &target);
+    client
+        .call("Page.enable", &json!({}), Some(&session))
+        .expect("enable");
+    let url = format!("http://{address}/");
+    client
+        .call("Page.navigate", &json!({"url": url}), Some(&session))
+        .expect("navigate");
+    wait_for_load(&mut client, Duration::from_secs(5));
+
+    // A blocking script must time out, interrupt the renderer, and return
+    // instead of holding the tab for the full request budget.
+    let started = Instant::now();
+    let blocked = eval(&mut client, &target, "while(true){}");
+    assert!(blocked.is_err(), "wedged eval must fail: {blocked:?}");
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "wedged eval did not time out: {:?}",
+        started.elapsed()
+    );
+
+    // The tab released the wedged renderer and mounts the next navigation in
+    // a fresh process.
+    client
+        .call("Page.navigate", &json!({"url": url}), Some(&session))
+        .expect("renavigate");
+    wait_for_load(&mut client, Duration::from_secs(10));
+    assert_eq!(eval(&mut client, &target, "2+2").unwrap(), "4");
+    server.join().expect("server");
+}
+
+fn wait_for_load(client: &mut cdp::Client, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let event = client
+            .read_event(Duration::from_millis(500))
+            .expect("event read")
+            .expect("event");
+        if event["method"] == json!("Page.loadEventFired") {
+            return;
+        }
+        assert!(Instant::now() < deadline, "load event not seen");
+    }
+}
+
+#[test]
 fn blank_targets_stay_virtual_and_idle_processes_collapse_to_one_spare() {
     let mut fixture = Fixture::new("tinybrowser-renderer");
     fixture.spawn_daemon();

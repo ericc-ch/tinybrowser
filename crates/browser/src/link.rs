@@ -31,8 +31,21 @@ use tokio::task::JoinHandle;
 use tokio::time::timeout;
 
 /// Upper bound on one request to a renderer. The renderer budget is seconds;
-/// this is a last-resort wake-up if its reply path dies silently.
+/// this is a last-resort wake-up if its reply path dies silently. A renderer
+/// that misses it is interrupted so the tab can re-acquire a fresh process
+/// instead of paying the timeout on every later operation.
+///
+/// `TINYBROWSER_RENDERER_REQUEST_TIMEOUT_MS` overrides it so recovery tests
+/// do not wait a full minute.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// The effective renderer request deadline.
+fn request_timeout() -> Duration {
+    std::env::var_os("TINYBROWSER_RENDERER_REQUEST_TIMEOUT_MS")
+        .and_then(|value| value.to_str()?.parse::<u64>().ok())
+        .filter(|millis| *millis > 0)
+        .map_or(REQUEST_TIMEOUT, Duration::from_millis)
+}
 
 /// Upper bound for one downloaded renderer payload such as a PNG.
 const MAX_RENDERER_STREAM_BYTES: usize = 64 * 1024 * 1024;
@@ -86,6 +99,7 @@ pub(crate) struct HandleStartResponseOptions<'a> {
 
 pub(crate) struct ResponseWriter {
     assignment: RendererAssignmentId,
+    process: Arc<RendererHandle>,
     upload: ResponseUpload,
 }
 
@@ -96,29 +110,43 @@ impl ResponseWriter {
                 message: "response chunk exceeds IPC limit".into(),
             });
         }
-        self.upload
-            .write(payload)
-            .await
-            .map_err(|_| TabError::ActorStopped)
+        if let Ok(result) = timeout(request_timeout(), self.upload.write(payload)).await {
+            result.map_err(|_| TabError::ActorStopped)
+        } else {
+            self.process.interrupt();
+            Err(TabError::ActorStopped)
+        }
     }
 
     pub(crate) async fn finish(self) -> Result<Reply, TabError> {
-        let assignment = self.assignment;
-        let response = self
-            .upload
-            .finish()
-            .await
-            .map_err(|_| TabError::ActorStopped)?;
+        let Self {
+            assignment,
+            process,
+            upload,
+        } = self;
+        let response = if let Ok(result) = timeout(request_timeout(), upload.finish()).await {
+            result.map_err(|_| TabError::ActorStopped)?
+        } else {
+            process.interrupt();
+            return Err(TabError::ActorStopped);
+        };
         decode_reply(assignment, response)
     }
 
     pub(crate) async fn abort(self, failure: renderer::DialFailure) -> Result<Reply, TabError> {
-        let assignment = self.assignment;
-        let response = self
-            .upload
-            .abort(format!("{failure:?}"))
-            .await
-            .map_err(|_| TabError::ActorStopped)?;
+        let Self {
+            assignment,
+            process,
+            upload,
+        } = self;
+        let response =
+            if let Ok(result) = timeout(request_timeout(), upload.abort(format!("{failure:?}"))).await
+            {
+                result.map_err(|_| TabError::ActorStopped)?
+            } else {
+                process.interrupt();
+                return Err(TabError::ActorStopped);
+            };
         decode_reply(assignment, response)
     }
 }
@@ -157,22 +185,28 @@ impl RendererHandle {
     /// # Errors
     ///
     /// [`TabError::ActorStopped`] when the renderer is gone or the reply does
-    /// not arrive within the request timeout.
+    /// not arrive within the request timeout. A timeout also interrupts the
+    /// renderer: a process that stopped answering must not keep its tab
+    /// hostage.
     pub(crate) async fn request(
         &self,
         assignment: RendererAssignmentId,
         command: RendererCommand,
     ) -> Result<Reply, TabError> {
-        let response = timeout(
-            REQUEST_TIMEOUT,
+        let response = if let Ok(result) = timeout(
+            request_timeout(),
             self.client.call(RendererCall::Command {
                 assignment,
                 command,
             }),
         )
         .await
-        .map_err(|_| TabError::ActorStopped)?
-        .map_err(|_| TabError::ActorStopped)?;
+        {
+            result.map_err(|_| TabError::ActorStopped)?
+        } else {
+            self.interrupt();
+            return Err(TabError::ActorStopped);
+        };
         decode_reply(assignment, response)
     }
 
@@ -188,8 +222,8 @@ impl RendererHandle {
         assignment: RendererAssignmentId,
         command: RendererCommand,
     ) -> Result<Vec<u8>, TabError> {
-        let (response, bytes) = timeout(
-            REQUEST_TIMEOUT,
+        let (response, bytes) = if let Ok(result) = timeout(
+            request_timeout(),
             self.client.call_download(
                 RendererCall::Command {
                     assignment,
@@ -199,8 +233,12 @@ impl RendererHandle {
             ),
         )
         .await
-        .map_err(|_| TabError::ActorStopped)?
-        .map_err(|_| TabError::ActorStopped)?;
+        {
+            result.map_err(|_| TabError::ActorStopped)?
+        } else {
+            self.interrupt();
+            return Err(TabError::ActorStopped);
+        };
         match decode_reply(assignment, response)? {
             Reply::Screenshot {
                 result: Ok(expected),
@@ -217,7 +255,10 @@ impl RendererHandle {
 
     /// Streams one top-level response to the renderer and waits for its mount
     /// result. The body is carried only in bounded raw IPC frames.
-    pub(crate) async fn mount(&self, options: HandleMountOptions) -> Result<Reply, TabError> {
+    pub(crate) async fn mount(
+        self: &Arc<Self>,
+        options: HandleMountOptions,
+    ) -> Result<Reply, TabError> {
         let HandleMountOptions {
             assignment,
             frame,
@@ -242,7 +283,7 @@ impl RendererHandle {
     }
 
     pub(crate) async fn start_response(
-        &self,
+        self: &Arc<Self>,
         options: HandleStartResponseOptions<'_>,
     ) -> Result<ResponseWriter, TabError> {
         let HandleStartResponseOptions {
@@ -259,12 +300,23 @@ impl RendererHandle {
             content_type: mount.content_type.clone(),
             content_language: mount.content_language.clone(),
         };
-        let upload = self
-            .client
-            .begin_upload(RendererCall::Response { response: start })
-            .await
-            .map_err(|_| TabError::ActorStopped)?;
-        Ok(ResponseWriter { assignment, upload })
+        let upload = if let Ok(result) = timeout(
+            request_timeout(),
+            self.client
+                .begin_upload(RendererCall::Response { response: start }),
+        )
+        .await
+        {
+            result.map_err(|_| TabError::ActorStopped)?
+        } else {
+            self.interrupt();
+            return Err(TabError::ActorStopped);
+        };
+        Ok(ResponseWriter {
+            assignment,
+            process: Arc::clone(self),
+            upload,
+        })
     }
 
     /// Interrupts a blocked script by killing the renderer process.

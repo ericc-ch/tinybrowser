@@ -769,7 +769,13 @@ impl Tab {
         let Some(renderer) = self.renderer.clone() else {
             return Err(TabError::ActorStopped);
         };
-        renderer.request(command).await
+        let result = renderer.request(command).await;
+        if result.is_err() {
+            // Transport failures and timeouts both mean this renderer is not
+            // usable: release it so the next operation acquires a fresh one.
+            self.drop_renderer();
+        }
+        result
     }
 
     /// One streamed byte request (screenshots) against the tab's renderer,
@@ -784,7 +790,11 @@ impl Tab {
         let Some(renderer) = self.renderer.clone() else {
             return Err(TabError::ActorStopped);
         };
-        renderer.request_bytes(command).await
+        let result = renderer.request_bytes(command).await;
+        if result.is_err() {
+            self.drop_renderer();
+        }
+        result
     }
 
     /// Mounts the virtual blank document this tab has been carrying.
