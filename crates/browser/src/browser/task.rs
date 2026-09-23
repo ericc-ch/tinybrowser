@@ -7,10 +7,12 @@ use crate::exchange::ServerInput;
 use crate::manager::{RendererProcessManager, RendererProcessManagerOptions};
 
 use super::{
-    BrowserError, BrowserHandle, BrowserServer, Command, Notice, OpenWindowOptions, Reply,
+    AddCookie, BrowserError, BrowserHandle, BrowserOperation, BrowserServer, ClearCookies,
+    CloseTab, Command, CookieRecords, CreateTab, GetTab, ListTabs, Notice, OpenWindowOptions,
+    OpenerTab, Reply, WindowMessage,
 };
 
-pub(super) struct BrowserTask {
+pub(crate) struct BrowserTask {
     server: BrowserServer,
     context: BrowserContext,
     renderers: Arc<RendererProcessManager>,
@@ -86,37 +88,17 @@ impl BrowserTask {
 
     async fn dispatch(&mut self, command: Command) -> DispatchOutcome {
         let reply = match command {
-            Command::CreateTab => Reply::CreateTab(self.create_tab()),
-            Command::Tabs => Reply::Tabs(self.tabs.keys().copied().collect()),
-            Command::Tab { id } => Reply::Tab(
-                self.tabs
-                    .get(&id)
-                    .map(|task| task.handle.clone())
-                    .ok_or(BrowserError::UnknownTab),
-            ),
-            Command::CloseTab { id } => Reply::CloseTab(self.close_tab(id).await),
-            Command::CookieRecords { url } => {
-                Reply::CookieRecords(self.context.cookie_records(&url))
-            }
-            Command::ClearCookies => {
-                self.context.clear_cookies();
-                Reply::ClearCookies
-            }
-            Command::AddCookie { cookie, url } => {
-                Reply::AddCookie(self.context.add_cookie(&cookie, &url))
-            }
-            Command::OpenWindow(request) => Reply::OpenWindow(self.open_window(request)),
-            Command::OpenerTab { tab } => Reply::OpenerTab(self.openers.get(&tab).copied()),
+            Command::CreateTab => CreateTab.serve(self).await,
+            Command::Tabs => ListTabs.serve(self).await,
+            Command::Tab { id } => GetTab { id }.serve(self).await,
+            Command::CloseTab { id } => CloseTab { id }.serve(self).await,
+            Command::CookieRecords { url } => CookieRecords { url }.serve(self).await,
+            Command::ClearCookies => ClearCookies.serve(self).await,
+            Command::AddCookie { cookie, url } => AddCookie { cookie, url }.serve(self).await,
+            Command::OpenWindow(request) => request.serve(self).await,
+            Command::OpenerTab { tab } => OpenerTab { tab }.serve(self).await,
             Command::WindowMessage { target, payload } => {
-                let handle = self.tabs.get(&target).map(|task| task.handle.clone());
-                let result = match handle {
-                    Some(handle) => handle
-                        .window_message(payload)
-                        .await
-                        .map_err(|_| BrowserError::UnknownTab),
-                    None => Err(BrowserError::UnknownTab),
-                };
-                Reply::WindowMessage(result)
+                WindowMessage { target, payload }.serve(self).await
             }
             Command::Close => {
                 let result = self.shutdown().await;
@@ -176,5 +158,247 @@ impl BrowserTask {
             task.shutdown().await;
         }
         self.context.persist().await
+    }
+}
+
+impl BrowserOperation for CreateTab {
+    type Output = Result<TabHandle, BrowserError>;
+
+    fn into_command(self) -> Command {
+        Command::CreateTab
+    }
+
+    fn unwrap(reply: Reply) -> Option<Self::Output> {
+        match reply {
+            Reply::CreateTab(result) => Some(result),
+            _ => None,
+        }
+    }
+
+    #[expect(
+        clippy::unused_async_trait_impl,
+        reason = "serve is async by BrowserOperation contract; this op resolves synchronously"
+    )]
+    async fn serve(self, task: &mut BrowserTask) -> Reply {
+        Reply::CreateTab(task.create_tab())
+    }
+}
+
+impl BrowserOperation for ListTabs {
+    type Output = Vec<TabId>;
+
+    fn into_command(self) -> Command {
+        Command::Tabs
+    }
+
+    fn unwrap(reply: Reply) -> Option<Self::Output> {
+        match reply {
+            Reply::Tabs(tabs) => Some(tabs),
+            _ => None,
+        }
+    }
+
+    #[expect(
+        clippy::unused_async_trait_impl,
+        reason = "serve is async by BrowserOperation contract; this op resolves synchronously"
+    )]
+    async fn serve(self, task: &mut BrowserTask) -> Reply {
+        Reply::Tabs(task.tabs.keys().copied().collect())
+    }
+}
+
+impl BrowserOperation for GetTab {
+    type Output = Result<TabHandle, BrowserError>;
+
+    fn into_command(self) -> Command {
+        Command::Tab { id: self.id }
+    }
+
+    fn unwrap(reply: Reply) -> Option<Self::Output> {
+        match reply {
+            Reply::Tab(result) => Some(result),
+            _ => None,
+        }
+    }
+
+    #[expect(
+        clippy::unused_async_trait_impl,
+        reason = "serve is async by BrowserOperation contract; this op resolves synchronously"
+    )]
+    async fn serve(self, task: &mut BrowserTask) -> Reply {
+        Reply::Tab(
+            task.tabs
+                .get(&self.id)
+                .map(|task| task.handle.clone())
+                .ok_or(BrowserError::UnknownTab),
+        )
+    }
+}
+
+impl BrowserOperation for CloseTab {
+    type Output = Result<(), BrowserError>;
+
+    fn into_command(self) -> Command {
+        Command::CloseTab { id: self.id }
+    }
+
+    fn unwrap(reply: Reply) -> Option<Self::Output> {
+        match reply {
+            Reply::CloseTab(result) => Some(result),
+            _ => None,
+        }
+    }
+
+    async fn serve(self, task: &mut BrowserTask) -> Reply {
+        Reply::CloseTab(task.close_tab(self.id).await)
+    }
+}
+
+impl BrowserOperation for CookieRecords {
+    type Output = Vec<net::CookieRecord>;
+
+    fn into_command(self) -> Command {
+        Command::CookieRecords { url: self.url }
+    }
+
+    fn unwrap(reply: Reply) -> Option<Self::Output> {
+        match reply {
+            Reply::CookieRecords(records) => Some(records),
+            _ => None,
+        }
+    }
+
+    #[expect(
+        clippy::unused_async_trait_impl,
+        reason = "serve is async by BrowserOperation contract; this op resolves synchronously"
+    )]
+    async fn serve(self, task: &mut BrowserTask) -> Reply {
+        Reply::CookieRecords(task.context.cookie_records(&self.url))
+    }
+}
+
+impl BrowserOperation for ClearCookies {
+    type Output = ();
+
+    fn into_command(self) -> Command {
+        Command::ClearCookies
+    }
+
+    fn unwrap(reply: Reply) -> Option<Self::Output> {
+        match reply {
+            Reply::ClearCookies => Some(()),
+            _ => None,
+        }
+    }
+
+    #[expect(
+        clippy::unused_async_trait_impl,
+        reason = "serve is async by BrowserOperation contract; this op resolves synchronously"
+    )]
+    async fn serve(self, task: &mut BrowserTask) -> Reply {
+        task.context.clear_cookies();
+        Reply::ClearCookies
+    }
+}
+
+impl BrowserOperation for AddCookie {
+    type Output = bool;
+
+    fn into_command(self) -> Command {
+        Command::AddCookie {
+            cookie: self.cookie,
+            url: self.url,
+        }
+    }
+
+    fn unwrap(reply: Reply) -> Option<Self::Output> {
+        match reply {
+            Reply::AddCookie(stored) => Some(stored),
+            _ => None,
+        }
+    }
+
+    #[expect(
+        clippy::unused_async_trait_impl,
+        reason = "serve is async by BrowserOperation contract; this op resolves synchronously"
+    )]
+    async fn serve(self, task: &mut BrowserTask) -> Reply {
+        Reply::AddCookie(task.context.add_cookie(&self.cookie, &self.url))
+    }
+}
+
+impl BrowserOperation for OpenWindowOptions {
+    type Output = Result<TabId, BrowserError>;
+
+    fn into_command(self) -> Command {
+        Command::OpenWindow(self)
+    }
+
+    fn unwrap(reply: Reply) -> Option<Self::Output> {
+        match reply {
+            Reply::OpenWindow(result) => Some(result),
+            _ => None,
+        }
+    }
+
+    #[expect(
+        clippy::unused_async_trait_impl,
+        reason = "serve is async by BrowserOperation contract; this op resolves synchronously"
+    )]
+    async fn serve(self, task: &mut BrowserTask) -> Reply {
+        Reply::OpenWindow(task.open_window(self))
+    }
+}
+
+impl BrowserOperation for OpenerTab {
+    type Output = Option<TabId>;
+
+    fn into_command(self) -> Command {
+        Command::OpenerTab { tab: self.tab }
+    }
+
+    fn unwrap(reply: Reply) -> Option<Self::Output> {
+        match reply {
+            Reply::OpenerTab(tab) => Some(tab),
+            _ => None,
+        }
+    }
+
+    #[expect(
+        clippy::unused_async_trait_impl,
+        reason = "serve is async by BrowserOperation contract; this op resolves synchronously"
+    )]
+    async fn serve(self, task: &mut BrowserTask) -> Reply {
+        Reply::OpenerTab(task.openers.get(&self.tab).copied())
+    }
+}
+
+impl BrowserOperation for WindowMessage {
+    type Output = Result<(), BrowserError>;
+
+    fn into_command(self) -> Command {
+        Command::WindowMessage {
+            target: self.target,
+            payload: self.payload,
+        }
+    }
+
+    fn unwrap(reply: Reply) -> Option<Self::Output> {
+        match reply {
+            Reply::WindowMessage(result) => Some(result),
+            _ => None,
+        }
+    }
+
+    async fn serve(self, task: &mut BrowserTask) -> Reply {
+        let handle = task.tabs.get(&self.target).map(|task| task.handle.clone());
+        let result = match handle {
+            Some(handle) => handle
+                .window_message(self.payload)
+                .await
+                .map_err(|_| BrowserError::UnknownTab),
+            None => Err(BrowserError::UnknownTab),
+        };
+        Reply::WindowMessage(result)
     }
 }

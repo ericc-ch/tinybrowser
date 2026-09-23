@@ -116,6 +116,99 @@ type TabClient = exchange::Client<Command, Infallible, Infallible, TabReply, Tab
 type TabServer = exchange::Server<Infallible, TabReply, TabEvent, Command, Infallible>;
 type TabNotifier = exchange::Notifier<Infallible, TabReply, TabEvent>;
 
+/// One tab operation: its input, command mapping, reply extraction, and
+/// coordinator execution.
+///
+/// Each [`TabHandle`] method builds one of these structs and passes it to
+/// [`TabHandle::ask`]; [`handle_command`] routes the [`Command`] back into
+/// [`serve`](Self::serve). Waiter operations retain instead of replying, and
+/// [`Shutdown`] terminates the coordinator, so `serve` reports a
+/// [`TabOutcome`] instead of a bare reply.
+trait TabOperation {
+    /// Value [`ask`](TabHandle::ask) resolves on a matching [`TabReply`].
+    type Output;
+    /// Command sent through the tab exchange.
+    fn into_command(self) -> Command;
+    /// Reply extraction; `None` means the coordinator answered for another
+    /// operation.
+    fn unwrap(reply: TabReply) -> Option<Self::Output>;
+    /// Coordinator-side execution.
+    async fn serve(self, ctx: ServeContext<'_>) -> TabOutcome;
+}
+
+/// Coordinator-side resources one operation executes with.
+struct ServeContext<'a> {
+    /// Live tab state owned by the coordinator loop.
+    tab: &'a mut Tab,
+    /// Exchange server for replies and waiter retention.
+    server: &'a TabServer,
+    /// Request being served; waiter operations retain under this id.
+    id: RequestId,
+    /// Live `run_until` waiters.
+    waiters: &'a mut Vec<Waiter>,
+}
+
+/// How [`handle_command`] finishes one served operation.
+enum TabOutcome {
+    /// Reply now through the exchange.
+    Reply(TabReply),
+    /// Waiter retained; its reply comes from a later resolution pass.
+    Retained,
+    /// Reply now, then terminate the coordinator loop.
+    Shutdown(TabReply),
+}
+
+/// Parses `html` into the tab and starts a new JS realm.
+struct LoadHtml {
+    /// Document source to parse.
+    html: String,
+}
+
+/// Starts navigation without waiting for it.
+struct Goto {
+    /// URL to navigate to.
+    url: String,
+}
+
+/// Renders one frame to a PNG.
+struct ScreenshotFrame {
+    /// Frame to render.
+    frame: FrameId,
+    /// Viewport and crop window.
+    request: renderer::ScreenshotRequest,
+}
+
+/// Waits until the current navigation has fired `load`.
+struct RunUntilLoad {
+    /// Maximum time to wait.
+    timeout: Duration,
+}
+
+/// Waits until `source` evaluates to JS `true` in `frame`.
+struct RunUntilJs {
+    /// Frame to evaluate in.
+    frame: FrameId,
+    /// Predicate source.
+    source: String,
+    /// Maximum time to wait.
+    timeout: Duration,
+}
+
+/// Delivers one remote `window` `message` payload into the tab.
+struct WindowMessage {
+    /// Encoded message payload.
+    payload: String,
+}
+
+/// Returns the document URL after navigation.
+struct DocumentUrl;
+
+/// Returns whether the last navigation dial failed.
+struct LastNavigationFailed;
+
+/// Stops the renderer and terminates the coordinator loop.
+struct Shutdown;
+
 /// One pending `RunUntilLoadTimeout` (`source` is `None`) or `RunUntilJsTrue`
 /// (`source` holds the predicate) wait.
 struct Waiter {
@@ -164,15 +257,10 @@ impl TabHandle {
     ///
     /// [`TabError::ActorStopped`] when the tab or its renderer has shut down.
     pub async fn load_html(&self, html: &str) -> Result<(), TabError> {
-        match self
-            .call(Command::LoadHtml {
-                html: html.to_owned(),
-            })
-            .await?
-        {
-            TabReply::LoadHtml(result) => result,
-            _ => Err(TabError::ActorStopped),
-        }
+        self.ask(LoadHtml {
+            html: html.to_owned(),
+        })
+        .await?
     }
 
     /// Starts navigation. The tab continues independently; call
@@ -182,15 +270,10 @@ impl TabHandle {
     ///
     /// [`TabError::InvalidUrl`] or [`TabError::ActorStopped`].
     pub async fn goto(&self, url: &str) -> Result<(), TabError> {
-        match self
-            .call(Command::Goto {
-                url: url.to_owned(),
-            })
-            .await?
-        {
-            TabReply::Goto(result) => result,
-            _ => Err(TabError::ActorStopped),
-        }
+        self.ask(Goto {
+            url: url.to_owned(),
+        })
+        .await?
     }
 
     /// Evaluates `source` and returns a value-only script result.
@@ -231,22 +314,7 @@ impl TabHandle {
         &self,
         options: ExecuteScriptInOptions<'_>,
     ) -> Result<RemoteValue, TabError> {
-        let ExecuteScriptInOptions {
-            frame,
-            source,
-            timeout,
-        } = options;
-        match self
-            .call(Command::Execute {
-                frame,
-                source: source.to_owned(),
-                timeout,
-            })
-            .await?
-        {
-            TabReply::Execute(result) => result,
-            _ => Err(TabError::ActorStopped),
-        }
+        self.ask(options).await?
     }
 
     /// Renders the tab's top-level document to a PNG.
@@ -273,10 +341,7 @@ impl TabHandle {
         frame: FrameId,
         request: renderer::ScreenshotRequest,
     ) -> Result<Vec<u8>, TabError> {
-        match self.call(Command::Screenshot { frame, request }).await? {
-            TabReply::Screenshot(result) => result,
-            _ => Err(TabError::ActorStopped),
-        }
+        self.ask(ScreenshotFrame { frame, request }).await?
     }
 
     /// Waits until the current navigation has fired `load`, returning `false`
@@ -286,10 +351,7 @@ impl TabHandle {
     ///
     /// [`TabError::ActorStopped`].
     pub async fn run_until_load_timeout(&self, timeout: Duration) -> Result<bool, TabError> {
-        match self.call(Command::RunUntilLoadTimeout { timeout }).await? {
-            TabReply::RunUntilLoad(result) => result,
-            _ => Err(TabError::ActorStopped),
-        }
+        self.ask(RunUntilLoad { timeout }).await?
     }
 
     /// Waits until `source` evaluates to JS `true`, returning `false` on timeout.
@@ -325,17 +387,12 @@ impl TabHandle {
             source,
             timeout,
         } = options;
-        match self
-            .call(Command::RunUntilJsTrue {
-                frame,
-                source: source.to_owned(),
-                timeout,
-            })
-            .await?
-        {
-            TabReply::RunUntilJs(result) => result,
-            _ => Err(TabError::ActorStopped),
-        }
+        self.ask(RunUntilJs {
+            frame,
+            source: source.to_owned(),
+            timeout,
+        })
+        .await?
     }
 
     /// Document URL after navigation.
@@ -344,10 +401,7 @@ impl TabHandle {
     ///
     /// [`TabError::ActorStopped`].
     pub async fn document_url(&self) -> Result<String, TabError> {
-        match self.call(Command::DocumentUrl).await? {
-            TabReply::DocumentUrl(url) => Ok(url),
-            _ => Err(TabError::ActorStopped),
-        }
+        self.ask(DocumentUrl).await
     }
 
     /// Subscribes to tab events emitted after this call.
@@ -373,10 +427,7 @@ impl TabHandle {
     ///
     /// [`TabError::ActorStopped`].
     pub async fn last_navigation_failed(&self) -> Result<bool, TabError> {
-        match self.call(Command::LastNavigationFailed).await? {
-            TabReply::LastNavigationFailed(failed) => Ok(failed),
-            _ => Err(TabError::ActorStopped),
-        }
+        self.ask(LastNavigationFailed).await
     }
 
     /// Delivers one remote `window` `message` payload into this tab.
@@ -385,10 +436,7 @@ impl TabHandle {
     ///
     /// [`TabError::ActorStopped`] when the coordinator or renderer is gone.
     pub async fn window_message(&self, payload: String) -> Result<(), TabError> {
-        match self.call(Command::WindowMessage { payload }).await? {
-            TabReply::WindowMessage(result) => result,
-            _ => Err(TabError::ActorStopped),
-        }
+        self.ask(WindowMessage { payload }).await?
     }
 
     async fn call(&self, command: Command) -> Result<TabReply, TabError> {
@@ -396,6 +444,10 @@ impl TabHandle {
             .call(command)
             .await
             .map_err(|_| TabError::ActorStopped)
+    }
+
+    async fn ask<Op: TabOperation>(&self, op: Op) -> Result<Op::Output, TabError> {
+        Op::unwrap(self.call(op.into_command()).await?).ok_or(TabError::ActorStopped)
     }
 }
 
@@ -438,7 +490,7 @@ impl TabTask {
     }
 
     pub(crate) async fn shutdown(&mut self) {
-        let _result = timeout(SHUTDOWN_TIMEOUT, self.handle.call(Command::Shutdown)).await;
+        let _result = timeout(SHUTDOWN_TIMEOUT, self.handle.ask(Shutdown)).await;
         if let Some(mut join) = self.join.take()
             && timeout(SHUTDOWN_TIMEOUT, &mut join).await.is_err()
         {
@@ -1044,88 +1096,334 @@ async fn handle_command(options: HandleCommandOptions<'_>) -> bool {
         command,
         waiters,
     } = options;
-    match command {
-        Command::LoadHtml { html } => {
-            let _result = server
-                .reply(id, TabReply::LoadHtml(tab.load_html(&html).await))
-                .await;
-        }
-        Command::Goto { url } => {
-            let _result = server.reply(id, TabReply::Goto(tab.goto(&url))).await;
-        }
+    let ctx = ServeContext {
+        tab,
+        server,
+        id,
+        waiters,
+    };
+    let outcome = match command {
+        Command::LoadHtml { html } => LoadHtml { html }.serve(ctx).await,
+        Command::Goto { url } => Goto { url }.serve(ctx).await,
         Command::Execute {
             frame,
             source,
             timeout,
         } => {
-            let result = tab
-                .renderer_request(RendererCommand::ExecuteScript {
-                    frame,
-                    source,
-                    timeout_ms: timeout.map(millis),
-                })
-                .await
-                .and_then(reply_value);
-            let _result = server.reply(id, TabReply::Execute(result)).await;
+            ExecuteScriptInOptions {
+                frame,
+                source: source.as_str(),
+                timeout,
+            }
+            .serve(ctx)
+            .await
         }
         Command::Screenshot { frame, request } => {
-            let result = screenshot_frame(ScreenshotFrameOptions {
-                tab,
-                frame,
-                request,
-            })
-            .await;
-            let _result = server.reply(id, TabReply::Screenshot(result)).await;
+            ScreenshotFrame { frame, request }.serve(ctx).await
         }
-        Command::RunUntilLoadTimeout { timeout } => {
-            retain_waiter(RetainWaiterOptions {
-                waiters,
-                waiter: Waiter {
-                    id,
-                    deadline: Instant::now() + timeout,
-                    source: None,
-                },
-                server,
-            })
-            .await;
-        }
+        Command::RunUntilLoadTimeout { timeout } => RunUntilLoad { timeout }.serve(ctx).await,
         Command::RunUntilJsTrue {
             frame,
             source,
             timeout,
         } => {
-            retain_waiter(RetainWaiterOptions {
-                waiters,
-                waiter: Waiter {
-                    id,
-                    deadline: Instant::now() + timeout,
-                    source: Some((frame, source)),
-                },
-                server,
-            })
-            .await;
+            RunUntilJs {
+                frame,
+                source,
+                timeout,
+            }
+            .serve(ctx)
+            .await
         }
-        Command::DocumentUrl => {
-            let _result = server
-                .reply(id, TabReply::DocumentUrl(tab.document_url.to_string()))
-                .await;
+        Command::DocumentUrl => DocumentUrl.serve(ctx).await,
+        Command::LastNavigationFailed => LastNavigationFailed.serve(ctx).await,
+        Command::WindowMessage { payload } => WindowMessage { payload }.serve(ctx).await,
+        Command::Shutdown => Shutdown.serve(ctx).await,
+    };
+    match outcome {
+        TabOutcome::Reply(reply) => {
+            let _result = server.reply(id, reply).await;
+            false
         }
-        Command::LastNavigationFailed => {
-            let _result = server
-                .reply(id, TabReply::LastNavigationFailed(tab.navigation_failed))
-                .await;
-        }
-        Command::WindowMessage { payload } => {
-            let result = tab.deliver_window_message(payload).await;
-            let _result = server.reply(id, TabReply::WindowMessage(result)).await;
-        }
-        Command::Shutdown => {
-            tab.stop_renderer().await;
-            let _result = server.reply(id, TabReply::Shutdown).await;
-            return true;
+        TabOutcome::Retained => false,
+        TabOutcome::Shutdown(reply) => {
+            let _result = server.reply(id, reply).await;
+            true
         }
     }
-    false
+}
+
+impl TabOperation for LoadHtml {
+    type Output = Result<(), TabError>;
+
+    fn into_command(self) -> Command {
+        Command::LoadHtml { html: self.html }
+    }
+
+    fn unwrap(reply: TabReply) -> Option<Self::Output> {
+        match reply {
+            TabReply::LoadHtml(result) => Some(result),
+            _ => None,
+        }
+    }
+
+    async fn serve(self, ctx: ServeContext<'_>) -> TabOutcome {
+        let ServeContext { tab, .. } = ctx;
+        TabOutcome::Reply(TabReply::LoadHtml(tab.load_html(&self.html).await))
+    }
+}
+
+impl TabOperation for Goto {
+    type Output = Result<(), TabError>;
+
+    fn into_command(self) -> Command {
+        Command::Goto { url: self.url }
+    }
+
+    fn unwrap(reply: TabReply) -> Option<Self::Output> {
+        match reply {
+            TabReply::Goto(result) => Some(result),
+            _ => None,
+        }
+    }
+
+    #[expect(
+        clippy::unused_async_trait_impl,
+        reason = "serve is async by TabOperation contract; this op resolves synchronously"
+    )]
+    async fn serve(self, ctx: ServeContext<'_>) -> TabOutcome {
+        let ServeContext { tab, .. } = ctx;
+        TabOutcome::Reply(TabReply::Goto(tab.goto(&self.url)))
+    }
+}
+
+impl TabOperation for ExecuteScriptInOptions<'_> {
+    type Output = Result<RemoteValue, TabError>;
+
+    fn into_command(self) -> Command {
+        Command::Execute {
+            frame: self.frame,
+            source: self.source.to_owned(),
+            timeout: self.timeout,
+        }
+    }
+
+    fn unwrap(reply: TabReply) -> Option<Self::Output> {
+        match reply {
+            TabReply::Execute(result) => Some(result),
+            _ => None,
+        }
+    }
+
+    async fn serve(self, ctx: ServeContext<'_>) -> TabOutcome {
+        let ServeContext { tab, .. } = ctx;
+        let result = tab
+            .renderer_request(RendererCommand::ExecuteScript {
+                frame: self.frame,
+                source: self.source.to_owned(),
+                timeout_ms: self.timeout.map(millis),
+            })
+            .await
+            .and_then(reply_value);
+        TabOutcome::Reply(TabReply::Execute(result))
+    }
+}
+
+impl TabOperation for ScreenshotFrame {
+    type Output = Result<Vec<u8>, TabError>;
+
+    fn into_command(self) -> Command {
+        Command::Screenshot {
+            frame: self.frame,
+            request: self.request,
+        }
+    }
+
+    fn unwrap(reply: TabReply) -> Option<Self::Output> {
+        match reply {
+            TabReply::Screenshot(result) => Some(result),
+            _ => None,
+        }
+    }
+
+    async fn serve(self, ctx: ServeContext<'_>) -> TabOutcome {
+        let ServeContext { tab, .. } = ctx;
+        let result = screenshot_frame(ScreenshotFrameOptions {
+            tab,
+            frame: self.frame,
+            request: self.request,
+        })
+        .await;
+        TabOutcome::Reply(TabReply::Screenshot(result))
+    }
+}
+
+impl TabOperation for RunUntilLoad {
+    type Output = Result<bool, TabError>;
+
+    fn into_command(self) -> Command {
+        Command::RunUntilLoadTimeout {
+            timeout: self.timeout,
+        }
+    }
+
+    fn unwrap(reply: TabReply) -> Option<Self::Output> {
+        match reply {
+            TabReply::RunUntilLoad(result) => Some(result),
+            _ => None,
+        }
+    }
+
+    async fn serve(self, ctx: ServeContext<'_>) -> TabOutcome {
+        let ServeContext {
+            server,
+            id,
+            waiters,
+            ..
+        } = ctx;
+        retain_waiter(RetainWaiterOptions {
+            waiters,
+            waiter: Waiter {
+                id,
+                deadline: Instant::now() + self.timeout,
+                source: None,
+            },
+            server,
+        })
+        .await;
+        TabOutcome::Retained
+    }
+}
+
+impl TabOperation for RunUntilJs {
+    type Output = Result<bool, TabError>;
+
+    fn into_command(self) -> Command {
+        Command::RunUntilJsTrue {
+            frame: self.frame,
+            source: self.source,
+            timeout: self.timeout,
+        }
+    }
+
+    fn unwrap(reply: TabReply) -> Option<Self::Output> {
+        match reply {
+            TabReply::RunUntilJs(result) => Some(result),
+            _ => None,
+        }
+    }
+
+    async fn serve(self, ctx: ServeContext<'_>) -> TabOutcome {
+        let ServeContext {
+            server,
+            id,
+            waiters,
+            ..
+        } = ctx;
+        retain_waiter(RetainWaiterOptions {
+            waiters,
+            waiter: Waiter {
+                id,
+                deadline: Instant::now() + self.timeout,
+                source: Some((self.frame, self.source)),
+            },
+            server,
+        })
+        .await;
+        TabOutcome::Retained
+    }
+}
+
+impl TabOperation for DocumentUrl {
+    type Output = String;
+
+    fn into_command(self) -> Command {
+        Command::DocumentUrl
+    }
+
+    fn unwrap(reply: TabReply) -> Option<Self::Output> {
+        match reply {
+            TabReply::DocumentUrl(url) => Some(url),
+            _ => None,
+        }
+    }
+
+    #[expect(
+        clippy::unused_async_trait_impl,
+        reason = "serve is async by TabOperation contract; this op resolves synchronously"
+    )]
+    async fn serve(self, ctx: ServeContext<'_>) -> TabOutcome {
+        let ServeContext { tab, .. } = ctx;
+        TabOutcome::Reply(TabReply::DocumentUrl(tab.document_url.to_string()))
+    }
+}
+
+impl TabOperation for LastNavigationFailed {
+    type Output = bool;
+
+    fn into_command(self) -> Command {
+        Command::LastNavigationFailed
+    }
+
+    fn unwrap(reply: TabReply) -> Option<Self::Output> {
+        match reply {
+            TabReply::LastNavigationFailed(failed) => Some(failed),
+            _ => None,
+        }
+    }
+
+    #[expect(
+        clippy::unused_async_trait_impl,
+        reason = "serve is async by TabOperation contract; this op resolves synchronously"
+    )]
+    async fn serve(self, ctx: ServeContext<'_>) -> TabOutcome {
+        let ServeContext { tab, .. } = ctx;
+        TabOutcome::Reply(TabReply::LastNavigationFailed(tab.navigation_failed))
+    }
+}
+
+impl TabOperation for WindowMessage {
+    type Output = Result<(), TabError>;
+
+    fn into_command(self) -> Command {
+        Command::WindowMessage {
+            payload: self.payload,
+        }
+    }
+
+    fn unwrap(reply: TabReply) -> Option<Self::Output> {
+        match reply {
+            TabReply::WindowMessage(result) => Some(result),
+            _ => None,
+        }
+    }
+
+    async fn serve(self, ctx: ServeContext<'_>) -> TabOutcome {
+        let ServeContext { tab, .. } = ctx;
+        let result = tab.deliver_window_message(self.payload).await;
+        TabOutcome::Reply(TabReply::WindowMessage(result))
+    }
+}
+
+impl TabOperation for Shutdown {
+    type Output = ();
+
+    fn into_command(self) -> Command {
+        Command::Shutdown
+    }
+
+    fn unwrap(reply: TabReply) -> Option<Self::Output> {
+        match reply {
+            TabReply::Shutdown => Some(()),
+            _ => None,
+        }
+    }
+
+    async fn serve(self, ctx: ServeContext<'_>) -> TabOutcome {
+        let ServeContext { tab, .. } = ctx;
+        tab.stop_renderer().await;
+        TabOutcome::Shutdown(TabReply::Shutdown)
+    }
 }
 
 async fn screenshot_frame(options: ScreenshotFrameOptions<'_>) -> Result<Vec<u8>, TabError> {
