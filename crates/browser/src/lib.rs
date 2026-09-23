@@ -16,6 +16,7 @@
 #![cfg_attr(test, allow(clippy::too_many_arguments))]
 
 mod actor;
+mod assignment;
 mod broadcast;
 mod browser;
 pub mod child;

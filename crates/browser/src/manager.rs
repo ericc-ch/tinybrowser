@@ -2,7 +2,9 @@
 //!
 //! Blank documents stay virtual, the manager keeps one unlocked spare, and
 //! under the soft limit each live site instance receives its own renderer
-//! process.
+//! process. Assignment release arrives as a notice from the registry's drop
+//! path, so process shutdown is decided off the same state lock that reserves
+//! assignments.
 
 use std::collections::HashMap;
 use std::io;
@@ -10,13 +12,11 @@ use std::sync::Weak;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, PoisonError};
 
-use crate::wire::RendererAssignmentId;
-use tokio::sync::Semaphore;
+use tokio::sync::{Semaphore, mpsc};
 
+use crate::assignment::{Assignment, AssignmentOptions, AssignmentRegistry};
 use crate::context::PartitionServices;
-use crate::link::{
-    AssignmentContext, RendererAssignment, RendererHandle, SpawnProcessOptions, spawn_process,
-};
+use crate::link::{RendererHandle, SpawnProcessOptions, spawn_process};
 use crate::site::Site;
 use crate::storage::SessionStorage;
 
@@ -34,8 +34,8 @@ struct ManagerInner {
     sessions: Arc<SessionStorage>,
     browser: crate::browser::BrowserHandle,
     next: AtomicU64,
-    next_assignment: AtomicU64,
     slots: Arc<Semaphore>,
+    registry: Arc<AssignmentRegistry>,
     state: tokio::sync::Mutex<ManagerState>,
 }
 
@@ -63,53 +63,55 @@ impl RendererProcessManager {
             partition,
             sessions,
         } = services;
-        let manager = Self {
-            inner: Arc::new(ManagerInner {
-                partition,
-                sessions,
-                browser,
-                next: AtomicU64::new(1),
-                next_assignment: AtomicU64::new(1),
-                slots: Arc::new(Semaphore::new(renderer_process_limit())),
-                state: tokio::sync::Mutex::new(ManagerState::default()),
-            }),
-        };
-        manager.fill_spare();
-        manager
+        let (releases, release_rx) = mpsc::unbounded_channel();
+        let inner = Arc::new(ManagerInner {
+            partition,
+            sessions,
+            browser,
+            next: AtomicU64::new(1),
+            slots: Arc::new(Semaphore::new(renderer_process_limit())),
+            registry: Arc::new(AssignmentRegistry::new(releases)),
+            state: tokio::sync::Mutex::new(ManagerState::default()),
+        });
+        tokio::spawn(release_loop(Arc::downgrade(&inner), release_rx));
+        fill_spare(&inner);
+        Self { inner }
     }
 
-    /// Creates a renderer locked to `site`.
+    /// Creates one assignment for `options`, reusing a live same-site process
+    /// when the budget requires it.
     ///
     /// # Errors
     ///
-    /// Process spawn failure or a failed protocol handshake.
-    pub(crate) async fn acquire(
-        &self,
-        context: AssignmentContext,
-    ) -> io::Result<Arc<RendererAssignment>> {
-        let process = self.acquire_process(&context.site).await?;
-        let assignment =
-            RendererAssignmentId::new(self.inner.next_assignment.fetch_add(1, Ordering::Relaxed));
-        if let Err(error) = process.assign(assignment, context).await {
-            process.unreserve_assignment();
+    /// Process spawn failure, a failed protocol handshake, or an exhausted
+    /// process budget with no reusable process.
+    pub(crate) async fn acquire(&self, options: AssignmentOptions) -> io::Result<Arc<Assignment>> {
+        let (process, assignment) = self.acquire_reserved(options).await?;
+        if let Err(error) = process.assign_notify(assignment.id()).await {
+            // Dropping the assignment releases the reservation and asks the
+            // manager to re-evaluate the process.
+            drop(assignment);
             return Err(error);
         }
-        self.fill_spare();
-        Ok(Arc::new(RendererAssignment {
-            id: assignment,
-            process,
-        }))
+        fill_spare(&self.inner);
+        Ok(assignment)
     }
 
-    async fn acquire_process(&self, site: &Site) -> io::Result<Arc<RendererHandle>> {
+    /// Picks a process and records the assignment while holding the state
+    /// lock, so a concurrent release cannot observe zero assignments and shut
+    /// the process down mid-acquire.
+    async fn acquire_reserved(
+        &self,
+        options: AssignmentOptions,
+    ) -> io::Result<(Arc<RendererHandle>, Arc<Assignment>)> {
         let mut state = self.inner.state.lock().await;
         let process = if let Some(spare) = state.spare.take() {
-            spare.bind(site)?;
+            spare.bind(&options.site)?;
             spare
-        } else if let Some(process) = spawn_slot(&self.inner, Some(site.clone())).await? {
+        } else if let Some(process) = spawn_slot(&self.inner, Some(options.site.clone())).await? {
             process
         } else {
-            let candidates = state.sites.entry(site.clone()).or_default();
+            let candidates = state.sites.entry(options.site.clone()).or_default();
             candidates.retain(|candidate| {
                 candidate
                     .upgrade()
@@ -120,7 +122,7 @@ impl RendererProcessManager {
                 .find_map(Weak::upgrade)
                 .ok_or_else(|| io::Error::other("renderer process budget exhausted"))?
         };
-        let processes = state.sites.entry(site.clone()).or_default();
+        let processes = state.sites.entry(options.site.clone()).or_default();
         if !processes.iter().any(|candidate| {
             candidate
                 .upgrade()
@@ -128,19 +130,26 @@ impl RendererProcessManager {
         }) {
             processes.push(Arc::downgrade(&process));
         }
-        // Reserve the assignment before the state lock is released so a
-        // concurrent release cannot observe zero and shut this process down.
-        process.reserve_assignment();
-        Ok(process)
+        let assignment = self.inner.registry.reserve(Arc::clone(&process), options);
+        Ok((process, assignment))
     }
+}
 
-    pub(crate) async fn release(&self, assignment: Arc<RendererAssignment>) {
-        let process = Arc::clone(&assignment.process);
-        process.release(assignment.id).await;
-        drop(assignment);
-        // Decide shutdown under the same lock that `acquire_process` reserves
-        // assignments with, so a new acquisition either keeps the process or
-        // arrives after it is removed from the site pool.
+/// Evaluates process shutdown for every released assignment.
+///
+/// The notice carries the process, not the id: the registry already removed
+/// the record and decremented the count before sending it. A release that
+/// races an acquire either lands before the reservation (and finds a live
+/// assignment) or after the process left the site pool, so the two paths
+/// cannot disagree.
+async fn release_loop(
+    inner: Weak<ManagerInner>,
+    mut releases: mpsc::UnboundedReceiver<Arc<RendererHandle>>,
+) {
+    while let Some(process) = releases.recv().await {
+        let Some(inner) = inner.upgrade() else {
+            return;
+        };
         let site = process
             .site
             .lock()
@@ -148,7 +157,7 @@ impl RendererProcessManager {
             .clone();
         let mut shutdown = false;
         {
-            let mut state = self.inner.state.lock().await;
+            let mut state = inner.state.lock().await;
             if process.assignments.load(Ordering::Relaxed) == 0 {
                 if let Some(site) = &site
                     && let Some(processes) = state.sites.get_mut(site)
@@ -169,31 +178,31 @@ impl RendererProcessManager {
             process.shutdown().await;
         }
         drop(process);
-        self.fill_spare();
+        fill_spare(&inner);
     }
+}
 
-    fn fill_spare(&self) {
-        let inner = Arc::clone(&self.inner);
-        tokio::spawn(async move {
-            {
-                let mut state = inner.state.lock().await;
-                if state.spare.is_some() || state.spawning_spare {
-                    return;
-                }
-                state.spawning_spare = true;
-            }
-            let result = match spawn_slot(&inner, None).await {
-                Ok(Some(spare)) => Ok(spare),
-                Ok(None) => Err(io::Error::other("renderer process budget exhausted")),
-                Err(error) => Err(error),
-            };
+fn fill_spare(inner: &Arc<ManagerInner>) {
+    let inner = Arc::clone(inner);
+    tokio::spawn(async move {
+        {
             let mut state = inner.state.lock().await;
-            state.spawning_spare = false;
-            if let Ok(spare) = result {
-                state.spare = Some(spare);
+            if state.spare.is_some() || state.spawning_spare {
+                return;
             }
-        });
-    }
+            state.spawning_spare = true;
+        }
+        let result = match spawn_slot(&inner, None).await {
+            Ok(Some(spare)) => Ok(spare),
+            Ok(None) => Err(io::Error::other("renderer process budget exhausted")),
+            Err(error) => Err(error),
+        };
+        let mut state = inner.state.lock().await;
+        state.spawning_spare = false;
+        if let Ok(spare) = result {
+            state.spare = Some(spare);
+        }
+    });
 }
 
 /// Takes one slot from the process budget and spawns a renderer into it.
@@ -215,6 +224,7 @@ async fn spawn_slot(
             partition: inner.partition.clone(),
             sessions: Arc::clone(&inner.sessions),
             browser: inner.browser.clone(),
+            registry: Arc::clone(&inner.registry),
             slot,
         })
         .await?,

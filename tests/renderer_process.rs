@@ -205,6 +205,86 @@ fn close_interrupts_a_running_script_in_the_renderer_process() {
 }
 
 #[test]
+fn aborted_tab_releases_its_assignment() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let address = listener.local_addr().expect("address");
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept");
+        let mut request = [0_u8; 1024];
+        let _ = stream.read(&mut request).expect("read request");
+        let body = b"<!doctype html><title>abort</title>";
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .expect("write head");
+        stream.write_all(body).expect("write body");
+    });
+
+    let mut fixture = Fixture::new("tinybrowser-renderer-abort");
+    fixture.spawn_daemon_with_env("TINYBROWSER_LOG", "debug");
+    let _ = fixture.wait_json();
+    let mut client = fixture.connect();
+    let target = create(&mut client);
+    let session = attach(&mut client, &target);
+    client
+        .call("Page.enable", &json!({}), Some(&session))
+        .expect("enable");
+    client
+        .call(
+            "Page.navigate",
+            &json!({"url": format!("http://{address}/")}),
+            Some(&session),
+        )
+        .expect("navigate");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let event = client
+            .read_event(Duration::from_millis(500))
+            .expect("event read")
+            .expect("event");
+        if event["method"] == json!("Page.loadEventFired") {
+            break;
+        }
+        assert!(Instant::now() < deadline, "page did not load");
+    }
+
+    // Block the coordinator inside a renderer request, then close the tab:
+    // the shutdown ask times out and the coordinator is aborted mid-flight.
+    // Release must still happen (it is owned by the assignment's drop).
+    let endpoint = fixture.endpoint();
+    let blocked = target.clone();
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let runner = std::thread::spawn(move || {
+        let mut runner = cdp::Client::connect(endpoint).expect("runner connect");
+        let result = eval(&mut runner, &blocked, "while(true){}");
+        let _ = done_tx.send(result);
+    });
+    std::thread::sleep(Duration::from_millis(300));
+    close(&mut client, &target);
+    let _ = done_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("blocked eval never returned after close");
+    runner.join().expect("runner");
+
+    let path = fixture.data.join("tinybrowser/logs/default.log");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let text = std::fs::read_to_string(&path).unwrap_or_default();
+        if text.contains("assignment released") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "aborted coordinator never released its assignment: {text}"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    server.join().expect("server");
+}
+
+#[test]
 fn blank_targets_stay_virtual_and_idle_processes_collapse_to_one_spare() {
     let mut fixture = Fixture::new("tinybrowser-renderer");
     fixture.spawn_daemon();

@@ -30,6 +30,12 @@ impl RendererAssignmentId {
     pub fn new(raw: u64) -> Self {
         Self(raw)
     }
+
+    /// The raw browser-process integer, used for release high-water marks.
+    #[must_use]
+    pub(crate) const fn get(self) -> u64 {
+        self.0
+    }
 }
 
 /// Host command to a renderer.

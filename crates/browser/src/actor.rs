@@ -17,10 +17,10 @@ use tokio::task::JoinHandle;
 use tokio::time::{Instant, sleep_until, timeout};
 use url::Url;
 
-use crate::exchange::{self, RequestId, ServerInput};
-use crate::link::{
-    AssignmentContext, AssignmentMountOptions, AssignmentStartResponseOptions, RendererAssignment,
+use crate::assignment::{
+    Assignment, AssignmentMountOptions, AssignmentOptions, AssignmentStartResponseOptions,
 };
+use crate::exchange::{self, RequestId, ServerInput};
 use crate::manager::RendererProcessManager;
 use crate::network::{NAV_BODY_LIMIT, NavOutcome, TabNetworkHandle, dial_failure};
 use crate::site::Site;
@@ -520,7 +520,7 @@ struct Tab {
     id: TabId,
     renderers: Arc<RendererProcessManager>,
     network: TabNetworkHandle,
-    renderer: Option<Arc<RendererAssignment>>,
+    renderer: Option<Arc<Assignment>>,
     pending_mount: Option<Mount>,
     site: Option<Site>,
     events_rx: Option<mpsc::Receiver<(FrameId, RendererEvent)>>,
@@ -649,14 +649,14 @@ impl Tab {
         }
         let handle = self
             .renderers
-            .acquire(AssignmentContext {
+            .acquire(AssignmentOptions {
                 tab: self.id,
                 site: site.clone(),
                 network: self.network.clone(),
             })
             .await
             .map_err(|error| renderer_unavailable(&error.to_string()))?;
-        self.drop_renderer().await;
+        self.drop_renderer();
         self.events_rx = Some(handle.subscribe());
         self.site = Some(site.clone());
         self.renderer = Some(handle);
@@ -684,7 +684,7 @@ impl Tab {
             .await
             .and_then(reply_unit);
         if result.is_err() {
-            self.drop_renderer().await;
+            self.drop_renderer();
         }
         result
     }
@@ -696,7 +696,6 @@ impl Tab {
             mount,
             mut body,
         } = options;
-        self.ensure_renderer(site).await?;
         self.ensure_renderer(site).await?;
         self.pending_mount = None;
         self.document_loaded = false;
@@ -715,12 +714,12 @@ impl Tab {
                     received = received.saturating_add(chunk.len());
                     if received > NAV_BODY_LIMIT {
                         let _ = stream.abort(DialFailure::Limit).await;
-                        self.drop_renderer().await;
+                        self.drop_renderer();
                         return Err(renderer_unavailable("navigation body exceeds limit"));
                     }
                     if let Err(error) = stream.write(chunk).await {
                         drop(stream);
-                        self.drop_renderer().await;
+                        self.drop_renderer();
                         return Err(error);
                     }
                 }
@@ -728,24 +727,25 @@ impl Tab {
                 Err(error) => {
                     let failure = dial_failure(&error);
                     let _ = stream.abort(failure).await;
-                    self.drop_renderer().await;
+                    self.drop_renderer();
                     return Err(renderer_unavailable(&error.to_string()));
                 }
             }
         }
         let result = stream.finish().await.and_then(reply_unit);
         if result.is_err() {
-            self.drop_renderer().await;
+            self.drop_renderer();
         }
         result
     }
 
-    async fn drop_renderer(&mut self) {
+    fn drop_renderer(&mut self) {
         self.site = None;
         self.events_rx = None;
-        if let Some(renderer) = self.renderer.take() {
-            self.renderers.release(renderer).await;
-        }
+        // Dropping the assignment is the release: it removes the registry
+        // record, notifies the renderer, and lets the process manager
+        // evaluate shutdown.
+        self.renderer = None;
     }
 
     /// Routes one remote `postMessage` payload into this tab's main frame.
@@ -902,9 +902,9 @@ impl Tab {
         self.nav.is_some() || (!self.document_loaded && !self.navigation_failed)
     }
 
-    async fn stop_renderer(&mut self) {
+    fn stop_renderer(&mut self) {
         self.cancel_dial();
-        self.drop_renderer().await;
+        self.drop_renderer();
     }
 }
 
@@ -987,7 +987,7 @@ async fn coordinator_loop(mut server: TabServer, mut tab: Tab) {
             Wake::Navigation(None) | Wake::WaiterDeadline => {}
             Wake::Renderer(Some((frame, event))) => tab.handle_renderer_event(frame, event).await,
             Wake::Renderer(None) => {
-                tab.drop_renderer().await;
+                tab.drop_renderer();
                 fail_waiters(FailWaitersOptions {
                     server: &server,
                     waiters: &mut waiters,
@@ -1003,7 +1003,7 @@ async fn coordinator_loop(mut server: TabServer, mut tab: Tab) {
         })
         .await;
     }
-    tab.stop_renderer().await;
+    tab.stop_renderer();
 }
 
 async fn next_renderer_event(
@@ -1419,9 +1419,13 @@ impl TabOperation for Shutdown {
         }
     }
 
+    #[expect(
+        clippy::unused_async_trait_impl,
+        reason = "serve is async by TabOperation contract; this op resolves synchronously"
+    )]
     async fn serve(self, ctx: ServeContext<'_>) -> TabOutcome {
         let ServeContext { tab, .. } = ctx;
-        tab.stop_renderer().await;
+        tab.stop_renderer();
         TabOutcome::Shutdown(TabReply::Shutdown)
     }
 }
