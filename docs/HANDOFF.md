@@ -39,20 +39,26 @@ Done:
   site check (previously none), `WindowMessage`/`WindowClose` relatedness gates. Proof:
   `window_messages_are_limited_to_related_tabs` (forged unrelated message is not queued;
   related delivery is); red run fails when the gate is disabled.
+- **U5a storage transport safety** (`2d76416`): `MAX_CONTROL_BYTES` 8 → 24 MiB, the
+  worst legal storage frame (setItem/getItem/storage event with double-escaped quota
+  values). Proof: `legal_storage_values_do_not_kill_the_renderer` stores 2.5M quotes and
+  reads them back; with the old cap the renderer dies. This is a stopgap; the payload plane
+  below is the real fix.
 - Review report: `~/Documents/obsidian/everything/projects/tinybrowser/architecture-review-2026-09-24.md`.
 
 In flight: none.
 
 Next:
 
-1. **U5 one `Connection` RPC + payload handles.** Replace the generic
+1. **U5b payload plane (the real fix for the control-cap stopgap).** Replace the generic
    `Client`/`Server`/`Router`/`Upload`/`Responder`/`Notifier` stack with one framed
    connection: typed enums per direction, one pending-call table, cancel + deadlines in one
-   place, and a `PayloadRef` for bulk bytes (storage values, dial bodies, messaging). The
-   chunk framing already exists (`wire/channel.rs`, `exchange::Frame`); route bulk payloads
-   through it so an in-quota storage value can never exceed `MAX_CONTROL_BYTES` and kill a
-   process. Keep the sync renderer adapter and the cancel-before-call negative cache. See
-   review findings 2.1, 2.2, 3.8, and the `exchange.rs` dead lanes.
+   place, and a `PayloadRef` for bulk bytes (storage values, dial bodies, messaging). Route
+   bulk payloads through the existing chunk framing (`wire/channel.rs`, `exchange::Frame`)
+   in both directions, including the browser→renderer reply and notice directions that have
+   no chunk path today, so `MAX_CONTROL_BYTES` can drop back to a small bound. Keep the sync
+   renderer adapter and the cancel-before-call negative cache. See review findings 2.1, 2.2,
+   3.8, and the `exchange.rs` dead lanes.
 2. **U6 conformance moves** (can land as small PRs any time): move spec assertions out of
    `crates/dom/tests/selectors.rs` and `crates/net/tests/net/send_loopback.rs` into WPT;
    register the `wdspec` executor; fix or delete `tools/intl/test262` (it drives deleted CLI
