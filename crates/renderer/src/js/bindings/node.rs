@@ -1947,17 +1947,16 @@ impl JsNode {
         namespace: OptString,
         local: WebIdlString,
     ) -> Result<Value<'js>> {
-        let local = if document_is_html(&ctx, self.handle.0) {
-            local.0.to_ascii_lowercase()
-        } else {
-            local.0
-        };
+        // The namespace variant matches the local name exactly, in HTML
+        // documents too: the lowercasing rule belongs to
+        // `getElementsByTagName` alone
+        // (<https://dom.spec.whatwg.org/#concept-getelementsbytagnamens>).
         live_collection(
             &ctx,
             self.handle.0,
             CollectionKind::ElementsByTagNs {
                 namespace: namespace.0.unwrap_or_default(),
-                local,
+                local: local.0,
             },
             Some("HTMLCollection"),
         )
