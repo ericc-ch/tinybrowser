@@ -1458,6 +1458,11 @@ fn collect_by_tag_ns(dom: &dom::Dom, scope: NodeId, namespace: &str, local: &str
 
 fn collect_by_class(dom: &dom::Dom, scope: NodeId, names: &str) -> Vec<NodeId> {
     let wanted: Vec<&str> = names.split_ascii_whitespace().collect();
+    // An empty class set matches nothing
+    // (<https://dom.spec.whatwg.org/#concept-getelementsbyclassname>).
+    if wanted.is_empty() {
+        return Vec::new();
+    }
     dom.descendants(scope)
         .filter(|&id| {
             if !is_element(dom, id) {

@@ -1570,8 +1570,11 @@ impl JsNode {
     }
 
     #[qjs(set, rename = "nodeValue")]
-    fn set_node_value(&self, ctx: Ctx<'_>, value: WebIdlString) -> Result<()> {
-        set_character_data(&ctx, self.handle.0, value.0)
+    fn set_node_value(&self, ctx: Ctx<'_>, value: OptString) -> Result<()> {
+        // "If the given value is null, act as if it was the empty string"
+        // (<https://dom.spec.whatwg.org/#dom-node-nodevalue>); `OptString`
+        // maps null and undefined to `None`.
+        set_character_data(&ctx, self.handle.0, value.0.unwrap_or_default())
     }
 
     // https://dom.spec.whatwg.org/#dom-node-textcontent
