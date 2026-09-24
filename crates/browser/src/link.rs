@@ -18,7 +18,7 @@ use crate::context::PartitionServices;
 use crate::exchange::{self, Frame, RequestId, ServerInput};
 use crate::manager::RendererId;
 use crate::site::Site;
-use crate::storage::{LocalSetOptions, SessionKeyOptions, SessionSetOptions, SessionStorage};
+use crate::storage::SessionStorage;
 use crate::wire::{
     BrowserCall, BrowsingContextCall, Command as RendererCommand, FromRenderer, HostNotice,
     MessagingCall, NetworkCall, RendererAssignmentId, RendererCall, RendererNotice, RendererReply,
@@ -82,22 +82,6 @@ pub(crate) struct RendererHandle {
     _slot: tokio::sync::OwnedSemaphorePermit,
 }
 
-/// One document mount into the process's renderer.
-pub(crate) struct HandleMountOptions {
-    pub(crate) assignment: RendererAssignmentId,
-    pub(crate) frame: FrameId,
-    pub(crate) status: u16,
-    pub(crate) mount: Mount,
-}
-
-/// One streamed response start into the process's renderer.
-pub(crate) struct HandleStartResponseOptions<'a> {
-    pub(crate) assignment: RendererAssignmentId,
-    pub(crate) frame: FrameId,
-    pub(crate) status: u16,
-    pub(crate) mount: &'a Mount,
-}
-
 pub(crate) struct ResponseWriter {
     assignment: RendererAssignmentId,
     process: Arc<RendererHandle>,
@@ -140,14 +124,14 @@ impl ResponseWriter {
             process,
             upload,
         } = self;
-        let response =
-            if let Ok(result) = timeout(request_timeout(), upload.abort(format!("{failure:?}"))).await
-            {
-                result.map_err(|_| TabError::ActorStopped)?
-            } else {
-                process.interrupt();
-                return Err(TabError::ActorStopped);
-            };
+        let response = if let Ok(result) =
+            timeout(request_timeout(), upload.abort(format!("{failure:?}"))).await
+        {
+            result.map_err(|_| TabError::ActorStopped)?
+        } else {
+            process.interrupt();
+            return Err(TabError::ActorStopped);
+        };
         decode_reply(assignment, response)
     }
 }
@@ -258,21 +242,13 @@ impl RendererHandle {
     /// result. The body is carried only in bounded raw IPC frames.
     pub(crate) async fn mount(
         self: &Arc<Self>,
-        options: HandleMountOptions,
+        assignment: RendererAssignmentId,
+        frame: FrameId,
+        status: u16,
+        mount: Mount,
     ) -> Result<Reply, TabError> {
-        let HandleMountOptions {
-            assignment,
-            frame,
-            status,
-            mount,
-        } = options;
         let response = self
-            .start_response(HandleStartResponseOptions {
-                assignment,
-                frame,
-                status,
-                mount: &mount,
-            })
+            .start_response(assignment, frame, status, &mount)
             .await?;
         for chunk in mount
             .body
@@ -285,14 +261,11 @@ impl RendererHandle {
 
     pub(crate) async fn start_response(
         self: &Arc<Self>,
-        options: HandleStartResponseOptions<'_>,
+        assignment: RendererAssignmentId,
+        frame: FrameId,
+        status: u16,
+        mount: &Mount,
     ) -> Result<ResponseWriter, TabError> {
-        let HandleStartResponseOptions {
-            assignment,
-            frame,
-            status,
-            mount,
-        } = options;
         let start = ResponseStart {
             assignment,
             frame,
@@ -386,141 +359,14 @@ struct ServiceContext {
     browser: crate::browser::BrowserHandle,
 }
 
-/// One renderer transport writer task.
-struct WriterTaskOptions {
-    rx: exchange::Receiver<ToRenderer>,
-    writer: Box<dyn AsyncWrite + Send + Unpin>,
+async fn writer_task(
+    mut rx: exchange::Receiver<ToRenderer>,
+    mut writer: Box<dyn AsyncWrite + Send + Unpin>,
     alive: Arc<AtomicBool>,
     router: RendererRouter,
     kill: watch::Sender<bool>,
-    kill_rx: watch::Receiver<bool>,
-}
-
-/// One renderer transport reader task.
-struct ReaderTaskOptions {
-    reader: Box<dyn AsyncRead + Send + Unpin>,
-    context: ReaderContext,
-    ready: Option<oneshot::Sender<bool>>,
-}
-
-/// One renderer document event routed to subscribers.
-#[derive(Clone, Copy)]
-struct RouteEventOptions<'a> {
-    context: &'a ServiceContext,
-    assignment: RendererAssignmentId,
-    frame: FrameId,
-    event: RendererEvent,
-}
-
-/// One browser service call from a renderer.
-struct RouteServiceCallOptions<'a> {
-    context: &'a ServiceContext,
-    id: RequestId,
-    assignment: RendererAssignmentId,
-    call: ServiceCall,
-}
-
-/// One `window` service call from a renderer.
-struct RouteWindowCallOptions<'a> {
-    context: &'a ServiceContext,
-    assignment: &'a Assignment,
-    id: RequestId,
-    call: BrowsingContextCall,
-}
-
-/// Whether a page may close `target`: itself or a tab it opened.
-fn close_related(context: &ServiceContext, assignment: &Assignment, target: TabId) -> bool {
-    target == assignment.tab || context.tabs.opener(target) == Some(assignment.tab)
-}
-
-/// Whether a page may address `target` with `postMessage`: itself, its
-/// opener, or a tab it opened.
-fn message_related(context: &ServiceContext, assignment: &Assignment, target: TabId) -> bool {
-    target == assignment.tab
-        || context.tabs.opener(target) == Some(assignment.tab)
-        || context.tabs.opener(assignment.tab) == Some(target)
-}
-
-/// One storage service call from a renderer.
-struct RouteStorageCallOptions<'a> {
-    context: &'a ServiceContext,
-    assignment: RendererAssignmentId,
-    authority: &'a Assignment,
-    id: RequestId,
-    call: StorageCall,
-}
-
-/// One benign reply for a call on a released assignment.
-#[derive(Clone, Copy)]
-struct SendReleasedReplyOptions<'a> {
-    responder: &'a BrowserServiceResponder,
-    id: RequestId,
-    call: &'a ServiceCall,
-}
-
-/// One browser service reply to a renderer.
-struct SendReplyOptions<'a> {
-    responder: &'a BrowserServiceResponder,
-    id: RequestId,
-    reply: ServiceReply,
-}
-
-/// One renderer teardown: mark dead, fail the router, signal kill.
-#[derive(Clone, Copy)]
-struct FailOptions<'a> {
-    alive: &'a Arc<AtomicBool>,
-    router: &'a RendererRouter,
-    kill: &'a watch::Sender<bool>,
-}
-
-/// One renderer event-subscription request.
-#[derive(Clone, Copy)]
-struct SubscribeRendererEventsOptions<'a> {
-    partition: &'a PartitionServices,
-    client: &'a RendererClient,
-    kill: &'a watch::Sender<bool>,
-}
-
-/// One renderer process spawn.
-pub(crate) struct SpawnProcessOptions {
-    /// Renderer identity to spawn.
-    pub(crate) id: RendererId,
-    /// Site lock for the new process, if any.
-    pub(crate) site: Option<Site>,
-    /// Partition services shared with the new process.
-    pub(crate) partition: PartitionServices,
-    /// Session storage owned by the browser.
-    pub(crate) sessions: Arc<SessionStorage>,
-    /// Browser command handle for `window.open` callbacks.
-    pub(crate) browser: crate::browser::BrowserHandle,
-    /// Assignment registry shared by every renderer of this browser context.
-    pub(crate) registry: Arc<AssignmentRegistry>,
-    /// Tab registry for cross-tab calls from renderer service tasks.
-    pub(crate) tabs: TabRegistry,
-    /// Process budget slot held for the renderer's life.
-    pub(crate) slot: tokio::sync::OwnedSemaphorePermit,
-}
-
-/// One local-storage broadcast to same-origin documents.
-#[derive(Clone, Copy)]
-struct BroadcastLocalStorageEventOptions<'a> {
-    context: &'a ServiceContext,
-    assignment: RendererAssignmentId,
-    source: FrameId,
-    origin: &'a str,
-    url: &'a str,
-    change: &'a StorageChange,
-}
-
-async fn writer_task(options: WriterTaskOptions) {
-    let WriterTaskOptions {
-        mut rx,
-        mut writer,
-        alive,
-        router,
-        kill,
-        mut kill_rx,
-    } = options;
+    mut kill_rx: watch::Receiver<bool>,
+) {
     if *kill_rx.borrow() {
         return;
     }
@@ -535,11 +381,7 @@ async fn writer_task(options: WriterTaskOptions) {
         };
         let result = write_to_renderer(&mut *writer, &message).await;
         if result.is_err() {
-            fail(FailOptions {
-                alive: &alive,
-                router: &router,
-                kill: &kill,
-            });
+            fail(&alive, &router, &kill);
             return;
         }
     }
@@ -553,22 +395,18 @@ where
         Frame::RequestChunk { id, bytes } => {
             crate::wire::channel::write_frame_async(
                 writer,
-                crate::wire::channel::WriteFrameOptions {
-                    kind: crate::wire::channel::FrameKind::RequestChunk,
-                    request: id.get(),
-                    payload: bytes,
-                },
+                crate::wire::channel::FrameKind::RequestChunk,
+                id.get(),
+                bytes,
             )
             .await
         }
         Frame::ResponseChunk { id, bytes } => {
             crate::wire::channel::write_frame_async(
                 writer,
-                crate::wire::channel::WriteFrameOptions {
-                    kind: crate::wire::channel::FrameKind::ResponseChunk,
-                    request: id.get(),
-                    payload: bytes,
-                },
+                crate::wire::channel::FrameKind::ResponseChunk,
+                id.get(),
+                bytes,
             )
             .await
         }
@@ -576,12 +414,11 @@ where
     }
 }
 
-async fn reader_task(options: ReaderTaskOptions) {
-    let ReaderTaskOptions {
-        mut reader,
-        context,
-        ready,
-    } = options;
+async fn reader_task(
+    mut reader: Box<dyn AsyncRead + Send + Unpin>,
+    context: ReaderContext,
+    ready: Option<oneshot::Sender<bool>>,
+) {
     let mut ready = ready;
     let mut buffer = Vec::new();
     loop {
@@ -627,11 +464,7 @@ async fn reader_task(options: ReaderTaskOptions) {
     if let Some(ready_tx) = ready {
         let _ = ready_tx.send(false);
     }
-    fail(FailOptions {
-        alive: &context.alive,
-        router: &context.router,
-        kill: &context.kill,
-    });
+    fail(&context.alive, &context.router, &context.kill);
 }
 
 /// Runs browser services and renderer notifications after the exchange router
@@ -642,25 +475,12 @@ async fn service_task(mut server: BrowserServiceServer, context: ServiceContext)
             ServerInput::Call {
                 id,
                 body: BrowserCall { assignment, call },
-            } => {
-                route_service_call(RouteServiceCallOptions {
-                    context: &context,
-                    id,
-                    assignment,
-                    call,
-                })
-                .await
-            }
+            } => route_service_call(&context, id, assignment, call).await,
             ServerInput::Notify(RendererNotice::Event {
                 assignment,
                 frame,
                 event,
-            }) => route_event(RouteEventOptions {
-                context: &context,
-                assignment,
-                frame,
-                event,
-            }),
+            }) => route_event(&context, assignment, frame, event),
             ServerInput::Notify(RendererNotice::Ready)
             | ServerInput::RequestChunk { .. }
             | ServerInput::RequestEnd { .. }
@@ -673,13 +493,12 @@ async fn service_task(mut server: BrowserServiceServer, context: ServiceContext)
     }
 }
 
-fn route_event(options: RouteEventOptions<'_>) -> Result<(), RendererViolation> {
-    let RouteEventOptions {
-        context,
-        assignment,
-        frame,
-        event,
-    } = options;
+fn route_event(
+    context: &ServiceContext,
+    assignment: RendererAssignmentId,
+    frame: FrameId,
+    event: RendererEvent,
+) -> Result<(), RendererViolation> {
     let Some(assignment) = context.registry.resolve(assignment) else {
         return if context.registry.was_released(assignment) {
             Ok(())
@@ -696,29 +515,19 @@ fn route_event(options: RouteEventOptions<'_>) -> Result<(), RendererViolation> 
 
 /// Routes one browser service call from a renderer. This is a dispatch table:
 /// each arm validates and forwards one call shape.
-#[expect(
-    clippy::too_many_lines,
-    reason = "dispatch table over ServiceCall; each arm is one validation plus one forward"
-)]
-async fn route_service_call(options: RouteServiceCallOptions<'_>) -> Result<(), RendererViolation> {
-    let RouteServiceCallOptions {
-        context,
-        id,
-        assignment: assignment_id,
-        call,
-    } = options;
+async fn route_service_call(
+    context: &ServiceContext,
+    id: RequestId,
+    assignment_id: RendererAssignmentId,
+    call: ServiceCall,
+) -> Result<(), RendererViolation> {
     let Some(assignment) = context.registry.resolve(assignment_id) else {
         // The renderer may have queued the call before it processed
         // `Release`. Answer with a benign failure so a synchronous
         // `document.cookie` caller cannot block forever, and keep the
         // process alive for its other assignments.
         if context.registry.was_released(assignment_id) {
-            return send_released_reply(SendReleasedReplyOptions {
-                responder: &context.responder,
-                id,
-                call: &call,
-            })
-            .await;
+            return send_released_reply(&context.responder, id, &call).await;
         }
         return Err(RendererViolation);
     };
@@ -733,11 +542,7 @@ async fn route_service_call(options: RouteServiceCallOptions<'_>) -> Result<(), 
             let cancel = context.kill.subscribe();
             tokio::spawn(async move {
                 let outcome = worker_network
-                    .dial_request(crate::network::DialRequestOptions {
-                        request: &request,
-                        initiator: &initiator,
-                        cancel,
-                    })
+                    .dial_request(&request, &initiator, cancel)
                     .await;
                 if responder
                     .reply(id, ServiceReply::Dial(outcome))
@@ -753,24 +558,14 @@ async fn route_service_call(options: RouteServiceCallOptions<'_>) -> Result<(), 
                 return Err(RendererViolation);
             };
             let reply = ServiceReply::Cookie(assignment.network.cookies_for(&url));
-            send_reply(SendReplyOptions {
-                responder: &context.responder,
-                id,
-                reply,
-            })
-            .await?;
+            send_reply(&context.responder, id, reply).await?;
         }
         ServiceCall::Network(NetworkCall::CookieSet { value, url }) => {
             let Some(url) = assignment.site.authorize(&url) else {
                 return Err(RendererViolation);
             };
             assignment.network.set_cookie(&value, &url);
-            send_reply(SendReplyOptions {
-                responder: &context.responder,
-                id,
-                reply: ServiceReply::Unit,
-            })
-            .await?;
+            send_reply(&context.responder, id, ServiceReply::Unit).await?;
         }
         ServiceCall::Messaging(MessagingCall::BroadcastPost {
             origin,
@@ -792,51 +587,40 @@ async fn route_service_call(options: RouteServiceCallOptions<'_>) -> Result<(), 
                     payload,
                     source: (assignment_id, channel),
                 }));
-            send_reply(SendReplyOptions {
-                responder: &context.responder,
-                id,
-                reply: ServiceReply::Unit,
-            })
-            .await?;
+            send_reply(&context.responder, id, ServiceReply::Unit).await?;
         }
         ServiceCall::Storage(call) => {
-            return route_storage_call(RouteStorageCallOptions {
-                context,
-                assignment: assignment_id,
-                authority: &assignment,
-                id,
-                call,
-            })
-            .await;
+            return route_storage_call(context, assignment_id, &assignment, id, call).await;
         }
         ServiceCall::BrowsingContext(call) => {
-            return route_window_call(RouteWindowCallOptions {
-                context,
-                assignment: &assignment,
-                id,
-                call,
-            })
-            .await;
+            return route_window_call(context, &assignment, id, call).await;
         }
     }
     Ok(())
 }
 
+/// Whether a page may close `target`: itself or a tab it opened.
+fn close_related(context: &ServiceContext, assignment: &Assignment, target: TabId) -> bool {
+    target == assignment.tab || context.tabs.opener(target) == Some(assignment.tab)
+}
+
+/// Whether a page may address `target` with `postMessage`: itself, its
+/// opener, or a tab it opened.
+fn message_related(context: &ServiceContext, assignment: &Assignment, target: TabId) -> bool {
+    target == assignment.tab
+        || context.tabs.opener(target) == Some(assignment.tab)
+        || context.tabs.opener(assignment.tab) == Some(target)
+}
+
 /// Routes one `window.open`/`window.close`/`postMessage` service call. Step 1
 /// created the tab and its first navigation; step 2 adds the opener link,
-/// cross-tab messaging, and the relatedness gates. This is a dispatch table
-/// over `BrowsingContextCall`.
-#[expect(
-    clippy::too_many_lines,
-    reason = "dispatch table over BrowsingContextCall; each arm is one validation plus one forward"
-)]
-async fn route_window_call(options: RouteWindowCallOptions<'_>) -> Result<(), RendererViolation> {
-    let RouteWindowCallOptions {
-        context,
-        assignment,
-        id,
-        call,
-    } = options;
+/// cross-tab messaging, and the relatedness gates.
+async fn route_window_call(
+    context: &ServiceContext,
+    assignment: &Assignment,
+    id: RequestId,
+    call: BrowsingContextCall,
+) -> Result<(), RendererViolation> {
     match call {
         BrowsingContextCall::WindowOpen { url, features, .. } => {
             let spec = if url.is_empty() || url == "about:blank" {
@@ -867,12 +651,7 @@ async fn route_window_call(options: RouteWindowCallOptions<'_>) -> Result<(), Re
                     .map(TabId::get),
                 None => None,
             };
-            send_reply(SendReplyOptions {
-                responder: &context.responder,
-                id,
-                reply: ServiceReply::Window(tab),
-            })
-            .await?;
+            send_reply(&context.responder, id, ServiceReply::Window(tab)).await?;
         }
         BrowsingContextCall::WindowClose { tab } => {
             let target = TabId::new(tab);
@@ -881,21 +660,11 @@ async fn route_window_call(options: RouteWindowCallOptions<'_>) -> Result<(), Re
             if close_related(context, assignment, target) {
                 let _result = context.browser.close_tab(target).await;
             }
-            send_reply(SendReplyOptions {
-                responder: &context.responder,
-                id,
-                reply: ServiceReply::Unit,
-            })
-            .await?;
+            send_reply(&context.responder, id, ServiceReply::Unit).await?;
         }
         BrowsingContextCall::Opener => {
             let opener = context.tabs.opener(assignment.tab).map(TabId::get);
-            send_reply(SendReplyOptions {
-                responder: &context.responder,
-                id,
-                reply: ServiceReply::Window(opener),
-            })
-            .await?;
+            send_reply(&context.responder, id, ServiceReply::Window(opener)).await?;
         }
         BrowsingContextCall::WindowMessage { tab, payload } => {
             // A page can only hold a `WindowProxy` for a related window: its
@@ -908,12 +677,7 @@ async fn route_window_call(options: RouteWindowCallOptions<'_>) -> Result<(), Re
                 // busy target block this renderer.
                 let _queued = context.tabs.deliver(target, payload).await;
             }
-            send_reply(SendReplyOptions {
-                responder: &context.responder,
-                id,
-                reply: ServiceReply::Unit,
-            })
-            .await?;
+            send_reply(&context.responder, id, ServiceReply::Unit).await?;
         }
         BrowsingContextCall::RemoteSessionGet { tab, origin, key } => {
             if !assignment.authorize_origin(&origin) {
@@ -924,20 +688,9 @@ async fn route_window_call(options: RouteWindowCallOptions<'_>) -> Result<(), Re
                 || context.tabs.opener(target) == Some(assignment.tab)
                 || context.tabs.opener(assignment.tab) == Some(target);
             let value = related
-                .then(|| {
-                    context.sessions.get(SessionKeyOptions {
-                        tab: target,
-                        origin: &origin,
-                        key: &key,
-                    })
-                })
+                .then(|| context.sessions.get(target, &origin, &key))
                 .flatten();
-            send_reply(SendReplyOptions {
-                responder: &context.responder,
-                id,
-                reply: ServiceReply::StorageValue(value),
-            })
-            .await?;
+            send_reply(&context.responder, id, ServiceReply::StorageValue(value)).await?;
         }
     }
     Ok(())
@@ -950,65 +703,10 @@ struct StorageRouter<'a> {
     request: RequestId,
 }
 
-/// One `Storage.getItem(key)` routed to the owning area.
-#[derive(Clone, Copy)]
-struct StorageGetOptions<'a> {
-    kind: StorageKind,
-    origin: &'a str,
-    key: &'a str,
-}
-
-/// One `Storage.setItem(key, value)` routed to the owning area.
-#[derive(Clone, Copy)]
-struct StorageSetOptions<'a> {
-    kind: StorageKind,
-    origin: &'a str,
-    url: &'a str,
-    key: &'a str,
-    value: &'a str,
-    source: FrameId,
-}
-
-/// One `Storage.removeItem(key)` routed to the owning area.
-#[derive(Clone, Copy)]
-struct StorageRemoveOptions<'a> {
-    kind: StorageKind,
-    origin: &'a str,
-    url: &'a str,
-    key: &'a str,
-    source: FrameId,
-}
-
-/// One `Storage.clear()` routed to the owning area.
-#[derive(Clone, Copy)]
-struct StorageClearOptions<'a> {
-    kind: StorageKind,
-    origin: &'a str,
-    url: &'a str,
-    source: FrameId,
-}
-
-/// One storage mutation announced to same-origin documents.
-#[derive(Clone, Copy)]
-struct StoragePublishOptions<'a> {
-    source: FrameId,
-    kind: StorageKind,
-    origin: &'a str,
-    url: &'a str,
-    change: Option<&'a StorageChange>,
-}
-
 impl StorageRouter<'_> {
     async fn route(&self, call: StorageCall) -> Result<(), RendererViolation> {
         match call {
-            StorageCall::Get { kind, origin, key } => {
-                self.get(StorageGetOptions {
-                    kind,
-                    origin: &origin,
-                    key: &key,
-                })
-                .await
-            }
+            StorageCall::Get { kind, origin, key } => self.get(kind, &origin, &key).await,
             StorageCall::Keys { kind, origin } => self.keys(kind, &origin).await,
             StorageCall::Set {
                 kind,
@@ -1017,66 +715,39 @@ impl StorageRouter<'_> {
                 key,
                 value,
                 source,
-            } => {
-                self.set(StorageSetOptions {
-                    kind,
-                    origin: &origin,
-                    url: &url,
-                    key: &key,
-                    value: &value,
-                    source,
-                })
-                .await
-            }
+            } => self.set(kind, &origin, &url, &key, &value, source).await,
             StorageCall::Remove {
                 kind,
                 origin,
                 url,
                 key,
                 source,
-            } => {
-                self.remove(StorageRemoveOptions {
-                    kind,
-                    origin: &origin,
-                    url: &url,
-                    key: &key,
-                    source,
-                })
-                .await
-            }
+            } => self.remove(kind, &origin, &url, &key, source).await,
             StorageCall::Clear {
                 kind,
                 origin,
                 url,
                 source,
-            } => {
-                self.clear(StorageClearOptions {
-                    kind,
-                    origin: &origin,
-                    url: &url,
-                    source,
-                })
-                .await
-            }
+            } => self.clear(kind, &origin, &url, source).await,
         }
     }
 
-    async fn get(&self, read: StorageGetOptions<'_>) -> Result<(), RendererViolation> {
-        let StorageGetOptions { kind, origin, key } = read;
+    async fn get(
+        &self,
+        kind: StorageKind,
+        origin: &str,
+        key: &str,
+    ) -> Result<(), RendererViolation> {
         self.authorize(origin, None)?;
         let value = match kind {
             StorageKind::Local => self.context.partition.local_storage.get(origin, key),
-            StorageKind::Session => self.context.sessions.get(SessionKeyOptions {
-                tab: self.authority.tab,
-                origin,
-                key,
-            }),
+            StorageKind::Session => self.context.sessions.get(self.authority.tab, origin, key),
         };
-        send_reply(SendReplyOptions {
-            responder: &self.context.responder,
-            id: self.request,
-            reply: ServiceReply::StorageValue(value),
-        })
+        send_reply(
+            &self.context.responder,
+            self.request,
+            ServiceReply::StorageValue(value),
+        )
         .await
     }
 
@@ -1086,109 +757,90 @@ impl StorageRouter<'_> {
             StorageKind::Local => self.context.partition.local_storage.keys(origin),
             StorageKind::Session => self.context.sessions.keys(self.authority.tab, origin),
         };
-        send_reply(SendReplyOptions {
-            responder: &self.context.responder,
-            id: self.request,
-            reply: ServiceReply::StorageKeys(keys),
-        })
+        send_reply(
+            &self.context.responder,
+            self.request,
+            ServiceReply::StorageKeys(keys),
+        )
         .await
     }
 
-    async fn set(&self, write: StorageSetOptions<'_>) -> Result<(), RendererViolation> {
-        let StorageSetOptions {
-            kind,
-            origin,
-            url,
-            key,
-            value,
-            source,
-        } = write;
+    async fn set(
+        &self,
+        kind: StorageKind,
+        origin: &str,
+        url: &str,
+        key: &str,
+        value: &str,
+        source: FrameId,
+    ) -> Result<(), RendererViolation> {
         self.authorize(origin, Some(url))?;
         let change = match kind {
-            StorageKind::Local => {
+            StorageKind::Local => self.context.partition.local_storage.set(origin, key, value),
+            StorageKind::Session => {
                 self.context
-                    .partition
-                    .local_storage
-                    .set(LocalSetOptions { origin, key, value })
+                    .sessions
+                    .set(self.authority.tab, origin, key, value)
             }
-            StorageKind::Session => self.context.sessions.set(SessionSetOptions {
-                tab: self.authority.tab,
-                origin,
-                key,
-                value,
-            }),
         };
-        self.publish(StoragePublishOptions {
+        self.publish(
             source,
             kind,
             origin,
             url,
-            change: change.as_ref().ok().and_then(Option::as_ref),
-        });
-        send_reply(SendReplyOptions {
-            responder: &self.context.responder,
-            id: self.request,
-            reply: ServiceReply::StorageChanged(change),
-        })
+            change.as_ref().ok().and_then(Option::as_ref),
+        );
+        send_reply(
+            &self.context.responder,
+            self.request,
+            ServiceReply::StorageChanged(change),
+        )
         .await
     }
 
-    async fn remove(&self, removal: StorageRemoveOptions<'_>) -> Result<(), RendererViolation> {
-        let StorageRemoveOptions {
-            kind,
-            origin,
-            url,
-            key,
-            source,
-        } = removal;
+    async fn remove(
+        &self,
+        kind: StorageKind,
+        origin: &str,
+        url: &str,
+        key: &str,
+        source: FrameId,
+    ) -> Result<(), RendererViolation> {
         self.authorize(origin, Some(url))?;
         let change = match kind {
             StorageKind::Local => self.context.partition.local_storage.remove(origin, key),
-            StorageKind::Session => self.context.sessions.remove(SessionKeyOptions {
-                tab: self.authority.tab,
-                origin,
-                key,
-            }),
+            StorageKind::Session => self
+                .context
+                .sessions
+                .remove(self.authority.tab, origin, key),
         };
-        self.publish(StoragePublishOptions {
-            source,
-            kind,
-            origin,
-            url,
-            change: change.as_ref(),
-        });
-        send_reply(SendReplyOptions {
-            responder: &self.context.responder,
-            id: self.request,
-            reply: ServiceReply::StorageChanged(Ok(change)),
-        })
+        self.publish(source, kind, origin, url, change.as_ref());
+        send_reply(
+            &self.context.responder,
+            self.request,
+            ServiceReply::StorageChanged(Ok(change)),
+        )
         .await
     }
 
-    async fn clear(&self, clear: StorageClearOptions<'_>) -> Result<(), RendererViolation> {
-        let StorageClearOptions {
-            kind,
-            origin,
-            url,
-            source,
-        } = clear;
+    async fn clear(
+        &self,
+        kind: StorageKind,
+        origin: &str,
+        url: &str,
+        source: FrameId,
+    ) -> Result<(), RendererViolation> {
         self.authorize(origin, Some(url))?;
         let change = match kind {
             StorageKind::Local => self.context.partition.local_storage.clear(origin),
             StorageKind::Session => self.context.sessions.clear(self.authority.tab, origin),
         };
-        self.publish(StoragePublishOptions {
-            source,
-            kind,
-            origin,
-            url,
-            change: change.as_ref(),
-        });
-        send_reply(SendReplyOptions {
-            responder: &self.context.responder,
-            id: self.request,
-            reply: ServiceReply::StorageChanged(Ok(change)),
-        })
+        self.publish(source, kind, origin, url, change.as_ref());
+        send_reply(
+            &self.context.responder,
+            self.request,
+            ServiceReply::StorageChanged(Ok(change)),
+        )
         .await
     }
 
@@ -1201,38 +853,37 @@ impl StorageRouter<'_> {
         Ok(())
     }
 
-    fn publish(&self, publication: StoragePublishOptions<'_>) {
-        let StoragePublishOptions {
-            source,
-            kind,
-            origin,
-            url,
-            change,
-        } = publication;
+    fn publish(
+        &self,
+        source: FrameId,
+        kind: StorageKind,
+        origin: &str,
+        url: &str,
+        change: Option<&StorageChange>,
+    ) {
         let Some(change) = change else {
             return;
         };
         if kind == StorageKind::Local {
-            broadcast_local_storage_event(BroadcastLocalStorageEventOptions {
-                context: self.context,
-                assignment: self.assignment,
+            broadcast_local_storage_event(
+                self.context,
+                self.assignment,
                 source,
                 origin,
                 url,
                 change,
-            });
+            );
         }
     }
 }
 
-async fn route_storage_call(options: RouteStorageCallOptions<'_>) -> Result<(), RendererViolation> {
-    let RouteStorageCallOptions {
-        context,
-        assignment,
-        authority,
-        id,
-        call,
-    } = options;
+async fn route_storage_call(
+    context: &ServiceContext,
+    assignment: RendererAssignmentId,
+    authority: &Assignment,
+    id: RequestId,
+    call: StorageCall,
+) -> Result<(), RendererViolation> {
     StorageRouter {
         context,
         assignment,
@@ -1243,15 +894,14 @@ async fn route_storage_call(options: RouteStorageCallOptions<'_>) -> Result<(), 
     .await
 }
 
-fn broadcast_local_storage_event(options: BroadcastLocalStorageEventOptions<'_>) {
-    let BroadcastLocalStorageEventOptions {
-        context,
-        assignment,
-        source,
-        origin,
-        url,
-        change,
-    } = options;
+fn broadcast_local_storage_event(
+    context: &ServiceContext,
+    assignment: RendererAssignmentId,
+    source: FrameId,
+    origin: &str,
+    url: &str,
+    change: &StorageChange,
+) {
     context
         .partition
         .events
@@ -1269,13 +919,10 @@ fn broadcast_local_storage_event(options: BroadcastLocalStorageEventOptions<'_>)
 /// Answers a late call from a released assignment so the renderer's blocking
 /// service path stays unblocked while its engine is torn down.
 async fn send_released_reply(
-    options: SendReleasedReplyOptions<'_>,
+    responder: &BrowserServiceResponder,
+    id: RequestId,
+    call: &ServiceCall,
 ) -> Result<(), RendererViolation> {
-    let SendReleasedReplyOptions {
-        responder,
-        id,
-        call,
-    } = options;
     let reply = match call {
         ServiceCall::Network(NetworkCall::Dial(_)) => {
             ServiceReply::Dial(Err(renderer::DialFailure::Cancelled))
@@ -1298,32 +945,21 @@ async fn send_released_reply(
             BrowsingContextCall::WindowOpen { .. } | BrowsingContextCall::Opener,
         ) => ServiceReply::Window(None),
     };
-    send_reply(SendReplyOptions {
-        responder,
-        id,
-        reply,
-    })
-    .await
+    send_reply(responder, id, reply).await
 }
 
-async fn send_reply(options: SendReplyOptions<'_>) -> Result<(), RendererViolation> {
-    let SendReplyOptions {
-        responder,
-        id,
-        reply,
-    } = options;
+async fn send_reply(
+    responder: &BrowserServiceResponder,
+    id: RequestId,
+    reply: ServiceReply,
+) -> Result<(), RendererViolation> {
     responder
         .reply(id, reply)
         .await
         .map_err(|_| RendererViolation)
 }
 
-fn fail(options: FailOptions<'_>) {
-    let FailOptions {
-        alive,
-        router,
-        kill,
-    } = options;
+fn fail(alive: &Arc<AtomicBool>, router: &RendererRouter, kill: &watch::Sender<bool>) {
     alive.store(false, Ordering::Relaxed);
     router.close();
     let _ = kill.send(true);
@@ -1401,12 +1037,11 @@ fn spawn_transport(command: &mut Command) -> io::Result<SpawnedRenderer> {
 /// the renderer may be blocked in a synchronous service call, and losing an
 /// observable event is better than killing the page. A closed client removes
 /// the subscription and stops the renderer.
-fn subscribe_renderer_events(options: SubscribeRendererEventsOptions<'_>) {
-    let SubscribeRendererEventsOptions {
-        partition,
-        client,
-        kill,
-    } = options;
+fn subscribe_renderer_events(
+    partition: &PartitionServices,
+    client: &RendererClient,
+    kill: &watch::Sender<bool>,
+) {
     let client = client.clone();
     let kill = kill.clone();
     partition.events.subscribe(Box::new(move |event| {
@@ -1436,17 +1071,33 @@ fn subscribe_renderer_events(options: SubscribeRendererEventsOptions<'_>) {
     }));
 }
 
-pub(crate) async fn spawn_process(options: SpawnProcessOptions) -> io::Result<RendererHandle> {
-    let SpawnProcessOptions {
-        id,
-        site,
+/// Browser services one renderer process hosts for its assignments.
+pub(crate) struct RendererServices {
+    /// Partition services shared with the new process.
+    pub(crate) partition: PartitionServices,
+    /// Session storage owned by the browser.
+    pub(crate) sessions: Arc<SessionStorage>,
+    /// Browser command handle for `window.open` callbacks.
+    pub(crate) browser: crate::browser::BrowserHandle,
+    /// Assignment registry shared by every renderer of this browser context.
+    pub(crate) registry: Arc<AssignmentRegistry>,
+    /// Tab registry for cross-tab calls from renderer service tasks.
+    pub(crate) tabs: TabRegistry,
+}
+
+pub(crate) async fn spawn_process(
+    id: RendererId,
+    site: Option<Site>,
+    services: RendererServices,
+    slot: tokio::sync::OwnedSemaphorePermit,
+) -> io::Result<RendererHandle> {
+    let RendererServices {
         partition,
         sessions,
         browser,
         registry,
         tabs,
-        slot,
-    } = options;
+    } = services;
     let mut command = Command::new(std::env::current_exe()?);
     command
         .arg("renderer")
@@ -1464,21 +1115,17 @@ pub(crate) async fn spawn_process(options: SpawnProcessOptions) -> io::Result<Re
     let (tx, rx) = exchange::pair(COMMAND_CAPACITY, COMMAND_CAPACITY);
     let (client, server, router) = exchange::endpoint(tx, COMMAND_CAPACITY);
     let (kill, kill_rx) = watch::channel(false);
-    subscribe_renderer_events(SubscribeRendererEventsOptions {
-        partition: &partition,
-        client: &client,
-        kill: &kill,
-    });
+    subscribe_renderer_events(&partition, &client, &kill);
     let alive = Arc::new(AtomicBool::new(true));
     let (ready_tx, ready_rx) = oneshot::channel();
-    let writer_task = tokio::spawn(writer_task(WriterTaskOptions {
+    let writer_task = tokio::spawn(writer_task(
         rx,
         writer,
-        alive: Arc::clone(&alive),
-        router: router.clone(),
-        kill: kill.clone(),
-        kill_rx: kill_rx.clone(),
-    }));
+        Arc::clone(&alive),
+        router.clone(),
+        kill.clone(),
+        kill_rx.clone(),
+    ));
     let site = Arc::new(Mutex::new(site));
     let reader_context = ReaderContext {
         router: router.clone(),
@@ -1494,11 +1141,7 @@ pub(crate) async fn spawn_process(options: SpawnProcessOptions) -> io::Result<Re
         kill: kill.clone(),
         browser,
     };
-    let reader_task = tokio::spawn(reader_task(ReaderTaskOptions {
-        reader,
-        context: reader_context,
-        ready: Some(ready_tx),
-    }));
+    let reader_task = tokio::spawn(reader_task(reader, reader_context, Some(ready_tx)));
     let service_task = tokio::spawn(service_task(server, service_context));
     let stderr_task = tokio::spawn(forward_stderr(stderr));
     // Detached child task: it reaps the child when the channel closes or the

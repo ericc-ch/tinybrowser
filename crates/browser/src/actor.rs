@@ -17,9 +17,7 @@ use tokio::task::JoinHandle;
 use tokio::time::{Instant, sleep_until, timeout};
 use url::Url;
 
-use crate::assignment::{
-    Assignment, AssignmentMountOptions, AssignmentOptions, AssignmentStartResponseOptions,
-};
+use crate::assignment::Assignment;
 use crate::exchange::{self, RequestId, ServerInput};
 use crate::manager::RendererProcessManager;
 use crate::network::{NAV_BODY_LIMIT, NavOutcome, TabNetworkHandle, dial_failure};
@@ -444,31 +442,15 @@ pub(crate) struct TabTask {
     join: Option<JoinHandle<()>>,
 }
 
-/// Dependencies one [`TabTask`] coordinator starts with.
-pub(crate) struct SpawnOptions {
-    /// Tab identity to coordinate.
-    pub(crate) id: TabId,
-    /// Network capability for the tab.
-    pub(crate) network: TabNetworkHandle,
-    /// Renderer pool the tab acquires from.
-    pub(crate) renderers: Arc<RendererProcessManager>,
-}
-
 impl TabTask {
-    pub(crate) fn spawn(options: SpawnOptions) -> Self {
-        let SpawnOptions {
-            id,
-            network,
-            renderers,
-        } = options;
+    pub(crate) fn spawn(
+        id: TabId,
+        network: TabNetworkHandle,
+        renderers: Arc<RendererProcessManager>,
+    ) -> Self {
         let (client, server) = exchange::local(COMMAND_CAPACITY);
         let handle = TabHandle { id, client };
-        let tab = Tab::new(TabOptions {
-            id,
-            network,
-            renderers,
-            events: server.notifier(),
-        });
+        let tab = Tab::new(id, network, renderers, server.notifier());
         let (deliveries, delivery_rx) = mpsc::channel(DELIVERY_CAPACITY);
         let join = tokio::spawn(coordinator_loop(server, tab, delivery_rx));
         Self {
@@ -531,37 +513,13 @@ struct Tab {
     events: TabNotifier,
 }
 
-/// Inputs for constructing one [`Tab`].
-struct TabOptions {
-    id: TabId,
-    network: TabNetworkHandle,
-    renderers: Arc<RendererProcessManager>,
-    events: TabNotifier,
-}
-
-/// One completed document mount into the tab's renderer.
-struct MountOptions<'a> {
-    site: &'a Site,
-    status: u16,
-    mount: Mount,
-}
-
-/// One streamed response mount into the tab's renderer.
-struct MountStreamOptions<'a> {
-    site: &'a Site,
-    status: u16,
-    mount: Mount,
-    body: net::Body,
-}
-
 impl Tab {
-    fn new(options: TabOptions) -> Self {
-        let TabOptions {
-            id,
-            network,
-            renderers,
-            events,
-        } = options;
+    fn new(
+        id: TabId,
+        network: TabNetworkHandle,
+        renderers: Arc<RendererProcessManager>,
+        events: TabNotifier,
+    ) -> Self {
         let (dial_tx, dial_rx) = mpsc::unbounded_channel();
         Self {
             id,
@@ -600,12 +558,7 @@ impl Tab {
             self.record_event(TabEvent::Load).await;
             return Ok(());
         }
-        self.mount(MountOptions {
-            site: &site,
-            status: 200,
-            mount,
-        })
-        .await
+        self.mount(&site, 200, mount).await
     }
 
     fn goto(&mut self, spec: &str) -> Result<(), TabError> {
@@ -643,11 +596,7 @@ impl Tab {
         }
         let handle = self
             .renderers
-            .acquire(AssignmentOptions {
-                tab: self.id,
-                site: site.clone(),
-                network: self.network.clone(),
-            })
+            .acquire(self.id, site.clone(), self.network.clone())
             .await
             .map_err(|error| renderer_unavailable(&error.to_string()))?;
         self.drop_renderer();
@@ -657,12 +606,7 @@ impl Tab {
         Ok(())
     }
 
-    async fn mount(&mut self, options: MountOptions<'_>) -> Result<(), TabError> {
-        let MountOptions {
-            site,
-            status,
-            mount,
-        } = options;
+    async fn mount(&mut self, site: &Site, status: u16, mount: Mount) -> Result<(), TabError> {
         self.ensure_renderer(site).await?;
         self.pending_mount = None;
         self.document_loaded = false;
@@ -671,11 +615,7 @@ impl Tab {
             .renderer
             .as_ref()
             .ok_or(TabError::ActorStopped)?
-            .mount(AssignmentMountOptions {
-                frame: FrameId::MAIN,
-                status,
-                mount,
-            })
+            .mount(FrameId::MAIN, status, mount)
             .await
             .and_then(reply_unit);
         if result.is_err() {
@@ -686,24 +626,20 @@ impl Tab {
         result
     }
 
-    async fn mount_stream(&mut self, options: MountStreamOptions<'_>) -> Result<(), TabError> {
-        let MountStreamOptions {
-            site,
-            status,
-            mount,
-            mut body,
-        } = options;
+    async fn mount_stream(
+        &mut self,
+        site: &Site,
+        status: u16,
+        mount: Mount,
+        mut body: net::Body,
+    ) -> Result<(), TabError> {
         self.ensure_renderer(site).await?;
         self.pending_mount = None;
         self.document_loaded = false;
         let document_url = mount.url.clone();
         let renderer = self.renderer.as_ref().ok_or(TabError::ActorStopped)?;
         let stream = renderer
-            .start_response(AssignmentStartResponseOptions {
-                frame: FrameId::MAIN,
-                status,
-                mount: &mount,
-            })
+            .start_response(FrameId::MAIN, status, &mount)
             .await?;
         let mut received = 0usize;
         loop {
@@ -812,12 +748,7 @@ impl Tab {
         let site = Site::for_url(&self.document_url)
             .or_else(|| self.site.clone())
             .unwrap_or_else(|| Site::opaque(self.id));
-        self.mount(MountOptions {
-            site: &site,
-            status: 200,
-            mount,
-        })
-        .await
+        self.mount(&site, 200, mount).await
     }
 
     fn launch_navigation(&mut self) {
@@ -832,15 +763,9 @@ impl Tab {
         let initiator = nav.initiator.clone();
         self.cancel_dial();
         let (cancel, cancel_rx) = watch::channel(false);
-        let guard = self
-            .network
-            .dial_navigation(crate::network::DialNavigationOptions {
-                epoch,
-                url,
-                initiator,
-                reply: self.dial_tx.clone(),
-                cancel: cancel_rx,
-            });
+        let guard =
+            self.network
+                .dial_navigation(epoch, url, initiator, self.dial_tx.clone(), cancel_rx);
         self.dial_cancel = Some(cancel);
         self.dial_guard = Some(guard);
         if let Some(nav) = self.nav.as_mut() {
@@ -891,12 +816,7 @@ impl Tab {
             body: Vec::new(),
         };
         if self
-            .mount_stream(MountStreamOptions {
-                site: &site,
-                status: outcome.status,
-                mount,
-                body: outcome.body,
-            })
+            .mount_stream(&site, outcome.status, mount, outcome.body)
             .await
             .is_err()
         {
@@ -978,15 +898,7 @@ async fn coordinator_loop(
                 if cancelled.remove(&id) {
                     continue;
                 }
-                if handle_command(HandleCommandOptions {
-                    tab: &mut tab,
-                    server: &server,
-                    id,
-                    command: body,
-                    waiters: &mut waiters,
-                })
-                .await
-                {
+                if handle_command(&mut tab, &server, id, body, &mut waiters).await {
                     return;
                 }
             }
@@ -994,11 +906,7 @@ async fn coordinator_loop(
                 let before = waiters.len();
                 waiters.retain(|waiter| waiter.id != id);
                 if waiters.len() == before {
-                    remember_cancelled(RememberCancelledOptions {
-                        cancelled: &mut cancelled,
-                        order: &mut cancelled_order,
-                        id,
-                    });
+                    remember_cancelled(&mut cancelled, &mut cancelled_order, id);
                 }
             }
             Wake::Command(Some(
@@ -1014,12 +922,7 @@ async fn coordinator_loop(
             Wake::Renderer(Some((frame, event))) => tab.handle_renderer_event(frame, event).await,
             Wake::Renderer(None) => {
                 tab.drop_renderer();
-                fail_waiters(FailWaitersOptions {
-                    server: &server,
-                    waiters: &mut waiters,
-                    error: &TabError::ActorStopped,
-                })
-                .await;
+                fail_waiters(&server, &mut waiters, &TabError::ActorStopped).await;
             }
             Wake::Delivery(Some(payload)) => {
                 let _result = tab.deliver_window_message(payload).await;
@@ -1029,12 +932,7 @@ async fn coordinator_loop(
                 delivery_rx = None;
             }
         }
-        resolve_waiters(ResolveWaitersOptions {
-            tab: &mut tab,
-            server: &server,
-            waiters: &mut waiters,
-        })
-        .await;
+        resolve_waiters(&mut tab, &server, &mut waiters).await;
     }
     tab.stop_renderer();
 }
@@ -1066,56 +964,11 @@ fn next_waiter_deadline(waiters: &[Waiter]) -> Option<Instant> {
     waiters.iter().map(|waiter| waiter.deadline).min()
 }
 
-/// Bounded record of cancelled waiter ids.
-struct RememberCancelledOptions<'a> {
-    cancelled: &'a mut HashSet<RequestId>,
-    order: &'a mut VecDeque<RequestId>,
+fn remember_cancelled(
+    cancelled: &mut HashSet<RequestId>,
+    order: &mut VecDeque<RequestId>,
     id: RequestId,
-}
-
-/// One coordinator command with its routing context.
-struct HandleCommandOptions<'a> {
-    tab: &'a mut Tab,
-    server: &'a TabServer,
-    id: RequestId,
-    command: Command,
-    waiters: &'a mut Vec<Waiter>,
-}
-
-/// One frame screenshot of the tab's live renderer.
-struct ScreenshotFrameOptions<'a> {
-    tab: &'a mut Tab,
-    frame: FrameId,
-    request: renderer::ScreenshotRequest,
-}
-
-/// One waiter registration.
-struct RetainWaiterOptions<'a> {
-    waiters: &'a mut Vec<Waiter>,
-    waiter: Waiter,
-    server: &'a TabServer,
-}
-
-/// One waiter failure broadcast.
-struct FailWaitersOptions<'a> {
-    server: &'a TabServer,
-    waiters: &'a mut Vec<Waiter>,
-    error: &'a TabError,
-}
-
-/// One waiter resolution pass over live tab state.
-struct ResolveWaitersOptions<'a> {
-    tab: &'a mut Tab,
-    server: &'a TabServer,
-    waiters: &'a mut Vec<Waiter>,
-}
-
-fn remember_cancelled(options: RememberCancelledOptions<'_>) {
-    let RememberCancelledOptions {
-        cancelled,
-        order,
-        id,
-    } = options;
+) {
     if cancelled.insert(id) {
         order.push_back(id);
     }
@@ -1128,14 +981,13 @@ fn remember_cancelled(options: RememberCancelledOptions<'_>) {
 }
 
 /// Handles one command. `true` means the coordinator returns.
-async fn handle_command(options: HandleCommandOptions<'_>) -> bool {
-    let HandleCommandOptions {
-        tab,
-        server,
-        id,
-        command,
-        waiters,
-    } = options;
+async fn handle_command(
+    tab: &mut Tab,
+    server: &TabServer,
+    id: RequestId,
+    command: Command,
+    waiters: &mut Vec<Waiter>,
+) -> bool {
     let ctx = ServeContext {
         tab,
         server,
@@ -1287,12 +1139,7 @@ impl TabOperation for ScreenshotFrame {
 
     async fn serve(self, ctx: ServeContext<'_>) -> TabOutcome {
         let ServeContext { tab, .. } = ctx;
-        let result = screenshot_frame(ScreenshotFrameOptions {
-            tab,
-            frame: self.frame,
-            request: self.request,
-        })
-        .await;
+        let result = screenshot_frame(tab, self.frame, self.request).await;
         TabOutcome::Reply(TabReply::Screenshot(result))
     }
 }
@@ -1320,15 +1167,15 @@ impl TabOperation for RunUntilLoad {
             waiters,
             ..
         } = ctx;
-        retain_waiter(RetainWaiterOptions {
+        retain_waiter(
             waiters,
-            waiter: Waiter {
+            Waiter {
                 id,
                 deadline: Instant::now() + self.timeout,
                 source: None,
             },
             server,
-        })
+        )
         .await;
         TabOutcome::Retained
     }
@@ -1359,15 +1206,15 @@ impl TabOperation for RunUntilJs {
             waiters,
             ..
         } = ctx;
-        retain_waiter(RetainWaiterOptions {
+        retain_waiter(
             waiters,
-            waiter: Waiter {
+            Waiter {
                 id,
                 deadline: Instant::now() + self.timeout,
                 source: Some((self.frame, self.source)),
             },
             server,
-        })
+        )
         .await;
         TabOutcome::Retained
     }
@@ -1446,22 +1293,16 @@ impl TabOperation for Shutdown {
     }
 }
 
-async fn screenshot_frame(options: ScreenshotFrameOptions<'_>) -> Result<Vec<u8>, TabError> {
-    let ScreenshotFrameOptions {
-        tab,
-        frame,
-        request,
-    } = options;
+async fn screenshot_frame(
+    tab: &mut Tab,
+    frame: FrameId,
+    request: renderer::ScreenshotRequest,
+) -> Result<Vec<u8>, TabError> {
     tab.renderer_request_bytes(RendererCommand::Screenshot { frame, request })
         .await
 }
 
-async fn retain_waiter(options: RetainWaiterOptions<'_>) {
-    let RetainWaiterOptions {
-        waiters,
-        waiter,
-        server,
-    } = options;
+async fn retain_waiter(waiters: &mut Vec<Waiter>, waiter: Waiter, server: &TabServer) {
     if waiters.len() < MAX_WAITERS {
         waiters.push(waiter);
         return;
@@ -1473,24 +1314,14 @@ async fn retain_waiter(options: RetainWaiterOptions<'_>) {
     let _result = server.reply(waiter.id, reply).await;
 }
 
-async fn fail_waiters(options: FailWaitersOptions<'_>) {
-    let FailWaitersOptions {
-        server,
-        waiters,
-        error,
-    } = options;
+async fn fail_waiters(server: &TabServer, waiters: &mut Vec<Waiter>, error: &TabError) {
     for waiter in waiters.drain(..) {
         let reply = waiter_reply(&waiter, Err(error.clone()));
         let _result = server.reply(waiter.id, reply).await;
     }
 }
 
-async fn resolve_waiters(options: ResolveWaitersOptions<'_>) {
-    let ResolveWaitersOptions {
-        tab,
-        server,
-        waiters,
-    } = options;
+async fn resolve_waiters(tab: &mut Tab, server: &TabServer, waiters: &mut Vec<Waiter>) {
     let now = Instant::now();
     let mut pending = Vec::new();
     for waiter in std::mem::take(waiters) {

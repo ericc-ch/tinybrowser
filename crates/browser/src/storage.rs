@@ -32,41 +32,6 @@ pub(crate) struct SessionStorage {
     namespaces: Mutex<HashMap<TabId, BTreeMap<String, StorageArea>>>,
 }
 
-/// Address of one `sessionStorage` entry in a top-level browsing context.
-#[derive(Clone, Copy)]
-pub(crate) struct SessionKeyOptions<'a> {
-    /// Top-level browsing context that owns the namespace.
-    pub(crate) tab: TabId,
-    /// Origin that owns the area.
-    pub(crate) origin: &'a str,
-    /// Entry key.
-    pub(crate) key: &'a str,
-}
-
-/// One `sessionStorage` write.
-#[derive(Clone, Copy)]
-pub(crate) struct SessionSetOptions<'a> {
-    /// Top-level browsing context that owns the namespace.
-    pub(crate) tab: TabId,
-    /// Origin that owns the area.
-    pub(crate) origin: &'a str,
-    /// Entry key.
-    pub(crate) key: &'a str,
-    /// Entry value.
-    pub(crate) value: &'a str,
-}
-
-/// One `localStorage` write.
-#[derive(Clone, Copy)]
-pub(crate) struct LocalSetOptions<'a> {
-    /// Origin that owns the area.
-    pub(crate) origin: &'a str,
-    /// Entry key.
-    pub(crate) key: &'a str,
-    /// Entry value.
-    pub(crate) value: &'a str,
-}
-
 impl SessionStorage {
     pub(crate) fn create(&self, tab: TabId) {
         self.namespaces
@@ -94,8 +59,7 @@ impl SessionStorage {
             .remove(&tab);
     }
 
-    pub(crate) fn get(&self, address: SessionKeyOptions<'_>) -> Option<String> {
-        let SessionKeyOptions { tab, origin, key } = address;
+    pub(crate) fn get(&self, tab: TabId, origin: &str, key: &str) -> Option<String> {
         self.namespaces
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -116,14 +80,11 @@ impl SessionStorage {
 
     pub(crate) fn set(
         &self,
-        write: SessionSetOptions<'_>,
+        tab: TabId,
+        origin: &str,
+        key: &str,
+        value: &str,
     ) -> Result<Option<StorageChange>, StorageError> {
-        let SessionSetOptions {
-            tab,
-            origin,
-            key,
-            value,
-        } = write;
         let mut namespaces = self
             .namespaces
             .lock()
@@ -137,8 +98,7 @@ impl SessionStorage {
             .set(key, value)
     }
 
-    pub(crate) fn remove(&self, address: SessionKeyOptions<'_>) -> Option<StorageChange> {
-        let SessionKeyOptions { tab, origin, key } = address;
+    pub(crate) fn remove(&self, tab: TabId, origin: &str, key: &str) -> Option<StorageChange> {
         self.namespaces
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -182,9 +142,10 @@ impl LocalStorage {
     /// (<https://html.spec.whatwg.org/multipage/webstorage.html#dom-storage-setitem>).
     pub(crate) fn set(
         &self,
-        write: LocalSetOptions<'_>,
+        origin: &str,
+        key: &str,
+        value: &str,
     ) -> Result<Option<StorageChange>, StorageError> {
-        let LocalSetOptions { origin, key, value } = write;
         let mut areas = self.areas.lock().unwrap_or_else(PoisonError::into_inner);
         let area = areas.entry(origin.to_owned()).or_default();
         let change = area.set(key, value)?;

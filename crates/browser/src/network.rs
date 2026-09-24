@@ -117,30 +117,6 @@ pub(crate) struct TabNetworkHandle {
     tab: Arc<Semaphore>,
 }
 
-/// One navigation dial requested by a tab coordinator.
-pub(crate) struct DialNavigationOptions {
-    /// Renderer epoch that tags the completion.
-    pub(crate) epoch: u64,
-    /// Requested navigation URL.
-    pub(crate) url: Url,
-    /// Document that initiated the navigation.
-    pub(crate) initiator: Url,
-    /// Completion sink for the epoch-tagged result.
-    pub(crate) reply: UnboundedSender<(u64, Result<NavOutcome, DialFailure>)>,
-    /// Cancellation signal owned by the calling tab.
-    pub(crate) cancel: tokio::sync::watch::Receiver<bool>,
-}
-
-/// One renderer service dial, cancelled when the renderer dies or the tab closes.
-pub(crate) struct DialRequestOptions<'a> {
-    /// Renderer-issued request to perform.
-    pub(crate) request: &'a DialRequest,
-    /// Document that initiated the request.
-    pub(crate) initiator: &'a Url,
-    /// Cancellation signal owned by the calling tab.
-    pub(crate) cancel: tokio::sync::watch::Receiver<bool>,
-}
-
 impl TabNetworkHandle {
     /// `document.cookie` getter for `url`.
     #[must_use]
@@ -158,16 +134,13 @@ impl TabNetworkHandle {
     /// `reply` tagged with `epoch`.
     pub(crate) fn dial_navigation(
         &self,
-        dial: DialNavigationOptions,
+        epoch: u64,
+        url: Url,
+        initiator: Url,
+        reply: UnboundedSender<(u64, Result<NavOutcome, DialFailure>)>,
+        mut cancel: tokio::sync::watch::Receiver<bool>,
     ) -> tokio::task::JoinHandle<()> {
         let network = self.clone();
-        let DialNavigationOptions {
-            epoch,
-            url,
-            initiator,
-            reply,
-            mut cancel,
-        } = dial;
         tokio::spawn(async move {
             let result = tokio::select! {
                 biased;
@@ -209,13 +182,10 @@ impl TabNetworkHandle {
     /// dies or the tab closes.
     pub(crate) async fn dial_request(
         &self,
-        dial: DialRequestOptions<'_>,
+        request: &DialRequest,
+        initiator: &Url,
+        mut cancel: tokio::sync::watch::Receiver<bool>,
     ) -> Result<DialOutcome, DialFailure> {
-        let DialRequestOptions {
-            request,
-            initiator,
-            mut cancel,
-        } = dial;
         let call = async {
             let deadline = Instant::now() + PAGE_FETCH_TIMEOUT;
             let _global = Self::acquire(&self.permits.global, deadline).await?;
@@ -297,44 +267,36 @@ pub(crate) fn dial_failure(error: &net::NetError) -> DialFailure {
 /// (<https://wicg.github.io/ua-client-hints/#sec-ch-ua>,
 /// <https://w3c.github.io/webappsec-secure-contexts/#is-url-trustworthy>).
 fn chrome_navigation_request(request: &mut Request, url: &Url) {
-    const DOCUMENT_HEADERS: [(&str, &str); 6] = [
-        ("Upgrade-Insecure-Requests", "1"),
-        (
-            "Accept",
-            "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
-        ),
-        ("Sec-Fetch-Site", "none"),
-        ("Sec-Fetch-Mode", "navigate"),
-        ("Sec-Fetch-User", "?1"),
-        ("Sec-Fetch-Dest", "document"),
-    ];
-    insert_identity_headers(request, DOCUMENT_HEADERS);
+    identity_header(request, "Upgrade-Insecure-Requests", "1");
+    identity_header(
+        request,
+        "Accept",
+        "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+    );
+    identity_header(request, "Sec-Fetch-Site", "none");
+    identity_header(request, "Sec-Fetch-Mode", "navigate");
+    identity_header(request, "Sec-Fetch-User", "?1");
+    identity_header(request, "Sec-Fetch-Dest", "document");
     if sends_default_ua_client_hints(url) {
-        insert_identity_headers(
-            request,
-            [
-                ("Sec-CH-UA", crate::SEC_CH_UA),
-                ("Sec-CH-UA-Mobile", crate::SEC_CH_UA_MOBILE),
-                ("Sec-CH-UA-Platform", crate::SEC_CH_UA_PLATFORM),
-                (
-                    "Sec-CH-Prefers-Color-Scheme",
-                    crate::SEC_CH_PREFERS_COLOR_SCHEME,
-                ),
-            ],
-        );
+        for (name, value) in [
+            ("Sec-CH-UA", crate::SEC_CH_UA),
+            ("Sec-CH-UA-Mobile", crate::SEC_CH_UA_MOBILE),
+            ("Sec-CH-UA-Platform", crate::SEC_CH_UA_PLATFORM),
+            (
+                "Sec-CH-Prefers-Color-Scheme",
+                crate::SEC_CH_PREFERS_COLOR_SCHEME,
+            ),
+        ] {
+            identity_header(request, name, value);
+        }
     }
 }
 
-fn insert_identity_headers(
-    request: &mut Request,
-    headers: impl IntoIterator<Item = (&'static str, &'static str)>,
-) {
-    for (name, value) in headers {
-        request
-            .headers
-            .insert(name, value)
-            .expect("Chrome navigation identity headers are static HTTP tokens with no CTL bytes");
-    }
+fn identity_header(request: &mut Request, name: &str, value: &str) {
+    request
+        .headers
+        .insert(name, value)
+        .expect("Chrome navigation identity headers are static HTTP tokens with no CTL bytes");
 }
 
 fn sends_default_ua_client_hints(url: &Url) -> bool {

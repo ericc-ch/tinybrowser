@@ -34,30 +34,19 @@ pub(crate) struct BrowserContext {
     sessions: Arc<SessionStorage>,
 }
 
-/// Inputs for opening one [`BrowserContext`].
-pub(crate) struct BrowserContextOptions<'a> {
-    /// Root below which profiles are stored.
-    pub(crate) data_home: &'a Path,
-    /// Durable profile to open exclusively.
-    pub(crate) profile: &'a Profile,
-    /// Live partition network.
-    pub(crate) network: NetworkContext,
-}
-
 impl BrowserContext {
-    /// Creates one context and restores its durable partition state.
+    /// Opens one context and restores its durable partition state.
     ///
     /// # Errors
     ///
     /// The profile directory cannot be created or exclusively locked, or stored
     /// profile data could not be read or quarantined.
-    pub(crate) fn new(config: BrowserContextOptions<'_>) -> io::Result<Self> {
-        let BrowserContextOptions {
-            data_home,
-            profile,
-            network,
-        } = config;
-        let store = ProfileStore::new(data_home, profile)?;
+    pub(crate) fn open(
+        data_home: &Path,
+        profile: &Profile,
+        network: NetworkContext,
+    ) -> io::Result<Self> {
+        let store = ProfileStore::open_in(data_home, profile)?;
         store.load_into(&network.agent())?;
         let local_storage = Arc::new(LocalStorage::default());
         store.load_local_storage(&local_storage)?;

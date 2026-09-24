@@ -11,9 +11,9 @@ use std::path::PathBuf;
 
 use url::Url;
 
-use self::task::{BrowserTask, BrowserTaskOptions};
+use self::task::BrowserTask;
 use crate::actor::{TabHandle, TabId};
-use crate::context::{BrowserContext, BrowserContextOptions};
+use crate::context::BrowserContext;
 use crate::exchange;
 use crate::network::NetworkContext;
 use crate::profile::Profile;
@@ -215,19 +215,11 @@ impl Browser {
             Some(data_home) => data_home,
             None => default_data_home().map_err(BrowserOpenError::Profile)?,
         };
-        let context = BrowserContext::new(BrowserContextOptions {
-            data_home: &data_home,
-            profile: &options.profile,
-            network,
-        })
-        .map_err(BrowserOpenError::Profile)?;
+        let context = BrowserContext::open(&data_home, &options.profile, network)
+            .map_err(BrowserOpenError::Profile)?;
         let (client, server) = exchange::local(BROWSER_COMMAND_CAPACITY);
         let handle = BrowserHandle { client };
-        let task = BrowserTask::new(BrowserTaskOptions {
-            server,
-            context,
-            browser: handle.clone(),
-        });
+        let task = BrowserTask::new(server, context, handle.clone());
         runtime.spawn(task.run());
         Ok(Self { handle })
     }

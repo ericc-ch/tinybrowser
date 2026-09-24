@@ -10,11 +10,6 @@
 //! on each other, `dom`, `net`, or `renderer`.
 //! Browser and tab state live in bounded Tokio owner tasks.
 
-// Test harnesses are throwaway scaffolding, not shipped API: they stay
-// positional while non-test code follows the two-parameter convention in
-// `clippy.toml`.
-#![cfg_attr(test, allow(clippy::too_many_arguments))]
-
 mod actor;
 mod assignment;
 mod broadcast;

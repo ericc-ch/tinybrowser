@@ -14,10 +14,12 @@ use std::sync::{Arc, PoisonError};
 
 use tokio::sync::{Semaphore, mpsc};
 
-use crate::assignment::{Assignment, AssignmentOptions, AssignmentRegistry};
+use crate::actor::TabId;
+use crate::assignment::{Assignment, AssignmentRegistry};
 use crate::browser::TabRegistry;
 use crate::context::PartitionServices;
-use crate::link::{RendererHandle, SpawnProcessOptions, spawn_process};
+use crate::link::{RendererHandle, RendererServices, spawn_process};
+use crate::network::TabNetworkHandle;
 use crate::site::Site;
 use crate::storage::SessionStorage;
 
@@ -48,26 +50,13 @@ struct ManagerState {
     spawning_spare: bool,
 }
 
-/// Browser-owned dependencies one renderer manager runs with.
-pub(crate) struct RendererProcessManagerOptions {
-    /// Services shared by renderer assignments in the partition.
-    pub(crate) partition: PartitionServices,
-    /// Session storage owned by the browser.
-    pub(crate) sessions: Arc<SessionStorage>,
-    /// Tab registry handed to every renderer service task.
-    pub(crate) tabs: TabRegistry,
-}
-
 impl RendererProcessManager {
     pub(crate) fn new(
+        partition: PartitionServices,
+        sessions: Arc<SessionStorage>,
         browser: crate::browser::BrowserHandle,
-        services: RendererProcessManagerOptions,
+        tabs: TabRegistry,
     ) -> Self {
-        let RendererProcessManagerOptions {
-            partition,
-            sessions,
-            tabs,
-        } = services;
         let (releases, release_rx) = mpsc::unbounded_channel();
         let inner = Arc::new(ManagerInner {
             partition,
@@ -91,8 +80,13 @@ impl RendererProcessManager {
     ///
     /// Process spawn failure, a failed protocol handshake, or an exhausted
     /// process budget with no reusable process.
-    pub(crate) async fn acquire(&self, options: AssignmentOptions) -> io::Result<Arc<Assignment>> {
-        let (process, assignment) = self.acquire_reserved(options).await?;
+    pub(crate) async fn acquire(
+        &self,
+        tab: TabId,
+        site: Site,
+        network: TabNetworkHandle,
+    ) -> io::Result<Arc<Assignment>> {
+        let (process, assignment) = self.acquire_reserved(tab, site, network).await?;
         if let Err(error) = process.assign_notify(assignment.id()).await {
             // Dropping the assignment releases the reservation and asks the
             // manager to re-evaluate the process.
@@ -108,16 +102,18 @@ impl RendererProcessManager {
     /// the process down mid-acquire.
     async fn acquire_reserved(
         &self,
-        options: AssignmentOptions,
+        tab: TabId,
+        site: Site,
+        network: TabNetworkHandle,
     ) -> io::Result<(Arc<RendererHandle>, Arc<Assignment>)> {
         let mut state = self.inner.state.lock().await;
         let process = if let Some(spare) = state.spare.take() {
-            spare.bind(&options.site)?;
+            spare.bind(&site)?;
             spare
-        } else if let Some(process) = spawn_slot(&self.inner, Some(options.site.clone())).await? {
+        } else if let Some(process) = spawn_slot(&self.inner, Some(site.clone())).await? {
             process
         } else {
-            let candidates = state.sites.entry(options.site.clone()).or_default();
+            let candidates = state.sites.entry(site.clone()).or_default();
             candidates.retain(|candidate| {
                 candidate
                     .upgrade()
@@ -128,7 +124,7 @@ impl RendererProcessManager {
                 .find_map(Weak::upgrade)
                 .ok_or_else(|| io::Error::other("renderer process budget exhausted"))?
         };
-        let processes = state.sites.entry(options.site.clone()).or_default();
+        let processes = state.sites.entry(site.clone()).or_default();
         if !processes.iter().any(|candidate| {
             candidate
                 .upgrade()
@@ -136,7 +132,10 @@ impl RendererProcessManager {
         }) {
             processes.push(Arc::downgrade(&process));
         }
-        let assignment = self.inner.registry.reserve(Arc::clone(&process), options);
+        let assignment = self
+            .inner
+            .registry
+            .reserve(Arc::clone(&process), tab, site, network);
         Ok((process, assignment))
     }
 }
@@ -224,16 +223,18 @@ async fn spawn_slot(
     };
     let id = RendererId(inner.next.fetch_add(1, Ordering::Relaxed));
     Ok(Some(Arc::new(
-        spawn_process(SpawnProcessOptions {
+        spawn_process(
             id,
             site,
-            partition: inner.partition.clone(),
-            sessions: Arc::clone(&inner.sessions),
-            browser: inner.browser.clone(),
-            registry: Arc::clone(&inner.registry),
-            tabs: inner.tabs.clone(),
+            RendererServices {
+                partition: inner.partition.clone(),
+                sessions: Arc::clone(&inner.sessions),
+                browser: inner.browser.clone(),
+                registry: Arc::clone(&inner.registry),
+                tabs: inner.tabs.clone(),
+            },
             slot,
-        })
+        )
         .await?,
     )))
 }

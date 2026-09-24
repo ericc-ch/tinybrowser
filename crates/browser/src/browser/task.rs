@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use crate::actor::{TabHandle, TabId, TabTask};
 use crate::context::BrowserContext;
 use crate::exchange::ServerInput;
-use crate::manager::{RendererProcessManager, RendererProcessManagerOptions};
+use crate::manager::RendererProcessManager;
 
 use super::{
     AddCookie, BrowserError, BrowserHandle, BrowserOperation, BrowserServer, ClearCookies,
@@ -129,36 +129,23 @@ pub(crate) struct BrowserTask {
     next_tab: Option<u64>,
 }
 
-/// Dependencies one [`BrowserTask`] starts with.
-pub(super) struct BrowserTaskOptions {
-    /// Server end of the browser exchange.
-    pub(super) server: BrowserServer,
-    /// Live profile context.
-    pub(super) context: BrowserContext,
-    /// Handle cloned into the renderer manager for `window.open` callbacks.
-    pub(super) browser: BrowserHandle,
-}
-
 enum DispatchOutcome {
     Continue(Reply),
     Stop(Reply),
 }
 
 impl BrowserTask {
-    pub(super) fn new(parts: BrowserTaskOptions) -> Self {
-        let BrowserTaskOptions {
-            server,
-            context,
-            browser,
-        } = parts;
+    pub(super) fn new(
+        server: BrowserServer,
+        context: BrowserContext,
+        browser: BrowserHandle,
+    ) -> Self {
         let tabs = TabRegistry::new();
         let renderers = Arc::new(RendererProcessManager::new(
+            context.partition_services(),
+            context.session_storage(),
             browser,
-            RendererProcessManagerOptions {
-                partition: context.partition_services(),
-                sessions: context.session_storage(),
-                tabs: tabs.clone(),
-            },
+            tabs.clone(),
         ));
         Self {
             server,
@@ -218,11 +205,7 @@ impl BrowserTask {
         self.next_tab = raw.checked_add(1);
         let id = TabId::new(raw);
         self.context.create_tab(id);
-        let task = TabTask::spawn(crate::actor::SpawnOptions {
-            id,
-            network: self.context.tab_network(),
-            renderers: Arc::clone(&self.renderers),
-        });
+        let task = TabTask::spawn(id, self.context.tab_network(), Arc::clone(&self.renderers));
         let handle = task.handle.clone();
         self.tabs.insert(id, task);
         Ok(handle)

@@ -460,11 +460,7 @@ where
 
     pub(crate) async fn call(&self, body: OC) -> Result<IR, Error> {
         let (id, receiver) = self.start_call(body, Pending::Unary).await?;
-        let mut cancel = CancelOnDrop::new(CancelOnDropOptions {
-            id,
-            tx: self.tx.clone(),
-            pending: Arc::clone(&self.pending),
-        });
+        let mut cancel = CancelOnDrop::new(id, self.tx.clone(), Arc::clone(&self.pending));
         let result = receiver.await.unwrap_or(Err(Error::Closed));
         cancel.disarm();
         result
@@ -482,11 +478,7 @@ where
                 reply,
             })
             .await?;
-        let mut cancel = CancelOnDrop::new(CancelOnDropOptions {
-            id,
-            tx: self.tx.clone(),
-            pending: Arc::clone(&self.pending),
-        });
+        let mut cancel = CancelOnDrop::new(id, self.tx.clone(), Arc::clone(&self.pending));
         let result = receiver.await.unwrap_or(Err(Error::Closed));
         cancel.disarm();
         result
@@ -556,12 +548,6 @@ where
     }
 }
 
-struct CancelOnDropOptions<C, R, N, IR> {
-    id: RequestId,
-    tx: Sender<Frame<C, R, N>>,
-    pending: PendingMap<IR>,
-}
-
 struct CancelOnDrop<C, R, N, IR> {
     id: RequestId,
     tx: Sender<Frame<C, R, N>>,
@@ -570,8 +556,7 @@ struct CancelOnDrop<C, R, N, IR> {
 }
 
 impl<C, R, N, IR> CancelOnDrop<C, R, N, IR> {
-    fn new(options: CancelOnDropOptions<C, R, N, IR>) -> Self {
-        let CancelOnDropOptions { id, tx, pending } = options;
+    fn new(id: RequestId, tx: Sender<Frame<C, R, N>>, pending: PendingMap<IR>) -> Self {
         Self {
             id,
             tx,
@@ -634,11 +619,7 @@ impl<C, R, N, IR> Upload<C, R, N, IR> {
         let Some(receiver) = self.reply.take() else {
             return Err(Error::Protocol);
         };
-        let mut cancel = CancelOnDrop::new(CancelOnDropOptions {
-            id: self.id,
-            tx: self.tx.clone(),
-            pending: Arc::clone(&self.pending),
-        });
+        let mut cancel = CancelOnDrop::new(self.id, self.tx.clone(), Arc::clone(&self.pending));
         let result = receiver.await.unwrap_or(Err(Error::Closed));
         cancel.disarm();
         result
@@ -775,11 +756,7 @@ where
         match frame {
             Frame::Call { id, body } => self.send_server(ServerInput::Call { id, body }),
             Frame::Reply { id, body } => {
-                route_reply(RouteReplyOptions {
-                    pending: &self.pending,
-                    id,
-                    body,
-                });
+                route_reply(&self.pending, id, body);
                 Ok(())
             }
             Frame::Notify(notice) => {
@@ -793,11 +770,7 @@ where
             }
             Frame::RequestChunk { id, .. } => self.send_server(ServerInput::RequestChunk { id }),
             Frame::RequestEnd { id, .. } => self.send_server(ServerInput::RequestEnd { id }),
-            Frame::ResponseChunk { id, bytes } => route_chunk(RouteChunkOptions {
-                pending: &self.pending,
-                id,
-                bytes: &bytes,
-            }),
+            Frame::ResponseChunk { id, bytes } => route_chunk(&self.pending, id, &bytes),
             Frame::Cancel { id } => self.send_server(ServerInput::Cancel { id }),
         }
     }
@@ -850,15 +823,11 @@ where
     (client, server, router)
 }
 
-pub(crate) struct BindOptions<OC, OR, ON, IC, IR, IN> {
-    tx: Sender<Frame<OC, OR, ON>>,
-    rx: Receiver<Frame<IC, IR, IN>>,
-    capacity: usize,
-}
-
 /// Binds a decoded transport to one call client and one request server.
 pub(crate) fn bind<OC, OR, ON, IC, IR, IN>(
-    options: BindOptions<OC, OR, ON, IC, IR, IN>,
+    tx: Sender<Frame<OC, OR, ON>>,
+    mut rx: Receiver<Frame<IC, IR, IN>>,
+    capacity: usize,
 ) -> Bound<OC, OR, ON, IC, IR, IN>
 where
     OC: Send + 'static,
@@ -868,11 +837,6 @@ where
     IR: Send + 'static,
     IN: Clone + Send + 'static,
 {
-    let BindOptions {
-        tx,
-        mut rx,
-        capacity,
-    } = options;
     let closed = tx.closed.clone();
     let (client, server, router) = endpoint(tx, capacity);
     tokio::spawn(async move {
@@ -910,16 +874,8 @@ where
 {
     let (to_server, from_client) = pair(control, data);
     let (to_client, from_server) = pair(control, data);
-    let (client, _client_server) = bind(BindOptions {
-        tx: to_server,
-        rx: from_server,
-        capacity: control.max(data),
-    });
-    let (_server_client, server) = bind(BindOptions {
-        tx: to_client,
-        rx: from_client,
-        capacity: control.max(data),
-    });
+    let (client, _client_server) = bind(to_server, from_server, control.max(data));
+    let (_server_client, server) = bind(to_client, from_client, control.max(data));
     (client, server)
 }
 
@@ -1014,14 +970,7 @@ impl<C, OR, N, IR> BlockingClient<C, OR, N, IR> {
     }
 }
 
-struct RouteReplyOptions<'a, R> {
-    pending: &'a Mutex<HashMap<RequestId, Pending<R>>>,
-    id: RequestId,
-    body: R,
-}
-
-fn route_reply<R>(options: RouteReplyOptions<'_, R>) {
-    let RouteReplyOptions { pending, id, body } = options;
+fn route_reply<R>(pending: &Mutex<HashMap<RequestId, Pending<R>>>, id: RequestId, body: R) {
     let waiting = pending
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
@@ -1037,19 +986,11 @@ fn route_reply<R>(options: RouteReplyOptions<'_, R>) {
     }
 }
 
-#[derive(Clone, Copy)]
-struct RouteChunkOptions<'a, R> {
-    pending: &'a Mutex<HashMap<RequestId, Pending<R>>>,
+fn route_chunk<R>(
+    pending: &Mutex<HashMap<RequestId, Pending<R>>>,
     id: RequestId,
-    bytes: &'a [u8],
-}
-
-#[expect(
-    clippy::needless_pass_by_value,
-    reason = "options structs are taken by value by convention; R is not Copy"
-)]
-fn route_chunk<R>(options: RouteChunkOptions<'_, R>) -> Result<(), Error> {
-    let RouteChunkOptions { pending, id, bytes } = options;
+    bytes: &[u8],
+) -> Result<(), Error> {
     let mut pending = pending.lock().unwrap_or_else(PoisonError::into_inner);
     match pending.get_mut(&id) {
         Some(Pending::Download {
@@ -1141,12 +1082,11 @@ mod tests {
     async fn response_chunks_are_correlated_with_the_call() {
         let (to_peer, mut peer_rx) = pair(2, 2);
         let (from_peer, from_peer_rx) = pair(2, 2);
-        let (client, _server) =
-            bind::<u8, Infallible, Infallible, Infallible, u16, Infallible>(BindOptions {
-                tx: to_peer,
-                rx: from_peer_rx,
-                capacity: 2,
-            });
+        let (client, _server) = bind::<u8, Infallible, Infallible, Infallible, u16, Infallible>(
+            to_peer,
+            from_peer_rx,
+            2,
+        );
         let pending = tokio::spawn(async move { client.call_download(4, 3).await });
         let Some(Frame::Call { id, body }) = peer_rx.recv().await else {
             panic!("peer expected call");
@@ -1172,12 +1112,11 @@ mod tests {
     async fn leftover_response_chunks_after_cancel_are_ignored() {
         let (to_peer, mut peer_rx) = pair(2, 2);
         let (from_peer, from_peer_rx) = pair(2, 2);
-        let (client, _server) =
-            bind::<u8, Infallible, Infallible, Infallible, u16, Infallible>(BindOptions {
-                tx: to_peer,
-                rx: from_peer_rx,
-                capacity: 2,
-            });
+        let (client, _server) = bind::<u8, Infallible, Infallible, Infallible, u16, Infallible>(
+            to_peer,
+            from_peer_rx,
+            2,
+        );
         let client = client.clone();
         let pending = tokio::spawn({
             let client = client.clone();

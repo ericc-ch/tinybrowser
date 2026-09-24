@@ -16,9 +16,7 @@ use tokio::sync::mpsc;
 use url::{Origin, Url};
 
 use crate::actor::TabId;
-use crate::link::{
-    HandleMountOptions, HandleStartResponseOptions, RendererHandle, ResponseWriter,
-};
+use crate::link::{RendererHandle, ResponseWriter};
 use crate::network::TabNetworkHandle;
 use crate::site::Site;
 use crate::wire::{Command as RendererCommand, RendererAssignmentId, Reply};
@@ -28,16 +26,6 @@ use renderer::{FrameId, Mount, RendererEvent, TabError};
 /// protocol violation: dropping lifecycle events would corrupt tab state,
 /// while blocking the reader could strand a reply behind those events.
 const EVENT_SUBSCRIBER_CAPACITY: usize = 4096;
-
-/// Browser-owned inputs for creating one assignment.
-pub(crate) struct AssignmentOptions {
-    /// Tab that owns the document.
-    pub(crate) tab: TabId,
-    /// Site lock the hosting process was bound to.
-    pub(crate) site: Site,
-    /// Network handle for the tab's dials and cookies.
-    pub(crate) network: TabNetworkHandle,
-}
 
 /// One browser-authorized top-level document inside a renderer process.
 pub(crate) struct Assignment {
@@ -55,26 +43,6 @@ pub(crate) struct Assignment {
     /// opaque for `about:blank` and friends.
     committed_origin: Mutex<Option<Origin>>,
     subscribers: Mutex<Vec<mpsc::Sender<(FrameId, RendererEvent)>>>,
-}
-
-/// One document mount into the assignment's renderer.
-pub(crate) struct AssignmentMountOptions {
-    /// Target frame.
-    pub(crate) frame: FrameId,
-    /// HTTP status of the mounted document.
-    pub(crate) status: u16,
-    /// Completed document to mount.
-    pub(crate) mount: Mount,
-}
-
-/// One streamed response start into the assignment's renderer.
-pub(crate) struct AssignmentStartResponseOptions<'a> {
-    /// Target frame.
-    pub(crate) frame: FrameId,
-    /// HTTP status of the mounted document.
-    pub(crate) status: u16,
-    /// Response metadata; the body streams separately.
-    pub(crate) mount: &'a Mount,
 }
 
 impl Assignment {
@@ -127,38 +95,23 @@ impl Assignment {
         self.process.request_bytes(self.id, command).await
     }
 
-    pub(crate) async fn mount(&self, options: AssignmentMountOptions) -> Result<Reply, TabError> {
-        let AssignmentMountOptions {
-            frame,
-            status,
-            mount,
-        } = options;
-        self.process
-            .mount(HandleMountOptions {
-                assignment: self.id,
-                frame,
-                status,
-                mount,
-            })
-            .await
+    pub(crate) async fn mount(
+        &self,
+        frame: FrameId,
+        status: u16,
+        mount: Mount,
+    ) -> Result<Reply, TabError> {
+        self.process.mount(self.id, frame, status, mount).await
     }
 
     pub(crate) async fn start_response(
         &self,
-        options: AssignmentStartResponseOptions<'_>,
+        frame: FrameId,
+        status: u16,
+        mount: &Mount,
     ) -> Result<ResponseWriter, TabError> {
-        let AssignmentStartResponseOptions {
-            frame,
-            status,
-            mount,
-        } = options;
         self.process
-            .start_response(HandleStartResponseOptions {
-                assignment: self.id,
-                frame,
-                status,
-                mount,
-            })
+            .start_response(self.id, frame, status, mount)
             .await
     }
 
@@ -252,16 +205,18 @@ impl AssignmentRegistry {
     pub(crate) fn reserve(
         self: &Arc<Self>,
         process: Arc<RendererHandle>,
-        options: AssignmentOptions,
+        tab: TabId,
+        site: Site,
+        network: TabNetworkHandle,
     ) -> Arc<Assignment> {
         let id = RendererAssignmentId::new(self.next.fetch_add(1, Ordering::Relaxed));
         let assignment = Arc::new(Assignment {
             id,
             process,
             registry: Arc::clone(self),
-            tab: options.tab,
-            site: options.site,
-            network: options.network,
+            tab,
+            site,
+            network,
             committed_origin: Mutex::new(None),
             subscribers: Mutex::new(Vec::new()),
         });
@@ -269,7 +224,10 @@ impl AssignmentRegistry {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .insert(id, Arc::downgrade(&assignment));
-        assignment.process.assignments.fetch_add(1, Ordering::Relaxed);
+        assignment
+            .process
+            .assignments
+            .fetch_add(1, Ordering::Relaxed);
         assignment
     }
 
