@@ -19,7 +19,7 @@ WPT has many test groups (html, css, dom, and more). Each percentage is the pass
 
 The total percentage is the pass count over all WPT. Total stays unscored until a real all-WPT score exists.
 
-Slices, not full-group percentages: html5lib (`html/syntax/parsing/html5lib_*.html`, 173 as expected on 2026-09-15), `dom/events/`, and the CSS reftest slice `css/css-color/` (266/307 on 2026-09-18 with `--test-types reftest`).
+Slices, not full-group percentages: html5lib (`html/syntax/parsing/html5lib_*.html`, 173 as expected on 2026-09-15), `dom/events/`, `css/selectors/`, `fetch/api/`, and the CSS reftest slice `css/css-color/` (266/307 on 2026-09-18 with `--test-types reftest`).
 
 ```sh
 nix develop --command ./tools/wpt/run --score <directory> -- --exclude=worker
@@ -73,6 +73,7 @@ nix develop --command ./tools/wpt/run --score <directory> -- --exclude=worker
 | `cpu-performance/` | unscored |
 | `credential-management/` | unscored |
 | `css/` | unscored |
+| `css/selectors/` (slice) | 7.0% |
 | `cssom/` | unscored |
 | `custom-elements/` | 2.6% |
 | `delegated-ink/` | unscored |
@@ -103,6 +104,7 @@ nix develop --command ./tools/wpt/run --score <directory> -- --exclude=worker
 | `fedcm/` | unscored |
 | `fenced-frame/` | unscored |
 | `fetch/` | unscored |
+| `fetch/api/` (slice) | 7.4% |
 | `file-system-access/` | unscored |
 | `FileAPI/` | 47.1% |
 | `focus/` | 7.3% |

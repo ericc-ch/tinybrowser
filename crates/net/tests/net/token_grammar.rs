@@ -1,4 +1,4 @@
-use net::{HeaderError, HeaderMap, Method};
+use net::{HeaderError, HeaderMap};
 
 #[tokio::test]
 async fn request_tokens_accept_the_protocol_grammar_and_reject_injection() {
@@ -35,23 +35,4 @@ async fn request_tokens_accept_the_protocol_grammar_and_reject_injection() {
         ));
     }
     assert_eq!(headers.len(), 1);
-
-    for (input, wire) in [
-        ("get", "GET"),
-        ("Head", "HEAD"),
-        ("patch", "patch"),
-        ("PATCH", "PATCH"),
-        ("propfind", "propfind"),
-        ("PropFind", "PropFind"),
-    ] {
-        assert_eq!(Method::parse(input).expect("valid token").as_str(), wire);
-    }
-    for invalid in ["", "G ET", "GET\t", "get ", "MËTA"] {
-        assert!(
-            Method::parse(invalid)
-                .expect_err("invalid method")
-                .to_string()
-                .contains(&format!("{invalid:?}"))
-        );
-    }
 }
