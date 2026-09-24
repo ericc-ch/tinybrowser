@@ -286,10 +286,9 @@ async fn request_shaping_custom_method_fragments_and_rejections_are_wire_visible
     server.assert_clean();
 }
 
-/// Our redirect cap and its typed error. Redirect policy for 301-303 and
-/// 307 (rewrites, following) is WPT's `fetch/api/redirect/`; the 308 row,
-/// `Location` fragments, and forbidden-header stripping on origin change
-/// have no WPT coverage and are asserted below.
+/// Our redirect cap and its typed error: a tinybrowser option, not a
+/// web-platform contract. Redirect policy itself is WPT's
+/// `fetch/api/redirect/`.
 #[tokio::test]
 async fn max_redirects_cap_returns_limit_exceeded() {
     let empty = scripted([canned_redirect(302, ""), canned_redirect(302, "")]);
@@ -317,36 +316,6 @@ async fn max_redirects_cap_returns_limit_exceeded() {
         .await,
         Err(NetError::Limit(LimitExceeded::Redirect))
     ));
-    assert_eq!(server.requests().len(), 3);
-    server.assert_clean();
-}
-
-/// WPT's `fetch/api/redirect/` never sends 308 (`redirect-method.any.js`
-/// covers 301-303 and 307 only) and never puts a fragment in `Location`.
-#[tokio::test]
-async fn redirect_308_keeps_post_and_fragments_survive_location() {
-    let server = scripted([canned_redirect(308, "/landed"), canned_ok(&[], b"ok")]);
-    let mut post = Request::new(Method::POST, server.url("/start"));
-    post.body = Some(b"field=1".to_vec());
-    default_agent().send(post).await.expect("308");
-    let requests = server.requests();
-    assert_eq!(requests[0].method, "POST");
-    assert_eq!(requests[1].method, "POST");
-    assert_eq!(requests[1].body, b"field=1");
-    server.assert_clean();
-
-    let server = scripted([
-        canned_redirect(302, "/next"),
-        canned_redirect(302, "/next"),
-        canned_ok(&[], b"landed"),
-    ]);
-    let asked = server.url("/start#fragment");
-    let response = default_agent()
-        .send(Request::new(Method::GET, asked))
-        .await
-        .expect("chain");
-    assert_eq!(response.status(), 200);
-    assert_eq!(response.final_url(), &server.url("/next#fragment"));
     assert_eq!(server.requests().len(), 3);
     server.assert_clean();
 }

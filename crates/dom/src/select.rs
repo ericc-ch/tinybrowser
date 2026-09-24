@@ -1003,15 +1003,29 @@ impl Dom {
 
     /// One matching context (and its caches) for a query: matching is a
     /// read, so nothing here can invalidate the arena underneath it.
-    fn query_context<'a>(&self, caches: &'a mut SelectorCaches) -> MatchingContext<'a, Selectors> {
-        MatchingContext::new(
+    ///
+    /// `scope` is the scoping root the caller queries against; `:scope`
+    /// matches it when it is an element
+    /// (<https://drafts.csswg.org/selectors-4/#scope-pseudo>). For document
+    /// and fragment scopes the selectors engine falls back to the root
+    /// element, which is the browser behavior.
+    fn query_context<'a>(
+        &self,
+        caches: &'a mut SelectorCaches,
+        scope: Option<NodeId>,
+    ) -> MatchingContext<'a, Selectors> {
+        let mut context = MatchingContext::new(
             MatchingMode::Normal,
             None,
             caches,
             self.quirks_mode().engine(),
             NeedsSelectorFlags::No,
             MatchingForInvalidation::No,
-        )
+        );
+        context.scope_element = scope
+            .and_then(|id| DomElement::new(self, id))
+            .map(|element| element.opaque());
+        context
     }
 
     /// Shared scan behind [`Dom::select_all`] and [`Dom::select_first`]:
@@ -1023,7 +1037,7 @@ impl Dom {
         limit: Option<usize>,
     ) -> Vec<NodeId> {
         let mut caches = SelectorCaches::default();
-        let mut context = self.query_context(&mut caches);
+        let mut context = self.query_context(&mut caches, Some(scope));
         let mut hits = Vec::new();
         for candidate in Descendants::new(self, scope) {
             let Some(element) = DomElement::new(self, candidate) else {
@@ -1087,7 +1101,7 @@ impl Dom {
             });
         };
         let mut caches = SelectorCaches::default();
-        let mut context = self.query_context(&mut caches);
+        let mut context = self.query_context(&mut caches, Some(element));
         Ok(matches_selector_list(&list, &view, &mut context))
     }
 }

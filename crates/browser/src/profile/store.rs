@@ -3,7 +3,6 @@
 //! The browser context owns live state and uses this store only at open and
 //! persistence boundaries.
 
-use std::env;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -13,7 +12,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use net::{Agent, CookieRecord, CookieSameSite};
 
-use crate::profile::Profile;
+use super::Profile;
 use crate::storage::LocalStorage;
 
 const COOKIES_VERSION: &str = "tinybrowser-cookies-v1";
@@ -21,37 +20,19 @@ const LOCAL_STORAGE_VERSION: &str = "tinybrowser-localstorage-v1";
 static COOKIE_TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// Durable backing for one Profile under `XDG_DATA_HOME`.
-pub struct ProfileStore {
+pub(crate) struct ProfileStore {
     root: PathBuf,
     _lock: File,
     disk: Mutex<()>,
 }
 
 impl ProfileStore {
-    /// Data home for profile files: `XDG_DATA_HOME` or `$HOME/.local/share`.
-    ///
-    /// # Errors
-    ///
-    /// Both `XDG_DATA_HOME` and `HOME` are unset or empty.
-    pub fn data_home() -> io::Result<PathBuf> {
-        if let Some(dir) = env::var_os("XDG_DATA_HOME").filter(|value| !value.is_empty()) {
-            return Ok(PathBuf::from(dir));
-        }
-        if let Some(home) = env::var_os("HOME").filter(|value| !value.is_empty()) {
-            return Ok(PathBuf::from(home).join(".local/share"));
-        }
-        Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            "XDG_DATA_HOME and HOME are unset",
-        ))
-    }
-
     /// Opens and exclusively locks the on-disk store for `profile` under `data_home`.
     ///
     /// # Errors
     ///
     /// The directory cannot be created or another process owns the profile.
-    pub fn open_in(data_home: &Path, profile: &Profile) -> io::Result<Self> {
+    pub(crate) fn open_in(data_home: &Path, profile: &Profile) -> io::Result<Self> {
         let root = data_home
             .join("tinybrowser")
             .join("profiles")

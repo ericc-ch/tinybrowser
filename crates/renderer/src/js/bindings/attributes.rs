@@ -322,8 +322,10 @@ impl JsAttr {
     }
 
     #[qjs(set, rename = "nodeValue")]
-    fn set_node_value(&self, ctx: Ctx<'_>, value: WebIdlString) -> Result<()> {
-        self.set_value(ctx, value)
+    fn set_node_value(&self, ctx: Ctx<'_>, value: OptString) -> Result<()> {
+        // `Attr.nodeValue` follows the node rule: null acts as the empty
+        // string (<https://dom.spec.whatwg.org/#dom-node-nodevalue>).
+        self.set_value(ctx, WebIdlString(value.0.unwrap_or_default()))
     }
 
     // https://dom.spec.whatwg.org/#dom-node-textcontent

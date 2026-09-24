@@ -6,7 +6,66 @@
   const definitions = new Map();
   const constructors = new Map();
   const upgraded = new WeakSet();
+  const connected = new WeakSet();
+  // Shadow roots keyed by host. `host.shadowRoot` is null in closed mode, but
+  // lifecycle traversal still has to reach those descendants.
+  const shadowRoots = new WeakMap();
   const pending = new Map();
+
+  function shadowRootOf(host) {
+    return host.shadowRoot || shadowRoots.get(host) || null;
+  }
+
+  // Shadow-including element descendants, in tree order. A host's shadow tree
+  // is visited before its light children
+  // (<https://dom.spec.whatwg.org/#concept-shadow-including-tree-order>).
+  // Fragments and shadow roots walk their element children.
+  function visitElements(root, callback) {
+    if (!root) return;
+    if (root.nodeType === 11) {
+      for (const child of root.children || []) visitElements(child, callback);
+      return;
+    }
+    if (root.nodeType !== 1) return;
+    callback(root);
+    const shadow = shadowRootOf(root);
+    if (shadow) {
+      for (const child of shadow.children || []) visitElements(child, callback);
+    }
+    for (const child of root.children || []) visitElements(child, callback);
+  }
+
+  // Connection reactions: fire once per connection transition, whatever
+  // mutation path caused it. The WeakSet makes the synchronous mutation
+  // hooks and the MutationObserver idempotent.
+  function notifyConnected(root) {
+    visitElements(root, function(element) {
+      if (!upgraded.has(element) || connected.has(element) || !element.isConnected) return;
+      connected.add(element);
+      invoke(element, 'connectedCallback', []);
+    });
+  }
+
+  function notifyDisconnected(root) {
+    visitElements(root, function(element) {
+      if (!upgraded.has(element) || !connected.has(element) || element.isConnected) return;
+      connected.delete(element);
+      invoke(element, 'disconnectedCallback', []);
+    });
+  }
+
+  // A connected move removes and re-inserts the node, so both reactions fire
+  // even though the node stays connected
+  // (<https://dom.spec.whatwg.org/#concept-node-insert>).
+  function notifyMoved(root) {
+    visitElements(root, function(element) {
+      if (!upgraded.has(element) || !connected.has(element) || !element.isConnected) return;
+      connected.delete(element);
+      invoke(element, 'disconnectedCallback', []);
+      connected.add(element);
+      invoke(element, 'connectedCallback', []);
+    });
+  }
 
   function validName(name) {
     return typeof name === 'string' && name.includes('-') &&
@@ -48,7 +107,10 @@
           invoke(element, 'attributeChangedCallback', [name, null, element.getAttribute(name)]);
         }
       }
-      if (element.isConnected) invoke(element, 'connectedCallback', []);
+      if (element.isConnected) {
+        connected.add(element);
+        invoke(element, 'connectedCallback', []);
+      }
     } catch (error) {
       console.error(error);
     }
@@ -120,37 +182,63 @@
     return element;
   };
 
-  // DOM insertion runs custom-element reactions before returning. Fragment
-  // insertion snapshots its children because the native operation empties
-  // the fragment.
+  // Insertion runs custom-element reactions before returning. Fragment
+  // insertion snapshots its children because the native operation empties the
+  // fragment. A node that was already connected is a move: it gets the
+  // disconnect and connect reactions.
   // https://html.spec.whatwg.org/multipage/custom-elements.html#enqueue-a-custom-element-upgrade-reaction
+  function insertedChildren(node) {
+    return node.nodeType === 11 ? Array.from(node.childNodes) : [node];
+  }
+
+  function reactToInsertion(added, moved) {
+    for (const child of added) {
+      upgradeTree(child);
+      if (moved.includes(child)) notifyMoved(child);
+      notifyConnected(child);
+    }
+  }
+
   const nativeAppendChild = Node.prototype.appendChild;
   Node.prototype.appendChild = function(node) {
-    const added = node.nodeType === 11 ? Array.from(node.childNodes) : [node];
+    const added = insertedChildren(node);
+    const moved = added.filter(child => child.isConnected);
     const result = nativeAppendChild.call(this, node);
-    for (const child of added) upgradeTree(child);
+    reactToInsertion(added, moved);
     return result;
   };
   const nativeInsertBefore = Node.prototype.insertBefore;
   Node.prototype.insertBefore = function(node, child) {
-    const added = node.nodeType === 11 ? Array.from(node.childNodes) : [node];
+    const added = insertedChildren(node);
+    const moved = added.filter(entry => entry.isConnected);
     const result = nativeInsertBefore.call(this, node, child);
-    for (const addedNode of added) upgradeTree(addedNode);
+    reactToInsertion(added, moved);
+    return result;
+  };
+  const nativeRemoveChild = Node.prototype.removeChild;
+  Node.prototype.removeChild = function(node) {
+    const result = nativeRemoveChild.call(this, node);
+    notifyDisconnected(node);
+    return result;
+  };
+  const nativeReplaceChild = Node.prototype.replaceChild;
+  Node.prototype.replaceChild = function(node, child) {
+    const added = insertedChildren(node);
+    const moved = added.filter(entry => entry.isConnected);
+    const result = nativeReplaceChild.call(this, node, child);
+    notifyDisconnected(child);
+    reactToInsertion(added, moved);
     return result;
   };
 
   const observer = new MutationObserver(records => {
     for (const record of records) {
       if (record.type === 'childList') {
-        for (const node of record.addedNodes) upgradeTree(node);
-        for (const node of record.removedNodes) {
-          if (node.nodeType === 1 && upgraded.has(node)) invoke(node, 'disconnectedCallback', []);
-          if (node.querySelectorAll) {
-            for (const descendant of node.querySelectorAll('*')) {
-              if (upgraded.has(descendant)) invoke(descendant, 'disconnectedCallback', []);
-            }
-          }
+        for (const node of record.addedNodes) {
+          upgradeTree(node);
+          notifyConnected(node);
         }
+        for (const node of record.removedNodes) notifyDisconnected(node);
       } else if (record.type === 'attributes' && upgraded.has(record.target)) {
         const definition = definitions.get(record.target.localName);
         if (definition && definition.observed.includes(record.attributeName)) {
@@ -168,6 +256,7 @@
   const nativeAttachShadow = Element.prototype.attachShadow;
   Element.prototype.attachShadow = function(init) {
     const root = nativeAttachShadow.call(this, init);
+    shadowRoots.set(this, root);
     observer.observe(root, observerOptions);
     return root;
   };

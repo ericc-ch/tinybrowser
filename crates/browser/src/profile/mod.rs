@@ -1,6 +1,11 @@
-//! Named Profile identity. Persistence lives in [`crate::ProfileStore`].
+//! Named profile identity and default location.
 
+pub(crate) mod store;
+
+use std::env;
 use std::fmt;
+use std::io;
+use std::path::PathBuf;
 
 /// A named durable browser data set. The implicit name is `default`.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -108,3 +113,21 @@ impl fmt::Display for ProfileError {
 }
 
 impl std::error::Error for ProfileError {}
+
+/// Data home for profile files: `XDG_DATA_HOME` or `$HOME/.local/share`.
+///
+/// # Errors
+///
+/// Both `XDG_DATA_HOME` and `HOME` are unset or empty.
+pub fn default_data_home() -> io::Result<PathBuf> {
+    if let Some(dir) = env::var_os("XDG_DATA_HOME").filter(|value| !value.is_empty()) {
+        return Ok(PathBuf::from(dir));
+    }
+    if let Some(home) = env::var_os("HOME").filter(|value| !value.is_empty()) {
+        return Ok(PathBuf::from(home).join(".local/share"));
+    }
+    Err(io::Error::new(
+        io::ErrorKind::NotFound,
+        "XDG_DATA_HOME and HOME are unset",
+    ))
+}

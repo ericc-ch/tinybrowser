@@ -3,7 +3,6 @@
 //! One private platform channel per renderer, length-prefixed frames, async
 //! reader and writer tasks, and oneshot replies. The handle stays value-only.
 
-use std::collections::{HashMap, HashSet};
 use std::io;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -12,11 +11,12 @@ use std::time::Duration;
 use tokio::process::Child;
 
 use crate::actor::TabId;
+use crate::assignment::{Assignment, AssignmentRegistry};
 use crate::broadcast::{BroadcastMessage, ContextEvent, StorageBroadcast};
+use crate::browser::TabRegistry;
 use crate::context::PartitionServices;
 use crate::exchange::{self, Frame, RequestId, ServerInput};
 use crate::manager::RendererId;
-use crate::network::TabNetworkHandle;
 use crate::site::Site;
 use crate::storage::SessionStorage;
 use crate::wire::{
@@ -27,13 +27,26 @@ use crate::wire::{
 use renderer::{FrameId, Mount, RendererEvent, StorageChange, StorageKind, TabError};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite};
 use tokio::process::Command;
-use tokio::sync::{mpsc, oneshot, watch};
+use tokio::sync::{oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 
 /// Upper bound on one request to a renderer. The renderer budget is seconds;
-/// this is a last-resort wake-up if its reply path dies silently.
+/// this is a last-resort wake-up if its reply path dies silently. A renderer
+/// that misses it is interrupted so the tab can re-acquire a fresh process
+/// instead of paying the timeout on every later operation.
+///
+/// `TINYBROWSER_RENDERER_REQUEST_TIMEOUT_MS` overrides it so recovery tests
+/// do not wait a full minute.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// The effective renderer request deadline.
+fn request_timeout() -> Duration {
+    std::env::var_os("TINYBROWSER_RENDERER_REQUEST_TIMEOUT_MS")
+        .and_then(|value| value.to_str()?.parse::<u64>().ok())
+        .filter(|millis| *millis > 0)
+        .map_or(REQUEST_TIMEOUT, Duration::from_millis)
+}
 
 /// Upper bound for one downloaded renderer payload such as a PNG.
 const MAX_RENDERER_STREAM_BYTES: usize = 64 * 1024 * 1024;
@@ -44,19 +57,8 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long teardown waits for transport tasks to finish.
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// Bounded renderer-event handoff to its owning tab coordinator. Saturation is
-/// a renderer protocol violation: dropping lifecycle events would corrupt tab
-/// state, while blocking the reader could strand a reply behind those events.
-const EVENT_SUBSCRIBER_CAPACITY: usize = 4096;
-
 /// Bounded browser-to-renderer command queue.
 const COMMAND_CAPACITY: usize = 256;
-
-/// Live subscribers to one renderer's frame-tagged document events.
-type EventSubscribers =
-    Arc<Mutex<HashMap<RendererAssignmentId, Vec<mpsc::Sender<(FrameId, RendererEvent)>>>>>;
-
-type AssignmentContexts = Arc<Mutex<HashMap<RendererAssignmentId, AssignmentContext>>>;
 
 type RendererClient =
     exchange::Client<RendererCall, ServiceReply, HostNotice, RendererReply, RendererNotice>;
@@ -66,77 +68,27 @@ type BrowserServiceResponder = exchange::Responder<RendererCall, ServiceReply, H
 type RendererRouter = exchange::Router<BrowserCall, RendererReply, RendererNotice>;
 type ResponseUpload = exchange::Upload<RendererCall, ServiceReply, HostNotice, RendererReply>;
 
-/// Value-only handle to one renderer.
+/// Value-only transport handle to one renderer process.
 pub(crate) struct RendererHandle {
+    /// Process identity, checked against an assignment's host before serving
+    /// a renderer call: the assignment registry is shared by every process, so
+    /// a call must be bound to the process that sent it.
+    pub(crate) id: RendererId,
     client: RendererClient,
     pub(crate) alive: Arc<AtomicBool>,
-    subscribers: EventSubscribers,
-    contexts: AssignmentContexts,
     kill: watch::Sender<bool>,
     tasks: Mutex<Vec<JoinHandle<()>>>,
     pub(crate) site: Arc<Mutex<Option<Site>>>,
+    /// Live assignments counted against this process. The assignment registry
+    /// increments while the manager's state lock is held; release decrements
+    /// before the manager re-evaluates shutdown.
     pub(crate) assignments: AtomicUsize,
-    /// Assignment ids this process has released. A call for an id that was
-    /// never assigned here is a protocol violation, not a late release.
-    released: Arc<Mutex<HashSet<RendererAssignmentId>>>,
     _slot: tokio::sync::OwnedSemaphorePermit,
-}
-
-/// One browser-authorized top-level document inside a renderer process.
-pub(crate) struct RendererAssignment {
-    pub(crate) id: RendererAssignmentId,
-    pub(crate) process: Arc<RendererHandle>,
-}
-
-/// Browser-owned authority attached to one renderer assignment.
-#[derive(Clone)]
-pub(crate) struct AssignmentContext {
-    pub(crate) tab: TabId,
-    pub(crate) site: Site,
-    pub(crate) network: TabNetworkHandle,
-}
-
-impl RendererAssignment {
-    pub(crate) async fn request(&self, command: RendererCommand) -> Result<Reply, TabError> {
-        self.process.request(self.id, command).await
-    }
-
-    pub(crate) async fn mount(
-        &self,
-        frame: FrameId,
-        status: u16,
-        mount: Mount,
-    ) -> Result<Reply, TabError> {
-        self.process.mount(self.id, frame, status, mount).await
-    }
-
-    pub(crate) async fn start_response(
-        &self,
-        frame: FrameId,
-        status: u16,
-        mount: &Mount,
-    ) -> Result<ResponseWriter, TabError> {
-        self.process
-            .start_response(self.id, frame, status, mount)
-            .await
-    }
-
-    #[must_use]
-    pub(crate) fn subscribe(&self) -> mpsc::Receiver<(FrameId, RendererEvent)> {
-        self.process.subscribe(self.id)
-    }
-
-    /// Streams one request whose reply is bytes (screenshots).
-    pub(crate) async fn request_bytes(
-        &self,
-        command: RendererCommand,
-    ) -> Result<Vec<u8>, TabError> {
-        self.process.request_bytes(self.id, command).await
-    }
 }
 
 pub(crate) struct ResponseWriter {
     assignment: RendererAssignmentId,
+    process: Arc<RendererHandle>,
     upload: ResponseUpload,
 }
 
@@ -147,29 +99,43 @@ impl ResponseWriter {
                 message: "response chunk exceeds IPC limit".into(),
             });
         }
-        self.upload
-            .write(payload)
-            .await
-            .map_err(|_| TabError::ActorStopped)
+        if let Ok(result) = timeout(request_timeout(), self.upload.write(payload)).await {
+            result.map_err(|_| TabError::ActorStopped)
+        } else {
+            self.process.interrupt();
+            Err(TabError::ActorStopped)
+        }
     }
 
     pub(crate) async fn finish(self) -> Result<Reply, TabError> {
-        let assignment = self.assignment;
-        let response = self
-            .upload
-            .finish()
-            .await
-            .map_err(|_| TabError::ActorStopped)?;
+        let Self {
+            assignment,
+            process,
+            upload,
+        } = self;
+        let response = if let Ok(result) = timeout(request_timeout(), upload.finish()).await {
+            result.map_err(|_| TabError::ActorStopped)?
+        } else {
+            process.interrupt();
+            return Err(TabError::ActorStopped);
+        };
         decode_reply(assignment, response)
     }
 
     pub(crate) async fn abort(self, failure: renderer::DialFailure) -> Result<Reply, TabError> {
-        let assignment = self.assignment;
-        let response = self
-            .upload
-            .abort(format!("{failure:?}"))
-            .await
-            .map_err(|_| TabError::ActorStopped)?;
+        let Self {
+            assignment,
+            process,
+            upload,
+        } = self;
+        let response = if let Ok(result) =
+            timeout(request_timeout(), upload.abort(format!("{failure:?}"))).await
+        {
+            result.map_err(|_| TabError::ActorStopped)?
+        } else {
+            process.interrupt();
+            return Err(TabError::ActorStopped);
+        };
         decode_reply(assignment, response)
     }
 }
@@ -189,57 +155,31 @@ impl RendererHandle {
         }
     }
 
-    /// Counts an assignment that the manager selected this process for. The
-    /// manager holds its state lock across this call, so a concurrent release
-    /// cannot observe zero and shut the process down.
-    pub(crate) fn reserve_assignment(&self) {
-        self.assignments.fetch_add(1, Ordering::Relaxed);
-    }
-
-    /// Rolls back a reservation whose `Assign` message never reached the
-    /// renderer.
-    pub(crate) fn unreserve_assignment(&self) {
-        self.assignments.fetch_sub(1, Ordering::Relaxed);
-    }
-
-    pub(crate) async fn assign(
-        &self,
-        assignment: RendererAssignmentId,
-        context: AssignmentContext,
-    ) -> io::Result<()> {
-        self.contexts
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .insert(assignment, context);
-        let result = self
-            .client
+    /// Tells the renderer to create the engine for one reserved assignment.
+    pub(crate) async fn assign_notify(&self, assignment: RendererAssignmentId) -> io::Result<()> {
+        self.client
             .notify(HostNotice::Assign { assignment })
             .await
-            .map_err(|_| io::Error::other("renderer stopped"));
-        if result.is_err() {
-            self.contexts
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .remove(&assignment);
-        }
-        result
+            .map_err(|_| io::Error::other("renderer stopped"))
     }
 
-    pub(crate) async fn release(&self, assignment: RendererAssignmentId) {
-        self.subscribers
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .remove(&assignment);
-        self.contexts
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .remove(&assignment);
-        self.released
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .insert(assignment);
-        let _result = self.client.notify(HostNotice::Release { assignment }).await;
-        self.assignments.fetch_sub(1, Ordering::Relaxed);
+    /// Best-effort release notice from the assignment registry's drop path.
+    /// A dead renderer needs none, and a full lane must not disconnect the
+    /// shared transport, so the notice is delivered on its own task instead of
+    /// a `try_notify` that closes the exchange when the lane is full.
+    pub(crate) fn try_notify_release(&self, assignment: RendererAssignmentId) {
+        let notice = HostNotice::Release { assignment };
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => {
+                let client = self.client.clone();
+                runtime.spawn(async move {
+                    let _ = client.notify(notice).await;
+                });
+            }
+            Err(_) => {
+                let _ = self.client.try_notify_lossy(notice);
+            }
+        }
     }
 
     /// Sends one command and waits for its reply.
@@ -247,22 +187,28 @@ impl RendererHandle {
     /// # Errors
     ///
     /// [`TabError::ActorStopped`] when the renderer is gone or the reply does
-    /// not arrive within the request timeout.
-    async fn request(
+    /// not arrive within the request timeout. A timeout also interrupts the
+    /// renderer: a process that stopped answering must not keep its tab
+    /// hostage.
+    pub(crate) async fn request(
         &self,
         assignment: RendererAssignmentId,
         command: RendererCommand,
     ) -> Result<Reply, TabError> {
-        let response = timeout(
-            REQUEST_TIMEOUT,
+        let response = if let Ok(result) = timeout(
+            request_timeout(),
             self.client.call(RendererCall::Command {
                 assignment,
                 command,
             }),
         )
         .await
-        .map_err(|_| TabError::ActorStopped)?
-        .map_err(|_| TabError::ActorStopped)?;
+        {
+            result.map_err(|_| TabError::ActorStopped)?
+        } else {
+            self.interrupt();
+            return Err(TabError::ActorStopped);
+        };
         decode_reply(assignment, response)
     }
 
@@ -273,13 +219,13 @@ impl RendererHandle {
     ///
     /// [`TabError::ActorStopped`] when the renderer is gone, the stream is
     /// incomplete when the process dies, or the reply times out.
-    async fn request_bytes(
+    pub(crate) async fn request_bytes(
         &self,
         assignment: RendererAssignmentId,
         command: RendererCommand,
     ) -> Result<Vec<u8>, TabError> {
-        let (response, bytes) = timeout(
-            REQUEST_TIMEOUT,
+        let (response, bytes) = if let Ok(result) = timeout(
+            request_timeout(),
             self.client.call_download(
                 RendererCall::Command {
                     assignment,
@@ -289,8 +235,12 @@ impl RendererHandle {
             ),
         )
         .await
-        .map_err(|_| TabError::ActorStopped)?
-        .map_err(|_| TabError::ActorStopped)?;
+        {
+            result.map_err(|_| TabError::ActorStopped)?
+        } else {
+            self.interrupt();
+            return Err(TabError::ActorStopped);
+        };
         match decode_reply(assignment, response)? {
             Reply::Screenshot {
                 result: Ok(expected),
@@ -307,8 +257,8 @@ impl RendererHandle {
 
     /// Streams one top-level response to the renderer and waits for its mount
     /// result. The body is carried only in bounded raw IPC frames.
-    async fn mount(
-        &self,
+    pub(crate) async fn mount(
+        self: &Arc<Self>,
         assignment: RendererAssignmentId,
         frame: FrameId,
         status: u16,
@@ -326,8 +276,8 @@ impl RendererHandle {
         response.finish().await
     }
 
-    async fn start_response(
-        &self,
+    pub(crate) async fn start_response(
+        self: &Arc<Self>,
         assignment: RendererAssignmentId,
         frame: FrameId,
         status: u16,
@@ -341,27 +291,23 @@ impl RendererHandle {
             content_type: mount.content_type.clone(),
             content_language: mount.content_language.clone(),
         };
-        let upload = self
-            .client
-            .begin_upload(RendererCall::Response { response: start })
-            .await
-            .map_err(|_| TabError::ActorStopped)?;
-        Ok(ResponseWriter { assignment, upload })
-    }
-    /// Subscribes to renderer document events after this call.
-    #[must_use]
-    fn subscribe(
-        &self,
-        assignment: RendererAssignmentId,
-    ) -> mpsc::Receiver<(FrameId, RendererEvent)> {
-        let (tx, rx) = mpsc::channel(EVENT_SUBSCRIBER_CAPACITY);
-        self.subscribers
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .entry(assignment)
-            .or_default()
-            .push(tx);
-        rx
+        let upload = if let Ok(result) = timeout(
+            request_timeout(),
+            self.client
+                .begin_upload(RendererCall::Response { response: start }),
+        )
+        .await
+        {
+            result.map_err(|_| TabError::ActorStopped)?
+        } else {
+            self.interrupt();
+            return Err(TabError::ActorStopped);
+        };
+        Ok(ResponseWriter {
+            assignment,
+            process: Arc::clone(self),
+            upload,
+        })
     }
 
     /// Interrupts a blocked script by killing the renderer process.
@@ -419,11 +365,15 @@ struct ReaderContext {
 
 struct ServiceContext {
     responder: BrowserServiceResponder,
-    subscribers: EventSubscribers,
-    assignments: AssignmentContexts,
+    /// Process this service task belongs to; renderer calls may only resolve
+    /// assignments this process hosts.
+    renderer: RendererId,
+    registry: Arc<AssignmentRegistry>,
+    /// Cross-tab calls resolve through this registry, never through the
+    /// browser owner task: the wait-for graph stays acyclic.
+    tabs: TabRegistry,
     partition: PartitionServices,
     sessions: Arc<SessionStorage>,
-    released: Arc<Mutex<HashSet<RendererAssignmentId>>>,
     kill: watch::Sender<bool>,
     /// Browser command handle: renderer links create tabs for `window.open`.
     browser: crate::browser::BrowserHandle,
@@ -569,61 +519,52 @@ fn route_event(
     frame: FrameId,
     event: RendererEvent,
 ) -> Result<(), RendererViolation> {
-    let mut saturated = false;
-    let mut subscribers = context
-        .subscribers
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner);
-    let Some(assignment_subscribers) = subscribers.get_mut(&assignment) else {
-        return if was_released(&context.released, assignment) {
+    let Some(assignment) = context
+        .registry
+        .resolve(assignment)
+        .filter(|assignment| assignment.hosted_by(context.renderer))
+    else {
+        return if context.registry.was_released(assignment) {
             Ok(())
         } else {
             Err(RendererViolation)
         };
     };
-    assignment_subscribers.retain(|subscriber| match subscriber.try_send((frame, event)) {
-        Ok(()) => true,
-        Err(mpsc::error::TrySendError::Closed(_)) => false,
-        Err(mpsc::error::TrySendError::Full(_)) => {
-            saturated = true;
-            false
-        }
-    });
-    if saturated {
+    if assignment.publish_event(frame, event) {
         Err(RendererViolation)
     } else {
         Ok(())
     }
 }
 
+/// Routes one browser service call from a renderer. This is a dispatch table:
+/// each arm validates and forwards one call shape.
 async fn route_service_call(
     context: &ServiceContext,
     id: RequestId,
-    assignment: RendererAssignmentId,
+    assignment_id: RendererAssignmentId,
     call: ServiceCall,
 ) -> Result<(), RendererViolation> {
-    let assignment_context = context
-        .assignments
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .get(&assignment)
-        .cloned();
-    let Some(assignment_context) = assignment_context else {
+    let Some(assignment) = context
+        .registry
+        .resolve(assignment_id)
+        .filter(|assignment| assignment.hosted_by(context.renderer))
+    else {
         // The renderer may have queued the call before it processed
         // `Release`. Answer with a benign failure so a synchronous
         // `document.cookie` caller cannot block forever, and keep the
         // process alive for its other assignments.
-        if was_released(&context.released, assignment) {
+        if context.registry.was_released(assignment_id) {
             return send_released_reply(&context.responder, id, &call).await;
         }
         return Err(RendererViolation);
     };
     match call {
         ServiceCall::Network(NetworkCall::Dial(request)) => {
-            let Some(initiator) = assignment_context.site.authorize(&request.initiator) else {
+            let Some(initiator) = assignment.site.authorize(&request.initiator) else {
                 return Err(RendererViolation);
             };
-            let worker_network = assignment_context.network.clone();
+            let worker_network = assignment.network.clone();
             let responder = context.responder.clone();
             let worker_kill = context.kill.clone();
             let cancel = context.kill.subscribe();
@@ -641,17 +582,17 @@ async fn route_service_call(
             });
         }
         ServiceCall::Network(NetworkCall::CookieGet { url }) => {
-            let Some(url) = assignment_context.site.authorize(&url) else {
+            let Some(url) = assignment.site.authorize(&url) else {
                 return Err(RendererViolation);
             };
-            let reply = ServiceReply::Cookie(assignment_context.network.cookies_for(&url));
+            let reply = ServiceReply::Cookie(assignment.network.cookies_for(&url));
             send_reply(&context.responder, id, reply).await?;
         }
         ServiceCall::Network(NetworkCall::CookieSet { value, url }) => {
-            let Some(url) = assignment_context.site.authorize(&url) else {
+            let Some(url) = assignment.site.authorize(&url) else {
                 return Err(RendererViolation);
             };
-            assignment_context.network.set_cookie(&value, &url);
+            assignment.network.set_cookie(&value, &url);
             send_reply(&context.responder, id, ServiceReply::Unit).await?;
         }
         ServiceCall::Messaging(MessagingCall::BroadcastPost {
@@ -660,6 +601,11 @@ async fn route_service_call(
             payload,
             channel,
         }) => {
+            // `BroadcastChannel` is origin-scoped; a frame's origin is the
+            // frame's, so the browser bound is the process site lock.
+            if assignment.site.authorize(&origin).is_none() {
+                return Err(RendererViolation);
+            }
             context
                 .partition
                 .events
@@ -667,26 +613,39 @@ async fn route_service_call(
                     origin,
                     name,
                     payload,
-                    source: (assignment, channel),
+                    source: (assignment_id, channel),
                 }));
             send_reply(&context.responder, id, ServiceReply::Unit).await?;
         }
         ServiceCall::Storage(call) => {
-            return route_storage_call(context, assignment, &assignment_context, id, call).await;
+            return route_storage_call(context, assignment_id, &assignment, id, call).await;
         }
         ServiceCall::BrowsingContext(call) => {
-            return route_window_call(context, &assignment_context, id, call).await;
+            return route_window_call(context, &assignment, id, call).await;
         }
     }
     Ok(())
 }
 
+/// Whether a page may close `target`: itself or a tab it opened.
+fn close_related(context: &ServiceContext, assignment: &Assignment, target: TabId) -> bool {
+    target == assignment.tab || context.tabs.opener(target) == Some(assignment.tab)
+}
+
+/// Whether a page may address `target` with `postMessage`: itself, its
+/// opener, or a tab it opened.
+fn message_related(context: &ServiceContext, assignment: &Assignment, target: TabId) -> bool {
+    target == assignment.tab
+        || context.tabs.opener(target) == Some(assignment.tab)
+        || context.tabs.opener(assignment.tab) == Some(target)
+}
+
 /// Routes one `window.open`/`window.close`/`postMessage` service call. Step 1
-/// created the tab and its first navigation; step 2 adds the opener link and
-/// cross-tab messaging.
+/// created the tab and its first navigation; step 2 adds the opener link,
+/// cross-tab messaging, and the relatedness gates.
 async fn route_window_call(
     context: &ServiceContext,
-    assignment: &AssignmentContext,
+    assignment: &Assignment,
     id: RequestId,
     call: BrowsingContextCall,
 ) -> Result<(), RendererViolation> {
@@ -710,7 +669,11 @@ async fn route_window_call(
             let tab = match spec {
                 Some(spec) => context
                     .browser
-                    .open_window(spec, source, noopener)
+                    .open_window(crate::browser::OpenWindowOptions {
+                        url: spec,
+                        source,
+                        noopener,
+                    })
                     .await
                     .ok()
                     .map(TabId::get),
@@ -719,40 +682,39 @@ async fn route_window_call(
             send_reply(&context.responder, id, ServiceReply::Window(tab)).await?;
         }
         BrowsingContextCall::WindowClose { tab } => {
-            let _result = context.browser.close_tab(TabId::new(tab)).await;
+            let target = TabId::new(tab);
+            // A page may close itself or a tab it opened; anything else is a
+            // forged target.
+            if close_related(context, assignment, target) {
+                let _result = context.browser.close_tab(target).await;
+            }
             send_reply(&context.responder, id, ServiceReply::Unit).await?;
         }
         BrowsingContextCall::Opener => {
-            let opener = context
-                .browser
-                .opener_tab(assignment.tab)
-                .await
-                .ok()
-                .flatten()
-                .map(TabId::get);
+            let opener = context.tabs.opener(assignment.tab).map(TabId::get);
             send_reply(&context.responder, id, ServiceReply::Window(opener)).await?;
         }
         BrowsingContextCall::WindowMessage { tab, payload } => {
-            let _result = context
-                .browser
-                .window_message(TabId::new(tab), payload)
-                .await;
+            // A page can only hold a `WindowProxy` for a related window: its
+            // own, its opener, or a tab it opened. An unrelated target is a
+            // forged call and is ignored.
+            let target = TabId::new(tab);
+            if message_related(context, assignment, target) {
+                // Enqueue on the target's mailbox and return: the spec's
+                // `postMessage` is asynchronous, and waiting here would let a
+                // busy target block this renderer.
+                let _queued = context.tabs.deliver(target, payload);
+            }
             send_reply(&context.responder, id, ServiceReply::Unit).await?;
         }
         BrowsingContextCall::RemoteSessionGet { tab, origin, key } => {
-            if assignment.site.authorize(&origin).is_none() {
+            if !assignment.authorize_origin(&origin) {
                 return Err(RendererViolation);
             }
             let target = TabId::new(tab);
             let related = target == assignment.tab
-                || context.browser.opener_tab(target).await.ok().flatten() == Some(assignment.tab)
-                || context
-                    .browser
-                    .opener_tab(assignment.tab)
-                    .await
-                    .ok()
-                    .flatten()
-                    == Some(target);
+                || context.tabs.opener(target) == Some(assignment.tab)
+                || context.tabs.opener(assignment.tab) == Some(target);
             let value = related
                 .then(|| context.sessions.get(target, &origin, &key))
                 .flatten();
@@ -765,7 +727,7 @@ async fn route_window_call(
 struct StorageRouter<'a> {
     context: &'a ServiceContext,
     assignment: RendererAssignmentId,
-    authority: &'a AssignmentContext,
+    authority: &'a Assignment,
     request: RequestId,
 }
 
@@ -946,14 +908,14 @@ impl StorageRouter<'_> {
 async fn route_storage_call(
     context: &ServiceContext,
     assignment: RendererAssignmentId,
-    assignment_context: &AssignmentContext,
+    authority: &Assignment,
     id: RequestId,
     call: StorageCall,
 ) -> Result<(), RendererViolation> {
     StorageRouter {
         context,
         assignment,
-        authority: assignment_context,
+        authority,
         request: id,
     }
     .route(call)
@@ -980,16 +942,6 @@ fn broadcast_local_storage_event(
             url: url.to_owned(),
             source: (assignment, source),
         }));
-}
-
-fn was_released(
-    released: &Mutex<HashSet<RendererAssignmentId>>,
-    assignment: RendererAssignmentId,
-) -> bool {
-    released
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .contains(&assignment)
 }
 
 /// Answers a late call from a released assignment so the renderer's blocking
@@ -1147,14 +1099,33 @@ fn subscribe_renderer_events(
     }));
 }
 
+/// Browser services one renderer process hosts for its assignments.
+pub(crate) struct RendererServices {
+    /// Partition services shared with the new process.
+    pub(crate) partition: PartitionServices,
+    /// Session storage owned by the browser.
+    pub(crate) sessions: Arc<SessionStorage>,
+    /// Browser command handle for `window.open` callbacks.
+    pub(crate) browser: crate::browser::BrowserHandle,
+    /// Assignment registry shared by every renderer of this browser context.
+    pub(crate) registry: Arc<AssignmentRegistry>,
+    /// Tab registry for cross-tab calls from renderer service tasks.
+    pub(crate) tabs: TabRegistry,
+}
+
 pub(crate) async fn spawn_process(
     id: RendererId,
     site: Option<Site>,
-    partition: PartitionServices,
-    sessions: Arc<SessionStorage>,
-    browser: crate::browser::BrowserHandle,
+    services: RendererServices,
     slot: tokio::sync::OwnedSemaphorePermit,
 ) -> io::Result<RendererHandle> {
+    let RendererServices {
+        partition,
+        sessions,
+        browser,
+        registry,
+        tabs,
+    } = services;
     let mut command = Command::new(std::env::current_exe()?);
     command
         .arg("renderer")
@@ -1174,8 +1145,6 @@ pub(crate) async fn spawn_process(
     let (kill, kill_rx) = watch::channel(false);
     subscribe_renderer_events(&partition, &client, &kill);
     let alive = Arc::new(AtomicBool::new(true));
-    let subscribers = Arc::new(Mutex::new(HashMap::new()));
-    let contexts = Arc::new(Mutex::new(HashMap::new()));
     let (ready_tx, ready_rx) = oneshot::channel();
     let writer_task = tokio::spawn(writer_task(
         rx,
@@ -1186,7 +1155,6 @@ pub(crate) async fn spawn_process(
         kill_rx.clone(),
     ));
     let site = Arc::new(Mutex::new(site));
-    let released = Arc::new(Mutex::new(HashSet::new()));
     let reader_context = ReaderContext {
         router: router.clone(),
         alive: Arc::clone(&alive),
@@ -1194,11 +1162,11 @@ pub(crate) async fn spawn_process(
     };
     let service_context = ServiceContext {
         responder: server.responder(),
-        subscribers: Arc::clone(&subscribers),
-        assignments: Arc::clone(&contexts),
+        renderer: id,
+        registry,
+        tabs,
         partition,
         sessions,
-        released: Arc::clone(&released),
         kill: kill.clone(),
         browser,
     };
@@ -1224,15 +1192,13 @@ pub(crate) async fn spawn_process(
     );
     let tasks = vec![writer_task, reader_task, service_task, stderr_task];
     Ok(RendererHandle {
+        id,
         client,
         alive,
-        subscribers,
-        contexts,
         kill,
         tasks: Mutex::new(tasks),
         site,
         assignments: AtomicUsize::new(0),
-        released,
         _slot: slot,
     })
 }

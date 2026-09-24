@@ -14,7 +14,9 @@ use std::net::TcpListener;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use browser::{AgentOptions, Browser, Profile};
+use browser::{
+    AgentOptions, Browser, BrowserOpenError, BrowserOptions, Profile, default_data_home,
+};
 use cli::{Cli, Command};
 use logging::{Config, Level, Logger};
 
@@ -53,7 +55,7 @@ fn run(cli: &Cli) -> ExitCode {
             }
         },
         Some(Command::Daemon { profile }) => run_browser_process("daemon", async {
-            let home = daemon::data_home()?;
+            let home = default_data_home()?;
             daemon::run(profile, &home).await
         }),
         Some(Command::Webdriver {
@@ -107,7 +109,7 @@ fn env_level() -> Option<Level> {
 
 /// Per-profile log file, or `None` when no data home can be resolved.
 fn profile_log_file(profile: &Profile) -> Option<PathBuf> {
-    let home = daemon::data_home().ok()?;
+    let home = default_data_home().ok()?;
     Some(
         home.join("tinybrowser")
             .join("logs")
@@ -167,21 +169,27 @@ fn run_browser_process(
 }
 
 async fn serve_webdriver(port: u16, options: AgentOptions, profile: &Profile) -> io::Result<()> {
-    let data_home = daemon::data_home()?;
+    let data_home = default_data_home()?;
     // Open before binding: option content is validated here, so a bad value
     // surfaces as a usage error before the port is taken.
-    let browser = Browser::open_in_with_network(&data_home, profile, options).map_err(|error| {
-        if error.kind() == io::ErrorKind::InvalidInput {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("invalid network option (--resolve/--tls-ca): {error}"),
-            )
-        } else {
-            io::Error::other(format!("profile failed: {error}"))
+    let browser = Browser::new(BrowserOptions {
+        data_home: Some(data_home),
+        profile: profile.clone(),
+        network: options,
+    })
+    .map_err(|error| match error {
+        BrowserOpenError::InvalidNetwork(error) => io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("invalid network option (--resolve/--tls-ca): {error}"),
+        ),
+        BrowserOpenError::Profile(error) => {
+            io::Error::new(error.kind(), format!("profile failed: {error}"))
         }
+        BrowserOpenError::RuntimeUnavailable => io::Error::other("browser runtime unavailable"),
     })?;
     let listener = TcpListener::bind(("127.0.0.1", port))
         .map_err(|error| io::Error::new(error.kind(), format!("bind failed: {error}")))?;
-    let result = webdriver::serve(&listener, &browser.handle()).await;
-    result.and(browser.handle().close().await)
+    let result = webdriver::serve(&listener, browser.handle()).await;
+    let close = browser.close().await;
+    result.and(close)
 }

@@ -35,7 +35,17 @@ pub const PROTOCOL_VERSION: u8 = 9;
 pub const HEADER_BYTES: usize = 16;
 
 /// Maximum encoded size of one JSON control payload.
-pub const MAX_CONTROL_BYTES: usize = 8 * 1024 * 1024;
+///
+/// Storage is the largest legal control payload, and it is double-encoded:
+/// one origin may hold [`webstorage::STORAGE_QUOTA_BYTES`] (5 MiB) of
+/// JSON-encoded keys and values, and the wire escapes that encoded text a
+/// second time. The worst legal frames are a `setItem` request, a `getItem`
+/// reply (one encoded value), and a `storage` event carrying both the old and
+/// the new encoded value: 2 × 5 MiB × 2 plus JSON overhead. A cap below that
+/// bound turns a legal `setItem` into a transport error, and an oversize
+/// control frame stops the renderer, so this cap clears the bound until bulk
+/// payloads move to the chunk lane.
+pub const MAX_CONTROL_BYTES: usize = 24 * 1024 * 1024;
 
 /// Maximum size of one raw response-body chunk.
 pub const MAX_BODY_CHUNK_BYTES: usize = 64 * 1024;

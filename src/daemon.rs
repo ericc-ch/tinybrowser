@@ -6,7 +6,7 @@ use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
-use browser::{Browser, Profile, ProfileName, ProfileStore};
+use browser::{Browser, BrowserOptions, Profile, ProfileName};
 use serde_json::json;
 
 /// Registration recorded at `$XDG_RUNTIME_DIR/tinybrowser/<profile>/daemon.json`.
@@ -42,7 +42,12 @@ pub async fn run(profile: &Profile, data_home: &Path) -> io::Result<()> {
         profile.name().as_str(),
         addr.port()
     );
-    let browser = Browser::open_in(data_home, profile)?;
+    let browser = Browser::new(BrowserOptions {
+        data_home: Some(data_home.to_path_buf()),
+        profile: profile.clone(),
+        ..BrowserOptions::default()
+    })
+    .map_err(io::Error::from)?;
     // Real browsers start with one page target; clients (Playwright included)
     // assume at least one top-level traversable exists.
     let initial = browser
@@ -64,9 +69,9 @@ pub async fn run(profile: &Profile, data_home: &Path) -> io::Result<()> {
             port: addr.port(),
         },
     )?;
-    let result = cdp::serve(&listener, &browser.handle()).await;
+    let result = cdp::serve(&listener, browser.handle()).await;
     if result.is_err() {
-        let _close_result = browser.handle().close().await;
+        let _close_result = browser.close().await;
     }
     let _ = fs::remove_file(&lock_path);
     result
@@ -208,13 +213,4 @@ fn write_endpoint(runtime: &Path, endpoint: &DaemonEndpoint) -> io::Result<()> {
 
 fn pid_alive(pid: u32) -> bool {
     Path::new("/proc").join(pid.to_string()).exists()
-}
-
-/// Data home for profile files: `XDG_DATA_HOME` or `$HOME/.local/share`.
-///
-/// # Errors
-///
-/// Both `XDG_DATA_HOME` and `HOME` are unset or empty.
-pub fn data_home() -> io::Result<PathBuf> {
-    ProfileStore::data_home()
 }
