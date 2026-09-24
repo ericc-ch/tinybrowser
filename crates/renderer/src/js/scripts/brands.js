@@ -157,6 +157,21 @@
   };
   // Every element interface chains to HTMLElement except the media pair,
   // which chains through HTMLMediaElement, and SVG, which chains to Element.
+  // Per-interface members copied from the native wrapper prototype.
+  // `type` is defined per interface below; the form-control states live
+  // here so each interface exposes exactly the reflecting attributes the
+  // spec gives it (<https://html.spec.whatwg.org/#the-disabled-attribute>).
+  const interfaceMembers = {
+    HTMLIFrameElement: ['contentDocument', 'contentWindow'],
+    HTMLImageElement: ['naturalWidth', 'naturalHeight', 'complete', 'currentSrc'],
+    HTMLInputElement: ['value', 'disabled', 'readOnly', 'required', 'multiple'],
+    HTMLTextAreaElement: ['disabled', 'readOnly', 'required'],
+    HTMLSelectElement: ['disabled', 'required', 'multiple'],
+    HTMLButtonElement: ['disabled'],
+    HTMLFieldSetElement: ['disabled'],
+    HTMLOptGroupElement: ['disabled'],
+    HTMLOptionElement: ['disabled'],
+  };
   for (const [name, parent] of [
     ['HTMLAnchorElement', HTMLElementInterface],
     ['HTMLAreaElement', HTMLElementInterface],
@@ -223,12 +238,7 @@
     ['HTMLUListElement', HTMLElementInterface],
     ['HTMLVideoElement', HTMLMediaElementInterface],
   ]) {
-    const members = name === 'HTMLIFrameElement'
-      ? ['contentDocument', 'contentWindow']
-      : name === 'HTMLImageElement'
-        ? ['naturalWidth', 'naturalHeight', 'complete', 'currentSrc']
-      : name === 'HTMLInputElement' ? ['value'] : [];
-    table[name] = define(name, parent, members).prototype;
+    table[name] = define(name, parent, interfaceMembers[name] ?? []).prototype;
   }
   // URL decomposition IDL attributes
   // (<https://html.spec.whatwg.org/multipage/links.html#url-decomposition-idl-attributes>).

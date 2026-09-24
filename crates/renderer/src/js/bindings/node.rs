@@ -1001,6 +1001,71 @@ impl JsNode {
         Ok(())
     }
 
+    /// Reflecting boolean attribute shared by the form-control states: the
+    /// engine exposes one element wrapper, so these answer on every element,
+    /// the same shortcut `value` takes.
+    #[qjs(skip)]
+    fn reflect_boolean(&self, ctx: Ctx<'_>, name: &str, value: bool) -> Result<()> {
+        if value {
+            self.set_attribute(ctx, WebIdlString(name.into()), WebIdlString(String::new()))
+        } else {
+            self.remove_attribute(ctx, WebIdlString(name.into()))
+        }
+    }
+
+    #[qjs(skip)]
+    fn attribute_present(&self, ctx: &Ctx<'_>, name: &str) -> Result<bool> {
+        let world = world(ctx)?;
+        let world = world.borrow();
+        Ok(world
+            .document(self.handle.0)
+            .is_some_and(|parsed| parsed.dom.attribute(self.handle.0, name).is_some()))
+    }
+
+    // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#dom-fe-disabled
+    #[qjs(get, rename = "disabled")]
+    fn disabled(&self, ctx: Ctx<'_>) -> Result<bool> {
+        self.attribute_present(&ctx, "disabled")
+    }
+
+    #[qjs(set, rename = "disabled")]
+    fn set_disabled(&self, ctx: Ctx<'_>, value: bool) -> Result<()> {
+        self.reflect_boolean(ctx, "disabled", value)
+    }
+
+    // https://html.spec.whatwg.org/multipage/input.html#dom-input-readonly
+    #[qjs(get, rename = "readOnly")]
+    fn read_only(&self, ctx: Ctx<'_>) -> Result<bool> {
+        self.attribute_present(&ctx, "readonly")
+    }
+
+    #[qjs(set, rename = "readOnly")]
+    fn set_read_only(&self, ctx: Ctx<'_>, value: bool) -> Result<()> {
+        self.reflect_boolean(ctx, "readonly", value)
+    }
+
+    // https://html.spec.whatwg.org/multipage/input.html#dom-input-required
+    #[qjs(get, rename = "required")]
+    fn required(&self, ctx: Ctx<'_>) -> Result<bool> {
+        self.attribute_present(&ctx, "required")
+    }
+
+    #[qjs(set, rename = "required")]
+    fn set_required(&self, ctx: Ctx<'_>, value: bool) -> Result<()> {
+        self.reflect_boolean(ctx, "required", value)
+    }
+
+    // https://html.spec.whatwg.org/multipage/select.html#dom-select-multiple
+    #[qjs(get, rename = "multiple")]
+    fn multiple(&self, ctx: Ctx<'_>) -> Result<bool> {
+        self.attribute_present(&ctx, "multiple")
+    }
+
+    #[qjs(set, rename = "multiple")]
+    fn set_multiple(&self, ctx: Ctx<'_>, value: bool) -> Result<()> {
+        self.reflect_boolean(ctx, "multiple", value)
+    }
+
     #[qjs(get)]
     fn src(&self, ctx: Ctx<'_>) -> Result<String> {
         attribute_value(&ctx, self.handle.0, "src")

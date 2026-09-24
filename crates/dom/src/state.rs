@@ -119,16 +119,14 @@ fn lang_range_matches(range: &str, tag: &str) -> bool {
 // ── hyperlinks ──────────────────────────────────────────────────────────────
 
 /// `:link` / `:any-link`, an element that is a hyperlink: local name
-/// `a`, `area`, or `link` carrying an `href`, in **any** namespace.
-///
-/// <https://drafts.csswg.org/selectors-4/#selectordef-link> defines the
-/// match by element *type* and href, not by namespace; SVG2 gives `<a>`
-/// hyperlink status the same way
-/// (<https://svgwg.org/svg2-draft/struct.html#__svg__SVGElementElement>),
-/// which is why HTML-only matching would miss SVG `<a href>`.
+/// `a` or `area` carrying an `href`, in **any** namespace. SVG2 gives SVG
+/// `<a>` hyperlink status the same way
+/// (<https://svgwg.org/svg2-draft/linking.html#AElement>). `<link href>` is
+/// not a hyperlink for matching
+/// (<https://drafts.csswg.org/selectors-4/#the-any-link-pseudo>).
 #[must_use]
 pub fn is_hyperlink(dom: &Dom, id: NodeId) -> bool {
-    local_is(dom, id, &["a", "area", "link"]) && attr_value(dom, id, "href").is_some()
+    local_is(dom, id, &["a", "area"]) && attr_value(dom, id, "href").is_some()
 }
 
 // ── form-control UI states ──────────────────────────────────────────────────
@@ -138,13 +136,14 @@ pub fn is_hyperlink(dom: &Dom, id: NodeId) -> bool {
 /// form-associated custom elements cannot exist here). Also the population
 /// [`is_enabled`] ranges over.
 fn is_form_control(dom: &Dom, id: NodeId) -> bool {
-    local_is(
-        dom,
-        id,
-        &[
-            "button", "input", "select", "textarea", "optgroup", "option", "fieldset",
-        ],
-    )
+    is_html(dom, id)
+        && local_is(
+            dom,
+            id,
+            &[
+                "button", "input", "select", "textarea", "optgroup", "option", "fieldset",
+            ],
+        )
 }
 
 /// `:disabled` / actually-disabled per HTML §4.15
@@ -275,7 +274,7 @@ pub fn is_checked(dom: &Dom, id: NodeId) -> bool {
 /// The constraint-validation population: `input`, `select`, `textarea`
 /// (<https://html.spec.whatwg.org/#selector-required>).
 fn constraint_target(dom: &Dom, id: NodeId) -> bool {
-    local_is(dom, id, &["input", "select", "textarea"])
+    is_html(dom, id) && local_is(dom, id, &["input", "select", "textarea"])
 }
 
 /// `:required` (<https://html.spec.whatwg.org/#selector-required>).
@@ -290,26 +289,58 @@ pub fn is_optional(dom: &Dom, id: NodeId) -> bool {
     constraint_target(dom, id) && attr_value(dom, id, "required").is_none()
 }
 
-/// `:read-only` per HTML §4.16.3 as implemented by Chrome: an
-/// `input`/`textarea` is read-only when `readonly` or `disabled`; other
-/// elements are neither read-only nor read-write. (The section's other
-/// reading, Firefox makes *all* non-editable elements `:read-only`, is
-/// the documented counter-engine; `contenteditable` hosts have no
-/// representation in this tree yet.)
-#[must_use]
-pub fn is_read_only(dom: &Dom, id: NodeId) -> bool {
-    if !local_is(dom, id, &["input", "textarea"]) {
-        return false;
-    }
-    attr_value(dom, id, "readonly").is_some() || attr_value(dom, id, "disabled").is_some()
+/// Input types to which the `readonly` attribute applies
+/// (<https://html.spec.whatwg.org/multipage/input.html#attr-input-readonly>):
+/// the free-form entry types. Checkboxes, radios, ranges, colors, files,
+/// buttons, and hidden inputs have no readonly state and are never
+/// read-write.
+fn readonly_applies(dom: &Dom, id: NodeId) -> bool {
+    let ty = attr_value(dom, id, "type").unwrap_or("text");
+    [
+        "text",
+        "search",
+        "url",
+        "tel",
+        "email",
+        "password",
+        "date",
+        "month",
+        "week",
+        "time",
+        "datetime-local",
+        "number",
+    ]
+    .iter()
+    .any(|applicable| ty.eq_ignore_ascii_case(applicable))
 }
 
-/// `:read-write`, an editable control: the same `input`/`textarea`
-/// population that is not [`is_read_only`]. Non-form elements match neither
-/// state, following the Chrome reading above.
+/// `:read-write`, an editable control
+/// (<https://drafts.csswg.org/selectors-4/#read-write-pseudo>): an `input`
+/// to which `readonly` applies that is neither `readonly` nor disabled, or a
+/// `textarea` that is neither `readonly` nor disabled. Editing hosts
+/// (`contenteditable`) have no representation in this tree yet.
 #[must_use]
 pub fn is_read_write(dom: &Dom, id: NodeId) -> bool {
-    local_is(dom, id, &["input", "textarea"]) && !is_read_only(dom, id)
+    if !is_html(dom, id) {
+        return false;
+    }
+    if local_is(dom, id, &["textarea"]) {
+        return attr_value(dom, id, "readonly").is_none() && !is_disabled(dom, id);
+    }
+    if local_is(dom, id, &["input"]) {
+        return readonly_applies(dom, id)
+            && attr_value(dom, id, "readonly").is_none()
+            && !is_disabled(dom, id);
+    }
+    false
+}
+
+/// `:read-only`: every element that is not `:read-write`
+/// (<https://drafts.csswg.org/selectors-4/#read-only-pseudo>). This is the
+/// spec's complement, not a form-control population: a `div` is read-only.
+#[must_use]
+pub fn is_read_only(dom: &Dom, id: NodeId) -> bool {
+    !is_read_write(dom, id)
 }
 
 /// Input types that can present a placeholder
@@ -326,19 +357,20 @@ fn placeholder_capable_type(dom: &Dom, id: NodeId) -> bool {
 
 /// `:placeholder-shown`: a placeholder is *shown* only while the control's
 /// value is empty (<https://html.spec.whatwg.org/#attr-input-placeholder>).
-/// For an `input` that means a placeholder-capable type with an absent or
-/// empty `value`; for a `textarea` the value *is* its text content, so any
-/// non-empty text hides it.
+/// The value is the *live* value, not the content attribute: a dirty value
+/// set through the IDL hides the placeholder. For an `input` that means a
+/// placeholder-capable type whose [`Dom::input_value`] is empty; for a
+/// `textarea` the value is its text content.
 #[must_use]
 pub fn is_placeholder_shown(dom: &Dom, id: NodeId) -> bool {
-    if attr_value(dom, id, "placeholder").is_none() {
+    if !is_html(dom, id) || attr_value(dom, id, "placeholder").is_none() {
         return false;
     }
     if local_is(dom, id, &["input"]) {
         if !placeholder_capable_type(dom, id) {
             return false;
         }
-        return attr_value(dom, id, "value").is_none_or(str::is_empty);
+        return dom.input_value(id).is_none_or(|value| value.is_empty());
     }
     if local_is(dom, id, &["textarea"]) {
         let mut empty = true;
