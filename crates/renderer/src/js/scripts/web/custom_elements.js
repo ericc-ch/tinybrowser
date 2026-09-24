@@ -6,7 +6,44 @@
   const definitions = new Map();
   const constructors = new Map();
   const upgraded = new WeakSet();
+  const connected = new WeakSet();
   const pending = new Map();
+
+  // Shadow-including element descendants, in tree order. Fragments and
+  // shadow roots walk their element children.
+  function visitElements(root, callback) {
+    if (!root) return;
+    if (root.nodeType === 11) {
+      for (const child of root.children || []) visitElements(child, callback);
+      return;
+    }
+    if (root.nodeType !== 1) return;
+    callback(root);
+    for (const child of root.children || []) visitElements(child, callback);
+    const shadow = root.shadowRoot;
+    if (shadow) {
+      for (const child of shadow.children || []) visitElements(child, callback);
+    }
+  }
+
+  // Connection reactions: fire once per connection transition, whatever
+  // mutation path caused it. The WeakSet makes the synchronous mutation
+  // hooks and the MutationObserver idempotent.
+  function notifyConnected(root) {
+    visitElements(root, function(element) {
+      if (!upgraded.has(element) || connected.has(element) || !element.isConnected) return;
+      connected.add(element);
+      invoke(element, 'connectedCallback', []);
+    });
+  }
+
+  function notifyDisconnected(root) {
+    visitElements(root, function(element) {
+      if (!upgraded.has(element) || !connected.has(element) || element.isConnected) return;
+      connected.delete(element);
+      invoke(element, 'disconnectedCallback', []);
+    });
+  }
 
   function validName(name) {
     return typeof name === 'string' && name.includes('-') &&
@@ -48,7 +85,10 @@
           invoke(element, 'attributeChangedCallback', [name, null, element.getAttribute(name)]);
         }
       }
-      if (element.isConnected) invoke(element, 'connectedCallback', []);
+      if (element.isConnected) {
+        connected.add(element);
+        invoke(element, 'connectedCallback', []);
+      }
     } catch (error) {
       console.error(error);
     }
@@ -128,29 +168,45 @@
   Node.prototype.appendChild = function(node) {
     const added = node.nodeType === 11 ? Array.from(node.childNodes) : [node];
     const result = nativeAppendChild.call(this, node);
-    for (const child of added) upgradeTree(child);
+    for (const child of added) {
+      upgradeTree(child);
+      notifyConnected(child);
+    }
     return result;
   };
   const nativeInsertBefore = Node.prototype.insertBefore;
   Node.prototype.insertBefore = function(node, child) {
     const added = node.nodeType === 11 ? Array.from(node.childNodes) : [node];
     const result = nativeInsertBefore.call(this, node, child);
-    for (const addedNode of added) upgradeTree(addedNode);
+    for (const addedNode of added) {
+      upgradeTree(addedNode);
+      notifyConnected(addedNode);
+    }
+    return result;
+  };
+  const nativeRemoveChild = Node.prototype.removeChild;
+  Node.prototype.removeChild = function(node) {
+    const result = nativeRemoveChild.call(this, node);
+    notifyDisconnected(node);
+    return result;
+  };
+  const nativeReplaceChild = Node.prototype.replaceChild;
+  Node.prototype.replaceChild = function(node, child) {
+    const result = nativeReplaceChild.call(this, node, child);
+    notifyDisconnected(child);
+    upgradeTree(node);
+    notifyConnected(node);
     return result;
   };
 
   const observer = new MutationObserver(records => {
     for (const record of records) {
       if (record.type === 'childList') {
-        for (const node of record.addedNodes) upgradeTree(node);
-        for (const node of record.removedNodes) {
-          if (node.nodeType === 1 && upgraded.has(node)) invoke(node, 'disconnectedCallback', []);
-          if (node.querySelectorAll) {
-            for (const descendant of node.querySelectorAll('*')) {
-              if (upgraded.has(descendant)) invoke(descendant, 'disconnectedCallback', []);
-            }
-          }
+        for (const node of record.addedNodes) {
+          upgradeTree(node);
+          notifyConnected(node);
         }
+        for (const node of record.removedNodes) notifyDisconnected(node);
       } else if (record.type === 'attributes' && upgraded.has(record.target)) {
         const definition = definitions.get(record.target.localName);
         if (definition && definition.observed.includes(record.attributeName)) {
