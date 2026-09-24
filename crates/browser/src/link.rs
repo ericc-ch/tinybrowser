@@ -70,6 +70,10 @@ type ResponseUpload = exchange::Upload<RendererCall, ServiceReply, HostNotice, R
 
 /// Value-only transport handle to one renderer process.
 pub(crate) struct RendererHandle {
+    /// Process identity, checked against an assignment's host before serving
+    /// a renderer call: the assignment registry is shared by every process, so
+    /// a call must be bound to the process that sent it.
+    pub(crate) id: RendererId,
     client: RendererClient,
     pub(crate) alive: Arc<AtomicBool>,
     kill: watch::Sender<bool>,
@@ -160,9 +164,22 @@ impl RendererHandle {
     }
 
     /// Best-effort release notice from the assignment registry's drop path.
-    /// A dead renderer needs none.
+    /// A dead renderer needs none, and a full lane must not disconnect the
+    /// shared transport, so the notice is delivered on its own task instead of
+    /// a `try_notify` that closes the exchange when the lane is full.
     pub(crate) fn try_notify_release(&self, assignment: RendererAssignmentId) {
-        let _ = self.client.try_notify(HostNotice::Release { assignment });
+        let notice = HostNotice::Release { assignment };
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => {
+                let client = self.client.clone();
+                runtime.spawn(async move {
+                    let _ = client.notify(notice).await;
+                });
+            }
+            Err(_) => {
+                let _ = self.client.try_notify_lossy(notice);
+            }
+        }
     }
 
     /// Sends one command and waits for its reply.
@@ -348,6 +365,9 @@ struct ReaderContext {
 
 struct ServiceContext {
     responder: BrowserServiceResponder,
+    /// Process this service task belongs to; renderer calls may only resolve
+    /// assignments this process hosts.
+    renderer: RendererId,
     registry: Arc<AssignmentRegistry>,
     /// Cross-tab calls resolve through this registry, never through the
     /// browser owner task: the wait-for graph stays acyclic.
@@ -499,7 +519,11 @@ fn route_event(
     frame: FrameId,
     event: RendererEvent,
 ) -> Result<(), RendererViolation> {
-    let Some(assignment) = context.registry.resolve(assignment) else {
+    let Some(assignment) = context
+        .registry
+        .resolve(assignment)
+        .filter(|assignment| assignment.hosted_by(context.renderer))
+    else {
         return if context.registry.was_released(assignment) {
             Ok(())
         } else {
@@ -521,7 +545,11 @@ async fn route_service_call(
     assignment_id: RendererAssignmentId,
     call: ServiceCall,
 ) -> Result<(), RendererViolation> {
-    let Some(assignment) = context.registry.resolve(assignment_id) else {
+    let Some(assignment) = context
+        .registry
+        .resolve(assignment_id)
+        .filter(|assignment| assignment.hosted_by(context.renderer))
+    else {
         // The renderer may have queued the call before it processed
         // `Release`. Answer with a benign failure so a synchronous
         // `document.cookie` caller cannot block forever, and keep the
@@ -675,7 +703,7 @@ async fn route_window_call(
                 // Enqueue on the target's mailbox and return: the spec's
                 // `postMessage` is asynchronous, and waiting here would let a
                 // busy target block this renderer.
-                let _queued = context.tabs.deliver(target, payload).await;
+                let _queued = context.tabs.deliver(target, payload);
             }
             send_reply(&context.responder, id, ServiceReply::Unit).await?;
         }
@@ -1134,6 +1162,7 @@ pub(crate) async fn spawn_process(
     };
     let service_context = ServiceContext {
         responder: server.responder(),
+        renderer: id,
         registry,
         tabs,
         partition,
@@ -1163,6 +1192,7 @@ pub(crate) async fn spawn_process(
     );
     let tasks = vec![writer_task, reader_task, service_task, stderr_task];
     Ok(RendererHandle {
+        id,
         client,
         alive,
         kill,

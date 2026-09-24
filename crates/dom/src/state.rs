@@ -289,29 +289,18 @@ pub fn is_optional(dom: &Dom, id: NodeId) -> bool {
     constraint_target(dom, id) && attr_value(dom, id, "required").is_none()
 }
 
-/// Input types to which the `readonly` attribute applies
-/// (<https://html.spec.whatwg.org/multipage/input.html#attr-input-readonly>):
-/// the free-form entry types. Checkboxes, radios, ranges, colors, files,
-/// buttons, and hidden inputs have no readonly state and are never
-/// read-write.
+/// Input types to which the `readonly` attribute does **not** apply
+/// (<https://html.spec.whatwg.org/multipage/input.html#attr-input-readonly>).
+/// An invalid `type` takes the Text state, where `readonly` applies, so this
+/// is an exclusion set rather than an allowlist.
 fn readonly_applies(dom: &Dom, id: NodeId) -> bool {
     let ty = attr_value(dom, id, "type").unwrap_or("text");
-    [
-        "text",
-        "search",
-        "url",
-        "tel",
-        "email",
-        "password",
-        "date",
-        "month",
-        "week",
-        "time",
-        "datetime-local",
-        "number",
+    ![
+        "hidden", "checkbox", "radio", "file", "submit", "image", "reset", "button", "color",
+        "range",
     ]
     .iter()
-    .any(|applicable| ty.eq_ignore_ascii_case(applicable))
+    .any(|excluded| ty.eq_ignore_ascii_case(excluded))
 }
 
 /// `:read-write`, an editable control
@@ -345,14 +334,29 @@ pub fn is_read_only(dom: &Dom, id: NodeId) -> bool {
 
 /// Input types that can present a placeholder
 /// (<https://html.spec.whatwg.org/#attr-input-placeholder>: textual and
-/// numeric-entry types only; a checkbox shows nothing).
+/// numeric-entry types only; a checkbox shows nothing). An invalid `type`
+/// takes the Text state, so this excludes the types that never show one.
 fn placeholder_capable_type(dom: &Dom, id: NodeId) -> bool {
     let ty = attr_value(dom, id, "type").unwrap_or("text");
-    [
-        "text", "search", "url", "tel", "email", "password", "number",
+    ![
+        "hidden",
+        "checkbox",
+        "radio",
+        "file",
+        "submit",
+        "image",
+        "reset",
+        "button",
+        "color",
+        "range",
+        "date",
+        "month",
+        "week",
+        "time",
+        "datetime-local",
     ]
     .iter()
-    .any(|capable| ty.eq_ignore_ascii_case(capable))
+    .any(|excluded| ty.eq_ignore_ascii_case(excluded))
 }
 
 /// `:placeholder-shown`: a placeholder is *shown* only while the control's

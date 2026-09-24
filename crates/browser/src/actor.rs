@@ -25,8 +25,9 @@ use crate::site::Site;
 
 const EVENT_SUBSCRIBER_CAPACITY: usize = 256;
 const COMMAND_CAPACITY: usize = 256;
-/// Bounded `postMessage` mailbox per tab. Senders wait for capacity instead of
-/// dropping messages; the coordinator drains it in order.
+/// Bounded `postMessage` mailbox per tab. Senders enqueue without waiting; a
+/// full mailbox drops the message so a busy target cannot stall the sender's
+/// renderer service task. The coordinator drains it in order.
 const DELIVERY_CAPACITY: usize = 256;
 const MAX_WAITERS: usize = 256;
 const MAX_SUBSCRIBERS: usize = 256;
@@ -435,8 +436,8 @@ impl TabHandle {
 /// Join handle and delivery mailbox for one tab coordinator task.
 pub(crate) struct TabTask {
     pub handle: TabHandle,
-    /// Ordered `postMessage` deliveries for this tab. Senders wait for
-    /// capacity; the coordinator drains it in order, so a busy target never
+    /// Ordered `postMessage` deliveries for this tab. Senders enqueue without
+    /// waiting; the coordinator drains it in order, so a busy target never
     /// blocks the sender's renderer or the browser owner task.
     deliveries: mpsc::Sender<String>,
     join: Option<JoinHandle<()>>,

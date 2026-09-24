@@ -52,6 +52,14 @@ impl Assignment {
         self.id
     }
 
+    /// Whether `renderer` is the process hosting this assignment. Renderer
+    /// calls carry an assignment id; the shared registry must not let one
+    /// process act on another process's document.
+    #[must_use]
+    pub(crate) fn hosted_by(&self, renderer: crate::manager::RendererId) -> bool {
+        self.process.id == renderer
+    }
+
     /// Records the origin the browser mounted for this top-level document.
     pub(crate) fn set_committed_origin(&self, origin: Origin) {
         *self

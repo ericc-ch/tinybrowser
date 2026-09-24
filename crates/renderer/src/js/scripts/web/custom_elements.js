@@ -7,10 +7,19 @@
   const constructors = new Map();
   const upgraded = new WeakSet();
   const connected = new WeakSet();
+  // Shadow roots keyed by host. `host.shadowRoot` is null in closed mode, but
+  // lifecycle traversal still has to reach those descendants.
+  const shadowRoots = new WeakMap();
   const pending = new Map();
 
-  // Shadow-including element descendants, in tree order. Fragments and
-  // shadow roots walk their element children.
+  function shadowRootOf(host) {
+    return host.shadowRoot || shadowRoots.get(host) || null;
+  }
+
+  // Shadow-including element descendants, in tree order. A host's shadow tree
+  // is visited before its light children
+  // (<https://dom.spec.whatwg.org/#concept-shadow-including-tree-order>).
+  // Fragments and shadow roots walk their element children.
   function visitElements(root, callback) {
     if (!root) return;
     if (root.nodeType === 11) {
@@ -19,11 +28,11 @@
     }
     if (root.nodeType !== 1) return;
     callback(root);
-    for (const child of root.children || []) visitElements(child, callback);
-    const shadow = root.shadowRoot;
+    const shadow = shadowRootOf(root);
     if (shadow) {
       for (const child of shadow.children || []) visitElements(child, callback);
     }
+    for (const child of root.children || []) visitElements(child, callback);
   }
 
   // Connection reactions: fire once per connection transition, whatever
@@ -42,6 +51,19 @@
       if (!upgraded.has(element) || !connected.has(element) || element.isConnected) return;
       connected.delete(element);
       invoke(element, 'disconnectedCallback', []);
+    });
+  }
+
+  // A connected move removes and re-inserts the node, so both reactions fire
+  // even though the node stays connected
+  // (<https://dom.spec.whatwg.org/#concept-node-insert>).
+  function notifyMoved(root) {
+    visitElements(root, function(element) {
+      if (!upgraded.has(element) || !connected.has(element) || !element.isConnected) return;
+      connected.delete(element);
+      invoke(element, 'disconnectedCallback', []);
+      connected.add(element);
+      invoke(element, 'connectedCallback', []);
     });
   }
 
@@ -160,28 +182,37 @@
     return element;
   };
 
-  // DOM insertion runs custom-element reactions before returning. Fragment
-  // insertion snapshots its children because the native operation empties
-  // the fragment.
+  // Insertion runs custom-element reactions before returning. Fragment
+  // insertion snapshots its children because the native operation empties the
+  // fragment. A node that was already connected is a move: it gets the
+  // disconnect and connect reactions.
   // https://html.spec.whatwg.org/multipage/custom-elements.html#enqueue-a-custom-element-upgrade-reaction
-  const nativeAppendChild = Node.prototype.appendChild;
-  Node.prototype.appendChild = function(node) {
-    const added = node.nodeType === 11 ? Array.from(node.childNodes) : [node];
-    const result = nativeAppendChild.call(this, node);
+  function insertedChildren(node) {
+    return node.nodeType === 11 ? Array.from(node.childNodes) : [node];
+  }
+
+  function reactToInsertion(added, moved) {
     for (const child of added) {
       upgradeTree(child);
+      if (moved.includes(child)) notifyMoved(child);
       notifyConnected(child);
     }
+  }
+
+  const nativeAppendChild = Node.prototype.appendChild;
+  Node.prototype.appendChild = function(node) {
+    const added = insertedChildren(node);
+    const moved = added.filter(child => child.isConnected);
+    const result = nativeAppendChild.call(this, node);
+    reactToInsertion(added, moved);
     return result;
   };
   const nativeInsertBefore = Node.prototype.insertBefore;
   Node.prototype.insertBefore = function(node, child) {
-    const added = node.nodeType === 11 ? Array.from(node.childNodes) : [node];
+    const added = insertedChildren(node);
+    const moved = added.filter(entry => entry.isConnected);
     const result = nativeInsertBefore.call(this, node, child);
-    for (const addedNode of added) {
-      upgradeTree(addedNode);
-      notifyConnected(addedNode);
-    }
+    reactToInsertion(added, moved);
     return result;
   };
   const nativeRemoveChild = Node.prototype.removeChild;
@@ -192,10 +223,11 @@
   };
   const nativeReplaceChild = Node.prototype.replaceChild;
   Node.prototype.replaceChild = function(node, child) {
+    const added = insertedChildren(node);
+    const moved = added.filter(entry => entry.isConnected);
     const result = nativeReplaceChild.call(this, node, child);
     notifyDisconnected(child);
-    upgradeTree(node);
-    notifyConnected(node);
+    reactToInsertion(added, moved);
     return result;
   };
 
@@ -224,6 +256,7 @@
   const nativeAttachShadow = Element.prototype.attachShadow;
   Element.prototype.attachShadow = function(init) {
     const root = nativeAttachShadow.call(this, init);
+    shadowRoots.set(this, root);
     observer.observe(root, observerOptions);
     return root;
   };
