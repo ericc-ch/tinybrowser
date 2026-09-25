@@ -151,6 +151,8 @@ interface engine {
     /// are not produced here. A child frame reaching load arrives as `load`
     /// with that child's frame.
     variant event {
+        /// A frame committed a navigation to this URL.
+        navigated(string),
         /// A frame reached `readyState = "complete"` and dispatched `load`.
         load,
         /// A host timer whose delay elapsed.

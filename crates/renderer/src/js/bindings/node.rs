@@ -1576,6 +1576,24 @@ impl JsNode {
         self.reflect_boolean(ctx, "selected", value)
     }
 
+    // https://html.spec.whatwg.org/multipage/form-elements.html#dom-option-label
+    #[qjs(get)]
+    fn label(&self, ctx: Ctx<'_>) -> Result<String> {
+        if self.attribute_present(&ctx, "label")? {
+            return attribute_value(&ctx, self.handle.0, "label");
+        }
+        let world = world(&ctx)?;
+        let world = world.borrow();
+        Ok(world
+            .document(self.handle.0)
+            .map_or_else(String::new, |parsed| parsed.dom.text_content(self.handle.0)))
+    }
+
+    #[qjs(set, rename = "label")]
+    fn set_label(&self, ctx: Ctx<'_>, value: WebIdlString) -> Result<()> {
+        self.set_attribute(ctx, WebIdlString("label".into()), value)
+    }
+
     // https://html.spec.whatwg.org/multipage/form-elements.html#dom-option-text
     #[qjs(get)]
     fn text(&self, ctx: Ctx<'_>) -> Result<String> {

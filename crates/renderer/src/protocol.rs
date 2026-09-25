@@ -141,10 +141,17 @@ impl fmt::Display for ScriptFailure {
 impl std::error::Error for ScriptFailure {}
 
 /// Observable HTML-job outcomes, in the order the renderer ran them.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RendererEvent {
     /// The document reached `readyState = "complete"` and dispatched `load`.
     Load,
+    /// A frame committed a navigation to this URL. The actor re-announces the
+    /// top-level document so a `CDP` client re-creates its execution contexts
+    /// (<https://chromedevtools.github.io/devtools-protocol/tot/Page/#event-frameNavigated>).
+    Navigated {
+        /// The final URL after redirects.
+        url: String,
+    },
     /// A host timer whose delay elapsed.
     Timer(u32),
     /// A `fetch` or navigation job finished with this HTTP status.

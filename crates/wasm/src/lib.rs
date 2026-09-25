@@ -174,6 +174,7 @@ impl Tab {
 /// The renderer's event vocabulary, restricted to what this component emits.
 fn to_event(event: RendererEvent) -> Event {
     match event {
+        RendererEvent::Navigated { url } => Event::Navigated(url),
         RendererEvent::Load => Event::Load,
         RendererEvent::Timer(id) => Event::Timer(id),
         RendererEvent::Fetch { status } => Event::Fetch(status),

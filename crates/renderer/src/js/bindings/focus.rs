@@ -438,11 +438,29 @@ pub(crate) fn install_webdriver_bridge(ctx: &Ctx<'_>, globals: &Object<'_>) -> R
         "__tb_webdriver_element",
         rquickjs::prelude::Func::from(webdriver_element),
     )?;
+    globals.set(
+        "__tbActivate",
+        rquickjs::prelude::Func::from(activate_element),
+    )?;
     ctx.eval::<(), _>(
-        "['__tb_webdriver_click','__tb_webdriver_element']\
+        "['__tb_webdriver_click','__tb_webdriver_element','__tbActivate']\
          .forEach(function(k){Object.defineProperty(globalThis,k,{writable:false,configurable:false,enumerable:false});});",
     )?;
     Ok(())
+}
+
+/// Runs the activation behavior for an element the input paths clicked, so a
+/// real click toggles a checkbox or submits a form
+/// (<https://html.spec.whatwg.org/multipage/interaction.html#activation-behavior>).
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "rquickjs Func ABI passes arguments by value"
+)]
+fn activate_element<'js>(ctx: Ctx<'js>, element: Value<'js>) -> Result<()> {
+    let Some(node) = host_node_id(&ctx, &element) else {
+        return Ok(());
+    };
+    run_activation(&ctx, node)
 }
 
 /// The `WebDriver` "element click" step: a trusted click at the element, with

@@ -827,10 +827,24 @@ impl Tab {
         true
     }
 
-    async fn handle_renderer_event(&mut self, frame: FrameId, event: RendererEvent) {
-        if frame == FrameId::MAIN && event == RendererEvent::Load {
-            self.document_loaded = true;
-            self.record_event(TabEvent::Load).await;
+    async fn handle_renderer_event(&mut self, frame: FrameId, event: &RendererEvent) {
+        if frame != FrameId::MAIN {
+            return;
+        }
+        match event {
+            RendererEvent::Navigated { url } => {
+                if let Ok(url) = Url::parse(url) {
+                    self.document_url = url;
+                }
+                self.document_loaded = false;
+                self.navigation_failed = false;
+                self.record_event(TabEvent::Navigated).await;
+            }
+            RendererEvent::Load => {
+                self.document_loaded = true;
+                self.record_event(TabEvent::Load).await;
+            }
+            _ => {}
         }
     }
 
@@ -920,7 +934,7 @@ async fn coordinator_loop(
                 tab.handle_navigation(epoch, result).await;
             }
             Wake::Navigation(None) | Wake::WaiterDeadline => {}
-            Wake::Renderer(Some((frame, event))) => tab.handle_renderer_event(frame, event).await,
+            Wake::Renderer(Some((frame, event))) => tab.handle_renderer_event(frame, &event).await,
             Wake::Renderer(None) => {
                 tab.drop_renderer();
                 fail_waiters(&server, &mut waiters, &TabError::ActorStopped).await;

@@ -38,3 +38,28 @@ test("typing into form controls", async ({ daemon }) => {
 
   await browser.close();
 });
+
+// Form fill and submit through Playwright's actionability and the engine's
+// submission path: a GET form navigates to the query string, a POST form sends
+// the urlencoded body.
+test("filling and submitting a form", async ({ daemon }) => {
+  const browser = await chromium.connectOverCDP(daemon.origin);
+  const context = browser.contexts()[0];
+  const page = context.pages()[0];
+
+  await page.goto(daemon.formUrl);
+  await page.fill("#g-name", "Ada");
+  await page.selectOption("#g-color", "blue");
+  await page.check("#g-agree");
+  await page.click("#g-submit");
+  await page.waitForURL(/\/echo\?/);
+  await expect(page.locator("#result")).toHaveText("GET name=Ada&color=blue&agree=yes");
+
+  await page.goto(daemon.formUrl);
+  await page.fill("#p-name", "Grace");
+  await page.click("#p-submit");
+  await page.waitForURL(/\/echo$/);
+  await expect(page.locator("#result")).toHaveText("POST name=Grace");
+
+  await browser.close();
+});

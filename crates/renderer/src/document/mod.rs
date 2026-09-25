@@ -1253,6 +1253,12 @@ impl Document {
                 let Ok(url) = Url::parse(&outcome.final_url) else {
                     return;
                 };
+                // Announce the commit before the new document's load, so the
+                // browser can re-create the top-level execution contexts
+                // (<https://chromedevtools.github.io/devtools-protocol/tot/Page/#event-frameNavigated>).
+                self.record_event(RendererEvent::Navigated {
+                    url: url.to_string(),
+                });
                 self.load_frame_response(
                     &url,
                     outcome.content_type.as_deref(),

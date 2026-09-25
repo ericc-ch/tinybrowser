@@ -79,7 +79,11 @@
       const node = at(state.x, state.y);
       fire(node, new PointerEvent('pointerup', pointerInit(state, state.x, state.y, state.buttons, { button: button })));
       fire(node, new MouseEvent('mouseup', mouseInit(state.x, state.y, state.buttons, { button: button })));
-      if (button === 0) fire(node, new MouseEvent('click', mouseInit(state.x, state.y, 0, { button: 0 })));
+      if (button === 0 && fire(node, new MouseEvent('click', mouseInit(state.x, state.y, 0, { button: 0 })))) {
+        // A non-canceled click runs the activation behavior
+        // (<https://html.spec.whatwg.org/multipage/interaction.html#activation-behavior>).
+        if (typeof globalThis.__tbActivate === 'function') globalThis.__tbActivate(node);
+      }
     } else if (item.type === 'pointerCancel') {
       fire(at(state.x, state.y), new PointerEvent('pointercancel', pointerInit(state, state.x, state.y, state.buttons)));
       state.buttons = 0;

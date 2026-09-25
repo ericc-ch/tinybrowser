@@ -474,6 +474,20 @@ fn requested_node(params: &Value) -> u64 {
     params.get("nodeId").and_then(Value::as_u64).unwrap_or(1)
 }
 
+/// A page-side expression resolving the node a DOM method targets, from any of
+/// `objectId` (a remote handle), `backendNodeId`, or `nodeId`.
+fn requested_node_expression(params: &Value) -> String {
+    if let Some(id) = params.get("objectId").and_then(Value::as_str) {
+        return format!("(globalThis.__tb_handles || {{}})[{}]", json_string(id));
+    }
+    let id = params
+        .get("backendNodeId")
+        .and_then(Value::as_u64)
+        .or_else(|| params.get("nodeId").and_then(Value::as_u64))
+        .unwrap_or(1);
+    format!("(globalThis.__tb_dom_nodes || [])[{id}]")
+}
+
 /// `DOM.querySelector`/`DOM.querySelectorAll`: register the matches in the
 /// page's node table and answer with their ids.
 pub(crate) async fn dom_query_selector(
@@ -645,7 +659,7 @@ pub(crate) async fn css_stylesheets(tab: &TabHandle) -> Result<Vec<Value>, Dispa
 /// quads (the engine has no separate boxes, so all four are the border box).
 pub(crate) async fn dom_box_model(tab: &TabHandle, params: &Value) -> Result<Value, DispatchError> {
     const TEMPLATE: &str = r"(function(){
-      const n = globalThis.__tb_dom_nodes[__NODE__];
+      const n = (__NODE__);
       if (!n || !n.getBoundingClientRect) return JSON.stringify({model: null});
       const r = n.getBoundingClientRect();
       const quad = [r.left, r.top, r.right, r.top, r.right, r.bottom, r.left, r.bottom];
@@ -654,7 +668,7 @@ pub(crate) async fn dom_box_model(tab: &TabHandle, params: &Value) -> Result<Val
         width: Math.round(r.width), height: Math.round(r.height),
       }});
     })()";
-    let script = TEMPLATE.replace("__NODE__", &requested_node(params).to_string());
+    let script = TEMPLATE.replace("__NODE__", &requested_node_expression(params));
     dom_eval(tab, &script).await
 }
 
@@ -664,7 +678,7 @@ pub(crate) async fn dom_content_quads(
     params: &Value,
 ) -> Result<Value, DispatchError> {
     const TEMPLATE: &str = r"(function(){
-      const n = globalThis.__tb_dom_nodes[__NODE__];
+      const n = (__NODE__);
       if (!n || !n.getClientRects) return JSON.stringify({quads: []});
       const quads = [];
       for (const r of n.getClientRects()) {
@@ -672,7 +686,7 @@ pub(crate) async fn dom_content_quads(
       }
       return JSON.stringify({quads: quads});
     })()";
-    let script = TEMPLATE.replace("__NODE__", &requested_node(params).to_string());
+    let script = TEMPLATE.replace("__NODE__", &requested_node_expression(params));
     dom_eval(tab, &script).await
 }
 
