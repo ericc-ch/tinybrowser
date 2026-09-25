@@ -890,6 +890,10 @@ pub(crate) const RUNTIME_HANDLE: &str = r#"(() => {
   }
   if (t === "string" || t === "boolean") return JSON.stringify({ type: t, value: v });
   globalThis.__tb_handles[__ID__] = v;
+  // A DOM node is an `ElementHandle` only when the remote object says
+  // `subtype: "node"` (CDP `Runtime.RemoteObject`).
+  if (t === "object" && typeof v.nodeType === "number" && typeof v.nodeName === "string")
+    return JSON.stringify({ type: "object", subtype: "node", className: (v.constructor && v.constructor.name) || "", objectId: __ID__ });
   return JSON.stringify({ type: t === "function" ? "function" : "object", objectId: __ID__ });
 })()"#;
 
@@ -925,6 +929,10 @@ pub(crate) const RUNTIME_HANDLE_READ: &str = r#"(() => {
   }
   if (t === "string" || t === "boolean") return JSON.stringify({ type: t, value: v });
   globalThis.__tb_handles[__ID__] = v;
+  // A DOM node is an `ElementHandle` only when the remote object says
+  // `subtype: "node"` (CDP `Runtime.RemoteObject`).
+  if (t === "object" && typeof v.nodeType === "number" && typeof v.nodeName === "string")
+    return JSON.stringify({ type: "object", subtype: "node", className: (v.constructor && v.constructor.name) || "", objectId: __ID__ });
   return JSON.stringify({ type: t === "function" ? "function" : "object", objectId: __ID__ });
 })()"#;
 

@@ -21,12 +21,11 @@ test("clicks use real layout geometry", async ({ daemon }) => {
   await browser.close();
 });
 
-// Blocked on Playwright actionability, not on form semantics: the textarea now
-// has an intrinsic box and exposes `value`/selection/editing, but
-// `locator.focus()` still times out while waiting for the element to become
-// actionable over CDP. Follow up on the CDP element-state surface before
-// promoting this to a plain `test`.
-test.fixme("typing into form controls", async ({ daemon }) => {
+// Typing through the CDP actionability path: `locator.focus()` waits for the
+// element to be visible, enabled, editable and stable, which needs a resolved
+// `visibility` from `getComputedStyle` and node handles that CDP reports as
+// `subtype: "node"` so Playwright builds an `ElementHandle`.
+test("typing into form controls", async ({ daemon }) => {
   const browser = await chromium.connectOverCDP(daemon.origin);
   const context = browser.contexts()[0];
   const page = context.pages()[0];
