@@ -955,10 +955,7 @@ fn javascript_mime(typ: Option<&str>) -> bool {
 
 fn element_text(tree: &dom::Dom, id: dom::NodeId) -> String {
     let mut text = String::new();
-    let mut stack: Vec<_> = tree
-        .children(id)
-        .map(Iterator::collect)
-        .unwrap_or_default();
+    let mut stack: Vec<_> = tree.children(id).map(Iterator::collect).unwrap_or_default();
     stack.reverse();
     while let Some(child) = stack.pop() {
         match tree.kind(child) {

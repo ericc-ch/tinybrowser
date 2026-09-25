@@ -889,12 +889,12 @@ impl Element for DomElement<'_> {
 
     /// `:empty` ignores comments and doctypes; empty text counts as nothing.
     fn is_empty(&self) -> bool {
-        let Some(kids) = self.dom.children(self.id) else {
+        let Some(mut kids) = self.dom.children(self.id) else {
             unreachable!(
                 "selector matching walks live nodes; children() is None only for stale handles"
             );
         };
-        kids.into_iter().all(|kid| match self.dom.kind(kid) {
+        kids.all(|kid| match self.dom.kind(kid) {
             Some(NodeKind::Text { data }) => data.is_empty(),
             Some(NodeKind::Element { .. }) => false,
             _ => true,

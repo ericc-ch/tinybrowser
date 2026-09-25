@@ -129,9 +129,18 @@ pub enum NodeKind {
 /// (<https://drafts.csswg.org/selectors-4/#the-nth-child-pseudo>: the index of
 /// each child is a walk over its preceding siblings).
 ///
-/// `parent` is deliberately redundant with the child links, exactly as it was
-/// redundant with the old child list: upward walks are common enough to pay
-/// for the pointer, and it is the fast `is_connected`/`would_cycle` step.
+/// `parent` duplicates what the sibling links already reach by walking upward.
+/// Upward walks are common enough to pay for the pointer, and it is the fast
+/// `is_connected`/`would_cycle` step.
+///
+/// The five links cost memory: `Node` measures 152 bytes here against 112 with
+/// the former per-parent `Vec<NodeId>` child list (`size_of::<Node>()`), a
+/// deliberate +40 bytes per node for the O(1) sibling access that keeps
+/// `:nth-*` selector matching linear. Links are arena-internal and never
+/// outlive their node, so the fields could later shrink to slot-only
+/// `Option<NonZeroU32>` and rebuild the `NodeId` generation from the slot if
+/// the trade ever stops paying.
+///
 /// Everything here is arena-internal; outside code sees only [`crate::NodeId`]
 /// handles and the read/mutation API on [`crate::Dom`].
 #[derive(Debug)]

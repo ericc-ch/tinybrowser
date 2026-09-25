@@ -3,6 +3,7 @@
 use std::cell::Cell;
 use std::collections::HashMap;
 use std::fmt;
+use std::iter::FusedIterator;
 use std::marker::PhantomData;
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -250,6 +251,10 @@ impl DoubleEndedIterator for Children<'_> {
         Some(current)
     }
 }
+
+// Once both cursors retire the iterator stays exhausted, never resurrecting a
+// node through a later `next`/`next_back`.
+impl FusedIterator for Children<'_> {}
 
 impl Dom {
     /// An empty document containing just the root `Document` node.
@@ -607,9 +612,7 @@ impl Dom {
                 return assigned;
             }
         }
-        self.children(id)
-            .map(Iterator::collect)
-            .unwrap_or_default()
+        self.children(id).map(Iterator::collect).unwrap_or_default()
     }
 
     /// Parent in the flattened tree used for style and box construction.
@@ -789,10 +792,7 @@ impl Dom {
                 }
             }
             if subtree {
-                let kids: Vec<NodeId> = self
-                    .children(source)
-                    .ok_or(DomError::StaleNode)?
-                    .collect();
+                let kids: Vec<NodeId> = self.children(source).ok_or(DomError::StaleNode)?.collect();
                 for kid in kids {
                     let child = self.alloc(self.kind(kid).ok_or(DomError::StaleNode)?.clone());
                     self.append(target, child)?;
@@ -1066,9 +1066,6 @@ impl Dom {
         if child != node && self.parent(child) == Some(parent) {
             let child_snapshot = self.connection_snapshot(child);
             self.unlink_from_current_parent(child);
-            if let Some(detached) = self.node_mut(child) {
-                detached.parent = None;
-            }
             self.record_snapshot(child_snapshot);
             removed.push(child);
         }
@@ -1258,9 +1255,6 @@ impl Dom {
         }
         let tracked = self.connection_snapshot(id);
         self.unlink_from_current_parent(id);
-        if let Some(node) = self.node_mut(id) {
-            node.parent = None;
-        }
         self.record_snapshot(tracked);
         Ok(())
     }
@@ -1284,7 +1278,7 @@ impl Dom {
     /// # Panics
     ///
     /// Only on an internal invariant defect (a verified-live node missing its
-    /// child list), never on user input.
+    /// slot), never on user input.
     ///
     /// # Errors
     ///
@@ -1325,18 +1319,18 @@ impl Dom {
             }
             self.ensure_document_content_model(&sequence)?;
         }
-        let (Some(first), Some(last)) = (self.first_child(from), self.last_child(from)) else {
+        let moved: Vec<NodeId> = self
+            .children(from)
+            .expect("verified-live `from` has a node")
+            .collect();
+        if moved.is_empty() {
             return Ok(());
-        };
+        }
         // Defect guards, not input errors: both handles were verified live
-        // above, so a miss here means the parent-pointer/child-link duality
+        // above, so a miss here means the parent-pointer/sibling-link duality
         // is broken. Panicking beats reporting a lying "stale node".
         let from_connected = self.is_connected(from);
         let to_connected = self.is_connected(to);
-        let moved: Vec<NodeId> = self
-            .children(from)
-            .expect("verified-live `from` has a child list")
-            .collect();
         let tracked: Vec<(NodeId, bool)> = if from_connected == to_connected {
             Vec::new()
         } else {
@@ -1345,15 +1339,15 @@ impl Dom {
                 .flat_map(|&id| self.connection_snapshot(id))
                 .collect()
         };
-        // Detach the whole linked run from `from` and append it to `to`.
-        {
-            let source = self
-                .node_mut(from)
-                .expect("verified-live `from` has a node");
-            source.first_child = None;
-            source.last_child = None;
+        // Move the run one node at a time through the single-node primitives:
+        // each `unlink`/`insert_linked` step is O(1), so the move stays O(k)
+        // and the link invariant has exactly two writers.
+        for &id in &moved {
+            self.unlink(id);
         }
-        self.insert_run(to, None, first, last, &moved);
+        for &id in &moved {
+            self.insert_linked(to, id, None);
+        }
         self.record_snapshot(tracked);
         Ok(())
     }
@@ -1633,23 +1627,12 @@ impl Dom {
         };
         let added = self.incoming_nodes(node);
         self.recording_suppressed = true;
-        // Bulk-detach the whole standing child list before placing the
-        // replacement. Unlinking each child through the generic path would
-        // repeat k-constant list surgery k times; clearing the parent's
-        // endpoints and each child's links once is O(k).
-        {
-            let parent_node = self
-                .node_mut(parent)
-                .expect("verified-live parent has a node");
-            parent_node.first_child = None;
-            parent_node.last_child = None;
-        }
+        // Detach the standing children through the single-node primitive; its
+        // O(1) steps make the loop O(k), and it keeps `unlink` the only
+        // remover of a node. Recording is suppressed, so no observer sees
+        // these individual removals.
         for &kid in &removed {
-            if let Some(detached) = self.node_mut(kid) {
-                detached.parent = None;
-                detached.previous_sibling = None;
-                detached.next_sibling = None;
-            }
+            self.unlink_from_current_parent(kid);
         }
         if self.is_fragment(node) {
             self.splice_fragment(parent, node, None);
@@ -2126,62 +2109,6 @@ impl Dom {
         }
     }
 
-    /// Links the already-connected run `[first, last]` under `parent`
-    /// immediately before `before` (or at the end when `before` is `None`).
-    ///
-    /// The run's internal links are assumed intact and in order; `ids` names
-    /// every node in it so their `parent` pointers can be rewritten. This is
-    /// the O(1) link surgery behind fragment splicing and the bulk child
-    /// moves.
-    fn insert_run(
-        &mut self,
-        parent: NodeId,
-        before: Option<NodeId>,
-        first: NodeId,
-        last: NodeId,
-        ids: &[NodeId],
-    ) {
-        let previous = match before {
-            Some(before) => self.previous_sibling(before),
-            None => self.last_child(parent),
-        };
-        self.node_mut(first)
-            .expect("run head has no slot")
-            .previous_sibling = previous;
-        self.node_mut(last)
-            .expect("run tail has no slot")
-            .next_sibling = before;
-        match previous {
-            Some(previous) => {
-                self.node_mut(previous)
-                    .expect("linked previous sibling has no slot")
-                    .next_sibling = Some(first);
-            }
-            None => {
-                self.node_mut(parent)
-                    .expect("verified-live parent has no slot")
-                    .first_child = Some(first);
-            }
-        }
-        match before {
-            Some(before) => {
-                self.node_mut(before)
-                    .expect("linked reference child has no slot")
-                    .previous_sibling = Some(last);
-            }
-            None => {
-                self.node_mut(parent)
-                    .expect("verified-live parent has no slot")
-                    .last_child = Some(last);
-            }
-        }
-        for &id in ids {
-            self.node_mut(id)
-                .expect("moved run node has no slot")
-                .parent = Some(parent);
-        }
-    }
-
     /// Insert a fragment by moving its children under `parent`, leaving the
     /// fragment empty and unparented
     /// (<https://dom.spec.whatwg.org/#concept-node-insert>).
@@ -2205,16 +2132,8 @@ impl Dom {
             previous: None,
             next: None,
         });
-        let first = moved[0];
-        let last = *moved.last().expect("non-empty run has a tail");
-        // Detach the run from the fragment; the run keeps its internal links.
-        {
-            let emptied = self
-                .node_mut(fragment)
-                .expect("verified-live fragment has no slot");
-            emptied.first_child = None;
-            emptied.last_child = None;
-        }
+        // Sibling references for the mutation record, read before the run
+        // leaves the fragment.
         let (previous, next) = if self.record_mutations && !self.recording_suppressed {
             let previous = match before {
                 Some(before) => self.previous_sibling(before),
@@ -2224,7 +2143,15 @@ impl Dom {
         } else {
             (None, None)
         };
-        self.insert_run(parent, before, first, last, &moved);
+        // Move the run one node at a time. Inserting each immediately before
+        // the same reference preserves order, and O(1) steps keep the splice
+        // O(k) with `insert_linked` as the only insert writer.
+        for &id in &moved {
+            self.unlink(id);
+        }
+        for &id in &moved {
+            self.insert_linked(parent, id, before);
+        }
         self.record_snapshot(tracked);
         self.record(Mutation::ChildList {
             target: parent,

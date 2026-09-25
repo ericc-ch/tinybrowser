@@ -1752,10 +1752,10 @@ impl JsNode {
             let Some(parsed) = parsed.document(self.handle.0) else {
                 return Ok(Value::new_null(ctx));
             };
-            parsed.dom.children(self.handle.0).and_then(|kids| {
-                kids.rev()
-                    .find(|&kid| is_element(&parsed.dom, kid))
-            })
+            parsed
+                .dom
+                .children(self.handle.0)
+                .and_then(|kids| kids.rev().find(|&kid| is_element(&parsed.dom, kid)))
         };
         child_value(&ctx, found)
     }
@@ -2041,10 +2041,7 @@ impl JsNode {
         let previous = parsed.dom.sibling(self.handle.0, false);
         let reference = match previous {
             Some(previous) => parsed.dom.sibling(previous, true),
-            None => parsed
-                .dom
-                .children(parent)
-                .and_then(|mut kids| kids.next()),
+            None => parsed.dom.children(parent).and_then(|mut kids| kids.next()),
         };
         parsed
             .dom

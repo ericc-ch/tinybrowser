@@ -264,16 +264,10 @@ impl Sink {
     fn insert_text(&self, parent: Handle, before: Option<Handle>, text: &str) {
         let mut dom = self.dom.borrow_mut();
         let neighbor = match before {
-            None => dom
-                .children(parent)
-                .and_then(|mut kids| kids.next_back()),
-            Some(sibling) => dom
-                .children(parent)
-                .and_then(|mut kids| kids.position(|kid| kid == sibling))
-                .and_then(|position| {
-                    dom.children(parent)
-                        .and_then(|mut kids| kids.nth(position.checked_sub(1)?))
-                }),
+            None => dom.children(parent).and_then(|mut kids| kids.next_back()),
+            // On the parser path `sibling` is always a child of `parent`, so
+            // its previous sibling is the neighbor to coalesce with.
+            Some(sibling) => dom.previous_sibling(sibling),
         };
         if let Some(handle) = neighbor
             && matches!(dom.kind(handle), Some(NodeKind::Text { .. }))

@@ -184,8 +184,8 @@ fn is_descendant_of(dom: &Dom, id: NodeId, ancestor: NodeId) -> bool {
 }
 
 fn first_legend_child(dom: &Dom, fieldset: NodeId) -> Option<NodeId> {
-    let kids = dom.children(fieldset)?;
-    kids.into_iter().find(|&kid| local_is(dom, kid, &["legend"]))
+    dom.children(fieldset)?
+        .find(|&kid| local_is(dom, kid, &["legend"]))
 }
 
 fn disabled_by_fieldset(dom: &Dom, id: NodeId) -> bool {

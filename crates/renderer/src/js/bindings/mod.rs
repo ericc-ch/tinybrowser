@@ -1006,10 +1006,7 @@ pub(super) fn string_value<'js>(ctx: &Ctx<'js>, text: &str) -> Result<Value<'js>
 /// non-container child contributes nothing, so its subtree is not entered.
 pub(super) fn descendant_text(dom: &dom::Dom, id: NodeId) -> String {
     let mut text = String::new();
-    let mut stack: Vec<NodeId> = dom
-        .children(id)
-        .map(Iterator::collect)
-        .unwrap_or_default();
+    let mut stack: Vec<NodeId> = dom.children(id).map(Iterator::collect).unwrap_or_default();
     stack.reverse();
     while let Some(current) = stack.pop() {
         match dom.kind(current) {
@@ -1086,13 +1083,17 @@ pub(super) fn nodes_equal(dom: &dom::Dom, a: NodeId, b: NodeId) -> bool {
     if !equal {
         return false;
     }
-    let kids_a: Vec<NodeId> = dom.children(a).expect("live node has no child list").collect();
-    let kids_b: Vec<NodeId> = dom.children(b).expect("live node has no child list").collect();
-    kids_a.len() == kids_b.len()
-        && kids_a
-            .iter()
-            .zip(kids_b.iter())
-            .all(|(&first, &second)| nodes_equal(dom, first, second))
+    // Walk both child runs in step: equal length, equal children, no
+    // allocation. Both cursors and the recursive call share the frozen tree.
+    let mut kids_a = dom.children(a).expect("live node has no slot");
+    let mut kids_b = dom.children(b).expect("live node has no slot");
+    loop {
+        match (kids_a.next(), kids_b.next()) {
+            (None, None) => return true,
+            (Some(first), Some(second)) if nodes_equal(dom, first, second) => {}
+            _ => return false,
+        }
+    }
 }
 
 /// [Locate a namespace](https://dom.spec.whatwg.org/#locate-a-namespace) for
