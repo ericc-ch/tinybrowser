@@ -1622,6 +1622,7 @@ impl Dom {
                 &value,
                 self.attribute(id, "min").as_deref().and_then(parse_finite),
                 self.attribute(id, "max").as_deref().and_then(parse_finite),
+                self.attribute(id, "step").as_deref(),
             ),
             "date" => sanitize_grammar(value, is_valid_date),
             "month" => sanitize_grammar(value, is_valid_month),
@@ -3101,16 +3102,35 @@ fn normalize_time(time: &str) -> String {
 /// (the midpoint of the range, or 50), then the value is clamped to the
 /// min/max range
 /// (<https://html.spec.whatwg.org/multipage/input.html#range-state-(type=range):value-sanitization-algorithm>).
-fn sanitize_range_value(value: &str, min: Option<f64>, max: Option<f64>) -> String {
+fn sanitize_range_value(
+    value: &str,
+    min: Option<f64>,
+    max: Option<f64>,
+    step_attr: Option<&str>,
+) -> String {
+    // A reversed range collapses to its minimum.
+    if let (Some(min), Some(max)) = (min, max)
+        && max < min
+    {
+        return format!("{min}");
+    }
     let mut number = parse_finite(value).unwrap_or(f64::NAN);
     if !number.is_finite() {
         number = match (min, max) {
-            (Some(min), Some(max)) if max < min => min,
             (Some(min), Some(max)) => min + (max - min) / 2.0,
             (Some(min), None) => min,
             (None, Some(max)) => max - max / 2.0,
             (None, None) => 50.0,
         };
+    }
+    let step_any = step_attr.is_some_and(|text| text.trim().eq_ignore_ascii_case("any"));
+    if !step_any {
+        let step = step_attr
+            .and_then(parse_finite)
+            .filter(|step| *step > 0.0)
+            .unwrap_or(1.0);
+        let base = min.unwrap_or(0.0);
+        number = base + ((number - base) / step).round() * step;
     }
     if let Some(min) = min
         && number < min
