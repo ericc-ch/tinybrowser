@@ -463,22 +463,73 @@
     return parts.join('&');
   };
 
+  // multipart/form-data with a generated boundary
+  // (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#multipart-form-data>).
+  const escapeMultipartName = value =>
+    String(value).replace(/\r\n|\r|\n/g, '\r\n').replace(/"/g, '%22');
+  const encodeMultipart = formData => {
+    const boundary = `----tinybrowser${Math.random().toString(16).slice(2)}`;
+    const parts = [];
+    for (const entry of formData) {
+      const name = escapeMultipartName(entry[0]);
+      const value = entry[1];
+      parts.push(`--${boundary}\r\n`);
+      if (value !== null && typeof value === 'object' && typeof value.name === 'string') {
+        parts.push(
+          `Content-Disposition: form-data; name="${name}"; filename="${escapeMultipartName(value.name)}"\r\n`,
+        );
+        parts.push(`Content-Type: ${value.type || 'application/octet-stream'}\r\n\r\n`);
+        parts.push(String(value));
+        parts.push('\r\n');
+      } else {
+        parts.push(`Content-Disposition: form-data; name="${name}"\r\n\r\n`);
+        parts.push(String(value));
+        parts.push('\r\n');
+      }
+    }
+    parts.push(`--${boundary}--\r\n`);
+    return { body: parts.join(''), contentType: `multipart/form-data; boundary=${boundary}` };
+  };
+
+  const encodeTextPlain = formData => {
+    const lines = [];
+    for (const entry of formData) {
+      lines.push(`${String(entry[0])}=${String(entry[1]).replace(/\r\n|\r|\n/g, '\r\n')}`);
+    }
+    return lines.join('\r\n');
+  };
+
   const submitForm = (form, formData) => {
     const method = form.method;
     if (method === 'dialog') return;
-    let action = form.action;
+    const action = form.action;
+    const target = form.target;
     if (method === 'get') {
+      let url = action;
       const encoded = urlEncode(formData);
       if (encoded !== '') {
-        const hash = action.indexOf('#');
-        const base = hash === -1 ? action : action.slice(0, hash);
+        const hash = url.indexOf('#');
+        const base = hash === -1 ? url : url.slice(0, hash);
         const query = base.indexOf('?');
-        action = (query === -1 ? base : base.slice(0, query)) + '?' + encoded;
+        url = (query === -1 ? base : base.slice(0, query)) + '?' + encoded;
       }
+      globalThis.__tbFormNavigate(url, target, 'GET', '', null);
+      return;
     }
-    // POST needs the request-body protocol; submit as GET until it lands
+    // POST: the entries become the request body, encoded per `enctype`
     // (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#submit-mutate-action>).
-    globalThis.__tbFormNavigate(action, form.target);
+    let body;
+    let contentType;
+    if (form.enctype === 'multipart/form-data') {
+      ({ body, contentType } = encodeMultipart(formData));
+    } else if (form.enctype === 'text/plain') {
+      body = encodeTextPlain(formData);
+      contentType = 'text/plain';
+    } else {
+      body = urlEncode(formData);
+      contentType = 'application/x-www-form-urlencoded';
+    }
+    globalThis.__tbFormNavigate(action, target, 'POST', body, contentType);
   };
 
   // <https://html.spec.whatwg.org/multipage/forms.html#dom-form-submit>

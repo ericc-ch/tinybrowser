@@ -143,6 +143,25 @@ pub(crate) struct FrameNavigation {
     /// The spec to navigate to, absolute or resolvable against the queuing
     /// document.
     pub(crate) spec: String,
+    /// HTTP method; `GET` for every navigation but a form submission.
+    pub(crate) method: String,
+    /// Request body, empty for a GET.
+    pub(crate) body: Vec<u8>,
+    /// `Content-Type` for `body`, when there is one.
+    pub(crate) content_type: Option<String>,
+}
+
+impl FrameNavigation {
+    /// A GET navigation, the shape of every navigation but a form submission.
+    pub(crate) fn get(target: NavigationTarget, spec: String) -> Self {
+        Self {
+            target,
+            spec,
+            method: "GET".to_owned(),
+            body: Vec::new(),
+            content_type: None,
+        }
+    }
 }
 
 pub(crate) enum DocumentStreamCommand {

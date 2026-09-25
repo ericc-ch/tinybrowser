@@ -190,14 +190,14 @@ impl Document {
             }
             if let Ok(url) = self.resolve_dial_url(&fetch.url) {
                 let initiator = self.url.clone();
-                self.queued_dials.push(QueuedDial {
-                    context: DialContext::JsFetch {
+                self.queued_dials.push(QueuedDial::get(
+                    DialContext::JsFetch {
                         id: fetch.js_id,
                         epoch: self.js_epoch,
                     },
                     url,
                     initiator,
-                });
+                ));
             } else {
                 self.record_event(RendererEvent::FetchFailed);
                 self.settle_js_fetch(fetch.js_id, false, 0, "");

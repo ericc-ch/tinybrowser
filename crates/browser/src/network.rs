@@ -191,7 +191,14 @@ impl TabNetworkHandle {
             let _global = Self::acquire(&self.permits.global, deadline).await?;
             let _tab = Self::acquire(&self.tab, deadline).await?;
             let url = Url::parse(&request.url).map_err(|_| DialFailure::Connect)?;
-            let mut outbound = Request::new(Method::GET, url);
+            let method = net::Method::parse(&request.method).map_err(|_| DialFailure::Connect)?;
+            let mut outbound = Request::new(method, url);
+            if let Some(content_type) = &request.content_type {
+                let _ = outbound.headers.insert("Content-Type", content_type.as_bytes());
+            }
+            if !request.body.is_empty() {
+                outbound.body = Some(request.body.clone());
+            }
             outbound.initiator_kind = InitiatorKind::Fetch;
             outbound.initiator = Some(initiator.clone());
             outbound.deadline = Some(deadline);

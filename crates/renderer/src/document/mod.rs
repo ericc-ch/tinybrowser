@@ -105,6 +105,26 @@ pub(crate) struct QueuedDial {
     pub(crate) context: DialContext,
     pub(crate) url: Url,
     pub(crate) initiator: Url,
+    /// HTTP method. Every dial except a form navigation is a GET.
+    pub(crate) method: String,
+    /// Request body, empty for a GET.
+    pub(crate) body: Vec<u8>,
+    /// `Content-Type` for `body`, when there is one.
+    pub(crate) content_type: Option<String>,
+}
+
+impl QueuedDial {
+    /// A GET dial, the shape of every dial but a form navigation.
+    pub(crate) fn get(context: DialContext, url: Url, initiator: Url) -> Self {
+        Self {
+            context,
+            url,
+            initiator,
+            method: "GET".to_owned(),
+            body: Vec::new(),
+            content_type: None,
+        }
+    }
 }
 
 /// One finished dial with the response it produced.
@@ -428,7 +448,14 @@ impl Document {
 
     /// Starts the frame's own navigation. The dial runs on this document, so
     /// a navigation that replaces the frame cancels an unfinished one.
-    pub(crate) fn navigate_to(&mut self, url: Url, initiator: Url) {
+    pub(crate) fn navigate_to(
+        &mut self,
+        url: Url,
+        initiator: Url,
+        method: String,
+        body: Vec<u8>,
+        content_type: Option<String>,
+    ) {
         self.frame_load_sequence = self.frame_load_sequence.wrapping_add(1);
         self.frame_load_in_flight = true;
         self.initial_blank = false;
@@ -438,6 +465,9 @@ impl Document {
             },
             url,
             initiator,
+            method,
+            body,
+            content_type,
         });
     }
 
@@ -1064,14 +1094,14 @@ impl Document {
                             if let Ok(url) = self.resolve_dial_url(&src) {
                                 self.classic_fetch_in_flight = true;
                                 let initiator = self.url.clone();
-                                self.queued_dials.push(QueuedDial {
-                                    context: DialContext::ClassicScript {
+                                self.queued_dials.push(QueuedDial::get(
+                                    DialContext::ClassicScript {
                                         element: id,
                                         epoch: self.js_epoch,
                                     },
                                     url,
                                     initiator,
-                                });
+                                ));
                                 return;
                             }
                             self.sync_parser_from_world();
@@ -1407,14 +1437,14 @@ impl Document {
             if !self.stylesheet_urls.insert(url.as_str().to_owned()) {
                 continue;
             }
-            self.queued_dials.push(QueuedDial {
-                context: DialContext::Stylesheet {
+            self.queued_dials.push(QueuedDial::get(
+                DialContext::Stylesheet {
                     element,
                     epoch: self.js_epoch,
                 },
                 url,
-                initiator: initiator.clone(),
-            });
+                initiator.clone(),
+            ));
             self.pending_stylesheets = self.pending_stylesheets.saturating_add(1);
             queued += 1;
         }
@@ -1491,15 +1521,15 @@ impl Document {
         let selected = url.as_str().to_owned();
         self.image_selected_src.insert(element, selected.clone());
         self.world.borrow_mut().begin_image(element, selected);
-        self.queued_dials.push(QueuedDial {
-            context: DialContext::Image {
+        self.queued_dials.push(QueuedDial::get(
+            DialContext::Image {
                 element,
                 epoch: self.js_epoch,
                 generation,
             },
             url,
             initiator,
-        });
+        ));
         self.pending_images = self.pending_images.saturating_add(1);
         self.launch_queued_dials();
     }

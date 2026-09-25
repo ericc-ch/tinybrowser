@@ -171,7 +171,7 @@ impl Engine {
                     .get(&parent)
                     .and_then(|document| document.frame_src(container));
                 if let Some(src) = src {
-                    self.navigate_frame(child, container, &src);
+                    self.navigate_frame(child, container, &src, "GET", &[], None);
                 }
                 if let Some(document) = self.frames.get_mut(&parent) {
                     document.mark_frame_load_pending(container);
@@ -554,7 +554,14 @@ impl Engine {
                             .frames
                             .get(&parent)
                             .and_then(|document| document.frame_src(container));
-                        self.navigate_frame(child, container, src.as_deref().unwrap_or(""));
+                        self.navigate_frame(
+                            child,
+                            container,
+                            src.as_deref().unwrap_or(""),
+                            "GET",
+                            &[],
+                            None,
+                        );
                         self.publish_frame_document(container, child);
                     } else if let Some(document) = self.frames.get_mut(&parent) {
                         document.queue_connected_image(container);
@@ -626,7 +633,15 @@ impl Engine {
     /// Navigates a child frame to one URL, resolving it against the parent
     /// document and dispatching on its scheme
     /// (<https://html.spec.whatwg.org/multipage/iframe-embed-object.html#process-the-iframe-attributes>).
-    fn navigate_frame(&mut self, child: FrameId, container: dom::NodeId, spec: &str) {
+    fn navigate_frame(
+        &mut self,
+        child: FrameId,
+        container: dom::NodeId,
+        spec: &str,
+        method: &str,
+        body: &[u8],
+        content_type: Option<&str>,
+    ) {
         let parent = self
             .runtime
             .shared
@@ -656,7 +671,7 @@ impl Engine {
             self.mark_frame_load_pending(container, parent);
             return;
         };
-        self.load_frame_url(child, url, parent, &parent_url);
+        self.load_frame_url(child, url, parent, method, body, content_type);
         self.mark_frame_load_pending(container, parent);
     }
 
@@ -675,9 +690,21 @@ impl Engine {
 
     /// Starts the load one resolved frame URL names, dispatching on its scheme
     /// (<https://html.spec.whatwg.org/multipage/iframe-embed-object.html#process-the-iframe-attributes>).
-    fn load_frame_url(&mut self, child: FrameId, url: Url, parent: FrameId, parent_url: &str) {
+    fn load_frame_url(
+        &mut self,
+        child: FrameId,
+        url: Url,
+        parent: FrameId,
+        method: &str,
+        body: &[u8],
+        content_type: Option<&str>,
+    ) {
+        let parent_url = self
+            .frames
+            .get(&parent)
+            .map_or_else(|| String::from("about:blank"), Document::inherited_url);
         match url.scheme() {
-            "about" => self.keep_initial_blank(child, parent_url),
+            "about" => self.keep_initial_blank(child, &parent_url),
             "data" => {
                 if let Some((content_type, body)) = decode_data_url(url.as_str()) {
                     if let Some(document) = self.frames.get_mut(&child) {
@@ -708,7 +735,7 @@ impl Engine {
                         // created; its result is discarded.
                         document.eval_frame_script(&script);
                     } else {
-                        document.load_javascript_frame(Some(parent_url), &script);
+                        document.load_javascript_frame(Some(&parent_url), &script);
                     }
                 }
             }
@@ -737,7 +764,13 @@ impl Engine {
                     .and_then(|document| Url::parse(document.document_url()).ok())
                     .unwrap_or_else(|| url.clone());
                 if let Some(document) = self.frames.get_mut(&child) {
-                    document.navigate_to(url, initiator);
+                    document.navigate_to(
+                        url,
+                        initiator,
+                        method.to_owned(),
+                        body.to_vec(),
+                        content_type.map(str::to_owned),
+                    );
                 }
             }
             _ => {
@@ -757,7 +790,17 @@ impl Engine {
     }
 
     fn apply_navigations(&mut self, navigations: Vec<(FrameId, FrameNavigation)>) {
-        for (frame, FrameNavigation { target, spec }) in navigations {
+        for (
+            frame,
+            FrameNavigation {
+                target,
+                spec,
+                method,
+                body,
+                content_type,
+            },
+        ) in navigations
+        {
             match target {
                 NavigationTarget::Container(container) => {
                     let Some(child) = self
@@ -769,7 +812,14 @@ impl Engine {
                     else {
                         continue;
                     };
-                    self.navigate_frame(child, container, &spec);
+                    self.navigate_frame(
+                        child,
+                        container,
+                        &spec,
+                        &method,
+                        &body,
+                        content_type.as_deref(),
+                    );
                     self.publish_frame_document(container, child);
                 }
                 NavigationTarget::SelfFrame => {
@@ -779,8 +829,9 @@ impl Engine {
                     let Ok(url) = Url::parse(&spec) else {
                         continue;
                     };
-                    let initiator = Url::parse(document.document_url()).unwrap_or_else(|_| url.clone());
-                    document.navigate_to(url, initiator);
+                    let initiator =
+                        Url::parse(document.document_url()).unwrap_or_else(|_| url.clone());
+                    document.navigate_to(url, initiator, method, body, content_type);
                 }
             }
         }

@@ -172,22 +172,30 @@ fn hard_wrap(value: &str, cols: usize) -> String {
     clippy::needless_pass_by_value,
     reason = "rquickjs Func ABI passes arguments by value"
 )]
-pub(super) fn form_navigate(ctx: Ctx<'_>, url: String, target: String) -> Result<()> {
+pub(super) fn form_navigate(
+    ctx: Ctx<'_>,
+    url: String,
+    target: String,
+    method: String,
+    body: String,
+    content_type: Option<String>,
+) -> Result<()> {
     let world_rc = world(&ctx)?;
     let container = if target.is_empty() || target.starts_with('_') {
         None
     } else {
         find_named_frame(&world_rc, &target)
     };
-    let navigation = match container {
-        Some(container) => FrameNavigation {
-            target: crate::js::NavigationTarget::Container(container),
-            spec: url,
-        },
-        None => FrameNavigation {
-            target: crate::js::NavigationTarget::SelfFrame,
-            spec: url,
-        },
+    let navigation_target = match container {
+        Some(container) => crate::js::NavigationTarget::Container(container),
+        None => crate::js::NavigationTarget::SelfFrame,
+    };
+    let navigation = FrameNavigation {
+        target: navigation_target,
+        spec: url,
+        method,
+        body: body.into_bytes(),
+        content_type,
     };
     world_rc.borrow_mut().queue_frame_navigation(navigation);
     Ok(())

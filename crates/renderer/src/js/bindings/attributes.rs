@@ -980,10 +980,10 @@ pub(crate) fn after_attribute_change(ctx: &Ctx<'_>, element: NodeId, local: &str
         return Ok(());
     }
     if is_iframe {
-        world.borrow_mut().queue_frame_navigation(FrameNavigation {
-            target: NavigationTarget::Container(element),
+        world.borrow_mut().queue_frame_navigation(FrameNavigation::get(
+            NavigationTarget::Container(element),
             spec,
-        });
+        ));
     } else {
         world.borrow_mut().queue_image_update(element);
     }
