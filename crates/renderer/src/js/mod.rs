@@ -955,17 +955,14 @@ fn javascript_mime(typ: Option<&str>) -> bool {
 
 fn element_text(tree: &dom::Dom, id: dom::NodeId) -> String {
     let mut text = String::new();
-    let mut stack: Vec<_> = tree
-        .children(id)
-        .map(|kids| kids.copied().collect())
-        .unwrap_or_default();
+    let mut stack: Vec<_> = tree.children(id).map(Iterator::collect).unwrap_or_default();
     stack.reverse();
     while let Some(child) = stack.pop() {
         match tree.kind(child) {
             Some(dom::NodeKind::Text { data }) => text.push_str(data),
             Some(dom::NodeKind::Element { .. }) => {
                 if let Some(kids) = tree.children(child) {
-                    let mut kids: Vec<_> = kids.copied().collect();
+                    let mut kids: Vec<_> = kids.collect();
                     kids.reverse();
                     stack.extend(kids);
                 }

@@ -449,7 +449,7 @@ fn inline_stylesheets(dom: &dom::Dom) -> Vec<String> {
         }
         let mut css = String::new();
         if let Some(children) = dom.children(node) {
-            for &child in children {
+            for child in children {
                 if let Some(NodeKind::Text { data }) = dom.kind(child) {
                     css.push_str(data);
                 }
@@ -1006,17 +1006,14 @@ pub(super) fn string_value<'js>(ctx: &Ctx<'js>, text: &str) -> Result<Value<'js>
 /// non-container child contributes nothing, so its subtree is not entered.
 pub(super) fn descendant_text(dom: &dom::Dom, id: NodeId) -> String {
     let mut text = String::new();
-    let mut stack: Vec<NodeId> = dom
-        .children(id)
-        .map(|kids| kids.copied().collect())
-        .unwrap_or_default();
+    let mut stack: Vec<NodeId> = dom.children(id).map(Iterator::collect).unwrap_or_default();
     stack.reverse();
     while let Some(current) = stack.pop() {
         match dom.kind(current) {
             Some(NodeKind::Text { data } | NodeKind::CDataSection { data }) => text.push_str(data),
             Some(NodeKind::Element { .. } | NodeKind::Fragment) => {
                 if let Some(kids) = dom.children(current) {
-                    let mut kids: Vec<NodeId> = kids.copied().collect();
+                    let mut kids: Vec<NodeId> = kids.collect();
                     kids.reverse();
                     stack.extend(kids);
                 }
@@ -1086,12 +1083,17 @@ pub(super) fn nodes_equal(dom: &dom::Dom, a: NodeId, b: NodeId) -> bool {
     if !equal {
         return false;
     }
-    let kids_a = dom.children(a).expect("live node has no child list");
-    let kids_b = dom.children(b).expect("live node has no child list");
-    kids_a.len() == kids_b.len()
-        && kids_a
-            .zip(kids_b)
-            .all(|(&first, &second)| nodes_equal(dom, first, second))
+    // Walk both child runs in step: equal length, equal children, no
+    // allocation. Both cursors and the recursive call share the frozen tree.
+    let mut kids_a = dom.children(a).expect("live node has no slot");
+    let mut kids_b = dom.children(b).expect("live node has no slot");
+    loop {
+        match (kids_a.next(), kids_b.next()) {
+            (None, None) => return true,
+            (Some(first), Some(second)) if nodes_equal(dom, first, second) => {}
+            _ => return false,
+        }
+    }
 }
 
 /// [Locate a namespace](https://dom.spec.whatwg.org/#locate-a-namespace) for
@@ -1395,14 +1397,13 @@ pub(super) fn collection_ids(
         CollectionKind::Children => parsed
             .dom
             .children(scope)
-            .map(|children| children.copied().collect())
+            .map(Iterator::collect)
             .unwrap_or_default(),
         CollectionKind::ElementChildren => parsed
             .dom
             .children(scope)
             .map(|children| {
                 children
-                    .copied()
                     .filter(|&kid| is_element(&parsed.dom, kid))
                     .collect()
             })
@@ -1542,7 +1543,7 @@ pub(super) fn tree_order(dom: &dom::Dom, a: NodeId, b: NodeId) -> std::cmp::Orde
     let child_b = chain_b[chain_b.len() - 1 - common];
     let kids: Vec<NodeId> = dom
         .children(*parent)
-        .map(|kids| kids.copied().collect())
+        .map(Iterator::collect)
         .unwrap_or_default();
     let position_a = kids.iter().position(|&kid| kid == child_a);
     let position_b = kids.iter().position(|&kid| kid == child_b);

@@ -827,7 +827,7 @@ fn has_document_element(dom: &Dom, document: NodeId) -> bool {
 
 fn children(dom: &Dom, parent: NodeId) -> Vec<NodeId> {
     dom.children(parent)
-        .map(|children| children.copied().collect())
+        .map(Iterator::collect)
         .unwrap_or_default()
 }
 

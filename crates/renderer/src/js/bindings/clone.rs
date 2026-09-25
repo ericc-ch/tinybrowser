@@ -72,8 +72,7 @@ pub(crate) fn clone_document<'js>(ctx: &Ctx<'js>, id: NodeId, deep: bool) -> Res
                 .dom
                 .children(id)
                 .map(|kids| {
-                    kids.copied()
-                        .filter_map(|kid| import_snapshot(&parsed.dom, kid, true))
+                    kids.filter_map(|kid| import_snapshot(&parsed.dom, kid, true))
                         .collect()
                 })
                 .unwrap_or_default()
@@ -126,8 +125,7 @@ pub(crate) fn import_snapshot(dom: &dom::Dom, id: NodeId, deep: bool) -> Option<
         }
         dom.children(id)
             .map(|kids| {
-                kids.copied()
-                    .filter_map(|kid| import_snapshot(dom, kid, true))
+                kids.filter_map(|kid| import_snapshot(dom, kid, true))
                     .collect()
             })
             .unwrap_or_default()
@@ -141,8 +139,7 @@ pub(crate) fn import_snapshot(dom: &dom::Dom, id: NodeId, deep: bool) -> Option<
                 if deep {
                     dom.children(contents)
                         .map(|kids| {
-                            kids.copied()
-                                .filter_map(|kid| import_snapshot(dom, kid, true))
+                            kids.filter_map(|kid| import_snapshot(dom, kid, true))
                                 .collect()
                         })
                         .unwrap_or_default()

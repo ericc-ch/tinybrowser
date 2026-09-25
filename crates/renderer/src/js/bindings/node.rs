@@ -175,8 +175,8 @@ fn parse_html_fragment_snapshots(
     let fragment_root = parsed_fragment
         .dom
         .children(parsed_fragment.dom.document())
-        .and_then(|children| {
-            children.copied().find(|&id| {
+        .and_then(|mut children| {
+            children.find(|&id| {
                 matches!(
                     parsed_fragment.dom.kind(id),
                     Some(NodeKind::Element { name, .. })
@@ -190,7 +190,6 @@ fn parse_html_fragment_snapshots(
         .children(fragment_root)
         .map(|children| {
             children
-                .copied()
                 .filter_map(|child| import_snapshot(&parsed_fragment.dom, child, true))
                 .collect()
         })
@@ -213,7 +212,6 @@ fn document_first_child(parsed: &crate::Parsed, want: fn(&NodeKind) -> bool) -> 
         .children(parsed.dom.document())
         .into_iter()
         .flatten()
-        .copied()
         .find(|&id| parsed.dom.kind(id).is_some_and(want))
 }
 
@@ -308,7 +306,7 @@ impl JsNode {
             parsed
                 .dom
                 .children(self.handle.0)
-                .and_then(|mut kids| kids.next().copied())
+                .and_then(|mut kids| kids.next())
         };
         child_value(&ctx, id)
     }
@@ -1572,7 +1570,7 @@ impl JsNode {
                 parsed
                     .dom
                     .children(self.handle.0)
-                    .and_then(|kids| kids.last().copied())
+                    .and_then(|mut kids| kids.next_back())
             })
             .flatten();
         child_value(&ctx, id)
@@ -1740,7 +1738,7 @@ impl JsNode {
             parsed
                 .dom
                 .children(self.handle.0)
-                .and_then(|kids| kids.copied().find(|&kid| is_element(&parsed.dom, kid)))
+                .and_then(|mut kids| kids.find(|&kid| is_element(&parsed.dom, kid)))
         };
         child_value(&ctx, found)
     }
@@ -1754,11 +1752,10 @@ impl JsNode {
             let Some(parsed) = parsed.document(self.handle.0) else {
                 return Ok(Value::new_null(ctx));
             };
-            parsed.dom.children(self.handle.0).and_then(|kids| {
-                kids.rev()
-                    .copied()
-                    .find(|&kid| is_element(&parsed.dom, kid))
-            })
+            parsed
+                .dom
+                .children(self.handle.0)
+                .and_then(|kids| kids.rev().find(|&kid| is_element(&parsed.dom, kid)))
         };
         child_value(&ctx, found)
     }
@@ -1772,7 +1769,7 @@ impl JsNode {
             return Ok(0);
         };
         Ok(parsed.dom.children(self.handle.0).map_or(0, |kids| {
-            kids.filter(|&kid| is_element(&parsed.dom, *kid)).count()
+            kids.filter(|&kid| is_element(&parsed.dom, kid)).count()
         }))
     }
 
@@ -1806,7 +1803,7 @@ impl JsNode {
         let reference = parsed
             .dom
             .children(self.handle.0)
-            .and_then(|kids| kids.copied().next());
+            .and_then(|mut kids| kids.next());
         parsed
             .dom
             .pre_insert(self.handle.0, node, reference)
@@ -1978,7 +1975,7 @@ impl JsNode {
             });
         let kids: Vec<NodeId> = dom
             .children(title)
-            .map(|kids| kids.copied().collect())
+            .map(Iterator::collect)
             .unwrap_or_default();
         for kid in kids {
             dom.detach(kid).map_err(|err| throw_dom_error(&ctx, err))?;
@@ -2044,10 +2041,7 @@ impl JsNode {
         let previous = parsed.dom.sibling(self.handle.0, false);
         let reference = match previous {
             Some(previous) => parsed.dom.sibling(previous, true),
-            None => parsed
-                .dom
-                .children(parent)
-                .and_then(|kids| kids.copied().next()),
+            None => parsed.dom.children(parent).and_then(|mut kids| kids.next()),
         };
         parsed
             .dom
@@ -2581,7 +2575,7 @@ impl JsNode {
         let mut stack = vec![self.handle.0];
         while let Some(id) = stack.pop() {
             if let Some(kids) = dom.children(id) {
-                for &kid in kids {
+                for kid in kids {
                     if matches!(dom.kind(kid), Some(NodeKind::Element { .. })) {
                         containers.push(kid);
                         stack.push(kid);
@@ -2592,7 +2586,7 @@ impl JsNode {
         for container in containers {
             let kids: Vec<NodeId> = dom
                 .children(container)
-                .map(|kids| kids.copied().collect())
+                .map(Iterator::collect)
                 .unwrap_or_default();
             // In tree order: drop empty Text nodes, merge contiguous runs
             // into the first non-empty one

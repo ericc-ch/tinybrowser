@@ -124,11 +124,36 @@ fn assert_matches(dom: &Dom, document: NodeId, handles: &[NodeId], model: &Model
         assert_eq!(
             dom.children(handle)
                 .expect("live elements have children")
-                .copied()
                 .collect::<Vec<_>>(),
             expected_children,
             "children {index}"
         );
+        // The intrusive links must agree with the child run the model keeps:
+        // heads and tails, then every neighbour pair in both directions.
+        assert_eq!(
+            dom.first_child(handle),
+            expected_children.first().copied(),
+            "first child {index}"
+        );
+        assert_eq!(
+            dom.last_child(handle),
+            expected_children.last().copied(),
+            "last child {index}"
+        );
+        for (position, &child) in expected_children.iter().enumerate() {
+            assert_eq!(
+                dom.previous_sibling(child),
+                position
+                    .checked_sub(1)
+                    .map(|previous| expected_children[previous]),
+                "previous sibling {index}/{position}"
+            );
+            assert_eq!(
+                dom.next_sibling(child),
+                expected_children.get(position + 1).copied(),
+                "next sibling {index}/{position}"
+            );
+        }
     }
 }
 
@@ -245,7 +270,6 @@ fn document_fragments_templates_and_clones_keep_their_contracts() {
     assert_eq!(
         dom.children(html)
             .expect("html children")
-            .copied()
             .collect::<Vec<_>>(),
         vec![first, second]
     );
@@ -339,4 +363,236 @@ fn img_connection_transitions_record_lifecycle_events() {
 
     dom.detach(img).expect("detach");
     assert_eq!(dom.take_lifecycle(), vec![Lifecycle::Removed(img)]);
+}
+
+#[test]
+fn connected_iframes_survive_replace_and_report_destroy() {
+    let mut dom = Dom::new();
+    let document = dom.document();
+    let root = dom.create_element(qn("root"), Vec::new());
+    let holder = dom.create_element(qn("holder"), Vec::new());
+    let iframe = dom.create_element(qn("iframe"), Vec::new());
+    dom.append(document, root).expect("root");
+    dom.append(root, holder).expect("holder");
+    dom.append(holder, iframe).expect("iframe");
+    assert_eq!(dom.connected_iframe_count(), 1);
+    let _ = dom.take_lifecycle();
+
+    // `replaceChildren(holder.firstChild)`: the iframe stays connected across
+    // the replace, so it must neither churn an event nor double the count.
+    dom.replace_all(holder, iframe).expect("replace_all");
+    assert_eq!(dom.connected_iframe_count(), 1);
+    assert!(dom.take_lifecycle().is_empty());
+
+    // `replaceChild` where the replacement sits inside the replaced node: the
+    // transient detach must not read as removed-then-reinserted either.
+    let wrapper = dom.create_element(qn("wrapper"), Vec::new());
+    dom.replace_all(holder, wrapper).expect("wrap");
+    let nested = dom.create_element(qn("iframe"), Vec::new());
+    dom.append(wrapper, nested).expect("nested iframe");
+    assert_eq!(dom.connected_iframe_count(), 1);
+    let _ = dom.take_lifecycle();
+    dom.replace_child(holder, nested, wrapper)
+        .expect("replace_child");
+    assert_eq!(dom.connected_iframe_count(), 1);
+    assert!(dom.take_lifecycle().is_empty());
+
+    // Destroying a connected iframe reports the removal and drops the count.
+    dom.destroy(nested).expect("destroy");
+    assert_eq!(dom.connected_iframe_count(), 0);
+    assert_eq!(dom.take_lifecycle(), vec![Lifecycle::Removed(nested)]);
+}
+
+#[test]
+fn replacement_reports_removal_before_insertion() {
+    let mut dom = Dom::new();
+    let document = dom.document();
+    let root = dom.create_element(qn("root"), Vec::new());
+    dom.append(document, root).expect("root");
+    let old = dom.create_element(qn("iframe"), Vec::new());
+    dom.append(root, old).expect("old iframe");
+    let _ = dom.take_lifecycle();
+
+    let fresh = dom.create_element(qn("iframe"), Vec::new());
+    dom.replace_child(root, fresh, old).expect("replace_child");
+    assert_eq!(
+        dom.take_lifecycle(),
+        vec![Lifecycle::Removed(old), Lifecycle::Inserted(fresh)],
+        "a replacement must release the old frame before framing the new one"
+    );
+    assert_eq!(dom.connected_iframe_count(), 1);
+
+    let swap = dom.create_element(qn("iframe"), Vec::new());
+    dom.replace_all(root, swap).expect("replace_all");
+    assert_eq!(
+        dom.take_lifecycle(),
+        vec![Lifecycle::Removed(fresh), Lifecycle::Inserted(swap)],
+        "replace_all must release before inserting too"
+    );
+    assert_eq!(dom.connected_iframe_count(), 1);
+}
+
+/// Asserts the intrusive links of `parent` match `expected` exactly: the
+/// child run, its endpoints, and every neighbour in both directions.
+fn assert_links(dom: &Dom, parent: NodeId, expected: &[NodeId]) {
+    assert_eq!(
+        dom.children(parent)
+            .expect("live parent")
+            .collect::<Vec<_>>(),
+        expected
+    );
+    assert_eq!(dom.first_child(parent), expected.first().copied());
+    assert_eq!(dom.last_child(parent), expected.last().copied());
+    for (position, &child) in expected.iter().enumerate() {
+        assert_eq!(
+            dom.parent(child),
+            Some(parent),
+            "parent of child {position}"
+        );
+        assert_eq!(
+            dom.previous_sibling(child),
+            position.checked_sub(1).map(|previous| expected[previous]),
+            "previous sibling of child {position}"
+        );
+        assert_eq!(
+            dom.next_sibling(child),
+            expected.get(position + 1).copied(),
+            "next sibling of child {position}"
+        );
+    }
+}
+
+#[test]
+fn bulk_moves_keep_the_link_invariant() {
+    let mut dom = Dom::new();
+    let wrapper = dom.create_element(qn("wrapper"), Vec::new());
+    let host = dom.create_element(qn("host"), Vec::new());
+    let dest = dom.create_element(qn("dest"), Vec::new());
+    dom.append(wrapper, host).expect("host");
+    dom.append(wrapper, dest).expect("dest");
+
+    let first = dom.create_element(qn("first"), Vec::new());
+    let second = dom.create_element(qn("second"), Vec::new());
+    let third = dom.create_element(qn("third"), Vec::new());
+    for &child in &[first, second, third] {
+        dom.append(host, child).expect("host child");
+    }
+    assert_links(&dom, host, &[first, second, third]);
+
+    // replace_all detaches the standing children and links the replacement.
+    let replacement = dom.create_element(qn("replacement"), Vec::new());
+    dom.replace_all(host, replacement).expect("replace_all");
+    assert_links(&dom, host, &[replacement]);
+    for &detached in &[first, second, third] {
+        assert_eq!(dom.parent(detached), None);
+        assert_eq!(dom.previous_sibling(detached), None);
+        assert_eq!(dom.next_sibling(detached), None);
+    }
+
+    // replace_all with a node already in the standing set.
+    let kept = dom.create_element(qn("kept"), Vec::new());
+    dom.append(host, kept).expect("kept");
+    assert_links(&dom, host, &[replacement, kept]);
+    dom.replace_all(host, kept)
+        .expect("replace_all reusing a child");
+    assert_links(&dom, host, &[kept]);
+    assert_eq!(dom.parent(replacement), None);
+    assert_eq!(dom.previous_sibling(replacement), None);
+    assert_eq!(dom.next_sibling(replacement), None);
+
+    // replace_child swaps exactly one node.
+    let replaced = dom.create_element(qn("replaced"), Vec::new());
+    dom.append(host, replaced).expect("replaced");
+    let inserted = dom.create_element(qn("inserted"), Vec::new());
+    dom.replace_child(host, inserted, replaced)
+        .expect("replace_child");
+    assert_links(&dom, host, &[kept, inserted]);
+    assert_eq!(dom.parent(replaced), None);
+    assert_eq!(dom.next_sibling(replaced), None);
+
+    // reparent_children moves the whole run in order to the destination.
+    let marker = dom.create_comment("marker");
+    dom.append(dest, marker).expect("dest child");
+    dom.reparent_children(host, dest)
+        .expect("reparent_children");
+    assert_links(&dom, host, &[]);
+    assert_links(&dom, dest, &[marker, kept, inserted]);
+
+    // Inserting a fragment splices its children before the reference.
+    let fragment = dom.create_fragment();
+    let frag_one = dom.create_element(qn("frag-one"), Vec::new());
+    let frag_two = dom.create_element(qn("frag-two"), Vec::new());
+    dom.append(fragment, frag_one).expect("frag_one");
+    dom.append(fragment, frag_two).expect("frag_two");
+    dom.insert_before(kept, fragment).expect("splice fragment");
+    assert_links(&dom, dest, &[marker, frag_one, frag_two, kept, inserted]);
+    assert_eq!(dom.children(fragment).expect("fragment").count(), 0);
+
+    // Appending a fragment splices its children at the end.
+    let tail = dom.create_fragment();
+    let tail_one = dom.create_element(qn("tail-one"), Vec::new());
+    let tail_two = dom.create_element(qn("tail-two"), Vec::new());
+    dom.append(tail, tail_one).expect("tail_one");
+    dom.append(tail, tail_two).expect("tail_two");
+    dom.append(dest, tail).expect("append fragment");
+    assert_links(
+        &dom,
+        dest,
+        &[
+            marker, frag_one, frag_two, kept, inserted, tail_one, tail_two,
+        ],
+    );
+    assert_eq!(dom.children(tail).expect("tail").count(), 0);
+
+    // replace_all with a fragment replaces the run with the fragment's children.
+    let swap = dom.create_fragment();
+    let swap_child = dom.create_element(qn("swap-child"), Vec::new());
+    dom.append(swap, swap_child).expect("swap_child");
+    dom.replace_all(dest, swap).expect("replace_all fragment");
+    assert_links(&dom, dest, &[swap_child]);
+}
+
+#[test]
+fn child_iteration_covers_each_child_once_across_both_directions() {
+    let mut dom = Dom::new();
+    let document = dom.document();
+    let root = dom.create_element(qn("root"), Vec::new());
+    dom.append(document, root).expect("root");
+
+    let mut kids = Vec::new();
+    for _ in 0..5 {
+        let kid = dom.create_element(qn("node"), Vec::new());
+        dom.append(root, kid).expect("child");
+        kids.push(kid);
+    }
+
+    // Alternating ends must yield every child exactly once: the two cursors
+    // retire together when they meet, so neither can repeat the other's node.
+    let mut iter = dom.children(root).expect("root children");
+    let mut front = true;
+    let mut seen = Vec::new();
+    while let Some(id) = if front { iter.next() } else { iter.next_back() } {
+        seen.push(id);
+        front = !front;
+    }
+    assert_eq!(seen.len(), kids.len());
+    for kid in &kids {
+        assert!(seen.contains(kid), "child yielded at most once");
+    }
+
+    // A lone child is yielded once, not once per direction.
+    let only = dom.create_element(qn("only"), Vec::new());
+    dom.append(root, only).expect("only container");
+    let text = dom.create_text("x");
+    dom.append(only, text).expect("only child");
+    let mut iter = dom.children(only).expect("only children");
+    assert_eq!(iter.next(), Some(text));
+    assert_eq!(iter.next_back(), None);
+
+    // An empty run yields nothing from either end.
+    let empty = dom.create_element(qn("empty"), Vec::new());
+    dom.append(root, empty).expect("empty container");
+    let mut iter = dom.children(empty).expect("empty children");
+    assert_eq!(iter.next(), None);
+    assert_eq!(iter.next_back(), None);
 }

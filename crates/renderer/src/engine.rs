@@ -42,7 +42,7 @@ fn collect_stylesheets(dom: &dom::Dom, document: &Document) -> Vec<String> {
             "style" => {
                 let mut css = String::new();
                 if let Some(children) = dom.children(node) {
-                    for &child in children {
+                    for child in children {
                         if let Some(dom::NodeKind::Text { data }) = dom.kind(child) {
                             css.push_str(data);
                         }

@@ -822,7 +822,7 @@ impl World {
                 let mut children: Vec<NodeId> = parsed
                     .dom
                     .children(id)
-                    .map(|kids| kids.copied().collect())
+                    .map(Iterator::collect)
                     .unwrap_or_default();
                 if let Some(root) = parsed.dom.shadow_root(id) {
                     children.push(root);

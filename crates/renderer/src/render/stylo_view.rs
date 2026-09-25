@@ -583,10 +583,10 @@ impl<'a> selectors::Element for &'a StyloNode<'a> {
     }
 
     fn is_empty(&self) -> bool {
-        let Some(mut kids) = self.dom.children(self.id) else {
+        let Some(kids) = self.dom.children(self.id) else {
             return false;
         };
-        kids.all(|&kid| match self.dom.kind(kid) {
+        kids.into_iter().all(|kid| match self.dom.kind(kid) {
             Some(dom::NodeKind::Text { data }) => data.is_empty(),
             Some(dom::NodeKind::Element { .. }) => false,
             _ => true,

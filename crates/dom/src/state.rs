@@ -184,8 +184,8 @@ fn is_descendant_of(dom: &Dom, id: NodeId, ancestor: NodeId) -> bool {
 }
 
 fn first_legend_child(dom: &Dom, fieldset: NodeId) -> Option<NodeId> {
-    let kids = dom.children(fieldset)?;
-    kids.copied().find(|&kid| local_is(dom, kid, &["legend"]))
+    dom.children(fieldset)?
+        .find(|&kid| local_is(dom, kid, &["legend"]))
 }
 
 fn disabled_by_fieldset(dom: &Dom, id: NodeId) -> bool {
@@ -380,7 +380,7 @@ pub fn is_placeholder_shown(dom: &Dom, id: NodeId) -> bool {
         let mut empty = true;
         if let Some(kids) = dom.children(id) {
             for kid in kids {
-                if let Some(NodeKind::Text { data }) = dom.kind(*kid) {
+                if let Some(NodeKind::Text { data }) = dom.kind(kid) {
                     empty &= data.is_empty();
                 }
             }
