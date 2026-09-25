@@ -26,6 +26,10 @@ pub(super) fn install(_ctx: &Ctx<'_>, globals: &Object<'_>) -> Result<()> {
         "__tbSetInputFiles",
         rquickjs::prelude::Func::from(set_input_files),
     )?;
+    globals.set(
+        "__tbEncodeForm",
+        rquickjs::prelude::Func::from(encode_form),
+    )?;
     Ok(())
 }
 
@@ -207,6 +211,21 @@ fn push_file_entries<'js>(
         entries.set(at + 1, file)?;
     }
     Ok(())
+}
+
+/// Encodes `text` in the form's submission encoding, returning a Latin-1
+/// string of the encoded bytes. A character the encoding cannot represent
+/// becomes a numeric character reference, per the Encoding Standard's
+/// `encode` (<https://encoding.spec.whatwg.org/#encode>).
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "rquickjs Func ABI passes arguments by value"
+)]
+pub(super) fn encode_form(text: String, label: String) -> String {
+    let encoding = encoding_rs::Encoding::for_label(label.trim().as_bytes())
+        .unwrap_or(encoding_rs::UTF_8);
+    let (bytes, _, _) = encoding.encode(&text);
+    bytes.iter().map(|&byte| char::from(byte)).collect()
 }
 
 /// The host half of the `input.files` setter: records the assigned file list so

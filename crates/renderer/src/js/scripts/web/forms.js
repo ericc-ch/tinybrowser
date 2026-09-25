@@ -454,22 +454,76 @@
   // application/x-www-form-urlencoded: LF is normalized to CRLF, a space
   // becomes `+`, and the `!'()~` set is percent-encoded
   // (<https://url.spec.whatwg.org/#concept-urlencoded-serializer>).
-  const urlEncodePart = value =>
-    encodeURIComponent(value.replace(/\r\n|\r|\n/g, '\r\n'))
-      .replace(/%20/g, '+')
-      .replace(/[!'()~]/g, ch => `%${ch.charCodeAt(0).toString(16).toUpperCase()}`);
+  // The submission encoding: the first label in `accept-charset`, defaulting
+  // to UTF-8 (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#attr-fs-accept-charset>).
+  const charsetLabel = form => {
+    const accept = (form.acceptCharset || '').split(',')[0].trim();
+    return accept === '' ? 'UTF-8' : accept;
+  };
+  // A string encoded in `label`, as bytes. `__tbEncodeForm` applies the
+  // Encoding Standard's `encode`, so unrepresentable characters become numeric
+  // character references.
+  // A JS string with a lone surrogate cannot cross to Rust as UTF-8; replace
+  // lone surrogates with U+FFFD, the same replacement the Encoding Standard's
+  // `encode` applies
+  // (<https://encoding.spec.whatwg.org/#encode>).
+  const toWellFormed = text => {
+    let out = '';
+    for (let index = 0; index < text.length; index++) {
+      const code = text.charCodeAt(index);
+      if (code >= 0xD800 && code <= 0xDBFF) {
+        const next = text.charCodeAt(index + 1);
+        if (next >= 0xDC00 && next <= 0xDFFF) {
+          out += text[index] + text[index + 1];
+          index++;
+        } else {
+          out += '\uFFFD';
+        }
+      } else if (code >= 0xDC00 && code <= 0xDFFF) {
+        out += '\uFFFD';
+      } else {
+        out += text[index];
+      }
+    }
+    return out;
+  };
+  const charsetBytes = (text, label) => {
+    const encoded = globalThis.__tbEncodeForm(toWellFormed(String(text)), label);
+    const bytes = new Uint8Array(encoded.length);
+    for (let index = 0; index < encoded.length; index++) {
+      bytes[index] = encoded.charCodeAt(index);
+    }
+    return bytes;
+  };
+  // application/x-www-form-urlencoded over the encoded bytes: unreserved bytes
+  // stay, a space becomes `+`, everything else is percent-encoded
+  // (<https://url.spec.whatwg.org/#concept-urlencoded-serializer>).
+  const UNRESERVED = byte =>
+    (byte >= 0x30 && byte <= 0x39) || (byte >= 0x41 && byte <= 0x5A) ||
+    (byte >= 0x61 && byte <= 0x7A) || byte === 0x2A || byte === 0x2D ||
+    byte === 0x2E || byte === 0x5F;
+  const percentEncode = bytes => {
+    let out = '';
+    for (const byte of bytes) {
+      if (byte === 0x20) out += '+';
+      else if (UNRESERVED(byte)) out += String.fromCharCode(byte);
+      else out += `%${byte.toString(16).toUpperCase().padStart(2, '0')}`;
+    }
+    return out;
+  };
   // A `File`/`Blob` entry serializes as its file name
   // (<https://url.spec.whatwg.org/#concept-urlencoded-serializer>).
   const entryValueString = value =>
     (value !== null && typeof value === 'object' && typeof value.name === 'string')
       ? value.name
       : String(value);
-
-  const urlEncode = formData => {
+  const urlEncode = (formData, label) => {
     const parts = [];
     for (const entry of formData) {
+      const name = String(entry[0]).replace(/\r\n|\r|\n/g, '\r\n');
+      const value = entryValueString(entry[1]).replace(/\r\n|\r|\n/g, '\r\n');
       parts.push(
-        `${urlEncodePart(String(entry[0]))}=${urlEncodePart(entryValueString(entry[1]))}`,
+        `${percentEncode(charsetBytes(name, label))}=${percentEncode(charsetBytes(value, label))}`,
       );
     }
     return parts.join('&');
@@ -513,7 +567,7 @@
     return out;
   };
 
-  const encodeMultipart = formData => {
+  const encodeMultipart = (formData, label) => {
     const boundary = `----tinybrowser${Math.random().toString(16).slice(2)}`;
     const chunks = [];
     const push = text => chunks.push(encoder.encode(text));
@@ -522,16 +576,19 @@
       const value = entry[1];
       push(`--${boundary}\r\n`);
       if (value !== null && typeof value === 'object' && typeof value.name === 'string') {
-        push(
-          `Content-Disposition: form-data; name="${name}"; filename="${escapeMultipartFilename(value.name)}"\r\n`,
-        );
-        push(`Content-Type: ${value.type || 'application/octet-stream'}\r\n\r\n`);
+        push(`Content-Disposition: form-data; name="`);
+        chunks.push(charsetBytes(name, label));
+        push(`"; filename="`);
+        chunks.push(charsetBytes(escapeMultipartFilename(value.name), label));
+        push(`"\r\nContent-Type: ${value.type || 'application/octet-stream'}\r\n\r\n`);
         const data = value[__tbBlobData];
         chunks.push(data === undefined ? encoder.encode(String(value)) : data.bytes);
         push('\r\n');
       } else {
-        push(`Content-Disposition: form-data; name="${name}"\r\n\r\n`);
-        push(String(value).replace(/\r\n|\r|\n/g, '\r\n'));
+        push(`Content-Disposition: form-data; name="`);
+        chunks.push(charsetBytes(name, label));
+        push(`"\r\n\r\n`);
+        chunks.push(charsetBytes(String(value).replace(/\r\n|\r|\n/g, '\r\n'), label));
         push('\r\n');
       }
     }
@@ -542,12 +599,15 @@
     };
   };
 
-  const encodeTextPlain = formData => {
+  const encodeTextPlain = (formData, label) => {
     let body = '';
     for (const entry of formData) {
-      const name = String(entry[0]).replace(/\r\n|\r|\n/g, '\r\n');
-      const value = entryValueString(entry[1]).replace(/\r\n|\r|\n/g, '\r\n');
-      body += `${name}=${value}\r\n`;
+      const name = charsetBytes(String(entry[0]).replace(/\r\n|\r|\n/g, '\r\n'), label);
+      const value = charsetBytes(
+        entryValueString(entry[1]).replace(/\r\n|\r|\n/g, '\r\n'),
+        label,
+      );
+      body += `${toLatin1(name)}=${toLatin1(value)}\r\n`;
     }
     return body;
   };
@@ -581,9 +641,13 @@
     const target = targetAttr !== null ? targetAttr : form.target;
     const enctypeAttr = submitterAttribute(submitter, 'formenctype');
     const enctype = enctypeAttr !== null ? enctypeKeyword(enctypeAttr) : form.enctype;
+    const label = charsetLabel(form);
+    // A `_charset_` control carries the submission encoding's name
+    // (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#attr-fe-name-charset>).
+    if (formData.has('_charset_')) formData.set('_charset_', label);
     if (method === 'get') {
       let url = action;
-      const encoded = urlEncode(formData);
+      const encoded = urlEncode(formData, label);
       if (encoded !== '') {
         const hash = url.indexOf('#');
         const base = hash === -1 ? url : url.slice(0, hash);
@@ -598,12 +662,12 @@
     let body;
     let contentType;
     if (enctype === 'multipart/form-data') {
-      ({ body, contentType } = encodeMultipart(formData));
+      ({ body, contentType } = encodeMultipart(formData, label));
     } else if (enctype === 'text/plain') {
-      body = toLatin1(encoder.encode(encodeTextPlain(formData)));
+      body = encodeTextPlain(formData, label);
       contentType = 'text/plain';
     } else {
-      body = toLatin1(encoder.encode(urlEncode(formData)));
+      body = urlEncode(formData, label);
       contentType = 'application/x-www-form-urlencoded';
     }
     globalThis.__tbFormNavigate(action, target, 'POST', body, contentType);

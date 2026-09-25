@@ -1277,6 +1277,17 @@ impl JsNode {
         self.reflect_boolean(ctx, "novalidate", value)
     }
 
+    // https://html.spec.whatwg.org/multipage/forms.html#dom-form-acceptcharset
+    #[qjs(get, rename = "acceptCharset")]
+    fn accept_charset(&self, ctx: Ctx<'_>) -> Result<String> {
+        attribute_value(&ctx, self.handle.0, "accept-charset")
+    }
+
+    #[qjs(set, rename = "acceptCharset")]
+    fn set_accept_charset(&self, ctx: Ctx<'_>, value: WebIdlString) -> Result<()> {
+        self.set_attribute(ctx, WebIdlString("accept-charset".into()), value)
+    }
+
     // https://drafts.csswg.org/cssom-view/#dom-element-scrollleft
     #[qjs(get, rename = "scrollLeft")]
     fn scroll_left(&self, ctx: Ctx<'_>) -> Result<f64> {
