@@ -191,7 +191,17 @@ fn push_file_entries<'js>(
             })
             .unwrap_or_default()
     };
+    let no_files = files.is_empty();
     for file in files {
+        let at = entries.len();
+        entries.set(at, name)?;
+        entries.set(at + 1, file)?;
+    }
+    if no_files
+        && let Ok(empty) = ctx.globals().get::<_, Value>("__tbEmptyFile")
+        && let Some(function) = empty.as_function()
+        && let Ok(file) = function.call::<_, Value>(())
+    {
         let at = entries.len();
         entries.set(at, name)?;
         entries.set(at + 1, file)?;

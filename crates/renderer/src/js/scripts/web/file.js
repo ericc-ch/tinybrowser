@@ -410,3 +410,7 @@ globalThis.DataTransfer = class DataTransfer {
 Object.defineProperty(globalThis.DataTransfer.prototype, Symbol.toStringTag, {
   value: 'DataTransfer', writable: false, enumerable: false, configurable: true,
 });
+
+// A `type=file` input with no files still contributes an entry, an empty File
+// (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#constructing-form-data-set>).
+globalThis.__tbEmptyFile = () => new globalThis.File([], '');
