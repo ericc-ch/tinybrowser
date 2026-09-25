@@ -90,7 +90,6 @@ fn is_actually_disabled(dom: &dom::Dom, node: NodeId) -> bool {
                 .children(parent)
                 .into_iter()
                 .flatten()
-                .copied()
                 .find(|&child| node_local_name(dom, child).as_deref() == Some("legend"));
             if let Some(legend) = first_legend {
                 let mut inner = Some(node);

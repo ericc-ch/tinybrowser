@@ -208,6 +208,49 @@ impl Default for Dom {
     }
 }
 
+/// The children of one node, walked through the sibling links.
+///
+/// Double-ended because the tree is: `next_back` reads `last_child` and the
+/// `previous_sibling` links, so both directions are O(1) per step. Obtained
+/// from [`Dom::children`]; `None` there means the handle is stale, while a
+/// live leaf yields an empty iterator.
+pub struct Children<'a> {
+    dom: &'a Dom,
+    front: Option<NodeId>,
+    back: Option<NodeId>,
+}
+
+impl Iterator for Children<'_> {
+    type Item = NodeId;
+
+    fn next(&mut self) -> Option<NodeId> {
+        let current = self.front?;
+        // When the two cursors meet on the last element, both must retire:
+        // leaving `back` behind would let `next_back` yield the same node
+        // again to a caller that mixes directions.
+        if self.back == Some(current) {
+            self.front = None;
+            self.back = None;
+        } else {
+            self.front = self.dom.next_sibling(current);
+        }
+        Some(current)
+    }
+}
+
+impl DoubleEndedIterator for Children<'_> {
+    fn next_back(&mut self) -> Option<NodeId> {
+        let current = self.back?;
+        if self.front == Some(current) {
+            self.front = None;
+            self.back = None;
+        } else {
+            self.back = self.dom.previous_sibling(current);
+        }
+        Some(current)
+    }
+}
+
 impl Dom {
     /// An empty document containing just the root `Document` node.
     #[must_use]
@@ -215,7 +258,10 @@ impl Dom {
         let document_id = NEXT_DOCUMENT_ID.fetch_add(1, Ordering::Relaxed);
         let root = Node {
             parent: None,
-            children: Vec::new(),
+            first_child: None,
+            last_child: None,
+            previous_sibling: None,
+            next_sibling: None,
             kind: NodeKind::Document,
         };
         Self {
@@ -338,9 +384,9 @@ impl Dom {
     }
 
     fn first_slot(&self, root: NodeId, name: &str) -> Option<NodeId> {
-        let mut stack = self
+        let mut stack: Vec<NodeId> = self
             .children(root)
-            .map(|children| children.copied().collect::<Vec<_>>())
+            .map(Iterator::collect)
             .unwrap_or_default();
         stack.reverse();
         while let Some(node) = stack.pop() {
@@ -351,7 +397,7 @@ impl Dom {
                 continue;
             }
             if let Some(children) = self.children(node) {
-                stack.extend(children.rev().copied());
+                stack.extend(children.rev());
             }
         }
         None
@@ -371,7 +417,6 @@ impl Dom {
         self.children(host)
             .into_iter()
             .flatten()
-            .copied()
             .filter(|&child| self.slottable_name(child).as_deref() == Some(name.as_str()))
             .collect()
     }
@@ -394,7 +439,7 @@ impl Dom {
                 snapshot.push((current, self.is_connected(current)));
             }
             if let Some(children) = self.children(current) {
-                stack.extend(children.copied());
+                stack.extend(children);
             }
             if let Some(root) = self.shadow_root(current) {
                 stack.push(root);
@@ -504,28 +549,46 @@ impl Dom {
     /// gate below refuses to give them children. Childless and dead remain
     /// different answers; only staleness is `None`.
     #[must_use]
-    pub fn children(&self, id: NodeId) -> Option<std::slice::Iter<'_, NodeId>> {
-        self.live_slot(id)
-            .and_then(|slot| slot.node.as_ref())
-            .map(|node| node.children.iter())
+    pub fn children(&self, id: NodeId) -> Option<Children<'_>> {
+        let node = self.live_slot(id)?.node.as_ref()?;
+        Some(Children {
+            dom: self,
+            front: node.first_child,
+            back: node.last_child,
+        })
+    }
+
+    /// The first child of `id`, or `None` when it has none or is stale.
+    #[must_use]
+    pub fn first_child(&self, id: NodeId) -> Option<NodeId> {
+        self.live_slot(id)?.node.as_ref()?.first_child
+    }
+
+    /// The last child of `id`, or `None` when it has none or is stale.
+    #[must_use]
+    pub fn last_child(&self, id: NodeId) -> Option<NodeId> {
+        self.live_slot(id)?.node.as_ref()?.last_child
+    }
+
+    /// The sibling immediately before `id`, or `None`.
+    #[must_use]
+    pub fn previous_sibling(&self, id: NodeId) -> Option<NodeId> {
+        self.live_slot(id)?.node.as_ref()?.previous_sibling
+    }
+
+    /// The sibling immediately after `id`, or `None`.
+    #[must_use]
+    pub fn next_sibling(&self, id: NodeId) -> Option<NodeId> {
+        self.live_slot(id)?.node.as_ref()?.next_sibling
     }
 
     /// The sibling of `id` adjacent in the given direction, or `None`.
     #[must_use]
     pub fn sibling(&self, id: NodeId, forward: bool) -> Option<NodeId> {
-        let parent = self.parent(id)?;
-        let kids = self.children(parent)?;
         if forward {
-            kids.copied().skip_while(|&kid| kid != id).nth(1)
+            self.next_sibling(id)
         } else {
-            let mut previous = None;
-            for &kid in kids {
-                if kid == id {
-                    return previous;
-                }
-                previous = Some(kid);
-            }
-            None
+            self.previous_sibling(id)
         }
     }
 
@@ -545,7 +608,7 @@ impl Dom {
             }
         }
         self.children(id)
-            .map(|children| children.copied().collect())
+            .map(Iterator::collect)
             .unwrap_or_default()
     }
 
@@ -729,7 +792,6 @@ impl Dom {
                 let kids: Vec<NodeId> = self
                     .children(source)
                     .ok_or(DomError::StaleNode)?
-                    .copied()
                     .collect();
                 for kid in kids {
                     let child = self.alloc(self.kind(kid).ok_or(DomError::StaleNode)?.clone());
@@ -975,7 +1037,7 @@ impl Dom {
         if self.is_document(parent) {
             let incoming = self.incoming_nodes(node);
             let mut sequence: Vec<NodeId> = Vec::new();
-            for &existing in self.children(parent).into_iter().flatten() {
+            for existing in self.children(parent).into_iter().flatten() {
                 if existing == child {
                     sequence.extend_from_slice(&incoming);
                 } else {
@@ -1167,11 +1229,11 @@ impl Dom {
         let mut inserted = false;
         if let Some(kids) = self.children(parent) {
             for existing in kids {
-                if !inserted && Some(*existing) == reference {
+                if !inserted && Some(existing) == reference {
                     sequence.extend_from_slice(&incoming);
                     inserted = true;
                 }
-                sequence.push(*existing);
+                sequence.push(existing);
             }
         }
         if !inserted {
@@ -1256,22 +1318,25 @@ impl Dom {
             // standing children followed by the moved run.
             let mut sequence: Vec<NodeId> = Vec::new();
             if let Some(kids) = self.children(to) {
-                sequence.extend(kids.copied());
+                sequence.extend(kids);
             }
             if let Some(kids) = self.children(from) {
-                sequence.extend(kids.copied());
+                sequence.extend(kids);
             }
             self.ensure_document_content_model(&sequence)?;
         }
+        let (Some(first), Some(last)) = (self.first_child(from), self.last_child(from)) else {
+            return Ok(());
+        };
         // Defect guards, not input errors: both handles were verified live
-        // above, so a miss here means the parent-pointer/child-list duality
+        // above, so a miss here means the parent-pointer/child-link duality
         // is broken. Panicking beats reporting a lying "stale node".
         let from_connected = self.is_connected(from);
         let to_connected = self.is_connected(to);
-        let moved = self
-            .children_mut(from)
-            .map(std::mem::take)
-            .expect("verified-live `from` has no child list");
+        let moved: Vec<NodeId> = self
+            .children(from)
+            .expect("verified-live `from` has a child list")
+            .collect();
         let tracked: Vec<(NodeId, bool)> = if from_connected == to_connected {
             Vec::new()
         } else {
@@ -1280,17 +1345,15 @@ impl Dom {
                 .flat_map(|&id| self.connection_snapshot(id))
                 .collect()
         };
-        let list = self
-            .children_mut(to)
-            .expect("verified-live `to` has no child list");
-        for id in &moved {
-            list.push(*id);
+        // Detach the whole linked run from `from` and append it to `to`.
+        {
+            let source = self
+                .node_mut(from)
+                .expect("verified-live `from` has a node");
+            source.first_child = None;
+            source.last_child = None;
         }
-        for &id in &moved {
-            if let Some(node) = self.node_mut(id) {
-                node.parent = Some(to);
-            }
-        }
+        self.insert_run(to, None, first, last, &moved);
         self.record_snapshot(tracked);
         Ok(())
     }
@@ -1536,6 +1599,11 @@ impl Dom {
     ///   `node` is a doctype outside a document, or the document content
     ///   model refuses the replacement.
     /// - [`DomError::CycleForbidden`] if `node` is an ancestor of `parent`.
+    ///
+    /// # Panics
+    ///
+    /// Only on an internal invariant defect (a verified-live node missing its
+    /// slot), never on user input.
     pub fn replace_all(&mut self, parent: NodeId, node: NodeId) -> Result<(), DomError> {
         self.ensure_alive(parent, node)?;
         if !self.can_contain_children(parent) {
@@ -1553,7 +1621,7 @@ impl Dom {
         let parent_connected = self.is_connected(parent);
         let removed: Vec<NodeId> = self
             .children(parent)
-            .map(|kids| kids.copied().collect())
+            .map(Iterator::collect)
             .unwrap_or_default();
         let removed_snapshot: Vec<(NodeId, bool)> = if parent_connected {
             removed
@@ -1565,10 +1633,22 @@ impl Dom {
         };
         let added = self.incoming_nodes(node);
         self.recording_suppressed = true;
+        // Bulk-detach the whole standing child list before placing the
+        // replacement. Unlinking each child through the generic path would
+        // repeat k-constant list surgery k times; clearing the parent's
+        // endpoints and each child's links once is O(k).
+        {
+            let parent_node = self
+                .node_mut(parent)
+                .expect("verified-live parent has a node");
+            parent_node.first_child = None;
+            parent_node.last_child = None;
+        }
         for &kid in &removed {
-            self.unlink_from_current_parent(kid);
             if let Some(detached) = self.node_mut(kid) {
                 detached.parent = None;
+                detached.previous_sibling = None;
+                detached.next_sibling = None;
             }
         }
         if self.is_fragment(node) {
@@ -1827,11 +1907,21 @@ impl Dom {
             }
             self.template_contents
                 .retain(|_, contents| *contents != current);
-            let index = current.index();
-            let slot = &mut self.slots[index];
-            if let Some(node) = slot.node.take() {
-                pending.extend(node.children.iter().copied());
+            // Collect the child run through the links while the slot is still
+            // populated. Descendants are processed later, so their own links
+            // are intact when their turn comes.
+            let mut child = self.slots[current.index()]
+                .node
+                .as_ref()
+                .and_then(|node| node.first_child);
+            while let Some(id) = child {
+                pending.push(id);
+                child = self.slots[id.index()]
+                    .node
+                    .as_ref()
+                    .and_then(|node| node.next_sibling);
             }
+            self.slots[current.index()].node = None;
             // No generation tick here: emptiness is what makes the handle
             // dead (`live_slot` requires `node.is_some()`), and the single
             // tick happens at reallocation in `alloc`.
@@ -1958,7 +2048,7 @@ impl Dom {
     fn incoming_nodes(&self, node: NodeId) -> Vec<NodeId> {
         if self.is_fragment(node) {
             self.children(node)
-                .map(|kids| kids.copied().collect())
+                .map(Iterator::collect)
                 .unwrap_or_default()
         } else {
             vec![node]
@@ -1970,42 +2060,19 @@ impl Dom {
     fn place_node(&mut self, parent: NodeId, node: NodeId, before: Option<NodeId>) {
         let tracked = self.connection_snapshot(node);
         self.unlink_from_current_parent(node);
-        // Insertion index; `None` appends. The sibling references for the
-        // mutation record are computed only while recording: no observer
-        // exists on the parse path, so the lookup stays off it.
-        let position = before.map(|sibling| {
-            self.children(parent)
-                .expect("verified-live parent has no child list")
-                .position(|&entry| entry == sibling)
-                .expect("live sibling missing from its own parent's list")
-        });
+        // Sibling references for the mutation record, read from the run the
+        // node is about to join. Computed only while recording: no observer
+        // exists on the parse path, so the lookups stay off it.
         let (previous, next) = if self.record_mutations && !self.recording_suppressed {
-            let list = self
-                .children(parent)
-                .expect("verified-live parent has no child list");
-            match position {
-                None => (list.last().copied(), None),
-                Some(index) => (
-                    index
-                        .checked_sub(1)
-                        .and_then(|previous| list.clone().nth(previous))
-                        .copied(),
-                    list.clone().nth(index).copied(),
-                ),
-            }
+            let previous = match before {
+                Some(before) => self.previous_sibling(before),
+                None => self.last_child(parent),
+            };
+            (previous, before)
         } else {
             (None, None)
         };
-        let list = self
-            .children_mut(parent)
-            .expect("verified-live parent has no child list");
-        match position {
-            None => list.push(node),
-            Some(index) => list.insert(index, node),
-        }
-        if let Some(attached) = self.node_mut(node) {
-            attached.parent = Some(parent);
-        }
+        self.insert_linked(parent, node, before);
         self.record_snapshot(tracked);
         self.record(Mutation::ChildList {
             target: parent,
@@ -2016,63 +2083,148 @@ impl Dom {
         });
     }
 
+    /// Links the unparented `node` under `parent` immediately before
+    /// `before` (or as last child when `before` is `None`).
+    ///
+    /// `before`, when present, must already be a child of `parent`; `node`
+    /// must carry no parent and no sibling links. This is the single place
+    /// that writes the four link fields on insertion.
+    fn insert_linked(&mut self, parent: NodeId, node: NodeId, before: Option<NodeId>) {
+        let previous = match before {
+            Some(before) => self.previous_sibling(before),
+            None => self.last_child(parent),
+        };
+        {
+            let attached = self.node_mut(node).expect("verified-live node has no slot");
+            attached.parent = Some(parent);
+            attached.previous_sibling = previous;
+            attached.next_sibling = before;
+        }
+        match previous {
+            Some(previous) => {
+                self.node_mut(previous)
+                    .expect("linked previous sibling has no slot")
+                    .next_sibling = Some(node);
+            }
+            None => {
+                self.node_mut(parent)
+                    .expect("verified-live parent has no slot")
+                    .first_child = Some(node);
+            }
+        }
+        match before {
+            Some(before) => {
+                self.node_mut(before)
+                    .expect("linked reference child has no slot")
+                    .previous_sibling = Some(node);
+            }
+            None => {
+                self.node_mut(parent)
+                    .expect("verified-live parent has no slot")
+                    .last_child = Some(node);
+            }
+        }
+    }
+
+    /// Links the already-connected run `[first, last]` under `parent`
+    /// immediately before `before` (or at the end when `before` is `None`).
+    ///
+    /// The run's internal links are assumed intact and in order; `ids` names
+    /// every node in it so their `parent` pointers can be rewritten. This is
+    /// the O(1) link surgery behind fragment splicing and the bulk child
+    /// moves.
+    fn insert_run(
+        &mut self,
+        parent: NodeId,
+        before: Option<NodeId>,
+        first: NodeId,
+        last: NodeId,
+        ids: &[NodeId],
+    ) {
+        let previous = match before {
+            Some(before) => self.previous_sibling(before),
+            None => self.last_child(parent),
+        };
+        self.node_mut(first)
+            .expect("run head has no slot")
+            .previous_sibling = previous;
+        self.node_mut(last)
+            .expect("run tail has no slot")
+            .next_sibling = before;
+        match previous {
+            Some(previous) => {
+                self.node_mut(previous)
+                    .expect("linked previous sibling has no slot")
+                    .next_sibling = Some(first);
+            }
+            None => {
+                self.node_mut(parent)
+                    .expect("verified-live parent has no slot")
+                    .first_child = Some(first);
+            }
+        }
+        match before {
+            Some(before) => {
+                self.node_mut(before)
+                    .expect("linked reference child has no slot")
+                    .previous_sibling = Some(last);
+            }
+            None => {
+                self.node_mut(parent)
+                    .expect("verified-live parent has no slot")
+                    .last_child = Some(last);
+            }
+        }
+        for &id in ids {
+            self.node_mut(id)
+                .expect("moved run node has no slot")
+                .parent = Some(parent);
+        }
+    }
+
     /// Insert a fragment by moving its children under `parent`, leaving the
     /// fragment empty and unparented
     /// (<https://dom.spec.whatwg.org/#concept-node-insert>).
     fn splice_fragment(&mut self, parent: NodeId, fragment: NodeId, before: Option<NodeId>) {
-        let tracked: Vec<(NodeId, bool)> = self
+        let moved: Vec<NodeId> = self
             .children(fragment)
-            .map(|children| children.copied().collect::<Vec<_>>())
-            .unwrap_or_default()
+            .map(Iterator::collect)
+            .unwrap_or_default();
+        let tracked: Vec<(NodeId, bool)> = moved
             .iter()
             .flat_map(|&id| self.connection_snapshot(id))
             .collect();
         self.unlink_from_current_parent(fragment);
-        if let Some(node) = self.node_mut(fragment) {
-            node.parent = None;
-        }
-        let moved = self
-            .children_mut(fragment)
-            .map(std::mem::take)
-            .expect("verified-live fragment has no child list");
-        if !moved.is_empty() {
-            self.record(Mutation::ChildList {
-                target: fragment,
-                added: Vec::new(),
-                removed: moved.clone(),
-                previous: None,
-                next: None,
-            });
-        }
         if moved.is_empty() {
             return;
         }
-        let list = self
-            .children_mut(parent)
-            .expect("verified-live parent has no child list");
-        let position = match before {
-            None => list.len(),
-            Some(sibling) => list
-                .iter()
-                .position(|&entry| entry == sibling)
-                .expect("live sibling missing from its own parent's list"),
-        };
-        let (previous, next) = match before {
-            None => (list.last().copied(), None),
-            Some(sibling) => (
-                position
-                    .checked_sub(1)
-                    .and_then(|index| list.get(index))
-                    .copied(),
-                Some(sibling),
-            ),
-        };
-        list.splice(position..position, moved.iter().copied());
-        for id in &moved {
-            if let Some(node) = self.node_mut(*id) {
-                node.parent = Some(parent);
-            }
+        self.record(Mutation::ChildList {
+            target: fragment,
+            added: Vec::new(),
+            removed: moved.clone(),
+            previous: None,
+            next: None,
+        });
+        let first = moved[0];
+        let last = *moved.last().expect("non-empty run has a tail");
+        // Detach the run from the fragment; the run keeps its internal links.
+        {
+            let emptied = self
+                .node_mut(fragment)
+                .expect("verified-live fragment has no slot");
+            emptied.first_child = None;
+            emptied.last_child = None;
         }
+        let (previous, next) = if self.record_mutations && !self.recording_suppressed {
+            let previous = match before {
+                Some(before) => self.previous_sibling(before),
+                None => self.last_child(parent),
+            };
+            (previous, before)
+        } else {
+            (None, None)
+        };
+        self.insert_run(parent, before, first, last, &moved);
         self.record_snapshot(tracked);
         self.record(Mutation::ChildList {
             target: parent,
@@ -2081,10 +2233,6 @@ impl Dom {
             previous,
             next,
         });
-    }
-
-    fn children_mut(&mut self, id: NodeId) -> Option<&mut Vec<NodeId>> {
-        self.node_mut(id).map(|node| &mut node.children)
     }
 
     fn ensure_alive(&self, a: NodeId, b: NodeId) -> Result<(), DomError> {
@@ -2131,7 +2279,8 @@ impl Dom {
     /// algorithm's adopt step, whose removal is observable even though the
     /// rest of the replacement suppresses observers
     /// (<https://dom.spec.whatwg.org/#concept-node-adopt>). The caller has
-    /// verified `id` live; a missing list entry is arena corruption.
+    /// verified `id` live; a missing parent is a silent no-op (the node is
+    /// already detached).
     fn record_unlink(&mut self, id: NodeId) {
         if !self.record_mutations || self.recording_suppressed {
             return;
@@ -2139,55 +2288,71 @@ impl Dom {
         let Some(parent) = self.parent(id) else {
             return;
         };
-        let mut previous = None;
-        let mut next = None;
-        let mut found = false;
-        for &entry in self
-            .children(parent)
-            .expect("live parent has no child list")
-        {
-            if entry == id {
-                found = true;
-            } else if found {
-                next = Some(entry);
-                break;
-            } else {
-                previous = Some(entry);
-            }
-        }
-        assert!(
-            found,
-            "child missing from the very list its parent pointer names"
-        );
         self.record(Mutation::ChildList {
             target: parent,
             added: Vec::new(),
             removed: vec![id],
-            previous,
-            next,
+            previous: self.previous_sibling(id),
+            next: self.next_sibling(id),
         });
     }
 
-    /// Removes `id` from whichever list currently holds it.
+    /// Removes `id` from whichever parent currently holds it.
+    fn unlink_from_current_parent(&mut self, id: NodeId) {
+        if self.parent(id).is_none() {
+            return;
+        }
+        self.record_unlink(id);
+        self.unlink(id);
+    }
+
+    /// Splices `id` out of its parent's child run and clears its parent and
+    /// sibling links. A no-op when `id` is unparented.
     ///
     /// Defect policy, like every other structural site in this module: `id`
-    /// was verified live, so a `Some` parent must own a list and that list
-    /// must name `id`. Parent-pointer/child-list divergence is arena
+    /// was verified live, so a `Some` parent must name it and the link
+    /// fields must agree. Parent-pointer/sibling-link divergence is arena
     /// corruption; panicking beats silently producing a node with two
     /// parents (or none), which later mutations would compound.
-    fn unlink_from_current_parent(&mut self, id: NodeId) {
-        if let Some(old_parent) = self.parent(id) {
-            let position = self
-                .children(old_parent)
-                .expect("live parent has no child list")
-                .position(|&entry| entry == id)
-                .expect("child missing from the very list its parent pointer names");
-            self.record_unlink(id);
-            let list = self
-                .children_mut(old_parent)
-                .expect("live parent has no child list");
-            list.remove(position);
+    fn unlink(&mut self, id: NodeId) {
+        let Some((parent, previous, next)) = self.node_mut(id).and_then(|node| {
+            node.parent
+                .map(|parent| (parent, node.previous_sibling, node.next_sibling))
+        }) else {
+            return;
+        };
+        if let Some(previous) = previous {
+            self.node_mut(previous)
+                .expect("previous sibling has no slot")
+                .next_sibling = next;
+        } else {
+            let first = self
+                .node_mut(parent)
+                .expect("live parent has no slot")
+                .first_child;
+            assert_eq!(first, Some(id), "parent's head is not the unlinked node");
+            self.node_mut(parent)
+                .expect("live parent has no slot")
+                .first_child = next;
         }
+        if let Some(next) = next {
+            self.node_mut(next)
+                .expect("next sibling has no slot")
+                .previous_sibling = previous;
+        } else {
+            let last = self
+                .node_mut(parent)
+                .expect("live parent has no slot")
+                .last_child;
+            assert_eq!(last, Some(id), "parent's tail is not the unlinked node");
+            self.node_mut(parent)
+                .expect("live parent has no slot")
+                .last_child = previous;
+        }
+        let detached = self.node_mut(id).expect("live node has no slot");
+        detached.parent = None;
+        detached.previous_sibling = None;
+        detached.next_sibling = None;
     }
 
     fn set_data(
@@ -2220,7 +2385,10 @@ impl Dom {
     fn alloc(&mut self, kind: NodeKind) -> NodeId {
         let node = Node {
             parent: None,
-            children: Vec::new(),
+            first_child: None,
+            last_child: None,
+            previous_sibling: None,
+            next_sibling: None,
             kind,
         };
         if let Some(slot) = self.free.pop() {

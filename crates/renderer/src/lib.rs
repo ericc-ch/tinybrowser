@@ -266,14 +266,13 @@ impl Sink {
         let neighbor = match before {
             None => dom
                 .children(parent)
-                .and_then(|mut kids| kids.next_back().copied()),
+                .and_then(|mut kids| kids.next_back()),
             Some(sibling) => dom
                 .children(parent)
-                .and_then(|mut kids| kids.position(|&kid| kid == sibling))
+                .and_then(|mut kids| kids.position(|kid| kid == sibling))
                 .and_then(|position| {
                     dom.children(parent)
                         .and_then(|mut kids| kids.nth(position.checked_sub(1)?))
-                        .copied()
                 }),
         };
         if let Some(handle) = neighbor
@@ -555,13 +554,13 @@ fn html_list_of_options(dom: &dom::Dom, select: Handle) -> Vec<Handle> {
     let Some(kids) = dom.children(select) else {
         return out;
     };
-    for kid in kids.copied() {
+    for kid in kids {
         if is_html_named(dom, kid, "option") {
             out.push(kid);
         } else if is_html_named(dom, kid, "optgroup")
             && let Some(grouped) = dom.children(kid)
         {
-            for inner in grouped.copied() {
+            for inner in grouped {
                 if is_html_named(dom, inner, "option") {
                     out.push(inner);
                 }
@@ -604,7 +603,7 @@ fn enabled_selectedcontent(dom: &dom::Dom, select: Handle) -> Option<Handle> {
     if html_bool_attr(dom, select, "multiple") {
         return None;
     }
-    let mut pending: Vec<_> = dom.children(select)?.rev().copied().collect();
+    let mut pending: Vec<_> = dom.children(select)?.rev().collect();
     while let Some(id) = pending.pop() {
         if is_html_named(dom, id, "selectedcontent") {
             // https://html.spec.whatwg.org/multipage/form-elements.html#the-selectedcontent-element
@@ -620,7 +619,7 @@ fn enabled_selectedcontent(dom: &dom::Dom, select: Handle) -> Option<Handle> {
             return Some(id);
         }
         if let Some(kids) = dom.children(id) {
-            pending.extend(kids.rev().copied());
+            pending.extend(kids.rev());
         }
     }
     None
@@ -630,7 +629,7 @@ fn enabled_selectedcontent(dom: &dom::Dom, select: Handle) -> Option<Handle> {
 fn clone_option_into_selectedcontent(dom: &mut dom::Dom, option: Handle, selectedcontent: Handle) {
     let stale: Vec<Handle> = dom
         .children(selectedcontent)
-        .map(|children| children.copied().collect())
+        .map(Iterator::collect)
         .unwrap_or_default();
     for child in stale {
         dom.destroy(child)
@@ -638,7 +637,7 @@ fn clone_option_into_selectedcontent(dom: &mut dom::Dom, option: Handle, selecte
     }
     let kids: Vec<Handle> = dom
         .children(option)
-        .map(|children| children.copied().collect())
+        .map(Iterator::collect)
         .unwrap_or_default();
     for kid in kids {
         let cloned = dom

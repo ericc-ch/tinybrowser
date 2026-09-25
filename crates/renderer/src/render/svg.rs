@@ -184,7 +184,7 @@ fn paint_children(
     let Some(children) = dom.children(parent) else {
         return;
     };
-    for child in children.clone().copied() {
+    for child in children {
         let Some(dom::NodeKind::Element { name, .. }) = dom.kind(child) else {
             continue;
         };

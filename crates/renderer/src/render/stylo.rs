@@ -325,7 +325,7 @@ fn run_traversal(
         // filter keys off it.
         let mut queue: VecDeque<(StyloElement<'_>, usize)> = VecDeque::new();
         if let Some(kids) = dom.children(document) {
-            for &kid in kids {
+            for kid in kids {
                 if let Some(element) =
                     node_at(node_refs, tables, Some(kid)).filter(NodeInfo::is_element)
                 {
@@ -379,9 +379,8 @@ fn root_computed(
 /// The document's root element (`<html>` in practice).
 fn root_element(dom: &Dom) -> Option<NodeId> {
     let document = dom.document();
-    dom.children(document)?.find_map(|&kid| {
-        matches!(dom.kind(kid), Some(dom::NodeKind::Element { .. })).then_some(kid)
-    })
+    dom.children(document)?
+        .find(|&kid| matches!(dom.kind(kid), Some(dom::NodeKind::Element { .. })))
 }
 
 /// Our single-threaded traversal: [`recalc_style_at`] per element, children

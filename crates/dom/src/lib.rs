@@ -29,7 +29,7 @@ pub use state::{
     is_required, lang_matches, local_is,
 };
 
-pub use arena::{Dom, DomError, Lifecycle, Mutation, QuirksMode};
+pub use arena::{Children, Dom, DomError, Lifecycle, Mutation, QuirksMode};
 pub use id::NodeId;
 pub use node::{
     Attribute, LocalName, Namespace, NodeKind, Prefix, QualName, html_namespace,

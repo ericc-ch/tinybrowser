@@ -44,7 +44,7 @@ use selectors::{
     },
 };
 
-use crate::arena::{Dom, QuirksMode};
+use crate::arena::{Children, Dom, QuirksMode};
 use crate::id::NodeId;
 use crate::node::{Attribute, NodeKind};
 use crate::state;
@@ -713,43 +713,36 @@ impl Element for DomElement<'_> {
     }
 
     fn prev_sibling_element(&self) -> Option<Self> {
-        let parent = self.dom.parent(self.id)?;
-        let kids = self.dom.children(parent)?;
-        let mut last = None;
-        for &kid in kids {
-            if kid == self.id {
-                return last.map(|id| Self { dom: self.dom, id });
+        let mut cursor = self.dom.previous_sibling(self.id);
+        while let Some(id) = cursor {
+            if DomElement::new(self.dom, id).is_some() {
+                return Some(Self { dom: self.dom, id });
             }
-            if DomElement::new(self.dom, kid).is_some() {
-                last = Some(kid);
-            }
+            cursor = self.dom.previous_sibling(id);
         }
         None
     }
 
     fn next_sibling_element(&self) -> Option<Self> {
-        let parent = self.dom.parent(self.id)?;
-        let kids = self.dom.children(parent)?;
-        let mut passed_self = false;
-        for &kid in kids {
-            if kid == self.id {
-                passed_self = true;
-            } else if passed_self && DomElement::new(self.dom, kid).is_some() {
-                return Some(Self {
-                    dom: self.dom,
-                    id: kid,
-                });
+        let mut cursor = self.dom.next_sibling(self.id);
+        while let Some(id) = cursor {
+            if DomElement::new(self.dom, id).is_some() {
+                return Some(Self { dom: self.dom, id });
             }
+            cursor = self.dom.next_sibling(id);
         }
         None
     }
 
     fn first_element_child(&self) -> Option<Self> {
-        let mut kids = self.dom.children(self.id)?;
-        let id = kids
-            .find(|&&kid| DomElement::new(self.dom, kid).is_some())
-            .copied()?;
-        Some(Self { dom: self.dom, id })
+        let mut cursor = self.dom.first_child(self.id);
+        while let Some(id) = cursor {
+            if DomElement::new(self.dom, id).is_some() {
+                return Some(Self { dom: self.dom, id });
+            }
+            cursor = self.dom.next_sibling(id);
+        }
+        None
     }
 
     fn is_html_element_in_html_document(&self) -> bool {
@@ -896,12 +889,12 @@ impl Element for DomElement<'_> {
 
     /// `:empty` ignores comments and doctypes; empty text counts as nothing.
     fn is_empty(&self) -> bool {
-        let Some(mut kids) = self.dom.children(self.id) else {
+        let Some(kids) = self.dom.children(self.id) else {
             unreachable!(
                 "selector matching walks live nodes; children() is None only for stale handles"
             );
         };
-        kids.all(|&kid| match self.dom.kind(kid) {
+        kids.into_iter().all(|kid| match self.dom.kind(kid) {
             Some(NodeKind::Text { data }) => data.is_empty(),
             Some(NodeKind::Element { .. }) => false,
             _ => true,
@@ -928,7 +921,7 @@ impl Element for DomElement<'_> {
 /// child-list cursors), so tree depth costs nothing but bookkeeping.
 struct Descendants<'a> {
     dom: &'a Dom,
-    stack: Vec<std::slice::Iter<'a, NodeId>>,
+    stack: Vec<Children<'a>>,
 }
 
 impl<'a> Descendants<'a> {
@@ -946,7 +939,7 @@ impl Iterator for Descendants<'_> {
     fn next(&mut self) -> Option<NodeId> {
         while let Some(top) = self.stack.last_mut() {
             match top.next() {
-                Some(&id) => {
+                Some(id) => {
                     if let Some(kids) = self.dom.children(id) {
                         self.stack.push(kids);
                     }

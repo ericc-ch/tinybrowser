@@ -124,11 +124,36 @@ fn assert_matches(dom: &Dom, document: NodeId, handles: &[NodeId], model: &Model
         assert_eq!(
             dom.children(handle)
                 .expect("live elements have children")
-                .copied()
                 .collect::<Vec<_>>(),
             expected_children,
             "children {index}"
         );
+        // The intrusive links must agree with the child run the model keeps:
+        // heads and tails, then every neighbour pair in both directions.
+        assert_eq!(
+            dom.first_child(handle),
+            expected_children.first().copied(),
+            "first child {index}"
+        );
+        assert_eq!(
+            dom.last_child(handle),
+            expected_children.last().copied(),
+            "last child {index}"
+        );
+        for (position, &child) in expected_children.iter().enumerate() {
+            assert_eq!(
+                dom.previous_sibling(child),
+                position
+                    .checked_sub(1)
+                    .map(|previous| expected_children[previous]),
+                "previous sibling {index}/{position}"
+            );
+            assert_eq!(
+                dom.next_sibling(child),
+                expected_children.get(position + 1).copied(),
+                "next sibling {index}/{position}"
+            );
+        }
     }
 }
 
@@ -245,7 +270,6 @@ fn document_fragments_templates_and_clones_keep_their_contracts() {
     assert_eq!(
         dom.children(html)
             .expect("html children")
-            .copied()
             .collect::<Vec<_>>(),
         vec![first, second]
     );
@@ -339,4 +363,49 @@ fn img_connection_transitions_record_lifecycle_events() {
 
     dom.detach(img).expect("detach");
     assert_eq!(dom.take_lifecycle(), vec![Lifecycle::Removed(img)]);
+}
+
+#[test]
+fn child_iteration_covers_each_child_once_across_both_directions() {
+    let mut dom = Dom::new();
+    let document = dom.document();
+    let root = dom.create_element(qn("root"), Vec::new());
+    dom.append(document, root).expect("root");
+
+    let mut kids = Vec::new();
+    for _ in 0..5 {
+        let kid = dom.create_element(qn("node"), Vec::new());
+        dom.append(root, kid).expect("child");
+        kids.push(kid);
+    }
+
+    // Alternating ends must yield every child exactly once: the two cursors
+    // retire together when they meet, so neither can repeat the other's node.
+    let mut iter = dom.children(root).expect("root children");
+    let mut front = true;
+    let mut seen = Vec::new();
+    while let Some(id) = if front { iter.next() } else { iter.next_back() } {
+        seen.push(id);
+        front = !front;
+    }
+    assert_eq!(seen.len(), kids.len());
+    for kid in &kids {
+        assert!(seen.contains(kid), "child yielded at most once");
+    }
+
+    // A lone child is yielded once, not once per direction.
+    let only = dom.create_element(qn("only"), Vec::new());
+    dom.append(root, only).expect("only container");
+    let text = dom.create_text("x");
+    dom.append(only, text).expect("only child");
+    let mut iter = dom.children(only).expect("only children");
+    assert_eq!(iter.next(), Some(text));
+    assert_eq!(iter.next_back(), None);
+
+    // An empty run yields nothing from either end.
+    let empty = dom.create_element(qn("empty"), Vec::new());
+    dom.append(root, empty).expect("empty container");
+    let mut iter = dom.children(empty).expect("empty children");
+    assert_eq!(iter.next(), None);
+    assert_eq!(iter.next_back(), None);
 }

@@ -78,8 +78,8 @@ fn propagate_canvas_background(
         root
     } else {
         dom.children(root)
-            .and_then(|children| {
-                children.clone().copied().find(|child| {
+            .and_then(|mut children| {
+                children.find(|child| {
                     matches!(
                         dom.kind(*child),
                         Some(dom::NodeKind::Element { name, .. })

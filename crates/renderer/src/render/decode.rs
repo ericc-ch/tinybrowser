@@ -121,7 +121,6 @@ fn decode_svg(bytes: &[u8]) -> Option<RasterImage> {
     let root = parsed
         .dom
         .children(parsed.dom.document())?
-        .copied()
         .find(|node| svg::is_outer_svg(&parsed.dom, *node))?;
     svg::rasterize(&parsed.dom, root)
 }
