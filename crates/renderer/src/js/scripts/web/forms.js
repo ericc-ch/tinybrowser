@@ -391,4 +391,127 @@
       },
     });
   }
+
+  // ── submit events and submission ───────────────────────────────────────
+
+  const SUBMITTER = Symbol('tb-submit-submitter');
+  const FORMDATA = Symbol('tb-formdata-event-data');
+
+  // <https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#submitevent>
+  function SubmitEvent(type) {
+    if (new.target === undefined) {
+      throw new TypeError('Class constructor SubmitEvent cannot be invoked without new');
+    }
+    const init = arguments[1];
+    const event = Reflect.construct(globalThis.Event, arguments, new.target);
+    event[SUBMITTER] =
+      (init === undefined || init === null || init.submitter === undefined) ? null : init.submitter;
+    return event;
+  }
+  const submitProto = Object.create(globalThis.Event.prototype);
+  Object.defineProperty(submitProto, 'constructor', {
+    value: SubmitEvent, writable: true, configurable: true,
+  });
+  Object.defineProperty(submitProto, 'submitter', {
+    get() { return this[SUBMITTER]; }, enumerable: true, configurable: true,
+  });
+  Object.defineProperty(submitProto, Symbol.toStringTag, {
+    value: 'SubmitEvent', writable: false, enumerable: false, configurable: true,
+  });
+  Object.defineProperty(SubmitEvent, 'prototype', { value: submitProto, writable: false });
+  Object.defineProperty(globalThis, 'SubmitEvent', {
+    value: SubmitEvent, writable: true, configurable: true,
+  });
+
+  // <https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#formdataevent>
+  function FormDataEvent(type) {
+    if (new.target === undefined) {
+      throw new TypeError('Class constructor FormDataEvent cannot be invoked without new');
+    }
+    const init = arguments[1];
+    if (init === undefined || init === null || init.formData === undefined) {
+      throw new TypeError('FormDataEventInit requires formData');
+    }
+    const event = Reflect.construct(globalThis.Event, arguments, new.target);
+    event[FORMDATA] = init.formData;
+    return event;
+  }
+  const formDataProto = Object.create(globalThis.Event.prototype);
+  Object.defineProperty(formDataProto, 'constructor', {
+    value: FormDataEvent, writable: true, configurable: true,
+  });
+  Object.defineProperty(formDataProto, 'formData', {
+    get() { return this[FORMDATA]; }, enumerable: true, configurable: true,
+  });
+  Object.defineProperty(formDataProto, Symbol.toStringTag, {
+    value: 'FormDataEvent', writable: false, enumerable: false, configurable: true,
+  });
+  Object.defineProperty(FormDataEvent, 'prototype', { value: formDataProto, writable: false });
+  Object.defineProperty(globalThis, 'FormDataEvent', {
+    value: FormDataEvent, writable: true, configurable: true,
+  });
+
+  // application/x-www-form-urlencoded: LF is normalized to CRLF and a space
+  // becomes `+` (<https://url.spec.whatwg.org/#concept-urlencoded-serializer>).
+  const urlEncodePart = value =>
+    encodeURIComponent(value.replace(/\r\n|\r|\n/g, '\r\n')).replace(/%20/g, '+');
+  const urlEncode = formData => {
+    const parts = [];
+    for (const entry of formData) {
+      parts.push(`${urlEncodePart(String(entry[0]))}=${urlEncodePart(String(entry[1]))}`);
+    }
+    return parts.join('&');
+  };
+
+  const submitForm = (form, formData) => {
+    const method = form.method;
+    if (method === 'dialog') return;
+    let action = form.action;
+    if (method === 'get') {
+      const encoded = urlEncode(formData);
+      if (encoded !== '') {
+        const hash = action.indexOf('#');
+        const base = hash === -1 ? action : action.slice(0, hash);
+        const query = base.indexOf('?');
+        action = (query === -1 ? base : base.slice(0, query)) + '?' + encoded;
+      }
+    }
+    // POST needs the request-body protocol; submit as GET until it lands
+    // (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#submit-mutate-action>).
+    globalThis.__tbFormNavigate(action, form.target);
+  };
+
+  // <https://html.spec.whatwg.org/multipage/forms.html#dom-form-submit>
+  Object.defineProperty(globalThis.HTMLFormElement.prototype, 'submit', {
+    value: function() {
+      submitForm(this, new globalThis.FormData(this));
+    },
+    writable: true,
+    enumerable: true,
+    configurable: true,
+  });
+
+  // <https://html.spec.whatwg.org/multipage/forms.html#dom-form-requestsubmit>
+  Object.defineProperty(globalThis.HTMLFormElement.prototype, 'requestSubmit', {
+    value: function(submitter) {
+      if (submitter !== undefined && submitter !== null) {
+        const tag = submitter.tagName;
+        if (tag !== 'BUTTON' && !(tag === 'INPUT' && submitter.type === 'submit')) {
+          throw new TypeError('submitter must be a submit button');
+        }
+      }
+      const formData = new globalThis.FormData(this);
+      const event = new SubmitEvent('submit', {
+        submitter: submitter === undefined ? null : submitter,
+        bubbles: true,
+        cancelable: true,
+      });
+      if (!this.dispatchEvent(event)) return;
+      this.dispatchEvent(new FormDataEvent('formdata', { formData: formData }));
+      submitForm(this, formData);
+    },
+    writable: true,
+    enumerable: true,
+    configurable: true,
+  });
 })();

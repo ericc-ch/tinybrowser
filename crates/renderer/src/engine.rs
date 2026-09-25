@@ -84,7 +84,7 @@ fn strip_cdata(css: &str) -> &str {
         .unwrap_or(css)
 }
 use crate::documents::DocumentStore;
-use crate::js::{DocumentStreamCommand, FrameNavigation, RealmRegistry, SharedJsRuntime};
+use crate::js::{DocumentStreamCommand, FrameNavigation, NavigationTarget, RealmRegistry, SharedJsRuntime};
 use crate::messaging::{Delivery, MAX_FRAMES, SharedHandle};
 use crate::protocol::{BrowserServices, FrameId, Mount, RendererEvent, TabError};
 use crate::storage::PendingStorageEvent;
@@ -497,7 +497,12 @@ impl Engine {
                         .into_iter()
                         .map(|event| (frame, event)),
                 );
-                navigations.extend(document.take_frame_navigations());
+                navigations.extend(
+                    document
+                        .take_frame_navigations()
+                        .into_iter()
+                        .map(|navigation| (frame, navigation)),
+                );
                 let commands = document.take_document_stream();
                 if !commands.is_empty() {
                     streams.push((frame, commands));
@@ -751,19 +756,33 @@ impl Engine {
         }
     }
 
-    fn apply_navigations(&mut self, navigations: Vec<FrameNavigation>) {
-        for FrameNavigation { container, spec } in navigations {
-            let Some(child) = self
-                .runtime
-                .shared
-                .borrow()
-                .tree
-                .frame_for_container(container)
-            else {
-                continue;
-            };
-            self.navigate_frame(child, container, &spec);
-            self.publish_frame_document(container, child);
+    fn apply_navigations(&mut self, navigations: Vec<(FrameId, FrameNavigation)>) {
+        for (frame, FrameNavigation { target, spec }) in navigations {
+            match target {
+                NavigationTarget::Container(container) => {
+                    let Some(child) = self
+                        .runtime
+                        .shared
+                        .borrow()
+                        .tree
+                        .frame_for_container(container)
+                    else {
+                        continue;
+                    };
+                    self.navigate_frame(child, container, &spec);
+                    self.publish_frame_document(container, child);
+                }
+                NavigationTarget::SelfFrame => {
+                    let Some(document) = self.frames.get_mut(&frame) else {
+                        continue;
+                    };
+                    let Ok(url) = Url::parse(&spec) else {
+                        continue;
+                    };
+                    let initiator = Url::parse(document.document_url()).unwrap_or_else(|_| url.clone());
+                    document.navigate_to(url, initiator);
+                }
+            }
         }
     }
 

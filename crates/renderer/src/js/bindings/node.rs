@@ -1200,6 +1200,83 @@ impl JsNode {
         Ok(())
     }
 
+    // https://html.spec.whatwg.org/multipage/forms.html#dom-form-action
+    #[qjs(get, rename = "action")]
+    fn action(&self, ctx: Ctx<'_>) -> Result<String> {
+        let world_rc = world(&ctx)?;
+        let raw = world_rc
+            .borrow()
+            .document(self.handle.0)
+            .and_then(|parsed| parsed.dom.attribute(self.handle.0, "action"));
+        let base = document_base_url_string(&ctx, self.handle.0);
+        let Some(raw) = raw else {
+            return Ok(base);
+        };
+        Ok(url::Url::parse(&base)
+            .ok()
+            .and_then(|base| base.join(&raw).ok())
+            .map_or(raw, |url| url.to_string()))
+    }
+
+    #[qjs(set, rename = "action")]
+    fn set_action(&self, ctx: Ctx<'_>, value: WebIdlString) -> Result<()> {
+        self.set_attribute(ctx, WebIdlString("action".into()), value)
+    }
+
+    // https://html.spec.whatwg.org/multipage/forms.html#dom-form-method
+    #[qjs(get, rename = "method")]
+    fn method(&self, ctx: Ctx<'_>) -> Result<String> {
+        let raw = attribute_value(&ctx, self.handle.0, "method")?;
+        Ok(match raw.trim().to_ascii_lowercase().as_str() {
+            "post" => "post",
+            "dialog" => "dialog",
+            _ => "get",
+        }
+        .to_owned())
+    }
+
+    #[qjs(set, rename = "method")]
+    fn set_method(&self, ctx: Ctx<'_>, value: WebIdlString) -> Result<()> {
+        self.set_attribute(ctx, WebIdlString("method".into()), value)
+    }
+
+    // https://html.spec.whatwg.org/multipage/forms.html#dom-form-enctype
+    #[qjs(get, rename = "enctype")]
+    fn enctype(&self, ctx: Ctx<'_>) -> Result<String> {
+        Ok(encoding_keyword(&attribute_value(&ctx, self.handle.0, "enctype")?).to_owned())
+    }
+
+    #[qjs(set, rename = "enctype")]
+    fn set_enctype(&self, ctx: Ctx<'_>, value: WebIdlString) -> Result<()> {
+        self.set_attribute(ctx, WebIdlString("enctype".into()), value)
+    }
+
+    #[qjs(get, rename = "encoding")]
+    fn encoding(&self, ctx: Ctx<'_>) -> Result<String> {
+        Ok(encoding_keyword(&attribute_value(&ctx, self.handle.0, "enctype")?).to_owned())
+    }
+
+    #[qjs(set, rename = "encoding")]
+    fn set_encoding(&self, ctx: Ctx<'_>, value: WebIdlString) -> Result<()> {
+        self.set_attribute(ctx, WebIdlString("enctype".into()), value)
+    }
+
+    #[qjs(set, rename = "target")]
+    fn set_target(&self, ctx: Ctx<'_>, value: WebIdlString) -> Result<()> {
+        self.set_attribute(ctx, WebIdlString("target".into()), value)
+    }
+
+    // https://html.spec.whatwg.org/multipage/forms.html#dom-form-novalidate
+    #[qjs(get, rename = "noValidate")]
+    fn no_validate(&self, ctx: Ctx<'_>) -> Result<bool> {
+        self.attribute_present(&ctx, "novalidate")
+    }
+
+    #[qjs(set, rename = "noValidate")]
+    fn set_no_validate(&self, ctx: Ctx<'_>, value: bool) -> Result<()> {
+        self.reflect_boolean(ctx, "novalidate", value)
+    }
+
     // https://drafts.csswg.org/cssom-view/#dom-element-scrollleft
     #[qjs(get, rename = "scrollLeft")]
     fn scroll_left(&self, ctx: Ctx<'_>) -> Result<f64> {
@@ -2380,12 +2457,19 @@ impl JsNode {
     }
 
     // https://dom.spec.whatwg.org/#dom-processinginstruction-target
+    // https://html.spec.whatwg.org/multipage/forms.html#dom-form-target
+    // One shared wrapper carries both: a processing instruction answers with
+    // its target, any other element with its reflected `target` attribute.
     #[qjs(get)]
     fn target(&self, ctx: Ctx<'_>) -> Result<String> {
-        with_node_kind(&ctx, self.handle.0, |kind| match kind {
-            Some(NodeKind::ProcessingInstruction { target, .. }) => target.clone(),
-            _ => String::new(),
-        })
+        let processing_instruction = with_node_kind(&ctx, self.handle.0, |kind| match kind {
+            Some(NodeKind::ProcessingInstruction { target, .. }) => Some(target.clone()),
+            _ => None,
+        })?;
+        match processing_instruction {
+            Some(target) => Ok(target),
+            None => Ok(attribute_value(&ctx, self.handle.0, "target")?),
+        }
     }
 
     // https://dom.spec.whatwg.org/#dom-element-localname
@@ -3300,5 +3384,17 @@ fn direction_code(direction: &str) -> u8 {
         "forward" => 1,
         "backward" => 2,
         _ => 0,
+    }
+}
+
+/// The form `enctype` keyword for a raw attribute value: the three known
+/// keywords, case-insensitively, with the urlencoded default for a missing or
+/// invalid value
+/// (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#attr-fs-enctype>).
+fn encoding_keyword(raw: &str) -> &'static str {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "multipart/form-data" => "multipart/form-data",
+        "text/plain" => "text/plain",
+        _ => "application/x-www-form-urlencoded",
     }
 }

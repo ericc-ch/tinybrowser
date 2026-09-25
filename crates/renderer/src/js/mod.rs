@@ -11,7 +11,7 @@ mod modules;
 mod url_parts;
 mod world;
 
-pub(crate) use world::{DocumentStreamCommand, FrameNavigation, RealmRegistry};
+pub(crate) use world::{DocumentStreamCommand, FrameNavigation, NavigationTarget, RealmRegistry};
 
 use std::cell::{Cell, OnceCell, RefCell};
 use std::fmt;

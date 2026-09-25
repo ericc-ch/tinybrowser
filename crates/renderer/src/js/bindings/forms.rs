@@ -6,8 +6,24 @@
 //! flat `[name, value, ...]` array.
 
 use super::{host_node_id, is_html_element, with_node_kind, world};
+use crate::js::{FrameNavigation, World};
 use dom::{NodeId, NodeKind, html_namespace};
-use rquickjs::{Ctx, Result, Value};
+use rquickjs::{Ctx, Object, Result, Value};
+use std::cell::RefCell;
+use std::rc::Rc;
+
+/// Host functions the `FormData` and form-submission shims call.
+pub(super) fn install(_ctx: &Ctx<'_>, globals: &Object<'_>) -> Result<()> {
+    globals.set(
+        "__tbFormEntries",
+        rquickjs::prelude::Func::from(form_entries),
+    )?;
+    globals.set(
+        "__tbFormNavigate",
+        rquickjs::prelude::Func::from(form_navigate),
+    )?;
+    Ok(())
+}
 
 /// The form's entry list as `[name, value, ...]`, in tree order.
 #[allow(
@@ -106,8 +122,7 @@ pub(super) fn form_entries<'js>(ctx: Ctx<'js>, form: Value<'js>) -> Result<Vec<S
     Ok(entries)
 }
 
-/// Whether a `textarea`'s `wrap` attribute is in the Hard state
-/// (<https://html.spec.whatwg.org/multipage/form-elements.html#attr-textarea-wrap>):
+/// Whether a `textarea`'s `wrap` attribute is in the Hard state/// (<https://html.spec.whatwg.org/multipage/form-elements.html#attr-textarea-wrap>):
 /// an enumerated attribute, ASCII case-insensitive.
 fn wrap_is_hard(wrap: Option<&str>) -> bool {
     wrap.is_some_and(|wrap| wrap.trim().eq_ignore_ascii_case("hard"))
@@ -146,4 +161,58 @@ fn hard_wrap(value: &str, cols: usize) -> String {
         }
     }
     out
+}
+
+/// Queues a form-submission navigation to `url`. A `target` naming an `iframe`
+/// lands in that frame; `_self`, `_top`, `_parent`, `_blank`, and the empty
+/// target all land in the submitting frame (a new tab for `_blank` is not
+/// modelled yet)
+/// (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#form-submission-algorithm>).
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "rquickjs Func ABI passes arguments by value"
+)]
+pub(super) fn form_navigate(ctx: Ctx<'_>, url: String, target: String) -> Result<()> {
+    let world_rc = world(&ctx)?;
+    let container = if target.is_empty() || target.starts_with('_') {
+        None
+    } else {
+        find_named_frame(&world_rc, &target)
+    };
+    let navigation = match container {
+        Some(container) => FrameNavigation {
+            target: crate::js::NavigationTarget::Container(container),
+            spec: url,
+        },
+        None => FrameNavigation {
+            target: crate::js::NavigationTarget::SelfFrame,
+            spec: url,
+        },
+    };
+    world_rc.borrow_mut().queue_frame_navigation(navigation);
+    Ok(())
+}
+
+/// The first `iframe` in the main document whose `name` matches, for a form
+/// `target` that is a browsing-context name.
+fn find_named_frame(world: &Rc<RefCell<World>>, name: &str) -> Option<NodeId> {
+    let world = world.borrow();
+    let parsed = world.main_document()?;
+    let mut stack = vec![parsed.dom.document()];
+    while let Some(node) = stack.pop() {
+        if let Some(NodeKind::Element { name: element, .. }) = parsed.dom.kind(node)
+            && element.ns == html_namespace()
+            && element.local.as_ref() == "iframe"
+            && parsed.dom.attribute(node, "name").as_deref() == Some(name)
+        {
+            return Some(node);
+        }
+        let children: Vec<NodeId> = parsed
+            .dom
+            .children(node)
+            .map(Iterator::collect)
+            .unwrap_or_default();
+        stack.extend(children);
+    }
+    None
 }

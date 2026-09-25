@@ -165,7 +165,7 @@
   const interfaceMembers = {
     HTMLIFrameElement: ['contentDocument', 'contentWindow'],
     HTMLImageElement: ['naturalWidth', 'naturalHeight', 'complete', 'currentSrc'],
-    HTMLFormElement: ['reset'],
+    HTMLFormElement: ['reset', 'action', 'method', 'enctype', 'encoding', 'target', 'noValidate'],
     HTMLInputElement: ['value', 'defaultValue', 'disabled', 'readOnly', 'required', 'multiple',
       'selectionStart', 'selectionEnd', 'selectionDirection'],
     HTMLTextAreaElement: ['value', 'defaultValue', 'textLength', 'disabled', 'readOnly', 'required',

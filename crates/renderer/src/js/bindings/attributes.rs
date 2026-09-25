@@ -16,7 +16,7 @@ use dom::{NodeId, qualified_name_eq};
 use rquickjs::{Class, Ctx, Exception, Function, Persistent, Result, Value, class::Trace};
 
 use crate::js::events::report_exception;
-use crate::js::world::{AttrState, FrameNavigation, Handle, World, Wrapper};
+use crate::js::world::{AttrState, FrameNavigation, Handle, NavigationTarget, World, Wrapper};
 
 /// `DOMTokenList` for `Element.classList`
 /// (<https://dom.spec.whatwg.org/#interface-domtokenlist>).
@@ -981,7 +981,7 @@ pub(crate) fn after_attribute_change(ctx: &Ctx<'_>, element: NodeId, local: &str
     }
     if is_iframe {
         world.borrow_mut().queue_frame_navigation(FrameNavigation {
-            container: element,
+            target: NavigationTarget::Container(element),
             spec,
         });
     } else {

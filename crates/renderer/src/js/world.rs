@@ -128,10 +128,20 @@ impl RealmRegistry {
 
 /// A child frame navigation queued from inside a script, applied after it
 /// stops: the `iframe`'s `src` changed (or the element just connected).
+/// Where a queued navigation lands.
+pub(crate) enum NavigationTarget {
+    /// The child frame whose container is this node.
+    Container(NodeId),
+    /// The frame that queued the navigation; used by form submission to the
+    /// form's own frame (`_self`, `_top`, `_parent`).
+    SelfFrame,
+}
+
 pub(crate) struct FrameNavigation {
-    /// The `iframe` container whose frame should navigate.
-    pub(crate) container: NodeId,
-    /// The spec to navigate to, resolved against the parent document.
+    /// The frame to navigate.
+    pub(crate) target: NavigationTarget,
+    /// The spec to navigate to, absolute or resolvable against the queuing
+    /// document.
     pub(crate) spec: String,
 }
 
