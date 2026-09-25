@@ -1820,6 +1820,67 @@ impl JsNode {
         schedule_mutation_delivery(&ctx)
     }
 
+    // https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-element-insertadjacenthtml
+    #[qjs(rename = "insertAdjacentHTML")]
+    fn insert_adjacent_html(
+        &self,
+        ctx: Ctx<'_>,
+        position: WebIdlString,
+        text: WebIdlString,
+    ) -> Result<()> {
+        let position = position.0.to_ascii_lowercase();
+        if !matches!(
+            position.as_str(),
+            "beforebegin" | "afterbegin" | "beforeend" | "afterend"
+        ) {
+            return Err(throw_dom(&ctx, "SyntaxError", "invalid position"));
+        }
+        let context = with_node_kind(&ctx, self.handle.0, |kind| match kind {
+            Some(NodeKind::Element { name, .. }) => Some(html_fragment_context(name)),
+            _ => None,
+        })?
+        .ok_or_else(|| Exception::throw_type(&ctx, "insertAdjacentHTML requires an element"))?;
+        let snapshots = parse_html_fragment_snapshots(&ctx, &text.0, &context)?;
+        let world = world(&ctx)?;
+        let world = world.borrow();
+        let Some(mut parsed) = world.document_mut(self.handle.0) else {
+            return Err(Exception::throw_type(&ctx, "no document"));
+        };
+        let needs_parent = matches!(position.as_str(), "beforebegin" | "afterend");
+        if needs_parent && parsed.dom.parent(self.handle.0).is_none() {
+            return Err(throw_dom(
+                &ctx,
+                "NoModificationAllowedError",
+                "element has no parent",
+            ));
+        }
+        let fragment = materialize_children(&mut parsed.dom, &snapshots)
+            .map_err(|err| throw_dom_error(&ctx, err))?;
+        let result = if position == "beforebegin" {
+            parsed.dom.insert_before(self.handle.0, fragment)
+        } else if position == "afterbegin" {
+            match parsed.dom.first_child(self.handle.0) {
+                Some(first) => parsed.dom.insert_before(first, fragment),
+                None => parsed.dom.append(self.handle.0, fragment),
+            }
+        } else if position == "afterend" {
+            if let Some(next) = parsed.dom.next_sibling(self.handle.0) {
+                parsed.dom.insert_before(next, fragment)
+            } else {
+                let Some(parent) = parsed.dom.parent(self.handle.0) else {
+                    return Ok(());
+                };
+                parsed.dom.append(parent, fragment)
+            }
+        } else {
+            parsed.dom.append(self.handle.0, fragment)
+        };
+        result.map_err(|err| throw_dom_error(&ctx, err))?;
+        drop(parsed);
+        drop(world);
+        schedule_mutation_delivery(&ctx)
+    }
+
     // https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-element-outerhtml
     #[qjs(set, rename = "outerHTML")]
     fn set_outer_html(&self, ctx: Ctx<'_>, value: LegacyNullString) -> Result<()> {

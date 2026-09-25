@@ -98,6 +98,7 @@
     'nextElementSibling', 'tagName', 'localName', 'prefix', 'namespaceURI',
     'className', 'classList', 'dataset', 'id', 'src', 'href', 'name', 'content', 'outerHTML', 'innerHTML', 'style',
     'remove', 'getBoundingClientRect', 'getClientRects', 'scrollIntoView',
+    'insertAdjacentHTML',
     'scrollLeft', 'scrollTop',
     'attachShadow', 'shadowRoot'
   ]);
