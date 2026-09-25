@@ -1052,7 +1052,10 @@
     if (text !== undefined) option.text = String(text);
     if (value !== undefined) option.value = String(value);
     if (defaultSelected !== undefined) option.defaultSelected = Boolean(defaultSelected);
-    if (selected !== undefined) option.selected = Boolean(selected);
+    // The `selected` argument sets selectedness without the dirty flag, so a
+    // later `selected` attribute change still updates it
+    // (<https://html.spec.whatwg.org/multipage/form-elements.html#dom-option-option>).
+    globalThis.__tbSetOptionSelectedness(option, selected !== undefined && Boolean(selected));
     return option;
   }
   Object.defineProperty(Option, 'prototype', {

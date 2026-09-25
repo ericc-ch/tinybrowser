@@ -175,7 +175,7 @@
     HTMLTextAreaElement: ['value', 'defaultValue', 'textLength', 'disabled', 'readOnly', 'required',
       'selectionStart', 'selectionEnd', 'selectionDirection', 'form'],
     HTMLOptionElement: ['value', 'selected', 'defaultSelected', 'text', 'index', 'disabled',
-      'label'],
+      'label', 'form'],
     HTMLSelectElement: ['value', 'selectedIndex', 'options', 'length', 'multiple', 'disabled',
       'required', 'name', 'selectedOptions', 'form'],
     HTMLButtonElement: ['disabled', 'form',

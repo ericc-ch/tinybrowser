@@ -1616,14 +1616,14 @@ impl JsNode {
     // https://html.spec.whatwg.org/multipage/form-elements.html#dom-option-label
     #[qjs(get)]
     fn label(&self, ctx: Ctx<'_>) -> Result<String> {
-        if self.attribute_present(&ctx, "label")? {
-            return attribute_value(&ctx, self.handle.0, "label");
-        }
         let world = world(&ctx)?;
         let world = world.borrow();
-        Ok(world
-            .document(self.handle.0)
-            .map_or_else(String::new, |parsed| parsed.dom.text_content(self.handle.0)))
+        Ok(world.document(self.handle.0).map_or_else(String::new, |parsed| {
+            parsed
+                .dom
+                .no_namespace_attribute(self.handle.0, "label")
+                .unwrap_or_else(|| parsed.dom.option_text(self.handle.0))
+        }))
     }
 
     #[qjs(set, rename = "label")]
@@ -1638,7 +1638,7 @@ impl JsNode {
         let world = world.borrow();
         Ok(world
             .document(self.handle.0)
-            .map_or_else(String::new, |parsed| parsed.dom.text_content(self.handle.0)))
+            .map_or_else(String::new, |parsed| parsed.dom.option_text(self.handle.0)))
     }
 
     #[qjs(set, rename = "text")]

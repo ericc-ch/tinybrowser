@@ -34,6 +34,29 @@ pub(super) fn install(_ctx: &Ctx<'_>, globals: &Object<'_>) -> Result<()> {
         "__tbInputTypeChange",
         rquickjs::prelude::Func::from(input_type_change),
     )?;
+    globals.set(
+        "__tbSetOptionSelectedness",
+        rquickjs::prelude::Func::from(set_option_selectedness),
+    )?;
+    Ok(())
+}
+
+/// Sets an option's selectedness without the dirty flag, as the `Option`
+/// constructor does.
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "rquickjs Func ABI passes arguments by value"
+)]
+fn set_option_selectedness<'js>(ctx: Ctx<'js>, element: Value<'js>, selected: bool) -> Result<()> {
+    let Some(node) = host_node_id(&ctx, &element) else {
+        return Ok(());
+    };
+    let world = world_for_node(&ctx, node)?;
+    let world = world.borrow();
+    let Some(mut parsed) = world.document_mut(node) else {
+        return Ok(());
+    };
+    parsed.dom.set_option_selectedness(node, selected);
     Ok(())
 }
 

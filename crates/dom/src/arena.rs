@@ -1,7 +1,7 @@
 //! The arena: flat slot array, generational handles, tree mutations.
 
 use std::cell::Cell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::iter::FusedIterator;
 use std::marker::PhantomData;
@@ -210,10 +210,12 @@ pub struct Dom {
     /// The focused element per document, backing the `:focus` family
     /// (<https://drafts.csswg.org/selectors-4/#the-focus-pseudo>).
     active_element: HashMap<u32, NodeId>,
-    /// An `option`'s selectedness while the dirty selectedness flag is set;
-    /// absence means the `selected` content attribute decides
+    /// An `option`'s selectedness value
     /// (<https://html.spec.whatwg.org/multipage/form-elements.html#concept-option-selectedness>).
     option_selectedness: HashMap<NodeId, bool>,
+    /// Whether an `option`'s dirty selectedness flag is set; when clear, the
+    /// `selected` content attribute drives selectedness.
+    option_dirty_selected: HashSet<NodeId>,
     /// Per-element scroll offsets `(left, top)`. The engine has no scrollable
     /// overflow yet, but `scrollLeft`/`scrollTop` must round-trip a set value
     /// (<https://drafts.csswg.org/cssom-view/#dom-element-scrollleft>).
@@ -331,6 +333,7 @@ impl Dom {
             indeterminate: HashMap::new(),
             active_element: HashMap::new(),
             option_selectedness: HashMap::new(),
+            option_dirty_selected: HashSet::new(),
             scroll_offsets: HashMap::new(),
             input_selectable: HashMap::new(),
             mutations: Vec::new(),
@@ -2021,6 +2024,9 @@ impl Dom {
         if let Some(selected) = self.option_selectedness.get(&from).copied() {
             self.option_selectedness.insert(to, selected);
         }
+        if self.option_dirty_selected.contains(&from) {
+            self.option_dirty_selected.insert(to);
+        }
     }
 
     /// An `option`'s selectedness: the stored value while the dirty
@@ -2036,6 +2042,22 @@ impl Dom {
     /// Sets `id`'s selectedness and the dirty selectedness flag.
     pub fn set_option_selected(&mut self, id: NodeId, selected: bool) {
         self.option_selectedness.insert(id, selected);
+        self.option_dirty_selected.insert(id);
+    }
+
+    /// Sets `id`'s selectedness without the dirty flag, as the `Option`
+    /// constructor does.
+    pub fn set_option_selectedness(&mut self, id: NodeId, selected: bool) {
+        self.option_selectedness.insert(id, selected);
+    }
+
+    /// Re-reads an `option`'s selectedness from its `selected` attribute when
+    /// the dirty flag is clear.
+    fn refresh_option_selectedness(&mut self, id: NodeId) {
+        if self.html_local_is(id, "option") && !self.option_dirty_selected.contains(&id) {
+            let selected = self.attribute(id, "selected").is_some();
+            self.option_selectedness.insert(id, selected);
+        }
     }
 
     /// The `select` ancestor of an `option`, if any.
@@ -2060,9 +2082,11 @@ impl Dom {
         {
             for other in self.select_options(select) {
                 self.option_selectedness.insert(other, false);
+                self.option_dirty_selected.insert(other);
             }
         }
         self.option_selectedness.insert(option, selected);
+        self.option_dirty_selected.insert(option);
     }
 
     /// The text content of `id`: every descendant text node's data.
@@ -2093,8 +2117,55 @@ impl Dom {
     /// (<https://html.spec.whatwg.org/multipage/form-elements.html#dom-option-value>).
     #[must_use]
     pub fn option_value(&self, id: NodeId) -> String {
-        self.attribute(id, "value")
-            .unwrap_or_else(|| self.text_content(id))
+        self.no_namespace_attribute(id, "value")
+            .unwrap_or_else(|| self.option_text(id))
+    }
+
+    /// An `option`'s text: its child text content with ASCII whitespace
+    /// stripped and collapsed, skipping HTML and SVG `script` subtrees
+    /// (<https://html.spec.whatwg.org/multipage/form-elements.html#dom-option-text>).
+    #[must_use]
+    pub fn option_text(&self, id: NodeId) -> String {
+        let mut text = String::new();
+        self.collect_option_text(id, &mut text);
+        collapse_whitespace(&text)
+    }
+
+    /// Appends the option text under `id`, skipping HTML and SVG `script`.
+    fn collect_option_text(&self, id: NodeId, text: &mut String) {
+        let Some(children) = self.children(id) else {
+            return;
+        };
+        for child in children {
+            match self.kind(child) {
+                Some(NodeKind::Text { data } | NodeKind::CDataSection { data }) => {
+                    text.push_str(data);
+                }
+                Some(NodeKind::Element { name, .. }) => {
+                    let is_script = name.local.as_ref().eq_ignore_ascii_case("script");
+                    let skippable = name.ns == html_namespace()
+                        || name.ns.as_ref() == "http://www.w3.org/2000/svg";
+                    if !(is_script && skippable) {
+                        self.collect_option_text(child, text);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// An attribute in no namespace with the given local name, as HTML
+    /// `getAttribute` matches
+    /// (<https://dom.spec.whatwg.org/#concept-element-attributes-get-by-name>).
+    #[must_use]
+    pub fn no_namespace_attribute(&self, id: NodeId, local: &str) -> Option<String> {
+        let (_, attributes) = self.element(id)?;
+        attributes
+            .iter()
+            .find(|attribute| {
+                attribute.name.ns.as_ref().is_empty() && attribute.name.local.as_ref() == local
+            })
+            .map(|attribute| attribute.value.clone())
     }
 
     /// A `select`'s value: the first selected option's value, else the empty
@@ -2137,12 +2208,14 @@ impl Dom {
         if self.attribute(id, "multiple").is_none() {
             for &option in &options {
                 self.option_selectedness.insert(option, false);
+                self.option_dirty_selected.insert(option);
             }
         }
         if let Ok(index) = usize::try_from(index)
             && let Some(&option) = options.get(index)
         {
             self.option_selectedness.insert(option, true);
+            self.option_dirty_selected.insert(option);
         }
     }
 
@@ -2152,10 +2225,12 @@ impl Dom {
         let options = self.select_options(id);
         for &option in &options {
             self.option_selectedness.insert(option, false);
+            self.option_dirty_selected.insert(option);
         }
         for option in options {
             if self.option_value(option) == value {
                 self.option_selectedness.insert(option, true);
+                self.option_dirty_selected.insert(option);
                 break;
             }
         }
@@ -2294,6 +2369,9 @@ impl Dom {
             namespace: removed.name.ns.to_string(),
             old_value: Some(removed.value),
         });
+        if local == "selected" {
+            self.refresh_option_selectedness(id);
+        }
         Ok(())
     }
 
@@ -2504,6 +2582,9 @@ impl Dom {
             namespace: recorded_namespace,
             old_value,
         });
+        if local == "selected" {
+            self.refresh_option_selectedness(id);
+        }
         Ok(())
     }
 
@@ -2644,6 +2725,7 @@ impl Dom {
             self.checkedness.remove(&current);
             self.indeterminate.remove(&current);
             self.option_selectedness.remove(&current);
+            self.option_dirty_selected.remove(&current);
             self.scroll_offsets.remove(&current);
             self.input_selectable.remove(&current);
             if let Some(contents) = self.template_contents.remove(&current) {
@@ -3128,6 +3210,26 @@ impl Dom {
 /// string, the default for every grammar-constrained input state except color.
 fn sanitize_grammar(value: String, valid: fn(&str) -> bool) -> String {
     if valid(&value) { value } else { String::new() }
+}
+
+/// Strips leading and trailing ASCII whitespace and collapses internal runs to
+/// one space
+/// (<https://infra.spec.whatwg.org/#strip-and-collapse-ascii-whitespace>).
+fn collapse_whitespace(text: &str) -> String {
+    let mut result = String::new();
+    let mut pending_space = false;
+    for character in text.chars() {
+        if character.is_ascii_whitespace() {
+            pending_space = !result.is_empty();
+        } else {
+            if pending_space {
+                result.push(' ');
+                pending_space = false;
+            }
+            result.push(character);
+        }
+    }
+    result
 }
 
 /// The `value` IDL attribute's mode for an input state
