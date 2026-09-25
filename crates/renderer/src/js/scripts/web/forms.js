@@ -1088,4 +1088,97 @@
       writable: true, enumerable: true, configurable: true,
     },
   });
+
+  // ── form controls collection ───────────────────────────────────────────
+
+  const LISTED = 'button, fieldset, input, object, output, select, textarea';
+
+  // The form's listed elements, in tree order: every matching control whose
+  // form owner is the form
+  // (<https://html.spec.whatwg.org/multipage/forms.html#category-listed>).
+  const listedElements = form =>
+    Array.from(form.ownerDocument.querySelectorAll(LISTED))
+      .filter(element => element.form === form);
+
+  // Collection interfaces. The engine may already publish `HTMLCollection`;
+  // reuse it so both brands share one prototype chain
+  // (<https://html.spec.whatwg.org/multipage/forms.html#htmlformcontrolscollection>).
+  const collectionInterface = name => {
+    const existing = globalThis[name];
+    if (existing !== undefined && existing !== null) return existing;
+    const constructor = function() { throw new TypeError('Illegal constructor'); };
+    Object.defineProperty(constructor.prototype, Symbol.toStringTag, {
+      value: name, configurable: true,
+    });
+    Object.defineProperty(globalThis, name, {
+      value: constructor, writable: true, configurable: true,
+    });
+    return constructor;
+  };
+  const HTMLCollectionInterface = collectionInterface('HTMLCollection');
+  const FormControlsInterface = collectionInterface('HTMLFormControlsCollection');
+  const RadioNodeListInterface = collectionInterface('RadioNodeList');
+  Object.setPrototypeOf(FormControlsInterface.prototype, HTMLCollectionInterface.prototype);
+  Object.setPrototypeOf(RadioNodeListInterface.prototype, HTMLCollectionInterface.prototype);
+
+  // A live, named, indexed collection. `getList` recomputes on each access so
+  // the collection tracks DOM changes; the proxy's prototype reports the right
+  // interface for `instanceof`.
+  const collectionOf = (getList, prototype, radioList) =>
+    new Proxy({}, {
+      get(_target, property) {
+        const list = getList();
+        if (property === 'length') return list.length;
+        if (property === 'item') return index => list[Number(index)] ?? null;
+        if (property === 'namedItem') return name => namedItemIn(getList(), String(name), prototype);
+        if (property === 'value' && radioList) {
+          const checked = list.find(element => element.type === 'radio' && element.checked);
+          return checked ? checked.value : '';
+        }
+        if (property === Symbol.iterator) return function* () { yield* list; };
+        if (typeof property === 'string') {
+          if (/^\d+$/.test(property)) return list[Number(property)];
+          const named = namedItemIn(list, property, prototype);
+          return named === null ? undefined : named;
+        }
+        return undefined;
+      },
+      getPrototypeOf() { return prototype; },
+      has(_target, property) {
+        const list = getList();
+        if (property === 'length' || property === 'item' || property === 'namedItem') return true;
+        if (typeof property === 'string' && /^\d+$/.test(property)) return list[Number(property)] !== undefined;
+        return namedItemIn(list, String(property), prototype) !== null;
+      },
+    });
+
+  const namedItemIn = (list, name, prototype) => {
+    const matches = list.filter(
+      element => element.id === name || element.getAttribute('name') === name,
+    );
+    if (matches.length === 0) return null;
+    if (matches.length === 1) return matches[0];
+    return collectionOf(() => matches, prototype, true);
+  };
+
+  const elementsCache = new WeakMap();
+  Object.defineProperties(globalThis.HTMLFormElement.prototype, {
+    elements: {
+      get() {
+        let collection = elementsCache.get(this);
+        if (collection === undefined) {
+          collection = collectionOf(
+            () => listedElements(this), FormControlsInterface.prototype, false,
+          );
+          elementsCache.set(this, collection);
+        }
+        return collection;
+      },
+      configurable: true,
+    },
+    length: {
+      get() { return listedElements(this).length; },
+      configurable: true,
+    },
+  });
 })();
