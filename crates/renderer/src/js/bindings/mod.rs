@@ -123,6 +123,7 @@ pub(crate) fn throw_dom_error(ctx: &Ctx<'_>, err: DomError) -> rquickjs::Error {
             throw_dom(ctx, "HierarchyRequestError", &err.to_string())
         }
         DomError::NoParent => throw_dom(ctx, "NotFoundError", &err.to_string()),
+        DomError::InvalidState => throw_dom(ctx, "InvalidStateError", &err.to_string()),
         // Programming errors, not web-visible DOM exceptions.
         DomError::StaleNode | DomError::WrongNodeType => {
             Exception::throw_type(ctx, &err.to_string())

@@ -314,11 +314,30 @@
       configurable: true,
     };
   }
-  Object.defineProperty(table.HTMLInputElement, 'type', reflectType(new Set([
+  const INPUT_TYPE_KEYWORDS = new Set([
     'hidden', 'text', 'search', 'tel', 'url', 'email', 'password',
     'date', 'month', 'week', 'time', 'datetime-local', 'number', 'range',
     'color', 'checkbox', 'radio', 'file', 'submit', 'image', 'reset', 'button',
-  ]), 'text'));
+  ]);
+  Object.defineProperty(table.HTMLInputElement, 'type', {
+    get: function() {
+      const value = this.getAttribute('type');
+      if (value === null) return 'text';
+      const lowered = String(value).toLowerCase();
+      return INPUT_TYPE_KEYWORDS.has(lowered) ? lowered : 'text';
+    },
+    set: function(value) {
+      // The type-change steps run before the attribute lands, so the old state
+      // can migrate its value
+      // (<https://html.spec.whatwg.org/multipage/input.html#the-input-element:type-change-state>).
+      const lowered = String(value).toLowerCase();
+      const next = INPUT_TYPE_KEYWORDS.has(lowered) ? lowered : 'text';
+      globalThis.__tbInputTypeChange(this, next);
+      this.setAttribute('type', String(value));
+    },
+    enumerable: true,
+    configurable: true,
+  });
   // `<input type=file>` exposes a (possibly empty) FileList
   // (<https://html.spec.whatwg.org/multipage/input.html#dom-input-files>).
   Object.defineProperty(table.HTMLInputElement, 'files', {

@@ -5,7 +5,7 @@
 //! and contribute a value. The list is returned to the `FormData` shim as a
 //! flat `[name, value, ...]` array.
 
-use super::{host_node_id, is_html_element, with_node_kind, world};
+use super::{WebIdlString, host_node_id, is_html_element, throw_dom_error, with_node_kind, world, world_for_node};
 use crate::js::{FrameNavigation, World};
 use dom::{NodeId, NodeKind, html_namespace};
 use rquickjs::{Array, Ctx, Object, Persistent, Result, Value};
@@ -30,6 +30,31 @@ pub(super) fn install(_ctx: &Ctx<'_>, globals: &Object<'_>) -> Result<()> {
         "__tbEncodeForm",
         rquickjs::prelude::Func::from(encode_form),
     )?;
+    globals.set(
+        "__tbInputTypeChange",
+        rquickjs::prelude::Func::from(input_type_change),
+    )?;
+    Ok(())
+}
+
+/// Runs an input's type-change steps before the new `type` attribute lands.
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "rquickjs Func ABI passes arguments by value"
+)]
+fn input_type_change<'js>(ctx: Ctx<'js>, element: Value<'js>, new_type: WebIdlString) -> Result<()> {
+    let Some(node) = host_node_id(&ctx, &element) else {
+        return Ok(());
+    };
+    let world = world_for_node(&ctx, node)?;
+    let world = world.borrow();
+    let Some(mut parsed) = world.document_mut(node) else {
+        return Ok(());
+    };
+    parsed
+        .dom
+        .input_type_change(node, &new_type.0)
+        .map_err(|error| throw_dom_error(&ctx, error))?;
     Ok(())
 }
 

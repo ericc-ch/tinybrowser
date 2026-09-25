@@ -127,6 +127,9 @@ pub enum DomError {
     /// An insert was requested beside a node with no parent to sit under.
     /// (Maps to `NotFoundError`.)
     NoParent,
+    /// The control's state forbids the operation, such as setting a non-empty
+    /// `value` on a `type=file` input. (Maps to `InvalidStateError`.)
+    InvalidState,
 }
 
 impl fmt::Display for DomError {
@@ -139,6 +142,7 @@ impl fmt::Display for DomError {
             }
             Self::WrongNodeType => f.write_str("operation not valid for this node kind"),
             Self::NoParent => f.write_str("target has no parent to insert beside"),
+            Self::InvalidState => f.write_str("operation invalid for the control's state"),
         }
     }
 }
@@ -1493,17 +1497,23 @@ impl Dom {
     /// (<https://html.spec.whatwg.org/multipage/input.html#dom-input-value>).
     #[must_use]
     pub fn input_value(&self, id: NodeId) -> Option<String> {
-        let (name, _) = self.element(id)?;
-        if name.ns != html_namespace() || name.local.as_ref() != "input" {
-            return None;
-        }
-        let value = self
-            .input_values
-            .get(&id)
-            .cloned()
-            .or_else(|| self.attribute(id, "value"))
-            .unwrap_or_default();
-        Some(self.sanitize_input_value(id, value))
+        let typ = self.input_type(id)?;
+        Some(match input_value_mode(&typ) {
+            ValueMode::Value => {
+                let value = self
+                    .input_values
+                    .get(&id)
+                    .cloned()
+                    .or_else(|| self.attribute(id, "value"))
+                    .unwrap_or_default();
+                self.sanitize_input_value(id, value)
+            }
+            ValueMode::Default => self.attribute(id, "value").unwrap_or_default(),
+            ValueMode::DefaultOn => self
+                .attribute(id, "value")
+                .unwrap_or_else(|| "on".to_owned()),
+            ValueMode::Filename => String::new(),
+        })
     }
 
     /// Sets an HTML `input` element's live value and its dirty value flag.
@@ -1512,14 +1522,58 @@ impl Dom {
     ///
     /// # Errors
     ///
-    /// Returns [`DomError::WrongNodeType`] when `id` is not an HTML `input`.
+    /// Returns [`DomError::WrongNodeType`] when `id` is not an HTML `input`,
+    /// or [`DomError::InvalidState`] when setting a non-empty value on a
+    /// `type=file` input.
     pub fn set_input_value(&mut self, id: NodeId, value: String) -> Result<(), DomError> {
-        let (name, _) = self.element(id).ok_or(DomError::WrongNodeType)?;
-        if name.ns != html_namespace() || name.local.as_ref() != "input" {
-            return Err(DomError::WrongNodeType);
+        let typ = self.input_type(id).ok_or(DomError::WrongNodeType)?;
+        match input_value_mode(&typ) {
+            ValueMode::Value => {
+                let value = self.sanitize_input_value(id, value);
+                self.input_values.insert(id, value);
+            }
+            ValueMode::Default | ValueMode::DefaultOn => {
+                self.set_attribute(id, "value", value)?;
+            }
+            ValueMode::Filename => {
+                if !value.is_empty() {
+                    return Err(DomError::InvalidState);
+                }
+            }
         }
-        let value = self.sanitize_input_value(id, value);
-        self.input_values.insert(id, value);
+        Ok(())
+    }
+
+    /// Runs the input type-change steps when `type` moves to `new_type`
+    /// (<https://html.spec.whatwg.org/multipage/input.html#the-input-element:type-change-state>).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DomError::WrongNodeType`] when `id` is not an HTML `input`.
+    pub fn input_type_change(&mut self, id: NodeId, new_type: &str) -> Result<(), DomError> {
+        let old = self.input_type(id).ok_or(DomError::WrongNodeType)?;
+        if old == new_type {
+            return Ok(());
+        }
+        match (input_value_mode(&old), input_value_mode(new_type)) {
+            // A value-mode value becomes the new default, unless it is empty.
+            (ValueMode::Value, ValueMode::Default | ValueMode::DefaultOn) => {
+                let value = self.input_value(id).unwrap_or_default();
+                if !value.is_empty() {
+                    self.set_attribute(id, "value", value)?;
+                }
+                self.input_values.remove(&id);
+            }
+            // A non-value state follows the content attribute again.
+            (mode, ValueMode::Value) if mode != ValueMode::Value => {
+                self.input_values.remove(&id);
+            }
+            // A non-filename state clears the value for a file input.
+            (mode, ValueMode::Filename) if mode != ValueMode::Filename => {
+                self.input_values.remove(&id);
+            }
+            _ => {}
+        }
         Ok(())
     }
 
@@ -2929,6 +2983,25 @@ impl Dom {
 /// string, the default for every grammar-constrained input state except color.
 fn sanitize_grammar(value: String, valid: fn(&str) -> bool) -> String {
     if valid(&value) { value } else { String::new() }
+}
+
+/// The `value` IDL attribute's mode for an input state
+/// (<https://html.spec.whatwg.org/multipage/input.html#the-input-element:value-mode>).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ValueMode {
+    Value,
+    Default,
+    DefaultOn,
+    Filename,
+}
+
+fn input_value_mode(typ: &str) -> ValueMode {
+    match typ {
+        "checkbox" | "radio" => ValueMode::DefaultOn,
+        "file" => ValueMode::Filename,
+        "hidden" | "submit" | "image" | "reset" | "button" => ValueMode::Default,
+        _ => ValueMode::Value,
+    }
 }
 
 /// Parses a finite floating-point number, or `None` when the text is not a
