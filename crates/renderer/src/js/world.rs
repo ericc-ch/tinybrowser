@@ -290,6 +290,10 @@ pub(crate) struct World {
     frame_navigations: Vec<FrameNavigation>,
     /// Connected `<img>` elements whose `src` changed inside script.
     image_updates: Vec<NodeId>,
+    /// Controls whose selection changed and owe a queued `select` event
+    /// (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#set-the-selection-range>).
+    /// Interior mutability because a selection setter only holds `&World`.
+    pending_selects: RefCell<Vec<NodeId>>,
     document_stream: Vec<DocumentStreamCommand>,
     object_urls: HashMap<String, ObjectUrlEntry>,
     budget: Rc<RefCell<ResourceBudget>>,
@@ -418,6 +422,7 @@ impl World {
             pending_html_writes: Vec::new(),
             frame_navigations: Vec::new(),
             image_updates: Vec::new(),
+            pending_selects: RefCell::new(Vec::new()),
             document_stream: Vec::new(),
             object_urls: HashMap::new(),
             budget: runtime.registry.borrow().budget(),
@@ -1000,6 +1005,20 @@ impl World {
 
     pub(crate) fn take_image_updates(&mut self) -> Vec<NodeId> {
         std::mem::take(&mut self.image_updates)
+    }
+
+    /// Records that `node`'s selection changed, so a `select` event is due once
+    /// the current task finishes. One event per change: a repeated identical
+    /// change does not queue a second time.
+    pub(crate) fn queue_select(&self, node: NodeId) {
+        let mut pending = self.pending_selects.borrow_mut();
+        if !pending.contains(&node) {
+            pending.push(node);
+        }
+    }
+
+    pub(crate) fn take_pending_selects(&mut self) -> Vec<NodeId> {
+        std::mem::take(&mut *self.pending_selects.borrow_mut())
     }
 
     /// Starts a fetch for `url`. If the current request is still available,

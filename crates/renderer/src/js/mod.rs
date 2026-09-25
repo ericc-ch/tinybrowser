@@ -326,6 +326,25 @@ impl JsRealm {
         })
     }
 
+    /// Fires a trusted `select` event at `node`. The DOM queues the event when
+    /// a selection setter changes the stored range, so it lands one task after
+    /// the change
+    /// (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#set-the-selection-range>).
+    pub(crate) fn fire_select(&self, node: dom::NodeId) -> Result<(), JsError> {
+        self.with_budget(None, || {
+            self.context.with(|ctx| {
+                events::fire_trusted(
+                    &ctx,
+                    world::EventTargetKey::Node(node),
+                    "select",
+                    true,
+                    false,
+                )
+                .map_err(JsError::from)
+            })
+        })
+    }
+
     pub(crate) fn finish_js_fetch(
         &self,
         js_id: i32,

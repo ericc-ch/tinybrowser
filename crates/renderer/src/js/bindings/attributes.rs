@@ -914,6 +914,28 @@ fn compile_handler_attribute(ctx: &Ctx<'_>, element: NodeId, typ: &str) -> Resul
     Ok(())
 }
 
+/// The input `type` change step that touches the text selection: when an
+/// `input` becomes selectable again after a non-selectable type (for example
+/// `color` back to `text`), the text entry cursor moves to the beginning
+/// (<https://html.spec.whatwg.org/multipage/input.html#the-input-element>).
+fn apply_input_type_change(ctx: &Ctx<'_>, element: NodeId) -> Result<()> {
+    if !with_node_kind(ctx, element, |kind| is_html_element(kind, "input"))? {
+        return Ok(());
+    }
+    let world = world(ctx)?;
+    let world = world.borrow();
+    let Some(mut parsed) = world.document_mut(element) else {
+        return Ok(());
+    };
+    let now = parsed.dom.selection_supported(element);
+    let previously = parsed.dom.input_selectable(element);
+    if !previously && now {
+        parsed.dom.set_selection(element, 0, 0, 0);
+    }
+    parsed.dom.set_input_selectable(element, now);
+    Ok(())
+}
+
 /// After an attribute change, runs the element's attribute-change hooks: an
 /// `iframe`'s `src` drives its browsing context's navigation
 /// (<https://html.spec.whatwg.org/multipage/iframe-embed-object.html#process-the-iframe-attributes>),
@@ -929,6 +951,9 @@ pub(crate) fn after_attribute_change(ctx: &Ctx<'_>, element: NodeId, local: &str
             .all(|character| character.is_ascii_lowercase() || character.is_ascii_digit())
     {
         compile_handler_attribute(ctx, element, typ)?;
+    }
+    if local == "type" {
+        apply_input_type_change(ctx, element)?;
     }
     if local != "src" {
         return Ok(());

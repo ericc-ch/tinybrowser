@@ -98,6 +98,7 @@
     'nextElementSibling', 'tagName', 'localName', 'prefix', 'namespaceURI',
     'className', 'classList', 'dataset', 'id', 'src', 'href', 'name', 'content', 'outerHTML', 'innerHTML', 'style',
     'remove', 'getBoundingClientRect', 'getClientRects', 'scrollIntoView',
+    'scrollLeft', 'scrollTop',
     'attachShadow', 'shadowRoot'
   ]);
   // classList is `[PutForwards=value]`: assigning to it sets `.value`
@@ -164,6 +165,7 @@
   const interfaceMembers = {
     HTMLIFrameElement: ['contentDocument', 'contentWindow'],
     HTMLImageElement: ['naturalWidth', 'naturalHeight', 'complete', 'currentSrc'],
+    HTMLFormElement: ['reset'],
     HTMLInputElement: ['value', 'defaultValue', 'disabled', 'readOnly', 'required', 'multiple',
       'selectionStart', 'selectionEnd', 'selectionDirection'],
     HTMLTextAreaElement: ['value', 'defaultValue', 'textLength', 'disabled', 'readOnly', 'required',

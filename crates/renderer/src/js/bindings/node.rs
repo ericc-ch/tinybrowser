@@ -1075,7 +1075,13 @@ impl JsNode {
             ));
         };
         let start = value.0;
-        parsed.dom.set_selection(self.handle.0, start, end.max(start), direction);
+        let changed = parsed
+            .dom
+            .set_selection(self.handle.0, start, end.max(start), direction);
+        drop(parsed);
+        if changed {
+            world.queue_select(self.handle.0);
+        }
         Ok(())
     }
 
@@ -1107,7 +1113,11 @@ impl JsNode {
                 "selectionEnd does not apply to this control",
             ));
         };
-        parsed.dom.set_selection(self.handle.0, start, value.0, direction);
+        let changed = parsed.dom.set_selection(self.handle.0, start, value.0, direction);
+        drop(parsed);
+        if changed {
+            world.queue_select(self.handle.0);
+        }
         Ok(())
     }
 
@@ -1140,7 +1150,97 @@ impl JsNode {
             ));
         };
         let direction = direction_code(&value.0);
-        parsed.dom.set_selection(self.handle.0, start, end, direction);
+        let changed = parsed.dom.set_selection(self.handle.0, start, end, direction);
+        drop(parsed);
+        if changed {
+            world.queue_select(self.handle.0);
+        }
+        Ok(())
+    }
+
+    // https://html.spec.whatwg.org/multipage/forms.html#dom-form-reset
+    #[qjs(rename = "reset")]
+    fn reset(&self, ctx: Ctx<'_>) -> Result<()> {
+        if !with_node_kind(&ctx, self.handle.0, |kind| is_html_element(kind, "form"))? {
+            return Err(throw_dom(
+                &ctx,
+                "InvalidStateError",
+                "reset is only available on a form",
+            ));
+        }
+        let world_rc = world(&ctx)?;
+        let world = world_rc.borrow();
+        let Some(mut parsed) = world.document_mut(self.handle.0) else {
+            return Ok(());
+        };
+        // The reset algorithm runs on the form owner's controls: for now, the
+        // descendants that are form controls. Form-owner association lands with
+        // the form units.
+        let mut controls = Vec::new();
+        let mut stack = vec![self.handle.0];
+        while let Some(node) = stack.pop() {
+            let children: Vec<NodeId> = parsed
+                .dom
+                .children(node)
+                .map(Iterator::collect)
+                .unwrap_or_default();
+            for child in children {
+                if let Some(NodeKind::Element { name, .. }) = parsed.dom.kind(child)
+                    && name.ns == html_namespace()
+                    && matches!(name.local.as_ref(), "input" | "textarea" | "select")
+                {
+                    controls.push(child);
+                }
+                stack.push(child);
+            }
+        }
+        for control in controls {
+            parsed.dom.reset_control(control);
+        }
+        Ok(())
+    }
+
+    // https://drafts.csswg.org/cssom-view/#dom-element-scrollleft
+    #[qjs(get, rename = "scrollLeft")]
+    fn scroll_left(&self, ctx: Ctx<'_>) -> Result<f64> {
+        let world = world(&ctx)?;
+        let world = world.borrow();
+        Ok(world
+            .document(self.handle.0)
+            .map_or(0.0, |parsed| parsed.dom.scroll_offset(self.handle.0).0))
+    }
+
+    #[qjs(set, rename = "scrollLeft")]
+    fn set_scroll_left(&self, ctx: Ctx<'_>, value: f64) -> Result<()> {
+        let world = world(&ctx)?;
+        let world = world.borrow();
+        let Some(mut parsed) = world.document_mut(self.handle.0) else {
+            return Ok(());
+        };
+        let (_, top) = parsed.dom.scroll_offset(self.handle.0);
+        parsed.dom.set_scroll_offset(self.handle.0, value, top);
+        Ok(())
+    }
+
+    // https://drafts.csswg.org/cssom-view/#dom-element-scrolltop
+    #[qjs(get, rename = "scrollTop")]
+    fn scroll_top(&self, ctx: Ctx<'_>) -> Result<f64> {
+        let world = world(&ctx)?;
+        let world = world.borrow();
+        Ok(world
+            .document(self.handle.0)
+            .map_or(0.0, |parsed| parsed.dom.scroll_offset(self.handle.0).1))
+    }
+
+    #[qjs(set, rename = "scrollTop")]
+    fn set_scroll_top(&self, ctx: Ctx<'_>, value: f64) -> Result<()> {
+        let world = world(&ctx)?;
+        let world = world.borrow();
+        let Some(mut parsed) = world.document_mut(self.handle.0) else {
+            return Ok(());
+        };
+        let (left, _) = parsed.dom.scroll_offset(self.handle.0);
+        parsed.dom.set_scroll_offset(self.handle.0, left, value);
         Ok(())
     }
 

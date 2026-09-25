@@ -296,6 +296,12 @@
     },
     setRangeText: {
       value: function(replacement, start, end, selectionMode) {
+        // No overload takes zero arguments, so the Web IDL layer throws before
+        // the method body runs
+        // (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#dom-textarea/input-setrangetext>).
+        if (arguments.length === 0) {
+          throw new TypeError('setRangeText: at least 1 argument required');
+        }
         requireSelection(this);
         replacement = String(replacement);
         let rangeStart;

@@ -192,6 +192,14 @@ pub struct Dom {
     /// the parser so reported exceptions carry a document line number
     /// (<https://html.spec.whatwg.org/multipage/webappapis.html#script's-line-number>).
     script_lines: HashMap<NodeId, u32>,
+    /// Per-element scroll offsets `(left, top)`. The engine has no scrollable
+    /// overflow yet, but `scrollLeft`/`scrollTop` must round-trip a set value
+    /// (<https://drafts.csswg.org/cssom-view/#dom-element-scrollleft>).
+    scroll_offsets: HashMap<NodeId, (f64, f64)>,
+    /// Whether an `input`'s type supported a text selection the last time its
+    /// `type` changed, so a change back to a selectable type can reset the
+    /// cursor (<https://html.spec.whatwg.org/multipage/input.html#the-input-element>).
+    input_selectable: HashMap<NodeId, bool>,
     /// Text selection for text-like controls: `(start, end, direction)` in
     /// UTF-16 code units. Direction is 0 "none", 1 "forward", 2 "backward"
     /// (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#concept-textarea/input-selection>).
@@ -297,6 +305,8 @@ impl Dom {
             input_values: HashMap::new(),
             selections: HashMap::new(),
             script_lines: HashMap::new(),
+            scroll_offsets: HashMap::new(),
+            input_selectable: HashMap::new(),
             mutations: Vec::new(),
             record_mutations: false,
             recording_suppressed: false,
@@ -1673,14 +1683,52 @@ impl Dom {
         Some((start.min(length), end.min(length), direction))
     }
 
-    /// Stores `id`'s selection, clamped to the current API value length.
-    pub fn set_selection(&mut self, id: NodeId, start: u32, end: u32, direction: u8) {
-        if !self.selection_supported(id) {
+    /// The API value of a non-dirty `textarea` `parent`, or `None` when
+    /// `parent` is not such a control. Used to detect whether a child change
+    /// really changed the value.
+    fn textarea_value_before_change(&self, parent: NodeId) -> Option<String> {
+        if !self.html_local_is(parent, "textarea") || self.input_values.contains_key(&parent) {
+            return None;
+        }
+        self.textarea_value(parent)
+    }
+
+    /// A `textarea` with no stored raw value (dirty value flag unset) derives
+    /// its value from its children, so a child change that alters the API value
+    /// invalidates its selection: reset it to the start. A change that leaves
+    /// the API value alone (for example one that only differs in raw newlines)
+    /// keeps the selection. A dirty textarea keeps both its value and its
+    /// selection.
+    fn reset_textarea_selection_if_changed(&mut self, parent: NodeId, before: Option<String>) {
+        let Some(before) = before else {
             return;
+        };
+        if self.textarea_value(parent).as_deref() != Some(before.as_str()) {
+            self.selections.insert(parent, (0, 0, 0));
+        }
+    }
+
+    /// Stores `id`'s selection, clamped to the current API value length, and
+    /// reports whether the stored tuple actually changed (so the caller can
+    /// queue a `select` event only for a real modification).
+    pub fn set_selection(&mut self, id: NodeId, start: u32, end: u32, direction: u8) -> bool {
+        if !self.selection_supported(id) {
+            return false;
         }
         let length = self.control_value(id).map_or(0, |value| utf16_length(&value));
-        self.selections
-            .insert(id, (start.min(length), end.min(length), direction.min(2)));
+        let mut end = end.min(length);
+        let mut start = start.min(length);
+        // If end is less than or equal to start, both are placed immediately
+        // before the character with offset end
+        // (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#set-the-selection-range>).
+        if end <= start {
+            start = end;
+        }
+        end = end.max(start);
+        let next = (start, end, direction.min(2));
+        let previous = self.selections.get(&id).copied().unwrap_or((0, 0, 0));
+        self.selections.insert(id, next);
+        next != previous
     }
 
     /// Records the source-text start line of the inline `script` element `id`,
@@ -1694,6 +1742,38 @@ impl Dom {
     #[must_use]
     pub fn script_line(&self, id: NodeId) -> Option<u32> {
         self.script_lines.get(&id).copied()
+    }
+
+    /// The scrolled offset `(left, top)` of `id`; `(0, 0)` when never set.
+    #[must_use]
+    pub fn scroll_offset(&self, id: NodeId) -> (f64, f64) {
+        self.scroll_offsets.get(&id).copied().unwrap_or((0.0, 0.0))
+    }
+
+    /// Stores `id`'s scroll offset.
+    pub fn set_scroll_offset(&mut self, id: NodeId, left: f64, top: f64) {
+        self.scroll_offsets.insert(id, (left, top));
+    }
+
+    /// Whether `id`'s input type supported a text selection when its `type`
+    /// last changed. The input default (`type=text`) is selectable.
+    #[must_use]
+    pub fn input_selectable(&self, id: NodeId) -> bool {
+        self.input_selectable.get(&id).copied().unwrap_or(true)
+    }
+
+    /// Records whether `id`'s input type currently supports a text selection.
+    pub fn set_input_selectable(&mut self, id: NodeId, selectable: bool) {
+        self.input_selectable.insert(id, selectable);
+    }
+
+    /// The reset algorithm for a text-like control: clear the dirty value flag
+    /// so the value reverts to its default
+    /// (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#concept-form-reset-control>).
+    pub fn reset_control(&mut self, id: NodeId) {
+        if self.html_local_is(id, "input") || self.html_local_is(id, "textarea") {
+            self.input_values.remove(&id);
+        }
     }
 
     /// The `defaultValue` of a text-like control: the `value` content
@@ -2036,6 +2116,8 @@ impl Dom {
     /// - [`DomError::StaleNode`] if `id` is stale.
     /// - [`DomError::WrongNodeType`] if `id` is not a text node.
     pub fn append_text(&mut self, id: NodeId, extra: &str) -> Result<(), DomError> {
+        let parent = self.parent(id);
+        let value_before = parent.and_then(|parent| self.textarea_value_before_change(parent));
         let recording = self.record_mutations && !self.recording_suppressed;
         let old_value = {
             let node = self.node_mut(id).ok_or(DomError::StaleNode)?;
@@ -2051,6 +2133,9 @@ impl Dom {
                 target: id,
                 old_value,
             });
+        }
+        if let Some(parent) = parent {
+            self.reset_textarea_selection_if_changed(parent, value_before);
         }
         Ok(())
     }
@@ -2141,6 +2226,8 @@ impl Dom {
             self.input_values.remove(&current);
             self.selections.remove(&current);
             self.script_lines.remove(&current);
+            self.scroll_offsets.remove(&current);
+            self.input_selectable.remove(&current);
             if let Some(contents) = self.template_contents.remove(&current) {
                 pending.push(contents);
             }
@@ -2310,6 +2397,7 @@ impl Dom {
     /// whole operation is done. Recording here would both misread a node the
     /// caller already detached and pin the event order relative to a removal.
     fn place_node(&mut self, parent: NodeId, node: NodeId, before: Option<NodeId>) {
+        let value_before = self.textarea_value_before_change(parent);
         self.unlink_from_current_parent(node);
         // Sibling references for the mutation record, read from the run the
         // node is about to join. Computed only while recording: no observer
@@ -2331,6 +2419,7 @@ impl Dom {
             previous,
             next,
         });
+        self.reset_textarea_selection_if_changed(parent, value_before);
     }
 
     /// Links the unparented `node` under `parent` immediately before
@@ -2513,6 +2602,7 @@ impl Dom {
         }) else {
             return;
         };
+        let value_before = self.textarea_value_before_change(parent);
         if let Some(previous) = previous {
             self.node_mut(previous)
                 .expect("previous sibling has no slot")
@@ -2545,6 +2635,7 @@ impl Dom {
         detached.parent = None;
         detached.previous_sibling = None;
         detached.next_sibling = None;
+        self.reset_textarea_selection_if_changed(parent, value_before);
     }
 
     fn set_data(
@@ -2553,6 +2644,8 @@ impl Dom {
         extract: impl Fn(&mut NodeKind) -> Option<&mut String>,
         data: String,
     ) -> Result<(), DomError> {
+        let parent = self.parent(id);
+        let value_before = parent.and_then(|parent| self.textarea_value_before_change(parent));
         let node = self.node_mut(id).ok_or(DomError::StaleNode)?;
         match extract(&mut node.kind) {
             Some(field) => {
@@ -2561,6 +2654,9 @@ impl Dom {
                     target: id,
                     old_value,
                 });
+                if let Some(parent) = parent {
+                    self.reset_textarea_selection_if_changed(parent, value_before);
+                }
                 Ok(())
             }
             None => Err(DomError::WrongNodeType),
