@@ -310,7 +310,20 @@ pub(super) fn form_navigate(
         target: navigation_target,
         spec: url,
         method,
-        body: body.into_bytes(),
+        // The body arrives as a Latin-1 string, one char per byte, so file
+        // bytes survive the JS boundary unchanged
+        // (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#multipart-form-data>).
+        body: body
+            .chars()
+            .map(|character| {
+                #[allow(
+                    clippy::cast_possible_truncation,
+                    reason = "the JS side maps each byte to U+0000..U+00FF"
+                )]
+                let byte = character as u8;
+                byte
+            })
+            .collect(),
         content_type,
     };
     world_rc.borrow_mut().queue_frame_navigation(navigation);

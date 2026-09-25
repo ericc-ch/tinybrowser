@@ -477,30 +477,69 @@
 
   // multipart/form-data with a generated boundary
   // (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#multipart-form-data>).
+  // The multipart name/filename escape: CR, LF, and `"` become percent
+  // escapes (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#multipart-form-data>).
   const escapeMultipartName = value =>
-    String(value).replace(/\r\n|\r|\n/g, '\r\n').replace(/"/g, '%22');
+    String(value)
+      .replace(/\r\n|\r|\n/g, '\r\n')
+      .replace(/\r/g, '%0D')
+      .replace(/\n/g, '%0A')
+      .replace(/"/g, '%22');
+  // A filename's newlines are not normalized first, only escaped.
+  const escapeMultipartFilename = value =>
+    String(value)
+      .replace(/\r/g, '%0D')
+      .replace(/\n/g, '%0A')
+      .replace(/"/g, '%22');
+  // The navigation body crosses to Rust as a Latin-1 string, one char per
+  // byte, so file bytes survive unchanged while text is UTF-8 encoded first.
+  const encoder = new TextEncoder();
+  const toLatin1 = bytes => {
+    let text = '';
+    for (let index = 0; index < bytes.length; index++) {
+      text += String.fromCharCode(bytes[index]);
+    }
+    return text;
+  };
+  const concatBytes = chunks => {
+    let total = 0;
+    for (const chunk of chunks) total += chunk.length;
+    const out = new Uint8Array(total);
+    let offset = 0;
+    for (const chunk of chunks) {
+      out.set(chunk, offset);
+      offset += chunk.length;
+    }
+    return out;
+  };
+
   const encodeMultipart = formData => {
     const boundary = `----tinybrowser${Math.random().toString(16).slice(2)}`;
-    const parts = [];
+    const chunks = [];
+    const push = text => chunks.push(encoder.encode(text));
     for (const entry of formData) {
       const name = escapeMultipartName(entry[0]);
       const value = entry[1];
-      parts.push(`--${boundary}\r\n`);
+      push(`--${boundary}\r\n`);
       if (value !== null && typeof value === 'object' && typeof value.name === 'string') {
-        parts.push(
-          `Content-Disposition: form-data; name="${name}"; filename="${escapeMultipartName(value.name)}"\r\n`,
+        push(
+          `Content-Disposition: form-data; name="${name}"; filename="${escapeMultipartFilename(value.name)}"\r\n`,
         );
-        parts.push(`Content-Type: ${value.type || 'application/octet-stream'}\r\n\r\n`);
-        parts.push(String(value));
-        parts.push('\r\n');
+        push(`Content-Type: ${value.type || 'application/octet-stream'}\r\n\r\n`);
+        const data = value[__tbBlobData];
+        chunks.push(data === undefined ? encoder.encode(String(value)) : data.bytes);
+        push('\r\n');
       } else {
-        parts.push(`Content-Disposition: form-data; name="${name}"\r\n\r\n`);
-        parts.push(String(value));
-        parts.push('\r\n');
+        push(`Content-Disposition: form-data; name="${name}"\r\n\r\n`);
+        push(String(value).replace(/\r\n|\r|\n/g, '\r\n'));
+        push('\r\n');
       }
     }
-    parts.push(`--${boundary}--\r\n`);
-    return { body: parts.join(''), contentType: `multipart/form-data; boundary=${boundary}` };
+    push(`--${boundary}--\r\n`);
+    return {
+      body: toLatin1(concatBytes(chunks)),
+      contentType: `multipart/form-data; boundary=${boundary}`,
+    };
   };
 
   const encodeTextPlain = formData => {
@@ -537,10 +576,10 @@
     if (form.enctype === 'multipart/form-data') {
       ({ body, contentType } = encodeMultipart(formData));
     } else if (form.enctype === 'text/plain') {
-      body = encodeTextPlain(formData);
+      body = toLatin1(encoder.encode(encodeTextPlain(formData)));
       contentType = 'text/plain';
     } else {
-      body = urlEncode(formData);
+      body = toLatin1(encoder.encode(urlEncode(formData)));
       contentType = 'application/x-www-form-urlencoded';
     }
     globalThis.__tbFormNavigate(action, target, 'POST', body, contentType);
