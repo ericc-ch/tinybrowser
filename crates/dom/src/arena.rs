@@ -1555,7 +1555,12 @@ impl Dom {
                 .replace(['\r', '\n'], "")
                 .trim_matches(|character: char| character.is_ascii_whitespace())
                 .to_owned(),
-            "number" | "range" => sanitize_grammar(value, is_valid_floating_point),
+            "number" => sanitize_grammar(value, is_valid_floating_point),
+            "range" => sanitize_range_value(
+                &value,
+                self.attribute(id, "min").as_deref().and_then(parse_finite),
+                self.attribute(id, "max").as_deref().and_then(parse_finite),
+            ),
             "date" => sanitize_grammar(value, is_valid_date),
             "month" => sanitize_grammar(value, is_valid_month),
             "week" => sanitize_grammar(value, is_valid_week),
@@ -2924,6 +2929,43 @@ impl Dom {
 /// string, the default for every grammar-constrained input state except color.
 fn sanitize_grammar(value: String, valid: fn(&str) -> bool) -> String {
     if valid(&value) { value } else { String::new() }
+}
+
+/// Parses a finite floating-point number, or `None` when the text is not a
+/// valid floating-point number.
+fn parse_finite(text: &str) -> Option<f64> {
+    if !is_valid_floating_point(text) {
+        return None;
+    }
+    text.parse::<f64>().ok().filter(|number| number.is_finite())
+}
+
+/// The range state's value sanitization: an invalid value becomes the default
+/// (the midpoint of the range, or 50), then the value is clamped to the
+/// min/max range
+/// (<https://html.spec.whatwg.org/multipage/input.html#range-state-(type=range):value-sanitization-algorithm>).
+fn sanitize_range_value(value: &str, min: Option<f64>, max: Option<f64>) -> String {
+    let mut number = parse_finite(value).unwrap_or(f64::NAN);
+    if !number.is_finite() {
+        number = match (min, max) {
+            (Some(min), Some(max)) if max < min => min,
+            (Some(min), Some(max)) => min + (max - min) / 2.0,
+            (Some(min), None) => min,
+            (None, Some(max)) => max - max / 2.0,
+            (None, None) => 50.0,
+        };
+    }
+    if let Some(min) = min
+        && number < min
+    {
+        number = min;
+    }
+    if let Some(max) = max
+        && number > max
+    {
+        number = max;
+    }
+    format!("{number}")
 }
 
 /// Replaces CRLF and lone CR with LF

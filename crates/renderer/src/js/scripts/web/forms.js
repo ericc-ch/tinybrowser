@@ -264,7 +264,7 @@
   };
   const parseMonth = value => {
     const match = /^(\d{4,6})-(\d{2})$/.exec(value);
-    return match ? (+match[1]) * 12 + (+match[2]) - 1 : null;
+    return match ? (+match[1] - 1970) * 12 + (+match[2]) - 1 : null;
   };
   const epochMonday = (() => {
     const januaryFirst = daysFromCivil(1970, 1, 1);
@@ -1085,6 +1085,244 @@
         const option = this.options[Number(index)];
         if (option !== undefined) option.remove();
       },
+      writable: true, enumerable: true, configurable: true,
+    },
+  });
+
+  // ── input valueAsNumber / valueAsDate / stepUp / stepDown ──────────────
+
+  const DATE_LIKE = new Set(['date', 'month', 'week', 'time', 'datetime-local']);
+
+  const civilFromDays = days => {
+    const z = days + 719468;
+    const era = Math.floor((z >= 0 ? z : z - 146096) / 146097);
+    const dayOfEra = z - era * 146097;
+    const yearOfEra = Math.floor(
+      (dayOfEra - Math.floor(dayOfEra / 1460) + Math.floor(dayOfEra / 36524)
+        - Math.floor(dayOfEra / 146096)) / 365,
+    );
+    const year = yearOfEra + era * 400;
+    const dayOfYear = dayOfEra - (365 * yearOfEra + Math.floor(yearOfEra / 4) - Math.floor(yearOfEra / 100));
+    const mp = Math.floor((5 * dayOfYear + 2) / 153);
+    const day = dayOfYear - Math.floor((153 * mp + 2) / 5) + 1;
+    const month = mp + (mp < 10 ? 3 : -9);
+    return { year: year + (month <= 2 ? 1 : 0), month, day };
+  };
+  const pad = (number, width) => String(number).padStart(width, '0');
+  const formatDate = days => {
+    const { year, month, day } = civilFromDays(days);
+    return `${pad(year, 4)}-${pad(month, 2)}-${pad(day, 2)}`;
+  };
+  const formatMonth = index => {
+    const months = index + 1970 * 12;
+    return `${pad(Math.floor(months / 12), 4)}-${pad((months % 12) + 1, 2)}`;
+  };
+  const formatWeek = weeks => {
+    const days = epochMonday + weeks * 7;
+    const { year } = civilFromDays(days + 3);
+    const januaryFourth = daysFromCivil(year, 1, 4);
+    const mondayOfWeekOne = januaryFourth - weekdayFromDays(januaryFourth);
+    return `${pad(year, 4)}-W${pad(Math.round((days - mondayOfWeekOne) / 7) + 1, 2)}`;
+  };
+  const formatTime = seconds => {
+    const whole = Math.floor(seconds);
+    const millis = Math.round((seconds - whole) * 1000);
+    const base = `${pad(Math.floor(whole / 3600), 2)}:${pad(Math.floor((whole % 3600) / 60), 2)}`;
+    if (millis === 0 && whole % 60 === 0) return base;
+    const withSeconds = `${base}:${pad(whole % 60, 2)}`;
+    return millis === 0 ? withSeconds : `${withSeconds}.${pad(millis, 3).replace(/0+$/, '')}`;
+  };
+
+  // The input's value as a number in each state's scale, or NaN
+  // (<https://html.spec.whatwg.org/multipage/input.html#value-as-a-number>).
+  const valueAsNumberOf = element => {
+    const type = inputType(element);
+    const value = element.value;
+    if (value === '') return NaN;
+    switch (type) {
+      case 'number': case 'range': {
+        const number = Number(value);
+        return Number.isNaN(number) ? NaN : number;
+      }
+      case 'date': {
+        const days = parseDate(value);
+        return days === null ? NaN : days * 86400000;
+      }
+      case 'month': {
+        const index = parseMonth(value);
+        return index === null ? NaN : index;
+      }
+      case 'week': {
+        const weeks = parseWeek(value);
+        return weeks === null ? NaN : (epochMonday + weeks * 7) * 86400000;
+      }
+      case 'time': {
+        const seconds = parseTime(value);
+        return seconds === null ? NaN : seconds * 1000;
+      }
+      case 'datetime-local': {
+        const seconds = parseLocalDateTime(value);
+        return seconds === null ? NaN : seconds * 1000;
+      }
+      default: return NaN;
+    }
+  };
+
+  const whole = value => Math.abs(value - Math.round(value)) < 1e-9;
+  const formatValueAsNumber = (type, number) => {
+    switch (type) {
+      case 'number': case 'range': return String(number);
+      case 'date': return whole(number / 86400000) ? formatDate(Math.round(number / 86400000)) : '';
+      case 'month': return whole(number) ? formatMonth(number) : '';
+      case 'week': {
+        if (!whole(number / 86400000)) return '';
+        return formatWeek((Math.round(number / 86400000) - epochMonday) / 7);
+      }
+      case 'time': {
+        const normalized = ((number % 86400000) + 86400000) % 86400000;
+        return formatTime(normalized / 1000);
+      }
+      case 'datetime-local': {
+        const days = Math.floor(number / 86400000);
+        return `${formatDate(days)}T${formatTime((number - days * 86400000) / 1000)}`;
+      }
+      default: return '';
+    }
+  };
+
+  const setValueAsNumber = (element, value) => {
+    const type = inputType(element);
+    if (type !== 'number' && type !== 'range' && !DATE_LIKE.has(type)) {
+      throw new DOMException('valueAsNumber is not applicable', 'InvalidStateError');
+    }
+    const number = Number(value);
+    element.value = Number.isNaN(number) ? '' : formatValueAsNumber(type, number);
+  };
+
+  // `valueAsDate` applies to date, month, week, and time
+  // (<https://html.spec.whatwg.org/multipage/input.html#dom-input-valueasdate>).
+  const DATE_VALUE_TYPES = new Set(['date', 'month', 'week', 'time']);
+  const valueAsDateOf = element => {
+    const type = inputType(element);
+    if (!DATE_VALUE_TYPES.has(type) || element.value === '') return null;
+    let milliseconds = NaN;
+    if (type === 'date') {
+      const days = parseDate(element.value);
+      if (days !== null) milliseconds = days * 86400000;
+    } else if (type === 'month') {
+      const index = parseMonth(element.value);
+      if (index !== null) {
+        const months = index + 1970 * 12;
+        milliseconds = daysFromCivil(Math.floor(months / 12), (months % 12) + 1, 1) * 86400000;
+      }
+    } else if (type === 'week') {
+      const weeks = parseWeek(element.value);
+      if (weeks !== null) milliseconds = (epochMonday + weeks * 7) * 86400000;
+    } else {
+      const seconds = parseTime(element.value);
+      if (seconds !== null) milliseconds = seconds * 1000;
+    }
+    return Number.isNaN(milliseconds) ? null : new Date(milliseconds);
+  };
+  const setValueAsDate = (element, value) => {
+    const type = inputType(element);
+    if (!DATE_VALUE_TYPES.has(type)) {
+      throw new DOMException('valueAsDate is not applicable', 'InvalidStateError');
+    }
+    if (value === null) { element.value = ''; return; }
+    if (!(value instanceof globalThis.Date)) {
+      throw new TypeError('valueAsDate requires a Date');
+    }
+    const time = value.getTime();
+    if (Number.isNaN(time)) { element.value = ''; return; }
+    if (type === 'date') {
+      element.value = whole(time / 86400000) ? formatDate(Math.round(time / 86400000)) : '';
+    } else if (type === 'month') {
+      const { year, month } = civilFromDays(Math.floor(time / 86400000));
+      element.value = formatMonth((year - 1970) * 12 + month - 1);
+    } else if (type === 'week') {
+      element.value = formatWeek((Math.floor(time / 86400000) - epochMonday) / 7);
+    } else {
+      const normalized = ((time % 86400000) + 86400000) % 86400000;
+      element.value = formatTime(normalized / 1000);
+    }
+  };
+
+  // The value serialized in each state's `parseValue` unit, for `stepUp`.
+  const formatValueInUnit = (type, value) => {
+    switch (type) {
+      case 'number': case 'range': return String(value);
+      case 'date': return formatDate(value);
+      case 'month': return formatMonth(value);
+      case 'week': return formatWeek(value);
+      case 'time': return formatTime(value);
+      case 'datetime-local': {
+        const days = Math.floor(value / 86400);
+        return `${formatDate(days)}T${formatTime(value - days * 86400)}`;
+      }
+      default: return '';
+    }
+  };
+
+  // Moves the value by `count` steps
+  // (<https://html.spec.whatwg.org/multipage/input.html#dom-input-stepup>).
+  const stepBy = (element, count, direction) => {
+    const type = inputType(element);
+    const fallback = STEP_DEFAULT[type];
+    if (fallback === undefined) {
+      throw new DOMException('stepUp is not applicable', 'InvalidStateError');
+    }
+    const raw = element.getAttribute('step');
+    if (raw !== null && raw.trim().toLowerCase() === 'any') {
+      throw new DOMException('step is any', 'InvalidStateError');
+    }
+    let step = raw === null ? fallback : Number(raw);
+    if (Number.isNaN(step) || step <= 0) step = fallback;
+    const min = parseValue(type, element.getAttribute('min'));
+    const max = parseValue(type, element.getAttribute('max'));
+    if (min !== null && max !== null && min > max) return;
+    const base = min === null ? 0 : min;
+    const alignUp = value => base + Math.ceil((value - base) / step - 1e-9) * step;
+    const alignDown = value => base + Math.floor((value - base) / step + 1e-9) * step;
+    // Nothing in [min, max] is representable: nothing to do.
+    if (min !== null && max !== null && alignUp(min) > max + 1e-9) return;
+    const parsed = parseValue(type, element.value);
+    const wasEmpty = parsed === null;
+    let value = parsed === null ? 0 : parsed;
+    const valueBefore = value;
+    const quotient = (value - base) / step;
+    if (Math.abs(quotient - Math.round(quotient)) > 1e-9) {
+      // Snap to the nearest representable value in the stepping direction.
+      value = direction > 0 ? alignUp(value) : alignDown(value);
+    } else {
+      value += direction * step * count;
+    }
+    if (min !== null && value < min) value = alignUp(min);
+    if (max !== null && value > max) value = alignDown(max);
+    if (!wasEmpty) {
+      if (direction < 0 && value > valueBefore) return;
+      if (direction > 0 && value < valueBefore) return;
+    }
+    element.value = formatValueInUnit(type, value);
+  };
+
+  Object.defineProperties(globalThis.HTMLInputElement.prototype, {
+    valueAsNumber: {
+      get() { return valueAsNumberOf(this); },
+      set(value) { setValueAsNumber(this, value); },
+      configurable: true,
+    },
+    valueAsDate: {
+      get() { return valueAsDateOf(this); },
+      set(value) { setValueAsDate(this, value); },
+      configurable: true,
+    },
+    stepUp: {
+      value: function(count) { stepBy(this, count === undefined ? 1 : Number(count), 1); },
+      writable: true, enumerable: true, configurable: true,
+    },
+    stepDown: {
+      value: function(count) { stepBy(this, count === undefined ? 1 : Number(count), -1); },
       writable: true, enumerable: true, configurable: true,
     },
   });
