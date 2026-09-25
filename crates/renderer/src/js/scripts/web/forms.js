@@ -91,14 +91,28 @@
     }
   };
 
+  // The scope a radio button group lives in: its form owner, or the root of
+  // its tree (which may be detached)
+  // (<https://html.spec.whatwg.org/multipage/input.html#radio-button-group>).
+  const radioRoot = element => {
+    if (element.form) return element.form;
+    if (typeof element.getRootNode === 'function') return element.getRootNode();
+    return element.ownerDocument;
+  };
+  const radiosIn = root => {
+    if (!root) return [];
+    if (typeof root.querySelectorAll === 'function') return Array.from(root.querySelectorAll('input'));
+    if (typeof root.getElementsByTagName === 'function') return Array.from(root.getElementsByTagName('input'));
+    return [];
+  };
+
   const anyRadioChecked = element => {
     if (element.checked) return true;
     const name = element.name;
     if (!name) return false;
-    const root = element.form || element.ownerDocument;
-    if (!root || typeof root.getElementsByTagName !== 'function') return false;
-    for (const radio of root.getElementsByTagName('input')) {
-      if (radio !== element && radio.type === 'radio' && radio.name === name && radio.checked) {
+    for (const radio of radiosIn(radioRoot(element))) {
+      if (radio !== element && radio.type === 'radio' && radio.name === name
+          && radio.form === element.form && radio.checked) {
         return true;
       }
     }
@@ -113,10 +127,9 @@
     if (element.required) return true;
     const name = element.name;
     if (!name) return false;
-    const root = element.form || element.ownerDocument;
-    if (!root || typeof root.getElementsByTagName !== 'function') return false;
-    for (const radio of root.getElementsByTagName('input')) {
-      if (radio.type === 'radio' && radio.name === name && radio.required) return true;
+    for (const radio of radiosIn(radioRoot(element))) {
+      if (radio.type === 'radio' && radio.name === name
+          && radio.form === element.form && radio.required) return true;
     }
     return false;
   };

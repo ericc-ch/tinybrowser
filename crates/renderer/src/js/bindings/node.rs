@@ -1511,6 +1511,22 @@ impl JsNode {
         self.reflect_boolean(ctx, "multiple", value)
     }
 
+    // https://html.spec.whatwg.org/multipage/forms.html#dom-fae-form
+    #[qjs(get, rename = "form")]
+    fn form<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
+        let form = {
+            let world = world(&ctx)?;
+            let world = world.borrow();
+            world
+                .document(self.handle.0)
+                .and_then(|parsed| parsed.dom.form_owner(self.handle.0))
+        };
+        match form {
+            Some(form) => wrap_node(&ctx, form),
+            None => Ok(Value::new_null(ctx)),
+        }
+    }
+
     // https://html.spec.whatwg.org/multipage/input.html#dom-input-checked
     #[qjs(get)]
     fn checked(&self, ctx: Ctx<'_>) -> Result<bool> {
@@ -1528,7 +1544,7 @@ impl JsNode {
         let Some(mut parsed) = world.document_mut(self.handle.0) else {
             return Ok(());
         };
-        parsed.dom.set_checkedness(self.handle.0, value);
+        parsed.dom.set_input_checkedness(self.handle.0, value);
         Ok(())
     }
 

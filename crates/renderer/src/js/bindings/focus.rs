@@ -251,16 +251,126 @@ pub(crate) fn element_click(ctx: &Ctx<'_>, node: NodeId) -> Result<()> {
         if is_focusable(ctx, node)? {
             focus_node(ctx, node)?;
         }
+        // The legacy-pre-activation behavior updates checkedness before the
+        // `click` event, so a handler observes the new state; a canceled click
+        // restores it afterwards
+        // (<https://html.spec.whatwg.org/multipage/input.html#the-input-element:legacy-pre-activation-behavior>).
+        let previous = legacy_pre_activation(ctx, node)?;
         let event = Class::instance(ctx.clone(), events::JsEvent::uninitialized())?;
         event.borrow().initialize("click".to_owned(), true, true);
         let not_canceled = events::dispatch_event(ctx, EventTargetKey::Node(node), &event)?;
         if not_canceled {
-            run_activation(ctx, node)?;
+            complete_activation(ctx, node)?;
+        } else {
+            legacy_canceled_activation(ctx, node, &previous)?;
         }
         Ok(())
     })();
     world.borrow_mut().set_click_in_progress(node, false);
     result
+}
+
+/// The checkedness state a canceled click restores.
+enum PreActivation {
+    None,
+    Checkbox {
+        checked: bool,
+        indeterminate: bool,
+    },
+    Radio(Option<NodeId>),
+}
+
+/// The legacy-pre-activation behavior: a checkbox toggles, a radio becomes
+/// checked and remembers the group's previous checked radio.
+fn legacy_pre_activation(ctx: &Ctx<'_>, node: NodeId) -> Result<PreActivation> {
+    let world = world_for_node(ctx, node)?;
+    let world = world.borrow();
+    let Some(mut parsed) = world.document_mut(node) else {
+        return Ok(PreActivation::None);
+    };
+    let dom = &mut parsed.dom;
+    let type_attr = dom
+        .attribute(node, "type")
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    Ok(match type_attr.as_str() {
+        "checkbox" => {
+            let previous = PreActivation::Checkbox {
+                checked: dom.checkedness(node),
+                indeterminate: dom.indeterminate(node),
+            };
+            let next = !dom.checkedness(node);
+            dom.set_input_checkedness(node, next);
+            dom.set_indeterminate(node, false);
+            previous
+        }
+        "radio" => {
+            let previous = dom.radio_group_checked(node);
+            dom.set_input_checkedness(node, true);
+            PreActivation::Radio(previous)
+        }
+        _ => PreActivation::None,
+    })
+}
+
+/// The legacy-canceled-activation behavior: undo the pre-activation change.
+fn legacy_canceled_activation(ctx: &Ctx<'_>, node: NodeId, previous: &PreActivation) -> Result<()> {
+    let world = world_for_node(ctx, node)?;
+    let world = world.borrow();
+    let Some(mut parsed) = world.document_mut(node) else {
+        return Ok(());
+    };
+    let dom = &mut parsed.dom;
+    match previous {
+        PreActivation::Checkbox {
+            checked,
+            indeterminate,
+        } => {
+            dom.set_input_checkedness(node, *checked);
+            dom.set_indeterminate(node, *indeterminate);
+        }
+        PreActivation::Radio(Some(other)) => {
+            dom.set_input_checkedness(node, false);
+            dom.set_input_checkedness(*other, true);
+        }
+        PreActivation::Radio(None) => {
+            dom.set_input_checkedness(node, false);
+        }
+        PreActivation::None => {}
+    }
+    Ok(())
+}
+
+/// The post-click activation for a non-canceled click. A checkbox or radio
+/// already changed checkedness in pre-activation, so only its events fire;
+/// other controls run their activation behavior.
+fn complete_activation(ctx: &Ctx<'_>, node: NodeId) -> Result<()> {
+    let world = world_for_node(ctx, node)?;
+    let checkable = {
+        let world = world.borrow();
+        world.document(node).is_some_and(|parsed| {
+            parsed
+                .dom
+                .attribute(node, "type")
+                .is_some_and(|value| {
+                    let value = value.trim().to_ascii_lowercase();
+                    value == "checkbox" || value == "radio"
+                })
+        })
+    };
+    if checkable {
+        fire_checkable_events(ctx, node)
+    } else {
+        run_activation(ctx, node)
+    }
+}
+
+/// Fires the `input` and `change` events a checkbox/radio activation produces.
+fn fire_checkable_events(ctx: &Ctx<'_>, node: NodeId) -> Result<()> {
+    events::fire_trusted(ctx, EventTargetKey::Node(node), "input", true, false)?;
+    events::fire_trusted(ctx, EventTargetKey::Node(node), "change", true, false)?;
+    Ok(())
 }
 
 /// What a clicked control does.
@@ -284,19 +394,6 @@ fn nearest_form(dom: &dom::Dom, node: NodeId) -> Option<NodeId> {
         current = dom.parent(parent);
     }
     None
-}
-
-/// Whether `node` is a radio button with the given group name.
-fn is_radio_named(dom: &dom::Dom, node: NodeId, group_name: &str) -> bool {
-    let Some(NodeKind::Element { name, .. }) = dom.kind(node) else {
-        return false;
-    };
-    name.ns == html_namespace()
-        && name.local.as_ref() == "input"
-        && dom
-            .attribute(node, "type")
-            .is_some_and(|value| value.trim().eq_ignore_ascii_case("radio"))
-        && dom.attribute(node, "name").unwrap_or_default() == group_name
 }
 
 /// The checkbox/radio activation behavior: toggle (checkbox) or set (radio)
@@ -325,7 +422,7 @@ fn toggle_checkedness(ctx: &Ctx<'_>, node: NodeId) -> Result<()> {
         match type_attr.as_str() {
             "checkbox" => {
                 let next = !dom.checkedness(node);
-                dom.set_checkedness(node, next);
+                dom.set_input_checkedness(node, next);
                 true
             }
             "radio" => {
@@ -333,16 +430,7 @@ fn toggle_checkedness(ctx: &Ctx<'_>, node: NodeId) -> Result<()> {
                 if dom.checkedness(node) {
                     false
                 } else {
-                    let group_name = dom.attribute(node, "name").unwrap_or_default();
-                    let scope = nearest_form(dom, node).unwrap_or_else(|| dom.document());
-                    let members: Vec<NodeId> = dom
-                        .descendants(scope)
-                        .filter(|&other| other != node && is_radio_named(dom, other, &group_name))
-                        .collect();
-                    for other in members {
-                        dom.set_checkedness(other, false);
-                    }
-                    dom.set_checkedness(node, true);
+                    dom.set_input_checkedness(node, true);
                     true
                 }
             }

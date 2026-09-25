@@ -1888,6 +1888,93 @@ impl Dom {
         self.checkedness.insert(id, checked);
     }
 
+    /// Sets an input's checkedness, unchecking the rest of a radio button
+    /// group when checking a radio
+    /// (<https://html.spec.whatwg.org/multipage/input.html#radio-button-state-(type=radio)>).
+    pub fn set_input_checkedness(&mut self, id: NodeId, checked: bool) {
+        if checked
+            && self.input_type(id).as_deref() == Some("radio")
+            && let Some(name) = self.attribute(id, "name")
+            && !name.is_empty()
+        {
+            let owner = self.nearest_form_ancestor(id);
+            let scope = owner.unwrap_or_else(|| self.tree_root_of(id));
+            let others: Vec<NodeId> = self
+                .descendants(scope)
+                .filter(|&other| {
+                    other != id
+                        && self.is_radio_named(other, &name)
+                        && self.nearest_form_ancestor(other) == owner
+                })
+                .collect();
+            for other in others {
+                self.checkedness.insert(other, false);
+            }
+        }
+        self.checkedness.insert(id, checked);
+    }
+
+    /// The form owner of a form-associated element: the form named by its
+    /// `form` attribute, else its nearest ancestor form
+    /// (<https://html.spec.whatwg.org/multipage/forms.html#form-owner>).
+    #[must_use]
+    pub fn form_owner(&self, id: NodeId) -> Option<NodeId> {
+        if let Some(reference) = self.attribute(id, "form")
+            && !reference.is_empty()
+        {
+            let root = self.tree_root_of(id);
+            let found = self.descendants(root).find(|&other| {
+                self.html_local_is(other, "form")
+                    && self.attribute(other, "id").as_deref() == Some(reference.as_str())
+            });
+            if found.is_some() {
+                return found;
+            }
+        }
+        self.nearest_form_ancestor(id)
+    }
+
+    /// The checked radio in `id`'s radio button group, if any.
+    #[must_use]
+    pub fn radio_group_checked(&self, id: NodeId) -> Option<NodeId> {
+        let name = self.attribute(id, "name")?;
+        if name.is_empty() {
+            return None;
+        }
+        let owner = self.nearest_form_ancestor(id);
+        let scope = owner.unwrap_or_else(|| self.tree_root_of(id));
+        self.descendants(scope).find(|&other| {
+            other != id && self.is_radio_named(other, &name) && self.checkedness(other)
+        })
+    }
+
+    /// The nearest ancestor `form` of `node`, if any.
+    fn nearest_form_ancestor(&self, node: NodeId) -> Option<NodeId> {
+        let mut current = self.parent(node);
+        while let Some(parent) = current {
+            if self.html_local_is(parent, "form") {
+                return Some(parent);
+            }
+            current = self.parent(parent);
+        }
+        None
+    }
+
+    /// The root of `node`'s tree, for grouping radios outside any form.
+    fn tree_root_of(&self, node: NodeId) -> NodeId {
+        let mut current = node;
+        while let Some(parent) = self.parent(current) {
+            current = parent;
+        }
+        current
+    }
+
+    /// Whether `node` is a radio with the given group name.
+    fn is_radio_named(&self, node: NodeId, name: &str) -> bool {
+        self.input_type(node).as_deref() == Some("radio")
+            && self.attribute(node, "name").as_deref() == Some(name)
+    }
+
     /// An `input`'s indeterminateness
     /// (<https://html.spec.whatwg.org/multipage/input.html#concept-input-indeterminate>).
     #[must_use]
