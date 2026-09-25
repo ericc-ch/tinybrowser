@@ -343,6 +343,9 @@
   // (<https://html.spec.whatwg.org/multipage/input.html#dom-input-files>).
   Object.defineProperty(table.HTMLInputElement, 'files', {
     get: function() {
+      // `files` applies only to the File Upload state
+      // (<https://html.spec.whatwg.org/multipage/input.html#dom-input-files>).
+      if (this.type !== 'file') return null;
       let list = this[inputFilesSymbol];
       if (list === undefined) {
         list = globalThis.__tbCreateFileList([]);
@@ -353,7 +356,13 @@
       return list;
     },
     set: function(value) {
-      // `input.files = fileList` replaces the list a script set
+      if (this.type !== 'file') return;
+      if (value === null) return;
+      if (!(value instanceof globalThis.FileList)) {
+        throw new TypeError('files must be a FileList');
+      }
+      // `input.files = fileList` replaces the list a script set; the same list
+      // can be shared across inputs
       // (<https://html.spec.whatwg.org/multipage/input.html#dom-input-files>).
       Object.defineProperty(this, inputFilesSymbol, {
         value: value, writable: true, enumerable: false, configurable: true,

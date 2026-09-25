@@ -1627,7 +1627,7 @@ impl Dom {
             "month" => sanitize_grammar(value, is_valid_month),
             "week" => sanitize_grammar(value, is_valid_week),
             "time" => sanitize_grammar(value, is_valid_time),
-            "datetime-local" => sanitize_grammar(value, is_valid_local_date_time),
+            "datetime-local" => sanitize_local_date_time_value(&value),
             "color" => {
                 if is_valid_simple_color(&value) {
                     value.to_ascii_lowercase()
@@ -3068,6 +3068,33 @@ fn parse_finite(text: &str) -> Option<f64> {
         return None;
     }
     text.parse::<f64>().ok().filter(|number| number.is_finite())
+}
+
+/// The local date and time state's value sanitization: the separator becomes
+/// `T` and the time is normalized.
+fn sanitize_local_date_time_value(value: &str) -> String {
+    if !is_valid_local_date_time(value) {
+        return String::new();
+    }
+    let Some((date, time)) = value.split_once(['T', ' ']) else {
+        return String::new();
+    };
+    format!("{date}T{}", normalize_time(time))
+}
+
+/// Drops a zero seconds field and a zero fraction from a valid time string.
+fn normalize_time(time: &str) -> String {
+    let mut result = time.to_owned();
+    if let Some((base, fraction)) = result.split_once('.')
+        && fraction.bytes().all(|byte| byte == b'0')
+    {
+        result.truncate(base.len());
+    }
+    let parts: Vec<&str> = result.split(':').collect();
+    if parts.len() == 3 && parts[2] == "00" {
+        result = format!("{}:{}", parts[0], parts[1]);
+    }
+    result
 }
 
 /// The range state's value sanitization: an invalid value becomes the default

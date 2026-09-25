@@ -555,7 +555,9 @@
     },
     select: {
       value: function() {
-        if (this.tagName === 'INPUT' && !isTextControl(this)) return;
+        // A control with no selectable text is a no-op
+        // (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#dom-textarea/input-select>).
+        if (!selectionApplies(this)) return;
         applySelection(this, 0, this.value.length, 'none');
       },
       writable: true, enumerable: true, configurable: true,
@@ -1325,6 +1327,18 @@
       value: function(count) { stepBy(this, count === undefined ? 1 : Number(count), -1); },
       writable: true, enumerable: true, configurable: true,
     },
+  });
+
+  // The `list` attribute's datalist, or null
+  // (<https://html.spec.whatwg.org/multipage/input.html#dom-input-list>).
+  Object.defineProperty(globalThis.HTMLInputElement.prototype, 'list', {
+    get() {
+      const id = this.getAttribute('list');
+      if (id === null) return null;
+      const element = this.ownerDocument.getElementById(id);
+      return element !== null && element.tagName === 'DATALIST' ? element : null;
+    },
+    configurable: true,
   });
 
   // ── form controls collection ───────────────────────────────────────────

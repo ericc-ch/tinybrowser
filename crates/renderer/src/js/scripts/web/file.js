@@ -381,6 +381,7 @@ Object.defineProperty(globalThis.FileReader.prototype, Symbol.toStringTag, { val
 // (<https://html.spec.whatwg.org/multipage/dnd.html#datatransfer>).
 const __tbDataTransferFiles = Symbol('tb-data-transfer-files');
 const __tbDataTransferItems = Symbol('tb-data-transfer-items');
+const __tbDataTransferFileList = Symbol('tb-data-transfer-file-list');
 globalThis.DataTransfer = class DataTransfer {
   constructor() {
     Object.defineProperty(this, __tbDataTransferFiles, {
@@ -404,7 +405,16 @@ globalThis.DataTransfer = class DataTransfer {
     return items;
   }
   get files() {
-    return globalThis.__tbCreateFileList(this[__tbDataTransferFiles].slice());
+    // `files` is a `[SameObject]` FileList over the DataTransfer's items
+    // (<https://html.spec.whatwg.org/multipage/dnd.html#dom-datatransfer-files>).
+    if (this[__tbDataTransferFileList] === undefined) {
+      Object.defineProperty(this, __tbDataTransferFileList, {
+        value: globalThis.__tbCreateFileList(this[__tbDataTransferFiles]),
+        writable: false, enumerable: false, configurable: false,
+      });
+    }
+    __tbBrand(this[__tbDataTransferFileList], __tbFileListData).files = this[__tbDataTransferFiles];
+    return this[__tbDataTransferFileList];
   }
 };
 Object.defineProperty(globalThis.DataTransfer.prototype, Symbol.toStringTag, {
