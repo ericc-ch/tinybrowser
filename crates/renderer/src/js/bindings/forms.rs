@@ -8,7 +8,7 @@
 use super::{host_node_id, is_html_element, with_node_kind, world};
 use crate::js::{FrameNavigation, World};
 use dom::{NodeId, NodeKind, html_namespace};
-use rquickjs::{Ctx, Object, Result, Value};
+use rquickjs::{Array, Ctx, Object, Persistent, Result, Value};
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -22,7 +22,18 @@ pub(super) fn install(_ctx: &Ctx<'_>, globals: &Object<'_>) -> Result<()> {
         "__tbFormNavigate",
         rquickjs::prelude::Func::from(form_navigate),
     )?;
+    globals.set(
+        "__tbSetInputFiles",
+        rquickjs::prelude::Func::from(set_input_files),
+    )?;
     Ok(())
+}
+
+/// A control's contribution to the entry list, resolved inside one world
+/// borrow; file controls read their JS `files` after the borrow ends.
+enum PendingEntry {
+    Text(String, String),
+    Files(String, NodeId),
 }
 
 /// The form's entry list as `[name, value, ...]`, in tree order.
@@ -30,8 +41,8 @@ pub(super) fn install(_ctx: &Ctx<'_>, globals: &Object<'_>) -> Result<()> {
     clippy::needless_pass_by_value,
     reason = "rquickjs Func ABI passes arguments by value"
 )]
-pub(super) fn form_entries<'js>(ctx: Ctx<'js>, form: Value<'js>) -> Result<Vec<String>> {
-    let mut entries = Vec::new();
+pub(super) fn form_entries<'js>(ctx: Ctx<'js>, form: Value<'js>) -> Result<Array<'js>> {
+    let entries = Array::new(ctx.clone())?;
     let Some(id) = host_node_id(&ctx, &form) else {
         return Ok(entries);
     };
@@ -39,90 +50,172 @@ pub(super) fn form_entries<'js>(ctx: Ctx<'js>, form: Value<'js>) -> Result<Vec<S
         return Ok(entries);
     }
     let world_rc = world(&ctx)?;
-    let world = world_rc.borrow();
-    let Some(parsed) = world.document(id) else {
-        return Ok(entries);
+    let pending: Vec<PendingEntry> = {
+        let world = world_rc.borrow();
+        let Some(parsed) = world.document(id) else {
+            return Ok(entries);
+        };
+        // Pre-order traversal: an explicit stack with reversed children keeps
+        // document order.
+        let mut order = Vec::new();
+        let mut stack = vec![id];
+        while let Some(node) = stack.pop() {
+            order.push(node);
+            let children: Vec<NodeId> = parsed
+                .dom
+                .children(node)
+                .map(Iterator::collect)
+                .unwrap_or_default();
+            for child in children.into_iter().rev() {
+                stack.push(child);
+            }
+        }
+        let mut pending = Vec::new();
+        for node in order {
+            if node == id {
+                continue;
+            }
+            let Some(NodeKind::Element { name, .. }) = parsed.dom.kind(node) else {
+                continue;
+            };
+            if name.ns != html_namespace() {
+                continue;
+            }
+            let local = name.local.as_ref();
+            if local != "input" && local != "textarea" && local != "select" {
+                continue;
+            }
+            // A control without a name, or disabled, contributes nothing
+            // (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#constructing-form-data-set>).
+            let Some(control_name) = parsed.dom.attribute(node, "name") else {
+                continue;
+            };
+            if control_name.is_empty() || parsed.dom.attribute(node, "disabled").is_some() {
+                continue;
+            }
+            match local {
+                "textarea" => {
+                    let mut value = parsed.dom.textarea_value(node).unwrap_or_default();
+                    if wrap_is_hard(parsed.dom.attribute(node, "wrap").as_deref()) {
+                        let cols = parse_positive(parsed.dom.attribute(node, "cols").as_deref())
+                            .unwrap_or(20);
+                        value = hard_wrap(&value, cols);
+                    }
+                    pending.push(PendingEntry::Text(control_name, value));
+                }
+                "input" => {
+                    let typ = parsed
+                        .dom
+                        .attribute(node, "type")
+                        .unwrap_or_else(|| "text".to_owned());
+                    let typ = typ.trim().to_ascii_lowercase();
+                    if matches!(
+                        typ.as_str(),
+                        "submit" | "reset" | "button" | "image" | "checkbox" | "radio"
+                    ) {
+                        continue;
+                    }
+                    if typ == "file" {
+                        pending.push(PendingEntry::Files(control_name, node));
+                    } else {
+                        pending.push(PendingEntry::Text(
+                            control_name,
+                            parsed.dom.input_value(node).unwrap_or_default(),
+                        ));
+                    }
+                }
+                // A `select` contributes through selectedness, which lands
+                // with the select unit.
+                _ => {}
+            }
+        }
+        pending
     };
-    // Pre-order traversal: an explicit stack with reversed children keeps
-    // document order.
-    let mut order = Vec::new();
-    let mut stack = vec![id];
-    while let Some(node) = stack.pop() {
-        order.push(node);
-        let children: Vec<NodeId> = parsed
-            .dom
-            .children(node)
-            .map(Iterator::collect)
-            .unwrap_or_default();
-        for child in children.into_iter().rev() {
-            stack.push(child);
-        }
-    }
-    for node in order {
-        if node == id {
-            continue;
-        }
-        let Some(NodeKind::Element { name, .. }) = parsed.dom.kind(node) else {
-            continue;
-        };
-        if name.ns != html_namespace() {
-            continue;
-        }
-        let local = name.local.as_ref();
-        if local != "input" && local != "textarea" && local != "select" {
-            continue;
-        }
-        // A control without a name, or disabled, contributes nothing
-        // (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#constructing-form-data-set>).
-        let Some(control_name) = parsed.dom.attribute(node, "name") else {
-            continue;
-        };
-        if control_name.is_empty() || parsed.dom.attribute(node, "disabled").is_some() {
-            continue;
-        }
-        match local {
-            "textarea" => {
-                let mut value = parsed.dom.textarea_value(node).unwrap_or_default();
-                if wrap_is_hard(parsed.dom.attribute(node, "wrap").as_deref()) {
-                    let cols = parse_positive(parsed.dom.attribute(node, "cols").as_deref())
-                        .unwrap_or(20);
-                    value = hard_wrap(&value, cols);
-                }
-                entries.push(control_name);
-                entries.push(value);
+    for entry in pending {
+        match entry {
+            PendingEntry::Text(name, value) => {
+                let index = entries.len();
+                entries.set(index, name)?;
+                entries.set(index + 1, value)?;
             }
-            "input" => {
-                // Only text-entry inputs for now; checkbox/radio/select need
-                // checkedness/selectedness state that lands with the input
-                // units.
-                let typ = parsed
-                    .dom
-                    .attribute(node, "type")
-                    .unwrap_or_else(|| "text".to_owned());
-                let typ = typ.trim().to_ascii_lowercase();
-                if matches!(
-                    typ.as_str(),
-                    "submit"
-                        | "reset"
-                        | "button"
-                        | "image"
-                        | "checkbox"
-                        | "radio"
-                        | "file"
-                        | "hidden"
-                ) {
-                    continue;
-                }
-                entries.push(control_name);
-                entries.push(parsed.dom.input_value(node).unwrap_or_default());
+            PendingEntry::Files(name, node) => {
+                push_file_entries(&ctx, &entries, &world_rc, node, &name)?;
             }
-            _ => {}
         }
     }
     Ok(entries)
 }
 
-/// Whether a `textarea`'s `wrap` attribute is in the Hard state/// (<https://html.spec.whatwg.org/multipage/form-elements.html#attr-textarea-wrap>):
+/// Appends one `[name, File]` pair per file a script assigned to a `type=file`
+/// input, read from the world so it does not depend on JS wrapper identity
+/// (<https://html.spec.whatwg.org/multipage/input.html#dom-input-files>).
+fn push_file_entries<'js>(
+    ctx: &Ctx<'js>,
+    entries: &Array<'js>,
+    world: &Rc<RefCell<World>>,
+    node: NodeId,
+    name: &str,
+) -> Result<()> {
+    let files: Vec<Value<'js>> = {
+        let world = world.borrow();
+        world
+            .input_files(node)
+            .map(|saved| {
+                saved
+                    .iter()
+                    .filter_map(|saved| saved.clone().restore(ctx).ok())
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    for file in files {
+        let at = entries.len();
+        entries.set(at, name)?;
+        entries.set(at + 1, file)?;
+    }
+    Ok(())
+}
+
+/// The host half of the `input.files` setter: records the assigned file list so
+/// the form entry list can read it later.
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "rquickjs Func ABI passes arguments by value"
+)]
+pub(super) fn set_input_files<'js>(    ctx: Ctx<'js>,
+    element: Value<'js>,
+    files: Value<'js>,
+) -> Result<()> {
+    let Some(node) = host_node_id(&ctx, &element) else {
+        return Ok(());
+    };
+    let world_rc = world(&ctx)?;
+    let mut stored = Vec::new();
+    if let Some(object) = files.as_object() {
+        let length = object.get::<_, f64>("length").unwrap_or(0.0);
+        if length.is_finite() && length > 0.0 {
+            #[allow(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "a file count is a small non-negative integer"
+            )]
+            let length = (length as usize).min(1024);
+            for index in 0..length {
+                let Ok(file) = object.get::<_, Value>(index.to_string()) else {
+                    continue;
+                };
+                if !file.is_undefined() && !file.is_null() {
+                    stored.push(Persistent::save(&ctx, file));
+                }
+            }
+        }
+    }
+    world_rc.borrow_mut().set_input_files(node, stored);
+    Ok(())
+}
+
+/// Whether a `textarea`'s `wrap` attribute is in the Hard state
+/// (<https://html.spec.whatwg.org/multipage/form-elements.html#attr-textarea-wrap>):
 /// an enumerated attribute, ASCII case-insensitive.
 fn wrap_is_hard(wrap: Option<&str>) -> bool {
     wrap.is_some_and(|wrap| wrap.trim().eq_ignore_ascii_case("hard"))

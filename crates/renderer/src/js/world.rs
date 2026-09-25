@@ -319,6 +319,10 @@ pub(crate) struct World {
     frame_navigations: Vec<FrameNavigation>,
     /// Connected `<img>` elements whose `src` changed inside script.
     image_updates: Vec<NodeId>,
+    /// Files a script set on an `input[type=file]` through `input.files`, so
+    /// the form entry list reads them without depending on JS wrapper identity
+    /// (<https://html.spec.whatwg.org/multipage/input.html#dom-input-files>).
+    input_files: HashMap<NodeId, Vec<Persistent<Value<'static>>>>,
     /// Controls whose selection changed and owe a queued `select` event
     /// (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#set-the-selection-range>).
     /// Interior mutability because a selection setter only holds `&World`.
@@ -451,6 +455,7 @@ impl World {
             pending_html_writes: Vec::new(),
             frame_navigations: Vec::new(),
             image_updates: Vec::new(),
+            input_files: HashMap::new(),
             pending_selects: RefCell::new(Vec::new()),
             document_stream: Vec::new(),
             object_urls: HashMap::new(),
@@ -1048,6 +1053,16 @@ impl World {
 
     pub(crate) fn take_pending_selects(&mut self) -> Vec<NodeId> {
         std::mem::take(&mut *self.pending_selects.borrow_mut())
+    }
+
+    /// Records the file list a script assigned to a `type=file` input.
+    pub(crate) fn set_input_files(&mut self, id: NodeId, files: Vec<Persistent<Value<'static>>>) {
+        self.input_files.insert(id, files);
+    }
+
+    /// The file list a script assigned to a `type=file` input, if any.
+    pub(crate) fn input_files(&self, id: NodeId) -> Option<&[Persistent<Value<'static>>]> {
+        self.input_files.get(&id).map(Vec::as_slice)
     }
 
     /// Starts a fetch for `url`. If the current request is still available,

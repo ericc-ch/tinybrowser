@@ -326,6 +326,14 @@
       }
       return list;
     },
+    set: function(value) {
+      // `input.files = fileList` replaces the list a script set
+      // (<https://html.spec.whatwg.org/multipage/input.html#dom-input-files>).
+      Object.defineProperty(this, inputFilesSymbol, {
+        value: value, writable: true, enumerable: false, configurable: true,
+      });
+      globalThis.__tbSetInputFiles(this, value);
+    },
     enumerable: true,
     configurable: true,
   });

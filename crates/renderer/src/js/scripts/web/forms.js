@@ -451,14 +451,26 @@
     value: FormDataEvent, writable: true, configurable: true,
   });
 
-  // application/x-www-form-urlencoded: LF is normalized to CRLF and a space
-  // becomes `+` (<https://url.spec.whatwg.org/#concept-urlencoded-serializer>).
+  // application/x-www-form-urlencoded: LF is normalized to CRLF, a space
+  // becomes `+`, and the `!'()~` set is percent-encoded
+  // (<https://url.spec.whatwg.org/#concept-urlencoded-serializer>).
   const urlEncodePart = value =>
-    encodeURIComponent(value.replace(/\r\n|\r|\n/g, '\r\n')).replace(/%20/g, '+');
+    encodeURIComponent(value.replace(/\r\n|\r|\n/g, '\r\n'))
+      .replace(/%20/g, '+')
+      .replace(/[!'()~]/g, ch => `%${ch.charCodeAt(0).toString(16).toUpperCase()}`);
+  // A `File`/`Blob` entry serializes as its file name
+  // (<https://url.spec.whatwg.org/#concept-urlencoded-serializer>).
+  const entryValueString = value =>
+    (value !== null && typeof value === 'object' && typeof value.name === 'string')
+      ? value.name
+      : String(value);
+
   const urlEncode = formData => {
     const parts = [];
     for (const entry of formData) {
-      parts.push(`${urlEncodePart(String(entry[0]))}=${urlEncodePart(String(entry[1]))}`);
+      parts.push(
+        `${urlEncodePart(String(entry[0]))}=${urlEncodePart(entryValueString(entry[1]))}`,
+      );
     }
     return parts.join('&');
   };
@@ -492,11 +504,13 @@
   };
 
   const encodeTextPlain = formData => {
-    const lines = [];
+    let body = '';
     for (const entry of formData) {
-      lines.push(`${String(entry[0])}=${String(entry[1]).replace(/\r\n|\r|\n/g, '\r\n')}`);
+      const name = String(entry[0]).replace(/\r\n|\r|\n/g, '\r\n');
+      const value = entryValueString(entry[1]).replace(/\r\n|\r|\n/g, '\r\n');
+      body += `${name}=${value}\r\n`;
     }
-    return lines.join('\r\n');
+    return body;
   };
 
   const submitForm = (form, formData) => {
@@ -532,10 +546,20 @@
     globalThis.__tbFormNavigate(action, target, 'POST', body, contentType);
   };
 
+  // The submission algorithm's entry-list step: build the list, let a
+  // `formdata` handler extend it, then submit. `form.submit()` runs this
+  // without the `submit` event; `requestSubmit()` fires that first
+  // (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#constructing-form-data-set>).
+  const runSubmission = form => {
+    const formData = new globalThis.FormData(form);
+    form.dispatchEvent(new FormDataEvent('formdata', { formData: formData }));
+    submitForm(form, formData);
+  };
+
   // <https://html.spec.whatwg.org/multipage/forms.html#dom-form-submit>
   Object.defineProperty(globalThis.HTMLFormElement.prototype, 'submit', {
     value: function() {
-      submitForm(this, new globalThis.FormData(this));
+      runSubmission(this);
     },
     writable: true,
     enumerable: true,
@@ -551,15 +575,13 @@
           throw new TypeError('submitter must be a submit button');
         }
       }
-      const formData = new globalThis.FormData(this);
       const event = new SubmitEvent('submit', {
         submitter: submitter === undefined ? null : submitter,
         bubbles: true,
         cancelable: true,
       });
       if (!this.dispatchEvent(event)) return;
-      this.dispatchEvent(new FormDataEvent('formdata', { formData: formData }));
-      submitForm(this, formData);
+      runSubmission(this);
     },
     writable: true,
     enumerable: true,
