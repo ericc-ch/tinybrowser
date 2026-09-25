@@ -365,6 +365,44 @@ fn img_connection_transitions_record_lifecycle_events() {
     assert_eq!(dom.take_lifecycle(), vec![Lifecycle::Removed(img)]);
 }
 
+#[test]
+fn connected_iframes_survive_replace_and_report_destroy() {
+    let mut dom = Dom::new();
+    let document = dom.document();
+    let root = dom.create_element(qn("root"), Vec::new());
+    let holder = dom.create_element(qn("holder"), Vec::new());
+    let iframe = dom.create_element(qn("iframe"), Vec::new());
+    dom.append(document, root).expect("root");
+    dom.append(root, holder).expect("holder");
+    dom.append(holder, iframe).expect("iframe");
+    assert_eq!(dom.connected_iframe_count(), 1);
+    let _ = dom.take_lifecycle();
+
+    // `replaceChildren(holder.firstChild)`: the iframe stays connected across
+    // the replace, so it must neither churn an event nor double the count.
+    dom.replace_all(holder, iframe).expect("replace_all");
+    assert_eq!(dom.connected_iframe_count(), 1);
+    assert!(dom.take_lifecycle().is_empty());
+
+    // `replaceChild` where the replacement sits inside the replaced node: the
+    // transient detach must not read as removed-then-reinserted either.
+    let wrapper = dom.create_element(qn("wrapper"), Vec::new());
+    dom.replace_all(holder, wrapper).expect("wrap");
+    let nested = dom.create_element(qn("iframe"), Vec::new());
+    dom.append(wrapper, nested).expect("nested iframe");
+    assert_eq!(dom.connected_iframe_count(), 1);
+    let _ = dom.take_lifecycle();
+    dom.replace_child(holder, nested, wrapper)
+        .expect("replace_child");
+    assert_eq!(dom.connected_iframe_count(), 1);
+    assert!(dom.take_lifecycle().is_empty());
+
+    // Destroying a connected iframe reports the removal and drops the count.
+    dom.destroy(nested).expect("destroy");
+    assert_eq!(dom.connected_iframe_count(), 0);
+    assert_eq!(dom.take_lifecycle(), vec![Lifecycle::Removed(nested)]);
+}
+
 /// Asserts the intrusive links of `parent` match `expected` exactly: the
 /// child run, its endpoints, and every neighbour in both directions.
 fn assert_links(dom: &Dom, parent: NodeId, expected: &[NodeId]) {

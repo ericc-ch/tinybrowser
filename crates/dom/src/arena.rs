@@ -315,11 +315,15 @@ impl Dom {
     /// taken before an operation. Snapshots only ever carry those elements
     /// (see [`Dom::connection_snapshot`]): filtering in the snapshot keeps
     /// the parser's hot path free of per-element bookkeeping.
-    fn record_snapshot(&mut self, snapshot: Vec<(NodeId, bool)>) {
-        for (id, was_connected) in snapshot {
+    ///
+    /// The snapshot carries each element's kind so a destroyed node still
+    /// moves the `iframe` count: after `destroy` frees it, `is_iframe_element`
+    /// can no longer answer.
+    fn record_snapshot(&mut self, snapshot: Vec<(NodeId, bool, bool)>) {
+        for (id, was_connected, is_iframe) in snapshot {
             let connected = self.is_connected(id);
             if connected != was_connected {
-                if self.is_iframe_element(id) {
+                if is_iframe {
                     if connected {
                         self.connected_iframes = self.connected_iframes.saturating_add(1);
                     } else {
@@ -434,14 +438,18 @@ impl Dom {
         Some(slot).filter(|&slot| self.assigned_nodes(slot).contains(&id))
     }
 
-    /// The iframe and img elements in `id`'s inclusive subtree with their
-    /// connectivity, for a post-connection/removing step pass.
-    fn connection_snapshot(&self, id: NodeId) -> Vec<(NodeId, bool)> {
+    /// The iframe and img elements in `id`'s inclusive subtree with, for each,
+    /// its connectivity and whether it is an iframe (the only kind that moves
+    /// `connected_iframes`). Captured before an operation and handed to
+    /// [`Dom::record_snapshot`] after it, so the transition is measured across
+    /// the whole operation rather than at an internal step.
+    fn connection_snapshot(&self, id: NodeId) -> Vec<(NodeId, bool, bool)> {
         let mut snapshot = Vec::new();
         let mut stack = vec![id];
         while let Some(current) = stack.pop() {
-            if self.is_iframe_element(current) || self.is_img_element(current) {
-                snapshot.push((current, self.is_connected(current)));
+            let is_iframe = self.is_iframe_element(current);
+            if is_iframe || self.is_img_element(current) {
+                snapshot.push((current, self.is_connected(current), is_iframe));
             }
             if let Some(children) = self.children(current) {
                 stack.extend(children);
@@ -942,11 +950,12 @@ impl Dom {
             return Err(DomError::HierarchyRequest);
         }
         self.ensure_pre_insert_validity(parent, child, None)?;
+        let tracked = self.connection_snapshot(child);
         if self.is_fragment(child) {
-            self.splice_fragment(parent, child, None);
+            self.splice_fragment(parent, child, None, tracked);
             return Ok(());
         }
-        self.place_node(parent, child, None);
+        self.place_node(parent, child, None, tracked);
         Ok(())
     }
 
@@ -985,11 +994,12 @@ impl Dom {
             return Ok(());
         }
         self.ensure_pre_insert_validity(parent, node, Some(sibling))?;
+        let tracked = self.connection_snapshot(node);
         if self.is_fragment(node) {
-            self.splice_fragment(parent, node, Some(sibling));
+            self.splice_fragment(parent, node, Some(sibling), tracked);
             return Ok(());
         }
-        self.place_node(parent, node, Some(sibling));
+        self.place_node(parent, node, Some(sibling), tracked);
         Ok(())
     }
 
@@ -1061,20 +1071,29 @@ impl Dom {
         // (<https://dom.spec.whatwg.org/#concept-node-replace>). The removal
         // still runs the removing steps, so iframe connection transitions
         // fire: a replaced iframe's frame must not survive.
+        //
+        // Both snapshots are taken before any removal: `node` can sit inside
+        // `child`'s subtree, and detaching `child` first would read the wrong
+        // starting state. Both are recorded after the whole operation, so a
+        // disconnected-then-reinserted iframe reports no transition at all.
+        let node_tracked = self.connection_snapshot(node);
+        let child_tracked = (child != node && self.parent(child) == Some(parent))
+            .then(|| self.connection_snapshot(child));
         let mut removed = Vec::new();
         self.recording_suppressed = true;
         if child != node && self.parent(child) == Some(parent) {
-            let child_snapshot = self.connection_snapshot(child);
             self.unlink_from_current_parent(child);
-            self.record_snapshot(child_snapshot);
             removed.push(child);
         }
         if self.is_fragment(node) {
-            self.splice_fragment(parent, node, reference);
+            self.splice_fragment(parent, node, reference, node_tracked);
         } else {
-            self.place_node(parent, node, reference);
+            self.place_node(parent, node, reference, node_tracked);
         }
         self.recording_suppressed = false;
+        if let Some(child_tracked) = child_tracked {
+            self.record_snapshot(child_tracked);
+        }
         self.record(Mutation::ChildList {
             target: parent,
             added,
@@ -1157,10 +1176,11 @@ impl Dom {
         } else {
             reference
         };
+        let tracked = self.connection_snapshot(node);
         if self.is_fragment(node) {
-            self.splice_fragment(parent, node, reference);
+            self.splice_fragment(parent, node, reference, tracked);
         } else {
-            self.place_node(parent, node, reference);
+            self.place_node(parent, node, reference, tracked);
         }
         Ok(())
     }
@@ -1331,7 +1351,7 @@ impl Dom {
         // is broken. Panicking beats reporting a lying "stale node".
         let from_connected = self.is_connected(from);
         let to_connected = self.is_connected(to);
-        let tracked: Vec<(NodeId, bool)> = if from_connected == to_connected {
+        let tracked: Vec<(NodeId, bool, bool)> = if from_connected == to_connected {
             Vec::new()
         } else {
             moved
@@ -1617,7 +1637,7 @@ impl Dom {
             .children(parent)
             .map(Iterator::collect)
             .unwrap_or_default();
-        let removed_snapshot: Vec<(NodeId, bool)> = if parent_connected {
+        let removed_snapshot: Vec<(NodeId, bool, bool)> = if parent_connected {
             removed
                 .iter()
                 .flat_map(|&id| self.connection_snapshot(id))
@@ -1626,6 +1646,10 @@ impl Dom {
             Vec::new()
         };
         let added = self.incoming_nodes(node);
+        // `node` can be one of the removed children (JS `replaceChildren(
+        // firstChild)`), so its starting connectivity must be read before the
+        // detach loop below.
+        let node_tracked = self.connection_snapshot(node);
         self.recording_suppressed = true;
         // Detach the standing children through the single-node primitive; its
         // O(1) steps make the loop O(k), and it keeps `unlink` the only
@@ -1635,9 +1659,9 @@ impl Dom {
             self.unlink_from_current_parent(kid);
         }
         if self.is_fragment(node) {
-            self.splice_fragment(parent, node, None);
+            self.splice_fragment(parent, node, None, node_tracked);
         } else {
-            self.place_node(parent, node, None);
+            self.place_node(parent, node, None, node_tracked);
         }
         self.recording_suppressed = false;
         self.record_snapshot(removed_snapshot);
@@ -1864,6 +1888,9 @@ impl Dom {
     /// Every handle into the destroyed region goes stale at once. Destroying
     /// the document root is refused.
     ///
+    /// A connected subtree's `iframe` connection transitions are recorded,
+    /// even though the nodes are gone by the time they are reported.
+    ///
     /// # Errors
     ///
     /// - [`DomError::StaleNode`] if `id` is stale.
@@ -1873,6 +1900,9 @@ impl Dom {
         if id == self.document {
             return Err(DomError::HierarchyRequest);
         }
+        // Read connectivity before unlinking; the snapshot carries the
+        // iframe-ness so the count still moves once the slots are freed.
+        let tracked = self.connection_snapshot(id);
         self.unlink_from_current_parent(id);
 
         let mut pending = vec![id];
@@ -1910,6 +1940,7 @@ impl Dom {
             // tick happens at reallocation in `alloc`.
             self.free.push(current.slot);
         }
+        self.record_snapshot(tracked);
         Ok(())
     }
 
@@ -2040,8 +2071,17 @@ impl Dom {
 
     /// Places a non-fragment `node` under `parent` before `before` (or at
     /// the end when `before` is `None`).
-    fn place_node(&mut self, parent: NodeId, node: NodeId, before: Option<NodeId>) {
-        let tracked = self.connection_snapshot(node);
+    ///
+    /// `tracked` is `node`'s connection snapshot, captured by the caller
+    /// before it performed any part of the operation. Taking it here instead
+    /// would misread a node the caller already detached.
+    fn place_node(
+        &mut self,
+        parent: NodeId,
+        node: NodeId,
+        before: Option<NodeId>,
+        tracked: Vec<(NodeId, bool, bool)>,
+    ) {
         self.unlink_from_current_parent(node);
         // Sibling references for the mutation record, read from the run the
         // node is about to join. Computed only while recording: no observer
@@ -2112,15 +2152,20 @@ impl Dom {
     /// Insert a fragment by moving its children under `parent`, leaving the
     /// fragment empty and unparented
     /// (<https://dom.spec.whatwg.org/#concept-node-insert>).
-    fn splice_fragment(&mut self, parent: NodeId, fragment: NodeId, before: Option<NodeId>) {
+    ///
+    /// `tracked` is the fragment subtree's connection snapshot, captured by
+    /// the caller before any part of the operation (see [`Dom::place_node`]).
+    fn splice_fragment(
+        &mut self,
+        parent: NodeId,
+        fragment: NodeId,
+        before: Option<NodeId>,
+        tracked: Vec<(NodeId, bool, bool)>,
+    ) {
         let moved: Vec<NodeId> = self
             .children(fragment)
             .map(Iterator::collect)
             .unwrap_or_default();
-        let tracked: Vec<(NodeId, bool)> = moved
-            .iter()
-            .flat_map(|&id| self.connection_snapshot(id))
-            .collect();
         self.unlink_from_current_parent(fragment);
         if moved.is_empty() {
             return;
