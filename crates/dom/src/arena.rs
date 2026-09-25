@@ -181,8 +181,12 @@ pub struct Dom {
     shadow_roots: HashMap<NodeId, (NodeId, bool)>,
     /// Shadow root → host, the inverse of `shadow_roots`.
     shadow_hosts: HashMap<NodeId, NodeId>,
-    /// Dirty value state for text-like `input` elements. Absence means the
-    /// live value still follows the `value` content attribute.
+    /// Dirty value state for text-like controls (`input`, `textarea`).
+    ///
+    /// An entry means the dirty value flag is set and stores the raw value.
+    /// Absence means the live value still follows the control's default: the
+    /// `value` content attribute for `input`, the child text content for
+    /// `textarea` (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#concept-fe-dirty>).
     input_values: HashMap<NodeId, String>,
     /// Recorded mutations, drained by the renderer's `MutationObserver`
     /// plumbing; empty and unrecorded unless someone observes the document.
@@ -791,6 +795,12 @@ impl Dom {
         let copy = self.alloc(self.kind(id).ok_or(DomError::StaleNode)?.clone());
         let mut pending = vec![(id, copy)];
         while let Some((source, target)) = pending.pop() {
+            // Cloning steps for text-like controls propagate the raw value and
+            // dirty value flag from source to copy
+            // (<https://html.spec.whatwg.org/multipage/form-elements.html#the-textarea-element:concept-node-clone-ext>).
+            if let Some(value) = self.input_values.get(&source).cloned() {
+                self.input_values.insert(target, value);
+            }
             // https://html.spec.whatwg.org/multipage/scripting.html#the-template-element:cloning-steps
             if let Some(contents) = self.template_contents(source) {
                 let cloned_contents = self.create_fragment();
@@ -1512,6 +1522,141 @@ impl Dom {
                 .to_owned(),
             _ => value,
         }
+    }
+
+    /// Whether `id` is an HTML element with local name `local` (exact match).
+    fn html_local_is(&self, id: NodeId, local: &str) -> bool {
+        self.element(id).is_some_and(|(name, _)| {
+            name.ns == html_namespace() && name.local.as_ref() == local
+        })
+    }
+
+    /// The [child text content](https://dom.spec.whatwg.org/#concept-child-text-content)
+    /// of node `id`: the concatenated data of its `Text` children.
+    ///
+    /// `CDATASection` is a `Text` node ([DOM](https://dom.spec.whatwg.org/#interface-cdatasection)),
+    /// so its data is included. A stale handle has no children, so this
+    /// yields the empty string.
+    #[must_use]
+    pub fn child_text_content(&self, id: NodeId) -> String {
+        let mut text = String::new();
+        if let Some(children) = self.children(id) {
+            for child in children {
+                if let Some(NodeKind::Text { data } | NodeKind::CDataSection { data }) =
+                    self.kind(child)
+                {
+                    text.push_str(data);
+                }
+            }
+        }
+        text
+    }
+
+    /// The raw value of an HTML `textarea`: its stored raw value while the
+    /// dirty value flag is set, otherwise its child text content.
+    ///
+    /// <https://html.spec.whatwg.org/multipage/form-elements.html#concept-textarea-raw-value>
+    #[must_use]
+    pub fn textarea_raw_value(&self, id: NodeId) -> Option<String> {
+        if !self.html_local_is(id, "textarea") {
+            return None;
+        }
+        Some(
+            self.input_values
+                .get(&id)
+                .cloned()
+                .unwrap_or_else(|| self.child_text_content(id)),
+        )
+    }
+
+    /// The API value of an HTML `textarea`: its raw value with newlines
+    /// normalized to LF.
+    ///
+    /// <https://html.spec.whatwg.org/multipage/form-elements.html#concept-fe-api-value>
+    #[must_use]
+    pub fn textarea_value(&self, id: NodeId) -> Option<String> {
+        self.textarea_raw_value(id)
+            .map(|value| normalize_newlines(&value))
+    }
+
+    /// Sets an HTML `textarea`'s raw value and dirty value flag.
+    ///
+    /// <https://html.spec.whatwg.org/multipage/form-elements.html#dom-textarea-value>
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DomError::WrongNodeType`] when `id` is not an HTML `textarea`.
+    pub fn set_textarea_value(&mut self, id: NodeId, value: String) -> Result<(), DomError> {
+        if !self.html_local_is(id, "textarea") {
+            return Err(DomError::WrongNodeType);
+        }
+        self.input_values.insert(id, value);
+        Ok(())
+    }
+
+    /// The live value of a text-like control, as the `value` IDL attribute
+    /// reports it: the API value for `input` and `textarea`.
+    #[must_use]
+    pub fn control_value(&self, id: NodeId) -> Option<String> {
+        if self.html_local_is(id, "input") {
+            self.input_value(id)
+        } else {
+            self.textarea_value(id)
+        }
+    }
+
+    /// Sets the live value of a text-like control and its dirty value flag.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DomError::WrongNodeType`] when `id` is not an HTML `input` or
+    /// `textarea`.
+    pub fn set_control_value(&mut self, id: NodeId, value: String) -> Result<(), DomError> {
+        if self.html_local_is(id, "input") {
+            self.set_input_value(id, value)
+        } else {
+            self.set_textarea_value(id, value)
+        }
+    }
+
+    /// The `defaultValue` of a text-like control: the `value` content
+    /// attribute for `input`, the child text content for `textarea`.
+    ///
+    /// <https://html.spec.whatwg.org/multipage/form-elements.html#dom-textarea-defaultvalue>
+    #[must_use]
+    pub fn control_default_value(&self, id: NodeId) -> Option<String> {
+        if self.html_local_is(id, "input") {
+            Some(self.attribute(id, "value").unwrap_or_default())
+        } else if self.html_local_is(id, "textarea") {
+            Some(self.child_text_content(id))
+        } else {
+            None
+        }
+    }
+
+    /// Sets the `defaultValue` of a text-like control: assigning the `value`
+    /// content attribute for `input`, string-replacing all children for
+    /// `textarea`.
+    ///
+    /// <https://html.spec.whatwg.org/multipage/form-elements.html#dom-textarea-defaultvalue>
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DomError::WrongNodeType`] when `id` is not an HTML `input` or
+    /// `textarea`.
+    pub fn set_control_default_value(&mut self, id: NodeId, value: String) -> Result<(), DomError> {
+        if self.html_local_is(id, "input") {
+            return self.set_attribute(id, "value", value);
+        }
+        if !self.html_local_is(id, "textarea") {
+            return Err(DomError::WrongNodeType);
+        }
+        let replacement = self.create_fragment();
+        if !value.is_empty() {
+            let text = self.create_text(value);
+            self.append(replacement, text)?;
+        }
+        self.replace_all(id, replacement)
     }
 
     /// [Element.hasAttribute](https://dom.spec.whatwg.org/#dom-element-hasattribute):
@@ -2384,6 +2529,24 @@ impl Dom {
         });
         NodeId::new(self.document.document, slot, 0)
     }
+}
+
+/// Replaces CRLF and lone CR with LF
+/// (<https://infra.spec.whatwg.org/#normalize-newlines>).
+fn normalize_newlines(text: &str) -> String {
+    let mut normalized = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(character) = chars.next() {
+        if character == '\r' {
+            if chars.peek() == Some(&'\n') {
+                chars.next();
+            }
+            normalized.push('\n');
+        } else {
+            normalized.push(character);
+        }
+    }
+    normalized
 }
 
 /// Adds each attribute whose qualified name is not already present; the

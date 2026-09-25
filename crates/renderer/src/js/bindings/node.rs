@@ -981,12 +981,12 @@ impl JsNode {
         let Some(parsed) = world.document(self.handle.0) else {
             return Err(Exception::throw_type(&ctx, "no document"));
         };
-        Ok(parsed.dom.input_value(self.handle.0).unwrap_or_default())
+        Ok(parsed.dom.control_value(self.handle.0).unwrap_or_default())
     }
 
     // https://html.spec.whatwg.org/multipage/input.html#dom-input-value
     #[qjs(set, rename = "value")]
-    fn set_value(&self, ctx: Ctx<'_>, value: WebIdlString) -> Result<()> {
+    fn set_value(&self, ctx: Ctx<'_>, value: LegacyNullString) -> Result<()> {
         let world = world(&ctx)?;
         let world = world.borrow();
         let Some(mut parsed) = world.document_mut(self.handle.0) else {
@@ -994,9 +994,56 @@ impl JsNode {
         };
         parsed
             .dom
-            .set_input_value(self.handle.0, value.0)
+            .set_control_value(self.handle.0, value.0)
             .map_err(|err| throw_dom_error(&ctx, err))?;
         Ok(())
+    }
+
+    // https://html.spec.whatwg.org/multipage/form-elements.html#dom-textarea-defaultvalue
+    #[qjs(get, rename = "defaultValue")]
+    fn default_value(&self, ctx: Ctx<'_>) -> Result<String> {
+        let world = world(&ctx)?;
+        let world = world.borrow();
+        let Some(parsed) = world.document(self.handle.0) else {
+            return Err(Exception::throw_type(&ctx, "no document"));
+        };
+        Ok(parsed
+            .dom
+            .control_default_value(self.handle.0)
+            .unwrap_or_default())
+    }
+
+    // https://html.spec.whatwg.org/multipage/form-elements.html#dom-textarea-defaultvalue
+    #[qjs(set, rename = "defaultValue")]
+    fn set_default_value(&self, ctx: Ctx<'_>, value: WebIdlString) -> Result<()> {
+        let world = world(&ctx)?;
+        let world = world.borrow();
+        let Some(mut parsed) = world.document_mut(self.handle.0) else {
+            return Err(Exception::throw_type(&ctx, "no document"));
+        };
+        parsed
+            .dom
+            .set_control_default_value(self.handle.0, value.0)
+            .map_err(|err| throw_dom_error(&ctx, err))?;
+        Ok(())
+    }
+
+    // https://html.spec.whatwg.org/multipage/form-elements.html#dom-textarea-textlength
+    #[qjs(get, rename = "textLength")]
+    fn text_length(&self, ctx: Ctx<'_>) -> Result<u32> {
+        let world = world(&ctx)?;
+        let world = world.borrow();
+        let Some(parsed) = world.document(self.handle.0) else {
+            return Ok(0);
+        };
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "a 64-bit string length beyond u32 cannot be produced by this engine"
+        )]
+        Ok(parsed
+            .dom
+            .textarea_value(self.handle.0)
+            .map_or(0, |value| value.encode_utf16().count() as u32))
     }
 
     /// Reflecting boolean attribute shared by the form-control states: the

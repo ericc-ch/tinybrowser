@@ -19,7 +19,7 @@
 
 use crate::arena::Dom;
 use crate::id::NodeId;
-use crate::node::{NodeKind, QualName, html_namespace, svg_namespace, xml_namespace};
+use crate::node::{QualName, html_namespace, svg_namespace, xml_namespace};
 
 // ── shared lookups ──────────────────────────────────────────────────────────
 
@@ -377,15 +377,9 @@ pub fn is_placeholder_shown(dom: &Dom, id: NodeId) -> bool {
         return dom.input_value(id).is_none_or(|value| value.is_empty());
     }
     if local_is(dom, id, &["textarea"]) {
-        let mut empty = true;
-        if let Some(kids) = dom.children(id) {
-            for kid in kids {
-                if let Some(NodeKind::Text { data }) = dom.kind(kid) {
-                    empty &= data.is_empty();
-                }
-            }
-        }
-        return empty;
+        return dom
+            .textarea_value(id)
+            .is_none_or(|value| value.is_empty());
     }
     false
 }

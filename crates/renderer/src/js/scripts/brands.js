@@ -164,8 +164,8 @@
   const interfaceMembers = {
     HTMLIFrameElement: ['contentDocument', 'contentWindow'],
     HTMLImageElement: ['naturalWidth', 'naturalHeight', 'complete', 'currentSrc'],
-    HTMLInputElement: ['value', 'disabled', 'readOnly', 'required', 'multiple'],
-    HTMLTextAreaElement: ['disabled', 'readOnly', 'required'],
+    HTMLInputElement: ['value', 'defaultValue', 'disabled', 'readOnly', 'required', 'multiple'],
+    HTMLTextAreaElement: ['value', 'defaultValue', 'textLength', 'disabled', 'readOnly', 'required'],
     HTMLSelectElement: ['disabled', 'required', 'multiple'],
     HTMLButtonElement: ['disabled'],
     HTMLFieldSetElement: ['disabled'],
@@ -328,6 +328,12 @@
   Object.defineProperty(table.HTMLButtonElement, 'type', reflectType(new Set([
     'submit', 'reset', 'button',
   ]), 'submit'));
+  // <https://html.spec.whatwg.org/multipage/form-elements.html#dom-textarea-type>
+  Object.defineProperty(table.HTMLTextAreaElement, 'type', {
+    get: function() { return 'textarea'; },
+    enumerable: true,
+    configurable: true,
+  });
   Object.defineProperties(table.HTMLSlotElement, {
     assignedNodes: {
       value: function() {

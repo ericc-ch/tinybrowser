@@ -56,6 +56,7 @@ const INSTALL_WEB_APIS_JS: &str = concat!(
     include_str!("scripts/web/observers.js"),
     include_str!("scripts/web/messaging.js"),
     include_str!("scripts/web/ui_events.js"),
+    include_str!("scripts/web/forms.js"),
     include_str!("scripts/web/input.js"),
     "})();",
 );
