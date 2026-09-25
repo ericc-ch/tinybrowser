@@ -48,6 +48,10 @@
     'text', 'search', 'tel', 'url', 'email', 'password', 'date', 'month',
     'week', 'time', 'datetime-local', 'number',
   ]);
+  // The text-selection APIs apply only to these input types (plus textarea);
+  // notably email and number are excluded
+  // (<https://html.spec.whatwg.org/multipage/input.html#do-not-apply>).
+  const SELECTION_TYPES = new Set(['text', 'search', 'tel', 'url', 'password']);
   const BARRED_TYPES = new Set(['hidden', 'button', 'reset', 'image']);
 
   const isInput = element => element.tagName === 'INPUT';
@@ -235,6 +239,150 @@
     Object.defineProperties(constructor.prototype, {
       maxLength: lengthProperty('maxlength'),
       minLength: lengthProperty('minlength'),
+    });
+  }
+
+  // ── Text control selection ─────────────────────────────────────────────
+
+  // Web IDL `unsigned long` conversion.
+  const toUnsignedLong = value => {
+    let number = Number(value);
+    if (!Number.isFinite(number)) number = 0;
+    number = Math.trunc(number);
+    return ((number % 4294967296) + 4294967296) % 4294967296;
+  };
+
+  const DIRECTION = value =>
+    value === 'forward' || value === 'backward' ? value : 'none';
+
+  const selectionApplies = element =>
+    element.tagName === 'TEXTAREA' ||
+    (isInput(element) && SELECTION_TYPES.has(element.type));
+
+  // "Set the selection range" algorithm
+  // (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#set-the-selection-range>).
+  // `direction` is optional; a missing or unknown value means "none".
+  const applySelection = (element, start, end, direction) => {
+    const length = element.value.length;
+    let rangeStart = Math.min(toUnsignedLong(start), length);
+    let rangeEnd = Math.min(toUnsignedLong(end), length);
+    if (rangeEnd <= rangeStart) rangeStart = rangeEnd;
+    element.selectionStart = rangeStart;
+    element.selectionEnd = rangeEnd;
+    element.selectionDirection = direction === undefined ? 'none' : DIRECTION(direction);
+  };
+
+  const requireSelection = element => {
+    if (!selectionApplies(element)) {
+      throw new DOMException(
+        'The text selection APIs do not apply to this control', 'InvalidStateError');
+    }
+  };
+
+  const selectionMethods = {
+    setSelectionRange: {
+      value: function(start, end, direction) {
+        requireSelection(this);
+        applySelection(this, start, end, direction);
+      },
+      writable: true, enumerable: true, configurable: true,
+    },
+    select: {
+      value: function() {
+        if (this.tagName === 'INPUT' && !isTextControl(this)) return;
+        applySelection(this, 0, this.value.length, 'none');
+      },
+      writable: true, enumerable: true, configurable: true,
+    },
+    setRangeText: {
+      value: function(replacement, start, end, selectionMode) {
+        requireSelection(this);
+        replacement = String(replacement);
+        let rangeStart;
+        let rangeEnd;
+        if (arguments.length === 1) {
+          rangeStart = this.selectionStart;
+          rangeEnd = this.selectionEnd;
+        } else {
+          rangeStart = toUnsignedLong(start);
+          rangeEnd = toUnsignedLong(end);
+        }
+        if (rangeStart > rangeEnd) {
+          throw new DOMException('start is greater than end', 'IndexSizeError');
+        }
+        const length = this.value.length;
+        rangeStart = Math.min(rangeStart, length);
+        rangeEnd = Math.min(rangeEnd, length);
+        const selectionStart = this.selectionStart;
+        const selectionEnd = this.selectionEnd;
+        const mode = selectionMode === undefined ? 'preserve' : String(selectionMode);
+        this.value =
+          this.value.slice(0, rangeStart) + replacement + this.value.slice(rangeEnd);
+        const newEnd = rangeStart + replacement.length;
+        if (mode === 'select') {
+          applySelection(this, rangeStart, newEnd, this.selectionDirection);
+        } else if (mode === 'start') {
+          applySelection(this, rangeStart, rangeStart, this.selectionDirection);
+        } else if (mode === 'end') {
+          applySelection(this, newEnd, newEnd, this.selectionDirection);
+        } else {
+          // "preserve": shift the old selection by the replacement's delta.
+          const delta = replacement.length - (rangeEnd - rangeStart);
+          let nextStart = selectionStart;
+          let nextEnd = selectionEnd;
+          if (nextStart > rangeEnd) nextStart += delta;
+          else if (nextStart > rangeStart) nextStart = rangeStart;
+          if (nextEnd > rangeEnd) nextEnd += delta;
+          else if (nextEnd > rangeStart) nextEnd = newEnd;
+          applySelection(this, nextStart, nextEnd, this.selectionDirection);
+        }
+      },
+      writable: true, enumerable: true, configurable: true,
+    },
+  };
+
+  for (const name of ['HTMLInputElement', 'HTMLTextAreaElement']) {
+    const constructor = globalThis[name];
+    if (!constructor || !constructor.prototype) continue;
+    Object.defineProperties(constructor.prototype, selectionMethods);
+  }
+
+  // ── textarea sizing reflection ─────────────────────────────────────────
+
+  // `[ReflectPositiveWithFallback]` unsigned long: an absent, invalid, or zero
+  // attribute reports the fallback
+  // (<https://html.spec.whatwg.org/multipage/form-elements.html#dom-textarea-rows>).
+  const positiveFallback = (name, fallback) => ({
+    get: function() {
+      const raw = this.getAttribute(name);
+      if (raw === null) return fallback;
+      const parsed = parseNonNegative(raw);
+      return parsed === null || parsed === 0 ? fallback : parsed;
+    },
+    set: function(value) {
+      this.setAttribute(name, String(toUnsignedLong(value)));
+    },
+    enumerable: true,
+    configurable: true,
+  });
+
+  if (globalThis.HTMLTextAreaElement && globalThis.HTMLTextAreaElement.prototype) {
+    Object.defineProperties(globalThis.HTMLTextAreaElement.prototype, {
+      rows: positiveFallback('rows', 2),
+      cols: positiveFallback('cols', 20),
+      // `[Reflect]`; the enumerated missing value default is Soft
+      // (<https://html.spec.whatwg.org/multipage/form-elements.html#dom-textarea-wrap>).
+      wrap: {
+        get: function() {
+          const raw = this.getAttribute('wrap');
+          return raw === null ? 'soft' : raw;
+        },
+        set: function(value) {
+          this.setAttribute('wrap', String(value));
+        },
+        enumerable: true,
+        configurable: true,
+      },
     });
   }
 })();

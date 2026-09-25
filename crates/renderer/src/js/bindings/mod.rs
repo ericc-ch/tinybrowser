@@ -60,7 +60,7 @@ use rquickjs::{
 
 use super::events::{self, JsEvent, JsEventTarget};
 
-use super::world::{EventTargetKey, Handle, World};
+use super::world::{Handle, World};
 
 thread_local! {
     /// JS world per live realm, keyed by its QuickJS context pointer.
@@ -347,42 +347,6 @@ pub(crate) fn check_host_token<'js>(ctx: &Ctx<'js>, token: &Value<'js>) -> Resul
         // Install predates the token: accept (yesterday's behavior).
         None => Ok(()),
     }
-}
-
-/// The `WebDriver` "element send keys" step: focus the element and append
-/// `text` to its value, firing a trusted `input` event.
-#[allow(
-    clippy::needless_pass_by_value,
-    reason = "rquickjs Func ABI passes arguments by value"
-)]
-pub(super) fn webdriver_send_keys<'js>(
-    ctx: Ctx<'js>,
-    element: Value<'js>,
-    text: String,
-) -> Result<()> {
-    let Some(node) = host_node_id(&ctx, &element) else {
-        return Err(Exception::throw_type(&ctx, "not an element"));
-    };
-    if is_focusable(&ctx, node)? {
-        focus_node(&ctx, node)?;
-    }
-    if !is_text_control(&ctx, node)? {
-        return Ok(());
-    }
-    let value = wrap_node(&ctx, node)?;
-    let Some(object) = value.as_object().cloned() else {
-        return Ok(());
-    };
-    let current = match object.get::<_, Value>("value")? {
-        value if value.is_undefined() || value.is_null() => String::new(),
-        value => value
-            .as_string()
-            .and_then(|string| string.to_string().ok())
-            .unwrap_or_default(),
-    };
-    object.set("value", format!("{current}{text}"))?;
-    events::fire_trusted(&ctx, EventTargetKey::Node(node), "input", true, false)?;
-    Ok(())
 }
 
 /// Resolves a `WebDriver` element id to its wrapper, or `null` when no node

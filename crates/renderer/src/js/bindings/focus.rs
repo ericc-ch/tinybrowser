@@ -1,6 +1,6 @@
 //! Focus, activation behavior, and the `WebDriver` bridge.
 
-use super::{events, host_node_id, webdriver_element, webdriver_send_keys, world_for_node};
+use super::{events, host_node_id, webdriver_element, world_for_node};
 
 use std::rc::Rc;
 
@@ -144,57 +144,6 @@ fn node_local_name(dom: &dom::Dom, node: NodeId) -> Option<String> {
     }
 }
 
-/// Whether the element accepts typed text: an enabled, non-readonly text-like
-/// control. Checkboxes, radio buttons, and files do not take text input
-/// (<https://html.spec.whatwg.org/multipage/input.html#text-(type=text)-state-and-search-state-(type=search)>).
-pub(crate) fn is_text_control(ctx: &Ctx<'_>, node: NodeId) -> Result<bool> {
-    let world = world_for_node(ctx, node)?;
-    let world = world.borrow();
-    let Some(parsed) = world.document(node) else {
-        return Ok(false);
-    };
-    if parsed.dom.kind(node).is_none() || is_actually_disabled(&parsed.dom, node) {
-        return Ok(false);
-    }
-    if parsed.dom.attribute(node, "readonly").is_some() {
-        return Ok(false);
-    }
-    let Some(local) = node_local_name(&parsed.dom, node) else {
-        return Ok(false);
-    };
-    Ok(match local.as_str() {
-        "textarea" => true,
-        "input" => {
-            let kind = parsed
-                .dom
-                .attribute(node, "type")
-                .unwrap_or_else(|| "text".to_owned())
-                .to_ascii_lowercase();
-            // An unknown or missing type is the Text state, so it takes keys
-            // (<https://html.spec.whatwg.org/multipage/input.html#attr-input-type>).
-            !matches!(
-                kind.as_str(),
-                "hidden"
-                    | "checkbox"
-                    | "radio"
-                    | "file"
-                    | "submit"
-                    | "reset"
-                    | "button"
-                    | "image"
-                    | "color"
-                    | "range"
-                    | "date"
-                    | "datetime-local"
-                    | "month"
-                    | "week"
-                    | "time"
-            )
-        }
-        _ => false,
-    })
-}
-
 /// Moves focus to `node`. The previously focused area is cleared before the
 /// `blur`/`focusout` chain, and the new one installed before `focus`/`focusin`
 /// (<https://html.spec.whatwg.org/multipage/interaction.html#focus-update-steps>).
@@ -320,15 +269,11 @@ pub(crate) fn install_webdriver_bridge(ctx: &Ctx<'_>, globals: &Object<'_>) -> R
         rquickjs::prelude::Func::from(webdriver_click),
     )?;
     globals.set(
-        "__tb_webdriver_send_keys",
-        rquickjs::prelude::Func::from(webdriver_send_keys),
-    )?;
-    globals.set(
         "__tb_webdriver_element",
         rquickjs::prelude::Func::from(webdriver_element),
     )?;
     ctx.eval::<(), _>(
-        "['__tb_webdriver_click','__tb_webdriver_send_keys','__tb_webdriver_element']\
+        "['__tb_webdriver_click','__tb_webdriver_element']\
          .forEach(function(k){Object.defineProperty(globalThis,k,{writable:false,configurable:false,enumerable:false});});",
     )?;
     Ok(())

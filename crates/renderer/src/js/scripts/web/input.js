@@ -109,33 +109,84 @@
     }
     return { key: value, code: value };
   };
-  const insertText = text => {
+  const textControl = () => {
     const element = document.activeElement;
-    if (!element) return;
+    if (!element) return null;
     const tag = element.tagName;
-    if (tag === 'INPUT' || tag === 'TEXTAREA') {
-      // `beforeinput` is cancelable and runs first: a canceled edit writes
-      // nothing and fires no `input`
-      // (<https://w3c.github.io/uievents/#events-inputevents>).
-      const before = new InputEvent('beforeinput', { bubbles: true, cancelable: true, inputType: 'insertText', data: text });
-      if (!element.dispatchEvent(before)) return;
-      const start = element.selectionStart === undefined || element.selectionStart === null ? element.value.length : element.selectionStart;
-      const end = element.selectionEnd === undefined || element.selectionEnd === null ? start : element.selectionEnd;
-      if (typeof element.setRangeText === 'function') element.setRangeText(text, start, end, 'end');
-      else element.value = element.value.slice(0, start) + text + element.value.slice(end);
-      fire(element, new InputEvent('input', { bubbles: true, inputType: 'insertText', data: text }));
-    } else if (element.isContentEditable) {
-      element.textContent = (element.textContent || '') + text;
-      fire(element, new InputEvent('input', { bubbles: true, inputType: 'insertText', data: text }));
+    if (tag !== 'INPUT' && tag !== 'TEXTAREA') return null;
+    if (element.disabled || element.readOnly) return null;
+    return element;
+  };
+  const fireInput = (element, inputType, data) => {
+    fire(element, new InputEvent('input', { bubbles: true, inputType: inputType, data: data }));
+  };
+  // Replaces the inclusive range with `text` through `setRangeText`, gating on
+  // the cancelable `beforeinput` event first
+  // (<https://w3c.github.io/uievents/#events-inputevents>).
+  const replaceRange = (element, text, start, end, inputType, data) => {
+    const before = new InputEvent('beforeinput', {
+      bubbles: true, cancelable: true, inputType: inputType, data: data,
+    });
+    if (!element.dispatchEvent(before)) return;
+    if (typeof element.setRangeText === 'function') element.setRangeText(text, start, end, 'end');
+    else element.value = element.value.slice(0, start) + text + element.value.slice(end);
+    fireInput(element, inputType, data);
+  };
+  const insertText = text => {
+    const element = textControl();
+    if (!element) return;
+    const start = element.selectionStart === undefined || element.selectionStart === null
+      ? element.value.length : element.selectionStart;
+    const end = element.selectionEnd === undefined || element.selectionEnd === null
+      ? start : element.selectionEnd;
+    replaceRange(element, text, start, end, 'insertText', text);
+  };
+  const deleteText = backwards => {
+    const element = textControl();
+    if (!element) return;
+    const start = element.selectionStart;
+    const end = element.selectionEnd;
+    if (start === end) {
+      if (backwards && start === 0) return;
+      if (!backwards && end === element.value.length) return;
+      const from = backwards ? start - 1 : start;
+      const to = backwards ? end : end + 1;
+      replaceRange(element, '', from, to, 'deleteContentBackward', null);
+    } else {
+      replaceRange(element, '', start, end, 'deleteContentBackward', null);
     }
+  };
+  const moveCaret = to => {
+    const element = textControl();
+    if (!element) return;
+    const length = element.value.length;
+    const start = element.selectionStart;
+    const end = element.selectionEnd;
+    let position;
+    if (to === 'home') position = 0;
+    else if (to === 'end') position = length;
+    else if (to === 'left') position = start === end ? Math.max(0, start - 1) : start;
+    else position = start === end ? Math.min(length, end + 1) : end;
+    element.setSelectionRange(position, position);
   };
   const keyItem = (item, down) => {
     const value = item.value === undefined ? '' : String(item.value);
     const info = keyOf(value);
     const node = document.activeElement || document.body || document.documentElement;
     if (down) {
-      fire(node, new KeyboardEvent('keydown', { bubbles: true, cancelable: true, key: info.key, code: info.code }));
-      if (value.length === 1 || value === '\uE00D') insertText(value === '\uE00D' ? ' ' : value);
+      const accepted = fire(node, new KeyboardEvent('keydown', {
+        bubbles: true, cancelable: true, key: info.key, code: info.code,
+      }));
+      if (accepted) {
+        if (value.length === 1) insertText(value);
+        else if (value === '\uE00D') insertText(' ');
+        else if (value === '\uE003') deleteText(true);
+        else if (value === '\uE017') deleteText(false);
+        else if (value === '\uE011') moveCaret('home');
+        else if (value === '\uE010') moveCaret('end');
+        else if (value === '\uE012') moveCaret('left');
+        else if (value === '\uE014') moveCaret('right');
+      }
       if (value.length === 1) fire(node, new KeyboardEvent('keypress', { bubbles: true, cancelable: true, key: info.key, code: info.code }));
     } else {
       fire(node, new KeyboardEvent('keyup', { bubbles: true, cancelable: true, key: info.key, code: info.code }));
@@ -153,6 +204,43 @@
     })));
     if (accepted && typeof node.scrollBy === 'function') node.scrollBy(item.deltaX || 0, item.deltaY || 0);
   };
+  // The WebDriver "element send keys" command: focus the element and feed each
+  // character through the same editing path as Perform Actions, so special
+  // keys like Backspace edit instead of appending their private-use codepoint
+  // (<https://w3c.github.io/webdriver/#element-send-keys>).
+  const hookChangeOnBlur = element => {
+    if (element.__tbChangeHooked) return;
+    Object.defineProperty(element, '__tbChangeHooked', { value: true, configurable: true });
+    element.addEventListener('blur', () => {
+      if (element.value !== element.__tbChangeBaseline) {
+        element.dispatchEvent(new Event('change', { bubbles: true }));
+      }
+    });
+  };
+  globalThis.__tbWebDriverSendKeys = function(element, text) {
+    if (!element || typeof element.focus !== 'function') return false;
+    try { element.focus(); } catch (error) {}
+    hookChangeOnBlur(element);
+    element.__tbChangeBaseline = element.value;
+    for (const character of String(text)) {
+      const code = character.charCodeAt(0);
+      if (character.length === 1 && code >= 0xE000 && code <= 0xE05D) {
+        if (character === '\uE003') deleteText(true);
+        else if (character === '\uE017') deleteText(false);
+        else if (character === '\uE011') moveCaret('home');
+        else if (character === '\uE010') moveCaret('end');
+        else if (character === '\uE012') moveCaret('left');
+        else if (character === '\uE014') moveCaret('right');
+        else if (character === '\uE00D') insertText(' ');
+      } else {
+        insertText(character);
+      }
+    }
+    return true;
+  };
+  Object.defineProperty(globalThis, '__tbWebDriverSendKeys', {
+    writable: false, configurable: false, enumerable: false,
+  });
   globalThis.__tbWebDriverActions = function(actions) {
     let ticks = 0;
     for (const source of actions) {

@@ -1046,6 +1046,104 @@ impl JsNode {
             .map_or(0, |value| value.encode_utf16().count() as u32))
     }
 
+    // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#dom-textarea/input-selectionstart
+    #[qjs(get, rename = "selectionStart")]
+    fn selection_start<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
+        let world = world(&ctx)?;
+        let world = world.borrow();
+        let Some(parsed) = world.document(self.handle.0) else {
+            return Ok(Value::new_null(ctx));
+        };
+        match parsed.dom.selection(self.handle.0) {
+            Some((start, _, _)) => Ok(Value::new_number(ctx, f64::from(start))),
+            None => Ok(Value::new_null(ctx)),
+        }
+    }
+
+    #[qjs(set, rename = "selectionStart")]
+    fn set_selection_start(&self, ctx: Ctx<'_>, value: WebIdlUnsignedLong) -> Result<()> {
+        let world = world(&ctx)?;
+        let world = world.borrow();
+        let Some(mut parsed) = world.document_mut(self.handle.0) else {
+            return Ok(());
+        };
+        let Some((_, end, direction)) = parsed.dom.selection(self.handle.0) else {
+            return Err(throw_dom(
+                &ctx,
+                "InvalidStateError",
+                "selectionStart does not apply to this control",
+            ));
+        };
+        let start = value.0;
+        parsed.dom.set_selection(self.handle.0, start, end.max(start), direction);
+        Ok(())
+    }
+
+    // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#dom-textarea/input-selectionend
+    #[qjs(get, rename = "selectionEnd")]
+    fn selection_end<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
+        let world = world(&ctx)?;
+        let world = world.borrow();
+        let Some(parsed) = world.document(self.handle.0) else {
+            return Ok(Value::new_null(ctx));
+        };
+        match parsed.dom.selection(self.handle.0) {
+            Some((_, end, _)) => Ok(Value::new_number(ctx, f64::from(end))),
+            None => Ok(Value::new_null(ctx)),
+        }
+    }
+
+    #[qjs(set, rename = "selectionEnd")]
+    fn set_selection_end(&self, ctx: Ctx<'_>, value: WebIdlUnsignedLong) -> Result<()> {
+        let world = world(&ctx)?;
+        let world = world.borrow();
+        let Some(mut parsed) = world.document_mut(self.handle.0) else {
+            return Ok(());
+        };
+        let Some((start, _, direction)) = parsed.dom.selection(self.handle.0) else {
+            return Err(throw_dom(
+                &ctx,
+                "InvalidStateError",
+                "selectionEnd does not apply to this control",
+            ));
+        };
+        parsed.dom.set_selection(self.handle.0, start, value.0, direction);
+        Ok(())
+    }
+
+    // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#dom-textarea/input-selectiondirection
+    #[qjs(get, rename = "selectionDirection")]
+    fn selection_direction<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
+        let world = world(&ctx)?;
+        let world = world.borrow();
+        let Some(parsed) = world.document(self.handle.0) else {
+            return Ok(Value::new_null(ctx));
+        };
+        match parsed.dom.selection(self.handle.0) {
+            Some((_, _, direction)) => Ok(string_value(&ctx, direction_name(direction))?),
+            None => Ok(Value::new_null(ctx)),
+        }
+    }
+
+    #[qjs(set, rename = "selectionDirection")]
+    fn set_selection_direction(&self, ctx: Ctx<'_>, value: WebIdlString) -> Result<()> {
+        let world = world(&ctx)?;
+        let world = world.borrow();
+        let Some(mut parsed) = world.document_mut(self.handle.0) else {
+            return Ok(());
+        };
+        let Some((start, end, _)) = parsed.dom.selection(self.handle.0) else {
+            return Err(throw_dom(
+                &ctx,
+                "InvalidStateError",
+                "selectionDirection does not apply to this control",
+            ));
+        };
+        let direction = direction_code(&value.0);
+        parsed.dom.set_selection(self.handle.0, start, end, direction);
+        Ok(())
+    }
+
     /// Reflecting boolean attribute shared by the form-control states: the
     /// engine exposes one element wrapper, so these answer on every element,
     /// the same shortcut `value` takes.
@@ -3067,5 +3165,25 @@ impl JsNode {
             .min(units.len());
         units.splice(offset..end, data.0.encode_utf16());
         set_character_data(&ctx, self.handle.0, String::from_utf16_lossy(&units))
+    }
+}
+
+/// The `SelectionMode` direction name for the stored code
+/// (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#selection-direction>).
+fn direction_name(direction: u8) -> &'static str {
+    match direction {
+        1 => "forward",
+        2 => "backward",
+        _ => "none",
+    }
+}
+
+/// Maps a `selectionDirection` string to its stored code; anything but the two
+/// known keywords is "none".
+fn direction_code(direction: &str) -> u8 {
+    match direction {
+        "forward" => 1,
+        "backward" => 2,
+        _ => 0,
     }
 }

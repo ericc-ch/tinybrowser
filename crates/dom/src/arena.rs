@@ -188,6 +188,11 @@ pub struct Dom {
     /// `value` content attribute for `input`, the child text content for
     /// `textarea` (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#concept-fe-dirty>).
     input_values: HashMap<NodeId, String>,
+    /// Text selection for text-like controls: `(start, end, direction)` in
+    /// UTF-16 code units. Direction is 0 "none", 1 "forward", 2 "backward"
+    /// (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#concept-textarea/input-selection>).
+    /// Absence means the initial selection `(0, 0, "none")`.
+    selections: HashMap<NodeId, (u32, u32, u8)>,
     /// Recorded mutations, drained by the renderer's `MutationObserver`
     /// plumbing; empty and unrecorded unless someone observes the document.
     mutations: Vec<Mutation>,
@@ -286,6 +291,7 @@ impl Dom {
             shadow_roots: HashMap::new(),
             shadow_hosts: HashMap::new(),
             input_values: HashMap::new(),
+            selections: HashMap::new(),
             mutations: Vec::new(),
             record_mutations: false,
             recording_suppressed: false,
@@ -1607,16 +1613,69 @@ impl Dom {
 
     /// Sets the live value of a text-like control and its dirty value flag.
     ///
+    /// When the API value changes, the text entry cursor moves to the end and
+    /// the selection direction resets
+    /// (<https://html.spec.whatwg.org/multipage/form-elements.html#dom-textarea-value>,
+    /// <https://html.spec.whatwg.org/multipage/input.html#dom-input-value>).
+    ///
     /// # Errors
     ///
     /// Returns [`DomError::WrongNodeType`] when `id` is not an HTML `input` or
     /// `textarea`.
     pub fn set_control_value(&mut self, id: NodeId, value: String) -> Result<(), DomError> {
+        let old = self.control_value(id);
         if self.html_local_is(id, "input") {
-            self.set_input_value(id, value)
+            self.set_input_value(id, value)?;
         } else {
-            self.set_textarea_value(id, value)
+            self.set_textarea_value(id, value)?;
         }
+        if self.selection_supported(id) && self.control_value(id) != old {
+            let end = self
+                .control_value(id)
+                .map_or(0, |value| utf16_length(&value));
+            self.set_selection(id, end, end, 0);
+        }
+        Ok(())
+    }
+
+    /// Whether a text selection applies to `id`: an `HTMLTextAreaElement`, or
+    /// an `HTMLInputElement` whose type is a text-entry type. Other input
+    /// types report null and rejecting setters
+    /// (<https://html.spec.whatwg.org/multipage/input.html#do-not-apply>).
+    #[must_use]
+    pub fn selection_supported(&self, id: NodeId) -> bool {
+        if self.html_local_is(id, "textarea") {
+            return true;
+        }
+        if !self.html_local_is(id, "input") {
+            return false;
+        }
+        matches!(
+            self.input_type(id).as_deref(),
+            Some("text" | "search" | "tel" | "url" | "password")
+        )
+    }
+
+    /// The stored selection `(start, end, direction)`, clamped to the current
+    /// API value length. `None` when no text selection applies.
+    #[must_use]
+    pub fn selection(&self, id: NodeId) -> Option<(u32, u32, u8)> {
+        if !self.selection_supported(id) {
+            return None;
+        }
+        let length = self.control_value(id).map_or(0, |value| utf16_length(&value));
+        let (start, end, direction) = self.selections.get(&id).copied().unwrap_or((0, 0, 0));
+        Some((start.min(length), end.min(length), direction))
+    }
+
+    /// Stores `id`'s selection, clamped to the current API value length.
+    pub fn set_selection(&mut self, id: NodeId, start: u32, end: u32, direction: u8) {
+        if !self.selection_supported(id) {
+            return;
+        }
+        let length = self.control_value(id).map_or(0, |value| utf16_length(&value));
+        self.selections
+            .insert(id, (start.min(length), end.min(length), direction.min(2)));
     }
 
     /// The `defaultValue` of a text-like control: the `value` content
@@ -2062,6 +2121,7 @@ impl Dom {
         let mut pending = vec![id];
         while let Some(current) = pending.pop() {
             self.input_values.remove(&current);
+            self.selections.remove(&current);
             if let Some(contents) = self.template_contents.remove(&current) {
                 pending.push(contents);
             }
@@ -2547,6 +2607,16 @@ fn normalize_newlines(text: &str) -> String {
         }
     }
     normalized
+}
+
+/// The [length](https://infra.spec.whatwg.org/#string-length) of `text` in
+/// UTF-16 code units, the unit the selection APIs use.
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "a 64-bit string length beyond u32 cannot be produced by this engine"
+)]
+fn utf16_length(text: &str) -> u32 {
+    text.encode_utf16().count() as u32
 }
 
 /// Adds each attribute whose qualified name is not already present; the

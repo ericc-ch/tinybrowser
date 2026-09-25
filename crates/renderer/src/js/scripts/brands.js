@@ -164,8 +164,10 @@
   const interfaceMembers = {
     HTMLIFrameElement: ['contentDocument', 'contentWindow'],
     HTMLImageElement: ['naturalWidth', 'naturalHeight', 'complete', 'currentSrc'],
-    HTMLInputElement: ['value', 'defaultValue', 'disabled', 'readOnly', 'required', 'multiple'],
-    HTMLTextAreaElement: ['value', 'defaultValue', 'textLength', 'disabled', 'readOnly', 'required'],
+    HTMLInputElement: ['value', 'defaultValue', 'disabled', 'readOnly', 'required', 'multiple',
+      'selectionStart', 'selectionEnd', 'selectionDirection'],
+    HTMLTextAreaElement: ['value', 'defaultValue', 'textLength', 'disabled', 'readOnly', 'required',
+      'selectionStart', 'selectionEnd', 'selectionDirection'],
     HTMLSelectElement: ['disabled', 'required', 'multiple'],
     HTMLButtonElement: ['disabled'],
     HTMLFieldSetElement: ['disabled'],
