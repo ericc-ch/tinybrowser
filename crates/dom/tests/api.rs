@@ -403,6 +403,35 @@ fn connected_iframes_survive_replace_and_report_destroy() {
     assert_eq!(dom.take_lifecycle(), vec![Lifecycle::Removed(nested)]);
 }
 
+#[test]
+fn replacement_reports_removal_before_insertion() {
+    let mut dom = Dom::new();
+    let document = dom.document();
+    let root = dom.create_element(qn("root"), Vec::new());
+    dom.append(document, root).expect("root");
+    let old = dom.create_element(qn("iframe"), Vec::new());
+    dom.append(root, old).expect("old iframe");
+    let _ = dom.take_lifecycle();
+
+    let fresh = dom.create_element(qn("iframe"), Vec::new());
+    dom.replace_child(root, fresh, old).expect("replace_child");
+    assert_eq!(
+        dom.take_lifecycle(),
+        vec![Lifecycle::Removed(old), Lifecycle::Inserted(fresh)],
+        "a replacement must release the old frame before framing the new one"
+    );
+    assert_eq!(dom.connected_iframe_count(), 1);
+
+    let swap = dom.create_element(qn("iframe"), Vec::new());
+    dom.replace_all(root, swap).expect("replace_all");
+    assert_eq!(
+        dom.take_lifecycle(),
+        vec![Lifecycle::Removed(fresh), Lifecycle::Inserted(swap)],
+        "replace_all must release before inserting too"
+    );
+    assert_eq!(dom.connected_iframe_count(), 1);
+}
+
 /// Asserts the intrusive links of `parent` match `expected` exactly: the
 /// child run, its endpoints, and every neighbour in both directions.
 fn assert_links(dom: &Dom, parent: NodeId, expected: &[NodeId]) {

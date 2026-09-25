@@ -952,10 +952,11 @@ impl Dom {
         self.ensure_pre_insert_validity(parent, child, None)?;
         let tracked = self.connection_snapshot(child);
         if self.is_fragment(child) {
-            self.splice_fragment(parent, child, None, tracked);
-            return Ok(());
+            self.splice_fragment(parent, child, None);
+        } else {
+            self.place_node(parent, child, None);
         }
-        self.place_node(parent, child, None, tracked);
+        self.record_snapshot(tracked);
         Ok(())
     }
 
@@ -996,10 +997,11 @@ impl Dom {
         self.ensure_pre_insert_validity(parent, node, Some(sibling))?;
         let tracked = self.connection_snapshot(node);
         if self.is_fragment(node) {
-            self.splice_fragment(parent, node, Some(sibling), tracked);
-            return Ok(());
+            self.splice_fragment(parent, node, Some(sibling));
+        } else {
+            self.place_node(parent, node, Some(sibling));
         }
-        self.place_node(parent, node, Some(sibling), tracked);
+        self.record_snapshot(tracked);
         Ok(())
     }
 
@@ -1075,7 +1077,9 @@ impl Dom {
         // Both snapshots are taken before any removal: `node` can sit inside
         // `child`'s subtree, and detaching `child` first would read the wrong
         // starting state. Both are recorded after the whole operation, so a
-        // disconnected-then-reinserted iframe reports no transition at all.
+        // disconnected-then-reinserted iframe reports no transition at all,
+        // and the removal is recorded before the insertion so a replacement
+        // frees its frame slot before the new frame is capped.
         let node_tracked = self.connection_snapshot(node);
         let child_tracked = (child != node && self.parent(child) == Some(parent))
             .then(|| self.connection_snapshot(child));
@@ -1086,14 +1090,15 @@ impl Dom {
             removed.push(child);
         }
         if self.is_fragment(node) {
-            self.splice_fragment(parent, node, reference, node_tracked);
+            self.splice_fragment(parent, node, reference);
         } else {
-            self.place_node(parent, node, reference, node_tracked);
+            self.place_node(parent, node, reference);
         }
         self.recording_suppressed = false;
         if let Some(child_tracked) = child_tracked {
             self.record_snapshot(child_tracked);
         }
+        self.record_snapshot(node_tracked);
         self.record(Mutation::ChildList {
             target: parent,
             added,
@@ -1178,10 +1183,11 @@ impl Dom {
         };
         let tracked = self.connection_snapshot(node);
         if self.is_fragment(node) {
-            self.splice_fragment(parent, node, reference, tracked);
+            self.splice_fragment(parent, node, reference);
         } else {
-            self.place_node(parent, node, reference, tracked);
+            self.place_node(parent, node, reference);
         }
+        self.record_snapshot(tracked);
         Ok(())
     }
 
@@ -1659,12 +1665,15 @@ impl Dom {
             self.unlink_from_current_parent(kid);
         }
         if self.is_fragment(node) {
-            self.splice_fragment(parent, node, None, node_tracked);
+            self.splice_fragment(parent, node, None);
         } else {
-            self.place_node(parent, node, None, node_tracked);
+            self.place_node(parent, node, None);
         }
         self.recording_suppressed = false;
+        // Removal before insertion: a replacement frees its frame slot before
+        // the new frame is checked against the frame cap.
         self.record_snapshot(removed_snapshot);
+        self.record_snapshot(node_tracked);
         // "If either addedNodes or removedNodes is not empty, then queue a
         // tree mutation record" (<https://dom.spec.whatwg.org/#concept-node-replace-all>):
         // e.g. `textContent = ""` on an already-empty element changes nothing
@@ -2072,16 +2081,11 @@ impl Dom {
     /// Places a non-fragment `node` under `parent` before `before` (or at
     /// the end when `before` is `None`).
     ///
-    /// `tracked` is `node`'s connection snapshot, captured by the caller
-    /// before it performed any part of the operation. Taking it here instead
-    /// would misread a node the caller already detached.
-    fn place_node(
-        &mut self,
-        parent: NodeId,
-        node: NodeId,
-        before: Option<NodeId>,
-        tracked: Vec<(NodeId, bool, bool)>,
-    ) {
+    /// Structural only: lifecycle recording belongs to the calling operation,
+    /// which captures one snapshot before it starts and records it once the
+    /// whole operation is done. Recording here would both misread a node the
+    /// caller already detached and pin the event order relative to a removal.
+    fn place_node(&mut self, parent: NodeId, node: NodeId, before: Option<NodeId>) {
         self.unlink_from_current_parent(node);
         // Sibling references for the mutation record, read from the run the
         // node is about to join. Computed only while recording: no observer
@@ -2096,7 +2100,6 @@ impl Dom {
             (None, None)
         };
         self.insert_linked(parent, node, before);
-        self.record_snapshot(tracked);
         self.record(Mutation::ChildList {
             target: parent,
             added: vec![node],
@@ -2153,15 +2156,9 @@ impl Dom {
     /// fragment empty and unparented
     /// (<https://dom.spec.whatwg.org/#concept-node-insert>).
     ///
-    /// `tracked` is the fragment subtree's connection snapshot, captured by
-    /// the caller before any part of the operation (see [`Dom::place_node`]).
-    fn splice_fragment(
-        &mut self,
-        parent: NodeId,
-        fragment: NodeId,
-        before: Option<NodeId>,
-        tracked: Vec<(NodeId, bool, bool)>,
-    ) {
+    /// Structural only; the caller records the fragment subtree's lifecycle
+    /// snapshot (see [`Dom::place_node`]).
+    fn splice_fragment(&mut self, parent: NodeId, fragment: NodeId, before: Option<NodeId>) {
         let moved: Vec<NodeId> = self
             .children(fragment)
             .map(Iterator::collect)
@@ -2197,7 +2194,6 @@ impl Dom {
         for &id in &moved {
             self.insert_linked(parent, id, before);
         }
-        self.record_snapshot(tracked);
         self.record(Mutation::ChildList {
             target: parent,
             added: moved,
