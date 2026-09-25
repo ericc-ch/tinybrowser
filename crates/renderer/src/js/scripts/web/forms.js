@@ -70,8 +70,22 @@
     element.tagName === 'TEXTAREA' || (isInput(element) && VALUE_MODE_TYPES.has(element.type));
 
   // <https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#barred-from-constraint-validation>
+  // A control is disabled by a disabled fieldset ancestor, unless it is inside
+  // the fieldset's first legend
+  // (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#concept-fe-disabled>).
+  const fieldsetDisabled = element => {
+    for (let ancestor = element.parentElement; ancestor; ancestor = ancestor.parentElement) {
+      if (ancestor.tagName === 'FIELDSET' && ancestor.hasAttribute('disabled')) {
+        const legend = Array.from(ancestor.children).find(child => child.tagName === 'LEGEND');
+        if (legend === undefined || !legend.contains(element)) return true;
+        return false;
+      }
+    }
+    return false;
+  };
+
   const barredFromValidation = element => {
-    if (element.disabled) return true;
+    if (element.disabled || fieldsetDisabled(element)) return true;
     // A control inside a `datalist` is barred
     // (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#barred-from-constraint-validation>).
     for (let ancestor = element.parentElement; ancestor; ancestor = ancestor.parentElement) {
@@ -136,7 +150,8 @@
 
   // A control is mutable when it is neither disabled nor readonly
   // (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#mutability>).
-  const isMutable = element => !element.disabled && !element.readOnly;
+  const isMutable = element =>
+    !element.disabled && !fieldsetDisabled(element) && !element.readOnly;
 
   // <https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#suffering-from-being-missing>
   const valueMissing = element => {
