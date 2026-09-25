@@ -12,6 +12,10 @@ use crate::node::{
     Attribute, LocalName, Namespace, Node, NodeKind, Prefix, QualName, html_namespace,
     html_qualified_name_eq, qualified_name_eq,
 };
+use crate::value::{
+    is_valid_date, is_valid_floating_point, is_valid_local_date_time, is_valid_month,
+    is_valid_simple_color, is_valid_time, is_valid_week,
+};
 
 /// Next document id for a freshly constructed [`Dom`]. Relaxed arithmetic is
 /// enough: the only requirement is that two live `Dom` values do not share
@@ -1539,10 +1543,10 @@ impl Dom {
         (name.ns == html_namespace() && name.local.as_ref() == "input").then_some(())
     }
 
-    /// Applies the value sanitization algorithm for the input states needed
-    /// by text entry. Other states retain their string until their dedicated
-    /// state algorithms are implemented.
-    /// <https://html.spec.whatwg.org/multipage/input.html#value-sanitization-algorithm>
+    /// Applies the value sanitization algorithm for each input state whose
+    /// value has a grammar. A string that does not match is replaced by the
+    /// state's default (the empty string, or `#000000` for color)
+    /// <https://html.spec.whatwg.org/multipage/input.html#value-sanitization-algorithm>.
     fn sanitize_input_value(&self, id: NodeId, value: String) -> String {
         let typ = self.input_type(id).unwrap_or_else(|| "text".into());
         match typ.as_str() {
@@ -1551,6 +1555,19 @@ impl Dom {
                 .replace(['\r', '\n'], "")
                 .trim_matches(|character: char| character.is_ascii_whitespace())
                 .to_owned(),
+            "number" | "range" => sanitize_grammar(value, is_valid_floating_point),
+            "date" => sanitize_grammar(value, is_valid_date),
+            "month" => sanitize_grammar(value, is_valid_month),
+            "week" => sanitize_grammar(value, is_valid_week),
+            "time" => sanitize_grammar(value, is_valid_time),
+            "datetime-local" => sanitize_grammar(value, is_valid_local_date_time),
+            "color" => {
+                if is_valid_simple_color(&value) {
+                    value.to_ascii_lowercase()
+                } else {
+                    "#000000".to_owned()
+                }
+            }
             _ => value,
         }
     }
@@ -2901,6 +2918,12 @@ impl Dom {
         });
         NodeId::new(self.document.document, slot, 0)
     }
+}
+
+/// Keeps `value` when it satisfies `valid`, else replaces it with the empty
+/// string, the default for every grammar-constrained input state except color.
+fn sanitize_grammar(value: String, valid: fn(&str) -> bool) -> String {
+    if valid(&value) { value } else { String::new() }
 }
 
 /// Replaces CRLF and lone CR with LF

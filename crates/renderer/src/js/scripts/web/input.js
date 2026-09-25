@@ -128,6 +128,7 @@
       bubbles: true, cancelable: true, inputType: inputType, data: data,
     });
     if (!element.dispatchEvent(before)) return;
+    if (typeof globalThis.__tbMarkUserEdited === 'function') globalThis.__tbMarkUserEdited(element);
     if (typeof element.setRangeText === 'function') element.setRangeText(text, start, end, 'end');
     else element.value = element.value.slice(0, start) + text + element.value.slice(end);
     fireInput(element, inputType, data);

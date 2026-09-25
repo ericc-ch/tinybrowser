@@ -43,6 +43,17 @@
 
   const customErrors = new WeakMap();
   const validityStates = new WeakMap();
+  // Controls whose value was last changed by a user edit. `maxlength` and
+  // `minlength` apply only then
+  // (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#suffering-from-being-too-long>).
+  const userEdited = new WeakSet();
+  // The input/typing paths call this so `maxlength`/`minlength` can tell a
+  // user edit from a script assignment
+  // (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#suffering-from-being-too-long>).
+  Object.defineProperty(globalThis, '__tbMarkUserEdited', {
+    value: element => { userEdited.add(element); },
+    writable: false, configurable: false, enumerable: false,
+  });
 
   const VALUE_MODE_TYPES = new Set([
     'text', 'search', 'tel', 'url', 'email', 'password', 'date', 'month',
@@ -61,6 +72,11 @@
   // <https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#barred-from-constraint-validation>
   const barredFromValidation = element => {
     if (element.disabled) return true;
+    // A control inside a `datalist` is barred
+    // (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#barred-from-constraint-validation>).
+    for (let ancestor = element.parentElement; ancestor; ancestor = ancestor.parentElement) {
+      if (ancestor.tagName === 'DATALIST') return true;
+    }
     switch (element.tagName) {
       case 'INPUT':
         return BARRED_TYPES.has(element.type) || element.readOnly;
@@ -89,24 +105,53 @@
     return false;
   };
 
+  // A radio button group is required when any member has the `required`
+  // attribute; every member then suffers from being missing while none is
+  // checked
+  // (<https://html.spec.whatwg.org/multipage/input.html#radio-button-state-(type=radio):suffering-from-being-missing>).
+  const radioGroupRequired = element => {
+    if (element.required) return true;
+    const name = element.name;
+    if (!name) return false;
+    const root = element.form || element.ownerDocument;
+    if (!root || typeof root.getElementsByTagName !== 'function') return false;
+    for (const radio of root.getElementsByTagName('input')) {
+      if (radio.type === 'radio' && radio.name === name && radio.required) return true;
+    }
+    return false;
+  };
+
+  // A control is mutable when it is neither disabled nor readonly
+  // (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#mutability>).
+  const isMutable = element => !element.disabled && !element.readOnly;
+
   // <https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#suffering-from-being-missing>
   const valueMissing = element => {
+    // A radio group is missing while no member is checked, for every member
+    // of a group that has any required member
+    // (<https://html.spec.whatwg.org/multipage/input.html#radio-button-state-(type=radio):suffering-from-being-missing>).
+    if (element.tagName === 'INPUT' && element.type === 'radio') {
+      // A radio with an empty name is not part of a radio button group, so
+      // the radio-group clause does not apply
+      // (<https://html.spec.whatwg.org/multipage/input.html#radio-button-state-(type=radio)>).
+      if (element.name === '') return false;
+      return radioGroupRequired(element) && !anyRadioChecked(element);
+    }
     if (!element.required) return false;
-    // A readonly or otherwise barred control is not mutable, so it cannot be
-    // missing (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#mutability>).
-    if (barredFromValidation(element)) return false;
     switch (element.tagName) {
       case 'INPUT':
         switch (element.type) {
+          // The checkedness and filename clauses do not require a mutable
+          // control; only the value-mode clause does.
           case 'checkbox': return !element.checked;
-          case 'radio': return !anyRadioChecked(element);
           case 'file': return element.files.length === 0;
           case 'hidden': return false;
-          default: return isTextControl(element) && element.value === '';
+          default: return isMutable(element) && isTextControl(element) && element.value === '';
         }
       case 'TEXTAREA':
-        return element.value === '';
+        return isMutable(element) && element.value === '';
       case 'SELECT':
+        // The select clause does not require mutability.
         return element.value === '';
       default:
         return false;
@@ -114,13 +159,13 @@
   };
 
   const tooLong = element => {
-    if (!isTextControl(element)) return false;
+    if (!isTextControl(element) || !userEdited.has(element)) return false;
     const maximum = element.maxLength;
     return maximum >= 0 && element.value.length > maximum;
   };
 
   const tooShort = element => {
-    if (!isTextControl(element)) return false;
+    if (!isTextControl(element) || !userEdited.has(element)) return false;
     const minimum = element.minLength;
     return minimum > 0 && element.value.length !== 0 && element.value.length < minimum;
   };
@@ -148,52 +193,191 @@
     return false;
   };
 
-  // The `pattern` attribute, compiled with the `v` flag and anchored
+  // QuickJS's `v` implementation rejects a few characters that the spec allows
+  // as literals (`/`, and `-` outside a character class); translate them to
+  // equivalent escapes so the pattern still compiles
   // (<https://html.spec.whatwg.org/multipage/input.html#the-pattern-attribute>).
-  const patternMismatch = element => {
+  const translatePattern = pattern => {
+    let translated = '';
+    let depth = 0;
+    for (let index = 0; index < pattern.length; index += 1) {
+      const character = pattern[index];
+      if (character === '\\' && index + 1 < pattern.length) {
+        translated += character + pattern[index + 1];
+        index += 1;
+        continue;
+      }
+      if (character === '[') depth += 1;
+      else if (character === ']' && depth > 0) depth -= 1;
+      else if (character === '/') { translated += '\\/'; continue; }
+      else if (character === '-' && depth === 0) { translated += '\\u002D'; continue; }
+      translated += character;
+    }
+    return translated;
+  };
+
+  // The `pattern` attribute compiled with the `v` flag; a pattern that does
+  // not compile is ignored
+  // (<https://html.spec.whatwg.org/multipage/input.html#the-pattern-attribute>).
+  const compiledPattern = element => {
     const pattern = element.getAttribute('pattern');
-    if (pattern === null || element.value === '') return false;
-    let expression;
+    if (pattern === null || pattern === '') return null;
+    const translated = translatePattern(pattern);
     try {
-      expression = new RegExp(`^(?:${pattern})$`, 'v');
+      new RegExp(translated, 'v');
     } catch (error) {
-      try { expression = new RegExp(`^(?:${pattern})$`, 'u'); }
-      catch (fallback) { return false; }
+      return null;
+    }
+    return new RegExp(`^(?:${translated})$`, 'v');
+  };
+
+  const patternMismatch = element => {
+    if (element.value === '') return false;
+    const expression = compiledPattern(element);
+    if (expression === null) return false;
+    // For a multiple email control the pattern applies to each address
+    // (<https://html.spec.whatwg.org/multipage/input.html#attr-input-multiple>).
+    if (inputType(element) === 'email' && element.hasAttribute('multiple')) {
+      return element.value.split(',').some(part => !expression.test(part.trim()));
     }
     return !expression.test(element.value);
   };
 
-  const numberValue = element => {
-    if (inputType(element) !== 'number' || element.value === '') return null;
-    const number = Number(element.value);
-    return Number.isNaN(number) ? null : number;
+  // Value-as-number scales for the date-like states, in each state's step
+  // unit: days for date, months for month, weeks for week, seconds for time
+  // and datetime-local
+  // (<https://html.spec.whatwg.org/multipage/input.html#value-as-a-number>).
+  const daysFromCivil = (year, month, day) => {
+    const y = year - (month <= 2 ? 1 : 0);
+    const era = Math.floor((y >= 0 ? y : y - 399) / 400);
+    const yearOfEra = y - era * 400;
+    const dayOfYear = Math.floor((153 * (month + (month > 2 ? -3 : 9)) + 2) / 5) + day - 1;
+    const dayOfEra = yearOfEra * 365
+      + Math.floor(yearOfEra / 4) - Math.floor(yearOfEra / 100) + dayOfYear;
+    return era * 146097 + dayOfEra - 719468;
   };
-  const bound = (element, name) => {
-    const raw = element.getAttribute(name);
-    if (raw === null) return null;
-    const number = Number(raw);
-    return Number.isNaN(number) ? null : number;
+  // Monday is 0 ... Sunday is 6; 1970-01-01 was a Thursday.
+  const weekdayFromDays = days => (((days % 7) + 10) % 7);
+  const parseDate = value => {
+    const match = /^(\d{4,6})-(\d{2})-(\d{2})$/.exec(value);
+    return match ? daysFromCivil(+match[1], +match[2], +match[3]) : null;
   };
+  const parseMonth = value => {
+    const match = /^(\d{4,6})-(\d{2})$/.exec(value);
+    return match ? (+match[1]) * 12 + (+match[2]) - 1 : null;
+  };
+  const epochMonday = (() => {
+    const januaryFirst = daysFromCivil(1970, 1, 1);
+    return januaryFirst - weekdayFromDays(januaryFirst);
+  })();
+  const parseWeek = value => {
+    const match = /^(\d{4,6})-W(\d{2})$/.exec(value);
+    if (!match) return null;
+    const januaryFourth = daysFromCivil(+match[1], 1, 4);
+    const mondayOfWeekOne = januaryFourth - weekdayFromDays(januaryFourth);
+    return (mondayOfWeekOne - epochMonday) / 7 + (+match[2]) - 1;
+  };
+  const parseTime = value => {
+    const match = /^(\d{2}):(\d{2})(?::(\d{2})(?:\.(\d{1,3}))?)?$/.exec(value);
+    if (!match) return null;
+    const fraction = match[4] || '';
+    return (+match[1]) * 3600 + (+match[2]) * 60 + (+match[3] || 0)
+      + (+fraction) / 10 ** fraction.length;
+  };
+  const parseLocalDateTime = value => {
+    const match = /^(\d{4,6}-\d{2}-\d{2})[T ](\d{2}:\d{2}(?::\d{2}(?:\.\d{1,3})?)?)$/.exec(value);
+    if (!match) return null;
+    const days = parseDate(match[1]);
+    const seconds = parseTime(match[2]);
+    return days === null || seconds === null ? null : days * 86400 + seconds;
+  };
+  const parseValue = (type, value) => {
+    if (value === null || value === '') return null;
+    switch (type) {
+      case 'number':
+      case 'range': {
+        const number = Number(value);
+        return Number.isFinite(number) ? number : null;
+      }
+      case 'date': return parseDate(value);
+      case 'month': return parseMonth(value);
+      case 'week': return parseWeek(value);
+      case 'time': return parseTime(value);
+      case 'datetime-local': return parseLocalDateTime(value);
+      default: return null;
+    }
+  };
+  const STEP_DEFAULT = {
+    date: 1, month: 1, week: 1, time: 60, 'datetime-local': 60, number: 1, range: 1,
+  };
+  const valueAsNumber = element => parseValue(inputType(element), element.value);
   const rangeUnderflow = element => {
-    const value = numberValue(element);
-    const min = bound(element, 'min');
-    return value !== null && min !== null && value < min;
+    const value = valueAsNumber(element);
+    const type = inputType(element);
+    const min = parseValue(type, element.getAttribute('min'));
+    const max = parseValue(type, element.getAttribute('max'));
+    if (value === null || min === null) return false;
+    // A reversed range (min greater than max) accepts everything outside the
+    // open interval (max, min).
+    if (max !== null && min > max) return value > max && value < min;
+    return value < min;
   };
   const rangeOverflow = element => {
-    const value = numberValue(element);
-    const max = bound(element, 'max');
-    return value !== null && max !== null && value > max;
+    const value = valueAsNumber(element);
+    const type = inputType(element);
+    const min = parseValue(type, element.getAttribute('min'));
+    const max = parseValue(type, element.getAttribute('max'));
+    if (value === null || max === null) return false;
+    if (min !== null && min > max) return value > max && value < min;
+    return value > max;
   };
+  // Parses a decimal string into an exact `BigInt` scaled by a power of ten
+  // (<https://html.spec.whatwg.org/multipage/common-microsyntaxes.html#rules-for-parsing-floating-point-number-values>).
+  const parseDecimal = text => {
+    const match = /^([+-]?)(\d*)(?:\.(\d*))?(?:[eE]([+-]?\d+))?$/.exec(text);
+    if (match === null) return null;
+    const integer = match[2] || '';
+    const fraction = match[3] || '';
+    if (integer === '' && fraction === '') return null;
+    const sign = match[1] === '-' ? -1n : 1n;
+    let value = BigInt(integer + fraction) * sign;
+    let scale = fraction.length - (match[4] ? Number(match[4]) : 0);
+    if (scale < 0) {
+      value *= 10n ** BigInt(-scale);
+      scale = 0;
+    }
+    return { value, scale };
+  };
+  const atScale = (decimal, scale) => decimal.value * 10n ** BigInt(scale - decimal.scale);
+
   const stepMismatch = element => {
-    const value = numberValue(element);
+    const type = inputType(element);
+    const fallback = STEP_DEFAULT[type];
+    if (fallback === undefined) return false;
+    const rawStep = element.getAttribute('step');
+    if (rawStep !== null && rawStep.trim().toLowerCase() === 'any') return false;
+    if (type === 'number' || type === 'range') {
+      // Exact decimal arithmetic: a very small step with a large value loses
+      // the fraction in f64
+      // (<https://html.spec.whatwg.org/multipage/input.html#the-step-attribute>).
+      const value = parseDecimal(element.value);
+      if (value === null) return false;
+      let step = rawStep === null ? null : parseDecimal(rawStep.trim());
+      if (step === null || step.value <= 0n) step = { value: 1n, scale: 0 };
+      const minText = element.getAttribute('min');
+      let min = minText === null ? null : parseDecimal(minText.trim());
+      if (min === null) min = { value: 0n, scale: 0 };
+      const scale = Math.max(value.scale, min.scale, step.scale);
+      return (atScale(value, scale) - atScale(min, scale)) % atScale(step, scale) !== 0n;
+    }
+    const value = valueAsNumber(element);
     if (value === null) return false;
-    const raw = element.getAttribute('step');
-    if (raw !== null && raw.trim().toLowerCase() === 'any') return false;
-    let step = raw === null ? 1 : Number(raw);
-    if (Number.isNaN(step) || step <= 0) step = 1;
-    const base = bound(element, 'min') ?? 0;
-    const steps = (value - base) / step;
-    return Math.abs(steps - Math.round(steps)) > 1e-9;
+    let step = rawStep === null ? fallback : Number(rawStep);
+    if (Number.isNaN(step) || step <= 0) step = fallback;
+    const min = parseValue(type, element.getAttribute('min'));
+    const remainder = Math.abs((value - (min === null ? 0 : min)) % step);
+    if (remainder === 0) return false;
+    return Math.min(remainder, step - remainder) > step * 1e-9;
   };
 
   const FLAGS = {
@@ -308,6 +492,7 @@
   for (const name of [
     'HTMLInputElement', 'HTMLTextAreaElement', 'HTMLSelectElement',
     'HTMLButtonElement', 'HTMLFieldSetElement', 'HTMLOutputElement',
+    'HTMLObjectElement',
   ]) {
     const constructor = globalThis[name];
     if (!constructor || !constructor.prototype) continue;

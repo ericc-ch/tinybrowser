@@ -773,6 +773,14 @@ pub(crate) fn fire_trusted(
     fire_trusted_with_related(ctx, target, typ, bubbles, cancelable, None)
 }
 
+/// Fires a trusted `click` and reports whether it was not canceled, so the
+/// caller can run the activation behavior
+/// (<https://dom.spec.whatwg.org/#concept-event-dispatch>).
+pub(crate) fn fire_trusted_click(ctx: &Ctx<'_>, target: EventTargetKey) -> Result<bool> {
+    let event = Class::instance(ctx.clone(), JsEvent::trusted("click", true, true))?;
+    dispatch(ctx, target, &event, None)
+}
+
 /// Creates and dispatches a trusted event with a `relatedTarget`, as the
 /// focus update steps require
 /// (<https://html.spec.whatwg.org/multipage/interaction.html#focus-update-steps>).

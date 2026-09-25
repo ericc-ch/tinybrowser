@@ -268,10 +268,97 @@ enum Activation {
     None,
     Submit,
     Reset,
+    ToggleCheckedness,
+}
+
+/// The nearest ancestor `form` element of `node`, if any.
+fn nearest_form(dom: &dom::Dom, node: NodeId) -> Option<NodeId> {
+    let mut current = dom.parent(node);
+    while let Some(parent) = current {
+        if let Some(NodeKind::Element { name, .. }) = dom.kind(parent)
+            && name.ns == html_namespace()
+            && name.local.as_ref() == "form"
+        {
+            return Some(parent);
+        }
+        current = dom.parent(parent);
+    }
+    None
+}
+
+/// Whether `node` is a radio button with the given group name.
+fn is_radio_named(dom: &dom::Dom, node: NodeId, group_name: &str) -> bool {
+    let Some(NodeKind::Element { name, .. }) = dom.kind(node) else {
+        return false;
+    };
+    name.ns == html_namespace()
+        && name.local.as_ref() == "input"
+        && dom
+            .attribute(node, "type")
+            .is_some_and(|value| value.trim().eq_ignore_ascii_case("radio"))
+        && dom.attribute(node, "name").unwrap_or_default() == group_name
+}
+
+/// The checkbox/radio activation behavior: toggle (checkbox) or set (radio)
+/// checkedness, unchecking the rest of the radio group, then fire `input` and
+/// `change`
+/// (<https://html.spec.whatwg.org/multipage/input.html#checkbox-state-(type=checkbox):activation-behavior>).
+fn toggle_checkedness(ctx: &Ctx<'_>, node: NodeId) -> Result<()> {
+    let world = world_for_node(ctx, node)?;
+    let changed = {
+        let world = world.borrow_mut();
+        let Some(mut parsed) = world.document_mut(node) else {
+            return Ok(());
+        };
+        let dom = &mut parsed.dom;
+        let Some(NodeKind::Element { name, .. }) = dom.kind(node) else {
+            return Ok(());
+        };
+        if name.ns != html_namespace() || name.local.as_ref() != "input" {
+            return Ok(());
+        }
+        let type_attr = dom
+            .attribute(node, "type")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase();
+        match type_attr.as_str() {
+            "checkbox" => {
+                let next = !dom.checkedness(node);
+                dom.set_checkedness(node, next);
+                true
+            }
+            "radio" => {
+                // A checked radio cannot be unchecked by clicking.
+                if dom.checkedness(node) {
+                    false
+                } else {
+                    let group_name = dom.attribute(node, "name").unwrap_or_default();
+                    let scope = nearest_form(dom, node).unwrap_or_else(|| dom.document());
+                    let members: Vec<NodeId> = dom
+                        .descendants(scope)
+                        .filter(|&other| other != node && is_radio_named(dom, other, &group_name))
+                        .collect();
+                    for other in members {
+                        dom.set_checkedness(other, false);
+                    }
+                    dom.set_checkedness(node, true);
+                    true
+                }
+            }
+            _ => false,
+        }
+    };
+    if changed {
+        events::fire_trusted(ctx, EventTargetKey::Node(node), "input", true, false)?;
+        events::fire_trusted(ctx, EventTargetKey::Node(node), "change", true, false)?;
+    }
+    Ok(())
 }
 
 /// The activation behavior of a clicked control: a submit button submits its
-/// form owner with itself as submitter, a reset button resets it
+/// form owner with itself as submitter, a reset button resets it, and a
+/// checkbox or radio updates its checkedness
 /// (<https://html.spec.whatwg.org/multipage/form-elements.html#the-button-element:activation-behavior>).
 fn run_activation(ctx: &Ctx<'_>, node: NodeId) -> Result<()> {
     let world = world_for_node(ctx, node)?;
@@ -287,64 +374,56 @@ fn run_activation(ctx: &Ctx<'_>, node: NodeId) -> Result<()> {
         if name.ns != html_namespace() {
             return Ok(());
         }
-        let button_type = |dom: &dom::Dom| {
+        let type_attr = |dom: &dom::Dom| {
             dom.attribute(node, "type")
                 .map(|value| value.trim().to_ascii_lowercase())
         };
         let activation = match name.local.as_ref() {
-            "input" => match button_type(dom).as_deref() {
+            "input" => match type_attr(dom).as_deref() {
                 Some("submit") => Activation::Submit,
                 Some("reset") => Activation::Reset,
+                Some("checkbox" | "radio") => Activation::ToggleCheckedness,
                 _ => Activation::None,
             },
-            "button" => match button_type(dom).as_deref() {
+            "button" => match type_attr(dom).as_deref() {
                 None | Some("submit") => Activation::Submit,
                 Some("reset") => Activation::Reset,
                 _ => Activation::None,
             },
             _ => Activation::None,
         };
-        if matches!(activation, Activation::None) {
-            return Ok(());
-        }
-        // The form owner is the nearest ancestor `form` for now; the `form`
-        // attribute association lands with the form-owner unit.
-        let mut form = None;
-        let mut current = dom.parent(node);
-        while let Some(parent) = current {
-            if let Some(NodeKind::Element { name, .. }) = dom.kind(parent)
-                && name.ns == html_namespace()
-                && name.local.as_ref() == "form"
-            {
-                form = Some(parent);
-                break;
-            }
-            current = dom.parent(parent);
-        }
-        (activation, form)
+        (activation, nearest_form(dom, node))
     };
-    let Some(form) = form else {
-        return Ok(());
-    };
-    let form_value = wrap_node(ctx, form)?;
-    let Some(form_object) = form_value.as_object() else {
-        return Ok(());
-    };
-    let button_value = wrap_node(ctx, node)?;
     match activation {
-        Activation::Submit => {
-            if let Ok(function) = form_object.get::<_, Function>("requestSubmit") {
-                let _ = function.call::<_, ()>((This(form_object.clone()), button_value));
+        Activation::None => Ok(()),
+        Activation::ToggleCheckedness => toggle_checkedness(ctx, node),
+        Activation::Submit | Activation::Reset => {
+            // The form owner is the nearest ancestor `form` for now; the `form`
+            // attribute association lands with the form-owner unit.
+            let Some(form) = form else {
+                return Ok(());
+            };
+            let form_value = wrap_node(ctx, form)?;
+            let Some(form_object) = form_value.as_object() else {
+                return Ok(());
+            };
+            let button_value = wrap_node(ctx, node)?;
+            match activation {
+                Activation::Submit => {
+                    if let Ok(function) = form_object.get::<_, Function>("requestSubmit") {
+                        let _ = function.call::<_, ()>((This(form_object.clone()), button_value));
+                    }
+                }
+                Activation::Reset => {
+                    if let Ok(function) = form_object.get::<_, Function>("reset") {
+                        let _ = function.call::<_, ()>((This(form_object.clone()),));
+                    }
+                }
+                Activation::None | Activation::ToggleCheckedness => {}
             }
+            Ok(())
         }
-        Activation::Reset => {
-            if let Ok(function) = form_object.get::<_, Function>("reset") {
-                let _ = function.call::<_, ()>((This(form_object.clone()),));
-            }
-        }
-        Activation::None => {}
     }
-    Ok(())
 }
 
 /// The `WebDriver` element bridge. Page script can still call it by name and
@@ -390,6 +469,8 @@ fn webdriver_click<'js>(ctx: Ctx<'js>, element: Value<'js>) -> Result<()> {
     if is_focusable(&ctx, node)? {
         focus_node(&ctx, node)?;
     }
-    events::fire_trusted(&ctx, EventTargetKey::Node(node), "click", true, true)?;
+    if events::fire_trusted_click(&ctx, EventTargetKey::Node(node))? {
+        run_activation(&ctx, node)?;
+    }
     Ok(())
 }

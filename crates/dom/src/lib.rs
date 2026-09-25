@@ -22,6 +22,7 @@ mod id;
 mod node;
 mod select;
 mod state;
+mod value;
 
 pub use state::{
     attr_value, direction_is, is_checked, is_default, is_defined, is_disabled, is_enabled, is_html,
@@ -37,3 +38,7 @@ pub use node::{
     xmlns_namespace,
 };
 pub use select::{ParseFail, ParseFailKind, SelectError};
+pub use value::{
+    is_valid_date, is_valid_floating_point, is_valid_local_date_time, is_valid_month,
+    is_valid_simple_color, is_valid_time, is_valid_week,
+};

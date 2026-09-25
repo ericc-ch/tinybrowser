@@ -1359,6 +1359,49 @@ impl JsNode {
         self.reflect_boolean(ctx, "formnovalidate", value)
     }
 
+    // https://html.spec.whatwg.org/multipage/input.html#the-pattern-attribute
+    #[qjs(get)]
+    fn pattern(&self, ctx: Ctx<'_>) -> Result<String> {
+        attribute_value(&ctx, self.handle.0, "pattern")
+    }
+
+    #[qjs(set, rename = "pattern")]
+    fn set_pattern(&self, ctx: Ctx<'_>, value: WebIdlString) -> Result<()> {
+        self.set_attribute(ctx, WebIdlString("pattern".into()), value)
+    }
+
+    // https://html.spec.whatwg.org/multipage/input.html#the-min-and-max-attributes
+    #[qjs(get)]
+    fn min(&self, ctx: Ctx<'_>) -> Result<String> {
+        attribute_value(&ctx, self.handle.0, "min")
+    }
+
+    #[qjs(set, rename = "min")]
+    fn set_min(&self, ctx: Ctx<'_>, value: WebIdlString) -> Result<()> {
+        self.set_attribute(ctx, WebIdlString("min".into()), value)
+    }
+
+    #[qjs(get)]
+    fn max(&self, ctx: Ctx<'_>) -> Result<String> {
+        attribute_value(&ctx, self.handle.0, "max")
+    }
+
+    #[qjs(set, rename = "max")]
+    fn set_max(&self, ctx: Ctx<'_>, value: WebIdlString) -> Result<()> {
+        self.set_attribute(ctx, WebIdlString("max".into()), value)
+    }
+
+    // https://html.spec.whatwg.org/multipage/input.html#the-step-attribute
+    #[qjs(get)]
+    fn step(&self, ctx: Ctx<'_>) -> Result<String> {
+        attribute_value(&ctx, self.handle.0, "step")
+    }
+
+    #[qjs(set, rename = "step")]
+    fn set_step(&self, ctx: Ctx<'_>, value: WebIdlString) -> Result<()> {
+        self.set_attribute(ctx, WebIdlString("step".into()), value)
+    }
+
     // https://drafts.csswg.org/cssom-view/#dom-element-scrollleft
     #[qjs(get, rename = "scrollLeft")]
     fn scroll_left(&self, ctx: Ctx<'_>) -> Result<f64> {
