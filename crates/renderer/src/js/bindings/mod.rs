@@ -22,6 +22,7 @@ mod collections;
 mod document;
 mod exceptions;
 mod focus;
+mod forms;
 mod messaging;
 mod mutation;
 mod node;
@@ -370,6 +371,10 @@ pub(crate) fn install(ctx: &Ctx<'_>, world: &Rc<RefCell<World>>) -> Result<()> {
     Class::<JsTokenList>::define(&globals)?;
     Class::<JsAttr>::define(&globals)?;
     Class::<JsNamedNodeMap>::define(&globals)?;
+    globals.set(
+        "__tbFormEntries",
+        rquickjs::prelude::Func::from(forms::form_entries),
+    )?;
     Class::<JsDomParser>::define(&globals)?;
     ctx.eval::<(), _>(parsing::INSTALL_DOMPARSER_CTOR_JS)?;
     Class::<JsXmlSerializer>::define(&globals)?;
