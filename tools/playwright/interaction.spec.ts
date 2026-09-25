@@ -21,10 +21,11 @@ test("clicks use real layout geometry", async ({ daemon }) => {
   await browser.close();
 });
 
-// Blocked on form-control support: `#name` (a textarea) lays out as a zero
-// box because the UA stylesheet gives it no intrinsic size, and the typing
-// path reads `element.value.length`, which the engine's textarea does not
-// expose yet. Once those land this becomes a plain `test`.
+// Blocked on Playwright actionability, not on form semantics: the textarea now
+// has an intrinsic box and exposes `value`/selection/editing, but
+// `locator.focus()` still times out while waiting for the element to become
+// actionable over CDP. Follow up on the CDP element-state surface before
+// promoting this to a plain `test`.
 test.fixme("typing into form controls", async ({ daemon }) => {
   const browser = await chromium.connectOverCDP(daemon.origin);
   const context = browser.contexts()[0];
