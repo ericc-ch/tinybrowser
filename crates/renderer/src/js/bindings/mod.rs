@@ -157,6 +157,128 @@ pub(super) fn report_exception_value<'js>(
     let _ = report.call::<_, ()>((caught, meta));
 }
 
+/// A promise rejected without a handler, waiting for either the
+/// microtask-checkpoint `unhandledrejection` report or a late handler
+/// (<https://html.spec.whatwg.org/multipage/webappapis.html#unhandled-promise-rejections>).
+struct PendingRejection {
+    world: Weak<RefCell<World>>,
+    promise: Persistent<Value<'static>>,
+    reason: Persistent<Value<'static>>,
+    reported: bool,
+}
+
+type SavedPromise = (Persistent<Value<'static>>, Persistent<Value<'static>>);
+
+thread_local! {
+    static PENDING_REJECTIONS: RefCell<Vec<PendingRejection>> =
+        const { RefCell::new(Vec::new()) };
+    /// Promises whose `unhandledrejection` already fired and which were handled
+    /// afterwards; each fires one `rejectionhandled`.
+    static LATE_HANDLED: RefCell<Vec<SavedPromise>> = const { RefCell::new(Vec::new()) };
+}
+
+/// `QuickJS`'s host rejection tracker, called when a promise is rejected with no
+/// handler (`handled` false) and again when a handler is attached to a still
+/// unhandled rejection (`handled` true). It only records state; the events fire
+/// from [`drain_rejections`] at the microtask checkpoint, because firing a DOM
+/// event from inside the promise machinery would reenter the engine.
+pub(super) fn note_rejection<'js>(
+    ctx: &Ctx<'js>,
+    promise: Value<'js>,
+    reason: Value<'js>,
+    handled: bool,
+) {
+    PENDING_REJECTIONS.with(|queue| {
+        let mut queue = queue.borrow_mut();
+        let index = queue.iter().position(|entry| {
+            entry
+                .promise
+                .clone()
+                .restore(ctx)
+                .is_ok_and(|stored| stored == promise)
+        });
+        if handled {
+            let Some(index) = index else {
+                return;
+            };
+            let entry = queue.remove(index);
+            if entry.reported {
+                LATE_HANDLED.with(|late| {
+                    late.borrow_mut().push((entry.promise, entry.reason));
+                });
+            }
+            return;
+        }
+        if index.is_some() {
+            return;
+        }
+        let Ok(world) = world(ctx) else {
+            return;
+        };
+        queue.push(PendingRejection {
+            world: Rc::downgrade(&world),
+            promise: Persistent::save(ctx, promise),
+            reason: Persistent::save(ctx, reason),
+            reported: false,
+        });
+    });
+}
+
+/// Fires the queued rejection events for `current`'s realm: one
+/// `unhandledrejection` per newly unhandled rejection, then any
+/// `rejectionhandled` a late handler queued. Called after a microtask
+/// checkpoint.
+pub(super) fn drain_rejections(ctx: &Ctx<'_>, current: &Rc<RefCell<World>>) {
+    let pending: Vec<PendingRejection> = PENDING_REJECTIONS.with(|queue| {
+        let mut queue = queue.borrow_mut();
+        let mut mine = Vec::new();
+        let mut rest = Vec::new();
+        for entry in queue.drain(..) {
+            let Some(world) = entry.world.upgrade() else {
+                // The realm is gone; its promise no longer matters.
+                continue;
+            };
+            if Rc::ptr_eq(&world, current) {
+                mine.push(entry);
+            } else {
+                rest.push(entry);
+            }
+        }
+        *queue = rest;
+        mine
+    });
+    for mut entry in pending {
+        if !entry.reported {
+            entry.reported = true;
+            if let (Ok(promise), Ok(reason)) = (
+                entry.promise.clone().restore(ctx),
+                entry.reason.clone().restore(ctx),
+            ) {
+                fire_rejection(ctx, false, promise, reason);
+            }
+        }
+        PENDING_REJECTIONS.with(|queue| queue.borrow_mut().push(entry));
+    }
+    let late: Vec<SavedPromise> = LATE_HANDLED.with(|queue| std::mem::take(&mut *queue.borrow_mut()));
+    for (promise, reason) in late {
+        if let (Ok(promise), Ok(reason)) = (promise.restore(ctx), reason.restore(ctx)) {
+            fire_rejection(ctx, true, promise, reason);
+        }
+    }
+}
+
+/// Dispatches one `PromiseRejectionEvent` at the realm window through the
+/// `__tbPromiseRejection` shim.
+fn fire_rejection<'js>(ctx: &Ctx<'js>, handled: bool, promise: Value<'js>, reason: Value<'js>) {
+    let Ok(report) = ctx.globals().get::<_, Value>("__tbPromiseRejection") else {
+        return;
+    };
+    let Some(report) = report.as_function() else {
+        return;
+    };
+    let _ = report.call::<_, Value>((handled, promise, reason));
+}
+
 impl<'js> rquickjs::FromJs<'js> for OptString {
     fn from_js(ctx: &Ctx<'js>, value: Value<'js>) -> Result<Self> {
         if value.is_null() || value.is_undefined() {

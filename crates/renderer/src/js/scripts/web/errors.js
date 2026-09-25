@@ -8,6 +8,8 @@
   const LINENO = Symbol('tb-error-lineno');
   const COLNO = Symbol('tb-error-colno');
   const ERROR = Symbol('tb-error-error');
+  const PROMISE = Symbol('tb-rejection-promise');
+  const REASON = Symbol('tb-rejection-reason');
 
   // `ErrorEventInit` members beyond `EventInit`
   // (<https://html.spec.whatwg.org/multipage/webappapis.html#erroreventinit>).
@@ -51,6 +53,41 @@
   Object.defineProperty(ErrorEvent, 'prototype', { value: proto, writable: false });
   Object.defineProperty(globalThis, 'ErrorEvent', {
     value: ErrorEvent, writable: true, configurable: true,
+  });
+
+  // `PromiseRejectionEventInit`: `promise` is required, `reason` defaults to
+  // undefined (<https://html.spec.whatwg.org/multipage/webappapis.html#promiserejectioneventinit>).
+  function PromiseRejectionEvent(type) {
+    if (new.target === undefined) {
+      throw new TypeError('Class constructor PromiseRejectionEvent cannot be invoked without new');
+    }
+    const init = arguments[1];
+    if (init === undefined || init === null || init.promise === undefined) {
+      throw new TypeError('PromiseRejectionEventInit requires a promise');
+    }
+    const event = Reflect.construct(globalThis.Event, arguments, new.target);
+    event[PROMISE] = init.promise;
+    event[REASON] = init.reason;
+    return event;
+  }
+  const rejectionProto = Object.create(globalThis.Event.prototype);
+  Object.defineProperty(rejectionProto, 'constructor', {
+    value: PromiseRejectionEvent, writable: true, configurable: true,
+  });
+  Object.defineProperty(rejectionProto, 'promise', {
+    get() { return this[PROMISE]; }, enumerable: true, configurable: true,
+  });
+  Object.defineProperty(rejectionProto, 'reason', {
+    get() { return this[REASON]; }, enumerable: true, configurable: true,
+  });
+  Object.defineProperty(rejectionProto, Symbol.toStringTag, {
+    value: 'PromiseRejectionEvent', writable: false, enumerable: false, configurable: true,
+  });
+  Object.defineProperty(PromiseRejectionEvent, 'prototype', {
+    value: rejectionProto, writable: false,
+  });
+  Object.defineProperty(globalThis, 'PromiseRejectionEvent', {
+    value: PromiseRejectionEvent, writable: true, configurable: true,
   });
 
   // The first `file:line:column` a QuickJS stack frame ends with, script-relative.
@@ -107,6 +144,22 @@
     }
   };
   Object.defineProperty(globalThis, '__tbReportException', {
+    writable: false, configurable: false, enumerable: false,
+  });
+
+  // The host calls this at the end of a microtask checkpoint for a promise
+  // rejected without a handler, and again if a handler is attached after the
+  // rejection was reported
+  // (<https://html.spec.whatwg.org/multipage/webappapis.html#unhandled-promise-rejections>).
+  globalThis.__tbPromiseRejection = function(handled, promise, reason) {
+    const event = new PromiseRejectionEvent(
+      handled ? 'rejectionhandled' : 'unhandledrejection',
+      { promise: promise, reason: reason, cancelable: !handled },
+    );
+    globalThis.__tbDispatchTrusted(hostToken, event);
+    return event.defaultPrevented;
+  };
+  Object.defineProperty(globalThis, '__tbPromiseRejection', {
     writable: false, configurable: false, enumerable: false,
   });
 })();

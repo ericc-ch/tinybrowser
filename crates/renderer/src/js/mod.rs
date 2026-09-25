@@ -157,6 +157,15 @@ impl SharedJsRuntime {
         let slot = self.0.get_or_init(|| {
             let runtime = Runtime::new().map_err(|err| err.to_string().into_boxed_str())?;
             runtime.set_loader(modules::WebModuleResolver, modules::WebModuleLoader);
+            // QuickJS reports a rejected-without-handler promise and a late
+            // handler for one here; the events fire at the microtask
+            // checkpoint
+            // (<https://html.spec.whatwg.org/multipage/webappapis.html#unhandled-promise-rejections>).
+            runtime.set_host_promise_rejection_tracker(Some(Box::new(
+                |ctx, promise, reason, handled| {
+                    bindings::note_rejection(&ctx, promise, reason, handled);
+                },
+            )));
             Ok(runtime)
         });
         slot.as_ref()
@@ -599,11 +608,22 @@ impl JsRealm {
         let result = operation();
         // https://html.spec.whatwg.org/multipage/webappapis.html#clean-up-after-running-script
         let jobs = self.run_jobs();
+        // Rejections without a handler report at the end of the microtask
+        // checkpoint, after the jobs above have run.
+        self.report_pending_rejections();
         if interrupted.get() {
             Err(JsError::Interrupted)
         } else {
             result.and_then(|value| jobs.map(|()| value))
         }
+    }
+
+    /// Fires queued `unhandledrejection` / `rejectionhandled` events for this
+    /// realm after a microtask checkpoint.
+    fn report_pending_rejections(&self) {
+        self.context.with(|ctx| {
+            bindings::drain_rejections(&ctx, &self.world);
+        });
     }
 
     fn run_jobs(&self) -> Result<(), JsError> {
