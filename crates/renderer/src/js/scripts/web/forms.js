@@ -604,6 +604,26 @@
     configurable: true,
   });
 
+  // <https://html.spec.whatwg.org/multipage/forms.html#dom-form-checkvalidity>
+  const formValidation = form => {
+    let valid = true;
+    for (const control of form.querySelectorAll('input, textarea, select, button')) {
+      if (typeof control.checkValidity !== 'function') continue;
+      if (!control.checkValidity()) valid = false;
+    }
+    return valid;
+  };
+  Object.defineProperties(globalThis.HTMLFormElement.prototype, {
+    checkValidity: {
+      value: function() { return formValidation(this); },
+      writable: true, enumerable: true, configurable: true,
+    },
+    reportValidity: {
+      value: function() { return formValidation(this); },
+      writable: true, enumerable: true, configurable: true,
+    },
+  });
+
   // <https://html.spec.whatwg.org/multipage/forms.html#dom-form-requestsubmit>
   Object.defineProperty(globalThis.HTMLFormElement.prototype, 'requestSubmit', {
     value: function(submitter) {
@@ -613,6 +633,9 @@
           throw new TypeError('submitter must be a submit button');
         }
       }
+      // Interactive validation runs before the submit event and can stop the
+      // submission (<https://html.spec.whatwg.org/multipage/forms.html#interactively-validate-the-constraints>).
+      if (!this.noValidate && !this.checkValidity()) return;
       const event = new SubmitEvent('submit', {
         submitter: submitter === undefined ? null : submitter,
         bubbles: true,
