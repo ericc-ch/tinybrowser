@@ -8,13 +8,20 @@
       throw new TypeError('Class constructor FormData cannot be invoked without new');
     }
     const list = [];
+    lists.set(this, list);
     if (form !== undefined && form !== null) {
       const flat = globalThis.__tbFormEntries(form);
       for (let index = 0; index + 1 < flat.length; index += 2) {
         list.push([String(flat[index]), flat[index + 1]]);
       }
+      // Constructing the entry list fires `formdata`, whose handler may extend
+      // the list (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#constructing-form-data-set>).
+      if (typeof globalThis.FormDataEvent === 'function') {
+        form.dispatchEvent(new globalThis.FormDataEvent('formdata', {
+          formData: this, bubbles: true, cancelable: false,
+        }));
+      }
     }
-    lists.set(this, list);
   }
 
   const entryList = receiver => {

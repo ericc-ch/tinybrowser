@@ -1386,6 +1386,38 @@ impl JsNode {
         self.reflect_boolean(ctx, "multiple", value)
     }
 
+    // https://html.spec.whatwg.org/multipage/input.html#dom-input-checked
+    #[qjs(get)]
+    fn checked(&self, ctx: Ctx<'_>) -> Result<bool> {
+        let world = world(&ctx)?;
+        let world = world.borrow();
+        Ok(world
+            .document(self.handle.0)
+            .is_some_and(|parsed| parsed.dom.checkedness(self.handle.0)))
+    }
+
+    #[qjs(set, rename = "checked")]
+    fn set_checked(&self, ctx: Ctx<'_>, value: bool) -> Result<()> {
+        let world = world(&ctx)?;
+        let world = world.borrow();
+        let Some(mut parsed) = world.document_mut(self.handle.0) else {
+            return Ok(());
+        };
+        parsed.dom.set_checkedness(self.handle.0, value);
+        Ok(())
+    }
+
+    // https://html.spec.whatwg.org/multipage/input.html#dom-input-defaultchecked
+    #[qjs(get, rename = "defaultChecked")]
+    fn default_checked(&self, ctx: Ctx<'_>) -> Result<bool> {
+        self.attribute_present(&ctx, "checked")
+    }
+
+    #[qjs(set, rename = "defaultChecked")]
+    fn set_default_checked(&self, ctx: Ctx<'_>, value: bool) -> Result<()> {
+        self.reflect_boolean(ctx, "checked", value)
+    }
+
     /// URL-reflected `src`: parsed against the document base and stored
     /// serialized, like `href`; an absent attribute reflects as the empty
     /// string (<https://html.spec.whatwg.org/multipage/urls-and-fetching.html#reflecting-content-attributes-in-idl-attributes>).

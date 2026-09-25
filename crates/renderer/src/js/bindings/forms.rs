@@ -50,90 +50,17 @@ pub(super) fn form_entries<'js>(ctx: Ctx<'js>, form: Value<'js>) -> Result<Array
         return Ok(entries);
     }
     let world_rc = world(&ctx)?;
-    let pending: Vec<PendingEntry> = {
-        let world = world_rc.borrow();
-        let Some(parsed) = world.document(id) else {
-            return Ok(entries);
-        };
-        // Pre-order traversal: an explicit stack with reversed children keeps
-        // document order.
-        let mut order = Vec::new();
-        let mut stack = vec![id];
-        while let Some(node) = stack.pop() {
-            order.push(node);
-            let children: Vec<NodeId> = parsed
-                .dom
-                .children(node)
-                .map(Iterator::collect)
-                .unwrap_or_default();
-            for child in children.into_iter().rev() {
-                stack.push(child);
-            }
-        }
-        let mut pending = Vec::new();
-        for node in order {
-            if node == id {
-                continue;
-            }
-            let Some(NodeKind::Element { name, .. }) = parsed.dom.kind(node) else {
-                continue;
-            };
-            if name.ns != html_namespace() {
-                continue;
-            }
-            let local = name.local.as_ref();
-            if local != "input" && local != "textarea" && local != "select" {
-                continue;
-            }
-            // A control without a name, or disabled, contributes nothing
-            // (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#constructing-form-data-set>).
-            let Some(control_name) = parsed.dom.attribute(node, "name") else {
-                continue;
-            };
-            if control_name.is_empty() || parsed.dom.attribute(node, "disabled").is_some() {
-                continue;
-            }
-            match local {
-                "textarea" => {
-                    let mut value = parsed.dom.textarea_value(node).unwrap_or_default();
-                    if wrap_is_hard(parsed.dom.attribute(node, "wrap").as_deref()) {
-                        let cols = parse_positive(parsed.dom.attribute(node, "cols").as_deref())
-                            .unwrap_or(20);
-                        value = hard_wrap(&value, cols);
-                    }
-                    pending.push(PendingEntry::Text(control_name, value));
-                }
-                "input" => {
-                    let typ = parsed
-                        .dom
-                        .attribute(node, "type")
-                        .unwrap_or_else(|| "text".to_owned());
-                    let typ = typ.trim().to_ascii_lowercase();
-                    if matches!(
-                        typ.as_str(),
-                        "submit" | "reset" | "button" | "image" | "checkbox" | "radio"
-                    ) {
-                        continue;
-                    }
-                    if typ == "file" {
-                        pending.push(PendingEntry::Files(control_name, node));
-                    } else {
-                        pending.push(PendingEntry::Text(
-                            control_name,
-                            parsed.dom.input_value(node).unwrap_or_default(),
-                        ));
-                    }
-                }
-                // A `select` contributes through selectedness, which lands
-                // with the select unit.
-                _ => {}
-            }
-        }
-        pending
-    };
+    let pending = collect_pending_entries(&world_rc, id);
     for entry in pending {
         match entry {
             PendingEntry::Text(name, value) => {
+                // A control named `_charset_` carries the encoding name
+                // (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#attr-fe-name-charset>).
+                let value = if name == "_charset_" {
+                    "UTF-8".to_owned()
+                } else {
+                    value
+                };
                 let index = entries.len();
                 entries.set(index, name)?;
                 entries.set(index + 1, value)?;
@@ -144,6 +71,102 @@ pub(super) fn form_entries<'js>(ctx: Ctx<'js>, form: Value<'js>) -> Result<Array
         }
     }
     Ok(entries)
+}
+
+/// Walks a form's descendants in tree order and resolves each named, enabled
+/// control into its contribution.
+fn collect_pending_entries(
+    world_rc: &Rc<RefCell<World>>,
+    id: NodeId,
+) -> Vec<PendingEntry> {
+    let world = world_rc.borrow();
+    let Some(parsed) = world.document(id) else {
+        return Vec::new();
+    };
+    // Pre-order traversal: an explicit stack with reversed children keeps
+    // document order.
+    let mut order = Vec::new();
+    let mut stack = vec![id];
+    while let Some(node) = stack.pop() {
+        order.push(node);
+        let children: Vec<NodeId> = parsed
+            .dom
+            .children(node)
+            .map(Iterator::collect)
+            .unwrap_or_default();
+        for child in children.into_iter().rev() {
+            stack.push(child);
+        }
+    }
+    let mut pending = Vec::new();
+    for node in order {
+        if node == id {
+            continue;
+        }
+        let Some(NodeKind::Element { name, .. }) = parsed.dom.kind(node) else {
+            continue;
+        };
+        if name.ns != html_namespace() {
+            continue;
+        }
+        let local = name.local.as_ref();
+        if local != "input" && local != "textarea" && local != "select" {
+            continue;
+        }
+        // A control without a name, or disabled, contributes nothing
+        // (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#constructing-form-data-set>).
+        let Some(control_name) = parsed.dom.attribute(node, "name") else {
+            continue;
+        };
+        if control_name.is_empty() || parsed.dom.attribute(node, "disabled").is_some() {
+            continue;
+        }
+        match local {
+            "textarea" => {
+                let mut value = parsed.dom.textarea_value(node).unwrap_or_default();
+                if wrap_is_hard(parsed.dom.attribute(node, "wrap").as_deref()) {
+                    let cols =
+                        parse_positive(parsed.dom.attribute(node, "cols").as_deref()).unwrap_or(20);
+                    value = hard_wrap(&value, cols);
+                }
+                pending.push(PendingEntry::Text(control_name, value));
+            }
+            "input" => {
+                let typ = parsed
+                    .dom
+                    .attribute(node, "type")
+                    .unwrap_or_else(|| "text".to_owned());
+                let typ = typ.trim().to_ascii_lowercase();
+                if matches!(typ.as_str(), "submit" | "reset" | "button" | "image") {
+                    continue;
+                }
+                if typ == "checkbox" || typ == "radio" {
+                    // A checkbox or radio contributes only when checked, and
+                    // its value defaults to "on"
+                    // (<https://html.spec.whatwg.org/multipage/input.html#dom-input-value-default-on>).
+                    if !parsed.dom.checkedness(node) {
+                        continue;
+                    }
+                    let value = parsed
+                        .dom
+                        .attribute(node, "value")
+                        .unwrap_or_else(|| "on".to_owned());
+                    pending.push(PendingEntry::Text(control_name, value));
+                } else if typ == "file" {
+                    pending.push(PendingEntry::Files(control_name, node));
+                } else {
+                    pending.push(PendingEntry::Text(
+                        control_name,
+                        parsed.dom.input_value(node).unwrap_or_default(),
+                    ));
+                }
+            }
+            // A `select` contributes through selectedness, which lands with
+            // the select unit.
+            _ => {}
+        }
+    }
+    pending
 }
 
 /// Appends one `[name, File]` pair per file a script assigned to a `type=file`

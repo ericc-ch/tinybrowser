@@ -167,7 +167,7 @@
     HTMLImageElement: ['naturalWidth', 'naturalHeight', 'complete', 'currentSrc'],
     HTMLFormElement: ['reset', 'action', 'method', 'enctype', 'encoding', 'target', 'noValidate'],
     HTMLInputElement: ['value', 'defaultValue', 'disabled', 'readOnly', 'required', 'multiple',
-      'selectionStart', 'selectionEnd', 'selectionDirection'],
+      'checked', 'defaultChecked', 'selectionStart', 'selectionEnd', 'selectionDirection'],
     HTMLTextAreaElement: ['value', 'defaultValue', 'textLength', 'disabled', 'readOnly', 'required',
       'selectionStart', 'selectionEnd', 'selectionDirection'],
     HTMLSelectElement: ['disabled', 'required', 'multiple'],

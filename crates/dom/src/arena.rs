@@ -192,6 +192,10 @@ pub struct Dom {
     /// the parser so reported exceptions carry a document line number
     /// (<https://html.spec.whatwg.org/multipage/webappapis.html#script's-line-number>).
     script_lines: HashMap<NodeId, u32>,
+    /// An `input`'s checkedness while the dirty checkedness flag is set;
+    /// absence means the `checked` content attribute decides
+    /// (<https://html.spec.whatwg.org/multipage/input.html#concept-input-checked-dirty-flag>).
+    checkedness: HashMap<NodeId, bool>,
     /// Per-element scroll offsets `(left, top)`. The engine has no scrollable
     /// overflow yet, but `scrollLeft`/`scrollTop` must round-trip a set value
     /// (<https://drafts.csswg.org/cssom-view/#dom-element-scrollleft>).
@@ -305,6 +309,7 @@ impl Dom {
             input_values: HashMap::new(),
             selections: HashMap::new(),
             script_lines: HashMap::new(),
+            checkedness: HashMap::new(),
             scroll_offsets: HashMap::new(),
             input_selectable: HashMap::new(),
             mutations: Vec::new(),
@@ -1773,7 +1778,24 @@ impl Dom {
     pub fn reset_control(&mut self, id: NodeId) {
         if self.html_local_is(id, "input") || self.html_local_is(id, "textarea") {
             self.input_values.remove(&id);
+            self.checkedness.remove(&id);
         }
+    }
+
+    /// An `input`'s checkedness: the stored value while the dirty checkedness
+    /// flag is set, else whether the `checked` content attribute is present
+    /// (<https://html.spec.whatwg.org/multipage/input.html#dom-input-checked>).
+    #[must_use]
+    pub fn checkedness(&self, id: NodeId) -> bool {
+        self.checkedness
+            .get(&id)
+            .copied()
+            .unwrap_or_else(|| self.attribute(id, "checked").is_some())
+    }
+
+    /// Sets `id`'s checkedness and the dirty checkedness flag.
+    pub fn set_checkedness(&mut self, id: NodeId, checked: bool) {
+        self.checkedness.insert(id, checked);
     }
 
     /// The `defaultValue` of a text-like control: the `value` content
@@ -2226,6 +2248,7 @@ impl Dom {
             self.input_values.remove(&current);
             self.selections.remove(&current);
             self.script_lines.remove(&current);
+            self.checkedness.remove(&current);
             self.scroll_offsets.remove(&current);
             self.input_selectable.remove(&current);
             if let Some(contents) = self.template_contents.remove(&current) {

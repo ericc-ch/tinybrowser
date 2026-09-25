@@ -546,14 +546,13 @@
     globalThis.__tbFormNavigate(action, target, 'POST', body, contentType);
   };
 
-  // The submission algorithm's entry-list step: build the list, let a
-  // `formdata` handler extend it, then submit. `form.submit()` runs this
-  // without the `submit` event; `requestSubmit()` fires that first
+  // The submission algorithm's entry-list step: the FormData constructor
+  // fires `formdata`, whose handler may extend the list, then we submit it.
+  // `form.submit()` runs this without the `submit` event; `requestSubmit()`
+  // fires that first
   // (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#constructing-form-data-set>).
   const runSubmission = form => {
-    const formData = new globalThis.FormData(form);
-    form.dispatchEvent(new FormDataEvent('formdata', { formData: formData }));
-    submitForm(form, formData);
+    submitForm(form, new globalThis.FormData(form));
   };
 
   // <https://html.spec.whatwg.org/multipage/forms.html#dom-form-submit>
