@@ -129,6 +129,34 @@ pub(crate) fn throw_dom_error(ctx: &Ctx<'_>, err: DomError) -> rquickjs::Error {
     }
 }
 
+/// Fires the realm window's `error` event for one uncaught exception, driving
+/// `window.onerror` with the spec's five arguments. `base_line` translates the
+/// inline stack's script-relative line into a document line (0 when unknown).
+///
+/// <https://html.spec.whatwg.org/multipage/webappapis.html#report-the-error>
+pub(super) fn report_exception_value<'js>(
+    ctx: &Ctx<'js>,
+    caught: Value<'js>,
+    base_line: u32,
+    filename: &str,
+) {
+    let Ok(report) = ctx.globals().get::<_, Value>("__tbReportException") else {
+        return;
+    };
+    let Some(report) = report.as_function() else {
+        return;
+    };
+    let Ok(meta) = Object::new(ctx.clone()) else {
+        return;
+    };
+    if meta.set("baseLine", base_line).is_err() || meta.set("filename", filename).is_err() {
+        return;
+    }
+    // A throwing `onerror` is the reporter's problem to swallow; report_exception
+    // already dropped the pending exception.
+    let _ = report.call::<_, ()>((caught, meta));
+}
+
 impl<'js> rquickjs::FromJs<'js> for OptString {
     fn from_js(ctx: &Ctx<'js>, value: Value<'js>) -> Result<Self> {
         if value.is_null() || value.is_undefined() {

@@ -231,6 +231,9 @@ struct Sink {
     /// whether foreign-content tokens break out; the default answer (`false`)
     /// mis-nests every child of such elements.
     integration_points: RefCell<HashSet<Handle>>,
+    /// The line number html5ever most recently reported for the token being
+    /// processed, so an inline `script` can record its source's start line.
+    current_line: Cell<u64>,
 }
 
 impl Sink {
@@ -239,6 +242,7 @@ impl Sink {
             dom: RefCell::new(dom::Dom::new()),
             quirks_mode: Cell::new(QuirksMode::NoQuirks),
             integration_points: RefCell::new(HashSet::new()),
+            current_line: Cell::new(0),
         }
     }
 
@@ -327,6 +331,13 @@ impl TreeSink for Sink {
     /// consumer reads a parse-error count.
     fn parse_error(&self, _msg: Cow<'static, str>) {}
 
+    /// html5ever reports the line of each token before the tree builder
+    /// processes it; remember it so a `script` start tag can record the line
+    /// its source text starts on.
+    fn set_current_line(&self, line_number: u64) {
+        self.current_line.set(line_number);
+    }
+
     fn get_document(&self) -> Self::Handle {
         self.dom.borrow().document()
     }
@@ -347,10 +358,19 @@ impl TreeSink for Sink {
         attrs: Vec<markup5ever::Attribute>,
         flags: ElementFlags,
     ) -> Self::Handle {
+        let is_script = name.ns == dom::html_namespace() && name.local.as_ref() == "script";
+        let line = self.current_line.get();
         let element = self
             .dom
             .borrow_mut()
             .create_element(name, convert_attrs(attrs));
+        if is_script {
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "a document line beyond u32 is not reachable"
+            )]
+            self.dom.borrow_mut().set_script_line(element, line as u32);
+        }
         if flags.template {
             let contents = self.dom.borrow_mut().create_fragment();
             self.dom

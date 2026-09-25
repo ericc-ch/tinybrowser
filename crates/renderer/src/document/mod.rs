@@ -988,11 +988,17 @@ impl Document {
         }
     }
 
-    fn eval_classic(&mut self, source: &str, element: Option<dom::NodeId>) {
+    fn eval_classic(
+        &mut self,
+        source: &str,
+        element: Option<dom::NodeId>,
+        base_line: u32,
+        filename: &str,
+    ) {
         // https://html.spec.whatwg.org/multipage/webappapis.html#run-a-classic-script
         let previous = self.world.borrow().current_script;
         self.world.borrow_mut().current_script = element;
-        self.fire_js(|js| js.eval(source).map(|_| ()));
+        self.fire_js(|js| js.eval_classic_script(source, base_line, filename));
         self.world.borrow_mut().current_script = previous;
         self.adopt_js_work();
     }
@@ -1046,10 +1052,12 @@ impl Document {
                     self.deliver_mutations();
                     let script = crate::js::script_at(&self.world.borrow(), id);
                     match script {
-                        Some(crate::js::Script::Classic(crate::js::ScriptSource::Inline(
+                        Some(crate::js::Script::Classic(crate::js::ScriptSource::Inline {
                             source,
-                        ))) => {
-                            self.eval_classic(&source, Some(id));
+                            line,
+                        })) => {
+                            let filename = self.url.as_str().to_owned();
+                            self.eval_classic(&source, Some(id), line, &filename);
                             self.sync_parser_from_world();
                         }
                         Some(crate::js::Script::Classic(crate::js::ScriptSource::Src(src))) => {
@@ -1149,7 +1157,8 @@ impl Document {
                     self.classic_fetch_in_flight = false;
                     if (200..300).contains(&outcome.status) {
                         let source = String::from_utf8_lossy(&outcome.body);
-                        self.eval_classic(&source, Some(element));
+                        let filename = outcome.final_url.clone();
+                        self.eval_classic(&source, Some(element), 1, &filename);
                     }
                     self.sync_parser_from_world();
                     self.advance_parser();
@@ -1330,7 +1339,7 @@ impl Document {
         let modules = std::mem::take(&mut self.deferred_modules);
         for (index, (element, source)) in modules.into_iter().enumerate() {
             let result = match source {
-                crate::js::ScriptSource::Inline(source) => {
+                crate::js::ScriptSource::Inline { source, .. } => {
                     let name = format!("{}#inline-module-{index}", self.url);
                     self.js
                         .as_ref()

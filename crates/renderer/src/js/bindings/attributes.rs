@@ -874,7 +874,15 @@ fn compile_handler_attribute(ctx: &Ctx<'_>, element: NodeId, typ: &str) -> Resul
         && with_node_kind(ctx, element, |kind| is_html_element(kind, "body"))?;
     match body {
         Some(body) if !body.trim().is_empty() => {
-            let source = format!("(function(event) {{\n{body}\n}})");
+            // The `onerror` handler takes the spec's five arguments, not the
+            // usual single event argument
+            // (<https://html.spec.whatwg.org/multipage/webappapis.html#the-event-handler-processing-algorithm>).
+            let params = if name == "onerror" {
+                "event, source, lineno, colno, error"
+            } else {
+                "event"
+            };
+            let source = format!("(function({params}) {{\n{body}\n}})");
             match ctx.eval::<Function, _>(source) {
                 Ok(compiled) => {
                     object.set(name.as_str(), compiled.clone())?;

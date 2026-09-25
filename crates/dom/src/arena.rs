@@ -188,6 +188,10 @@ pub struct Dom {
     /// `value` content attribute for `input`, the child text content for
     /// `textarea` (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#concept-fe-dirty>).
     input_values: HashMap<NodeId, String>,
+    /// The source-text start line of an inline `script` element, recorded by
+    /// the parser so reported exceptions carry a document line number
+    /// (<https://html.spec.whatwg.org/multipage/webappapis.html#script's-line-number>).
+    script_lines: HashMap<NodeId, u32>,
     /// Text selection for text-like controls: `(start, end, direction)` in
     /// UTF-16 code units. Direction is 0 "none", 1 "forward", 2 "backward"
     /// (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#concept-textarea/input-selection>).
@@ -292,6 +296,7 @@ impl Dom {
             shadow_hosts: HashMap::new(),
             input_values: HashMap::new(),
             selections: HashMap::new(),
+            script_lines: HashMap::new(),
             mutations: Vec::new(),
             record_mutations: false,
             recording_suppressed: false,
@@ -1678,6 +1683,19 @@ impl Dom {
             .insert(id, (start.min(length), end.min(length), direction.min(2)));
     }
 
+    /// Records the source-text start line of the inline `script` element `id`,
+    /// as the parser counted it (1-based)
+    /// (<https://html.spec.whatwg.org/multipage/webappapis.html#script's-line-number>).
+    pub fn set_script_line(&mut self, id: NodeId, line: u32) {
+        self.script_lines.insert(id, line);
+    }
+
+    /// The start line recorded for the inline `script` element `id`.
+    #[must_use]
+    pub fn script_line(&self, id: NodeId) -> Option<u32> {
+        self.script_lines.get(&id).copied()
+    }
+
     /// The `defaultValue` of a text-like control: the `value` content
     /// attribute for `input`, the child text content for `textarea`.
     ///
@@ -2122,6 +2140,7 @@ impl Dom {
         while let Some(current) = pending.pop() {
             self.input_values.remove(&current);
             self.selections.remove(&current);
+            self.script_lines.remove(&current);
             if let Some(contents) = self.template_contents.remove(&current) {
                 pending.push(contents);
             }

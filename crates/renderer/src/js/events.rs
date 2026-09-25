@@ -1081,13 +1081,14 @@ fn call_listener<'js>(
 /// [Report the exception](https://html.spec.whatwg.org/multipage/webappapis.html#report-an-exception)
 /// step of the dispatch algorithm.
 ///
-/// The engine has no `ErrorEvent`/`window.onerror` plumbing yet, so the
-/// exception is dropped. Dropping it keeps a throwing listener from aborting
-/// the rest of the dispatch, and consuming it keeps a later JavaScript
-/// operation from observing the stale pending exception.
+/// Fires the window's `error` event (`window.onerror`) for a throwing listener
+/// or handler, then drops the exception so it cannot abort the rest of the
+/// dispatch or leak into a later JavaScript operation. The location is taken
+/// from the exception's own stack; no document line offset is applied.
 pub(super) fn report_exception(ctx: &Ctx<'_>, error: &rquickjs::Error) {
     if error.is_exception() {
-        let _caught = ctx.catch();
+        let caught = ctx.catch();
+        super::bindings::report_exception_value(ctx, caught, 0, "");
     }
 }
 
@@ -1299,9 +1300,15 @@ fn call_handler_attribute<'js>(
         && let Some(source) = handler_attribute_source(ctx, object, &name)?
     {
         // A handler content attribute compiles to a function whose body is
-        // the attribute value and whose `this` is the object
+        // the attribute value and whose `this` is the object. `onerror` takes
+        // the spec's five arguments, not the usual single event argument
         // (<https://html.spec.whatwg.org/multipage/webappapis.html#event-handler-content-attributes>).
-        let source = format!("(function(event) {{\n{source}\n}})");
+        let params = if typ == "error" {
+            "event, source, lineno, colno, error"
+        } else {
+            "event"
+        };
+        let source = format!("(function({params}) {{\n{source}\n}})");
         match ctx.eval::<Function, _>(source) {
             Ok(compiled) => {
                 object.set(name.as_str(), compiled.clone())?;
@@ -1317,10 +1324,48 @@ fn call_handler_attribute<'js>(
             }
         }
     }
-    if let Some(function) = handler.as_function()
-        && let Err(error) = function.call::<_, ()>((This(object.clone()), event.clone()))
+    if let Some(function) = handler.as_function() {
+        let is_window = bindings::host_node_id(ctx, object.as_value()).is_none();
+        let result = if typ == "error" && is_window {
+            call_error_handler(ctx, function, object, event)
+        } else {
+            function.call::<_, ()>((This(object.clone()), event.clone()))
+        };
+        if let Err(error) = result {
+            report_exception(ctx, &error);
+        }
+    }
+    Ok(())
+}
+
+/// The special `window.onerror` signature: `(message, filename, lineno, colno,
+/// error)`, where returning `true` cancels the event
+/// (<https://html.spec.whatwg.org/multipage/webappapis.html#the-event-handler-processing-algorithm>).
+fn call_error_handler<'js>(
+    ctx: &Ctx<'js>,
+    function: &Function<'js>,
+    object: &Object<'js>,
+    event: &Value<'js>,
+) -> Result<()> {
+    let Some(event_object) = event.as_object() else {
+        return function.call::<_, ()>((This(object.clone()), event.clone()));
+    };
+    let field = |name: &str| {
+        event_object
+            .get::<_, Value>(name)
+            .unwrap_or_else(|_| Value::new_undefined(ctx.clone()))
+    };
+    let message = field("message");
+    let filename = field("filename");
+    let lineno = field("lineno");
+    let colno = field("colno");
+    let error = field("error");
+    let result: Value =
+        function.call((This(object.clone()), message, filename, lineno, colno, error))?;
+    if result.as_bool() == Some(true)
+        && let Ok(prevent) = event_object.get::<_, Function>("preventDefault")
     {
-        report_exception(ctx, &error);
+        let _ = prevent.call::<_, ()>((This(event_object.clone()),));
     }
     Ok(())
 }

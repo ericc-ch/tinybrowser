@@ -1209,9 +1209,24 @@ impl JsNode {
         self.reflect_boolean(ctx, "multiple", value)
     }
 
+    /// URL-reflected `src`: parsed against the document base and stored
+    /// serialized, like `href`; an absent attribute reflects as the empty
+    /// string (<https://html.spec.whatwg.org/multipage/urls-and-fetching.html#reflecting-content-attributes-in-idl-attributes>).
     #[qjs(get)]
     fn src(&self, ctx: Ctx<'_>) -> Result<String> {
-        attribute_value(&ctx, self.handle.0, "src")
+        let world_rc = world(&ctx)?;
+        let raw = world_rc
+            .borrow()
+            .document(self.handle.0)
+            .and_then(|parsed| parsed.dom.attribute(self.handle.0, "src"));
+        let Some(raw) = raw else {
+            return Ok(String::new());
+        };
+        let base = document_base_url_string(&ctx, self.handle.0);
+        Ok(url::Url::parse(&base)
+            .ok()
+            .and_then(|base| base.join(&raw).ok())
+            .map_or(raw, |url| url.to_string()))
     }
 
     #[qjs(set, rename = "src")]
