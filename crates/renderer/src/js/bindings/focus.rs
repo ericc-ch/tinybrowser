@@ -1,12 +1,12 @@
 //! Focus, activation behavior, and the `WebDriver` bridge.
 
-use super::{events, host_node_id, webdriver_element, world_for_node};
+use super::{events, host_node_id, webdriver_element, world_for_node, wrap_node};
 
 use std::rc::Rc;
 
 use dom::{NodeId, NodeKind, html_namespace};
 
-use rquickjs::{Class, Ctx, Exception, Object, Result, Value};
+use rquickjs::{Class, Ctx, Exception, Function, Object, Result, Value, prelude::This};
 
 use crate::js::events::EventTargetRef;
 
@@ -253,11 +253,98 @@ pub(crate) fn element_click(ctx: &Ctx<'_>, node: NodeId) -> Result<()> {
         }
         let event = Class::instance(ctx.clone(), events::JsEvent::uninitialized())?;
         event.borrow().initialize("click".to_owned(), true, true);
-        events::dispatch_event(ctx, EventTargetKey::Node(node), &event)?;
+        let not_canceled = events::dispatch_event(ctx, EventTargetKey::Node(node), &event)?;
+        if not_canceled {
+            run_activation(ctx, node)?;
+        }
         Ok(())
     })();
     world.borrow_mut().set_click_in_progress(node, false);
     result
+}
+
+/// What a clicked control does.
+enum Activation {
+    None,
+    Submit,
+    Reset,
+}
+
+/// The activation behavior of a clicked control: a submit button submits its
+/// form owner with itself as submitter, a reset button resets it
+/// (<https://html.spec.whatwg.org/multipage/form-elements.html#the-button-element:activation-behavior>).
+fn run_activation(ctx: &Ctx<'_>, node: NodeId) -> Result<()> {
+    let world = world_for_node(ctx, node)?;
+    let (activation, form) = {
+        let world = world.borrow();
+        let Some(parsed) = world.document(node) else {
+            return Ok(());
+        };
+        let dom = &parsed.dom;
+        let Some(NodeKind::Element { name, .. }) = dom.kind(node) else {
+            return Ok(());
+        };
+        if name.ns != html_namespace() {
+            return Ok(());
+        }
+        let button_type = |dom: &dom::Dom| {
+            dom.attribute(node, "type")
+                .map(|value| value.trim().to_ascii_lowercase())
+        };
+        let activation = match name.local.as_ref() {
+            "input" => match button_type(dom).as_deref() {
+                Some("submit") => Activation::Submit,
+                Some("reset") => Activation::Reset,
+                _ => Activation::None,
+            },
+            "button" => match button_type(dom).as_deref() {
+                None | Some("submit") => Activation::Submit,
+                Some("reset") => Activation::Reset,
+                _ => Activation::None,
+            },
+            _ => Activation::None,
+        };
+        if matches!(activation, Activation::None) {
+            return Ok(());
+        }
+        // The form owner is the nearest ancestor `form` for now; the `form`
+        // attribute association lands with the form-owner unit.
+        let mut form = None;
+        let mut current = dom.parent(node);
+        while let Some(parent) = current {
+            if let Some(NodeKind::Element { name, .. }) = dom.kind(parent)
+                && name.ns == html_namespace()
+                && name.local.as_ref() == "form"
+            {
+                form = Some(parent);
+                break;
+            }
+            current = dom.parent(parent);
+        }
+        (activation, form)
+    };
+    let Some(form) = form else {
+        return Ok(());
+    };
+    let form_value = wrap_node(ctx, form)?;
+    let Some(form_object) = form_value.as_object() else {
+        return Ok(());
+    };
+    let button_value = wrap_node(ctx, node)?;
+    match activation {
+        Activation::Submit => {
+            if let Ok(function) = form_object.get::<_, Function>("requestSubmit") {
+                let _ = function.call::<_, ()>((This(form_object.clone()), button_value));
+            }
+        }
+        Activation::Reset => {
+            if let Ok(function) = form_object.get::<_, Function>("reset") {
+                let _ = function.call::<_, ()>((This(form_object.clone()),));
+            }
+        }
+        Activation::None => {}
+    }
+    Ok(())
 }
 
 /// The `WebDriver` element bridge. Page script can still call it by name and

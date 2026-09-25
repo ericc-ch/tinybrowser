@@ -552,11 +552,35 @@
     return body;
   };
 
-  const submitForm = (form, formData) => {
-    const method = form.method;
+  const methodKeyword = raw => {
+    const value = String(raw).trim().toLowerCase();
+    return (value === 'post' || value === 'dialog') ? value : 'get';
+  };
+  const enctypeKeyword = raw => {
+    const value = String(raw).trim().toLowerCase();
+    if (value === 'multipart/form-data' || value === 'text/plain') return value;
+    return 'application/x-www-form-urlencoded';
+  };
+  // A submit button overrides its form's action/method/enctype/target through
+  // its `form*` attributes
+  // (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#form-submission-algorithm>).
+  const submitterAttribute = (submitter, attribute) =>
+    submitter !== undefined && submitter !== null && submitter.hasAttribute(attribute)
+      ? submitter.getAttribute(attribute)
+      : null;
+
+  const submitForm = (form, formData, submitter) => {
+    const methodAttr = submitterAttribute(submitter, 'formmethod');
+    const method = methodAttr !== null ? methodKeyword(methodAttr) : form.method;
     if (method === 'dialog') return;
-    const action = form.action;
-    const target = form.target;
+    const actionAttr = submitterAttribute(submitter, 'formaction');
+    const action = actionAttr !== null
+      ? new globalThis.URL(actionAttr, globalThis.document.URL).href
+      : form.action;
+    const targetAttr = submitterAttribute(submitter, 'formtarget');
+    const target = targetAttr !== null ? targetAttr : form.target;
+    const enctypeAttr = submitterAttribute(submitter, 'formenctype');
+    const enctype = enctypeAttr !== null ? enctypeKeyword(enctypeAttr) : form.enctype;
     if (method === 'get') {
       let url = action;
       const encoded = urlEncode(formData);
@@ -573,9 +597,9 @@
     // (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#submit-mutate-action>).
     let body;
     let contentType;
-    if (form.enctype === 'multipart/form-data') {
+    if (enctype === 'multipart/form-data') {
       ({ body, contentType } = encodeMultipart(formData));
-    } else if (form.enctype === 'text/plain') {
+    } else if (enctype === 'text/plain') {
       body = toLatin1(encoder.encode(encodeTextPlain(formData)));
       contentType = 'text/plain';
     } else {
@@ -590,8 +614,16 @@
   // `form.submit()` runs this without the `submit` event; `requestSubmit()`
   // fires that first
   // (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#constructing-form-data-set>).
-  const runSubmission = form => {
-    submitForm(form, new globalThis.FormData(form));
+  const runSubmission = (form, submitter) => {
+    const formData = new globalThis.FormData(form);
+    // A submitter contributes its own name/value to the submitted list.
+    if (submitter !== undefined && submitter !== null) {
+      const name = submitter.getAttribute('name');
+      if (name) {
+        formData.append(name, submitter.getAttribute('value') ?? '');
+      }
+    }
+    submitForm(form, formData, submitter);
   };
 
   // <https://html.spec.whatwg.org/multipage/forms.html#dom-form-submit>
@@ -642,7 +674,7 @@
         cancelable: true,
       });
       if (!this.dispatchEvent(event)) return;
-      runSubmission(this);
+      runSubmission(this, submitter);
     },
     writable: true,
     enumerable: true,
