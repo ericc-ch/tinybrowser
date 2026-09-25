@@ -169,6 +169,7 @@
     HTMLFormElement: ['reset', 'action', 'method', 'enctype', 'encoding', 'target', 'noValidate', 'acceptCharset'],
     HTMLInputElement: ['value', 'defaultValue', 'disabled', 'readOnly', 'required', 'multiple',
       'checked', 'defaultChecked', 'selectionStart', 'selectionEnd', 'selectionDirection',
+      'indeterminate',
       'formAction', 'formMethod', 'formEnctype', 'formTarget', 'formNoValidate',
       'pattern', 'min', 'max', 'step'],
     HTMLTextAreaElement: ['value', 'defaultValue', 'textLength', 'disabled', 'readOnly', 'required',

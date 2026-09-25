@@ -1532,6 +1532,27 @@ impl JsNode {
         Ok(())
     }
 
+    // https://html.spec.whatwg.org/multipage/input.html#dom-input-indeterminate
+    #[qjs(get)]
+    fn indeterminate(&self, ctx: Ctx<'_>) -> Result<bool> {
+        let world = world(&ctx)?;
+        let world = world.borrow();
+        Ok(world
+            .document(self.handle.0)
+            .is_some_and(|parsed| parsed.dom.indeterminate(self.handle.0)))
+    }
+
+    #[qjs(set, rename = "indeterminate")]
+    fn set_indeterminate(&self, ctx: Ctx<'_>, value: bool) -> Result<()> {
+        let world = world(&ctx)?;
+        let world = world.borrow();
+        let Some(mut parsed) = world.document_mut(self.handle.0) else {
+            return Ok(());
+        };
+        parsed.dom.set_indeterminate(self.handle.0, value);
+        Ok(())
+    }
+
     // https://html.spec.whatwg.org/multipage/input.html#dom-input-defaultchecked
     #[qjs(get, rename = "defaultChecked")]
     fn default_checked(&self, ctx: Ctx<'_>) -> Result<bool> {
@@ -3487,6 +3508,34 @@ impl JsNode {
             .dom
             .clone_node(self.handle.0, deep)
             .map_err(|err| throw_dom_error(&ctx, err))?;
+        // Run the form-control cloning steps for the source and clone in
+        // parallel tree order, so a deep clone carries each control's value and
+        // checkedness
+        // (<https://html.spec.whatwg.org/multipage/input.html#the-input-element:cloning-steps>).
+        let pairs: Vec<(dom::NodeId, dom::NodeId)> = {
+            let dom = &parsed.dom;
+            let mut from_stack = vec![self.handle.0];
+            let mut to_stack = vec![clone];
+            let mut pairs = Vec::new();
+            while let (Some(from), Some(to)) = (from_stack.pop(), to_stack.pop()) {
+                pairs.push((from, to));
+                let from_children: Vec<_> = dom
+                    .children(from)
+                    .map(Iterator::collect)
+                    .unwrap_or_default();
+                let to_children: Vec<_> = dom.children(to).map(Iterator::collect).unwrap_or_default();
+                for child in from_children.into_iter().rev() {
+                    from_stack.push(child);
+                }
+                for child in to_children.into_iter().rev() {
+                    to_stack.push(child);
+                }
+            }
+            pairs
+        };
+        for (from, to) in pairs {
+            parsed.dom.clone_form_state(from, to);
+        }
         drop(parsed);
         drop(world);
         wrap_node(&ctx, clone)

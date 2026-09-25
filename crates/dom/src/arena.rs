@@ -204,6 +204,9 @@ pub struct Dom {
     /// absence means the `checked` content attribute decides
     /// (<https://html.spec.whatwg.org/multipage/input.html#concept-input-checked-dirty-flag>).
     checkedness: HashMap<NodeId, bool>,
+    /// An `input`'s indeterminateness, independent of its checkedness
+    /// (<https://html.spec.whatwg.org/multipage/input.html#concept-input-indeterminate>).
+    indeterminate: HashMap<NodeId, bool>,
     /// An `option`'s selectedness while the dirty selectedness flag is set;
     /// absence means the `selected` content attribute decides
     /// (<https://html.spec.whatwg.org/multipage/form-elements.html#concept-option-selectedness>).
@@ -322,6 +325,7 @@ impl Dom {
             selections: HashMap::new(),
             script_lines: HashMap::new(),
             checkedness: HashMap::new(),
+            indeterminate: HashMap::new(),
             option_selectedness: HashMap::new(),
             scroll_offsets: HashMap::new(),
             input_selectable: HashMap::new(),
@@ -1879,6 +1883,36 @@ impl Dom {
         self.checkedness.insert(id, checked);
     }
 
+    /// An `input`'s indeterminateness
+    /// (<https://html.spec.whatwg.org/multipage/input.html#concept-input-indeterminate>).
+    #[must_use]
+    pub fn indeterminate(&self, id: NodeId) -> bool {
+        self.indeterminate.get(&id).copied().unwrap_or(false)
+    }
+
+    /// Sets `id`'s indeterminateness.
+    pub fn set_indeterminate(&mut self, id: NodeId, indeterminate: bool) {
+        self.indeterminate.insert(id, indeterminate);
+    }
+
+    /// The input/option cloning steps: propagate value, dirty value, and
+    /// checkedness state from `from` to `to`
+    /// (<https://html.spec.whatwg.org/multipage/input.html#the-input-element:cloning-steps>).
+    pub fn clone_form_state(&mut self, from: NodeId, to: NodeId) {
+        if let Some(value) = self.input_values.get(&from).cloned() {
+            self.input_values.insert(to, value);
+        }
+        if let Some(checked) = self.checkedness.get(&from).copied() {
+            self.checkedness.insert(to, checked);
+        }
+        if let Some(indeterminate) = self.indeterminate.get(&from).copied() {
+            self.indeterminate.insert(to, indeterminate);
+        }
+        if let Some(selected) = self.option_selectedness.get(&from).copied() {
+            self.option_selectedness.insert(to, selected);
+        }
+    }
+
     /// An `option`'s selectedness: the stored value while the dirty
     /// selectedness flag is set, else whether `selected` is present.
     #[must_use]
@@ -2498,6 +2532,7 @@ impl Dom {
             self.selections.remove(&current);
             self.script_lines.remove(&current);
             self.checkedness.remove(&current);
+            self.indeterminate.remove(&current);
             self.option_selectedness.remove(&current);
             self.scroll_offsets.remove(&current);
             self.input_selectable.remove(&current);
