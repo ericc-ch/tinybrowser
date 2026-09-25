@@ -207,6 +207,9 @@ pub struct Dom {
     /// An `input`'s indeterminateness, independent of its checkedness
     /// (<https://html.spec.whatwg.org/multipage/input.html#concept-input-indeterminate>).
     indeterminate: HashMap<NodeId, bool>,
+    /// The focused element per document, backing the `:focus` family
+    /// (<https://drafts.csswg.org/selectors-4/#the-focus-pseudo>).
+    active_element: HashMap<u32, NodeId>,
     /// An `option`'s selectedness while the dirty selectedness flag is set;
     /// absence means the `selected` content attribute decides
     /// (<https://html.spec.whatwg.org/multipage/form-elements.html#concept-option-selectedness>).
@@ -326,6 +329,7 @@ impl Dom {
             script_lines: HashMap::new(),
             checkedness: HashMap::new(),
             indeterminate: HashMap::new(),
+            active_element: HashMap::new(),
             option_selectedness: HashMap::new(),
             scroll_offsets: HashMap::new(),
             input_selectable: HashMap::new(),
@@ -1893,6 +1897,24 @@ impl Dom {
     /// Sets `id`'s indeterminateness.
     pub fn set_indeterminate(&mut self, id: NodeId, indeterminate: bool) {
         self.indeterminate.insert(id, indeterminate);
+    }
+
+    /// Records the focused element for a document, backing `:focus`.
+    pub fn set_active_element(&mut self, document: u32, node: Option<NodeId>) {
+        match node {
+            Some(node) => {
+                self.active_element.insert(document, node);
+            }
+            None => {
+                self.active_element.remove(&document);
+            }
+        }
+    }
+
+    /// The focused element for a document, if any.
+    #[must_use]
+    pub fn active_element(&self, document: u32) -> Option<NodeId> {
+        self.active_element.get(&document).copied()
     }
 
     /// The input/option cloning steps: propagate value, dirty value, and

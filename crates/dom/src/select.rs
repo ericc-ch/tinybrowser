@@ -825,12 +825,22 @@ impl Element for DomElement<'_> {
             PseudoClass::Dir(direction) => state::direction_is(self.dom, self.id, direction),
             PseudoClass::Indeterminate => state::is_indeterminate(self.dom, self.id),
             PseudoClass::Default => state::is_default(self.dom, self.id),
+            PseudoClass::Focus | PseudoClass::FocusVisible => {
+                self.dom.active_element(self.id.document_id()) == Some(self.id)
+            }
+            PseudoClass::FocusWithin => {
+                let mut cursor = self.dom.active_element(self.id.document_id());
+                while let Some(current) = cursor {
+                    if current == self.id {
+                        return true;
+                    }
+                    cursor = self.dom.parent(current);
+                }
+                false
+            }
             PseudoClass::Visited
             | PseudoClass::Hover
             | PseudoClass::Active
-            | PseudoClass::Focus
-            | PseudoClass::FocusWithin
-            | PseudoClass::FocusVisible
             | PseudoClass::Target
             | PseudoClass::InRange
             | PseudoClass::OutOfRange

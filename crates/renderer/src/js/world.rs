@@ -1432,6 +1432,11 @@ impl World {
                 self.active_elements.remove(&document);
             }
         }
+        // Mirror into the document so `:focus` and `:focus-within` match
+        // (<https://drafts.csswg.org/selectors-4/#the-focus-pseudo>).
+        if let Some(parsed) = self.runtime.documents.borrow_mut().get_mut(document) {
+            parsed.dom.set_active_element(document, node);
+        }
     }
 
     /// Whether `node`'s `click()` is already running.
