@@ -744,4 +744,82 @@
     enumerable: true,
     configurable: true,
   });
+
+  // ── select helpers ─────────────────────────────────────────────────────
+
+  // <https://html.spec.whatwg.org/multipage/form-elements.html#dom-option>
+  function Option(text, value, defaultSelected, selected) {
+    if (new.target === undefined) {
+      throw new TypeError('Class constructor Option cannot be invoked without new');
+    }
+    const option = globalThis.document.createElement('option');
+    if (text !== undefined) option.text = String(text);
+    if (value !== undefined) option.value = String(value);
+    if (defaultSelected !== undefined) option.defaultSelected = Boolean(defaultSelected);
+    if (selected !== undefined) option.selected = Boolean(selected);
+    return option;
+  }
+  Object.defineProperty(Option, 'prototype', {
+    value: globalThis.HTMLOptionElement.prototype, writable: false,
+  });
+  Object.defineProperty(globalThis, 'Option', {
+    value: Option, writable: true, configurable: true,
+  });
+
+  Object.defineProperties(globalThis.HTMLSelectElement.prototype, {
+    item: {
+      value: function(index) {
+        const option = this.options[index];
+        return option === undefined ? null : option;
+      },
+      writable: true, enumerable: true, configurable: true,
+    },
+    namedItem: {
+      value: function(name) {
+        const key = String(name);
+        for (const option of this.options) {
+          if (option.id === key || option.getAttribute('name') === key) return option;
+        }
+        return null;
+      },
+      writable: true, enumerable: true, configurable: true,
+    },
+    // <https://html.spec.whatwg.org/multipage/form-elements.html#dom-select-add>
+    add: {
+      value: function(element, before) {
+        if (element === undefined) throw new TypeError('add requires an element');
+        // Adding a node before itself is a no-op
+        // (<https://html.spec.whatwg.org/multipage/form-elements.html#dom-select-add>).
+        if (element === before) return;
+        if (before === undefined || before === null) {
+          this.appendChild(element);
+          return;
+        }
+        if (typeof before === 'number') {
+          const options = this.options;
+          const index = before < 0 ? options.length : before;
+          const reference = options[index];
+          if (reference === undefined) this.appendChild(element);
+          else this.insertBefore(element, reference);
+          return;
+        }
+        if (before.parentNode !== this) {
+          throw new DOMException('reference is not a child of this select', 'NotFoundError');
+        }
+        this.insertBefore(element, before);
+      },
+      writable: true, enumerable: true, configurable: true,
+    },
+    remove: {
+      value: function(index) {
+        if (arguments.length === 0) {
+          globalThis.Element.prototype.remove.call(this);
+          return;
+        }
+        const option = this.options[Number(index)];
+        if (option !== undefined) option.remove();
+      },
+      writable: true, enumerable: true, configurable: true,
+    },
+  });
 })();

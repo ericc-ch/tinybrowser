@@ -173,7 +173,7 @@
       'selectionStart', 'selectionEnd', 'selectionDirection'],
     HTMLOptionElement: ['value', 'selected', 'defaultSelected', 'text', 'index', 'disabled'],
     HTMLSelectElement: ['value', 'selectedIndex', 'options', 'length', 'multiple', 'disabled',
-      'required', 'name'],
+      'required', 'name', 'selectedOptions'],
     HTMLButtonElement: ['disabled'],
     HTMLFieldSetElement: ['disabled'],
     HTMLOptGroupElement: ['disabled'],
