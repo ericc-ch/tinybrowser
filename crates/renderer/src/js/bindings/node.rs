@@ -1288,6 +1288,77 @@ impl JsNode {
         self.set_attribute(ctx, WebIdlString("accept-charset".into()), value)
     }
 
+    // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#dom-fs-formaction
+    #[qjs(get, rename = "formAction")]
+    fn form_action(&self, ctx: Ctx<'_>) -> Result<String> {
+        let world = world(&ctx)?;
+        let raw = world
+            .borrow()
+            .document(self.handle.0)
+            .and_then(|parsed| parsed.dom.attribute(self.handle.0, "formaction"));
+        let base = document_base_url_string(&ctx, self.handle.0);
+        let Some(raw) = raw else {
+            return Ok(base);
+        };
+        Ok(url::Url::parse(&base)
+            .ok()
+            .and_then(|base| base.join(&raw).ok())
+            .map_or(raw, |url| url.to_string()))
+    }
+
+    #[qjs(set, rename = "formAction")]
+    fn set_form_action(&self, ctx: Ctx<'_>, value: WebIdlString) -> Result<()> {
+        self.set_attribute(ctx, WebIdlString("formaction".into()), value)
+    }
+
+    // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#dom-fs-formmethod
+    #[qjs(get, rename = "formMethod")]
+    fn form_method(&self, ctx: Ctx<'_>) -> Result<String> {
+        let raw = attribute_value(&ctx, self.handle.0, "formmethod")?;
+        Ok(match raw.trim().to_ascii_lowercase().as_str() {
+            "post" => "post",
+            "dialog" => "dialog",
+            _ => "get",
+        }
+        .to_owned())
+    }
+
+    #[qjs(set, rename = "formMethod")]
+    fn set_form_method(&self, ctx: Ctx<'_>, value: WebIdlString) -> Result<()> {
+        self.set_attribute(ctx, WebIdlString("formmethod".into()), value)
+    }
+
+    // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#dom-fs-formenctype
+    #[qjs(get, rename = "formEnctype")]
+    fn form_enctype(&self, ctx: Ctx<'_>) -> Result<String> {
+        Ok(encoding_keyword(&attribute_value(&ctx, self.handle.0, "formenctype")?).to_owned())
+    }
+
+    #[qjs(set, rename = "formEnctype")]
+    fn set_form_enctype(&self, ctx: Ctx<'_>, value: WebIdlString) -> Result<()> {
+        self.set_attribute(ctx, WebIdlString("formenctype".into()), value)
+    }
+
+    #[qjs(get, rename = "formTarget")]
+    fn form_target(&self, ctx: Ctx<'_>) -> Result<String> {
+        attribute_value(&ctx, self.handle.0, "formtarget")
+    }
+
+    #[qjs(set, rename = "formTarget")]
+    fn set_form_target(&self, ctx: Ctx<'_>, value: WebIdlString) -> Result<()> {
+        self.set_attribute(ctx, WebIdlString("formtarget".into()), value)
+    }
+
+    #[qjs(get, rename = "formNoValidate")]
+    fn form_no_validate(&self, ctx: Ctx<'_>) -> Result<bool> {
+        self.attribute_present(&ctx, "formnovalidate")
+    }
+
+    #[qjs(set, rename = "formNoValidate")]
+    fn set_form_no_validate(&self, ctx: Ctx<'_>, value: bool) -> Result<()> {
+        self.reflect_boolean(ctx, "formnovalidate", value)
+    }
+
     // https://drafts.csswg.org/cssom-view/#dom-element-scrollleft
     #[qjs(get, rename = "scrollLeft")]
     fn scroll_left(&self, ctx: Ctx<'_>) -> Result<f64> {
