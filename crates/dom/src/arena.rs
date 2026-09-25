@@ -196,6 +196,10 @@ pub struct Dom {
     /// absence means the `checked` content attribute decides
     /// (<https://html.spec.whatwg.org/multipage/input.html#concept-input-checked-dirty-flag>).
     checkedness: HashMap<NodeId, bool>,
+    /// An `option`'s selectedness while the dirty selectedness flag is set;
+    /// absence means the `selected` content attribute decides
+    /// (<https://html.spec.whatwg.org/multipage/form-elements.html#concept-option-selectedness>).
+    option_selectedness: HashMap<NodeId, bool>,
     /// Per-element scroll offsets `(left, top)`. The engine has no scrollable
     /// overflow yet, but `scrollLeft`/`scrollTop` must round-trip a set value
     /// (<https://drafts.csswg.org/cssom-view/#dom-element-scrollleft>).
@@ -310,6 +314,7 @@ impl Dom {
             selections: HashMap::new(),
             script_lines: HashMap::new(),
             checkedness: HashMap::new(),
+            option_selectedness: HashMap::new(),
             scroll_offsets: HashMap::new(),
             input_selectable: HashMap::new(),
             mutations: Vec::new(),
@@ -1798,6 +1803,174 @@ impl Dom {
         self.checkedness.insert(id, checked);
     }
 
+    /// An `option`'s selectedness: the stored value while the dirty
+    /// selectedness flag is set, else whether `selected` is present.
+    #[must_use]
+    pub fn option_selected(&self, id: NodeId) -> bool {
+        self.option_selectedness
+            .get(&id)
+            .copied()
+            .unwrap_or_else(|| self.attribute(id, "selected").is_some())
+    }
+
+    /// Sets `id`'s selectedness and the dirty selectedness flag.
+    pub fn set_option_selected(&mut self, id: NodeId, selected: bool) {
+        self.option_selectedness.insert(id, selected);
+    }
+
+    /// The `select` ancestor of an `option`, if any.
+    #[must_use]
+    pub fn option_select_owner(&self, option: NodeId) -> Option<NodeId> {
+        let mut current = self.parent(option);
+        while let Some(parent) = current {
+            if self.html_local_is(parent, "select") {
+                return Some(parent);
+            }
+            current = self.parent(parent);
+        }
+        None
+    }
+
+    /// Sets an option's selectedness; selecting an option in a single-select
+    /// clears the others.
+    pub fn set_option_selected_in_select(&mut self, option: NodeId, selected: bool) {
+        if selected
+            && let Some(select) = self.option_select_owner(option)
+            && self.attribute(select, "multiple").is_none()
+        {
+            for other in self.select_options(select) {
+                self.option_selectedness.insert(other, false);
+            }
+        }
+        self.option_selectedness.insert(option, selected);
+    }
+
+    /// The text content of `id`: every descendant text node's data.
+    #[must_use]
+    pub fn text_content(&self, id: NodeId) -> String {
+        let mut text = String::new();
+        for node in self.descendants(id) {
+            if let Some(NodeKind::Text { data } | NodeKind::CDataSection { data }) = self.kind(node)
+            {
+                text.push_str(data);
+            }
+        }
+        text
+    }
+
+    /// The `option` elements under a `select`, in tree order.
+    #[must_use]
+    pub fn select_options(&self, select: NodeId) -> Vec<NodeId> {
+        if !self.html_local_is(select, "select") {
+            return Vec::new();
+        }
+        self.descendants(select)
+            .filter(|&id| self.html_local_is(id, "option"))
+            .collect()
+    }
+
+    /// An `option`'s value: its `value` attribute, else its text content
+    /// (<https://html.spec.whatwg.org/multipage/form-elements.html#dom-option-value>).
+    #[must_use]
+    pub fn option_value(&self, id: NodeId) -> String {
+        self.attribute(id, "value")
+            .unwrap_or_else(|| self.text_content(id))
+    }
+
+    /// A `select`'s value: the first selected option's value, else the empty
+    /// string (<https://html.spec.whatwg.org/multipage/form-elements.html#dom-select-value>).
+    #[must_use]
+    pub fn select_value(&self, id: NodeId) -> String {
+        let options = self.select_options(id);
+        for &option in &options {
+            if self.option_selected(option) {
+                return self.option_value(option);
+            }
+        }
+        // A single-select keeps one option selected; the first is the default.
+        if self.attribute(id, "multiple").is_none()
+            && let Some(&first) = options.first()
+        {
+            return self.option_value(first);
+        }
+        String::new()
+    }
+
+    /// A `select`'s selected index: the first selected option's index, else -1.
+    #[must_use]
+    pub fn select_selected_index(&self, id: NodeId) -> i32 {
+        let options = self.select_options(id);
+        for (index, &option) in options.iter().enumerate() {
+            if self.option_selected(option) {
+                return i32::try_from(index).unwrap_or(i32::MAX);
+            }
+        }
+        if self.attribute(id, "multiple").is_none() && !options.is_empty() {
+            return 0;
+        }
+        -1
+    }
+
+    /// Selects the option at `index`; a single-select clears the others first.
+    pub fn set_select_selected_index(&mut self, id: NodeId, index: i32) {
+        let options = self.select_options(id);
+        if self.attribute(id, "multiple").is_none() {
+            for &option in &options {
+                self.option_selectedness.insert(option, false);
+            }
+        }
+        if let Ok(index) = usize::try_from(index)
+            && let Some(&option) = options.get(index)
+        {
+            self.option_selectedness.insert(option, true);
+        }
+    }
+
+    /// Selects the first option whose value is `value`, clearing the rest
+    /// (<https://html.spec.whatwg.org/multipage/form-elements.html#dom-select-value>).
+    pub fn set_select_value(&mut self, id: NodeId, value: &str) {
+        let options = self.select_options(id);
+        for &option in &options {
+            self.option_selectedness.insert(option, false);
+        }
+        for option in options {
+            if self.option_value(option) == value {
+                self.option_selectedness.insert(option, true);
+                break;
+            }
+        }
+    }
+
+    /// The `value` IDL value for any element that has one: `option`, `select`,
+    /// or a text-like control.
+    #[must_use]
+    pub fn element_value(&self, id: NodeId) -> Option<String> {
+        if self.html_local_is(id, "option") {
+            Some(self.option_value(id))
+        } else if self.html_local_is(id, "select") {
+            Some(self.select_value(id))
+        } else {
+            self.control_value(id)
+        }
+    }
+
+    /// Sets the `value` IDL value for `option`, `select`, or a text-like
+    /// control.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DomError::WrongNodeType`] when `id` has no `value`.
+    pub fn set_element_value(&mut self, id: NodeId, value: String) -> Result<(), DomError> {
+        if self.html_local_is(id, "option") {
+            return self.set_attribute(id, "value", value);
+        }
+        if self.html_local_is(id, "select") {
+            self.set_select_value(id, &value);
+            return Ok(());
+        }
+        self.set_control_value(id, value)
+    }
+
     /// The `defaultValue` of a text-like control: the `value` content
     /// attribute for `input`, the child text content for `textarea`.
     ///
@@ -2249,6 +2422,7 @@ impl Dom {
             self.selections.remove(&current);
             self.script_lines.remove(&current);
             self.checkedness.remove(&current);
+            self.option_selectedness.remove(&current);
             self.scroll_offsets.remove(&current);
             self.input_selectable.remove(&current);
             if let Some(contents) = self.template_contents.remove(&current) {

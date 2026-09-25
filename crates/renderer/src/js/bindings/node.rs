@@ -981,7 +981,7 @@ impl JsNode {
         let Some(parsed) = world.document(self.handle.0) else {
             return Err(Exception::throw_type(&ctx, "no document"));
         };
-        Ok(parsed.dom.control_value(self.handle.0).unwrap_or_default())
+        Ok(parsed.dom.element_value(self.handle.0).unwrap_or_default())
     }
 
     // https://html.spec.whatwg.org/multipage/input.html#dom-input-value
@@ -994,7 +994,7 @@ impl JsNode {
         };
         parsed
             .dom
-            .set_control_value(self.handle.0, value.0)
+            .set_element_value(self.handle.0, value.0)
             .map_err(|err| throw_dom_error(&ctx, err))?;
         Ok(())
     }
@@ -1427,6 +1427,121 @@ impl JsNode {
     #[qjs(set, rename = "defaultChecked")]
     fn set_default_checked(&self, ctx: Ctx<'_>, value: bool) -> Result<()> {
         self.reflect_boolean(ctx, "checked", value)
+    }
+
+    // https://html.spec.whatwg.org/multipage/form-elements.html#dom-option-selected
+    #[qjs(get, rename = "selected")]
+    fn selected(&self, ctx: Ctx<'_>) -> Result<bool> {
+        let world = world(&ctx)?;
+        let world = world.borrow();
+        Ok(world
+            .document(self.handle.0)
+            .is_some_and(|parsed| parsed.dom.option_selected(self.handle.0)))
+    }
+
+    #[qjs(set, rename = "selected")]
+    fn set_selected(&self, ctx: Ctx<'_>, value: bool) -> Result<()> {
+        let world = world(&ctx)?;
+        let world = world.borrow();
+        let Some(mut parsed) = world.document_mut(self.handle.0) else {
+            return Ok(());
+        };
+        parsed
+            .dom
+            .set_option_selected_in_select(self.handle.0, value);
+        Ok(())
+    }
+
+    #[qjs(get, rename = "defaultSelected")]
+    fn default_selected(&self, ctx: Ctx<'_>) -> Result<bool> {
+        self.attribute_present(&ctx, "selected")
+    }
+
+    #[qjs(set, rename = "defaultSelected")]
+    fn set_default_selected(&self, ctx: Ctx<'_>, value: bool) -> Result<()> {
+        self.reflect_boolean(ctx, "selected", value)
+    }
+
+    // https://html.spec.whatwg.org/multipage/form-elements.html#dom-option-text
+    #[qjs(get)]
+    fn text(&self, ctx: Ctx<'_>) -> Result<String> {
+        let world = world(&ctx)?;
+        let world = world.borrow();
+        Ok(world
+            .document(self.handle.0)
+            .map_or_else(String::new, |parsed| parsed.dom.text_content(self.handle.0)))
+    }
+
+    #[qjs(set, rename = "text")]
+    fn set_text(&self, ctx: Ctx<'_>, value: WebIdlString) -> Result<()> {
+        let world = world(&ctx)?;
+        let world = world.borrow();
+        let Some(mut parsed) = world.document_mut(self.handle.0) else {
+            return Ok(());
+        };
+        let replacement = parsed.dom.create_fragment();
+        if !value.0.is_empty() {
+            let text = parsed.dom.create_text(value.0);
+            parsed
+                .dom
+                .append(replacement, text)
+                .map_err(|err| throw_dom_error(&ctx, err))?;
+        }
+        parsed
+            .dom
+            .replace_all(self.handle.0, replacement)
+            .map_err(|err| throw_dom_error(&ctx, err))?;
+        Ok(())
+    }
+
+    // https://html.spec.whatwg.org/multipage/form-elements.html#dom-option-index
+    #[qjs(get)]
+    fn index(&self, ctx: Ctx<'_>) -> Result<i32> {
+        let world = world(&ctx)?;
+        let world = world.borrow();
+        let Some(parsed) = world.document(self.handle.0) else {
+            return Ok(0);
+        };
+        let Some(select) = parsed.dom.option_select_owner(self.handle.0) else {
+            return Ok(0);
+        };
+        for (index, option) in parsed.dom.select_options(select).into_iter().enumerate() {
+            if option == self.handle.0 {
+                return Ok(i32::try_from(index).unwrap_or(i32::MAX));
+            }
+        }
+        Ok(0)
+    }
+
+    // https://html.spec.whatwg.org/multipage/form-elements.html#dom-select-selectedindex
+    #[qjs(get, rename = "selectedIndex")]
+    fn selected_index(&self, ctx: Ctx<'_>) -> Result<i32> {
+        let world = world(&ctx)?;
+        let world = world.borrow();
+        Ok(world
+            .document(self.handle.0)
+            .map_or(-1, |parsed| parsed.dom.select_selected_index(self.handle.0)))
+    }
+
+    #[qjs(set, rename = "selectedIndex")]
+    fn set_selected_index(&self, ctx: Ctx<'_>, value: i32) -> Result<()> {
+        let world = world(&ctx)?;
+        let world = world.borrow();
+        let Some(mut parsed) = world.document_mut(self.handle.0) else {
+            return Ok(());
+        };
+        parsed.dom.set_select_selected_index(self.handle.0, value);
+        Ok(())
+    }
+
+    #[qjs(get)]
+    fn options<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
+        live_collection(
+            &ctx,
+            self.handle.0,
+            CollectionKind::ElementsByTag("option".to_owned()),
+            Some("HTMLCollection"),
+        )
     }
 
     /// URL-reflected `src`: parsed against the document base and stored
@@ -3387,9 +3502,30 @@ impl JsNode {
     }
 
     // https://dom.spec.whatwg.org/#dom-characterdata-length
+    // https://html.spec.whatwg.org/multipage/form-elements.html#dom-select-length
+    // One shared wrapper carries both: a character-data node answers with its
+    // data length, a `select` with its option count.
     #[qjs(get, rename = "length")]
     fn length(&self, ctx: Ctx<'_>) -> Result<usize> {
-        Ok(character_data(&ctx, self.handle.0)?.encode_utf16().count())
+        let character_data_node = with_node_kind(&ctx, self.handle.0, |kind| {
+            matches!(
+                kind,
+                Some(
+                    NodeKind::Text { .. }
+                        | NodeKind::Comment { .. }
+                        | NodeKind::CDataSection { .. }
+                        | NodeKind::ProcessingInstruction { .. }
+                )
+            )
+        })?;
+        if character_data_node {
+            return Ok(character_data(&ctx, self.handle.0)?.encode_utf16().count());
+        }
+        let world = world(&ctx)?;
+        let world = world.borrow();
+        Ok(world
+            .document(self.handle.0)
+            .map_or(0, |parsed| parsed.dom.select_options(self.handle.0).len()))
     }
 
     // https://dom.spec.whatwg.org/#dom-characterdata-substringdata

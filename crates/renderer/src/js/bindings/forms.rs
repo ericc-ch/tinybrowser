@@ -125,52 +125,81 @@ fn collect_pending_entries(
         if control_name.is_empty() || parsed.dom.attribute(node, "disabled").is_some() {
             continue;
         }
-        match local {
-            "textarea" => {
-                let mut value = parsed.dom.textarea_value(node).unwrap_or_default();
-                if wrap_is_hard(parsed.dom.attribute(node, "wrap").as_deref()) {
-                    let cols =
-                        parse_positive(parsed.dom.attribute(node, "cols").as_deref()).unwrap_or(20);
-                    value = hard_wrap(&value, cols);
-                }
-                pending.push(PendingEntry::Text(control_name, value));
-            }
-            "input" => {
-                let typ = parsed
-                    .dom
-                    .attribute(node, "type")
-                    .unwrap_or_else(|| "text".to_owned());
-                let typ = typ.trim().to_ascii_lowercase();
-                if matches!(typ.as_str(), "submit" | "reset" | "button" | "image") {
-                    continue;
-                }
-                if typ == "checkbox" || typ == "radio" {
-                    // A checkbox or radio contributes only when checked, and
-                    // its value defaults to "on"
-                    // (<https://html.spec.whatwg.org/multipage/input.html#dom-input-value-default-on>).
-                    if !parsed.dom.checkedness(node) {
-                        continue;
-                    }
-                    let value = parsed
-                        .dom
-                        .attribute(node, "value")
-                        .unwrap_or_else(|| "on".to_owned());
-                    pending.push(PendingEntry::Text(control_name, value));
-                } else if typ == "file" {
-                    pending.push(PendingEntry::Files(control_name, node));
-                } else {
-                    pending.push(PendingEntry::Text(
-                        control_name,
-                        parsed.dom.input_value(node).unwrap_or_default(),
-                    ));
-                }
-            }
-            // A `select` contributes through selectedness, which lands with
-            // the select unit.
-            _ => {}
-        }
+        pending.extend(pending_entry(&parsed.dom, node, local, control_name));
     }
     pending
+}
+
+/// One named, enabled control's contribution: nothing, one entry, or (for a
+/// multiple `select`) several
+/// (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#constructing-form-data-set>).
+fn pending_entry(
+    dom: &dom::Dom,
+    node: NodeId,
+    local: &str,
+    control_name: String,
+) -> Vec<PendingEntry> {
+    match local {
+        "textarea" => {
+            let mut value = dom.textarea_value(node).unwrap_or_default();
+            if wrap_is_hard(dom.attribute(node, "wrap").as_deref()) {
+                let cols = parse_positive(dom.attribute(node, "cols").as_deref()).unwrap_or(20);
+                value = hard_wrap(&value, cols);
+            }
+            vec![PendingEntry::Text(control_name, value)]
+        }
+        "input" => {
+            let typ = dom
+                .attribute(node, "type")
+                .unwrap_or_else(|| "text".to_owned());
+            let typ = typ.trim().to_ascii_lowercase();
+            if matches!(typ.as_str(), "submit" | "reset" | "button" | "image") {
+                return Vec::new();
+            }
+            if typ == "checkbox" || typ == "radio" {
+                // A checkbox or radio contributes only when checked, and its
+                // value defaults to "on"
+                // (<https://html.spec.whatwg.org/multipage/input.html#dom-input-value-default-on>).
+                if !dom.checkedness(node) {
+                    return Vec::new();
+                }
+                let value = dom
+                    .attribute(node, "value")
+                    .unwrap_or_else(|| "on".to_owned());
+                vec![PendingEntry::Text(control_name, value)]
+            } else if typ == "file" {
+                vec![PendingEntry::Files(control_name, node)]
+            } else {
+                vec![PendingEntry::Text(
+                    control_name,
+                    dom.input_value(node).unwrap_or_default(),
+                )]
+            }
+        }
+        "select" => {
+            let multiple = dom.attribute(node, "multiple").is_some();
+            let options = dom.select_options(node);
+            let selected: Vec<String> = options
+                .iter()
+                .filter(|&&option| dom.option_selected(option))
+                .map(|&option| dom.option_value(option))
+                .collect();
+            if multiple {
+                selected
+                    .into_iter()
+                    .map(|value| PendingEntry::Text(control_name.clone(), value))
+                    .collect()
+            } else {
+                let value = selected
+                    .into_iter()
+                    .next()
+                    .or_else(|| options.first().map(|&option| dom.option_value(option)))
+                    .unwrap_or_default();
+                vec![PendingEntry::Text(control_name, value)]
+            }
+        }
+        _ => Vec::new(),
+    }
 }
 
 /// Appends one `[name, File]` pair per file a script assigned to a `type=file`

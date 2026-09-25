@@ -171,11 +171,12 @@
       'checked', 'defaultChecked', 'selectionStart', 'selectionEnd', 'selectionDirection'],
     HTMLTextAreaElement: ['value', 'defaultValue', 'textLength', 'disabled', 'readOnly', 'required',
       'selectionStart', 'selectionEnd', 'selectionDirection'],
-    HTMLSelectElement: ['disabled', 'required', 'multiple'],
+    HTMLOptionElement: ['value', 'selected', 'defaultSelected', 'text', 'index', 'disabled'],
+    HTMLSelectElement: ['value', 'selectedIndex', 'options', 'length', 'multiple', 'disabled',
+      'required', 'name'],
     HTMLButtonElement: ['disabled'],
     HTMLFieldSetElement: ['disabled'],
     HTMLOptGroupElement: ['disabled'],
-    HTMLOptionElement: ['disabled'],
   };
   for (const [name, parent] of [
     ['HTMLAnchorElement', HTMLElementInterface],
