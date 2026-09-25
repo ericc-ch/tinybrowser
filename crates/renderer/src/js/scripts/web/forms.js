@@ -92,6 +92,9 @@
   // <https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#suffering-from-being-missing>
   const valueMissing = element => {
     if (!element.required) return false;
+    // A readonly or otherwise barred control is not mutable, so it cannot be
+    // missing (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#mutability>).
+    if (barredFromValidation(element)) return false;
     switch (element.tagName) {
       case 'INPUT':
         switch (element.type) {
@@ -122,10 +125,86 @@
     return minimum > 0 && element.value.length !== 0 && element.value.length < minimum;
   };
 
+  const inputType = element => (isInput(element) ? element.type : '');
+
+  // An email/url control whose value does not match its type
+  // (<https://html.spec.whatwg.org/multipage/input.html#the-email-state-(type=email)>).
+  const typeMismatch = element => {
+    const value = element.value;
+    if (value === '') return false;
+    const type = inputType(element);
+    if (type === 'email') {
+      const address = /^[a-zA-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*$/;
+      // A comma separates addresses only with the `multiple` attribute
+      // (<https://html.spec.whatwg.org/multipage/input.html#attr-input-multiple>).
+      if (element.hasAttribute('multiple')) {
+        return value.split(',').some(part => !address.test(part.trim()));
+      }
+      return !address.test(value);
+    }
+    if (type === 'url') {
+      try { new globalThis.URL(value); return false; } catch (error) { return true; }
+    }
+    return false;
+  };
+
+  // The `pattern` attribute, compiled with the `v` flag and anchored
+  // (<https://html.spec.whatwg.org/multipage/input.html#the-pattern-attribute>).
+  const patternMismatch = element => {
+    const pattern = element.getAttribute('pattern');
+    if (pattern === null || element.value === '') return false;
+    let expression;
+    try {
+      expression = new RegExp(`^(?:${pattern})$`, 'v');
+    } catch (error) {
+      try { expression = new RegExp(`^(?:${pattern})$`, 'u'); }
+      catch (fallback) { return false; }
+    }
+    return !expression.test(element.value);
+  };
+
+  const numberValue = element => {
+    if (inputType(element) !== 'number' || element.value === '') return null;
+    const number = Number(element.value);
+    return Number.isNaN(number) ? null : number;
+  };
+  const bound = (element, name) => {
+    const raw = element.getAttribute(name);
+    if (raw === null) return null;
+    const number = Number(raw);
+    return Number.isNaN(number) ? null : number;
+  };
+  const rangeUnderflow = element => {
+    const value = numberValue(element);
+    const min = bound(element, 'min');
+    return value !== null && min !== null && value < min;
+  };
+  const rangeOverflow = element => {
+    const value = numberValue(element);
+    const max = bound(element, 'max');
+    return value !== null && max !== null && value > max;
+  };
+  const stepMismatch = element => {
+    const value = numberValue(element);
+    if (value === null) return false;
+    const raw = element.getAttribute('step');
+    if (raw !== null && raw.trim().toLowerCase() === 'any') return false;
+    let step = raw === null ? 1 : Number(raw);
+    if (Number.isNaN(step) || step <= 0) step = 1;
+    const base = bound(element, 'min') ?? 0;
+    const steps = (value - base) / step;
+    return Math.abs(steps - Math.round(steps)) > 1e-9;
+  };
+
   const FLAGS = {
     valueMissing,
+    typeMismatch,
+    patternMismatch,
     tooLong,
     tooShort,
+    rangeUnderflow,
+    rangeOverflow,
+    stepMismatch,
     customError: element => (customErrors.get(element) || '') !== '',
   };
 
@@ -169,6 +248,8 @@
   };
 
   const validationMessageOf = element => {
+    // A barred control has no validation message.
+    if (barredFromValidation(element)) return '';
     const custom = customErrors.get(element) || '';
     if (custom !== '') return custom;
     return isValid(element) ? '' : 'Constraints not satisfied';
