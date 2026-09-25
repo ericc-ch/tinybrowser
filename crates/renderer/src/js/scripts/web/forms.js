@@ -1372,6 +1372,73 @@
     configurable: true,
   });
 
+  // ── labels and labelable elements ──────────────────────────────────────
+
+  const LABELABLE = new Set(['BUTTON', 'METER', 'OUTPUT', 'PROGRESS', 'SELECT', 'TEXTAREA']);
+  const isLabelable = element => {
+    const tag = element.tagName;
+    if (tag === 'INPUT') return element.type !== 'hidden';
+    return LABELABLE.has(tag);
+  };
+
+  // `label.htmlFor` reflects the `for` attribute
+  // (<https://html.spec.whatwg.org/multipage/forms.html#dom-label-htmlfor>).
+  Object.defineProperty(globalThis.HTMLLabelElement.prototype, 'htmlFor', {
+    get() { return this.getAttribute('for') ?? ''; },
+    set(value) { this.setAttribute('for', String(value)); },
+    enumerable: true, configurable: true,
+  });
+
+  // `label.control`: the element named by `for`, or the first labelable
+  // descendant
+  // (<https://html.spec.whatwg.org/multipage/forms.html#dom-label-control>).
+  Object.defineProperty(globalThis.HTMLLabelElement.prototype, 'control', {
+    get() {
+      if (this.hasAttribute('for')) {
+        const reference = this.htmlFor;
+        const root = this.getRootNode ? this.getRootNode() : this.ownerDocument;
+        const element = root.getElementById ? root.getElementById(reference) : null;
+        return element !== null && isLabelable(element) ? element : null;
+      }
+      for (const descendant of this.querySelectorAll('button, input, meter, output, progress, select, textarea')) {
+        if (isLabelable(descendant)) return descendant;
+      }
+      return null;
+    },
+    configurable: true,
+  });
+
+  // A label's `form` is its labeled control's form owner
+  // (<https://html.spec.whatwg.org/multipage/forms.html#dom-label-form>).
+  Object.defineProperty(globalThis.HTMLLabelElement.prototype, 'form', {
+    get() {
+      const control = this.control;
+      return control ? control.form : null;
+    },
+    configurable: true,
+  });
+
+  const labelsOf = element => {
+    if (!isLabelable(element)) return null;
+    const root = element.getRootNode ? element.getRootNode() : element.ownerDocument;
+    const labels = Array.from(root.querySelectorAll('label'))
+      .filter(label => label.control === element);
+    // An array (for `assert_array_equals`) that still reports as a NodeList.
+    Object.setPrototypeOf(labels, collectionInterface('NodeList').prototype);
+    return labels;
+  };
+  for (const name of [
+    'HTMLButtonElement', 'HTMLInputElement', 'HTMLMeterElement', 'HTMLOutputElement',
+    'HTMLProgressElement', 'HTMLSelectElement', 'HTMLTextAreaElement',
+  ]) {
+    const constructor = globalThis[name];
+    if (!constructor || !constructor.prototype) continue;
+    Object.defineProperty(constructor.prototype, 'labels', {
+      get() { return labelsOf(this); },
+      configurable: true,
+    });
+  }
+
   // ── form controls collection ───────────────────────────────────────────
 
   const LISTED = 'button, fieldset, input, object, output, select, textarea';

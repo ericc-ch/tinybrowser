@@ -181,6 +181,7 @@
     HTMLButtonElement: ['disabled', 'form',
       'formAction', 'formMethod', 'formEnctype', 'formTarget', 'formNoValidate'],
     HTMLFieldSetElement: ['disabled', 'form'],
+    HTMLLabelElement: ['form'],
     HTMLOptGroupElement: ['disabled'],
   };
   for (const [name, parent] of [
