@@ -156,7 +156,11 @@ pub(super) fn report_exception_value<'js>(
     }
     // A throwing `onerror` is the reporter's problem to swallow; report_exception
     // already dropped the pending exception.
-    let _ = report.call::<_, ()>((caught, meta));
+    if report.call::<_, ()>((caught, meta)).is_err() {
+        // Clear the exception the reporter threw so it does not surface at the
+        // next `catch`.
+        let _ = ctx.catch();
+    }
 }
 
 /// A promise rejected without a handler, waiting for either the
@@ -169,14 +173,20 @@ struct PendingRejection {
     reported: bool,
 }
 
-type SavedPromise = (Persistent<Value<'static>>, Persistent<Value<'static>>);
+/// A promise whose `unhandledrejection` already fired and which was handled
+/// afterwards, with the realm that owns it.
+struct LateHandled {
+    world: Weak<RefCell<World>>,
+    promise: Persistent<Value<'static>>,
+    reason: Persistent<Value<'static>>,
+}
 
 thread_local! {
     static PENDING_REJECTIONS: RefCell<Vec<PendingRejection>> =
         const { RefCell::new(Vec::new()) };
     /// Promises whose `unhandledrejection` already fired and which were handled
     /// afterwards; each fires one `rejectionhandled`.
-    static LATE_HANDLED: RefCell<Vec<SavedPromise>> = const { RefCell::new(Vec::new()) };
+    static LATE_HANDLED: RefCell<Vec<LateHandled>> = const { RefCell::new(Vec::new()) };
 }
 
 /// `QuickJS`'s host rejection tracker, called when a promise is rejected with no
@@ -206,7 +216,11 @@ pub(super) fn note_rejection<'js>(
             let entry = queue.remove(index);
             if entry.reported {
                 LATE_HANDLED.with(|late| {
-                    late.borrow_mut().push((entry.promise, entry.reason));
+                    late.borrow_mut().push(LateHandled {
+                        world: entry.world.clone(),
+                        promise: entry.promise,
+                        reason: entry.reason,
+                    });
                 });
             }
             return;
@@ -250,20 +264,42 @@ pub(super) fn drain_rejections(ctx: &Ctx<'_>, current: &Rc<RefCell<World>>) {
         mine
     });
     for mut entry in pending {
-        if !entry.reported {
-            entry.reported = true;
-            if let (Ok(promise), Ok(reason)) = (
-                entry.promise.clone().restore(ctx),
-                entry.reason.clone().restore(ctx),
-            ) {
-                fire_rejection(ctx, false, promise, reason);
+        if entry.reported {
+            PENDING_REJECTIONS.with(|queue| queue.borrow_mut().push(entry));
+            continue;
+        }
+        entry.reported = true;
+        let restored = (
+            entry.promise.clone().restore(ctx),
+            entry.reason.clone().restore(ctx),
+        );
+        // Re-queue before firing, so a handler attached inside the
+        // `unhandledrejection` event still produces `rejectionhandled`.
+        PENDING_REJECTIONS.with(|queue| queue.borrow_mut().push(entry));
+        if let (Ok(promise), Ok(reason)) = restored {
+            fire_rejection(ctx, false, promise, reason);
+        }
+    }
+    let late: Vec<LateHandled> = LATE_HANDLED.with(|queue| {
+        let mut queue = queue.borrow_mut();
+        let mut mine = Vec::new();
+        let mut rest = Vec::new();
+        for entry in queue.drain(..) {
+            if entry
+                .world
+                .upgrade()
+                .is_some_and(|world| Rc::ptr_eq(&world, current))
+            {
+                mine.push(entry);
+            } else {
+                rest.push(entry);
             }
         }
-        PENDING_REJECTIONS.with(|queue| queue.borrow_mut().push(entry));
-    }
-    let late: Vec<SavedPromise> = LATE_HANDLED.with(|queue| std::mem::take(&mut *queue.borrow_mut()));
-    for (promise, reason) in late {
-        if let (Ok(promise), Ok(reason)) = (promise.restore(ctx), reason.restore(ctx)) {
+        *queue = rest;
+        mine
+    });
+    for entry in late {
+        if let (Ok(promise), Ok(reason)) = (entry.promise.restore(ctx), entry.reason.restore(ctx)) {
             fire_rejection(ctx, true, promise, reason);
         }
     }
@@ -278,7 +314,10 @@ fn fire_rejection<'js>(ctx: &Ctx<'js>, handled: bool, promise: Value<'js>, reaso
     let Some(report) = report.as_function() else {
         return;
     };
-    let _ = report.call::<_, Value>((handled, promise, reason));
+    if report.call::<_, Value>((handled, promise, reason)).is_err() {
+        // Clear the exception the handler threw.
+        let _ = ctx.catch();
+    }
 }
 
 impl<'js> rquickjs::FromJs<'js> for OptString {

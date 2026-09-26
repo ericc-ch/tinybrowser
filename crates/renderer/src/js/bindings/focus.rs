@@ -289,6 +289,13 @@ fn legacy_pre_activation(ctx: &Ctx<'_>, node: NodeId) -> Result<PreActivation> {
         return Ok(PreActivation::None);
     };
     let dom = &mut parsed.dom;
+    let Some(NodeKind::Element { name, .. }) = dom.kind(node) else {
+        return Ok(PreActivation::None);
+    };
+    // Only an `input` has the checkbox/radio activation behavior.
+    if name.ns != html_namespace() || name.local.as_ref() != "input" {
+        return Ok(PreActivation::None);
+    }
     let type_attr = dom
         .attribute(node, "type")
         .unwrap_or_default()
@@ -350,13 +357,15 @@ fn complete_activation(ctx: &Ctx<'_>, node: NodeId) -> Result<()> {
     let checkable = {
         let world = world.borrow();
         world.document(node).is_some_and(|parsed| {
-            parsed
-                .dom
-                .attribute(node, "type")
-                .is_some_and(|value| {
-                    let value = value.trim().to_ascii_lowercase();
-                    value == "checkbox" || value == "radio"
-                })
+            let dom = &parsed.dom;
+            matches!(
+                dom.kind(node),
+                Some(NodeKind::Element { name, .. })
+                    if name.ns == html_namespace() && name.local.as_ref() == "input"
+            ) && dom.attribute(node, "type").is_some_and(|value| {
+                let value = value.trim().to_ascii_lowercase();
+                value == "checkbox" || value == "radio"
+            })
         })
     };
     if checkable {
@@ -379,21 +388,6 @@ enum Activation {
     Submit,
     Reset,
     ToggleCheckedness,
-}
-
-/// The nearest ancestor `form` element of `node`, if any.
-fn nearest_form(dom: &dom::Dom, node: NodeId) -> Option<NodeId> {
-    let mut current = dom.parent(node);
-    while let Some(parent) = current {
-        if let Some(NodeKind::Element { name, .. }) = dom.kind(parent)
-            && name.ns == html_namespace()
-            && name.local.as_ref() == "form"
-        {
-            return Some(parent);
-        }
-        current = dom.parent(parent);
-    }
-    None
 }
 
 /// The checkbox/radio activation behavior: toggle (checkbox) or set (radio)
@@ -474,20 +468,18 @@ fn run_activation(ctx: &Ctx<'_>, node: NodeId) -> Result<()> {
                 _ => Activation::None,
             },
             "button" => match type_attr(dom).as_deref() {
-                None | Some("submit") => Activation::Submit,
+                // The missing and invalid value defaults are both Auto (submit).
                 Some("reset") => Activation::Reset,
-                _ => Activation::None,
+                _ => Activation::Submit,
             },
             _ => Activation::None,
         };
-        (activation, nearest_form(dom, node))
+        (activation, dom.form_owner(node))
     };
     match activation {
         Activation::None => Ok(()),
         Activation::ToggleCheckedness => toggle_checkedness(ctx, node),
         Activation::Submit | Activation::Reset => {
-            // The form owner is the nearest ancestor `form` for now; the `form`
-            // attribute association lands with the form-owner unit.
             let Some(form) = form else {
                 return Ok(());
             };
@@ -498,13 +490,20 @@ fn run_activation(ctx: &Ctx<'_>, node: NodeId) -> Result<()> {
             let button_value = wrap_node(ctx, node)?;
             match activation {
                 Activation::Submit => {
-                    if let Ok(function) = form_object.get::<_, Function>("requestSubmit") {
-                        let _ = function.call::<_, ()>((This(form_object.clone()), button_value));
+                    if let Ok(function) = form_object.get::<_, Function>("requestSubmit")
+                        && function
+                            .call::<_, ()>((This(form_object.clone()), button_value))
+                            .is_err()
+                    {
+                        // Clear the exception the page's handler threw.
+                        let _ = ctx.catch();
                     }
                 }
                 Activation::Reset => {
-                    if let Ok(function) = form_object.get::<_, Function>("reset") {
-                        let _ = function.call::<_, ()>((This(form_object.clone()),));
+                    if let Ok(function) = form_object.get::<_, Function>("reset")
+                        && function.call::<_, ()>((This(form_object.clone()),)).is_err()
+                    {
+                        let _ = ctx.catch();
                     }
                 }
                 Activation::None | Activation::ToggleCheckedness => {}
@@ -548,6 +547,17 @@ fn activate_element<'js>(ctx: Ctx<'js>, element: Value<'js>) -> Result<()> {
     let Some(node) = host_node_id(&ctx, &element) else {
         return Ok(());
     };
+    // A disabled control eats the click
+    // (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#concept-fe-disabled>).
+    {
+        let world = world_for_node(&ctx, node)?;
+        let world = world.borrow();
+        if let Some(parsed) = world.document(node)
+            && is_actually_disabled(&parsed.dom, node)
+        {
+            return Ok(());
+        }
+    }
     run_activation(&ctx, node)
 }
 

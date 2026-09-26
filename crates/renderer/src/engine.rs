@@ -823,15 +823,10 @@ impl Engine {
                     self.publish_frame_document(container, child);
                 }
                 NavigationTarget::SelfFrame => {
-                    let Some(document) = self.frames.get_mut(&frame) else {
-                        continue;
-                    };
                     let Ok(url) = Url::parse(&spec) else {
                         continue;
                     };
-                    let initiator =
-                        Url::parse(document.document_url()).unwrap_or_else(|_| url.clone());
-                    document.navigate_to(url, initiator, method, body, content_type);
+                    self.load_frame_url(frame, url, frame, &method, &body, content_type.as_deref());
                 }
             }
         }

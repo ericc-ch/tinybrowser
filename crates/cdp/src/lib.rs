@@ -524,6 +524,14 @@ impl Conn {
 
     /// Emits the commit event set: frame commit plus the new document's
     /// execution contexts (default and every known isolated world).
+    /// Mints a fresh loader id for a navigation
+    /// (<https://chromedevtools.github.io/devtools-protocol/tot/Page/#type-Frame>).
+    fn next_loader_id(&mut self) -> String {
+        let id = format!("{}", self.next_loader);
+        self.next_loader = self.next_loader.saturating_add(1);
+        id
+    }
+
     async fn push_navigated(
         &mut self,
         messages: &mut Vec<Value>,
@@ -532,7 +540,13 @@ impl Conn {
     ) {
         let tab_id = tab.id();
         let frame_id = tab_id.to_string();
-        let loader_id = self.loader_ids.get(&tab_id).cloned().unwrap_or_default();
+        // A browser-initiated `Page.navigate` stored its loader id; a
+        // renderer-initiated navigation has none and mints a fresh one
+        // (<https://chromedevtools.github.io/devtools-protocol/tot/Page/#type-Frame>).
+        let loader_id = match self.loader_ids.remove(&tab_id) {
+            Some(id) => id,
+            None => self.next_loader_id(),
+        };
         // Final URL after redirects, not the requested one.
         let url = tab.document_url().await.unwrap_or_default();
         let mut navigated = json!({
@@ -1060,14 +1074,15 @@ impl Conn {
             .get("url")
             .and_then(Value::as_str)
             .ok_or_else(|| DispatchError::Failed("missing url".into()))?;
-        let loader_id = format!("{}", self.next_loader);
-        self.next_loader = self.next_loader.saturating_add(1);
-        self.loader_ids.insert(tab.id(), loader_id.clone());
         let frame_id = tab.id().to_string();
+        let loader_id = self.next_loader_id();
         if url.is_empty() || url == "about:blank" {
             open_url(tab, url).await?;
             return Ok(json!({"frameId": frame_id, "loaderId": loader_id}));
         }
+        // Store the id so the `frameNavigated` event reports the same loader id
+        // (<https://chromedevtools.github.io/devtools-protocol/tot/Page/#event-frameNavigated>).
+        self.loader_ids.insert(tab.id(), loader_id.clone());
         let events = tab
             .subscribe()
             .map_err(|error| DispatchError::Failed(error.to_string()))?;

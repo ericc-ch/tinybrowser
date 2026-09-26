@@ -1372,8 +1372,10 @@ fn call_error_handler<'js>(
         function.call((This(object.clone()), message, filename, lineno, colno, error))?;
     if result.as_bool() == Some(true)
         && let Ok(prevent) = event_object.get::<_, Function>("preventDefault")
+        && prevent.call::<_, ()>((This(event_object.clone()),)).is_err()
     {
-        let _ = prevent.call::<_, ()>((This(event_object.clone()),));
+        // Clear the exception a page-clobbered `preventDefault` threw.
+        let _ = ctx.catch();
     }
     Ok(())
 }

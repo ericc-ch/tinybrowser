@@ -836,6 +836,10 @@ impl Tab {
                 if let Ok(url) = Url::parse(url) {
                     self.document_url = url;
                 }
+                // The committed origin is an authorization input; record it from
+                // the navigated URL, as a browser-initiated mount does
+                // (<https://html.spec.whatwg.org/multipage/browsers.html#concept-origin>).
+                self.record_committed_origin(url);
                 self.document_loaded = false;
                 self.navigation_failed = false;
                 self.record_event(TabEvent::Navigated).await;
