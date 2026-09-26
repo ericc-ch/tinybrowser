@@ -938,7 +938,16 @@ async fn coordinator_loop(
                 tab.handle_navigation(epoch, result).await;
             }
             Wake::Navigation(None) | Wake::WaiterDeadline => {}
-            Wake::Renderer(Some((frame, event))) => tab.handle_renderer_event(frame, &event).await,
+            Wake::Renderer(Some((frame, event))) => {
+                let navigated = matches!(event, RendererEvent::Navigated { .. });
+                tab.handle_renderer_event(frame, &event).await;
+                if navigated {
+                    // The frame's realm is gone, so its `run_until_js_true`
+                    // waiters cannot settle; resolve them instead of polling to
+                    // the deadline.
+                    resolve_frame_waiters(&server, &mut waiters, frame).await;
+                }
+            }
             Wake::Renderer(None) => {
                 tab.drop_renderer();
                 fail_waiters(&server, &mut waiters, &TabError::ActorStopped).await;
@@ -1338,6 +1347,23 @@ async fn fail_waiters(server: &TabServer, waiters: &mut Vec<Waiter>, error: &Tab
         let reply = waiter_reply(&waiter, Err(error.clone()));
         let _result = server.reply(waiter.id, reply).await;
     }
+}
+
+/// Resolves the `RunUntilJs` waiters for a frame that just navigated: the
+/// predicate ran against the old realm and cannot settle, so reply `false`
+/// instead of polling to the deadline.
+async fn resolve_frame_waiters(server: &TabServer, waiters: &mut Vec<Waiter>, frame: FrameId) {
+    let mut pending = Vec::new();
+    for waiter in std::mem::take(waiters) {
+        if waiter.source.as_ref().is_some_and(|(wait_frame, _)| *wait_frame == frame) {
+            let _result = server
+                .reply(waiter.id, TabReply::RunUntilJs(Ok(false)))
+                .await;
+        } else {
+            pending.push(waiter);
+        }
+    }
+    *waiters = pending;
 }
 
 async fn resolve_waiters(tab: &mut Tab, server: &TabServer, waiters: &mut Vec<Waiter>) {

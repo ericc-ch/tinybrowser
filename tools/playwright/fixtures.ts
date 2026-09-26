@@ -23,6 +23,8 @@ export interface Daemon {
   interactiveUrl: string;
   /** Page with GET and POST forms that submit to the echo route. */
   formUrl: string;
+  /** Page with a realistic multipart form covering every control type. */
+  richUrl: string;
 }
 
 interface Fixtures {
@@ -81,6 +83,25 @@ const FORM = `<!doctype html><title>form</title>
   <button id="p-submit" type="submit">Post</button>
 </form>`;
 
+/** A realistic multipart form covering every control type Playwright can drive. */
+const RICH_FORM = `<!doctype html><title>rich form</title>
+<form id="rich-form" method="post" action="/echo" enctype="multipart/form-data">
+  <input id="r-name" name="name" type="text">
+  <input id="r-email" name="email" type="email">
+  <input id="r-age" name="age" type="number">
+  <input id="r-date" name="date" type="date">
+  <textarea id="r-bio" name="bio"></textarea>
+  <select id="r-color" name="color">
+    <option value="red">Red</option>
+    <option value="blue">Blue</option>
+  </select>
+  <input id="r-agree" type="checkbox" name="agree" value="yes">
+  <input id="r-size-s" type="radio" name="size" value="s">
+  <input id="r-size-l" type="radio" name="size" value="l">
+  <input id="r-file" type="file" name="upload">
+  <button id="r-submit" type="submit">Send</button>
+</form>`;
+
 async function waitForPort(jsonPath: string, timeoutMs: number): Promise<number> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
@@ -128,6 +149,9 @@ export const test = base.extend<Fixtures>({
       } else if (path === "/form") {
         response.writeHead(200, { "content-type": "text/html" });
         response.end(FORM);
+      } else if (path === "/rich") {
+        response.writeHead(200, { "content-type": "text/html" });
+        response.end(RICH_FORM);
       } else if (path === "/echo") {
         const chunks: Buffer[] = [];
         request.on("data", (chunk: Buffer) => chunks.push(chunk));
@@ -183,6 +207,7 @@ export const test = base.extend<Fixtures>({
       plainUrl: `http://127.0.0.1:${httpPort}/plain`,
       interactiveUrl: `http://127.0.0.1:${httpPort}/interactive`,
       formUrl: `http://127.0.0.1:${httpPort}/form`,
+      richUrl: `http://127.0.0.1:${httpPort}/rich`,
     });
 
     try {
