@@ -329,12 +329,9 @@
       return INPUT_TYPE_KEYWORDS.has(lowered) ? lowered : 'text';
     },
     set: function(value) {
-      // The type-change steps run before the attribute lands, so the old state
-      // can migrate its value
+      // The `type` attribute change runs the input type-change steps in the
+      // DOM, whatever the mutation path
       // (<https://html.spec.whatwg.org/multipage/input.html#the-input-element:type-change-state>).
-      const lowered = String(value).toLowerCase();
-      const next = INPUT_TYPE_KEYWORDS.has(lowered) ? lowered : 'text';
-      globalThis.__tbInputTypeChange(this, next);
       this.setAttribute('type', String(value));
     },
     enumerable: true,

@@ -196,6 +196,10 @@ pub struct Dom {
     /// `value` content attribute for `input`, the child text content for
     /// `textarea` (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#concept-fe-dirty>).
     input_values: HashMap<NodeId, String>,
+    /// The last normalized `type` state of an `input`, so an attribute change
+    /// can detect a state transition and run the type-change steps
+    /// (<https://html.spec.whatwg.org/multipage/input.html#the-input-element:type-change-state>).
+    input_types: HashMap<NodeId, String>,
     /// The source-text start line of an inline `script` element, recorded by
     /// the parser so reported exceptions carry a document line number
     /// (<https://html.spec.whatwg.org/multipage/webappapis.html#script's-line-number>).
@@ -327,6 +331,7 @@ impl Dom {
             shadow_roots: HashMap::new(),
             shadow_hosts: HashMap::new(),
             input_values: HashMap::new(),
+            input_types: HashMap::new(),
             selections: HashMap::new(),
             script_lines: HashMap::new(),
             checkedness: HashMap::new(),
@@ -1555,21 +1560,44 @@ impl Dom {
         Ok(())
     }
 
-    /// Runs the input type-change steps when `type` moves to `new_type`
+    /// Runs the input type-change steps after the `type` attribute changed,
+    /// comparing against the last normalized state
     /// (<https://html.spec.whatwg.org/multipage/input.html#the-input-element:type-change-state>).
-    ///
-    /// # Errors
-    ///
-    /// Returns [`DomError::WrongNodeType`] when `id` is not an HTML `input`.
-    pub fn input_type_change(&mut self, id: NodeId, new_type: &str) -> Result<(), DomError> {
-        let old = self.input_type(id).ok_or(DomError::WrongNodeType)?;
+    fn refresh_input_type(&mut self, id: NodeId) -> Result<(), DomError> {
+        let Some(new_type) = self.input_type(id) else {
+            return Ok(());
+        };
+        let old = self
+            .input_types
+            .get(&id)
+            .cloned()
+            .unwrap_or_else(|| "text".to_owned());
+        self.input_types.insert(id, new_type.clone());
         if old == new_type {
             return Ok(());
         }
-        match (input_value_mode(&old), input_value_mode(new_type)) {
+        self.apply_input_type_migration(id, &old, &new_type)
+    }
+
+    /// Migrates an input's value between value modes and re-sanitizes it for
+    /// the new state
+    /// (<https://html.spec.whatwg.org/multipage/input.html#the-input-element:type-change-state>).
+    fn apply_input_type_migration(
+        &mut self,
+        id: NodeId,
+        old: &str,
+        new_type: &str,
+    ) -> Result<(), DomError> {
+        match (input_value_mode(old), input_value_mode(new_type)) {
             // A value-mode value becomes the new default, unless it is empty.
             (ValueMode::Value, ValueMode::Default | ValueMode::DefaultOn) => {
-                let value = self.input_value(id).unwrap_or_default();
+                let raw = self
+                    .input_values
+                    .get(&id)
+                    .cloned()
+                    .or_else(|| self.attribute(id, "value"))
+                    .unwrap_or_default();
+                let value = self.sanitize_value_for_type(id, old, raw);
                 if !value.is_empty() {
                     self.set_attribute(id, "value", value)?;
                 }
@@ -1584,6 +1612,13 @@ impl Dom {
                 self.input_values.remove(&id);
             }
             _ => {}
+        }
+        // The type-change steps invoke the new state's value sanitization.
+        if input_value_mode(new_type) == ValueMode::Value
+            && let Some(value) = self.input_values.get(&id).cloned()
+        {
+            let sanitized = self.sanitize_value_for_type(id, new_type, value);
+            self.input_values.insert(id, sanitized);
         }
         Ok(())
     }
@@ -1614,7 +1649,14 @@ impl Dom {
     /// <https://html.spec.whatwg.org/multipage/input.html#value-sanitization-algorithm>.
     fn sanitize_input_value(&self, id: NodeId, value: String) -> String {
         let typ = self.input_type(id).unwrap_or_else(|| "text".into());
-        match typ.as_str() {
+        self.sanitize_value_for_type(id, &typ, value)
+    }
+
+    /// The value sanitization algorithm for a named state; used by
+    /// [`Self::sanitize_input_value`] and by the type-change steps, which must
+    /// sanitize for the new state before the `type` attribute lands.
+    fn sanitize_value_for_type(&self, id: NodeId, typ: &str, value: String) -> String {
+        match typ {
             "text" | "search" | "tel" | "password" => value.replace(['\r', '\n'], ""),
             "url" | "email" => value
                 .replace(['\r', '\n'], "")
@@ -2372,6 +2414,9 @@ impl Dom {
         if local == "selected" {
             self.refresh_option_selectedness(id);
         }
+        if local.eq_ignore_ascii_case("type") {
+            self.refresh_input_type(id)?;
+        }
         Ok(())
     }
 
@@ -2585,6 +2630,9 @@ impl Dom {
         if local == "selected" {
             self.refresh_option_selectedness(id);
         }
+        if local.eq_ignore_ascii_case("type") {
+            self.refresh_input_type(id)?;
+        }
         Ok(())
     }
 
@@ -2720,6 +2768,7 @@ impl Dom {
         let mut pending = vec![id];
         while let Some(current) = pending.pop() {
             self.input_values.remove(&current);
+            self.input_types.remove(&current);
             self.selections.remove(&current);
             self.script_lines.remove(&current);
             self.checkedness.remove(&current);
