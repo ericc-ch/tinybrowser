@@ -68,3 +68,29 @@ test("dogfood: submit a GET form and read the query", async ({ daemon }) => {
 
   await browser.close();
 });
+
+// File upload through Playwright's `setInputFiles`, which builds a File in the
+// page and assigns it to `input.files`; the multipart body must carry the name,
+// the content type, and the bytes.
+test("dogfood: upload a file and submit multipart", async ({ daemon }) => {
+  const browser = await chromium.connectOverCDP(daemon.origin);
+  const context = browser.contexts()[0];
+  const page = context.pages()[0];
+
+  await page.goto(daemon.richUrl);
+  await page.fill("#r-name", "File Tester");
+  await page.setInputFiles("#r-file", {
+    name: "note.txt",
+    mimeType: "text/plain",
+    buffer: Buffer.from("hello from tinybrowser"),
+  });
+
+  await page.click("#r-submit");
+  await page.waitForURL(/\/echo$/);
+  const body = (await page.locator("#result").textContent() ?? "").replace(/\r\n/g, "\n");
+  expect(body).toContain('name="upload"; filename="note.txt"');
+  expect(body).toContain("Content-Type: text/plain");
+  expect(body).toContain("hello from tinybrowser");
+
+  await browser.close();
+});
