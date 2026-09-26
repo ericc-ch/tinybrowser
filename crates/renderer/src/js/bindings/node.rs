@@ -981,12 +981,12 @@ impl JsNode {
         let Some(parsed) = world.document(self.handle.0) else {
             return Err(Exception::throw_type(&ctx, "no document"));
         };
-        Ok(parsed.dom.input_value(self.handle.0).unwrap_or_default())
+        Ok(parsed.dom.element_value(self.handle.0).unwrap_or_default())
     }
 
     // https://html.spec.whatwg.org/multipage/input.html#dom-input-value
     #[qjs(set, rename = "value")]
-    fn set_value(&self, ctx: Ctx<'_>, value: WebIdlString) -> Result<()> {
+    fn set_value(&self, ctx: Ctx<'_>, value: LegacyNullString) -> Result<()> {
         let world = world(&ctx)?;
         let world = world.borrow();
         let Some(mut parsed) = world.document_mut(self.handle.0) else {
@@ -994,8 +994,455 @@ impl JsNode {
         };
         parsed
             .dom
-            .set_input_value(self.handle.0, value.0)
+            .set_element_value(self.handle.0, value.0)
             .map_err(|err| throw_dom_error(&ctx, err))?;
+        Ok(())
+    }
+
+    // https://html.spec.whatwg.org/multipage/form-elements.html#dom-textarea-defaultvalue
+    #[qjs(get, rename = "defaultValue")]
+    fn default_value(&self, ctx: Ctx<'_>) -> Result<String> {
+        let world = world(&ctx)?;
+        let world = world.borrow();
+        let Some(parsed) = world.document(self.handle.0) else {
+            return Err(Exception::throw_type(&ctx, "no document"));
+        };
+        Ok(parsed
+            .dom
+            .control_default_value(self.handle.0)
+            .unwrap_or_default())
+    }
+
+    // https://html.spec.whatwg.org/multipage/form-elements.html#dom-textarea-defaultvalue
+    #[qjs(set, rename = "defaultValue")]
+    fn set_default_value(&self, ctx: Ctx<'_>, value: WebIdlString) -> Result<()> {
+        let world = world(&ctx)?;
+        let world = world.borrow();
+        let Some(mut parsed) = world.document_mut(self.handle.0) else {
+            return Err(Exception::throw_type(&ctx, "no document"));
+        };
+        parsed
+            .dom
+            .set_control_default_value(self.handle.0, value.0)
+            .map_err(|err| throw_dom_error(&ctx, err))?;
+        Ok(())
+    }
+
+    // https://html.spec.whatwg.org/multipage/form-elements.html#dom-textarea-textlength
+    #[qjs(get, rename = "textLength")]
+    fn text_length(&self, ctx: Ctx<'_>) -> Result<u32> {
+        let world = world(&ctx)?;
+        let world = world.borrow();
+        let Some(parsed) = world.document(self.handle.0) else {
+            return Ok(0);
+        };
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "a 64-bit string length beyond u32 cannot be produced by this engine"
+        )]
+        Ok(parsed
+            .dom
+            .textarea_value(self.handle.0)
+            .map_or(0, |value| value.encode_utf16().count() as u32))
+    }
+
+    // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#dom-textarea/input-selectionstart
+    #[qjs(get, rename = "selectionStart")]
+    fn selection_start<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
+        let world = world(&ctx)?;
+        let world = world.borrow();
+        let Some(parsed) = world.document(self.handle.0) else {
+            return Ok(Value::new_null(ctx));
+        };
+        match parsed.dom.selection(self.handle.0) {
+            Some((start, _, _)) => Ok(Value::new_number(ctx, f64::from(start))),
+            None => Ok(Value::new_null(ctx)),
+        }
+    }
+
+    #[qjs(set, rename = "selectionStart")]
+    fn set_selection_start(&self, ctx: Ctx<'_>, value: WebIdlUnsignedLong) -> Result<()> {
+        let world = world(&ctx)?;
+        let world = world.borrow();
+        let Some(mut parsed) = world.document_mut(self.handle.0) else {
+            return Ok(());
+        };
+        let Some((_, end, direction)) = parsed.dom.selection(self.handle.0) else {
+            return Err(throw_dom(
+                &ctx,
+                "InvalidStateError",
+                "selectionStart does not apply to this control",
+            ));
+        };
+        let start = value.0;
+        let changed = parsed
+            .dom
+            .set_selection(self.handle.0, start, end.max(start), direction);
+        drop(parsed);
+        if changed {
+            world.queue_select(self.handle.0);
+        }
+        Ok(())
+    }
+
+    // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#dom-textarea/input-selectionend
+    #[qjs(get, rename = "selectionEnd")]
+    fn selection_end<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
+        let world = world(&ctx)?;
+        let world = world.borrow();
+        let Some(parsed) = world.document(self.handle.0) else {
+            return Ok(Value::new_null(ctx));
+        };
+        match parsed.dom.selection(self.handle.0) {
+            Some((_, end, _)) => Ok(Value::new_number(ctx, f64::from(end))),
+            None => Ok(Value::new_null(ctx)),
+        }
+    }
+
+    #[qjs(set, rename = "selectionEnd")]
+    fn set_selection_end(&self, ctx: Ctx<'_>, value: WebIdlUnsignedLong) -> Result<()> {
+        let world = world(&ctx)?;
+        let world = world.borrow();
+        let Some(mut parsed) = world.document_mut(self.handle.0) else {
+            return Ok(());
+        };
+        let Some((start, _, direction)) = parsed.dom.selection(self.handle.0) else {
+            return Err(throw_dom(
+                &ctx,
+                "InvalidStateError",
+                "selectionEnd does not apply to this control",
+            ));
+        };
+        let changed = parsed.dom.set_selection(self.handle.0, start, value.0, direction);
+        drop(parsed);
+        if changed {
+            world.queue_select(self.handle.0);
+        }
+        Ok(())
+    }
+
+    // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#dom-textarea/input-selectiondirection
+    #[qjs(get, rename = "selectionDirection")]
+    fn selection_direction<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
+        let world = world(&ctx)?;
+        let world = world.borrow();
+        let Some(parsed) = world.document(self.handle.0) else {
+            return Ok(Value::new_null(ctx));
+        };
+        match parsed.dom.selection(self.handle.0) {
+            Some((_, _, direction)) => Ok(string_value(&ctx, direction_name(direction))?),
+            None => Ok(Value::new_null(ctx)),
+        }
+    }
+
+    #[qjs(set, rename = "selectionDirection")]
+    fn set_selection_direction(&self, ctx: Ctx<'_>, value: WebIdlString) -> Result<()> {
+        let world = world(&ctx)?;
+        let world = world.borrow();
+        let Some(mut parsed) = world.document_mut(self.handle.0) else {
+            return Ok(());
+        };
+        let Some((start, end, _)) = parsed.dom.selection(self.handle.0) else {
+            return Err(throw_dom(
+                &ctx,
+                "InvalidStateError",
+                "selectionDirection does not apply to this control",
+            ));
+        };
+        let direction = direction_code(&value.0);
+        let changed = parsed.dom.set_selection(self.handle.0, start, end, direction);
+        drop(parsed);
+        if changed {
+            world.queue_select(self.handle.0);
+        }
+        Ok(())
+    }
+
+    // https://html.spec.whatwg.org/multipage/forms.html#dom-form-reset
+    #[qjs(rename = "reset")]
+    fn reset(&self, ctx: Ctx<'_>) -> Result<()> {
+        if !with_node_kind(&ctx, self.handle.0, |kind| is_html_element(kind, "form"))? {
+            return Err(throw_dom(
+                &ctx,
+                "InvalidStateError",
+                "reset is only available on a form",
+            ));
+        }
+        let world_rc = world(&ctx)?;
+        let world = world_rc.borrow();
+        let Some(mut parsed) = world.document_mut(self.handle.0) else {
+            return Ok(());
+        };
+        // The reset algorithm runs on the form owner's controls: for now, the
+        // descendants that are form controls. Form-owner association lands with
+        // the form units.
+        let mut controls = Vec::new();
+        let mut stack = vec![self.handle.0];
+        while let Some(node) = stack.pop() {
+            let children: Vec<NodeId> = parsed
+                .dom
+                .children(node)
+                .map(Iterator::collect)
+                .unwrap_or_default();
+            for child in children {
+                if let Some(NodeKind::Element { name, .. }) = parsed.dom.kind(child)
+                    && name.ns == html_namespace()
+                    && matches!(name.local.as_ref(), "input" | "textarea" | "select")
+                {
+                    controls.push(child);
+                }
+                stack.push(child);
+            }
+        }
+        for control in controls {
+            parsed.dom.reset_control(control);
+        }
+        Ok(())
+    }
+
+    // https://html.spec.whatwg.org/multipage/forms.html#dom-form-action
+    #[qjs(get, rename = "action")]
+    fn action(&self, ctx: Ctx<'_>) -> Result<String> {
+        let world_rc = world(&ctx)?;
+        let raw = world_rc
+            .borrow()
+            .document(self.handle.0)
+            .and_then(|parsed| parsed.dom.attribute(self.handle.0, "action"));
+        let base = document_base_url_string(&ctx, self.handle.0);
+        let Some(raw) = raw else {
+            return Ok(base);
+        };
+        Ok(url::Url::parse(&base)
+            .ok()
+            .and_then(|base| base.join(&raw).ok())
+            .map_or(raw, |url| url.to_string()))
+    }
+
+    #[qjs(set, rename = "action")]
+    fn set_action(&self, ctx: Ctx<'_>, value: WebIdlString) -> Result<()> {
+        self.set_attribute(ctx, WebIdlString("action".into()), value)
+    }
+
+    // https://html.spec.whatwg.org/multipage/forms.html#dom-form-method
+    #[qjs(get, rename = "method")]
+    fn method(&self, ctx: Ctx<'_>) -> Result<String> {
+        let raw = attribute_value(&ctx, self.handle.0, "method")?;
+        Ok(match raw.trim().to_ascii_lowercase().as_str() {
+            "post" => "post",
+            "dialog" => "dialog",
+            _ => "get",
+        }
+        .to_owned())
+    }
+
+    #[qjs(set, rename = "method")]
+    fn set_method(&self, ctx: Ctx<'_>, value: WebIdlString) -> Result<()> {
+        self.set_attribute(ctx, WebIdlString("method".into()), value)
+    }
+
+    // https://html.spec.whatwg.org/multipage/forms.html#dom-form-enctype
+    #[qjs(get, rename = "enctype")]
+    fn enctype(&self, ctx: Ctx<'_>) -> Result<String> {
+        Ok(encoding_keyword(&attribute_value(&ctx, self.handle.0, "enctype")?).to_owned())
+    }
+
+    #[qjs(set, rename = "enctype")]
+    fn set_enctype(&self, ctx: Ctx<'_>, value: WebIdlString) -> Result<()> {
+        self.set_attribute(ctx, WebIdlString("enctype".into()), value)
+    }
+
+    #[qjs(get, rename = "encoding")]
+    fn encoding(&self, ctx: Ctx<'_>) -> Result<String> {
+        Ok(encoding_keyword(&attribute_value(&ctx, self.handle.0, "enctype")?).to_owned())
+    }
+
+    #[qjs(set, rename = "encoding")]
+    fn set_encoding(&self, ctx: Ctx<'_>, value: WebIdlString) -> Result<()> {
+        self.set_attribute(ctx, WebIdlString("enctype".into()), value)
+    }
+
+    #[qjs(set, rename = "target")]
+    fn set_target(&self, ctx: Ctx<'_>, value: WebIdlString) -> Result<()> {
+        self.set_attribute(ctx, WebIdlString("target".into()), value)
+    }
+
+    // https://html.spec.whatwg.org/multipage/forms.html#dom-form-novalidate
+    #[qjs(get, rename = "noValidate")]
+    fn no_validate(&self, ctx: Ctx<'_>) -> Result<bool> {
+        self.attribute_present(&ctx, "novalidate")
+    }
+
+    #[qjs(set, rename = "noValidate")]
+    fn set_no_validate(&self, ctx: Ctx<'_>, value: bool) -> Result<()> {
+        self.reflect_boolean(ctx, "novalidate", value)
+    }
+
+    // https://html.spec.whatwg.org/multipage/forms.html#dom-form-acceptcharset
+    #[qjs(get, rename = "acceptCharset")]
+    fn accept_charset(&self, ctx: Ctx<'_>) -> Result<String> {
+        attribute_value(&ctx, self.handle.0, "accept-charset")
+    }
+
+    #[qjs(set, rename = "acceptCharset")]
+    fn set_accept_charset(&self, ctx: Ctx<'_>, value: WebIdlString) -> Result<()> {
+        self.set_attribute(ctx, WebIdlString("accept-charset".into()), value)
+    }
+
+    // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#dom-fs-formaction
+    #[qjs(get, rename = "formAction")]
+    fn form_action(&self, ctx: Ctx<'_>) -> Result<String> {
+        let world = world(&ctx)?;
+        let raw = world
+            .borrow()
+            .document(self.handle.0)
+            .and_then(|parsed| parsed.dom.attribute(self.handle.0, "formaction"));
+        let base = document_base_url_string(&ctx, self.handle.0);
+        let Some(raw) = raw else {
+            return Ok(base);
+        };
+        Ok(url::Url::parse(&base)
+            .ok()
+            .and_then(|base| base.join(&raw).ok())
+            .map_or(raw, |url| url.to_string()))
+    }
+
+    #[qjs(set, rename = "formAction")]
+    fn set_form_action(&self, ctx: Ctx<'_>, value: WebIdlString) -> Result<()> {
+        self.set_attribute(ctx, WebIdlString("formaction".into()), value)
+    }
+
+    // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#dom-fs-formmethod
+    #[qjs(get, rename = "formMethod")]
+    fn form_method(&self, ctx: Ctx<'_>) -> Result<String> {
+        let raw = attribute_value(&ctx, self.handle.0, "formmethod")?;
+        Ok(match raw.trim().to_ascii_lowercase().as_str() {
+            "post" => "post",
+            "dialog" => "dialog",
+            _ => "get",
+        }
+        .to_owned())
+    }
+
+    #[qjs(set, rename = "formMethod")]
+    fn set_form_method(&self, ctx: Ctx<'_>, value: WebIdlString) -> Result<()> {
+        self.set_attribute(ctx, WebIdlString("formmethod".into()), value)
+    }
+
+    // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#dom-fs-formenctype
+    #[qjs(get, rename = "formEnctype")]
+    fn form_enctype(&self, ctx: Ctx<'_>) -> Result<String> {
+        Ok(encoding_keyword(&attribute_value(&ctx, self.handle.0, "formenctype")?).to_owned())
+    }
+
+    #[qjs(set, rename = "formEnctype")]
+    fn set_form_enctype(&self, ctx: Ctx<'_>, value: WebIdlString) -> Result<()> {
+        self.set_attribute(ctx, WebIdlString("formenctype".into()), value)
+    }
+
+    #[qjs(get, rename = "formTarget")]
+    fn form_target(&self, ctx: Ctx<'_>) -> Result<String> {
+        attribute_value(&ctx, self.handle.0, "formtarget")
+    }
+
+    #[qjs(set, rename = "formTarget")]
+    fn set_form_target(&self, ctx: Ctx<'_>, value: WebIdlString) -> Result<()> {
+        self.set_attribute(ctx, WebIdlString("formtarget".into()), value)
+    }
+
+    #[qjs(get, rename = "formNoValidate")]
+    fn form_no_validate(&self, ctx: Ctx<'_>) -> Result<bool> {
+        self.attribute_present(&ctx, "formnovalidate")
+    }
+
+    #[qjs(set, rename = "formNoValidate")]
+    fn set_form_no_validate(&self, ctx: Ctx<'_>, value: bool) -> Result<()> {
+        self.reflect_boolean(ctx, "formnovalidate", value)
+    }
+
+    // https://html.spec.whatwg.org/multipage/input.html#the-pattern-attribute
+    #[qjs(get)]
+    fn pattern(&self, ctx: Ctx<'_>) -> Result<String> {
+        attribute_value(&ctx, self.handle.0, "pattern")
+    }
+
+    #[qjs(set, rename = "pattern")]
+    fn set_pattern(&self, ctx: Ctx<'_>, value: WebIdlString) -> Result<()> {
+        self.set_attribute(ctx, WebIdlString("pattern".into()), value)
+    }
+
+    // https://html.spec.whatwg.org/multipage/input.html#the-min-and-max-attributes
+    #[qjs(get)]
+    fn min(&self, ctx: Ctx<'_>) -> Result<String> {
+        attribute_value(&ctx, self.handle.0, "min")
+    }
+
+    #[qjs(set, rename = "min")]
+    fn set_min(&self, ctx: Ctx<'_>, value: WebIdlString) -> Result<()> {
+        self.set_attribute(ctx, WebIdlString("min".into()), value)
+    }
+
+    #[qjs(get)]
+    fn max(&self, ctx: Ctx<'_>) -> Result<String> {
+        attribute_value(&ctx, self.handle.0, "max")
+    }
+
+    #[qjs(set, rename = "max")]
+    fn set_max(&self, ctx: Ctx<'_>, value: WebIdlString) -> Result<()> {
+        self.set_attribute(ctx, WebIdlString("max".into()), value)
+    }
+
+    // https://html.spec.whatwg.org/multipage/input.html#the-step-attribute
+    #[qjs(get)]
+    fn step(&self, ctx: Ctx<'_>) -> Result<String> {
+        attribute_value(&ctx, self.handle.0, "step")
+    }
+
+    #[qjs(set, rename = "step")]
+    fn set_step(&self, ctx: Ctx<'_>, value: WebIdlString) -> Result<()> {
+        self.set_attribute(ctx, WebIdlString("step".into()), value)
+    }
+
+    // https://drafts.csswg.org/cssom-view/#dom-element-scrollleft
+    #[qjs(get, rename = "scrollLeft")]
+    fn scroll_left(&self, ctx: Ctx<'_>) -> Result<f64> {
+        let world = world(&ctx)?;
+        let world = world.borrow();
+        Ok(world
+            .document(self.handle.0)
+            .map_or(0.0, |parsed| parsed.dom.scroll_offset(self.handle.0).0))
+    }
+
+    #[qjs(set, rename = "scrollLeft")]
+    fn set_scroll_left(&self, ctx: Ctx<'_>, value: f64) -> Result<()> {
+        let world = world(&ctx)?;
+        let world = world.borrow();
+        let Some(mut parsed) = world.document_mut(self.handle.0) else {
+            return Ok(());
+        };
+        let (_, top) = parsed.dom.scroll_offset(self.handle.0);
+        parsed.dom.set_scroll_offset(self.handle.0, value, top);
+        Ok(())
+    }
+
+    // https://drafts.csswg.org/cssom-view/#dom-element-scrolltop
+    #[qjs(get, rename = "scrollTop")]
+    fn scroll_top(&self, ctx: Ctx<'_>) -> Result<f64> {
+        let world = world(&ctx)?;
+        let world = world.borrow();
+        Ok(world
+            .document(self.handle.0)
+            .map_or(0.0, |parsed| parsed.dom.scroll_offset(self.handle.0).1))
+    }
+
+    #[qjs(set, rename = "scrollTop")]
+    fn set_scroll_top(&self, ctx: Ctx<'_>, value: f64) -> Result<()> {
+        let world = world(&ctx)?;
+        let world = world.borrow();
+        let Some(mut parsed) = world.document_mut(self.handle.0) else {
+            return Ok(());
+        };
+        let (left, _) = parsed.dom.scroll_offset(self.handle.0);
+        parsed.dom.set_scroll_offset(self.handle.0, left, value);
         Ok(())
     }
 
@@ -1064,9 +1511,249 @@ impl JsNode {
         self.reflect_boolean(ctx, "multiple", value)
     }
 
+    // https://html.spec.whatwg.org/multipage/forms.html#dom-fae-form
+    #[qjs(get, rename = "form")]
+    fn form<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
+        let form = {
+            let world = world(&ctx)?;
+            let world = world.borrow();
+            world
+                .document(self.handle.0)
+                .and_then(|parsed| parsed.dom.form_owner(self.handle.0))
+        };
+        match form {
+            Some(form) => wrap_node(&ctx, form),
+            None => Ok(Value::new_null(ctx)),
+        }
+    }
+
+    // https://html.spec.whatwg.org/multipage/input.html#dom-input-checked
+    #[qjs(get)]
+    fn checked(&self, ctx: Ctx<'_>) -> Result<bool> {
+        let world = world(&ctx)?;
+        let world = world.borrow();
+        Ok(world
+            .document(self.handle.0)
+            .is_some_and(|parsed| parsed.dom.checkedness(self.handle.0)))
+    }
+
+    #[qjs(set, rename = "checked")]
+    fn set_checked(&self, ctx: Ctx<'_>, value: bool) -> Result<()> {
+        let world = world(&ctx)?;
+        let world = world.borrow();
+        let Some(mut parsed) = world.document_mut(self.handle.0) else {
+            return Ok(());
+        };
+        parsed.dom.set_input_checkedness(self.handle.0, value);
+        Ok(())
+    }
+
+    // https://html.spec.whatwg.org/multipage/input.html#dom-input-indeterminate
+    #[qjs(get)]
+    fn indeterminate(&self, ctx: Ctx<'_>) -> Result<bool> {
+        let world = world(&ctx)?;
+        let world = world.borrow();
+        Ok(world
+            .document(self.handle.0)
+            .is_some_and(|parsed| parsed.dom.indeterminate(self.handle.0)))
+    }
+
+    #[qjs(set, rename = "indeterminate")]
+    fn set_indeterminate(&self, ctx: Ctx<'_>, value: bool) -> Result<()> {
+        let world = world(&ctx)?;
+        let world = world.borrow();
+        let Some(mut parsed) = world.document_mut(self.handle.0) else {
+            return Ok(());
+        };
+        parsed.dom.set_indeterminate(self.handle.0, value);
+        Ok(())
+    }
+
+    // https://html.spec.whatwg.org/multipage/input.html#dom-input-defaultchecked
+    #[qjs(get, rename = "defaultChecked")]
+    fn default_checked(&self, ctx: Ctx<'_>) -> Result<bool> {
+        self.attribute_present(&ctx, "checked")
+    }
+
+    #[qjs(set, rename = "defaultChecked")]
+    fn set_default_checked(&self, ctx: Ctx<'_>, value: bool) -> Result<()> {
+        self.reflect_boolean(ctx, "checked", value)
+    }
+
+    // https://html.spec.whatwg.org/multipage/form-elements.html#dom-option-selected
+    #[qjs(get, rename = "selected")]
+    fn selected(&self, ctx: Ctx<'_>) -> Result<bool> {
+        let world = world(&ctx)?;
+        let world = world.borrow();
+        Ok(world
+            .document(self.handle.0)
+            .is_some_and(|parsed| parsed.dom.option_selected(self.handle.0)))
+    }
+
+    #[qjs(set, rename = "selected")]
+    fn set_selected(&self, ctx: Ctx<'_>, value: bool) -> Result<()> {
+        let world = world(&ctx)?;
+        let world = world.borrow();
+        let Some(mut parsed) = world.document_mut(self.handle.0) else {
+            return Ok(());
+        };
+        parsed
+            .dom
+            .set_option_selected_in_select(self.handle.0, value);
+        Ok(())
+    }
+
+    #[qjs(get, rename = "defaultSelected")]
+    fn default_selected(&self, ctx: Ctx<'_>) -> Result<bool> {
+        self.attribute_present(&ctx, "selected")
+    }
+
+    #[qjs(set, rename = "defaultSelected")]
+    fn set_default_selected(&self, ctx: Ctx<'_>, value: bool) -> Result<()> {
+        self.reflect_boolean(ctx, "selected", value)
+    }
+
+    // https://html.spec.whatwg.org/multipage/form-elements.html#dom-option-label
+    #[qjs(get)]
+    fn label(&self, ctx: Ctx<'_>) -> Result<String> {
+        let world = world(&ctx)?;
+        let world = world.borrow();
+        Ok(world.document(self.handle.0).map_or_else(String::new, |parsed| {
+            parsed
+                .dom
+                .no_namespace_attribute(self.handle.0, "label")
+                .unwrap_or_else(|| parsed.dom.option_text(self.handle.0))
+        }))
+    }
+
+    #[qjs(set, rename = "label")]
+    fn set_label(&self, ctx: Ctx<'_>, value: WebIdlString) -> Result<()> {
+        self.set_attribute(ctx, WebIdlString("label".into()), value)
+    }
+
+    // https://html.spec.whatwg.org/multipage/form-elements.html#dom-option-text
+    #[qjs(get)]
+    fn text(&self, ctx: Ctx<'_>) -> Result<String> {
+        let world = world(&ctx)?;
+        let world = world.borrow();
+        Ok(world
+            .document(self.handle.0)
+            .map_or_else(String::new, |parsed| parsed.dom.option_text(self.handle.0)))
+    }
+
+    #[qjs(set, rename = "text")]
+    fn set_text(&self, ctx: Ctx<'_>, value: WebIdlString) -> Result<()> {
+        let world = world(&ctx)?;
+        let world = world.borrow();
+        let Some(mut parsed) = world.document_mut(self.handle.0) else {
+            return Ok(());
+        };
+        let replacement = parsed.dom.create_fragment();
+        if !value.0.is_empty() {
+            let text = parsed.dom.create_text(value.0);
+            parsed
+                .dom
+                .append(replacement, text)
+                .map_err(|err| throw_dom_error(&ctx, err))?;
+        }
+        parsed
+            .dom
+            .replace_all(self.handle.0, replacement)
+            .map_err(|err| throw_dom_error(&ctx, err))?;
+        Ok(())
+    }
+
+    // https://html.spec.whatwg.org/multipage/form-elements.html#dom-option-index
+    #[qjs(get)]
+    fn index(&self, ctx: Ctx<'_>) -> Result<i32> {
+        let world = world(&ctx)?;
+        let world = world.borrow();
+        let Some(parsed) = world.document(self.handle.0) else {
+            return Ok(0);
+        };
+        let Some(select) = parsed.dom.option_select_owner(self.handle.0) else {
+            return Ok(0);
+        };
+        for (index, option) in parsed.dom.select_options(select).into_iter().enumerate() {
+            if option == self.handle.0 {
+                return Ok(i32::try_from(index).unwrap_or(i32::MAX));
+            }
+        }
+        Ok(0)
+    }
+
+    // https://html.spec.whatwg.org/multipage/form-elements.html#dom-select-selectedindex
+    #[qjs(get, rename = "selectedIndex")]
+    fn selected_index(&self, ctx: Ctx<'_>) -> Result<i32> {
+        let world = world(&ctx)?;
+        let world = world.borrow();
+        Ok(world
+            .document(self.handle.0)
+            .map_or(-1, |parsed| parsed.dom.select_selected_index(self.handle.0)))
+    }
+
+    #[qjs(set, rename = "selectedIndex")]
+    fn set_selected_index(&self, ctx: Ctx<'_>, value: i32) -> Result<()> {
+        let world = world(&ctx)?;
+        let world = world.borrow();
+        let Some(mut parsed) = world.document_mut(self.handle.0) else {
+            return Ok(());
+        };
+        parsed.dom.set_select_selected_index(self.handle.0, value);
+        Ok(())
+    }
+
+    #[qjs(get)]
+    fn options<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
+        live_collection(
+            &ctx,
+            self.handle.0,
+            CollectionKind::ElementsByTag("option".to_owned()),
+            Some("HTMLCollection"),
+        )
+    }
+
+    // https://html.spec.whatwg.org/multipage/form-elements.html#dom-select-selectedoptions
+    #[qjs(get, rename = "selectedOptions")]
+    fn selected_options<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
+        let world = world(&ctx)?;
+        let world = world.borrow();
+        let Some(parsed) = world.document(self.handle.0) else {
+            return Ok(Value::new_null(ctx));
+        };
+        let handles: Vec<Handle> = parsed
+            .dom
+            .select_options(self.handle.0)
+            .into_iter()
+            .filter(|&option| parsed.dom.option_selected(option))
+            .map(Handle)
+            .collect();
+        live_collection(
+            &ctx,
+            self.handle.0,
+            CollectionKind::Static(handles),
+            Some("HTMLCollection"),
+        )
+    }
+
+    /// URL-reflected `src`: parsed against the document base and stored
+    /// serialized, like `href`; an absent attribute reflects as the empty
+    /// string (<https://html.spec.whatwg.org/multipage/urls-and-fetching.html#reflecting-content-attributes-in-idl-attributes>).
     #[qjs(get)]
     fn src(&self, ctx: Ctx<'_>) -> Result<String> {
-        attribute_value(&ctx, self.handle.0, "src")
+        let world_rc = world(&ctx)?;
+        let raw = world_rc
+            .borrow()
+            .document(self.handle.0)
+            .and_then(|parsed| parsed.dom.attribute(self.handle.0, "src"));
+        let Some(raw) = raw else {
+            return Ok(String::new());
+        };
+        let base = document_base_url_string(&ctx, self.handle.0);
+        Ok(url::Url::parse(&base)
+            .ok()
+            .and_then(|base| base.join(&raw).ok())
+            .map_or(raw, |url| url.to_string()))
     }
 
     #[qjs(set, rename = "src")]
@@ -1446,6 +2133,67 @@ impl JsNode {
             .dom
             .replace_all(target, replacement)
             .map_err(|err| throw_dom_error(&ctx, err))?;
+        drop(parsed);
+        drop(world);
+        schedule_mutation_delivery(&ctx)
+    }
+
+    // https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-element-insertadjacenthtml
+    #[qjs(rename = "insertAdjacentHTML")]
+    fn insert_adjacent_html(
+        &self,
+        ctx: Ctx<'_>,
+        position: WebIdlString,
+        text: WebIdlString,
+    ) -> Result<()> {
+        let position = position.0.to_ascii_lowercase();
+        if !matches!(
+            position.as_str(),
+            "beforebegin" | "afterbegin" | "beforeend" | "afterend"
+        ) {
+            return Err(throw_dom(&ctx, "SyntaxError", "invalid position"));
+        }
+        let context = with_node_kind(&ctx, self.handle.0, |kind| match kind {
+            Some(NodeKind::Element { name, .. }) => Some(html_fragment_context(name)),
+            _ => None,
+        })?
+        .ok_or_else(|| Exception::throw_type(&ctx, "insertAdjacentHTML requires an element"))?;
+        let snapshots = parse_html_fragment_snapshots(&ctx, &text.0, &context)?;
+        let world = world(&ctx)?;
+        let world = world.borrow();
+        let Some(mut parsed) = world.document_mut(self.handle.0) else {
+            return Err(Exception::throw_type(&ctx, "no document"));
+        };
+        let needs_parent = matches!(position.as_str(), "beforebegin" | "afterend");
+        if needs_parent && parsed.dom.parent(self.handle.0).is_none() {
+            return Err(throw_dom(
+                &ctx,
+                "NoModificationAllowedError",
+                "element has no parent",
+            ));
+        }
+        let fragment = materialize_children(&mut parsed.dom, &snapshots)
+            .map_err(|err| throw_dom_error(&ctx, err))?;
+        let result = if position == "beforebegin" {
+            parsed.dom.insert_before(self.handle.0, fragment)
+        } else if position == "afterbegin" {
+            match parsed.dom.first_child(self.handle.0) {
+                Some(first) => parsed.dom.insert_before(first, fragment),
+                None => parsed.dom.append(self.handle.0, fragment),
+            }
+        } else if position == "afterend" {
+            if let Some(next) = parsed.dom.next_sibling(self.handle.0) {
+                parsed.dom.insert_before(next, fragment)
+            } else {
+                let Some(parent) = parsed.dom.parent(self.handle.0) else {
+                    return Ok(());
+                };
+                parsed.dom.append(parent, fragment)
+            }
+        } else {
+            parsed.dom.append(self.handle.0, fragment)
+        };
+        result.map_err(|err| throw_dom_error(&ctx, err))?;
         drop(parsed);
         drop(world);
         schedule_mutation_delivery(&ctx)
@@ -2120,12 +2868,19 @@ impl JsNode {
     }
 
     // https://dom.spec.whatwg.org/#dom-processinginstruction-target
+    // https://html.spec.whatwg.org/multipage/forms.html#dom-form-target
+    // One shared wrapper carries both: a processing instruction answers with
+    // its target, any other element with its reflected `target` attribute.
     #[qjs(get)]
     fn target(&self, ctx: Ctx<'_>) -> Result<String> {
-        with_node_kind(&ctx, self.handle.0, |kind| match kind {
-            Some(NodeKind::ProcessingInstruction { target, .. }) => target.clone(),
-            _ => String::new(),
-        })
+        let processing_instruction = with_node_kind(&ctx, self.handle.0, |kind| match kind {
+            Some(NodeKind::ProcessingInstruction { target, .. }) => Some(target.clone()),
+            _ => None,
+        })?;
+        match processing_instruction {
+            Some(target) => Ok(target),
+            None => Ok(attribute_value(&ctx, self.handle.0, "target")?),
+        }
     }
 
     // https://dom.spec.whatwg.org/#dom-element-localname
@@ -2769,6 +3524,34 @@ impl JsNode {
             .dom
             .clone_node(self.handle.0, deep)
             .map_err(|err| throw_dom_error(&ctx, err))?;
+        // Run the form-control cloning steps for the source and clone in
+        // parallel tree order, so a deep clone carries each control's value and
+        // checkedness
+        // (<https://html.spec.whatwg.org/multipage/input.html#the-input-element:cloning-steps>).
+        let pairs: Vec<(dom::NodeId, dom::NodeId)> = {
+            let dom = &parsed.dom;
+            let mut from_stack = vec![self.handle.0];
+            let mut to_stack = vec![clone];
+            let mut pairs = Vec::new();
+            while let (Some(from), Some(to)) = (from_stack.pop(), to_stack.pop()) {
+                pairs.push((from, to));
+                let from_children: Vec<_> = dom
+                    .children(from)
+                    .map(Iterator::collect)
+                    .unwrap_or_default();
+                let to_children: Vec<_> = dom.children(to).map(Iterator::collect).unwrap_or_default();
+                for child in from_children.into_iter().rev() {
+                    from_stack.push(child);
+                }
+                for child in to_children.into_iter().rev() {
+                    to_stack.push(child);
+                }
+            }
+            pairs
+        };
+        for (from, to) in pairs {
+            parsed.dom.clone_form_state(from, to);
+        }
         drop(parsed);
         drop(world);
         wrap_node(&ctx, clone)
@@ -2939,9 +3722,30 @@ impl JsNode {
     }
 
     // https://dom.spec.whatwg.org/#dom-characterdata-length
+    // https://html.spec.whatwg.org/multipage/form-elements.html#dom-select-length
+    // One shared wrapper carries both: a character-data node answers with its
+    // data length, a `select` with its option count.
     #[qjs(get, rename = "length")]
     fn length(&self, ctx: Ctx<'_>) -> Result<usize> {
-        Ok(character_data(&ctx, self.handle.0)?.encode_utf16().count())
+        let character_data_node = with_node_kind(&ctx, self.handle.0, |kind| {
+            matches!(
+                kind,
+                Some(
+                    NodeKind::Text { .. }
+                        | NodeKind::Comment { .. }
+                        | NodeKind::CDataSection { .. }
+                        | NodeKind::ProcessingInstruction { .. }
+                )
+            )
+        })?;
+        if character_data_node {
+            return Ok(character_data(&ctx, self.handle.0)?.encode_utf16().count());
+        }
+        let world = world(&ctx)?;
+        let world = world.borrow();
+        Ok(world
+            .document(self.handle.0)
+            .map_or(0, |parsed| parsed.dom.select_options(self.handle.0).len()))
     }
 
     // https://dom.spec.whatwg.org/#dom-characterdata-substringdata
@@ -3020,5 +3824,37 @@ impl JsNode {
             .min(units.len());
         units.splice(offset..end, data.0.encode_utf16());
         set_character_data(&ctx, self.handle.0, String::from_utf16_lossy(&units))
+    }
+}
+
+/// The `SelectionMode` direction name for the stored code
+/// (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#selection-direction>).
+fn direction_name(direction: u8) -> &'static str {
+    match direction {
+        1 => "forward",
+        2 => "backward",
+        _ => "none",
+    }
+}
+
+/// Maps a `selectionDirection` string to its stored code; anything but the two
+/// known keywords is "none".
+fn direction_code(direction: &str) -> u8 {
+    match direction {
+        "forward" => 1,
+        "backward" => 2,
+        _ => 0,
+    }
+}
+
+/// The form `enctype` keyword for a raw attribute value: the three known
+/// keywords, case-insensitively, with the urlencoded default for a missing or
+/// invalid value
+/// (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#attr-fs-enctype>).
+fn encoding_keyword(raw: &str) -> &'static str {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "multipart/form-data" => "multipart/form-data",
+        "text/plain" => "text/plain",
+        _ => "application/x-www-form-urlencoded",
     }
 }

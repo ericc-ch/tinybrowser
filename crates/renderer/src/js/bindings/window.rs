@@ -9,7 +9,7 @@ use std::rc::Rc;
 
 use dom::NodeId;
 
-use rquickjs::{Class, Ctx, Object, Result, Value};
+use rquickjs::{Class, Ctx, Exception, Object, Result, Value};
 
 use crate::js::events::JsEvent;
 use crate::js::world::{EventTargetKey, World};
@@ -92,18 +92,39 @@ pub(crate) fn install_location<'js>(
     Ok(())
 }
 
+/// The window a `Window` method call targets, resolving a sloppy bare call.
+///
+/// A host function invoked as a bare global (`addEventListener(type, fn)`)
+/// receives `undefined` for `this`: host functions do not get the sloppy-mode
+/// global substitution a page function does. A missing receiver means the
+/// current realm's window; any other non-object receiver is an illegal
+/// invocation
+/// (<https://webidl.spec.whatwg.org/#es-operations>).
+fn window_world_for_call<'js>(
+    ctx: &Ctx<'js>,
+    this: &Value<'js>,
+) -> Result<Rc<RefCell<World>>> {
+    if this.is_undefined() || this.is_null() {
+        return world(ctx);
+    }
+    let Some(object) = this.as_object() else {
+        return Err(Exception::throw_type(ctx, "Illegal invocation"));
+    };
+    world_for_window_this(ctx, object)
+}
+
 #[allow(
     clippy::needless_pass_by_value,
     reason = "rquickjs Func ABI passes arguments by value"
 )]
 pub(crate) fn window_add_event_listener<'js>(
     ctx: Ctx<'js>,
-    this: This<Object<'js>>,
+    this: This<Value<'js>>,
     typ: Value<'js>,
     callback: Value<'js>,
     options: Opt<Value<'js>>,
 ) -> Result<()> {
-    let world = world_for_window_this(&ctx, &this.0)?;
+    let world = window_world_for_call(&ctx, &this.0)?;
     events::add_listener_in(
         &ctx,
         &world,
@@ -120,12 +141,12 @@ pub(crate) fn window_add_event_listener<'js>(
 )]
 pub(crate) fn window_remove_event_listener<'js>(
     ctx: Ctx<'js>,
-    this: This<Object<'js>>,
+    this: This<Value<'js>>,
     typ: Value<'js>,
     callback: Value<'js>,
     options: Opt<Value<'js>>,
 ) -> Result<()> {
-    let world = world_for_window_this(&ctx, &this.0)?;
+    let world = window_world_for_call(&ctx, &this.0)?;
     events::remove_listener_in(
         &ctx,
         &world,
@@ -142,10 +163,10 @@ pub(crate) fn window_remove_event_listener<'js>(
 )]
 pub(crate) fn window_dispatch_event<'js>(
     ctx: Ctx<'js>,
-    this: This<Object<'js>>,
+    this: This<Value<'js>>,
     event: Class<'js, JsEvent>,
 ) -> Result<bool> {
-    let world = world_for_window_this(&ctx, &this.0)?;
+    let world = window_world_for_call(&ctx, &this.0)?;
     events::dispatch_event_for_window(&ctx, &world, &event)
 }
 

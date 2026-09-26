@@ -141,10 +141,17 @@ impl fmt::Display for ScriptFailure {
 impl std::error::Error for ScriptFailure {}
 
 /// Observable HTML-job outcomes, in the order the renderer ran them.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RendererEvent {
     /// The document reached `readyState = "complete"` and dispatched `load`.
     Load,
+    /// A frame committed a navigation to this URL. The actor re-announces the
+    /// top-level document so a `CDP` client re-creates its execution contexts
+    /// (<https://chromedevtools.github.io/devtools-protocol/tot/Page/#event-frameNavigated>).
+    Navigated {
+        /// The final URL after redirects.
+        url: String,
+    },
     /// A host timer whose delay elapsed.
     Timer(u32),
     /// A `fetch` or navigation job finished with this HTTP status.
@@ -254,7 +261,8 @@ pub struct ScreenshotClip {
     pub height: f32,
 }
 
-/// One blocking GET the renderer asks the browser process to perform.
+/// One blocking request the renderer asks the browser process to perform
+/// (a GET for most dials; a navigation may carry a method and body).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DialRequest {
     /// Why the dial happens.
@@ -265,6 +273,19 @@ pub struct DialRequest {
     pub initiator: String,
     /// Read the response body.
     pub read_body: bool,
+    /// HTTP method; defaults to `GET` for dials that predate bodies.
+    #[serde(default = "default_dial_method")]
+    pub method: String,
+    /// Request body bytes, empty for `GET`.
+    #[serde(default)]
+    pub body: Vec<u8>,
+    /// `Content-Type` header for `body`, when there is one.
+    #[serde(default)]
+    pub content_type: Option<String>,
+}
+
+fn default_dial_method() -> String {
+    "GET".to_owned()
 }
 
 /// Result of one blocking GET.

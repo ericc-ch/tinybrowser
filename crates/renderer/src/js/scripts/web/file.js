@@ -225,9 +225,17 @@ globalThis.FileList = class FileList {
 Object.defineProperty(globalThis.FileList.prototype, Symbol.toStringTag, { value: 'FileList', writable: false, enumerable: false, configurable: true });
 globalThis.__tbCreateFileList = files => {
   const list = Object.create(globalThis.FileList.prototype);
+  const items = Array.from(files);
   Object.defineProperty(list, __tbFileListData, {
-    value: { files: Array.from(files) },
+    value: { files: items },
     writable: false, enumerable: false, configurable: false,
+  });
+  // The indexed getter (<https://webidl.spec.whatwg.org/#dfn-indexed-property-getter>):
+  // a FileList is fixed-size, so each index is an own property.
+  items.forEach((file, index) => {
+    Object.defineProperty(list, index, {
+      value: file, writable: false, enumerable: true, configurable: true,
+    });
   });
   return list;
 };
@@ -367,3 +375,52 @@ Object.defineProperty(globalThis.FileReader.prototype, Symbol.toStringTag, { val
 // (<https://webidl.spec.whatwg.org/#idl-USVString>). Values that cross into
 // Rust have to be valid UTF-8, and a URL parser sees replacement characters
 // anyway.
+
+// `DataTransfer` only as far as tests need it: `items.add(file)` collects
+// files and `files` exposes them as a FileList
+// (<https://html.spec.whatwg.org/multipage/dnd.html#datatransfer>).
+const __tbDataTransferFiles = Symbol('tb-data-transfer-files');
+const __tbDataTransferItems = Symbol('tb-data-transfer-items');
+const __tbDataTransferFileList = Symbol('tb-data-transfer-file-list');
+globalThis.DataTransfer = class DataTransfer {
+  constructor() {
+    Object.defineProperty(this, __tbDataTransferFiles, {
+      value: [], writable: false, enumerable: false, configurable: false,
+    });
+  }
+  get items() {
+    let items = this[__tbDataTransferItems];
+    if (items === undefined) {
+      const files = this[__tbDataTransferFiles];
+      items = {
+        add(file) { files.push(file); return null; },
+      };
+      Object.defineProperty(items, 'length', {
+        get() { return files.length; }, enumerable: true, configurable: true,
+      });
+      Object.defineProperty(this, __tbDataTransferItems, {
+        value: items, writable: false, enumerable: false, configurable: false,
+      });
+    }
+    return items;
+  }
+  get files() {
+    // `files` is a `[SameObject]` FileList over the DataTransfer's items
+    // (<https://html.spec.whatwg.org/multipage/dnd.html#dom-datatransfer-files>).
+    if (this[__tbDataTransferFileList] === undefined) {
+      Object.defineProperty(this, __tbDataTransferFileList, {
+        value: globalThis.__tbCreateFileList(this[__tbDataTransferFiles]),
+        writable: false, enumerable: false, configurable: false,
+      });
+    }
+    __tbBrand(this[__tbDataTransferFileList], __tbFileListData).files = this[__tbDataTransferFiles];
+    return this[__tbDataTransferFileList];
+  }
+};
+Object.defineProperty(globalThis.DataTransfer.prototype, Symbol.toStringTag, {
+  value: 'DataTransfer', writable: false, enumerable: false, configurable: true,
+});
+
+// A `type=file` input with no files still contributes an entry, an empty File
+// (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#constructing-form-data-set>).
+globalThis.__tbEmptyFile = () => new globalThis.File([], '');

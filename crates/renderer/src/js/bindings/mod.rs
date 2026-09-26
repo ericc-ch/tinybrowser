@@ -22,6 +22,7 @@ mod collections;
 mod document;
 mod exceptions;
 mod focus;
+mod forms;
 mod messaging;
 mod mutation;
 mod node;
@@ -60,7 +61,7 @@ use rquickjs::{
 
 use super::events::{self, JsEvent, JsEventTarget};
 
-use super::world::{EventTargetKey, Handle, World};
+use super::world::{Handle, World};
 
 thread_local! {
     /// JS world per live realm, keyed by its QuickJS context pointer.
@@ -122,10 +123,200 @@ pub(crate) fn throw_dom_error(ctx: &Ctx<'_>, err: DomError) -> rquickjs::Error {
             throw_dom(ctx, "HierarchyRequestError", &err.to_string())
         }
         DomError::NoParent => throw_dom(ctx, "NotFoundError", &err.to_string()),
+        DomError::InvalidState => throw_dom(ctx, "InvalidStateError", &err.to_string()),
         // Programming errors, not web-visible DOM exceptions.
         DomError::StaleNode | DomError::WrongNodeType => {
             Exception::throw_type(ctx, &err.to_string())
         }
+    }
+}
+
+/// Fires the realm window's `error` event for one uncaught exception, driving
+/// `window.onerror` with the spec's five arguments. `base_line` translates the
+/// inline stack's script-relative line into a document line (0 when unknown).
+///
+/// <https://html.spec.whatwg.org/multipage/webappapis.html#report-the-error>
+pub(super) fn report_exception_value<'js>(
+    ctx: &Ctx<'js>,
+    caught: Value<'js>,
+    base_line: u32,
+    filename: &str,
+) {
+    let Ok(report) = ctx.globals().get::<_, Value>("__tbReportException") else {
+        return;
+    };
+    let Some(report) = report.as_function() else {
+        return;
+    };
+    let Ok(meta) = Object::new(ctx.clone()) else {
+        return;
+    };
+    if meta.set("baseLine", base_line).is_err() || meta.set("filename", filename).is_err() {
+        return;
+    }
+    // A throwing `onerror` is the reporter's problem to swallow; report_exception
+    // already dropped the pending exception.
+    if report.call::<_, ()>((caught, meta)).is_err() {
+        // Clear the exception the reporter threw so it does not surface at the
+        // next `catch`.
+        let _ = ctx.catch();
+    }
+}
+
+/// A promise rejected without a handler, waiting for either the
+/// microtask-checkpoint `unhandledrejection` report or a late handler
+/// (<https://html.spec.whatwg.org/multipage/webappapis.html#unhandled-promise-rejections>).
+struct PendingRejection {
+    world: Weak<RefCell<World>>,
+    promise: Persistent<Value<'static>>,
+    reason: Persistent<Value<'static>>,
+    reported: bool,
+}
+
+/// A promise whose `unhandledrejection` already fired and which was handled
+/// afterwards, with the realm that owns it.
+struct LateHandled {
+    world: Weak<RefCell<World>>,
+    promise: Persistent<Value<'static>>,
+    reason: Persistent<Value<'static>>,
+}
+
+thread_local! {
+    static PENDING_REJECTIONS: RefCell<Vec<PendingRejection>> =
+        const { RefCell::new(Vec::new()) };
+    /// Promises whose `unhandledrejection` already fired and which were handled
+    /// afterwards; each fires one `rejectionhandled`.
+    static LATE_HANDLED: RefCell<Vec<LateHandled>> = const { RefCell::new(Vec::new()) };
+}
+
+/// `QuickJS`'s host rejection tracker, called when a promise is rejected with no
+/// handler (`handled` false) and again when a handler is attached to a still
+/// unhandled rejection (`handled` true). It only records state; the events fire
+/// from [`drain_rejections`] at the microtask checkpoint, because firing a DOM
+/// event from inside the promise machinery would reenter the engine.
+pub(super) fn note_rejection<'js>(
+    ctx: &Ctx<'js>,
+    promise: Value<'js>,
+    reason: Value<'js>,
+    handled: bool,
+) {
+    PENDING_REJECTIONS.with(|queue| {
+        let mut queue = queue.borrow_mut();
+        let index = queue.iter().position(|entry| {
+            entry
+                .promise
+                .clone()
+                .restore(ctx)
+                .is_ok_and(|stored| stored == promise)
+        });
+        if handled {
+            let Some(index) = index else {
+                return;
+            };
+            let entry = queue.remove(index);
+            if entry.reported {
+                LATE_HANDLED.with(|late| {
+                    late.borrow_mut().push(LateHandled {
+                        world: entry.world.clone(),
+                        promise: entry.promise,
+                        reason: entry.reason,
+                    });
+                });
+            }
+            return;
+        }
+        if index.is_some() {
+            return;
+        }
+        let Ok(world) = world(ctx) else {
+            return;
+        };
+        queue.push(PendingRejection {
+            world: Rc::downgrade(&world),
+            promise: Persistent::save(ctx, promise),
+            reason: Persistent::save(ctx, reason),
+            reported: false,
+        });
+    });
+}
+
+/// Fires the queued rejection events for `current`'s realm: one
+/// `unhandledrejection` per newly unhandled rejection, then any
+/// `rejectionhandled` a late handler queued. Called after a microtask
+/// checkpoint.
+pub(super) fn drain_rejections(ctx: &Ctx<'_>, current: &Rc<RefCell<World>>) {
+    let pending: Vec<PendingRejection> = PENDING_REJECTIONS.with(|queue| {
+        let mut queue = queue.borrow_mut();
+        let mut mine = Vec::new();
+        let mut rest = Vec::new();
+        for entry in queue.drain(..) {
+            let Some(world) = entry.world.upgrade() else {
+                // The realm is gone; its promise no longer matters.
+                continue;
+            };
+            if Rc::ptr_eq(&world, current) {
+                mine.push(entry);
+            } else {
+                rest.push(entry);
+            }
+        }
+        *queue = rest;
+        mine
+    });
+    for mut entry in pending {
+        if entry.reported {
+            PENDING_REJECTIONS.with(|queue| queue.borrow_mut().push(entry));
+            continue;
+        }
+        entry.reported = true;
+        let restored = (
+            entry.promise.clone().restore(ctx),
+            entry.reason.clone().restore(ctx),
+        );
+        // Re-queue before firing, so a handler attached inside the
+        // `unhandledrejection` event still produces `rejectionhandled`.
+        PENDING_REJECTIONS.with(|queue| queue.borrow_mut().push(entry));
+        if let (Ok(promise), Ok(reason)) = restored {
+            fire_rejection(ctx, false, promise, reason);
+        }
+    }
+    let late: Vec<LateHandled> = LATE_HANDLED.with(|queue| {
+        let mut queue = queue.borrow_mut();
+        let mut mine = Vec::new();
+        let mut rest = Vec::new();
+        for entry in queue.drain(..) {
+            if entry
+                .world
+                .upgrade()
+                .is_some_and(|world| Rc::ptr_eq(&world, current))
+            {
+                mine.push(entry);
+            } else {
+                rest.push(entry);
+            }
+        }
+        *queue = rest;
+        mine
+    });
+    for entry in late {
+        if let (Ok(promise), Ok(reason)) = (entry.promise.restore(ctx), entry.reason.restore(ctx)) {
+            fire_rejection(ctx, true, promise, reason);
+        }
+    }
+}
+
+/// Dispatches one `PromiseRejectionEvent` at the realm window through the
+/// `__tbPromiseRejection` shim.
+fn fire_rejection<'js>(ctx: &Ctx<'js>, handled: bool, promise: Value<'js>, reason: Value<'js>) {
+    let Ok(report) = ctx.globals().get::<_, Value>("__tbPromiseRejection") else {
+        return;
+    };
+    let Some(report) = report.as_function() else {
+        return;
+    };
+    if report.call::<_, Value>((handled, promise, reason)).is_err() {
+        // Clear the exception the handler threw.
+        let _ = ctx.catch();
     }
 }
 
@@ -220,6 +411,7 @@ pub(crate) fn install(ctx: &Ctx<'_>, world: &Rc<RefCell<World>>) -> Result<()> {
     Class::<JsTokenList>::define(&globals)?;
     Class::<JsAttr>::define(&globals)?;
     Class::<JsNamedNodeMap>::define(&globals)?;
+    forms::install(ctx, &globals)?;
     Class::<JsDomParser>::define(&globals)?;
     ctx.eval::<(), _>(parsing::INSTALL_DOMPARSER_CTOR_JS)?;
     Class::<JsXmlSerializer>::define(&globals)?;
@@ -347,42 +539,6 @@ pub(crate) fn check_host_token<'js>(ctx: &Ctx<'js>, token: &Value<'js>) -> Resul
         // Install predates the token: accept (yesterday's behavior).
         None => Ok(()),
     }
-}
-
-/// The `WebDriver` "element send keys" step: focus the element and append
-/// `text` to its value, firing a trusted `input` event.
-#[allow(
-    clippy::needless_pass_by_value,
-    reason = "rquickjs Func ABI passes arguments by value"
-)]
-pub(super) fn webdriver_send_keys<'js>(
-    ctx: Ctx<'js>,
-    element: Value<'js>,
-    text: String,
-) -> Result<()> {
-    let Some(node) = host_node_id(&ctx, &element) else {
-        return Err(Exception::throw_type(&ctx, "not an element"));
-    };
-    if is_focusable(&ctx, node)? {
-        focus_node(&ctx, node)?;
-    }
-    if !is_text_control(&ctx, node)? {
-        return Ok(());
-    }
-    let value = wrap_node(&ctx, node)?;
-    let Some(object) = value.as_object().cloned() else {
-        return Ok(());
-    };
-    let current = match object.get::<_, Value>("value")? {
-        value if value.is_undefined() || value.is_null() => String::new(),
-        value => value
-            .as_string()
-            .and_then(|string| string.to_string().ok())
-            .unwrap_or_default(),
-    };
-    object.set("value", format!("{current}{text}"))?;
-    events::fire_trusted(&ctx, EventTargetKey::Node(node), "input", true, false)?;
-    Ok(())
 }
 
 /// Resolves a `WebDriver` element id to its wrapper, or `null` when no node

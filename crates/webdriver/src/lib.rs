@@ -611,7 +611,7 @@ async fn element_send_keys(
     }
     let script = format!(
         "(function(){{const el=__tb_webdriver_element({remote});\
-         if(el===null)return false;__tb_webdriver_send_keys(el, {});return true;}})()",
+         if(el===null)return false;__tbWebDriverSendKeys(el, {});return true;}})()",
         json!(text)
     );
     match window.tab.execute_script(&script).await {

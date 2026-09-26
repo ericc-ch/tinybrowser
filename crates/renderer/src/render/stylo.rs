@@ -96,7 +96,7 @@ input[type=hidden] { display: none; }
    assign a definite width
    (https://source.chromium.org/chromium/chromium/src/+/main:third_party/blink/renderer/core/html/resources/html.css). */
 input[type=submit], input[type=reset], input[type=button] { width: auto; height: auto; background-color: #efefef; }
-textarea { white-space: pre-wrap; }
+textarea { width: 180px; height: 48px; padding: 2px 4px; border: 1px solid #767676; background-color: white; color: black; font-family: monospace; white-space: pre-wrap; }
 ";
 
 /// Styles every element of `dom` and returns our layout styles by node.

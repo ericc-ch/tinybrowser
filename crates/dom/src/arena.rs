@@ -1,7 +1,7 @@
 //! The arena: flat slot array, generational handles, tree mutations.
 
 use std::cell::Cell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::iter::FusedIterator;
 use std::marker::PhantomData;
@@ -18,31 +18,6 @@ use crate::node::{
 /// an id until the counter wraps (2^32 documents, accepted like generation
 /// wrap).
 static NEXT_DOCUMENT_ID: AtomicU32 = AtomicU32::new(0);
-
-const INPUT_TYPES: &[&str] = &[
-    "hidden",
-    "text",
-    "search",
-    "tel",
-    "url",
-    "email",
-    "password",
-    "date",
-    "month",
-    "week",
-    "time",
-    "datetime-local",
-    "number",
-    "range",
-    "color",
-    "checkbox",
-    "radio",
-    "file",
-    "submit",
-    "image",
-    "reset",
-    "button",
-];
 
 /// The document-compatibility mode a query runs under: what html5ever's
 /// tree builder reports and parsed pages carry.
@@ -123,6 +98,9 @@ pub enum DomError {
     /// An insert was requested beside a node with no parent to sit under.
     /// (Maps to `NotFoundError`.)
     NoParent,
+    /// The control's state forbids the operation, such as setting a non-empty
+    /// `value` on a `type=file` input. (Maps to `InvalidStateError`.)
+    InvalidState,
 }
 
 impl fmt::Display for DomError {
@@ -135,6 +113,7 @@ impl fmt::Display for DomError {
             }
             Self::WrongNodeType => f.write_str("operation not valid for this node kind"),
             Self::NoParent => f.write_str("target has no parent to insert beside"),
+            Self::InvalidState => f.write_str("operation invalid for the control's state"),
         }
     }
 }
@@ -181,9 +160,50 @@ pub struct Dom {
     shadow_roots: HashMap<NodeId, (NodeId, bool)>,
     /// Shadow root → host, the inverse of `shadow_roots`.
     shadow_hosts: HashMap<NodeId, NodeId>,
-    /// Dirty value state for text-like `input` elements. Absence means the
-    /// live value still follows the `value` content attribute.
-    input_values: HashMap<NodeId, String>,
+    /// Dirty value state for text-like controls (`input`, `textarea`).
+    ///
+    /// An entry means the dirty value flag is set and stores the raw value.
+    /// Absence means the live value still follows the control's default: the
+    /// `value` content attribute for `input`, the child text content for
+    /// `textarea` (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#concept-fe-dirty>).
+    pub(crate) input_values: HashMap<NodeId, String>,
+    /// The last normalized `type` state of an `input`, so an attribute change
+    /// can detect a state transition and run the type-change steps
+    /// (<https://html.spec.whatwg.org/multipage/input.html#the-input-element:type-change-state>).
+    pub(crate) input_types: HashMap<NodeId, String>,
+    /// The source-text start line of an inline `script` element, recorded by
+    /// the parser so reported exceptions carry a document line number
+    /// (<https://html.spec.whatwg.org/multipage/webappapis.html#script's-line-number>).
+    script_lines: HashMap<NodeId, u32>,
+    /// An `input`'s checkedness while the dirty checkedness flag is set;
+    /// absence means the `checked` content attribute decides
+    /// (<https://html.spec.whatwg.org/multipage/input.html#concept-input-checked-dirty-flag>).
+    pub(crate) checkedness: HashMap<NodeId, bool>,
+    /// An `input`'s indeterminateness, independent of its checkedness
+    /// (<https://html.spec.whatwg.org/multipage/input.html#concept-input-indeterminate>).
+    pub(crate) indeterminate: HashMap<NodeId, bool>,
+    /// The focused element per document, backing the `:focus` family
+    /// (<https://drafts.csswg.org/selectors-4/#the-focus-pseudo>).
+    active_element: HashMap<u32, NodeId>,
+    /// An `option`'s selectedness value
+    /// (<https://html.spec.whatwg.org/multipage/form-elements.html#concept-option-selectedness>).
+    pub(crate) option_selectedness: HashMap<NodeId, bool>,
+    /// Whether an `option`'s dirty selectedness flag is set; when clear, the
+    /// `selected` content attribute drives selectedness.
+    pub(crate) option_dirty_selected: HashSet<NodeId>,
+    /// Per-element scroll offsets `(left, top)`. The engine has no scrollable
+    /// overflow yet, but `scrollLeft`/`scrollTop` must round-trip a set value
+    /// (<https://drafts.csswg.org/cssom-view/#dom-element-scrollleft>).
+    scroll_offsets: HashMap<NodeId, (f64, f64)>,
+    /// Whether an `input`'s type supported a text selection the last time its
+    /// `type` changed, so a change back to a selectable type can reset the
+    /// cursor (<https://html.spec.whatwg.org/multipage/input.html#the-input-element>).
+    pub(crate) input_selectable: HashMap<NodeId, bool>,
+    /// Text selection for text-like controls: `(start, end, direction)` in
+    /// UTF-16 code units. Direction is 0 "none", 1 "forward", 2 "backward"
+    /// (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#concept-textarea/input-selection>).
+    /// Absence means the initial selection `(0, 0, "none")`.
+    pub(crate) selections: HashMap<NodeId, (u32, u32, u8)>,
     /// Recorded mutations, drained by the renderer's `MutationObserver`
     /// plumbing; empty and unrecorded unless someone observes the document.
     mutations: Vec<Mutation>,
@@ -282,6 +302,16 @@ impl Dom {
             shadow_roots: HashMap::new(),
             shadow_hosts: HashMap::new(),
             input_values: HashMap::new(),
+            input_types: HashMap::new(),
+            selections: HashMap::new(),
+            script_lines: HashMap::new(),
+            checkedness: HashMap::new(),
+            indeterminate: HashMap::new(),
+            active_element: HashMap::new(),
+            option_selectedness: HashMap::new(),
+            option_dirty_selected: HashSet::new(),
+            scroll_offsets: HashMap::new(),
+            input_selectable: HashMap::new(),
             mutations: Vec::new(),
             record_mutations: false,
             recording_suppressed: false,
@@ -791,6 +821,12 @@ impl Dom {
         let copy = self.alloc(self.kind(id).ok_or(DomError::StaleNode)?.clone());
         let mut pending = vec![(id, copy)];
         while let Some((source, target)) = pending.pop() {
+            // Cloning steps for text-like controls propagate the raw value and
+            // dirty value flag from source to copy
+            // (<https://html.spec.whatwg.org/multipage/form-elements.html#the-textarea-element:concept-node-clone-ext>).
+            if let Some(value) = self.input_values.get(&source).cloned() {
+                self.input_values.insert(target, value);
+            }
             // https://html.spec.whatwg.org/multipage/scripting.html#the-template-element:cloning-steps
             if let Some(contents) = self.template_contents(source) {
                 let cloned_contents = self.create_fragment();
@@ -1441,77 +1477,101 @@ impl Dom {
             .map(|attribute| attribute.value.clone())
     }
 
-    /// The live value of an HTML `input` element.
-    ///
-    /// Before the dirty value flag is set, the value follows the content
-    /// attribute; setting the IDL value stores an independent value
-    /// (<https://html.spec.whatwg.org/multipage/input.html#dom-input-value>).
-    #[must_use]
-    pub fn input_value(&self, id: NodeId) -> Option<String> {
-        let (name, _) = self.element(id)?;
-        if name.ns != html_namespace() || name.local.as_ref() != "input" {
-            return None;
-        }
-        let value = self
-            .input_values
-            .get(&id)
-            .cloned()
-            .or_else(|| self.attribute(id, "value"))
-            .unwrap_or_default();
-        Some(self.sanitize_input_value(id, value))
-    }
-
-    /// Sets an HTML `input` element's live value and its dirty value flag.
-    ///
-    /// <https://html.spec.whatwg.org/multipage/input.html#dom-input-value>
-    ///
-    /// # Errors
-    ///
-    /// Returns [`DomError::WrongNodeType`] when `id` is not an HTML `input`.
-    pub fn set_input_value(&mut self, id: NodeId, value: String) -> Result<(), DomError> {
-        let (name, _) = self.element(id).ok_or(DomError::WrongNodeType)?;
-        if name.ns != html_namespace() || name.local.as_ref() != "input" {
-            return Err(DomError::WrongNodeType);
-        }
-        let value = self.sanitize_input_value(id, value);
-        self.input_values.insert(id, value);
-        Ok(())
-    }
-
-    /// The normalized type state of an HTML `input` element.
-    #[must_use]
-    pub fn input_type(&self, id: NodeId) -> Option<String> {
-        self.input_value_element(id)?;
-        let value = self
-            .attribute(id, "type")
-            .unwrap_or_else(|| "text".into())
-            .to_ascii_lowercase();
-        Some(if INPUT_TYPES.contains(&value.as_str()) {
-            value
-        } else {
-            "text".into()
+    /// Whether `id` is an HTML element with local name `local` (exact match).
+    pub(crate) fn html_local_is(&self, id: NodeId, local: &str) -> bool {
+        self.element(id).is_some_and(|(name, _)| {
+            name.ns == html_namespace() && name.local.as_ref() == local
         })
     }
 
-    fn input_value_element(&self, id: NodeId) -> Option<()> {
-        let (name, _) = self.element(id)?;
-        (name.ns == html_namespace() && name.local.as_ref() == "input").then_some(())
+    /// The [child text content](https://dom.spec.whatwg.org/#concept-child-text-content)
+    /// of node `id`: the concatenated data of its `Text` children.
+    ///
+    /// `CDATASection` is a `Text` node ([DOM](https://dom.spec.whatwg.org/#interface-cdatasection)),
+    /// so its data is included. A stale handle has no children, so this
+    /// yields the empty string.
+    #[must_use]
+    pub fn child_text_content(&self, id: NodeId) -> String {
+        let mut text = String::new();
+        if let Some(children) = self.children(id) {
+            for child in children {
+                if let Some(NodeKind::Text { data } | NodeKind::CDataSection { data }) =
+                    self.kind(child)
+                {
+                    text.push_str(data);
+                }
+            }
+        }
+        text
     }
 
-    /// Applies the value sanitization algorithm for the input states needed
-    /// by text entry. Other states retain their string until their dedicated
-    /// state algorithms are implemented.
-    /// <https://html.spec.whatwg.org/multipage/input.html#value-sanitization-algorithm>
-    fn sanitize_input_value(&self, id: NodeId, value: String) -> String {
-        let typ = self.input_type(id).unwrap_or_else(|| "text".into());
-        match typ.as_str() {
-            "text" | "search" | "tel" | "password" => value.replace(['\r', '\n'], ""),
-            "url" | "email" => value
-                .replace(['\r', '\n'], "")
-                .trim_matches(|character: char| character.is_ascii_whitespace())
-                .to_owned(),
-            _ => value,
+    /// Records the source-text start line of the inline `script` element `id`,
+    /// as the parser counted it (1-based)
+    /// (<https://html.spec.whatwg.org/multipage/webappapis.html#script's-line-number>).
+    pub fn set_script_line(&mut self, id: NodeId, line: u32) {
+        self.script_lines.insert(id, line);
+    }
+
+    /// The start line recorded for the inline `script` element `id`.
+    #[must_use]
+    pub fn script_line(&self, id: NodeId) -> Option<u32> {
+        self.script_lines.get(&id).copied()
+    }
+
+    /// The scrolled offset `(left, top)` of `id`; `(0, 0)` when never set.
+    #[must_use]
+    pub fn scroll_offset(&self, id: NodeId) -> (f64, f64) {
+        self.scroll_offsets.get(&id).copied().unwrap_or((0.0, 0.0))
+    }
+
+    /// Stores `id`'s scroll offset.
+    pub fn set_scroll_offset(&mut self, id: NodeId, left: f64, top: f64) {
+        self.scroll_offsets.insert(id, (left, top));
+    }
+
+    /// Records the focused element for a document, backing `:focus`.
+    pub fn set_active_element(&mut self, document: u32, node: Option<NodeId>) {
+        match node {
+            Some(node) => {
+                self.active_element.insert(document, node);
+            }
+            None => {
+                self.active_element.remove(&document);
+            }
         }
+    }
+
+    /// The focused element for a document, if any.
+    #[must_use]
+    pub fn active_element(&self, document: u32) -> Option<NodeId> {
+        self.active_element.get(&document).copied()
+    }
+
+    /// The text content of `id`: every descendant text node's data.
+    #[must_use]
+    pub fn text_content(&self, id: NodeId) -> String {
+        let mut text = String::new();
+        for node in self.descendants(id) {
+            if let Some(NodeKind::Text { data } | NodeKind::CDataSection { data }) = self.kind(node)
+            {
+                text.push_str(data);
+            }
+        }
+        text
+    }
+
+    /// An attribute in no namespace with the given local name, as HTML
+    /// `getAttribute` matches
+    /// (<https://dom.spec.whatwg.org/#concept-element-attributes-get-by-name>).
+    #[must_use]
+    pub fn no_namespace_attribute(&self, id: NodeId, local: &str) -> Option<String> {
+        let (_, attributes) = self.element(id)?;
+        attributes
+            .iter()
+            .find(|attribute| {
+                attribute.name.ns.as_ref().is_empty() && attribute.name.local.as_ref() == local
+            })
+            .map(|attribute| attribute.value.clone())
     }
 
     /// [Element.hasAttribute](https://dom.spec.whatwg.org/#dom-element-hasattribute):
@@ -1577,6 +1637,20 @@ impl Dom {
             namespace: removed.name.ns.to_string(),
             old_value: Some(removed.value),
         });
+        if local.eq_ignore_ascii_case("selected") {
+            self.refresh_option_selectedness(id);
+            if let Some(select) = self.nearest_select_ancestor(id) {
+                self.apply_default_selectedness(select);
+            }
+        }
+        if local.eq_ignore_ascii_case("type") {
+            self.refresh_input_type(id)?;
+        }
+        if self.html_local_is(id, "select")
+            && (local.eq_ignore_ascii_case("multiple") || local.eq_ignore_ascii_case("size"))
+        {
+            self.apply_default_selectedness(id);
+        }
         Ok(())
     }
 
@@ -1787,6 +1861,23 @@ impl Dom {
             namespace: recorded_namespace,
             old_value,
         });
+        if local.eq_ignore_ascii_case("selected") {
+            self.refresh_option_selectedness(id);
+            if let Some(select) = self.nearest_select_ancestor(id) {
+                self.apply_default_selectedness(select);
+            }
+        }
+        if local.eq_ignore_ascii_case("type") {
+            self.refresh_input_type(id)?;
+        }
+        if local.eq_ignore_ascii_case("name") || local.eq_ignore_ascii_case("checked") {
+            self.refresh_radio_group(id);
+        }
+        if self.html_local_is(id, "select")
+            && (local.eq_ignore_ascii_case("multiple") || local.eq_ignore_ascii_case("size"))
+        {
+            self.apply_default_selectedness(id);
+        }
         Ok(())
     }
 
@@ -1814,6 +1905,8 @@ impl Dom {
     /// - [`DomError::StaleNode`] if `id` is stale.
     /// - [`DomError::WrongNodeType`] if `id` is not a text node.
     pub fn append_text(&mut self, id: NodeId, extra: &str) -> Result<(), DomError> {
+        let parent = self.parent(id);
+        let value_before = parent.and_then(|parent| self.textarea_value_before_change(parent));
         let recording = self.record_mutations && !self.recording_suppressed;
         let old_value = {
             let node = self.node_mut(id).ok_or(DomError::StaleNode)?;
@@ -1829,6 +1922,9 @@ impl Dom {
                 target: id,
                 old_value,
             });
+        }
+        if let Some(parent) = parent {
+            self.reset_textarea_selection_if_changed(parent, value_before);
         }
         Ok(())
     }
@@ -1917,6 +2013,15 @@ impl Dom {
         let mut pending = vec![id];
         while let Some(current) = pending.pop() {
             self.input_values.remove(&current);
+            self.input_types.remove(&current);
+            self.selections.remove(&current);
+            self.script_lines.remove(&current);
+            self.checkedness.remove(&current);
+            self.indeterminate.remove(&current);
+            self.option_selectedness.remove(&current);
+            self.option_dirty_selected.remove(&current);
+            self.scroll_offsets.remove(&current);
+            self.input_selectable.remove(&current);
             if let Some(contents) = self.template_contents.remove(&current) {
                 pending.push(contents);
             }
@@ -1952,8 +2057,6 @@ impl Dom {
         self.record_snapshot(tracked);
         Ok(())
     }
-
-    // ── internals ────────────────────────────────────────────────────────
 
     fn live_slot(&self, id: NodeId) -> Option<&Slot> {
         if id.document != self.document.document {
@@ -2086,7 +2189,12 @@ impl Dom {
     /// whole operation is done. Recording here would both misread a node the
     /// caller already detached and pin the event order relative to a removal.
     fn place_node(&mut self, parent: NodeId, node: NodeId, before: Option<NodeId>) {
+        let value_before = self.textarea_value_before_change(parent);
         self.unlink_from_current_parent(node);
+        // A checked radio whose form owner changes on insertion unchecks its
+        // new group
+        // (<https://html.spec.whatwg.org/multipage/input.html#radio-button-group>).
+        let radio_owner_before = self.checked_radio_form_owner(node);
         // Sibling references for the mutation record, read from the run the
         // node is about to join. Computed only while recording: no observer
         // exists on the parse path, so the lookups stay off it.
@@ -2107,6 +2215,16 @@ impl Dom {
             previous,
             next,
         });
+        self.reset_textarea_selection_if_changed(parent, value_before);
+        if radio_owner_before != self.checked_radio_form_owner(node) {
+            self.refresh_radio_group(node);
+        }
+        // An option joining a select may become the default selection.
+        if (self.html_local_is(node, "option") || self.html_local_is(node, "optgroup"))
+            && let Some(select) = self.nearest_select_ancestor(node)
+        {
+            self.apply_default_selectedness(select);
+        }
     }
 
     /// Links the unparented `node` under `parent` immediately before
@@ -2191,8 +2309,20 @@ impl Dom {
         for &id in &moved {
             self.unlink(id);
         }
+        // Insert each node and run its group rule immediately, so a radio or
+        // option sees the run in insertion order: radios moved out of a
+        // fragment into a form join a group, and options joining a select may
+        // become the default selection.
         for &id in &moved {
             self.insert_linked(parent, id, before);
+            if self.checked_radio_form_owner(id).is_some() {
+                self.refresh_radio_group(id);
+            }
+            if (self.html_local_is(id, "option") || self.html_local_is(id, "optgroup"))
+                && let Some(select) = self.nearest_select_ancestor(id)
+            {
+                self.apply_default_selectedness(select);
+            }
         }
         self.record(Mutation::ChildList {
             target: parent,
@@ -2289,6 +2419,12 @@ impl Dom {
         }) else {
             return;
         };
+        let select = if self.html_local_is(id, "option") || self.html_local_is(id, "optgroup") {
+            self.nearest_select_ancestor(id)
+        } else {
+            None
+        };
+        let value_before = self.textarea_value_before_change(parent);
         if let Some(previous) = previous {
             self.node_mut(previous)
                 .expect("previous sibling has no slot")
@@ -2321,6 +2457,10 @@ impl Dom {
         detached.parent = None;
         detached.previous_sibling = None;
         detached.next_sibling = None;
+        self.reset_textarea_selection_if_changed(parent, value_before);
+        if let Some(select) = select {
+            self.apply_default_selectedness(select);
+        }
     }
 
     fn set_data(
@@ -2329,6 +2469,8 @@ impl Dom {
         extract: impl Fn(&mut NodeKind) -> Option<&mut String>,
         data: String,
     ) -> Result<(), DomError> {
+        let parent = self.parent(id);
+        let value_before = parent.and_then(|parent| self.textarea_value_before_change(parent));
         let node = self.node_mut(id).ok_or(DomError::StaleNode)?;
         match extract(&mut node.kind) {
             Some(field) => {
@@ -2337,6 +2479,9 @@ impl Dom {
                     target: id,
                     old_value,
                 });
+                if let Some(parent) = parent {
+                    self.reset_textarea_selection_if_changed(parent, value_before);
+                }
                 Ok(())
             }
             None => Err(DomError::WrongNodeType),
@@ -2384,6 +2529,7 @@ impl Dom {
         });
         NodeId::new(self.document.document, slot, 0)
     }
+
 }
 
 /// Adds each attribute whose qualified name is not already present; the

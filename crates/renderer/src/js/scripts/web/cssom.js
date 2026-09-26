@@ -56,13 +56,72 @@
     }),
     writable: true, configurable: true,
   });
+  // A computed style always resolves: an unset property reports its initial
+  // value, not the empty string
+  // (<https://drafts.csswg.org/cssom/#resolved-values>). The engine has no
+  // full cascade in script yet, so this covers the initial values clients
+  // read (visibility for actionability, boxes for geometry).
+  const __tbInitialValues = {
+    visibility: 'visible',
+    display: 'inline',
+    cursor: 'auto',
+    transform: 'none',
+    'transform-origin': '50% 50%',
+    'border-left-width': '0px',
+    'border-top-width': '0px',
+    'border-right-width': '0px',
+    'border-bottom-width': '0px',
+    'border-left-style': 'none',
+    'border-top-style': 'none',
+    'border-right-style': 'none',
+    'border-bottom-style': 'none',
+    'padding-left': '0px',
+    'padding-top': '0px',
+    'padding-right': '0px',
+    'padding-bottom': '0px',
+    'margin-left': '0px',
+    'margin-top': '0px',
+    'margin-right': '0px',
+    'margin-bottom': '0px',
+    color: 'rgb(0, 0, 0)',
+    'background-color': 'rgba(0, 0, 0, 0)',
+    'font-size': '16px',
+    'font-weight': '400',
+    'font-family': 'serif',
+    'line-height': 'normal',
+    width: 'auto',
+    height: 'auto',
+    'box-sizing': 'content-box',
+    position: 'static',
+    overflow: 'visible',
+    opacity: '1',
+    'z-index': 'auto',
+    'text-align': 'start',
+    'white-space': 'normal',
+  };
   Object.defineProperty(globalThis, 'getComputedStyle', {
     value: function(element) {
-      const style = element?.style ?? {};
-      if (typeof style.getPropertyValue !== 'function') {
-        style.getPropertyValue = function(name) { return this[name] ?? ''; };
+      const inline = element?.style ?? {};
+      if (typeof inline.getPropertyValue !== 'function') {
+        inline.getPropertyValue = function(name) { return this[name] ?? ''; };
       }
-      return style;
+      return new Proxy(inline, {
+        get(target, property, receiver) {
+          if (typeof property !== 'string') return Reflect.get(target, property, receiver);
+          if (property === 'getPropertyValue') {
+            return name => {
+              const value = target.getPropertyValue(name);
+              if (value !== '') return value;
+              return __tbInitialValues[String(name).toLowerCase()] ?? '';
+            };
+          }
+          const value = Reflect.get(target, property, receiver);
+          if (value !== undefined && value !== null && value !== '') return value;
+          const kebab = property.replace(/[A-Z]/g, letter => '-' + letter.toLowerCase());
+          if (kebab in __tbInitialValues) return __tbInitialValues[kebab];
+          return value;
+        },
+      });
     },
     writable: true, configurable: true,
   });

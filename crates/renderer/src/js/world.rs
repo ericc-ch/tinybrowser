@@ -128,11 +128,40 @@ impl RealmRegistry {
 
 /// A child frame navigation queued from inside a script, applied after it
 /// stops: the `iframe`'s `src` changed (or the element just connected).
+/// Where a queued navigation lands.
+pub(crate) enum NavigationTarget {
+    /// The child frame whose container is this node.
+    Container(NodeId),
+    /// The frame that queued the navigation; used by form submission to the
+    /// form's own frame (`_self`, `_top`, `_parent`).
+    SelfFrame,
+}
+
 pub(crate) struct FrameNavigation {
-    /// The `iframe` container whose frame should navigate.
-    pub(crate) container: NodeId,
-    /// The spec to navigate to, resolved against the parent document.
+    /// The frame to navigate.
+    pub(crate) target: NavigationTarget,
+    /// The spec to navigate to, absolute or resolvable against the queuing
+    /// document.
     pub(crate) spec: String,
+    /// HTTP method; `GET` for every navigation but a form submission.
+    pub(crate) method: String,
+    /// Request body, empty for a GET.
+    pub(crate) body: Vec<u8>,
+    /// `Content-Type` for `body`, when there is one.
+    pub(crate) content_type: Option<String>,
+}
+
+impl FrameNavigation {
+    /// A GET navigation, the shape of every navigation but a form submission.
+    pub(crate) fn get(target: NavigationTarget, spec: String) -> Self {
+        Self {
+            target,
+            spec,
+            method: "GET".to_owned(),
+            body: Vec::new(),
+            content_type: None,
+        }
+    }
 }
 
 pub(crate) enum DocumentStreamCommand {
@@ -290,6 +319,14 @@ pub(crate) struct World {
     frame_navigations: Vec<FrameNavigation>,
     /// Connected `<img>` elements whose `src` changed inside script.
     image_updates: Vec<NodeId>,
+    /// Files a script set on an `input[type=file]` through `input.files`, so
+    /// the form entry list reads them without depending on JS wrapper identity
+    /// (<https://html.spec.whatwg.org/multipage/input.html#dom-input-files>).
+    input_files: HashMap<NodeId, Vec<Persistent<Value<'static>>>>,
+    /// Controls whose selection changed and owe a queued `select` event
+    /// (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#set-the-selection-range>).
+    /// Interior mutability because a selection setter only holds `&World`.
+    pending_selects: RefCell<Vec<NodeId>>,
     document_stream: Vec<DocumentStreamCommand>,
     object_urls: HashMap<String, ObjectUrlEntry>,
     budget: Rc<RefCell<ResourceBudget>>,
@@ -418,6 +455,8 @@ impl World {
             pending_html_writes: Vec::new(),
             frame_navigations: Vec::new(),
             image_updates: Vec::new(),
+            input_files: HashMap::new(),
+            pending_selects: RefCell::new(Vec::new()),
             document_stream: Vec::new(),
             object_urls: HashMap::new(),
             budget: runtime.registry.borrow().budget(),
@@ -1002,6 +1041,30 @@ impl World {
         std::mem::take(&mut self.image_updates)
     }
 
+    /// Records that `node`'s selection changed, so a `select` event is due once
+    /// the current task finishes. One event per change: a repeated identical
+    /// change does not queue a second time.
+    pub(crate) fn queue_select(&self, node: NodeId) {
+        let mut pending = self.pending_selects.borrow_mut();
+        if !pending.contains(&node) {
+            pending.push(node);
+        }
+    }
+
+    pub(crate) fn take_pending_selects(&mut self) -> Vec<NodeId> {
+        std::mem::take(&mut *self.pending_selects.borrow_mut())
+    }
+
+    /// Records the file list a script assigned to a `type=file` input.
+    pub(crate) fn set_input_files(&mut self, id: NodeId, files: Vec<Persistent<Value<'static>>>) {
+        self.input_files.insert(id, files);
+    }
+
+    /// The file list a script assigned to a `type=file` input, if any.
+    pub(crate) fn input_files(&self, id: NodeId) -> Option<&[Persistent<Value<'static>>]> {
+        self.input_files.get(&id).map(Vec::as_slice)
+    }
+
     /// Starts a fetch for `url`. If the current request is still available,
     /// keep its pixels and `currentSrc` until this request commits
     /// (<https://html.spec.whatwg.org/multipage/images.html#updating-the-image-data>).
@@ -1368,6 +1431,11 @@ impl World {
             None => {
                 self.active_elements.remove(&document);
             }
+        }
+        // Mirror into the document so `:focus` and `:focus-within` match
+        // (<https://drafts.csswg.org/selectors-4/#the-focus-pseudo>).
+        if let Some(parsed) = self.runtime.documents.borrow_mut().get_mut(document) {
+            parsed.dom.set_active_element(document, node);
         }
     }
 

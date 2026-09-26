@@ -137,12 +137,12 @@ impl Assignment {
     /// Delivers one event to every subscriber; returns whether a subscriber
     /// was too slow to accept it (the caller treats saturation as a protocol
     /// violation).
-    pub(crate) fn publish_event(&self, frame: FrameId, event: RendererEvent) -> bool {
+    pub(crate) fn publish_event(&self, frame: FrameId, event: &RendererEvent) -> bool {
         let mut saturated = false;
         self.subscribers
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .retain(|subscriber| match subscriber.try_send((frame, event)) {
+            .retain(|subscriber| match subscriber.try_send((frame, event.clone())) {
                 Ok(()) => true,
                 Err(mpsc::error::TrySendError::Closed(_)) => false,
                 Err(mpsc::error::TrySendError::Full(_)) => {

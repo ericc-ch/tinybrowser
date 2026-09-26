@@ -190,14 +190,14 @@ impl Document {
             }
             if let Ok(url) = self.resolve_dial_url(&fetch.url) {
                 let initiator = self.url.clone();
-                self.queued_dials.push(QueuedDial {
-                    context: DialContext::JsFetch {
+                self.queued_dials.push(QueuedDial::get(
+                    DialContext::JsFetch {
                         id: fetch.js_id,
                         epoch: self.js_epoch,
                     },
                     url,
                     initiator,
-                });
+                ));
             } else {
                 self.record_event(RendererEvent::FetchFailed);
                 self.settle_js_fetch(fetch.js_id, false, 0, "");
@@ -206,6 +206,23 @@ impl Document {
         let images = self.world.borrow_mut().take_image_updates();
         for element in images {
             self.queue_image(element, true);
+        }
+        self.fire_pending_selects();
+    }
+
+    /// Fires the `select` events that selection changes queued, one task after
+    /// the change. A listener that changes the selection again queues another,
+    /// so drain in a bounded loop
+    /// (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#set-the-selection-range>).
+    fn fire_pending_selects(&mut self) {
+        for _ in 0..64 {
+            let nodes = self.world.borrow_mut().take_pending_selects();
+            if nodes.is_empty() {
+                return;
+            }
+            for node in nodes {
+                self.fire_js(|js| js.fire_select(node));
+            }
         }
     }
 

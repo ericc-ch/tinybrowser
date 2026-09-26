@@ -524,6 +524,14 @@ impl Conn {
 
     /// Emits the commit event set: frame commit plus the new document's
     /// execution contexts (default and every known isolated world).
+    /// Mints a fresh loader id for a navigation
+    /// (<https://chromedevtools.github.io/devtools-protocol/tot/Page/#type-Frame>).
+    fn next_loader_id(&mut self) -> String {
+        let id = format!("{}", self.next_loader);
+        self.next_loader = self.next_loader.saturating_add(1);
+        id
+    }
+
     async fn push_navigated(
         &mut self,
         messages: &mut Vec<Value>,
@@ -532,7 +540,13 @@ impl Conn {
     ) {
         let tab_id = tab.id();
         let frame_id = tab_id.to_string();
-        let loader_id = self.loader_ids.get(&tab_id).cloned().unwrap_or_default();
+        // A browser-initiated `Page.navigate` stored its loader id; a
+        // renderer-initiated navigation has none and mints a fresh one
+        // (<https://chromedevtools.github.io/devtools-protocol/tot/Page/#type-Frame>).
+        let loader_id = match self.loader_ids.remove(&tab_id) {
+            Some(id) => id,
+            None => self.next_loader_id(),
+        };
         // Final URL after redirects, not the requested one.
         let url = tab.document_url().await.unwrap_or_default();
         let mut navigated = json!({
@@ -1060,14 +1074,15 @@ impl Conn {
             .get("url")
             .and_then(Value::as_str)
             .ok_or_else(|| DispatchError::Failed("missing url".into()))?;
-        let loader_id = format!("{}", self.next_loader);
-        self.next_loader = self.next_loader.saturating_add(1);
-        self.loader_ids.insert(tab.id(), loader_id.clone());
         let frame_id = tab.id().to_string();
+        let loader_id = self.next_loader_id();
         if url.is_empty() || url == "about:blank" {
             open_url(tab, url).await?;
             return Ok(json!({"frameId": frame_id, "loaderId": loader_id}));
         }
+        // Store the id so the `frameNavigated` event reports the same loader id
+        // (<https://chromedevtools.github.io/devtools-protocol/tot/Page/#event-frameNavigated>).
+        self.loader_ids.insert(tab.id(), loader_id.clone());
         let events = tab
             .subscribe()
             .map_err(|error| DispatchError::Failed(error.to_string()))?;
@@ -1181,14 +1196,31 @@ impl Conn {
         let ready = format!(
             "Boolean(globalThis.__tb_async_handles && globalThis.__tb_async_handles[{id}] && globalThis.__tb_async_handles[{id}].done)"
         );
-        match tab
-            .run_until_js_true_in(RunUntilJsTrueInOptions {
-                frame,
-                source: &ready,
-                timeout,
-            })
-            .await
-        {
+        // A navigation replaces the main frame's realm, so an awaited slot in
+        // the old realm never settles. Stop waiting as soon as the navigation
+        // commits instead of polling until the timeout, which would also hold
+        // back the tab events the socket loop is waiting to deliver
+        // (<https://chromedevtools.github.io/devtools-protocol/tot/Runtime/#method-callFunctionOn>).
+        let mut events = tab.subscribe().ok();
+        let run = tab.run_until_js_true_in(RunUntilJsTrueInOptions {
+            frame,
+            source: &ready,
+            timeout,
+        });
+        tokio::pin!(run);
+        let settled = loop {
+            tokio::select! {
+                result = &mut run => break result,
+                event = next_tab_event(&mut events) => match event {
+                    Some(TabEvent::Navigated) if frame == FrameId::MAIN => {
+                        return exception_text_reply("execution context was destroyed");
+                    }
+                    Some(_) => {}
+                    None => events = None,
+                },
+            }
+        };
+        match settled {
             Ok(true) => {}
             Ok(false) => {
                 // Drop the slot so a late settle cannot pile up results; the
@@ -1408,6 +1440,15 @@ impl Conn {
             }
         }
         self.subscriptions = retained;
+    }
+}
+
+/// Receives the next tab event, or pends forever once the subscription is
+/// dropped so a closed channel does not spin.
+async fn next_tab_event(receiver: &mut Option<mpsc::Receiver<TabEvent>>) -> Option<TabEvent> {
+    match receiver {
+        Some(receiver) => receiver.recv().await,
+        None => std::future::pending().await,
     }
 }
 

@@ -120,6 +120,9 @@ pub(in crate::document) fn request(dial: &QueuedDial) -> DialRequest {
         url: dial.url.to_string(),
         initiator: dial.initiator.to_string(),
         read_body: true,
+        method: dial.method.clone(),
+        body: dial.body.clone(),
+        content_type: dial.content_type.clone(),
     }
 }
 

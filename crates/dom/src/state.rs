@@ -19,7 +19,7 @@
 
 use crate::arena::Dom;
 use crate::id::NodeId;
-use crate::node::{NodeKind, QualName, html_namespace, svg_namespace, xml_namespace};
+use crate::node::{QualName, html_namespace, svg_namespace, xml_namespace};
 
 // ── shared lookups ──────────────────────────────────────────────────────────
 
@@ -377,15 +377,9 @@ pub fn is_placeholder_shown(dom: &Dom, id: NodeId) -> bool {
         return dom.input_value(id).is_none_or(|value| value.is_empty());
     }
     if local_is(dom, id, &["textarea"]) {
-        let mut empty = true;
-        if let Some(kids) = dom.children(id) {
-            for kid in kids {
-                if let Some(NodeKind::Text { data }) = dom.kind(kid) {
-                    empty &= data.is_empty();
-                }
-            }
-        }
-        return empty;
+        return dom
+            .textarea_value(id)
+            .is_none_or(|value| value.is_empty());
     }
     false
 }
@@ -403,7 +397,19 @@ pub fn is_default(dom: &Dom, id: NodeId) -> bool {
 /// groups are not represented (no form-owner association).
 #[must_use]
 pub fn is_indeterminate(dom: &Dom, id: NodeId) -> bool {
-    local_is(dom, id, &["progress"]) && attr_value(dom, id, "value").is_none()
+    if local_is(dom, id, &["progress"]) {
+        return attr_value(dom, id, "value").is_none();
+    }
+    if local_is(dom, id, &["input"]) {
+        let typ = attr_value(dom, id, "type").unwrap_or_default().to_ascii_lowercase();
+        if typ == "checkbox" {
+            return dom.indeterminate(id);
+        }
+        if typ == "radio" {
+            return dom.radio_group_checked(id).is_none();
+        }
+    }
+    false
 }
 
 /// `:defined` per <https://html.spec.whatwg.org/#selector-defined>: an

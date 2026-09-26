@@ -1,12 +1,12 @@
 //! Focus, activation behavior, and the `WebDriver` bridge.
 
-use super::{events, host_node_id, webdriver_element, webdriver_send_keys, world_for_node};
+use super::{events, host_node_id, webdriver_element, world_for_node, wrap_node};
 
 use std::rc::Rc;
 
 use dom::{NodeId, NodeKind, html_namespace};
 
-use rquickjs::{Class, Ctx, Exception, Object, Result, Value};
+use rquickjs::{Class, Ctx, Exception, Function, Object, Result, Value, prelude::This};
 
 use crate::js::events::EventTargetRef;
 
@@ -144,57 +144,6 @@ fn node_local_name(dom: &dom::Dom, node: NodeId) -> Option<String> {
     }
 }
 
-/// Whether the element accepts typed text: an enabled, non-readonly text-like
-/// control. Checkboxes, radio buttons, and files do not take text input
-/// (<https://html.spec.whatwg.org/multipage/input.html#text-(type=text)-state-and-search-state-(type=search)>).
-pub(crate) fn is_text_control(ctx: &Ctx<'_>, node: NodeId) -> Result<bool> {
-    let world = world_for_node(ctx, node)?;
-    let world = world.borrow();
-    let Some(parsed) = world.document(node) else {
-        return Ok(false);
-    };
-    if parsed.dom.kind(node).is_none() || is_actually_disabled(&parsed.dom, node) {
-        return Ok(false);
-    }
-    if parsed.dom.attribute(node, "readonly").is_some() {
-        return Ok(false);
-    }
-    let Some(local) = node_local_name(&parsed.dom, node) else {
-        return Ok(false);
-    };
-    Ok(match local.as_str() {
-        "textarea" => true,
-        "input" => {
-            let kind = parsed
-                .dom
-                .attribute(node, "type")
-                .unwrap_or_else(|| "text".to_owned())
-                .to_ascii_lowercase();
-            // An unknown or missing type is the Text state, so it takes keys
-            // (<https://html.spec.whatwg.org/multipage/input.html#attr-input-type>).
-            !matches!(
-                kind.as_str(),
-                "hidden"
-                    | "checkbox"
-                    | "radio"
-                    | "file"
-                    | "submit"
-                    | "reset"
-                    | "button"
-                    | "image"
-                    | "color"
-                    | "range"
-                    | "date"
-                    | "datetime-local"
-                    | "month"
-                    | "week"
-                    | "time"
-            )
-        }
-        _ => false,
-    })
-}
-
 /// Moves focus to `node`. The previously focused area is cleared before the
 /// `blur`/`focusout` chain, and the new one installed before `focus`/`focusin`
 /// (<https://html.spec.whatwg.org/multipage/interaction.html#focus-update-steps>).
@@ -302,13 +251,266 @@ pub(crate) fn element_click(ctx: &Ctx<'_>, node: NodeId) -> Result<()> {
         if is_focusable(ctx, node)? {
             focus_node(ctx, node)?;
         }
+        // The legacy-pre-activation behavior updates checkedness before the
+        // `click` event, so a handler observes the new state; a canceled click
+        // restores it afterwards
+        // (<https://html.spec.whatwg.org/multipage/input.html#the-input-element:legacy-pre-activation-behavior>).
+        let previous = legacy_pre_activation(ctx, node)?;
         let event = Class::instance(ctx.clone(), events::JsEvent::uninitialized())?;
         event.borrow().initialize("click".to_owned(), true, true);
-        events::dispatch_event(ctx, EventTargetKey::Node(node), &event)?;
+        let not_canceled = events::dispatch_event(ctx, EventTargetKey::Node(node), &event)?;
+        if not_canceled {
+            complete_activation(ctx, node)?;
+        } else {
+            legacy_canceled_activation(ctx, node, &previous)?;
+        }
         Ok(())
     })();
     world.borrow_mut().set_click_in_progress(node, false);
     result
+}
+
+/// The checkedness state a canceled click restores.
+enum PreActivation {
+    None,
+    Checkbox {
+        checked: bool,
+        indeterminate: bool,
+    },
+    Radio(Option<NodeId>),
+}
+
+/// The legacy-pre-activation behavior: a checkbox toggles, a radio becomes
+/// checked and remembers the group's previous checked radio.
+fn legacy_pre_activation(ctx: &Ctx<'_>, node: NodeId) -> Result<PreActivation> {
+    let world = world_for_node(ctx, node)?;
+    let world = world.borrow();
+    let Some(mut parsed) = world.document_mut(node) else {
+        return Ok(PreActivation::None);
+    };
+    let dom = &mut parsed.dom;
+    let Some(NodeKind::Element { name, .. }) = dom.kind(node) else {
+        return Ok(PreActivation::None);
+    };
+    // Only an `input` has the checkbox/radio activation behavior.
+    if name.ns != html_namespace() || name.local.as_ref() != "input" {
+        return Ok(PreActivation::None);
+    }
+    let type_attr = dom
+        .attribute(node, "type")
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    Ok(match type_attr.as_str() {
+        "checkbox" => {
+            let previous = PreActivation::Checkbox {
+                checked: dom.checkedness(node),
+                indeterminate: dom.indeterminate(node),
+            };
+            let next = !dom.checkedness(node);
+            dom.set_input_checkedness(node, next);
+            dom.set_indeterminate(node, false);
+            previous
+        }
+        "radio" => {
+            let previous = dom.radio_group_checked(node);
+            dom.set_input_checkedness(node, true);
+            PreActivation::Radio(previous)
+        }
+        _ => PreActivation::None,
+    })
+}
+
+/// The legacy-canceled-activation behavior: undo the pre-activation change.
+fn legacy_canceled_activation(ctx: &Ctx<'_>, node: NodeId, previous: &PreActivation) -> Result<()> {
+    let world = world_for_node(ctx, node)?;
+    let world = world.borrow();
+    let Some(mut parsed) = world.document_mut(node) else {
+        return Ok(());
+    };
+    let dom = &mut parsed.dom;
+    match previous {
+        PreActivation::Checkbox {
+            checked,
+            indeterminate,
+        } => {
+            dom.set_input_checkedness(node, *checked);
+            dom.set_indeterminate(node, *indeterminate);
+        }
+        PreActivation::Radio(Some(other)) => {
+            dom.set_input_checkedness(node, false);
+            dom.set_input_checkedness(*other, true);
+        }
+        PreActivation::Radio(None) => {
+            dom.set_input_checkedness(node, false);
+        }
+        PreActivation::None => {}
+    }
+    Ok(())
+}
+
+/// The post-click activation for a non-canceled click. A checkbox or radio
+/// already changed checkedness in pre-activation, so only its events fire;
+/// other controls run their activation behavior.
+fn complete_activation(ctx: &Ctx<'_>, node: NodeId) -> Result<()> {
+    let world = world_for_node(ctx, node)?;
+    let checkable = {
+        let world = world.borrow();
+        world.document(node).is_some_and(|parsed| {
+            let dom = &parsed.dom;
+            matches!(
+                dom.kind(node),
+                Some(NodeKind::Element { name, .. })
+                    if name.ns == html_namespace() && name.local.as_ref() == "input"
+            ) && dom.attribute(node, "type").is_some_and(|value| {
+                let value = value.trim().to_ascii_lowercase();
+                value == "checkbox" || value == "radio"
+            })
+        })
+    };
+    if checkable {
+        fire_checkable_events(ctx, node)
+    } else {
+        run_activation(ctx, node)
+    }
+}
+
+/// Fires the `input` and `change` events a checkbox/radio activation produces.
+fn fire_checkable_events(ctx: &Ctx<'_>, node: NodeId) -> Result<()> {
+    events::fire_trusted(ctx, EventTargetKey::Node(node), "input", true, false)?;
+    events::fire_trusted(ctx, EventTargetKey::Node(node), "change", true, false)?;
+    Ok(())
+}
+
+/// What a clicked control does.
+enum Activation {
+    None,
+    Submit,
+    Reset,
+    ToggleCheckedness,
+}
+
+/// The checkbox/radio activation behavior: toggle (checkbox) or set (radio)
+/// checkedness, unchecking the rest of the radio group, then fire `input` and
+/// `change`
+/// (<https://html.spec.whatwg.org/multipage/input.html#checkbox-state-(type=checkbox):activation-behavior>).
+fn toggle_checkedness(ctx: &Ctx<'_>, node: NodeId) -> Result<()> {
+    let world = world_for_node(ctx, node)?;
+    let changed = {
+        let world = world.borrow_mut();
+        let Some(mut parsed) = world.document_mut(node) else {
+            return Ok(());
+        };
+        let dom = &mut parsed.dom;
+        let Some(NodeKind::Element { name, .. }) = dom.kind(node) else {
+            return Ok(());
+        };
+        if name.ns != html_namespace() || name.local.as_ref() != "input" {
+            return Ok(());
+        }
+        let type_attr = dom
+            .attribute(node, "type")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase();
+        match type_attr.as_str() {
+            "checkbox" => {
+                let next = !dom.checkedness(node);
+                dom.set_input_checkedness(node, next);
+                true
+            }
+            "radio" => {
+                // A checked radio cannot be unchecked by clicking.
+                if dom.checkedness(node) {
+                    false
+                } else {
+                    dom.set_input_checkedness(node, true);
+                    true
+                }
+            }
+            _ => false,
+        }
+    };
+    if changed {
+        events::fire_trusted(ctx, EventTargetKey::Node(node), "input", true, false)?;
+        events::fire_trusted(ctx, EventTargetKey::Node(node), "change", true, false)?;
+    }
+    Ok(())
+}
+
+/// The activation behavior of a clicked control: a submit button submits its
+/// form owner with itself as submitter, a reset button resets it, and a
+/// checkbox or radio updates its checkedness
+/// (<https://html.spec.whatwg.org/multipage/form-elements.html#the-button-element:activation-behavior>).
+fn run_activation(ctx: &Ctx<'_>, node: NodeId) -> Result<()> {
+    let world = world_for_node(ctx, node)?;
+    let (activation, form) = {
+        let world = world.borrow();
+        let Some(parsed) = world.document(node) else {
+            return Ok(());
+        };
+        let dom = &parsed.dom;
+        let Some(NodeKind::Element { name, .. }) = dom.kind(node) else {
+            return Ok(());
+        };
+        if name.ns != html_namespace() {
+            return Ok(());
+        }
+        let type_attr = |dom: &dom::Dom| {
+            dom.attribute(node, "type")
+                .map(|value| value.trim().to_ascii_lowercase())
+        };
+        let activation = match name.local.as_ref() {
+            "input" => match type_attr(dom).as_deref() {
+                Some("submit") => Activation::Submit,
+                Some("reset") => Activation::Reset,
+                Some("checkbox" | "radio") => Activation::ToggleCheckedness,
+                _ => Activation::None,
+            },
+            "button" => match type_attr(dom).as_deref() {
+                // The missing and invalid value defaults are both Auto (submit).
+                Some("reset") => Activation::Reset,
+                _ => Activation::Submit,
+            },
+            _ => Activation::None,
+        };
+        (activation, dom.form_owner(node))
+    };
+    match activation {
+        Activation::None => Ok(()),
+        Activation::ToggleCheckedness => toggle_checkedness(ctx, node),
+        Activation::Submit | Activation::Reset => {
+            let Some(form) = form else {
+                return Ok(());
+            };
+            let form_value = wrap_node(ctx, form)?;
+            let Some(form_object) = form_value.as_object() else {
+                return Ok(());
+            };
+            let button_value = wrap_node(ctx, node)?;
+            match activation {
+                Activation::Submit => {
+                    if let Ok(function) = form_object.get::<_, Function>("requestSubmit")
+                        && function
+                            .call::<_, ()>((This(form_object.clone()), button_value))
+                            .is_err()
+                    {
+                        // Clear the exception the page's handler threw.
+                        let _ = ctx.catch();
+                    }
+                }
+                Activation::Reset => {
+                    if let Ok(function) = form_object.get::<_, Function>("reset")
+                        && function.call::<_, ()>((This(form_object.clone()),)).is_err()
+                    {
+                        let _ = ctx.catch();
+                    }
+                }
+                Activation::None | Activation::ToggleCheckedness => {}
+            }
+            Ok(())
+        }
+    }
 }
 
 /// The `WebDriver` element bridge. Page script can still call it by name and
@@ -320,18 +522,43 @@ pub(crate) fn install_webdriver_bridge(ctx: &Ctx<'_>, globals: &Object<'_>) -> R
         rquickjs::prelude::Func::from(webdriver_click),
     )?;
     globals.set(
-        "__tb_webdriver_send_keys",
-        rquickjs::prelude::Func::from(webdriver_send_keys),
-    )?;
-    globals.set(
         "__tb_webdriver_element",
         rquickjs::prelude::Func::from(webdriver_element),
     )?;
+    globals.set(
+        "__tbActivate",
+        rquickjs::prelude::Func::from(activate_element),
+    )?;
     ctx.eval::<(), _>(
-        "['__tb_webdriver_click','__tb_webdriver_send_keys','__tb_webdriver_element']\
+        "['__tb_webdriver_click','__tb_webdriver_element','__tbActivate']\
          .forEach(function(k){Object.defineProperty(globalThis,k,{writable:false,configurable:false,enumerable:false});});",
     )?;
     Ok(())
+}
+
+/// Runs the activation behavior for an element the input paths clicked, so a
+/// real click toggles a checkbox or submits a form
+/// (<https://html.spec.whatwg.org/multipage/interaction.html#activation-behavior>).
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "rquickjs Func ABI passes arguments by value"
+)]
+fn activate_element<'js>(ctx: Ctx<'js>, element: Value<'js>) -> Result<()> {
+    let Some(node) = host_node_id(&ctx, &element) else {
+        return Ok(());
+    };
+    // A disabled control eats the click
+    // (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#concept-fe-disabled>).
+    {
+        let world = world_for_node(&ctx, node)?;
+        let world = world.borrow();
+        if let Some(parsed) = world.document(node)
+            && is_actually_disabled(&parsed.dom, node)
+        {
+            return Ok(());
+        }
+    }
+    run_activation(&ctx, node)
 }
 
 /// The `WebDriver` "element click" step: a trusted click at the element, with
@@ -358,6 +585,8 @@ fn webdriver_click<'js>(ctx: Ctx<'js>, element: Value<'js>) -> Result<()> {
     if is_focusable(&ctx, node)? {
         focus_node(&ctx, node)?;
     }
-    events::fire_trusted(&ctx, EventTargetKey::Node(node), "click", true, true)?;
+    if events::fire_trusted_click(&ctx, EventTargetKey::Node(node))? {
+        run_activation(&ctx, node)?;
+    }
     Ok(())
 }

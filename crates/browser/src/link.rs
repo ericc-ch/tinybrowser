@@ -500,7 +500,7 @@ async fn service_task(mut server: BrowserServiceServer, context: ServiceContext)
                 assignment,
                 frame,
                 event,
-            }) => route_event(&context, assignment, frame, event),
+            }) => route_event(&context, assignment, frame, &event),
             ServerInput::Notify(RendererNotice::Ready)
             | ServerInput::RequestChunk { .. }
             | ServerInput::RequestEnd { .. }
@@ -517,7 +517,7 @@ fn route_event(
     context: &ServiceContext,
     assignment: RendererAssignmentId,
     frame: FrameId,
-    event: RendererEvent,
+    event: &RendererEvent,
 ) -> Result<(), RendererViolation> {
     let Some(assignment) = context
         .registry

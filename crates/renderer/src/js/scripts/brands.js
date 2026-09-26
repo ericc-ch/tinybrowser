@@ -98,6 +98,8 @@
     'nextElementSibling', 'tagName', 'localName', 'prefix', 'namespaceURI',
     'className', 'classList', 'dataset', 'id', 'src', 'href', 'name', 'content', 'outerHTML', 'innerHTML', 'style',
     'remove', 'getBoundingClientRect', 'getClientRects', 'scrollIntoView',
+    'insertAdjacentHTML',
+    'scrollLeft', 'scrollTop',
     'attachShadow', 'shadowRoot'
   ]);
   // classList is `[PutForwards=value]`: assigning to it sets `.value`
@@ -164,13 +166,23 @@
   const interfaceMembers = {
     HTMLIFrameElement: ['contentDocument', 'contentWindow'],
     HTMLImageElement: ['naturalWidth', 'naturalHeight', 'complete', 'currentSrc'],
-    HTMLInputElement: ['value', 'disabled', 'readOnly', 'required', 'multiple'],
-    HTMLTextAreaElement: ['disabled', 'readOnly', 'required'],
-    HTMLSelectElement: ['disabled', 'required', 'multiple'],
-    HTMLButtonElement: ['disabled'],
-    HTMLFieldSetElement: ['disabled'],
+    HTMLFormElement: ['reset', 'action', 'method', 'enctype', 'encoding', 'target', 'noValidate', 'acceptCharset'],
+    HTMLInputElement: ['value', 'defaultValue', 'disabled', 'readOnly', 'required', 'multiple',
+      'checked', 'defaultChecked', 'selectionStart', 'selectionEnd', 'selectionDirection',
+      'indeterminate', 'form',
+      'formAction', 'formMethod', 'formEnctype', 'formTarget', 'formNoValidate',
+      'pattern', 'min', 'max', 'step'],
+    HTMLTextAreaElement: ['value', 'defaultValue', 'textLength', 'disabled', 'readOnly', 'required',
+      'selectionStart', 'selectionEnd', 'selectionDirection', 'form'],
+    HTMLOptionElement: ['value', 'selected', 'defaultSelected', 'text', 'index', 'disabled',
+      'label', 'form'],
+    HTMLSelectElement: ['value', 'selectedIndex', 'options', 'length', 'multiple', 'disabled',
+      'required', 'name', 'selectedOptions', 'form'],
+    HTMLButtonElement: ['disabled', 'form',
+      'formAction', 'formMethod', 'formEnctype', 'formTarget', 'formNoValidate'],
+    HTMLFieldSetElement: ['disabled', 'form'],
+    HTMLLabelElement: ['form'],
     HTMLOptGroupElement: ['disabled'],
-    HTMLOptionElement: ['disabled'],
   };
   for (const [name, parent] of [
     ['HTMLAnchorElement', HTMLElementInterface],
@@ -304,15 +316,34 @@
       configurable: true,
     };
   }
-  Object.defineProperty(table.HTMLInputElement, 'type', reflectType(new Set([
+  const INPUT_TYPE_KEYWORDS = new Set([
     'hidden', 'text', 'search', 'tel', 'url', 'email', 'password',
     'date', 'month', 'week', 'time', 'datetime-local', 'number', 'range',
     'color', 'checkbox', 'radio', 'file', 'submit', 'image', 'reset', 'button',
-  ]), 'text'));
+  ]);
+  Object.defineProperty(table.HTMLInputElement, 'type', {
+    get: function() {
+      const value = this.getAttribute('type');
+      if (value === null) return 'text';
+      const lowered = String(value).toLowerCase();
+      return INPUT_TYPE_KEYWORDS.has(lowered) ? lowered : 'text';
+    },
+    set: function(value) {
+      // The `type` attribute change runs the input type-change steps in the
+      // DOM, whatever the mutation path
+      // (<https://html.spec.whatwg.org/multipage/input.html#the-input-element:type-change-state>).
+      this.setAttribute('type', String(value));
+    },
+    enumerable: true,
+    configurable: true,
+  });
   // `<input type=file>` exposes a (possibly empty) FileList
   // (<https://html.spec.whatwg.org/multipage/input.html#dom-input-files>).
   Object.defineProperty(table.HTMLInputElement, 'files', {
     get: function() {
+      // `files` applies only to the File Upload state
+      // (<https://html.spec.whatwg.org/multipage/input.html#dom-input-files>).
+      if (this.type !== 'file') return null;
       let list = this[inputFilesSymbol];
       if (list === undefined) {
         list = globalThis.__tbCreateFileList([]);
@@ -322,12 +353,32 @@
       }
       return list;
     },
+    set: function(value) {
+      if (this.type !== 'file') return;
+      if (value === null) return;
+      if (!(value instanceof globalThis.FileList)) {
+        throw new TypeError('files must be a FileList');
+      }
+      // `input.files = fileList` replaces the list a script set; the same list
+      // can be shared across inputs
+      // (<https://html.spec.whatwg.org/multipage/input.html#dom-input-files>).
+      Object.defineProperty(this, inputFilesSymbol, {
+        value: value, writable: true, enumerable: false, configurable: true,
+      });
+      globalThis.__tbSetInputFiles(this, value);
+    },
     enumerable: true,
     configurable: true,
   });
   Object.defineProperty(table.HTMLButtonElement, 'type', reflectType(new Set([
     'submit', 'reset', 'button',
   ]), 'submit'));
+  // <https://html.spec.whatwg.org/multipage/form-elements.html#dom-textarea-type>
+  Object.defineProperty(table.HTMLTextAreaElement, 'type', {
+    get: function() { return 'textarea'; },
+    enumerable: true,
+    configurable: true,
+  });
   Object.defineProperties(table.HTMLSlotElement, {
     assignedNodes: {
       value: function() {

@@ -105,6 +105,26 @@ pub(crate) struct QueuedDial {
     pub(crate) context: DialContext,
     pub(crate) url: Url,
     pub(crate) initiator: Url,
+    /// HTTP method. Every dial except a form navigation is a GET.
+    pub(crate) method: String,
+    /// Request body, empty for a GET.
+    pub(crate) body: Vec<u8>,
+    /// `Content-Type` for `body`, when there is one.
+    pub(crate) content_type: Option<String>,
+}
+
+impl QueuedDial {
+    /// A GET dial, the shape of every dial but a form navigation.
+    pub(crate) fn get(context: DialContext, url: Url, initiator: Url) -> Self {
+        Self {
+            context,
+            url,
+            initiator,
+            method: "GET".to_owned(),
+            body: Vec::new(),
+            content_type: None,
+        }
+    }
 }
 
 /// One finished dial with the response it produced.
@@ -428,7 +448,14 @@ impl Document {
 
     /// Starts the frame's own navigation. The dial runs on this document, so
     /// a navigation that replaces the frame cancels an unfinished one.
-    pub(crate) fn navigate_to(&mut self, url: Url, initiator: Url) {
+    pub(crate) fn navigate_to(
+        &mut self,
+        url: Url,
+        initiator: Url,
+        method: String,
+        body: Vec<u8>,
+        content_type: Option<String>,
+    ) {
         self.frame_load_sequence = self.frame_load_sequence.wrapping_add(1);
         self.frame_load_in_flight = true;
         self.initial_blank = false;
@@ -438,6 +465,9 @@ impl Document {
             },
             url,
             initiator,
+            method,
+            body,
+            content_type,
         });
     }
 
@@ -988,11 +1018,17 @@ impl Document {
         }
     }
 
-    fn eval_classic(&mut self, source: &str, element: Option<dom::NodeId>) {
+    fn eval_classic(
+        &mut self,
+        source: &str,
+        element: Option<dom::NodeId>,
+        base_line: u32,
+        filename: &str,
+    ) {
         // https://html.spec.whatwg.org/multipage/webappapis.html#run-a-classic-script
         let previous = self.world.borrow().current_script;
         self.world.borrow_mut().current_script = element;
-        self.fire_js(|js| js.eval(source).map(|_| ()));
+        self.fire_js(|js| js.eval_classic_script(source, base_line, filename));
         self.world.borrow_mut().current_script = previous;
         self.adopt_js_work();
     }
@@ -1046,24 +1082,26 @@ impl Document {
                     self.deliver_mutations();
                     let script = crate::js::script_at(&self.world.borrow(), id);
                     match script {
-                        Some(crate::js::Script::Classic(crate::js::ScriptSource::Inline(
+                        Some(crate::js::Script::Classic(crate::js::ScriptSource::Inline {
                             source,
-                        ))) => {
-                            self.eval_classic(&source, Some(id));
+                            line,
+                        })) => {
+                            let filename = self.url.as_str().to_owned();
+                            self.eval_classic(&source, Some(id), line, &filename);
                             self.sync_parser_from_world();
                         }
                         Some(crate::js::Script::Classic(crate::js::ScriptSource::Src(src))) => {
                             if let Ok(url) = self.resolve_dial_url(&src) {
                                 self.classic_fetch_in_flight = true;
                                 let initiator = self.url.clone();
-                                self.queued_dials.push(QueuedDial {
-                                    context: DialContext::ClassicScript {
+                                self.queued_dials.push(QueuedDial::get(
+                                    DialContext::ClassicScript {
                                         element: id,
                                         epoch: self.js_epoch,
                                     },
                                     url,
                                     initiator,
-                                });
+                                ));
                                 return;
                             }
                             self.sync_parser_from_world();
@@ -1149,7 +1187,8 @@ impl Document {
                     self.classic_fetch_in_flight = false;
                     if (200..300).contains(&outcome.status) {
                         let source = String::from_utf8_lossy(&outcome.body);
-                        self.eval_classic(&source, Some(element));
+                        let filename = outcome.final_url.clone();
+                        self.eval_classic(&source, Some(element), 1, &filename);
                     }
                     self.sync_parser_from_world();
                     self.advance_parser();
@@ -1214,6 +1253,12 @@ impl Document {
                 let Ok(url) = Url::parse(&outcome.final_url) else {
                     return;
                 };
+                // Announce the commit before the new document's load, so the
+                // browser can re-create the top-level execution contexts
+                // (<https://chromedevtools.github.io/devtools-protocol/tot/Page/#event-frameNavigated>).
+                self.record_event(RendererEvent::Navigated {
+                    url: url.to_string(),
+                });
                 self.load_frame_response(
                     &url,
                     outcome.content_type.as_deref(),
@@ -1330,7 +1375,7 @@ impl Document {
         let modules = std::mem::take(&mut self.deferred_modules);
         for (index, (element, source)) in modules.into_iter().enumerate() {
             let result = match source {
-                crate::js::ScriptSource::Inline(source) => {
+                crate::js::ScriptSource::Inline { source, .. } => {
                     let name = format!("{}#inline-module-{index}", self.url);
                     self.js
                         .as_ref()
@@ -1398,14 +1443,14 @@ impl Document {
             if !self.stylesheet_urls.insert(url.as_str().to_owned()) {
                 continue;
             }
-            self.queued_dials.push(QueuedDial {
-                context: DialContext::Stylesheet {
+            self.queued_dials.push(QueuedDial::get(
+                DialContext::Stylesheet {
                     element,
                     epoch: self.js_epoch,
                 },
                 url,
-                initiator: initiator.clone(),
-            });
+                initiator.clone(),
+            ));
             self.pending_stylesheets = self.pending_stylesheets.saturating_add(1);
             queued += 1;
         }
@@ -1482,15 +1527,15 @@ impl Document {
         let selected = url.as_str().to_owned();
         self.image_selected_src.insert(element, selected.clone());
         self.world.borrow_mut().begin_image(element, selected);
-        self.queued_dials.push(QueuedDial {
-            context: DialContext::Image {
+        self.queued_dials.push(QueuedDial::get(
+            DialContext::Image {
                 element,
                 epoch: self.js_epoch,
                 generation,
             },
             url,
             initiator,
-        });
+        ));
         self.pending_images = self.pending_images.saturating_add(1);
         self.launch_queued_dials();
     }

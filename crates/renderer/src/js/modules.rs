@@ -63,6 +63,9 @@ pub(super) fn load_module<'js>(ctx: &Ctx<'js>, name: &str) -> Result<Module<'js,
             url: name.to_owned(),
             initiator,
             read_body: true,
+            method: "GET".to_owned(),
+            body: Vec::new(),
+            content_type: None,
         },
         Box::new(move |outcome| {
             let _result = send.send(outcome);

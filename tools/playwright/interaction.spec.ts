@@ -21,11 +21,11 @@ test("clicks use real layout geometry", async ({ daemon }) => {
   await browser.close();
 });
 
-// Blocked on form-control support: `#name` (a textarea) lays out as a zero
-// box because the UA stylesheet gives it no intrinsic size, and the typing
-// path reads `element.value.length`, which the engine's textarea does not
-// expose yet. Once those land this becomes a plain `test`.
-test.fixme("typing into form controls", async ({ daemon }) => {
+// Typing through the CDP actionability path: `locator.focus()` waits for the
+// element to be visible, enabled, editable and stable, which needs a resolved
+// `visibility` from `getComputedStyle` and node handles that CDP reports as
+// `subtype: "node"` so Playwright builds an `ElementHandle`.
+test("typing into form controls", async ({ daemon }) => {
   const browser = await chromium.connectOverCDP(daemon.origin);
   const context = browser.contexts()[0];
   const page = context.pages()[0];
@@ -35,6 +35,31 @@ test.fixme("typing into form controls", async ({ daemon }) => {
   await page.keyboard.type("abc");
   await expect(page.locator("#name")).toHaveValue("abc");
   await expect(page.locator("#out")).toHaveText("typed:abc");
+
+  await browser.close();
+});
+
+// Form fill and submit through Playwright's actionability and the engine's
+// submission path: a GET form navigates to the query string, a POST form sends
+// the urlencoded body.
+test("filling and submitting a form", async ({ daemon }) => {
+  const browser = await chromium.connectOverCDP(daemon.origin);
+  const context = browser.contexts()[0];
+  const page = context.pages()[0];
+
+  await page.goto(daemon.formUrl);
+  await page.fill("#g-name", "Ada");
+  await page.selectOption("#g-color", "blue");
+  await page.check("#g-agree");
+  await page.click("#g-submit");
+  await page.waitForURL(/\/echo\?/);
+  await expect(page.locator("#result")).toHaveText("GET name=Ada&color=blue&agree=yes");
+
+  await page.goto(daemon.formUrl);
+  await page.fill("#p-name", "Grace");
+  await page.click("#p-submit");
+  await page.waitForURL(/\/echo$/);
+  await expect(page.locator("#result")).toHaveText("POST name=Grace");
 
   await browser.close();
 });

@@ -11,7 +11,7 @@ mod modules;
 mod url_parts;
 mod world;
 
-pub(crate) use world::{DocumentStreamCommand, FrameNavigation, RealmRegistry};
+pub(crate) use world::{DocumentStreamCommand, FrameNavigation, NavigationTarget, RealmRegistry};
 
 use std::cell::{Cell, OnceCell, RefCell};
 use std::fmt;
@@ -56,6 +56,9 @@ const INSTALL_WEB_APIS_JS: &str = concat!(
     include_str!("scripts/web/observers.js"),
     include_str!("scripts/web/messaging.js"),
     include_str!("scripts/web/ui_events.js"),
+    include_str!("scripts/web/errors.js"),
+    include_str!("scripts/web/forms.js"),
+    include_str!("scripts/web/form_data.js"),
     include_str!("scripts/web/input.js"),
     "})();",
 );
@@ -92,7 +95,8 @@ pub(crate) enum Script {
 
 #[derive(Clone)]
 pub(crate) enum ScriptSource {
-    Inline(String),
+    /// Inline text, with the 1-based document line its source starts on.
+    Inline { source: String, line: u32 },
     Src(String),
 }
 
@@ -154,6 +158,15 @@ impl SharedJsRuntime {
         let slot = self.0.get_or_init(|| {
             let runtime = Runtime::new().map_err(|err| err.to_string().into_boxed_str())?;
             runtime.set_loader(modules::WebModuleResolver, modules::WebModuleLoader);
+            // QuickJS reports a rejected-without-handler promise and a late
+            // handler for one here; the events fire at the microtask
+            // checkpoint
+            // (<https://html.spec.whatwg.org/multipage/webappapis.html#unhandled-promise-rejections>).
+            runtime.set_host_promise_rejection_tracker(Some(Box::new(
+                |ctx, promise, reason, handled| {
+                    bindings::note_rejection(&ctx, promise, reason, handled);
+                },
+            )));
             Ok(runtime)
         });
         slot.as_ref()
@@ -201,6 +214,35 @@ impl JsRealm {
             self.context.with(|ctx| {
                 let value: Value = eval_classic(&ctx, source)?;
                 render_eval_result(&ctx, value)
+            })
+        })
+    }
+
+    /// Evaluates one parser-driven classic script and, when it throws, reports
+    /// the exception to the realm's window (`window.onerror` and the `error`
+    /// event) before returning the failure.
+    ///
+    /// `base_line` is the 1-based document line the script's first source line
+    /// occupies (0 when unknown), used to translate the inline stack's
+    /// script-relative line into a document line
+    /// (<https://html.spec.whatwg.org/multipage/webappapis.html#report-the-error>).
+    pub(crate) fn eval_classic_script(
+        &self,
+        source: &str,
+        base_line: u32,
+        filename: &str,
+    ) -> Result<(), JsError> {
+        self.with_budget(None, || {
+            self.context.with(|ctx| {
+                let mut options = EvalOptions::default();
+                options.strict = false;
+                match ctx.eval_with_options::<Value, _>(source, options) {
+                    Ok(_) => Ok(()),
+                    Err(error) => {
+                        report_script_error(&ctx, &error, base_line, filename);
+                        Err(JsError::from(error))
+                    }
+                }
             })
         })
     }
@@ -259,12 +301,47 @@ impl JsRealm {
                 // A cancelled timer already left the queue: firing is a
                 // no-op, not a `TypeError`
                 // (<https://html.spec.whatwg.org/multipage/timers-and-user-prompts.html#timers>).
-                let func: Option<Function> = timeouts.get(idx)?;
+                let value: Value = timeouts.get(idx)?;
                 timeouts.as_object().remove(js_id)?;
-                if let Some(func) = func {
-                    func.call::<_, ()>(())?;
+                if value.is_undefined() || value.is_null() {
+                    return Ok(());
+                }
+                if let Some(func) = value.as_function() {
+                    if let Err(error) = func.call::<_, ()>(()) {
+                        report_callback_error(&ctx, &error);
+                    }
+                    return Ok(());
+                }
+                // A non-function argument is compiled and run as a classic
+                // script when the timer fires; a compile or runtime error is
+                // reported like any uncaught script error
+                // (<https://html.spec.whatwg.org/multipage/timers-and-user-prompts.html#dom-settimeout>).
+                let code = Coerced::<String>::from_js(&ctx, value)?.0;
+                let mut options = EvalOptions::default();
+                options.strict = false;
+                if let Err(error) = ctx.eval_with_options::<Value, _>(code.as_str(), options) {
+                    report_script_error(&ctx, &error, 0, "");
                 }
                 Ok(())
+            })
+        })
+    }
+
+    /// Fires a trusted `select` event at `node`. The DOM queues the event when
+    /// a selection setter changes the stored range, so it lands one task after
+    /// the change
+    /// (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#set-the-selection-range>).
+    pub(crate) fn fire_select(&self, node: dom::NodeId) -> Result<(), JsError> {
+        self.with_budget(None, || {
+            self.context.with(|ctx| {
+                events::fire_trusted(
+                    &ctx,
+                    world::EventTargetKey::Node(node),
+                    "select",
+                    true,
+                    false,
+                )
+                .map_err(JsError::from)
             })
         })
     }
@@ -281,7 +358,9 @@ impl JsRealm {
             self.context.with(|ctx| {
                 let cbs: Object = ctx.globals().get("__tb_fetchCbs")?;
                 let func: Function = cbs.get(js_id)?;
-                func.call::<_, ()>((ok, status, body))?;
+                if let Err(error) = func.call::<_, ()>((ok, status, body)) {
+                    report_callback_error(&ctx, &error);
+                }
                 Ok(())
             })
         })
@@ -549,11 +628,22 @@ impl JsRealm {
         let result = operation();
         // https://html.spec.whatwg.org/multipage/webappapis.html#clean-up-after-running-script
         let jobs = self.run_jobs();
+        // Rejections without a handler report at the end of the microtask
+        // checkpoint, after the jobs above have run.
+        self.report_pending_rejections();
         if interrupted.get() {
             Err(JsError::Interrupted)
         } else {
             result.and_then(|value| jobs.map(|()| value))
         }
+    }
+
+    /// Fires queued `unhandledrejection` / `rejectionhandled` events for this
+    /// realm after a microtask checkpoint.
+    fn report_pending_rejections(&self) {
+        self.context.with(|ctx| {
+            bindings::drain_rejections(&ctx, &self.world);
+        });
     }
 
     fn run_jobs(&self) -> Result<(), JsError> {
@@ -901,7 +991,10 @@ pub(crate) fn script_at(world: &World, id: dom::NodeId) -> Option<Script> {
     }
     let source = match parsed.dom.attribute(id, "src") {
         Some(src) if !src.trim().is_empty() => ScriptSource::Src(src),
-        _ => ScriptSource::Inline(element_text(&parsed.dom, id)),
+        _ => ScriptSource::Inline {
+            source: element_text(&parsed.dom, id),
+            line: parsed.dom.script_line(id).unwrap_or(0),
+        },
     };
     let typ = parsed.dom.attribute(id, "type");
     if typ
@@ -1001,6 +1094,39 @@ fn eval_classic<'js, V: FromJs<'js>>(ctx: &rquickjs::Ctx<'js>, source: &str) -> 
             }
             other => JsError::engine(other),
         })
+}
+
+/// Reports one uncaught exception to the realm's window: the `error` event and
+/// `window.onerror`. `base_line` is the 1-based document line the script's
+/// first source line occupies (0 when unknown), so the inline stack's
+/// script-relative line can be translated into a document line.
+///
+/// <https://html.spec.whatwg.org/multipage/webappapis.html#report-the-error>
+fn report_script_error(
+    ctx: &rquickjs::Ctx<'_>,
+    error: &rquickjs::Error,
+    base_line: u32,
+    filename: &str,
+) {
+    let caught = if error.is_exception() {
+        ctx.catch()
+    } else {
+        match rquickjs::String::from_str(ctx.clone(), &error.to_string()) {
+            Ok(text) => text.into_value(),
+            Err(_) => return,
+        }
+    };
+    bindings::report_exception_value(ctx, caught, base_line, filename);
+}
+
+/// Reports an exception thrown by a host-invoked callback (timer, `fetch`)
+/// through the realm window's `error` event. The callback source carries no
+/// document line, so only the callback's own stack location is used.
+fn report_callback_error(ctx: &rquickjs::Ctx<'_>, error: &rquickjs::Error) {
+    if error.is_exception() {
+        let caught = ctx.catch();
+        bindings::report_exception_value(ctx, caught, 0, "");
+    }
 }
 
 fn decode_value<'js>(ctx: &rquickjs::Ctx<'js>, value: Value<'js>) -> Result<ScriptValue, JsError> {
