@@ -1181,14 +1181,31 @@ impl Conn {
         let ready = format!(
             "Boolean(globalThis.__tb_async_handles && globalThis.__tb_async_handles[{id}] && globalThis.__tb_async_handles[{id}].done)"
         );
-        match tab
-            .run_until_js_true_in(RunUntilJsTrueInOptions {
-                frame,
-                source: &ready,
-                timeout,
-            })
-            .await
-        {
+        // A navigation replaces the main frame's realm, so an awaited slot in
+        // the old realm never settles. Stop waiting as soon as the navigation
+        // commits instead of polling until the timeout, which would also hold
+        // back the tab events the socket loop is waiting to deliver
+        // (<https://chromedevtools.github.io/devtools-protocol/tot/Runtime/#method-callFunctionOn>).
+        let mut events = tab.subscribe().ok();
+        let run = tab.run_until_js_true_in(RunUntilJsTrueInOptions {
+            frame,
+            source: &ready,
+            timeout,
+        });
+        tokio::pin!(run);
+        let settled = loop {
+            tokio::select! {
+                result = &mut run => break result,
+                event = next_tab_event(&mut events) => match event {
+                    Some(TabEvent::Navigated) if frame == FrameId::MAIN => {
+                        return exception_text_reply("execution context was destroyed");
+                    }
+                    Some(_) => {}
+                    None => events = None,
+                },
+            }
+        };
+        match settled {
             Ok(true) => {}
             Ok(false) => {
                 // Drop the slot so a late settle cannot pile up results; the
@@ -1408,6 +1425,15 @@ impl Conn {
             }
         }
         self.subscriptions = retained;
+    }
+}
+
+/// Receives the next tab event, or pends forever once the subscription is
+/// dropped so a closed channel does not spin.
+async fn next_tab_event(receiver: &mut Option<mpsc::Receiver<TabEvent>>) -> Option<TabEvent> {
+    match receiver {
+        Some(receiver) => receiver.recv().await,
+        None => std::future::pending().await,
     }
 }
 
