@@ -2132,7 +2132,8 @@ impl Dom {
     }
 
     /// The root of `node`'s tree, for grouping radios outside any form.
-    fn tree_root_of(&self, node: NodeId) -> NodeId {
+    #[must_use]
+    pub fn tree_root_of(&self, node: NodeId) -> NodeId {
         let mut current = node;
         while let Some(parent) = self.parent(current) {
             current = parent;

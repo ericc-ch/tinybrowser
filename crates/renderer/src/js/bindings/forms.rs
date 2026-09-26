@@ -7,7 +7,8 @@
 
 use super::{host_node_id, is_html_element, with_node_kind, world, world_for_node};
 use crate::js::{FrameNavigation, World};
-use dom::{NodeId, NodeKind, html_namespace};
+use dom::{NodeId, NodeKind, html_namespace, is_disabled};
+use rquickjs::prelude::Opt;
 use rquickjs::{Array, Ctx, Object, Persistent, Result, Value};
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -31,10 +32,25 @@ pub(super) fn install(_ctx: &Ctx<'_>, globals: &Object<'_>) -> Result<()> {
         rquickjs::prelude::Func::from(encode_form),
     )?;
     globals.set(
+        "__tbEncodingName",
+        rquickjs::prelude::Func::from(encoding_name),
+    )?;
+    globals.set(
         "__tbSetOptionSelectedness",
         rquickjs::prelude::Func::from(set_option_selectedness),
     )?;
     Ok(())
+}
+
+/// Resolves an encoding label to its canonical name, or `null`
+/// (<https://encoding.spec.whatwg.org/#names-and-labels>).
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "rquickjs Func ABI passes arguments by value"
+)]
+pub(super) fn encoding_name(label: String) -> Option<String> {
+    encoding_rs::Encoding::for_label(label.trim().as_bytes())
+        .map(|encoding| encoding.name().to_owned())
 }
 
 /// Sets an option's selectedness without the dirty flag, as the `Option`
@@ -68,7 +84,11 @@ enum PendingEntry {
     clippy::needless_pass_by_value,
     reason = "rquickjs Func ABI passes arguments by value"
 )]
-pub(super) fn form_entries<'js>(ctx: Ctx<'js>, form: Value<'js>) -> Result<Array<'js>> {
+pub(super) fn form_entries<'js>(
+    ctx: Ctx<'js>,
+    form: Value<'js>,
+    submitter: Opt<Value<'js>>,
+) -> Result<Array<'js>> {
     let entries = Array::new(ctx.clone())?;
     let Some(id) = host_node_id(&ctx, &form) else {
         return Ok(entries);
@@ -76,18 +96,12 @@ pub(super) fn form_entries<'js>(ctx: Ctx<'js>, form: Value<'js>) -> Result<Array
     if !with_node_kind(&ctx, id, |kind| is_html_element(kind, "form"))? {
         return Ok(entries);
     }
+    let submitter = submitter.0.and_then(|value| host_node_id(&ctx, &value));
     let world_rc = world(&ctx)?;
-    let pending = collect_pending_entries(&world_rc, id);
+    let pending = collect_pending_entries(&world_rc, id, submitter);
     for entry in pending {
         match entry {
             PendingEntry::Text(name, value) => {
-                // A control named `_charset_` carries the encoding name
-                // (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#attr-fe-name-charset>).
-                let value = if name == "_charset_" {
-                    "UTF-8".to_owned()
-                } else {
-                    value
-                };
                 let index = entries.len();
                 entries.set(index, name)?;
                 entries.set(index + 1, value)?;
@@ -100,57 +114,70 @@ pub(super) fn form_entries<'js>(ctx: Ctx<'js>, form: Value<'js>) -> Result<Array
     Ok(entries)
 }
 
-/// Walks a form's descendants in tree order and resolves each named, enabled
-/// control into its contribution.
+/// Collects a form's entry list: every submittable control whose form owner is
+/// the form, in tree order, that carries a name and is not disabled or inside a
+/// `datalist`
+/// (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#constructing-form-data-set>).
 fn collect_pending_entries(
     world_rc: &Rc<RefCell<World>>,
-    id: NodeId,
+    form: NodeId,
+    submitter: Option<NodeId>,
 ) -> Vec<PendingEntry> {
     let world = world_rc.borrow();
-    let Some(parsed) = world.document(id) else {
+    let Some(parsed) = world.document(form) else {
         return Vec::new();
     };
-    // Pre-order traversal: an explicit stack with reversed children keeps
-    // document order.
-    let mut order = Vec::new();
-    let mut stack = vec![id];
-    while let Some(node) = stack.pop() {
-        order.push(node);
-        let children: Vec<NodeId> = parsed
-            .dom
-            .children(node)
-            .map(Iterator::collect)
-            .unwrap_or_default();
-        for child in children.into_iter().rev() {
-            stack.push(child);
-        }
-    }
+    let document = &parsed.dom;
+    let root = document.tree_root_of(form);
     let mut pending = Vec::new();
-    for node in order {
-        if node == id {
-            continue;
-        }
-        let Some(NodeKind::Element { name, .. }) = parsed.dom.kind(node) else {
+    for node in document.descendants(root) {
+        let Some(NodeKind::Element { name, .. }) = document.kind(node) else {
             continue;
         };
         if name.ns != html_namespace() {
             continue;
         }
         let local = name.local.as_ref();
-        if local != "input" && local != "textarea" && local != "select" {
+        if local != "input" && local != "textarea" && local != "select" && local != "button" {
             continue;
         }
-        // A control without a name, or disabled, contributes nothing
-        // (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#constructing-form-data-set>).
-        let Some(control_name) = parsed.dom.attribute(node, "name") else {
+        if document.form_owner(node) != Some(form) {
+            continue;
+        }
+        let Some(control_name) = document.attribute(node, "name") else {
             continue;
         };
-        if control_name.is_empty() || parsed.dom.attribute(node, "disabled").is_some() {
+        if control_name.is_empty() || is_disabled(document, node) || has_datalist_ancestor(document, node)
+        {
             continue;
         }
-        pending.extend(pending_entry(&parsed.dom, node, local, control_name));
+        // A hidden input named `_charset_` carries the encoding name
+        // (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#attr-fe-name-charset>).
+        if local == "input"
+            && document
+                .attribute(node, "type")
+                .is_some_and(|typ| typ.trim().eq_ignore_ascii_case("hidden"))
+            && control_name.eq_ignore_ascii_case("_charset_")
+        {
+            pending.push(PendingEntry::Text(control_name, "UTF-8".to_owned()));
+            continue;
+        }
+        let is_submitter = submitter == Some(node);
+        pending.extend(pending_entry(document, node, local, control_name, is_submitter));
     }
     pending
+}
+
+/// Whether `node` has a `datalist` ancestor, which bars it from the entry list
+/// (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#constructing-form-data-set>).
+fn has_datalist_ancestor(document: &dom::Dom, node: NodeId) -> bool {
+    document.ancestors(node).any(|ancestor| {
+        matches!(
+            document.kind(ancestor),
+            Some(NodeKind::Element { name, .. })
+                if name.ns == html_namespace() && name.local.as_ref() == "datalist"
+        )
+    })
 }
 
 /// One named, enabled control's contribution: nothing, one entry, or (for a
@@ -161,6 +188,7 @@ fn pending_entry(
     node: NodeId,
     local: &str,
     control_name: String,
+    is_submitter: bool,
 ) -> Vec<PendingEntry> {
     match local {
         "textarea" => {
@@ -171,13 +199,35 @@ fn pending_entry(
             }
             vec![PendingEntry::Text(control_name, value)]
         }
+        "button" => {
+            // A button contributes only when it is the submitter
+            // (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#constructing-form-data-set>).
+            if !is_submitter {
+                return Vec::new();
+            }
+            vec![PendingEntry::Text(
+                control_name,
+                dom.attribute(node, "value").unwrap_or_default(),
+            )]
+        }
         "input" => {
             let typ = dom
                 .attribute(node, "type")
                 .unwrap_or_else(|| "text".to_owned());
             let typ = typ.trim().to_ascii_lowercase();
-            if matches!(typ.as_str(), "submit" | "reset" | "button" | "image") {
+            if matches!(typ.as_str(), "reset" | "button") {
                 return Vec::new();
+            }
+            if matches!(typ.as_str(), "submit" | "image") {
+                // A submit or image button contributes only when it is the
+                // submitter.
+                if !is_submitter {
+                    return Vec::new();
+                }
+                return vec![PendingEntry::Text(
+                    control_name,
+                    dom.attribute(node, "value").unwrap_or_default(),
+                )];
             }
             if typ == "checkbox" || typ == "radio" {
                 // A checkbox or radio contributes only when checked, and its
@@ -200,25 +250,16 @@ fn pending_entry(
             }
         }
         "select" => {
-            let multiple = dom.attribute(node, "multiple").is_some();
-            let options = dom.select_options(node);
-            let selected: Vec<String> = options
-                .iter()
-                .filter(|&&option| dom.option_selected(option))
-                .map(|&option| dom.option_value(option))
-                .collect();
-            if multiple {
-                selected
-                    .into_iter()
-                    .map(|value| PendingEntry::Text(control_name.clone(), value))
+            if dom.attribute(node, "multiple").is_some() {
+                dom.select_options(node)
+                    .iter()
+                    .filter(|&&option| dom.option_selected(option) && !is_disabled(dom, option))
+                    .map(|&option| {
+                        PendingEntry::Text(control_name.clone(), dom.option_value(option))
+                    })
                     .collect()
             } else {
-                let value = selected
-                    .into_iter()
-                    .next()
-                    .or_else(|| options.first().map(|&option| dom.option_value(option)))
-                    .unwrap_or_default();
-                vec![PendingEntry::Text(control_name, value)]
+                vec![PendingEntry::Text(control_name, dom.select_value(node))]
             }
         }
         _ => Vec::new(),

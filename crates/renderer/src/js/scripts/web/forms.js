@@ -392,18 +392,29 @@
       if (value === null) return false;
       let step = rawStep === null ? null : parseDecimal(rawStep.trim());
       if (step === null || step.value <= 0n) step = { value: 1n, scale: 0 };
+      // The step base is the min attribute, else the value attribute, else 0.
+      let base = null;
       const minText = element.getAttribute('min');
-      let min = minText === null ? null : parseDecimal(minText.trim());
-      if (min === null) min = { value: 0n, scale: 0 };
-      const scale = Math.max(value.scale, min.scale, step.scale);
-      return (atScale(value, scale) - atScale(min, scale)) % atScale(step, scale) !== 0n;
+      if (minText !== null) base = parseDecimal(minText.trim());
+      if (base === null) {
+        const valueText = element.getAttribute('value');
+        if (valueText !== null) base = parseDecimal(valueText.trim());
+      }
+      if (base === null) base = { value: 0n, scale: 0 };
+      const scale = Math.max(value.scale, base.scale, step.scale);
+      return (atScale(value, scale) - atScale(base, scale)) % atScale(step, scale) !== 0n;
     }
-    const value = valueAsNumber(element);
+    // The date-like states work in their `parseValue` unit (days, months,
+    // weeks, or seconds), which is the step scale factor's unit.
+    const value = parseValue(type, element.value);
     if (value === null) return false;
     let step = rawStep === null ? fallback : Number(rawStep);
     if (Number.isNaN(step) || step <= 0) step = fallback;
-    const min = parseValue(type, element.getAttribute('min'));
-    const remainder = Math.abs((value - (min === null ? 0 : min)) % step);
+    // The step base is the min attribute, else the value attribute, else 0.
+    let base = parseValue(type, element.getAttribute('min'));
+    if (base === null) base = parseValue(type, element.getAttribute('value'));
+    if (base === null) base = 0;
+    const remainder = Math.abs((value - base) % step);
     if (remainder === 0) return false;
     return Math.min(remainder, step - remainder) > step * 1e-9;
   };
@@ -750,11 +761,16 @@
   // application/x-www-form-urlencoded: LF is normalized to CRLF, a space
   // becomes `+`, and the `!'()~` set is percent-encoded
   // (<https://url.spec.whatwg.org/#concept-urlencoded-serializer>).
-  // The submission encoding: the first label in `accept-charset`, defaulting
-  // to UTF-8 (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#attr-fs-accept-charset>).
+  // The submission encoding: the first label in `accept-charset` that resolves
+  // to an encoding, else UTF-8
+  // (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#attr-fs-accept-charset>).
   const charsetLabel = form => {
-    const accept = (form.acceptCharset || '').split(',')[0].trim();
-    return accept === '' ? 'UTF-8' : accept;
+    for (const label of (form.acceptCharset || '').split(/[\t\n\f\r ]+/)) {
+      if (label === '') continue;
+      const name = globalThis.__tbEncodingName(label);
+      if (name !== null && name !== undefined) return name;
+    }
+    return 'UTF-8';
   };
   // A string encoded in `label`, as bytes. `__tbEncodeForm` applies the
   // Encoding Standard's `encode`, so unrepresentable characters become numeric
@@ -942,15 +958,16 @@
     // (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#attr-fe-name-charset>).
     if (formData.has('_charset_')) formData.set('_charset_', label);
     if (method === 'get') {
-      let url = action;
       const encoded = urlEncode(formData, label);
-      if (encoded !== '') {
-        const hash = url.indexOf('#');
-        const base = hash === -1 ? url : url.slice(0, hash);
-        const query = base.indexOf('?');
-        url = (query === -1 ? base : base.slice(0, query)) + '?' + encoded;
-      }
-      globalThis.__tbFormNavigate(url, target, 'GET', '', null);
+      // Mutate the action URL: replace the query component, keeping the
+      // fragment; an empty entry list still produces an empty query
+      // (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#submit-mutate-action>).
+      const hash = action.indexOf('#');
+      const fragment = hash === -1 ? '' : action.slice(hash);
+      const withoutFragment = hash === -1 ? action : action.slice(0, hash);
+      const query = withoutFragment.indexOf('?');
+      const base = query === -1 ? withoutFragment : withoutFragment.slice(0, query);
+      globalThis.__tbFormNavigate(base + '?' + encoded + fragment, target, 'GET', '', null);
       return;
     }
     // POST: the entries become the request body, encoded per `enctype`
@@ -975,14 +992,9 @@
   // fires that first
   // (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#constructing-form-data-set>).
   const runSubmission = (form, submitter) => {
-    const formData = new globalThis.FormData(form);
-    // A submitter contributes its own name/value to the submitted list.
-    if (submitter !== undefined && submitter !== null) {
-      const name = submitter.getAttribute('name');
-      if (name) {
-        formData.append(name, submitter.getAttribute('value') ?? '');
-      }
-    }
+    // The entry list includes the submitter before `formdata` fires
+    // (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#constructing-form-data-set>).
+    const formData = new globalThis.FormData(form, submitter ?? null);
     submitForm(form, formData, submitter);
   };
 
@@ -999,7 +1011,7 @@
   // <https://html.spec.whatwg.org/multipage/forms.html#dom-form-checkvalidity>
   const formValidation = form => {
     let valid = true;
-    for (const control of form.querySelectorAll('input, textarea, select, button')) {
+    for (const control of listedElements(form)) {
       if (typeof control.checkValidity !== 'function') continue;
       if (!control.checkValidity()) valid = false;
     }
@@ -1021,13 +1033,22 @@
     value: function(submitter) {
       if (submitter !== undefined && submitter !== null) {
         const tag = submitter.tagName;
-        if (tag !== 'BUTTON' && !(tag === 'INPUT' && submitter.type === 'submit')) {
+        const isSubmit = tag === 'BUTTON'
+          ? submitter.type === 'submit'
+          : tag === 'INPUT' && (submitter.type === 'submit' || submitter.type === 'image');
+        if (!isSubmit) {
           throw new TypeError('submitter must be a submit button');
+        }
+        if (submitter.form !== this) {
+          throw new DOMException('submitter must belong to this form', 'NotFoundError');
         }
       }
       // Interactive validation runs before the submit event and can stop the
-      // submission (<https://html.spec.whatwg.org/multipage/forms.html#interactively-validate-the-constraints>).
-      if (!this.noValidate && !this.checkValidity()) return;
+      // submission; a submitter's `formnovalidate` skips it
+      // (<https://html.spec.whatwg.org/multipage/forms.html#interactively-validate-the-constraints>).
+      const noValidate = this.noValidate
+        || (submitter !== undefined && submitter !== null && submitter.formNoValidate);
+      if (!noValidate && !this.checkValidity()) return;
       const event = new SubmitEvent('submit', {
         submitter: submitter === undefined ? null : submitter,
         bubbles: true,
@@ -1224,11 +1245,16 @@
   };
 
   const setValueAsNumber = (element, value) => {
+    const number = Number(value);
+    // An infinite value throws before the applicability check
+    // (<https://html.spec.whatwg.org/multipage/input.html#dom-input-valueasnumber>).
+    if (number === Infinity || number === -Infinity) {
+      throw new TypeError('valueAsNumber must be finite');
+    }
     const type = inputType(element);
     if (type !== 'number' && type !== 'range' && !DATE_LIKE.has(type)) {
       throw new DOMException('valueAsNumber is not applicable', 'InvalidStateError');
     }
-    const number = Number(value);
     element.value = Number.isNaN(number) ? '' : formatValueAsNumber(type, number);
   };
 
@@ -1314,7 +1340,10 @@
     const min = parseValue(type, element.getAttribute('min'));
     const max = parseValue(type, element.getAttribute('max'));
     if (min !== null && max !== null && min > max) return;
-    const base = min === null ? 0 : min;
+    // The step base is the min attribute, else the value attribute, else 0.
+    let base = min;
+    if (base === null) base = parseValue(type, element.getAttribute('value'));
+    if (base === null) base = 0;
     const alignUp = value => base + Math.ceil((value - base) / step - 1e-9) * step;
     const alignDown = value => base + Math.floor((value - base) / step + 1e-9) * step;
     // Nothing in [min, max] is representable: nothing to do.
@@ -1351,11 +1380,11 @@
       configurable: true,
     },
     stepUp: {
-      value: function(count) { stepBy(this, count === undefined ? 1 : Number(count), 1); },
+      value: function(count) { stepBy(this, count === undefined ? 1 : Math.trunc(Number(count)), 1); },
       writable: true, enumerable: true, configurable: true,
     },
     stepDown: {
-      value: function(count) { stepBy(this, count === undefined ? 1 : Number(count), -1); },
+      value: function(count) { stepBy(this, count === undefined ? 1 : Math.trunc(Number(count)), -1); },
       writable: true, enumerable: true, configurable: true,
     },
   });
@@ -1448,7 +1477,10 @@
   // (<https://html.spec.whatwg.org/multipage/forms.html#category-listed>).
   const listedElements = form =>
     Array.from(form.ownerDocument.querySelectorAll(LISTED))
-      .filter(element => element.form === form);
+      .filter(element => element.form === form)
+      // An image button is excluded from the controls collection for historical
+      // reasons (<https://html.spec.whatwg.org/multipage/forms.html#dom-form-elements>).
+      .filter(element => !(element.tagName === 'INPUT' && element.type === 'image'));
 
   // Collection interfaces. The engine may already publish `HTMLCollection`;
   // reuse it so both brands share one prototype chain

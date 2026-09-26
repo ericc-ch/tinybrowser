@@ -3,14 +3,15 @@
 (function() {
   const lists = new WeakMap();
 
-  function FormData(form) {
+  function FormData(form, submitter) {
     if (!(this instanceof FormData)) {
       throw new TypeError('Class constructor FormData cannot be invoked without new');
     }
     const list = [];
     lists.set(this, list);
     if (form !== undefined && form !== null) {
-      const flat = globalThis.__tbFormEntries(form);
+      const flat = globalThis.__tbFormEntries(
+        form, submitter === undefined || submitter === null ? null : submitter);
       for (let index = 0; index + 1 < flat.length; index += 2) {
         list.push([String(flat[index]), flat[index + 1]]);
       }
@@ -32,15 +33,24 @@
     return list;
   };
 
-  // A `Blob` value keeps its file name as the third argument; a string value
-  // ignores it (<https://xhr.spec.whatwg.org/#dom-formdata-append>).
-  const addValue = (list, name, value) => {
-    list.push([String(name), value]);
+  // A `Blob` value becomes a `File` named by the optional third argument; any
+  // other value is stringified
+  // (<https://xhr.spec.whatwg.org/#create-an-entry>).
+  const createEntry = (value, filename) => {
+    if (globalThis.Blob && value instanceof globalThis.Blob) {
+      if (globalThis.File && value instanceof globalThis.File) return value;
+      return new globalThis.File(
+        [value],
+        filename === undefined ? 'blob' : String(filename),
+        { type: value.type },
+      );
+    }
+    return String(value);
   };
 
   Object.defineProperty(FormData.prototype, 'append', {
-    value: function(name, value) {
-      addValue(entryList(this), name, value);
+    value: function(name, value, filename) {
+      entryList(this).push([String(name), createEntry(value, filename)]);
     },
     writable: true, enumerable: true, configurable: true,
   });
@@ -88,16 +98,21 @@
   });
 
   Object.defineProperty(FormData.prototype, 'set', {
-    value: function(name, value) {
+    value: function(name, value, filename) {
       const key = String(name);
+      const entry = [key, createEntry(value, filename)];
       const list = entryList(this);
-      let replaced = false;
-      for (let index = list.length - 1; index >= 0; index--) {
-        if (list[index][0] !== key) continue;
-        if (replaced) list.splice(index, 1);
-        else { list[index] = [key, value]; replaced = true; }
+      // Replace the first match and remove the rest
+      // (<https://xhr.spec.whatwg.org/#dom-formdata-set>).
+      const first = list.findIndex(item => item[0] === key);
+      if (first === -1) {
+        list.push(entry);
+        return;
       }
-      if (!replaced) list.push([key, value]);
+      list[first] = entry;
+      for (let index = list.length - 1; index > first; index--) {
+        if (list[index][0] === key) list.splice(index, 1);
+      }
     },
     writable: true, enumerable: true, configurable: true,
   });
