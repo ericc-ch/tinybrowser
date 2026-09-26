@@ -1667,6 +1667,7 @@ impl Dom {
                 &value,
                 self.attribute(id, "min").as_deref().and_then(parse_finite),
                 self.attribute(id, "max").as_deref().and_then(parse_finite),
+                self.attribute(id, "value").as_deref().and_then(parse_finite),
                 self.attribute(id, "step").as_deref(),
             ),
             "date" => sanitize_grammar(value, is_valid_date),
@@ -1907,13 +1908,23 @@ impl Dom {
         self.input_selectable.insert(id, selectable);
     }
 
-    /// The reset algorithm for a text-like control: clear the dirty value flag
-    /// so the value reverts to its default
+    /// The reset algorithm for a form control: an `input`/`textarea` clears its
+    /// dirty value and checkedness flags, and a `select` restores each option's
+    /// selectedness from its `selected` attribute before running the
+    /// selectedness setting algorithm
     /// (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#concept-form-reset-control>).
     pub fn reset_control(&mut self, id: NodeId) {
         if self.html_local_is(id, "input") || self.html_local_is(id, "textarea") {
             self.input_values.remove(&id);
             self.checkedness.remove(&id);
+            self.indeterminate.remove(&id);
+        } else if self.html_local_is(id, "select") {
+            for option in self.select_options(id) {
+                let selected = self.attribute(option, "selected").is_some();
+                self.option_selectedness.insert(option, selected);
+                self.option_dirty_selected.remove(&option);
+            }
+            self.apply_default_selectedness(id);
         }
     }
 
@@ -1937,26 +1948,58 @@ impl Dom {
     /// group when checking a radio
     /// (<https://html.spec.whatwg.org/multipage/input.html#radio-button-state-(type=radio)>).
     pub fn set_input_checkedness(&mut self, id: NodeId, checked: bool) {
-        if checked
-            && self.input_type(id).as_deref() == Some("radio")
-            && let Some(name) = self.attribute(id, "name")
-            && !name.is_empty()
-        {
-            let owner = self.nearest_form_ancestor(id);
-            let scope = owner.unwrap_or_else(|| self.tree_root_of(id));
-            let others: Vec<NodeId> = self
-                .descendants(scope)
-                .filter(|&other| {
-                    other != id
-                        && self.is_radio_named(other, &name)
-                        && self.nearest_form_ancestor(other) == owner
-                })
-                .collect();
-            for other in others {
-                self.checkedness.insert(other, false);
-            }
+        if checked && self.input_type(id).as_deref() == Some("radio") {
+            self.uncheck_radio_group(id);
         }
         self.checkedness.insert(id, checked);
+    }
+
+    /// Unchecks the other radios in `id`'s group. A radio button group is the
+    /// radios in the same tree with the same form owner and name
+    /// (<https://html.spec.whatwg.org/multipage/input.html#radio-button-group>).
+    fn uncheck_radio_group(&mut self, id: NodeId) {
+        let Some(name) = self.attribute(id, "name") else {
+            return;
+        };
+        if name.is_empty() {
+            return;
+        }
+        let owner = self.form_owner(id);
+        let scope = self.tree_root_of(id);
+        let others: Vec<NodeId> = self
+            .descendants(scope)
+            .filter(|&other| {
+                other != id
+                    && self.is_radio_named(other, &name)
+                    && self.form_owner(other) == owner
+            })
+            .collect();
+        for other in others {
+            self.checkedness.insert(other, false);
+        }
+    }
+
+    /// Re-applies a checked radio's group rule after its `name` or form owner
+    /// changed or it moved trees
+    /// (<https://html.spec.whatwg.org/multipage/input.html#radio-button-group>).
+    fn refresh_radio_group(&mut self, id: NodeId) {
+        if self.checkedness(id) && self.input_type(id).as_deref() == Some("radio") {
+            self.uncheck_radio_group(id);
+        }
+    }
+
+    /// The form owner of `node` when it is a checked radio, else `None`; used
+    /// to detect a form-owner change on insertion
+    /// (<https://html.spec.whatwg.org/multipage/input.html#radio-button-group>).
+    fn checked_radio_form_owner(&self, node: NodeId) -> Option<NodeId> {
+        if self.html_local_is(node, "input")
+            && self.input_type(node).as_deref() == Some("radio")
+            && self.checkedness(node)
+        {
+            self.form_owner(node)
+        } else {
+            None
+        }
     }
 
     /// The form owner of a form-associated element: the form named by its
@@ -1979,6 +2022,86 @@ impl Dom {
         self.nearest_form_ancestor(id)
     }
 
+    /// The nearest ancestor `select` of `node` (including `node`), if any.
+    fn nearest_select_ancestor(&self, node: NodeId) -> Option<NodeId> {
+        let mut current = Some(node);
+        while let Some(candidate) = current {
+            if self.html_local_is(candidate, "select") {
+                return Some(candidate);
+            }
+            current = self.parent(candidate);
+        }
+        None
+    }
+
+    /// A `select`'s display size: the `size` attribute, else 4 with `multiple`
+    /// and 1 otherwise
+    /// (<https://html.spec.whatwg.org/multipage/form-elements.html#the-select-element:display-size>).
+    fn display_size(&self, select: NodeId) -> u32 {
+        self.attribute(select, "size")
+            .and_then(|raw| raw.trim().parse::<u32>().ok())
+            .filter(|size| *size > 0)
+            .unwrap_or_else(|| {
+                if self.attribute(select, "multiple").is_some() {
+                    4
+                } else {
+                    1
+                }
+            })
+    }
+
+    /// Whether an option is disabled by its own attribute or a disabled
+    /// ancestor `optgroup`
+    /// (<https://html.spec.whatwg.org/multipage/form-elements.html#concept-option-disabled>).
+    fn option_disabled(&self, option: NodeId) -> bool {
+        if self.attribute(option, "disabled").is_some() {
+            return true;
+        }
+        let mut current = self.parent(option);
+        while let Some(ancestor) = current {
+            if self.html_local_is(ancestor, "select")
+                || self.html_local_is(ancestor, "hr")
+                || self.html_local_is(ancestor, "datalist")
+                || self.html_local_is(ancestor, "option")
+            {
+                return false;
+            }
+            if self.html_local_is(ancestor, "optgroup") {
+                return self.attribute(ancestor, "disabled").is_some();
+            }
+            current = self.parent(ancestor);
+        }
+        false
+    }
+
+    /// The `select` selectedness setting algorithm: a single-select of display
+    /// size 1 selects its first non-disabled option when nothing is selected,
+    /// and keeps only the last selected option
+    /// (<https://html.spec.whatwg.org/multipage/form-elements.html#selectedness-setting-algorithm>).
+    fn apply_default_selectedness(&mut self, select: NodeId) {
+        if self.attribute(select, "multiple").is_some() {
+            return;
+        }
+        let options = self.select_options(select);
+        let selected: Vec<NodeId> = options
+            .iter()
+            .copied()
+            .filter(|&option| self.option_selected(option))
+            .collect();
+        if selected.len() >= 2 {
+            for &option in &selected[..selected.len() - 1] {
+                self.option_selectedness.insert(option, false);
+            }
+            return;
+        }
+        if selected.is_empty()
+            && self.display_size(select) == 1
+            && let Some(&first) = options.iter().find(|&&option| !self.option_disabled(option))
+        {
+            self.option_selectedness.insert(first, true);
+        }
+    }
+
     /// The checked radio in `id`'s radio button group, if any.
     #[must_use]
     pub fn radio_group_checked(&self, id: NodeId) -> Option<NodeId> {
@@ -1986,10 +2109,13 @@ impl Dom {
         if name.is_empty() {
             return None;
         }
-        let owner = self.nearest_form_ancestor(id);
-        let scope = owner.unwrap_or_else(|| self.tree_root_of(id));
+        let owner = self.form_owner(id);
+        let scope = self.tree_root_of(id);
         self.descendants(scope).find(|&other| {
-            other != id && self.is_radio_named(other, &name) && self.checkedness(other)
+            other != id
+                && self.is_radio_named(other, &name)
+                && self.form_owner(other) == owner
+                && self.checkedness(other)
         })
     }
 
@@ -2214,17 +2340,10 @@ impl Dom {
     /// string (<https://html.spec.whatwg.org/multipage/form-elements.html#dom-select-value>).
     #[must_use]
     pub fn select_value(&self, id: NodeId) -> String {
-        let options = self.select_options(id);
-        for &option in &options {
+        for option in self.select_options(id) {
             if self.option_selected(option) {
                 return self.option_value(option);
             }
-        }
-        // A single-select keeps one option selected; the first is the default.
-        if self.attribute(id, "multiple").is_none()
-            && let Some(&first) = options.first()
-        {
-            return self.option_value(first);
         }
         String::new()
     }
@@ -2232,14 +2351,10 @@ impl Dom {
     /// A `select`'s selected index: the first selected option's index, else -1.
     #[must_use]
     pub fn select_selected_index(&self, id: NodeId) -> i32 {
-        let options = self.select_options(id);
-        for (index, &option) in options.iter().enumerate() {
-            if self.option_selected(option) {
+        for (index, option) in self.select_options(id).iter().enumerate() {
+            if self.option_selected(*option) {
                 return i32::try_from(index).unwrap_or(i32::MAX);
             }
-        }
-        if self.attribute(id, "multiple").is_none() && !options.is_empty() {
-            return 0;
         }
         -1
     }
@@ -2411,11 +2526,19 @@ impl Dom {
             namespace: removed.name.ns.to_string(),
             old_value: Some(removed.value),
         });
-        if local == "selected" {
+        if local.eq_ignore_ascii_case("selected") {
             self.refresh_option_selectedness(id);
+            if let Some(select) = self.nearest_select_ancestor(id) {
+                self.apply_default_selectedness(select);
+            }
         }
         if local.eq_ignore_ascii_case("type") {
             self.refresh_input_type(id)?;
+        }
+        if self.html_local_is(id, "select")
+            && (local.eq_ignore_ascii_case("multiple") || local.eq_ignore_ascii_case("size"))
+        {
+            self.apply_default_selectedness(id);
         }
         Ok(())
     }
@@ -2627,11 +2750,22 @@ impl Dom {
             namespace: recorded_namespace,
             old_value,
         });
-        if local == "selected" {
+        if local.eq_ignore_ascii_case("selected") {
             self.refresh_option_selectedness(id);
+            if let Some(select) = self.nearest_select_ancestor(id) {
+                self.apply_default_selectedness(select);
+            }
         }
         if local.eq_ignore_ascii_case("type") {
             self.refresh_input_type(id)?;
+        }
+        if local.eq_ignore_ascii_case("name") || local.eq_ignore_ascii_case("checked") {
+            self.refresh_radio_group(id);
+        }
+        if self.html_local_is(id, "select")
+            && (local.eq_ignore_ascii_case("multiple") || local.eq_ignore_ascii_case("size"))
+        {
+            self.apply_default_selectedness(id);
         }
         Ok(())
     }
@@ -2948,6 +3082,10 @@ impl Dom {
     fn place_node(&mut self, parent: NodeId, node: NodeId, before: Option<NodeId>) {
         let value_before = self.textarea_value_before_change(parent);
         self.unlink_from_current_parent(node);
+        // A checked radio whose form owner changes on insertion unchecks its
+        // new group
+        // (<https://html.spec.whatwg.org/multipage/input.html#radio-button-group>).
+        let radio_owner_before = self.checked_radio_form_owner(node);
         // Sibling references for the mutation record, read from the run the
         // node is about to join. Computed only while recording: no observer
         // exists on the parse path, so the lookups stay off it.
@@ -2969,6 +3107,15 @@ impl Dom {
             next,
         });
         self.reset_textarea_selection_if_changed(parent, value_before);
+        if radio_owner_before != self.checked_radio_form_owner(node) {
+            self.refresh_radio_group(node);
+        }
+        // An option joining a select may become the default selection.
+        if (self.html_local_is(node, "option") || self.html_local_is(node, "optgroup"))
+            && let Some(select) = self.nearest_select_ancestor(node)
+        {
+            self.apply_default_selectedness(select);
+        }
     }
 
     /// Links the unparented `node` under `parent` immediately before
@@ -3053,8 +3200,20 @@ impl Dom {
         for &id in &moved {
             self.unlink(id);
         }
+        // Insert each node and run its group rule immediately, so a radio or
+        // option sees the run in insertion order: radios moved out of a
+        // fragment into a form join a group, and options joining a select may
+        // become the default selection.
         for &id in &moved {
             self.insert_linked(parent, id, before);
+            if self.checked_radio_form_owner(id).is_some() {
+                self.refresh_radio_group(id);
+            }
+            if (self.html_local_is(id, "option") || self.html_local_is(id, "optgroup"))
+                && let Some(select) = self.nearest_select_ancestor(id)
+            {
+                self.apply_default_selectedness(select);
+            }
         }
         self.record(Mutation::ChildList {
             target: parent,
@@ -3151,6 +3310,11 @@ impl Dom {
         }) else {
             return;
         };
+        let select = if self.html_local_is(id, "option") || self.html_local_is(id, "optgroup") {
+            self.nearest_select_ancestor(id)
+        } else {
+            None
+        };
         let value_before = self.textarea_value_before_change(parent);
         if let Some(previous) = previous {
             self.node_mut(previous)
@@ -3185,6 +3349,9 @@ impl Dom {
         detached.previous_sibling = None;
         detached.next_sibling = None;
         self.reset_textarea_selection_if_changed(parent, value_before);
+        if let Some(select) = select {
+            self.apply_default_selectedness(select);
+        }
     }
 
     fn set_data(
@@ -3321,13 +3488,18 @@ fn sanitize_local_date_time_value(value: &str) -> String {
     format!("{date}T{}", normalize_time(time))
 }
 
-/// Drops a zero seconds field and a zero fraction from a valid time string.
+/// Drops a zero seconds field and trailing zeros from the fraction of a valid
+/// time string, so it is the shortest form
+/// (<https://html.spec.whatwg.org/multipage/input.html#time-state-(type=time)>).
 fn normalize_time(time: &str) -> String {
     let mut result = time.to_owned();
-    if let Some((base, fraction)) = result.split_once('.')
-        && fraction.bytes().all(|byte| byte == b'0')
-    {
-        result.truncate(base.len());
+    if let Some((base, fraction)) = result.split_once('.') {
+        let trimmed = fraction.trim_end_matches('0');
+        if trimmed.is_empty() {
+            result.truncate(base.len());
+        } else if trimmed.len() != fraction.len() {
+            result.truncate(base.len() + 1 + trimmed.len());
+        }
     }
     let parts: Vec<&str> = result.split(':').collect();
     if parts.len() == 3 && parts[2] == "00" {
@@ -3337,48 +3509,73 @@ fn normalize_time(time: &str) -> String {
 }
 
 /// The range state's value sanitization: an invalid value becomes the default
-/// (the midpoint of the range, or 50), then the value is clamped to the
-/// min/max range
-/// (<https://html.spec.whatwg.org/multipage/input.html#range-state-(type=range):value-sanitization-algorithm>).
+/// value, the value is clamped to the range, and a step mismatch rounds to the
+/// nearest representable value in the range
+/// (<https://html.spec.whatwg.org/multipage/input.html#range-state-(type=range)>).
 fn sanitize_range_value(
     value: &str,
-    min: Option<f64>,
-    max: Option<f64>,
+    min_attr: Option<f64>,
+    max_attr: Option<f64>,
+    value_attr: Option<f64>,
     step_attr: Option<&str>,
 ) -> String {
-    // A reversed range collapses to its minimum.
-    if let (Some(min), Some(max)) = (min, max)
-        && max < min
-    {
-        return format!("{min}");
+    // The range state defines a default minimum of 0 and a default maximum of
+    // 100.
+    let min = min_attr.unwrap_or(0.0);
+    let max = max_attr.unwrap_or(100.0);
+    // The default value is the midpoint, or the minimum when the range is
+    // reversed.
+    let mut number = parse_finite(value).unwrap_or_else(|| {
+        if max < min {
+            min
+        } else {
+            min + (max - min) / 2.0
+        }
+    });
+    // Underflow, then overflow (only when the maximum is not less than the
+    // minimum).
+    number = number.max(min);
+    if max >= min {
+        number = number.min(max);
     }
-    let mut number = parse_finite(value).unwrap_or(f64::NAN);
-    if !number.is_finite() {
-        number = match (min, max) {
-            (Some(min), Some(max)) => min + (max - min) / 2.0,
-            (Some(min), None) => min,
-            (None, Some(max)) => max - max / 2.0,
-            (None, None) => 50.0,
-        };
-    }
+    // A step mismatch rounds to the nearest representable value within the
+    // range, ties toward positive infinity.
     let step_any = step_attr.is_some_and(|text| text.trim().eq_ignore_ascii_case("any"));
     if !step_any {
         let step = step_attr
             .and_then(parse_finite)
             .filter(|step| *step > 0.0)
             .unwrap_or(1.0);
-        let base = min.unwrap_or(0.0);
-        number = base + ((number - base) / step).round() * step;
-    }
-    if let Some(min) = min
-        && number < min
-    {
-        number = min;
-    }
-    if let Some(max) = max
-        && number > max
-    {
-        number = max;
+        // The step base is the min attribute, else the value attribute, else 0.
+        let base = min_attr.or(value_attr).unwrap_or(0.0);
+        let quotient = (number - base) / step;
+        if (quotient - quotient.round()).abs() > 1e-9 {
+            let in_range = |candidate: f64| {
+                candidate >= min - 1e-9 && (max < min || candidate <= max + 1e-9)
+            };
+            let mut best: Option<f64> = None;
+            for candidate in [base + quotient.floor() * step, base + quotient.ceil() * step] {
+                if !in_range(candidate) {
+                    continue;
+                }
+                let keep = match best {
+                    None => true,
+                    Some(current) => {
+                        let current_distance = (current - number).abs();
+                        let candidate_distance = (candidate - number).abs();
+                        candidate_distance < current_distance - 1e-9
+                            || ((candidate_distance - current_distance).abs() <= 1e-9
+                                && candidate > current)
+                    }
+                };
+                if keep {
+                    best = Some(candidate);
+                }
+            }
+            if let Some(candidate) = best {
+                number = candidate;
+            }
+        }
     }
     format!("{number}")
 }
