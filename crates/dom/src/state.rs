@@ -397,7 +397,19 @@ pub fn is_default(dom: &Dom, id: NodeId) -> bool {
 /// groups are not represented (no form-owner association).
 #[must_use]
 pub fn is_indeterminate(dom: &Dom, id: NodeId) -> bool {
-    local_is(dom, id, &["progress"]) && attr_value(dom, id, "value").is_none()
+    if local_is(dom, id, &["progress"]) {
+        return attr_value(dom, id, "value").is_none();
+    }
+    if local_is(dom, id, &["input"]) {
+        let typ = attr_value(dom, id, "type").unwrap_or_default().to_ascii_lowercase();
+        if typ == "checkbox" {
+            return dom.indeterminate(id);
+        }
+        if typ == "radio" {
+            return dom.radio_group_checked(id).is_none();
+        }
+    }
+    false
 }
 
 /// `:defined` per <https://html.spec.whatwg.org/#selector-defined>: an

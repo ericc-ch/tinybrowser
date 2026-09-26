@@ -1939,11 +1939,6 @@ impl Dom {
             .unwrap_or_else(|| self.attribute(id, "checked").is_some())
     }
 
-    /// Sets `id`'s checkedness and the dirty checkedness flag.
-    pub fn set_checkedness(&mut self, id: NodeId, checked: bool) {
-        self.checkedness.insert(id, checked);
-    }
-
     /// Sets an input's checkedness, unchecking the rest of a radio button
     /// group when checking a radio
     /// (<https://html.spec.whatwg.org/multipage/input.html#radio-button-state-(type=radio)>).
@@ -2206,12 +2201,6 @@ impl Dom {
             .get(&id)
             .copied()
             .unwrap_or_else(|| self.attribute(id, "selected").is_some())
-    }
-
-    /// Sets `id`'s selectedness and the dirty selectedness flag.
-    pub fn set_option_selected(&mut self, id: NodeId, selected: bool) {
-        self.option_selectedness.insert(id, selected);
-        self.option_dirty_selected.insert(id);
     }
 
     /// Sets `id`'s selectedness without the dirty flag, as the `Option`

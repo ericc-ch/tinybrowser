@@ -327,7 +327,8 @@ pub(super) fn encode_form(text: String, label: String) -> String {
     clippy::needless_pass_by_value,
     reason = "rquickjs Func ABI passes arguments by value"
 )]
-pub(super) fn set_input_files<'js>(    ctx: Ctx<'js>,
+pub(super) fn set_input_files<'js>(
+    ctx: Ctx<'js>,
     element: Value<'js>,
     files: Value<'js>,
 ) -> Result<()> {
