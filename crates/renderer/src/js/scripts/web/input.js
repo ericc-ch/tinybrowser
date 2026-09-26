@@ -113,19 +113,32 @@
     }
     return { key: value, code: value };
   };
+  // The input states that accept typed text. The selection APIs do not apply to
+  // the email, number, and date-like states, but those are still editable
+  // (<https://html.spec.whatwg.org/multipage/input.html#common-input-element-attributes>).
+  const EDITABLE_TYPES = new Set([
+    'text', 'search', 'tel', 'url', 'email', 'password',
+    'date', 'month', 'week', 'time', 'datetime-local', 'number',
+  ]);
   const textControl = () => {
     const element = document.activeElement;
     if (!element) return null;
-    const tag = element.tagName;
-    if (tag !== 'INPUT' && tag !== 'TEXTAREA') return null;
-    if (element.disabled || element.readOnly) return null;
+    const editable = element.tagName === 'TEXTAREA'
+      || (element.tagName === 'INPUT' && EDITABLE_TYPES.has(element.type));
+    if (!editable || element.disabled || element.readOnly) return null;
     return element;
   };
+  // A control exposes the selection APIs when `selectionStart` is not null; the
+  // email, number, and date-like states return null and reject `setRangeText`
+  // and `setSelectionRange`
+  // (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#do-not-apply>).
+  const supportsSelection = element =>
+    element.tagName === 'TEXTAREA' || element.selectionStart !== null;
   const fireInput = (element, inputType, data) => {
     fire(element, new InputEvent('input', { bubbles: true, inputType: inputType, data: data }));
   };
-  // Replaces the inclusive range with `text` through `setRangeText`, gating on
-  // the cancelable `beforeinput` event first
+  // Replaces the inclusive range with `text`, gating on the cancelable
+  // `beforeinput` event first
   // (<https://w3c.github.io/uievents/#events-inputevents>).
   const replaceRange = (element, text, start, end, inputType, data) => {
     const before = new InputEvent('beforeinput', {
@@ -133,8 +146,11 @@
     });
     if (!element.dispatchEvent(before)) return;
     if (typeof globalThis.__tbMarkUserEdited === 'function') globalThis.__tbMarkUserEdited(element);
-    if (typeof element.setRangeText === 'function') element.setRangeText(text, start, end, 'end');
-    else element.value = element.value.slice(0, start) + text + element.value.slice(end);
+    if (supportsSelection(element)) {
+      element.setRangeText(text, start, end, 'end');
+    } else {
+      element.value = element.value.slice(0, start) + text + element.value.slice(end);
+    }
     fireInput(element, inputType, data);
   };
   const insertText = text => {
@@ -149,21 +165,24 @@
   const deleteText = backwards => {
     const element = textControl();
     if (!element) return;
-    const start = element.selectionStart;
-    const end = element.selectionEnd;
+    const length = element.value.length;
+    const start = element.selectionStart === null || element.selectionStart === undefined
+      ? length : element.selectionStart;
+    const end = element.selectionEnd === null || element.selectionEnd === undefined
+      ? length : element.selectionEnd;
     if (start === end) {
       if (backwards && start === 0) return;
-      if (!backwards && end === element.value.length) return;
+      if (!backwards && end === length) return;
       const from = backwards ? start - 1 : start;
       const to = backwards ? end : end + 1;
-      replaceRange(element, '', from, to, 'deleteContentBackward', null);
+      replaceRange(element, '', from, to, backwards ? 'deleteContentBackward' : 'deleteContentForward', null);
     } else {
       replaceRange(element, '', start, end, 'deleteContentBackward', null);
     }
   };
   const moveCaret = to => {
     const element = textControl();
-    if (!element) return;
+    if (!element || !supportsSelection(element)) return;
     const length = element.value.length;
     const start = element.selectionStart;
     const end = element.selectionEnd;
