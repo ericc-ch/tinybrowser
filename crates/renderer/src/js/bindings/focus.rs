@@ -44,25 +44,25 @@ pub(crate) fn is_focusable(ctx: &Ctx<'_>, node: NodeId) -> Result<bool> {
     let Some(parsed) = world.document(node) else {
         return Ok(false);
     };
-    let Some(kind) = parsed.dom.kind(node) else {
+    let Some(kind) = parsed.document.kind(node) else {
         return Ok(false);
     };
     let NodeKind::Element { name, .. } = kind else {
         return Ok(false);
     };
-    if !parsed.dom.is_connected(node) || is_actually_disabled(&parsed.dom, node) {
+    if !parsed.document.is_connected(node) || is_actually_disabled(&parsed.document, node) {
         return Ok(false);
     }
     // `tabindex` and `contenteditable` apply to SVG elements too.
-    if parsed.dom.attribute(node, "tabindex").is_some() || is_editable(&parsed.dom, node) {
+    if parsed.document.attribute(node, "tabindex").is_some() || is_editable(&parsed.document, node) {
         return Ok(true);
     }
     if name.ns != html_namespace() {
         return Ok(false);
     }
     Ok(match name.local.as_ref() {
-        "input" => !is_hidden_input(&parsed.dom, node),
-        "a" | "area" => parsed.dom.attribute(node, "href").is_some(),
+        "input" => !is_hidden_input(&parsed.document, node),
+        "a" | "area" => parsed.document.attribute(node, "href").is_some(),
         "button" | "iframe" | "select" | "textarea" => true,
         _ => false,
     })
@@ -240,7 +240,7 @@ pub(crate) fn element_click(ctx: &Ctx<'_>, node: NodeId) -> Result<()> {
         let Some(parsed) = world.document(node) else {
             return Ok(());
         };
-        if is_actually_disabled(&parsed.dom, node) || world.click_in_progress(node) {
+        if is_actually_disabled(&parsed.document, node) || world.click_in_progress(node) {
             return Ok(());
         }
     }
@@ -288,7 +288,7 @@ fn legacy_pre_activation(ctx: &Ctx<'_>, node: NodeId) -> Result<PreActivation> {
     let Some(mut parsed) = world.document_mut(node) else {
         return Ok(PreActivation::None);
     };
-    let dom = &mut parsed.dom;
+    let dom = &mut parsed.document;
     let Some(NodeKind::Element { name, .. }) = dom.kind(node) else {
         return Ok(PreActivation::None);
     };
@@ -328,7 +328,7 @@ fn legacy_canceled_activation(ctx: &Ctx<'_>, node: NodeId, previous: &PreActivat
     let Some(mut parsed) = world.document_mut(node) else {
         return Ok(());
     };
-    let dom = &mut parsed.dom;
+    let dom = &mut parsed.document;
     match previous {
         PreActivation::Checkbox {
             checked,
@@ -357,7 +357,7 @@ fn complete_activation(ctx: &Ctx<'_>, node: NodeId) -> Result<()> {
     let checkable = {
         let world = world.borrow();
         world.document(node).is_some_and(|parsed| {
-            let dom = &parsed.dom;
+            let dom = &parsed.document;
             matches!(
                 dom.kind(node),
                 Some(NodeKind::Element { name, .. })
@@ -401,7 +401,7 @@ fn toggle_checkedness(ctx: &Ctx<'_>, node: NodeId) -> Result<()> {
         let Some(mut parsed) = world.document_mut(node) else {
             return Ok(());
         };
-        let dom = &mut parsed.dom;
+        let dom = &mut parsed.document;
         let Some(NodeKind::Element { name, .. }) = dom.kind(node) else {
             return Ok(());
         };
@@ -449,7 +449,7 @@ fn run_activation(ctx: &Ctx<'_>, node: NodeId) -> Result<()> {
         let Some(parsed) = world.document(node) else {
             return Ok(());
         };
-        let dom = &parsed.dom;
+        let dom = &parsed.document;
         let Some(NodeKind::Element { name, .. }) = dom.kind(node) else {
             return Ok(());
         };
@@ -553,7 +553,7 @@ fn activate_element<'js>(ctx: Ctx<'js>, element: Value<'js>) -> Result<()> {
         let world = world_for_node(&ctx, node)?;
         let world = world.borrow();
         if let Some(parsed) = world.document(node)
-            && is_actually_disabled(&parsed.dom, node)
+            && is_actually_disabled(&parsed.document, node)
         {
             return Ok(());
         }
@@ -577,7 +577,7 @@ fn webdriver_click<'js>(ctx: Ctx<'js>, element: Value<'js>) -> Result<()> {
         let world = world_for_node(&ctx, node)?;
         let world = world.borrow();
         if let Some(parsed) = world.document(node)
-            && is_actually_disabled(&parsed.dom, node)
+            && is_actually_disabled(&parsed.document, node)
         {
             return Ok(());
         }

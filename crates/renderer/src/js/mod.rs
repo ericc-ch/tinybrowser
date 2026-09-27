@@ -983,20 +983,20 @@ impl Drop for JsRealm {
 
 pub(crate) fn script_at(world: &World, id: dom::NodeId) -> Option<Script> {
     let parsed = world.document(id)?;
-    let Some(dom::NodeKind::Element { name, .. }) = parsed.dom.kind(id) else {
+    let Some(dom::NodeKind::Element { name, .. }) = parsed.document.kind(id) else {
         return None;
     };
     if name.ns != dom::html_namespace() || !name.local.as_ref().eq_ignore_ascii_case("script") {
         return None;
     }
-    let source = match parsed.dom.attribute(id, "src") {
+    let source = match parsed.document.attribute(id, "src") {
         Some(src) if !src.trim().is_empty() => ScriptSource::Src(src),
         _ => ScriptSource::Inline {
-            source: element_text(&parsed.dom, id),
-            line: parsed.dom.script_line(id).unwrap_or(0),
+            source: element_text(&parsed.document, id),
+            line: parsed.document.script_line(id).unwrap_or(0),
         },
     };
-    let typ = parsed.dom.attribute(id, "type");
+    let typ = parsed.document.attribute(id, "type");
     if typ
         .as_deref()
         .is_some_and(|typ| typ.trim().eq_ignore_ascii_case("module"))

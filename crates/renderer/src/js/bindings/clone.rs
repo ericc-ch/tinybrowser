@@ -33,7 +33,7 @@ pub(crate) fn adopt_across_documents(
         let Some(parsed) = owner.document(node) else {
             return Err(Exception::throw_type(ctx, "no document"));
         };
-        import_snapshot(&parsed.dom, node, true)
+        import_snapshot(&parsed.document, node, true)
             .ok_or_else(|| throw_dom(ctx, "HierarchyRequestError", "node cannot be adopted"))?
     };
     {
@@ -46,7 +46,7 @@ pub(crate) fn adopt_across_documents(
             return Err(Exception::throw_type(ctx, "no document"));
         };
         parsed
-            .dom
+            .document
             .detach(node)
             .map_err(|err| throw_dom_error(ctx, err))?;
     }
@@ -54,7 +54,7 @@ pub(crate) fn adopt_across_documents(
     let Some(mut parsed) = world.document_mut(parent) else {
         return Err(Exception::throw_type(ctx, "no document"));
     };
-    materialize_import(&mut parsed.dom, &snapshot).map_err(|err| throw_dom_error(ctx, err))
+    materialize_import(&mut parsed.document, &snapshot).map_err(|err| throw_dom_error(ctx, err))
 }
 
 /// [Clones](https://dom.spec.whatwg.org/#concept-node-clone) a document into a
@@ -69,10 +69,10 @@ pub(crate) fn clone_document<'js>(ctx: &Ctx<'js>, id: NodeId, deep: bool) -> Res
         };
         let children = if deep {
             parsed
-                .dom
+                .document
                 .children(id)
                 .map(|kids| {
-                    kids.filter_map(|kid| import_snapshot(&parsed.dom, kid, true))
+                    kids.filter_map(|kid| import_snapshot(&parsed.document, kid, true))
                         .collect()
                 })
                 .unwrap_or_default()
@@ -83,12 +83,12 @@ pub(crate) fn clone_document<'js>(ctx: &Ctx<'js>, id: NodeId, deep: bool) -> Res
     };
     let mut parsed = crate::Parsed::empty(content_type);
     parsed.quirks_mode = quirks_mode;
-    let document = parsed.dom.document();
+    let document = parsed.document.document();
     for child in children {
         let child =
-            materialize_import(&mut parsed.dom, &child).map_err(|err| throw_dom_error(ctx, err))?;
+            materialize_import(&mut parsed.document, &child).map_err(|err| throw_dom_error(ctx, err))?;
         parsed
-            .dom
+            .document
             .append(document, child)
             .map_err(|err| throw_dom_error(ctx, err))?;
     }

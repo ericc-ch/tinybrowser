@@ -1230,7 +1230,7 @@ fn default_passive(ctx: &Ctx<'_>, typ: &str, target: EventTargetKey) -> Result<b
             let Some(parsed) = world.document(id) else {
                 return Ok(false);
             };
-            let dom = &parsed.dom;
+            let dom = &parsed.document;
             if dom.document() == id {
                 return Ok(true);
             }
@@ -1412,7 +1412,7 @@ fn active_body(ctx: &Ctx<'_>) -> Option<dom::NodeId> {
     let world = bindings::world(ctx).ok()?;
     let world = world.borrow();
     let parsed = world.main_document()?;
-    dom::selector::select_first(&parsed.dom, parsed.dom.document(), "body")
+    dom::selector::select_first(&parsed.document, parsed.document.document(), "body")
         .ok()
         .flatten()
 }

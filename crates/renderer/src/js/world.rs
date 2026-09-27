@@ -504,7 +504,7 @@ impl World {
         let mut documents = self.runtime.documents.borrow_mut();
         for id in &self.owned {
             if let Some(parsed) = documents.get_mut(*id) {
-                parsed.dom.set_record_mutations(recording);
+                parsed.document.set_record_mutations(recording);
             }
         }
     }
@@ -517,13 +517,13 @@ impl World {
             let Some(parsed) = documents.get_mut(*id) else {
                 continue;
             };
-            let mutations = parsed.dom.take_mutations();
+            let mutations = parsed.document.take_mutations();
             if mutations.is_empty() || self.observers.is_empty() {
                 continue;
             }
             for mutation in mutations {
                 for observer in self.observers.values_mut() {
-                    if let Some(record) = match_observation(&parsed.dom, observer, &mutation) {
+                    if let Some(record) = match_observation(&parsed.document, observer, &mutation) {
                         observer.queue.push(record);
                     }
                 }
@@ -607,7 +607,7 @@ impl World {
     /// document, its wrappers, and its realm keep their identity while the
     /// object is replaced in the store.
     pub(crate) fn set_document(&mut self, parsed: Parsed) -> u32 {
-        let id = parsed.dom.document_id();
+        let id = parsed.document.document_id();
         if self.document == Some(id) {
             self.runtime.documents.borrow_mut().insert(parsed);
             self.current_script = None;
@@ -732,7 +732,7 @@ impl World {
 
     /// Stores a secondary document and returns its root id.
     pub(crate) fn add_document(&mut self, parsed: Parsed) -> NodeId {
-        let root = parsed.dom.document();
+        let root = parsed.document.document();
         let id = self.runtime.documents.borrow_mut().insert(parsed);
         self.owned.insert(id);
         root
@@ -762,7 +762,7 @@ impl World {
             owner
                 .borrow()
                 .main_document()
-                .is_some_and(|parsed| parsed.dom.is_connected(container))
+                .is_some_and(|parsed| parsed.document.is_connected(container))
         })
     }
 
@@ -787,7 +787,7 @@ impl World {
     pub(crate) fn register_pending_frames(&mut self) -> Vec<NodeId> {
         let mut created = Vec::new();
         let has_iframes = self
-            .with_main_document(|parsed| parsed.dom.connected_iframe_count() > 0)
+            .with_main_document(|parsed| parsed.document.connected_iframe_count() > 0)
             .unwrap_or(false);
         if !has_iframes {
             return created;
@@ -853,17 +853,17 @@ impl World {
     pub(crate) fn iframe_containers_in_order(&self) -> Vec<NodeId> {
         self.with_main_document(|parsed| {
             let mut containers = Vec::new();
-            let mut stack = vec![parsed.dom.document()];
+            let mut stack = vec![parsed.document.document()];
             while let Some(id) = stack.pop() {
-                if parsed.dom.is_iframe_element(id) && parsed.dom.is_connected(id) {
+                if parsed.document.is_iframe_element(id) && parsed.document.is_connected(id) {
                     containers.push(id);
                 }
                 let mut children: Vec<NodeId> = parsed
-                    .dom
+                    .document
                     .children(id)
                     .map(Iterator::collect)
                     .unwrap_or_default();
-                if let Some(root) = parsed.dom.shadow_root(id) {
+                if let Some(root) = parsed.document.shadow_root(id) {
                     children.push(root);
                 }
                 children.reverse();
@@ -1015,7 +1015,7 @@ impl World {
 
     /// The root node of the frame's active document.
     pub(crate) fn main_document_root(&self) -> Option<NodeId> {
-        self.main_document().map(|parsed| parsed.dom.document())
+        self.main_document().map(|parsed| parsed.document.document())
     }
 
     pub(crate) fn queue_frame_navigation(&mut self, navigation: FrameNavigation) {
@@ -1298,13 +1298,13 @@ impl World {
 
     /// The parent of `id` in its tree, if any.
     pub(crate) fn node_parent(&self, id: NodeId) -> Option<NodeId> {
-        self.document(id).and_then(|parsed| parsed.dom.parent(id))
+        self.document(id).and_then(|parsed| parsed.document.parent(id))
     }
 
     /// Whether `id` is the root document node of its tree.
     pub(crate) fn node_is_document(&self, id: NodeId) -> bool {
         self.document(id)
-            .is_some_and(|parsed| parsed.dom.document() == id)
+            .is_some_and(|parsed| parsed.document.document() == id)
     }
 
     pub(crate) fn clear_listeners(&mut self) {
@@ -1435,7 +1435,7 @@ impl World {
         // Mirror into the document so `:focus` and `:focus-within` match
         // (<https://drafts.csswg.org/selectors-4/#the-focus-pseudo>).
         if let Some(parsed) = self.runtime.documents.borrow_mut().get_mut(document) {
-            parsed.dom.set_active_element(document, node);
+            parsed.document.set_active_element(document, node);
         }
     }
 

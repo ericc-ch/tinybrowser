@@ -306,7 +306,7 @@ impl Engine {
         let world = document.world();
         let world = world.borrow();
         let sheets = world
-            .with_main_document(|parsed| collect_stylesheets(&parsed.dom, document))
+            .with_main_document(|parsed| collect_stylesheets(&parsed.document, document))
             .ok_or_else(|| TabError::RendererUnavailable {
                 message: "no document to render".into(),
             })?;
@@ -317,7 +317,7 @@ impl Engine {
         };
         let image = world
             .with_main_document(|parsed| {
-                crate::render::render(&parsed.dom, &sheets, &options, &world.images)
+                crate::render::render(&parsed.document, &sheets, &options, &world.images)
             })
             .ok_or_else(|| TabError::RendererUnavailable {
                 message: "no document to render".into(),

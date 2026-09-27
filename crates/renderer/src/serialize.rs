@@ -316,7 +316,7 @@ enum DefaultDeclarationHandling {
 }
 
 struct XmlSerializer<'a> {
-    dom: &'a Document,
+    document: &'a Document,
     require_well_formed: bool,
     prefix_index: u32,
 }
@@ -324,7 +324,7 @@ struct XmlSerializer<'a> {
 impl<'a> XmlSerializer<'a> {
     fn new(dom: &'a Document, require_well_formed: bool) -> Self {
         Self {
-            dom,
+            document: dom,
             require_well_formed,
             prefix_index: 1,
         }
@@ -339,21 +339,21 @@ impl<'a> XmlSerializer<'a> {
         map: &PrefixMap,
         output: &mut String,
     ) -> Result<(), XmlSerializeError> {
-        let Some(kind) = self.dom.kind(id).cloned() else {
+        let Some(kind) = self.document.kind(id).cloned() else {
             return Err(XmlSerializeError);
         };
         match kind {
             NodeKind::Document => {
-                if self.require_well_formed && !has_document_element(self.dom, id) {
+                if self.require_well_formed && !has_document_element(self.document, id) {
                     return Err(XmlSerializeError);
                 }
-                for child in children(self.dom, id) {
+                for child in children(self.document, id) {
                     self.node(child, context, map, output)?;
                 }
                 Ok(())
             }
             NodeKind::Fragment => {
-                for child in children(self.dom, id) {
+                for child in children(self.document, id) {
                     self.node(child, context, map, output)?;
                 }
                 Ok(())
@@ -667,7 +667,7 @@ impl<'a> XmlSerializer<'a> {
             namespace: ns,
             context: child_context,
         } = *serialized;
-        let element_children = children(self.dom, id);
+        let element_children = children(self.document, id);
         let in_html = ns == Some(html_namespace().as_ref());
         let has_children = !element_children.is_empty();
         if in_html && !has_children && serializes_as_void(name) {
@@ -680,13 +680,13 @@ impl<'a> XmlSerializer<'a> {
         }
         output.push('>');
         let contents = if in_html && name.local.as_ref() == "template" {
-            self.dom.template_contents(id)
+            self.document.template_contents(id)
         } else {
             None
         };
         match contents {
             Some(contents) => {
-                for child in children(self.dom, contents) {
+                for child in children(self.document, contents) {
                     self.node(child, child_context, map, output)?;
                 }
             }

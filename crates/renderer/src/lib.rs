@@ -63,7 +63,7 @@ pub(crate) enum ReadyState {
 #[derive(Debug)]
 pub(crate) struct Parsed {
     /// The parsed tree, rooted at [`dom::Document::document`].
-    pub dom: dom::Document,
+    pub document: dom::Document,
     /// Compatibility mode selected by the doctype (or its absence).
     pub quirks_mode: QuirksMode,
     /// MIME type this document reports from `document.contentType`.
@@ -83,7 +83,7 @@ impl Parsed {
     /// like the ones script constructors create.
     pub(crate) fn empty(content_type: &'static str) -> Self {
         Self {
-            dom: dom::Document::new(),
+            document: dom::Document::new(),
             quirks_mode: QuirksMode::NoQuirks,
             content_type,
             ready_state: ReadyState::Complete,
@@ -222,7 +222,7 @@ struct Sink {
     // the middle of another call: borrows are short, sequential, and cannot
     // overlap. If one ever did overlap, that is an adapter bug and the
     // `RefCell` panics loudly rather than corrupting the tree.
-    dom: RefCell<dom::Document>,
+    document: RefCell<dom::Document>,
     quirks_mode: Cell<QuirksMode>,
     /// Elements the tree builder flagged as
     /// [HTML integration points](https://html.spec.whatwg.org/multipage/parsing.html#html-integration-point):
@@ -240,7 +240,7 @@ struct Sink {
 impl Sink {
     fn new() -> Self {
         Self {
-            dom: RefCell::new(dom::Document::new()),
+            document: RefCell::new(dom::Document::new()),
             quirks_mode: Cell::new(QuirksMode::NoQuirks),
             integration_points: RefCell::new(HashSet::new()),
             current_line: Cell::new(0),
@@ -249,7 +249,7 @@ impl Sink {
 
     fn take_state(&self) -> Parsed {
         Parsed {
-            dom: std::mem::replace(&mut *self.dom.borrow_mut(), dom::Document::new()),
+            document: std::mem::replace(&mut *self.document.borrow_mut(), dom::Document::new()),
             quirks_mode: self.quirks_mode.get(),
             content_type: "text/html",
             ready_state: ReadyState::Loading,
@@ -258,7 +258,7 @@ impl Sink {
     }
 
     fn restore(&self, parsed: Parsed) {
-        *self.dom.borrow_mut() = parsed.dom;
+        *self.document.borrow_mut() = parsed.document;
         self.quirks_mode.set(parsed.quirks_mode);
     }
 
@@ -267,7 +267,7 @@ impl Sink {
     /// home here. The append path (`before == None`) checks the last child;
     /// the insert path checks `before`'s previous sibling.
     fn insert_text(&self, parent: Handle, before: Option<Handle>, text: &str) {
-        let mut dom = self.dom.borrow_mut();
+        let mut dom = self.document.borrow_mut();
         let neighbor = match before {
             None => dom.children(parent).and_then(|mut kids| kids.next_back()),
             // On the parser path `sibling` is always a child of `parent`, so
@@ -320,7 +320,7 @@ impl TreeSink for Sink {
 
     fn finish(self) -> Self::Output {
         Parsed {
-            dom: self.dom.into_inner(),
+            document: self.document.into_inner(),
             quirks_mode: self.quirks_mode.get(),
             content_type: "text/html",
             ready_state: ReadyState::Loading,
@@ -340,11 +340,11 @@ impl TreeSink for Sink {
     }
 
     fn get_document(&self) -> Self::Handle {
-        self.dom.borrow().document()
+        self.document.borrow().document()
     }
 
     fn elem_name<'a>(&'a self, target: &'a Self::Handle) -> Self::ElemName<'a> {
-        match self.dom.borrow().kind(*target) {
+        match self.document.borrow().kind(*target) {
             Some(NodeKind::Element { name, .. }) => OwnedElemName {
                 ns: name.ns.clone(),
                 local: name.local.clone(),
@@ -362,7 +362,7 @@ impl TreeSink for Sink {
         let is_script = name.ns == dom::html_namespace() && name.local.as_ref() == "script";
         let line = self.current_line.get();
         let element = self
-            .dom
+            .document
             .borrow_mut()
             .create_element(name, convert_attrs(attrs));
         if is_script {
@@ -370,11 +370,11 @@ impl TreeSink for Sink {
                 clippy::cast_possible_truncation,
                 reason = "a document line beyond u32 is not reachable"
             )]
-            self.dom.borrow_mut().set_script_line(element, line as u32);
+            self.document.borrow_mut().set_script_line(element, line as u32);
         }
         if flags.template {
-            let contents = self.dom.borrow_mut().create_fragment();
-            self.dom
+            let contents = self.document.borrow_mut().create_fragment();
+            self.document
                 .borrow_mut()
                 .set_template_contents(element, contents)
                 .expect("fresh template element accepts a fresh contents fragment");
@@ -386,20 +386,20 @@ impl TreeSink for Sink {
     }
 
     fn create_comment(&self, text: StrTendril) -> Self::Handle {
-        self.dom.borrow_mut().create_comment(text)
+        self.document.borrow_mut().create_comment(text)
     }
 
     /// Per the HTML spec, processing instructions become comments whose data
     /// is `target + ' ' + data`.
     fn create_pi(&self, target: StrTendril, data: StrTendril) -> Self::Handle {
         let combined = format!("{target} {data}");
-        self.dom.borrow_mut().create_comment(combined)
+        self.document.borrow_mut().create_comment(combined)
     }
 
     fn append(&self, parent: &Self::Handle, child: NodeOrText<Self::Handle>) {
         match child {
             NodeOrText::AppendNode(node) => {
-                let _ = self.dom.borrow_mut().append(*parent, node);
+                let _ = self.document.borrow_mut().append(*parent, node);
             }
             NodeOrText::AppendText(ref text) => self.insert_text(*parent, None, text),
         }
@@ -411,7 +411,7 @@ impl TreeSink for Sink {
         prev_element: &Self::Handle,
         child: NodeOrText<Self::Handle>,
     ) {
-        if self.dom.borrow().parent(*element).is_some() {
+        if self.document.borrow().parent(*element).is_some() {
             self.append_before_sibling(element, child);
         } else {
             self.append(prev_element, child);
@@ -426,14 +426,14 @@ impl TreeSink for Sink {
     ) {
         let doc = self.get_document();
         let doctype = self
-            .dom
+            .document
             .borrow_mut()
             .create_doctype(name, public_id, system_id);
-        let _ = self.dom.borrow_mut().append(doc, doctype);
+        let _ = self.document.borrow_mut().append(doc, doctype);
     }
 
     fn get_template_contents(&self, target: &Self::Handle) -> Self::Handle {
-        self.dom
+        self.document
             .borrow()
             .template_contents(*target)
             .unwrap_or_else(|| panic!("template contents requested for a non-template"))
@@ -459,18 +459,18 @@ impl TreeSink for Sink {
             QuirksMode::LimitedQuirks => dom::QuirksMode::LimitedQuirks,
             QuirksMode::Quirks => dom::QuirksMode::Quirks,
         };
-        self.dom.borrow_mut().set_quirks_mode(stored);
+        self.document.borrow_mut().set_quirks_mode(stored);
     }
 
     fn append_before_sibling(&self, sibling: &Self::Handle, new_node: NodeOrText<Self::Handle>) {
         match new_node {
             NodeOrText::AppendNode(node) => {
-                let _ = self.dom.borrow_mut().insert_before(*sibling, node);
+                let _ = self.document.borrow_mut().insert_before(*sibling, node);
             }
             NodeOrText::AppendText(ref text) => {
                 // Merge into the previous sibling when that is text; the
                 // builder promises `sibling` itself is not a text node.
-                let parent = { self.dom.borrow().parent(*sibling) };
+                let parent = { self.document.borrow().parent(*sibling) };
                 if let Some(parent) = parent {
                     self.insert_text(parent, Some(*sibling), text);
                 }
@@ -480,22 +480,22 @@ impl TreeSink for Sink {
 
     fn add_attrs_if_missing(&self, target: &Self::Handle, attrs: Vec<markup5ever::Attribute>) {
         let _ = self
-            .dom
+            .document
             .borrow_mut()
             .add_attrs_if_missing(*target, convert_attrs(attrs));
     }
 
     fn remove_from_parent(&self, target: &Self::Handle) {
-        let _ = self.dom.borrow_mut().detach(*target);
+        let _ = self.document.borrow_mut().detach(*target);
     }
 
     fn reparent_children(&self, node: &Self::Handle, new_parent: &Self::Handle) {
-        let _ = self.dom.borrow_mut().reparent_children(*node, *new_parent);
+        let _ = self.document.borrow_mut().reparent_children(*node, *new_parent);
     }
 
     /// [Maybe clone an option into selectedcontent](https://html.spec.whatwg.org/multipage/form-elements.html#maybe-clone-an-option-into-selectedcontent).
     fn maybe_clone_an_option_into_selectedcontent(&self, option: &Self::Handle) {
-        let mut dom = self.dom.borrow_mut();
+        let mut dom = self.document.borrow_mut();
         let Some(select) = nearest_html_select(&dom, *option) else {
             return;
         };

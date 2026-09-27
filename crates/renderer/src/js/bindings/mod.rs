@@ -96,7 +96,7 @@ pub(crate) fn forget_world(context: &rquickjs::Context) {
 pub(crate) fn main_document(ctx: &Ctx<'_>) -> Result<NodeId> {
     world(ctx)?
         .borrow()
-        .with_main_document(|parsed| parsed.dom.document())
+        .with_main_document(|parsed| parsed.document.document())
         .ok_or_else(|| Exception::throw_type(ctx, "no document"))
 }
 
@@ -449,7 +449,7 @@ pub(crate) fn install(ctx: &Ctx<'_>, world: &Rc<RefCell<World>>) -> Result<()> {
 
     let document_id = world
         .borrow()
-        .with_main_document(|parsed| parsed.dom.document());
+        .with_main_document(|parsed| parsed.document.document());
     if let Some(id) = document_id {
         globals.set("document", wrap_node(ctx, id)?)?;
     }
@@ -562,8 +562,8 @@ pub(super) fn webdriver_element(ctx: Ctx<'_>, remote_id: f64) -> Result<Value<'_
     };
     // Only a live, connected element is a valid element reference.
     let valid = world.borrow().document(node).is_some_and(|parsed| {
-        parsed.dom.is_connected(node)
-            && matches!(parsed.dom.kind(node), Some(NodeKind::Element { .. }))
+        parsed.document.is_connected(node)
+            && matches!(parsed.document.kind(node), Some(NodeKind::Element { .. }))
     });
     if !valid {
         return Ok(Value::new_null(ctx));
@@ -579,14 +579,14 @@ pub(super) fn layout_boxes(ctx: &Ctx<'_>, document: NodeId) -> Result<Vec<crate:
     let Some(parsed) = world.document(document) else {
         return Ok(Vec::new());
     };
-    let sheets = inline_stylesheets(&parsed.dom);
+    let sheets = inline_stylesheets(&parsed.document);
     let options = crate::render::RenderOptions {
         width: crate::engine::VIEWPORT_WIDTH,
         height: crate::engine::VIEWPORT_HEIGHT,
         scale: 1.0,
     };
     Ok(
-        crate::render::layout_boxes(&parsed.dom, &sheets, &options, &world.images)
+        crate::render::layout_boxes(&parsed.document, &sheets, &options, &world.images)
             .unwrap_or_default(),
     )
 }
@@ -716,7 +716,7 @@ fn instantiate_node<'js>(ctx: &Ctx<'js>, id: NodeId) -> Result<Value<'js>> {
     let is_shadow_root = world(ctx)?
         .borrow()
         .document(id)
-        .is_some_and(|parsed| parsed.dom.shadow_host(id).is_some());
+        .is_some_and(|parsed| parsed.document.shadow_host(id).is_some());
     let brand = with_node_kind(ctx, id, |kind| match kind {
         Some(NodeKind::Document) => Some(if document_is_html_content(ctx, id) {
             "Document"
@@ -1018,7 +1018,7 @@ pub(super) fn with_node_kind<T>(
     let Some(parsed) = parsed.document(id) else {
         return Err(Exception::throw_type(ctx, "no document"));
     };
-    Ok(read(parsed.dom.kind(id)))
+    Ok(read(parsed.document.kind(id)))
 }
 
 pub(crate) fn character_data(ctx: &Ctx<'_>, id: NodeId) -> Result<String> {
@@ -1039,7 +1039,7 @@ pub(super) fn attribute_value(ctx: &Ctx<'_>, id: NodeId, local: &str) -> Result<
     Ok(world
         .borrow()
         .document(id)
-        .and_then(|parsed| parsed.dom.attribute(id, local))
+        .and_then(|parsed| parsed.document.attribute(id, local))
         .unwrap_or_default())
 }
 
@@ -1051,28 +1051,28 @@ pub(super) fn set_character_data(ctx: &Ctx<'_>, id: NodeId, data: String) -> Res
     let Some(mut parsed) = world.document_mut(id) else {
         return Ok(());
     };
-    match parsed.dom.kind(id) {
+    match parsed.document.kind(id) {
         Some(NodeKind::Text { .. }) => {
             parsed
-                .dom
+                .document
                 .set_text(id, data)
                 .map_err(|err| throw_dom_error(ctx, err))?;
         }
         Some(NodeKind::CDataSection { .. }) => {
             parsed
-                .dom
+                .document
                 .set_cdata_section(id, data)
                 .map_err(|err| throw_dom_error(ctx, err))?;
         }
         Some(NodeKind::ProcessingInstruction { .. }) => {
             parsed
-                .dom
+                .document
                 .set_processing_instruction(id, data)
                 .map_err(|err| throw_dom_error(ctx, err))?;
         }
         Some(NodeKind::Comment { .. }) => {
             parsed
-                .dom
+                .document
                 .set_comment(id, data)
                 .map_err(|err| throw_dom_error(ctx, err))?;
         }
@@ -1122,7 +1122,7 @@ pub(super) fn sibling_value<'js>(ctx: &Ctx<'js>, id: NodeId, forward: bool) -> R
     let sibling = world
         .borrow()
         .document(id)
-        .and_then(|parsed| parsed.dom.sibling(id, forward));
+        .and_then(|parsed| parsed.document.sibling(id, forward));
     child_value(ctx, sibling)
 }
 
@@ -1139,12 +1139,12 @@ pub(super) fn element_sibling_value<'js>(
         let Some(parsed) = parsed.document(id) else {
             return Ok(Value::new_null(ctx.clone()));
         };
-        let mut cursor = parsed.dom.sibling(id, forward);
+        let mut cursor = parsed.document.sibling(id, forward);
         while let Some(sibling) = cursor {
-            if is_element(&parsed.dom, sibling) {
+            if is_element(&parsed.document, sibling) {
                 break;
             }
-            cursor = parsed.dom.sibling(sibling, forward);
+            cursor = parsed.document.sibling(sibling, forward);
         }
         cursor
     };
@@ -1346,11 +1346,11 @@ pub(super) fn create_element_named<'js>(
     let Some(mut parsed) = world.document_mut(document) else {
         return Err(Exception::throw_type(ctx, "no document"));
     };
-    let id = parsed.dom.create_element(name, Vec::new());
+    let id = parsed.document.create_element(name, Vec::new());
     if is_template {
-        let contents = parsed.dom.create_fragment();
+        let contents = parsed.document.create_fragment();
         parsed
-            .dom
+            .document
             .set_template_contents(id, contents)
             .map_err(|err| throw_dom_error(ctx, err))?;
     }
@@ -1369,7 +1369,7 @@ pub(super) fn create_kind<'js>(
     let Some(mut parsed) = world.document_mut(document) else {
         return Err(Exception::throw_type(ctx, "no document"));
     };
-    let id = make(&mut parsed.dom);
+    let id = make(&mut parsed.document);
     drop(parsed);
     drop(world);
     wrap_node(ctx, id)
@@ -1551,33 +1551,33 @@ pub(super) fn collection_ids(
     };
     Ok(match kind {
         CollectionKind::Children => parsed
-            .dom
+            .document
             .children(scope)
             .map(Iterator::collect)
             .unwrap_or_default(),
         CollectionKind::ElementChildren => parsed
-            .dom
+            .document
             .children(scope)
             .map(|children| {
                 children
-                    .filter(|&kid| is_element(&parsed.dom, kid))
+                    .filter(|&kid| is_element(&parsed.document, kid))
                     .collect()
             })
             .unwrap_or_default(),
-        CollectionKind::ElementsByTag(name) => collect_by_tag(&parsed.dom, scope, name),
+        CollectionKind::ElementsByTag(name) => collect_by_tag(&parsed.document, scope, name),
         CollectionKind::ElementsByTagNs { namespace, local } => {
-            collect_by_tag_ns(&parsed.dom, scope, namespace, local)
+            collect_by_tag_ns(&parsed.document, scope, namespace, local)
         }
-        CollectionKind::ElementsByClass(names) => collect_by_class(&parsed.dom, scope, names),
-        CollectionKind::ElementsByName(name) => collect_by_name(&parsed.dom, scope, name),
-        CollectionKind::SelectOptions => parsed.dom.select_options(scope),
+        CollectionKind::ElementsByClass(names) => collect_by_class(&parsed.document, scope, names),
+        CollectionKind::ElementsByName(name) => collect_by_name(&parsed.document, scope, name),
+        CollectionKind::SelectOptions => parsed.document.select_options(scope),
         CollectionKind::SelectedOptions => parsed
-            .dom
+            .document
             .select_options(scope)
             .into_iter()
-            .filter(|&option| parsed.dom.option_selected(option))
+            .filter(|&option| parsed.document.option_selected(option))
             .collect(),
-        CollectionKind::WindowNamed(name) => collect_window_named(&parsed.dom, scope, name),
+        CollectionKind::WindowNamed(name) => collect_window_named(&parsed.document, scope, name),
         CollectionKind::Static(handles) => handles.iter().map(|handle| handle.0).collect(),
     })
 }
@@ -2001,7 +2001,7 @@ mod realm_tests {
         let realm_b = JsRealm::new(&shared, world_b.clone(), Arc::clone(&stop)).expect("realm b");
         let b_root = world_b
             .borrow()
-            .with_main_document(|parsed| parsed.dom.document())
+            .with_main_document(|parsed| parsed.document.document())
             .expect("b document");
 
         // Realm A wraps realm B's document: the same object as B's `document`.

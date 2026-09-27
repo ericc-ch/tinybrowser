@@ -91,7 +91,7 @@ impl JsImplementation {
             )?)
         };
         let mut parsed = crate::Parsed::empty(content_type);
-        let document = parsed.dom.document();
+        let document = parsed.document.document();
         if !doctype.is_null()
             && !doctype.is_undefined()
             && doctype_fields_for(&ctx, host_node_id(&ctx, &doctype).unwrap_or(document)).is_none()
@@ -112,21 +112,21 @@ impl JsImplementation {
                 let Some(source) = owner.document(doctype) else {
                     return Err(Exception::throw_type(&ctx, "no document"));
                 };
-                import_snapshot(&source.dom, doctype, true)
+                import_snapshot(&source.document, doctype, true)
             };
             if let Some(snapshot) = snapshot {
-                let node = materialize_import(&mut parsed.dom, &snapshot)
+                let node = materialize_import(&mut parsed.document, &snapshot)
                     .map_err(|err| throw_dom_error(&ctx, err))?;
                 parsed
-                    .dom
+                    .document
                     .append(document, node)
                     .map_err(|err| throw_dom_error(&ctx, err))?;
             }
         }
         if let Some(name) = root {
-            let element = parsed.dom.create_element(name, Vec::new());
+            let element = parsed.document.create_element(name, Vec::new());
             parsed
-                .dom
+                .document
                 .append(document, element)
                 .map_err(|err| throw_dom_error(&ctx, err))?;
         }
@@ -141,45 +141,45 @@ impl JsImplementation {
         title: Opt<OptionalTitle>,
     ) -> Result<Value<'js>> {
         let mut parsed = crate::Parsed::empty("text/html");
-        let document = parsed.dom.document();
-        let doctype = parsed.dom.create_doctype("html", "", "");
+        let document = parsed.document.document();
+        let doctype = parsed.document.create_doctype("html", "", "");
         parsed
-            .dom
+            .document
             .append(document, doctype)
             .map_err(|err| throw_dom_error(&ctx, err))?;
         let html = parsed
-            .dom
+            .document
             .create_element(html_element_name("html"), Vec::new());
         parsed
-            .dom
+            .document
             .append(document, html)
             .map_err(|err| throw_dom_error(&ctx, err))?;
         let head = parsed
-            .dom
+            .document
             .create_element(html_element_name("head"), Vec::new());
         parsed
-            .dom
+            .document
             .append(html, head)
             .map_err(|err| throw_dom_error(&ctx, err))?;
         if let Some(title) = title.0.and_then(|title| title.0) {
             let title_element = parsed
-                .dom
+                .document
                 .create_element(html_element_name("title"), Vec::new());
             parsed
-                .dom
+                .document
                 .append(head, title_element)
                 .map_err(|err| throw_dom_error(&ctx, err))?;
-            let text = parsed.dom.create_text(title);
+            let text = parsed.document.create_text(title);
             parsed
-                .dom
+                .document
                 .append(title_element, text)
                 .map_err(|err| throw_dom_error(&ctx, err))?;
         }
         let body = parsed
-            .dom
+            .document
             .create_element(html_element_name("body"), Vec::new());
         parsed
-            .dom
+            .document
             .append(html, body)
             .map_err(|err| throw_dom_error(&ctx, err))?;
         wrap_new_document(&ctx, parsed)
@@ -191,7 +191,7 @@ pub(super) fn doctype_fields(
     parsed: &crate::Parsed,
     id: NodeId,
 ) -> Option<(String, String, String)> {
-    match parsed.dom.kind(id) {
+    match parsed.document.kind(id) {
         Some(NodeKind::Doctype {
             name,
             public_id,
@@ -336,7 +336,7 @@ impl JsXmlSerializer {
         let Some(parsed) = world.document(id) else {
             return Err(Exception::throw_type(&ctx, "no document"));
         };
-        crate::serialize::serialize_xml(&parsed.dom, id, false)
+        crate::serialize::serialize_xml(&parsed.document, id, false)
             .map_err(|err| throw_dom(&ctx, "InvalidStateError", &err.to_string()))
     }
 }

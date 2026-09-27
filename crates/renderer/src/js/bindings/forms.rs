@@ -68,7 +68,7 @@ fn set_option_selectedness<'js>(ctx: Ctx<'js>, element: Value<'js>, selected: bo
     let Some(mut parsed) = world.document_mut(node) else {
         return Ok(());
     };
-    parsed.dom.set_option_selectedness(node, selected);
+    parsed.document.set_option_selectedness(node, selected);
     Ok(())
 }
 
@@ -127,7 +127,7 @@ fn collect_pending_entries(
     let Some(parsed) = world.document(form) else {
         return Vec::new();
     };
-    let document = &parsed.dom;
+    let document = &parsed.document;
     let root = document.tree_root_of(form);
     let mut pending = Vec::new();
     for node in document.tree().descendants(root) {
@@ -458,17 +458,17 @@ pub(super) fn form_navigate(
 fn find_named_frame(world: &Rc<RefCell<World>>, name: &str) -> Option<NodeId> {
     let world = world.borrow();
     let parsed = world.main_document()?;
-    let mut stack = vec![parsed.dom.document()];
+    let mut stack = vec![parsed.document.document()];
     while let Some(node) = stack.pop() {
-        if let Some(NodeKind::Element { name: element, .. }) = parsed.dom.kind(node)
+        if let Some(NodeKind::Element { name: element, .. }) = parsed.document.kind(node)
             && element.ns == html_namespace()
             && element.local.as_ref() == "iframe"
-            && parsed.dom.attribute(node, "name").as_deref() == Some(name)
+            && parsed.document.attribute(node, "name").as_deref() == Some(name)
         {
             return Some(node);
         }
         let children: Vec<NodeId> = parsed
-            .dom
+            .document
             .children(node)
             .map(Iterator::collect)
             .unwrap_or_default();

@@ -115,7 +115,7 @@ pub(crate) fn convert_nodes_into_node<'js>(
     let Some(mut parsed) = world.document_mut(document) else {
         return Err(Exception::throw_type(ctx, "no document"));
     };
-    let dom = &mut parsed.dom;
+    let dom = &mut parsed.document;
     if pieces.len() == 1 {
         return match pieces.pop() {
             Some(Piece::Node(id)) => Ok(id),

@@ -51,7 +51,7 @@ impl JsTokenList {
         Ok(world
             .borrow()
             .document(self.element.0)
-            .and_then(|parsed| parsed.dom.attribute(self.element.0, "class"))
+            .and_then(|parsed| parsed.document.attribute(self.element.0, "class"))
             .unwrap_or_default())
     }
 
@@ -175,7 +175,7 @@ fn class_tokens(ctx: &Ctx<'_>, id: NodeId) -> Result<Vec<String>> {
     for token in world
         .borrow()
         .document(id)
-        .and_then(|parsed| parsed.dom.attribute(id, "class"))
+        .and_then(|parsed| parsed.document.attribute(id, "class"))
         .unwrap_or_default()
         .split_ascii_whitespace()
     {
@@ -238,11 +238,11 @@ fn write_class(ctx: &Ctx<'_>, id: NodeId, value: &str) -> Result<()> {
     let Some(mut parsed) = world.document_mut(id) else {
         return Ok(());
     };
-    if value.is_empty() && parsed.dom.attribute(id, "class").is_none() {
+    if value.is_empty() && parsed.document.attribute(id, "class").is_none() {
         return Ok(());
     }
     parsed
-        .dom
+        .document
         .set_attribute(id, "class", value)
         .map_err(|err| throw_dom_error(ctx, err))?;
     drop(parsed);
@@ -370,14 +370,14 @@ impl JsAttr {
                 world_for_node(&ctx, self.scope.0).ok().and_then(|world| {
                     world
                         .borrow()
-                        .with_document(self.scope.0, |parsed| parsed.dom.document())
+                        .with_document(self.scope.0, |parsed| parsed.document.document())
                 })
             },
             |owner| {
                 world_for_node(&ctx, owner).ok().and_then(|world| {
                     world
                         .borrow()
-                        .with_document(owner, |parsed| parsed.dom.document())
+                        .with_document(owner, |parsed| parsed.document.document())
                 })
             },
         );
@@ -414,7 +414,7 @@ impl JsNamedNodeMap {
             return Ok(0);
         };
         Ok(parsed
-            .dom
+            .document
             .attributes(self.element.0)
             .map_or(0, <[dom::Attribute]>::len))
     }
@@ -503,7 +503,7 @@ fn attribute_at(ctx: &Ctx<'_>, element: NodeId, index: i64) -> Result<Option<(St
     let Some(parsed) = world.document(element) else {
         return Ok(None);
     };
-    let Some(list) = parsed.dom.attributes(element) else {
+    let Some(list) = parsed.document.attributes(element) else {
         return Ok(None);
     };
     Ok(usize::try_from(index)
@@ -552,7 +552,7 @@ fn named_attribute_id(
         let Some(parsed) = world.document(element) else {
             return Ok(None);
         };
-        parsed.dom.attributes(element).and_then(|list| {
+        parsed.document.attributes(element).and_then(|list| {
             list.iter()
                 .find(|attribute| qualified_name_eq(&attribute.name, &name))
                 .map(|attribute| {
@@ -589,7 +589,7 @@ pub(crate) fn attr_owner(ctx: &Ctx<'_>, scope: NodeId, id: u64) -> Option<NodeId
     let state = world.attrs.get(&id)?;
     let parsed = world.document(owner)?;
     parsed
-        .dom
+        .document
         .attribute_ns(owner, &state.namespace, &state.local)
         .map(|_| owner)
 }
@@ -601,7 +601,7 @@ fn attr_value(ctx: &Ctx<'_>, scope: NodeId, id: u64) -> Result<String> {
         if let Some(state) = world.attrs.get(&id)
             && let Some(parsed) = world.document(owner)
             && let Some(value) = parsed
-                .dom
+                .document
                 .attribute_ns(owner, &state.namespace, &state.local)
         {
             return Ok(value);
@@ -635,7 +635,7 @@ fn set_attr_value(ctx: &Ctx<'_>, scope: NodeId, id: u64, value: String) -> Resul
         return Ok(());
     };
     parsed
-        .dom
+        .document
         .set_attribute_by_ns(owner, &namespace, prefix.as_deref(), &local, value)
         .map_err(|err| throw_dom_error(ctx, err))?;
     drop(parsed);
@@ -659,7 +659,7 @@ pub(crate) fn refresh_named_node_map<'js>(
         let world = world_rc.borrow();
         world
             .document(element)
-            .map(|parsed| parsed.dom.attribute_names(element))
+            .map(|parsed| parsed.document.attribute_names(element))
             .unwrap_or_default()
     };
     let refresh: Function = ctx.globals().get("__tb_refreshNamedNodeMap")?;
@@ -694,7 +694,7 @@ pub(crate) fn attached_attr_id(
         let Some(parsed) = world.document(element) else {
             return Ok(None);
         };
-        parsed.dom.attributes(element).and_then(|list| {
+        parsed.document.attributes(element).and_then(|list| {
             list.iter()
                 .find(|attribute| {
                     attribute.name.ns.as_ref() == namespace
@@ -863,7 +863,7 @@ fn compile_handler_attribute(ctx: &Ctx<'_>, element: NodeId, typ: &str) -> Resul
     let body = world(ctx)?
         .borrow()
         .document(element)
-        .and_then(|parsed| parsed.dom.attribute(element, &name));
+        .and_then(|parsed| parsed.document.attribute(element, &name));
     let Some(object) = wrap_node(ctx, element)?.as_object().cloned() else {
         return Ok(());
     };
@@ -927,12 +927,12 @@ fn apply_input_type_change(ctx: &Ctx<'_>, element: NodeId) -> Result<()> {
     let Some(mut parsed) = world.document_mut(element) else {
         return Ok(());
     };
-    let now = parsed.dom.selection_supported(element);
-    let previously = parsed.dom.input_selectable(element);
+    let now = parsed.document.selection_supported(element);
+    let previously = parsed.document.input_selectable(element);
     if !previously && now {
-        parsed.dom.set_selection(element, 0, 0, 0);
+        parsed.document.set_selection(element, 0, 0, 0);
     }
-    parsed.dom.set_input_selectable(element, now);
+    parsed.document.set_input_selectable(element, now);
     Ok(())
 }
 
@@ -967,7 +967,7 @@ pub(crate) fn after_attribute_change(ctx: &Ctx<'_>, element: NodeId, local: &str
     let spec = world
         .borrow()
         .document(element)
-        .and_then(|parsed| parsed.dom.attribute(element, "src"))
+        .and_then(|parsed| parsed.document.attribute(element, "src"))
         .unwrap_or_default();
     // A detached `iframe` has no browsing context yet; insertion reads the
     // current attribute, so queueing here would navigate it twice. The same
@@ -975,7 +975,7 @@ pub(crate) fn after_attribute_change(ctx: &Ctx<'_>, element: NodeId, local: &str
     let connected = world
         .borrow()
         .document(element)
-        .is_some_and(|parsed| parsed.dom.is_connected(element));
+        .is_some_and(|parsed| parsed.document.is_connected(element));
     if !connected {
         return Ok(());
     }
@@ -996,7 +996,7 @@ pub(crate) fn handler_attribute(ctx: &Ctx<'_>, id: NodeId, name: &str) -> Result
     Ok(world
         .borrow()
         .document(id)
-        .and_then(|parsed| parsed.dom.attribute(id, name)))
+        .and_then(|parsed| parsed.document.attribute(id, name)))
 }
 
 /// Whether script explicitly cleared this element's handler property, which
@@ -1032,12 +1032,12 @@ pub(crate) fn remove_attribute_sync(
         };
         if by_namespace {
             parsed
-                .dom
+                .document
                 .remove_attribute_ns(element, namespace, local)
                 .map_err(|err| throw_dom_error(ctx, err))?;
         } else {
             parsed
-                .dom
+                .document
                 .remove_attribute(element, local)
                 .map_err(|err| throw_dom_error(ctx, err))?;
         }
@@ -1116,7 +1116,7 @@ pub(crate) fn set_attribute_node<'js>(
                 return Err(Exception::throw_type(ctx, "no document"));
             };
             parsed
-                .dom
+                .document
                 .set_attribute_by_ns(
                     element,
                     &state.namespace,

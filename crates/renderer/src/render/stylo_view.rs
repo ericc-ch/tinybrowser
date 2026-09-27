@@ -98,7 +98,7 @@ impl StyloTables {
 /// handles behind cells (filled after every record exists).
 pub(crate) struct StyloNode<'a> {
     /// The tree.
-    pub(crate) dom: &'a Document,
+    pub(crate) document: &'a Document,
     /// This node.
     pub(crate) id: NodeId,
     /// The pass's side tables.
@@ -153,7 +153,7 @@ impl<'a> StyloNode<'a> {
         std::iter::once(document)
             .chain(descendants)
             .map(|id| StyloNode {
-                dom,
+                document: dom,
                 id,
                 tables,
                 parent: Cell::new(None),
@@ -177,9 +177,9 @@ impl<'a> StyloNode<'a> {
         self.parent.set(node_at(
             nodes,
             self.tables,
-            self.dom.rendered_parent(self.id),
+            self.document.rendered_parent(self.id),
         ));
-        let kids = self.dom.rendered_children(self.id);
+        let kids = self.document.rendered_children(self.id);
         self.first_child
             .set(node_at(nodes, self.tables, kids.first().copied()));
         self.last_child
@@ -187,15 +187,15 @@ impl<'a> StyloNode<'a> {
         self.prev_sibling.set(node_at(
             nodes,
             self.tables,
-            self.dom.rendered_sibling(self.id, false),
+            self.document.rendered_sibling(self.id, false),
         ));
         self.next_sibling.set(node_at(
             nodes,
             self.tables,
-            self.dom.rendered_sibling(self.id, true),
+            self.document.rendered_sibling(self.id, true),
         ));
         let mut root = self.id;
-        while let Some(parent) = self.dom.rendered_parent(root) {
+        while let Some(parent) = self.document.rendered_parent(root) {
             root = parent;
         }
         self.owner_doc.set(node_at(nodes, self.tables, Some(root)));
@@ -203,20 +203,20 @@ impl<'a> StyloNode<'a> {
 
     /// Whether this node is an element.
     pub(crate) fn is_element(&self) -> bool {
-        matches!(self.dom.kind(self.id), Some(dom::NodeKind::Element { .. }))
+        matches!(self.document.kind(self.id), Some(dom::NodeKind::Element { .. }))
     }
 
     /// Whether this node is character data.
     pub(crate) fn is_text_node(&self) -> bool {
         matches!(
-            self.dom.kind(self.id),
+            self.document.kind(self.id),
             Some(dom::NodeKind::Text { .. } | dom::NodeKind::CDataSection { .. })
         )
     }
 
     /// The element's name, if this node is an element.
     fn name(&self) -> Option<&dom::QualName> {
-        match self.dom.kind(self.id) {
+        match self.document.kind(self.id) {
             Some(dom::NodeKind::Element { name, .. }) => Some(name),
             _ => None,
         }
@@ -286,7 +286,7 @@ impl<'a> TNode for &'a StyloNode<'a> {
     }
 
     fn is_in_document(&self) -> bool {
-        self.dom.is_connected(self.id)
+        self.document.is_connected(self.id)
     }
 
     fn opaque(&self) -> OpaqueNode {
@@ -302,7 +302,7 @@ impl<'a> TNode for &'a StyloNode<'a> {
     }
 
     fn as_document(&self) -> Option<Self::ConcreteDocument> {
-        matches!(self.dom.kind(self.id), Some(dom::NodeKind::Document)).then_some(*self)
+        matches!(self.document.kind(self.id), Some(dom::NodeKind::Document)).then_some(*self)
     }
 
     fn as_shadow_root(&self) -> Option<Self::ConcreteShadowRoot> {
@@ -421,11 +421,11 @@ impl<'a> selectors::Element for &'a StyloNode<'a> {
     }
 
     fn is_html_element_in_html_document(&self) -> bool {
-        self.is_element() && dom::is_html(self.dom, self.id)
+        self.is_element() && dom::is_html(self.document, self.id)
     }
 
     fn has_local_name(&self, local_name: &web_atoms::LocalName) -> bool {
-        dom::local_is(self.dom, self.id, &[local_name])
+        dom::local_is(self.document, self.id, &[local_name])
     }
 
     fn has_namespace(&self, ns: &web_atoms::Namespace) -> bool {
@@ -437,7 +437,7 @@ impl<'a> selectors::Element for &'a StyloNode<'a> {
             (Some(a), Some(b)) => {
                 let (a_name, b_name): (&str, &str) = (&a.local, &b.local);
                 a.ns == b.ns
-                    && if dom::is_html(self.dom, self.id) {
+                    && if dom::is_html(self.document, self.id) {
                         a_name.eq_ignore_ascii_case(b_name)
                     } else {
                         a_name == b_name
@@ -453,7 +453,7 @@ impl<'a> selectors::Element for &'a StyloNode<'a> {
         local_name: &style::LocalName,
         operation: &AttrSelectorOperation<&style::values::AtomString>,
     ) -> bool {
-        let Some(attributes) = self.dom.attributes(self.id) else {
+        let Some(attributes) = self.document.attributes(self.id) else {
             return false;
         };
         attributes.iter().any(|attribute| {
@@ -468,7 +468,7 @@ impl<'a> selectors::Element for &'a StyloNode<'a> {
             // `has_local_name`); value case handling rides inside `operation`.
             let stored = attribute.name.local.as_ref();
             let wanted: &str = &local_name.0;
-            let named = if dom::is_html(self.dom, self.id) {
+            let named = if dom::is_html(self.document, self.id) {
                 stored.eq_ignore_ascii_case(wanted)
             } else {
                 stored == wanted
@@ -483,7 +483,7 @@ impl<'a> selectors::Element for &'a StyloNode<'a> {
         _context: &mut selectors::context::MatchingContext<SelectorImpl>,
     ) -> bool {
         use style::selector_parser::NonTSPseudoClass as Pc;
-        let (dom, id) = (self.dom, self.id);
+        let (dom, id) = (self.document, self.id);
         match pc {
             Pc::AnyLink | Pc::Link => dom::is_hyperlink(dom, id),
             Pc::Enabled => dom::is_enabled(dom, id),
@@ -542,7 +542,7 @@ impl<'a> selectors::Element for &'a StyloNode<'a> {
     }
 
     fn is_link(&self) -> bool {
-        dom::is_hyperlink(self.dom, self.id)
+        dom::is_hyperlink(self.document, self.id)
     }
 
     fn is_html_slot_element(&self) -> bool {
@@ -554,7 +554,7 @@ impl<'a> selectors::Element for &'a StyloNode<'a> {
         id: &style::values::AtomIdent,
         case_sensitivity: selectors::attr::CaseSensitivity,
     ) -> bool {
-        dom::attr_value(self.dom, self.id, "id")
+        dom::attr_value(self.document, self.id, "id")
             .is_some_and(|value| case_sensitivity.eq(value.as_bytes(), id.0.as_bytes()))
     }
 
@@ -563,7 +563,7 @@ impl<'a> selectors::Element for &'a StyloNode<'a> {
         name: &style::values::AtomIdent,
         case_sensitivity: selectors::attr::CaseSensitivity,
     ) -> bool {
-        dom::attr_value(self.dom, self.id, "class").is_some_and(|value| {
+        dom::attr_value(self.document, self.id, "class").is_some_and(|value| {
             value
                 .split_ascii_whitespace()
                 .any(|token| case_sensitivity.eq(token.as_bytes(), name.0.as_bytes()))
@@ -583,10 +583,10 @@ impl<'a> selectors::Element for &'a StyloNode<'a> {
     }
 
     fn is_empty(&self) -> bool {
-        let Some(kids) = self.dom.children(self.id) else {
+        let Some(kids) = self.document.children(self.id) else {
             return false;
         };
-        kids.into_iter().all(|kid| match self.dom.kind(kid) {
+        kids.into_iter().all(|kid| match self.document.kind(kid) {
             Some(dom::NodeKind::Text { data }) => data.is_empty(),
             Some(dom::NodeKind::Element { .. }) => false,
             _ => true,
@@ -595,8 +595,8 @@ impl<'a> selectors::Element for &'a StyloNode<'a> {
 
     fn is_root(&self) -> bool {
         matches!(
-            self.dom.parent(self.id),
-            Some(parent) if matches!(self.dom.kind(parent), Some(dom::NodeKind::Document))
+            self.document.parent(self.id),
+            Some(parent) if matches!(self.document.kind(parent), Some(dom::NodeKind::Document))
         )
     }
 
@@ -648,7 +648,7 @@ impl<'a> TElement for &'a StyloNode<'a> {
         // non-structural matching here; every interactive state misses
         // vacuously.
         let mut state = stylo_dom::ElementState::empty();
-        if dom::is_hyperlink(self.dom, self.id) {
+        if dom::is_hyperlink(self.document, self.id) {
             state.insert(stylo_dom::ElementState::VISITED_OR_UNVISITED);
         }
         state
@@ -670,7 +670,7 @@ impl<'a> TElement for &'a StyloNode<'a> {
     where
         F: FnMut(&style::values::AtomIdent),
     {
-        if let Some(class) = dom::attr_value(self.dom, self.id, "class") {
+        if let Some(class) = dom::attr_value(self.document, self.id, "class") {
             for token in class.split_ascii_whitespace() {
                 let atom = style::Atom::from(token);
                 callback(style::values::AtomIdent::cast(&atom));
@@ -682,7 +682,7 @@ impl<'a> TElement for &'a StyloNode<'a> {
     where
         F: FnMut(&style::LocalName),
     {
-        if let Some(attributes) = self.dom.attributes(self.id) {
+        if let Some(attributes) = self.document.attributes(self.id) {
             // Own the interned names for the callback's duration.
             let names: Vec<style::LocalName> = attributes
                 .iter()
@@ -836,18 +836,18 @@ impl<'a> TElement for &'a StyloNode<'a> {
                         && tag[..value.len()].eq_ignore_ascii_case(value)
             }
             Some(None) => false,
-            None => dom::lang_matches(self.dom, self.id, std::slice::from_ref(value)),
+            None => dom::lang_matches(self.document, self.id, std::slice::from_ref(value)),
         }
     }
 
     fn is_html_document_body_element(&self) -> bool {
-        if !dom::local_is(self.dom, self.id, &["body"]) || !dom::is_html(self.dom, self.id) {
+        if !dom::local_is(self.document, self.id, &["body"]) || !dom::is_html(self.document, self.id) {
             return false;
         }
-        let Some(parent) = self.dom.parent(self.id) else {
+        let Some(parent) = self.document.parent(self.id) else {
             return false;
         };
-        dom::local_is(self.dom, parent, &["html"])
+        dom::local_is(self.document, parent, &["html"])
     }
 
     fn synthesize_presentational_hints_for_legacy_attributes<V>(
@@ -895,7 +895,7 @@ impl<'a> TElement for &'a StyloNode<'a> {
     fn get_attr(&self, attr: &style::LocalName, namespace: &style::Namespace) -> Option<String> {
         let wanted_ns: &str = &namespace.0;
         let wanted: &str = &attr.0;
-        self.dom.attributes(self.id)?.iter().find_map(|attribute| {
+        self.document.attributes(self.id)?.iter().find_map(|attribute| {
             (attribute.name.ns.as_ref() == wanted_ns && attribute.name.local.as_ref() == wanted)
                 .then(|| attribute.value.clone())
         })
