@@ -221,6 +221,10 @@ pub struct Dom {
     /// [`Dom::record`]; see [`Dom::named_name_exists`].
     pub(crate) named_names: HashSet<String>,
     pub(crate) named_names_seeded: bool,
+    /// Live name count at the last rebuild, the baseline for rebuilding the
+    /// growth-only index when churn outpaces the document
+    /// (<https://html.spec.whatwg.org/multipage/nav-history-apis.html#named-access-on-the-window-object>).
+    pub(crate) named_names_watermark: usize,
     /// `Cell<()>` is `Send` + `!Sync`; `PhantomData` makes `Dom` inherit
     /// exactly that split. Deleting this field would silently re-derive
     /// `Sync`, which is the point: that deletion has to be a conscious act.
@@ -324,6 +328,7 @@ impl Dom {
             mutation_serial: 0,
             named_names: HashSet::new(),
             named_names_seeded: false,
+            named_names_watermark: 0,
             _share_forbidden: PhantomData,
         }
     }
