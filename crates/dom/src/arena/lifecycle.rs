@@ -98,7 +98,7 @@ impl Dom {
     pub fn is_connected(&self, id: NodeId) -> bool {
         let mut current = Some(id);
         while let Some(node) = current {
-            if node == self.document {
+            if node == self.document() {
                 return true;
             }
             current = self.parent(node).or_else(|| self.shadow_host(node));

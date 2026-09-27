@@ -1,32 +1,29 @@
 //! The arena: flat slot array, generational handles, tree mutations.
 
+mod journal;
 mod lifecycle;
 mod metadata;
 mod shadow;
+mod tree;
 
 use std::cell::Cell;
 use std::fmt;
-use std::iter::FusedIterator;
 use std::marker::PhantomData;
-use std::sync::atomic::{AtomicU32, Ordering};
 
 use crate::form::FormState;
 use crate::id::NodeId;
 use crate::named::NamedIndex;
 use crate::node::{
-    Attribute, LocalName, Namespace, Node, NodeKind, Prefix, QualName, html_namespace,
+    Attribute, LocalName, Namespace, NodeKind, Prefix, QualName, html_namespace,
     html_qualified_name_eq, qualified_name_eq,
 };
 
+use self::journal::MutationJournal;
 use self::lifecycle::ConnectionState;
 use self::metadata::Metadata;
 use self::shadow::ShadowState;
-
-/// Next document id for a freshly constructed [`Dom`]. Relaxed arithmetic is
-/// enough: the only requirement is that two live `Dom` values do not share
-/// an id until the counter wraps (2^32 documents, accepted like generation
-/// wrap).
-static NEXT_DOCUMENT_ID: AtomicU32 = AtomicU32::new(0);
+pub use self::tree::Children;
+use self::tree::{Slot, Tree};
 
 /// The document-compatibility mode a query runs under: what html5ever's
 /// tree builder reports and parsed pages carry.
@@ -129,16 +126,6 @@ impl fmt::Display for DomError {
 
 impl std::error::Error for DomError {}
 
-/// One cell of the arena: current contents plus how many times it changed hands.
-///
-/// Crate-visible only so selector matching can take a node's storage address
-/// as a stable identity token (see [`Dom::cache_identity`]).
-#[derive(Debug)]
-pub(crate) struct Slot {
-    generation: u32,
-    node: Option<Node>,
-}
-
 /// A document: every node lives inside one flat slot array.
 ///
 /// All access goes through [`NodeId`] handles. Handles outliving their node
@@ -152,20 +139,12 @@ pub(crate) struct Slot {
 /// otherwise-auto-derived `Sync`.
 #[derive(Debug)]
 pub struct Dom {
-    slots: Vec<Slot>,
-    free: Vec<u32>,
-    document: NodeId,
+    tree: Tree,
     metadata: Metadata,
     shadow: ShadowState,
     pub(crate) form: FormState,
-    /// Recorded mutations, drained by the renderer's `MutationObserver`
-    /// plumbing; empty and unrecorded unless someone observes the document.
-    mutations: Vec<Mutation>,
-    record_mutations: bool,
-    recording_suppressed: bool,
+    journal: MutationJournal,
     connections: ConnectionState,
-    /// Bumped by every mutation; see [`Dom::mutation_serial`].
-    mutation_serial: u64,
     pub(crate) named: NamedIndex,
     /// `Cell<()>` is `Send` + `!Sync`; `PhantomData` makes `Dom` inherit
     /// exactly that split. Deleting this field would silently re-derive
@@ -179,81 +158,17 @@ impl Default for Dom {
     }
 }
 
-/// The children of one node, walked through the sibling links.
-///
-/// Double-ended because the tree is: `next_back` reads `last_child` and the
-/// `previous_sibling` links, so both directions are O(1) per step. Obtained
-/// from [`Dom::children`]; `None` there means the handle is stale, while a
-/// live leaf yields an empty iterator.
-pub struct Children<'a> {
-    dom: &'a Dom,
-    front: Option<NodeId>,
-    back: Option<NodeId>,
-}
-
-impl Iterator for Children<'_> {
-    type Item = NodeId;
-
-    fn next(&mut self) -> Option<NodeId> {
-        let current = self.front?;
-        // When the two cursors meet on the last element, both must retire:
-        // leaving `back` behind would let `next_back` yield the same node
-        // again to a caller that mixes directions.
-        if self.back == Some(current) {
-            self.front = None;
-            self.back = None;
-        } else {
-            self.front = self.dom.next_sibling(current);
-        }
-        Some(current)
-    }
-}
-
-impl DoubleEndedIterator for Children<'_> {
-    fn next_back(&mut self) -> Option<NodeId> {
-        let current = self.back?;
-        if self.front == Some(current) {
-            self.front = None;
-            self.back = None;
-        } else {
-            self.back = self.dom.previous_sibling(current);
-        }
-        Some(current)
-    }
-}
-
-// Once both cursors retire the iterator stays exhausted, never resurrecting a
-// node through a later `next`/`next_back`.
-impl FusedIterator for Children<'_> {}
-
 impl Dom {
     /// An empty document containing just the root `Document` node.
     #[must_use]
     pub fn new() -> Self {
-        let document_id = NEXT_DOCUMENT_ID.fetch_add(1, Ordering::Relaxed);
-        let root = Node {
-            parent: None,
-            first_child: None,
-            last_child: None,
-            previous_sibling: None,
-            next_sibling: None,
-            kind: NodeKind::Document,
-        };
         Self {
-            slots: vec![Slot {
-                generation: 0,
-                node: Some(root),
-            }],
-            free: Vec::new(),
-            document: NodeId::new(document_id, 0, 0),
+            tree: Tree::new(),
             metadata: Metadata::default(),
             shadow: ShadowState::default(),
             form: FormState::default(),
-            mutations: Vec::new(),
-            record_mutations: false,
-            recording_suppressed: false,
+            journal: MutationJournal::default(),
             connections: ConnectionState::default(),
-            mutation_serial: 0,
             named: NamedIndex::default(),
             _share_forbidden: PhantomData,
         }
@@ -262,15 +177,12 @@ impl Dom {
     /// Turns mutation recording on or off; recording costs nothing while no
     /// `MutationObserver` is registered.
     pub fn set_record_mutations(&mut self, recording: bool) {
-        self.record_mutations = recording;
-        if !recording {
-            self.mutations.clear();
-        }
+        self.journal.set_recording(recording);
     }
 
     /// Drains the recorded mutations in order.
     pub fn take_mutations(&mut self) -> Vec<Mutation> {
-        std::mem::take(&mut self.mutations)
+        self.journal.take()
     }
 
     /// `id`'s ancestors, nearest first, `id` excluded.
@@ -279,12 +191,7 @@ impl Dom {
     }
 
     fn record(&mut self, mutation: Mutation) {
-        // Bumped even while recording is suppressed: the tree changed, and
-        // the renderer's frame-order cache keys off this serial.
-        self.mutation_serial = self.mutation_serial.wrapping_add(1);
-        if self.record_mutations && !self.recording_suppressed {
-            self.mutations.push(mutation);
-        }
+        self.journal.record(mutation);
     }
 
     /// A counter that changes on every recorded mutation.
@@ -293,19 +200,19 @@ impl Dom {
     /// of walking the whole document on every turn.
     #[must_use]
     pub fn mutation_serial(&self) -> u64 {
-        self.mutation_serial
+        self.journal.serial()
     }
 
     /// The root `Document` node; every other node descends from it.
     #[must_use]
     pub fn document(&self) -> NodeId {
-        self.document
+        self.tree.document()
     }
 
     /// This document's arena id, for per-document renderer lookups.
     #[must_use]
     pub fn document_id(&self) -> u32 {
-        self.document.document_id()
+        self.tree.document().document_id()
     }
 
     /// Whether `id` names a currently live node.
@@ -314,19 +221,19 @@ impl Dom {
     /// later occupy the same slot; that is the whole point of generations.
     #[must_use]
     pub fn contains(&self, id: NodeId) -> bool {
-        self.live_slot(id).is_some()
+        self.tree.contains(id)
     }
 
     /// What kind of node `id` names, or `None` for a stale handle.
     #[must_use]
     pub fn kind(&self, id: NodeId) -> Option<&NodeKind> {
-        Some(&self.live_slot(id)?.node.as_ref()?.kind)
+        self.tree.kind(id)
     }
 
     /// The parent of `id`, or `None` if it is unparented or `id` is stale.
     #[must_use]
     pub fn parent(&self, id: NodeId) -> Option<NodeId> {
-        self.live_slot(id)?.node.as_ref()?.parent
+        self.tree.parent(id)
     }
 
     /// The children of `id` in document order, or `None` for a stale handle.
@@ -337,36 +244,31 @@ impl Dom {
     /// different answers; only staleness is `None`.
     #[must_use]
     pub fn children(&self, id: NodeId) -> Option<Children<'_>> {
-        let node = self.live_slot(id)?.node.as_ref()?;
-        Some(Children {
-            dom: self,
-            front: node.first_child,
-            back: node.last_child,
-        })
+        self.tree.children(id)
     }
 
     /// The first child of `id`, or `None` when it has none or is stale.
     #[must_use]
     pub fn first_child(&self, id: NodeId) -> Option<NodeId> {
-        self.live_slot(id)?.node.as_ref()?.first_child
+        self.tree.first_child(id)
     }
 
     /// The last child of `id`, or `None` when it has none or is stale.
     #[must_use]
     pub fn last_child(&self, id: NodeId) -> Option<NodeId> {
-        self.live_slot(id)?.node.as_ref()?.last_child
+        self.tree.last_child(id)
     }
 
     /// The sibling immediately before `id`, or `None`.
     #[must_use]
     pub fn previous_sibling(&self, id: NodeId) -> Option<NodeId> {
-        self.live_slot(id)?.node.as_ref()?.previous_sibling
+        self.tree.previous_sibling(id)
     }
 
     /// The sibling immediately after `id`, or `None`.
     #[must_use]
     pub fn next_sibling(&self, id: NodeId) -> Option<NodeId> {
-        self.live_slot(id)?.node.as_ref()?.next_sibling
+        self.tree.next_sibling(id)
     }
 
     /// The sibling of `id` adjacent in the given direction, or `None`.
@@ -447,7 +349,8 @@ impl Dom {
     /// so identity survives detachment too.
     #[must_use]
     pub(crate) fn cache_identity(&self, id: NodeId) -> &Slot {
-        self.live_slot(id)
+        self.tree
+            .live_slot(id)
             .expect("selector cache identity requires a live handle")
     }
 
@@ -559,7 +462,7 @@ impl Dom {
     /// - [`DomError::WrongNodeType`] if `id` is the document.
     pub fn clone_node(&mut self, id: NodeId, subtree: bool) -> Result<NodeId, DomError> {
         self.require_live(id)?;
-        if id == self.document {
+        if id == self.tree.document() {
             return Err(DomError::WrongNodeType);
         }
         let copy = self.alloc(self.kind(id).ok_or(DomError::StaleNode)?.clone());
@@ -606,7 +509,7 @@ impl Dom {
     /// - [`DomError::CycleForbidden`] if `child` is an ancestor of `parent`.
     pub fn append(&mut self, parent: NodeId, child: NodeId) -> Result<(), DomError> {
         self.ensure_alive(parent, child)?;
-        if child == self.document {
+        if child == self.tree.document() {
             // The root must never gain a parent; that is how a document
             // gets orphaned from itself. (Maps to HierarchyRequestError.)
             return Err(DomError::HierarchyRequest);
@@ -647,7 +550,7 @@ impl Dom {
         // beside; a detached one has none: the outer pre-insert
         // algorithm's parent-null refusal (`NotFoundError`).
         let parent = self.parent(sibling).ok_or(DomError::NoParent)?;
-        if node == self.document {
+        if node == self.tree.document() {
             return Err(DomError::HierarchyRequest);
         }
         // Node-beside-itself means "stay put": the gate would reject this
@@ -746,7 +649,7 @@ impl Dom {
         let child_tracked = (child != node && self.parent(child) == Some(parent))
             .then(|| self.connection_snapshot(child));
         let mut removed = Vec::new();
-        self.recording_suppressed = true;
+        self.journal.suppress(true);
         if child != node && self.parent(child) == Some(parent) {
             self.unlink_from_current_parent(child);
             removed.push(child);
@@ -756,7 +659,7 @@ impl Dom {
         } else {
             self.place_node(parent, node, reference);
         }
-        self.recording_suppressed = false;
+        self.journal.suppress(false);
         if let Some(child_tracked) = child_tracked {
             self.record_snapshot(child_tracked);
         }
@@ -938,7 +841,7 @@ impl Dom {
     /// - [`DomError::HierarchyRequest`] for the document root.
     pub fn detach(&mut self, id: NodeId) -> Result<(), DomError> {
         self.require_live(id)?;
-        if id == self.document {
+        if id == self.tree.document() {
             return Err(DomError::HierarchyRequest);
         }
         let tracked = self.connection_snapshot(id);
@@ -987,7 +890,7 @@ impl Dom {
                 return Err(DomError::HierarchyRequest);
             }
         }
-        if from == self.document {
+        if from == self.tree.document() {
             // Draining the root would strand the entire document inside an
             // arbitrary detached subtree. (Maps to HierarchyRequestError.)
             return Err(DomError::HierarchyRequest);
@@ -1034,7 +937,7 @@ impl Dom {
             self.unlink(id);
         }
         for &id in &moved {
-            self.insert_linked(to, id, None);
+            self.tree.insert_linked(to, id, None);
             if !from_connected && to_connected {
                 self.node_inserted(id);
             }
@@ -1316,7 +1219,7 @@ impl Dom {
         // firstChild)`), so its starting connectivity must be read before the
         // detach loop below.
         let node_tracked = self.connection_snapshot(node);
-        self.recording_suppressed = true;
+        self.journal.suppress(true);
         // Detach the standing children through the single-node primitive; its
         // O(1) steps make the loop O(k), and it keeps `unlink` the only
         // remover of a node. Recording is suppressed, so no observer sees
@@ -1329,7 +1232,7 @@ impl Dom {
         } else {
             self.place_node(parent, node, None);
         }
-        self.recording_suppressed = false;
+        self.journal.suppress(false);
         // Removal before insertion: a replacement frees its frame slot before
         // the new frame is checked against the frame cap.
         self.record_snapshot(removed_snapshot);
@@ -1477,10 +1380,10 @@ impl Dom {
     pub fn append_text(&mut self, id: NodeId, extra: &str) -> Result<(), DomError> {
         let parent = self.parent(id);
         let value_before = parent.and_then(|parent| self.textarea_value_before_change(parent));
-        let recording = self.record_mutations && !self.recording_suppressed;
+        let recording = self.journal.recording();
         let old_value = {
-            let node = self.node_mut(id).ok_or(DomError::StaleNode)?;
-            let NodeKind::Text { data } = &mut node.kind else {
+            let kind = self.tree.kind_mut(id).ok_or(DomError::StaleNode)?;
+            let NodeKind::Text { data } = kind else {
                 return Err(DomError::WrongNodeType);
             };
             let old_value = recording.then(|| data.clone());
@@ -1572,7 +1475,7 @@ impl Dom {
     /// - [`DomError::HierarchyRequest`] for the document root.
     pub fn destroy(&mut self, id: NodeId) -> Result<(), DomError> {
         self.require_live(id)?;
-        if id == self.document {
+        if id == self.tree.document() {
             return Err(DomError::HierarchyRequest);
         }
         // Read connectivity before unlinking; the snapshot carries the
@@ -1585,47 +1488,10 @@ impl Dom {
             self.form.forget(current);
             self.metadata.forget(current);
             self.shadow.forget(current, &mut pending);
-            // Collect the child run through the links while the slot is still
-            // populated. Descendants are processed later, so their own links
-            // are intact when their turn comes.
-            let mut child = self.slots[current.index()]
-                .node
-                .as_ref()
-                .and_then(|node| node.first_child);
-            while let Some(id) = child {
-                pending.push(id);
-                child = self.slots[id.index()]
-                    .node
-                    .as_ref()
-                    .and_then(|node| node.next_sibling);
-            }
-            self.slots[current.index()].node = None;
-            // No generation tick here: emptiness is what makes the handle
-            // dead (`live_slot` requires `node.is_some()`), and the single
-            // tick happens at reallocation in `alloc`.
-            self.free.push(current.slot);
+            self.tree.retire(current, &mut pending);
         }
         self.record_snapshot(tracked);
         Ok(())
-    }
-
-    fn live_slot(&self, id: NodeId) -> Option<&Slot> {
-        if id.document != self.document.document {
-            return None;
-        }
-        self.slots
-            .get(id.index())
-            .filter(|slot| slot.generation == id.generation && slot.node.is_some())
-    }
-
-    fn node_mut(&mut self, id: NodeId) -> Option<&mut Node> {
-        if id.document != self.document.document {
-            return None;
-        }
-        self.slots
-            .get_mut(id.index())
-            .filter(|slot| slot.generation == id.generation)
-            .and_then(|slot| slot.node.as_mut())
     }
 
     /// Whether `id` is one of the container kinds that may hold children.
@@ -1677,7 +1543,7 @@ impl Dom {
 
     /// Mutable variant of [`Dom::element`] for the attribute mutators.
     fn element_mut(&mut self, id: NodeId) -> Result<(&QualName, &mut Vec<Attribute>), DomError> {
-        match &mut self.node_mut(id).ok_or(DomError::StaleNode)?.kind {
+        match self.tree.kind_mut(id).ok_or(DomError::StaleNode)? {
             NodeKind::Element { name, attributes } => Ok((name, attributes)),
             _ => Err(DomError::WrongNodeType),
         }
@@ -1749,7 +1615,7 @@ impl Dom {
         // Sibling references for the mutation record, read from the run the
         // node is about to join. Computed only while recording: no observer
         // exists on the parse path, so the lookups stay off it.
-        let (previous, next) = if self.record_mutations && !self.recording_suppressed {
+        let (previous, next) = if self.journal.recording() {
             let previous = match before {
                 Some(before) => self.previous_sibling(before),
                 None => self.last_child(parent),
@@ -1758,7 +1624,7 @@ impl Dom {
         } else {
             (None, None)
         };
-        self.insert_linked(parent, node, before);
+        self.tree.insert_linked(parent, node, before);
         self.node_inserted(node);
         self.record(Mutation::ChildList {
             target: parent,
@@ -1780,49 +1646,6 @@ impl Dom {
         }
         if let Some(select) = self.inserted_list_owner(node) {
             self.apply_default_selectedness(select);
-        }
-    }
-
-    /// Links the unparented `node` under `parent` immediately before
-    /// `before` (or as last child when `before` is `None`).
-    ///
-    /// `before`, when present, must already be a child of `parent`; `node`
-    /// must carry no parent and no sibling links. This is the single place
-    /// that writes the four link fields on insertion.
-    fn insert_linked(&mut self, parent: NodeId, node: NodeId, before: Option<NodeId>) {
-        let previous = match before {
-            Some(before) => self.previous_sibling(before),
-            None => self.last_child(parent),
-        };
-        {
-            let attached = self.node_mut(node).expect("verified-live node has no slot");
-            attached.parent = Some(parent);
-            attached.previous_sibling = previous;
-            attached.next_sibling = before;
-        }
-        match previous {
-            Some(previous) => {
-                self.node_mut(previous)
-                    .expect("linked previous sibling has no slot")
-                    .next_sibling = Some(node);
-            }
-            None => {
-                self.node_mut(parent)
-                    .expect("verified-live parent has no slot")
-                    .first_child = Some(node);
-            }
-        }
-        match before {
-            Some(before) => {
-                self.node_mut(before)
-                    .expect("linked reference child has no slot")
-                    .previous_sibling = Some(node);
-            }
-            None => {
-                self.node_mut(parent)
-                    .expect("verified-live parent has no slot")
-                    .last_child = Some(node);
-            }
         }
     }
 
@@ -1858,7 +1681,7 @@ impl Dom {
         });
         // Sibling references for the mutation record, read before the run
         // leaves the fragment.
-        let (previous, next) = if self.record_mutations && !self.recording_suppressed {
+        let (previous, next) = if self.journal.recording() {
             let previous = match before {
                 Some(before) => self.previous_sibling(before),
                 None => self.last_child(parent),
@@ -1878,7 +1701,7 @@ impl Dom {
         // fragment into a form join a group, and options joining a select may
         // become the default selection.
         for &id in &moved {
-            self.insert_linked(parent, id, before);
+            self.tree.insert_linked(parent, id, before);
             self.node_inserted(id);
             if self.checked_radio_form_owner(id).is_some() {
                 self.refresh_radio_group(id);
@@ -1911,7 +1734,7 @@ impl Dom {
     pub(crate) fn append_fresh_children(&mut self, parent: NodeId, added: Vec<NodeId>) {
         let previous = self.last_child(parent);
         for &node in &added {
-            self.insert_linked(parent, node, None);
+            self.tree.insert_linked(parent, node, None);
             self.node_inserted(node);
         }
         self.record(Mutation::ChildList {
@@ -1966,7 +1789,7 @@ impl Dom {
     /// verified `id` live; a missing parent is a silent no-op (the node is
     /// already detached).
     fn record_unlink(&mut self, id: NodeId) {
-        if !self.record_mutations || self.recording_suppressed {
+        if !self.journal.recording() {
             return;
         }
         let Some(parent) = self.parent(id) else {
@@ -1999,46 +1822,12 @@ impl Dom {
     /// corruption; panicking beats silently producing a node with two
     /// parents (or none), which later mutations would compound.
     fn unlink(&mut self, id: NodeId) {
-        let Some((parent, previous, next)) = self.node_mut(id).and_then(|node| {
-            node.parent
-                .map(|parent| (parent, node.previous_sibling, node.next_sibling))
-        }) else {
+        let Some(parent) = self.parent(id) else {
             return;
         };
         let select = self.inserted_list_owner(id);
         let value_before = self.textarea_value_before_change(parent);
-        if let Some(previous) = previous {
-            self.node_mut(previous)
-                .expect("previous sibling has no slot")
-                .next_sibling = next;
-        } else {
-            let first = self
-                .node_mut(parent)
-                .expect("live parent has no slot")
-                .first_child;
-            assert_eq!(first, Some(id), "parent's head is not the unlinked node");
-            self.node_mut(parent)
-                .expect("live parent has no slot")
-                .first_child = next;
-        }
-        if let Some(next) = next {
-            self.node_mut(next)
-                .expect("next sibling has no slot")
-                .previous_sibling = previous;
-        } else {
-            let last = self
-                .node_mut(parent)
-                .expect("live parent has no slot")
-                .last_child;
-            assert_eq!(last, Some(id), "parent's tail is not the unlinked node");
-            self.node_mut(parent)
-                .expect("live parent has no slot")
-                .last_child = previous;
-        }
-        let detached = self.node_mut(id).expect("live node has no slot");
-        detached.parent = None;
-        detached.previous_sibling = None;
-        detached.next_sibling = None;
+        self.tree.unlink_linked(id);
         self.reset_textarea_selection_if_changed(parent, value_before);
         if let Some(select) = select {
             self.apply_default_selectedness(select);
@@ -2053,8 +1842,8 @@ impl Dom {
     ) -> Result<(), DomError> {
         let parent = self.parent(id);
         let value_before = parent.and_then(|parent| self.textarea_value_before_change(parent));
-        let node = self.node_mut(id).ok_or(DomError::StaleNode)?;
-        match extract(&mut node.kind) {
+        let kind = self.tree.kind_mut(id).ok_or(DomError::StaleNode)?;
+        match extract(kind) {
             Some(field) => {
                 let old_value = std::mem::replace(field, data);
                 self.record(Mutation::CharacterData {
@@ -2070,46 +1859,8 @@ impl Dom {
         }
     }
 
-    /// Places a fresh node into a recycled or newly grown slot.
-    ///
-    /// # Panics
-    ///
-    /// Only when the arena would need more than `u32::MAX` slots: hundreds
-    /// of GB of RAM, not a reachable runtime condition; the bound guards the
-    /// handle width (`NodeId.slot` is a `u32`).
     fn alloc(&mut self, kind: NodeKind) -> NodeId {
-        let node = Node {
-            parent: None,
-            first_child: None,
-            last_child: None,
-            previous_sibling: None,
-            next_sibling: None,
-            kind,
-        };
-        if let Some(slot) = self.free.pop() {
-            // Lossless widening cast (u32 → usize); no From impl exists for it.
-            let index = slot as usize;
-            // The single generation tick per change of hands happens here.
-            let generation = self.slots[index].generation.wrapping_add(1);
-            self.slots[index] = Slot {
-                generation,
-                node: Some(node),
-            };
-            return NodeId::new(self.document.document, slot, generation);
-        }
-        // The bound is the `u32` handle width itself; exhausting it requires
-        // >4 billion slots (hundreds of GB of arena), an impossible runtime
-        // condition rather than an error to handle. Generations wrap after
-        // 2^32 recycles of one slot; that residual ABA window is accepted by
-        // design. Exploiting it needs billions of death/reuse cycles on a
-        // single slot while some outside handle to that slot still exists.
-        let slot = u32::try_from(self.slots.len())
-            .expect("arena exhausted: >u32::MAX slots requires hundreds of GB of RAM");
-        self.slots.push(Slot {
-            generation: 0,
-            node: Some(node),
-        });
-        NodeId::new(self.document.document, slot, 0)
+        self.tree.alloc(kind)
     }
 }
 

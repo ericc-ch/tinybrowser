@@ -193,7 +193,7 @@ impl Dom {
         let root = self.create_fragment();
         self.shadow.shadow_roots.insert(host, (root, open));
         self.shadow.shadow_hosts.insert(root, host);
-        self.mutation_serial = self.mutation_serial.wrapping_add(1);
+        self.journal.bump();
         Ok(root)
     }
 
