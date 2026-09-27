@@ -24,7 +24,7 @@ use self::metadata::Metadata;
 use self::shadow::ShadowState;
 pub use self::tree::Children;
 use self::tree::Slot;
-pub(crate) use self::tree::Tree;
+pub use self::tree::Tree;
 
 /// The document-compatibility mode a query runs under: what html5ever's
 /// tree builder reports and parsed pages carry.
@@ -208,6 +208,12 @@ impl Dom {
     #[must_use]
     pub fn document(&self) -> NodeId {
         self.tree.document()
+    }
+
+    /// A read-only view of node storage and traversal.
+    #[must_use]
+    pub fn tree(&self) -> &Tree {
+        &self.tree
     }
 
     /// This document's arena id, for per-document renderer lookups.
@@ -1054,7 +1060,7 @@ impl Dom {
     #[must_use]
     pub fn text_content(&self, id: NodeId) -> String {
         let mut text = String::new();
-        for node in self.descendants(id) {
+        for node in self.tree.descendants(id) {
             if let Some(NodeKind::Text { data } | NodeKind::CDataSection { data }) = self.kind(node)
             {
                 text.push_str(data);

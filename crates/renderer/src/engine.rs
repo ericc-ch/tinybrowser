@@ -31,7 +31,7 @@ pub(crate) const VIEWPORT_HEIGHT: f32 = 600.0;
 /// their element positions.
 fn collect_stylesheets(dom: &dom::Dom, document: &Document) -> Vec<String> {
     let mut sheets = Vec::new();
-    for node in dom.descendants(dom.document()) {
+    for node in dom.tree().descendants(dom.document()) {
         let Some(dom::NodeKind::Element { name, .. }) = dom.kind(node) else {
             continue;
         };

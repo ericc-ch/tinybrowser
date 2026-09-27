@@ -256,8 +256,7 @@ pub fn is_checked(dom: &Dom, id: NodeId) -> bool {
         }
         // HTML's "list of options", within which `optgroup`s (and anything
         // else wrapping them) are transparent containers.
-        let options: Vec<NodeId> = dom
-            .descendants(select)
+        let options: Vec<NodeId> = dom.tree().descendants(select)
             .filter(|&option| local_is(dom, option, &["option"]))
             .collect();
         let Some((first, rest)) = options.split_first() else {

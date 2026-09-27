@@ -174,8 +174,7 @@ impl Dom {
             return self.option_select_owner(node);
         }
         if self.html_local_is(node, "optgroup") {
-            return self
-                .descendants(node)
+            return self.tree().descendants(node)
                 .filter(|&id| self.html_local_is(id, "option"))
                 .find_map(|option| self.option_select_owner(option));
         }
@@ -242,7 +241,7 @@ impl Dom {
         if !self.html_local_is(select, "select") {
             return Vec::new();
         }
-        self.descendants(select)
+        self.tree().descendants(select)
             .filter(|&id| self.option_select_owner(id) == Some(select))
             .collect()
     }

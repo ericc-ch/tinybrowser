@@ -34,7 +34,7 @@ pub(crate) struct Slot {
 }
 
 #[derive(Debug)]
-pub(crate) struct Tree {
+pub struct Tree {
     slots: Vec<Slot>,
     free: Vec<u32>,
     document: NodeId,
@@ -77,7 +77,42 @@ impl DoubleEndedIterator for Children<'_> {
 
 impl FusedIterator for Children<'_> {}
 
+/// A depth-first walk through a node's descendants in tree order.
+struct Descendants<'a> {
+    tree: &'a Tree,
+    stack: Vec<Children<'a>>,
+}
+
+impl Iterator for Descendants<'_> {
+    type Item = NodeId;
+
+    fn next(&mut self) -> Option<NodeId> {
+        while let Some(top) = self.stack.last_mut() {
+            match top.next() {
+                Some(id) => {
+                    if let Some(children) = self.tree.children(id) {
+                        self.stack.push(children);
+                    }
+                    return Some(id);
+                }
+                None => {
+                    self.stack.pop();
+                }
+            }
+        }
+        None
+    }
+}
+
 impl Tree {
+    /// Every descendant of `scope` in tree order, excluding `scope`
+    /// (<https://dom.spec.whatwg.org/#concept-tree-order>).
+    pub fn descendants(&self, scope: NodeId) -> impl Iterator<Item = NodeId> + '_ {
+        Descendants {
+            tree: self,
+            stack: self.children(scope).into_iter().collect(),
+        }
+    }
     pub(super) fn new() -> Self {
         let document_id = NEXT_DOCUMENT_ID.fetch_add(1, Ordering::Relaxed);
         let root = Node {

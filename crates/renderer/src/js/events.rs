@@ -1234,11 +1234,11 @@ fn default_passive(ctx: &Ctx<'_>, typ: &str, target: EventTargetKey) -> Result<b
             if dom.document() == id {
                 return Ok(true);
             }
-            let html = dom.select_first(dom.document(), "html").ok().flatten();
+            let html = dom::selector::select_first(dom, dom.document(), "html").ok().flatten();
             if html == Some(id) {
                 return Ok(true);
             }
-            let body = dom.select_first(dom.document(), "body").ok().flatten();
+            let body = dom::selector::select_first(dom, dom.document(), "body").ok().flatten();
             Ok(body == Some(id))
         }
     }
@@ -1412,9 +1412,7 @@ fn active_body(ctx: &Ctx<'_>) -> Option<dom::NodeId> {
     let world = bindings::world(ctx).ok()?;
     let world = world.borrow();
     let parsed = world.main_document()?;
-    parsed
-        .dom
-        .select_first(parsed.dom.document(), "body")
+    dom::selector::select_first(&parsed.dom, parsed.dom.document(), "body")
         .ok()
         .flatten()
 }

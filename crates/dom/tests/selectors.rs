@@ -4,7 +4,7 @@
 
 use dom::{
     Attribute, Dom, LocalName, Namespace, NodeId, ParseFailKind, QualName, SelectError,
-    html_namespace,
+    html_namespace, selector,
 };
 
 fn qn(local: &str) -> QualName {
@@ -37,23 +37,33 @@ fn selector_queries_observe_the_public_tree_boundary() {
     // A malformed selector keeps its syntax class.
     for invalid in ["", "div[", ":dir(up)", ":frobnicate"] {
         assert!(matches!(
-            dom.select_all(document, invalid),
+            selector::select_all(&dom, document, invalid),
             Err(SelectError::Syntax(_))
         ));
     }
-    let Err(SelectError::Syntax(failure)) = dom.select_all(document, "div[") else {
+    let Err(SelectError::Syntax(failure)) = selector::select_all(&dom, document, "div[") else {
         panic!("malformed selector must retain a syntax class");
     };
     assert_eq!(failure.kind(), ParseFailKind::MalformedInput);
 
     // A non-element has no `matches` semantics.
-    assert_eq!(dom.matches(text, "*"), Err(SelectError::NotAnElement));
+    assert_eq!(
+        selector::matches(&dom, text, "*"),
+        Err(SelectError::NotAnElement)
+    );
 
     // Detaching hides a subtree from document queries; destroying it makes
     // every old handle stale at once.
     dom.detach(main).expect("detach");
-    assert!(dom.select_all(document, "#main").expect("query").is_empty());
+    assert!(
+        selector::select_all(&dom, document, "#main")
+            .expect("query")
+            .is_empty()
+    );
     dom.destroy(main).expect("destroy");
-    assert_eq!(dom.select_all(main, "*"), Err(SelectError::StaleNode));
-    assert!(dom.select_all(document, "*").is_ok());
+    assert_eq!(
+        selector::select_all(&dom, main, "*"),
+        Err(SelectError::StaleNode)
+    );
+    assert!(selector::select_all(&dom, document, "*").is_ok());
 }

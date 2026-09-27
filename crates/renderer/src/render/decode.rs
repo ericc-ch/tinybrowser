@@ -111,9 +111,7 @@ fn decode_webp(bytes: &[u8]) -> Option<RasterImage> {
 fn decode_svg(bytes: &[u8]) -> Option<RasterImage> {
     let text = std::str::from_utf8(bytes).ok()?;
     let parsed = crate::xml::parse_document(text, "image/svg+xml");
-    if parsed
-        .dom
-        .descendants(parsed.dom.document())
+    if parsed.dom.tree().descendants(parsed.dom.document())
         .any(|node| is_parser_error(&parsed.dom, node))
     {
         return None;

@@ -198,9 +198,7 @@ fn parse_html_fragment_snapshots(
 
 /// The first node matching `selector` under `parsed`'s document root.
 fn document_first(parsed: &crate::Parsed, selector: &str) -> Option<NodeId> {
-    parsed
-        .dom
-        .select_first(parsed.dom.document(), selector)
+    dom::selector::select_first(&parsed.dom, parsed.dom.document(), selector)
         .ok()
         .flatten()
 }
@@ -2576,9 +2574,7 @@ impl JsNode {
             let Some(parsed) = parsed.document(self.handle.0) else {
                 return Ok(Value::new_null(ctx));
             };
-            parsed
-                .dom
-                .select_first(self.handle.0, &selectors.0)
+            dom::selector::select_first(&parsed.dom, self.handle.0, &selectors.0)
                 .map_err(|err| select_error(&ctx, &err))?
         };
         child_value(&ctx, found)
@@ -2599,9 +2595,7 @@ impl JsNode {
             parsed
                 .document(self.handle.0)
                 .map(|parsed| {
-                    parsed
-                        .dom
-                        .select_all(self.handle.0, &selectors.0)
+                    dom::selector::select_all(&parsed.dom, self.handle.0, &selectors.0)
                         .map_err(|err| select_error(&ctx, &err))
                 })
                 .transpose()?
@@ -2619,9 +2613,7 @@ impl JsNode {
         let Some(parsed) = parsed.document(self.handle.0) else {
             return Ok(false);
         };
-        parsed
-            .dom
-            .matches(self.handle.0, &selectors.0)
+        dom::selector::matches(&parsed.dom, self.handle.0, &selectors.0)
             .map_err(|err| select_error(&ctx, &err))
     }
 
@@ -2638,9 +2630,7 @@ impl JsNode {
             let mut cursor = Some(self.handle.0);
             while let Some(id) = cursor {
                 if is_element(&parsed.dom, id)
-                    && parsed
-                        .dom
-                        .matches(id, &selectors.0)
+                    && dom::selector::matches(&parsed.dom, id, &selectors.0)
                         .map_err(|err| select_error(&ctx, &err))?
                 {
                     candidate = Some(id);
@@ -2676,9 +2666,7 @@ impl JsNode {
         let Some(parsed) = parsed.document(self.handle.0) else {
             return Ok(String::new());
         };
-        let title = parsed
-            .dom
-            .select_first(parsed.dom.document(), "title")
+        let title = dom::selector::select_first(&parsed.dom, parsed.dom.document(), "title")
             .ok()
             .flatten();
         Ok(title.map_or_else(String::new, |title| descendant_text(&parsed.dom, title)))
@@ -2692,18 +2680,20 @@ impl JsNode {
             return Ok(());
         };
         let dom = &mut parsed.dom;
-        let title = dom
-            .select_first(dom.document(), "title")
+        let title = dom::selector::select_first(dom, dom.document(), "title")
             .ok()
             .flatten()
             .unwrap_or_else(|| {
                 let name = QualName::new(None, html_namespace(), LocalName::from("title"));
                 let title = dom.create_element(name, Vec::new());
-                let target = dom
-                    .select_first(dom.document(), "head")
+                let target = dom::selector::select_first(dom, dom.document(), "head")
                     .ok()
                     .flatten()
-                    .or_else(|| dom.select_first(dom.document(), "html").ok().flatten());
+                    .or_else(|| {
+                        dom::selector::select_first(dom, dom.document(), "html")
+                            .ok()
+                            .flatten()
+                    });
                 if let Some(target) = target {
                     let _ = dom.append(target, title);
                 }

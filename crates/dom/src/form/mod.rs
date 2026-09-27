@@ -159,8 +159,7 @@ impl Dom {
         }
         let owner = self.form_owner(id);
         let scope = self.tree_root_of(id);
-        let others: Vec<NodeId> = self
-            .descendants(scope)
+        let others: Vec<NodeId> = self.tree().descendants(scope)
             .filter(|&other| {
                 other != id && self.is_radio_named(other, &name) && self.form_owner(other) == owner
             })
@@ -202,7 +201,7 @@ impl Dom {
             && !reference.is_empty()
         {
             let root = self.tree_root_of(id);
-            let found = self.descendants(root).find(|&other| {
+            let found = self.tree().descendants(root).find(|&other| {
                 self.html_local_is(other, "form")
                     && self.attribute(other, "id").as_deref() == Some(reference.as_str())
             });
@@ -222,7 +221,7 @@ impl Dom {
         }
         let owner = self.form_owner(id);
         let scope = self.tree_root_of(id);
-        self.descendants(scope).find(|&other| {
+        self.tree().descendants(scope).find(|&other| {
             other != id
                 && self.is_radio_named(other, &name)
                 && self.form_owner(other) == owner

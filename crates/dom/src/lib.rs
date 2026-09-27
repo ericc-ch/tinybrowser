@@ -22,7 +22,7 @@ mod form;
 mod id;
 pub mod named;
 mod node;
-mod selector;
+pub mod selector;
 mod state;
 mod value;
 
@@ -32,7 +32,7 @@ pub use state::{
     is_required, lang_matches, local_is,
 };
 
-pub use arena::{Children, Dom, DomError, Lifecycle, Mutation, QuirksMode};
+pub use arena::{Children, Dom, DomError, Lifecycle, Mutation, QuirksMode, Tree};
 pub use id::NodeId;
 pub use node::{
     Attribute, LocalName, Namespace, NodeKind, Prefix, QualName, html_namespace,

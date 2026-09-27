@@ -130,7 +130,7 @@ fn collect_pending_entries(
     let document = &parsed.dom;
     let root = document.tree_root_of(form);
     let mut pending = Vec::new();
-    for node in document.descendants(root) {
+    for node in document.tree().descendants(root) {
         let Some(NodeKind::Element { name, .. }) = document.kind(node) else {
             continue;
         };

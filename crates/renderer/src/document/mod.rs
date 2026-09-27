@@ -1158,7 +1158,9 @@ impl Document {
         let Some(parsed) = world.main_document() else {
             return self.url.clone();
         };
-        let Ok(Some(base_el)) = parsed.dom.select_first(parsed.dom.document(), "base[href]") else {
+        let Ok(Some(base_el)) =
+            dom::selector::select_first(&parsed.dom, parsed.dom.document(), "base[href]")
+        else {
             return self.url.clone();
         };
         let Some(href) = parsed.dom.attribute(base_el, "href") else {
@@ -1426,7 +1428,9 @@ impl Document {
                 return;
             };
             let document = parsed.dom.document();
-            let Ok(links) = parsed.dom.select_all(document, "link[rel~=\"stylesheet\"]") else {
+            let Ok(links) =
+                dom::selector::select_all(&parsed.dom, document, "link[rel~=\"stylesheet\"]")
+            else {
                 return;
             };
             links
@@ -1469,10 +1473,7 @@ impl Document {
                 return;
             };
             let document = parsed.dom.document();
-            parsed
-                .dom
-                .select_all(document, "img[src]")
-                .unwrap_or_default()
+            dom::selector::select_all(&parsed.dom, document, "img[src]").unwrap_or_default()
         };
         for element in images {
             self.queue_image(element, false);

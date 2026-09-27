@@ -596,7 +596,7 @@ pub(super) fn layout_boxes(ctx: &Ctx<'_>, document: NodeId) -> Result<Vec<crate:
 /// without the author rules.
 fn inline_stylesheets(dom: &dom::Dom) -> Vec<String> {
     let mut sheets = Vec::new();
-    for node in dom.descendants(dom.document()) {
+    for node in dom.tree().descendants(dom.document()) {
         let Some(NodeKind::Element { name, .. }) = dom.kind(node) else {
             continue;
         };
@@ -1587,7 +1587,7 @@ fn collect_by_tag(dom: &dom::Dom, scope: NodeId, name: &str) -> Vec<NodeId> {
     // name ASCII-lowercased; other elements match the name exactly
     // (<https://dom.spec.whatwg.org/#concept-getelementsbytagname>).
     let lowered = name.to_ascii_lowercase();
-    dom.descendants(scope)
+    dom.tree().descendants(scope)
         .filter(|&id| {
             let Some(NodeKind::Element { name: qual, .. }) = dom.kind(id) else {
                 return false;
@@ -1603,7 +1603,7 @@ fn collect_by_tag(dom: &dom::Dom, scope: NodeId, name: &str) -> Vec<NodeId> {
 }
 
 fn collect_by_name(dom: &dom::Dom, scope: NodeId, name: &str) -> Vec<NodeId> {
-    dom.descendants(scope)
+    dom.tree().descendants(scope)
         .filter(|&id| is_element(dom, id) && dom.attribute(id, "name").as_deref() == Some(name))
         .collect()
 }
@@ -1616,7 +1616,7 @@ fn collect_window_named(dom: &dom::Dom, scope: NodeId, name: &str) -> Vec<NodeId
     if name.is_empty() {
         return Vec::new();
     }
-    dom.descendants(scope)
+    dom.tree().descendants(scope)
         .filter(|&id| {
             if dom.no_namespace_attribute(id, "id").as_deref() == Some(name) {
                 return true;
@@ -1633,7 +1633,7 @@ fn collect_window_named(dom: &dom::Dom, scope: NodeId, name: &str) -> Vec<NodeId
 }
 
 fn collect_by_tag_ns(dom: &dom::Dom, scope: NodeId, namespace: &str, local: &str) -> Vec<NodeId> {
-    dom.descendants(scope)
+    dom.tree().descendants(scope)
         .filter(|&id| {
             matches!(
                 dom.kind(id),
@@ -1652,7 +1652,7 @@ fn collect_by_class(dom: &dom::Dom, scope: NodeId, names: &str) -> Vec<NodeId> {
     if wanted.is_empty() {
         return Vec::new();
     }
-    dom.descendants(scope)
+    dom.tree().descendants(scope)
         .filter(|&id| {
             if !is_element(dom, id) {
                 return false;
@@ -1739,7 +1739,7 @@ pub(super) fn tree_order(dom: &dom::Dom, a: NodeId, b: NodeId) -> std::cmp::Orde
 }
 
 pub(super) fn find_element_by_id(dom: &dom::Dom, scope: NodeId, id: &str) -> Option<NodeId> {
-    dom.descendants(scope)
+    dom.tree().descendants(scope)
         .find(|&node| is_element(dom, node) && dom.attribute(node, "id").as_deref() == Some(id))
 }
 

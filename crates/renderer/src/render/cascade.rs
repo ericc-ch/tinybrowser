@@ -64,7 +64,7 @@ fn propagate_canvas_background(
     dom: &Dom,
     styles: &mut std::collections::HashMap<dom::NodeId, crate::render::style::Style>,
 ) -> Color {
-    let Some(root) = dom.select_first(dom.document(), "html").ok().flatten() else {
+    let Some(root) = dom::selector::select_first(dom, dom.document(), "html").ok().flatten() else {
         return Color::TRANSPARENT;
     };
     let Some(root_style) = styles.get(&root) else {
