@@ -2,9 +2,39 @@
 //! selectedness setting algorithm, and the `select` value/index IDL
 //! (<https://html.spec.whatwg.org/multipage/form-elements.html#the-select-element>).
 
-use crate::{Dom, NodeId, NodeKind, html_namespace};
+use crate::{Dom, DomError, LocalName, NodeId, NodeKind, QualName, html_namespace};
 
 impl Dom {
+    /// Appends blank options as one tree mutation, then applies the select's
+    /// selectedness setting algorithm
+    /// (<https://html.spec.whatwg.org/multipage/common-dom-interfaces.html#append-new-option-elements>).
+    ///
+    /// # Errors
+    ///
+    /// - [`DomError::StaleNode`] if `select` is stale.
+    /// - [`DomError::WrongNodeType`] if `select` is not an HTML `select`.
+    pub fn append_blank_options(&mut self, select: NodeId, count: usize) -> Result<(), DomError> {
+        if !self.contains(select) {
+            return Err(DomError::StaleNode);
+        }
+        if !self.html_local_is(select, "select") {
+            return Err(DomError::WrongNodeType);
+        }
+        if count == 0 {
+            return Ok(());
+        }
+        let mut added = Vec::with_capacity(count);
+        for _ in 0..count {
+            added.push(self.create_element(
+                QualName::new(None, html_namespace(), LocalName::from("option")),
+                Vec::new(),
+            ));
+        }
+        self.append_fresh_children(select, added);
+        self.apply_default_selectedness(select);
+        Ok(())
+    }
+
     /// A `select`'s display size: the `size` attribute, else 4 with `multiple`
     /// and 1 otherwise
     /// (<https://html.spec.whatwg.org/multipage/form-elements.html#the-select-element:display-size>).
@@ -66,7 +96,7 @@ impl Dom {
             .collect();
         if selected.len() >= 2 {
             for &option in &selected[..selected.len() - 1] {
-                self.option_selectedness.insert(option, false);
+                self.form.option_selectedness.insert(option, false);
             }
             return;
         }
@@ -76,7 +106,7 @@ impl Dom {
                 .iter()
                 .find(|&&option| !self.option_disabled(option))
         {
-            self.option_selectedness.insert(first, true);
+            self.form.option_selectedness.insert(first, true);
         }
     }
 
@@ -84,7 +114,8 @@ impl Dom {
     /// selectedness flag is set, else whether `selected` is present.
     #[must_use]
     pub fn option_selected(&self, id: NodeId) -> bool {
-        self.option_selectedness
+        self.form
+            .option_selectedness
             .get(&id)
             .copied()
             .unwrap_or_else(|| self.attribute(id, "selected").is_some())
@@ -93,15 +124,15 @@ impl Dom {
     /// Sets `id`'s selectedness without the dirty flag, as the `Option`
     /// constructor does.
     pub fn set_option_selectedness(&mut self, id: NodeId, selected: bool) {
-        self.option_selectedness.insert(id, selected);
+        self.form.option_selectedness.insert(id, selected);
     }
 
     /// Re-reads an `option`'s selectedness from its `selected` attribute when
     /// the dirty flag is clear.
     pub(crate) fn refresh_option_selectedness(&mut self, id: NodeId) {
-        if self.html_local_is(id, "option") && !self.option_dirty_selected.contains(&id) {
+        if self.html_local_is(id, "option") && !self.form.option_dirty_selected.contains(&id) {
             let selected = self.attribute(id, "selected").is_some();
-            self.option_selectedness.insert(id, selected);
+            self.form.option_selectedness.insert(id, selected);
         }
     }
 
@@ -177,7 +208,7 @@ impl Dom {
         }
         for other in self.select_options(select) {
             if other != option {
-                self.option_selectedness.insert(other, false);
+                self.form.option_selectedness.insert(other, false);
             }
         }
     }
@@ -191,12 +222,12 @@ impl Dom {
             && self.attribute(select, "multiple").is_none()
         {
             for other in self.select_options(select) {
-                self.option_selectedness.insert(other, false);
-                self.option_dirty_selected.insert(other);
+                self.form.option_selectedness.insert(other, false);
+                self.form.option_dirty_selected.insert(other);
             }
         }
-        self.option_selectedness.insert(option, selected);
-        self.option_dirty_selected.insert(option);
+        self.form.option_selectedness.insert(option, selected);
+        self.form.option_dirty_selected.insert(option);
         // An option whose selectedness becomes false asks its select to reset
         // (<https://html.spec.whatwg.org/multipage/form-elements.html#ask-for-a-reset>).
         if !selected && let Some(select) = owner {
@@ -285,15 +316,15 @@ impl Dom {
         let options = self.select_options(id);
         if self.attribute(id, "multiple").is_none() {
             for &option in &options {
-                self.option_selectedness.insert(option, false);
-                self.option_dirty_selected.insert(option);
+                self.form.option_selectedness.insert(option, false);
+                self.form.option_dirty_selected.insert(option);
             }
         }
         if let Ok(index) = usize::try_from(index)
             && let Some(&option) = options.get(index)
         {
-            self.option_selectedness.insert(option, true);
-            self.option_dirty_selected.insert(option);
+            self.form.option_selectedness.insert(option, true);
+            self.form.option_dirty_selected.insert(option);
         }
     }
 
@@ -302,13 +333,13 @@ impl Dom {
     pub fn set_select_value(&mut self, id: NodeId, value: &str) {
         let options = self.select_options(id);
         for &option in &options {
-            self.option_selectedness.insert(option, false);
-            self.option_dirty_selected.insert(option);
+            self.form.option_selectedness.insert(option, false);
+            self.form.option_dirty_selected.insert(option);
         }
         for option in options {
             if self.option_value(option) == value {
-                self.option_selectedness.insert(option, true);
-                self.option_dirty_selected.insert(option);
+                self.form.option_selectedness.insert(option, true);
+                self.form.option_dirty_selected.insert(option);
                 break;
             }
         }

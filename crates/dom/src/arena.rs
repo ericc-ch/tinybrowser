@@ -1,17 +1,26 @@
 //! The arena: flat slot array, generational handles, tree mutations.
 
+mod lifecycle;
+mod metadata;
+mod shadow;
+
 use std::cell::Cell;
-use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::iter::FusedIterator;
 use std::marker::PhantomData;
 use std::sync::atomic::{AtomicU32, Ordering};
 
+use crate::form::FormState;
 use crate::id::NodeId;
+use crate::named::NamedIndex;
 use crate::node::{
     Attribute, LocalName, Namespace, Node, NodeKind, Prefix, QualName, html_namespace,
     html_qualified_name_eq, qualified_name_eq,
 };
+
+use self::lifecycle::ConnectionState;
+use self::metadata::Metadata;
+use self::shadow::ShadowState;
 
 /// Next document id for a freshly constructed [`Dom`]. Relaxed arithmetic is
 /// enough: the only requirement is that two live `Dom` values do not share
@@ -146,85 +155,18 @@ pub struct Dom {
     slots: Vec<Slot>,
     free: Vec<u32>,
     document: NodeId,
-    quirks_mode: QuirksMode,
-    /// HTTP `Content-Language` and parsed `document` language default for
-    /// `:lang()` when no `lang` / `xml:lang` is on the ancestor chain.
-    document_language: Option<String>,
-    /// `<template>` element → its contents fragment. Contents live outside
-    /// the element's child list
-    /// (<https://html.spec.whatwg.org/multipage/scripting.html#the-template-element>).
-    template_contents: HashMap<NodeId, NodeId>,
-    /// Shadow host → (shadow root, open mode). Shadow roots are detached
-    /// fragments in the node tree and cross to their host only for the
-    /// shadow-including tree algorithms.
-    shadow_roots: HashMap<NodeId, (NodeId, bool)>,
-    /// Shadow root → host, the inverse of `shadow_roots`.
-    shadow_hosts: HashMap<NodeId, NodeId>,
-    /// Dirty value state for text-like controls (`input`, `textarea`).
-    ///
-    /// An entry means the dirty value flag is set and stores the raw value.
-    /// Absence means the live value still follows the control's default: the
-    /// `value` content attribute for `input`, the child text content for
-    /// `textarea` (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#concept-fe-dirty>).
-    pub(crate) input_values: HashMap<NodeId, String>,
-    /// The last normalized `type` state of an `input`, so an attribute change
-    /// can detect a state transition and run the type-change steps
-    /// (<https://html.spec.whatwg.org/multipage/input.html#the-input-element:type-change-state>).
-    pub(crate) input_types: HashMap<NodeId, String>,
-    /// The source-text start line of an inline `script` element, recorded by
-    /// the parser so reported exceptions carry a document line number
-    /// (<https://html.spec.whatwg.org/multipage/webappapis.html#script's-line-number>).
-    script_lines: HashMap<NodeId, u32>,
-    /// An `input`'s checkedness while the dirty checkedness flag is set;
-    /// absence means the `checked` content attribute decides
-    /// (<https://html.spec.whatwg.org/multipage/input.html#concept-input-checked-dirty-flag>).
-    pub(crate) checkedness: HashMap<NodeId, bool>,
-    /// An `input`'s indeterminateness, independent of its checkedness
-    /// (<https://html.spec.whatwg.org/multipage/input.html#concept-input-indeterminate>).
-    pub(crate) indeterminate: HashMap<NodeId, bool>,
-    /// The focused element per document, backing the `:focus` family
-    /// (<https://drafts.csswg.org/selectors-4/#the-focus-pseudo>).
-    active_element: HashMap<u32, NodeId>,
-    /// An `option`'s selectedness value
-    /// (<https://html.spec.whatwg.org/multipage/form-elements.html#concept-option-selectedness>).
-    pub(crate) option_selectedness: HashMap<NodeId, bool>,
-    /// Whether an `option`'s dirty selectedness flag is set; when clear, the
-    /// `selected` content attribute drives selectedness.
-    pub(crate) option_dirty_selected: HashSet<NodeId>,
-    /// Per-element scroll offsets `(left, top)`. The engine has no scrollable
-    /// overflow yet, but `scrollLeft`/`scrollTop` must round-trip a set value
-    /// (<https://drafts.csswg.org/cssom-view/#dom-element-scrollleft>).
-    scroll_offsets: HashMap<NodeId, (f64, f64)>,
-    /// Whether an `input`'s type supported a text selection the last time its
-    /// `type` changed, so a change back to a selectable type can reset the
-    /// cursor (<https://html.spec.whatwg.org/multipage/input.html#the-input-element>).
-    pub(crate) input_selectable: HashMap<NodeId, bool>,
-    /// Text selection for text-like controls: `(start, end, direction)` in
-    /// UTF-16 code units. Direction is 0 "none", 1 "forward", 2 "backward"
-    /// (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#concept-textarea/input-selection>).
-    /// Absence means the initial selection `(0, 0, "none")`.
-    pub(crate) selections: HashMap<NodeId, (u32, u32, u8)>,
+    metadata: Metadata,
+    shadow: ShadowState,
+    pub(crate) form: FormState,
     /// Recorded mutations, drained by the renderer's `MutationObserver`
     /// plumbing; empty and unrecorded unless someone observes the document.
     mutations: Vec<Mutation>,
     record_mutations: bool,
     recording_suppressed: bool,
-    /// Connection transitions in order; never suppressed, because the
-    /// renderer's frame lifetime hangs off them, not off observers.
-    lifecycle: Vec<Lifecycle>,
-    /// Connected `iframe` elements, so the renderer can tell whether a frame
-    /// scan is needed at all.
-    connected_iframes: u32,
+    connections: ConnectionState,
     /// Bumped by every mutation; see [`Dom::mutation_serial`].
     mutation_serial: u64,
-    /// Window named-property names, seeded on first use then grown by
-    /// [`Dom::record`]; see [`Dom::named_name_exists`].
-    pub(crate) named_names: HashSet<String>,
-    pub(crate) named_names_seeded: bool,
-    /// Live name count at the last rebuild, the baseline for rebuilding the
-    /// growth-only index when churn outpaces the document
-    /// (<https://html.spec.whatwg.org/multipage/nav-history-apis.html#named-access-on-the-window-object>).
-    pub(crate) named_names_watermark: usize,
+    pub(crate) named: NamedIndex,
     /// `Cell<()>` is `Send` + `!Sync`; `PhantomData` makes `Dom` inherit
     /// exactly that split. Deleting this field would silently re-derive
     /// `Sync`, which is the point: that deletion has to be a conscious act.
@@ -304,31 +246,15 @@ impl Dom {
             }],
             free: Vec::new(),
             document: NodeId::new(document_id, 0, 0),
-            quirks_mode: QuirksMode::NoQuirks,
-            document_language: None,
-            template_contents: HashMap::new(),
-            shadow_roots: HashMap::new(),
-            shadow_hosts: HashMap::new(),
-            input_values: HashMap::new(),
-            input_types: HashMap::new(),
-            selections: HashMap::new(),
-            script_lines: HashMap::new(),
-            checkedness: HashMap::new(),
-            indeterminate: HashMap::new(),
-            active_element: HashMap::new(),
-            option_selectedness: HashMap::new(),
-            option_dirty_selected: HashSet::new(),
-            scroll_offsets: HashMap::new(),
-            input_selectable: HashMap::new(),
+            metadata: Metadata::default(),
+            shadow: ShadowState::default(),
+            form: FormState::default(),
             mutations: Vec::new(),
             record_mutations: false,
             recording_suppressed: false,
-            lifecycle: Vec::new(),
-            connected_iframes: 0,
+            connections: ConnectionState::default(),
             mutation_serial: 0,
-            named_names: HashSet::new(),
-            named_names_seeded: false,
-            named_names_watermark: 0,
+            named: NamedIndex::default(),
             _share_forbidden: PhantomData,
         }
     }
@@ -347,174 +273,6 @@ impl Dom {
         std::mem::take(&mut self.mutations)
     }
 
-    /// Drains the recorded connection transitions in order.
-    pub fn take_lifecycle(&mut self) -> Vec<Lifecycle> {
-        std::mem::take(&mut self.lifecycle)
-    }
-
-    /// Records every `iframe` and `img` connection transition in a snapshot
-    /// taken before an operation. Snapshots only ever carry those elements
-    /// (see [`Dom::connection_snapshot`]): filtering in the snapshot keeps
-    /// the parser's hot path free of per-element bookkeeping.
-    ///
-    /// The snapshot carries each element's kind so a destroyed node still
-    /// moves the `iframe` count: after `destroy` frees it, `is_iframe_element`
-    /// can no longer answer.
-    fn record_snapshot(&mut self, snapshot: Vec<(NodeId, bool, bool)>) {
-        for (id, was_connected, is_iframe) in snapshot {
-            let connected = self.is_connected(id);
-            if connected != was_connected {
-                if is_iframe {
-                    if connected {
-                        self.connected_iframes = self.connected_iframes.saturating_add(1);
-                    } else {
-                        self.connected_iframes = self.connected_iframes.saturating_sub(1);
-                    }
-                }
-                self.lifecycle.push(if connected {
-                    Lifecycle::Inserted(id)
-                } else {
-                    Lifecycle::Removed(id)
-                });
-            }
-        }
-    }
-
-    /// How many `iframe` elements are connected in this document.
-    #[must_use]
-    pub fn connected_iframe_count(&self) -> u32 {
-        self.connected_iframes
-    }
-
-    /// Whether `id` is an HTML `iframe` element.
-    #[must_use]
-    pub fn is_iframe_element(&self, id: NodeId) -> bool {
-        matches!(
-            self.kind(id),
-            Some(NodeKind::Element { name, .. })
-                if name.ns == html_namespace() && name.local.as_ref() == "iframe"
-        )
-    }
-
-    /// Whether `id` is an HTML `img` element.
-    #[must_use]
-    pub fn is_img_element(&self, id: NodeId) -> bool {
-        matches!(
-            self.kind(id),
-            Some(NodeKind::Element { name, .. })
-                if name.ns == html_namespace() && name.local.as_ref() == "img"
-        )
-    }
-
-    fn is_html_slot(&self, id: NodeId) -> bool {
-        matches!(
-            self.kind(id),
-            Some(NodeKind::Element { name, .. })
-                if name.ns == html_namespace() && name.local.as_ref() == "slot"
-        )
-    }
-
-    fn slottable_name(&self, id: NodeId) -> Option<String> {
-        match self.kind(id) {
-            Some(NodeKind::Element { .. }) => Some(self.attribute(id, "slot").unwrap_or_default()),
-            Some(NodeKind::Text { .. }) => Some(String::new()),
-            _ => None,
-        }
-    }
-
-    fn containing_shadow_root(&self, id: NodeId) -> Option<NodeId> {
-        let mut current = Some(id);
-        while let Some(node) = current {
-            if self.shadow_host(node).is_some() {
-                return Some(node);
-            }
-            current = self.parent(node);
-        }
-        None
-    }
-
-    fn first_slot(&self, root: NodeId, name: &str) -> Option<NodeId> {
-        let mut stack: Vec<NodeId> = self
-            .children(root)
-            .map(Iterator::collect)
-            .unwrap_or_default();
-        stack.reverse();
-        while let Some(node) = stack.pop() {
-            if self.is_html_slot(node) && self.attribute(node, "name").unwrap_or_default() == name {
-                return Some(node);
-            }
-            if self.shadow_root(node).is_some() {
-                continue;
-            }
-            if let Some(children) = self.children(node) {
-                stack.extend(children.rev());
-            }
-        }
-        None
-    }
-
-    fn assigned_nodes(&self, slot: NodeId) -> Vec<NodeId> {
-        let Some(root) = self.containing_shadow_root(slot) else {
-            return Vec::new();
-        };
-        let Some(host) = self.shadow_host(root) else {
-            return Vec::new();
-        };
-        let name = self.attribute(slot, "name").unwrap_or_default();
-        if self.first_slot(root, &name) != Some(slot) {
-            return Vec::new();
-        }
-        self.children(host)
-            .into_iter()
-            .flatten()
-            .filter(|&child| self.slottable_name(child).as_deref() == Some(name.as_str()))
-            .collect()
-    }
-
-    fn assigned_slot(&self, id: NodeId) -> Option<NodeId> {
-        let host = self.parent(id)?;
-        let root = self.shadow_root(host)?;
-        let name = self.slottable_name(id)?;
-        let slot = self.first_slot(root, &name)?;
-        Some(slot).filter(|&slot| self.assigned_nodes(slot).contains(&id))
-    }
-
-    /// The iframe and img elements in `id`'s inclusive subtree with, for each,
-    /// its connectivity and whether it is an iframe (the only kind that moves
-    /// `connected_iframes`). Captured before an operation and handed to
-    /// [`Dom::record_snapshot`] after it, so the transition is measured across
-    /// the whole operation rather than at an internal step.
-    fn connection_snapshot(&self, id: NodeId) -> Vec<(NodeId, bool, bool)> {
-        let mut snapshot = Vec::new();
-        let mut stack = vec![id];
-        while let Some(current) = stack.pop() {
-            let is_iframe = self.is_iframe_element(current);
-            if is_iframe || self.is_img_element(current) {
-                snapshot.push((current, self.is_connected(current), is_iframe));
-            }
-            if let Some(children) = self.children(current) {
-                stack.extend(children);
-            }
-            if let Some(root) = self.shadow_root(current) {
-                stack.push(root);
-            }
-        }
-        snapshot
-    }
-
-    /// Whether `id`'s ancestor chain reaches the document root.
-    #[must_use]
-    pub fn is_connected(&self, id: NodeId) -> bool {
-        let mut current = Some(id);
-        while let Some(node) = current {
-            if node == self.document {
-                return true;
-            }
-            current = self.parent(node).or_else(|| self.shadow_host(node));
-        }
-        false
-    }
-
     /// `id`'s ancestors, nearest first, `id` excluded.
     pub fn ancestors(&self, id: NodeId) -> impl Iterator<Item = NodeId> + '_ {
         std::iter::successors(self.parent(id), |&node| self.parent(node))
@@ -524,9 +282,6 @@ impl Dom {
         // Bumped even while recording is suppressed: the tree changed, and
         // the renderer's frame-order cache keys off this serial.
         self.mutation_serial = self.mutation_serial.wrapping_add(1);
-        if self.named_names_seeded {
-            self.index_named_names(&mutation);
-        }
         if self.record_mutations && !self.recording_suppressed {
             self.mutations.push(mutation);
         }
@@ -539,31 +294,6 @@ impl Dom {
     #[must_use]
     pub fn mutation_serial(&self) -> u64 {
         self.mutation_serial
-    }
-
-    /// Compatibility mode this document answers selector queries under.
-    #[must_use]
-    pub fn quirks_mode(&self) -> QuirksMode {
-        self.quirks_mode
-    }
-
-    /// Sets the compatibility mode. The html5ever adapter writes this from
-    /// the tree builder; tests may set it to exercise the id/class quirk.
-    pub fn set_quirks_mode(&mut self, mode: QuirksMode) {
-        self.quirks_mode = mode;
-    }
-
-    /// Document-level language from HTTP `Content-Language`, used by
-    /// `:lang()` when no element `lang` / `xml:lang` applies.
-    #[must_use]
-    pub fn document_language(&self) -> Option<&str> {
-        self.document_language.as_deref()
-    }
-
-    /// Sets the document language default. `browser` writes this after
-    /// navigation; tests may set it directly.
-    pub fn set_document_language(&mut self, language: Option<String>) {
-        self.document_language = language;
     }
 
     /// The root `Document` node; every other node descends from it.
@@ -835,12 +565,7 @@ impl Dom {
         let copy = self.alloc(self.kind(id).ok_or(DomError::StaleNode)?.clone());
         let mut pending = vec![(id, copy)];
         while let Some((source, target)) = pending.pop() {
-            // Cloning steps for text-like controls propagate the raw value and
-            // dirty value flag from source to copy
-            // (<https://html.spec.whatwg.org/multipage/form-elements.html#the-textarea-element:concept-node-clone-ext>).
-            if let Some(value) = self.input_values.get(&source).cloned() {
-                self.input_values.insert(target, value);
-            }
+            self.form.clone_dirty_value(source, target);
             // https://html.spec.whatwg.org/multipage/scripting.html#the-template-element:cloning-steps
             if let Some(contents) = self.template_contents(source) {
                 let cloned_contents = self.create_fragment();
@@ -859,119 +584,6 @@ impl Dom {
             }
         }
         Ok(copy)
-    }
-
-    /// Associates `contents` as the [template contents](https://html.spec.whatwg.org/multipage/scripting.html#template-contents)
-    /// of `template`. The fragment stays out of `template`'s child list.
-    ///
-    /// Replacing an existing association destroys the previous fragment.
-    ///
-    /// # Errors
-    ///
-    /// - [`DomError::CycleForbidden`] if the association creates a host-including cycle.
-    /// - [`DomError::HierarchyRequest`] if replacement would destroy the new contents.
-    /// - [`DomError::StaleNode`] if either handle is stale.
-    /// - [`DomError::WrongNodeType`] if `template` is not an HTML `template`
-    ///   element, `contents` is not a fragment, or `contents` already belongs
-    ///   to another template.
-    pub fn set_template_contents(
-        &mut self,
-        template: NodeId,
-        contents: NodeId,
-    ) -> Result<(), DomError> {
-        self.require_live(template)?;
-        self.require_live(contents)?;
-        if !self.is_html_template_element(template) {
-            return Err(DomError::WrongNodeType);
-        }
-        if !self.is_fragment(contents) {
-            return Err(DomError::WrongNodeType);
-        }
-        if self
-            .template_contents
-            .iter()
-            .any(|(&owner, &mapped)| mapped == contents && owner != template)
-        {
-            return Err(DomError::WrongNodeType);
-        }
-        // https://dom.spec.whatwg.org/#concept-tree-host-including-inclusive-ancestor
-        if self.would_cycle(contents, template) {
-            return Err(DomError::CycleForbidden);
-        }
-        if let Some(old) = self.template_contents.get(&template).copied()
-            && old != contents
-        {
-            if self.would_cycle(old, contents) {
-                return Err(DomError::HierarchyRequest);
-            }
-            self.destroy(old)?;
-            self.template_contents.remove(&template);
-        }
-        self.template_contents.insert(template, contents);
-        Ok(())
-    }
-
-    /// The contents fragment of `template`, if this document associated one.
-    #[must_use]
-    pub fn template_contents(&self, template: NodeId) -> Option<NodeId> {
-        let contents = self.template_contents.get(&template).copied()?;
-        self.contains(contents).then_some(contents)
-    }
-
-    /// Attaches a new shadow root to `host`.
-    ///
-    /// Implements the tree association from the DOM "attach a shadow root"
-    /// algorithm; policy checks such as the HTML element safelist remain at
-    /// the binding boundary.
-    /// <https://dom.spec.whatwg.org/#concept-attach-a-shadow-root>
-    ///
-    /// # Errors
-    ///
-    /// Returns [`DomError::HierarchyRequest`] if the host already has a
-    /// shadow root, and [`DomError::WrongNodeType`] for a non-element host.
-    pub fn attach_shadow(&mut self, host: NodeId, open: bool) -> Result<NodeId, DomError> {
-        self.require_live(host)?;
-        if !matches!(self.kind(host), Some(NodeKind::Element { .. })) {
-            return Err(DomError::WrongNodeType);
-        }
-        if self.shadow_roots.contains_key(&host) {
-            return Err(DomError::HierarchyRequest);
-        }
-        let root = self.create_fragment();
-        self.shadow_roots.insert(host, (root, open));
-        self.shadow_hosts.insert(root, host);
-        self.mutation_serial = self.mutation_serial.wrapping_add(1);
-        Ok(root)
-    }
-
-    /// The shadow root associated with `host`, including a closed root.
-    #[must_use]
-    pub fn shadow_root(&self, host: NodeId) -> Option<NodeId> {
-        let (root, _) = self.shadow_roots.get(&host).copied()?;
-        self.contains(root).then_some(root)
-    }
-
-    /// The open shadow root associated with `host`.
-    #[must_use]
-    pub fn open_shadow_root(&self, host: NodeId) -> Option<NodeId> {
-        let (root, open) = self.shadow_roots.get(&host).copied()?;
-        (open && self.contains(root)).then_some(root)
-    }
-
-    /// The host of a shadow-root fragment.
-    #[must_use]
-    pub fn shadow_host(&self, root: NodeId) -> Option<NodeId> {
-        let host = self.shadow_hosts.get(&root).copied()?;
-        self.contains(host).then_some(host)
-    }
-
-    /// Whether `root` is an open shadow root.
-    #[must_use]
-    pub fn shadow_root_is_open(&self, root: NodeId) -> Option<bool> {
-        let host = self.shadow_host(root)?;
-        self.shadow_roots
-            .get(&host)
-            .and_then(|&(candidate, open)| (candidate == root).then_some(open))
     }
 
     /// Appends `child` as the last child of `parent`.
@@ -1423,6 +1035,9 @@ impl Dom {
         }
         for &id in &moved {
             self.insert_linked(to, id, None);
+            if !from_connected && to_connected {
+                self.node_inserted(id);
+            }
         }
         self.record_snapshot(tracked);
         Ok(())
@@ -1476,7 +1091,20 @@ impl Dom {
         attrs: Vec<Attribute>,
     ) -> Result<(), DomError> {
         let (_, attributes) = self.element_mut(id)?;
+        let added_name = attrs
+            .iter()
+            .find(|attribute| {
+                attribute.name.ns.as_ref().is_empty()
+                    && matches!(attribute.name.local.as_ref(), "id" | "name")
+                    && !attributes
+                        .iter()
+                        .any(|existing| existing.name == attribute.name)
+            })
+            .map(|attribute| attribute.name.local.to_string());
         merge_attrs(attributes, attrs);
+        if let Some(name) = added_name {
+            self.attribute_changed(id, &name);
+        }
         Ok(())
     }
 
@@ -1493,9 +1121,8 @@ impl Dom {
 
     /// Whether `id` is an HTML element with local name `local` (exact match).
     pub(crate) fn html_local_is(&self, id: NodeId, local: &str) -> bool {
-        self.element(id).is_some_and(|(name, _)| {
-            name.ns == html_namespace() && name.local.as_ref() == local
-        })
+        self.element(id)
+            .is_some_and(|(name, _)| name.ns == html_namespace() && name.local.as_ref() == local)
     }
 
     /// The [child text content](https://dom.spec.whatwg.org/#concept-child-text-content)
@@ -1517,48 +1144,6 @@ impl Dom {
             }
         }
         text
-    }
-
-    /// Records the source-text start line of the inline `script` element `id`,
-    /// as the parser counted it (1-based)
-    /// (<https://html.spec.whatwg.org/multipage/webappapis.html#script's-line-number>).
-    pub fn set_script_line(&mut self, id: NodeId, line: u32) {
-        self.script_lines.insert(id, line);
-    }
-
-    /// The start line recorded for the inline `script` element `id`.
-    #[must_use]
-    pub fn script_line(&self, id: NodeId) -> Option<u32> {
-        self.script_lines.get(&id).copied()
-    }
-
-    /// The scrolled offset `(left, top)` of `id`; `(0, 0)` when never set.
-    #[must_use]
-    pub fn scroll_offset(&self, id: NodeId) -> (f64, f64) {
-        self.scroll_offsets.get(&id).copied().unwrap_or((0.0, 0.0))
-    }
-
-    /// Stores `id`'s scroll offset.
-    pub fn set_scroll_offset(&mut self, id: NodeId, left: f64, top: f64) {
-        self.scroll_offsets.insert(id, (left, top));
-    }
-
-    /// Records the focused element for a document, backing `:focus`.
-    pub fn set_active_element(&mut self, document: u32, node: Option<NodeId>) {
-        match node {
-            Some(node) => {
-                self.active_element.insert(document, node);
-            }
-            None => {
-                self.active_element.remove(&document);
-            }
-        }
-    }
-
-    /// The focused element for a document, if any.
-    #[must_use]
-    pub fn active_element(&self, document: u32) -> Option<NodeId> {
-        self.active_element.get(&document).copied()
     }
 
     /// The text content of `id`: every descendant text node's data.
@@ -1651,21 +1236,7 @@ impl Dom {
             namespace: removed.name.ns.to_string(),
             old_value: Some(removed.value),
         });
-        if local.eq_ignore_ascii_case("selected") {
-            self.refresh_option_selectedness(id);
-            if let Some(select) = self.option_select_owner(id) {
-                self.apply_default_selectedness(select);
-            }
-        }
-        if local.eq_ignore_ascii_case("type") {
-            self.refresh_input_type(id)?;
-        }
-        if self.html_local_is(id, "select")
-            && (local.eq_ignore_ascii_case("multiple") || local.eq_ignore_ascii_case("size"))
-        {
-            self.apply_default_selectedness(id);
-        }
-        Ok(())
+        self.attribute_removed(id, local)
     }
 
     /// [Element.removeAttributeNS](https://dom.spec.whatwg.org/#dom-element-removeattributens).
@@ -1693,6 +1264,7 @@ impl Dom {
             namespace: ns.to_owned(),
             old_value: Some(removed.value),
         });
+        self.attribute_changed(id, local);
         Ok(())
     }
 
@@ -1821,6 +1393,7 @@ impl Dom {
             namespace: namespace.to_owned(),
             old_value,
         });
+        self.attribute_changed(id, local);
         Ok(())
     }
 
@@ -1875,24 +1448,7 @@ impl Dom {
             namespace: recorded_namespace,
             old_value,
         });
-        if local.eq_ignore_ascii_case("selected") {
-            self.refresh_option_selectedness(id);
-            if let Some(select) = self.option_select_owner(id) {
-                self.apply_default_selectedness(select);
-            }
-        }
-        if local.eq_ignore_ascii_case("type") {
-            self.refresh_input_type(id)?;
-        }
-        if local.eq_ignore_ascii_case("name") || local.eq_ignore_ascii_case("checked") {
-            self.refresh_radio_group(id);
-        }
-        if self.html_local_is(id, "select")
-            && (local.eq_ignore_ascii_case("multiple") || local.eq_ignore_ascii_case("size"))
-        {
-            self.apply_default_selectedness(id);
-        }
-        Ok(())
+        self.attribute_set(id, local)
     }
 
     /// Replaces the data of the text node `id`.
@@ -2026,28 +1582,9 @@ impl Dom {
 
         let mut pending = vec![id];
         while let Some(current) = pending.pop() {
-            self.input_values.remove(&current);
-            self.input_types.remove(&current);
-            self.selections.remove(&current);
-            self.script_lines.remove(&current);
-            self.checkedness.remove(&current);
-            self.indeterminate.remove(&current);
-            self.option_selectedness.remove(&current);
-            self.option_dirty_selected.remove(&current);
-            self.scroll_offsets.remove(&current);
-            self.input_selectable.remove(&current);
-            if let Some(contents) = self.template_contents.remove(&current) {
-                pending.push(contents);
-            }
-            if let Some((root, _)) = self.shadow_roots.remove(&current) {
-                self.shadow_hosts.remove(&root);
-                pending.push(root);
-            }
-            if let Some(host) = self.shadow_hosts.remove(&current) {
-                self.shadow_roots.remove(&host);
-            }
-            self.template_contents
-                .retain(|_, contents| *contents != current);
+            self.form.forget(current);
+            self.metadata.forget(current);
+            self.shadow.forget(current, &mut pending);
             // Collect the child run through the links while the slot is still
             // populated. Descendants are processed later, so their own links
             // are intact when their turn comes.
@@ -2222,6 +1759,7 @@ impl Dom {
             (None, None)
         };
         self.insert_linked(parent, node, before);
+        self.node_inserted(node);
         self.record(Mutation::ChildList {
             target: parent,
             added: vec![node],
@@ -2341,6 +1879,7 @@ impl Dom {
         // become the default selection.
         for &id in &moved {
             self.insert_linked(parent, id, before);
+            self.node_inserted(id);
             if self.checked_radio_form_owner(id).is_some() {
                 self.refresh_radio_group(id);
             }
@@ -2365,42 +1904,23 @@ impl Dom {
         });
     }
 
-    /// Appends a run of new, unselected HTML options as one tree mutation.
-    /// Their lack of descendants, attributes, and lifecycle hooks permits a
-    /// single selectedness pass after the run is linked
-    /// (<https://html.spec.whatwg.org/multipage/common-dom-interfaces.html#append-new-option-elements>).
-    ///
-    /// # Errors
-    ///
-    /// - [`DomError::StaleNode`] if `select` is stale.
-    /// - [`DomError::WrongNodeType`] if `select` is not an HTML `select`.
-    pub fn append_blank_options(&mut self, select: NodeId, count: usize) -> Result<(), DomError> {
-        self.require_live(select)?;
-        if !self.html_local_is(select, "select") {
-            return Err(DomError::WrongNodeType);
+    /// Appends a run of fresh, unparented leaves to a live container as one
+    /// child-list mutation. The caller performs element-specific insertion
+    /// steps; only the link writer here touches parent and sibling pointers
+    /// (<https://dom.spec.whatwg.org/#concept-node-insert>).
+    pub(crate) fn append_fresh_children(&mut self, parent: NodeId, added: Vec<NodeId>) {
+        let previous = self.last_child(parent);
+        for &node in &added {
+            self.insert_linked(parent, node, None);
+            self.node_inserted(node);
         }
-        if count == 0 {
-            return Ok(());
-        }
-        let previous = self.last_child(select);
-        let mut added = Vec::with_capacity(count);
-        for _ in 0..count {
-            let option = self.create_element(
-                QualName::new(None, html_namespace(), LocalName::from("option")),
-                Vec::new(),
-            );
-            self.insert_linked(select, option, None);
-            added.push(option);
-        }
-        self.apply_default_selectedness(select);
         self.record(Mutation::ChildList {
-            target: select,
+            target: parent,
             added,
             removed: Vec::new(),
             previous,
             next: None,
         });
-        Ok(())
     }
 
     fn ensure_alive(&self, a: NodeId, b: NodeId) -> Result<(), DomError> {
@@ -2427,11 +1947,7 @@ impl Dom {
             }
             cursor = self.parent(id).or_else(|| {
                 if self.is_fragment(id) {
-                    self.shadow_hosts.get(&id).copied().or_else(|| {
-                        self.template_contents
-                            .iter()
-                            .find_map(|(&host, &contents)| (contents == id).then_some(host))
-                    })
+                    self.shadow.associated_host(id)
                 } else {
                     None
                 }
@@ -2595,7 +2111,6 @@ impl Dom {
         });
         NodeId::new(self.document.document, slot, 0)
     }
-
 }
 
 /// Adds each attribute whose qualified name is not already present; the

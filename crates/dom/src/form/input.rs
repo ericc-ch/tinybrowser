@@ -45,6 +45,7 @@ impl Dom {
         Some(match input_value_mode(&typ) {
             ValueMode::Value => {
                 let value = self
+                    .form
                     .input_values
                     .get(&id)
                     .cloned()
@@ -74,7 +75,7 @@ impl Dom {
         match input_value_mode(&typ) {
             ValueMode::Value => {
                 let value = self.sanitize_input_value(id, value);
-                self.input_values.insert(id, value);
+                self.form.input_values.insert(id, value);
             }
             ValueMode::Default | ValueMode::DefaultOn => {
                 self.set_attribute(id, "value", value)?;
@@ -96,11 +97,12 @@ impl Dom {
             return Ok(());
         };
         let old = self
+            .form
             .input_types
             .get(&id)
             .cloned()
             .unwrap_or_else(|| "text".to_owned());
-        self.input_types.insert(id, new_type.clone());
+        self.form.input_types.insert(id, new_type.clone());
         if old == new_type {
             return Ok(());
         }
@@ -120,6 +122,7 @@ impl Dom {
             // A value-mode value becomes the new default, unless it is empty.
             (ValueMode::Value, ValueMode::Default | ValueMode::DefaultOn) => {
                 let raw = self
+                    .form
                     .input_values
                     .get(&id)
                     .cloned()
@@ -129,24 +132,24 @@ impl Dom {
                 if !value.is_empty() {
                     self.set_attribute(id, "value", value)?;
                 }
-                self.input_values.remove(&id);
+                self.form.input_values.remove(&id);
             }
             // A non-value state follows the content attribute again.
             (mode, ValueMode::Value) if mode != ValueMode::Value => {
-                self.input_values.remove(&id);
+                self.form.input_values.remove(&id);
             }
             // A non-filename state clears the value for a file input.
             (mode, ValueMode::Filename) if mode != ValueMode::Filename => {
-                self.input_values.remove(&id);
+                self.form.input_values.remove(&id);
             }
             _ => {}
         }
         // The type-change steps invoke the new state's value sanitization.
         if input_value_mode(new_type) == ValueMode::Value
-            && let Some(value) = self.input_values.get(&id).cloned()
+            && let Some(value) = self.form.input_values.get(&id).cloned()
         {
             let sanitized = self.sanitize_value_for_type(id, new_type, value);
-            self.input_values.insert(id, sanitized);
+            self.form.input_values.insert(id, sanitized);
         }
         Ok(())
     }
@@ -195,7 +198,9 @@ impl Dom {
                 &value,
                 self.attribute(id, "min").as_deref().and_then(parse_finite),
                 self.attribute(id, "max").as_deref().and_then(parse_finite),
-                self.attribute(id, "value").as_deref().and_then(parse_finite),
+                self.attribute(id, "value")
+                    .as_deref()
+                    .and_then(parse_finite),
                 self.attribute(id, "step").as_deref(),
             ),
             "date" => sanitize_grammar(value, is_valid_date),
@@ -224,7 +229,8 @@ impl Dom {
             return None;
         }
         Some(
-            self.input_values
+            self.form
+                .input_values
                 .get(&id)
                 .cloned()
                 .unwrap_or_else(|| self.child_text_content(id)),
@@ -252,7 +258,7 @@ impl Dom {
         if !self.html_local_is(id, "textarea") {
             return Err(DomError::WrongNodeType);
         }
-        self.input_values.insert(id, value);
+        self.form.input_values.insert(id, value);
         Ok(())
     }
 
@@ -319,8 +325,10 @@ impl Dom {
         if !self.selection_supported(id) {
             return None;
         }
-        let length = self.control_value(id).map_or(0, |value| utf16_length(&value));
-        let (start, end, direction) = self.selections.get(&id).copied().unwrap_or((0, 0, 0));
+        let length = self
+            .control_value(id)
+            .map_or(0, |value| utf16_length(&value));
+        let (start, end, direction) = self.form.selections.get(&id).copied().unwrap_or((0, 0, 0));
         Some((start.min(length), end.min(length), direction))
     }
 
@@ -328,7 +336,7 @@ impl Dom {
     /// `parent` is not such a control. Used to detect whether a child change
     /// really changed the value.
     pub(crate) fn textarea_value_before_change(&self, parent: NodeId) -> Option<String> {
-        if !self.html_local_is(parent, "textarea") || self.input_values.contains_key(&parent) {
+        if !self.html_local_is(parent, "textarea") || self.form.input_values.contains_key(&parent) {
             return None;
         }
         self.textarea_value(parent)
@@ -340,12 +348,16 @@ impl Dom {
     /// the API value alone (for example one that only differs in raw newlines)
     /// keeps the selection. A dirty textarea keeps both its value and its
     /// selection.
-    pub(crate) fn reset_textarea_selection_if_changed(&mut self, parent: NodeId, before: Option<String>) {
+    pub(crate) fn reset_textarea_selection_if_changed(
+        &mut self,
+        parent: NodeId,
+        before: Option<String>,
+    ) {
         let Some(before) = before else {
             return;
         };
         if self.textarea_value(parent).as_deref() != Some(before.as_str()) {
-            self.selections.insert(parent, (0, 0, 0));
+            self.form.selections.insert(parent, (0, 0, 0));
         }
     }
 
@@ -356,7 +368,9 @@ impl Dom {
         if !self.selection_supported(id) {
             return false;
         }
-        let length = self.control_value(id).map_or(0, |value| utf16_length(&value));
+        let length = self
+            .control_value(id)
+            .map_or(0, |value| utf16_length(&value));
         let mut end = end.min(length);
         let mut start = start.min(length);
         // If end is less than or equal to start, both are placed immediately
@@ -367,8 +381,8 @@ impl Dom {
         }
         end = end.max(start);
         let next = (start, end, direction.min(2));
-        let previous = self.selections.get(&id).copied().unwrap_or((0, 0, 0));
-        self.selections.insert(id, next);
+        let previous = self.form.selections.get(&id).copied().unwrap_or((0, 0, 0));
+        self.form.selections.insert(id, next);
         next != previous
     }
 
@@ -376,12 +390,12 @@ impl Dom {
     /// last changed. The input default (`type=text`) is selectable.
     #[must_use]
     pub fn input_selectable(&self, id: NodeId) -> bool {
-        self.input_selectable.get(&id).copied().unwrap_or(true)
+        self.form.input_selectable.get(&id).copied().unwrap_or(true)
     }
 
     /// Records whether `id`'s input type currently supports a text selection.
     pub fn set_input_selectable(&mut self, id: NodeId, selectable: bool) {
-        self.input_selectable.insert(id, selectable);
+        self.form.input_selectable.insert(id, selectable);
     }
 
     /// The `value` IDL value for any element that has one: `option`, `select`,
@@ -453,7 +467,6 @@ impl Dom {
         }
         self.replace_all(id, replacement)
     }
-
 }
 
 /// Keeps `value` when it satisfies `valid`, else replaces it with the empty
@@ -558,11 +571,13 @@ fn sanitize_range_value(
         let base = min_attr.or(value_attr).unwrap_or(0.0);
         let quotient = (number - base) / step;
         if (quotient - quotient.round()).abs() > 1e-9 {
-            let in_range = |candidate: f64| {
-                candidate >= min - 1e-9 && (max < min || candidate <= max + 1e-9)
-            };
+            let in_range =
+                |candidate: f64| candidate >= min - 1e-9 && (max < min || candidate <= max + 1e-9);
             let mut best: Option<f64> = None;
-            for candidate in [base + quotient.floor() * step, base + quotient.ceil() * step] {
+            for candidate in [
+                base + quotient.floor() * step,
+                base + quotient.ceil() * step,
+            ] {
                 if !in_range(candidate) {
                     continue;
                 }
@@ -613,4 +628,3 @@ fn normalize_newlines(text: &str) -> String {
 fn utf16_length(text: &str) -> u32 {
     text.encode_utf16().count() as u32
 }
-

@@ -19,6 +19,7 @@
 
 mod arena;
 mod form;
+mod hooks;
 mod id;
 mod named;
 mod node;
