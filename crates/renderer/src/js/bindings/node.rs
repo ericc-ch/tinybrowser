@@ -1708,30 +1708,18 @@ impl JsNode {
         live_collection(
             &ctx,
             self.handle.0,
-            CollectionKind::ElementsByTag("option".to_owned()),
-            Some("HTMLCollection"),
+            CollectionKind::SelectOptions,
+            Some("HTMLOptionsCollection"),
         )
     }
 
     // https://html.spec.whatwg.org/multipage/form-elements.html#dom-select-selectedoptions
     #[qjs(get, rename = "selectedOptions")]
     fn selected_options<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
-        let world = world(&ctx)?;
-        let world = world.borrow();
-        let Some(parsed) = world.document(self.handle.0) else {
-            return Ok(Value::new_null(ctx));
-        };
-        let handles: Vec<Handle> = parsed
-            .dom
-            .select_options(self.handle.0)
-            .into_iter()
-            .filter(|&option| parsed.dom.option_selected(option))
-            .map(Handle)
-            .collect();
         live_collection(
             &ctx,
             self.handle.0,
-            CollectionKind::Static(handles),
+            CollectionKind::SelectedOptions,
             Some("HTMLCollection"),
         )
     }

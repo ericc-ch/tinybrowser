@@ -1087,21 +1087,38 @@
   });
 
   Object.defineProperties(globalThis.HTMLSelectElement.prototype, {
-    item: {
-      value: function(index) {
-        const option = this.options[index];
-        return option === undefined ? null : option;
+    // `[Reflect, ReflectDefault=0] attribute unsigned long size` with the
+    // rules for parsing non-negative integers
+    // (<https://html.spec.whatwg.org/multipage/form-elements.html#dom-select-size>).
+    size: {
+      get: function() {
+        const raw = this.getAttribute('size');
+        const match = raw === null ? null : /^[\t\n\f\r ]*\+?([0-9]+)/.exec(raw);
+        const parsed = match === null ? null : Number(match[1]);
+        return parsed !== null && parsed <= 2147483647 ? parsed : 0;
       },
+      set: function(value) {
+        const unsigned = (+value) >>> 0;
+        this.setAttribute('size', String(unsigned <= 2147483647 ? unsigned : 0));
+      },
+      enumerable: true, configurable: true,
+    },
+    length: {
+      get: function() { return this.options.length; },
+      set: function(value) { this.options.length = value; },
+      enumerable: true, configurable: true,
+    },
+    // Both delegate to the options collection
+    // (<https://html.spec.whatwg.org/multipage/form-elements.html#dom-select-item>,
+    // <https://html.spec.whatwg.org/multipage/form-elements.html#dom-select-nameditem>).
+    // `item` takes `unsigned long`, so a negative index wraps out of range and
+    // returns null instead of reaching the host's `usize` conversion.
+    item: {
+      value: function(index) { return this.options.item((+index) >>> 0); },
       writable: true, enumerable: true, configurable: true,
     },
     namedItem: {
-      value: function(name) {
-        const key = String(name);
-        for (const option of this.options) {
-          if (option.id === key || option.getAttribute('name') === key) return option;
-        }
-        return null;
-      },
+      value: function(name) { return this.options.namedItem(name); },
       writable: true, enumerable: true, configurable: true,
     },
     // <https://html.spec.whatwg.org/multipage/form-elements.html#dom-select-add>
@@ -1115,18 +1132,19 @@
           this.appendChild(element);
           return;
         }
-        if (typeof before === 'number') {
+        if (!before || typeof before !== 'object' || before.nodeType !== 1) {
           const options = this.options;
-          const index = before < 0 ? options.length : before;
+          const beforeIndex = toLong(before);
+          const index = beforeIndex < 0 ? options.length : beforeIndex;
           const reference = options[index];
           if (reference === undefined) this.appendChild(element);
-          else this.insertBefore(element, reference);
+          else reference.parentNode.insertBefore(element, reference);
           return;
         }
-        if (before.parentNode !== this) {
+        if (before === this || !this.contains(before)) {
           throw new DOMException('reference is not a child of this select', 'NotFoundError');
         }
-        this.insertBefore(element, before);
+        before.parentNode.insertBefore(element, before);
       },
       writable: true, enumerable: true, configurable: true,
     },
@@ -1136,7 +1154,7 @@
           globalThis.Element.prototype.remove.call(this);
           return;
         }
-        const option = this.options[Number(index)];
+        const option = this.options[toLong(index)];
         if (option !== undefined) option.remove();
       },
       writable: true, enumerable: true, configurable: true,
