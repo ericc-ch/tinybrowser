@@ -1,8 +1,14 @@
 (function() {
   const isOptionNode = globalThis.__tbIsOptionNode;
   const appendBlankOptions = globalThis.__tbAppendBlankOptions;
+  const windowNamedValue = globalThis.__tbWindowNamedValue;
+  const windowNamedNames = globalThis.__tbWindowNamedNames;
+  const windowNamedSerial = globalThis.__tbWindowNamedSerial;
   delete globalThis.__tbIsOptionNode;
   delete globalThis.__tbAppendBlankOptions;
+  delete globalThis.__tbWindowNamedValue;
+  delete globalThis.__tbWindowNamedNames;
+  delete globalThis.__tbWindowNamedSerial;
   const canonicalIndex = /^(0|[1-9][0-9]*)$/;
   const native = globalThis.NodeList.prototype;
   function values() {
@@ -284,4 +290,59 @@
       }
     }
   });
+  // Named access on the Window object
+  // (<https://html.spec.whatwg.org/multipage/nav-history-apis.html#named-access-on-the-window-object>):
+  // a named properties object sits between the global and its prototype. It
+  // exposes an element for a name, or an `HTMLCollection` when several named
+  // objects share the name. The names are recomputed only when the document's
+  // mutation serial changes, so probing an undefined global stays O(1).
+  {
+    let names = null;
+    let namesSerial = null;
+    const refreshNames = () => {
+      const serial = windowNamedSerial();
+      if (names === null || namesSerial !== serial) {
+        names = new Set(windowNamedNames());
+        namesSerial = serial;
+      }
+    };
+    const visible = name => {
+      refreshNames();
+      return names.has(name);
+    };
+    const originalProto = Object.getPrototypeOf(globalThis);
+    const target = Object.create(originalProto);
+    Object.setPrototypeOf(globalThis, new Proxy(target, {
+      get: function(inner, property, receiver) {
+        if (typeof property === 'string' && !Reflect.has(inner, property) && visible(property)) {
+          const value = windowNamedValue(property);
+          if (value !== undefined) return value;
+        }
+        return Reflect.get(inner, property, receiver);
+      },
+      has: function(inner, property) {
+        if (typeof property === 'string' && !Reflect.has(inner, property) && visible(property)) {
+          return windowNamedValue(property) !== undefined;
+        }
+        return Reflect.has(inner, property);
+      },
+      getOwnPropertyDescriptor: function(inner, property) {
+        if (typeof property === 'string' && !Reflect.has(inner, property) && visible(property)) {
+          const value = windowNamedValue(property);
+          if (value !== undefined) {
+            return { value, writable: true, enumerable: false, configurable: true };
+          }
+        }
+        return Reflect.getOwnPropertyDescriptor(inner, property);
+      },
+      ownKeys: function(inner) {
+        const keys = Reflect.ownKeys(inner);
+        refreshNames();
+        for (const name of names) {
+          if (!keys.includes(name)) keys.push(name);
+        }
+        return keys;
+      },
+    }));
+  }
 })();

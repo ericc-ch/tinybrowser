@@ -1577,6 +1577,7 @@ pub(super) fn collection_ids(
             .into_iter()
             .filter(|&option| parsed.dom.option_selected(option))
             .collect(),
+        CollectionKind::WindowNamed(name) => collect_window_named(&parsed.dom, scope, name),
         CollectionKind::Static(handles) => handles.iter().map(|handle| handle.0).collect(),
     })
 }
@@ -1604,6 +1605,30 @@ fn collect_by_tag(dom: &dom::Dom, scope: NodeId, name: &str) -> Vec<NodeId> {
 fn collect_by_name(dom: &dom::Dom, scope: NodeId, name: &str) -> Vec<NodeId> {
     dom.descendants(scope)
         .filter(|&id| is_element(dom, id) && dom.attribute(id, "name").as_deref() == Some(name))
+        .collect()
+}
+
+/// The Window named objects with `name`: every element whose ID is `name`,
+/// plus `embed`, `form`, `img`, and `object` elements whose `name` is `name`,
+/// in tree order
+/// (<https://html.spec.whatwg.org/multipage/nav-history-apis.html#named-access-on-the-window-object>).
+fn collect_window_named(dom: &dom::Dom, scope: NodeId, name: &str) -> Vec<NodeId> {
+    if name.is_empty() {
+        return Vec::new();
+    }
+    dom.descendants(scope)
+        .filter(|&id| {
+            if dom.no_namespace_attribute(id, "id").as_deref() == Some(name) {
+                return true;
+            }
+            matches!(
+                dom.kind(id),
+                Some(NodeKind::Element { name: qual, .. })
+                    if qual.ns == html_namespace()
+                        && matches!(qual.local.as_ref(), "embed" | "form" | "img" | "object")
+                        && dom.no_namespace_attribute(id, "name").as_deref() == Some(name)
+            )
+        })
         .collect()
 }
 
