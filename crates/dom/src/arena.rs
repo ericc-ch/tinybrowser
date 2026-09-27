@@ -10,9 +10,9 @@ use std::cell::Cell;
 use std::fmt;
 use std::marker::PhantomData;
 
-use crate::form::FormState;
+use crate::form::{self, FormState};
 use crate::id::NodeId;
-use crate::named::NamedIndex;
+use crate::named::{self, NamedIndex};
 use crate::node::{
     Attribute, LocalName, Namespace, NodeKind, Prefix, QualName, html_namespace,
     html_qualified_name_eq, qualified_name_eq,
@@ -23,7 +23,8 @@ use self::lifecycle::ConnectionState;
 use self::metadata::Metadata;
 use self::shadow::ShadowState;
 pub use self::tree::Children;
-use self::tree::{Slot, Tree};
+use self::tree::Slot;
+pub(crate) use self::tree::Tree;
 
 /// The document-compatibility mode a query runs under: what html5ever's
 /// tree builder reports and parsed pages carry.
@@ -139,7 +140,7 @@ impl std::error::Error for DomError {}
 /// otherwise-auto-derived `Sync`.
 #[derive(Debug)]
 pub struct Dom {
-    tree: Tree,
+    pub(crate) tree: Tree,
     metadata: Metadata,
     shadow: ShadowState,
     pub(crate) form: FormState,
@@ -939,7 +940,7 @@ impl Dom {
         for &id in &moved {
             self.tree.insert_linked(to, id, None);
             if !from_connected && to_connected {
-                self.node_inserted(id);
+                named::inserted(self, id);
             }
         }
         self.record_snapshot(tracked);
@@ -1006,7 +1007,7 @@ impl Dom {
             .map(|attribute| attribute.name.local.to_string());
         merge_attrs(attributes, attrs);
         if let Some(name) = added_name {
-            self.attribute_changed(id, &name);
+            named::attribute_changed(self, id, &name);
         }
         Ok(())
     }
@@ -1067,13 +1068,9 @@ impl Dom {
     /// (<https://dom.spec.whatwg.org/#concept-element-attributes-get-by-name>).
     #[must_use]
     pub fn no_namespace_attribute(&self, id: NodeId, local: &str) -> Option<String> {
-        let (_, attributes) = self.element(id)?;
-        attributes
-            .iter()
-            .find(|attribute| {
-                attribute.name.ns.as_ref().is_empty() && attribute.name.local.as_ref() == local
-            })
-            .map(|attribute| attribute.value.clone())
+        self.tree
+            .no_namespace_attribute(id, local)
+            .map(str::to_owned)
     }
 
     /// [Element.hasAttribute](https://dom.spec.whatwg.org/#dom-element-hasattribute):
@@ -1139,7 +1136,8 @@ impl Dom {
             namespace: removed.name.ns.to_string(),
             old_value: Some(removed.value),
         });
-        self.attribute_removed(id, local)
+        named::attribute_changed(self, id, local);
+        form::attribute_removed(self, id, local)
     }
 
     /// [Element.removeAttributeNS](https://dom.spec.whatwg.org/#dom-element-removeattributens).
@@ -1167,7 +1165,7 @@ impl Dom {
             namespace: ns.to_owned(),
             old_value: Some(removed.value),
         });
-        self.attribute_changed(id, local);
+        named::attribute_changed(self, id, local);
         Ok(())
     }
 
@@ -1296,7 +1294,7 @@ impl Dom {
             namespace: namespace.to_owned(),
             old_value,
         });
-        self.attribute_changed(id, local);
+        named::attribute_changed(self, id, local);
         Ok(())
     }
 
@@ -1351,7 +1349,8 @@ impl Dom {
             namespace: recorded_namespace,
             old_value,
         });
-        self.attribute_set(id, local)
+        named::attribute_changed(self, id, local);
+        form::attribute_set(self, id, local)
     }
 
     /// Replaces the data of the text node `id`.
@@ -1625,7 +1624,7 @@ impl Dom {
             (None, None)
         };
         self.tree.insert_linked(parent, node, before);
-        self.node_inserted(node);
+        named::inserted(self, node);
         self.record(Mutation::ChildList {
             target: parent,
             added: vec![node],
@@ -1702,7 +1701,7 @@ impl Dom {
         // become the default selection.
         for &id in &moved {
             self.tree.insert_linked(parent, id, before);
-            self.node_inserted(id);
+            named::inserted(self, id);
             if self.checked_radio_form_owner(id).is_some() {
                 self.refresh_radio_group(id);
             }
@@ -1735,7 +1734,7 @@ impl Dom {
         let previous = self.last_child(parent);
         for &node in &added {
             self.tree.insert_linked(parent, node, None);
-            self.node_inserted(node);
+            named::inserted(self, node);
         }
         self.record(Mutation::ChildList {
             target: parent,

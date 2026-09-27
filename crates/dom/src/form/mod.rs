@@ -11,7 +11,7 @@ mod select;
 
 use std::collections::{HashMap, HashSet};
 
-use crate::{Dom, NodeId};
+use crate::{Dom, DomError, NodeId};
 
 #[derive(Debug, Default)]
 pub(crate) struct FormState {
@@ -57,6 +57,51 @@ impl FormState {
         self.input_selectable.remove(&id);
         self.selections.remove(&id);
     }
+}
+
+/// Run the form-control steps after setting an attribute.
+pub(crate) fn attribute_set(document: &mut Dom, node: NodeId, name: &str) -> Result<(), DomError> {
+    if name.eq_ignore_ascii_case("selected") {
+        document.refresh_option_selectedness(node);
+        if let Some(select) = document.option_select_owner(node) {
+            document.apply_default_selectedness(select);
+        }
+    }
+    if name.eq_ignore_ascii_case("type") {
+        document.refresh_input_type(node)?;
+    }
+    if name.eq_ignore_ascii_case("name") || name.eq_ignore_ascii_case("checked") {
+        document.refresh_radio_group(node);
+    }
+    if document.html_local_is(node, "select")
+        && (name.eq_ignore_ascii_case("multiple") || name.eq_ignore_ascii_case("size"))
+    {
+        document.apply_default_selectedness(node);
+    }
+    Ok(())
+}
+
+/// Run the form-control steps after removing an attribute.
+pub(crate) fn attribute_removed(
+    document: &mut Dom,
+    node: NodeId,
+    name: &str,
+) -> Result<(), DomError> {
+    if name.eq_ignore_ascii_case("selected") {
+        document.refresh_option_selectedness(node);
+        if let Some(select) = document.option_select_owner(node) {
+            document.apply_default_selectedness(select);
+        }
+    }
+    if name.eq_ignore_ascii_case("type") {
+        document.refresh_input_type(node)?;
+    }
+    if document.html_local_is(node, "select")
+        && (name.eq_ignore_ascii_case("multiple") || name.eq_ignore_ascii_case("size"))
+    {
+        document.apply_default_selectedness(node);
+    }
+    Ok(())
 }
 
 impl Dom {

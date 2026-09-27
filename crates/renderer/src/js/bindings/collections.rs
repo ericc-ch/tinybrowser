@@ -162,7 +162,7 @@ fn window_named_has(ctx: Ctx<'_>, name: String) -> Result<bool> {
     let Some(mut parsed) = world.main_document_mut() else {
         return Ok(false);
     };
-    Ok(parsed.dom.named_name_exists(&name))
+    Ok(dom::named::exists(&mut parsed.dom, &name))
 }
 
 #[expect(

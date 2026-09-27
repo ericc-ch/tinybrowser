@@ -34,7 +34,7 @@ pub(crate) struct Slot {
 }
 
 #[derive(Debug)]
-pub(super) struct Tree {
+pub(crate) struct Tree {
     slots: Vec<Slot>,
     free: Vec<u32>,
     document: NodeId,
@@ -98,7 +98,7 @@ impl Tree {
         }
     }
 
-    pub(super) fn document(&self) -> NodeId {
+    pub(crate) fn document(&self) -> NodeId {
         self.document
     }
 
@@ -106,7 +106,7 @@ impl Tree {
         self.live_slot(id).is_some()
     }
 
-    pub(super) fn kind(&self, id: NodeId) -> Option<&NodeKind> {
+    pub(crate) fn kind(&self, id: NodeId) -> Option<&NodeKind> {
         Some(&self.live_slot(id)?.node.as_ref()?.kind)
     }
 
@@ -114,7 +114,7 @@ impl Tree {
         self.live_slot(id)?.node.as_ref()?.parent
     }
 
-    pub(super) fn children(&self, id: NodeId) -> Option<Children<'_>> {
+    pub(crate) fn children(&self, id: NodeId) -> Option<Children<'_>> {
         let node = self.live_slot(id)?.node.as_ref()?;
         Some(Children {
             tree: self,
@@ -125,6 +125,19 @@ impl Tree {
 
     pub(super) fn first_child(&self, id: NodeId) -> Option<NodeId> {
         self.live_slot(id)?.node.as_ref()?.first_child
+    }
+
+    /// The value of a no-namespace attribute with this exact local name.
+    pub(crate) fn no_namespace_attribute(&self, id: NodeId, local: &str) -> Option<&str> {
+        let NodeKind::Element { attributes, .. } = self.kind(id)? else {
+            return None;
+        };
+        attributes
+            .iter()
+            .find(|attribute| {
+                attribute.name.ns.as_ref().is_empty() && attribute.name.local.as_ref() == local
+            })
+            .map(|attribute| attribute.value.as_str())
     }
 
     pub(super) fn last_child(&self, id: NodeId) -> Option<NodeId> {

@@ -19,9 +19,8 @@
 
 mod arena;
 mod form;
-mod hooks;
 mod id;
-mod named;
+pub mod named;
 mod node;
 mod selector;
 mod state;

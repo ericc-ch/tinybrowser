@@ -15,6 +15,7 @@
 
 use std::collections::HashSet;
 
+use crate::arena::Tree;
 use crate::{Dom, NodeId, NodeKind, html_namespace};
 
 /// Extra names tolerated beyond twice the live count before a rebuild.
@@ -27,75 +28,82 @@ pub(crate) struct NamedIndex {
     watermark: usize,
 }
 
-impl Dom {
-    /// Whether `name` is a supported Window named-property name, seeding the
-    /// index from the document on first use.
-    pub fn named_name_exists(&mut self, name: &str) -> bool {
-        if !self.named.seeded {
-            self.named.seeded = true;
-            let document = self.document();
-            self.walk_named_names(document);
-            self.named.watermark = self.named.names.len();
+/// Whether `name` is a supported Window named-property name. The first query
+/// seeds the index from the document tree.
+pub fn exists(document: &mut Dom, name: &str) -> bool {
+    document.named.exists(&document.tree, name)
+}
+
+/// Include names in an inserted, connected subtree.
+pub(crate) fn inserted(document: &mut Dom, node: NodeId) {
+    if document.named.seeded && document.is_connected(node) {
+        document.named.inserted(&document.tree, node);
+    }
+}
+
+/// Include a connected element's changed `id` or exposed `name`.
+pub(crate) fn attribute_changed(document: &mut Dom, node: NodeId, name: &str) {
+    if document.named.seeded
+        && (name.eq_ignore_ascii_case("id") || name.eq_ignore_ascii_case("name"))
+        && document.is_connected(node)
+    {
+        document.named.inserted(&document.tree, node);
+    }
+}
+
+impl NamedIndex {
+    fn exists(&mut self, tree: &Tree, name: &str) -> bool {
+        if !self.seeded {
+            self.seeded = true;
+            self.walk_named_names(tree, tree.document());
+            self.watermark = self.names.len();
         }
-        self.named.names.contains(name)
+        self.names.contains(name)
     }
 
-    pub(crate) fn index_inserted_names(&mut self, node: NodeId) {
-        if self.named.seeded && self.is_connected(node) {
-            self.insert_named_names(node);
-        }
-    }
-
-    pub(crate) fn index_changed_name(&mut self, node: NodeId, name: &str) {
-        if self.named.seeded
-            && self.is_connected(node)
-            && (name.eq_ignore_ascii_case("id") || name.eq_ignore_ascii_case("name"))
-        {
-            self.insert_named_names(node);
-        }
+    fn inserted(&mut self, tree: &Tree, node: NodeId) {
+        self.insert_named_names(tree, node);
     }
 
     /// Adds `root`'s names, rebuilding the index from the document first when
     /// churn has grown it past the live count.
-    fn insert_named_names(&mut self, root: NodeId) {
+    fn insert_named_names(&mut self, tree: &Tree, root: NodeId) {
         let rebuild_at = self
-            .named
             .watermark
             .saturating_mul(2)
             .saturating_add(REBUILD_SLACK);
-        if self.named.names.len() >= rebuild_at {
-            self.named.names.clear();
-            let document = self.document();
-            self.walk_named_names(document);
-            self.named.watermark = self.named.names.len();
+        if self.names.len() >= rebuild_at {
+            self.names.clear();
+            self.walk_named_names(tree, tree.document());
+            self.watermark = self.names.len();
         }
-        self.walk_named_names(root);
+        self.walk_named_names(tree, root);
     }
 
     /// Adds every non-empty id and exposed `name` in `root`'s inclusive
     /// subtree. Roots enter through the document scan or connected mutations;
     /// names removed later remain harmless until a rebuild.
-    fn walk_named_names(&mut self, root: NodeId) {
+    fn walk_named_names(&mut self, tree: &Tree, root: NodeId) {
         let mut stack = vec![root];
         while let Some(current) = stack.pop() {
-            if let Some(id) = self.no_namespace_attribute(current, "id")
+            if let Some(id) = tree.no_namespace_attribute(current, "id")
                 && !id.is_empty()
             {
-                self.named.names.insert(id);
+                self.names.insert(id.to_owned());
             }
             let exposes_name = matches!(
-                self.kind(current),
+                tree.kind(current),
                 Some(NodeKind::Element { name, .. })
                     if name.ns == html_namespace()
                         && matches!(name.local.as_ref(), "embed" | "form" | "img" | "object")
             );
             if exposes_name
-                && let Some(name) = self.no_namespace_attribute(current, "name")
+                && let Some(name) = tree.no_namespace_attribute(current, "name")
                 && !name.is_empty()
             {
-                self.named.names.insert(name);
+                self.names.insert(name.to_owned());
             }
-            if let Some(children) = self.children(current) {
+            if let Some(children) = tree.children(current) {
                 stack.extend(children);
             }
         }
