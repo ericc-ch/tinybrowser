@@ -147,6 +147,24 @@ impl Dom {
         None
     }
 
+    /// The single-select rule for an option joining a list of options: when an
+    /// option whose selectedness is true is added, every other option's
+    /// selectedness becomes false
+    /// (<https://html.spec.whatwg.org/multipage/form-elements.html#the-select-element>).
+    pub(crate) fn option_added_to_select(&mut self, option: NodeId) {
+        let Some(select) = self.option_select_owner(option) else {
+            return;
+        };
+        if self.attribute(select, "multiple").is_some() || !self.option_selected(option) {
+            return;
+        }
+        for other in self.select_options(select) {
+            if other != option {
+                self.option_selectedness.insert(other, false);
+            }
+        }
+    }
+
     /// Sets an option's selectedness; selecting an option in a single-select
     /// clears the others.
     pub fn set_option_selected_in_select(&mut self, option: NodeId, selected: bool) {

@@ -2219,7 +2219,12 @@ impl Dom {
         if radio_owner_before != self.checked_radio_form_owner(node) {
             self.refresh_radio_group(node);
         }
-        // An option joining a select may become the default selection.
+        // An option joining a select follows the option insertion steps: a
+        // selected option clears the others, then the selectedness setting
+        // algorithm supplies the default when nothing is selected.
+        if self.html_local_is(node, "option") {
+            self.option_added_to_select(node);
+        }
         if (self.html_local_is(node, "option") || self.html_local_is(node, "optgroup"))
             && let Some(select) = self.nearest_select_ancestor(node)
         {
@@ -2326,11 +2331,15 @@ impl Dom {
             if self.checked_radio_form_owner(id).is_some() {
                 self.refresh_radio_group(id);
             }
-            if !blank_options
-                && (self.html_local_is(id, "option") || self.html_local_is(id, "optgroup"))
-                && let Some(select) = self.nearest_select_ancestor(id)
-            {
-                self.apply_default_selectedness(select);
+            if !blank_options {
+                if self.html_local_is(id, "option") {
+                    self.option_added_to_select(id);
+                }
+                if (self.html_local_is(id, "option") || self.html_local_is(id, "optgroup"))
+                    && let Some(select) = self.nearest_select_ancestor(id)
+                {
+                    self.apply_default_selectedness(select);
+                }
             }
         }
         if blank_options {

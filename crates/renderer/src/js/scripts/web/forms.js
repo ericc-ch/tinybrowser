@@ -1109,21 +1109,15 @@
       set: function(value) { this.options.length = value; },
       enumerable: true, configurable: true,
     },
+    // Both delegate to the options collection
+    // (<https://html.spec.whatwg.org/multipage/form-elements.html#dom-select-item>,
+    // <https://html.spec.whatwg.org/multipage/form-elements.html#dom-select-nameditem>).
     item: {
-      value: function(index) {
-        const option = this.options[index];
-        return option === undefined ? null : option;
-      },
+      value: function(index) { return this.options.item(index); },
       writable: true, enumerable: true, configurable: true,
     },
     namedItem: {
-      value: function(name) {
-        const key = String(name);
-        for (const option of this.options) {
-          if (option.id === key || option.getAttribute('name') === key) return option;
-        }
-        return null;
-      },
+      value: function(name) { return this.options.namedItem(name); },
       writable: true, enumerable: true, configurable: true,
     },
     // <https://html.spec.whatwg.org/multipage/form-elements.html#dom-select-add>
