@@ -16,7 +16,7 @@
 use std::collections::HashSet;
 
 use crate::arena::Tree;
-use crate::{Document, NodeId, NodeKind, html_namespace};
+use crate::{Document, NodeId, NodeKind, html_namespace, lifecycle};
 
 /// Extra names tolerated beyond twice the live count before a rebuild.
 const REBUILD_SLACK: usize = 1024;
@@ -36,7 +36,7 @@ pub fn exists(document: &mut Document, name: &str) -> bool {
 
 /// Include names in an inserted, connected subtree.
 pub(crate) fn inserted(document: &mut Document, node: NodeId) {
-    if document.named.seeded && document.is_connected(node) {
+    if document.named.seeded && lifecycle::is_connected(document, node) {
         document.named.inserted(&document.tree, node);
     }
 }
@@ -45,7 +45,7 @@ pub(crate) fn inserted(document: &mut Document, node: NodeId) {
 pub(crate) fn attribute_changed(document: &mut Document, node: NodeId, name: &str) {
     if document.named.seeded
         && (name.eq_ignore_ascii_case("id") || name.eq_ignore_ascii_case("name"))
-        && document.is_connected(node)
+        && lifecycle::is_connected(document, node)
     {
         document.named.inserted(&document.tree, node);
     }

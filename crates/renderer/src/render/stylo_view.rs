@@ -286,7 +286,7 @@ impl<'a> TNode for &'a StyloNode<'a> {
     }
 
     fn is_in_document(&self) -> bool {
-        self.document.is_connected(self.id)
+        dom::lifecycle::is_connected(self.document, self.id)
     }
 
     fn opaque(&self) -> OpaqueNode {

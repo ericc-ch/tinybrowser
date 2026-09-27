@@ -20,6 +20,7 @@
 mod arena;
 mod form;
 mod id;
+pub mod lifecycle;
 pub mod named;
 mod node;
 pub mod selector;
@@ -32,8 +33,9 @@ pub use state::{
     is_required, lang_matches, local_is,
 };
 
-pub use arena::{Children, Document, DomError, Lifecycle, Mutation, QuirksMode, Tree};
+pub use arena::{Children, Document, DomError, Mutation, QuirksMode, Tree};
 pub use id::NodeId;
+pub use lifecycle::Lifecycle;
 pub use node::{
     Attribute, LocalName, Namespace, NodeKind, Prefix, QualName, html_namespace,
     html_qualified_name_eq, qualified_name_eq, svg_namespace, xlink_namespace, xml_namespace,

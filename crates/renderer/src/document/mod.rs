@@ -407,7 +407,9 @@ impl Document {
         self.world
             .borrow()
             .main_document_mut()
-            .map_or_else(Vec::new, |mut parsed| parsed.document.take_lifecycle())
+            .map_or_else(Vec::new, |mut parsed| {
+                dom::lifecycle::take(&mut parsed.document)
+            })
     }
 
     pub(crate) fn take_frame_navigations(&mut self) -> Vec<FrameNavigation> {
@@ -429,7 +431,7 @@ impl Document {
         self.world
             .borrow()
             .document(id)
-            .is_some_and(|parsed| parsed.document.is_iframe_element(id))
+            .is_some_and(|parsed| dom::lifecycle::is_iframe_element(&parsed.document, id))
     }
 
     /// Queues the image fetch for a newly connected `<img>`, if it still needs one
@@ -1504,9 +1506,7 @@ impl Document {
         let generation = self.bump_image_generation(element);
         self.in_flight_images.insert(element);
         let src = self.world.borrow().document(element).and_then(|parsed| {
-            parsed
-                .document
-                .is_img_element(element)
+            dom::lifecycle::is_img_element(&parsed.document, element)
                 .then(|| parsed.document.attribute(element, "src"))
                 .flatten()
         });

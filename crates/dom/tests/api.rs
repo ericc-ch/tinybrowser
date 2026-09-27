@@ -1,4 +1,6 @@
-use dom::{Attribute, Document, DomError, Lifecycle, LocalName, Namespace, NodeId, NodeKind, QualName};
+use dom::{
+    Attribute, Document, DomError, Lifecycle, LocalName, Namespace, NodeId, NodeKind, QualName,
+};
 
 const HTML_NS: &str = "http://www.w3.org/1999/xhtml";
 
@@ -322,28 +324,37 @@ fn connection_transitions_record_lifecycle_events() {
     dom.append(root, html).expect("html");
     dom.append(html, body).expect("body");
     // Only iframe transitions are tracked; ordinary elements are not.
-    assert!(dom.take_lifecycle().is_empty());
+    assert!(dom::lifecycle::take(&mut dom).is_empty());
 
     dom.append(body, iframe).expect("iframe");
-    assert_eq!(dom.take_lifecycle(), vec![Lifecycle::Inserted(iframe)]);
+    assert_eq!(
+        dom::lifecycle::take(&mut dom),
+        vec![Lifecycle::Inserted(iframe)]
+    );
 
     // A detached subtree records nothing until it is connected...
     let detached = dom.create_element(qn("div"), Vec::new());
     let nested = dom.create_element(qn("iframe"), Vec::new());
     dom.append(detached, nested).expect("detached iframe");
-    assert!(dom.take_lifecycle().is_empty());
+    assert!(dom::lifecycle::take(&mut dom).is_empty());
 
     // ...then every iframe in the inserted subtree is reported.
     dom.append(body, detached).expect("connect subtree");
-    assert_eq!(dom.take_lifecycle(), vec![Lifecycle::Inserted(nested)]);
+    assert_eq!(
+        dom::lifecycle::take(&mut dom),
+        vec![Lifecycle::Inserted(nested)]
+    );
 
     // Moving a connected element is not a removal plus insertion.
     dom.append(body, nested).expect("move nested");
-    assert!(dom.take_lifecycle().is_empty());
+    assert!(dom::lifecycle::take(&mut dom).is_empty());
 
     // Detaching reports the removed iframe.
     dom.detach(nested).expect("detach");
-    assert_eq!(dom.take_lifecycle(), vec![Lifecycle::Removed(nested)]);
+    assert_eq!(
+        dom::lifecycle::take(&mut dom),
+        vec![Lifecycle::Removed(nested)]
+    );
 }
 
 #[test]
@@ -356,13 +367,19 @@ fn img_connection_transitions_record_lifecycle_events() {
 
     dom.append(root, html).expect("html");
     dom.append(html, body).expect("body");
-    assert!(dom.take_lifecycle().is_empty());
+    assert!(dom::lifecycle::take(&mut dom).is_empty());
 
     dom.append(body, img).expect("img");
-    assert_eq!(dom.take_lifecycle(), vec![Lifecycle::Inserted(img)]);
+    assert_eq!(
+        dom::lifecycle::take(&mut dom),
+        vec![Lifecycle::Inserted(img)]
+    );
 
     dom.detach(img).expect("detach");
-    assert_eq!(dom.take_lifecycle(), vec![Lifecycle::Removed(img)]);
+    assert_eq!(
+        dom::lifecycle::take(&mut dom),
+        vec![Lifecycle::Removed(img)]
+    );
 }
 
 #[test]
@@ -375,14 +392,14 @@ fn connected_iframes_survive_replace_and_report_destroy() {
     dom.append(document, root).expect("root");
     dom.append(root, holder).expect("holder");
     dom.append(holder, iframe).expect("iframe");
-    assert_eq!(dom.connected_iframe_count(), 1);
-    let _ = dom.take_lifecycle();
+    assert_eq!(dom::lifecycle::connected_iframe_count(&dom), 1);
+    let _ = dom::lifecycle::take(&mut dom);
 
     // `replaceChildren(holder.firstChild)`: the iframe stays connected across
     // the replace, so it must neither churn an event nor double the count.
     dom.replace_all(holder, iframe).expect("replace_all");
-    assert_eq!(dom.connected_iframe_count(), 1);
-    assert!(dom.take_lifecycle().is_empty());
+    assert_eq!(dom::lifecycle::connected_iframe_count(&dom), 1);
+    assert!(dom::lifecycle::take(&mut dom).is_empty());
 
     // `replaceChild` where the replacement sits inside the replaced node: the
     // transient detach must not read as removed-then-reinserted either.
@@ -390,17 +407,20 @@ fn connected_iframes_survive_replace_and_report_destroy() {
     dom.replace_all(holder, wrapper).expect("wrap");
     let nested = dom.create_element(qn("iframe"), Vec::new());
     dom.append(wrapper, nested).expect("nested iframe");
-    assert_eq!(dom.connected_iframe_count(), 1);
-    let _ = dom.take_lifecycle();
+    assert_eq!(dom::lifecycle::connected_iframe_count(&dom), 1);
+    let _ = dom::lifecycle::take(&mut dom);
     dom.replace_child(holder, nested, wrapper)
         .expect("replace_child");
-    assert_eq!(dom.connected_iframe_count(), 1);
-    assert!(dom.take_lifecycle().is_empty());
+    assert_eq!(dom::lifecycle::connected_iframe_count(&dom), 1);
+    assert!(dom::lifecycle::take(&mut dom).is_empty());
 
     // Destroying a connected iframe reports the removal and drops the count.
     dom.destroy(nested).expect("destroy");
-    assert_eq!(dom.connected_iframe_count(), 0);
-    assert_eq!(dom.take_lifecycle(), vec![Lifecycle::Removed(nested)]);
+    assert_eq!(dom::lifecycle::connected_iframe_count(&dom), 0);
+    assert_eq!(
+        dom::lifecycle::take(&mut dom),
+        vec![Lifecycle::Removed(nested)]
+    );
 }
 
 #[test]
@@ -411,25 +431,25 @@ fn replacement_reports_removal_before_insertion() {
     dom.append(document, root).expect("root");
     let old = dom.create_element(qn("iframe"), Vec::new());
     dom.append(root, old).expect("old iframe");
-    let _ = dom.take_lifecycle();
+    let _ = dom::lifecycle::take(&mut dom);
 
     let fresh = dom.create_element(qn("iframe"), Vec::new());
     dom.replace_child(root, fresh, old).expect("replace_child");
     assert_eq!(
-        dom.take_lifecycle(),
+        dom::lifecycle::take(&mut dom),
         vec![Lifecycle::Removed(old), Lifecycle::Inserted(fresh)],
         "a replacement must release the old frame before framing the new one"
     );
-    assert_eq!(dom.connected_iframe_count(), 1);
+    assert_eq!(dom::lifecycle::connected_iframe_count(&dom), 1);
 
     let swap = dom.create_element(qn("iframe"), Vec::new());
     dom.replace_all(root, swap).expect("replace_all");
     assert_eq!(
-        dom.take_lifecycle(),
+        dom::lifecycle::take(&mut dom),
         vec![Lifecycle::Removed(fresh), Lifecycle::Inserted(swap)],
         "replace_all must release before inserting too"
     );
-    assert_eq!(dom.connected_iframe_count(), 1);
+    assert_eq!(dom::lifecycle::connected_iframe_count(&dom), 1);
 }
 
 /// Asserts the intrusive links of `parent` match `expected` exactly: the

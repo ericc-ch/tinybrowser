@@ -975,7 +975,7 @@ pub(crate) fn after_attribute_change(ctx: &Ctx<'_>, element: NodeId, local: &str
     let connected = world
         .borrow()
         .document(element)
-        .is_some_and(|parsed| parsed.document.is_connected(element));
+        .is_some_and(|parsed| dom::lifecycle::is_connected(&parsed.document, element));
     if !connected {
         return Ok(());
     }

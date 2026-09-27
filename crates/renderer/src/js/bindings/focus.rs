@@ -50,7 +50,9 @@ pub(crate) fn is_focusable(ctx: &Ctx<'_>, node: NodeId) -> Result<bool> {
     let NodeKind::Element { name, .. } = kind else {
         return Ok(false);
     };
-    if !parsed.document.is_connected(node) || is_actually_disabled(&parsed.document, node) {
+    if !dom::lifecycle::is_connected(&parsed.document, node)
+        || is_actually_disabled(&parsed.document, node)
+    {
         return Ok(false);
     }
     // `tabindex` and `contenteditable` apply to SVG elements too.

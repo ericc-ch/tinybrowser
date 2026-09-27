@@ -1,7 +1,6 @@
 //! The arena: flat slot array, generational handles, tree mutations.
 
 mod journal;
-mod lifecycle;
 mod metadata;
 mod shadow;
 mod tree;
@@ -19,12 +18,12 @@ use crate::node::{
 };
 
 use self::journal::MutationJournal;
-use self::lifecycle::ConnectionState;
 use self::metadata::Metadata;
 use self::shadow::ShadowState;
 pub use self::tree::Children;
 use self::tree::Slot;
 pub use self::tree::Tree;
+use crate::lifecycle::{self, ConnectionState};
 
 /// The document-compatibility mode a query runs under: what html5ever's
 /// tree builder reports and parsed pages carry.
@@ -63,20 +62,6 @@ pub enum Mutation {
     },
     /// Character data replaced on `target`.
     CharacterData { target: NodeId, old_value: String },
-}
-
-/// A connection transition of one element, for HTML lifecycle steps.
-///
-/// [HTML's post-connection and removing steps](https://html.spec.whatwg.org/multipage/iframe-embed-object.html#the-iframe-element)
-/// hang off exactly these transitions: an iframe creates its content
-/// navigable when it becomes connected and destroys it when disconnected.
-/// Recorded always, independent of `MutationObserver` recording.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Lifecycle {
-    /// An element became connected to a document.
-    Inserted(NodeId),
-    /// An element became disconnected from a document.
-    Removed(NodeId),
 }
 
 /// Why a mutation was refused.
@@ -145,7 +130,7 @@ pub struct Document {
     shadow: ShadowState,
     pub(crate) form: FormState,
     journal: MutationJournal,
-    connections: ConnectionState,
+    pub(crate) connections: ConnectionState,
     pub(crate) named: NamedIndex,
     /// `Cell<()>` is `Send` + `!Sync`; `PhantomData` makes `Document` inherit
     /// exactly that split. Deleting this field would silently re-derive
@@ -522,13 +507,13 @@ impl Document {
             return Err(DomError::HierarchyRequest);
         }
         self.ensure_pre_insert_validity(parent, child, None)?;
-        let tracked = self.connection_snapshot(child);
+        let tracked = lifecycle::snapshot(self, child);
         if self.is_fragment(child) {
             self.splice_fragment(parent, child, None);
         } else {
             self.place_node(parent, child, None);
         }
-        self.record_snapshot(tracked);
+        lifecycle::record_snapshot(self, tracked);
         Ok(())
     }
 
@@ -567,13 +552,13 @@ impl Document {
             return Ok(());
         }
         self.ensure_pre_insert_validity(parent, node, Some(sibling))?;
-        let tracked = self.connection_snapshot(node);
+        let tracked = lifecycle::snapshot(self, node);
         if self.is_fragment(node) {
             self.splice_fragment(parent, node, Some(sibling));
         } else {
             self.place_node(parent, node, Some(sibling));
         }
-        self.record_snapshot(tracked);
+        lifecycle::record_snapshot(self, tracked);
         Ok(())
     }
 
@@ -652,9 +637,9 @@ impl Document {
         // disconnected-then-reinserted iframe reports no transition at all,
         // and the removal is recorded before the insertion so a replacement
         // frees its frame slot before the new frame is capped.
-        let node_tracked = self.connection_snapshot(node);
+        let node_tracked = lifecycle::snapshot(self, node);
         let child_tracked = (child != node && self.parent(child) == Some(parent))
-            .then(|| self.connection_snapshot(child));
+            .then(|| lifecycle::snapshot(self, child));
         let mut removed = Vec::new();
         self.journal.suppress(true);
         if child != node && self.parent(child) == Some(parent) {
@@ -668,9 +653,9 @@ impl Document {
         }
         self.journal.suppress(false);
         if let Some(child_tracked) = child_tracked {
-            self.record_snapshot(child_tracked);
+            lifecycle::record_snapshot(self, child_tracked);
         }
-        self.record_snapshot(node_tracked);
+        lifecycle::record_snapshot(self, node_tracked);
         self.record(Mutation::ChildList {
             target: parent,
             added,
@@ -753,13 +738,13 @@ impl Document {
         } else {
             reference
         };
-        let tracked = self.connection_snapshot(node);
+        let tracked = lifecycle::snapshot(self, node);
         if self.is_fragment(node) {
             self.splice_fragment(parent, node, reference);
         } else {
             self.place_node(parent, node, reference);
         }
-        self.record_snapshot(tracked);
+        lifecycle::record_snapshot(self, tracked);
         Ok(())
     }
 
@@ -851,9 +836,9 @@ impl Document {
         if id == self.tree.document() {
             return Err(DomError::HierarchyRequest);
         }
-        let tracked = self.connection_snapshot(id);
+        let tracked = lifecycle::snapshot(self, id);
         self.unlink_from_current_parent(id);
-        self.record_snapshot(tracked);
+        lifecycle::record_snapshot(self, tracked);
         Ok(())
     }
 
@@ -927,14 +912,14 @@ impl Document {
         // Defect guards, not input errors: both handles were verified live
         // above, so a miss here means the parent-pointer/sibling-link duality
         // is broken. Panicking beats reporting a lying "stale node".
-        let from_connected = self.is_connected(from);
-        let to_connected = self.is_connected(to);
+        let from_connected = lifecycle::is_connected(self, from);
+        let to_connected = lifecycle::is_connected(self, to);
         let tracked: Vec<(NodeId, bool, bool)> = if from_connected == to_connected {
             Vec::new()
         } else {
             moved
                 .iter()
-                .flat_map(|&id| self.connection_snapshot(id))
+                .flat_map(|&id| lifecycle::snapshot(self, id))
                 .collect()
         };
         // Move the run one node at a time through the single-node primitives:
@@ -949,7 +934,7 @@ impl Document {
                 named::inserted(self, id);
             }
         }
-        self.record_snapshot(tracked);
+        lifecycle::record_snapshot(self, tracked);
         Ok(())
     }
 
@@ -1205,7 +1190,7 @@ impl Document {
         } else if !self.is_fragment(node) && self.is_doctype(node) {
             return Err(DomError::HierarchyRequest);
         }
-        let parent_connected = self.is_connected(parent);
+        let parent_connected = lifecycle::is_connected(self, parent);
         let removed: Vec<NodeId> = self
             .children(parent)
             .map(Iterator::collect)
@@ -1213,7 +1198,7 @@ impl Document {
         let removed_snapshot: Vec<(NodeId, bool, bool)> = if parent_connected {
             removed
                 .iter()
-                .flat_map(|&id| self.connection_snapshot(id))
+                .flat_map(|&id| lifecycle::snapshot(self, id))
                 .collect()
         } else {
             Vec::new()
@@ -1222,7 +1207,7 @@ impl Document {
         // `node` can be one of the removed children (JS `replaceChildren(
         // firstChild)`), so its starting connectivity must be read before the
         // detach loop below.
-        let node_tracked = self.connection_snapshot(node);
+        let node_tracked = lifecycle::snapshot(self, node);
         self.journal.suppress(true);
         // Detach the standing children through the single-node primitive; its
         // O(1) steps make the loop O(k), and it keeps `unlink` the only
@@ -1239,8 +1224,8 @@ impl Document {
         self.journal.suppress(false);
         // Removal before insertion: a replacement frees its frame slot before
         // the new frame is checked against the frame cap.
-        self.record_snapshot(removed_snapshot);
-        self.record_snapshot(node_tracked);
+        lifecycle::record_snapshot(self, removed_snapshot);
+        lifecycle::record_snapshot(self, node_tracked);
         // "If either addedNodes or removedNodes is not empty, then queue a
         // tree mutation record" (<https://dom.spec.whatwg.org/#concept-node-replace-all>):
         // e.g. `textContent = ""` on an already-empty element changes nothing
@@ -1485,7 +1470,7 @@ impl Document {
         }
         // Read connectivity before unlinking; the snapshot carries the
         // iframe-ness so the count still moves once the slots are freed.
-        let tracked = self.connection_snapshot(id);
+        let tracked = lifecycle::snapshot(self, id);
         self.unlink_from_current_parent(id);
 
         let mut pending = vec![id];
@@ -1495,7 +1480,7 @@ impl Document {
             self.shadow.forget(current, &mut pending);
             self.tree.retire(current, &mut pending);
         }
-        self.record_snapshot(tracked);
+        lifecycle::record_snapshot(self, tracked);
         Ok(())
     }
 

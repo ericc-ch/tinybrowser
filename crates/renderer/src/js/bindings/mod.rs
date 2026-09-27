@@ -562,7 +562,7 @@ pub(super) fn webdriver_element(ctx: Ctx<'_>, remote_id: f64) -> Result<Value<'_
     };
     // Only a live, connected element is a valid element reference.
     let valid = world.borrow().document(node).is_some_and(|parsed| {
-        parsed.document.is_connected(node)
+        dom::lifecycle::is_connected(&parsed.document, node)
             && matches!(parsed.document.kind(node), Some(NodeKind::Element { .. }))
     });
     if !valid {

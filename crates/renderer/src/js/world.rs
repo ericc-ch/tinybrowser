@@ -762,7 +762,7 @@ impl World {
             owner
                 .borrow()
                 .main_document()
-                .is_some_and(|parsed| parsed.document.is_connected(container))
+                .is_some_and(|parsed| dom::lifecycle::is_connected(&parsed.document, container))
         })
     }
 
@@ -787,7 +787,9 @@ impl World {
     pub(crate) fn register_pending_frames(&mut self) -> Vec<NodeId> {
         let mut created = Vec::new();
         let has_iframes = self
-            .with_main_document(|parsed| parsed.document.connected_iframe_count() > 0)
+            .with_main_document(|parsed| {
+                dom::lifecycle::connected_iframe_count(&parsed.document) > 0
+            })
             .unwrap_or(false);
         if !has_iframes {
             return created;
@@ -855,7 +857,9 @@ impl World {
             let mut containers = Vec::new();
             let mut stack = vec![parsed.document.document()];
             while let Some(id) = stack.pop() {
-                if parsed.document.is_iframe_element(id) && parsed.document.is_connected(id) {
+                if dom::lifecycle::is_iframe_element(&parsed.document, id)
+                    && dom::lifecycle::is_connected(&parsed.document, id)
+                {
                     containers.push(id);
                 }
                 let mut children: Vec<NodeId> = parsed

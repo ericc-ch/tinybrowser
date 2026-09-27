@@ -430,7 +430,7 @@ impl JsNode {
             && world
                 .borrow()
                 .document(node)
-                .is_some_and(|parsed| parsed.document.is_connected(node))
+                .is_some_and(|parsed| dom::lifecycle::is_connected(&parsed.document, node))
         {
             return wrap_node(&ctx, node);
         }
@@ -3476,7 +3476,10 @@ impl JsNode {
         let Some(parsed) = parsed.document(self.handle.0) else {
             return Ok(false);
         };
-        Ok(parsed.document.is_connected(self.handle.0))
+        Ok(dom::lifecycle::is_connected(
+            &parsed.document,
+            self.handle.0,
+        ))
     }
 
     // https://dom.spec.whatwg.org/#dom-node-clonenode
