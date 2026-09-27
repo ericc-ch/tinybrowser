@@ -282,8 +282,8 @@ impl Sink {
         }
         let fresh = dom.create_text(text);
         let placed = match before {
-            None => dom.append(parent, fresh),
-            Some(sibling) => dom.insert_before(sibling, fresh),
+            None => dom::mutation::append(&mut dom, parent, fresh),
+            Some(sibling) => dom::mutation::insert_before(&mut dom, sibling, fresh),
         };
         // A parser-blocking script may have moved or removed the insertion
         // point since html5ever last yielded. The HTML tree builder ignores
@@ -399,7 +399,7 @@ impl TreeSink for Sink {
     fn append(&self, parent: &Self::Handle, child: NodeOrText<Self::Handle>) {
         match child {
             NodeOrText::AppendNode(node) => {
-                let _ = self.document.borrow_mut().append(*parent, node);
+                let _ = dom::mutation::append(&mut self.document.borrow_mut(), *parent, node);
             }
             NodeOrText::AppendText(ref text) => self.insert_text(*parent, None, text),
         }
@@ -429,7 +429,7 @@ impl TreeSink for Sink {
             .document
             .borrow_mut()
             .create_doctype(name, public_id, system_id);
-        let _ = self.document.borrow_mut().append(doc, doctype);
+        let _ = dom::mutation::append(&mut self.document.borrow_mut(), doc, doctype);
     }
 
     fn get_template_contents(&self, target: &Self::Handle) -> Self::Handle {
@@ -465,7 +465,11 @@ impl TreeSink for Sink {
     fn append_before_sibling(&self, sibling: &Self::Handle, new_node: NodeOrText<Self::Handle>) {
         match new_node {
             NodeOrText::AppendNode(node) => {
-                let _ = self.document.borrow_mut().insert_before(*sibling, node);
+                let _ = dom::mutation::insert_before(
+                    &mut self.document.borrow_mut(),
+                    *sibling,
+                    node,
+                );
             }
             NodeOrText::AppendText(ref text) => {
                 // Merge into the previous sibling when that is text; the
@@ -490,7 +494,11 @@ impl TreeSink for Sink {
     }
 
     fn reparent_children(&self, node: &Self::Handle, new_parent: &Self::Handle) {
-        let _ = self.document.borrow_mut().reparent_children(*node, *new_parent);
+        let _ = dom::mutation::reparent_children(
+            &mut self.document.borrow_mut(),
+            *node,
+            *new_parent,
+        );
     }
 
     /// [Maybe clone an option into selectedcontent](https://html.spec.whatwg.org/multipage/form-elements.html#maybe-clone-an-option-into-selectedcontent).
@@ -658,7 +666,7 @@ fn clone_option_into_selectedcontent(dom: &mut dom::Document, option: Handle, se
         let cloned = dom
             .clone_node(kid, true)
             .expect("option children clone into new nodes");
-        dom.append(selectedcontent, cloned)
+        dom::mutation::append(dom, selectedcontent, cloned)
             .expect("selectedcontent accepts cloned option children");
     }
 }

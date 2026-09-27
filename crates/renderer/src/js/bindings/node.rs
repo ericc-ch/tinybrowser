@@ -338,9 +338,7 @@ impl JsNode {
             let Some(parsed) = parsed.document(self.handle.0) else {
                 return Err(Exception::throw_type(&ctx, "no document"));
             };
-            parsed
-                .document
-                .validate_pre_insert(self.handle.0, kid, None)
+            dom::mutation::validate_pre_insert(&parsed.document, self.handle.0, kid, None)
                 .map_err(|err| throw_dom_error(&ctx, err))?;
         }
         let kid = adopt_across_documents(&ctx, self.handle.0, kid)?;
@@ -350,9 +348,7 @@ impl JsNode {
         let Some(mut parsed) = world.document_mut(self.handle.0) else {
             return Err(Exception::throw_type(&ctx, "no document"));
         };
-        parsed
-            .document
-            .pre_insert(parent, kid, None)
+        dom::mutation::pre_insert(&mut parsed.document, parent, kid, None)
             .map_err(|err| throw_dom_error(&ctx, err))?;
         drop(parsed);
         drop(world);
@@ -1649,9 +1645,7 @@ impl JsNode {
         let replacement = parsed.document.create_fragment();
         if !value.0.is_empty() {
             let text = parsed.document.create_text(value.0);
-            parsed
-                .document
-                .append(replacement, text)
+            dom::mutation::append(&mut parsed.document, replacement, text)
                 .map_err(|err| throw_dom_error(&ctx, err))?;
         }
         parsed
@@ -2161,23 +2155,23 @@ impl JsNode {
         let fragment = materialize_children(&mut parsed.document, &snapshots)
             .map_err(|err| throw_dom_error(&ctx, err))?;
         let result = if position == "beforebegin" {
-            parsed.document.insert_before(self.handle.0, fragment)
+            dom::mutation::insert_before(&mut parsed.document, self.handle.0, fragment)
         } else if position == "afterbegin" {
             match parsed.document.first_child(self.handle.0) {
-                Some(first) => parsed.document.insert_before(first, fragment),
-                None => parsed.document.append(self.handle.0, fragment),
+                Some(first) => dom::mutation::insert_before(&mut parsed.document, first, fragment),
+                None => dom::mutation::append(&mut parsed.document, self.handle.0, fragment),
             }
         } else if position == "afterend" {
             if let Some(next) = parsed.document.next_sibling(self.handle.0) {
-                parsed.document.insert_before(next, fragment)
+                dom::mutation::insert_before(&mut parsed.document, next, fragment)
             } else {
                 let Some(parent) = parsed.document.parent(self.handle.0) else {
                     return Ok(());
                 };
-                parsed.document.append(parent, fragment)
+                dom::mutation::append(&mut parsed.document, parent, fragment)
             }
         } else {
-            parsed.document.append(self.handle.0, fragment)
+            dom::mutation::append(&mut parsed.document, self.handle.0, fragment)
         };
         result.map_err(|err| throw_dom_error(&ctx, err))?;
         drop(parsed);
@@ -2224,9 +2218,7 @@ impl JsNode {
         };
         let replacement = materialize_children(&mut parsed.document, &snapshots)
             .map_err(|err| throw_dom_error(&ctx, err))?;
-        parsed
-            .document
-            .replace_child(parent, replacement, self.handle.0)
+        dom::mutation::replace_child(&mut parsed.document, parent, replacement, self.handle.0)
             .map_err(|err| throw_dom_error(&ctx, err))?;
         drop(parsed);
         drop(world);
@@ -2437,7 +2429,7 @@ impl JsNode {
         let replacement = dom.create_fragment();
         if !text.is_empty() {
             let text_id = dom.create_text(text);
-            dom.append(replacement, text_id)
+            dom::mutation::append(dom, replacement, text_id)
                 .map_err(|err| throw_dom_error(&ctx, err))?;
         }
         dom.replace_all(self.handle.0, replacement)
@@ -2516,9 +2508,7 @@ impl JsNode {
         let Some(mut parsed) = world.document_mut(self.handle.0) else {
             return Err(Exception::throw_type(&ctx, "no document"));
         };
-        parsed
-            .document
-            .pre_insert(self.handle.0, node, None)
+        dom::mutation::pre_insert(&mut parsed.document, self.handle.0, node, None)
             .map_err(|err| throw_dom_error(&ctx, err))?;
         drop(parsed);
         drop(world);
@@ -2538,9 +2528,7 @@ impl JsNode {
             .document
             .children(self.handle.0)
             .and_then(|mut kids| kids.next());
-        parsed
-            .document
-            .pre_insert(self.handle.0, node, reference)
+        dom::mutation::pre_insert(&mut parsed.document, self.handle.0, node, reference)
             .map_err(|err| throw_dom_error(&ctx, err))?;
         drop(parsed);
         drop(world);
@@ -2695,7 +2683,7 @@ impl JsNode {
                             .flatten()
                     });
                 if let Some(target) = target {
-                    let _ = dom.append(target, title);
+                    let _ = dom::mutation::append(dom, target, title);
                 }
                 title
             });
@@ -2708,7 +2696,7 @@ impl JsNode {
         }
         if !value.0.is_empty() {
             let text = dom.create_text(value.0);
-            dom.append(title, text)
+            dom::mutation::append(dom, title, text)
                 .map_err(|err| throw_dom_error(&ctx, err))?;
         }
         drop(parsed);
@@ -2769,9 +2757,7 @@ impl JsNode {
             Some(previous) => parsed.document.sibling(previous, true),
             None => parsed.document.children(parent).and_then(|mut kids| kids.next()),
         };
-        parsed
-            .document
-            .pre_insert(parent, node, reference)
+        dom::mutation::pre_insert(&mut parsed.document, parent, node, reference)
             .map_err(|err| throw_dom_error(&ctx, err))?;
         drop(parsed);
         drop(world);
@@ -2791,9 +2777,7 @@ impl JsNode {
             return Ok(());
         };
         let reference = parsed.document.sibling(self.handle.0, true);
-        parsed
-            .document
-            .pre_insert(parent, node, reference)
+        dom::mutation::pre_insert(&mut parsed.document, parent, node, reference)
             .map_err(|err| throw_dom_error(&ctx, err))?;
         drop(parsed);
         drop(world);
@@ -2812,9 +2796,7 @@ impl JsNode {
         let Some(parent) = parsed.document.parent(self.handle.0) else {
             return Ok(());
         };
-        parsed
-            .document
-            .replace_child(parent, node, self.handle.0)
+        dom::mutation::replace_child(&mut parsed.document, parent, node, self.handle.0)
             .map_err(|err| throw_dom_error(&ctx, err))?;
         drop(parsed);
         drop(world);
@@ -3554,9 +3536,7 @@ impl JsNode {
             let Some(parsed) = parsed.document(self.handle.0) else {
                 return Err(Exception::throw_type(&ctx, "no document"));
             };
-            parsed
-                .document
-                .validate_pre_insert(self.handle.0, node, reference)
+            dom::mutation::validate_pre_insert(&parsed.document, self.handle.0, node, reference)
                 .map_err(|err| throw_dom_error(&ctx, err))?;
         }
         let node = adopt_across_documents(&ctx, self.handle.0, node)?;
@@ -3566,7 +3546,7 @@ impl JsNode {
             return Err(Exception::throw_type(&ctx, "no document"));
         };
         let dom = &mut parsed.document;
-        dom.pre_insert(self.handle.0, node, reference)
+        dom::mutation::pre_insert(dom, self.handle.0, node, reference)
             .map_err(|err| throw_dom_error(&ctx, err))?;
         drop(parsed);
         drop(world);
@@ -3615,9 +3595,7 @@ impl JsNode {
             let Some(parsed) = parsed.document(self.handle.0) else {
                 return Err(Exception::throw_type(&ctx, "no document"));
             };
-            parsed
-                .document
-                .validate_pre_insert(self.handle.0, node, Some(child))
+            dom::mutation::validate_pre_insert(&parsed.document, self.handle.0, node, Some(child))
                 .map_err(|err| throw_dom_error(&ctx, err))?;
         }
         let node = adopt_across_documents(&ctx, self.handle.0, node)?;
@@ -3626,9 +3604,7 @@ impl JsNode {
         let Some(mut parsed) = world.document_mut(self.handle.0) else {
             return Err(Exception::throw_type(&ctx, "no document"));
         };
-        parsed
-            .document
-            .replace_child(self.handle.0, node, child)
+        dom::mutation::replace_child(&mut parsed.document, self.handle.0, node, child)
             .map_err(|err| throw_dom_error(&ctx, err))?;
         drop(parsed);
         drop(world);

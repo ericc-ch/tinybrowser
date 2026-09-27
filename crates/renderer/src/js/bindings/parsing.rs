@@ -117,17 +117,13 @@ impl JsImplementation {
             if let Some(snapshot) = snapshot {
                 let node = materialize_import(&mut parsed.document, &snapshot)
                     .map_err(|err| throw_dom_error(&ctx, err))?;
-                parsed
-                    .document
-                    .append(document, node)
+                dom::mutation::append(&mut parsed.document, document, node)
                     .map_err(|err| throw_dom_error(&ctx, err))?;
             }
         }
         if let Some(name) = root {
             let element = parsed.document.create_element(name, Vec::new());
-            parsed
-                .document
-                .append(document, element)
+            dom::mutation::append(&mut parsed.document, document, element)
                 .map_err(|err| throw_dom_error(&ctx, err))?;
         }
         wrap_new_document(&ctx, parsed)
@@ -143,44 +139,32 @@ impl JsImplementation {
         let mut parsed = crate::Parsed::empty("text/html");
         let document = parsed.document.document();
         let doctype = parsed.document.create_doctype("html", "", "");
-        parsed
-            .document
-            .append(document, doctype)
+        dom::mutation::append(&mut parsed.document, document, doctype)
             .map_err(|err| throw_dom_error(&ctx, err))?;
         let html = parsed
             .document
             .create_element(html_element_name("html"), Vec::new());
-        parsed
-            .document
-            .append(document, html)
+        dom::mutation::append(&mut parsed.document, document, html)
             .map_err(|err| throw_dom_error(&ctx, err))?;
         let head = parsed
             .document
             .create_element(html_element_name("head"), Vec::new());
-        parsed
-            .document
-            .append(html, head)
+        dom::mutation::append(&mut parsed.document, html, head)
             .map_err(|err| throw_dom_error(&ctx, err))?;
         if let Some(title) = title.0.and_then(|title| title.0) {
             let title_element = parsed
                 .document
                 .create_element(html_element_name("title"), Vec::new());
-            parsed
-                .document
-                .append(head, title_element)
+            dom::mutation::append(&mut parsed.document, head, title_element)
                 .map_err(|err| throw_dom_error(&ctx, err))?;
             let text = parsed.document.create_text(title);
-            parsed
-                .document
-                .append(title_element, text)
+            dom::mutation::append(&mut parsed.document, title_element, text)
                 .map_err(|err| throw_dom_error(&ctx, err))?;
         }
         let body = parsed
             .document
             .create_element(html_element_name("body"), Vec::new());
-        parsed
-            .document
-            .append(html, body)
+        dom::mutation::append(&mut parsed.document, html, body)
             .map_err(|err| throw_dom_error(&ctx, err))?;
         wrap_new_document(&ctx, parsed)
     }

@@ -77,7 +77,7 @@ impl<'a> XmlParser<'a> {
             ),
             Vec::new(),
         );
-        let _ = self.document.append(self.root, error);
+        let _ = dom::mutation::append(&mut self.document, self.root, error);
     }
 
     fn rest(&self) -> &'a str {
@@ -138,7 +138,7 @@ impl<'a> XmlParser<'a> {
 
     fn append(&mut self, node: NodeId) -> Result<(), ()> {
         let parent = *self.stack.last().unwrap_or(&self.root);
-        self.document.append(parent, node).map_err(|_| ())
+        dom::mutation::append(&mut self.document, parent, node).map_err(|_| ())
     }
 
     fn run(&mut self) -> Result<(), ()> {

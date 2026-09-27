@@ -270,7 +270,7 @@ mod tests {
 
     fn append_html_element(dom: &mut Document, parent: dom::NodeId, local: &str) -> dom::NodeId {
         let element = dom.create_element(html_name(local), Vec::new());
-        dom.append(parent, element).expect("append");
+        dom::mutation::append(dom, parent, element).expect("append");
         element
     }
 

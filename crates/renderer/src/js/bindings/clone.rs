@@ -85,9 +85,7 @@ pub(crate) fn clone_document<'js>(ctx: &Ctx<'js>, id: NodeId, deep: bool) -> Res
     for child in children {
         let child =
             materialize_import(&mut parsed.document, &child).map_err(|err| throw_dom_error(ctx, err))?;
-        parsed
-            .document
-            .append(document, child)
+        dom::mutation::append(&mut parsed.document, document, child)
             .map_err(|err| throw_dom_error(ctx, err))?;
     }
     wrap_new_document(ctx, parsed)
@@ -183,7 +181,7 @@ pub(crate) fn materialize_import(
             let id = dom.create_element(name.clone(), attributes.clone());
             for child in children {
                 let child = materialize_import(dom, child)?;
-                dom.append(id, child)?;
+                dom::mutation::append(dom, id, child)?;
             }
             if let Some(contents) = template_contents {
                 let fragment = materialize_children(dom, contents)?;
@@ -214,7 +212,7 @@ pub(crate) fn materialize_children(
     let fragment = dom.create_fragment();
     for snapshot in snapshots {
         let child = materialize_import(dom, snapshot)?;
-        dom.append(fragment, child)?;
+        dom::mutation::append(dom, fragment, child)?;
     }
     Ok(fragment)
 }

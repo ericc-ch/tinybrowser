@@ -5,11 +5,19 @@
 //! parent and sibling links; operations here sequence the spec steps and queue
 //! the observer records.
 
+mod insert;
 mod journal;
 
 use crate::lifecycle;
 use crate::{Document, DomError, NodeId};
 
+pub use insert::{
+    append, insert_before, pre_insert, reparent_children, replace_child, validate_pre_insert,
+};
+pub(crate) use insert::{
+    append_fresh_children, ensure_document_content_model, place_node, splice_fragment,
+    unlink_from_current_parent,
+};
 pub(crate) use journal::MutationJournal;
 
 /// One recorded tree mutation, for `MutationObserver` delivery.
@@ -87,7 +95,7 @@ pub fn detach(document: &mut Document, id: NodeId) -> Result<(), DomError> {
         return Err(DomError::HierarchyRequest);
     }
     let tracked = lifecycle::snapshot(document, id);
-    document.unlink_from_current_parent(id);
+    insert::unlink_from_current_parent(document, id);
     lifecycle::record_snapshot(document, tracked);
     Ok(())
 }

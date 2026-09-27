@@ -167,7 +167,7 @@ fn mutations_match_an_independent_tree_model() {
     let mut dom = Document::new();
     let document = dom.document();
     let root = dom.create_element(qn("root"), Vec::new());
-    dom.append(document, root).expect("root");
+    dom::mutation::append(&mut dom, document, root).expect("root");
 
     let mut handles = vec![root];
     let mut model = Model::default();
@@ -177,10 +177,10 @@ fn mutations_match_an_independent_tree_model() {
         model.create();
     }
     for (child, _) in handles.iter().enumerate().skip(1).take(4) {
-        assert_eq!(dom.append(root, handles[child]), model.append(0, child));
+        assert_eq!(dom::mutation::append(&mut dom, root, handles[child]), model.append(0, child));
     }
-    assert_eq!(dom.append(handles[1], handles[5]), model.append(1, 5));
-    assert_eq!(dom.append(handles[5], handles[1]), model.append(5, 1));
+    assert_eq!(dom::mutation::append(&mut dom, handles[1], handles[5]), model.append(1, 5));
+    assert_eq!(dom::mutation::append(&mut dom, handles[5], handles[1]), model.append(5, 1));
 
     let mut state = 0x2545_F491_4F6C_DD1D_u64;
     let mut successes = 0_usize;
@@ -197,7 +197,7 @@ fn mutations_match_an_independent_tree_model() {
                 let parent = model.live(&mut state, true);
                 let child = model.live(&mut state, false);
                 let expected = model.append(parent, child);
-                let actual = dom.append(handles[parent], handles[child]);
+                let actual = dom::mutation::append(&mut dom, handles[parent], handles[child]);
                 assert_eq!(actual, expected);
                 if actual.is_ok() {
                     successes += 1;
@@ -209,7 +209,8 @@ fn mutations_match_an_independent_tree_model() {
                 let sibling = model.live(&mut state, false);
                 let node = model.live(&mut state, false);
                 let expected = model.insert_before(sibling, node);
-                let actual = dom.insert_before(handles[sibling], handles[node]);
+                let actual =
+                    dom::mutation::insert_before(&mut dom, handles[sibling], handles[node]);
                 assert_eq!(actual, expected);
                 if actual.is_ok() {
                     successes += 1;
@@ -246,16 +247,16 @@ fn document_fragments_templates_and_clones_keep_their_contracts() {
     let document = dom.document();
     let doctype = dom.create_doctype("html", "", "");
     let html = dom.create_element(qn("html"), Vec::new());
-    dom.append(document, doctype).expect("doctype");
-    dom.append(document, html).expect("document element");
+    dom::mutation::append(&mut dom, document, doctype).expect("doctype");
+    dom::mutation::append(&mut dom, document, html).expect("document element");
 
     let second_root = dom.create_element(qn("second"), Vec::new());
     assert_eq!(
-        dom.append(document, second_root),
+        dom::mutation::append(&mut dom, document, second_root),
         Err(DomError::HierarchyRequest)
     );
     let text = dom.create_text("outside");
-    assert_eq!(dom.append(document, text), Err(DomError::HierarchyRequest));
+    assert_eq!(dom::mutation::append(&mut dom, document, text), Err(DomError::HierarchyRequest));
 
     let fragment = dom.create_fragment();
     let first = dom.create_element(
@@ -266,9 +267,9 @@ fn document_fragments_templates_and_clones_keep_their_contracts() {
         }],
     );
     let second = dom.create_comment("second");
-    dom.append(fragment, first).expect("fragment child");
-    dom.append(fragment, second).expect("fragment child");
-    dom.append(html, fragment).expect("fragment splice");
+    dom::mutation::append(&mut dom, fragment, first).expect("fragment child");
+    dom::mutation::append(&mut dom, fragment, second).expect("fragment child");
+    dom::mutation::append(&mut dom, html, fragment).expect("fragment splice");
     assert_eq!(
         dom.children(html)
             .expect("html children")
@@ -282,8 +283,8 @@ fn document_fragments_templates_and_clones_keep_their_contracts() {
     dom.set_template_contents(template, contents)
         .expect("template contents");
     let inner = dom.create_text("inside");
-    dom.append(contents, inner).expect("template text");
-    dom.append(html, template).expect("template");
+    dom::mutation::append(&mut dom, contents, inner).expect("template text");
+    dom::mutation::append(&mut dom, html, template).expect("template");
     assert_eq!(
         dom.children(template).expect("template children").count(),
         0
@@ -310,7 +311,7 @@ fn document_fragments_templates_and_clones_keep_their_contracts() {
     ));
 
     let other = Document::new();
-    assert_eq!(dom.append(html, other.document()), Err(DomError::StaleNode));
+    assert_eq!(dom::mutation::append(&mut dom, html, other.document()), Err(DomError::StaleNode));
 }
 
 #[test]
@@ -321,12 +322,12 @@ fn connection_transitions_record_lifecycle_events() {
     let body = dom.create_element(qn("body"), Vec::new());
     let iframe = dom.create_element(qn("iframe"), Vec::new());
 
-    dom.append(root, html).expect("html");
-    dom.append(html, body).expect("body");
+    dom::mutation::append(&mut dom, root, html).expect("html");
+    dom::mutation::append(&mut dom, html, body).expect("body");
     // Only iframe transitions are tracked; ordinary elements are not.
     assert!(dom::lifecycle::take(&mut dom).is_empty());
 
-    dom.append(body, iframe).expect("iframe");
+    dom::mutation::append(&mut dom, body, iframe).expect("iframe");
     assert_eq!(
         dom::lifecycle::take(&mut dom),
         vec![Lifecycle::Inserted(iframe)]
@@ -335,18 +336,18 @@ fn connection_transitions_record_lifecycle_events() {
     // A detached subtree records nothing until it is connected...
     let detached = dom.create_element(qn("div"), Vec::new());
     let nested = dom.create_element(qn("iframe"), Vec::new());
-    dom.append(detached, nested).expect("detached iframe");
+    dom::mutation::append(&mut dom, detached, nested).expect("detached iframe");
     assert!(dom::lifecycle::take(&mut dom).is_empty());
 
     // ...then every iframe in the inserted subtree is reported.
-    dom.append(body, detached).expect("connect subtree");
+    dom::mutation::append(&mut dom, body, detached).expect("connect subtree");
     assert_eq!(
         dom::lifecycle::take(&mut dom),
         vec![Lifecycle::Inserted(nested)]
     );
 
     // Moving a connected element is not a removal plus insertion.
-    dom.append(body, nested).expect("move nested");
+    dom::mutation::append(&mut dom, body, nested).expect("move nested");
     assert!(dom::lifecycle::take(&mut dom).is_empty());
 
     // Detaching reports the removed iframe.
@@ -365,11 +366,11 @@ fn img_connection_transitions_record_lifecycle_events() {
     let body = dom.create_element(qn("body"), Vec::new());
     let img = dom.create_element(qn("img"), Vec::new());
 
-    dom.append(root, html).expect("html");
-    dom.append(html, body).expect("body");
+    dom::mutation::append(&mut dom, root, html).expect("html");
+    dom::mutation::append(&mut dom, html, body).expect("body");
     assert!(dom::lifecycle::take(&mut dom).is_empty());
 
-    dom.append(body, img).expect("img");
+    dom::mutation::append(&mut dom, body, img).expect("img");
     assert_eq!(
         dom::lifecycle::take(&mut dom),
         vec![Lifecycle::Inserted(img)]
@@ -389,9 +390,9 @@ fn connected_iframes_survive_replace_and_report_destroy() {
     let root = dom.create_element(qn("root"), Vec::new());
     let holder = dom.create_element(qn("holder"), Vec::new());
     let iframe = dom.create_element(qn("iframe"), Vec::new());
-    dom.append(document, root).expect("root");
-    dom.append(root, holder).expect("holder");
-    dom.append(holder, iframe).expect("iframe");
+    dom::mutation::append(&mut dom, document, root).expect("root");
+    dom::mutation::append(&mut dom, root, holder).expect("holder");
+    dom::mutation::append(&mut dom, holder, iframe).expect("iframe");
     assert_eq!(dom::lifecycle::connected_iframe_count(&dom), 1);
     let _ = dom::lifecycle::take(&mut dom);
 
@@ -406,10 +407,10 @@ fn connected_iframes_survive_replace_and_report_destroy() {
     let wrapper = dom.create_element(qn("wrapper"), Vec::new());
     dom.replace_all(holder, wrapper).expect("wrap");
     let nested = dom.create_element(qn("iframe"), Vec::new());
-    dom.append(wrapper, nested).expect("nested iframe");
+    dom::mutation::append(&mut dom, wrapper, nested).expect("nested iframe");
     assert_eq!(dom::lifecycle::connected_iframe_count(&dom), 1);
     let _ = dom::lifecycle::take(&mut dom);
-    dom.replace_child(holder, nested, wrapper)
+    dom::mutation::replace_child(&mut dom, holder, nested, wrapper)
         .expect("replace_child");
     assert_eq!(dom::lifecycle::connected_iframe_count(&dom), 1);
     assert!(dom::lifecycle::take(&mut dom).is_empty());
@@ -428,13 +429,13 @@ fn replacement_reports_removal_before_insertion() {
     let mut dom = Document::new();
     let document = dom.document();
     let root = dom.create_element(qn("root"), Vec::new());
-    dom.append(document, root).expect("root");
+    dom::mutation::append(&mut dom, document, root).expect("root");
     let old = dom.create_element(qn("iframe"), Vec::new());
-    dom.append(root, old).expect("old iframe");
+    dom::mutation::append(&mut dom, root, old).expect("old iframe");
     let _ = dom::lifecycle::take(&mut dom);
 
     let fresh = dom.create_element(qn("iframe"), Vec::new());
-    dom.replace_child(root, fresh, old).expect("replace_child");
+    dom::mutation::replace_child(&mut dom, root, fresh, old).expect("replace_child");
     assert_eq!(
         dom::lifecycle::take(&mut dom),
         vec![Lifecycle::Removed(old), Lifecycle::Inserted(fresh)],
@@ -488,14 +489,14 @@ fn bulk_moves_keep_the_link_invariant() {
     let wrapper = dom.create_element(qn("wrapper"), Vec::new());
     let host = dom.create_element(qn("host"), Vec::new());
     let dest = dom.create_element(qn("dest"), Vec::new());
-    dom.append(wrapper, host).expect("host");
-    dom.append(wrapper, dest).expect("dest");
+    dom::mutation::append(&mut dom, wrapper, host).expect("host");
+    dom::mutation::append(&mut dom, wrapper, dest).expect("dest");
 
     let first = dom.create_element(qn("first"), Vec::new());
     let second = dom.create_element(qn("second"), Vec::new());
     let third = dom.create_element(qn("third"), Vec::new());
     for &child in &[first, second, third] {
-        dom.append(host, child).expect("host child");
+        dom::mutation::append(&mut dom, host, child).expect("host child");
     }
     assert_links(&dom, host, &[first, second, third]);
 
@@ -511,7 +512,7 @@ fn bulk_moves_keep_the_link_invariant() {
 
     // replace_all with a node already in the standing set.
     let kept = dom.create_element(qn("kept"), Vec::new());
-    dom.append(host, kept).expect("kept");
+    dom::mutation::append(&mut dom, host, kept).expect("kept");
     assert_links(&dom, host, &[replacement, kept]);
     dom.replace_all(host, kept)
         .expect("replace_all reusing a child");
@@ -522,9 +523,9 @@ fn bulk_moves_keep_the_link_invariant() {
 
     // replace_child swaps exactly one node.
     let replaced = dom.create_element(qn("replaced"), Vec::new());
-    dom.append(host, replaced).expect("replaced");
+    dom::mutation::append(&mut dom, host, replaced).expect("replaced");
     let inserted = dom.create_element(qn("inserted"), Vec::new());
-    dom.replace_child(host, inserted, replaced)
+    dom::mutation::replace_child(&mut dom, host, inserted, replaced)
         .expect("replace_child");
     assert_links(&dom, host, &[kept, inserted]);
     assert_eq!(dom.parent(replaced), None);
@@ -532,8 +533,8 @@ fn bulk_moves_keep_the_link_invariant() {
 
     // reparent_children moves the whole run in order to the destination.
     let marker = dom.create_comment("marker");
-    dom.append(dest, marker).expect("dest child");
-    dom.reparent_children(host, dest)
+    dom::mutation::append(&mut dom, dest, marker).expect("dest child");
+    dom::mutation::reparent_children(&mut dom, host, dest)
         .expect("reparent_children");
     assert_links(&dom, host, &[]);
     assert_links(&dom, dest, &[marker, kept, inserted]);
@@ -542,9 +543,9 @@ fn bulk_moves_keep_the_link_invariant() {
     let fragment = dom.create_fragment();
     let frag_one = dom.create_element(qn("frag-one"), Vec::new());
     let frag_two = dom.create_element(qn("frag-two"), Vec::new());
-    dom.append(fragment, frag_one).expect("frag_one");
-    dom.append(fragment, frag_two).expect("frag_two");
-    dom.insert_before(kept, fragment).expect("splice fragment");
+    dom::mutation::append(&mut dom, fragment, frag_one).expect("frag_one");
+    dom::mutation::append(&mut dom, fragment, frag_two).expect("frag_two");
+    dom::mutation::insert_before(&mut dom, kept, fragment).expect("splice fragment");
     assert_links(&dom, dest, &[marker, frag_one, frag_two, kept, inserted]);
     assert_eq!(dom.children(fragment).expect("fragment").count(), 0);
 
@@ -552,9 +553,9 @@ fn bulk_moves_keep_the_link_invariant() {
     let tail = dom.create_fragment();
     let tail_one = dom.create_element(qn("tail-one"), Vec::new());
     let tail_two = dom.create_element(qn("tail-two"), Vec::new());
-    dom.append(tail, tail_one).expect("tail_one");
-    dom.append(tail, tail_two).expect("tail_two");
-    dom.append(dest, tail).expect("append fragment");
+    dom::mutation::append(&mut dom, tail, tail_one).expect("tail_one");
+    dom::mutation::append(&mut dom, tail, tail_two).expect("tail_two");
+    dom::mutation::append(&mut dom, dest, tail).expect("append fragment");
     assert_links(
         &dom,
         dest,
@@ -567,7 +568,7 @@ fn bulk_moves_keep_the_link_invariant() {
     // replace_all with a fragment replaces the run with the fragment's children.
     let swap = dom.create_fragment();
     let swap_child = dom.create_element(qn("swap-child"), Vec::new());
-    dom.append(swap, swap_child).expect("swap_child");
+    dom::mutation::append(&mut dom, swap, swap_child).expect("swap_child");
     dom.replace_all(dest, swap).expect("replace_all fragment");
     assert_links(&dom, dest, &[swap_child]);
 }
@@ -577,12 +578,12 @@ fn child_iteration_covers_each_child_once_across_both_directions() {
     let mut dom = Document::new();
     let document = dom.document();
     let root = dom.create_element(qn("root"), Vec::new());
-    dom.append(document, root).expect("root");
+    dom::mutation::append(&mut dom, document, root).expect("root");
 
     let mut kids = Vec::new();
     for _ in 0..5 {
         let kid = dom.create_element(qn("node"), Vec::new());
-        dom.append(root, kid).expect("child");
+        dom::mutation::append(&mut dom, root, kid).expect("child");
         kids.push(kid);
     }
 
@@ -602,16 +603,16 @@ fn child_iteration_covers_each_child_once_across_both_directions() {
 
     // A lone child is yielded once, not once per direction.
     let only = dom.create_element(qn("only"), Vec::new());
-    dom.append(root, only).expect("only container");
+    dom::mutation::append(&mut dom, root, only).expect("only container");
     let text = dom.create_text("x");
-    dom.append(only, text).expect("only child");
+    dom::mutation::append(&mut dom, only, text).expect("only child");
     let mut iter = dom.children(only).expect("only children");
     assert_eq!(iter.next(), Some(text));
     assert_eq!(iter.next_back(), None);
 
     // An empty run yields nothing from either end.
     let empty = dom.create_element(qn("empty"), Vec::new());
-    dom.append(root, empty).expect("empty container");
+    dom::mutation::append(&mut dom, root, empty).expect("empty container");
     let mut iter = dom.children(empty).expect("empty children");
     assert_eq!(iter.next(), None);
     assert_eq!(iter.next_back(), None);

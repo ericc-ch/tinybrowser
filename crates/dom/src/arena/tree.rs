@@ -216,7 +216,7 @@ impl Tree {
     /// `before`, when present, must already be a child of `parent`; `node`
     /// must carry no parent and no sibling links. This is the single place
     /// that writes the four link fields on insertion.
-    pub(super) fn insert_linked(&mut self, parent: NodeId, node: NodeId, before: Option<NodeId>) {
+    pub(crate) fn insert_linked(&mut self, parent: NodeId, node: NodeId, before: Option<NodeId>) {
         let previous = match before {
             Some(before) => self.previous_sibling(before),
             None => self.last_child(parent),
@@ -255,7 +255,7 @@ impl Tree {
 
     /// Unlinks one attached node, preserving its slot and descendants
     /// (<https://dom.spec.whatwg.org/#concept-node-remove>).
-    pub(super) fn unlink_linked(&mut self, id: NodeId) {
+    pub(crate) fn unlink_linked(&mut self, id: NodeId) {
         let Some((parent, previous, next)) = self.node_mut(id).and_then(|node| {
             node.parent
                 .map(|parent| (parent, node.previous_sibling, node.next_sibling))

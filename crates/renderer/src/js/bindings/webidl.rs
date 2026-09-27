@@ -129,7 +129,7 @@ pub(crate) fn convert_nodes_into_node<'js>(
             Piece::Node(id) => id,
             Piece::Text(text) => dom.create_text(text),
         };
-        dom.append(fragment, id)
+        dom::mutation::append(dom, fragment, id)
             .map_err(|err| throw_dom_error(ctx, err))?;
     }
     Ok(fragment)

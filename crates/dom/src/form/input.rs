@@ -463,7 +463,7 @@ impl Document {
         let replacement = self.create_fragment();
         if !value.is_empty() {
             let text = self.create_text(value);
-            self.append(replacement, text)?;
+            crate::mutation::append(self, replacement, text)?;
         }
         self.replace_all(id, replacement)
     }

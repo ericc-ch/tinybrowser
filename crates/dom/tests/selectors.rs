@@ -20,7 +20,7 @@ fn attr(name: &str, value: &str) -> Attribute {
 
 fn append_element(dom: &mut Document, parent: NodeId, name: &str, attrs: Vec<Attribute>) -> NodeId {
     let element = dom.create_element(qn(name), attrs);
-    dom.append(parent, element).expect("fixture append");
+    dom::mutation::append(dom, parent, element).expect("fixture append");
     element
 }
 
@@ -32,7 +32,7 @@ fn selector_queries_observe_the_public_tree_boundary() {
     let body = append_element(&mut dom, html, "body", Vec::new());
     let main = append_element(&mut dom, body, "div", vec![attr("id", "main")]);
     let text = dom.create_text("not an element");
-    dom.append(main, text).expect("fixture text");
+    dom::mutation::append(&mut dom, main, text).expect("fixture text");
 
     // A malformed selector keeps its syntax class.
     for invalid in ["", "div[", ":dir(up)", ":frobnicate"] {

@@ -30,7 +30,7 @@ impl Document {
                 Vec::new(),
             ));
         }
-        self.append_fresh_children(select, added);
+        crate::mutation::append_fresh_children(self, select, added);
         self.apply_default_selectedness(select);
         Ok(())
     }
