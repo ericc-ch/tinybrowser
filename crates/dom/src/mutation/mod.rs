@@ -1,8 +1,14 @@
 //! DOM mutation operations and their observer records.
+//!
+//! This module owns the observable mutation workflows: removal, insertion,
+//! attribute and text changes, and cloning. `Tree` remains the only writer of
+//! parent and sibling links; operations here sequence the spec steps and queue
+//! the observer records.
 
 mod journal;
 
-use crate::NodeId;
+use crate::lifecycle;
+use crate::{Document, DomError, NodeId};
 
 pub(crate) use journal::MutationJournal;
 
@@ -29,38 +35,59 @@ pub enum Mutation {
 }
 
 /// Enable or disable mutation-observer recording for this document.
-pub fn set_recording(document: &mut crate::Document, recording: bool) {
+pub fn set_recording(document: &mut Document, recording: bool) {
     document.journal.set_recording(recording);
 }
 
 /// Drain mutation records in operation order.
-pub fn take(document: &mut crate::Document) -> Vec<Mutation> {
+pub fn take(document: &mut Document) -> Vec<Mutation> {
     document.journal.take()
 }
 
 /// The serial advances on record requests and shadow-root attachment. Unlink
 /// bookkeeping can skip a record request when observers are disabled.
 #[must_use]
-pub fn serial(document: &crate::Document) -> u64 {
+pub fn serial(document: &Document) -> u64 {
     document.journal.serial()
 }
 
-pub(crate) fn record(document: &mut crate::Document, mutation: Mutation) {
+pub(crate) fn record(document: &mut Document, mutation: Mutation) {
     document.journal.record(mutation);
 }
 
-pub(crate) fn recording(document: &crate::Document) -> bool {
+pub(crate) fn recording(document: &Document) -> bool {
     document.journal.recording()
 }
 
-pub(crate) fn suppress(document: &mut crate::Document) {
+pub(crate) fn suppress(document: &mut Document) {
     document.journal.suppress(true);
 }
 
-pub(crate) fn resume(document: &mut crate::Document) {
+pub(crate) fn resume(document: &mut Document) {
     document.journal.suppress(false);
 }
 
-pub(crate) fn bump(document: &mut crate::Document) {
+pub(crate) fn bump(document: &mut Document) {
     document.journal.bump();
+}
+
+/// Unlinks `id` from its parent while leaving its subtree alive
+/// (<https://dom.spec.whatwg.org/#concept-node-remove>). Detaching an already
+/// detached node is a success, not an error; the document root cannot be
+/// detached. Connection transitions for `iframe` and `img` descendants are
+/// recorded from a snapshot taken before the removal.
+///
+/// # Errors
+///
+/// - [`DomError::StaleNode`] if `id` is stale.
+/// - [`DomError::HierarchyRequest`] for the document root.
+pub fn detach(document: &mut Document, id: NodeId) -> Result<(), DomError> {
+    document.require_live(id)?;
+    if id == document.document() {
+        return Err(DomError::HierarchyRequest);
+    }
+    let tracked = lifecycle::snapshot(document, id);
+    document.unlink_from_current_parent(id);
+    lifecycle::record_snapshot(document, tracked);
+    Ok(())
 }

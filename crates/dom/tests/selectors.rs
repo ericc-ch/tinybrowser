@@ -54,7 +54,7 @@ fn selector_queries_observe_the_public_tree_boundary() {
 
     // Detaching hides a subtree from document queries; destroying it makes
     // every old handle stale at once.
-    dom.detach(main).expect("detach");
+    dom::mutation::detach(&mut dom, main).expect("detach");
     assert!(
         selector::select_all(&dom, document, "#main")
             .expect("query")

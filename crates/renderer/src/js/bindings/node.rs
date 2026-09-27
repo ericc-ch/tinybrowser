@@ -2704,7 +2704,7 @@ impl JsNode {
             .map(Iterator::collect)
             .unwrap_or_default();
         for kid in kids {
-            dom.detach(kid).map_err(|err| throw_dom_error(&ctx, err))?;
+            dom::mutation::detach(dom, kid).map_err(|err| throw_dom_error(&ctx, err))?;
         }
         if !value.0.is_empty() {
             let text = dom.create_text(value.0);
@@ -3299,7 +3299,7 @@ impl JsNode {
         // Text children and drop empty ones.
         if let Some(NodeKind::Text { data }) = dom.kind(self.handle.0) {
             if data.is_empty() {
-                dom.detach(self.handle.0)
+                dom::mutation::detach(dom, self.handle.0)
                     .map_err(|err| throw_dom_error(&ctx, err))?;
             }
             return Ok(());
@@ -3328,7 +3328,7 @@ impl JsNode {
             for kid in kids {
                 match dom.kind(kid) {
                     Some(NodeKind::Text { data }) if data.is_empty() => {
-                        dom.detach(kid).map_err(|err| throw_dom_error(&ctx, err))?;
+                        dom::mutation::detach(dom, kid).map_err(|err| throw_dom_error(&ctx, err))?;
                     }
                     Some(NodeKind::Text { data }) => {
                         if let Some(previous) = merged {
@@ -3339,7 +3339,7 @@ impl JsNode {
                             joined.push_str(data);
                             dom.set_text(previous, joined)
                                 .map_err(|err| throw_dom_error(&ctx, err))?;
-                            dom.detach(kid).map_err(|err| throw_dom_error(&ctx, err))?;
+                            dom::mutation::detach(dom, kid).map_err(|err| throw_dom_error(&ctx, err))?;
                         } else {
                             merged = Some(kid);
                         }
@@ -3590,9 +3590,7 @@ impl JsNode {
                 "child is not a child of this node",
             ));
         }
-        parsed
-            .document
-            .detach(child)
+        dom::mutation::detach(&mut parsed.document, child)
             .map_err(|err| throw_dom_error(&ctx, err))?;
         drop(parsed);
         drop(world);
@@ -3692,9 +3690,7 @@ impl JsNode {
         let Some(mut parsed) = world.document_mut(self.handle.0) else {
             return Ok(());
         };
-        parsed
-            .document
-            .detach(self.handle.0)
+        dom::mutation::detach(&mut parsed.document, self.handle.0)
             .map_err(|err| throw_dom_error(&ctx, err))?;
         drop(parsed);
         drop(world);

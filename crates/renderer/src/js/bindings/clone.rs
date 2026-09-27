@@ -45,9 +45,7 @@ pub(crate) fn adopt_across_documents(
         let Some(mut parsed) = owner.document_mut(node) else {
             return Err(Exception::throw_type(ctx, "no document"));
         };
-        parsed
-            .document
-            .detach(node)
+        dom::mutation::detach(&mut parsed.document, node)
             .map_err(|err| throw_dom_error(ctx, err))?;
     }
     let world = world_rc.borrow_mut();

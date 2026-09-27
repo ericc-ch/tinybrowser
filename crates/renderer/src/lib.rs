@@ -486,7 +486,7 @@ impl TreeSink for Sink {
     }
 
     fn remove_from_parent(&self, target: &Self::Handle) {
-        let _ = self.document.borrow_mut().detach(*target);
+        let _ = dom::mutation::detach(&mut self.document.borrow_mut(), *target);
     }
 
     fn reparent_children(&self, node: &Self::Handle, new_parent: &Self::Handle) {

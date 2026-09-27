@@ -220,7 +220,7 @@ fn mutations_match_an_independent_tree_model() {
             3 => {
                 let node = model.live(&mut state, false);
                 model.detach(node);
-                dom.detach(handles[node]).expect("live element detaches");
+                dom::mutation::detach(&mut dom, handles[node]).expect("live element detaches");
                 successes += 1;
             }
             4 => {
@@ -350,7 +350,7 @@ fn connection_transitions_record_lifecycle_events() {
     assert!(dom::lifecycle::take(&mut dom).is_empty());
 
     // Detaching reports the removed iframe.
-    dom.detach(nested).expect("detach");
+    dom::mutation::detach(&mut dom, nested).expect("detach");
     assert_eq!(
         dom::lifecycle::take(&mut dom),
         vec![Lifecycle::Removed(nested)]
@@ -375,7 +375,7 @@ fn img_connection_transitions_record_lifecycle_events() {
         vec![Lifecycle::Inserted(img)]
     );
 
-    dom.detach(img).expect("detach");
+    dom::mutation::detach(&mut dom, img).expect("detach");
     assert_eq!(
         dom::lifecycle::take(&mut dom),
         vec![Lifecycle::Removed(img)]

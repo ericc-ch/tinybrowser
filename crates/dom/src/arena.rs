@@ -778,26 +778,6 @@ impl Document {
         self.ensure_document_content_model(&sequence)
     }
 
-    /// Unlinks `id` from its parent, keeping the whole subtree alive.
-    ///
-    /// Idempotent: detaching an already-detached node succeeds. The document
-    /// root cannot be detached.
-    ///
-    /// # Errors
-    ///
-    /// - [`DomError::StaleNode`] if `id` is stale.
-    /// - [`DomError::HierarchyRequest`] for the document root.
-    pub fn detach(&mut self, id: NodeId) -> Result<(), DomError> {
-        self.require_live(id)?;
-        if id == self.tree.document() {
-            return Err(DomError::HierarchyRequest);
-        }
-        let tracked = lifecycle::snapshot(self, id);
-        self.unlink_from_current_parent(id);
-        lifecycle::record_snapshot(self, tracked);
-        Ok(())
-    }
-
     /// Moves every child of `from` to the end of `to`'s child list.
     ///
     /// This is the bulk-move primitive behind foster parenting and the
@@ -1728,7 +1708,7 @@ impl Document {
     }
 
     /// Single-handle variant of [`Document::ensure_alive`].
-    fn require_live(&self, a: NodeId) -> Result<(), DomError> {
+    pub(crate) fn require_live(&self, a: NodeId) -> Result<(), DomError> {
         if self.contains(a) {
             Ok(())
         } else {
@@ -1784,7 +1764,7 @@ impl Document {
     }
 
     /// Removes `id` from whichever parent currently holds it.
-    fn unlink_from_current_parent(&mut self, id: NodeId) {
+    pub(crate) fn unlink_from_current_parent(&mut self, id: NodeId) {
         if self.parent(id).is_none() {
             return;
         }
