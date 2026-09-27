@@ -3,7 +3,7 @@
 use super::Mutation;
 
 #[derive(Debug, Default)]
-pub(super) struct MutationJournal {
+pub(crate) struct MutationJournal {
     mutations: Vec<Mutation>,
     recording: bool,
     suppressed: bool,

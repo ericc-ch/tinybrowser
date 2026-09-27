@@ -1,6 +1,5 @@
 //! The arena: flat slot array, generational handles, tree mutations.
 
-mod journal;
 mod metadata;
 mod shadow;
 mod tree;
@@ -17,13 +16,13 @@ use crate::node::{
     html_qualified_name_eq, qualified_name_eq,
 };
 
-use self::journal::MutationJournal;
 use self::metadata::Metadata;
 use self::shadow::ShadowState;
 pub use self::tree::Children;
 use self::tree::Slot;
 pub use self::tree::Tree;
 use crate::lifecycle::{self, ConnectionState};
+use crate::mutation::{self, Mutation, MutationJournal};
 
 /// The document-compatibility mode a query runs under: what html5ever's
 /// tree builder reports and parsed pages carry.
@@ -40,28 +39,6 @@ pub enum QuirksMode {
     LimitedQuirks,
     /// Full quirks: legacy case-insensitive class/id matching.
     Quirks,
-}
-
-/// One recorded tree mutation, for `MutationObserver` delivery.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Mutation {
-    /// Children added and/or removed on `target`, in one operation.
-    ChildList {
-        target: NodeId,
-        added: Vec<NodeId>,
-        removed: Vec<NodeId>,
-        previous: Option<NodeId>,
-        next: Option<NodeId>,
-    },
-    /// An attribute set, changed, or removed on `target`.
-    Attributes {
-        target: NodeId,
-        name: String,
-        namespace: String,
-        old_value: Option<String>,
-    },
-    /// Character data replaced on `target`.
-    CharacterData { target: NodeId, old_value: String },
 }
 
 /// Why a mutation was refused.
@@ -129,7 +106,7 @@ pub struct Document {
     metadata: Metadata,
     shadow: ShadowState,
     pub(crate) form: FormState,
-    journal: MutationJournal,
+    pub(crate) journal: MutationJournal,
     pub(crate) connections: ConnectionState,
     pub(crate) named: NamedIndex,
     /// `Cell<()>` is `Send` + `!Sync`; `PhantomData` makes `Document` inherit
@@ -160,33 +137,9 @@ impl Document {
         }
     }
 
-    /// Turns mutation recording on or off; recording costs nothing while no
-    /// `MutationObserver` is registered.
-    pub fn set_record_mutations(&mut self, recording: bool) {
-        self.journal.set_recording(recording);
-    }
-
-    /// Drains the recorded mutations in order.
-    pub fn take_mutations(&mut self) -> Vec<Mutation> {
-        self.journal.take()
-    }
-
     /// `id`'s ancestors, nearest first, `id` excluded.
     pub fn ancestors(&self, id: NodeId) -> impl Iterator<Item = NodeId> + '_ {
         std::iter::successors(self.parent(id), |&node| self.parent(node))
-    }
-
-    fn record(&mut self, mutation: Mutation) {
-        self.journal.record(mutation);
-    }
-
-    /// A counter that changes on every recorded mutation.
-    ///
-    /// Consumers that must rescan the tree (frame order) compare this instead
-    /// of walking the whole document on every turn.
-    #[must_use]
-    pub fn mutation_serial(&self) -> u64 {
-        self.journal.serial()
     }
 
     /// The root `Document` node; every other node descends from it.
@@ -641,7 +594,7 @@ impl Document {
         let child_tracked = (child != node && self.parent(child) == Some(parent))
             .then(|| lifecycle::snapshot(self, child));
         let mut removed = Vec::new();
-        self.journal.suppress(true);
+        mutation::suppress(self);
         if child != node && self.parent(child) == Some(parent) {
             self.unlink_from_current_parent(child);
             removed.push(child);
@@ -651,18 +604,21 @@ impl Document {
         } else {
             self.place_node(parent, node, reference);
         }
-        self.journal.suppress(false);
+        mutation::resume(self);
         if let Some(child_tracked) = child_tracked {
             lifecycle::record_snapshot(self, child_tracked);
         }
         lifecycle::record_snapshot(self, node_tracked);
-        self.record(Mutation::ChildList {
-            target: parent,
-            added,
-            removed,
-            previous,
-            next: reference,
-        });
+        mutation::record(
+            self,
+            Mutation::ChildList {
+                target: parent,
+                added,
+                removed,
+                previous,
+                next: reference,
+            },
+        );
         Ok(())
     }
 
@@ -1121,12 +1077,15 @@ impl Document {
         // name and `attributeNamespace` its namespace, not the
         // queried qualified name
         // (<https://dom.spec.whatwg.org/#dom-mutationrecord-attributename>).
-        self.record(Mutation::Attributes {
-            target: id,
-            name: removed.name.local.to_string(),
-            namespace: removed.name.ns.to_string(),
-            old_value: Some(removed.value),
-        });
+        mutation::record(
+            self,
+            Mutation::Attributes {
+                target: id,
+                name: removed.name.local.to_string(),
+                namespace: removed.name.ns.to_string(),
+                old_value: Some(removed.value),
+            },
+        );
         named::attribute_changed(self, id, local);
         form::attribute_removed(self, id, local)
     }
@@ -1150,12 +1109,15 @@ impl Document {
             return Ok(());
         };
         let removed = attributes.remove(index);
-        self.record(Mutation::Attributes {
-            target: id,
-            name: local.to_owned(),
-            namespace: ns.to_owned(),
-            old_value: Some(removed.value),
-        });
+        mutation::record(
+            self,
+            Mutation::Attributes {
+                target: id,
+                name: local.to_owned(),
+                namespace: ns.to_owned(),
+                old_value: Some(removed.value),
+            },
+        );
         named::attribute_changed(self, id, local);
         Ok(())
     }
@@ -1208,7 +1170,7 @@ impl Document {
         // firstChild)`), so its starting connectivity must be read before the
         // detach loop below.
         let node_tracked = lifecycle::snapshot(self, node);
-        self.journal.suppress(true);
+        mutation::suppress(self);
         // Detach the standing children through the single-node primitive; its
         // O(1) steps make the loop O(k), and it keeps `unlink` the only
         // remover of a node. Recording is suppressed, so no observer sees
@@ -1221,7 +1183,7 @@ impl Document {
         } else {
             self.place_node(parent, node, None);
         }
-        self.journal.suppress(false);
+        mutation::resume(self);
         // Removal before insertion: a replacement frees its frame slot before
         // the new frame is checked against the frame cap.
         lifecycle::record_snapshot(self, removed_snapshot);
@@ -1231,13 +1193,16 @@ impl Document {
         // e.g. `textContent = ""` on an already-empty element changes nothing
         // and is silent.
         if !added.is_empty() || !removed.is_empty() {
-            self.record(Mutation::ChildList {
-                target: parent,
-                added,
-                removed,
-                previous: None,
-                next: None,
-            });
+            mutation::record(
+                self,
+                Mutation::ChildList {
+                    target: parent,
+                    added,
+                    removed,
+                    previous: None,
+                    next: None,
+                },
+            );
         }
         Ok(())
     }
@@ -1279,12 +1244,15 @@ impl Document {
             });
             None
         };
-        self.record(Mutation::Attributes {
-            target: id,
-            name: local.to_owned(),
-            namespace: namespace.to_owned(),
-            old_value,
-        });
+        mutation::record(
+            self,
+            Mutation::Attributes {
+                target: id,
+                name: local.to_owned(),
+                namespace: namespace.to_owned(),
+                old_value,
+            },
+        );
         named::attribute_changed(self, id, local);
         Ok(())
     }
@@ -1334,12 +1302,15 @@ impl Document {
             });
             (local, String::new(), None)
         };
-        self.record(Mutation::Attributes {
-            target: id,
-            name: recorded_name,
-            namespace: recorded_namespace,
-            old_value,
-        });
+        mutation::record(
+            self,
+            Mutation::Attributes {
+                target: id,
+                name: recorded_name,
+                namespace: recorded_namespace,
+                old_value,
+            },
+        );
         named::attribute_changed(self, id, local);
         form::attribute_set(self, id, local)
     }
@@ -1370,7 +1341,7 @@ impl Document {
     pub fn append_text(&mut self, id: NodeId, extra: &str) -> Result<(), DomError> {
         let parent = self.parent(id);
         let value_before = parent.and_then(|parent| self.textarea_value_before_change(parent));
-        let recording = self.journal.recording();
+        let recording = mutation::recording(self);
         let old_value = {
             let kind = self.tree.kind_mut(id).ok_or(DomError::StaleNode)?;
             let NodeKind::Text { data } = kind else {
@@ -1381,10 +1352,13 @@ impl Document {
             old_value
         };
         if let Some(old_value) = old_value {
-            self.record(Mutation::CharacterData {
-                target: id,
-                old_value,
-            });
+            mutation::record(
+                self,
+                Mutation::CharacterData {
+                    target: id,
+                    old_value,
+                },
+            );
         }
         if let Some(parent) = parent {
             self.reset_textarea_selection_if_changed(parent, value_before);
@@ -1605,7 +1579,7 @@ impl Document {
         // Sibling references for the mutation record, read from the run the
         // node is about to join. Computed only while recording: no observer
         // exists on the parse path, so the lookups stay off it.
-        let (previous, next) = if self.journal.recording() {
+        let (previous, next) = if mutation::recording(self) {
             let previous = match before {
                 Some(before) => self.previous_sibling(before),
                 None => self.last_child(parent),
@@ -1616,13 +1590,16 @@ impl Document {
         };
         self.tree.insert_linked(parent, node, before);
         named::inserted(self, node);
-        self.record(Mutation::ChildList {
-            target: parent,
-            added: vec![node],
-            removed: Vec::new(),
-            previous,
-            next,
-        });
+        mutation::record(
+            self,
+            Mutation::ChildList {
+                target: parent,
+                added: vec![node],
+                removed: Vec::new(),
+                previous,
+                next,
+            },
+        );
         self.reset_textarea_selection_if_changed(parent, value_before);
         if radio_owner_before != self.checked_radio_form_owner(node) {
             self.refresh_radio_group(node);
@@ -1662,16 +1639,19 @@ impl Document {
             && moved
                 .iter()
                 .all(|&id| self.html_local_is(id, "option") && !self.option_selected(id));
-        self.record(Mutation::ChildList {
-            target: fragment,
-            added: Vec::new(),
-            removed: moved.clone(),
-            previous: None,
-            next: None,
-        });
+        mutation::record(
+            self,
+            Mutation::ChildList {
+                target: fragment,
+                added: Vec::new(),
+                removed: moved.clone(),
+                previous: None,
+                next: None,
+            },
+        );
         // Sibling references for the mutation record, read before the run
         // leaves the fragment.
-        let (previous, next) = if self.journal.recording() {
+        let (previous, next) = if mutation::recording(self) {
             let previous = match before {
                 Some(before) => self.previous_sibling(before),
                 None => self.last_child(parent),
@@ -1708,13 +1688,16 @@ impl Document {
         if blank_options {
             self.apply_default_selectedness(parent);
         }
-        self.record(Mutation::ChildList {
-            target: parent,
-            added: moved,
-            removed: Vec::new(),
-            previous,
-            next,
-        });
+        mutation::record(
+            self,
+            Mutation::ChildList {
+                target: parent,
+                added: moved,
+                removed: Vec::new(),
+                previous,
+                next,
+            },
+        );
     }
 
     /// Appends a run of fresh, unparented leaves to a live container as one
@@ -1727,13 +1710,16 @@ impl Document {
             self.tree.insert_linked(parent, node, None);
             named::inserted(self, node);
         }
-        self.record(Mutation::ChildList {
-            target: parent,
-            added,
-            removed: Vec::new(),
-            previous,
-            next: None,
-        });
+        mutation::record(
+            self,
+            Mutation::ChildList {
+                target: parent,
+                added,
+                removed: Vec::new(),
+                previous,
+                next: None,
+            },
+        );
     }
 
     fn ensure_alive(&self, a: NodeId, b: NodeId) -> Result<(), DomError> {
@@ -1779,19 +1765,22 @@ impl Document {
     /// verified `id` live; a missing parent is a silent no-op (the node is
     /// already detached).
     fn record_unlink(&mut self, id: NodeId) {
-        if !self.journal.recording() {
+        if !mutation::recording(self) {
             return;
         }
         let Some(parent) = self.parent(id) else {
             return;
         };
-        self.record(Mutation::ChildList {
-            target: parent,
-            added: Vec::new(),
-            removed: vec![id],
-            previous: self.previous_sibling(id),
-            next: self.next_sibling(id),
-        });
+        mutation::record(
+            self,
+            Mutation::ChildList {
+                target: parent,
+                added: Vec::new(),
+                removed: vec![id],
+                previous: self.previous_sibling(id),
+                next: self.next_sibling(id),
+            },
+        );
     }
 
     /// Removes `id` from whichever parent currently holds it.
@@ -1836,10 +1825,13 @@ impl Document {
         match extract(kind) {
             Some(field) => {
                 let old_value = std::mem::replace(field, data);
-                self.record(Mutation::CharacterData {
-                    target: id,
-                    old_value,
-                });
+                mutation::record(
+                    self,
+                    Mutation::CharacterData {
+                        target: id,
+                        old_value,
+                    },
+                );
                 if let Some(parent) = parent {
                     self.reset_textarea_selection_if_changed(parent, value_before);
                 }

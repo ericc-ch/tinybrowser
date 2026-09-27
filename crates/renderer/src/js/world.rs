@@ -504,7 +504,7 @@ impl World {
         let mut documents = self.runtime.documents.borrow_mut();
         for id in &self.owned {
             if let Some(parsed) = documents.get_mut(*id) {
-                parsed.document.set_record_mutations(recording);
+                dom::mutation::set_recording(&mut parsed.document, recording);
             }
         }
     }
@@ -517,7 +517,7 @@ impl World {
             let Some(parsed) = documents.get_mut(*id) else {
                 continue;
             };
-            let mutations = parsed.document.take_mutations();
+            let mutations = dom::mutation::take(&mut parsed.document);
             if mutations.is_empty() || self.observers.is_empty() {
                 continue;
             }

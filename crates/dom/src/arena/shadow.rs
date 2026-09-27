@@ -193,7 +193,7 @@ impl Document {
         let root = self.create_fragment();
         self.shadow.shadow_roots.insert(host, (root, open));
         self.shadow.shadow_hosts.insert(root, host);
-        self.journal.bump();
+        crate::mutation::bump(self);
         Ok(root)
     }
 

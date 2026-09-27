@@ -500,7 +500,7 @@ impl Document {
         let serial = self
             .world
             .borrow()
-            .with_main_document(|parsed| parsed.document.mutation_serial());
+            .with_main_document(|parsed| dom::mutation::serial(&parsed.document));
         match serial {
             Some(serial) if serial == self.frame_order_serial => false,
             Some(serial) => {
