@@ -20,6 +20,7 @@
 mod arena;
 mod form;
 mod id;
+mod named;
 mod node;
 mod selector;
 mod state;

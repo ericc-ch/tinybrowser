@@ -1095,12 +1095,11 @@
         const raw = this.getAttribute('size');
         const match = raw === null ? null : /^[\t\n\f\r ]*\+?([0-9]+)/.exec(raw);
         const parsed = match === null ? null : Number(match[1]);
-        return parsed !== null && parsed <= 4294967295 ? parsed : 0;
+        return parsed !== null && parsed <= 2147483647 ? parsed : 0;
       },
       set: function(value) {
         const unsigned = (+value) >>> 0;
-        if (unsigned === 0) this.removeAttribute('size');
-        else this.setAttribute('size', String(unsigned));
+        this.setAttribute('size', String(unsigned <= 2147483647 ? unsigned : 0));
       },
       enumerable: true, configurable: true,
     },
@@ -1112,8 +1111,10 @@
     // Both delegate to the options collection
     // (<https://html.spec.whatwg.org/multipage/form-elements.html#dom-select-item>,
     // <https://html.spec.whatwg.org/multipage/form-elements.html#dom-select-nameditem>).
+    // `item` takes `unsigned long`, so a negative index wraps out of range and
+    // returns null instead of reaching the host's `usize` conversion.
     item: {
-      value: function(index) { return this.options.item(index); },
+      value: function(index) { return this.options.item((+index) >>> 0); },
       writable: true, enumerable: true, configurable: true,
     },
     namedItem: {
@@ -1153,7 +1154,7 @@
           globalThis.Element.prototype.remove.call(this);
           return;
         }
-        const option = this.options[Number(index)];
+        const option = this.options[toLong(index)];
         if (option !== undefined) option.remove();
       },
       writable: true, enumerable: true, configurable: true,

@@ -1,14 +1,16 @@
 (function() {
   const isOptionNode = globalThis.__tbIsOptionNode;
   const appendBlankOptions = globalThis.__tbAppendBlankOptions;
+  const collectionNamed = globalThis.__tbCollectionNamed;
+  const collectionKeys = globalThis.__tbCollectionKeys;
   const windowNamedValue = globalThis.__tbWindowNamedValue;
-  const windowNamedNames = globalThis.__tbWindowNamedNames;
-  const windowNamedSerial = globalThis.__tbWindowNamedSerial;
+  const windowNamedHas = globalThis.__tbWindowNamedHas;
   delete globalThis.__tbIsOptionNode;
   delete globalThis.__tbAppendBlankOptions;
+  delete globalThis.__tbCollectionNamed;
+  delete globalThis.__tbCollectionKeys;
   delete globalThis.__tbWindowNamedValue;
-  delete globalThis.__tbWindowNamedNames;
-  delete globalThis.__tbWindowNamedSerial;
+  delete globalThis.__tbWindowNamedHas;
   const canonicalIndex = /^(0|[1-9][0-9]*)$/;
   const native = globalThis.NodeList.prototype;
   function values() {
@@ -46,6 +48,7 @@
     });
   }
   const ctor = function() { throw new TypeError('Illegal constructor'); };
+  Object.defineProperty(ctor, 'name', { value: 'HTMLCollection', configurable: true });
   const proto = Object.create(Object.prototype);
   for (const member of ['length', 'item']) {
     const descriptor = Object.getOwnPropertyDescriptor(native, member);
@@ -62,19 +65,13 @@
     value: 'HTMLCollection', writable: false, enumerable: false, configurable: true,
   });
   Object.defineProperty(proto, 'namedItem', {
-    value: function(name) {
-      const key = String(name);
-      if (key === '') return null;
-      for (const element of this) {
-        if (element.id === key || element.getAttribute('name') === key) return element;
-      }
-      return null;
-    },
-    writable: true, configurable: true,
+    value: function(name) { return collectionNamed(this, String(name)); },
+    writable: true, enumerable: true, configurable: true,
   });
   Object.defineProperty(globalThis, 'HTMLCollection', { value: ctor, writable: true, configurable: true });
   // <https://html.spec.whatwg.org/multipage/common-dom-interfaces.html#htmloptionscollection>
   const optionsCtor = function() { throw new TypeError('Illegal constructor'); };
+  Object.defineProperty(optionsCtor, 'name', { value: 'HTMLOptionsCollection', configurable: true });
   const optionsProto = Object.create(proto);
   Object.defineProperty(optionsProto, 'constructor', {
     value: optionsCtor, writable: true, configurable: true,
@@ -117,10 +114,10 @@
     if (!isOptionNode(option)) {
       throw new TypeError('option must be an HTMLOptionElement');
     }
-    // The spec does not cap indexed writes, but Blink caps list growth at
-    // 100,000 options to avoid unbounded allocations.
+    // The spec does not cap indexed writes, but Blink refuses to grow the
+    // list past 100,000 options to avoid unbounded allocations
     // (<https://html.spec.whatwg.org/multipage/common-dom-interfaces.html#htmloptionscollection>).
-    if (index >= 100000 && index >= select.options.length) return;
+    if (index > select.options.length && index >= 100000) return;
     const existing = select.options.item(index);
     if (existing) {
       existing.parentNode.replaceChild(option, existing);
@@ -152,15 +149,18 @@
     selectedIndex: {
       get: function() { return optionOwners.get(this).selectedIndex; },
       set: function(value) { optionOwners.get(this).selectedIndex = value; },
-      configurable: true,
+      enumerable: true, configurable: true,
     },
     add: {
       value: function(element, before) { optionOwners.get(this).add(element, before); },
-      writable: true, configurable: true,
+      writable: true, enumerable: true, configurable: true,
     },
     remove: {
-      value: function(index) { optionOwners.get(this).remove(index); },
-      writable: true, configurable: true,
+      value: function(index) {
+        if (arguments.length === 0) throw new TypeError('remove requires an index');
+        optionOwners.get(this).remove(index);
+      },
+      writable: true, enumerable: true, configurable: true,
     },
   });
   Object.defineProperty(globalThis, '__tb_liveCollection', {
@@ -210,17 +210,17 @@
           for (let i = 0; i < inner.length; i++) {
             keys.push(String(i));
           }
-          if (typeof inner.namedItem === 'function') {
-            for (let index = 0; index < inner.length; index++) {
-              const element = inner.item(index);
-              for (const key of [element.id, element.getAttribute('name')]) {
-                if (key && !keys.includes(key) && !Reflect.has(inner, key)) keys.push(key);
-              }
+          const seen = new Set(keys);
+          for (const key of collectionKeys(inner)) {
+            if (!seen.has(key)) {
+              seen.add(key);
+              keys.push(key);
             }
           }
           return keys;
         },
         getOwnPropertyDescriptor: function(inner, property) {
+          const options = Object.getPrototypeOf(inner) === optionsProto;
           if (typeof property === 'string' && canonicalIndex.test(property)) {
             const index = Number(property);
             if (index < inner.length) {
@@ -228,7 +228,7 @@
                 value: inner.item(index),
                 enumerable: true,
                 configurable: true,
-                writable: Object.getPrototypeOf(inner) === optionsProto,
+                writable: options,
               };
             }
           }
@@ -236,7 +236,10 @@
               && typeof inner.namedItem === 'function') {
             const named = inner.namedItem(property);
             if (named !== null) {
-              return { value: named, enumerable: false, configurable: true, writable: false };
+              // HTMLCollection is `[LegacyUnenumerableNamedProperties]`;
+              // HTMLOptionsCollection is not, so its names are enumerable
+              // (<https://webidl.spec.whatwg.org/#LegacyUnenumerableNamedProperties>).
+              return { value: named, enumerable: options, configurable: true, writable: false };
             }
           }
           return Reflect.getOwnPropertyDescriptor(inner, property);
@@ -294,40 +297,30 @@
   // (<https://html.spec.whatwg.org/multipage/nav-history-apis.html#named-access-on-the-window-object>):
   // a named properties object sits between the global and its prototype. It
   // exposes an element for a name, or an `HTMLCollection` when several named
-  // objects share the name. The names are recomputed only when the document's
-  // mutation serial changes, so probing an undefined global stays O(1).
+  // objects share the name. The name test is an O(1) index lookup; only a
+  // name that is present pays for the value scan.
   {
-    let names = null;
-    let namesSerial = null;
-    const refreshNames = () => {
-      const serial = windowNamedSerial();
-      if (names === null || namesSerial !== serial) {
-        names = new Set(windowNamedNames());
-        namesSerial = serial;
-      }
-    };
-    const visible = name => {
-      refreshNames();
-      return names.has(name);
-    };
     const originalProto = Object.getPrototypeOf(globalThis);
     const target = Object.create(originalProto);
     Object.setPrototypeOf(globalThis, new Proxy(target, {
       get: function(inner, property, receiver) {
-        if (typeof property === 'string' && !Reflect.has(inner, property) && visible(property)) {
+        if (typeof property === 'string' && !Reflect.has(inner, property)
+            && windowNamedHas(property)) {
           const value = windowNamedValue(property);
           if (value !== undefined) return value;
         }
         return Reflect.get(inner, property, receiver);
       },
       has: function(inner, property) {
-        if (typeof property === 'string' && !Reflect.has(inner, property) && visible(property)) {
+        if (typeof property === 'string' && !Reflect.has(inner, property)
+            && windowNamedHas(property)) {
           return windowNamedValue(property) !== undefined;
         }
         return Reflect.has(inner, property);
       },
       getOwnPropertyDescriptor: function(inner, property) {
-        if (typeof property === 'string' && !Reflect.has(inner, property) && visible(property)) {
+        if (typeof property === 'string' && !Reflect.has(inner, property)
+            && windowNamedHas(property)) {
           const value = windowNamedValue(property);
           if (value !== undefined) {
             return { value, writable: true, enumerable: false, configurable: true };
@@ -335,13 +328,16 @@
         }
         return Reflect.getOwnPropertyDescriptor(inner, property);
       },
-      ownKeys: function(inner) {
-        const keys = Reflect.ownKeys(inner);
-        refreshNames();
-        for (const name of names) {
-          if (!keys.includes(name)) keys.push(name);
-        }
-        return keys;
+      // WebIDL keeps the named properties object immutable: it rejects
+      // defining and deleting properties, preventing extensions, and changing
+      // the prototype
+      // (<https://webidl.spec.whatwg.org/#named-properties-object>). Named
+      // properties are not real own properties, so there is no ownKeys trap.
+      defineProperty: function() { return false; },
+      deleteProperty: function() { return false; },
+      preventExtensions: function() { return false; },
+      setPrototypeOf: function(inner, proto) {
+        return proto === Reflect.getPrototypeOf(inner);
       },
     }));
   }

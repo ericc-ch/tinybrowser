@@ -3,7 +3,8 @@
 use super::{INSTALL_COLLECTIONS_JS, collection_ids, host_node_id, live_collection, world, wrap_node};
 
 use rquickjs::{
-    Array, Ctx, Exception, Function, Object, Persistent, Result, Value, class::Trace, prelude::Func,
+    Array, Class, Ctx, Exception, Function, Object, Persistent, Result, Value, class::Trace,
+    prelude::Func,
 };
 
 use crate::js::world::Handle;
@@ -66,9 +67,11 @@ pub(crate) fn install_collection_brand(ctx: &Ctx<'_>) -> Result<()> {
     ctx.globals()
         .set("__tbWindowNamedValue", Func::from(window_named_value))?;
     ctx.globals()
-        .set("__tbWindowNamedNames", Func::from(window_named_names))?;
+        .set("__tbWindowNamedHas", Func::from(window_named_has))?;
     ctx.globals()
-        .set("__tbWindowNamedSerial", Func::from(window_named_serial))?;
+        .set("__tbCollectionNamed", Func::from(collection_named))?;
+    ctx.globals()
+        .set("__tbCollectionKeys", Func::from(collection_keys))?;
     ctx.eval::<(), _>(INSTALL_COLLECTIONS_JS)?;
     let ctor: Function = ctx.globals().get("HTMLCollection")?;
     let proto: Object = ctor.get("prototype")?;
@@ -148,61 +151,105 @@ fn window_named_value(ctx: Ctx<'_>, name: String) -> Result<Value<'_>> {
     clippy::needless_pass_by_value,
     reason = "rquickjs Func ABI passes arguments by value"
 )]
-/// The supported property names of the Window, in tree order with later
-/// duplicates ignored
+/// Whether `name` is a supported Window named-property name
 /// (<https://html.spec.whatwg.org/multipage/nav-history-apis.html#named-access-on-the-window-object>).
-fn window_named_names(ctx: Ctx<'_>) -> Result<Array<'_>> {
-    let array = Array::new(ctx.clone())?;
-    let document = world(&ctx)?.borrow().main_document_root();
-    let Some(document) = document else {
-        return Ok(array);
+fn window_named_has(ctx: Ctx<'_>, name: String) -> Result<bool> {
+    if name.is_empty() {
+        return Ok(false);
+    }
+    let world = world(&ctx)?;
+    let world = world.borrow();
+    let Some(mut parsed) = world.main_document_mut() else {
+        return Ok(false);
     };
-    let mut names: Vec<String> = Vec::new();
-    let mut seen: HashSet<String> = HashSet::new();
-    {
-        let world = world(&ctx)?;
-        let world = world.borrow();
-        let Some(parsed) = world.document(document) else {
-            return Ok(array);
-        };
-        for id in parsed.dom.descendants(document) {
-            let Some(NodeKind::Element { name, .. }) = parsed.dom.kind(id) else {
-                continue;
-            };
-            if let Some(element_id) = parsed.dom.no_namespace_attribute(id, "id")
-                && !element_id.is_empty()
-                && seen.insert(element_id.clone())
-            {
-                names.push(element_id);
-            }
-            // Only these HTML elements expose a `name` to the Window
-            // (<https://html.spec.whatwg.org/multipage/nav-history-apis.html#named-access-on-the-window-object>).
-            if name.ns == html_namespace()
-                && matches!(name.local.as_ref(), "embed" | "form" | "img" | "object")
-                && let Some(element_name) = parsed.dom.no_namespace_attribute(id, "name")
-                && !element_name.is_empty()
-                && seen.insert(element_name.clone())
-            {
-                names.push(element_name);
-            }
-        }
-    }
-    for (index, name) in names.iter().enumerate() {
-        array.set(index, name.as_str())?;
-    }
-    Ok(array)
+    Ok(parsed.dom.named_name_exists(&name))
 }
 
 #[expect(
     clippy::needless_pass_by_value,
     reason = "rquickjs Func ABI passes arguments by value"
 )]
-/// The document's mutation serial, so the shim can rebuild the name set only
-/// when the tree changed.
-fn window_named_serial(ctx: Ctx<'_>) -> Result<String> {
-    let serial = world(&ctx)?
-        .borrow()
-        .main_document()
-        .map_or(0, |parsed| parsed.dom.mutation_serial());
-    Ok(serial.to_string())
+/// The named item of an `HTMLCollection`: the first element whose id is
+/// `name`, or whose `name` attribute is `name` in the HTML namespace
+/// (<https://dom.spec.whatwg.org/#dom-htmlcollection-nameditem>).
+fn collection_named<'js>(ctx: Ctx<'js>, target: Value<'js>, name: String) -> Result<Value<'js>> {
+    if name.is_empty() {
+        return Ok(Value::new_null(ctx));
+    }
+    let Ok(collection) = Class::<JsCollection>::from_value(&target) else {
+        return Ok(Value::new_null(ctx));
+    };
+    let ids = {
+        let collection = collection.borrow();
+        collection_ids(&ctx, collection.scope.0, &collection.kind)?
+    };
+    for id in ids {
+        let matches = {
+            let world = world(&ctx)?;
+            let world = world.borrow();
+            let Some(parsed) = world.document(id) else {
+                return Ok(Value::new_null(ctx));
+            };
+            let id_matches =
+                parsed.dom.no_namespace_attribute(id, "id").as_deref() == Some(name.as_str());
+            let name_matches = matches!(
+                parsed.dom.kind(id),
+                Some(NodeKind::Element { name: qual, .. }) if qual.ns == html_namespace()
+            ) && parsed.dom.no_namespace_attribute(id, "name").as_deref() == Some(name.as_str());
+            id_matches || name_matches
+        };
+        if matches {
+            return wrap_node(&ctx, id);
+        }
+    }
+    Ok(Value::new_null(ctx))
+}
+
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "rquickjs Func ABI passes arguments by value"
+)]
+/// The named keys of an `HTMLCollection`, in tree order with later duplicates
+/// ignored (<https://dom.spec.whatwg.org/#interface-htmlcollection>).
+fn collection_keys<'js>(ctx: Ctx<'js>, target: Value<'js>) -> Result<Array<'js>> {
+    let array = Array::new(ctx.clone())?;
+    let Ok(collection) = Class::<JsCollection>::from_value(&target) else {
+        return Ok(array);
+    };
+    let ids = {
+        let collection = collection.borrow();
+        collection_ids(&ctx, collection.scope.0, &collection.kind)?
+    };
+    let mut keys: Vec<String> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    {
+        let world = world(&ctx)?;
+        let world = world.borrow();
+        for &id in &ids {
+            let Some(parsed) = world.document(id) else {
+                continue;
+            };
+            if let Some(element_id) = parsed.dom.no_namespace_attribute(id, "id")
+                && !element_id.is_empty()
+                && seen.insert(element_id.clone())
+            {
+                keys.push(element_id);
+            }
+            let exposes_name = matches!(
+                parsed.dom.kind(id),
+                Some(NodeKind::Element { name, .. }) if name.ns == html_namespace()
+            );
+            if exposes_name
+                && let Some(element_name) = parsed.dom.no_namespace_attribute(id, "name")
+                && !element_name.is_empty()
+                && seen.insert(element_name.clone())
+            {
+                keys.push(element_name);
+            }
+        }
+    }
+    for (index, key) in keys.iter().enumerate() {
+        array.set(index, key.as_str())?;
+    }
+    Ok(array)
 }

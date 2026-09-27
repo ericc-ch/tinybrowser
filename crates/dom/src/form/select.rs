@@ -5,18 +5,6 @@
 use crate::{Dom, NodeId, NodeKind, html_namespace};
 
 impl Dom {
-    /// The nearest ancestor `select` of `node` (including `node`), if any.
-    pub(crate) fn nearest_select_ancestor(&self, node: NodeId) -> Option<NodeId> {
-        let mut current = Some(node);
-        while let Some(candidate) = current {
-            if self.html_local_is(candidate, "select") {
-                return Some(candidate);
-            }
-            current = self.parent(candidate);
-        }
-        None
-    }
-
     /// A `select`'s display size: the `size` attribute, else 4 with `multiple`
     /// and 1 otherwise
     /// (<https://html.spec.whatwg.org/multipage/form-elements.html#the-select-element:display-size>).
@@ -117,6 +105,52 @@ impl Dom {
         }
     }
 
+    /// The `select` whose list of options contains `node`'s subtree, if any.
+    /// `node` is an `option` or `optgroup`; the walk stops at the boundaries
+    /// the list-of-options algorithm excludes
+    /// (<https://html.spec.whatwg.org/multipage/form-elements.html#concept-select-option-list>).
+    #[must_use]
+    pub fn node_list_owner(&self, node: NodeId) -> Option<NodeId> {
+        let mut current = self.parent(node);
+        let mut inside_optgroup = false;
+        while let Some(ancestor) = current {
+            if self.html_local_is(ancestor, "select") {
+                return Some(ancestor);
+            }
+            if self.html_local_is(ancestor, "option")
+                || self.html_local_is(ancestor, "hr")
+                || self.html_local_is(ancestor, "datalist")
+            {
+                return None;
+            }
+            if self.html_local_is(ancestor, "optgroup") {
+                if inside_optgroup {
+                    return None;
+                }
+                inside_optgroup = true;
+            }
+            current = self.parent(ancestor);
+        }
+        None
+    }
+
+    /// The `select` whose list of options gains the inserted `option` or
+    /// `optgroup` subtree, if any. An `optgroup` contributes through its
+    /// descendant options, so a doubly nested group resolves to no select.
+    #[must_use]
+    pub(crate) fn inserted_list_owner(&self, node: NodeId) -> Option<NodeId> {
+        if self.html_local_is(node, "option") {
+            return self.option_select_owner(node);
+        }
+        if self.html_local_is(node, "optgroup") {
+            return self
+                .descendants(node)
+                .filter(|&id| self.html_local_is(id, "option"))
+                .find_map(|option| self.option_select_owner(option));
+        }
+        None
+    }
+
     /// The `select` whose list of options contains this `option`, if any
     /// (<https://html.spec.whatwg.org/multipage/form-elements.html#concept-select-option-list>).
     #[must_use]
@@ -124,33 +158,16 @@ impl Dom {
         if !self.html_local_is(option, "option") {
             return None;
         }
-        let mut current = self.parent(option);
-        let mut inside_optgroup = false;
-        while let Some(node) = current {
-            if self.html_local_is(node, "select") {
-                return Some(node);
-            }
-            if self.html_local_is(node, "option")
-                || self.html_local_is(node, "hr")
-                || self.html_local_is(node, "datalist")
-            {
-                return None;
-            }
-            if self.html_local_is(node, "optgroup") {
-                if inside_optgroup {
-                    return None;
-                }
-                inside_optgroup = true;
-            }
-            current = self.parent(node);
-        }
-        None
+        self.node_list_owner(option)
     }
 
     /// The single-select rule for an option joining a list of options: when an
     /// option whose selectedness is true is added, every other option's
-    /// selectedness becomes false
-    /// (<https://html.spec.whatwg.org/multipage/form-elements.html#the-select-element>).
+    /// selectedness becomes false. The prose near
+    /// <https://html.spec.whatwg.org/multipage/form-elements.html#the-select-element>
+    /// states this rule, but the selectedness setting algorithm's keep-last
+    /// step would contradict it; WPT `inserted-or-removed.html` and Chromium's
+    /// `DeselectItemsWithoutValidation` follow this rule, so this does too.
     pub(crate) fn option_added_to_select(&mut self, option: NodeId) {
         let Some(select) = self.option_select_owner(option) else {
             return;

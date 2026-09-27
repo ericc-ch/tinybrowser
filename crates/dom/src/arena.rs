@@ -217,6 +217,10 @@ pub struct Dom {
     connected_iframes: u32,
     /// Bumped by every mutation; see [`Dom::mutation_serial`].
     mutation_serial: u64,
+    /// Window named-property names, seeded on first use then grown by
+    /// [`Dom::record`]; see [`Dom::named_name_exists`].
+    pub(crate) named_names: HashSet<String>,
+    pub(crate) named_names_seeded: bool,
     /// `Cell<()>` is `Send` + `!Sync`; `PhantomData` makes `Dom` inherit
     /// exactly that split. Deleting this field would silently re-derive
     /// `Sync`, which is the point: that deletion has to be a conscious act.
@@ -318,6 +322,8 @@ impl Dom {
             lifecycle: Vec::new(),
             connected_iframes: 0,
             mutation_serial: 0,
+            named_names: HashSet::new(),
+            named_names_seeded: false,
             _share_forbidden: PhantomData,
         }
     }
@@ -513,6 +519,9 @@ impl Dom {
         // Bumped even while recording is suppressed: the tree changed, and
         // the renderer's frame-order cache keys off this serial.
         self.mutation_serial = self.mutation_serial.wrapping_add(1);
+        if self.named_names_seeded {
+            self.index_named_names(&mutation);
+        }
         if self.record_mutations && !self.recording_suppressed {
             self.mutations.push(mutation);
         }
@@ -2221,13 +2230,12 @@ impl Dom {
         }
         // An option joining a select follows the option insertion steps: a
         // selected option clears the others, then the selectedness setting
-        // algorithm supplies the default when nothing is selected.
+        // algorithm supplies the default when nothing is selected. Only a
+        // select whose list of options actually gained the node runs it.
         if self.html_local_is(node, "option") {
             self.option_added_to_select(node);
         }
-        if (self.html_local_is(node, "option") || self.html_local_is(node, "optgroup"))
-            && let Some(select) = self.nearest_select_ancestor(node)
-        {
+        if let Some(select) = self.inserted_list_owner(node) {
             self.apply_default_selectedness(select);
         }
     }
@@ -2335,9 +2343,7 @@ impl Dom {
                 if self.html_local_is(id, "option") {
                     self.option_added_to_select(id);
                 }
-                if (self.html_local_is(id, "option") || self.html_local_is(id, "optgroup"))
-                    && let Some(select) = self.nearest_select_ancestor(id)
-                {
+                if let Some(select) = self.inserted_list_owner(id) {
                     self.apply_default_selectedness(select);
                 }
             }
@@ -2478,11 +2484,7 @@ impl Dom {
         }) else {
             return;
         };
-        let select = if self.html_local_is(id, "option") || self.html_local_is(id, "optgroup") {
-            self.nearest_select_ancestor(id)
-        } else {
-            None
-        };
+        let select = self.inserted_list_owner(id);
         let value_before = self.textarea_value_before_change(parent);
         if let Some(previous) = previous {
             self.node_mut(previous)
