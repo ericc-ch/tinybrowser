@@ -2,9 +2,9 @@
 //! selectedness setting algorithm, and the `select` value/index IDL
 //! (<https://html.spec.whatwg.org/multipage/form-elements.html#the-select-element>).
 
-use crate::{Dom, DomError, LocalName, NodeId, NodeKind, QualName, html_namespace};
+use crate::{Document, DomError, LocalName, NodeId, NodeKind, QualName, html_namespace};
 
-impl Dom {
+impl Document {
     /// Appends blank options as one tree mutation, then applies the select's
     /// selectedness setting algorithm
     /// (<https://html.spec.whatwg.org/multipage/common-dom-interfaces.html#append-new-option-elements>).

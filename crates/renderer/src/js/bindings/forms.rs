@@ -170,7 +170,7 @@ fn collect_pending_entries(
 
 /// Whether `node` has a `datalist` ancestor, which bars it from the entry list
 /// (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#constructing-form-data-set>).
-fn has_datalist_ancestor(document: &dom::Dom, node: NodeId) -> bool {
+fn has_datalist_ancestor(document: &dom::Document, node: NodeId) -> bool {
     document.ancestors(node).any(|ancestor| {
         matches!(
             document.kind(ancestor),
@@ -184,7 +184,7 @@ fn has_datalist_ancestor(document: &dom::Dom, node: NodeId) -> bool {
 /// multiple `select`) several
 /// (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#constructing-form-data-set>).
 fn pending_entry(
-    dom: &dom::Dom,
+    dom: &dom::Document,
     node: NodeId,
     local: &str,
     control_name: String,

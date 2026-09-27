@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use super::{Dom, NodeId, QuirksMode};
+use super::{Document, NodeId, QuirksMode};
 
 #[derive(Debug, Default)]
 pub(super) struct Metadata {
@@ -25,7 +25,7 @@ impl Metadata {
     }
 }
 
-impl Dom {
+impl Document {
     /// Compatibility mode this document answers selector queries under.
     #[must_use]
     pub fn quirks_mode(&self) -> QuirksMode {

@@ -1,4 +1,4 @@
-use dom::{Attribute, Dom, DomError, Lifecycle, LocalName, Namespace, NodeId, NodeKind, QualName};
+use dom::{Attribute, Document, DomError, Lifecycle, LocalName, Namespace, NodeId, NodeKind, QualName};
 
 const HTML_NS: &str = "http://www.w3.org/1999/xhtml";
 
@@ -100,7 +100,7 @@ fn roll(state: &mut u64, limit: usize) -> usize {
         .expect("choice fits usize")
 }
 
-fn assert_matches(dom: &Dom, document: NodeId, handles: &[NodeId], model: &Model) {
+fn assert_matches(dom: &Document, document: NodeId, handles: &[NodeId], model: &Model) {
     for (index, &handle) in handles.iter().enumerate() {
         assert_eq!(dom.contains(handle), model.alive[index], "liveness {index}");
         if !model.alive[index] {
@@ -160,9 +160,9 @@ fn assert_matches(dom: &Dom, document: NodeId, handles: &[NodeId], model: &Model
 #[test]
 fn mutations_match_an_independent_tree_model() {
     fn assert_send<T: Send>() {}
-    assert_send::<Dom>();
+    assert_send::<Document>();
 
-    let mut dom = Dom::new();
+    let mut dom = Document::new();
     let document = dom.document();
     let root = dom.create_element(qn("root"), Vec::new());
     dom.append(document, root).expect("root");
@@ -240,7 +240,7 @@ fn mutations_match_an_independent_tree_model() {
 
 #[test]
 fn document_fragments_templates_and_clones_keep_their_contracts() {
-    let mut dom = Dom::new();
+    let mut dom = Document::new();
     let document = dom.document();
     let doctype = dom.create_doctype("html", "", "");
     let html = dom.create_element(qn("html"), Vec::new());
@@ -307,13 +307,13 @@ fn document_fragments_templates_and_clones_keep_their_contracts() {
         Some(NodeKind::Element { attributes, .. }) if attributes[0].value == "first"
     ));
 
-    let other = Dom::new();
+    let other = Document::new();
     assert_eq!(dom.append(html, other.document()), Err(DomError::StaleNode));
 }
 
 #[test]
 fn connection_transitions_record_lifecycle_events() {
-    let mut dom = Dom::new();
+    let mut dom = Document::new();
     let root = dom.document();
     let html = dom.create_element(qn("html"), Vec::new());
     let body = dom.create_element(qn("body"), Vec::new());
@@ -348,7 +348,7 @@ fn connection_transitions_record_lifecycle_events() {
 
 #[test]
 fn img_connection_transitions_record_lifecycle_events() {
-    let mut dom = Dom::new();
+    let mut dom = Document::new();
     let root = dom.document();
     let html = dom.create_element(qn("html"), Vec::new());
     let body = dom.create_element(qn("body"), Vec::new());
@@ -367,7 +367,7 @@ fn img_connection_transitions_record_lifecycle_events() {
 
 #[test]
 fn connected_iframes_survive_replace_and_report_destroy() {
-    let mut dom = Dom::new();
+    let mut dom = Document::new();
     let document = dom.document();
     let root = dom.create_element(qn("root"), Vec::new());
     let holder = dom.create_element(qn("holder"), Vec::new());
@@ -405,7 +405,7 @@ fn connected_iframes_survive_replace_and_report_destroy() {
 
 #[test]
 fn replacement_reports_removal_before_insertion() {
-    let mut dom = Dom::new();
+    let mut dom = Document::new();
     let document = dom.document();
     let root = dom.create_element(qn("root"), Vec::new());
     dom.append(document, root).expect("root");
@@ -434,7 +434,7 @@ fn replacement_reports_removal_before_insertion() {
 
 /// Asserts the intrusive links of `parent` match `expected` exactly: the
 /// child run, its endpoints, and every neighbour in both directions.
-fn assert_links(dom: &Dom, parent: NodeId, expected: &[NodeId]) {
+fn assert_links(dom: &Document, parent: NodeId, expected: &[NodeId]) {
     assert_eq!(
         dom.children(parent)
             .expect("live parent")
@@ -464,7 +464,7 @@ fn assert_links(dom: &Dom, parent: NodeId, expected: &[NodeId]) {
 
 #[test]
 fn bulk_moves_keep_the_link_invariant() {
-    let mut dom = Dom::new();
+    let mut dom = Document::new();
     let wrapper = dom.create_element(qn("wrapper"), Vec::new());
     let host = dom.create_element(qn("host"), Vec::new());
     let dest = dom.create_element(qn("dest"), Vec::new());
@@ -554,7 +554,7 @@ fn bulk_moves_keep_the_link_invariant() {
 
 #[test]
 fn child_iteration_covers_each_child_once_across_both_directions() {
-    let mut dom = Dom::new();
+    let mut dom = Document::new();
     let document = dom.document();
     let root = dom.create_element(qn("root"), Vec::new());
     dom.append(document, root).expect("root");

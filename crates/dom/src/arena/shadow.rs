@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use super::{Dom, DomError, NodeId, NodeKind, html_namespace};
+use super::{Document, DomError, NodeId, NodeKind, html_namespace};
 
 #[derive(Debug, Default)]
 pub(super) struct ShadowState {
@@ -39,7 +39,7 @@ impl ShadowState {
     }
 }
 
-impl Dom {
+impl Document {
     pub(super) fn is_html_slot(&self, id: NodeId) -> bool {
         matches!(
             self.kind(id),

@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 
-use dom::{Dom, NodeId};
+use dom::{Document, NodeId};
 use kurbo::{BezPath, PathEl};
 use tiny_skia::{PathBuilder, Transform};
 
@@ -17,7 +17,7 @@ use crate::render::paint::Painter;
 use crate::render::style::{Dimension, Display, Length, Style, Visibility};
 
 /// Whether `node` is an outer SVG viewport element.
-pub(crate) fn is_outer_svg(dom: &Dom, node: NodeId) -> bool {
+pub(crate) fn is_outer_svg(dom: &Document, node: NodeId) -> bool {
     matches!(
         dom.kind(node),
         Some(dom::NodeKind::Element { name, .. })
@@ -27,7 +27,7 @@ pub(crate) fn is_outer_svg(dom: &Dom, node: NodeId) -> bool {
 
 /// Applies outer SVG intrinsic dimensions to its replaced CSS box
 /// (<https://svgwg.org/svg2-draft/coords.html#SizingSVGInCSS>).
-pub(crate) fn apply_dimensions(dom: &Dom, node: NodeId, style: &mut Style) {
+pub(crate) fn apply_dimensions(dom: &Document, node: NodeId, style: &mut Style) {
     let viewport = view_box(dom, node);
     let width = positive_length(dom.attribute(node, "width").as_deref());
     let height = positive_length(dom.attribute(node, "height").as_deref());
@@ -55,7 +55,7 @@ pub(crate) fn apply_dimensions(dom: &Dom, node: NodeId, style: &mut Style) {
 /// and the CSS default object size 300×150
 /// (<https://svgwg.org/svg2-draft/coords.html#SizingSVGInCSS>,
 /// <https://drafts.csswg.org/css-images-3/#default-sizing>).
-pub(crate) fn rasterize(dom: &Dom, root: NodeId) -> Option<RasterImage> {
+pub(crate) fn rasterize(dom: &Document, root: NodeId) -> Option<RasterImage> {
     let mut style = Style::initial();
     apply_dimensions(dom, root, &mut style);
     let (width, height) = replaced_natural_size(
@@ -145,7 +145,7 @@ fn device_side(value: f32) -> Option<u32> {
 /// (<https://svgwg.org/svg2-draft/render.html#RenderingOrder>).
 pub(crate) fn paint(
     painter: &mut Painter,
-    dom: &Dom,
+    dom: &Document,
     styles: &HashMap<NodeId, Style>,
     root: NodeId,
     destination: Rect,
@@ -174,7 +174,7 @@ pub(crate) fn paint(
 
 fn paint_children(
     painter: &mut Painter,
-    dom: &Dom,
+    dom: &Document,
     styles: &HashMap<NodeId, Style>,
     parent: NodeId,
     viewport: ViewBox,
@@ -252,7 +252,7 @@ fn path(data: &str) -> Option<tiny_skia::Path> {
     builder.finish()
 }
 
-fn rectangle(dom: &Dom, node: NodeId, viewport: ViewBox) -> Option<tiny_skia::Path> {
+fn rectangle(dom: &Document, node: NodeId, viewport: ViewBox) -> Option<tiny_skia::Path> {
     let x = coordinate(dom.attribute(node, "x").as_deref(), viewport.width).unwrap_or(0.0);
     let y = coordinate(dom.attribute(node, "y").as_deref(), viewport.height).unwrap_or(0.0);
     let width = coordinate(dom.attribute(node, "width").as_deref(), viewport.width)?;
@@ -300,7 +300,7 @@ struct ViewBox {
     height: f32,
 }
 
-fn view_box(dom: &Dom, node: NodeId) -> Option<ViewBox> {
+fn view_box(dom: &Document, node: NodeId) -> Option<ViewBox> {
     let value = dom.attribute(node, "viewBox")?;
     let mut values = value
         .split(|character: char| character == ',' || character.is_ascii_whitespace())

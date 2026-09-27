@@ -72,7 +72,7 @@ pub(crate) fn is_focusable(ctx: &Ctx<'_>, node: NodeId) -> Result<bool> {
 /// supports, including descendants of a disabled `fieldset` that are not
 /// inside its first `legend`
 /// (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#concept-fe-disabled>).
-fn is_actually_disabled(dom: &dom::Dom, node: NodeId) -> bool {
+fn is_actually_disabled(dom: &dom::Document, node: NodeId) -> bool {
     if dom.attribute(node, "disabled").is_some()
         && matches!(
             node_local_name(dom, node).as_deref(),
@@ -111,7 +111,7 @@ fn is_actually_disabled(dom: &dom::Dom, node: NodeId) -> bool {
 /// inheriting the value from ancestors. Only `""`, `true`, and
 /// `plaintext-only` enable editing
 /// (<https://html.spec.whatwg.org/multipage/interaction.html#attr-contenteditable>).
-fn is_editable(dom: &dom::Dom, node: NodeId) -> bool {
+fn is_editable(dom: &dom::Document, node: NodeId) -> bool {
     let mut cursor = Some(node);
     while let Some(current) = cursor {
         if let Some(value) = dom.attribute(current, "contenteditable") {
@@ -130,12 +130,12 @@ fn is_editable(dom: &dom::Dom, node: NodeId) -> bool {
     false
 }
 
-fn is_hidden_input(dom: &dom::Dom, node: NodeId) -> bool {
+fn is_hidden_input(dom: &dom::Document, node: NodeId) -> bool {
     dom.attribute(node, "type")
         .is_some_and(|kind| kind.eq_ignore_ascii_case("hidden"))
 }
 
-fn node_local_name(dom: &dom::Dom, node: NodeId) -> Option<String> {
+fn node_local_name(dom: &dom::Document, node: NodeId) -> Option<String> {
     match dom.kind(node) {
         Some(NodeKind::Element { name, .. }) if name.ns == html_namespace() => {
             Some(name.local.to_string())
@@ -456,7 +456,7 @@ fn run_activation(ctx: &Ctx<'_>, node: NodeId) -> Result<()> {
         if name.ns != html_namespace() {
             return Ok(());
         }
-        let type_attr = |dom: &dom::Dom| {
+        let type_attr = |dom: &dom::Document| {
             dom.attribute(node, "type")
                 .map(|value| value.trim().to_ascii_lowercase())
         };

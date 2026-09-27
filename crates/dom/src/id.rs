@@ -1,6 +1,6 @@
 //! Node identity: copyable handles into the arena.
 
-/// Handle to one node in a [`crate::Dom`].
+/// Handle to one node in a [`crate::Document`].
 ///
 /// A `NodeId` is three integers: which document it was issued by, which slot
 /// of that arena to look in, and which generation of that slot. Destroying a
@@ -10,7 +10,7 @@
 /// happens to share slot and generation.
 ///
 /// Copy it freely, store it anywhere, hand it to JavaScript. The only
-/// thing you can do with it is pass it back to the [`crate::Dom`] it came from.
+/// thing you can do with it is pass it back to the [`crate::Document`] it came from.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct NodeId {
     pub(crate) document: u32,

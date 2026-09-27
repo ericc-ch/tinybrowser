@@ -19,7 +19,7 @@
 use std::fmt;
 
 use dom::{
-    Attribute, Dom, LocalName, Namespace, NodeId, NodeKind, QualName, html_namespace,
+    Attribute, Document, LocalName, Namespace, NodeId, NodeKind, QualName, html_namespace,
     svg_namespace, xlink_namespace, xml_namespace, xmlns_namespace,
 };
 
@@ -34,7 +34,7 @@ const MATHML_NS: &str = "http://www.w3.org/1998/Math/MathML";
 /// the HTML fragment serialization algorithm.
 ///
 /// <https://html.spec.whatwg.org/multipage/parsing.html#serialising-html-fragments>
-pub(crate) fn serialize_html_fragment(dom: &Dom, element: NodeId) -> String {
+pub(crate) fn serialize_html_fragment(dom: &Document, element: NodeId) -> String {
     let root = dom.template_contents(element).unwrap_or(element);
     let parent = match dom.kind(element) {
         Some(NodeKind::Element { name, .. }) => Some((name.ns.clone(), name.local.clone())),
@@ -54,7 +54,7 @@ pub(crate) fn serialize_html_fragment(dom: &Dom, element: NodeId) -> String {
 
 /// Serializes one element with the HTML fragment serialization algorithm.
 pub(crate) fn serialize_html_element(
-    dom: &Dom,
+    dom: &Document,
     id: NodeId,
     name: &QualName,
     attributes: &[Attribute],
@@ -85,7 +85,7 @@ pub(crate) fn serialize_html_element(
 }
 
 fn serialize_html_node(
-    dom: &Dom,
+    dom: &Document,
     id: NodeId,
     parent: Option<(&Namespace, &LocalName)>,
     output: &mut String,
@@ -260,7 +260,7 @@ impl std::error::Error for XmlSerializeError {}
 ///
 /// <https://w3c.github.io/DOM-Parsing/#xml-serialization>
 pub(crate) fn serialize_xml(
-    dom: &Dom,
+    dom: &Document,
     node: NodeId,
     require_well_formed: bool,
 ) -> Result<String, XmlSerializeError> {
@@ -272,7 +272,7 @@ pub(crate) fn serialize_xml(
 /// XML-serializes the children of `parent` with no namespace in scope,
 /// the entry point `innerHTML` uses on XML documents.
 pub(crate) fn serialize_xml_children(
-    dom: &Dom,
+    dom: &Document,
     parent: NodeId,
     require_well_formed: bool,
 ) -> Result<String, XmlSerializeError> {
@@ -288,7 +288,7 @@ pub(crate) fn serialize_xml_children(
 /// initial prefix map of every entry point
 /// (<https://w3c.github.io/DOM-Parsing/#dfn-xml-serialization-algorithm>).
 fn serialize_in_context(
-    dom: &Dom,
+    dom: &Document,
     require_well_formed: bool,
     write: impl FnOnce(&mut XmlSerializer<'_>, &PrefixMap, &mut String) -> Result<(), XmlSerializeError>,
 ) -> Result<String, XmlSerializeError> {
@@ -316,13 +316,13 @@ enum DefaultDeclarationHandling {
 }
 
 struct XmlSerializer<'a> {
-    dom: &'a Dom,
+    dom: &'a Document,
     require_well_formed: bool,
     prefix_index: u32,
 }
 
 impl<'a> XmlSerializer<'a> {
-    fn new(dom: &'a Dom, require_well_formed: bool) -> Self {
+    fn new(dom: &'a Document, require_well_formed: bool) -> Self {
         Self {
             dom,
             require_well_formed,
@@ -819,13 +819,13 @@ fn push_xml_identifier(output: &mut String, identifier: &str) {
     output.push(quote);
 }
 
-fn has_document_element(dom: &Dom, document: NodeId) -> bool {
+fn has_document_element(dom: &Document, document: NodeId) -> bool {
     children(dom, document)
         .into_iter()
         .any(|child| matches!(dom.kind(child), Some(NodeKind::Element { .. })))
 }
 
-fn children(dom: &Dom, parent: NodeId) -> Vec<NodeId> {
+fn children(dom: &Document, parent: NodeId) -> Vec<NodeId> {
     dom.children(parent)
         .map(Iterator::collect)
         .unwrap_or_default()

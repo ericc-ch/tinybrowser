@@ -1,9 +1,10 @@
-//! Page engine for one document — HTML parser, `Dom`, `QuickJS` — behind the
-//! value-only browser seam.
+//! Page engine for one document: the HTML parser, `dom::Document`, and `QuickJS`
+//! behind a value-only browser interface.
 //!
-//! The engine owns `Document` and never links `net`; the browser process owns
-//! the tab, navigation, the network, and cookies. Style, layout, and paint live
-//! in the `render` module: one-shot screenshot and geometry (Blink `core/css`,
+//! The engine owns the frame actor (`document::Document`) and never links `net`.
+//! The browser process owns the tab, navigation, the network, and cookies.
+//! Style, layout, and paint live in the `render` module: one-shot screenshot
+//! and geometry (Blink `core/css`,
 //! `core/layout`, `core/paint`). A carrier drives this crate: the browser's
 //! child transport on a native build, the WebAssembly component on a wasm
 //! build. Both feed the same [`Engine`], and both implement [`BrowserServices`]
@@ -61,8 +62,8 @@ pub(crate) enum ReadyState {
 /// The result of parsing one document.
 #[derive(Debug)]
 pub(crate) struct Parsed {
-    /// The parsed tree, rooted at [`Dom::document`].
-    pub dom: dom::Dom,
+    /// The parsed tree, rooted at [`dom::Document::document`].
+    pub dom: dom::Document,
     /// Compatibility mode selected by the doctype (or its absence).
     pub quirks_mode: QuirksMode,
     /// MIME type this document reports from `document.contentType`.
@@ -82,7 +83,7 @@ impl Parsed {
     /// like the ones script constructors create.
     pub(crate) fn empty(content_type: &'static str) -> Self {
         Self {
-            dom: dom::Dom::new(),
+            dom: dom::Document::new(),
             quirks_mode: QuirksMode::NoQuirks,
             content_type,
             ready_state: ReadyState::Complete,
@@ -161,7 +162,7 @@ impl ActiveParser {
     }
 }
 
-/// Parses a full HTML document into a fresh [`dom::Dom`] with the scripting
+/// Parses a full HTML document into a fresh [`dom::Document`] with the scripting
 /// flag enabled (the browser default).
 ///
 /// Broken markup is recovered exactly the way the HTML spec, and therefore
@@ -215,13 +216,13 @@ fn fragment_context_name(spec: &str) -> QualName {
 // ── the sink ────────────────────────────────────────────────────────────────
 
 struct Sink {
-    // `TreeSink` 0.39 hands out `&self`, while every `dom::Dom` mutation needs
+    // `TreeSink` 0.39 hands out `&self`, while every `dom::Document` mutation needs
     // `&mut self`; hence interior mutability at this one boundary. Sound
     // because the driver is single-threaded and never reenters the sink in
     // the middle of another call: borrows are short, sequential, and cannot
     // overlap. If one ever did overlap, that is an adapter bug and the
     // `RefCell` panics loudly rather than corrupting the tree.
-    dom: RefCell<dom::Dom>,
+    dom: RefCell<dom::Document>,
     quirks_mode: Cell<QuirksMode>,
     /// Elements the tree builder flagged as
     /// [HTML integration points](https://html.spec.whatwg.org/multipage/parsing.html#html-integration-point):
@@ -239,7 +240,7 @@ struct Sink {
 impl Sink {
     fn new() -> Self {
         Self {
-            dom: RefCell::new(dom::Dom::new()),
+            dom: RefCell::new(dom::Document::new()),
             quirks_mode: Cell::new(QuirksMode::NoQuirks),
             integration_points: RefCell::new(HashSet::new()),
             current_line: Cell::new(0),
@@ -248,7 +249,7 @@ impl Sink {
 
     fn take_state(&self) -> Parsed {
         Parsed {
-            dom: std::mem::replace(&mut *self.dom.borrow_mut(), dom::Dom::new()),
+            dom: std::mem::replace(&mut *self.dom.borrow_mut(), dom::Document::new()),
             quirks_mode: self.quirks_mode.get(),
             content_type: "text/html",
             ready_state: ReadyState::Loading,
@@ -508,7 +509,7 @@ impl TreeSink for Sink {
     }
 }
 
-fn is_html_named(dom: &dom::Dom, id: Handle, local: &str) -> bool {
+fn is_html_named(dom: &dom::Document, id: Handle, local: &str) -> bool {
     match dom.kind(id) {
         Some(NodeKind::Element { name, .. }) => {
             name.ns == html_namespace() && name.local.as_ref().eq_ignore_ascii_case(local)
@@ -517,7 +518,7 @@ fn is_html_named(dom: &dom::Dom, id: Handle, local: &str) -> bool {
     }
 }
 
-fn html_bool_attr(dom: &dom::Dom, id: Handle, local: &str) -> bool {
+fn html_bool_attr(dom: &dom::Document, id: Handle, local: &str) -> bool {
     match dom.kind(id) {
         Some(NodeKind::Element { attributes, .. }) => attributes.iter().any(|attribute| {
             attribute.name.ns.is_empty()
@@ -527,7 +528,7 @@ fn html_bool_attr(dom: &dom::Dom, id: Handle, local: &str) -> bool {
     }
 }
 
-fn html_attr_value(dom: &dom::Dom, id: Handle, local: &str) -> Option<String> {
+fn html_attr_value(dom: &dom::Document, id: Handle, local: &str) -> Option<String> {
     match dom.kind(id) {
         Some(NodeKind::Element { attributes, .. }) => attributes.iter().find_map(|attribute| {
             (attribute.name.ns.is_empty()
@@ -538,7 +539,7 @@ fn html_attr_value(dom: &dom::Dom, id: Handle, local: &str) -> Option<String> {
     }
 }
 
-fn nearest_html_select(dom: &dom::Dom, mut id: Handle) -> Option<Handle> {
+fn nearest_html_select(dom: &dom::Document, mut id: Handle) -> Option<Handle> {
     loop {
         id = dom.parent(id)?;
         if is_html_named(dom, id, "select") {
@@ -548,7 +549,7 @@ fn nearest_html_select(dom: &dom::Dom, mut id: Handle) -> Option<Handle> {
 }
 
 /// [Select display size](https://html.spec.whatwg.org/multipage/form-elements.html#concept-select-size).
-fn select_display_size(dom: &dom::Dom, select: Handle) -> u32 {
+fn select_display_size(dom: &dom::Document, select: Handle) -> u32 {
     if let Some(raw) = html_attr_value(dom, select, "size")
         && let Ok(size) = raw.trim().parse::<u32>()
         && size > 0
@@ -563,7 +564,7 @@ fn select_display_size(dom: &dom::Dom, select: Handle) -> u32 {
 }
 
 /// [List of options](https://html.spec.whatwg.org/multipage/form-elements.html#concept-select-option-list).
-fn html_list_of_options(dom: &dom::Dom, select: Handle) -> Vec<Handle> {
+fn html_list_of_options(dom: &dom::Document, select: Handle) -> Vec<Handle> {
     let mut out = Vec::new();
     let Some(kids) = dom.children(select) else {
         return out;
@@ -584,7 +585,7 @@ fn html_list_of_options(dom: &dom::Dom, select: Handle) -> Vec<Handle> {
     out
 }
 
-fn option_is_disabled(dom: &dom::Dom, option: Handle) -> bool {
+fn option_is_disabled(dom: &dom::Document, option: Handle) -> bool {
     if html_bool_attr(dom, option, "disabled") {
         return true;
     }
@@ -596,7 +597,7 @@ fn option_is_disabled(dom: &dom::Dom, option: Handle) -> bool {
 
 /// Parse-time [selectedness](https://html.spec.whatwg.org/multipage/form-elements.html#concept-option-selectedness)
 /// plus the [selectedness setting algorithm](https://html.spec.whatwg.org/multipage/form-elements.html#selectedness-setting-algorithm).
-fn option_is_selected(dom: &dom::Dom, option: Handle, select: Handle) -> bool {
+fn option_is_selected(dom: &dom::Document, option: Handle, select: Handle) -> bool {
     let options = html_list_of_options(dom, select);
     if html_bool_attr(dom, select, "multiple") {
         return options.contains(&option) && html_bool_attr(dom, option, "selected");
@@ -613,7 +614,7 @@ fn option_is_selected(dom: &dom::Dom, option: Handle, select: Handle) -> bool {
 }
 
 /// [Enabled selectedcontent](https://html.spec.whatwg.org/multipage/form-elements.html#get-a-select-s-enabled-selectedcontent).
-fn enabled_selectedcontent(dom: &dom::Dom, select: Handle) -> Option<Handle> {
+fn enabled_selectedcontent(dom: &dom::Document, select: Handle) -> Option<Handle> {
     if html_bool_attr(dom, select, "multiple") {
         return None;
     }
@@ -640,7 +641,7 @@ fn enabled_selectedcontent(dom: &dom::Dom, select: Handle) -> Option<Handle> {
 }
 
 /// [Clone an option into a selectedcontent](https://html.spec.whatwg.org/multipage/form-elements.html#clone-an-option-into-a-selectedcontent).
-fn clone_option_into_selectedcontent(dom: &mut dom::Dom, option: Handle, selectedcontent: Handle) {
+fn clone_option_into_selectedcontent(dom: &mut dom::Document, option: Handle, selectedcontent: Handle) {
     let stale: Vec<Handle> = dom
         .children(selectedcontent)
         .map(Iterator::collect)

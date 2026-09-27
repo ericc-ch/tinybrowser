@@ -3,7 +3,7 @@
 //! (`css/selectors/`), not here (AGENTS.md).
 
 use dom::{
-    Attribute, Dom, LocalName, Namespace, NodeId, ParseFailKind, QualName, SelectError,
+    Attribute, Document, LocalName, Namespace, NodeId, ParseFailKind, QualName, SelectError,
     html_namespace, selector,
 };
 
@@ -18,7 +18,7 @@ fn attr(name: &str, value: &str) -> Attribute {
     }
 }
 
-fn append_element(dom: &mut Dom, parent: NodeId, name: &str, attrs: Vec<Attribute>) -> NodeId {
+fn append_element(dom: &mut Document, parent: NodeId, name: &str, attrs: Vec<Attribute>) -> NodeId {
     let element = dom.create_element(qn(name), attrs);
     dom.append(parent, element).expect("fixture append");
     element
@@ -26,7 +26,7 @@ fn append_element(dom: &mut Dom, parent: NodeId, name: &str, attrs: Vec<Attribut
 
 #[test]
 fn selector_queries_observe_the_public_tree_boundary() {
-    let mut dom = Dom::new();
+    let mut dom = Document::new();
     let document = dom.document();
     let html = append_element(&mut dom, document, "html", Vec::new());
     let body = append_element(&mut dom, html, "body", Vec::new());

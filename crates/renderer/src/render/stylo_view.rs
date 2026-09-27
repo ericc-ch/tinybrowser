@@ -1,7 +1,7 @@
 //! Stylo's view of our DOM.
 //!
 //! Servo's style engine is written against its own `TElement`/`TNode`
-//! traits, so this module wraps our immutable [`dom::Dom`] in per-pass node
+//! traits, so this module wraps our immutable [`dom::Document`] in per-pass node
 //! records and hands out borrowed handles. It mirrors `dom/src/select.rs`
 //! (same tree, same state policy) but against Stylo's `SelectorImpl` and
 //! node traits.
@@ -23,7 +23,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 
-use dom::{Dom, NodeId};
+use dom::{Document, NodeId};
 use selectors::attr::{AttrSelectorOperation, NamespaceConstraint};
 use selectors::matching::ElementSelectorFlags;
 use style::data::{ElementData, ElementDataMut, ElementDataRef, ElementDataWrapper};
@@ -98,7 +98,7 @@ impl StyloTables {
 /// handles behind cells (filled after every record exists).
 pub(crate) struct StyloNode<'a> {
     /// The tree.
-    pub(crate) dom: &'a Dom,
+    pub(crate) dom: &'a Document,
     /// This node.
     pub(crate) id: NodeId,
     /// The pass's side tables.
@@ -147,7 +147,7 @@ impl<'a> StyloNode<'a> {
     /// The caller owns the returned `Vec` for the whole pass, borrows it,
     /// and calls [`StyloNode::fill_neighbors`] with that borrow so the cells
     /// can point at other records.
-    pub(crate) fn build_all(dom: &'a Dom, tables: &'a StyloTables) -> Vec<StyloNode<'a>> {
+    pub(crate) fn build_all(dom: &'a Document, tables: &'a StyloTables) -> Vec<StyloNode<'a>> {
         let document = dom.document();
         let descendants = dom.rendered_descendants(document);
         std::iter::once(document)

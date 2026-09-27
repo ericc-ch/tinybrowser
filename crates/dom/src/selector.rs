@@ -44,7 +44,7 @@ use selectors::{
     },
 };
 
-use crate::arena::{Dom, QuirksMode};
+use crate::arena::{Document, QuirksMode};
 use crate::id::NodeId;
 use crate::node::{Attribute, NodeKind};
 use crate::state;
@@ -650,15 +650,15 @@ impl From<SelectorParseErrorKind<'_>> for ParseFail {
 
 // ── Element view ────────────────────────────────────────────────────────────
 
-/// One live element as the engine sees it: a borrowed [`Dom`] plus a handle.
+/// One live element as the engine sees it: a borrowed [`Document`] plus a handle.
 #[derive(Clone, Debug)]
 struct DomElement<'a> {
-    dom: &'a Dom,
+    dom: &'a Document,
     id: NodeId,
 }
 
 impl<'a> DomElement<'a> {
-    fn new(dom: &'a Dom, id: NodeId) -> Option<Self> {
+    fn new(dom: &'a Document, id: NodeId) -> Option<Self> {
         matches!(dom.kind(id)?, NodeKind::Element { .. }).then_some(Self { dom, id })
     }
 
@@ -680,7 +680,7 @@ impl<'a> DomElement<'a> {
     }
 }
 
-/// The engine's view of the tree: every question routes through [`Dom`]'s
+/// The engine's view of the tree: every question routes through [`Document`]'s
 /// public reads, so matching can never observe a half-mutated arena.
 impl Element for DomElement<'_> {
     type Impl = Selectors;
@@ -949,7 +949,7 @@ fn compile(selectors: &str) -> Result<SelectorList<Selectors>, SelectError> {
 /// Compiles `selectors` and checks that `scope` is live; syntax errors
 /// win over staleness, in that order.
 fn compile_scoped(
-    dom: &Dom,
+    dom: &Document,
     scope: NodeId,
     selectors: &str,
 ) -> Result<SelectorList<Selectors>, SelectError> {
@@ -969,7 +969,7 @@ fn compile_scoped(
 /// and fragment scopes the selectors engine falls back to the root
 /// element, which is the browser behavior.
 fn query_context<'a>(
-    dom: &Dom,
+    dom: &Document,
     caches: &'a mut SelectorCaches,
     scope: Option<NodeId>,
 ) -> MatchingContext<'a, Selectors> {
@@ -990,7 +990,7 @@ fn query_context<'a>(
 /// Shared scan behind [`select_all`] and [`select_first`]:
 /// walks candidates in document order, stopping after `limit` hits.
 fn find_matches(
-    dom: &Dom,
+    dom: &Document,
     list: &SelectorList<Selectors>,
     scope: NodeId,
     limit: Option<usize>,
@@ -1021,7 +1021,7 @@ fn find_matches(
 ///
 /// - [`SelectError::StaleNode`] if `scope` names a destroyed node.
 /// - [`SelectError::Syntax`] if `selectors` does not parse.
-pub fn select_all(dom: &Dom, scope: NodeId, selectors: &str) -> Result<Vec<NodeId>, SelectError> {
+pub fn select_all(dom: &Document, scope: NodeId, selectors: &str) -> Result<Vec<NodeId>, SelectError> {
     let list = compile_scoped(dom, scope, selectors)?;
     Ok(find_matches(dom, &list, scope, None))
 }
@@ -1033,7 +1033,7 @@ pub fn select_all(dom: &Dom, scope: NodeId, selectors: &str) -> Result<Vec<NodeI
 ///
 /// Same as [`select_all`].
 pub fn select_first(
-    dom: &Dom,
+    dom: &Document,
     scope: NodeId,
     selectors: &str,
 ) -> Result<Option<NodeId>, SelectError> {
@@ -1050,7 +1050,7 @@ pub fn select_first(
 /// - [`SelectError::StaleNode`] if `element` names a destroyed node.
 /// - [`SelectError::NotAnElement`] if `element` names a non-element node.
 /// - [`SelectError::Syntax`] if `selectors` does not parse.
-pub fn matches(dom: &Dom, element: NodeId, selectors: &str) -> Result<bool, SelectError> {
+pub fn matches(dom: &Document, element: NodeId, selectors: &str) -> Result<bool, SelectError> {
     let list = compile(selectors)?;
     let Some(view) = DomElement::new(dom, element) else {
         return Err(if dom.contains(element) {

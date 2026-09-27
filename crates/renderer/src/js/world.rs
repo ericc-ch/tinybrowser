@@ -1474,7 +1474,7 @@ impl World {
 /// registration asked for it (the spec's `interestedObservers` map folds the
 /// registrations per observer).
 fn match_observation(
-    dom: &dom::Dom,
+    dom: &dom::Document,
     observer: &ObserverState,
     mutation: &dom::Mutation,
 ) -> Option<RecordData> {
@@ -1567,7 +1567,7 @@ fn record(
     }
 }
 
-fn inclusive_descendant(dom: &dom::Dom, ancestor: NodeId, node: NodeId) -> bool {
+fn inclusive_descendant(dom: &dom::Document, ancestor: NodeId, node: NodeId) -> bool {
     let mut cursor = Some(node);
     while let Some(id) = cursor {
         if id == ancestor {

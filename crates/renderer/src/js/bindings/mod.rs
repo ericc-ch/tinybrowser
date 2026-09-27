@@ -594,7 +594,7 @@ pub(super) fn layout_boxes(ctx: &Ctx<'_>, document: NodeId) -> Result<Vec<crate:
 /// Inline `<style>` text in document order. External sheets are not mirrored
 /// into script geometry yet, so a page styled only by `<link>` lays out
 /// without the author rules.
-fn inline_stylesheets(dom: &dom::Dom) -> Vec<String> {
+fn inline_stylesheets(dom: &dom::Document) -> Vec<String> {
     let mut sheets = Vec::new();
     for node in dom.tree().descendants(dom.document()) {
         let Some(NodeKind::Element { name, .. }) = dom.kind(node) else {
@@ -1160,7 +1160,7 @@ pub(super) fn string_value<'js>(ctx: &Ctx<'js>, text: &str) -> Result<Value<'js>
 ///
 /// Descends only into elements and fragments: a `Document` or other
 /// non-container child contributes nothing, so its subtree is not entered.
-pub(super) fn descendant_text(dom: &dom::Dom, id: NodeId) -> String {
+pub(super) fn descendant_text(dom: &dom::Document, id: NodeId) -> String {
     let mut text = String::new();
     let mut stack: Vec<NodeId> = dom.children(id).map(Iterator::collect).unwrap_or_default();
     stack.reverse();
@@ -1182,7 +1182,7 @@ pub(super) fn descendant_text(dom: &dom::Dom, id: NodeId) -> String {
 
 /// Structural `isEqualNode`
 /// (<https://dom.spec.whatwg.org/#concept-node-equals>).
-pub(super) fn nodes_equal(dom: &dom::Dom, a: NodeId, b: NodeId) -> bool {
+pub(super) fn nodes_equal(dom: &dom::Document, a: NodeId, b: NodeId) -> bool {
     if a == b {
         return true;
     }
@@ -1255,7 +1255,7 @@ pub(super) fn nodes_equal(dom: &dom::Dom, a: NodeId, b: NodeId) -> bool {
 /// [Locate a namespace](https://dom.spec.whatwg.org/#locate-a-namespace) for
 /// `prefix` walking `cursor`'s inclusive ancestors.
 pub(super) fn locate_namespace(
-    dom: &dom::Dom,
+    dom: &dom::Document,
     cursor: NodeId,
     prefix: Option<&str>,
 ) -> Option<Namespace> {
@@ -1278,7 +1278,7 @@ pub(super) fn locate_namespace(
 
 /// [Locate a namespace prefix](https://dom.spec.whatwg.org/#locate-a-namespace-prefix)
 /// for `namespace` walking `cursor`'s inclusive ancestors.
-pub(super) fn locate_prefix(dom: &dom::Dom, cursor: NodeId, namespace: &str) -> Option<String> {
+pub(super) fn locate_prefix(dom: &dom::Document, cursor: NodeId, namespace: &str) -> Option<String> {
     let mut cursor = Some(cursor);
     while let Some(id) = cursor {
         if let Some(NodeKind::Element { name, attributes }) = dom.kind(id) {
@@ -1362,7 +1362,7 @@ pub(super) fn create_element_named<'js>(
 pub(super) fn create_kind<'js>(
     ctx: &Ctx<'js>,
     document: NodeId,
-    make: impl FnOnce(&mut dom::Dom) -> NodeId,
+    make: impl FnOnce(&mut dom::Document) -> NodeId,
 ) -> Result<Value<'js>> {
     let world = world(ctx)?;
     let world = world.borrow();
@@ -1582,7 +1582,7 @@ pub(super) fn collection_ids(
     })
 }
 
-fn collect_by_tag(dom: &dom::Dom, scope: NodeId, name: &str) -> Vec<NodeId> {
+fn collect_by_tag(dom: &dom::Document, scope: NodeId, name: &str) -> Vec<NodeId> {
     // In an HTML document, an HTML-namespace element matches the queried
     // name ASCII-lowercased; other elements match the name exactly
     // (<https://dom.spec.whatwg.org/#concept-getelementsbytagname>).
@@ -1602,7 +1602,7 @@ fn collect_by_tag(dom: &dom::Dom, scope: NodeId, name: &str) -> Vec<NodeId> {
         .collect()
 }
 
-fn collect_by_name(dom: &dom::Dom, scope: NodeId, name: &str) -> Vec<NodeId> {
+fn collect_by_name(dom: &dom::Document, scope: NodeId, name: &str) -> Vec<NodeId> {
     dom.tree().descendants(scope)
         .filter(|&id| is_element(dom, id) && dom.attribute(id, "name").as_deref() == Some(name))
         .collect()
@@ -1612,7 +1612,7 @@ fn collect_by_name(dom: &dom::Dom, scope: NodeId, name: &str) -> Vec<NodeId> {
 /// plus `embed`, `form`, `img`, and `object` elements whose `name` is `name`,
 /// in tree order
 /// (<https://html.spec.whatwg.org/multipage/nav-history-apis.html#named-access-on-the-window-object>).
-fn collect_window_named(dom: &dom::Dom, scope: NodeId, name: &str) -> Vec<NodeId> {
+fn collect_window_named(dom: &dom::Document, scope: NodeId, name: &str) -> Vec<NodeId> {
     if name.is_empty() {
         return Vec::new();
     }
@@ -1632,7 +1632,7 @@ fn collect_window_named(dom: &dom::Dom, scope: NodeId, name: &str) -> Vec<NodeId
         .collect()
 }
 
-fn collect_by_tag_ns(dom: &dom::Dom, scope: NodeId, namespace: &str, local: &str) -> Vec<NodeId> {
+fn collect_by_tag_ns(dom: &dom::Document, scope: NodeId, namespace: &str, local: &str) -> Vec<NodeId> {
     dom.tree().descendants(scope)
         .filter(|&id| {
             matches!(
@@ -1645,7 +1645,7 @@ fn collect_by_tag_ns(dom: &dom::Dom, scope: NodeId, namespace: &str, local: &str
         .collect()
 }
 
-fn collect_by_class(dom: &dom::Dom, scope: NodeId, names: &str) -> Vec<NodeId> {
+fn collect_by_class(dom: &dom::Document, scope: NodeId, names: &str) -> Vec<NodeId> {
     let wanted: Vec<&str> = names.split_ascii_whitespace().collect();
     // An empty class set matches nothing
     // (<https://dom.spec.whatwg.org/#concept-getelementsbyclassname>).
@@ -1664,7 +1664,7 @@ fn collect_by_class(dom: &dom::Dom, scope: NodeId, names: &str) -> Vec<NodeId> {
         .collect()
 }
 
-pub(super) fn is_element(dom: &dom::Dom, id: NodeId) -> bool {
+pub(super) fn is_element(dom: &dom::Document, id: NodeId) -> bool {
     matches!(dom.kind(id), Some(NodeKind::Element { .. }))
 }
 
@@ -1688,7 +1688,7 @@ pub(super) fn is_template_element(kind: Option<&NodeKind>) -> bool {
 }
 
 /// The root of the tree `id` participates in (itself when detached).
-pub(super) fn root_of(dom: &dom::Dom, id: NodeId) -> NodeId {
+pub(super) fn root_of(dom: &dom::Document, id: NodeId) -> NodeId {
     let mut root = id;
     while let Some(parent) = dom.parent(root) {
         root = parent;
@@ -1697,7 +1697,7 @@ pub(super) fn root_of(dom: &dom::Dom, id: NodeId) -> NodeId {
 }
 
 /// `id` followed by its inclusive ancestors, nearest first.
-pub(super) fn ancestor_chain(dom: &dom::Dom, id: NodeId) -> Vec<NodeId> {
+pub(super) fn ancestor_chain(dom: &dom::Document, id: NodeId) -> Vec<NodeId> {
     let mut chain = vec![id];
     let mut cursor = id;
     while let Some(parent) = dom.parent(cursor) {
@@ -1709,7 +1709,7 @@ pub(super) fn ancestor_chain(dom: &dom::Dom, id: NodeId) -> Vec<NodeId> {
 
 /// Document order of two nodes in one tree
 /// (<https://dom.spec.whatwg.org/#concept-tree-order>).
-pub(super) fn tree_order(dom: &dom::Dom, a: NodeId, b: NodeId) -> std::cmp::Ordering {
+pub(super) fn tree_order(dom: &dom::Document, a: NodeId, b: NodeId) -> std::cmp::Ordering {
     use std::cmp::Ordering;
     let chain_a = ancestor_chain(dom, a);
     let chain_b = ancestor_chain(dom, b);
@@ -1738,7 +1738,7 @@ pub(super) fn tree_order(dom: &dom::Dom, a: NodeId, b: NodeId) -> std::cmp::Orde
     position_a.cmp(&position_b)
 }
 
-pub(super) fn find_element_by_id(dom: &dom::Dom, scope: NodeId, id: &str) -> Option<NodeId> {
+pub(super) fn find_element_by_id(dom: &dom::Document, scope: NodeId, id: &str) -> Option<NodeId> {
     dom.tree().descendants(scope)
         .find(|&node| is_element(dom, node) && dom.attribute(node, "id").as_deref() == Some(id))
 }

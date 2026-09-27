@@ -58,7 +58,7 @@ pub(crate) fn construct_node<'js>(
         }
         "DocumentFragment" => {
             let document = main_document(&ctx)?;
-            create_kind(&ctx, document, dom::Dom::create_fragment)
+            create_kind(&ctx, document, dom::Document::create_fragment)
         }
         "Document" | "XMLDocument" => {
             // The `Document` constructor creates an XML document
@@ -665,7 +665,7 @@ impl JsNode {
     // https://dom.spec.whatwg.org/#dom-document-createdocumentfragment
     #[qjs(rename = "createDocumentFragment")]
     fn create_document_fragment<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
-        create_kind(&ctx, self.handle.0, dom::Dom::create_fragment)
+        create_kind(&ctx, self.handle.0, dom::Document::create_fragment)
     }
 
     // https://dom.spec.whatwg.org/#dom-document-importnode

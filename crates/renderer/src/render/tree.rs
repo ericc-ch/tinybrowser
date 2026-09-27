@@ -9,7 +9,7 @@
 
 use std::collections::HashMap;
 
-use dom::{Dom, NodeId};
+use dom::{Document, NodeId};
 
 use crate::render::RasterImage;
 use crate::render::geometry::Edges;
@@ -54,7 +54,7 @@ pub(crate) struct BoxNode {
 
 /// Builds the box tree for one document.
 pub(crate) fn build(
-    dom: &Dom,
+    dom: &Document,
     styles: &HashMap<NodeId, Style>,
     images: &HashMap<NodeId, RasterImage>,
 ) -> BoxNode {
@@ -80,7 +80,7 @@ pub(crate) fn build(
 
 /// Builds the boxes for every child of `parent`.
 fn build_children(
-    dom: &Dom,
+    dom: &Document,
     styles: &HashMap<NodeId, Style>,
     images: &HashMap<NodeId, RasterImage>,
     parent: NodeId,
@@ -174,7 +174,7 @@ fn build_children(
 /// dimensions
 /// (<https://html.spec.whatwg.org/multipage/rendering.html#attributes-for-embedded-content-and-images>,
 /// <https://drafts.csswg.org/css-images-3/#sizing>).
-fn apply_image_dimensions(dom: &Dom, id: NodeId, image: &RasterImage, style: &mut Style) {
+fn apply_image_dimensions(dom: &Document, id: NodeId, image: &RasterImage, style: &mut Style) {
     if image.width == 0 || image.height == 0 {
         return;
     }
@@ -194,7 +194,7 @@ fn apply_image_dimensions(dom: &Dom, id: NodeId, image: &RasterImage, style: &mu
 
 /// Parses the non-negative integer or legacy percentage syntax accepted by
 /// image dimension presentational hints.
-fn image_dimension_attribute(dom: &Dom, id: NodeId, name: &str) -> Option<Dimension> {
+fn image_dimension_attribute(dom: &Document, id: NodeId, name: &str) -> Option<Dimension> {
     let value = dom.attribute(id, name)?;
     let value = value.trim();
     if let Some(percent) = value.strip_suffix('%') {
@@ -210,7 +210,7 @@ fn image_dimension_attribute(dom: &Dom, id: NodeId, name: &str) -> Option<Dimens
 /// textual. Form-control appearance is UA-defined; the value itself comes
 /// from HTML's live value state
 /// (<https://html.spec.whatwg.org/multipage/input.html#dom-input-value>).
-fn rendered_input_text(dom: &Dom, id: NodeId) -> Option<String> {
+fn rendered_input_text(dom: &Document, id: NodeId) -> Option<String> {
     let dom::NodeKind::Element { name, .. } = dom.kind(id)? else {
         return None;
     };

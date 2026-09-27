@@ -11,7 +11,7 @@
 //! `parsererror` element, matching the HTML XML parsing rules.
 
 use dom::{
-    Attribute, Dom, LocalName, Namespace, NodeId, Prefix, QualName, xml_namespace, xmlns_namespace,
+    Attribute, Document, LocalName, Namespace, NodeId, Prefix, QualName, xml_namespace, xmlns_namespace,
 };
 
 use crate::Parsed;
@@ -28,7 +28,7 @@ pub(crate) fn parse_document(input: &str, content_type: &'static str) -> Parsed 
 struct XmlParser<'a> {
     input: &'a str,
     pos: usize,
-    dom: Dom,
+    dom: Document,
     document: NodeId,
     content_type: &'static str,
     /// Open elements, outermost first.
@@ -40,7 +40,7 @@ struct XmlParser<'a> {
 
 impl<'a> XmlParser<'a> {
     fn new(input: &'a str, content_type: &'static str) -> Self {
-        let dom = Dom::new();
+        let dom = Document::new();
         let document = dom.document();
         Self {
             input,

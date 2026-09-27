@@ -1,6 +1,6 @@
 //! Connection transitions for renderer-owned frames and images.
 
-use super::{Dom, Lifecycle, NodeId, NodeKind, html_namespace};
+use super::{Document, Lifecycle, NodeId, NodeKind, html_namespace};
 
 #[derive(Debug, Default)]
 pub(super) struct ConnectionState {
@@ -8,7 +8,7 @@ pub(super) struct ConnectionState {
     connected_iframes: u32,
 }
 
-impl Dom {
+impl Document {
     /// Drains the recorded connection transitions in order.
     pub fn take_lifecycle(&mut self) -> Vec<Lifecycle> {
         std::mem::take(&mut self.connections.lifecycle)
@@ -16,7 +16,7 @@ impl Dom {
 
     /// Records every `iframe` and `img` connection transition in a snapshot
     /// taken before an operation. Snapshots only ever carry those elements
-    /// (see [`Dom::connection_snapshot`]): filtering in the snapshot keeps
+    /// (see [`Document::connection_snapshot`]): filtering in the snapshot keeps
     /// the parser's hot path free of per-element bookkeeping.
     ///
     /// The snapshot carries each element's kind so a destroyed node still
@@ -73,7 +73,7 @@ impl Dom {
     /// The iframe and img elements in `id`'s inclusive subtree with, for each,
     /// its connectivity and whether it is an iframe (the only kind that moves
     /// `connected_iframes`). Captured before an operation and handed to
-    /// [`Dom::record_snapshot`] after it, so the transition is measured across
+    /// [`Document::record_snapshot`] after it, so the transition is measured across
     /// the whole operation rather than at an internal step.
     pub(super) fn connection_snapshot(&self, id: NodeId) -> Vec<(NodeId, bool, bool)> {
         let mut snapshot = Vec::new();

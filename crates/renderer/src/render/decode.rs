@@ -123,7 +123,7 @@ fn decode_svg(bytes: &[u8]) -> Option<RasterImage> {
     svg::rasterize(&parsed.dom, root)
 }
 
-fn is_parser_error(dom: &dom::Dom, node: dom::NodeId) -> bool {
+fn is_parser_error(dom: &dom::Document, node: dom::NodeId) -> bool {
     matches!(
         dom.kind(node),
         Some(dom::NodeKind::Element { name, .. })

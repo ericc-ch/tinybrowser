@@ -58,7 +58,7 @@ pub(crate) fn adopt_across_documents(
 }
 
 /// [Clones](https://dom.spec.whatwg.org/#concept-node-clone) a document into a
-/// new tree in this world. `Dom::clone_node` refuses the document node because
+/// new tree in this world. `Document::clone_node` refuses the document node because
 /// a document clone is a different document, not a node in the same arena.
 pub(crate) fn clone_document<'js>(ctx: &Ctx<'js>, id: NodeId, deep: bool) -> Result<Value<'js>> {
     let world_rc = world(ctx)?;
@@ -118,7 +118,7 @@ pub(crate) enum ImportSnapshot {
     Fragment(Vec<ImportSnapshot>),
 }
 
-pub(crate) fn import_snapshot(dom: &dom::Dom, id: NodeId, deep: bool) -> Option<ImportSnapshot> {
+pub(crate) fn import_snapshot(dom: &dom::Document, id: NodeId, deep: bool) -> Option<ImportSnapshot> {
     let children = |deep: bool| -> Vec<ImportSnapshot> {
         if !deep {
             return Vec::new();
@@ -172,7 +172,7 @@ pub(crate) fn import_snapshot(dom: &dom::Dom, id: NodeId, deep: bool) -> Option<
 }
 
 pub(crate) fn materialize_import(
-    dom: &mut dom::Dom,
+    dom: &mut dom::Document,
     snapshot: &ImportSnapshot,
 ) -> std::result::Result<NodeId, dom::DomError> {
     match snapshot {
@@ -210,7 +210,7 @@ pub(crate) fn materialize_import(
 
 /// Materializes `snapshots` into a fresh fragment in tree order.
 pub(crate) fn materialize_children(
-    dom: &mut dom::Dom,
+    dom: &mut dom::Document,
     snapshots: &[ImportSnapshot],
 ) -> std::result::Result<NodeId, dom::DomError> {
     let fragment = dom.create_fragment();

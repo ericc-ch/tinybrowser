@@ -17,21 +17,21 @@
 //! [`attr_value`], [`is_html`]): one definition of the case-regime policy,
 //! shared with selector-side name matching in `select.rs`.
 
-use crate::arena::Dom;
+use crate::arena::Document;
 use crate::id::NodeId;
 use crate::node::{QualName, html_namespace, svg_namespace, xml_namespace};
 
 // ── shared lookups ──────────────────────────────────────────────────────────
 
 /// Qualified name of a live element, else `None`.
-fn qual_name(dom: &Dom, id: NodeId) -> Option<&QualName> {
+fn qual_name(dom: &Document, id: NodeId) -> Option<&QualName> {
     dom.element(id).map(|(name, _)| name)
 }
 
 /// Whether the element lives in the HTML namespace: the case-regime switch
 /// shared with selector name matching in `select.rs`.
 #[must_use]
-pub fn is_html(dom: &Dom, id: NodeId) -> bool {
+pub fn is_html(dom: &Document, id: NodeId) -> bool {
     qual_name(dom, id).is_some_and(|name| name.ns == html_namespace())
 }
 
@@ -40,7 +40,7 @@ pub fn is_html(dom: &Dom, id: NodeId) -> bool {
 /// `<INPUT>` behaves like tokenized `<input>`. This is the single
 /// definition of that policy; selector-side name checks route here too.
 #[must_use]
-pub fn local_is(dom: &Dom, id: NodeId, names: &[&str]) -> bool {
+pub fn local_is(dom: &Document, id: NodeId, names: &[&str]) -> bool {
     let Some(name) = qual_name(dom, id) else {
         return false;
     };
@@ -62,7 +62,7 @@ pub fn local_is(dom: &Dom, id: NodeId, names: &[&str]) -> bool {
 /// dropped it, and one lookup policy keeps `[href]` and `:link` answers
 /// consistent).
 #[must_use]
-pub fn attr_value<'a>(dom: &'a Dom, id: NodeId, name: &str) -> Option<&'a str> {
+pub fn attr_value<'a>(dom: &'a Document, id: NodeId, name: &str) -> Option<&'a str> {
     let (_, attributes) = dom.element(id)?;
     let html = is_html(dom, id);
     attributes.iter().find_map(|attribute| {
@@ -80,7 +80,7 @@ pub fn attr_value<'a>(dom: &'a Dom, id: NodeId, name: &str) -> Option<&'a str> {
 }
 
 /// First `xml:lang` in the XML namespace.
-fn xml_lang_value(dom: &Dom, id: NodeId) -> Option<&str> {
+fn xml_lang_value(dom: &Document, id: NodeId) -> Option<&str> {
     let (_, attributes) = dom.element(id)?;
     attributes.iter().find_map(|attribute| {
         (attribute.name.ns == xml_namespace() && attribute.name.local.as_ref() == "lang")
@@ -125,7 +125,7 @@ fn lang_range_matches(range: &str, tag: &str) -> bool {
 /// not a hyperlink for matching
 /// (<https://drafts.csswg.org/selectors-4/#the-any-link-pseudo>).
 #[must_use]
-pub fn is_hyperlink(dom: &Dom, id: NodeId) -> bool {
+pub fn is_hyperlink(dom: &Document, id: NodeId) -> bool {
     local_is(dom, id, &["a", "area"]) && attr_value(dom, id, "href").is_some()
 }
 
@@ -135,7 +135,7 @@ pub fn is_hyperlink(dom: &Dom, id: NodeId) -> bool {
 /// option, fieldset (<https://html.spec.whatwg.org/#concept-fe-disabled>;
 /// form-associated custom elements cannot exist here). Also the population
 /// [`is_enabled`] ranges over.
-fn is_form_control(dom: &Dom, id: NodeId) -> bool {
+fn is_form_control(dom: &Document, id: NodeId) -> bool {
     is_html(dom, id)
         && local_is(
             dom,
@@ -156,7 +156,7 @@ fn is_form_control(dom: &Dom, id: NodeId) -> bool {
 /// for an `option`, when its direct parent `optgroup` is disabled
 /// (§4.10.11).
 #[must_use]
-pub fn is_disabled(dom: &Dom, id: NodeId) -> bool {
+pub fn is_disabled(dom: &Document, id: NodeId) -> bool {
     if !is_form_control(dom, id) {
         return false;
     }
@@ -179,16 +179,16 @@ pub fn is_disabled(dom: &Dom, id: NodeId) -> bool {
     disabled_by_fieldset(dom, id)
 }
 
-fn is_descendant_of(dom: &Dom, id: NodeId, ancestor: NodeId) -> bool {
+fn is_descendant_of(dom: &Document, id: NodeId, ancestor: NodeId) -> bool {
     dom.ancestors(id).any(|current| current == ancestor)
 }
 
-fn first_legend_child(dom: &Dom, fieldset: NodeId) -> Option<NodeId> {
+fn first_legend_child(dom: &Document, fieldset: NodeId) -> Option<NodeId> {
     dom.children(fieldset)?
         .find(|&kid| local_is(dom, kid, &["legend"]))
 }
 
-fn disabled_by_fieldset(dom: &Dom, id: NodeId) -> bool {
+fn disabled_by_fieldset(dom: &Document, id: NodeId) -> bool {
     dom.ancestors(id).any(|ancestor| {
         local_is(dom, ancestor, &["fieldset"])
             && attr_value(dom, ancestor, "disabled").is_some()
@@ -201,7 +201,7 @@ fn disabled_by_fieldset(dom: &Dom, id: NodeId) -> bool {
 /// elements* (<https://html.spec.whatwg.org/#selector-enabled>): a `div`
 /// without `disabled` is not "enabled", it is out of scope.
 #[must_use]
-pub fn is_enabled(dom: &Dom, id: NodeId) -> bool {
+pub fn is_enabled(dom: &Document, id: NodeId) -> bool {
     is_form_control(dom, id) && !is_disabled(dom, id)
 }
 
@@ -209,21 +209,21 @@ pub fn is_enabled(dom: &Dom, id: NodeId) -> bool {
 /// of selectedness
 /// (<https://html.spec.whatwg.org/#concept-option-selectedness>): the
 /// `selected` content attribute sets it.
-fn has_selected_attribute(dom: &Dom, id: NodeId) -> bool {
+fn has_selected_attribute(dom: &Document, id: NodeId) -> bool {
     attr_value(dom, id, "selected").is_some()
 }
 
 /// Nearest `select` above `id`, if one exists: the owner whose list of
 /// options decides default selectedness (`id` is an `option` here, never
 /// the select itself).
-fn owning_select(dom: &Dom, id: NodeId) -> Option<NodeId> {
+fn owning_select(dom: &Document, id: NodeId) -> Option<NodeId> {
     dom.ancestors(id)
         .find(|&ancestor| local_is(dom, ancestor, &["select"]))
 }
 
 /// Whether `id` is a checkbox/radio input whose checkedness is true
 /// (statically, those carrying `checked`).
-fn checked_input(dom: &Dom, id: NodeId) -> bool {
+fn checked_input(dom: &Document, id: NodeId) -> bool {
     if !local_is(dom, id, &["input"]) {
         return false;
     }
@@ -240,7 +240,7 @@ fn checked_input(dom: &Dom, id: NodeId) -> bool {
 /// `selected`, and the list flattens `optgroup`s), so fresh parsed pages
 /// answer as browsers do.
 #[must_use]
-pub fn is_checked(dom: &Dom, id: NodeId) -> bool {
+pub fn is_checked(dom: &Document, id: NodeId) -> bool {
     if checked_input(dom, id) {
         return true;
     }
@@ -272,19 +272,19 @@ pub fn is_checked(dom: &Dom, id: NodeId) -> bool {
 
 /// The constraint-validation population: `input`, `select`, `textarea`
 /// (<https://html.spec.whatwg.org/#selector-required>).
-fn constraint_target(dom: &Dom, id: NodeId) -> bool {
+fn constraint_target(dom: &Document, id: NodeId) -> bool {
     is_html(dom, id) && local_is(dom, id, &["input", "select", "textarea"])
 }
 
 /// `:required` (<https://html.spec.whatwg.org/#selector-required>).
 #[must_use]
-pub fn is_required(dom: &Dom, id: NodeId) -> bool {
+pub fn is_required(dom: &Document, id: NodeId) -> bool {
     constraint_target(dom, id) && attr_value(dom, id, "required").is_some()
 }
 
 /// `:optional`: the same population without `required`.
 #[must_use]
-pub fn is_optional(dom: &Dom, id: NodeId) -> bool {
+pub fn is_optional(dom: &Document, id: NodeId) -> bool {
     constraint_target(dom, id) && attr_value(dom, id, "required").is_none()
 }
 
@@ -292,7 +292,7 @@ pub fn is_optional(dom: &Dom, id: NodeId) -> bool {
 /// (<https://html.spec.whatwg.org/multipage/input.html#attr-input-readonly>).
 /// An invalid `type` takes the Text state, where `readonly` applies, so this
 /// is an exclusion set rather than an allowlist.
-fn readonly_applies(dom: &Dom, id: NodeId) -> bool {
+fn readonly_applies(dom: &Document, id: NodeId) -> bool {
     let ty = attr_value(dom, id, "type").unwrap_or("text");
     ![
         "hidden", "checkbox", "radio", "file", "submit", "image", "reset", "button", "color",
@@ -308,7 +308,7 @@ fn readonly_applies(dom: &Dom, id: NodeId) -> bool {
 /// `textarea` that is neither `readonly` nor disabled. Editing hosts
 /// (`contenteditable`) have no representation in this tree yet.
 #[must_use]
-pub fn is_read_write(dom: &Dom, id: NodeId) -> bool {
+pub fn is_read_write(dom: &Document, id: NodeId) -> bool {
     if !is_html(dom, id) {
         return false;
     }
@@ -327,7 +327,7 @@ pub fn is_read_write(dom: &Dom, id: NodeId) -> bool {
 /// (<https://drafts.csswg.org/selectors-4/#read-only-pseudo>). This is the
 /// spec's complement, not a form-control population: a `div` is read-only.
 #[must_use]
-pub fn is_read_only(dom: &Dom, id: NodeId) -> bool {
+pub fn is_read_only(dom: &Document, id: NodeId) -> bool {
     !is_read_write(dom, id)
 }
 
@@ -335,7 +335,7 @@ pub fn is_read_only(dom: &Dom, id: NodeId) -> bool {
 /// (<https://html.spec.whatwg.org/#attr-input-placeholder>: textual and
 /// numeric-entry types only; a checkbox shows nothing). An invalid `type`
 /// takes the Text state, so this excludes the types that never show one.
-fn placeholder_capable_type(dom: &Dom, id: NodeId) -> bool {
+fn placeholder_capable_type(dom: &Document, id: NodeId) -> bool {
     let ty = attr_value(dom, id, "type").unwrap_or("text");
     ![
         "hidden",
@@ -362,10 +362,10 @@ fn placeholder_capable_type(dom: &Dom, id: NodeId) -> bool {
 /// value is empty (<https://html.spec.whatwg.org/#attr-input-placeholder>).
 /// The value is the *live* value, not the content attribute: a dirty value
 /// set through the IDL hides the placeholder. For an `input` that means a
-/// placeholder-capable type whose [`Dom::input_value`] is empty; for a
+/// placeholder-capable type whose [`Document::input_value`] is empty; for a
 /// `textarea` the value is its text content.
 #[must_use]
-pub fn is_placeholder_shown(dom: &Dom, id: NodeId) -> bool {
+pub fn is_placeholder_shown(dom: &Document, id: NodeId) -> bool {
     if !is_html(dom, id) || attr_value(dom, id, "placeholder").is_none() {
         return false;
     }
@@ -387,7 +387,7 @@ pub fn is_placeholder_shown(dom: &Dom, id: NodeId) -> bool {
 /// checkbox/radio inputs with `checked`, options with `selected`. Form
 /// default-submit buttons are not represented (no form-owner association).
 #[must_use]
-pub fn is_default(dom: &Dom, id: NodeId) -> bool {
+pub fn is_default(dom: &Document, id: NodeId) -> bool {
     checked_input(dom, id) || (local_is(dom, id, &["option"]) && has_selected_attribute(dom, id))
 }
 
@@ -395,7 +395,7 @@ pub fn is_default(dom: &Dom, id: NodeId) -> bool {
 /// attribute (<https://html.spec.whatwg.org/#the-progress-element>). Radio
 /// groups are not represented (no form-owner association).
 #[must_use]
-pub fn is_indeterminate(dom: &Dom, id: NodeId) -> bool {
+pub fn is_indeterminate(dom: &Document, id: NodeId) -> bool {
     if local_is(dom, id, &["progress"]) {
         return attr_value(dom, id, "value").is_none();
     }
@@ -417,7 +417,7 @@ pub fn is_indeterminate(dom: &Dom, id: NodeId) -> bool {
 /// reserved hyphenated names. No custom-element registry exists here, so
 /// every other hyphenated HTML name is undefined.
 #[must_use]
-pub fn is_defined(dom: &Dom, id: NodeId) -> bool {
+pub fn is_defined(dom: &Document, id: NodeId) -> bool {
     const RESERVED: &[&str] = &[
         "annotation-xml",
         "font-face",
@@ -455,7 +455,7 @@ pub fn is_defined(dom: &Dom, id: NodeId) -> bool {
 /// `Content-Language` default
 /// (<https://html.spec.whatwg.org/multipage/dom.html#language>).
 #[must_use]
-pub fn lang_matches(dom: &Dom, id: NodeId, ranges: &[Box<str>]) -> bool {
+pub fn lang_matches(dom: &Document, id: NodeId, ranges: &[Box<str>]) -> bool {
     let found = std::iter::once(id)
         .chain(dom.ancestors(id))
         .find_map(|current| {
@@ -477,7 +477,7 @@ pub fn lang_matches(dom: &Dom, id: NodeId, ranges: &[Box<str>]) -> bool {
 /// rules that matter statically: only `ltr`/`rtl` count; anything else
 /// (`auto`, garbage, foreign elements) leaves the direction undefined here
 /// and lets inheritance continue past this node.
-fn dir_attr(dom: &Dom, id: NodeId) -> Option<&str> {
+fn dir_attr(dom: &Document, id: NodeId) -> Option<&str> {
     if !is_html(dom, id) {
         return None;
     }
@@ -490,7 +490,7 @@ fn dir_attr(dom: &Dom, id: NodeId) -> Option<&str> {
 /// Defaults to `ltr`. `dir="auto"` is not classified (needs first-strong
 /// bidi); invalid values inherit, per Undefined direction.
 #[must_use]
-pub fn direction_is(dom: &Dom, id: NodeId, want: &str) -> bool {
+pub fn direction_is(dom: &Document, id: NodeId, want: &str) -> bool {
     std::iter::once(id)
         .chain(dom.ancestors(id))
         .find_map(|current| dir_attr(dom, current))

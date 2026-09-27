@@ -4,7 +4,7 @@
 //! (<https://html.spec.whatwg.org/multipage/input.html#the-input-element>).
 
 use crate::{
-    Dom, DomError, NodeId, html_namespace, is_valid_date, is_valid_floating_point,
+    Document, DomError, NodeId, html_namespace, is_valid_date, is_valid_floating_point,
     is_valid_local_date_time, is_valid_month, is_valid_simple_color, is_valid_time, is_valid_week,
 };
 
@@ -33,7 +33,7 @@ const INPUT_TYPES: &[&str] = &[
     "button",
 ];
 
-impl Dom {
+impl Document {
     /// The live value of an HTML `input` element.
     ///
     /// Before the dirty value flag is set, the value follows the content

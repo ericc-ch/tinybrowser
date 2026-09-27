@@ -91,7 +91,7 @@ pub struct Attribute {
 /// What kind of node this is, and the data unique to that kind.
 #[derive(Clone, Debug)]
 pub enum NodeKind {
-    /// The root created with the `Dom`; every document has exactly one.
+    /// The root created with the `Document`; every document has exactly one.
     Document,
     /// The `<!DOCTYPE html>` declaration.
     Doctype {

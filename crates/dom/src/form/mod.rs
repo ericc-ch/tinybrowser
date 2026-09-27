@@ -1,7 +1,7 @@
 //! The form control model: form ownership, checkedness, radio button groups,
 //! selectability, and the reset algorithm.
 //!
-//! The state lives in [`FormState`]. These methods remain on [`Dom`] because
+//! The state lives in [`FormState`]. These methods remain on [`Document`] because
 //! they also inspect the tree. Tree mutation primitives call into them at the
 //! points the spec defines as phenomena
 //! (<https://html.spec.whatwg.org/multipage/forms.html#form-associated-element>).
@@ -11,7 +11,7 @@ mod select;
 
 use std::collections::{HashMap, HashSet};
 
-use crate::{Dom, DomError, NodeId};
+use crate::{Document, DomError, NodeId};
 
 #[derive(Debug, Default)]
 pub(crate) struct FormState {
@@ -60,7 +60,7 @@ impl FormState {
 }
 
 /// Run the form-control steps after setting an attribute.
-pub(crate) fn attribute_set(document: &mut Dom, node: NodeId, name: &str) -> Result<(), DomError> {
+pub(crate) fn attribute_set(document: &mut Document, node: NodeId, name: &str) -> Result<(), DomError> {
     if name.eq_ignore_ascii_case("selected") {
         document.refresh_option_selectedness(node);
         if let Some(select) = document.option_select_owner(node) {
@@ -83,7 +83,7 @@ pub(crate) fn attribute_set(document: &mut Dom, node: NodeId, name: &str) -> Res
 
 /// Run the form-control steps after removing an attribute.
 pub(crate) fn attribute_removed(
-    document: &mut Dom,
+    document: &mut Document,
     node: NodeId,
     name: &str,
 ) -> Result<(), DomError> {
@@ -104,7 +104,7 @@ pub(crate) fn attribute_removed(
     Ok(())
 }
 
-impl Dom {
+impl Document {
     /// The reset algorithm for a form control: an `input`/`textarea` clears its
     /// dirty value and checkedness flags, and a `select` restores each option's
     /// selectedness from its `selected` attribute before running the

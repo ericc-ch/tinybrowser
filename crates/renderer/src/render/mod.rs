@@ -21,7 +21,7 @@
 //! - flex containers use the flex layout algorithm
 //!   (<https://drafts.csswg.org/css-flexbox-1/#layout-algorithm>)
 //!
-//! The DOM arrives as an immutable [`dom::Dom`]; the output is a
+//! The DOM arrives as an immutable [`dom::Document`]; the output is a
 //! [`RgbaImage`] ready for PNG encoding in [`png`].
 
 #![doc = include_str!("README.md")]
@@ -138,7 +138,7 @@ impl RgbaImage {
 /// Returns [`RenderError`] when a stylesheet cannot be parsed or the pipeline
 /// refuses a document it cannot lay out.
 pub(crate) fn render(
-    dom: &dom::Dom,
+    dom: &dom::Document,
     stylesheets: &[String],
     options: &RenderOptions,
     images: &std::collections::HashMap<dom::NodeId, RasterImage>,
@@ -169,7 +169,7 @@ pub struct NodeBox {
 /// Returns [`RenderError`] when a stylesheet cannot be parsed or the viewport
 /// is unusable.
 pub fn layout_boxes(
-    dom: &dom::Dom,
+    dom: &dom::Document,
     stylesheets: &[String],
     options: &RenderOptions,
     images: &std::collections::HashMap<dom::NodeId, RasterImage>,
@@ -261,14 +261,14 @@ impl std::error::Error for RenderError {}
 #[cfg(test)]
 mod tests {
     use super::{RenderOptions, encode_png, layout_boxes, render};
-    use dom::{Dom, LocalName, QualName, html_namespace};
+    use dom::{Document, LocalName, QualName, html_namespace};
     use std::collections::HashMap;
 
     fn html_name(local: &str) -> QualName {
         QualName::new(None, html_namespace(), LocalName::from(local))
     }
 
-    fn append_html_element(dom: &mut Dom, parent: dom::NodeId, local: &str) -> dom::NodeId {
+    fn append_html_element(dom: &mut Document, parent: dom::NodeId, local: &str) -> dom::NodeId {
         let element = dom.create_element(html_name(local), Vec::new());
         dom.append(parent, element).expect("append");
         element
@@ -276,7 +276,7 @@ mod tests {
 
     #[test]
     fn renders_requested_viewport() {
-        let dom = Dom::new();
+        let dom = Document::new();
         let image = render(
             &dom,
             &[],
@@ -298,7 +298,7 @@ mod tests {
 
     #[test]
     fn encodes_png() {
-        let dom = Dom::new();
+        let dom = Document::new();
         let image = render(
             &dom,
             &[],
@@ -316,7 +316,7 @@ mod tests {
 
     #[test]
     fn styles_a_tree_of_elements() {
-        let mut dom = Dom::new();
+        let mut dom = Document::new();
         let document = dom.document();
         let html = append_html_element(&mut dom, document, "html");
         let body = append_html_element(&mut dom, html, "body");

@@ -96,7 +96,7 @@ pub enum DomError {
     /// a document gaining a second root or a misplaced doctype, character
     /// data under a document, a leaf node asked to parent children, the
     /// document root asked to gain a parent. (Maps to
-    /// `HierarchyRequestError`; see `Dom::ensure_pre_insert_validity`.)
+    /// `HierarchyRequestError`; see `Document::ensure_pre_insert_validity`.)
     HierarchyRequest,
     /// The operation does not apply to that kind of node (setting text data
     /// on an element, attributes on a text node). (Maps to a type error at
@@ -134,12 +134,12 @@ impl std::error::Error for DomError {}
 /// layer hold handles across garbage-collection cycles without borrowing
 /// anything.
 ///
-/// [`Send`] but deliberately not [`Sync`]: a `Dom` may be handed between
+/// [`Send`] but deliberately not [`Sync`]: a `Document` may be handed between
 /// workers, but two threads can never touch one simultaneously (one worker
 /// per document). The marker field below is what suppresses the
 /// otherwise-auto-derived `Sync`.
 #[derive(Debug)]
-pub struct Dom {
+pub struct Document {
     pub(crate) tree: Tree,
     metadata: Metadata,
     shadow: ShadowState,
@@ -147,19 +147,19 @@ pub struct Dom {
     journal: MutationJournal,
     connections: ConnectionState,
     pub(crate) named: NamedIndex,
-    /// `Cell<()>` is `Send` + `!Sync`; `PhantomData` makes `Dom` inherit
+    /// `Cell<()>` is `Send` + `!Sync`; `PhantomData` makes `Document` inherit
     /// exactly that split. Deleting this field would silently re-derive
     /// `Sync`, which is the point: that deletion has to be a conscious act.
     _share_forbidden: PhantomData<Cell<()>>,
 }
 
-impl Default for Dom {
+impl Default for Document {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl Dom {
+impl Document {
     /// An empty document containing just the root `Document` node.
     #[must_use]
     pub fn new() -> Self {
@@ -368,7 +368,7 @@ impl Dom {
     /// "an attribute list is essentially a map of names to attributes"),
     /// so later duplicates are dropped and the first occurrence wins,
     /// matching the merge rule the parser drives through
-    /// [`Dom::add_attrs_if_missing`]. Hand-built callers get the same
+    /// [`Document::add_attrs_if_missing`]. Hand-built callers get the same
     /// normalization instead of an unrepresentable state.
     ///
     /// # Panics
@@ -388,7 +388,7 @@ impl Dom {
     ///
     /// # Panics
     ///
-    /// See [`Dom::create_element`]: unreachable except beyond `u32::MAX` nodes.
+    /// See [`Document::create_element`]: unreachable except beyond `u32::MAX` nodes.
     pub fn create_text(&mut self, data: impl Into<String>) -> NodeId {
         self.alloc(NodeKind::Text { data: data.into() })
     }
@@ -397,7 +397,7 @@ impl Dom {
     ///
     /// # Panics
     ///
-    /// See [`Dom::create_element`]: unreachable except beyond `u32::MAX` nodes.
+    /// See [`Document::create_element`]: unreachable except beyond `u32::MAX` nodes.
     pub fn create_comment(&mut self, data: impl Into<String>) -> NodeId {
         self.alloc(NodeKind::Comment { data: data.into() })
     }
@@ -406,7 +406,7 @@ impl Dom {
     ///
     /// # Panics
     ///
-    /// See [`Dom::create_element`]: unreachable except beyond `u32::MAX` nodes.
+    /// See [`Document::create_element`]: unreachable except beyond `u32::MAX` nodes.
     pub fn create_cdata_section(&mut self, data: impl Into<String>) -> NodeId {
         self.alloc(NodeKind::CDataSection { data: data.into() })
     }
@@ -415,7 +415,7 @@ impl Dom {
     ///
     /// # Panics
     ///
-    /// See [`Dom::create_element`]: unreachable except beyond `u32::MAX` nodes.
+    /// See [`Document::create_element`]: unreachable except beyond `u32::MAX` nodes.
     pub fn create_processing_instruction(
         &mut self,
         target: impl Into<String>,
@@ -431,7 +431,7 @@ impl Dom {
     ///
     /// # Panics
     ///
-    /// See [`Dom::create_element`]: unreachable except beyond `u32::MAX` nodes.
+    /// See [`Document::create_element`]: unreachable except beyond `u32::MAX` nodes.
     pub fn create_doctype(
         &mut self,
         name: impl Into<String>,
@@ -448,12 +448,12 @@ impl Dom {
     /// Creates an empty document fragment, unattached like every fresh node.
     ///
     /// Fragments are containers outside the main tree: the contents root of
-    /// `<template>` elements (associated with [`Dom::set_template_contents`]) and
+    /// `<template>` elements (associated with [`Document::set_template_contents`]) and
     /// the context node for `innerHTML`-style fragment parsing.
     ///
     /// # Panics
     ///
-    /// See [`Dom::create_element`]: unreachable except beyond `u32::MAX` nodes.
+    /// See [`Document::create_element`]: unreachable except beyond `u32::MAX` nodes.
     pub fn create_fragment(&mut self) -> NodeId {
         self.alloc(NodeKind::Fragment)
     }
@@ -534,7 +534,7 @@ impl Dom {
 
     /// Inserts `node` immediately before `sibling` under sibling's parent.
     ///
-    /// Moving semantics, like [`Dom::append`]. Inserting a node beside
+    /// Moving semantics, like [`Document::append`]. Inserting a node beside
     /// itself is a legal stay-put no-op (WHATWG DOM's *ensure pre-insert
     /// validity* returns without doing anything in that case), not an
     /// error.
@@ -550,7 +550,7 @@ impl Dom {
     /// - [`DomError::NoParent`] if `sibling` has no parent to insert beside
     ///   (`NotFoundError`, including the detached-sibling case).
     /// - [`DomError::HierarchyRequest`] / [`DomError::CycleForbidden`] as
-    ///   from `Dom::ensure_pre_insert_validity`.
+    ///   from `Document::ensure_pre_insert_validity`.
     pub fn insert_before(&mut self, sibling: NodeId, node: NodeId) -> Result<(), DomError> {
         self.ensure_alive(sibling, node)?;
         // The reference child must sit under some parent to be inserted
@@ -591,7 +591,7 @@ impl Dom {
     /// - [`DomError::NoParent`] if `child` is not a child of `parent`
     ///   (`NotFoundError`).
     /// - [`DomError::HierarchyRequest`] / [`DomError::CycleForbidden`] as
-    ///   from `Dom::ensure_pre_insert_validity`.
+    ///   from `Document::ensure_pre_insert_validity`.
     pub fn replace_child(
         &mut self,
         parent: NodeId,
@@ -774,7 +774,7 @@ impl Dom {
     /// numbers, are what stay true). Refusals here are always
     /// [`DomError::HierarchyRequest`] or [`DomError::CycleForbidden`]; the
     /// document content model itself is encoded exactly once, in
-    /// [`Dom::ensure_document_content_model`].
+    /// [`Document::ensure_document_content_model`].
     fn ensure_pre_insert_validity(
         &self,
         parent: NodeId,
@@ -869,7 +869,7 @@ impl Dom {
     /// impossible (a doctype can only ever sit directly under the root,
     /// so none can appear in a moved run). When `to` **is** the document,
     /// the full document content model applies to the *resulting* sequence;
-    /// see `Dom::ensure_document_content_model`. A bulk move is one
+    /// see `Document::ensure_document_content_model`. A bulk move is one
     /// operation: `[html, main]` into an empty document would pass
     /// per-child and fail as a pair.
     ///
@@ -958,7 +958,7 @@ impl Dom {
     /// doctype placed strictly ahead of that element; comments may sit
     /// anywhere, and fragments stay opaque containers. Deliberately the *only* encoding of the model:
     /// incremental insertions arrive as their resulting sequence from
-    /// `Dom::ensure_pre_insert_validity`, bulk moves as the document's
+    /// `Document::ensure_pre_insert_validity`, bulk moves as the document's
     /// standing children followed by the moved run. Per-child checks cannot
     /// see a violating pair like `[html, main]`.
     fn ensure_document_content_model(&self, sequence: &[NodeId]) -> Result<(), DomError> {
@@ -1546,7 +1546,7 @@ impl Dom {
         }
     }
 
-    /// Mutable variant of [`Dom::element`] for the attribute mutators.
+    /// Mutable variant of [`Document::element`] for the attribute mutators.
     fn element_mut(&mut self, id: NodeId) -> Result<(&QualName, &mut Vec<Attribute>), DomError> {
         match self.tree.kind_mut(id).ok_or(DomError::StaleNode)? {
             NodeKind::Element { name, attributes } => Ok((name, attributes)),
@@ -1659,7 +1659,7 @@ impl Dom {
     /// (<https://dom.spec.whatwg.org/#concept-node-insert>).
     ///
     /// Structural only; the caller records the fragment subtree's lifecycle
-    /// snapshot (see [`Dom::place_node`]).
+    /// snapshot (see [`Document::place_node`]).
     fn splice_fragment(&mut self, parent: NodeId, fragment: NodeId, before: Option<NodeId>) {
         let moved: Vec<NodeId> = self
             .children(fragment)
@@ -1756,7 +1756,7 @@ impl Dom {
         self.require_live(b)
     }
 
-    /// Single-handle variant of [`Dom::ensure_alive`].
+    /// Single-handle variant of [`Document::ensure_alive`].
     fn require_live(&self, a: NodeId) -> Result<(), DomError> {
         if self.contains(a) {
             Ok(())
@@ -1787,7 +1787,7 @@ impl Dom {
     /// Queues the removal record for `id` from its current parent, without
     /// touching the tree.
     ///
-    /// Shared by [`Dom::unlink_from_current_parent`] and the replace
+    /// Shared by [`Document::unlink_from_current_parent`] and the replace
     /// algorithm's adopt step, whose removal is observable even though the
     /// rest of the replacement suppresses observers
     /// (<https://dom.spec.whatwg.org/#concept-node-adopt>). The caller has

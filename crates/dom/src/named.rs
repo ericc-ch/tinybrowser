@@ -16,7 +16,7 @@
 use std::collections::HashSet;
 
 use crate::arena::Tree;
-use crate::{Dom, NodeId, NodeKind, html_namespace};
+use crate::{Document, NodeId, NodeKind, html_namespace};
 
 /// Extra names tolerated beyond twice the live count before a rebuild.
 const REBUILD_SLACK: usize = 1024;
@@ -30,19 +30,19 @@ pub(crate) struct NamedIndex {
 
 /// Whether `name` is a supported Window named-property name. The first query
 /// seeds the index from the document tree.
-pub fn exists(document: &mut Dom, name: &str) -> bool {
+pub fn exists(document: &mut Document, name: &str) -> bool {
     document.named.exists(&document.tree, name)
 }
 
 /// Include names in an inserted, connected subtree.
-pub(crate) fn inserted(document: &mut Dom, node: NodeId) {
+pub(crate) fn inserted(document: &mut Document, node: NodeId) {
     if document.named.seeded && document.is_connected(node) {
         document.named.inserted(&document.tree, node);
     }
 }
 
 /// Include a connected element's changed `id` or exposed `name`.
-pub(crate) fn attribute_changed(document: &mut Dom, node: NodeId, name: &str) {
+pub(crate) fn attribute_changed(document: &mut Document, node: NodeId, name: &str) {
     if document.named.seeded
         && (name.eq_ignore_ascii_case("id") || name.eq_ignore_ascii_case("name"))
         && document.is_connected(node)

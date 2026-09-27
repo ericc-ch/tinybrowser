@@ -4,7 +4,7 @@
 //! Parley (text), Stylo replaces our hand-rolled property database and
 //! cascade. What we take is the cascade math — selector matching, origins,
 //! inheritance, computed values. What we skip is everything platform: no
-//! rayon traversal (our [`dom::Dom`] is `!Sync` by design, so the traversal
+//! rayon traversal (our [`dom::Document`] is `!Sync` by design, so the traversal
 //! below is a single-threaded breadth-first walk), no restyle/invalidation
 //! (one screenshot styles each element exactly once), no animations, no
 //! snapshots, no shadow DOM.
@@ -25,7 +25,7 @@
 
 use std::collections::{HashMap, VecDeque};
 
-use dom::{Dom, NodeId};
+use dom::{Document, NodeId};
 use style::Atom;
 use style::animation::DocumentAnimationSet;
 use style::context::{
@@ -105,7 +105,7 @@ textarea { width: 180px; height: 48px; padding: 2px 4px; border: 1px solid #7676
 /// parsed per element. Viewport units and `@media` resolve against
 /// `viewport_width` x `viewport_height`.
 pub(crate) fn style_document(
-    dom: &Dom,
+    dom: &Document,
     sheets: &[String],
     viewport_width: f32,
     viewport_height: f32,
@@ -171,7 +171,7 @@ pub(crate) fn style_document(
 
 /// Registers every element under the document: traversal indices plus fresh
 /// element data.
-fn register_elements(dom: &Dom, tables: &mut StyloTables) {
+fn register_elements(dom: &Document, tables: &mut StyloTables) {
     let document = dom.document();
     tables.register(document);
     for node in dom.rendered_descendants(document) {
@@ -185,7 +185,7 @@ fn register_elements(dom: &Dom, tables: &mut StyloTables) {
 }
 
 /// Re-inserts fresh element data after a `rem` second pass clears the table.
-fn register_data(dom: &Dom, tables: &mut StyloTables) {
+fn register_data(dom: &Document, tables: &mut StyloTables) {
     let document = dom.document();
     for node in dom.rendered_descendants(document) {
         if matches!(dom.kind(node), Some(dom::NodeKind::Element { .. })) {
@@ -198,7 +198,7 @@ fn register_data(dom: &Dom, tables: &mut StyloTables) {
 
 /// Parses every element's `id` and `style` attribute into the side tables.
 /// Unparseable declarations drop, like browsers drop them.
-fn parse_attributes(dom: &Dom, tables: &mut StyloTables) {
+fn parse_attributes(dom: &Document, tables: &mut StyloTables) {
     let url = UrlExtraData(Arc::new(
         url::Url::parse("about:blank").expect("about:blank parses"),
     ));
@@ -278,7 +278,7 @@ fn append_sheet(
 
 /// Runs one breadth-first styling pass, returning computed values by element.
 fn run_traversal(
-    dom: &Dom,
+    dom: &Document,
     tables: &StyloTables,
     stylist: &Stylist,
 ) -> HashMap<NodeId, Arc<ComputedValues>> {
@@ -360,7 +360,7 @@ fn run_traversal(
 }
 
 /// The root element's computed font size, or 16px without a root.
-fn root_font_size(dom: &Dom, computed: &HashMap<NodeId, Arc<ComputedValues>>) -> f32 {
+fn root_font_size(dom: &Document, computed: &HashMap<NodeId, Arc<ComputedValues>>) -> f32 {
     root_element(dom)
         .and_then(|root| computed.get(&root))
         .map_or(16.0, |values| {
@@ -370,14 +370,14 @@ fn root_font_size(dom: &Dom, computed: &HashMap<NodeId, Arc<ComputedValues>>) ->
 
 /// The root element's computed values, if styled.
 fn root_computed(
-    dom: &Dom,
+    dom: &Document,
     computed: &HashMap<NodeId, Arc<ComputedValues>>,
 ) -> Option<Arc<ComputedValues>> {
     root_element(dom).and_then(|root| computed.get(&root).cloned())
 }
 
 /// The document's root element (`<html>` in practice).
-fn root_element(dom: &Dom) -> Option<NodeId> {
+fn root_element(dom: &Document) -> Option<NodeId> {
     let document = dom.document();
     dom.children(document)?
         .find(|&kid| matches!(dom.kind(kid), Some(dom::NodeKind::Element { .. })))
