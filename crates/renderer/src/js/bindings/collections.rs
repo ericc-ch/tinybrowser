@@ -1,10 +1,11 @@
 //! Live node collections (`NodeList`, `HTMLCollection`).
 
-use super::{INSTALL_COLLECTIONS_JS, collection_ids, world, wrap_node};
+use super::{INSTALL_COLLECTIONS_JS, collection_ids, host_node_id, world, wrap_node};
 
-use rquickjs::{Ctx, Exception, Function, Object, Persistent, Result, Value, class::Trace};
+use rquickjs::{Ctx, Exception, Function, Object, Persistent, Result, Value, class::Trace, prelude::Func};
 
 use crate::js::world::Handle;
+use dom::{NodeKind, html_namespace};
 
 #[derive(Trace, rquickjs::JsLifetime)]
 pub(crate) enum CollectionKind {
@@ -14,6 +15,8 @@ pub(crate) enum CollectionKind {
     ElementsByTagNs { namespace: String, local: String },
     ElementsByClass(String),
     ElementsByName(String),
+    SelectOptions,
+    SelectedOptions,
     Static(Vec<Handle>),
 }
 
@@ -52,11 +55,57 @@ impl JsCollection {
 }
 
 pub(crate) fn install_collection_brand(ctx: &Ctx<'_>) -> Result<()> {
+    ctx.globals()
+        .set("__tbIsOptionNode", Func::from(is_option_node))?;
+    ctx.globals()
+        .set("__tbAppendBlankOptions", Func::from(append_blank_options))?;
     ctx.eval::<(), _>(INSTALL_COLLECTIONS_JS)?;
     let ctor: Function = ctx.globals().get("HTMLCollection")?;
     let proto: Object = ctor.get("prototype")?;
-    world(ctx)?
-        .borrow_mut()
-        .intern_brand("HTMLCollection", Persistent::save(ctx, proto));
+    let options_ctor: Function = ctx.globals().get("HTMLOptionsCollection")?;
+    let options_proto: Object = options_ctor.get("prototype")?;
+    let world = world(ctx)?;
+    let mut world = world.borrow_mut();
+    world.intern_brand("HTMLCollection", Persistent::save(ctx, proto));
+    world.intern_brand(
+        "HTMLOptionsCollection",
+        Persistent::save(ctx, options_proto),
+    );
     Ok(())
+}
+
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "rquickjs Func ABI passes arguments by value"
+)]
+fn is_option_node<'js>(ctx: Ctx<'js>, value: Value<'js>) -> Result<bool> {
+    let Some(id) = host_node_id(&ctx, &value) else {
+        return Ok(false);
+    };
+    let world = world(&ctx)?;
+    let world = world.borrow();
+    Ok(world.document(id).is_some_and(|parsed| {
+        matches!(parsed.dom.kind(id), Some(NodeKind::Element { name, .. })
+            if name.ns == html_namespace() && name.local.as_ref() == "option")
+    }))
+}
+
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "rquickjs Func ABI passes arguments by value"
+)]
+fn append_blank_options<'js>(ctx: Ctx<'js>, select: Value<'js>, count: u32) -> Result<()> {
+    let Some(id) = host_node_id(&ctx, &select) else {
+        return Err(Exception::throw_type(&ctx, "not a select"));
+    };
+    let count = usize::try_from(count).map_err(|_| Exception::throw_type(&ctx, "invalid count"))?;
+    let world = world(&ctx)?;
+    let world = world.borrow();
+    let Some(mut parsed) = world.document_mut(id) else {
+        return Err(Exception::throw_type(&ctx, "no document"));
+    };
+    parsed
+        .dom
+        .append_blank_options(id, count)
+        .map_err(|_| Exception::throw_type(&ctx, "not a select"))
 }

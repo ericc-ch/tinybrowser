@@ -1570,6 +1570,13 @@ pub(super) fn collection_ids(
         }
         CollectionKind::ElementsByClass(names) => collect_by_class(&parsed.dom, scope, names),
         CollectionKind::ElementsByName(name) => collect_by_name(&parsed.dom, scope, name),
+        CollectionKind::SelectOptions => parsed.dom.select_options(scope),
+        CollectionKind::SelectedOptions => parsed
+            .dom
+            .select_options(scope)
+            .into_iter()
+            .filter(|&option| parsed.dom.option_selected(option))
+            .collect(),
         CollectionKind::Static(handles) => handles.iter().map(|handle| handle.0).collect(),
     })
 }

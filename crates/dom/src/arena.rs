@@ -1639,7 +1639,7 @@ impl Dom {
         });
         if local.eq_ignore_ascii_case("selected") {
             self.refresh_option_selectedness(id);
-            if let Some(select) = self.nearest_select_ancestor(id) {
+            if let Some(select) = self.option_select_owner(id) {
                 self.apply_default_selectedness(select);
             }
         }
@@ -1863,7 +1863,7 @@ impl Dom {
         });
         if local.eq_ignore_ascii_case("selected") {
             self.refresh_option_selectedness(id);
-            if let Some(select) = self.nearest_select_ancestor(id) {
+            if let Some(select) = self.option_select_owner(id) {
                 self.apply_default_selectedness(select);
             }
         }
@@ -2285,6 +2285,14 @@ impl Dom {
         if moved.is_empty() {
             return;
         }
+        // Appending a run of unselected options yields the same selection as
+        // applying the setting algorithm after every insertion. No script can
+        // observe the intermediate state during the fragment splice
+        // (<https://html.spec.whatwg.org/multipage/form-elements.html#selectedness-setting-algorithm>).
+        let blank_options = self.html_local_is(parent, "select")
+            && moved
+                .iter()
+                .all(|&id| self.html_local_is(id, "option") && !self.option_selected(id));
         self.record(Mutation::ChildList {
             target: fragment,
             added: Vec::new(),
@@ -2318,11 +2326,15 @@ impl Dom {
             if self.checked_radio_form_owner(id).is_some() {
                 self.refresh_radio_group(id);
             }
-            if (self.html_local_is(id, "option") || self.html_local_is(id, "optgroup"))
+            if !blank_options
+                && (self.html_local_is(id, "option") || self.html_local_is(id, "optgroup"))
                 && let Some(select) = self.nearest_select_ancestor(id)
             {
                 self.apply_default_selectedness(select);
             }
+        }
+        if blank_options {
+            self.apply_default_selectedness(parent);
         }
         self.record(Mutation::ChildList {
             target: parent,
@@ -2331,6 +2343,44 @@ impl Dom {
             previous,
             next,
         });
+    }
+
+    /// Appends a run of new, unselected HTML options as one tree mutation.
+    /// Their lack of descendants, attributes, and lifecycle hooks permits a
+    /// single selectedness pass after the run is linked
+    /// (<https://html.spec.whatwg.org/multipage/common-dom-interfaces.html#append-new-option-elements>).
+    ///
+    /// # Errors
+    ///
+    /// - [`DomError::StaleNode`] if `select` is stale.
+    /// - [`DomError::WrongNodeType`] if `select` is not an HTML `select`.
+    pub fn append_blank_options(&mut self, select: NodeId, count: usize) -> Result<(), DomError> {
+        self.require_live(select)?;
+        if !self.html_local_is(select, "select") {
+            return Err(DomError::WrongNodeType);
+        }
+        if count == 0 {
+            return Ok(());
+        }
+        let previous = self.last_child(select);
+        let mut added = Vec::with_capacity(count);
+        for _ in 0..count {
+            let option = self.create_element(
+                QualName::new(None, html_namespace(), LocalName::from("option")),
+                Vec::new(),
+            );
+            self.insert_linked(select, option, None);
+            added.push(option);
+        }
+        self.apply_default_selectedness(select);
+        self.record(Mutation::ChildList {
+            target: select,
+            added,
+            removed: Vec::new(),
+            previous,
+            next: None,
+        });
+        Ok(())
     }
 
     fn ensure_alive(&self, a: NodeId, b: NodeId) -> Result<(), DomError> {

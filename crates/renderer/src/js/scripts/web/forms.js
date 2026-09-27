@@ -1087,6 +1087,28 @@
   });
 
   Object.defineProperties(globalThis.HTMLSelectElement.prototype, {
+    // `[Reflect, ReflectDefault=0] attribute unsigned long size` with the
+    // rules for parsing non-negative integers
+    // (<https://html.spec.whatwg.org/multipage/form-elements.html#dom-select-size>).
+    size: {
+      get: function() {
+        const raw = this.getAttribute('size');
+        const match = raw === null ? null : /^[\t\n\f\r ]*\+?([0-9]+)/.exec(raw);
+        const parsed = match === null ? null : Number(match[1]);
+        return parsed !== null && parsed <= 4294967295 ? parsed : 0;
+      },
+      set: function(value) {
+        const unsigned = (+value) >>> 0;
+        if (unsigned === 0) this.removeAttribute('size');
+        else this.setAttribute('size', String(unsigned));
+      },
+      enumerable: true, configurable: true,
+    },
+    length: {
+      get: function() { return this.options.length; },
+      set: function(value) { this.options.length = value; },
+      enumerable: true, configurable: true,
+    },
     item: {
       value: function(index) {
         const option = this.options[index];
@@ -1115,18 +1137,19 @@
           this.appendChild(element);
           return;
         }
-        if (typeof before === 'number') {
+        if (!before || typeof before !== 'object' || before.nodeType !== 1) {
           const options = this.options;
-          const index = before < 0 ? options.length : before;
+          const beforeIndex = toLong(before);
+          const index = beforeIndex < 0 ? options.length : beforeIndex;
           const reference = options[index];
           if (reference === undefined) this.appendChild(element);
-          else this.insertBefore(element, reference);
+          else reference.parentNode.insertBefore(element, reference);
           return;
         }
-        if (before.parentNode !== this) {
+        if (before === this || !this.contains(before)) {
           throw new DOMException('reference is not a child of this select', 'NotFoundError');
         }
-        this.insertBefore(element, before);
+        before.parentNode.insertBefore(element, before);
       },
       writable: true, enumerable: true, configurable: true,
     },

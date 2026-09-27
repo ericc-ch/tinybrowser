@@ -22,7 +22,12 @@ impl Dom {
     /// (<https://html.spec.whatwg.org/multipage/form-elements.html#the-select-element:display-size>).
     fn display_size(&self, select: NodeId) -> u32 {
         self.attribute(select, "size")
-            .and_then(|raw| raw.trim().parse::<u32>().ok())
+            .and_then(|raw| {
+                let raw = raw.trim_start_matches(['\t', '\n', '\u{c}', '\r', ' ']);
+                let raw = raw.strip_prefix('+').unwrap_or(raw);
+                let digits = raw.bytes().take_while(u8::is_ascii_digit).count();
+                raw[..digits].parse::<u32>().ok()
+            })
             .filter(|size| *size > 0)
             .unwrap_or_else(|| {
                 if self.attribute(select, "multiple").is_some() {
@@ -79,7 +84,9 @@ impl Dom {
         }
         if selected.is_empty()
             && self.display_size(select) == 1
-            && let Some(&first) = options.iter().find(|&&option| !self.option_disabled(option))
+            && let Some(&first) = options
+                .iter()
+                .find(|&&option| !self.option_disabled(option))
         {
             self.option_selectedness.insert(first, true);
         }
@@ -110,15 +117,32 @@ impl Dom {
         }
     }
 
-    /// The `select` ancestor of an `option`, if any.
+    /// The `select` whose list of options contains this `option`, if any
+    /// (<https://html.spec.whatwg.org/multipage/form-elements.html#concept-select-option-list>).
     #[must_use]
     pub fn option_select_owner(&self, option: NodeId) -> Option<NodeId> {
+        if !self.html_local_is(option, "option") {
+            return None;
+        }
         let mut current = self.parent(option);
-        while let Some(parent) = current {
-            if self.html_local_is(parent, "select") {
-                return Some(parent);
+        let mut inside_optgroup = false;
+        while let Some(node) = current {
+            if self.html_local_is(node, "select") {
+                return Some(node);
             }
-            current = self.parent(parent);
+            if self.html_local_is(node, "option")
+                || self.html_local_is(node, "hr")
+                || self.html_local_is(node, "datalist")
+            {
+                return None;
+            }
+            if self.html_local_is(node, "optgroup") {
+                if inside_optgroup {
+                    return None;
+                }
+                inside_optgroup = true;
+            }
+            current = self.parent(node);
         }
         None
     }
@@ -126,8 +150,9 @@ impl Dom {
     /// Sets an option's selectedness; selecting an option in a single-select
     /// clears the others.
     pub fn set_option_selected_in_select(&mut self, option: NodeId, selected: bool) {
+        let owner = self.option_select_owner(option);
         if selected
-            && let Some(select) = self.option_select_owner(option)
+            && let Some(select) = owner
             && self.attribute(select, "multiple").is_none()
         {
             for other in self.select_options(select) {
@@ -137,16 +162,22 @@ impl Dom {
         }
         self.option_selectedness.insert(option, selected);
         self.option_dirty_selected.insert(option);
+        // An option whose selectedness becomes false asks its select to reset
+        // (<https://html.spec.whatwg.org/multipage/form-elements.html#ask-for-a-reset>).
+        if !selected && let Some(select) = owner {
+            self.apply_default_selectedness(select);
+        }
     }
 
-    /// The `option` elements under a `select`, in tree order.
+    /// The `option` elements in a `select`'s list of options, in tree order
+    /// (<https://html.spec.whatwg.org/multipage/form-elements.html#concept-select-option-list>).
     #[must_use]
     pub fn select_options(&self, select: NodeId) -> Vec<NodeId> {
         if !self.html_local_is(select, "select") {
             return Vec::new();
         }
         self.descendants(select)
-            .filter(|&id| self.html_local_is(id, "option"))
+            .filter(|&id| self.option_select_owner(id) == Some(select))
             .collect()
     }
 
@@ -247,7 +278,6 @@ impl Dom {
             }
         }
     }
-
 }
 
 /// Strips leading and trailing ASCII whitespace and collapses internal runs to
@@ -269,4 +299,3 @@ fn collapse_whitespace(text: &str) -> String {
     }
     result
 }
-
