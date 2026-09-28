@@ -19,6 +19,7 @@
 
 use crate::arena::Document;
 use crate::id::NodeId;
+use crate::metadata;
 use crate::node::{QualName, html_namespace, svg_namespace, xml_namespace};
 
 // ── shared lookups ──────────────────────────────────────────────────────────
@@ -466,7 +467,7 @@ pub fn lang_matches(dom: &Document, id: NodeId, ranges: &[Box<str>]) -> bool {
                     .flatten()
             })
         });
-    let tag = found.or_else(|| dom.document_language());
+    let tag = found.or_else(|| metadata::document_language(dom));
     let Some(tag) = tag else {
         return false;
     };

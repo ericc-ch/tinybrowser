@@ -44,8 +44,9 @@ use selectors::{
     },
 };
 
-use crate::arena::{Document, QuirksMode};
+use crate::arena::Document;
 use crate::id::NodeId;
+use crate::metadata::{self, QuirksMode};
 use crate::node::{Attribute, NodeKind};
 use crate::state;
 
@@ -827,10 +828,10 @@ impl Element for DomElement<'_> {
             PseudoClass::Indeterminate => state::is_indeterminate(self.dom, self.id),
             PseudoClass::Default => state::is_default(self.dom, self.id),
             PseudoClass::Focus | PseudoClass::FocusVisible => {
-                self.dom.active_element(self.id.document_id()) == Some(self.id)
+                metadata::active_element(self.dom, self.id.document_id()) == Some(self.id)
             }
             PseudoClass::FocusWithin => {
-                let mut cursor = self.dom.active_element(self.id.document_id());
+                let mut cursor = metadata::active_element(self.dom, self.id.document_id());
                 while let Some(current) = cursor {
                     if current == self.id {
                         return true;
@@ -977,7 +978,7 @@ fn query_context<'a>(
         MatchingMode::Normal,
         None,
         caches,
-        dom.quirks_mode().engine(),
+        metadata::quirks_mode(dom).engine(),
         NeedsSelectorFlags::No,
         MatchingForInvalidation::No,
     );

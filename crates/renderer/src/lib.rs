@@ -370,7 +370,7 @@ impl TreeSink for Sink {
                 clippy::cast_possible_truncation,
                 reason = "a document line beyond u32 is not reachable"
             )]
-            self.document.borrow_mut().set_script_line(element, line as u32);
+            dom::metadata::set_script_line(&mut self.document.borrow_mut(), element, line as u32);
         }
         if flags.template {
             let contents = self.document.borrow_mut().create_fragment();
@@ -459,7 +459,7 @@ impl TreeSink for Sink {
             QuirksMode::LimitedQuirks => dom::QuirksMode::LimitedQuirks,
             QuirksMode::Quirks => dom::QuirksMode::Quirks,
         };
-        self.document.borrow_mut().set_quirks_mode(stored);
+        dom::metadata::set_quirks_mode(&mut self.document.borrow_mut(), stored);
     }
 
     fn append_before_sibling(&self, sibling: &Self::Handle, new_node: NodeOrText<Self::Handle>) {

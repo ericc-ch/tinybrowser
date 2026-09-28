@@ -1,6 +1,5 @@
 //! The arena: flat slot array, generational handles, tree mutations.
 
-mod metadata;
 mod shadow;
 mod tree;
 
@@ -16,30 +15,15 @@ use crate::node::{
     html_qualified_name_eq, qualified_name_eq,
 };
 
-use self::metadata::Metadata;
 use self::shadow::ShadowState;
 pub use self::tree::Children;
 use self::tree::Slot;
 pub use self::tree::Tree;
 use crate::lifecycle::{self, ConnectionState};
+use crate::metadata::{self, ActiveElements, ScriptLines, ScrollOffsets, Settings};
 use crate::mutation::{self, Mutation, MutationJournal};
 
-/// The document-compatibility mode a query runs under: what html5ever's
-/// tree builder reports and parsed pages carry.
-///
-/// It changes exactly one matching behavior: in full quirks mode, class
-/// and id selector values compare ASCII-case-insensitively (the WHATWG
-/// id/class quirk). Standards and limited-quirks modes stay exact.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum QuirksMode {
-    /// Standards mode: full CSS case rules.
-    #[default]
-    NoQuirks,
-    /// Limited quirks: same selector rules as standards mode.
-    LimitedQuirks,
-    /// Full quirks: legacy case-insensitive class/id matching.
-    Quirks,
-}
+
 
 /// Why a mutation was refused.
 ///
@@ -103,7 +87,10 @@ impl std::error::Error for DomError {}
 #[derive(Debug)]
 pub struct Document {
     pub(crate) tree: Tree,
-    metadata: Metadata,
+    pub(crate) settings: Settings,
+    pub(crate) script_lines: ScriptLines,
+    pub(crate) scroll_offsets: ScrollOffsets,
+    pub(crate) active_elements: ActiveElements,
     shadow: ShadowState,
     pub(crate) form: FormState,
     pub(crate) journal: MutationJournal,
@@ -127,7 +114,10 @@ impl Document {
     pub fn new() -> Self {
         Self {
             tree: Tree::new(),
-            metadata: Metadata::default(),
+            settings: Settings::default(),
+            script_lines: ScriptLines::default(),
+            scroll_offsets: ScrollOffsets::default(),
+            active_elements: ActiveElements::default(),
             shadow: ShadowState::default(),
             form: FormState::default(),
             journal: MutationJournal::default(),
@@ -958,7 +948,7 @@ impl Document {
         let mut pending = vec![id];
         while let Some(current) = pending.pop() {
             self.form.forget(current);
-            self.metadata.forget(current);
+            metadata::forget(self, current);
             self.shadow.forget(current, &mut pending);
             self.tree.retire(current, &mut pending);
         }

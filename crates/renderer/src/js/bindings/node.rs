@@ -1403,7 +1403,7 @@ impl JsNode {
         let world = world.borrow();
         Ok(world
             .document(self.handle.0)
-            .map_or(0.0, |parsed| parsed.document.scroll_offset(self.handle.0).0))
+            .map_or(0.0, |parsed| dom::metadata::scroll_offset(&parsed.document, self.handle.0).0))
     }
 
     #[qjs(set, rename = "scrollLeft")]
@@ -1413,8 +1413,8 @@ impl JsNode {
         let Some(mut parsed) = world.document_mut(self.handle.0) else {
             return Ok(());
         };
-        let (_, top) = parsed.document.scroll_offset(self.handle.0);
-        parsed.document.set_scroll_offset(self.handle.0, value, top);
+        let (_, top) = dom::metadata::scroll_offset(&parsed.document, self.handle.0);
+        dom::metadata::set_scroll_offset(&mut parsed.document, self.handle.0, value, top);
         Ok(())
     }
 
@@ -1425,7 +1425,7 @@ impl JsNode {
         let world = world.borrow();
         Ok(world
             .document(self.handle.0)
-            .map_or(0.0, |parsed| parsed.document.scroll_offset(self.handle.0).1))
+            .map_or(0.0, |parsed| dom::metadata::scroll_offset(&parsed.document, self.handle.0).1))
     }
 
     #[qjs(set, rename = "scrollTop")]
@@ -1435,8 +1435,8 @@ impl JsNode {
         let Some(mut parsed) = world.document_mut(self.handle.0) else {
             return Ok(());
         };
-        let (left, _) = parsed.document.scroll_offset(self.handle.0);
-        parsed.document.set_scroll_offset(self.handle.0, left, value);
+        let (left, _) = dom::metadata::scroll_offset(&parsed.document, self.handle.0);
+        dom::metadata::set_scroll_offset(&mut parsed.document, self.handle.0, left, value);
         Ok(())
     }
 

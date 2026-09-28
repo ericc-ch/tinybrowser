@@ -1439,7 +1439,7 @@ impl World {
         // Mirror into the document so `:focus` and `:focus-within` match
         // (<https://drafts.csswg.org/selectors-4/#the-focus-pseudo>).
         if let Some(parsed) = self.runtime.documents.borrow_mut().get_mut(document) {
-            parsed.document.set_active_element(document, node);
+            dom::metadata::set_active_element(&mut parsed.document, document, node);
         }
     }
 

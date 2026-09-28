@@ -1047,9 +1047,7 @@ impl Document {
     /// Installs `parsed` as the active document and registers it, reporting
     /// whether a realm owns it afterwards.
     fn install_parsed(&mut self, mut parsed: Parsed) -> bool {
-        parsed
-            .document
-            .set_document_language(self.content_language.clone());
+        dom::metadata::set_document_language(&mut parsed.document, self.content_language.clone());
         if self.js.is_none() {
             let document = self.world.borrow_mut().replace_document(parsed);
             self.register_document(document);

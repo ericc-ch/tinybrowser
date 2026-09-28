@@ -993,7 +993,7 @@ pub(crate) fn script_at(world: &World, id: dom::NodeId) -> Option<Script> {
         Some(src) if !src.trim().is_empty() => ScriptSource::Src(src),
         _ => ScriptSource::Inline {
             source: element_text(&parsed.document, id),
-            line: parsed.document.script_line(id).unwrap_or(0),
+            line: dom::metadata::script_line(&parsed.document, id).unwrap_or(0),
         },
     };
     let typ = parsed.document.attribute(id, "type");
