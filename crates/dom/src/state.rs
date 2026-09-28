@@ -363,7 +363,7 @@ fn placeholder_capable_type(dom: &Document, id: NodeId) -> bool {
 /// value is empty (<https://html.spec.whatwg.org/#attr-input-placeholder>).
 /// The value is the *live* value, not the content attribute: a dirty value
 /// set through the IDL hides the placeholder. For an `input` that means a
-/// placeholder-capable type whose [`Document::input_value`] is empty; for a
+/// placeholder-capable type whose [`crate::form::input_value`] is empty; for a
 /// `textarea` the value is its text content.
 #[must_use]
 pub fn is_placeholder_shown(dom: &Document, id: NodeId) -> bool {
@@ -374,11 +374,10 @@ pub fn is_placeholder_shown(dom: &Document, id: NodeId) -> bool {
         if !placeholder_capable_type(dom, id) {
             return false;
         }
-        return dom.input_value(id).is_none_or(|value| value.is_empty());
+        return crate::form::input_value(dom, id).is_none_or(|value| value.is_empty());
     }
     if local_is(dom, id, &["textarea"]) {
-        return dom
-            .textarea_value(id)
+        return crate::form::textarea_value(dom, id)
             .is_none_or(|value| value.is_empty());
     }
     false
@@ -403,10 +402,10 @@ pub fn is_indeterminate(dom: &Document, id: NodeId) -> bool {
     if local_is(dom, id, &["input"]) {
         let typ = attr_value(dom, id, "type").unwrap_or_default().to_ascii_lowercase();
         if typ == "checkbox" {
-            return dom.indeterminate(id);
+            return crate::form::indeterminate(dom, id);
         }
         if typ == "radio" {
-            return dom.radio_group_checked(id).is_none();
+            return crate::form::radio_group_checked(dom, id).is_none();
         }
     }
     false

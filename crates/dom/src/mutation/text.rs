@@ -14,7 +14,7 @@ fn set_data(
     data: String,
 ) -> Result<(), DomError> {
     let parent = document.parent(id);
-    let value_before = parent.and_then(|parent| document.textarea_value_before_change(parent));
+    let value_before = parent.and_then(|parent| crate::form::textarea_value_before_change(document, parent));
     let kind = document.tree.kind_mut(id).ok_or(DomError::StaleNode)?;
     match extract(kind) {
         Some(field) => {
@@ -27,7 +27,7 @@ fn set_data(
                 },
             );
             if let Some(parent) = parent {
-                document.reset_textarea_selection_if_changed(parent, value_before);
+                crate::form::reset_textarea_selection_if_changed(document, parent, value_before);
             }
             Ok(())
         }
@@ -65,7 +65,7 @@ pub fn set_text(
 /// - [`DomError::WrongNodeType`] if `id` is not a text node.
 pub fn append_text(document: &mut Document, id: NodeId, extra: &str) -> Result<(), DomError> {
     let parent = document.parent(id);
-    let value_before = parent.and_then(|parent| document.textarea_value_before_change(parent));
+    let value_before = parent.and_then(|parent| crate::form::textarea_value_before_change(document, parent));
     let recording = mutation::recording(document);
     let old_value = {
         let kind = document.tree.kind_mut(id).ok_or(DomError::StaleNode)?;
@@ -86,7 +86,7 @@ pub fn append_text(document: &mut Document, id: NodeId, extra: &str) -> Result<(
         );
     }
     if let Some(parent) = parent {
-        document.reset_textarea_selection_if_changed(parent, value_before);
+        crate::form::reset_textarea_selection_if_changed(document, parent, value_before);
     }
     Ok(())
 }

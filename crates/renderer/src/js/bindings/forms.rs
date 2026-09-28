@@ -68,7 +68,7 @@ fn set_option_selectedness<'js>(ctx: Ctx<'js>, element: Value<'js>, selected: bo
     let Some(mut parsed) = world.document_mut(node) else {
         return Ok(());
     };
-    parsed.document.set_option_selectedness(node, selected);
+    dom::form::set_option_selectedness(&mut parsed.document, node, selected);
     Ok(())
 }
 
@@ -128,7 +128,7 @@ fn collect_pending_entries(
         return Vec::new();
     };
     let document = &parsed.document;
-    let root = document.tree_root_of(form);
+    let root = dom::form::tree_root_of(document, form);
     let mut pending = Vec::new();
     for node in document.tree().descendants(root) {
         let Some(NodeKind::Element { name, .. }) = document.kind(node) else {
@@ -141,7 +141,7 @@ fn collect_pending_entries(
         if local != "input" && local != "textarea" && local != "select" && local != "button" {
             continue;
         }
-        if document.form_owner(node) != Some(form) {
+        if dom::form::form_owner(document, node) != Some(form) {
             continue;
         }
         let Some(control_name) = document.attribute(node, "name") else {
@@ -192,7 +192,7 @@ fn pending_entry(
 ) -> Vec<PendingEntry> {
     match local {
         "textarea" => {
-            let mut value = dom.textarea_value(node).unwrap_or_default();
+            let mut value = dom::form::textarea_value(dom, node).unwrap_or_default();
             if wrap_is_hard(dom.attribute(node, "wrap").as_deref()) {
                 let cols = parse_positive(dom.attribute(node, "cols").as_deref()).unwrap_or(20);
                 value = hard_wrap(&value, cols);
@@ -233,7 +233,7 @@ fn pending_entry(
                 // A checkbox or radio contributes only when checked, and its
                 // value defaults to "on"
                 // (<https://html.spec.whatwg.org/multipage/input.html#dom-input-value-default-on>).
-                if !dom.checkedness(node) {
+                if !dom::form::checkedness(dom, node) {
                     return Vec::new();
                 }
                 let value = dom
@@ -245,21 +245,21 @@ fn pending_entry(
             } else {
                 vec![PendingEntry::Text(
                     control_name,
-                    dom.input_value(node).unwrap_or_default(),
+                    dom::form::input_value(dom, node).unwrap_or_default(),
                 )]
             }
         }
         "select" => {
             if dom.attribute(node, "multiple").is_some() {
-                dom.select_options(node)
+                dom::form::select_options(dom, node)
                     .iter()
-                    .filter(|&&option| dom.option_selected(option) && !is_disabled(dom, option))
+                    .filter(|&&option| dom::form::option_selected(dom, option) && !is_disabled(dom, option))
                     .map(|&option| {
-                        PendingEntry::Text(control_name.clone(), dom.option_value(option))
+                        PendingEntry::Text(control_name.clone(), dom::form::option_value(dom, option))
                     })
                     .collect()
             } else {
-                vec![PendingEntry::Text(control_name, dom.select_value(node))]
+                vec![PendingEntry::Text(control_name, dom::form::select_value(dom, node))]
             }
         }
         _ => Vec::new(),

@@ -217,28 +217,28 @@ fn rendered_input_text(dom: &Document, id: NodeId) -> Option<String> {
     if name.ns != dom::html_namespace() || name.local.as_ref() != "input" {
         return None;
     }
-    let input_type = dom.input_type(id).unwrap_or_else(|| "text".into());
+    let input_type = dom::form::input_type(dom, id).unwrap_or_else(|| "text".into());
     match input_type.as_str() {
         "hidden" | "checkbox" | "radio" | "file" | "image" | "range" | "color" => {
             Some(String::new())
         }
         "submit" => Some(
-            dom.input_value(id)
+            dom::form::input_value(dom, id)
                 .filter(|value| !value.is_empty())
                 .unwrap_or_else(|| "Submit".into()),
         ),
         "reset" => Some(
-            dom.input_value(id)
+            dom::form::input_value(dom, id)
                 .filter(|value| !value.is_empty())
                 .unwrap_or_else(|| "Reset".into()),
         ),
         // https://html.spec.whatwg.org/multipage/rendering.html#the-input-element-as-a-text-entry-widget
         "password" => Some(
-            dom.input_value(id)
+            dom::form::input_value(dom, id)
                 .map(|value| "\u{2022}".repeat(value.chars().count()))
                 .unwrap_or_default(),
         ),
-        _ => dom.input_value(id),
+        _ => dom::form::input_value(dom, id),
     }
 }
 

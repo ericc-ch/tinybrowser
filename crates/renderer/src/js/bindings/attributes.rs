@@ -930,12 +930,12 @@ fn apply_input_type_change(ctx: &Ctx<'_>, element: NodeId) -> Result<()> {
     let Some(mut parsed) = world.document_mut(element) else {
         return Ok(());
     };
-    let now = parsed.document.selection_supported(element);
-    let previously = parsed.document.input_selectable(element);
+    let now = dom::form::selection_supported(&parsed.document, element);
+    let previously = dom::form::input_selectable(&parsed.document, element);
     if !previously && now {
-        parsed.document.set_selection(element, 0, 0, 0);
+        dom::form::set_selection(&mut parsed.document, element, 0, 0, 0);
     }
-    parsed.document.set_input_selectable(element, now);
+    dom::form::set_input_selectable(&mut parsed.document, element, now);
     Ok(())
 }
 

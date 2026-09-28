@@ -306,17 +306,17 @@ fn legacy_pre_activation(ctx: &Ctx<'_>, node: NodeId) -> Result<PreActivation> {
     Ok(match type_attr.as_str() {
         "checkbox" => {
             let previous = PreActivation::Checkbox {
-                checked: dom.checkedness(node),
-                indeterminate: dom.indeterminate(node),
+                checked: dom::form::checkedness(dom, node),
+                indeterminate: dom::form::indeterminate(dom, node),
             };
-            let next = !dom.checkedness(node);
-            dom.set_input_checkedness(node, next);
-            dom.set_indeterminate(node, false);
+            let next = !dom::form::checkedness(dom, node);
+            dom::form::set_input_checkedness(dom, node, next);
+            dom::form::set_indeterminate(dom, node, false);
             previous
         }
         "radio" => {
-            let previous = dom.radio_group_checked(node);
-            dom.set_input_checkedness(node, true);
+            let previous = dom::form::radio_group_checked(dom, node);
+            dom::form::set_input_checkedness(dom, node, true);
             PreActivation::Radio(previous)
         }
         _ => PreActivation::None,
@@ -336,15 +336,15 @@ fn legacy_canceled_activation(ctx: &Ctx<'_>, node: NodeId, previous: &PreActivat
             checked,
             indeterminate,
         } => {
-            dom.set_input_checkedness(node, *checked);
-            dom.set_indeterminate(node, *indeterminate);
+            dom::form::set_input_checkedness(dom, node, *checked);
+            dom::form::set_indeterminate(dom, node, *indeterminate);
         }
         PreActivation::Radio(Some(other)) => {
-            dom.set_input_checkedness(node, false);
-            dom.set_input_checkedness(*other, true);
+            dom::form::set_input_checkedness(dom, node, false);
+            dom::form::set_input_checkedness(dom, *other, true);
         }
         PreActivation::Radio(None) => {
-            dom.set_input_checkedness(node, false);
+            dom::form::set_input_checkedness(dom, node, false);
         }
         PreActivation::None => {}
     }
@@ -417,16 +417,16 @@ fn toggle_checkedness(ctx: &Ctx<'_>, node: NodeId) -> Result<()> {
             .to_ascii_lowercase();
         match type_attr.as_str() {
             "checkbox" => {
-                let next = !dom.checkedness(node);
-                dom.set_input_checkedness(node, next);
+                let next = !dom::form::checkedness(dom, node);
+                dom::form::set_input_checkedness(dom, node, next);
                 true
             }
             "radio" => {
                 // A checked radio cannot be unchecked by clicking.
-                if dom.checkedness(node) {
+                if dom::form::checkedness(dom, node) {
                     false
                 } else {
-                    dom.set_input_checkedness(node, true);
+                    dom::form::set_input_checkedness(dom, node, true);
                     true
                 }
             }
@@ -476,7 +476,7 @@ fn run_activation(ctx: &Ctx<'_>, node: NodeId) -> Result<()> {
             },
             _ => Activation::None,
         };
-        (activation, dom.form_owner(node))
+        (activation, dom::form::form_owner(dom, node))
     };
     match activation {
         Activation::None => Ok(()),

@@ -18,7 +18,7 @@
 //! ```
 
 mod arena;
-mod form;
+pub mod form;
 mod id;
 pub mod lifecycle;
 pub mod metadata;

@@ -978,7 +978,7 @@ impl JsNode {
         let Some(parsed) = world.document(self.handle.0) else {
             return Err(Exception::throw_type(&ctx, "no document"));
         };
-        Ok(parsed.document.element_value(self.handle.0).unwrap_or_default())
+        Ok(dom::form::element_value(&parsed.document, self.handle.0).unwrap_or_default())
     }
 
     // https://html.spec.whatwg.org/multipage/input.html#dom-input-value
@@ -989,9 +989,7 @@ impl JsNode {
         let Some(mut parsed) = world.document_mut(self.handle.0) else {
             return Err(Exception::throw_type(&ctx, "no document"));
         };
-        parsed
-            .document
-            .set_element_value(self.handle.0, value.0)
+        dom::form::set_element_value(&mut parsed.document, self.handle.0, value.0)
             .map_err(|err| throw_dom_error(&ctx, err))?;
         Ok(())
     }
@@ -1004,9 +1002,7 @@ impl JsNode {
         let Some(parsed) = world.document(self.handle.0) else {
             return Err(Exception::throw_type(&ctx, "no document"));
         };
-        Ok(parsed
-            .document
-            .control_default_value(self.handle.0)
+        Ok(dom::form::control_default_value(&parsed.document, self.handle.0)
             .unwrap_or_default())
     }
 
@@ -1018,9 +1014,7 @@ impl JsNode {
         let Some(mut parsed) = world.document_mut(self.handle.0) else {
             return Err(Exception::throw_type(&ctx, "no document"));
         };
-        parsed
-            .document
-            .set_control_default_value(self.handle.0, value.0)
+        dom::form::set_control_default_value(&mut parsed.document, self.handle.0, value.0)
             .map_err(|err| throw_dom_error(&ctx, err))?;
         Ok(())
     }
@@ -1037,9 +1031,7 @@ impl JsNode {
             clippy::cast_possible_truncation,
             reason = "a 64-bit string length beyond u32 cannot be produced by this engine"
         )]
-        Ok(parsed
-            .document
-            .textarea_value(self.handle.0)
+        Ok(dom::form::textarea_value(&parsed.document, self.handle.0)
             .map_or(0, |value| value.encode_utf16().count() as u32))
     }
 
@@ -1051,7 +1043,7 @@ impl JsNode {
         let Some(parsed) = world.document(self.handle.0) else {
             return Ok(Value::new_null(ctx));
         };
-        match parsed.document.selection(self.handle.0) {
+        match dom::form::selection(&parsed.document, self.handle.0) {
             Some((start, _, _)) => Ok(Value::new_number(ctx, f64::from(start))),
             None => Ok(Value::new_null(ctx)),
         }
@@ -1064,7 +1056,7 @@ impl JsNode {
         let Some(mut parsed) = world.document_mut(self.handle.0) else {
             return Ok(());
         };
-        let Some((_, end, direction)) = parsed.document.selection(self.handle.0) else {
+        let Some((_, end, direction)) = dom::form::selection(&parsed.document, self.handle.0) else {
             return Err(throw_dom(
                 &ctx,
                 "InvalidStateError",
@@ -1072,9 +1064,7 @@ impl JsNode {
             ));
         };
         let start = value.0;
-        let changed = parsed
-            .document
-            .set_selection(self.handle.0, start, end.max(start), direction);
+        let changed = dom::form::set_selection(&mut parsed.document, self.handle.0, start, end.max(start), direction);
         drop(parsed);
         if changed {
             world.queue_select(self.handle.0);
@@ -1090,7 +1080,7 @@ impl JsNode {
         let Some(parsed) = world.document(self.handle.0) else {
             return Ok(Value::new_null(ctx));
         };
-        match parsed.document.selection(self.handle.0) {
+        match dom::form::selection(&parsed.document, self.handle.0) {
             Some((_, end, _)) => Ok(Value::new_number(ctx, f64::from(end))),
             None => Ok(Value::new_null(ctx)),
         }
@@ -1103,14 +1093,14 @@ impl JsNode {
         let Some(mut parsed) = world.document_mut(self.handle.0) else {
             return Ok(());
         };
-        let Some((start, _, direction)) = parsed.document.selection(self.handle.0) else {
+        let Some((start, _, direction)) = dom::form::selection(&parsed.document, self.handle.0) else {
             return Err(throw_dom(
                 &ctx,
                 "InvalidStateError",
                 "selectionEnd does not apply to this control",
             ));
         };
-        let changed = parsed.document.set_selection(self.handle.0, start, value.0, direction);
+        let changed = dom::form::set_selection(&mut parsed.document, self.handle.0, start, value.0, direction);
         drop(parsed);
         if changed {
             world.queue_select(self.handle.0);
@@ -1126,7 +1116,7 @@ impl JsNode {
         let Some(parsed) = world.document(self.handle.0) else {
             return Ok(Value::new_null(ctx));
         };
-        match parsed.document.selection(self.handle.0) {
+        match dom::form::selection(&parsed.document, self.handle.0) {
             Some((_, _, direction)) => Ok(string_value(&ctx, direction_name(direction))?),
             None => Ok(Value::new_null(ctx)),
         }
@@ -1139,7 +1129,7 @@ impl JsNode {
         let Some(mut parsed) = world.document_mut(self.handle.0) else {
             return Ok(());
         };
-        let Some((start, end, _)) = parsed.document.selection(self.handle.0) else {
+        let Some((start, end, _)) = dom::form::selection(&parsed.document, self.handle.0) else {
             return Err(throw_dom(
                 &ctx,
                 "InvalidStateError",
@@ -1147,7 +1137,7 @@ impl JsNode {
             ));
         };
         let direction = direction_code(&value.0);
-        let changed = parsed.document.set_selection(self.handle.0, start, end, direction);
+        let changed = dom::form::set_selection(&mut parsed.document, self.handle.0, start, end, direction);
         drop(parsed);
         if changed {
             world.queue_select(self.handle.0);
@@ -1192,7 +1182,7 @@ impl JsNode {
             }
         }
         for control in controls {
-            parsed.document.reset_control(control);
+            dom::form::reset_control(&mut parsed.document, control);
         }
         Ok(())
     }
@@ -1516,7 +1506,7 @@ impl JsNode {
             let world = world.borrow();
             world
                 .document(self.handle.0)
-                .and_then(|parsed| parsed.document.form_owner(self.handle.0))
+                .and_then(|parsed| dom::form::form_owner(&parsed.document, self.handle.0))
         };
         match form {
             Some(form) => wrap_node(&ctx, form),
@@ -1531,7 +1521,7 @@ impl JsNode {
         let world = world.borrow();
         Ok(world
             .document(self.handle.0)
-            .is_some_and(|parsed| parsed.document.checkedness(self.handle.0)))
+            .is_some_and(|parsed| dom::form::checkedness(&parsed.document, self.handle.0)))
     }
 
     #[qjs(set, rename = "checked")]
@@ -1541,7 +1531,7 @@ impl JsNode {
         let Some(mut parsed) = world.document_mut(self.handle.0) else {
             return Ok(());
         };
-        parsed.document.set_input_checkedness(self.handle.0, value);
+        dom::form::set_input_checkedness(&mut parsed.document, self.handle.0, value);
         Ok(())
     }
 
@@ -1552,7 +1542,7 @@ impl JsNode {
         let world = world.borrow();
         Ok(world
             .document(self.handle.0)
-            .is_some_and(|parsed| parsed.document.indeterminate(self.handle.0)))
+            .is_some_and(|parsed| dom::form::indeterminate(&parsed.document, self.handle.0)))
     }
 
     #[qjs(set, rename = "indeterminate")]
@@ -1562,7 +1552,7 @@ impl JsNode {
         let Some(mut parsed) = world.document_mut(self.handle.0) else {
             return Ok(());
         };
-        parsed.document.set_indeterminate(self.handle.0, value);
+        dom::form::set_indeterminate(&mut parsed.document, self.handle.0, value);
         Ok(())
     }
 
@@ -1584,7 +1574,7 @@ impl JsNode {
         let world = world.borrow();
         Ok(world
             .document(self.handle.0)
-            .is_some_and(|parsed| parsed.document.option_selected(self.handle.0)))
+            .is_some_and(|parsed| dom::form::option_selected(&parsed.document, self.handle.0)))
     }
 
     #[qjs(set, rename = "selected")]
@@ -1594,9 +1584,7 @@ impl JsNode {
         let Some(mut parsed) = world.document_mut(self.handle.0) else {
             return Ok(());
         };
-        parsed
-            .document
-            .set_option_selected_in_select(self.handle.0, value);
+        dom::form::set_option_selected_in_select(&mut parsed.document, self.handle.0, value);
         Ok(())
     }
 
@@ -1619,7 +1607,7 @@ impl JsNode {
             parsed
                 .document
                 .no_namespace_attribute(self.handle.0, "label")
-                .unwrap_or_else(|| parsed.document.option_text(self.handle.0))
+                .unwrap_or_else(|| dom::form::option_text(&parsed.document, self.handle.0))
         }))
     }
 
@@ -1636,7 +1624,7 @@ impl JsNode {
         Ok(world
             .document(self.handle.0)
             .map_or_else(String::new, |parsed| {
-                parsed.document.option_text(self.handle.0)
+                dom::form::option_text(&parsed.document, self.handle.0)
             }))
     }
 
@@ -1666,10 +1654,10 @@ impl JsNode {
         let Some(parsed) = world.document(self.handle.0) else {
             return Ok(0);
         };
-        let Some(select) = parsed.document.option_select_owner(self.handle.0) else {
+        let Some(select) = dom::form::option_select_owner(&parsed.document, self.handle.0) else {
             return Ok(0);
         };
-        for (index, option) in parsed.document.select_options(select).into_iter().enumerate() {
+        for (index, option) in dom::form::select_options(&parsed.document, select).into_iter().enumerate() {
             if option == self.handle.0 {
                 return Ok(i32::try_from(index).unwrap_or(i32::MAX));
             }
@@ -1683,7 +1671,7 @@ impl JsNode {
         let world = world(&ctx)?;
         let world = world.borrow();
         Ok(world.document(self.handle.0).map_or(-1, |parsed| {
-            parsed.document.select_selected_index(self.handle.0)
+            dom::form::select_selected_index(&parsed.document, self.handle.0)
         }))
     }
 
@@ -1694,7 +1682,7 @@ impl JsNode {
         let Some(mut parsed) = world.document_mut(self.handle.0) else {
             return Ok(());
         };
-        parsed.document.set_select_selected_index(self.handle.0, value);
+        dom::form::set_select_selected_index(&mut parsed.document, self.handle.0, value);
         Ok(())
     }
 
@@ -3510,7 +3498,7 @@ impl JsNode {
             pairs
         };
         for (from, to) in pairs {
-            parsed.document.clone_form_state(from, to);
+            dom::form::clone_form_state(&mut parsed.document, from, to);
         }
         drop(parsed);
         drop(world);
@@ -3694,7 +3682,7 @@ impl JsNode {
         let world = world(&ctx)?;
         let world = world.borrow();
         Ok(world.document(self.handle.0).map_or(0, |parsed| {
-            parsed.document.select_options(self.handle.0).len()
+            dom::form::select_options(&parsed.document, self.handle.0).len()
         }))
     }
 

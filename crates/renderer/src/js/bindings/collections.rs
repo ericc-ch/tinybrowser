@@ -117,9 +117,7 @@ fn append_blank_options<'js>(ctx: Ctx<'js>, select: Value<'js>, count: u32) -> R
     let Some(mut parsed) = world.document_mut(id) else {
         return Err(Exception::throw_type(&ctx, "no document"));
     };
-    parsed
-        .document
-        .append_blank_options(id, count)
+    dom::form::append_blank_options(&mut parsed.document, id, count)
         .map_err(|_| Exception::throw_type(&ctx, "not a select"))
 }
 

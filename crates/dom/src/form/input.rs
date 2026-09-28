@@ -33,28 +33,27 @@ const INPUT_TYPES: &[&str] = &[
     "button",
 ];
 
-impl Document {
     /// The live value of an HTML `input` element.
     ///
     /// Before the dirty value flag is set, the value follows the content
     /// attribute; setting the IDL value stores an independent value
     /// (<https://html.spec.whatwg.org/multipage/input.html#dom-input-value>).
     #[must_use]
-    pub fn input_value(&self, id: NodeId) -> Option<String> {
-        let typ = self.input_type(id)?;
+    pub fn input_value(document: &Document, id: NodeId) -> Option<String> {
+        let typ = input_type(document, id)?;
         Some(match input_value_mode(&typ) {
             ValueMode::Value => {
-                let value = self
+                let value = document
                     .form
                     .input_values
                     .get(&id)
                     .cloned()
-                    .or_else(|| self.attribute(id, "value"))
+                    .or_else(|| document.attribute(id, "value"))
                     .unwrap_or_default();
-                self.sanitize_input_value(id, value)
+                sanitize_input_value(document, id, value)
             }
-            ValueMode::Default => self.attribute(id, "value").unwrap_or_default(),
-            ValueMode::DefaultOn => self
+            ValueMode::Default => document.attribute(id, "value").unwrap_or_default(),
+            ValueMode::DefaultOn => document
                 .attribute(id, "value")
                 .unwrap_or_else(|| "on".to_owned()),
             ValueMode::Filename => String::new(),
@@ -70,15 +69,15 @@ impl Document {
     /// Returns [`DomError::WrongNodeType`] when `id` is not an HTML `input`,
     /// or [`DomError::InvalidState`] when setting a non-empty value on a
     /// `type=file` input.
-    pub fn set_input_value(&mut self, id: NodeId, value: String) -> Result<(), DomError> {
-        let typ = self.input_type(id).ok_or(DomError::WrongNodeType)?;
+    pub fn set_input_value(document: &mut Document, id: NodeId, value: String) -> Result<(), DomError> {
+        let typ = input_type(document, id).ok_or(DomError::WrongNodeType)?;
         match input_value_mode(&typ) {
             ValueMode::Value => {
-                let value = self.sanitize_input_value(id, value);
-                self.form.input_values.insert(id, value);
+                let value = sanitize_input_value(document, id, value);
+                document.form.input_values.insert(id, value);
             }
             ValueMode::Default | ValueMode::DefaultOn => {
-                crate::mutation::set_attribute(self, id, "value", value)?;
+                crate::mutation::set_attribute(document, id, "value", value)?;
             }
             ValueMode::Filename => {
                 if !value.is_empty() {
@@ -92,28 +91,28 @@ impl Document {
     /// Runs the input type-change steps after the `type` attribute changed,
     /// comparing against the last normalized state
     /// (<https://html.spec.whatwg.org/multipage/input.html#the-input-element:type-change-state>).
-    pub(crate) fn refresh_input_type(&mut self, id: NodeId) -> Result<(), DomError> {
-        let Some(new_type) = self.input_type(id) else {
+    pub(crate) fn refresh_input_type(document: &mut Document, id: NodeId) -> Result<(), DomError> {
+        let Some(new_type) = input_type(document, id) else {
             return Ok(());
         };
-        let old = self
+        let old = document
             .form
             .input_types
             .get(&id)
             .cloned()
             .unwrap_or_else(|| "text".to_owned());
-        self.form.input_types.insert(id, new_type.clone());
+        document.form.input_types.insert(id, new_type.clone());
         if old == new_type {
             return Ok(());
         }
-        self.apply_input_type_migration(id, &old, &new_type)
+        apply_input_type_migration(document, id, &old, &new_type)
     }
 
     /// Migrates an input's value between value modes and re-sanitizes it for
     /// the new state
     /// (<https://html.spec.whatwg.org/multipage/input.html#the-input-element:type-change-state>).
     fn apply_input_type_migration(
-        &mut self,
+        document: &mut Document,
         id: NodeId,
         old: &str,
         new_type: &str,
@@ -121,44 +120,44 @@ impl Document {
         match (input_value_mode(old), input_value_mode(new_type)) {
             // A value-mode value becomes the new default, unless it is empty.
             (ValueMode::Value, ValueMode::Default | ValueMode::DefaultOn) => {
-                let raw = self
+                let raw = document
                     .form
                     .input_values
                     .get(&id)
                     .cloned()
-                    .or_else(|| self.attribute(id, "value"))
+                    .or_else(|| document.attribute(id, "value"))
                     .unwrap_or_default();
-                let value = self.sanitize_value_for_type(id, old, raw);
+                let value = sanitize_value_for_type(document, id, old, raw);
                 if !value.is_empty() {
-                    crate::mutation::set_attribute(self, id, "value", value)?;
+                    crate::mutation::set_attribute(document, id, "value", value)?;
                 }
-                self.form.input_values.remove(&id);
+                document.form.input_values.remove(&id);
             }
             // A non-value state follows the content attribute again.
             (mode, ValueMode::Value) if mode != ValueMode::Value => {
-                self.form.input_values.remove(&id);
+                document.form.input_values.remove(&id);
             }
             // A non-filename state clears the value for a file input.
             (mode, ValueMode::Filename) if mode != ValueMode::Filename => {
-                self.form.input_values.remove(&id);
+                document.form.input_values.remove(&id);
             }
             _ => {}
         }
         // The type-change steps invoke the new state's value sanitization.
         if input_value_mode(new_type) == ValueMode::Value
-            && let Some(value) = self.form.input_values.get(&id).cloned()
+            && let Some(value) = document.form.input_values.get(&id).cloned()
         {
-            let sanitized = self.sanitize_value_for_type(id, new_type, value);
-            self.form.input_values.insert(id, sanitized);
+            let sanitized = sanitize_value_for_type(document, id, new_type, value);
+            document.form.input_values.insert(id, sanitized);
         }
         Ok(())
     }
 
     /// The normalized type state of an HTML `input` element.
     #[must_use]
-    pub fn input_type(&self, id: NodeId) -> Option<String> {
-        self.input_value_element(id)?;
-        let value = self
+    pub fn input_type(document: &Document, id: NodeId) -> Option<String> {
+        input_value_element(document, id)?;
+        let value = document
             .attribute(id, "type")
             .unwrap_or_else(|| "text".into())
             .to_ascii_lowercase();
@@ -169,8 +168,8 @@ impl Document {
         })
     }
 
-    fn input_value_element(&self, id: NodeId) -> Option<()> {
-        let (name, _) = self.element(id)?;
+    fn input_value_element(document: &Document, id: NodeId) -> Option<()> {
+        let (name, _) = document.element(id)?;
         (name.ns == html_namespace() && name.local.as_ref() == "input").then_some(())
     }
 
@@ -178,15 +177,15 @@ impl Document {
     /// value has a grammar. A string that does not match is replaced by the
     /// state's default (the empty string, or `#000000` for color)
     /// <https://html.spec.whatwg.org/multipage/input.html#value-sanitization-algorithm>.
-    fn sanitize_input_value(&self, id: NodeId, value: String) -> String {
-        let typ = self.input_type(id).unwrap_or_else(|| "text".into());
-        self.sanitize_value_for_type(id, &typ, value)
+    fn sanitize_input_value(document: &Document, id: NodeId, value: String) -> String {
+        let typ = input_type(document, id).unwrap_or_else(|| "text".into());
+        sanitize_value_for_type(document, id, &typ, value)
     }
 
     /// The value sanitization algorithm for a named state; used by
     /// [`Self::sanitize_input_value`] and by the type-change steps, which must
     /// sanitize for the new state before the `type` attribute lands.
-    fn sanitize_value_for_type(&self, id: NodeId, typ: &str, value: String) -> String {
+    fn sanitize_value_for_type(document: &Document, id: NodeId, typ: &str, value: String) -> String {
         match typ {
             "text" | "search" | "tel" | "password" => value.replace(['\r', '\n'], ""),
             "url" | "email" => value
@@ -196,12 +195,12 @@ impl Document {
             "number" => sanitize_grammar(value, is_valid_floating_point),
             "range" => sanitize_range_value(
                 &value,
-                self.attribute(id, "min").as_deref().and_then(parse_finite),
-                self.attribute(id, "max").as_deref().and_then(parse_finite),
-                self.attribute(id, "value")
+                document.attribute(id, "min").as_deref().and_then(parse_finite),
+                document.attribute(id, "max").as_deref().and_then(parse_finite),
+                document.attribute(id, "value")
                     .as_deref()
                     .and_then(parse_finite),
-                self.attribute(id, "step").as_deref(),
+                document.attribute(id, "step").as_deref(),
             ),
             "date" => sanitize_grammar(value, is_valid_date),
             "month" => sanitize_grammar(value, is_valid_month),
@@ -224,16 +223,16 @@ impl Document {
     ///
     /// <https://html.spec.whatwg.org/multipage/form-elements.html#concept-textarea-raw-value>
     #[must_use]
-    pub fn textarea_raw_value(&self, id: NodeId) -> Option<String> {
-        if !self.html_local_is(id, "textarea") {
+    pub fn textarea_raw_value(document: &Document, id: NodeId) -> Option<String> {
+        if !document.html_local_is(id, "textarea") {
             return None;
         }
         Some(
-            self.form
+            document.form
                 .input_values
                 .get(&id)
                 .cloned()
-                .unwrap_or_else(|| self.child_text_content(id)),
+                .unwrap_or_else(|| document.child_text_content(id)),
         )
     }
 
@@ -242,8 +241,8 @@ impl Document {
     ///
     /// <https://html.spec.whatwg.org/multipage/form-elements.html#concept-fe-api-value>
     #[must_use]
-    pub fn textarea_value(&self, id: NodeId) -> Option<String> {
-        self.textarea_raw_value(id)
+    pub fn textarea_value(document: &Document, id: NodeId) -> Option<String> {
+        textarea_raw_value(document, id)
             .map(|value| normalize_newlines(&value))
     }
 
@@ -254,22 +253,22 @@ impl Document {
     /// # Errors
     ///
     /// Returns [`DomError::WrongNodeType`] when `id` is not an HTML `textarea`.
-    pub fn set_textarea_value(&mut self, id: NodeId, value: String) -> Result<(), DomError> {
-        if !self.html_local_is(id, "textarea") {
+    pub fn set_textarea_value(document: &mut Document, id: NodeId, value: String) -> Result<(), DomError> {
+        if !document.html_local_is(id, "textarea") {
             return Err(DomError::WrongNodeType);
         }
-        self.form.input_values.insert(id, value);
+        document.form.input_values.insert(id, value);
         Ok(())
     }
 
     /// The live value of a text-like control, as the `value` IDL attribute
     /// reports it: the API value for `input` and `textarea`.
     #[must_use]
-    pub fn control_value(&self, id: NodeId) -> Option<String> {
-        if self.html_local_is(id, "input") {
-            self.input_value(id)
+    pub fn control_value(document: &Document, id: NodeId) -> Option<String> {
+        if document.html_local_is(id, "input") {
+            input_value(document, id)
         } else {
-            self.textarea_value(id)
+            textarea_value(document, id)
         }
     }
 
@@ -284,18 +283,17 @@ impl Document {
     ///
     /// Returns [`DomError::WrongNodeType`] when `id` is not an HTML `input` or
     /// `textarea`.
-    pub fn set_control_value(&mut self, id: NodeId, value: String) -> Result<(), DomError> {
-        let old = self.control_value(id);
-        if self.html_local_is(id, "input") {
-            self.set_input_value(id, value)?;
+    pub fn set_control_value(document: &mut Document, id: NodeId, value: String) -> Result<(), DomError> {
+        let old = control_value(document, id);
+        if document.html_local_is(id, "input") {
+            set_input_value(document, id, value)?;
         } else {
-            self.set_textarea_value(id, value)?;
+            set_textarea_value(document, id, value)?;
         }
-        if self.selection_supported(id) && self.control_value(id) != old {
-            let end = self
-                .control_value(id)
+        if selection_supported(document, id) && control_value(document, id) != old {
+            let end = control_value(document, id)
                 .map_or(0, |value| utf16_length(&value));
-            self.set_selection(id, end, end, 0);
+            set_selection(document, id, end, end, 0);
         }
         Ok(())
     }
@@ -305,15 +303,15 @@ impl Document {
     /// types report null and rejecting setters
     /// (<https://html.spec.whatwg.org/multipage/input.html#do-not-apply>).
     #[must_use]
-    pub fn selection_supported(&self, id: NodeId) -> bool {
-        if self.html_local_is(id, "textarea") {
+    pub fn selection_supported(document: &Document, id: NodeId) -> bool {
+        if document.html_local_is(id, "textarea") {
             return true;
         }
-        if !self.html_local_is(id, "input") {
+        if !document.html_local_is(id, "input") {
             return false;
         }
         matches!(
-            self.input_type(id).as_deref(),
+            input_type(document, id).as_deref(),
             Some("text" | "search" | "tel" | "url" | "password")
         )
     }
@@ -321,25 +319,24 @@ impl Document {
     /// The stored selection `(start, end, direction)`, clamped to the current
     /// API value length. `None` when no text selection applies.
     #[must_use]
-    pub fn selection(&self, id: NodeId) -> Option<(u32, u32, u8)> {
-        if !self.selection_supported(id) {
+    pub fn selection(document: &Document, id: NodeId) -> Option<(u32, u32, u8)> {
+        if !selection_supported(document, id) {
             return None;
         }
-        let length = self
-            .control_value(id)
+        let length = control_value(document, id)
             .map_or(0, |value| utf16_length(&value));
-        let (start, end, direction) = self.form.selections.get(&id).copied().unwrap_or((0, 0, 0));
+        let (start, end, direction) = document.form.selections.get(&id).copied().unwrap_or((0, 0, 0));
         Some((start.min(length), end.min(length), direction))
     }
 
     /// The API value of a non-dirty `textarea` `parent`, or `None` when
     /// `parent` is not such a control. Used to detect whether a child change
     /// really changed the value.
-    pub(crate) fn textarea_value_before_change(&self, parent: NodeId) -> Option<String> {
-        if !self.html_local_is(parent, "textarea") || self.form.input_values.contains_key(&parent) {
+    pub(crate) fn textarea_value_before_change(document: &Document, parent: NodeId) -> Option<String> {
+        if !document.html_local_is(parent, "textarea") || document.form.input_values.contains_key(&parent) {
             return None;
         }
-        self.textarea_value(parent)
+        textarea_value(document, parent)
     }
 
     /// A `textarea` with no stored raw value (dirty value flag unset) derives
@@ -349,27 +346,26 @@ impl Document {
     /// keeps the selection. A dirty textarea keeps both its value and its
     /// selection.
     pub(crate) fn reset_textarea_selection_if_changed(
-        &mut self,
+        document: &mut Document,
         parent: NodeId,
         before: Option<String>,
     ) {
         let Some(before) = before else {
             return;
         };
-        if self.textarea_value(parent).as_deref() != Some(before.as_str()) {
-            self.form.selections.insert(parent, (0, 0, 0));
+        if textarea_value(document, parent).as_deref() != Some(before.as_str()) {
+            document.form.selections.insert(parent, (0, 0, 0));
         }
     }
 
     /// Stores `id`'s selection, clamped to the current API value length, and
     /// reports whether the stored tuple actually changed (so the caller can
     /// queue a `select` event only for a real modification).
-    pub fn set_selection(&mut self, id: NodeId, start: u32, end: u32, direction: u8) -> bool {
-        if !self.selection_supported(id) {
+    pub fn set_selection(document: &mut Document, id: NodeId, start: u32, end: u32, direction: u8) -> bool {
+        if !selection_supported(document, id) {
             return false;
         }
-        let length = self
-            .control_value(id)
+        let length = control_value(document, id)
             .map_or(0, |value| utf16_length(&value));
         let mut end = end.min(length);
         let mut start = start.min(length);
@@ -381,33 +377,33 @@ impl Document {
         }
         end = end.max(start);
         let next = (start, end, direction.min(2));
-        let previous = self.form.selections.get(&id).copied().unwrap_or((0, 0, 0));
-        self.form.selections.insert(id, next);
+        let previous = document.form.selections.get(&id).copied().unwrap_or((0, 0, 0));
+        document.form.selections.insert(id, next);
         next != previous
     }
 
     /// Whether `id`'s input type supported a text selection when its `type`
     /// last changed. The input default (`type=text`) is selectable.
     #[must_use]
-    pub fn input_selectable(&self, id: NodeId) -> bool {
-        self.form.input_selectable.get(&id).copied().unwrap_or(true)
+    pub fn input_selectable(document: &Document, id: NodeId) -> bool {
+        document.form.input_selectable.get(&id).copied().unwrap_or(true)
     }
 
     /// Records whether `id`'s input type currently supports a text selection.
-    pub fn set_input_selectable(&mut self, id: NodeId, selectable: bool) {
-        self.form.input_selectable.insert(id, selectable);
+    pub fn set_input_selectable(document: &mut Document, id: NodeId, selectable: bool) {
+        document.form.input_selectable.insert(id, selectable);
     }
 
     /// The `value` IDL value for any element that has one: `option`, `select`,
     /// or a text-like control.
     #[must_use]
-    pub fn element_value(&self, id: NodeId) -> Option<String> {
-        if self.html_local_is(id, "option") {
-            Some(self.option_value(id))
-        } else if self.html_local_is(id, "select") {
-            Some(self.select_value(id))
+    pub fn element_value(document: &Document, id: NodeId) -> Option<String> {
+        if document.html_local_is(id, "option") {
+            Some(super::select::option_value(document, id))
+        } else if document.html_local_is(id, "select") {
+            Some(super::select::select_value(document, id))
         } else {
-            self.control_value(id)
+            control_value(document, id)
         }
     }
 
@@ -417,15 +413,15 @@ impl Document {
     /// # Errors
     ///
     /// Returns [`DomError::WrongNodeType`] when `id` has no `value`.
-    pub fn set_element_value(&mut self, id: NodeId, value: String) -> Result<(), DomError> {
-        if self.html_local_is(id, "option") {
-            return crate::mutation::set_attribute(self, id, "value", value);
+    pub fn set_element_value(document: &mut Document, id: NodeId, value: String) -> Result<(), DomError> {
+        if document.html_local_is(id, "option") {
+            return crate::mutation::set_attribute(document, id, "value", value);
         }
-        if self.html_local_is(id, "select") {
-            self.set_select_value(id, &value);
+        if document.html_local_is(id, "select") {
+            super::select::set_select_value(document, id, &value);
             return Ok(());
         }
-        self.set_control_value(id, value)
+        set_control_value(document, id, value)
     }
 
     /// The `defaultValue` of a text-like control: the `value` content
@@ -433,11 +429,11 @@ impl Document {
     ///
     /// <https://html.spec.whatwg.org/multipage/form-elements.html#dom-textarea-defaultvalue>
     #[must_use]
-    pub fn control_default_value(&self, id: NodeId) -> Option<String> {
-        if self.html_local_is(id, "input") {
-            Some(self.attribute(id, "value").unwrap_or_default())
-        } else if self.html_local_is(id, "textarea") {
-            Some(self.child_text_content(id))
+    pub fn control_default_value(document: &Document, id: NodeId) -> Option<String> {
+        if document.html_local_is(id, "input") {
+            Some(document.attribute(id, "value").unwrap_or_default())
+        } else if document.html_local_is(id, "textarea") {
+            Some(document.child_text_content(id))
         } else {
             None
         }
@@ -453,21 +449,20 @@ impl Document {
     ///
     /// Returns [`DomError::WrongNodeType`] when `id` is not an HTML `input` or
     /// `textarea`.
-    pub fn set_control_default_value(&mut self, id: NodeId, value: String) -> Result<(), DomError> {
-        if self.html_local_is(id, "input") {
-            return crate::mutation::set_attribute(self, id, "value", value);
+    pub fn set_control_default_value(document: &mut Document, id: NodeId, value: String) -> Result<(), DomError> {
+        if document.html_local_is(id, "input") {
+            return crate::mutation::set_attribute(document, id, "value", value);
         }
-        if !self.html_local_is(id, "textarea") {
+        if !document.html_local_is(id, "textarea") {
             return Err(DomError::WrongNodeType);
         }
-        let replacement = self.create_fragment();
+        let replacement = document.create_fragment();
         if !value.is_empty() {
-            let text = self.create_text(value);
-            crate::mutation::append(self, replacement, text)?;
+            let text = document.create_text(value);
+            crate::mutation::append(document, replacement, text)?;
         }
-        crate::mutation::replace_all(self, id, replacement)
+        crate::mutation::replace_all(document, id, replacement)
     }
-}
 
 /// Keeps `value` when it satisfies `valid`, else replaces it with the empty
 /// string, the default for every grammar-constrained input state except color.

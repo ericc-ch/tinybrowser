@@ -1560,12 +1560,10 @@ pub(super) fn collection_ids(
         }
         CollectionKind::ElementsByClass(names) => collect_by_class(&parsed.document, scope, names),
         CollectionKind::ElementsByName(name) => collect_by_name(&parsed.document, scope, name),
-        CollectionKind::SelectOptions => parsed.document.select_options(scope),
-        CollectionKind::SelectedOptions => parsed
-            .document
-            .select_options(scope)
+        CollectionKind::SelectOptions => dom::form::select_options(&parsed.document, scope),
+        CollectionKind::SelectedOptions => dom::form::select_options(&parsed.document, scope)
             .into_iter()
-            .filter(|&option| parsed.document.option_selected(option))
+            .filter(|&option| dom::form::option_selected(&parsed.document, option))
             .collect(),
         CollectionKind::WindowNamed(name) => collect_window_named(&parsed.document, scope, name),
         CollectionKind::Static(handles) => handles.iter().map(|handle| handle.0).collect(),

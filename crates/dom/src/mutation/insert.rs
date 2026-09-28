@@ -469,12 +469,12 @@ pub(crate) fn place_node(
     node: NodeId,
     before: Option<NodeId>,
 ) {
-    let value_before = document.textarea_value_before_change(parent);
+    let value_before = crate::form::textarea_value_before_change(document, parent);
     unlink_from_current_parent(document, node);
     // A checked radio whose form owner changes on insertion unchecks its
     // new group
     // (<https://html.spec.whatwg.org/multipage/input.html#radio-button-group>).
-    let radio_owner_before = document.checked_radio_form_owner(node);
+    let radio_owner_before = crate::form::checked_radio_form_owner(document, node);
     // Sibling references for the mutation record, read from the run the
     // node is about to join. Computed only while recording: no observer
     // exists on the parse path, so the lookups stay off it.
@@ -499,19 +499,19 @@ pub(crate) fn place_node(
             next,
         },
     );
-    document.reset_textarea_selection_if_changed(parent, value_before);
-    if radio_owner_before != document.checked_radio_form_owner(node) {
-        document.refresh_radio_group(node);
+    crate::form::reset_textarea_selection_if_changed(document, parent, value_before);
+    if radio_owner_before != crate::form::checked_radio_form_owner(document, node) {
+        crate::form::refresh_radio_group(document, node);
     }
     // An option joining a select follows the option insertion steps: a
     // selected option clears the others, then the selectedness setting
     // algorithm supplies the default when nothing is selected. Only a
     // select whose list of options actually gained the node runs it.
     if document.html_local_is(node, "option") {
-        document.option_added_to_select(node);
+        crate::form::option_added_to_select(document, node);
     }
-    if let Some(select) = document.inserted_list_owner(node) {
-        document.apply_default_selectedness(select);
+    if let Some(select) = crate::form::inserted_list_owner(document, node) {
+        crate::form::apply_default_selectedness(document, select);
     }
 }
 
@@ -542,7 +542,7 @@ pub(crate) fn splice_fragment(
     let blank_options = document.html_local_is(parent, "select")
         && moved
             .iter()
-            .all(|&id| document.html_local_is(id, "option") && !document.option_selected(id));
+            .all(|&id| document.html_local_is(id, "option") && !crate::form::option_selected(document, id));
     mutation::record(
         document,
         Mutation::ChildList {
@@ -577,20 +577,20 @@ pub(crate) fn splice_fragment(
     for &id in &moved {
         document.tree.insert_linked(parent, id, before);
         named::inserted(document, id);
-        if document.checked_radio_form_owner(id).is_some() {
-            document.refresh_radio_group(id);
+        if crate::form::checked_radio_form_owner(document, id).is_some() {
+            crate::form::refresh_radio_group(document, id);
         }
         if !blank_options {
             if document.html_local_is(id, "option") {
-                document.option_added_to_select(id);
+                crate::form::option_added_to_select(document, id);
             }
-            if let Some(select) = document.inserted_list_owner(id) {
-                document.apply_default_selectedness(select);
+            if let Some(select) = crate::form::inserted_list_owner(document, id) {
+                crate::form::apply_default_selectedness(document, select);
             }
         }
     }
     if blank_options {
-        document.apply_default_selectedness(parent);
+        crate::form::apply_default_selectedness(document, parent);
     }
     mutation::record(
         document,
@@ -710,12 +710,12 @@ fn unlink(document: &mut Document, id: NodeId) {
     let Some(parent) = document.parent(id) else {
         return;
     };
-    let select = document.inserted_list_owner(id);
-    let value_before = document.textarea_value_before_change(parent);
+    let select = crate::form::inserted_list_owner(document, id);
+    let value_before = crate::form::textarea_value_before_change(document, parent);
     document.tree.unlink_linked(id);
-    document.reset_textarea_selection_if_changed(parent, value_before);
+    crate::form::reset_textarea_selection_if_changed(document, parent, value_before);
     if let Some(select) = select {
-        document.apply_default_selectedness(select);
+        crate::form::apply_default_selectedness(document, select);
     }
 }
 
