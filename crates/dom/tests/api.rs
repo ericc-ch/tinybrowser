@@ -291,7 +291,7 @@ fn document_fragments_templates_and_clones_keep_their_contracts() {
     );
     assert_eq!(dom::shadow::template_contents(&dom, template), Some(contents));
 
-    let clone = dom.clone_node(template, true).expect("deep template clone");
+    let clone = dom::mutation::clone_node(&mut dom, template, true).expect("deep template clone");
     let clone_contents = dom::shadow::template_contents(&dom, clone).expect("clone contents");
     assert_ne!(clone_contents, contents);
     assert_eq!(

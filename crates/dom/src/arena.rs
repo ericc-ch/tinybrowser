@@ -380,44 +380,6 @@ impl Document {
         self.alloc(NodeKind::Fragment)
     }
 
-    /// [Clones](https://dom.spec.whatwg.org/#concept-node-clone) `id` into a
-    /// new unattached node. `subtree` copies descendants (and a template's
-    /// contents fragment). The document node is refused: cloning a document
-    /// is a different spec operation.
-    ///
-    /// # Errors
-    ///
-    /// - [`DomError::StaleNode`] if `id` is stale.
-    /// - [`DomError::WrongNodeType`] if `id` is the document.
-    pub fn clone_node(&mut self, id: NodeId, subtree: bool) -> Result<NodeId, DomError> {
-        self.require_live(id)?;
-        if id == self.tree.document() {
-            return Err(DomError::WrongNodeType);
-        }
-        let copy = self.alloc(self.kind(id).ok_or(DomError::StaleNode)?.clone());
-        let mut pending = vec![(id, copy)];
-        while let Some((source, target)) = pending.pop() {
-            self.form.clone_dirty_value(source, target);
-            // https://html.spec.whatwg.org/multipage/scripting.html#the-template-element:cloning-steps
-            if let Some(contents) = shadow::template_contents(self, source) {
-                let cloned_contents = self.create_fragment();
-                shadow::set_template_contents(self, target, cloned_contents)?;
-                if subtree {
-                    pending.push((contents, cloned_contents));
-                }
-            }
-            if subtree {
-                let kids: Vec<NodeId> = self.children(source).ok_or(DomError::StaleNode)?.collect();
-                for kid in kids {
-                    let child = self.alloc(self.kind(kid).ok_or(DomError::StaleNode)?.clone());
-                    crate::mutation::append(self, target, child)?;
-                    pending.push((kid, child));
-                }
-            }
-        }
-        Ok(copy)
-    }
-
     /// The value of the attribute whose qualified name is `local` on element
     /// `id`.
     ///
@@ -617,7 +579,7 @@ impl Document {
         false
     }
 
-    fn alloc(&mut self, kind: NodeKind) -> NodeId {
+    pub(crate) fn alloc(&mut self, kind: NodeKind) -> NodeId {
         self.tree.alloc(kind)
     }
 }

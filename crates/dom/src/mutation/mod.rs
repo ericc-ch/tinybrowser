@@ -6,6 +6,7 @@
 //! the observer records.
 
 mod attributes;
+mod clone;
 mod insert;
 mod journal;
 mod text;
@@ -16,6 +17,7 @@ use crate::{Document, DomError, NodeId};
 pub use attributes::{
     add_attrs_if_missing, remove_attribute, remove_attribute_ns, set_attribute, set_attribute_by_ns,
 };
+pub use clone::clone_node;
 pub(crate) use attributes::{find_attribute, merge_attrs};
 pub use insert::{
     append, destroy, insert_before, pre_insert, reparent_children, replace_all, replace_child,

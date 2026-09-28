@@ -3482,9 +3482,7 @@ impl JsNode {
         let Some(mut parsed) = world.document_mut(self.handle.0) else {
             return Err(Exception::throw_type(&ctx, "no document"));
         };
-        let clone = parsed
-            .document
-            .clone_node(self.handle.0, deep)
+        let clone = dom::mutation::clone_node(&mut parsed.document, self.handle.0, deep)
             .map_err(|err| throw_dom_error(&ctx, err))?;
         // Run the form-control cloning steps for the source and clone in
         // parallel tree order, so a deep clone carries each control's value and

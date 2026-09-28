@@ -663,9 +663,8 @@ fn clone_option_into_selectedcontent(
         .map(Iterator::collect)
         .unwrap_or_default();
     for kid in kids {
-        let cloned = dom
-            .clone_node(kid, true)
-            .expect("option children clone into new nodes");
+        let cloned =
+            dom::mutation::clone_node(dom, kid, true).expect("option children clone into new nodes");
         dom::mutation::append(dom, selectedcontent, cloned)
             .expect("selectedcontent accepts cloned option children");
     }
