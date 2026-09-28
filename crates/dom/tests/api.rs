@@ -280,7 +280,7 @@ fn document_fragments_templates_and_clones_keep_their_contracts() {
 
     let template = dom.create_element(qn("template"), Vec::new());
     let contents = dom.create_fragment();
-    dom.set_template_contents(template, contents)
+    dom::shadow::set_template_contents(&mut dom, template, contents)
         .expect("template contents");
     let inner = dom.create_text("inside");
     dom::mutation::append(&mut dom, contents, inner).expect("template text");
@@ -289,10 +289,10 @@ fn document_fragments_templates_and_clones_keep_their_contracts() {
         dom.children(template).expect("template children").count(),
         0
     );
-    assert_eq!(dom.template_contents(template), Some(contents));
+    assert_eq!(dom::shadow::template_contents(&dom, template), Some(contents));
 
     let clone = dom.clone_node(template, true).expect("deep template clone");
-    let clone_contents = dom.template_contents(clone).expect("clone contents");
+    let clone_contents = dom::shadow::template_contents(&dom, clone).expect("clone contents");
     assert_ne!(clone_contents, contents);
     assert_eq!(
         dom.children(clone_contents)

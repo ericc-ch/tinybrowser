@@ -35,7 +35,7 @@ const MATHML_NS: &str = "http://www.w3.org/1998/Math/MathML";
 ///
 /// <https://html.spec.whatwg.org/multipage/parsing.html#serialising-html-fragments>
 pub(crate) fn serialize_html_fragment(dom: &Document, element: NodeId) -> String {
-    let root = dom.template_contents(element).unwrap_or(element);
+    let root = dom::shadow::template_contents(dom, element).unwrap_or(element);
     let parent = match dom.kind(element) {
         Some(NodeKind::Element { name, .. }) => Some((name.ns.clone(), name.local.clone())),
         _ => None,
@@ -75,7 +75,7 @@ pub(crate) fn serialize_html_element(
         return;
     }
 
-    let child_root = dom.template_contents(id).unwrap_or(id);
+    let child_root = dom::shadow::template_contents(dom, id).unwrap_or(id);
     for child in children(dom, child_root) {
         serialize_html_node(dom, child, Some((&name.ns, &name.local)), output);
     }
@@ -680,7 +680,7 @@ impl<'a> XmlSerializer<'a> {
         }
         output.push('>');
         let contents = if in_html && name.local.as_ref() == "template" {
-            self.document.template_contents(id)
+            dom::shadow::template_contents(self.document, id)
         } else {
             None
         };

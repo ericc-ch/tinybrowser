@@ -1,6 +1,5 @@
 //! The arena: flat slot array, generational handles, tree mutations.
 
-mod shadow;
 mod tree;
 
 use std::cell::Cell;
@@ -15,7 +14,7 @@ use crate::node::{
     html_qualified_name_eq, qualified_name_eq,
 };
 
-use self::shadow::ShadowState;
+use crate::shadow::{self, ShadowState};
 pub use self::tree::Children;
 use self::tree::Slot;
 pub use self::tree::Tree;
@@ -91,7 +90,7 @@ pub struct Document {
     pub(crate) script_lines: ScriptLines,
     pub(crate) scroll_offsets: ScrollOffsets,
     pub(crate) active_elements: ActiveElements,
-    shadow: ShadowState,
+    pub(crate) shadow: ShadowState,
     pub(crate) form: FormState,
     pub(crate) journal: MutationJournal,
     pub(crate) connections: ConnectionState,
@@ -222,11 +221,11 @@ impl Document {
     /// (<https://drafts.csswg.org/css-scoping/#flattening>).
     #[must_use]
     pub fn rendered_children(&self, id: NodeId) -> Vec<NodeId> {
-        if let Some(root) = self.shadow_root(id) {
+        if let Some(root) = shadow::shadow_root(self, id) {
             return self.rendered_children(root);
         }
-        if self.is_html_slot(id) {
-            let assigned = self.assigned_nodes(id);
+        if shadow::is_html_slot(self, id) {
+            let assigned = shadow::assigned_nodes(self, id);
             if !assigned.is_empty() {
                 return assigned;
             }
@@ -237,12 +236,12 @@ impl Document {
     /// Parent in the flattened tree used for style and box construction.
     #[must_use]
     pub fn rendered_parent(&self, id: NodeId) -> Option<NodeId> {
-        if let Some(slot) = self.assigned_slot(id) {
+        if let Some(slot) = shadow::assigned_slot(self, id) {
             return Some(slot);
         }
         match self.parent(id) {
-            Some(parent) => self.shadow_host(parent).or(Some(parent)),
-            None => self.shadow_host(id),
+            Some(parent) => shadow::shadow_host(self, parent).or(Some(parent)),
+            None => shadow::shadow_host(self, id),
         }
     }
 
@@ -376,7 +375,7 @@ impl Document {
     /// Creates an empty document fragment, unattached like every fresh node.
     ///
     /// Fragments are containers outside the main tree: the contents root of
-    /// `<template>` elements (associated with [`Document::set_template_contents`]) and
+    /// `<template>` elements (associated with [`crate::shadow::set_template_contents`]) and
     /// the context node for `innerHTML`-style fragment parsing.
     ///
     /// # Panics
@@ -405,9 +404,9 @@ impl Document {
         while let Some((source, target)) = pending.pop() {
             self.form.clone_dirty_value(source, target);
             // https://html.spec.whatwg.org/multipage/scripting.html#the-template-element:cloning-steps
-            if let Some(contents) = self.template_contents(source) {
+            if let Some(contents) = shadow::template_contents(self, source) {
                 let cloned_contents = self.create_fragment();
-                self.set_template_contents(target, cloned_contents)?;
+                shadow::set_template_contents(self, target, cloned_contents)?;
                 if subtree {
                     pending.push((contents, cloned_contents));
                 }
@@ -1038,14 +1037,7 @@ impl Document {
             .find(|attribute| Self::attr_query_eq(&name.ns, &attribute.name, local))
     }
 
-    fn is_html_template_element(&self, id: NodeId) -> bool {
-        match self.kind(id) {
-            Some(NodeKind::Element { name, .. }) => {
-                name.ns == html_namespace() && name.local.as_ref().eq_ignore_ascii_case("template")
-            }
-            _ => false,
-        }
-    }
+
 
     /// Nodes the insert algorithm actually places: a fragment's children,
     /// otherwise the node itself

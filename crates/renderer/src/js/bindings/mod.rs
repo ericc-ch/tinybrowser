@@ -716,7 +716,7 @@ fn instantiate_node<'js>(ctx: &Ctx<'js>, id: NodeId) -> Result<Value<'js>> {
     let is_shadow_root = world(ctx)?
         .borrow()
         .document(id)
-        .is_some_and(|parsed| parsed.document.shadow_host(id).is_some());
+        .is_some_and(|parsed| dom::shadow::shadow_host(&parsed.document, id).is_some());
     let brand = with_node_kind(ctx, id, |kind| match kind {
         Some(NodeKind::Document) => Some(if document_is_html_content(ctx, id) {
             "Document"
@@ -1349,9 +1349,7 @@ pub(super) fn create_element_named<'js>(
     let id = parsed.document.create_element(name, Vec::new());
     if is_template {
         let contents = parsed.document.create_fragment();
-        parsed
-            .document
-            .set_template_contents(id, contents)
+        dom::shadow::set_template_contents(&mut parsed.document, id, contents)
             .map_err(|err| throw_dom_error(ctx, err))?;
     }
     drop(parsed);

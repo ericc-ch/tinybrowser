@@ -1,5 +1,6 @@
 //! Connection transitions for renderer-owned frames and images.
 
+use crate::shadow;
 use crate::{Document, NodeId, NodeKind, html_namespace};
 
 /// A connection transition of one element, for HTML lifecycle steps.
@@ -99,7 +100,7 @@ pub(crate) fn snapshot(document: &Document, id: NodeId) -> Vec<(NodeId, bool, bo
         if let Some(children) = document.children(current) {
             stack.extend(children);
         }
-        if let Some(root) = document.shadow_root(current) {
+        if let Some(root) = shadow::shadow_root(document, current) {
             stack.push(root);
         }
     }
@@ -114,7 +115,9 @@ pub fn is_connected(document: &Document, id: NodeId) -> bool {
         if node == document.document() {
             return true;
         }
-        current = document.parent(node).or_else(|| document.shadow_host(node));
+        current = document
+            .parent(node)
+            .or_else(|| shadow::shadow_host(document, node));
     }
     false
 }

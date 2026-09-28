@@ -374,9 +374,7 @@ impl TreeSink for Sink {
         }
         if flags.template {
             let contents = self.document.borrow_mut().create_fragment();
-            self.document
-                .borrow_mut()
-                .set_template_contents(element, contents)
+            dom::shadow::set_template_contents(&mut self.document.borrow_mut(), element, contents)
                 .expect("fresh template element accepts a fresh contents fragment");
         }
         if flags.mathml_annotation_xml_integration_point {
@@ -433,9 +431,7 @@ impl TreeSink for Sink {
     }
 
     fn get_template_contents(&self, target: &Self::Handle) -> Self::Handle {
-        self.document
-            .borrow()
-            .template_contents(*target)
+        dom::shadow::template_contents(&self.document.borrow(), *target)
             .unwrap_or_else(|| panic!("template contents requested for a non-template"))
     }
 

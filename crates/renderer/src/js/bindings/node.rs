@@ -1884,7 +1884,7 @@ impl JsNode {
             let world = world.borrow();
             world.document(self.handle.0).and_then(|parsed| {
                 is_template_element(parsed.document.kind(self.handle.0))
-                    .then(|| parsed.document.template_contents(self.handle.0))
+                    .then(|| dom::shadow::template_contents(&parsed.document, self.handle.0))
                     .flatten()
             })
         };
@@ -1967,16 +1967,14 @@ impl JsNode {
         let Some(mut parsed) = world_ref.document_mut(self.handle.0) else {
             return Err(Exception::throw_type(&ctx, "no document"));
         };
-        if parsed.document.shadow_root(self.handle.0).is_some() {
+        if dom::shadow::shadow_root(&parsed.document, self.handle.0).is_some() {
             return Err(throw_dom(
                 &ctx,
                 "NotSupportedError",
                 "element already hosts a shadow root",
             ));
         }
-        let root = parsed
-            .document
-            .attach_shadow(self.handle.0, open)
+        let root = dom::shadow::attach_shadow(&mut parsed.document, self.handle.0, open)
             .map_err(|err| throw_dom_error(&ctx, err))?;
         drop(parsed);
         drop(world_ref);
@@ -1989,7 +1987,7 @@ impl JsNode {
         let root = world
             .borrow()
             .document(self.handle.0)
-            .and_then(|parsed| parsed.document.open_shadow_root(self.handle.0));
+            .and_then(|parsed| dom::shadow::open_shadow_root(&parsed.document, self.handle.0));
         child_value(&ctx, root)
     }
 
@@ -1999,7 +1997,7 @@ impl JsNode {
         let host = world
             .borrow()
             .document(self.handle.0)
-            .and_then(|parsed| parsed.document.shadow_host(self.handle.0));
+            .and_then(|parsed| dom::shadow::shadow_host(&parsed.document, self.handle.0));
         match host {
             Some(host) => wrap_node(&ctx, host),
             None => Err(Exception::throw_type(&ctx, "not a shadow root")),
@@ -2012,7 +2010,7 @@ impl JsNode {
         let open = world
             .borrow()
             .document(self.handle.0)
-            .and_then(|parsed| parsed.document.shadow_root_is_open(self.handle.0))
+            .and_then(|parsed| dom::shadow::shadow_root_is_open(&parsed.document, self.handle.0))
             .ok_or_else(|| Exception::throw_type(&ctx, "not a shadow root"))?;
         Ok(if open { "open" } else { "closed" }.into())
     }
@@ -2076,7 +2074,7 @@ impl JsNode {
             let world = world(&ctx).ok()?;
             let world = world.borrow();
             let parsed = world.document(self.handle.0)?;
-            let host = parsed.document.shadow_host(self.handle.0)?;
+            let host = dom::shadow::shadow_host(&parsed.document, self.handle.0)?;
             let Some(NodeKind::Element { name, .. }) = parsed.document.kind(host) else {
                 return None;
             };
@@ -2094,13 +2092,11 @@ impl JsNode {
             return Err(Exception::throw_type(&ctx, "no document"));
         };
         let target = if is_template {
-            if let Some(contents) = parsed.document.template_contents(self.handle.0) {
+            if let Some(contents) = dom::shadow::template_contents(&parsed.document, self.handle.0) {
                 contents
             } else {
                 let contents = parsed.document.create_fragment();
-                parsed
-                    .document
-                    .set_template_contents(self.handle.0, contents)
+                dom::shadow::set_template_contents(&mut parsed.document, self.handle.0, contents)
                     .map_err(|err| throw_dom_error(&ctx, err))?;
                 contents
             }

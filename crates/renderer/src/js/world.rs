@@ -867,7 +867,7 @@ impl World {
                     .children(id)
                     .map(Iterator::collect)
                     .unwrap_or_default();
-                if let Some(root) = parsed.document.shadow_root(id) {
+                if let Some(root) = dom::shadow::shadow_root(&parsed.document, id) {
                     children.push(root);
                 }
                 children.reverse();

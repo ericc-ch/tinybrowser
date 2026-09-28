@@ -26,6 +26,7 @@ pub mod mutation;
 pub mod named;
 mod node;
 pub mod selector;
+pub mod shadow;
 mod state;
 mod value;
 

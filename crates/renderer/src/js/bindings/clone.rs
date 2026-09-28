@@ -131,7 +131,7 @@ pub(crate) fn import_snapshot(dom: &dom::Document, id: NodeId, deep: bool) -> Op
             name: name.clone(),
             attributes: attributes.clone(),
             children: children(deep),
-            template_contents: dom.template_contents(id).map(|contents| {
+            template_contents: dom::shadow::template_contents(dom, id).map(|contents| {
                 if deep {
                     dom.children(contents)
                         .map(|kids| {
@@ -185,7 +185,7 @@ pub(crate) fn materialize_import(
             }
             if let Some(contents) = template_contents {
                 let fragment = materialize_children(dom, contents)?;
-                dom.set_template_contents(id, fragment)?;
+                dom::shadow::set_template_contents(&mut *dom, id, fragment)?;
             }
             Ok(id)
         }
