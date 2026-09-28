@@ -457,12 +457,12 @@ pub fn reparent_children(
 }
 
 /// Places a non-fragment `node` under `parent` before `before` (or at
-/// the end when `before` is `None`).
-///
-/// Structural only: lifecycle recording belongs to the calling operation,
-/// which captures one snapshot before it starts and records it once the
-/// whole operation is done. Recording here would both misread a node the
-/// caller already detached and pin the event order relative to a removal.
+/// the end when `before` is `None`). Queues the `ChildList` record and runs
+/// the named-index and form reactions; only iframe/img lifecycle recording
+/// belongs to the calling operation, which captures one snapshot before it
+/// starts and records it once the whole operation is done. Recording
+/// lifecycle here would both misread a node the caller already detached and
+/// pin the event order relative to a removal.
 pub(crate) fn place_node(
     document: &mut Document,
     parent: NodeId,
@@ -519,8 +519,9 @@ pub(crate) fn place_node(
 /// fragment empty and unparented
 /// (<https://dom.spec.whatwg.org/#concept-node-insert>).
 ///
-/// Structural only; the caller records the fragment subtree's lifecycle
-/// snapshot (see [`place_node`]).
+/// Queues one record per moved child (plus named-index and form reactions
+/// via [`place_node`]); only the fragment subtree's lifecycle snapshot is
+/// the caller's job (see [`place_node`]).
 pub(crate) fn splice_fragment(
     document: &mut Document,
     parent: NodeId,

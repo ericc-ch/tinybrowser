@@ -62,8 +62,10 @@ pub fn take(document: &mut Document) -> Vec<Mutation> {
     document.journal.take()
 }
 
-/// The serial advances on record requests and shadow-root attachment. Unlink
-/// bookkeeping can skip a record request when observers are disabled.
+/// The serial advances on record requests and shadow-root attachment. A
+/// suppressed unlink skips its record request while observers are disabled,
+/// so no serial bump happens for it; suppressed inserts still record (and
+/// bump) through the normal path.
 #[must_use]
 pub fn serial(document: &Document) -> u64 {
     document.journal.serial()

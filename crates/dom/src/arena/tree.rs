@@ -6,8 +6,10 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use crate::id::NodeId;
 use crate::node::NodeKind;
 
-/// One node's structural links and kind-specific data. Only `Tree` can write
-/// the links; operation code sees just the mutable kind.
+/// One node's structural links and kind-specific data. Links are written
+/// only through `Tree` methods (`insert_linked`, `unlink_linked`, `retire`);
+/// kinds are mutated through `kind_mut` by the `mutation` workflows, which
+/// pair every write with its observer record and domain reactions.
 ///
 /// The five intrusive links give O(1) access to either sibling and either end
 /// of a child run. They cost 40 bytes per node versus the former child vector,

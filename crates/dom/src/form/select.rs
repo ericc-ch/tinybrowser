@@ -35,18 +35,12 @@ use crate::{Document, DomError, LocalName, NodeId, NodeKind, QualName, html_name
         Ok(())
     }
 
-    /// A `select`'s display size: the `size` attribute, else 4 with `multiple`
-    /// and 1 otherwise
+    /// A `select`'s display size: the `size` attribute parsed under the
+    /// non-negative-integer rules, else 4 with `multiple` and 1 otherwise
     /// (<https://html.spec.whatwg.org/multipage/form-elements.html#the-select-element:display-size>).
     fn display_size(document: &Document, select: NodeId) -> u32 {
         document.attribute(select, "size")
-            .and_then(|raw| {
-                let raw = raw.trim_start_matches(['\t', '\n', '\u{c}', '\r', ' ']);
-                let raw = raw.strip_prefix('+').unwrap_or(raw);
-                let digits = raw.bytes().take_while(u8::is_ascii_digit).count();
-                raw[..digits].parse::<u32>().ok()
-            })
-            .filter(|size| *size > 0)
+            .and_then(|raw| parse_non_negative_integer(&raw))
             .unwrap_or_else(|| {
                 if document.attribute(select, "multiple").is_some() {
                     4
@@ -54,6 +48,50 @@ use crate::{Document, DomError, LocalName, NodeId, NodeKind, QualName, html_name
                     1
                 }
             })
+    }
+
+    /// [Rules for parsing non-negative integers](https://html.spec.whatwg.org/multipage/common-microsyntaxes.html#rules-for-parsing-non-negative-integers):
+    /// ASCII whitespace, one optional sign, then leading ASCII digits.
+    /// Trailing junk never fails the parse (`size="2abc"` is 2), and only a
+    /// missing digit run is an error. Saturates on overflow: only the `== 1`
+    /// comparison consumes this, which saturation preserves.
+    fn parse_non_negative_integer(raw: &str) -> Option<u32> {
+        let bytes = raw.as_bytes();
+        let mut pos = 0;
+        while pos < bytes.len() && matches!(bytes[pos], b'\t' | b'\n' | b'\x0C' | b'\r' | b' ') {
+            pos += 1;
+        }
+        if pos >= bytes.len() {
+            return None;
+        }
+        let negative = match bytes[pos] {
+            b'-' => {
+                pos += 1;
+                true
+            }
+            b'+' => {
+                pos += 1;
+                false
+            }
+            _ => false,
+        };
+        if pos >= bytes.len() || !bytes[pos].is_ascii_digit() {
+            return None;
+        }
+        let mut magnitude: u64 = 0;
+        while pos < bytes.len() && bytes[pos].is_ascii_digit() {
+            magnitude = magnitude
+                .saturating_mul(10)
+                .saturating_add(u64::from(bytes[pos] - b'0'));
+            pos += 1;
+        }
+        if negative {
+            // `-0` still parses to zero; any other negative fails the
+            // non-negative check.
+            if magnitude == 0 { Some(0) } else { None }
+        } else {
+            Some(u32::try_from(magnitude).unwrap_or(u32::MAX))
+        }
     }
 
     /// Whether an option is disabled by its own attribute or a disabled
@@ -344,32 +382,37 @@ use crate::{Document, DomError, LocalName, NodeId, NodeKind, QualName, html_name
         }
     }
 
-/// [Maybe clone an option into selectedcontent](https://html.spec.whatwg.org/multipage/form-elements.html#maybe-clone-an-option-into-selectedcontent):
-/// after the parser inserts an option, the select's enabled selectedcontent
-/// mirrors the option when it is selected. The decision reads the live
-/// selectedness, which the insertion steps already settled, rather than
-/// re-deriving it from attributes.
+/// [Update descendant selectedcontent elements for an option](https://html.spec.whatwg.org/multipage/form-elements.html#update-descendant-selectedcontent-elements-for-an-option):
+/// when the parser pops an option, the select's enabled selectedcontent
+/// mirrors the first selected option in list order. The gate reads the
+/// popped option's live selectedness; the insertion steps
+/// (`place_node` → `option_added_to_select` + `apply_default_selectedness`)
+/// already ran, so outside mid-parse script mutation the popped option is
+/// the only selected one. Mid-parse scripts can dirty other options, so the
+/// list is re-read to match the spec's first-selected rule instead of
+/// assuming the popped option.
 pub fn maybe_clone_option_into_selectedcontent(document: &mut Document, option: NodeId) {
-    let Some(select) = nearest_select(document, option) else {
+    // The option's nearest ancestor select, with the list-of-options
+    // boundaries (spec's "get the nearest ancestor select").
+    let Some(select) = option_select_owner(document, option) else {
         return;
     };
-    if !select_options(document, select).contains(&option) || !option_selected(document, option) {
+    // Only a selected option triggers the update.
+    if !option_selected(document, option) {
         return;
     }
     let Some(selectedcontent) = enabled_selectedcontent(document, select) else {
         return;
     };
-    clone_option_into_selectedcontent(document, option, selectedcontent);
-}
-
-/// The nearest HTML `select` ancestor of `option`, if any.
-fn nearest_select(document: &Document, mut id: NodeId) -> Option<NodeId> {
-    loop {
-        id = document.parent(id)?;
-        if is_html_named(document, id, "select") {
-            return Some(id);
-        }
-    }
+    // "Update a selectedcontent": the first option in list order whose
+    // selectedness is true, if any.
+    let Some(first) = select_options(document, select)
+        .into_iter()
+        .find(|&id| option_selected(document, id))
+    else {
+        return;
+    };
+    clone_option_into_selectedcontent(document, first, selectedcontent);
 }
 
 /// Whether `id` is an HTML element with local name `local`, ASCII

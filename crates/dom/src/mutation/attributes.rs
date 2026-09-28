@@ -2,7 +2,7 @@
 //!
 //! Each setter validates the element, updates the attribute list, and queues
 //! the observer record. Name-driven reactions follow the change: named-access
-//! indexing for every mutation, plus the form control steps for the
+//! indexing for every attribute change, plus the form control steps for the
 //! unnamespaced set/remove paths. `add_attrs_if_missing` merges parser
 //! attributes without queuing a record.
 
