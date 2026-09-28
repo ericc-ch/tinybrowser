@@ -128,6 +128,14 @@ pub fn set_attribute_by_ns(
         },
     );
     named::attribute_changed(document, id, local);
+    // DOM's "set an attribute value" runs the attribute change steps
+    // regardless of entry API (`setAttributeNS(null, …)`, `setAttributeNode`,
+    // `Attr.value`); the form steps key off no-namespace attributes, so only
+    // the empty-namespace path runs them
+    // (<https://dom.spec.whatwg.org/#concept-element-attributes-set>).
+    if namespace.is_empty() {
+        form::attribute_set(document, id, local)?;
+    }
     Ok(())
 }
 
@@ -250,6 +258,11 @@ pub fn remove_attribute_ns(
         },
     );
     named::attribute_changed(document, id, local);
+    // Same entry-API independence as the setter: `removeAttributeNS(null, …)`
+    // and `removeAttributeNode` run the form steps for no-namespace names.
+    if ns.is_empty() {
+        form::attribute_removed(document, id, local)?;
+    }
     Ok(())
 }
 

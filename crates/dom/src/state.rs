@@ -391,9 +391,11 @@ pub fn is_default(dom: &Document, id: NodeId) -> bool {
     checked_input(dom, id) || (local_is(dom, id, &["option"]) && has_selected_attribute(dom, id))
 }
 
-/// `:indeterminate`, static subset: a `progress` without a `value`
-/// attribute (<https://html.spec.whatwg.org/#the-progress-element>). Radio
-/// groups are not represented (no form-owner association).
+/// `:indeterminate`: a `progress` without a `value` attribute
+/// (<https://html.spec.whatwg.org/#the-progress-element>), or a radio whose
+/// group has no checked button. A checked radio is determined, never
+/// indeterminate: the states are mutually exclusive
+/// (<https://drafts.csswg.org/selectors-4/#indeterminate>).
 #[must_use]
 pub fn is_indeterminate(dom: &Document, id: NodeId) -> bool {
     if local_is(dom, id, &["progress"]) {
@@ -405,7 +407,11 @@ pub fn is_indeterminate(dom: &Document, id: NodeId) -> bool {
             return crate::form::indeterminate(dom, id);
         }
         if typ == "radio" {
-            return crate::form::radio_group_checked(dom, id).is_none();
+            // `radio_group_checked` skips the element itself (its other
+            // callers want the rest of the group), so own checkedness is
+            // checked separately.
+            return !crate::form::checkedness(dom, id)
+                && crate::form::radio_group_checked(dom, id).is_none();
         }
     }
     false
