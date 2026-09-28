@@ -5,6 +5,7 @@
 //! record. `Tree` stays the only writer of parent and sibling pointers.
 
 use crate::lifecycle;
+use crate::metadata;
 use crate::mutation::{self, Mutation};
 use crate::{Document, DomError, NodeId, NodeKind, named};
 
@@ -716,4 +717,122 @@ fn unlink(document: &mut Document, id: NodeId) {
     if let Some(select) = select {
         document.apply_default_selectedness(select);
     }
+}
+
+/// Replaces every child of `parent` with `node`
+/// (<https://dom.spec.whatwg.org/#concept-node-replace-all>). Removed
+/// children stay alive, detached, like the spec's remove step.
+///
+/// # Errors
+///
+/// - [`DomError::StaleNode`] if either handle is stale.
+/// - [`DomError::HierarchyRequest`] if `parent` cannot contain children,
+///   `node` is a doctype outside a document, or the document content
+///   model refuses the replacement.
+/// - [`DomError::CycleForbidden`] if `node` is an ancestor of `parent`.
+///
+/// # Panics
+///
+/// Only on an internal invariant defect (a verified-live node missing its
+/// slot), never on user input.
+pub fn replace_all(document: &mut Document, parent: NodeId, node: NodeId) -> Result<(), DomError> {
+    document.ensure_alive(parent, node)?;
+    if !document.can_contain_children(parent) {
+        return Err(DomError::HierarchyRequest);
+    }
+    if document.would_cycle(node, parent) {
+        return Err(DomError::CycleForbidden);
+    }
+    if document.is_document(parent) {
+        let incoming = document.incoming_nodes(node);
+        crate::mutation::ensure_document_content_model(document, &incoming)?;
+    } else if !document.is_fragment(node) && document.is_doctype(node) {
+        return Err(DomError::HierarchyRequest);
+    }
+    let parent_connected = lifecycle::is_connected(document, parent);
+    let removed: Vec<NodeId> = document
+        .children(parent)
+        .map(Iterator::collect)
+        .unwrap_or_default();
+    let removed_snapshot: Vec<(NodeId, bool, bool)> = if parent_connected {
+        removed
+            .iter()
+            .flat_map(|&id| lifecycle::snapshot(document, id))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let added = document.incoming_nodes(node);
+    // `node` can be one of the removed children (JS `replaceChildren(
+    // firstChild)`), so its starting connectivity must be read before the
+    // detach loop below.
+    let node_tracked = lifecycle::snapshot(document, node);
+    mutation::suppress(document);
+    // Detach the standing children through the single-node primitive; its
+    // O(1) steps make the loop O(k), and it keeps `unlink` the only
+    // remover of a node. Recording is suppressed, so no observer sees
+    // these individual removals.
+    for &kid in &removed {
+        crate::mutation::unlink_from_current_parent(document, kid);
+    }
+    if document.is_fragment(node) {
+        crate::mutation::splice_fragment(document, parent, node, None);
+    } else {
+        crate::mutation::place_node(document, parent, node, None);
+    }
+    mutation::resume(document);
+    // Removal before insertion: a replacement frees its frame slot before
+    // the new frame is checked against the frame cap.
+    lifecycle::record_snapshot(document, removed_snapshot);
+    lifecycle::record_snapshot(document, node_tracked);
+    // "If either addedNodes or removedNodes is not empty, then queue a
+    // tree mutation record" (<https://dom.spec.whatwg.org/#concept-node-replace-all>):
+    // e.g. `textContent = ""` on an already-empty element changes nothing
+    // and is silent.
+    if !added.is_empty() || !removed.is_empty() {
+        mutation::record(
+            document,
+            Mutation::ChildList {
+                target: parent,
+                added,
+                removed,
+                previous: None,
+                next: None,
+            },
+        );
+    }
+    Ok(())
+}
+
+/// Destroys `id` and its entire subtree, recycling their slots.
+///
+/// Every handle into the destroyed region goes stale at once. Destroying
+/// the document root is refused.
+///
+/// A connected subtree's `iframe` connection transitions are recorded,
+/// even though the nodes are gone by the time they are reported.
+///
+/// # Errors
+///
+/// - [`DomError::StaleNode`] if `id` is stale.
+/// - [`DomError::HierarchyRequest`] for the document root.
+pub fn destroy(document: &mut Document, id: NodeId) -> Result<(), DomError> {
+    document.require_live(id)?;
+    if id == document.tree.document() {
+        return Err(DomError::HierarchyRequest);
+    }
+    // Read connectivity before unlinking; the snapshot carries the
+    // iframe-ness so the count still moves once the slots are freed.
+    let tracked = lifecycle::snapshot(document, id);
+    crate::mutation::unlink_from_current_parent(document, id);
+
+    let mut pending = vec![id];
+    while let Some(current) = pending.pop() {
+        document.form.forget(current);
+        metadata::forget(document, current);
+        document.shadow.forget(current, &mut pending);
+        document.tree.retire(current, &mut pending);
+    }
+    lifecycle::record_snapshot(document, tracked);
+    Ok(())
 }

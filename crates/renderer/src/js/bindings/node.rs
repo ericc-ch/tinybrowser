@@ -947,10 +947,13 @@ impl JsNode {
             let Some(mut parsed) = world.document_mut(self.handle.0) else {
                 return Err(Exception::throw_type(&ctx, "no document"));
             };
-            parsed
-                .document
-                .set_attribute(self.handle.0, &local, value.0.clone())
-                .map_err(|err| throw_dom_error(&ctx, err))?;
+            dom::mutation::set_attribute(
+                &mut parsed.document,
+                self.handle.0,
+                &local,
+                value.0.clone(),
+            )
+            .map_err(|err| throw_dom_error(&ctx, err))?;
         }
         touch_attr(&ctx, self.handle.0, "", &local, &value.0)?;
         after_attribute_change(&ctx, self.handle.0, &local)?;
@@ -1401,9 +1404,9 @@ impl JsNode {
     fn scroll_left(&self, ctx: Ctx<'_>) -> Result<f64> {
         let world = world(&ctx)?;
         let world = world.borrow();
-        Ok(world
-            .document(self.handle.0)
-            .map_or(0.0, |parsed| dom::metadata::scroll_offset(&parsed.document, self.handle.0).0))
+        Ok(world.document(self.handle.0).map_or(0.0, |parsed| {
+            dom::metadata::scroll_offset(&parsed.document, self.handle.0).0
+        }))
     }
 
     #[qjs(set, rename = "scrollLeft")]
@@ -1423,9 +1426,9 @@ impl JsNode {
     fn scroll_top(&self, ctx: Ctx<'_>) -> Result<f64> {
         let world = world(&ctx)?;
         let world = world.borrow();
-        Ok(world
-            .document(self.handle.0)
-            .map_or(0.0, |parsed| dom::metadata::scroll_offset(&parsed.document, self.handle.0).1))
+        Ok(world.document(self.handle.0).map_or(0.0, |parsed| {
+            dom::metadata::scroll_offset(&parsed.document, self.handle.0).1
+        }))
     }
 
     #[qjs(set, rename = "scrollTop")]
@@ -1632,7 +1635,9 @@ impl JsNode {
         let world = world.borrow();
         Ok(world
             .document(self.handle.0)
-            .map_or_else(String::new, |parsed| parsed.document.option_text(self.handle.0)))
+            .map_or_else(String::new, |parsed| {
+                parsed.document.option_text(self.handle.0)
+            }))
     }
 
     #[qjs(set, rename = "text")]
@@ -1648,9 +1653,7 @@ impl JsNode {
             dom::mutation::append(&mut parsed.document, replacement, text)
                 .map_err(|err| throw_dom_error(&ctx, err))?;
         }
-        parsed
-            .document
-            .replace_all(self.handle.0, replacement)
+        dom::mutation::replace_all(&mut parsed.document, self.handle.0, replacement)
             .map_err(|err| throw_dom_error(&ctx, err))?;
         Ok(())
     }
@@ -1679,9 +1682,9 @@ impl JsNode {
     fn selected_index(&self, ctx: Ctx<'_>) -> Result<i32> {
         let world = world(&ctx)?;
         let world = world.borrow();
-        Ok(world
-            .document(self.handle.0)
-            .map_or(-1, |parsed| parsed.document.select_selected_index(self.handle.0)))
+        Ok(world.document(self.handle.0).map_or(-1, |parsed| {
+            parsed.document.select_selected_index(self.handle.0)
+        }))
     }
 
     #[qjs(set, rename = "selectedIndex")]
@@ -2105,9 +2108,7 @@ impl JsNode {
         };
         let replacement = materialize_children(&mut parsed.document, &snapshots)
             .map_err(|err| throw_dom_error(&ctx, err))?;
-        parsed
-            .document
-            .replace_all(target, replacement)
+        dom::mutation::replace_all(&mut parsed.document, target, replacement)
             .map_err(|err| throw_dom_error(&ctx, err))?;
         drop(parsed);
         drop(world);
@@ -2428,7 +2429,7 @@ impl JsNode {
             dom::mutation::append(dom, replacement, text_id)
                 .map_err(|err| throw_dom_error(&ctx, err))?;
         }
-        dom.replace_all(self.handle.0, replacement)
+        dom::mutation::replace_all(dom, self.handle.0, replacement)
             .map_err(|err| throw_dom_error(&ctx, err))?;
         drop(parsed);
         drop(world);
@@ -2540,9 +2541,7 @@ impl JsNode {
         let Some(mut parsed) = world.document_mut(self.handle.0) else {
             return Err(Exception::throw_type(&ctx, "no document"));
         };
-        parsed
-            .document
-            .replace_all(self.handle.0, node)
+        dom::mutation::replace_all(&mut parsed.document, self.handle.0, node)
             .map_err(|err| throw_dom_error(&ctx, err))?;
         drop(parsed);
         drop(world);
@@ -2650,10 +2649,13 @@ impl JsNode {
         let Some(parsed) = parsed.document(self.handle.0) else {
             return Ok(String::new());
         };
-        let title = dom::selector::select_first(&parsed.document, parsed.document.document(), "title")
-            .ok()
-            .flatten();
-        Ok(title.map_or_else(String::new, |title| descendant_text(&parsed.document, title)))
+        let title =
+            dom::selector::select_first(&parsed.document, parsed.document.document(), "title")
+                .ok()
+                .flatten();
+        Ok(title.map_or_else(String::new, |title| {
+            descendant_text(&parsed.document, title)
+        }))
     }
 
     #[qjs(set, rename = "title")]
@@ -2893,9 +2895,7 @@ impl JsNode {
         let Some(mut parsed) = world.document_mut(self.handle.0) else {
             return Err(Exception::throw_type(&ctx, "no document"));
         };
-        parsed
-            .document
-            .set_attribute(self.handle.0, "class", value.0)
+        dom::mutation::set_attribute(&mut parsed.document, self.handle.0, "class", value.0)
             .map_err(|err| throw_dom_error(&ctx, err))?;
         drop(parsed);
         drop(world);
@@ -2977,10 +2977,11 @@ impl JsNode {
     ) -> Result<Value<'js>> {
         let namespace = namespace.0.unwrap_or_default();
         let world = world(&ctx)?;
-        let found = world
-            .borrow()
-            .document(self.handle.0)
-            .and_then(|parsed| parsed.document.attribute_ns(self.handle.0, &namespace, &local.0));
+        let found = world.borrow().document(self.handle.0).and_then(|parsed| {
+            parsed
+                .document
+                .attribute_ns(self.handle.0, &namespace, &local.0)
+        });
         match found {
             Some(value) => string_value(&ctx, &value),
             None => Ok(Value::new_null(ctx)),
@@ -3037,16 +3038,15 @@ impl JsNode {
             let Some(mut parsed) = world.document_mut(self.handle.0) else {
                 return Err(Exception::throw_type(&ctx, "no document"));
             };
-            parsed
-                .document
-                .set_attribute_by_ns(
-                    self.handle.0,
-                    &namespace,
-                    prefix.as_deref(),
-                    &local,
-                    value.0.clone(),
-                )
-                .map_err(|err| throw_dom_error(&ctx, err))?;
+            dom::mutation::set_attribute_by_ns(
+                &mut parsed.document,
+                self.handle.0,
+                &namespace,
+                prefix.as_deref(),
+                &local,
+                value.0.clone(),
+            )
+            .map_err(|err| throw_dom_error(&ctx, err))?;
         }
         touch_attr(&ctx, self.handle.0, &namespace, &local, &value.0)?;
         schedule_mutation_delivery(&ctx)
@@ -3065,9 +3065,7 @@ impl JsNode {
             let Some(mut parsed) = world.document_mut(self.handle.0) else {
                 return Ok(());
             };
-            parsed
-                .document
-                .remove_attribute(self.handle.0, &local)
+            dom::mutation::remove_attribute(&mut parsed.document, self.handle.0, &local)
                 .map_err(|err| throw_dom_error(&ctx, err))?;
         }
         detach_attr(&ctx, self.handle.0, "", &local)?;
@@ -3089,10 +3087,13 @@ impl JsNode {
             let Some(mut parsed) = world.document_mut(self.handle.0) else {
                 return Ok(());
             };
-            parsed
-                .document
-                .remove_attribute_ns(self.handle.0, &namespace, &local.0)
-                .map_err(|err| throw_dom_error(&ctx, err))?;
+            dom::mutation::remove_attribute_ns(
+                &mut parsed.document,
+                self.handle.0,
+                &namespace,
+                &local.0,
+            )
+            .map_err(|err| throw_dom_error(&ctx, err))?;
         }
         detach_attr(&ctx, self.handle.0, &namespace, &local.0)?;
         schedule_mutation_delivery(&ctx)
@@ -3241,14 +3242,15 @@ impl JsNode {
             let exists = parsed.document.has_attribute(self.handle.0, &local);
             let should_exist = force.0.unwrap_or(!exists);
             if should_exist && !exists {
-                parsed
-                    .document
-                    .set_attribute(self.handle.0, &local, String::new())
-                    .map_err(|err| throw_dom_error(&ctx, err))?;
+                dom::mutation::set_attribute(
+                    &mut parsed.document,
+                    self.handle.0,
+                    &local,
+                    String::new(),
+                )
+                .map_err(|err| throw_dom_error(&ctx, err))?;
             } else if !should_exist && exists {
-                parsed
-                    .document
-                    .remove_attribute(self.handle.0, &local)
+                dom::mutation::remove_attribute(&mut parsed.document, self.handle.0, &local)
                     .map_err(|err| throw_dom_error(&ctx, err))?;
             }
             (should_exist, should_exist != exists)
@@ -3315,9 +3317,10 @@ impl JsNode {
                                 _ => String::new(),
                             };
                             joined.push_str(data);
-                            dom.set_text(previous, joined)
+                            dom::mutation::set_text(dom, previous, joined)
                                 .map_err(|err| throw_dom_error(&ctx, err))?;
-                            dom::mutation::detach(dom, kid).map_err(|err| throw_dom_error(&ctx, err))?;
+                            dom::mutation::detach(dom, kid)
+                                .map_err(|err| throw_dom_error(&ctx, err))?;
                         } else {
                             merged = Some(kid);
                         }
@@ -3692,9 +3695,9 @@ impl JsNode {
         }
         let world = world(&ctx)?;
         let world = world.borrow();
-        Ok(world
-            .document(self.handle.0)
-            .map_or(0, |parsed| parsed.document.select_options(self.handle.0).len()))
+        Ok(world.document(self.handle.0).map_or(0, |parsed| {
+            parsed.document.select_options(self.handle.0).len()
+        }))
     }
 
     // https://dom.spec.whatwg.org/#dom-characterdata-substringdata

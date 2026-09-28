@@ -5,20 +5,28 @@
 //! parent and sibling links; operations here sequence the spec steps and queue
 //! the observer records.
 
+mod attributes;
 mod insert;
 mod journal;
+mod text;
 
 use crate::lifecycle;
 use crate::{Document, DomError, NodeId};
 
+pub use attributes::{
+    add_attrs_if_missing, remove_attribute, remove_attribute_ns, set_attribute, set_attribute_by_ns,
+};
+pub(crate) use attributes::{find_attribute, merge_attrs};
 pub use insert::{
-    append, insert_before, pre_insert, reparent_children, replace_child, validate_pre_insert,
+    append, destroy, insert_before, pre_insert, reparent_children, replace_all, replace_child,
+    validate_pre_insert,
 };
 pub(crate) use insert::{
     append_fresh_children, ensure_document_content_model, place_node, splice_fragment,
     unlink_from_current_parent,
 };
 pub(crate) use journal::MutationJournal;
+pub use text::{append_text, set_cdata_section, set_comment, set_processing_instruction, set_text};
 
 /// One recorded tree mutation, for `MutationObserver` delivery.
 #[derive(Clone, Debug, PartialEq, Eq)]

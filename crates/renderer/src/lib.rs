@@ -277,7 +277,7 @@ impl Sink {
         if let Some(handle) = neighbor
             && matches!(dom.kind(handle), Some(NodeKind::Text { .. }))
         {
-            let _ = dom.append_text(handle, text);
+            let _ = dom::mutation::append_text(&mut dom, handle, text);
             return;
         }
         let fresh = dom.create_text(text);
@@ -479,10 +479,11 @@ impl TreeSink for Sink {
     }
 
     fn add_attrs_if_missing(&self, target: &Self::Handle, attrs: Vec<markup5ever::Attribute>) {
-        let _ = self
-            .document
-            .borrow_mut()
-            .add_attrs_if_missing(*target, convert_attrs(attrs));
+        let _ = dom::mutation::add_attrs_if_missing(
+            &mut self.document.borrow_mut(),
+            *target,
+            convert_attrs(attrs),
+        );
     }
 
     fn remove_from_parent(&self, target: &Self::Handle) {
@@ -645,14 +646,17 @@ fn enabled_selectedcontent(dom: &dom::Document, select: Handle) -> Option<Handle
 }
 
 /// [Clone an option into a selectedcontent](https://html.spec.whatwg.org/multipage/form-elements.html#clone-an-option-into-a-selectedcontent).
-fn clone_option_into_selectedcontent(dom: &mut dom::Document, option: Handle, selectedcontent: Handle) {
+fn clone_option_into_selectedcontent(
+    dom: &mut dom::Document,
+    option: Handle,
+    selectedcontent: Handle,
+) {
     let stale: Vec<Handle> = dom
         .children(selectedcontent)
         .map(Iterator::collect)
         .unwrap_or_default();
     for child in stale {
-        dom.destroy(child)
-            .expect("selectedcontent children are live descendants");
+        dom::mutation::destroy(dom, child).expect("selectedcontent children are live descendants");
     }
     let kids: Vec<Handle> = dom
         .children(option)

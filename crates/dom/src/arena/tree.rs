@@ -196,7 +196,7 @@ impl Tree {
             .filter(|slot| slot.generation == id.generation && slot.node.is_some())
     }
 
-    pub(super) fn kind_mut(&mut self, id: NodeId) -> Option<&mut NodeKind> {
+    pub(crate) fn kind_mut(&mut self, id: NodeId) -> Option<&mut NodeKind> {
         Some(&mut self.node_mut(id)?.kind)
     }
 
@@ -297,7 +297,7 @@ impl Tree {
     }
 
     /// A freed slot stays empty until reuse ticks its generation.
-    pub(super) fn retire(&mut self, id: NodeId, pending: &mut Vec<NodeId>) {
+    pub(crate) fn retire(&mut self, id: NodeId, pending: &mut Vec<NodeId>) {
         pending.extend(self.children(id).expect("retiring a live node"));
         self.slots[id.index()].node = None;
         self.free.push(id.slot);

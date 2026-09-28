@@ -227,7 +227,7 @@ fn mutations_match_an_independent_tree_model() {
             4 => {
                 let node = model.live(&mut state, false);
                 model.destroy(node);
-                dom.destroy(handles[node]).expect("live subtree destroys");
+                dom::mutation::destroy(&mut dom, handles[node]).expect("live subtree destroys");
                 successes += 1;
             }
             _ => unreachable!(),
@@ -301,7 +301,7 @@ fn document_fragments_templates_and_clones_keep_their_contracts() {
         1
     );
 
-    dom.destroy(template).expect("destroy template subtree");
+    dom::mutation::destroy(&mut dom, template).expect("destroy template subtree");
     assert!(!dom.contains(template));
     assert!(!dom.contains(contents));
     assert!(!dom.contains(inner));
@@ -398,25 +398,24 @@ fn connected_iframes_survive_replace_and_report_destroy() {
 
     // `replaceChildren(holder.firstChild)`: the iframe stays connected across
     // the replace, so it must neither churn an event nor double the count.
-    dom.replace_all(holder, iframe).expect("replace_all");
+    dom::mutation::replace_all(&mut dom, holder, iframe).expect("replace_all");
     assert_eq!(dom::lifecycle::connected_iframe_count(&dom), 1);
     assert!(dom::lifecycle::take(&mut dom).is_empty());
 
     // `replaceChild` where the replacement sits inside the replaced node: the
     // transient detach must not read as removed-then-reinserted either.
     let wrapper = dom.create_element(qn("wrapper"), Vec::new());
-    dom.replace_all(holder, wrapper).expect("wrap");
+    dom::mutation::replace_all(&mut dom, holder, wrapper).expect("wrap");
     let nested = dom.create_element(qn("iframe"), Vec::new());
     dom::mutation::append(&mut dom, wrapper, nested).expect("nested iframe");
     assert_eq!(dom::lifecycle::connected_iframe_count(&dom), 1);
     let _ = dom::lifecycle::take(&mut dom);
-    dom::mutation::replace_child(&mut dom, holder, nested, wrapper)
-        .expect("replace_child");
+    dom::mutation::replace_child(&mut dom, holder, nested, wrapper).expect("replace_child");
     assert_eq!(dom::lifecycle::connected_iframe_count(&dom), 1);
     assert!(dom::lifecycle::take(&mut dom).is_empty());
 
     // Destroying a connected iframe reports the removal and drops the count.
-    dom.destroy(nested).expect("destroy");
+    dom::mutation::destroy(&mut dom, nested).expect("destroy");
     assert_eq!(dom::lifecycle::connected_iframe_count(&dom), 0);
     assert_eq!(
         dom::lifecycle::take(&mut dom),
@@ -444,7 +443,7 @@ fn replacement_reports_removal_before_insertion() {
     assert_eq!(dom::lifecycle::connected_iframe_count(&dom), 1);
 
     let swap = dom.create_element(qn("iframe"), Vec::new());
-    dom.replace_all(root, swap).expect("replace_all");
+    dom::mutation::replace_all(&mut dom, root, swap).expect("replace_all");
     assert_eq!(
         dom::lifecycle::take(&mut dom),
         vec![Lifecycle::Removed(fresh), Lifecycle::Inserted(swap)],
@@ -502,7 +501,7 @@ fn bulk_moves_keep_the_link_invariant() {
 
     // replace_all detaches the standing children and links the replacement.
     let replacement = dom.create_element(qn("replacement"), Vec::new());
-    dom.replace_all(host, replacement).expect("replace_all");
+    dom::mutation::replace_all(&mut dom, host, replacement).expect("replace_all");
     assert_links(&dom, host, &[replacement]);
     for &detached in &[first, second, third] {
         assert_eq!(dom.parent(detached), None);
@@ -514,8 +513,7 @@ fn bulk_moves_keep_the_link_invariant() {
     let kept = dom.create_element(qn("kept"), Vec::new());
     dom::mutation::append(&mut dom, host, kept).expect("kept");
     assert_links(&dom, host, &[replacement, kept]);
-    dom.replace_all(host, kept)
-        .expect("replace_all reusing a child");
+    dom::mutation::replace_all(&mut dom, host, kept).expect("replace_all reusing a child");
     assert_links(&dom, host, &[kept]);
     assert_eq!(dom.parent(replacement), None);
     assert_eq!(dom.previous_sibling(replacement), None);
@@ -569,7 +567,7 @@ fn bulk_moves_keep_the_link_invariant() {
     let swap = dom.create_fragment();
     let swap_child = dom.create_element(qn("swap-child"), Vec::new());
     dom::mutation::append(&mut dom, swap, swap_child).expect("swap_child");
-    dom.replace_all(dest, swap).expect("replace_all fragment");
+    dom::mutation::replace_all(&mut dom, dest, swap).expect("replace_all fragment");
     assert_links(&dom, dest, &[swap_child]);
 }
 

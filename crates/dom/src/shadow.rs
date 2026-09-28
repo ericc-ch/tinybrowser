@@ -169,7 +169,7 @@ pub fn set_template_contents(
         if document.would_cycle(old, contents) {
             return Err(DomError::HierarchyRequest);
         }
-        document.destroy(old)?;
+        crate::mutation::destroy(document, old)?;
         document.shadow.template_contents.remove(&template);
     }
     document.shadow.template_contents.insert(template, contents);

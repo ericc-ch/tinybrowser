@@ -78,7 +78,7 @@ impl Document {
                 self.form.input_values.insert(id, value);
             }
             ValueMode::Default | ValueMode::DefaultOn => {
-                self.set_attribute(id, "value", value)?;
+                crate::mutation::set_attribute(self, id, "value", value)?;
             }
             ValueMode::Filename => {
                 if !value.is_empty() {
@@ -130,7 +130,7 @@ impl Document {
                     .unwrap_or_default();
                 let value = self.sanitize_value_for_type(id, old, raw);
                 if !value.is_empty() {
-                    self.set_attribute(id, "value", value)?;
+                    crate::mutation::set_attribute(self, id, "value", value)?;
                 }
                 self.form.input_values.remove(&id);
             }
@@ -419,7 +419,7 @@ impl Document {
     /// Returns [`DomError::WrongNodeType`] when `id` has no `value`.
     pub fn set_element_value(&mut self, id: NodeId, value: String) -> Result<(), DomError> {
         if self.html_local_is(id, "option") {
-            return self.set_attribute(id, "value", value);
+            return crate::mutation::set_attribute(self, id, "value", value);
         }
         if self.html_local_is(id, "select") {
             self.set_select_value(id, &value);
@@ -455,7 +455,7 @@ impl Document {
     /// `textarea`.
     pub fn set_control_default_value(&mut self, id: NodeId, value: String) -> Result<(), DomError> {
         if self.html_local_is(id, "input") {
-            return self.set_attribute(id, "value", value);
+            return crate::mutation::set_attribute(self, id, "value", value);
         }
         if !self.html_local_is(id, "textarea") {
             return Err(DomError::WrongNodeType);
@@ -465,7 +465,7 @@ impl Document {
             let text = self.create_text(value);
             crate::mutation::append(self, replacement, text)?;
         }
-        self.replace_all(id, replacement)
+        crate::mutation::replace_all(self, id, replacement)
     }
 }
 

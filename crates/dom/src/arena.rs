@@ -6,23 +6,18 @@ use std::cell::Cell;
 use std::fmt;
 use std::marker::PhantomData;
 
-use crate::form::{self, FormState};
+use crate::form::FormState;
 use crate::id::NodeId;
-use crate::named::{self, NamedIndex};
-use crate::node::{
-    Attribute, LocalName, Namespace, NodeKind, Prefix, QualName, html_namespace,
-    html_qualified_name_eq, qualified_name_eq,
-};
+use crate::named::NamedIndex;
+use crate::node::{Attribute, NodeKind, QualName, html_namespace};
 
-use crate::shadow::{self, ShadowState};
 pub use self::tree::Children;
 use self::tree::Slot;
 pub use self::tree::Tree;
-use crate::lifecycle::{self, ConnectionState};
-use crate::metadata::{self, ActiveElements, ScriptLines, ScrollOffsets, Settings};
-use crate::mutation::{self, Mutation, MutationJournal};
-
-
+use crate::lifecycle::ConnectionState;
+use crate::metadata::{ActiveElements, ScriptLines, ScrollOffsets, Settings};
+use crate::mutation::MutationJournal;
+use crate::shadow::{self, ShadowState};
 
 /// Why a mutation was refused.
 ///
@@ -295,7 +290,7 @@ impl Document {
     /// "an attribute list is essentially a map of names to attributes"),
     /// so later duplicates are dropped and the first occurrence wins,
     /// matching the merge rule the parser drives through
-    /// [`Document::add_attrs_if_missing`]. Hand-built callers get the same
+    /// [`crate::mutation::add_attrs_if_missing`]. Hand-built callers get the same
     /// normalization instead of an unrepresentable state.
     ///
     /// # Panics
@@ -304,7 +299,7 @@ impl Document {
     /// reachable runtime condition; the bound guards the handle width.
     pub fn create_element(&mut self, name: QualName, attributes: Vec<Attribute>) -> NodeId {
         let mut unique: Vec<Attribute> = Vec::with_capacity(attributes.len());
-        merge_attrs(&mut unique, attributes);
+        crate::mutation::merge_attrs(&mut unique, attributes);
         self.alloc(NodeKind::Element {
             name,
             attributes: unique,
@@ -423,39 +418,6 @@ impl Document {
         Ok(copy)
     }
 
-    /// Adds each attribute that `id` does not already carry, matched by
-    /// qualified name.
-    ///
-    /// The adapter's `add_attrs_if_missing` landing pad: html5ever merges
-    /// attributes from repeated start-tag tokens through this call.
-    ///
-    /// # Errors
-    ///
-    /// - [`DomError::StaleNode`] if `id` is stale.
-    /// - [`DomError::WrongNodeType`] if `id` is not an element.
-    pub fn add_attrs_if_missing(
-        &mut self,
-        id: NodeId,
-        attrs: Vec<Attribute>,
-    ) -> Result<(), DomError> {
-        let (_, attributes) = self.element_mut(id)?;
-        let added_name = attrs
-            .iter()
-            .find(|attribute| {
-                attribute.name.ns.as_ref().is_empty()
-                    && matches!(attribute.name.local.as_ref(), "id" | "name")
-                    && !attributes
-                        .iter()
-                        .any(|existing| existing.name == attribute.name)
-            })
-            .map(|attribute| attribute.name.local.to_string());
-        merge_attrs(attributes, attrs);
-        if let Some(name) = added_name {
-            named::attribute_changed(self, id, &name);
-        }
-        Ok(())
-    }
-
     /// The value of the attribute whose qualified name is `local` on element
     /// `id`.
     ///
@@ -463,8 +425,7 @@ impl Document {
     /// after HTML’s ASCII-lowercase name conversion.
     #[must_use]
     pub fn attribute(&self, id: NodeId, local: &str) -> Option<String> {
-        self.find_attribute(id, local)
-            .map(|attribute| attribute.value.clone())
+        crate::mutation::find_attribute(self, id, local).map(|attribute| attribute.value.clone())
     }
 
     /// Whether `id` is an HTML element with local name `local` (exact match).
@@ -521,7 +482,7 @@ impl Document {
     /// exact local-name match; HTML elements lowercase the queried name.
     #[must_use]
     pub fn has_attribute(&self, id: NodeId, local: &str) -> bool {
-        self.find_attribute(id, local).is_some()
+        crate::mutation::find_attribute(self, id, local).is_some()
     }
 
     /// [Element.getAttributeNS](https://dom.spec.whatwg.org/#dom-element-getattributens):
@@ -553,406 +514,6 @@ impl Document {
     #[must_use]
     pub fn attributes(&self, id: NodeId) -> Option<&[Attribute]> {
         self.element(id).map(|(_, attributes)| attributes)
-    }
-
-    /// [Element.removeAttribute](https://dom.spec.whatwg.org/#dom-element-removeattribute).
-    ///
-    /// # Errors
-    ///
-    /// - [`DomError::StaleNode`] if `id` is stale.
-    /// - [`DomError::WrongNodeType`] if `id` is not an element.
-    pub fn remove_attribute(&mut self, id: NodeId, local: &str) -> Result<(), DomError> {
-        let (name, attributes) = self.element_mut(id)?;
-        let Some(index) = attributes
-            .iter()
-            .position(|attribute| Self::attr_query_eq(&name.ns, &attribute.name, local))
-        else {
-            return Ok(());
-        };
-        let removed = attributes.remove(index);
-        // `MutationRecord.attributeName` is the attribute's local
-        // name and `attributeNamespace` its namespace, not the
-        // queried qualified name
-        // (<https://dom.spec.whatwg.org/#dom-mutationrecord-attributename>).
-        mutation::record(
-            self,
-            Mutation::Attributes {
-                target: id,
-                name: removed.name.local.to_string(),
-                namespace: removed.name.ns.to_string(),
-                old_value: Some(removed.value),
-            },
-        );
-        named::attribute_changed(self, id, local);
-        form::attribute_removed(self, id, local)
-    }
-
-    /// [Element.removeAttributeNS](https://dom.spec.whatwg.org/#dom-element-removeattributens).
-    ///
-    /// # Errors
-    ///
-    /// - [`DomError::StaleNode`] if `id` is stale.
-    /// - [`DomError::WrongNodeType`] if `id` is not an element.
-    pub fn remove_attribute_ns(
-        &mut self,
-        id: NodeId,
-        ns: &str,
-        local: &str,
-    ) -> Result<(), DomError> {
-        let (_, attributes) = self.element_mut(id)?;
-        let Some(index) = attributes.iter().position(|attribute| {
-            attribute.name.ns.as_ref() == ns && attribute.name.local.as_ref() == local
-        }) else {
-            return Ok(());
-        };
-        let removed = attributes.remove(index);
-        mutation::record(
-            self,
-            Mutation::Attributes {
-                target: id,
-                name: local.to_owned(),
-                namespace: ns.to_owned(),
-                old_value: Some(removed.value),
-            },
-        );
-        named::attribute_changed(self, id, local);
-        Ok(())
-    }
-
-    /// Replaces every child of `parent` with `node`
-    /// (<https://dom.spec.whatwg.org/#concept-node-replace-all>). Removed
-    /// children stay alive, detached, like the spec's remove step.
-    ///
-    /// # Errors
-    ///
-    /// - [`DomError::StaleNode`] if either handle is stale.
-    /// - [`DomError::HierarchyRequest`] if `parent` cannot contain children,
-    ///   `node` is a doctype outside a document, or the document content
-    ///   model refuses the replacement.
-    /// - [`DomError::CycleForbidden`] if `node` is an ancestor of `parent`.
-    ///
-    /// # Panics
-    ///
-    /// Only on an internal invariant defect (a verified-live node missing its
-    /// slot), never on user input.
-    pub fn replace_all(&mut self, parent: NodeId, node: NodeId) -> Result<(), DomError> {
-        self.ensure_alive(parent, node)?;
-        if !self.can_contain_children(parent) {
-            return Err(DomError::HierarchyRequest);
-        }
-        if self.would_cycle(node, parent) {
-            return Err(DomError::CycleForbidden);
-        }
-        if self.is_document(parent) {
-            let incoming = self.incoming_nodes(node);
-            crate::mutation::ensure_document_content_model(self, &incoming)?;
-        } else if !self.is_fragment(node) && self.is_doctype(node) {
-            return Err(DomError::HierarchyRequest);
-        }
-        let parent_connected = lifecycle::is_connected(self, parent);
-        let removed: Vec<NodeId> = self
-            .children(parent)
-            .map(Iterator::collect)
-            .unwrap_or_default();
-        let removed_snapshot: Vec<(NodeId, bool, bool)> = if parent_connected {
-            removed
-                .iter()
-                .flat_map(|&id| lifecycle::snapshot(self, id))
-                .collect()
-        } else {
-            Vec::new()
-        };
-        let added = self.incoming_nodes(node);
-        // `node` can be one of the removed children (JS `replaceChildren(
-        // firstChild)`), so its starting connectivity must be read before the
-        // detach loop below.
-        let node_tracked = lifecycle::snapshot(self, node);
-        mutation::suppress(self);
-        // Detach the standing children through the single-node primitive; its
-        // O(1) steps make the loop O(k), and it keeps `unlink` the only
-        // remover of a node. Recording is suppressed, so no observer sees
-        // these individual removals.
-        for &kid in &removed {
-            crate::mutation::unlink_from_current_parent(self, kid);
-        }
-        if self.is_fragment(node) {
-            crate::mutation::splice_fragment(self, parent, node, None);
-        } else {
-            crate::mutation::place_node(self, parent, node, None);
-        }
-        mutation::resume(self);
-        // Removal before insertion: a replacement frees its frame slot before
-        // the new frame is checked against the frame cap.
-        lifecycle::record_snapshot(self, removed_snapshot);
-        lifecycle::record_snapshot(self, node_tracked);
-        // "If either addedNodes or removedNodes is not empty, then queue a
-        // tree mutation record" (<https://dom.spec.whatwg.org/#concept-node-replace-all>):
-        // e.g. `textContent = ""` on an already-empty element changes nothing
-        // and is silent.
-        if !added.is_empty() || !removed.is_empty() {
-            mutation::record(
-                self,
-                Mutation::ChildList {
-                    target: parent,
-                    added,
-                    removed,
-                    previous: None,
-                    next: None,
-                },
-            );
-        }
-        Ok(())
-    }
-
-    /// Sets an attribute identified by namespace and local name, replacing
-    /// the first attribute with that namespace and local name (the existing
-    /// prefix is kept, matching "set an attribute value").
-    ///
-    /// [DOM setAttributeNS](https://dom.spec.whatwg.org/#dom-element-setattributens)
-    /// and `setAttributeNode` land here.
-    ///
-    /// # Errors
-    ///
-    /// - [`DomError::StaleNode`] if `id` is stale.
-    /// - [`DomError::WrongNodeType`] if `id` is not an element.
-    pub fn set_attribute_by_ns(
-        &mut self,
-        id: NodeId,
-        namespace: &str,
-        prefix: Option<&str>,
-        local: &str,
-        value: impl Into<String>,
-    ) -> Result<(), DomError> {
-        let value = value.into();
-        let (_, attributes) = self.element_mut(id)?;
-        let index = attributes.iter().position(|attribute| {
-            attribute.name.ns.as_ref() == namespace && attribute.name.local.as_ref() == local
-        });
-        let old_value = if let Some(index) = index {
-            Some(std::mem::replace(&mut attributes[index].value, value))
-        } else {
-            attributes.push(Attribute {
-                name: QualName::new(
-                    prefix.map(Prefix::from),
-                    Namespace::from(namespace),
-                    LocalName::from(local),
-                ),
-                value,
-            });
-            None
-        };
-        mutation::record(
-            self,
-            Mutation::Attributes {
-                target: id,
-                name: local.to_owned(),
-                namespace: namespace.to_owned(),
-                old_value,
-            },
-        );
-        named::attribute_changed(self, id, local);
-        Ok(())
-    }
-
-    /// Sets the unnamespaced attribute `local` on element `id`, replacing a
-    /// same-name attribute if one exists.
-    ///
-    /// [DOM setAttribute](https://dom.spec.whatwg.org/#dom-element-setattribute)
-    ///
-    /// # Errors
-    ///
-    /// - [`DomError::StaleNode`] if `id` is stale.
-    /// - [`DomError::WrongNodeType`] if `id` is not an element.
-    pub fn set_attribute(
-        &mut self,
-        id: NodeId,
-        local: &str,
-        value: impl Into<String>,
-    ) -> Result<(), DomError> {
-        let value = value.into();
-        let (name, attributes) = self.element_mut(id)?;
-        let html = name.ns == html_namespace();
-        let existing = attributes
-            .iter()
-            .position(|attribute| Self::attr_query_eq(&name.ns, &attribute.name, local));
-        // A matched attribute can carry a namespace even though the query is
-        // unnamespaced (`setAttribute("xlink:href", …)` on an SVG element);
-        // the record reports the changed attribute's real name and namespace
-        // (<https://dom.spec.whatwg.org/#dom-mutationrecord-attributename>).
-        let (recorded_name, recorded_namespace, old_value) = if let Some(index) = existing {
-            let attribute = &mut attributes[index];
-            let old_value = std::mem::replace(&mut attribute.value, value);
-            (
-                attribute.name.local.to_string(),
-                attribute.name.ns.to_string(),
-                Some(old_value),
-            )
-        } else {
-            let local = if html {
-                local.to_ascii_lowercase()
-            } else {
-                local.to_owned()
-            };
-            attributes.push(Attribute {
-                name: QualName::new(None, Namespace::from(""), LocalName::from(local.as_str())),
-                value,
-            });
-            (local, String::new(), None)
-        };
-        mutation::record(
-            self,
-            Mutation::Attributes {
-                target: id,
-                name: recorded_name,
-                namespace: recorded_namespace,
-                old_value,
-            },
-        );
-        named::attribute_changed(self, id, local);
-        form::attribute_set(self, id, local)
-    }
-
-    /// Replaces the data of the text node `id`.
-    ///
-    /// # Errors
-    ///
-    /// - [`DomError::StaleNode`] if `id` is stale.
-    /// - [`DomError::WrongNodeType`] if `id` is not a text node.
-    pub fn set_text(&mut self, id: NodeId, data: impl Into<String>) -> Result<(), DomError> {
-        self.set_data(
-            id,
-            |kind| match kind {
-                NodeKind::Text { data } => Some(data),
-                _ => None,
-            },
-            data.into(),
-        )
-    }
-
-    /// Appends `extra` to the text node `id`.
-    ///
-    /// # Errors
-    ///
-    /// - [`DomError::StaleNode`] if `id` is stale.
-    /// - [`DomError::WrongNodeType`] if `id` is not a text node.
-    pub fn append_text(&mut self, id: NodeId, extra: &str) -> Result<(), DomError> {
-        let parent = self.parent(id);
-        let value_before = parent.and_then(|parent| self.textarea_value_before_change(parent));
-        let recording = mutation::recording(self);
-        let old_value = {
-            let kind = self.tree.kind_mut(id).ok_or(DomError::StaleNode)?;
-            let NodeKind::Text { data } = kind else {
-                return Err(DomError::WrongNodeType);
-            };
-            let old_value = recording.then(|| data.clone());
-            data.push_str(extra);
-            old_value
-        };
-        if let Some(old_value) = old_value {
-            mutation::record(
-                self,
-                Mutation::CharacterData {
-                    target: id,
-                    old_value,
-                },
-            );
-        }
-        if let Some(parent) = parent {
-            self.reset_textarea_selection_if_changed(parent, value_before);
-        }
-        Ok(())
-    }
-
-    /// Replaces the data of the comment node `id`.
-    ///
-    /// # Errors
-    ///
-    /// - [`DomError::StaleNode`] if `id` is stale.
-    /// - [`DomError::WrongNodeType`] if `id` is not a comment node.
-    pub fn set_comment(&mut self, id: NodeId, data: impl Into<String>) -> Result<(), DomError> {
-        self.set_data(
-            id,
-            |kind| match kind {
-                NodeKind::Comment { data } => Some(data),
-                _ => None,
-            },
-            data.into(),
-        )
-    }
-
-    /// Replaces the data of the CDATA section `id`.
-    ///
-    /// # Errors
-    ///
-    /// - [`DomError::StaleNode`] if `id` is stale.
-    /// - [`DomError::WrongNodeType`] if `id` is not a CDATA section.
-    pub fn set_cdata_section(
-        &mut self,
-        id: NodeId,
-        data: impl Into<String>,
-    ) -> Result<(), DomError> {
-        self.set_data(
-            id,
-            |kind| match kind {
-                NodeKind::CDataSection { data } => Some(data),
-                _ => None,
-            },
-            data.into(),
-        )
-    }
-
-    /// Replaces the data of the processing instruction `id`.
-    ///
-    /// # Errors
-    ///
-    /// - [`DomError::StaleNode`] if `id` is stale.
-    /// - [`DomError::WrongNodeType`] if `id` is not a processing instruction.
-    pub fn set_processing_instruction(
-        &mut self,
-        id: NodeId,
-        data: impl Into<String>,
-    ) -> Result<(), DomError> {
-        self.set_data(
-            id,
-            |kind| match kind {
-                NodeKind::ProcessingInstruction { data, .. } => Some(data),
-                _ => None,
-            },
-            data.into(),
-        )
-    }
-
-    /// Destroys `id` and its entire subtree, recycling their slots.
-    ///
-    /// Every handle into the destroyed region goes stale at once. Destroying
-    /// the document root is refused.
-    ///
-    /// A connected subtree's `iframe` connection transitions are recorded,
-    /// even though the nodes are gone by the time they are reported.
-    ///
-    /// # Errors
-    ///
-    /// - [`DomError::StaleNode`] if `id` is stale.
-    /// - [`DomError::HierarchyRequest`] for the document root.
-    pub fn destroy(&mut self, id: NodeId) -> Result<(), DomError> {
-        self.require_live(id)?;
-        if id == self.tree.document() {
-            return Err(DomError::HierarchyRequest);
-        }
-        // Read connectivity before unlinking; the snapshot carries the
-        // iframe-ness so the count still moves once the slots are freed.
-        let tracked = lifecycle::snapshot(self, id);
-        crate::mutation::unlink_from_current_parent(self, id);
-
-        let mut pending = vec![id];
-        while let Some(current) = pending.pop() {
-            self.form.forget(current);
-            metadata::forget(self, current);
-            self.shadow.forget(current, &mut pending);
-            self.tree.retire(current, &mut pending);
-        }
-        lifecycle::record_snapshot(self, tracked);
-        Ok(())
     }
 
     /// Whether `id` is one of the container kinds that may hold children.
@@ -1002,14 +563,6 @@ impl Document {
         }
     }
 
-    /// Mutable variant of [`Document::element`] for the attribute mutators.
-    fn element_mut(&mut self, id: NodeId) -> Result<(&QualName, &mut Vec<Attribute>), DomError> {
-        match self.tree.kind_mut(id).ok_or(DomError::StaleNode)? {
-            NodeKind::Element { name, attributes } => Ok((name, attributes)),
-            _ => Err(DomError::WrongNodeType),
-        }
-    }
-
     /// A qualified name's serialization: `prefix:local` or just `local`.
     fn serialize_qualified_name(name: &QualName) -> String {
         match &name.prefix {
@@ -1017,27 +570,6 @@ impl Document {
             _ => name.local.to_string(),
         }
     }
-
-    fn attr_query_eq(element_ns: &Namespace, name: &QualName, query: &str) -> bool {
-        if *element_ns == html_namespace() {
-            html_qualified_name_eq(name, query)
-        } else {
-            qualified_name_eq(name, query)
-        }
-    }
-
-    /// The first attribute on `id` whose **qualified name** matches `local`
-    /// under the element's case regime; HTML elements ASCII-lowercase the
-    /// queried name first
-    /// ([DOM get-an-attribute-by-name](https://dom.spec.whatwg.org/#concept-element-attributes-get-by-name)).
-    fn find_attribute<'a>(&'a self, id: NodeId, local: &str) -> Option<&'a Attribute> {
-        let (name, attributes) = self.element(id)?;
-        attributes
-            .iter()
-            .find(|attribute| Self::attr_query_eq(&name.ns, &attribute.name, local))
-    }
-
-
 
     /// Nodes the insert algorithm actually places: a fragment's children,
     /// otherwise the node itself
@@ -1085,46 +617,7 @@ impl Document {
         false
     }
 
-    fn set_data(
-        &mut self,
-        id: NodeId,
-        extract: impl Fn(&mut NodeKind) -> Option<&mut String>,
-        data: String,
-    ) -> Result<(), DomError> {
-        let parent = self.parent(id);
-        let value_before = parent.and_then(|parent| self.textarea_value_before_change(parent));
-        let kind = self.tree.kind_mut(id).ok_or(DomError::StaleNode)?;
-        match extract(kind) {
-            Some(field) => {
-                let old_value = std::mem::replace(field, data);
-                mutation::record(
-                    self,
-                    Mutation::CharacterData {
-                        target: id,
-                        old_value,
-                    },
-                );
-                if let Some(parent) = parent {
-                    self.reset_textarea_selection_if_changed(parent, value_before);
-                }
-                Ok(())
-            }
-            None => Err(DomError::WrongNodeType),
-        }
-    }
-
     fn alloc(&mut self, kind: NodeKind) -> NodeId {
         self.tree.alloc(kind)
-    }
-}
-
-/// Adds each attribute whose qualified name is not already present; the
-/// first occurrence wins, matching the DOM's name-keyed attribute list
-/// (<https://dom.spec.whatwg.org/#concept-attribute>).
-fn merge_attrs(attributes: &mut Vec<Attribute>, attrs: impl IntoIterator<Item = Attribute>) {
-    for attr in attrs {
-        if !attributes.iter().any(|existing| existing.name == attr.name) {
-            attributes.push(attr);
-        }
     }
 }

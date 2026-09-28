@@ -1053,27 +1053,19 @@ pub(super) fn set_character_data(ctx: &Ctx<'_>, id: NodeId, data: String) -> Res
     };
     match parsed.document.kind(id) {
         Some(NodeKind::Text { .. }) => {
-            parsed
-                .document
-                .set_text(id, data)
+            dom::mutation::set_text(&mut parsed.document, id, data)
                 .map_err(|err| throw_dom_error(ctx, err))?;
         }
         Some(NodeKind::CDataSection { .. }) => {
-            parsed
-                .document
-                .set_cdata_section(id, data)
+            dom::mutation::set_cdata_section(&mut parsed.document, id, data)
                 .map_err(|err| throw_dom_error(ctx, err))?;
         }
         Some(NodeKind::ProcessingInstruction { .. }) => {
-            parsed
-                .document
-                .set_processing_instruction(id, data)
+            dom::mutation::set_processing_instruction(&mut parsed.document, id, data)
                 .map_err(|err| throw_dom_error(ctx, err))?;
         }
         Some(NodeKind::Comment { .. }) => {
-            parsed
-                .document
-                .set_comment(id, data)
+            dom::mutation::set_comment(&mut parsed.document, id, data)
                 .map_err(|err| throw_dom_error(ctx, err))?;
         }
         _ => return Ok(()),

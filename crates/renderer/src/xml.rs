@@ -68,7 +68,7 @@ impl<'a> XmlParser<'a> {
         self.stack.clear();
         self.scopes.clear();
         let clear = self.document.create_fragment();
-        let _ = self.document.replace_all(self.root, clear);
+        let _ = dom::mutation::replace_all(&mut self.document, self.root, clear);
         let error = self.document.create_element(
             QualName::new(
                 None,

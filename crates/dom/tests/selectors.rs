@@ -60,7 +60,7 @@ fn selector_queries_observe_the_public_tree_boundary() {
             .expect("query")
             .is_empty()
     );
-    dom.destroy(main).expect("destroy");
+    dom::mutation::destroy(&mut dom, main).expect("destroy");
     assert_eq!(
         selector::select_all(&dom, main, "*"),
         Err(SelectError::StaleNode)

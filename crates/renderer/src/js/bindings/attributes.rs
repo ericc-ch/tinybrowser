@@ -241,9 +241,7 @@ fn write_class(ctx: &Ctx<'_>, id: NodeId, value: &str) -> Result<()> {
     if value.is_empty() && parsed.document.attribute(id, "class").is_none() {
         return Ok(());
     }
-    parsed
-        .document
-        .set_attribute(id, "class", value)
+    dom::mutation::set_attribute(&mut parsed.document, id, "class", value)
         .map_err(|err| throw_dom_error(ctx, err))?;
     drop(parsed);
     drop(world);
@@ -634,10 +632,15 @@ fn set_attr_value(ctx: &Ctx<'_>, scope: NodeId, id: u64, value: String) -> Resul
     let Some(mut parsed) = world.document_mut(owner) else {
         return Ok(());
     };
-    parsed
-        .document
-        .set_attribute_by_ns(owner, &namespace, prefix.as_deref(), &local, value)
-        .map_err(|err| throw_dom_error(ctx, err))?;
+    dom::mutation::set_attribute_by_ns(
+        &mut parsed.document,
+        owner,
+        &namespace,
+        prefix.as_deref(),
+        &local,
+        value,
+    )
+    .map_err(|err| throw_dom_error(ctx, err))?;
     drop(parsed);
     drop(world);
     schedule_mutation_delivery(ctx)
@@ -1031,14 +1034,10 @@ pub(crate) fn remove_attribute_sync(
             return Ok(());
         };
         if by_namespace {
-            parsed
-                .document
-                .remove_attribute_ns(element, namespace, local)
+            dom::mutation::remove_attribute_ns(&mut parsed.document, element, namespace, local)
                 .map_err(|err| throw_dom_error(ctx, err))?;
         } else {
-            parsed
-                .document
-                .remove_attribute(element, local)
+            dom::mutation::remove_attribute(&mut parsed.document, element, local)
                 .map_err(|err| throw_dom_error(ctx, err))?;
         }
     }
@@ -1115,16 +1114,15 @@ pub(crate) fn set_attribute_node<'js>(
             let Some(mut parsed) = world.document_mut(element) else {
                 return Err(Exception::throw_type(ctx, "no document"));
             };
-            parsed
-                .document
-                .set_attribute_by_ns(
-                    element,
-                    &state.namespace,
-                    state.prefix.as_deref(),
-                    &state.local,
-                    value.clone(),
-                )
-                .map_err(|err| throw_dom_error(ctx, err))?;
+            dom::mutation::set_attribute_by_ns(
+                &mut parsed.document,
+                element,
+                &state.namespace,
+                state.prefix.as_deref(),
+                &state.local,
+                value.clone(),
+            )
+            .map_err(|err| throw_dom_error(ctx, err))?;
         }
         world.attr_values.insert(id, value);
         world.attr_owners.insert(id, Some(element));
