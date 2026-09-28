@@ -12,7 +12,7 @@
 //! `:empty`, …) and delegates named states to the embedder through two
 //! parse hooks whose results come back to
 //! [`Element::match_non_ts_pseudo_class`]. Our answers live in
-//! [`crate::state`] under one truth policy: a state matches when static
+//! `crate::state` under one truth policy: a state matches when static
 //! markup determines it, misses vacuously when its context cannot exist in
 //! a headless tree (`:hover`, `:visited`, …), and anything outside both
 //! categories is refused at parse time, exactly as browsers refuse unknown
@@ -44,8 +44,9 @@ use selectors::{
     },
 };
 
-use crate::arena::{Children, Dom, QuirksMode};
+use crate::arena::Document;
 use crate::id::NodeId;
+use crate::metadata::{self, QuirksMode};
 use crate::node::{Attribute, NodeKind};
 use crate::state;
 
@@ -65,7 +66,8 @@ impl QuirksMode {
 pub enum SelectError {
     /// The scope or element handle named a node that no longer exists.
     StaleNode,
-    /// [`Dom::matches`] was handed a handle that does not name an element.
+    /// [`crate::selector::matches`] was handed a handle that does not name an
+    /// element.
     NotAnElement,
     /// The selector string did not parse.
     Syntax(ParseFail),
@@ -649,15 +651,15 @@ impl From<SelectorParseErrorKind<'_>> for ParseFail {
 
 // ── Element view ────────────────────────────────────────────────────────────
 
-/// One live element as the engine sees it: a borrowed [`Dom`] plus a handle.
+/// One live element as the engine sees it: a borrowed [`Document`] plus a handle.
 #[derive(Clone, Debug)]
 struct DomElement<'a> {
-    dom: &'a Dom,
+    dom: &'a Document,
     id: NodeId,
 }
 
 impl<'a> DomElement<'a> {
-    fn new(dom: &'a Dom, id: NodeId) -> Option<Self> {
+    fn new(dom: &'a Document, id: NodeId) -> Option<Self> {
         matches!(dom.kind(id)?, NodeKind::Element { .. }).then_some(Self { dom, id })
     }
 
@@ -679,7 +681,7 @@ impl<'a> DomElement<'a> {
     }
 }
 
-/// The engine's view of the tree: every question routes through [`Dom`]'s
+/// The engine's view of the tree: every question routes through [`Document`]'s
 /// public reads, so matching can never observe a half-mutated arena.
 impl Element for DomElement<'_> {
     type Impl = Selectors;
@@ -826,10 +828,10 @@ impl Element for DomElement<'_> {
             PseudoClass::Indeterminate => state::is_indeterminate(self.dom, self.id),
             PseudoClass::Default => state::is_default(self.dom, self.id),
             PseudoClass::Focus | PseudoClass::FocusVisible => {
-                self.dom.active_element(self.id.document_id()) == Some(self.id)
+                metadata::active_element(self.dom, self.id.document_id()) == Some(self.id)
             }
             PseudoClass::FocusWithin => {
-                let mut cursor = self.dom.active_element(self.id.document_id());
+                let mut cursor = metadata::active_element(self.dom, self.id.document_id());
                 while let Some(current) = cursor {
                     if current == self.id {
                         return true;
@@ -926,185 +928,139 @@ impl Element for DomElement<'_> {
 
 // ── Search ──────────────────────────────────────────────────────────────────
 
-/// Every descendant of `scope` in document order, scope itself excluded:
-/// the candidate set of a scoped query. Iterative (an explicit stack of
-/// child-list cursors), so tree depth costs nothing but bookkeeping.
-struct Descendants<'a> {
-    dom: &'a Dom,
-    stack: Vec<Children<'a>>,
-}
-
-impl<'a> Descendants<'a> {
-    fn new(dom: &'a Dom, scope: NodeId) -> Self {
-        Self {
-            dom,
-            stack: dom.children(scope).into_iter().collect(),
-        }
-    }
-}
-
-impl Iterator for Descendants<'_> {
-    type Item = NodeId;
-
-    fn next(&mut self) -> Option<NodeId> {
-        while let Some(top) = self.stack.last_mut() {
-            match top.next() {
-                Some(id) => {
-                    if let Some(kids) = self.dom.children(id) {
-                        self.stack.push(kids);
-                    }
-                    return Some(id);
-                }
-                None => {
-                    self.stack.pop();
-                }
-            }
-        }
-        None
-    }
-}
-
-impl Dom {
-    /// Every descendant of `scope` in document order, `scope` excluded:
-    /// the candidate set of a scoped query.
-    pub fn descendants(&self, scope: NodeId) -> impl Iterator<Item = NodeId> + '_ {
-        Descendants::new(self, scope)
-    }
-
-    /// Compiles a selector list once per query.
-    fn compile(selectors: &str) -> Result<SelectorList<Selectors>, SelectError> {
-        let mut input = ParserInput::new(selectors);
-        let mut parser = CssParser::new(&mut input);
-        SelectorList::parse(&SelectorLanguage, &mut parser, ParseRelative::No).map_err(|error| {
-            // Engine-classified failures carry their kind; token-level
-            // junk keeps the CSS lexer's own wording under
-            // [`ParseFailKind::MalformedInput`].
-            let fail = match error.kind {
-                cssparser::ParseErrorKind::Custom(fail) => fail,
-                cssparser::ParseErrorKind::Basic(basic) => ParseFail {
-                    kind: ParseFailKind::MalformedInput,
-                    message: basic.to_string().into(),
-                },
-            };
-            SelectError::Syntax(fail)
-        })
-    }
-
-    /// Compiles `selectors` and checks that `scope` is live; syntax errors
-    /// win over staleness, in that order.
-    fn compile_scoped(
-        &self,
-        scope: NodeId,
-        selectors: &str,
-    ) -> Result<SelectorList<Selectors>, SelectError> {
-        let list = Self::compile(selectors)?;
-        if !self.contains(scope) {
-            return Err(SelectError::StaleNode);
-        }
-        Ok(list)
-    }
-
-    /// One matching context (and its caches) for a query: matching is a
-    /// read, so nothing here can invalidate the arena underneath it.
-    ///
-    /// `scope` is the scoping root the caller queries against; `:scope`
-    /// matches it when it is an element
-    /// (<https://drafts.csswg.org/selectors-4/#scope-pseudo>). For document
-    /// and fragment scopes the selectors engine falls back to the root
-    /// element, which is the browser behavior.
-    fn query_context<'a>(
-        &self,
-        caches: &'a mut SelectorCaches,
-        scope: Option<NodeId>,
-    ) -> MatchingContext<'a, Selectors> {
-        let mut context = MatchingContext::new(
-            MatchingMode::Normal,
-            None,
-            caches,
-            self.quirks_mode().engine(),
-            NeedsSelectorFlags::No,
-            MatchingForInvalidation::No,
-        );
-        context.scope_element = scope
-            .and_then(|id| DomElement::new(self, id))
-            .map(|element| element.opaque());
-        context
-    }
-
-    /// Shared scan behind [`Dom::select_all`] and [`Dom::select_first`]:
-    /// walks candidates in document order, stopping after `limit` hits.
-    fn find_matches(
-        &self,
-        list: &SelectorList<Selectors>,
-        scope: NodeId,
-        limit: Option<usize>,
-    ) -> Vec<NodeId> {
-        let mut caches = SelectorCaches::default();
-        let mut context = self.query_context(&mut caches, Some(scope));
-        let mut hits = Vec::new();
-        for candidate in Descendants::new(self, scope) {
-            let Some(element) = DomElement::new(self, candidate) else {
-                continue; // text, comments, doctype: never matchable
-            };
-            if matches_selector_list(list, &element, &mut context) {
-                hits.push(candidate);
-                if limit.is_some_and(|max| hits.len() >= max) {
-                    break;
-                }
-            }
-        }
-        hits
-    }
-
-    /// Every descendant of `scope` matching the selector list, in document
-    /// order: `querySelectorAll` semantics. The scope node itself is not a
-    /// candidate; ancestors above it remain visible to combinators, exactly
-    /// as in browsers.
-    ///
-    /// # Errors
-    ///
-    /// - [`SelectError::StaleNode`] if `scope` names a destroyed node.
-    /// - [`SelectError::Syntax`] if `selectors` does not parse.
-    pub fn select_all(&self, scope: NodeId, selectors: &str) -> Result<Vec<NodeId>, SelectError> {
-        let list = self.compile_scoped(scope, selectors)?;
-        Ok(self.find_matches(&list, scope, None))
-    }
-
-    /// The first matching descendant of `scope` in document order:
-    /// `querySelector` semantics. Stops scanning at the first hit.
-    ///
-    /// # Errors
-    ///
-    /// Same as [`Dom::select_all`].
-    pub fn select_first(
-        &self,
-        scope: NodeId,
-        selectors: &str,
-    ) -> Result<Option<NodeId>, SelectError> {
-        let list = self.compile_scoped(scope, selectors)?;
-        Ok(self.find_matches(&list, scope, Some(1)).into_iter().next())
-    }
-
-    /// Whether one element matches the selector list: `Element.matches`
-    /// semantics. Matching may walk this element's real ancestors and
-    /// siblings, wherever it sits.
-    ///
-    /// # Errors
-    ///
-    /// - [`SelectError::StaleNode`] if `element` names a destroyed node.
-    /// - [`SelectError::NotAnElement`] if `element` names a non-element node.
-    /// - [`SelectError::Syntax`] if `selectors` does not parse.
-    pub fn matches(&self, element: NodeId, selectors: &str) -> Result<bool, SelectError> {
-        let list = Self::compile(selectors)?;
-        let Some(view) = DomElement::new(self, element) else {
-            return Err(if self.contains(element) {
-                SelectError::NotAnElement
-            } else {
-                SelectError::StaleNode
-            });
+/// Compiles a selector list once per query.
+fn compile(selectors: &str) -> Result<SelectorList<Selectors>, SelectError> {
+    let mut input = ParserInput::new(selectors);
+    let mut parser = CssParser::new(&mut input);
+    SelectorList::parse(&SelectorLanguage, &mut parser, ParseRelative::No).map_err(|error| {
+        // Engine-classified failures carry their kind; token-level
+        // junk keeps the CSS lexer's own wording under
+        // [`ParseFailKind::MalformedInput`].
+        let fail = match error.kind {
+            cssparser::ParseErrorKind::Custom(fail) => fail,
+            cssparser::ParseErrorKind::Basic(basic) => ParseFail {
+                kind: ParseFailKind::MalformedInput,
+                message: basic.to_string().into(),
+            },
         };
-        let mut caches = SelectorCaches::default();
-        let mut context = self.query_context(&mut caches, Some(element));
-        Ok(matches_selector_list(&list, &view, &mut context))
+        SelectError::Syntax(fail)
+    })
+}
+
+/// Compiles `selectors` and checks that `scope` is live; syntax errors
+/// win over staleness, in that order.
+fn compile_scoped(
+    dom: &Document,
+    scope: NodeId,
+    selectors: &str,
+) -> Result<SelectorList<Selectors>, SelectError> {
+    let list = compile(selectors)?;
+    if !dom.contains(scope) {
+        return Err(SelectError::StaleNode);
     }
+    Ok(list)
+}
+
+/// One matching context (and its caches) for a query: matching is a
+/// read, so nothing here can invalidate the arena underneath it.
+///
+/// `scope` is the scoping root the caller queries against; `:scope`
+/// matches it when it is an element
+/// (<https://drafts.csswg.org/selectors-4/#scope-pseudo>). For document
+/// and fragment scopes the selectors engine falls back to the root
+/// element, which is the browser behavior.
+fn query_context<'a>(
+    dom: &Document,
+    caches: &'a mut SelectorCaches,
+    scope: Option<NodeId>,
+) -> MatchingContext<'a, Selectors> {
+    let mut context = MatchingContext::new(
+        MatchingMode::Normal,
+        None,
+        caches,
+        metadata::quirks_mode(dom).engine(),
+        NeedsSelectorFlags::No,
+        MatchingForInvalidation::No,
+    );
+    context.scope_element = scope
+        .and_then(|id| DomElement::new(dom, id))
+        .map(|element| element.opaque());
+    context
+}
+
+/// Shared scan behind [`select_all`] and [`select_first`]:
+/// walks candidates in document order, stopping after `limit` hits.
+fn find_matches(
+    dom: &Document,
+    list: &SelectorList<Selectors>,
+    scope: NodeId,
+    limit: Option<usize>,
+) -> Vec<NodeId> {
+    let mut caches = SelectorCaches::default();
+    let mut context = query_context(dom, &mut caches, Some(scope));
+    let mut hits = Vec::new();
+    for candidate in dom.tree().descendants(scope) {
+        let Some(element) = DomElement::new(dom, candidate) else {
+            continue; // text, comments, doctype: never matchable
+        };
+        if matches_selector_list(list, &element, &mut context) {
+            hits.push(candidate);
+            if limit.is_some_and(|max| hits.len() >= max) {
+                break;
+            }
+        }
+    }
+    hits
+}
+
+/// Every descendant of `scope` matching the selector list, in document
+/// order: `querySelectorAll` semantics. The scope node itself is not a
+/// candidate; ancestors above it remain visible to combinators, exactly
+/// as in browsers.
+///
+/// # Errors
+///
+/// - [`SelectError::StaleNode`] if `scope` names a destroyed node.
+/// - [`SelectError::Syntax`] if `selectors` does not parse.
+pub fn select_all(dom: &Document, scope: NodeId, selectors: &str) -> Result<Vec<NodeId>, SelectError> {
+    let list = compile_scoped(dom, scope, selectors)?;
+    Ok(find_matches(dom, &list, scope, None))
+}
+
+/// The first matching descendant of `scope` in document order:
+/// `querySelector` semantics. Stops scanning at the first hit.
+///
+/// # Errors
+///
+/// Same as [`select_all`].
+pub fn select_first(
+    dom: &Document,
+    scope: NodeId,
+    selectors: &str,
+) -> Result<Option<NodeId>, SelectError> {
+    let list = compile_scoped(dom, scope, selectors)?;
+    Ok(find_matches(dom, &list, scope, Some(1)).into_iter().next())
+}
+
+/// Whether one element matches the selector list: `Element.matches`
+/// semantics. Matching may walk this element's real ancestors and
+/// siblings, wherever it sits.
+///
+/// # Errors
+///
+/// - [`SelectError::StaleNode`] if `element` names a destroyed node.
+/// - [`SelectError::NotAnElement`] if `element` names a non-element node.
+/// - [`SelectError::Syntax`] if `selectors` does not parse.
+pub fn matches(dom: &Document, element: NodeId, selectors: &str) -> Result<bool, SelectError> {
+    let list = compile(selectors)?;
+    let Some(view) = DomElement::new(dom, element) else {
+        return Err(if dom.contains(element) {
+            SelectError::NotAnElement
+        } else {
+            SelectError::StaleNode
+        });
+    };
+    let mut caches = SelectorCaches::default();
+    let mut context = query_context(dom, &mut caches, Some(element));
+    Ok(matches_selector_list(&list, &view, &mut context))
 }

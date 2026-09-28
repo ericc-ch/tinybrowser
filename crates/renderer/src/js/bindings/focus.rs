@@ -44,25 +44,27 @@ pub(crate) fn is_focusable(ctx: &Ctx<'_>, node: NodeId) -> Result<bool> {
     let Some(parsed) = world.document(node) else {
         return Ok(false);
     };
-    let Some(kind) = parsed.dom.kind(node) else {
+    let Some(kind) = parsed.document.kind(node) else {
         return Ok(false);
     };
     let NodeKind::Element { name, .. } = kind else {
         return Ok(false);
     };
-    if !parsed.dom.is_connected(node) || is_actually_disabled(&parsed.dom, node) {
+    if !dom::lifecycle::is_connected(&parsed.document, node)
+        || is_actually_disabled(&parsed.document, node)
+    {
         return Ok(false);
     }
     // `tabindex` and `contenteditable` apply to SVG elements too.
-    if parsed.dom.attribute(node, "tabindex").is_some() || is_editable(&parsed.dom, node) {
+    if parsed.document.attribute(node, "tabindex").is_some() || is_editable(&parsed.document, node) {
         return Ok(true);
     }
     if name.ns != html_namespace() {
         return Ok(false);
     }
     Ok(match name.local.as_ref() {
-        "input" => !is_hidden_input(&parsed.dom, node),
-        "a" | "area" => parsed.dom.attribute(node, "href").is_some(),
+        "input" => !is_hidden_input(&parsed.document, node),
+        "a" | "area" => parsed.document.attribute(node, "href").is_some(),
         "button" | "iframe" | "select" | "textarea" => true,
         _ => false,
     })
@@ -72,7 +74,7 @@ pub(crate) fn is_focusable(ctx: &Ctx<'_>, node: NodeId) -> Result<bool> {
 /// supports, including descendants of a disabled `fieldset` that are not
 /// inside its first `legend`
 /// (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#concept-fe-disabled>).
-fn is_actually_disabled(dom: &dom::Dom, node: NodeId) -> bool {
+fn is_actually_disabled(dom: &dom::Document, node: NodeId) -> bool {
     if dom.attribute(node, "disabled").is_some()
         && matches!(
             node_local_name(dom, node).as_deref(),
@@ -111,7 +113,7 @@ fn is_actually_disabled(dom: &dom::Dom, node: NodeId) -> bool {
 /// inheriting the value from ancestors. Only `""`, `true`, and
 /// `plaintext-only` enable editing
 /// (<https://html.spec.whatwg.org/multipage/interaction.html#attr-contenteditable>).
-fn is_editable(dom: &dom::Dom, node: NodeId) -> bool {
+fn is_editable(dom: &dom::Document, node: NodeId) -> bool {
     let mut cursor = Some(node);
     while let Some(current) = cursor {
         if let Some(value) = dom.attribute(current, "contenteditable") {
@@ -130,12 +132,12 @@ fn is_editable(dom: &dom::Dom, node: NodeId) -> bool {
     false
 }
 
-fn is_hidden_input(dom: &dom::Dom, node: NodeId) -> bool {
+fn is_hidden_input(dom: &dom::Document, node: NodeId) -> bool {
     dom.attribute(node, "type")
         .is_some_and(|kind| kind.eq_ignore_ascii_case("hidden"))
 }
 
-fn node_local_name(dom: &dom::Dom, node: NodeId) -> Option<String> {
+fn node_local_name(dom: &dom::Document, node: NodeId) -> Option<String> {
     match dom.kind(node) {
         Some(NodeKind::Element { name, .. }) if name.ns == html_namespace() => {
             Some(name.local.to_string())
@@ -240,7 +242,7 @@ pub(crate) fn element_click(ctx: &Ctx<'_>, node: NodeId) -> Result<()> {
         let Some(parsed) = world.document(node) else {
             return Ok(());
         };
-        if is_actually_disabled(&parsed.dom, node) || world.click_in_progress(node) {
+        if is_actually_disabled(&parsed.document, node) || world.click_in_progress(node) {
             return Ok(());
         }
     }
@@ -288,7 +290,7 @@ fn legacy_pre_activation(ctx: &Ctx<'_>, node: NodeId) -> Result<PreActivation> {
     let Some(mut parsed) = world.document_mut(node) else {
         return Ok(PreActivation::None);
     };
-    let dom = &mut parsed.dom;
+    let dom = &mut parsed.document;
     let Some(NodeKind::Element { name, .. }) = dom.kind(node) else {
         return Ok(PreActivation::None);
     };
@@ -304,17 +306,17 @@ fn legacy_pre_activation(ctx: &Ctx<'_>, node: NodeId) -> Result<PreActivation> {
     Ok(match type_attr.as_str() {
         "checkbox" => {
             let previous = PreActivation::Checkbox {
-                checked: dom.checkedness(node),
-                indeterminate: dom.indeterminate(node),
+                checked: dom::form::checkedness(dom, node),
+                indeterminate: dom::form::indeterminate(dom, node),
             };
-            let next = !dom.checkedness(node);
-            dom.set_input_checkedness(node, next);
-            dom.set_indeterminate(node, false);
+            let next = !dom::form::checkedness(dom, node);
+            dom::form::set_input_checkedness(dom, node, next);
+            dom::form::set_indeterminate(dom, node, false);
             previous
         }
         "radio" => {
-            let previous = dom.radio_group_checked(node);
-            dom.set_input_checkedness(node, true);
+            let previous = dom::form::radio_group_checked(dom, node);
+            dom::form::set_input_checkedness(dom, node, true);
             PreActivation::Radio(previous)
         }
         _ => PreActivation::None,
@@ -328,21 +330,21 @@ fn legacy_canceled_activation(ctx: &Ctx<'_>, node: NodeId, previous: &PreActivat
     let Some(mut parsed) = world.document_mut(node) else {
         return Ok(());
     };
-    let dom = &mut parsed.dom;
+    let dom = &mut parsed.document;
     match previous {
         PreActivation::Checkbox {
             checked,
             indeterminate,
         } => {
-            dom.set_input_checkedness(node, *checked);
-            dom.set_indeterminate(node, *indeterminate);
+            dom::form::set_input_checkedness(dom, node, *checked);
+            dom::form::set_indeterminate(dom, node, *indeterminate);
         }
         PreActivation::Radio(Some(other)) => {
-            dom.set_input_checkedness(node, false);
-            dom.set_input_checkedness(*other, true);
+            dom::form::set_input_checkedness(dom, node, false);
+            dom::form::set_input_checkedness(dom, *other, true);
         }
         PreActivation::Radio(None) => {
-            dom.set_input_checkedness(node, false);
+            dom::form::set_input_checkedness(dom, node, false);
         }
         PreActivation::None => {}
     }
@@ -357,7 +359,7 @@ fn complete_activation(ctx: &Ctx<'_>, node: NodeId) -> Result<()> {
     let checkable = {
         let world = world.borrow();
         world.document(node).is_some_and(|parsed| {
-            let dom = &parsed.dom;
+            let dom = &parsed.document;
             matches!(
                 dom.kind(node),
                 Some(NodeKind::Element { name, .. })
@@ -401,7 +403,7 @@ fn toggle_checkedness(ctx: &Ctx<'_>, node: NodeId) -> Result<()> {
         let Some(mut parsed) = world.document_mut(node) else {
             return Ok(());
         };
-        let dom = &mut parsed.dom;
+        let dom = &mut parsed.document;
         let Some(NodeKind::Element { name, .. }) = dom.kind(node) else {
             return Ok(());
         };
@@ -415,16 +417,16 @@ fn toggle_checkedness(ctx: &Ctx<'_>, node: NodeId) -> Result<()> {
             .to_ascii_lowercase();
         match type_attr.as_str() {
             "checkbox" => {
-                let next = !dom.checkedness(node);
-                dom.set_input_checkedness(node, next);
+                let next = !dom::form::checkedness(dom, node);
+                dom::form::set_input_checkedness(dom, node, next);
                 true
             }
             "radio" => {
                 // A checked radio cannot be unchecked by clicking.
-                if dom.checkedness(node) {
+                if dom::form::checkedness(dom, node) {
                     false
                 } else {
-                    dom.set_input_checkedness(node, true);
+                    dom::form::set_input_checkedness(dom, node, true);
                     true
                 }
             }
@@ -449,14 +451,14 @@ fn run_activation(ctx: &Ctx<'_>, node: NodeId) -> Result<()> {
         let Some(parsed) = world.document(node) else {
             return Ok(());
         };
-        let dom = &parsed.dom;
+        let dom = &parsed.document;
         let Some(NodeKind::Element { name, .. }) = dom.kind(node) else {
             return Ok(());
         };
         if name.ns != html_namespace() {
             return Ok(());
         }
-        let type_attr = |dom: &dom::Dom| {
+        let type_attr = |dom: &dom::Document| {
             dom.attribute(node, "type")
                 .map(|value| value.trim().to_ascii_lowercase())
         };
@@ -474,7 +476,7 @@ fn run_activation(ctx: &Ctx<'_>, node: NodeId) -> Result<()> {
             },
             _ => Activation::None,
         };
-        (activation, dom.form_owner(node))
+        (activation, dom::form::form_owner(dom, node))
     };
     match activation {
         Activation::None => Ok(()),
@@ -553,7 +555,7 @@ fn activate_element<'js>(ctx: Ctx<'js>, element: Value<'js>) -> Result<()> {
         let world = world_for_node(&ctx, node)?;
         let world = world.borrow();
         if let Some(parsed) = world.document(node)
-            && is_actually_disabled(&parsed.dom, node)
+            && is_actually_disabled(&parsed.document, node)
         {
             return Ok(());
         }
@@ -577,7 +579,7 @@ fn webdriver_click<'js>(ctx: Ctx<'js>, element: Value<'js>) -> Result<()> {
         let world = world_for_node(&ctx, node)?;
         let world = world.borrow();
         if let Some(parsed) = world.document(node)
-            && is_actually_disabled(&parsed.dom, node)
+            && is_actually_disabled(&parsed.document, node)
         {
             return Ok(());
         }

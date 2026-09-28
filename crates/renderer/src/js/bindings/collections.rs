@@ -98,7 +98,7 @@ fn is_option_node<'js>(ctx: Ctx<'js>, value: Value<'js>) -> Result<bool> {
     let world = world(&ctx)?;
     let world = world.borrow();
     Ok(world.document(id).is_some_and(|parsed| {
-        matches!(parsed.dom.kind(id), Some(NodeKind::Element { name, .. })
+        matches!(parsed.document.kind(id), Some(NodeKind::Element { name, .. })
             if name.ns == html_namespace() && name.local.as_ref() == "option")
     }))
 }
@@ -117,9 +117,7 @@ fn append_blank_options<'js>(ctx: Ctx<'js>, select: Value<'js>, count: u32) -> R
     let Some(mut parsed) = world.document_mut(id) else {
         return Err(Exception::throw_type(&ctx, "no document"));
     };
-    parsed
-        .dom
-        .append_blank_options(id, count)
+    dom::form::append_blank_options(&mut parsed.document, id, count)
         .map_err(|_| Exception::throw_type(&ctx, "not a select"))
 }
 
@@ -162,7 +160,7 @@ fn window_named_has(ctx: Ctx<'_>, name: String) -> Result<bool> {
     let Some(mut parsed) = world.main_document_mut() else {
         return Ok(false);
     };
-    Ok(parsed.dom.named_name_exists(&name))
+    Ok(dom::named::exists(&mut parsed.document, &name))
 }
 
 #[expect(
@@ -191,11 +189,11 @@ fn collection_named<'js>(ctx: Ctx<'js>, target: Value<'js>, name: String) -> Res
                 return Ok(Value::new_null(ctx));
             };
             let id_matches =
-                parsed.dom.no_namespace_attribute(id, "id").as_deref() == Some(name.as_str());
+                parsed.document.no_namespace_attribute(id, "id").as_deref() == Some(name.as_str());
             let name_matches = matches!(
-                parsed.dom.kind(id),
+                parsed.document.kind(id),
                 Some(NodeKind::Element { name: qual, .. }) if qual.ns == html_namespace()
-            ) && parsed.dom.no_namespace_attribute(id, "name").as_deref() == Some(name.as_str());
+            ) && parsed.document.no_namespace_attribute(id, "name").as_deref() == Some(name.as_str());
             id_matches || name_matches
         };
         if matches {
@@ -229,18 +227,18 @@ fn collection_keys<'js>(ctx: Ctx<'js>, target: Value<'js>) -> Result<Array<'js>>
             let Some(parsed) = world.document(id) else {
                 continue;
             };
-            if let Some(element_id) = parsed.dom.no_namespace_attribute(id, "id")
+            if let Some(element_id) = parsed.document.no_namespace_attribute(id, "id")
                 && !element_id.is_empty()
                 && seen.insert(element_id.clone())
             {
                 keys.push(element_id);
             }
             let exposes_name = matches!(
-                parsed.dom.kind(id),
+                parsed.document.kind(id),
                 Some(NodeKind::Element { name, .. }) if name.ns == html_namespace()
             );
             if exposes_name
-                && let Some(element_name) = parsed.dom.no_namespace_attribute(id, "name")
+                && let Some(element_name) = parsed.document.no_namespace_attribute(id, "name")
                 && !element_name.is_empty()
                 && seen.insert(element_name.clone())
             {

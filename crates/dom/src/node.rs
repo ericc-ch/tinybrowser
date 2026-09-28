@@ -6,8 +6,6 @@
 //! straight through with no conversion, and element names are interned
 //! rather than copied per node.
 
-use crate::id::NodeId;
-
 pub use markup5ever::{LocalName, Namespace, Prefix, QualName};
 
 /// The HTML namespace URL.
@@ -93,7 +91,7 @@ pub struct Attribute {
 /// What kind of node this is, and the data unique to that kind.
 #[derive(Clone, Debug)]
 pub enum NodeKind {
-    /// The root created with the `Dom`; every document has exactly one.
+    /// The root created with the `Document`; every document has exactly one.
     Document,
     /// The `<!DOCTYPE html>` declaration.
     Doctype {
@@ -118,37 +116,4 @@ pub enum NodeKind {
     ProcessingInstruction { target: String, data: String },
     /// An HTML comment.
     Comment { data: String },
-}
-
-/// One node record: where it sits in the tree, plus its kind-specific data.
-///
-/// The tree is an intrusive doubly-linked structure, not a per-parent array:
-/// a parent names its first and last child, and every child names its
-/// neighbours. That makes sibling access O(1) in both directions, which the
-/// selector engine's `:nth-*` machinery depends on
-/// (<https://drafts.csswg.org/selectors-4/#the-nth-child-pseudo>: the index of
-/// each child is a walk over its preceding siblings).
-///
-/// `parent` duplicates what the sibling links already reach by walking upward.
-/// Upward walks are common enough to pay for the pointer, and it is the fast
-/// `is_connected`/`would_cycle` step.
-///
-/// The five links cost memory: `Node` measures 152 bytes here against 112 with
-/// the former per-parent `Vec<NodeId>` child list (`size_of::<Node>()`), a
-/// deliberate +40 bytes per node for the O(1) sibling access that keeps
-/// `:nth-*` selector matching linear. Links are arena-internal and never
-/// outlive their node, so the fields could later shrink to slot-only
-/// `Option<NonZeroU32>` and rebuild the `NodeId` generation from the slot if
-/// the trade ever stops paying.
-///
-/// Everything here is arena-internal; outside code sees only [`crate::NodeId`]
-/// handles and the read/mutation API on [`crate::Dom`].
-#[derive(Debug)]
-pub(crate) struct Node {
-    pub(crate) parent: Option<NodeId>,
-    pub(crate) first_child: Option<NodeId>,
-    pub(crate) last_child: Option<NodeId>,
-    pub(crate) previous_sibling: Option<NodeId>,
-    pub(crate) next_sibling: Option<NodeId>,
-    pub(crate) kind: NodeKind,
 }

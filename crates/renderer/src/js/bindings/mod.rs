@@ -96,7 +96,7 @@ pub(crate) fn forget_world(context: &rquickjs::Context) {
 pub(crate) fn main_document(ctx: &Ctx<'_>) -> Result<NodeId> {
     world(ctx)?
         .borrow()
-        .with_main_document(|parsed| parsed.dom.document())
+        .with_main_document(|parsed| parsed.document.document())
         .ok_or_else(|| Exception::throw_type(ctx, "no document"))
 }
 
@@ -449,7 +449,7 @@ pub(crate) fn install(ctx: &Ctx<'_>, world: &Rc<RefCell<World>>) -> Result<()> {
 
     let document_id = world
         .borrow()
-        .with_main_document(|parsed| parsed.dom.document());
+        .with_main_document(|parsed| parsed.document.document());
     if let Some(id) = document_id {
         globals.set("document", wrap_node(ctx, id)?)?;
     }
@@ -562,8 +562,8 @@ pub(super) fn webdriver_element(ctx: Ctx<'_>, remote_id: f64) -> Result<Value<'_
     };
     // Only a live, connected element is a valid element reference.
     let valid = world.borrow().document(node).is_some_and(|parsed| {
-        parsed.dom.is_connected(node)
-            && matches!(parsed.dom.kind(node), Some(NodeKind::Element { .. }))
+        dom::lifecycle::is_connected(&parsed.document, node)
+            && matches!(parsed.document.kind(node), Some(NodeKind::Element { .. }))
     });
     if !valid {
         return Ok(Value::new_null(ctx));
@@ -579,14 +579,14 @@ pub(super) fn layout_boxes(ctx: &Ctx<'_>, document: NodeId) -> Result<Vec<crate:
     let Some(parsed) = world.document(document) else {
         return Ok(Vec::new());
     };
-    let sheets = inline_stylesheets(&parsed.dom);
+    let sheets = inline_stylesheets(&parsed.document);
     let options = crate::render::RenderOptions {
         width: crate::engine::VIEWPORT_WIDTH,
         height: crate::engine::VIEWPORT_HEIGHT,
         scale: 1.0,
     };
     Ok(
-        crate::render::layout_boxes(&parsed.dom, &sheets, &options, &world.images)
+        crate::render::layout_boxes(&parsed.document, &sheets, &options, &world.images)
             .unwrap_or_default(),
     )
 }
@@ -594,9 +594,9 @@ pub(super) fn layout_boxes(ctx: &Ctx<'_>, document: NodeId) -> Result<Vec<crate:
 /// Inline `<style>` text in document order. External sheets are not mirrored
 /// into script geometry yet, so a page styled only by `<link>` lays out
 /// without the author rules.
-fn inline_stylesheets(dom: &dom::Dom) -> Vec<String> {
+fn inline_stylesheets(dom: &dom::Document) -> Vec<String> {
     let mut sheets = Vec::new();
-    for node in dom.descendants(dom.document()) {
+    for node in dom.tree().descendants(dom.document()) {
         let Some(NodeKind::Element { name, .. }) = dom.kind(node) else {
             continue;
         };
@@ -716,7 +716,7 @@ fn instantiate_node<'js>(ctx: &Ctx<'js>, id: NodeId) -> Result<Value<'js>> {
     let is_shadow_root = world(ctx)?
         .borrow()
         .document(id)
-        .is_some_and(|parsed| parsed.dom.shadow_host(id).is_some());
+        .is_some_and(|parsed| dom::shadow::shadow_host(&parsed.document, id).is_some());
     let brand = with_node_kind(ctx, id, |kind| match kind {
         Some(NodeKind::Document) => Some(if document_is_html_content(ctx, id) {
             "Document"
@@ -1018,7 +1018,7 @@ pub(super) fn with_node_kind<T>(
     let Some(parsed) = parsed.document(id) else {
         return Err(Exception::throw_type(ctx, "no document"));
     };
-    Ok(read(parsed.dom.kind(id)))
+    Ok(read(parsed.document.kind(id)))
 }
 
 pub(crate) fn character_data(ctx: &Ctx<'_>, id: NodeId) -> Result<String> {
@@ -1039,7 +1039,7 @@ pub(super) fn attribute_value(ctx: &Ctx<'_>, id: NodeId, local: &str) -> Result<
     Ok(world
         .borrow()
         .document(id)
-        .and_then(|parsed| parsed.dom.attribute(id, local))
+        .and_then(|parsed| parsed.document.attribute(id, local))
         .unwrap_or_default())
 }
 
@@ -1051,29 +1051,21 @@ pub(super) fn set_character_data(ctx: &Ctx<'_>, id: NodeId, data: String) -> Res
     let Some(mut parsed) = world.document_mut(id) else {
         return Ok(());
     };
-    match parsed.dom.kind(id) {
+    match parsed.document.kind(id) {
         Some(NodeKind::Text { .. }) => {
-            parsed
-                .dom
-                .set_text(id, data)
+            dom::mutation::set_text(&mut parsed.document, id, data)
                 .map_err(|err| throw_dom_error(ctx, err))?;
         }
         Some(NodeKind::CDataSection { .. }) => {
-            parsed
-                .dom
-                .set_cdata_section(id, data)
+            dom::mutation::set_cdata_section(&mut parsed.document, id, data)
                 .map_err(|err| throw_dom_error(ctx, err))?;
         }
         Some(NodeKind::ProcessingInstruction { .. }) => {
-            parsed
-                .dom
-                .set_processing_instruction(id, data)
+            dom::mutation::set_processing_instruction(&mut parsed.document, id, data)
                 .map_err(|err| throw_dom_error(ctx, err))?;
         }
         Some(NodeKind::Comment { .. }) => {
-            parsed
-                .dom
-                .set_comment(id, data)
+            dom::mutation::set_comment(&mut parsed.document, id, data)
                 .map_err(|err| throw_dom_error(ctx, err))?;
         }
         _ => return Ok(()),
@@ -1122,7 +1114,7 @@ pub(super) fn sibling_value<'js>(ctx: &Ctx<'js>, id: NodeId, forward: bool) -> R
     let sibling = world
         .borrow()
         .document(id)
-        .and_then(|parsed| parsed.dom.sibling(id, forward));
+        .and_then(|parsed| parsed.document.sibling(id, forward));
     child_value(ctx, sibling)
 }
 
@@ -1139,12 +1131,12 @@ pub(super) fn element_sibling_value<'js>(
         let Some(parsed) = parsed.document(id) else {
             return Ok(Value::new_null(ctx.clone()));
         };
-        let mut cursor = parsed.dom.sibling(id, forward);
+        let mut cursor = parsed.document.sibling(id, forward);
         while let Some(sibling) = cursor {
-            if is_element(&parsed.dom, sibling) {
+            if is_element(&parsed.document, sibling) {
                 break;
             }
-            cursor = parsed.dom.sibling(sibling, forward);
+            cursor = parsed.document.sibling(sibling, forward);
         }
         cursor
     };
@@ -1160,7 +1152,7 @@ pub(super) fn string_value<'js>(ctx: &Ctx<'js>, text: &str) -> Result<Value<'js>
 ///
 /// Descends only into elements and fragments: a `Document` or other
 /// non-container child contributes nothing, so its subtree is not entered.
-pub(super) fn descendant_text(dom: &dom::Dom, id: NodeId) -> String {
+pub(super) fn descendant_text(dom: &dom::Document, id: NodeId) -> String {
     let mut text = String::new();
     let mut stack: Vec<NodeId> = dom.children(id).map(Iterator::collect).unwrap_or_default();
     stack.reverse();
@@ -1182,7 +1174,7 @@ pub(super) fn descendant_text(dom: &dom::Dom, id: NodeId) -> String {
 
 /// Structural `isEqualNode`
 /// (<https://dom.spec.whatwg.org/#concept-node-equals>).
-pub(super) fn nodes_equal(dom: &dom::Dom, a: NodeId, b: NodeId) -> bool {
+pub(super) fn nodes_equal(dom: &dom::Document, a: NodeId, b: NodeId) -> bool {
     if a == b {
         return true;
     }
@@ -1255,7 +1247,7 @@ pub(super) fn nodes_equal(dom: &dom::Dom, a: NodeId, b: NodeId) -> bool {
 /// [Locate a namespace](https://dom.spec.whatwg.org/#locate-a-namespace) for
 /// `prefix` walking `cursor`'s inclusive ancestors.
 pub(super) fn locate_namespace(
-    dom: &dom::Dom,
+    dom: &dom::Document,
     cursor: NodeId,
     prefix: Option<&str>,
 ) -> Option<Namespace> {
@@ -1278,7 +1270,7 @@ pub(super) fn locate_namespace(
 
 /// [Locate a namespace prefix](https://dom.spec.whatwg.org/#locate-a-namespace-prefix)
 /// for `namespace` walking `cursor`'s inclusive ancestors.
-pub(super) fn locate_prefix(dom: &dom::Dom, cursor: NodeId, namespace: &str) -> Option<String> {
+pub(super) fn locate_prefix(dom: &dom::Document, cursor: NodeId, namespace: &str) -> Option<String> {
     let mut cursor = Some(cursor);
     while let Some(id) = cursor {
         if let Some(NodeKind::Element { name, attributes }) = dom.kind(id) {
@@ -1346,12 +1338,10 @@ pub(super) fn create_element_named<'js>(
     let Some(mut parsed) = world.document_mut(document) else {
         return Err(Exception::throw_type(ctx, "no document"));
     };
-    let id = parsed.dom.create_element(name, Vec::new());
+    let id = parsed.document.create_element(name, Vec::new());
     if is_template {
-        let contents = parsed.dom.create_fragment();
-        parsed
-            .dom
-            .set_template_contents(id, contents)
+        let contents = parsed.document.create_fragment();
+        dom::shadow::set_template_contents(&mut parsed.document, id, contents)
             .map_err(|err| throw_dom_error(ctx, err))?;
     }
     drop(parsed);
@@ -1362,14 +1352,14 @@ pub(super) fn create_element_named<'js>(
 pub(super) fn create_kind<'js>(
     ctx: &Ctx<'js>,
     document: NodeId,
-    make: impl FnOnce(&mut dom::Dom) -> NodeId,
+    make: impl FnOnce(&mut dom::Document) -> NodeId,
 ) -> Result<Value<'js>> {
     let world = world(ctx)?;
     let world = world.borrow();
     let Some(mut parsed) = world.document_mut(document) else {
         return Err(Exception::throw_type(ctx, "no document"));
     };
-    let id = make(&mut parsed.dom);
+    let id = make(&mut parsed.document);
     drop(parsed);
     drop(world);
     wrap_node(ctx, id)
@@ -1551,43 +1541,41 @@ pub(super) fn collection_ids(
     };
     Ok(match kind {
         CollectionKind::Children => parsed
-            .dom
+            .document
             .children(scope)
             .map(Iterator::collect)
             .unwrap_or_default(),
         CollectionKind::ElementChildren => parsed
-            .dom
+            .document
             .children(scope)
             .map(|children| {
                 children
-                    .filter(|&kid| is_element(&parsed.dom, kid))
+                    .filter(|&kid| is_element(&parsed.document, kid))
                     .collect()
             })
             .unwrap_or_default(),
-        CollectionKind::ElementsByTag(name) => collect_by_tag(&parsed.dom, scope, name),
+        CollectionKind::ElementsByTag(name) => collect_by_tag(&parsed.document, scope, name),
         CollectionKind::ElementsByTagNs { namespace, local } => {
-            collect_by_tag_ns(&parsed.dom, scope, namespace, local)
+            collect_by_tag_ns(&parsed.document, scope, namespace, local)
         }
-        CollectionKind::ElementsByClass(names) => collect_by_class(&parsed.dom, scope, names),
-        CollectionKind::ElementsByName(name) => collect_by_name(&parsed.dom, scope, name),
-        CollectionKind::SelectOptions => parsed.dom.select_options(scope),
-        CollectionKind::SelectedOptions => parsed
-            .dom
-            .select_options(scope)
+        CollectionKind::ElementsByClass(names) => collect_by_class(&parsed.document, scope, names),
+        CollectionKind::ElementsByName(name) => collect_by_name(&parsed.document, scope, name),
+        CollectionKind::SelectOptions => dom::form::select_options(&parsed.document, scope),
+        CollectionKind::SelectedOptions => dom::form::select_options(&parsed.document, scope)
             .into_iter()
-            .filter(|&option| parsed.dom.option_selected(option))
+            .filter(|&option| dom::form::option_selected(&parsed.document, option))
             .collect(),
-        CollectionKind::WindowNamed(name) => collect_window_named(&parsed.dom, scope, name),
+        CollectionKind::WindowNamed(name) => collect_window_named(&parsed.document, scope, name),
         CollectionKind::Static(handles) => handles.iter().map(|handle| handle.0).collect(),
     })
 }
 
-fn collect_by_tag(dom: &dom::Dom, scope: NodeId, name: &str) -> Vec<NodeId> {
+fn collect_by_tag(dom: &dom::Document, scope: NodeId, name: &str) -> Vec<NodeId> {
     // In an HTML document, an HTML-namespace element matches the queried
     // name ASCII-lowercased; other elements match the name exactly
     // (<https://dom.spec.whatwg.org/#concept-getelementsbytagname>).
     let lowered = name.to_ascii_lowercase();
-    dom.descendants(scope)
+    dom.tree().descendants(scope)
         .filter(|&id| {
             let Some(NodeKind::Element { name: qual, .. }) = dom.kind(id) else {
                 return false;
@@ -1602,8 +1590,8 @@ fn collect_by_tag(dom: &dom::Dom, scope: NodeId, name: &str) -> Vec<NodeId> {
         .collect()
 }
 
-fn collect_by_name(dom: &dom::Dom, scope: NodeId, name: &str) -> Vec<NodeId> {
-    dom.descendants(scope)
+fn collect_by_name(dom: &dom::Document, scope: NodeId, name: &str) -> Vec<NodeId> {
+    dom.tree().descendants(scope)
         .filter(|&id| is_element(dom, id) && dom.attribute(id, "name").as_deref() == Some(name))
         .collect()
 }
@@ -1612,11 +1600,11 @@ fn collect_by_name(dom: &dom::Dom, scope: NodeId, name: &str) -> Vec<NodeId> {
 /// plus `embed`, `form`, `img`, and `object` elements whose `name` is `name`,
 /// in tree order
 /// (<https://html.spec.whatwg.org/multipage/nav-history-apis.html#named-access-on-the-window-object>).
-fn collect_window_named(dom: &dom::Dom, scope: NodeId, name: &str) -> Vec<NodeId> {
+fn collect_window_named(dom: &dom::Document, scope: NodeId, name: &str) -> Vec<NodeId> {
     if name.is_empty() {
         return Vec::new();
     }
-    dom.descendants(scope)
+    dom.tree().descendants(scope)
         .filter(|&id| {
             if dom.no_namespace_attribute(id, "id").as_deref() == Some(name) {
                 return true;
@@ -1632,8 +1620,8 @@ fn collect_window_named(dom: &dom::Dom, scope: NodeId, name: &str) -> Vec<NodeId
         .collect()
 }
 
-fn collect_by_tag_ns(dom: &dom::Dom, scope: NodeId, namespace: &str, local: &str) -> Vec<NodeId> {
-    dom.descendants(scope)
+fn collect_by_tag_ns(dom: &dom::Document, scope: NodeId, namespace: &str, local: &str) -> Vec<NodeId> {
+    dom.tree().descendants(scope)
         .filter(|&id| {
             matches!(
                 dom.kind(id),
@@ -1645,14 +1633,14 @@ fn collect_by_tag_ns(dom: &dom::Dom, scope: NodeId, namespace: &str, local: &str
         .collect()
 }
 
-fn collect_by_class(dom: &dom::Dom, scope: NodeId, names: &str) -> Vec<NodeId> {
+fn collect_by_class(dom: &dom::Document, scope: NodeId, names: &str) -> Vec<NodeId> {
     let wanted: Vec<&str> = names.split_ascii_whitespace().collect();
     // An empty class set matches nothing
     // (<https://dom.spec.whatwg.org/#concept-getelementsbyclassname>).
     if wanted.is_empty() {
         return Vec::new();
     }
-    dom.descendants(scope)
+    dom.tree().descendants(scope)
         .filter(|&id| {
             if !is_element(dom, id) {
                 return false;
@@ -1664,7 +1652,7 @@ fn collect_by_class(dom: &dom::Dom, scope: NodeId, names: &str) -> Vec<NodeId> {
         .collect()
 }
 
-pub(super) fn is_element(dom: &dom::Dom, id: NodeId) -> bool {
+pub(super) fn is_element(dom: &dom::Document, id: NodeId) -> bool {
     matches!(dom.kind(id), Some(NodeKind::Element { .. }))
 }
 
@@ -1688,7 +1676,7 @@ pub(super) fn is_template_element(kind: Option<&NodeKind>) -> bool {
 }
 
 /// The root of the tree `id` participates in (itself when detached).
-pub(super) fn root_of(dom: &dom::Dom, id: NodeId) -> NodeId {
+pub(super) fn root_of(dom: &dom::Document, id: NodeId) -> NodeId {
     let mut root = id;
     while let Some(parent) = dom.parent(root) {
         root = parent;
@@ -1697,7 +1685,7 @@ pub(super) fn root_of(dom: &dom::Dom, id: NodeId) -> NodeId {
 }
 
 /// `id` followed by its inclusive ancestors, nearest first.
-pub(super) fn ancestor_chain(dom: &dom::Dom, id: NodeId) -> Vec<NodeId> {
+pub(super) fn ancestor_chain(dom: &dom::Document, id: NodeId) -> Vec<NodeId> {
     let mut chain = vec![id];
     let mut cursor = id;
     while let Some(parent) = dom.parent(cursor) {
@@ -1709,7 +1697,7 @@ pub(super) fn ancestor_chain(dom: &dom::Dom, id: NodeId) -> Vec<NodeId> {
 
 /// Document order of two nodes in one tree
 /// (<https://dom.spec.whatwg.org/#concept-tree-order>).
-pub(super) fn tree_order(dom: &dom::Dom, a: NodeId, b: NodeId) -> std::cmp::Ordering {
+pub(super) fn tree_order(dom: &dom::Document, a: NodeId, b: NodeId) -> std::cmp::Ordering {
     use std::cmp::Ordering;
     let chain_a = ancestor_chain(dom, a);
     let chain_b = ancestor_chain(dom, b);
@@ -1738,8 +1726,8 @@ pub(super) fn tree_order(dom: &dom::Dom, a: NodeId, b: NodeId) -> std::cmp::Orde
     position_a.cmp(&position_b)
 }
 
-pub(super) fn find_element_by_id(dom: &dom::Dom, scope: NodeId, id: &str) -> Option<NodeId> {
-    dom.descendants(scope)
+pub(super) fn find_element_by_id(dom: &dom::Document, scope: NodeId, id: &str) -> Option<NodeId> {
+    dom.tree().descendants(scope)
         .find(|&node| is_element(dom, node) && dom.attribute(node, "id").as_deref() == Some(id))
 }
 
@@ -2001,7 +1989,7 @@ mod realm_tests {
         let realm_b = JsRealm::new(&shared, world_b.clone(), Arc::clone(&stop)).expect("realm b");
         let b_root = world_b
             .borrow()
-            .with_main_document(|parsed| parsed.dom.document())
+            .with_main_document(|parsed| parsed.document.document())
             .expect("b document");
 
         // Realm A wraps realm B's document: the same object as B's `document`.

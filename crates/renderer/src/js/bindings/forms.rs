@@ -68,7 +68,7 @@ fn set_option_selectedness<'js>(ctx: Ctx<'js>, element: Value<'js>, selected: bo
     let Some(mut parsed) = world.document_mut(node) else {
         return Ok(());
     };
-    parsed.dom.set_option_selectedness(node, selected);
+    dom::form::set_option_selectedness(&mut parsed.document, node, selected);
     Ok(())
 }
 
@@ -127,10 +127,10 @@ fn collect_pending_entries(
     let Some(parsed) = world.document(form) else {
         return Vec::new();
     };
-    let document = &parsed.dom;
-    let root = document.tree_root_of(form);
+    let document = &parsed.document;
+    let root = dom::form::tree_root_of(document, form);
     let mut pending = Vec::new();
-    for node in document.descendants(root) {
+    for node in document.tree().descendants(root) {
         let Some(NodeKind::Element { name, .. }) = document.kind(node) else {
             continue;
         };
@@ -141,7 +141,7 @@ fn collect_pending_entries(
         if local != "input" && local != "textarea" && local != "select" && local != "button" {
             continue;
         }
-        if document.form_owner(node) != Some(form) {
+        if dom::form::form_owner(document, node) != Some(form) {
             continue;
         }
         let Some(control_name) = document.attribute(node, "name") else {
@@ -170,7 +170,7 @@ fn collect_pending_entries(
 
 /// Whether `node` has a `datalist` ancestor, which bars it from the entry list
 /// (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#constructing-form-data-set>).
-fn has_datalist_ancestor(document: &dom::Dom, node: NodeId) -> bool {
+fn has_datalist_ancestor(document: &dom::Document, node: NodeId) -> bool {
     document.ancestors(node).any(|ancestor| {
         matches!(
             document.kind(ancestor),
@@ -184,7 +184,7 @@ fn has_datalist_ancestor(document: &dom::Dom, node: NodeId) -> bool {
 /// multiple `select`) several
 /// (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#constructing-form-data-set>).
 fn pending_entry(
-    dom: &dom::Dom,
+    dom: &dom::Document,
     node: NodeId,
     local: &str,
     control_name: String,
@@ -192,7 +192,7 @@ fn pending_entry(
 ) -> Vec<PendingEntry> {
     match local {
         "textarea" => {
-            let mut value = dom.textarea_value(node).unwrap_or_default();
+            let mut value = dom::form::textarea_value(dom, node).unwrap_or_default();
             if wrap_is_hard(dom.attribute(node, "wrap").as_deref()) {
                 let cols = parse_positive(dom.attribute(node, "cols").as_deref()).unwrap_or(20);
                 value = hard_wrap(&value, cols);
@@ -233,7 +233,7 @@ fn pending_entry(
                 // A checkbox or radio contributes only when checked, and its
                 // value defaults to "on"
                 // (<https://html.spec.whatwg.org/multipage/input.html#dom-input-value-default-on>).
-                if !dom.checkedness(node) {
+                if !dom::form::checkedness(dom, node) {
                     return Vec::new();
                 }
                 let value = dom
@@ -245,21 +245,21 @@ fn pending_entry(
             } else {
                 vec![PendingEntry::Text(
                     control_name,
-                    dom.input_value(node).unwrap_or_default(),
+                    dom::form::input_value(dom, node).unwrap_or_default(),
                 )]
             }
         }
         "select" => {
             if dom.attribute(node, "multiple").is_some() {
-                dom.select_options(node)
+                dom::form::select_options(dom, node)
                     .iter()
-                    .filter(|&&option| dom.option_selected(option) && !is_disabled(dom, option))
+                    .filter(|&&option| dom::form::option_selected(dom, option) && !is_disabled(dom, option))
                     .map(|&option| {
-                        PendingEntry::Text(control_name.clone(), dom.option_value(option))
+                        PendingEntry::Text(control_name.clone(), dom::form::option_value(dom, option))
                     })
                     .collect()
             } else {
-                vec![PendingEntry::Text(control_name, dom.select_value(node))]
+                vec![PendingEntry::Text(control_name, dom::form::select_value(dom, node))]
             }
         }
         _ => Vec::new(),
@@ -458,17 +458,17 @@ pub(super) fn form_navigate(
 fn find_named_frame(world: &Rc<RefCell<World>>, name: &str) -> Option<NodeId> {
     let world = world.borrow();
     let parsed = world.main_document()?;
-    let mut stack = vec![parsed.dom.document()];
+    let mut stack = vec![parsed.document.document()];
     while let Some(node) = stack.pop() {
-        if let Some(NodeKind::Element { name: element, .. }) = parsed.dom.kind(node)
+        if let Some(NodeKind::Element { name: element, .. }) = parsed.document.kind(node)
             && element.ns == html_namespace()
             && element.local.as_ref() == "iframe"
-            && parsed.dom.attribute(node, "name").as_deref() == Some(name)
+            && parsed.document.attribute(node, "name").as_deref() == Some(name)
         {
             return Some(node);
         }
         let children: Vec<NodeId> = parsed
-            .dom
+            .document
             .children(node)
             .map(Iterator::collect)
             .unwrap_or_default();

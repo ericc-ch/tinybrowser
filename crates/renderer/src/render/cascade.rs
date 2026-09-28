@@ -1,7 +1,7 @@
 //! The render pipeline: cascade styles over the DOM, build the box tree, lay
 //! it out, and paint one image.
 
-use dom::Dom;
+use dom::Document;
 
 use crate::render::color::Color;
 use crate::render::font::Fonts;
@@ -18,7 +18,7 @@ use crate::render::{RasterImage, RenderError, RenderOptions, RgbaImage};
 ///
 /// See [`RenderError`].
 pub(crate) fn render(
-    dom: &Dom,
+    dom: &Document,
     stylesheets: &[String],
     options: &RenderOptions,
     images: &std::collections::HashMap<dom::NodeId, RasterImage>,
@@ -61,10 +61,10 @@ pub(crate) fn render(
 /// propagation, so translucent colors are blended into the canvas only once
 /// (<https://drafts.csswg.org/css-backgrounds-3/#special-backgrounds>).
 fn propagate_canvas_background(
-    dom: &Dom,
+    dom: &Document,
     styles: &mut std::collections::HashMap<dom::NodeId, crate::render::style::Style>,
 ) -> Color {
-    let Some(root) = dom.select_first(dom.document(), "html").ok().flatten() else {
+    let Some(root) = dom::selector::select_first(dom, dom.document(), "html").ok().flatten() else {
         return Color::TRANSPARENT;
     };
     let Some(root_style) = styles.get(&root) else {
@@ -101,7 +101,7 @@ fn propagate_canvas_background(
 /// Lays `dom` out without painting and returns every box in tree order, for
 /// script geometry (`getBoundingClientRect`, hit testing).
 pub(crate) fn boxes(
-    dom: &Dom,
+    dom: &Document,
     stylesheets: &[String],
     options: &RenderOptions,
     images: &std::collections::HashMap<dom::NodeId, RasterImage>,
@@ -155,7 +155,7 @@ fn paint(
     layout: &LayoutBox,
     fonts: &Fonts,
     images: &std::collections::HashMap<dom::NodeId, RasterImage>,
-    dom: &Dom,
+    dom: &Document,
     styles: &std::collections::HashMap<dom::NodeId, crate::render::style::Style>,
 ) {
     if layout.style.opacity <= 0.0 {

@@ -11,7 +11,7 @@
 //! `parsererror` element, matching the HTML XML parsing rules.
 
 use dom::{
-    Attribute, Dom, LocalName, Namespace, NodeId, Prefix, QualName, xml_namespace, xmlns_namespace,
+    Attribute, Document, LocalName, Namespace, NodeId, Prefix, QualName, xml_namespace, xmlns_namespace,
 };
 
 use crate::Parsed;
@@ -28,8 +28,8 @@ pub(crate) fn parse_document(input: &str, content_type: &'static str) -> Parsed 
 struct XmlParser<'a> {
     input: &'a str,
     pos: usize,
-    dom: Dom,
-    document: NodeId,
+    document: Document,
+    root: NodeId,
     content_type: &'static str,
     /// Open elements, outermost first.
     stack: Vec<NodeId>,
@@ -40,13 +40,13 @@ struct XmlParser<'a> {
 
 impl<'a> XmlParser<'a> {
     fn new(input: &'a str, content_type: &'static str) -> Self {
-        let dom = Dom::new();
-        let document = dom.document();
+        let dom = Document::new();
+        let root = dom.document();
         Self {
             input,
             pos: 0,
-            dom,
-            document,
+            document: dom,
+            root,
             content_type,
             stack: Vec::new(),
             scopes: Vec::new(),
@@ -55,7 +55,7 @@ impl<'a> XmlParser<'a> {
 
     fn finish(self) -> Parsed {
         Parsed {
-            dom: self.dom,
+            document: self.document,
             quirks_mode: markup5ever::interface::QuirksMode::NoQuirks,
             content_type: self.content_type,
             ready_state: crate::ReadyState::Complete,
@@ -67,9 +67,9 @@ impl<'a> XmlParser<'a> {
     fn malformed(&mut self) {
         self.stack.clear();
         self.scopes.clear();
-        let clear = self.dom.create_fragment();
-        let _ = self.dom.replace_all(self.document, clear);
-        let error = self.dom.create_element(
+        let clear = self.document.create_fragment();
+        let _ = dom::mutation::replace_all(&mut self.document, self.root, clear);
+        let error = self.document.create_element(
             QualName::new(
                 None,
                 Namespace::from("http://www.w3.org/1999/xhtml"),
@@ -77,7 +77,7 @@ impl<'a> XmlParser<'a> {
             ),
             Vec::new(),
         );
-        let _ = self.dom.append(self.document, error);
+        let _ = dom::mutation::append(&mut self.document, self.root, error);
     }
 
     fn rest(&self) -> &'a str {
@@ -137,8 +137,8 @@ impl<'a> XmlParser<'a> {
     }
 
     fn append(&mut self, node: NodeId) -> Result<(), ()> {
-        let parent = *self.stack.last().unwrap_or(&self.document);
-        self.dom.append(parent, node).map_err(|_| ())
+        let parent = *self.stack.last().unwrap_or(&self.root);
+        dom::mutation::append(&mut self.document, parent, node).map_err(|_| ())
     }
 
     fn run(&mut self) -> Result<(), ()> {
@@ -184,14 +184,14 @@ impl<'a> XmlParser<'a> {
         }
         let mut decoded = String::with_capacity(raw.len());
         decode_references(raw, false, &mut decoded)?;
-        let node = self.dom.create_text(decoded);
+        let node = self.document.create_text(decoded);
         self.append(node)
     }
 
     fn comment(&mut self) -> Result<(), ()> {
         let rest = self.rest();
         let end = rest[4..].find("-->").ok_or(())? + 4;
-        let node = self.dom.create_comment(&rest[4..end]);
+        let node = self.document.create_comment(&rest[4..end]);
         self.pos += end + 3;
         self.append(node)
     }
@@ -199,7 +199,7 @@ impl<'a> XmlParser<'a> {
     fn cdata(&mut self) -> Result<(), ()> {
         let rest = self.rest();
         let end = rest[9..].find("]]>").ok_or(())? + 9;
-        let node = self.dom.create_cdata_section(&rest[9..end]);
+        let node = self.document.create_cdata_section(&rest[9..end]);
         self.pos += end + 3;
         self.append(node)
     }
@@ -219,7 +219,7 @@ impl<'a> XmlParser<'a> {
         if target.eq_ignore_ascii_case("xml") {
             return Ok(());
         }
-        let node = self.dom.create_processing_instruction(target, data);
+        let node = self.document.create_processing_instruction(target, data);
         self.append(node)
     }
 
@@ -253,7 +253,7 @@ impl<'a> XmlParser<'a> {
             return Err(());
         }
         self.skip(1);
-        let node = self.dom.create_doctype(name, public_id, system_id);
+        let node = self.document.create_doctype(name, public_id, system_id);
         self.append(node)
     }
 
@@ -282,7 +282,7 @@ impl<'a> XmlParser<'a> {
             return Err(());
         };
         let matches = matches!(
-            self.dom.kind(top),
+            self.document.kind(top),
             Some(dom::NodeKind::Element { name: element, .. }) if qualified_equals(element, name)
         );
         if !matches {
@@ -304,7 +304,7 @@ impl<'a> XmlParser<'a> {
         let (raw_attributes, self_closing) = self.parse_attributes()?;
         let declarations = namespace_declarations(&raw_attributes);
         let (element_name, attributes) = self.resolve_element(&name, &raw_attributes)?;
-        let element = self.dom.create_element(element_name, attributes);
+        let element = self.document.create_element(element_name, attributes);
         self.append(element)?;
         if !self_closing {
             self.stack.push(element);

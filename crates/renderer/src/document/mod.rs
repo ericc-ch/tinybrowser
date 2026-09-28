@@ -323,7 +323,7 @@ impl Document {
     pub(crate) fn document_root(&self) -> Option<dom::NodeId> {
         self.world
             .borrow()
-            .with_main_document(|parsed| parsed.dom.document())
+            .with_main_document(|parsed| parsed.document.document())
     }
 
     /// The `iframe`'s `src` attribute value, when the element has a
@@ -334,7 +334,7 @@ impl Document {
         let world = self.world.borrow();
         let value = world
             .document(container)
-            .and_then(|parsed| parsed.dom.attribute(container, "src"))?;
+            .and_then(|parsed| parsed.document.attribute(container, "src"))?;
         (!value.is_empty()).then_some(value)
     }
 
@@ -407,7 +407,9 @@ impl Document {
         self.world
             .borrow()
             .main_document_mut()
-            .map_or_else(Vec::new, |mut parsed| parsed.dom.take_lifecycle())
+            .map_or_else(Vec::new, |mut parsed| {
+                dom::lifecycle::take(&mut parsed.document)
+            })
     }
 
     pub(crate) fn take_frame_navigations(&mut self) -> Vec<FrameNavigation> {
@@ -429,7 +431,7 @@ impl Document {
         self.world
             .borrow()
             .document(id)
-            .is_some_and(|parsed| parsed.dom.is_iframe_element(id))
+            .is_some_and(|parsed| dom::lifecycle::is_iframe_element(&parsed.document, id))
     }
 
     /// Queues the image fetch for a newly connected `<img>`, if it still needs one
@@ -498,7 +500,7 @@ impl Document {
         let serial = self
             .world
             .borrow()
-            .with_main_document(|parsed| parsed.dom.mutation_serial());
+            .with_main_document(|parsed| dom::mutation::serial(&parsed.document));
         match serial {
             Some(serial) if serial == self.frame_order_serial => false,
             Some(serial) => {
@@ -1045,9 +1047,7 @@ impl Document {
     /// Installs `parsed` as the active document and registers it, reporting
     /// whether a realm owns it afterwards.
     fn install_parsed(&mut self, mut parsed: Parsed) -> bool {
-        parsed
-            .dom
-            .set_document_language(self.content_language.clone());
+        dom::metadata::set_document_language(&mut parsed.document, self.content_language.clone());
         if self.js.is_none() {
             let document = self.world.borrow_mut().replace_document(parsed);
             self.register_document(document);
@@ -1158,10 +1158,12 @@ impl Document {
         let Some(parsed) = world.main_document() else {
             return self.url.clone();
         };
-        let Ok(Some(base_el)) = parsed.dom.select_first(parsed.dom.document(), "base[href]") else {
+        let Ok(Some(base_el)) =
+            dom::selector::select_first(&parsed.document, parsed.document.document(), "base[href]")
+        else {
             return self.url.clone();
         };
-        let Some(href) = parsed.dom.attribute(base_el, "href") else {
+        let Some(href) = parsed.document.attribute(base_el, "href") else {
             return self.url.clone();
         };
         self.url.join(&href).unwrap_or_else(|_| self.url.clone())
@@ -1425,13 +1427,15 @@ impl Document {
             let Some(parsed) = world.main_document() else {
                 return;
             };
-            let document = parsed.dom.document();
-            let Ok(links) = parsed.dom.select_all(document, "link[rel~=\"stylesheet\"]") else {
+            let document = parsed.document.document();
+            let Ok(links) =
+                dom::selector::select_all(&parsed.document, document, "link[rel~=\"stylesheet\"]")
+            else {
                 return;
             };
             links
                 .into_iter()
-                .filter_map(|link| parsed.dom.attribute(link, "href").map(|href| (link, href)))
+                .filter_map(|link| parsed.document.attribute(link, "href").map(|href| (link, href)))
                 .collect()
         };
         let initiator = self.url.clone();
@@ -1468,11 +1472,8 @@ impl Document {
             let Some(parsed) = world.main_document() else {
                 return;
             };
-            let document = parsed.dom.document();
-            parsed
-                .dom
-                .select_all(document, "img[src]")
-                .unwrap_or_default()
+            let document = parsed.document.document();
+            dom::selector::select_all(&parsed.document, document, "img[src]").unwrap_or_default()
         };
         for element in images {
             self.queue_image(element, false);
@@ -1503,10 +1504,8 @@ impl Document {
         let generation = self.bump_image_generation(element);
         self.in_flight_images.insert(element);
         let src = self.world.borrow().document(element).and_then(|parsed| {
-            parsed
-                .dom
-                .is_img_element(element)
-                .then(|| parsed.dom.attribute(element, "src"))
+            dom::lifecycle::is_img_element(&parsed.document, element)
+                .then(|| parsed.document.attribute(element, "src"))
                 .flatten()
         });
         let Some(src) = src.filter(|src| !src.is_empty()) else {

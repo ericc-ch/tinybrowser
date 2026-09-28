@@ -13,16 +13,20 @@
 //! # Seam map
 //!
 //! ```text
-//! browser:  html5ever TreeSink → Dom mutations; QuickJS ↔ NodeId
+//! browser:  html5ever TreeSink → Document mutations; QuickJS ↔ NodeId
 //! dom:      slots, generations, children lists; form/: the form control model
 //! ```
 
 mod arena;
-mod form;
+pub mod form;
 mod id;
-mod named;
+pub mod lifecycle;
+pub mod metadata;
+pub mod mutation;
+pub mod named;
 mod node;
-mod selector;
+pub mod selector;
+pub mod shadow;
 mod state;
 mod value;
 
@@ -32,8 +36,11 @@ pub use state::{
     is_required, lang_matches, local_is,
 };
 
-pub use arena::{Children, Dom, DomError, Lifecycle, Mutation, QuirksMode};
+pub use arena::{Children, Document, DomError, Tree};
 pub use id::NodeId;
+pub use lifecycle::Lifecycle;
+pub use metadata::QuirksMode;
+pub use mutation::Mutation;
 pub use node::{
     Attribute, LocalName, Namespace, NodeKind, Prefix, QualName, html_namespace,
     html_qualified_name_eq, qualified_name_eq, svg_namespace, xlink_namespace, xml_namespace,

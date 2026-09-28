@@ -3,8 +3,8 @@
 //! (`css/selectors/`), not here (AGENTS.md).
 
 use dom::{
-    Attribute, Dom, LocalName, Namespace, NodeId, ParseFailKind, QualName, SelectError,
-    html_namespace,
+    Attribute, Document, LocalName, Namespace, NodeId, ParseFailKind, QualName, SelectError,
+    html_namespace, selector,
 };
 
 fn qn(local: &str) -> QualName {
@@ -18,42 +18,52 @@ fn attr(name: &str, value: &str) -> Attribute {
     }
 }
 
-fn append_element(dom: &mut Dom, parent: NodeId, name: &str, attrs: Vec<Attribute>) -> NodeId {
+fn append_element(dom: &mut Document, parent: NodeId, name: &str, attrs: Vec<Attribute>) -> NodeId {
     let element = dom.create_element(qn(name), attrs);
-    dom.append(parent, element).expect("fixture append");
+    dom::mutation::append(dom, parent, element).expect("fixture append");
     element
 }
 
 #[test]
 fn selector_queries_observe_the_public_tree_boundary() {
-    let mut dom = Dom::new();
+    let mut dom = Document::new();
     let document = dom.document();
     let html = append_element(&mut dom, document, "html", Vec::new());
     let body = append_element(&mut dom, html, "body", Vec::new());
     let main = append_element(&mut dom, body, "div", vec![attr("id", "main")]);
     let text = dom.create_text("not an element");
-    dom.append(main, text).expect("fixture text");
+    dom::mutation::append(&mut dom, main, text).expect("fixture text");
 
     // A malformed selector keeps its syntax class.
     for invalid in ["", "div[", ":dir(up)", ":frobnicate"] {
         assert!(matches!(
-            dom.select_all(document, invalid),
+            selector::select_all(&dom, document, invalid),
             Err(SelectError::Syntax(_))
         ));
     }
-    let Err(SelectError::Syntax(failure)) = dom.select_all(document, "div[") else {
+    let Err(SelectError::Syntax(failure)) = selector::select_all(&dom, document, "div[") else {
         panic!("malformed selector must retain a syntax class");
     };
     assert_eq!(failure.kind(), ParseFailKind::MalformedInput);
 
     // A non-element has no `matches` semantics.
-    assert_eq!(dom.matches(text, "*"), Err(SelectError::NotAnElement));
+    assert_eq!(
+        selector::matches(&dom, text, "*"),
+        Err(SelectError::NotAnElement)
+    );
 
     // Detaching hides a subtree from document queries; destroying it makes
     // every old handle stale at once.
-    dom.detach(main).expect("detach");
-    assert!(dom.select_all(document, "#main").expect("query").is_empty());
-    dom.destroy(main).expect("destroy");
-    assert_eq!(dom.select_all(main, "*"), Err(SelectError::StaleNode));
-    assert!(dom.select_all(document, "*").is_ok());
+    dom::mutation::detach(&mut dom, main).expect("detach");
+    assert!(
+        selector::select_all(&dom, document, "#main")
+            .expect("query")
+            .is_empty()
+    );
+    dom::mutation::destroy(&mut dom, main).expect("destroy");
+    assert_eq!(
+        selector::select_all(&dom, main, "*"),
+        Err(SelectError::StaleNode)
+    );
+    assert!(selector::select_all(&dom, document, "*").is_ok());
 }

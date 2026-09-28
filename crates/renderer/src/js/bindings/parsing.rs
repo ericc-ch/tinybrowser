@@ -91,7 +91,7 @@ impl JsImplementation {
             )?)
         };
         let mut parsed = crate::Parsed::empty(content_type);
-        let document = parsed.dom.document();
+        let document = parsed.document.document();
         if !doctype.is_null()
             && !doctype.is_undefined()
             && doctype_fields_for(&ctx, host_node_id(&ctx, &doctype).unwrap_or(document)).is_none()
@@ -112,22 +112,18 @@ impl JsImplementation {
                 let Some(source) = owner.document(doctype) else {
                     return Err(Exception::throw_type(&ctx, "no document"));
                 };
-                import_snapshot(&source.dom, doctype, true)
+                import_snapshot(&source.document, doctype, true)
             };
             if let Some(snapshot) = snapshot {
-                let node = materialize_import(&mut parsed.dom, &snapshot)
+                let node = materialize_import(&mut parsed.document, &snapshot)
                     .map_err(|err| throw_dom_error(&ctx, err))?;
-                parsed
-                    .dom
-                    .append(document, node)
+                dom::mutation::append(&mut parsed.document, document, node)
                     .map_err(|err| throw_dom_error(&ctx, err))?;
             }
         }
         if let Some(name) = root {
-            let element = parsed.dom.create_element(name, Vec::new());
-            parsed
-                .dom
-                .append(document, element)
+            let element = parsed.document.create_element(name, Vec::new());
+            dom::mutation::append(&mut parsed.document, document, element)
                 .map_err(|err| throw_dom_error(&ctx, err))?;
         }
         wrap_new_document(&ctx, parsed)
@@ -141,46 +137,34 @@ impl JsImplementation {
         title: Opt<OptionalTitle>,
     ) -> Result<Value<'js>> {
         let mut parsed = crate::Parsed::empty("text/html");
-        let document = parsed.dom.document();
-        let doctype = parsed.dom.create_doctype("html", "", "");
-        parsed
-            .dom
-            .append(document, doctype)
+        let document = parsed.document.document();
+        let doctype = parsed.document.create_doctype("html", "", "");
+        dom::mutation::append(&mut parsed.document, document, doctype)
             .map_err(|err| throw_dom_error(&ctx, err))?;
         let html = parsed
-            .dom
+            .document
             .create_element(html_element_name("html"), Vec::new());
-        parsed
-            .dom
-            .append(document, html)
+        dom::mutation::append(&mut parsed.document, document, html)
             .map_err(|err| throw_dom_error(&ctx, err))?;
         let head = parsed
-            .dom
+            .document
             .create_element(html_element_name("head"), Vec::new());
-        parsed
-            .dom
-            .append(html, head)
+        dom::mutation::append(&mut parsed.document, html, head)
             .map_err(|err| throw_dom_error(&ctx, err))?;
         if let Some(title) = title.0.and_then(|title| title.0) {
             let title_element = parsed
-                .dom
+                .document
                 .create_element(html_element_name("title"), Vec::new());
-            parsed
-                .dom
-                .append(head, title_element)
+            dom::mutation::append(&mut parsed.document, head, title_element)
                 .map_err(|err| throw_dom_error(&ctx, err))?;
-            let text = parsed.dom.create_text(title);
-            parsed
-                .dom
-                .append(title_element, text)
+            let text = parsed.document.create_text(title);
+            dom::mutation::append(&mut parsed.document, title_element, text)
                 .map_err(|err| throw_dom_error(&ctx, err))?;
         }
         let body = parsed
-            .dom
+            .document
             .create_element(html_element_name("body"), Vec::new());
-        parsed
-            .dom
-            .append(html, body)
+        dom::mutation::append(&mut parsed.document, html, body)
             .map_err(|err| throw_dom_error(&ctx, err))?;
         wrap_new_document(&ctx, parsed)
     }
@@ -191,7 +175,7 @@ pub(super) fn doctype_fields(
     parsed: &crate::Parsed,
     id: NodeId,
 ) -> Option<(String, String, String)> {
-    match parsed.dom.kind(id) {
+    match parsed.document.kind(id) {
         Some(NodeKind::Doctype {
             name,
             public_id,
@@ -336,7 +320,7 @@ impl JsXmlSerializer {
         let Some(parsed) = world.document(id) else {
             return Err(Exception::throw_type(&ctx, "no document"));
         };
-        crate::serialize::serialize_xml(&parsed.dom, id, false)
+        crate::serialize::serialize_xml(&parsed.document, id, false)
             .map_err(|err| throw_dom(&ctx, "InvalidStateError", &err.to_string()))
     }
 }

@@ -33,7 +33,7 @@ pub(crate) fn adopt_across_documents(
         let Some(parsed) = owner.document(node) else {
             return Err(Exception::throw_type(ctx, "no document"));
         };
-        import_snapshot(&parsed.dom, node, true)
+        import_snapshot(&parsed.document, node, true)
             .ok_or_else(|| throw_dom(ctx, "HierarchyRequestError", "node cannot be adopted"))?
     };
     {
@@ -45,20 +45,18 @@ pub(crate) fn adopt_across_documents(
         let Some(mut parsed) = owner.document_mut(node) else {
             return Err(Exception::throw_type(ctx, "no document"));
         };
-        parsed
-            .dom
-            .detach(node)
+        dom::mutation::detach(&mut parsed.document, node)
             .map_err(|err| throw_dom_error(ctx, err))?;
     }
     let world = world_rc.borrow_mut();
     let Some(mut parsed) = world.document_mut(parent) else {
         return Err(Exception::throw_type(ctx, "no document"));
     };
-    materialize_import(&mut parsed.dom, &snapshot).map_err(|err| throw_dom_error(ctx, err))
+    materialize_import(&mut parsed.document, &snapshot).map_err(|err| throw_dom_error(ctx, err))
 }
 
 /// [Clones](https://dom.spec.whatwg.org/#concept-node-clone) a document into a
-/// new tree in this world. `Dom::clone_node` refuses the document node because
+/// new tree in this world. `Document::clone_node` refuses the document node because
 /// a document clone is a different document, not a node in the same arena.
 pub(crate) fn clone_document<'js>(ctx: &Ctx<'js>, id: NodeId, deep: bool) -> Result<Value<'js>> {
     let world_rc = world(ctx)?;
@@ -69,10 +67,10 @@ pub(crate) fn clone_document<'js>(ctx: &Ctx<'js>, id: NodeId, deep: bool) -> Res
         };
         let children = if deep {
             parsed
-                .dom
+                .document
                 .children(id)
                 .map(|kids| {
-                    kids.filter_map(|kid| import_snapshot(&parsed.dom, kid, true))
+                    kids.filter_map(|kid| import_snapshot(&parsed.document, kid, true))
                         .collect()
                 })
                 .unwrap_or_default()
@@ -83,13 +81,11 @@ pub(crate) fn clone_document<'js>(ctx: &Ctx<'js>, id: NodeId, deep: bool) -> Res
     };
     let mut parsed = crate::Parsed::empty(content_type);
     parsed.quirks_mode = quirks_mode;
-    let document = parsed.dom.document();
+    let document = parsed.document.document();
     for child in children {
         let child =
-            materialize_import(&mut parsed.dom, &child).map_err(|err| throw_dom_error(ctx, err))?;
-        parsed
-            .dom
-            .append(document, child)
+            materialize_import(&mut parsed.document, &child).map_err(|err| throw_dom_error(ctx, err))?;
+        dom::mutation::append(&mut parsed.document, document, child)
             .map_err(|err| throw_dom_error(ctx, err))?;
     }
     wrap_new_document(ctx, parsed)
@@ -118,7 +114,7 @@ pub(crate) enum ImportSnapshot {
     Fragment(Vec<ImportSnapshot>),
 }
 
-pub(crate) fn import_snapshot(dom: &dom::Dom, id: NodeId, deep: bool) -> Option<ImportSnapshot> {
+pub(crate) fn import_snapshot(dom: &dom::Document, id: NodeId, deep: bool) -> Option<ImportSnapshot> {
     let children = |deep: bool| -> Vec<ImportSnapshot> {
         if !deep {
             return Vec::new();
@@ -135,7 +131,7 @@ pub(crate) fn import_snapshot(dom: &dom::Dom, id: NodeId, deep: bool) -> Option<
             name: name.clone(),
             attributes: attributes.clone(),
             children: children(deep),
-            template_contents: dom.template_contents(id).map(|contents| {
+            template_contents: dom::shadow::template_contents(dom, id).map(|contents| {
                 if deep {
                     dom.children(contents)
                         .map(|kids| {
@@ -172,7 +168,7 @@ pub(crate) fn import_snapshot(dom: &dom::Dom, id: NodeId, deep: bool) -> Option<
 }
 
 pub(crate) fn materialize_import(
-    dom: &mut dom::Dom,
+    dom: &mut dom::Document,
     snapshot: &ImportSnapshot,
 ) -> std::result::Result<NodeId, dom::DomError> {
     match snapshot {
@@ -185,11 +181,11 @@ pub(crate) fn materialize_import(
             let id = dom.create_element(name.clone(), attributes.clone());
             for child in children {
                 let child = materialize_import(dom, child)?;
-                dom.append(id, child)?;
+                dom::mutation::append(dom, id, child)?;
             }
             if let Some(contents) = template_contents {
                 let fragment = materialize_children(dom, contents)?;
-                dom.set_template_contents(id, fragment)?;
+                dom::shadow::set_template_contents(&mut *dom, id, fragment)?;
             }
             Ok(id)
         }
@@ -210,13 +206,13 @@ pub(crate) fn materialize_import(
 
 /// Materializes `snapshots` into a fresh fragment in tree order.
 pub(crate) fn materialize_children(
-    dom: &mut dom::Dom,
+    dom: &mut dom::Document,
     snapshots: &[ImportSnapshot],
 ) -> std::result::Result<NodeId, dom::DomError> {
     let fragment = dom.create_fragment();
     for snapshot in snapshots {
         let child = materialize_import(dom, snapshot)?;
-        dom.append(fragment, child)?;
+        dom::mutation::append(dom, fragment, child)?;
     }
     Ok(fragment)
 }

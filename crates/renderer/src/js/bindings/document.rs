@@ -51,21 +51,19 @@ pub(crate) fn document_base_url_string(ctx: &Ctx<'_>, id: NodeId) -> String {
     let Some(parsed) = world.document(id) else {
         return fallback;
     };
-    let Some(base) = parsed
-        .dom
-        .select_all(parsed.dom.document(), "base")
+    let Some(base) = dom::selector::select_all(&parsed.document, parsed.document.document(), "base")
         .ok()
         // Frozen base URL: the first `base` element *with* an `href`
         // (<https://html.spec.whatwg.org/multipage/urls-and-fetching.html#document-base-url>).
         .and_then(|candidates| {
             candidates
                 .into_iter()
-                .find(|candidate| parsed.dom.attribute(*candidate, "href").is_some())
+                .find(|candidate| parsed.document.attribute(*candidate, "href").is_some())
         })
     else {
         return fallback;
     };
-    let Some(href) = parsed.dom.attribute(base, "href") else {
+    let Some(href) = parsed.document.attribute(base, "href") else {
         return fallback;
     };
     url::Url::parse(&fallback)
@@ -94,7 +92,7 @@ pub(crate) fn element_is_html(ctx: &Ctx<'_>, id: NodeId) -> bool {
     let parsed = world.borrow();
     parsed.with_document(id, |parsed| {
         matches!(
-            parsed.dom.kind(id),
+            parsed.document.kind(id),
             Some(NodeKind::Element { name, .. }) if name.ns == html_namespace()
         )
     }) == Some(true)

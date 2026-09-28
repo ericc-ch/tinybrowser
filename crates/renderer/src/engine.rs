@@ -29,9 +29,9 @@ pub(crate) const VIEWPORT_HEIGHT: f32 = 600.0;
 /// Every stylesheet that applies to the document, in document order:
 /// `<style>` text and loaded `<link rel=stylesheet>` sheets, spliced at
 /// their element positions.
-fn collect_stylesheets(dom: &dom::Dom, document: &Document) -> Vec<String> {
+fn collect_stylesheets(dom: &dom::Document, document: &Document) -> Vec<String> {
     let mut sheets = Vec::new();
-    for node in dom.descendants(dom.document()) {
+    for node in dom.tree().descendants(dom.document()) {
         let Some(dom::NodeKind::Element { name, .. }) = dom.kind(node) else {
             continue;
         };
@@ -306,7 +306,7 @@ impl Engine {
         let world = document.world();
         let world = world.borrow();
         let sheets = world
-            .with_main_document(|parsed| collect_stylesheets(&parsed.dom, document))
+            .with_main_document(|parsed| collect_stylesheets(&parsed.document, document))
             .ok_or_else(|| TabError::RendererUnavailable {
                 message: "no document to render".into(),
             })?;
@@ -317,7 +317,7 @@ impl Engine {
         };
         let image = world
             .with_main_document(|parsed| {
-                crate::render::render(&parsed.dom, &sheets, &options, &world.images)
+                crate::render::render(&parsed.document, &sheets, &options, &world.images)
             })
             .ok_or_else(|| TabError::RendererUnavailable {
                 message: "no document to render".into(),

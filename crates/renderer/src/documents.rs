@@ -18,7 +18,7 @@ pub(crate) struct DocumentStore {
 impl DocumentStore {
     /// Stores `parsed` and returns its document id.
     pub(crate) fn insert(&mut self, parsed: Parsed) -> u32 {
-        let id = parsed.dom.document_id();
+        let id = parsed.document.document_id();
         self.documents.insert(id, parsed);
         id
     }

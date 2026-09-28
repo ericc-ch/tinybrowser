@@ -111,21 +111,19 @@ fn decode_webp(bytes: &[u8]) -> Option<RasterImage> {
 fn decode_svg(bytes: &[u8]) -> Option<RasterImage> {
     let text = std::str::from_utf8(bytes).ok()?;
     let parsed = crate::xml::parse_document(text, "image/svg+xml");
-    if parsed
-        .dom
-        .descendants(parsed.dom.document())
-        .any(|node| is_parser_error(&parsed.dom, node))
+    if parsed.document.tree().descendants(parsed.document.document())
+        .any(|node| is_parser_error(&parsed.document, node))
     {
         return None;
     }
     let root = parsed
-        .dom
-        .children(parsed.dom.document())?
-        .find(|node| svg::is_outer_svg(&parsed.dom, *node))?;
-    svg::rasterize(&parsed.dom, root)
+        .document
+        .children(parsed.document.document())?
+        .find(|node| svg::is_outer_svg(&parsed.document, *node))?;
+    svg::rasterize(&parsed.document, root)
 }
 
-fn is_parser_error(dom: &dom::Dom, node: dom::NodeId) -> bool {
+fn is_parser_error(dom: &dom::Document, node: dom::NodeId) -> bool {
     matches!(
         dom.kind(node),
         Some(dom::NodeKind::Element { name, .. })

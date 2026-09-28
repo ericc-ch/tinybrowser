@@ -19,7 +19,7 @@
 use std::fmt;
 
 use dom::{
-    Attribute, Dom, LocalName, Namespace, NodeId, NodeKind, QualName, html_namespace,
+    Attribute, Document, LocalName, Namespace, NodeId, NodeKind, QualName, html_namespace,
     svg_namespace, xlink_namespace, xml_namespace, xmlns_namespace,
 };
 
@@ -34,8 +34,8 @@ const MATHML_NS: &str = "http://www.w3.org/1998/Math/MathML";
 /// the HTML fragment serialization algorithm.
 ///
 /// <https://html.spec.whatwg.org/multipage/parsing.html#serialising-html-fragments>
-pub(crate) fn serialize_html_fragment(dom: &Dom, element: NodeId) -> String {
-    let root = dom.template_contents(element).unwrap_or(element);
+pub(crate) fn serialize_html_fragment(dom: &Document, element: NodeId) -> String {
+    let root = dom::shadow::template_contents(dom, element).unwrap_or(element);
     let parent = match dom.kind(element) {
         Some(NodeKind::Element { name, .. }) => Some((name.ns.clone(), name.local.clone())),
         _ => None,
@@ -54,7 +54,7 @@ pub(crate) fn serialize_html_fragment(dom: &Dom, element: NodeId) -> String {
 
 /// Serializes one element with the HTML fragment serialization algorithm.
 pub(crate) fn serialize_html_element(
-    dom: &Dom,
+    dom: &Document,
     id: NodeId,
     name: &QualName,
     attributes: &[Attribute],
@@ -75,7 +75,7 @@ pub(crate) fn serialize_html_element(
         return;
     }
 
-    let child_root = dom.template_contents(id).unwrap_or(id);
+    let child_root = dom::shadow::template_contents(dom, id).unwrap_or(id);
     for child in children(dom, child_root) {
         serialize_html_node(dom, child, Some((&name.ns, &name.local)), output);
     }
@@ -85,7 +85,7 @@ pub(crate) fn serialize_html_element(
 }
 
 fn serialize_html_node(
-    dom: &Dom,
+    dom: &Document,
     id: NodeId,
     parent: Option<(&Namespace, &LocalName)>,
     output: &mut String,
@@ -260,7 +260,7 @@ impl std::error::Error for XmlSerializeError {}
 ///
 /// <https://w3c.github.io/DOM-Parsing/#xml-serialization>
 pub(crate) fn serialize_xml(
-    dom: &Dom,
+    dom: &Document,
     node: NodeId,
     require_well_formed: bool,
 ) -> Result<String, XmlSerializeError> {
@@ -272,7 +272,7 @@ pub(crate) fn serialize_xml(
 /// XML-serializes the children of `parent` with no namespace in scope,
 /// the entry point `innerHTML` uses on XML documents.
 pub(crate) fn serialize_xml_children(
-    dom: &Dom,
+    dom: &Document,
     parent: NodeId,
     require_well_formed: bool,
 ) -> Result<String, XmlSerializeError> {
@@ -288,7 +288,7 @@ pub(crate) fn serialize_xml_children(
 /// initial prefix map of every entry point
 /// (<https://w3c.github.io/DOM-Parsing/#dfn-xml-serialization-algorithm>).
 fn serialize_in_context(
-    dom: &Dom,
+    dom: &Document,
     require_well_formed: bool,
     write: impl FnOnce(&mut XmlSerializer<'_>, &PrefixMap, &mut String) -> Result<(), XmlSerializeError>,
 ) -> Result<String, XmlSerializeError> {
@@ -316,15 +316,15 @@ enum DefaultDeclarationHandling {
 }
 
 struct XmlSerializer<'a> {
-    dom: &'a Dom,
+    document: &'a Document,
     require_well_formed: bool,
     prefix_index: u32,
 }
 
 impl<'a> XmlSerializer<'a> {
-    fn new(dom: &'a Dom, require_well_formed: bool) -> Self {
+    fn new(dom: &'a Document, require_well_formed: bool) -> Self {
         Self {
-            dom,
+            document: dom,
             require_well_formed,
             prefix_index: 1,
         }
@@ -339,21 +339,21 @@ impl<'a> XmlSerializer<'a> {
         map: &PrefixMap,
         output: &mut String,
     ) -> Result<(), XmlSerializeError> {
-        let Some(kind) = self.dom.kind(id).cloned() else {
+        let Some(kind) = self.document.kind(id).cloned() else {
             return Err(XmlSerializeError);
         };
         match kind {
             NodeKind::Document => {
-                if self.require_well_formed && !has_document_element(self.dom, id) {
+                if self.require_well_formed && !has_document_element(self.document, id) {
                     return Err(XmlSerializeError);
                 }
-                for child in children(self.dom, id) {
+                for child in children(self.document, id) {
                     self.node(child, context, map, output)?;
                 }
                 Ok(())
             }
             NodeKind::Fragment => {
-                for child in children(self.dom, id) {
+                for child in children(self.document, id) {
                     self.node(child, context, map, output)?;
                 }
                 Ok(())
@@ -667,7 +667,7 @@ impl<'a> XmlSerializer<'a> {
             namespace: ns,
             context: child_context,
         } = *serialized;
-        let element_children = children(self.dom, id);
+        let element_children = children(self.document, id);
         let in_html = ns == Some(html_namespace().as_ref());
         let has_children = !element_children.is_empty();
         if in_html && !has_children && serializes_as_void(name) {
@@ -680,13 +680,13 @@ impl<'a> XmlSerializer<'a> {
         }
         output.push('>');
         let contents = if in_html && name.local.as_ref() == "template" {
-            self.dom.template_contents(id)
+            dom::shadow::template_contents(self.document, id)
         } else {
             None
         };
         match contents {
             Some(contents) => {
-                for child in children(self.dom, contents) {
+                for child in children(self.document, contents) {
                     self.node(child, child_context, map, output)?;
                 }
             }
@@ -819,13 +819,13 @@ fn push_xml_identifier(output: &mut String, identifier: &str) {
     output.push(quote);
 }
 
-fn has_document_element(dom: &Dom, document: NodeId) -> bool {
+fn has_document_element(dom: &Document, document: NodeId) -> bool {
     children(dom, document)
         .into_iter()
         .any(|child| matches!(dom.kind(child), Some(NodeKind::Element { .. })))
 }
 
-fn children(dom: &Dom, parent: NodeId) -> Vec<NodeId> {
+fn children(dom: &Document, parent: NodeId) -> Vec<NodeId> {
     dom.children(parent)
         .map(Iterator::collect)
         .unwrap_or_default()
