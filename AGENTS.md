@@ -19,6 +19,13 @@ Do not test spec conformance in cargo tests. Never add, keep, or "fix" a cargo t
 - Unless already inside the dev shell, run direct Cargo commands and runners that build the browser through `nix develop --command`; the host shell may not expose `pkg-config` or OpenSSL. `tools/check` already enters the Nix shell for clippy.
 - When adding or changing `unsafe`: `tools/check miri` (pure-Rust) and `tools/check valgrind` (FFI / renderer / net).
 
+## Dependencies
+
+- Engine forks, one maintained branch each (`master` is the line). Fixes stay
+  downstream; do not submit an upstream PR.
+  - QuickJS-NG fork `github.com/ericc-ch/quickjs`. Pinned as the `sys/quickjs` submodule in the rquickjs fork.
+  - rquickjs fork `github.com/ericc-ch/rquickjs`. Pinned in tinybrowser via `[patch.crates-io]` plus `Cargo.lock`.
+
 ## Working rules
 
 Never maintain handwritten `unsafe`: no `unsafe {}`, `unsafe fn`, `unsafe trait`, `unsafe impl`, or `#[allow(unsafe_code)]` in tinybrowser-owned code, unless:
