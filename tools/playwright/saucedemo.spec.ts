@@ -2,8 +2,6 @@ import { chromium } from "@playwright/test";
 
 import { expect, test } from "./fixtures";
 
-test.skip(process.env.TINYBROWSER_LIVE_SAUCE !== "1", "opt-in hosted-site dogfood");
-
 test("hosted Sauce Demo checkout", async ({ daemon }) => {
   const browser = await chromium.connectOverCDP(daemon.origin);
   try {
