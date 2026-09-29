@@ -1,7 +1,7 @@
 //! Live node collections (`NodeList`, `HTMLCollection`).
 
 use super::{
-    INSTALL_COLLECTIONS_JS, WebIdlUnsignedLong, collection_ids, host_node_id, live_collection,
+    WebIdlUnsignedLong, collection_ids, host_node_id, install_collections_js, live_collection,
     world, wrap_node,
 };
 
@@ -469,7 +469,7 @@ pub(crate) fn install_collection_brand(ctx: &Ctx<'_>) -> Result<()> {
         .set("__tbCollectionNamed", Func::from(collection_named))?;
     ctx.globals()
         .set("__tbCollectionLength", Func::from(collection_length))?;
-    ctx.eval::<(), _>(INSTALL_COLLECTIONS_JS)?;
+    ctx.eval::<(), _>(install_collections_js(ctx)?)?;
     // Capture the options indexed-write entry point, then remove it from the
     // page-visible global so `__tbSetOption` is not fingerprintable.
     let setter: Function = ctx.globals().get("__tbSetOption")?;

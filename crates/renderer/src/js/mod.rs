@@ -5,6 +5,7 @@
 //! uses `Function::call` on the renderer thread.
 
 mod bindings;
+mod blob;
 mod events;
 mod intl;
 mod modules;
@@ -39,29 +40,17 @@ const DEFAULT_SCRIPT_BUDGET: Duration = Duration::from_secs(5);
 /// `const`/`function` bindings stay visible to every shim file but invisible
 /// to page script, which shares the global lexical scope. Only explicit
 /// `globalThis` assignments publish names outward.
-const INSTALL_WEB_APIS_JS: &str = concat!(
-    "(function(){",
-    include_str!("scripts/web/timers.js"),
-    include_str!("scripts/web/fetch.js"),
-    include_str!("scripts/web/encoding.js"),
-    include_str!("scripts/web/crypto.js"),
-    include_str!("scripts/web/streams.js"),
-    include_str!("scripts/web/file.js"),
-    include_str!("scripts/web/url.js"),
-    include_str!("scripts/web/dom.js"),
-    include_str!("scripts/web/cssom.js"),
-    include_str!("scripts/web/navigator.js"),
-    include_str!("scripts/web/tree_walker.js"),
-    include_str!("scripts/web/custom_elements.js"),
-    include_str!("scripts/web/observers.js"),
-    include_str!("scripts/web/messaging.js"),
-    include_str!("scripts/web/ui_events.js"),
-    include_str!("scripts/web/errors.js"),
-    include_str!("scripts/web/forms.js"),
-    include_str!("scripts/web/form_data.js"),
-    include_str!("scripts/web/input.js"),
-    "})();",
-);
+///
+/// The bundle is assembled and deflated by `build.rs` from the file order in
+/// `scripts/web/order.txt`; it inflates once per process.
+const INSTALL_WEB_APIS_DEFLATE: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/js_blobs/web_bundle.deflate"));
+
+/// The web shim bundle, inflated once per process.
+fn install_web_apis_js(ctx: &Ctx<'_>) -> rquickjs::Result<&'static str> {
+    static CACHE: std::sync::OnceLock<Box<str>> = std::sync::OnceLock::new();
+    blob::decompress(ctx, INSTALL_WEB_APIS_DEFLATE, &CACHE)
+}
 
 /// A value produced by script evaluation.
 #[derive(Clone, Debug, PartialEq)]
@@ -668,7 +657,7 @@ impl JsRealm {
             install_window_host_functions(&ctx, &world)?;
             url_parts::install(&ctx)?;
             bindings::install_messaging(&ctx)?;
-            ctx.eval::<(), _>(INSTALL_WEB_APIS_JS)?;
+            ctx.eval::<(), _>(install_web_apis_js(&ctx)?)?;
             // The shims captured the host token; page script must never see
             // it. Host plumbing is then frozen: function-valued `__tb*`
             // bindings become non-writable and non-configurable, so a page

@@ -272,8 +272,15 @@ impl JsDomParser {
 /// Wraps the native `DOMParser` so every instance remembers the URL of the
 /// realm that constructed it; the parsed document takes that URL
 /// (<https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-domparser-parsefromstring>).
-pub(crate) const INSTALL_DOMPARSER_CTOR_JS: &str =
-    include_str!("../scripts/parsing/dom_parser_ctor.js");
+/// Deflated by `build.rs`, inflated once per process.
+pub(crate) const INSTALL_DOMPARSER_CTOR_DEFLATE: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/js_blobs/dom_parser_ctor.deflate"));
+
+/// The `DOMParser` constructor shim, inflated once per process.
+pub(crate) fn install_domparser_ctor_js(ctx: &Ctx<'_>) -> Result<&'static str> {
+    static CACHE: std::sync::OnceLock<Box<str>> = std::sync::OnceLock::new();
+    crate::js::blob::decompress(ctx, INSTALL_DOMPARSER_CTOR_DEFLATE, &CACHE)
+}
 
 /// The `DOMParser` `parseFromString` `SupportedType` values
 /// (<https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-domparser-parsefromstring>).

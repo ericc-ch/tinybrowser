@@ -383,7 +383,7 @@ pub(crate) fn install(ctx: &Ctx<'_>, world: &Rc<RefCell<World>>) -> Result<()> {
         .borrow_mut()
         .set_window(Persistent::save(ctx, globals.clone()));
     Class::<JsEvent>::define(&globals)?;
-    ctx.eval::<(), _>(events::INSTALL_EVENT_CTOR_JS)?;
+    ctx.eval::<(), _>(events::install_event_ctor_js(ctx)?)?;
     install_webdriver_bridge(ctx, &globals)?;
     globals.set("innerWidth", f64::from(crate::engine::VIEWPORT_WIDTH))?;
     globals.set("innerHeight", f64::from(crate::engine::VIEWPORT_HEIGHT))?;
@@ -399,23 +399,23 @@ pub(crate) fn install(ctx: &Ctx<'_>, world: &Rc<RefCell<World>>) -> Result<()> {
         "__tb_init_custom_event",
         rquickjs::prelude::Func::from(events::init_custom_event),
     )?;
-    ctx.eval::<(), _>(events::INSTALL_CUSTOM_EVENT_JS)?;
+    ctx.eval::<(), _>(events::install_custom_event_js(ctx)?)?;
     Class::<JsEventTarget>::define(&globals)?;
-    ctx.eval::<(), _>(events::INSTALL_EVENT_TARGET_CTOR_JS)?;
+    ctx.eval::<(), _>(events::install_event_target_ctor_js(ctx)?)?;
     Class::<JsNode>::define(&globals)?;
     Class::<JsNodeList>::define(&globals)?;
     Class::<JsHtmlCollection>::define(&globals)?;
     Class::<JsOptionsCollection>::define(&globals)?;
     Class::<JsDomException>::define(&globals)?;
     inherit_error_prototype(&globals)?;
-    ctx.eval::<(), _>(events::INSTALL_ABORT_JS)?;
+    ctx.eval::<(), _>(events::install_abort_js(ctx)?)?;
     Class::<JsImplementation>::define(&globals)?;
     Class::<JsTokenList>::define(&globals)?;
     Class::<JsAttr>::define(&globals)?;
     Class::<JsNamedNodeMap>::define(&globals)?;
     forms::install(ctx, &globals)?;
     Class::<JsDomParser>::define(&globals)?;
-    ctx.eval::<(), _>(parsing::INSTALL_DOMPARSER_CTOR_JS)?;
+    ctx.eval::<(), _>(parsing::install_domparser_ctor_js(ctx)?)?;
     Class::<JsXmlSerializer>::define(&globals)?;
     Class::<JsMutationObserver>::define(&globals)?;
     Class::<JsMutationRecord>::define(&globals)?;
@@ -931,11 +931,18 @@ pub(super) fn deref_weak<'js>(
 }
 
 /// Prototype-brand installation script for the browser-realm platform
-/// objects; one `define` per `WebIDL` interface.
-const INSTALL_BRANDS_JS: &str = include_str!("../scripts/brands.js");
+/// objects; one `define` per `WebIDL` interface. Deflated by `build.rs`,
+/// inflated once per process.
+const INSTALL_BRANDS_DEFLATE: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/js_blobs/brands.deflate"));
+
+fn install_brands_js(ctx: &Ctx<'_>) -> Result<&'static str> {
+    static CACHE: std::sync::OnceLock<Box<str>> = std::sync::OnceLock::new();
+    super::blob::decompress(ctx, INSTALL_BRANDS_DEFLATE, &CACHE)
+}
 
 fn install_brands(ctx: &Ctx<'_>) -> Result<()> {
-    ctx.eval::<(), _>(INSTALL_BRANDS_JS)?;
+    ctx.eval::<(), _>(install_brands_js(ctx)?)?;
     let table: Object = ctx.globals().get("__tb_brandTable")?;
     let entries = table
         .props::<String, Object>()
@@ -950,7 +957,15 @@ fn install_brands(ctx: &Ctx<'_>) -> Result<()> {
 }
 
 /// Collection prototypes and legacy named-property behavior for the browser realm.
-pub(super) const INSTALL_COLLECTIONS_JS: &str = include_str!("../scripts/collections.js");
+/// Deflated by `build.rs`, inflated once per process.
+pub(super) const INSTALL_COLLECTIONS_DEFLATE: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/js_blobs/collections.deflate"));
+
+/// The collections shim, inflated once per process.
+pub(super) fn install_collections_js(ctx: &Ctx<'_>) -> Result<&'static str> {
+    static CACHE: std::sync::OnceLock<Box<str>> = std::sync::OnceLock::new();
+    super::blob::decompress(ctx, INSTALL_COLLECTIONS_DEFLATE, &CACHE)
+}
 
 /// `DOMException` is an exception interface: its interface prototype object's
 /// `[[Prototype]]` is `%Error.prototype%`, so `String(exception)` is
