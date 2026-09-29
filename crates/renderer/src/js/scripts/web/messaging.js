@@ -1217,6 +1217,7 @@ Object.defineProperty(globalThis, 'top', {
     'TokenList', 'Implementation', 'DOMParser', 'XMLSerializer', 'MutationObserver',
     'MutationRecord', 'MessageEvent', 'MessagePort', 'MessageChannel', 'Headers',
     'Request', 'Response', 'Blob', 'File', 'FileList', 'FileReader', 'ProgressEvent',
+    'XMLHttpRequest', 'XMLHttpRequestUpload',
     'ReadableStream', 'TextDecoder', 'TextEncoder', 'URL', 'URLSearchParams',
     'AbortController', 'AbortSignal', 'CustomEvent', 'Document',
     'Storage', 'StorageEvent', 'QuotaExceededError',

@@ -40,7 +40,7 @@ pub use embedded::EmbeddedRenderer;
 pub use engine::Engine;
 pub use protocol::{
     BrowserServices, BrowsingContextHost, DialCompletion, DialFailure, DialKind, DialOutcome,
-    DialRequest, FrameId, MAX_RESPONSE_BODY_BYTES, MessagingHost, Mount, NetworkHost,
+    DialRequest, FrameId, HistorySnapshot, MAX_RESPONSE_BODY_BYTES, MessagingHost, Mount, NetworkHost,
     RendererEvent, ResourceLimit, STORAGE_QUOTA_BYTES, ScreenshotClip, ScreenshotRequest,
     ScriptFailure, StorageChange, StorageError, StorageHost, StorageKind, TabError,
 };

@@ -23,6 +23,7 @@ use rquickjs::{
     Array, Coerced, Context, Ctx, Exception, FromJs, Function, Module, Object, Runtime, TypedArray,
     Value, context::EvalOptions, prelude::Func,
 };
+use url::Url;
 
 pub(crate) use world::World;
 
@@ -47,6 +48,7 @@ const INSTALL_WEB_APIS_JS: &str = concat!(
     include_str!("scripts/web/crypto.js"),
     include_str!("scripts/web/streams.js"),
     include_str!("scripts/web/file.js"),
+    include_str!("scripts/web/xhr.js"),
     include_str!("scripts/web/url.js"),
     include_str!("scripts/web/dom.js"),
     include_str!("scripts/web/cssom.js"),
@@ -55,6 +57,7 @@ const INSTALL_WEB_APIS_JS: &str = concat!(
     include_str!("scripts/web/custom_elements.js"),
     include_str!("scripts/web/observers.js"),
     include_str!("scripts/web/messaging.js"),
+    include_str!("scripts/web/history.js"),
     include_str!("scripts/web/ui_events.js"),
     include_str!("scripts/web/errors.js"),
     include_str!("scripts/web/forms.js"),
@@ -139,6 +142,10 @@ pub(crate) struct PendingTimeout {
 pub(crate) struct PendingJsFetch {
     pub url: String,
     pub js_id: i32,
+    pub method: String,
+    pub body: Vec<u8>,
+    pub content_type: Option<String>,
+    pub headers: Vec<(String, String)>,
 }
 
 /// One renderer process's `QuickJS` heap, created on first use and shared by
@@ -349,16 +356,29 @@ impl JsRealm {
     pub(crate) fn finish_js_fetch(
         &self,
         js_id: i32,
-        ok: bool,
-        status: i32,
-        body: &str,
+        outcome: Option<crate::protocol::DialOutcome>,
     ) -> Result<(), JsError> {
         self.with_budget(None, || {
-            let body = body.to_owned();
             self.context.with(|ctx| {
                 let cbs: Object = ctx.globals().get("__tb_fetchCbs")?;
                 let func: Function = cbs.get(js_id)?;
-                if let Err(error) = func.call::<_, ()>((ok, status, body)) {
+                let (status, body, url, content_type, headers) = match outcome {
+                    Some(outcome) => (
+                        i32::from(outcome.status),
+                        outcome.body,
+                        outcome.final_url,
+                        outcome.content_type.unwrap_or_default(),
+                        outcome
+                            .headers
+                            .into_iter()
+                            .map(|(name, value)| vec![name, value])
+                            .collect::<Vec<_>>(),
+                    ),
+                    None => (0, Vec::new(), String::new(), String::new(), Vec::new()),
+                };
+                let bytes = TypedArray::new(ctx.clone(), body)?;
+                if let Err(error) = func.call::<_, ()>((status, bytes, url, content_type, headers))
+                {
                     report_callback_error(&ctx, &error);
                 }
                 Ok(())
@@ -370,6 +390,22 @@ impl JsRealm {
         self.with_budget(None, || {
             self.context.with(|ctx| {
                 bindings::fire_window_load(&ctx)?;
+                Ok(())
+            })
+        })
+    }
+
+    pub(crate) fn traverse_history(
+        &self,
+        url: &str,
+        state: Option<&str>,
+        length: usize,
+    ) -> Result<(), JsError> {
+        self.with_budget(None, || {
+            self.context.with(|ctx| {
+                let restore: Function = ctx.globals().get("__tbHistoryRestore")?;
+                let state: Value = restore.call((url, state, length))?;
+                events::fire_trusted_popstate(&ctx, state)?;
                 Ok(())
             })
         })
@@ -666,6 +702,7 @@ impl JsRealm {
             Self::install_crypto_host_functions(&ctx)?;
             install_storage_host_functions(&ctx, &world)?;
             install_window_host_functions(&ctx, &world)?;
+            install_history_host_functions(&ctx, &world)?;
             url_parts::install(&ctx)?;
             bindings::install_messaging(&ctx)?;
             ctx.eval::<(), _>(INSTALL_WEB_APIS_JS)?;
@@ -722,9 +759,31 @@ impl JsRealm {
 
         ctx.globals().set(
             "__queueFetch",
-            Func::from(move |url: String, js_id: i32| {
-                fetches.borrow_mut().push(PendingJsFetch { url, js_id });
-            }),
+            Func::from(
+                move |url: String,
+                      js_id: i32,
+                      method: String,
+                      body: Vec<u8>,
+                      content_type: Option<String>,
+                      headers: Vec<Vec<String>>| {
+                    let headers = headers
+                        .into_iter()
+                        .map(|field| match field.as_slice() {
+                            [name, value] => Ok((name.clone(), value.clone())),
+                            _ => Err(rquickjs::Error::new_from_js("array", "header pair")),
+                        })
+                        .collect::<rquickjs::Result<Vec<_>>>()?;
+                    fetches.borrow_mut().push(PendingJsFetch {
+                        url,
+                        js_id,
+                        method,
+                        body,
+                        content_type,
+                        headers,
+                    });
+                    Ok::<(), rquickjs::Error>(())
+                },
+            ),
         )?;
         Ok(())
     }
@@ -819,6 +878,42 @@ impl JsRealm {
         )?;
         Ok(())
     }
+}
+
+/// Validates and records the synchronous history API's URL update, then
+/// forwards it to the tab coordinator after the current script finishes.
+/// <https://html.spec.whatwg.org/multipage/nav-history-apis.html#shared-history-push/replace-state-steps>
+fn install_history_host_functions(ctx: &Ctx<'_>, world: &Rc<RefCell<World>>) -> Result<(), JsError> {
+    let snapshot = world.borrow().history.clone();
+    ctx.globals().set("__tbHistoryLength", snapshot.length.max(1))?;
+    ctx.globals().set("__tbHistoryState", snapshot.state)?;
+    let update_world = world.clone();
+    ctx.globals().set(
+        "__tbHistoryUpdate",
+        Func::from(move |ctx: Ctx<'_>, url: String, state: String, replace: bool| {
+            let next = Url::parse(&url)
+                .map_err(|_| Exception::throw_type(&ctx, "Invalid history URL"))?;
+            let mut world = update_world.borrow_mut();
+            if next.origin() != world.document_url.origin() {
+                return Err(Exception::throw_type(&ctx, "Cross-origin history URL"));
+            }
+            world.document_url = next;
+            world.history.state = Some(state.clone());
+            if !replace {
+                world.history.length = world.history.length.max(1).saturating_add(1);
+            }
+            world.pending_history.push(crate::protocol::RendererEvent::HistoryUpdated { url, state, replace });
+            Ok::<usize, rquickjs::Error>(world.history.length)
+        }),
+    )?;
+    let traverse_world = world.clone();
+    ctx.globals().set(
+        "__tbHistoryTraverse",
+        Func::from(move |delta: i32| {
+            traverse_world.borrow_mut().pending_history.push(crate::protocol::RendererEvent::HistoryTraversal { delta });
+        }),
+    )?;
+    Ok(())
 }
 
 /// Produces the cryptographically strong bytes required by

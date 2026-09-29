@@ -26,63 +26,6 @@ pub(crate) const VIEWPORT_WIDTH: f32 = 800.0;
 /// See [`VIEWPORT_WIDTH`].
 pub(crate) const VIEWPORT_HEIGHT: f32 = 600.0;
 
-/// Every stylesheet that applies to the document, in document order:
-/// `<style>` text and loaded `<link rel=stylesheet>` sheets, spliced at
-/// their element positions.
-fn collect_stylesheets(dom: &dom::Document, document: &Document) -> Vec<String> {
-    let mut sheets = Vec::new();
-    for node in dom.tree().descendants(dom.document()) {
-        let Some(dom::NodeKind::Element { name, .. }) = dom.kind(node) else {
-            continue;
-        };
-        if name.ns != dom::html_namespace() {
-            continue;
-        }
-        match name.local.as_ref() {
-            "style" => {
-                let mut css = String::new();
-                if let Some(children) = dom.children(node) {
-                    for child in children {
-                        if let Some(dom::NodeKind::Text { data }) = dom.kind(child) {
-                            css.push_str(data);
-                        }
-                    }
-                }
-                let css = strip_cdata(&css);
-                if !css.trim().is_empty() {
-                    sheets.push(css.to_owned());
-                }
-            }
-            "link" => {
-                let rel = dom.attribute(node, "rel").unwrap_or_default();
-                if !rel
-                    .split_ascii_whitespace()
-                    .any(|token| token.eq_ignore_ascii_case("stylesheet"))
-                {
-                    continue;
-                }
-                if let Some(css) = document.stylesheet_for(node) {
-                    sheets.push(css.to_owned());
-                }
-            }
-            _ => {}
-        }
-    }
-    sheets
-}
-
-/// Strips the `<![CDATA[` / `]]>` wrapper a `<style>` element carries when
-/// the document is XML-flavored (WPT serves `.xht` as
-/// `application/xhtml+xml`). In the XML tree those markers delimit a CDATA
-/// section, so they are not part of the CSS; without an XML parser they
-/// arrive inside the raw text.
-fn strip_cdata(css: &str) -> &str {
-    let trimmed = css.trim();
-    trimmed
-        .strip_prefix("<![CDATA[")
-        .and_then(|rest| rest.strip_suffix("]]>"))
-        .unwrap_or(css)
-}
 use crate::documents::DocumentStore;
 use crate::js::{DocumentStreamCommand, FrameNavigation, NavigationTarget, RealmRegistry, SharedJsRuntime};
 use crate::messaging::{Delivery, MAX_FRAMES, SharedHandle};
@@ -306,7 +249,7 @@ impl Engine {
         let world = document.world();
         let world = world.borrow();
         let sheets = world
-            .with_main_document(|parsed| collect_stylesheets(&parsed.document, document))
+            .with_main_document(|parsed| world.author_stylesheets(parsed))
             .ok_or_else(|| TabError::RendererUnavailable {
                 message: "no document to render".into(),
             })?;
@@ -396,6 +339,17 @@ impl Engine {
         if let Some(document) = self.frames.get_mut(&FrameId::MAIN) {
             document.push_remote_message(payload);
         }
+    }
+
+    /// Activates an entry that belongs to the main frame's current document.
+    ///
+    /// # Errors
+    ///
+    /// [`TabError::UnknownFrame`] when the main frame is not mounted and
+    /// [`TabError::InvalidUrl`] when `url` does not parse or is cross-origin.
+    pub fn traverse_history(&mut self, url: &str, state: Option<&str>, length: usize) -> Result<(), TabError> {
+        let document = self.frames.get_mut(&FrameId::MAIN).ok_or(TabError::UnknownFrame { frame: FrameId::MAIN.get() })?;
+        document.traverse_history(url, state, length)
     }
 
     /// Queues one `BroadcastChannel` message on every same-origin frame of

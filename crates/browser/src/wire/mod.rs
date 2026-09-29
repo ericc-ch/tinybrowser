@@ -62,6 +62,12 @@ pub enum Command {
         /// `__tbEncode` payload from the posting window.
         payload: String,
     },
+    /// Activate an existing entry in the current document without replacing it.
+    HistoryTraverse {
+        url: String,
+        state: Option<String>,
+        length: usize,
+    },
 }
 
 /// Renderer reply to one [`Command`].
@@ -481,6 +487,7 @@ mod tests {
                         method: "GET".into(),
                         body: Vec::new(),
                         content_type: None,
+                        headers: Vec::new(),
                     })),
                 },
             },

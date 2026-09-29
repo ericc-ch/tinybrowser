@@ -111,6 +111,7 @@ pub(crate) struct QueuedDial {
     pub(crate) body: Vec<u8>,
     /// `Content-Type` for `body`, when there is one.
     pub(crate) content_type: Option<String>,
+    pub(crate) headers: Vec<(String, String)>,
 }
 
 impl QueuedDial {
@@ -123,6 +124,7 @@ impl QueuedDial {
             method: "GET".to_owned(),
             body: Vec::new(),
             content_type: None,
+            headers: Vec::new(),
         }
     }
 }
@@ -189,11 +191,9 @@ pub(crate) struct Document {
     dial_rx: Receiver<Result<CompletedDial, DialContext>>,
     in_flight_dials: usize,
     queued_dials: Vec<QueuedDial>,
-    /// Loaded `<link rel=stylesheet>` sheets, keyed by their link element so
-    /// the renderer can splice them into the cascade at the right position.
-    stylesheets: HashMap<dom::NodeId, String>,
     /// Every stylesheet URL already queued or loaded, so re-scans do not
-    /// refetch.
+    /// refetch. The loaded text lives in the world beside decoded images so
+    /// paint and script geometry share one source.
     stylesheet_urls: HashSet<String>,
     /// Stylesheet dials queued or in flight; the load event waits for them
     /// (<https://html.spec.whatwg.org/multipage/links.html#link-type-stylesheet>).
@@ -280,7 +280,6 @@ impl Document {
             dial_rx,
             in_flight_dials: 0,
             queued_dials: Vec::new(),
-            stylesheets: HashMap::new(),
             stylesheet_urls: HashSet::new(),
             pending_stylesheets: 0,
             pending_images: 0,
@@ -470,6 +469,7 @@ impl Document {
             method,
             body,
             content_type,
+            headers: Vec::new(),
         });
     }
 
@@ -552,6 +552,25 @@ impl Document {
             self.url = url.clone();
             self.world.borrow_mut().document_url = url;
         }
+    }
+
+    /// Restores a same-document session history entry while preserving the realm.
+    pub(crate) fn traverse_history(
+        &mut self,
+        url: &str,
+        state: Option<&str>,
+        length: usize,
+    ) -> Result<(), TabError> {
+        let url = Url::parse(url).map_err(|_| TabError::InvalidUrl { spec: url.to_owned() })?;
+        if url.origin() != self.url.origin() {
+            return Err(TabError::InvalidUrl { spec: url.into() });
+        }
+        self.apply_document_url(url.as_str());
+        self.world.borrow_mut().history = crate::protocol::HistorySnapshot { length, state: state.map(str::to_owned) };
+        if let Some(js) = &self.js {
+            js.traverse_history(url.as_str(), state, length).map_err(TabError::from)?;
+        }
+        Ok(())
     }
 
     /// Queues one posted window message as a task on this frame's task source
@@ -762,6 +781,7 @@ impl Document {
         let url = Url::parse(&mount.url).map_err(|_| TabError::InvalidUrl {
             spec: mount.url.clone(),
         })?;
+        self.world.borrow_mut().history = mount.history.clone();
         self.load_response_body(
             &url,
             mount.content_type.as_deref(),
@@ -971,7 +991,7 @@ impl Document {
         // Every queued dial belongs to the old realm; drop them all.
         self.queued_dials.clear();
         // Sheets belong to the replaced document; the new parse re-scans.
-        self.stylesheets.clear();
+        self.world.borrow_mut().clear_stylesheets();
         self.stylesheet_urls.clear();
         self.pending_stylesheets = 0;
         self.world.borrow_mut().clear_images();
@@ -1177,8 +1197,7 @@ impl Document {
                     status: outcome.status,
                 });
                 if epoch == self.js_epoch {
-                    let body = String::from_utf8_lossy(&outcome.body);
-                    self.settle_js_fetch(id, true, i32::from(outcome.status), &body);
+                    self.settle_js_fetch(id, Some(outcome));
                 }
             }
             DialContext::ClassicScript { element, epoch } => {
@@ -1209,8 +1228,10 @@ impl Document {
                 });
                 self.pending_stylesheets = self.pending_stylesheets.saturating_sub(1);
                 if (200..300).contains(&outcome.status) {
-                    self.stylesheets
-                        .insert(element, String::from_utf8_lossy(&outcome.body).into_owned());
+                    self.world.borrow_mut().store_stylesheet(
+                        element,
+                        String::from_utf8_lossy(&outcome.body).into_owned(),
+                    );
                 }
                 self.fire_document_load();
             }
@@ -1277,7 +1298,7 @@ impl Document {
         match fail {
             DialContext::JsFetch { id, epoch } => {
                 if epoch == self.js_epoch {
-                    self.settle_js_fetch(id, false, 0, "");
+                    self.settle_js_fetch(id, None);
                 }
             }
             DialContext::ClassicScript { epoch, .. } => {
@@ -1324,14 +1345,8 @@ impl Document {
         self.adopt_js_work();
     }
 
-    pub(in crate::document) fn settle_js_fetch(
-        &mut self,
-        id: i32,
-        ok: bool,
-        status: i32,
-        body: &str,
-    ) {
-        self.fire_js(|js| js.finish_js_fetch(id, ok, status, body));
+    pub(in crate::document) fn settle_js_fetch(&mut self, id: i32, outcome: Option<DialOutcome>) {
+        self.fire_js(|js| js.finish_js_fetch(id, outcome));
     }
 
     fn sync_parser_from_world(&self) {
@@ -1435,7 +1450,12 @@ impl Document {
             };
             links
                 .into_iter()
-                .filter_map(|link| parsed.document.attribute(link, "href").map(|href| (link, href)))
+                .filter_map(|link| {
+                    parsed
+                        .document
+                        .attribute(link, "href")
+                        .map(|href| (link, href))
+                })
                 .collect()
         };
         let initiator = self.url.clone();
@@ -1537,11 +1557,6 @@ impl Document {
         ));
         self.pending_images = self.pending_images.saturating_add(1);
         self.launch_queued_dials();
-    }
-
-    /// The loaded CSS of one `<link rel=stylesheet>`, if it arrived.
-    pub(crate) fn stylesheet_for(&self, element: dom::NodeId) -> Option<&str> {
-        self.stylesheets.get(&element).map(String::as_str)
     }
 
     /// Fires this document's `load` event once it and every child browsing

@@ -152,6 +152,14 @@ pub enum RendererEvent {
         /// The final URL after redirects.
         url: String,
     },
+    /// A history API update in the active document (no new JS realm).
+    HistoryUpdated {
+        url: String,
+        state: String,
+        replace: bool,
+    },
+    /// Request to traverse the tab's session history by `delta` entries.
+    HistoryTraversal { delta: i32 },
     /// A host timer whose delay elapsed.
     Timer(u32),
     /// A `fetch` or navigation job finished with this HTTP status.
@@ -197,6 +205,16 @@ pub struct Mount {
     /// Raw document bytes; the renderer decodes them.
     #[serde(skip, default)]
     pub body: Vec<u8>,
+    /// Session history visible in the newly mounted document.
+    #[serde(default)]
+    pub history: HistorySnapshot,
+}
+
+/// Browser-owned history state passed to a newly created document realm.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct HistorySnapshot {
+    pub length: usize,
+    pub state: Option<String>,
 }
 
 /// Why a browser-service dial failed. Preserved across the renderer seam.
@@ -282,6 +300,9 @@ pub struct DialRequest {
     /// `Content-Type` header for `body`, when there is one.
     #[serde(default)]
     pub content_type: Option<String>,
+    /// Author-supplied request headers, in insertion order.
+    #[serde(default)]
+    pub headers: Vec<(String, String)>,
 }
 
 fn default_dial_method() -> String {
@@ -299,6 +320,9 @@ pub struct DialOutcome {
     pub content_type: Option<String>,
     /// `Content-Language` header, when present and a single tag.
     pub content_language: Option<String>,
+    /// Response headers visible to page scripts, in wire order.
+    #[serde(default)]
+    pub headers: Vec<(String, String)>,
     /// Response body, when [`DialRequest::read_body`].
     pub body: Vec<u8>,
 }

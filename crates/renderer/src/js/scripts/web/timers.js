@@ -2,9 +2,10 @@
 // shims pass it to the trusted-event bridge; page script cannot name it.
 const __tbHostToken = globalThis.__tbHostToken;
 globalThis.__tb_timeouts = [];
+globalThis.__tb_intervals = Object.create(null);
 globalThis.__tb_fetchCbs = Object.create(null);
 globalThis.__tb_fetchSeq = 0;
-['__scheduleTimeout','__cancelTimeout','__queueFetch','__cookieGet','__cookieSet','__tbCreateObjectURL','__tbRevokeObjectURL','__tbResolveUrl','__tbParseUrl','__tb_timeouts','__tb_fetchCbs'].forEach(function(k) {
+['__scheduleTimeout','__cancelTimeout','__queueFetch','__cookieGet','__cookieSet','__tbCreateObjectURL','__tbRevokeObjectURL','__tbResolveUrl','__tbParseUrl','__tb_timeouts','__tb_intervals','__tb_fetchCbs'].forEach(function(k) {
   Object.defineProperty(globalThis, k, { writable: false, configurable: false, enumerable: false });
 });
 globalThis.setTimeout = function(fn, ms) {
@@ -15,8 +16,36 @@ globalThis.setTimeout = function(fn, ms) {
 };
 globalThis.clearTimeout = function(id) {
   globalThis.__tb_timeouts[id] = function() {};
+  delete globalThis.__tb_intervals[id];
   globalThis.__cancelTimeout(Number(id));
 };
+// Both clear methods remove IDs from the same timer map, and an interval
+// reschedules with its original ID after invoking its handler.
+// <https://html.spec.whatwg.org/multipage/timers-and-user-prompts.html#timer-initialisation-steps>
+globalThis.setInterval = function(handler, ms, ...args) {
+  var id = globalThis.__tb_timeouts.length;
+  var delay = Number(ms);
+  var callback = typeof handler === 'function' ? handler : String(handler);
+  function tick() {
+    try {
+      if (typeof callback === 'function') {
+        callback.apply(globalThis, args);
+      } else {
+        (0, eval)(callback);
+      }
+    } finally {
+      if (globalThis.__tb_intervals[id]) {
+        globalThis.__tb_timeouts[id] = tick;
+        globalThis.__scheduleTimeout(id, delay);
+      }
+    }
+  }
+  globalThis.__tb_intervals[id] = true;
+  globalThis.__tb_timeouts.push(tick);
+  globalThis.__scheduleTimeout(id, delay);
+  return id;
+};
+globalThis.clearInterval = globalThis.clearTimeout;
 // The engine has no rendering pipeline; a frame callback is a 16ms timer
 // (<https://html.spec.whatwg.org/multipage/imagebitmap-and-animations.html#dom-animationframeprovider-requestanimationframe>).
 // Deviations: callbacks queued in the same frame do not share a

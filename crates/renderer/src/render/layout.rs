@@ -414,21 +414,29 @@ fn process_text(text: &str, style: &Style) -> ProcessedText {
 }
 /// tree rooted at the atomic.
 fn measure_atomic(node: &BoxNode, ctx: &Ctx<'_>, available: f32) -> Atomic {
-    let mut preferred = max_content_width(node, ctx).ceil();
-    if preferred == 0.0
-        && node.style.width == Dimension::Auto
-        && node.style.height == Dimension::Auto
-        && let Some(ratio) = node.style.aspect_ratio
-    {
-        // Replaced content with only an intrinsic ratio uses the 300x150
-        // default object size, contained by the available inline size.
-        // https://drafts.csswg.org/css-images-3/#default-sizing
-        preferred = (150.0 * ratio).min(300.0).min(available);
-    }
+    // A definite width resolves against the containing inline size; only
+    // `auto` shrink-wraps to content
+    // (<https://drafts.csswg.org/css-sizing-3/#shrink-to-fit>).
+    let preferred = match node.style.width {
+        Dimension::Length(length) => length.resolve(available),
+        Dimension::Auto => {
+            let mut preferred = max_content_width(node, ctx).ceil();
+            if preferred == 0.0
+                && node.style.height == Dimension::Auto
+                && let Some(ratio) = node.style.aspect_ratio
+            {
+                // Replaced content with only an intrinsic ratio uses the 300x150
+                // default object size, contained by the available inline size.
+                // https://drafts.csswg.org/css-images-3/#default-sizing
+                preferred = (150.0 * ratio).min(300.0).min(available);
+            }
+            preferred
+        }
+    };
     let layout = crate::render::boxes::layout_subtree(node, ctx, preferred);
     let margin = node.style.margin.map(|dimension| match dimension {
         Dimension::Auto => 0.0,
-        Dimension::Length(length) => length.resolve(preferred),
+        Dimension::Length(length) => length.resolve(available),
     });
     Atomic {
         content_width: layout.content_box().width,

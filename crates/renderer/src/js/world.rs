@@ -314,6 +314,8 @@ pub(crate) struct World {
     /// Document ids this realm created; only these feed its observers.
     owned: HashSet<u32>,
     pub document_url: Url,
+    pub(crate) history: crate::protocol::HistorySnapshot,
+    pub(crate) pending_history: Vec<crate::protocol::RendererEvent>,
     pub pending_cancels: Vec<i32>,
     pub pending_html_writes: Vec<String>,
     frame_navigations: Vec<FrameNavigation>,
@@ -415,6 +417,10 @@ pub(crate) struct World {
     /// Current request is broken and there is no pending request
     /// (<https://html.spec.whatwg.org/multipage/images.html#img-error>).
     pub(crate) image_broken: HashSet<NodeId>,
+    /// Loaded `<link rel=stylesheet>` text by link element, in document order
+    /// at collection time. Stored here (like decoded images) so paint and
+    /// script geometry share one source.
+    pub(crate) author_sheets: HashMap<NodeId, String>,
 }
 
 impl Drop for World {
@@ -455,6 +461,8 @@ impl World {
             document: None,
             owned: HashSet::new(),
             document_url,
+            history: crate::protocol::HistorySnapshot::default(),
+            pending_history: Vec::new(),
             pending_cancels: Vec::new(),
             pending_html_writes: Vec::new(),
             frame_navigations: Vec::new(),
@@ -501,6 +509,7 @@ impl World {
             image_loading: HashSet::new(),
             image_current_src: HashMap::new(),
             image_broken: HashSet::new(),
+            author_sheets: HashMap::new(),
         }
     }
 
@@ -1140,6 +1149,63 @@ impl World {
         self.release_decoded_image_bytes(bytes);
     }
 
+    /// Retains one loaded `<link rel=stylesheet>` sheet for the cascade.
+    pub(crate) fn store_stylesheet(&mut self, element: NodeId, css: String) {
+        self.author_sheets.insert(element, css);
+    }
+
+    /// Drops every loaded sheet; a navigation re-scans the new document.
+    pub(crate) fn clear_stylesheets(&mut self) {
+        self.author_sheets.clear();
+    }
+
+    /// Every stylesheet that applies to `parsed`, in document order: `<style>`
+    /// text and loaded `<link rel=stylesheet>` sheets, spliced at their
+    /// element positions.
+    pub(crate) fn author_stylesheets(&self, parsed: &Parsed) -> Vec<String> {
+        let mut sheets = Vec::new();
+        for node in parsed.document.tree().descendants(parsed.document.document()) {
+            let Some(dom::NodeKind::Element { name, .. }) = parsed.document.kind(node) else {
+                continue;
+            };
+            if name.ns != dom::html_namespace() {
+                continue;
+            }
+            match name.local.as_ref() {
+                "style" => {
+                    let mut css = String::new();
+                    if let Some(children) = parsed.document.children(node) {
+                        for child in children {
+                            if let Some(dom::NodeKind::Text { data }) =
+                                parsed.document.kind(child)
+                            {
+                                css.push_str(data);
+                            }
+                        }
+                    }
+                    let css = strip_stylesheet_cdata(&css);
+                    if !css.trim().is_empty() {
+                        sheets.push(css.to_owned());
+                    }
+                }
+                "link" => {
+                    let rel = parsed.document.attribute(node, "rel").unwrap_or_default();
+                    if !rel
+                        .split_ascii_whitespace()
+                        .any(|token| token.eq_ignore_ascii_case("stylesheet"))
+                    {
+                        continue;
+                    }
+                    if let Some(css) = self.author_sheets.get(&node) {
+                        sheets.push(css.clone());
+                    }
+                }
+                _ => {}
+            }
+        }
+        sheets
+    }
+
     fn reserve_decoded_image_bytes(&self, bytes: usize) -> bool {
         let mut budget = self.budget.borrow_mut();
         let Some(total) = budget.decoded_images.checked_add(bytes) else {
@@ -1595,4 +1661,14 @@ pub(crate) struct AttrState {
     pub prefix: Option<String>,
     pub local: String,
     pub qualified: String,
+}
+
+/// Strips the `<![CDATA[` / `]]>` wrapper a `<style>` element carries when the
+/// document is XML-flavored (WPT serves `.xht` as `application/xhtml+xml`).
+fn strip_stylesheet_cdata(css: &str) -> &str {
+    let trimmed = css.trim();
+    trimmed
+        .strip_prefix("<![CDATA[")
+        .and_then(|rest| rest.strip_suffix("]]>"))
+        .unwrap_or(css)
 }

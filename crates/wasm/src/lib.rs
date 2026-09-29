@@ -110,6 +110,7 @@ impl GuestTab for Tab {
             content_type: Some("text/html; charset=utf-8".into()),
             content_language: None,
             body: html.into_bytes(),
+            history: renderer::HistorySnapshot::default(),
         };
         renderer.mount(&mount).map_err(|error| error.to_string())?;
         Ok(Self {
@@ -175,6 +176,10 @@ impl Tab {
 fn to_event(event: RendererEvent) -> Event {
     match event {
         RendererEvent::Navigated { url } => Event::Navigated(url),
+        RendererEvent::HistoryUpdated { url, state, replace } => {
+            Event::HistoryUpdated((url, state, replace))
+        }
+        RendererEvent::HistoryTraversal { delta } => Event::HistoryTraversal(delta),
         RendererEvent::Load => Event::Load,
         RendererEvent::Timer(id) => Event::Timer(id),
         RendererEvent::Fetch { status } => Event::Fetch(status),
@@ -380,6 +385,7 @@ fn decode_fetch_result(response: FetchResponse, hop_url: &Url) -> Result<DialOut
         final_url: final_url.into(),
         content_type: response.content_type,
         content_language: response.content_language,
+        headers: Vec::new(),
         body: response.body,
     })
 }

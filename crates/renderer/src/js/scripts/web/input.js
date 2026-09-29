@@ -146,10 +146,15 @@
     });
     if (!element.dispatchEvent(before)) return;
     if (typeof globalThis.__tbMarkUserEdited === 'function') globalThis.__tbMarkUserEdited(element);
+    const value = element.value.slice(0, start) + text + element.value.slice(end);
+    // Native user editing changes the control's internal value without
+    // invoking an author-defined own `value` setter. React observes the
+    // subsequent input event against its previous tracked value.
+    // <https://html.spec.whatwg.org/multipage/interaction.html#input-events>
+    globalThis.__tbSetNativeValue(element, value);
     if (supportsSelection(element)) {
-      element.setRangeText(text, start, end, 'end');
-    } else {
-      element.value = element.value.slice(0, start) + text + element.value.slice(end);
+      const position = start + text.length;
+      element.setSelectionRange(position, position);
     }
     fireInput(element, inputType, data);
   };

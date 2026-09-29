@@ -450,7 +450,10 @@ impl JsNode {
     #[qjs(rename = "getBoundingClientRect")]
     fn get_bounding_client_rect<'js>(&self, ctx: Ctx<'js>) -> Result<Object<'js>> {
         match element_box(&ctx, self.handle.0)? {
-            Some((left, top, width, height)) => rect_object(&ctx, left, top, width, height),
+            Some((left, top, width, height)) => {
+                let (scroll_x, scroll_y) = super::viewport_scroll(&ctx, self.handle.0)?;
+                rect_object(&ctx, left - scroll_x, top - scroll_y, width, height)
+            }
             None => rect_object(&ctx, 0.0, 0.0, 0.0, 0.0),
         }
     }
@@ -459,14 +462,41 @@ impl JsNode {
     fn get_client_rects<'js>(&self, ctx: Ctx<'js>) -> Result<Array<'js>> {
         let array = Array::new(ctx.clone())?;
         if let Some((left, top, width, height)) = element_box(&ctx, self.handle.0)? {
-            array.set(0, rect_object(&ctx, left, top, width, height)?)?;
+            let (scroll_x, scroll_y) = super::viewport_scroll(&ctx, self.handle.0)?;
+            array.set(0, rect_object(&ctx, left - scroll_x, top - scroll_y, width, height)?)?;
         }
         Ok(array)
     }
 
-    /// No layout means there is nothing to scroll.
+    /// Scrolls the viewport so this element's border box is visible.
+    /// <https://drafts.csswg.org/cssom-view/#dom-element-scrollintoview>
     #[qjs(rename = "scrollIntoView")]
-    fn scroll_into_view(&self) {}
+    fn scroll_into_view(&self, ctx: Ctx<'_>) -> Result<()> {
+        let Some((left, top, width, height)) = element_box(&ctx, self.handle.0)? else {
+            return Ok(());
+        };
+        let world = world(&ctx)?;
+        let world = world.borrow();
+        let Some(mut parsed) = world.document_mut(self.handle.0) else {
+            return Ok(());
+        };
+        let Some(root) = dom::selector::select_first(&parsed.document, parsed.document.document(), "html")
+            .ok()
+            .flatten() else {
+            return Ok(());
+        };
+        let (scroll_x, scroll_y) = dom::metadata::scroll_offset(&parsed.document, root);
+        let viewport_width = f64::from(crate::engine::VIEWPORT_WIDTH);
+        let viewport_height = f64::from(crate::engine::VIEWPORT_HEIGHT);
+        let next_x = if left < scroll_x { left } else if left + width > scroll_x + viewport_width {
+            left + width - viewport_width
+        } else { scroll_x };
+        let next_y = if top < scroll_y { top } else if top + height > scroll_y + viewport_height {
+            top + height - viewport_height
+        } else { scroll_y };
+        dom::metadata::set_scroll_offset(&mut parsed.document, root, next_x.max(0.0), next_y.max(0.0));
+        Ok(())
+    }
 
     // https://html.spec.whatwg.org/multipage/nav-history-apis.html#dom-document-defaultview
     #[qjs(get, rename = "defaultView")]
