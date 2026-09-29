@@ -7,6 +7,7 @@
 //! read here and by the round-trip test, so adding a shim cannot silently
 //! diverge from what realms evaluate.
 
+use std::collections::HashSet;
 use std::env;
 use std::fmt::Write as _;
 use std::fs;
@@ -53,17 +54,31 @@ fn main() {
     println!("cargo:rerun-if-changed={}", order_path.display());
     let mut bundle = WEB_PREFIX.to_owned();
     let mut bundle_inputs = Vec::new();
+    let mut seen = HashSet::new();
     let order = fs::read_to_string(&order_path).expect("read web order.txt");
     for file in order.lines() {
         let file = file.trim();
         if file.is_empty() || file.starts_with('#') {
             continue;
         }
+        assert!(
+            file.chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-')),
+            "order.txt entry {file:?} must be a plain file name"
+        );
+        assert!(seen.insert(file.to_owned()), "duplicate order.txt entry {file}");
         let rel = format!("src/js/scripts/web/{file}");
         println!("cargo:rerun-if-changed={}", root.join(&rel).display());
-        bundle.push_str(&fs::read_to_string(root.join(&rel)).expect("read web shim"));
+        bundle.push_str(
+            &fs::read_to_string(root.join(&rel))
+                .unwrap_or_else(|err| panic!("read web shim {rel}: {err}")),
+        );
         bundle_inputs.push(rel);
     }
+    assert!(
+        !bundle_inputs.is_empty(),
+        "order.txt lists no shims; refusing to ship an empty web bundle"
+    );
     bundle.push_str(WEB_SUFFIX);
     write_blob(&out, "web_bundle.deflate", bundle.as_bytes());
     writeln!(
@@ -75,8 +90,9 @@ fn main() {
 
     for (blob, input) in SINGLES {
         println!("cargo:rerun-if-changed={}", root.join(input).display());
-        let bytes = fs::read(root.join(input)).expect("read shim");
-        write_blob(&out, blob, &bytes);
+        let text = fs::read_to_string(root.join(input))
+            .unwrap_or_else(|err| panic!("read shim {input}: {err}"));
+        write_blob(&out, blob, text.as_bytes());
         writeln!(manifest, "{blob}\tsingle\t{input}").expect("write manifest line");
     }
     fs::write(out.join("manifest.txt"), manifest).expect("write manifest");

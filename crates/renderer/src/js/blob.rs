@@ -12,8 +12,9 @@ use std::sync::OnceLock;
 use rquickjs::{Ctx, Exception, Result};
 
 /// Inflates `deflated` on first call through `cache`, returning the cached
-/// source afterwards. A second caller racing the first blocks in
-/// `get_or_init` and receives the winner's value; inflation is idempotent.
+/// source afterwards. Callers racing the first inflate redundantly in
+/// parallel and the losers discard their copies; `get_or_init` publishes
+/// exactly one, and inflation is idempotent so every copy is identical.
 pub(crate) fn decompress(
     ctx: &Ctx<'_>,
     deflated: &'static [u8],
@@ -63,19 +64,14 @@ mod tests {
                 "bundle" => {
                     let (wrap, paths) = payload.split_once('\t').expect("bundle manifest");
                     let (prefix, suffix) = wrap.split_once('|').expect("bundle wrapper");
-                    assert!(
-                        out.starts_with(prefix) && out.ends_with(suffix),
-                        "{blob} lost its wrapper"
-                    );
-                    let body = &out[prefix.len()..out.len() - suffix.len()];
+                    let mut expected = String::from(prefix);
                     for path in paths.split(',') {
                         let source =
                             fs::read_to_string(root.join(path)).expect("read shim source");
-                        assert!(
-                            body.contains(&source),
-                            "{blob} drifted from {path}"
-                        );
+                        expected.push_str(&source);
                     }
+                    expected.push_str(suffix);
+                    assert_eq!(out, expected, "{blob} drifted from its ordered sources");
                 }
                 _ => panic!("unknown manifest mode {mode}"),
             }
