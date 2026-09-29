@@ -91,7 +91,7 @@ impl<'js> Trace<'js> for EventStateCell {
 /// The `CustomEvent` platform object.
 ///
 /// `detail` is the one `any` attribute of the interface, so it lives as a
-/// symbol-keyed own property on the object (`INSTALL_CUSTOM_EVENT_JS`) rather
+/// symbol-keyed own property on the object (`install_custom_event_js`) rather
 /// than in this struct; every Rust-held JS value would pin the context.
 #[derive(Trace, rquickjs::JsLifetime)]
 #[rquickjs::class(rename = "Event")]
@@ -330,7 +330,7 @@ impl JsEvent {
 /// (<https://dom.spec.whatwg.org/#interface-eventtarget>).
 ///
 /// Nodes get their own copies of the three methods on the JavaScript `Node`
-/// prototype (`INSTALL_BRANDS_JS` copies them from the Rust `Node.prototype`),
+/// prototype (`install_brands_js` copies them from the Rust `Node.prototype`),
 /// so these methods only ever see `new EventTarget()` receivers. That matters
 /// because rquickjs methods brand-check their receiver as the defining class.
 #[derive(Trace, rquickjs::JsLifetime)]
@@ -421,18 +421,41 @@ impl JsEventTarget {
 /// Wraps the native `EventTarget` constructor so a call without `new` throws
 /// (<https://webidl.spec.whatwg.org/#interface-object>); the wrapper shares the
 /// native prototype so `Class::<JsEventTarget>` conversions keep working.
-pub(crate) const INSTALL_EVENT_TARGET_CTOR_JS: &str =
-    include_str!("scripts/events/event_target_ctor.js");
+/// Deflated by `build.rs`, inflated once per process.
+pub(crate) const INSTALL_EVENT_TARGET_CTOR_DEFLATE: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/js_blobs/event_target_ctor.deflate"));
+
+/// The `EventTarget` constructor shim, inflated once per process.
+pub(crate) fn install_event_target_ctor_js(ctx: &Ctx<'_>) -> Result<&'static str> {
+    static CACHE: std::sync::OnceLock<Box<str>> = std::sync::OnceLock::new();
+    super::blob::decompress(ctx, INSTALL_EVENT_TARGET_CTOR_DEFLATE, &CACHE)
+}
 
 /// `AbortController` and `AbortSignal`
 /// (<https://dom.spec.whatwg.org/#interface-abortcontroller>,
 /// <https://dom.spec.whatwg.org/#abortsignal>).
-pub(crate) const INSTALL_ABORT_JS: &str = include_str!("scripts/events/abort.js");
+/// Deflated by `build.rs`, inflated once per process.
+pub(crate) const INSTALL_ABORT_DEFLATE: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/js_blobs/abort.deflate"));
+
+/// The abort shim, inflated once per process.
+pub(crate) fn install_abort_js(ctx: &Ctx<'_>) -> Result<&'static str> {
+    static CACHE: std::sync::OnceLock<Box<str>> = std::sync::OnceLock::new();
+    super::blob::decompress(ctx, INSTALL_ABORT_DEFLATE, &CACHE)
+}
 
 /// Wraps the native `Event` constructor so a call without `new` throws
 /// (<https://webidl.spec.whatwg.org/#interface-object>); the wrapper shares the
 /// native prototype so `Class::<JsEvent>` conversions keep working.
-pub(crate) const INSTALL_EVENT_CTOR_JS: &str = include_str!("scripts/events/event_ctor.js");
+/// Deflated by `build.rs`, inflated once per process.
+pub(crate) const INSTALL_EVENT_CTOR_DEFLATE: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/js_blobs/event_ctor.deflate"));
+
+/// The `Event` constructor shim, inflated once per process.
+pub(crate) fn install_event_ctor_js(ctx: &Ctx<'_>) -> Result<&'static str> {
+    static CACHE: std::sync::OnceLock<Box<str>> = std::sync::OnceLock::new();
+    super::blob::decompress(ctx, INSTALL_EVENT_CTOR_DEFLATE, &CACHE)
+}
 
 /// Keeps a constructible target's object reachable from its world, so dispatch
 /// can use it as `target`/`currentTarget`.
@@ -521,7 +544,15 @@ pub(crate) fn init_custom_event<'js>(ctx: Ctx<'js>, args: Rest<Value<'js>>) -> R
 }
 
 /// Registers the `CustomEvent` constructor and its prototype chain.
-pub(crate) const INSTALL_CUSTOM_EVENT_JS: &str = include_str!("scripts/events/custom_event.js");
+/// Deflated by `build.rs`, inflated once per process.
+pub(crate) const INSTALL_CUSTOM_EVENT_DEFLATE: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/js_blobs/custom_event.deflate"));
+
+/// The `CustomEvent` shim, inflated once per process.
+pub(crate) fn install_custom_event_js(ctx: &Ctx<'_>) -> Result<&'static str> {
+    static CACHE: std::sync::OnceLock<Box<str>> = std::sync::OnceLock::new();
+    super::blob::decompress(ctx, INSTALL_CUSTOM_EVENT_DEFLATE, &CACHE)
+}
 
 fn event_arguments<'js>(
     ctx: &Ctx<'js>,
