@@ -1856,6 +1856,7 @@ dependencies = [
  "encoding_rs",
  "euclid",
  "fixed_decimal",
+ "flate2",
  "fontique",
  "getrandom",
  "html5ever",
