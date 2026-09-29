@@ -15,6 +15,19 @@ test("hosted Sauce Demo checkout", async ({ daemon }) => {
     await page.locator("#password").fill("secret_sauce");
     await page.locator("#login-button").click();
     await expect(page.locator(".inventory_list")).toBeVisible();
+    await expect(page.locator(".inventory_item img").first()).toBeVisible();
+    await expect.poll(() => page.evaluate(() =>
+      document.querySelector<HTMLImageElement>(".inventory_item img")?.naturalWidth ?? 0,
+    )).toBeGreaterThan(0);
+    await expect.poll(() => page.evaluate(() => {
+      const image = document.querySelector<HTMLImageElement>(".inventory_item img");
+      const frame = document.querySelector<HTMLElement>(".inventory_item_img");
+      if (!image || !frame || !image.naturalHeight) return Infinity;
+      const box = image.getBoundingClientRect();
+      const height = frame.getBoundingClientRect().height;
+      return Math.abs(box.height - height)
+        + Math.abs(box.width - height * image.naturalWidth / image.naturalHeight);
+    })).toBeLessThan(2);
 
     await page.locator(".product_sort_container").selectOption("lohi");
     const products = page.locator(".inventory_item");

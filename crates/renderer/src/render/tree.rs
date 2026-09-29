@@ -48,6 +48,8 @@ pub(crate) struct BoxNode {
     pub(crate) node: Option<NodeId>,
     /// Computed style (for text boxes, the parent element's style).
     pub(crate) style: Style,
+    /// Natural inline size of replaced content, if it has one.
+    pub(crate) natural_width: Option<f32>,
     /// Children in tree order.
     pub(crate) children: Vec<BoxNode>,
 }
@@ -74,6 +76,7 @@ pub(crate) fn build(
         kind: BoxKind::Block,
         node: None,
         style: root_style.clone(),
+        natural_width: None,
         children: wrap_anonymous(children, &root_style),
     }
 }
@@ -134,6 +137,7 @@ fn build_children(
                             kind: BoxKind::Text(value),
                             node: None,
                             style: style.clone(),
+                            natural_width: None,
                             children: Vec::new(),
                         }]
                     }
@@ -145,6 +149,9 @@ fn build_children(
                     kind,
                     node: Some(child),
                     style,
+                    natural_width: images
+                        .get(&child)
+                        .map(|image| crate::render::pixels(image.width)),
                     children,
                 });
             }
@@ -156,6 +163,7 @@ fn build_children(
                     kind: BoxKind::Text(data.clone()),
                     node: None,
                     style: parent_style.clone(),
+                    natural_width: None,
                     children: Vec::new(),
                 });
             }
@@ -309,6 +317,7 @@ fn push_anonymous(out: &mut Vec<BoxNode>, style: &Style, pending: &mut Vec<BoxNo
             kind: BoxKind::Block,
             node: None,
             style: style.clone(),
+            natural_width: None,
             children: std::mem::take(pending),
         });
     } else {
