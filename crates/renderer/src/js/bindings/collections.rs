@@ -1,9 +1,13 @@
 //! Live node collections (`NodeList`, `HTMLCollection`).
 
-use super::{INSTALL_COLLECTIONS_JS, collection_ids, host_node_id, live_collection, world, wrap_node};
+use super::{
+    INSTALL_COLLECTIONS_JS, WebIdlUnsignedLong, collection_ids, host_node_id, live_collection,
+    world, wrap_node,
+};
 
 use rquickjs::{
-    Array, Class, Ctx, Exception, Function, Object, Persistent, Result, Value, class::Trace,
+    Atom, Class, Ctx, Exception, Function, Object, Persistent, Result, Value,
+    class::{ExoticDefineResult, ExoticSetResult, PropertyDescriptor, PropertyName, Trace},
     prelude::Func,
 };
 
@@ -26,14 +30,114 @@ pub(crate) enum CollectionKind {
 }
 
 #[derive(Trace, rquickjs::JsLifetime)]
-#[rquickjs::class(rename = "NodeList")]
-pub(crate) struct JsCollection {
+pub(crate) struct CollectionQuery {
     pub(crate) scope: Handle,
     pub(crate) kind: CollectionKind,
 }
 
+impl CollectionQuery {
+    fn ids(&self, ctx: &Ctx<'_>) -> Result<Vec<dom::NodeId>> {
+        collection_ids(ctx, self.scope.0, &self.kind)
+    }
+
+    fn item<'js>(&self, ctx: &Ctx<'js>, index: usize) -> Result<Value<'js>> {
+        match self.ids(ctx)?.get(index).copied() {
+            Some(id) => wrap_node(ctx, id),
+            None => Ok(Value::new_null(ctx.clone())),
+        }
+    }
+}
+
+// https://webidl.spec.whatwg.org/#is-an-array-index
+pub(super) fn array_index(name: &str) -> Option<u32> {
+    let index = name
+        .parse::<u32>()
+        .ok()
+        .filter(|index| *index != u32::MAX)?;
+    (index.to_string() == name).then_some(index)
+}
+
+/// The property key as a string, or `None` for symbols.
+/// Symbols (including `Symbol.iterator` and `Symbol("0")`) are never
+/// supported indexed or named properties, so every exotic hook falls through
+/// to the ordinary path instead of treating a symbol description as a name.
+/// Re-interning distinguishes string atoms from symbol atoms that share a
+/// description; numeric atoms are checked via both string and `u32` forms.
+pub(super) fn atom_name<'js>(ctx: &Ctx<'js>, atom: &Atom<'js>) -> Option<String> {
+    let name = atom.to_string().ok()?;
+    if let Ok(string_atom) = Atom::from_str(ctx.clone(), &name)
+        && string_atom == *atom
+    {
+        return Some(name);
+    }
+    if let Some(index) = array_index(&name)
+        && let Ok(number_atom) = Atom::from_u32(ctx.clone(), index)
+        && number_atom == *atom
+    {
+        return Some(name);
+    }
+    None
+}
+
+fn indexed_descriptor<'js>(
+    ctx: &Ctx<'js>,
+    query: &CollectionQuery,
+    name: &str,
+    writable: bool,
+) -> Result<Option<PropertyDescriptor<'js>>> {
+    let Some(index) = array_index(name) else {
+        return Ok(None);
+    };
+    let Some(id) = query.ids(ctx)?.get(index as usize).copied() else {
+        return Ok(None);
+    };
+    Ok(Some(PropertyDescriptor::new_value(
+        wrap_node(ctx, id)?,
+        true,
+        true,
+        writable,
+    )))
+}
+
+fn indexed_names<'js>(ctx: &Ctx<'js>, len: usize) -> Result<Vec<PropertyName<'js>>> {
+    (0..len)
+        .map(|index| {
+            Ok(PropertyName {
+                atom: Atom::from_u32(
+                    ctx.clone(),
+                    u32::try_from(index)
+                        .map_err(|_| Exception::throw_range(ctx, "collection index too large"))?,
+                )?,
+                is_enumerable: true,
+            })
+        })
+        .collect()
+}
+
+pub(super) fn reject_indexed_write<'js>(
+    name: &str,
+    object: &Value<'js>,
+    receiver: &Value<'js>,
+) -> ExoticSetResult {
+    // https://webidl.spec.whatwg.org/#legacy-platform-object-set: any array
+    // index is rejected (even past the end) so `coll[999] = 1` does not create
+    // an expando; `HTMLCollection-supported-property-indices.html` requires it.
+    if object == receiver && array_index(name).is_some() {
+        ExoticSetResult::Handled(false)
+    } else {
+        ExoticSetResult::Fallthrough
+    }
+}
+
+#[derive(Trace, rquickjs::JsLifetime)]
+#[rquickjs::class(rename = "NodeList", exotic)]
+pub(crate) struct JsNodeList {
+    pub(crate) query: CollectionQuery,
+}
+
 #[rquickjs::methods]
-impl JsCollection {
+#[expect(clippy::needless_pass_by_value, reason = "rquickjs method ABI passes Ctx by value")]
+impl JsNodeList {
     #[qjs(constructor)]
     fn ctor(ctx: Ctx<'_>) -> Result<Self> {
         let error = Exception::throw_type(&ctx, "Illegal constructor");
@@ -43,19 +147,312 @@ impl JsCollection {
 
     #[qjs(get)]
     fn length(&self, ctx: Ctx<'_>) -> Result<usize> {
-        let result = collection_ids(&ctx, self.scope.0, &self.kind).map(|ids| ids.len());
+        let result = self.query.ids(&ctx).map(|ids| ids.len());
         drop(ctx);
         result
     }
 
-    fn item<'js>(&self, ctx: Ctx<'js>, index: usize) -> Result<Value<'js>> {
-        match collection_ids(&ctx, self.scope.0, &self.kind)?
-            .get(index)
-            .copied()
-        {
-            Some(id) => wrap_node(&ctx, id),
-            None => Ok(Value::new_null(ctx)),
+    fn item<'js>(&self, ctx: Ctx<'js>, index: WebIdlUnsignedLong) -> Result<Value<'js>> {
+        self.query.item(&ctx, index.0 as usize)
+    }
+}
+
+#[rquickjs::exotic]
+#[expect(clippy::needless_pass_by_value, reason = "rquickjs exotic callback ABI requires owned atoms and values")]
+impl JsNodeList {
+    #[qjs(define_own_property)]
+    #[expect(clippy::unused_self, clippy::unnecessary_wraps, reason = "rquickjs exotic ABI requires self and Result")]
+    fn define<'js>(
+        &self,
+        ctx: &Ctx<'js>,
+        atom: Atom<'js>,
+        _value: Value<'_>,
+        _is_data: bool,
+    ) -> Result<ExoticDefineResult> {
+        // https://webidl.spec.whatwg.org/#legacy-platform-object-defineownproperty:
+        // any array index is rejected, even past the end (no indexed expando).
+        let Some(name) = atom_name(ctx, &atom) else {
+            return Ok(ExoticDefineResult::Fallthrough);
+        };
+        Ok(if array_index(&name).is_some() {
+            ExoticDefineResult::Handled(false)
+        } else {
+            ExoticDefineResult::Fallthrough
+        })
+    }
+
+    #[qjs(get_own_property)]
+    fn own_property<'js>(
+        &self,
+        ctx: &Ctx<'js>,
+        atom: Atom<'js>,
+    ) -> Result<Option<PropertyDescriptor<'js>>> {
+        // https://webidl.spec.whatwg.org/#legacy-platform-object-getownproperty
+        let Some(name) = atom_name(ctx, &atom) else {
+            return Ok(None);
+        };
+        indexed_descriptor(ctx, &self.query, &name, false)
+    }
+
+    #[qjs(get_own_property_names)]
+    fn own_names<'js>(&self, ctx: &Ctx<'js>) -> Result<Vec<PropertyName<'js>>> {
+        indexed_names(ctx, self.query.ids(ctx)?.len())
+    }
+
+    #[qjs(set)]
+    #[expect(clippy::unused_self, clippy::unnecessary_wraps, reason = "rquickjs exotic ABI requires self and Result")]
+    fn set<'js>(
+        &self,
+        ctx: &Ctx<'js>,
+        atom: Atom<'js>,
+        object: Value<'js>,
+        receiver: Value<'js>,
+        _value: Value<'js>,
+    ) -> Result<ExoticSetResult> {
+        // https://webidl.spec.whatwg.org/#legacy-platform-object-set
+        let Some(name) = atom_name(ctx, &atom) else {
+            return Ok(ExoticSetResult::Fallthrough);
+        };
+        Ok(reject_indexed_write(&name, &object, &receiver))
+    }
+
+    #[qjs(delete)]
+    fn delete<'js>(&self, ctx: &Ctx<'js>, atom: Atom<'js>) -> Result<bool> {
+        // https://webidl.spec.whatwg.org/#legacy-platform-object-delete
+        let Some(name) = atom_name(ctx, &atom) else {
+            return Ok(true);
+        };
+        let Some(index) = array_index(&name) else {
+            return Ok(true);
+        };
+        Ok(index as usize >= self.query.ids(ctx)?.len())
+    }
+}
+
+#[derive(Trace, rquickjs::JsLifetime)]
+#[rquickjs::class(rename = "HTMLCollection", exotic)]
+pub(crate) struct JsHtmlCollection {
+    pub(crate) query: CollectionQuery,
+}
+
+#[rquickjs::methods]
+#[expect(clippy::needless_pass_by_value, reason = "rquickjs constructor ABI passes Ctx by value")]
+impl JsHtmlCollection {
+    #[qjs(constructor)]
+    fn ctor(ctx: Ctx<'_>) -> Result<Self> {
+        Err(Exception::throw_type(&ctx, "Illegal constructor"))
+    }
+
+    // https://dom.spec.whatwg.org/#dom-htmlcollection-length
+    #[qjs(get)]
+    fn length(&self, ctx: Ctx<'_>) -> Result<usize> {
+        let result = self.query.ids(&ctx).map(|ids| ids.len());
+        drop(ctx);
+        result
+    }
+
+    // https://dom.spec.whatwg.org/#dom-htmlcollection-item
+    #[qjs(rename = "item")]
+    fn item<'js>(&self, ctx: Ctx<'js>, index: WebIdlUnsignedLong) -> Result<Value<'js>> {
+        self.query.item(&ctx, index.0 as usize)
+    }
+}
+
+#[rquickjs::exotic]
+#[expect(clippy::needless_pass_by_value, reason = "rquickjs exotic callback ABI requires owned atoms and values")]
+impl JsHtmlCollection {
+    #[qjs(define_own_property)]
+    fn define<'js>(&self, ctx: &Ctx<'js>, atom: Atom<'js>, _value: Value<'js>, _is_data: bool) -> Result<ExoticDefineResult> {
+        // https://webidl.spec.whatwg.org/#legacy-platform-object-defineownproperty:
+        // any array index is rejected, even past the end.
+        let Some(name) = atom_name(ctx, &atom) else {
+            return Ok(ExoticDefineResult::Fallthrough);
+        };
+        if array_index(&name).is_some() {
+            return Ok(ExoticDefineResult::Handled(false));
         }
+        // Without the holder the prototype-visibility check is approximated by
+        // the interface members that always shadow named properties; the full
+        // holder-aware check lives in `own_property`/`own_names`/`delete`.
+        // `define` gains the holder param once the fork forwards it.
+        let ids = self.query.ids(ctx)?;
+        if named_keys(ctx, &ids)?.contains(&name)
+            && !matches!(name.as_str(), "length" | "item" | "namedItem" | "constructor")
+        {
+            return Ok(ExoticDefineResult::Handled(false));
+        }
+        Ok(ExoticDefineResult::Fallthrough)
+    }
+
+    #[qjs(get_own_property)]
+    fn own_property<'js>(
+        &self,
+        ctx: &Ctx<'js>,
+        atom: Atom<'js>,
+        object: Value<'js>,
+    ) -> Result<Option<PropertyDescriptor<'js>>> {
+        // https://webidl.spec.whatwg.org/#legacy-platform-object-getownproperty
+        let Some(name) = atom_name(ctx, &atom) else {
+            return Ok(None);
+        };
+        collection_descriptor(ctx, &self.query, &name, &object, false)
+    }
+
+    #[qjs(get_own_property_names)]
+    fn own_names<'js>(&self, ctx: &Ctx<'js>, object: Value<'js>) -> Result<Vec<PropertyName<'js>>> {
+        collection_names(ctx, &self.query, &object, false)
+    }
+
+    #[qjs(set)]
+    #[expect(clippy::unused_self, clippy::unnecessary_wraps, reason = "rquickjs exotic ABI requires self and Result")]
+    fn set<'js>(
+        &self,
+        ctx: &Ctx<'js>,
+        atom: Atom<'js>,
+        object: Value<'js>,
+        receiver: Value<'js>,
+        _value: Value<'js>,
+    ) -> Result<ExoticSetResult> {
+        // https://webidl.spec.whatwg.org/#legacy-platform-object-set
+        // Inherited named properties are ignored when the receiver differs.
+        let Some(name) = atom_name(ctx, &atom) else {
+            return Ok(ExoticSetResult::Fallthrough);
+        };
+        if object != receiver && array_index(&name).is_none() {
+            return Ok(ExoticSetResult::FallthroughSkippingOwnProperty);
+        }
+        Ok(reject_indexed_write(&name, &object, &receiver))
+    }
+
+    #[qjs(delete)]
+    fn delete<'js>(&self, ctx: &Ctx<'js>, atom: Atom<'js>, object: Value<'js>) -> Result<bool> {
+        // https://webidl.spec.whatwg.org/#legacy-platform-object-delete
+        let Some(name) = atom_name(ctx, &atom) else {
+            return Ok(true);
+        };
+        collection_delete(ctx, &self.query, &name, &object)
+    }
+}
+
+#[derive(Trace, rquickjs::JsLifetime)]
+#[rquickjs::class(rename = "HTMLOptionsCollection", exotic)]
+pub(crate) struct JsOptionsCollection {
+    pub(crate) query: CollectionQuery,
+}
+
+#[rquickjs::methods]
+#[expect(clippy::needless_pass_by_value, reason = "rquickjs constructor ABI passes Ctx by value")]
+impl JsOptionsCollection {
+    #[qjs(constructor)]
+    fn ctor(ctx: Ctx<'_>) -> Result<Self> {
+        Err(Exception::throw_type(&ctx, "Illegal constructor"))
+    }
+
+    // No native `length`: the install script defines a custom accessor with a
+    // truncating/expanding setter, which would conflict with a non-configurable
+    // native own property. `item` stays native.
+    #[qjs(rename = "item")]
+    fn item<'js>(&self, ctx: Ctx<'js>, index: WebIdlUnsignedLong) -> Result<Value<'js>> {
+        self.query.item(&ctx, index.0 as usize)
+    }
+}
+
+fn option_setter<'js>(ctx: &Ctx<'js>) -> Result<Function<'js>> {
+    let world = world(ctx)?;
+    let setter = world.borrow().option_setter.clone();
+    match setter {
+        Some(setter) => setter.restore(ctx),
+        None => Err(Exception::throw_type(ctx, "options setter not installed")),
+    }
+}
+
+#[rquickjs::exotic]
+#[expect(clippy::needless_pass_by_value, reason = "rquickjs exotic callback ABI passes owned arguments")]
+impl JsOptionsCollection {
+    #[qjs(define_own_property)]
+    fn define<'js>(
+        &self,
+        ctx: &Ctx<'js>,
+        atom: Atom<'js>,
+        value: Value<'js>,
+        is_data: bool,
+    ) -> Result<ExoticDefineResult> {
+        // https://webidl.spec.whatwg.org/#legacy-platform-object-defineownproperty
+        let Some(name) = atom_name(ctx, &atom) else {
+            return Ok(ExoticDefineResult::Fallthrough);
+        };
+        if let Some(index) = array_index(&name) {
+            if !is_data {
+                return Ok(ExoticDefineResult::Handled(false));
+            }
+            let select = wrap_node(ctx, self.query.scope.0)?;
+            option_setter(ctx)?.call::<_, ()>((select, index, value))?;
+            return Ok(ExoticDefineResult::Handled(true));
+        }
+        // `[LegacyOverrideBuiltIns]`: named properties override built-ins, so
+        // no prototype-visibility check here.
+        // (<https://html.spec.whatwg.org/multipage/common-dom-interfaces.html#htmloptionscollection>)
+        Ok(if named_keys(ctx, &self.query.ids(ctx)?)?.contains(&name) {
+            ExoticDefineResult::Handled(false)
+        } else {
+            ExoticDefineResult::Fallthrough
+        })
+    }
+
+    #[qjs(get_own_property)]
+    fn own_property<'js>(
+        &self,
+        ctx: &Ctx<'js>,
+        atom: Atom<'js>,
+        object: Value<'js>,
+    ) -> Result<Option<PropertyDescriptor<'js>>> {
+        // https://webidl.spec.whatwg.org/#legacy-platform-object-getownproperty
+        let Some(name) = atom_name(ctx, &atom) else {
+            return Ok(None);
+        };
+        collection_descriptor(ctx, &self.query, &name, &object, true)
+    }
+
+    #[qjs(get_own_property_names)]
+    fn own_names<'js>(&self, ctx: &Ctx<'js>, object: Value<'js>) -> Result<Vec<PropertyName<'js>>> {
+        collection_names(ctx, &self.query, &object, true)
+    }
+
+    #[qjs(set)]
+    fn set<'js>(
+        &self,
+        ctx: &Ctx<'js>,
+        atom: Atom<'js>,
+        object: Value<'js>,
+        receiver: Value<'js>,
+        value: Value<'js>,
+    ) -> Result<ExoticSetResult> {
+        // https://webidl.spec.whatwg.org/#legacy-platform-object-set
+        let Some(name) = atom_name(ctx, &atom) else {
+            return Ok(ExoticSetResult::Fallthrough);
+        };
+        if object != receiver {
+            return Ok(if array_index(&name).is_some() {
+                ExoticSetResult::Fallthrough
+            } else {
+                ExoticSetResult::FallthroughSkippingOwnProperty
+            });
+        }
+        let Some(index) = array_index(&name) else {
+            return Ok(ExoticSetResult::Fallthrough);
+        };
+        let select = wrap_node(ctx, self.query.scope.0)?;
+        option_setter(ctx)?.call::<_, ()>((select, index, value))?;
+        Ok(ExoticSetResult::Handled(true))
+    }
+
+    #[qjs(delete)]
+    fn delete<'js>(&self, ctx: &Ctx<'js>, atom: Atom<'js>, object: Value<'js>) -> Result<bool> {
+        // https://webidl.spec.whatwg.org/#legacy-platform-object-delete
+        let Some(name) = atom_name(ctx, &atom) else {
+            return Ok(true);
+        };
+        collection_delete(ctx, &self.query, &name, &object)
     }
 }
 
@@ -71,19 +468,13 @@ pub(crate) fn install_collection_brand(ctx: &Ctx<'_>) -> Result<()> {
     ctx.globals()
         .set("__tbCollectionNamed", Func::from(collection_named))?;
     ctx.globals()
-        .set("__tbCollectionKeys", Func::from(collection_keys))?;
+        .set("__tbCollectionLength", Func::from(collection_length))?;
     ctx.eval::<(), _>(INSTALL_COLLECTIONS_JS)?;
-    let ctor: Function = ctx.globals().get("HTMLCollection")?;
-    let proto: Object = ctor.get("prototype")?;
-    let options_ctor: Function = ctx.globals().get("HTMLOptionsCollection")?;
-    let options_proto: Object = options_ctor.get("prototype")?;
-    let world = world(ctx)?;
-    let mut world = world.borrow_mut();
-    world.intern_brand("HTMLCollection", Persistent::save(ctx, proto));
-    world.intern_brand(
-        "HTMLOptionsCollection",
-        Persistent::save(ctx, options_proto),
-    );
+    // Capture the options indexed-write entry point, then remove it from the
+    // page-visible global so `__tbSetOption` is not fingerprintable.
+    let setter: Function = ctx.globals().get("__tbSetOption")?;
+    world(ctx)?.borrow_mut().option_setter = Some(Persistent::save(ctx, setter));
+    ctx.globals().remove("__tbSetOption")?;
     Ok(())
 }
 
@@ -174,56 +565,83 @@ fn collection_named<'js>(ctx: Ctx<'js>, target: Value<'js>, name: String) -> Res
     if name.is_empty() {
         return Ok(Value::new_null(ctx));
     }
-    let Ok(collection) = Class::<JsCollection>::from_value(&target) else {
-        return Ok(Value::new_null(ctx));
-    };
-    let ids = {
-        let collection = collection.borrow();
-        collection_ids(&ctx, collection.scope.0, &collection.kind)?
-    };
-    for id in ids {
-        let matches = {
-            let world = world(&ctx)?;
-            let world = world.borrow();
-            let Some(parsed) = world.document(id) else {
-                return Ok(Value::new_null(ctx));
-            };
-            let id_matches =
-                parsed.document.no_namespace_attribute(id, "id").as_deref() == Some(name.as_str());
-            let name_matches = matches!(
-                parsed.document.kind(id),
-                Some(NodeKind::Element { name: qual, .. }) if qual.ns == html_namespace()
-            ) && parsed.document.no_namespace_attribute(id, "name").as_deref() == Some(name.as_str());
-            id_matches || name_matches
-        };
-        if matches {
-            return wrap_node(&ctx, id);
-        }
-    }
-    Ok(Value::new_null(ctx))
+    with_query(&target, |query| named_item(&ctx, query, &name))
+        .unwrap_or_else(|| Err(Exception::throw_type(&ctx, "Illegal invocation")))
 }
 
-#[expect(
-    clippy::needless_pass_by_value,
-    reason = "rquickjs Func ABI passes arguments by value"
-)]
-/// The named keys of an `HTMLCollection`, in tree order with later duplicates
-/// ignored (<https://dom.spec.whatwg.org/#interface-htmlcollection>).
-fn collection_keys<'js>(ctx: Ctx<'js>, target: Value<'js>) -> Result<Array<'js>> {
-    let array = Array::new(ctx.clone())?;
-    let Ok(collection) = Class::<JsCollection>::from_value(&target) else {
-        return Ok(array);
-    };
-    let ids = {
-        let collection = collection.borrow();
-        collection_ids(&ctx, collection.scope.0, &collection.kind)?
-    };
+fn with_query<T>(
+    target: &Value<'_>,
+    f: impl FnOnce(&CollectionQuery) -> Result<T>,
+) -> Option<Result<T>> {
+    if let Ok(collection) = Class::<JsNodeList>::from_value(target) {
+        return Some(f(&collection.borrow().query));
+    }
+    if let Ok(collection) = Class::<JsHtmlCollection>::from_value(target) {
+        return Some(f(&collection.borrow().query));
+    }
+    if let Ok(collection) = Class::<JsOptionsCollection>::from_value(target) {
+        return Some(f(&collection.borrow().query));
+    }
+    None
+}
+
+#[expect(clippy::needless_pass_by_value, reason = "rquickjs Func ABI passes arguments by value")]
+fn collection_length(ctx: Ctx<'_>, target: Value<'_>) -> Result<usize> {
+    with_query(&target, |query| {
+        query.ids(target.ctx()).map(|ids| ids.len())
+    })
+    .unwrap_or_else(|| Err(Exception::throw_type(&ctx, "Illegal invocation")))
+}
+
+fn named_item<'js>(ctx: &Ctx<'js>, query: &CollectionQuery, name: &str) -> Result<Value<'js>> {
+    // https://dom.spec.whatwg.org/#dom-htmlcollection-nameditem: id has global
+    // precedence over name, so two passes in tree order.
+    let ids = query.ids(ctx)?;
+    for id in &ids {
+        let matches = {
+            let world = world(ctx)?;
+            let world = world.borrow();
+            let Some(parsed) = world.document(*id) else {
+                continue;
+            };
+            parsed.document.no_namespace_attribute(*id, "id").as_deref() == Some(name)
+        };
+        if matches {
+            return wrap_node(ctx, *id);
+        }
+    }
+    for id in &ids {
+        let matches = {
+            let world = world(ctx)?;
+            let world = world.borrow();
+            let Some(parsed) = world.document(*id) else {
+                continue;
+            };
+            matches!(
+                parsed.document.kind(*id),
+                Some(NodeKind::Element { name: qual, .. }) if qual.ns == html_namespace()
+            ) && parsed
+                .document
+                .no_namespace_attribute(*id, "name")
+                .as_deref()
+                == Some(name)
+        };
+        if matches {
+            return wrap_node(ctx, *id);
+        }
+    }
+    Ok(Value::new_null(ctx.clone()))
+}
+
+/// The supported named properties of an `HTMLCollection`, in tree order.
+/// <https://dom.spec.whatwg.org/#interface-htmlcollection>
+fn named_keys(ctx: &Ctx<'_>, ids: &[dom::NodeId]) -> Result<Vec<String>> {
     let mut keys: Vec<String> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
     {
-        let world = world(&ctx)?;
+        let world = world(ctx)?;
         let world = world.borrow();
-        for &id in &ids {
+        for &id in ids {
             let Some(parsed) = world.document(id) else {
                 continue;
             };
@@ -246,8 +664,84 @@ fn collection_keys<'js>(ctx: Ctx<'js>, target: Value<'js>) -> Result<Array<'js>>
             }
         }
     }
-    for (index, key) in keys.iter().enumerate() {
-        array.set(index, key.as_str())?;
+    Ok(keys)
+}
+
+// https://webidl.spec.whatwg.org/#dfn-named-property-visibility
+fn named_key_visible(object: &Value<'_>, name: &str) -> Result<bool> {
+    let mut prototype = object.as_object().and_then(Object::get_prototype);
+    while let Some(current) = prototype {
+        if current.contains_own_key(name)? {
+            return Ok(false);
+        }
+        prototype = current.get_prototype();
     }
-    Ok(array)
+    Ok(true)
+}
+
+fn collection_descriptor<'js>(
+    ctx: &Ctx<'js>,
+    query: &CollectionQuery,
+    name: &str,
+    object: &Value<'js>,
+    is_options: bool,
+) -> Result<Option<PropertyDescriptor<'js>>> {
+    if let Some(descriptor) = indexed_descriptor(ctx, query, name, is_options)? {
+        return Ok(Some(descriptor));
+    }
+    if array_index(name).is_some()
+        || !named_keys(ctx, &query.ids(ctx)?)?.iter().any(|key| key == name)
+        // `HTMLOptionsCollection` is `[LegacyOverrideBuiltIns]`: named
+        // properties override built-ins, so no visibility check.
+        // (<https://html.spec.whatwg.org/multipage/common-dom-interfaces.html#htmloptionscollection>)
+        // `HTMLCollection` keeps `[LegacyUnenumerableNamedProperties]` hiding.
+        || (!is_options && !named_key_visible(object, name)?)
+    {
+        return Ok(None);
+    }
+    let value = named_item(ctx, query, name)?;
+    Ok(Some(PropertyDescriptor::new_value(
+        value, true, is_options, false,
+    )))
+}
+
+fn collection_names<'js>(
+    ctx: &Ctx<'js>,
+    query: &CollectionQuery,
+    object: &Value<'js>,
+    is_options: bool,
+) -> Result<Vec<PropertyName<'js>>> {
+    let ids = query.ids(ctx)?;
+    let mut names = indexed_names(ctx, ids.len())?;
+    for name in named_keys(ctx, &ids)? {
+        if array_index(&name).is_none() && (is_options || named_key_visible(object, &name)?) {
+            names.push(PropertyName {
+                atom: Atom::from_str(ctx.clone(), &name)?,
+                is_enumerable: is_options,
+            });
+        }
+    }
+    Ok(names)
+}
+
+fn collection_delete(
+    ctx: &Ctx<'_>,
+    query: &CollectionQuery,
+    name: &str,
+    object: &Value<'_>,
+) -> Result<bool> {
+    if let Some(index) = array_index(name) {
+        return Ok(index as usize >= query.ids(ctx)?.len());
+    }
+    // Options named properties override built-ins, so visibility only gates
+    // plain `HTMLCollection`.
+    let visible = query_ids_are_options(query) || named_key_visible(object, name).unwrap_or(true);
+    Ok(!named_keys(ctx, &query.ids(ctx)?)?.iter().any(|key| key == name) || !visible)
+}
+
+fn query_ids_are_options(query: &CollectionQuery) -> bool {
+    matches!(
+        query.kind,
+        CollectionKind::SelectOptions | CollectionKind::SelectedOptions
+    )
 }

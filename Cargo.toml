@@ -29,6 +29,12 @@ server = { path = "crates/server" }
 webdriver = { path = "crates/webdriver" }
 webstorage = { path = "crates/webstorage" }
 
+[patch.crates-io]
+rquickjs = { git = "https://github.com/ericc-ch/rquickjs.git", rev = "c161d2586e58ecffb00c2c1ef9169ee6bfec90b8" }
+rquickjs-core = { git = "https://github.com/ericc-ch/rquickjs.git", rev = "c161d2586e58ecffb00c2c1ef9169ee6bfec90b8" }
+rquickjs-macro = { git = "https://github.com/ericc-ch/rquickjs.git", rev = "c161d2586e58ecffb00c2c1ef9169ee6bfec90b8" }
+rquickjs-sys = { git = "https://github.com/ericc-ch/rquickjs.git", rev = "c161d2586e58ecffb00c2c1ef9169ee6bfec90b8" }
+
 [package]
 name = "tinybrowser"
 version = "0.1.0"

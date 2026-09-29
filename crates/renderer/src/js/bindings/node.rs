@@ -2905,10 +2905,7 @@ impl JsNode {
                 element: self.handle,
             },
         )?;
-        let raw = Class::into_value(class);
-        // Indexed access (`classList[0]`) goes through the shared proxy.
-        let proxy: Function = ctx.globals().get("__tb_liveCollection")?;
-        let value: Value = proxy.call((raw,))?;
+        let value = Class::into_value(class);
         let weak = make_weak(&ctx, value.clone())?;
         world_rc.borrow_mut().intern_wrapper(
             self.handle.0,

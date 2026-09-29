@@ -2,16 +2,19 @@
   const isOptionNode = globalThis.__tbIsOptionNode;
   const appendBlankOptions = globalThis.__tbAppendBlankOptions;
   const collectionNamed = globalThis.__tbCollectionNamed;
-  const collectionKeys = globalThis.__tbCollectionKeys;
+  const collectionLength = globalThis.__tbCollectionLength;
   const windowNamedValue = globalThis.__tbWindowNamedValue;
   const windowNamedHas = globalThis.__tbWindowNamedHas;
   delete globalThis.__tbIsOptionNode;
   delete globalThis.__tbAppendBlankOptions;
   delete globalThis.__tbCollectionNamed;
-  delete globalThis.__tbCollectionKeys;
+  delete globalThis.__tbCollectionLength;
   delete globalThis.__tbWindowNamedValue;
   delete globalThis.__tbWindowNamedHas;
-  const canonicalIndex = /^(0|[1-9][0-9]*)$/;
+  const toUnsignedLong = value => {
+    const number = +value;
+    return Number.isFinite(number) ? ((Math.trunc(number) % 4294967296) + 4294967296) % 4294967296 : 0;
+  };
   const native = globalThis.NodeList.prototype;
   function values() {
     let index = 0;
@@ -42,25 +45,19 @@
   for (const [collectionName, collectionProto] of [
     ['NodeList', native],
     ['NamedNodeMap', globalThis.NamedNodeMap.prototype],
+    ['DOMTokenList', globalThis.DOMTokenList.prototype],
   ]) {
     Object.defineProperty(collectionProto, Symbol.toStringTag, {
       value: collectionName, writable: false, enumerable: false, configurable: true,
     });
   }
-  const ctor = function() { throw new TypeError('Illegal constructor'); };
-  Object.defineProperty(ctor, 'name', { value: 'HTMLCollection', configurable: true });
-  const proto = Object.create(Object.prototype);
-  for (const member of ['length', 'item']) {
-    const descriptor = Object.getOwnPropertyDescriptor(native, member);
-    if (descriptor) Object.defineProperty(proto, member, descriptor);
-  }
-  Object.defineProperty(proto, 'constructor', { value: ctor, writable: true, configurable: true });
+  const ctor = globalThis.HTMLCollection;
+  const proto = ctor.prototype;
   Object.defineProperty(proto, Symbol.iterator, {
     value: values,
     writable: true,
     configurable: true,
   });
-  Object.defineProperty(ctor, 'prototype', { value: proto, writable: false });
   Object.defineProperty(proto, Symbol.toStringTag, {
     value: 'HTMLCollection', writable: false, enumerable: false, configurable: true,
   });
@@ -68,23 +65,14 @@
     value: function(name) { return collectionNamed(this, String(name)); },
     writable: true, enumerable: true, configurable: true,
   });
-  Object.defineProperty(globalThis, 'HTMLCollection', { value: ctor, writable: true, configurable: true });
   // <https://html.spec.whatwg.org/multipage/common-dom-interfaces.html#htmloptionscollection>
-  const optionsCtor = function() { throw new TypeError('Illegal constructor'); };
-  Object.defineProperty(optionsCtor, 'name', { value: 'HTMLOptionsCollection', configurable: true });
-  const optionsProto = Object.create(proto);
-  Object.defineProperty(optionsProto, 'constructor', {
-    value: optionsCtor, writable: true, configurable: true,
-  });
-  Object.defineProperty(optionsCtor, 'prototype', { value: optionsProto, writable: false });
+  const optionsCtor = globalThis.HTMLOptionsCollection;
+  const optionsProto = optionsCtor.prototype;
+  Object.setPrototypeOf(optionsProto, proto);
   Object.setPrototypeOf(optionsCtor, ctor);
   Object.defineProperty(optionsProto, Symbol.toStringTag, {
     value: 'HTMLOptionsCollection', configurable: true,
   });
-  Object.defineProperty(globalThis, 'HTMLOptionsCollection', {
-    value: optionsCtor, writable: true, configurable: true,
-  });
-  const collectionTargets = new WeakMap();
   const optionOwners = new WeakMap();
   for (const name of ['options', 'selectedOptions']) {
     const nativeGetter = Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, name).get;
@@ -95,17 +83,13 @@
         if (collection === undefined) {
           collection = nativeGetter.call(this);
           cache.set(this, collection);
-          if (name === 'options') optionOwners.set(collectionTargets.get(collection), this);
+          if (name === 'options') optionOwners.set(collection, this);
         }
         return collection;
       },
       enumerable: true, configurable: true,
     });
   }
-  const toUnsignedLong = value => {
-    const number = +value;
-    return Number.isFinite(number) ? ((Math.trunc(number) % 4294967296) + 4294967296) % 4294967296 : 0;
-  };
   const setOption = (select, index, option) => {
     if (option === null || option === undefined) {
       select.remove(index);
@@ -126,10 +110,14 @@
       select.add(option);
     }
   };
-  const baseLength = Object.getOwnPropertyDescriptor(proto, 'length').get;
+  // Captured by Rust at install, then deleted from the global by Rust so page
+  // script cannot call it directly. Configurable so the install can remove it.
+  Object.defineProperty(globalThis, '__tbSetOption', {
+    value: setOption, configurable: true, writable: false,
+  });
   Object.defineProperties(optionsProto, {
     length: {
-      get: function() { return baseLength.call(this); },
+      get: function() { return collectionLength(this); },
       set: function(value) {
         const select = optionOwners.get(this);
         const length = toUnsignedLong(value);
@@ -162,102 +150,6 @@
       },
       writable: true, enumerable: true, configurable: true,
     },
-  });
-  Object.defineProperty(globalThis, '__tb_liveCollection', {
-    enumerable: false,
-    configurable: false,
-    writable: false,
-    value: function(target) {
-      // Only platform methods need binding to the target; Object.prototype
-      // built-ins like hasOwnProperty must see the proxy as `this`.
-      function isPlatformMethod(inner, property) {
-        let proto = Object.getPrototypeOf(inner);
-        while (proto && proto !== Object.prototype) {
-          if (Object.prototype.hasOwnProperty.call(proto, property)) {
-            return true;
-          }
-          proto = Object.getPrototypeOf(proto);
-        }
-        return false;
-      }
-      const collection = new Proxy(target, {
-        get: function(inner, property) {
-          if (typeof property === 'string' && canonicalIndex.test(property)) {
-            const index = Number(property);
-            return index < inner.length ? inner.item(index) : undefined;
-          }
-          if (typeof property === 'string' && !Reflect.has(inner, property)
-              && typeof inner.namedItem === 'function') {
-            const named = inner.namedItem(property);
-            if (named !== null) return named;
-          }
-          const value = Reflect.get(inner, property, inner);
-          if (property !== 'constructor' && typeof value === 'function' && isPlatformMethod(inner, property)) {
-            return value.bind(inner);
-          }
-          return value;
-        },
-        has: function(inner, property) {
-          if (typeof property === 'string' && canonicalIndex.test(property)) {
-            return Number(property) < inner.length;
-          }
-          if (typeof property === 'string' && !Reflect.has(inner, property)
-              && typeof inner.namedItem === 'function' && inner.namedItem(property) !== null) return true;
-          return Reflect.has(inner, property);
-        },
-        ownKeys: function(inner) {
-          const keys = [];
-          for (let i = 0; i < inner.length; i++) {
-            keys.push(String(i));
-          }
-          const seen = new Set(keys);
-          for (const key of collectionKeys(inner)) {
-            if (!seen.has(key)) {
-              seen.add(key);
-              keys.push(key);
-            }
-          }
-          return keys;
-        },
-        getOwnPropertyDescriptor: function(inner, property) {
-          const options = Object.getPrototypeOf(inner) === optionsProto;
-          if (typeof property === 'string' && canonicalIndex.test(property)) {
-            const index = Number(property);
-            if (index < inner.length) {
-              return {
-                value: inner.item(index),
-                enumerable: true,
-                configurable: true,
-                writable: options,
-              };
-            }
-          }
-          if (typeof property === 'string' && !Reflect.has(inner, property)
-              && typeof inner.namedItem === 'function') {
-            const named = inner.namedItem(property);
-            if (named !== null) {
-              // HTMLCollection is `[LegacyUnenumerableNamedProperties]`;
-              // HTMLOptionsCollection is not, so its names are enumerable
-              // (<https://webidl.spec.whatwg.org/#LegacyUnenumerableNamedProperties>).
-              return { value: named, enumerable: options, configurable: true, writable: false };
-            }
-          }
-          return Reflect.getOwnPropertyDescriptor(inner, property);
-        },
-        set: function(inner, property, value) {
-          if (typeof property === 'string' && canonicalIndex.test(property)) {
-            const index = Number(property);
-            if (Object.getPrototypeOf(inner) === optionsProto && index < 4294967295) {
-              setOption(optionOwners.get(inner), index, value);
-            }
-            return true;
-          }
-          return Reflect.set(inner, property, value, inner);
-        }
-      });
-      collectionTargets.set(collection, target);
-      return collection;
-    }
   });
   // NamedNodeMap exposes both indexed and named properties, and its own
   // property names are the indices followed by the qualified names

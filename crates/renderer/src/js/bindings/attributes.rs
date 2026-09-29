@@ -13,7 +13,10 @@ use std::rc::Rc;
 
 use dom::{NodeId, qualified_name_eq};
 
-use rquickjs::{Class, Ctx, Exception, Function, Persistent, Result, Value, class::Trace};
+use rquickjs::{
+    Atom, Class, Ctx, Exception, Function, IntoJs, Persistent, Result, Value,
+    class::{ExoticDefineResult, ExoticSetResult, PropertyDescriptor, PropertyName, Trace},
+};
 
 use crate::js::events::report_exception;
 use crate::js::world::{AttrState, FrameNavigation, Handle, NavigationTarget, World, Wrapper};
@@ -21,7 +24,7 @@ use crate::js::world::{AttrState, FrameNavigation, Handle, NavigationTarget, Wor
 /// `DOMTokenList` for `Element.classList`
 /// (<https://dom.spec.whatwg.org/#interface-domtokenlist>).
 #[derive(Trace, rquickjs::JsLifetime)]
-#[rquickjs::class(rename = "DOMTokenList")]
+#[rquickjs::class(rename = "DOMTokenList", exotic)]
 pub struct JsTokenList {
     pub(crate) element: Handle,
 }
@@ -165,6 +168,90 @@ impl JsTokenList {
     #[qjs(rename = "toString")]
     fn to_string_js(&self, ctx: Ctx<'_>) -> Result<String> {
         self.value(ctx)
+    }
+}
+
+// https://webidl.spec.whatwg.org/#legacy-platform-object-getownproperty
+#[rquickjs::exotic]
+#[expect(clippy::needless_pass_by_value, reason = "rquickjs exotic callback ABI requires owned atoms and values")]
+impl JsTokenList {
+    #[qjs(define_own_property)]
+    #[expect(clippy::unused_self, clippy::unnecessary_wraps, reason = "rquickjs exotic ABI requires self and Result")]
+    fn define<'js>(&self, ctx: &Ctx<'js>, atom: Atom<'js>, _value: Value<'js>, _is_data: bool) -> Result<ExoticDefineResult> {
+        // https://webidl.spec.whatwg.org/#legacy-platform-object-defineownproperty:
+        // any array index is rejected, even past the end.
+        let Some(name) = super::atom_name(ctx, &atom) else {
+            return Ok(ExoticDefineResult::Fallthrough);
+        };
+        Ok(if super::array_index(&name).is_some() {
+            ExoticDefineResult::Handled(false)
+        } else {
+            ExoticDefineResult::Fallthrough
+        })
+    }
+
+    #[qjs(get_own_property)]
+    fn own_property<'js>(
+        &self,
+        ctx: &Ctx<'js>,
+        atom: Atom<'js>,
+    ) -> Result<Option<PropertyDescriptor<'js>>> {
+        let Some(name) = super::atom_name(ctx, &atom) else {
+            return Ok(None);
+        };
+        let Some(index) = super::array_index(&name) else {
+            return Ok(None);
+        };
+        Ok(class_tokens(ctx, self.element.0)?
+            .get(index as usize)
+            .map(|token| token.clone().into_js(ctx))
+            .transpose()?
+            .map(|value| PropertyDescriptor::new_value(value, true, true, false)))
+    }
+
+    #[qjs(get_own_property_names)]
+    fn own_names<'js>(&self, ctx: &Ctx<'js>) -> Result<Vec<PropertyName<'js>>> {
+        (0..class_tokens(ctx, self.element.0)?.len())
+            .map(|index| {
+                Ok(PropertyName {
+                    atom: Atom::from_u32(
+                        ctx.clone(),
+                        u32::try_from(index)
+                            .map_err(|_| Exception::throw_range(ctx, "token index too large"))?,
+                    )?,
+                    is_enumerable: true,
+                })
+            })
+            .collect()
+    }
+
+    #[qjs(set)]
+    #[expect(clippy::unused_self, clippy::unnecessary_wraps, reason = "rquickjs exotic ABI requires self and Result")]
+    fn set<'js>(
+        &self,
+        ctx: &Ctx<'js>,
+        atom: Atom<'js>,
+        object: Value<'js>,
+        receiver: Value<'js>,
+        _value: Value<'js>,
+    ) -> Result<ExoticSetResult> {
+        // https://dom.spec.whatwg.org/#interface-domtokenlist
+        let Some(name) = super::atom_name(ctx, &atom) else {
+            return Ok(ExoticSetResult::Fallthrough);
+        };
+        Ok(super::reject_indexed_write(&name, &object, &receiver))
+    }
+
+    #[qjs(delete)]
+    fn delete<'js>(&self, ctx: &Ctx<'js>, atom: Atom<'js>) -> Result<bool> {
+        // https://webidl.spec.whatwg.org/#legacy-platform-object-delete
+        let Some(name) = super::atom_name(ctx, &atom) else {
+            return Ok(true);
+        };
+        let Some(index) = super::array_index(&name) else {
+            return Ok(true);
+        };
+        Ok(index as usize >= class_tokens(ctx, self.element.0)?.len())
     }
 }
 

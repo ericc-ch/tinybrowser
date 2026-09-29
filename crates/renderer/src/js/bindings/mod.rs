@@ -403,7 +403,9 @@ pub(crate) fn install(ctx: &Ctx<'_>, world: &Rc<RefCell<World>>) -> Result<()> {
     Class::<JsEventTarget>::define(&globals)?;
     ctx.eval::<(), _>(events::INSTALL_EVENT_TARGET_CTOR_JS)?;
     Class::<JsNode>::define(&globals)?;
-    Class::<JsCollection>::define(&globals)?;
+    Class::<JsNodeList>::define(&globals)?;
+    Class::<JsHtmlCollection>::define(&globals)?;
+    Class::<JsOptionsCollection>::define(&globals)?;
     Class::<JsDomException>::define(&globals)?;
     inherit_error_prototype(&globals)?;
     ctx.eval::<(), _>(events::INSTALL_ABORT_JS)?;
@@ -947,15 +949,8 @@ fn install_brands(ctx: &Ctx<'_>) -> Result<()> {
     Ok(())
 }
 
-/// Collection and legacy index-property proxies for the browser realm.
+/// Collection prototypes and legacy named-property behavior for the browser realm.
 pub(super) const INSTALL_COLLECTIONS_JS: &str = include_str!("../scripts/collections.js");
-
-fn class_proto<'js>(ctx: &Ctx<'js>, name: &str) -> Result<Option<Object<'js>>> {
-    let Some(saved) = world(ctx)?.borrow().brand(name) else {
-        return Ok(None);
-    };
-    Ok(Some(saved.restore(ctx)?))
-}
 
 /// `DOMException` is an exception interface: its interface prototype object's
 /// `[[Prototype]]` is `%Error.prototype%`, so `String(exception)` is
@@ -1507,26 +1502,37 @@ pub(super) fn elements_by_tag<'js>(
     )
 }
 
+/// Builds a live collection wrapper. `brand` selects the interface:
+/// `None` means `NodeList`, `Some("HTMLCollection")` and
+/// `Some("HTMLOptionsCollection")` select those; anything else throws.
 pub(super) fn live_collection<'js>(
     ctx: &Ctx<'js>,
     scope: NodeId,
     kind: CollectionKind,
     brand: Option<&str>,
 ) -> Result<Value<'js>> {
-    let class = Class::instance(
-        ctx.clone(),
-        JsCollection {
-            scope: Handle(scope),
-            kind,
-        },
-    )?;
-    if let Some(brand) = brand
-        && let Some(proto) = class_proto(ctx, brand)?
-    {
-        class.set_prototype(Some(&proto))?;
+    let query = CollectionQuery {
+        scope: Handle(scope),
+        kind,
+    };
+    match brand {
+        None => Ok(Class::into_value(Class::instance(
+            ctx.clone(),
+            JsNodeList { query },
+        )?)),
+        Some("HTMLCollection") => Ok(Class::into_value(Class::instance(
+            ctx.clone(),
+            JsHtmlCollection { query },
+        )?)),
+        Some("HTMLOptionsCollection") => Ok(Class::into_value(Class::instance(
+            ctx.clone(),
+            JsOptionsCollection { query },
+        )?)),
+        Some(_) => Err(Exception::throw_type(
+            ctx,
+            "unsupported collection interface",
+        )),
     }
-    let proxy: Function = ctx.globals().get("__tb_liveCollection")?;
-    proxy.call((Class::into_value(class),))
 }
 
 pub(super) fn collection_ids(
