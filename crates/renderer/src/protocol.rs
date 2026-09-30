@@ -152,6 +152,14 @@ pub enum RendererEvent {
         /// The final URL after redirects.
         url: String,
     },
+    /// A history API update in the active document (no new JS realm).
+    HistoryUpdated {
+        url: String,
+        state: String,
+        replace: bool,
+    },
+    /// Request to traverse the tab's session history by `delta` entries.
+    HistoryTraversal { delta: i32 },
     /// A host timer whose delay elapsed.
     Timer(u32),
     /// A `fetch` or navigation job finished with this HTTP status.
@@ -197,6 +205,20 @@ pub struct Mount {
     /// Raw document bytes; the renderer decodes them.
     #[serde(skip, default)]
     pub body: Vec<u8>,
+    /// Session history visible in the newly mounted document.
+    #[serde(default)]
+    pub history: HistorySnapshot,
+}
+
+/// Browser-owned history state passed to a newly created document realm.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct HistorySnapshot {
+    /// Total session-history entry count.
+    pub length: usize,
+    /// Zero-based position of the active entry, including any forward branch.
+    pub index: usize,
+    /// Serialized classic history API state of the active entry.
+    pub state: Option<String>,
 }
 
 /// Why a browser-service dial failed. Preserved across the renderer seam.
@@ -282,6 +304,9 @@ pub struct DialRequest {
     /// `Content-Type` header for `body`, when there is one.
     #[serde(default)]
     pub content_type: Option<String>,
+    /// Author-supplied request headers, in insertion order.
+    #[serde(default)]
+    pub headers: Vec<(String, String)>,
 }
 
 fn default_dial_method() -> String {
@@ -299,6 +324,9 @@ pub struct DialOutcome {
     pub content_type: Option<String>,
     /// `Content-Language` header, when present and a single tag.
     pub content_language: Option<String>,
+    /// Response headers visible to page scripts, in wire order.
+    #[serde(default)]
+    pub headers: Vec<(String, String)>,
     /// Response body, when [`DialRequest::read_body`].
     pub body: Vec<u8>,
 }
@@ -306,14 +334,19 @@ pub struct DialOutcome {
 /// Completion for a dial submitted to the browser process.
 pub type DialCompletion = Box<dyn FnOnce(Result<DialOutcome, DialFailure>) + Send + 'static>;
 
+/// Cancels a submitted dial, including its redirect chain. Calling it still
+/// delivers exactly one completion; dropping it leaves the request running.
+pub type DialCancellation = Box<dyn FnOnce() + Send + 'static>;
+
 /// Network effects the page engine asks its host to perform.
 pub trait NetworkHost: Send + Sync + 'static {
-    /// Submits one GET without blocking the renderer thread. The completion
+    /// Submits one HTTP request without blocking the renderer thread and
+    /// returns a handle that cancels it. The completion
     /// receives [`DialFailure`] for transport, timeout, queue, body-limit, or
     /// cancellation failure.
     /// Implementations must invoke it exactly once, including when submission
     /// is rejected.
-    fn start_dial(&self, request: DialRequest, completion: DialCompletion);
+    fn start_dial(&self, request: DialRequest, completion: DialCompletion) -> DialCancellation;
 
     /// `document.cookie` getter for `url`.
     fn cookies_for(&self, url: &Url) -> String;

@@ -14,7 +14,7 @@ pub mod channel;
 
 use serde::{Deserialize, Serialize};
 
-use crate::exchange::Frame;
+use crate::exchange::{Frame, RequestId};
 use renderer::{
     DialFailure, DialOutcome, DialRequest, FrameId, RemoteValue, RendererEvent, StorageChange,
     StorageError, StorageKind, TabError,
@@ -61,6 +61,11 @@ pub enum Command {
     WindowMessage {
         /// `__tbEncode` payload from the posting window.
         payload: String,
+    },
+    /// Activate an existing entry in the current document without replacing it.
+    HistoryTraverse {
+        url: String,
+        history: renderer::HistorySnapshot,
     },
 }
 
@@ -164,6 +169,8 @@ pub struct ResponseStart {
     pub content_type: Option<String>,
     /// HTTP `Content-Language`, when present.
     pub content_language: Option<String>,
+    /// Session history applied before the new realm parses response bytes.
+    pub history: renderer::HistorySnapshot,
 }
 
 /// One renderer-originated browser-service call.
@@ -222,8 +229,10 @@ pub enum ServiceCall {
 /// Network and cookie operation requested by a renderer.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum NetworkCall {
-    /// HTTP GET submitted to the browser-owned network executor.
+    /// HTTP request submitted to the browser-owned network executor.
     Dial(DialRequest),
+    /// Cancels a dial submitted by this assignment.
+    CancelDial { id: RequestId },
     /// `document.cookie` getter.
     CookieGet {
         /// Document URL.
@@ -414,6 +423,7 @@ mod tests {
                         final_url: "http://example.test/".into(),
                         content_type: Some("text/html".into()),
                         content_language: None,
+                        history: renderer::HistorySnapshot::default(),
                     },
                 },
             },
@@ -481,6 +491,7 @@ mod tests {
                         method: "GET".into(),
                         body: Vec::new(),
                         content_type: None,
+                        headers: Vec::new(),
                     })),
                 },
             },
@@ -578,6 +589,7 @@ mod tests {
                     final_url: "http://example.test/".into(),
                     content_type: Some("text/html".into()),
                     content_language: None,
+                    history: renderer::HistorySnapshot::default(),
                 },
             },
         };

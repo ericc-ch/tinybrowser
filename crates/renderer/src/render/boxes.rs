@@ -36,7 +36,9 @@ use dom::NodeId;
 
 use crate::render::font::Fonts;
 use crate::render::geometry::{Edges, Rect};
-use crate::render::layout::{Ctx, LayoutBox, PaintItem, layout_inline_run, min_content_width};
+use crate::render::layout::{
+    Ctx, InlineSpace, LayoutBox, PaintItem, layout_inline_run, min_content_width,
+};
 use crate::render::style::{
     AlignContent, AlignItems, AlignSelf, BoxSizing, Clear, Dimension, Display, FlexDirection,
     FlexWrap, Float, GridLine, GridPlacement, GridTrack, JustifyContent, Length, Overflow,
@@ -57,6 +59,8 @@ struct InlineRun<'a> {
     nodes: &'a [BoxNode],
     /// Horizontal alignment of short lines.
     text_align: TextAlign,
+    /// Preferred height of the element establishing this inline context.
+    height: Dimension,
 }
 
 /// Per-node data kept alongside the Taffy tree for the convert pass.
@@ -77,9 +81,8 @@ struct Builder<'a> {
     data: HashMap<taffy::NodeId, NodeData>,
     /// Inline runs owned by leaves, indexed by [`TextLeaf::run`].
     runs: Vec<InlineRun<'a>>,
-    /// Inline layout results cached by the measure function, with the width
-    /// they were laid out at.
-    cache: HashMap<taffy::NodeId, (f32, Vec<PaintItem>)>,
+    /// Inline layout results and the definite dimensions they used.
+    cache: HashMap<taffy::NodeId, (InlineSpace, Vec<PaintItem>)>,
     /// Layout fonts and sizes.
     ctx: &'a Ctx<'a>,
 }
@@ -114,7 +117,12 @@ pub(crate) fn layout_root(
 
 /// Lays out one atomic subtree (an inline-block/flex/grid) at a fixed
 /// available width, for inline-level measurement and placement.
-pub(crate) fn layout_subtree(node: &BoxNode, ctx: &Ctx<'_>, available: f32) -> LayoutBox {
+pub(crate) fn layout_subtree(
+    node: &BoxNode,
+    ctx: &Ctx<'_>,
+    available: f32,
+    height_basis: Option<f32>,
+) -> LayoutBox {
     let mut builder = Builder::new(ctx);
     // Atomic roots lay out as containers, never as text leaves: routing them
     // through `build_node` would wrap them in a leaf and recurse forever.
@@ -124,9 +132,32 @@ pub(crate) fn layout_subtree(node: &BoxNode, ctx: &Ctx<'_>, available: f32) -> L
         BoxKind::InlineGrid => builder.build_grid(node),
         _ => builder.build_node(node),
     };
+    // The nested atomic is a Taffy root: resolve percentage height against
+    // its real containing block. A definite height fixes that axis even when
+    // max-width constrains the ratio-derived width; Taffy would otherwise
+    // transfer max-width through the aspect ratio into max-height.
+    // https://drafts.csswg.org/css-sizing-3/#percentage-sizing
+    // https://www.w3.org/TR/CSS22/visudet.html#min-max-widths
+    let definite_height = crate::render::layout::constrained_height(node, height_basis);
+    if let Some(height) = definite_height {
+        let mut style = builder
+            .tree
+            .style(root_id)
+            .cloned()
+            .expect("atomic root exists");
+        style.size.height = taffy::Dimension::length(height);
+        style.aspect_ratio = None;
+        builder
+            .tree
+            .set_style(root_id, style)
+            .expect("atomic root exists");
+    }
     let space = TaffySize {
         width: TaffyAvailableSpace::Definite(available.max(0.0)),
-        height: TaffyAvailableSpace::MaxContent,
+        height: height_basis.map_or(
+            TaffyAvailableSpace::MaxContent,
+            TaffyAvailableSpace::Definite,
+        ),
     };
     builder.run_layout(root_id, space);
     let mut layout = builder.convert(root_id, 0.0, 0.0, available);
@@ -149,9 +180,10 @@ pub(crate) fn layout_subtree(node: &BoxNode, ctx: &Ctx<'_>, available: f32) -> L
 /// adds this node's padding and border.
 fn measure_content(
     runs: &[InlineRun<'_>],
-    cache: &mut HashMap<taffy::NodeId, (f32, Vec<PaintItem>)>,
+    cache: &mut HashMap<taffy::NodeId, (InlineSpace, Vec<PaintItem>)>,
     ctx: &Ctx<'_>,
     input: LayoutInput,
+    imposed_height: Option<f32>,
     node: taffy::NodeId,
     context: Option<&mut TextLeaf>,
 ) -> TaffySize<f32> {
@@ -185,12 +217,30 @@ fn measure_content(
             }
         }
     };
-    let result = layout_inline_run(run.nodes, ctx, 0.0, 0.0, width.max(0.0), run.text_align);
+    // Taffy's PerformLayout measure call passes no known dimensions even if
+    // its CSS height resolved. Its available space is the content-box height;
+    // do not use it as a percentage basis when height is auto/indefinite.
+    // <https://drafts.csswg.org/css-sizing-3/#percentage-sizing>
+    let definite_height = imposed_height.is_some()
+        || (input.known_dimensions.height.is_some() && input.known_dimensions_are_definite.height)
+        || match run.height {
+            Dimension::Length(Length::Px(_)) => true,
+            Dimension::Length(Length::Percent(_)) => input.parent_size.height.is_some(),
+            Dimension::Auto => false,
+        };
+    let space = InlineSpace {
+        width: width.max(0.0),
+        height: match input.available_space.height {
+            TaffyAvailableSpace::Definite(height) if definite_height => Some(height),
+            _ => None,
+        },
+    };
+    let result = layout_inline_run(run.nodes, ctx, 0.0, 0.0, space, run.text_align);
     let height = match input.known_dimensions.height {
         Some(height) => height,
         None => result.height,
     };
-    cache.insert(node, (width, result.items));
+    cache.insert(node, (space, result.items));
     TaffySize { width, height }
 }
 
@@ -233,7 +283,11 @@ impl<'a> Builder<'a> {
                     let mut nested = input;
                     nested.known_dimensions = known;
                     nested.available_space = available_space;
-                    measure_content(runs, cache, ctx, nested, node, context)
+                    let imposed_height = input
+                        .known_dimensions
+                        .height
+                        .filter(|_| input.known_dimensions_are_definite.height);
+                    measure_content(runs, cache, ctx, nested, imposed_height, node, context)
                 },
             )
         })
@@ -410,6 +464,7 @@ impl<'a> Builder<'a> {
         self.runs.push(InlineRun {
             nodes: run,
             text_align,
+            height: style.height,
         });
         let mut converted = convert_style(style);
         converted.display = TaffyDisplay::Block;
@@ -468,8 +523,23 @@ impl<'a> Builder<'a> {
             // flex stretching can widen the leaf afterwards, so re-run the
             // inline engine when the widths disagree.
             let cached = self.cache.remove(&node);
+            let content_height = (rect.height
+                - data.style.border.top.width
+                - data.style.border.bottom.width
+                - padding.top
+                - padding.bottom)
+                .max(0.0);
+            let space = InlineSpace {
+                width: content_width,
+                height: cached
+                    .as_ref()
+                    .and_then(|(space, _)| space.height.map(|_| content_height)),
+            };
             let fresh = match cached {
-                Some((width, mut items)) if (width - content_width).abs() < 0.5 => {
+                Some((measured, mut items))
+                    if (measured.width - space.width).abs() < 0.5
+                        && measured.height == space.height =>
+                {
                     crate::render::layout::shift_items(&mut items, content_x, content_y);
                     Some(items)
                 }
@@ -481,7 +551,7 @@ impl<'a> Builder<'a> {
                     self.ctx,
                     content_x,
                     content_y,
-                    content_width,
+                    space,
                     run.text_align,
                 )
                 .items

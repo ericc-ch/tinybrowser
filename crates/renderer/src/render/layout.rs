@@ -8,7 +8,7 @@ use dom::NodeId;
 
 use crate::render::font::Fonts;
 use crate::render::geometry::{Edges, Rect};
-use crate::render::style::{BoxSizing, Dimension, Style, TextAlign, WhiteSpace};
+use crate::render::style::{BoxSizing, Dimension, Length, Style, TextAlign, WhiteSpace};
 use crate::render::text::{FontStyle, PlacedRun, Segment, SegmentStyle};
 use crate::render::tree::{BoxKind, BoxNode, is_block_level};
 
@@ -84,8 +84,15 @@ struct Atomic {
     height: f32,
     /// Outer width including margins.
     outer_width: f32,
-    /// Content width used to lay the box out.
-    content_width: f32,
+    /// Border-box width used to lay the box out.
+    border_width: f32,
+}
+
+/// Available inline size and a definite block-size basis, when one exists.
+#[derive(Clone, Copy)]
+pub(crate) struct InlineSpace {
+    pub(crate) width: f32,
+    pub(crate) height: Option<f32>,
 }
 
 /// One collected input token in document order.
@@ -105,15 +112,19 @@ enum RawToken<'a> {
 ///
 /// Text is shaped by Parley; atomic boxes are laid out in nested subtrees
 /// and placed at Parley's inline-box positions.
+///
+/// A definite block size in `space` resolves percentage heights against the
+/// containing block (<https://drafts.csswg.org/css-sizing-3/#percentage-sizing>).
+/// Intrinsic sizing passes `None`, where percentages behave as `auto`.
 pub(crate) fn layout_inline_run(
     run: &[BoxNode],
     ctx: &Ctx<'_>,
     x: f32,
     y: f32,
-    available: f32,
+    space: InlineSpace,
     text_align: TextAlign,
 ) -> InlineResult {
-    layout_inline_run_wrap(run, ctx, x, y, available, text_align, true)
+    layout_inline_run_wrap(run, ctx, x, y, space, text_align, true)
 }
 
 /// Lays out `run` without soft wraps, for max-content.
@@ -125,7 +136,18 @@ fn layout_inline_run_nowrap(
     available: f32,
     text_align: TextAlign,
 ) -> InlineResult {
-    layout_inline_run_wrap(run, ctx, x, y, available, text_align, false)
+    layout_inline_run_wrap(
+        run,
+        ctx,
+        x,
+        y,
+        InlineSpace {
+            width: available,
+            height: None,
+        },
+        text_align,
+        false,
+    )
 }
 
 fn layout_inline_run_wrap(
@@ -133,7 +155,7 @@ fn layout_inline_run_wrap(
     ctx: &Ctx<'_>,
     x: f32,
     y: f32,
-    available: f32,
+    space: InlineSpace,
     text_align: TextAlign,
     allow_wrap: bool,
 ) -> InlineResult {
@@ -150,7 +172,7 @@ fn layout_inline_run_wrap(
         collect_token(
             node,
             ctx,
-            available,
+            space,
             &mut raw,
             &mut preserve,
             &mut wrap,
@@ -179,7 +201,7 @@ fn layout_inline_run_wrap(
                 ctx,
                 x,
                 y + height,
-                available,
+                space,
                 text_align,
                 preserve,
                 wrap,
@@ -210,7 +232,7 @@ fn shape_group(
     ctx: &Ctx<'_>,
     x: f32,
     y: f32,
-    available: f32,
+    space: InlineSpace,
     text_align: TextAlign,
     preserve: bool,
     wrap: bool,
@@ -246,7 +268,7 @@ fn shape_group(
         ctx.fonts,
         &tokens,
         &sizes,
-        available.max(0.0),
+        space.width.max(0.0),
         wrap,
         text_align,
         preserve,
@@ -255,8 +277,12 @@ fn shape_group(
     for line in &lines {
         for atomic in &line.atomics {
             let (node, measurement) = atomics[atomic.index];
-            let mut layout =
-                crate::render::boxes::layout_subtree(node, ctx, measurement.content_width);
+            let mut layout = crate::render::boxes::layout_subtree(
+                node,
+                ctx,
+                measurement.border_width,
+                space.height,
+            );
             shift_layout(&mut layout, x + atomic.x, y + height + atomic.y);
             items.push(PaintItem::Box(Box::new(layout)));
         }
@@ -285,7 +311,7 @@ fn shift_glyph_run(run: &mut PlacedRun, dx: f32, dy: f32) {
 fn collect_token<'a>(
     node: &'a BoxNode,
     ctx: &Ctx<'_>,
-    available: f32,
+    space: InlineSpace,
     out: &mut Vec<RawToken<'a>>,
     preserve: &mut bool,
     wrap: &mut bool,
@@ -315,7 +341,7 @@ fn collect_token<'a>(
         }
         BoxKind::Inline => {
             for child in &node.children {
-                collect_token(child, ctx, available, out, preserve, wrap, pending_space);
+                collect_token(child, ctx, space, out, preserve, wrap, pending_space);
             }
         }
         // `<br>` always breaks, in every whitespace mode. It splits the run
@@ -341,7 +367,7 @@ fn collect_token<'a>(
                 }
                 *pending_space = false;
             }
-            let measurement = measure_atomic(node, ctx, available);
+            let measurement = measure_atomic(node, ctx, space);
             out.push(RawToken::Atomic { node, measurement });
         }
     }
@@ -413,25 +439,43 @@ fn process_text(text: &str, style: &Style) -> ProcessedText {
     }
 }
 /// tree rooted at the atomic.
-fn measure_atomic(node: &BoxNode, ctx: &Ctx<'_>, available: f32) -> Atomic {
-    let mut preferred = max_content_width(node, ctx).ceil();
-    if preferred == 0.0
-        && node.style.width == Dimension::Auto
-        && node.style.height == Dimension::Auto
-        && let Some(ratio) = node.style.aspect_ratio
-    {
-        // Replaced content with only an intrinsic ratio uses the 300x150
-        // default object size, contained by the available inline size.
-        // https://drafts.csswg.org/css-images-3/#default-sizing
-        preferred = (150.0 * ratio).min(300.0).min(available);
-    }
-    let layout = crate::render::boxes::layout_subtree(node, ctx, preferred);
+fn measure_atomic(node: &BoxNode, ctx: &Ctx<'_>, space: InlineSpace) -> Atomic {
+    // A definite width resolves against the containing inline size; only
+    // `auto` shrink-wraps to content
+    // (<https://drafts.csswg.org/css-sizing-3/#shrink-to-fit>).
+    let preferred = match node.style.width {
+        Dimension::Length(length) => length.resolve(space.width),
+        Dimension::Auto => {
+            // A ratio-sized box with a definite height derives its width
+            // from the resolved height instead of content
+            // (<https://drafts.csswg.org/css-images-3/#sizing>).
+            if let Some(height) = constrained_height(node, space.height)
+                && let Some(ratio) = node.style.aspect_ratio
+                && ratio > 0.0
+            {
+                ratio_width(node, height, ratio)
+            } else {
+                let mut preferred = max_content_width(node, ctx).ceil();
+                if preferred == 0.0
+                    && node.style.height == Dimension::Auto
+                    && let Some(ratio) = node.style.aspect_ratio
+                {
+                    // Replaced content with only an intrinsic ratio uses the 300x150
+                    // default object size, contained by the available inline size.
+                    // https://drafts.csswg.org/css-images-3/#default-sizing
+                    preferred = (150.0 * ratio).min(300.0).min(space.width);
+                }
+                preferred
+            }
+        }
+    };
+    let layout = crate::render::boxes::layout_subtree(node, ctx, preferred, space.height);
     let margin = node.style.margin.map(|dimension| match dimension {
         Dimension::Auto => 0.0,
-        Dimension::Length(length) => length.resolve(preferred),
+        Dimension::Length(length) => length.resolve(space.width),
     });
     Atomic {
-        content_width: layout.content_box().width,
+        border_width: layout.rect.width,
         height: layout.rect.height,
         outer_width: layout.rect.width + margin.left + margin.right,
     }
@@ -540,6 +584,38 @@ fn outer_extras(node: &BoxNode) -> f32 {
     padding + style.border.left.width + style.border.right.width
 }
 
+/// Definite used block size after min/max constraints, if height can resolve
+/// (<https://www.w3.org/TR/CSS22/visudet.html#min-max-heights>).
+pub(crate) fn constrained_height(node: &BoxNode, basis: Option<f32>) -> Option<f32> {
+    let resolve = |dimension| match dimension {
+        Dimension::Length(Length::Px(value)) => Some(value),
+        Dimension::Length(Length::Percent(percent)) => basis.map(|basis| basis * percent / 100.0),
+        Dimension::Auto => None,
+    };
+    let height = resolve(node.style.height)?;
+    let min = resolve(node.style.min_height).unwrap_or(0.0);
+    let max = resolve(node.style.max_height)
+        .unwrap_or(f32::INFINITY)
+        .max(min);
+    Some(height.max(min).min(max))
+}
+
+/// Border-box width transferred from a definite height through an aspect ratio
+/// (<https://drafts.csswg.org/css-sizing-3/#box-sizing>).
+fn ratio_width(node: &BoxNode, height: f32, ratio: f32) -> f32 {
+    let style = &node.style;
+    let block_extras = style.padding.top.resolve(0.0)
+        + style.padding.bottom.resolve(0.0)
+        + style.border.top.width
+        + style.border.bottom.width;
+    let content_height = if style.box_sizing == BoxSizing::BorderBox {
+        (height - block_extras).max(0.0)
+    } else {
+        height
+    };
+    content_height.max(0.0) * ratio + outer_extras(node)
+}
+
 /// Max-content width of a box
 /// (<https://drafts.csswg.org/css-sizing-3/#max-content>).
 pub(crate) fn max_content_width(node: &BoxNode, ctx: &Ctx<'_>) -> f32 {
@@ -617,7 +693,15 @@ pub(crate) fn max_content_width(node: &BoxNode, ctx: &Ctx<'_>) -> f32 {
                 value + extras
             }
         }
-        Dimension::Auto => content + extras,
+        Dimension::Auto => match (
+            node.natural_width,
+            constrained_height(node, None),
+            style.aspect_ratio,
+        ) {
+            (Some(_), Some(height), Some(ratio)) if ratio > 0.0 => ratio_width(node, height, ratio),
+            (Some(width), _, _) => width + extras,
+            _ => content + extras,
+        },
     }
 }
 

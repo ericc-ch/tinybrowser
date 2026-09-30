@@ -1,6 +1,9 @@
 //! Focus, activation behavior, and the `WebDriver` bridge.
 
-use super::{events, host_node_id, webdriver_element, world_for_node, wrap_node};
+use super::{
+    LegacyNullString, events, host_node_id, throw_dom_error, webdriver_element, world_for_node,
+    wrap_node,
+};
 
 use std::rc::Rc;
 
@@ -531,8 +534,12 @@ pub(crate) fn install_webdriver_bridge(ctx: &Ctx<'_>, globals: &Object<'_>) -> R
         "__tbActivate",
         rquickjs::prelude::Func::from(activate_element),
     )?;
+    globals.set(
+        "__tbSetNativeValue",
+        rquickjs::prelude::Func::from(set_native_value),
+    )?;
     ctx.eval::<(), _>(
-        "['__tb_webdriver_click','__tb_webdriver_element','__tbActivate']\
+        "['__tb_webdriver_click','__tb_webdriver_element','__tbActivate','__tbSetNativeValue']\
          .forEach(function(k){Object.defineProperty(globalThis,k,{writable:false,configurable:false,enumerable:false});});",
     )?;
     Ok(())
@@ -561,6 +568,33 @@ fn activate_element<'js>(ctx: Ctx<'js>, element: Value<'js>) -> Result<()> {
         }
     }
     run_activation(&ctx, node)
+}
+
+/// Sets an input or textarea's value without invoking an author-defined
+/// `value` setter. Native user editing changes the control's internal value;
+/// libraries that track the value (notably React's input value tracker)
+/// observe the subsequent `input` event against the previously tracked value,
+/// so routing the change through the IDL setter would make the edit invisible
+/// to them
+/// (<https://html.spec.whatwg.org/multipage/interaction.html#input-events>).
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "rquickjs Func ABI passes arguments by value"
+)]
+fn set_native_value<'a>(ctx: Ctx<'a>, element: Value<'a>, value: LegacyNullString) -> Result<()> {
+    let Some(node) = host_node_id(&ctx, &element) else {
+        return Err(Exception::throw_type(&ctx, "argument is not an element"));
+    };
+    let world = world_for_node(&ctx, node)?;
+    let world = world.borrow();
+    let Some(mut parsed) = world.document_mut(node) else {
+        return Err(Exception::throw_type(&ctx, "no document"));
+    };
+    // Same write the IDL setter performs, minus the author-visible entry
+    // point (<https://html.spec.whatwg.org/multipage/input.html#dom-input-value>).
+    dom::form::set_element_value(&mut parsed.document, node, value.0)
+        .map_err(|err| throw_dom_error(&ctx, err))?;
+    Ok(())
 }
 
 /// The `WebDriver` "element click" step: a trusted click at the element, with

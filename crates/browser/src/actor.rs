@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::wire::{Command as RendererCommand, Reply};
-use renderer::{DialFailure, FrameId, Mount, RemoteValue, RendererEvent, ResourceLimit, TabError};
+use renderer::{DialFailure, FrameId, HistorySnapshot, Mount, RemoteValue, RendererEvent, ResourceLimit, TabError};
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, sleep_until, timeout};
@@ -19,6 +19,7 @@ use url::Url;
 
 use crate::assignment::Assignment;
 use crate::exchange::{self, RequestId, ServerInput};
+use crate::history::SessionHistory;
 use crate::manager::RendererProcessManager;
 use crate::network::{NAV_BODY_LIMIT, NavOutcome, TabNetworkHandle, dial_failure};
 use crate::site::Site;
@@ -42,6 +43,8 @@ pub struct TabId(u64);
 pub enum TabEvent {
     /// A navigation committed its final URL.
     Navigated,
+    /// The active document changed URL without replacing its JS realm.
+    SameDocumentNavigation,
     /// The top-level document fired `load`.
     Load,
     /// A navigation failed and left the previous document active.
@@ -502,6 +505,8 @@ struct Tab {
     site: Option<Site>,
     events_rx: Option<mpsc::Receiver<(FrameId, RendererEvent)>>,
     document_url: Url,
+    history: SessionHistory,
+    traversal: Option<crate::history::EntryId>,
     document_loaded: bool,
     navigation_failed: bool,
     nav: Option<ActiveNavigation>,
@@ -531,6 +536,8 @@ impl Tab {
             site: None,
             events_rx: None,
             document_url: Url::parse("about:blank").expect("about:blank is a valid URL"),
+            history: SessionHistory::new(Url::parse("about:blank").expect("about:blank is a valid URL")),
+            traversal: None,
             document_loaded: false,
             navigation_failed: false,
             nav: None,
@@ -552,6 +559,7 @@ impl Tab {
             content_type: Some("text/html; charset=utf-8".to_owned()),
             content_language: None,
             body: html.as_bytes().to_vec(),
+            history: self.history.snapshot(),
         };
         if self.renderer.is_none() && self.document_url.scheme() == "about" {
             self.pending_mount = Some(mount);
@@ -564,6 +572,7 @@ impl Tab {
 
     fn goto(&mut self, spec: &str) -> Result<(), TabError> {
         let url = self.resolve_url(spec)?;
+        self.traversal = None;
         // Monotonic across the tab's life, never derived from the live
         // navigation: `cancel_dial`'s abort is not a barrier, so a cancelled
         // dial's completion can still be enqueued after its successor
@@ -801,6 +810,7 @@ impl Tab {
             })
             .await;
         } else {
+            self.traversal = None;
             self.navigation_failed = true;
             self.record_event(TabEvent::NavigationFailed).await;
         }
@@ -809,12 +819,17 @@ impl Tab {
     /// Returns true when the new document mounted.
     async fn commit_navigation(&mut self, outcome: NavOutcome) -> bool {
         let site = Site::for_url(&outcome.final_url).unwrap_or_else(|| Site::opaque(self.id));
-        self.document_url = outcome.final_url.clone();
+        let mut history = self.history.clone();
+        if !history.navigate(outcome.final_url.clone(), self.traversal.take()) {
+            self.navigation_failed = true;
+            return false;
+        }
         let mount = Mount {
             url: outcome.final_url.to_string(),
             content_type: outcome.content_type.clone(),
             content_language: outcome.content_language.clone(),
             body: Vec::new(),
+            history: history.snapshot(),
         };
         if self
             .mount_stream(&site, outcome.status, mount, outcome.body)
@@ -824,6 +839,8 @@ impl Tab {
             self.navigation_failed = true;
             return false;
         }
+        self.history = history;
+        self.document_url = outcome.final_url;
         true
     }
 
@@ -834,6 +851,7 @@ impl Tab {
         match event {
             RendererEvent::Navigated { url } => {
                 if let Ok(url) = Url::parse(url) {
+                    self.history.navigate(url.clone(), None);
                     self.document_url = url;
                 }
                 // The committed origin is an authorization input; record it from
@@ -848,7 +866,56 @@ impl Tab {
                 self.document_loaded = true;
                 self.record_event(TabEvent::Load).await;
             }
+            RendererEvent::HistoryUpdated { url, state, replace } => {
+                if let Ok(url) = Url::parse(url)
+                    && url.origin() == self.document_url.origin() {
+                    self.history.update(url.clone(), state.clone(), *replace);
+                    self.document_url = url;
+                    self.record_event(TabEvent::SameDocumentNavigation).await;
+                }
+            }
+            RendererEvent::HistoryTraversal { delta } => {
+                self.traverse_history(*delta).await;
+            }
             _ => {}
+        }
+    }
+
+    async fn traverse_history(&mut self, delta: i32) {
+        // `go(0)` reloads the current entry without touching history
+        // (<https://html.spec.whatwg.org/multipage/nav-history-apis.html#dom-history-go>).
+        if delta == 0 {
+            let url = self.document_url.to_string();
+            if self.goto(&url).is_ok() {
+                self.traversal = Some(self.history.current_entry());
+            }
+            return;
+        }
+        let Some((index, entry, url, state, same_document)) = self.history.target(delta) else {
+            return;
+        };
+        let url = url.to_string();
+        let state = state.map(str::to_owned);
+        if same_document {
+            let result = self.renderer_request(RendererCommand::HistoryTraverse {
+                url: url.clone(),
+                history: HistorySnapshot {
+                    state,
+                    index,
+                    length: self.history.snapshot().length,
+                },
+            }).await;
+            if matches!(result, Ok(Reply::Unit(Ok(())))) {
+                self.history.traverse_same_document(index);
+                if let Ok(url) = Url::parse(&url) {
+                    self.document_url = url;
+                }
+                self.record_event(TabEvent::SameDocumentNavigation).await;
+            }
+            return;
+        }
+        if self.goto(&url).is_ok() {
+            self.traversal = Some(entry);
         }
     }
 
@@ -872,6 +939,7 @@ fn blank_mount() -> Mount {
         content_type: Some("text/html; charset=utf-8".into()),
         content_language: None,
         body: b"<!doctype html><title></title>".to_vec(),
+        history: HistorySnapshot::default(),
     }
 }
 

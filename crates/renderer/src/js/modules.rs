@@ -57,7 +57,7 @@ pub(super) fn load_module<'js>(ctx: &Ctx<'js>, name: &str) -> Result<Module<'js,
     drop(world);
 
     let (send, receive) = mpsc::sync_channel(1);
-    services.start_dial(
+    let cancel = services.start_dial(
         DialRequest {
             kind: DialKind::ModuleScript,
             url: name.to_owned(),
@@ -66,15 +66,18 @@ pub(super) fn load_module<'js>(ctx: &Ctx<'js>, name: &str) -> Result<Module<'js,
             method: "GET".to_owned(),
             body: Vec::new(),
             content_type: None,
+            headers: Vec::new(),
         },
         Box::new(move |outcome| {
             let _result = send.send(outcome);
         }),
     );
-    let outcome = receive
-        .recv_timeout(Duration::from_secs(30))
-        .map_err(|_| Error::new_loading(name))?
-        .map_err(|_| Error::new_loading(name))?;
+    let outcome = if let Ok(outcome) = receive.recv_timeout(Duration::from_secs(30)) {
+        outcome.map_err(|_| Error::new_loading(name))?
+    } else {
+        cancel();
+        return Err(Error::new_loading(name));
+    };
     if !(200..300).contains(&outcome.status)
         || !super::javascript_module_mime(outcome.content_type.as_deref())
     {

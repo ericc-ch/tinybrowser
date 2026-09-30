@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use net::{Agent, AgentOptions, InitiatorKind, Method, Request};
-use renderer::{DialFailure, DialOutcome, DialRequest};
+use renderer::{DialFailure, DialKind, DialOutcome, DialRequest};
 use tokio::sync::Semaphore;
 use tokio::sync::mpsc::UnboundedSender;
 use url::Url;
@@ -178,7 +178,7 @@ impl TabNetworkHandle {
         })
     }
 
-    /// Async GET for one renderer service call, cancelled when the renderer
+    /// Async HTTP request for one renderer service call, cancelled when the renderer
     /// dies or the tab closes.
     pub(crate) async fn dial_request(
         &self,
@@ -191,10 +191,37 @@ impl TabNetworkHandle {
             let _global = Self::acquire(&self.permits.global, deadline).await?;
             let _tab = Self::acquire(&self.tab, deadline).await?;
             let url = Url::parse(&request.url).map_err(|_| DialFailure::Connect)?;
+            // Until the Fetch CORS protocol is implemented, do not issue a
+            // cross-origin script request (including requests with side
+            // effects) or expose a redirected response to the caller.
+            // <https://fetch.spec.whatwg.org/#http-fetch>
+            if request.kind == DialKind::JsFetch && url.origin() != initiator.origin() {
+                return Err(DialFailure::Connect);
+            }
             let method = net::Method::parse(&request.method).map_err(|_| DialFailure::Connect)?;
+            // https://fetch.spec.whatwg.org/#forbidden-method
+            if request.kind == DialKind::JsFetch
+                && matches!(method.as_str().to_ascii_uppercase().as_str(), "CONNECT" | "TRACE" | "TRACK")
+            {
+                return Err(DialFailure::Connect);
+            }
             let mut outbound = Request::new(method, url);
+            if request.kind == DialKind::JsFetch {
+                outbound.same_origin = Some(initiator.origin());
+            }
             if let Some(content_type) = &request.content_type {
-                let _ = outbound.headers.insert("Content-Type", content_type.as_bytes());
+                let _ = outbound
+                    .headers
+                    .insert("Content-Type", content_type.as_bytes());
+            }
+            for (name, value) in &request.headers {
+                if request.kind == DialKind::JsFetch && forbidden_page_header(name, value) {
+                    continue;
+                }
+                outbound
+                    .headers
+                    .insert(name, value.as_bytes())
+                    .map_err(|_| DialFailure::Connect)?;
             }
             if !request.body.is_empty() {
                 outbound.body = Some(request.body.clone());
@@ -210,6 +237,16 @@ impl TabNetworkHandle {
             let status = response.status();
             let final_url = response.final_url().to_string();
             let (content_type, content_language) = response_meta(response.headers());
+            let headers = response
+                .headers()
+                .iter()
+                .filter(|(name, _)| {
+                    request.kind != DialKind::JsFetch
+                        || (!name.eq_ignore_ascii_case("set-cookie")
+                            && !name.eq_ignore_ascii_case("set-cookie2"))
+                })
+                .map(|(name, value)| (name.to_owned(), String::from_utf8_lossy(value).into_owned()))
+                .collect();
             let body = if request.read_body {
                 response
                     .into_body()
@@ -224,6 +261,7 @@ impl TabNetworkHandle {
                 final_url,
                 content_type,
                 content_language,
+                headers,
                 body,
             })
         };
@@ -249,6 +287,50 @@ impl TabNetworkHandle {
             Err(_) => Err(DialFailure::QueueFull),
         }
     }
+}
+
+/// Browser-generated request headers cannot be overridden by page scripts.
+/// <https://fetch.spec.whatwg.org/#forbidden-request-header>
+fn forbidden_page_header(name: &str, value: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    if lower.starts_with("proxy-") || lower.starts_with("sec-") {
+        return true;
+    }
+    if matches!(
+        lower.as_str(),
+        "accept-charset"
+            | "accept-encoding"
+            | "access-control-request-headers"
+            | "access-control-request-method"
+            | "connection"
+            | "content-length"
+            | "cookie"
+            | "cookie2"
+            | "date"
+            | "dnt"
+            | "expect"
+            | "host"
+            | "keep-alive"
+            | "origin"
+            | "referer"
+            | "set-cookie"
+            | "te"
+            | "trailer"
+            | "transfer-encoding"
+            | "upgrade"
+            | "via"
+    ) {
+        return true;
+    }
+    matches!(
+        lower.as_str(),
+        "x-http-method" | "x-http-method-override" | "x-method-override"
+    ) && value.split(',').any(|method| {
+        matches!(
+            method.trim().to_ascii_lowercase().as_str(),
+            "connect" | "trace" | "track"
+        )
+    })
 }
 
 pub(crate) fn dial_failure(error: &net::NetError) -> DialFailure {

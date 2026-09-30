@@ -496,6 +496,15 @@ impl Conn {
                 self.push_navigated(&mut messages, &tab, session.as_deref())
                     .await;
             }
+            TabEvent::SameDocumentNavigation => {
+                let url = tab.document_url().await.unwrap_or_default();
+                let mut navigated = json!({
+                    "method": "Page.navigatedWithinDocument",
+                    "params": {"frameId": tab.id().to_string(), "url": url},
+                });
+                attach_session(&mut navigated, session.as_deref());
+                messages.push(navigated);
+            }
             TabEvent::Load => {
                 let frame_id = tab.id().to_string();
                 let loader_id = self.loader_ids.get(&tab.id()).cloned().unwrap_or_default();

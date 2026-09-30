@@ -193,7 +193,9 @@ fn handle_request(
             Command::Screenshot { .. } => Reply::Screenshot {
                 result: Err(stream_error("unknown assignment")),
             },
-            Command::WindowMessage { .. } => Reply::Unit(Err(stream_error("unknown assignment"))),
+            Command::WindowMessage { .. } | Command::HistoryTraverse { .. } => {
+                Reply::Unit(Err(stream_error("unknown assignment")))
+            }
         };
         return send_to_browser(
             outbox,
@@ -351,6 +353,7 @@ impl ResponseStreams {
             url.as_ref(),
             response.content_type.as_deref(),
             response.content_language.as_deref(),
+            &response.history,
         )?;
         self.active.insert(
             id,
@@ -525,6 +528,9 @@ fn handle_command(engine: &mut Engine, command: Command) -> Handled {
         Command::WindowMessage { payload } => {
             engine.receive_remote_window_message(payload);
             Handled::Reply(Reply::Unit(Ok(())))
+        }
+        Command::HistoryTraverse { url, history } => {
+            Handled::Reply(Reply::Unit(engine.traverse_history(&url, &history)))
         }
     }
 }

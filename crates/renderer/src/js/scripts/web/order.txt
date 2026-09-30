@@ -4,6 +4,7 @@ encoding.js
 crypto.js
 streams.js
 file.js
+xhr.js
 url.js
 dom.js
 cssom.js
@@ -12,6 +13,7 @@ tree_walker.js
 custom_elements.js
 observers.js
 messaging.js
+history.js
 ui_events.js
 errors.js
 forms.js

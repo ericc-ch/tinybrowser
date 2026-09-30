@@ -804,6 +804,18 @@ pub(crate) fn fire_trusted(
     fire_trusted_with_related(ctx, target, typ, bubbles, cancelable, None)
 }
 
+/// Fires `popstate` with the deserialized state for the activated entry.
+/// <https://html.spec.whatwg.org/multipage/nav-history-apis.html#the-popstateevent-interface>
+pub(crate) fn fire_trusted_popstate<'js>(ctx: &Ctx<'js>, state: Value<'js>) -> Result<()> {
+    let event = Class::instance(ctx.clone(), JsEvent::trusted("popstate", false, false))?;
+    if let Some(prototype) = bindings::world(ctx)?.borrow().brand("PopStateEvent") {
+        event.set_prototype(Some(&prototype.restore(ctx)?))?;
+    }
+    event.set("state", state)?;
+    dispatch(ctx, EventTargetKey::Window, &event, None)?;
+    Ok(())
+}
+
 /// Fires a trusted `click` and reports whether it was not canceled, so the
 /// caller can run the activation behavior
 /// (<https://dom.spec.whatwg.org/#concept-event-dispatch>).

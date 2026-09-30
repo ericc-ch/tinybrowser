@@ -581,7 +581,7 @@ pub(super) fn layout_boxes(ctx: &Ctx<'_>, document: NodeId) -> Result<Vec<crate:
     let Some(parsed) = world.document(document) else {
         return Ok(Vec::new());
     };
-    let sheets = inline_stylesheets(&parsed.document);
+    let sheets = world.author_stylesheets(&parsed);
     let options = crate::render::RenderOptions {
         width: crate::engine::VIEWPORT_WIDTH,
         height: crate::engine::VIEWPORT_HEIGHT,
@@ -591,33 +591,6 @@ pub(super) fn layout_boxes(ctx: &Ctx<'_>, document: NodeId) -> Result<Vec<crate:
         crate::render::layout_boxes(&parsed.document, &sheets, &options, &world.images)
             .unwrap_or_default(),
     )
-}
-
-/// Inline `<style>` text in document order. External sheets are not mirrored
-/// into script geometry yet, so a page styled only by `<link>` lays out
-/// without the author rules.
-fn inline_stylesheets(dom: &dom::Document) -> Vec<String> {
-    let mut sheets = Vec::new();
-    for node in dom.tree().descendants(dom.document()) {
-        let Some(NodeKind::Element { name, .. }) = dom.kind(node) else {
-            continue;
-        };
-        if name.ns != dom::html_namespace() || name.local.as_ref() != "style" {
-            continue;
-        }
-        let mut css = String::new();
-        if let Some(children) = dom.children(node) {
-            for child in children {
-                if let Some(NodeKind::Text { data }) = dom.kind(child) {
-                    css.push_str(data);
-                }
-            }
-        }
-        if !css.trim().is_empty() {
-            sheets.push(css);
-        }
-    }
-    sheets
 }
 
 /// `node`'s border box `(left, top, width, height)` from the current layout,
@@ -637,6 +610,20 @@ pub(super) fn element_box(ctx: &Ctx<'_>, node: NodeId) -> Result<Option<(f64, f6
         }))
 }
 
+/// Current viewport offset from the document's scrolling element.
+/// <https://drafts.csswg.org/cssom-view/#scrolling-viewport>
+fn viewport_scroll(ctx: &Ctx<'_>, node: NodeId) -> Result<(f64, f64)> {
+    let world = world_for_node(ctx, node)?;
+    let world = world.borrow();
+    let Some(parsed) = world.document(node) else {
+        return Ok((0.0, 0.0));
+    };
+    let root = dom::selector::select_first(&parsed.document, parsed.document.document(), "html")
+        .ok()
+        .flatten();
+    Ok(root.map_or((0.0, 0.0), |root| dom::metadata::scroll_offset(&parsed.document, root)))
+}
+
 /// The deepest element whose laid-out border box contains the point, if any.
 pub(super) fn element_at_point(
     ctx: &Ctx<'_>,
@@ -644,6 +631,9 @@ pub(super) fn element_at_point(
     x: f64,
     y: f64,
 ) -> Result<Option<NodeId>> {
+    let (scroll_x, scroll_y) = viewport_scroll(ctx, document)?;
+    let x = x + scroll_x;
+    let y = y + scroll_y;
     let boxes = layout_boxes(ctx, document)?;
     let mut best = None;
     for item in boxes {
@@ -1773,8 +1763,9 @@ mod realm_tests {
     struct NullServices;
 
     impl NetworkHost for NullServices {
-        fn start_dial(&self, _request: DialRequest, completion: DialCompletion) {
+        fn start_dial(&self, _request: DialRequest, completion: DialCompletion) -> crate::protocol::DialCancellation {
             completion(Err(crate::protocol::DialFailure::Connect));
+            Box::new(|| {})
         }
 
         fn cookies_for(&self, _url: &Url) -> String {
