@@ -23,8 +23,15 @@ Do not test spec conformance in cargo tests. Never add, keep, or "fix" a cargo t
 
 - Engine forks, one maintained branch each (`master` is the line). Fixes stay
   downstream; do not submit an upstream PR.
-  - QuickJS-NG fork `github.com/ericc-ch/quickjs`. Pinned as the `sys/quickjs` submodule in the rquickjs fork.
-  - rquickjs fork `github.com/ericc-ch/rquickjs`. Pinned in tinybrowser via `[patch.crates-io]` plus `Cargo.lock`.
+  - QuickJS-NG fork `github.com/ericc-ch/quickjs`. Checked out as the nested
+    `sys/quickjs` submodule inside the rquickjs checkout below.
+  - rquickjs fork `github.com/ericc-ch/rquickjs`. Checked out as the
+    `third_party/rquickjs` submodule (recursive) and wired in via
+    `[patch.crates-io]` path entries. It is its own workspace, excluded from
+    the tinybrowser workspace, so its lint config stays separate.
+  - Pull upstream inside the submodule, push the fork branch there, then bump
+    the submodule pointer in tinybrowser. Fresh clones and worktrees need
+    `git submodule update --init --recursive`.
 
 ## Working rules
 

@@ -1,7 +1,25 @@
-# Vendored third-party data
+# Vendored third-party code and data
 
-Everything under `third_party/` belongs to someone else. Nothing here ships in
-the binary; it exists so tests are reproducible and offline-capable.
+Most of `third_party/` is test input that never ships in the binary. The
+exception is the JS engine forks below, which do ship.
+
+## Engine forks (ship in the binary)
+
+- **What**: the maintained rquickjs and QuickJS-NG forks tinybrowser builds
+  against.
+- **Upstream**: <https://github.com/ericc-ch/rquickjs> at
+  `third_party/rquickjs`, with the QuickJS-NG fork at
+  `third_party/rquickjs/sys/quickjs` as its nested submodule.
+- **Wiring**: `[patch.crates-io]` path entries in the workspace root
+  `Cargo.toml`; the rquickjs tree is its own workspace excluded from the
+  tinybrowser workspace.
+- **Pinned revisions**: `third_party/rquickjs` at `d73fbda`, nested
+  `sys/quickjs` at `712757e` (check `git submodule status`).
+- **Fresh clones**: `git submodule update --init --recursive`.
+- **Update**: pull upstream inside the submodule, push the fork branch there,
+  then bump the submodule pointer here.
+
+## Test data (never ships)
 
 ## web-platform-tests
 
