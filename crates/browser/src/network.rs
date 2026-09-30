@@ -178,7 +178,7 @@ impl TabNetworkHandle {
         })
     }
 
-    /// Async GET for one renderer service call, cancelled when the renderer
+    /// Async HTTP request for one renderer service call, cancelled when the renderer
     /// dies or the tab closes.
     pub(crate) async fn dial_request(
         &self,
@@ -199,7 +199,16 @@ impl TabNetworkHandle {
                 return Err(DialFailure::Connect);
             }
             let method = net::Method::parse(&request.method).map_err(|_| DialFailure::Connect)?;
+            // https://fetch.spec.whatwg.org/#forbidden-method
+            if request.kind == DialKind::JsFetch
+                && matches!(method.as_str().to_ascii_uppercase().as_str(), "CONNECT" | "TRACE" | "TRACK")
+            {
+                return Err(DialFailure::Connect);
+            }
             let mut outbound = Request::new(method, url);
+            if request.kind == DialKind::JsFetch {
+                outbound.same_origin = Some(initiator.origin());
+            }
             if let Some(content_type) = &request.content_type {
                 let _ = outbound
                     .headers
@@ -225,11 +234,6 @@ impl TabNetworkHandle {
                 .send(outbound)
                 .await
                 .map_err(|error| dial_failure(&error))?;
-            if request.kind == DialKind::JsFetch
-                && response.final_url().origin() != initiator.origin()
-            {
-                return Err(DialFailure::Connect);
-            }
             let status = response.status();
             let final_url = response.final_url().to_string();
             let (content_type, content_language) = response_meta(response.headers());

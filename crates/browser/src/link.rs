@@ -4,6 +4,7 @@
 //! reader and writer tasks, and oneshot replies. The handle stays value-only.
 
 use std::io;
+use std::collections::HashMap;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -290,6 +291,7 @@ impl RendererHandle {
             final_url: mount.url.clone(),
             content_type: mount.content_type.clone(),
             content_language: mount.content_language.clone(),
+            history: mount.history.clone(),
         };
         let upload = if let Ok(result) = timeout(
             request_timeout(),
@@ -363,6 +365,11 @@ struct ReaderContext {
     kill: watch::Sender<bool>,
 }
 
+struct ActiveDial {
+    assignment: RendererAssignmentId,
+    cancel: watch::Sender<bool>,
+}
+
 struct ServiceContext {
     responder: BrowserServiceResponder,
     /// Process this service task belongs to; renderer calls may only resolve
@@ -377,6 +384,7 @@ struct ServiceContext {
     kill: watch::Sender<bool>,
     /// Browser command handle: renderer links create tabs for `window.open`.
     browser: crate::browser::BrowserHandle,
+    dials: Arc<Mutex<HashMap<RequestId, ActiveDial>>>,
 }
 
 async fn writer_task(
@@ -567,11 +575,17 @@ async fn route_service_call(
             let worker_network = assignment.network.clone();
             let responder = context.responder.clone();
             let worker_kill = context.kill.clone();
-            let cancel = context.kill.subscribe();
+            let mut kill = context.kill.subscribe();
+            let (cancel_tx, cancel_rx) = watch::channel(false);
+            context.dials.lock().unwrap_or_else(PoisonError::into_inner).insert(id, ActiveDial { assignment: assignment_id, cancel: cancel_tx });
+            let dials = context.dials.clone();
             tokio::spawn(async move {
-                let outcome = worker_network
-                    .dial_request(&request, &initiator, cancel)
-                    .await;
+                let outcome = tokio::select! {
+                    biased;
+                    _ = kill.changed() => Err(renderer::DialFailure::Cancelled),
+                    result = worker_network.dial_request(&request, &initiator, cancel_rx) => result,
+                };
+                dials.lock().unwrap_or_else(PoisonError::into_inner).remove(&id);
                 if responder
                     .reply(id, ServiceReply::Dial(outcome))
                     .await
@@ -580,6 +594,15 @@ async fn route_service_call(
                     let _result = worker_kill.send(true);
                 }
             });
+        }
+        ServiceCall::Network(NetworkCall::CancelDial { id: target }) => {
+            if let Some(dial) = context.dials.lock().unwrap_or_else(PoisonError::into_inner).get(&target) {
+                if dial.assignment != assignment_id {
+                    return Err(RendererViolation);
+                }
+                let _sent = dial.cancel.send(true);
+            }
+            send_reply(&context.responder, id, ServiceReply::Unit).await?;
         }
         ServiceCall::Network(NetworkCall::CookieGet { url }) => {
             let Some(url) = assignment.site.authorize(&url) else {
@@ -956,7 +979,7 @@ async fn send_released_reply(
             ServiceReply::Dial(Err(renderer::DialFailure::Cancelled))
         }
         ServiceCall::Network(NetworkCall::CookieGet { .. }) => ServiceReply::Cookie(String::new()),
-        ServiceCall::Network(NetworkCall::CookieSet { .. })
+        ServiceCall::Network(NetworkCall::CookieSet { .. } | NetworkCall::CancelDial { .. })
         | ServiceCall::Messaging(MessagingCall::BroadcastPost { .. })
         | ServiceCall::BrowsingContext(
             BrowsingContextCall::WindowClose { .. } | BrowsingContextCall::WindowMessage { .. },
@@ -1169,6 +1192,7 @@ pub(crate) async fn spawn_process(
         sessions,
         kill: kill.clone(),
         browser,
+        dials: Arc::new(Mutex::new(HashMap::new())),
     };
     let reader_task = tokio::spawn(reader_task(reader, reader_context, Some(ready_tx)));
     let service_task = tokio::spawn(service_task(server, service_context));

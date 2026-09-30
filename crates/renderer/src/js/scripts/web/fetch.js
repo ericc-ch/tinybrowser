@@ -3,6 +3,14 @@
 const __tbHeadersData = Symbol.for('tinybrowser.headers.data');
 const __tbResponseData = Symbol.for('tinybrowser.response.data');
 const __tbRequestData = Symbol.for('tinybrowser.request.data');
+// https://fetch.spec.whatwg.org/#concept-method-normalize
+const __tbRequestMethod = value => {
+  const method = String(value);
+  if (!/^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/.test(method) || /^(CONNECT|TRACE|TRACK)$/i.test(method)) {
+    throw new TypeError('Invalid HTTP method');
+  }
+  return /^(DELETE|GET|HEAD|OPTIONS|POST|PUT)$/i.test(method) ? method.toUpperCase() : method;
+};
 const __tbBrand = (value, symbol, message) => {
   const data = value === null || value === undefined ? undefined : value[symbol];
   if (data === undefined) throw new TypeError(message === undefined ? 'Illegal invocation' : message);
@@ -148,13 +156,13 @@ globalThis.Request = class Request {
       url = source.url;
       method = source.method;
       blob = source.blob;
-      headers = source.headers;
+      headers = new globalThis.Headers(source.headers);
       body = source.body;
     } else {
       const resolved = globalThis.__tbResolveUrl(String(input), undefined);
       url = resolved === null ? String(input) : resolved;
     }
-    if (options.method !== undefined) method = String(options.method).toUpperCase();
+    if (options.method !== undefined) method = __tbRequestMethod(options.method);
     if (options.headers !== undefined) headers = new globalThis.Headers(options.headers);
     if (options.body !== undefined) body = options.body;
     // A Request keeps a blob URL's data alive, so fetching it still works
@@ -171,7 +179,7 @@ globalThis.Request = class Request {
     const data = __tbBrand(this, __tbRequestData);
     const copy = Object.create(globalThis.Request.prototype);
     Object.defineProperty(copy, __tbRequestData, {
-      value: { url: data.url, method: data.method, blob: data.blob, headers: data.headers, body: data.body },
+      value: { url: data.url, method: data.method, blob: data.blob, headers: new globalThis.Headers(data.headers), body: data.body },
       writable: false, enumerable: false, configurable: false,
     });
     return copy;
@@ -201,6 +209,7 @@ const __tbQueuePageRequest = (url, method, body, headers, callback) => {
     callback(status, bytes, finalUrl, contentType, responseHeaders);
   };
   __tbPageRequestBody(body).then(payload => {
+    if (!globalThis.__tb_fetchCbs[id]) return;
     const fields = new globalThis.Headers(headers);
     const type = fields.get('content-type') === null ? payload.type : null;
     globalThis.__queueFetch(url, id, method, payload.bytes, type, Array.from(fields));
@@ -209,6 +218,12 @@ const __tbQueuePageRequest = (url, method, body, headers, callback) => {
     if (done) done(0, new Uint8Array(), '', '', []);
   });
   return id;
+};
+// https://fetch.spec.whatwg.org/#fetch-controller
+const __tbCancelPageRequest = id => {
+  if (id === null) return;
+  delete globalThis.__tb_fetchCbs[id];
+  globalThis.__cancelFetch(id);
 };
 globalThis.fetch = function(input, init) {
   const options = init === undefined ? {} : Object(init);
@@ -222,13 +237,16 @@ globalThis.fetch = function(input, init) {
     url = source.url;
     method = source.method;
     blob = source.blob;
-    headers = source.headers;
+    headers = new globalThis.Headers(source.headers);
     body = source.body;
   } else {
     const resolved = globalThis.__tbResolveUrl(String(input), undefined);
     url = resolved === null ? String(input) : resolved;
   }
-  if (options.method !== undefined) method = String(options.method).toUpperCase();
+  if (options.method !== undefined) {
+    try { method = __tbRequestMethod(options.method); }
+    catch (error) { return Promise.reject(error); }
+  }
   if (options.headers !== undefined) headers = new globalThis.Headers(options.headers);
   if (options.body !== undefined) body = options.body;
   return new Promise(function(resolve, reject) {

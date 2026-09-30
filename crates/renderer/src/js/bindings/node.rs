@@ -472,10 +472,10 @@ impl JsNode {
     /// <https://drafts.csswg.org/cssom-view/#dom-element-scrollintoview>
     #[qjs(rename = "scrollIntoView")]
     fn scroll_into_view(&self, ctx: Ctx<'_>) -> Result<()> {
-        let Some((left, top, width, height)) = element_box(&ctx, self.handle.0)? else {
+        let Some((left, top, width, _height)) = element_box(&ctx, self.handle.0)? else {
             return Ok(());
         };
-        let world = world(&ctx)?;
+        let world = world_for_node(&ctx, self.handle.0)?;
         let world = world.borrow();
         let Some(mut parsed) = world.document_mut(self.handle.0) else {
             return Ok(());
@@ -485,15 +485,13 @@ impl JsNode {
             .flatten() else {
             return Ok(());
         };
-        let (scroll_x, scroll_y) = dom::metadata::scroll_offset(&parsed.document, root);
+        let (scroll_x, _scroll_y) = dom::metadata::scroll_offset(&parsed.document, root);
         let viewport_width = f64::from(crate::engine::VIEWPORT_WIDTH);
-        let viewport_height = f64::from(crate::engine::VIEWPORT_HEIGHT);
         let next_x = if left < scroll_x { left } else if left + width > scroll_x + viewport_width {
             left + width - viewport_width
         } else { scroll_x };
-        let next_y = if top < scroll_y { top } else if top + height > scroll_y + viewport_height {
-            top + height - viewport_height
-        } else { scroll_y };
+        // https://drafts.csswg.org/cssom-view/#dom-element-scrollintoview
+        let next_y = top;
         dom::metadata::set_scroll_offset(&mut parsed.document, root, next_x.max(0.0), next_y.max(0.0));
         Ok(())
     }

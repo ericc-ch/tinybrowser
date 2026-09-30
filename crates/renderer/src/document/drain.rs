@@ -31,6 +31,13 @@ impl Document {
     fn adopt_dial_completions(&mut self) {
         while let Ok(completed) = self.dial_rx.try_recv() {
             self.in_flight_dials = self.in_flight_dials.saturating_sub(1);
+            let context = match &completed {
+                Ok(done) => done.context,
+                Err(context) => *context,
+            };
+            if let DialContext::JsFetch { epoch, id } = context {
+                self.fetch_cancellations.remove(&(epoch, id));
+            }
             match completed {
                 Ok(done) => self.tasks.push_back(Task::DialFinished(done)),
                 Err(fail) => self.tasks.push_back(Task::DialFailed(fail)),
@@ -67,6 +74,9 @@ impl Document {
     }
 
     pub(crate) fn release(&mut self) {
+        for (_, cancel) in self.fetch_cancellations.drain() {
+            cancel();
+        }
         self.queued_dials.clear();
         self.in_flight_dials = 0;
         self.decoder = None;
@@ -97,7 +107,7 @@ impl Document {
             let stop = Arc::clone(&self.stop);
             let request = super::dial::request(&dial);
             self.in_flight_dials = self.in_flight_dials.saturating_add(1);
-            self.services.start_dial(
+            let cancel = self.services.start_dial(
                 request,
                 Box::new(move |outcome| {
                     if stop.is_set() {
@@ -108,6 +118,9 @@ impl Document {
                     wake.notify_one();
                 }),
             );
+            if let DialContext::JsFetch { epoch, id } = dial.context {
+                self.fetch_cancellations.insert((epoch, id), cancel);
+            }
         }
     }
 
@@ -183,7 +196,17 @@ impl Document {
             let id = self.schedule_timer(timeout.delay);
             self.js_timer_slots.insert(id, timeout.js_id);
         }
+        let fetch_cancels: HashSet<_> = std::mem::take(&mut self.world.borrow_mut().pending_fetch_cancels).into_iter().collect();
+        self.queued_dials.retain(|dial| !matches!(dial.context, DialContext::JsFetch { id, epoch } if epoch == self.js_epoch && fetch_cancels.contains(&id)));
+        for id in &fetch_cancels {
+            if let Some(cancel) = self.fetch_cancellations.remove(&(self.js_epoch, *id)) {
+                cancel();
+            }
+        }
         for fetch in fetches {
+            if fetch_cancels.contains(&fetch.js_id) {
+                continue;
+            }
             let pending_js_fetches = self.in_flight_dials.saturating_add(
                 self.queued_dials
                     .iter()

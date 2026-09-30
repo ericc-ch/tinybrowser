@@ -613,7 +613,7 @@ pub(super) fn element_box(ctx: &Ctx<'_>, node: NodeId) -> Result<Option<(f64, f6
 /// Current viewport offset from the document's scrolling element.
 /// <https://drafts.csswg.org/cssom-view/#scrolling-viewport>
 fn viewport_scroll(ctx: &Ctx<'_>, node: NodeId) -> Result<(f64, f64)> {
-    let world = world(ctx)?;
+    let world = world_for_node(ctx, node)?;
     let world = world.borrow();
     let Some(parsed) = world.document(node) else {
         return Ok((0.0, 0.0));
@@ -1763,8 +1763,9 @@ mod realm_tests {
     struct NullServices;
 
     impl NetworkHost for NullServices {
-        fn start_dial(&self, _request: DialRequest, completion: DialCompletion) {
+        fn start_dial(&self, _request: DialRequest, completion: DialCompletion) -> crate::protocol::DialCancellation {
             completion(Err(crate::protocol::DialFailure::Connect));
+            Box::new(|| {})
         }
 
         fn cookies_for(&self, _url: &Url) -> String {

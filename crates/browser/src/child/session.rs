@@ -353,6 +353,7 @@ impl ResponseStreams {
             url.as_ref(),
             response.content_type.as_deref(),
             response.content_language.as_deref(),
+            &response.history,
         )?;
         self.active.insert(
             id,
@@ -528,8 +529,8 @@ fn handle_command(engine: &mut Engine, command: Command) -> Handled {
             engine.receive_remote_window_message(payload);
             Handled::Reply(Reply::Unit(Ok(())))
         }
-        Command::HistoryTraverse { url, state, length } => {
-            Handled::Reply(Reply::Unit(engine.traverse_history(&url, state.as_deref(), length)))
+        Command::HistoryTraverse { url, history } => {
+            Handled::Reply(Reply::Unit(engine.traverse_history(&url, &history)))
         }
     }
 }

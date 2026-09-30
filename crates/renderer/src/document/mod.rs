@@ -190,6 +190,7 @@ pub(crate) struct Document {
     dial_tx: Sender<Result<CompletedDial, DialContext>>,
     dial_rx: Receiver<Result<CompletedDial, DialContext>>,
     in_flight_dials: usize,
+    fetch_cancellations: HashMap<(u64, i32), crate::protocol::DialCancellation>,
     queued_dials: Vec<QueuedDial>,
     /// Every stylesheet URL already queued or loaded, so re-scans do not
     /// refetch. The loaded text lives in the world beside decoded images so
@@ -279,6 +280,7 @@ impl Document {
             dial_tx,
             dial_rx,
             in_flight_dials: 0,
+            fetch_cancellations: HashMap::new(),
             queued_dials: Vec::new(),
             stylesheet_urls: HashSet::new(),
             pending_stylesheets: 0,
@@ -558,17 +560,16 @@ impl Document {
     pub(crate) fn traverse_history(
         &mut self,
         url: &str,
-        state: Option<&str>,
-        length: usize,
+        history: &crate::protocol::HistorySnapshot,
     ) -> Result<(), TabError> {
         let url = Url::parse(url).map_err(|_| TabError::InvalidUrl { spec: url.to_owned() })?;
         if url.origin() != self.url.origin() {
             return Err(TabError::InvalidUrl { spec: url.into() });
         }
         self.apply_document_url(url.as_str());
-        self.world.borrow_mut().history = crate::protocol::HistorySnapshot { length, state: state.map(str::to_owned) };
+        self.world.borrow_mut().history = history.clone();
         if let Some(js) = &self.js {
-            js.traverse_history(url.as_str(), state, length).map_err(TabError::from)?;
+            js.traverse_history(url.as_str(), history.state.as_deref(), history.length).map_err(TabError::from)?;
         }
         Ok(())
     }
@@ -971,6 +972,9 @@ impl Document {
     }
 
     fn reset_js_realm(&mut self) {
+        for (_, cancel) in self.fetch_cancellations.drain() {
+            cancel();
+        }
         // The old realm's ports are gone with it; the peers fire `close`
         // (<https://html.spec.whatwg.org/multipage/web-messaging.html#disentangle>).
         // A navigation also destroys this frame's own children.

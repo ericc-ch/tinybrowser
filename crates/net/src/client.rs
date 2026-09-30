@@ -337,6 +337,10 @@ impl Agent {
         }
 
         loop {
+            // https://fetch.spec.whatwg.org/#http-fetch
+            if request.same_origin.as_ref().is_some_and(|origin| url.origin() != *origin) {
+                return Err(NetError::Protocol(ProtocolError::RejectedRequest));
+            }
             if budget.is_expired() {
                 return Err(NetError::Transport(TransportError::Timeout(
                     budget.timeout_kind(TimeoutKind::Global),
@@ -457,6 +461,9 @@ pub struct Request {
     /// Overrides [`AgentOptions::timeout_global`]; the per-call timeout still
     /// applies hop by hop.
     pub deadline: Option<Instant>,
+    /// When set, reject any initial or redirected hop outside this origin
+    /// before sending headers or body. Navigation and subresources leave it unset.
+    pub same_origin: Option<url::Origin>,
 }
 
 impl Request {
@@ -472,6 +479,7 @@ impl Request {
             initiator: None,
             body: None,
             deadline: None,
+            same_origin: None,
         }
     }
 }

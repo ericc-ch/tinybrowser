@@ -912,8 +912,8 @@ impl<C, OR, N, IR> BlockingClient<C, OR, N, IR> {
         &self,
         body: C,
         callback: impl FnOnce(Result<IR, Error>) + Send + 'static,
-    ) {
-        let _result = self.start(body, BlockingPending::Callback(Box::new(callback)));
+    ) -> Option<RequestId> {
+        self.start(body, BlockingPending::Callback(Box::new(callback))).ok()
     }
 
     pub(crate) fn deliver(&self, id: RequestId, body: IR) {
@@ -949,7 +949,7 @@ impl<C, OR, N, IR> BlockingClient<C, OR, N, IR> {
         }
     }
 
-    fn start(&self, body: C, pending: BlockingPending<IR>) -> Result<(), Error> {
+    fn start(&self, body: C, pending: BlockingPending<IR>) -> Result<RequestId, Error> {
         let id = RequestId::new(self.next.fetch_add(1, Ordering::Relaxed));
         self.pending
             .lock()
@@ -966,7 +966,7 @@ impl<C, OR, N, IR> BlockingClient<C, OR, N, IR> {
             }
             return Err(Error::Closed);
         }
-        Ok(())
+        Ok(id)
     }
 }
 

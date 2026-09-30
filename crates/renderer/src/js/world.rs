@@ -317,6 +317,7 @@ pub(crate) struct World {
     pub(crate) history: crate::protocol::HistorySnapshot,
     pub(crate) pending_history: Vec<crate::protocol::RendererEvent>,
     pub pending_cancels: Vec<i32>,
+    pub pending_fetch_cancels: Vec<i32>,
     pub pending_html_writes: Vec<String>,
     frame_navigations: Vec<FrameNavigation>,
     /// Connected `<img>` elements whose `src` changed inside script.
@@ -464,6 +465,7 @@ impl World {
             history: crate::protocol::HistorySnapshot::default(),
             pending_history: Vec::new(),
             pending_cancels: Vec::new(),
+            pending_fetch_cancels: Vec::new(),
             pending_html_writes: Vec::new(),
             frame_navigations: Vec::new(),
             image_updates: Vec::new(),

@@ -213,7 +213,11 @@ pub struct Mount {
 /// Browser-owned history state passed to a newly created document realm.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct HistorySnapshot {
+    /// Total session-history entry count.
     pub length: usize,
+    /// Zero-based position of the active entry, including any forward branch.
+    pub index: usize,
+    /// Serialized classic history API state of the active entry.
     pub state: Option<String>,
 }
 
@@ -330,14 +334,19 @@ pub struct DialOutcome {
 /// Completion for a dial submitted to the browser process.
 pub type DialCompletion = Box<dyn FnOnce(Result<DialOutcome, DialFailure>) + Send + 'static>;
 
+/// Cancels a submitted dial, including its redirect chain. Calling it still
+/// delivers exactly one completion; dropping it leaves the request running.
+pub type DialCancellation = Box<dyn FnOnce() + Send + 'static>;
+
 /// Network effects the page engine asks its host to perform.
 pub trait NetworkHost: Send + Sync + 'static {
-    /// Submits one GET without blocking the renderer thread. The completion
+    /// Submits one HTTP request without blocking the renderer thread and
+    /// returns a handle that cancels it. The completion
     /// receives [`DialFailure`] for transport, timeout, queue, body-limit, or
     /// cancellation failure.
     /// Implementations must invoke it exactly once, including when submission
     /// is rejected.
-    fn start_dial(&self, request: DialRequest, completion: DialCompletion);
+    fn start_dial(&self, request: DialRequest, completion: DialCompletion) -> DialCancellation;
 
     /// `document.cookie` getter for `url`.
     fn cookies_for(&self, url: &Url) -> String;

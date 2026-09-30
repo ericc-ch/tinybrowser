@@ -31,6 +31,7 @@ impl SessionHistory {
     pub(crate) fn snapshot(&self) -> HistorySnapshot {
         HistorySnapshot {
             length: self.entries.len(),
+            index: self.current,
             state: self.entries[self.current].state.clone(),
         }
     }

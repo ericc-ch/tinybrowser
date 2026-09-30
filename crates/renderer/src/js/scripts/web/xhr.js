@@ -1,5 +1,37 @@
 // https://xhr.spec.whatwg.org/#the-xmlhttprequest-interface
 const __tbXhrData = Symbol('tinybrowser.xhr');
+const __tbXhrCancel = data => {
+  data.generation++;
+  __tbCancelPageRequest(data.request);
+  data.request = null;
+  if (data.timer !== null) clearTimeout(data.timer);
+  data.timer = null;
+};
+// https://xhr.spec.whatwg.org/#request-error-steps
+const __tbXhrError = (xhr, data, type) => {
+  __tbXhrCancel(data);
+  data.sent = false;
+  data.state = 4;
+  data.status = 0;
+  data.responseURL = '';
+  data.responseHeaders = new Headers();
+  data.responseBytes = new Uint8Array();
+  xhr.dispatchEvent(new Event('readystatechange'));
+  xhr.dispatchEvent(new ProgressEvent(type));
+  xhr.dispatchEvent(new ProgressEvent('loadend'));
+};
+// https://xhr.spec.whatwg.org/#the-timeout-attribute
+const __tbXhrTimeout = (xhr, data) => {
+  if (data.timer !== null) clearTimeout(data.timer);
+  data.timer = null;
+  if (!data.sent || data.timeout === 0) return;
+  const generation = data.generation;
+  data.timer = globalThis.__tb_timeouts.length;
+  globalThis.__tb_timeouts.push(() => {
+    if (data.sent && data.generation === generation) __tbXhrError(xhr, data, 'timeout');
+  });
+  globalThis.__scheduleTimeout(data.timer, Math.max(0, data.started + data.timeout - Date.now()));
+};
 globalThis.XMLHttpRequestUpload = class XMLHttpRequestUpload extends EventTarget {};
 globalThis.XMLHttpRequest = class XMLHttpRequest extends EventTarget {
   constructor() {
@@ -9,6 +41,7 @@ globalThis.XMLHttpRequest = class XMLHttpRequest extends EventTarget {
         state: 0, sent: false, method: '', url: '', headers: new Headers(),
         responseHeaders: new Headers(), responseURL: '', status: 0, responseBytes: new Uint8Array(),
         responseType: '', timeout: 0, withCredentials: false, generation: 0,
+        request: null, timer: null, started: 0,
         upload: new XMLHttpRequestUpload(),
       },
     });
@@ -19,7 +52,11 @@ globalThis.XMLHttpRequest = class XMLHttpRequest extends EventTarget {
   get responseURL() { return __tbBrand(this, __tbXhrData).responseURL; }
   get upload() { return __tbBrand(this, __tbXhrData).upload; }
   get timeout() { return __tbBrand(this, __tbXhrData).timeout; }
-  set timeout(value) { __tbBrand(this, __tbXhrData).timeout = Number(value) >>> 0; }
+  set timeout(value) {
+    const data = __tbBrand(this, __tbXhrData);
+    data.timeout = Number(value) >>> 0;
+    __tbXhrTimeout(this, data);
+  }
   get withCredentials() { return __tbBrand(this, __tbXhrData).withCredentials; }
   set withCredentials(value) {
     const data = __tbBrand(this, __tbXhrData);
@@ -59,7 +96,7 @@ globalThis.XMLHttpRequest = class XMLHttpRequest extends EventTarget {
     const parsed = globalThis.__tbResolveUrl(String(url), undefined);
     if (parsed === null) throw new DOMException('Invalid URL', 'SyntaxError');
     if (!async) throw new DOMException('Synchronous requests are not supported', 'InvalidAccessError');
-    data.generation++;
+    __tbXhrCancel(data);
     data.method = /^(GET|HEAD|POST|PUT|DELETE|OPTIONS)$/i.test(verb) ? verb.toUpperCase() : verb;
     data.url = parsed;
     data.sent = false;
@@ -85,17 +122,15 @@ globalThis.XMLHttpRequest = class XMLHttpRequest extends EventTarget {
     if (data.state !== 1 || data.sent) throw new DOMException('Request not open', 'InvalidStateError');
     if (data.method === 'GET' || data.method === 'HEAD') body = null;
     data.sent = true;
+    data.started = Date.now();
     const generation = data.generation;
     this.dispatchEvent(new ProgressEvent('loadstart'));
     if (data.state !== 1 || !data.sent || data.generation !== generation) return;
-    __tbQueuePageRequest(data.url, data.method, body, data.headers, (status, bytes, url, type, fields) => {
+    data.request = __tbQueuePageRequest(data.url, data.method, body, data.headers, (status, bytes, url, type, fields) => {
       if (data.generation !== generation || !data.sent) return;
+      data.request = null;
       if (status === 0) {
-        data.state = 4;
-        data.sent = false;
-        this.dispatchEvent(new Event('readystatechange'));
-        this.dispatchEvent(new ProgressEvent('error'));
-        this.dispatchEvent(new ProgressEvent('loadend'));
+        __tbXhrError(this, data, 'error');
         return;
       }
       data.status = status;
@@ -104,32 +139,38 @@ globalThis.XMLHttpRequest = class XMLHttpRequest extends EventTarget {
       if (type && !data.responseHeaders.has('content-type')) data.responseHeaders.set('content-type', type);
       data.state = 2;
       this.dispatchEvent(new Event('readystatechange'));
-      if (data.state !== 2) return;
+      if (data.generation !== generation || data.state !== 2 || !data.sent) return;
       data.responseBytes = bytes;
       if (bytes.length) {
         data.state = 3;
         this.dispatchEvent(new Event('readystatechange'));
+        if (data.generation !== generation || data.state !== 3 || !data.sent) return;
         this.dispatchEvent(new ProgressEvent('progress', { loaded: bytes.length }));
+        if (data.generation !== generation || data.state !== 3 || !data.sent) return;
       }
+      // https://xhr.spec.whatwg.org/#handle-response-end-of-body
+      if (data.timer !== null) clearTimeout(data.timer);
+      data.timer = null;
       data.state = 4;
       data.sent = false;
       this.dispatchEvent(new Event('readystatechange'));
+      if (data.generation !== generation || data.state !== 4) return;
       this.dispatchEvent(new ProgressEvent('load', { loaded: bytes.length }));
       this.dispatchEvent(new ProgressEvent('loadend', { loaded: bytes.length }));
     });
+    __tbXhrTimeout(this, data);
   }
   // https://xhr.spec.whatwg.org/#the-abort()-method
   abort() {
     const data = __tbBrand(this, __tbXhrData);
-    data.generation++;
     if (data.sent || data.state === 2 || data.state === 3) {
-      data.sent = false;
-      data.state = 4;
+      __tbXhrError(this, data, 'abort');
+    } else {
+      __tbXhrCancel(data);
       data.status = 0;
+      data.responseURL = '';
+      data.responseHeaders = new Headers();
       data.responseBytes = new Uint8Array();
-      this.dispatchEvent(new Event('readystatechange'));
-      this.dispatchEvent(new ProgressEvent('abort'));
-      this.dispatchEvent(new ProgressEvent('loadend'));
     }
     if (data.state === 4) data.state = 0;
   }

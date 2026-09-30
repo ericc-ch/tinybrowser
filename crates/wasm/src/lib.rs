@@ -190,6 +190,7 @@ fn to_event(event: RendererEvent) -> Event {
 
 /// One dial's state, kept across its redirect hops.
 struct Chain {
+    dial: u64,
     /// URL of the hop in flight.
     url: Url,
     /// Document URL the dial started from, for `SameSite`.
@@ -418,7 +419,7 @@ impl WasmServices {
 }
 
 impl NetworkHost for WasmServices {
-    fn start_dial(&self, request: DialRequest, completion: DialCompletion) {
+    fn start_dial(&self, request: DialRequest, completion: DialCompletion) -> renderer::DialCancellation {
         // A dial the component cannot shape is not a transport question, so it
         // never reaches the host.
         let shaped = Url::parse(&request.url)
@@ -426,11 +427,13 @@ impl NetworkHost for WasmServices {
             .filter(|url| matches!(url.scheme(), "http" | "https"));
         let Some(url) = shaped else {
             completion(Err(DialFailure::Connect));
-            return;
+            return Box::new(|| {});
         };
+        let dial = NEXT_FETCH.fetch_add(1, Ordering::Relaxed);
         start_hop(
             self.owner,
             Chain {
+                dial,
                 url,
                 initiator: Url::parse(&request.initiator).ok(),
                 kind: request.kind,
@@ -440,6 +443,19 @@ impl NetworkHost for WasmServices {
             },
             completion,
         );
+        Box::new(move || {
+            let pending = {
+                let mut fetches = lock(pending_fetches());
+                let id = fetches.iter().find_map(|(&id, fetch)| (fetch.chain.dial == dial).then_some(id));
+                id.and_then(|id| fetches.remove(&id).map(|fetch| (id, fetch)))
+            };
+            if let Some((id, fetch)) = pending {
+                bindings::tinybrowser::browser::host::cancel_fetch(id);
+                if let Some(completion) = fetch.completion {
+                    completion(Err(DialFailure::Cancelled));
+                }
+            }
+        })
     }
 
     fn cookies_for(&self, url: &Url) -> String {

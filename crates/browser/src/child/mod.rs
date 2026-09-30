@@ -247,12 +247,12 @@ impl ChannelServices {
     }
 
     fn start_dial(
-        &self,
+        self: &Arc<Self>,
         assignment: RendererAssignmentId,
         request: DialRequest,
         completion: DialCompletion,
-    ) {
-        self.client.call_with(
+    ) -> renderer::DialCancellation {
+        let id = self.client.call_with(
             BrowserCall {
                 assignment,
                 call: ServiceCall::Network(NetworkCall::Dial(request)),
@@ -270,6 +270,15 @@ impl ChannelServices {
                 | Err(_) => completion(Err(renderer::DialFailure::Connect)),
             },
         );
+        let channel = self.clone();
+        Box::new(move || {
+            if let Some(id) = id {
+                let _call = channel.client.call_with(
+                    BrowserCall { assignment, call: ServiceCall::Network(NetworkCall::CancelDial { id }) },
+                    |_| {},
+                );
+            }
+        })
     }
 
     fn deliver(&self, id: RequestId, reply: ServiceReply) {
@@ -296,9 +305,9 @@ impl AssignmentServices {
 }
 
 impl NetworkHost for AssignmentServices {
-    fn start_dial(&self, request: DialRequest, completion: DialCompletion) {
+    fn start_dial(&self, request: DialRequest, completion: DialCompletion) -> renderer::DialCancellation {
         self.channel
-            .start_dial(self.assignment, request, completion);
+            .start_dial(self.assignment, request, completion)
     }
 
     fn cookies_for(&self, url: &Url) -> String {

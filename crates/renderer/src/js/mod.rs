@@ -348,7 +348,9 @@ impl JsRealm {
         self.with_budget(None, || {
             self.context.with(|ctx| {
                 let cbs: Object = ctx.globals().get("__tb_fetchCbs")?;
-                let func: Function = cbs.get(js_id)?;
+                let Some(func) = cbs.get::<_, Option<Function>>(js_id)? else {
+                    return Ok(());
+                };
                 let (status, body, url, content_type, headers) = match outcome {
                     Some(outcome) => (
                         i32::from(outcome.status),
@@ -726,6 +728,7 @@ impl JsRealm {
         let timeouts = self.pending_timeouts.clone();
         let fetches = self.pending_fetches.clone();
         let cancel_world = world.clone();
+        let cancel_fetch_world = world.clone();
 
         ctx.globals().set(
             "__scheduleTimeout",
@@ -744,6 +747,12 @@ impl JsRealm {
             }),
         )?;
 
+        ctx.globals().set(
+            "__cancelFetch",
+            Func::from(move |js_id: i32| {
+                cancel_fetch_world.borrow_mut().pending_fetch_cancels.push(js_id);
+            }),
+        )?;
         ctx.globals().set(
             "__queueFetch",
             Func::from(
@@ -887,7 +896,9 @@ fn install_history_host_functions(ctx: &Ctx<'_>, world: &Rc<RefCell<World>>) -> 
             world.document_url = next;
             world.history.state = Some(state.clone());
             if !replace {
-                world.history.length = world.history.length.max(1).saturating_add(1);
+                // https://html.spec.whatwg.org/multipage/browsing-the-web.html#url-and-history-update-steps
+                world.history.index = world.history.index.saturating_add(1);
+                world.history.length = world.history.index.saturating_add(1);
             }
             world.pending_history.push(crate::protocol::RendererEvent::HistoryUpdated { url, state, replace });
             Ok::<usize, rquickjs::Error>(world.history.length)

@@ -896,8 +896,11 @@ impl Tab {
         if same_document {
             let result = self.renderer_request(RendererCommand::HistoryTraverse {
                 url: url.clone(),
-                state,
-                length: self.history.snapshot().length,
+                history: HistorySnapshot {
+                    state,
+                    index,
+                    length: self.history.snapshot().length,
+                },
             }).await;
             if matches!(result, Ok(Reply::Unit(Ok(())))) {
                 self.history.traverse_same_document(index);

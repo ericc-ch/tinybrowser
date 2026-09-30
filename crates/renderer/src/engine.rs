@@ -160,10 +160,12 @@ impl Engine {
         url: Option<&Url>,
         content_type: Option<&str>,
         content_language: Option<&str>,
+        history: &crate::protocol::HistorySnapshot,
     ) -> Result<(), TabError> {
         self.remove_descendants(frame);
-        self.frame_mut(frame)?
-            .begin_response(url, content_type, content_language);
+        let document = self.frame_mut(frame)?;
+        document.world().borrow_mut().history = history.clone();
+        document.begin_response(url, content_type, content_language);
         Ok(())
     }
 
@@ -347,9 +349,9 @@ impl Engine {
     ///
     /// [`TabError::UnknownFrame`] when the main frame is not mounted and
     /// [`TabError::InvalidUrl`] when `url` does not parse or is cross-origin.
-    pub fn traverse_history(&mut self, url: &str, state: Option<&str>, length: usize) -> Result<(), TabError> {
+    pub fn traverse_history(&mut self, url: &str, history: &crate::protocol::HistorySnapshot) -> Result<(), TabError> {
         let document = self.frames.get_mut(&FrameId::MAIN).ok_or(TabError::UnknownFrame { frame: FrameId::MAIN.get() })?;
-        document.traverse_history(url, state, length)
+        document.traverse_history(url, history)
     }
 
     /// Queues one `BroadcastChannel` message on every same-origin frame of
