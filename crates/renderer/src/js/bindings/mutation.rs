@@ -1,94 +1,82 @@
 //! Mutation records, observers, and the mutation delivery queue.
 
 use super::{
-    CollectionKind, child_value, live_collection, option_truthy, required_node, string_value,
-    webidl_to_string, world, wrap_node,
+    CollectionKind, child_value, live_collection, option_truthy, required_node, webidl_to_string,
+    world, wrap_node,
 };
 
 use dom::NodeId;
 
 use rquickjs::{
-    Class, Ctx, Exception, Function, Object, Persistent, Result, Value, class::Trace, prelude::This,
+    Ctx, Exception, Function, Object, Persistent, Result, Value, class::Trace, prelude::This,
 };
 
 use crate::js::world::{Handle, Observation, ObserverOptions, ObserverState, RecordData};
 
 /// `MutationRecord` (<https://dom.spec.whatwg.org/#interface-mutationrecord>).
 #[derive(Trace, rquickjs::JsLifetime)]
-#[rquickjs::class(rename = "MutationRecord")]
-pub struct JsMutationRecord {
-    pub(crate) record: RecordData,
+pub struct JsMutationRecord<'js> {
+    record: RecordData,
+    target: Value<'js>,
+    added_nodes: Value<'js>,
+    removed_nodes: Value<'js>,
 }
 
-#[rquickjs::methods]
-#[allow(
-    clippy::needless_pass_by_value,
-    clippy::unused_self,
-    reason = "rquickjs method ABI passes Ctx by value"
-)]
-impl JsMutationRecord {
-    #[qjs(constructor)]
-    fn ctor(ctx: Ctx<'_>) -> Result<Self> {
-        Err(Exception::throw_type(&ctx, "Illegal constructor"))
+impl<'js> JsMutationRecord<'js> {
+    // https://dom.spec.whatwg.org/#interface-mutationrecord
+    fn new(ctx: &Ctx<'js>, mut record: RecordData) -> Result<Self> {
+        let target = wrap_node(ctx, record.target.0)?;
+        let added_nodes = node_list(ctx, record.target.0, std::mem::take(&mut record.added))?;
+        let removed_nodes = node_list(ctx, record.target.0, std::mem::take(&mut record.removed))?;
+        Ok(Self {
+            record,
+            target,
+            added_nodes,
+            removed_nodes,
+        })
     }
 
-    #[qjs(get, rename = "type")]
-    fn record_type(&self) -> String {
-        self.record.typ.clone()
+    fn record_type(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
+        rquickjs::String::from_str(ctx.clone(), &self.record.typ)
     }
 
-    #[qjs(get)]
-    fn target<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
-        wrap_node(&ctx, self.record.target.0)
+    fn previous_sibling(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
+        child_value(ctx, self.record.previous.map(|handle| handle.0))
     }
 
-    #[qjs(get, rename = "addedNodes")]
-    fn added_nodes<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
-        node_list(&ctx, self.record.target.0, &self.record.added)
+    fn next_sibling(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
+        child_value(ctx, self.record.next.map(|handle| handle.0))
     }
 
-    #[qjs(get, rename = "removedNodes")]
-    fn removed_nodes<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
-        node_list(&ctx, self.record.target.0, &self.record.removed)
+    fn attribute_name(&self, ctx: &Ctx<'js>) -> Result<Option<rquickjs::String<'js>>> {
+        self.record
+            .attribute_name
+            .as_deref()
+            .map(|name| rquickjs::String::from_str(ctx.clone(), name))
+            .transpose()
     }
 
-    #[qjs(get, rename = "previousSibling")]
-    fn previous_sibling<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
-        child_value(&ctx, self.record.previous.map(|handle| handle.0))
+    fn attribute_namespace(&self, ctx: &Ctx<'js>) -> Result<Option<rquickjs::String<'js>>> {
+        self.record
+            .attribute_namespace
+            .as_deref()
+            .map(|namespace| rquickjs::String::from_str(ctx.clone(), namespace))
+            .transpose()
     }
 
-    #[qjs(get, rename = "nextSibling")]
-    fn next_sibling<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
-        child_value(&ctx, self.record.next.map(|handle| handle.0))
-    }
-
-    #[qjs(get, rename = "attributeName")]
-    fn attribute_name<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
-        match &self.record.attribute_name {
-            Some(name) => string_value(&ctx, name),
-            None => Ok(Value::new_null(ctx)),
-        }
-    }
-
-    #[qjs(get, rename = "attributeNamespace")]
-    fn attribute_namespace<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
-        match &self.record.attribute_namespace {
-            Some(namespace) => string_value(&ctx, namespace),
-            None => Ok(Value::new_null(ctx)),
-        }
-    }
-
-    #[qjs(get, rename = "oldValue")]
-    fn old_value<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
-        match &self.record.old_value {
-            Some(value) => string_value(&ctx, value),
-            None => Ok(Value::new_null(ctx)),
-        }
+    fn old_value(&self, ctx: &Ctx<'js>) -> Result<Option<rquickjs::String<'js>>> {
+        self.record
+            .old_value
+            .as_deref()
+            .map(|value| rquickjs::String::from_str(ctx.clone(), value))
+            .transpose()
     }
 }
 
-fn node_list<'js>(ctx: &Ctx<'js>, scope: NodeId, nodes: &[Handle]) -> Result<Value<'js>> {
-    live_collection(ctx, scope, CollectionKind::Static(nodes.to_vec()), None)
+include!(concat!(env!("OUT_DIR"), "/MutationRecord.rs"));
+
+fn node_list<'js>(ctx: &Ctx<'js>, scope: NodeId, nodes: Vec<Handle>) -> Result<Value<'js>> {
+    live_collection(ctx, scope, CollectionKind::Static(nodes), None)
 }
 
 /// `MutationObserver` (<https://dom.spec.whatwg.org/#interface-mutationobserver>).
@@ -268,7 +256,8 @@ impl JsMutationObserver {
         queue
             .into_iter()
             .map(|record| {
-                Ok(Class::instance(ctx.clone(), JsMutationRecord { record })?.into_value())
+                let record = JsMutationRecord::new(&ctx, record)?;
+                Ok(super::host::instance(&ctx, record)?.into_value())
             })
             .collect()
     }
@@ -312,7 +301,8 @@ fn deliver_ready(ctx: &Ctx<'_>) -> Result<()> {
                 for (index, record) in observer.records.into_iter().enumerate() {
                     array.set(
                         index,
-                        Class::instance(ctx.clone(), JsMutationRecord { record })?.into_value(),
+                        super::host::instance(ctx, JsMutationRecord::new(ctx, record)?)?
+                            .into_value(),
                     )?;
                 }
                 let object = observer.object.restore(ctx)?;

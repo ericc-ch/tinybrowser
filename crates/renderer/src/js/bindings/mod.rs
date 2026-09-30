@@ -23,6 +23,7 @@ mod document;
 mod exceptions;
 mod focus;
 mod forms;
+pub(crate) mod host;
 mod messaging;
 mod mutation;
 mod node;
@@ -61,7 +62,7 @@ use rquickjs::{
 
 use super::events::{self, JsEvent, JsEventTarget};
 
-use super::world::{Handle, World};
+use super::world::{Handle, WeakReferences, World};
 
 thread_local! {
     /// JS world per live realm, keyed by its QuickJS context pointer.
@@ -103,13 +104,12 @@ pub(crate) fn main_document(ctx: &Ctx<'_>) -> Result<NodeId> {
 /// Builds and throws a `DOMException` from Rust with a real prototype, so
 /// `instanceof DOMException` and `constructor` checks pass.
 pub(crate) fn throw_dom(ctx: &Ctx<'_>, name: &str, message: &str) -> rquickjs::Error {
-    match Class::instance(
-        ctx.clone(),
-        JsDomException {
-            name: name.into(),
-            message: message.into(),
-        },
-    ) {
+    let exception = (|| {
+        let name = rquickjs::String::from_str(ctx.clone(), name)?;
+        let message = rquickjs::String::from_str(ctx.clone(), message)?;
+        host::instance(ctx, JsDomException { name, message })
+    })();
+    match exception {
         Ok(exception) => ctx.throw(Class::into_value(exception)),
         Err(err) => err,
     }
@@ -407,7 +407,6 @@ pub(crate) fn install(ctx: &Ctx<'_>, world: &Rc<RefCell<World>>) -> Result<()> {
     Class::<JsHtmlCollection>::define(&globals)?;
     Class::<JsOptionsCollection>::define(&globals)?;
     Class::<JsDomException>::define(&globals)?;
-    inherit_error_prototype(&globals)?;
     ctx.eval::<(), _>(events::install_abort_js(ctx)?)?;
     Class::<JsImplementation>::define(&globals)?;
     Class::<JsTokenList>::define(&globals)?;
@@ -446,8 +445,11 @@ pub(crate) fn install(ctx: &Ctx<'_>, world: &Rc<RefCell<World>>) -> Result<()> {
         rquickjs::prelude::Func::from(set_window_handler),
     )?;
     install_brands(ctx)?;
+    // Generated members land on the brands.js `Node.prototype`; the derived
+    // interface prototypes inherit them through the prototype chain.
+    node::install(ctx)?;
     install_collection_brand(ctx)?;
-    install_dom_exception_codes(ctx)?;
+    capture_host_primitives(ctx, &globals, world)?;
 
     let document_id = world
         .borrow()
@@ -484,10 +486,6 @@ pub(crate) fn install(ctx: &Ctx<'_>, world: &Rc<RefCell<World>>) -> Result<()> {
         "__tbDispatchTrusted",
         rquickjs::prelude::Func::from(window_dispatch_trusted_event),
     )?;
-    // Capture pristine intrinsics and the host token before any page script
-    // runs. Conversions and scheduling use these, never `ctx.globals()`,
-    // which page script can clobber.
-    capture_host_primitives(ctx, &globals, world)?;
     Ok(())
 }
 
@@ -502,9 +500,16 @@ fn capture_host_primitives<'js>(
     let number: Function = globals.get("Number")?;
     let boolean: Function = globals.get("Boolean")?;
     let deliver: Function = globals.get("__tb_deliver_mutations")?;
+    let weak_ref: Constructor = globals.get("WeakRef")?;
+    let weak_ref_prototype: Object = weak_ref.get("prototype")?;
+    let weak_ref_deref: Function = weak_ref_prototype.get("deref")?;
     let token = Symbol::new(ctx.clone())?.into_value();
     globals.set("__tbHostToken", token.clone())?;
     let mut world = world.borrow_mut();
+    world.weak_references = Some(WeakReferences {
+        constructor: Persistent::save(ctx, weak_ref),
+        deref: Persistent::save(ctx, weak_ref_deref),
+    });
     world.pristine_string = Some(Persistent::save(ctx, string));
     world.pristine_number = Some(Persistent::save(ctx, number));
     world.pristine_boolean = Some(Persistent::save(ctx, boolean));
@@ -621,7 +626,9 @@ fn viewport_scroll(ctx: &Ctx<'_>, node: NodeId) -> Result<(f64, f64)> {
     let root = dom::selector::select_first(&parsed.document, parsed.document.document(), "html")
         .ok()
         .flatten();
-    Ok(root.map_or((0.0, 0.0), |root| dom::metadata::scroll_offset(&parsed.document, root)))
+    Ok(root.map_or((0.0, 0.0), |root| {
+        dom::metadata::scroll_offset(&parsed.document, root)
+    }))
 }
 
 /// The deepest element whose laid-out border box contains the point, if any.
@@ -899,7 +906,14 @@ fn html_element_interface(local: &str) -> &'static str {
 }
 
 pub(super) fn make_weak<'js>(ctx: &Ctx<'js>, target: Value<'js>) -> Result<Value<'js>> {
-    let ctor: Constructor = ctx.globals().get("WeakRef")?;
+    let ctor = world(ctx)?
+        .borrow()
+        .weak_references
+        .as_ref()
+        .ok_or_else(|| Exception::throw_internal(ctx, "weak references are not initialized"))?
+        .constructor
+        .clone()
+        .restore(ctx)?;
     ctor.construct((target,))
 }
 
@@ -911,7 +925,14 @@ pub(super) fn deref_weak<'js>(
     let object = weak
         .as_object()
         .ok_or_else(|| Exception::throw_type(ctx, "weak wrapper"))?;
-    let deref: Function = object.get("deref")?;
+    let deref = world(ctx)?
+        .borrow()
+        .weak_references
+        .as_ref()
+        .ok_or_else(|| Exception::throw_internal(ctx, "weak references are not initialized"))?
+        .deref
+        .clone()
+        .restore(ctx)?;
     let value: Value = deref.call((This(object.clone()),))?;
     if value.is_undefined() {
         Ok(None)
@@ -955,40 +976,6 @@ pub(super) const INSTALL_COLLECTIONS_DEFLATE: &[u8] =
 pub(super) fn install_collections_js(ctx: &Ctx<'_>) -> Result<&'static str> {
     static CACHE: std::sync::OnceLock<Box<str>> = std::sync::OnceLock::new();
     super::blob::decompress(ctx, INSTALL_COLLECTIONS_DEFLATE, &CACHE)
-}
-
-/// `DOMException` is an exception interface: its interface prototype object's
-/// `[[Prototype]]` is `%Error.prototype%`, so `String(exception)` is
-/// `"Name: message"` and `instanceof Error` holds
-/// (<https://webidl.spec.whatwg.org/#js-DOMException-specialness>).
-fn inherit_error_prototype(globals: &Object<'_>) -> Result<()> {
-    let constructor: Object = globals.get("DOMException")?;
-    let prototype: Object = constructor.get("prototype")?;
-    let error: Object = globals.get("Error")?;
-    let error_prototype: Object = error.get("prototype")?;
-    prototype.set_prototype(Some(&error_prototype))?;
-    Ok(())
-}
-
-/// `WebIDL` constants appear on the `interface object`, the `interface
-/// prototype object`, and the `named constructor`
-/// (<https://webidl.spec.whatwg.org/#interface-object>).
-fn install_dom_exception_codes(ctx: &Ctx<'_>) -> Result<()> {
-    // `DOMException.prototype[@@toStringTag]` is `"DOMException"`, which is
-    // also how a structured clone recognizes the interface across realms
-    // (<https://webidl.spec.whatwg.org/#idl-DOMException>).
-    ctx.eval::<(), _>(
-        r"Object.defineProperty(globalThis.DOMException.prototype, Symbol.toStringTag, {
-  value: 'DOMException', writable: false, enumerable: false, configurable: true,
-});",
-    )?;
-    let ctor: Object = ctx.globals().get("DOMException")?;
-    let proto: Object = ctor.get("prototype")?;
-    for (name, _, code) in DOM_EXCEPTION_CODES {
-        ctor.set(name, code)?;
-        proto.set(name, code)?;
-    }
-    Ok(())
 }
 
 pub(crate) fn world(ctx: &Ctx<'_>) -> Result<Rc<RefCell<World>>> {
@@ -1270,7 +1257,11 @@ pub(super) fn locate_namespace(
 
 /// [Locate a namespace prefix](https://dom.spec.whatwg.org/#locate-a-namespace-prefix)
 /// for `namespace` walking `cursor`'s inclusive ancestors.
-pub(super) fn locate_prefix(dom: &dom::Document, cursor: NodeId, namespace: &str) -> Option<String> {
+pub(super) fn locate_prefix(
+    dom: &dom::Document,
+    cursor: NodeId,
+    namespace: &str,
+) -> Option<String> {
     let mut cursor = Some(cursor);
     while let Some(id) = cursor {
         if let Some(NodeKind::Element { name, attributes }) = dom.kind(id) {
@@ -1586,7 +1577,8 @@ fn collect_by_tag(dom: &dom::Document, scope: NodeId, name: &str) -> Vec<NodeId>
     // name ASCII-lowercased; other elements match the name exactly
     // (<https://dom.spec.whatwg.org/#concept-getelementsbytagname>).
     let lowered = name.to_ascii_lowercase();
-    dom.tree().descendants(scope)
+    dom.tree()
+        .descendants(scope)
         .filter(|&id| {
             let Some(NodeKind::Element { name: qual, .. }) = dom.kind(id) else {
                 return false;
@@ -1602,7 +1594,8 @@ fn collect_by_tag(dom: &dom::Document, scope: NodeId, name: &str) -> Vec<NodeId>
 }
 
 fn collect_by_name(dom: &dom::Document, scope: NodeId, name: &str) -> Vec<NodeId> {
-    dom.tree().descendants(scope)
+    dom.tree()
+        .descendants(scope)
         .filter(|&id| is_element(dom, id) && dom.attribute(id, "name").as_deref() == Some(name))
         .collect()
 }
@@ -1615,7 +1608,8 @@ fn collect_window_named(dom: &dom::Document, scope: NodeId, name: &str) -> Vec<N
     if name.is_empty() {
         return Vec::new();
     }
-    dom.tree().descendants(scope)
+    dom.tree()
+        .descendants(scope)
         .filter(|&id| {
             if dom.no_namespace_attribute(id, "id").as_deref() == Some(name) {
                 return true;
@@ -1631,8 +1625,14 @@ fn collect_window_named(dom: &dom::Document, scope: NodeId, name: &str) -> Vec<N
         .collect()
 }
 
-fn collect_by_tag_ns(dom: &dom::Document, scope: NodeId, namespace: &str, local: &str) -> Vec<NodeId> {
-    dom.tree().descendants(scope)
+fn collect_by_tag_ns(
+    dom: &dom::Document,
+    scope: NodeId,
+    namespace: &str,
+    local: &str,
+) -> Vec<NodeId> {
+    dom.tree()
+        .descendants(scope)
         .filter(|&id| {
             matches!(
                 dom.kind(id),
@@ -1651,7 +1651,8 @@ fn collect_by_class(dom: &dom::Document, scope: NodeId, names: &str) -> Vec<Node
     if wanted.is_empty() {
         return Vec::new();
     }
-    dom.tree().descendants(scope)
+    dom.tree()
+        .descendants(scope)
         .filter(|&id| {
             if !is_element(dom, id) {
                 return false;
@@ -1738,7 +1739,8 @@ pub(super) fn tree_order(dom: &dom::Document, a: NodeId, b: NodeId) -> std::cmp:
 }
 
 pub(super) fn find_element_by_id(dom: &dom::Document, scope: NodeId, id: &str) -> Option<NodeId> {
-    dom.tree().descendants(scope)
+    dom.tree()
+        .descendants(scope)
         .find(|&node| is_element(dom, node) && dom.attribute(node, "id").as_deref() == Some(id))
 }
 
@@ -1763,7 +1765,11 @@ mod realm_tests {
     struct NullServices;
 
     impl NetworkHost for NullServices {
-        fn start_dial(&self, _request: DialRequest, completion: DialCompletion) -> crate::protocol::DialCancellation {
+        fn start_dial(
+            &self,
+            _request: DialRequest,
+            completion: DialCompletion,
+        ) -> crate::protocol::DialCancellation {
             completion(Err(crate::protocol::DialFailure::Connect));
             Box::new(|| {})
         }

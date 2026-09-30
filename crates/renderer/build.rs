@@ -28,10 +28,7 @@ const SINGLES: &[(&str, &str)] = &[
         "src/js/scripts/events/event_target_ctor.js",
     ),
     ("abort.deflate", "src/js/scripts/events/abort.js"),
-    (
-        "event_ctor.deflate",
-        "src/js/scripts/events/event_ctor.js",
-    ),
+    ("event_ctor.deflate", "src/js/scripts/events/event_ctor.js"),
     (
         "custom_event.deflate",
         "src/js/scripts/events/custom_event.js",
@@ -44,6 +41,7 @@ const WEB_PREFIX: &str = "(function(){";
 const WEB_SUFFIX: &str = "})();";
 
 fn main() {
+    generate_bindings();
     let root = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR is set"));
     let out = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR is set")).join("js_blobs");
     fs::create_dir_all(&out).expect("create js_blobs dir");
@@ -66,7 +64,10 @@ fn main() {
                 .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-')),
             "order.txt entry {file:?} must be a plain file name"
         );
-        assert!(seen.insert(file.to_owned()), "duplicate order.txt entry {file}");
+        assert!(
+            seen.insert(file.to_owned()),
+            "duplicate order.txt entry {file}"
+        );
         let rel = format!("src/js/scripts/web/{file}");
         println!("cargo:rerun-if-changed={}", root.join(&rel).display());
         bundle.push_str(
@@ -101,9 +102,36 @@ fn main() {
 /// Deflate-compresses `bytes` at maximum level; output is deterministic for
 /// one `flate2` version, which `Cargo.lock` pins.
 fn write_blob(out: &Path, name: &str, bytes: &[u8]) {
-    let mut encoder =
-        flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::best());
+    let mut encoder = flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::best());
     encoder.write_all(bytes).expect("deflate shim");
     let compressed = encoder.finish().expect("finish deflate");
     fs::write(out.join(name), compressed).expect("write blob");
+}
+
+/// Compiles only the declared native surface. Unsupported semantics fail the
+/// build instead of producing bindings that merely look like Web IDL.
+fn generate_bindings() {
+    let root = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
+    let out = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR"));
+    let idl = root.join("idl");
+    println!("cargo:rerun-if-changed={}", idl.display());
+    let mut inputs: Vec<_> = fs::read_dir(&idl)
+        .expect("read native IDL directory")
+        .map(|entry| entry.expect("read native IDL entry").path())
+        .collect();
+    inputs.sort();
+    for input in inputs {
+        assert!(
+            input
+                .extension()
+                .is_some_and(|extension| extension == "webidl"),
+            "unexpected IDL input: {}",
+            input.display()
+        );
+        let source = fs::read_to_string(&input).expect("read native IDL");
+        let generated = webidl_bindgen::compile(&source)
+            .unwrap_or_else(|error| panic!("{}: {error}", input.display()));
+        let name = input.file_stem().expect("native IDL file name");
+        fs::write(out.join(name).with_extension("rs"), generated).expect("write generated binding");
+    }
 }

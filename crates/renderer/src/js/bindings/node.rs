@@ -13,12 +13,11 @@ use super::{
     fixup_focus_after_removal, focus_node, host_node_id, import_snapshot, is_element, is_focusable,
     is_html_element, is_main_document, is_template_element, live_collection, locate_namespace,
     locate_prefix, main_document, make_weak, materialize_children, materialize_import,
-    new_detached_attr, nodes_equal, optional_node, qualified_name, rect_object,
-    refresh_named_node_map, remove_attribute_sync, required_node, root_of,
-    schedule_mutation_delivery, select_error, set_attribute_node, set_character_data,
-    sibling_value, string_value, throw_dom, throw_dom_error, touch_attr, tree_order,
-    valid_attribute_local_name, validate_and_extract, webidl_to_string, with_node_kind, world,
-    world_for_node, wrap_new_document, wrap_node,
+    new_detached_attr, nodes_equal, qualified_name, rect_object, refresh_named_node_map,
+    remove_attribute_sync, required_node, root_of, schedule_mutation_delivery, select_error,
+    set_attribute_node, set_character_data, sibling_value, string_value, throw_dom,
+    throw_dom_error, touch_attr, tree_order, valid_attribute_local_name, validate_and_extract,
+    webidl_to_string, with_node_kind, world, world_for_node, wrap_new_document, wrap_node,
 };
 use rquickjs::function::{Opt, Rest};
 
@@ -31,6 +30,9 @@ use crate::js::events::{self, JsEvent};
 use crate::js::world::{DocumentStreamCommand, EventTargetKey, Handle, Wrapper};
 
 use crate::ReadyState;
+
+include!(concat!(env!("OUT_DIR"), "/Node.rs"));
+pub(super) use webidl_generated::install;
 
 /// Backs the constructible platform interfaces (`new Text(…)`); the current
 /// realm's main document owns the new node
@@ -260,9 +262,9 @@ impl JsNode {
     fn ctor(ctx: Ctx<'_>) -> Result<Self> {
         Err(Exception::throw_type(&ctx, "Illegal constructor"))
     }
-    #[qjs(get, rename = "nodeType")]
-    fn node_type(&self, ctx: Ctx<'_>) -> Result<i32> {
-        with_node_kind(&ctx, self.handle.0, |kind| match kind {
+    #[qjs(skip)]
+    fn node_type(&self, ctx: &Ctx<'_>) -> Result<u16> {
+        with_node_kind(ctx, self.handle.0, |kind| match kind {
             Some(NodeKind::Element { .. }) => Ok(1),
             Some(NodeKind::Text { .. }) => Ok(3),
             Some(NodeKind::CDataSection { .. }) => Ok(4),
@@ -271,16 +273,16 @@ impl JsNode {
             Some(NodeKind::Document) => Ok(9),
             Some(NodeKind::Doctype { .. }) => Ok(10),
             Some(NodeKind::Fragment) => Ok(11),
-            None => Err(Exception::throw_type(&ctx, "stale node")),
+            None => Err(Exception::throw_type(ctx, "stale node")),
         })?
     }
 
     // https://dom.spec.whatwg.org/#dom-node-nodename
     // https://dom.spec.whatwg.org/#concept-element-html-uppercased-qualified-name
-    #[qjs(get, rename = "nodeName")]
-    fn node_name(&self, ctx: Ctx<'_>) -> Result<String> {
-        let uppercase = document_is_html_content(&ctx, self.handle.0);
-        with_node_kind(&ctx, self.handle.0, |kind| match kind {
+    #[qjs(skip)]
+    fn node_name<'js>(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
+        let uppercase = document_is_html_content(ctx, self.handle.0);
+        let name = with_node_kind(ctx, self.handle.0, |kind| match kind {
             Some(NodeKind::Element { name, .. }) => Ok(element_node_name(name, uppercase)),
             Some(NodeKind::Text { .. }) => Ok("#text".into()),
             Some(NodeKind::CDataSection { .. }) => Ok("#cdata-section".into()),
@@ -289,37 +291,36 @@ impl JsNode {
             Some(NodeKind::Document) => Ok("#document".into()),
             Some(NodeKind::Doctype { name, .. }) => Ok(name.clone()),
             Some(NodeKind::Fragment) => Ok("#document-fragment".into()),
-            None => Err(Exception::throw_type(&ctx, "stale node")),
-        })?
+            None => Err(Exception::throw_type(ctx, "stale node")),
+        })?;
+        let name = name?;
+        rquickjs::String::from_str(ctx.clone(), &name)
     }
 
-    #[qjs(get, rename = "firstChild")]
-    fn first_child<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
-        let world = world(&ctx)?;
-        let id = {
-            let parsed = world.borrow();
-            let Some(parsed) = parsed.document(self.handle.0) else {
-                return Err(Exception::throw_type(&ctx, "no document"));
-            };
-            parsed
-                .document
-                .children(self.handle.0)
-                .and_then(|mut kids| kids.next())
-        };
-        child_value(&ctx, id)
+    // https://dom.spec.whatwg.org/#dom-node-firstchild
+    #[qjs(skip)]
+    fn first_child<'js>(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
+        let world = world(ctx)?;
+        let id = world
+            .borrow()
+            .with_document(self.handle.0, |parsed| {
+                parsed
+                    .document
+                    .children(self.handle.0)
+                    .and_then(|mut kids| kids.next())
+            })
+            .flatten();
+        child_value(ctx, id)
     }
 
-    #[qjs(get, rename = "parentNode")]
-    fn parent_node<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
-        let world = world(&ctx)?;
+    #[qjs(skip)]
+    fn parent_node<'js>(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
+        let world = world(ctx)?;
         let id = world
             .borrow()
             .document(self.handle.0)
             .and_then(|parsed| parsed.document.parent(self.handle.0));
-        match id {
-            Some(parent) => wrap_node(&ctx, parent),
-            None => Ok(Value::new_null(ctx)),
-        }
+        child_value(ctx, id)
     }
 
     #[qjs(get, rename = "childNodes")]
@@ -327,33 +328,31 @@ impl JsNode {
         live_collection(&ctx, self.handle.0, CollectionKind::Children, None)
     }
 
-    #[qjs(rename = "appendChild")]
-    fn append_child<'js>(&self, ctx: Ctx<'js>, child: Value<'js>) -> Result<Value<'js>> {
-        let Some(kid) = host_node_id(&ctx, &child) else {
-            return Err(Exception::throw_type(&ctx, "not a node"));
-        };
+    // https://dom.spec.whatwg.org/#dom-node-appendchild
+    #[qjs(skip)]
+    fn append_child<'js>(&self, ctx: Ctx<'js>, node: NodeId) -> Result<Value<'js>> {
         {
             let world = world(&ctx)?;
             let parsed = world.borrow();
             let Some(parsed) = parsed.document(self.handle.0) else {
                 return Err(Exception::throw_type(&ctx, "no document"));
             };
-            dom::mutation::validate_pre_insert(&parsed.document, self.handle.0, kid, None)
+            dom::mutation::validate_pre_insert(&parsed.document, self.handle.0, node, None)
                 .map_err(|err| throw_dom_error(&ctx, err))?;
         }
-        let kid = adopt_across_documents(&ctx, self.handle.0, kid)?;
+        let node = adopt_across_documents(&ctx, self.handle.0, node)?;
         let parent = self.handle.0;
         let world = world(&ctx)?;
         let world = world.borrow();
         let Some(mut parsed) = world.document_mut(self.handle.0) else {
             return Err(Exception::throw_type(&ctx, "no document"));
         };
-        dom::mutation::pre_insert(&mut parsed.document, parent, kid, None)
+        dom::mutation::pre_insert(&mut parsed.document, parent, node, None)
             .map_err(|err| throw_dom_error(&ctx, err))?;
         drop(parsed);
         drop(world);
         schedule_mutation_delivery(&ctx)?;
-        wrap_node(&ctx, kid)
+        wrap_node(&ctx, node)
     }
 
     #[qjs(rename = "addEventListener")]
@@ -463,7 +462,10 @@ impl JsNode {
         let array = Array::new(ctx.clone())?;
         if let Some((left, top, width, height)) = element_box(&ctx, self.handle.0)? {
             let (scroll_x, scroll_y) = super::viewport_scroll(&ctx, self.handle.0)?;
-            array.set(0, rect_object(&ctx, left - scroll_x, top - scroll_y, width, height)?)?;
+            array.set(
+                0,
+                rect_object(&ctx, left - scroll_x, top - scroll_y, width, height)?,
+            )?;
         }
         Ok(array)
     }
@@ -480,19 +482,30 @@ impl JsNode {
         let Some(mut parsed) = world.document_mut(self.handle.0) else {
             return Ok(());
         };
-        let Some(root) = dom::selector::select_first(&parsed.document, parsed.document.document(), "html")
-            .ok()
-            .flatten() else {
+        let Some(root) =
+            dom::selector::select_first(&parsed.document, parsed.document.document(), "html")
+                .ok()
+                .flatten()
+        else {
             return Ok(());
         };
         let (scroll_x, _scroll_y) = dom::metadata::scroll_offset(&parsed.document, root);
         let viewport_width = f64::from(crate::engine::VIEWPORT_WIDTH);
-        let next_x = if left < scroll_x { left } else if left + width > scroll_x + viewport_width {
+        let next_x = if left < scroll_x {
+            left
+        } else if left + width > scroll_x + viewport_width {
             left + width - viewport_width
-        } else { scroll_x };
+        } else {
+            scroll_x
+        };
         // https://drafts.csswg.org/cssom-view/#dom-element-scrollintoview
         let next_y = top;
-        dom::metadata::set_scroll_offset(&mut parsed.document, root, next_x.max(0.0), next_y.max(0.0));
+        dom::metadata::set_scroll_offset(
+            &mut parsed.document,
+            root,
+            next_x.max(0.0),
+            next_y.max(0.0),
+        );
         Ok(())
     }
 
@@ -723,8 +736,8 @@ impl JsNode {
         let Some(mut target) = world.document_mut(self.handle.0) else {
             return Err(Exception::throw_type(&ctx, "no document"));
         };
-        let id =
-            materialize_import(&mut target.document, &tree).map_err(|err| throw_dom_error(&ctx, err))?;
+        let id = materialize_import(&mut target.document, &tree)
+            .map_err(|err| throw_dom_error(&ctx, err))?;
         drop(target);
         drop(world);
         wrap_node(&ctx, id)
@@ -1030,8 +1043,7 @@ impl JsNode {
         let Some(parsed) = world.document(self.handle.0) else {
             return Err(Exception::throw_type(&ctx, "no document"));
         };
-        Ok(dom::form::control_default_value(&parsed.document, self.handle.0)
-            .unwrap_or_default())
+        Ok(dom::form::control_default_value(&parsed.document, self.handle.0).unwrap_or_default())
     }
 
     // https://html.spec.whatwg.org/multipage/form-elements.html#dom-textarea-defaultvalue
@@ -1084,7 +1096,8 @@ impl JsNode {
         let Some(mut parsed) = world.document_mut(self.handle.0) else {
             return Ok(());
         };
-        let Some((_, end, direction)) = dom::form::selection(&parsed.document, self.handle.0) else {
+        let Some((_, end, direction)) = dom::form::selection(&parsed.document, self.handle.0)
+        else {
             return Err(throw_dom(
                 &ctx,
                 "InvalidStateError",
@@ -1092,7 +1105,13 @@ impl JsNode {
             ));
         };
         let start = value.0;
-        let changed = dom::form::set_selection(&mut parsed.document, self.handle.0, start, end.max(start), direction);
+        let changed = dom::form::set_selection(
+            &mut parsed.document,
+            self.handle.0,
+            start,
+            end.max(start),
+            direction,
+        );
         drop(parsed);
         if changed {
             world.queue_select(self.handle.0);
@@ -1121,14 +1140,21 @@ impl JsNode {
         let Some(mut parsed) = world.document_mut(self.handle.0) else {
             return Ok(());
         };
-        let Some((start, _, direction)) = dom::form::selection(&parsed.document, self.handle.0) else {
+        let Some((start, _, direction)) = dom::form::selection(&parsed.document, self.handle.0)
+        else {
             return Err(throw_dom(
                 &ctx,
                 "InvalidStateError",
                 "selectionEnd does not apply to this control",
             ));
         };
-        let changed = dom::form::set_selection(&mut parsed.document, self.handle.0, start, value.0, direction);
+        let changed = dom::form::set_selection(
+            &mut parsed.document,
+            self.handle.0,
+            start,
+            value.0,
+            direction,
+        );
         drop(parsed);
         if changed {
             world.queue_select(self.handle.0);
@@ -1165,7 +1191,8 @@ impl JsNode {
             ));
         };
         let direction = direction_code(&value.0);
-        let changed = dom::form::set_selection(&mut parsed.document, self.handle.0, start, end, direction);
+        let changed =
+            dom::form::set_selection(&mut parsed.document, self.handle.0, start, end, direction);
         drop(parsed);
         if changed {
             world.queue_select(self.handle.0);
@@ -1631,12 +1658,14 @@ impl JsNode {
     fn label(&self, ctx: Ctx<'_>) -> Result<String> {
         let world = world(&ctx)?;
         let world = world.borrow();
-        Ok(world.document(self.handle.0).map_or_else(String::new, |parsed| {
-            parsed
-                .document
-                .no_namespace_attribute(self.handle.0, "label")
-                .unwrap_or_else(|| dom::form::option_text(&parsed.document, self.handle.0))
-        }))
+        Ok(world
+            .document(self.handle.0)
+            .map_or_else(String::new, |parsed| {
+                parsed
+                    .document
+                    .no_namespace_attribute(self.handle.0, "label")
+                    .unwrap_or_else(|| dom::form::option_text(&parsed.document, self.handle.0))
+            }))
     }
 
     #[qjs(set, rename = "label")]
@@ -1685,7 +1714,10 @@ impl JsNode {
         let Some(select) = dom::form::option_select_owner(&parsed.document, self.handle.0) else {
             return Ok(0);
         };
-        for (index, option) in dom::form::select_options(&parsed.document, select).into_iter().enumerate() {
+        for (index, option) in dom::form::select_options(&parsed.document, select)
+            .into_iter()
+            .enumerate()
+        {
             if option == self.handle.0 {
                 return Ok(i32::try_from(index).unwrap_or(i32::MAX));
             }
@@ -2061,7 +2093,8 @@ impl JsNode {
         let Some(parsed) = parsed.document(self.handle.0) else {
             return Err(Exception::throw_type(&ctx, "no document"));
         };
-        let Some(NodeKind::Element { name, attributes }) = parsed.document.kind(self.handle.0) else {
+        let Some(NodeKind::Element { name, attributes }) = parsed.document.kind(self.handle.0)
+        else {
             return Err(Exception::throw_type(&ctx, "outerHTML requires an element"));
         };
         if parsed.content_type == "text/html" {
@@ -2111,7 +2144,8 @@ impl JsNode {
             return Err(Exception::throw_type(&ctx, "no document"));
         };
         let target = if is_template {
-            if let Some(contents) = dom::shadow::template_contents(&parsed.document, self.handle.0) {
+            if let Some(contents) = dom::shadow::template_contents(&parsed.document, self.handle.0)
+            {
                 contents
             } else {
                 let contents = parsed.document.create_fragment();
@@ -2300,9 +2334,9 @@ impl JsNode {
     }
 
     // https://dom.spec.whatwg.org/#dom-node-lastchild
-    #[qjs(get, rename = "lastChild")]
-    fn last_child<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
-        let world = world(&ctx)?;
+    #[qjs(skip)]
+    fn last_child<'js>(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
+        let world = world(ctx)?;
         let id = world
             .borrow()
             .with_document(self.handle.0, |parsed| {
@@ -2312,19 +2346,19 @@ impl JsNode {
                     .and_then(|mut kids| kids.next_back())
             })
             .flatten();
-        child_value(&ctx, id)
+        child_value(ctx, id)
     }
 
     // https://dom.spec.whatwg.org/#dom-node-nextsibling
-    #[qjs(get, rename = "nextSibling")]
-    fn next_sibling<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
-        sibling_value(&ctx, self.handle.0, true)
+    #[qjs(skip)]
+    fn next_sibling<'js>(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
+        sibling_value(ctx, self.handle.0, true)
     }
 
     // https://dom.spec.whatwg.org/#dom-node-previoussibling
-    #[qjs(get, rename = "previousSibling")]
-    fn previous_sibling<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
-        sibling_value(&ctx, self.handle.0, false)
+    #[qjs(skip)]
+    fn previous_sibling<'js>(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
+        sibling_value(ctx, self.handle.0, false)
     }
 
     // https://dom.spec.whatwg.org/#dom-node-ownerdocument
@@ -2508,7 +2542,8 @@ impl JsNode {
             return Ok(0);
         };
         Ok(parsed.document.children(self.handle.0).map_or(0, |kids| {
-            kids.filter(|&kid| is_element(&parsed.document, kid)).count()
+            kids.filter(|&kid| is_element(&parsed.document, kid))
+                .count()
         }))
     }
 
@@ -2710,8 +2745,7 @@ impl JsNode {
         }
         if !value.0.is_empty() {
             let text = dom.create_text(value.0);
-            dom::mutation::append(dom, title, text)
-                .map_err(|err| throw_dom_error(&ctx, err))?;
+            dom::mutation::append(dom, title, text).map_err(|err| throw_dom_error(&ctx, err))?;
         }
         drop(parsed);
         drop(world);
@@ -2769,7 +2803,10 @@ impl JsNode {
         let previous = parsed.document.sibling(self.handle.0, false);
         let reference = match previous {
             Some(previous) => parsed.document.sibling(previous, true),
-            None => parsed.document.children(parent).and_then(|mut kids| kids.next()),
+            None => parsed
+                .document
+                .children(parent)
+                .and_then(|mut kids| kids.next()),
         };
         dom::mutation::pre_insert(&mut parsed.document, parent, node, reference)
             .map_err(|err| throw_dom_error(&ctx, err))?;
@@ -3321,7 +3358,8 @@ impl JsNode {
             for kid in kids {
                 match dom.kind(kid) {
                     Some(NodeKind::Text { data }) if data.is_empty() => {
-                        dom::mutation::detach(dom, kid).map_err(|err| throw_dom_error(&ctx, err))?;
+                        dom::mutation::detach(dom, kid)
+                            .map_err(|err| throw_dom_error(&ctx, err))?;
                     }
                     Some(NodeKind::Text { data }) => {
                         if let Some(previous) = merged {
@@ -3512,7 +3550,8 @@ impl JsNode {
                     .children(from)
                     .map(Iterator::collect)
                     .unwrap_or_default();
-                let to_children: Vec<_> = dom.children(to).map(Iterator::collect).unwrap_or_default();
+                let to_children: Vec<_> =
+                    dom.children(to).map(Iterator::collect).unwrap_or_default();
                 for child in from_children.into_iter().rev() {
                     from_stack.push(child);
                 }
@@ -3531,22 +3570,20 @@ impl JsNode {
     }
 
     // https://dom.spec.whatwg.org/#dom-node-insertbefore
-    #[qjs(rename = "insertBefore")]
+    #[qjs(skip)]
     fn insert_before<'js>(
         &self,
         ctx: Ctx<'js>,
-        node: Value<'js>,
-        child: Value<'js>,
+        node: NodeId,
+        child: Option<NodeId>,
     ) -> Result<Value<'js>> {
-        let node = required_node(&ctx, &node)?;
-        let reference = optional_node(&ctx, &child)?;
         {
             let world = world(&ctx)?;
             let parsed = world.borrow();
             let Some(parsed) = parsed.document(self.handle.0) else {
                 return Err(Exception::throw_type(&ctx, "no document"));
             };
-            dom::mutation::validate_pre_insert(&parsed.document, self.handle.0, node, reference)
+            dom::mutation::validate_pre_insert(&parsed.document, self.handle.0, node, child)
                 .map_err(|err| throw_dom_error(&ctx, err))?;
         }
         let node = adopt_across_documents(&ctx, self.handle.0, node)?;
@@ -3556,7 +3593,7 @@ impl JsNode {
             return Err(Exception::throw_type(&ctx, "no document"));
         };
         let dom = &mut parsed.document;
-        dom::mutation::pre_insert(dom, self.handle.0, node, reference)
+        dom::mutation::pre_insert(dom, self.handle.0, node, child)
             .map_err(|err| throw_dom_error(&ctx, err))?;
         drop(parsed);
         drop(world);
@@ -3565,9 +3602,8 @@ impl JsNode {
     }
 
     // https://dom.spec.whatwg.org/#dom-node-removechild
-    #[qjs(rename = "removeChild")]
-    fn remove_child<'js>(&self, ctx: Ctx<'js>, child: Value<'js>) -> Result<Value<'js>> {
-        let child = required_node(&ctx, &child)?;
+    #[qjs(skip)]
+    fn remove_child<'js>(&self, ctx: Ctx<'js>, child: NodeId) -> Result<Value<'js>> {
         let world = world(&ctx)?;
         let world = world.borrow();
         let Some(mut parsed) = world.document_mut(self.handle.0) else {
@@ -3590,15 +3626,8 @@ impl JsNode {
     }
 
     // https://dom.spec.whatwg.org/#dom-node-replacechild
-    #[qjs(rename = "replaceChild")]
-    fn replace_child<'js>(
-        &self,
-        ctx: Ctx<'js>,
-        node: Value<'js>,
-        child: Value<'js>,
-    ) -> Result<Value<'js>> {
-        let node = required_node(&ctx, &node)?;
-        let child = required_node(&ctx, &child)?;
+    #[qjs(skip)]
+    fn replace_child<'js>(&self, ctx: Ctx<'js>, node: NodeId, child: NodeId) -> Result<Value<'js>> {
         {
             let world = world(&ctx)?;
             let parsed = world.borrow();

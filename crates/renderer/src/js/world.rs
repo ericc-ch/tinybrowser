@@ -298,6 +298,11 @@ pub(crate) enum Wrapper {
     Dataset,
 }
 
+pub(crate) struct WeakReferences {
+    pub(crate) constructor: Persistent<rquickjs::function::Constructor<'static>>,
+    pub(crate) deref: Persistent<Function<'static>>,
+}
+
 pub(crate) struct World {
     /// The handles every frame of this renderer process shares: trees,
     /// registry and wrapper cache, ports, JS heap, wake handle, and stop flag.
@@ -394,6 +399,7 @@ pub(crate) struct World {
     pub(crate) pristine_number: Option<Persistent<Function<'static>>>,
     pub(crate) pristine_boolean: Option<Persistent<Function<'static>>>,
     pub(crate) pristine_queue_microtask: Option<Persistent<Function<'static>>>,
+    pub(crate) weak_references: Option<WeakReferences>,
     /// The realm's own mutation-delivery entry point, so scheduling never
     /// depends on a page-deletable global.
     pub(crate) deliver_mutations_fn: Option<Persistent<Function<'static>>>,
@@ -504,6 +510,7 @@ impl World {
             pristine_number: None,
             pristine_boolean: None,
             pristine_queue_microtask: None,
+            weak_references: None,
             deliver_mutations_fn: None,
             option_setter: None,
             host_token: None,
@@ -1408,6 +1415,7 @@ impl World {
         self.pristine_number = None;
         self.pristine_boolean = None;
         self.pristine_queue_microtask = None;
+        self.weak_references = None;
         self.deliver_mutations_fn = None;
         self.option_setter = None;
         self.host_token = None;

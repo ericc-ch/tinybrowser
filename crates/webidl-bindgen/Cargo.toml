@@ -1,0 +1,14 @@
+[package]
+name = "webidl-bindgen"
+version.workspace = true
+edition.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+weedle = { package = "weedle2", version = "5" }
+proc-macro2 = "1"
+quote = "1"
+syn = { version = "3", features = ["full"] }
+prettyplease = "0.3"
