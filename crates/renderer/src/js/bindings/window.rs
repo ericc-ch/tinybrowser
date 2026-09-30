@@ -50,6 +50,9 @@ fn world_for_window_this<'js>(ctx: &Ctx<'js>, this: &Object<'js>) -> Result<Rc<R
 /// Installs the `Location` object. The engine has no navigation, so only the
 /// read-only URL components exist
 /// (<https://html.spec.whatwg.org/multipage/nav-history-apis.html#the-location-interface>).
+/// Empty components return empty strings, as specified by
+/// <https://html.spec.whatwg.org/multipage/nav-history-apis.html#dom-location-search>
+/// and <https://html.spec.whatwg.org/multipage/nav-history-apis.html#dom-location-hash>.
 pub(crate) fn install_location<'js>(
     ctx: &Ctx<'js>,
     globals: &Object<'js>,
@@ -76,8 +79,8 @@ pub(crate) fn install_location<'js>(
             match component {
                 Component::Pathname => url.path().to_owned(),
                 Component::Href => url.as_str().to_owned(),
-                Component::Search => url.query().map_or_else(String::new, |query| format!("?{query}")),
-                Component::Hash => url.fragment().map_or_else(String::new, |fragment| format!("#{fragment}")),
+                Component::Search => url.query().filter(|query| !query.is_empty()).map_or_else(String::new, |query| format!("?{query}")),
+                Component::Hash => url.fragment().filter(|fragment| !fragment.is_empty()).map_or_else(String::new, |fragment| format!("#{fragment}")),
                 Component::Origin => url.origin().ascii_serialization(),
                 Component::Protocol => format!("{}:", url.scheme()),
                 Component::Host => match url.port() {
