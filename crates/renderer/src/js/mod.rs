@@ -12,17 +12,19 @@ mod modules;
 mod url_parts;
 mod world;
 
+mod observers;
+
 pub(crate) use world::{DocumentStreamCommand, FrameNavigation, NavigationTarget, RealmRegistry};
 
 use std::cell::{Cell, OnceCell, RefCell};
 use std::fmt;
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use rquickjs::{
-    Array, Coerced, Context, Ctx, Exception, FromJs, Function, Module, Object, Persistent, Runtime, TypedArray,
-    Value, context::EvalOptions, prelude::Func,
+    Array, Coerced, Context, Ctx, Exception, FromJs, Function, Module, Object, Persistent, Runtime,
+    TypedArray, Value, context::EvalOptions, prelude::Func,
 };
 use url::Url;
 
@@ -92,7 +94,10 @@ pub(crate) enum Script {
 #[derive(Clone)]
 pub(crate) enum ScriptSource {
     /// Inline text, with the 1-based document line its source starts on.
-    Inline { source: String, line: u32 },
+    Inline {
+        source: String,
+        line: u32,
+    },
     Src(String),
 }
 
@@ -153,7 +158,30 @@ pub(crate) struct PendingJsFetch {
 #[derive(Clone, Default)]
 pub(crate) struct SharedJsRuntime(Rc<OnceCell<Result<Runtime, Box<str>>>>);
 
+#[derive(Clone)]
+pub(crate) struct JsRuntimeHandle(Weak<OnceCell<Result<Runtime, Box<str>>>>);
+
+impl JsRuntimeHandle {
+    fn get(&self) -> Result<Runtime, JsError> {
+        let owner = self
+            .0
+            .upgrade()
+            .ok_or_else(|| JsError::Engine("renderer JS runtime has been released".into()))?;
+        SharedJsRuntime(owner).get().cloned()
+    }
+}
+
 impl SharedJsRuntime {
+    pub(crate) fn handle(&self) -> JsRuntimeHandle {
+        JsRuntimeHandle(Rc::downgrade(&self.0))
+    }
+
+    pub(crate) fn collect(&self) {
+        if let Some(Ok(runtime)) = self.0.get() {
+            runtime.run_gc();
+        }
+    }
+
     pub(crate) fn get(&self) -> Result<&Runtime, JsError> {
         let slot = self.0.get_or_init(|| {
             let runtime = Runtime::new().map_err(|err| err.to_string().into_boxed_str())?;
@@ -188,11 +216,11 @@ pub(crate) struct JsRealm {
 
 impl JsRealm {
     pub(crate) fn new(
-        shared: &SharedJsRuntime,
+        shared: &JsRuntimeHandle,
         world: Rc<RefCell<World>>,
         stop: Arc<Stop>,
     ) -> Result<Self, JsError> {
-        let runtime = shared.get()?.clone();
+        let runtime = shared.get()?;
         runtime.set_memory_limit(MAX_RUNTIME_MEMORY);
         runtime.set_max_stack_size(MAX_RUNTIME_STACK);
         let context = Context::full(&runtime)?;
@@ -308,7 +336,7 @@ impl JsRealm {
                 }
                 if let Some(func) = value.as_function() {
                     if let Err(error) = func.call::<_, ()>(()) {
-                        report_callback_error(&ctx, &error);
+                        bindings::host::report_callback_error(&ctx, &error);
                     }
                     return Ok(());
                 }
@@ -374,7 +402,7 @@ impl JsRealm {
                 let bytes = TypedArray::new(ctx.clone(), body)?;
                 if let Err(error) = func.call::<_, ()>((status, bytes, url, content_type, headers))
                 {
-                    report_callback_error(&ctx, &error);
+                    bindings::host::report_callback_error(&ctx, &error);
                 }
                 Ok(())
             })
@@ -412,7 +440,7 @@ impl JsRealm {
             self.context.with(|ctx| {
                 let state = state.clone().restore(&ctx)?;
                 if let Err(error) = events::fire_trusted_popstate(&ctx, state) {
-                    report_callback_error(&ctx, &error);
+                    bindings::host::report_callback_error(&ctx, &error);
                 }
                 Ok(())
             })
@@ -678,7 +706,7 @@ impl JsRealm {
                 let jobs = self.run_jobs();
                 self.report_pending_rejections();
                 jobs
-            },
+            }
             MicrotaskCheckpoint::Defer => Ok(()),
         };
         if interrupted.get() {
@@ -722,7 +750,9 @@ impl JsRealm {
             ctx.eval::<(), _>(install_web_apis_js(&ctx)?)?;
             let constructor: Object = ctx.globals().get("PopStateEvent")?;
             let prototype: Object = constructor.get("prototype")?;
-            world.borrow_mut().intern_brand("PopStateEvent", Persistent::save(&ctx, prototype));
+            world
+                .borrow_mut()
+                .intern_brand("PopStateEvent", Persistent::save(&ctx, prototype));
             // The shims captured the host token; page script must never see
             // it. Host plumbing is then frozen: function-valued `__tb*`
             // bindings become non-writable and non-configurable, so a page
@@ -778,7 +808,10 @@ impl JsRealm {
         ctx.globals().set(
             "__cancelFetch",
             Func::from(move |js_id: i32| {
-                cancel_fetch_world.borrow_mut().pending_fetch_cancels.push(js_id);
+                cancel_fetch_world
+                    .borrow_mut()
+                    .pending_fetch_cancels
+                    .push(js_id);
             }),
         )?;
         ctx.globals().set(
@@ -907,36 +940,51 @@ impl JsRealm {
 /// Validates and records the synchronous history API's URL update, then
 /// forwards it to the tab coordinator after the current script finishes.
 /// <https://html.spec.whatwg.org/multipage/nav-history-apis.html#shared-history-push/replace-state-steps>
-fn install_history_host_functions(ctx: &Ctx<'_>, world: &Rc<RefCell<World>>) -> Result<(), JsError> {
+fn install_history_host_functions(
+    ctx: &Ctx<'_>,
+    world: &Rc<RefCell<World>>,
+) -> Result<(), JsError> {
     let snapshot = world.borrow().history.clone();
-    ctx.globals().set("__tbHistoryLength", snapshot.length.max(1))?;
+    ctx.globals()
+        .set("__tbHistoryLength", snapshot.length.max(1))?;
     ctx.globals().set("__tbHistoryState", snapshot.state)?;
     let update_world = world.clone();
     ctx.globals().set(
         "__tbHistoryUpdate",
-        Func::from(move |ctx: Ctx<'_>, url: String, state: String, replace: bool| {
-            let next = Url::parse(&url)
-                .map_err(|_| Exception::throw_type(&ctx, "Invalid history URL"))?;
-            let mut world = update_world.borrow_mut();
-            if next.origin() != world.document_url.origin() {
-                return Err(Exception::throw_type(&ctx, "Cross-origin history URL"));
-            }
-            world.document_url = next;
-            world.history.state = Some(state.clone());
-            if !replace {
-                // https://html.spec.whatwg.org/multipage/browsing-the-web.html#url-and-history-update-steps
-                world.history.index = world.history.index.saturating_add(1);
-                world.history.length = world.history.index.saturating_add(1);
-            }
-            world.pending_history.push(crate::protocol::RendererEvent::HistoryUpdated { url, state, replace });
-            Ok::<usize, rquickjs::Error>(world.history.length)
-        }),
+        Func::from(
+            move |ctx: Ctx<'_>, url: String, state: String, replace: bool| {
+                let next = Url::parse(&url)
+                    .map_err(|_| Exception::throw_type(&ctx, "Invalid history URL"))?;
+                let mut world = update_world.borrow_mut();
+                if next.origin() != world.document_url.origin() {
+                    return Err(Exception::throw_type(&ctx, "Cross-origin history URL"));
+                }
+                world.document_url = next;
+                world.history.state = Some(state.clone());
+                if !replace {
+                    // https://html.spec.whatwg.org/multipage/browsing-the-web.html#url-and-history-update-steps
+                    world.history.index = world.history.index.saturating_add(1);
+                    world.history.length = world.history.index.saturating_add(1);
+                }
+                world
+                    .pending_history
+                    .push(crate::protocol::RendererEvent::HistoryUpdated {
+                        url,
+                        state,
+                        replace,
+                    });
+                Ok::<usize, rquickjs::Error>(world.history.length)
+            },
+        ),
     )?;
     let traverse_world = world.clone();
     ctx.globals().set(
         "__tbHistoryTraverse",
         Func::from(move |delta: i32| {
-            traverse_world.borrow_mut().pending_history.push(crate::protocol::RendererEvent::HistoryTraversal { delta });
+            traverse_world
+                .borrow_mut()
+                .pending_history
+                .push(crate::protocol::RendererEvent::HistoryTraversal { delta });
         }),
     )?;
     Ok(())
@@ -1173,7 +1221,7 @@ fn element_text(tree: &dom::Document, id: dom::NodeId) -> String {
     stack.reverse();
     while let Some(child) = stack.pop() {
         match tree.kind(child) {
-            Some(dom::NodeKind::Text { data }) => text.push_str(data),
+            Some(dom::NodeKind::Text { data }) => text.push_str(&data.to_string_lossy()),
             Some(dom::NodeKind::Element { .. }) => {
                 if let Some(kids) = tree.children(child) {
                     let mut kids: Vec<_> = kids.collect();
@@ -1238,16 +1286,6 @@ fn report_script_error(
         }
     };
     bindings::report_exception_value(ctx, caught, base_line, filename);
-}
-
-/// Reports an exception thrown by a host-invoked callback (timer, `fetch`)
-/// through the realm window's `error` event. The callback source carries no
-/// document line, so only the callback's own stack location is used.
-fn report_callback_error(ctx: &rquickjs::Ctx<'_>, error: &rquickjs::Error) {
-    if error.is_exception() {
-        let caught = ctx.catch();
-        bindings::report_exception_value(ctx, caught, 0, "");
-    }
 }
 
 fn decode_value<'js>(ctx: &rquickjs::Ctx<'js>, value: Value<'js>) -> Result<ScriptValue, JsError> {

@@ -8,6 +8,8 @@
 
 pub use markup5ever::{LocalName, Namespace, Prefix, QualName};
 
+use crate::string::DomString;
+
 /// The HTML namespace URL.
 ///
 /// The interned `markup5ever` atom, so namespace checks do not re-hash the URL.
@@ -109,11 +111,11 @@ pub enum NodeKind {
     /// `innerHTML`-style fragment parsing.
     Fragment,
     /// Character data; adjacent runs are *not* merged by dom itself.
-    Text { data: String },
+    Text { data: DomString },
     /// CDATA character data (`<![CDATA[...]]>` in XML).
-    CDataSection { data: String },
+    CDataSection { data: DomString },
     /// An XML processing instruction.
-    ProcessingInstruction { target: String, data: String },
+    ProcessingInstruction { target: String, data: DomString },
     /// An HTML comment.
-    Comment { data: String },
+    Comment { data: DomString },
 }

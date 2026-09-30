@@ -232,7 +232,7 @@ const INPUT_TYPES: &[&str] = &[
                 .input_values
                 .get(&id)
                 .cloned()
-                .unwrap_or_else(|| document.child_text_content(id)),
+                .unwrap_or_else(|| document.child_text_content(id).to_string_lossy().into_owned()),
         )
     }
 
@@ -433,7 +433,7 @@ const INPUT_TYPES: &[&str] = &[
         if document.html_local_is(id, "input") {
             Some(document.attribute(id, "value").unwrap_or_default())
         } else if document.html_local_is(id, "textarea") {
-            Some(document.child_text_content(id))
+            Some(document.child_text_content(id).to_string_lossy().into_owned())
         } else {
             None
         }

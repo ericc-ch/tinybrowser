@@ -11,13 +11,17 @@ pub struct JsDomException<'js> {
 
 impl<'js> JsDomException<'js> {
     // https://webidl.spec.whatwg.org/#dom-domexception-domexception
-    fn new(message: String<'js>, name: String<'js>) -> Self {
-        Self { name, message }
+    #[allow(
+        clippy::unnecessary_wraps,
+        reason = "generated constructors share one fallible call shape; this payload cannot fail"
+    )]
+    fn new(_ctx: &Ctx<'js>, message: String<'js>, name: String<'js>) -> Result<Self> {
+        Ok(Self { name, message })
     }
 
     // https://webidl.spec.whatwg.org/#dom-domexception-code
     fn get_code(&self, _ctx: &Ctx<'js>) -> Result<u16> {
-        webidl_generated::legacy_code(&self.name)
+        dom_exception_generated::legacy_code(&self.name)
     }
 }
 

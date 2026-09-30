@@ -160,7 +160,7 @@ fn build_children(
                     continue;
                 }
                 boxes.push(BoxNode {
-                    kind: BoxKind::Text(data.clone()),
+                    kind: BoxKind::Text(data.to_string_lossy().into_owned()),
                     node: None,
                     style: parent_style.clone(),
                     natural_width: None,

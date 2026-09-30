@@ -1,10 +1,11 @@
 //! Mutation records and the structural change serial.
 
-use super::Mutation;
+use super::{Mutation, MutationOrder};
 
 #[derive(Debug, Default)]
 pub(crate) struct MutationJournal {
-    mutations: Vec<Mutation>,
+    mutations: Vec<(u64, Mutation)>,
+    order: MutationOrder,
     recording: bool,
     suppressed: bool,
     serial: u64,
@@ -19,13 +20,30 @@ impl MutationJournal {
     }
 
     pub(super) fn take(&mut self) -> Vec<Mutation> {
+        self.take_ordered()
+            .into_iter()
+            .map(|(_, mutation)| mutation)
+            .collect()
+    }
+
+    pub(super) fn take_ordered(&mut self) -> Vec<(u64, Mutation)> {
         std::mem::take(&mut self.mutations)
+    }
+
+    pub(super) fn share_order(&mut self, order: &MutationOrder) {
+        if std::sync::Arc::ptr_eq(&self.order.0, &order.0) {
+            return;
+        }
+        self.order = order.clone();
+        for (position, _) in &mut self.mutations {
+            *position = self.order.next();
+        }
     }
 
     pub(super) fn record(&mut self, mutation: Mutation) {
         self.bump();
         if self.recording() {
-            self.mutations.push(mutation);
+            self.mutations.push((self.order.next(), mutation));
         }
     }
 

@@ -13,12 +13,18 @@ use crate::Parsed;
 #[derive(Default)]
 pub(crate) struct DocumentStore {
     documents: HashMap<u32, Parsed>,
+    mutation_order: dom::mutation::MutationOrder,
 }
 
 impl DocumentStore {
+    pub(crate) fn values_mut(&mut self) -> impl Iterator<Item = &mut Parsed> {
+        self.documents.values_mut()
+    }
+
     /// Stores `parsed` and returns its document id.
-    pub(crate) fn insert(&mut self, parsed: Parsed) -> u32 {
+    pub(crate) fn insert(&mut self, mut parsed: Parsed) -> u32 {
         let id = parsed.document.document_id();
+        dom::mutation::share_order(&mut parsed.document, &self.mutation_order);
         self.documents.insert(id, parsed);
         id
     }

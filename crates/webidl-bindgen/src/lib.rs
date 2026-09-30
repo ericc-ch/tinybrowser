@@ -51,19 +51,50 @@ mod tests {
         };
     ";
 
+    const SETTERS: &str = r"
+        [Exposed=Window, Rust=Payload] partial interface Sample {
+            [Rust=label, RustSet=set_label] attribute DOMString label;
+            [Rust=value, RustSet=set_value] attribute DOMString? value;
+        };
+    ";
+
+    const CALLBACK: &str = r"
+        callback MutationCallback = undefined (sequence<MutationRecord> records, MutationObserver observer);
+        [Exposed=Window, Rust=Observer] interface MutationObserver {
+            [Rust=create] constructor(MutationCallback callback);
+        };
+    ";
+
+    const DICTIONARY: &str = r"
+        dictionary ObserverInit {
+            [Rust=child_list] boolean childList = false;
+            [Rust=attributes] boolean attributes;
+            [Rust=filter] sequence<DOMString> attributeFilter;
+        };
+        [Exposed=Window, Rust=Observer] interface MutationObserver {
+            [Rust=observe] undefined observe(Node target, optional ObserverInit options = {});
+            [Rust=records] sequence<MutationRecord> takeRecords();
+        };
+    ";
+
     #[test]
     fn supported_fixtures_emit_complete_rust_modules() {
-        for source in [
-            INPUT,
-            "[Exposed=Window, Rust=Payload] interface Empty { [Rust=create] constructor(); };",
-            PARTIAL,
+        for (source, module) in [
+            (INPUT, "sample_generated"),
+            (
+                "[Exposed=Window, Rust=Payload] interface Empty { [Rust=create] constructor(); };",
+                "empty_generated",
+            ),
+            (PARTIAL, "sample_generated"),
+            (SETTERS, "sample_generated"),
+            (CALLBACK, "mutation_observer_generated"),
         ] {
             let output = compile(source).expect("compile supported fixture");
             let file = syn::parse_file(&output).expect("generated module is valid Rust syntax");
-            let [syn::Item::Mod(module)] = file.items.as_slice() else {
+            let [syn::Item::Mod(item)] = file.items.as_slice() else {
                 panic!("expected one generated module");
             };
-            assert_eq!(module.ident, "webidl_generated");
+            assert_eq!(item.ident, module);
         }
     }
 
@@ -78,6 +109,8 @@ mod tests {
         for source in [
             INPUT.replace("Rust=label", "Rust=label, Replaceable"),
             INPUT.replace("readonly attribute", "attribute"),
+            INPUT.replace("Rust=label", "Rust=label, RustSet=set_label"),
+            SETTERS.replace("DOMString label", "unsigned short label"),
             INPUT.replace("DOMString label;", "object label;"),
             INPUT.replace("Rust=Payload", "Rust=\"not a rust path\""),
             INPUT.replace("interface Sample", "interface Sample : Parent"),
@@ -100,6 +133,119 @@ mod tests {
         ] {
             assert!(compile(&source).is_err(), "accepted {source}");
         }
+    }
+
+    #[test]
+    fn callback_arguments_emit_callable_conversion() {
+        let output = compile(CALLBACK).expect("compile callback fixture");
+        assert!(
+            output.contains("callback_argument"),
+            "constructor must convert through the callback helper"
+        );
+    }
+
+    #[test]
+    fn dictionaries_emit_structs_and_optional_arguments() {
+        let output = compile(DICTIONARY).expect("compile dictionary fixture");
+        for fragment in [
+            "struct ObserverInit",
+            "from_object",
+            "dict_flag",
+            "dict_string_sequence",
+        ] {
+            assert!(
+                output.contains(fragment),
+                "dictionary output must contain {fragment}"
+            );
+        }
+    }
+
+    #[test]
+    fn dictionary_semantics_fail_the_build() {
+        for source in [
+            DICTIONARY.replace(
+                "[Rust=child_list] boolean childList",
+                "[Rust=child_list] required boolean childList",
+            ),
+            DICTIONARY.replace("[Rust=attributes] ", ""),
+            DICTIONARY.replace(
+                "[Rust=filter] sequence<DOMString> attributeFilter;",
+                "[Rust=filter] sequence<DOMString> attributeFilter;
+                [Rust=again] boolean attributes;",
+            ),
+            DICTIONARY.replace("boolean attributes;", "DOMString attributes;"),
+            DICTIONARY.replace("boolean attributes;", "boolean? attributes;"),
+            DICTIONARY.replace(
+                "sequence<DOMString> attributeFilter;",
+                "sequence<DOMString> attributeFilter = [];",
+            ),
+            DICTIONARY.replace(
+                "optional ObserverInit options = {}",
+                "optional Node target = {}",
+            ),
+            DICTIONARY.replace(
+                "(Node target, optional ObserverInit options = {})",
+                "(optional ObserverInit options = {}, Node target)",
+            ),
+            DICTIONARY.replace("dictionary ObserverInit", "partial dictionary ObserverInit"),
+            DICTIONARY.replace(
+                "dictionary ObserverInit",
+                "dictionary ObserverInit : Parent",
+            ),
+            DICTIONARY.replace(
+                "[Rust=observe] undefined observe",
+                "[Rust=observe] ObserverInit observe",
+            ),
+        ] {
+            assert!(compile(&source).is_err(), "accepted {source}");
+        }
+    }
+
+    #[test]
+    fn callback_semantics_fail_the_build() {
+        for source in [
+            CALLBACK.replace(
+                "callback MutationCallback = undefined",
+                "callback MutationCallback = DOMString",
+            ),
+            format!("{CALLBACK}\ncallback MutationCallback = undefined ();"),
+            CALLBACK.replace(
+                "[Rust=create] constructor(MutationCallback callback);",
+                "[Rust=create] constructor(optional MutationCallback callback);",
+            ),
+            CALLBACK.replace(
+                "[Rust=create] constructor(MutationCallback callback);",
+                "[Rust=watch] MutationCallback watch(MutationCallback callback);",
+            ),
+            CALLBACK.replace(
+                "[Rust=create] constructor(MutationCallback callback);",
+                "[Rust=create] constructor(MutationCallback callback);\n[Rust=hook] readonly attribute MutationCallback hook;",
+            ),
+            CALLBACK.replace(
+                "callback MutationCallback = undefined",
+                "dictionary MutationCallback { boolean flag; }; callback Unused = undefined",
+            ),
+            format!(
+                "{CALLBACK}\n[Exposed=Window, Rust=Other] interface Other {{ [Rust=create] constructor(); }};"
+            ),
+        ] {
+            assert!(compile(&source).is_err(), "accepted {source}");
+        }
+    }
+
+    #[test]
+    fn receiver_object_reaches_this_taking_operations() {
+        const THIS: &str = r"
+            [Exposed=Window, Rust=Payload] interface Sample {
+                [Rust=create] constructor();
+                [Rust=watch, RustThis] undefined watch(Node node);
+            };
+        ";
+        let output = compile(THIS).expect("compile receiver fixture");
+        assert!(
+            output.contains("this_object"),
+            "RustThis operations must receive the receiver object"
+        );
     }
 
     #[test]

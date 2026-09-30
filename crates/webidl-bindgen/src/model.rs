@@ -18,10 +18,11 @@ pub(crate) struct Interface {
     pub(crate) has_lifetime: bool,
     pub(crate) parent_intrinsic: Option<String>,
     pub(crate) constructor: Option<Constructor>,
-    pub(crate) getters: Vec<Getter>,
+    pub(crate) attributes: Vec<Attribute>,
     pub(crate) constants: Vec<Constant>,
     pub(crate) kind: InterfaceKind,
     pub(crate) operations: Vec<Operation>,
+    pub(crate) dictionaries: Vec<Dictionary>,
 }
 
 pub(crate) enum InterfaceKind {
@@ -32,23 +33,51 @@ pub(crate) enum InterfaceKind {
 pub(crate) struct Operation {
     pub(crate) name: String,
     pub(crate) rust: Ident,
-    pub(crate) arguments: Vec<ReturnType>,
+    pub(crate) result: OperationResult,
+    pub(crate) takes_this: bool,
+    pub(crate) arguments: Vec<OperationArgument>,
+}
+
+pub(crate) enum OperationResult {
+    Node,
+    Undefined,
+    RecordSequence,
+}
+
+pub(crate) struct OperationArgument {
+    pub(crate) type_: ReturnType,
+    pub(crate) optional: bool,
 }
 
 pub(crate) struct Constructor {
     pub(crate) rust: Ident,
-    pub(crate) arguments: Vec<StringArgument>,
+    pub(crate) arguments: Vec<ConstructorArgument>,
 }
 
-pub(crate) struct StringArgument {
-    pub(crate) default: Option<String>,
+pub(crate) struct ConstructorArgument {
+    pub(crate) kind: ConstructorArgumentKind,
 }
 
-pub(crate) struct Getter {
+pub(crate) enum ConstructorArgumentKind {
+    String { default: Option<String> },
+    Callback,
+}
+
+impl ConstructorArgumentKind {
+    pub(crate) fn is_required(&self) -> bool {
+        match self {
+            Self::String { default } => default.is_none(),
+            Self::Callback => true,
+        }
+    }
+}
+
+pub(crate) struct Attribute {
     pub(crate) name: String,
     pub(crate) rust: Ident,
     pub(crate) return_type: ReturnType,
     pub(crate) mapping: GetterMapping,
+    pub(crate) setter: Option<Ident>,
 }
 
 pub(crate) enum GetterMapping {
@@ -63,12 +92,42 @@ pub(crate) enum ReturnType {
     NullableNode,
     Node,
     NodeList,
+    Callback,
+    Dictionary(String),
+    RecordSequence,
+}
+
+pub(crate) struct Callback {
+    pub(crate) name: String,
+}
+
+pub(crate) struct Dictionary {
+    pub(crate) name: String,
+    pub(crate) fields: Vec<DictionaryField>,
+}
+
+pub(crate) struct DictionaryField {
+    pub(crate) name: String,
+    pub(crate) rust: Ident,
+    pub(crate) type_: DictionaryFieldType,
+}
+
+pub(crate) enum DictionaryFieldType {
+    Boolean { default: Option<bool> },
+    StringSequence,
 }
 
 pub(crate) struct Constant {
     pub(crate) name: String,
     pub(crate) value: u16,
     pub(crate) legacy_name: Option<String>,
+}
+
+/// Named types visible to one interface file: callbacks and dictionaries
+/// declared alongside it.
+pub(crate) struct TypeNames {
+    pub(crate) callbacks: HashSet<String>,
+    pub(crate) dictionaries: HashSet<String>,
 }
 
 impl Interface {
@@ -80,9 +139,7 @@ impl Interface {
         if !remaining.trim().is_empty() {
             return Err(Error(format!("invalid Web IDL near {remaining:?}")));
         }
-        let [definition] = definitions.as_slice() else {
-            return Err(Error("expected exactly one native interface".into()));
-        };
+        let (callbacks, dictionaries, definition) = split_definitions(&definitions)?;
         let (kind, identifier_token, members, attributes) = match definition {
             Definition::Interface(definition) => {
                 if definition.inheritance.is_some() {
@@ -128,23 +185,38 @@ impl Interface {
                 "partial interfaces cannot select a prototype parent".into(),
             ));
         }
+        let names = TypeNames {
+            callbacks: callbacks
+                .iter()
+                .map(|callback| callback.name.clone())
+                .collect(),
+            dictionaries: dictionaries
+                .iter()
+                .map(|dictionary| dictionary.name.clone())
+                .collect(),
+        };
         let mut result = Self {
             name: identifier(identifier_token)?.into(),
             rust,
             has_lifetime,
             parent_intrinsic,
             constructor: None,
-            getters: Vec::new(),
+            attributes: Vec::new(),
             constants: Vec::new(),
             kind,
             operations: Vec::new(),
+            dictionaries,
         };
-        result.lower_members(members)?;
+        result.lower_members(members, &names)?;
         Ok(result)
     }
 
-    fn lower_members(&mut self, members: &[InterfaceMember<'_>]) -> Result<(), Error> {
-        let mut names = HashSet::new();
+    fn lower_members(
+        &mut self,
+        members: &[InterfaceMember<'_>],
+        names: &TypeNames,
+    ) -> Result<(), Error> {
+        let mut taken = HashSet::new();
         for member in members {
             match member {
                 InterfaceMember::Constructor(member) => {
@@ -156,11 +228,12 @@ impl Interface {
                     if self.constructor.is_some() {
                         return Err(Error("constructor overloads are not supported yet".into()));
                     }
-                    self.constructor = Some(Constructor::parse(member)?);
+                    self.constructor = Some(Constructor::parse(member, names)?);
                 }
                 InterfaceMember::Attribute(member) => {
-                    check_name(&mut names, member.identifier.0)?;
-                    self.getters.push(Getter::parse(member, self.has_lifetime)?);
+                    check_name(&mut taken, member.identifier.0)?;
+                    self.attributes
+                        .push(Attribute::parse(member, self.has_lifetime, names)?);
                 }
                 InterfaceMember::Const(member) => {
                     if matches!(self.kind, InterfaceKind::Partial) {
@@ -168,12 +241,12 @@ impl Interface {
                             "partial interface constants are not supported yet".into(),
                         ));
                     }
-                    check_name(&mut names, member.identifier.0)?;
+                    check_name(&mut taken, member.identifier.0)?;
                     self.constants.push(Constant::parse(member)?);
                 }
                 InterfaceMember::Operation(member) => {
-                    let operation = Operation::parse(member)?;
-                    if !names.insert(operation.name.clone()) {
+                    let operation = Operation::parse(member, names)?;
+                    if !taken.insert(operation.name.clone()) {
                         return Err(Error(format!(
                             "duplicate interface member: {}",
                             operation.name
@@ -189,7 +262,10 @@ impl Interface {
 }
 
 impl Operation {
-    fn parse(member: &weedle::interface::OperationInterfaceMember<'_>) -> Result<Self, Error> {
+    fn parse(
+        member: &weedle::interface::OperationInterfaceMember<'_>,
+        names: &TypeNames,
+    ) -> Result<Self, Error> {
         if member.modifier.is_some() || member.special.is_some() {
             return Err(Error("only regular named operations are supported".into()));
         }
@@ -199,25 +275,30 @@ impl Operation {
             .ok_or_else(|| Error("operation needs an identifier".into()))?;
         let mut attributes = Attributes::parse(member.attributes.as_ref())?;
         let rust = attributes.rust()?;
+        let takes_this = attributes.flag("RustThis")?;
         attributes.finish()?;
-        let weedle::types::ReturnType::Type(result) = &member.return_type else {
-            return Err(Error(
-                "only Node operation results are supported yet".into(),
-            ));
+        let result = match &member.return_type {
+            weedle::types::ReturnType::Undefined(_) => OperationResult::Undefined,
+            weedle::types::ReturnType::Type(type_) => match ReturnType::parse(type_, names)? {
+                ReturnType::Node => OperationResult::Node,
+                ReturnType::RecordSequence => OperationResult::RecordSequence,
+                _ => {
+                    return Err(Error(
+                            "only Node, undefined, and record sequence operation results are supported yet"
+                                .into(),
+                        ));
+                }
+            },
         };
-        if !matches!(ReturnType::parse(result)?, ReturnType::Node) {
-            return Err(Error(
-                "only Node operation results are supported yet".into(),
-            ));
-        }
         let mut arguments = Vec::new();
-        let mut names = HashSet::new();
+        let mut taken = HashSet::new();
+        let mut optional_seen = false;
         for argument in &member.args.body.list {
             let Argument::Single(argument) = argument else {
                 return Err(Error("variadic operations are not supported yet".into()));
             };
             identifier_spelling(argument.identifier.0)?;
-            if !names.insert(
+            if !taken.insert(
                 argument
                     .identifier
                     .0
@@ -228,34 +309,60 @@ impl Operation {
             }
             Attributes::parse(argument.attributes.as_ref())?.finish()?;
             Attributes::parse(argument.type_.attributes.as_ref())?.finish()?;
-            if argument.optional.is_some() || argument.default.is_some() {
+            let type_ = ReturnType::parse(&argument.type_.type_, names)?;
+            let optional = argument.optional.is_some();
+            match (&type_, optional, &argument.default) {
+                (ReturnType::Dictionary(_), true, Some(default))
+                    if matches!(
+                        default.value,
+                        weedle::literal::DefaultValue::EmptyDictionary(_)
+                    ) => {}
+                (_, true, _) | (_, _, Some(_)) => {
+                    return Err(Error(
+                        "only trailing optional dictionaries with {} defaults are supported yet"
+                            .into(),
+                    ));
+                }
+                _ => {}
+            }
+            if optional_seen && !optional {
                 return Err(Error(
-                    "optional operation arguments are not supported yet".into(),
+                    "required arguments after optional ones are not supported yet".into(),
                 ));
             }
-            let type_ = ReturnType::parse(&argument.type_.type_)?;
-            if !matches!(type_, ReturnType::Node | ReturnType::NullableNode) {
+            optional_seen |= optional;
+            if !matches!(
+                type_,
+                ReturnType::Node
+                    | ReturnType::NullableNode
+                    | ReturnType::Callback
+                    | ReturnType::Dictionary(_)
+            ) {
                 return Err(Error(
-                    "only Node operation arguments are supported yet".into(),
+                    "only Node, callback, and dictionary operation arguments are supported yet"
+                        .into(),
                 ));
             }
-            arguments.push(type_);
+            arguments.push(OperationArgument { type_, optional });
         }
         Ok(Self {
             name: identifier(name.0)?.into(),
             rust,
+            result,
+            takes_this,
             arguments,
         })
     }
 }
 
-impl Getter {
+impl Attribute {
     fn parse(
         member: &weedle::interface::AttributeInterfaceMember<'_>,
         has_lifetime: bool,
+        names: &TypeNames,
     ) -> Result<Self, Error> {
-        if member.readonly.is_none() || member.modifier.is_some() {
-            return Err(Error("expected a regular readonly attribute".into()));
+        if member.modifier.is_some() {
+            return Err(Error("expected a regular attribute".into()));
         }
         let mut attributes = Attributes::parse(member.attributes.as_ref())?;
         let field = attributes.take("RustField")?;
@@ -267,9 +374,29 @@ impl Getter {
             (attributes.rust()?, GetterMapping::Method)
         };
         let same_object = attributes.flag("SameObject")?;
+        let setter = attributes
+            .take("RustSet")?
+            .map(|name| {
+                syn::parse_str(&name)
+                    .map_err(|error| Error(format!("invalid Rust setter {name:?}: {error}")))
+            })
+            .transpose()?;
+        if member.readonly.is_some() == setter.is_some() {
+            return Err(Error(
+                "writable attributes require RustSet; readonly attributes forbid it".into(),
+            ));
+        }
         attributes.finish()?;
         Attributes::parse(member.type_.attributes.as_ref())?.finish()?;
-        let return_type = ReturnType::parse(&member.type_.type_)?;
+        let return_type = ReturnType::parse(&member.type_.type_, names)?;
+        if setter.is_some()
+            && (!matches!(mapping, GetterMapping::Method)
+                || !matches!(return_type, ReturnType::String | ReturnType::NullableString))
+        {
+            return Err(Error(
+                "only method-mapped string setters are supported yet".into(),
+            ));
+        }
         match (&mapping, &return_type, same_object, has_lifetime) {
             (GetterMapping::Field, ReturnType::Node | ReturnType::NodeList, true, true)
             | (GetterMapping::Field, ReturnType::String, false, true)
@@ -293,12 +420,16 @@ impl Getter {
             rust,
             return_type,
             mapping,
+            setter,
         })
     }
 }
 
 impl Constructor {
-    fn parse(member: &weedle::interface::ConstructorInterfaceMember<'_>) -> Result<Self, Error> {
+    fn parse(
+        member: &weedle::interface::ConstructorInterfaceMember<'_>,
+        names: &TypeNames,
+    ) -> Result<Self, Error> {
         let mut attributes = Attributes::parse(member.attributes.as_ref())?;
         let rust = attributes.rust()?;
         attributes.finish()?;
@@ -311,37 +442,48 @@ impl Constructor {
             identifier_spelling(argument.identifier.0)?;
             Attributes::parse(argument.attributes.as_ref())?.finish()?;
             Attributes::parse(argument.type_.attributes.as_ref())?.finish()?;
-            if !matches!(
-                ReturnType::parse(&argument.type_.type_)?,
-                ReturnType::String
-            ) {
-                return Err(Error(
-                    "only DOMString constructor arguments are supported yet".into(),
-                ));
-            }
-            let default = match (&argument.optional, &argument.default) {
-                (Some(_), Some(default)) => {
-                    let DefaultValue::String(value) = &default.value else {
-                        return Err(Error("expected a DOMString default".into()));
+            let kind = match ReturnType::parse(&argument.type_.type_, names)? {
+                ReturnType::String => {
+                    let default = match (&argument.optional, &argument.default) {
+                        (Some(_), Some(default)) => {
+                            let DefaultValue::String(value) = &default.value else {
+                                return Err(Error("expected a DOMString default".into()));
+                            };
+                            optional_seen = true;
+                            Some(value.0.into())
+                        }
+                        (None, None) if !optional_seen => None,
+                        _ => {
+                            return Err(Error(
+                                "expected trailing optional arguments with defaults".into(),
+                            ));
+                        }
                     };
-                    optional_seen = true;
-                    Some(value.0.into())
+                    ConstructorArgumentKind::String { default }
                 }
-                (None, None) if !optional_seen => None,
+                ReturnType::Callback => match (&argument.optional, &argument.default) {
+                    (None, None) if !optional_seen => ConstructorArgumentKind::Callback,
+                    _ => {
+                        return Err(Error(
+                            "optional callback arguments are not supported yet".into(),
+                        ));
+                    }
+                },
                 _ => {
                     return Err(Error(
-                        "expected trailing optional arguments with defaults".into(),
+                        "only DOMString and callback constructor arguments are supported yet"
+                            .into(),
                     ));
                 }
             };
-            arguments.push(StringArgument { default });
+            arguments.push(ConstructorArgument { kind });
         }
         Ok(Self { rust, arguments })
     }
 }
 
 impl ReturnType {
-    fn parse(type_: &Type<'_>) -> Result<Self, Error> {
+    fn parse(type_: &Type<'_>, names: &TypeNames) -> Result<Self, Error> {
         match type_ {
             Type::Single(SingleType::NonAny(NonAnyType::DOMString(value))) => {
                 Ok(if value.q_mark.is_some() {
@@ -355,6 +497,21 @@ impl ReturnType {
             {
                 Ok(Self::UnsignedShort)
             }
+            Type::Single(SingleType::NonAny(NonAnyType::Sequence(value))) => {
+                if value.q_mark.is_some() {
+                    return Err(Error("nullable sequences are not supported yet".into()));
+                }
+                match value.type_.generics.body.as_ref() {
+                    Type::Single(SingleType::NonAny(NonAnyType::Identifier(element)))
+                        if element.type_.0 == "MutationRecord" && element.q_mark.is_none() =>
+                    {
+                        Ok(Self::RecordSequence)
+                    }
+                    _ => Err(Error(
+                        "only mutation record sequences are supported yet".into(),
+                    )),
+                }
+            }
             Type::Single(SingleType::NonAny(NonAnyType::Identifier(value))) => {
                 match value.type_.0 {
                     "Node" => Ok(if value.q_mark.is_some() {
@@ -363,11 +520,136 @@ impl ReturnType {
                         Self::Node
                     }),
                     "NodeList" if value.q_mark.is_none() => Ok(Self::NodeList),
+                    name if value.q_mark.is_none() && names.callbacks.contains(name) => {
+                        Ok(Self::Callback)
+                    }
+                    name if value.q_mark.is_none() && names.dictionaries.contains(name) => {
+                        Ok(Self::Dictionary(name.into()))
+                    }
                     _ => Err(Error(format!("unsupported interface result: {value:?}"))),
                 }
             }
             _ => Err(Error(format!("unsupported binding type: {type_:?}"))),
         }
+    }
+}
+
+impl Callback {
+    fn parse(definition: &weedle::CallbackDefinition<'_>) -> Result<Self, Error> {
+        Attributes::parse(definition.attributes.as_ref())?.finish()?;
+        // https://webidl.spec.whatwg.org/#idl-callback-functions
+        if !matches!(
+            definition.return_type,
+            weedle::types::ReturnType::Undefined(_)
+        ) {
+            return Err(Error(
+                "only undefined callback results are supported yet".into(),
+            ));
+        }
+        // The parameter list documents the call contract the hand-written
+        // delivery code implements; conversion never runs on it, so only the
+        // shape is checked here and WPT covers the behavior.
+        for argument in &definition.arguments.body.list {
+            let Argument::Single(argument) = argument else {
+                return Err(Error("variadic callbacks are not supported yet".into()));
+            };
+            identifier_spelling(argument.identifier.0)?;
+            if argument.optional.is_some() || argument.default.is_some() {
+                return Err(Error(
+                    "optional callback parameters are not supported yet".into(),
+                ));
+            }
+        }
+        Ok(Self {
+            name: identifier(definition.identifier.0)?.into(),
+        })
+    }
+}
+
+impl Dictionary {
+    fn parse(definition: &weedle::DictionaryDefinition<'_>) -> Result<Self, Error> {
+        Attributes::parse(definition.attributes.as_ref())?.finish()?;
+        if definition.inheritance.is_some() {
+            return Err(Error("dictionary inheritance is not supported yet".into()));
+        }
+        let mut fields = Vec::new();
+        let mut taken = HashSet::new();
+        for member in &definition.members.body {
+            if member.required.is_some() {
+                return Err(Error(
+                    "required dictionary fields are not supported yet".into(),
+                ));
+            }
+            let mut attributes = Attributes::parse(member.attributes.as_ref())?;
+            let rust = attributes.rust()?;
+            attributes.finish()?;
+            if !taken.insert(member.identifier.0) {
+                return Err(Error(format!(
+                    "duplicate dictionary field: {}",
+                    member.identifier.0
+                )));
+            }
+            let type_ = match &member.type_ {
+                Type::Single(SingleType::NonAny(NonAnyType::Boolean(value))) => {
+                    if value.q_mark.is_some() {
+                        return Err(Error(
+                            "nullable dictionary fields are not supported yet".into(),
+                        ));
+                    }
+                    let default = match &member.default {
+                        None => None,
+                        Some(default) => {
+                            let DefaultValue::Boolean(value) = &default.value else {
+                                return Err(Error(
+                                    "only boolean dictionary defaults are supported yet".into(),
+                                ));
+                            };
+                            Some(value.0)
+                        }
+                    };
+                    DictionaryFieldType::Boolean { default }
+                }
+                Type::Single(SingleType::NonAny(NonAnyType::Sequence(value))) => {
+                    if value.q_mark.is_some() {
+                        return Err(Error(
+                            "nullable dictionary fields are not supported yet".into(),
+                        ));
+                    }
+                    match value.type_.generics.body.as_ref() {
+                        Type::Single(SingleType::NonAny(NonAnyType::DOMString(element)))
+                            if element.q_mark.is_none() => {}
+                        _ => {
+                            return Err(Error(
+                                "only string sequence dictionary fields are supported yet".into(),
+                            ));
+                        }
+                    }
+                    if member.default.is_some() {
+                        return Err(Error(
+                            "sequence dictionary defaults are not supported yet".into(),
+                        ));
+                    }
+                    DictionaryFieldType::StringSequence
+                }
+                _ => {
+                    return Err(Error(format!(
+                        "unsupported dictionary field type: {:?}",
+                        member.type_
+                    )));
+                }
+            };
+            fields.push(DictionaryField {
+                name: identifier(member.identifier.0)?.into(),
+                rust,
+                type_,
+            });
+        }
+        // https://webidl.spec.whatwg.org/#js-dictionary
+        fields.sort_by(|left, right| left.name.cmp(&right.name));
+        Ok(Self {
+            name: identifier(definition.identifier.0)?.into(),
+            fields,
+        })
     }
 }
 
@@ -399,6 +681,55 @@ impl Constant {
 
 fn is_unsigned_short(type_: IntegerType) -> bool {
     matches!(type_, IntegerType::Short(value) if value.unsigned.is_some())
+}
+
+/// One interface file is one native interface plus the callbacks and
+/// dictionaries its members name.
+fn split_definitions<'a, 'b>(
+    definitions: &'a Definitions<'b>,
+) -> Result<(Vec<Callback>, Vec<Dictionary>, &'a Definition<'b>), Error> {
+    let mut callbacks = Vec::new();
+    let mut dictionaries = Vec::new();
+    let mut interface = None;
+    for definition in definitions.as_slice() {
+        match definition {
+            Definition::Callback(definition) => {
+                let callback = Callback::parse(definition)?;
+                if callbacks
+                    .iter()
+                    .any(|existing: &Callback| existing.name == callback.name)
+                {
+                    return Err(Error(format!("duplicate callback: {}", callback.name)));
+                }
+                callbacks.push(callback);
+            }
+            Definition::Dictionary(definition) => {
+                let dictionary = Dictionary::parse(definition)?;
+                if dictionaries
+                    .iter()
+                    .any(|existing: &Dictionary| existing.name == dictionary.name)
+                {
+                    return Err(Error(format!("duplicate dictionary: {}", dictionary.name)));
+                }
+                dictionaries.push(dictionary);
+            }
+            Definition::Interface(_) | Definition::PartialInterface(_) => {
+                if interface.is_some() {
+                    return Err(Error("expected exactly one native interface".into()));
+                }
+                interface = Some(definition);
+            }
+            _ => {
+                return Err(Error(
+                    "only native interfaces, dictionaries, and callbacks are supported yet".into(),
+                ));
+            }
+        }
+    }
+    let Some(interface) = interface else {
+        return Err(Error("expected exactly one native interface".into()));
+    };
+    Ok((callbacks, dictionaries, interface))
 }
 
 fn check_name(names: &mut HashSet<String>, name: &str) -> Result<(), Error> {

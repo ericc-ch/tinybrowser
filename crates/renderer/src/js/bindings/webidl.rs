@@ -55,6 +55,12 @@ pub(crate) struct WebIdlString(pub(crate) String);
 /// (<https://webidl.spec.whatwg.org/#LegacyNullToEmptyString>).
 pub(crate) struct LegacyNullString(pub(crate) String);
 
+/// A `DOMString` argument that keeps every UTF-16 code unit.
+///
+/// Character data may contain unpaired surrogates, which a Rust `String`
+/// cannot hold, so these entry points carry the exact code units instead.
+pub(crate) struct WebIdlCodeUnits(pub(crate) dom::DomString);
+
 /// An optional title argument: omitted and `undefined` mean "not given",
 /// `null` is the string "null" like any other `DOMString`.
 pub(crate) struct OptionalTitle(pub(crate) Option<String>);
@@ -67,17 +73,36 @@ pub(crate) struct WebIdlUnsignedLong(pub(crate) u32);
 /// page-assigned global must not hijack `DOMString` conversion or re-enter
 /// Rust through it.
 pub(crate) fn webidl_to_string<'js>(ctx: &Ctx<'js>, value: Value<'js>) -> Result<String> {
+    webidl_to_js_string(ctx, value)?.to_string()
+}
+
+/// `DOMString` conversion keeping every UTF-16 code unit
+/// (<https://webidl.spec.whatwg.org/#es-DOMString>), for character data that
+/// may contain unpaired surrogates.
+pub(crate) fn webidl_to_units<'js>(ctx: &Ctx<'js>, value: Value<'js>) -> Result<Vec<u16>> {
+    webidl_to_js_string(ctx, value)?.to_utf16()
+}
+
+/// `[LegacyNullToEmptyString]` `DOMString` keeping every UTF-16 code unit:
+/// `null` becomes the empty string, every other value converts with `ToString`
+/// (<https://webidl.spec.whatwg.org/#LegacyNullToEmptyString>).
+pub(crate) fn legacy_null_units<'js>(ctx: &Ctx<'js>, value: Value<'js>) -> Result<dom::DomString> {
+    if value.is_null() {
+        return Ok(dom::DomString::default());
+    }
+    Ok(dom::DomString::from_utf16(webidl_to_units(ctx, value)?))
+}
+
+fn webidl_to_js_string<'js>(ctx: &Ctx<'js>, value: Value<'js>) -> Result<rquickjs::String<'js>> {
     if let Ok(world_rc) = world(ctx)
         && let Some(to_string) = world_rc.borrow().pristine_string.clone()
     {
         let to_string: Function = to_string.restore(ctx)?;
-        let text: rquickjs::String = to_string.call((value,))?;
-        return text.to_string();
+        return to_string.call((value,));
     }
     // Install predates the capture: fall back to the (clobberable) global.
     let to_string: Function = ctx.globals().get("String")?;
-    let text: rquickjs::String = to_string.call((value,))?;
-    text.to_string()
+    to_string.call((value,))
 }
 
 /// [Converting nodes into a node](https://dom.spec.whatwg.org/#convert-nodes-into-a-node):
@@ -129,8 +154,7 @@ pub(crate) fn convert_nodes_into_node<'js>(
             Piece::Node(id) => id,
             Piece::Text(text) => dom.create_text(text),
         };
-        dom::mutation::append(dom, fragment, id)
-            .map_err(|err| throw_dom_error(ctx, err))?;
+        dom::mutation::append(dom, fragment, id).map_err(|err| throw_dom_error(ctx, err))?;
     }
     Ok(fragment)
 }

@@ -39,10 +39,11 @@ pub use document::Stop;
 pub use embedded::EmbeddedRenderer;
 pub use engine::Engine;
 pub use protocol::{
-    BrowserServices, BrowsingContextHost, DialCancellation, DialCompletion, DialFailure, DialKind, DialOutcome,
-    DialRequest, FrameId, HistorySnapshot, MAX_RESPONSE_BODY_BYTES, MessagingHost, Mount, NetworkHost,
-    RendererEvent, ResourceLimit, STORAGE_QUOTA_BYTES, ScreenshotClip, ScreenshotRequest,
-    ScriptFailure, StorageChange, StorageError, StorageHost, StorageKind, TabError,
+    BrowserServices, BrowsingContextHost, DialCancellation, DialCompletion, DialFailure, DialKind,
+    DialOutcome, DialRequest, FrameId, HistorySnapshot, MAX_RESPONSE_BODY_BYTES, MessagingHost,
+    Mount, NetworkHost, RendererEvent, ResourceLimit, STORAGE_QUOTA_BYTES, ScreenshotClip,
+    ScreenshotRequest, ScriptFailure, StorageChange, StorageError, StorageHost, StorageKind,
+    TabError,
 };
 pub use remote::RemoteValue;
 pub use storage::PendingStorageEvent;
@@ -384,7 +385,7 @@ impl TreeSink for Sink {
     }
 
     fn create_comment(&self, text: StrTendril) -> Self::Handle {
-        self.document.borrow_mut().create_comment(text)
+        self.document.borrow_mut().create_comment(&*text)
     }
 
     /// Per the HTML spec, processing instructions become comments whose data
@@ -461,11 +462,8 @@ impl TreeSink for Sink {
     fn append_before_sibling(&self, sibling: &Self::Handle, new_node: NodeOrText<Self::Handle>) {
         match new_node {
             NodeOrText::AppendNode(node) => {
-                let _ = dom::mutation::insert_before(
-                    &mut self.document.borrow_mut(),
-                    *sibling,
-                    node,
-                );
+                let _ =
+                    dom::mutation::insert_before(&mut self.document.borrow_mut(), *sibling, node);
             }
             NodeOrText::AppendText(ref text) => {
                 // Merge into the previous sibling when that is text; the
@@ -491,11 +489,8 @@ impl TreeSink for Sink {
     }
 
     fn reparent_children(&self, node: &Self::Handle, new_parent: &Self::Handle) {
-        let _ = dom::mutation::reparent_children(
-            &mut self.document.borrow_mut(),
-            *node,
-            *new_parent,
-        );
+        let _ =
+            dom::mutation::reparent_children(&mut self.document.borrow_mut(), *node, *new_parent);
     }
 
     /// [Maybe clone an option into selectedcontent](https://html.spec.whatwg.org/multipage/form-elements.html#maybe-clone-an-option-into-selectedcontent).

@@ -2,14 +2,14 @@
 
 use super::{
     CollectionKind, FromJs, ImportSnapshot, JsAttr, JsImplementation, JsNamedNodeMap, JsTokenList,
-    LegacyNullString, NodeContext, OptString, Trace, WebIdlString, WebIdlUnsignedLong,
-    adopt_across_documents, after_attribute_change, ancestor_chain, attached_attr_id, attr_owner,
-    attr_state, attr_wrapper, attribute_local_name, attribute_value, blur_node, character_data,
-    character_data_offset, child_value, clone_document, convert_nodes_into_node,
-    create_element_named, create_html_element, create_kind, deref_weak, descendant_text,
-    detach_attr, doctype_fields, document_base_url_string, document_is_html,
-    document_is_html_content, document_url_string, element_at_point, element_box, element_click,
-    element_node_name, element_sibling_value, elements_by_tag, find_element_by_id,
+    LegacyNullString, NodeContext, OptString, Trace, WebIdlCodeUnits, WebIdlString,
+    WebIdlUnsignedLong, adopt_across_documents, after_attribute_change, ancestor_chain,
+    attached_attr_id, attr_owner, attr_state, attr_wrapper, attribute_local_name, attribute_value,
+    blur_node, character_data, character_data_offset, child_value, clone_document,
+    convert_nodes_into_node, create_element_named, create_html_element, create_kind, deref_weak,
+    descendant_text, detach_attr, doctype_fields, document_base_url_string, document_is_html,
+    document_is_html_content, document_url_string, dom_string, element_at_point, element_box,
+    element_click, element_node_name, element_sibling_value, elements_by_tag, find_element_by_id,
     fixup_focus_after_removal, focus_node, host_node_id, import_snapshot, is_element, is_focusable,
     is_html_element, is_main_document, is_template_element, live_collection, locate_namespace,
     locate_prefix, main_document, make_weak, materialize_children, materialize_import,
@@ -32,7 +32,7 @@ use crate::js::world::{DocumentStreamCommand, EventTargetKey, Handle, Wrapper};
 use crate::ReadyState;
 
 include!(concat!(env!("OUT_DIR"), "/Node.rs"));
-pub(super) use webidl_generated::install;
+pub(super) use node_generated::install;
 
 /// Backs the constructible platform interfaces (`new Text(…)`); the current
 /// realm's main document owns the new node
@@ -49,12 +49,12 @@ pub(crate) fn construct_node<'js>(
     let first = args.0.into_iter().next();
     match name.0.as_str() {
         "Text" => {
-            let data = constructor_string(&ctx, first)?;
+            let data = constructor_units(&ctx, first)?;
             let document = main_document(&ctx)?;
             create_kind(&ctx, document, |dom| dom.create_text(data))
         }
         "Comment" => {
-            let data = constructor_string(&ctx, first)?;
+            let data = constructor_units(&ctx, first)?;
             let document = main_document(&ctx)?;
             create_kind(&ctx, document, |dom| dom.create_comment(data))
         }
@@ -134,13 +134,15 @@ fn discard_custom_construction<'js>(ctx: Ctx<'js>, value: Value<'js>) -> Result<
     Ok(())
 }
 
-/// Constructor `DOMString` with the IDL default: missing and `undefined` are
-/// the empty string, `null` is "null" (<https://webidl.spec.whatwg.org/#es-DOMString>).
-fn constructor_string<'js>(ctx: &Ctx<'js>, value: Option<Value<'js>>) -> Result<String> {
+/// Constructor `DOMString` that keeps every UTF-16 code unit, for the
+/// character-data constructors (`new Text(…)`).
+fn constructor_units<'js>(ctx: &Ctx<'js>, value: Option<Value<'js>>) -> Result<dom::DomString> {
     match value {
-        None => Ok(String::new()),
-        Some(value) if value.is_undefined() => Ok(String::new()),
-        Some(value) => webidl_to_string(ctx, value),
+        None => Ok(dom::DomString::default()),
+        Some(value) if value.is_undefined() => Ok(dom::DomString::default()),
+        Some(value) => Ok(dom::DomString::from_utf16(super::webidl_to_units(
+            ctx, value,
+        )?)),
     }
 }
 
@@ -584,13 +586,13 @@ impl JsNode {
     }
 
     #[qjs(rename = "createTextNode")]
-    fn create_text_node<'js>(&self, ctx: Ctx<'js>, data: WebIdlString) -> Result<Value<'js>> {
+    fn create_text_node<'js>(&self, ctx: Ctx<'js>, data: WebIdlCodeUnits) -> Result<Value<'js>> {
         create_kind(&ctx, self.handle.0, |dom| dom.create_text(data.0))
     }
 
     // https://dom.spec.whatwg.org/#dom-document-createcomment
     #[qjs(rename = "createComment")]
-    fn create_comment<'js>(&self, ctx: Ctx<'js>, data: WebIdlString) -> Result<Value<'js>> {
+    fn create_comment<'js>(&self, ctx: Ctx<'js>, data: WebIdlCodeUnits) -> Result<Value<'js>> {
         create_kind(&ctx, self.handle.0, |dom| dom.create_comment(data.0))
     }
 
@@ -600,7 +602,7 @@ impl JsNode {
         &self,
         ctx: Ctx<'js>,
         target: WebIdlString,
-        data: WebIdlString,
+        data: WebIdlCodeUnits,
     ) -> Result<Value<'js>> {
         if !crate::xml::is_valid_name(&target.0) {
             return Err(throw_dom(
@@ -618,7 +620,7 @@ impl JsNode {
                 "target must not be xml",
             ));
         }
-        if data.0.contains("?>") {
+        if data.0.to_string_lossy().contains("?>") {
             return Err(throw_dom(&ctx, "InvalidCharacterError", "data contains ?>"));
         }
         create_kind(&ctx, self.handle.0, |dom| {
@@ -628,7 +630,11 @@ impl JsNode {
 
     // https://dom.spec.whatwg.org/#dom-document-createcdatasection
     #[qjs(rename = "createCDATASection")]
-    fn create_cdata_section<'js>(&self, ctx: Ctx<'js>, data: WebIdlString) -> Result<Value<'js>> {
+    fn create_cdata_section<'js>(
+        &self,
+        ctx: Ctx<'js>,
+        data: WebIdlCodeUnits,
+    ) -> Result<Value<'js>> {
         // CDATA sections cannot exist in HTML documents
         // (<https://dom.spec.whatwg.org/#dom-document-createcdatasection>).
         if document_is_html(&ctx, self.handle.0) {
@@ -638,7 +644,7 @@ impl JsNode {
                 "CDATA sections are not supported in HTML documents",
             ));
         }
-        if data.0.contains("]]>") {
+        if data.0.to_string_lossy().contains("]]>") {
             return Err(throw_dom(
                 &ctx,
                 "InvalidCharacterError",
@@ -1686,7 +1692,7 @@ impl JsNode {
     }
 
     #[qjs(set, rename = "text")]
-    fn set_text(&self, ctx: Ctx<'_>, value: WebIdlString) -> Result<()> {
+    fn set_text(&self, ctx: Ctx<'_>, value: WebIdlCodeUnits) -> Result<()> {
         let world = world(&ctx)?;
         let world = world.borrow();
         let Some(mut parsed) = world.document_mut(self.handle.0) else {
@@ -2068,26 +2074,26 @@ impl JsNode {
 
     // https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-element-innerhtml
     #[qjs(get, rename = "innerHTML")]
-    fn inner_html(&self, ctx: Ctx<'_>) -> Result<String> {
+    fn inner_html<'js>(&self, ctx: Ctx<'js>) -> Result<rquickjs::String<'js>> {
         let world = world(&ctx)?;
         let parsed = world.borrow();
         let Some(parsed) = parsed.document(self.handle.0) else {
             return Err(Exception::throw_type(&ctx, "no document"));
         };
         if parsed.content_type == "text/html" {
-            Ok(crate::serialize::serialize_html_fragment(
-                &parsed.document,
-                self.handle.0,
-            ))
+            let markup = crate::serialize::serialize_html_fragment(&parsed.document, self.handle.0);
+            dom_string(&ctx, &markup)
         } else {
-            crate::serialize::serialize_xml_children(&parsed.document, self.handle.0, true)
-                .map_err(|err| throw_dom(&ctx, "InvalidStateError", &err.to_string()))
+            let markup =
+                crate::serialize::serialize_xml_children(&parsed.document, self.handle.0, true)
+                    .map_err(|err| throw_dom(&ctx, "InvalidStateError", &err.to_string()))?;
+            dom_string(&ctx, &markup)
         }
     }
 
     // https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-element-outerhtml
     #[qjs(get, rename = "outerHTML")]
-    fn outer_html(&self, ctx: Ctx<'_>) -> Result<String> {
+    fn outer_html<'js>(&self, ctx: Ctx<'js>) -> Result<rquickjs::String<'js>> {
         let world = world(&ctx)?;
         let parsed = world.borrow();
         let Some(parsed) = parsed.document(self.handle.0) else {
@@ -2098,18 +2104,17 @@ impl JsNode {
             return Err(Exception::throw_type(&ctx, "outerHTML requires an element"));
         };
         if parsed.content_type == "text/html" {
-            let mut output = String::new();
-            crate::serialize::serialize_html_element(
+            let markup = crate::serialize::serialize_html_outer(
                 &parsed.document,
                 self.handle.0,
                 name,
                 attributes,
-                &mut output,
             );
-            Ok(output)
+            dom_string(&ctx, &markup)
         } else {
-            crate::serialize::serialize_xml(&parsed.document, self.handle.0, true)
-                .map_err(|err| throw_dom(&ctx, "InvalidStateError", &err.to_string()))
+            let markup = crate::serialize::serialize_xml(&parsed.document, self.handle.0, true)
+                .map_err(|err| throw_dom(&ctx, "InvalidStateError", &err.to_string()))?;
+            dom_string(&ctx, &markup)
         }
     }
 
@@ -2324,13 +2329,14 @@ impl JsNode {
     }
 
     #[qjs(get)]
-    fn data(&self, ctx: Ctx<'_>) -> Result<String> {
-        character_data(&ctx, self.handle.0)
+    fn data<'js>(&self, ctx: Ctx<'js>) -> Result<rquickjs::String<'js>> {
+        dom_string(&ctx, &character_data(&ctx, self.handle.0)?)
     }
 
     #[qjs(set, rename = "data")]
-    fn set_data(&self, ctx: Ctx<'_>, value: LegacyNullString) -> Result<()> {
-        set_character_data(&ctx, self.handle.0, value.0)
+    fn set_data<'js>(&self, ctx: Ctx<'js>, value: Value<'js>) -> Result<()> {
+        let data = super::legacy_null_units(&ctx, value)?;
+        set_character_data(&ctx, self.handle.0, data)
     }
 
     // https://dom.spec.whatwg.org/#dom-node-lastchild
@@ -2387,12 +2393,12 @@ impl JsNode {
     }
 
     // https://dom.spec.whatwg.org/#dom-node-nodevalue
-    #[qjs(get, rename = "nodeValue")]
-    fn node_value<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
-        let world = world(&ctx)?;
+    #[qjs(skip)]
+    fn node_value<'js>(&self, ctx: &Ctx<'js>) -> Result<Option<rquickjs::String<'js>>> {
+        let world = world(ctx)?;
         let parsed = world.borrow();
         let Some(parsed) = parsed.document(self.handle.0) else {
-            return Ok(Value::new_null(ctx));
+            return Ok(None);
         };
         match parsed.document.kind(self.handle.0) {
             Some(
@@ -2400,50 +2406,55 @@ impl JsNode {
                 | NodeKind::CDataSection { data }
                 | NodeKind::ProcessingInstruction { data, .. }
                 | NodeKind::Comment { data },
-            ) => string_value(&ctx, data),
-            _ => Ok(Value::new_null(ctx)),
+            ) => dom_string(ctx, data).map(Some),
+            _ => Ok(None),
         }
     }
 
-    #[qjs(set, rename = "nodeValue")]
-    fn set_node_value(&self, ctx: Ctx<'_>, value: OptString) -> Result<()> {
-        // "If the given value is null, act as if it was the empty string"
-        // (<https://dom.spec.whatwg.org/#dom-node-nodevalue>); `OptString`
-        // maps null and undefined to `None`.
-        set_character_data(&ctx, self.handle.0, value.0.unwrap_or_default())
+    // https://dom.spec.whatwg.org/#dom-node-nodevalue
+    #[qjs(skip)]
+    fn set_node_value(&self, ctx: &Ctx<'_>, value: Option<rquickjs::String<'_>>) -> Result<()> {
+        let value = match value {
+            Some(value) => dom::DomString::from_utf16(value.to_utf16()?),
+            None => dom::DomString::default(),
+        };
+        set_character_data(ctx, self.handle.0, value)
     }
 
     // https://dom.spec.whatwg.org/#dom-node-textcontent
-    #[qjs(get, rename = "textContent")]
-    fn text_content<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
-        let world = world(&ctx)?;
+    #[qjs(skip)]
+    fn text_content<'js>(&self, ctx: &Ctx<'js>) -> Result<Option<rquickjs::String<'js>>> {
+        let world = world(ctx)?;
         let parsed = world.borrow();
         let Some(parsed) = parsed.document(self.handle.0) else {
-            return Ok(Value::new_null(ctx));
+            return Ok(None);
         };
         match parsed.document.kind(self.handle.0) {
             Some(NodeKind::Element { .. } | NodeKind::Fragment) => {
                 let text = descendant_text(&parsed.document, self.handle.0);
-                string_value(&ctx, &text)
+                dom_string(ctx, &text).map(Some)
             }
             Some(
                 NodeKind::Text { data }
                 | NodeKind::CDataSection { data }
                 | NodeKind::ProcessingInstruction { data, .. }
                 | NodeKind::Comment { data },
-            ) => string_value(&ctx, data),
-            _ => Ok(Value::new_null(ctx)),
+            ) => dom_string(ctx, data).map(Some),
+            _ => Ok(None),
         }
     }
 
-    #[qjs(set, rename = "textContent")]
-    fn set_text_content(&self, ctx: Ctx<'_>, value: OptString) -> Result<()> {
-        let text = value.0.unwrap_or_default();
+    #[qjs(skip)]
+    fn set_text_content(&self, ctx: &Ctx<'_>, value: Option<rquickjs::String<'_>>) -> Result<()> {
+        let text = match value {
+            Some(value) => dom::DomString::from_utf16(value.to_utf16()?),
+            None => dom::DomString::default(),
+        };
         // A `CharacterData` node [replaces its data] in place; `Document` and
         // `DocumentType` ignore the setter; every other node replaces its
         // children with one `Text` node
         // (<https://dom.spec.whatwg.org/#dom-node-textcontent>).
-        let world_rc = world(&ctx)?;
+        let world_rc = world(ctx)?;
         let character_data = {
             let world = world_rc.borrow();
             let Some(parsed) = world.document(self.handle.0) else {
@@ -2460,7 +2471,7 @@ impl JsNode {
             )
         };
         if character_data {
-            return set_character_data(&ctx, self.handle.0, text);
+            return set_character_data(ctx, self.handle.0, text);
         }
         let world = world_rc.borrow();
         let Some(mut parsed) = world.document_mut(self.handle.0) else {
@@ -2477,13 +2488,13 @@ impl JsNode {
         if !text.is_empty() {
             let text_id = dom.create_text(text);
             dom::mutation::append(dom, replacement, text_id)
-                .map_err(|err| throw_dom_error(&ctx, err))?;
+                .map_err(|err| throw_dom_error(ctx, err))?;
         }
         dom::mutation::replace_all(dom, self.handle.0, replacement)
-            .map_err(|err| throw_dom_error(&ctx, err))?;
+            .map_err(|err| throw_dom_error(ctx, err))?;
         drop(parsed);
         drop(world);
-        schedule_mutation_delivery(&ctx)
+        schedule_mutation_delivery(ctx)
     }
 
     // ── ParentNode ───────────────────────────────────────────────────────
@@ -2694,23 +2705,24 @@ impl JsNode {
 
     // https://dom.spec.whatwg.org/#dom-document-title
     #[qjs(get)]
-    fn title(&self, ctx: Ctx<'_>) -> Result<String> {
+    fn title<'js>(&self, ctx: Ctx<'js>) -> Result<rquickjs::String<'js>> {
         let world = world(&ctx)?;
         let parsed = world.borrow();
         let Some(parsed) = parsed.document(self.handle.0) else {
-            return Ok(String::new());
+            return rquickjs::String::from_str(ctx.clone(), "");
         };
         let title =
             dom::selector::select_first(&parsed.document, parsed.document.document(), "title")
                 .ok()
                 .flatten();
-        Ok(title.map_or_else(String::new, |title| {
-            descendant_text(&parsed.document, title)
-        }))
+        match title {
+            Some(title) => dom_string(&ctx, &descendant_text(&parsed.document, title)),
+            None => rquickjs::String::from_str(ctx.clone(), ""),
+        }
     }
 
     #[qjs(set, rename = "title")]
-    fn set_title(&self, ctx: Ctx<'_>, value: WebIdlString) -> Result<()> {
+    fn set_title(&self, ctx: Ctx<'_>, value: WebIdlCodeUnits) -> Result<()> {
         let world = world(&ctx)?;
         let world = world.borrow();
         let Some(mut parsed) = world.document_mut(self.handle.0) else {
@@ -3365,9 +3377,9 @@ impl JsNode {
                         if let Some(previous) = merged {
                             let mut joined = match dom.kind(previous) {
                                 Some(NodeKind::Text { data }) => data.clone(),
-                                _ => String::new(),
+                                _ => dom::DomString::default(),
                             };
-                            joined.push_str(data);
+                            joined.push_dom(data);
                             dom::mutation::set_text(dom, previous, joined)
                                 .map_err(|err| throw_dom_error(&ctx, err))?;
                             dom::mutation::detach(dom, kid)
@@ -3731,7 +3743,7 @@ impl JsNode {
             )
         })?;
         if character_data_node {
-            return Ok(character_data(&ctx, self.handle.0)?.encode_utf16().count());
+            return Ok(character_data(&ctx, self.handle.0)?.len());
         }
         let world = world(&ctx)?;
         let world = world.borrow();
@@ -3742,26 +3754,25 @@ impl JsNode {
 
     // https://dom.spec.whatwg.org/#dom-characterdata-substringdata
     #[qjs(rename = "substringData")]
-    fn substring_data(
+    fn substring_data<'js>(
         &self,
-        ctx: Ctx<'_>,
+        ctx: Ctx<'js>,
         offset: WebIdlUnsignedLong,
         count: WebIdlUnsignedLong,
-    ) -> Result<String> {
-        let data = character_data(&ctx, self.handle.0)?;
-        let units: Vec<u16> = data.encode_utf16().collect();
+    ) -> Result<rquickjs::String<'js>> {
+        let units = character_data(&ctx, self.handle.0)?.units().into_owned();
         let offset = character_data_offset(&ctx, offset.0, units.len())?;
         let end = offset
             .saturating_add(usize::try_from(count.0).unwrap_or(usize::MAX))
             .min(units.len());
-        Ok(String::from_utf16_lossy(&units[offset..end]))
+        rquickjs::String::from_utf16(ctx.clone(), &units[offset..end])
     }
 
     // https://dom.spec.whatwg.org/#dom-characterdata-appenddata
     #[qjs(rename = "appendData")]
-    fn append_data(&self, ctx: Ctx<'_>, data: WebIdlString) -> Result<()> {
+    fn append_data(&self, ctx: Ctx<'_>, data: WebIdlCodeUnits) -> Result<()> {
         let mut current = character_data(&ctx, self.handle.0)?;
-        current.push_str(&data.0);
+        current.push_dom(&data.0);
         set_character_data(&ctx, self.handle.0, current)
     }
 
@@ -3771,14 +3782,13 @@ impl JsNode {
         &self,
         ctx: Ctx<'_>,
         offset: WebIdlUnsignedLong,
-        data: WebIdlString,
+        data: WebIdlCodeUnits,
     ) -> Result<()> {
-        let current = character_data(&ctx, self.handle.0)?;
-        let mut units: Vec<u16> = current.encode_utf16().collect();
+        let mut units = character_data(&ctx, self.handle.0)?.units().into_owned();
         let offset = character_data_offset(&ctx, offset.0, units.len())?;
-        let insert: Vec<u16> = data.0.encode_utf16().collect();
-        units.splice(offset..offset, insert);
-        set_character_data(&ctx, self.handle.0, String::from_utf16_lossy(&units))
+        let insert = data.0.units();
+        units.splice(offset..offset, insert.iter().copied());
+        set_character_data(&ctx, self.handle.0, dom::DomString::from_utf16(units))
     }
 
     // https://dom.spec.whatwg.org/#dom-characterdata-deletedata
@@ -3789,14 +3799,13 @@ impl JsNode {
         offset: WebIdlUnsignedLong,
         count: WebIdlUnsignedLong,
     ) -> Result<()> {
-        let current = character_data(&ctx, self.handle.0)?;
-        let mut units: Vec<u16> = current.encode_utf16().collect();
+        let mut units = character_data(&ctx, self.handle.0)?.units().into_owned();
         let offset = character_data_offset(&ctx, offset.0, units.len())?;
         let end = offset
             .saturating_add(usize::try_from(count.0).unwrap_or(usize::MAX))
             .min(units.len());
         units.drain(offset..end);
-        set_character_data(&ctx, self.handle.0, String::from_utf16_lossy(&units))
+        set_character_data(&ctx, self.handle.0, dom::DomString::from_utf16(units))
     }
 
     // https://dom.spec.whatwg.org/#dom-characterdata-replacedata
@@ -3806,16 +3815,16 @@ impl JsNode {
         ctx: Ctx<'_>,
         offset: WebIdlUnsignedLong,
         count: WebIdlUnsignedLong,
-        data: WebIdlString,
+        data: WebIdlCodeUnits,
     ) -> Result<()> {
-        let current = character_data(&ctx, self.handle.0)?;
-        let mut units: Vec<u16> = current.encode_utf16().collect();
+        let mut units = character_data(&ctx, self.handle.0)?.units().into_owned();
         let offset = character_data_offset(&ctx, offset.0, units.len())?;
         let end = offset
             .saturating_add(usize::try_from(count.0).unwrap_or(usize::MAX))
             .min(units.len());
-        units.splice(offset..end, data.0.encode_utf16());
-        set_character_data(&ctx, self.handle.0, String::from_utf16_lossy(&units))
+        let replacement = data.0.units();
+        units.splice(offset..end, replacement.iter().copied());
+        set_character_data(&ctx, self.handle.0, dom::DomString::from_utf16(units))
     }
 }
 

@@ -3,35 +3,61 @@
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
 
-use crate::model::{Getter, GetterMapping, Interface, InterfaceKind, Operation, ReturnType};
+use crate::model::{
+    Attribute, ConstructorArgumentKind, Dictionary, DictionaryFieldType, GetterMapping, Interface,
+    InterfaceKind, Operation, OperationResult, ReturnType,
+};
 
 pub(crate) fn interface(interface: &Interface) -> TokenStream {
     let rust = &interface.rust;
+    let module = module_name(&interface.name);
     let payload = if interface.has_lifetime {
         quote! { #rust<'js> }
     } else {
         quote! { #rust }
     };
     let (required, constructor_body) = constructor(interface);
-    let getters = interface.getters.iter().enumerate().map(getter_dispatch);
-    let getters_members = interface.getters.iter().enumerate().map(|(index, getter)| {
-        let id = index + 1;
-        let name = &getter.name;
-        quote! { host::Member { name: #name, kind: host::MemberKind::Getter(host::Operation::new(#id)) } }
-    });
+    let dictionaries = interface.dictionaries.iter().map(dictionary);
+    let getters = interface.attributes.iter().enumerate().map(getter_dispatch);
+    let setters = interface
+        .attributes
+        .iter()
+        .enumerate()
+        .filter_map(setter_dispatch);
+    let attributes_members = interface
+        .attributes
+        .iter()
+        .enumerate()
+        .map(|(index, attribute)| {
+            let id = index * 2 + 1;
+            let name = &attribute.name;
+            let setter = if attribute.setter.is_some() {
+                let id = id + 1;
+                quote! { Some(host::Operation::new(#id)) }
+            } else {
+                quote! { None }
+            };
+            quote! { host::Member { name: #name, kind: host::MemberKind::Attribute {
+                getter: host::Operation::new(#id), setter: #setter,
+            } } }
+        });
     let operation_members = interface.operations.iter().enumerate().map(|(index, operation)| {
-        let id = interface.getters.len() + index + 1;
+        let id = interface.attributes.len() * 2 + index + 1;
         let name = &operation.name;
-        let length = operation.arguments.len();
+        let length = operation
+        .arguments
+        .iter()
+        .filter(|argument| !argument.optional)
+        .count();
         quote! { host::Member { name: #name, kind: host::MemberKind::Method { operation: host::Operation::new(#id), length: #length } } }
     });
-    let members = getters_members.chain(operation_members);
+    let members = attributes_members.chain(operation_members);
     let operations = interface
         .operations
         .iter()
         .enumerate()
         .map(|(index, operation)| {
-            let id = interface.getters.len() + index + 1;
+            let id = interface.attributes.len() * 2 + index + 1;
             operation_dispatch(id, operation)
         });
     let constants = interface.constants.iter().map(|constant| {
@@ -41,7 +67,7 @@ pub(crate) fn interface(interface: &Interface) -> TokenStream {
     });
     let legacy_code = legacy_codes(interface);
     let definition = definition(interface, &payload, required);
-    let conversion_import = if interface.getters.is_empty() {
+    let conversion_import = if interface.attributes.is_empty() {
         quote! {}
     } else {
         quote! { use rquickjs::IntoJs; }
@@ -55,7 +81,7 @@ pub(crate) fn interface(interface: &Interface) -> TokenStream {
         InterfaceKind::Partial => quote! {},
     };
     quote! {
-        mod webidl_generated {
+        mod #module {
             use super::#rust;
             use crate::js::bindings::host;
             use rquickjs::{Ctx, Object, Result, Value};
@@ -65,6 +91,7 @@ pub(crate) fn interface(interface: &Interface) -> TokenStream {
             const MEMBERS: &[host::Member] = &[#(#members),*];
             const CONSTANTS: &[host::Constant] = &[#(#constants),*];
             #definition
+            #(#dictionaries)*
 
             // https://webidl.spec.whatwg.org/#es-interface-call
             fn dispatch<'js>(operation: host::Operation, params: &Params<'_, 'js>) -> Result<Value<'js>> {
@@ -76,6 +103,7 @@ pub(crate) fn interface(interface: &Interface) -> TokenStream {
                 let receiver = receiver.borrow();
                 match operation.index() {
                     #(#getters,)*
+                    #(#setters,)*
                     #(#operations,)*
                     _ => Err(rquickjs::Exception::throw_internal(&ctx, "unknown native operation")),
                 }
@@ -124,8 +152,8 @@ fn definition(interface: &Interface, payload: &TokenStream, required: usize) -> 
     }
 }
 
-fn getter_dispatch((index, getter): (usize, &Getter)) -> TokenStream {
-    let id = index + 1;
+fn getter_dispatch((index, getter): (usize, &Attribute)) -> TokenStream {
+    let id = index * 2 + 1;
     let method = &getter.rust;
     let body = match getter.mapping {
         GetterMapping::Field => quote! { receiver.#method.clone().into_js(&ctx) },
@@ -144,41 +172,107 @@ fn getter_dispatch((index, getter): (usize, &Getter)) -> TokenStream {
                 }
             },
             ReturnType::NullableNode => quote! { receiver.#method(&ctx) },
-            ReturnType::Node | ReturnType::NodeList => unreachable!("validated field mapping"),
+            ReturnType::Node
+            | ReturnType::NodeList
+            | ReturnType::Callback
+            | ReturnType::Dictionary(_)
+            | ReturnType::RecordSequence => {
+                unreachable!("validated field mapping")
+            }
         },
     };
     quote! { #id => { #body } }
 }
 
+fn setter_dispatch((index, attribute): (usize, &Attribute)) -> Option<TokenStream> {
+    let method = attribute.setter.as_ref()?;
+    let id = index * 2 + 2;
+    let convert = match attribute.return_type {
+        ReturnType::String => quote! { host::string_argument(params, 0, None)? },
+        ReturnType::NullableString => quote! { host::nullable_string_argument(params, 0)? },
+        _ => unreachable!("validated string setter"),
+    };
+    Some(quote! {
+        #id => {
+            // https://webidl.spec.whatwg.org/#es-attributes
+            // Chromium and Firefox reject an omitted setter argument;
+            // WebIDL instead converts undefined, so follow that algorithm.
+            let value = #convert;
+            receiver.#method(&ctx, value)?;
+            Ok(Value::new_undefined(ctx))
+        }
+    })
+}
+
 fn operation_dispatch(id: usize, operation: &Operation) -> TokenStream {
     let method = &operation.rust;
-    let required = operation.arguments.len();
-    let argument_names: Vec<_> = (0..required)
+    let required = operation
+        .arguments
+        .iter()
+        .take_while(|argument| !argument.optional)
+        .count();
+    let argument_names: Vec<_> = (0..operation.arguments.len())
         .map(|index| format_ident!("arg_{index}"))
         .collect();
     let arguments = operation
         .arguments
         .iter()
         .enumerate()
-        .map(|(index, type_)| {
+        .map(|(index, argument)| {
             let variable = &argument_names[index];
-            let convert = match type_ {
-                ReturnType::Node => quote! { crate::js::bindings::required_node(&ctx, &value)? },
-                ReturnType::NullableNode => {
-                    quote! { crate::js::bindings::optional_node(&ctx, &value)? }
+            let fetch = quote! {
+                let value = params.arg(#index).unwrap_or_else(|| Value::new_undefined(ctx.clone()));
+            };
+            match &argument.type_ {
+                ReturnType::Node => quote! {
+                    #fetch
+                    let #variable = crate::js::bindings::required_node(&ctx, &value)?;
+                },
+                ReturnType::NullableNode => quote! {
+                    #fetch
+                    let #variable = crate::js::bindings::optional_node(&ctx, &value)?;
+                },
+                ReturnType::Callback => quote! {
+                    #fetch
+                    let #variable = host::callback_argument(&ctx, &value)?;
+                },
+                ReturnType::Dictionary(name) => {
+                    let struct_name = format_ident!("{name}");
+                    quote! {
+                        #fetch
+                        let #variable = #struct_name::from_object(&ctx, &value)?;
+                    }
                 }
                 _ => unreachable!("validated operation argument"),
-            };
-            quote! {
-                let value = params.arg(#index).unwrap_or_else(|| Value::new_undefined(ctx.clone()));
-                let #variable = #convert;
             }
         });
+    let call = if operation.takes_this {
+        quote! {
+            receiver.#method(
+                ctx.clone(),
+                host::this_object(params)?,
+                #(#argument_names),*
+            )
+        }
+    } else {
+        quote! { receiver.#method(ctx.clone(), #(#argument_names),*) }
+    };
+    let body = match operation.result {
+        OperationResult::Node => quote! { #call },
+        OperationResult::Undefined => quote! {
+            #call?;
+            Ok(Value::new_undefined(ctx))
+        },
+        OperationResult::RecordSequence => quote! {
+            let result: Vec<Value> = #call?;
+            host::sequence(&ctx, result)
+        },
+    };
     quote! {
         #id => {
             host::require_arguments(params, #required)?;
             #(#arguments)*
-            receiver.#method(ctx.clone(), #(#argument_names),*)
+            #body
         }
     }
 }
@@ -200,7 +294,7 @@ fn constructor(interface: &Interface) -> (usize, TokenStream) {
     let required = constructor
         .arguments
         .iter()
-        .take_while(|arg| arg.default.is_none())
+        .take_while(|argument| argument.kind.is_required())
         .count();
     let argument_names: Vec<_> = (0..constructor.arguments.len())
         .map(|index| format_ident!("arg_{index}"))
@@ -211,12 +305,20 @@ fn constructor(interface: &Interface) -> (usize, TokenStream) {
         .enumerate()
         .map(|(index, argument)| {
             let variable = &argument_names[index];
-            let default = if let Some(default) = &argument.default {
-                quote! { Some(#default) }
-            } else {
-                quote! { None }
-            };
-            quote! { let #variable = host::string_argument(params, #index, #default)?; }
+            match &argument.kind {
+                ConstructorArgumentKind::String { default } => {
+                    let default = if let Some(default) = default {
+                        quote! { Some(#default) }
+                    } else {
+                        quote! { None }
+                    };
+                    quote! { let #variable = host::string_argument(params, #index, #default)?; }
+                }
+                ConstructorArgumentKind::Callback => quote! {
+                    let value = params.arg(#index).unwrap_or_else(|| Value::new_undefined(ctx.clone()));
+                    let #variable = host::callback_argument(&ctx, &value)?;
+                },
+            }
         });
     (
         required,
@@ -225,10 +327,98 @@ fn constructor(interface: &Interface) -> (usize, TokenStream) {
             host::require_arguments(params, #required)?;
             #(#arguments)*
             let prototype = host::constructor_prototype::<#payload>(params)?;
-            let result = #rust::#create(#(#argument_names),*);
+            let result = #rust::#create(&ctx, #(#argument_names),*)?;
             return rquickjs::Class::instance_proto(result, prototype).map(rquickjs::Class::into_value);
         },
     )
+}
+
+fn dictionary(dictionary: &Dictionary) -> TokenStream {
+    let name = format_ident!("{}", dictionary.name);
+    let defaults = dictionary.fields.iter().map(|field| {
+        let rust = &field.rust;
+        match &field.type_ {
+            DictionaryFieldType::Boolean {
+                default: Some(default),
+            } => quote! { #rust: #default },
+            DictionaryFieldType::Boolean { default: None }
+            | DictionaryFieldType::StringSequence => {
+                quote! { #rust: None }
+            }
+        }
+    });
+    let fields = dictionary.fields.iter().map(|field| {
+        let rust = &field.rust;
+        match &field.type_ {
+            DictionaryFieldType::Boolean { default: Some(_) } => {
+                quote! { pub(crate) #rust: bool }
+            }
+            DictionaryFieldType::Boolean { default: None } => {
+                quote! { pub(crate) #rust: Option<bool> }
+            }
+            DictionaryFieldType::StringSequence => {
+                quote! { pub(crate) #rust: Option<Vec<Vec<u16>>> }
+            }
+        }
+    });
+    let conversions = dictionary.fields.iter().map(|field| {
+        let rust = &field.rust;
+        let key = &field.name;
+        match &field.type_ {
+            DictionaryFieldType::Boolean {
+                default: Some(default),
+            } => quote! {
+                #rust: host::dict_flag(ctx, &object, #key)?.unwrap_or(#default)
+            },
+            DictionaryFieldType::Boolean { default: None } => quote! {
+                #rust: host::dict_flag(ctx, &object, #key)?
+            },
+            DictionaryFieldType::StringSequence => quote! {
+                #rust: host::dict_string_sequence(ctx, &object, #key)?
+            },
+        }
+    });
+    quote! {
+        // https://webidl.spec.whatwg.org/#es-dictionary
+        pub(crate) struct #name {
+            #(#fields),*
+        }
+        impl #name {
+            pub(crate) fn from_object<'js>(ctx: &Ctx<'js>, value: &Value<'js>) -> Result<Self> {
+                if value.is_null() || value.is_undefined() {
+                    return Ok(Self { #(#defaults),* });
+                }
+                let object: Object = value.clone().into_object().ok_or_else(|| {
+                    rquickjs::Exception::throw_type(ctx, "dictionary must be an object")
+                })?;
+                Ok(Self {
+                    #(#conversions),*
+                })
+            }
+        }
+    }
+}
+
+/// One generated module per interface, named after it, so a bindings file
+/// that includes several interfaces cannot collide.
+fn module_name(name: &str) -> proc_macro2::Ident {
+    let mut snake = String::new();
+    let chars: Vec<char> = name.chars().collect();
+    for (index, char) in chars.iter().enumerate() {
+        if !char.is_ascii_uppercase() {
+            snake.push(*char);
+            continue;
+        }
+        // Word boundary on lower-to-upper (`mutation|Observer`) and acronym
+        // end (`DOM|Exception`); never before the first character.
+        let before_lower = index > 0 && chars[index - 1].is_ascii_lowercase();
+        let after_lower = chars.get(index + 1).is_some_and(char::is_ascii_lowercase);
+        if index > 0 && (before_lower || after_lower) {
+            snake.push('_');
+        }
+        snake.push(char.to_ascii_lowercase());
+    }
+    format_ident!("{snake}_generated")
 }
 
 fn legacy_codes(interface: &Interface) -> TokenStream {

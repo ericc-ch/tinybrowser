@@ -273,8 +273,10 @@ impl JsDomParser {
 /// realm that constructed it; the parsed document takes that URL
 /// (<https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-domparser-parsefromstring>).
 /// Deflated by `build.rs`, inflated once per process.
-pub(crate) const INSTALL_DOMPARSER_CTOR_DEFLATE: &[u8] =
-    include_bytes!(concat!(env!("OUT_DIR"), "/js_blobs/dom_parser_ctor.deflate"));
+pub(crate) const INSTALL_DOMPARSER_CTOR_DEFLATE: &[u8] = include_bytes!(concat!(
+    env!("OUT_DIR"),
+    "/js_blobs/dom_parser_ctor.deflate"
+));
 
 /// The `DOMParser` constructor shim, inflated once per process.
 pub(crate) fn install_domparser_ctor_js(ctx: &Ctx<'_>) -> Result<&'static str> {
@@ -313,11 +315,15 @@ impl JsXmlSerializer {
 
     // https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-xmlserializer-serializetostring
     #[qjs(rename = "serializeToString")]
-    fn serialize_to_string<'js>(&self, ctx: Ctx<'js>, root: Value<'js>) -> Result<String> {
+    fn serialize_to_string<'js>(
+        &self,
+        ctx: Ctx<'js>,
+        root: Value<'js>,
+    ) -> Result<rquickjs::String<'js>> {
         // An `Attr` serializes as the empty string
         // (<https://w3c.github.io/DOM-Parsing/#dfn-xml-serialization-algorithm>).
         if Class::<JsAttr>::from_js(&ctx, root.clone()).is_ok() {
-            return Ok(String::new());
+            return rquickjs::String::from_str(ctx.clone(), "");
         }
         let Some(id) = host_node_id(&ctx, &root) else {
             return Err(Exception::throw_type(&ctx, "argument is not a Node"));
@@ -327,7 +333,8 @@ impl JsXmlSerializer {
         let Some(parsed) = world.document(id) else {
             return Err(Exception::throw_type(&ctx, "no document"));
         };
-        crate::serialize::serialize_xml(&parsed.document, id, false)
-            .map_err(|err| throw_dom(&ctx, "InvalidStateError", &err.to_string()))
+        let markup = crate::serialize::serialize_xml(&parsed.document, id, false)
+            .map_err(|err| throw_dom(&ctx, "InvalidStateError", &err.to_string()))?;
+        super::dom_string(&ctx, &markup)
     }
 }

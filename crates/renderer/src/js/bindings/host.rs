@@ -37,8 +37,14 @@ pub(crate) struct Member {
 
 #[derive(Clone, Copy)]
 pub(crate) enum MemberKind {
-    Getter(Operation),
-    Method { operation: Operation, length: usize },
+    Attribute {
+        getter: Operation,
+        setter: Option<Operation>,
+    },
+    Method {
+        operation: Operation,
+        length: usize,
+    },
 }
 
 pub(crate) struct Constant {
@@ -110,10 +116,17 @@ pub(crate) fn install_members(
     let ctx = prototype.ctx();
     for member in members {
         match member.kind {
-            MemberKind::Getter(operation) => {
-                let getter = Function::new_native(ctx.clone(), HostCall::new(dispatch, operation))?
+            MemberKind::Attribute { getter, setter } => {
+                let getter = Function::new_native(ctx.clone(), HostCall::new(dispatch, getter))?
                     .with_name(format!("get {}", member.name))?;
-                prototype.prop(member.name, Getter(getter))?;
+                let setter = setter
+                    .map(|operation| {
+                        Function::new_native(ctx.clone(), HostCall::new(dispatch, operation))?
+                            .with_name(format!("set {}", member.name))?
+                            .with_length(1)
+                    })
+                    .transpose()?;
+                prototype.prop(member.name, Attribute { getter, setter })?;
             }
             MemberKind::Method { operation, length } => {
                 let function =
@@ -191,12 +204,16 @@ fn install_constants(target: &Object<'_>, constants: &[Constant]) -> Result<()> 
 
 /// rquickjs's `Accessor` takes a generic Rust callback, not an existing JS
 /// function. Supply that descriptor through its safe property trait instead.
-struct Getter<'js>(Function<'js>);
+struct Attribute<'js> {
+    getter: Function<'js>,
+    setter: Option<Function<'js>>,
+}
 
-impl<'js> AsProperty<'js, ()> for Getter<'js> {
+impl<'js> AsProperty<'js, ()> for Attribute<'js> {
     fn config(self, ctx: &Ctx<'js>) -> Result<(PropertyFlags, Value<'js>, Value<'js>, Value<'js>)> {
         use rquickjs::qjs;
         let flags = qjs::JS_PROP_HAS_GET
+            | qjs::JS_PROP_HAS_SET
             | qjs::JS_PROP_HAS_ENUMERABLE
             | qjs::JS_PROP_ENUMERABLE
             | qjs::JS_PROP_HAS_CONFIGURABLE
@@ -206,8 +223,9 @@ impl<'js> AsProperty<'js, ()> for Getter<'js> {
         Ok((
             flags,
             Value::new_undefined(ctx.clone()),
-            self.0.into_value(),
-            Value::new_undefined(ctx.clone()),
+            self.getter.into_value(),
+            self.setter
+                .map_or_else(|| Value::new_undefined(ctx.clone()), Function::into_value),
         ))
     }
 }
@@ -242,6 +260,16 @@ pub(crate) fn receiver<'js, T: JsClass<'js>>(params: &Params<'_, 'js>) -> Result
         .map_err(|_| Exception::throw_type(params.ctx(), "incompatible receiver"))
 }
 
+/// The receiver JS object for hand methods that keep it (observer identity
+/// for callback delivery). The receiver check already passed, so a missing
+/// object is an internal error, never a user throw.
+pub(crate) fn this_object<'js>(params: &Params<'_, 'js>) -> Result<Object<'js>> {
+    params
+        .this()
+        .into_object()
+        .ok_or_else(|| Exception::throw_internal(params.ctx(), "native receiver has no object"))
+}
+
 pub(crate) fn string_argument<'js>(
     params: &Params<'_, 'js>,
     index: usize,
@@ -260,4 +288,111 @@ pub(crate) fn string_argument<'js>(
     // Coerced uses the engine's ToString, not the mutable global String function
     // (whose special Symbol conversion also differs from WebIDL's ToString).
     Coerced::<rquickjs::String>::from_js(params.ctx(), value).map(|string| string.0)
+}
+
+pub(crate) fn callback_argument<'js>(ctx: &Ctx<'js>, value: &Value<'js>) -> Result<Function<'js>> {
+    // https://webidl.spec.whatwg.org/#js-callback-function
+    value
+        .clone()
+        .into_function()
+        .ok_or_else(|| Exception::throw_type(ctx, "argument is not a function"))
+}
+
+pub(crate) fn nullable_string_argument<'js>(
+    params: &Params<'_, 'js>,
+    index: usize,
+) -> Result<Option<rquickjs::String<'js>>> {
+    // https://webidl.spec.whatwg.org/#js-nullable-type
+    let value = params
+        .arg(index)
+        .unwrap_or_else(|| Value::new_undefined(params.ctx().clone()));
+    if value.is_null() || value.is_undefined() {
+        return Ok(None);
+    }
+    Coerced::<rquickjs::String>::from_js(params.ctx(), value).map(|string| Some(string.0))
+}
+
+/// One presence-preserving dictionary flag
+/// (<https://webidl.spec.whatwg.org/#es-dictionary>): absent or `undefined`
+/// is `None`, anything else converts with `ToBoolean` (`null` is false).
+pub(crate) fn dict_flag<'js>(
+    ctx: &Ctx<'js>,
+    object: &Object<'js>,
+    key: &str,
+) -> Result<Option<bool>> {
+    let value: Value = object.get(key)?;
+    if value.is_undefined() {
+        return Ok(None);
+    }
+    Coerced::<bool>::from_js(ctx, value).map(|flag| Some(flag.0))
+}
+
+/// One presence-preserving string sequence
+/// (<https://webidl.spec.whatwg.org/#js-sequence>): absent or `undefined` is
+/// `None`. Present values must be objects with a callable iterator, whose
+/// elements convert to `DOMString` without losing UTF-16 code units.
+pub(crate) fn dict_string_sequence<'js>(
+    ctx: &Ctx<'js>,
+    object: &Object<'js>,
+    key: &str,
+) -> Result<Option<Vec<Vec<u16>>>> {
+    let value: Value = object.get(key)?;
+    if value.is_undefined() {
+        return Ok(None);
+    }
+    let iterable = value
+        .into_object()
+        .ok_or_else(|| Exception::throw_type(ctx, "sequence must be an iterable object"))?;
+    let method: Value = iterable.get(PredefinedAtom::SymbolIterator)?;
+    let method = method
+        .into_function()
+        .ok_or_else(|| Exception::throw_type(ctx, "sequence iterator is not callable"))?;
+    let iterator: Value = method.call((rquickjs::prelude::This(iterable),))?;
+    let iterator = iterator
+        .into_object()
+        .ok_or_else(|| Exception::throw_type(ctx, "sequence iterator must return an object"))?;
+    let next: Value = iterator.get("next")?;
+    let next = next
+        .into_function()
+        .ok_or_else(|| Exception::throw_type(ctx, "sequence iterator next is not callable"))?;
+    let mut items = Vec::new();
+    loop {
+        let result: Value = next.call((rquickjs::prelude::This(iterator.clone()),))?;
+        let result = result.into_object().ok_or_else(|| {
+            Exception::throw_type(ctx, "sequence iterator result must be an object")
+        })?;
+        let done: Coerced<bool> = result.get("done")?;
+        if done.0 {
+            break;
+        }
+        let value: Value = result.get("value")?;
+        let string = Coerced::<rquickjs::String>::from_js(ctx, value)?.0;
+        items.push(string.to_utf16()?);
+    }
+    Ok(Some(items))
+}
+
+/// A record sequence result as a fresh JS array
+/// (<https://webidl.spec.whatwg.org/#es-sequence>).
+pub(crate) fn sequence<'js>(ctx: &Ctx<'js>, values: Vec<Value<'js>>) -> Result<Value<'js>> {
+    let array = rquickjs::Array::new(ctx.clone())?;
+    for (index, value) in values.into_iter().enumerate() {
+        array.as_object().prop(
+            index.to_string(),
+            Property::from(value).writable().enumerable().configurable(),
+        )?;
+    }
+    Ok(array.into_value())
+}
+
+/// Reports an exception thrown by a host-invoked callback (timer, `fetch`,
+/// mutation observer) through the invoking realm window's `error` event
+/// (<https://html.spec.whatwg.org/multipage/webappapis.html#report-the-error>).
+/// The callback source carries no document line, so only the callback's own
+/// stack location is used.
+pub(crate) fn report_callback_error(ctx: &Ctx<'_>, error: &rquickjs::Error) {
+    if error.is_exception() {
+        let caught = ctx.catch();
+        super::report_exception_value(ctx, caught, 0, "");
+    }
 }

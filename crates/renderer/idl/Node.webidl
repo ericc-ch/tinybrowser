@@ -8,6 +8,8 @@ partial interface Node {
     [Rust=next_sibling] readonly attribute Node? nextSibling;
     [Rust=previous_sibling] readonly attribute Node? previousSibling;
     [Rust=parent_node] readonly attribute Node? parentNode;
+    [Rust=node_value, RustSet=set_node_value] attribute DOMString? nodeValue;
+    [Rust=text_content, RustSet=set_text_content] attribute DOMString? textContent;
     [Rust=append_child] Node appendChild(Node node);
     [Rust=insert_before] Node insertBefore(Node node, Node? child);
     [Rust=remove_child] Node removeChild(Node child);

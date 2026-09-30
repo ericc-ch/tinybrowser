@@ -28,6 +28,7 @@ mod node;
 pub mod selector;
 pub mod shadow;
 mod state;
+mod string;
 mod value;
 
 pub use state::{
@@ -47,6 +48,7 @@ pub use node::{
     xmlns_namespace,
 };
 pub use selector::{ParseFail, ParseFailKind, SelectError};
+pub use string::DomString;
 pub use value::{
     is_valid_date, is_valid_floating_point, is_valid_local_date_time, is_valid_month,
     is_valid_simple_color, is_valid_time, is_valid_week,

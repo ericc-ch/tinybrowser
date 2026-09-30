@@ -344,6 +344,14 @@ impl<'js> rquickjs::FromJs<'js> for LegacyNullString {
     }
 }
 
+impl<'js> rquickjs::FromJs<'js> for WebIdlCodeUnits {
+    fn from_js(ctx: &Ctx<'js>, value: Value<'js>) -> Result<Self> {
+        Ok(Self(dom::DomString::from_utf16(webidl_to_units(
+            ctx, value,
+        )?)))
+    }
+}
+
 impl<'js> rquickjs::FromJs<'js> for OptionalTitle {
     fn from_js(ctx: &Ctx<'js>, value: Value<'js>) -> Result<Self> {
         if value.is_undefined() {
@@ -1008,7 +1016,7 @@ pub(super) fn with_node_kind<T>(
     Ok(read(parsed.document.kind(id)))
 }
 
-pub(crate) fn character_data(ctx: &Ctx<'_>, id: NodeId) -> Result<String> {
+pub(crate) fn character_data(ctx: &Ctx<'_>, id: NodeId) -> Result<dom::DomString> {
     with_node_kind(ctx, id, |kind| match kind {
         Some(
             NodeKind::Text { data }
@@ -1016,7 +1024,7 @@ pub(crate) fn character_data(ctx: &Ctx<'_>, id: NodeId) -> Result<String> {
             | NodeKind::ProcessingInstruction { data, .. }
             | NodeKind::Comment { data },
         ) => data.clone(),
-        _ => String::new(),
+        _ => dom::DomString::default(),
     })
 }
 
@@ -1032,7 +1040,7 @@ pub(super) fn attribute_value(ctx: &Ctx<'_>, id: NodeId, local: &str) -> Result<
 
 /// [Replaces data](https://dom.spec.whatwg.org/#concept-cd-replace) on a
 /// `CharacterData` node; other kinds are a silent no-op (`nodeValue` setter).
-pub(super) fn set_character_data(ctx: &Ctx<'_>, id: NodeId, data: String) -> Result<()> {
+pub(super) fn set_character_data(ctx: &Ctx<'_>, id: NodeId, data: dom::DomString) -> Result<()> {
     let world = world(ctx)?;
     let world = world.borrow();
     let Some(mut parsed) = world.document_mut(id) else {
@@ -1134,18 +1142,26 @@ pub(super) fn string_value<'js>(ctx: &Ctx<'js>, text: &str) -> Result<Value<'js>
     Ok(rquickjs::String::from_str(ctx.clone(), text)?.into_value())
 }
 
+/// A DOM string as a JavaScript string value, preserving every code unit.
+pub(super) fn dom_string<'js>(
+    ctx: &Ctx<'js>,
+    value: &dom::DomString,
+) -> Result<rquickjs::String<'js>> {
+    rquickjs::String::from_utf16(ctx.clone(), &value.units())
+}
+
 /// [Descendant text content](https://dom.spec.whatwg.org/#concept-descendant-text-content):
 /// the data of all `Text` descendants in tree order.
 ///
 /// Descends only into elements and fragments: a `Document` or other
 /// non-container child contributes nothing, so its subtree is not entered.
-pub(super) fn descendant_text(dom: &dom::Document, id: NodeId) -> String {
-    let mut text = String::new();
+pub(super) fn descendant_text(dom: &dom::Document, id: NodeId) -> dom::DomString {
+    let mut text = dom::DomString::default();
     let mut stack: Vec<NodeId> = dom.children(id).map(Iterator::collect).unwrap_or_default();
     stack.reverse();
     while let Some(current) = stack.pop() {
         match dom.kind(current) {
-            Some(NodeKind::Text { data } | NodeKind::CDataSection { data }) => text.push_str(data),
+            Some(NodeKind::Text { data } | NodeKind::CDataSection { data }) => text.push_dom(data),
             Some(NodeKind::Element { .. } | NodeKind::Fragment) => {
                 if let Some(kids) = dom.children(current) {
                     let mut kids: Vec<NodeId> = kids.collect();
@@ -1847,6 +1863,7 @@ mod realm_tests {
     }
 
     fn world_with_document(
+        js_runtime: &SharedJsRuntime,
         services: &Arc<dyn BrowserServices>,
         documents: &Rc<RefCell<crate::documents::DocumentStore>>,
         registry: &Rc<RefCell<crate::js::RealmRegistry>>,
@@ -1855,7 +1872,7 @@ mod realm_tests {
     ) -> Rc<RefCell<World>> {
         let runtime = crate::document::FrameRuntime {
             services: Arc::clone(services),
-            js_runtime: SharedJsRuntime::default(),
+            js_runtime: js_runtime.handle(),
             wake: Arc::new(tokio::sync::Notify::new()),
             stop: Arc::new(Stop::new()),
             documents: Rc::clone(documents),
@@ -1882,13 +1899,14 @@ mod realm_tests {
         let documents = Rc::new(RefCell::new(crate::documents::DocumentStore::default()));
         let registry = Rc::new(RefCell::new(crate::js::RealmRegistry::default()));
         let world = world_with_document(
+            &shared,
             &services,
             &documents,
             &registry,
             "https://a.test/",
             "<!doctype html><p></p>",
         );
-        let realm = JsRealm::new(&shared, world, stop).expect("realm");
+        let realm = JsRealm::new(&shared.handle(), world, stop).expect("realm");
         realm
             .eval("window.ev = new CustomEvent('x', {detail: 1})")
             .expect("eval");
@@ -1904,13 +1922,14 @@ mod realm_tests {
         let documents = Rc::new(RefCell::new(crate::documents::DocumentStore::default()));
         let registry = Rc::new(RefCell::new(crate::js::RealmRegistry::default()));
         let world = world_with_document(
+            &shared,
             &services,
             &documents,
             &registry,
             "https://a.test/",
             "<!doctype html><p>hello</p>",
         );
-        let realm = JsRealm::new(&shared, world, stop).expect("realm");
+        let realm = JsRealm::new(&shared.handle(), world, stop).expect("realm");
         realm
             .eval("window.onload = function(){}; document.onreadystatechange = function(){};")
             .expect("eval");
@@ -1930,6 +1949,7 @@ mod realm_tests {
         let documents = Rc::new(RefCell::new(crate::documents::DocumentStore::default()));
         let registry = Rc::new(RefCell::new(crate::js::RealmRegistry::default()));
         let world_a = world_with_document(
+            &shared,
             &services,
             &documents,
             &registry,
@@ -1937,14 +1957,17 @@ mod realm_tests {
             "<!doctype html><p id=a></p>",
         );
         let world_b = world_with_document(
+            &shared,
             &services,
             &documents,
             &registry,
             "https://b.test/",
             "<!doctype html><p id=b></p>",
         );
-        let realm_a = JsRealm::new(&shared, world_a.clone(), Arc::clone(&stop)).expect("realm a");
-        let realm_b = JsRealm::new(&shared, world_b.clone(), Arc::clone(&stop)).expect("realm b");
+        let realm_a =
+            JsRealm::new(&shared.handle(), world_a.clone(), Arc::clone(&stop)).expect("realm a");
+        let realm_b =
+            JsRealm::new(&shared.handle(), world_b.clone(), Arc::clone(&stop)).expect("realm b");
 
         // Each realm resolves its own world; one runtime-wide slot would
         // clobber the first world when the second realm installs.
@@ -1990,6 +2013,7 @@ mod realm_tests {
         let documents = Rc::new(RefCell::new(crate::documents::DocumentStore::default()));
         let registry = Rc::new(RefCell::new(crate::js::RealmRegistry::default()));
         let world_a = world_with_document(
+            &shared,
             &services,
             &documents,
             &registry,
@@ -1997,14 +2021,16 @@ mod realm_tests {
             "<!doctype html><p id=a></p>",
         );
         let world_b = world_with_document(
+            &shared,
             &services,
             &documents,
             &registry,
             "https://b.test/",
             "<!doctype html><p id=b></p>",
         );
-        let realm_a = JsRealm::new(&shared, world_a, Arc::clone(&stop)).expect("realm a");
-        let realm_b = JsRealm::new(&shared, world_b.clone(), Arc::clone(&stop)).expect("realm b");
+        let realm_a = JsRealm::new(&shared.handle(), world_a, Arc::clone(&stop)).expect("realm a");
+        let realm_b =
+            JsRealm::new(&shared.handle(), world_b.clone(), Arc::clone(&stop)).expect("realm b");
         let b_root = world_b
             .borrow()
             .with_main_document(|parsed| parsed.document.document())
