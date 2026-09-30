@@ -557,6 +557,7 @@ impl Document {
     }
 
     /// Restores a same-document session history entry while preserving the realm.
+    /// <https://html.spec.whatwg.org/multipage/browsing-the-web.html#update-document-for-history-step-application>
     pub(crate) fn traverse_history(
         &mut self,
         url: &str,
@@ -566,10 +567,21 @@ impl Document {
         if url.origin() != self.url.origin() {
             return Err(TabError::InvalidUrl { spec: url.into() });
         }
+        let previous_url = self.url.clone();
+        let previous_history = self.world.borrow().history.clone();
         self.apply_document_url(url.as_str());
         self.world.borrow_mut().history = history.clone();
-        if let Some(js) = &self.js {
-            js.traverse_history(url.as_str(), history.state.as_deref(), history.length).map_err(TabError::from)?;
+        let restored_state = self.js.as_ref().map(|js| {
+            js.restore_history(history.state.as_deref(), history.length)
+        }).transpose();
+        match restored_state {
+            Ok(Some(state)) => self.fire_js(|js| js.fire_popstate(&state)),
+            Ok(None) => {},
+            Err(error) => {
+                self.apply_document_url(previous_url.as_str());
+                self.world.borrow_mut().history = previous_history;
+                return Err(TabError::from(error));
+            }
         }
         Ok(())
     }

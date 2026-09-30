@@ -3,24 +3,15 @@
   const initialState = globalThis.__tbHistoryState;
   let currentState = initialState == null ? null : __tbDecode(initialState, Object.create(null));
   let length = globalThis.__tbHistoryLength;
-  function updateLocation(url) {
-    const parsed = new URL(url);
-    const location = globalThis.location;
-    location.href = parsed.href;
-    location.pathname = parsed.pathname;
-    location.search = parsed.search;
-    location.hash = parsed.hash;
-  }
   globalThis.PopStateEvent = class PopStateEvent extends Event {
     constructor(type, init) {
       super(type, init);
       this.state = init == null || init.state === undefined ? null : init.state;
     }
   };
-  globalThis.__tbHistoryRestore = function(url, payload, count) {
+  globalThis.__tbHistoryRestore = function(payload, count) {
     currentState = payload == null ? null : __tbDecode(payload, Object.create(null));
     length = count;
-    updateLocation(url);
     return currentState;
   };
   globalThis.history = {
@@ -48,7 +39,6 @@
     }
     length = globalThis.__tbHistoryUpdate(next, serialized, replace);
     currentState = __tbDecode(serialized, Object.create(null));
-    updateLocation(next);
   }
   Object.defineProperty(globalThis.history, Symbol.toStringTag, { value: 'History' });
 })();

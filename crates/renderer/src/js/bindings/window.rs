@@ -2,6 +2,7 @@
 
 use super::{events, main_document, world};
 use rquickjs::function::{Opt, This};
+use rquickjs::object::Accessor;
 
 use std::cell::RefCell;
 
@@ -54,40 +55,40 @@ pub(crate) fn install_location<'js>(
     globals: &Object<'js>,
     world: &Rc<RefCell<World>>,
 ) -> Result<()> {
-    let (pathname, href, search, hash, origin, protocol, host, hostname, port) = {
-        let world = world.borrow();
-        let url = &world.document_url;
-        let hostname = url.host_str().map_or_else(String::new, ToOwned::to_owned);
-        let port = url.port().map_or_else(String::new, |port| port.to_string());
-        let host = if port.is_empty() {
-            hostname.clone()
-        } else {
-            format!("{hostname}:{port}")
-        };
-        (
-            url.path().to_owned(),
-            url.as_str().to_owned(),
-            url.query()
-                .map_or_else(String::new, |query| format!("?{query}")),
-            url.fragment()
-                .map_or_else(String::new, |fragment| format!("#{fragment}")),
-            url.origin().ascii_serialization(),
-            format!("{}:", url.scheme()),
-            host,
-            hostname,
-            port,
-        )
-    };
+    enum Component { Pathname, Href, Search, Hash, Origin, Protocol, Host, Hostname, Port }
+    let components = [
+        ("pathname", Component::Pathname),
+        ("href", Component::Href),
+        ("search", Component::Search),
+        ("hash", Component::Hash),
+        ("origin", Component::Origin),
+        ("protocol", Component::Protocol),
+        ("host", Component::Host),
+        ("hostname", Component::Hostname),
+        ("port", Component::Port),
+    ];
     let location = Object::new(ctx.clone())?;
-    location.set("pathname", pathname)?;
-    location.set("href", href)?;
-    location.set("search", search)?;
-    location.set("hash", hash)?;
-    location.set("origin", origin)?;
-    location.set("protocol", protocol)?;
-    location.set("host", host)?;
-    location.set("hostname", hostname)?;
-    location.set("port", port)?;
+    for (name, component) in components {
+        let owner = Rc::clone(world);
+        location.prop(name, Accessor::new_get(move || {
+            let owner = owner.borrow();
+            let url = &owner.document_url;
+            match component {
+                Component::Pathname => url.path().to_owned(),
+                Component::Href => url.as_str().to_owned(),
+                Component::Search => url.query().map_or_else(String::new, |query| format!("?{query}")),
+                Component::Hash => url.fragment().map_or_else(String::new, |fragment| format!("#{fragment}")),
+                Component::Origin => url.origin().ascii_serialization(),
+                Component::Protocol => format!("{}:", url.scheme()),
+                Component::Host => match url.port() {
+                    Some(port) => format!("{}:{port}", url.host_str().unwrap_or_default()),
+                    None => url.host_str().unwrap_or_default().to_owned(),
+                },
+                Component::Hostname => url.host_str().unwrap_or_default().to_owned(),
+                Component::Port => url.port().map_or_else(String::new, |port| port.to_string()),
+            }
+        }).enumerable())?;
+    }
     globals.set("location", location)?;
     Ok(())
 }

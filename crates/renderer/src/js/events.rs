@@ -805,12 +805,12 @@ pub(crate) fn fire_trusted(
 }
 
 /// Fires `popstate` with the deserialized state for the activated entry.
-/// <https://html.spec.whatwg.org/multipage/browsing-the-web.html#popstateevent>
+/// <https://html.spec.whatwg.org/multipage/nav-history-apis.html#the-popstateevent-interface>
 pub(crate) fn fire_trusted_popstate<'js>(ctx: &Ctx<'js>, state: Value<'js>) -> Result<()> {
     let event = Class::instance(ctx.clone(), JsEvent::trusted("popstate", false, false))?;
-    let constructor: Object = ctx.globals().get("PopStateEvent")?;
-    let prototype: Object = constructor.get("prototype")?;
-    event.set_prototype(Some(&prototype))?;
+    if let Some(prototype) = bindings::world(ctx)?.borrow().brand("PopStateEvent") {
+        event.set_prototype(Some(&prototype.restore(ctx)?))?;
+    }
     event.set("state", state)?;
     dispatch(ctx, EventTargetKey::Window, &event, None)?;
     Ok(())

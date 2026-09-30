@@ -21,7 +21,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use rquickjs::{
-    Array, Coerced, Context, Ctx, Exception, FromJs, Function, Module, Object, Runtime, TypedArray,
+    Array, Coerced, Context, Ctx, Exception, FromJs, Function, Module, Object, Persistent, Runtime, TypedArray,
     Value, context::EvalOptions, prelude::Func,
 };
 use url::Url;
@@ -33,6 +33,12 @@ use crate::document::Stop;
 const MAX_RUNTIME_MEMORY: usize = 32 * 1024 * 1024;
 const MAX_RUNTIME_STACK: usize = 512 * 1024;
 const DEFAULT_SCRIPT_BUDGET: Duration = Duration::from_secs(5);
+
+#[derive(Clone, Copy)]
+enum MicrotaskCheckpoint {
+    Perform,
+    Defer,
+}
 
 /// Web-platform JS shims, one spec area per file, evaluated in order as a
 /// single script so top-level bindings are shared across areas.
@@ -204,7 +210,7 @@ impl JsRealm {
     }
 
     pub(crate) fn eval(&self, source: &str) -> Result<String, JsError> {
-        self.with_budget(None, || {
+        self.with_budget(None, MicrotaskCheckpoint::Perform, || {
             self.context.with(|ctx| {
                 let value: Value = eval_classic(&ctx, source)?;
                 render_eval_result(&ctx, value)
@@ -226,7 +232,7 @@ impl JsRealm {
         base_line: u32,
         filename: &str,
     ) -> Result<(), JsError> {
-        self.with_budget(None, || {
+        self.with_budget(None, MicrotaskCheckpoint::Perform, || {
             self.context.with(|ctx| {
                 let mut options = EvalOptions::default();
                 options.strict = false;
@@ -242,7 +248,7 @@ impl JsRealm {
     }
 
     pub(crate) fn eval_inline_module(&self, name: &str, source: &str) -> Result<(), JsError> {
-        self.with_budget(None, || {
+        self.with_budget(None, MicrotaskCheckpoint::Perform, || {
             self.context.with(|ctx| {
                 let promise = Module::evaluate(ctx, name, source)?;
                 promise.finish::<()>()?;
@@ -252,7 +258,7 @@ impl JsRealm {
     }
 
     pub(crate) fn eval_external_module(&self, url: &str) -> Result<(), JsError> {
-        self.with_budget(None, || {
+        self.with_budget(None, MicrotaskCheckpoint::Perform, || {
             self.context.with(|ctx| {
                 let module = modules::load_module(&ctx, url)?;
                 let (_, promise) = module.eval()?;
@@ -267,7 +273,7 @@ impl JsRealm {
         source: &str,
         deadline: Option<Instant>,
     ) -> Result<crate::js::ScriptValue, JsError> {
-        self.with_budget(deadline, || {
+        self.with_budget(deadline, MicrotaskCheckpoint::Perform, || {
             self.context.with(|ctx| {
                 let value: Value = eval_classic(&ctx, source)?;
                 decode_value(&ctx, value)
@@ -288,7 +294,7 @@ impl JsRealm {
     }
 
     pub(crate) fn fire_timer(&self, js_id: i32) -> Result<(), JsError> {
-        self.with_budget(None, || {
+        self.with_budget(None, MicrotaskCheckpoint::Perform, || {
             self.context.with(|ctx| {
                 let timeouts: Array = ctx.globals().get("__tb_timeouts")?;
                 let idx = usize::try_from(js_id).map_err(|_| JsError::BadTimerId)?;
@@ -326,7 +332,7 @@ impl JsRealm {
     /// the change
     /// (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#set-the-selection-range>).
     pub(crate) fn fire_select(&self, node: dom::NodeId) -> Result<(), JsError> {
-        self.with_budget(None, || {
+        self.with_budget(None, MicrotaskCheckpoint::Perform, || {
             self.context.with(|ctx| {
                 events::fire_trusted(
                     &ctx,
@@ -345,7 +351,7 @@ impl JsRealm {
         js_id: i32,
         outcome: Option<crate::protocol::DialOutcome>,
     ) -> Result<(), JsError> {
-        self.with_budget(None, || {
+        self.with_budget(None, MicrotaskCheckpoint::Perform, || {
             self.context.with(|ctx| {
                 let cbs: Object = ctx.globals().get("__tb_fetchCbs")?;
                 let Some(func) = cbs.get::<_, Option<Function>>(js_id)? else {
@@ -376,7 +382,7 @@ impl JsRealm {
     }
 
     pub(crate) fn fire_load(&self) -> Result<(), JsError> {
-        self.with_budget(None, || {
+        self.with_budget(None, MicrotaskCheckpoint::Perform, || {
             self.context.with(|ctx| {
                 bindings::fire_window_load(&ctx)?;
                 Ok(())
@@ -384,17 +390,30 @@ impl JsRealm {
         })
     }
 
-    pub(crate) fn traverse_history(
+    /// Restores state without a microtask checkpoint. The caller commits the
+    /// traversal before firing `popstate` and performing its checkpoint.
+    /// <https://html.spec.whatwg.org/multipage/browsing-the-web.html#update-document-for-history-step-application>
+    pub(crate) fn restore_history(
         &self,
-        url: &str,
         state: Option<&str>,
         length: usize,
-    ) -> Result<(), JsError> {
-        self.with_budget(None, || {
+    ) -> Result<Persistent<Value<'static>>, JsError> {
+        self.with_budget(None, MicrotaskCheckpoint::Defer, || {
             self.context.with(|ctx| {
                 let restore: Function = ctx.globals().get("__tbHistoryRestore")?;
-                let state: Value = restore.call((url, state, length))?;
-                events::fire_trusted_popstate(&ctx, state)?;
+                let state: Value = restore.call((state, length))?;
+                Ok(Persistent::save(&ctx, state))
+            })
+        })
+    }
+
+    pub(crate) fn fire_popstate(&self, state: &Persistent<Value<'static>>) -> Result<(), JsError> {
+        self.with_budget(None, MicrotaskCheckpoint::Perform, || {
+            self.context.with(|ctx| {
+                let state = state.clone().restore(&ctx)?;
+                if let Err(error) = events::fire_trusted_popstate(&ctx, state) {
+                    report_callback_error(&ctx, &error);
+                }
                 Ok(())
             })
         })
@@ -403,7 +422,7 @@ impl JsRealm {
     /// Fires `DOMContentLoaded` at the document
     /// (<https://html.spec.whatwg.org/multipage/parsing.html#the-end>).
     pub(crate) fn fire_dom_content_loaded(&self) -> Result<(), JsError> {
-        self.with_budget(None, || {
+        self.with_budget(None, MicrotaskCheckpoint::Perform, || {
             self.context.with(|ctx| {
                 bindings::fire_dom_content_loaded(&ctx)?;
                 Ok(())
@@ -413,7 +432,7 @@ impl JsRealm {
 
     /// Fires `readystatechange` after a document readiness change.
     pub(crate) fn fire_ready_state_change(&self) -> Result<(), JsError> {
-        self.with_budget(None, || {
+        self.with_budget(None, MicrotaskCheckpoint::Perform, || {
             self.context.with(|ctx| {
                 bindings::fire_ready_state_change(&ctx)?;
                 Ok(())
@@ -422,7 +441,7 @@ impl JsRealm {
     }
 
     pub(crate) fn fire_node_load(&self, id: dom::NodeId) -> Result<(), JsError> {
-        self.with_budget(None, || {
+        self.with_budget(None, MicrotaskCheckpoint::Perform, || {
             self.context.with(|ctx| {
                 bindings::fire_node_load(&ctx, id)?;
                 Ok(())
@@ -431,7 +450,7 @@ impl JsRealm {
     }
 
     pub(crate) fn fire_node_error(&self, id: dom::NodeId) -> Result<(), JsError> {
-        self.with_budget(None, || {
+        self.with_budget(None, MicrotaskCheckpoint::Perform, || {
             self.context.with(|ctx| {
                 bindings::fire_node_error(&ctx, id)?;
                 Ok(())
@@ -451,7 +470,7 @@ impl JsRealm {
         payload: &str,
         ports: &[u64],
     ) -> Result<bool, JsError> {
-        self.with_budget(None, || {
+        self.with_budget(None, MicrotaskCheckpoint::Perform, || {
             let payload = payload.to_owned();
             let origin = origin.to_owned();
             let ports: Vec<f64> = ports.iter().map(|port| js_number(*port)).collect();
@@ -469,7 +488,7 @@ impl JsRealm {
         source: u64,
         origin: &str,
     ) -> Result<(), JsError> {
-        self.with_budget(None, || {
+        self.with_budget(None, MicrotaskCheckpoint::Perform, || {
             let origin = origin.to_owned();
             let source = js_number(source);
             self.context.with(|ctx| {
@@ -492,7 +511,7 @@ impl JsRealm {
         let old_value = event.old_value.clone();
         let new_value = event.new_value.clone();
         let url = event.url.clone();
-        self.with_budget(None, || {
+        self.with_budget(None, MicrotaskCheckpoint::Perform, || {
             self.context.with(|ctx| {
                 let fire: Function = ctx.globals().get("__tbFireStorageEvent")?;
                 fire.call::<_, ()>((kind, key, old_value, new_value, url))?;
@@ -506,7 +525,7 @@ impl JsRealm {
     /// (<https://html.spec.whatwg.org/multipage/web-messaging.html#window-post-message-steps>)
     pub(crate) fn deliver_remote_message(&self, payload: &str) -> Result<(), JsError> {
         let payload = payload.to_owned();
-        self.with_budget(None, || {
+        self.with_budget(None, MicrotaskCheckpoint::Perform, || {
             self.context.with(|ctx| {
                 let deliver: Function = ctx.globals().get("__tbDeliverRemoteMessage")?;
                 deliver.call::<_, ()>((payload,))?;
@@ -528,7 +547,7 @@ impl JsRealm {
         let name = name.to_owned();
         let payload = payload.to_owned();
         let source = source.map(crate::js::js_number);
-        self.with_budget(None, || {
+        self.with_budget(None, MicrotaskCheckpoint::Perform, || {
             self.context.with(|ctx| {
                 let deliver: Function = ctx.globals().get("__tbDeliverBroadcast")?;
                 deliver.call::<_, ()>((name, payload, origin, source))?;
@@ -544,7 +563,7 @@ impl JsRealm {
         payload: &str,
         ports: &[u64],
     ) -> Result<bool, JsError> {
-        self.with_budget(None, || {
+        self.with_budget(None, MicrotaskCheckpoint::Perform, || {
             let payload = payload.to_owned();
             let ports: Vec<f64> = ports.iter().map(|port| js_number(*port)).collect();
             let endpoint = js_number(endpoint);
@@ -557,7 +576,7 @@ impl JsRealm {
 
     /// Dispatches `messageerror` at a port whose payload failed to decode.
     pub(crate) fn deliver_port_message_error(&self, endpoint: u64) -> Result<(), JsError> {
-        self.with_budget(None, || {
+        self.with_budget(None, MicrotaskCheckpoint::Perform, || {
             let endpoint = js_number(endpoint);
             self.context.with(|ctx| {
                 let deliver: Function = ctx.globals().get("__tbDeliverPortMessageError")?;
@@ -570,7 +589,7 @@ impl JsRealm {
     /// Applies the proxy writes this realm stored for `frame` before its
     /// realm existed.
     pub(crate) fn flush_frame_sets(&self, frame: u64) -> Result<(), JsError> {
-        self.with_budget(None, || {
+        self.with_budget(None, MicrotaskCheckpoint::Perform, || {
             let frame = js_number(frame);
             self.context.with(|ctx| {
                 let flush: Function = ctx.globals().get("__tbFlushFrameSets")?;
@@ -583,7 +602,7 @@ impl JsRealm {
     /// Fires `close` at one channel endpoint
     /// (<https://html.spec.whatwg.org/multipage/web-messaging.html#disentangle>).
     pub(crate) fn deliver_port_close(&self, endpoint: u64) -> Result<(), JsError> {
-        self.with_budget(None, || {
+        self.with_budget(None, MicrotaskCheckpoint::Perform, || {
             let endpoint = js_number(endpoint);
             self.context.with(|ctx| {
                 let deliver: Function = ctx.globals().get("__tbDeliverPortClose")?;
@@ -600,7 +619,7 @@ impl JsRealm {
     /// nothing else schedules delivery. Called between parser scripts, where
     /// the spec drains microtasks before the next script runs.
     pub(crate) fn deliver_mutations(&self) -> Result<(), JsError> {
-        self.with_budget(None, || {
+        self.with_budget(None, MicrotaskCheckpoint::Perform, || {
             self.context.with(|ctx| {
                 bindings::schedule_mutation_delivery(&ctx)?;
                 Ok(())
@@ -622,13 +641,14 @@ impl JsRealm {
     fn with_budget<T>(
         &self,
         deadline: Option<Instant>,
+        checkpoint: MicrotaskCheckpoint,
         operation: impl FnOnce() -> Result<T, JsError>,
     ) -> Result<T, JsError> {
         if self.budget_depth.get() > 0 {
             return operation();
         }
         self.budget_depth.set(1);
-        let outcome = self.with_budget_outer(deadline, operation);
+        let outcome = self.with_budget_outer(deadline, checkpoint, operation);
         self.budget_depth.set(0);
         outcome
     }
@@ -636,6 +656,7 @@ impl JsRealm {
     fn with_budget_outer<T>(
         &self,
         deadline: Option<Instant>,
+        checkpoint: MicrotaskCheckpoint,
         operation: impl FnOnce() -> Result<T, JsError>,
     ) -> Result<T, JsError> {
         let deadline = deadline.unwrap_or_else(|| Instant::now() + DEFAULT_SCRIPT_BUDGET);
@@ -652,10 +673,14 @@ impl JsRealm {
         };
         let result = operation();
         // https://html.spec.whatwg.org/multipage/webappapis.html#clean-up-after-running-script
-        let jobs = self.run_jobs();
-        // Rejections without a handler report at the end of the microtask
-        // checkpoint, after the jobs above have run.
-        self.report_pending_rejections();
+        let jobs = match checkpoint {
+            MicrotaskCheckpoint::Perform => {
+                let jobs = self.run_jobs();
+                self.report_pending_rejections();
+                jobs
+            },
+            MicrotaskCheckpoint::Defer => Ok(()),
+        };
         if interrupted.get() {
             Err(JsError::Interrupted)
         } else {
@@ -695,6 +720,9 @@ impl JsRealm {
             url_parts::install(&ctx)?;
             bindings::install_messaging(&ctx)?;
             ctx.eval::<(), _>(install_web_apis_js(&ctx)?)?;
+            let constructor: Object = ctx.globals().get("PopStateEvent")?;
+            let prototype: Object = constructor.get("prototype")?;
+            world.borrow_mut().intern_brand("PopStateEvent", Persistent::save(&ctx, prototype));
             // The shims captured the host token; page script must never see
             // it. Host plumbing is then frozen: function-valued `__tb*`
             // bindings become non-writable and non-configurable, so a page

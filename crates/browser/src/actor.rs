@@ -506,7 +506,7 @@ struct Tab {
     events_rx: Option<mpsc::Receiver<(FrameId, RendererEvent)>>,
     document_url: Url,
     history: SessionHistory,
-    traversal: Option<usize>,
+    traversal: Option<crate::history::EntryId>,
     document_loaded: bool,
     navigation_failed: bool,
     nav: Option<ActiveNavigation>,
@@ -820,7 +820,10 @@ impl Tab {
     async fn commit_navigation(&mut self, outcome: NavOutcome) -> bool {
         let site = Site::for_url(&outcome.final_url).unwrap_or_else(|| Site::opaque(self.id));
         let mut history = self.history.clone();
-        history.navigate(outcome.final_url.clone(), self.traversal.take());
+        if !history.navigate(outcome.final_url.clone(), self.traversal.take()) {
+            self.navigation_failed = true;
+            return false;
+        }
         let mount = Mount {
             url: outcome.final_url.to_string(),
             content_type: outcome.content_type.clone(),
@@ -884,11 +887,11 @@ impl Tab {
         if delta == 0 {
             let url = self.document_url.to_string();
             if self.goto(&url).is_ok() {
-                self.traversal = Some(self.history.current_index());
+                self.traversal = Some(self.history.current_entry());
             }
             return;
         }
-        let Some((index, url, state, same_document)) = self.history.target(delta) else {
+        let Some((index, entry, url, state, same_document)) = self.history.target(delta) else {
             return;
         };
         let url = url.to_string();
@@ -912,7 +915,7 @@ impl Tab {
             return;
         }
         if self.goto(&url).is_ok() {
-            self.traversal = Some(index);
+            self.traversal = Some(entry);
         }
     }
 
