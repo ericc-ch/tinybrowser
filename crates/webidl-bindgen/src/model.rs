@@ -30,6 +30,27 @@ pub(crate) struct Interface {
     pub(crate) stringifier: Option<usize>,
     pub(crate) value_iterable: bool,
     pub(crate) indexed_setter: Option<IndexedSetter>,
+    /// `[RustInstall="A,B"]`: partial-interface members that belong to a spec
+    /// mixin, installed on each named interface's prototype instead of one
+    /// interface that shares the payload.
+    pub(crate) install_targets: Vec<String>,
+    /// `[RustOwnedCtx]`: hand-written getters and setters take an owned `Ctx`
+    /// instead of `&Ctx`, so generated attribute dispatch clones it.
+    pub(crate) ctx_mode: CtxMode,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum CtxMode {
+    /// Attribute getters and setters receive `&Ctx`.
+    Borrowed,
+    /// Attribute getters and setters receive an owned `Ctx`.
+    Owned,
+}
+
+impl CtxMode {
+    pub(crate) const fn is_owned(self) -> bool {
+        matches!(self, Self::Owned)
+    }
 }
 
 pub(crate) struct IndexedSetter {
@@ -224,6 +245,22 @@ pub(crate) struct TypeNames {
     pub(crate) enumerations: HashSet<String>,
 }
 
+/// Resolves the inherited prototype and rejects a direct self-inheritance.
+fn resolve_parent(
+    parent: Option<&str>,
+    intrinsic: Option<String>,
+    identifier_token: &str,
+) -> Result<Option<PrototypeParent>, Error> {
+    let parent = parent
+        .map(|name| identifier(name).map(|name| PrototypeParent::Interface(name.to_owned())))
+        .transpose()?
+        .or_else(|| intrinsic.map(PrototypeParent::Intrinsic));
+    if matches!(&parent, Some(PrototypeParent::Interface(parent)) if parent == identifier_token) {
+        return Err(Error("an interface cannot inherit from itself".into()));
+    }
+    Ok(parent)
+}
+
 impl Interface {
     pub(crate) fn parse(source: &str) -> Result<Self, Error> {
         // weedle::parse asserts on trailing input. Use the fallible parser and
@@ -288,19 +325,21 @@ impl Interface {
                 "interface cannot declare two prototype parents".into(),
             ));
         }
-        let parent = parent
-            .map(|name| identifier(name).map(|name| PrototypeParent::Interface(name.to_owned())))
-            .transpose()?
-            .or_else(|| intrinsic.map(PrototypeParent::Intrinsic));
-        if matches!(&parent, Some(PrototypeParent::Interface(parent)) if parent == identifier_token)
-        {
-            return Err(Error("an interface cannot inherit from itself".into()));
-        }
+        let parent = resolve_parent(parent, intrinsic, identifier_token)?;
+        let install_targets = attributes.install_targets()?;
+        let ctx_mode = if attributes.flag("RustOwnedCtx")? {
+            CtxMode::Owned
+        } else {
+            CtxMode::Borrowed
+        };
         attributes.finish()?;
         if matches!(kind, InterfaceKind::Partial) && parent.is_some() {
             return Err(Error(
                 "partial interfaces cannot select a prototype parent".into(),
             ));
+        }
+        if !install_targets.is_empty() && !matches!(kind, InterfaceKind::Partial) {
+            return Err(Error("RustInstall requires a partial interface".into()));
         }
         let mut result = Self {
             name: identifier(identifier_token)?.into(),
@@ -320,6 +359,8 @@ impl Interface {
             stringifier: None,
             value_iterable: false,
             indexed_setter: None,
+            install_targets,
+            ctx_mode,
         };
         result.lower_members(members, &names)?;
         result.validate_property_hooks()?;
@@ -1633,6 +1674,20 @@ impl Attributes {
             .ok_or_else(|| Error("missing Rust mapping".into()))?;
         syn::parse_str(&value)
             .map_err(|error| Error(format!("invalid Rust mapping {value:?}: {error}")))
+    }
+
+    /// `[RustInstall="A,B"]`: the interfaces a partial (spec mixin) installs on.
+    fn install_targets(&mut self) -> Result<Vec<String>, Error> {
+        Ok(self
+            .take("RustInstall")?
+            .map(|list| {
+                list.split(',')
+                    .map(str::trim)
+                    .filter(|name| !name.is_empty())
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default())
     }
 
     fn finish(self) -> Result<(), Error> {

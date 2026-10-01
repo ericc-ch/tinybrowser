@@ -174,9 +174,9 @@ fn dispatch_groups(
         arms.push((
             index * 2 + 1,
             false,
-            getter_dispatch(index * 2 + 1, attribute),
+            getter_dispatch(index * 2 + 1, attribute, interface.ctx_mode.is_owned()),
         ));
-        if let Some(setter) = setter_dispatch((index, attribute)) {
+        if let Some(setter) = setter_dispatch((index, attribute), interface.ctx_mode.is_owned()) {
             arms.push((index * 2 + 2, true, setter));
         }
     }
@@ -186,7 +186,7 @@ fn dispatch_groups(
     }
     if let Some(index) = interface.stringifier {
         let id = interface.attributes.len() * 2 + interface.operations.len() + 1;
-        arms.push((id, false, getter_dispatch(id, &interface.attributes[index])));
+        arms.push((id, false, getter_dispatch(id, &interface.attributes[index], interface.ctx_mode.is_owned())));
     }
     let mut routes = Vec::new();
     let mut groups = Vec::new();
@@ -263,13 +263,23 @@ fn definition(interface: &Interface, payload: &TokenStream, required: usize) -> 
                 }
             }
         },
-        InterfaceKind::Partial => quote! {
-            pub(crate) fn install(ctx: &Ctx<'_>) -> Result<()> {
-                let constructor: Object = ctx.globals().get(#name)?;
-                let prototype: Object = constructor.get("prototype")?;
-                host::install_members(&prototype, MEMBERS, CONSTANTS, dispatch)
+        InterfaceKind::Partial => {
+            let targets: Vec<&str> = if interface.install_targets.is_empty() {
+                vec![name.as_str()]
+            } else {
+                interface.install_targets.iter().map(String::as_str).collect()
+            };
+            quote! {
+                pub(crate) fn install(ctx: &Ctx<'_>) -> Result<()> {
+                    #(
+                        let constructor: Object = ctx.globals().get(#targets)?;
+                        let prototype: Object = constructor.get("prototype")?;
+                        host::install_members(&prototype, MEMBERS, CONSTANTS, dispatch)?;
+                    )*
+                    Ok(())
+                }
             }
-        },
+        }
     }
 }
 
@@ -611,37 +621,44 @@ fn indexed_hooks_with_tokens(
     }
 }
 
-fn getter_dispatch(id: usize, getter: &Attribute) -> TokenStream {
+fn getter_dispatch(id: usize, getter: &Attribute, owned_ctx: bool) -> TokenStream {
     let method = &getter.rust;
+    // Operation dispatch always hands over an owned `Ctx`; attributes borrow it
+    // unless the interface opts into owned contexts for hand-written getters.
+    let ctx_arg = if owned_ctx {
+        quote! { ctx.clone() }
+    } else {
+        quote! { &ctx }
+    };
     let body = match getter.mapping {
         GetterMapping::Field => quote! { receiver.#method.clone().into_js(&ctx) },
         GetterMapping::Method => match getter.return_type {
             // `[RustValue]`: the method returns the platform value directly.
-            ReturnType::Value => quote! { receiver.#method(&ctx) },
+            ReturnType::Value => quote! { receiver.#method(#ctx_arg) },
             ReturnType::String => {
-                quote! { let result = receiver.#method(&ctx)?; result.into_js(&ctx) }
+                quote! { let result = receiver.#method(#ctx_arg)?; result.into_js(&ctx) }
             }
             ReturnType::UsvString => quote! {
-                let result = receiver.#method(&ctx)?;
+                let result = receiver.#method(#ctx_arg)?;
                 let result = result.to_string_lossy();
                 result.into_js(&ctx)
             },
             ReturnType::Boolean => quote! {
-                let result: bool = receiver.#method(&ctx)?;
+                let result: bool = receiver.#method(#ctx_arg)?;
                 result.into_js(&ctx)
             },
             ReturnType::UnsignedShort => {
-                quote! { let result: u16 = receiver.#method(&ctx)?; result.into_js(&ctx) }
+                quote! { let result: u16 = receiver.#method(#ctx_arg)?; result.into_js(&ctx) }
             }
             ReturnType::Long => {
-                quote! { let result: i32 = receiver.#method(&ctx)?; result.into_js(&ctx) }
+                quote! { let result: i32 = receiver.#method(#ctx_arg)?; result.into_js(&ctx) }
             }
             ReturnType::UnsignedLong => quote! {
-                let result = receiver.#method(&ctx)?;
+                let result = receiver.#method(#ctx_arg)?;
                 result.into_js(&ctx)
             },
             ReturnType::NullableString => quote! {
-                let result: Option<rquickjs::String> = receiver.#method(&ctx)?;
+                let result: Option<rquickjs::String> = receiver.#method(#ctx_arg)?;
                 match result {
                     Some(result) => result.into_js(&ctx),
                     None => Ok(Value::new_null(ctx)),
@@ -649,11 +666,11 @@ fn getter_dispatch(id: usize, getter: &Attribute) -> TokenStream {
             },
             ReturnType::Double => quote! {
                 // https://webidl.spec.whatwg.org/#idl-DOMHighResTimeStamp
-                let result: f64 = receiver.#method(&ctx)?;
+                let result: f64 = receiver.#method(#ctx_arg)?;
                 result.into_js(&ctx)
             },
             ReturnType::NullableNode | ReturnType::NodeList | ReturnType::PlatformObject => {
-                quote! { receiver.#method(&ctx) }
+                quote! { receiver.#method(#ctx_arg) }
             }
             ReturnType::Node
             | ReturnType::Callback
@@ -669,9 +686,14 @@ fn getter_dispatch(id: usize, getter: &Attribute) -> TokenStream {
     quote! { #id => { #body } }
 }
 
-fn setter_dispatch((index, attribute): (usize, &Attribute)) -> Option<TokenStream> {
+fn setter_dispatch((index, attribute): (usize, &Attribute), owned_ctx: bool) -> Option<TokenStream> {
     let setter = attribute.setter.as_ref()?;
     let id = index * 2 + 2;
+    let ctx_arg = if owned_ctx {
+        quote! { ctx.clone() }
+    } else {
+        quote! { &ctx }
+    };
     let (method, from_js) = match setter {
         Setter::Method { rust, from_js } => (rust, from_js),
         Setter::PutForwards { target, nullable } => {
@@ -733,7 +755,7 @@ fn setter_dispatch((index, attribute): (usize, &Attribute)) -> Option<TokenStrea
         }
     };
     let body = quote! {
-        receiver.#method(&ctx, value)?;
+        receiver.#method(#ctx_arg, value)?;
         Ok(Value::new_undefined(ctx.clone()))
     };
     let body = if attribute.reactions {
