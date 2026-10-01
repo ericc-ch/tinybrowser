@@ -30,44 +30,42 @@ methods marked `#[qjs(skip)]`.
 
 ## Migrated (generated IDL modules)
 
-`Node`, `Document`, `DocumentFragment`, `Element`, `HTMLElement`, `SVGElement`,
-`MathMLElement`, `CharacterData`, `DocumentType`, `ProcessingInstruction`,
-`Attr`, `DOMException`, `DOMImplementation`, `DOMParser`, `XMLSerializer`,
-`EventTarget`, `Event`, `MutationObserver`, `MutationRecord`, `DOMTokenList`,
-`NamedNodeMap`, `NodeList`, `HTMLCollection`, `HTMLOptionsCollection`.
+The whole native binding layer is generated. Every `JsNode` member is either a
+generated table entry or a `#[qjs(skip)]` platform method; no interface member
+is installed by `#[rquickjs::methods]` anymore.
+
+DOM: `Node`, `Document`, `DocumentFragment`, `Element`, `HTMLElement`,
+`SVGElement`, `MathMLElement`, `CharacterData`, `DocumentType`,
+`ProcessingInstruction`, `Attr`, `DocumentImplementation`, `DOMParser`,
+`XMLSerializer`, `EventTarget`, `Event`, `MutationObserver`, `MutationRecord`,
+`DOMTokenList`, `NamedNodeMap`, `NodeList`, `HTMLCollection`,
+`HTMLOptionsCollection`, `DOMException`.
+
+Mixins and shared groups: `ParentNode`, `ChildNode`,
+`NonDocumentTypeChildNode`, `ShadowRoot`, `ElementReflections` (the element-wide
+`name`/`href`/`src`/`content` reflections).
+
+HTML form controls and elements: `HTMLFormElement`, `HTMLInputElement`,
+`HTMLTextAreaElement`, `HTMLSelectElement`, `HTMLOptionElement`,
+`HTMLButtonElement`, `HTMLFieldSetElement`, `HTMLOptGroupElement`,
+`HTMLIFrameElement`, `HTMLImageElement`.
 
 ## Remaining
 
-1. Native JS-visible members still on `JsNode` in `node.rs` (~130 bindings):
-   - DOM core: ParentNode (`children`, `firstElementChild`, `lastElementChild`,
-     `childElementCount`, `append`, `prepend`, `replaceChildren`,
-     `querySelector`, `querySelectorAll`), ChildNode (`before`, `after`,
-     `replaceWith`, `remove`), NonDocumentTypeChildNode
-     (`previousElementSibling`, `nextElementSibling`), Element
-     (`matches`, `closest`, `getElementsByClassName`,
-     `innerHTML`/`outerHTML`/`insertAdjacentHTML`,
-     `getBoundingClientRect`/`getClientRects`/`scrollIntoView`/`scrollLeft`/
-     `scrollTop`, `attachShadow`/`shadowRoot`, `style`, `href`/`src`), ShadowRoot
-     (`host`, `mode`), HTMLElement (`click`, `focus`, `blur`, `title`), Document
-     (`write`, `activeElement`, `title`).
-   - HTML form controls: `HTMLFormElement`, `HTMLInputElement`,
-     `HTMLTextAreaElement`, `HTMLOptionElement`, `HTMLSelectElement`,
-     `HTMLButtonElement`, `HTMLFieldSetElement`, `HTMLLabelElement`,
-     `HTMLOptGroupElement`.
-   - Other HTML: `HTMLIFrameElement`, `HTMLImageElement`, `HTMLMetaElement`.
-2. Generator features those need: variadic union arguments
-   (`(Node or DOMString)...`), overloaded operations, required dictionary
-   fields, attribute/setter types beyond
-   String/NullableString/Boolean/UnsignedLong/Long (nullable numerics, enums,
-   `USVString`, nullable interface returns), interface names in
-   argument/return position, `[PutForwards]` on nullable attributes.
-3. Pure-JS interface shims in `crates/renderer/src/js/scripts/web/*.js` are a
+1. Pure-JS interface shims in `crates/renderer/src/js/scripts/web/*.js` are a
    separate, larger scope (encodings, file/fetch, messaging, storage, CSSOM,
-   XHR, navigator, streams, events). Not part of the native-layer goal unless
-   asked.
-4. Internal `__tb*` host bridges (about 48) still duplicate some spec behavior
+   XHR, navigator, streams, events, and the form shims that extend generated
+   interfaces: `type`, `files`, `validity`, `setCustomValidity`, `size`,
+   `item`, `namedItem`, label `form`, form `elements`/`length`).
+2. Internal `__tb*` host bridges (about 48) still duplicate some spec behavior
    (`__tbWindowNamedValue`/`Has`, `__tb_refreshNamedNodeMap`, `__tbMakeDataset`,
    handler tables).
+3. Preexisting conformance gaps unrelated to the binding layer: lossy Rust
+   `String` attribute/form storage, `Text.splitText`, `attachInternals`,
+   copied cross-document adoption, iframe `Window` identity, incomplete
+   iterator methods.
+4. `docs/progress.md` WPT totals are still the pre-migration overnight dump;
+   rerun the full scorer to refresh the scored groups.
 
 ## Durable decisions
 
@@ -76,9 +74,12 @@ methods marked `#[qjs(skip)]`.
   live in `OUT_DIR`. Implementation follows IDL; never edit IDL to match code.
 - `[Rust=path]`, `[RustValue]`, `[RustFromJs=path]`, `[RustSetFromJs=path]`,
   `[RustAlternate=Type]`, `[RustPropertyHooks=Indexed|IndexedNamed|JavaScript]`,
-  `[RustSupportedNames=path]` are the escape hatches. `[RustValue]` getters
-  return the platform `Value` directly; arguments converted with
-  `[RustFromJs]`/`[RustValue]` bypass generated conversion.
+  `[RustSupportedNames=path]`, `[RustInstall="A,B"]` (mixin install targets),
+  and `[RustOwnedCtx]` (attribute getters/setters take `Ctx` by value) are the
+  escape hatches. `[RustValue]` getters return the platform `Value` directly;
+  arguments converted with `[RustFromJs]`/`[RustValue]` bypass generated
+  conversion. Generated operation dispatch always passes an owned `Ctx`;
+  attribute dispatch borrows unless `[RustOwnedCtx]` is set.
 - One shared `NativeFunc` `HostCall` per member. Distinct JS function objects,
   one dispatch table per interface. Receiver downcast precedes arity and
   conversion. Generated wrappers use `host::instance` or the node-associated
