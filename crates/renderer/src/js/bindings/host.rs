@@ -302,6 +302,9 @@ pub(crate) fn require_node_interface(
         .ok_or_else(|| Exception::throw_type(ctx, "stale node"))?;
     let kind = document.document.kind(id);
     let implements = match interface {
+        "Document" | "XMLDocument" => matches!(kind, Some(dom::NodeKind::Document)),
+        "DocumentFragment" => matches!(kind, Some(dom::NodeKind::Fragment)),
+        "Element" => matches!(kind, Some(dom::NodeKind::Element { .. })),
         "CharacterData" => matches!(
             kind,
             Some(

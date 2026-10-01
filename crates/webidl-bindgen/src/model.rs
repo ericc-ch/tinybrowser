@@ -64,6 +64,10 @@ pub(crate) struct OperationArgument {
     pub(crate) null_default: bool,
     pub(crate) legacy_null_to_empty: bool,
     pub(crate) boolean_default: Option<bool>,
+    /// `[RustFromJs=PATH]`: convert the raw argument with `PATH::from_js`
+    /// instead of a generated conversion. Used for the renderer's exact
+    /// code-unit and pristine-string argument types.
+    pub(crate) from_js: Option<syn::Path>,
 }
 
 pub(crate) struct Constructor {
@@ -413,6 +417,7 @@ impl OperationArgument {
     ) -> Result<Self, Error> {
         let mut argument_attributes = Attributes::parse(argument.attributes.as_ref())?;
         let rust_value = argument_attributes.flag("RustValue")?;
+        let rust_from_js = argument_attributes.take("RustFromJs")?;
         let mut type_attributes = Attributes::parse(argument.type_.attributes.as_ref())?;
         let legacy_null_to_empty = argument_attributes.flag("LegacyNullToEmptyString")?
             || type_attributes.flag("LegacyNullToEmptyString")?;
@@ -472,19 +477,27 @@ impl OperationArgument {
                 | ReturnType::NullableDocumentType
                 | ReturnType::Boolean
                 | ReturnType::UnsignedLong
+                | ReturnType::Double
                 | ReturnType::Enumeration(_)
         ) {
             return Err(Error(
-                    "only Node, callback, dictionary, string, and value operation arguments are supported yet"
+                    "only Node, callback, dictionary, string, double, and value operation arguments are supported yet"
                         .into(),
                 ));
         }
+        let from_js = rust_from_js
+            .map(|path| {
+                syn::parse_str::<syn::Path>(&path)
+                    .map_err(|error| Error(format!("invalid RustFromJs {path:?}: {error}")))
+            })
+            .transpose()?;
         Ok(Self {
             type_,
             optional,
             null_default,
             legacy_null_to_empty,
             boolean_default,
+            from_js,
         })
     }
 }
@@ -509,6 +522,7 @@ impl Attribute {
         };
         let same_object = attributes.flag("SameObject")?;
         let reactions = attributes.flag("CEReactions")?;
+        let rust_value = attributes.flag("RustValue")?;
         // The unforgeable-attribute property shape is installed by the
         // interface's own shim; the generator only needs to accept the
         // annotation (<https://webidl.spec.whatwg.org/#LegacyUnforgeable>).
@@ -533,7 +547,11 @@ impl Attribute {
         }
         attributes.finish()?;
         type_attributes.finish()?;
-        let return_type = ReturnType::parse(&member.type_.type_, names)?;
+        let return_type = if rust_value {
+            ReturnType::Value
+        } else {
+            ReturnType::parse(&member.type_.type_, names)?
+        };
         if legacy_null_to_empty && !matches!(return_type, ReturnType::String) {
             return Err(Error("LegacyNullToEmptyString requires DOMString".into()));
         }
@@ -561,7 +579,8 @@ impl Attribute {
                 | ReturnType::UnsignedShort
                 | ReturnType::UnsignedLong
                 | ReturnType::NullableNode
-                | ReturnType::Double,
+                | ReturnType::Double
+                | ReturnType::Value,
                 false,
                 _,
             )

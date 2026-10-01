@@ -32,12 +32,14 @@ use crate::js::world::{DocumentStreamCommand, EventTargetKey, Handle, NodeRefere
 use crate::ReadyState;
 
 include!(concat!(env!("OUT_DIR"), "/Node.rs"));
+include!(concat!(env!("OUT_DIR"), "/Document.rs"));
 include!(concat!(env!("OUT_DIR"), "/CharacterData.rs"));
 include!(concat!(env!("OUT_DIR"), "/DocumentType.rs"));
 include!(concat!(env!("OUT_DIR"), "/ProcessingInstruction.rs"));
 
 pub(super) fn install(ctx: &Ctx<'_>) -> Result<()> {
     node_generated::install(ctx)?;
+    document_generated::install(ctx)?;
     character_data_generated::install(ctx)?;
     document_type_generated::install(ctx)?;
     processing_instruction_generated::install(ctx)
@@ -646,23 +648,31 @@ impl JsNode {
     }
 
     // https://html.spec.whatwg.org/multipage/nav-history-apis.html#dom-document-defaultview
-    #[qjs(get, rename = "defaultView")]
-    fn default_view<'js>(&self, ctx: Ctx<'js>) -> Value<'js> {
+    #[qjs(skip)]
+    #[allow(
+        clippy::unnecessary_wraps,
+        reason = "generated getters share one fallible call shape"
+    )]
+    fn default_view<'js>(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
         // A document with no browsing context, such as one from DOMParser or
         // `createDocument`, has no view.
         let has_view =
-            world(&ctx).is_ok_and(|world| world.borrow().is_main_document(self.handle.0));
-        if has_view {
+            world(ctx).is_ok_and(|world| world.borrow().is_main_document(self.handle.0));
+        Ok(if has_view {
             ctx.globals().into_value()
         } else {
-            Value::new_null(ctx)
-        }
+            Value::new_null(ctx.clone())
+        })
     }
 
     // https://html.spec.whatwg.org/multipage/interaction.html#dom-document-hasfocus
-    #[qjs(rename = "hasFocus")]
-    fn has_focus(&self, ctx: Ctx<'_>) -> bool {
-        is_main_document(&ctx, self.handle.0)
+    #[qjs(skip)]
+    #[allow(
+        clippy::unnecessary_wraps,
+        reason = "generated operations share one fallible call shape"
+    )]
+    fn has_focus(&self, ctx: Ctx<'_>) -> Result<bool> {
+        Ok(is_main_document(&ctx, self.handle.0))
     }
 
     // https://drafts.csswg.org/cssom-view/#dom-document-elementfrompoint
@@ -943,11 +953,11 @@ impl JsNode {
     }
 
     // https://dom.spec.whatwg.org/#dom-document-implementation
-    #[qjs(get)]
-    fn implementation<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
-        let world_rc = world(&ctx)?;
+    #[qjs(skip)]
+    fn implementation<'js>(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
+        let world_rc = world(ctx)?;
         if let Some(saved) = world_rc.borrow().implementation(self.handle.0)
-            && let Some(value) = deref_weak(&ctx, saved)?
+            && let Some(value) = deref_weak(ctx, saved)?
         {
             return Ok(value);
         }
@@ -958,10 +968,10 @@ impl JsNode {
             },
         )?
         .into_value();
-        let weak = make_weak(&ctx, value.clone())?;
+        let weak = make_weak(ctx, value.clone())?;
         world_rc
             .borrow_mut()
-            .intern_implementation(self.handle.0, Persistent::save(&ctx, weak));
+            .intern_implementation(self.handle.0, Persistent::save(ctx, weak));
         Ok(value)
     }
 
@@ -974,47 +984,47 @@ impl JsNode {
         elements_by_tag(&ctx, self.handle.0, &name.0)
     }
 
-    #[qjs(get)]
-    fn body<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
-        document_value(&ctx, self.handle.0, |parsed| document_first(parsed, "body"))
+    #[qjs(skip)]
+    fn body<'js>(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
+        document_value(ctx, self.handle.0, |parsed| document_first(parsed, "body"))
     }
 
     // https://html.spec.whatwg.org/multipage/dom.html#dom-document-head
-    #[qjs(get)]
-    fn head<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
-        document_value(&ctx, self.handle.0, |parsed| document_first(parsed, "head"))
+    #[qjs(skip)]
+    fn head<'js>(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
+        document_value(ctx, self.handle.0, |parsed| document_first(parsed, "head"))
     }
 
     // https://html.spec.whatwg.org/multipage/dom.html#dom-document-currentscript
-    #[qjs(get, rename = "currentScript")]
-    fn current_script<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
-        let world = world(&ctx)?;
+    #[qjs(skip)]
+    fn current_script<'js>(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
+        let world = world(ctx)?;
         let current = world.borrow().current_script;
         match current {
-            Some(id) if id.document_id() == self.handle.0.document_id() => wrap_node(&ctx, id),
-            _ => Ok(Value::new_null(ctx)),
+            Some(id) if id.document_id() == self.handle.0.document_id() => wrap_node(ctx, id),
+            _ => Ok(Value::new_null(ctx.clone())),
         }
     }
 
-    #[qjs(get, rename = "documentElement")]
-    fn document_element<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
-        document_value(&ctx, self.handle.0, |parsed| {
+    #[qjs(skip)]
+    fn document_element<'js>(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
+        document_value(ctx, self.handle.0, |parsed| {
             document_first_child(parsed, |kind| matches!(kind, NodeKind::Element { .. }))
         })
     }
 
     // https://dom.spec.whatwg.org/#dom-document-doctype
-    #[qjs(get, rename = "doctype")]
-    fn doctype<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
-        document_value(&ctx, self.handle.0, |parsed| {
+    #[qjs(skip)]
+    fn doctype<'js>(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
+        document_value(ctx, self.handle.0, |parsed| {
             document_first_child(parsed, |kind| matches!(kind, NodeKind::Doctype { .. }))
         })
     }
 
     // https://dom.spec.whatwg.org/#dom-document-readyState
-    #[qjs(get, rename = "readyState")]
-    fn ready_state(&self, ctx: Ctx<'_>) -> Result<String> {
-        let world = world(&ctx)?;
+    #[qjs(skip)]
+    fn ready_state(&self, ctx: &Ctx<'_>) -> Result<String> {
+        let world = world(ctx)?;
         let world = world.borrow();
         let Some(parsed) = world.document(self.handle.0) else {
             return Ok(String::new());
@@ -1030,15 +1040,23 @@ impl JsNode {
     }
 
     // https://dom.spec.whatwg.org/#dom-document-url
-    #[qjs(get, rename = "URL")]
-    fn url(&self, ctx: Ctx<'_>) -> String {
-        document_url_string(&ctx, self.handle.0)
+    #[qjs(skip)]
+    #[allow(
+        clippy::unnecessary_wraps,
+        reason = "generated getters share one fallible call shape"
+    )]
+    fn url(&self, ctx: &Ctx<'_>) -> Result<dom::DomString> {
+        Ok(document_url_string(ctx, self.handle.0).into())
     }
 
     // https://dom.spec.whatwg.org/#dom-document-documenturi
-    #[qjs(get, rename = "documentURI")]
-    fn document_uri(&self, ctx: Ctx<'_>) -> String {
-        document_url_string(&ctx, self.handle.0)
+    #[qjs(skip)]
+    #[allow(
+        clippy::unnecessary_wraps,
+        reason = "generated getters share one fallible call shape"
+    )]
+    fn document_uri(&self, ctx: &Ctx<'_>) -> Result<dom::DomString> {
+        Ok(document_url_string(ctx, self.handle.0).into())
     }
 
     // https://html.spec.whatwg.org/multipage/urls-and-fetching.html#dom-document-baseuri
@@ -1052,34 +1070,46 @@ impl JsNode {
     }
 
     // https://html.spec.whatwg.org/multipage/nav-history-apis.html#dom-document-location
-    #[qjs(get)]
-    fn location<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
-        if is_main_document(&ctx, self.handle.0) {
+    #[qjs(skip)]
+    fn location<'js>(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
+        if is_main_document(ctx, self.handle.0) {
             return ctx.globals().get("location");
         }
-        Ok(Value::new_null(ctx))
+        Ok(Value::new_null(ctx.clone()))
     }
 
     // https://encoding.spec.whatwg.org/#dom-document-characterset
-    #[qjs(get, rename = "characterSet")]
-    fn character_set(&self) -> &'static str {
-        "UTF-8"
+    #[qjs(skip)]
+    #[allow(
+        clippy::unnecessary_wraps,
+        reason = "generated getters share one fallible call shape"
+    )]
+    fn character_set(&self, _ctx: &Ctx<'_>) -> Result<&'static str> {
+        Ok("UTF-8")
     }
 
-    #[qjs(get, rename = "charset")]
-    fn charset(&self) -> &'static str {
-        "UTF-8"
+    #[qjs(skip)]
+    #[allow(
+        clippy::unnecessary_wraps,
+        reason = "generated getters share one fallible call shape"
+    )]
+    fn charset(&self, _ctx: &Ctx<'_>) -> Result<&'static str> {
+        Ok("UTF-8")
     }
 
-    #[qjs(get, rename = "inputEncoding")]
-    fn input_encoding(&self) -> &'static str {
-        "UTF-8"
+    #[qjs(skip)]
+    #[allow(
+        clippy::unnecessary_wraps,
+        reason = "generated getters share one fallible call shape"
+    )]
+    fn input_encoding(&self, _ctx: &Ctx<'_>) -> Result<&'static str> {
+        Ok("UTF-8")
     }
 
     // https://dom.spec.whatwg.org/#dom-document-contenttype
-    #[qjs(get, rename = "contentType")]
-    fn content_type(&self, ctx: Ctx<'_>) -> Result<&'static str> {
-        let world_rc = world(&ctx)?;
+    #[qjs(skip)]
+    fn content_type(&self, ctx: &Ctx<'_>) -> Result<&'static str> {
+        let world_rc = world(ctx)?;
         let parsed = world_rc.borrow();
         Ok(parsed
             .document(self.handle.0)
@@ -1087,9 +1117,9 @@ impl JsNode {
     }
 
     // https://dom.spec.whatwg.org/#dom-document-compatmode
-    #[qjs(get, rename = "compatMode")]
-    fn compat_mode(&self, ctx: Ctx<'_>) -> Result<String> {
-        let world = world(&ctx)?;
+    #[qjs(skip)]
+    fn compat_mode(&self, ctx: &Ctx<'_>) -> Result<String> {
+        let world = world(ctx)?;
         let parsed = world.borrow();
         let quirks = parsed
             .document(self.handle.0)

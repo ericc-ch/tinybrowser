@@ -243,6 +243,8 @@ fn getter_dispatch((index, getter): (usize, &Attribute)) -> TokenStream {
     let body = match getter.mapping {
         GetterMapping::Field => quote! { receiver.#method.clone().into_js(&ctx) },
         GetterMapping::Method => match getter.return_type {
+            // `[RustValue]`: the method returns the platform value directly.
+            ReturnType::Value => quote! { receiver.#method(&ctx) },
             ReturnType::String => {
                 quote! { let result = receiver.#method(&ctx)?; result.into_js(&ctx) }
             }
@@ -282,7 +284,6 @@ fn getter_dispatch((index, getter): (usize, &Attribute)) -> TokenStream {
             | ReturnType::Dictionary(_)
             | ReturnType::Enumeration(_)
             | ReturnType::InterfaceSequence
-            | ReturnType::Value
             | ReturnType::NullableDocumentType => {
                 unreachable!("validated field mapping")
             }
@@ -386,6 +387,19 @@ fn operation_dispatch(id: usize, operation: &Operation) -> TokenStream {
     }
 }
 
+/// `[RustFromJs=PATH]`: convert the raw argument with `PATH::from_js`, keeping
+/// the renderer's exact code-unit and pristine-string argument types.
+fn from_js_argument(
+    index: usize,
+    variable: &proc_macro2::Ident,
+    path: &syn::Path,
+) -> TokenStream {
+    quote! {
+        let value = params.arg(#index).unwrap_or_else(|| Value::new_undefined(ctx.clone()));
+        let #variable: #path = rquickjs::FromJs::from_js(&ctx, value)?;
+    }
+}
+
 fn operation_argument(
     index: usize,
     argument: &OperationArgument,
@@ -394,6 +408,10 @@ fn operation_argument(
     let fetch = quote! {
         let value = params.arg(#index).unwrap_or_else(|| Value::new_undefined(ctx.clone()));
     };
+    if let Some(path) = &argument.from_js {
+        // https://webidl.spec.whatwg.org/#es-type-mapping
+        return from_js_argument(index, variable, path);
+    }
     match &argument.type_ {
         ReturnType::Node => quote! {
             #fetch
@@ -456,24 +474,7 @@ fn operation_argument(
                 let #variable = host::document_type_argument(&ctx, &value)?;
             }
         }
-        ReturnType::Boolean => {
-            let default = argument.boolean_default.map_or_else(
-                || quote! {},
-                |default| {
-                    quote! {
-                        let value = if value.is_undefined() {
-                            Value::new_bool(ctx.clone(), #default)
-                        } else { value };
-                    }
-                },
-            );
-            quote! {
-                #fetch
-                #default
-                let converted: rquickjs::Coerced<bool> = rquickjs::FromJs::from_js(&ctx, value)?;
-                let #variable = converted.0;
-            }
-        }
+        ReturnType::Boolean => boolean_argument(argument, variable, &fetch),
         ReturnType::UnsignedLong => quote! {
             #fetch
             // https://webidl.spec.whatwg.org/#es-unsigned-long
@@ -484,7 +485,38 @@ fn operation_argument(
             #fetch
             let #variable = value;
         },
+        ReturnType::Double => quote! {
+            #fetch
+            // https://webidl.spec.whatwg.org/#es-double
+            let converted: rquickjs::Coerced<f64> = rquickjs::FromJs::from_js(&ctx, value)?;
+            let #variable = converted.0;
+        },
         _ => unreachable!("validated operation argument"),
+    }
+}
+
+/// `boolean` argument conversion with its optional default
+/// (<https://webidl.spec.whatwg.org/#es-boolean>).
+fn boolean_argument(
+    argument: &OperationArgument,
+    variable: &proc_macro2::Ident,
+    fetch: &TokenStream,
+) -> TokenStream {
+    let default = argument.boolean_default.map_or_else(
+        || quote! {},
+        |default| {
+            quote! {
+                let value = if value.is_undefined() {
+                    Value::new_bool(ctx.clone(), #default)
+                } else { value };
+            }
+        },
+    );
+    quote! {
+        #fetch
+        #default
+        let converted: rquickjs::Coerced<bool> = rquickjs::FromJs::from_js(&ctx, value)?;
+        let #variable = converted.0;
     }
 }
 
