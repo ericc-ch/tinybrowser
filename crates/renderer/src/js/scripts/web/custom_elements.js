@@ -4,7 +4,6 @@
   const definitions = new Map();
   const constructors = new Map();
   const upgraded = new WeakSet();
-  const queuedUpgrades = new WeakSet();
   const connected = new WeakSet();
   // Shadow roots keyed by host. `host.shadowRoot` is null in closed mode, but
   // lifecycle traversal still has to reach those descendants.
@@ -112,8 +111,7 @@
   }
 
   function enqueueUpgrade(element, definition) {
-    if (nativeApply(weakSetHas, upgraded, [element]) || nativeApply(weakSetHas, queuedUpgrades, [element])) return;
-    nativeApply(weakSetAdd, queuedUpgrades, [element]);
+    if (nativeApply(weakSetHas, upgraded, [element])) return;
     enqueueReaction(element, deliverUpgrade, [definition]);
   }
 
@@ -244,6 +242,34 @@
     }
     return element;
   };
+
+  // The engine adopts a cross-document node by materializing a copy
+  // (<crates/renderer/src/js/bindings/clone.rs>), while Web IDL adoption keeps
+  // the same object. Reactions the observer enqueues for the copy never reach
+  // the original wrapper the page holds, so upgrade the arguments of the
+  // insertion operations as well
+  // (<https://dom.spec.whatwg.org/#concept-node-adopt>).
+  function insertedNodes(node) {
+    if (nativeApply(nodeTypeGetter, node, []) !== 11) return [node];
+    const children = [];
+    for (let child = nativeApply(firstChildGetter, node, []); child; child = nativeApply(nextSiblingGetter, child, [])) {
+      children.push(child);
+    }
+    return children;
+  }
+  for (const name of ['appendChild', 'insertBefore', 'replaceChild']) {
+    const native = Node.prototype[name];
+    const insertion = function() {
+      const inserted = insertedNodes(arguments[0]);
+      const result = nativeApply(native, this, arguments);
+      pushReactions();
+      try { for (const node of inserted) upgradeTree(node); } finally { popReactions(); }
+      return result;
+    };
+    Object.defineProperty(insertion, 'length', { value: native.length });
+    Object.defineProperty(insertion, 'name', { value: native.name });
+    Node.prototype[name] = insertion;
+  }
 
   // https://html.spec.whatwg.org/multipage/custom-elements.html#enqueue-a-custom-element-callback-reaction
   function collectRecords(records) {
