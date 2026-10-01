@@ -16,13 +16,14 @@
   }
   // Constants are `{writable:false, enumerable:true, configurable:false}` on
   // both the interface object and its prototype
-  // (<https://webidl.spec.whatwg.org/#define-the-constants>).
+  // (<https://webidl.spec.whatwg.org/#define-the-constants>). The generator
+  // already defines them on the native prototype; the wrapper function is a
+  // distinct object and needs its own copy.
   function defineConstant(target, name, value) {
     Object.defineProperty(target, name, { value: value, writable: false, enumerable: true, configurable: false });
   }
   for (const [name, value] of [['NONE', 0], ['CAPTURING_PHASE', 1], ['AT_TARGET', 2], ['BUBBLING_PHASE', 3]]) {
     defineConstant(Event, name, value);
-    defineConstant(Native.prototype, name, value);
   }
   Object.defineProperty(Event, 'prototype', { value: Native.prototype, writable: false, configurable: false });
   Object.defineProperty(Native.prototype, 'constructor', { value: Event, writable: true, configurable: true });

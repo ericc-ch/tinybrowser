@@ -2,9 +2,9 @@
 
 Goal: Replace tinybrowser's whole native JS binding layer with browser-specific
 WebIDL codegen plus shared dispatch, to shrink the shipping binary. Whole-layer
-migration is in progress. The parser, character-data, and `Attr` slice landed in
-this commit; `Document`, `Element`, form controls, events, and the exotic
-collections still use the old bindings.
+migration is in progress. The parser, character-data, `Attr`, and
+`Event`/`EventTarget` slices have landed; `Document`, `Element`, form controls,
+and the exotic collections still use the old bindings.
 
 Plan: Extend the generator with each migrated interface. Verify each step with
 `tools/check`, workspace tests, and a before/after WPT report comparison.
@@ -122,6 +122,40 @@ This milestone's verification files are in `/tmp/opencode/jsbinding-research/`:
   across the attribute-cycle and reaction lifecycle probe.
 - `release2.log`: stripped shipping binary 8,862,872 bytes.
 
+## Event and EventTarget
+
+- `Event` and `EventTarget` now use generated construction and member
+  dispatch. `CustomEvent` stays a JavaScript shim over the native `Event`.
+- The generator gained boolean attribute setters, `DOMHighResTimeStamp`
+  (`double`), `sequence<Interface>` results, nullable interface getters,
+  dictionary constructor arguments, and integer-constant lexing (weedle reads
+  `0` as an octal literal).
+- The trusted-event bridge (`__tbDispatchTrusted`) moved off the macro and is
+  installed on the `EventTarget` prototype. Nodes still receive only the three
+  listener methods through `brands.js`.
+- The custom-element shim now upgrades the arguments of insertion operations
+  too, because the engine adopts a cross-document node by materializing a copy.
+  It also enqueues a reaction per insertion instead of deduplicating, which
+  restores the spec's constructor-recursion ordering.
+
+Verification for this slice (`/tmp/opencode/jsbinding-research/` was cleared by
+a server restart and rebuilt; `probe.py` and `compare-wpt.py` are the current
+harness):
+
+- `check.log`: `tools/check` clean.
+- `probe-current.log`: 13/13 public-boundary cases pass; `probe-before.log`
+  shows the baseline fails two (no `Attr` Node inheritance, no synchronous
+  disconnect).
+- `after.json` vs `before.json` (826-file `dom/nodes`, `domparsing`,
+  `dom/events`, `custom-elements`): 1,545 FAIL-to-PASS, 5 ERROR-to-OK, 6
+  previously-missing subtests now pass.
+- The only status regressions are four `custom-elements/state/*` files:
+  they call the unimplemented `attachInternals`, and custom-element callback
+  errors now reach `window.onerror` as the spec requires, so the harness marks
+  the file as an error instead of a failing subtest. No behavior these files
+  test is implemented either way.
+- `release.log`: stripped shipping binary 8,833,368 bytes.
+
 Verification files are in `/tmp/opencode/jsbinding-research/`:
 
 - `final4-tools-check.log` and `final4-workspace.log` pass.
@@ -155,14 +189,13 @@ Verification files are in `/tmp/opencode/jsbinding-research/`:
 Next:
 
 1. Migrate `Document`, `Element`, and form-control members still using
-   `#[rquickjs::methods]`.
-2. Move the `Event`/`EventTarget` interfaces to generated bindings.
-3. Add exotic collections (`NodeList`, `HTMLCollection`, `DOMTokenList`
+   `#[rquickjs::methods]` (`crates/renderer/src/js/bindings/node.rs`).
+2. Add exotic collections (`NodeList`, `HTMLCollection`, `DOMTokenList`
    indexed/named hooks) and richer argument/result mappings: variadics,
    dictionaries with inheritance, and interface results such as `Document?`
    and `Element?`.
-4. Migrate the remaining private host helpers.
-5. Publish the rquickjs commits and bump the submodule pointer when push is
+3. Migrate the remaining private host helpers.
+4. Publish the rquickjs commits and bump the submodule pointer when push is
    authorized. Keep the fork's checks separate from the browser workspace.
 
 Decisions made:
@@ -230,5 +263,5 @@ Gotchas:
 - `Text.normalize()` removes an empty receiver in the existing implementation,
   whereas the DOM algorithm visits descendant Text nodes. The chronology probe
   that exposed the routing bug used that separate, preexisting spec defect.
-- `Document`, `Element`, form controls, events, collections, and most private
+- `Document`, `Element`, form controls, exotic collections, and most private
   helpers still use rquickjs macros.

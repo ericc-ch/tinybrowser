@@ -354,6 +354,16 @@ pub(crate) fn string_argument<'js>(
     Coerced::<rquickjs::String>::from_js(params.ctx(), value).map(|string| string.0)
 }
 
+/// A `boolean` argument, converted with the pristine `ToBoolean`
+/// (<https://webidl.spec.whatwg.org/#es-boolean>).
+pub(crate) fn boolean_argument(params: &Params<'_, '_>, index: usize) -> Result<bool> {
+    let ctx = params.ctx();
+    let value = params
+        .arg(index)
+        .unwrap_or_else(|| Value::new_undefined(ctx.clone()));
+    super::to_boolean(ctx, &value)
+}
+
 pub(crate) fn callback_argument<'js>(ctx: &Ctx<'js>, value: &Value<'js>) -> Result<Function<'js>> {
     // https://webidl.spec.whatwg.org/#js-callback-function
     value

@@ -51,7 +51,7 @@ pub(crate) enum OperationResult {
     /// The method returns the platform object or value to hand back.
     Object,
     Undefined,
-    RecordSequence,
+    Sequence,
     /// The method returns `rquickjs::String<'js>`.
     String,
     Boolean,
@@ -78,6 +78,7 @@ pub(crate) struct ConstructorArgument {
 pub(crate) enum ConstructorArgumentKind {
     String { default: Option<String> },
     Callback,
+    Dictionary(String),
 }
 
 impl ConstructorArgumentKind {
@@ -85,6 +86,7 @@ impl ConstructorArgumentKind {
         match self {
             Self::String { default } => default.is_none(),
             Self::Callback => true,
+            Self::Dictionary(_) => false,
         }
     }
 }
@@ -118,8 +120,11 @@ pub(crate) enum ReturnType {
     Callback,
     Dictionary(String),
     Enumeration(String),
-    RecordSequence,
+    InterfaceSequence,
     PlatformObject,
+    /// `DOMHighResTimeStamp`, a `double`
+    /// (<https://webidl.spec.whatwg.org/#idl-DOMHighResTimeStamp>).
+    Double,
     /// Explicit `[RustValue]` implementation mapping; the method converts it.
     Value,
 }
@@ -352,13 +357,13 @@ impl Operation {
                 ReturnType::Node | ReturnType::PlatformObject | ReturnType::NullableString => {
                     OperationResult::Object
                 }
-                ReturnType::RecordSequence => OperationResult::RecordSequence,
+                ReturnType::InterfaceSequence => OperationResult::Sequence,
                 ReturnType::String => OperationResult::String,
                 ReturnType::Boolean => OperationResult::Boolean,
                 ReturnType::UnsignedShort => OperationResult::UnsignedShort,
                 _ => {
                     return Err(Error(
-                            "only Node, undefined, string, and record sequence operation results are supported yet"
+                            "only Node, undefined, string, interface sequence, boolean, and unsigned short operation results are supported yet"
                                 .into(),
                         ));
                 }
@@ -504,6 +509,10 @@ impl Attribute {
         };
         let same_object = attributes.flag("SameObject")?;
         let reactions = attributes.flag("CEReactions")?;
+        // The unforgeable-attribute property shape is installed by the
+        // interface's own shim; the generator only needs to accept the
+        // annotation (<https://webidl.spec.whatwg.org/#LegacyUnforgeable>).
+        let _legacy_unforgeable = attributes.flag("LegacyUnforgeable")?;
         if reactions && member.readonly.is_some() {
             return Err(Error("CEReactions requires a writable attribute".into()));
         }
@@ -530,10 +539,13 @@ impl Attribute {
         }
         if setter.is_some()
             && (!matches!(mapping, GetterMapping::Method)
-                || !matches!(return_type, ReturnType::String | ReturnType::NullableString))
+                || !matches!(
+                    return_type,
+                    ReturnType::String | ReturnType::NullableString | ReturnType::Boolean
+                ))
         {
             return Err(Error(
-                "only method-mapped string setters are supported yet".into(),
+                "only method-mapped string and boolean setters are supported yet".into(),
             ));
         }
         match (&mapping, &return_type, same_object, has_lifetime) {
@@ -548,7 +560,8 @@ impl Attribute {
                 | ReturnType::NullableString
                 | ReturnType::UnsignedShort
                 | ReturnType::UnsignedLong
-                | ReturnType::NullableNode,
+                | ReturnType::NullableNode
+                | ReturnType::Double,
                 false,
                 _,
             )
@@ -615,9 +628,23 @@ impl Constructor {
                         ));
                     }
                 },
+                ReturnType::Dictionary(name) => match (&argument.optional, &argument.default) {
+                    (Some(_), Some(default))
+                        if matches!(default.value, DefaultValue::EmptyDictionary(_)) =>
+                    {
+                        optional_seen = true;
+                        ConstructorArgumentKind::Dictionary(name)
+                    }
+                    _ => {
+                        return Err(Error(
+                            "only trailing optional dictionaries with {} defaults are supported yet"
+                                .into(),
+                        ));
+                    }
+                },
                 _ => {
                     return Err(Error(
-                        "only DOMString and callback constructor arguments are supported yet"
+                        "only DOMString, callback, and dictionary constructor arguments are supported yet"
                             .into(),
                     ));
                 }
@@ -692,12 +719,12 @@ impl ReturnType {
                 }
                 match value.type_.generics.body.as_ref() {
                     Type::Single(SingleType::NonAny(NonAnyType::Identifier(element)))
-                        if element.type_.0 == "MutationRecord" && element.q_mark.is_none() =>
+                        if element.q_mark.is_none() && is_interface_name(element.type_.0) =>
                     {
-                        Ok(Self::RecordSequence)
+                        Ok(Self::InterfaceSequence)
                     }
                     _ => Err(Error(
-                        "only mutation record sequences are supported yet".into(),
+                        "only sequences of known interfaces are supported yet".into(),
                     )),
                 }
             }
@@ -710,6 +737,7 @@ impl ReturnType {
                     }),
                     "NodeList" if value.q_mark.is_none() => Ok(Self::NodeList),
                     "DocumentType" if value.q_mark.is_some() => Ok(Self::NullableDocumentType),
+                    "DOMHighResTimeStamp" if value.q_mark.is_none() => Ok(Self::Double),
                     name if value.q_mark.is_none() && names.callbacks.contains(name) => {
                         Ok(Self::Callback)
                     }
@@ -719,9 +747,8 @@ impl ReturnType {
                     name if value.q_mark.is_none() && names.enumerations.contains(name) => {
                         Ok(Self::Enumeration(name.into()))
                     }
-                    "Document" | "XMLDocument" | "DocumentType" | "Element" => {
-                        Ok(Self::PlatformObject)
-                    }
+                    "Document" | "XMLDocument" | "DocumentType" | "Element" | "Event"
+                    | "EventTarget" => Ok(Self::PlatformObject),
                     _ => Err(Error(format!("unsupported interface type: {value:?}"))),
                 }
             }
@@ -857,13 +884,17 @@ impl Constant {
         if type_.q_mark.is_some() || !is_unsigned_short(type_.type_) {
             return Err(Error("expected an unsigned short constant".into()));
         }
-        let ConstValue::Integer(IntegerLit::Dec(value)) = member.const_value else {
-            return Err(Error("expected a decimal constant".into()));
+        // https://webidl.spec.whatwg.org/#idl-constants
+        // weedle lexes `0` as an octal literal, so accept every integer form.
+        let value = match member.const_value {
+            ConstValue::Integer(IntegerLit::Dec(value)) => parse_const_integer(value.0, 10)?,
+            ConstValue::Integer(IntegerLit::Hex(value)) => {
+                let digits = value.0.strip_prefix("0x").unwrap_or(value.0);
+                parse_const_integer(digits, 16)?
+            }
+            ConstValue::Integer(IntegerLit::Oct(value)) => parse_const_integer(value.0, 8)?,
+            _ => return Err(Error("expected an integer constant".into())),
         };
-        let value = value
-            .0
-            .parse()
-            .map_err(|error| Error(format!("invalid constant: {error}")))?;
         let mut attributes = Attributes::parse(member.attributes.as_ref())?;
         let legacy_name = attributes.take("RustLegacyName")?;
         attributes.finish()?;
@@ -877,6 +908,32 @@ impl Constant {
 
 fn is_unsigned_short(type_: IntegerType) -> bool {
     matches!(type_, IntegerType::Short(value) if value.unsigned.is_some())
+}
+
+/// Parse a Web IDL integer constant literal
+/// (<https://webidl.spec.whatwg.org/#idl-constants>) into its `unsigned short`
+/// value.
+fn parse_const_integer(digits: &str, radix: u32) -> Result<u16, Error> {
+    u16::from_str_radix(digits, radix)
+        .map_err(|error| Error(format!("invalid constant: {error}")))
+}
+
+/// Interface identifiers the generator can carry as platform objects, so a
+/// `sequence<Interface>` element is known to become a JS platform-object array
+/// (<https://webidl.spec.whatwg.org/#idl-sequences>).
+fn is_interface_name(name: &str) -> bool {
+    matches!(
+        name,
+        "Node"
+            | "NodeList"
+            | "Document"
+            | "XMLDocument"
+            | "DocumentType"
+            | "Element"
+            | "Event"
+            | "EventTarget"
+            | "MutationRecord"
+    )
 }
 
 /// One interface file is one native interface plus the callbacks and

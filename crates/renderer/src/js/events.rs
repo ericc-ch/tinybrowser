@@ -11,13 +11,16 @@ use std::sync::OnceLock;
 use std::time::Instant;
 
 use rquickjs::{
-    Array, Class, Ctx, Exception, FromJs, Function, Object, Persistent, Result, Value,
+    Class, Ctx, Exception, FromJs, Function, Object, Persistent, Result, Value,
     class::{Trace, Tracer},
-    function::{Opt, Rest, This},
+    function::{Rest, This},
 };
 
 use super::bindings;
 use super::world::{EventTargetKey, Listener, World};
+
+include!(concat!(env!("OUT_DIR"), "/Event.rs"));
+include!(concat!(env!("OUT_DIR"), "/EventTarget.rs"));
 
 /// `Event.NONE` (<https://dom.spec.whatwg.org/#dom-event-none>).
 pub(crate) const NONE: u16 = 0;
@@ -94,7 +97,6 @@ impl<'js> Trace<'js> for EventStateCell {
 /// symbol-keyed own property on the object (`install_custom_event_js`) rather
 /// than in this struct; every Rust-held JS value would pin the context.
 #[derive(Trace, rquickjs::JsLifetime)]
-#[rquickjs::class(rename = "Event")]
 pub struct JsEvent {
     pub(crate) state: EventStateCell,
 }
@@ -151,168 +153,170 @@ impl JsEvent {
         state.bubbles = bubbles;
         state.cancelable = cancelable;
     }
+
+    /// Build an initialized event from an already-converted constructor
+    /// argument set (<https://dom.spec.whatwg.org/#dom-event-event>).
+    fn from_init(typ: String, init: &event_generated::EventInit) -> Self {
+        Self {
+            state: EventStateCell(RefCell::new(EventState {
+                typ,
+                bubbles: init.bubbles,
+                cancelable: init.cancelable,
+                composed: init.composed,
+                initialized: true,
+                time_stamp: now_millis(),
+                ..EventState::default()
+            })),
+        }
+    }
 }
 
-#[rquickjs::methods]
 #[allow(
     clippy::needless_pass_by_value,
-    reason = "the rquickjs method macro passes Ctx and This by value"
+    clippy::unnecessary_wraps,
+    reason = "generated dispatch shares one fallible call shape and passes Ctx by value"
 )]
 impl JsEvent {
     // https://dom.spec.whatwg.org/#dom-event-event
-    #[qjs(constructor)]
-    fn new<'js>(ctx: Ctx<'js>, args: Rest<Value<'js>>) -> Result<Self> {
-        let (typ, init) = event_arguments(&ctx, args)?;
-        event_from_init(&ctx, typ, init.as_ref())
+    fn new<'js>(
+        _ctx: &Ctx<'js>,
+        typ: rquickjs::String<'js>,
+        init: event_generated::EventInit,
+    ) -> Result<Self> {
+        Ok(Self::from_init(typ.to_string()?, &init))
     }
 
     // https://dom.spec.whatwg.org/#dom-event-type
-    #[qjs(get, rename = "type")]
-    fn get_type(&self) -> String {
-        self.state().typ.clone()
+    fn get_type<'js>(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
+        rquickjs::String::from_str(ctx.clone(), &self.state().typ)
     }
 
     // https://dom.spec.whatwg.org/#dom-event-target
-    #[qjs(get, rename = "target")]
-    fn get_target<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
-        stored_target(&ctx, self.state().target.as_ref())
+    fn get_target<'js>(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
+        stored_target(ctx, self.state().target.as_ref())
     }
 
     // https://dom.spec.whatwg.org/#dom-event-srcelement
-    #[qjs(get, rename = "srcElement")]
-    fn get_src_element<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
-        stored_target(&ctx, self.state().target.as_ref())
+    fn get_src_element<'js>(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
+        stored_target(ctx, self.state().target.as_ref())
     }
 
     // https://dom.spec.whatwg.org/#dom-event-currenttarget
-    #[qjs(get, rename = "currentTarget")]
-    fn get_current_target<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
-        stored_target(&ctx, self.state().current_target.as_ref())
+    fn get_current_target<'js>(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
+        stored_target(ctx, self.state().current_target.as_ref())
     }
 
     // https://w3c.github.io/uievents/#dom-focusevent-relatedtarget
-    #[qjs(get, rename = "relatedTarget")]
-    fn get_related_target<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
-        stored_target(&ctx, self.state().related_target.as_ref())
+    fn get_related_target<'js>(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
+        stored_target(ctx, self.state().related_target.as_ref())
     }
 
     // https://dom.spec.whatwg.org/#dom-event-eventphase
-    #[qjs(get, rename = "eventPhase")]
-    fn get_event_phase(&self) -> u16 {
-        self.state().phase
+    fn get_event_phase(&self, _ctx: &Ctx<'_>) -> Result<u16> {
+        Ok(self.state().phase)
     }
 
     // https://dom.spec.whatwg.org/#dom-event-bubbles
-    #[qjs(get, rename = "bubbles")]
-    fn get_bubbles(&self) -> bool {
-        self.state().bubbles
+    fn get_bubbles(&self, _ctx: &Ctx<'_>) -> Result<bool> {
+        Ok(self.state().bubbles)
     }
 
     // https://dom.spec.whatwg.org/#dom-event-cancelable
-    #[qjs(get, rename = "cancelable")]
-    fn get_cancelable(&self) -> bool {
-        self.state().cancelable
+    fn get_cancelable(&self, _ctx: &Ctx<'_>) -> Result<bool> {
+        Ok(self.state().cancelable)
     }
 
     // https://dom.spec.whatwg.org/#dom-event-composed
-    #[qjs(get, rename = "composed")]
-    fn get_composed(&self) -> bool {
-        self.state().composed
+    fn get_composed(&self, _ctx: &Ctx<'_>) -> Result<bool> {
+        Ok(self.state().composed)
     }
 
     // https://dom.spec.whatwg.org/#dom-event-defaultprevented
-    #[qjs(get, rename = "defaultPrevented")]
-    fn get_default_prevented(&self) -> bool {
-        self.state().canceled
+    fn get_default_prevented(&self, _ctx: &Ctx<'_>) -> Result<bool> {
+        Ok(self.state().canceled)
     }
 
     // https://dom.spec.whatwg.org/#dom-event-istrusted
-    #[qjs(get, rename = "isTrusted")]
-    fn get_is_trusted(&self) -> bool {
-        self.state().is_trusted
+    fn get_is_trusted(&self, _ctx: &Ctx<'_>) -> Result<bool> {
+        Ok(self.state().is_trusted)
     }
 
     // https://dom.spec.whatwg.org/#dom-event-timestamp
-    #[qjs(get, rename = "timeStamp")]
-    fn get_time_stamp(&self) -> f64 {
-        self.state().time_stamp
+    fn get_time_stamp(&self, _ctx: &Ctx<'_>) -> Result<f64> {
+        Ok(self.state().time_stamp)
     }
 
     // https://dom.spec.whatwg.org/#dom-event-cancelbubble
-    #[qjs(get, rename = "cancelBubble")]
-    fn get_cancel_bubble(&self) -> bool {
-        self.state().stop_propagation
+    fn get_cancel_bubble(&self, _ctx: &Ctx<'_>) -> Result<bool> {
+        Ok(self.state().stop_propagation)
     }
 
-    #[qjs(set, rename = "cancelBubble")]
-    fn set_cancel_bubble<'js>(&self, ctx: Ctx<'js>, value: Value<'js>) -> Result<()> {
-        if bindings::to_boolean(&ctx, &value)? {
+    // https://dom.spec.whatwg.org/#dom-event-cancelbubble
+    fn set_cancel_bubble(&self, _ctx: &Ctx<'_>, value: bool) -> Result<()> {
+        if value {
             self.state_mut().stop_propagation = true;
         }
         Ok(())
     }
 
     // https://dom.spec.whatwg.org/#dom-event-returnvalue
-    #[qjs(get, rename = "returnValue")]
-    fn get_return_value(&self) -> bool {
-        !self.state().canceled
+    fn get_return_value(&self, _ctx: &Ctx<'_>) -> Result<bool> {
+        Ok(!self.state().canceled)
     }
 
-    #[qjs(set, rename = "returnValue")]
-    fn set_return_value<'js>(&self, ctx: Ctx<'js>, value: Value<'js>) -> Result<()> {
-        if !bindings::to_boolean(&ctx, &value)? {
+    // https://dom.spec.whatwg.org/#dom-event-returnvalue
+    fn set_return_value(&self, _ctx: &Ctx<'_>, value: bool) -> Result<()> {
+        if !value {
             self.set_canceled_flag();
         }
         Ok(())
     }
 
     // https://dom.spec.whatwg.org/#dom-event-stoppropagation
-    #[qjs(rename = "stopPropagation")]
-    fn stop_propagation(&self) {
+    fn stop_propagation(&self, _ctx: Ctx<'_>) -> Result<()> {
         self.state_mut().stop_propagation = true;
+        Ok(())
     }
 
     // https://dom.spec.whatwg.org/#dom-event-stopimmediatepropagation
-    #[qjs(rename = "stopImmediatePropagation")]
-    fn stop_immediate_propagation(&self) {
+    fn stop_immediate_propagation(&self, _ctx: Ctx<'_>) -> Result<()> {
         let mut state = self.state_mut();
         state.stop_propagation = true;
         state.stop_immediate = true;
+        Ok(())
     }
 
     // https://dom.spec.whatwg.org/#dom-event-preventdefault
-    #[qjs(rename = "preventDefault")]
-    fn prevent_default(&self) {
+    fn prevent_default(&self, _ctx: Ctx<'_>) -> Result<()> {
         self.set_canceled_flag();
+        Ok(())
     }
 
     // https://dom.spec.whatwg.org/#dom-event-composedpath
-    #[qjs(rename = "composedPath")]
-    fn composed_path<'js>(&self, ctx: Ctx<'js>) -> Result<Array<'js>> {
+    fn composed_path<'js>(&self, ctx: Ctx<'js>) -> Result<Vec<Value<'js>>> {
         let state = self.state();
-        let path = Array::new(ctx.clone())?;
-        for (index, reference) in state.path.iter().enumerate() {
-            path.set(index, resolve_target(&ctx, reference)?)?;
-        }
-        Ok(path)
+        state
+            .path
+            .iter()
+            .map(|reference| resolve_target(&ctx, reference))
+            .collect()
     }
 
     // https://dom.spec.whatwg.org/#dom-event-initevent
-    #[qjs(rename = "initEvent")]
-    fn init_event<'js>(&self, ctx: Ctx<'js>, args: Rest<Value<'js>>) -> Result<()> {
-        // Web IDL converts the arguments before the algorithm runs, so a
-        // missing or throwing `type` fails even while dispatching.
-        let mut args = args.0.into_iter();
-        let Some(typ) = args.next() else {
-            return Err(Exception::throw_type(&ctx, "type is required"));
-        };
-        let typ = bindings::webidl_to_string(&ctx, typ)?;
-        let bubbles = boolean_argument(&ctx, args.next())?;
-        let cancelable = boolean_argument(&ctx, args.next())?;
+    fn init_event<'js>(
+        &self,
+        _ctx: Ctx<'js>,
+        typ: rquickjs::String<'js>,
+        bubbles: bool,
+        cancelable: bool,
+    ) -> Result<()> {
+        // Web IDL converts the arguments before the algorithm runs; the
+        // generated dispatch already did, so a dispatch flag returns without
+        // re-initializing.
         if self.state().dispatching {
             return Ok(());
         }
-        self.initialize(typ, bubbles, cancelable);
+        self.initialize(typ.to_string()?, bubbles, cancelable);
         Ok(())
     }
 
@@ -334,88 +338,103 @@ impl JsEvent {
 /// so these methods only ever see `new EventTarget()` receivers. That matters
 /// because rquickjs methods brand-check their receiver as the defining class.
 #[derive(Trace, rquickjs::JsLifetime)]
-#[rquickjs::class(rename = "EventTarget")]
 pub struct JsEventTarget {
     id: u64,
 }
 
-#[rquickjs::methods]
 #[allow(
     clippy::needless_pass_by_value,
-    reason = "the rquickjs method macro passes Ctx and This by value"
+    reason = "generated dispatch passes Ctx by value and the receiver object by value"
 )]
 impl JsEventTarget {
-    #[qjs(constructor)]
-    fn new(ctx: Ctx<'_>) -> Result<Self> {
-        let id = bindings::world(&ctx)?.borrow_mut().next_standalone_target();
+    // https://dom.spec.whatwg.org/#dom-eventtarget-eventtarget
+    fn new(ctx: &Ctx<'_>) -> Result<Self> {
+        let id = bindings::world(ctx)?.borrow_mut().next_standalone_target();
         Ok(Self { id })
     }
 
-    #[qjs(rename = "addEventListener")]
+    // https://dom.spec.whatwg.org/#dom-eventtarget-addeventlistener
     fn add_event_listener<'js>(
         &self,
         ctx: Ctx<'js>,
-        this: This<Object<'js>>,
-        typ: Value<'js>,
+        this: Object<'js>,
+        typ: rquickjs::String<'js>,
         callback: Value<'js>,
-        options: Opt<Value<'js>>,
+        options: Value<'js>,
     ) -> Result<()> {
-        register_standalone(&ctx, self.id, &this.0)?;
+        register_standalone(&ctx, self.id, &this)?;
         add_listener(
             &ctx,
             EventTargetKey::Standalone(self.id),
-            typ,
+            typ.into_value(),
             callback,
-            options.0,
+            Some(options),
         )
     }
 
-    #[qjs(rename = "removeEventListener")]
+    // https://dom.spec.whatwg.org/#dom-eventtarget-removeeventlistener
     fn remove_event_listener<'js>(
         &self,
         ctx: Ctx<'js>,
-        this: This<Object<'js>>,
-        typ: Value<'js>,
+        this: Object<'js>,
+        typ: rquickjs::String<'js>,
         callback: Value<'js>,
-        options: Opt<Value<'js>>,
+        options: Value<'js>,
     ) -> Result<()> {
-        register_standalone(&ctx, self.id, &this.0)?;
+        register_standalone(&ctx, self.id, &this)?;
         remove_listener(
             &ctx,
             EventTargetKey::Standalone(self.id),
-            typ,
+            typ.into_value(),
             callback,
-            options.0,
+            Some(options),
         )
     }
 
-    #[qjs(rename = "dispatchEvent")]
+    // https://dom.spec.whatwg.org/#dom-eventtarget-dispatchevent
     fn dispatch_event<'js>(
         &self,
         ctx: Ctx<'js>,
-        this: This<Object<'js>>,
-        event: Class<'js, JsEvent>,
+        this: Object<'js>,
+        event: Value<'js>,
     ) -> Result<bool> {
-        register_standalone(&ctx, self.id, &this.0)?;
+        register_standalone(&ctx, self.id, &this)?;
+        let event = Class::<JsEvent>::from_js(&ctx, event)?;
         dispatch_event(&ctx, EventTargetKey::Standalone(self.id), &event)
     }
+}
 
-    /// User-agent delivery for a shim-fired event: same as `dispatchEvent`
-    /// but the event keeps its trust bit. The first argument is the host
-    /// token our shims close over; calls without it throw instead of forging
-    /// a trusted event.
-    #[qjs(rename = "__tbDispatchTrusted")]
-    fn dispatch_trusted<'js>(
-        &self,
-        ctx: Ctx<'js>,
-        this: This<Object<'js>>,
-        token: Value<'js>,
-        event: Class<'js, JsEvent>,
-    ) -> Result<bool> {
-        bindings::check_host_token(&ctx, &token)?;
-        register_standalone(&ctx, self.id, &this.0)?;
-        dispatch_trusted_event(&ctx, EventTargetKey::Standalone(self.id), &event)
-    }
+/// Installs the host-token bridge user-agent shims use to deliver a trusted
+/// event to a constructible `EventTarget` without `dispatchEvent`'s trust
+/// clearing. Not part of the Web IDL surface.
+pub(crate) fn install_event_target_bridge(ctx: &Ctx<'_>) -> Result<()> {
+    let prototype = Class::<JsEventTarget>::prototype(ctx)?.ok_or_else(|| {
+        Exception::throw_internal(ctx, "EventTarget has no prototype")
+    })?;
+    prototype.set(
+        "__tbDispatchTrusted",
+        rquickjs::prelude::Func::from(dispatch_trusted_bridge),
+    )?;
+    Ok(())
+}
+
+/// The `__tbDispatchTrusted` implementation: rejects calls that do not carry
+/// the host token, then dispatches without clearing the trust bit.
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "rquickjs Func ABI passes arguments by value"
+)]
+fn dispatch_trusted_bridge<'js>(
+    ctx: Ctx<'js>,
+    this: This<Object<'js>>,
+    token: Value<'js>,
+    event: Class<'js, JsEvent>,
+) -> Result<bool> {
+    bindings::check_host_token(&ctx, &token)?;
+    let class = Class::<JsEventTarget>::from_js(&ctx, this.0.clone().into_value())?;
+    let id = class.borrow().id;
+    register_standalone(&ctx, id, &this.0)?;
+    dispatch_trusted_event(&ctx, EventTargetKey::Standalone(id), &event)
 }
 
 /// Wraps the native `EventTarget` constructor so a call without `new` throws
@@ -510,8 +529,17 @@ pub(crate) fn construct_custom_event<'js>(
     ctx: Ctx<'js>,
     args: Rest<Value<'js>>,
 ) -> Result<Value<'js>> {
-    let (typ, init) = event_arguments(&ctx, args)?;
-    let class = Class::instance(ctx.clone(), event_from_init(&ctx, typ, init.as_ref())?)?;
+    let mut args = args.0.into_iter();
+    let Some(typ) = args.next() else {
+        return Err(Exception::throw_type(
+            &ctx,
+            "1 argument required, but only 0 present",
+        ));
+    };
+    let typ = bindings::webidl_to_string(&ctx, typ)?;
+    let init = args.next().unwrap_or_else(|| Value::new_undefined(ctx.clone()));
+    let init = event_generated::EventInit::from_object(&ctx, &init)?;
+    let class = Class::instance(ctx.clone(), JsEvent::from_init(typ, &init))?;
     set_custom_event_prototype(&ctx, &class)?;
     Ok(Class::into_value(class))
 }
@@ -554,59 +582,6 @@ pub(crate) const INSTALL_CUSTOM_EVENT_DEFLATE: &[u8] =
 pub(crate) fn install_custom_event_js(ctx: &Ctx<'_>) -> Result<&'static str> {
     static CACHE: std::sync::OnceLock<Box<str>> = std::sync::OnceLock::new();
     super::blob::decompress(ctx, INSTALL_CUSTOM_EVENT_DEFLATE, &CACHE)
-}
-
-fn event_arguments<'js>(
-    ctx: &Ctx<'js>,
-    args: Rest<Value<'js>>,
-) -> Result<(Value<'js>, Option<Object<'js>>)> {
-    let mut args = args.0.into_iter();
-    let Some(typ) = args.next() else {
-        return Err(Exception::throw_type(
-            ctx,
-            "1 argument required, but only 0 present",
-        ));
-    };
-    let init = match args.next() {
-        None => None,
-        Some(value) if value.is_undefined() || value.is_null() => None,
-        Some(value) => Some(
-            value
-                .into_object()
-                .ok_or_else(|| Exception::throw_type(ctx, "eventInitDict must be an object"))?,
-        ),
-    };
-    Ok((typ, init))
-}
-
-fn event_from_init<'js>(
-    ctx: &Ctx<'js>,
-    typ: Value<'js>,
-    init: Option<&Object<'js>>,
-) -> Result<JsEvent> {
-    let typ = bindings::webidl_to_string(ctx, typ)?;
-    let mut bubbles = false;
-    let mut cancelable = false;
-    let mut composed = false;
-    if let Some(init) = init {
-        // `EventInit` member order; `CustomEventInit.detail` is read by the
-        // JavaScript wrapper afterwards
-        // (<https://dom.spec.whatwg.org/#dictdef-eventinit>).
-        bubbles = bindings::option_truthy(ctx, init, "bubbles")?;
-        cancelable = bindings::option_truthy(ctx, init, "cancelable")?;
-        composed = bindings::option_truthy(ctx, init, "composed")?;
-    }
-    Ok(JsEvent {
-        state: EventStateCell(RefCell::new(EventState {
-            typ,
-            bubbles,
-            cancelable,
-            composed,
-            initialized: true,
-            time_stamp: now_millis(),
-            ..EventState::default()
-        })),
-    })
 }
 
 /// Appends one listener to a target's list

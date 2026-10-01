@@ -432,6 +432,7 @@ pub(crate) fn install(ctx: &Ctx<'_>, world: &Rc<RefCell<World>>) -> Result<()> {
     )?;
     ctx.eval::<(), _>(events::install_custom_event_js(ctx)?)?;
     Class::<JsEventTarget>::define(&globals)?;
+    events::install_event_target_bridge(ctx)?;
     ctx.eval::<(), _>(events::install_event_target_ctor_js(ctx)?)?;
     Class::<JsNode>::define(&globals)?;
     Class::<JsNodeList>::define(&globals)?;

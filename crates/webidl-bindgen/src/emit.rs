@@ -269,6 +269,11 @@ fn getter_dispatch((index, getter): (usize, &Attribute)) -> TokenStream {
                     None => Ok(Value::new_null(ctx)),
                 }
             },
+            ReturnType::Double => quote! {
+                // https://webidl.spec.whatwg.org/#idl-DOMHighResTimeStamp
+                let result: f64 = receiver.#method(&ctx)?;
+                result.into_js(&ctx)
+            },
             ReturnType::NullableNode | ReturnType::NodeList | ReturnType::PlatformObject => {
                 quote! { receiver.#method(&ctx) }
             }
@@ -276,7 +281,7 @@ fn getter_dispatch((index, getter): (usize, &Attribute)) -> TokenStream {
             | ReturnType::Callback
             | ReturnType::Dictionary(_)
             | ReturnType::Enumeration(_)
-            | ReturnType::RecordSequence
+            | ReturnType::InterfaceSequence
             | ReturnType::Value
             | ReturnType::NullableDocumentType => {
                 unreachable!("validated field mapping")
@@ -295,7 +300,9 @@ fn setter_dispatch((index, attribute): (usize, &Attribute)) -> Option<TokenStrea
         },
         ReturnType::String => quote! { host::string_argument(params, 0, None)? },
         ReturnType::NullableString => quote! { host::nullable_string_argument(params, 0)? },
-        _ => unreachable!("validated string setter"),
+        // https://webidl.spec.whatwg.org/#es-boolean
+        ReturnType::Boolean => quote! { host::boolean_argument(params, 0)? },
+        _ => unreachable!("validated string or boolean setter"),
     };
     let body = quote! {
         receiver.#method(&ctx, value)?;
@@ -349,7 +356,7 @@ fn operation_dispatch(id: usize, operation: &Operation) -> TokenStream {
             #call?;
             Ok(Value::new_undefined(ctx.clone()))
         },
-        OperationResult::RecordSequence => quote! {
+        OperationResult::Sequence => quote! {
             let result: Vec<Value> = #call?;
             host::sequence(&ctx, result)
         },
@@ -522,6 +529,14 @@ fn constructor(interface: &Interface) -> (usize, TokenStream) {
                     let value = params.arg(#index).unwrap_or_else(|| Value::new_undefined(ctx.clone()));
                     let #variable = host::callback_argument(&ctx, &value)?;
                 },
+                ConstructorArgumentKind::Dictionary(name) => {
+                    // https://webidl.spec.whatwg.org/#es-dictionary
+                    let struct_name = format_ident!("{name}");
+                    quote! {
+                        let value = params.arg(#index).unwrap_or_else(|| Value::new_undefined(ctx.clone()));
+                        let #variable = #struct_name::from_object(&ctx, &value)?;
+                    }
+                }
             }
         });
     (
