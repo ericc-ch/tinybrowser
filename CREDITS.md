@@ -2,6 +2,8 @@
 
 Simple acknowledgements for code, data, tests, and prior art used by tinybrowser.
 
+License texts: [LICENSE](LICENSE) (MIT for our code) and [NOTICE](NOTICE) (third-party sticky terms).
+
 ## Engines and browsers
 
 - [Servo](https://servo.org/) ([Stylo](https://github.com/servo/stylo), [html5ever](https://crates.io/crates/html5ever), [selectors](https://crates.io/crates/selectors), [cssparser](https://crates.io/crates/cssparser), and related crates)
