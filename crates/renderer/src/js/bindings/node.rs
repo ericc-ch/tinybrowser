@@ -3151,8 +3151,9 @@ impl JsNode {
         {
             return Ok(value);
         }
-        let class = super::host::instance(
+        let class = super::host::instance_for_node(
             ctx,
+            self.handle.0,
             JsTokenList {
                 element: self.handle,
             },
@@ -3334,8 +3335,9 @@ impl JsNode {
             refresh_named_node_map(ctx, self.handle.0, &value)?;
             return Ok(value);
         }
-        let class = super::host::instance(
+        let class = super::host::instance_for_node(
             ctx,
+            self.handle.0,
             JsNamedNodeMap {
                 element: self.handle,
             },

@@ -377,10 +377,10 @@ impl Interface {
                     self.value_iterable = true;
                     if !matches!(
                         ReturnType::parse(&member.generics.body.type_, names)?,
-                        ReturnType::String
+                        ReturnType::String | ReturnType::Node
                     ) {
                         return Err(Error(
-                            "only string value iterables are supported yet".into(),
+                            "only string and node value iterables are supported yet".into(),
                         ));
                     }
                 }
@@ -485,6 +485,7 @@ impl Operation {
             weedle::types::ReturnType::Undefined(_) => OperationResult::Undefined,
             weedle::types::ReturnType::Type(type_) => match ReturnType::parse(type_, names)? {
                 ReturnType::Node
+                | ReturnType::NullableNode
                 | ReturnType::PlatformObject
                 | ReturnType::NullableString
                 | ReturnType::NodeList => OperationResult::Object,

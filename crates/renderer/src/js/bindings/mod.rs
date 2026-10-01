@@ -1600,8 +1600,9 @@ pub(super) fn live_collection<'js>(
         kind,
     };
     match brand {
-        None => Ok(Class::into_value(Class::instance(
-            ctx.clone(),
+        None => Ok(Class::into_value(host::instance_for_node(
+            ctx,
+            scope,
             JsNodeList { query },
         )?)),
         Some("HTMLCollection") => Ok(Class::into_value(Class::instance(
@@ -1624,7 +1625,10 @@ pub(super) fn collection_ids(
     scope: NodeId,
     kind: &CollectionKind,
 ) -> Result<Vec<NodeId>> {
-    let world = world(ctx)?;
+    let registry = realm_registry(ctx)?;
+    let Some(world) = registry.borrow().owner_world(scope) else {
+        return Ok(Vec::new());
+    };
     let parsed = world.borrow();
     let Some(parsed) = parsed.document(scope) else {
         return Ok(Vec::new());

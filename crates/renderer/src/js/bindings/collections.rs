@@ -41,7 +41,28 @@ impl CollectionQuery {
     }
 
     fn item<'js>(&self, ctx: &Ctx<'js>, index: usize) -> Result<Value<'js>> {
-        match self.ids(ctx)?.get(index).copied() {
+        let id = match &self.kind {
+            CollectionKind::Static(handles) => {
+                if super::realm_registry(ctx)?
+                    .borrow()
+                    .owner_world(self.scope.0)
+                    .is_none()
+                {
+                    return Ok(Value::new_null(ctx.clone()));
+                }
+                handles.get(index).map(|handle| handle.0)
+            }
+            CollectionKind::Children
+            | CollectionKind::ElementChildren
+            | CollectionKind::ElementsByTag(_)
+            | CollectionKind::ElementsByTagNs { .. }
+            | CollectionKind::ElementsByClass(_)
+            | CollectionKind::ElementsByName(_)
+            | CollectionKind::SelectOptions
+            | CollectionKind::SelectedOptions
+            | CollectionKind::WindowNamed(_) => self.ids(ctx)?.get(index).copied(),
+        };
+        match id {
             Some(id) => wrap_node(ctx, id),
             None => Ok(Value::new_null(ctx.clone())),
         }
@@ -130,102 +151,55 @@ pub(super) fn reject_indexed_write<'js>(
 }
 
 #[derive(Trace, rquickjs::JsLifetime)]
-#[rquickjs::class(rename = "NodeList", exotic)]
 pub(crate) struct JsNodeList {
     pub(crate) query: CollectionQuery,
 }
 
-#[rquickjs::methods]
-#[expect(clippy::needless_pass_by_value, reason = "rquickjs method ABI passes Ctx by value")]
+include!(concat!(env!("OUT_DIR"), "/NodeList.rs"));
+
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "generated operation dispatch passes Ctx by value"
+)]
 impl JsNodeList {
-    #[qjs(constructor)]
-    fn ctor(ctx: Ctx<'_>) -> Result<Self> {
-        let error = Exception::throw_type(&ctx, "Illegal constructor");
-        drop(ctx);
-        Err(error)
-    }
-
-    #[qjs(get)]
-    fn length(&self, ctx: Ctx<'_>) -> Result<usize> {
-        let result = self.query.ids(&ctx).map(|ids| ids.len());
-        drop(ctx);
-        result
-    }
-
-    fn item<'js>(&self, ctx: Ctx<'js>, index: WebIdlUnsignedLong) -> Result<Value<'js>> {
-        self.query.item(&ctx, index.0 as usize)
-    }
-}
-
-#[rquickjs::exotic]
-#[expect(clippy::needless_pass_by_value, reason = "rquickjs exotic callback ABI requires owned atoms and values")]
-impl JsNodeList {
-    #[qjs(define_own_property)]
-    #[expect(clippy::unused_self, clippy::unnecessary_wraps, reason = "rquickjs exotic ABI requires self and Result")]
-    fn define<'js>(
-        &self,
-        ctx: &Ctx<'js>,
-        atom: Atom<'js>,
-        _value: Value<'_>,
-        _is_data: bool,
-    ) -> Result<ExoticDefineResult> {
-        // https://webidl.spec.whatwg.org/#legacy-platform-object-defineownproperty:
-        // any array index is rejected, even past the end (no indexed expando).
-        let Some(name) = atom_name(ctx, &atom) else {
-            return Ok(ExoticDefineResult::Fallthrough);
+    // https://dom.spec.whatwg.org/#dom-nodelist-length
+    fn length(&self, ctx: &Ctx<'_>) -> Result<usize> {
+        let registry = super::realm_registry(ctx)?;
+        let Some(world) = registry.borrow().owner_world(self.query.scope.0) else {
+            return Ok(0);
         };
-        Ok(if array_index(&name).is_some() {
-            ExoticDefineResult::Handled(false)
-        } else {
-            ExoticDefineResult::Fallthrough
+        let world = world.borrow();
+        let Some(parsed) = world.document(self.query.scope.0) else {
+            return Ok(0);
+        };
+        Ok(match &self.query.kind {
+            CollectionKind::Static(handles) => handles.len(),
+            CollectionKind::Children => parsed
+                .document
+                .children(self.query.scope.0)
+                .map_or(0, Iterator::count),
+            CollectionKind::ElementsByName(name) => parsed
+                .document
+                .tree()
+                .descendants(self.query.scope.0)
+                .filter(|&id| {
+                    super::is_element(&parsed.document, id)
+                        && parsed.document.attribute(id, "name").as_deref() == Some(name)
+                })
+                .count(),
+            CollectionKind::ElementChildren
+            | CollectionKind::ElementsByTag(_)
+            | CollectionKind::ElementsByTagNs { .. }
+            | CollectionKind::ElementsByClass(_)
+            | CollectionKind::SelectOptions
+            | CollectionKind::SelectedOptions
+            | CollectionKind::WindowNamed(_) => self.query.ids(ctx)?.len(),
         })
     }
 
-    #[qjs(get_own_property)]
-    fn own_property<'js>(
-        &self,
-        ctx: &Ctx<'js>,
-        atom: Atom<'js>,
-    ) -> Result<Option<PropertyDescriptor<'js>>> {
-        // https://webidl.spec.whatwg.org/#legacy-platform-object-getownproperty
-        let Some(name) = atom_name(ctx, &atom) else {
-            return Ok(None);
-        };
-        indexed_descriptor(ctx, &self.query, &name, false)
-    }
-
-    #[qjs(get_own_property_names)]
-    fn own_names<'js>(&self, ctx: &Ctx<'js>) -> Result<Vec<PropertyName<'js>>> {
-        indexed_names(ctx, self.query.ids(ctx)?.len())
-    }
-
-    #[qjs(set)]
-    #[expect(clippy::unused_self, clippy::unnecessary_wraps, reason = "rquickjs exotic ABI requires self and Result")]
-    fn set<'js>(
-        &self,
-        ctx: &Ctx<'js>,
-        atom: Atom<'js>,
-        object: Value<'js>,
-        receiver: Value<'js>,
-        _value: Value<'js>,
-    ) -> Result<ExoticSetResult> {
-        // https://webidl.spec.whatwg.org/#legacy-platform-object-set
-        let Some(name) = atom_name(ctx, &atom) else {
-            return Ok(ExoticSetResult::Fallthrough);
-        };
-        Ok(reject_indexed_write(&name, &object, &receiver))
-    }
-
-    #[qjs(delete)]
-    fn delete<'js>(&self, ctx: &Ctx<'js>, atom: Atom<'js>) -> Result<bool> {
-        // https://webidl.spec.whatwg.org/#legacy-platform-object-delete
-        let Some(name) = atom_name(ctx, &atom) else {
-            return Ok(true);
-        };
-        let Some(index) = array_index(&name) else {
-            return Ok(true);
-        };
-        Ok(index as usize >= self.query.ids(ctx)?.len())
+    // https://dom.spec.whatwg.org/#dom-nodelist-item
+    fn item<'js>(&self, ctx: Ctx<'js>, index: u32) -> Result<Value<'js>> {
+        self.query.item(&ctx, index as usize)
     }
 }
 
@@ -236,7 +210,10 @@ pub(crate) struct JsHtmlCollection {
 }
 
 #[rquickjs::methods]
-#[expect(clippy::needless_pass_by_value, reason = "rquickjs constructor ABI passes Ctx by value")]
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "rquickjs constructor ABI passes Ctx by value"
+)]
 impl JsHtmlCollection {
     #[qjs(constructor)]
     fn ctor(ctx: Ctx<'_>) -> Result<Self> {
@@ -259,10 +236,19 @@ impl JsHtmlCollection {
 }
 
 #[rquickjs::exotic]
-#[expect(clippy::needless_pass_by_value, reason = "rquickjs exotic callback ABI requires owned atoms and values")]
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "rquickjs exotic callback ABI requires owned atoms and values"
+)]
 impl JsHtmlCollection {
     #[qjs(define_own_property)]
-    fn define<'js>(&self, ctx: &Ctx<'js>, atom: Atom<'js>, _value: Value<'js>, _is_data: bool) -> Result<ExoticDefineResult> {
+    fn define<'js>(
+        &self,
+        ctx: &Ctx<'js>,
+        atom: Atom<'js>,
+        _value: Value<'js>,
+        _is_data: bool,
+    ) -> Result<ExoticDefineResult> {
         // https://webidl.spec.whatwg.org/#legacy-platform-object-defineownproperty:
         // any array index is rejected, even past the end.
         let Some(name) = atom_name(ctx, &atom) else {
@@ -277,7 +263,10 @@ impl JsHtmlCollection {
         // `define` gains the holder param once the fork forwards it.
         let ids = self.query.ids(ctx)?;
         if named_keys(ctx, &ids)?.contains(&name)
-            && !matches!(name.as_str(), "length" | "item" | "namedItem" | "constructor")
+            && !matches!(
+                name.as_str(),
+                "length" | "item" | "namedItem" | "constructor"
+            )
         {
             return Ok(ExoticDefineResult::Handled(false));
         }
@@ -304,7 +293,11 @@ impl JsHtmlCollection {
     }
 
     #[qjs(set)]
-    #[expect(clippy::unused_self, clippy::unnecessary_wraps, reason = "rquickjs exotic ABI requires self and Result")]
+    #[expect(
+        clippy::unused_self,
+        clippy::unnecessary_wraps,
+        reason = "rquickjs exotic ABI requires self and Result"
+    )]
     fn set<'js>(
         &self,
         ctx: &Ctx<'js>,
@@ -341,7 +334,10 @@ pub(crate) struct JsOptionsCollection {
 }
 
 #[rquickjs::methods]
-#[expect(clippy::needless_pass_by_value, reason = "rquickjs constructor ABI passes Ctx by value")]
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "rquickjs constructor ABI passes Ctx by value"
+)]
 impl JsOptionsCollection {
     #[qjs(constructor)]
     fn ctor(ctx: Ctx<'_>) -> Result<Self> {
@@ -367,7 +363,10 @@ fn option_setter<'js>(ctx: &Ctx<'js>) -> Result<Function<'js>> {
 }
 
 #[rquickjs::exotic]
-#[expect(clippy::needless_pass_by_value, reason = "rquickjs exotic callback ABI passes owned arguments")]
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "rquickjs exotic callback ABI passes owned arguments"
+)]
 impl JsOptionsCollection {
     #[qjs(define_own_property)]
     fn define<'js>(
@@ -585,7 +584,10 @@ fn with_query<T>(
     None
 }
 
-#[expect(clippy::needless_pass_by_value, reason = "rquickjs Func ABI passes arguments by value")]
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "rquickjs Func ABI passes arguments by value"
+)]
 fn collection_length(ctx: Ctx<'_>, target: Value<'_>) -> Result<usize> {
     with_query(&target, |query| {
         query.ids(target.ctx()).map(|ids| ids.len())
@@ -736,7 +738,10 @@ fn collection_delete(
     // Options named properties override built-ins, so visibility only gates
     // plain `HTMLCollection`.
     let visible = query_ids_are_options(query) || named_key_visible(object, name).unwrap_or(true);
-    Ok(!named_keys(ctx, &query.ids(ctx)?)?.iter().any(|key| key == name) || !visible)
+    Ok(!named_keys(ctx, &query.ids(ctx)?)?
+        .iter()
+        .any(|key| key == name)
+        || !visible)
 }
 
 fn query_ids_are_options(query: &CollectionQuery) -> bool {

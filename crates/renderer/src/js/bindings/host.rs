@@ -12,7 +12,7 @@ use rquickjs::{
     Class, Coerced, Ctx, Exception, FromJs, Function, Object, Persistent, Result, Value,
 };
 
-use super::world;
+use super::{world, world_for_node};
 pub(crate) use crate::js::world::NodeReference;
 
 pub(crate) type Dispatch = for<'a, 'js> fn(Operation, &Params<'a, 'js>) -> Result<Value<'js>>;
@@ -147,10 +147,29 @@ pub(crate) fn install_members(
     install_constants(prototype, constants)
 }
 
+/// Create a platform wrapper with the interface prototype from `ctx`'s realm
+/// (<https://webidl.spec.whatwg.org/#dfn-platform-object>).
+/// The rquickjs `Class::instance` prototype cache is shared across a runtime's
+/// realms. Generated interface prototypes belong to one realm.
 pub(crate) fn instance<'js, T: JsClass<'js>>(ctx: &Ctx<'js>, value: T) -> Result<Class<'js, T>> {
     let prototype = T::prototype(ctx)?
         .ok_or_else(|| Exception::throw_internal(ctx, "native interface has no prototype"))?;
     Class::instance_proto(value, prototype)
+}
+
+/// Create a node-associated platform wrapper with its document owner's
+/// interface prototype (<https://dom.spec.whatwg.org/#concept-node>).
+pub(crate) fn instance_for_node<'js, T: JsClass<'js>>(
+    ctx: &Ctx<'js>,
+    node: dom::NodeId,
+    value: T,
+) -> Result<Class<'js, T>> {
+    let owner = world_for_node(ctx, node)?;
+    let prototype = owner
+        .borrow()
+        .brand(T::NAME)
+        .ok_or_else(|| Exception::throw_internal(ctx, "node owner has no interface prototype"))?;
+    Class::instance_proto(value, prototype.restore(ctx)?)
 }
 
 pub(crate) fn constructor<'js>(
