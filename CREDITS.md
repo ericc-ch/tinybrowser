@@ -4,20 +4,20 @@ Simple acknowledgements for code, data, tests, and prior art used by tinybrowser
 
 ## Engines and browsers
 
-- Servo (Stylo, html5ever, selectors, cssparser, and related crates)
-- Chromium / Blink (behavioral reference, CDP fixtures, several algorithms)
-- Firefox / Gecko / SpiderMonkey (behavioral reference, several algorithms, Intl boundary)
-- WebKit (docs-only third read when Chromium and Firefox disagree)
-- QuickJS (Fabrice Bellard) → QuickJS-NG → rquickjs (DelSkayn) → project forks
+- [Servo](https://servo.org/) ([Stylo](https://github.com/servo/stylo), [html5ever](https://crates.io/crates/html5ever), [selectors](https://crates.io/crates/selectors), [cssparser](https://crates.io/crates/cssparser), and related crates)
+- [Chromium](https://www.chromium.org/) / [Blink](https://www.chromium.org/blink/) (behavioral reference, CDP fixtures, several algorithms)
+- [Firefox](https://www.mozilla.org/firefox/) / [Gecko](https://firefox-source-docs.mozilla.org/) / [SpiderMonkey](https://spidermonkey.dev/) (behavioral reference, several algorithms, Intl boundary)
+- [WebKit](https://webkit.org/) (docs-only third read when Chromium and Firefox disagree)
+- [QuickJS](https://bellard.org/quickjs/) (Fabrice Bellard) → [QuickJS-NG](https://github.com/quickjs-ng/quickjs) → [rquickjs](https://github.com/DelSkayn/rquickjs) (DelSkayn) → [project forks](https://github.com/ericc-ch/rquickjs)
 
 ## Inspiration and prior art
 
-- Obscura (CPU paint over Taffy)
-- Kitesurf (agent-first trade-offs)
-- Blitz / DioxusLabs (size/quality benchmark; Taffy + Parley + Stylo integration pattern)
-- NetSurf (small-engine pipeline prior art)
-- Dillo (style → layout → canvas prior art)
-- Effect Logger (logging crate model)
+- [Obscura](https://github.com/h4ckf0r0day/obscura) (CPU paint over Taffy)
+- [Kitesurf](https://developers.cloudflare.com/browser-run/kitesurf/) (agent-first trade-offs)
+- [Blitz](https://github.com/DioxusLabs/blitz) / [DioxusLabs](https://github.com/DioxusLabs) (size/quality benchmark; Taffy + Parley + Stylo integration pattern)
+- [NetSurf](https://www.netsurf-browser.org/) (small-engine pipeline prior art)
+- [Dillo](https://dillo-browser.github.io/) (style → layout → canvas prior art)
+- [Effect Logger](https://github.com/EduSantosBrito/effectful) (logging crate model)
 
 ## Direct Rust dependencies (by role)
 
@@ -25,88 +25,87 @@ Versions move; check `Cargo.lock`. Notable licenses called out.
 
 ### JS
 
-- rquickjs (+ core/macro/sys), patched fork wrapping QuickJS-NG
+- [rquickjs](https://crates.io/crates/rquickjs) (+ [core](https://crates.io/crates/rquickjs-core)/[macro](https://crates.io/crates/rquickjs-macro)/[sys](https://crates.io/crates/rquickjs-sys)), [patched fork](https://github.com/ericc-ch/rquickjs) wrapping QuickJS-NG
 
 ### HTML / DOM / CSS
 
-- html5ever, markup5ever, tendril, web_atoms
-- cssparser, selectors, precomputed-hash (MPL-2.0 where applicable)
-- stylo, stylo_dom, stylo_static_prefs, stylo_traits, app_units (MPL-2.0)
-- euclid, url
+- [html5ever](https://crates.io/crates/html5ever), [markup5ever](https://crates.io/crates/markup5ever), [tendril](https://crates.io/crates/tendril), [web_atoms](https://crates.io/crates/web_atoms)
+- [cssparser](https://crates.io/crates/cssparser), [selectors](https://crates.io/crates/selectors), [precomputed-hash](https://crates.io/crates/precomputed-hash) ([MPL-2.0](https://www.mozilla.org/MPL/2.0/) where applicable)
+- [stylo](https://crates.io/crates/stylo), [stylo_dom](https://crates.io/crates/stylo_dom), [stylo_static_prefs](https://crates.io/crates/stylo_static_prefs), [stylo_traits](https://crates.io/crates/stylo_traits), [app_units](https://crates.io/crates/app_units) ([MPL-2.0](https://www.mozilla.org/MPL/2.0/))
+- [euclid](https://crates.io/crates/euclid), [url](https://crates.io/crates/url)
 
 ### Layout / text / paint
 
-- taffy
-- parley, fontique
-- skrifa
-- tiny-skia (BSD-3-Clause)
-- kurbo
-- png, zune-jpeg, zune-core, image-webp
-- encoding_rs ((Apache-2.0 OR MIT) AND BSD-3-Clause)
-- flate2, getrandom
+- [taffy](https://crates.io/crates/taffy)
+- [parley](https://crates.io/crates/parley), [fontique](https://crates.io/crates/fontique)
+- [skrifa](https://crates.io/crates/skrifa)
+- [tiny-skia](https://crates.io/crates/tiny-skia) ([BSD-3-Clause](https://opensource.org/licenses/BSD-3-Clause))
+- [kurbo](https://crates.io/crates/kurbo)
+- [png](https://crates.io/crates/png), [zune-jpeg](https://crates.io/crates/zune-jpeg), [zune-core](https://crates.io/crates/zune-core), [image-webp](https://crates.io/crates/image-webp)
+- [encoding_rs](https://crates.io/crates/encoding_rs) (((Apache-2.0 OR MIT) AND BSD-3-Clause))
+- [flate2](https://crates.io/crates/flate2), [getrandom](https://crates.io/crates/getrandom)
 
 ### Intl
 
-- icu_* family and related crates (Unicode-3.0)
-- locale data blob from icu4x-datagen
+- [icu_*](https://icu4x.unicode.org/) family and related crates ([Unicode-3.0](https://www.unicode.org/license.txt))
+- locale data blob from [icu4x-datagen](https://crates.io/crates/icu4x-datagen)
 
 ### Net / runtime
 
-- hyper, hyper-util, http, http-body-util, hyper-tls
-- native-tls, tokio-native-tls
-- tungstenite, tokio-tungstenite
-- tokio, futures-util, tower-service, bytes
-- serde, serde_json, thiserror, base64, sha1
-- wit-bindgen
+- [hyper](https://crates.io/crates/hyper), [hyper-util](https://crates.io/crates/hyper-util), [http](https://crates.io/crates/http), [http-body-util](https://crates.io/crates/http-body-util), [hyper-tls](https://crates.io/crates/hyper-tls)
+- [native-tls](https://crates.io/crates/native-tls), [tokio-native-tls](https://crates.io/crates/tokio-native-tls)
+- [tungstenite](https://crates.io/crates/tungstenite), [tokio-tungstenite](https://crates.io/crates/tokio-tungstenite)
+- [tokio](https://crates.io/crates/tokio), [futures-util](https://crates.io/crates/futures-util), [tower-service](https://crates.io/crates/tower-service), [bytes](https://crates.io/crates/bytes)
+- [serde](https://crates.io/crates/serde), [serde_json](https://crates.io/crates/serde_json), [thiserror](https://crates.io/crates/thiserror), [base64](https://crates.io/crates/base64), [sha1](https://crates.io/crates/sha1)
+- [wit-bindgen](https://crates.io/crates/wit-bindgen)
 
 ## Vendored trees and fixtures
 
-- `third_party/wpt` — web-platform-tests (submodule)
-- `third_party/blink-cdp/` — Chromium Blink inspector-protocol web tests
-- test262 (via WPT) for Intl tooling
+- `third_party/wpt` — [web-platform-tests](https://github.com/web-platform-tests/wpt) (submodule)
+- `third_party/blink-cdp/` — Chromium Blink [inspector-protocol](https://source.chromium.org/chromium/chromium/src/+/main:third_party/blink/web_tests/inspector-protocol/) web tests
+- [test262](https://github.com/tc39/test262) (via WPT) for Intl tooling
 
 ## Fonts and data
 
-- Liberation Sans (OFL-1.1) under `crates/renderer/assets/`
-- Public Suffix List (`crates/cookies/src/public_suffix_list.dat`) from publicsuffix.org
+- [Liberation Sans](https://github.com/liberationfonts/liberation-fonts) ([OFL-1.1](https://openfontlicense.org/)) under `crates/renderer/assets/`
+- [Public Suffix List](https://publicsuffix.org/list/) (`crates/cookies/src/public_suffix_list.dat`) from [publicsuffix.org](https://publicsuffix.org/)
 
 ## Ports and algorithm references
 
 Not a full copy of those engines; behavior taken from comments in-tree:
 
-- Gecko `EnsureAllowedAsChild` → `dom/mutation/insert.rs`
+- Gecko [`EnsureAllowedAsChild`](https://searchfox.org/firefox-main/source/dom/base/nsINode.cpp) → `dom/mutation/insert.rs`
 - Blink / Firefox MessagePort disentangle → `renderer/messaging.rs`
 - Blink `DispatchMessageEventWithOriginCheck` → `renderer/engine.rs`
 - Blink `[CrossOrigin]` + Firefox `sCrossOriginProperties` → `js/scripts/web/messaging.js`
-- Chromium timer clamping (crbug.com/1108877) → `js/scripts/web/timers.js`
+- Chromium timer clamping ([crbug.com/1108877](https://crbug.com/1108877)) → `js/scripts/web/timers.js`
 - Blink HTMLOptionsCollection 100k cap → `js/scripts/collections.js`
 - Chromium `DeselectItemsWithoutValidation` → `dom/form/select.rs`
-- Firefox `nsDOMAttributeMap::GetSupportedNames` → `js/bindings/attributes.rs`
-- SpiderMonkey / Firefox Intl option boundary → `js/intl.rs`, `js/scripts/intl.js`
-- Chromium `html.css` form-submit UA sheet → `render/stylo.rs`
-- Blitz Stylo prefs / container-query stub → stylo integration
-- Blitz Taffy + own-paint split → `render/boxes.rs`
+- Firefox [`nsDOMAttributeMap::GetSupportedNames`](https://searchfox.org/firefox-main/source/dom/base/nsDOMAttributeMap.cpp) → `js/bindings/attributes.rs`
+- SpiderMonkey / Firefox Intl option boundary → `js/intl.rs`, `js/scripts/intl.js` (e.g. [NumberFormat.cpp](https://searchfox.org/firefox-main/source/js/src/builtin/intl/NumberFormat.cpp))
+- Chromium [`html.css`](https://source.chromium.org/chromium/chromium/src/+/main:third_party/blink/renderer/core/html/resources/html.css) form-submit UA sheet → `render/stylo.rs`
+- [Blitz](https://github.com/DioxusLabs/blitz) Stylo prefs / container-query stub → stylo integration
+- [Blitz](https://github.com/DioxusLabs/blitz) Taffy + own-paint split → `render/boxes.rs`
 - Blink / Gecko realm-agnostic document store → `documents.rs`
-- Chromium process lock / site isolation → `browser/site.rs`
+- Chromium [process lock / site isolation](https://chromium.googlesource.com/chromium/src/+/main/docs/process_model_and_site_isolation.md#process-locks) → `browser/site.rs`
 - Chrome navigation headers (Accept, Sec-Fetch-*, UA-CH) → `browser/network.rs`
-- html5lib `svg ` / `math ` foreign-content prefixes → renderer
-- CDP and WebDriver crates reimplement those protocols (not copies of Chrome)
+- [html5lib](https://github.com/html5lib/html5lib-tests) `svg ` / `math ` foreign-content prefixes → renderer
+- [CDP](https://chromedevtools.github.io/devtools-protocol/) and [WebDriver](https://www.w3.org/TR/webdriver2/) crates reimplement those protocols (not copies of Chrome)
 
-Most other DOM / Fetch / HTML follows WHATWG with engines as a behavioral check (Chromium first, then Firefox).
+Most other DOM / Fetch / HTML follows [WHATWG](https://spec.whatwg.org/) with engines as a behavioral check (Chromium first, then Firefox).
 
 ## Specs and protocols
 
-- WHATWG (DOM, HTML, Fetch, URL, Infra, Web IDL, messaging, …)
-- W3C WebDriver
-- Chrome DevTools Protocol
-- ECMA-262 / ECMA-402
-- Selected WebAppSec / Fetch Metadata / UA-CH / Upgrade-Insecure-Requests
+- [WHATWG](https://spec.whatwg.org/) (DOM, HTML, Fetch, URL, Infra, Web IDL, messaging, …)
+- [W3C WebDriver](https://www.w3.org/TR/webdriver2/)
+- [Chrome DevTools Protocol](https://chromedevtools.github.io/devtools-protocol/)
+- [ECMA-262](https://tc39.es/ecma262/) / [ECMA-402](https://tc39.es/ecma402/)
+- Selected WebAppSec / [Fetch Metadata](https://w3c.github.io/webappsec-fetch-metadata/) / [UA-CH](https://wicg.github.io/ua-client-hints/) / [Upgrade-Insecure-Requests](https://www.w3.org/TR/upgrade-insecure-requests/)
 
 ## License notes
 
-- MPL-2.0: Stylo, selectors, cssparser, app_units (and related). Source offer / notices should stay in sync with those crates.
-- BSD-3-Clause: tiny-skia; parts of encoding_rs
-- Unicode-3.0: ICU4X
-- OFL-1.1: Liberation Sans
-- Public Suffix List: see upstream license at publicsuffix.org
-
+- [MPL-2.0](https://www.mozilla.org/MPL/2.0/): Stylo, selectors, cssparser, app_units (and related). Source offer / notices should stay in sync with those crates.
+- [BSD-3-Clause](https://opensource.org/licenses/BSD-3-Clause): tiny-skia; parts of encoding_rs
+- [Unicode-3.0](https://www.unicode.org/license.txt): ICU4X
+- [OFL-1.1](https://openfontlicense.org/): Liberation Sans
+- Public Suffix List: see upstream license at [publicsuffix.org](https://publicsuffix.org/)
