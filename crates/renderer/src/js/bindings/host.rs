@@ -13,6 +13,7 @@ use rquickjs::{
 };
 
 use super::world;
+pub(crate) use crate::js::world::NodeReference;
 
 pub(crate) type Dispatch = for<'a, 'js> fn(Operation, &Params<'a, 'js>) -> Result<Value<'js>>;
 
@@ -260,6 +261,69 @@ pub(crate) fn receiver<'js, T: JsClass<'js>>(params: &Params<'_, 'js>) -> Result
         .map_err(|_| Exception::throw_type(params.ctx(), "incompatible receiver"))
 }
 
+pub(crate) fn node_argument<'js>(ctx: &Ctx<'js>, value: &Value<'js>) -> Result<NodeReference> {
+    // https://webidl.spec.whatwg.org/#js-interface
+    // https://dom.spec.whatwg.org/#interface-attr
+    if let Some(id) = super::host_node_id(ctx, value) {
+        return Ok(NodeReference::Tree(id));
+    }
+    if let Ok(attr) = Class::<super::JsAttr>::from_value(value) {
+        let attr = attr.borrow();
+        return Ok(NodeReference::Attribute {
+            scope: attr.scope.0,
+            id: attr.id,
+        });
+    }
+    Err(Exception::throw_type(ctx, "argument is not a Node"))
+}
+
+pub(crate) fn nullable_node_argument<'js>(
+    ctx: &Ctx<'js>,
+    value: &Value<'js>,
+) -> Result<Option<NodeReference>> {
+    if value.is_null() || value.is_undefined() {
+        Ok(None)
+    } else {
+        node_argument(ctx, value).map(Some)
+    }
+}
+
+pub(crate) fn require_node_interface(
+    ctx: &Ctx<'_>,
+    id: dom::NodeId,
+    interface: &str,
+) -> Result<()> {
+    // https://webidl.spec.whatwg.org/#es-attributes
+    // https://webidl.spec.whatwg.org/#es-operations
+    let owner = super::world_for_node(ctx, id)?;
+    let owner = owner.borrow();
+    let document = owner
+        .document(id)
+        .ok_or_else(|| Exception::throw_type(ctx, "stale node"))?;
+    let kind = document.document.kind(id);
+    let implements = match interface {
+        "CharacterData" => matches!(
+            kind,
+            Some(
+                dom::NodeKind::Text { .. }
+                    | dom::NodeKind::Comment { .. }
+                    | dom::NodeKind::CDataSection { .. }
+                    | dom::NodeKind::ProcessingInstruction { .. }
+            )
+        ),
+        "DocumentType" => matches!(kind, Some(dom::NodeKind::Doctype { .. })),
+        "ProcessingInstruction" => {
+            matches!(kind, Some(dom::NodeKind::ProcessingInstruction { .. }))
+        }
+        _ => return Err(Exception::throw_internal(ctx, "unknown node interface")),
+    };
+    if implements {
+        Ok(())
+    } else {
+        Err(Exception::throw_type(ctx, "incompatible receiver"))
+    }
+}
+
 /// The receiver JS object for hand methods that keep it (observer identity
 /// for callback delivery). The receiver check already passed, so a missing
 /// object is an internal error, never a user throw.
@@ -296,6 +360,41 @@ pub(crate) fn callback_argument<'js>(ctx: &Ctx<'js>, value: &Value<'js>) -> Resu
         .clone()
         .into_function()
         .ok_or_else(|| Exception::throw_type(ctx, "argument is not a function"))
+}
+
+pub(crate) fn legacy_null_string_argument<'js>(
+    params: &Params<'_, 'js>,
+    index: usize,
+) -> Result<rquickjs::String<'js>> {
+    // https://webidl.spec.whatwg.org/#LegacyNullToEmptyString
+    if params.arg(index).is_some_and(|value| value.is_null()) {
+        rquickjs::String::from_str(params.ctx().clone(), "")
+    } else {
+        string_argument(params, index, None)
+    }
+}
+
+pub(crate) fn document_type_argument<'js>(
+    ctx: &Ctx<'js>,
+    value: &Value<'js>,
+) -> Result<Option<dom::NodeId>> {
+    // https://webidl.spec.whatwg.org/#js-interface
+    // https://webidl.spec.whatwg.org/#js-nullable-type
+    if value.is_null() || value.is_undefined() {
+        return Ok(None);
+    }
+    let id = super::required_node(ctx, value)?;
+    let owner = super::world_for_node(ctx, id)?;
+    if owner.borrow().document(id).is_some_and(|parsed| {
+        matches!(
+            parsed.document.kind(id),
+            Some(dom::NodeKind::Doctype { .. })
+        )
+    }) {
+        Ok(Some(id))
+    } else {
+        Err(Exception::throw_type(ctx, "argument is not a DocumentType"))
+    }
 }
 
 pub(crate) fn nullable_string_argument<'js>(

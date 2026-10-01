@@ -422,8 +422,10 @@ impl JsEventTarget {
 /// (<https://webidl.spec.whatwg.org/#interface-object>); the wrapper shares the
 /// native prototype so `Class::<JsEventTarget>` conversions keep working.
 /// Deflated by `build.rs`, inflated once per process.
-pub(crate) const INSTALL_EVENT_TARGET_CTOR_DEFLATE: &[u8] =
-    include_bytes!(concat!(env!("OUT_DIR"), "/js_blobs/event_target_ctor.deflate"));
+pub(crate) const INSTALL_EVENT_TARGET_CTOR_DEFLATE: &[u8] = include_bytes!(concat!(
+    env!("OUT_DIR"),
+    "/js_blobs/event_target_ctor.deflate"
+));
 
 /// The `EventTarget` constructor shim, inflated once per process.
 pub(crate) fn install_event_target_ctor_js(ctx: &Ctx<'_>) -> Result<&'static str> {
@@ -982,12 +984,18 @@ fn build_path<'js>(
                 target: value,
             }])
         }
-        EventTargetKey::Standalone(id) => {
+        EventTargetKey::Attribute { .. } | EventTargetKey::Standalone(_) => {
+            // https://dom.spec.whatwg.org/#get-the-parent
+            // https://dom.spec.whatwg.org/#interface-attr
+            // Attr's owner element is not its parent; Chromium's
+            // EventPath::CalculatePath likewise follows parentNode().
             let reference = EventTargetRef {
                 key: target,
-                world: bindings::world(ctx)?,
+                world: target_world(ctx, target)?,
             };
-            if reference.world.borrow().standalone_target(id).is_none() {
+            if let EventTargetKey::Standalone(id) = target
+                && reference.world.borrow().standalone_target(id).is_none()
+            {
                 return Err(Exception::throw_internal(ctx, "missing EventTarget"));
             }
             let value = resolve_target(ctx, &reference)?;
@@ -1266,7 +1274,7 @@ fn default_passive(ctx: &Ctx<'_>, typ: &str, target: EventTargetKey) -> Result<b
     }
     match target {
         EventTargetKey::Window => Ok(true),
-        EventTargetKey::Standalone(_) => Ok(false),
+        EventTargetKey::Attribute { .. } | EventTargetKey::Standalone(_) => Ok(false),
         EventTargetKey::Node(id) => {
             let world = bindings::world_for_node(ctx, id)?;
             let world = world.borrow();
@@ -1277,11 +1285,15 @@ fn default_passive(ctx: &Ctx<'_>, typ: &str, target: EventTargetKey) -> Result<b
             if dom.document() == id {
                 return Ok(true);
             }
-            let html = dom::selector::select_first(dom, dom.document(), "html").ok().flatten();
+            let html = dom::selector::select_first(dom, dom.document(), "html")
+                .ok()
+                .flatten();
             if html == Some(id) {
                 return Ok(true);
             }
-            let body = dom::selector::select_first(dom, dom.document(), "body").ok().flatten();
+            let body = dom::selector::select_first(dom, dom.document(), "body")
+                .ok()
+                .flatten();
             Ok(body == Some(id))
         }
     }
@@ -1303,6 +1315,10 @@ fn signal_aborted(ctx: &Ctx<'_>, signal: &Persistent<Object<'static>>) -> bool {
 fn target_world(ctx: &Ctx<'_>, target: EventTargetKey) -> Result<Rc<RefCell<World>>> {
     match target {
         EventTargetKey::Node(id) => bindings::world_for_node(ctx, id),
+        EventTargetKey::Attribute { scope, id } => {
+            let state = bindings::attr_state(ctx, scope, id)?;
+            bindings::world_for_node(ctx, state.document)
+        }
         EventTargetKey::Window | EventTargetKey::Standalone(_) => bindings::world(ctx),
     }
 }
@@ -1324,6 +1340,7 @@ fn resolve_target<'js>(ctx: &Ctx<'js>, reference: &EventTargetRef) -> Result<Val
             None => Ok(ctx.globals().into_value()),
         },
         EventTargetKey::Node(id) => bindings::wrap_node(ctx, id),
+        EventTargetKey::Attribute { id, .. } => bindings::attr_wrapper(ctx, id),
         EventTargetKey::Standalone(id) => match reference.world.borrow().standalone_target(id) {
             Some(saved) => Ok(saved.restore(ctx)?.into_value()),
             None => Ok(Value::new_null(ctx.clone())),
@@ -1411,11 +1428,19 @@ fn call_error_handler<'js>(
     let lineno = field("lineno");
     let colno = field("colno");
     let error = field("error");
-    let result: Value =
-        function.call((This(object.clone()), message, filename, lineno, colno, error))?;
+    let result: Value = function.call((
+        This(object.clone()),
+        message,
+        filename,
+        lineno,
+        colno,
+        error,
+    ))?;
     if result.as_bool() == Some(true)
         && let Ok(prevent) = event_object.get::<_, Function>("preventDefault")
-        && prevent.call::<_, ()>((This(event_object.clone()),)).is_err()
+        && prevent
+            .call::<_, ()>((This(event_object.clone()),))
+            .is_err()
     {
         // Clear the exception a page-clobbered `preventDefault` threw.
         let _ = ctx.catch();

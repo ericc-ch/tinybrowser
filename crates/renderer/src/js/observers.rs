@@ -2,14 +2,13 @@
 
 use std::collections::BTreeMap;
 
-use dom::NodeId;
 use rquickjs::{Function, Object, Persistent};
 
 use crate::documents::DocumentStore;
 use crate::protocol::FrameId;
 
 use super::world::{
-    Handle, Observation, ObserverOptions, ObserverState, ReadyObserver, RecordData,
+    NodeReference, Observation, ObserverOptions, ObserverState, ReadyObserver, RecordData,
     match_observation,
 };
 
@@ -49,7 +48,7 @@ impl MutationObservers {
     pub(crate) fn observe(
         &mut self,
         id: u64,
-        target: NodeId,
+        target: NodeReference,
         options: ObserverOptions,
         object: Persistent<Object<'static>>,
         documents: &mut DocumentStore,
@@ -59,19 +58,19 @@ impl MutationObservers {
             if let Some(existing) = observer
                 .observations
                 .iter_mut()
-                .find(|item| item.target.0 == target)
+                .find(|item| item.target == target)
             {
                 existing.options = options;
             } else {
                 self.next_registration += 1;
                 observer.observations.push(Observation {
-                    target: Handle(target),
+                    target,
                     options,
                     order: self.next_registration,
                 });
             }
             observer.object = Some(object);
-            if let Some(parsed) = documents.get_mut(target.document_id()) {
+            if let Some(parsed) = documents.get_mut(target.scope().document_id()) {
                 dom::mutation::set_recording(&mut parsed.document, true);
             }
         }
@@ -115,7 +114,7 @@ impl MutationObservers {
                 observer
                     .observations
                     .iter()
-                    .any(|item| item.target.0.document_id() == id)
+                    .any(|item| item.target.scope().document_id() == id)
             });
             dom::mutation::set_recording(&mut parsed.document, watched);
         }

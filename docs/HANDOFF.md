@@ -2,17 +2,18 @@
 
 Goal: Replace tinybrowser's whole native JS binding layer with browser-specific
 WebIDL codegen plus shared dispatch, to shrink the shipping binary. Whole-layer
-migration is in progress; only the first slice has landed.
+migration is in progress. The parser, character-data, and `Attr` slice landed in
+this commit; `Document`, `Element`, form controls, events, and the exotic
+collections still use the old bindings.
 
 Plan: Extend the generator with each migrated interface. Verify each step with
 `tools/check`, workspace tests, and a before/after WPT report comparison.
 
-State: Branch `webidl-bindings` has commits `e2b3498` and `178ef61`.
-Draft PR: https://github.com/ericc-ch/tinybrowser/pull/39.
-The observer, dictionary, journal, setter, renderer teardown, and DOM string
-changes below are uncommitted. The rquickjs submodule also has an uncommitted
-UTF-16 API change. These changes are not on the draft PR. `tools/check` and
-workspace tests pass.
+State: Branch `webidl-bindings` has commits `e2b3498`, `178ef61`, and
+`d80b626` (MutationObserver and Node text accessors). Draft PR:
+https://github.com/ericc-ch/tinybrowser/pull/39. The rquickjs submodule has
+local commits `d73fbda` and `7a541e0`; the QuickJS fork commit `712757e` is
+published. `tools/check` and workspace tests pass.
 
 Done:
 
@@ -73,6 +74,54 @@ Implemented in the worktree:
   `new Text`/`new Comment`, `CharacterData.data`, `appendData`, `insertData`,
   `deleteData`, `replaceData`, `substringData`, and `HTMLTitleElement.text`.
 
+## Parser, Attr, and custom-element reactions
+
+- Generated bindings now cover `Node` (every declared member), `Attr`,
+  `CharacterData`, `DocumentType`, `ProcessingInstruction`, `DOMParser`,
+  `XMLSerializer`, and `DOMImplementation`, alongside the earlier
+  `DOMException`, `MutationRecord`, and `MutationObserver`.
+- The generator gained interface inheritance (prototype and constructor),
+  enumerations, booleans with defaults, unsigned short/long, nullable and
+  optional strings, `USVString`, callbacks, dictionaries, and
+  `NodeReference` alternate dispatch so `Attr` reuses inherited `Node`
+  operations.
+- `RealmRegistry` owns one `AttributeRegistry` for the agent: globally issued
+  ids, the `(element, namespace, local)` attachment index, weak wrappers, and
+  the attribute listener lists. Adoption changes the node document and never
+  the creation scope, so an `Attr` created in a frame and attached to the main
+  document keeps one identity and resolves methods through its owning realm.
+- `reactions.rs` owns the custom-element reaction stack, element queues, backup
+  queue, and per-frame collector hooks. `custom_elements.js` keeps the
+  lifecycle algorithms but defers callback invocation to the native stack.
+  `define()` captures prototype callbacks at definition time, guards reentry,
+  and reads platform operations and callback storage through captured
+  intrinsics.
+- The four `Node` event operations route through the generated `EventTarget`
+  path for both nodes and attributes.
+- `DOMImplementation.createDocument` and `createHTMLDocument` publish new
+  documents in the receiver's realm, not the caller's.
+- `locate_namespace`/`locate_prefix` share one algorithm with XML and XMLNS
+  handling and namespace declarations. `compareDocumentPosition` follows the
+  attribute rules, and `tree_order` handles ancestor pairs.
+- `dom::DomString` stores code-unit sequences and round-trips unpaired
+  surrogates for character data, `MutationRecord.oldValue`, and serialization.
+
+This milestone's verification files are in `/tmp/opencode/jsbinding-research/`:
+
+- `attr-global-check.log`: `tools/check` clean (clippy, embedded JS, rustdoc).
+- `final2-comparison.json`: 485-file WPT slice (`dom/nodes`, `domparsing`,
+  `custom-elements/reactions`) with 1,451 FAIL-to-PASS, 2 ERROR-to-OK, 6
+  previously-missing subtests now passing, and zero status regressions.
+- `attr-global-reaction.log` and `attr-global-event.log`: focused probes for
+  attribute identity, namespace lookup, adoption, reactions, and borrowed
+  attribute event methods.
+- `attr-global-playwright.log`: 14/15; the hosted SauceDemo checkout failed on
+  a site flake and passed 3/3 when run alone in `attr-global-saucedemo.log`.
+- `attr-global-cdp.log`: default Blink CDP gate PASS.
+- `lifecycle2-memcheck-*.log`: zero errors and zero definite/indirect leaks
+  across the attribute-cycle and reaction lifecycle probe.
+- `release2.log`: stripped shipping binary 8,862,872 bytes.
+
 Verification files are in `/tmp/opencode/jsbinding-research/`:
 
 - `final4-tools-check.log` and `final4-workspace.log` pass.
@@ -105,12 +154,15 @@ Verification files are in `/tmp/opencode/jsbinding-research/`:
 
 Next:
 
-1. Continue across form controls, event constructors, and remaining Node members.
-   Extend boolean/integer/string argument mappings and dictionary types as needed.
-2. Add exotic collections (`NodeList`/`HTMLCollection` indexed/named hooks) and
-   interface result types such as `Document?` and `Element?`.
-3. Migrate remaining interfaces and private host helpers.
-4. Publish the rquickjs UTF-16 change and bump its pointer when commit/push is
+1. Migrate `Document`, `Element`, and form-control members still using
+   `#[rquickjs::methods]`.
+2. Move the `Event`/`EventTarget` interfaces to generated bindings.
+3. Add exotic collections (`NodeList`, `HTMLCollection`, `DOMTokenList`
+   indexed/named hooks) and richer argument/result mappings: variadics,
+   dictionaries with inheritance, and interface results such as `Document?`
+   and `Element?`.
+4. Migrate the remaining private host helpers.
+5. Publish the rquickjs commits and bump the submodule pointer when push is
    authorized. Keep the fork's checks separate from the browser workspace.
 
 Decisions made:
@@ -150,9 +202,11 @@ Gotchas:
 - Fresh clones and worktrees need `git submodule update --init --recursive`.
 - Correct WPT syntax: `tools/wpt/run --score webidl/ --save-report FILE --
   --exclude=worker --processes 4`, with `TINYBROWSER_BINARY` selecting a
-  preserved build. Baseline
-  `/tmp/opencode/jsbinding-research/webidl-full-before.json` plus
-  `mutation-before.json`.
+  preserved build. This milestone's baseline is
+  `/tmp/opencode/jsbinding-research/before.json` (built from `d80b626` into
+  `tinybrowser-before`); compare with
+  `python3 /tmp/opencode/jsbinding-research/compare-wpt.py BEFORE AFTER`. Older
+  baselines are `webidl-full-before.json` plus `mutation-before.json`.
 - Never add handwritten `unsafe` in tinybrowser-owned code; workspace denies
   `unsafe_code`. Do not test spec conformance in cargo tests.
 
@@ -168,9 +222,13 @@ Gotchas:
   exact UTF-16 code units. Attribute values (`setAttribute`, `Attr.value`) and
   form-control values still store Rust `String`, so a lone surrogate there is
   rejected or replaced. `Text.splitText` is not implemented.
+- `[CEReactions]` lowers to `reactions::with_reactions` around the platform
+  step, but only the migrated operations carry it; the shim still pushes its own
+  scope for `define()` and `upgrade()`.
 - Renderer teardown no longer leaks: the runtime has a single owner and
   JavaScript host closures can no longer form a cycle with the heap.
 - `Text.normalize()` removes an empty receiver in the existing implementation,
   whereas the DOM algorithm visits descendant Text nodes. The chronology probe
   that exposed the routing bug used that separate, preexisting spec defect.
-- Most native interfaces and private helpers still use rquickjs macros.
+- `Document`, `Element`, form controls, events, collections, and most private
+  helpers still use rquickjs macros.

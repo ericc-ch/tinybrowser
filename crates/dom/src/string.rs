@@ -125,7 +125,11 @@ impl DomString {
                     merged.extend_from_slice(units);
                     self.0 = Self::from_utf16(merged).0;
                 }
-                Repr::Utf16(existing) => existing.extend_from_slice(units),
+                Repr::Utf16(existing) => {
+                    existing.extend_from_slice(units);
+                    let merged = std::mem::take(existing);
+                    self.0 = Self::from_utf16(merged).0;
+                }
             },
         }
     }

@@ -13,6 +13,7 @@ mod url_parts;
 mod world;
 
 mod observers;
+mod reactions;
 
 pub(crate) use world::{DocumentStreamCommand, FrameNavigation, NavigationTarget, RealmRegistry};
 
@@ -747,7 +748,9 @@ impl JsRealm {
             install_history_host_functions(&ctx, &world)?;
             url_parts::install(&ctx)?;
             bindings::install_messaging(&ctx)?;
+            reactions::install(&ctx)?;
             ctx.eval::<(), _>(install_web_apis_js(&ctx)?)?;
+            reactions::capture(&ctx)?;
             let constructor: Object = ctx.globals().get("PopStateEvent")?;
             let prototype: Object = constructor.get("prototype")?;
             world

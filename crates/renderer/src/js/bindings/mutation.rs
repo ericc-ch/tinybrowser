@@ -124,7 +124,7 @@ impl JsMutationObserver {
         &self,
         ctx: Ctx<'js>,
         observer_object: Object<'js>,
-        target: NodeId,
+        target: super::host::NodeReference,
         options: mutation_observer_generated::MutationObserverInit,
     ) -> Result<()> {
         // Dictionary presence ignores explicit `undefined`: `{attributes:

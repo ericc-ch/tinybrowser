@@ -62,7 +62,7 @@ use rquickjs::{
 
 use super::events::{self, JsEvent, JsEventTarget};
 
-use super::world::{Handle, WeakReferences, World};
+use super::world::{Handle, RealmRegistry, WeakReferences, World};
 
 thread_local! {
     /// JS world per live realm, keyed by its QuickJS context pointer.
@@ -73,10 +73,20 @@ thread_local! {
     /// so the map is thread-local and keyed by pointer identity.
     static REALM_WORLDS: RefCell<HashMap<usize, Weak<RefCell<World>>>> =
         RefCell::new(HashMap::new());
+    static REALM_REGISTRIES: RefCell<HashMap<usize, Weak<RefCell<RealmRegistry>>>> =
+        RefCell::new(HashMap::new());
 }
 
 /// Remembers `world` as the JS world of the realm behind `ctx`.
 fn register_world(ctx: &Ctx<'_>, world: &Rc<RefCell<World>>) {
+    let registry = world.borrow().registry();
+    let context = ctx.as_raw().as_ptr() as usize;
+    REALM_REGISTRIES.with(|registries| {
+        registries
+            .borrow_mut()
+            .insert(context, Rc::downgrade(&registry));
+    });
+    registry.borrow_mut().realm_contexts.push(context);
     REALM_WORLDS.with(|worlds| {
         worlds
             .borrow_mut()
@@ -91,6 +101,28 @@ pub(crate) fn forget_world(context: &rquickjs::Context) {
             .borrow_mut()
             .remove(&(context.as_raw().as_ptr() as usize));
     });
+}
+
+pub(crate) fn forget_registry_contexts(contexts: &[usize]) {
+    REALM_REGISTRIES.with(|registries| {
+        let mut registries = registries.borrow_mut();
+        for context in contexts {
+            registries.remove(context);
+        }
+    });
+}
+
+/// The agent associated with a context, including a retired iframe context
+/// kept alive by an adopted platform object's prototype.
+pub(crate) fn realm_registry(ctx: &Ctx<'_>) -> Result<Rc<RefCell<RealmRegistry>>> {
+    REALM_REGISTRIES
+        .with(|registries| {
+            registries
+                .borrow()
+                .get(&(ctx.as_raw().as_ptr() as usize))
+                .and_then(Weak::upgrade)
+        })
+        .ok_or_else(|| Exception::throw_internal(ctx, "missing JS agent"))
 }
 
 /// The document of the current realm's global object.
@@ -352,15 +384,6 @@ impl<'js> rquickjs::FromJs<'js> for WebIdlCodeUnits {
     }
 }
 
-impl<'js> rquickjs::FromJs<'js> for OptionalTitle {
-    fn from_js(ctx: &Ctx<'js>, value: Value<'js>) -> Result<Self> {
-        if value.is_undefined() {
-            return Ok(Self(None));
-        }
-        Ok(Self(Some(webidl_to_string(ctx, value)?)))
-    }
-}
-
 impl<'js> rquickjs::FromJs<'js> for WebIdlUnsignedLong {
     fn from_js(ctx: &Ctx<'js>, value: Value<'js>) -> Result<Self> {
         // The pristine `Number`, captured at install: a page-assigned global
@@ -418,7 +441,6 @@ pub(crate) fn install(ctx: &Ctx<'_>, world: &Rc<RefCell<World>>) -> Result<()> {
     ctx.eval::<(), _>(events::install_abort_js(ctx)?)?;
     Class::<JsImplementation>::define(&globals)?;
     Class::<JsTokenList>::define(&globals)?;
-    Class::<JsAttr>::define(&globals)?;
     Class::<JsNamedNodeMap>::define(&globals)?;
     forms::install(ctx, &globals)?;
     Class::<JsDomParser>::define(&globals)?;
@@ -456,6 +478,7 @@ pub(crate) fn install(ctx: &Ctx<'_>, world: &Rc<RefCell<World>>) -> Result<()> {
     // Generated members land on the brands.js `Node.prototype`; the derived
     // interface prototypes inherit them through the prototype chain.
     node::install(ctx)?;
+    Class::<JsAttr>::define(&globals)?;
     install_collection_brand(ctx)?;
     capture_host_primitives(ctx, &globals, world)?;
 
@@ -710,12 +733,22 @@ pub(crate) fn wrap_node<'js>(ctx: &Ctx<'js>, id: NodeId) -> Result<Value<'js>> {
 /// Publishes `parsed` as a new document of this realm's world and wraps its
 /// root.
 pub(super) fn wrap_new_document<'js>(ctx: &Ctx<'js>, parsed: crate::Parsed) -> Result<Value<'js>> {
-    let world_rc = world(ctx)?;
+    wrap_new_document_in_world(ctx, parsed, &world(ctx)?)
+}
+
+/// Publishes a new document in `world_rc`, which determines its and its
+/// descendants' relevant realm, and returns the document's shared wrapper.
+/// <https://dom.spec.whatwg.org/#create-a-document>
+pub(super) fn wrap_new_document_in_world<'js>(
+    ctx: &Ctx<'js>,
+    parsed: crate::Parsed,
+    world_rc: &Rc<RefCell<World>>,
+) -> Result<Value<'js>> {
     let root = world_rc.borrow_mut().add_document(parsed);
     let registry = world_rc.borrow().registry();
     registry
         .borrow_mut()
-        .insert_document(root.document_id(), &world_rc);
+        .insert_document(root.document_id(), world_rc);
     wrap_node(ctx, root)
 }
 
@@ -998,9 +1031,12 @@ pub(crate) fn world(ctx: &Ctx<'_>) -> Result<Rc<RefCell<World>>> {
 }
 
 pub(crate) fn world_for_node(ctx: &Ctx<'_>, id: NodeId) -> Result<Rc<RefCell<World>>> {
-    let current = world(ctx)?;
-    let owner = current.borrow().owner_world(id);
-    Ok(owner.unwrap_or(current))
+    let registry = realm_registry(ctx)?;
+    let owner = registry.borrow().owner_world(id);
+    match owner {
+        Some(owner) => Ok(owner),
+        None => world(ctx),
+    }
 }
 
 pub(super) fn with_node_kind<T>(
@@ -1087,14 +1123,6 @@ pub(crate) fn character_data_offset(ctx: &Ctx<'_>, offset: u32, length: usize) -
 
 pub(super) fn required_node<'js>(ctx: &Ctx<'js>, value: &Value<'js>) -> Result<NodeId> {
     host_node_id(ctx, value).ok_or_else(|| Exception::throw_type(ctx, "argument is not a Node"))
-}
-
-pub(super) fn optional_node<'js>(ctx: &Ctx<'js>, value: &Value<'js>) -> Result<Option<NodeId>> {
-    if value.is_null() || value.is_undefined() {
-        Ok(None)
-    } else {
-        Ok(Some(required_node(ctx, value)?))
-    }
 }
 
 pub(super) fn child_value<'js>(ctx: &Ctx<'js>, id: Option<NodeId>) -> Result<Value<'js>> {
@@ -1254,9 +1282,16 @@ pub(super) fn locate_namespace(
     cursor: NodeId,
     prefix: Option<&str>,
 ) -> Option<Namespace> {
-    let mut cursor = Some(cursor);
+    let mut cursor = namespace_element(dom, cursor);
     while let Some(id) = cursor {
-        if let Some(NodeKind::Element { name, .. }) = dom.kind(id) {
+        if let Some(NodeKind::Element { name, attributes }) = dom.kind(id) {
+            match prefix {
+                Some("xml") => {
+                    return Some(Namespace::from("http://www.w3.org/XML/1998/namespace"));
+                }
+                Some("xmlns") => return Some(Namespace::from("http://www.w3.org/2000/xmlns/")),
+                _ => {}
+            }
             let actual = name
                 .prefix
                 .as_ref()
@@ -1265,8 +1300,30 @@ pub(super) fn locate_namespace(
             if !name.ns.is_empty() && actual == prefix {
                 return Some(name.ns.clone());
             }
+            for attribute in attributes {
+                if attribute.name.ns.as_ref() != "http://www.w3.org/2000/xmlns/" {
+                    continue;
+                }
+                let declaration = match prefix {
+                    Some(prefix) => {
+                        attribute
+                            .name
+                            .prefix
+                            .as_ref()
+                            .is_some_and(|value| value.as_ref() == "xmlns")
+                            && attribute.name.local.as_ref() == prefix
+                    }
+                    None => {
+                        attribute.name.prefix.is_none() && attribute.name.local.as_ref() == "xmlns"
+                    }
+                };
+                if declaration {
+                    return (!attribute.value.is_empty())
+                        .then(|| Namespace::from(attribute.value.as_str()));
+                }
+            }
         }
-        cursor = dom.parent(id);
+        cursor = dom.parent(id).filter(|parent| is_element(dom, *parent));
     }
     None
 }
@@ -1278,7 +1335,7 @@ pub(super) fn locate_prefix(
     cursor: NodeId,
     namespace: &str,
 ) -> Option<String> {
-    let mut cursor = Some(cursor);
+    let mut cursor = namespace_element(dom, cursor);
     while let Some(id) = cursor {
         if let Some(NodeKind::Element { name, attributes }) = dom.kind(id) {
             if name.ns.as_ref() == namespace
@@ -1287,20 +1344,31 @@ pub(super) fn locate_prefix(
                 return Some(prefix.to_string());
             }
             for attribute in attributes {
-                if attribute.name.ns.as_ref() == namespace
-                    && let Some(prefix) = attribute
-                        .name
-                        .prefix
-                        .as_ref()
-                        .filter(|prefix| !prefix.is_empty())
+                if attribute
+                    .name
+                    .prefix
+                    .as_ref()
+                    .is_some_and(|prefix| prefix.as_ref() == "xmlns")
+                    && attribute.value == namespace
                 {
-                    return Some(prefix.to_string());
+                    return Some(attribute.name.local.to_string());
                 }
             }
         }
-        cursor = dom.parent(id);
+        cursor = dom.parent(id).filter(|parent| is_element(dom, *parent));
     }
     None
+}
+
+// https://dom.spec.whatwg.org/#locate-a-namespace
+// Attr dispatch supplies its owner element before entering the tree lookup.
+fn namespace_element(dom: &dom::Document, node: NodeId) -> Option<NodeId> {
+    match dom.kind(node)? {
+        NodeKind::Element { .. } => Some(node),
+        NodeKind::Document => dom.children(node)?.find(|child| is_element(dom, *child)),
+        NodeKind::Doctype { .. } | NodeKind::Fragment => None,
+        _ => dom.parent(node).filter(|parent| is_element(dom, *parent)),
+    }
 }
 
 pub(super) fn create_html_element<'js>(
@@ -1735,6 +1803,12 @@ pub(super) fn tree_order(dom: &dom::Document, a: NodeId, b: NodeId) -> std::cmp:
         && chain_a[chain_a.len() - 1 - common] == chain_b[chain_b.len() - 1 - common]
     {
         common += 1;
+    }
+    if common == chain_a.len() {
+        return chain_a.len().cmp(&chain_b.len());
+    }
+    if common == chain_b.len() {
+        return Ordering::Greater;
     }
     let Some(parent) = chain_a
         .len()

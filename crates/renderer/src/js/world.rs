@@ -21,7 +21,10 @@ use crate::{Parsed, ReadyState};
 /// alive, so cached wrappers never outlive the heap.
 #[derive(Default)]
 pub(crate) struct RealmRegistry {
+    pub(crate) realm_contexts: Vec<usize>,
+    pub(crate) attributes: AttributeRegistry,
     pub(crate) observers: super::observers::MutationObservers,
+    pub(crate) reactions: super::reactions::CustomElementReactions,
     budget: Rc<RefCell<ResourceBudget>>,
     /// The World that owns each document id, for wrapper realm resolution.
     documents: HashMap<u32, Weak<RefCell<World>>>,
@@ -86,6 +89,7 @@ impl RealmRegistry {
 
     /// Drops every realm and wrapper association for a document that is gone.
     pub(crate) fn forget_document(&mut self, id: u32) {
+        self.attributes.forget_document(id);
         self.documents.remove(&id);
         self.wrappers.retain(|node, _| node.document_id() != id);
         self.frame_documents
@@ -116,6 +120,10 @@ impl RealmRegistry {
 
     /// Drops every cached wrapper; called while the runtime is still alive.
     pub(crate) fn clear(&mut self) {
+        super::bindings::forget_registry_contexts(&self.realm_contexts);
+        self.realm_contexts.clear();
+        self.attributes.clear();
+        self.reactions.clear();
         self.documents.clear();
         self.frames.clear();
         self.wrappers.clear();
@@ -198,9 +206,32 @@ pub(crate) struct ObserverOptions {
 
 #[derive(Clone)]
 pub(crate) struct Observation {
-    pub target: Handle,
+    pub target: NodeReference,
     pub options: ObserverOptions,
     pub order: u64,
+}
+
+/// Both native representations implementing Node, including Attr, which is
+/// not a member of a document's child tree.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum NodeReference {
+    Tree(dom::NodeId),
+    Attribute { scope: dom::NodeId, id: u64 },
+}
+
+impl NodeReference {
+    pub(crate) fn tree(self) -> Option<dom::NodeId> {
+        match self {
+            Self::Tree(id) => Some(id),
+            Self::Attribute { .. } => None,
+        }
+    }
+
+    pub(crate) fn scope(self) -> dom::NodeId {
+        match self {
+            Self::Tree(id) | Self::Attribute { scope: id, .. } => id,
+        }
+    }
 }
 
 /// One queued `MutationRecord`, ready to wrap for JS.
@@ -272,6 +303,11 @@ pub(crate) struct Listener {
 pub(crate) enum EventTargetKey {
     Window,
     Node(NodeId),
+    /// Attr registry identity: immutable creation scope and agent-issued id.
+    Attribute {
+        scope: NodeId,
+        id: u64,
+    },
     /// A constructible `EventTarget`, numbered per world.
     Standalone(u64),
 }
@@ -366,10 +402,6 @@ pub(crate) struct World {
     /// (<https://html.spec.whatwg.org/multipage/interaction.html#dom-click>).
     clicks_in_progress: HashSet<NodeId>,
     brands: HashMap<String, Persistent<Object<'static>>>,
-    /// `Attr` platform-object identity, keyed by a per-realm id.
-    pub(crate) attrs: HashMap<u64, AttrState>,
-    /// Owner element for each `Attr` id; `None` while detached.
-    pub(crate) attr_owners: HashMap<u64, Option<NodeId>>,
     /// Event handler properties (`element.onload`, `window.onmessage`) live
     /// here rather than on the wrapper, which may be collected while the node
     /// stays alive. Keyed by `(None, name)` for the window and
@@ -380,16 +412,9 @@ pub(crate) struct World {
     /// does not resurrect the element's content attribute
     /// (<https://html.spec.whatwg.org/multipage/webappapis.html#event-handler-content-attributes>).
     cleared_handlers: HashSet<(Option<NodeId>, String)>,
-    /// Last known value, so a detached `Attr` keeps its data.
-    pub(crate) attr_values: HashMap<u64, String>,
-    /// Wrapper object for each `Attr` id (identity is the id).
-    pub(crate) attr_wrappers: HashMap<u64, Persistent<Value<'static>>>,
     /// Stable `WebDriver` element ids for nodes, and the reverse lookup.
     remote_ids: HashMap<NodeId, u64>,
     remote_nodes: HashMap<u64, NodeId>,
-    /// Attached attributes: (element, namespace, local) -> `Attr` id.
-    pub(crate) attr_ids: HashMap<(NodeId, String, String), u64>,
-    pub(crate) next_attr_id: u64,
     /// Registered `MutationObserver`s, keyed by their platform id.
     /// Pristine intrinsics captured at install, before page script runs.
     /// `WebIDL` conversions and scheduling must use these, never
@@ -494,16 +519,10 @@ impl World {
             active_elements: HashMap::new(),
             clicks_in_progress: HashSet::new(),
             brands: HashMap::new(),
-            attrs: HashMap::new(),
-            attr_owners: HashMap::new(),
             handler_attributes: HashMap::new(),
             cleared_handlers: HashSet::new(),
-            attr_values: HashMap::new(),
-            attr_wrappers: HashMap::new(),
             remote_ids: HashMap::new(),
             remote_nodes: HashMap::new(),
-            attr_ids: HashMap::new(),
-            next_attr_id: 0,
             pristine_string: None,
             pristine_number: None,
             pristine_boolean: None,
@@ -540,7 +559,6 @@ impl World {
         self.wrappers.clear();
         self.implementations.clear();
         self.active_elements.clear();
-        self.clear_attributes();
         self.frame_navigations.clear();
         self.image_updates.clear();
         self.clear_images();
@@ -1282,18 +1300,57 @@ impl World {
     }
 
     pub(crate) fn add_listener(&mut self, target: EventTargetKey, listener: Rc<Listener>) {
+        if let EventTargetKey::Attribute { id, .. } = target {
+            if let Some(entry) = self
+                .runtime
+                .registry
+                .borrow_mut()
+                .attributes
+                .entries
+                .get_mut(&id)
+            {
+                entry.listeners.push(listener);
+            }
+            return;
+        }
         self.listeners.entry(target).or_default().push(listener);
     }
 
     /// A clone of one target's listener list, taken when dispatch invokes the
     /// target (<https://dom.spec.whatwg.org/#concept-event-listener-invoke>).
     pub(crate) fn listener_snapshot(&self, target: EventTargetKey) -> Vec<Rc<Listener>> {
+        if let EventTargetKey::Attribute { id, .. } = target {
+            return self
+                .runtime
+                .registry
+                .borrow()
+                .attributes
+                .entries
+                .get(&id)
+                .map(|entry| entry.listeners.clone())
+                .unwrap_or_default();
+        }
         self.listeners.get(&target).cloned().unwrap_or_default()
     }
 
     /// Drops one listener from a target's list; the listener's `removed` flag
     /// is what a concurrent dispatch checks, so both happen together.
     pub(crate) fn remove_listener(&mut self, target: EventTargetKey, listener: &Rc<Listener>) {
+        if let EventTargetKey::Attribute { id, .. } = target {
+            if let Some(entry) = self
+                .runtime
+                .registry
+                .borrow_mut()
+                .attributes
+                .entries
+                .get_mut(&id)
+            {
+                entry
+                    .listeners
+                    .retain(|existing| !Rc::ptr_eq(existing, listener));
+            }
+            return;
+        }
         if let Some(list) = self.listeners.get_mut(&target) {
             list.retain(|existing| !Rc::ptr_eq(existing, listener));
         }
@@ -1362,7 +1419,6 @@ impl World {
         self.brands.clear();
         self.handler_attributes.clear();
         self.cleared_handlers.clear();
-        self.clear_attributes();
         self.clear_observers();
     }
 
@@ -1372,6 +1428,11 @@ impl World {
     /// `Rc<World>` closures) alive, so an unreleased primitive deadlocks
     /// teardown and trips `JS_FreeRuntime`'s live-object assertion.
     pub(crate) fn release_host_primitives(&mut self) {
+        self.runtime
+            .registry
+            .borrow_mut()
+            .reactions
+            .forget_frame(self.frame);
         self.pristine_string = None;
         self.pristine_number = None;
         self.pristine_boolean = None;
@@ -1380,15 +1441,6 @@ impl World {
         self.deliver_mutations_fn = None;
         self.option_setter = None;
         self.host_token = None;
-    }
-
-    fn clear_attributes(&mut self) {
-        self.attrs.clear();
-        self.attr_owners.clear();
-        self.attr_values.clear();
-        self.attr_wrappers.clear();
-        self.attr_ids.clear();
-        self.next_attr_id = 0;
     }
 
     /// One cached platform object, if this realm created it.
@@ -1534,7 +1586,10 @@ pub(super) fn match_observation(
     let mut want_attribute_old_value = false;
     let mut want_character_data_old_value = false;
     for observation in &observer.observations {
-        let Some(depth) = ancestor_distance(dom, observation.target.0, target) else {
+        let Some(root) = observation.target.tree() else {
+            continue;
+        };
+        let Some(depth) = ancestor_distance(dom, root, target) else {
             continue;
         };
         if depth != 0 && !observation.options.subtree {
@@ -1642,10 +1697,153 @@ fn ancestor_distance(dom: &dom::Document, ancestor: NodeId, node: NodeId) -> Opt
 /// Identity of one `Attr` platform object.
 #[derive(Clone)]
 pub(crate) struct AttrState {
+    pub scope: NodeId,
+    pub document: NodeId,
+    pub owner: Option<NodeId>,
+    pub value: String,
     pub namespace: String,
     pub prefix: Option<String>,
     pub local: String,
     pub qualified: String,
+}
+
+/// Agent-owned Attr identities, attachment indexes, and weak wrappers.
+/// Adoption changes the node document, never the creation scope or id
+/// (<https://dom.spec.whatwg.org/#concept-element-attributes-append>).
+#[derive(Default)]
+pub(crate) struct AttributeRegistry {
+    entries: HashMap<u64, AttrEntry>,
+    attached: HashMap<(NodeId, String, String), u64>,
+    next_id: u64,
+}
+
+struct AttrEntry {
+    state: AttrState,
+    wrapper: Option<Persistent<Value<'static>>>,
+    listeners: Vec<Rc<Listener>>,
+}
+
+pub(crate) enum AttrAttachError {
+    Stale,
+    InUse,
+    Dom(dom::DomError),
+}
+
+impl AttributeRegistry {
+    pub(crate) fn create(&mut self, state: AttrState) -> Option<u64> {
+        let id = self.next_id.checked_add(1)?;
+        self.next_id = id;
+        if let Some(owner) = state.owner {
+            self.attached
+                .insert((owner, state.namespace.clone(), state.local.clone()), id);
+        }
+        self.entries.insert(
+            id,
+            AttrEntry {
+                state,
+                wrapper: None,
+                listeners: Vec::new(),
+            },
+        );
+        Some(id)
+    }
+
+    pub(crate) fn state(&self, id: u64) -> Option<&AttrState> {
+        self.entries.get(&id).map(|entry| &entry.state)
+    }
+
+    pub(crate) fn state_mut(&mut self, id: u64) -> Option<&mut AttrState> {
+        self.entries.get_mut(&id).map(|entry| &mut entry.state)
+    }
+
+    pub(crate) fn wrapper(&self, id: u64) -> Option<Persistent<Value<'static>>> {
+        self.entries
+            .get(&id)
+            .and_then(|entry| entry.wrapper.clone())
+    }
+
+    pub(crate) fn intern_wrapper(&mut self, id: u64, value: Persistent<Value<'static>>) {
+        if let Some(entry) = self.entries.get_mut(&id) {
+            entry.wrapper = Some(value);
+        }
+    }
+
+    pub(crate) fn attached(&self, element: NodeId, namespace: &str, local: &str) -> Option<u64> {
+        self.attached
+            .get(&(element, namespace.to_owned(), local.to_owned()))
+            .copied()
+    }
+
+    pub(crate) fn detach(&mut self, element: NodeId, namespace: &str, local: &str) {
+        if let Some(id) = self
+            .attached
+            .remove(&(element, namespace.to_owned(), local.to_owned()))
+            && let Some(state) = self.state_mut(id)
+        {
+            state.owner = None;
+        }
+    }
+
+    pub(crate) fn touch(&mut self, element: NodeId, namespace: &str, local: &str, value: String) {
+        if let Some(id) = self.attached(element, namespace, local)
+            && let Some(state) = self.state_mut(id)
+        {
+            state.value = value;
+        }
+    }
+
+    /// Validates the source identity and owner before mutating the destination,
+    /// then publishes replacement and adoption in the same registry borrow.
+    /// <https://dom.spec.whatwg.org/#concept-element-attributes-set>
+    pub(crate) fn attach(
+        &mut self,
+        id: u64,
+        document: &mut dom::Document,
+        element: NodeId,
+        value: String,
+    ) -> Result<Option<u64>, AttrAttachError> {
+        let entry = self.entries.get_mut(&id).ok_or(AttrAttachError::Stale)?;
+        let state = &mut entry.state;
+        if state.owner.is_some_and(|owner| owner != element) {
+            return Err(AttrAttachError::InUse);
+        }
+        let key = (element, state.namespace.clone(), state.local.clone());
+        let previous = self.attached.get(&key).copied();
+        if previous == Some(id) {
+            return Ok(previous);
+        }
+        dom::mutation::set_attribute_by_ns(
+            document,
+            element,
+            &state.namespace,
+            state.prefix.as_deref(),
+            &state.local,
+            value.clone(),
+        )
+        .map_err(AttrAttachError::Dom)?;
+        state.owner = Some(element);
+        state.document = document.document();
+        state.value = value;
+        if let Some(previous) = previous
+            && let Some(state) = self.state_mut(previous)
+        {
+            state.owner = None;
+        }
+        self.attached.insert(key, id);
+        Ok(previous)
+    }
+
+    fn forget_document(&mut self, document: u32) {
+        self.entries
+            .retain(|_, entry| entry.state.document.document_id() != document);
+        self.attached
+            .retain(|(element, _, _), _| element.document_id() != document);
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.attached.clear();
+    }
 }
 
 /// Strips the `<![CDATA[` / `]]>` wrapper a `<style>` element carries when the

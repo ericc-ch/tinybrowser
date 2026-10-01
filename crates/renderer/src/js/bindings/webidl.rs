@@ -61,10 +61,6 @@ pub(crate) struct LegacyNullString(pub(crate) String);
 /// cannot hold, so these entry points carry the exact code units instead.
 pub(crate) struct WebIdlCodeUnits(pub(crate) dom::DomString);
 
-/// An optional title argument: omitted and `undefined` mean "not given",
-/// `null` is the string "null" like any other `DOMString`.
-pub(crate) struct OptionalTitle(pub(crate) Option<String>);
-
 /// `WebIDL` `unsigned long` conversion
 /// (<https://webidl.spec.whatwg.org/#es-unsigned-long>).
 pub(crate) struct WebIdlUnsignedLong(pub(crate) u32);
@@ -81,16 +77,6 @@ pub(crate) fn webidl_to_string<'js>(ctx: &Ctx<'js>, value: Value<'js>) -> Result
 /// may contain unpaired surrogates.
 pub(crate) fn webidl_to_units<'js>(ctx: &Ctx<'js>, value: Value<'js>) -> Result<Vec<u16>> {
     webidl_to_js_string(ctx, value)?.to_utf16()
-}
-
-/// `[LegacyNullToEmptyString]` `DOMString` keeping every UTF-16 code unit:
-/// `null` becomes the empty string, every other value converts with `ToString`
-/// (<https://webidl.spec.whatwg.org/#LegacyNullToEmptyString>).
-pub(crate) fn legacy_null_units<'js>(ctx: &Ctx<'js>, value: Value<'js>) -> Result<dom::DomString> {
-    if value.is_null() {
-        return Ok(dom::DomString::default());
-    }
-    Ok(dom::DomString::from_utf16(webidl_to_units(ctx, value)?))
 }
 
 fn webidl_to_js_string<'js>(ctx: &Ctx<'js>, value: Value<'js>) -> Result<rquickjs::String<'js>> {

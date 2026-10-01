@@ -58,6 +58,14 @@ mod tests {
         };
     ";
 
+    const VALUE_OPERATIONS: &str = r"
+        [Exposed=Window, Rust=Payload] interface Serializer {
+            [Rust=new] constructor();
+            [Rust=serialize] DOMString serializeToString([RustValue] Node root);
+            [Rust=parse] Document parse(DOMString source);
+        };
+    ";
+
     const CALLBACK: &str = r"
         callback MutationCallback = undefined (sequence<MutationRecord> records, MutationObserver observer);
         [Exposed=Window, Rust=Observer] interface MutationObserver {
@@ -87,6 +95,7 @@ mod tests {
             ),
             (PARTIAL, "sample_generated"),
             (SETTERS, "sample_generated"),
+            (VALUE_OPERATIONS, "serializer_generated"),
             (CALLBACK, "mutation_observer_generated"),
         ] {
             let output = compile(source).expect("compile supported fixture");
@@ -113,11 +122,22 @@ mod tests {
             SETTERS.replace("DOMString label", "unsigned short label"),
             INPUT.replace("DOMString label;", "object label;"),
             INPUT.replace("Rust=Payload", "Rust=\"not a rust path\""),
-            INPUT.replace("interface Sample", "interface Sample : Parent"),
+            INPUT
+                .replace("interface Sample", "interface Sample : Parent")
+                .replace("Rust=Payload", "Rust=Payload, RustPrototype=Error"),
+            INPUT.replace("interface Sample", "interface Sample : Sample"),
+            VALUE_OPERATIONS.replace("DOMString source", "Document source"),
+            VALUE_OPERATIONS
+                .replace("Rust=parse", "Rust=parse, NewObject")
+                .replace("Document parse", "boolean parse"),
+            VALUE_OPERATIONS
+                .replace("Rust=parse", "Rust=parse, NewObject")
+                .replace("Document parse", "Document? parse"),
+            INPUT.replace("Rust=label", "Rust=label, CEReactions"),
+            INPUT.replace("Rust=Payload", "Rust=Payload, RustAlternateLifetime"),
             PARTIAL.replace("Node node", "optional Node node"),
             PARTIAL.replace("Node node", "Node... node"),
             PARTIAL.replace("Node insert", "static Node insert"),
-            PARTIAL.replace("Node insert", "DOMString insert"),
             PARTIAL.replace(
                 "Node? child);",
                 "Node? child); [Rust=other] Node insert(Node node);",

@@ -15,19 +15,27 @@ use crate::Error;
 pub(crate) struct Interface {
     pub(crate) name: String,
     pub(crate) rust: Ident,
+    pub(crate) alternate: Option<Ident>,
+    pub(crate) alternate_has_lifetime: bool,
     pub(crate) has_lifetime: bool,
-    pub(crate) parent_intrinsic: Option<String>,
+    pub(crate) parent: Option<PrototypeParent>,
     pub(crate) constructor: Option<Constructor>,
     pub(crate) attributes: Vec<Attribute>,
     pub(crate) constants: Vec<Constant>,
     pub(crate) kind: InterfaceKind,
     pub(crate) operations: Vec<Operation>,
     pub(crate) dictionaries: Vec<Dictionary>,
+    pub(crate) enumerations: Vec<Enumeration>,
 }
 
 pub(crate) enum InterfaceKind {
     Complete,
     Partial,
+}
+
+pub(crate) enum PrototypeParent {
+    Intrinsic(String),
+    Interface(String),
 }
 
 pub(crate) struct Operation {
@@ -36,17 +44,26 @@ pub(crate) struct Operation {
     pub(crate) result: OperationResult,
     pub(crate) takes_this: bool,
     pub(crate) arguments: Vec<OperationArgument>,
+    pub(crate) reactions: bool,
 }
 
 pub(crate) enum OperationResult {
-    Node,
+    /// The method returns the platform object or value to hand back.
+    Object,
     Undefined,
     RecordSequence,
+    /// The method returns `rquickjs::String<'js>`.
+    String,
+    Boolean,
+    UnsignedShort,
 }
 
 pub(crate) struct OperationArgument {
     pub(crate) type_: ReturnType,
     pub(crate) optional: bool,
+    pub(crate) null_default: bool,
+    pub(crate) legacy_null_to_empty: bool,
+    pub(crate) boolean_default: Option<bool>,
 }
 
 pub(crate) struct Constructor {
@@ -78,6 +95,8 @@ pub(crate) struct Attribute {
     pub(crate) return_type: ReturnType,
     pub(crate) mapping: GetterMapping,
     pub(crate) setter: Option<Ident>,
+    pub(crate) legacy_null_to_empty: bool,
+    pub(crate) reactions: bool,
 }
 
 pub(crate) enum GetterMapping {
@@ -89,16 +108,29 @@ pub(crate) enum ReturnType {
     String,
     NullableString,
     UnsignedShort,
+    UnsignedLong,
+    Boolean,
+    UsvString,
+    NullableDocumentType,
     NullableNode,
     Node,
     NodeList,
     Callback,
     Dictionary(String),
+    Enumeration(String),
     RecordSequence,
+    PlatformObject,
+    /// Explicit `[RustValue]` implementation mapping; the method converts it.
+    Value,
 }
 
 pub(crate) struct Callback {
     pub(crate) name: String,
+}
+
+pub(crate) struct Enumeration {
+    pub(crate) name: String,
+    pub(crate) values: Vec<(String, Ident)>,
 }
 
 pub(crate) struct Dictionary {
@@ -128,6 +160,7 @@ pub(crate) struct Constant {
 pub(crate) struct TypeNames {
     pub(crate) callbacks: HashSet<String>,
     pub(crate) dictionaries: HashSet<String>,
+    pub(crate) enumerations: HashSet<String>,
 }
 
 impl Interface {
@@ -139,24 +172,31 @@ impl Interface {
         if !remaining.trim().is_empty() {
             return Err(Error(format!("invalid Web IDL near {remaining:?}")));
         }
-        let (callbacks, dictionaries, definition) = split_definitions(&definitions)?;
-        let (kind, identifier_token, members, attributes) = match definition {
-            Definition::Interface(definition) => {
-                if definition.inheritance.is_some() {
-                    return Err(Error("interface inheritance is not supported yet".into()));
-                }
-                (
-                    InterfaceKind::Complete,
-                    definition.identifier.0,
-                    &definition.members.body,
-                    definition.attributes.as_ref(),
-                )
-            }
+        let parsed = split_definitions(&definitions)?;
+        let names = parsed.type_names()?;
+        let DefinitionsInFile {
+            callbacks: _,
+            dictionaries,
+            enumerations,
+            interface: definition,
+        } = parsed;
+        let (kind, identifier_token, members, attributes, parent) = match definition {
+            Definition::Interface(definition) => (
+                InterfaceKind::Complete,
+                definition.identifier.0,
+                &definition.members.body,
+                definition.attributes.as_ref(),
+                definition
+                    .inheritance
+                    .as_ref()
+                    .map(|parent| parent.identifier.0),
+            ),
             Definition::PartialInterface(definition) => (
                 InterfaceKind::Partial,
                 definition.identifier.0,
                 &definition.members.body,
                 definition.attributes.as_ref(),
+                None,
             ),
             _ => {
                 return Err(Error(
@@ -171,41 +211,55 @@ impl Interface {
             ));
         }
         let rust = attributes.rust()?;
+        let alternate = attributes
+            .take("RustAlternate")?
+            .map(|name| {
+                syn::parse_str(&name)
+                    .map_err(|error| Error(format!("invalid Rust alternate {name:?}: {error}")))
+            })
+            .transpose()?;
+        let alternate_has_lifetime = attributes.flag("RustAlternateLifetime")?;
+        if alternate_has_lifetime && alternate.is_none() {
+            return Err(Error("RustAlternateLifetime requires RustAlternate".into()));
+        }
         let has_lifetime = attributes.flag("RustLifetime")?;
-        let parent_intrinsic = attributes.take("RustPrototype")?;
-        if parent_intrinsic
-            .as_deref()
-            .is_some_and(|name| name != "Error")
-        {
+        let intrinsic = attributes.take("RustPrototype")?;
+        if intrinsic.as_deref().is_some_and(|name| name != "Error") {
             return Err(Error("unsupported intrinsic prototype".into()));
         }
+        if parent.is_some() && intrinsic.is_some() {
+            return Err(Error(
+                "interface cannot declare two prototype parents".into(),
+            ));
+        }
+        let parent = parent
+            .map(|name| identifier(name).map(|name| PrototypeParent::Interface(name.to_owned())))
+            .transpose()?
+            .or_else(|| intrinsic.map(PrototypeParent::Intrinsic));
+        if matches!(&parent, Some(PrototypeParent::Interface(parent)) if parent == identifier_token)
+        {
+            return Err(Error("an interface cannot inherit from itself".into()));
+        }
         attributes.finish()?;
-        if matches!(kind, InterfaceKind::Partial) && parent_intrinsic.is_some() {
+        if matches!(kind, InterfaceKind::Partial) && parent.is_some() {
             return Err(Error(
                 "partial interfaces cannot select a prototype parent".into(),
             ));
         }
-        let names = TypeNames {
-            callbacks: callbacks
-                .iter()
-                .map(|callback| callback.name.clone())
-                .collect(),
-            dictionaries: dictionaries
-                .iter()
-                .map(|dictionary| dictionary.name.clone())
-                .collect(),
-        };
         let mut result = Self {
             name: identifier(identifier_token)?.into(),
             rust,
+            alternate,
+            alternate_has_lifetime,
             has_lifetime,
-            parent_intrinsic,
+            parent,
             constructor: None,
             attributes: Vec::new(),
             constants: Vec::new(),
             kind,
             operations: Vec::new(),
             dictionaries,
+            enumerations,
         };
         result.lower_members(members, &names)?;
         Ok(result)
@@ -276,15 +330,35 @@ impl Operation {
         let mut attributes = Attributes::parse(member.attributes.as_ref())?;
         let rust = attributes.rust()?;
         let takes_this = attributes.flag("RustThis")?;
+        let new_object = attributes.flag("NewObject")?;
+        let reactions = attributes.flag("CEReactions")?;
         attributes.finish()?;
+        if new_object
+            && !matches!(
+                &member.return_type,
+                weedle::types::ReturnType::Type(Type::Single(SingleType::NonAny(NonAnyType::Identifier(value))))
+                    if value.q_mark.is_none() && matches!(ReturnType::parse(
+                        &Type::Single(SingleType::NonAny(NonAnyType::Identifier(*value))), names
+                    )?, ReturnType::Node | ReturnType::PlatformObject)
+            )
+        {
+            return Err(Error(
+                "NewObject requires a non-nullable interface result".into(),
+            ));
+        }
         let result = match &member.return_type {
             weedle::types::ReturnType::Undefined(_) => OperationResult::Undefined,
             weedle::types::ReturnType::Type(type_) => match ReturnType::parse(type_, names)? {
-                ReturnType::Node => OperationResult::Node,
+                ReturnType::Node | ReturnType::PlatformObject | ReturnType::NullableString => {
+                    OperationResult::Object
+                }
                 ReturnType::RecordSequence => OperationResult::RecordSequence,
+                ReturnType::String => OperationResult::String,
+                ReturnType::Boolean => OperationResult::Boolean,
+                ReturnType::UnsignedShort => OperationResult::UnsignedShort,
                 _ => {
                     return Err(Error(
-                            "only Node, undefined, and record sequence operation results are supported yet"
+                            "only Node, undefined, string, and record sequence operation results are supported yet"
                                 .into(),
                         ));
                 }
@@ -307,43 +381,14 @@ impl Operation {
             ) {
                 return Err(Error("duplicate operation argument".into()));
             }
-            Attributes::parse(argument.attributes.as_ref())?.finish()?;
-            Attributes::parse(argument.type_.attributes.as_ref())?.finish()?;
-            let type_ = ReturnType::parse(&argument.type_.type_, names)?;
-            let optional = argument.optional.is_some();
-            match (&type_, optional, &argument.default) {
-                (ReturnType::Dictionary(_), true, Some(default))
-                    if matches!(
-                        default.value,
-                        weedle::literal::DefaultValue::EmptyDictionary(_)
-                    ) => {}
-                (_, true, _) | (_, _, Some(_)) => {
-                    return Err(Error(
-                        "only trailing optional dictionaries with {} defaults are supported yet"
-                            .into(),
-                    ));
-                }
-                _ => {}
-            }
-            if optional_seen && !optional {
+            let argument = OperationArgument::parse(argument, names)?;
+            if optional_seen && !argument.optional {
                 return Err(Error(
                     "required arguments after optional ones are not supported yet".into(),
                 ));
             }
-            optional_seen |= optional;
-            if !matches!(
-                type_,
-                ReturnType::Node
-                    | ReturnType::NullableNode
-                    | ReturnType::Callback
-                    | ReturnType::Dictionary(_)
-            ) {
-                return Err(Error(
-                    "only Node, callback, and dictionary operation arguments are supported yet"
-                        .into(),
-                ));
-            }
-            arguments.push(OperationArgument { type_, optional });
+            optional_seen |= argument.optional;
+            arguments.push(argument);
         }
         Ok(Self {
             name: identifier(name.0)?.into(),
@@ -351,6 +396,90 @@ impl Operation {
             result,
             takes_this,
             arguments,
+            reactions,
+        })
+    }
+}
+
+impl OperationArgument {
+    fn parse(
+        argument: &weedle::argument::SingleArgument<'_>,
+        names: &TypeNames,
+    ) -> Result<Self, Error> {
+        let mut argument_attributes = Attributes::parse(argument.attributes.as_ref())?;
+        let rust_value = argument_attributes.flag("RustValue")?;
+        let mut type_attributes = Attributes::parse(argument.type_.attributes.as_ref())?;
+        let legacy_null_to_empty = argument_attributes.flag("LegacyNullToEmptyString")?
+            || type_attributes.flag("LegacyNullToEmptyString")?;
+        argument_attributes.finish()?;
+        type_attributes.finish()?;
+        let type_ = if rust_value {
+            ReturnType::Value
+        } else {
+            ReturnType::parse(&argument.type_.type_, names)?
+        };
+        let optional = argument.optional.is_some();
+        let null_default = argument
+            .default
+            .as_ref()
+            .is_some_and(|default| matches!(default.value, DefaultValue::Null(_)));
+        let boolean_default = argument
+            .default
+            .as_ref()
+            .and_then(|default| match default.value {
+                DefaultValue::Boolean(value) => Some(value.0),
+                _ => None,
+            });
+        match (&type_, optional, &argument.default) {
+            (ReturnType::Boolean, true, Some(_)) if boolean_default.is_some() => {}
+            (ReturnType::String, true, None) => {}
+            (ReturnType::NullableDocumentType, true, Some(_)) if null_default => {}
+            (ReturnType::Dictionary(_), true, Some(default))
+                if matches!(
+                    default.value,
+                    weedle::literal::DefaultValue::EmptyDictionary(_)
+                ) => {}
+            (ReturnType::Value, true, Some(default))
+                if rust_value
+                    && matches!(
+                        default.value,
+                        weedle::literal::DefaultValue::EmptyDictionary(_)
+                    ) => {}
+            (_, true, _) | (_, _, Some(_)) => {
+                return Err(Error(
+                    "only trailing optional dictionaries with {} defaults are supported yet".into(),
+                ));
+            }
+            _ => {}
+        }
+        if legacy_null_to_empty && !matches!(type_, ReturnType::String) {
+            return Err(Error("LegacyNullToEmptyString requires DOMString".into()));
+        }
+        if !matches!(
+            type_,
+            ReturnType::Node
+                | ReturnType::NullableNode
+                | ReturnType::Callback
+                | ReturnType::Dictionary(_)
+                | ReturnType::String
+                | ReturnType::NullableString
+                | ReturnType::Value
+                | ReturnType::NullableDocumentType
+                | ReturnType::Boolean
+                | ReturnType::UnsignedLong
+                | ReturnType::Enumeration(_)
+        ) {
+            return Err(Error(
+                    "only Node, callback, dictionary, string, and value operation arguments are supported yet"
+                        .into(),
+                ));
+        }
+        Ok(Self {
+            type_,
+            optional,
+            null_default,
+            legacy_null_to_empty,
+            boolean_default,
         })
     }
 }
@@ -374,6 +503,13 @@ impl Attribute {
             (attributes.rust()?, GetterMapping::Method)
         };
         let same_object = attributes.flag("SameObject")?;
+        let reactions = attributes.flag("CEReactions")?;
+        if reactions && member.readonly.is_some() {
+            return Err(Error("CEReactions requires a writable attribute".into()));
+        }
+        let mut type_attributes = Attributes::parse(member.type_.attributes.as_ref())?;
+        let legacy_null_to_empty = attributes.flag("LegacyNullToEmptyString")?
+            || type_attributes.flag("LegacyNullToEmptyString")?;
         let setter = attributes
             .take("RustSet")?
             .map(|name| {
@@ -387,8 +523,11 @@ impl Attribute {
             ));
         }
         attributes.finish()?;
-        Attributes::parse(member.type_.attributes.as_ref())?.finish()?;
+        type_attributes.finish()?;
         let return_type = ReturnType::parse(&member.type_.type_, names)?;
+        if legacy_null_to_empty && !matches!(return_type, ReturnType::String) {
+            return Err(Error("LegacyNullToEmptyString requires DOMString".into()));
+        }
         if setter.is_some()
             && (!matches!(mapping, GetterMapping::Method)
                 || !matches!(return_type, ReturnType::String | ReturnType::NullableString))
@@ -403,12 +542,17 @@ impl Attribute {
             | (
                 GetterMapping::Method,
                 ReturnType::String
+                | ReturnType::UsvString
+                | ReturnType::Boolean
+                | ReturnType::PlatformObject
                 | ReturnType::NullableString
                 | ReturnType::UnsignedShort
+                | ReturnType::UnsignedLong
                 | ReturnType::NullableNode,
                 false,
                 _,
-            ) => {}
+            )
+            | (GetterMapping::Method, ReturnType::NodeList, true, _) => {}
             _ => {
                 return Err(Error(
                     "unsupported getter mapping or SameObject declaration".into(),
@@ -421,6 +565,8 @@ impl Attribute {
             return_type,
             mapping,
             setter,
+            legacy_null_to_empty,
+            reactions,
         })
     }
 }
@@ -485,6 +631,43 @@ impl Constructor {
 impl ReturnType {
     fn parse(type_: &Type<'_>, names: &TypeNames) -> Result<Self, Error> {
         match type_ {
+            Type::Union(value) if value.q_mark.is_none() && value.type_.body.list.len() == 2 => {
+                // https://webidl.spec.whatwg.org/#es-union
+                // TrustedHTML has no implementation in this runtime yet, so
+                // no input implements that interface: the DOMString arm wins.
+                let mut string = false;
+                let mut trusted_html = false;
+                for member in &value.type_.body.list {
+                    let weedle::types::UnionMemberType::Single(member) = member else {
+                        return Err(Error("nested unions are not supported yet".into()));
+                    };
+                    Attributes::parse(member.attributes.as_ref())?.finish()?;
+                    match &member.type_ {
+                        NonAnyType::DOMString(value) if value.q_mark.is_none() => string = true,
+                        NonAnyType::Identifier(value)
+                            if value.q_mark.is_none() && value.type_.0 == "TrustedHTML" =>
+                        {
+                            trusted_html = true;
+                        }
+                        _ => return Err(Error("unsupported string union member".into())),
+                    }
+                }
+                if string && trusted_html {
+                    Ok(Self::String)
+                } else {
+                    Err(Error("expected TrustedHTML or DOMString".into()))
+                }
+            }
+            Type::Single(SingleType::NonAny(NonAnyType::USVString(value)))
+                if value.q_mark.is_none() =>
+            {
+                Ok(Self::UsvString)
+            }
+            Type::Single(SingleType::NonAny(NonAnyType::Boolean(value)))
+                if value.q_mark.is_none() =>
+            {
+                Ok(Self::Boolean)
+            }
             Type::Single(SingleType::NonAny(NonAnyType::DOMString(value))) => {
                 Ok(if value.q_mark.is_some() {
                     Self::NullableString
@@ -496,6 +679,12 @@ impl ReturnType {
                 if value.q_mark.is_none() && is_unsigned_short(value.type_) =>
             {
                 Ok(Self::UnsignedShort)
+            }
+            Type::Single(SingleType::NonAny(NonAnyType::Integer(value)))
+                if value.q_mark.is_none()
+                    && matches!(value.type_, IntegerType::Long(value) if value.unsigned.is_some()) =>
+            {
+                Ok(Self::UnsignedLong)
             }
             Type::Single(SingleType::NonAny(NonAnyType::Sequence(value))) => {
                 if value.q_mark.is_some() {
@@ -520,13 +709,20 @@ impl ReturnType {
                         Self::Node
                     }),
                     "NodeList" if value.q_mark.is_none() => Ok(Self::NodeList),
+                    "DocumentType" if value.q_mark.is_some() => Ok(Self::NullableDocumentType),
                     name if value.q_mark.is_none() && names.callbacks.contains(name) => {
                         Ok(Self::Callback)
                     }
                     name if value.q_mark.is_none() && names.dictionaries.contains(name) => {
                         Ok(Self::Dictionary(name.into()))
                     }
-                    _ => Err(Error(format!("unsupported interface result: {value:?}"))),
+                    name if value.q_mark.is_none() && names.enumerations.contains(name) => {
+                        Ok(Self::Enumeration(name.into()))
+                    }
+                    "Document" | "XMLDocument" | "DocumentType" | "Element" => {
+                        Ok(Self::PlatformObject)
+                    }
+                    _ => Err(Error(format!("unsupported interface type: {value:?}"))),
                 }
             }
             _ => Err(Error(format!("unsupported binding type: {type_:?}"))),
@@ -685,14 +881,102 @@ fn is_unsigned_short(type_: IntegerType) -> bool {
 
 /// One interface file is one native interface plus the callbacks and
 /// dictionaries its members name.
+struct DefinitionsInFile<'a, 'b> {
+    callbacks: Vec<Callback>,
+    dictionaries: Vec<Dictionary>,
+    enumerations: Vec<Enumeration>,
+    interface: &'a Definition<'b>,
+}
+
+impl DefinitionsInFile<'_, '_> {
+    fn type_names(&self) -> Result<TypeNames, Error> {
+        // https://webidl.spec.whatwg.org/#idl-names
+        let mut taken = HashSet::new();
+        let names = TypeNames {
+            callbacks: self
+                .callbacks
+                .iter()
+                .map(|callback| callback.name.clone())
+                .collect(),
+            dictionaries: self
+                .dictionaries
+                .iter()
+                .map(|dictionary| dictionary.name.clone())
+                .collect(),
+            enumerations: self
+                .enumerations
+                .iter()
+                .map(|enumeration| enumeration.name.clone())
+                .collect(),
+        };
+        let interface = match self.interface {
+            Definition::Interface(interface) => interface.identifier.0,
+            Definition::PartialInterface(interface) => interface.identifier.0,
+            _ => return Err(Error("expected a native interface".into())),
+        };
+        for name in names
+            .callbacks
+            .iter()
+            .chain(&names.dictionaries)
+            .chain(&names.enumerations)
+            .map(String::as_str)
+            .chain(std::iter::once(identifier(interface)?))
+        {
+            if !taken.insert(name) {
+                return Err(Error(format!("duplicate named definition: {name}")));
+            }
+        }
+        Ok(names)
+    }
+}
+
 fn split_definitions<'a, 'b>(
     definitions: &'a Definitions<'b>,
-) -> Result<(Vec<Callback>, Vec<Dictionary>, &'a Definition<'b>), Error> {
+) -> Result<DefinitionsInFile<'a, 'b>, Error> {
     let mut callbacks = Vec::new();
     let mut dictionaries = Vec::new();
+    let mut enumerations = Vec::new();
     let mut interface = None;
     for definition in definitions.as_slice() {
         match definition {
+            Definition::Enum(definition) => {
+                Attributes::parse(definition.attributes.as_ref())?.finish()?;
+                let name = identifier(definition.identifier.0)?.to_owned();
+                if enumerations
+                    .iter()
+                    .any(|existing: &Enumeration| existing.name == name)
+                {
+                    return Err(Error(format!("duplicate enumeration: {name}")));
+                }
+                let mut values = Vec::new();
+                let mut taken = HashSet::new();
+                for value in &definition.values.body.list {
+                    let text = value.value.0;
+                    let mut variant = String::new();
+                    for word in text
+                        .split(|char: char| !char.is_ascii_alphanumeric())
+                        .filter(|word| !word.is_empty())
+                    {
+                        let mut chars = word.chars();
+                        if let Some(first) = chars.next() {
+                            variant.push(first.to_ascii_uppercase());
+                            variant.extend(chars);
+                        }
+                    }
+                    if variant.is_empty() {
+                        variant.push_str("Empty");
+                    }
+                    if !taken.insert(variant.clone()) {
+                        return Err(Error(format!(
+                            "duplicate Rust enumeration variant: {variant}"
+                        )));
+                    }
+                    let variant = syn::parse_str(&variant)
+                        .map_err(|error| Error(format!("invalid enumeration variant: {error}")))?;
+                    values.push((text.into(), variant));
+                }
+                enumerations.push(Enumeration { name, values });
+            }
             Definition::Callback(definition) => {
                 let callback = Callback::parse(definition)?;
                 if callbacks
@@ -729,7 +1013,12 @@ fn split_definitions<'a, 'b>(
     let Some(interface) = interface else {
         return Err(Error("expected exactly one native interface".into()));
     };
-    Ok((callbacks, dictionaries, interface))
+    Ok(DefinitionsInFile {
+        callbacks,
+        dictionaries,
+        enumerations,
+        interface,
+    })
 }
 
 fn check_name(names: &mut HashSet<String>, name: &str) -> Result<(), Error> {
