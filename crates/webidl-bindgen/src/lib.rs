@@ -66,6 +66,26 @@ mod tests {
         };
     ";
 
+    const INDEXED_NAMED: &str = r"
+        [Exposed=Window, Rust=Payload, RustPropertyHooks=IndexedNamed, RustSupportedNames=supported_names]
+        interface Sample {
+            [Rust=length] readonly attribute unsigned long length;
+            [Rust=item] getter Element? item(unsigned long index);
+            [Rust=named_item] getter Element? namedItem(DOMString name);
+        };
+    ";
+
+    const OPTIONS: &str = r"
+        [Exposed=Window, LegacyOverrideBuiltIns, Rust=Payload, RustPropertyHooks=IndexedNamed, RustSupportedNames=supported_names]
+        interface Options : Sample {
+            [Rust=item] getter Element? item(unsigned long index);
+            [Rust=named_item] getter Element? namedItem(DOMString name);
+            [CEReactions, Rust=length, RustSet=set_length] attribute unsigned long length;
+            [CEReactions, Rust=set_indexed] setter undefined (unsigned long index, [RustValue] HTMLOptionElement? option);
+            [CEReactions, Rust=remove] undefined remove(long index);
+            [CEReactions, Rust=selected_index, RustSet=set_selected_index] attribute long selectedIndex;
+        };
+    ";
     const CALLBACK: &str = r"
         callback MutationCallback = undefined (sequence<MutationRecord> records, MutationObserver observer);
         [Exposed=Window, Rust=Observer] interface MutationObserver {
@@ -97,6 +117,8 @@ mod tests {
             (SETTERS, "sample_generated"),
             (VALUE_OPERATIONS, "serializer_generated"),
             (CALLBACK, "mutation_observer_generated"),
+            (INDEXED_NAMED, "sample_generated"),
+            (OPTIONS, "options_generated"),
         ] {
             let output = compile(source).expect("compile supported fixture");
             let file = syn::parse_file(&output).expect("generated module is valid Rust syntax");
@@ -104,6 +126,22 @@ mod tests {
                 panic!("expected one generated module");
             };
             assert_eq!(item.ident, module);
+        }
+    }
+
+    #[test]
+    fn indexed_named_and_long_setters_emit_hooks() {
+        let output = compile(OPTIONS).expect("compile options fixture");
+        for fragment in [
+            "exotic_get_own_property",
+            "ExoticDefineResult",
+            "set_indexed",
+            "selected_index",
+        ] {
+            assert!(
+                output.contains(fragment),
+                "options output must contain {fragment}"
+            );
         }
     }
 
@@ -157,6 +195,10 @@ mod tests {
                 "Node? child);",
                 "Node? child); const unsigned short LIMIT = 7;",
             ),
+            INDEXED_NAMED.replace("RustSupportedNames=supported_names", "RustPropertyHooks=Indexed"),
+            INDEXED_NAMED.replace("IndexedNamed", "Indexed"),
+            OPTIONS.replace("[RustValue] HTMLOptionElement? option", "HTMLOptionElement? option"),
+            OPTIONS.replace("attribute long selectedIndex", "attribute Long selectedIndex"),
         ] {
             assert!(compile(&source).is_err(), "accepted {source}");
         }
