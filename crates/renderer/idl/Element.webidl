@@ -5,6 +5,28 @@
 partial interface Element {
     [Rust=get_elements_by_tag_name] HTMLCollection getElementsByTagName([RustFromJs=WebIdlString] DOMString qualifiedName);
     [Rust=get_elements_by_tag_name_ns] HTMLCollection getElementsByTagNameNS([RustFromJs=OptString] DOMString? namespace, [RustFromJs=WebIdlString] DOMString localName);
+    [RustValue, Rust=get_elements_by_class_name] HTMLCollection getElementsByClassName([RustFromJs=WebIdlString] DOMString classNames);
+    [Rust=matches] boolean matches([RustFromJs=WebIdlString] DOMString selectors);
+    [RustValue, Rust=closest] Element? closest([RustFromJs=WebIdlString] DOMString selectors);
+
+    // The `style` attribute is readonly with `[PutForwards=cssText]` in CSSOM;
+    // here the platform setter reflects the content attribute, which is the
+    // same observable behavior.
+    [SameObject, RustValue, Rust=style, RustSet=set_style, RustSetFromJs=WebIdlString] attribute CSSStyleDeclaration style;
+    [CEReactions, Rust=inner_html, RustSet=set_inner_html, RustSetFromJs=LegacyNullString] attribute [LegacyNullToEmptyString] DOMString innerHTML;
+    [CEReactions, Rust=outer_html, RustSet=set_outer_html, RustSetFromJs=LegacyNullString] attribute [LegacyNullToEmptyString] DOMString outerHTML;
+    [CEReactions, Rust=insert_adjacent_html] undefined insertAdjacentHTML([RustFromJs=WebIdlString] DOMString position, [RustFromJs=WebIdlString] DOMString text);
+
+    // https://drafts.csswg.org/cssom-view/#extension-to-the-element-interface
+    [RustValue, Rust=get_bounding_client_rect] DOMRect getBoundingClientRect();
+    [RustValue, Rust=get_client_rects] DOMRectList getClientRects();
+    [Rust=scroll_into_view] undefined scrollIntoView(optional [RustValue] (boolean or ScrollIntoViewOptions) arg);
+    [Rust=scroll_left, RustSet=set_scroll_left] attribute double scrollLeft;
+    [Rust=scroll_top, RustSet=set_scroll_top] attribute double scrollTop;
+
+    // https://dom.spec.whatwg.org/#ref-for-dom-element-attachshadow
+    [RustValue, Rust=attach_shadow] ShadowRoot attachShadow([RustValue] ShadowRootInit init);
+    [RustValue, Rust=shadow_root] readonly attribute ShadowRoot? shadowRoot;
 
     [Rust=tag_name] readonly attribute DOMString tagName;
     [Rust=local_name] readonly attribute DOMString localName;

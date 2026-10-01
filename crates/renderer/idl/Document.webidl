@@ -22,6 +22,10 @@ partial interface Document {
     [RustValue, Rust=default_view] readonly attribute object? defaultView;
     [RustValue, Rust=location] readonly attribute Location? location;
     [Rust=has_focus] boolean hasFocus();
+    [RustValue, Rust=active_element] readonly attribute Element? activeElement;
+    [CEReactions, Rust=title, RustSet=set_title, RustSetFromJs=WebIdlCodeUnits] attribute DOMString title;
+    [CEReactions, Rust=write] undefined write([RustFromJs=WebIdlString] DOMString... text);
+    [RustValue, Rust=get_elements_by_class_name] HTMLCollection getElementsByClassName([RustFromJs=WebIdlString] DOMString classNames);
 
     [Rust=create_event] Event createEvent([RustValue] DOMString eventInterface);
     [Rust=create_element] Element createElement([RustFromJs=WebIdlString] DOMString localName);

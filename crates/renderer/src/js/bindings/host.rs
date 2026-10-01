@@ -307,6 +307,15 @@ pub(crate) fn nullable_node_argument<'js>(
     }
 }
 
+/// Whether `kind` is an HTML element with the given local name.
+fn html_local(kind: Option<&dom::NodeKind>, local: &str) -> bool {
+    matches!(
+        kind,
+        Some(dom::NodeKind::Element { name, .. })
+            if name.ns == dom::html_namespace() && name.local.as_ref() == local
+    )
+}
+
 pub(crate) fn require_node_interface(
     ctx: &Ctx<'_>,
     id: dom::NodeId,
@@ -322,7 +331,8 @@ pub(crate) fn require_node_interface(
     let kind = document.document.kind(id);
     let implements = match interface {
         "Document" | "XMLDocument" => matches!(kind, Some(dom::NodeKind::Document)),
-        "DocumentFragment" => matches!(kind, Some(dom::NodeKind::Fragment)),
+        // A shadow root is a fragment carrying shadow metadata.
+        "DocumentFragment" | "ShadowRoot" => matches!(kind, Some(dom::NodeKind::Fragment)),
         "Element" => matches!(kind, Some(dom::NodeKind::Element { .. })),
         "HTMLElement" => {
             matches!(kind, Some(dom::NodeKind::Element { name, .. }) if name.ns == dom::html_namespace())
@@ -346,6 +356,48 @@ pub(crate) fn require_node_interface(
         "ProcessingInstruction" => {
             matches!(kind, Some(dom::NodeKind::ProcessingInstruction { .. }))
         }
+        // Spec mixins: their members are installed on every including
+        // interface, so the receiver check accepts the union of those kinds.
+        "ParentNode" => matches!(
+            kind,
+            Some(
+                dom::NodeKind::Document
+                    | dom::NodeKind::Fragment
+                    | dom::NodeKind::Element { .. }
+            )
+        ),
+        "ChildNode" => matches!(
+            kind,
+            Some(
+                dom::NodeKind::Element { .. }
+                    | dom::NodeKind::Text { .. }
+                    | dom::NodeKind::Comment { .. }
+                    | dom::NodeKind::CDataSection { .. }
+                    | dom::NodeKind::ProcessingInstruction { .. }
+                    | dom::NodeKind::Doctype { .. }
+            )
+        ),
+        "NonDocumentTypeChildNode" => matches!(
+            kind,
+            Some(
+                dom::NodeKind::Element { .. }
+                    | dom::NodeKind::Text { .. }
+                    | dom::NodeKind::Comment { .. }
+                    | dom::NodeKind::CDataSection { .. }
+                    | dom::NodeKind::ProcessingInstruction { .. }
+            )
+        ),
+        // HTML element interfaces check the element's local name.
+        "HTMLFormElement" => html_local(kind, "form"),
+        "HTMLInputElement" => html_local(kind, "input"),
+        "HTMLTextAreaElement" => html_local(kind, "textarea"),
+        "HTMLSelectElement" => html_local(kind, "select"),
+        "HTMLOptionElement" => html_local(kind, "option"),
+        "HTMLButtonElement" => html_local(kind, "button"),
+        "HTMLFieldSetElement" => html_local(kind, "fieldset"),
+        "HTMLOptGroupElement" => html_local(kind, "optgroup"),
+        "HTMLIFrameElement" => html_local(kind, "iframe"),
+        "HTMLImageElement" => html_local(kind, "img"),
         _ => return Err(Exception::throw_internal(ctx, "unknown node interface")),
     };
     if implements {
