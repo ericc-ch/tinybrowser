@@ -6,9 +6,9 @@ import { join } from "node:path";
 
 const MDN_FORM_URL = "https://developer.mozilla.org/en-US/docs/Web/HTML/Reference/Elements/form";
 const output = process.env.MDN_SCREENSHOT ?? "/tmp/tinybrowser-mdn-filled.png";
-const binary = process.env.TINYBROWSER_BIN;
+const binary = process.env.TINYBROWSER_BINARY;
 
-if (!binary) throw new Error("TINYBROWSER_BIN must name a built tinybrowser binary");
+if (!binary) throw new Error("TINYBROWSER_BINARY must name a built tinybrowser binary");
 
 async function openCdpSocket(url) {
   const socket = new WebSocket(url);
