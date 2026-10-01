@@ -55,6 +55,7 @@ include!(concat!(env!("OUT_DIR"), "/HTMLFieldSetElement.rs"));
 include!(concat!(env!("OUT_DIR"), "/HTMLOptGroupElement.rs"));
 include!(concat!(env!("OUT_DIR"), "/HTMLIFrameElement.rs"));
 include!(concat!(env!("OUT_DIR"), "/HTMLImageElement.rs"));
+include!(concat!(env!("OUT_DIR"), "/ElementReflections.rs"));
 
 pub(super) fn install(ctx: &Ctx<'_>) -> Result<()> {
     node_generated::install(ctx)?;
@@ -80,7 +81,8 @@ pub(super) fn install(ctx: &Ctx<'_>) -> Result<()> {
     html_field_set_element_generated::install(ctx)?;
     html_opt_group_element_generated::install(ctx)?;
     htmli_frame_element_generated::install(ctx)?;
-    html_image_element_generated::install(ctx)
+    html_image_element_generated::install(ctx)?;
+    element_reflections_generated::install(ctx)
 }
 
 fn insertion_tree_nodes(
@@ -1974,7 +1976,7 @@ impl JsNode {
     /// URL-reflected `src`: parsed against the document base and stored
     /// serialized, like `href`; an absent attribute reflects as the empty
     /// string (<https://html.spec.whatwg.org/multipage/urls-and-fetching.html#reflecting-content-attributes-in-idl-attributes>).
-    #[qjs(get)]
+    #[qjs(skip)]
     fn src(&self, ctx: Ctx<'_>) -> Result<String> {
         let world_rc = world(&ctx)?;
         let raw = world_rc
@@ -1991,7 +1993,7 @@ impl JsNode {
             .map_or(raw, |url| url.to_string()))
     }
 
-    #[qjs(set, rename = "src")]
+    #[qjs(skip)]
     fn set_src(&self, ctx: Ctx<'_>, value: WebIdlString) -> Result<()> {
         self.set_attribute(ctx, WebIdlString("src".into()), value)
     }
@@ -2087,7 +2089,7 @@ impl JsNode {
         }
     }
 
-    #[qjs(get)]
+    #[qjs(skip)]
     fn name(&self, ctx: Ctx<'_>) -> Result<String> {
         let world = world(&ctx)?;
         let world = world.borrow();
@@ -2133,12 +2135,12 @@ impl JsNode {
             .map_or(String::new(), |(_, _, system_id)| system_id))
     }
 
-    #[qjs(set, rename = "name")]
+    #[qjs(skip)]
     fn set_name(&self, ctx: Ctx<'_>, value: WebIdlString) -> Result<()> {
         self.set_attribute(ctx, WebIdlString("name".into()), value)
     }
 
-    #[qjs(get)]
+    #[qjs(skip)]
     fn content<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
         let world = world(&ctx)?;
         let template_contents = {
@@ -2161,7 +2163,7 @@ impl JsNode {
         Ok(Value::from_string(rquickjs::String::from_str(ctx, &value)?))
     }
 
-    #[qjs(set, rename = "content")]
+    #[qjs(skip)]
     fn set_content(&self, ctx: Ctx<'_>, value: WebIdlString) -> Result<()> {
         self.set_attribute(ctx, WebIdlString("content".into()), value)
     }
@@ -2486,7 +2488,7 @@ impl JsNode {
 
     /// URL-reflected `href`: parsed against the document base and stored
     /// serialized (percent-encoded).
-    #[qjs(get)]
+    #[qjs(skip)]
     fn href(&self, ctx: Ctx<'_>) -> Result<String> {
         let world_rc = world(&ctx)?;
         let raw = world_rc
@@ -2501,7 +2503,7 @@ impl JsNode {
             .map_or(raw, |url| url.to_string()))
     }
 
-    #[qjs(set, rename = "href")]
+    #[qjs(skip)]
     fn set_href(&self, ctx: Ctx<'_>, value: WebIdlString) -> Result<()> {
         // URL reflection stores the given value; resolution happens on get
         // (<https://html.spec.whatwg.org/multipage/urls-and-fetching.html#reflecting-content-attributes-in-idl-attributes>).
@@ -3919,15 +3921,8 @@ impl JsNode {
         Ok(character_data(ctx, self.handle.0)?.len())
     }
 
-    // https://html.spec.whatwg.org/multipage/form-elements.html#dom-select-length
-    #[qjs(get, rename = "length")]
-    fn length(&self, ctx: Ctx<'_>) -> Result<usize> {
-        let world = world(&ctx)?;
-        let world = world.borrow();
-        Ok(world.document(self.handle.0).map_or(0, |parsed| {
-            dom::form::select_options(&parsed.document, self.handle.0).len()
-        }))
-    }
+    // `HTMLSelectElement.length` is provided by the forms.js shim, which
+    // delegates to the options collection.
 
     // https://dom.spec.whatwg.org/#dom-characterdata-substringdata
     #[qjs(skip)]

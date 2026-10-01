@@ -387,6 +387,8 @@ pub(crate) fn require_node_interface(
                     | dom::NodeKind::ProcessingInstruction { .. }
             )
         ),
+        // Shared element-level reflections accept any element.
+        "ElementReflections" => matches!(kind, Some(dom::NodeKind::Element { .. })),
         // HTML element interfaces check the element's local name.
         "HTMLFormElement" => html_local(kind, "form"),
         "HTMLInputElement" => html_local(kind, "input"),
