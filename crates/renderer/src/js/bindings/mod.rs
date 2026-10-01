@@ -1610,8 +1610,9 @@ pub(super) fn live_collection<'js>(
             scope,
             JsHtmlCollection { query },
         )?)),
-        Some("HTMLOptionsCollection") => Ok(Class::into_value(Class::instance(
-            ctx.clone(),
+        Some("HTMLOptionsCollection") => Ok(Class::into_value(host::instance_for_node(
+            ctx,
+            scope,
             JsOptionsCollection { query },
         )?)),
         Some(_) => Err(Exception::throw_type(

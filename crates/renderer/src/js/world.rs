@@ -429,10 +429,6 @@ pub(crate) struct World {
     /// The realm's own mutation-delivery entry point, so scheduling never
     /// depends on a page-deletable global.
     pub(crate) deliver_mutations_fn: Option<Persistent<Function<'static>>>,
-    /// Captured `HTMLOptionsCollection` indexed-write entry point. The install
-    /// script defines the setter, Rust captures it, then the global is deleted
-    /// so page script cannot call `__tbSetOption` directly.
-    pub(crate) option_setter: Option<Persistent<Function<'static>>>,
     /// Unforgeable token for the trusted-event bridge: our shims close over
     /// a copy, page script cannot name it, and the bridge rejects calls made
     /// without it.
@@ -529,7 +525,6 @@ impl World {
             pristine_queue_microtask: None,
             weak_references: None,
             deliver_mutations_fn: None,
-            option_setter: None,
             host_token: None,
             images: HashMap::new(),
             image_loading: HashSet::new(),
@@ -1439,7 +1434,6 @@ impl World {
         self.pristine_queue_microtask = None;
         self.weak_references = None;
         self.deliver_mutations_fn = None;
-        self.option_setter = None;
         self.host_token = None;
     }
 

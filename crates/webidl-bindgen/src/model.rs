@@ -29,6 +29,12 @@ pub(crate) struct Interface {
     pub(crate) properties: PropertyHooks,
     pub(crate) stringifier: Option<usize>,
     pub(crate) value_iterable: bool,
+    pub(crate) indexed_setter: Option<IndexedSetter>,
+}
+
+pub(crate) struct IndexedSetter {
+    pub(crate) rust: Ident,
+    pub(crate) reactions: bool,
 }
 
 pub(crate) enum PropertyHooks {
@@ -38,6 +44,7 @@ pub(crate) enum PropertyHooks {
     IndexedNamed {
         names: Ident,
         unenumerable: bool,
+        override_builtins: bool,
     },
 }
 
@@ -77,6 +84,7 @@ pub(crate) enum OperationResult {
     String,
     Boolean,
     UnsignedShort,
+    Long,
 }
 
 pub(crate) struct OperationArgument {
@@ -153,6 +161,7 @@ pub(crate) enum ReturnType {
     NullableString,
     UnsignedShort,
     UnsignedLong,
+    Long,
     Boolean,
     UsvString,
     NullableDocumentType,
@@ -307,6 +316,7 @@ impl Interface {
             properties,
             stringifier: None,
             value_iterable: false,
+            indexed_setter: None,
         };
         result.lower_members(members, &names)?;
         result.validate_property_hooks()?;
@@ -354,6 +364,16 @@ impl Interface {
                     self.constants.push(Constant::parse(member)?);
                 }
                 InterfaceMember::Operation(member) => {
+                    if matches!(
+                        member.special,
+                        Some(weedle::interface::Special::Setter(_))
+                    ) {
+                        if self.indexed_setter.is_some() {
+                            return Err(Error("indexed setter overloads are not supported yet".into()));
+                        }
+                        self.indexed_setter = Some(IndexedSetter::parse(member, names)?);
+                        continue;
+                    }
                     let operation = Operation::parse(member, names, &self.properties)?;
                     if !taken.insert(operation.name.clone()) {
                         return Err(Error(format!(
@@ -421,7 +441,6 @@ impl Interface {
             if matches!(self.kind, InterfaceKind::Partial)
                 || !self.attributes.iter().any(|attribute| {
                     attribute.name == "length"
-                        && attribute.setter.is_none()
                         && matches!(attribute.return_type, ReturnType::UnsignedLong)
                 })
             {
@@ -453,8 +472,72 @@ impl Interface {
             {
                 return Err(Error("named hooks require a value-returning DOMString getter".into()));
             }
+            if self.indexed_setter.is_some()
+                && !matches!(self.properties, PropertyHooks::IndexedNamed { .. })
+            {
+                return Err(Error("indexed setters require named hooks".into()));
+            }
+        } else if self.indexed_setter.is_some() {
+            return Err(Error("indexed setters require indexed hooks".into()));
         }
         Ok(())
+    }
+}
+
+impl IndexedSetter {
+    fn parse(
+        member: &weedle::interface::OperationInterfaceMember<'_>,
+        names: &TypeNames,
+    ) -> Result<Self, Error> {
+        // https://webidl.spec.whatwg.org/#idl-indexed-properties: an indexed
+        // setter takes an unsigned long index and a value, with no identifier.
+        if member.identifier.is_some() {
+            return Err(Error("indexed setters must not have an identifier".into()));
+        }
+        if member.modifier.is_some() {
+            return Err(Error("indexed setters must not be static".into()));
+        }
+        if !matches!(
+            &member.return_type,
+            weedle::types::ReturnType::Undefined(_)
+        ) {
+            return Err(Error("indexed setters require an undefined result".into()));
+        }
+        let mut attributes = Attributes::parse(member.attributes.as_ref())?;
+        let rust = attributes.rust()?;
+        let reactions = attributes.flag("CEReactions")?;
+        attributes.finish()?;
+        let [Argument::Single(index), Argument::Single(value)] =
+            member.args.body.list.as_slice()
+        else {
+            return Err(Error("indexed setters require an index and a value".into()));
+        };
+        if index.optional.is_some() || index.default.is_some() {
+            return Err(Error("indexed setter index must be required".into()));
+        }
+        if !matches!(
+            ReturnType::parse(&index.type_.type_, names)?,
+            ReturnType::UnsignedLong
+        ) {
+            return Err(Error("indexed setter index requires unsigned long".into()));
+        }
+        Attributes::parse(index.attributes.as_ref())?.finish()?;
+        Attributes::parse(index.type_.attributes.as_ref())?.finish()?;
+        if value.optional.is_some() || value.default.is_some() {
+            return Err(Error("indexed setter value must be required".into()));
+        }
+        let mut value_attributes = Attributes::parse(value.attributes.as_ref())?;
+        let mut value_type_attributes = Attributes::parse(value.type_.attributes.as_ref())?;
+        let rust_value = value_attributes.flag("RustValue")?
+            || value_type_attributes.flag("RustValue")?;
+        value_attributes.finish()?;
+        value_type_attributes.finish()?;
+        if !rust_value {
+            return Err(Error("indexed setter values require RustValue".into()));
+        }
+        // The value type is carried as a JS value; the platform method checks
+        // whether it is an option, null, or undefined.
+        Ok(Self { rust, reactions })
     }
 }
 
@@ -509,6 +592,7 @@ impl Operation {
                 ReturnType::String => OperationResult::String,
                 ReturnType::Boolean => OperationResult::Boolean,
                 ReturnType::UnsignedShort => OperationResult::UnsignedShort,
+                ReturnType::Long => OperationResult::Long,
                 _ => {
                     return Err(Error(
                             "only Node, undefined, string, interface sequence, boolean, and unsigned short operation results are supported yet"
@@ -589,8 +673,7 @@ fn property_getter(
 }
 
 impl OperationArgument {
-    fn parse(argument: &Argument<'_>, names: &TypeNames) -> Result<Self, Error> {
-        let (attributes, type_attributes, type_, default, arity) = match argument {
+    fn parse(argument: &Argument<'_>, names: &TypeNames) -> Result<Self, Error> {        let (attributes, type_attributes, type_, default, arity) = match argument {
             Argument::Single(argument) => (
                 argument.attributes.as_ref(),
                 argument.type_.attributes.as_ref(),
@@ -611,9 +694,12 @@ impl OperationArgument {
             ),
         };
         let mut argument_attributes = Attributes::parse(attributes)?;
-        let rust_value = argument_attributes.flag("RustValue")?;
-        let from_js = argument_attributes.rust_mapping("RustFromJs")?;
         let mut type_attributes = Attributes::parse(type_attributes)?;
+        let rust_value = argument_attributes.flag("RustValue")?
+            || type_attributes.flag("RustValue")?;
+        let from_js = argument_attributes
+            .rust_mapping("RustFromJs")?
+            .or(type_attributes.rust_mapping("RustFromJs")?);
         let legacy_null_to_empty = argument_attributes.flag("LegacyNullToEmptyString")?
             || type_attributes.flag("LegacyNullToEmptyString")?;
         argument_attributes.finish()?;
@@ -633,54 +719,8 @@ impl OperationArgument {
             DefaultValue::Boolean(value) => Some(value.0),
             _ => None,
         });
-        match (&type_, optional, default) {
-            (ReturnType::Boolean, true, Some(_)) if boolean_default.is_some() => {}
-            (ReturnType::Boolean | ReturnType::String, true, None) => {}
-            (ReturnType::NullableDocumentType, true, Some(_)) if null_default => {}
-            (ReturnType::Dictionary(_), true, Some(default))
-                if matches!(
-                    default.value,
-                    weedle::literal::DefaultValue::EmptyDictionary(_)
-                ) => {}
-            (ReturnType::Value, true, Some(default))
-                if rust_value
-                    && matches!(
-                        default.value,
-                        weedle::literal::DefaultValue::EmptyDictionary(_)
-                    ) => {}
-            (ReturnType::Value, true, None) if rust_value => {}
-            (_, true, _) | (_, _, Some(_)) => {
-                return Err(Error(
-                    "only trailing optional dictionaries with {} defaults are supported yet".into(),
-                ));
-            }
-            _ => {}
-        }
-        if legacy_null_to_empty && !matches!(type_, ReturnType::String) {
-            return Err(Error("LegacyNullToEmptyString requires DOMString".into()));
-        }
-        if from_js.is_none()
-            && !matches!(
-                type_,
-                ReturnType::Node
-                    | ReturnType::NullableNode
-                    | ReturnType::Callback
-                    | ReturnType::Dictionary(_)
-                    | ReturnType::String
-                    | ReturnType::NullableString
-                    | ReturnType::Value
-                    | ReturnType::NullableDocumentType
-                    | ReturnType::Boolean
-                    | ReturnType::UnsignedLong
-                    | ReturnType::Double
-                    | ReturnType::Enumeration(_)
-            )
-        {
-            return Err(Error(
-                    "only Node, callback, dictionary, string, double, and value operation arguments are supported yet"
-                        .into(),
-                ));
-        }
+        validate_optional_default(&type_, optional, default.as_ref().map(|default| &default.value), rust_value)?;
+        validate_argument_type(&type_, legacy_null_to_empty, from_js.is_some())?;
         Ok(Self {
             type_,
             arity,
@@ -689,6 +729,70 @@ impl OperationArgument {
             boolean_default,
             from_js,
         })
+    }
+}
+
+fn validate_optional_default(
+    type_: &ReturnType,
+    optional: bool,
+    default: Option<&DefaultValue<'_>>,
+    rust_value: bool,
+) -> Result<(), Error> {
+    let null_default = default.is_some_and(|default| matches!(default, DefaultValue::Null(_)));
+    let boolean_default = default.and_then(|default| match default {
+        DefaultValue::Boolean(value) => Some(value.0),
+        _ => None,
+    });
+    match (type_, optional, default) {
+        (ReturnType::Boolean, true, Some(_)) if boolean_default.is_some() => Ok(()),
+        (ReturnType::Boolean | ReturnType::String, true, None)
+        | (ReturnType::Dictionary(_), true, Some(DefaultValue::EmptyDictionary(_))) => Ok(()),
+        (ReturnType::NullableDocumentType, true, Some(_)) if null_default => Ok(()),
+        (ReturnType::Value, true, Some(DefaultValue::EmptyDictionary(_) | DefaultValue::Null(_)))
+            if rust_value =>
+        {
+            Ok(())
+        }
+        (ReturnType::Value, true, None) if rust_value => Ok(()),
+        (_, true, _) | (_, _, Some(_)) => Err(Error(
+            "only trailing optional dictionaries with {} defaults are supported yet".into(),
+        )),
+        _ => Ok(()),
+    }
+}
+
+fn validate_argument_type(
+    type_: &ReturnType,
+    legacy_null_to_empty: bool,
+    has_from_js: bool,
+) -> Result<(), Error> {
+    if legacy_null_to_empty && !matches!(type_, ReturnType::String) {
+        return Err(Error("LegacyNullToEmptyString requires DOMString".into()));
+    }
+    if has_from_js
+        || matches!(
+            type_,
+            ReturnType::Node
+                | ReturnType::NullableNode
+                | ReturnType::Callback
+                | ReturnType::Dictionary(_)
+                | ReturnType::String
+                | ReturnType::NullableString
+                | ReturnType::Value
+                | ReturnType::NullableDocumentType
+                | ReturnType::Boolean
+                | ReturnType::UnsignedLong
+                | ReturnType::Long
+                | ReturnType::Double
+                | ReturnType::Enumeration(_)
+        )
+    {
+        Ok(())
+    } else {
+        Err(Error(
+            "only Node, callback, dictionary, string, double, and value operation arguments are supported yet"
+                .into(),
+        ))
     }
 }
 
@@ -752,7 +856,11 @@ impl Attribute {
             && (!matches!(mapping, GetterMapping::Method)
                 || !matches!(
                     return_type,
-                    ReturnType::String | ReturnType::NullableString | ReturnType::Boolean
+                    ReturnType::String
+                        | ReturnType::NullableString
+                        | ReturnType::Boolean
+                        | ReturnType::UnsignedLong
+                        | ReturnType::Long
                 ))
         {
             return Err(Error(
@@ -771,6 +879,7 @@ impl Attribute {
                 | ReturnType::NullableString
                 | ReturnType::UnsignedShort
                 | ReturnType::UnsignedLong
+                | ReturnType::Long
                 | ReturnType::NullableNode
                 | ReturnType::Double
                 | ReturnType::Value,
@@ -982,6 +1091,12 @@ impl ReturnType {
                     && matches!(value.type_, IntegerType::Long(value) if value.unsigned.is_some()) =>
             {
                 Ok(Self::UnsignedLong)
+            }
+            Type::Single(SingleType::NonAny(NonAnyType::Integer(value)))
+                if value.q_mark.is_none()
+                    && matches!(value.type_, IntegerType::Long(value) if value.unsigned.is_none()) =>
+            {
+                Ok(Self::Long)
             }
             Type::Single(SingleType::NonAny(NonAnyType::Sequence(value))) => {
                 if value.q_mark.is_some() {
@@ -1423,6 +1538,7 @@ impl Attributes {
     fn property_hooks(&mut self) -> Result<PropertyHooks, Error> {
         let names: Option<Ident> = self.rust_mapping("RustSupportedNames")?;
         let unenumerable = self.flag("LegacyUnenumerableNamedProperties")?;
+        let override_builtins = self.flag("LegacyOverrideBuiltIns")?;
         let hooks = match self.take("RustPropertyHooks")?.as_deref() {
             None => PropertyHooks::None,
             Some("JavaScript") => PropertyHooks::JavaScript,
@@ -1430,6 +1546,7 @@ impl Attributes {
             Some("IndexedNamed") => PropertyHooks::IndexedNamed {
                 names: names.clone().ok_or_else(|| Error("named hooks require RustSupportedNames".into()))?,
                 unenumerable,
+                override_builtins,
             },
             Some(_) => return Err(Error("unsupported property-hook implementation".into())),
         };
@@ -1441,6 +1558,11 @@ impl Attributes {
         {
             return Err(Error(
                 "named property annotations require property hooks".into(),
+            ));
+        }
+        if override_builtins && !matches!(hooks, PropertyHooks::IndexedNamed { .. }) {
+            return Err(Error(
+                "LegacyOverrideBuiltIns requires named hooks".into(),
             ));
         }
         Ok(hooks)

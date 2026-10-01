@@ -35,6 +35,7 @@ pub(crate) fn interface(interface: &Interface) -> TokenStream {
                     | ReturnType::Boolean
                     | ReturnType::UnsignedShort
                     | ReturnType::UnsignedLong
+                    | ReturnType::Long
                     | ReturnType::Double
             )
     }) {
@@ -292,7 +293,12 @@ impl NamedHooks {
     }
 
     fn parse(interface: &Interface) -> Self {
-        let PropertyHooks::IndexedNamed { names, unenumerable } = &interface.properties else {
+        let PropertyHooks::IndexedNamed {
+            names,
+            unenumerable,
+            override_builtins,
+        } = &interface.properties
+        else {
             return Self::none();
         };
         let named_item = &interface
@@ -302,6 +308,44 @@ impl NamedHooks {
             .expect("validated named item")
             .rust;
         let enumerable = !unenumerable;
+        // `[LegacyOverrideBuiltIns]`: named properties override built-ins, so
+        // no prototype-visibility check
+        // (<https://html.spec.whatwg.org/multipage/common-dom-interfaces.html#htmloptionscollection>).
+        // Plain `HTMLCollection` keeps `[LegacyUnenumerableNamedProperties]` hiding.
+        if *override_builtins {
+            return Self {
+                descriptor: quote! {
+                    if receiver.#names(ctx)?.contains(&name) {
+                        let value = receiver.#named_item(ctx.clone(), rquickjs::String::from_str(ctx.clone(), &name)?)?;
+                        return Ok(Some(rquickjs::class::PropertyDescriptor::new_value(value, true, #enumerable, false)));
+                    }
+                    return Ok(None);
+                },
+                names: quote! {
+                    for name in this.borrow().#names(ctx)? {
+                        if crate::js::bindings::array_index(&name).is_none() {
+                            names.push(rquickjs::class::PropertyName {
+                                atom: rquickjs::Atom::from_str(ctx.clone(), &name)?,
+                                is_enumerable: #enumerable,
+                            });
+                        }
+                    }
+                },
+                define: quote! {
+                    if this.borrow().#names(ctx)?.contains(&name) {
+                        return Ok(rquickjs::class::ExoticDefineResult::Handled(false));
+                    }
+                },
+                set: quote! {
+                    if object != receiver && crate::js::bindings::array_index(&name).is_none() {
+                        return Ok(rquickjs::class::ExoticSetResult::FallthroughSkippingOwnProperty);
+                    }
+                },
+                delete: quote! {
+                    return Ok(!this.borrow().#names(ctx)?.contains(&name));
+                },
+            };
+        }
         Self {
             descriptor: quote! {
                 if receiver.#names(ctx)?.contains(&name)
@@ -357,12 +401,17 @@ fn indexed_property_hooks(interface: &Interface) -> TokenStream {
         .expect("validated indexed item")
         .rust;
     let named = NamedHooks::parse(interface);
-    let object = if matches!(interface.properties, PropertyHooks::IndexedNamed { .. }) {
-        format_ident!("object")
-    } else {
-        format_ident!("_object")
+    let object = match &interface.properties {
+        PropertyHooks::IndexedNamed {
+            override_builtins: true,
+            ..
+        } => format_ident!("_object"),
+        PropertyHooks::IndexedNamed { .. } => format_ident!("object"),
+        _ => format_ident!("_object"),
     };
-    let define_receiver = if matches!(interface.properties, PropertyHooks::IndexedNamed { .. }) {
+    let define_receiver = if matches!(interface.properties, PropertyHooks::IndexedNamed { .. })
+        || interface.indexed_setter.is_some()
+    {
         format_ident!("this")
     } else {
         format_ident!("_this")
@@ -372,12 +421,104 @@ fn indexed_property_hooks(interface: &Interface) -> TokenStream {
     } else {
         quote! {}
     };
-    indexed_hooks_body(length, item, &named, &object, &define_receiver, &mutable_names)
+    indexed_hooks_body(
+        length,
+        item,
+        interface.indexed_setter.as_ref(),
+        &named,
+        &object,
+        &define_receiver,
+        &mutable_names,
+    )
+}
+
+struct SetterTokens {
+    define_value: proc_macro2::Ident,
+    define_is_data: proc_macro2::Ident,
+    indexed_define: TokenStream,
+    set_receiver: proc_macro2::Ident,
+    set_value: proc_macro2::Ident,
+    indexed_set: TokenStream,
+    writable: bool,
+}
+
+impl SetterTokens {
+    fn parse(setter: Option<&crate::model::IndexedSetter>) -> Self {
+        let Some(setter) = setter else {
+            return Self {
+                define_value: format_ident!("_value"),
+                define_is_data: format_ident!("_is_data"),
+                indexed_define: quote! {
+                    if crate::js::bindings::array_index(&name).is_some() {
+                        return Ok(rquickjs::class::ExoticDefineResult::Handled(false));
+                    }
+                },
+                set_receiver: format_ident!("_this"),
+                set_value: format_ident!("_value"),
+                indexed_set: quote! {},
+                writable: false,
+            };
+        };
+        let method = &setter.rust;
+        let call = quote! {
+            let receiver = this.borrow();
+            receiver.#method(ctx.clone(), index, value)?;
+        };
+        let call = if setter.reactions {
+            quote! {
+                crate::js::reactions::with_reactions(ctx, || {
+                    #call
+                    Ok(Value::new_undefined(ctx.clone()))
+                })?;
+            }
+        } else {
+            quote! { #call }
+        };
+        Self {
+            define_value: format_ident!("value"),
+            define_is_data: format_ident!("is_data"),
+            indexed_define: quote! {
+                if let Some(index) = crate::js::bindings::array_index(&name) {
+                    if !is_data {
+                        return Ok(rquickjs::class::ExoticDefineResult::Handled(false));
+                    }
+                    #call
+                    return Ok(rquickjs::class::ExoticDefineResult::Handled(true));
+                }
+            },
+            set_receiver: format_ident!("this"),
+            set_value: format_ident!("value"),
+            indexed_set: quote! {
+                if let Some(index) = crate::js::bindings::array_index(&name) {
+                    if object != receiver {
+                        return Ok(rquickjs::class::ExoticSetResult::Fallthrough);
+                    }
+                    #call
+                    return Ok(rquickjs::class::ExoticSetResult::Handled(true));
+                }
+            },
+            writable: true,
+        }
+    }
 }
 
 fn indexed_hooks_body(
     length: &proc_macro2::Ident,
     item: &proc_macro2::Ident,
+    setter: Option<&crate::model::IndexedSetter>,
+    hooks: &NamedHooks,
+    object: &proc_macro2::Ident,
+    define_receiver: &proc_macro2::Ident,
+    mutable_names: &TokenStream,
+) -> TokenStream {
+    let tokens = SetterTokens::parse(setter);
+    indexed_hooks_with_tokens(length, item, &tokens, hooks, object, define_receiver, mutable_names)
+}
+
+fn indexed_hooks_with_tokens(
+    length: &proc_macro2::Ident,
+    item: &proc_macro2::Ident,
+    tokens: &SetterTokens,
     hooks: &NamedHooks,
     object: &proc_macro2::Ident,
     define_receiver: &proc_macro2::Ident,
@@ -388,6 +529,15 @@ fn indexed_hooks_body(
     let define = &hooks.define;
     let set = &hooks.set;
     let delete = &hooks.delete;
+    // Indexed properties are writable only when an indexed setter exists
+    // (<https://webidl.spec.whatwg.org/#legacy-platform-object-getownproperty>).
+    let writable = tokens.writable;
+    let define_value = &tokens.define_value;
+    let define_is_data = &tokens.define_is_data;
+    let indexed_define = &tokens.indexed_define;
+    let set_receiver = &tokens.set_receiver;
+    let set_value = &tokens.set_value;
+    let indexed_set = &tokens.indexed_set;
     quote! {
         const KIND: rquickjs::class::ClassKind = rquickjs::class::ClassKind::Exotic;
         const EXOTIC_HOOKS: rquickjs::class::ExoticHooks = rquickjs::class::ExoticHooks {
@@ -405,7 +555,7 @@ fn indexed_hooks_body(
             let Some(index) = crate::js::bindings::array_index(&name) else { #descriptor };
             if index as usize >= receiver.#length(ctx)? { return Ok(None); }
             let value = receiver.#item(ctx.clone(), index)?;
-            Ok(Some(rquickjs::class::PropertyDescriptor::new_value(value, true, true, false)))
+            Ok(Some(rquickjs::class::PropertyDescriptor::new_value(value, true, true, #writable)))
         }
 
         // https://webidl.spec.whatwg.org/#legacy-platform-object-ownpropertykeys
@@ -426,26 +576,25 @@ fn indexed_hooks_body(
         // https://webidl.spec.whatwg.org/#legacy-platform-object-defineownproperty
         fn exotic_define_own_property(
             #define_receiver: &rquickjs::class::JsCell<'js, Self>, ctx: &Ctx<'js>,
-            atom: rquickjs::Atom<'js>, _value: Value<'js>, _is_data: bool,
+            atom: rquickjs::Atom<'js>, #define_value: Value<'js>, #define_is_data: bool,
         ) -> Result<rquickjs::class::ExoticDefineResult> {
             let Some(name) = crate::js::bindings::atom_name(ctx, &atom) else {
                 return Ok(rquickjs::class::ExoticDefineResult::Fallthrough);
             };
-            if crate::js::bindings::array_index(&name).is_some() {
-                return Ok(rquickjs::class::ExoticDefineResult::Handled(false));
-            }
+            #indexed_define
             #define
             Ok(rquickjs::class::ExoticDefineResult::Fallthrough)
         }
 
         // https://webidl.spec.whatwg.org/#legacy-platform-object-set
         fn exotic_set_property(
-            _this: &rquickjs::class::JsCell<'js, Self>, ctx: &Ctx<'js>, atom: rquickjs::Atom<'js>,
-            object: Value<'js>, receiver: Value<'js>, _value: Value<'js>,
+            #set_receiver: &rquickjs::class::JsCell<'js, Self>, ctx: &Ctx<'js>, atom: rquickjs::Atom<'js>,
+            object: Value<'js>, receiver: Value<'js>, #set_value: Value<'js>,
         ) -> Result<rquickjs::class::ExoticSetResult> {
             let Some(name) = crate::js::bindings::atom_name(ctx, &atom) else {
                 return Ok(rquickjs::class::ExoticSetResult::Fallthrough);
             };
+            #indexed_set
             #set
             Ok(crate::js::bindings::reject_indexed_write(&name, &object, &receiver))
         }
@@ -483,6 +632,9 @@ fn getter_dispatch(id: usize, getter: &Attribute) -> TokenStream {
             },
             ReturnType::UnsignedShort => {
                 quote! { let result: u16 = receiver.#method(&ctx)?; result.into_js(&ctx) }
+            }
+            ReturnType::Long => {
+                quote! { let result: i32 = receiver.#method(&ctx)?; result.into_js(&ctx) }
             }
             ReturnType::UnsignedLong => quote! {
                 let result = receiver.#method(&ctx)?;
@@ -549,7 +701,23 @@ fn setter_dispatch((index, attribute): (usize, &Attribute)) -> Option<TokenStrea
             ReturnType::NullableString => quote! { host::nullable_string_argument(params, 0)? },
             // https://webidl.spec.whatwg.org/#es-boolean
             ReturnType::Boolean => quote! { host::boolean_argument(params, 0)? },
-            _ => unreachable!("validated string or boolean setter"),
+            // https://webidl.spec.whatwg.org/#es-unsigned-long
+            ReturnType::UnsignedLong => quote! {
+                {
+                    let value = params.arg(0).unwrap_or_else(|| Value::new_undefined(ctx.clone()));
+                    let converted: rquickjs::Coerced<i32> = rquickjs::FromJs::from_js(&ctx, value)?;
+                    converted.0.cast_unsigned()
+                }
+            },
+            // https://webidl.spec.whatwg.org/#es-long
+            ReturnType::Long => quote! {
+                {
+                    let value = params.arg(0).unwrap_or_else(|| Value::new_undefined(ctx.clone()));
+                    let converted: rquickjs::Coerced<i32> = rquickjs::FromJs::from_js(&ctx, value)?;
+                    converted.0
+                }
+            },
+            _ => unreachable!("validated string, boolean, or integer setter"),
         }
     };
     let body = quote! {
@@ -625,6 +793,10 @@ fn operation_dispatch(id: usize, operation: &Operation) -> TokenStream {
         },
         OperationResult::UnsignedShort => quote! {
             let result: u16 = #call?;
+            rquickjs::IntoJs::into_js(result, &ctx)
+        },
+        OperationResult::Long => quote! {
+            let result: i32 = #call?;
             rquickjs::IntoJs::into_js(result, &ctx)
         },
     };
@@ -763,16 +935,9 @@ fn operation_argument_at(
             }
         }
         ReturnType::Boolean => boolean_argument(argument, variable, &fetch),
-        ReturnType::UnsignedLong => quote! {
-            #fetch
-            // https://webidl.spec.whatwg.org/#es-unsigned-long
-            let converted: rquickjs::Coerced<i32> = rquickjs::FromJs::from_js(&ctx, value)?;
-            let #variable = converted.0.cast_unsigned();
-        },
-        ReturnType::Value => quote! {
-            #fetch
-            let #variable = value;
-        },
+        ReturnType::UnsignedLong => unsigned_long_argument(variable, &fetch),
+        ReturnType::Long => long_argument(variable, &fetch),
+        ReturnType::Value => value_argument(index, argument, variable, &fetch),
         ReturnType::Double => quote! {
             #fetch
             // https://webidl.spec.whatwg.org/#es-double
@@ -780,6 +945,48 @@ fn operation_argument_at(
             let #variable = converted.0;
         },
         _ => unreachable!("validated operation argument"),
+    }
+}
+
+fn unsigned_long_argument(variable: &proc_macro2::Ident, fetch: &TokenStream) -> TokenStream {
+    quote! {
+        #fetch
+        // https://webidl.spec.whatwg.org/#es-unsigned-long
+        let converted: rquickjs::Coerced<i32> = rquickjs::FromJs::from_js(&ctx, value)?;
+        let #variable = converted.0.cast_unsigned();
+    }
+}
+
+fn long_argument(variable: &proc_macro2::Ident, fetch: &TokenStream) -> TokenStream {
+    quote! {
+        #fetch
+        // https://webidl.spec.whatwg.org/#es-long
+        let converted: rquickjs::Coerced<i32> = rquickjs::FromJs::from_js(&ctx, value)?;
+        let #variable = converted.0;
+    }
+}
+
+fn value_argument(
+    index: &TokenStream,
+    argument: &OperationArgument,
+    variable: &proc_macro2::Ident,
+    fetch: &TokenStream,
+) -> TokenStream {
+    if argument.null_default {
+        quote! {
+            let value = params.arg(#index).unwrap_or_else(|| Value::new_null(ctx.clone()));
+            let value = if value.is_undefined() {
+                Value::new_null(ctx.clone())
+            } else {
+                value
+            };
+            let #variable = value;
+        }
+    } else {
+        quote! {
+            #fetch
+            let #variable = value;
+        }
     }
 }
 

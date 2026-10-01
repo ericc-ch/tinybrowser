@@ -1,13 +1,12 @@
 //! Live node collections (`NodeList`, `HTMLCollection`).
 
 use super::{
-    WebIdlUnsignedLong, collection_ids, host_node_id, install_collections_js, live_collection,
-    world, wrap_node,
+    collection_ids, install_collections_js, live_collection, world, wrap_node,
 };
 
 use rquickjs::{
-    Atom, Ctx, Exception, Function, Object, Persistent, Result, Value,
-    class::{ExoticDefineResult, ExoticSetResult, PropertyDescriptor, PropertyName, Trace},
+    Atom, Ctx, Exception, Object, Result, Value,
+    class::{ExoticSetResult, Trace},
     prelude::Func,
 };
 
@@ -98,41 +97,6 @@ pub(super) fn atom_name<'js>(ctx: &Ctx<'js>, atom: &Atom<'js>) -> Option<String>
         return Some(name);
     }
     None
-}
-
-fn indexed_descriptor<'js>(
-    ctx: &Ctx<'js>,
-    query: &CollectionQuery,
-    name: &str,
-    writable: bool,
-) -> Result<Option<PropertyDescriptor<'js>>> {
-    let Some(index) = array_index(name) else {
-        return Ok(None);
-    };
-    let Some(id) = query.ids(ctx)?.get(index as usize).copied() else {
-        return Ok(None);
-    };
-    Ok(Some(PropertyDescriptor::new_value(
-        wrap_node(ctx, id)?,
-        true,
-        true,
-        writable,
-    )))
-}
-
-fn indexed_names<'js>(ctx: &Ctx<'js>, len: usize) -> Result<Vec<PropertyName<'js>>> {
-    (0..len)
-        .map(|index| {
-            Ok(PropertyName {
-                atom: Atom::from_u32(
-                    ctx.clone(),
-                    u32::try_from(index)
-                        .map_err(|_| Exception::throw_range(ctx, "collection index too large"))?,
-                )?,
-                is_enumerable: true,
-            })
-        })
-        .collect()
 }
 
 pub(super) fn reject_indexed_write<'js>(
@@ -235,198 +199,481 @@ impl JsHtmlCollection {
 }
 
 #[derive(Trace, rquickjs::JsLifetime)]
-#[rquickjs::class(rename = "HTMLOptionsCollection", exotic)]
 pub(crate) struct JsOptionsCollection {
     pub(crate) query: CollectionQuery,
 }
 
-#[rquickjs::methods]
+include!(concat!(env!("OUT_DIR"), "/HTMLOptionsCollection.rs"));
+
 #[expect(
     clippy::needless_pass_by_value,
-    reason = "rquickjs constructor ABI passes Ctx by value"
+    reason = "generated operation dispatch passes Ctx by value"
 )]
 impl JsOptionsCollection {
-    #[qjs(constructor)]
-    fn ctor(ctx: Ctx<'_>) -> Result<Self> {
-        Err(Exception::throw_type(&ctx, "Illegal constructor"))
-    }
-
-    // No native `length`: the install script defines a custom accessor with a
-    // truncating/expanding setter, which would conflict with a non-configurable
-    // native own property. `item` stays native.
-    #[qjs(rename = "item")]
-    fn native_item<'js>(&self, ctx: Ctx<'js>, index: WebIdlUnsignedLong) -> Result<Value<'js>> {
-        self.query.item(&ctx, index.0 as usize)
-    }
-
-    #[qjs(skip)]
-    fn item<'js>(&self, ctx: Ctx<'js>, index: u32) -> Result<Value<'js>> {
-        self.query.item(&ctx, index as usize)
-    }
-
-    #[qjs(skip)]
+    // https://dom.spec.whatwg.org/#dom-htmlcollection-length
     fn length(&self, ctx: &Ctx<'_>) -> Result<usize> {
         self.query.ids(ctx).map(|ids| ids.len())
     }
 
-    #[qjs(skip)]
+    // https://html.spec.whatwg.org/multipage/common-dom-interfaces.html#dom-htmloptionscollection-length
+    fn set_length(&self, ctx: &Ctx<'_>, value: u32) -> Result<()> {
+        let select = self.query.scope.0;
+        let registry = super::realm_registry(ctx)?;
+        let Some(owner) = registry.borrow().owner_world(select) else {
+            return Ok(());
+        };
+        let length = value as usize;
+        let owner = owner.borrow();
+        let Some(mut parsed) = owner.document_mut(select) else {
+            return Ok(());
+        };
+        let current = dom::form::select_options(&parsed.document, select).len();
+        if length == current {
+            return Ok(());
+        }
+        if length > current {
+            if length > 100_000 {
+                return Ok(());
+            }
+            drop(parsed);
+            drop(owner);
+            let owner = registry.borrow().owner_world(select).ok_or_else(|| {
+                Exception::throw_internal(ctx, "missing JS world")
+            })?;
+            owner.borrow().document_mut(select).map_or(Ok(()), |mut parsed| {
+                dom::form::append_blank_options(&mut parsed.document, select, length - current)
+                    .map_err(|_| Exception::throw_type(ctx, "not a select"))
+            })?;
+            super::mutation::schedule_mutation_delivery(ctx)?;
+            return Ok(());
+        }
+        let options = dom::form::select_options(&parsed.document, select);
+        let removed: Vec<dom::NodeId> = options[length..].to_vec();
+        for option in removed {
+            dom::mutation::detach(&mut parsed.document, option)
+                .map_err(|err| super::throw_dom_error(ctx, err))?;
+        }
+        drop(parsed);
+        drop(owner);
+        super::mutation::schedule_mutation_delivery(ctx)?;
+        Ok(())
+    }
+
+    // https://dom.spec.whatwg.org/#dom-htmlcollection-item
+    fn item<'js>(&self, ctx: Ctx<'js>, index: u32) -> Result<Value<'js>> {
+        self.query.item(&ctx, index as usize)
+    }
+
     fn named_item<'js>(&self, ctx: Ctx<'js>, name: rquickjs::String<'js>) -> Result<Value<'js>> {
         named_item(&ctx, &self.query, &name.to_string()?)
     }
+
+    fn supported_names(&self, ctx: &Ctx<'_>) -> Result<Vec<String>> {
+        named_keys(ctx, &self.query.ids(ctx)?)
+    }
+
+    // https://html.spec.whatwg.org/multipage/common-dom-interfaces.html#htmloptionscollection-set-indexed
+    fn set_indexed<'js>(&self, ctx: Ctx<'js>, index: u32, value: Value<'js>) -> Result<()> {
+        let select = self.query.scope.0;
+        if value.is_null() || value.is_undefined() {
+            let index = i32::try_from(index).unwrap_or(i32::MAX);
+            return self.remove_option(&ctx, index);
+        }
+        let option = require_option_element(&ctx, &value)?;
+        let index_usize = index as usize;
+        let registry = super::realm_registry(&ctx)?;
+        let Some(owner) = registry.borrow().owner_world(select) else {
+            return Ok(());
+        };
+        let current = {
+            let owner = owner.borrow();
+            let Some(parsed) = owner.document(select) else {
+                return Ok(());
+            };
+            dom::form::select_options(&parsed.document, select).len()
+        };
+        if index_usize > current && index_usize >= 100_000 {
+            return Ok(());
+        }
+        if index_usize < current {
+            return replace_collection_option(&ctx, select, index_usize, option);
+        }
+        if index_usize > current {
+            grow_collection_options(&ctx, select, index_usize - current)?;
+        }
+        append_collection_option(&ctx, select, option)
+    }
+
+    // https://html.spec.whatwg.org/multipage/common-dom-interfaces.html#dom-htmloptionscollection-add
+    fn add<'js>(&self, ctx: Ctx<'js>, element: Value<'js>, before: Value<'js>) -> Result<()> {
+        let select = self.query.scope.0;
+        let element = require_option_group(&ctx, &element)?;
+        if let Some(before_id) = super::host_node_id(&ctx, &before)
+            && before_id == element
+        {
+            return Ok(());
+        }
+        if before.is_null() || before.is_undefined() {
+            return append_add_element(&ctx, select, element);
+        }
+        if super::host_node_id(&ctx, &before).is_some() {
+            return insert_before_element(&ctx, select, element, &before);
+        }
+        insert_before_index(&ctx, select, element, before)
+    }
+
+    // https://html.spec.whatwg.org/multipage/common-dom-interfaces.html#dom-htmloptionscollection-remove
+    fn remove(&self, ctx: Ctx<'_>, index: i32) -> Result<()> {
+        self.remove_option(&ctx, index)
+    }
+
+    fn remove_option(&self, ctx: &Ctx<'_>, index: i32) -> Result<()> {
+        let select = self.query.scope.0;
+        let Ok(index) = usize::try_from(index) else {
+            return Ok(());
+        };
+        let registry = super::realm_registry(ctx)?;
+        let Some(owner) = registry.borrow().owner_world(select) else {
+            return Ok(());
+        };
+        let target = {
+            let owner = owner.borrow();
+            let Some(parsed) = owner.document(select) else {
+                return Ok(());
+            };
+            dom::form::select_options(&parsed.document, select)
+                .get(index)
+                .copied()
+        };
+        let Some(target) = target else {
+            return Ok(());
+        };
+        let owner = registry.borrow().owner_world(select).ok_or_else(|| {
+            Exception::throw_internal(ctx, "missing JS world")
+        })?;
+        let owner = owner.borrow();
+        let Some(mut parsed) = owner.document_mut(select) else {
+            return Ok(());
+        };
+        dom::mutation::detach(&mut parsed.document, target)
+            .map_err(|err| super::throw_dom_error(ctx, err))?;
+        drop(parsed);
+        drop(owner);
+        super::mutation::schedule_mutation_delivery(ctx)?;
+        Ok(())
+    }
+
+    // https://html.spec.whatwg.org/multipage/form-elements.html#dom-select-selectedindex
+    fn selected_index(&self, ctx: &Ctx<'_>) -> Result<i32> {
+        let select = self.query.scope.0;
+        let registry = super::realm_registry(ctx)?;
+        let Some(owner) = registry.borrow().owner_world(select) else {
+            return Ok(-1);
+        };
+        let owner = owner.borrow();
+        Ok(owner.document(select).map_or(-1, |parsed| {
+            dom::form::select_selected_index(&parsed.document, select)
+        }))
+    }
+
+    fn set_selected_index(&self, ctx: &Ctx<'_>, value: i32) -> Result<()> {
+        let select = self.query.scope.0;
+        let registry = super::realm_registry(ctx)?;
+        let Some(owner) = registry.borrow().owner_world(select) else {
+            return Ok(());
+        };
+        let owner = owner.borrow();
+        let Some(mut parsed) = owner.document_mut(select) else {
+            return Ok(());
+        };
+        dom::form::set_select_selected_index(&mut parsed.document, select, value);
+        Ok(())
+    }
 }
 
-fn option_setter<'js>(ctx: &Ctx<'js>) -> Result<Function<'js>> {
-    let world = world(ctx)?;
-    let setter = world.borrow().option_setter.clone();
-    match setter {
-        Some(setter) => setter.restore(ctx),
-        None => Err(Exception::throw_type(ctx, "options setter not installed")),
+fn require_option_element<'js>(ctx: &Ctx<'js>, value: &Value<'js>) -> Result<dom::NodeId> {
+    let Some(option) = super::host_node_id(ctx, value) else {
+        return Err(Exception::throw_type(ctx, "option must be an HTMLOptionElement"));
+    };
+    let registry = super::realm_registry(ctx)?;
+    let Some(owner) = registry.borrow().owner_world(option) else {
+        return Err(Exception::throw_type(ctx, "option must be an HTMLOptionElement"));
+    };
+    let owner = owner.borrow();
+    let Some(parsed) = owner.document(option) else {
+        return Err(Exception::throw_type(ctx, "option must be an HTMLOptionElement"));
+    };
+    let is_option = matches!(
+        parsed.document.kind(option),
+        Some(NodeKind::Element { name, .. }) if name.ns == html_namespace() && name.local.as_ref() == "option"
+    );
+    if is_option {
+        Ok(option)
+    } else {
+        Err(Exception::throw_type(ctx, "option must be an HTMLOptionElement"))
     }
 }
 
-#[rquickjs::exotic]
-#[expect(
-    clippy::needless_pass_by_value,
-    reason = "rquickjs exotic callback ABI passes owned arguments"
-)]
-impl JsOptionsCollection {
-    #[qjs(define_own_property)]
-    fn define<'js>(
-        &self,
-        ctx: &Ctx<'js>,
-        atom: Atom<'js>,
-        value: Value<'js>,
-        is_data: bool,
-    ) -> Result<ExoticDefineResult> {
-        // https://webidl.spec.whatwg.org/#legacy-platform-object-defineownproperty
-        let Some(name) = atom_name(ctx, &atom) else {
-            return Ok(ExoticDefineResult::Fallthrough);
+fn require_option_group<'js>(ctx: &Ctx<'js>, value: &Value<'js>) -> Result<dom::NodeId> {
+    let Some(element) = super::host_node_id(ctx, value) else {
+        return Err(Exception::throw_type(ctx, "add requires an option or optgroup element"));
+    };
+    let registry = super::realm_registry(ctx)?;
+    let Some(owner) = registry.borrow().owner_world(element) else {
+        return Err(Exception::throw_type(ctx, "add requires an option or optgroup element"));
+    };
+    let owner = owner.borrow();
+    let Some(parsed) = owner.document(element) else {
+        return Err(Exception::throw_type(ctx, "add requires an option or optgroup element"));
+    };
+    let is_option_group = matches!(
+        parsed.document.kind(element),
+        Some(NodeKind::Element { name, .. }) if name.ns == html_namespace()
+            && matches!(name.local.as_ref(), "option" | "optgroup")
+    );
+    if is_option_group {
+        Ok(element)
+    } else {
+        Err(Exception::throw_type(ctx, "add requires an option or optgroup element"))
+    }
+}
+
+fn append_add_element(ctx: &Ctx<'_>, select: dom::NodeId, element: dom::NodeId) -> Result<()> {
+    let adopted = super::clone::adopt_across_documents(ctx, select, element)?;
+    let registry = super::realm_registry(ctx)?;
+    let Some(owner) = registry.borrow().owner_world(select) else {
+        return Ok(());
+    };
+    let owner = owner.borrow();
+    let Some(mut parsed) = owner.document_mut(select) else {
+        return Ok(());
+    };
+    // https://html.spec.whatwg.org/multipage/form-elements.html#dom-select-add
+    if parsed.document.parent(element) == Some(select) {
+        return Ok(());
+    }
+    dom::mutation::append(&mut parsed.document, select, adopted)
+        .map_err(|err| super::throw_dom_error(ctx, err))?;
+    drop(parsed);
+    drop(owner);
+    super::mutation::schedule_mutation_delivery(ctx)?;
+    Ok(())
+}
+
+fn insert_before_element<'js>(
+    ctx: &Ctx<'js>,
+    select: dom::NodeId,
+    element: dom::NodeId,
+    before: &Value<'js>,
+) -> Result<()> {
+    let Some(before_id) = super::host_node_id(ctx, before) else {
+        return Ok(());
+    };
+    let registry = super::realm_registry(ctx)?;
+    let Some(select_owner) = registry.borrow().owner_world(select) else {
+        return Ok(());
+    };
+    if !is_select_descendant(&select_owner, select, before_id) {
+        return Err(super::throw_dom(
+            ctx,
+            "NotFoundError",
+            "reference is not a child of this select",
+        ));
+    }
+    if before_id == select {
+        return Err(super::throw_dom(
+            ctx,
+            "NotFoundError",
+            "reference is not a child of this select",
+        ));
+    }
+    let parent = {
+        let select_owner = select_owner.borrow();
+        let Some(parsed) = select_owner.document(select) else {
+            return Ok(());
         };
-        if let Some(index) = array_index(&name) {
-            if !is_data {
-                return Ok(ExoticDefineResult::Handled(false));
-            }
-            let select = wrap_node(ctx, self.query.scope.0)?;
-            option_setter(ctx)?.call::<_, ()>((select, index, value))?;
-            return Ok(ExoticDefineResult::Handled(true));
+        parsed.document.parent(before_id)
+    };
+    let Some(parent) = parent else {
+        return Err(super::throw_dom(
+            ctx,
+            "NotFoundError",
+            "reference is not a child of this select",
+        ));
+    };
+    let adopted = super::clone::adopt_across_documents(ctx, parent, element)?;
+    let Some(owner) = registry.borrow().owner_world(select) else {
+        return Ok(());
+    };
+    let owner = owner.borrow();
+    let Some(mut parsed) = owner.document_mut(select) else {
+        return Ok(());
+    };
+    dom::mutation::insert_before(&mut parsed.document, before_id, adopted)
+        .map_err(|err| super::throw_dom_error(ctx, err))?;
+    drop(parsed);
+    drop(owner);
+    super::mutation::schedule_mutation_delivery(ctx)?;
+    Ok(())
+}
+
+fn insert_before_index<'js>(ctx: &Ctx<'js>, select: dom::NodeId, element: dom::NodeId, before: Value<'js>) -> Result<()> {
+    let converted: rquickjs::Coerced<i32> = rquickjs::FromJs::from_js(ctx, before)?;
+    let reference = select_option_at(ctx, select, converted.0)?;
+    let Some(reference) = reference else {
+        return append_add_element(ctx, select, element);
+    };
+    let parent = {
+        let registry = super::realm_registry(ctx)?;
+        let Some(owner) = registry.borrow().owner_world(select) else {
+            return Ok(());
+        };
+        let owner = owner.borrow();
+        let Some(parsed) = owner.document(select) else {
+            return Ok(());
+        };
+        parsed.document.parent(reference)
+    };
+    let Some(parent) = parent else {
+        return Ok(());
+    };
+    let adopted = super::clone::adopt_across_documents(ctx, parent, element)?;
+    let registry = super::realm_registry(ctx)?;
+    let Some(owner) = registry.borrow().owner_world(select) else {
+        return Ok(());
+    };
+    let owner = owner.borrow();
+    let Some(mut parsed) = owner.document_mut(select) else {
+        return Ok(());
+    };
+    dom::mutation::insert_before(&mut parsed.document, reference, adopted)
+        .map_err(|err| super::throw_dom_error(ctx, err))?;
+    drop(parsed);
+    drop(owner);
+    super::mutation::schedule_mutation_delivery(ctx)?;
+    Ok(())
+}
+
+fn select_option_at(ctx: &Ctx<'_>, select: dom::NodeId, before_index: i32) -> Result<Option<dom::NodeId>> {
+    let registry = super::realm_registry(ctx)?;
+    let Some(owner) = registry.borrow().owner_world(select) else {
+        return Ok(None);
+    };
+    let owner = owner.borrow();
+    let Some(parsed) = owner.document(select) else {
+        return Ok(None);
+    };
+    let options = dom::form::select_options(&parsed.document, select);
+    if before_index < 0 {
+        return Ok(None);
+    }
+    let Ok(index) = usize::try_from(before_index) else {
+        return Ok(None);
+    };
+    Ok(options.get(index).copied())
+}
+
+fn is_select_descendant(
+    select_owner: &std::rc::Rc<std::cell::RefCell<crate::js::world::World>>,
+    select: dom::NodeId,
+    descendant: dom::NodeId,
+) -> bool {
+    let select_owner = select_owner.borrow();
+    let Some(parsed) = select_owner.document(select) else {
+        return false;
+    };
+    let mut current = Some(descendant);
+    while let Some(id) = current {
+        if id == select {
+            return true;
         }
-        // `[LegacyOverrideBuiltIns]`: named properties override built-ins, so
-        // no prototype-visibility check here.
-        // (<https://html.spec.whatwg.org/multipage/common-dom-interfaces.html#htmloptionscollection>)
-        Ok(if named_keys(ctx, &self.query.ids(ctx)?)?.contains(&name) {
-            ExoticDefineResult::Handled(false)
-        } else {
-            ExoticDefineResult::Fallthrough
-        })
+        current = parsed.document.parent(id);
     }
+    false
+}
 
-    #[qjs(get_own_property)]
-    fn own_property<'js>(
-        &self,
-        ctx: &Ctx<'js>,
-        atom: Atom<'js>,
-        object: Value<'js>,
-    ) -> Result<Option<PropertyDescriptor<'js>>> {
-        // https://webidl.spec.whatwg.org/#legacy-platform-object-getownproperty
-        let Some(name) = atom_name(ctx, &atom) else {
-            return Ok(None);
+fn replace_collection_option(
+    ctx: &Ctx<'_>,
+    select: dom::NodeId,
+    index: usize,
+    option: dom::NodeId,
+) -> Result<()> {
+    let registry = super::realm_registry(ctx)?;
+    let (existing, parent) = {
+        let Some(owner) = registry.borrow().owner_world(select) else {
+            return Ok(());
         };
-        collection_descriptor(ctx, &self.query, &name, &object, true)
-    }
+        let owner = owner.borrow();
+        let Some(parsed) = owner.document(select) else {
+            return Ok(());
+        };
+        let options = dom::form::select_options(&parsed.document, select);
+        let Some(&existing) = options.get(index) else {
+            return Ok(());
+        };
+        (existing, parsed.document.parent(existing))
+    };
+    let Some(parent) = parent else {
+        return Ok(());
+    };
+    let adopted = super::clone::adopt_across_documents(ctx, parent, option)?;
+    let Some(owner) = registry.borrow().owner_world(select) else {
+        return Ok(());
+    };
+    let owner = owner.borrow();
+    let Some(mut parsed) = owner.document_mut(select) else {
+        return Ok(());
+    };
+    dom::mutation::replace_child(&mut parsed.document, parent, adopted, existing)
+        .map_err(|err| super::throw_dom_error(ctx, err))?;
+    drop(parsed);
+    drop(owner);
+    super::mutation::schedule_mutation_delivery(ctx)?;
+    Ok(())
+}
 
-    #[qjs(get_own_property_names)]
-    fn own_names<'js>(&self, ctx: &Ctx<'js>, object: Value<'js>) -> Result<Vec<PropertyName<'js>>> {
-        collection_names(ctx, &self.query, &object, true)
-    }
+fn grow_collection_options(ctx: &Ctx<'_>, select: dom::NodeId, delta: usize) -> Result<()> {
+    let registry = super::realm_registry(ctx)?;
+    let Some(owner) = registry.borrow().owner_world(select) else {
+        return Ok(());
+    };
+    let owner = owner.borrow();
+    let Some(mut parsed) = owner.document_mut(select) else {
+        return Ok(());
+    };
+    dom::form::append_blank_options(&mut parsed.document, select, delta)
+        .map_err(|_| Exception::throw_type(ctx, "not a select"))?;
+    drop(parsed);
+    drop(owner);
+    super::mutation::schedule_mutation_delivery(ctx)?;
+    Ok(())
+}
 
-    #[qjs(set)]
-    fn set<'js>(
-        &self,
-        ctx: &Ctx<'js>,
-        atom: Atom<'js>,
-        object: Value<'js>,
-        receiver: Value<'js>,
-        value: Value<'js>,
-    ) -> Result<ExoticSetResult> {
-        // https://webidl.spec.whatwg.org/#legacy-platform-object-set
-        let Some(name) = atom_name(ctx, &atom) else {
-            return Ok(ExoticSetResult::Fallthrough);
-        };
-        if object != receiver {
-            return Ok(if array_index(&name).is_some() {
-                ExoticSetResult::Fallthrough
-            } else {
-                ExoticSetResult::FallthroughSkippingOwnProperty
-            });
-        }
-        let Some(index) = array_index(&name) else {
-            return Ok(ExoticSetResult::Fallthrough);
-        };
-        let select = wrap_node(ctx, self.query.scope.0)?;
-        option_setter(ctx)?.call::<_, ()>((select, index, value))?;
-        Ok(ExoticSetResult::Handled(true))
-    }
-
-    #[qjs(delete)]
-    fn delete<'js>(&self, ctx: &Ctx<'js>, atom: Atom<'js>, object: Value<'js>) -> Result<bool> {
-        // https://webidl.spec.whatwg.org/#legacy-platform-object-delete
-        let Some(name) = atom_name(ctx, &atom) else {
-            return Ok(true);
-        };
-        collection_delete(ctx, &self.query, &name, &object)
-    }
+fn append_collection_option(ctx: &Ctx<'_>, select: dom::NodeId, option: dom::NodeId) -> Result<()> {
+    let adopted = super::clone::adopt_across_documents(ctx, select, option)?;
+    let registry = super::realm_registry(ctx)?;
+    let Some(owner) = registry.borrow().owner_world(select) else {
+        return Ok(());
+    };
+    let owner = owner.borrow();
+    let Some(mut parsed) = owner.document_mut(select) else {
+        return Ok(());
+    };
+    dom::mutation::append(&mut parsed.document, select, adopted)
+        .map_err(|err| super::throw_dom_error(ctx, err))?;
+    drop(parsed);
+    drop(owner);
+    super::mutation::schedule_mutation_delivery(ctx)?;
+    Ok(())
 }
 
 pub(crate) fn install_collection_brand(ctx: &Ctx<'_>) -> Result<()> {
-    ctx.globals()
-        .set("__tbIsOptionNode", Func::from(is_option_node))?;
-    ctx.globals()
-        .set("__tbAppendBlankOptions", Func::from(append_blank_options))?;
     ctx.globals()
         .set("__tbWindowNamedValue", Func::from(window_named_value))?;
     ctx.globals()
         .set("__tbWindowNamedHas", Func::from(window_named_has))?;
     ctx.eval::<(), _>(install_collections_js(ctx)?)?;
-    // Capture the options indexed-write entry point, then remove it from the
-    // page-visible global so `__tbSetOption` is not fingerprintable.
-    let setter: Function = ctx.globals().get("__tbSetOption")?;
-    world(ctx)?.borrow_mut().option_setter = Some(Persistent::save(ctx, setter));
-    ctx.globals().remove("__tbSetOption")?;
     Ok(())
-}
-
-#[expect(
-    clippy::needless_pass_by_value,
-    reason = "rquickjs Func ABI passes arguments by value"
-)]
-fn is_option_node<'js>(ctx: Ctx<'js>, value: Value<'js>) -> Result<bool> {
-    let Some(id) = host_node_id(&ctx, &value) else {
-        return Ok(false);
-    };
-    let world = world(&ctx)?;
-    let world = world.borrow();
-    Ok(world.document(id).is_some_and(|parsed| {
-        matches!(parsed.document.kind(id), Some(NodeKind::Element { name, .. })
-            if name.ns == html_namespace() && name.local.as_ref() == "option")
-    }))
-}
-
-#[expect(
-    clippy::needless_pass_by_value,
-    reason = "rquickjs Func ABI passes arguments by value"
-)]
-fn append_blank_options<'js>(ctx: Ctx<'js>, select: Value<'js>, count: u32) -> Result<()> {
-    let Some(id) = host_node_id(&ctx, &select) else {
-        return Err(Exception::throw_type(&ctx, "not a select"));
-    };
-    let count = usize::try_from(count).map_err(|_| Exception::throw_type(&ctx, "invalid count"))?;
-    let world = world(&ctx)?;
-    let world = world.borrow();
-    let Some(mut parsed) = world.document_mut(id) else {
-        return Err(Exception::throw_type(&ctx, "no document"));
-    };
-    dom::form::append_blank_options(&mut parsed.document, id, count)
-        .map_err(|_| Exception::throw_type(&ctx, "not a select"))
 }
 
 /// Determines the value of a Window named property: the single named element,
@@ -572,74 +819,4 @@ pub(super) fn named_key_visible(object: &Value<'_>, name: &str) -> Result<bool> 
         prototype = current.get_prototype();
     }
     Ok(true)
-}
-
-fn collection_descriptor<'js>(
-    ctx: &Ctx<'js>,
-    query: &CollectionQuery,
-    name: &str,
-    object: &Value<'js>,
-    is_options: bool,
-) -> Result<Option<PropertyDescriptor<'js>>> {
-    if let Some(descriptor) = indexed_descriptor(ctx, query, name, is_options)? {
-        return Ok(Some(descriptor));
-    }
-    if array_index(name).is_some()
-        || !named_keys(ctx, &query.ids(ctx)?)?.iter().any(|key| key == name)
-        // `HTMLOptionsCollection` is `[LegacyOverrideBuiltIns]`: named
-        // properties override built-ins, so no visibility check.
-        // (<https://html.spec.whatwg.org/multipage/common-dom-interfaces.html#htmloptionscollection>)
-        // `HTMLCollection` keeps `[LegacyUnenumerableNamedProperties]` hiding.
-        || (!is_options && !named_key_visible(object, name)?)
-    {
-        return Ok(None);
-    }
-    let value = named_item(ctx, query, name)?;
-    Ok(Some(PropertyDescriptor::new_value(
-        value, true, is_options, false,
-    )))
-}
-
-fn collection_names<'js>(
-    ctx: &Ctx<'js>,
-    query: &CollectionQuery,
-    object: &Value<'js>,
-    is_options: bool,
-) -> Result<Vec<PropertyName<'js>>> {
-    let ids = query.ids(ctx)?;
-    let mut names = indexed_names(ctx, ids.len())?;
-    for name in named_keys(ctx, &ids)? {
-        if array_index(&name).is_none() && (is_options || named_key_visible(object, &name)?) {
-            names.push(PropertyName {
-                atom: Atom::from_str(ctx.clone(), &name)?,
-                is_enumerable: is_options,
-            });
-        }
-    }
-    Ok(names)
-}
-
-fn collection_delete(
-    ctx: &Ctx<'_>,
-    query: &CollectionQuery,
-    name: &str,
-    object: &Value<'_>,
-) -> Result<bool> {
-    if let Some(index) = array_index(name) {
-        return Ok(index as usize >= query.ids(ctx)?.len());
-    }
-    // Options named properties override built-ins, so visibility only gates
-    // plain `HTMLCollection`.
-    let visible = query_ids_are_options(query) || named_key_visible(object, name).unwrap_or(true);
-    Ok(!named_keys(ctx, &query.ids(ctx)?)?
-        .iter()
-        .any(|key| key == name)
-        || !visible)
-}
-
-fn query_ids_are_options(query: &CollectionQuery) -> bool {
-    matches!(
-        query.kind,
-        CollectionKind::SelectOptions | CollectionKind::SelectedOptions
-    )
 }
