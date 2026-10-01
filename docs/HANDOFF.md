@@ -19,8 +19,17 @@ methods marked `#[qjs(skip)]`.
   `sys/quickjs`). Upstream pulls happen inside the submodule, then the pointer is
   bumped here. Fresh worktrees need
   `git submodule update --init --recursive`.
-- Shipping binary is 8,754,040 bytes (`docs/progress.md`). Verify with
+- Shipping binary is 8,670,008 bytes (`docs/progress.md`). Verify with
   `nix develop --command ./tools/release`.
+- Last migration evidence (`/tmp/opencode/`): `before-domcore.json` vs
+  `after-domcore.json` over `dom/nodes`, `dom/collections`, `shadow-dom`,
+  `css/cssom-view`, `html/dom`, `domparsing` gives 749 FAIL-to-PASS, 38
+  MISSING-to-PASS, 1 ERROR-to-OK, and no `PASS`/`OK`-to-worse change; the
+  only `MISSING`/`TIMEOUT` entries are two long files
+  (`shadow-dom/declarative/gethtml.html`, `html/dom/reflection-embedded.html`)
+  that the runner interrupts in both runs. `before-forms.json` vs
+  `after-forms.json` over `html/semantics/forms` gives 2 FAIL-to-PASS and no
+  real regression.
 - Verification harness: `tools/check` (clippy, embedded JS, rustdoc),
   `cargo test --workspace`, the 30-case probe at
   `/tmp/opencode/jsbinding-research/probe.py <binary>`, and before/after WPT via
