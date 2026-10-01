@@ -421,7 +421,6 @@ pub(crate) struct World {
     /// `ctx.globals()`: a page that replaces `String`/`Number`/`Boolean` (or
     /// deletes `queueMicrotask`) must not change conversion behavior, which
     /// follows the realm's original intrinsics.
-    pub(crate) pristine_string: Option<Persistent<Function<'static>>>,
     pub(crate) pristine_number: Option<Persistent<Function<'static>>>,
     pub(crate) pristine_boolean: Option<Persistent<Function<'static>>>,
     pub(crate) pristine_reflect_set: Option<Persistent<Function<'static>>>,
@@ -524,7 +523,6 @@ impl World {
             cleared_handlers: HashSet::new(),
             remote_ids: HashMap::new(),
             remote_nodes: HashMap::new(),
-            pristine_string: None,
             pristine_number: None,
             pristine_boolean: None,
             pristine_reflect_set: None,
@@ -1435,7 +1433,6 @@ impl World {
             .borrow_mut()
             .reactions
             .forget_frame(self.frame);
-        self.pristine_string = None;
         self.pristine_number = None;
         self.pristine_boolean = None;
         self.pristine_reflect_set = None;

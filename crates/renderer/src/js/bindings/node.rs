@@ -1,8 +1,8 @@
 //! The single `Node` wrapper class and its members.
 
 use super::{
-    CollectionKind, FromJs, ImportSnapshot, JsAttr, JsImplementation, JsNamedNodeMap, JsTokenList,
-    LegacyNullString, NodeContext, OptString, Trace, WebIdlCodeUnits, WebIdlString,
+    AttrArgument, CollectionKind, FromJs, ImportSnapshot, JsImplementation, JsNamedNodeMap,
+    JsTokenList, LegacyNullString, NodeContext, OptString, Trace, WebIdlCodeUnits, WebIdlString,
     WebIdlUnsignedLong, adopt_across_documents, after_attribute_change, ancestor_chain,
     attached_attr_id, attr_owner, attr_state, attr_wrapper, attribute_local_name, attribute_value,
     blur_node, character_data, character_data_offset, child_value, clone_document,
@@ -54,8 +54,6 @@ pub(super) fn install(ctx: &Ctx<'_>) -> Result<()> {
     document_type_generated::install(ctx)?;
     processing_instruction_generated::install(ctx)
 }
-
-type AttrArgument<'js> = Class<'js, JsAttr<'js>>;
 
 fn insertion_tree_nodes(
     ctx: &Ctx<'_>,
@@ -3153,8 +3151,8 @@ impl JsNode {
         {
             return Ok(value);
         }
-        let class = Class::instance(
-            ctx.clone(),
+        let class = super::host::instance(
+            ctx,
             JsTokenList {
                 element: self.handle,
             },
@@ -3336,8 +3334,8 @@ impl JsNode {
             refresh_named_node_map(ctx, self.handle.0, &value)?;
             return Ok(value);
         }
-        let class = Class::instance(
-            ctx.clone(),
+        let class = super::host::instance(
+            ctx,
             JsNamedNodeMap {
                 element: self.handle,
             },

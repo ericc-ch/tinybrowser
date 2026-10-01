@@ -528,7 +528,6 @@ fn capture_host_primitives<'js>(
     globals: &Object<'js>,
     world: &Rc<RefCell<World>>,
 ) -> Result<()> {
-    let string: Function = globals.get("String")?;
     let number: Function = globals.get("Number")?;
     let boolean: Function = globals.get("Boolean")?;
     let reflect: Object = globals.get("Reflect")?;
@@ -544,7 +543,6 @@ fn capture_host_primitives<'js>(
         constructor: Persistent::save(ctx, weak_ref),
         deref: Persistent::save(ctx, weak_ref_deref),
     });
-    world.pristine_string = Some(Persistent::save(ctx, string));
     world.pristine_number = Some(Persistent::save(ctx, number));
     world.pristine_boolean = Some(Persistent::save(ctx, boolean));
     world.pristine_reflect_set = Some(Persistent::save(ctx, reflect_set));

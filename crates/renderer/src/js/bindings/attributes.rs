@@ -5,7 +5,6 @@ use super::{
     make_weak, qualified_name, realm_registry, schedule_mutation_delivery, string_value, throw_dom,
     throw_dom_error, with_node_kind, world, world_for_node, wrap_node,
 };
-use rquickjs::function::{Opt, Rest};
 
 use std::cell::RefCell;
 
@@ -13,10 +12,7 @@ use std::rc::Rc;
 
 use dom::{NodeId, qualified_name_eq};
 
-use rquickjs::{
-    Atom, Class, Ctx, Exception, Function, IntoJs, Persistent, Result, Value,
-    class::{ExoticDefineResult, ExoticSetResult, PropertyDescriptor, PropertyName, Trace},
-};
+use rquickjs::{Class, Ctx, Exception, Function, Persistent, Result, Value, class::Trace};
 
 use crate::js::events::{self, JsEvent, report_exception};
 use crate::js::world::{
@@ -27,48 +23,40 @@ use crate::js::world::{
 /// `DOMTokenList` for `Element.classList`
 /// (<https://dom.spec.whatwg.org/#interface-domtokenlist>).
 #[derive(Trace, rquickjs::JsLifetime)]
-#[rquickjs::class(rename = "DOMTokenList", exotic)]
 pub struct JsTokenList {
     pub(crate) element: Handle,
 }
 
-#[rquickjs::methods]
+include!(concat!(env!("OUT_DIR"), "/DOMTokenList.rs"));
+
 #[allow(
     clippy::needless_pass_by_value,
     clippy::unused_self,
-    reason = "rquickjs method ABI passes Ctx by value; DOMTokenList methods may ignore self"
+    reason = "generated dispatch passes Ctx by value and invokes operations on the receiver"
 )]
 impl JsTokenList {
-    #[qjs(constructor)]
-    fn ctor(ctx: Ctx<'_>) -> Result<Self> {
-        Err(Exception::throw_type(&ctx, "Illegal constructor"))
-    }
-
     // https://dom.spec.whatwg.org/#dom-domtokenlist-length
-    #[qjs(get)]
-    fn length(&self, ctx: Ctx<'_>) -> Result<usize> {
-        Ok(class_tokens(&ctx, self.element.0)?.len())
+    fn length(&self, ctx: &Ctx<'_>) -> Result<usize> {
+        Ok(class_tokens(ctx, self.element.0)?.len())
     }
 
     // https://dom.spec.whatwg.org/#dom-domtokenlist-value
-    #[qjs(get)]
-    fn value(&self, ctx: Ctx<'_>) -> Result<String> {
-        let world = world(&ctx)?;
-        Ok(world
+    fn value<'js>(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
+        let world = world(ctx)?;
+        let value = world
             .borrow()
             .document(self.element.0)
             .and_then(|parsed| parsed.document.attribute(self.element.0, "class"))
-            .unwrap_or_default())
+            .unwrap_or_default();
+        rquickjs::String::from_str(ctx.clone(), &value)
     }
 
-    #[qjs(set, rename = "value")]
-    fn set_value(&self, ctx: Ctx<'_>, value: WebIdlString) -> Result<()> {
-        write_class(&ctx, self.element.0, &value.0)
+    fn set_value(&self, ctx: &Ctx<'_>, value: WebIdlString) -> Result<()> {
+        write_class(ctx, self.element.0, &value.0)
     }
 
     // https://dom.spec.whatwg.org/#dom-domtokenlist-item
-    #[qjs(rename = "item")]
-    fn item<'js>(&self, ctx: Ctx<'js>, index: i64) -> Result<Value<'js>> {
+    fn item<'js>(&self, ctx: Ctx<'js>, index: u32) -> Result<Value<'js>> {
         let tokens = class_tokens(&ctx, self.element.0)?;
         match usize::try_from(index)
             .ok()
@@ -80,7 +68,6 @@ impl JsTokenList {
     }
 
     // https://dom.spec.whatwg.org/#dom-domtokenlist-contains
-    #[qjs(rename = "contains")]
     fn contains(&self, ctx: Ctx<'_>, token: WebIdlString) -> Result<bool> {
         // `contains` does not validate its argument
         // (<https://dom.spec.whatwg.org/#dom-domtokenlist-contains>).
@@ -88,11 +75,12 @@ impl JsTokenList {
     }
 
     // https://dom.spec.whatwg.org/#dom-domtokenlist-add
-    #[qjs(rename = "add")]
-    fn add(&self, ctx: Ctx<'_>, tokens: Rest<WebIdlString>) -> Result<()> {
-        let mut current = class_tokens(&ctx, self.element.0)?;
-        for token in tokens.0 {
+    fn add(&self, ctx: Ctx<'_>, tokens: Vec<WebIdlString>) -> Result<()> {
+        for token in &tokens {
             validate_token(&ctx, &token.0)?;
+        }
+        let mut current = class_tokens(&ctx, self.element.0)?;
+        for token in tokens {
             if !current.contains(&token.0) {
                 current.push(token.0);
             }
@@ -103,23 +91,23 @@ impl JsTokenList {
     }
 
     // https://dom.spec.whatwg.org/#dom-domtokenlist-remove
-    #[qjs(rename = "remove")]
-    fn remove(&self, ctx: Ctx<'_>, tokens: Rest<WebIdlString>) -> Result<()> {
-        let mut current = class_tokens(&ctx, self.element.0)?;
-        for token in tokens.0 {
+    fn remove(&self, ctx: Ctx<'_>, tokens: Vec<WebIdlString>) -> Result<()> {
+        for token in &tokens {
             validate_token(&ctx, &token.0)?;
+        }
+        let mut current = class_tokens(&ctx, self.element.0)?;
+        for token in tokens {
             current.retain(|existing| existing != &token.0);
         }
         write_class_tokens(&ctx, self.element.0, &current)
     }
 
     // https://dom.spec.whatwg.org/#dom-domtokenlist-toggle
-    #[qjs(rename = "toggle")]
-    fn toggle(&self, ctx: Ctx<'_>, token: WebIdlString, force: Opt<bool>) -> Result<bool> {
+    fn toggle(&self, ctx: Ctx<'_>, token: WebIdlString, force: Option<bool>) -> Result<bool> {
         validate_token(&ctx, &token.0)?;
         let mut current = class_tokens(&ctx, self.element.0)?;
         let present = current.contains(&token.0);
-        let should_be_present = force.0.unwrap_or(!present);
+        let should_be_present = force.unwrap_or(!present);
         if should_be_present != present {
             if should_be_present {
                 current.push(token.0);
@@ -132,7 +120,6 @@ impl JsTokenList {
     }
 
     // https://dom.spec.whatwg.org/#dom-domtokenlist-replace
-    #[qjs(rename = "replace")]
     fn replace(&self, ctx: Ctx<'_>, old: WebIdlString, new: WebIdlString) -> Result<bool> {
         validate_token_pair(&ctx, &old.0, &new.0)?;
         let mut current = class_tokens(&ctx, self.element.0)?;
@@ -157,7 +144,6 @@ impl JsTokenList {
     }
 
     // https://dom.spec.whatwg.org/#dom-domtokenlist-supports
-    #[qjs(rename = "supports")]
     fn supports(&self, ctx: Ctx<'_>, _token: WebIdlString) -> Result<bool> {
         // The spec ends with "throw a TypeError"
         // (<https://dom.spec.whatwg.org/#dom-domtokenlist-supports>).
@@ -165,113 +151,6 @@ impl JsTokenList {
             &ctx,
             "DOMTokenList has no supported tokens",
         ))
-    }
-
-    // https://dom.spec.whatwg.org/#interface-domtokenlist: stringifier
-    #[qjs(rename = "toString")]
-    fn to_string_js(&self, ctx: Ctx<'_>) -> Result<String> {
-        self.value(ctx)
-    }
-}
-
-// https://webidl.spec.whatwg.org/#legacy-platform-object-getownproperty
-#[rquickjs::exotic]
-#[expect(
-    clippy::needless_pass_by_value,
-    reason = "rquickjs exotic callback ABI requires owned atoms and values"
-)]
-impl JsTokenList {
-    #[qjs(define_own_property)]
-    #[expect(
-        clippy::unused_self,
-        clippy::unnecessary_wraps,
-        reason = "rquickjs exotic ABI requires self and Result"
-    )]
-    fn define<'js>(
-        &self,
-        ctx: &Ctx<'js>,
-        atom: Atom<'js>,
-        _value: Value<'js>,
-        _is_data: bool,
-    ) -> Result<ExoticDefineResult> {
-        // https://webidl.spec.whatwg.org/#legacy-platform-object-defineownproperty:
-        // any array index is rejected, even past the end.
-        let Some(name) = super::atom_name(ctx, &atom) else {
-            return Ok(ExoticDefineResult::Fallthrough);
-        };
-        Ok(if super::array_index(&name).is_some() {
-            ExoticDefineResult::Handled(false)
-        } else {
-            ExoticDefineResult::Fallthrough
-        })
-    }
-
-    #[qjs(get_own_property)]
-    fn own_property<'js>(
-        &self,
-        ctx: &Ctx<'js>,
-        atom: Atom<'js>,
-    ) -> Result<Option<PropertyDescriptor<'js>>> {
-        let Some(name) = super::atom_name(ctx, &atom) else {
-            return Ok(None);
-        };
-        let Some(index) = super::array_index(&name) else {
-            return Ok(None);
-        };
-        Ok(class_tokens(ctx, self.element.0)?
-            .get(index as usize)
-            .map(|token| token.clone().into_js(ctx))
-            .transpose()?
-            .map(|value| PropertyDescriptor::new_value(value, true, true, false)))
-    }
-
-    #[qjs(get_own_property_names)]
-    fn own_names<'js>(&self, ctx: &Ctx<'js>) -> Result<Vec<PropertyName<'js>>> {
-        (0..class_tokens(ctx, self.element.0)?.len())
-            .map(|index| {
-                Ok(PropertyName {
-                    atom: Atom::from_u32(
-                        ctx.clone(),
-                        u32::try_from(index)
-                            .map_err(|_| Exception::throw_range(ctx, "token index too large"))?,
-                    )?,
-                    is_enumerable: true,
-                })
-            })
-            .collect()
-    }
-
-    #[qjs(set)]
-    #[expect(
-        clippy::unused_self,
-        clippy::unnecessary_wraps,
-        reason = "rquickjs exotic ABI requires self and Result"
-    )]
-    fn set<'js>(
-        &self,
-        ctx: &Ctx<'js>,
-        atom: Atom<'js>,
-        object: Value<'js>,
-        receiver: Value<'js>,
-        _value: Value<'js>,
-    ) -> Result<ExoticSetResult> {
-        // https://dom.spec.whatwg.org/#interface-domtokenlist
-        let Some(name) = super::atom_name(ctx, &atom) else {
-            return Ok(ExoticSetResult::Fallthrough);
-        };
-        Ok(super::reject_indexed_write(&name, &object, &receiver))
-    }
-
-    #[qjs(delete)]
-    fn delete<'js>(&self, ctx: &Ctx<'js>, atom: Atom<'js>) -> Result<bool> {
-        // https://webidl.spec.whatwg.org/#legacy-platform-object-delete
-        let Some(name) = super::atom_name(ctx, &atom) else {
-            return Ok(true);
-        };
-        let Some(index) = super::array_index(&name) else {
-            return Ok(true);
-        };
-        Ok(index as usize >= class_tokens(ctx, self.element.0)?.len())
     }
 }
 
@@ -336,6 +215,14 @@ fn validate_token_pair(ctx: &Ctx<'_>, old: &str, new: &str) -> Result<()> {
 /// attribute does not exist and the value is empty they do nothing
 /// (<https://dom.spec.whatwg.org/#concept-dtl-update>).
 fn write_class_tokens(ctx: &Ctx<'_>, id: NodeId, tokens: &[String]) -> Result<()> {
+    if tokens.is_empty()
+        && world(ctx)?
+            .borrow()
+            .document(id)
+            .is_none_or(|parsed| parsed.document.attribute(id, "class").is_none())
+    {
+        return Ok(());
+    }
     write_class(ctx, id, &tokens.join(" "))
 }
 
@@ -345,9 +232,6 @@ fn write_class(ctx: &Ctx<'_>, id: NodeId, value: &str) -> Result<()> {
     let Some(mut parsed) = world.document_mut(id) else {
         return Ok(());
     };
-    if value.is_empty() && parsed.document.attribute(id, "class").is_none() {
-        return Ok(());
-    }
     dom::mutation::set_attribute(&mut parsed.document, id, "class", value)
         .map_err(|err| throw_dom_error(ctx, err))?;
     drop(parsed);
@@ -376,6 +260,8 @@ impl<'js> Trace<'js> for AttrChildren<'js> {
 }
 
 include!(concat!(env!("OUT_DIR"), "/Attr.rs"));
+
+pub(super) type AttrArgument<'js> = Class<'js, JsAttr<'js>>;
 
 #[allow(
     clippy::needless_pass_by_value,
@@ -815,27 +701,21 @@ impl<'object> JsAttr<'object> {
 /// `NamedNodeMap`, live over the element's attribute list
 /// (<https://dom.spec.whatwg.org/#interface-namednodemap>).
 #[derive(Trace, rquickjs::JsLifetime)]
-#[rquickjs::class(rename = "NamedNodeMap")]
 pub struct JsNamedNodeMap {
     pub(crate) element: Handle,
 }
 
-#[rquickjs::methods]
+include!(concat!(env!("OUT_DIR"), "/NamedNodeMap.rs"));
+
 #[allow(
     clippy::needless_pass_by_value,
     clippy::unused_self,
-    reason = "rquickjs method ABI passes Ctx by value"
+    reason = "generated dispatch passes Ctx by value and invokes operations on the receiver"
 )]
 impl JsNamedNodeMap {
-    #[qjs(constructor)]
-    fn ctor(ctx: Ctx<'_>) -> Result<Self> {
-        Err(Exception::throw_type(&ctx, "Illegal constructor"))
-    }
-
     // https://dom.spec.whatwg.org/#dom-namednodemap-length
-    #[qjs(get)]
-    fn length(&self, ctx: Ctx<'_>) -> Result<usize> {
-        let world = world(&ctx)?;
+    fn length(&self, ctx: &Ctx<'_>) -> Result<usize> {
+        let world = world(ctx)?;
         let parsed = world.borrow();
         let Some(parsed) = parsed.document(self.element.0) else {
             return Ok(0);
@@ -847,9 +727,8 @@ impl JsNamedNodeMap {
     }
 
     // https://dom.spec.whatwg.org/#dom-namednodemap-item
-    #[qjs(rename = "item")]
-    fn item<'js>(&self, ctx: Ctx<'js>, index: i64) -> Result<Value<'js>> {
-        let Some(attribute) = attribute_at(&ctx, self.element.0, index)? else {
+    fn item<'js>(&self, ctx: Ctx<'js>, index: u32) -> Result<Value<'js>> {
+        let Some(attribute) = attribute_at(&ctx, self.element.0, i64::from(index))? else {
             return Ok(Value::new_null(ctx));
         };
         match attached_attr_id(&ctx, self.element.0, &attribute.0, &attribute.1)? {
@@ -859,13 +738,11 @@ impl JsNamedNodeMap {
     }
 
     // https://dom.spec.whatwg.org/#dom-namednodemap-getnameditem
-    #[qjs(rename = "getNamedItem")]
     fn get_named_item<'js>(&self, ctx: Ctx<'js>, name: WebIdlString) -> Result<Value<'js>> {
         named_item(&ctx, self.element.0, &name.0)
     }
 
     // https://dom.spec.whatwg.org/#dom-namednodemap-getnameditemns
-    #[qjs(rename = "getNamedItemNS")]
     fn get_named_item_ns<'js>(
         &self,
         ctx: Ctx<'js>,
@@ -880,19 +757,16 @@ impl JsNamedNodeMap {
     }
 
     // https://dom.spec.whatwg.org/#dom-namednodemap-setnameditem
-    #[qjs(rename = "setNamedItem")]
-    fn set_named_item<'js>(&self, ctx: Ctx<'js>, attr: Value<'js>) -> Result<Value<'js>> {
-        set_attribute_node(&ctx, self.element.0, &attr)
+    fn set_named_item<'js>(&self, ctx: Ctx<'js>, attr: AttrArgument<'js>) -> Result<Value<'js>> {
+        set_attribute_node(&ctx, self.element.0, &attr.into_value())
     }
 
     // https://dom.spec.whatwg.org/#dom-namednodemap-setnameditemns
-    #[qjs(rename = "setNamedItemNS")]
-    fn set_named_item_ns<'js>(&self, ctx: Ctx<'js>, attr: Value<'js>) -> Result<Value<'js>> {
-        set_attribute_node(&ctx, self.element.0, &attr)
+    fn set_named_item_ns<'js>(&self, ctx: Ctx<'js>, attr: AttrArgument<'js>) -> Result<Value<'js>> {
+        set_attribute_node(&ctx, self.element.0, &attr.into_value())
     }
 
     // https://dom.spec.whatwg.org/#dom-namednodemap-removenameditem
-    #[qjs(rename = "removeNamedItem")]
     fn remove_named_item<'js>(&self, ctx: Ctx<'js>, name: WebIdlString) -> Result<Value<'js>> {
         let world_rc = world(&ctx)?;
         let Some((namespace, local, id)) =
@@ -906,7 +780,6 @@ impl JsNamedNodeMap {
     }
 
     // https://dom.spec.whatwg.org/#dom-namednodemap-removenameditemns
-    #[qjs(rename = "removeNamedItemNS")]
     fn remove_named_item_ns<'js>(
         &self,
         ctx: Ctx<'js>,

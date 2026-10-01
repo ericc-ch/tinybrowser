@@ -26,6 +26,15 @@ pub(crate) struct Interface {
     pub(crate) operations: Vec<Operation>,
     pub(crate) dictionaries: Vec<Dictionary>,
     pub(crate) enumerations: Vec<Enumeration>,
+    pub(crate) properties: PropertyHooks,
+    pub(crate) stringifier: Option<usize>,
+    pub(crate) value_iterable: bool,
+}
+
+pub(crate) enum PropertyHooks {
+    None,
+    JavaScript,
+    Indexed,
 }
 
 pub(crate) enum InterfaceKind {
@@ -45,6 +54,13 @@ pub(crate) struct Operation {
     pub(crate) takes_this: bool,
     pub(crate) arguments: Vec<OperationArgument>,
     pub(crate) reactions: bool,
+    pub(crate) getter: Option<PropertyGetter>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PropertyGetter {
+    Indexed,
+    Named,
 }
 
 pub(crate) enum OperationResult {
@@ -61,7 +77,7 @@ pub(crate) enum OperationResult {
 
 pub(crate) struct OperationArgument {
     pub(crate) type_: ReturnType,
-    pub(crate) optional: bool,
+    pub(crate) arity: ArgumentArity,
     pub(crate) null_default: bool,
     pub(crate) legacy_null_to_empty: bool,
     pub(crate) boolean_default: Option<bool>,
@@ -69,6 +85,13 @@ pub(crate) struct OperationArgument {
     /// instead of a generated conversion. Used for the renderer's exact
     /// code-unit and pristine-string argument types.
     pub(crate) from_js: Option<syn::Path>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ArgumentArity {
+    Required,
+    Optional,
+    Variadic,
 }
 
 pub(crate) struct Constructor {
@@ -233,18 +256,13 @@ impl Interface {
             ));
         }
         let rust = attributes.rust()?;
-        let alternate = attributes
-            .take("RustAlternate")?
-            .map(|name| {
-                syn::parse_str(&name)
-                    .map_err(|error| Error(format!("invalid Rust alternate {name:?}: {error}")))
-            })
-            .transpose()?;
+        let alternate = attributes.rust_mapping("RustAlternate")?;
         let alternate_has_lifetime = attributes.flag("RustAlternateLifetime")?;
         if alternate_has_lifetime && alternate.is_none() {
             return Err(Error("RustAlternateLifetime requires RustAlternate".into()));
         }
         let has_lifetime = attributes.flag("RustLifetime")?;
+        let properties = attributes.property_hooks()?;
         let intrinsic = attributes.take("RustPrototype")?;
         if intrinsic.as_deref().is_some_and(|name| name != "Error") {
             return Err(Error("unsupported intrinsic prototype".into()));
@@ -282,8 +300,12 @@ impl Interface {
             operations: Vec::new(),
             dictionaries,
             enumerations,
+            properties,
+            stringifier: None,
+            value_iterable: false,
         };
         result.lower_members(members, &names)?;
+        result.validate_property_hooks()?;
         Ok(result)
     }
 
@@ -308,6 +330,13 @@ impl Interface {
                 }
                 InterfaceMember::Attribute(member) => {
                     check_name(&mut taken, member.identifier.0)?;
+                    if matches!(
+                        member.modifier,
+                        Some(weedle::interface::StringifierOrInheritOrStatic::Stringifier(_))
+                    ) && self.stringifier.replace(self.attributes.len()).is_some()
+                    {
+                        return Err(Error("only one stringifier is allowed".into()));
+                    }
                     self.attributes
                         .push(Attribute::parse(member, self.has_lifetime, names)?);
                 }
@@ -321,7 +350,7 @@ impl Interface {
                     self.constants.push(Constant::parse(member)?);
                 }
                 InterfaceMember::Operation(member) => {
-                    let operation = Operation::parse(member, names)?;
+                    let operation = Operation::parse(member, names, &self.properties)?;
                     if !taken.insert(operation.name.clone()) {
                         return Err(Error(format!(
                             "duplicate interface member: {}",
@@ -330,7 +359,84 @@ impl Interface {
                     }
                     self.operations.push(operation);
                 }
+                InterfaceMember::Iterable(member)
+                    if !matches!(self.properties, PropertyHooks::None) =>
+                {
+                    let weedle::interface::IterableInterfaceMember::Single(member) = member else {
+                        return Err(Error("only value iterables are supported yet".into()));
+                    };
+                    let mut attributes = Attributes::parse(member.attributes.as_ref())?;
+                    if attributes.take("RustIterable")?.as_deref() != Some("JavaScript")
+                        || self.value_iterable
+                    {
+                        return Err(Error(
+                            "value iterables require one explicit JavaScript implementation".into(),
+                        ));
+                    }
+                    attributes.finish()?;
+                    self.value_iterable = true;
+                    if !matches!(
+                        ReturnType::parse(&member.generics.body.type_, names)?,
+                        ReturnType::String
+                    ) {
+                        return Err(Error(
+                            "only string value iterables are supported yet".into(),
+                        ));
+                    }
+                }
                 _ => return Err(Error(format!("unsupported interface member: {member:?}"))),
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_property_hooks(&self) -> Result<(), Error> {
+        if self.value_iterable
+            && !self
+                .operations
+                .iter()
+                .any(|operation| operation.getter == Some(PropertyGetter::Indexed))
+        {
+            return Err(Error("value iterables require an indexed getter".into()));
+        }
+        // https://webidl.spec.whatwg.org/#idl-indexed-properties
+        // https://webidl.spec.whatwg.org/#idl-named-properties
+        for getter in [PropertyGetter::Indexed, PropertyGetter::Named] {
+            let count = self
+                .operations
+                .iter()
+                .filter(|operation| operation.getter == Some(getter))
+                .count();
+            if count > 1 || (count != 0 && matches!(self.kind, InterfaceKind::Partial)) {
+                return Err(Error(
+                    "property getters must be unique and declared on a complete interface".into(),
+                ));
+            }
+        }
+        if matches!(self.properties, PropertyHooks::Indexed) {
+            if matches!(self.kind, InterfaceKind::Partial)
+                || !self.attributes.iter().any(|attribute| {
+                    attribute.name == "length"
+                        && attribute.setter.is_none()
+                        && matches!(attribute.return_type, ReturnType::UnsignedLong)
+                })
+            {
+                return Err(Error(
+                    "indexed hooks require a complete interface with an unsigned long length"
+                        .into(),
+                ));
+            }
+            if !self.operations.iter().any(|operation| {
+                operation.getter == Some(PropertyGetter::Indexed)
+                    && matches!(operation.result, OperationResult::Object)
+                    && matches!(operation.arguments[0].type_, ReturnType::UnsignedLong)
+                    && !operation.takes_this
+                    && !operation.reactions
+                    && operation.arguments[0].from_js.is_none()
+            }) {
+                return Err(Error(
+                    "indexed hooks require a value-returning unsigned long getter".into(),
+                ));
             }
         }
         Ok(())
@@ -341,9 +447,16 @@ impl Operation {
     fn parse(
         member: &weedle::interface::OperationInterfaceMember<'_>,
         names: &TypeNames,
+        properties: &PropertyHooks,
     ) -> Result<Self, Error> {
-        if member.modifier.is_some() || member.special.is_some() {
+        if member.modifier.is_some()
+            || (member.special.is_some() && matches!(properties, PropertyHooks::None))
+        {
             return Err(Error("only regular named operations are supported".into()));
+        }
+        let getter = property_getter(member, names)?;
+        if matches!(properties, PropertyHooks::Indexed) && getter == Some(PropertyGetter::Named) {
+            return Err(Error("indexed hooks do not support named getters".into()));
         }
         let name = member
             .identifier
@@ -391,27 +504,26 @@ impl Operation {
         let mut arguments = Vec::new();
         let mut taken = HashSet::new();
         let mut optional_seen = false;
-        for argument in &member.args.body.list {
-            let Argument::Single(argument) = argument else {
-                return Err(Error("variadic operations are not supported yet".into()));
+        for (index, argument) in member.args.body.list.iter().enumerate() {
+            let name = match argument {
+                Argument::Single(argument) => argument.identifier.0,
+                Argument::Variadic(argument) => argument.identifier.0,
             };
-            identifier_spelling(argument.identifier.0)?;
-            if !taken.insert(
-                argument
-                    .identifier
-                    .0
-                    .strip_prefix('_')
-                    .unwrap_or(argument.identifier.0),
-            ) {
+            identifier_spelling(name)?;
+            if !taken.insert(name.strip_prefix('_').unwrap_or(name)) {
                 return Err(Error("duplicate operation argument".into()));
             }
             let argument = OperationArgument::parse(argument, names)?;
-            if optional_seen && !argument.optional {
+            if optional_seen && argument.arity == ArgumentArity::Required {
                 return Err(Error(
                     "required arguments after optional ones are not supported yet".into(),
                 ));
             }
-            optional_seen |= argument.optional;
+            if argument.arity == ArgumentArity::Variadic && index + 1 != member.args.body.list.len()
+            {
+                return Err(Error("a variadic argument must be last".into()));
+            }
+            optional_seen |= argument.arity == ArgumentArity::Optional;
             arguments.push(argument);
         }
         Ok(Self {
@@ -421,19 +533,71 @@ impl Operation {
             takes_this,
             arguments,
             reactions,
+            getter,
         })
     }
 }
 
+fn property_getter(
+    member: &weedle::interface::OperationInterfaceMember<'_>,
+    names: &TypeNames,
+) -> Result<Option<PropertyGetter>, Error> {
+    let Some(special) = &member.special else {
+        return Ok(None);
+    };
+    // https://webidl.spec.whatwg.org/#idl-indexed-properties
+    // https://webidl.spec.whatwg.org/#idl-named-properties
+    if !matches!(special, weedle::interface::Special::Getter(_)) {
+        return Err(Error(
+            "only readonly property getters are supported yet".into(),
+        ));
+    }
+    let [Argument::Single(argument)] = member.args.body.list.as_slice() else {
+        return Err(Error("property getters require one argument".into()));
+    };
+    if argument.optional.is_some()
+        || argument.default.is_some()
+        || matches!(member.return_type, weedle::types::ReturnType::Undefined(_))
+    {
+        return Err(Error(
+            "property getters require DOMString or unsigned long".into(),
+        ));
+    }
+    match ReturnType::parse(&argument.type_.type_, names)? {
+        ReturnType::String => Ok(Some(PropertyGetter::Named)),
+        ReturnType::UnsignedLong => Ok(Some(PropertyGetter::Indexed)),
+        _ => Err(Error(
+            "property getters require DOMString or unsigned long".into(),
+        )),
+    }
+}
+
 impl OperationArgument {
-    fn parse(
-        argument: &weedle::argument::SingleArgument<'_>,
-        names: &TypeNames,
-    ) -> Result<Self, Error> {
-        let mut argument_attributes = Attributes::parse(argument.attributes.as_ref())?;
+    fn parse(argument: &Argument<'_>, names: &TypeNames) -> Result<Self, Error> {
+        let (attributes, type_attributes, type_, default, arity) = match argument {
+            Argument::Single(argument) => (
+                argument.attributes.as_ref(),
+                argument.type_.attributes.as_ref(),
+                &argument.type_.type_,
+                argument.default.as_ref(),
+                if argument.optional.is_some() {
+                    ArgumentArity::Optional
+                } else {
+                    ArgumentArity::Required
+                },
+            ),
+            Argument::Variadic(argument) => (
+                argument.attributes.as_ref(),
+                None,
+                &argument.type_,
+                None,
+                ArgumentArity::Variadic,
+            ),
+        };
+        let mut argument_attributes = Attributes::parse(attributes)?;
         let rust_value = argument_attributes.flag("RustValue")?;
-        let rust_from_js = argument_attributes.take("RustFromJs")?;
-        let mut type_attributes = Attributes::parse(argument.type_.attributes.as_ref())?;
+        let from_js = argument_attributes.rust_mapping("RustFromJs")?;
+        let mut type_attributes = Attributes::parse(type_attributes)?;
         let legacy_null_to_empty = argument_attributes.flag("LegacyNullToEmptyString")?
             || type_attributes.flag("LegacyNullToEmptyString")?;
         argument_attributes.finish()?;
@@ -441,21 +605,19 @@ impl OperationArgument {
         let type_ = if rust_value {
             ReturnType::Value
         } else {
-            ReturnType::parse(&argument.type_.type_, names)?
+            ReturnType::parse(type_, names)?
         };
-        let optional = argument.optional.is_some();
-        let null_default = argument
-            .default
-            .as_ref()
-            .is_some_and(|default| matches!(default.value, DefaultValue::Null(_)));
-        let boolean_default = argument
-            .default
-            .as_ref()
-            .and_then(|default| match default.value {
-                DefaultValue::Boolean(value) => Some(value.0),
-                _ => None,
-            });
-        match (&type_, optional, &argument.default) {
+        let optional = arity == ArgumentArity::Optional;
+        if arity == ArgumentArity::Variadic && !matches!(type_, ReturnType::String) {
+            return Err(Error("only DOMString variadics are supported yet".into()));
+        }
+        let null_default =
+            default.is_some_and(|default| matches!(default.value, DefaultValue::Null(_)));
+        let boolean_default = default.and_then(|default| match default.value {
+            DefaultValue::Boolean(value) => Some(value.0),
+            _ => None,
+        });
+        match (&type_, optional, default) {
             (ReturnType::Boolean, true, Some(_)) if boolean_default.is_some() => {}
             (ReturnType::Boolean | ReturnType::String, true, None) => {}
             (ReturnType::NullableDocumentType, true, Some(_)) if null_default => {}
@@ -481,7 +643,7 @@ impl OperationArgument {
         if legacy_null_to_empty && !matches!(type_, ReturnType::String) {
             return Err(Error("LegacyNullToEmptyString requires DOMString".into()));
         }
-        if rust_from_js.is_none()
+        if from_js.is_none()
             && !matches!(
                 type_,
                 ReturnType::Node
@@ -503,15 +665,9 @@ impl OperationArgument {
                         .into(),
                 ));
         }
-        let from_js = rust_from_js
-            .map(|path| {
-                syn::parse_str::<syn::Path>(&path)
-                    .map_err(|error| Error(format!("invalid RustFromJs {path:?}: {error}")))
-            })
-            .transpose()?;
         Ok(Self {
             type_,
-            optional,
+            arity,
             null_default,
             legacy_null_to_empty,
             boolean_default,
@@ -526,7 +682,12 @@ impl Attribute {
         has_lifetime: bool,
         names: &TypeNames,
     ) -> Result<Self, Error> {
-        if member.modifier.is_some() {
+        if member.modifier.is_some()
+            && !matches!(
+                member.modifier,
+                Some(weedle::interface::StringifierOrInheritOrStatic::Stringifier(_))
+            )
+        {
             return Err(Error("expected a regular attribute".into()));
         }
         let mut attributes = Attributes::parse(member.attributes.as_ref())?;
@@ -551,25 +712,13 @@ impl Attribute {
         let mut type_attributes = Attributes::parse(member.type_.attributes.as_ref())?;
         let legacy_null_to_empty = attributes.flag("LegacyNullToEmptyString")?
             || type_attributes.flag("LegacyNullToEmptyString")?;
-        let setter = Setter::parse(&mut attributes, member.readonly.is_some(), rust_value)?;
-        if matches!(setter, Some(Setter::PutForwards { .. })) {
-            // https://webidl.spec.whatwg.org/#PutForwards
-            let Type::Single(SingleType::NonAny(NonAnyType::Identifier(type_))) =
-                &member.type_.type_
-            else {
-                return Err(Error("PutForwards requires an interface type".into()));
-            };
-            if type_.q_mark.is_some()
-                || !matches!(
-                    ReturnType::parse(&member.type_.type_, names)?,
-                    ReturnType::Node | ReturnType::NodeList | ReturnType::PlatformObject
-                )
-            {
-                return Err(Error(
-                    "PutForwards requires a non-nullable interface type".into(),
-                ));
-            }
-        }
+        let setter = Setter::parse(
+            &mut attributes,
+            member.readonly.is_some(),
+            rust_value,
+            &member.type_.type_,
+            names,
+        )?;
         attributes.finish()?;
         type_attributes.finish()?;
         let return_type = if rust_value {
@@ -577,6 +726,9 @@ impl Attribute {
         } else {
             ReturnType::parse(&member.type_.type_, names)?
         };
+        if member.modifier.is_some() && !matches!(return_type, ReturnType::String) {
+            return Err(Error("stringifier attributes require DOMString".into()));
+        }
         if legacy_null_to_empty && !matches!(return_type, ReturnType::String) {
             return Err(Error("LegacyNullToEmptyString requires DOMString".into()));
         }
@@ -633,6 +785,8 @@ impl Setter {
         attributes: &mut Attributes,
         readonly: bool,
         rust_value: bool,
+        type_: &Type<'_>,
+        names: &TypeNames,
     ) -> Result<Option<Self>, Error> {
         let rust = attributes
             .take("RustSet")?
@@ -641,14 +795,20 @@ impl Setter {
                     .map_err(|error| Error(format!("invalid Rust setter {name:?}: {error}")))
             })
             .transpose()?;
-        let from_js = attributes
-            .take("RustSetFromJs")?
-            .map(|path| {
-                syn::parse_str::<syn::Path>(&path)
-                    .map_err(|error| Error(format!("invalid RustSetFromJs {path:?}: {error}")))
-            })
-            .transpose()?;
+        let from_js = attributes.rust_mapping("RustSetFromJs")?;
         let put_forwards = attributes.take("PutForwards")?;
+        if put_forwards.is_some()
+            && (!matches!(type_, Type::Single(SingleType::NonAny(NonAnyType::Identifier(type_))) if type_.q_mark.is_none())
+                || !matches!(
+                    ReturnType::parse(type_, names)?,
+                    ReturnType::Node | ReturnType::NodeList | ReturnType::PlatformObject
+                ))
+        {
+            // https://webidl.spec.whatwg.org/#PutForwards
+            return Err(Error(
+                "PutForwards requires a non-nullable interface type".into(),
+            ));
+        }
         if readonly == rust.is_some() {
             return Err(Error(
                 "writable attributes require RustSet; readonly attributes forbid it".into(),
@@ -1236,6 +1396,31 @@ fn identifier_spelling(token: &str) -> Result<(), Error> {
 struct Attributes(BTreeMap<String, Option<String>>);
 
 impl Attributes {
+    fn rust_mapping<T: syn::parse::Parse>(&mut self, key: &str) -> Result<Option<T>, Error> {
+        self.take(key)?
+            .map(|path| {
+                syn::parse_str(&path)
+                    .map_err(|error| Error(format!("invalid {key} {path:?}: {error}")))
+            })
+            .transpose()
+    }
+    fn property_hooks(&mut self) -> Result<PropertyHooks, Error> {
+        let hooks = match self.take("RustPropertyHooks")?.as_deref() {
+            None => PropertyHooks::None,
+            Some("JavaScript") => PropertyHooks::JavaScript,
+            Some("Indexed") => PropertyHooks::Indexed,
+            Some(_) => return Err(Error("unsupported property-hook implementation".into())),
+        };
+        if self.flag("LegacyUnenumerableNamedProperties")?
+            && !matches!(hooks, PropertyHooks::JavaScript)
+        {
+            return Err(Error(
+                "named property annotations require property hooks".into(),
+            ));
+        }
+        Ok(hooks)
+    }
+
     fn parse(list: Option<&ExtendedAttributeList<'_>>) -> Result<Self, Error> {
         let mut result = BTreeMap::new();
         if let Some(list) = list {

@@ -4,9 +4,9 @@ use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
 
 use crate::model::{
-    Attribute, ConstructorArgumentKind, Dictionary, DictionaryFieldType, Enumeration,
-    GetterMapping, Interface, InterfaceKind, Operation, OperationArgument, OperationResult,
-    PrototypeParent, ReturnType, Setter,
+    ArgumentArity, Attribute, ConstructorArgumentKind, Dictionary, DictionaryFieldType,
+    Enumeration, GetterMapping, Interface, InterfaceKind, Operation, OperationArgument,
+    OperationResult, PropertyGetter, PropertyHooks, PrototypeParent, ReturnType, Setter,
 };
 
 pub(crate) fn interface(interface: &Interface) -> TokenStream {
@@ -117,11 +117,17 @@ fn member_tables(interface: &Interface) -> TokenStream {
         let length = operation
         .arguments
         .iter()
-        .filter(|argument| !argument.optional)
+        .take_while(|argument| argument.arity == ArgumentArity::Required)
         .count();
         quote! { host::Member { name: #name, kind: host::MemberKind::Method { operation: host::Operation::new(#id), length: #length } } }
     });
-    let members = attributes_members.chain(operation_members);
+    let stringifier = interface.stringifier.map(|_| {
+        let id = interface.attributes.len() * 2 + interface.operations.len() + 1;
+        quote! { host::Member { name: "toString", kind: host::MemberKind::Method { operation: host::Operation::new(#id), length: 0 } } }
+    });
+    let members = attributes_members
+        .chain(operation_members)
+        .chain(stringifier);
     let constants = interface.constants.iter().map(|constant| {
         let name = &constant.name;
         let value = constant.value;
@@ -164,7 +170,11 @@ fn dispatch_groups(
 ) -> (Vec<TokenStream>, Vec<TokenStream>) {
     let mut arms = Vec::new();
     for (index, attribute) in interface.attributes.iter().enumerate() {
-        arms.push((index * 2 + 1, false, getter_dispatch((index, attribute))));
+        arms.push((
+            index * 2 + 1,
+            false,
+            getter_dispatch(index * 2 + 1, attribute),
+        ));
         if let Some(setter) = setter_dispatch((index, attribute)) {
             arms.push((index * 2 + 2, true, setter));
         }
@@ -172,6 +182,10 @@ fn dispatch_groups(
     for (index, operation) in interface.operations.iter().enumerate() {
         let id = interface.attributes.len() * 2 + index + 1;
         arms.push((id, true, operation_dispatch(id, operation)));
+    }
+    if let Some(index) = interface.stringifier {
+        let id = interface.attributes.len() * 2 + interface.operations.len() + 1;
+        arms.push((id, false, getter_dispatch(id, &interface.attributes[index])));
     }
     let mut routes = Vec::new();
     let mut groups = Vec::new();
@@ -210,6 +224,7 @@ fn dispatch_groups(
 
 fn definition(interface: &Interface, payload: &TokenStream, required: usize) -> TokenStream {
     let name = &interface.name;
+    let property_hooks = indexed_property_hooks(interface);
     let parent = match &interface.parent {
         Some(PrototypeParent::Intrinsic(parent) | PrototypeParent::Interface(parent)) => {
             quote! { Some(#parent) }
@@ -230,6 +245,7 @@ fn definition(interface: &Interface, payload: &TokenStream, required: usize) -> 
             impl<'js> JsClass<'js> for #payload {
                 const NAME: &'static str = #name;
                 type Mutable = Readable;
+                #property_hooks
 
                 fn prototype(ctx: &Ctx<'js>) -> Result<Option<Object<'js>>> {
                     host::prototype(ctx, #name, #parent, MEMBERS, CONSTANTS, dispatch).map(Some)
@@ -256,8 +272,92 @@ fn definition(interface: &Interface, payload: &TokenStream, required: usize) -> 
     }
 }
 
-fn getter_dispatch((index, getter): (usize, &Attribute)) -> TokenStream {
-    let id = index * 2 + 1;
+fn indexed_property_hooks(interface: &Interface) -> TokenStream {
+    if !matches!(interface.properties, PropertyHooks::Indexed) {
+        return quote! {};
+    }
+    let length = &interface
+        .attributes
+        .iter()
+        .find(|attribute| attribute.name == "length")
+        .expect("validated indexed length")
+        .rust;
+    let item = &interface
+        .operations
+        .iter()
+        .find(|operation| operation.getter == Some(PropertyGetter::Indexed))
+        .expect("validated indexed item")
+        .rust;
+    quote! {
+        const KIND: rquickjs::class::ClassKind = rquickjs::class::ClassKind::Exotic;
+        const EXOTIC_HOOKS: rquickjs::class::ExoticHooks = rquickjs::class::ExoticHooks {
+            get: false, has: false, set: true, delete: true, define_own_property: true,
+            get_own_property: true, get_own_property_names: true,
+        };
+
+        // https://webidl.spec.whatwg.org/#legacy-platform-object-getownproperty
+        fn exotic_get_own_property(
+            this: &rquickjs::class::JsCell<'js, Self>, ctx: &Ctx<'js>,
+            atom: rquickjs::Atom<'js>, _object: Value<'js>,
+        ) -> Result<Option<rquickjs::class::PropertyDescriptor<'js>>> {
+            let Some(name) = crate::js::bindings::atom_name(ctx, &atom) else { return Ok(None); };
+            let Some(index) = crate::js::bindings::array_index(&name) else { return Ok(None); };
+            let receiver = this.borrow();
+            if index as usize >= receiver.#length(ctx)? { return Ok(None); }
+            let value = receiver.#item(ctx.clone(), index)?;
+            Ok(Some(rquickjs::class::PropertyDescriptor::new_value(value, true, true, false)))
+        }
+
+        // https://webidl.spec.whatwg.org/#legacy-platform-object-ownpropertykeys
+        fn exotic_get_own_property_names(
+            this: &rquickjs::class::JsCell<'js, Self>, ctx: &Ctx<'js>, _object: Value<'js>,
+        ) -> Result<Vec<rquickjs::class::PropertyName<'js>>> {
+            (0..this.borrow().#length(ctx)?)
+                .map(|index| Ok(rquickjs::class::PropertyName {
+                    atom: rquickjs::Atom::from_u32(ctx.clone(), u32::try_from(index)
+                        .map_err(|_| rquickjs::Exception::throw_range(ctx, "collection index too large"))?)?,
+                    is_enumerable: true,
+                }))
+                .collect()
+        }
+
+        // https://webidl.spec.whatwg.org/#legacy-platform-object-defineownproperty
+        fn exotic_define_own_property(
+            _this: &rquickjs::class::JsCell<'js, Self>, ctx: &Ctx<'js>,
+            atom: rquickjs::Atom<'js>, _value: Value<'js>, _is_data: bool,
+        ) -> Result<rquickjs::class::ExoticDefineResult> {
+            let Some(name) = crate::js::bindings::atom_name(ctx, &atom) else {
+                return Ok(rquickjs::class::ExoticDefineResult::Fallthrough);
+            };
+            Ok(if crate::js::bindings::array_index(&name).is_some() {
+                rquickjs::class::ExoticDefineResult::Handled(false)
+            } else { rquickjs::class::ExoticDefineResult::Fallthrough })
+        }
+
+        // https://webidl.spec.whatwg.org/#legacy-platform-object-set
+        fn exotic_set_property(
+            _this: &rquickjs::class::JsCell<'js, Self>, ctx: &Ctx<'js>, atom: rquickjs::Atom<'js>,
+            object: Value<'js>, receiver: Value<'js>, _value: Value<'js>,
+        ) -> Result<rquickjs::class::ExoticSetResult> {
+            let Some(name) = crate::js::bindings::atom_name(ctx, &atom) else {
+                return Ok(rquickjs::class::ExoticSetResult::Fallthrough);
+            };
+            Ok(crate::js::bindings::reject_indexed_write(&name, &object, &receiver))
+        }
+
+        // https://webidl.spec.whatwg.org/#legacy-platform-object-delete
+        fn exotic_delete_property(
+            this: &rquickjs::class::JsCell<'js, Self>, ctx: &Ctx<'js>,
+            atom: rquickjs::Atom<'js>, _object: Value<'js>,
+        ) -> Result<bool> {
+            let Some(name) = crate::js::bindings::atom_name(ctx, &atom) else { return Ok(true); };
+            let Some(index) = crate::js::bindings::array_index(&name) else { return Ok(true); };
+            Ok(index as usize >= this.borrow().#length(ctx)?)
+        }
+    }
+}
+
+fn getter_dispatch(id: usize, getter: &Attribute) -> TokenStream {
     let method = &getter.rust;
     let body = match getter.mapping {
         GetterMapping::Field => quote! { receiver.#method.clone().into_js(&ctx) },
@@ -372,7 +472,7 @@ fn operation_dispatch(id: usize, operation: &Operation) -> TokenStream {
     let required = operation
         .arguments
         .iter()
-        .take_while(|argument| !argument.optional)
+        .take_while(|argument| argument.arity == ArgumentArity::Required)
         .count();
     let argument_names: Vec<_> = (0..operation.arguments.len())
         .map(|index| format_ident!("arg_{index}"))
@@ -439,7 +539,11 @@ fn operation_dispatch(id: usize, operation: &Operation) -> TokenStream {
 
 /// `[RustFromJs=PATH]`: convert the raw argument with `PATH::from_js`, keeping
 /// the renderer's exact code-unit and pristine-string argument types.
-fn from_js_argument(index: usize, variable: &proc_macro2::Ident, path: &syn::Path) -> TokenStream {
+fn from_js_argument(
+    index: &TokenStream,
+    variable: &proc_macro2::Ident,
+    path: &syn::Path,
+) -> TokenStream {
     quote! {
         let value = params.arg(#index).unwrap_or_else(|| Value::new_undefined(ctx.clone()));
         let #variable: super::#path = rquickjs::FromJs::from_js(&ctx, value)?;
@@ -448,6 +552,26 @@ fn from_js_argument(index: usize, variable: &proc_macro2::Ident, path: &syn::Pat
 
 fn operation_argument(
     index: usize,
+    argument: &OperationArgument,
+    variable: &proc_macro2::Ident,
+) -> TokenStream {
+    if argument.arity == ArgumentArity::Variadic {
+        let conversion =
+            operation_argument_at(&quote! { index }, argument, &format_ident!("converted"));
+        return quote! {
+            // https://webidl.spec.whatwg.org/#es-overloads
+            let mut #variable = Vec::with_capacity(params.len().saturating_sub(#index));
+            for index in #index..params.len() {
+                #conversion
+                #variable.push(converted);
+            }
+        };
+    }
+    operation_argument_at(&quote! { #index }, argument, variable)
+}
+
+fn operation_argument_at(
+    index: &TokenStream,
     argument: &OperationArgument,
     variable: &proc_macro2::Ident,
 ) -> TokenStream {
@@ -491,7 +615,7 @@ fn operation_argument(
             } else {
                 quote! { host::string_argument(params, #index, None)? }
             };
-            if argument.optional {
+            if argument.arity == ArgumentArity::Optional {
                 quote! {
                     #fetch
                     let #variable = if value.is_undefined() {
@@ -520,15 +644,19 @@ fn operation_argument(
                 let #variable = host::document_type_argument(&ctx, &value)?;
             }
         }
-        ReturnType::Boolean if argument.optional && argument.boolean_default.is_none() => quote! {
-            #fetch
-            // https://webidl.spec.whatwg.org/#es-boolean
-            let #variable = if value.is_undefined() {
-                None
-            } else {
-                Some(host::boolean_argument(params, #index)?)
-            };
-        },
+        ReturnType::Boolean
+            if argument.arity == ArgumentArity::Optional && argument.boolean_default.is_none() =>
+        {
+            quote! {
+                #fetch
+                // https://webidl.spec.whatwg.org/#es-boolean
+                let #variable = if value.is_undefined() {
+                    None
+                } else {
+                    Some(host::boolean_argument(params, #index)?)
+                };
+            }
+        }
         ReturnType::Boolean => boolean_argument(argument, variable, &fetch),
         ReturnType::UnsignedLong => quote! {
             #fetch

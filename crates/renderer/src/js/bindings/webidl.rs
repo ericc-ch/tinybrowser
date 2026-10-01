@@ -65,9 +65,8 @@ pub(crate) struct WebIdlCodeUnits(pub(crate) dom::DomString);
 /// (<https://webidl.spec.whatwg.org/#es-unsigned-long>).
 pub(crate) struct WebIdlUnsignedLong(pub(crate) u32);
 
-/// `ToString` through the pristine `String`, captured at install: a
-/// page-assigned global must not hijack `DOMString` conversion or re-enter
-/// Rust through it.
+/// `DOMString` conversion through the engine's `ToString` operation
+/// (<https://webidl.spec.whatwg.org/#es-DOMString>).
 pub(crate) fn webidl_to_string<'js>(ctx: &Ctx<'js>, value: Value<'js>) -> Result<String> {
     webidl_to_js_string(ctx, value)?.to_string()
 }
@@ -80,15 +79,8 @@ pub(crate) fn webidl_to_units<'js>(ctx: &Ctx<'js>, value: Value<'js>) -> Result<
 }
 
 fn webidl_to_js_string<'js>(ctx: &Ctx<'js>, value: Value<'js>) -> Result<rquickjs::String<'js>> {
-    if let Ok(world_rc) = world(ctx)
-        && let Some(to_string) = world_rc.borrow().pristine_string.clone()
-    {
-        let to_string: Function = to_string.restore(ctx)?;
-        return to_string.call((value,));
-    }
-    // Install predates the capture: fall back to the (clobberable) global.
-    let to_string: Function = ctx.globals().get("String")?;
-    to_string.call((value,))
+    let converted: rquickjs::Coerced<rquickjs::String> = rquickjs::FromJs::from_js(ctx, value)?;
+    Ok(converted.0)
 }
 
 /// [Converting nodes into a node](https://dom.spec.whatwg.org/#convert-nodes-into-a-node):

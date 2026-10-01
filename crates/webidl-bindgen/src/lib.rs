@@ -142,6 +142,8 @@ mod tests {
                 .replace("Rust=label", "Rust=label, RustValue, PutForwards=value"),
             PARTIAL.replace("Node node", "optional Node node"),
             PARTIAL.replace("Node node", "Node... node"),
+            "[Exposed=Window, Rust=Payload, RustPropertyHooks=Indexed] interface Bad { [Rust=length] readonly attribute unsigned long length; [Rust=item] getter DOMString? item([RustValue] unsigned long index); };".into(),
+            "[Exposed=Window, Rust=Payload, RustPropertyHooks=JavaScript] interface Bad { [RustIterable=JavaScript] iterable<DOMString>; };".into(),
             PARTIAL.replace("Node insert", "static Node insert"),
             PARTIAL.replace(
                 "Node? child);",
