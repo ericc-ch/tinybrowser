@@ -305,6 +305,15 @@ pub(crate) fn require_node_interface(
         "Document" | "XMLDocument" => matches!(kind, Some(dom::NodeKind::Document)),
         "DocumentFragment" => matches!(kind, Some(dom::NodeKind::Fragment)),
         "Element" => matches!(kind, Some(dom::NodeKind::Element { .. })),
+        "HTMLElement" => {
+            matches!(kind, Some(dom::NodeKind::Element { name, .. }) if name.ns == dom::html_namespace())
+        }
+        "SVGElement" => {
+            matches!(kind, Some(dom::NodeKind::Element { name, .. }) if name.ns == dom::svg_namespace())
+        }
+        "MathMLElement" => {
+            matches!(kind, Some(dom::NodeKind::Element { name, .. }) if name.ns == dom::mathml_namespace())
+        }
         "CharacterData" => matches!(
             kind,
             Some(
@@ -335,6 +344,31 @@ pub(crate) fn this_object<'js>(params: &Params<'_, 'js>) -> Result<Object<'js>> 
         .this()
         .into_object()
         .ok_or_else(|| Exception::throw_internal(params.ctx(), "native receiver has no object"))
+}
+
+pub(crate) fn put_forwards<'js>(
+    params: &Params<'_, 'js>,
+    name: &str,
+    target: &str,
+) -> Result<Value<'js>> {
+    // https://webidl.spec.whatwg.org/#es-attributes
+    let ctx = params.ctx();
+    let object = this_object(params)?;
+    let forwarded: Value = object.get(name)?;
+    let forwarded = forwarded
+        .into_object()
+        .ok_or_else(|| Exception::throw_type(ctx, "forwarded attribute is not an object"))?;
+    let value = params
+        .arg(0)
+        .unwrap_or_else(|| Value::new_undefined(ctx.clone()));
+    let reflect_set = world(ctx)?
+        .borrow()
+        .pristine_reflect_set
+        .clone()
+        .ok_or_else(|| Exception::throw_internal(ctx, "Reflect.set was not captured"))?;
+    let reflect_set = reflect_set.restore(ctx)?;
+    let _: bool = reflect_set.call((forwarded, target, value))?;
+    Ok(Value::new_undefined(ctx.clone()))
 }
 
 pub(crate) fn string_argument<'js>(

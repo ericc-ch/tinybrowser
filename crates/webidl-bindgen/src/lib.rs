@@ -135,6 +135,11 @@ mod tests {
                 .replace("Document parse", "Document? parse"),
             INPUT.replace("Rust=label", "Rust=label, CEReactions"),
             INPUT.replace("Rust=Payload", "Rust=Payload, RustAlternateLifetime"),
+            INPUT.replace("Rust=label", "Rust=label, RustSetFromJs=Converted"),
+            INPUT.replace("Rust=label", "Rust=label, RustValue, PutForwards=value"),
+            INPUT
+                .replace("DOMString label;", "DOMTokenList? label;")
+                .replace("Rust=label", "Rust=label, RustValue, PutForwards=value"),
             PARTIAL.replace("Node node", "optional Node node"),
             PARTIAL.replace("Node node", "Node... node"),
             PARTIAL.replace("Node insert", "static Node insert"),

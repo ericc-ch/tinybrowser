@@ -6,7 +6,7 @@ use quote::{format_ident, quote};
 use crate::model::{
     Attribute, ConstructorArgumentKind, Dictionary, DictionaryFieldType, Enumeration,
     GetterMapping, Interface, InterfaceKind, Operation, OperationArgument, OperationResult,
-    PrototypeParent, ReturnType,
+    PrototypeParent, ReturnType, Setter,
 };
 
 pub(crate) fn interface(interface: &Interface) -> TokenStream {
@@ -20,6 +20,80 @@ pub(crate) fn interface(interface: &Interface) -> TokenStream {
     let (required, constructor_body) = constructor(interface);
     let dictionaries = interface.dictionaries.iter().map(dictionary);
     let enumerations = interface.enumerations.iter().map(enumeration);
+    let tables = member_tables(interface);
+    let (routes, groups) = dispatch_groups(interface, &payload, "dispatch");
+    let (alternate_dispatch, alternate_groups) = alternate_dispatch(interface);
+    let legacy_code = legacy_codes(interface);
+    let definition = definition(interface, &payload, required);
+    let conversion_import = if interface.attributes.iter().any(|attribute| {
+        matches!(attribute.mapping, GetterMapping::Field)
+            || matches!(
+                attribute.return_type,
+                ReturnType::String
+                    | ReturnType::UsvString
+                    | ReturnType::NullableString
+                    | ReturnType::Boolean
+                    | ReturnType::UnsignedShort
+                    | ReturnType::UnsignedLong
+                    | ReturnType::Double
+            )
+    }) {
+        quote! { use rquickjs::IntoJs; }
+    } else {
+        quote! {}
+    };
+    let constructor_dispatch = match interface.kind {
+        InterfaceKind::Complete => quote! {
+            if operation.index() == 0 {
+                #constructor_body
+            }
+        },
+        InterfaceKind::Partial => quote! {},
+    };
+    let receiver_check = if interface.rust == "JsNode" && interface.name != "Node" {
+        let name = &interface.name;
+        quote! { host::require_node_interface(&ctx, receiver.node_id(), #name)?; }
+    } else {
+        quote! {}
+    };
+    quote! {
+        pub(super) mod #module {
+            use super::#rust;
+            use crate::js::bindings::host;
+            use rquickjs::{Ctx, Object, Result, Value};
+            use rquickjs::function::Params;
+            #conversion_import
+
+            #tables
+            #definition
+            #(#dictionaries)*
+            #(#enumerations)*
+
+            // https://webidl.spec.whatwg.org/#es-interface-call
+            fn dispatch<'js>(operation: host::Operation, params: &Params<'_, 'js>) -> Result<Value<'js>> {
+                let ctx = params.ctx().clone();
+                #constructor_dispatch
+                #alternate_dispatch
+                // https://webidl.spec.whatwg.org/#es-attributes
+                // https://webidl.spec.whatwg.org/#es-operations
+                let receiver = host::receiver::<#payload>(params)?;
+                let receiver = receiver.borrow();
+                #receiver_check
+                match operation.index() {
+                    #(#routes,)*
+                    _ => Err(rquickjs::Exception::throw_internal(&ctx, "unknown native operation")),
+                }
+            }
+
+            #(#groups)*
+            #(#alternate_groups)*
+
+            #legacy_code
+        }
+    }
+}
+
+fn member_tables(interface: &Interface) -> TokenStream {
     let attributes_members = interface
         .attributes
         .iter()
@@ -48,69 +122,14 @@ pub(crate) fn interface(interface: &Interface) -> TokenStream {
         quote! { host::Member { name: #name, kind: host::MemberKind::Method { operation: host::Operation::new(#id), length: #length } } }
     });
     let members = attributes_members.chain(operation_members);
-    let (routes, groups) = dispatch_groups(interface, &payload, "dispatch");
-    let (alternate_dispatch, alternate_groups) = alternate_dispatch(interface);
     let constants = interface.constants.iter().map(|constant| {
         let name = &constant.name;
         let value = constant.value;
         quote! { host::Constant { name: #name, value: #value } }
     });
-    let legacy_code = legacy_codes(interface);
-    let definition = definition(interface, &payload, required);
-    let conversion_import = if interface.attributes.is_empty() {
-        quote! {}
-    } else {
-        quote! { use rquickjs::IntoJs; }
-    };
-    let constructor_dispatch = match interface.kind {
-        InterfaceKind::Complete => quote! {
-            if operation.index() == 0 {
-                #constructor_body
-            }
-        },
-        InterfaceKind::Partial => quote! {},
-    };
-    let receiver_check = if interface.rust == "JsNode" && interface.name != "Node" {
-        let name = &interface.name;
-        quote! { host::require_node_interface(&ctx, receiver.node_id(), #name)?; }
-    } else {
-        quote! {}
-    };
     quote! {
-        pub(super) mod #module {
-            use super::#rust;
-            use crate::js::bindings::host;
-            use rquickjs::{Ctx, Object, Result, Value};
-            use rquickjs::function::Params;
-            #conversion_import
-
-            const MEMBERS: &[host::Member] = &[#(#members),*];
-            const CONSTANTS: &[host::Constant] = &[#(#constants),*];
-            #definition
-            #(#dictionaries)*
-            #(#enumerations)*
-
-            // https://webidl.spec.whatwg.org/#es-interface-call
-            fn dispatch<'js>(operation: host::Operation, params: &Params<'_, 'js>) -> Result<Value<'js>> {
-                let ctx = params.ctx().clone();
-                #constructor_dispatch
-                #alternate_dispatch
-                // https://webidl.spec.whatwg.org/#es-attributes
-                // https://webidl.spec.whatwg.org/#es-operations
-                let receiver = host::receiver::<#payload>(params)?;
-                let receiver = receiver.borrow();
-                #receiver_check
-                match operation.index() {
-                    #(#routes,)*
-                    _ => Err(rquickjs::Exception::throw_internal(&ctx, "unknown native operation")),
-                }
-            }
-
-            #(#groups)*
-            #(#alternate_groups)*
-
-            #legacy_code
-        }
+        const MEMBERS: &[host::Member] = &[#(#members),*];
+        const CONSTANTS: &[host::Constant] = &[#(#constants),*];
     }
 }
 
@@ -284,6 +303,7 @@ fn getter_dispatch((index, getter): (usize, &Attribute)) -> TokenStream {
             | ReturnType::Dictionary(_)
             | ReturnType::Enumeration(_)
             | ReturnType::InterfaceSequence
+            | ReturnType::StringSequence
             | ReturnType::NullableDocumentType => {
                 unreachable!("validated field mapping")
             }
@@ -293,17 +313,39 @@ fn getter_dispatch((index, getter): (usize, &Attribute)) -> TokenStream {
 }
 
 fn setter_dispatch((index, attribute): (usize, &Attribute)) -> Option<TokenStream> {
-    let method = attribute.setter.as_ref()?;
+    let setter = attribute.setter.as_ref()?;
     let id = index * 2 + 2;
-    let convert = match attribute.return_type {
-        ReturnType::String if attribute.legacy_null_to_empty => quote! {
-            host::legacy_null_string_argument(params, 0)?
-        },
-        ReturnType::String => quote! { host::string_argument(params, 0, None)? },
-        ReturnType::NullableString => quote! { host::nullable_string_argument(params, 0)? },
-        // https://webidl.spec.whatwg.org/#es-boolean
-        ReturnType::Boolean => quote! { host::boolean_argument(params, 0)? },
-        _ => unreachable!("validated string or boolean setter"),
+    let (method, from_js) = match setter {
+        Setter::Method { rust, from_js } => (rust, from_js),
+        Setter::PutForwards { target } => {
+            let name = &attribute.name;
+            return Some(quote! {
+                #id => {
+                    // https://webidl.spec.whatwg.org/#es-attributes
+                    host::put_forwards(params, #name, #target)
+                }
+            });
+        }
+    };
+    let convert = if let Some(path) = from_js {
+        // https://webidl.spec.whatwg.org/#es-type-mapping
+        quote! {
+            <super::#path as rquickjs::FromJs>::from_js(
+                &ctx,
+                params.arg(0).unwrap_or_else(|| Value::new_undefined(ctx.clone())),
+            )?
+        }
+    } else {
+        match attribute.return_type {
+            ReturnType::String if attribute.legacy_null_to_empty => quote! {
+                host::legacy_null_string_argument(params, 0)?
+            },
+            ReturnType::String => quote! { host::string_argument(params, 0, None)? },
+            ReturnType::NullableString => quote! { host::nullable_string_argument(params, 0)? },
+            // https://webidl.spec.whatwg.org/#es-boolean
+            ReturnType::Boolean => quote! { host::boolean_argument(params, 0)? },
+            _ => unreachable!("validated string or boolean setter"),
+        }
     };
     let body = quote! {
         receiver.#method(&ctx, value)?;
@@ -361,6 +403,14 @@ fn operation_dispatch(id: usize, operation: &Operation) -> TokenStream {
             let result: Vec<Value> = #call?;
             host::sequence(&ctx, result)
         },
+        OperationResult::StringSequence => quote! {
+            let result: Vec<String> = #call?;
+            let values = result
+                .into_iter()
+                .map(|item| rquickjs::String::from_str(ctx.clone(), &item).map(rquickjs::String::into_value))
+                .collect::<Result<Vec<Value>>>()?;
+            host::sequence(&ctx, values)
+        },
         OperationResult::String => quote! {
             #call.map(rquickjs::String::into_value)
         },
@@ -389,11 +439,7 @@ fn operation_dispatch(id: usize, operation: &Operation) -> TokenStream {
 
 /// `[RustFromJs=PATH]`: convert the raw argument with `PATH::from_js`, keeping
 /// the renderer's exact code-unit and pristine-string argument types.
-fn from_js_argument(
-    index: usize,
-    variable: &proc_macro2::Ident,
-    path: &syn::Path,
-) -> TokenStream {
+fn from_js_argument(index: usize, variable: &proc_macro2::Ident, path: &syn::Path) -> TokenStream {
     quote! {
         let value = params.arg(#index).unwrap_or_else(|| Value::new_undefined(ctx.clone()));
         let #variable: super::#path = rquickjs::FromJs::from_js(&ctx, value)?;
@@ -474,6 +520,15 @@ fn operation_argument(
                 let #variable = host::document_type_argument(&ctx, &value)?;
             }
         }
+        ReturnType::Boolean if argument.optional && argument.boolean_default.is_none() => quote! {
+            #fetch
+            // https://webidl.spec.whatwg.org/#es-boolean
+            let #variable = if value.is_undefined() {
+                None
+            } else {
+                Some(host::boolean_argument(params, #index)?)
+            };
+        },
         ReturnType::Boolean => boolean_argument(argument, variable, &fetch),
         ReturnType::UnsignedLong => quote! {
             #fetch

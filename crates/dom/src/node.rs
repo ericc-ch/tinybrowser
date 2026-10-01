@@ -30,6 +30,12 @@ pub fn svg_namespace() -> Namespace {
     markup5ever::ns!(svg)
 }
 
+/// The `MathML` namespace URL.
+#[must_use]
+pub fn mathml_namespace() -> Namespace {
+    markup5ever::ns!(mathml)
+}
+
 /// The `xmlns` declaration namespace URL
 /// (<https://www.w3.org/TR/xml-names/#ns-decl>).
 #[must_use]

@@ -102,17 +102,6 @@
     'scrollLeft', 'scrollTop',
     'attachShadow', 'shadowRoot'
   ]);
-  // classList is `[PutForwards=value]`: assigning to it sets `.value`
-  // (<https://dom.spec.whatwg.org/#dom-element-classlist>).
-  {
-    const descriptor = Object.getOwnPropertyDescriptor(ElementInterface.prototype, 'classList');
-    Object.defineProperty(ElementInterface.prototype, 'classList', {
-      get: descriptor.get,
-      set: function(value) { this.classList.value = value; },
-      enumerable: true,
-      configurable: true,
-    });
-  }
   const XMLDocumentInterface = define('XMLDocument', DocumentInterface, []);
   const CharacterDataInterface = define('CharacterData', NodeInterface, [
     'data', 'length', 'substringData', 'appendData', 'insertData', 'deleteData',
@@ -140,6 +129,7 @@
   const HTMLUnknownElementInterface = define('HTMLUnknownElement', HTMLElementInterface, []);
   const HTMLMediaElementInterface = define('HTMLMediaElement', HTMLElementInterface, []);
   const SVGElementInterface = define('SVGElement', ElementInterface, ['click', 'focus', 'blur']);
+  const MathMLElementInterface = define('MathMLElement', ElementInterface, []);
   const table = {
     Document: DocumentInterface.prototype,
     XMLDocument: XMLDocumentInterface.prototype,
@@ -156,6 +146,7 @@
     HTMLUnknownElement: HTMLUnknownElementInterface.prototype,
     HTMLMediaElement: HTMLMediaElementInterface.prototype,
     SVGElement: SVGElementInterface.prototype,
+    MathMLElement: MathMLElementInterface.prototype,
   };
   // Every element interface chains to HTMLElement except the media pair,
   // which chains through HTMLMediaElement, and SVG, which chains to Element.

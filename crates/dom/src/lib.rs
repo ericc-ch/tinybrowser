@@ -44,8 +44,8 @@ pub use metadata::QuirksMode;
 pub use mutation::Mutation;
 pub use node::{
     Attribute, LocalName, Namespace, NodeKind, Prefix, QualName, html_namespace,
-    html_qualified_name_eq, qualified_name_eq, svg_namespace, xlink_namespace, xml_namespace,
-    xmlns_namespace,
+    html_qualified_name_eq, mathml_namespace, qualified_name_eq, svg_namespace, xlink_namespace,
+    xml_namespace, xmlns_namespace,
 };
 pub use selector::{ParseFail, ParseFailKind, SelectError};
 pub use string::DomString;

@@ -424,6 +424,7 @@ pub(crate) struct World {
     pub(crate) pristine_string: Option<Persistent<Function<'static>>>,
     pub(crate) pristine_number: Option<Persistent<Function<'static>>>,
     pub(crate) pristine_boolean: Option<Persistent<Function<'static>>>,
+    pub(crate) pristine_reflect_set: Option<Persistent<Function<'static>>>,
     pub(crate) pristine_queue_microtask: Option<Persistent<Function<'static>>>,
     pub(crate) weak_references: Option<WeakReferences>,
     /// The realm's own mutation-delivery entry point, so scheduling never
@@ -526,6 +527,7 @@ impl World {
             pristine_string: None,
             pristine_number: None,
             pristine_boolean: None,
+            pristine_reflect_set: None,
             pristine_queue_microtask: None,
             weak_references: None,
             deliver_mutations_fn: None,
@@ -1436,6 +1438,7 @@ impl World {
         self.pristine_string = None;
         self.pristine_number = None;
         self.pristine_boolean = None;
+        self.pristine_reflect_set = None;
         self.pristine_queue_microtask = None;
         self.weak_references = None;
         self.deliver_mutations_fn = None;

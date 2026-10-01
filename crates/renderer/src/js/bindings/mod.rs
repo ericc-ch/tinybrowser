@@ -531,6 +531,8 @@ fn capture_host_primitives<'js>(
     let string: Function = globals.get("String")?;
     let number: Function = globals.get("Number")?;
     let boolean: Function = globals.get("Boolean")?;
+    let reflect: Object = globals.get("Reflect")?;
+    let reflect_set: Function = reflect.get("set")?;
     let deliver: Function = globals.get("__tb_deliver_mutations")?;
     let weak_ref: Constructor = globals.get("WeakRef")?;
     let weak_ref_prototype: Object = weak_ref.get("prototype")?;
@@ -545,6 +547,7 @@ fn capture_host_primitives<'js>(
     world.pristine_string = Some(Persistent::save(ctx, string));
     world.pristine_number = Some(Persistent::save(ctx, number));
     world.pristine_boolean = Some(Persistent::save(ctx, boolean));
+    world.pristine_reflect_set = Some(Persistent::save(ctx, reflect_set));
     world.pristine_queue_microtask = globals
         .get::<_, Function>("queueMicrotask")
         .ok()
@@ -798,13 +801,15 @@ fn instantiate_node<'js>(ctx: &Ctx<'js>, id: NodeId) -> Result<Value<'js>> {
 
 /// The element interface for a qualified name
 /// (<https://html.spec.whatwg.org/multipage/dom.html#elements-in-the-dom:html-element>
-/// and its SVG counterparts). Names outside the HTML and SVG namespaces keep
-/// the base `Element` interface.
+/// and <https://w3c.github.io/mathml-core/#dom-mathmlelement>).
+/// Other namespaces use the base `Element` interface.
 fn element_interface(name: &QualName) -> &'static str {
     if name.ns == html_namespace() {
         html_element_interface(name.local.as_ref())
     } else if name.ns == svg_namespace() {
         "SVGElement"
+    } else if name.ns == dom::mathml_namespace() {
+        "MathMLElement"
     } else {
         "Element"
     }

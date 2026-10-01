@@ -52,6 +52,7 @@ pub(crate) enum OperationResult {
     Object,
     Undefined,
     Sequence,
+    StringSequence,
     /// The method returns `rquickjs::String<'js>`.
     String,
     Boolean,
@@ -100,9 +101,19 @@ pub(crate) struct Attribute {
     pub(crate) rust: Ident,
     pub(crate) return_type: ReturnType,
     pub(crate) mapping: GetterMapping,
-    pub(crate) setter: Option<Ident>,
+    pub(crate) setter: Option<Setter>,
     pub(crate) legacy_null_to_empty: bool,
     pub(crate) reactions: bool,
+}
+
+pub(crate) enum Setter {
+    Method {
+        rust: Ident,
+        from_js: Option<syn::Path>,
+    },
+    PutForwards {
+        target: String,
+    },
 }
 
 pub(crate) enum GetterMapping {
@@ -125,6 +136,8 @@ pub(crate) enum ReturnType {
     Dictionary(String),
     Enumeration(String),
     InterfaceSequence,
+    /// `sequence<DOMString>` result, mapped to a JavaScript array of strings.
+    StringSequence,
     PlatformObject,
     /// `DOMHighResTimeStamp`, a `double`
     /// (<https://webidl.spec.whatwg.org/#idl-DOMHighResTimeStamp>).
@@ -363,6 +376,7 @@ impl Operation {
                 | ReturnType::NullableString
                 | ReturnType::NodeList => OperationResult::Object,
                 ReturnType::InterfaceSequence => OperationResult::Sequence,
+                ReturnType::StringSequence => OperationResult::StringSequence,
                 ReturnType::String => OperationResult::String,
                 ReturnType::Boolean => OperationResult::Boolean,
                 ReturnType::UnsignedShort => OperationResult::UnsignedShort,
@@ -443,7 +457,7 @@ impl OperationArgument {
             });
         match (&type_, optional, &argument.default) {
             (ReturnType::Boolean, true, Some(_)) if boolean_default.is_some() => {}
-            (ReturnType::String, true, None) => {}
+            (ReturnType::Boolean | ReturnType::String, true, None) => {}
             (ReturnType::NullableDocumentType, true, Some(_)) if null_default => {}
             (ReturnType::Dictionary(_), true, Some(default))
                 if matches!(
@@ -456,6 +470,7 @@ impl OperationArgument {
                         default.value,
                         weedle::literal::DefaultValue::EmptyDictionary(_)
                     ) => {}
+            (ReturnType::Value, true, None) if rust_value => {}
             (_, true, _) | (_, _, Some(_)) => {
                 return Err(Error(
                     "only trailing optional dictionaries with {} defaults are supported yet".into(),
@@ -466,21 +481,23 @@ impl OperationArgument {
         if legacy_null_to_empty && !matches!(type_, ReturnType::String) {
             return Err(Error("LegacyNullToEmptyString requires DOMString".into()));
         }
-        if !matches!(
-            type_,
-            ReturnType::Node
-                | ReturnType::NullableNode
-                | ReturnType::Callback
-                | ReturnType::Dictionary(_)
-                | ReturnType::String
-                | ReturnType::NullableString
-                | ReturnType::Value
-                | ReturnType::NullableDocumentType
-                | ReturnType::Boolean
-                | ReturnType::UnsignedLong
-                | ReturnType::Double
-                | ReturnType::Enumeration(_)
-        ) {
+        if rust_from_js.is_none()
+            && !matches!(
+                type_,
+                ReturnType::Node
+                    | ReturnType::NullableNode
+                    | ReturnType::Callback
+                    | ReturnType::Dictionary(_)
+                    | ReturnType::String
+                    | ReturnType::NullableString
+                    | ReturnType::Value
+                    | ReturnType::NullableDocumentType
+                    | ReturnType::Boolean
+                    | ReturnType::UnsignedLong
+                    | ReturnType::Double
+                    | ReturnType::Enumeration(_)
+            )
+        {
             return Err(Error(
                     "only Node, callback, dictionary, string, double, and value operation arguments are supported yet"
                         .into(),
@@ -534,17 +551,24 @@ impl Attribute {
         let mut type_attributes = Attributes::parse(member.type_.attributes.as_ref())?;
         let legacy_null_to_empty = attributes.flag("LegacyNullToEmptyString")?
             || type_attributes.flag("LegacyNullToEmptyString")?;
-        let setter = attributes
-            .take("RustSet")?
-            .map(|name| {
-                syn::parse_str(&name)
-                    .map_err(|error| Error(format!("invalid Rust setter {name:?}: {error}")))
-            })
-            .transpose()?;
-        if member.readonly.is_some() == setter.is_some() {
-            return Err(Error(
-                "writable attributes require RustSet; readonly attributes forbid it".into(),
-            ));
+        let setter = Setter::parse(&mut attributes, member.readonly.is_some(), rust_value)?;
+        if matches!(setter, Some(Setter::PutForwards { .. })) {
+            // https://webidl.spec.whatwg.org/#PutForwards
+            let Type::Single(SingleType::NonAny(NonAnyType::Identifier(type_))) =
+                &member.type_.type_
+            else {
+                return Err(Error("PutForwards requires an interface type".into()));
+            };
+            if type_.q_mark.is_some()
+                || !matches!(
+                    ReturnType::parse(&member.type_.type_, names)?,
+                    ReturnType::Node | ReturnType::NodeList | ReturnType::PlatformObject
+                )
+            {
+                return Err(Error(
+                    "PutForwards requires a non-nullable interface type".into(),
+                ));
+            }
         }
         attributes.finish()?;
         type_attributes.finish()?;
@@ -556,7 +580,7 @@ impl Attribute {
         if legacy_null_to_empty && !matches!(return_type, ReturnType::String) {
             return Err(Error("LegacyNullToEmptyString requires DOMString".into()));
         }
-        if setter.is_some()
+        if matches!(setter, Some(Setter::Method { .. }))
             && (!matches!(mapping, GetterMapping::Method)
                 || !matches!(
                     return_type,
@@ -585,7 +609,7 @@ impl Attribute {
                 false,
                 _,
             )
-            | (GetterMapping::Method, ReturnType::NodeList, true, _) => {}
+            | (GetterMapping::Method, ReturnType::NodeList | ReturnType::Value, true, _) => {}
             _ => {
                 return Err(Error(
                     "unsupported getter mapping or SameObject declaration".into(),
@@ -601,6 +625,49 @@ impl Attribute {
             legacy_null_to_empty,
             reactions,
         })
+    }
+}
+
+impl Setter {
+    fn parse(
+        attributes: &mut Attributes,
+        readonly: bool,
+        rust_value: bool,
+    ) -> Result<Option<Self>, Error> {
+        let rust = attributes
+            .take("RustSet")?
+            .map(|name| {
+                syn::parse_str(&name)
+                    .map_err(|error| Error(format!("invalid Rust setter {name:?}: {error}")))
+            })
+            .transpose()?;
+        let from_js = attributes
+            .take("RustSetFromJs")?
+            .map(|path| {
+                syn::parse_str::<syn::Path>(&path)
+                    .map_err(|error| Error(format!("invalid RustSetFromJs {path:?}: {error}")))
+            })
+            .transpose()?;
+        let put_forwards = attributes.take("PutForwards")?;
+        if readonly == rust.is_some() {
+            return Err(Error(
+                "writable attributes require RustSet; readonly attributes forbid it".into(),
+            ));
+        }
+        if from_js.is_some() && rust.is_none() {
+            return Err(Error("RustSetFromJs requires RustSet".into()));
+        }
+        match (rust, put_forwards) {
+            (Some(rust), None) => Ok(Some(Self::Method { rust, from_js })),
+            (None, Some(target)) if readonly && rust_value => Ok(Some(Self::PutForwards {
+                target: identifier(&target)?.into(),
+            })),
+            (None, Some(_)) => Err(Error(
+                "PutForwards requires a readonly platform object".into(),
+            )),
+            (None, None) => Ok(None),
+            (Some(_), Some(_)) => Err(Error("PutForwards forbids RustSet".into())),
+        }
     }
 }
 
@@ -680,10 +747,10 @@ impl ReturnType {
         match type_ {
             Type::Union(value) if value.q_mark.is_none() && value.type_.body.list.len() == 2 => {
                 // https://webidl.spec.whatwg.org/#es-union
-                // TrustedHTML has no implementation in this runtime yet, so
+                // TrustedHTML and TrustedType have no implementation in this runtime yet, so
                 // no input implements that interface: the DOMString arm wins.
                 let mut string = false;
-                let mut trusted_html = false;
+                let mut trusted = false;
                 for member in &value.type_.body.list {
                     let weedle::types::UnionMemberType::Single(member) = member else {
                         return Err(Error("nested unions are not supported yet".into()));
@@ -692,17 +759,18 @@ impl ReturnType {
                     match &member.type_ {
                         NonAnyType::DOMString(value) if value.q_mark.is_none() => string = true,
                         NonAnyType::Identifier(value)
-                            if value.q_mark.is_none() && value.type_.0 == "TrustedHTML" =>
+                            if value.q_mark.is_none()
+                                && matches!(value.type_.0, "TrustedHTML" | "TrustedType") =>
                         {
-                            trusted_html = true;
+                            trusted = true;
                         }
                         _ => return Err(Error("unsupported string union member".into())),
                     }
                 }
-                if string && trusted_html {
+                if string && trusted {
                     Ok(Self::String)
                 } else {
-                    Err(Error("expected TrustedHTML or DOMString".into()))
+                    Err(Error("expected a trusted type or DOMString".into()))
                 }
             }
             Type::Single(SingleType::NonAny(NonAnyType::USVString(value)))
@@ -749,8 +817,13 @@ impl ReturnType {
                     {
                         Ok(Self::InterfaceSequence)
                     }
+                    Type::Single(SingleType::NonAny(NonAnyType::DOMString(element)))
+                        if element.q_mark.is_none() =>
+                    {
+                        Ok(Self::StringSequence)
+                    }
                     _ => Err(Error(
-                        "only sequences of known interfaces are supported yet".into(),
+                        "only sequences of known interfaces or DOMString are supported yet".into(),
                     )),
                 }
             }
@@ -781,9 +854,21 @@ fn identifier_type(name: &str, nullable: bool, names: &TypeNames) -> Result<Retu
         name if !nullable && names.enumerations.contains(name) => {
             Ok(ReturnType::Enumeration(name.into()))
         }
-        "Document" | "XMLDocument" | "DocumentType" | "Element" | "Event" | "EventTarget"
-        | "DocumentFragment" | "Attr" | "Text" | "Comment" | "CDATASection"
-        | "ProcessingInstruction" | "HTMLCollection" => Ok(ReturnType::PlatformObject),
+        "Document"
+        | "XMLDocument"
+        | "DocumentType"
+        | "Element"
+        | "Event"
+        | "EventTarget"
+        | "DocumentFragment"
+        | "Attr"
+        | "Text"
+        | "Comment"
+        | "CDATASection"
+        | "ProcessingInstruction"
+        | "HTMLCollection"
+        | "DOMTokenList"
+        | "DOMStringMap" => Ok(ReturnType::PlatformObject),
         _ => Err(Error(format!("unsupported interface type: {name}"))),
     }
 }
@@ -945,8 +1030,7 @@ fn is_unsigned_short(type_: IntegerType) -> bool {
 /// (<https://webidl.spec.whatwg.org/#idl-constants>) into its `unsigned short`
 /// value.
 fn parse_const_integer(digits: &str, radix: u32) -> Result<u16, Error> {
-    u16::from_str_radix(digits, radix)
-        .map_err(|error| Error(format!("invalid constant: {error}")))
+    u16::from_str_radix(digits, radix).map_err(|error| Error(format!("invalid constant: {error}")))
 }
 
 /// Interface identifiers the generator can carry as platform objects, so a
