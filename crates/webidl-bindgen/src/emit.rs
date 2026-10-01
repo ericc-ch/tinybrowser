@@ -272,8 +272,76 @@ fn definition(interface: &Interface, payload: &TokenStream, required: usize) -> 
     }
 }
 
+struct NamedHooks {
+    descriptor: TokenStream,
+    names: TokenStream,
+    define: TokenStream,
+    set: TokenStream,
+    delete: TokenStream,
+}
+
+impl NamedHooks {
+    fn none() -> Self {
+        Self {
+            descriptor: quote! { return Ok(None); },
+            names: quote! {},
+            define: quote! {},
+            set: quote! {},
+            delete: quote! { return Ok(true); },
+        }
+    }
+
+    fn parse(interface: &Interface) -> Self {
+        let PropertyHooks::IndexedNamed { names, unenumerable } = &interface.properties else {
+            return Self::none();
+        };
+        let named_item = &interface
+            .operations
+            .iter()
+            .find(|operation| operation.getter == Some(PropertyGetter::Named))
+            .expect("validated named item")
+            .rust;
+        let enumerable = !unenumerable;
+        Self {
+            descriptor: quote! {
+                if receiver.#names(ctx)?.contains(&name)
+                    && crate::js::bindings::named_key_visible(&object, &name)? {
+                    let value = receiver.#named_item(ctx.clone(), rquickjs::String::from_str(ctx.clone(), &name)?)?;
+                    return Ok(Some(rquickjs::class::PropertyDescriptor::new_value(value, true, #enumerable, false)));
+                }
+                return Ok(None);
+            },
+            names: quote! {
+                for name in this.borrow().#names(ctx)? {
+                    if crate::js::bindings::array_index(&name).is_none()
+                        && crate::js::bindings::named_key_visible(&object, &name)? {
+                        names.push(rquickjs::class::PropertyName {
+                            atom: rquickjs::Atom::from_str(ctx.clone(), &name)?,
+                            is_enumerable: #enumerable,
+                        });
+                    }
+                }
+            },
+            define: quote! {
+                if this.borrow().#names(ctx)?.contains(&name) {
+                    return Ok(rquickjs::class::ExoticDefineResult::Handled(false));
+                }
+            },
+            set: quote! {
+                if object != receiver && crate::js::bindings::array_index(&name).is_none() {
+                    return Ok(rquickjs::class::ExoticSetResult::FallthroughSkippingOwnProperty);
+                }
+            },
+            delete: quote! {
+                return Ok(!this.borrow().#names(ctx)?.contains(&name)
+                    || !crate::js::bindings::named_key_visible(&object, &name)?);
+            },
+        }
+    }
+}
+
 fn indexed_property_hooks(interface: &Interface) -> TokenStream {
-    if !matches!(interface.properties, PropertyHooks::Indexed) {
+    if !matches!(interface.properties, PropertyHooks::Indexed | PropertyHooks::IndexedNamed { .. }) {
         return quote! {};
     }
     let length = &interface
@@ -288,6 +356,38 @@ fn indexed_property_hooks(interface: &Interface) -> TokenStream {
         .find(|operation| operation.getter == Some(PropertyGetter::Indexed))
         .expect("validated indexed item")
         .rust;
+    let named = NamedHooks::parse(interface);
+    let object = if matches!(interface.properties, PropertyHooks::IndexedNamed { .. }) {
+        format_ident!("object")
+    } else {
+        format_ident!("_object")
+    };
+    let define_receiver = if matches!(interface.properties, PropertyHooks::IndexedNamed { .. }) {
+        format_ident!("this")
+    } else {
+        format_ident!("_this")
+    };
+    let mutable_names = if matches!(interface.properties, PropertyHooks::IndexedNamed { .. }) {
+        quote! { mut }
+    } else {
+        quote! {}
+    };
+    indexed_hooks_body(length, item, &named, &object, &define_receiver, &mutable_names)
+}
+
+fn indexed_hooks_body(
+    length: &proc_macro2::Ident,
+    item: &proc_macro2::Ident,
+    hooks: &NamedHooks,
+    object: &proc_macro2::Ident,
+    define_receiver: &proc_macro2::Ident,
+    mutable_names: &TokenStream,
+) -> TokenStream {
+    let descriptor = &hooks.descriptor;
+    let supported = &hooks.names;
+    let define = &hooks.define;
+    let set = &hooks.set;
+    let delete = &hooks.delete;
     quote! {
         const KIND: rquickjs::class::ClassKind = rquickjs::class::ClassKind::Exotic;
         const EXOTIC_HOOKS: rquickjs::class::ExoticHooks = rquickjs::class::ExoticHooks {
@@ -298,11 +398,11 @@ fn indexed_property_hooks(interface: &Interface) -> TokenStream {
         // https://webidl.spec.whatwg.org/#legacy-platform-object-getownproperty
         fn exotic_get_own_property(
             this: &rquickjs::class::JsCell<'js, Self>, ctx: &Ctx<'js>,
-            atom: rquickjs::Atom<'js>, _object: Value<'js>,
+            atom: rquickjs::Atom<'js>, #object: Value<'js>,
         ) -> Result<Option<rquickjs::class::PropertyDescriptor<'js>>> {
             let Some(name) = crate::js::bindings::atom_name(ctx, &atom) else { return Ok(None); };
-            let Some(index) = crate::js::bindings::array_index(&name) else { return Ok(None); };
             let receiver = this.borrow();
+            let Some(index) = crate::js::bindings::array_index(&name) else { #descriptor };
             if index as usize >= receiver.#length(ctx)? { return Ok(None); }
             let value = receiver.#item(ctx.clone(), index)?;
             Ok(Some(rquickjs::class::PropertyDescriptor::new_value(value, true, true, false)))
@@ -310,28 +410,32 @@ fn indexed_property_hooks(interface: &Interface) -> TokenStream {
 
         // https://webidl.spec.whatwg.org/#legacy-platform-object-ownpropertykeys
         fn exotic_get_own_property_names(
-            this: &rquickjs::class::JsCell<'js, Self>, ctx: &Ctx<'js>, _object: Value<'js>,
+            this: &rquickjs::class::JsCell<'js, Self>, ctx: &Ctx<'js>, #object: Value<'js>,
         ) -> Result<Vec<rquickjs::class::PropertyName<'js>>> {
-            (0..this.borrow().#length(ctx)?)
+            let #mutable_names names = (0..this.borrow().#length(ctx)?)
                 .map(|index| Ok(rquickjs::class::PropertyName {
                     atom: rquickjs::Atom::from_u32(ctx.clone(), u32::try_from(index)
                         .map_err(|_| rquickjs::Exception::throw_range(ctx, "collection index too large"))?)?,
                     is_enumerable: true,
                 }))
-                .collect()
+                .collect::<Result<Vec<_>>>()?;
+            #supported
+            Ok(names)
         }
 
         // https://webidl.spec.whatwg.org/#legacy-platform-object-defineownproperty
         fn exotic_define_own_property(
-            _this: &rquickjs::class::JsCell<'js, Self>, ctx: &Ctx<'js>,
+            #define_receiver: &rquickjs::class::JsCell<'js, Self>, ctx: &Ctx<'js>,
             atom: rquickjs::Atom<'js>, _value: Value<'js>, _is_data: bool,
         ) -> Result<rquickjs::class::ExoticDefineResult> {
             let Some(name) = crate::js::bindings::atom_name(ctx, &atom) else {
                 return Ok(rquickjs::class::ExoticDefineResult::Fallthrough);
             };
-            Ok(if crate::js::bindings::array_index(&name).is_some() {
-                rquickjs::class::ExoticDefineResult::Handled(false)
-            } else { rquickjs::class::ExoticDefineResult::Fallthrough })
+            if crate::js::bindings::array_index(&name).is_some() {
+                return Ok(rquickjs::class::ExoticDefineResult::Handled(false));
+            }
+            #define
+            Ok(rquickjs::class::ExoticDefineResult::Fallthrough)
         }
 
         // https://webidl.spec.whatwg.org/#legacy-platform-object-set
@@ -342,16 +446,17 @@ fn indexed_property_hooks(interface: &Interface) -> TokenStream {
             let Some(name) = crate::js::bindings::atom_name(ctx, &atom) else {
                 return Ok(rquickjs::class::ExoticSetResult::Fallthrough);
             };
+            #set
             Ok(crate::js::bindings::reject_indexed_write(&name, &object, &receiver))
         }
 
         // https://webidl.spec.whatwg.org/#legacy-platform-object-delete
         fn exotic_delete_property(
             this: &rquickjs::class::JsCell<'js, Self>, ctx: &Ctx<'js>,
-            atom: rquickjs::Atom<'js>, _object: Value<'js>,
+            atom: rquickjs::Atom<'js>, #object: Value<'js>,
         ) -> Result<bool> {
             let Some(name) = crate::js::bindings::atom_name(ctx, &atom) else { return Ok(true); };
-            let Some(index) = crate::js::bindings::array_index(&name) else { return Ok(true); };
+            let Some(index) = crate::js::bindings::array_index(&name) else { #delete };
             Ok(index as usize >= this.borrow().#length(ctx)?)
         }
     }

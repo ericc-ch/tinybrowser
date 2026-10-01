@@ -1,14 +1,10 @@
 (function() {
   const isOptionNode = globalThis.__tbIsOptionNode;
   const appendBlankOptions = globalThis.__tbAppendBlankOptions;
-  const collectionNamed = globalThis.__tbCollectionNamed;
-  const collectionLength = globalThis.__tbCollectionLength;
   const windowNamedValue = globalThis.__tbWindowNamedValue;
   const windowNamedHas = globalThis.__tbWindowNamedHas;
   delete globalThis.__tbIsOptionNode;
   delete globalThis.__tbAppendBlankOptions;
-  delete globalThis.__tbCollectionNamed;
-  delete globalThis.__tbCollectionLength;
   delete globalThis.__tbWindowNamedValue;
   delete globalThis.__tbWindowNamedHas;
   const toUnsignedLong = value => {
@@ -61,10 +57,7 @@
   Object.defineProperty(proto, Symbol.toStringTag, {
     value: 'HTMLCollection', writable: false, enumerable: false, configurable: true,
   });
-  Object.defineProperty(proto, 'namedItem', {
-    value: function(name) { return collectionNamed(this, String(name)); },
-    writable: true, enumerable: true, configurable: true,
-  });
+  const collectionLength = Object.getOwnPropertyDescriptor(proto, 'length').get;
   // <https://html.spec.whatwg.org/multipage/common-dom-interfaces.html#htmloptionscollection>
   const optionsCtor = globalThis.HTMLOptionsCollection;
   const optionsProto = optionsCtor.prototype;
@@ -117,7 +110,7 @@
   });
   Object.defineProperties(optionsProto, {
     length: {
-      get: function() { return collectionLength(this); },
+      get: function() { return collectionLength.call(this); },
       set: function(value) {
         const select = optionOwners.get(this);
         const length = toUnsignedLong(value);

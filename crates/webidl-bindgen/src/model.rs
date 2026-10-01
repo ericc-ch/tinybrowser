@@ -35,6 +35,10 @@ pub(crate) enum PropertyHooks {
     None,
     JavaScript,
     Indexed,
+    IndexedNamed {
+        names: Ident,
+        unenumerable: bool,
+    },
 }
 
 pub(crate) enum InterfaceKind {
@@ -413,7 +417,7 @@ impl Interface {
                 ));
             }
         }
-        if matches!(self.properties, PropertyHooks::Indexed) {
+        if matches!(self.properties, PropertyHooks::Indexed | PropertyHooks::IndexedNamed { .. }) {
             if matches!(self.kind, InterfaceKind::Partial)
                 || !self.attributes.iter().any(|attribute| {
                     attribute.name == "length"
@@ -437,6 +441,17 @@ impl Interface {
                 return Err(Error(
                     "indexed hooks require a value-returning unsigned long getter".into(),
                 ));
+            }
+            if matches!(self.properties, PropertyHooks::IndexedNamed { .. })
+                && !self.operations.iter().any(|operation| {
+                    operation.getter == Some(PropertyGetter::Named)
+                        && matches!(operation.result, OperationResult::Object)
+                        && !operation.takes_this
+                        && !operation.reactions
+                        && operation.arguments[0].from_js.is_none()
+                })
+            {
+                return Err(Error("named hooks require a value-returning DOMString getter".into()));
             }
         }
         Ok(())
@@ -1406,14 +1421,23 @@ impl Attributes {
             .transpose()
     }
     fn property_hooks(&mut self) -> Result<PropertyHooks, Error> {
+        let names: Option<Ident> = self.rust_mapping("RustSupportedNames")?;
+        let unenumerable = self.flag("LegacyUnenumerableNamedProperties")?;
         let hooks = match self.take("RustPropertyHooks")?.as_deref() {
             None => PropertyHooks::None,
             Some("JavaScript") => PropertyHooks::JavaScript,
             Some("Indexed") => PropertyHooks::Indexed,
+            Some("IndexedNamed") => PropertyHooks::IndexedNamed {
+                names: names.clone().ok_or_else(|| Error("named hooks require RustSupportedNames".into()))?,
+                unenumerable,
+            },
             Some(_) => return Err(Error("unsupported property-hook implementation".into())),
         };
-        if self.flag("LegacyUnenumerableNamedProperties")?
-            && !matches!(hooks, PropertyHooks::JavaScript)
+        if names.is_some() && !matches!(hooks, PropertyHooks::IndexedNamed { .. }) {
+            return Err(Error("RustSupportedNames requires named hooks".into()));
+        }
+        if unenumerable
+            && !matches!(hooks, PropertyHooks::JavaScript | PropertyHooks::IndexedNamed { .. })
         {
             return Err(Error(
                 "named property annotations require property hooks".into(),

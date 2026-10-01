@@ -1605,8 +1605,9 @@ pub(super) fn live_collection<'js>(
             scope,
             JsNodeList { query },
         )?)),
-        Some("HTMLCollection") => Ok(Class::into_value(Class::instance(
-            ctx.clone(),
+        Some("HTMLCollection") => Ok(Class::into_value(host::instance_for_node(
+            ctx,
+            scope,
             JsHtmlCollection { query },
         )?)),
         Some("HTMLOptionsCollection") => Ok(Class::into_value(Class::instance(
