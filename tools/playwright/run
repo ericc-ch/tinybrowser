@@ -13,8 +13,15 @@ if ! command -v node >/dev/null 2>&1 || ! command -v npm >/dev/null 2>&1; then
 fi
 
 cd "$ROOT"
-cargo build -q --offline 2>/dev/null || cargo build -q
-export TINYBROWSER_BINARY="$("$ROOT/tools/binary-path")"
+if [[ -z "${TINYBROWSER_BINARY:-}" ]]; then
+  cargo build -q --offline 2>/dev/null || cargo build -q
+  TINYBROWSER_BINARY="$("$ROOT/tools/binary-path")"
+fi
+if [[ ! -x "$TINYBROWSER_BINARY" ]]; then
+  echo "tinybrowser binary not found at $TINYBROWSER_BINARY" >&2
+  exit 1
+fi
+export TINYBROWSER_BINARY="$(realpath "$TINYBROWSER_BINARY")"
 
 cd "$ROOT/tools/playwright"
 if [ ! -d node_modules ]; then
