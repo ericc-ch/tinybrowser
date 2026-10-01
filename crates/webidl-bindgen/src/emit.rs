@@ -674,12 +674,12 @@ fn setter_dispatch((index, attribute): (usize, &Attribute)) -> Option<TokenStrea
     let id = index * 2 + 2;
     let (method, from_js) = match setter {
         Setter::Method { rust, from_js } => (rust, from_js),
-        Setter::PutForwards { target } => {
+        Setter::PutForwards { target, nullable } => {
             let name = &attribute.name;
             return Some(quote! {
                 #id => {
                     // https://webidl.spec.whatwg.org/#es-attributes
-                    host::put_forwards(params, #name, #target)
+                    host::put_forwards(params, #name, #target, #nullable)
                 }
             });
         }
@@ -717,7 +717,19 @@ fn setter_dispatch((index, attribute): (usize, &Attribute)) -> Option<TokenStrea
                     converted.0
                 }
             },
-            _ => unreachable!("validated string, boolean, or integer setter"),
+            // https://webidl.spec.whatwg.org/#es-double
+            ReturnType::Double => quote! {
+                {
+                    let value = params.arg(0).unwrap_or_else(|| Value::new_undefined(ctx.clone()));
+                    let converted: rquickjs::Coerced<f64> = rquickjs::FromJs::from_js(&ctx, value)?;
+                    converted.0
+                }
+            },
+            // `[RustValue]`: the platform setter converts the raw argument.
+            ReturnType::Value => quote! {
+                params.arg(0).unwrap_or_else(|| Value::new_undefined(ctx.clone()))
+            },
+            _ => unreachable!("validated string, boolean, integer, double, or value setter"),
         }
     };
     let body = quote! {
@@ -833,6 +845,21 @@ fn operation_argument(
     variable: &proc_macro2::Ident,
 ) -> TokenStream {
     if argument.arity == ArgumentArity::Variadic {
+        if matches!(&argument.type_, ReturnType::Value) && argument.from_js.is_none() {
+            // `[RustValue]` variadics hand the platform method the raw rest
+            // arguments, matching the `(Node or DOMString)...` signatures.
+            return quote! {
+                // https://webidl.spec.whatwg.org/#es-overloads
+                let mut values = Vec::with_capacity(params.len().saturating_sub(#index));
+                for index in #index..params.len() {
+                    values.push(
+                        params.arg(index)
+                            .unwrap_or_else(|| Value::new_undefined(ctx.clone())),
+                    );
+                }
+                let #variable = rquickjs::function::Rest(values);
+            };
+        }
         let conversion =
             operation_argument_at(&quote! { index }, argument, &format_ident!("converted"));
         return quote! {

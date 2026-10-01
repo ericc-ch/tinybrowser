@@ -369,11 +369,18 @@ pub(crate) fn put_forwards<'js>(
     params: &Params<'_, 'js>,
     name: &str,
     target: &str,
+    nullable: bool,
 ) -> Result<Value<'js>> {
     // https://webidl.spec.whatwg.org/#es-attributes
     let ctx = params.ctx();
     let object = this_object(params)?;
     let forwarded: Value = object.get(name)?;
+    // A nullable `[PutForwards]` target (`Document.location` on a detached
+    // document) makes the assignment a no-op
+    // (<https://webidl.spec.whatwg.org/#PutForwards>).
+    if nullable && (forwarded.is_null() || forwarded.is_undefined()) {
+        return Ok(Value::new_undefined(ctx.clone()));
+    }
     let forwarded = forwarded
         .into_object()
         .ok_or_else(|| Exception::throw_type(ctx, "forwarded attribute is not an object"))?;

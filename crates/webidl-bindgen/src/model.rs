@@ -148,6 +148,9 @@ pub(crate) enum Setter {
     },
     PutForwards {
         target: String,
+        /// The attributed type is nullable, so forwarding must no-op when the
+        /// getter returns null (`Document.location` on a detached document).
+        nullable: bool,
     },
 }
 
@@ -565,8 +568,12 @@ impl Operation {
         let takes_this = attributes.flag("RustThis")?;
         let new_object = attributes.flag("NewObject")?;
         let reactions = attributes.flag("CEReactions")?;
+        // `[RustValue]` means the platform method returns the JS value directly,
+        // so the IDL result type documents the spec shape without resolution.
+        let rust_value = attributes.flag("RustValue")?;
         attributes.finish()?;
         if new_object
+            && !rust_value
             && !matches!(
                 &member.return_type,
                 weedle::types::ReturnType::Type(Type::Single(SingleType::NonAny(NonAnyType::Identifier(value))))
@@ -579,27 +586,31 @@ impl Operation {
                 "NewObject requires a non-nullable interface result".into(),
             ));
         }
-        let result = match &member.return_type {
-            weedle::types::ReturnType::Undefined(_) => OperationResult::Undefined,
-            weedle::types::ReturnType::Type(type_) => match ReturnType::parse(type_, names)? {
-                ReturnType::Node
-                | ReturnType::NullableNode
-                | ReturnType::PlatformObject
-                | ReturnType::NullableString
-                | ReturnType::NodeList => OperationResult::Object,
-                ReturnType::InterfaceSequence => OperationResult::Sequence,
-                ReturnType::StringSequence => OperationResult::StringSequence,
-                ReturnType::String => OperationResult::String,
-                ReturnType::Boolean => OperationResult::Boolean,
-                ReturnType::UnsignedShort => OperationResult::UnsignedShort,
-                ReturnType::Long => OperationResult::Long,
-                _ => {
-                    return Err(Error(
+        let result = if rust_value {
+            OperationResult::Object
+        } else {
+            match &member.return_type {
+                weedle::types::ReturnType::Undefined(_) => OperationResult::Undefined,
+                weedle::types::ReturnType::Type(type_) => match ReturnType::parse(type_, names)? {
+                    ReturnType::Node
+                    | ReturnType::NullableNode
+                    | ReturnType::PlatformObject
+                    | ReturnType::NullableString
+                    | ReturnType::NodeList => OperationResult::Object,
+                    ReturnType::InterfaceSequence => OperationResult::Sequence,
+                    ReturnType::StringSequence => OperationResult::StringSequence,
+                    ReturnType::String => OperationResult::String,
+                    ReturnType::Boolean => OperationResult::Boolean,
+                    ReturnType::UnsignedShort => OperationResult::UnsignedShort,
+                    ReturnType::Long => OperationResult::Long,
+                    _ => {
+                        return Err(Error(
                             "only Node, undefined, string, interface sequence, boolean, and unsigned short operation results are supported yet"
                                 .into(),
                         ));
-                }
-            },
+                    }
+                },
+            }
         };
         let mut arguments = Vec::new();
         let mut taken = HashSet::new();
@@ -704,14 +715,21 @@ impl OperationArgument {
             || type_attributes.flag("LegacyNullToEmptyString")?;
         argument_attributes.finish()?;
         type_attributes.finish()?;
-        let type_ = if rust_value {
+        // `[RustValue]` and `[RustFromJs]` both mean the argument conversion is
+        // supplied by the platform method, so the IDL type documents the spec
+        // shape without the generator resolving it.
+        let type_ = if rust_value || from_js.is_some() {
             ReturnType::Value
         } else {
             ReturnType::parse(type_, names)?
         };
         let optional = arity == ArgumentArity::Optional;
-        if arity == ArgumentArity::Variadic && !matches!(type_, ReturnType::String) {
-            return Err(Error("only DOMString variadics are supported yet".into()));
+        if arity == ArgumentArity::Variadic
+            && !matches!(type_, ReturnType::String | ReturnType::Value)
+        {
+            return Err(Error(
+                "only DOMString and [RustValue] variadics are supported yet".into(),
+            ));
         }
         let null_default =
             default.is_some_and(|default| matches!(default.value, DefaultValue::Null(_)));
@@ -748,12 +766,9 @@ fn validate_optional_default(
         (ReturnType::Boolean | ReturnType::String, true, None)
         | (ReturnType::Dictionary(_), true, Some(DefaultValue::EmptyDictionary(_))) => Ok(()),
         (ReturnType::NullableDocumentType, true, Some(_)) if null_default => Ok(()),
-        (ReturnType::Value, true, Some(DefaultValue::EmptyDictionary(_) | DefaultValue::Null(_)))
-            if rust_value =>
-        {
-            Ok(())
-        }
-        (ReturnType::Value, true, None) if rust_value => Ok(()),
+        // A `[RustValue]` argument lets the platform method observe the raw
+        // argument, including whether it was omitted, so any default is fine.
+        (_, true, _) if rust_value => Ok(()),
         (_, true, _) | (_, _, Some(_)) => Err(Error(
             "only trailing optional dictionaries with {} defaults are supported yet".into(),
         )),
@@ -837,7 +852,6 @@ impl Attribute {
             member.readonly.is_some(),
             rust_value,
             &member.type_.type_,
-            names,
         )?;
         attributes.finish()?;
         type_attributes.finish()?;
@@ -861,10 +875,12 @@ impl Attribute {
                         | ReturnType::Boolean
                         | ReturnType::UnsignedLong
                         | ReturnType::Long
+                        | ReturnType::Double
+                        | ReturnType::Value
                 ))
         {
             return Err(Error(
-                "only method-mapped string and boolean setters are supported yet".into(),
+                "only method-mapped string, boolean, integer, double, and value setters are supported yet".into(),
             ));
         }
         match (&mapping, &return_type, same_object, has_lifetime) {
@@ -911,7 +927,6 @@ impl Setter {
         readonly: bool,
         rust_value: bool,
         type_: &Type<'_>,
-        names: &TypeNames,
     ) -> Result<Option<Self>, Error> {
         let rust = attributes
             .take("RustSet")?
@@ -922,18 +937,18 @@ impl Setter {
             .transpose()?;
         let from_js = attributes.rust_mapping("RustSetFromJs")?;
         let put_forwards = attributes.take("PutForwards")?;
-        if put_forwards.is_some()
-            && (!matches!(type_, Type::Single(SingleType::NonAny(NonAnyType::Identifier(type_))) if type_.q_mark.is_none())
-                || !matches!(
-                    ReturnType::parse(type_, names)?,
-                    ReturnType::Node | ReturnType::NodeList | ReturnType::PlatformObject
-                ))
-        {
+        let put_forwards_nullable = match &put_forwards {
             // https://webidl.spec.whatwg.org/#PutForwards
-            return Err(Error(
-                "PutForwards requires a non-nullable interface type".into(),
-            ));
-        }
+            Some(_) => match type_ {
+                Type::Single(SingleType::NonAny(NonAnyType::Identifier(type_))) => {
+                    type_.q_mark.is_some()
+                }
+                _ => {
+                    return Err(Error("PutForwards requires an interface type".into()));
+                }
+            },
+            None => false,
+        };
         if readonly == rust.is_some() {
             return Err(Error(
                 "writable attributes require RustSet; readonly attributes forbid it".into(),
@@ -946,6 +961,7 @@ impl Setter {
             (Some(rust), None) => Ok(Some(Self::Method { rust, from_js })),
             (None, Some(target)) if readonly && rust_value => Ok(Some(Self::PutForwards {
                 target: identifier(&target)?.into(),
+                nullable: put_forwards_nullable,
             })),
             (None, Some(_)) => Err(Error(
                 "PutForwards requires a readonly platform object".into(),

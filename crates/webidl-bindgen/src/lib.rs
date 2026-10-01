@@ -105,6 +105,16 @@ mod tests {
         };
     ";
 
+    const NEW_SIGNATURES: &str = r"
+        [Exposed=Window, Rust=Payload] partial interface Sample {
+            [RustValue, Rust=append] undefined append([RustValue] (Node or DOMString)... nodes);
+            [RustValue, Rust=attach_shadow] ShadowRoot attachShadow([RustValue] ShadowRootInit init);
+            [RustValue, Rust=style, RustSet=set_style, RustSetFromJs=WebIdlString] attribute DOMString style;
+            [Rust=scroll_left, RustSet=set_scroll_left] attribute double scrollLeft;
+            [RustValue, Rust=location, PutForwards=href] readonly attribute Location? location;
+        };
+    ";
+
     #[test]
     fn supported_fixtures_emit_complete_rust_modules() {
         for (source, module) in [
@@ -126,6 +136,21 @@ mod tests {
                 panic!("expected one generated module");
             };
             assert_eq!(item.ident, module);
+        }
+    }
+
+    #[test]
+    fn value_variadics_and_extended_setters_emit() {
+        let output = compile(NEW_SIGNATURES).expect("compile new signature fixture");
+        for fragment in [
+            "rquickjs :: function :: Rest",
+            "put_forwards",
+            "Coerced < f64 >",
+        ] {
+            assert!(
+                output.replace(' ', "").contains(&fragment.replace(' ', "")),
+                "new signature output must contain {fragment}"
+            );
         }
     }
 
@@ -175,9 +200,6 @@ mod tests {
             INPUT.replace("Rust=Payload", "Rust=Payload, RustAlternateLifetime"),
             INPUT.replace("Rust=label", "Rust=label, RustSetFromJs=Converted"),
             INPUT.replace("Rust=label", "Rust=label, RustValue, PutForwards=value"),
-            INPUT
-                .replace("DOMString label;", "DOMTokenList? label;")
-                .replace("Rust=label", "Rust=label, RustValue, PutForwards=value"),
             PARTIAL.replace("Node node", "optional Node node"),
             PARTIAL.replace("Node node", "Node... node"),
             "[Exposed=Window, Rust=Payload, RustPropertyHooks=Indexed] interface Bad { [Rust=length] readonly attribute unsigned long length; [Rust=item] getter DOMString? item([RustValue] unsigned long index); };".into(),
