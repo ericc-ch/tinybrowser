@@ -396,7 +396,7 @@ fn from_js_argument(
 ) -> TokenStream {
     quote! {
         let value = params.arg(#index).unwrap_or_else(|| Value::new_undefined(ctx.clone()));
-        let #variable: #path = rquickjs::FromJs::from_js(&ctx, value)?;
+        let #variable: super::#path = rquickjs::FromJs::from_js(&ctx, value)?;
     }
 }
 

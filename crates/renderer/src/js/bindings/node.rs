@@ -33,6 +33,8 @@ use crate::ReadyState;
 
 include!(concat!(env!("OUT_DIR"), "/Node.rs"));
 include!(concat!(env!("OUT_DIR"), "/Document.rs"));
+include!(concat!(env!("OUT_DIR"), "/DocumentFragment.rs"));
+include!(concat!(env!("OUT_DIR"), "/Element.rs"));
 include!(concat!(env!("OUT_DIR"), "/CharacterData.rs"));
 include!(concat!(env!("OUT_DIR"), "/DocumentType.rs"));
 include!(concat!(env!("OUT_DIR"), "/ProcessingInstruction.rs"));
@@ -40,6 +42,8 @@ include!(concat!(env!("OUT_DIR"), "/ProcessingInstruction.rs"));
 pub(super) fn install(ctx: &Ctx<'_>) -> Result<()> {
     node_generated::install(ctx)?;
     document_generated::install(ctx)?;
+    document_fragment_generated::install(ctx)?;
+    element_generated::install(ctx)?;
     character_data_generated::install(ctx)?;
     document_type_generated::install(ctx)?;
     processing_instruction_generated::install(ctx)
@@ -676,7 +680,7 @@ impl JsNode {
     }
 
     // https://drafts.csswg.org/cssom-view/#dom-document-elementfrompoint
-    #[qjs(rename = "elementFromPoint")]
+    #[qjs(skip)]
     fn element_from_point<'js>(&self, ctx: Ctx<'js>, x: f64, y: f64) -> Result<Value<'js>> {
         let Some(node) = element_at_point(&ctx, self.handle.0, x, y)? else {
             return Ok(Value::new_null(ctx));
@@ -686,39 +690,37 @@ impl JsNode {
 
     // The no-layout hit test: the deepest element whose virtual box contains
     // the point (see `element_at_point`).
-    #[qjs(rename = "elementsFromPoint")]
-    fn elements_from_point<'js>(&self, ctx: Ctx<'js>, x: f64, y: f64) -> Result<Array<'js>> {
-        let array = Array::new(ctx.clone())?;
+    #[qjs(skip)]
+    fn elements_from_point<'js>(&self, ctx: Ctx<'js>, x: f64, y: f64) -> Result<Vec<Value<'js>>> {
+        let mut elements = Vec::new();
         let Some(node) = element_at_point(&ctx, self.handle.0, x, y)? else {
-            return Ok(array);
+            return Ok(elements);
         };
         // The hit-test stack: the element and its ancestors, topmost first.
         let world = world_for_node(&ctx, node)?;
-        let mut index = 0;
         let mut cursor = Some(node);
         while let Some(current) = cursor {
-            array.set(index, wrap_node(&ctx, current)?)?;
-            index += 1;
+            elements.push(wrap_node(&ctx, current)?);
             cursor = world.borrow().node_parent(current);
         }
-        Ok(array)
+        Ok(elements)
     }
 
     // https://dom.spec.whatwg.org/#dom-document-createevent
-    #[qjs(rename = "createEvent")]
+    #[qjs(skip)]
     fn create_event<'js>(&self, ctx: Ctx<'js>, interface: Value<'js>) -> Result<Value<'js>> {
         let interface = webidl_to_string(&ctx, interface)?;
         events::create_event(&ctx, &interface)
     }
 
-    #[qjs(rename = "createElement")]
+    #[qjs(skip)]
     fn create_element<'js>(&self, ctx: Ctx<'js>, tag: WebIdlString) -> Result<Value<'js>> {
         create_html_element(&ctx, self.handle.0, &tag.0)
     }
 
     // https://dom.spec.whatwg.org/#dom-document-createelementns
     // https://dom.spec.whatwg.org/#internal-createelementns-steps
-    #[qjs(rename = "createElementNS")]
+    #[qjs(skip)]
     fn create_element_ns<'js>(
         &self,
         ctx: Ctx<'js>,
@@ -729,19 +731,19 @@ impl JsNode {
         create_element_named(&ctx, self.handle.0, name)
     }
 
-    #[qjs(rename = "createTextNode")]
+    #[qjs(skip)]
     fn create_text_node<'js>(&self, ctx: Ctx<'js>, data: WebIdlCodeUnits) -> Result<Value<'js>> {
         create_kind(&ctx, self.handle.0, |dom| dom.create_text(data.0))
     }
 
     // https://dom.spec.whatwg.org/#dom-document-createcomment
-    #[qjs(rename = "createComment")]
+    #[qjs(skip)]
     fn create_comment<'js>(&self, ctx: Ctx<'js>, data: WebIdlCodeUnits) -> Result<Value<'js>> {
         create_kind(&ctx, self.handle.0, |dom| dom.create_comment(data.0))
     }
 
     // https://dom.spec.whatwg.org/#dom-document-createprocessinginstruction
-    #[qjs(rename = "createProcessingInstruction")]
+    #[qjs(skip)]
     fn create_processing_instruction<'js>(
         &self,
         ctx: Ctx<'js>,
@@ -773,7 +775,7 @@ impl JsNode {
     }
 
     // https://dom.spec.whatwg.org/#dom-document-createcdatasection
-    #[qjs(rename = "createCDATASection")]
+    #[qjs(skip)]
     fn create_cdata_section<'js>(
         &self,
         ctx: Ctx<'js>,
@@ -799,7 +801,7 @@ impl JsNode {
     }
 
     // https://dom.spec.whatwg.org/#dom-document-createattribute
-    #[qjs(rename = "createAttribute")]
+    #[qjs(skip)]
     fn create_attribute<'js>(&self, ctx: Ctx<'js>, name: WebIdlString) -> Result<Value<'js>> {
         if !valid_attribute_local_name(&name.0) {
             return Err(throw_dom(
@@ -820,7 +822,7 @@ impl JsNode {
     }
 
     // https://dom.spec.whatwg.org/#dom-document-createattributens
-    #[qjs(rename = "createAttributeNS")]
+    #[qjs(skip)]
     fn create_attribute_ns<'js>(
         &self,
         ctx: Ctx<'js>,
@@ -850,18 +852,18 @@ impl JsNode {
     }
 
     // https://dom.spec.whatwg.org/#dom-document-createdocumentfragment
-    #[qjs(rename = "createDocumentFragment")]
+    #[qjs(skip)]
     fn create_document_fragment<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
         create_kind(&ctx, self.handle.0, dom::Document::create_fragment)
     }
 
     // https://dom.spec.whatwg.org/#dom-document-importnode
-    #[qjs(rename = "importNode")]
+    #[qjs(skip)]
     fn import_node<'js>(
         &self,
         ctx: Ctx<'js>,
         node: Value<'js>,
-        deep: Opt<bool>,
+        deep: bool,
     ) -> Result<Value<'js>> {
         let source_id = required_node(&ctx, &node)?;
         let world_rc = world_for_node(&ctx, self.handle.0)?;
@@ -877,7 +879,7 @@ impl JsNode {
                     "cannot import a document",
                 ));
             }
-            import_snapshot(&source.document, source_id, deep.0.unwrap_or(false))
+            import_snapshot(&source.document, source_id, deep)
         };
         let Some(tree) = tree else {
             return Err(Exception::throw_type(&ctx, "stale node"));
@@ -894,7 +896,7 @@ impl JsNode {
     }
 
     // https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-document-open
-    #[qjs(rename = "open")]
+    #[qjs(skip)]
     fn open_document<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
         world_for_node(&ctx, self.handle.0)?
             .borrow_mut()
@@ -928,7 +930,7 @@ impl JsNode {
     }
 
     // https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-document-close
-    #[qjs(rename = "close")]
+    #[qjs(skip)]
     fn close_document(&self, ctx: Ctx<'_>) -> Result<()> {
         world_for_node(&ctx, self.handle.0)?
             .borrow_mut()
@@ -936,7 +938,7 @@ impl JsNode {
             .map_err(|()| Exception::throw_range(&ctx, "document stream budget exceeded"))
     }
 
-    #[qjs(rename = "getElementById")]
+    #[qjs(skip)]
     fn get_element_by_id<'js>(&self, ctx: Ctx<'js>, id: WebIdlString) -> Result<Value<'js>> {
         let world = world(&ctx)?;
         let found = {
@@ -975,7 +977,7 @@ impl JsNode {
         Ok(value)
     }
 
-    #[qjs(rename = "getElementsByTagName")]
+    #[qjs(skip)]
     fn get_elements_by_tag_name<'js>(
         &self,
         ctx: Ctx<'js>,
@@ -2939,7 +2941,7 @@ impl JsNode {
     }
 
     // https://html.spec.whatwg.org/multipage/dom.html#dom-document-getelementsbyname
-    #[qjs(rename = "getElementsByName")]
+    #[qjs(skip)]
     fn get_elements_by_name<'js>(&self, ctx: Ctx<'js>, name: WebIdlString) -> Result<Value<'js>> {
         live_collection(
             &ctx,
@@ -2950,7 +2952,7 @@ impl JsNode {
     }
 
     // https://dom.spec.whatwg.org/#dom-element-getelementsbytagnamens
-    #[qjs(rename = "getElementsByTagNameNS")]
+    #[qjs(skip)]
     fn get_elements_by_tag_name_ns<'js>(
         &self,
         ctx: Ctx<'js>,

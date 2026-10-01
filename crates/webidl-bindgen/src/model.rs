@@ -358,9 +358,10 @@ impl Operation {
         let result = match &member.return_type {
             weedle::types::ReturnType::Undefined(_) => OperationResult::Undefined,
             weedle::types::ReturnType::Type(type_) => match ReturnType::parse(type_, names)? {
-                ReturnType::Node | ReturnType::PlatformObject | ReturnType::NullableString => {
-                    OperationResult::Object
-                }
+                ReturnType::Node
+                | ReturnType::PlatformObject
+                | ReturnType::NullableString
+                | ReturnType::NodeList => OperationResult::Object,
                 ReturnType::InterfaceSequence => OperationResult::Sequence,
                 ReturnType::String => OperationResult::String,
                 ReturnType::Boolean => OperationResult::Boolean,
@@ -714,6 +715,12 @@ impl ReturnType {
             {
                 Ok(Self::Boolean)
             }
+            // https://webidl.spec.whatwg.org/#idl-floating-point
+            Type::Single(SingleType::NonAny(NonAnyType::FloatingPoint(value)))
+                if value.q_mark.is_none() =>
+            {
+                Ok(Self::Double)
+            }
             Type::Single(SingleType::NonAny(NonAnyType::DOMString(value))) => {
                 Ok(if value.q_mark.is_some() {
                     Self::NullableString
@@ -748,31 +755,36 @@ impl ReturnType {
                 }
             }
             Type::Single(SingleType::NonAny(NonAnyType::Identifier(value))) => {
-                match value.type_.0 {
-                    "Node" => Ok(if value.q_mark.is_some() {
-                        Self::NullableNode
-                    } else {
-                        Self::Node
-                    }),
-                    "NodeList" if value.q_mark.is_none() => Ok(Self::NodeList),
-                    "DocumentType" if value.q_mark.is_some() => Ok(Self::NullableDocumentType),
-                    "DOMHighResTimeStamp" if value.q_mark.is_none() => Ok(Self::Double),
-                    name if value.q_mark.is_none() && names.callbacks.contains(name) => {
-                        Ok(Self::Callback)
-                    }
-                    name if value.q_mark.is_none() && names.dictionaries.contains(name) => {
-                        Ok(Self::Dictionary(name.into()))
-                    }
-                    name if value.q_mark.is_none() && names.enumerations.contains(name) => {
-                        Ok(Self::Enumeration(name.into()))
-                    }
-                    "Document" | "XMLDocument" | "DocumentType" | "Element" | "Event"
-                    | "EventTarget" => Ok(Self::PlatformObject),
-                    _ => Err(Error(format!("unsupported interface type: {value:?}"))),
-                }
+                identifier_type(value.type_.0, value.q_mark.is_some(), names)
             }
             _ => Err(Error(format!("unsupported binding type: {type_:?}"))),
         }
+    }
+}
+
+/// A named IDL type: a callback, dictionary, enumeration, or an interface the
+/// generator can carry as a platform object.
+fn identifier_type(name: &str, nullable: bool, names: &TypeNames) -> Result<ReturnType, Error> {
+    match name {
+        "Node" => Ok(if nullable {
+            ReturnType::NullableNode
+        } else {
+            ReturnType::Node
+        }),
+        "NodeList" if !nullable => Ok(ReturnType::NodeList),
+        "DocumentType" if nullable => Ok(ReturnType::NullableDocumentType),
+        "DOMHighResTimeStamp" if !nullable => Ok(ReturnType::Double),
+        name if !nullable && names.callbacks.contains(name) => Ok(ReturnType::Callback),
+        name if !nullable && names.dictionaries.contains(name) => {
+            Ok(ReturnType::Dictionary(name.into()))
+        }
+        name if !nullable && names.enumerations.contains(name) => {
+            Ok(ReturnType::Enumeration(name.into()))
+        }
+        "Document" | "XMLDocument" | "DocumentType" | "Element" | "Event" | "EventTarget"
+        | "DocumentFragment" | "Attr" | "Text" | "Comment" | "CDATASection"
+        | "ProcessingInstruction" | "HTMLCollection" => Ok(ReturnType::PlatformObject),
+        _ => Err(Error(format!("unsupported interface type: {name}"))),
     }
 }
 
