@@ -660,9 +660,24 @@ fn add_referenced_definitions(
     for name in referenced {
         match database.definition(&name) {
             Some(weedle::Definition::Dictionary(_)) => {
-                interface
-                    .dictionaries
-                    .push(lower_dictionary(database, &name)?);
+                let dictionary = lower_dictionary(database, &name)?;
+                // Dictionaries name their own dependencies: enumerations
+                // their fields convert through.
+                for field in &dictionary.fields {
+                    if let model::DictionaryFieldType::Enumeration { name, .. } = &field.type_
+                        && !interface
+                            .enumerations
+                            .iter()
+                            .any(|enumeration| enumeration.name == *name)
+                        && let Some(weedle::Definition::Enum(definition)) =
+                            database.definition(name)
+                    {
+                        interface
+                            .enumerations
+                            .push(model::Enumeration::parse(definition)?);
+                    }
+                }
+                interface.dictionaries.push(dictionary);
             }
             Some(weedle::Definition::Enum(definition)) => {
                 interface
@@ -723,6 +738,156 @@ fn collect_reference(type_: &ReturnType, referenced: &mut BTreeSet<String>) {
 
 /// Lower an unchanged dictionary declaration. Field names are the IDL names
 /// snake-cased; no `Rust` annotations are read.
+/// One dictionary member's Rust representation. Anything without a
+/// generated conversion fails the build.
+fn dictionary_field_type(
+    database: &Database<'_>,
+    member: &weedle::dictionary::DictionaryMember<'_>,
+    required: bool,
+) -> Result<model::DictionaryFieldType, Error> {
+    match &member.type_.type_ {
+        Type::Single(SingleType::NonAny(NonAnyType::Boolean(value))) if value.q_mark.is_none() => {
+            let default = match &member.default {
+                None => None,
+                Some(default) => {
+                    let DefaultValue::Boolean(default) = &default.value else {
+                        return Err(Error(
+                            "only boolean dictionary defaults are supported yet".into(),
+                        ));
+                    };
+                    Some(default.0)
+                }
+            };
+            Ok(model::DictionaryFieldType::Boolean { default, required })
+        }
+        Type::Single(SingleType::NonAny(NonAnyType::Sequence(value)))
+            if value.q_mark.is_none() =>
+        {
+            let element = &value.type_.generics.body;
+            validate_empty_attributes(element.attributes.as_ref())?;
+            let is_string = matches!(
+                &element.type_,
+                Type::Single(SingleType::NonAny(NonAnyType::DOMString(element)))
+                    if element.q_mark.is_none()
+            );
+            if !is_string {
+                return Err(Error(
+                    "only sequence<DOMString> dictionary fields are supported yet".into(),
+                ));
+            }
+            if member.default.is_some() {
+                return Err(Error(
+                    "sequence dictionary defaults are not supported yet".into(),
+                ));
+            }
+            Ok(model::DictionaryFieldType::StringSequence)
+        }
+        Type::Single(SingleType::NonAny(NonAnyType::Identifier(value)))
+            if matches!(
+                database.definition(value.type_.0),
+                Some(weedle::Definition::Enum(_))
+            ) =>
+        {
+            dictionary_enum_field(database, member, value.type_.0, value.q_mark.is_some(), required)
+        }
+        Type::Single(SingleType::NonAny(NonAnyType::Identifier(value))) => {
+            dictionary_interface_field(database, member, value.type_.0, value.q_mark.is_some())
+        }
+        _ => Err(Error(format!(
+            "dictionary field type is not supported yet: {}",
+            member.identifier.0
+        ))),
+    }
+}
+
+/// An enumeration-typed dictionary member. Anything else named by the member
+/// fails the build.
+fn dictionary_enum_field(
+    database: &Database<'_>,
+    member: &weedle::dictionary::DictionaryMember<'_>,
+    name: &str,
+    nullable: bool,
+    required: bool,
+) -> Result<model::DictionaryFieldType, Error> {
+    if !matches!(
+        database.definition(name),
+        Some(weedle::Definition::Enum(_))
+    ) {
+        return Err(Error(format!(
+            "dictionary field type is not supported yet: {}",
+            member.identifier.0
+        )));
+    }
+    if required && nullable {
+        return Err(Error(format!(
+            "required dictionary field cannot be nullable: {}",
+            member.identifier.0
+        )));
+    }
+    // A default that is not a keyword would fail conversion at runtime, so
+    // resolve it to a variant at lowering instead.
+    let default = match &member.default {
+        None => None,
+        Some(default) => {
+            let DefaultValue::String(default) = &default.value else {
+                return Err(Error(
+                    "only string dictionary defaults are supported yet".into(),
+                ));
+            };
+            Some(dictionary_enum_variant(database, name, default.0)?)
+        }
+    };
+    Ok(model::DictionaryFieldType::Enumeration {
+        name: name.into(),
+        nullable,
+        default,
+        required,
+    })
+}
+
+/// An interface- or callback-interface-typed dictionary member.
+fn dictionary_interface_field(
+    database: &Database<'_>,
+    member: &weedle::dictionary::DictionaryMember<'_>,
+    name: &str,
+    nullable: bool,
+) -> Result<model::DictionaryFieldType, Error> {
+    if !matches!(
+        database.definition(name),
+        Some(weedle::Definition::Interface(_) | weedle::Definition::CallbackInterface(_))
+    ) {
+        return Err(Error(format!(
+            "dictionary field type is not supported yet: {}",
+            member.identifier.0
+        )));
+    }
+    if member.default.is_some() {
+        return Err(Error(
+            "interface dictionary defaults are not supported yet".into(),
+        ));
+    }
+    Ok(model::DictionaryFieldType::Interface { nullable })
+}
+
+/// Resolve a dictionary default keyword to its enumeration variant, so a
+/// default that is not a keyword fails the build instead of conversion.
+fn dictionary_enum_variant(
+    database: &Database<'_>,
+    name: &str,
+    text: &str,
+) -> Result<proc_macro2::Ident, Error> {
+    let Some(weedle::Definition::Enum(definition)) = database.definition(name) else {
+        return Err(Error(format!("unknown enumeration: {name}")));
+    };
+    let enumeration = model::Enumeration::parse(definition)?;
+    enumeration
+        .values
+        .iter()
+        .find(|(keyword, _)| keyword == text)
+        .map(|(_, variant)| variant.clone())
+        .ok_or_else(|| Error(format!("unknown {name} keyword in dictionary default: {text}")))
+}
+
 fn lower_dictionary(database: &Database<'_>, name: &str) -> Result<model::Dictionary, Error> {
     let definition = database.dictionary(name)?;
     validate_dictionary_attributes(definition.attributes.as_ref())?;
@@ -734,11 +899,6 @@ fn lower_dictionary(database: &Database<'_>, name: &str) -> Result<model::Dictio
     let mut fields = Vec::new();
     let mut taken: HashSet<_> = inherited.iter().map(|field| field.name.as_str()).collect();
     for member in &definition.members.body {
-        if member.required.is_some() {
-            return Err(Error(
-                "required dictionary fields are not supported yet".into(),
-            ));
-        }
         if !taken.insert(member.identifier.0) {
             return Err(Error(format!(
                 "duplicate dictionary field: {}",
@@ -747,70 +907,15 @@ fn lower_dictionary(database: &Database<'_>, name: &str) -> Result<model::Dictio
         }
         validate_empty_attributes(member.attributes.as_ref())?;
         validate_empty_attributes(member.type_.attributes.as_ref())?;
+        let required = member.required.is_some();
+        if required && member.default.is_some() {
+            return Err(Error(format!(
+                "required dictionary field cannot have a default: {}",
+                member.identifier.0
+            )));
+        }
         let rust = format_ident!("{}", snake_case(member.identifier.0));
-        let type_ = match &member.type_.type_ {
-            Type::Single(SingleType::NonAny(NonAnyType::Boolean(value)))
-                if value.q_mark.is_none() =>
-            {
-                let default = match &member.default {
-                    None => None,
-                    Some(default) => {
-                        let DefaultValue::Boolean(default) = &default.value else {
-                            return Err(Error(
-                                "only boolean dictionary defaults are supported yet".into(),
-                            ));
-                        };
-                        Some(default.0)
-                    }
-                };
-                model::DictionaryFieldType::Boolean { default }
-            }
-            Type::Single(SingleType::NonAny(NonAnyType::Sequence(value)))
-                if value.q_mark.is_none() =>
-            {
-                let element = &value.type_.generics.body;
-                validate_empty_attributes(element.attributes.as_ref())?;
-                let is_string = matches!(
-                    &element.type_,
-                    Type::Single(SingleType::NonAny(NonAnyType::DOMString(element)))
-                        if element.q_mark.is_none()
-                );
-                if !is_string {
-                    return Err(Error(
-                        "only sequence<DOMString> dictionary fields are supported yet".into(),
-                    ));
-                }
-                if member.default.is_some() {
-                    return Err(Error(
-                        "sequence dictionary defaults are not supported yet".into(),
-                    ));
-                }
-                model::DictionaryFieldType::StringSequence
-            }
-            Type::Single(SingleType::NonAny(NonAnyType::Identifier(value)))
-                if value.q_mark.is_none()
-                    && matches!(
-                        database.definition(value.type_.0),
-                        Some(
-                            weedle::Definition::Interface(_)
-                                | weedle::Definition::CallbackInterface(_)
-                        )
-                    ) =>
-            {
-                if member.default.is_some() {
-                    return Err(Error(
-                        "interface dictionary defaults are not supported yet".into(),
-                    ));
-                }
-                model::DictionaryFieldType::Value
-            }
-            _ => {
-                return Err(Error(format!(
-                    "dictionary field type is not supported yet: {}",
-                    member.identifier.0
-                )));
-            }
-        };
+        let type_ = dictionary_field_type(database, member, required)?;
         fields.push(model::DictionaryField {
             name: member.identifier.0.into(),
             rust,
@@ -1162,6 +1267,7 @@ fn operation_result(
                     quote! { Option<rquickjs::String<'js>> },
                 )),
                 ReturnType::Boolean => Ok((OperationResult::Boolean, quote! { bool })),
+                ReturnType::PromiseUndefined => Ok((OperationResult::PromiseUndefined, quote! { () })),
                 ReturnType::UnsignedShort => Ok((OperationResult::UnsignedShort, quote! { u16 })),
                 ReturnType::Long => Ok((OperationResult::Long, quote! { i32 })),
                 ReturnType::InterfaceSequence => {
@@ -1239,6 +1345,11 @@ fn lower_attribute(
         | ReturnType::NullableNode
         | ReturnType::NodeList
         | ReturnType::NullableDocumentType => ReturnType::PlatformObject,
+        ReturnType::PromiseUndefined => {
+            return Err(Error(
+                "promise attributes are not supported yet".into(),
+            ));
+        }
         type_ => type_,
     };
     if member.modifier.is_some() && !matches!(type_, ReturnType::String) {
@@ -1266,17 +1377,13 @@ fn lower_attribute(
     };
     let getter = format_ident!("{getter_name}");
     let mut signature = quote! { fn #getter(&self, ctx: &Ctx<'js>) -> Result<#result>; };
-    let setter = if writable {
-        let setter = format_ident!("{setter_name}");
-        let parameter = setter_parameter(&type_)?;
-        signature = quote! { #signature fn #setter(&self, ctx: &Ctx<'js>, value: #parameter) -> Result<()>; };
-        Some(model::Setter::Method {
-            rust: setter,
-            from_js: None,
-        })
-    } else {
-        None
-    };
+    let setter = attribute_setter(
+        member,
+        &type_,
+        writable,
+        &setter_name,
+        &mut signature,
+    )?;
     let attribute = model::Attribute {
         name: member.identifier.0.into(),
         rust: getter,
@@ -1287,6 +1394,65 @@ fn lower_attribute(
         reactions,
     };
     Ok(Some((attribute, signature)))
+}
+
+/// An attribute's setter: an implemented method, a generated `[PutForwards]`
+/// forwarding assignment, or nothing for readonly attributes. A hand-written
+/// setter alongside `[PutForwards]` fails the build, and forwarding requires
+/// a readonly platform object
+/// (<https://webidl.spec.whatwg.org/#PutForwards>).
+fn attribute_setter(
+    member: &weedle::interface::AttributeInterfaceMember<'_>,
+    type_: &ReturnType,
+    writable: bool,
+    setter_name: &str,
+    signature: &mut TokenStream,
+) -> Result<Option<model::Setter>, Error> {
+    let put_forwards = put_forwards_target(member.attributes.as_ref());
+    if put_forwards.is_some() {
+        if writable {
+            return Err(Error(format!(
+                "{}: PutForwards forbids an implemented setter",
+                member.identifier.0
+            )));
+        }
+        if !matches!(type_, ReturnType::PlatformObject) {
+            return Err(Error(format!(
+                "{}: PutForwards requires a readonly platform object",
+                member.identifier.0
+            )));
+        }
+    }
+    if writable {
+        let setter = format_ident!("{setter_name}");
+        let parameter = setter_parameter(type_)?;
+        *signature = quote! { #signature fn #setter(&self, ctx: &Ctx<'js>, value: #parameter) -> Result<()>; };
+        return Ok(Some(model::Setter::Method {
+            rust: setter,
+            from_js: None,
+        }));
+    }
+    Ok(put_forwards.map(|target| model::Setter::PutForwards {
+        target: target.into(),
+        nullable: matches!(
+            &member.type_.type_,
+            Type::Single(SingleType::NonAny(NonAnyType::Identifier(type_)))
+                if type_.q_mark.is_some()
+        ),
+    }))
+}
+
+/// The `[PutForwards]` member name, if the attribute forwards assignment to
+/// it (<https://webidl.spec.whatwg.org/#PutForwards>).
+fn put_forwards_target<'a>(attributes: Option<&ExtendedAttributeList<'a>>) -> Option<&'a str> {
+    attributes?.body.list.iter().find_map(|attribute| match attribute {
+        ExtendedAttribute::Ident(attribute)
+            if attribute.lhs_identifier.0 == "PutForwards" =>
+        {
+            Some(attribute.rhs.0)
+        }
+        _ => None,
+    })
 }
 
 /// The content attribute a `[Reflect]` member mirrors: the `Reflect` value
@@ -1661,61 +1827,99 @@ fn native_type(
             Ok(ReturnType::NullableUnsignedLong)
         }
         Type::Single(SingleType::NonAny(NonAnyType::Sequence(item))) if item.q_mark.is_none() => {
-            let element = &item.type_.generics.body;
-            validate_empty_attributes(element.attributes.as_ref())?;
-            match &element.type_ {
-                Type::Single(SingleType::NonAny(NonAnyType::DOMString(element)))
-                    if element.q_mark.is_none() =>
-                {
-                    Ok(ReturnType::StringSequence)
-                }
-                Type::Single(SingleType::NonAny(NonAnyType::Identifier(element)))
-                    if element.q_mark.is_none()
-                        && matches!(
-                            database.definition(element.type_.0),
-                            Some(weedle::Definition::Interface(_))
-                        ) =>
-                {
-                    Ok(ReturnType::InterfaceSequence)
-                }
-                _ => Err(Error(
-                    "only sequences of known interfaces or DOMString are supported yet".into(),
-                )),
-            }
+            native_sequence(database, item)
+        }
+        Type::Single(SingleType::NonAny(NonAnyType::FloatingPoint(item)))
+            if item.q_mark.is_none()
+                && matches!(
+                    item.type_,
+                    weedle::types::FloatingPointType::Double(double) if double.unrestricted.is_some()
+                ) =>
+        {
+            // `Coerced<f64>` is `ToNumber`, which admits NaN and infinities:
+            // exactly `unrestricted double`. Restricted `double` rejects
+            // them and needs its own conversion first.
+            Ok(ReturnType::Double)
+        }
+        Type::Single(SingleType::NonAny(NonAnyType::Promise(promise)))
+            if matches!(
+                &*promise.generics.body,
+                weedle::types::ReturnType::Undefined(_)
+            ) =>
+        {
+            Ok(ReturnType::PromiseUndefined)
         }
         Type::Single(SingleType::NonAny(NonAnyType::Identifier(item))) => {
-            let name = item.type_.0;
-            let nullable = item.q_mark.is_some();
-            if let Some(interface) = native_interface(database, name, nullable) {
-                return Ok(interface);
-            }
-            if nullable {
-                return Err(Error(format!(
-                    "nullable native type {name} is not supported yet"
-                )));
-            }
-            if !visited.insert(name.into()) {
-                return Err(Error(format!("typedef cycle at {name}")));
-            }
-            match database.definition(name) {
-                Some(weedle::Definition::Typedef(definition)) => {
-                    validate_empty_attributes(definition.attributes.as_ref())?;
-                    validate_empty_attributes(definition.type_.attributes.as_ref())?;
-                    native_type(database, &definition.type_.type_, visited)
-                }
-                Some(weedle::Definition::Callback(definition)) => {
-                    model::Callback::parse(definition)?;
-                    Ok(ReturnType::Callback)
-                }
-                Some(weedle::Definition::Dictionary(_)) => Ok(ReturnType::Dictionary(name.into())),
-                Some(weedle::Definition::Enum(_)) => Ok(ReturnType::Enumeration(name.into())),
-                _ => Err(Error(format!("native type {name} is not supported yet"))),
-            }
+            native_named(database, item.type_.0, item.q_mark.is_some(), visited)
         }
         Type::Union(union_) => lower_union(database, union_),
         Type::Single(_) => Err(Error(format!(
             "native type is not supported yet: {type_:?}"
         ))),
+    }
+}
+
+/// A `sequence<T>` member type. Only the element shapes with a generated
+/// conversion are accepted.
+fn native_sequence(
+    database: &Database<'_>,
+    item: &weedle::types::MayBeNull<weedle::types::SequenceType<'_>>,
+) -> Result<ReturnType, Error> {
+    let element = &item.type_.generics.body;
+    validate_empty_attributes(element.attributes.as_ref())?;
+    match &element.type_ {
+        Type::Single(SingleType::NonAny(NonAnyType::DOMString(element)))
+            if element.q_mark.is_none() =>
+        {
+            Ok(ReturnType::StringSequence)
+        }
+        Type::Single(SingleType::NonAny(NonAnyType::Identifier(element)))
+            if element.q_mark.is_none()
+                && matches!(
+                    database.definition(element.type_.0),
+                    Some(weedle::Definition::Interface(_))
+                ) =>
+        {
+            Ok(ReturnType::InterfaceSequence)
+        }
+        _ => Err(Error(
+            "only sequences of known interfaces or DOMString are supported yet".into(),
+        )),
+    }
+}
+
+/// A named type: a platform object, a typedef to follow, or a declared
+/// callback, dictionary, or enumeration.
+fn native_named(
+    database: &Database<'_>,
+    name: &str,
+    nullable: bool,
+    visited: &mut BTreeSet<String>,
+) -> Result<ReturnType, Error> {
+    if let Some(interface) = native_interface(database, name, nullable) {
+        return Ok(interface);
+    }
+    if nullable {
+        return Err(Error(format!(
+            "nullable native type {name} is not supported yet"
+        )));
+    }
+    if !visited.insert(name.into()) {
+        return Err(Error(format!("typedef cycle at {name}")));
+    }
+    match database.definition(name) {
+        Some(weedle::Definition::Typedef(definition)) => {
+            validate_empty_attributes(definition.attributes.as_ref())?;
+            validate_empty_attributes(definition.type_.attributes.as_ref())?;
+            native_type(database, &definition.type_.type_, visited)
+        }
+        Some(weedle::Definition::Callback(definition)) => {
+            model::Callback::parse(definition)?;
+            Ok(ReturnType::Callback)
+        }
+        Some(weedle::Definition::Dictionary(_)) => Ok(ReturnType::Dictionary(name.into())),
+        Some(weedle::Definition::Enum(_)) => Ok(ReturnType::Enumeration(name.into())),
+        _ => Err(Error(format!("native type {name} is not supported yet"))),
     }
 }
 
@@ -1980,6 +2184,8 @@ fn validate_attribute_attributes(
                             | "Reflect"
                             | "ReflectSetter"
                     ) => {}
+                // `[PutForwards]` lowers to a generated forwarding setter.
+                ExtendedAttribute::Ident(item) if item.lhs_identifier.0 == "PutForwards" => {}
                 ExtendedAttribute::String(item)
                     if item.lhs_identifier.0 == "Reflect" => {}
                 _ => {

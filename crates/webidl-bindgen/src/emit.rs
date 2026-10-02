@@ -4,10 +4,10 @@ use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
 
 use crate::model::{
-    ArgumentArity, Attribute, ConstructorArgumentKind, Dictionary, DictionaryFieldType,
-    Enumeration, GetterMapping, Interface, InterfaceKind, Operation, OperationArgument,
-    OperationResult, Payload, PropertyGetter, PropertyHooks, PrototypeParent, ReturnType, Setter,
-    Union, UnionMemberType,
+    ArgumentArity, Attribute, ConstructorArgumentKind, Dictionary, DictionaryField,
+    DictionaryFieldType, Enumeration, GetterMapping, Interface, InterfaceKind, Operation,
+    OperationArgument, OperationResult, Payload, PropertyGetter, PropertyHooks, PrototypeParent,
+    ReturnType, Setter, Union, UnionMemberType,
 };
 
 pub(crate) fn interface(interface: &Interface) -> TokenStream {
@@ -773,6 +773,9 @@ fn getter_dispatch(id: usize, getter: &Attribute, interface: &Interface) -> Toke
             ReturnType::NullableNode | ReturnType::NodeList | ReturnType::PlatformObject => {
                 quote! { #call }
             }
+            ReturnType::PromiseUndefined => {
+                unreachable!("promise attributes are rejected at lowering")
+            }
             ReturnType::Enumeration(_) => quote! {
                 let result = #call?;
                 let result = rquickjs::String::from_str(ctx.clone(), result.as_str())?;
@@ -978,6 +981,10 @@ fn operation_dispatch(id: usize, operation: &Operation, interface: &Interface) -
         OperationResult::Undefined => quote! {
             #call?;
             Ok(Value::new_undefined(ctx.clone()))
+        },
+        OperationResult::PromiseUndefined => quote! {
+            #call?;
+            host::resolved_promise(&ctx)
         },
         OperationResult::Sequence => quote! {
             let result: Vec<Value> = #call?;
@@ -1316,56 +1323,29 @@ fn constructor(interface: &Interface) -> (usize, TokenStream) {
 
 fn dictionary(dictionary: &Dictionary) -> TokenStream {
     let name = format_ident!("{}", dictionary.name);
-    let defaults = dictionary.fields.iter().map(|field| {
-        let rust = &field.rust;
-        match &field.type_ {
-            DictionaryFieldType::Boolean {
-                default: Some(default),
-            } => quote! { #rust: #default },
-            DictionaryFieldType::Boolean { default: None }
-            | DictionaryFieldType::StringSequence
-            | DictionaryFieldType::Value => {
-                quote! { #rust: None }
-            }
-        }
+    let has_required = dictionary.fields.iter().any(|field| {
+        matches!(
+            &field.type_,
+            DictionaryFieldType::Boolean { required: true, .. }
+                | DictionaryFieldType::Enumeration { required: true, .. }
+        )
     });
-    let fields = dictionary.fields.iter().map(|field| {
-        let rust = &field.rust;
-        match &field.type_ {
-            DictionaryFieldType::Boolean { default: Some(_) } => {
-                quote! { pub(crate) #rust: bool }
-            }
-            DictionaryFieldType::Boolean { default: None } => {
-                quote! { pub(crate) #rust: Option<bool> }
-            }
-            DictionaryFieldType::StringSequence => {
-                quote! { pub(crate) #rust: Option<Vec<Vec<u16>>> }
-            }
-            DictionaryFieldType::Value => {
-                quote! { pub(crate) #rust: Option<rquickjs::Persistent<Object<'static>>> }
-            }
+    let null_branch = if has_required {
+        quote! {
+            // A null or undefined dictionary with a required member throws
+            // instead of filling defaults
+            // (<https://webidl.spec.whatwg.org/#es-dictionary>).
+            return Err(rquickjs::Exception::throw_type(
+                ctx,
+                "required dictionary member is missing",
+            ));
         }
-    });
-    let conversions = dictionary.fields.iter().map(|field| {
-        let rust = &field.rust;
-        let key = &field.name;
-        match &field.type_ {
-            DictionaryFieldType::Boolean {
-                default: Some(default),
-            } => quote! {
-                #rust: host::dict_flag(ctx, &object, #key)?.unwrap_or(#default)
-            },
-            DictionaryFieldType::Boolean { default: None } => quote! {
-                #rust: host::dict_flag(ctx, &object, #key)?
-            },
-            DictionaryFieldType::StringSequence => quote! {
-                #rust: host::dict_string_sequence(ctx, &object, #key)?
-            },
-            DictionaryFieldType::Value => quote! {
-                #rust: host::dict_object(ctx, &object, #key)?
-            },
-        }
-    });
+    } else {
+        let defaults = dictionary.fields.iter().map(dictionary_default);
+        quote! { return Ok(Self { #(#defaults),* }); }
+    };
+    let fields = dictionary.fields.iter().map(dictionary_field);
+    let conversions = dictionary.fields.iter().map(dictionary_conversion);
     quote! {
         // https://webidl.spec.whatwg.org/#es-dictionary
         // A dictionary carries every IDL member; the algorithm that receives it
@@ -1377,7 +1357,7 @@ fn dictionary(dictionary: &Dictionary) -> TokenStream {
         impl #name {
             pub(crate) fn from_object<'js>(ctx: &Ctx<'js>, value: &Value<'js>) -> Result<Self> {
                 if value.is_null() || value.is_undefined() {
-                    return Ok(Self { #(#defaults),* });
+                    #null_branch
                 }
                 let object: Object = value.clone().into_object().ok_or_else(|| {
                     rquickjs::Exception::throw_type(ctx, "dictionary must be an object")
@@ -1387,6 +1367,189 @@ fn dictionary(dictionary: &Dictionary) -> TokenStream {
                 })
             }
         }
+    }
+}
+
+/// One dictionary field's struct member type.
+fn dictionary_field(field: &DictionaryField) -> TokenStream {
+    let rust = &field.rust;
+    match &field.type_ {
+        DictionaryFieldType::Boolean {
+            default: Some(_), ..
+        }
+        | DictionaryFieldType::Boolean { required: true, .. } => {
+            quote! { pub(crate) #rust: bool }
+        }
+        DictionaryFieldType::Boolean { .. } => {
+            quote! { pub(crate) #rust: Option<bool> }
+        }
+        DictionaryFieldType::Enumeration {
+            name: enum_name,
+            nullable: false,
+            default: Some(_),
+            ..
+        }
+        | DictionaryFieldType::Enumeration {
+            name: enum_name,
+            nullable: false,
+            required: true,
+            ..
+        } => {
+            let enum_name = format_ident!("{enum_name}");
+            quote! { pub(crate) #rust: #enum_name }
+        }
+        DictionaryFieldType::Enumeration { name: enum_name, .. } => {
+            let enum_name = format_ident!("{enum_name}");
+            quote! { pub(crate) #rust: Option<#enum_name> }
+        }
+        DictionaryFieldType::StringSequence => {
+            quote! { pub(crate) #rust: Option<Vec<Vec<u16>>> }
+        }
+        DictionaryFieldType::Interface { .. } => {
+            quote! { pub(crate) #rust: Option<rquickjs::Persistent<Object<'static>>> }
+        }
+    }
+}
+
+/// One dictionary field's default for a null or undefined input. Required
+/// members never reach this: their dictionaries throw above.
+fn dictionary_default(field: &DictionaryField) -> TokenStream {
+    let rust = &field.rust;
+    match &field.type_ {
+        DictionaryFieldType::Boolean {
+            default: Some(default),
+            ..
+        } => quote! { #rust: #default },
+        DictionaryFieldType::Boolean { .. } => quote! { #rust: None },
+        DictionaryFieldType::Enumeration {
+            name: enum_name,
+            default: Some(default),
+            nullable: false,
+            ..
+        } => {
+            let enum_name = format_ident!("{enum_name}");
+            quote! { #rust: #enum_name::#default }
+        }
+        DictionaryFieldType::Enumeration {
+            name: enum_name,
+            default: Some(default),
+            nullable: true,
+            ..
+        } => {
+            let enum_name = format_ident!("{enum_name}");
+            quote! { #rust: Some(#enum_name::#default) }
+        }
+        DictionaryFieldType::Enumeration { .. }
+        | DictionaryFieldType::StringSequence
+        | DictionaryFieldType::Interface { .. } => {
+            quote! { #rust: None }
+        }
+    }
+}
+
+/// One dictionary field's conversion from the input object.
+fn dictionary_conversion(field: &DictionaryField) -> TokenStream {
+    let rust = &field.rust;
+    let key = &field.name;
+    match &field.type_ {
+        DictionaryFieldType::Boolean { required: true, .. } => quote! {
+            #rust: host::dict_flag(ctx, &object, #key)?.ok_or_else(|| {
+                rquickjs::Exception::throw_type(ctx, "required dictionary member is missing")
+            })?
+        },
+        DictionaryFieldType::Boolean {
+            default: Some(default),
+            ..
+        } => quote! {
+            #rust: host::dict_flag(ctx, &object, #key)?.unwrap_or(#default)
+        },
+        DictionaryFieldType::Boolean { .. } => quote! {
+            #rust: host::dict_flag(ctx, &object, #key)?
+        },
+        DictionaryFieldType::Enumeration { .. } => dictionary_enum_conversion(field),
+        DictionaryFieldType::StringSequence => quote! {
+            #rust: host::dict_string_sequence(ctx, &object, #key)?
+        },
+        DictionaryFieldType::Interface { nullable: true } => quote! {
+            #rust: host::dict_object(ctx, &object, #key)?
+        },
+        DictionaryFieldType::Interface { nullable: false } => quote! {
+            // Absent and `undefined` members stay absent; a present
+            // null throws through the interface conversion
+            // (<https://webidl.spec.whatwg.org/#es-dictionary>).
+            #rust: {
+                let value: Value = object.get(#key)?;
+                if value.is_undefined() {
+                    None
+                } else {
+                    Some(host::dict_required_object(ctx, &object, #key)?)
+                }
+            }
+        },
+    }
+}
+
+/// One enumeration-typed dictionary field's conversion.
+fn dictionary_enum_conversion(field: &DictionaryField) -> TokenStream {
+    let rust = &field.rust;
+    let key = &field.name;
+    let DictionaryFieldType::Enumeration {
+        name: enum_name,
+        nullable,
+        default,
+        required,
+    } = &field.type_
+    else {
+        unreachable!("enumeration conversion takes enumeration fields")
+    };
+    let enum_name = format_ident!("{enum_name}");
+    if *required {
+        return quote! {
+            #rust: {
+                let value: Value = object.get(#key)?;
+                if value.is_undefined() {
+                    return Err(rquickjs::Exception::throw_type(
+                        ctx,
+                        "required dictionary member is missing",
+                    ));
+                }
+                #enum_name::from_value(ctx, value)?
+            }
+        };
+    }
+    match (nullable, default) {
+        (false, Some(default)) => quote! {
+            #rust: {
+                let value: Value = object.get(#key)?;
+                if value.is_undefined() {
+                    #enum_name::#default
+                } else {
+                    #enum_name::from_value(ctx, value)?
+                }
+            }
+        },
+        (true, Some(default)) => quote! {
+            #rust: {
+                let value: Value = object.get(#key)?;
+                if value.is_undefined() {
+                    Some(#enum_name::#default)
+                } else if value.is_null() {
+                    None
+                } else {
+                    Some(#enum_name::from_value(ctx, value)?)
+                }
+            }
+        },
+        (_, None) => quote! {
+            #rust: {
+                let value: Value = object.get(#key)?;
+                if value.is_null() || value.is_undefined() {
+                    None
+                } else {
+                    Some(#enum_name::from_value(ctx, value)?)
+                }
+            }
+        },
     }
 }
 
@@ -1422,6 +1585,8 @@ fn enumeration(enumeration: &Enumeration) -> TokenStream {
                 }
             }
 
+            // Only used when an algorithm reads the keyword back out.
+            #[allow(dead_code, reason = "generated from IDL; serialization is used on demand")]
             pub(crate) fn as_str(self) -> &'static str {
                 match self { #(#strings),* }
             }
@@ -1552,6 +1717,9 @@ fn union(union: &Union) -> TokenStream {
         quote! {}
     };
     quote! {
+        // A union carries every IDL member; the algorithm that receives it
+        // may consume a subset, so unconsumed variants are not dead code.
+        #[allow(dead_code, reason = "generated from IDL; algorithms may read a subset")]
         pub(crate) enum #name #generic {
             #(#variants),*
         }

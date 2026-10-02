@@ -453,6 +453,15 @@ fn node_interface_matches(kind: Option<&dom::NodeKind>, interface: &str) -> Opti
         }
         // Spec mixins: their members are installed on every including
         // interface, so the receiver check accepts the union of those kinds.
+        // `ElementCSSInlineStyle` is included by the HTML, SVG, and MathML
+        // element interfaces.
+        "ElementCSSInlineStyle" => matches!(
+            kind,
+            Some(dom::NodeKind::Element { name, .. })
+                if name.ns == dom::html_namespace()
+                    || name.ns == dom::svg_namespace()
+                    || name.ns == dom::mathml_namespace()
+        ),
         "ParentNode" => matches!(
             kind,
             Some(dom::NodeKind::Document | dom::NodeKind::Fragment | dom::NodeKind::Element { .. })
@@ -673,6 +682,33 @@ pub(crate) fn dict_flag<'js>(
         return Ok(None);
     }
     Coerced::<bool>::from_js(ctx, value).map(|flag| Some(flag.0))
+}
+
+/// A promise already resolved with `undefined`, for synchronous operations
+/// whose IDL result is `Promise<undefined>`
+/// (<https://webidl.spec.whatwg.org/#es-promise>).
+pub(crate) fn resolved_promise<'js>(ctx: &Ctx<'js>) -> Result<Value<'js>> {
+    let (promise, resolve, _) = ctx.promise()?;
+    resolve.call::<_, ()>((Value::new_undefined(ctx.clone()),))?;
+    Ok(promise.into_value())
+}
+
+/// One presence-preserving non-nullable interface dictionary member: a
+/// present value must be an object; absent, null, and undefined throw
+/// (<https://webidl.spec.whatwg.org/#es-interface>).
+pub(crate) fn dict_required_object<'js>(
+    ctx: &Ctx<'js>,
+    object: &Object<'js>,
+    key: &str,
+) -> Result<Persistent<Object<'static>>> {
+    let value: Value = object.get(key)?;
+    let Some(object) = value.as_object() else {
+        return Err(Exception::throw_type(
+            ctx,
+            "interface dictionary member must be an object",
+        ));
+    };
+    Ok(Persistent::save(ctx, object.clone()))
 }
 
 /// One presence-preserving interface-typed dictionary member

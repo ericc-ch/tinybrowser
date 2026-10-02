@@ -46,6 +46,7 @@ include!(concat!(env!("OUT_DIR"), "/ProcessingInstruction.rs"));
 include!(concat!(env!("OUT_DIR"), "/ParentNode.rs"));
 include!(concat!(env!("OUT_DIR"), "/ChildNode.rs"));
 include!(concat!(env!("OUT_DIR"), "/NonDocumentTypeChildNode.rs"));
+include!(concat!(env!("OUT_DIR"), "/ElementCSSInlineStyle.rs"));
 include!(concat!(env!("OUT_DIR"), "/ShadowRoot.rs"));
 include!(concat!(env!("OUT_DIR"), "/HTMLFormElement.rs"));
 include!(concat!(env!("OUT_DIR"), "/HTMLInputElement.rs"));
@@ -73,6 +74,7 @@ pub(super) fn install(ctx: &Ctx<'_>) -> Result<()> {
     parent_node_generated::install(ctx)?;
     child_node_generated::install(ctx)?;
     non_document_type_child_node_generated::install(ctx)?;
+    element_css_inline_style_generated::install(ctx)?;
     shadow_root_generated::install(ctx)?;
     html_form_element_generated::install(ctx)?;
     html_input_element_generated::install(ctx)?;
@@ -601,7 +603,7 @@ impl JsNode {
     /// Scrolls the viewport so this element's border box is visible.
     /// <https://drafts.csswg.org/cssom-view/#dom-element-scrollintoview>
     #[qjs(skip)]
-    fn scroll_into_view<'js>(&self, ctx: Ctx<'js>, _options: Value<'js>) -> Result<()> {
+    fn scroll_into_view(&self, ctx: Ctx<'_>) -> Result<()> {
         let Some((left, top, width, _height)) = element_box(&ctx, self.handle.0)? else {
             return Ok(());
         };
@@ -1807,21 +1809,12 @@ impl JsNode {
 
     // https://dom.spec.whatwg.org/#dom-element-attachshadow
     #[qjs(skip)]
-    fn attach_shadow<'js>(&self, ctx: Ctx<'js>, init: Value<'js>) -> Result<Value<'js>> {
-        let init = init
-            .into_object()
-            .ok_or_else(|| Exception::throw_type(&ctx, "dictionary must be an object"))?;
-        let mode: String = init.get("mode")?;
-        let open = match mode.as_str() {
-            "open" => true,
-            "closed" => false,
-            _ => {
-                return Err(Exception::throw_type(
-                    &ctx,
-                    "mode must be 'open' or 'closed'",
-                ));
-            }
-        };
+    fn attach_shadow<'js>(
+        &self,
+        ctx: Ctx<'js>,
+        init: element_generated::ShadowRootInit,
+    ) -> Result<Value<'js>> {
+        let open = matches!(init.mode, element_generated::ShadowRootMode::Open);
         let local = with_node_kind(&ctx, self.handle.0, |kind| match kind {
             Some(NodeKind::Element { name, .. }) if name.ns == html_namespace() => {
                 Some(name.local.to_string())
@@ -2167,11 +2160,6 @@ impl JsNode {
             Persistent::save(ctx, weak),
         );
         Ok(value)
-    }
-
-    #[qjs(skip)]
-    fn set_style(&self, ctx: &Ctx<'_>, value: WebIdlString) -> Result<()> {
-        self.set_attribute(ctx.clone(), WebIdlString("style".into()), value)
     }
 
     // https://dom.spec.whatwg.org/#dom-node-lastchild
@@ -3529,6 +3517,393 @@ impl<'js> node_generated::Node<'js> for JsNode {
     // https://dom.spec.whatwg.org/#dom-node-removechild
     fn remove_child(&self, ctx: Ctx<'js>, arg_0: NodeReference) -> Result<Value<'js>> {
         self.remove_child(ctx, arg_0)
+    }
+}
+
+impl<'js> element_generated::Element<'js> for JsNode {
+    // https://dom.spec.whatwg.org/#dom-element-getelementsbytagname
+    fn get_elements_by_tag_name(
+        &self,
+        ctx: Ctx<'js>,
+        arg_0: rquickjs::String<'js>,
+    ) -> Result<Value<'js>> {
+        self.get_elements_by_tag_name(ctx, WebIdlString(arg_0.to_string()?))
+    }
+
+    // https://dom.spec.whatwg.org/#dom-element-getelementsbytagnamens
+    fn get_elements_by_tag_name_ns(
+        &self,
+        ctx: Ctx<'js>,
+        arg_0: Option<rquickjs::String<'js>>,
+        arg_1: rquickjs::String<'js>,
+    ) -> Result<Value<'js>> {
+        self.get_elements_by_tag_name_ns(
+            ctx,
+            OptString(arg_0.map(|name| name.to_string()).transpose()?),
+            WebIdlString(arg_1.to_string()?),
+        )
+    }
+
+    // https://dom.spec.whatwg.org/#dom-element-getelementsbyclassname
+    fn get_elements_by_class_name(
+        &self,
+        ctx: Ctx<'js>,
+        arg_0: rquickjs::String<'js>,
+    ) -> Result<Value<'js>> {
+        self.get_elements_by_class_name(ctx, WebIdlString(arg_0.to_string()?))
+    }
+
+    // https://dom.spec.whatwg.org/#dom-element-matches
+    fn matches(&self, ctx: Ctx<'js>, arg_0: rquickjs::String<'js>) -> Result<bool> {
+        self.matches(ctx, WebIdlString(arg_0.to_string()?))
+    }
+
+    // https://dom.spec.whatwg.org/#dom-element-closest
+    fn closest(
+        &self,
+        ctx: Ctx<'js>,
+        arg_0: rquickjs::String<'js>,
+    ) -> Result<Value<'js>> {
+        self.closest(ctx, WebIdlString(arg_0.to_string()?))
+    }
+
+    // https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-innerhtml
+    fn get_inner_html(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
+        self.inner_html(ctx)
+    }
+
+    // https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-innerhtml
+    fn set_inner_html(&self, ctx: &Ctx<'js>, value: rquickjs::String<'js>) -> Result<()> {
+        self.set_inner_html(ctx, LegacyNullString(value.to_string()?))
+    }
+
+    // https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-outerhtml
+    fn get_outer_html(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
+        self.outer_html(ctx)
+    }
+
+    // https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-outerhtml
+    fn set_outer_html(&self, ctx: &Ctx<'js>, value: rquickjs::String<'js>) -> Result<()> {
+        self.set_outer_html(ctx, LegacyNullString(value.to_string()?))
+    }
+
+    // https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-insertadjacenthtml
+    fn insert_adjacent_html(
+        &self,
+        ctx: Ctx<'js>,
+        arg_0: rquickjs::String<'js>,
+        arg_1: rquickjs::String<'js>,
+    ) -> Result<()> {
+        self.insert_adjacent_html(
+            ctx,
+            WebIdlString(arg_0.to_string()?),
+            WebIdlString(arg_1.to_string()?),
+        )
+    }
+
+    // https://drafts.csswg.org/cssom-view/#dom-element-getboundingclientrect
+    fn get_bounding_client_rect(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
+        self.get_bounding_client_rect(ctx)
+    }
+
+    // https://drafts.csswg.org/cssom-view/#dom-element-getclientrects
+    fn get_client_rects(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
+        self.get_client_rects(ctx)
+    }
+
+    // https://drafts.csswg.org/cssom-view/#dom-element-scrollintoview
+    fn scroll_into_view(
+        &self,
+        ctx: Ctx<'js>,
+        _arg_0: element_generated::BooleanOrScrollIntoViewOptions,
+    ) -> Result<()> {
+        self.scroll_into_view(ctx)
+    }
+
+    // https://drafts.csswg.org/cssom-view/#dom-element-scrollleft
+    fn get_scroll_left(&self, ctx: &Ctx<'js>) -> Result<f64> {
+        self.scroll_left(ctx)
+    }
+
+    // https://drafts.csswg.org/#dom-element-scrollleft
+    fn set_scroll_left(&self, ctx: &Ctx<'js>, value: f64) -> Result<()> {
+        self.set_scroll_left(ctx, value)
+    }
+
+    // https://drafts.csswg.org/cssom-view/#dom-element-scrolltop
+    fn get_scroll_top(&self, ctx: &Ctx<'js>) -> Result<f64> {
+        self.scroll_top(ctx)
+    }
+
+    // https://drafts.csswg.org/#dom-element-scrolltop
+    fn set_scroll_top(&self, ctx: &Ctx<'js>, value: f64) -> Result<()> {
+        self.set_scroll_top(ctx, value)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-element-attachshadow
+    fn attach_shadow(
+        &self,
+        ctx: Ctx<'js>,
+        arg_0: element_generated::ShadowRootInit,
+    ) -> Result<Value<'js>> {
+        self.attach_shadow(ctx, arg_0)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-element-shadowroot
+    fn get_shadow_root(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
+        self.shadow_root(ctx)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-element-tagname
+    fn get_tag_name(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
+        let name = self.tag_name(ctx)?;
+        rquickjs::String::from_str(ctx.clone(), &name)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-element-localname
+    fn get_local_name(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
+        let name = self.local_name(ctx)?;
+        rquickjs::String::from_str(ctx.clone(), &name)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-element-prefix
+    fn get_prefix(&self, ctx: &Ctx<'js>) -> Result<Option<rquickjs::String<'js>>> {
+        let value = self.prefix(ctx)?;
+        if value.is_null() || value.is_undefined() {
+            Ok(None)
+        } else {
+            rquickjs::FromJs::from_js(ctx, value).map(Some)
+        }
+    }
+
+    // https://dom.spec.whatwg.org/#dom-element-namespaceuri
+    fn get_namespace_uri(
+        &self,
+        ctx: &Ctx<'js>,
+    ) -> Result<Option<rquickjs::String<'js>>> {
+        let value = self.namespace_uri(ctx)?;
+        if value.is_null() || value.is_undefined() {
+            Ok(None)
+        } else {
+            rquickjs::FromJs::from_js(ctx, value).map(Some)
+        }
+    }
+
+    // https://dom.spec.whatwg.org/#dom-element-id
+    fn get_id(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
+        let id = self.id(ctx)?;
+        rquickjs::String::from_str(ctx.clone(), &id)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-element-id
+    fn set_id(&self, ctx: &Ctx<'js>, value: rquickjs::String<'js>) -> Result<()> {
+        self.set_id(ctx, WebIdlString(value.to_string()?))
+    }
+
+    // https://dom.spec.whatwg.org/#dom-element-classname
+    fn get_class_name(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
+        let name = self.class_name(ctx)?;
+        rquickjs::String::from_str(ctx.clone(), &name)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-element-classname
+    fn set_class_name(&self, ctx: &Ctx<'js>, value: rquickjs::String<'js>) -> Result<()> {
+        self.set_class_name(ctx, WebIdlString(value.to_string()?))
+    }
+
+    // https://dom.spec.whatwg.org/#dom-element-classlist
+    fn get_class_list(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
+        self.class_list(ctx)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-element-getattribute
+    fn get_attribute(
+        &self,
+        ctx: Ctx<'js>,
+        arg_0: rquickjs::String<'js>,
+    ) -> Result<Option<rquickjs::String<'js>>> {
+        let value = self.get_attribute(ctx.clone(), WebIdlString(arg_0.to_string()?))?;
+        if value.is_null() || value.is_undefined() {
+            Ok(None)
+        } else {
+            rquickjs::FromJs::from_js(&ctx, value).map(Some)
+        }
+    }
+
+    // https://dom.spec.whatwg.org/#dom-element-setattribute
+    fn set_attribute(
+        &self,
+        ctx: Ctx<'js>,
+        arg_0: rquickjs::String<'js>,
+        arg_1: rquickjs::String<'js>,
+    ) -> Result<()> {
+        self.set_attribute(
+            ctx,
+            WebIdlString(arg_0.to_string()?),
+            WebIdlString(arg_1.to_string()?),
+        )
+    }
+
+    // https://dom.spec.whatwg.org/#dom-element-hasattribute
+    fn has_attribute(&self, ctx: Ctx<'js>, arg_0: rquickjs::String<'js>) -> Result<bool> {
+        self.has_attribute(ctx, WebIdlString(arg_0.to_string()?))
+    }
+
+    // https://dom.spec.whatwg.org/#dom-element-removeattribute
+    fn remove_attribute(&self, ctx: Ctx<'js>, arg_0: rquickjs::String<'js>) -> Result<()> {
+        self.remove_attribute(ctx, WebIdlString(arg_0.to_string()?))
+    }
+
+    // https://dom.spec.whatwg.org/#dom-element-toggleattribute
+    fn toggle_attribute(
+        &self,
+        ctx: Ctx<'js>,
+        arg_0: rquickjs::String<'js>,
+        arg_1: Option<bool>,
+    ) -> Result<bool> {
+        self.toggle_attribute(ctx, WebIdlString(arg_0.to_string()?), arg_1)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-element-getattributens
+    fn get_attribute_ns(
+        &self,
+        ctx: Ctx<'js>,
+        arg_0: Option<rquickjs::String<'js>>,
+        arg_1: rquickjs::String<'js>,
+    ) -> Result<Option<rquickjs::String<'js>>> {
+        let value = self.get_attribute_ns(
+            ctx.clone(),
+            OptString(arg_0.map(|name| name.to_string()).transpose()?),
+            WebIdlString(arg_1.to_string()?),
+        )?;
+        if value.is_null() || value.is_undefined() {
+            Ok(None)
+        } else {
+            rquickjs::FromJs::from_js(&ctx, value).map(Some)
+        }
+    }
+
+    // https://dom.spec.whatwg.org/#dom-element-setattributens
+    fn set_attribute_ns(
+        &self,
+        ctx: Ctx<'js>,
+        arg_0: Option<rquickjs::String<'js>>,
+        arg_1: rquickjs::String<'js>,
+        arg_2: rquickjs::String<'js>,
+    ) -> Result<()> {
+        self.set_attribute_ns(
+            ctx,
+            OptString(arg_0.map(|name| name.to_string()).transpose()?),
+            WebIdlString(arg_1.to_string()?),
+            WebIdlString(arg_2.to_string()?),
+        )
+    }
+
+    // https://dom.spec.whatwg.org/#dom-element-hasattributens
+    fn has_attribute_ns(
+        &self,
+        ctx: Ctx<'js>,
+        arg_0: Option<rquickjs::String<'js>>,
+        arg_1: rquickjs::String<'js>,
+    ) -> Result<bool> {
+        self.has_attribute_ns(
+            ctx,
+            OptString(arg_0.map(|name| name.to_string()).transpose()?),
+            WebIdlString(arg_1.to_string()?),
+        )
+    }
+
+    // https://dom.spec.whatwg.org/#dom-element-removeattributens
+    fn remove_attribute_ns(
+        &self,
+        ctx: Ctx<'js>,
+        arg_0: Option<rquickjs::String<'js>>,
+        arg_1: rquickjs::String<'js>,
+    ) -> Result<()> {
+        self.remove_attribute_ns(
+            ctx,
+            OptString(arg_0.map(|name| name.to_string()).transpose()?),
+            WebIdlString(arg_1.to_string()?),
+        )
+    }
+
+    // https://dom.spec.whatwg.org/#dom-element-getattributenames
+    fn get_attribute_names(&self, ctx: Ctx<'js>) -> Result<Vec<String>> {
+        self.get_attribute_names(ctx)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-element-attributes
+    fn get_attributes(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
+        self.attributes(ctx)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-element-hasattributes
+    fn has_attributes(&self, ctx: Ctx<'js>) -> Result<bool> {
+        self.has_attributes(ctx)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-element-getattributenode
+    fn get_attribute_node(
+        &self,
+        ctx: Ctx<'js>,
+        arg_0: rquickjs::String<'js>,
+    ) -> Result<Value<'js>> {
+        self.get_attribute_node(ctx, WebIdlString(arg_0.to_string()?))
+    }
+
+    // https://dom.spec.whatwg.org/#dom-element-getattributenodens
+    fn get_attribute_node_ns(
+        &self,
+        ctx: Ctx<'js>,
+        arg_0: Option<rquickjs::String<'js>>,
+        arg_1: rquickjs::String<'js>,
+    ) -> Result<Value<'js>> {
+        self.get_attribute_node_ns(
+            ctx,
+            OptString(arg_0.map(|name| name.to_string()).transpose()?),
+            WebIdlString(arg_1.to_string()?),
+        )
+    }
+
+    // https://dom.spec.whatwg.org/#dom-element-setattributenode
+    fn set_attribute_node(
+        &self,
+        ctx: Ctx<'js>,
+        arg_0: Value<'js>,
+    ) -> Result<Value<'js>> {
+        let attr = AttrArgument::from_value(&arg_0)?;
+        self.set_attribute_node(ctx, attr)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-element-setattributenodens
+    fn set_attribute_node_ns(
+        &self,
+        ctx: Ctx<'js>,
+        arg_0: Value<'js>,
+    ) -> Result<Value<'js>> {
+        let attr = AttrArgument::from_value(&arg_0)?;
+        self.set_attribute_node_ns(ctx, attr)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-element-removeattributenode
+    fn remove_attribute_node(
+        &self,
+        ctx: Ctx<'js>,
+        arg_0: Value<'js>,
+    ) -> Result<Value<'js>> {
+        let attr = AttrArgument::from_value(&arg_0)?;
+        self.remove_attribute_node(ctx, attr)
+    }
+}
+
+/// `ElementCSSInlineStyle` is a spec mixin included by `HTMLElement`,
+/// `SVGElement`, and `MathMLElement`, so the one contract installs on all
+/// three prototypes from the IDL includes
+/// (<https://drafts.csswg.org/cssom/#the-elementcssinlinestyle-mixin>).
+impl<'js> element_css_inline_style_generated::ElementCSSInlineStyle<'js> for JsNode {
+    // https://drafts.csswg.org/cssom/#dom-elementcssinlinestyle-style
+    fn get_style(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
+        self.style(ctx)
     }
 }
 

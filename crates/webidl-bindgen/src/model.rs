@@ -116,6 +116,10 @@ pub(crate) enum OperationResult {
     /// The method returns the platform object or value to hand back.
     Object,
     Undefined,
+    /// The method runs synchronously and the dispatch hands back a promise
+    /// resolved with `undefined`
+    /// (<https://webidl.spec.whatwg.org/#es-promise>).
+    PromiseUndefined,
     Sequence,
     StringSequence,
     /// The method returns `rquickjs::String<'js>`.
@@ -237,6 +241,9 @@ pub(crate) enum ReturnType {
     /// second field. Conversion tries members in `WebIDL` order
     /// (<https://webidl.spec.whatwg.org/#es-union>).
     Union(String, Vec<UnionMember>),
+    /// `Promise<undefined>`: the method runs synchronously and the dispatch
+    /// resolves the promise (<https://webidl.spec.whatwg.org/#es-promise>).
+    PromiseUndefined,
     /// Explicit `[RustValue]` implementation mapping; the method converts it.
     Value,
 }
@@ -298,11 +305,17 @@ pub(crate) struct DictionaryField {
 }
 
 pub(crate) enum DictionaryFieldType {
-    Boolean { default: Option<bool> },
+    Boolean { default: Option<bool>, required: bool },
+    Enumeration {
+        name: String,
+        nullable: bool,
+        default: Option<Ident>,
+        required: bool,
+    },
     StringSequence,
-    /// An interface- or callback-interface-typed member, carried as the
-    /// original object.
-    Value,
+    /// An interface- or callback-interface-typed member. Nullable members
+    /// map a present null to `None`; anything else must be an object.
+    Interface { nullable: bool },
 }
 
 pub(crate) struct Constant {
@@ -1431,7 +1444,7 @@ impl Dictionary {
                             Some(value.0)
                         }
                     };
-                    DictionaryFieldType::Boolean { default }
+                    DictionaryFieldType::Boolean { default, required: false }
                 }
                 Type::Single(SingleType::NonAny(NonAnyType::Sequence(value))) => {
                     if value.q_mark.is_some() {
