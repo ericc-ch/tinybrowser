@@ -105,13 +105,17 @@ Verification for the shipping candidate:
 
 ## Remaining
 
-1. Resolve the older WebIDL-migration adverse status changes listed above before
+1. Replace hand-maintained IDL partials and embedded `Rust*` annotations with
+   pinned upstream IDL inputs, separate implementation mappings, and support
+   selection. Resolve spec inheritance and mixins in the generator. Follow
+   `docs/researches/engine-source.md` for ownership and coverage rules.
+2. Resolve the older WebIDL-migration adverse status changes listed above before
    claiming migration conformance is unchanged.
-2. Preexisting conformance gaps unrelated to the bridge: lossy Rust
+3. Preexisting conformance gaps unrelated to the bridge: lossy Rust
    `String` attribute/form storage, `Text.splitText`, `attachInternals`,
    copied cross-document adoption, iframe `Window` identity, incomplete
    iterator methods.
-3. `docs/progress.md` WPT totals are still the pre-migration overnight dump;
+4. `docs/progress.md` WPT totals are still the pre-migration overnight dump;
    rerun the full scorer to refresh the scored groups.
 
 ## Durable decisions

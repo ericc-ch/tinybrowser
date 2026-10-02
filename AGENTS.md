@@ -33,9 +33,12 @@ Do not test spec conformance in cargo tests. Never add, keep, or "fix" a cargo t
     the submodule pointer in tinybrowser. Fresh clones and worktrees need
     `git submodule update --init --recursive`.
 
-- Checked-in WebIDL (`crates/renderer/idl/`) is the interface surface,
-  transcribed from the specs. Implementation follows IDL, never the reverse:
-  do not edit IDL to match our code.
+- Use pinned upstream WebIDL extracts as the interface contract. Keep
+  implementation mappings and support selection separate from spec declarations.
+  Implementation follows IDL, never the reverse: do not edit IDL to match our code.
+
+For Web API implementation or binding changes, read
+`docs/researches/engine-source.md` for JS/Rust ownership, IDL inputs, and coverage rules.
 
 ## Working rules
 
