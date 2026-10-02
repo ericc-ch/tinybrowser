@@ -454,14 +454,22 @@ fn lower_attribute(
             "native writable and special attributes are not supported yet".into(),
         ));
     }
-    validate_empty_attributes(member.attributes.as_ref())?;
+    validate_attribute_attributes(member.attributes.as_ref())?;
     validate_empty_attributes(member.type_.attributes.as_ref())?;
-    let type_ = native_type(database, &member.type_.type_, &mut BTreeSet::new())?;
+    let type_ = match native_type(database, &member.type_.type_, &mut BTreeSet::new())? {
+        // Getter dispatch hands a platform object or its null directly to JS.
+        ReturnType::Node | ReturnType::NullableNode | ReturnType::NodeList => {
+            ReturnType::PlatformObject
+        }
+        type_ => type_,
+    };
     let result = match type_ {
         ReturnType::String => quote! { rquickjs::String<'js> },
+        ReturnType::NullableString => quote! { Option<rquickjs::String<'js>> },
         ReturnType::Boolean => quote! { bool },
         ReturnType::UnsignedShort => quote! { u16 },
         ReturnType::UnsignedLong => quote! { usize },
+        ReturnType::PlatformObject => quote! { Value<'js> },
         _ => return Err(Error("native attribute type is not supported yet".into())),
     };
     let getter = format_ident!("{getter_name}");
@@ -545,8 +553,12 @@ fn native_type(
     visited: &mut BTreeSet<String>,
 ) -> Result<ReturnType, Error> {
     match type_ {
-        Type::Single(SingleType::NonAny(NonAnyType::DOMString(item))) if item.q_mark.is_none() => {
-            Ok(ReturnType::String)
+        Type::Single(SingleType::NonAny(NonAnyType::DOMString(item))) => {
+            Ok(if item.q_mark.is_some() {
+                ReturnType::NullableString
+            } else {
+                ReturnType::String
+            })
         }
         Type::Single(SingleType::NonAny(NonAnyType::Boolean(item))) if item.q_mark.is_none() => {
             Ok(ReturnType::Boolean)
@@ -603,6 +615,26 @@ fn native_interface(name: &str, nullable: bool) -> Option<ReturnType> {
         ("Element", _) => Some(ReturnType::PlatformObject),
         _ => None,
     }
+}
+
+/// Attribute extended attributes the contract path consumes or documents.
+fn validate_attribute_attributes(
+    attributes: Option<&ExtendedAttributeList<'_>>,
+) -> Result<(), Error> {
+    if let Some(attributes) = attributes {
+        for attribute in &attributes.body.list {
+            match attribute {
+                ExtendedAttribute::NoArgs(item)
+                    if matches!(item.0.0, "SameObject" | "LegacyUnforgeable") => {}
+                _ => {
+                    return Err(Error(format!(
+                        "native attribute semantics are not supported yet: {attribute:?}"
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn validate_empty_attributes(attributes: Option<&ExtendedAttributeList<'_>>) -> Result<(), Error> {

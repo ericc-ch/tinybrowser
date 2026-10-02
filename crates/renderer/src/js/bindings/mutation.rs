@@ -36,19 +36,34 @@ impl<'js> JsMutationRecord<'js> {
         })
     }
 
-    fn record_type(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
+}
+
+impl<'js> mutation_record_generated::MutationRecord<'js> for JsMutationRecord<'js> {
+    fn get_type(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
         rquickjs::String::from_str(ctx.clone(), &self.record.typ)
     }
 
-    fn previous_sibling(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
+    fn get_target(&self, _ctx: &Ctx<'js>) -> Result<Value<'js>> {
+        Ok(self.target.clone())
+    }
+
+    fn get_added_nodes(&self, _ctx: &Ctx<'js>) -> Result<Value<'js>> {
+        Ok(self.added_nodes.clone())
+    }
+
+    fn get_removed_nodes(&self, _ctx: &Ctx<'js>) -> Result<Value<'js>> {
+        Ok(self.removed_nodes.clone())
+    }
+
+    fn get_previous_sibling(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
         child_value(ctx, self.record.previous.map(|handle| handle.0))
     }
 
-    fn next_sibling(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
+    fn get_next_sibling(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
         child_value(ctx, self.record.next.map(|handle| handle.0))
     }
 
-    fn attribute_name(&self, ctx: &Ctx<'js>) -> Result<Option<rquickjs::String<'js>>> {
+    fn get_attribute_name(&self, ctx: &Ctx<'js>) -> Result<Option<rquickjs::String<'js>>> {
         self.record
             .attribute_name
             .as_deref()
@@ -56,7 +71,7 @@ impl<'js> JsMutationRecord<'js> {
             .transpose()
     }
 
-    fn attribute_namespace(&self, ctx: &Ctx<'js>) -> Result<Option<rquickjs::String<'js>>> {
+    fn get_attribute_namespace(&self, ctx: &Ctx<'js>) -> Result<Option<rquickjs::String<'js>>> {
         self.record
             .attribute_namespace
             .as_deref()
@@ -64,7 +79,7 @@ impl<'js> JsMutationRecord<'js> {
             .transpose()
     }
 
-    fn old_value(&self, ctx: &Ctx<'js>) -> Result<Option<rquickjs::String<'js>>> {
+    fn get_old_value(&self, ctx: &Ctx<'js>) -> Result<Option<rquickjs::String<'js>>> {
         self.record
             .old_value
             .as_ref()

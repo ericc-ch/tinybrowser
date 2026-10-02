@@ -140,6 +140,45 @@ fn getters_lower_to_property_hooks_and_operations() {
 }
 
 #[test]
+fn nullable_strings_and_platform_attributes_lower() {
+    let idl = [Source {
+        name: "mutation_record.idl",
+        text: r"
+            [Exposed=Window] interface MutationRecord {
+                readonly attribute DOMString type;
+                [SameObject] readonly attribute Node target;
+                readonly attribute Node? previousSibling;
+                readonly attribute DOMString? attributeName;
+            };
+        ",
+    }];
+    let rust = [Source {
+        name: "mutation_record.rs",
+        text: r"
+            impl<'js> mutation_record_generated::MutationRecord<'js> for JsMutationRecord<'js> {
+                fn get_type(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> { t(ctx) }
+                fn get_target(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> { g(ctx) }
+                fn get_previous_sibling(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> { p(ctx) }
+                fn get_attribute_name(&self, ctx: &Ctx<'js>) -> Result<Option<rquickjs::String<'js>>> { a(ctx) }
+            }
+        ",
+    }];
+    let bindings = compile_contracts(&idl, &rust).expect("compile fixture");
+    let trait_text = generated_trait(&bindings[0].rust)
+        .replace(' ', "")
+        .replace(",)", ")");
+    for fragment in [
+        "get_target(&self,ctx:&Ctx<'js>)->Result<Value<'js>>",
+        "get_attribute_name(&self,ctx:&Ctx<'js>)->Result<Option<rquickjs::String<'js>>>",
+    ] {
+        assert!(
+            trait_text.contains(fragment),
+            "missing {fragment}: {trait_text}"
+        );
+    }
+}
+
+#[test]
 fn malformed_graphs_return_named_diagnostics() {
     for (text, diagnostic) in [
         (
