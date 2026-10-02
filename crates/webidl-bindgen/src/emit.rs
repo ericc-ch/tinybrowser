@@ -52,12 +52,16 @@ pub(crate) fn interface(interface: &Interface) -> TokenStream {
         },
         InterfaceKind::Partial => quote! {},
     };
-    let receiver_check = if interface.rust == "JsNode" && interface.name != "Node" {
-        let name = &interface.name;
-        quote! { host::require_node_interface(&ctx, receiver.node_id(), #name)?; }
-    } else {
-        quote! {}
-    };
+    let receiver_check =
+        if matches!(interface.kind, InterfaceKind::Partial) && interface.contract.is_some() {
+            let name = &interface.name;
+            quote! { host::SharedClass::require_interface(&*receiver, &ctx, #name)?; }
+        } else if interface.rust == "JsNode" && interface.name != "Node" {
+            let name = &interface.name;
+            quote! { host::require_node_interface(&ctx, receiver.node_id(), #name)?; }
+        } else {
+            quote! {}
+        };
     quote! {
         pub(super) mod #module {
             use super::#rust;

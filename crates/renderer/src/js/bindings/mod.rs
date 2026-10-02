@@ -6,16 +6,6 @@
 //! type). Its members stay in `node`.
 use rquickjs::function::Constructor;
 
-macro_rules! branded_node {
-    ($name:ident, $js:literal) => {
-        #[derive(Trace, rquickjs::JsLifetime)]
-        #[rquickjs::class(rename = $js)]
-        pub(crate) struct $name {
-            pub(crate) handle: Handle,
-        }
-    };
-}
-
 mod attributes;
 mod clone;
 mod collections;
@@ -56,8 +46,8 @@ use dom::{
 };
 
 use rquickjs::{
-    Class, Ctx, Exception, FromJs, Function, Object, Persistent, Result, Value,
-    class::Trace, prelude::This,
+    Class, Ctx, Exception, FromJs, Function, Object, Persistent, Result, Value, class::Trace,
+    prelude::This,
 };
 
 use super::events::{self, JsEvent, JsEventTarget};

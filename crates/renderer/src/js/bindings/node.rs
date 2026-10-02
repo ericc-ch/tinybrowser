@@ -326,7 +326,19 @@ fn constructor_units<'js>(ctx: &Ctx<'js>, value: Option<Value<'js>>) -> Result<d
     }
 }
 
-branded_node!(JsNode, "Node");
+#[derive(Trace, rquickjs::JsLifetime)]
+#[rquickjs::class(rename = "Node")]
+pub(crate) struct JsNode {
+    pub(crate) handle: Handle,
+}
+
+impl super::host::SharedClass for JsNode {
+    // https://webidl.spec.whatwg.org/#es-attributes
+    // https://webidl.spec.whatwg.org/#es-operations
+    fn require_interface(&self, ctx: &Ctx<'_>, interface: &str) -> Result<()> {
+        super::host::require_node_interface(ctx, self.handle.0, interface)
+    }
+}
 
 impl JsNode {
     pub(crate) fn node_id(&self) -> NodeId {
@@ -2102,39 +2114,6 @@ impl JsNode {
             .unwrap_or_default())
     }
 
-    // https://dom.spec.whatwg.org/#dom-documenttype-name
-    #[qjs(skip)]
-    fn document_type_name(&self, ctx: &Ctx<'_>) -> Result<String> {
-        with_node_kind(ctx, self.handle.0, |kind| match kind {
-            Some(NodeKind::Doctype { name, .. }) => name.clone(),
-            _ => String::new(),
-        })
-    }
-
-    // https://dom.spec.whatwg.org/#dom-documenttype-publicid
-    #[qjs(skip)]
-    fn public_id(&self, ctx: &Ctx<'_>) -> Result<String> {
-        let world = world(ctx)?;
-        let world = world.borrow();
-        let Some(parsed) = world.document(self.handle.0) else {
-            return Ok(String::new());
-        };
-        Ok(doctype_fields(&parsed, self.handle.0)
-            .map_or(String::new(), |(_, public_id, _)| public_id))
-    }
-
-    // https://dom.spec.whatwg.org/#dom-documenttype-systemid
-    #[qjs(skip)]
-    fn system_id(&self, ctx: &Ctx<'_>) -> Result<String> {
-        let world = world(ctx)?;
-        let world = world.borrow();
-        let Some(parsed) = world.document(self.handle.0) else {
-            return Ok(String::new());
-        };
-        Ok(doctype_fields(&parsed, self.handle.0)
-            .map_or(String::new(), |(_, _, system_id)| system_id))
-    }
-
     #[qjs(skip)]
     fn set_name(&self, ctx: Ctx<'_>, value: WebIdlString) -> Result<()> {
         self.set_attribute(ctx, WebIdlString("name".into()), value)
@@ -2535,17 +2514,6 @@ impl JsNode {
     #[qjs(skip)]
     fn set_style(&self, ctx: &Ctx<'_>, value: WebIdlString) -> Result<()> {
         self.set_attribute(ctx.clone(), WebIdlString("style".into()), value)
-    }
-
-    #[qjs(skip)]
-    fn data<'js>(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
-        dom_string(ctx, &character_data(ctx, self.handle.0)?)
-    }
-
-    #[qjs(skip)]
-    fn set_data<'js>(&self, ctx: &Ctx<'js>, value: rquickjs::String<'js>) -> Result<()> {
-        let data = dom::DomString::from_utf16(value.to_utf16()?);
-        set_character_data(ctx, self.handle.0, data)
     }
 
     // https://dom.spec.whatwg.org/#dom-node-lastchild
@@ -3103,15 +3071,6 @@ impl JsNode {
     #[qjs(skip)]
     fn target(&self, ctx: Ctx<'_>) -> Result<String> {
         attribute_value(&ctx, self.handle.0, "target")
-    }
-
-    // https://dom.spec.whatwg.org/#dom-processinginstruction-target
-    #[qjs(skip)]
-    fn processing_instruction_target(&self, ctx: &Ctx<'_>) -> Result<String> {
-        with_node_kind(ctx, self.handle.0, |kind| match kind {
-            Some(NodeKind::ProcessingInstruction { target, .. }) => target.clone(),
-            _ => String::new(),
-        })
     }
 
     // https://dom.spec.whatwg.org/#dom-element-localname
@@ -3915,18 +3874,71 @@ impl JsNode {
         fixup_focus_after_removal(&ctx, self.handle.0)?;
         schedule_mutation_delivery(&ctx)
     }
+}
 
-    #[qjs(skip)]
-    fn character_data_length(&self, ctx: &Ctx<'_>) -> Result<usize> {
+impl<'js> processing_instruction_generated::ProcessingInstruction<'js> for JsNode {
+    // https://dom.spec.whatwg.org/#dom-processinginstruction-target
+    fn get_target(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
+        let target = with_node_kind(ctx, self.handle.0, |kind| match kind {
+            Some(NodeKind::ProcessingInstruction { target, .. }) => target.clone(),
+            _ => String::new(),
+        })?;
+        rquickjs::String::from_str(ctx.clone(), &target)
+    }
+}
+
+impl<'js> document_type_generated::DocumentType<'js> for JsNode {
+    // https://dom.spec.whatwg.org/#dom-documenttype-name
+    fn get_name(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
+        let name = with_node_kind(ctx, self.handle.0, |kind| match kind {
+            Some(NodeKind::Doctype { name, .. }) => name.clone(),
+            _ => String::new(),
+        })?;
+        rquickjs::String::from_str(ctx.clone(), &name)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-documenttype-publicid
+    fn get_public_id(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
+        let world = world(ctx)?;
+        let world = world.borrow();
+        let value = world
+            .document(self.handle.0)
+            .and_then(|parsed| doctype_fields(&parsed, self.handle.0))
+            .map_or(String::new(), |(_, public_id, _)| public_id);
+        rquickjs::String::from_str(ctx.clone(), &value)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-documenttype-systemid
+    fn get_system_id(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
+        let world = world(ctx)?;
+        let world = world.borrow();
+        let value = world
+            .document(self.handle.0)
+            .and_then(|parsed| doctype_fields(&parsed, self.handle.0))
+            .map_or(String::new(), |(_, _, system_id)| system_id);
+        rquickjs::String::from_str(ctx.clone(), &value)
+    }
+}
+
+impl<'js> character_data_generated::CharacterData<'js> for JsNode {
+    // https://dom.spec.whatwg.org/#dom-characterdata-data
+    fn get_data(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
+        dom_string(ctx, &character_data(ctx, self.handle.0)?)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-characterdata-data
+    fn set_data(&self, ctx: &Ctx<'js>, value: rquickjs::String<'js>) -> Result<()> {
+        let data = dom::DomString::from_utf16(value.to_utf16()?);
+        set_character_data(ctx, self.handle.0, data)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-characterdata-length
+    fn get_length(&self, ctx: &Ctx<'js>) -> Result<usize> {
         Ok(character_data(ctx, self.handle.0)?.len())
     }
 
-    // `HTMLSelectElement.length` is provided by the forms.js shim, which
-    // delegates to the options collection.
-
     // https://dom.spec.whatwg.org/#dom-characterdata-substringdata
-    #[qjs(skip)]
-    fn substring_data<'js>(
+    fn substring_data(
         &self,
         ctx: Ctx<'js>,
         offset: u32,
@@ -3941,21 +3953,14 @@ impl JsNode {
     }
 
     // https://dom.spec.whatwg.org/#dom-characterdata-appenddata
-    #[qjs(skip)]
-    fn append_data<'js>(&self, ctx: Ctx<'js>, data: rquickjs::String<'js>) -> Result<()> {
+    fn append_data(&self, ctx: Ctx<'js>, data: rquickjs::String<'js>) -> Result<()> {
         let mut current = character_data(&ctx, self.handle.0)?;
         current.push_dom(&dom::DomString::from_utf16(data.to_utf16()?));
         set_character_data(&ctx, self.handle.0, current)
     }
 
     // https://dom.spec.whatwg.org/#dom-characterdata-insertdata
-    #[qjs(skip)]
-    fn insert_data<'js>(
-        &self,
-        ctx: Ctx<'js>,
-        offset: u32,
-        data: rquickjs::String<'js>,
-    ) -> Result<()> {
+    fn insert_data(&self, ctx: Ctx<'js>, offset: u32, data: rquickjs::String<'js>) -> Result<()> {
         let mut units = character_data(&ctx, self.handle.0)?.units().into_owned();
         let offset = character_data_offset(&ctx, offset, units.len())?;
         let insert = data.to_utf16()?;
@@ -3964,8 +3969,7 @@ impl JsNode {
     }
 
     // https://dom.spec.whatwg.org/#dom-characterdata-deletedata
-    #[qjs(skip)]
-    fn delete_data(&self, ctx: Ctx<'_>, offset: u32, count: u32) -> Result<()> {
+    fn delete_data(&self, ctx: Ctx<'js>, offset: u32, count: u32) -> Result<()> {
         let mut units = character_data(&ctx, self.handle.0)?.units().into_owned();
         let offset = character_data_offset(&ctx, offset, units.len())?;
         let end = offset
@@ -3976,8 +3980,7 @@ impl JsNode {
     }
 
     // https://dom.spec.whatwg.org/#dom-characterdata-replacedata
-    #[qjs(skip)]
-    fn replace_data<'js>(
+    fn replace_data(
         &self,
         ctx: Ctx<'js>,
         offset: u32,

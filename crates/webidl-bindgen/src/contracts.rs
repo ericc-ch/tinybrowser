@@ -87,15 +87,26 @@ struct Implementation {
 pub(crate) fn compile(idl: &[Source<'_>], rust: &[Source<'_>]) -> Result<Vec<Binding>, Error> {
     let database = Database::parse(idl)?;
     let mut implementations = BTreeMap::new();
+    let mut classes = BTreeSet::new();
     for source in rust {
         let syntax = syn::parse_file(source.text)
             .map_err(|error| Error(format!("{}: invalid Rust: {error}", source.name)))?;
-        discover(&syntax.items, source.name, &mut implementations)?;
+        discover(
+            &syntax.items,
+            source.name,
+            &mut implementations,
+            &mut classes,
+        )?;
     }
     implementations
         .into_values()
         .map(|implementation| {
-            let interface = lower(&database, &implementation)?;
+            let kind = if classes.contains(&implementation.payload.to_string()) {
+                InterfaceKind::Partial
+            } else {
+                InterfaceKind::Complete
+            };
+            let interface = lower(&database, &implementation, kind)?;
             let syntax = syn::parse2(crate::emit::interface(&interface))
                 .map_err(|error| Error(format!("invalid generated contract: {error}")))?;
             Ok(Binding {
@@ -110,25 +121,60 @@ fn discover(
     items: &[syn::Item],
     source: &str,
     implementations: &mut BTreeMap<String, Implementation>,
+    classes: &mut BTreeSet<String>,
 ) -> Result<(), Error> {
     for item in items {
         if let syn::Item::Mod(module) = item
             && let Some((_, items)) = &module.content
         {
-            discover(items, source, implementations)?;
+            discover(items, source, implementations, classes)?;
+        }
+        if let syn::Item::Struct(item) = item
+            && item.attrs.iter().any(|attribute| {
+                attribute
+                    .path()
+                    .segments
+                    .iter()
+                    .map(|segment| segment.ident.to_string())
+                    .eq(["rquickjs", "class"].map(String::from))
+            })
+        {
+            if item.attrs.iter().any(|attribute| {
+                attribute.path().is_ident("cfg") || attribute.path().is_ident("cfg_attr")
+            }) {
+                return Err(Error(format!(
+                    "{source}: native classes must not conditionally disappear"
+                )));
+            }
+            classes.insert(item.ident.to_string());
         }
         let syn::Item::Impl(item) = item else {
             continue;
         };
-        let Some((path, _)) = &item.trait_ else {
+        let Some(implementation) = Implementation::parse(item, source)? else {
             continue;
+        };
+        let name = implementation.interface.clone();
+        if implementations.insert(name.clone(), implementation).is_some() {
+            return Err(Error(format!(
+                "{source}: multiple native implementations of {name} are not supported"
+            )));
+        }
+    }
+    Ok(())
+}
+
+impl Implementation {
+    fn parse(item: &syn::ItemImpl, source: &str) -> Result<Option<Self>, Error> {
+        let Some((path, _)) = &item.trait_ else {
+            return Ok(None);
         };
         let segments: Vec<_> = path.segments.iter().collect();
         let [module, interface] = segments.as_slice() else {
-            continue;
+            return Ok(None);
         };
         if !module.ident.to_string().ends_with("_generated") {
-            continue;
+            return Ok(None);
         }
         let name = interface.ident.to_string();
         if module.ident != format!("{}_generated", snake_case(&name)) {
@@ -182,22 +228,13 @@ fn discover(
                 )));
             }
         }
-        let implementation = Implementation {
-            interface: name.clone(),
+        Ok(Some(Self {
+            interface: name,
             payload: payload.0,
             lifetime: payload.1,
             methods,
-        };
-        if implementations
-            .insert(name.clone(), implementation)
-            .is_some()
-        {
-            return Err(Error(format!(
-                "{source}: multiple native implementations of {name} are not supported"
-            )));
-        }
+        }))
     }
-    Ok(())
 }
 
 fn payload_type(path: &syn::Path) -> Option<(syn::Ident, bool)> {
@@ -220,6 +257,7 @@ fn payload_type(path: &syn::Path) -> Option<(syn::Ident, bool)> {
 fn lower(
     database: &Database<'_>,
     implementation: &Implementation,
+    kind: InterfaceKind,
 ) -> Result<model::Interface, Error> {
     let declaration = database.interface(&implementation.interface)?;
     validate_interface_attributes(declaration.attributes.as_ref())?;
@@ -240,7 +278,7 @@ fn lower(
         constructor: None,
         attributes: Vec::new(),
         constants: Vec::new(),
-        kind: InterfaceKind::Complete,
+        kind,
         operations: Vec::new(),
         dictionaries: Vec::new(),
         enumerations: Vec::new(),
@@ -252,7 +290,19 @@ fn lower(
         ctx_mode: CtxMode::Borrowed,
         contract: None,
     };
-    interface.contract = Some(lower_members(database, &declaration, implementation, &mut interface)?);
+    interface.contract = Some(lower_members(
+        database,
+        &declaration,
+        implementation,
+        &mut interface,
+    )?);
+    if matches!(interface.kind, InterfaceKind::Partial)
+        && (interface.constructor.is_some() || !matches!(interface.properties, PropertyHooks::None))
+    {
+        return Err(Error(
+            "bindings for existing classes cannot replace constructors or property hooks".into(),
+        ));
+    }
     add_referenced_definitions(database, &mut interface)?;
     Ok(interface)
 }

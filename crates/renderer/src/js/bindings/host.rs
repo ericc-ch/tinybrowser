@@ -316,6 +316,12 @@ fn html_local(kind: Option<&dom::NodeKind>, local: &str) -> bool {
     )
 }
 
+/// Validates an interface against native state on a shared payload.
+/// Page-controlled prototypes must not grant an interface brand.
+pub(crate) trait SharedClass {
+    fn require_interface(&self, ctx: &Ctx<'_>, interface: &str) -> Result<()>;
+}
+
 pub(crate) fn require_node_interface(
     ctx: &Ctx<'_>,
     id: dom::NodeId,
@@ -330,6 +336,7 @@ pub(crate) fn require_node_interface(
         .ok_or_else(|| Exception::throw_type(ctx, "stale node"))?;
     let kind = document.document.kind(id);
     let implements = match interface {
+        "Node" => kind.is_some(),
         "Document" | "XMLDocument" => matches!(kind, Some(dom::NodeKind::Document)),
         // A shadow root is a fragment carrying shadow metadata.
         "DocumentFragment" | "ShadowRoot" => matches!(kind, Some(dom::NodeKind::Fragment)),
@@ -360,11 +367,7 @@ pub(crate) fn require_node_interface(
         // interface, so the receiver check accepts the union of those kinds.
         "ParentNode" => matches!(
             kind,
-            Some(
-                dom::NodeKind::Document
-                    | dom::NodeKind::Fragment
-                    | dom::NodeKind::Element { .. }
-            )
+            Some(dom::NodeKind::Document | dom::NodeKind::Fragment | dom::NodeKind::Element { .. })
         ),
         "ChildNode" => matches!(
             kind,

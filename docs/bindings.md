@@ -81,6 +81,13 @@ the JS receiver as a leading `Object<'js>` before its IDL arguments. Discovery
 recognizes this signature and dispatch supplies the receiver. The generated
 trait checks the remaining arguments against IDL-derived types.
 
+If a payload already declares `#[rquickjs::class]`, the generator emits an
+installer for its interface prototype instead of another `JsClass`
+implementation. This lets node interfaces share one native identity. Existing
+classes cannot replace constructors or exotic property hooks through this path.
+The payload implements `host::SharedClass` to check each interface's native brand
+before generated dispatch calls an algorithm.
+
 Dictionary field names use snake case. Dictionary conversion visits inherited
 declarations first and sorts each declaration's members, including partials,
 lexicographically. Unsupported defaults and conversions fail the build.
