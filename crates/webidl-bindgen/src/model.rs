@@ -12,12 +12,23 @@ use weedle::{Definition, Definitions, Parse};
 
 use crate::Error;
 
+/// One platform type implementing an interface. The primary payload owns the
+/// interface's prototype and class; alternates are additional Rust types the
+/// same interface contract dispatches to (for example every node interface is
+/// also an `EventTarget`, whose primary payload is `JsEventTarget`).
+#[derive(Clone)]
+pub(crate) struct Payload {
+    pub(crate) rust: Ident,
+    pub(crate) has_lifetime: bool,
+}
+
 pub(crate) struct Interface {
     pub(crate) contract: Option<proc_macro2::TokenStream>,
     pub(crate) name: String,
     pub(crate) rust: Ident,
-    pub(crate) alternate: Option<Ident>,
-    pub(crate) alternate_has_lifetime: bool,
+    /// Additional payload types implementing this interface, in discovery
+    /// order. `rust` is always the primary payload.
+    pub(crate) payloads: Vec<Payload>,
     pub(crate) has_lifetime: bool,
     pub(crate) parent: Option<PrototypeParent>,
     pub(crate) constructor: Option<Constructor>,
@@ -438,11 +449,17 @@ impl Interface {
             parent,
             &kind,
         )?;
+        let payloads = alternate
+            .iter()
+            .map(|alternate| Payload {
+                rust: alternate.clone(),
+                has_lifetime: alternate_has_lifetime,
+            })
+            .collect();
         let mut result = Self {
             name: identifier(identifier_token)?.into(),
             rust,
-            alternate,
-            alternate_has_lifetime,
+            payloads,
             has_lifetime,
             parent,
             constructor: None,

@@ -74,16 +74,31 @@ fn conflicting_providers_and_unknown_contract_methods_are_diagnostics() {
             .to_string(),
         "Sample: methods do not match a supported IDL contract: typo"
     );
-    let duplicates = [Source {
+    // Two payloads for one interface are the multi-payload case: one
+    // contract, one installation, a dispatch arm per platform type.
+    let providers = [Source {
         name: "fixture.rs",
         text: "impl<'js> sample_generated::Sample<'js> for A {} impl<'js> sample_generated::Sample<'js> for B {}",
     }];
+    let bindings = compile_contracts(&idl, &providers).expect("multi-payload provider");
+    let dispatch = bindings[0].rust.split_whitespace().collect::<String>();
+    assert!(
+        dispatch.contains("crate::js::bindings::B")
+            && dispatch.contains("host::receiver::<A>"),
+        "missing alternate payload arm: {}",
+        bindings[0].rust
+    );
+    // The same platform type twice is still a conflict.
+    let repeated = [Source {
+        name: "fixture.rs",
+        text: "impl<'js> sample_generated::Sample<'js> for A {} impl<'js> sample_generated::Sample<'js> for A {}",
+    }];
     assert_eq!(
-        compile_contracts(&idl, &duplicates)
+        compile_contracts(&idl, &repeated)
             .err()
-            .expect("duplicate provider")
+            .expect("repeated payload")
             .to_string(),
-        "fixture.rs: multiple native implementations of Sample are not supported"
+        "fixture.rs: Sample is implemented twice for A"
     );
 }
 

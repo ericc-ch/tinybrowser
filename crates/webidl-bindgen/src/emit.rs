@@ -6,8 +6,8 @@ use quote::{format_ident, quote};
 use crate::model::{
     ArgumentArity, Attribute, ConstructorArgumentKind, Dictionary, DictionaryFieldType,
     Enumeration, GetterMapping, Interface, InterfaceKind, Operation, OperationArgument,
-    OperationResult, PropertyGetter, PropertyHooks, PrototypeParent, ReturnType, Setter, Union,
-    UnionMemberType,
+    OperationResult, Payload, PropertyGetter, PropertyHooks, PrototypeParent, ReturnType, Setter,
+    Union, UnionMemberType,
 };
 
 pub(crate) fn interface(interface: &Interface) -> TokenStream {
@@ -59,16 +59,7 @@ pub(crate) fn interface(interface: &Interface) -> TokenStream {
         },
         InterfaceKind::Partial => quote! {},
     };
-    let receiver_check =
-        if matches!(interface.kind, InterfaceKind::Partial) && interface.contract.is_some() {
-            let name = &interface.name;
-            quote! { host::SharedClass::require_interface(&*receiver, &ctx, #name)?; }
-        } else if interface.rust == "JsNode" && interface.name != "Node" {
-            let name = &interface.name;
-            quote! { host::require_node_interface(&ctx, receiver.node_id(), #name)?; }
-        } else {
-            quote! {}
-        };
+    let receiver_check = receiver_check(interface, &interface.rust);
     quote! {
         pub(super) mod #module {
             use super::#rust;
@@ -155,28 +146,55 @@ fn member_tables(interface: &Interface) -> TokenStream {
     }
 }
 
-fn alternate_dispatch(interface: &Interface) -> (TokenStream, Vec<TokenStream>) {
-    let Some(alternate) = &interface.alternate else {
-        return (quote! {}, Vec::new());
-    };
-    let payload = if interface.alternate_has_lifetime {
-        quote! { crate::js::bindings::#alternate<'js> }
+/// The receiver brand check for one payload of an interface. A node payload
+/// checks the node's interface; a partial binding on an existing class uses
+/// the shared-class hook; a payload that *is* the interface's class needs no
+/// further check.
+fn receiver_check(interface: &Interface, rust: &proc_macro2::Ident) -> TokenStream {
+    let name = &interface.name;
+    if matches!(interface.kind, InterfaceKind::Partial) && interface.contract.is_some() {
+        quote! { host::SharedClass::require_interface(&*receiver, &ctx, #name)?; }
+    } else if rust == "JsNode" && interface.name != "Node" {
+        quote! { host::require_node_interface(&ctx, receiver.node_id(), #name)?; }
     } else {
-        quote! { crate::js::bindings::#alternate }
-    };
-    let (routes, groups) = dispatch_groups(interface, &payload, "alternate");
-    (
-        quote! {
+        quote! {}
+    }
+}
+
+fn payload_type(payload: &Payload) -> TokenStream {
+    let rust = &payload.rust;
+    if payload.has_lifetime {
+        quote! { crate::js::bindings::#rust<'js> }
+    } else {
+        quote! { crate::js::bindings::#rust }
+    }
+}
+
+/// Dispatch arms for interface payloads beyond the primary one, each tried in
+/// discovery order. This is how an interface implemented by more than one Rust
+/// type (every node interface is also an `EventTarget`) installs once and still
+/// reaches the right platform algorithm.
+fn alternate_dispatch(interface: &Interface) -> (TokenStream, Vec<TokenStream>) {
+    let mut arms = Vec::new();
+    let mut groups = Vec::new();
+    for (index, payload) in interface.payloads.iter().enumerate() {
+        let payload = payload_type(payload);
+        let prefix = format!("dispatch_{index}");
+        let (routes, mut payload_groups) = dispatch_groups(interface, &payload, &prefix);
+        let check = receiver_check(interface, &interface.payloads[index].rust);
+        arms.push(quote! {
             if let Ok(receiver) = rquickjs::Class::<#payload>::from_value(&params.this()) {
                 let receiver = receiver.borrow();
+                #check
                 return match operation.index() {
                     #(#routes,)*
                     _ => Err(rquickjs::Exception::throw_internal(&ctx, "unknown native operation")),
                 };
             }
-        },
-        groups,
-    )
+        });
+        groups.append(&mut payload_groups);
+    }
+    (quote! { #(#arms)* }, groups)
 }
 
 fn dispatch_groups(

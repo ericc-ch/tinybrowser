@@ -18,7 +18,7 @@ use crate::{Binding, Error, Source};
 
 /// One discovered implementation method: its parameter count after `self` and
 /// `ctx`, and whether the first such parameter is the JS receiver object.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 struct Method {
     has_self: bool,
     parameters: usize,
@@ -81,7 +81,43 @@ struct Implementation {
     interface: String,
     payload: syn::Ident,
     lifetime: bool,
+    /// Additional platform types implementing the same interface, discovered
+    /// in source order after the primary payload.
+    payloads: Vec<model::Payload>,
     methods: BTreeMap<String, Method>,
+}
+
+impl Implementation {
+    /// Fold a second implementation of the same interface into this one. Every
+    /// payload must provide the same method signatures, so the merged method
+    /// set is what the generated trait and every `impl` share.
+    fn absorb(&mut self, other: Self, source: &str) -> Result<(), Error> {
+        if self.payload == other.payload {
+            return Err(Error(format!(
+                "{source}: {} is implemented twice for {}",
+                other.interface, other.payload
+            )));
+        }
+        for (name, method) in other.methods {
+            match self.methods.get(&name) {
+                Some(existing) if *existing != method => {
+                    return Err(Error(format!(
+                        "{source}: {name} has a different signature on each {} payload",
+                        other.interface
+                    )));
+                }
+                Some(_) => {}
+                None => {
+                    self.methods.insert(name, method);
+                }
+            }
+        }
+        self.payloads.push(model::Payload {
+            rust: other.payload,
+            has_lifetime: other.lifetime,
+        });
+        Ok(())
+    }
 }
 
 pub(crate) fn compile(idl: &[Source<'_>], rust: &[Source<'_>]) -> Result<Vec<Binding>, Error> {
@@ -155,13 +191,10 @@ fn discover(
             continue;
         };
         let name = implementation.interface.clone();
-        if implementations
-            .insert(name.clone(), implementation)
-            .is_some()
-        {
-            return Err(Error(format!(
-                "{source}: multiple native implementations of {name} are not supported"
-            )));
+        if let Some(existing) = implementations.get_mut(&name) {
+            existing.absorb(implementation, source)?;
+        } else {
+            implementations.insert(name, implementation);
         }
     }
     Ok(())
@@ -235,6 +268,7 @@ impl Implementation {
             interface: name,
             payload: payload.0,
             lifetime: payload.1,
+            payloads: Vec::new(),
             methods,
         }))
     }
@@ -279,8 +313,7 @@ fn lower(
     let mut interface = model::Interface {
         name: declaration.name.into(),
         rust: implementation.payload.clone(),
-        alternate: None,
-        alternate_has_lifetime: false,
+        payloads: implementation.payloads.clone(),
         has_lifetime: implementation.lifetime,
         parent,
         constructor: None,
@@ -334,8 +367,7 @@ fn lower_mixin(
     let mut interface = model::Interface {
         name: implementation.interface.clone(),
         rust: implementation.payload.clone(),
-        alternate: None,
-        alternate_has_lifetime: false,
+        payloads: implementation.payloads.clone(),
         has_lifetime: implementation.lifetime,
         parent: None,
         constructor: None,
