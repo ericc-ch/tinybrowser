@@ -1350,7 +1350,7 @@ impl JsNode {
 
     // https://html.spec.whatwg.org/multipage/forms.html#dom-form-reset
     #[qjs(skip)]
-    fn reset(&self, ctx: Ctx<'_>) -> Result<()> {
+    fn reset_form(&self, ctx: Ctx<'_>) -> Result<()> {
         if !with_node_kind(&ctx, self.handle.0, |kind| is_html_element(kind, "form"))? {
             return Err(throw_dom(
                 &ctx,
@@ -1406,76 +1406,6 @@ impl JsNode {
             .ok()
             .and_then(|base| base.join(&raw).ok())
             .map_or(raw, |url| url.to_string()))
-    }
-
-    #[qjs(skip)]
-    fn set_action(&self, ctx: Ctx<'_>, value: WebIdlString) -> Result<()> {
-        self.set_attribute(ctx, WebIdlString("action".into()), value)
-    }
-
-    // https://html.spec.whatwg.org/multipage/forms.html#dom-form-method
-    #[qjs(skip)]
-    fn method(&self, ctx: Ctx<'_>) -> Result<String> {
-        let raw = attribute_value(&ctx, self.handle.0, "method")?;
-        Ok(match raw.trim().to_ascii_lowercase().as_str() {
-            "post" => "post",
-            "dialog" => "dialog",
-            _ => "get",
-        }
-        .to_owned())
-    }
-
-    #[qjs(skip)]
-    fn set_method(&self, ctx: Ctx<'_>, value: WebIdlString) -> Result<()> {
-        self.set_attribute(ctx, WebIdlString("method".into()), value)
-    }
-
-    // https://html.spec.whatwg.org/multipage/forms.html#dom-form-enctype
-    #[qjs(skip)]
-    fn enctype(&self, ctx: Ctx<'_>) -> Result<String> {
-        Ok(encoding_keyword(&attribute_value(&ctx, self.handle.0, "enctype")?).to_owned())
-    }
-
-    #[qjs(skip)]
-    fn set_enctype(&self, ctx: Ctx<'_>, value: WebIdlString) -> Result<()> {
-        self.set_attribute(ctx, WebIdlString("enctype".into()), value)
-    }
-
-    #[qjs(skip)]
-    fn encoding(&self, ctx: Ctx<'_>) -> Result<String> {
-        Ok(encoding_keyword(&attribute_value(&ctx, self.handle.0, "enctype")?).to_owned())
-    }
-
-    #[qjs(skip)]
-    fn set_encoding(&self, ctx: Ctx<'_>, value: WebIdlString) -> Result<()> {
-        self.set_attribute(ctx, WebIdlString("enctype".into()), value)
-    }
-
-    #[qjs(skip)]
-    fn set_target(&self, ctx: Ctx<'_>, value: WebIdlString) -> Result<()> {
-        self.set_attribute(ctx, WebIdlString("target".into()), value)
-    }
-
-    // https://html.spec.whatwg.org/multipage/forms.html#dom-form-novalidate
-    #[qjs(skip)]
-    fn no_validate(&self, ctx: Ctx<'_>) -> Result<bool> {
-        self.attribute_present(&ctx, "novalidate")
-    }
-
-    #[qjs(skip)]
-    fn set_no_validate(&self, ctx: Ctx<'_>, value: bool) -> Result<()> {
-        self.reflect_boolean(ctx, "novalidate", value)
-    }
-
-    // https://html.spec.whatwg.org/multipage/forms.html#dom-form-acceptcharset
-    #[qjs(skip)]
-    fn accept_charset(&self, ctx: Ctx<'_>) -> Result<String> {
-        attribute_value(&ctx, self.handle.0, "accept-charset")
-    }
-
-    #[qjs(skip)]
-    fn set_accept_charset(&self, ctx: Ctx<'_>, value: WebIdlString) -> Result<()> {
-        self.set_attribute(ctx, WebIdlString("accept-charset".into()), value)
     }
 
     // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#dom-fs-formaction
@@ -1568,38 +1498,6 @@ impl JsNode {
         Ok(())
     }
 
-    /// Reflecting boolean attribute shared by the form-control states: the
-    /// engine exposes one element wrapper, so these answer on every element,
-    /// the same shortcut `value` takes.
-    #[qjs(skip)]
-    fn reflect_boolean(&self, ctx: Ctx<'_>, name: &str, value: bool) -> Result<()> {
-        if value {
-            self.set_attribute(ctx, WebIdlString(name.into()), WebIdlString(String::new()))
-        } else {
-            self.remove_attribute(ctx, WebIdlString(name.into()))
-        }
-    }
-
-    #[qjs(skip)]
-    fn attribute_present(&self, ctx: &Ctx<'_>, name: &str) -> Result<bool> {
-        let world = world(ctx)?;
-        let world = world.borrow();
-        Ok(world
-            .document(self.handle.0)
-            .is_some_and(|parsed| parsed.document.attribute(self.handle.0, name).is_some()))
-    }
-
-    // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#dom-fe-disabled
-    #[qjs(skip)]
-    fn disabled(&self, ctx: Ctx<'_>) -> Result<bool> {
-        self.attribute_present(&ctx, "disabled")
-    }
-
-    #[qjs(skip)]
-    fn set_disabled(&self, ctx: Ctx<'_>, value: bool) -> Result<()> {
-        self.reflect_boolean(ctx, "disabled", value)
-    }
-
     // https://html.spec.whatwg.org/multipage/forms.html#dom-fae-form
     #[qjs(skip)]
     fn form<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
@@ -1679,16 +1577,6 @@ impl JsNode {
         Ok(())
     }
 
-    #[qjs(skip)]
-    fn default_selected(&self, ctx: Ctx<'_>) -> Result<bool> {
-        self.attribute_present(&ctx, "selected")
-    }
-
-    #[qjs(skip)]
-    fn set_default_selected(&self, ctx: Ctx<'_>, value: bool) -> Result<()> {
-        self.reflect_boolean(ctx, "selected", value)
-    }
-
     // https://html.spec.whatwg.org/multipage/form-elements.html#dom-option-label
     #[qjs(skip)]
     fn label(&self, ctx: Ctx<'_>) -> Result<String> {
@@ -1702,11 +1590,6 @@ impl JsNode {
                     .no_namespace_attribute(self.handle.0, "label")
                     .unwrap_or_else(|| dom::form::option_text(&parsed.document, self.handle.0))
             }))
-    }
-
-    #[qjs(skip)]
-    fn set_label(&self, ctx: Ctx<'_>, value: WebIdlString) -> Result<()> {
-        self.set_attribute(ctx, WebIdlString("label".into()), value)
     }
 
     // https://html.spec.whatwg.org/multipage/form-elements.html#dom-option-text
@@ -2650,12 +2533,6 @@ impl JsNode {
             Some(NodeKind::Element { name, .. }) => element_node_name(name, uppercase),
             _ => String::new(),
         })
-    }
-
-    // https://html.spec.whatwg.org/multipage/forms.html#dom-form-target
-    #[qjs(skip)]
-    fn target(&self, ctx: Ctx<'_>) -> Result<String> {
-        attribute_value(&ctx, self.handle.0, "target")
     }
 
     // https://dom.spec.whatwg.org/#dom-element-localname
@@ -4121,6 +3998,112 @@ impl<'js> html_input_element_generated::HTMLInputElement<'js> for JsNode {
             None => "none".into(),
         };
         self.set_selection_direction(ctx.clone(), WebIdlString(value))
+    }
+}
+
+impl<'js> html_form_element_generated::HTMLFormElement<'js> for JsNode {
+    // https://html.spec.whatwg.org/multipage/forms.html#dom-form-action
+    fn get_action(&self, ctx: &Ctx<'js>) -> Result<dom::DomString> {
+        Ok(self.action(ctx.clone())?.into())
+    }
+
+    // https://html.spec.whatwg.org/multipage/forms.html#dom-form-method
+    fn get_method(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
+        let raw = attribute_value(ctx, self.handle.0, "method")?;
+        let method = match raw.trim().to_ascii_lowercase().as_str() {
+            "post" => "post",
+            "dialog" => "dialog",
+            _ => "get",
+        };
+        rquickjs::String::from_str(ctx.clone(), method)
+    }
+
+    // https://html.spec.whatwg.org/multipage/forms.html#dom-form-method
+    fn set_method(&self, ctx: &Ctx<'js>, value: rquickjs::String<'js>) -> Result<()> {
+        self.set_attribute(
+            ctx.clone(),
+            WebIdlString("method".into()),
+            WebIdlString(value.to_string()?),
+        )
+    }
+
+    // https://html.spec.whatwg.org/multipage/forms.html#dom-form-enctype
+    fn get_enctype(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
+        let raw = attribute_value(ctx, self.handle.0, "enctype")?;
+        rquickjs::String::from_str(ctx.clone(), encoding_keyword(&raw))
+    }
+
+    // https://html.spec.whatwg.org/multipage/forms.html#dom-form-enctype
+    fn set_enctype(&self, ctx: &Ctx<'js>, value: rquickjs::String<'js>) -> Result<()> {
+        self.set_attribute(
+            ctx.clone(),
+            WebIdlString("enctype".into()),
+            WebIdlString(value.to_string()?),
+        )
+    }
+
+    // https://html.spec.whatwg.org/multipage/forms.html#dom-form-encoding
+    fn get_encoding(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
+        self.get_enctype(ctx)
+    }
+
+    // https://html.spec.whatwg.org/multipage/forms.html#dom-form-encoding
+    fn set_encoding(&self, ctx: &Ctx<'js>, value: rquickjs::String<'js>) -> Result<()> {
+        self.set_enctype(ctx, value)
+    }
+
+    // https://html.spec.whatwg.org/multipage/forms.html#dom-form-reset
+    fn reset(&self, ctx: Ctx<'js>) -> Result<()> {
+        self.reset_form(ctx)
+    }
+}
+
+impl<'js> html_option_element_generated::HTMLOptionElement<'js> for JsNode {
+    // https://html.spec.whatwg.org/multipage/forms.html#dom-fae-form
+    fn get_form(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
+        self.form(ctx.clone())
+    }
+
+    // https://html.spec.whatwg.org/multipage/form-elements.html#dom-option-label
+    fn get_label(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
+        let label = self.label(ctx.clone())?;
+        rquickjs::String::from_str(ctx.clone(), &label)
+    }
+
+    // https://html.spec.whatwg.org/multipage/form-elements.html#dom-option-selected
+    fn get_selected(&self, ctx: &Ctx<'js>) -> Result<bool> {
+        self.selected(ctx.clone())
+    }
+
+    // https://html.spec.whatwg.org/multipage/form-elements.html#dom-option-selected
+    fn set_selected(&self, ctx: &Ctx<'js>, value: bool) -> Result<()> {
+        self.set_selected(ctx.clone(), value)
+    }
+
+    // https://html.spec.whatwg.org/multipage/form-elements.html#dom-option-value
+    fn get_value(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
+        let value = self.value(ctx.clone())?;
+        rquickjs::String::from_str(ctx.clone(), &value)
+    }
+
+    // https://html.spec.whatwg.org/multipage/form-elements.html#dom-option-text
+    fn get_text(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
+        let text = self.text(ctx.clone())?;
+        rquickjs::String::from_str(ctx.clone(), &text)
+    }
+
+    // https://html.spec.whatwg.org/multipage/form-elements.html#dom-option-text
+    fn set_text(&self, ctx: &Ctx<'js>, value: rquickjs::String<'js>) -> Result<()> {
+        // DOMString keeps every code unit, including lone surrogates.
+        self.set_text(
+            ctx.clone(),
+            WebIdlCodeUnits(dom::DomString::from_utf16(value.to_utf16()?)),
+        )
+    }
+
+    // https://html.spec.whatwg.org/multipage/form-elements.html#dom-option-index
+    fn get_index(&self, ctx: &Ctx<'js>) -> Result<i32> {
+        self.index(ctx.clone())
     }
 }
 

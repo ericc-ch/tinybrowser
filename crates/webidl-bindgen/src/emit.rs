@@ -1421,37 +1421,79 @@ fn union(union: &Union) -> TokenStream {
     let name = format_ident!("{}", union.name);
     let variants = union.members.iter().map(|member| {
         let variant = &member.variant;
-        let type_ = match member.type_ {
-            UnionMemberType::Node => quote! { host::NodeReference },
+        let type_ = match &member.type_ {
+            UnionMemberType::Interface { node: true, .. } => quote! { host::NodeReference },
+            UnionMemberType::Interface { node: false, .. } => quote! { Value<'js> },
             UnionMemberType::String => quote! { rquickjs::String<'js> },
+            UnionMemberType::Boolean => quote! { bool },
+            UnionMemberType::Long => quote! { i32 },
+            UnionMemberType::Dictionary(name) => {
+                let name = format_ident!("{name}");
+                quote! { #name }
+            }
         };
         quote! { #variant(#type_) }
     });
     let mut trials = Vec::new();
     // Trial order follows the WebIDL union algorithm, not the declaration
-    // order: platform objects precede string coercion. A Node instance must
-    // match the interface member even when the union declares the string
-    // first, while every other value stringifies.
+    // order: platform objects, then objects as dictionaries, then primitives,
+    // then string coercion. Within a step, every member gets a trial.
     let mut ordered: Vec<_> = union.members.iter().collect();
-    ordered.sort_by_key(|member| match member.type_ {
-        UnionMemberType::Node => 0,
-        UnionMemberType::String => 1,
+    ordered.sort_by_key(|member| match &member.type_ {
+        UnionMemberType::Interface { .. } => 0,
+        UnionMemberType::Dictionary(_) => 1,
+        UnionMemberType::Boolean => 2,
+        UnionMemberType::Long => 3,
+        UnionMemberType::String => 4,
     });
     for member in ordered {
         let variant = &member.variant;
-        match member.type_ {
-            UnionMemberType::Node => trials.push(quote! {
-                // A Node is a platform object implementing the interface;
-                // anything else falls through to string coercion. The probe
-                // is strict: `Attr` has its own payload and stringifies.
-                if host::is_node(ctx, &value) {
+        match &member.type_ {
+            UnionMemberType::Interface {
+                name: interface,
+                node: true,
+            } => trials.push(quote! {
+                // A platform object implementing the interface; anything
+                // else falls through. `is_interface` is strict: `Attr` has
+                // its own payload and does not implement `Node`.
+                if host::is_interface(ctx, &value, #interface) {
                     return host::node_argument(ctx, &value).map(Self::#variant);
+                }
+            }),
+            UnionMemberType::Interface { node: false, .. } => unreachable!(
+                "non-node interface union members are rejected at lowering"
+            ),
+            UnionMemberType::Dictionary(name) => {
+                let name = format_ident!("{name}");
+                trials.push(quote! {
+                    // An object converts to the dictionary once platform
+                    // objects have been tried
+                    // (<https://webidl.spec.whatwg.org/#es-union>).
+                    if value.is_object() {
+                        return #name::from_object(ctx, &value).map(Self::#variant);
+                    }
+                });
+            }
+            UnionMemberType::Boolean => trials.push(quote! {
+                if let Some(boolean) = value.as_bool() {
+                    return Ok(Self::#variant(boolean));
+                }
+            }),
+            UnionMemberType::Long => trials.push(quote! {
+                // https://webidl.spec.whatwg.org/#es-long
+                if value.is_number() {
+                    let converted: rquickjs::Coerced<i32> =
+                        rquickjs::FromJs::from_js(ctx, value)?;
+                    return Ok(Self::#variant(converted.0));
                 }
             }),
             UnionMemberType::String => trials.push(quote! {
                 // https://webidl.spec.whatwg.org/#es-DOMString
                 // Coerced rejects Symbol and stringifies everything else.
-                rquickjs::FromJs::from_js(ctx, value).map(|string: rquickjs::Coerced<rquickjs::String>| Self::#variant(string.0))
+                // A string member is tried last, so this is the tail
+                // expression.
+                rquickjs::FromJs::from_js(ctx, value)
+                    .map(|string: rquickjs::Coerced<rquickjs::String>| Self::#variant(string.0))
             }),
         }
     }

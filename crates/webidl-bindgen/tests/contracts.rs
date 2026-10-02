@@ -321,7 +321,7 @@ fn enum_attributes_lower_to_the_generated_enum() {
 fn node_or_string_unions_convert_interfaces_before_strings() {
     let idl = [Source {
         name: "dom.idl",
-        text: "[Exposed=Window] interface Sample { undefined append((Node or DOMString)... nodes); };",
+        text: "[Exposed=Window] interface Node {}; [Exposed=Window] interface Sample { undefined append((Node or DOMString)... nodes); };",
     }];
     let rust = [Source {
         name: "sample.rs",
@@ -394,7 +394,7 @@ fn unscopable_operations_list_in_unscopables() {
 fn mixin_implementations_install_on_includers() {
     let idl = [Source {
         name: "dom.idl",
-        text: "[Exposed=Window] interface Element {}; [Exposed=Window] interface Document {}; interface mixin Nodes { undefined append((Node or DOMString)... nodes); }; Element includes Nodes; Document includes Nodes;",
+        text: "[Exposed=Window] interface Node {}; [Exposed=Window] interface Element {}; [Exposed=Window] interface Document {}; interface mixin Nodes { undefined append((Node or DOMString)... nodes); }; Element includes Nodes; Document includes Nodes;",
     }];
     let rust = [Source {
         name: "nodes.rs",

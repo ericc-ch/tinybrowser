@@ -241,8 +241,14 @@ pub(crate) struct UnionMember {
 /// the build at lowering instead of shipping a partial conversion.
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) enum UnionMemberType {
-    Node,
+    /// An interface member. `name` is the IDL interface and `node` says
+    /// whether it is `Node` or inherits from it (converted to
+    /// `host::NodeReference`) rather than another platform object.
+    Interface { name: String, node: bool },
     String,
+    Boolean,
+    Long,
+    Dictionary(String),
 }
 
 pub(crate) struct Callback {

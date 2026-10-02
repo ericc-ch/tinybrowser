@@ -561,6 +561,14 @@ fn collect_reference(type_: &ReturnType, referenced: &mut BTreeSet<String>) {
         ReturnType::Dictionary(name) | ReturnType::Enumeration(name) => {
             referenced.insert(name.clone());
         }
+        // Dictionaries a union member references still need their struct.
+        ReturnType::Union(_, members) => {
+            for member in members {
+                if let model::UnionMemberType::Dictionary(name) = &member.type_ {
+                    referenced.insert(name.clone());
+                }
+            }
+        }
         _ => {}
     }
 }
@@ -1034,7 +1042,13 @@ fn lower_attribute(
     validate_argument_attributes(member.type_.attributes.as_ref())?;
     let reactions = has_attribute(member.attributes.as_ref(), "CEReactions");
     let legacy_null_to_empty = has_attribute(member.attributes.as_ref(), "LegacyNullToEmptyString")
-        || has_attribute(member.type_.attributes.as_ref(), "LegacyNullToEmptyString");
+        || has_attribute(member.type_.attributes.as_ref(), "LegacyNullToEmptyString")
+        || match &member.type_.type_ {
+            Type::Union(union_) => {
+                union_member_has_attribute(&union_.type_.body.list, "LegacyNullToEmptyString")
+            }
+            Type::Single(_) => false,
+        };
     let type_ = match native_type(database, &member.type_.type_, &mut BTreeSet::new())? {
         // Getter dispatch hands a platform object or its null directly to JS.
         ReturnType::Node
@@ -1514,7 +1528,7 @@ fn native_type(
                 _ => Err(Error(format!("native type {name} is not supported yet"))),
             }
         }
-        Type::Union(union_) => lower_union(union_),
+        Type::Union(union_) => lower_union(database, union_),
         Type::Single(_) => Err(Error(format!(
             "native type is not supported yet: {type_:?}"
         ))),
@@ -1523,87 +1537,216 @@ fn native_type(
 
 /// Lower a union to a generated enum. Flattened member order follows the IDL
 /// declaration; conversion order follows the `WebIDL` union algorithm, which
-/// tries platform objects before string coercion
-/// (<https://webidl.spec.whatwg.org/#es-union>).
+/// tries platform objects before dictionaries, then primitives, then string
+/// coercion (<https://webidl.spec.whatwg.org/#es-union>).
 /// Chromium groups identical flattened member sets into one union class
 /// (`third_party/blink/renderer/bindings/scripts/web_idl/union.py`);
 /// Firefox tries members in the same order in its generated `Init`
-/// (`dom/bindings/Codegen.py`). Only member types with a generated
-/// conversion are accepted; anything else fails the build.
+/// (`dom/bindings/Codegen.py`). Trusted Types interfaces have no implementation
+/// in this runtime, so they collapse to the string member they accompany; a
+/// union that collapses to one member type lowers to that type, not an enum.
 fn lower_union(
+    database: &Database<'_>,
     union_: &weedle::types::MayBeNull<weedle::types::UnionType<'_>>,
 ) -> Result<ReturnType, Error> {
     if union_.q_mark.is_some() {
         return Err(Error("nullable unions are not supported yet".into()));
     }
-    let mut flattened = Vec::new();
-    flatten_union(&union_.type_.body.list, &mut flattened)?;
     let mut members = Vec::new();
-    for (name, type_) in &flattened {
-        let member = match type_ {
-            NonAnyType::Identifier(item)
-                if item.q_mark.is_none() && item.type_.0 == "Node" =>
-            {
-                model::UnionMember {
-                    variant: format_ident!("Node"),
-                    type_: model::UnionMemberType::Node,
-                }
-            }
-            NonAnyType::DOMString(item) if item.q_mark.is_none() => model::UnionMember {
-                variant: format_ident!("DOMString"),
-                type_: model::UnionMemberType::String,
-            },
-            _ => {
-                return Err(Error(format!("union member {name} is not supported yet")));
-            }
-        };
-        if members.contains(&member) {
-            return Err(Error(format!("duplicate union member {name}")));
-        }
-        members.push(member);
-    }
-    if members.len() < 2 {
-        return Err(Error("unions need at least two member types".into()));
-    }
-    // Canonical declaration-independent name, like Chromium's sorted
-    // union type names (`UnionType.type_name_without_extended_attributes`).
-    let mut idl_names: Vec<&str> = flattened.iter().map(|(name, _)| *name).collect();
-    idl_names.sort_unstable();
-    idl_names.dedup();
-    let name = idl_names.join("Or");
-    Ok(ReturnType::Union(name, members))
+    let mut visited = BTreeSet::new();
+    collect_union_members(
+        database,
+        &union_.type_.body.list,
+        &mut members,
+        &mut visited,
+    )?;
+    finish_union(members)
 }
 
-/// Flatten nested unions into `(IDL name, single type)` pairs, mirroring
-/// Chromium's `UnionType.flattened_member_types`. Member attributes must be
-/// empty; attributed members need explicit conversion support first.
-fn flatten_union<'idl>(
+/// Flatten nested unions and typedef'd unions into distinct member types,
+/// mirroring Chromium's `UnionType.flattened_member_types`. Members whose
+/// Rust representation repeats collapse into one; anything without a
+/// generated conversion fails the build.
+fn collect_union_members<'idl>(
+    database: &Database<'idl>,
     list: &[UnionMemberType<'idl>],
-    flattened: &mut Vec<(&'idl str, NonAnyType<'idl>)>,
+    members: &mut Vec<model::UnionMember>,
+    visited: &mut BTreeSet<String>,
 ) -> Result<(), Error> {
     for member in list {
         match member {
             UnionMemberType::Single(member) => {
-                validate_empty_attributes(member.attributes.as_ref())?;
-                flattened.push((member_name(&member.type_), member.type_.clone()));
+                validate_union_member_attributes(member.attributes.as_ref())?;
+                collect_union_member(
+                    database,
+                    &Type::Single(SingleType::NonAny(member.type_.clone())),
+                    members,
+                    visited,
+                )?;
             }
-            UnionMemberType::Union(member) => {
-                if member.q_mark.is_some() {
+            UnionMemberType::Union(inner) => {
+                if inner.q_mark.is_some() {
                     return Err(Error("nullable nested unions are not supported yet".into()));
                 }
-                flatten_union(&member.type_.body.list, flattened)?;
+                collect_union_members(database, &inner.type_.body.list, members, visited)?;
             }
         }
     }
     Ok(())
 }
 
-fn member_name<'a>(type_: &NonAnyType<'a>) -> &'a str {
-    match type_ {
-        NonAnyType::DOMString(_) => "DOMString",
-        NonAnyType::Identifier(item) => item.type_.0,
-        _ => "unknown",
+/// Reject member attributes the generated conversion cannot honor. A
+/// `[LegacyNullToEmptyString]` member is meaningful only to the attribute
+/// lowering that reads it back, so it is allowed here.
+fn validate_union_member_attributes(
+    attributes: Option<&ExtendedAttributeList<'_>>,
+) -> Result<(), Error> {
+    if let Some(attributes) = attributes {
+        for attribute in &attributes.body.list {
+            match attribute {
+                ExtendedAttribute::NoArgs(item) if item.0.0 == "LegacyNullToEmptyString" => {}
+                _ => {
+                    return Err(Error(format!(
+                        "union member attributes are not supported yet: {attribute:?}"
+                    )));
+                }
+            }
+        }
     }
+    Ok(())
+}
+
+fn collect_union_member<'idl>(
+    database: &Database<'idl>,
+    type_: &Type<'idl>,
+    members: &mut Vec<model::UnionMember>,
+    visited: &mut BTreeSet<String>,
+) -> Result<(), Error> {
+    match type_ {
+        Type::Union(inner) => {
+            if inner.q_mark.is_some() {
+                return Err(Error("nullable nested unions are not supported yet".into()));
+            }
+            collect_union_members(database, &inner.type_.body.list, members, visited)
+        }
+        Type::Single(SingleType::NonAny(NonAnyType::DOMString(item))) if item.q_mark.is_none() => {
+            push_union_member(members, format_ident!("DOMString"), model::UnionMemberType::String);
+            Ok(())
+        }
+        Type::Single(SingleType::NonAny(NonAnyType::Boolean(item))) if item.q_mark.is_none() => {
+            push_union_member(
+                members,
+                format_ident!("Boolean"),
+                model::UnionMemberType::Boolean,
+            );
+            Ok(())
+        }
+        Type::Single(SingleType::NonAny(NonAnyType::Integer(item)))
+            if item.q_mark.is_none()
+                && matches!(item.type_, IntegerType::Long(value) if value.unsigned.is_none()) =>
+        {
+            push_union_member(members, format_ident!("Long"), model::UnionMemberType::Long);
+            Ok(())
+        }
+        Type::Single(SingleType::NonAny(NonAnyType::Identifier(item))) if item.q_mark.is_none() => {
+            let name = item.type_.0;
+            match database.definition(name) {
+                // Trusted Types interfaces are uninhabited here, so a union
+                // containing one behaves as its string member
+                // (<https://w3c.github.io/trusted-types/dist/spec/>).
+                Some(weedle::Definition::Interface(_))
+                    if matches!(name, "TrustedHTML" | "TrustedScript" | "TrustedScriptURL") =>
+                {
+                    push_union_member(
+                        members,
+                        format_ident!("DOMString"),
+                        model::UnionMemberType::String,
+                    );
+                    Ok(())
+                }
+                Some(weedle::Definition::Interface(_)) => {
+                    let variant = format_ident!("{name}");
+                    push_union_member(
+                        members,
+                        variant,
+                        model::UnionMemberType::Interface {
+                            name: name.into(),
+                            node: database.is_node_interface(name),
+                        },
+                    );
+                    Ok(())
+                }
+                Some(weedle::Definition::Dictionary(_)) => {
+                    let variant = format_ident!("{name}");
+                    push_union_member(
+                        members,
+                        variant,
+                        model::UnionMemberType::Dictionary(name.into()),
+                    );
+                    Ok(())
+                }
+                Some(weedle::Definition::Typedef(definition)) => {
+                    if !visited.insert(name.into()) {
+                        return Err(Error(format!("union typedef cycle at {name}")));
+                    }
+                    validate_empty_attributes(definition.attributes.as_ref())?;
+                    collect_union_member(database, &definition.type_.type_, members, visited)
+                }
+                _ => Err(Error(format!("union member {name} is not supported yet"))),
+            }
+        }
+        Type::Single(_) => Err(Error(format!("union member is not supported yet: {type_:?}"))),
+    }
+}
+
+/// One variant per distinct Rust representation; duplicates collapse, so
+/// `(TrustedHTML or DOMString)` lowers to the string member alone.
+fn push_union_member(
+    members: &mut Vec<model::UnionMember>,
+    variant: proc_macro2::Ident,
+    type_: model::UnionMemberType,
+) {
+    let member = model::UnionMember { variant, type_ };
+    if !members.contains(&member) {
+        members.push(member);
+    }
+}
+
+fn finish_union(members: Vec<model::UnionMember>) -> Result<ReturnType, Error> {
+    if members.is_empty() {
+        return Err(Error("unions need at least one member type".into()));
+    }
+    if let [member] = members.as_slice() {
+        return Ok(member_return_type(&member.type_));
+    }
+    // Canonical declaration-independent name, like Chromium's sorted union
+    // type names (`UnionType.type_name_without_extended_attributes`).
+    let mut names: Vec<String> = members.iter().map(|member| member.variant.to_string()).collect();
+    names.sort_unstable();
+    names.dedup();
+    Ok(ReturnType::Union(names.join("Or"), members))
+}
+
+/// The `ReturnType` a single union member lowers to when the union collapses
+/// to one representation.
+fn member_return_type(type_: &model::UnionMemberType) -> ReturnType {
+    match type_ {
+        model::UnionMemberType::Interface { node: true, .. } => ReturnType::Node,
+        model::UnionMemberType::Interface { node: false, .. } => ReturnType::PlatformObject,
+        model::UnionMemberType::String => ReturnType::String,
+        model::UnionMemberType::Boolean => ReturnType::Boolean,
+        model::UnionMemberType::Long => ReturnType::Long,
+        model::UnionMemberType::Dictionary(name) => ReturnType::Dictionary(name.clone()),
+    }
+}
+
+/// Whether any union member or nested member carries `name`, so attribute
+/// lowering can read `[LegacyNullToEmptyString]` off a collapsed member.
+fn union_member_has_attribute(list: &[UnionMemberType<'_>], name: &str) -> bool {
+    list.iter().any(|member| match member {
+        UnionMemberType::Single(member) => has_attribute(member.attributes.as_ref(), name),
+        UnionMemberType::Union(inner) => union_member_has_attribute(&inner.type_.body.list, name),
+    })
 }
 
 /// Interface types the contract path carries. Node arguments need the
@@ -1726,6 +1869,10 @@ fn validate_interface_attributes(
                             | "LegacyUnenumerableNamedProperties"
                             | "LegacyOverrideBuiltIns"
                     ) => {}
+                // A named factory function (`new Option(...)`) is a JS shim
+                // concern; the generator installs no member for it.
+                ExtendedAttribute::NamedArgList(item)
+                    if item.lhs_identifier.0 == "LegacyFactoryFunction" => {}
                 _ => {
                     return Err(Error(format!(
                         "native interface semantics are not supported yet: {attribute:?}"

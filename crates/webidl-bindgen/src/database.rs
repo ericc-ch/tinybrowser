@@ -332,6 +332,30 @@ impl<'idl> Database<'idl> {
             .collect()
     }
 
+    /// Whether `name` is `Node` or inherits from it, walking the declared
+    /// inheritance chain.
+    pub(crate) fn is_node_interface(&self, name: &str) -> bool {
+        let mut current = name;
+        let mut seen = BTreeSet::new();
+        while seen.insert(current) {
+            if current == "Node" {
+                return true;
+            }
+            let Some(Definition::Interface(definition)) = self.definitions.get(current) else {
+                return false;
+            };
+            let Some(parent) = definition
+                .inheritance
+                .as_ref()
+                .map(|parent| parent.identifier.0)
+            else {
+                return false;
+            };
+            current = parent;
+        }
+        false
+    }
+
     pub(crate) fn dictionary(
         &self,
         name: &str,

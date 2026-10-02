@@ -376,14 +376,6 @@ pub(crate) fn receiver<'js, T: JsClass<'js>>(params: &Params<'_, 'js>) -> Result
         .map_err(|_| Exception::throw_type(params.ctx(), "incompatible receiver"))
 }
 
-/// Whether the value implements `Node`: a platform object with the shared
-/// node payload. `Attr` has its own payload and does not implement `Node`
-/// (<https://dom.spec.whatwg.org/#interface-attr>), so union conversion
-/// uses this probe rather than the broader `node_argument`.
-pub(crate) fn is_node<'js>(ctx: &Ctx<'js>, value: &Value<'js>) -> bool {
-    super::host_node_id(ctx, value).is_some()
-}
-
 pub(crate) fn node_argument<'js>(ctx: &Ctx<'js>, value: &Value<'js>) -> Result<NodeReference> {
     // https://webidl.spec.whatwg.org/#js-interface
     // https://dom.spec.whatwg.org/#interface-attr
@@ -426,20 +418,10 @@ pub(crate) trait SharedClass {
     fn require_interface(&self, ctx: &Ctx<'_>, interface: &str) -> Result<()>;
 }
 
-pub(crate) fn require_node_interface(
-    ctx: &Ctx<'_>,
-    id: dom::NodeId,
-    interface: &str,
-) -> Result<()> {
-    // https://webidl.spec.whatwg.org/#es-attributes
-    // https://webidl.spec.whatwg.org/#es-operations
-    let owner = super::world_for_node(ctx, id)?;
-    let owner = owner.borrow();
-    let document = owner
-        .document(id)
-        .ok_or_else(|| Exception::throw_type(ctx, "stale node"))?;
-    let kind = document.document.kind(id);
-    let implements = match interface {
+/// Whether `kind` implements the named node interface, or `None` when the
+/// name is not one the shared payload can represent.
+fn node_interface_matches(kind: Option<&dom::NodeKind>, interface: &str) -> Option<bool> {
+    Some(match interface {
         "Node" => kind.is_some(),
         "Document" | "XMLDocument" => matches!(kind, Some(dom::NodeKind::Document)),
         // A shadow root is a fragment carrying shadow metadata.
@@ -507,13 +489,44 @@ pub(crate) fn require_node_interface(
         "HTMLOptGroupElement" => html_local(kind, "optgroup"),
         "HTMLIFrameElement" => html_local(kind, "iframe"),
         "HTMLImageElement" => html_local(kind, "img"),
-        _ => return Err(Exception::throw_internal(ctx, "unknown node interface")),
-    };
-    if implements {
-        Ok(())
-    } else {
-        Err(Exception::throw_type(ctx, "incompatible receiver"))
+        _ => return None,
+    })
+}
+
+pub(crate) fn require_node_interface(
+    ctx: &Ctx<'_>,
+    id: dom::NodeId,
+    interface: &str,
+) -> Result<()> {
+    // https://webidl.spec.whatwg.org/#es-attributes
+    // https://webidl.spec.whatwg.org/#es-operations
+    let owner = super::world_for_node(ctx, id)?;
+    let owner = owner.borrow();
+    let document = owner
+        .document(id)
+        .ok_or_else(|| Exception::throw_type(ctx, "stale node"))?;
+    match node_interface_matches(document.document.kind(id), interface) {
+        Some(true) => Ok(()),
+        Some(false) => Err(Exception::throw_type(ctx, "incompatible receiver")),
+        None => Err(Exception::throw_internal(ctx, "unknown node interface")),
     }
+}
+
+/// Whether the JS value is a platform object implementing `interface`. The
+/// non-throwing counterpart `require_node_interface` needs, used by union
+/// conversion to try members in order.
+pub(crate) fn is_interface<'js>(ctx: &Ctx<'js>, value: &Value<'js>, interface: &str) -> bool {
+    let Some(id) = super::host_node_id(ctx, value) else {
+        return false;
+    };
+    let Ok(owner) = super::world_for_node(ctx, id) else {
+        return false;
+    };
+    let owner = owner.borrow();
+    let Some(document) = owner.document(id) else {
+        return false;
+    };
+    node_interface_matches(document.document.kind(id), interface) == Some(true)
 }
 
 /// The receiver JS object for hand methods that keep it (observer identity
