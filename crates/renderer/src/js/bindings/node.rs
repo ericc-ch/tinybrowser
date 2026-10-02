@@ -2792,20 +2792,6 @@ impl JsNode {
         )
     }
 
-    // ── ChildNode / NonDocumentTypeChildNode ─────────────────────────────
-
-    // https://dom.spec.whatwg.org/#dom-nondocumenttypechildnode-previouselementsibling
-    #[qjs(skip)]
-    fn previous_element_sibling<'js>(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
-        element_sibling_value(ctx, self.handle.0, false)
-    }
-
-    // https://dom.spec.whatwg.org/#dom-nondocumenttypechildnode-nextelementsibling
-    #[qjs(skip)]
-    fn next_element_sibling<'js>(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
-        element_sibling_value(ctx, self.handle.0, true)
-    }
-
     // ── Element identity and attributes ─────────────────────────────────
 
     // https://dom.spec.whatwg.org/#dom-element-tagname
@@ -3906,6 +3892,18 @@ impl<'js> child_node_generated::ChildNode<'js> for JsNode {
         drop(world);
         fixup_focus_after_removal(&ctx, self.handle.0)?;
         schedule_mutation_delivery(&ctx)
+    }
+}
+
+impl<'js> non_document_type_child_node_generated::NonDocumentTypeChildNode<'js> for JsNode {
+    // https://dom.spec.whatwg.org/#dom-nondocumenttypechildnode-previouselementsibling
+    fn get_previous_element_sibling(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
+        element_sibling_value(ctx, self.handle.0, false)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-nondocumenttypechildnode-nextelementsibling
+    fn get_next_element_sibling(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
+        element_sibling_value(ctx, self.handle.0, true)
     }
 }
 
