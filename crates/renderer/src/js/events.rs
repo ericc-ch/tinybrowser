@@ -17,6 +17,7 @@ use rquickjs::{
 };
 
 use super::bindings;
+use super::bindings::JsNode;
 use super::world::{EventTargetKey, Listener, World};
 
 include!(concat!(env!("OUT_DIR"), "/Event.rs"));
@@ -346,53 +347,57 @@ pub struct JsEventTarget {
     clippy::needless_pass_by_value,
     reason = "generated dispatch passes Ctx by value and the receiver object by value"
 )]
-impl JsEventTarget {
+impl<'js> event_target_generated::EventTarget<'js> for JsEventTarget {
     // https://dom.spec.whatwg.org/#dom-eventtarget-eventtarget
-    fn new(ctx: &Ctx<'_>) -> Result<Self> {
+    fn constructor(ctx: &Ctx<'js>) -> Result<Self> {
         let id = bindings::world(ctx)?.borrow_mut().next_standalone_target();
         Ok(Self { id })
     }
 
     // https://dom.spec.whatwg.org/#dom-eventtarget-addeventlistener
-    fn add_event_listener<'js>(
+    fn add_event_listener(
         &self,
         ctx: Ctx<'js>,
         this: Object<'js>,
         typ: rquickjs::String<'js>,
         callback: Value<'js>,
-        options: Value<'js>,
+        options: event_target_generated::AddEventListenerOptionsOrBoolean,
     ) -> Result<()> {
         register_standalone(&ctx, self.id, &this)?;
-        add_listener(
+        let callback = listener_callback(&ctx, callback)?;
+        let options = listener_options(options);
+        add_listener_parsed(
             &ctx,
             EventTargetKey::Standalone(self.id),
-            typ.into_value(),
+            typ.to_string()?,
             callback,
-            Some(options),
+            options,
         )
     }
 
     // https://dom.spec.whatwg.org/#dom-eventtarget-removeeventlistener
-    fn remove_event_listener<'js>(
+    fn remove_event_listener(
         &self,
         ctx: Ctx<'js>,
         this: Object<'js>,
         typ: rquickjs::String<'js>,
         callback: Value<'js>,
-        options: Value<'js>,
+        options: event_target_generated::BooleanOrEventListenerOptions,
     ) -> Result<()> {
         register_standalone(&ctx, self.id, &this)?;
-        remove_listener(
+        let callback = listener_callback(&ctx, callback)?;
+        let capture = remove_capture(options);
+        remove_listener_parsed(
             &ctx,
             EventTargetKey::Standalone(self.id),
-            typ.into_value(),
-            callback,
-            Some(options),
+            &typ.to_string()?,
+            callback.as_ref(),
+            capture,
         )
     }
 
     // https://dom.spec.whatwg.org/#dom-eventtarget-dispatchevent
-    fn dispatch_event<'js>(
+    fn dispatch_event(
         &self,
         ctx: Ctx<'js>,
         this: Object<'js>,
@@ -401,6 +406,99 @@ impl JsEventTarget {
         register_standalone(&ctx, self.id, &this)?;
         let event = Class::<JsEvent>::from_js(&ctx, event)?;
         dispatch_event(&ctx, EventTargetKey::Standalone(self.id), &event)
+    }
+}
+
+/// Every node interface is also an `EventTarget`, so the one contract
+/// dispatches node receivers to the node key.
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "generated dispatch passes Ctx by value and the receiver object by value"
+)]
+impl<'js> event_target_generated::EventTarget<'js> for JsNode {
+    fn constructor(ctx: &Ctx<'js>) -> Result<Self> {
+        Err(rquickjs::Exception::throw_type(ctx, "Illegal constructor"))
+    }
+
+    fn add_event_listener(
+        &self,
+        ctx: Ctx<'js>,
+        _this: Object<'js>,
+        typ: rquickjs::String<'js>,
+        callback: Value<'js>,
+        options: event_target_generated::AddEventListenerOptionsOrBoolean,
+    ) -> Result<()> {
+        let callback = listener_callback(&ctx, callback)?;
+        let options = listener_options(options);
+        add_listener_parsed(
+            &ctx,
+            EventTargetKey::Node(self.node_id()),
+            typ.to_string()?,
+            callback,
+            options,
+        )
+    }
+
+    fn remove_event_listener(
+        &self,
+        ctx: Ctx<'js>,
+        _this: Object<'js>,
+        typ: rquickjs::String<'js>,
+        callback: Value<'js>,
+        options: event_target_generated::BooleanOrEventListenerOptions,
+    ) -> Result<()> {
+        let callback = listener_callback(&ctx, callback)?;
+        let capture = remove_capture(options);
+        remove_listener_parsed(
+            &ctx,
+            EventTargetKey::Node(self.node_id()),
+            &typ.to_string()?,
+            callback.as_ref(),
+            capture,
+        )
+    }
+
+    fn dispatch_event(
+        &self,
+        ctx: Ctx<'js>,
+        _this: Object<'js>,
+        event: Value<'js>,
+    ) -> Result<bool> {
+        let event = Class::<JsEvent>::from_js(&ctx, event)?;
+        dispatch_event(&ctx, EventTargetKey::Node(self.node_id()), &event)
+    }
+}
+
+/// The `addEventListener` options union as parsed listener options.
+fn listener_options(options: event_target_generated::AddEventListenerOptionsOrBoolean) -> ListenerOptions {
+    match options {
+        event_target_generated::AddEventListenerOptionsOrBoolean::Boolean(capture) => {
+            ListenerOptions {
+                capture,
+                once: false,
+                passive: None,
+                signal: None,
+            }
+        }
+        event_target_generated::AddEventListenerOptionsOrBoolean::AddEventListenerOptions(
+            options,
+        ) => ListenerOptions {
+            capture: options.capture,
+            once: options.once,
+            passive: options.passive,
+            signal: options.signal,
+        },
+    }
+}
+
+/// `removeEventListener` reads only `capture`
+/// (<https://dom.spec.whatwg.org/#dom-eventtarget-removeeventlistener>).
+fn remove_capture(options: event_target_generated::BooleanOrEventListenerOptions) -> bool {
+    match options {
+        event_target_generated::BooleanOrEventListenerOptions::Boolean(capture) => capture,
+        event_target_generated::BooleanOrEventListenerOptions::EventListenerOptions(options) => {
+            options.capture
+        }
     }
 }
 
@@ -580,23 +678,6 @@ pub(crate) fn install_custom_event_js(ctx: &Ctx<'_>) -> Result<&'static str> {
 
 /// Appends one listener to a target's list
 /// (<https://dom.spec.whatwg.org/#dom-eventtarget-addeventlistener>).
-pub(crate) fn add_listener<'js>(
-    ctx: &Ctx<'js>,
-    target: EventTargetKey,
-    typ: Value<'js>,
-    callback: Value<'js>,
-    options: Option<Value<'js>>,
-) -> Result<()> {
-    add_listener_in(
-        ctx,
-        &target_world(ctx, target)?,
-        target,
-        typ,
-        callback,
-        options,
-    )
-}
-
 /// [`add_listener`] on a chosen realm. `contentWindow.addEventListener` runs
 /// in the caller's realm and must still register on the frame's window
 /// (<https://html.spec.whatwg.org/multipage/window-object.html#windowproxy-get>).
@@ -611,6 +692,36 @@ pub(crate) fn add_listener_in<'js>(
     let typ = bindings::webidl_to_string(ctx, typ)?;
     let callback = listener_callback(ctx, callback)?;
     let options = ListenerOptions::read(ctx, options)?;
+    add_listener_parsed_in(ctx, world, target, typ, callback, options)
+}
+
+/// [`add_listener`] from an already-converted `EventListener?` and options,
+/// used by the generated `EventTarget` contract.
+pub(crate) fn add_listener_parsed(
+    ctx: &Ctx<'_>,
+    target: EventTargetKey,
+    typ: String,
+    callback: Option<Persistent<Value<'static>>>,
+    options: ListenerOptions,
+) -> Result<()> {
+    add_listener_parsed_in(
+        ctx,
+        &target_world(ctx, target)?,
+        target,
+        typ,
+        callback,
+        options,
+    )
+}
+
+fn add_listener_parsed_in(
+    ctx: &Ctx<'_>,
+    world: &Rc<RefCell<World>>,
+    target: EventTargetKey,
+    typ: String,
+    callback: Option<Persistent<Value<'static>>>,
+    options: ListenerOptions,
+) -> Result<()> {
     if options
         .signal
         .as_ref()
@@ -663,23 +774,6 @@ pub(crate) fn add_listener_in<'js>(
 
 /// Removes one listener from a target's list
 /// (<https://dom.spec.whatwg.org/#dom-eventtarget-removeeventlistener>).
-pub(crate) fn remove_listener<'js>(
-    ctx: &Ctx<'js>,
-    target: EventTargetKey,
-    typ: Value<'js>,
-    callback: Value<'js>,
-    options: Option<Value<'js>>,
-) -> Result<()> {
-    remove_listener_in(
-        ctx,
-        &target_world(ctx, target)?,
-        target,
-        typ,
-        callback,
-        options,
-    )
-}
-
 pub(crate) fn remove_listener_in<'js>(
     ctx: &Ctx<'js>,
     world: &Rc<RefCell<World>>,
@@ -691,12 +785,42 @@ pub(crate) fn remove_listener_in<'js>(
     let typ = bindings::webidl_to_string(ctx, typ)?;
     let callback = listener_callback(ctx, callback)?;
     let capture = ListenerOptions::read_capture(ctx, options)?;
+    remove_listener_parsed_in(ctx, world, target, &typ, callback.as_ref(), capture)
+}
+
+/// [`remove_listener`] from an already-converted `EventListener?` and capture,
+/// used by the generated `EventTarget` contract.
+pub(crate) fn remove_listener_parsed(
+    ctx: &Ctx<'_>,
+    target: EventTargetKey,
+    typ: &str,
+    callback: Option<&Persistent<Value<'static>>>,
+    capture: bool,
+) -> Result<()> {
+    remove_listener_parsed_in(
+        ctx,
+        &target_world(ctx, target)?,
+        target,
+        typ,
+        callback,
+        capture,
+    )
+}
+
+fn remove_listener_parsed_in(
+    ctx: &Ctx<'_>,
+    world: &Rc<RefCell<World>>,
+    target: EventTargetKey,
+    typ: &str,
+    callback: Option<&Persistent<Value<'static>>>,
+    capture: bool,
+) -> Result<()> {
     let mut world = world.borrow_mut();
     let mut removed = Vec::new();
     for existing in world.listener_snapshot(target) {
         if existing.typ == typ
             && existing.capture == capture
-            && same_callback(ctx, existing.callback.as_ref(), callback.as_ref())?
+            && same_callback(ctx, existing.callback.as_ref(), callback)?
         {
             existing.removed.set(true);
             removed.push(existing);
@@ -953,11 +1077,10 @@ fn build_path<'js>(
                 target: value,
             }])
         }
-        EventTargetKey::Attribute { .. } | EventTargetKey::Standalone(_) => {
+        EventTargetKey::Standalone(_) => {
             // https://dom.spec.whatwg.org/#get-the-parent
-            // https://dom.spec.whatwg.org/#interface-attr
-            // Attr's owner element is not its parent; Chromium's
-            // EventPath::CalculatePath likewise follows parentNode().
+            // A constructible `EventTarget` has no parent, so its event path
+            // is the target alone.
             let reference = EventTargetRef {
                 key: target,
                 world: target_world(ctx, target)?,
@@ -1141,7 +1264,7 @@ fn listener_callback<'js>(
 
 /// Parsed `AddEventListenerOptions` / `EventListenerOptions`
 /// (<https://dom.spec.whatwg.org/#dictdef-addeventlisteneroptions>).
-struct ListenerOptions {
+pub(crate) struct ListenerOptions {
     capture: bool,
     once: bool,
     /// `None` means the member was omitted; the default passive value is
@@ -1243,7 +1366,7 @@ fn default_passive(ctx: &Ctx<'_>, typ: &str, target: EventTargetKey) -> Result<b
     }
     match target {
         EventTargetKey::Window => Ok(true),
-        EventTargetKey::Attribute { .. } | EventTargetKey::Standalone(_) => Ok(false),
+        EventTargetKey::Standalone(_) => Ok(false),
         EventTargetKey::Node(id) => {
             let world = bindings::world_for_node(ctx, id)?;
             let world = world.borrow();
@@ -1284,10 +1407,6 @@ fn signal_aborted(ctx: &Ctx<'_>, signal: &Persistent<Object<'static>>) -> bool {
 fn target_world(ctx: &Ctx<'_>, target: EventTargetKey) -> Result<Rc<RefCell<World>>> {
     match target {
         EventTargetKey::Node(id) => bindings::world_for_node(ctx, id),
-        EventTargetKey::Attribute { scope, id } => {
-            let state = bindings::attr_state(ctx, scope, id)?;
-            bindings::world_for_node(ctx, state.document)
-        }
         EventTargetKey::Window | EventTargetKey::Standalone(_) => bindings::world(ctx),
     }
 }
@@ -1309,7 +1428,6 @@ fn resolve_target<'js>(ctx: &Ctx<'js>, reference: &EventTargetRef) -> Result<Val
             None => Ok(ctx.globals().into_value()),
         },
         EventTargetKey::Node(id) => bindings::wrap_node(ctx, id),
-        EventTargetKey::Attribute { id, .. } => bindings::attr_wrapper(ctx, id),
         EventTargetKey::Standalone(id) => match reference.world.borrow().standalone_target(id) {
             Some(saved) => Ok(saved.restore(ctx)?.into_value()),
             None => Ok(Value::new_null(ctx.clone())),

@@ -118,6 +118,29 @@ impl Implementation {
         });
         Ok(())
     }
+
+    /// Choose the payload that owns the interface's prototype. A platform type
+    /// with no declared class needs one generated for it, so it is promoted
+    /// over an existing shared class (which only contributes an alternate arm).
+    fn promote(&mut self, classes: &BTreeSet<String>) {
+        if !classes.contains(&self.payload.to_string()) {
+            return;
+        }
+        let Some(index) = self
+            .payloads
+            .iter()
+            .position(|payload| !classes.contains(&payload.rust.to_string()))
+        else {
+            return;
+        };
+        let promoted = self.payloads.remove(index);
+        let previous = std::mem::replace(&mut self.payload, promoted.rust);
+        let previous_lifetime = std::mem::replace(&mut self.lifetime, promoted.has_lifetime);
+        self.payloads.push(model::Payload {
+            rust: previous,
+            has_lifetime: previous_lifetime,
+        });
+    }
 }
 
 pub(crate) fn compile(idl: &[Source<'_>], rust: &[Source<'_>]) -> Result<Vec<Binding>, Error> {
@@ -136,7 +159,8 @@ pub(crate) fn compile(idl: &[Source<'_>], rust: &[Source<'_>]) -> Result<Vec<Bin
     }
     implementations
         .into_values()
-        .map(|implementation| {
+        .map(|mut implementation| {
+            implementation.promote(&classes);
             let kind = if classes.contains(&implementation.payload.to_string()) {
                 InterfaceKind::Partial
             } else {
@@ -671,6 +695,23 @@ fn lower_dictionary(database: &Database<'_>, name: &str) -> Result<model::Dictio
                 }
                 model::DictionaryFieldType::StringSequence
             }
+            Type::Single(SingleType::NonAny(NonAnyType::Identifier(value)))
+                if value.q_mark.is_none()
+                    && matches!(
+                        database.definition(value.type_.0),
+                        Some(
+                            weedle::Definition::Interface(_)
+                                | weedle::Definition::CallbackInterface(_)
+                        )
+                    ) =>
+            {
+                if member.default.is_some() {
+                    return Err(Error(
+                        "interface dictionary defaults are not supported yet".into(),
+                    ));
+                }
+                model::DictionaryFieldType::Value
+            }
             _ => {
                 return Err(Error(format!(
                     "dictionary field type is not supported yet: {}",
@@ -890,13 +931,25 @@ fn lower_argument(
     }
     // https://webidl.spec.whatwg.org/#dfn-overload-resolution-algorithm
     match (&type_, argument.optional.is_some(), &argument.default) {
-        (_, false, None) | (ReturnType::String | ReturnType::Boolean, true, None) => {}
+        (_, false, None)
+        | (
+            ReturnType::String | ReturnType::Boolean | ReturnType::Union(_, _),
+            true,
+            None,
+        ) => {}
         (ReturnType::Boolean, true, Some(default))
             if matches!(default.value, DefaultValue::Boolean(_)) => {}
         (ReturnType::NullableDocumentType, true, Some(default))
             if matches!(default.value, DefaultValue::Null(_)) => {}
         (ReturnType::Dictionary(_), true, Some(default))
             if matches!(default.value, DefaultValue::EmptyDictionary(_)) => {}
+        // An optional union converts an omitted `{}` or `null` by its own
+        // algorithm; a dictionary member fills the default.
+        (ReturnType::Union(_, _), true, Some(default))
+            if matches!(
+                default.value,
+                DefaultValue::EmptyDictionary(_) | DefaultValue::Null(_)
+            ) => {}
         _ => {
             return Err(Error(
                 "native operation optionality or default is not supported yet".into(),
@@ -950,13 +1003,20 @@ fn argument_parameter(
         ReturnType::NullableString => quote! { Option<rquickjs::String<'js>> },
         ReturnType::NullableDocumentType => quote! { Option<dom::NodeId> },
         ReturnType::Callback => quote! { rquickjs::Function<'js> },
+        // A platform object or callback-interface argument arrives as the
+        // original value; the platform algorithm performs any further check.
+        ReturnType::PlatformObject => quote! { Value<'js> },
         ReturnType::Dictionary(name) | ReturnType::Enumeration(name) => {
             let name = format_ident!("{name}");
             quote! { #name }
         }
-        ReturnType::Union(name, _) => {
+        ReturnType::Union(name, members) => {
             let name = format_ident!("{name}");
-            quote! { #name<'js> }
+            if members.iter().any(|member| member.type_.needs_lifetime()) {
+                quote! { #name<'js> }
+            } else {
+                quote! { #name }
+            }
         }
         ReturnType::Boolean if optional && boolean_default.is_none() => quote! { Option<bool> },
         ReturnType::Boolean => quote! { bool },
@@ -1796,9 +1856,16 @@ fn native_interface(database: &Database<'_>, name: &str, nullable: bool) -> Opti
         ("WindowProxy", _) => Some(ReturnType::PlatformObject),
         _ if matches!(
             database.definition(name),
-            Some(weedle::Definition::Interface(_))
+            Some(
+                weedle::Definition::Interface(_)
+                    | weedle::Definition::CallbackInterface(_)
+            )
         ) =>
         {
+            // An interface or callback interface is a platform object carried
+            // as an opaque value; a callback interface is any object whose
+            // methods are looked up on invocation
+            // (<https://webidl.spec.whatwg.org/#es-callback-interface>).
             Some(ReturnType::PlatformObject)
         }
         _ => None,

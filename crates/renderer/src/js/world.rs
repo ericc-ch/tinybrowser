@@ -310,11 +310,6 @@ pub(crate) struct Listener {
 pub(crate) enum EventTargetKey {
     Window,
     Node(NodeId),
-    /// Attr registry identity: immutable creation scope and agent-issued id.
-    Attribute {
-        scope: NodeId,
-        id: u64,
-    },
     /// A constructible `EventTarget`, numbered per world.
     Standalone(u64),
 }
@@ -1299,57 +1294,18 @@ impl World {
     }
 
     pub(crate) fn add_listener(&mut self, target: EventTargetKey, listener: Rc<Listener>) {
-        if let EventTargetKey::Attribute { id, .. } = target {
-            if let Some(entry) = self
-                .runtime
-                .registry
-                .borrow_mut()
-                .attributes
-                .entries
-                .get_mut(&id)
-            {
-                entry.listeners.push(listener);
-            }
-            return;
-        }
         self.listeners.entry(target).or_default().push(listener);
     }
 
     /// A clone of one target's listener list, taken when dispatch invokes the
     /// target (<https://dom.spec.whatwg.org/#concept-event-listener-invoke>).
     pub(crate) fn listener_snapshot(&self, target: EventTargetKey) -> Vec<Rc<Listener>> {
-        if let EventTargetKey::Attribute { id, .. } = target {
-            return self
-                .runtime
-                .registry
-                .borrow()
-                .attributes
-                .entries
-                .get(&id)
-                .map(|entry| entry.listeners.clone())
-                .unwrap_or_default();
-        }
         self.listeners.get(&target).cloned().unwrap_or_default()
     }
 
     /// Drops one listener from a target's list; the listener's `removed` flag
     /// is what a concurrent dispatch checks, so both happen together.
     pub(crate) fn remove_listener(&mut self, target: EventTargetKey, listener: &Rc<Listener>) {
-        if let EventTargetKey::Attribute { id, .. } = target {
-            if let Some(entry) = self
-                .runtime
-                .registry
-                .borrow_mut()
-                .attributes
-                .entries
-                .get_mut(&id)
-            {
-                entry
-                    .listeners
-                    .retain(|existing| !Rc::ptr_eq(existing, listener));
-            }
-            return;
-        }
         if let Some(list) = self.listeners.get_mut(&target) {
             list.retain(|existing| !Rc::ptr_eq(existing, listener));
         }
@@ -1718,7 +1674,6 @@ pub(crate) struct AttributeRegistry {
 struct AttrEntry {
     state: AttrState,
     wrapper: Option<Persistent<Value<'static>>>,
-    listeners: Vec<Rc<Listener>>,
 }
 
 pub(crate) enum AttrAttachError {
@@ -1740,7 +1695,6 @@ impl AttributeRegistry {
             AttrEntry {
                 state,
                 wrapper: None,
-                listeners: Vec::new(),
             },
         );
         Some(id)

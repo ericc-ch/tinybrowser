@@ -14,9 +14,9 @@ use dom::{NodeId, qualified_name_eq};
 
 use rquickjs::{Class, Ctx, Exception, Function, Persistent, Result, Value, class::Trace};
 
-use crate::js::events::{self, JsEvent, report_exception};
+use crate::js::events::report_exception;
 use crate::js::world::{
-    AttrAttachError, AttrState, EventTargetKey, FrameNavigation, Handle, NavigationTarget, World,
+    AttrAttachError, AttrState, FrameNavigation, Handle, NavigationTarget, World,
     Wrapper,
 };
 
@@ -286,57 +286,6 @@ pub(super) type AttrArgument<'js> = Class<'js, JsAttr<'js>>;
     reason = "generated dispatch passes Ctx by value and invokes operations on the receiver"
 )]
 impl<'object> JsAttr<'object> {
-    fn event_target_key(&self, ctx: &Ctx<'_>) -> Result<EventTargetKey> {
-        let state = attr_state(ctx, self.scope.0, self.id)?;
-        Ok(EventTargetKey::Attribute {
-            scope: state.scope,
-            id: self.id,
-        })
-    }
-
-    // https://dom.spec.whatwg.org/#dom-eventtarget-addeventlistener
-    pub(super) fn add_event_listener<'js>(
-        &self,
-        ctx: Ctx<'js>,
-        typ: rquickjs::String<'js>,
-        callback: Value<'js>,
-        options: Value<'js>,
-    ) -> Result<()> {
-        let home = attr_context(&ctx, self.scope.0, self.id)?;
-        events::add_listener(
-            &home,
-            self.event_target_key(&home)?,
-            typ.into_value(),
-            callback,
-            Some(options),
-        )
-    }
-
-    // https://dom.spec.whatwg.org/#dom-eventtarget-removeeventlistener
-    pub(super) fn remove_event_listener<'js>(
-        &self,
-        ctx: Ctx<'js>,
-        typ: rquickjs::String<'js>,
-        callback: Value<'js>,
-        options: Value<'js>,
-    ) -> Result<()> {
-        let home = attr_context(&ctx, self.scope.0, self.id)?;
-        events::remove_listener(
-            &home,
-            self.event_target_key(&home)?,
-            typ.into_value(),
-            callback,
-            Some(options),
-        )
-    }
-
-    // https://dom.spec.whatwg.org/#dom-eventtarget-dispatchevent
-    pub(super) fn dispatch_event<'js>(&self, ctx: Ctx<'js>, event: Value<'js>) -> Result<bool> {
-        let home = attr_context(&ctx, self.scope.0, self.id)?;
-        let event = Class::<JsEvent>::from_js(&ctx, event)?;
-        events::dispatch_event(&home, self.event_target_key(&home)?, &event)
-    }
-
     // https://dom.spec.whatwg.org/#dom-node-nodevalue
     pub(super) fn node_value<'js>(&self, ctx: &Ctx<'js>) -> Result<Option<rquickjs::String<'js>>> {
         rquickjs::String::from_str(ctx.clone(), &attr_value(ctx, self.scope.0, self.id)?).map(Some)

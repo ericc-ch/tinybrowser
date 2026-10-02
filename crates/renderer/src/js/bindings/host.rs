@@ -422,7 +422,9 @@ pub(crate) trait SharedClass {
 /// name is not one the shared payload can represent.
 fn node_interface_matches(kind: Option<&dom::NodeKind>, interface: &str) -> Option<bool> {
     Some(match interface {
-        "Node" => kind.is_some(),
+        // Every node is also an `EventTarget`
+        // (<https://dom.spec.whatwg.org/#interface-eventtarget>).
+        "Node" | "EventTarget" => kind.is_some(),
         "Document" | "XMLDocument" => matches!(kind, Some(dom::NodeKind::Document)),
         // A shadow root is a fragment carrying shadow metadata.
         "DocumentFragment" | "ShadowRoot" => matches!(kind, Some(dom::NodeKind::Fragment)),
@@ -671,6 +673,31 @@ pub(crate) fn dict_flag<'js>(
         return Ok(None);
     }
     Coerced::<bool>::from_js(ctx, value).map(|flag| Some(flag.0))
+}
+
+/// One presence-preserving interface-typed dictionary member
+/// (<https://webidl.spec.whatwg.org/#es-dictionary>): absent or `undefined` is
+/// `None`. A present value must be an object
+/// (<https://webidl.spec.whatwg.org/#es-interface>).
+pub(crate) fn dict_object<'js>(
+    ctx: &Ctx<'js>,
+    object: &Object<'js>,
+    key: &str,
+) -> Result<Option<Persistent<Object<'static>>>> {
+    let value: Value = object.get(key)?;
+    // Only `undefined` means the member is absent; a present `null` is not an
+    // object and fails the interface conversion
+    // (<https://webidl.spec.whatwg.org/#es-interface>).
+    if value.is_undefined() {
+        return Ok(None);
+    }
+    let Some(object) = value.as_object() else {
+        return Err(Exception::throw_type(
+            ctx,
+            "interface dictionary member must be an object",
+        ));
+    };
+    Ok(Some(Persistent::save(ctx, object.clone())))
 }
 
 /// One presence-preserving string sequence

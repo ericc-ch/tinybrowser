@@ -1,7 +1,7 @@
 //! The single `Node` wrapper class and its members.
 
 use super::{
-    AttrArgument, CollectionKind, FromJs, ImportSnapshot, JsImplementation, JsNamedNodeMap,
+    AttrArgument, CollectionKind, ImportSnapshot, JsImplementation, JsNamedNodeMap,
     JsTokenList, LegacyNullString, NodeContext, NodeOrString, OptString, Trace, WebIdlCodeUnits,
     WebIdlString,
     WebIdlUnsignedLong, adopt_across_documents, after_attribute_change, ancestor_chain,
@@ -27,9 +27,9 @@ use dom::{LocalName, NodeId, NodeKind, QualName, html_namespace, svg_namespace};
 
 use rquickjs::{Array, Class, Ctx, Exception, Function, Persistent, Result, Value};
 
-use crate::js::events::{self, JsEvent};
+use crate::js::events;
 
-use crate::js::world::{DocumentStreamCommand, EventTargetKey, Handle, NodeReference, Wrapper};
+use crate::js::world::{DocumentStreamCommand, Handle, NodeReference, Wrapper};
 
 use crate::ReadyState;
 
@@ -541,49 +541,6 @@ impl JsNode {
         drop(world);
         schedule_mutation_delivery(&ctx)?;
         wrap_node(&ctx, node)
-    }
-
-    // https://dom.spec.whatwg.org/#dom-eventtarget-addeventlistener
-    #[qjs(skip)]
-    fn add_event_listener<'js>(
-        &self,
-        ctx: Ctx<'js>,
-        typ: rquickjs::String<'js>,
-        callback: Value<'js>,
-        options: Value<'js>,
-    ) -> Result<()> {
-        events::add_listener(
-            &ctx,
-            EventTargetKey::Node(self.handle.0),
-            typ.into_value(),
-            callback,
-            Some(options),
-        )
-    }
-
-    // https://dom.spec.whatwg.org/#dom-eventtarget-removeeventlistener
-    #[qjs(skip)]
-    fn remove_event_listener<'js>(
-        &self,
-        ctx: Ctx<'js>,
-        typ: rquickjs::String<'js>,
-        callback: Value<'js>,
-        options: Value<'js>,
-    ) -> Result<()> {
-        events::remove_listener(
-            &ctx,
-            EventTargetKey::Node(self.handle.0),
-            typ.into_value(),
-            callback,
-            Some(options),
-        )
-    }
-
-    // https://dom.spec.whatwg.org/#dom-eventtarget-dispatchevent
-    #[qjs(skip)]
-    fn dispatch_event<'js>(&self, ctx: Ctx<'js>, event: Value<'js>) -> Result<bool> {
-        let event = Class::<JsEvent>::from_js(&ctx, event)?;
-        events::dispatch_event(&ctx, EventTargetKey::Node(self.handle.0), &event)
     }
 
     // https://dom.spec.whatwg.org/#dom-document-activeelement

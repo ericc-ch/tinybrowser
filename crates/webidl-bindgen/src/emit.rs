@@ -1088,6 +1088,10 @@ fn operation_argument_at(
             #fetch
             let #variable = host::callback_argument(&ctx, &value)?;
         },
+        ReturnType::PlatformObject => quote! {
+            #fetch
+            let #variable = value;
+        },
         ReturnType::Dictionary(name) => {
             let struct_name = format_ident!("{name}");
             quote! {
@@ -1310,7 +1314,8 @@ fn dictionary(dictionary: &Dictionary) -> TokenStream {
                 default: Some(default),
             } => quote! { #rust: #default },
             DictionaryFieldType::Boolean { default: None }
-            | DictionaryFieldType::StringSequence => {
+            | DictionaryFieldType::StringSequence
+            | DictionaryFieldType::Value => {
                 quote! { #rust: None }
             }
         }
@@ -1326,6 +1331,9 @@ fn dictionary(dictionary: &Dictionary) -> TokenStream {
             }
             DictionaryFieldType::StringSequence => {
                 quote! { pub(crate) #rust: Option<Vec<Vec<u16>>> }
+            }
+            DictionaryFieldType::Value => {
+                quote! { pub(crate) #rust: Option<rquickjs::Persistent<Object<'static>>> }
             }
         }
     });
@@ -1343,6 +1351,9 @@ fn dictionary(dictionary: &Dictionary) -> TokenStream {
             },
             DictionaryFieldType::StringSequence => quote! {
                 #rust: host::dict_string_sequence(ctx, &object, #key)?
+            },
+            DictionaryFieldType::Value => quote! {
+                #rust: host::dict_object(ctx, &object, #key)?
             },
         }
     });
@@ -1487,10 +1498,11 @@ fn union(union: &Union) -> TokenStream {
             UnionMemberType::Dictionary(name) => {
                 let name = format_ident!("{name}");
                 trials.push(quote! {
-                    // An object converts to the dictionary once platform
-                    // objects have been tried
+                    // A null, undefined, or object value converts to the
+                    // dictionary once platform objects have been tried; the
+                    // dictionary defaults fill an omitted argument
                     // (<https://webidl.spec.whatwg.org/#es-union>).
-                    if value.is_object() {
+                    if value.is_null() || value.is_undefined() || value.is_object() {
                         return #name::from_object(ctx, &value).map(Self::#variant);
                     }
                 });
@@ -1520,27 +1532,60 @@ fn union(union: &Union) -> TokenStream {
     }
     // String coercion returns or throws, so it ends the trial chain; a
     // trailing mismatch error only exists without a string member.
-    let mismatch = if union
+    let mismatch = union_fallback(union);
+    let generic = if union
         .members
         .iter()
-        .any(|member| matches!(member.type_, UnionMemberType::String))
+        .any(|member| member.type_.needs_lifetime())
     {
-        quote! {}
+        quote! { <'js> }
     } else {
-        quote! { Err(rquickjs::Exception::throw_type(ctx, "value does not match the union")) }
+        quote! {}
     };
     quote! {
-        pub(crate) enum #name<'js> {
+        pub(crate) enum #name #generic {
             #(#variants),*
         }
 
-        impl<'js> #name<'js> {
+        impl<'js> #name #generic {
+            // A union trial calls `from_object` on a reference for dictionary
+            // members, so a union without a string member never consumes the
+            // value.
+            #[allow(clippy::needless_pass_by_value, reason = "generated from IDL; string members consume the value")]
             fn from_value(ctx: &Ctx<'js>, value: Value<'js>) -> Result<Self> {
                 #(#trials)*
                 #mismatch
             }
         }
     }
+}
+
+/// The tail of a union's `from_value`: a string member stringifies everything
+/// and a boolean member coerces everything, so either one or the other catches
+/// the remaining values; only a union with neither throws
+/// (<https://webidl.spec.whatwg.org/#es-union>).
+fn union_fallback(union: &Union) -> TokenStream {
+    if union
+        .members
+        .iter()
+        .any(|member| matches!(member.type_, UnionMemberType::String))
+    {
+        return quote! {};
+    }
+    if let Some(member) = union
+        .members
+        .iter()
+        .find(|member| matches!(member.type_, UnionMemberType::Boolean))
+    {
+        // Step 12: a boolean member is the fallback and converts any
+        // remaining value with `ToBoolean` (`2.3` is true, `""` is false).
+        let variant = &member.variant;
+        return quote! {
+            rquickjs::FromJs::from_js(ctx, value)
+                .map(|converted: rquickjs::Coerced<bool>| Self::#variant(converted.0))
+        };
+    }
+    quote! { Err(rquickjs::Exception::throw_type(ctx, "value does not match the union")) }
 }
 
 fn legacy_codes(interface: &Interface) -> TokenStream {

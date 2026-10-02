@@ -4,10 +4,6 @@ dictionary GetRootNodeOptions {
 };
 [Exposed=Window, Rust=JsNode, RustAlternate=JsAttr, RustAlternateLifetime]
 partial interface Node {
-    // https://dom.spec.whatwg.org/#interface-eventtarget
-    [Rust=add_event_listener] undefined addEventListener(DOMString type, [RustValue] EventListener? callback, [RustValue] optional (AddEventListenerOptions or boolean) options = {});
-    [Rust=remove_event_listener] undefined removeEventListener(DOMString type, [RustValue] EventListener? callback, [RustValue] optional (EventListenerOptions or boolean) options = {});
-    [Rust=dispatch_event] boolean dispatchEvent([RustValue] Event event);
     [Rust=node_type] readonly attribute unsigned short nodeType;
     [Rust=node_name] readonly attribute DOMString nodeName;
     [Rust=base_uri] readonly attribute USVString baseURI;

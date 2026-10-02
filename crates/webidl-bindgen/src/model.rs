@@ -262,6 +262,14 @@ pub(crate) enum UnionMemberType {
     Dictionary(String),
 }
 
+impl UnionMemberType {
+    /// Whether the member's Rust representation borrows the context lifetime,
+    /// making the generated union enum generic over `'js`.
+    pub(crate) const fn needs_lifetime(&self) -> bool {
+        matches!(self, Self::String | Self::Interface { node: false, .. })
+    }
+}
+
 pub(crate) struct Callback {
     pub(crate) name: String,
 }
@@ -292,6 +300,9 @@ pub(crate) struct DictionaryField {
 pub(crate) enum DictionaryFieldType {
     Boolean { default: Option<bool> },
     StringSequence,
+    /// An interface- or callback-interface-typed member, carried as the
+    /// original object.
+    Value,
 }
 
 pub(crate) struct Constant {
