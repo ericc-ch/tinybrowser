@@ -37,7 +37,20 @@ impl Member<'_> {
     pub(crate) fn validate_scopes(&self) -> Result<(), Error> {
         // https://webidl.spec.whatwg.org/#SecureContext
         // https://webidl.spec.whatwg.org/#using-mixins-and-partials
-        if let Some(scope) = self.scopes.iter().find(|scope| !scope.body.list.is_empty()) {
+        // `[LegacyOverrideBuiltIns]` only changes how named properties
+        // resolve against built-ins; on an interface without a named getter
+        // it is unobservable, so the scope is accepted. An interface that
+        // pairs it with a named getter needs the override semantics first.
+        if let Some(scope) = self.scopes.iter().find(|scope| {
+            !scope.body.list.is_empty()
+                && !scope.body.list.iter().all(|attribute| {
+                    matches!(
+                        attribute,
+                        weedle::attribute::ExtendedAttribute::NoArgs(attribute)
+                            if attribute.0.0 == "LegacyOverrideBuiltIns"
+                    )
+                })
+        }) {
             return Err(Error(format!(
                 "resolved declaration attributes are not supported yet: {scope:?}"
             )));

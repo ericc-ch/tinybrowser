@@ -558,8 +558,22 @@ fn unforgeable_and_scoped_native_members_fail_the_build() {
         name: "fixture.rs",
         text: "impl<'js> sample_generated::Sample<'js> for Payload { fn get_flag(&self, ctx: &Ctx<'js>) -> Result<bool> { Ok(true) } }",
     }];
+    // `[LegacyUnforgeable]` is annotation-only on the contract: the
+    // prototype accessor installs and the interface's own shim owns the
+    // unforgeable instance shape, matching the legacy path.
+    let unforgeable = [Source {
+        name: "fixture.idl",
+        text: "[Exposed=Window] interface Sample { [LegacyUnforgeable] readonly attribute boolean flag; };",
+    }];
+    compile_contracts(&unforgeable, &rust).expect("unforgeable annotation is accepted");
+    // `[LegacyOverrideBuiltIns]` without a named getter changes nothing
+    // observable, so the scope is accepted.
+    let scoped = [Source {
+        name: "fixture.idl",
+        text: "[Exposed=Window] interface Sample {}; [LegacyOverrideBuiltIns] partial interface Sample { readonly attribute boolean flag; };",
+    }];
+    compile_contracts(&scoped, &rust).expect("inert scope is accepted");
     for text in [
-        "[Exposed=Window] interface Sample { [LegacyUnforgeable] readonly attribute boolean flag; };",
         "[Exposed=Window] interface Sample {}; [SecureContext] partial interface Sample { readonly attribute boolean flag; };",
         "[Exposed=Window] interface Sample {}; [SecureContext] interface mixin Extra { readonly attribute boolean flag; }; Sample includes Extra;",
     ] {
@@ -569,7 +583,7 @@ fn unforgeable_and_scoped_native_members_fail_the_build() {
         }];
         let error = compile_contracts(&idl, &rust)
             .err()
-            .expect("scoped or unforgeable member must fail")
+            .expect("secure-context member must fail")
             .to_string();
         assert!(
             error.contains("not supported"),

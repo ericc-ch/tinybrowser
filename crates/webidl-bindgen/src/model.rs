@@ -136,10 +136,20 @@ pub(crate) struct OperationArgument {
     pub(crate) null_default: bool,
     pub(crate) legacy_null_to_empty: bool,
     pub(crate) boolean_default: Option<bool>,
+    /// An optional union's IDL default, materialized as the value before
+    /// conversion, mirroring boolean defaults.
+    pub(crate) union_default: Option<UnionDefault>,
     /// `[RustFromJs=PATH]`: convert the raw argument with `PATH::from_js`
     /// instead of a generated conversion. Used for the renderer's exact
     /// code-unit and pristine-string argument types.
     pub(crate) from_js: Option<syn::Path>,
+}
+
+/// An optional union argument's default value.
+#[derive(Clone, Copy)]
+pub(crate) enum UnionDefault {
+    Boolean(bool),
+    EmptyDictionary,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -212,6 +222,7 @@ pub(crate) enum GetterMapping {
     Reflect { content: String },
 }
 
+#[derive(Debug)]
 pub(crate) enum ReturnType {
     String,
     NullableString,
@@ -237,10 +248,16 @@ pub(crate) enum ReturnType {
     /// `DOMHighResTimeStamp`, a `double`
     /// (<https://webidl.spec.whatwg.org/#idl-DOMHighResTimeStamp>).
     Double,
+    /// Restricted `double`: rejects NaN and infinities on conversion
+    /// (<https://webidl.spec.whatwg.org/#es-double>).
+    RestrictedDouble,
     /// A union of IDL member types, with the generated enum named by the
     /// second field. Conversion tries members in `WebIDL` order
     /// (<https://webidl.spec.whatwg.org/#es-union>).
     Union(String, Vec<UnionMember>),
+    /// A nullable union: `null` or `undefined` convert to `None`
+    /// (<https://webidl.spec.whatwg.org/#js-nullable-type>).
+    NullableUnion(String, Vec<UnionMember>),
     /// `Promise<undefined>`: the method runs synchronously and the dispatch
     /// resolves the promise (<https://webidl.spec.whatwg.org/#es-promise>).
     PromiseUndefined,
@@ -249,7 +266,7 @@ pub(crate) enum ReturnType {
 }
 
 /// One flattened member of a union: the generated variant and its IDL type.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct UnionMember {
     pub(crate) variant: Ident,
     pub(crate) type_: UnionMemberType,
@@ -257,7 +274,7 @@ pub(crate) struct UnionMember {
 
 /// Member types a generated union conversion supports. Anything else fails
 /// the build at lowering instead of shipping a partial conversion.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum UnionMemberType {
     /// An interface member. `name` is the IDL interface and `node` says
     /// whether it is `Node` or inherits from it (converted to
@@ -313,6 +330,8 @@ pub(crate) enum DictionaryFieldType {
         required: bool,
     },
     StringSequence,
+    /// A `DOMString` dictionary member, converted with `ToString` when present.
+    DomString,
     /// An interface- or callback-interface-typed member. Nullable members
     /// map a present null to `None`; anything else must be an object.
     Interface { nullable: bool },
@@ -934,6 +953,9 @@ impl OperationArgument {
             null_default,
             legacy_null_to_empty,
             boolean_default,
+            // Optional union defaults are a contract-path conversion; the
+            // legacy path carries raw values instead.
+            union_default: None,
             from_js,
         })
     }

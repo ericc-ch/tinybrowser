@@ -219,7 +219,9 @@ pub(crate) fn compile(idl: &[Source<'_>], rust: &[Source<'_>]) -> Result<Vec<Bin
             } else {
                 InterfaceKind::Complete
             };
-            let interface = lower(&database, &implementation, kind)?;
+            let interface = lower(&database, &implementation, kind).map_err(|error| {
+                Error(format!("{}: {error}", implementation.interface))
+            })?;
             let syntax = syn::parse2(crate::emit::interface(&interface))
                 .map_err(|error| Error(format!("invalid generated contract: {error}")))?;
             Ok(Binding {
@@ -524,6 +526,23 @@ fn lower_mixin(
     Ok(interface)
 }
 
+/// The IDL member name for diagnostics.
+fn member_name<'a>(member: &InterfaceMember<'a>) -> &'a str {
+    match member {
+        InterfaceMember::Const(member) => member.identifier.0,
+        InterfaceMember::Constructor(_) => "constructor",
+        InterfaceMember::Attribute(member) => member.identifier.0,
+        InterfaceMember::Operation(member) => {
+            member.identifier.as_ref().map_or("<anonymous>", |identifier| identifier.0)
+        }
+        InterfaceMember::Iterable(_)
+        | InterfaceMember::AsyncIterable(_)
+        | InterfaceMember::Maplike(_)
+        | InterfaceMember::Setlike(_)
+        | InterfaceMember::Stringifier(_) => "<special>",
+    }
+}
+
 fn lower_members(
     database: &Database<'_>,
     declaration: &crate::database::Interface<'_>,
@@ -537,13 +556,13 @@ fn lower_members(
         let resolved = member;
         match &member.declaration {
             InterfaceMember::Const(member) => {
-                resolved.validate_scopes()?;
+                resolved.validate_scopes().map_err(|error| crate::Error(format!("{}: {error}", member_name(&resolved.declaration))))?;
                 interface.constants.push(model::Constant::parse(member)?);
             }
             InterfaceMember::Constructor(member)
                 if implementation.methods.contains_key("constructor") =>
             {
-                resolved.validate_scopes()?;
+                resolved.validate_scopes().map_err(|error| crate::Error(format!("{}: {error}", member_name(&resolved.declaration))))?;
                 if interface.constructor.is_some() {
                     return Err(Error(
                         "native constructor overloads are not supported yet".into(),
@@ -565,7 +584,7 @@ fn lower_members(
                 else {
                     continue;
                 };
-                resolved.validate_scopes()?;
+                resolved.validate_scopes().map_err(|error| crate::Error(format!("{}: {error}", member_name(&resolved.declaration))))?;
                 remaining.remove(&attribute.rust.to_string());
                 if let Some(model::Setter::Method { rust, .. }) = &attribute.setter {
                     remaining.remove(&rust.to_string());
@@ -586,12 +605,27 @@ fn lower_members(
                 }
                 interface.attributes.push(attribute);
             }
-            InterfaceMember::Operation(member) => {                let Some((operation, signature, property)) =
+            InterfaceMember::Operation(member) => {
+                // Overloads share one implementation method: the first IDL
+                // overload in declaration order consumes it and later
+                // same-name overloads are skipped, matching overload-set
+                // order. The implementation fully describes the shared
+                // behavior; unimplemented overloads stay absent.
+                let consumed = match &member.identifier {
+                    Some(identifier) => {
+                        !remaining.contains_key(snake_case(identifier.0).as_str())
+                    }
+                    None => false,
+                };
+                if consumed {
+                    continue;
+                }
+                let Some((operation, signature, property)) =
                     lower_operation(database, member, &implementation.methods)?
                 else {
                     continue;
                 };
-                resolved.validate_scopes()?;
+                resolved.validate_scopes().map_err(|error| crate::Error(format!("{}: {error}", member_name(&resolved.declaration))))?;
                 remaining.remove(&operation.rust.to_string());
                 if let Some(property) = property {
                     getters.push(property);
@@ -609,7 +643,7 @@ fn lower_members(
     }
     interface.properties =
         infer_property_hooks(declaration, &getters, &mut remaining, &mut methods)?;
-    ensure_no_extra_methods(declaration, &remaining)?;
+    ensure_no_extra_methods(&remaining)?;
     let name = format_ident!("{}", declaration.name);
     // A fully generated contract (such as `[Reflect]`-only members) has no
     // trait methods; the empty trait still marks the implementation.
@@ -623,15 +657,13 @@ fn lower_members(
 
 /// Reject implementation methods that no IDL member consumed.
 fn ensure_no_extra_methods(
-    declaration: &crate::database::Interface<'_>,
     remaining: &BTreeMap<String, Method>,
 ) -> Result<(), Error> {
     if remaining.is_empty() {
         return Ok(());
     }
     Err(Error(format!(
-        "{}: methods do not match a supported IDL contract: {}",
-        declaration.name,
+        "methods do not match a supported IDL contract: {}",
         remaining.keys().cloned().collect::<Vec<_>>().join(", ")
     )))
 }
@@ -707,7 +739,7 @@ fn add_referenced_definitions(
 /// emitted into the same module. The union carries its members inline
 /// because unions have no named declaration to re-lower.
 fn collect_union(type_: &ReturnType, unions: &mut Vec<model::Union>) {
-    if let ReturnType::Union(name, members) = type_
+    if let ReturnType::Union(name, members) | ReturnType::NullableUnion(name, members) = type_
         && !unions.iter().any(|union| union.name == *name)
     {
         unions.push(model::Union {
@@ -781,6 +813,16 @@ fn dictionary_field_type(
                 ));
             }
             Ok(model::DictionaryFieldType::StringSequence)
+        }
+        Type::Single(SingleType::NonAny(NonAnyType::DOMString(value)))
+            if value.q_mark.is_none() =>
+        {
+            if member.default.is_some() {
+                return Err(Error(
+                    "string dictionary defaults are not supported yet".into(),
+                ));
+            }
+            Ok(model::DictionaryFieldType::DomString)
         }
         Type::Single(SingleType::NonAny(NonAnyType::Identifier(value)))
             if matches!(
@@ -1107,6 +1149,7 @@ fn lower_argument(
                     null_default: false,
                     legacy_null_to_empty: false,
                     boolean_default: None,
+                    union_default: None,
                     from_js: None,
                 },
                 parameter: quote! { Vec<#element> },
@@ -1147,6 +1190,10 @@ fn lower_argument(
                 default.value,
                 DefaultValue::EmptyDictionary(_) | DefaultValue::Null(_)
             ) => {}
+        // An optional union with a boolean default materializes it before
+        // conversion, mirroring boolean defaults.
+        (ReturnType::Union(_, _) | ReturnType::NullableUnion(_, _), true, Some(default))
+            if matches!(default.value, DefaultValue::Boolean(_)) => {}
         _ => {
             return Err(Error(
                 "native operation optionality or default is not supported yet".into(),
@@ -1166,6 +1213,7 @@ fn lower_argument(
             _ => None,
         });
     let parameter = argument_parameter(&type_, arity, boolean_default)?;
+    let union_default = union_default(&type_, argument)?;
     Ok(LoweredArgument {
         argument: model::OperationArgument {
             type_,
@@ -1176,11 +1224,37 @@ fn lower_argument(
                 .is_some_and(|default| matches!(default.value, DefaultValue::Null(_))),
             legacy_null_to_empty,
             boolean_default,
+            union_default,
             from_js: None,
         },
         parameter,
         arity,
     })
+}
+
+/// An optional union argument's IDL default, if it is a boolean or an empty
+/// dictionary. Anything else fails the build.
+fn union_default(
+    type_: &ReturnType,
+    argument: &weedle::argument::SingleArgument<'_>,
+) -> Result<Option<model::UnionDefault>, Error> {
+    let is_union = matches!(
+        type_,
+        ReturnType::Union(..) | ReturnType::NullableUnion(..)
+    );
+    let Some(default) = argument.default.as_ref().filter(|_| is_union) else {
+        return Ok(None);
+    };
+    match default.value {
+        DefaultValue::Boolean(value) => Ok(Some(model::UnionDefault::Boolean(value.0))),
+        DefaultValue::EmptyDictionary(_) => Ok(Some(model::UnionDefault::EmptyDictionary)),
+        // `= null` on a nullable union needs no materialization: the
+        // conversion already maps a missing value to `None`.
+        DefaultValue::Null(_) => Ok(None),
+        _ => Err(Error(
+            "union argument defaults must be boolean, null, or {} for now".into(),
+        )),
+    }
 }
 
 /// The Rust parameter type for one lowered operation argument. These mirror the
@@ -1207,19 +1281,24 @@ fn argument_parameter(
             let name = format_ident!("{name}");
             quote! { #name }
         }
-        ReturnType::Union(name, members) => {
+        ReturnType::Union(name, members) | ReturnType::NullableUnion(name, members) => {
             let name = format_ident!("{name}");
-            if members.iter().any(|member| member.type_.needs_lifetime()) {
+            let union = if members.iter().any(|member| member.type_.needs_lifetime()) {
                 quote! { #name<'js> }
             } else {
                 quote! { #name }
+            };
+            if matches!(type_, ReturnType::NullableUnion(_, _)) {
+                quote! { Option<#union> }
+            } else {
+                union
             }
         }
         ReturnType::Boolean if optional && boolean_default.is_none() => quote! { Option<bool> },
         ReturnType::Boolean => quote! { bool },
         ReturnType::UnsignedLong => quote! { u32 },
         ReturnType::Long => quote! { i32 },
-        ReturnType::Double => quote! { f64 },
+        ReturnType::Double | ReturnType::RestrictedDouble => quote! { f64 },
         _ => {
             return Err(Error(
                 "native operation argument type is not supported yet".into(),
@@ -1345,6 +1424,15 @@ fn lower_attribute(
         | ReturnType::NullableNode
         | ReturnType::NodeList
         | ReturnType::NullableDocumentType => ReturnType::PlatformObject,
+        // A getter returns its value without conversion, so a union of
+        // platform objects passes through as the value or null.
+        ReturnType::Union(_, members) | ReturnType::NullableUnion(_, members)
+            if members
+                .iter()
+                .all(|member| matches!(member.type_, model::UnionMemberType::Interface { .. })) =>
+        {
+            ReturnType::PlatformObject
+        }
         ReturnType::PromiseUndefined => {
             return Err(Error(
                 "promise attributes are not supported yet".into(),
@@ -1357,24 +1445,7 @@ fn lower_attribute(
             "native attribute stringifiers require DOMString".into(),
         ));
     }
-    let result = match &type_ {
-        ReturnType::String => quote! { rquickjs::String<'js> },
-        // USVString getters hand a code-unit string to the lossy conversion.
-        ReturnType::UsvString => quote! { dom::DomString },
-        ReturnType::NullableString => quote! { Option<rquickjs::String<'js>> },
-        ReturnType::Boolean => quote! { bool },
-        ReturnType::UnsignedShort => quote! { u16 },
-        ReturnType::UnsignedLong => quote! { usize },
-        ReturnType::Long => quote! { i32 },
-        ReturnType::NullableUnsignedLong => quote! { Option<u32> },
-        ReturnType::Double => quote! { f64 },
-        ReturnType::PlatformObject => quote! { Value<'js> },
-        ReturnType::Enumeration(name) => {
-            let name = format_ident!("{name}");
-            quote! { #name }
-        }
-        _ => return Err(Error("native attribute type is not supported yet".into())),
-    };
+    let result = attribute_result(&type_)?;
     let getter = format_ident!("{getter_name}");
     let mut signature = quote! { fn #getter(&self, ctx: &Ctx<'js>) -> Result<#result>; };
     let setter = attribute_setter(
@@ -1394,6 +1465,28 @@ fn lower_attribute(
         reactions,
     };
     Ok(Some((attribute, signature)))
+}
+
+/// The Rust getter return type for one lowered attribute type.
+fn attribute_result(type_: &ReturnType) -> Result<TokenStream, Error> {
+    Ok(match type_ {
+        ReturnType::String => quote! { rquickjs::String<'js> },
+        // USVString getters hand a code-unit string to the lossy conversion.
+        ReturnType::UsvString => quote! { dom::DomString },
+        ReturnType::NullableString => quote! { Option<rquickjs::String<'js>> },
+        ReturnType::Boolean => quote! { bool },
+        ReturnType::UnsignedShort => quote! { u16 },
+        ReturnType::UnsignedLong => quote! { usize },
+        ReturnType::Long => quote! { i32 },
+        ReturnType::NullableUnsignedLong => quote! { Option<u32> },
+        ReturnType::Double | ReturnType::RestrictedDouble => quote! { f64 },
+        ReturnType::PlatformObject => quote! { Value<'js> },
+        ReturnType::Enumeration(name) => {
+            let name = format_ident!("{name}");
+            quote! { #name }
+        }
+        _ => return Err(Error("native attribute type is not supported yet".into())),
+    })
 }
 
 /// An attribute's setter: an implemented method, a generated `[PutForwards]`
@@ -1674,8 +1767,10 @@ fn setter_parameter(type_: &ReturnType) -> Result<TokenStream, Error> {
         ReturnType::UnsignedLong => quote! { u32 },
         ReturnType::Long => quote! { i32 },
         ReturnType::NullableUnsignedLong => quote! { Option<u32> },
-        ReturnType::Double => quote! { f64 },
-        ReturnType::Value => quote! { Value<'js> },
+        ReturnType::Double | ReturnType::RestrictedDouble => quote! { f64 },
+        // A platform-object setter takes the value as-is; the method owns
+        // the conversion, mirroring `[RustValue]` arguments.
+        ReturnType::Value | ReturnType::PlatformObject => quote! { Value<'js> },
         ReturnType::Enumeration(name) => {
             let name = format_ident!("{name}");
             quote! { #name }
@@ -1837,9 +1932,19 @@ fn native_type(
                 ) =>
         {
             // `Coerced<f64>` is `ToNumber`, which admits NaN and infinities:
-            // exactly `unrestricted double`. Restricted `double` rejects
-            // them and needs its own conversion first.
+            // exactly `unrestricted double`.
             Ok(ReturnType::Double)
+        }
+        Type::Single(SingleType::NonAny(NonAnyType::FloatingPoint(item)))
+            if item.q_mark.is_none()
+                && matches!(
+                    item.type_,
+                    weedle::types::FloatingPointType::Double(_)
+                ) =>
+        {
+            // Restricted `double` rejects NaN and infinities on conversion
+            // (<https://webidl.spec.whatwg.org/#es-double>).
+            Ok(ReturnType::RestrictedDouble)
         }
         Type::Single(SingleType::NonAny(NonAnyType::Promise(promise)))
             if matches!(
@@ -1899,11 +2004,6 @@ fn native_named(
     if let Some(interface) = native_interface(database, name, nullable) {
         return Ok(interface);
     }
-    if nullable {
-        return Err(Error(format!(
-            "nullable native type {name} is not supported yet"
-        )));
-    }
     if !visited.insert(name.into()) {
         return Err(Error(format!("typedef cycle at {name}")));
     }
@@ -1911,8 +2011,18 @@ fn native_named(
         Some(weedle::Definition::Typedef(definition)) => {
             validate_empty_attributes(definition.attributes.as_ref())?;
             validate_empty_attributes(definition.type_.attributes.as_ref())?;
-            native_type(database, &definition.type_.type_, visited)
+            let resolved = native_type(database, &definition.type_.type_, visited)?;
+            // Nullability applies after resolving the typedef, so a nullable
+            // typedef over a union or string keeps its null conversion.
+            if nullable {
+                make_nullable(resolved)
+            } else {
+                Ok(resolved)
+            }
         }
+        Some(_) if nullable => Err(Error(format!(
+            "nullable native type {name} is not supported yet"
+        ))),
         Some(weedle::Definition::Callback(definition)) => {
             model::Callback::parse(definition)?;
             Ok(ReturnType::Callback)
@@ -1920,6 +2030,26 @@ fn native_named(
         Some(weedle::Definition::Dictionary(_)) => Ok(ReturnType::Dictionary(name.into())),
         Some(weedle::Definition::Enum(_)) => Ok(ReturnType::Enumeration(name.into())),
         _ => Err(Error(format!("native type {name} is not supported yet"))),
+    }
+}
+
+/// Apply `?` to a resolved typedef target. Representations that already
+/// carry null absorb it; anything else without a nullable shape fails.
+fn make_nullable(type_: ReturnType) -> Result<ReturnType, Error> {
+    match type_ {
+        ReturnType::String => Ok(ReturnType::NullableString),
+        ReturnType::Node => Ok(ReturnType::NullableNode),
+        ReturnType::Union(name, members) => Ok(ReturnType::NullableUnion(name, members)),
+        // A value already carries null, so nullability is absorbed.
+        ReturnType::PlatformObject
+        | ReturnType::NullableString
+        | ReturnType::NullableNode
+        | ReturnType::NullableDocumentType
+        | ReturnType::NullableUnsignedLong
+        | ReturnType::NullableUnion(_, _) => Ok(type_),
+        type_ => Err(Error(format!(
+            "nullable native type is not supported yet: {type_:?}"
+        ))),
     }
 }
 
@@ -1937,9 +2067,7 @@ fn lower_union(
     database: &Database<'_>,
     union_: &weedle::types::MayBeNull<weedle::types::UnionType<'_>>,
 ) -> Result<ReturnType, Error> {
-    if union_.q_mark.is_some() {
-        return Err(Error("nullable unions are not supported yet".into()));
-    }
+    let nullable = union_.q_mark.is_some();
     let mut members = Vec::new();
     let mut visited = BTreeSet::new();
     collect_union_members(
@@ -1948,7 +2076,7 @@ fn lower_union(
         &mut members,
         &mut visited,
     )?;
-    finish_union(members)
+    finish_union(members, nullable)
 }
 
 /// Flatten nested unions and typedef'd unions into distinct member types,
@@ -2100,11 +2228,15 @@ fn push_union_member(
     }
 }
 
-fn finish_union(members: Vec<model::UnionMember>) -> Result<ReturnType, Error> {
+fn finish_union(members: Vec<model::UnionMember>, nullable: bool) -> Result<ReturnType, Error> {
     if members.is_empty() {
         return Err(Error("unions need at least one member type".into()));
     }
-    if let [member] = members.as_slice() {
+    // A nullable union stays a union even when it collapses to one
+    // representation, so the null conversion stays explicit.
+    if let [member] = members.as_slice()
+        && !nullable
+    {
         return Ok(member_return_type(&member.type_));
     }
     // Canonical declaration-independent name, like Chromium's sorted union
@@ -2112,7 +2244,12 @@ fn finish_union(members: Vec<model::UnionMember>) -> Result<ReturnType, Error> {
     let mut names: Vec<String> = members.iter().map(|member| member.variant.to_string()).collect();
     names.sort_unstable();
     names.dedup();
-    Ok(ReturnType::Union(names.join("Or"), members))
+    let name = names.join("Or");
+    if nullable {
+        Ok(ReturnType::NullableUnion(name, members))
+    } else {
+        Ok(ReturnType::Union(name, members))
+    }
 }
 
 /// The `ReturnType` a single union member lowers to when the union collapses
@@ -2181,10 +2318,14 @@ fn validate_attribute_attributes(
                         "SameObject"
                             | "CEReactions"
                             | "LegacyNullToEmptyString"
+                            | "LegacyUnforgeable"
                             | "Reflect"
                             | "ReflectSetter"
                     ) => {}
                 // `[PutForwards]` lowers to a generated forwarding setter.
+                // `[LegacyUnforgeable]` shapes the instance property in the
+                // interface's own shim, as the legacy path also accepts it;
+                // the generator installs the prototype accessor.
                 ExtendedAttribute::Ident(item) if item.lhs_identifier.0 == "PutForwards" => {}
                 ExtendedAttribute::String(item)
                     if item.lhs_identifier.0 == "Reflect" => {}

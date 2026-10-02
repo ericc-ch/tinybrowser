@@ -7,7 +7,7 @@ use crate::model::{
     ArgumentArity, Attribute, ConstructorArgumentKind, Dictionary, DictionaryField,
     DictionaryFieldType, Enumeration, GetterMapping, Interface, InterfaceKind, Operation,
     OperationArgument, OperationResult, Payload, PropertyGetter, PropertyHooks, PrototypeParent,
-    ReturnType, Setter, Union, UnionMemberType,
+    ReturnType, Setter, Union, UnionDefault, UnionMemberType,
 };
 
 pub(crate) fn interface(interface: &Interface) -> TokenStream {
@@ -44,6 +44,7 @@ pub(crate) fn interface(interface: &Interface) -> TokenStream {
                 | ReturnType::NullableUnsignedLong
                 | ReturnType::Long
                 | ReturnType::Double
+                | ReturnType::RestrictedDouble
                 | ReturnType::Enumeration(_)
         )
     }) {
@@ -765,13 +766,16 @@ fn getter_dispatch(id: usize, getter: &Attribute, interface: &Interface) -> Toke
                     None => Ok(Value::new_null(ctx)),
                 }
             },
-            ReturnType::Double => quote! {
+            ReturnType::Double | ReturnType::RestrictedDouble => quote! {
                 // https://webidl.spec.whatwg.org/#idl-DOMHighResTimeStamp
                 let result: f64 = #call?;
                 result.into_js(&ctx)
             },
             ReturnType::NullableNode | ReturnType::NodeList | ReturnType::PlatformObject => {
                 quote! { #call }
+            }
+            ReturnType::Union(..) | ReturnType::NullableUnion(..) => {
+                unreachable!("attribute unions collapse to platform objects at lowering")
             }
             ReturnType::PromiseUndefined => {
                 unreachable!("promise attributes are rejected at lowering")
@@ -784,7 +788,6 @@ fn getter_dispatch(id: usize, getter: &Attribute, interface: &Interface) -> Toke
             ReturnType::Node
             | ReturnType::Callback
             | ReturnType::Dictionary(_)
-            | ReturnType::Union(..)
             | ReturnType::InterfaceSequence
             | ReturnType::StringSequence
             | ReturnType::NullableDocumentType => {
@@ -793,6 +796,84 @@ fn getter_dispatch(id: usize, getter: &Attribute, interface: &Interface) -> Toke
         },
     };
     quote! { #id => { #body } }
+}
+
+/// One attribute setter's value conversion from the first argument.
+fn setter_value_conversion(return_type: &ReturnType, legacy_null_to_empty: bool) -> TokenStream {
+    match return_type {
+        ReturnType::String if legacy_null_to_empty => quote! {
+            host::legacy_null_string_argument(params, 0)?
+        },
+        ReturnType::String => quote! { host::string_argument(params, 0, None)? },
+        ReturnType::NullableString => quote! { host::nullable_string_argument(params, 0)? },
+        ReturnType::NullableUnsignedLong => quote! {
+            {
+                let value = params.arg(0).unwrap_or_else(|| Value::new_undefined(ctx.clone()));
+                if value.is_null() || value.is_undefined() {
+                    None
+                } else {
+                    // https://webidl.spec.whatwg.org/#es-unsigned-long
+                    let converted: rquickjs::Coerced<i32> = rquickjs::FromJs::from_js(&ctx, value)?;
+                    Some(converted.0.cast_unsigned())
+                }
+            }
+        },
+        // https://webidl.spec.whatwg.org/#es-boolean
+        ReturnType::Boolean => quote! { host::boolean_argument(params, 0)? },
+        // https://webidl.spec.whatwg.org/#es-unsigned-long
+        ReturnType::UnsignedLong => quote! {
+            {
+                let value = params.arg(0).unwrap_or_else(|| Value::new_undefined(ctx.clone()));
+                let converted: rquickjs::Coerced<i32> = rquickjs::FromJs::from_js(&ctx, value)?;
+                converted.0.cast_unsigned()
+            }
+        },
+        // https://webidl.spec.whatwg.org/#es-long
+        ReturnType::Long => quote! {
+            {
+                let value = params.arg(0).unwrap_or_else(|| Value::new_undefined(ctx.clone()));
+                let converted: rquickjs::Coerced<i32> = rquickjs::FromJs::from_js(&ctx, value)?;
+                converted.0
+            }
+        },
+        // https://webidl.spec.whatwg.org/#es-double
+        ReturnType::Double => quote! {
+            {
+                let value = params.arg(0).unwrap_or_else(|| Value::new_undefined(ctx.clone()));
+                let converted: rquickjs::Coerced<f64> = rquickjs::FromJs::from_js(&ctx, value)?;
+                converted.0
+            }
+        },
+        // Restricted `double` rejects NaN and infinities.
+        ReturnType::RestrictedDouble => quote! {
+            {
+                let value = params.arg(0).unwrap_or_else(|| Value::new_undefined(ctx.clone()));
+                let converted: rquickjs::Coerced<f64> = rquickjs::FromJs::from_js(&ctx, value)?;
+                if !converted.0.is_finite() {
+                    return Err(rquickjs::Exception::throw_type(
+                        &ctx,
+                        "finite double required",
+                    ));
+                }
+                converted.0
+            }
+        },
+        // `[RustValue]`: the platform setter converts the raw argument.
+        // A platform-object setter takes the value as-is, like one.
+        ReturnType::Value | ReturnType::PlatformObject => quote! {
+            params.arg(0).unwrap_or_else(|| Value::new_undefined(ctx.clone()))
+        },
+        ReturnType::Enumeration(name) => {
+            let name = format_ident!("{name}");
+            quote! {
+                {
+                    let value = params.arg(0).unwrap_or_else(|| Value::new_undefined(ctx.clone()));
+                    #name::from_value(&ctx, value)?
+                }
+            }
+        }
+        _ => unreachable!("validated string, boolean, integer, double, or value setter"),
+    }
 }
 
 fn setter_dispatch(
@@ -830,65 +911,7 @@ fn setter_dispatch(
             )?
         }
     } else {
-        match &attribute.return_type {
-            ReturnType::String if attribute.legacy_null_to_empty => quote! {
-                host::legacy_null_string_argument(params, 0)?
-            },
-            ReturnType::String => quote! { host::string_argument(params, 0, None)? },
-            ReturnType::NullableString => quote! { host::nullable_string_argument(params, 0)? },
-            ReturnType::NullableUnsignedLong => quote! {
-                {
-                    let value = params.arg(0).unwrap_or_else(|| Value::new_undefined(ctx.clone()));
-                    if value.is_null() || value.is_undefined() {
-                        None
-                    } else {
-                        // https://webidl.spec.whatwg.org/#es-unsigned-long
-                        let converted: rquickjs::Coerced<i32> = rquickjs::FromJs::from_js(&ctx, value)?;
-                        Some(converted.0.cast_unsigned())
-                    }
-                }
-            },
-            // https://webidl.spec.whatwg.org/#es-boolean
-            ReturnType::Boolean => quote! { host::boolean_argument(params, 0)? },
-            // https://webidl.spec.whatwg.org/#es-unsigned-long
-            ReturnType::UnsignedLong => quote! {
-                {
-                    let value = params.arg(0).unwrap_or_else(|| Value::new_undefined(ctx.clone()));
-                    let converted: rquickjs::Coerced<i32> = rquickjs::FromJs::from_js(&ctx, value)?;
-                    converted.0.cast_unsigned()
-                }
-            },
-            // https://webidl.spec.whatwg.org/#es-long
-            ReturnType::Long => quote! {
-                {
-                    let value = params.arg(0).unwrap_or_else(|| Value::new_undefined(ctx.clone()));
-                    let converted: rquickjs::Coerced<i32> = rquickjs::FromJs::from_js(&ctx, value)?;
-                    converted.0
-                }
-            },
-            // https://webidl.spec.whatwg.org/#es-double
-            ReturnType::Double => quote! {
-                {
-                    let value = params.arg(0).unwrap_or_else(|| Value::new_undefined(ctx.clone()));
-                    let converted: rquickjs::Coerced<f64> = rquickjs::FromJs::from_js(&ctx, value)?;
-                    converted.0
-                }
-            },
-            // `[RustValue]`: the platform setter converts the raw argument.
-            ReturnType::Value => quote! {
-                params.arg(0).unwrap_or_else(|| Value::new_undefined(ctx.clone()))
-            },
-            ReturnType::Enumeration(name) => {
-                let name = format_ident!("{name}");
-                quote! {
-                    {
-                        let value = params.arg(0).unwrap_or_else(|| Value::new_undefined(ctx.clone()));
-                        #name::from_value(&ctx, value)?
-                    }
-                }
-            }
-            _ => unreachable!("validated string, boolean, integer, double, or value setter"),
-        }
+        setter_value_conversion(&attribute.return_type, attribute.legacy_null_to_empty)
     };
     let call = method_call(interface, method, &quote! { #ctx_arg, value });
     let body = quote! {
@@ -1079,18 +1102,35 @@ fn operation_argument(
     operation_argument_at(&quote! { #index }, argument, variable)
 }
 
-fn operation_argument_at(
-    index: &TokenStream,
+/// An optional union argument's IDL default, materialized as the value
+/// before conversion, mirroring boolean defaults.
+fn union_default_value(argument: &OperationArgument) -> TokenStream {
+    match argument.union_default {
+        None => quote! {},
+        Some(UnionDefault::Boolean(default)) => quote! {
+            let value = if value.is_undefined() {
+                Value::new_bool(ctx.clone(), #default)
+            } else {
+                value
+            };
+        },
+        Some(UnionDefault::EmptyDictionary) => quote! {
+            let value = if value.is_undefined() {
+                rquickjs::Object::new(ctx.clone())?.into_value()
+            } else {
+                value
+            };
+        },
+    }
+}
+
+/// One object-family operation argument's conversion: nodes, callbacks,
+/// platform objects, dictionaries, enumerations, and unions.
+fn converted_argument(
     argument: &OperationArgument,
     variable: &proc_macro2::Ident,
+    fetch: &TokenStream,
 ) -> TokenStream {
-    let fetch = quote! {
-        let value = params.arg(#index).unwrap_or_else(|| Value::new_undefined(ctx.clone()));
-    };
-    if let Some(path) = &argument.from_js {
-        // https://webidl.spec.whatwg.org/#es-type-mapping
-        return from_js_argument(index, variable, path);
-    }
     match &argument.type_ {
         ReturnType::Node => quote! {
             #fetch
@@ -1117,10 +1157,50 @@ fn operation_argument_at(
         }
         ReturnType::Enumeration(name) | ReturnType::Union(name, _) => {
             let name = format_ident!("{name}");
+            let default = union_default_value(argument);
             quote! {
                 #fetch
+                #default
                 let #variable = #name::from_value(&ctx, value)?;
             }
+        }
+        ReturnType::NullableUnion(name, _) => {
+            let name = format_ident!("{name}");
+            quote! {
+                #fetch
+                let #variable = if value.is_null() || value.is_undefined() {
+                    None
+                } else {
+                    Some(#name::from_value(&ctx, value)?)
+                };
+            }
+        }
+        _ => unreachable!("converted arguments are object-family types"),
+    }
+}
+
+fn operation_argument_at(
+    index: &TokenStream,
+    argument: &OperationArgument,
+    variable: &proc_macro2::Ident,
+) -> TokenStream {
+    let fetch = quote! {
+        let value = params.arg(#index).unwrap_or_else(|| Value::new_undefined(ctx.clone()));
+    };
+    if let Some(path) = &argument.from_js {
+        // https://webidl.spec.whatwg.org/#es-type-mapping
+        return from_js_argument(index, variable, path);
+    }
+    match &argument.type_ {
+        ReturnType::Node
+        | ReturnType::NullableNode
+        | ReturnType::Callback
+        | ReturnType::PlatformObject
+        | ReturnType::Dictionary(_)
+        | ReturnType::Enumeration(_)
+        | ReturnType::Union(..)
+        | ReturnType::NullableUnion(..) => {
+            converted_argument(argument, variable, &fetch)
         }
         ReturnType::String => {
             let conversion = if argument.legacy_null_to_empty {
@@ -1178,6 +1258,15 @@ fn operation_argument_at(
             #fetch
             // https://webidl.spec.whatwg.org/#es-double
             let converted: rquickjs::Coerced<f64> = rquickjs::FromJs::from_js(&ctx, value)?;
+            let #variable = converted.0;
+        },
+        ReturnType::RestrictedDouble => quote! {
+            #fetch
+            // Restricted `double` rejects NaN and infinities.
+            let converted: rquickjs::Coerced<f64> = rquickjs::FromJs::from_js(&ctx, value)?;
+            if !converted.0.is_finite() {
+                return Err(rquickjs::Exception::throw_type(&ctx, "finite double required"));
+            }
             let #variable = converted.0;
         },
         _ => unreachable!("validated operation argument"),
@@ -1405,6 +1494,9 @@ fn dictionary_field(field: &DictionaryField) -> TokenStream {
         DictionaryFieldType::StringSequence => {
             quote! { pub(crate) #rust: Option<Vec<Vec<u16>>> }
         }
+        DictionaryFieldType::DomString => {
+            quote! { pub(crate) #rust: Option<String> }
+        }
         DictionaryFieldType::Interface { .. } => {
             quote! { pub(crate) #rust: Option<rquickjs::Persistent<Object<'static>>> }
         }
@@ -1441,6 +1533,7 @@ fn dictionary_default(field: &DictionaryField) -> TokenStream {
         }
         DictionaryFieldType::Enumeration { .. }
         | DictionaryFieldType::StringSequence
+        | DictionaryFieldType::DomString
         | DictionaryFieldType::Interface { .. } => {
             quote! { #rust: None }
         }
@@ -1469,6 +1562,18 @@ fn dictionary_conversion(field: &DictionaryField) -> TokenStream {
         DictionaryFieldType::Enumeration { .. } => dictionary_enum_conversion(field),
         DictionaryFieldType::StringSequence => quote! {
             #rust: host::dict_string_sequence(ctx, &object, #key)?
+        },
+        DictionaryFieldType::DomString => quote! {
+            #rust: {
+                let value: Value = object.get(#key)?;
+                if value.is_undefined() {
+                    None
+                } else {
+                    let converted: rquickjs::Coerced<rquickjs::String> =
+                        rquickjs::FromJs::from_js(ctx, value)?;
+                    Some(converted.0.to_string()?)
+                }
+            }
         },
         DictionaryFieldType::Interface { nullable: true } => quote! {
             #rust: host::dict_object(ctx, &object, #key)?

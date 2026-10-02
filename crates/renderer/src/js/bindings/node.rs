@@ -19,7 +19,7 @@ use super::{
     remove_attribute_sync, required_node, root_of, schedule_mutation_delivery, select_error,
     set_attribute_node, set_character_data, sibling_value, string_value, throw_dom,
     throw_dom_error, touch_attr, tree_order, valid_attribute_local_name, validate_and_extract,
-    webidl_to_string, with_node_kind, world, world_for_node, wrap_new_document, wrap_node,
+    with_node_kind, world, world_for_node, wrap_new_document, wrap_node,
 };
 use rquickjs::function::Rest;
 
@@ -695,11 +695,6 @@ impl JsNode {
 
     // https://dom.spec.whatwg.org/#dom-document-createevent
     #[qjs(skip)]
-    fn create_event<'js>(&self, ctx: Ctx<'js>, interface: Value<'js>) -> Result<Value<'js>> {
-        let interface = webidl_to_string(&ctx, interface)?;
-        events::create_event(&ctx, &interface)
-    }
-
     #[qjs(skip)]
     fn create_element<'js>(&self, ctx: Ctx<'js>, tag: WebIdlString) -> Result<Value<'js>> {
         create_html_element(&ctx, self.handle.0, &tag.0)
@@ -960,6 +955,88 @@ impl JsNode {
     #[qjs(skip)]
     fn body<'js>(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
         document_value(ctx, self.handle.0, |parsed| document_first(parsed, "body"))
+    }
+
+    // https://html.spec.whatwg.org/multipage/dom.html#dom-document-body
+    #[qjs(skip)]
+    fn set_body<'js>(&self, ctx: &Ctx<'js>, value: Value<'js>) -> Result<()> {
+        // A string or other non-node throws, like any interface conversion.
+        let Some(id) = host_node_id(ctx, &value) else {
+            return Err(Exception::throw_type(ctx, "body must be an element"));
+        };
+        let is_body = with_node_kind(ctx, id, |kind| {
+            matches!(
+                kind,
+                Some(NodeKind::Element { name, .. })
+                    if name.ns == html_namespace()
+                        && (name.local.as_ref() == "body" || name.local.as_ref() == "frameset")
+            )
+        })?;
+        if !is_body {
+            return Err(throw_dom(
+                ctx,
+                "HierarchyRequestError",
+                "body must be a body or frameset element",
+            ));
+        }
+        let world_rc = world(ctx)?;
+        let root_element = {
+            let world = world_rc.borrow();
+            let Some(parsed) = world.document(self.handle.0) else {
+                return Err(Exception::throw_type(ctx, "stale node"));
+            };
+            document_first_child(&parsed, |kind| {
+                matches!(kind, NodeKind::Element { .. })
+            })
+        };
+        let Some(root_element) = root_element else {
+            return Err(throw_dom(
+                ctx,
+                "HierarchyRequestError",
+                "document has no document element",
+            ));
+        };
+        let current = {
+            let world = world_rc.borrow();
+            let Some(parsed) = world.document(self.handle.0) else {
+                return Err(Exception::throw_type(ctx, "stale node"));
+            };
+            parsed
+                .document
+                .children(root_element)
+                .into_iter()
+                .flatten()
+                .find(|&child| {
+                    parsed.document.kind(child).is_some_and(|kind| {
+                        matches!(
+                            kind,
+                            NodeKind::Element { name, .. }
+                                if name.ns == html_namespace()
+                                    && (name.local.as_ref() == "body"
+                                        || name.local.as_ref() == "frameset")
+                        )
+                    })
+                })
+        };
+        if current == Some(id) {
+            return Ok(());
+        }
+        let node = adopt_across_documents(ctx, self.handle.0, id)?;
+        let world = world_rc.borrow();
+        let Some(mut parsed) = world.document_mut(self.handle.0) else {
+            return Err(Exception::throw_type(ctx, "no document"));
+        };
+        if let Some(current) = current {
+            dom::mutation::replace_child(&mut parsed.document, root_element, node, current)
+                .map_err(|error| throw_dom_error(ctx, error))?;
+            fixup_focus_after_removal(ctx, current)?;
+        } else {
+            dom::mutation::append(&mut parsed.document, root_element, node)
+                .map_err(|error| throw_dom_error(ctx, error))?;
+        }
+        drop(parsed);
+        drop(world);
+        schedule_mutation_delivery(ctx)
     }
 
     // https://html.spec.whatwg.org/multipage/dom.html#dom-document-head
@@ -3904,6 +3981,360 @@ impl<'js> element_css_inline_style_generated::ElementCSSInlineStyle<'js> for JsN
     // https://drafts.csswg.org/cssom/#dom-elementcssinlinestyle-style
     fn get_style(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
         self.style(ctx)
+    }
+}
+
+impl<'js> document_generated::Document<'js> for JsNode {
+    // https://dom.spec.whatwg.org/#dom-document-implementation
+    fn get_implementation(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
+        self.implementation(ctx)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-document-documentelement
+    fn get_document_element(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
+        self.document_element(ctx)
+    }
+
+    // https://html.spec.whatwg.org/multipage/dom.html#dom-document-body
+    fn get_body(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
+        self.body(ctx)
+    }
+
+    // https://html.spec.whatwg.org/multipage/dom.html#dom-document-body
+    fn set_body(&self, ctx: &Ctx<'js>, value: Value<'js>) -> Result<()> {
+        self.set_body(ctx, value)
+    }
+
+    // https://html.spec.whatwg.org/multipage/dom.html#dom-document-head
+    fn get_head(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
+        self.head(ctx)
+    }
+
+    // https://html.spec.whatwg.org/multipage/dom.html#dom-document-currentscript
+    fn get_current_script(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
+        self.current_script(ctx)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-document-doctype
+    fn get_doctype(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
+        self.doctype(ctx)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-document-documenturi
+    fn get_document_uri(&self, ctx: &Ctx<'js>) -> Result<dom::DomString> {
+        self.document_uri(ctx)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-document-url
+    fn get_url(&self, ctx: &Ctx<'js>) -> Result<dom::DomString> {
+        self.url(ctx)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-document-compatmode
+    fn get_compat_mode(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
+        let mode = self.compat_mode(ctx)?;
+        rquickjs::String::from_str(ctx.clone(), &mode)
+    }
+
+    // https://encoding.spec.whatwg.org/#dom-document-characterset
+    fn get_character_set(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
+        let set = self.character_set(ctx)?;
+        rquickjs::String::from_str(ctx.clone(), set)
+    }
+
+    // https://encoding.spec.whatwg.org/#dom-document-charset
+    fn get_charset(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
+        let set = self.charset(ctx)?;
+        rquickjs::String::from_str(ctx.clone(), set)
+    }
+
+    // https://encoding.spec.whatwg.org/#dom-document-inputencoding
+    fn get_input_encoding(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
+        let encoding = self.input_encoding(ctx)?;
+        rquickjs::String::from_str(ctx.clone(), encoding)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-document-contenttype
+    fn get_content_type(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
+        let content_type = self.content_type(ctx)?;
+        rquickjs::String::from_str(ctx.clone(), content_type)
+    }
+
+    // https://html.spec.whatwg.org/multipage/dom.html#dom-document-readystate
+    fn get_ready_state(
+        &self,
+        ctx: &Ctx<'js>,
+    ) -> Result<document_generated::DocumentReadyState> {
+        Ok(match self.ready_state(ctx)?.as_str() {
+            "interactive" => document_generated::DocumentReadyState::Interactive,
+            "complete" => document_generated::DocumentReadyState::Complete,
+            _ => document_generated::DocumentReadyState::Loading,
+        })
+    }
+
+    // https://html.spec.whatwg.org/multipage/nav-history-apis.html#dom-document-defaultview
+    fn get_default_view(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
+        self.default_view(ctx)
+    }
+
+    // https://html.spec.whatwg.org/multipage/nav-history-apis.html#dom-document-location
+    fn get_location(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
+        self.location(ctx)
+    }
+
+    // https://html.spec.whatwg.org/multipage/interaction.html#dom-document-hasfocus
+    fn has_focus(&self, ctx: Ctx<'js>) -> Result<bool> {
+        self.has_focus(ctx)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-document-activeelement
+    fn get_active_element(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
+        self.active_element(ctx)
+    }
+
+    // https://html.spec.whatwg.org/multipage/dom.html#dom-document-title
+    fn get_title(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
+        self.title(ctx)
+    }
+
+    // https://html.spec.whatwg.org/multipage/dom.html#dom-document-title
+    fn set_title(&self, ctx: &Ctx<'js>, value: rquickjs::String<'js>) -> Result<()> {
+        // `document.title` keeps every code unit, including lone surrogates.
+        self.set_title(
+            ctx,
+            WebIdlCodeUnits(dom::DomString::from_utf16(value.to_utf16()?)),
+        )
+    }
+
+    // https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-document-write
+    fn write(&self, ctx: Ctx<'js>, arg_0: Vec<rquickjs::String<'js>>) -> Result<()> {
+        let mut text = Vec::with_capacity(arg_0.len());
+        for part in arg_0 {
+            text.push(WebIdlString(part.to_string()?));
+        }
+        self.write(ctx, text)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-document-getelementsbyclassname
+    fn get_elements_by_class_name(
+        &self,
+        ctx: Ctx<'js>,
+        arg_0: rquickjs::String<'js>,
+    ) -> Result<Value<'js>> {
+        self.get_elements_by_class_name(ctx, WebIdlString(arg_0.to_string()?))
+    }
+
+    // https://dom.spec.whatwg.org/#dom-document-createevent
+    fn create_event(
+        &self,
+        ctx: Ctx<'js>,
+        arg_0: rquickjs::String<'js>,
+    ) -> Result<Value<'js>> {
+        let interface = arg_0.to_string()?;
+        events::create_event(&ctx, &interface)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-document-createelement
+    fn create_element(
+        &self,
+        ctx: Ctx<'js>,
+        arg_0: rquickjs::String<'js>,
+        _options: document_generated::DOMStringOrElementCreationOptions,
+    ) -> Result<Value<'js>> {
+        self.create_element(ctx, WebIdlString(arg_0.to_string()?))
+    }
+
+    // https://dom.spec.whatwg.org/#dom-document-createelementns
+    fn create_element_ns(
+        &self,
+        ctx: Ctx<'js>,
+        arg_0: Option<rquickjs::String<'js>>,
+        arg_1: rquickjs::String<'js>,
+        _options: document_generated::DOMStringOrElementCreationOptions,
+    ) -> Result<Value<'js>> {
+        self.create_element_ns(
+            ctx,
+            OptString(arg_0.map(|name| name.to_string()).transpose()?),
+            WebIdlString(arg_1.to_string()?),
+        )
+    }
+
+    // https://dom.spec.whatwg.org/#dom-document-createtextnode
+    fn create_text_node(
+        &self,
+        ctx: Ctx<'js>,
+        arg_0: rquickjs::String<'js>,
+    ) -> Result<Value<'js>> {
+        self.create_text_node(
+            ctx,
+            WebIdlCodeUnits(dom::DomString::from_utf16(arg_0.to_utf16()?)),
+        )
+    }
+
+    // https://dom.spec.whatwg.org/#dom-document-createcomment
+    fn create_comment(
+        &self,
+        ctx: Ctx<'js>,
+        arg_0: rquickjs::String<'js>,
+    ) -> Result<Value<'js>> {
+        self.create_comment(
+            ctx,
+            WebIdlCodeUnits(dom::DomString::from_utf16(arg_0.to_utf16()?)),
+        )
+    }
+
+    // https://dom.spec.whatwg.org/#dom-document-createprocessinginstruction
+    fn create_processing_instruction(
+        &self,
+        ctx: Ctx<'js>,
+        arg_0: rquickjs::String<'js>,
+        arg_1: rquickjs::String<'js>,
+    ) -> Result<Value<'js>> {
+        self.create_processing_instruction(
+            ctx,
+            WebIdlString(arg_0.to_string()?),
+            WebIdlCodeUnits(dom::DomString::from_utf16(arg_1.to_utf16()?)),
+        )
+    }
+
+    // https://dom.spec.whatwg.org/#dom-document-createcdatasection
+    fn create_cdata_section(
+        &self,
+        ctx: Ctx<'js>,
+        arg_0: rquickjs::String<'js>,
+    ) -> Result<Value<'js>> {
+        self.create_cdata_section(
+            ctx,
+            WebIdlCodeUnits(dom::DomString::from_utf16(arg_0.to_utf16()?)),
+        )
+    }
+
+    // https://dom.spec.whatwg.org/#dom-document-createattribute
+    fn create_attribute(
+        &self,
+        ctx: Ctx<'js>,
+        arg_0: rquickjs::String<'js>,
+    ) -> Result<Value<'js>> {
+        self.create_attribute(ctx, WebIdlString(arg_0.to_string()?))
+    }
+
+    // https://dom.spec.whatwg.org/#dom-document-createattributens
+    fn create_attribute_ns(
+        &self,
+        ctx: Ctx<'js>,
+        arg_0: Option<rquickjs::String<'js>>,
+        arg_1: rquickjs::String<'js>,
+    ) -> Result<Value<'js>> {
+        self.create_attribute_ns(
+            ctx,
+            OptString(arg_0.map(|name| name.to_string()).transpose()?),
+            WebIdlString(arg_1.to_string()?),
+        )
+    }
+
+    // https://dom.spec.whatwg.org/#dom-document-createdocumentfragment
+    fn create_document_fragment(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
+        self.create_document_fragment(ctx)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-document-importnode
+    fn import_node(
+        &self,
+        ctx: Ctx<'js>,
+        arg_0: NodeReference,
+        arg_1: document_generated::BooleanOrImportNodeOptions,
+    ) -> Result<Value<'js>> {
+        // `ImportNodeOptions` inverts the boolean form: selecting only the
+        // node itself is a shallow import.
+        let deep = match arg_1 {
+            document_generated::BooleanOrImportNodeOptions::Boolean(deep) => deep,
+            document_generated::BooleanOrImportNodeOptions::ImportNodeOptions(options) => {
+                !options.self_only
+            }
+        };
+        let node = match arg_0 {
+            NodeReference::Tree(id) => wrap_node(&ctx, id)?,
+            NodeReference::Attribute { id, .. } => attr_wrapper(&ctx, id)?,
+        };
+        self.import_node(ctx, node, deep)
+    }
+
+    // https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-document-open
+    // Both arguments are ignored upstream; the navigation overload stays
+    // absent with the rest of navigation.
+    fn open(
+        &self,
+        ctx: Ctx<'js>,
+        _arg_0: Option<rquickjs::String<'js>>,
+        _arg_1: Option<rquickjs::String<'js>>,
+    ) -> Result<Value<'js>> {
+        self.open_document(ctx)
+    }
+
+    // https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-document-close
+    fn close(&self, ctx: Ctx<'js>) -> Result<()> {
+        self.close_document(ctx)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-nonelementparentnode-getelementbyid
+    fn get_element_by_id(
+        &self,
+        ctx: Ctx<'js>,
+        arg_0: rquickjs::String<'js>,
+    ) -> Result<Value<'js>> {
+        self.get_element_by_id(ctx, WebIdlString(arg_0.to_string()?))
+    }
+
+    // https://dom.spec.whatwg.org/#dom-document-getelementsbytagname
+    fn get_elements_by_tag_name(
+        &self,
+        ctx: Ctx<'js>,
+        arg_0: rquickjs::String<'js>,
+    ) -> Result<Value<'js>> {
+        self.get_elements_by_tag_name(ctx, WebIdlString(arg_0.to_string()?))
+    }
+
+    // https://dom.spec.whatwg.org/#dom-document-getelementsbytagnamens
+    fn get_elements_by_tag_name_ns(
+        &self,
+        ctx: Ctx<'js>,
+        arg_0: Option<rquickjs::String<'js>>,
+        arg_1: rquickjs::String<'js>,
+    ) -> Result<Value<'js>> {
+        self.get_elements_by_tag_name_ns(
+            ctx,
+            OptString(arg_0.map(|name| name.to_string()).transpose()?),
+            WebIdlString(arg_1.to_string()?),
+        )
+    }
+
+    // https://html.spec.whatwg.org/multipage/dom.html#dom-document-getelementsbyname
+    fn get_elements_by_name(
+        &self,
+        ctx: Ctx<'js>,
+        arg_0: rquickjs::String<'js>,
+    ) -> Result<Value<'js>> {
+        self.get_elements_by_name(ctx, WebIdlString(arg_0.to_string()?))
+    }
+
+    // https://drafts.csswg.org/cssom-view/#dom-document-elementfrompoint
+    fn element_from_point(
+        &self,
+        ctx: Ctx<'js>,
+        arg_0: f64,
+        arg_1: f64,
+    ) -> Result<Value<'js>> {
+        self.element_from_point(ctx, arg_0, arg_1)
+    }
+
+    // https://drafts.csswg.org/cssom-view/#dom-document-elementsfrompoint
+    fn elements_from_point(
+        &self,
+        ctx: Ctx<'js>,
+        arg_0: f64,
+        arg_1: f64,
+    ) -> Result<Vec<Value<'js>>> {
+        self.elements_from_point(ctx, arg_0, arg_1)
     }
 }
 
