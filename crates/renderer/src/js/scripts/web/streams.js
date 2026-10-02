@@ -52,11 +52,5 @@ globalThis.ReadableStream = class ReadableStream {
     if (data.cancel !== null) return Promise.resolve(__tbApply(data.cancel, data.source, [reason]));
     return Promise.resolve();
   }
-  pipeThrough(transform) {
-    if (!transform || !transform.readable || !transform.writable) {
-      throw new TypeError('transform is not a readable/writable pair');
-    }
-    return transform.readable;
-  }
 };
 Object.defineProperty(globalThis.ReadableStream.prototype, Symbol.toStringTag, { value: 'ReadableStream', writable: false, enumerable: false, configurable: true });

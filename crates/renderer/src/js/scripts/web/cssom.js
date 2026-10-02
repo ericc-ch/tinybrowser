@@ -228,14 +228,9 @@
   Object.defineProperty(globalThis, 'matchMedia', {
     value: function(media) {
       return {
-        media: String(media), matches: __tbMediaQueryList(media), onchange: null,
-        addEventListener() {}, removeEventListener() {},
-        addListener() {}, removeListener() {}, dispatchEvent() { return true; },
+        media: String(media), matches: __tbMediaQueryList(media),
       };
     },
     writable: true, configurable: true,
-  });
-  Object.defineProperty(HTMLElement.prototype, 'scrollTo', {
-    value: function() {}, writable: true, configurable: true, enumerable: true,
   });
 }

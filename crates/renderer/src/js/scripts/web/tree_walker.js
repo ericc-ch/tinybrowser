@@ -72,18 +72,4 @@
     },
     writable: true, configurable: true, enumerable: true,
   });
-  const selection = {
-    anchorNode: null, anchorOffset: 0, focusNode: null, focusOffset: 0,
-    isCollapsed: true, rangeCount: 0, type: 'None',
-    getRangeAt() { throw new DOMException('no range at index', 'IndexSizeError'); },
-    removeAllRanges() {}, addRange() {}, collapse() {},
-    toString() { return ''; },
-  };
-  Object.defineProperty(Document.prototype, 'getSelection', {
-    value: function() { return selection; },
-    writable: true, configurable: true, enumerable: true,
-  });
-  Object.defineProperty(globalThis, 'getSelection', {
-    value: function() { return selection; }, writable: true, configurable: true,
-  });
 }

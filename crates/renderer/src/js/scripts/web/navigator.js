@@ -93,7 +93,6 @@
       if (globalThis.isSecureContext === false) return undefined;
       return userAgentData;
     }
-    sendBeacon() { return false; }
   }
   Object.defineProperty(globalThis, 'NavigatorUAData', {
     value: NavigatorUAData, writable: true, configurable: true,
