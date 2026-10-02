@@ -421,12 +421,11 @@ fn indexed_property_hooks(interface: &Interface) -> TokenStream {
         .find(|attribute| attribute.name == "length")
         .expect("validated indexed length")
         .rust;
-    let item = &interface
+    let item = interface
         .operations
         .iter()
         .find(|operation| operation.getter == Some(PropertyGetter::Indexed))
-        .expect("validated indexed item")
-        .rust;
+        .expect("validated indexed item");
     let named = NamedHooks::parse(interface);
     let object = match &interface.properties {
         PropertyHooks::IndexedNamed {
@@ -531,7 +530,7 @@ impl SetterTokens {
 
 fn indexed_hooks_body(
     length: &proc_macro2::Ident,
-    item: &proc_macro2::Ident,
+    item: &Operation,
     setter: Option<&crate::model::IndexedSetter>,
     hooks: &NamedHooks,
     object: &proc_macro2::Ident,
@@ -552,7 +551,7 @@ fn indexed_hooks_body(
 
 fn indexed_hooks_with_tokens(
     length: &proc_macro2::Ident,
-    item: &proc_macro2::Ident,
+    item: &Operation,
     tokens: &SetterTokens,
     hooks: &NamedHooks,
     object: &proc_macro2::Ident,
@@ -573,6 +572,15 @@ fn indexed_hooks_with_tokens(
     let set_receiver = &tokens.set_receiver;
     let set_value = &tokens.set_value;
     let indexed_set = &tokens.indexed_set;
+    let method = &item.rust;
+    let value = if matches!(item.result, OperationResult::NullableString) {
+        quote! {
+            let value = receiver.#method(ctx.clone(), index)?
+                .map_or_else(|| Value::new_null(ctx.clone()), rquickjs::String::into_value);
+        }
+    } else {
+        quote! { let value = rquickjs::IntoJs::into_js(receiver.#method(ctx.clone(), index)?, ctx)?; }
+    };
     quote! {
         const KIND: rquickjs::class::ClassKind = rquickjs::class::ClassKind::Exotic;
         const EXOTIC_HOOKS: rquickjs::class::ExoticHooks = rquickjs::class::ExoticHooks {
@@ -589,7 +597,7 @@ fn indexed_hooks_with_tokens(
             let receiver = this.borrow();
             let Some(index) = crate::js::bindings::array_index(&name) else { #descriptor };
             if index as usize >= receiver.#length(ctx)? { return Ok(None); }
-            let value = receiver.#item(ctx.clone(), index)?;
+            #value
             Ok(Some(rquickjs::class::PropertyDescriptor::new_value(value, true, true, #writable)))
         }
 
@@ -848,6 +856,9 @@ fn operation_dispatch(id: usize, operation: &Operation) -> TokenStream {
         },
         OperationResult::String => quote! {
             #call.map(rquickjs::String::into_value)
+        },
+        OperationResult::NullableString => quote! {
+            #call.map(|value| value.map_or_else(|| Value::new_null(ctx.clone()), rquickjs::String::into_value))
         },
         OperationResult::Boolean => quote! {
             let result: bool = #call?;

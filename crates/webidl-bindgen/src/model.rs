@@ -104,6 +104,7 @@ pub(crate) enum OperationResult {
     StringSequence,
     /// The method returns `rquickjs::String<'js>`.
     String,
+    NullableString,
     Boolean,
     UnsignedShort,
     Long,

@@ -223,14 +223,13 @@ fn lower(
 ) -> Result<model::Interface, Error> {
     let declaration = database.interface(&implementation.interface)?;
     validate_interface_attributes(declaration.attributes.as_ref())?;
-    let parent = if let Some(parent) = declaration.parent {
-        Some(PrototypeParent::Interface(parent.into()))
-    } else if declaration.name == "DOMException" {
-        // https://webidl.spec.whatwg.org/#js-DOMException-specialness
-        Some(PrototypeParent::Intrinsic("Error".into()))
-    } else {
-        None
-    };
+    // https://webidl.spec.whatwg.org/#js-DOMException-specialness
+    let parent = declaration
+        .parent
+        .map(|parent| PrototypeParent::Interface(parent.into()))
+        .or_else(|| {
+            (declaration.name == "DOMException").then(|| PrototypeParent::Intrinsic("Error".into()))
+        });
     let mut interface = model::Interface {
         name: declaration.name.into(),
         rust: implementation.payload.clone(),
@@ -253,6 +252,17 @@ fn lower(
         ctx_mode: CtxMode::Borrowed,
         contract: None,
     };
+    interface.contract = Some(lower_members(database, &declaration, implementation, &mut interface)?);
+    add_referenced_definitions(database, &mut interface)?;
+    Ok(interface)
+}
+
+fn lower_members(
+    database: &Database<'_>,
+    declaration: &crate::database::Interface<'_>,
+    implementation: &Implementation,
+    interface: &mut model::Interface,
+) -> Result<TokenStream, Error> {
     let mut remaining = implementation.methods.clone();
     let mut methods = Vec::new();
     let mut getters = Vec::new();
@@ -289,6 +299,16 @@ fn lower(
                 if let Some(model::Setter::Method { rust, .. }) = &attribute.setter {
                     remaining.remove(&rust.to_string());
                 }
+                if matches!(
+                    member.modifier,
+                    Some(weedle::interface::StringifierOrInheritOrStatic::Stringifier(_))
+                ) && interface
+                    .stringifier
+                    .replace(interface.attributes.len())
+                    .is_some()
+                {
+                    return Err(Error("multiple stringifiers are not supported".into()));
+                }
                 methods.push(signature);
                 interface.attributes.push(attribute);
             }
@@ -314,12 +334,10 @@ fn lower(
         }
     }
     interface.properties =
-        infer_property_hooks(&declaration, &getters, &mut remaining, &mut methods)?;
-    ensure_no_extra_methods(&declaration, &remaining)?;
-    add_referenced_definitions(database, &mut interface)?;
+        infer_property_hooks(declaration, &getters, &mut remaining, &mut methods)?;
+    ensure_no_extra_methods(declaration, &remaining)?;
     let name = format_ident!("{}", declaration.name);
-    interface.contract = Some(quote! { pub(super) trait #name<'js> { #(#methods)* } });
-    Ok(interface)
+    Ok(quote! { pub(super) trait #name<'js> { #(#methods)* } })
 }
 
 /// Reject implementation methods that no IDL member consumed.
@@ -587,6 +605,9 @@ fn lower_operation(
             parameter,
             arity,
         } = lower_argument(database, argument)?;
+        if arity == ArgumentArity::Variadic && index + 1 != member.args.body.list.len() {
+            return Err(Error("variadic arguments must be last".into()));
+        }
         if optional_seen && arity == ArgumentArity::Required {
             return Err(Error(
                 "native required argument after an optional one is not supported yet".into(),
@@ -638,10 +659,25 @@ fn lower_argument(
     database: &Database<'_>,
     argument: &weedle::argument::Argument<'_>,
 ) -> Result<LoweredArgument, Error> {
-    let Argument::Single(argument) = argument else {
-        return Err(Error(
-            "native variadic operations are not supported yet".into(),
-        ));
+    let argument = match argument {
+        Argument::Single(argument) => argument,
+        Argument::Variadic(argument) => {
+            validate_empty_attributes(argument.attributes.as_ref())?;
+            let type_ = native_type(database, &argument.type_, &mut BTreeSet::new())?;
+            let element = argument_parameter(&type_, ArgumentArity::Required, None)?;
+            return Ok(LoweredArgument {
+                argument: model::OperationArgument {
+                    type_,
+                    arity: ArgumentArity::Variadic,
+                    null_default: false,
+                    legacy_null_to_empty: false,
+                    boolean_default: None,
+                    from_js: None,
+                },
+                parameter: quote! { Vec<#element> },
+                arity: ArgumentArity::Variadic,
+            });
+        }
     };
     validate_argument_attributes(argument.attributes.as_ref())?;
     validate_argument_attributes(argument.type_.attributes.as_ref())?;
@@ -768,6 +804,10 @@ fn operation_result(
                 ReturnType::String => {
                     Ok((OperationResult::String, quote! { rquickjs::String<'js> }))
                 }
+                ReturnType::NullableString => Ok((
+                    OperationResult::NullableString,
+                    quote! { Option<rquickjs::String<'js>> },
+                )),
                 ReturnType::Boolean => Ok((OperationResult::Boolean, quote! { bool })),
                 ReturnType::UnsignedShort => Ok((OperationResult::UnsignedShort, quote! { u16 })),
                 ReturnType::Long => Ok((OperationResult::Long, quote! { i32 })),
@@ -817,7 +857,12 @@ fn lower_attribute(
             member.identifier.0
         )));
     }
-    if member.modifier.is_some() {
+    if member.modifier.is_some()
+        && !matches!(
+            member.modifier,
+            Some(weedle::interface::StringifierOrInheritOrStatic::Stringifier(_))
+        )
+    {
         return Err(Error(
             "native special attributes are not supported yet".into(),
         ));
@@ -835,6 +880,11 @@ fn lower_attribute(
         | ReturnType::NullableDocumentType => ReturnType::PlatformObject,
         type_ => type_,
     };
+    if member.modifier.is_some() && !matches!(type_, ReturnType::String) {
+        return Err(Error(
+            "native attribute stringifiers require DOMString".into(),
+        ));
+    }
     let result = match type_ {
         ReturnType::String => quote! { rquickjs::String<'js> },
         ReturnType::NullableString => quote! { Option<rquickjs::String<'js>> },

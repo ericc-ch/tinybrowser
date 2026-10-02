@@ -29,19 +29,14 @@ pub struct JsTokenList {
 
 include!(concat!(env!("OUT_DIR"), "/DOMTokenList.rs"));
 
-#[allow(
-    clippy::needless_pass_by_value,
-    clippy::unused_self,
-    reason = "generated dispatch passes Ctx by value and invokes operations on the receiver"
-)]
-impl JsTokenList {
+impl<'js> dom_token_list_generated::DOMTokenList<'js> for JsTokenList {
     // https://dom.spec.whatwg.org/#dom-domtokenlist-length
-    fn length(&self, ctx: &Ctx<'_>) -> Result<usize> {
+    fn get_length(&self, ctx: &Ctx<'js>) -> Result<usize> {
         Ok(class_tokens(ctx, self.element.0)?.len())
     }
 
     // https://dom.spec.whatwg.org/#dom-domtokenlist-value
-    fn value<'js>(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
+    fn get_value(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
         let world = world(ctx)?;
         let value = world
             .borrow()
@@ -51,38 +46,43 @@ impl JsTokenList {
         rquickjs::String::from_str(ctx.clone(), &value)
     }
 
-    fn set_value(&self, ctx: &Ctx<'_>, value: WebIdlString) -> Result<()> {
-        write_class(ctx, self.element.0, &value.0)
+    fn set_value(&self, ctx: &Ctx<'js>, value: rquickjs::String<'js>) -> Result<()> {
+        write_class(ctx, self.element.0, &value.to_string()?)
     }
 
     // https://dom.spec.whatwg.org/#dom-domtokenlist-item
-    fn item<'js>(&self, ctx: Ctx<'js>, index: u32) -> Result<Value<'js>> {
+    fn item(&self, ctx: Ctx<'js>, index: u32) -> Result<Option<rquickjs::String<'js>>> {
         let tokens = class_tokens(&ctx, self.element.0)?;
         match usize::try_from(index)
             .ok()
             .and_then(|index| tokens.get(index))
         {
-            Some(token) => string_value(&ctx, token),
-            None => Ok(Value::new_null(ctx)),
+            Some(token) => rquickjs::String::from_str(ctx, token).map(Some),
+            None => Ok(None),
         }
     }
 
     // https://dom.spec.whatwg.org/#dom-domtokenlist-contains
-    fn contains(&self, ctx: Ctx<'_>, token: WebIdlString) -> Result<bool> {
+    fn contains(&self, ctx: Ctx<'js>, token: rquickjs::String<'js>) -> Result<bool> {
         // `contains` does not validate its argument
         // (<https://dom.spec.whatwg.org/#dom-domtokenlist-contains>).
-        Ok(class_tokens(&ctx, self.element.0)?.contains(&token.0))
+        let token = token.to_string()?;
+        Ok(class_tokens(&ctx, self.element.0)?.contains(&token))
     }
 
     // https://dom.spec.whatwg.org/#dom-domtokenlist-add
-    fn add(&self, ctx: Ctx<'_>, tokens: Vec<WebIdlString>) -> Result<()> {
+    fn add(&self, ctx: Ctx<'js>, tokens: Vec<rquickjs::String<'js>>) -> Result<()> {
+        let tokens = tokens
+            .iter()
+            .map(rquickjs::String::to_string)
+            .collect::<Result<Vec<_>>>()?;
         for token in &tokens {
-            validate_token(&ctx, &token.0)?;
+            validate_token(&ctx, token)?;
         }
         let mut current = class_tokens(&ctx, self.element.0)?;
         for token in tokens {
-            if !current.contains(&token.0) {
-                current.push(token.0);
+            if !current.contains(&token) {
+                current.push(token);
             }
         }
         // The update steps run even when no token was added, normalizing
@@ -91,28 +91,38 @@ impl JsTokenList {
     }
 
     // https://dom.spec.whatwg.org/#dom-domtokenlist-remove
-    fn remove(&self, ctx: Ctx<'_>, tokens: Vec<WebIdlString>) -> Result<()> {
+    fn remove(&self, ctx: Ctx<'js>, tokens: Vec<rquickjs::String<'js>>) -> Result<()> {
+        let tokens = tokens
+            .iter()
+            .map(rquickjs::String::to_string)
+            .collect::<Result<Vec<_>>>()?;
         for token in &tokens {
-            validate_token(&ctx, &token.0)?;
+            validate_token(&ctx, token)?;
         }
         let mut current = class_tokens(&ctx, self.element.0)?;
         for token in tokens {
-            current.retain(|existing| existing != &token.0);
+            current.retain(|existing| existing != &token);
         }
         write_class_tokens(&ctx, self.element.0, &current)
     }
 
     // https://dom.spec.whatwg.org/#dom-domtokenlist-toggle
-    fn toggle(&self, ctx: Ctx<'_>, token: WebIdlString, force: Option<bool>) -> Result<bool> {
-        validate_token(&ctx, &token.0)?;
+    fn toggle(
+        &self,
+        ctx: Ctx<'js>,
+        token: rquickjs::String<'js>,
+        force: Option<bool>,
+    ) -> Result<bool> {
+        let token = token.to_string()?;
+        validate_token(&ctx, &token)?;
         let mut current = class_tokens(&ctx, self.element.0)?;
-        let present = current.contains(&token.0);
+        let present = current.contains(&token);
         let should_be_present = force.unwrap_or(!present);
         if should_be_present != present {
             if should_be_present {
-                current.push(token.0);
+                current.push(token);
             } else {
-                current.retain(|existing| existing != &token.0);
+                current.retain(|existing| existing != &token);
             }
             write_class_tokens(&ctx, self.element.0, &current)?;
         }
@@ -120,15 +130,22 @@ impl JsTokenList {
     }
 
     // https://dom.spec.whatwg.org/#dom-domtokenlist-replace
-    fn replace(&self, ctx: Ctx<'_>, old: WebIdlString, new: WebIdlString) -> Result<bool> {
-        validate_token_pair(&ctx, &old.0, &new.0)?;
+    fn replace(
+        &self,
+        ctx: Ctx<'js>,
+        old: rquickjs::String<'js>,
+        new: rquickjs::String<'js>,
+    ) -> Result<bool> {
+        let old = old.to_string()?;
+        let new = new.to_string()?;
+        validate_token_pair(&ctx, &old, &new)?;
         let mut current = class_tokens(&ctx, self.element.0)?;
-        if !current.contains(&old.0) {
+        if !current.contains(&old) {
             return Ok(false);
         }
         for token in &mut current {
-            if token == &old.0 {
-                token.clone_from(&new.0);
+            if token == &old {
+                token.clone_from(&new);
             }
         }
         // Replacing can duplicate an existing token; the token set keeps the
@@ -144,7 +161,7 @@ impl JsTokenList {
     }
 
     // https://dom.spec.whatwg.org/#dom-domtokenlist-supports
-    fn supports(&self, ctx: Ctx<'_>, _token: WebIdlString) -> Result<bool> {
+    fn supports(&self, ctx: Ctx<'js>, _token: rquickjs::String<'js>) -> Result<bool> {
         // The spec ends with "throw a TypeError"
         // (<https://dom.spec.whatwg.org/#dom-domtokenlist-supports>).
         Err(Exception::throw_type(
