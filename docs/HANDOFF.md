@@ -1,196 +1,110 @@
 # Handoff (2026-10-02)
 
-Goal: Hide browser internals from page scripts while retaining the JS Web APIs.
-All shim-private state, CDP storage, and WebDriver helpers are in scope.
-Plan: Private initialization and callbacks, private object state, privileged-path
-hardening, then security tests, WPT comparisons, and shipping-size measurement.
-Finish when only intended APIs are reachable and the audited paths do not leak
-capabilities. Fix regressions before committing locally. Pushing is not authorized.
+Goal: replace implementation-shaped WebIDL with the unchanged, pinned upstream
+contract. Every Rust and JS binding derives names, inheritance, descriptors,
+arity, and conversions from that IDL. Delete the hand-written `Rust*` partial
+declarations and the parallel support lists as each interface migrates. Keep the
+private bridge hardening and the real partial implementations. See
+`docs/bindings.md` for the policy and `AGENTS.md` for the rules.
 
-## State
+Plan: finish the native contract path and the JS contract path, migrate the
+remaining `crates/renderer/idl/*.webidl` interfaces one at a time, then delete the
+legacy compiler and its inputs. Conformance comes from WPT, size from the
+release binary.
 
-- Branch `webidl-bindings`. HEAD is local-only; the branch is many commits
-  ahead of `origin/webidl-bindings`. Draft PR:
-  https://github.com/ericc-ch/tinybrowser/pull/39. Do not push without
-  authorization.
-- Engine forks: rquickjs `github.com/ericc-ch/rquickjs` (`third_party/rquickjs`
-  submodule, own workspace), QuickJS-NG `github.com/ericc-ch/quickjs` (nested
-  `sys/quickjs`). Upstream pulls happen inside the submodule, then the pointer is
-  bumped here. Fresh worktrees need
-  `git submodule update --init --recursive`.
-- Shipping binary is 8,697,592 bytes (`docs/progress.md`). Verify with
-  `nix develop --command ./tools/release`.
-- Last migration evidence (`/tmp/opencode/`): `before-domcore.json` vs
-  `after-domcore.json` over `dom/nodes`, `dom/collections`, `shadow-dom`,
-  `css/cssom-view`, `html/dom`, `domparsing` gives 749 FAIL-to-PASS, 38
-  MISSING-to-PASS, 1 ERROR-to-OK, and no `PASS`/`OK`-to-worse change; the
-  interrupted files include
-  (`shadow-dom/declarative/gethtml.html`, `html/dom/reflection-embedded.html`)
-  that the runner interrupts in both runs. Those reports also contain adverse
-  FAIL-to-MISSING changes. `before-forms.json` vs `after-forms.json` over
-  `html/semantics/forms` gives 2 FAIL-to-PASS. Both reports need focused retests
-  of adverse ERROR/TIMEOUT changes before claiming conformance is unchanged.
-- Verification harness: `tools/check` (clippy, embedded JS, rustdoc),
-  `cargo test --workspace`, the 30-case probe at
-  `/tmp/opencode/jsbinding-research/probe.py <binary>`, and before/after WPT via
-  `/tmp/opencode/jsbinding-research/compare-wpt.py BEFORE AFTER`. Playwright
-  (`tools/playwright/run`) and Blink CDP (`tools/cdp-tests/run`) honor
-  `TINYBROWSER_BINARY`.
+State: branch `webidl-bindings`, HEAD `df580b1`, working tree clean. The
+repo-local gates are green: `cargo test --workspace` and `tools/check` pass
+(log `~/.cache/tinybrowser/logs/element-gates.log`, 36 suites ok). No pushes.
+Draft PR https://github.com/ericc-ch/tinybrowser/pull/39 holds earlier work only.
 
-## Migrated (generated IDL modules)
+Done (this session):
 
-The whole native binding layer is generated. Every `JsNode` member is either a
-generated table entry or a `#[qjs(skip)]` platform method; no interface member
-is installed by `#[rquickjs::methods]` anymore.
+- `0bce44f` Reject scoped and unforgeable native members. Proof: generator tests
+  `unforgeable_and_scoped_native_members_fail_the_build`.
+- `f8dd676` Dispatch generated operations through their contract traits. Proof:
+  renderer builds; DOM WPT `Element-matches` 668 PASS.
+- `ec7859e` Generate JavaScript interface bindings from IDL contracts, including
+  the private installer and the `TextEncoder` migration. Proof: WPT focused run
+  `~/.cache/tinybrowser/logs/after-js-focused.json` moved 11 `encodeInto`
+  subtests FAIL to PASS with no regressions; generator tests; Playwright 37/37
+  (`js-contract-playwright.log`); CDP pass (`js-contract-cdp.log`).
+- `e5aa2c0` Remove nonfunctional API placeholders. Proof: WPT focused run above;
+  the only changes are the approved honesty losses in `/selection` and `/beacon`.
+- `df580b1` Migrate HTMLElement and SVGElement to their IDL contracts, plus
+  `getElementById("")` returns null. Proof: WPT
+  `~/.cache/tinybrowser/logs/after-element-contracts2.json` (both getElementById
+  files fully pass; dataset failures are pre-existing missing `DOMStringMap`).
 
-DOM: `Node`, `Document`, `DocumentFragment`, `Element`, `HTMLElement`,
-`SVGElement`, `MathMLElement`, `CharacterData`, `DocumentType`,
-`ProcessingInstruction`, `Attr`, `DocumentImplementation`, `DOMParser`,
-`XMLSerializer`, `EventTarget`, `Event`, `MutationObserver`, `MutationRecord`,
-`DOMTokenList`, `NamedNodeMap`, `NodeList`, `HTMLCollection`,
-`HTMLOptionsCollection`, `DOMException`.
+Earlier sessions (unchanged): `a21f8a9` IDL import, `064baa2` NodeList and
+HTMLCollection, `9adbb7b` MutationRecord, `4930cbc` parsing and observers,
+`02f9f7a` DOMTokenList, `fe0d197` shared node interfaces, `682d273` Attr.
 
-Mixins and shared groups: `ParentNode`, `ChildNode`,
-`NonDocumentTypeChildNode`, `ShadowRoot`, `ElementReflections` (the element-wide
-`name`/`href`/`src`/`content` reflections).
+Unfinished:
 
-HTML form controls and elements: `HTMLFormElement`, `HTMLInputElement`,
-`HTMLTextAreaElement`, `HTMLSelectElement`, `HTMLOptionElement`,
-`HTMLButtonElement`, `HTMLFieldSetElement`, `HTMLOptGroupElement`,
-`HTMLIFrameElement`, `HTMLImageElement`.
+- Every remaining `crates/renderer/idl/*.webidl` interface is blocked on a
+  generator feature. Pick one feature and land it with its consumer migration in
+  the same commit:
+  - `[Reflect]` / `[ReflectSetter]` handling (form elements, `ElementReflections`).
+    Today `contracts.rs::validate_attribute_attributes` rejects them. Decide
+    whether the generator emits the reflection algorithm (end goal) or treats the
+    extended attribute as metadata the implementation owns (intermediate).
+  - Union types (`Element`, `Document`, `Node`, `EventTarget`, `ParentNode`,
+    `ChildNode`, `DOMParser`).
+  - Interface-typed arguments, e.g. `NamedNodeMap.setNamedItem(Attr attr)`. Today
+    `argument_parameter` has no `ReturnType::PlatformObject` arm.
+  - Enum attributes, e.g. `ShadowRoot.mode` (`ShadowRootMode`). Today
+    `lower_attribute` and `emit::getter_dispatch` have no `ReturnType::Enumeration`
+    arm, and the enum type has no `IntoJs`.
+  - Interface-level metadata attributes such as `[LegacyFactoryFunction]` on
+    `HTMLImageElement`, rejected by `validate_interface_attributes`.
+- `brands.js` still carries hand-written per-interface member lists (a second
+  support list). Reduce them as interfaces move to contracts. Do not blanket
+  delete without checking that the list is not the only installer for a member.
+- `/selection` lost the fixed placeholder and now has no Selection at all. There
+  is no native `Selection` (grep in `crates/renderer/src`). Implement it as its
+  own feature, not a placeholder.
+- `docs/progress.md` still records 8,699,448 bytes from before this session. Only
+  update it after measuring a new release binary.
+- Older WPT comparisons (`before/after-domcore.json`, `before/after-forms.json`)
+  are in `/tmp/opencode`; move to `~/.cache/tinybrowser/logs` before `/tmp` is
+  cleared.
 
-## Private bridge
+Next:
 
-`crates/renderer/src/js/bridge.rs` passes a private host object to initialization
-closures. Rust retains that object in each World. `scripts/private_state.js`
-stores object state in shared weak maps owned by RealmRegistry. The shared
-factory runs in an inert context. Realm leases release the factory after the
-last realm drops. Author evaluation uses a separate global evaluator. CDP and
-WebDriver encode author code before passing it to that evaluator.
+1. Design `[Reflect]` support in the generator and verify against one form
+   element (`HTMLOptGroupElement` has a single `[CEReactions, Reflect] boolean
+   disabled`), then batch the rest.
+2. Add union support, starting with `(Node or DOMString)` for `ParentNode` and
+   `ChildNode`, then `Element` and `Document`.
+3. Add `ReturnType::PlatformObject` arguments for `NamedNodeMap`.
+4. Keep running `cargo test --workspace`, `tools/check`, and the targeted WPT
+   subset per migration. Measure the release binary at each larger checkpoint.
 
-Private lists use captured indexed operations and null-prototype descriptors.
-Private registries use captured collection operations. Blob bytes, decoder
-state, and XHR received bytes live in the inert context. Input delivery uses
-captured constructors and native trusted dispatch. Debugger metadata uses
-private tables and captured serialization. Shared Window identity covers realm
-globals and WindowProxy objects. Private array iterators retain terminal state.
+Decisions made:
 
-Verification for the shipping candidate:
+- Discovery is the implementation itself: `impl {interface}_generated::{Interface}
+  <'js> for Payload` for Rust, `__tbInstallInterface(class Interface { ... })`
+  for JS. No second checklist. Unsupported implemented semantics fail the build.
+- The IDL is never edited to fit code; reshape the implementation instead.
+- Generated dispatch calls the contract trait explicitly
+  (`Interface::method(receiver, ...)`) so shared payloads with same-named
+  inherent methods cannot shadow it.
+- JS results allocate in the receiver's realm via a per-instance realm token on
+  the shared brand slot.
+- Generated dictionaries allow unconsumed fields, since an algorithm may read a
+  subset of the declared members.
+- Nonfunctional placeholders are removed; feature detection must report them
+  unsupported.
 
-- `tools/check`: `/tmp/opencode/bridge-check.log`.
-- Workspace tests: `/tmp/opencode/bridge-tests.log`.
-- Playwright 37/37, including 22 bridge regressions:
-  `/tmp/opencode/bridge-shipping-playwright.log`.
-- Blink CDP 1/1: `/tmp/opencode/bridge-cdp.log`.
-- Read-only reviews found Window receiver routing and iterator exhaustion
-  regressions. Runtime regressions pass after the fixes. A missed Window-table
-  rename also passes the follow-up serialization check. The trusted-message
-  regression sends an object to cover that path.
-- Valgrind's JS ownership tests reported zero definite leaks and zero errors:
-  `/tmp/opencode/bridge-valgrind-js.log`. The full renderer report's definite
-  leaks trace to Stylo thread-local caches:
-  `/tmp/opencode/bridge-valgrind-full.log`.
-- Final WPT comparisons cover 417 files with no adverse status changes.
-  The 278 storage/event/URL/Blob/XHR/FileReader files have identical statuses.
-  The 139 messaging and structured-clone files have 7 harness TIMEOUT-to-OK,
-  5 subtest TIMEOUT-to-PASS, and 2 subtest NOTRUN-to-PASS changes. Report pairs
-  are `before-bridge-wpt.json` versus
-  `final-bridge-wpt.json`, and `before-bridge-messaging-wpt.json` versus
-  `after-bridge-messaging-wpt.json`, all in `/tmp/opencode/`. The additional XHR
-  and FileReader reports are `before-bridge-io-wpt.json` and
-  `after-bridge-io-wpt.json`. Comparison files are `bridge-wpt-changes.json`,
-  `bridge-io-wpt-changes.json`, and `bridge-messaging-wpt-changes.json`.
-  The runs still exit 1 because existing failures remain. These focused
-  comparisons do not establish full Web-platform conformance.
+Gotchas:
 
-## Remaining
-
-1. Audit existing Rust and JS bindings, then replace hand-maintained IDL partials
-   and embedded `Rust*` annotations with pinned upstream IDL inputs and
-   standardized generated implementation contracts. Use no explicit mapping
-   tables or per-member overrides. Derive supported members from implementations.
-   Resolve spec inheritance and mixins in the generator. Remove confirmed
-   nonfunctional placeholders and redundant binding boilerplate. Follow
-   `docs/bindings.md` for ownership and coverage rules. Verify each migration
-   stage with WPT before deleting the old input/compiler path.
-   Done: the input snapshot, cross-file resolver, and contract generator.
-   Migrated: `DOMException`, `NodeList`, `HTMLCollection`, `MutationRecord`.
-   The remaining native and JS interfaces still use `crates/renderer/idl/` and
-   the legacy compiler. The contract path currently lowers constructors with
-   `DOMString` arguments, readonly attributes of string, boolean, integer,
-   nullable-string, and platform-object types, indexed and named getters,
-   constants, and `[SameObject]`/`[LegacyUnforgeable]` attributes. The next
-   generator work is writable attributes, `[CEReactions]`, method arguments and
-   results, dictionaries, callbacks, enums, unions, sequences, and variadics.
-   Those are needed for `Event`, `EventTarget`, `MutationObserver`, the form
-   elements, and the rest. Interfaces that share the `JsNode` payload also need
-   partial-install support, because only one Rust type may implement `JsClass`.
-2. Resolve the older WebIDL-migration adverse status changes listed above before
-   claiming migration conformance is unchanged.
-3. Preexisting conformance gaps unrelated to the bridge: lossy Rust
-   `String` attribute/form storage, `Text.splitText`, `attachInternals`,
-   copied cross-document adoption, iframe `Window` identity, incomplete
-   iterator methods.
-4. `docs/progress.md` WPT totals are still the pre-migration overnight dump;
-   rerun the full scorer to refresh the scored groups.
-
-## Durable decisions
-
-- Build-time Rust codegen from renderer `build.rs`; no npm step. The imported
-  extracts under `crates/webidl-bindgen/idl/` are the surface. Generated modules
-  live in `OUT_DIR`. Implementation follows IDL; never edit imported IDL to
-  match code.
-- `webidl_bindgen::compile_contracts` discovers
-  `impl foo_generated::Foo<'js> for Payload` in `crates/renderer/src/js` and
-  lowers the matching imported interface, resolving partials, mixins, and
-  inheritance across files. Method names follow IDL: `constructor`,
-  `get_attribute`, `set_attribute`, and snake-case operation names. The
-  generated `pub(super) trait` checks each implementation signature when the
-  renderer compiles it. Implemented members the generator cannot emit fail the
-  build. No explicit mapping tables or per-member overrides.
-- The legacy path is still live for interfaces the contract path does not cover.
-  `crates/renderer/idl/` holds their hand-maintained partial declarations and
-  `Rust*` annotations: `[Rust=path]`, `[RustValue]`, `[RustFromJs=path]`,
-  `[RustSetFromJs=path]`, `[RustAlternate=Type]`,
-  `[RustPropertyHooks=Indexed|IndexedNamed|JavaScript]`,
-  `[RustSupportedNames=path]`, `[RustInstall="A,B"]` (mixin install targets),
-  and `[RustOwnedCtx]`. Delete each legacy file as its interface moves to the
-  imported extracts. `build.rs` rejects an interface with both bindings.
-- One shared `NativeFunc` `HostCall` per member. Distinct JS function objects,
-  one dispatch table per interface. Receiver downcast precedes arity and
-  conversion. Generated wrappers use `host::instance` or the node-associated
-  `host::instance_for_node` (document owner realm), never a runtime-wide
-  prototype cache.
-- `JsNode` is the single wrapper class for every node kind. `brands.js` builds
-  the JS interface prototypes by copying native descriptors from
-  `Node.prototype`, then each generated partial interface's `install()`
-  overwrites its own members. Marking a native method `#[qjs(skip)]` is what
-  removes it from the native prototype surface.
-- `RealmRegistry` owns the agent-wide attribute registry (globally issued ids,
-  attachment index, weak wrappers), mutation observers, custom-element reaction
-  queues, and document-owner routing. Adoption preserves creation scope and
-  wrapper identity.
-- `[CEReactions]` lowers to `reactions::with_reactions` around the platform
-  steps after argument conversion. Callback exceptions are reported; platform
-  exceptions keep identity.
-- Cross-document insertion materializes a copy; the shim upgrades the original
-  argument wrappers and preserves function length/name.
-- `dom::DomString` keeps exact UTF-16 code units and compacts ordinary Unicode
-  to UTF-8. Attribute values, form values, and `Text.splitText` still use Rust
-  `String`, so lone surrogates there are lossy.
-- Decisions live in commit messages.
-
-## Gotchas
-
-- Correct WPT invocation:
-  `TINYBROWSER_BINARY=<binary> nix develop --command tools/wpt/run --processes N
-  --log-wptreport OUT.json <dirs...>`, compare with `compare-wpt.py`.
-- Direct cargo and the runners build through `nix develop --command` (host shell
-  may lack `pkg-config`/OpenSSL). `tools/check` enters the shell itself.
-- Do not test web-platform behavior in cargo tests; that is WPT's job. When a
-  spec regression would only be caught by a cargo test, the missing WPT run is
-  the bug.
-- Never add handwritten `unsafe` in tinybrowser-owned code; the workspace denies
-  `unsafe_code`.
-- The rquickjs checkout's exported slice (one `MethodImplementor` impl per
-  class) is why all node kinds share `JsNode`.
+- One WPT run at a time: the runner serializes on a venv lock and the build
+  holds the Cargo target. The `/encoding` legacy multibyte files dominate runtime.
+- `cargo build` writes generated contracts to
+  `OUT_DIR`; `crates/renderer/src/js/blob.rs::blobs_round_trip` re-runs the JS
+  compiler on the bundle, so a generator change must keep it consistent.
+- The renderer lists each generated `install` by interface module name in
+  `crates/renderer/src/js/bindings/node.rs`; deleting a legacy IDL file without
+  adding the contract impl breaks that call.
+- The Sauce Demo Playwright case hits a live site and is occasionally flaky; it
+  passes on retry.
