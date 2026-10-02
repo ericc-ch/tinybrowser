@@ -64,9 +64,17 @@ Selection, matchMedia listeners.
 
 Each needs:
 
-- **Node** — no new generator features. Has `RustAlternate=JsAttr`, which the
-  contract path does not support; `Attr` already has its own contract, so drop
-  it. Port this next.
+- **Node** — has `RustAlternate=JsAttr` (drop it; `Attr` has its own
+  contract) **and** a blocker: `Node.webidl` also lists `addEventListener`,
+  `removeEventListener`, and `dispatchEvent` with `JsNode`-receiver dispatchers.
+  rquickjs brand-checks methods by defining class, so `JsNode` elements cannot
+  call `JsEventTarget.prototype`'s methods. The JS prototype chain
+  (`Node.prototype` -> `EventTarget.prototype`) is not enough. Porting `Node`
+  removes those dispatchers and breaks `element.addEventListener`. Resolve by
+  giving `EventTarget`'s contract install targets that include descendant
+  payload prototypes (`Node`), or by a general "install a base interface on a
+  second class payload" mechanism. The generator currently allows one impl per
+  interface trait, so this needs a design decision.
 - **Element** — `[PutForwards]` on contract attributes (`classList`),
   `(boolean or ScrollIntoViewOptions)` union (dictionary|boolean supported),
   `[LegacyNullToEmptyString]`.
@@ -119,12 +127,12 @@ Each needs:
 
 ## Next
 
-1. Port `Node` (trait `node_generated::Node` for `JsNode`), delete
-   `Node.webidl`, drop the `RustAlternate`.
+1. Design the base-interface/second-payload install for `EventTarget` so `Node`
+   can drop its duplicated listener dispatchers (see the Node bullet above).
+   Then port `EventTarget` (JsEventTarget) and `Node`, then `Event` with
+   `[LegacyUnforgeable]`, then add nullable callback arguments.
 2. Add `[PutForwards]` and port `Element`; then `Document`.
-3. Add nullable callback support and port `EventTarget` (JsEventTarget), then
-   `Event` with `[LegacyUnforgeable]`.
-4. `HTMLOptionsCollection` (nullable union + inherited hooks), `NamedNodeMap`
+3. `HTMLOptionsCollection` (nullable union + inherited hooks), `NamedNodeMap`
    (interface args + hooks), delete `ElementReflections`.
-5. Delete the legacy path and run full WPT; measure the release binary and
+4. Delete the legacy path and run full WPT; measure the release binary and
    update `docs/progress.md`.
