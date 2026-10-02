@@ -470,7 +470,7 @@ impl<'js> event_target_generated::EventTarget<'js> for JsNode {
 }
 
 /// The `addEventListener` options union as parsed listener options.
-fn listener_options(options: event_target_generated::AddEventListenerOptionsOrBoolean) -> ListenerOptions {
+pub(crate) fn listener_options(options: event_target_generated::AddEventListenerOptionsOrBoolean) -> ListenerOptions {
     match options {
         event_target_generated::AddEventListenerOptionsOrBoolean::Boolean(capture) => {
             ListenerOptions {
@@ -493,7 +493,7 @@ fn listener_options(options: event_target_generated::AddEventListenerOptionsOrBo
 
 /// `removeEventListener` reads only `capture`
 /// (<https://dom.spec.whatwg.org/#dom-eventtarget-removeeventlistener>).
-fn remove_capture(options: event_target_generated::BooleanOrEventListenerOptions) -> bool {
+pub(crate) fn remove_capture(options: event_target_generated::BooleanOrEventListenerOptions) -> bool {
     match options {
         event_target_generated::BooleanOrEventListenerOptions::Boolean(capture) => capture,
         event_target_generated::BooleanOrEventListenerOptions::EventListenerOptions(options) => {
@@ -1077,10 +1077,11 @@ fn build_path<'js>(
                 target: value,
             }])
         }
-        EventTargetKey::Standalone(_) => {
+        EventTargetKey::Attribute { .. } | EventTargetKey::Standalone(_) => {
             // https://dom.spec.whatwg.org/#get-the-parent
-            // A constructible `EventTarget` has no parent, so its event path
-            // is the target alone.
+            // https://dom.spec.whatwg.org/#interface-attr
+            // Attr's owner element is not its parent; Chromium's
+            // EventPath::CalculatePath likewise follows parentNode().
             let reference = EventTargetRef {
                 key: target,
                 world: target_world(ctx, target)?,
@@ -1246,7 +1247,7 @@ pub(super) fn report_exception(ctx: &Ctx<'_>, error: &rquickjs::Error) {
 /// `EventListener?` conversion: null and undefined become a null callback and
 /// any object is a callback interface value, whose `handleEvent` is looked up
 /// when invoked (<https://webidl.spec.whatwg.org/#es-callback-interface>).
-fn listener_callback<'js>(
+pub(crate) fn listener_callback<'js>(
     ctx: &Ctx<'js>,
     callback: Value<'js>,
 ) -> Result<Option<Persistent<Value<'static>>>> {
@@ -1366,7 +1367,7 @@ fn default_passive(ctx: &Ctx<'_>, typ: &str, target: EventTargetKey) -> Result<b
     }
     match target {
         EventTargetKey::Window => Ok(true),
-        EventTargetKey::Standalone(_) => Ok(false),
+        EventTargetKey::Attribute { .. } | EventTargetKey::Standalone(_) => Ok(false),
         EventTargetKey::Node(id) => {
             let world = bindings::world_for_node(ctx, id)?;
             let world = world.borrow();
@@ -1407,6 +1408,10 @@ fn signal_aborted(ctx: &Ctx<'_>, signal: &Persistent<Object<'static>>) -> bool {
 fn target_world(ctx: &Ctx<'_>, target: EventTargetKey) -> Result<Rc<RefCell<World>>> {
     match target {
         EventTargetKey::Node(id) => bindings::world_for_node(ctx, id),
+        EventTargetKey::Attribute { scope, id } => {
+            let state = bindings::attr_state(ctx, scope, id)?;
+            bindings::world_for_node(ctx, state.document)
+        }
         EventTargetKey::Window | EventTargetKey::Standalone(_) => bindings::world(ctx),
     }
 }
@@ -1428,6 +1433,7 @@ fn resolve_target<'js>(ctx: &Ctx<'js>, reference: &EventTargetRef) -> Result<Val
             None => Ok(ctx.globals().into_value()),
         },
         EventTargetKey::Node(id) => bindings::wrap_node(ctx, id),
+        EventTargetKey::Attribute { id, .. } => bindings::attr_wrapper(ctx, id),
         EventTargetKey::Standalone(id) => match reference.world.borrow().standalone_target(id) {
             Some(saved) => Ok(saved.restore(ctx)?.into_value()),
             None => Ok(Value::new_null(ctx.clone())),

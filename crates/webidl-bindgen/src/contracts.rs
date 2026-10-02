@@ -119,34 +119,76 @@ impl Implementation {
         Ok(())
     }
 
-    /// Choose the payload that owns the interface's prototype. A platform type
-    /// with no declared class needs one generated for it, so it is promoted
-    /// over an existing shared class (which only contributes an alternate arm).
-    fn promote(&mut self, classes: &BTreeSet<String>) {
-        if !classes.contains(&self.payload.to_string()) {
-            return;
-        }
-        let Some(index) = self
-            .payloads
-            .iter()
-            .position(|payload| !classes.contains(&payload.rust.to_string()))
-        else {
-            return;
+    /// Choose the payload that owns the interface's prototype. A declared
+    /// class named for the interface already provides it (brands.js copies
+    /// the native prototype when defining the global), so it is elected
+    /// however discovery ordered the implementations. Otherwise the single
+    /// class-less payload dedicated to this interface gets a generated
+    /// class; several dedicated class-less payloads with no name match is
+    /// ambiguous and fails the build.
+    fn elect(
+        &mut self,
+        classes: &BTreeMap<String, String>,
+        usage: &BTreeMap<String, usize>,
+        source: &str,
+    ) -> Result<(), Error> {
+        let named = |payload: &syn::Ident| {
+            classes.get(&payload.to_string()).is_some_and(|name| name == &self.interface)
         };
-        let promoted = self.payloads.remove(index);
-        let previous = std::mem::replace(&mut self.payload, promoted.rust);
-        let previous_lifetime = std::mem::replace(&mut self.lifetime, promoted.has_lifetime);
-        self.payloads.push(model::Payload {
-            rust: previous,
-            has_lifetime: previous_lifetime,
-        });
+        let dedicated = |payload: &syn::Ident| {
+            !classes.contains_key(&payload.to_string())
+                && usage.get(&payload.to_string()).is_some_and(|used| *used == 1)
+        };
+        if let Some(found) = std::iter::once(&self.payload)
+            .chain(self.payloads.iter().map(|payload| &payload.rust))
+            .position(named)
+        {
+            if found > 0 {
+                let elected = self.payloads.remove(found - 1);
+                let previous = std::mem::replace(&mut self.payload, elected.rust);
+                let previous_lifetime =
+                    std::mem::replace(&mut self.lifetime, elected.has_lifetime);
+                self.payloads.push(model::Payload {
+                    rust: previous,
+                    has_lifetime: previous_lifetime,
+                });
+            }
+            return Ok(());
+        }
+        let mut exclusive = std::iter::once(&self.payload)
+            .chain(self.payloads.iter().map(|payload| &payload.rust))
+            .filter(|payload| dedicated(payload));
+        let Some(first) = exclusive.next() else {
+            return Ok(());
+        };
+        if exclusive.next().is_some() {
+            return Err(Error(format!(
+                "{source}: {} has no prototype owner: several class-less payloads and none is named for the interface",
+                self.interface
+            )));
+        }
+        if first != &self.payload {
+            let found = std::iter::once(&self.payload)
+                .chain(self.payloads.iter().map(|payload| &payload.rust))
+                .position(|payload| payload == first)
+                .expect("dedicated payload is listed");
+            let elected = self.payloads.remove(found - 1);
+            let previous = std::mem::replace(&mut self.payload, elected.rust);
+            let previous_lifetime =
+                std::mem::replace(&mut self.lifetime, elected.has_lifetime);
+            self.payloads.push(model::Payload {
+                rust: previous,
+                has_lifetime: previous_lifetime,
+            });
+        }
+        Ok(())
     }
 }
 
 pub(crate) fn compile(idl: &[Source<'_>], rust: &[Source<'_>]) -> Result<Vec<Binding>, Error> {
     let database = Database::parse(idl)?;
     let mut implementations = BTreeMap::new();
-    let mut classes = BTreeSet::new();
+    let mut classes = BTreeMap::new();
     for source in rust {
         let syntax = syn::parse_file(source.text)
             .map_err(|error| Error(format!("{}: invalid Rust: {error}", source.name)))?;
@@ -157,11 +199,22 @@ pub(crate) fn compile(idl: &[Source<'_>], rust: &[Source<'_>]) -> Result<Vec<Bin
             &mut classes,
         )?;
     }
+    let mut usage: BTreeMap<String, usize> = BTreeMap::new();
+    for implementation in implementations.values() {
+        for payload in std::iter::once(&implementation.payload).chain(
+            implementation
+                .payloads
+                .iter()
+                .map(|payload| &payload.rust),
+        ) {
+            *usage.entry(payload.to_string()).or_default() += 1;
+        }
+    }
     implementations
         .into_values()
         .map(|mut implementation| {
-            implementation.promote(&classes);
-            let kind = if classes.contains(&implementation.payload.to_string()) {
+            implementation.elect(&classes, &usage, "(discovered)")?;
+            let kind = if classes.contains_key(&implementation.payload.to_string()) {
                 InterfaceKind::Partial
             } else {
                 InterfaceKind::Complete
@@ -181,7 +234,7 @@ fn discover(
     items: &[syn::Item],
     source: &str,
     implementations: &mut BTreeMap<String, Implementation>,
-    classes: &mut BTreeSet<String>,
+    classes: &mut BTreeMap<String, String>,
 ) -> Result<(), Error> {
     for item in items {
         if let syn::Item::Mod(module) = item
@@ -206,7 +259,7 @@ fn discover(
                     "{source}: native classes must not conditionally disappear"
                 )));
             }
-            classes.insert(item.ident.to_string());
+            classes.insert(item.ident.to_string(), class_name(item, source)?);
         }
         let syn::Item::Impl(item) = item else {
             continue;
@@ -222,6 +275,45 @@ fn discover(
         }
     }
     Ok(())
+}
+
+/// The JavaScript name a declared class provides a prototype for: the
+/// `rename` value when present, otherwise the Rust type name. This is the
+/// derived signal that elects a prototype owner, never a mapping table.
+fn class_name(item: &syn::ItemStruct, source: &str) -> Result<String, Error> {
+    for attribute in &item.attrs {
+        let syn::Meta::List(meta) = &attribute.meta else {
+            continue;
+        };
+        if !meta
+            .path
+            .segments
+            .iter()
+            .map(|segment| segment.ident.to_string())
+            .eq(["rquickjs", "class"].map(String::from))
+        {
+            continue;
+        }
+        let renamed: Vec<_> = meta
+            .parse_args_with(
+                syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated,
+            )
+            .map_err(|error| Error(format!("{source}: invalid class attribute: {error}")))?
+            .into_iter()
+            .filter_map(|meta| match meta {
+                syn::Meta::NameValue(named) if named.path.is_ident("rename") => Some(named.value),
+                _ => None,
+            })
+            .collect();
+        let [syn::Expr::Lit(renamed)] = renamed.as_slice() else {
+            continue;
+        };
+        let syn::Lit::Str(renamed) = &renamed.lit else {
+            return Err(Error(format!("{source}: class rename must be a string")));
+        };
+        return Ok(renamed.value());
+    }
+    Ok(item.ident.to_string())
 }
 
 impl Implementation {
@@ -526,7 +618,7 @@ fn lower_members(
     } else {
         quote! {}
     };
-    Ok(quote! { #allow pub(super) trait #name<'js> { #(#methods)* } })
+    Ok(quote! { #allow pub(crate) trait #name<'js> { #(#methods)* } })
 }
 
 /// Reject implementation methods that no IDL member consumed.

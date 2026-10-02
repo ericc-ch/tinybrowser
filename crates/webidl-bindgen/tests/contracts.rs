@@ -48,7 +48,7 @@ fn contracts_follow_implementations_and_resolved_declarations() {
     assert_eq!(bindings.len(), 1);
     assert_eq!(bindings[0].interface, "Sample");
     assert_eq!(generated_trait(&bindings[0].rust).replace(' ', ""), quote::quote! {
-        pub(super) trait Sample<'js> {
+        pub(crate) trait Sample<'js> {
             fn constructor(ctx: &Ctx<'js>, arg_0: rquickjs::String<'js>) -> Result<Self> where Self: Sized;
             fn get_label(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>>;
             fn get_count(&self, ctx: &Ctx<'js>) -> Result<u16>;
@@ -75,18 +75,36 @@ fn conflicting_providers_and_unknown_contract_methods_are_diagnostics() {
         "Sample: methods do not match a supported IDL contract: typo"
     );
     // Two payloads for one interface are the multi-payload case: one
-    // contract, one installation, a dispatch arm per platform type.
+    // contract, one installation, a dispatch arm per platform type. The
+    // declared class named for the interface owns the prototype however
+    // discovery ordered the implementations.
     let providers = [Source {
         name: "fixture.rs",
-        text: "impl<'js> sample_generated::Sample<'js> for A {} impl<'js> sample_generated::Sample<'js> for B {}",
+        text: "#[rquickjs::class(rename = \"Sample\")] struct B; impl<'js> sample_generated::Sample<'js> for A {} impl<'js> sample_generated::Sample<'js> for B {}",
     }];
     let bindings = compile_contracts(&idl, &providers).expect("multi-payload provider");
     let dispatch = bindings[0].rust.split_whitespace().collect::<String>();
     assert!(
-        dispatch.contains("crate::js::bindings::B")
-            && dispatch.contains("host::receiver::<A>"),
+        dispatch.contains("host::receiver::<B>"),
+        "elected payload is not primary: {}",
+        bindings[0].rust
+    );
+    assert!(
+        dispatch.contains("crate::js::bindings::A"),
         "missing alternate payload arm: {}",
         bindings[0].rust
+    );
+    // Two class-less payloads with no name match have no prototype owner.
+    let anonymous = [Source {
+        name: "fixture.rs",
+        text: "impl<'js> sample_generated::Sample<'js> for A {} impl<'js> sample_generated::Sample<'js> for B {}",
+    }];
+    assert_eq!(
+        compile_contracts(&idl, &anonymous)
+            .err()
+            .expect("ambiguous owner")
+            .to_string(),
+        "(discovered): Sample has no prototype owner: several class-less payloads and none is named for the interface"
     );
     // The same platform type twice is still a conflict.
     let repeated = [Source {

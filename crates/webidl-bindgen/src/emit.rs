@@ -61,7 +61,7 @@ pub(crate) fn interface(interface: &Interface) -> TokenStream {
     };
     let receiver_check = receiver_check(interface, &interface.rust);
     quote! {
-        pub(super) mod #module {
+        pub(crate) mod #module {
             use super::#rust;
             use crate::js::bindings::host;
             use rquickjs::{Ctx, Object, Result, Value};
@@ -181,7 +181,16 @@ fn alternate_dispatch(interface: &Interface) -> (TokenStream, Vec<TokenStream>) 
         let payload = payload_type(payload);
         let prefix = format!("dispatch_{index}");
         let (routes, mut payload_groups) = dispatch_groups(interface, &payload, &prefix);
-        let check = receiver_check(interface, &interface.payloads[index].rust);
+        // The receiver check follows the payload, not the interface: the
+        // shared node payload consults the node table, every other payload
+        // answers through the shared-class hook it implements.
+        let check = if interface.payloads[index].rust == "JsNode" {
+            let name = &interface.name;
+            quote! { host::require_node_interface(&ctx, receiver.node_id(), #name)?; }
+        } else {
+            let name = &interface.name;
+            quote! { host::SharedClass::require_interface(&*receiver, &ctx, #name)?; }
+        };
         arms.push(quote! {
             if let Ok(receiver) = rquickjs::Class::<#payload>::from_value(&params.this()) {
                 let receiver = receiver.borrow();

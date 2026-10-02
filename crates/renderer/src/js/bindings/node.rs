@@ -3323,6 +3323,215 @@ where
     nodes.into_iter().map(NodeOrString::from).collect()
 }
 
+impl<'js> node_generated::Node<'js> for JsNode {
+    // https://dom.spec.whatwg.org/#dom-node-nodetype
+    fn get_node_type(&self, ctx: &Ctx<'js>) -> Result<u16> {
+        self.node_type(ctx)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-node-nodename
+    fn get_node_name(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
+        self.node_name(ctx)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-node-baseuri
+    fn get_base_uri(&self, ctx: &Ctx<'js>) -> Result<dom::DomString> {
+        self.base_uri(ctx)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-node-isconnected
+    fn get_is_connected(&self, ctx: &Ctx<'js>) -> Result<bool> {
+        self.is_connected(ctx)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-node-ownerdocument
+    fn get_owner_document(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
+        self.owner_document(ctx)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-node-getrootnode
+    fn get_root_node(
+        &self,
+        ctx: Ctx<'js>,
+        arg_0: node_generated::GetRootNodeOptions,
+    ) -> Result<Value<'js>> {
+        self.get_root_node(ctx, arg_0)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-node-parentnode
+    fn get_parent_node(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
+        self.parent_node(ctx)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-node-parentelement
+    fn get_parent_element(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
+        self.parent_element(ctx)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-node-haschildnodes
+    fn has_child_nodes(&self, ctx: Ctx<'js>) -> Result<bool> {
+        self.has_child_nodes(ctx)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-node-childnodes
+    fn get_child_nodes(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
+        self.child_nodes(ctx)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-node-firstchild
+    fn get_first_child(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
+        self.first_child(ctx)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-node-lastchild
+    fn get_last_child(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
+        self.last_child(ctx)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-node-previoussibling
+    fn get_previous_sibling(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
+        self.previous_sibling(ctx)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-node-nextsibling
+    fn get_next_sibling(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
+        self.next_sibling(ctx)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-node-nodevalue
+    fn get_node_value(&self, ctx: &Ctx<'js>) -> Result<Option<rquickjs::String<'js>>> {
+        self.node_value(ctx)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-node-nodevalue
+    fn set_node_value(
+        &self,
+        ctx: &Ctx<'js>,
+        value: Option<rquickjs::String<'js>>,
+    ) -> Result<()> {
+        self.set_node_value(ctx, value)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-node-textcontent
+    fn get_text_content(&self, ctx: &Ctx<'js>) -> Result<Option<rquickjs::String<'js>>> {
+        self.text_content(ctx)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-node-textcontent
+    fn set_text_content(
+        &self,
+        ctx: &Ctx<'js>,
+        value: Option<rquickjs::String<'js>>,
+    ) -> Result<()> {
+        self.set_text_content(ctx, value)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-node-normalize
+    fn normalize(&self, ctx: Ctx<'js>) -> Result<()> {
+        self.normalize(ctx)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-node-clonenode
+    fn clone_node(&self, ctx: Ctx<'js>, arg_0: bool) -> Result<Value<'js>> {
+        self.clone_node(ctx, arg_0)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-node-isequalnode
+    fn is_equal_node(
+        &self,
+        ctx: Ctx<'js>,
+        arg_0: Option<NodeReference>,
+    ) -> Result<bool> {
+        self.is_equal_node(ctx, arg_0)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-node-issamenode
+    fn is_same_node(&self, ctx: Ctx<'js>, arg_0: Option<NodeReference>) -> Result<bool> {
+        self.is_same_node(ctx, arg_0)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-node-comparedocumentposition
+    fn compare_document_position(
+        &self,
+        ctx: Ctx<'js>,
+        arg_0: NodeReference,
+    ) -> Result<u16> {
+        self.compare_document_position(ctx, arg_0)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-node-contains
+    fn contains(&self, ctx: Ctx<'js>, arg_0: Option<NodeReference>) -> Result<bool> {
+        self.contains(ctx, arg_0)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-node-lookupprefix
+    fn lookup_prefix(
+        &self,
+        ctx: Ctx<'js>,
+        arg_0: Option<rquickjs::String<'js>>,
+    ) -> Result<Option<rquickjs::String<'js>>> {
+        let value = self.lookup_prefix(ctx.clone(), arg_0)?;
+        if value.is_null() || value.is_undefined() {
+            Ok(None)
+        } else {
+            rquickjs::FromJs::from_js(&ctx, value).map(Some)
+        }
+    }
+
+    // https://dom.spec.whatwg.org/#dom-node-lookupnamespaceuri
+    fn lookup_namespace_uri(
+        &self,
+        ctx: Ctx<'js>,
+        arg_0: Option<rquickjs::String<'js>>,
+    ) -> Result<Option<rquickjs::String<'js>>> {
+        let value = self.lookup_namespace_uri(ctx.clone(), arg_0)?;
+        if value.is_null() || value.is_undefined() {
+            Ok(None)
+        } else {
+            rquickjs::FromJs::from_js(&ctx, value).map(Some)
+        }
+    }
+
+    // https://dom.spec.whatwg.org/#dom-node-isdefaultnamespace
+    fn is_default_namespace(
+        &self,
+        ctx: Ctx<'js>,
+        arg_0: Option<rquickjs::String<'js>>,
+    ) -> Result<bool> {
+        self.is_default_namespace(ctx, arg_0)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-node-insertbefore
+    fn insert_before(
+        &self,
+        ctx: Ctx<'js>,
+        arg_0: NodeReference,
+        arg_1: Option<NodeReference>,
+    ) -> Result<Value<'js>> {
+        self.insert_before(ctx, arg_0, arg_1)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-node-appendchild
+    fn append_child(&self, ctx: Ctx<'js>, arg_0: NodeReference) -> Result<Value<'js>> {
+        self.append_child(ctx, arg_0)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-node-replacechild
+    fn replace_child(
+        &self,
+        ctx: Ctx<'js>,
+        arg_0: NodeReference,
+        arg_1: NodeReference,
+    ) -> Result<Value<'js>> {
+        self.replace_child(ctx, arg_0, arg_1)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-node-removechild
+    fn remove_child(&self, ctx: Ctx<'js>, arg_0: NodeReference) -> Result<Value<'js>> {
+        self.remove_child(ctx, arg_0)
+    }
+}
+
 impl<'js> parent_node_generated::ParentNode<'js> for JsNode {
     // https://dom.spec.whatwg.org/#dom-parentnode-children
     fn get_children(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {

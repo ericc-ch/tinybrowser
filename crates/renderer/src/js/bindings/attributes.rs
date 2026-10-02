@@ -12,11 +12,15 @@ use std::rc::Rc;
 
 use dom::{NodeId, qualified_name_eq};
 
-use rquickjs::{Class, Ctx, Exception, Function, Persistent, Result, Value, class::Trace};
+use rquickjs::{Class, Ctx, Exception, Function, Object, Persistent, Result, Value, class::Trace};
 
-use crate::js::events::report_exception;
+use super::node::node_generated;
+use crate::js::events::{
+    JsEvent, add_listener_parsed, dispatch_event, event_target_generated, listener_callback,
+    listener_options, remove_capture, remove_listener_parsed, report_exception,
+};
 use crate::js::world::{
-    AttrAttachError, AttrState, FrameNavigation, Handle, NavigationTarget, World,
+    AttrAttachError, AttrState, EventTargetKey, FrameNavigation, Handle, NavigationTarget, World,
     Wrapper,
 };
 
@@ -279,6 +283,103 @@ impl<'js> Trace<'js> for AttrChildren<'js> {
 include!(concat!(env!("OUT_DIR"), "/Attr.rs"));
 
 pub(super) type AttrArgument<'js> = Class<'js, JsAttr<'js>>;
+
+/// `Attr` is a `Node` and therefore an `EventTarget`
+/// (<https://dom.spec.whatwg.org/#interface-attr>), so it is a third payload
+/// of the one `EventTarget` contract. Listeners key on the Attr registry
+/// identity, which never changes even when the attribute moves documents.
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "generated dispatch passes Ctx by value and the receiver object by value"
+)]
+impl<'js> event_target_generated::EventTarget<'js> for JsAttr<'js> {
+    fn constructor(ctx: &Ctx<'js>) -> Result<Self> {
+        Err(rquickjs::Exception::throw_type(ctx, "Illegal constructor"))
+    }
+
+    // https://dom.spec.whatwg.org/#dom-eventtarget-addeventlistener
+    fn add_event_listener(
+        &self,
+        ctx: Ctx<'js>,
+        _this: Object<'js>,
+        typ: rquickjs::String<'js>,
+        callback: Value<'js>,
+        options: event_target_generated::AddEventListenerOptionsOrBoolean,
+    ) -> Result<()> {
+        let state = attr_state(&ctx, self.scope.0, self.id)?;
+        let home = attr_context(&ctx, self.scope.0, self.id)?;
+        let callback = listener_callback(&home, callback)?;
+        let options = listener_options(options);
+        add_listener_parsed(
+            &home,
+            EventTargetKey::Attribute {
+                scope: state.scope,
+                id: self.id,
+            },
+            typ.to_string()?,
+            callback,
+            options,
+        )
+    }
+
+    // https://dom.spec.whatwg.org/#dom-eventtarget-removeeventlistener
+    fn remove_event_listener(
+        &self,
+        ctx: Ctx<'js>,
+        _this: Object<'js>,
+        typ: rquickjs::String<'js>,
+        callback: Value<'js>,
+        options: event_target_generated::BooleanOrEventListenerOptions,
+    ) -> Result<()> {
+        let state = attr_state(&ctx, self.scope.0, self.id)?;
+        let home = attr_context(&ctx, self.scope.0, self.id)?;
+        let callback = listener_callback(&home, callback)?;
+        let capture = remove_capture(options);
+        remove_listener_parsed(
+            &home,
+            EventTargetKey::Attribute {
+                scope: state.scope,
+                id: self.id,
+            },
+            &typ.to_string()?,
+            callback.as_ref(),
+            capture,
+        )
+    }
+
+    // https://dom.spec.whatwg.org/#dom-eventtarget-dispatchevent
+    fn dispatch_event(
+        &self,
+        ctx: Ctx<'js>,
+        _this: Object<'js>,
+        event: Value<'js>,
+    ) -> Result<bool> {
+        let state = attr_state(&ctx, self.scope.0, self.id)?;
+        let home = attr_context(&ctx, self.scope.0, self.id)?;
+        let event = Class::<JsEvent>::from_js(&home, event)?;
+        dispatch_event(
+            &home,
+            EventTargetKey::Attribute {
+                scope: state.scope,
+                id: self.id,
+            },
+            &event,
+        )
+    }
+}
+
+impl super::host::SharedClass for JsAttr<'_> {
+    // https://dom.spec.whatwg.org/#interface-attr
+    // `Attr` implements exactly `Attr`, `Node`, and `EventTarget`; anything
+    // else reaching an alternate arm is an incompatible receiver.
+    fn require_interface(&self, ctx: &Ctx<'_>, interface: &str) -> Result<()> {
+        if matches!(interface, "Attr" | "Node" | "EventTarget") {
+            Ok(())
+        } else {
+            Err(Exception::throw_type(ctx, "incompatible receiver"))
+        }
+    }
+}
 
 #[allow(
     clippy::needless_pass_by_value,
@@ -609,6 +710,237 @@ impl<'object> JsAttr<'object> {
             Some(rquickjs::String::from_js(&ctx, found)?.to_string()?)
         };
         Ok(found == namespace)
+    }
+}
+
+/// `Attr` is a `Node`
+/// (<https://dom.spec.whatwg.org/#interface-attr>), so it is the second
+/// payload of the one `Node` contract. The prototype owner stays `JsNode`
+/// by the class-name election; this arm only serves `Attr` receivers that
+/// reach `Node.prototype` through the prototype chain.
+impl<'js> node_generated::Node<'js> for JsAttr<'js> {
+    // https://dom.spec.whatwg.org/#dom-node-nodetype
+    fn get_node_type(&self, ctx: &Ctx<'js>) -> Result<u16> {
+        self.node_type(ctx)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-node-nodename
+    fn get_node_name(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
+        let name = self.node_name(ctx)?;
+        rquickjs::String::from_str(ctx.clone(), &name)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-node-baseuri
+    fn get_base_uri(&self, ctx: &Ctx<'js>) -> Result<dom::DomString> {
+        self.base_uri(ctx)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-node-isconnected
+    fn get_is_connected(&self, ctx: &Ctx<'js>) -> Result<bool> {
+        self.is_connected(ctx)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-node-ownerdocument
+    fn get_owner_document(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
+        self.owner_document(ctx)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-node-getrootnode
+    fn get_root_node(
+        &self,
+        ctx: Ctx<'js>,
+        arg_0: node_generated::GetRootNodeOptions,
+    ) -> Result<Value<'js>> {
+        self.get_root_node(ctx, arg_0)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-node-parentnode
+    fn get_parent_node(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
+        self.parent_node(ctx)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-node-parentelement
+    fn get_parent_element(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
+        self.parent_element(ctx)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-node-haschildnodes
+    fn has_child_nodes(&self, ctx: Ctx<'js>) -> Result<bool> {
+        self.has_child_nodes(ctx)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-node-childnodes
+    fn get_child_nodes(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
+        self.child_nodes(ctx)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-node-firstchild
+    fn get_first_child(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
+        self.first_child(ctx)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-node-lastchild
+    fn get_last_child(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
+        self.last_child(ctx)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-node-previoussibling
+    fn get_previous_sibling(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
+        self.previous_sibling(ctx)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-node-nextsibling
+    fn get_next_sibling(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
+        self.next_sibling(ctx)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-node-nodevalue
+    fn get_node_value(&self, ctx: &Ctx<'js>) -> Result<Option<rquickjs::String<'js>>> {
+        self.node_value(ctx)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-node-nodevalue
+    fn set_node_value(
+        &self,
+        ctx: &Ctx<'js>,
+        value: Option<rquickjs::String<'js>>,
+    ) -> Result<()> {
+        self.set_node_value(ctx, value)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-node-textcontent
+    fn get_text_content(&self, ctx: &Ctx<'js>) -> Result<Option<rquickjs::String<'js>>> {
+        self.text_content(ctx)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-node-textcontent
+    fn set_text_content(
+        &self,
+        ctx: &Ctx<'js>,
+        value: Option<rquickjs::String<'js>>,
+    ) -> Result<()> {
+        self.set_text_content(ctx, value)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-node-normalize
+    fn normalize(&self, ctx: Ctx<'js>) -> Result<()> {
+        self.normalize(ctx)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-node-clonenode
+    fn clone_node(&self, ctx: Ctx<'js>, arg_0: bool) -> Result<Value<'js>> {
+        self.clone_node(ctx, arg_0)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-node-isequalnode
+    fn is_equal_node(
+        &self,
+        ctx: Ctx<'js>,
+        arg_0: Option<super::host::NodeReference>,
+    ) -> Result<bool> {
+        self.is_equal_node(ctx, arg_0)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-node-issamenode
+    fn is_same_node(
+        &self,
+        ctx: Ctx<'js>,
+        arg_0: Option<super::host::NodeReference>,
+    ) -> Result<bool> {
+        self.is_same_node(ctx, arg_0)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-node-comparedocumentposition
+    fn compare_document_position(
+        &self,
+        ctx: Ctx<'js>,
+        arg_0: super::host::NodeReference,
+    ) -> Result<u16> {
+        self.compare_document_position(ctx, arg_0)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-node-contains
+    fn contains(
+        &self,
+        ctx: Ctx<'js>,
+        arg_0: Option<super::host::NodeReference>,
+    ) -> Result<bool> {
+        self.contains(ctx, arg_0)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-node-lookupprefix
+    fn lookup_prefix(
+        &self,
+        ctx: Ctx<'js>,
+        arg_0: Option<rquickjs::String<'js>>,
+    ) -> Result<Option<rquickjs::String<'js>>> {
+        let value = self.lookup_prefix(ctx.clone(), arg_0)?;
+        if value.is_null() || value.is_undefined() {
+            Ok(None)
+        } else {
+            rquickjs::FromJs::from_js(&ctx, value).map(Some)
+        }
+    }
+
+    // https://dom.spec.whatwg.org/#dom-node-lookupnamespaceuri
+    fn lookup_namespace_uri(
+        &self,
+        ctx: Ctx<'js>,
+        arg_0: Option<rquickjs::String<'js>>,
+    ) -> Result<Option<rquickjs::String<'js>>> {
+        let value = self.lookup_namespace_uri(ctx.clone(), arg_0)?;
+        if value.is_null() || value.is_undefined() {
+            Ok(None)
+        } else {
+            rquickjs::FromJs::from_js(&ctx, value).map(Some)
+        }
+    }
+
+    // https://dom.spec.whatwg.org/#dom-node-isdefaultnamespace
+    fn is_default_namespace(
+        &self,
+        ctx: Ctx<'js>,
+        arg_0: Option<rquickjs::String<'js>>,
+    ) -> Result<bool> {
+        self.is_default_namespace(ctx, arg_0)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-node-insertbefore
+    fn insert_before(
+        &self,
+        ctx: Ctx<'js>,
+        arg_0: super::host::NodeReference,
+        arg_1: Option<super::host::NodeReference>,
+    ) -> Result<Value<'js>> {
+        self.insert_before(ctx, arg_0, arg_1)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-node-appendchild
+    fn append_child(
+        &self,
+        ctx: Ctx<'js>,
+        arg_0: super::host::NodeReference,
+    ) -> Result<Value<'js>> {
+        self.append_child(ctx, arg_0)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-node-replacechild
+    fn replace_child(
+        &self,
+        ctx: Ctx<'js>,
+        arg_0: super::host::NodeReference,
+        arg_1: super::host::NodeReference,
+    ) -> Result<Value<'js>> {
+        self.replace_child(ctx, arg_0, arg_1)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-node-removechild
+    fn remove_child(
+        &self,
+        ctx: Ctx<'js>,
+        arg_0: super::host::NodeReference,
+    ) -> Result<Value<'js>> {
+        self.remove_child(ctx, arg_0)
     }
 }
 
