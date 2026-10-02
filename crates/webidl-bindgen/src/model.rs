@@ -176,7 +176,7 @@ pub(crate) enum Setter {
     },
     /// `[Reflect]`: the setter writes the content attribute through the
     /// shared helper. Like the getter, the trait carries no method.
-    Reflect,
+    Reflect { content: String },
     PutForwards {
         target: String,
         /// The attributed type is nullable, so forwarding must no-op when the

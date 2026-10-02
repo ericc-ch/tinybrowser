@@ -997,6 +997,12 @@ fn lower_attribute(
     if let Some(content) = reflect_content(member.attributes.as_ref(), member.identifier.0) {
         return lower_reflect_attribute(member, &content, implemented);
     }
+    // `ReflectSetter` reflects on set while the getter stays custom: the
+    // implementation provides the getter, the generator owns the setter.
+    if let Some(content) = reflect_setter_content(member.attributes.as_ref(), member.identifier.0)
+    {
+        return lower_reflect_setter_attribute(database, member, &content, implemented);
+    }
     let getter_name = format!("get_{}", snake_case(member.identifier.0));
     let setter_name = format!("set_{}", snake_case(member.identifier.0));
     let readable = implemented.contains_key(&getter_name);
@@ -1054,6 +1060,8 @@ fn lower_attribute(
     }
     let result = match &type_ {
         ReturnType::String => quote! { rquickjs::String<'js> },
+        // USVString getters hand a code-unit string to the lossy conversion.
+        ReturnType::UsvString => quote! { dom::DomString },
         ReturnType::NullableString => quote! { Option<rquickjs::String<'js>> },
         ReturnType::Boolean => quote! { bool },
         ReturnType::UnsignedShort => quote! { u16 },
@@ -1115,6 +1123,103 @@ fn reflect_content(
     None
 }
 
+/// The content attribute a `[ReflectSetter]` member writes: the value or
+/// the lowercase IDL name. Plain `[Reflect]` is handled separately; other
+/// parameterized forms stay unsupported.
+fn reflect_setter_content(
+    attributes: Option<&ExtendedAttributeList<'_>>,
+    idl_name: &str,
+) -> Option<String> {
+    let attributes = attributes?;
+    for attribute in &attributes.body.list {
+        match attribute {
+            ExtendedAttribute::NoArgs(item) if item.0.0 == "ReflectSetter" => {
+                return Some(idl_name.to_ascii_lowercase());
+            }
+            ExtendedAttribute::String(item) if item.lhs_identifier.0 == "ReflectSetter" => {
+                return Some(item.rhs.0.to_string());
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Lower a `[ReflectSetter]` attribute: the getter is a normal implemented
+/// method, the setter writes the content attribute through the shared
+/// helper. The implementation must provide the getter but not the setter.
+fn lower_reflect_setter_attribute(
+    database: &Database<'_>,
+    member: &weedle::interface::AttributeInterfaceMember<'_>,
+    content: &str,
+    implemented: &BTreeMap<String, Method>,
+) -> Result<Option<(model::Attribute, TokenStream)>, Error> {
+    let getter_name = format!("get_{}", snake_case(member.identifier.0));
+    let setter_name = format!("set_{}", snake_case(member.identifier.0));
+    if implemented.contains_key(&setter_name) {
+        return Err(Error(format!(
+            "{}: reflected setters are generated, not implemented",
+            member.identifier.0
+        )));
+    }
+    if !implemented.contains_key(&getter_name) {
+        return Ok(None);
+    }
+    if member.modifier.is_some() {
+        return Err(Error(
+            "reflect setter special attributes are not supported yet".into(),
+        ));
+    }
+    if member.readonly.is_some() {
+        return Err(Error(
+            "reflect setters require a writable attribute".into(),
+        ));
+    }
+    validate_argument_attributes(member.type_.attributes.as_ref())?;
+    if has_attribute(member.attributes.as_ref(), "SameObject")
+        || has_attribute(member.attributes.as_ref(), "PutForwards")
+    {
+        return Err(Error(format!(
+            "{}: reflect setter semantics are not supported yet",
+            member.identifier.0
+        )));
+    }
+    // The setter writes a string, so only string-family getters pair with
+    // it.
+    let type_ = native_type(database, &member.type_.type_, &mut BTreeSet::new())?;
+    if !matches!(type_, ReturnType::String | ReturnType::UsvString) {
+        return Err(Error(format!(
+            "{}: reflect setter type is not supported yet",
+            member.identifier.0
+        )));
+    }
+    if !implemented[&getter_name].has_self || implemented[&getter_name].parameters != 0 {
+        return Err(Error(format!(
+            "{}: attribute getter must take only self and ctx",
+            member.identifier.0
+        )));
+    }
+    let getter = format_ident!("{getter_name}");
+    let returns = if matches!(type_, ReturnType::UsvString) {
+        quote! { dom::DomString }
+    } else {
+        quote! { rquickjs::String<'js> }
+    };
+    let signature = quote! { fn #getter(&self, ctx: &Ctx<'js>) -> Result<#returns>; };
+    let attribute = model::Attribute {
+        name: member.identifier.0.into(),
+        rust: getter,
+        return_type: type_,
+        mapping: GetterMapping::Method,
+        setter: Some(model::Setter::Reflect {
+            content: content.into(),
+        }),
+        legacy_null_to_empty: false,
+        reactions: has_attribute(member.attributes.as_ref(), "CEReactions"),
+    };
+    Ok(Some((attribute, signature)))
+}
+
 /// Lower a `[Reflect]` attribute to generated content-attribute access.
 /// The trait carries no method and the implementation provides none: like
 /// Chromium's generated reflectors, the binding is complete by itself.
@@ -1167,7 +1272,9 @@ fn lower_reflect_attribute(
     validate_attribute_attributes(member.attributes.as_ref())?;
     let getter = format_ident!("{getter_name}");
     let setter = if writable {
-        Some(model::Setter::Reflect)
+        Some(model::Setter::Reflect {
+            content: content.into(),
+        })
     } else {
         None
     };
@@ -1513,9 +1620,14 @@ fn validate_attribute_attributes(
                 ExtendedAttribute::NoArgs(item)
                     if matches!(
                         item.0.0,
-                        "SameObject" | "CEReactions" | "LegacyNullToEmptyString" | "Reflect"
+                        "SameObject"
+                            | "CEReactions"
+                            | "LegacyNullToEmptyString"
+                            | "Reflect"
+                            | "ReflectSetter"
                     ) => {}
-                ExtendedAttribute::String(item) if item.lhs_identifier.0 == "Reflect" => {}
+                ExtendedAttribute::String(item)
+                    if item.lhs_identifier.0 == "Reflect" => {}
                 _ => {
                     return Err(Error(format!(
                         "native attribute semantics are not supported yet: {attribute:?}"

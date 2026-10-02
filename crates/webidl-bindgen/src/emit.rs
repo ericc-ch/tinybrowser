@@ -769,8 +769,8 @@ fn setter_dispatch(
     };
     let (method, from_js) = match setter {
         Setter::Method { rust, from_js } => (rust, from_js),
-        Setter::Reflect => {
-            return Some(reflect_setter(index, attribute));
+        Setter::Reflect { content } => {
+            return Some(reflect_setter(index, attribute, content));
         }
         Setter::PutForwards { target, nullable } => {
             let name = &attribute.name;
@@ -863,19 +863,18 @@ fn setter_dispatch(
 /// A `[Reflect]` setter: convert the value, then write the content
 /// attribute through the shared helper. Reactions wrap the write, like any
 /// setter.
-fn reflect_setter(index: usize, attribute: &Attribute) -> TokenStream {
+fn reflect_setter(index: usize, attribute: &Attribute, content: &str) -> TokenStream {
     let id = index * 2 + 2;
-    let GetterMapping::Reflect { content } = &attribute.mapping else {
-        unreachable!("reflect setter needs reflect mapping")
-    };
     let convert = match attribute.return_type {
-        ReturnType::String => quote! { host::string_argument(params, 0, None)? },
+        ReturnType::String | ReturnType::UsvString => {
+            quote! { host::string_argument(params, 0, None)? }
+        }
         // https://webidl.spec.whatwg.org/#es-boolean
         ReturnType::Boolean => quote! { host::boolean_argument(params, 0)? },
         _ => unreachable!("validated reflect mapping"),
     };
     let write = match attribute.return_type {
-        ReturnType::String => quote! {
+        ReturnType::String | ReturnType::UsvString => quote! {
             host::reflect_set_string(&ctx, receiver.node_id(), #content, &value)?;
         },
         ReturnType::Boolean => quote! {

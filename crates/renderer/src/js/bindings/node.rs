@@ -3981,6 +3981,47 @@ impl<'js> math_ml_element_generated::MathMLElement<'js> for JsNode {
 
 impl html_opt_group_element_generated::HTMLOptGroupElement<'_> for JsNode {}
 
+impl<'js> html_button_element_generated::HTMLButtonElement<'js> for JsNode {
+    // https://html.spec.whatwg.org/multipage/forms.html#dom-fae-form
+    fn get_form(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
+        self.form(ctx.clone())
+    }
+
+    // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#dom-fs-formaction
+    fn get_form_action(&self, ctx: &Ctx<'js>) -> Result<dom::DomString> {
+        Ok(self.form_action(ctx.clone())?.into())
+    }
+
+    // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#dom-fs-formmethod
+    fn get_form_method(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
+        let method = self.form_method(ctx.clone())?;
+        rquickjs::String::from_str(ctx.clone(), &method)
+    }
+
+    // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#dom-fs-formmethod
+    fn set_form_method(&self, ctx: &Ctx<'js>, value: rquickjs::String<'js>) -> Result<()> {
+        self.set_form_method(ctx.clone(), WebIdlString(value.to_string()?))
+    }
+
+    // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#dom-fs-formenctype
+    fn get_form_enctype(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
+        let enctype = self.form_enctype(ctx.clone())?;
+        rquickjs::String::from_str(ctx.clone(), &enctype)
+    }
+
+    // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#dom-fs-formenctype
+    fn set_form_enctype(&self, ctx: &Ctx<'js>, value: rquickjs::String<'js>) -> Result<()> {
+        self.set_form_enctype(ctx.clone(), WebIdlString(value.to_string()?))
+    }
+}
+
+impl<'js> html_field_set_element_generated::HTMLFieldSetElement<'js> for JsNode {
+    // https://html.spec.whatwg.org/multipage/forms.html#dom-fae-form
+    fn get_form(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
+        self.form(ctx.clone())
+    }
+}
+
 impl<'js> processing_instruction_generated::ProcessingInstruction<'js> for JsNode {
     // https://dom.spec.whatwg.org/#dom-processinginstruction-target
     fn get_target(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {

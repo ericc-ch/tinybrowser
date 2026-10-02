@@ -494,6 +494,32 @@ fn reflect_explicit_content_name() {
 }
 
 #[test]
+fn reflect_setter_splits_getter_and_generated_setter() {
+    let idl = [Source {
+        name: "html.idl",
+        text: "[Exposed=Window] interface Button { [CEReactions, ReflectSetter] attribute USVString formAction; [CEReactions, ReflectSetter] attribute DOMString command; };",
+    }];
+    // Only the getter with an implementation installs; the setter generates.
+    let rust = [Source {
+        name: "button.rs",
+        text: "#[rquickjs::class] struct Payload; impl<'js> button_generated::Button<'js> for Payload { fn get_form_action(&self, ctx: &Ctx<'js>) -> Result<dom::DomString> { Ok(\"x\".into()) } }",
+    }];
+    let bindings = compile_contracts(&idl, &rust).expect("compile reflect setter");
+    let source = bindings[0].rust.replace(' ', "");
+    assert!(source.contains("reflect_set_string"), "missing generated setter");
+    assert!(
+        !source.contains("\"command\""),
+        "unimplemented reflect setter member must stay absent"
+    );
+    // An implemented setter conflicts with the generated one.
+    let conflict = [Source {
+        name: "button.rs",
+        text: "#[rquickjs::class] struct Payload; impl<'js> button_generated::Button<'js> for Payload { fn get_form_action(&self, ctx: &Ctx<'js>) -> Result<dom::DomString> { Ok(\"x\".into()) } fn set_form_action(&self, ctx: &Ctx<'js>, value: rquickjs::String<'js>) -> Result<()> { Ok(()) } }",
+    }];
+    assert!(compile_contracts(&idl, &conflict).is_err());
+}
+
+#[test]
 fn unforgeable_and_scoped_native_members_fail_the_build() {
     let rust = [Source {
         name: "fixture.rs",
