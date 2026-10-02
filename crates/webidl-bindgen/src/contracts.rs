@@ -155,7 +155,10 @@ fn discover(
             continue;
         };
         let name = implementation.interface.clone();
-        if implementations.insert(name.clone(), implementation).is_some() {
+        if implementations
+            .insert(name.clone(), implementation)
+            .is_some()
+        {
             return Err(Error(format!(
                 "{source}: multiple native implementations of {name} are not supported"
             )));
@@ -317,13 +320,16 @@ fn lower_members(
     let mut methods = Vec::new();
     let mut getters = Vec::new();
     for member in &declaration.members {
-        match member {
+        let resolved = member;
+        match &member.declaration {
             InterfaceMember::Const(member) => {
+                resolved.validate_scopes()?;
                 interface.constants.push(model::Constant::parse(member)?);
             }
             InterfaceMember::Constructor(member)
                 if implementation.methods.contains_key("constructor") =>
             {
+                resolved.validate_scopes()?;
                 if interface.constructor.is_some() {
                     return Err(Error(
                         "native constructor overloads are not supported yet".into(),
@@ -345,6 +351,7 @@ fn lower_members(
                 else {
                     continue;
                 };
+                resolved.validate_scopes()?;
                 remaining.remove(&attribute.rust.to_string());
                 if let Some(model::Setter::Method { rust, .. }) = &attribute.setter {
                     remaining.remove(&rust.to_string());
@@ -368,6 +375,7 @@ fn lower_members(
                 else {
                     continue;
                 };
+                resolved.validate_scopes()?;
                 remaining.remove(&operation.rust.to_string());
                 if let Some(property) = property {
                     getters.push(property);
@@ -1209,10 +1217,7 @@ fn validate_attribute_attributes(
                 ExtendedAttribute::NoArgs(item)
                     if matches!(
                         item.0.0,
-                        "SameObject"
-                            | "LegacyUnforgeable"
-                            | "CEReactions"
-                            | "LegacyNullToEmptyString"
+                        "SameObject" | "CEReactions" | "LegacyNullToEmptyString"
                     ) => {}
                 _ => {
                     return Err(Error(format!(

@@ -16,7 +16,25 @@ pub(crate) struct Interface<'idl> {
     pub(crate) name: &'idl str,
     pub(crate) attributes: Option<weedle::attribute::ExtendedAttributeList<'idl>>,
     pub(crate) parent: Option<&'idl str>,
-    pub(crate) members: Vec<InterfaceMember<'idl>>,
+    pub(crate) members: Vec<Member<'idl>>,
+}
+
+pub(crate) struct Member<'idl> {
+    pub(crate) declaration: InterfaceMember<'idl>,
+    scopes: Vec<weedle::attribute::ExtendedAttributeList<'idl>>,
+}
+
+impl Member<'_> {
+    pub(crate) fn validate_scopes(&self) -> Result<(), Error> {
+        // https://webidl.spec.whatwg.org/#SecureContext
+        // https://webidl.spec.whatwg.org/#using-mixins-and-partials
+        if let Some(scope) = self.scopes.iter().find(|scope| !scope.body.list.is_empty()) {
+            return Err(Error(format!(
+                "resolved declaration attributes are not supported yet: {scope:?}"
+            )));
+        }
+        Ok(())
+    }
 }
 
 impl<'idl> Database<'idl> {
@@ -44,6 +62,11 @@ impl<'idl> Database<'idl> {
             for definition in definitions {
                 match definition {
                     Definition::IncludesStatement(include) => {
+                        if include.attributes.is_some() {
+                            return Err(Error(
+                                "includes statement attributes are not supported".into(),
+                            ));
+                        }
                         let interface = include.lhs_identifier.0;
                         let mixin = include.rhs_identifier.0;
                         if !result.includes.entry(interface).or_default().insert(mixin) {
@@ -175,13 +198,32 @@ impl<'idl> Database<'idl> {
         let Some(Definition::Interface(definition)) = self.definitions.get(name) else {
             return Err(Error(format!("no interface declaration for {name}")));
         };
-        let mut members = definition.members.body.clone();
+        let mut members: Vec<_> = definition
+            .members
+            .body
+            .iter()
+            .cloned()
+            .map(|declaration| Member {
+                declaration,
+                scopes: Vec::new(),
+            })
+            .collect();
         if let Some(partials) = self.partials.get(name) {
             for partial in partials {
                 let Definition::PartialInterface(partial) = partial else {
                     return Err(Error(format!("invalid partial interface {name}")));
                 };
-                members.extend(partial.members.body.iter().cloned());
+                members.extend(
+                    partial
+                        .members
+                        .body
+                        .iter()
+                        .cloned()
+                        .map(|declaration| Member {
+                            declaration,
+                            scopes: partial.attributes.iter().cloned().collect(),
+                        }),
+                );
             }
         }
         if let Some(mixins) = self.includes.get(name) {
@@ -190,13 +232,26 @@ impl<'idl> Database<'idl> {
                 else {
                     return Err(Error(format!("invalid mixin {mixin}")));
                 };
-                members.extend(definition.members.body.iter().map(mixin_member));
+                members.extend(definition.members.body.iter().map(|member| Member {
+                    declaration: mixin_member(member),
+                    scopes: definition.attributes.iter().cloned().collect(),
+                }));
                 if let Some(partials) = self.partials.get(mixin) {
                     for partial in partials {
                         let Definition::PartialInterfaceMixin(partial) = partial else {
                             return Err(Error(format!("invalid partial mixin {mixin}")));
                         };
-                        members.extend(partial.members.body.iter().map(mixin_member));
+                        members.extend(partial.members.body.iter().map(|member| {
+                            Member {
+                                declaration: mixin_member(member),
+                                scopes: definition
+                                    .attributes
+                                    .iter()
+                                    .chain(partial.attributes.iter())
+                                    .cloned()
+                                    .collect(),
+                            }
+                        }));
                     }
                 }
             }
