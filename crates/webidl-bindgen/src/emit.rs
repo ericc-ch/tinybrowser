@@ -38,6 +38,7 @@ pub(crate) fn interface(interface: &Interface) -> TokenStream {
                     | ReturnType::UnsignedLong
                     | ReturnType::Long
                     | ReturnType::Double
+                    | ReturnType::Enumeration(_)
             )
     }) {
         quote! { use rquickjs::IntoJs; }
@@ -715,10 +716,13 @@ fn getter_dispatch(id: usize, getter: &Attribute, interface: &Interface) -> Toke
             ReturnType::NullableNode | ReturnType::NodeList | ReturnType::PlatformObject => {
                 quote! { #call }
             }
+            ReturnType::Enumeration(_) => quote! {
+                let result = #call?;
+                rquickjs::String::from_str(ctx.clone(), result.as_str()).map(rquickjs::IntoJs::into_js)
+            },
             ReturnType::Node
             | ReturnType::Callback
             | ReturnType::Dictionary(_)
-            | ReturnType::Enumeration(_)
             | ReturnType::InterfaceSequence
             | ReturnType::StringSequence
             | ReturnType::NullableDocumentType => {
@@ -761,7 +765,7 @@ fn setter_dispatch(
             )?
         }
     } else {
-        match attribute.return_type {
+        match &attribute.return_type {
             ReturnType::String if attribute.legacy_null_to_empty => quote! {
                 host::legacy_null_string_argument(params, 0)?
             },
@@ -797,6 +801,15 @@ fn setter_dispatch(
             ReturnType::Value => quote! {
                 params.arg(0).unwrap_or_else(|| Value::new_undefined(ctx.clone()))
             },
+            ReturnType::Enumeration(name) => {
+                let name = format_ident!("{name}");
+                quote! {
+                    {
+                        let value = params.arg(0).unwrap_or_else(|| Value::new_undefined(ctx.clone()));
+                        #name::from_value(&ctx, value)?
+                    }
+                }
+            }
             _ => unreachable!("validated string, boolean, integer, double, or value setter"),
         }
     };

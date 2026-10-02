@@ -297,6 +297,27 @@ fn implemented_unsupported_types_do_not_disappear() {
 }
 
 #[test]
+fn enum_attributes_lower_to_the_generated_enum() {
+    let idl = [Source {
+        name: "dom.idl",
+        text: "enum Mode { \"open\", \"closed\" }; [Exposed=Window] interface Shadow { readonly attribute Mode mode; };",
+    }];
+    let rust = [Source {
+        name: "shadow.rs",
+        text: "impl<'js> shadow_generated::Shadow<'js> for Payload { fn get_mode(&self, ctx: &Ctx<'js>) -> Result<shadow_generated::Mode> { Ok(shadow_generated::Mode::Open) } }",
+    }];
+    let bindings = compile_contracts(&idl, &rust).expect("compile enum attribute");
+    let trait_text = generated_trait(&bindings[0].rust).replace(' ', "");
+    assert!(
+        trait_text.contains("fnget_mode(&self,ctx:&Ctx<'js>)->Result<Mode>"),
+        "{trait_text}"
+    );
+    let source = bindings[0].rust.replace(' ', "");
+    assert!(source.contains("enumMode"), "missing generated enum");
+    assert!(source.contains("as_str"), "missing enum string conversion");
+}
+
+#[test]
 fn unforgeable_and_scoped_native_members_fail_the_build() {
     let rust = [Source {
         name: "fixture.rs",

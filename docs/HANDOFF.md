@@ -44,19 +44,23 @@ Unfinished:
 - Every remaining `crates/renderer/idl/*.webidl` interface is blocked on a
   generator feature. Pick one feature and land it with its consumer migration in
   the same commit:
+  - Union types. This is the largest unblock: `Element`, `Document`, `Node`,
+    `ShadowRoot` (`innerHTML` is `(TrustedHTML or DOMString)`), `EventTarget`,
+    `ParentNode`, `ChildNode`, `DOMParser`. `ReturnType` and `native_type` in
+    `contracts.rs` have no union arm.
   - `[Reflect]` / `[ReflectSetter]` handling (form elements, `ElementReflections`).
     Today `contracts.rs::validate_attribute_attributes` rejects them. Decide
     whether the generator emits the reflection algorithm (end goal) or treats the
     extended attribute as metadata the implementation owns (intermediate).
-  - Union types (`Element`, `Document`, `Node`, `EventTarget`, `ParentNode`,
-    `ChildNode`, `DOMParser`).
   - Interface-typed arguments, e.g. `NamedNodeMap.setNamedItem(Attr attr)`. Today
-    `argument_parameter` has no `ReturnType::PlatformObject` arm.
-  - Enum attributes, e.g. `ShadowRoot.mode` (`ShadowRootMode`). Today
-    `lower_attribute` and `emit::getter_dispatch` have no `ReturnType::Enumeration`
-    arm, and the enum type has no `IntoJs`.
+    `argument_parameter` has no `ReturnType::PlatformObject` arm. `NamedNodeMap`
+    also needs a JS-implemented property-hook mode, which the contract path lacks.
   - Interface-level metadata attributes such as `[LegacyFactoryFunction]` on
     `HTMLImageElement`, rejected by `validate_interface_attributes`.
+- Enum attributes are now generated (`ReturnType::Enumeration` in
+  `lower_attribute`, `getter_dispatch`, and `setter_dispatch`), but no interface
+  consumes them yet. `Document.readyState` (`DocumentReadyState`) will once
+  `Document` migrates.
 - `brands.js` still carries hand-written per-interface member lists (a second
   support list). Reduce them as interfaces move to contracts. Do not blanket
   delete without checking that the list is not the only installer for a member.

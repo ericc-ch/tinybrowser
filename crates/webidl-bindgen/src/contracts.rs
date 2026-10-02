@@ -943,7 +943,7 @@ fn lower_attribute(
             "native attribute stringifiers require DOMString".into(),
         ));
     }
-    let result = match type_ {
+    let result = match &type_ {
         ReturnType::String => quote! { rquickjs::String<'js> },
         ReturnType::NullableString => quote! { Option<rquickjs::String<'js>> },
         ReturnType::Boolean => quote! { bool },
@@ -952,6 +952,10 @@ fn lower_attribute(
         ReturnType::Long => quote! { i32 },
         ReturnType::Double => quote! { f64 },
         ReturnType::PlatformObject => quote! { Value<'js> },
+        ReturnType::Enumeration(name) => {
+            let name = format_ident!("{name}");
+            quote! { #name }
+        }
         _ => return Err(Error("native attribute type is not supported yet".into())),
     };
     let getter = format_ident!("{getter_name}");
@@ -990,6 +994,10 @@ fn setter_parameter(type_: &ReturnType) -> Result<TokenStream, Error> {
         ReturnType::Long => quote! { i32 },
         ReturnType::Double => quote! { f64 },
         ReturnType::Value => quote! { Value<'js> },
+        ReturnType::Enumeration(name) => {
+            let name = format_ident!("{name}");
+            quote! { #name }
+        }
         _ => {
             return Err(Error(
                 "native attribute setter type is not supported yet".into(),
