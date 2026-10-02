@@ -748,7 +748,8 @@ fn getter_dispatch(id: usize, getter: &Attribute, interface: &Interface) -> Toke
             }
             ReturnType::Enumeration(_) => quote! {
                 let result = #call?;
-                rquickjs::String::from_str(ctx.clone(), result.as_str()).map(rquickjs::IntoJs::into_js)
+                let result = rquickjs::String::from_str(ctx.clone(), result.as_str())?;
+                rquickjs::IntoJs::into_js(result, &ctx)
             },
             ReturnType::Node
             | ReturnType::Callback
@@ -1368,6 +1369,8 @@ fn enumeration(enumeration: &Enumeration) -> TokenStream {
 
         impl #name {
             // https://webidl.spec.whatwg.org/#es-enumeration
+            // Only used when the enum converts an argument or setter value.
+            #[allow(dead_code, reason = "generated from IDL; conversion is used on demand")]
             fn from_value<'js>(ctx: &Ctx<'js>, value: Value<'js>) -> Result<Self> {
                 let string: rquickjs::Coerced<rquickjs::String> = rquickjs::FromJs::from_js(ctx, value)?;
                 let string = match string.0.to_string() {

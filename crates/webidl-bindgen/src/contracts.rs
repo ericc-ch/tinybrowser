@@ -1757,6 +1757,11 @@ fn native_interface(database: &Database<'_>, name: &str, nullable: bool) -> Opti
         ("Node", false) => Some(ReturnType::Node),
         ("Node", true) => Some(ReturnType::NullableNode),
         ("DocumentType", true) => Some(ReturnType::NullableDocumentType),
+        // `WindowProxy` is a platform object the HTML Standard defines in
+        // prose, so it has no declaration in the extracts to inspect; it is
+        // carried as an opaque value
+        // (<https://html.spec.whatwg.org/multipage/nav-history-apis.html#windowproxy>).
+        ("WindowProxy", _) => Some(ReturnType::PlatformObject),
         _ if matches!(
             database.definition(name),
             Some(weedle::Definition::Interface(_))

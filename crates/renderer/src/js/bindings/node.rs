@@ -4107,6 +4107,70 @@ impl<'js> html_option_element_generated::HTMLOptionElement<'js> for JsNode {
     }
 }
 
+impl<'js> shadow_root_generated::ShadowRoot<'js> for JsNode {
+    // https://dom.spec.whatwg.org/#dom-shadowroot-host
+    fn get_host(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
+        self.host(ctx)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-shadowroot-mode
+    fn get_mode(&self, ctx: &Ctx<'js>) -> Result<shadow_root_generated::ShadowRootMode> {
+        Ok(match self.mode(ctx)?.as_str() {
+            "closed" => shadow_root_generated::ShadowRootMode::Closed,
+            _ => shadow_root_generated::ShadowRootMode::Open,
+        })
+    }
+
+    // https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-innerhtml
+    fn get_inner_html(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
+        self.inner_html(ctx)
+    }
+
+    // https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-innerhtml
+    fn set_inner_html(&self, ctx: &Ctx<'js>, value: rquickjs::String<'js>) -> Result<()> {
+        self.set_inner_html(ctx, LegacyNullString(value.to_string()?))
+    }
+
+    // https://dom.spec.whatwg.org/#dom-documentorshadowroot-activeelement
+    fn get_active_element(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
+        self.active_element(ctx)
+    }
+}
+
+impl<'js> htmli_frame_element_generated::HTMLIFrameElement<'js> for JsNode {
+    // https://html.spec.whatwg.org/multipage/iframe-embed-object.html#dom-iframe-contentdocument
+    fn get_content_document(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
+        self.content_document(ctx.clone())
+    }
+
+    // https://html.spec.whatwg.org/multipage/iframe-embed-object.html#dom-iframe-contentwindow
+    fn get_content_window(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
+        self.content_window(ctx.clone())
+    }
+}
+
+impl<'js> html_image_element_generated::HTMLImageElement<'js> for JsNode {
+    // https://html.spec.whatwg.org/multipage/embedded-content.html#dom-img-naturalwidth
+    fn get_natural_width(&self, ctx: &Ctx<'js>) -> Result<usize> {
+        Ok(self.natural_width(ctx.clone())? as usize)
+    }
+
+    // https://html.spec.whatwg.org/multipage/embedded-content.html#dom-img-naturalheight
+    fn get_natural_height(&self, ctx: &Ctx<'js>) -> Result<usize> {
+        Ok(self.natural_height(ctx.clone())? as usize)
+    }
+
+    // https://html.spec.whatwg.org/multipage/embedded-content.html#dom-img-complete
+    fn get_complete(&self, ctx: &Ctx<'js>) -> Result<bool> {
+        self.complete(ctx.clone())
+    }
+
+    // https://html.spec.whatwg.org/multipage/embedded-content.html#dom-img-currentsrc
+    fn get_current_src(&self, ctx: &Ctx<'js>) -> Result<dom::DomString> {
+        Ok(self.current_src(ctx.clone())?.into())
+    }
+}
+
 impl<'js> processing_instruction_generated::ProcessingInstruction<'js> for JsNode {
     // https://dom.spec.whatwg.org/#dom-processinginstruction-target
     fn get_target(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {

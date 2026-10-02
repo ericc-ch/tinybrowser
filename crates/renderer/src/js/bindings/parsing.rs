@@ -197,16 +197,16 @@ include!(concat!(env!("OUT_DIR"), "/DOMParser.rs"));
     clippy::needless_pass_by_value,
     reason = "generated dispatch passes Ctx and Value by value"
 )]
-impl JsDomParser {
+impl<'js> dom_parser_generated::DOMParser<'js> for JsDomParser {
     // https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-domparser-domparser
-    fn new(ctx: &Ctx<'_>) -> Result<Self> {
+    fn constructor(ctx: &Ctx<'js>) -> Result<Self> {
         Ok(Self {
             url: world(ctx)?.borrow().document_url.as_str().to_owned(),
         })
     }
 
     // https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-domparser-parsefromstring
-    fn parse_from_string<'js>(
+    fn parse_from_string(
         &self,
         ctx: Ctx<'js>,
         source: rquickjs::String<'js>,
