@@ -4022,6 +4022,44 @@ impl<'js> html_field_set_element_generated::HTMLFieldSetElement<'js> for JsNode 
     }
 }
 
+impl<'js> html_select_element_generated::HTMLSelectElement<'js> for JsNode {
+    // https://html.spec.whatwg.org/multipage/form-elements.html#dom-select-value
+    fn get_value(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
+        let value = self.value(ctx.clone())?;
+        rquickjs::String::from_str(ctx.clone(), &value)
+    }
+
+    // https://html.spec.whatwg.org/multipage/form-elements.html#dom-select-value
+    fn set_value(&self, ctx: &Ctx<'js>, value: rquickjs::String<'js>) -> Result<()> {
+        self.set_value(ctx.clone(), LegacyNullString(value.to_string()?))
+    }
+
+    // https://html.spec.whatwg.org/multipage/form-elements.html#dom-select-selectedindex
+    fn get_selected_index(&self, ctx: &Ctx<'js>) -> Result<i32> {
+        self.selected_index(ctx.clone())
+    }
+
+    // https://html.spec.whatwg.org/multipage/form-elements.html#dom-select-selectedindex
+    fn set_selected_index(&self, ctx: &Ctx<'js>, value: i32) -> Result<()> {
+        self.set_selected_index(ctx.clone(), value)
+    }
+
+    // https://html.spec.whatwg.org/multipage/form-elements.html#dom-select-options
+    fn get_options(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
+        self.options(ctx.clone())
+    }
+
+    // https://html.spec.whatwg.org/multipage/form-elements.html#dom-select-selectedoptions
+    fn get_selected_options(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
+        self.selected_options(ctx.clone())
+    }
+
+    // https://html.spec.whatwg.org/multipage/forms.html#dom-fae-form
+    fn get_form(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
+        self.form(ctx.clone())
+    }
+}
+
 impl<'js> processing_instruction_generated::ProcessingInstruction<'js> for JsNode {
     // https://dom.spec.whatwg.org/#dom-processinginstruction-target
     fn get_target(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
