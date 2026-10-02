@@ -3979,6 +3979,8 @@ impl<'js> math_ml_element_generated::MathMLElement<'js> for JsNode {
     }
 }
 
+impl html_opt_group_element_generated::HTMLOptGroupElement<'_> for JsNode {}
+
 impl<'js> processing_instruction_generated::ProcessingInstruction<'js> for JsNode {
     // https://dom.spec.whatwg.org/#dom-processinginstruction-target
     fn get_target(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {

@@ -174,6 +174,9 @@ pub(crate) enum Setter {
         rust: Ident,
         from_js: Option<syn::Path>,
     },
+    /// `[Reflect]`: the setter writes the content attribute through the
+    /// shared helper. Like the getter, the trait carries no method.
+    Reflect,
     PutForwards {
         target: String,
         /// The attributed type is nullable, so forwarding must no-op when the
@@ -185,6 +188,13 @@ pub(crate) enum Setter {
 pub(crate) enum GetterMapping {
     Method,
     Field,
+    /// `[Reflect]`: the attribute mirrors a content attribute. Generated
+    /// dispatch reads and writes element storage directly; the trait carries
+    /// no method and the implementation provides none. The content name is
+    /// the `Reflect` value or the lowercase IDL name, following Chromium's
+    /// content-attribute key derivation
+    /// (`bind_gen/interface.py::_make_reflect_content_attribute_key`).
+    Reflect { content: String },
 }
 
 pub(crate) enum ReturnType {

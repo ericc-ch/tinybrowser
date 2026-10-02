@@ -30,19 +30,21 @@ pub(crate) fn interface(interface: &Interface) -> TokenStream {
     let legacy_code = legacy_codes(interface);
     let definition = definition(interface, &payload, required);
     let conversion_import = if interface.attributes.iter().any(|attribute| {
-        matches!(attribute.mapping, GetterMapping::Field)
-            || matches!(
-                attribute.return_type,
-                ReturnType::String
-                    | ReturnType::UsvString
-                    | ReturnType::NullableString
-                    | ReturnType::Boolean
-                    | ReturnType::UnsignedShort
-                    | ReturnType::UnsignedLong
-                    | ReturnType::Long
-                    | ReturnType::Double
-                    | ReturnType::Enumeration(_)
-            )
+        matches!(
+            attribute.mapping,
+            GetterMapping::Field | GetterMapping::Reflect { .. }
+        ) || matches!(
+            attribute.return_type,
+            ReturnType::String
+                | ReturnType::UsvString
+                | ReturnType::NullableString
+                | ReturnType::Boolean
+                | ReturnType::UnsignedShort
+                | ReturnType::UnsignedLong
+                | ReturnType::Long
+                | ReturnType::Double
+                | ReturnType::Enumeration(_)
+        )
     }) {
         quote! { use rquickjs::IntoJs; }
     } else {
@@ -682,8 +684,20 @@ fn getter_dispatch(id: usize, getter: &Attribute, interface: &Interface) -> Toke
         quote! { &ctx }
     };
     let call = method_call(interface, method, &ctx_arg);
-    let body = match getter.mapping {
+    let body = match &getter.mapping {
         GetterMapping::Field => quote! { receiver.#method.clone().into_js(&ctx) },
+        // `[Reflect]`: generated content-attribute access needs no trait
+        // method. The receiver check already ran, so `node_id` targets the
+        // branded element.
+        GetterMapping::Reflect { content } => match getter.return_type {
+            ReturnType::String => quote! {
+                host::reflect_string(&ctx, receiver.node_id(), #content)?.into_js(&ctx)
+            },
+            ReturnType::Boolean => quote! {
+                host::reflect_bool(&ctx, receiver.node_id(), #content)?.into_js(&ctx)
+            },
+            _ => unreachable!("validated reflect mapping"),
+        },
         GetterMapping::Method => match getter.return_type {
             // `[RustValue]`: the method returns the platform value directly.
             ReturnType::Value => quote! { #call },
@@ -755,6 +769,9 @@ fn setter_dispatch(
     };
     let (method, from_js) = match setter {
         Setter::Method { rust, from_js } => (rust, from_js),
+        Setter::Reflect => {
+            return Some(reflect_setter(index, attribute));
+        }
         Setter::PutForwards { target, nullable } => {
             let name = &attribute.name;
             return Some(quote! {
@@ -841,6 +858,47 @@ fn setter_dispatch(
             #body
         }
     })
+}
+
+/// A `[Reflect]` setter: convert the value, then write the content
+/// attribute through the shared helper. Reactions wrap the write, like any
+/// setter.
+fn reflect_setter(index: usize, attribute: &Attribute) -> TokenStream {
+    let id = index * 2 + 2;
+    let GetterMapping::Reflect { content } = &attribute.mapping else {
+        unreachable!("reflect setter needs reflect mapping")
+    };
+    let convert = match attribute.return_type {
+        ReturnType::String => quote! { host::string_argument(params, 0, None)? },
+        // https://webidl.spec.whatwg.org/#es-boolean
+        ReturnType::Boolean => quote! { host::boolean_argument(params, 0)? },
+        _ => unreachable!("validated reflect mapping"),
+    };
+    let write = match attribute.return_type {
+        ReturnType::String => quote! {
+            host::reflect_set_string(&ctx, receiver.node_id(), #content, &value)?;
+        },
+        ReturnType::Boolean => quote! {
+            host::reflect_set_bool(&ctx, receiver.node_id(), #content, value)?;
+        },
+        _ => unreachable!("validated reflect mapping"),
+    };
+    let body = quote! {
+        #write
+        Ok(Value::new_undefined(ctx.clone()))
+    };
+    let body = if attribute.reactions {
+        quote! { crate::js::reactions::with_reactions(&ctx, || { #body }) }
+    } else {
+        body
+    };
+    quote! {
+        #id => {
+            // https://webidl.spec.whatwg.org/#es-attributes
+            let value = #convert;
+            #body
+        }
+    }
 }
 
 fn operation_dispatch(id: usize, operation: &Operation, interface: &Interface) -> TokenStream {

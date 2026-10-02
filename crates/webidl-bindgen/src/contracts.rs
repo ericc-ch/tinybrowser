@@ -432,11 +432,13 @@ fn lower_members(
                 {
                     return Err(Error("multiple stringifiers are not supported".into()));
                 }
-                methods.push(signature);
+                // Reflected attributes contribute no trait methods.
+                if !signature.is_empty() {
+                    methods.push(signature);
+                }
                 interface.attributes.push(attribute);
             }
-            InterfaceMember::Operation(member) => {
-                let Some((operation, signature, property)) =
+            InterfaceMember::Operation(member) => {                let Some((operation, signature, property)) =
                     lower_operation(database, member, &implementation.methods)?
                 else {
                     continue;
@@ -461,7 +463,14 @@ fn lower_members(
         infer_property_hooks(declaration, &getters, &mut remaining, &mut methods)?;
     ensure_no_extra_methods(declaration, &remaining)?;
     let name = format_ident!("{}", declaration.name);
-    Ok(quote! { pub(super) trait #name<'js> { #(#methods)* } })
+    // A fully generated contract (such as `[Reflect]`-only members) has no
+    // trait methods; the empty trait still marks the implementation.
+    let allow = if methods.is_empty() {
+        quote! { #[allow(dead_code, reason = "fully generated contracts have no trait methods")] }
+    } else {
+        quote! {}
+    };
+    Ok(quote! { #allow pub(super) trait #name<'js> { #(#methods)* } })
 }
 
 /// Reject implementation methods that no IDL member consumed.
@@ -982,6 +991,12 @@ fn lower_attribute(
     member: &weedle::interface::AttributeInterfaceMember<'_>,
     implemented: &BTreeMap<String, Method>,
 ) -> Result<Option<(model::Attribute, TokenStream)>, Error> {
+    // Reflected attributes install without implementation methods, so
+    // resolve them before the implemented-member checks below. Other
+    // members keep skip-if-unimplemented semantics.
+    if let Some(content) = reflect_content(member.attributes.as_ref(), member.identifier.0) {
+        return lower_reflect_attribute(member, &content, implemented);
+    }
     let getter_name = format!("get_{}", snake_case(member.identifier.0));
     let setter_name = format!("set_{}", snake_case(member.identifier.0));
     let readable = implemented.contains_key(&getter_name);
@@ -1075,6 +1090,99 @@ fn lower_attribute(
         reactions,
     };
     Ok(Some((attribute, signature)))
+}
+
+/// The content attribute a `[Reflect]` member mirrors: the `Reflect` value
+/// or the lowercase IDL name, following Chromium's key derivation.
+/// `ReflectURL`, `ReflectOnly`, and the other parameterized forms need their
+/// own conversion support first.
+fn reflect_content(
+    attributes: Option<&ExtendedAttributeList<'_>>,
+    idl_name: &str,
+) -> Option<String> {
+    let attributes = attributes?;
+    for attribute in &attributes.body.list {
+        match attribute {
+            ExtendedAttribute::NoArgs(item) if item.0.0 == "Reflect" => {
+                return Some(idl_name.to_ascii_lowercase());
+            }
+            ExtendedAttribute::String(item) if item.lhs_identifier.0 == "Reflect" => {
+                return Some(item.rhs.0.to_string());
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Lower a `[Reflect]` attribute to generated content-attribute access.
+/// The trait carries no method and the implementation provides none: like
+/// Chromium's generated reflectors, the binding is complete by itself.
+/// Claiming a reflected name with implementation methods fails the build,
+/// so a custom algorithm cannot silently replace the reflection.
+/// Unsupported reflect shapes without implementation methods are absent
+/// until the generator grows them, like any unimplemented member.
+fn lower_reflect_attribute(
+    member: &weedle::interface::AttributeInterfaceMember<'_>,
+    content: &str,
+    implemented: &BTreeMap<String, Method>,
+) -> Result<Option<(model::Attribute, TokenStream)>, Error> {
+    let getter_name = format!("get_{}", snake_case(member.identifier.0));
+    let setter_name = format!("set_{}", snake_case(member.identifier.0));
+    if implemented.contains_key(&getter_name) || implemented.contains_key(&setter_name) {
+        return Err(Error(format!(
+            "{}: reflected attributes are generated, not implemented",
+            member.identifier.0
+        )));
+    }
+    if member.modifier.is_some() {
+        return Ok(None);
+    }
+    let writable = member.readonly.is_none();
+    validate_argument_attributes(member.type_.attributes.as_ref())?;
+    if has_attribute(member.attributes.as_ref(), "SameObject")
+        || has_attribute(member.attributes.as_ref(), "PutForwards")
+        || has_attribute(member.attributes.as_ref(), "LegacyNullToEmptyString")
+        || has_attribute(member.type_.attributes.as_ref(), "LegacyNullToEmptyString")
+    {
+        return Ok(None);
+    }
+    // Only plain string and boolean reflection so far; the type needs no
+    // database lookup, keeping reflected members independent of typedefs.
+    let type_ = match &member.type_.type_ {
+        Type::Single(SingleType::NonAny(NonAnyType::DOMString(item)))
+            if item.q_mark.is_none() =>
+        {
+            ReturnType::String
+        }
+        Type::Single(SingleType::NonAny(NonAnyType::Boolean(item)))
+            if item.q_mark.is_none() =>
+        {
+            ReturnType::Boolean
+        }
+        _ => return Ok(None),
+    };
+    // The shape is supported and installing, so unknown attributes fail
+    // instead of silently changing the reflection.
+    validate_attribute_attributes(member.attributes.as_ref())?;
+    let getter = format_ident!("{getter_name}");
+    let setter = if writable {
+        Some(model::Setter::Reflect)
+    } else {
+        None
+    };
+    let attribute = model::Attribute {
+        name: member.identifier.0.into(),
+        rust: getter,
+        return_type: type_,
+        mapping: GetterMapping::Reflect {
+            content: content.into(),
+        },
+        setter,
+        legacy_null_to_empty: false,
+        reactions: has_attribute(member.attributes.as_ref(), "CEReactions"),
+    };
+    Ok(Some((attribute, quote! {})))
 }
 
 /// The Rust parameter type for one lowered attribute setter, mirroring
@@ -1405,8 +1513,9 @@ fn validate_attribute_attributes(
                 ExtendedAttribute::NoArgs(item)
                     if matches!(
                         item.0.0,
-                        "SameObject" | "CEReactions" | "LegacyNullToEmptyString"
+                        "SameObject" | "CEReactions" | "LegacyNullToEmptyString" | "Reflect"
                     ) => {}
+                ExtendedAttribute::String(item) if item.lhs_identifier.0 == "Reflect" => {}
                 _ => {
                     return Err(Error(format!(
                         "native attribute semantics are not supported yet: {attribute:?}"

@@ -173,6 +173,76 @@ pub(crate) fn install_unscopables(prototype: &Object<'_>, names: &[&str]) -> Res
     )
 }
 
+/// Read a reflected `DOMString` attribute: the content attribute value,
+/// or the empty string when missing
+/// (<https://html.spec.whatwg.org/multipage/common-dom-interfaces.html#reflect>).
+pub(crate) fn reflect_string<'js>(
+    ctx: &Ctx<'js>,
+    element: dom::NodeId,
+    name: &str,
+) -> Result<rquickjs::String<'js>> {
+    let world = super::world(ctx)?;
+    let value = world
+        .borrow()
+        .document(element)
+        .and_then(|parsed| parsed.document.attribute(element, name))
+        .unwrap_or_default();
+    rquickjs::String::from_str(ctx.clone(), &value)
+}
+
+/// Read a reflected `boolean` attribute: presence of the content attribute
+/// (<https://html.spec.whatwg.org/multipage/common-dom-interfaces.html#reflect>).
+pub(crate) fn reflect_bool(
+    ctx: &Ctx<'_>,
+    element: dom::NodeId,
+    name: &str,
+) -> Result<bool> {
+    let world = super::world(ctx)?;
+    Ok(world
+        .borrow()
+        .document(element)
+        .is_some_and(|parsed| parsed.document.attribute(element, name).is_some()))
+}
+
+/// Write a reflected `DOMString` attribute: set the content attribute and
+/// notify mutation observers, mirroring the `setAttribute` algorithm.
+pub(crate) fn reflect_set_string(
+    ctx: &Ctx<'_>,
+    element: dom::NodeId,
+    name: &str,
+    value: &rquickjs::String<'_>,
+) -> Result<()> {
+    let value = value.to_string()?;
+    let owner = super::world_for_node(ctx, element)?;
+    let world = owner.borrow();
+    let Some(mut parsed) = world.document_mut(element) else {
+        return Err(Exception::throw_type(ctx, "no document"));
+    };
+    dom::mutation::set_attribute(&mut parsed.document, element, name, value.clone())
+        .map_err(|error| super::throw_dom_error(ctx, error))?;
+    drop(parsed);
+    drop(world);
+    super::touch_attr(ctx, element, "", name, &value)?;
+    super::after_attribute_change(ctx, element, name)?;
+    super::schedule_mutation_delivery(ctx)
+}
+
+/// Write a reflected `boolean` attribute: present with the empty string
+/// when true, removed when false.
+pub(crate) fn reflect_set_bool(
+    ctx: &Ctx<'_>,
+    element: dom::NodeId,
+    name: &str,
+    value: bool,
+) -> Result<()> {
+    if value {
+        let empty = rquickjs::String::from_str(ctx.clone(), "")?;
+        reflect_set_string(ctx, element, name, &empty)
+    } else {
+        super::remove_attribute_sync(ctx, element, "", name, false)
+    }
+}
+
 /// Create a platform wrapper with the interface prototype from `ctx`'s realm
 /// (<https://webidl.spec.whatwg.org/#dfn-platform-object>).
 /// The rquickjs `Class::instance` prototype cache is shared across a runtime's

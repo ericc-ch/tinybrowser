@@ -416,6 +416,84 @@ fn mixin_implementations_install_on_includers() {
 }
 
 #[test]
+fn reflect_attributes_install_without_implementation() {
+    let idl = [Source {
+        name: "html.idl",
+        text: "[Exposed=Window] interface Group { [CEReactions, Reflect] attribute boolean disabled; [CEReactions, Reflect] attribute DOMString label; };",
+    }];
+    let rust = [Source {
+        name: "group.rs",
+        text: "#[rquickjs::class] struct Payload; impl<'js> group_generated::Group<'js> for Payload {}",
+    }];
+    let bindings = compile_contracts(&idl, &rust).expect("compile reflect");
+    let source = bindings[0].rust.replace(' ', "");
+    for fragment in [
+        "reflect_bool",
+        "reflect_string",
+        "reflect_set_bool",
+        "\"disabled\"",
+        "\"label\"",
+    ] {
+        assert!(
+            source.contains(&fragment.replace(' ', "")),
+            "missing {fragment}"
+        );
+    }
+}
+
+#[test]
+fn reflect_conflicts_and_unsupported_shapes() {
+    // An implementation method for a reflected name fails the build.
+    let idl = [Source {
+        name: "html.idl",
+        text: "[Exposed=Window] interface Group { [Reflect] attribute boolean disabled; };",
+    }];
+    let rust = [Source {
+        name: "group.rs",
+        text: "#[rquickjs::class] struct Payload; impl<'js> group_generated::Group<'js> for Payload { fn get_disabled(&self, ctx: &Ctx<'js>) -> Result<bool> { Ok(true) } }",
+    }];
+    assert!(compile_contracts(&idl, &rust).is_err());
+    // Unsupported reflect shapes without implementation methods are absent,
+    // like any unimplemented member.
+    for text in [
+        "[Exposed=Window] interface Group { [Reflect] attribute unsigned long span; };",
+        "[Exposed=Window] interface Group { [CEReactions, ReflectURL] attribute USVString src; };",
+        "[Exposed=Window] interface Group { [Reflect] readonly attribute Element anchor; };",
+    ] {
+        let idl = [Source {
+            name: "html.idl",
+            text,
+        }];
+        let empty = [Source {
+            name: "group.rs",
+            text: "#[rquickjs::class] struct Payload; impl<'js> group_generated::Group<'js> for Payload {}",
+        }];
+        let bindings = compile_contracts(&idl, &empty).expect("unsupported reflect stays absent");
+        assert!(
+            !bindings[0].rust.contains("reflect_"),
+            "unexpected reflection for {text}"
+        );
+    }
+}
+
+#[test]
+fn reflect_explicit_content_name() {
+    let idl = [Source {
+        name: "html.idl",
+        text: "[Exposed=Window] interface Group { [Reflect=\"for\"] attribute DOMString target; };",
+    }];
+    let rust = [Source {
+        name: "group.rs",
+        text: "#[rquickjs::class] struct Payload; impl<'js> group_generated::Group<'js> for Payload {}",
+    }];
+    let bindings = compile_contracts(&idl, &rust).expect("compile named reflect");
+    assert!(
+        bindings[0].rust.replace(' ', "").contains("\"for\""),
+        "missing explicit content name"
+    );
+}
+
+#[test]
 fn unforgeable_and_scoped_native_members_fail_the_build() {
     let rust = [Source {
         name: "fixture.rs",
