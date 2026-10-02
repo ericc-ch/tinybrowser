@@ -293,7 +293,7 @@ pub(crate) fn install(ctx: &Ctx<'_>) -> Result<()> {
         ("__tbPushCustomReactions", 1),
         ("__tbPopCustomReactions", 2),
     ] {
-        ctx.globals().set(
+        super::bridge::object(ctx)?.set(
             name,
             Function::new_native(
                 ctx.clone(),
@@ -305,7 +305,7 @@ pub(crate) fn install(ctx: &Ctx<'_>) -> Result<()> {
 }
 
 pub(crate) fn capture(ctx: &Ctx<'_>) -> Result<()> {
-    let hook: Function = ctx.globals().get("__tbCollectCustomReactions")?;
+    let hook: Function = super::bridge::object(ctx)?.get("__tbCollectCustomReactions")?;
     let world = world(ctx)?;
     let world = world.borrow();
     world
@@ -320,7 +320,7 @@ pub(crate) fn capture(ctx: &Ctx<'_>) -> Result<()> {
         "__tbPushCustomReactions",
         "__tbPopCustomReactions",
     ] {
-        ctx.globals().remove(name)?;
+        super::bridge::object(ctx)?.remove(name)?;
     }
     Ok(())
 }

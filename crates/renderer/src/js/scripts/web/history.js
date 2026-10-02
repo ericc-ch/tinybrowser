@@ -1,15 +1,15 @@
 // https://html.spec.whatwg.org/multipage/nav-history-apis.html#the-history-interface
 (function() {
-  const initialState = globalThis.__tbHistoryState;
+  const initialState = host.__tbHistoryState;
   let currentState = initialState == null ? null : __tbDecode(initialState, Object.create(null));
-  let length = globalThis.__tbHistoryLength;
+  let length = host.__tbHistoryLength;
   globalThis.PopStateEvent = class PopStateEvent extends Event {
     constructor(type, init) {
       super(type, init);
       this.state = init == null || init.state === undefined ? null : init.state;
     }
   };
-  globalThis.__tbHistoryRestore = function(payload, count) {
+  host.__tbHistoryRestore = function(payload, count) {
     currentState = payload == null ? null : __tbDecode(payload, Object.create(null));
     length = count;
     return currentState;
@@ -20,7 +20,7 @@
     scrollRestoration: 'auto',
     pushState(data, unused, url) { update(data, url, false); },
     replaceState(data, unused, url) { update(data, url, true); },
-    go(delta = 0) { globalThis.__tbHistoryTraverse(Number(delta) | 0); },
+    go(delta = 0) { host.__tbHistoryTraverse(Number(delta) | 0); },
     back() { this.go(-1); },
     forward() { this.go(1); },
   };
@@ -37,7 +37,7 @@
     if (target.origin !== current.origin) {
       throw new DOMException('History URL must be same-origin', 'SecurityError');
     }
-    length = globalThis.__tbHistoryUpdate(next, serialized, replace);
+    length = host.__tbHistoryUpdate(next, serialized, replace);
     currentState = __tbDecode(serialized, Object.create(null));
   }
   Object.defineProperty(globalThis.history, Symbol.toStringTag, { value: 'History' });

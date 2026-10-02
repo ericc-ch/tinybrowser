@@ -259,7 +259,7 @@ fn noop_method(method: &str) -> bool {
 /// `Storage.getStorageKey`: the tab's origin.
 async fn storage_key(tab: &TabHandle) -> Result<Value, DispatchError> {
     let value = tab
-        .execute_script("String(location.origin)")
+        .execute_browser_script("String(location.origin)")
         .await
         .map_err(|error| DispatchError::Failed(error.to_string()))?;
     let key = match value {
@@ -273,34 +273,34 @@ async fn storage_key(tab: &TabHandle) -> Result<Value, DispatchError> {
 /// DOM calls can look it up by `nodeId`.
 pub(crate) async fn dom_get_document(tab: &TabHandle) -> Result<Value, DispatchError> {
     const SCRIPT: &str = r#"(function(){
-      globalThis.__tb_dom_nodes = [];
-      globalThis.__tb_dom_id = 0;
+      host.__tb_dom_nodes = host.array();
+      host.__tb_dom_id = 0;
       const register = node => {
-        const nodes = globalThis.__tb_dom_nodes;
+        const nodes = host.__tb_dom_nodes;
         for (let id = 1; id < nodes.length; id++) { if (nodes[id] === node) return id; }
-        const id = ++globalThis.__tb_dom_id;
+        const id = ++host.__tb_dom_id;
         nodes[id] = node;
         return id;
       };
       const walk = node => {
         const id = register(node);
-        const entry = { nodeId: id, backendNodeId: id, nodeType: node.nodeType, nodeName: node.nodeName };
-        if (node.nodeType === 1) { entry.localName = node.localName; entry.nodeValue = ""; entry.attributes = []; }
+        const entry = { __proto__: null, nodeId: id, backendNodeId: id, nodeType: node.nodeType, nodeName: node.nodeName };
+        if (node.nodeType === 1) { entry.localName = node.localName; entry.nodeValue = ""; entry.attributes = host.array(); }
         else if (node.nodeType === 9) {
           entry.nodeValue = ""; entry.documentURL = node.URL; entry.baseURL = node.baseURI;
           entry.compatibilityMode = "NoQuirks";
         } else { entry.nodeValue = node.nodeValue || ""; }
-        const children = [];
-        for (let child = node.firstChild; child; child = child.nextSibling) children.push(walk(child));
+        const children = host.array();
+        for (let child = node.firstChild; child; child = child.nextSibling) host.push(children, walk(child));
         if (children.length) entry.children = children;
         entry.childNodeCount = children.length;
         return entry;
       };
       const root = walk(document);
-      return JSON.stringify(root);
+      return host.stringify(root);
     })()"#;
     let value = tab
-        .execute_script(SCRIPT)
+        .execute_browser_script(SCRIPT)
         .await
         .map_err(|error| DispatchError::Failed(error.to_string()))?;
     let RemoteValue::String(text) = value else {
@@ -446,10 +446,10 @@ async fn run_actions(tab: &TabHandle, actions: &Value) -> Result<Value, Dispatch
     // array itself or a `{"actions": [...]}` envelope.
     let sources = actions.get("actions").unwrap_or(actions);
     let script = format!(
-        "(function(){{return globalThis.__tbWebDriverActions({});}})()",
+        "(function(){{return host.__tbWebDriverActions({});}})()",
         serde_json::to_string(sources).unwrap_or_else(|_| "[]".to_owned())
     );
-    tab.execute_script(&script)
+    tab.execute_browser_script(&script)
         .await
         .map_err(|error| DispatchError::Failed(error.to_string()))?;
     Ok(json!({}))
@@ -458,7 +458,7 @@ async fn run_actions(tab: &TabHandle, actions: &Value) -> Result<Value, Dispatch
 /// Runs a DOM helper script that returns a JSON string and parses the reply.
 async fn dom_eval(tab: &TabHandle, script: &str) -> Result<Value, DispatchError> {
     let value = tab
-        .execute_script(script)
+        .execute_browser_script(script)
         .await
         .map_err(|error| DispatchError::Failed(error.to_string()))?;
     let RemoteValue::String(text) = value else {
@@ -478,14 +478,14 @@ fn requested_node(params: &Value) -> u64 {
 /// `objectId` (a remote handle), `backendNodeId`, or `nodeId`.
 fn requested_node_expression(params: &Value) -> String {
     if let Some(id) = params.get("objectId").and_then(Value::as_str) {
-        return format!("(globalThis.__tb_handles || {{}})[{}]", json_string(id));
+        return format!("(host.__tb_handles || {{}})[{}]", json_string(id));
     }
     let id = params
         .get("backendNodeId")
         .and_then(Value::as_u64)
         .or_else(|| params.get("nodeId").and_then(Value::as_u64))
         .unwrap_or(1);
-    format!("(globalThis.__tb_dom_nodes || [])[{id}]")
+    format!("(host.__tb_dom_nodes || [])[{id}]")
 }
 
 /// `DOM.querySelector`/`DOM.querySelectorAll`: register the matches in the
@@ -497,31 +497,31 @@ pub(crate) async fn dom_query_selector(
 ) -> Result<Value, DispatchError> {
     const SINGLE: &str = r"(function(){
       const register = node => {
-        const nodes = globalThis.__tb_dom_nodes;
+        const nodes = host.__tb_dom_nodes;
         for (let id = 1; id < nodes.length; id++) { if (nodes[id] === node) return id; }
-        const id = ++globalThis.__tb_dom_id;
+        const id = ++host.__tb_dom_id;
         nodes[id] = node;
         return id;
       };
-      const n = globalThis.__tb_dom_nodes[__NODE__];
-      if (!n || !n.querySelector) return JSON.stringify({nodeId: 0});
+      const n = host.__tb_dom_nodes[__NODE__];
+      if (!n || !n.querySelector) return host.stringify({__proto__: null, nodeId: 0});
       const found = n.querySelector(__SELECTOR__);
-      if (!found) return JSON.stringify({nodeId: 0});
-      return JSON.stringify({nodeId: register(found)});
+      if (!found) return host.stringify({__proto__: null, nodeId: 0});
+      return host.stringify({__proto__: null, nodeId: register(found)});
     })()";
     const ALL: &str = r"(function(){
       const register = node => {
-        const nodes = globalThis.__tb_dom_nodes;
+        const nodes = host.__tb_dom_nodes;
         for (let id = 1; id < nodes.length; id++) { if (nodes[id] === node) return id; }
-        const id = ++globalThis.__tb_dom_id;
+        const id = ++host.__tb_dom_id;
         nodes[id] = node;
         return id;
       };
-      const n = globalThis.__tb_dom_nodes[__NODE__];
-      if (!n || !n.querySelectorAll) return JSON.stringify({nodeIds: []});
-      const nodeIds = [];
-      for (const found of n.querySelectorAll(__SELECTOR__)) nodeIds.push(register(found));
-      return JSON.stringify({nodeIds: nodeIds});
+      const n = host.__tb_dom_nodes[__NODE__];
+      if (!n || !n.querySelectorAll) return host.stringify({__proto__: null, nodeIds: []});
+      const nodeIds = host.array();
+      for (const found of n.querySelectorAll(__SELECTOR__)) host.push(nodeIds, register(found));
+      return host.stringify({__proto__: null, nodeIds: nodeIds});
     })()";
     let selector =
         serde_json::to_string(params.get("selector").and_then(Value::as_str).unwrap_or(""))
@@ -538,15 +538,15 @@ pub(crate) async fn dom_describe_node(
     params: &Value,
 ) -> Result<Value, DispatchError> {
     const TEMPLATE: &str = r"(function(){
-      const n = globalThis.__tb_dom_nodes[__NODE__];
-      if (!n) return JSON.stringify({node: null});
-      const entry = {
+      const n = host.__tb_dom_nodes[__NODE__];
+      if (!n) return host.stringify({__proto__: null, node: null});
+      const entry = { __proto__: null,
         nodeId: __NODE__, backendNodeId: __NODE__,
         nodeType: n.nodeType, nodeName: n.nodeName,
         childNodeCount: n.childNodes ? n.childNodes.length : 0,
       };
-      if (n.nodeType === 1) { entry.localName = n.localName; entry.attributes = []; }
-      return JSON.stringify({node: entry});
+      if (n.nodeType === 1) { entry.localName = n.localName; entry.attributes = host.array(); }
+      return host.stringify({__proto__: null, node: entry});
     })()";
     let script = TEMPLATE.replace("__NODE__", &requested_node(params).to_string());
     dom_eval(tab, &script).await
@@ -559,12 +559,12 @@ pub(crate) async fn dom_node_string(
     field: &str,
 ) -> Result<Value, DispatchError> {
     const TEMPLATE: &str = r#"(function(){
-      const n = globalThis.__tb_dom_nodes[__NODE__];
-      if (!n) return JSON.stringify({__FIELD__: null});
-      if ("__FIELD__" === "outerHTML") return JSON.stringify({outerHTML: n.outerHTML === undefined ? "" : n.outerHTML});
-      const attributes = [];
-      if (n.attributes) for (const a of n.attributes) { attributes.push(a.name, a.value); }
-      return JSON.stringify({attributes: attributes});
+      const n = host.__tb_dom_nodes[__NODE__];
+      if (!n) return host.stringify({__proto__: null, __FIELD__: null});
+      if ("__FIELD__" === "outerHTML") return host.stringify({__proto__: null, outerHTML: n.outerHTML === undefined ? "" : n.outerHTML});
+      const attributes = host.array();
+      if (n.attributes) for (const a of n.attributes) { host.push(attributes, a.name, a.value); }
+      return host.stringify({__proto__: null, attributes: attributes});
     })()"#;
     let script = TEMPLATE
         .replace("__NODE__", &requested_node(params).to_string())
@@ -578,12 +578,11 @@ pub(crate) async fn dom_resolve_node(
     params: &Value,
 ) -> Result<Value, DispatchError> {
     const TEMPLATE: &str = r#"(function(){
-      const n = globalThis.__tb_dom_nodes[__NODE__];
-      if (!n) return JSON.stringify({object: {type: "undefined"}});
+      const n = host.__tb_dom_nodes[__NODE__];
+      if (!n) return host.stringify({__proto__: null, object: {__proto__: null, type: "undefined"}});
       const objectId = "dom-__NODE__";
-      globalThis.__tb_handles = globalThis.__tb_handles || {};
-      globalThis.__tb_handles[objectId] = n;
-      return JSON.stringify({object: {
+      host.__tb_handles[objectId] = n;
+      return host.stringify({__proto__: null, object: {__proto__: null,
         type: "object", subtype: "node", objectId: objectId,
         className: n.constructor ? n.constructor.name : "Node",
         description: n.nodeName,
@@ -600,16 +599,16 @@ pub(crate) async fn dom_node_for_location(
 ) -> Result<Value, DispatchError> {
     const TEMPLATE: &str = r"(function(){
       const register = node => {
-        const nodes = globalThis.__tb_dom_nodes;
+        const nodes = host.__tb_dom_nodes;
         for (let id = 1; id < nodes.length; id++) { if (nodes[id] === node) return id; }
-        const id = ++globalThis.__tb_dom_id;
+        const id = ++host.__tb_dom_id;
         nodes[id] = node;
         return id;
       };
       const x = __X__, y = __Y__;
       const found = document.elementFromPoint ? document.elementFromPoint(x, y) : null;
-      if (!found) return JSON.stringify({nodeId: 0});
-      return JSON.stringify({nodeId: register(found)});
+      if (!found) return host.stringify({__proto__: null, nodeId: 0});
+      return host.stringify({__proto__: null, nodeId: register(found)});
     })()";
     let script = TEMPLATE
         .replace(
@@ -634,11 +633,11 @@ pub(crate) async fn dom_node_for_location(
 /// `CSS.enable`: one `CSS.styleSheetAdded` per document stylesheet.
 pub(crate) async fn css_stylesheets(tab: &TabHandle) -> Result<Vec<Value>, DispatchError> {
     const SCRIPT: &str = r#"(function(){
-      globalThis.__tb_css_id = globalThis.__tb_css_id || 0;
-      const out = [];
+      host.__tb_css_id = host.__tb_css_id || 0;
+      const out = host.array();
       for (const sheet of document.styleSheets) {
-        const id = String(++globalThis.__tb_css_id);
-        out.push({
+        const id = String(++host.__tb_css_id);
+        host.push(out, {__proto__: null,
           styleSheetId: id,
           sourceURL: sheet.href || "",
           origin: "regular",
@@ -649,7 +648,7 @@ pub(crate) async fn css_stylesheets(tab: &TabHandle) -> Result<Vec<Value>, Dispa
           length: sheet.cssRules ? sheet.cssRules.length : 0,
         });
       }
-      return JSON.stringify(out);
+      return host.stringify(out);
     })()"#;
     let value = dom_eval(tab, SCRIPT).await?;
     Ok(value.as_array().cloned().unwrap_or_default())
@@ -660,10 +659,10 @@ pub(crate) async fn css_stylesheets(tab: &TabHandle) -> Result<Vec<Value>, Dispa
 pub(crate) async fn dom_box_model(tab: &TabHandle, params: &Value) -> Result<Value, DispatchError> {
     const TEMPLATE: &str = r"(function(){
       const n = (__NODE__);
-      if (!n || !n.getBoundingClientRect) return JSON.stringify({model: null});
+      if (!n || !n.getBoundingClientRect) return host.stringify({__proto__: null, model: null});
       const r = n.getBoundingClientRect();
       const quad = [r.left, r.top, r.right, r.top, r.right, r.bottom, r.left, r.bottom];
-      return JSON.stringify({model: {
+      return host.stringify({__proto__: null, model: {__proto__: null,
         content: quad, padding: quad, border: quad, margin: quad,
         width: Math.round(r.width), height: Math.round(r.height),
       }});
@@ -679,12 +678,12 @@ pub(crate) async fn dom_content_quads(
 ) -> Result<Value, DispatchError> {
     const TEMPLATE: &str = r"(function(){
       const n = (__NODE__);
-      if (!n || !n.getClientRects) return JSON.stringify({quads: []});
-      const quads = [];
+      if (!n || !n.getClientRects) return host.stringify({__proto__: null, quads: []});
+      const quads = host.array();
       for (const r of n.getClientRects()) {
-        quads.push([r.left, r.top, r.right, r.top, r.right, r.bottom, r.left, r.bottom]);
+        host.push(quads, [r.left, r.top, r.right, r.top, r.right, r.bottom, r.left, r.bottom]);
       }
-      return JSON.stringify({quads: quads});
+      return host.stringify({__proto__: null, quads: quads});
     })()";
     let script = TEMPLATE.replace("__NODE__", &requested_node_expression(params));
     dom_eval(tab, &script).await
@@ -696,15 +695,15 @@ pub(crate) async fn css_computed_style(
     params: &Value,
 ) -> Result<Value, DispatchError> {
     const TEMPLATE: &str = r"(function(){
-      const n = globalThis.__tb_dom_nodes[__NODE__];
-      if (!n || !globalThis.getComputedStyle) return JSON.stringify({computedStyle: []});
+      const n = host.__tb_dom_nodes[__NODE__];
+      if (!n || !globalThis.getComputedStyle) return host.stringify({__proto__: null, computedStyle: []});
       const style = globalThis.getComputedStyle(n);
-      const computedStyle = [];
+      const computedStyle = host.array();
       for (let i = 0; i < style.length; i++) {
         const name = style.item(i);
-        computedStyle.push({name: name, value: style.getPropertyValue(name)});
+        host.push(computedStyle, {__proto__: null, name: name, value: style.getPropertyValue(name)});
       }
-      return JSON.stringify({computedStyle: computedStyle});
+      return host.stringify({__proto__: null, computedStyle: computedStyle});
     })()";
     let script = TEMPLATE.replace("__NODE__", &requested_node(params).to_string());
     dom_eval(tab, &script).await
@@ -844,7 +843,7 @@ pub(crate) fn arguments_expression(params: &Value) -> String {
     if let Some(arguments) = params.get("arguments").and_then(Value::as_array) {
         for argument in arguments {
             if let Some(id) = argument.get("objectId").and_then(Value::as_str) {
-                parts.push(format!("globalThis.__tb_handles[{}]", json_string(id)));
+                parts.push(format!("host.__tb_handles[{}]", json_string(id)));
             } else if let Some(value) = argument.get("value") {
                 parts.push(serde_json::to_string(value).unwrap_or_else(|_| "undefined".to_owned()));
             } else {
@@ -880,9 +879,8 @@ pub(crate) fn exception_text_reply(text: &str) -> Value {
 /// evaluation ID; a single shared slot would let overlapping evaluations
 /// overwrite each other.
 pub(crate) const RUNTIME_SCHEDULE: &str = r#"(() => {
-  globalThis.__tb_async = globalThis.__tb_async || {};
-  const slot = { done: false };
-  globalThis.__tb_async[__ID__] = slot;
+  const slot = { __proto__: null, done: false };
+  host.__tb_async[__ID__] = slot;
   Promise.resolve((__SOURCE__)).then(
     (v) => { slot.done = true; slot.value = v; },
     (e) => { slot.done = true; slot.error = String((e && e.message) || e); }
@@ -893,22 +891,21 @@ pub(crate) const RUNTIME_SCHEDULE: &str = r#"(() => {
 /// Evaluates `__SOURCE__`, stores a non-primitive in `__ID__`, and returns the
 /// CDP `RemoteObject` JSON (primitives inline, per protocol).
 pub(crate) const RUNTIME_HANDLE: &str = r#"(() => {
-  globalThis.__tb_handles = globalThis.__tb_handles || {};
   const v = (__SOURCE__);
-  if (v === null) return JSON.stringify({ type: "object", subtype: "null", value: null });
+  if (v === null) return host.stringify({__proto__: null, type: "object", subtype: "null", value: null });
   const t = typeof v;
-  if (t === "undefined") return JSON.stringify({ type: "undefined" });
+  if (t === "undefined") return host.stringify({__proto__: null, type: "undefined" });
   if (t === "number") {
-    if (Number.isFinite(v)) return JSON.stringify({ type: "number", value: v });
-    return JSON.stringify({ type: "number", unserializableValue: Number.isNaN(v) ? "NaN" : (v > 0 ? "Infinity" : "-Infinity") });
+    if (Number.isFinite(v)) return host.stringify({__proto__: null, type: "number", value: v });
+    return host.stringify({__proto__: null, type: "number", unserializableValue: Number.isNaN(v) ? "NaN" : (v > 0 ? "Infinity" : "-Infinity") });
   }
-  if (t === "string" || t === "boolean") return JSON.stringify({ type: t, value: v });
-  globalThis.__tb_handles[__ID__] = v;
+  if (t === "string" || t === "boolean") return host.stringify({__proto__: null, type: t, value: v });
+  host.__tb_handles[__ID__] = v;
   // A DOM node is an `ElementHandle` only when the remote object says
   // `subtype: "node"` (CDP `Runtime.RemoteObject`).
   if (t === "object" && typeof v.nodeType === "number" && typeof v.nodeName === "string")
-    return JSON.stringify({ type: "object", subtype: "node", className: (v.constructor && v.constructor.name) || "", objectId: __ID__ });
-  return JSON.stringify({ type: t === "function" ? "function" : "object", objectId: __ID__ });
+    return host.stringify({__proto__: null, type: "object", subtype: "node", className: (v.constructor && v.constructor.name) || "", objectId: __ID__ });
+  return host.stringify({__proto__: null, type: t === "function" ? "function" : "object", objectId: __ID__ });
 })()"#;
 
 /// Schedules an awaited evaluate whose result becomes a handle (or an inline
@@ -916,9 +913,8 @@ pub(crate) const RUNTIME_HANDLE: &str = r#"(() => {
 /// `returnByValue: false`. Results key by evaluation ID; a single shared slot
 /// would let overlapping evaluations overwrite each other.
 pub(crate) const RUNTIME_HANDLE_SCHEDULE: &str = r#"(() => {
-  globalThis.__tb_async_handles = globalThis.__tb_async_handles || {};
-  const slot = { done: false };
-  globalThis.__tb_async_handles[__ID__] = slot;
+  const slot = { __proto__: null, done: false };
+  host.__tb_async_handles[__ID__] = slot;
   Promise.resolve((__SOURCE__)).then(
     (v) => { slot.done = true; slot.value = v; },
     (e) => { slot.done = true; slot.error = String((e && e.message) || e); }
@@ -928,45 +924,44 @@ pub(crate) const RUNTIME_HANDLE_SCHEDULE: &str = r#"(() => {
 
 /// Reads the awaited handle result and serializes it as a CDP `RemoteObject`.
 pub(crate) const RUNTIME_HANDLE_READ: &str = r#"(() => {
-  const slot = globalThis.__tb_async_handles && globalThis.__tb_async_handles[__ID__];
-  if (!slot || !slot.done) return JSON.stringify({ pending: true });
-  delete globalThis.__tb_async_handles[__ID__];
-  if (slot.error !== undefined) return JSON.stringify({ error: slot.error });
-  globalThis.__tb_handles = globalThis.__tb_handles || {};
+  const slot = host.__tb_async_handles && host.__tb_async_handles[__ID__];
+  if (!slot || !slot.done) return host.stringify({__proto__: null, pending: true });
+  delete host.__tb_async_handles[__ID__];
+  if (slot.error !== undefined) return host.stringify({__proto__: null, error: slot.error });
   const v = slot.value;
-  if (v === null) return JSON.stringify({ type: "object", subtype: "null", value: null });
+  if (v === null) return host.stringify({__proto__: null, type: "object", subtype: "null", value: null });
   const t = typeof v;
-  if (t === "undefined") return JSON.stringify({ type: "undefined" });
+  if (t === "undefined") return host.stringify({__proto__: null, type: "undefined" });
   if (t === "number") {
-    if (Number.isFinite(v)) return JSON.stringify({ type: "number", value: v });
-    return JSON.stringify({ type: "number", unserializableValue: Number.isNaN(v) ? "NaN" : (v > 0 ? "Infinity" : "-Infinity") });
+    if (Number.isFinite(v)) return host.stringify({__proto__: null, type: "number", value: v });
+    return host.stringify({__proto__: null, type: "number", unserializableValue: Number.isNaN(v) ? "NaN" : (v > 0 ? "Infinity" : "-Infinity") });
   }
-  if (t === "string" || t === "boolean") return JSON.stringify({ type: t, value: v });
-  globalThis.__tb_handles[__ID__] = v;
+  if (t === "string" || t === "boolean") return host.stringify({__proto__: null, type: t, value: v });
+  host.__tb_handles[__ID__] = v;
   // A DOM node is an `ElementHandle` only when the remote object says
   // `subtype: "node"` (CDP `Runtime.RemoteObject`).
   if (t === "object" && typeof v.nodeType === "number" && typeof v.nodeName === "string")
-    return JSON.stringify({ type: "object", subtype: "node", className: (v.constructor && v.constructor.name) || "", objectId: __ID__ });
-  return JSON.stringify({ type: t === "function" ? "function" : "object", objectId: __ID__ });
+    return host.stringify({__proto__: null, type: "object", subtype: "node", className: (v.constructor && v.constructor.name) || "", objectId: __ID__ });
+  return host.stringify({__proto__: null, type: t === "function" ? "function" : "object", objectId: __ID__ });
 })()"#;
 
 /// Reads the captured async result and serializes it as a CDP `RemoteObject`.
 pub(crate) const RUNTIME_READ: &str = r#"(() => {
-  const s = globalThis.__tb_async && globalThis.__tb_async[__ID__];
-  if (!s || !s.done) return JSON.stringify({ pending: true });
-  delete globalThis.__tb_async[__ID__];
-  if (s.error !== undefined) return JSON.stringify({ error: s.error });
+  const s = host.__tb_async && host.__tb_async[__ID__];
+  if (!s || !s.done) return host.stringify({__proto__: null, pending: true });
+  delete host.__tb_async[__ID__];
+  if (s.error !== undefined) return host.stringify({__proto__: null, error: s.error });
   const v = s.value;
-  if (v === null) return JSON.stringify({ type: "object", subtype: "null", value: null });
+  if (v === null) return host.stringify({__proto__: null, type: "object", subtype: "null", value: null });
   const t = typeof v;
-  if (t === "undefined") return JSON.stringify({ type: "undefined" });
+  if (t === "undefined") return host.stringify({__proto__: null, type: "undefined" });
   if (t === "number") {
-    if (Number.isFinite(v)) return JSON.stringify({ type: "number", value: v });
-    return JSON.stringify({ type: "number", unserializableValue: Number.isNaN(v) ? "NaN" : (v > 0 ? "Infinity" : "-Infinity") });
+    if (Number.isFinite(v)) return host.stringify({__proto__: null, type: "number", value: v });
+    return host.stringify({__proto__: null, type: "number", unserializableValue: Number.isNaN(v) ? "NaN" : (v > 0 ? "Infinity" : "-Infinity") });
   }
-  if (t === "string" || t === "boolean") return JSON.stringify({ type: t, value: v });
-  try { return JSON.stringify({ type: "object", value: v }); }
-  catch (e) { return JSON.stringify({ type: "object" }); }
+  if (t === "string" || t === "boolean") return host.stringify({__proto__: null, type: t, value: v });
+  try { return host.stringify({__proto__: null, type: "object", value: v }); }
+  catch (e) { return host.stringify({__proto__: null, type: "object" }); }
 })()"#;
 
 pub(crate) async fn target_info(browser: &BrowserHandle, id: TabId) -> Value {

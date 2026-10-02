@@ -1,8 +1,8 @@
 (function() {
-  const windowNamedValue = globalThis.__tbWindowNamedValue;
-  const windowNamedHas = globalThis.__tbWindowNamedHas;
-  delete globalThis.__tbWindowNamedValue;
-  delete globalThis.__tbWindowNamedHas;
+  const windowNamedValue = host.__tbWindowNamedValue;
+  const windowNamedHas = host.__tbWindowNamedHas;
+  delete host.__tbWindowNamedValue;
+  delete host.__tbWindowNamedHas;
   const native = globalThis.NodeList.prototype;
   function values() {
     let index = 0;
@@ -54,7 +54,7 @@
   // `select.options` and `select.selectedOptions` collections.
   for (const name of ['options', 'selectedOptions']) {
     const nativeGetter = Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, name).get;
-    const cache = new WeakMap();
+    const cache = host.slots();
     Object.defineProperty(HTMLSelectElement.prototype, name, {
       get: function() {
         let collection = cache.get(this);
@@ -72,7 +72,7 @@
   // (<https://dom.spec.whatwg.org/#interface-namednodemap>).
   // NamedNodeMap exposes indexed and named properties as real own
   // properties; interface members and prototype methods always win.
-  Object.defineProperty(globalThis, '__tb_refreshNamedNodeMap', {
+  Object.defineProperty(host, '__tb_refreshNamedNodeMap', {
     enumerable: false,
     configurable: false,
     writable: false,

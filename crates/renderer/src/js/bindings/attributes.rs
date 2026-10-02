@@ -975,7 +975,7 @@ pub(crate) fn refresh_named_node_map<'js>(
             .map(|parsed| parsed.document.attribute_names(element))
             .unwrap_or_default()
     };
-    let refresh: Function = ctx.globals().get("__tb_refreshNamedNodeMap")?;
+    let refresh: Function = crate::js::bridge::object(ctx)?.get("__tb_refreshNamedNodeMap")?;
     refresh.call::<_, ()>((map.clone(), names, html))?;
     Ok(())
 }

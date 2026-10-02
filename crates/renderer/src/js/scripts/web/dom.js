@@ -1,4 +1,4 @@
-globalThis.__tbMakeDataset = element => new Proxy(Object.create(null), {
+host.__tbMakeDataset = element => new Proxy(Object.create(null), {
   get(_target, property) {
     if (property === Symbol.toStringTag) return 'DOMStringMap';
     if (typeof property !== 'string') return undefined;
@@ -31,7 +31,7 @@ globalThis.__tbMakeDataset = element => new Proxy(Object.create(null), {
   }
 });
 
-globalThis.__tbMakeStyle = element => {
+host.__tbMakeStyle = element => {
   const splitDeclarations = value => {
     const parts = []; let start = 0; let quote = '';
     for (let i = 0; i < value.length; i++) {

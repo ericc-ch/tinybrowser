@@ -57,7 +57,7 @@ impl EmbeddedRenderer {
         timeout: Option<Duration>,
     ) -> Result<RemoteValue, TabError> {
         self.engine
-            .execute_remote_in(FrameId::MAIN, source, timeout)
+            .execute_remote_in(FrameId::MAIN, crate::ScriptSource::Page(source), timeout)
     }
 
     /// Runs every immediately ready page task without blocking.

@@ -41,16 +41,16 @@
     configurable: true,
   });
 
-  const customErrors = new WeakMap();
-  const validityStates = new WeakMap();
+  const customErrors = host.slots();
+  const validityStates = host.slots();
   // Controls whose value was last changed by a user edit. `maxlength` and
   // `minlength` apply only then
   // (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#suffering-from-being-too-long>).
-  const userEdited = new WeakSet();
+  const userEdited = host.slots();
   // The input/typing paths call this so `maxlength`/`minlength` can tell a
   // user edit from a script assignment
   // (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#suffering-from-being-too-long>).
-  Object.defineProperty(globalThis, '__tbMarkUserEdited', {
+  Object.defineProperty(host, '__tbMarkUserEdited', {
     value: element => { userEdited.add(element); },
     writable: false, configurable: false, enumerable: false,
   });
@@ -701,8 +701,8 @@
 
   // ── submit events and submission ───────────────────────────────────────
 
-  const SUBMITTER = Symbol('tb-submit-submitter');
-  const FORMDATA = Symbol('tb-formdata-event-data');
+  const SUBMITTER = host.slots('tb-submit-submitter');
+  const FORMDATA = host.slots('tb-formdata-event-data');
 
   // <https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#submitevent>
   function SubmitEvent(type) {
@@ -711,8 +711,7 @@
     }
     const init = arguments[1];
     const event = Reflect.construct(globalThis.Event, arguments, new.target);
-    event[SUBMITTER] =
-      (init === undefined || init === null || init.submitter === undefined) ? null : init.submitter;
+    SUBMITTER.set(event, (init === undefined || init === null || init.submitter === undefined) ? null : init.submitter);
     return event;
   }
   const submitProto = Object.create(globalThis.Event.prototype);
@@ -720,7 +719,7 @@
     value: SubmitEvent, writable: true, configurable: true,
   });
   Object.defineProperty(submitProto, 'submitter', {
-    get() { return this[SUBMITTER]; }, enumerable: true, configurable: true,
+    get() { return SUBMITTER.get(this); }, enumerable: true, configurable: true,
   });
   Object.defineProperty(submitProto, Symbol.toStringTag, {
     value: 'SubmitEvent', writable: false, enumerable: false, configurable: true,
@@ -740,7 +739,7 @@
       throw new TypeError('FormDataEventInit requires formData');
     }
     const event = Reflect.construct(globalThis.Event, arguments, new.target);
-    event[FORMDATA] = init.formData;
+    FORMDATA.set(event, init.formData);
     return event;
   }
   const formDataProto = Object.create(globalThis.Event.prototype);
@@ -748,7 +747,7 @@
     value: FormDataEvent, writable: true, configurable: true,
   });
   Object.defineProperty(formDataProto, 'formData', {
-    get() { return this[FORMDATA]; }, enumerable: true, configurable: true,
+    get() { return FORMDATA.get(this); }, enumerable: true, configurable: true,
   });
   Object.defineProperty(formDataProto, Symbol.toStringTag, {
     value: 'FormDataEvent', writable: false, enumerable: false, configurable: true,
@@ -767,7 +766,7 @@
   const charsetLabel = form => {
     for (const label of (form.acceptCharset || '').split(/[\t\n\f\r ]+/)) {
       if (label === '') continue;
-      const name = globalThis.__tbEncodingName(label);
+      const name = host.__tbEncodingName(label);
       if (name !== null && name !== undefined) return name;
     }
     return 'UTF-8';
@@ -800,7 +799,7 @@
     return out;
   };
   const charsetBytes = (text, label) => {
-    const encoded = globalThis.__tbEncodeForm(toWellFormed(String(text)), label);
+    const encoded = host.__tbEncodeForm(toWellFormed(String(text)), label);
     const bytes = new Uint8Array(encoded.length);
     for (let index = 0; index < encoded.length; index++) {
       bytes[index] = encoded.charCodeAt(index);
@@ -893,7 +892,7 @@
         push(`"; filename="`);
         chunks.push(charsetBytes(escapeMultipartFilename(value.name), label));
         push(`"\r\nContent-Type: ${value.type || 'application/octet-stream'}\r\n\r\n`);
-        const data = value[__tbBlobData];
+        const data = __tbBlobData.get(value);
         chunks.push(data === undefined ? encoder.encode(String(value)) : data.bytes);
         push('\r\n');
       } else {
@@ -967,7 +966,7 @@
       const withoutFragment = hash === -1 ? action : action.slice(0, hash);
       const query = withoutFragment.indexOf('?');
       const base = query === -1 ? withoutFragment : withoutFragment.slice(0, query);
-      globalThis.__tbFormNavigate(base + '?' + encoded + fragment, target, 'GET', '', null);
+      host.__tbFormNavigate(base + '?' + encoded + fragment, target, 'GET', '', null);
       return;
     }
     // POST: the entries become the request body, encoded per `enctype`
@@ -983,7 +982,7 @@
       body = urlEncode(formData, label);
       contentType = 'application/x-www-form-urlencoded';
     }
-    globalThis.__tbFormNavigate(action, target, 'POST', body, contentType);
+    host.__tbFormNavigate(action, target, 'POST', body, contentType);
   };
 
   // The submission algorithm's entry-list step: the FormData constructor
@@ -1076,7 +1075,7 @@
     // The `selected` argument sets selectedness without the dirty flag, so a
     // later `selected` attribute change still updates it
     // (<https://html.spec.whatwg.org/multipage/form-elements.html#dom-option-option>).
-    globalThis.__tbSetOptionSelectedness(option, selected !== undefined && Boolean(selected));
+    host.__tbSetOptionSelectedness(option, selected !== undefined && Boolean(selected));
     return option;
   }
   Object.defineProperty(Option, 'prototype', {
@@ -1561,7 +1560,7 @@
     return collectionOf(() => matches, prototype, true);
   };
 
-  const elementsCache = new WeakMap();
+  const elementsCache = host.slots();
   Object.defineProperties(globalThis.HTMLFormElement.prototype, {
     elements: {
       get() {

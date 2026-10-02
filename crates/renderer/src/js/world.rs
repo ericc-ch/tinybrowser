@@ -25,6 +25,7 @@ pub(crate) struct RealmRegistry {
     pub(crate) attributes: AttributeRegistry,
     pub(crate) observers: super::observers::MutationObservers,
     pub(crate) reactions: super::reactions::CustomElementReactions,
+    pub(crate) private_slots: Option<PrivateSlots>,
     budget: Rc<RefCell<ResourceBudget>>,
     /// The World that owns each document id, for wrapper realm resolution.
     documents: HashMap<u32, Weak<RefCell<World>>>,
@@ -39,6 +40,11 @@ pub(crate) struct RealmRegistry {
     /// `WebDriver` element ids, allocated across every world and frame so a
     /// reference cannot alias between browsing contexts.
     next_remote: u64,
+}
+
+pub(crate) struct PrivateSlots {
+    pub(crate) factory: Persistent<Function<'static>>,
+    pub(crate) realms: HashSet<usize>,
 }
 
 impl RealmRegistry {
@@ -124,6 +130,7 @@ impl RealmRegistry {
         self.realm_contexts.clear();
         self.attributes.clear();
         self.reactions.clear();
+        self.private_slots = None;
         self.documents.clear();
         self.frames.clear();
         self.wrappers.clear();
@@ -402,6 +409,7 @@ pub(crate) struct World {
     /// (<https://html.spec.whatwg.org/multipage/interaction.html#dom-click>).
     clicks_in_progress: HashSet<NodeId>,
     brands: HashMap<String, Persistent<Object<'static>>>,
+    pub(crate) bridge: Option<Persistent<Object<'static>>>,
     /// Event handler properties (`element.onload`, `window.onmessage`) live
     /// here rather than on the wrapper, which may be collected while the node
     /// stays alive. Keyed by `(None, name)` for the window and
@@ -429,10 +437,6 @@ pub(crate) struct World {
     /// The realm's own mutation-delivery entry point, so scheduling never
     /// depends on a page-deletable global.
     pub(crate) deliver_mutations_fn: Option<Persistent<Function<'static>>>,
-    /// Unforgeable token for the trusted-event bridge: our shims close over
-    /// a copy, page script cannot name it, and the bridge rejects calls made
-    /// without it.
-    pub(crate) host_token: Option<Persistent<Value<'static>>>,
     /// Decoded `<img>` bitmaps for this document, used by both paint and
     /// script geometry.
     pub(crate) images: HashMap<NodeId, crate::render::RasterImage>,
@@ -515,6 +519,7 @@ impl World {
             active_elements: HashMap::new(),
             clicks_in_progress: HashSet::new(),
             brands: HashMap::new(),
+            bridge: None,
             handler_attributes: HashMap::new(),
             cleared_handlers: HashSet::new(),
             remote_ids: HashMap::new(),
@@ -525,7 +530,6 @@ impl World {
             pristine_queue_microtask: None,
             weak_references: None,
             deliver_mutations_fn: None,
-            host_token: None,
             images: HashMap::new(),
             image_loading: HashSet::new(),
             image_current_src: HashMap::new(),
@@ -1434,7 +1438,7 @@ impl World {
         self.pristine_queue_microtask = None;
         self.weak_references = None;
         self.deliver_mutations_fn = None;
-        self.host_token = None;
+        self.bridge = None;
     }
 
     /// One cached platform object, if this realm created it.

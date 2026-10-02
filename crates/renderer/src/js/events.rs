@@ -404,36 +404,30 @@ impl JsEventTarget {
     }
 }
 
-/// Installs the host-token bridge user-agent shims use to deliver a trusted
-/// event to a constructible `EventTarget` without `dispatchEvent`'s trust
-/// clearing. Not part of the Web IDL surface.
 pub(crate) fn install_event_target_bridge(ctx: &Ctx<'_>) -> Result<()> {
-    let prototype = Class::<JsEventTarget>::prototype(ctx)?.ok_or_else(|| {
-        Exception::throw_internal(ctx, "EventTarget has no prototype")
-    })?;
-    prototype.set(
-        "__tbDispatchTrusted",
+    super::bridge::object(ctx)?.set(
+        "__tbDispatchTargetTrusted",
         rquickjs::prelude::Func::from(dispatch_trusted_bridge),
     )?;
     Ok(())
 }
 
-/// The `__tbDispatchTrusted` implementation: rejects calls that do not carry
-/// the host token, then dispatches without clearing the trust bit.
 #[allow(
     clippy::needless_pass_by_value,
     reason = "rquickjs Func ABI passes arguments by value"
 )]
 fn dispatch_trusted_bridge<'js>(
     ctx: Ctx<'js>,
-    this: This<Object<'js>>,
-    token: Value<'js>,
+    target: Object<'js>,
     event: Class<'js, JsEvent>,
 ) -> Result<bool> {
-    bindings::check_host_token(&ctx, &token)?;
-    let class = Class::<JsEventTarget>::from_js(&ctx, this.0.clone().into_value())?;
+    // https://dom.spec.whatwg.org/#concept-event-fire
+    if let Some(node) = super::bindings::host_node_id(&ctx, target.as_value()) {
+        return dispatch_trusted_event(&ctx, EventTargetKey::Node(node), &event);
+    }
+    let class = Class::<JsEventTarget>::from_js(&ctx, target.clone().into_value())?;
     let id = class.borrow().id;
-    register_standalone(&ctx, id, &this.0)?;
+    register_standalone(&ctx, id, &target)?;
     dispatch_trusted_event(&ctx, EventTargetKey::Standalone(id), &event)
 }
 

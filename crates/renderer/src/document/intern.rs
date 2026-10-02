@@ -6,7 +6,7 @@ use crate::protocol::TabError;
 impl Document {
     pub(crate) fn execute_remote(
         &mut self,
-        source: &str,
+        source: crate::ScriptSource<&str>,
         timeout: Option<Duration>,
     ) -> Result<crate::RemoteValue, TabError> {
         let deadline = timeout.map(|duration| WallClock::now() + duration);

@@ -1,16 +1,16 @@
 (function() {
   const native = globalThis.Node.prototype;
-  const inputFilesSymbol = Symbol.for('tinybrowser.input.files');
+  const inputFilesSymbol = host.slots('tinybrowser.input.files');
   function illegal() { throw new TypeError('Illegal constructor'); }
   function define(name, parent, members, constructible) {
     const ctor = constructible
       ? function() {
-          const value = globalThis.__tb_construct.apply(
+          const value = __tbApply(host.__tb_construct,
             globalThis,
-            [name].concat(Array.prototype.slice.call(arguments))
+            [name, ...arguments]
           );
           if (name === 'HTMLElement' && new.target && new.target.prototype) {
-            Object.setPrototypeOf(value, new.target.prototype);
+            __tbSetPrototypeOf(value, new.target.prototype);
           }
           return value;
         }
@@ -255,9 +255,9 @@
     };
     const hrefValue = function() {
       const value = this.getAttribute('href');
-      return value === null ? null : globalThis.__tbUSVString(value);
+      return value === null ? null : host.__tbUSVString(value);
     };
-    const base = function() { return globalThis.__tbUSVString(document.baseURI); };
+    const base = function() { return host.__tbUSVString(document.baseURI); };
     for (const proto of [table.HTMLAnchorElement, table.HTMLAreaElement]) {
       for (const name of Object.keys(parts)) {
         const index = parts[name];
@@ -267,7 +267,7 @@
             // the document URL.
             const href = hrefValue.call(this);
             if (href === null) return name === 'protocol' ? ':' : '';
-            const values = __tbUrlParts(href, base.call(this));
+            const values = host.__tbUrlParts(href, base.call(this));
             if (values === null || values === undefined) {
               return name === 'protocol' ? ':' : '';
             }
@@ -281,8 +281,8 @@
             // Setting a component with no `href` attribute is a no-op.
             const href = hrefValue.call(this);
             if (href === null) return;
-            const result = __tbUrlSetPart(
-              href, base.call(this), index, globalThis.__tbUSVString(value));
+            const result = host.__tbUrlSetPart(
+              href, base.call(this), index, host.__tbUSVString(value));
             if (result !== null && result !== undefined) this.setAttribute('href', result);
           };
         }
@@ -335,12 +335,10 @@
       // `files` applies only to the File Upload state
       // (<https://html.spec.whatwg.org/multipage/input.html#dom-input-files>).
       if (this.type !== 'file') return null;
-      let list = this[inputFilesSymbol];
+      let list = inputFilesSymbol.get(this);
       if (list === undefined) {
-        list = globalThis.__tbCreateFileList([]);
-        Object.defineProperty(this, inputFilesSymbol, {
-          value: list, writable: false, enumerable: false, configurable: false,
-        });
+        list = host.__tbCreateFileList([]);
+        inputFilesSymbol.set(this, list);
       }
       return list;
     },
@@ -353,10 +351,8 @@
       // `input.files = fileList` replaces the list a script set; the same list
       // can be shared across inputs
       // (<https://html.spec.whatwg.org/multipage/input.html#dom-input-files>).
-      Object.defineProperty(this, inputFilesSymbol, {
-        value: value, writable: true, enumerable: false, configurable: true,
-      });
-      globalThis.__tbSetInputFiles(this, value);
+      inputFilesSymbol.set(this, value);
+      host.__tbSetInputFiles(this, value);
     },
     enumerable: true,
     configurable: true,
@@ -386,7 +382,7 @@
       writable: true, configurable: true, enumerable: true,
     },
   });
-  Object.defineProperty(globalThis, '__tb_brandTable', {
+  Object.defineProperty(host, '__tb_brandTable', {
     enumerable: false,
     configurable: true,
     value: table,

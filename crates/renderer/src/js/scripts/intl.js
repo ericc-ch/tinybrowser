@@ -1,14 +1,14 @@
 (function() {
-  const nativeCanonicalLocale = globalThis.__tbIntlCanonicalLocale;
-  const nativeResolveLocale = globalThis.__tbIntlResolveLocale;
-  const nativeCurrencyDigits = globalThis.__tbIntlCurrencyDigits;
-  const nativeFormatNumber = globalThis.__tbIntlFormatNumber;
-  const nativeFormatDateTime = globalThis.__tbIntlFormatDateTime;
-  delete globalThis.__tbIntlCanonicalLocale;
-  delete globalThis.__tbIntlResolveLocale;
-  delete globalThis.__tbIntlCurrencyDigits;
-  delete globalThis.__tbIntlFormatNumber;
-  delete globalThis.__tbIntlFormatDateTime;
+  const nativeCanonicalLocale = host.__tbIntlCanonicalLocale;
+  const nativeResolveLocale = host.__tbIntlResolveLocale;
+  const nativeCurrencyDigits = host.__tbIntlCurrencyDigits;
+  const nativeFormatNumber = host.__tbIntlFormatNumber;
+  const nativeFormatDateTime = host.__tbIntlFormatDateTime;
+  delete host.__tbIntlCanonicalLocale;
+  delete host.__tbIntlResolveLocale;
+  delete host.__tbIntlCurrencyDigits;
+  delete host.__tbIntlFormatNumber;
+  delete host.__tbIntlFormatDateTime;
 
   const call = Function.prototype.call.bind(Function.prototype.call);
   const objectConstructor = Object;
@@ -46,8 +46,8 @@
   const dateGetUTCMinutes = Date.prototype.getUTCMinutes;
   const dateGetUTCSeconds = Date.prototype.getUTCSeconds;
 
-  const numberSlots = new WeakMap();
-  const dateTimeSlots = new WeakMap();
+  const numberSlots = host.slots();
+  const dateTimeSlots = host.slots();
   const numberSlotsGet = numberSlots.get.bind(numberSlots);
   const numberSlotsSet = numberSlots.set.bind(numberSlots);
   const dateTimeSlotsGet = dateTimeSlots.get.bind(dateTimeSlots);

@@ -7,12 +7,15 @@
 // on the JS side.
 (function() {
   const Native = globalThis.DOMParser;
+  const parsers = host.slots('DOMParser');
   class DOMParser {
     constructor() {
-      Object.defineProperty(this, '__tbParser', { value: new Native() });
+      parsers.set(this, new Native());
     }
     parseFromString(source, type) {
-      return this.__tbParser.parseFromString(source, type);
+      const parser = parsers.get(this);
+      if (parser === undefined) throw new TypeError('Illegal invocation');
+      return parser.parseFromString(source, type);
     }
   }
   Object.defineProperty(globalThis, 'DOMParser', {

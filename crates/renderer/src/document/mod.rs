@@ -770,7 +770,7 @@ impl Document {
 
     pub(crate) fn execute_script_deadline(
         &mut self,
-        source: &str,
+        source: crate::ScriptSource<&str>,
         deadline: Option<WallClock>,
     ) -> Result<ScriptValue, TabError> {
         self.ensure_js()?;

@@ -4,11 +4,10 @@
   class CSSStyleSheet {
     constructor() {
       this.cssRules = [];
-      this._text = '';
     }
     replaceSync(text) {
-      this._text = String(text);
-      this.cssRules = this._text ? [{ cssText: this._text }] : [];
+      const cssText = String(text);
+      this.cssRules = cssText ? [{ cssText }] : [];
     }
     replace(text) {
       this.replaceSync(text);

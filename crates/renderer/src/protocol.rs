@@ -41,6 +41,40 @@ impl FrameId {
     }
 }
 
+/// Selects the evaluation environment at the browser-to-renderer boundary.
+/// Page sources run globally. Browser expressions receive the private bridge
+/// and must never contain interpolated author code.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub enum ScriptSource<T = String> {
+    /// Page code, evaluated in the global environment without engine capabilities.
+    Page(T),
+    /// A browser-owned expression, evaluated with the private realm bridge.
+    /// Author-provided code must be passed separately to the page evaluator.
+    Browser(T),
+}
+
+impl ScriptSource {
+    /// Borrows the source while preserving its evaluation environment.
+    #[must_use]
+    pub fn as_ref(&self) -> ScriptSource<&str> {
+        match self {
+            Self::Page(source) => ScriptSource::Page(source),
+            Self::Browser(source) => ScriptSource::Browser(source),
+        }
+    }
+}
+
+impl ScriptSource<&str> {
+    /// Copies the source for transport while preserving its environment.
+    #[must_use]
+    pub fn into_owned(self) -> ScriptSource {
+        match self {
+            Self::Page(source) => ScriptSource::Page(source.to_owned()),
+            Self::Browser(source) => ScriptSource::Browser(source.to_owned()),
+        }
+    }
+}
+
 /// Why a renderer API call was refused.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TabError {

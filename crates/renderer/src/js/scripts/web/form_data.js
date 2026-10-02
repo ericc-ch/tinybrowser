@@ -1,7 +1,7 @@
 // `FormData`: the entry list a form contributes, plus programmatic entries
 // (<https://xhr.spec.whatwg.org/#interface-formdata>).
 (function() {
-  const lists = new WeakMap();
+  const lists = host.slots();
 
   function FormData(form, submitter) {
     if (!(this instanceof FormData)) {
@@ -10,10 +10,10 @@
     const list = [];
     lists.set(this, list);
     if (form !== undefined && form !== null) {
-      const flat = globalThis.__tbFormEntries(
+      const flat = host.__tbFormEntries(
         form, submitter === undefined || submitter === null ? null : submitter);
       for (let index = 0; index + 1 < flat.length; index += 2) {
-        list.push([String(flat[index]), flat[index + 1]]);
+        __tbArray.push(list, [String(flat[index]), flat[index + 1]]);
       }
       // Constructing the entry list fires `formdata`, whose handler may extend
       // the list (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#constructing-form-data-set>).
@@ -50,7 +50,7 @@
 
   Object.defineProperty(FormData.prototype, 'append', {
     value: function(name, value, filename) {
-      entryList(this).push([String(name), createEntry(value, filename)]);
+      __tbArray.push(entryList(this), [String(name), createEntry(value, filename)]);
     },
     writable: true, enumerable: true, configurable: true,
   });
@@ -60,7 +60,7 @@
       const key = String(name);
       const list = entryList(this);
       for (let index = list.length - 1; index >= 0; index--) {
-        if (list[index][0] === key) list.splice(index, 1);
+        if (list[index][0] === key) __tbArray.remove(list, index);
       }
     },
     writable: true, enumerable: true, configurable: true,
@@ -69,7 +69,9 @@
   Object.defineProperty(FormData.prototype, 'get', {
     value: function(name) {
       const key = String(name);
-      for (const entry of entryList(this)) {
+      const list = entryList(this);
+      for (let index = 0; index < list.length; index++) {
+        const entry = list[index];
         if (entry[0] === key) return entry[1];
       }
       return null;
@@ -81,8 +83,10 @@
     value: function(name) {
       const key = String(name);
       const values = [];
-      for (const entry of entryList(this)) {
-        if (entry[0] === key) values.push(entry[1]);
+      const list = entryList(this);
+      for (let index = 0; index < list.length; index++) {
+        const entry = list[index];
+        if (entry[0] === key) __tbArray.push(values, entry[1]);
       }
       return values;
     },
@@ -92,7 +96,7 @@
   Object.defineProperty(FormData.prototype, 'has', {
     value: function(name) {
       const key = String(name);
-      return entryList(this).some(entry => entry[0] === key);
+      return __tbArray.some(entryList(this), entry => entry[0] === key);
     },
     writable: true, enumerable: true, configurable: true,
   });
@@ -104,14 +108,17 @@
       const list = entryList(this);
       // Replace the first match and remove the rest
       // (<https://xhr.spec.whatwg.org/#dom-formdata-set>).
-      const first = list.findIndex(item => item[0] === key);
+      let first = -1;
+      for (let index = 0; index < list.length; index++) {
+        if (list[index][0] === key) { first = index; break; }
+      }
       if (first === -1) {
-        list.push(entry);
+        __tbArray.push(list, entry);
         return;
       }
       list[first] = entry;
       for (let index = list.length - 1; index > first; index--) {
-        if (list[index][0] === key) list.splice(index, 1);
+        if (list[index][0] === key) __tbArray.remove(list, index);
       }
     },
     writable: true, enumerable: true, configurable: true,
@@ -122,15 +129,17 @@
       if (typeof callback !== 'function') {
         throw new TypeError('callback is not a function');
       }
-      for (const entry of entryList(this).slice()) {
-        callback.call(thisArg, entry[1], entry[0], this);
+      const list = __tbArray.map(entryList(this), entry => entry);
+      for (let index = 0; index < list.length; index++) {
+        const entry = list[index];
+        __tbApply(callback, thisArg, [entry[1], entry[0], this]);
       }
     },
     writable: true, enumerable: true, configurable: true,
   });
 
   const iterator = (receiver, kind) => {
-    const list = entryList(receiver).slice();
+    const list = __tbArray.map(entryList(receiver), entry => entry);
     let index = 0;
     const result = {
       next() {

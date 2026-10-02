@@ -5,11 +5,12 @@
     if (new.target === undefined) {
       throw new TypeError('Class constructor Event cannot be invoked without new');
     }
-    const event = Reflect.construct(Native, arguments, new.target);
+    const event = __tbConstruct(Native, arguments, new.target);
     // [LegacyUnforgeable] own getter
     // (<https://dom.spec.whatwg.org/#dom-event-istrusted>,
     // <https://webidl.spec.whatwg.org/#dfn-unforgeable>).
-    Object.defineProperty(event, 'isTrusted', {
+    __tbDefineProperty(event, 'isTrusted', {
+      __proto__: null,
       get: isTrustedGet, enumerable: true, configurable: false,
     });
     return event;

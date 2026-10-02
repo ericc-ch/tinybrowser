@@ -307,7 +307,7 @@ pub(crate) fn schedule_mutation_delivery(ctx: &Ctx<'_>) -> Result<()> {
             (deliver.restore(ctx)?, queue.restore(ctx)?)
         } else {
             (
-                ctx.globals().get::<_, Function>("__tb_deliver_mutations")?,
+                crate::js::bridge::object(ctx)?.get::<_, Function>("__tb_deliver_mutations")?,
                 ctx.globals().get::<_, Function>("queueMicrotask")?,
             )
         };

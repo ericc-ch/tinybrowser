@@ -1,13 +1,10 @@
-// Blob bytes live as a Uint8Array under a symbol key, so no IDL member is an
-// own property and a method called from another realm of the same runtime can
-// still recognize its receiver.
-const __tbBlobData = Symbol.for('tinybrowser.blob.data');
-const __tbFileData = Symbol.for('tinybrowser.file.data');
-const __tbFileListData = Symbol.for('tinybrowser.filelist.data');
-const __tbReaderData = Symbol.for('tinybrowser.filereader.data');
-const __tbProgressData = Symbol.for('tinybrowser.progress.data');
-const __tbDecoderData = Symbol.for('tinybrowser.textdecoder.data');
-const __tbStreamData = Symbol.for('tinybrowser.readablestream.data');
+const __tbBlobData = host.slots('tinybrowser.blob.data');
+const __tbFileData = host.slots('tinybrowser.file.data');
+const __tbFileListData = host.slots('tinybrowser.filelist.data');
+const __tbReaderData = host.slots('tinybrowser.filereader.data');
+const __tbProgressData = host.slots('tinybrowser.progress.data');
+const __tbDecoderData = host.slots('tinybrowser.textdecoder.data');
+const __tbStreamData = host.slots('tinybrowser.readablestream.data');
 // https://encoding.spec.whatwg.org/#utf-8-encoder, with lone surrogates
 // replaced as the standard requires.
 const __tbUtf8Encode = value => {
@@ -70,7 +67,7 @@ const __tbUtf8Decode = (bytes, fatal, ignoreBOM) => {
     text += String.fromCodePoint(code);
     index += needed + 1;
   }
-  return { text, remainder: bytes.slice(index) };
+  return { text, remainder: __tbBytesCopy(bytes, index) };
 };
 // https://encoding.spec.whatwg.org/#utf-16le-decoder
 const __tbUtf16Decode = (bytes, littleEndian, ignoreBOM) => {
@@ -86,13 +83,14 @@ const __tbUtf16Decode = (bytes, littleEndian, ignoreBOM) => {
     text += String.fromCharCode(code);
   }
   const consumed = bytes.length - ((bytes.length - start) & 1);
-  return { text, remainder: bytes.slice(consumed) };
+  return { text, remainder: __tbBytesCopy(bytes, consumed) };
 };
 // https://encoding.spec.whatwg.org/#windows-1252
 const __tbWindows1252 = bytes => {
   const table = '\u20ac\u0081\u201a\u0192\u201e\u2026\u2020\u2021\u02c6\u2030\u0160\u2039\u0152\u008d\u017d\u008f\u0090\u2018\u2019\u201c\u201d\u2022\u2013\u2014\u02dc\u2122\u0161\u203a\u0153\u009d\u017e\u0178';
   let text = '';
-  for (const byte of bytes) {
+  for (let index = 0; index < bytes.length; index++) {
+    const byte = bytes[index];
     text += byte >= 0x80 && byte <= 0x9f ? table[byte - 0x80] : String.fromCharCode(byte);
   }
   return text;
@@ -185,14 +183,11 @@ globalThis.TextDecoder = class TextDecoder {
     const optionsObject = options === undefined ? {} : Object(options);
     const encoding = label === undefined ? 'utf-8' : __tbEncoding(String(label));
     if (encoding === null) throw new RangeError('The encoding label is not supported');
-    Object.defineProperty(this, __tbDecoderData, {
-      value: {
+    __tbDecoderData.set(this, {
         encoding,
         fatal: optionsObject.fatal !== undefined && Boolean(optionsObject.fatal),
         ignoreBOM: optionsObject.ignoreBOM !== undefined && Boolean(optionsObject.ignoreBOM),
-        pending: new Uint8Array(0),
-      },
-      writable: false, enumerable: false, configurable: false,
+        pending: host.slots.bytes(0),
     });
   }
   get encoding() { return __tbBrand(this, __tbDecoderData).encoding; }
@@ -206,9 +201,9 @@ globalThis.TextDecoder = class TextDecoder {
       else if (input instanceof ArrayBuffer) bytes = new Uint8Array(input);
       else throw new TypeError('The input argument must be an ArrayBuffer or ArrayBufferView');
       if (bytes.length > 0) {
-        const combined = new Uint8Array(data.pending.length + bytes.length);
-        combined.set(data.pending);
-        combined.set(bytes, data.pending.length);
+        const combined = host.slots.bytes(data.pending.length + bytes.length);
+        for (let index = 0; index < data.pending.length; index++) combined[index] = data.pending[index];
+        for (let index = 0; index < bytes.length; index++) combined[data.pending.length + index] = bytes[index];
         data.pending = combined;
       }
     }
@@ -216,7 +211,7 @@ globalThis.TextDecoder = class TextDecoder {
     let text;
     if (data.encoding === 'utf-8') {
       const decoded = __tbUtf8Decode(data.pending, data.fatal, data.ignoreBOM);
-      data.pending = stream ? decoded.remainder : new Uint8Array(0);
+      data.pending = stream ? host.slots.bytes(decoded.remainder) : host.slots.bytes(0);
       if (!stream && decoded.remainder.length) {
         // A truncated tail is a decode error; fatal turns it into a throw,
         // otherwise it is one replacement character
@@ -228,10 +223,10 @@ globalThis.TextDecoder = class TextDecoder {
       }
     } else if (data.encoding === 'windows-1252') {
       text = __tbWindows1252(data.pending);
-      data.pending = new Uint8Array(0);
+      data.pending = host.slots.bytes(0);
     } else {
       const decoded = __tbUtf16Decode(data.pending, data.encoding === 'utf-16le', data.ignoreBOM);
-      data.pending = stream ? decoded.remainder : new Uint8Array(0);
+      data.pending = stream ? host.slots.bytes(decoded.remainder) : host.slots.bytes(0);
       text = decoded.text;
     }
     return text;

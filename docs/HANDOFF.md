@@ -1,12 +1,11 @@
-# Handoff (2026-10-01)
+# Handoff (2026-10-02)
 
-Goal: Replace tinybrowser's whole native JS binding layer with browser-specific
-WebIDL codegen plus shared dispatch, so the shipping binary shrinks. The
-`#[rquickjs::methods]` class in `crates/renderer/src/js/bindings/node.rs` is the
-last big native surface; every interface is being moved to a checked-in
-`.webidl` file under `crates/renderer/idl/` whose generated `OUT_DIR` module
-installs members onto the interface prototype and dispatches to Rust platform
-methods marked `#[qjs(skip)]`.
+Goal: Hide browser internals from page scripts while retaining the JS Web APIs.
+All shim-private state, CDP storage, and WebDriver helpers are in scope.
+Plan: Private initialization and callbacks, private object state, privileged-path
+hardening, then security tests, WPT comparisons, and shipping-size measurement.
+Finish when only intended APIs are reachable and the audited paths do not leak
+capabilities. Fix regressions before committing locally. Pushing is not authorized.
 
 ## State
 
@@ -19,17 +18,18 @@ methods marked `#[qjs(skip)]`.
   `sys/quickjs`). Upstream pulls happen inside the submodule, then the pointer is
   bumped here. Fresh worktrees need
   `git submodule update --init --recursive`.
-- Shipping binary is 8,670,008 bytes (`docs/progress.md`). Verify with
+- Shipping binary is 8,697,592 bytes (`docs/progress.md`). Verify with
   `nix develop --command ./tools/release`.
 - Last migration evidence (`/tmp/opencode/`): `before-domcore.json` vs
   `after-domcore.json` over `dom/nodes`, `dom/collections`, `shadow-dom`,
   `css/cssom-view`, `html/dom`, `domparsing` gives 749 FAIL-to-PASS, 38
   MISSING-to-PASS, 1 ERROR-to-OK, and no `PASS`/`OK`-to-worse change; the
-  only `MISSING`/`TIMEOUT` entries are two long files
+  interrupted files include
   (`shadow-dom/declarative/gethtml.html`, `html/dom/reflection-embedded.html`)
-  that the runner interrupts in both runs. `before-forms.json` vs
-  `after-forms.json` over `html/semantics/forms` gives 2 FAIL-to-PASS and no
-  real regression.
+  that the runner interrupts in both runs. Those reports also contain adverse
+  FAIL-to-MISSING changes. `before-forms.json` vs `after-forms.json` over
+  `html/semantics/forms` gives 2 FAIL-to-PASS. Both reports need focused retests
+  of adverse ERROR/TIMEOUT changes before claiming conformance is unchanged.
 - Verification harness: `tools/check` (clippy, embedded JS, rustdoc),
   `cargo test --workspace`, the 30-case probe at
   `/tmp/opencode/jsbinding-research/probe.py <binary>`, and before/after WPT via
@@ -59,21 +59,59 @@ HTML form controls and elements: `HTMLFormElement`, `HTMLInputElement`,
 `HTMLButtonElement`, `HTMLFieldSetElement`, `HTMLOptGroupElement`,
 `HTMLIFrameElement`, `HTMLImageElement`.
 
+## Private bridge
+
+`crates/renderer/src/js/bridge.rs` passes a private host object to initialization
+closures. Rust retains that object in each World. `scripts/private_state.js`
+stores object state in shared weak maps owned by RealmRegistry. The shared
+factory runs in an inert context. Realm leases release the factory after the
+last realm drops. Author evaluation uses a separate global evaluator. CDP and
+WebDriver encode author code before passing it to that evaluator.
+
+Private lists use captured indexed operations and null-prototype descriptors.
+Private registries use captured collection operations. Blob bytes, decoder
+state, and XHR received bytes live in the inert context. Input delivery uses
+captured constructors and native trusted dispatch. Debugger metadata uses
+private tables and captured serialization. Shared Window identity covers realm
+globals and WindowProxy objects. Private array iterators retain terminal state.
+
+Verification for the shipping candidate:
+
+- `tools/check`: `/tmp/opencode/bridge-check.log`.
+- Workspace tests: `/tmp/opencode/bridge-tests.log`.
+- Playwright 37/37, including 22 bridge regressions:
+  `/tmp/opencode/bridge-shipping-playwright.log`.
+- Blink CDP 1/1: `/tmp/opencode/bridge-cdp.log`.
+- Read-only reviews found Window receiver routing and iterator exhaustion
+  regressions. Runtime regressions pass after the fixes. A missed Window-table
+  rename also passes the follow-up serialization check. The trusted-message
+  regression sends an object to cover that path.
+- Valgrind's JS ownership tests reported zero definite leaks and zero errors:
+  `/tmp/opencode/bridge-valgrind-js.log`. The full renderer report's definite
+  leaks trace to Stylo thread-local caches:
+  `/tmp/opencode/bridge-valgrind-full.log`.
+- Final WPT comparisons cover 417 files with no adverse status changes.
+  The 278 storage/event/URL/Blob/XHR/FileReader files have identical statuses.
+  The 139 messaging and structured-clone files have 7 harness TIMEOUT-to-OK,
+  5 subtest TIMEOUT-to-PASS, and 2 subtest NOTRUN-to-PASS changes. Report pairs
+  are `before-bridge-wpt.json` versus
+  `final-bridge-wpt.json`, and `before-bridge-messaging-wpt.json` versus
+  `after-bridge-messaging-wpt.json`, all in `/tmp/opencode/`. The additional XHR
+  and FileReader reports are `before-bridge-io-wpt.json` and
+  `after-bridge-io-wpt.json`. Comparison files are `bridge-wpt-changes.json`,
+  `bridge-io-wpt-changes.json`, and `bridge-messaging-wpt-changes.json`.
+  The runs still exit 1 because existing failures remain. These focused
+  comparisons do not establish full Web-platform conformance.
+
 ## Remaining
 
-1. Pure-JS interface shims in `crates/renderer/src/js/scripts/web/*.js` are a
-   separate, larger scope (encodings, file/fetch, messaging, storage, CSSOM,
-   XHR, navigator, streams, events, and the form shims that extend generated
-   interfaces: `type`, `files`, `validity`, `setCustomValidity`, `size`,
-   `item`, `namedItem`, label `form`, form `elements`/`length`).
-2. Internal `__tb*` host bridges (about 48) still duplicate some spec behavior
-   (`__tbWindowNamedValue`/`Has`, `__tb_refreshNamedNodeMap`, `__tbMakeDataset`,
-   handler tables).
-3. Preexisting conformance gaps unrelated to the binding layer: lossy Rust
+1. Resolve the older WebIDL-migration adverse status changes listed above before
+   claiming migration conformance is unchanged.
+2. Preexisting conformance gaps unrelated to the bridge: lossy Rust
    `String` attribute/form storage, `Text.splitText`, `attachInternals`,
    copied cross-document adoption, iframe `Window` identity, incomplete
    iterator methods.
-4. `docs/progress.md` WPT totals are still the pre-migration overnight dump;
+3. `docs/progress.md` WPT totals are still the pre-migration overnight dump;
    rerun the full scorer to refresh the scored groups.
 
 ## Durable decisions

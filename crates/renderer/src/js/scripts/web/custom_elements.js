@@ -1,28 +1,24 @@
 // Autonomous custom elements backed by the agent's native reaction stack.
 // https://html.spec.whatwg.org/multipage/custom-elements.html#custom-elements-core-concepts
 {
-  const definitions = new Map();
-  const constructors = new Map();
-  const upgraded = new WeakSet();
-  const connected = new WeakSet();
+  const definitions = new __tbPrivateMap();
+  const constructors = new __tbPrivateMap();
+  const upgraded = host.slots();
+  const connected = host.slots();
   // Shadow roots keyed by host. `host.shadowRoot` is null in closed mode, but
   // lifecycle traversal still has to reach those descendants.
-  const shadowRoots = new WeakMap();
-  const pending = new Map();
+  const shadowRoots = host.slots();
+  const pending = new __tbPrivateMap();
   let definitionRunning = false;
-  const enqueueReaction = globalThis.__tbEnqueueCustomReaction;
-  const pushReactions = globalThis.__tbPushCustomReactions;
-  const popReactions = globalThis.__tbPopCustomReactions;
+  const enqueueReaction = host.__tbEnqueueCustomReaction;
+  const pushReactions = host.__tbPushCustomReactions;
+  const popReactions = host.__tbPopCustomReactions;
   const nativeApply = Reflect.apply;
   const nativeConstruct = Reflect.construct;
   const MapConstructor = Map;
   const mapGet = Map.prototype.get;
   const mapSet = Map.prototype.set;
   const mapHas = Map.prototype.has;
-  const weakSetHas = WeakSet.prototype.has;
-  const weakSetAdd = WeakSet.prototype.add;
-  const weakSetDelete = WeakSet.prototype.delete;
-  const weakMapGet = WeakMap.prototype.get;
   const arrayIncludes = Array.prototype.includes;
   const createObject = Object.create;
   const arrayFrom = Array.from;
@@ -53,7 +49,7 @@
   }
 
   function shadowRootOf(host) {
-    return nativeApply(shadowRootGetter, host, []) || nativeApply(weakMapGet, shadowRoots, [host]) || null;
+    return nativeApply(shadowRootGetter, host, []) || shadowRoots.get(host) || null;
   }
 
   // Shadow-including element descendants, in tree order. A host's shadow tree
@@ -80,16 +76,16 @@
   // hooks and the MutationObserver idempotent.
   function notifyConnected(root) {
     visitElements(root, function(element) {
-      if (!nativeApply(weakSetHas, upgraded, [element]) || nativeApply(weakSetHas, connected, [element]) || !isConnected(element)) return;
-      nativeApply(weakSetAdd, connected, [element]);
+      if (!upgraded.has(element) || connected.has(element) || !isConnected(element)) return;
+      connected.add(element);
       invoke(element, 'connectedCallback', []);
     });
   }
 
   function notifyDisconnected(root) {
     visitElements(root, function(element) {
-      if (!nativeApply(weakSetHas, upgraded, [element]) || !nativeApply(weakSetHas, connected, [element])) return;
-      nativeApply(weakSetDelete, connected, [element]);
+      if (!upgraded.has(element) || !connected.has(element)) return;
+      connected.delete(element);
       invoke(element, 'disconnectedCallback', []);
     });
   }
@@ -100,7 +96,7 @@
   }
 
   function invoke(element, name, args) {
-    const callback = nativeApply(mapGet, definitions, [localNameOf(element)])?.callbacks[name];
+    const callback = definitions.get(localNameOf(element))?.callbacks[name];
     if (typeof callback === 'function') {
       enqueueReaction(element, callback, args);
     }
@@ -111,23 +107,23 @@
   }
 
   function enqueueUpgrade(element, definition) {
-    if (nativeApply(weakSetHas, upgraded, [element])) return;
+    if (upgraded.has(element)) return;
     enqueueReaction(element, deliverUpgrade, [definition]);
   }
 
   function upgradeElement(element, definition) {
-    if (nativeApply(weakSetHas, upgraded, [element]) || localNameOf(element) !== definition.name) return;
-    nativeApply(weakSetAdd, upgraded, [element]);
+    if (upgraded.has(element) || localNameOf(element) !== definition.name) return;
+    upgraded.add(element);
     nativeApply(observe, observer, [element, observerOptions]);
     try {
-      __tbPushCustomConstruction(element);
+      host.__tbPushCustomConstruction(element);
       let constructed;
       try {
         constructed = nativeConstruct(definition.constructor, [], definition.constructor);
       } finally {
         // A constructor that fails before `super()` must not leave its
         // candidate on the construction stack for the next upgrade.
-        __tbDiscardCustomConstruction(element);
+        host.__tbDiscardCustomConstruction(element);
       }
       if (constructed !== element) throw new TypeError('custom element constructor returned another object');
       for (const name of definition.observed) {
@@ -136,7 +132,7 @@
         }
       }
       if (isConnected(element)) {
-        nativeApply(weakSetAdd, connected, [element]);
+        connected.add(element);
         invoke(element, 'connectedCallback', []);
       }
     } catch (error) {
@@ -146,7 +142,7 @@
 
   function upgradeTree(root) {
     visitElements(root, function(element) {
-      const definition = nativeApply(mapGet, definitions, [localNameOf(element)]);
+      const definition = definitions.get(localNameOf(element));
       if (definition) enqueueUpgrade(element, definition);
     });
   }
@@ -315,8 +311,8 @@
           upgradeTree(node);
           notifyConnected(node);
         }
-      } else if (record.type === 'attributes' && nativeApply(weakSetHas, upgraded, [record.target])) {
-        const definition = nativeApply(mapGet, definitions, [localNameOf(record.target)]);
+      } else if (record.type === 'attributes' && upgraded.has(record.target)) {
+        const definition = definitions.get(localNameOf(record.target));
         if (definition && nativeApply(arrayIncludes, definition.observed, [record.attributeName])) {
           invoke(record.target, 'attributeChangedCallback', [
             record.attributeName, record.oldValue, nativeApply(mapGet, newValues, [record]), record.attributeNamespace,
@@ -327,7 +323,7 @@
   }
   const observer = new MutationObserver(collectRecords);
   const takeRecords = MutationObserver.prototype.takeRecords;
-  globalThis.__tbCollectCustomReactions = function() {
+  host.__tbCollectCustomReactions = function() {
     collectRecords(nativeApply(takeRecords, observer, []));
   };
   const observerOptions = {

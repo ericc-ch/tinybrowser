@@ -266,7 +266,7 @@ pub(crate) fn construct_node<'js>(
 }
 
 pub(super) fn install_custom_construction(ctx: &Ctx<'_>) -> Result<()> {
-    let globals = ctx.globals();
+    let globals = crate::js::bridge::object(ctx)?;
     globals.set(
         "__tbPushCustomConstruction",
         rquickjs::prelude::Func::from(push_custom_construction),
@@ -2082,7 +2082,7 @@ impl JsNode {
         let frame = world(&ctx)?.borrow().frame_for_container(self.handle.0);
         match frame {
             Some(frame) => {
-                let proxy: Function = ctx.globals().get("__tbFrameProxy")?;
+                let proxy: Function = crate::js::bridge::object(&ctx)?.get("__tbFrameProxy")?;
                 proxy.call((crate::js::js_number(frame.get()),))
             }
             None => Ok(Value::new_null(ctx)),
@@ -2520,7 +2520,7 @@ impl JsNode {
         {
             return Ok(value);
         }
-        let factory: Function = ctx.globals().get("__tbMakeStyle")?;
+        let factory: Function = crate::js::bridge::object(ctx)?.get("__tbMakeStyle")?;
         let element = wrap_node(ctx, self.handle.0)?;
         let value: Value = factory.call((element,))?;
         let weak = make_weak(ctx, value.clone())?;
@@ -3210,7 +3210,7 @@ impl JsNode {
         {
             return Ok(value);
         }
-        let factory: Function = ctx.globals().get("__tbMakeDataset")?;
+        let factory: Function = crate::js::bridge::object(ctx)?.get("__tbMakeDataset")?;
         let element = wrap_node(ctx, self.handle.0)?;
         let value: Value = factory.call((element,))?;
         let weak = make_weak(ctx, value.clone())?;

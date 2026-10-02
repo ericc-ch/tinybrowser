@@ -668,11 +668,11 @@ fn append_collection_option(ctx: &Ctx<'_>, select: dom::NodeId, option: dom::Nod
 }
 
 pub(crate) fn install_collection_brand(ctx: &Ctx<'_>) -> Result<()> {
-    ctx.globals()
+    crate::js::bridge::object(ctx)?
         .set("__tbWindowNamedValue", Func::from(window_named_value))?;
-    ctx.globals()
+    crate::js::bridge::object(ctx)?
         .set("__tbWindowNamedHas", Func::from(window_named_has))?;
-    ctx.eval::<(), _>(install_collections_js(ctx)?)?;
+    crate::js::bridge::evaluate(ctx, install_collections_js(ctx)?)?;
     Ok(())
 }
 

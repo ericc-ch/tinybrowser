@@ -56,7 +56,7 @@ use dom::{
 };
 
 use rquickjs::{
-    Class, Ctx, Exception, FromJs, Function, Object, Persistent, Result, Symbol, Value,
+    Class, Ctx, Exception, FromJs, Function, Object, Persistent, Result, Value,
     class::Trace, prelude::This,
 };
 
@@ -174,7 +174,9 @@ pub(super) fn report_exception_value<'js>(
     base_line: u32,
     filename: &str,
 ) {
-    let Ok(report) = ctx.globals().get::<_, Value>("__tbReportException") else {
+    let Ok(report) =
+        crate::js::bridge::object(ctx).and_then(|host| host.get::<_, Value>("__tbReportException"))
+    else {
         return;
     };
     let Some(report) = report.as_function() else {
@@ -340,7 +342,9 @@ pub(super) fn drain_rejections(ctx: &Ctx<'_>, current: &Rc<RefCell<World>>) {
 /// Dispatches one `PromiseRejectionEvent` at the realm window through the
 /// `__tbPromiseRejection` shim.
 fn fire_rejection<'js>(ctx: &Ctx<'js>, handled: bool, promise: Value<'js>, reason: Value<'js>) {
-    let Ok(report) = ctx.globals().get::<_, Value>("__tbPromiseRejection") else {
+    let Ok(report) = crate::js::bridge::object(ctx)
+        .and_then(|host| host.get::<_, Value>("__tbPromiseRejection"))
+    else {
         return;
     };
     let Some(report) = report.as_function() else {
@@ -409,69 +413,70 @@ pub(super) fn handler_target<'js>(ctx: &Ctx<'js>, node: &Value<'js>) -> Result<N
 
 pub(crate) fn install(ctx: &Ctx<'_>, world: &Rc<RefCell<World>>) -> Result<()> {
     register_world(ctx, world);
+    crate::js::bridge::install(ctx, world)?;
     let globals = ctx.globals();
     world
         .borrow_mut()
         .set_window(Persistent::save(ctx, globals.clone()));
     Class::<JsEvent>::define(&globals)?;
-    ctx.eval::<(), _>(events::install_event_ctor_js(ctx)?)?;
-    install_webdriver_bridge(ctx, &globals)?;
+    crate::js::bridge::evaluate(ctx, events::install_event_ctor_js(ctx)?)?;
+    install_webdriver_bridge(ctx)?;
     globals.set("innerWidth", f64::from(crate::engine::VIEWPORT_WIDTH))?;
     globals.set("innerHeight", f64::from(crate::engine::VIEWPORT_HEIGHT))?;
     // No browser chrome exists, so the outer window equals the inner viewport
     // (<https://drafts.csswg.org/cssom-view/#dom-window-outerwidth>).
     globals.set("outerWidth", f64::from(crate::engine::VIEWPORT_WIDTH))?;
     globals.set("outerHeight", f64::from(crate::engine::VIEWPORT_HEIGHT))?;
-    globals.set(
+    crate::js::bridge::object(ctx)?.set(
         "__tb_new_custom_event",
         rquickjs::prelude::Func::from(events::construct_custom_event),
     )?;
-    globals.set(
+    crate::js::bridge::object(ctx)?.set(
         "__tb_init_custom_event",
         rquickjs::prelude::Func::from(events::init_custom_event),
     )?;
-    ctx.eval::<(), _>(events::install_custom_event_js(ctx)?)?;
+    crate::js::bridge::evaluate(ctx, events::install_custom_event_js(ctx)?)?;
     Class::<JsEventTarget>::define(&globals)?;
     events::install_event_target_bridge(ctx)?;
-    ctx.eval::<(), _>(events::install_event_target_ctor_js(ctx)?)?;
+    crate::js::bridge::evaluate(ctx, events::install_event_target_ctor_js(ctx)?)?;
     Class::<JsNode>::define(&globals)?;
     Class::<JsNodeList>::define(&globals)?;
     Class::<JsHtmlCollection>::define(&globals)?;
     Class::<JsOptionsCollection>::define(&globals)?;
     Class::<JsDomException>::define(&globals)?;
-    ctx.eval::<(), _>(events::install_abort_js(ctx)?)?;
+    crate::js::bridge::evaluate(ctx, events::install_abort_js(ctx)?)?;
     Class::<JsImplementation>::define(&globals)?;
     Class::<JsTokenList>::define(&globals)?;
     Class::<JsNamedNodeMap>::define(&globals)?;
-    forms::install(ctx, &globals)?;
+    forms::install(ctx, &crate::js::bridge::object(ctx)?)?;
     Class::<JsDomParser>::define(&globals)?;
-    ctx.eval::<(), _>(parsing::install_domparser_ctor_js(ctx)?)?;
+    crate::js::bridge::evaluate(ctx, parsing::install_domparser_ctor_js(ctx)?)?;
     Class::<JsXmlSerializer>::define(&globals)?;
     Class::<JsMutationObserver>::define(&globals)?;
     Class::<JsMutationRecord>::define(&globals)?;
-    globals.set(
+    crate::js::bridge::object(ctx)?.set(
         "__tb_deliver_mutations",
         rquickjs::prelude::Func::from(deliver_mutations),
     )?;
-    globals.set(
+    crate::js::bridge::object(ctx)?.set(
         "__tb_construct",
         rquickjs::prelude::Func::from(construct_node),
     )?;
     node::install_custom_construction(ctx)?;
-    globals.set("__tb_handlerNames", HANDLER_ATTRIBUTES.to_vec())?;
-    globals.set(
+    crate::js::bridge::object(ctx)?.set("__tb_handlerNames", HANDLER_ATTRIBUTES.to_vec())?;
+    crate::js::bridge::object(ctx)?.set(
         "__tbGetNodeHandler",
         rquickjs::prelude::Func::from(get_node_handler),
     )?;
-    globals.set(
+    crate::js::bridge::object(ctx)?.set(
         "__tbSetNodeHandler",
         rquickjs::prelude::Func::from(set_node_handler),
     )?;
-    globals.set(
+    crate::js::bridge::object(ctx)?.set(
         "__tbGetWindowHandler",
         rquickjs::prelude::Func::from(get_window_handler),
     )?;
-    globals.set(
+    crate::js::bridge::object(ctx)?.set(
         "__tbSetWindowHandler",
         rquickjs::prelude::Func::from(set_window_handler),
     )?;
@@ -511,10 +516,7 @@ pub(crate) fn install(ctx: &Ctx<'_>, world: &Rc<RefCell<World>>) -> Result<()> {
         "dispatchEvent",
         rquickjs::prelude::Func::from(window_dispatch_event),
     )?;
-    // User-agent delivery for shim-fired events (window.postMessage). Page
-    // script must pass the host token our shims close over; without it the
-    // bridge throws instead of forging a trusted event.
-    globals.set(
+    crate::js::bridge::object(ctx)?.set(
         "__tbDispatchTrusted",
         rquickjs::prelude::Func::from(window_dispatch_trusted_event),
     )?;
@@ -532,12 +534,10 @@ fn capture_host_primitives<'js>(
     let boolean: Function = globals.get("Boolean")?;
     let reflect: Object = globals.get("Reflect")?;
     let reflect_set: Function = reflect.get("set")?;
-    let deliver: Function = globals.get("__tb_deliver_mutations")?;
+    let deliver: Function = crate::js::bridge::object(ctx)?.get("__tb_deliver_mutations")?;
     let weak_ref: Constructor = globals.get("WeakRef")?;
     let weak_ref_prototype: Object = weak_ref.get("prototype")?;
     let weak_ref_deref: Function = weak_ref_prototype.get("deref")?;
-    let token = Symbol::new(ctx.clone())?.into_value();
-    globals.set("__tbHostToken", token.clone())?;
     let mut world = world.borrow_mut();
     world.weak_references = Some(WeakReferences {
         constructor: Persistent::save(ctx, weak_ref),
@@ -551,7 +551,6 @@ fn capture_host_primitives<'js>(
         .ok()
         .map(|queue| Persistent::save(ctx, queue));
     world.deliver_mutations_fn = Some(Persistent::save(ctx, deliver));
-    world.host_token = Some(Persistent::save(ctx, token));
     Ok(())
 }
 
@@ -559,26 +558,6 @@ pub(crate) fn host_node_id<'js>(ctx: &Ctx<'js>, value: &Value<'js>) -> Option<No
     Class::<JsNode>::from_js(ctx, value.clone())
         .ok()
         .map(|node| node.borrow().node_id())
-}
-
-/// Rejects trusted-bridge calls that do not carry the host token our shims
-/// close over. Page script cannot name the token (install deletes the global
-/// after the shims capture it), so only our shims can ask for trusted
-/// dispatch; Rust never goes through the global.
-pub(crate) fn check_host_token<'js>(ctx: &Ctx<'js>, token: &Value<'js>) -> Result<()> {
-    let world_rc = world(ctx)?;
-    let owned = world_rc.borrow().host_token.clone();
-    match owned {
-        Some(expected) => {
-            let expected: Value = expected.restore(ctx)?;
-            if token == &expected {
-                return Ok(());
-            }
-            Err(Exception::throw_type(ctx, "illegal invocation"))
-        }
-        // Install predates the token: accept (yesterday's behavior).
-        None => Ok(()),
-    }
 }
 
 /// Resolves a `WebDriver` element id to its wrapper, or `null` when no node
@@ -998,8 +977,8 @@ fn install_brands_js(ctx: &Ctx<'_>) -> Result<&'static str> {
 }
 
 fn install_brands(ctx: &Ctx<'_>) -> Result<()> {
-    ctx.eval::<(), _>(install_brands_js(ctx)?)?;
-    let table: Object = ctx.globals().get("__tb_brandTable")?;
+    crate::js::bridge::evaluate(ctx, install_brands_js(ctx)?)?;
+    let table: Object = crate::js::bridge::object(ctx)?.get("__tb_brandTable")?;
     let entries = table
         .props::<String, Object>()
         .collect::<Result<Vec<(String, Object)>>>()?;
@@ -1008,7 +987,7 @@ fn install_brands(ctx: &Ctx<'_>) -> Result<()> {
             .borrow_mut()
             .intern_brand(name, Persistent::save(ctx, proto));
     }
-    ctx.eval::<(), _>("delete globalThis.__tb_brandTable")?;
+    crate::js::bridge::object(ctx)?.remove("__tb_brandTable")?;
     Ok(())
 }
 

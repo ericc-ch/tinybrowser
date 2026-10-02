@@ -295,7 +295,7 @@ fn push_file_entries<'js>(
         entries.set(at + 1, file)?;
     }
     if no_files
-        && let Ok(empty) = ctx.globals().get::<_, Value>("__tbEmptyFile")
+        && let Ok(empty) = crate::js::bridge::object(ctx)?.get::<_, Value>("__tbEmptyFile")
         && let Some(function) = empty.as_function()
         && let Ok(file) = function.call::<_, Value>(())
     {

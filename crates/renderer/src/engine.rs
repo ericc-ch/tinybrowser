@@ -229,7 +229,7 @@ impl Engine {
     pub fn execute_remote_in(
         &mut self,
         frame: FrameId,
-        source: &str,
+        source: crate::ScriptSource<&str>,
         timeout: Option<Duration>,
     ) -> Result<RemoteValue, TabError> {
         let result = self.frame_mut(frame)?.execute_remote(source, timeout);
