@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use weedle::interface::{InterfaceMember, StringifierOrInheritOrStatic, StringifierOrStatic};
+use weedle::interface::{InterfaceMember, Special, StringifierOrInheritOrStatic, StringifierOrStatic};
 use weedle::mixin::MixinMember;
 use weedle::{Definition, Definitions, Parse};
 
@@ -343,6 +343,39 @@ impl<'idl> Database<'idl> {
             .filter(|(_, mixins)| mixins.contains(mixin))
             .map(|(interface, _)| interface.to_string())
             .collect()
+    }
+
+    /// Indexed and named getter operations inherited through the parent
+    /// chain, for hook support. An interface whose hook drivers come from a
+    /// parent lowers its own copies, derived here instead of repeated by
+    /// hand; anything else stays on the parent's prototype and dispatches
+    /// through the shared payload arms.
+    pub(crate) fn hook_members(&self, name: &str) -> Result<Vec<Member<'idl>>, Error> {
+        let mut members = Vec::new();
+        let mut seen = BTreeSet::new();
+        let Ok(interface) = self.interface(name) else {
+            return Ok(members);
+        };
+        let mut next = interface.parent;
+        while let Some(parent) = next {
+            if !seen.insert(parent) {
+                return Err(Error(format!("inheritance cycle at {parent}")));
+            }
+            let Ok(declaration) = self.interface(parent) else {
+                // Parents can be mixins, which terminate the chain.
+                self.mixin(parent)?;
+                return Ok(members);
+            };
+            for member in &declaration.members {
+                if let InterfaceMember::Operation(operation) = &member.declaration
+                    && matches!(operation.special, Some(Special::Getter(_)))
+                {
+                    members.push(member.clone());
+                }
+            }
+            next = declaration.parent;
+        }
+        Ok(members)
     }
 
     /// Whether `name` is `Node` or inherits from it, walking the declared

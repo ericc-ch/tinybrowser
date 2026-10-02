@@ -67,40 +67,9 @@
       enumerable: true, configurable: true,
     });
   }
-  // NamedNodeMap exposes both indexed and named properties, and its own
-  // property names are the indices followed by the qualified names
-  // (<https://dom.spec.whatwg.org/#interface-namednodemap>).
-  // NamedNodeMap exposes indexed and named properties as real own
-  // properties; interface members and prototype methods always win.
-  Object.defineProperty(host, '__tb_refreshNamedNodeMap', {
-    enumerable: false,
-    configurable: false,
-    writable: false,
-    value: function(map, names, lowercaseOnly) {
-      for (const key of Object.getOwnPropertyNames(map)) {
-        delete map[key];
-      }
-      for (let i = 0; i < names.length; i++) {
-        const attr = map.item(i);
-        Object.defineProperty(map, String(i), {
-          value: attr,
-          enumerable: true,
-          configurable: true,
-          writable: false,
-        });
-        const name = names[i];
-        const named = !lowercaseOnly || !/[A-Z]/.test(name);
-        if (named && !(name in map)) {
-          Object.defineProperty(map, name, {
-            value: attr,
-            enumerable: false,
-            configurable: true,
-            writable: false,
-          });
-        }
-      }
-    }
-  });
+  // NamedNodeMap exposes indexed and named properties through the
+  // generated exotic hooks; interface members and prototype methods always
+  // win.
   // Named access on the Window object
   // (<https://html.spec.whatwg.org/multipage/nav-history-apis.html#named-access-on-the-window-object>):
   // a named properties object sits between the global and its prototype. It

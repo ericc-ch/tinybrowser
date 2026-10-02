@@ -7,6 +7,7 @@ use super::{
 };
 
 use std::cell::RefCell;
+use std::collections::HashSet;
 
 use std::rc::Rc;
 
@@ -21,7 +22,6 @@ use crate::js::events::{
 };
 use crate::js::world::{
     AttrAttachError, AttrState, EventTargetKey, FrameNavigation, Handle, NavigationTarget, World,
-    Wrapper,
 };
 
 /// `DOMTokenList` for `Element.classList`
@@ -998,6 +998,104 @@ impl<'js> attr_generated::Attr<'js> for JsAttr<'js> {
     }
 }
 
+impl<'js> named_node_map_generated::NamedNodeMap<'js> for JsNamedNodeMap {
+    // https://dom.spec.whatwg.org/#dom-namednodemap-length
+    fn get_length(&self, ctx: &Ctx<'js>) -> Result<usize> {
+        self.length(ctx)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-namednodemap-item
+    fn item(&self, ctx: Ctx<'js>, arg_0: u32) -> Result<Value<'js>> {
+        self.item(ctx, arg_0)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-namednodemap-getnameditem
+    fn get_named_item(
+        &self,
+        ctx: Ctx<'js>,
+        arg_0: rquickjs::String<'js>,
+    ) -> Result<Value<'js>> {
+        self.get_named_item(ctx, arg_0)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-namednodemap-getnameditemns
+    fn get_named_item_ns(
+        &self,
+        ctx: Ctx<'js>,
+        arg_0: Option<rquickjs::String<'js>>,
+        arg_1: rquickjs::String<'js>,
+    ) -> Result<Value<'js>> {
+        self.get_named_item_ns(
+            ctx,
+            OptString(arg_0.map(|name| name.to_string()).transpose()?),
+            WebIdlString(arg_1.to_string()?),
+        )
+    }
+
+    // https://dom.spec.whatwg.org/#dom-namednodemap-setnameditem
+    fn set_named_item(
+        &self,
+        ctx: Ctx<'js>,
+        arg_0: Value<'js>,
+    ) -> Result<Value<'js>> {
+        let attr = AttrArgument::from_value(&arg_0)?;
+        self.set_named_item(ctx, attr)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-namednodemap-setnameditemns
+    fn set_named_item_ns(
+        &self,
+        ctx: Ctx<'js>,
+        arg_0: Value<'js>,
+    ) -> Result<Value<'js>> {
+        let attr = AttrArgument::from_value(&arg_0)?;
+        self.set_named_item_ns(ctx, attr)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-namednodemap-removenameditem
+    fn remove_named_item(
+        &self,
+        ctx: Ctx<'js>,
+        arg_0: rquickjs::String<'js>,
+    ) -> Result<Value<'js>> {
+        self.remove_named_item(ctx, WebIdlString(arg_0.to_string()?))
+    }
+
+    // https://dom.spec.whatwg.org/#dom-namednodemap-removenameditemns
+    fn remove_named_item_ns(
+        &self,
+        ctx: Ctx<'js>,
+        arg_0: Option<rquickjs::String<'js>>,
+        arg_1: rquickjs::String<'js>,
+    ) -> Result<Value<'js>> {
+        self.remove_named_item_ns(
+            ctx,
+            OptString(arg_0.map(|name| name.to_string()).transpose()?),
+            WebIdlString(arg_1.to_string()?),
+        )
+    }
+
+    // Supported property names are the attribute qualified names. HTML
+    // elements expose only names that survive ASCII lowercasing, since the
+    // named getter lowercases (Firefox: `nsDOMAttributeMap`). A name that
+    // repeats keeps its first attribute, matching own-property definition
+    // order.
+    fn supported_names(&self, ctx: &Ctx<'js>) -> Result<Vec<String>> {
+        let html = element_is_html(ctx, self.element.0);
+        let world_rc = world_for_node(ctx, self.element.0)?;
+        let world = world_rc.borrow();
+        let mut seen = HashSet::new();
+        Ok(world
+            .document(self.element.0)
+            .map(|parsed| parsed.document.attribute_names(self.element.0))
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|name| !html || !name.bytes().any(|byte| byte.is_ascii_uppercase()))
+            .filter(|name| seen.insert(name.clone()))
+            .collect())
+    }
+}
+
 /// `NamedNodeMap`, live over the element's attribute list
 /// (<https://dom.spec.whatwg.org/#interface-namednodemap>).
 #[derive(Trace, rquickjs::JsLifetime)]
@@ -1038,8 +1136,8 @@ impl JsNamedNodeMap {
     }
 
     // https://dom.spec.whatwg.org/#dom-namednodemap-getnameditem
-    fn get_named_item<'js>(&self, ctx: Ctx<'js>, name: WebIdlString) -> Result<Value<'js>> {
-        named_item(&ctx, self.element.0, &name.0)
+    fn get_named_item<'js>(&self, ctx: Ctx<'js>, name: rquickjs::String<'js>) -> Result<Value<'js>> {
+        named_item(&ctx, self.element.0, &name.to_string()?)
     }
 
     // https://dom.spec.whatwg.org/#dom-namednodemap-getnameditemns
@@ -1256,42 +1354,6 @@ fn set_attr_value(ctx: &Ctx<'_>, scope: NodeId, id: u64, value: String) -> Resul
     schedule_mutation_delivery(&home)
 }
 
-/// Rebuilds the `NamedNodeMap` object's own index and named properties
-/// (<https://dom.spec.whatwg.org/#interface-namednodemap>: named properties
-/// never shadow interface members). HTML elements expose only qualified
-/// names that survive ASCII lowercasing, since the named getter lowercases
-/// (Firefox: `nsDOMAttributeMap::GetSupportedNames`).
-pub(crate) fn refresh_named_node_map<'js>(
-    ctx: &Ctx<'js>,
-    element: NodeId,
-    map: &Value<'js>,
-) -> Result<()> {
-    let html = element_is_html(ctx, element);
-    let names: Vec<String> = {
-        let world_rc = world_for_node(ctx, element)?;
-        let world = world_rc.borrow();
-        world
-            .document(element)
-            .map(|parsed| parsed.document.attribute_names(element))
-            .unwrap_or_default()
-    };
-    let refresh: Function = crate::js::bridge::object(ctx)?.get("__tb_refreshNamedNodeMap")?;
-    refresh.call::<_, ()>((map.clone(), names, html))?;
-    Ok(())
-}
-
-/// Refreshes the cached `NamedNodeMap` after a mutation, when one exists.
-fn touch_named_node_map(ctx: &Ctx<'_>, element: NodeId) -> Result<()> {
-    let world_rc = world_for_node(ctx, element)?;
-    let Some(saved) = world_rc.borrow().wrapper(element, Wrapper::NamedNodeMap) else {
-        return Ok(());
-    };
-    if let Some(value) = deref_weak(ctx, saved)? {
-        refresh_named_node_map(ctx, element, &value)?;
-    }
-    Ok(())
-}
-
 /// The `Attr` id attached at `(element, namespace, local)`, creating the
 /// platform object's identity on first access. Clears a stale mapping when
 /// the attribute is gone.
@@ -1446,7 +1508,6 @@ pub(crate) fn touch_attr(
         .borrow_mut()
         .attributes
         .touch(element, namespace, local, value.to_owned());
-    touch_named_node_map(ctx, element)?;
     schedule_mutation_delivery(ctx)
 }
 
@@ -1685,7 +1746,6 @@ pub(crate) fn remove_attribute_sync(
             .attributes
             .detach(element, &namespace, &local);
     }
-    touch_named_node_map(ctx, element)?;
     after_attribute_change(ctx, element, local)?;
     schedule_mutation_delivery(ctx)
 }
@@ -1743,7 +1803,6 @@ pub(crate) fn set_attribute_node<'js>(
                 AttrAttachError::Dom(err) => throw_dom_error(ctx, err),
             })?
     };
-    touch_named_node_map(ctx, element)?;
     after_attribute_change(ctx, element, &state.local)?;
     schedule_mutation_delivery(ctx)?;
     match previous {

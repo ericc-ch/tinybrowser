@@ -552,7 +552,12 @@ fn lower_members(
     let mut remaining = implementation.methods.clone();
     let mut methods = Vec::new();
     let mut getters = Vec::new();
-    for member in &declaration.members {
+    // Indexed and named getters inherited through the parent chain lower as
+    // own members: the exotic hooks and direct calls both resolve on this
+    // interface's prototype. This derives the repetition the legacy IDL
+    // used to hand-write, instead of editing the contract.
+    let inherited = database.hook_members(declaration.name)?;
+    for member in declaration.members.iter().chain(inherited.iter()) {
         let resolved = member;
         match &member.declaration {
             InterfaceMember::Const(member) => {
@@ -562,21 +567,15 @@ fn lower_members(
             InterfaceMember::Constructor(member)
                 if implementation.methods.contains_key("constructor") =>
             {
-                resolved.validate_scopes().map_err(|error| crate::Error(format!("{}: {error}", member_name(&resolved.declaration))))?;
-                if interface.constructor.is_some() {
-                    return Err(Error(
-                        "native constructor overloads are not supported yet".into(),
-                    ));
-                }
-                remaining.remove("constructor");
-                if implementation.methods["constructor"].has_self {
-                    return Err(Error(
-                        "native constructors are associated functions, not methods".into(),
-                    ));
-                }
-                let (constructor, signature) = lower_constructor(database, member)?;
-                interface.constructor = Some(constructor);
-                methods.push(signature);
+                lower_constructor_member(
+                    database,
+                    member,
+                    resolved,
+                    implementation,
+                    &mut remaining,
+                    &mut methods,
+                    interface,
+                )?;
             }
             InterfaceMember::Attribute(member) => {
                 let Some((attribute, signature)) =
@@ -606,18 +605,19 @@ fn lower_members(
                 interface.attributes.push(attribute);
             }
             InterfaceMember::Operation(member) => {
-                // Overloads share one implementation method: the first IDL
-                // overload in declaration order consumes it and later
-                // same-name overloads are skipped, matching overload-set
-                // order. The implementation fully describes the shared
-                // behavior; unimplemented overloads stay absent.
-                let consumed = match &member.identifier {
-                    Some(identifier) => {
-                        !remaining.contains_key(snake_case(identifier.0).as_str())
+                if member.identifier.is_none() {
+                    if let Some(signature) = lower_indexed_setter(
+                        database,
+                        member,
+                        &implementation.methods,
+                        &mut *interface,
+                    )? {
+                        remaining.remove("set_indexed");
+                        methods.push(signature);
                     }
-                    None => false,
-                };
-                if consumed {
+                    continue;
+                }
+                if overload_consumed(member, &remaining) {
                     continue;
                 }
                 let Some((operation, signature, property)) =
@@ -1037,6 +1037,132 @@ fn has_attribute(
     })
 }
 
+/// One constructor member's lowering.
+fn lower_constructor_member(
+    database: &Database<'_>,
+    member: &weedle::interface::ConstructorInterfaceMember<'_>,
+    resolved: &crate::database::Member<'_>,
+    implementation: &Implementation,
+    remaining: &mut BTreeMap<String, Method>,
+    methods: &mut Vec<TokenStream>,
+    interface: &mut model::Interface,
+) -> Result<(), Error> {
+    resolved.validate_scopes().map_err(|error| {
+        crate::Error(format!("{}: {error}", member_name(&resolved.declaration)))
+    })?;
+    if interface.constructor.is_some() {
+        return Err(Error(
+            "native constructor overloads are not supported yet".into(),
+        ));
+    }
+    remaining.remove("constructor");
+    if implementation.methods["constructor"].has_self {
+        return Err(Error(
+            "native constructors are associated functions, not methods".into(),
+        ));
+    }
+    let (constructor, signature) = lower_constructor(database, member)?;
+    interface.constructor = Some(constructor);
+    methods.push(signature);
+    Ok(())
+}
+
+/// Whether an IDL operation was already consumed by an earlier overload.
+/// Overloads share one implementation method: the first IDL overload in
+/// declaration order consumes it and later same-name overloads are skipped,
+/// matching overload-set order. The implementation fully describes the
+/// shared behavior; unimplemented overloads stay absent.
+fn overload_consumed(
+    member: &weedle::interface::OperationInterfaceMember<'_>,
+    remaining: &BTreeMap<String, Method>,
+) -> bool {
+    match &member.identifier {
+        Some(identifier) => !remaining.contains_key(snake_case(identifier.0).as_str()),
+        None => false,
+    }
+}
+
+/// An anonymous indexed setter: `setter undefined (unsigned long index, T
+/// value)`. The value passes through as-is for the platform method to
+/// convert, mirroring `[RustValue]`; the trait carries the `set_indexed`
+/// method the exotic hooks call. Anything else anonymous stays absent like
+/// any unimplemented member.
+fn lower_indexed_setter(
+    database: &Database<'_>,
+    member: &weedle::interface::OperationInterfaceMember<'_>,
+    implemented: &BTreeMap<String, Method>,
+    interface: &mut model::Interface,
+) -> Result<Option<TokenStream>, Error> {
+    if !matches!(member.special, Some(Special::Setter(_))) {
+        return Ok(None);
+    }
+    if member.modifier.is_some() {
+        return Err(Error("indexed setters must not be static".into()));
+    }
+    if !matches!(
+        member.return_type,
+        weedle::types::ReturnType::Undefined(_)
+    ) {
+        return Err(Error("indexed setters require an undefined result".into()));
+    }
+    let mut reactions = false;
+    if let Some(attributes) = member.attributes.as_ref() {
+        for attribute in &attributes.body.list {
+            match attribute {
+                ExtendedAttribute::NoArgs(attribute) if attribute.0.0 == "CEReactions" => {
+                    reactions = true;
+                }
+                _ => {
+                    return Err(Error(format!(
+                        "indexed setter attributes are not supported yet: {attribute:?}"
+                    )));
+                }
+            }
+        }
+    }
+    let [Argument::Single(index), Argument::Single(value)] = member.args.body.list.as_slice()
+    else {
+        return Err(Error("indexed setters take an index and a value".into()));
+    };
+    if index.optional.is_some() || index.default.is_some() {
+        return Err(Error("indexed setter index must be required".into()));
+    }
+    validate_empty_attributes(index.attributes.as_ref())?;
+    validate_empty_attributes(index.type_.attributes.as_ref())?;
+    if !matches!(
+        native_type(database, &index.type_.type_, &mut BTreeSet::new())?,
+        ReturnType::UnsignedLong
+    ) {
+        return Err(Error("indexed setter index requires unsigned long".into()));
+    }
+    if value.optional.is_some() || value.default.is_some() {
+        return Err(Error("indexed setter value must be required".into()));
+    }
+    validate_empty_attributes(value.attributes.as_ref())?;
+    validate_empty_attributes(value.type_.attributes.as_ref())?;
+    // The value type must lower so nonsense fails here, but the raw value
+    // passes through for the platform method to convert.
+    native_type(database, &value.type_.type_, &mut BTreeSet::new())?;
+    let Some(method) = implemented.get("set_indexed") else {
+        return Ok(None);
+    };
+    if !method.has_self || method.parameters != 2 || method.receiver {
+        return Err(Error(
+            "indexed setter implementation takes self, ctx, an index, and a value".into(),
+        ));
+    }
+    if interface.indexed_setter.is_some() {
+        return Err(Error("multiple indexed setters are not supported yet".into()));
+    }
+    interface.indexed_setter = Some(model::IndexedSetter {
+        rust: format_ident!("set_indexed"),
+        reactions,
+    });
+    Ok(Some(
+        quote! { fn set_indexed(&self, ctx: Ctx<'js>, index: u32, value: Value<'js>) -> Result<()>; },
+    ))
+}
+
 fn lower_operation(
     database: &Database<'_>,
     member: &weedle::interface::OperationInterfaceMember<'_>,
@@ -1185,7 +1311,7 @@ fn lower_argument(
             if matches!(default.value, DefaultValue::EmptyDictionary(_)) => {}
         // An optional union converts an omitted `{}` or `null` by its own
         // algorithm; a dictionary member fills the default.
-        (ReturnType::Union(_, _), true, Some(default))
+        (ReturnType::Union(_, _) | ReturnType::NullableUnion(_, _), true, Some(default))
             if matches!(
                 default.value,
                 DefaultValue::EmptyDictionary(_) | DefaultValue::Null(_)

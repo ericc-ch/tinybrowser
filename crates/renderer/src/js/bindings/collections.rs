@@ -202,11 +202,6 @@ include!(concat!(env!("OUT_DIR"), "/HTMLOptionsCollection.rs"));
     reason = "generated operation dispatch passes Ctx by value"
 )]
 impl JsOptionsCollection {
-    // https://dom.spec.whatwg.org/#dom-htmlcollection-length
-    fn length(&self, ctx: &Ctx<'_>) -> Result<usize> {
-        self.query.ids(ctx).map(|ids| ids.len())
-    }
-
     // https://html.spec.whatwg.org/multipage/common-dom-interfaces.html#dom-htmloptionscollection-length
     fn set_length(&self, ctx: &Ctx<'_>, value: u32) -> Result<()> {
         let select = self.query.scope.0;
@@ -251,67 +246,46 @@ impl JsOptionsCollection {
         Ok(())
     }
 
-    // https://dom.spec.whatwg.org/#dom-htmlcollection-item
-    fn item<'js>(&self, ctx: Ctx<'js>, index: u32) -> Result<Value<'js>> {
-        self.query.item(&ctx, index as usize)
-    }
-
-    fn named_item<'js>(&self, ctx: Ctx<'js>, name: rquickjs::String<'js>) -> Result<Value<'js>> {
-        named_item(&ctx, &self.query, &name.to_string()?)
-    }
-
-    fn supported_names(&self, ctx: &Ctx<'_>) -> Result<Vec<String>> {
-        named_keys(ctx, &self.query.ids(ctx)?)
-    }
-
-    // https://html.spec.whatwg.org/multipage/common-dom-interfaces.html#htmloptionscollection-set-indexed
-    fn set_indexed<'js>(&self, ctx: Ctx<'js>, index: u32, value: Value<'js>) -> Result<()> {
-        let select = self.query.scope.0;
-        if value.is_null() || value.is_undefined() {
-            let index = i32::try_from(index).unwrap_or(i32::MAX);
-            return self.remove_option(&ctx, index);
-        }
-        let option = require_option_element(&ctx, &value)?;
-        let index_usize = index as usize;
-        let registry = super::realm_registry(&ctx)?;
-        let Some(owner) = registry.borrow().owner_world(select) else {
-            return Ok(());
-        };
-        let current = {
-            let owner = owner.borrow();
-            let Some(parsed) = owner.document(select) else {
-                return Ok(());
-            };
-            dom::form::select_options(&parsed.document, select).len()
-        };
-        if index_usize > current && index_usize >= 100_000 {
-            return Ok(());
-        }
-        if index_usize < current {
-            return replace_collection_option(&ctx, select, index_usize, option);
-        }
-        if index_usize > current {
-            grow_collection_options(&ctx, select, index_usize - current)?;
-        }
-        append_collection_option(&ctx, select, option)
-    }
-
     // https://html.spec.whatwg.org/multipage/common-dom-interfaces.html#dom-htmloptionscollection-add
-    fn add<'js>(&self, ctx: Ctx<'js>, element: Value<'js>, before: Value<'js>) -> Result<()> {
+    fn add(
+        &self,
+        ctx: Ctx<'_>,
+        element: html_options_collection_generated::HTMLOptGroupElementOrHTMLOptionElement,
+        before: Option<html_options_collection_generated::HTMLElementOrLong>,
+    ) -> Result<()> {
+        use html_options_collection_generated::{
+            HTMLElementOrLong, HTMLOptGroupElementOrHTMLOptionElement,
+        };
+        use super::host::NodeReference;
         let select = self.query.scope.0;
-        let element = require_option_group(&ctx, &element)?;
-        if let Some(before_id) = super::host_node_id(&ctx, &before)
-            && before_id == element
-        {
-            return Ok(());
+        // The union conversion already brand-checks the element, so only a
+        // tree node arrives here.
+        let element = match element {
+            HTMLOptGroupElementOrHTMLOptionElement::HTMLOptGroupElement(reference)
+            | HTMLOptGroupElementOrHTMLOptionElement::HTMLOptionElement(reference) => reference,
+        };
+        let NodeReference::Tree(element) = element else {
+            return Err(Exception::throw_type(
+                &ctx,
+                "add requires an option or optgroup element",
+            ));
+        };
+        match before {
+            None => append_add_element(&ctx, select, element),
+            Some(HTMLElementOrLong::HTMLElement(NodeReference::Tree(before))) => {
+                if before == element {
+                    return Ok(());
+                }
+                insert_before_element(&ctx, select, element, before)
+            }
+            Some(HTMLElementOrLong::HTMLElement(_)) => Err(Exception::throw_type(
+                &ctx,
+                "add requires an option or optgroup element",
+            )),
+            Some(HTMLElementOrLong::Long(index)) => {
+                insert_before_index(&ctx, select, element, index)
+            }
         }
-        if before.is_null() || before.is_undefined() {
-            return append_add_element(&ctx, select, element);
-        }
-        if super::host_node_id(&ctx, &before).is_some() {
-            return insert_before_element(&ctx, select, element, &before);
-        }
-        insert_before_index(&ctx, select, element, before)
     }
 
     // https://html.spec.whatwg.org/multipage/common-dom-interfaces.html#dom-htmloptionscollection-remove
@@ -382,6 +356,96 @@ impl JsOptionsCollection {
         Ok(())
     }
 }
+impl<'js> html_options_collection_generated::HTMLOptionsCollection<'js> for JsOptionsCollection {
+
+    // https://html.spec.whatwg.org/multipage/common-dom-interfaces.html#dom-htmloptionscollection-length
+    fn get_length(&self, ctx: &Ctx<'js>) -> Result<usize> {
+        self.query.ids(ctx).map(|ids| ids.len())
+    }
+
+    // Inherited `item` installs on this prototype too, derived from the
+    // parent chain instead of repeated by hand.
+    // https://dom.spec.whatwg.org/#dom-htmlcollection-item
+    fn item(&self, ctx: Ctx<'js>, arg_0: u32) -> Result<Value<'js>> {
+        self.query.item(&ctx, arg_0 as usize)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-htmlcollection-nameditem
+    fn named_item(
+        &self,
+        ctx: Ctx<'js>,
+        arg_0: rquickjs::String<'js>,
+    ) -> Result<Value<'js>> {
+        named_item(&ctx, &self.query, &arg_0.to_string()?)
+    }
+
+    // https://html.spec.whatwg.org/multipage/common-dom-interfaces.html#dom-htmloptionscollection-length
+    fn set_length(&self, ctx: &Ctx<'js>, value: u32) -> Result<()> {
+        self.set_length(ctx, value)
+    }
+
+    fn supported_names(&self, ctx: &Ctx<'js>) -> Result<Vec<String>> {
+        named_keys(ctx, &self.query.ids(ctx)?)
+    }
+
+    // https://html.spec.whatwg.org/multipage/common-dom-interfaces.html#dom-htmloptionscollection-add
+    fn add(
+        &self,
+        ctx: Ctx<'js>,
+        arg_0: html_options_collection_generated::HTMLOptGroupElementOrHTMLOptionElement,
+        arg_1: Option<html_options_collection_generated::HTMLElementOrLong>,
+    ) -> Result<()> {
+        self.add(ctx, arg_0, arg_1)
+    }
+
+    // https://html.spec.whatwg.org/multipage/common-dom-interfaces.html#htmloptionscollection-set-indexed
+    fn set_indexed(&self, ctx: Ctx<'js>, index: u32, value: Value<'js>) -> Result<()> {
+        let select = self.query.scope.0;
+        if value.is_null() || value.is_undefined() {
+            let index = i32::try_from(index).unwrap_or(i32::MAX);
+            return self.remove_option(&ctx, index);
+        }
+        let option = require_option_element(&ctx, &value)?;
+        let index_usize = index as usize;
+        let registry = super::realm_registry(&ctx)?;
+        let Some(owner) = registry.borrow().owner_world(select) else {
+            return Ok(());
+        };
+        let current = {
+            let owner = owner.borrow();
+            let Some(parsed) = owner.document(select) else {
+                return Ok(());
+            };
+            dom::form::select_options(&parsed.document, select).len()
+        };
+        if index_usize > current && index_usize >= 100_000 {
+            return Ok(());
+        }
+        if index_usize < current {
+            return replace_collection_option(&ctx, select, index_usize, option);
+        }
+        if index_usize > current {
+            grow_collection_options(&ctx, select, index_usize - current)?;
+        }
+        append_collection_option(&ctx, select, option)
+    }
+
+
+    // https://html.spec.whatwg.org/multipage/common-dom-interfaces.html#dom-htmloptionscollection-remove
+    fn remove(&self, ctx: Ctx<'js>, arg_0: i32) -> Result<()> {
+        self.remove(ctx, arg_0)
+    }
+
+    // https://html.spec.whatwg.org/multipage/form-elements.html#dom-select-selectedindex
+    fn get_selected_index(&self, ctx: &Ctx<'js>) -> Result<i32> {
+        self.selected_index(ctx)
+    }
+
+    // https://html.spec.whatwg.org/multipage/form-elements.html#dom-select-selectedindex
+    fn set_selected_index(&self, ctx: &Ctx<'js>, value: i32) -> Result<()> {
+        self.set_selected_index(ctx, value)
+    }
+}
 
 fn require_option_element<'js>(ctx: &Ctx<'js>, value: &Value<'js>) -> Result<dom::NodeId> {
     let Some(option) = super::host_node_id(ctx, value) else {
@@ -403,30 +467,6 @@ fn require_option_element<'js>(ctx: &Ctx<'js>, value: &Value<'js>) -> Result<dom
         Ok(option)
     } else {
         Err(Exception::throw_type(ctx, "option must be an HTMLOptionElement"))
-    }
-}
-
-fn require_option_group<'js>(ctx: &Ctx<'js>, value: &Value<'js>) -> Result<dom::NodeId> {
-    let Some(element) = super::host_node_id(ctx, value) else {
-        return Err(Exception::throw_type(ctx, "add requires an option or optgroup element"));
-    };
-    let registry = super::realm_registry(ctx)?;
-    let Some(owner) = registry.borrow().owner_world(element) else {
-        return Err(Exception::throw_type(ctx, "add requires an option or optgroup element"));
-    };
-    let owner = owner.borrow();
-    let Some(parsed) = owner.document(element) else {
-        return Err(Exception::throw_type(ctx, "add requires an option or optgroup element"));
-    };
-    let is_option_group = matches!(
-        parsed.document.kind(element),
-        Some(NodeKind::Element { name, .. }) if name.ns == html_namespace()
-            && matches!(name.local.as_ref(), "option" | "optgroup")
-    );
-    if is_option_group {
-        Ok(element)
-    } else {
-        Err(Exception::throw_type(ctx, "add requires an option or optgroup element"))
     }
 }
 
@@ -452,15 +492,12 @@ fn append_add_element(ctx: &Ctx<'_>, select: dom::NodeId, element: dom::NodeId) 
     Ok(())
 }
 
-fn insert_before_element<'js>(
-    ctx: &Ctx<'js>,
+fn insert_before_element(
+    ctx: &Ctx<'_>,
     select: dom::NodeId,
     element: dom::NodeId,
-    before: &Value<'js>,
+    before_id: dom::NodeId,
 ) -> Result<()> {
-    let Some(before_id) = super::host_node_id(ctx, before) else {
-        return Ok(());
-    };
     let registry = super::realm_registry(ctx)?;
     let Some(select_owner) = registry.borrow().owner_world(select) else {
         return Ok(());
@@ -509,9 +546,8 @@ fn insert_before_element<'js>(
     Ok(())
 }
 
-fn insert_before_index<'js>(ctx: &Ctx<'js>, select: dom::NodeId, element: dom::NodeId, before: Value<'js>) -> Result<()> {
-    let converted: rquickjs::Coerced<i32> = rquickjs::FromJs::from_js(ctx, before)?;
-    let reference = select_option_at(ctx, select, converted.0)?;
+fn insert_before_index(ctx: &Ctx<'_>, select: dom::NodeId, element: dom::NodeId, index: i32) -> Result<()> {
+    let reference = select_option_at(ctx, select, index)?;
     let Some(reference) = reference else {
         return append_add_element(ctx, select, element);
     };

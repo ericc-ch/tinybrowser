@@ -15,7 +15,7 @@ use super::{
     fixup_focus_after_removal, focus_node, host_node_id, import_snapshot, is_element, is_focusable,
     is_html_element, is_main_document, is_template_element, live_collection, locate_namespace,
     locate_prefix, main_document, make_weak, materialize_children, materialize_import,
-    new_detached_attr, nodes_equal, qualified_name, rect_object, refresh_named_node_map,
+    new_detached_attr, nodes_equal, qualified_name, rect_object,
     remove_attribute_sync, required_node, root_of, schedule_mutation_delivery, select_error,
     set_attribute_node, set_character_data, sibling_value, string_value, throw_dom,
     throw_dom_error, touch_attr, tree_order, valid_attribute_local_name, validate_and_extract,
@@ -2808,7 +2808,6 @@ impl JsNode {
             .wrapper(self.handle.0, Wrapper::NamedNodeMap)
             && let Some(value) = deref_weak(ctx, saved)?
         {
-            refresh_named_node_map(ctx, self.handle.0, &value)?;
             return Ok(value);
         }
         let class = super::host::instance_for_node(
@@ -2819,7 +2818,6 @@ impl JsNode {
             },
         )?;
         let value = Class::into_value(class);
-        refresh_named_node_map(ctx, self.handle.0, &value)?;
         let weak = make_weak(ctx, value.clone())?;
         world_rc.borrow_mut().intern_wrapper(
             self.handle.0,
