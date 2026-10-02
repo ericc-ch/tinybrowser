@@ -114,8 +114,17 @@ Verification for the shipping candidate:
    `docs/bindings.md` for ownership and coverage rules. Verify each migration
    stage with WPT before deleting the old input/compiler path.
    Done: the input snapshot, cross-file resolver, and contract generator.
-   Migrated: `DOMException`, `NodeList`, `HTMLCollection`. The remaining native
-   and JS interfaces still use `crates/renderer/idl/` and the legacy compiler.
+   Migrated: `DOMException`, `NodeList`, `HTMLCollection`, `MutationRecord`.
+   The remaining native and JS interfaces still use `crates/renderer/idl/` and
+   the legacy compiler. The contract path currently lowers constructors with
+   `DOMString` arguments, readonly attributes of string, boolean, integer,
+   nullable-string, and platform-object types, indexed and named getters,
+   constants, and `[SameObject]`/`[LegacyUnforgeable]` attributes. The next
+   generator work is writable attributes, `[CEReactions]`, method arguments and
+   results, dictionaries, callbacks, enums, unions, sequences, and variadics.
+   Those are needed for `Event`, `EventTarget`, `MutationObserver`, the form
+   elements, and the rest. Interfaces that share the `JsNode` payload also need
+   partial-install support, because only one Rust type may implement `JsClass`.
 2. Resolve the older WebIDL-migration adverse status changes listed above before
    claiming migration conformance is unchanged.
 3. Preexisting conformance gaps unrelated to the bridge: lossy Rust
