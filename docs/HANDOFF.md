@@ -7,128 +7,124 @@ declarations and the parallel support lists as each interface migrates. Keep the
 private bridge hardening and the real partial implementations. See
 `docs/bindings.md` for the policy and `AGENTS.md` for the rules.
 
-Plan: finish the native contract path and the JS contract path, migrate the
-remaining `crates/renderer/idl/*.webidl` interfaces one at a time, then delete the
-legacy compiler and its inputs. Conformance comes from WPT, size from the
-release binary.
+Plan: finish the generator's remaining IDL coverage, port the remaining
+interfaces, then delete the legacy path (`crates/renderer/idl/`, the legacy
+`model.rs`/`emit.rs` halves, `CtxMode`, `RustAlternate`, `RustInstall`) in one
+large commit. Verification is WPT before/after per batch against the previous
+binary.
 
-State: branch `webidl-bindings`, HEAD `24d3aba`, working tree clean. The
-repo-local gates are green: `cargo test --workspace` and `tools/check` pass
-(log `~/.cache/tinybrowser/logs/parentnode-tests.log`, 36 suites ok). No pushes.
-Draft PR https://github.com/ericc-ch/tinybrowser/pull/39 holds earlier work only.
+State: branch `webidl-bindings`, HEAD `7a34075`, working tree clean (only
+`docs/HANDOFF.md` uncommitted as this note is written). `cargo test --workspace`
+and `tools/check` pass (36 suites). No pushes. Draft PR
+https://github.com/ericc-ch/tinybrowser/pull/39 holds earlier work only.
 
-Done (this session):
+## Generator capabilities
 
-- `0bce44f` Reject scoped and unforgeable native members. Proof: generator tests
-  `unforgeable_and_scoped_native_members_fail_the_build`.
-- `f8dd676` Dispatch generated operations through their contract traits. Proof:
-  renderer builds; DOM WPT `Element-matches` 668 PASS.
-- `ec7859e` Generate JavaScript interface bindings from IDL contracts, including
-  the private installer and the `TextEncoder` migration. Proof: WPT focused run
-  `~/.cache/tinybrowser/logs/after-js-focused.json` moved 11 `encodeInto`
-  subtests FAIL to PASS with no regressions; generator tests; Playwright 37/37
-  (`js-contract-playwright.log`); CDP pass (`js-contract-cdp.log`).
-- `e5aa2c0` Remove nonfunctional API placeholders. Proof: WPT focused run above;
-  the only changes are the approved honesty losses in `/selection` and `/beacon`.
-- `df580b1` Migrate HTMLElement and SVGElement to their IDL contracts, plus
-  `getElementById("")` returns null. Proof: WPT
-  `~/.cache/tinybrowser/logs/after-element-contracts2.json` (both getElementById
-  files fully pass; dataset failures are pre-existing missing `DOMStringMap`).
-- `87744a3` Generate enum-typed attribute bindings. Proof: generator tests.
-  No interface consumes this yet.
-- `24d3aba` Generate union conversions and migrate ParentNode and ChildNode.
-  Unions flatten like Chromium, convert platform objects before strings per the
-  WebIDL algorithm, and reject unsupported members at build time. `[Unscopable]`
-  emits merging `@@unscopables`. Mixin members and install targets resolve from
-  IDL includes. Proof: generator tests (conversion order, rejections,
-  unscopables, mixin targets); WPT 9 tree files with zero status changes
-  against a pre-migration baseline binary
-  (`~/.cache/tinybrowser/logs/before-parentnode.json` vs
-  `after-parentnode.json`); workspace tests and `tools/check` green; Playwright
-  36/37 plus Sauce retry pass; CDP pass.
+Native contracts (`crates/webidl-bindgen/src/contracts.rs`, `emit.rs`):
+- Discovery from `impl {name}_generated::{Interface}<'js> for Payload`.
+- Attributes: `constructor`, `get_x`/`set_x`; operations snake-cased; optional
+  JS receiver as a leading `Object<'js>`.
+- `[Reflect]` / `[Reflect="custom"]` generated with no trait method (Blink-style,
+  `bind_gen/interface.py`). Only DOMString and boolean so far.
+- `[ReflectSetter]`: generated setter, implemented getter.
+- `[Unscopable]` merging `@@unscopables`.
+- Unions (`lower_union`): interface (node -> `NodeReference`, other ->
+  `Value`), dictionary, boolean, long, string; nested and typedef'd unions
+  flatten; Trusted Types interfaces collapse to string; conversion order
+  platform-object, dictionary, boolean, number, string, per `es-union`.
+- Enum attributes (getter + setter).
+- Nullable `unsigned long?` (`NullableUnsignedLong`).
+- Mixins install on every including interface, targets from IDL includes.
+- `LegacyFactoryFunction` accepted as JS-shim metadata; `WindowProxy` as an
+  opaque platform object.
+- Dictionaries and enums allow unconsumed generated members.
 
-Earlier sessions (unchanged): `a21f8a9` IDL import, `064baa2` NodeList and
-HTMLCollection, `9adbb7b` MutationRecord, `4930cbc` parsing and observers,
-`02f9f7a` DOMTokenList, `fe0d197` shared node interfaces, `682d273` Attr.
+JS contracts (`crates/webidl-bindgen/src/javascript.rs`,
+`crates/renderer/src/js/scripts/bindings.js`): Oxc discovery of
+`__tbInstallInterface`, private installer with brands, descriptors, safe
+argument reads, realm-correct `Uint8Array` results. `TextEncoder` migrated.
 
-Unfinished:
+## Migrated interfaces
 
-- Remaining `crates/renderer/idl/*.webidl`: `Document`, `DOMParser`, `Element`,
-  `ElementReflections`, `Event`, `EventTarget`, `HTML*` forms,
-  `HTMLOptionsCollection`, `NamedNodeMap`, `Node`, `NonDocumentTypeChildNode`,
-  `ShadowRoot`. Next generator features, each landed with a consumer migration:
-  - Union members beyond Node and DOMString: `(boolean or dictionary)` for
-    `scrollIntoView`, `(TrustedHTML or DOMString)` for `innerHTML` et al,
-    interface unions for `HTMLOptionsCollection.add`, nullable callbacks for
-    `EventTarget`. Each needs its conversion arm plus a consumer migration.
-  - `[Reflect]` / `[ReflectSetter]` handling (form elements, `ElementReflections`).
-    Decide whether the generator emits the reflection algorithm (end goal) or
-    treats the extended attribute as metadata the implementation owns.
-  - Interface-typed arguments, e.g. `NamedNodeMap.setNamedItem(Attr attr)`.
-    `argument_parameter` has no `ReturnType::PlatformObject` arm, and
-    `NamedNodeMap` needs a JS-implemented property-hook mode the contract path
-    lacks.
-  - Enum attributes are generated (`87744a3`) but no interface consumes them
-    yet. `Document.readyState` and `ShadowRoot.mode` will once their unions land.
-  - Interface-level metadata such as `[LegacyFactoryFunction]` on
-    `HTMLImageElement`, rejected by `validate_interface_attributes`.
-- `brands.js` still carries hand-written per-interface member lists (a second
-  support list). Reduce them as interfaces move to contracts. Do not blanket
-  delete without checking that the list is not the only installer for a member.
-- `/selection` lost the fixed placeholder and now has no Selection at all. There
-  is no native `Selection` (grep in `crates/renderer/src`). Implement it as its
-  own feature, not a placeholder.
-- `docs/progress.md` still records 8,699,448 bytes from before this session. Only
-  update it after measuring a new release binary.
-- Older WPT comparisons (`before/after-domcore.json`, `before/after-forms.json`)
-  are in `/tmp/opencode`; move to `~/.cache/tinybrowser/logs` before `/tmp` is
-  cleared.
+Native: DOMException, NodeList, HTMLCollection, MutationRecord, DOMImplementation,
+XMLSerializer, MutationObserver, DOMTokenList, CharacterData, DocumentType,
+ProcessingInstruction, Attr, DocumentFragment, HTMLElement, SVGElement,
+MathMLElement, ParentNode, ChildNode, NonDocumentTypeChildNode,
+HTMLOptGroupElement, HTMLButtonElement, HTMLFieldSetElement, HTMLSelectElement,
+HTMLTextAreaElement, HTMLInputElement, HTMLFormElement, HTMLOptionElement,
+ShadowRoot, HTMLIFrameElement, HTMLImageElement, DOMParser.
 
-Next:
+JS: TextEncoder. Placeholders removed: sendBeacon, pipeThrough, scrollTo,
+Selection, matchMedia listeners.
 
-1. Design `[Reflect]` support in the generator and verify against one form
-   element (`HTMLOptGroupElement` has a single `[CEReactions, Reflect] boolean
-   disabled`), then batch the rest.
-2. Add union support, starting with `(Node or DOMString)` for `ParentNode` and
-   `ChildNode`, then `Element` and `Document`.
-3. Add `ReturnType::PlatformObject` arguments for `NamedNodeMap`.
-4. Keep running `cargo test --workspace`, `tools/check`, and the targeted WPT
-   subset per migration. Measure the release binary at each larger checkpoint.
+## Remaining legacy (8 files)
 
-Decisions made:
+`Document`, `Element`, `ElementReflections`, `EventTarget`, `Event`,
+`HTMLOptionsCollection`, `NamedNodeMap`, `Node`.
 
-- Discovery is the implementation itself: `impl {interface}_generated::{Interface}
-  <'js> for Payload` for Rust, `__tbInstallInterface(class Interface { ... })`
-  for JS. No second checklist. Unsupported implemented semantics fail the build.
-- The IDL is never edited to fit code; reshape the implementation instead.
-- Generated dispatch calls the contract trait explicitly
-  (`Interface::method(receiver, ...)`) so shared payloads with same-named
-  inherent methods cannot shadow it.
-- JS results allocate in the receiver's realm via a per-instance realm token on
-  the shared brand slot.
-- Generated dictionaries allow unconsumed fields, since an algorithm may read a
-  subset of the declared members.
-- Nonfunctional placeholders are removed; feature detection must report them
-  unsupported.
-- Union conversion tries platform objects before strings, with a strict node
-  probe (`Attr` stringifies). Mixin installs derive targets from IDL includes.
+Each needs:
 
-Gotchas:
+- **Node** — no new generator features. Has `RustAlternate=JsAttr`, which the
+  contract path does not support; `Attr` already has its own contract, so drop
+  it. Port this next.
+- **Element** — `[PutForwards]` on contract attributes (`classList`),
+  `(boolean or ScrollIntoViewOptions)` union (dictionary|boolean supported),
+  `[LegacyNullToEmptyString]`.
+- **Document** — `[PutForwards]`, `(TrustedHTML or DOMString)` union (collapse
+  supported), dictionaries, sequences.
+- **EventTarget** — nullable callback argument (`EventListener?` is a
+  `callback interface`); union `(AddEventListenerOptions or boolean)`.
+  Payload is `JsEventTarget` in `crates/renderer/src/js/events.rs`, not JsNode.
+- **Event** — `[LegacyUnforgeable]` (`isTrusted`), `EventInit` dictionary,
+  `sequence<EventTarget>` result (`composedPath`). Needs unforgeable own-property
+  semantics (define per instance, non-configurable) or a documented decision.
+- **HTMLOptionsCollection** — interface unions (supported), nullable union
+  (`(HTMLElement or long)?`), inherited property hooks from `HTMLCollection`.
+- **NamedNodeMap** — interface-typed arguments (`Attr`), JS-implemented
+  property hooks (`RustPropertyHooks=JavaScript`; upstream Blink uses
+  `LegacyPlatformObject`).
+- **ElementReflections** — a fake interface; delete it and move `name`/`href`/
+  `src`/`content` to the real element interfaces that declare them.
 
+## Decisions
+
+- Discovery is the implementation itself; no second checklist. Unsupported
+  implemented semantics fail the build.
+- The IDL is never edited to fit code.
+- Generated dispatch calls the contract trait explicitly.
+- JS results allocate in the receiver's realm via a per-instance realm token.
+- Reflection is generator-owned (Blink-style), not hand-written.
+- Trusted Types interfaces collapse to their string member until Trusted Types
+  is implemented.
+- `Attribute::isTrusted` should get real unforgeable semantics, not be dropped.
+- `ElementReflections` will be deleted in favor of the real interfaces.
+
+## Gotchas
+
+- One WPT run at a time; the runner serializes on a venv lock.
 - Never `git submodule update --init --recursive` in a worktree: it clones the
-  1.2 GB WPT checkout fresh. Init `third_party/rquickjs` only; WPT resolves to
-  the primary checkout, and the rquickjs fork pin may not fetch (copy the dir).
-- Never `git add` a deleted path alongside modifications: the pathspec error
-  aborts the whole add and the commit lands partial. Stage deletions via
-  `git rm` first, or add surviving paths only.
+  1.2 GB WPT checkout. Init `third_party/rquickjs` only, or copy it.
+- Never `git add` a deleted path with modifications: the pathspec error aborts
+  the add. Use `git rm` first, or add only surviving paths.
+- A dead `#[qjs(skip)]` method becomes a `dead_code` error once its last legacy
+  consumer is deleted; the compiler drives the cleanup.
+- `Ctx` by value vs `&Ctx` matters: contract trait methods take `Ctx` for
+  operations and `&Ctx` for attributes. Inherent methods may differ, so inline
+  or rename on collision.
+- Enum getters with no argument/setter use and dictionary fields can be unused;
+  both are allowed in generated code with a reason.
+- Baseline binary for WPT comparison: `/home/erickc/.cache/tinybrowser/baseline-target/debug/tinybrowser`
+  is pre-session; rebuild per checkpoint or compare against the previous batch's
+  JSON in `~/.cache/tinybrowser/logs/`.
 
-- One WPT run at a time: the runner serializes on a venv lock and the build
-  holds the Cargo target. The `/encoding` legacy multibyte files dominate runtime.
-- `cargo build` writes generated contracts to
-  `OUT_DIR`; `crates/renderer/src/js/blob.rs::blobs_round_trip` re-runs the JS
-  compiler on the bundle, so a generator change must keep it consistent.
-- The renderer lists each generated `install` by interface module name in
-  `crates/renderer/src/js/bindings/node.rs`; deleting a legacy IDL file without
-  adding the contract impl breaks that call.
-- The Sauce Demo Playwright case hits a live site and is occasionally flaky; it
-  passes on retry.
+## Next
+
+1. Port `Node` (trait `node_generated::Node` for `JsNode`), delete
+   `Node.webidl`, drop the `RustAlternate`.
+2. Add `[PutForwards]` and port `Element`; then `Document`.
+3. Add nullable callback support and port `EventTarget` (JsEventTarget), then
+   `Event` with `[LegacyUnforgeable]`.
+4. `HTMLOptionsCollection` (nullable union + inherited hooks), `NamedNodeMap`
+   (interface args + hooks), delete `ElementReflections`.
+5. Delete the legacy path and run full WPT; measure the release binary and
+   update `docs/progress.md`.
