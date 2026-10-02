@@ -147,6 +147,32 @@ pub(crate) fn install_members(
     install_constants(prototype, constants)
 }
 
+/// Define `@@unscopables` on the prototype, listing the `[Unscopable]`
+/// members. Later installers on the same prototype merge rather than
+/// replace, so two mixins can share one prototype
+/// (<https://webidl.spec.whatwg.org/#es-operations>).
+pub(crate) fn install_unscopables(prototype: &Object<'_>, names: &[&str]) -> Result<()> {
+    if names.is_empty() {
+        return Ok(());
+    }
+    let ctx = prototype.ctx();
+    let existing: Value = prototype.get(PredefinedAtom::SymbolUnscopables)?;
+    let unscopables: Object = if existing.is_undefined() || existing.is_null() {
+        Object::new(ctx.clone())?
+    } else {
+        existing.into_object().ok_or_else(|| {
+            Exception::throw_internal(ctx, "@@unscopables is not an object")
+        })?
+    };
+    for name in names {
+        unscopables.set(*name, true)?;
+    }
+    prototype.prop(
+        PredefinedAtom::SymbolUnscopables,
+        Property::from(unscopables).configurable(),
+    )
+}
+
 /// Create a platform wrapper with the interface prototype from `ctx`'s realm
 /// (<https://webidl.spec.whatwg.org/#dfn-platform-object>).
 /// The rquickjs `Class::instance` prototype cache is shared across a runtime's
@@ -278,6 +304,14 @@ pub(crate) fn receiver<'js, T: JsClass<'js>>(params: &Params<'_, 'js>) -> Result
     // https://webidl.spec.whatwg.org/#es-attributes
     Class::from_value(&params.this())
         .map_err(|_| Exception::throw_type(params.ctx(), "incompatible receiver"))
+}
+
+/// Whether the value implements `Node`: a platform object with the shared
+/// node payload. `Attr` has its own payload and does not implement `Node`
+/// (<https://dom.spec.whatwg.org/#interface-attr>), so union conversion
+/// uses this probe rather than the broader `node_argument`.
+pub(crate) fn is_node<'js>(ctx: &Ctx<'js>, value: &Value<'js>) -> bool {
+    super::host_node_id(ctx, value).is_some()
 }
 
 pub(crate) fn node_argument<'js>(ctx: &Ctx<'js>, value: &Value<'js>) -> Result<NodeReference> {

@@ -24,6 +24,15 @@ pub(crate) struct Member<'idl> {
     scopes: Vec<weedle::attribute::ExtendedAttributeList<'idl>>,
 }
 
+impl Clone for Member<'_> {
+    fn clone(&self) -> Self {
+        Self {
+            declaration: self.declaration.clone(),
+            scopes: self.scopes.clone(),
+        }
+    }
+}
+
 impl Member<'_> {
     pub(crate) fn validate_scopes(&self) -> Result<(), Error> {
         // https://webidl.spec.whatwg.org/#SecureContext
@@ -271,6 +280,58 @@ impl<'idl> Database<'idl> {
         self.definitions.get(name)
     }
 
+    /// Resolve a mixin and the interfaces that include it. Mixins have no
+    /// interface object; the generated installer targets each includer.
+    /// Member scopes carry the mixin and partial-mixin declaration
+    /// attributes, following partial interfaces
+    /// (<https://webidl.spec.whatwg.org/#using-mixins-and-partials>).
+    /// Chromium resolves the same includes statements in
+    /// `third_party/blink/renderer/bindings/scripts/web_idl/idl_compiler.py`;
+    /// Firefox reads them in `dom/bindings/parser/WebIDL.py`.
+    pub(crate) fn mixin(&self, name: &str) -> Result<Mixin<'idl>, Error> {
+        let Some(Definition::InterfaceMixin(definition)) = self.definitions.get(name) else {
+            return Err(Error(format!("no mixin declaration for {name}")));
+        };
+        let mut members: Vec<Member<'idl>> = definition
+            .members
+            .body
+            .iter()
+            .map(|member| Member {
+                declaration: mixin_member(member),
+                scopes: definition.attributes.iter().cloned().collect(),
+            })
+            .collect();
+        if let Some(partials) = self.partials.get(name) {
+            for partial in partials {
+                let Definition::PartialInterfaceMixin(partial) = partial else {
+                    return Err(Error(format!("invalid partial mixin {name}")));
+                };
+                members.extend(partial.members.body.iter().map(|member| Member {
+                    declaration: mixin_member(member),
+                    scopes: definition
+                        .attributes
+                        .iter()
+                        .chain(partial.attributes.iter())
+                        .cloned()
+                        .collect(),
+                }));
+            }
+        }
+        Ok(Mixin {
+            name: definition.identifier.0,
+            members,
+        })
+    }
+
+    /// Interfaces that include the mixin, in IDL source order.
+    pub(crate) fn includers(&self, mixin: &str) -> Vec<String> {
+        self.includes
+            .iter()
+            .filter(|(_, mixins)| mixins.contains(mixin))
+            .map(|(interface, _)| interface.to_string())
+            .collect()
+    }
+
     pub(crate) fn dictionary(
         &self,
         name: &str,
@@ -298,6 +359,11 @@ impl<'idl> Database<'idl> {
         }
         Ok(definition)
     }
+}
+
+pub(crate) struct Mixin<'idl> {
+    pub(crate) name: &'idl str,
+    pub(crate) members: Vec<Member<'idl>>,
 }
 
 fn definition_name<'idl>(definition: &Definition<'idl>) -> Result<&'idl str, Error> {

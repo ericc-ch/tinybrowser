@@ -2,11 +2,13 @@
 
 use super::{
     AttrArgument, CollectionKind, FromJs, ImportSnapshot, JsImplementation, JsNamedNodeMap,
-    JsTokenList, LegacyNullString, NodeContext, OptString, Trace, WebIdlCodeUnits, WebIdlString,
+    JsTokenList, LegacyNullString, NodeContext, NodeOrString, OptString, Trace, WebIdlCodeUnits,
+    WebIdlString,
     WebIdlUnsignedLong, adopt_across_documents, after_attribute_change, ancestor_chain,
     attached_attr_id, attr_owner, attr_state, attr_wrapper, attribute_local_name, attribute_value,
     blur_node, character_data, character_data_offset, child_value, clone_document,
-    convert_nodes_into_node, create_element_named, create_html_element, create_kind, deref_weak,
+    convert_union_nodes_into_node, create_element_named, create_html_element, create_kind,
+    deref_weak,
     descendant_text, doctype_fields, document_base_url_string, document_is_html,
     document_is_html_content, document_url_string, dom_string, element_at_point, element_box,
     element_click, element_node_name, element_sibling_value, elements_by_tag, find_element_by_id,
@@ -2642,159 +2644,6 @@ impl JsNode {
         schedule_mutation_delivery(ctx)
     }
 
-    // ── ParentNode ───────────────────────────────────────────────────────
-
-    // https://dom.spec.whatwg.org/#dom-parentnode-children
-    #[qjs(skip)]
-    fn children<'js>(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
-        live_collection(
-            ctx,
-            self.handle.0,
-            CollectionKind::ElementChildren,
-            Some("HTMLCollection"),
-        )
-    }
-
-    // https://dom.spec.whatwg.org/#dom-parentnode-firstelementchild
-    #[qjs(skip)]
-    fn first_element_child<'js>(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
-        let world = world(ctx)?;
-        let found = {
-            let parsed = world.borrow();
-            let Some(parsed) = parsed.document(self.handle.0) else {
-                return Ok(Value::new_null(ctx.clone()));
-            };
-            parsed
-                .document
-                .children(self.handle.0)
-                .and_then(|mut kids| kids.find(|&kid| is_element(&parsed.document, kid)))
-        };
-        child_value(ctx, found)
-    }
-
-    // https://dom.spec.whatwg.org/#dom-parentnode-lastelementchild
-    #[qjs(skip)]
-    fn last_element_child<'js>(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
-        let world = world(ctx)?;
-        let found = {
-            let parsed = world.borrow();
-            let Some(parsed) = parsed.document(self.handle.0) else {
-                return Ok(Value::new_null(ctx.clone()));
-            };
-            parsed
-                .document
-                .children(self.handle.0)
-                .and_then(|kids| kids.rev().find(|&kid| is_element(&parsed.document, kid)))
-        };
-        child_value(ctx, found)
-    }
-
-    // https://dom.spec.whatwg.org/#dom-parentnode-childelementcount
-    #[qjs(skip)]
-    fn child_element_count(&self, ctx: &Ctx<'_>) -> Result<usize> {
-        let world = world(ctx)?;
-        let parsed = world.borrow();
-        let Some(parsed) = parsed.document(self.handle.0) else {
-            return Ok(0);
-        };
-        Ok(parsed.document.children(self.handle.0).map_or(0, |kids| {
-            kids.filter(|&kid| is_element(&parsed.document, kid))
-                .count()
-        }))
-    }
-
-    // https://dom.spec.whatwg.org/#dom-parentnode-append
-    #[qjs(skip)]
-    fn append<'js>(&self, ctx: Ctx<'js>, nodes: Rest<Value<'js>>) -> Result<()> {
-        let node = convert_nodes_into_node(&ctx, self.handle.0, nodes)?;
-        let world = world(&ctx)?;
-        let world = world.borrow();
-        let Some(mut parsed) = world.document_mut(self.handle.0) else {
-            return Err(Exception::throw_type(&ctx, "no document"));
-        };
-        dom::mutation::pre_insert(&mut parsed.document, self.handle.0, node, None)
-            .map_err(|err| throw_dom_error(&ctx, err))?;
-        drop(parsed);
-        drop(world);
-        schedule_mutation_delivery(&ctx)
-    }
-
-    // https://dom.spec.whatwg.org/#dom-parentnode-prepend
-    #[qjs(skip)]
-    fn prepend<'js>(&self, ctx: Ctx<'js>, nodes: Rest<Value<'js>>) -> Result<()> {
-        let node = convert_nodes_into_node(&ctx, self.handle.0, nodes)?;
-        let world = world(&ctx)?;
-        let world = world.borrow();
-        let Some(mut parsed) = world.document_mut(self.handle.0) else {
-            return Err(Exception::throw_type(&ctx, "no document"));
-        };
-        let reference = parsed
-            .document
-            .children(self.handle.0)
-            .and_then(|mut kids| kids.next());
-        dom::mutation::pre_insert(&mut parsed.document, self.handle.0, node, reference)
-            .map_err(|err| throw_dom_error(&ctx, err))?;
-        drop(parsed);
-        drop(world);
-        schedule_mutation_delivery(&ctx)
-    }
-
-    // https://dom.spec.whatwg.org/#dom-parentnode-replacechildren
-    #[qjs(skip)]
-    fn replace_children<'js>(&self, ctx: Ctx<'js>, nodes: Rest<Value<'js>>) -> Result<()> {
-        let node = convert_nodes_into_node(&ctx, self.handle.0, nodes)?;
-        let world = world(&ctx)?;
-        let world = world.borrow();
-        let Some(mut parsed) = world.document_mut(self.handle.0) else {
-            return Err(Exception::throw_type(&ctx, "no document"));
-        };
-        dom::mutation::replace_all(&mut parsed.document, self.handle.0, node)
-            .map_err(|err| throw_dom_error(&ctx, err))?;
-        drop(parsed);
-        drop(world);
-        schedule_mutation_delivery(&ctx)
-    }
-
-    // https://dom.spec.whatwg.org/#dom-parentnode-queryselector
-    #[qjs(skip)]
-    fn query_selector<'js>(&self, ctx: Ctx<'js>, selectors: WebIdlString) -> Result<Value<'js>> {
-        let world = world(&ctx)?;
-        let found = {
-            let parsed = world.borrow();
-            let Some(parsed) = parsed.document(self.handle.0) else {
-                return Ok(Value::new_null(ctx));
-            };
-            dom::selector::select_first(&parsed.document, self.handle.0, &selectors.0)
-                .map_err(|err| select_error(&ctx, &err))?
-        };
-        child_value(&ctx, found)
-    }
-
-    // https://dom.spec.whatwg.org/#dom-parentnode-queryselectorall
-    #[qjs(skip)]
-    fn query_selector_all<'js>(
-        &self,
-        ctx: Ctx<'js>,
-        selectors: WebIdlString,
-    ) -> Result<Value<'js>> {
-        let world = world(&ctx)?;
-        let ids = {
-            let parsed = world.borrow();
-            // A missing document answers with an empty list, not null
-            // (<https://dom.spec.whatwg.org/#dom-parentnode-queryselectorall>).
-            parsed
-                .document(self.handle.0)
-                .map(|parsed| {
-                    dom::selector::select_all(&parsed.document, self.handle.0, &selectors.0)
-                        .map_err(|err| select_error(&ctx, &err))
-                })
-                .transpose()?
-                .unwrap_or_default()
-        };
-        let handles = ids.into_iter().map(Handle).collect();
-        live_collection(&ctx, self.handle.0, CollectionKind::Static(handles), None)
-    }
-
     // https://dom.spec.whatwg.org/#dom-element-matches
     #[qjs(skip)]
     fn matches(&self, ctx: Ctx<'_>, selectors: WebIdlString) -> Result<bool> {
@@ -2944,72 +2793,6 @@ impl JsNode {
     }
 
     // ── ChildNode / NonDocumentTypeChildNode ─────────────────────────────
-
-    // https://dom.spec.whatwg.org/#dom-childnode-before
-    #[qjs(skip)]
-    fn before<'js>(&self, ctx: Ctx<'js>, nodes: Rest<Value<'js>>) -> Result<()> {
-        let node = convert_nodes_into_node(&ctx, self.handle.0, nodes)?;
-        let world = world(&ctx)?;
-        let world = world.borrow();
-        let Some(mut parsed) = world.document_mut(self.handle.0) else {
-            return Err(Exception::throw_type(&ctx, "no document"));
-        };
-        let Some(parent) = parsed.document.parent(self.handle.0) else {
-            return Ok(());
-        };
-        let previous = parsed.document.sibling(self.handle.0, false);
-        let reference = match previous {
-            Some(previous) => parsed.document.sibling(previous, true),
-            None => parsed
-                .document
-                .children(parent)
-                .and_then(|mut kids| kids.next()),
-        };
-        dom::mutation::pre_insert(&mut parsed.document, parent, node, reference)
-            .map_err(|err| throw_dom_error(&ctx, err))?;
-        drop(parsed);
-        drop(world);
-        schedule_mutation_delivery(&ctx)
-    }
-
-    // https://dom.spec.whatwg.org/#dom-childnode-after
-    #[qjs(skip)]
-    fn after<'js>(&self, ctx: Ctx<'js>, nodes: Rest<Value<'js>>) -> Result<()> {
-        let node = convert_nodes_into_node(&ctx, self.handle.0, nodes)?;
-        let world = world(&ctx)?;
-        let world = world.borrow();
-        let Some(mut parsed) = world.document_mut(self.handle.0) else {
-            return Err(Exception::throw_type(&ctx, "no document"));
-        };
-        let Some(parent) = parsed.document.parent(self.handle.0) else {
-            return Ok(());
-        };
-        let reference = parsed.document.sibling(self.handle.0, true);
-        dom::mutation::pre_insert(&mut parsed.document, parent, node, reference)
-            .map_err(|err| throw_dom_error(&ctx, err))?;
-        drop(parsed);
-        drop(world);
-        schedule_mutation_delivery(&ctx)
-    }
-
-    // https://dom.spec.whatwg.org/#dom-childnode-replacewith
-    #[qjs(skip)]
-    fn replace_with<'js>(&self, ctx: Ctx<'js>, nodes: Rest<Value<'js>>) -> Result<()> {
-        let node = convert_nodes_into_node(&ctx, self.handle.0, nodes)?;
-        let world = world(&ctx)?;
-        let world = world.borrow();
-        let Some(mut parsed) = world.document_mut(self.handle.0) else {
-            return Err(Exception::throw_type(&ctx, "no document"));
-        };
-        let Some(parent) = parsed.document.parent(self.handle.0) else {
-            return Ok(());
-        };
-        dom::mutation::replace_child(&mut parsed.document, parent, node, self.handle.0)
-            .map_err(|err| throw_dom_error(&ctx, err))?;
-        drop(parsed);
-        drop(world);
-        schedule_mutation_delivery(&ctx)
-    }
 
     // https://dom.spec.whatwg.org/#dom-nondocumenttypechildnode-previouselementsibling
     #[qjs(skip)]
@@ -3827,24 +3610,9 @@ impl JsNode {
         Ok(found.as_deref() == namespace.as_deref())
     }
 
-    // https://dom.spec.whatwg.org/#dom-childnode-remove
-    #[qjs(skip)]
-    fn remove(&self, ctx: Ctx<'_>) -> Result<()> {
-        let world = world(&ctx)?;
-        let world = world.borrow();
-        let Some(mut parsed) = world.document_mut(self.handle.0) else {
-            return Ok(());
-        };
-        dom::mutation::detach(&mut parsed.document, self.handle.0)
-            .map_err(|err| throw_dom_error(&ctx, err))?;
-        drop(parsed);
-        drop(world);
-        fixup_focus_after_removal(&ctx, self.handle.0)?;
-        schedule_mutation_delivery(&ctx)
     }
-}
 
-// https://dom.spec.whatwg.org/#dom-nonelementparentnode-getelementbyid
+    // https://dom.spec.whatwg.org/#dom-nonelementparentnode-getelementbyid
 fn element_by_id<'js>(ctx: &Ctx<'js>, root: NodeId, id: &str) -> Result<Value<'js>> {
     let owner = world_for_node(ctx, root)?;
     let found = {
@@ -3857,6 +3625,287 @@ fn element_by_id<'js>(ctx: &Ctx<'js>, root: NodeId, id: &str) -> Result<Value<'j
     match found {
         Some(node) => wrap_node(ctx, node),
         None => Ok(Value::new_null(ctx.clone())),
+    }
+}
+
+impl<'js> From<parent_node_generated::DOMStringOrNode<'js>> for NodeOrString<'js> {
+    fn from(item: parent_node_generated::DOMStringOrNode<'js>) -> Self {
+        match item {
+            parent_node_generated::DOMStringOrNode::Node(node) => Self::Node(node),
+            parent_node_generated::DOMStringOrNode::DOMString(string) => Self::String(string),
+        }
+    }
+}
+
+impl<'js> From<child_node_generated::DOMStringOrNode<'js>> for NodeOrString<'js> {
+    fn from(item: child_node_generated::DOMStringOrNode<'js>) -> Self {
+        match item {
+            child_node_generated::DOMStringOrNode::Node(node) => Self::Node(node),
+            child_node_generated::DOMStringOrNode::DOMString(string) => Self::String(string),
+        }
+    }
+}
+
+/// Map generated `(Node or DOMString)` members into the shared insertion
+/// representation. The enums differ per module but hold the same types.
+fn union_nodes<'js, T>(nodes: Vec<T>) -> Vec<NodeOrString<'js>>
+where
+    NodeOrString<'js>: From<T>,
+{
+    nodes.into_iter().map(NodeOrString::from).collect()
+}
+
+impl<'js> parent_node_generated::ParentNode<'js> for JsNode {
+    // https://dom.spec.whatwg.org/#dom-parentnode-children
+    fn get_children(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
+        live_collection(
+            ctx,
+            self.handle.0,
+            CollectionKind::ElementChildren,
+            Some("HTMLCollection"),
+        )
+    }
+
+    // https://dom.spec.whatwg.org/#dom-parentnode-firstelementchild
+    fn get_first_element_child(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
+        let world = world(ctx)?;
+        let found = {
+            let parsed = world.borrow();
+            let Some(parsed) = parsed.document(self.handle.0) else {
+                return Ok(Value::new_null(ctx.clone()));
+            };
+            parsed
+                .document
+                .children(self.handle.0)
+                .and_then(|mut kids| kids.find(|&kid| is_element(&parsed.document, kid)))
+        };
+        child_value(ctx, found)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-parentnode-lastelementchild
+    fn get_last_element_child(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
+        let world = world(ctx)?;
+        let found = {
+            let parsed = world.borrow();
+            let Some(parsed) = parsed.document(self.handle.0) else {
+                return Ok(Value::new_null(ctx.clone()));
+            };
+            parsed
+                .document
+                .children(self.handle.0)
+                .and_then(|kids| kids.rev().find(|&kid| is_element(&parsed.document, kid)))
+        };
+        child_value(ctx, found)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-parentnode-childelementcount
+    fn get_child_element_count(&self, ctx: &Ctx<'js>) -> Result<usize> {
+        let world = world(ctx)?;
+        let parsed = world.borrow();
+        let Some(parsed) = parsed.document(self.handle.0) else {
+            return Ok(0);
+        };
+        Ok(parsed.document.children(self.handle.0).map_or(0, |kids| {
+            kids.filter(|&kid| is_element(&parsed.document, kid))
+                .count()
+        }))
+    }
+
+    // https://dom.spec.whatwg.org/#dom-parentnode-append
+    fn append(
+        &self,
+        ctx: Ctx<'js>,
+        nodes: Vec<parent_node_generated::DOMStringOrNode<'js>>,
+    ) -> Result<()> {
+        let node = convert_union_nodes_into_node(&ctx, self.handle.0, union_nodes(nodes))?;
+        let world = world(&ctx)?;
+        let world = world.borrow();
+        let Some(mut parsed) = world.document_mut(self.handle.0) else {
+            return Err(Exception::throw_type(&ctx, "no document"));
+        };
+        dom::mutation::pre_insert(&mut parsed.document, self.handle.0, node, None)
+            .map_err(|err| throw_dom_error(&ctx, err))?;
+        drop(parsed);
+        drop(world);
+        schedule_mutation_delivery(&ctx)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-parentnode-prepend
+    fn prepend(
+        &self,
+        ctx: Ctx<'js>,
+        nodes: Vec<parent_node_generated::DOMStringOrNode<'js>>,
+    ) -> Result<()> {
+        let node = convert_union_nodes_into_node(&ctx, self.handle.0, union_nodes(nodes))?;
+        let world = world(&ctx)?;
+        let world = world.borrow();
+        let Some(mut parsed) = world.document_mut(self.handle.0) else {
+            return Err(Exception::throw_type(&ctx, "no document"));
+        };
+        let reference = parsed
+            .document
+            .children(self.handle.0)
+            .and_then(|mut kids| kids.next());
+        dom::mutation::pre_insert(&mut parsed.document, self.handle.0, node, reference)
+            .map_err(|err| throw_dom_error(&ctx, err))?;
+        drop(parsed);
+        drop(world);
+        schedule_mutation_delivery(&ctx)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-parentnode-replacechildren
+    fn replace_children(
+        &self,
+        ctx: Ctx<'js>,
+        nodes: Vec<parent_node_generated::DOMStringOrNode<'js>>,
+    ) -> Result<()> {
+        let node = convert_union_nodes_into_node(&ctx, self.handle.0, union_nodes(nodes))?;
+        let world = world(&ctx)?;
+        let world = world.borrow();
+        let Some(mut parsed) = world.document_mut(self.handle.0) else {
+            return Err(Exception::throw_type(&ctx, "no document"));
+        };
+        dom::mutation::replace_all(&mut parsed.document, self.handle.0, node)
+            .map_err(|err| throw_dom_error(&ctx, err))?;
+        drop(parsed);
+        drop(world);
+        schedule_mutation_delivery(&ctx)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-parentnode-queryselector
+    fn query_selector(
+        &self,
+        ctx: Ctx<'js>,
+        selectors: rquickjs::String<'js>,
+    ) -> Result<Value<'js>> {
+        let selectors = selectors.to_string()?;
+        let world = world(&ctx)?;
+        let found = {
+            let parsed = world.borrow();
+            let Some(parsed) = parsed.document(self.handle.0) else {
+                return Ok(Value::new_null(ctx));
+            };
+            dom::selector::select_first(&parsed.document, self.handle.0, &selectors)
+                .map_err(|err| select_error(&ctx, &err))?
+        };
+        child_value(&ctx, found)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-parentnode-queryselectorall
+    fn query_selector_all(
+        &self,
+        ctx: Ctx<'js>,
+        selectors: rquickjs::String<'js>,
+    ) -> Result<Value<'js>> {
+        let selectors = selectors.to_string()?;
+        let world = world(&ctx)?;
+        let ids = {
+            let parsed = world.borrow();
+            // A missing document answers with an empty list, not null
+            // (<https://dom.spec.whatwg.org/#dom-parentnode-queryselectorall>).
+            parsed
+                .document(self.handle.0)
+                .map(|parsed| {
+                    dom::selector::select_all(&parsed.document, self.handle.0, &selectors)
+                        .map_err(|err| select_error(&ctx, &err))
+                })
+                .transpose()?
+                .unwrap_or_default()
+        };
+        let handles = ids.into_iter().map(Handle).collect();
+        live_collection(&ctx, self.handle.0, CollectionKind::Static(handles), None)
+    }
+}
+
+impl<'js> child_node_generated::ChildNode<'js> for JsNode {
+    // https://dom.spec.whatwg.org/#dom-childnode-before
+    fn before(
+        &self,
+        ctx: Ctx<'js>,
+        nodes: Vec<child_node_generated::DOMStringOrNode<'js>>,
+    ) -> Result<()> {
+        let node = convert_union_nodes_into_node(&ctx, self.handle.0, union_nodes(nodes))?;
+        let world = world(&ctx)?;
+        let world = world.borrow();
+        let Some(mut parsed) = world.document_mut(self.handle.0) else {
+            return Err(Exception::throw_type(&ctx, "no document"));
+        };
+        let Some(parent) = parsed.document.parent(self.handle.0) else {
+            return Ok(());
+        };
+        let previous = parsed.document.sibling(self.handle.0, false);
+        let reference = match previous {
+            Some(previous) => parsed.document.sibling(previous, true),
+            None => parsed
+                .document
+                .children(parent)
+                .and_then(|mut kids| kids.next()),
+        };
+        dom::mutation::pre_insert(&mut parsed.document, parent, node, reference)
+            .map_err(|err| throw_dom_error(&ctx, err))?;
+        drop(parsed);
+        drop(world);
+        schedule_mutation_delivery(&ctx)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-childnode-after
+    fn after(
+        &self,
+        ctx: Ctx<'js>,
+        nodes: Vec<child_node_generated::DOMStringOrNode<'js>>,
+    ) -> Result<()> {
+        let node = convert_union_nodes_into_node(&ctx, self.handle.0, union_nodes(nodes))?;
+        let world = world(&ctx)?;
+        let world = world.borrow();
+        let Some(mut parsed) = world.document_mut(self.handle.0) else {
+            return Err(Exception::throw_type(&ctx, "no document"));
+        };
+        let Some(parent) = parsed.document.parent(self.handle.0) else {
+            return Ok(());
+        };
+        let reference = parsed.document.sibling(self.handle.0, true);
+        dom::mutation::pre_insert(&mut parsed.document, parent, node, reference)
+            .map_err(|err| throw_dom_error(&ctx, err))?;
+        drop(parsed);
+        drop(world);
+        schedule_mutation_delivery(&ctx)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-childnode-replacewith
+    fn replace_with(
+        &self,
+        ctx: Ctx<'js>,
+        nodes: Vec<child_node_generated::DOMStringOrNode<'js>>,
+    ) -> Result<()> {
+        let node = convert_union_nodes_into_node(&ctx, self.handle.0, union_nodes(nodes))?;
+        let world = world(&ctx)?;
+        let world = world.borrow();
+        let Some(mut parsed) = world.document_mut(self.handle.0) else {
+            return Err(Exception::throw_type(&ctx, "no document"));
+        };
+        let Some(parent) = parsed.document.parent(self.handle.0) else {
+            return Ok(());
+        };
+        dom::mutation::replace_child(&mut parsed.document, parent, node, self.handle.0)
+            .map_err(|err| throw_dom_error(&ctx, err))?;
+        drop(parsed);
+        drop(world);
+        schedule_mutation_delivery(&ctx)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-childnode-remove
+    fn remove(&self, ctx: Ctx<'js>) -> Result<()> {
+        let world = world(&ctx)?;
+        let world = world.borrow();
+        let Some(mut parsed) = world.document_mut(self.handle.0) else {
+            return Ok(());
+        };
+        dom::mutation::detach(&mut parsed.document, self.handle.0)
+            .map_err(|err| throw_dom_error(&ctx, err))?;
+        drop(parsed);
+        drop(world);
+        fixup_focus_after_removal(&ctx, self.handle.0)?;
+        schedule_mutation_delivery(&ctx)
     }
 }
 

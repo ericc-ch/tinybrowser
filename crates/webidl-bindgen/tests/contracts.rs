@@ -318,6 +318,104 @@ fn enum_attributes_lower_to_the_generated_enum() {
 }
 
 #[test]
+fn node_or_string_unions_convert_interfaces_before_strings() {
+    let idl = [Source {
+        name: "dom.idl",
+        text: "[Exposed=Window] interface Sample { undefined append((Node or DOMString)... nodes); };",
+    }];
+    let rust = [Source {
+        name: "sample.rs",
+        text: "impl<'js> sample_generated::Sample<'js> for Payload { fn append(&self, ctx: Ctx<'js>, nodes: Vec<sample_generated::DOMStringOrNode>) -> Result<()> { Ok(()) } }",
+    }];
+    let bindings = compile_contracts(&idl, &rust).expect("compile union");
+    let source = bindings[0].rust.replace(' ', "");
+    for fragment in [
+        "enumDOMStringOrNode",
+        "Node(host::NodeReference)",
+        "DOMString(rquickjs::String<'js>)",
+        "node_argument",
+        "Coerced<rquickjs::String>",
+    ] {
+        assert!(
+            source.contains(&fragment.replace(' ', "")),
+            "missing {fragment}"
+        );
+    }
+    let node_trial = source.find("node_argument").expect("node trial");
+    let string_trial = source.find("Coerced<rquickjs::String>").expect("string trial");
+    assert!(
+        node_trial < string_trial,
+        "interface trial must precede string coercion"
+    );
+}
+
+#[test]
+fn unsupported_unions_fail_the_build() {
+    let rust = [Source {
+        name: "sample.rs",
+        text: "impl<'js> sample_generated::Sample<'js> for Payload { fn append(&self, ctx: Ctx<'js>) -> Result<()> { Ok(()) } }",
+    }];
+    for text in [
+        "[Exposed=Window] interface Sample { undefined append((Node or long)... nodes); };",
+        "[Exposed=Window] interface Sample { undefined append((Node or DOMString)?... nodes); };",
+        "[Exposed=Window] interface Sample { undefined append(([LegacyNullToEmptyString] DOMString or Node)... nodes); };",
+    ] {
+        let idl = [Source {
+            name: "fixture.idl",
+            text,
+        }];
+        assert!(
+            compile_contracts(&idl, &rust).is_err(),
+            "accepted {text}"
+        );
+    }
+}
+
+#[test]
+fn unscopable_operations_list_in_unscopables() {
+    let idl = [Source {
+        name: "dom.idl",
+        text: "[Exposed=Window] interface Sample { [Unscopable] undefined append(Node node); undefined keep(Node node); };",
+    }];
+    let rust = [Source {
+        name: "sample.rs",
+        text: "impl<'js> sample_generated::Sample<'js> for Payload { fn append(&self, ctx: Ctx<'js>, node: host::NodeReference) -> Result<()> { Ok(()) } fn keep(&self, ctx: Ctx<'js>, node: host::NodeReference) -> Result<()> { Ok(()) } }",
+    }];
+    let bindings = compile_contracts(&idl, &rust).expect("compile unscopable");
+    let source = bindings[0].rust.replace(' ', "");
+    assert!(
+        source.contains("UNSCOPABLES:&[&str]=&[\"append\"]"),
+        "missing unscopables table"
+    );
+    assert!(source.contains("install_unscopables"), "missing install call");
+}
+
+#[test]
+fn mixin_implementations_install_on_includers() {
+    let idl = [Source {
+        name: "dom.idl",
+        text: "[Exposed=Window] interface Element {}; [Exposed=Window] interface Document {}; interface mixin Nodes { undefined append((Node or DOMString)... nodes); }; Element includes Nodes; Document includes Nodes;",
+    }];
+    let rust = [Source {
+        name: "nodes.rs",
+        text: "#[rquickjs::class] struct Payload; impl<'js> nodes_generated::Nodes<'js> for Payload { fn append(&self, ctx: Ctx<'js>, nodes: Vec<nodes_generated::DOMStringOrNode>) -> Result<()> { Ok(()) } }",
+    }];
+    let bindings = compile_contracts(&idl, &rust).expect("compile mixin");
+    assert_eq!(bindings[0].interface, "Nodes");
+    let source = bindings[0].rust.replace(' ', "");
+    for target in ["Element", "Document"] {
+        assert!(
+            source.contains(&format!("ctx.globals().get(\"{target}\")")),
+            "missing install target {target}"
+        );
+    }
+    assert!(
+        !source.contains("ctx.globals().get(\"Nodes\")"),
+        "mixin must not install on itself"
+    );
+}
+
+#[test]
 fn unforgeable_and_scoped_native_members_fail_the_build() {
     let rust = [Source {
         name: "fixture.rs",

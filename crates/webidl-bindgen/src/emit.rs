@@ -6,7 +6,8 @@ use quote::{format_ident, quote};
 use crate::model::{
     ArgumentArity, Attribute, ConstructorArgumentKind, Dictionary, DictionaryFieldType,
     Enumeration, GetterMapping, Interface, InterfaceKind, Operation, OperationArgument,
-    OperationResult, PropertyGetter, PropertyHooks, PrototypeParent, ReturnType, Setter,
+    OperationResult, PropertyGetter, PropertyHooks, PrototypeParent, ReturnType, Setter, Union,
+    UnionMemberType,
 };
 
 pub(crate) fn interface(interface: &Interface) -> TokenStream {
@@ -21,7 +22,9 @@ pub(crate) fn interface(interface: &Interface) -> TokenStream {
     let (required, constructor_body) = constructor(interface);
     let dictionaries = interface.dictionaries.iter().map(dictionary);
     let enumerations = interface.enumerations.iter().map(enumeration);
+    let unions = interface.unions.iter().map(union);
     let tables = member_tables(interface);
+    let unscopables = unscopables(interface);
     let (routes, groups) = dispatch_groups(interface, &payload, "dispatch");
     let (alternate_dispatch, alternate_groups) = alternate_dispatch(interface);
     let legacy_code = legacy_codes(interface);
@@ -76,6 +79,8 @@ pub(crate) fn interface(interface: &Interface) -> TokenStream {
             #definition
             #(#dictionaries)*
             #(#enumerations)*
+            #(#unions)*
+            #unscopables
 
             // https://webidl.spec.whatwg.org/#es-interface-call
             fn dispatch<'js>(operation: host::Operation, params: &Params<'_, 'js>) -> Result<Value<'js>> {
@@ -260,7 +265,9 @@ fn definition(interface: &Interface, payload: &TokenStream, required: usize) -> 
                 #property_hooks
 
                 fn prototype(ctx: &Ctx<'js>) -> Result<Option<Object<'js>>> {
-                    host::prototype(ctx, #name, #parent, MEMBERS, CONSTANTS, dispatch).map(Some)
+                    let prototype = host::prototype(ctx, #name, #parent, MEMBERS, CONSTANTS, dispatch)?;
+                    host::install_unscopables(&prototype, UNSCOPABLES)?;
+                    Ok(Some(prototype))
                 }
 
                 fn constructor(ctx: &Ctx<'js>) -> Result<Option<Constructor<'js>>> {
@@ -290,6 +297,7 @@ fn definition(interface: &Interface, payload: &TokenStream, required: usize) -> 
                         let constructor: Object = ctx.globals().get(#targets)?;
                         let prototype: Object = constructor.get("prototype")?;
                         host::install_members(&prototype, MEMBERS, CONSTANTS, dispatch)?;
+                        host::install_unscopables(&prototype, UNSCOPABLES)?;
                     )*
                     Ok(())
                 }
@@ -723,6 +731,7 @@ fn getter_dispatch(id: usize, getter: &Attribute, interface: &Interface) -> Toke
             ReturnType::Node
             | ReturnType::Callback
             | ReturnType::Dictionary(_)
+            | ReturnType::Union(..)
             | ReturnType::InterfaceSequence
             | ReturnType::StringSequence
             | ReturnType::NullableDocumentType => {
@@ -990,7 +999,7 @@ fn operation_argument_at(
                 let #variable = #struct_name::from_object(&ctx, &value)?;
             }
         }
-        ReturnType::Enumeration(name) => {
+        ReturnType::Enumeration(name) | ReturnType::Union(name, _) => {
             let name = format_ident!("{name}");
             quote! {
                 #fetch
@@ -1302,11 +1311,96 @@ fn enumeration(enumeration: &Enumeration) -> TokenStream {
     }
 }
 
+/// `[Unscopable]` member names for the `@@unscopables` object. Attributes
+/// cannot be unscopable yet; the contract path rejects them at lowering.
+fn unscopables(interface: &Interface) -> TokenStream {
+    let names: Vec<&str> = interface
+        .operations
+        .iter()
+        .filter(|operation| operation.unscopable)
+        .map(|operation| operation.name.as_str())
+        .collect();
+    quote! {
+        const UNSCOPABLES: &[&str] = &[#(#names),*];
+    }
+}
+
 /// One generated module per interface, named after it, so a bindings file
 /// that includes several interfaces cannot collide.
 fn module_name(name: &str) -> proc_macro2::Ident {
     let snake = crate::names::snake_case(name);
     format_ident!("{snake}_generated")
+}
+
+/// A generated union enum with an ordered `from_value`, following the
+/// `WebIDL` union conversion: platform-object members precede string
+/// coercion (<https://webidl.spec.whatwg.org/#es-union>). Chromium
+/// generates one class per flattened member set with the same trial order
+/// (`third_party/blink/renderer/bindings/scripts/bind_gen/union.py`);
+/// Firefox generates the same order in its union `Init`
+/// (`dom/bindings/Codegen.py::getJSToNativeConversionInfo`). V8 and
+/// `SpiderMonkey` glue does not transfer; only the trial order does.
+fn union(union: &Union) -> TokenStream {
+    let name = format_ident!("{}", union.name);
+    let variants = union.members.iter().map(|member| {
+        let variant = &member.variant;
+        let type_ = match member.type_ {
+            UnionMemberType::Node => quote! { host::NodeReference },
+            UnionMemberType::String => quote! { rquickjs::String<'js> },
+        };
+        quote! { #variant(#type_) }
+    });
+    let mut trials = Vec::new();
+    // Trial order follows the WebIDL union algorithm, not the declaration
+    // order: platform objects precede string coercion. A Node instance must
+    // match the interface member even when the union declares the string
+    // first, while every other value stringifies.
+    let mut ordered: Vec<_> = union.members.iter().collect();
+    ordered.sort_by_key(|member| match member.type_ {
+        UnionMemberType::Node => 0,
+        UnionMemberType::String => 1,
+    });
+    for member in ordered {
+        let variant = &member.variant;
+        match member.type_ {
+            UnionMemberType::Node => trials.push(quote! {
+                // A Node is a platform object implementing the interface;
+                // anything else falls through to string coercion. The probe
+                // is strict: `Attr` has its own payload and stringifies.
+                if host::is_node(ctx, &value) {
+                    return host::node_argument(ctx, &value).map(Self::#variant);
+                }
+            }),
+            UnionMemberType::String => trials.push(quote! {
+                // https://webidl.spec.whatwg.org/#es-DOMString
+                // Coerced rejects Symbol and stringifies everything else.
+                rquickjs::FromJs::from_js(ctx, value).map(|string: rquickjs::Coerced<rquickjs::String>| Self::#variant(string.0))
+            }),
+        }
+    }
+    // String coercion returns or throws, so it ends the trial chain; a
+    // trailing mismatch error only exists without a string member.
+    let mismatch = if union
+        .members
+        .iter()
+        .any(|member| matches!(member.type_, UnionMemberType::String))
+    {
+        quote! {}
+    } else {
+        quote! { Err(rquickjs::Exception::throw_type(ctx, "value does not match the union")) }
+    };
+    quote! {
+        pub(crate) enum #name<'js> {
+            #(#variants),*
+        }
+
+        impl<'js> #name<'js> {
+            fn from_value(ctx: &Ctx<'js>, value: Value<'js>) -> Result<Self> {
+                #(#trials)*
+                #mismatch
+            }
+        }
+    }
 }
 
 fn legacy_codes(interface: &Interface) -> TokenStream {

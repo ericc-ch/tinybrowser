@@ -27,6 +27,8 @@ pub(crate) struct Interface {
     pub(crate) operations: Vec<Operation>,
     pub(crate) dictionaries: Vec<Dictionary>,
     pub(crate) enumerations: Vec<Enumeration>,
+    /// Unions referenced by lowered members, deduplicated by name.
+    pub(crate) unions: Vec<Union>,
     pub(crate) properties: PropertyHooks,
     pub(crate) stringifier: Option<usize>,
     pub(crate) value_iterable: bool,
@@ -87,6 +89,9 @@ pub(crate) struct Operation {
     pub(crate) takes_this: bool,
     pub(crate) arguments: Vec<OperationArgument>,
     pub(crate) reactions: bool,
+    /// `[Unscopable]`: the member is listed in `@@unscopables`
+    /// (<https://webidl.spec.whatwg.org/#es-operations>).
+    pub(crate) unscopable: bool,
     pub(crate) getter: Option<PropertyGetter>,
 }
 
@@ -204,8 +209,27 @@ pub(crate) enum ReturnType {
     /// `DOMHighResTimeStamp`, a `double`
     /// (<https://webidl.spec.whatwg.org/#idl-DOMHighResTimeStamp>).
     Double,
+    /// A union of IDL member types, with the generated enum named by the
+    /// second field. Conversion tries members in `WebIDL` order
+    /// (<https://webidl.spec.whatwg.org/#es-union>).
+    Union(String, Vec<UnionMember>),
     /// Explicit `[RustValue]` implementation mapping; the method converts it.
     Value,
+}
+
+/// One flattened member of a union: the generated variant and its IDL type.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct UnionMember {
+    pub(crate) variant: Ident,
+    pub(crate) type_: UnionMemberType,
+}
+
+/// Member types a generated union conversion supports. Anything else fails
+/// the build at lowering instead of shipping a partial conversion.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) enum UnionMemberType {
+    Node,
+    String,
 }
 
 pub(crate) struct Callback {
@@ -220,6 +244,13 @@ pub(crate) struct Enumeration {
 pub(crate) struct Dictionary {
     pub(crate) name: String,
     pub(crate) fields: Vec<DictionaryField>,
+}
+
+/// A generated union enum: one variant per flattened IDL member type.
+#[derive(Clone)]
+pub(crate) struct Union {
+    pub(crate) name: String,
+    pub(crate) members: Vec<UnionMember>,
 }
 
 pub(crate) struct DictionaryField {
@@ -409,6 +440,7 @@ impl Interface {
             install_targets,
             ctx_mode,
             contract: None,
+            unions: Vec::new(),
         };
 
         result.lower_members(members, &names)?;
@@ -734,6 +766,7 @@ impl Operation {
             takes_this,
             arguments,
             reactions,
+            unscopable: false,
             getter,
         })
     }

@@ -1,7 +1,6 @@
 //! `WebIDL` argument conversion helpers.
 
-use super::{adopt_across_documents, host_node_id, throw_dom, throw_dom_error, world};
-use rquickjs::function::Rest;
+use super::{adopt_across_documents, throw_dom, throw_dom_error, world};
 
 use dom::NodeId;
 
@@ -83,30 +82,53 @@ fn webidl_to_js_string<'js>(ctx: &Ctx<'js>, value: Value<'js>) -> Result<rquickj
     Ok(converted.0)
 }
 
-/// [Converting nodes into a node](https://dom.spec.whatwg.org/#convert-nodes-into-a-node):
-/// strings become `Text`, one node stays itself, several become a fragment.
-/// Cross-document nodes adopt into the target document instead of throwing.
-/// Strings convert before any DOM borrow is held: `ToString` runs page code,
-/// which must not observe or re-enter a half-built fragment.
-pub(crate) fn convert_nodes_into_node<'js>(
+/// One already-converted `(Node or DOMString)` union member: the generated
+/// union enums map into this before insertion.
+pub(crate) enum NodeOrString<'js> {
+    Node(super::host::NodeReference),
+    String(rquickjs::String<'js>),
+}
+
+/// [Converting nodes into a node](https://dom.spec.whatwg.org/#convert-nodes-into-a-node)
+/// over generated union members. Dispatch already ran the union conversion,
+/// so strings arrive converted and nodes arrive as references.
+pub(crate) fn convert_union_nodes_into_node<'js>(
     ctx: &Ctx<'js>,
     document: NodeId,
-    nodes: Rest<Value<'js>>,
+    nodes: Vec<NodeOrString<'js>>,
 ) -> Result<NodeId> {
-    enum Piece {
-        Node(NodeId),
-        Text(String),
-    }
-    // Phase one, throwing conversions only: every string converts before any
-    // node moves, so a throwing `ToString` leaves no half-adopted tree behind.
-    let mut pieces = Vec::with_capacity(nodes.0.len());
-    for value in nodes.0 {
-        if let Some(id) = host_node_id(ctx, &value) {
-            pieces.push(Piece::Node(id));
-        } else {
-            pieces.push(Piece::Text(webidl_to_string(ctx, value)?));
+    let mut pieces = Vec::with_capacity(nodes.len());
+    for node in nodes {
+        match node {
+            NodeOrString::Node(reference) => {
+                let Some(id) = reference.tree() else {
+                    // The union trial only admits tree nodes, matching
+                    // insertion below, which rejects attribute references.
+                    return Err(throw_dom(ctx, "HierarchyRequestError", "attributes cannot be inserted"));
+                };
+                pieces.push(Piece::Node(id));
+            }
+            NodeOrString::String(string) => {
+                pieces.push(Piece::Text(string.to_string()?));
+            }
         }
     }
+    assemble_nodes_into_node(ctx, document, pieces)
+}
+
+/// A converted node list piece: a tree node or text to create.
+enum Piece {
+    Node(NodeId),
+    Text(String),
+}
+
+/// Phase two of node conversion: adopt nodes across documents, then return
+/// the single node or a fragment holding them all.
+fn assemble_nodes_into_node(
+    ctx: &Ctx<'_>,
+    document: NodeId,
+    mut pieces: Vec<Piece>,
+) -> Result<NodeId> {
     // Phase two, adoptions.
     for piece in &mut pieces {
         if let Piece::Node(id) = piece {

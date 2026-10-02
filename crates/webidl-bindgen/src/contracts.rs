@@ -6,7 +6,7 @@ use weedle::argument::Argument;
 use weedle::attribute::{ExtendedAttribute, ExtendedAttributeList};
 use weedle::interface::{InterfaceMember, Special};
 use weedle::literal::DefaultValue;
-use weedle::types::{IntegerType, NonAnyType, SingleType, Type};
+use weedle::types::{IntegerType, NonAnyType, SingleType, Type, UnionMemberType};
 
 use crate::database::Database;
 use crate::model::{
@@ -262,6 +262,11 @@ fn lower(
     implementation: &Implementation,
     kind: InterfaceKind,
 ) -> Result<model::Interface, Error> {
+    // Mixins have no interface object; their members install on every
+    // including interface's prototype, derived from the IDL includes.
+    if let Ok(mixin) = database.mixin(&implementation.interface) {
+        return lower_mixin(database, implementation, kind, &mixin);
+    }
     let declaration = database.interface(&implementation.interface)?;
     validate_interface_attributes(declaration.attributes.as_ref())?;
     // https://webidl.spec.whatwg.org/#js-DOMException-specialness
@@ -285,6 +290,7 @@ fn lower(
         operations: Vec::new(),
         dictionaries: Vec::new(),
         enumerations: Vec::new(),
+        unions: Vec::new(),
         properties: PropertyHooks::None,
         stringifier: None,
         value_iterable: false,
@@ -306,6 +312,66 @@ fn lower(
             "bindings for existing classes cannot replace constructors or property hooks".into(),
         ));
     }
+    add_referenced_definitions(database, &mut interface)?;
+    Ok(interface)
+}
+
+/// Lower a mixin implementation. The mixin itself has no prototype; the
+/// generated installer targets every interface that includes it, resolved
+/// from the imported includes statements rather than a handwritten list.
+fn lower_mixin(
+    database: &Database<'_>,
+    implementation: &Implementation,
+    kind: InterfaceKind,
+    mixin: &crate::database::Mixin<'_>,
+) -> Result<model::Interface, Error> {
+    if !matches!(kind, InterfaceKind::Partial) {
+        return Err(Error(format!(
+            "{}: mixin bindings require an existing class payload",
+            implementation.interface
+        )));
+    }
+    let mut interface = model::Interface {
+        name: implementation.interface.clone(),
+        rust: implementation.payload.clone(),
+        alternate: None,
+        alternate_has_lifetime: false,
+        has_lifetime: implementation.lifetime,
+        parent: None,
+        constructor: None,
+        attributes: Vec::new(),
+        constants: Vec::new(),
+        kind,
+        operations: Vec::new(),
+        dictionaries: Vec::new(),
+        enumerations: Vec::new(),
+        unions: Vec::new(),
+        properties: PropertyHooks::None,
+        stringifier: None,
+        value_iterable: false,
+        indexed_setter: None,
+        install_targets: database.includers(&implementation.interface),
+        ctx_mode: CtxMode::Borrowed,
+        contract: None,
+    };
+    if interface.install_targets.is_empty() {
+        return Err(Error(format!(
+            "{}: mixin is included by no interface",
+            implementation.interface
+        )));
+    }
+    let declaration = crate::database::Interface {
+        name: mixin.name,
+        attributes: None,
+        parent: None,
+        members: mixin.members.clone(),
+    };
+    interface.contract = Some(lower_members(
+        database,
+        &declaration,
+        implementation,
+        &mut interface,
+    )?);
     add_referenced_definitions(database, &mut interface)?;
     Ok(interface)
 }
@@ -454,7 +520,29 @@ fn add_referenced_definitions(
             }
         }
     }
+    for attribute in &interface.attributes {
+        collect_union(&attribute.return_type, &mut interface.unions);
+    }
+    for operation in &interface.operations {
+        for argument in &operation.arguments {
+            collect_union(&argument.type_, &mut interface.unions);
+        }
+    }
     Ok(())
+}
+
+/// Note a union a lowered member references, so its generated enum is
+/// emitted into the same module. The union carries its members inline
+/// because unions have no named declaration to re-lower.
+fn collect_union(type_: &ReturnType, unions: &mut Vec<model::Union>) {
+    if let ReturnType::Union(name, members) = type_
+        && !unions.iter().any(|union| union.name == *name)
+    {
+        unions.push(model::Union {
+            name: name.clone(),
+            members: members.clone(),
+        });
+    }
 }
 
 /// Note a dictionary or enumeration a lowered member references, so its
@@ -640,6 +728,7 @@ fn lower_operation(
     }
     validate_operation_attributes(member.attributes.as_ref())?;
     let reactions = has_attribute(member.attributes.as_ref(), "CEReactions");
+    let unscopable = has_attribute(member.attributes.as_ref(), "Unscopable");
     if !method.has_self {
         return Err(Error(format!(
             "native operation {name} must take self as its first parameter"
@@ -702,6 +791,7 @@ fn lower_operation(
         takes_this,
         arguments,
         reactions,
+        unscopable,
         getter: property,
     };
     Ok(Some((operation, signature, property)))
@@ -814,6 +904,10 @@ fn argument_parameter(
         ReturnType::Dictionary(name) | ReturnType::Enumeration(name) => {
             let name = format_ident!("{name}");
             quote! { #name }
+        }
+        ReturnType::Union(name, _) => {
+            let name = format_ident!("{name}");
+            quote! { #name<'js> }
         }
         ReturnType::Boolean if optional && boolean_default.is_none() => quote! { Option<bool> },
         ReturnType::Boolean => quote! { bool },
@@ -1190,9 +1284,95 @@ fn native_type(
                 _ => Err(Error(format!("native type {name} is not supported yet"))),
             }
         }
-        _ => Err(Error(format!(
+        Type::Union(union_) => lower_union(union_),
+        Type::Single(_) => Err(Error(format!(
             "native type is not supported yet: {type_:?}"
         ))),
+    }
+}
+
+/// Lower a union to a generated enum. Flattened member order follows the IDL
+/// declaration; conversion order follows the `WebIDL` union algorithm, which
+/// tries platform objects before string coercion
+/// (<https://webidl.spec.whatwg.org/#es-union>).
+/// Chromium groups identical flattened member sets into one union class
+/// (`third_party/blink/renderer/bindings/scripts/web_idl/union.py`);
+/// Firefox tries members in the same order in its generated `Init`
+/// (`dom/bindings/Codegen.py`). Only member types with a generated
+/// conversion are accepted; anything else fails the build.
+fn lower_union(
+    union_: &weedle::types::MayBeNull<weedle::types::UnionType<'_>>,
+) -> Result<ReturnType, Error> {
+    if union_.q_mark.is_some() {
+        return Err(Error("nullable unions are not supported yet".into()));
+    }
+    let mut flattened = Vec::new();
+    flatten_union(&union_.type_.body.list, &mut flattened)?;
+    let mut members = Vec::new();
+    for (name, type_) in &flattened {
+        let member = match type_ {
+            NonAnyType::Identifier(item)
+                if item.q_mark.is_none() && item.type_.0 == "Node" =>
+            {
+                model::UnionMember {
+                    variant: format_ident!("Node"),
+                    type_: model::UnionMemberType::Node,
+                }
+            }
+            NonAnyType::DOMString(item) if item.q_mark.is_none() => model::UnionMember {
+                variant: format_ident!("DOMString"),
+                type_: model::UnionMemberType::String,
+            },
+            _ => {
+                return Err(Error(format!("union member {name} is not supported yet")));
+            }
+        };
+        if members.contains(&member) {
+            return Err(Error(format!("duplicate union member {name}")));
+        }
+        members.push(member);
+    }
+    if members.len() < 2 {
+        return Err(Error("unions need at least two member types".into()));
+    }
+    // Canonical declaration-independent name, like Chromium's sorted
+    // union type names (`UnionType.type_name_without_extended_attributes`).
+    let mut idl_names: Vec<&str> = flattened.iter().map(|(name, _)| *name).collect();
+    idl_names.sort_unstable();
+    idl_names.dedup();
+    let name = idl_names.join("Or");
+    Ok(ReturnType::Union(name, members))
+}
+
+/// Flatten nested unions into `(IDL name, single type)` pairs, mirroring
+/// Chromium's `UnionType.flattened_member_types`. Member attributes must be
+/// empty; attributed members need explicit conversion support first.
+fn flatten_union<'idl>(
+    list: &[UnionMemberType<'idl>],
+    flattened: &mut Vec<(&'idl str, NonAnyType<'idl>)>,
+) -> Result<(), Error> {
+    for member in list {
+        match member {
+            UnionMemberType::Single(member) => {
+                validate_empty_attributes(member.attributes.as_ref())?;
+                flattened.push((member_name(&member.type_), member.type_.clone()));
+            }
+            UnionMemberType::Union(member) => {
+                if member.q_mark.is_some() {
+                    return Err(Error("nullable nested unions are not supported yet".into()));
+                }
+                flatten_union(&member.type_.body.list, flattened)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn member_name<'a>(type_: &NonAnyType<'a>) -> &'a str {
+    match type_ {
+        NonAnyType::DOMString(_) => "DOMString",
+        NonAnyType::Identifier(item) => item.type_.0,
+        _ => "unknown",
     }
 }
 
@@ -1246,7 +1426,7 @@ fn validate_operation_attributes(
         for attribute in &attributes.body.list {
             match attribute {
                 ExtendedAttribute::NoArgs(item)
-                    if matches!(item.0.0, "NewObject" | "CEReactions") => {}
+                    if matches!(item.0.0, "NewObject" | "CEReactions" | "Unscopable") => {}
                 _ => {
                     return Err(Error(format!(
                         "native operation semantics are not supported yet: {attribute:?}"
