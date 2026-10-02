@@ -4060,6 +4060,93 @@ impl<'js> html_select_element_generated::HTMLSelectElement<'js> for JsNode {
     }
 }
 
+impl<'js> html_text_area_element_generated::HTMLTextAreaElement<'js> for JsNode {
+    // https://html.spec.whatwg.org/multipage/form-elements.html#dom-textarea-value
+    fn get_value(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
+        let value = self.value(ctx.clone())?;
+        rquickjs::String::from_str(ctx.clone(), &value)
+    }
+
+    // https://html.spec.whatwg.org/multipage/form-elements.html#dom-textarea-value
+    fn set_value(&self, ctx: &Ctx<'js>, value: rquickjs::String<'js>) -> Result<()> {
+        self.set_value(ctx.clone(), LegacyNullString(value.to_string()?))
+    }
+
+    // https://html.spec.whatwg.org/multipage/form-elements.html#dom-textarea-defaultvalue
+    fn get_default_value(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
+        let value = self.default_value(ctx.clone())?;
+        rquickjs::String::from_str(ctx.clone(), &value)
+    }
+
+    // https://html.spec.whatwg.org/multipage/form-elements.html#dom-textarea-defaultvalue
+    fn set_default_value(&self, ctx: &Ctx<'js>, value: rquickjs::String<'js>) -> Result<()> {
+        self.set_default_value(ctx.clone(), WebIdlString(value.to_string()?))
+    }
+
+    // https://html.spec.whatwg.org/multipage/form-elements.html#dom-textarea-textlength
+    fn get_text_length(&self, ctx: &Ctx<'js>) -> Result<usize> {
+        Ok(self.text_length(ctx.clone())? as usize)
+    }
+
+    // Selection getters are non-nullable upstream. A textarea always has
+    // selectable text when attached; the null case only exists for detached
+    // nodes, which answer with the empty default. Input types where
+    // selection does not apply keep the spec-prose null, which the u32
+    // signature cannot express; that stays open until input migrates.
+    // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#textFieldSelection
+
+    // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#dom-textarea/input-selectionstart
+    fn get_selection_start(&self, ctx: &Ctx<'js>) -> Result<usize> {
+        let world = world(ctx)?;
+        let parsed = world.borrow();
+        Ok(parsed
+            .document(self.handle.0)
+            .and_then(|parsed| dom::form::selection(&parsed.document, self.handle.0))
+            .map_or(0, |(start, _, _)| start as usize))
+    }
+
+    // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#dom-textarea/input-selectionstart
+    fn set_selection_start(&self, ctx: &Ctx<'js>, value: u32) -> Result<()> {
+        self.set_selection_start(ctx.clone(), WebIdlUnsignedLong(value))
+    }
+
+    // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#dom-textarea/input-selectionend
+    fn get_selection_end(&self, ctx: &Ctx<'js>) -> Result<usize> {
+        let world = world(ctx)?;
+        let parsed = world.borrow();
+        Ok(parsed
+            .document(self.handle.0)
+            .and_then(|parsed| dom::form::selection(&parsed.document, self.handle.0))
+            .map_or(0, |(_, end, _)| end as usize))
+    }
+
+    // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#dom-textarea/input-selectionend
+    fn set_selection_end(&self, ctx: &Ctx<'js>, value: u32) -> Result<()> {
+        self.set_selection_end(ctx.clone(), WebIdlUnsignedLong(value))
+    }
+
+    // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#dom-textarea/input-selectiondirection
+    fn get_selection_direction(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
+        let world = world(ctx)?;
+        let direction = world
+            .borrow()
+            .document(self.handle.0)
+            .and_then(|parsed| dom::form::selection(&parsed.document, self.handle.0))
+            .map_or("none", |(_, _, direction)| direction_name(direction));
+        rquickjs::String::from_str(ctx.clone(), direction)
+    }
+
+    // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#dom-textarea/input-selectiondirection
+    fn set_selection_direction(&self, ctx: &Ctx<'js>, value: rquickjs::String<'js>) -> Result<()> {
+        self.set_selection_direction(ctx.clone(), WebIdlString(value.to_string()?))
+    }
+
+    // https://html.spec.whatwg.org/multipage/forms.html#dom-fae-form
+    fn get_form(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
+        self.form(ctx.clone())
+    }
+}
+
 impl<'js> processing_instruction_generated::ProcessingInstruction<'js> for JsNode {
     // https://dom.spec.whatwg.org/#dom-processinginstruction-target
     fn get_target(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
