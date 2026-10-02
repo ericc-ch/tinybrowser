@@ -4,14 +4,14 @@ use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
 use weedle::argument::Argument;
 use weedle::attribute::{ExtendedAttribute, ExtendedAttributeList};
-use weedle::interface::InterfaceMember;
+use weedle::interface::{InterfaceMember, Special};
 use weedle::literal::DefaultValue;
 use weedle::types::{IntegerType, NonAnyType, SingleType, Type};
 
 use crate::database::Database;
 use crate::model::{
-    self, ConstructorArgumentKind, CtxMode, GetterMapping, InterfaceKind, PropertyHooks,
-    PrototypeParent, ReturnType,
+    self, ArgumentArity, ConstructorArgumentKind, CtxMode, GetterMapping, InterfaceKind,
+    OperationResult, PropertyGetter, PropertyHooks, PrototypeParent, ReturnType,
 };
 use crate::names::snake_case;
 use crate::{Binding, Error, Source};
@@ -78,7 +78,9 @@ fn discover(
         if item.modifiers.polarity.is_some()
             || item.modifiers.defaultness.is_some()
             || item.unsafety.is_some()
-            || !item.attrs.is_empty()
+            || item.attrs.iter().any(|attribute| {
+                attribute.path().is_ident("cfg") || attribute.path().is_ident("cfg_attr")
+            })
         {
             return Err(Error(format!(
                 "{source}: binding implementations must be unconditional safe trait implementations"
@@ -188,6 +190,7 @@ fn lower(
     };
     let mut remaining = implementation.methods.clone();
     let mut methods = Vec::new();
+    let mut getters = Vec::new();
     for member in &declaration.members {
         match member {
             InterfaceMember::Const(member) => {
@@ -216,8 +219,20 @@ fn lower(
                 methods.push(signature);
                 interface.attributes.push(attribute);
             }
+            InterfaceMember::Operation(member) => {
+                let Some((operation, signature, property)) =
+                    lower_operation(database, member, &implementation.methods)?
+                else {
+                    continue;
+                };
+                remaining.remove(&operation.rust.to_string());
+                if let Some(property) = property {
+                    getters.push(property);
+                }
+                methods.push(signature);
+                interface.operations.push(operation);
+            }
             InterfaceMember::Constructor(_)
-            | InterfaceMember::Operation(_)
             | InterfaceMember::Iterable(_)
             | InterfaceMember::AsyncIterable(_)
             | InterfaceMember::Maplike(_)
@@ -225,6 +240,8 @@ fn lower(
             | InterfaceMember::Stringifier(_) => {}
         }
     }
+    interface.properties =
+        infer_property_hooks(&declaration, &getters, &mut remaining, &mut methods)?;
     if !remaining.is_empty() {
         return Err(Error(format!(
             "{}: methods do not match a supported IDL contract: {}",
@@ -235,6 +252,183 @@ fn lower(
     let name = format_ident!("{}", declaration.name);
     interface.contract = Some(quote! { pub(super) trait #name<'js> { #(#methods)* } });
     Ok(interface)
+}
+
+/// Infer legacy platform-object property hooks from declared getters.
+fn infer_property_hooks(
+    declaration: &crate::database::Interface<'_>,
+    getters: &[PropertyGetter],
+    remaining: &mut BTreeSet<String>,
+    methods: &mut Vec<TokenStream>,
+) -> Result<PropertyHooks, Error> {
+    let indexed = getters.contains(&PropertyGetter::Indexed);
+    let named = getters.contains(&PropertyGetter::Named);
+    match (indexed, named) {
+        (false, false) => Ok(PropertyHooks::None),
+        (true, false) => Ok(PropertyHooks::Indexed),
+        (false, true) => Err(Error(
+            "named-only property hooks are not supported yet".into(),
+        )),
+        (true, true) => {
+            let supported = format_ident!("supported_names");
+            if !remaining.remove("supported_names") {
+                return Err(Error(
+                    "named property hooks require a supported_names implementation".into(),
+                ));
+            }
+            methods
+                .push(quote! { fn supported_names(&self, ctx: &Ctx<'js>) -> Result<Vec<String>>; });
+            let attributes = declaration.attributes.as_ref();
+            Ok(PropertyHooks::IndexedNamed {
+                names: supported,
+                unenumerable: has_attribute(attributes, "LegacyUnenumerableNamedProperties"),
+                override_builtins: has_attribute(attributes, "LegacyOverrideBuiltIns"),
+            })
+        }
+    }
+}
+
+fn has_attribute(
+    attributes: Option<&weedle::attribute::ExtendedAttributeList<'_>>,
+    name: &str,
+) -> bool {
+    attributes.is_some_and(|attributes| {
+        attributes
+            .body
+            .list
+            .iter()
+            .any(|attribute| match attribute {
+                weedle::attribute::ExtendedAttribute::NoArgs(attribute) => attribute.0.0 == name,
+                _ => false,
+            })
+    })
+}
+
+fn lower_operation(
+    database: &Database<'_>,
+    member: &weedle::interface::OperationInterfaceMember<'_>,
+    implemented: &BTreeSet<String>,
+) -> Result<Option<(model::Operation, TokenStream, Option<PropertyGetter>)>, Error> {
+    if member.modifier.is_some() {
+        return Err(Error(
+            "native static and stringifier operations are not supported yet".into(),
+        ));
+    }
+    validate_empty_attributes(member.attributes.as_ref())?;
+    let Some(identifier) = &member.identifier else {
+        return Err(Error(
+            "native property setters and deleters are not supported yet".into(),
+        ));
+    };
+    let name = identifier.0;
+    let rust = format_ident!("{}", snake_case(name));
+    if !implemented.contains(&rust.to_string()) {
+        return Ok(None);
+    }
+    let property = match &member.special {
+        None => None,
+        Some(Special::Getter(_)) => Some(property_getter(database, member)?),
+        Some(_) => {
+            return Err(Error(
+                "only readonly property getters are supported yet".into(),
+            ));
+        }
+    };
+    let mut arguments = Vec::new();
+    let mut parameters = Vec::new();
+    for (index, argument) in member.args.body.list.iter().enumerate() {
+        let Argument::Single(argument) = argument else {
+            return Err(Error(
+                "native variadic operations are not supported yet".into(),
+            ));
+        };
+        validate_empty_attributes(argument.attributes.as_ref())?;
+        validate_empty_attributes(argument.type_.attributes.as_ref())?;
+        if argument.optional.is_some() || argument.default.is_some() {
+            return Err(Error(
+                "native optional operation arguments are not supported yet".into(),
+            ));
+        }
+        let type_ = native_type(database, &argument.type_.type_, &mut BTreeSet::new())?;
+        let parameter = match type_ {
+            ReturnType::UnsignedLong => quote! { u32 },
+            ReturnType::String => quote! { rquickjs::String<'js> },
+            ReturnType::Boolean => quote! { bool },
+            _ => {
+                return Err(Error(
+                    "native operation argument type is not supported yet".into(),
+                ));
+            }
+        };
+        let argument_name = format_ident!("arg_{index}");
+        parameters.push(quote! { #argument_name: #parameter });
+        arguments.push(model::OperationArgument {
+            type_,
+            arity: ArgumentArity::Required,
+            null_default: false,
+            legacy_null_to_empty: false,
+            boolean_default: None,
+            from_js: None,
+        });
+    }
+    let (result, returns) = operation_result(database, &member.return_type)?;
+    let signature =
+        quote! { fn #rust(&self, ctx: Ctx<'js>, #(#parameters),*) -> Result<#returns>; };
+    let operation = model::Operation {
+        name: name.into(),
+        rust,
+        result,
+        takes_this: false,
+        arguments,
+        reactions: false,
+        getter: property,
+    };
+    Ok(Some((operation, signature, property)))
+}
+
+fn property_getter(
+    database: &Database<'_>,
+    member: &weedle::interface::OperationInterfaceMember<'_>,
+) -> Result<PropertyGetter, Error> {
+    let [Argument::Single(argument)] = member.args.body.list.as_slice() else {
+        return Err(Error("property getters require one argument".into()));
+    };
+    if argument.optional.is_some() || argument.default.is_some() {
+        return Err(Error("property getter arguments must be required".into()));
+    }
+    match native_type(database, &argument.type_.type_, &mut BTreeSet::new())? {
+        ReturnType::UnsignedLong => Ok(PropertyGetter::Indexed),
+        ReturnType::String => Ok(PropertyGetter::Named),
+        _ => Err(Error(
+            "property getters require DOMString or unsigned long".into(),
+        )),
+    }
+}
+
+fn operation_result(
+    database: &Database<'_>,
+    return_type: &weedle::types::ReturnType<'_>,
+) -> Result<(OperationResult, TokenStream), Error> {
+    match return_type {
+        weedle::types::ReturnType::Undefined(_) => Ok((OperationResult::Undefined, quote! { () })),
+        weedle::types::ReturnType::Type(type_) => {
+            match native_type(database, type_, &mut BTreeSet::new())? {
+                ReturnType::Node
+                | ReturnType::NullableNode
+                | ReturnType::PlatformObject
+                | ReturnType::NodeList => Ok((OperationResult::Object, quote! { Value<'js> })),
+                ReturnType::String => {
+                    Ok((OperationResult::String, quote! { rquickjs::String<'js> }))
+                }
+                ReturnType::Boolean => Ok((OperationResult::Boolean, quote! { bool })),
+                ReturnType::UnsignedShort => Ok((OperationResult::UnsignedShort, quote! { u16 })),
+                ReturnType::Long => Ok((OperationResult::Long, quote! { i32 })),
+                _ => Err(Error(
+                    "native operation result type is not supported yet".into(),
+                )),
+            }
+        }
+    }
 }
 
 fn lower_attribute(
@@ -267,6 +461,7 @@ fn lower_attribute(
         ReturnType::String => quote! { rquickjs::String<'js> },
         ReturnType::Boolean => quote! { bool },
         ReturnType::UnsignedShort => quote! { u16 },
+        ReturnType::UnsignedLong => quote! { usize },
         _ => return Err(Error("native attribute type is not supported yet".into())),
     };
     let getter = format_ident!("{getter_name}");
@@ -362,7 +557,22 @@ fn native_type(
         {
             Ok(ReturnType::UnsignedShort)
         }
-        Type::Single(SingleType::NonAny(NonAnyType::Identifier(item))) if item.q_mark.is_none() => {
+        Type::Single(SingleType::NonAny(NonAnyType::Integer(item)))
+            if item.q_mark.is_none()
+                && matches!(item.type_, IntegerType::Long(item) if item.unsigned.is_some()) =>
+        {
+            Ok(ReturnType::UnsignedLong)
+        }
+        Type::Single(SingleType::NonAny(NonAnyType::Identifier(item))) => {
+            if let Some(interface) = native_interface(item.type_.0, item.q_mark.is_some()) {
+                return Ok(interface);
+            }
+            if item.q_mark.is_some() {
+                return Err(Error(format!(
+                    "nullable native type {} is not supported yet",
+                    item.type_.0
+                )));
+            }
             if !visited.insert(item.type_.0.into()) {
                 return Err(Error(format!("typedef cycle at {}", item.type_.0)));
             }
@@ -381,6 +591,17 @@ fn native_type(
         _ => Err(Error(format!(
             "native type is not supported yet: {type_:?}"
         ))),
+    }
+}
+
+/// Canonical platform-object types the contract path carries directly.
+fn native_interface(name: &str, nullable: bool) -> Option<ReturnType> {
+    match (name, nullable) {
+        ("Node", false) => Some(ReturnType::Node),
+        ("Node", true) => Some(ReturnType::NullableNode),
+        ("NodeList", false) => Some(ReturnType::NodeList),
+        ("Element", _) => Some(ReturnType::PlatformObject),
+        _ => None,
     }
 }
 
@@ -410,7 +631,13 @@ fn validate_interface_attributes(
                 ExtendedAttribute::IdentList(item) if item.identifier.0 == "Exposed" => {
                     exposed = item.list.body.list.iter().any(|item| item.0 == "Window");
                 }
-                ExtendedAttribute::NoArgs(item) if item.0.0 == "Serializable" => {}
+                ExtendedAttribute::NoArgs(item)
+                    if matches!(
+                        item.0.0,
+                        "Serializable"
+                            | "LegacyUnenumerableNamedProperties"
+                            | "LegacyOverrideBuiltIns"
+                    ) => {}
                 _ => {
                     return Err(Error(format!(
                         "native interface semantics are not supported yet: {attribute:?}"

@@ -121,13 +121,9 @@ pub(crate) struct JsNodeList {
 
 include!(concat!(env!("OUT_DIR"), "/NodeList.rs"));
 
-#[expect(
-    clippy::needless_pass_by_value,
-    reason = "generated operation dispatch passes Ctx by value"
-)]
-impl JsNodeList {
+impl<'js> node_list_generated::NodeList<'js> for JsNodeList {
     // https://dom.spec.whatwg.org/#dom-nodelist-length
-    fn length(&self, ctx: &Ctx<'_>) -> Result<usize> {
+    fn get_length(&self, ctx: &Ctx<'js>) -> Result<usize> {
         let registry = super::realm_registry(ctx)?;
         let Some(world) = registry.borrow().owner_world(self.query.scope.0) else {
             return Ok(0);
@@ -162,7 +158,7 @@ impl JsNodeList {
     }
 
     // https://dom.spec.whatwg.org/#dom-nodelist-item
-    fn item<'js>(&self, ctx: Ctx<'js>, index: u32) -> Result<Value<'js>> {
+    fn item(&self, ctx: Ctx<'js>, index: u32) -> Result<Value<'js>> {
         self.query.item(&ctx, index as usize)
     }
 }
@@ -174,26 +170,22 @@ pub(crate) struct JsHtmlCollection {
 
 include!(concat!(env!("OUT_DIR"), "/HTMLCollection.rs"));
 
-#[expect(
-    clippy::needless_pass_by_value,
-    reason = "generated operation dispatch passes Ctx by value"
-)]
-impl JsHtmlCollection {
+impl<'js> html_collection_generated::HTMLCollection<'js> for JsHtmlCollection {
     // https://dom.spec.whatwg.org/#dom-htmlcollection-length
-    fn length(&self, ctx: &Ctx<'_>) -> Result<usize> {
+    fn get_length(&self, ctx: &Ctx<'js>) -> Result<usize> {
         self.query.ids(ctx).map(|ids| ids.len())
     }
 
     // https://dom.spec.whatwg.org/#dom-htmlcollection-item
-    fn item<'js>(&self, ctx: Ctx<'js>, index: u32) -> Result<Value<'js>> {
+    fn item(&self, ctx: Ctx<'js>, index: u32) -> Result<Value<'js>> {
         self.query.item(&ctx, index as usize)
     }
 
-    fn named_item<'js>(&self, ctx: Ctx<'js>, name: rquickjs::String<'js>) -> Result<Value<'js>> {
+    fn named_item(&self, ctx: Ctx<'js>, name: rquickjs::String<'js>) -> Result<Value<'js>> {
         named_item(&ctx, &self.query, &name.to_string()?)
     }
 
-    fn supported_names(&self, ctx: &Ctx<'_>) -> Result<Vec<String>> {
+    fn supported_names(&self, ctx: &Ctx<'js>) -> Result<Vec<String>> {
         named_keys(ctx, &self.query.ids(ctx)?)
     }
 }

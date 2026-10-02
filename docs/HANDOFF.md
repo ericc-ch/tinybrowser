@@ -113,6 +113,9 @@ Verification for the shipping candidate:
    nonfunctional placeholders and redundant binding boilerplate. Follow
    `docs/bindings.md` for ownership and coverage rules. Verify each migration
    stage with WPT before deleting the old input/compiler path.
+   Done: the input snapshot, cross-file resolver, and contract generator.
+   Migrated: `DOMException`, `NodeList`, `HTMLCollection`. The remaining native
+   and JS interfaces still use `crates/renderer/idl/` and the legacy compiler.
 2. Resolve the older WebIDL-migration adverse status changes listed above before
    claiming migration conformance is unchanged.
 3. Preexisting conformance gaps unrelated to the bridge: lossy Rust

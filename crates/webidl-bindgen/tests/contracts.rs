@@ -88,6 +88,58 @@ fn conflicting_providers_and_unknown_contract_methods_are_diagnostics() {
 }
 
 #[test]
+fn getters_lower_to_property_hooks_and_operations() {
+    let idl = [Source {
+        name: "node_list.idl",
+        text: r"
+            [Exposed=Window] interface NodeList {
+                getter Node? item(unsigned long index);
+                readonly attribute unsigned long length;
+                iterable<Node>;
+            };
+        ",
+    }];
+    let rust = [Source {
+        name: "node_list.rs",
+        text: r"
+            impl<'js> node_list_generated::NodeList<'js> for Payload {
+                fn get_length(&self, ctx: &Ctx<'js>) -> Result<usize> { length(ctx) }
+                fn item(&self, ctx: Ctx<'js>, arg_0: u32) -> Result<Value<'js>> { item(ctx, arg_0) }
+            }
+        ",
+    }];
+    let bindings = compile_contracts(&idl, &rust).expect("compile fixture");
+    assert_eq!(bindings[0].interface, "NodeList");
+    for fragment in ["exotic_get_own_property", "fn get_length", "fn item"] {
+        assert!(
+            bindings[0].rust.contains(fragment),
+            "missing {fragment}: {}",
+            bindings[0].rust
+        );
+    }
+    let named_only = [Source {
+        name: "named.idl",
+        text: "[Exposed=Window] interface Named { getter Node? item(DOMString name); };",
+    }];
+    let named_rust = [Source {
+        name: "named.rs",
+        text: "impl<'js> named_generated::Named<'js> for Payload { fn item(&self, ctx: Ctx<'js>, arg_0: rquickjs::String<'js>) -> Result<Value<'js>> { item(ctx) } }",
+    }];
+    assert!(compile_contracts(&named_only, &named_rust).is_err());
+
+    let indexed_named = [Source {
+        name: "html_collection.idl",
+        text: "[Exposed=Window, LegacyUnenumerableNamedProperties] interface HTMLCollection { readonly attribute unsigned long length; getter Element? item(unsigned long index); getter Element? namedItem(DOMString name); };",
+    }];
+    let indexed_named_rust = [Source {
+        name: "html_collection.rs",
+        text: "impl<'js> html_collection_generated::HTMLCollection<'js> for Payload { fn get_length(&self, ctx: &Ctx<'js>) -> Result<usize> { l(ctx) } fn item(&self, ctx: Ctx<'js>, arg_0: u32) -> Result<Value<'js>> { i(ctx) } fn named_item(&self, ctx: Ctx<'js>, arg_0: rquickjs::String<'js>) -> Result<Value<'js>> { n(ctx) } fn supported_names(&self, ctx: &Ctx<'js>) -> Result<Vec<String>> { s(ctx) } }",
+    }];
+    let bindings = compile_contracts(&indexed_named, &indexed_named_rust).expect("compile fixture");
+    assert!(bindings[0].rust.contains("supported_names"));
+}
+
+#[test]
 fn malformed_graphs_return_named_diagnostics() {
     for (text, diagnostic) in [
         (
