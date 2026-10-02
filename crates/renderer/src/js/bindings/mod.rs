@@ -1808,6 +1808,11 @@ pub(super) fn tree_order(dom: &dom::Document, a: NodeId, b: NodeId) -> std::cmp:
 }
 
 pub(super) fn find_element_by_id(dom: &dom::Document, scope: NodeId, id: &str) -> Option<NodeId> {
+    // An element with an empty ID has no ID, so no element matches
+    // (<https://dom.spec.whatwg.org/#concept-id>).
+    if id.is_empty() {
+        return None;
+    }
     dom.tree()
         .descendants(scope)
         .find(|&node| is_element(dom, node) && dom.attribute(node, "id").as_deref() == Some(id))

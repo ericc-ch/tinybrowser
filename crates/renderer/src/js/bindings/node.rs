@@ -584,27 +584,6 @@ impl JsNode {
         events::dispatch_event(&ctx, EventTargetKey::Node(self.handle.0), &event)
     }
 
-    // https://html.spec.whatwg.org/multipage/interaction.html#dom-click
-    #[qjs(skip)]
-    fn click(&self, ctx: Ctx<'_>) -> Result<()> {
-        element_click(&ctx, self.handle.0)
-    }
-
-    // https://html.spec.whatwg.org/multipage/interaction.html#dom-focus
-    #[qjs(skip)]
-    fn focus(&self, ctx: Ctx<'_>) -> Result<()> {
-        if is_focusable(&ctx, self.handle.0)? {
-            focus_node(&ctx, self.handle.0)?;
-        }
-        Ok(())
-    }
-
-    // https://html.spec.whatwg.org/multipage/interaction.html#dom-blur
-    #[qjs(skip)]
-    fn blur(&self, ctx: Ctx<'_>) -> Result<()> {
-        blur_node(&ctx, self.handle.0)
-    }
-
     // https://dom.spec.whatwg.org/#dom-document-activeelement
     #[qjs(skip)]
     fn active_element<'js>(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
@@ -3888,10 +3867,68 @@ impl<'js> document_fragment_generated::DocumentFragment<'js> for JsNode {
     }
 }
 
+/// Moves focus to `id` when it is focusable
+/// (<https://html.spec.whatwg.org/multipage/interaction.html#dom-focus>).
+fn focus_element(ctx: &Ctx<'_>, id: NodeId) -> Result<()> {
+    if is_focusable(ctx, id)? {
+        focus_node(ctx, id)?;
+    }
+    Ok(())
+}
+
+impl<'js> html_element_generated::HTMLElement<'js> for JsNode {
+    // https://html.spec.whatwg.org/multipage/dom.html#dom-dataset
+    fn get_dataset(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
+        self.dataset(ctx)
+    }
+
+    // https://html.spec.whatwg.org/multipage/interaction.html#dom-click
+    fn click(&self, ctx: Ctx<'js>) -> Result<()> {
+        element_click(&ctx, self.handle.0)
+    }
+
+    // https://html.spec.whatwg.org/multipage/interaction.html#dom-focus
+    fn focus(&self, ctx: Ctx<'js>, _options: html_element_generated::FocusOptions) -> Result<()> {
+        focus_element(&ctx, self.handle.0)
+    }
+
+    // https://html.spec.whatwg.org/multipage/interaction.html#dom-blur
+    fn blur(&self, ctx: Ctx<'js>) -> Result<()> {
+        blur_node(&ctx, self.handle.0)
+    }
+}
+
+impl<'js> svg_element_generated::SVGElement<'js> for JsNode {
+    // https://html.spec.whatwg.org/multipage/dom.html#dom-dataset
+    fn get_dataset(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
+        self.dataset(ctx)
+    }
+
+    // https://html.spec.whatwg.org/multipage/interaction.html#dom-focus
+    fn focus(&self, ctx: Ctx<'js>, _options: svg_element_generated::FocusOptions) -> Result<()> {
+        focus_element(&ctx, self.handle.0)
+    }
+
+    // https://html.spec.whatwg.org/multipage/interaction.html#dom-blur
+    fn blur(&self, ctx: Ctx<'js>) -> Result<()> {
+        blur_node(&ctx, self.handle.0)
+    }
+}
+
 impl<'js> math_ml_element_generated::MathMLElement<'js> for JsNode {
     // https://html.spec.whatwg.org/multipage/dom.html#dom-dataset
     fn get_dataset(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
         self.dataset(ctx)
+    }
+
+    // https://html.spec.whatwg.org/multipage/interaction.html#dom-focus
+    fn focus(&self, ctx: Ctx<'js>, _options: math_ml_element_generated::FocusOptions) -> Result<()> {
+        focus_element(&ctx, self.handle.0)
+    }
+
+    // https://html.spec.whatwg.org/multipage/interaction.html#dom-blur
+    fn blur(&self, ctx: Ctx<'js>) -> Result<()> {
+        blur_node(&ctx, self.handle.0)
     }
 }
 

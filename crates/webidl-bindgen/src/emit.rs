@@ -1230,6 +1230,9 @@ fn dictionary(dictionary: &Dictionary) -> TokenStream {
     });
     quote! {
         // https://webidl.spec.whatwg.org/#es-dictionary
+        // A dictionary carries every IDL member; the algorithm that receives it
+        // may consume a subset, so unconsumed fields are not dead code.
+        #[allow(dead_code, reason = "generated from IDL; algorithms may read a subset")]
         pub(crate) struct #name {
             #(#fields),*
         }
