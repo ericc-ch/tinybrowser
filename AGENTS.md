@@ -38,7 +38,7 @@ Do not test spec conformance in cargo tests. Never add, keep, or "fix" a cargo t
   Implementation follows IDL, never the reverse: do not edit IDL to match our code.
 
 For Web API implementation or binding changes, read
-`docs/researches/engine-source.md` for JS/Rust ownership, IDL inputs, and coverage rules.
+`docs/bindings.md` for JS/Rust ownership, IDL inputs, and coverage rules.
 
 ## Working rules
 

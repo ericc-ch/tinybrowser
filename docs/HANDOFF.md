@@ -108,7 +108,7 @@ Verification for the shipping candidate:
 1. Replace hand-maintained IDL partials and embedded `Rust*` annotations with
    pinned upstream IDL inputs, separate implementation mappings, and support
    selection. Resolve spec inheritance and mixins in the generator. Follow
-   `docs/researches/engine-source.md` for ownership and coverage rules.
+   `docs/bindings.md` for ownership and coverage rules.
 2. Resolve the older WebIDL-migration adverse status changes listed above before
    claiming migration conformance is unchanged.
 3. Preexisting conformance gaps unrelated to the bridge: lossy Rust

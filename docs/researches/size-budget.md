@@ -22,7 +22,7 @@ research.
 ## Binding and JS size
 
 Sharing the `JsNode` payload avoids hundreds of rquickjs classes. For Web API
-changes, follow the JS/Rust ownership rules in [Engine source](engine-source.md#rust-binding-vs-js).
+changes, follow the JS/Rust ownership rules in [Web API bindings](../bindings.md#rust-binding-vs-js).
 
 Intl: option reads are JS (`INSTALL_INTL_JS`, about 31KB). Format is a Rust
 binding. The locale-filtered ICU4X blob is 125,426 bytes (`en-US`, `es-ES`,
