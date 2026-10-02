@@ -1277,7 +1277,7 @@ fn identifier_type(name: &str, nullable: bool, names: &TypeNames) -> Result<Retu
 }
 
 impl Callback {
-    fn parse(definition: &weedle::CallbackDefinition<'_>) -> Result<Self, Error> {
+    pub(crate) fn parse(definition: &weedle::CallbackDefinition<'_>) -> Result<Self, Error> {
         Attributes::parse(definition.attributes.as_ref())?.finish()?;
         // https://webidl.spec.whatwg.org/#idl-callback-functions
         if !matches!(
@@ -1427,6 +1427,41 @@ impl Constant {
     }
 }
 
+impl Enumeration {
+    pub(crate) fn parse(definition: &weedle::EnumDefinition<'_>) -> Result<Self, Error> {
+        Attributes::parse(definition.attributes.as_ref())?.finish()?;
+        let name = identifier(definition.identifier.0)?.to_owned();
+        let mut values = Vec::new();
+        let mut taken = HashSet::new();
+        for value in &definition.values.body.list {
+            let text = value.0;
+            let mut variant = String::new();
+            for word in text
+                .split(|char: char| !char.is_ascii_alphanumeric())
+                .filter(|word| !word.is_empty())
+            {
+                let mut chars = word.chars();
+                if let Some(first) = chars.next() {
+                    variant.push(first.to_ascii_uppercase());
+                    variant.extend(chars);
+                }
+            }
+            if variant.is_empty() {
+                variant.push_str("Empty");
+            }
+            if !taken.insert(variant.clone()) {
+                return Err(Error(format!(
+                    "duplicate Rust enumeration variant: {variant}"
+                )));
+            }
+            let variant = syn::parse_str(&variant)
+                .map_err(|error| Error(format!("invalid enumeration variant: {error}")))?;
+            values.push((text.into(), variant));
+        }
+        Ok(Self { name, values })
+    }
+}
+
 fn is_unsigned_short(type_: IntegerType) -> bool {
     matches!(type_, IntegerType::Short(value) if value.unsigned.is_some())
 }
@@ -1517,42 +1552,17 @@ fn split_definitions<'a, 'b>(
     for definition in definitions.as_slice() {
         match definition {
             Definition::Enum(definition) => {
-                Attributes::parse(definition.attributes.as_ref())?.finish()?;
-                let name = identifier(definition.identifier.0)?.to_owned();
+                let enumeration = Enumeration::parse(definition)?;
                 if enumerations
                     .iter()
-                    .any(|existing: &Enumeration| existing.name == name)
+                    .any(|existing: &Enumeration| existing.name == enumeration.name)
                 {
-                    return Err(Error(format!("duplicate enumeration: {name}")));
+                    return Err(Error(format!(
+                        "duplicate enumeration: {}",
+                        enumeration.name
+                    )));
                 }
-                let mut values = Vec::new();
-                let mut taken = HashSet::new();
-                for value in &definition.values.body.list {
-                    let text = value.0;
-                    let mut variant = String::new();
-                    for word in text
-                        .split(|char: char| !char.is_ascii_alphanumeric())
-                        .filter(|word| !word.is_empty())
-                    {
-                        let mut chars = word.chars();
-                        if let Some(first) = chars.next() {
-                            variant.push(first.to_ascii_uppercase());
-                            variant.extend(chars);
-                        }
-                    }
-                    if variant.is_empty() {
-                        variant.push_str("Empty");
-                    }
-                    if !taken.insert(variant.clone()) {
-                        return Err(Error(format!(
-                            "duplicate Rust enumeration variant: {variant}"
-                        )));
-                    }
-                    let variant = syn::parse_str(&variant)
-                        .map_err(|error| Error(format!("invalid enumeration variant: {error}")))?;
-                    values.push((text.into(), variant));
-                }
-                enumerations.push(Enumeration { name, values });
+                enumerations.push(enumeration);
             }
             Definition::Callback(definition) => {
                 let callback = Callback::parse(definition)?;

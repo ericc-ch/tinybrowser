@@ -215,6 +215,34 @@ impl<'idl> Database<'idl> {
     pub(crate) fn definition(&self, name: &str) -> Option<&Definition<'idl>> {
         self.definitions.get(name)
     }
+
+    pub(crate) fn dictionary(
+        &self,
+        name: &str,
+    ) -> Result<weedle::DictionaryDefinition<'idl>, Error> {
+        let Some(Definition::Dictionary(definition)) = self.definitions.get(name) else {
+            return Err(Error(format!("no dictionary declaration for {name}")));
+        };
+        let mut definition = definition.clone();
+        // https://webidl.spec.whatwg.org/#dfn-partial-dictionary
+        if let Some(partials) = self.partials.get(name) {
+            for partial in partials {
+                let Definition::PartialDictionary(partial) = partial else {
+                    return Err(Error(format!("invalid partial dictionary {name}")));
+                };
+                if partial.attributes.is_some() {
+                    return Err(Error(format!(
+                        "partial dictionary attributes are not supported yet: {name}"
+                    )));
+                }
+                definition
+                    .members
+                    .body
+                    .extend(partial.members.body.iter().cloned());
+            }
+        }
+        Ok(definition)
+    }
 }
 
 fn definition_name<'idl>(definition: &Definition<'idl>) -> Result<&'idl str, Error> {

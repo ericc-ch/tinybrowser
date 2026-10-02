@@ -74,6 +74,17 @@ module per implemented interface. The renderer build writes that module to
 implementation's signatures. An implemented member whose IDL semantics the
 generator cannot yet emit fails the build.
 
+Rust constructors use `constructor`. Attribute methods use `get_name` and
+`set_name`. Operations use the snake-case IDL name. Every entry point receives
+`Ctx` first, after `self` for instance methods. An operation may also receive
+the JS receiver as a leading `Object<'js>` before its IDL arguments. Discovery
+recognizes this signature and dispatch supplies the receiver. The generated
+trait checks the remaining arguments against IDL-derived types.
+
+Dictionary field names use snake case. Dictionary conversion visits inherited
+declarations first and sorts each declaration's members, including partials,
+lexicographically. Unsupported defaults and conversions fail the build.
+
 `crates/renderer/idl/` still holds hand-maintained partial declarations and
 `Rust*` annotations for interfaces the contract path does not yet cover. Delete
 each file when its interface moves to the imported extracts. The renderer build

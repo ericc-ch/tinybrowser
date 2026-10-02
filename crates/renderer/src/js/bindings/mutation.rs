@@ -35,7 +35,6 @@ impl<'js> JsMutationRecord<'js> {
             removed_nodes,
         })
     }
-
 }
 
 impl<'js> mutation_record_generated::MutationRecord<'js> for JsMutationRecord<'js> {
@@ -106,13 +105,17 @@ pub struct JsMutationObserver {
     registry: Weak<RefCell<RealmRegistry>>,
 }
 
-#[allow(
-    clippy::needless_pass_by_value,
-    reason = "generated dispatch calls with an owned realm handle"
-)]
 impl JsMutationObserver {
+    fn registry(&self, ctx: &Ctx<'_>) -> Result<Rc<RefCell<RealmRegistry>>> {
+        self.registry
+            .upgrade()
+            .ok_or_else(|| Exception::throw_type(ctx, "observer realm is gone"))
+    }
+}
+
+impl<'js> mutation_observer_generated::MutationObserver<'js> for JsMutationObserver {
     // https://dom.spec.whatwg.org/#dom-mutationobserver-mutationobserver
-    fn create<'js>(ctx: &Ctx<'js>, callback: Function<'js>) -> Result<Self> {
+    fn constructor(ctx: &Ctx<'js>, callback: Function<'js>) -> Result<Self> {
         let world_rc = world(ctx)?;
         let (registry, owner) = {
             let world = world_rc.borrow();
@@ -128,14 +131,8 @@ impl JsMutationObserver {
         })
     }
 
-    fn registry(&self, ctx: &Ctx<'_>) -> Result<Rc<RefCell<RealmRegistry>>> {
-        self.registry
-            .upgrade()
-            .ok_or_else(|| Exception::throw_type(ctx, "observer realm is gone"))
-    }
-
     // https://dom.spec.whatwg.org/#dom-mutationobserver-observe
-    fn observe<'js>(
+    fn observe(
         &self,
         ctx: Ctx<'js>,
         observer_object: Object<'js>,
@@ -202,7 +199,7 @@ impl JsMutationObserver {
     }
 
     // https://dom.spec.whatwg.org/#dom-mutationobserver-disconnect
-    fn disconnect(&self, ctx: Ctx<'_>) -> Result<()> {
+    fn disconnect(&self, ctx: Ctx<'js>) -> Result<()> {
         let runtime = world(&ctx)?.borrow().runtime.clone();
         self.registry(&ctx)?
             .borrow_mut()
@@ -212,7 +209,7 @@ impl JsMutationObserver {
     }
 
     // https://dom.spec.whatwg.org/#dom-mutationobserver-takerecords
-    fn take_records<'js>(&self, ctx: Ctx<'js>) -> Result<Vec<Value<'js>>> {
+    fn take_records(&self, ctx: Ctx<'js>) -> Result<Vec<Value<'js>>> {
         let runtime = world(&ctx)?.borrow().runtime.clone();
         let queue = self
             .registry(&ctx)?

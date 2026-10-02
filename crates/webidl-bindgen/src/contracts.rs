@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
@@ -16,11 +16,72 @@ use crate::model::{
 use crate::names::snake_case;
 use crate::{Binding, Error, Source};
 
+/// One discovered implementation method: its parameter count after `self` and
+/// `ctx`, and whether the first such parameter is the JS receiver object.
+#[derive(Clone, Copy)]
+struct Method {
+    has_self: bool,
+    parameters: usize,
+    receiver: bool,
+}
+
+impl Method {
+    fn parse(member: &syn::ImplItemFn, source: &str) -> Result<Self, Error> {
+        let inputs = &member.sig.inputs;
+        let (ctx_index, has_self) = match inputs.first() {
+            Some(syn::FnArg::Receiver(_)) => (1, true),
+            Some(syn::FnArg::Typed(_)) => (0, false),
+            None => {
+                return Err(Error(format!(
+                    "{source}: binding methods take a Ctx parameter first"
+                )));
+            }
+        };
+        let Some(syn::FnArg::Typed(ctx)) = inputs.get(ctx_index) else {
+            return Err(Error(format!(
+                "{source}: binding methods take a Ctx parameter first"
+            )));
+        };
+        let is_ctx = matches!(&*ctx.ty, syn::Type::Reference(reference) if is_ctx_type(&reference.elem))
+            || is_ctx_type(&ctx.ty);
+        if !is_ctx {
+            return Err(Error(format!(
+                "{source}: binding methods take a Ctx parameter first"
+            )));
+        }
+        let rest: Vec<_> = inputs.iter().skip(ctx_index + 1).collect();
+        let receiver = rest.first().is_some_and(|argument| {
+            matches!(argument, syn::FnArg::Typed(argument) if is_object_type(&argument.ty))
+        });
+        Ok(Self {
+            has_self,
+            parameters: rest.len(),
+            receiver,
+        })
+    }
+}
+
+fn is_ctx_type(type_: &syn::Type) -> bool {
+    matches!(type_, syn::Type::Path(path) if path.path.segments.last().is_some_and(|segment| segment.ident == "Ctx"))
+}
+
+fn is_object_type(type_: &syn::Type) -> bool {
+    match type_ {
+        syn::Type::Path(path) => path
+            .path
+            .segments
+            .last()
+            .is_some_and(|segment| segment.ident == "Object"),
+        // `Object<'js>` inside a reference is not a receiver.
+        _ => false,
+    }
+}
+
 struct Implementation {
     interface: String,
     payload: syn::Ident,
     lifetime: bool,
-    methods: BTreeSet<String>,
+    methods: BTreeMap<String, Method>,
 }
 
 pub(crate) fn compile(idl: &[Source<'_>], rust: &[Source<'_>]) -> Result<Vec<Binding>, Error> {
@@ -96,7 +157,7 @@ fn discover(
                 "{source}: binding payload must be a local type with at most a 'js lifetime"
             ))
         })?;
-        let mut methods = BTreeSet::new();
+        let mut methods = BTreeMap::new();
         for member in &item.items {
             let syn::ImplItem::Fn(member) = member else {
                 return Err(Error(format!(
@@ -110,7 +171,11 @@ fn discover(
                     "{source}: binding methods must not conditionally disappear"
                 )));
             }
-            if !methods.insert(member.sig.ident.to_string()) {
+            let method = Method::parse(member, source)?;
+            if methods
+                .insert(member.sig.ident.to_string(), method)
+                .is_some()
+            {
                 return Err(Error(format!(
                     "{source}: duplicate binding method {}",
                     member.sig.ident
@@ -197,7 +262,7 @@ fn lower(
                 interface.constants.push(model::Constant::parse(member)?);
             }
             InterfaceMember::Constructor(member)
-                if implementation.methods.contains("constructor") =>
+                if implementation.methods.contains_key("constructor") =>
             {
                 if interface.constructor.is_some() {
                     return Err(Error(
@@ -205,6 +270,11 @@ fn lower(
                     ));
                 }
                 remaining.remove("constructor");
+                if implementation.methods["constructor"].has_self {
+                    return Err(Error(
+                        "native constructors are associated functions, not methods".into(),
+                    ));
+                }
                 let (constructor, signature) = lower_constructor(database, member)?;
                 interface.constructor = Some(constructor);
                 methods.push(signature);
@@ -216,6 +286,9 @@ fn lower(
                     continue;
                 };
                 remaining.remove(&attribute.rust.to_string());
+                if let Some(model::Setter::Method { rust, .. }) = &attribute.setter {
+                    remaining.remove(&rust.to_string());
+                }
                 methods.push(signature);
                 interface.attributes.push(attribute);
             }
@@ -242,23 +315,190 @@ fn lower(
     }
     interface.properties =
         infer_property_hooks(&declaration, &getters, &mut remaining, &mut methods)?;
-    if !remaining.is_empty() {
-        return Err(Error(format!(
-            "{}: methods do not match a supported IDL contract: {}",
-            declaration.name,
-            remaining.into_iter().collect::<Vec<_>>().join(", ")
-        )));
-    }
+    ensure_no_extra_methods(&declaration, &remaining)?;
+    add_referenced_definitions(database, &mut interface)?;
     let name = format_ident!("{}", declaration.name);
     interface.contract = Some(quote! { pub(super) trait #name<'js> { #(#methods)* } });
     Ok(interface)
+}
+
+/// Reject implementation methods that no IDL member consumed.
+fn ensure_no_extra_methods(
+    declaration: &crate::database::Interface<'_>,
+    remaining: &BTreeMap<String, Method>,
+) -> Result<(), Error> {
+    if remaining.is_empty() {
+        return Ok(());
+    }
+    Err(Error(format!(
+        "{}: methods do not match a supported IDL contract: {}",
+        declaration.name,
+        remaining.keys().cloned().collect::<Vec<_>>().join(", ")
+    )))
+}
+
+/// Emit the dictionaries and enumerations the lowered members reference.
+fn add_referenced_definitions(
+    database: &Database<'_>,
+    interface: &mut model::Interface,
+) -> Result<(), Error> {
+    let mut referenced = BTreeSet::new();
+    for attribute in &interface.attributes {
+        collect_reference(&attribute.return_type, &mut referenced);
+    }
+    for operation in &interface.operations {
+        for argument in &operation.arguments {
+            collect_reference(&argument.type_, &mut referenced);
+        }
+    }
+    if let Some(constructor) = &interface.constructor {
+        for argument in &constructor.arguments {
+            if let ConstructorArgumentKind::Dictionary(name) = &argument.kind {
+                referenced.insert(name.clone());
+            }
+        }
+    }
+    for name in referenced {
+        match database.definition(&name) {
+            Some(weedle::Definition::Dictionary(_)) => {
+                interface
+                    .dictionaries
+                    .push(lower_dictionary(database, &name)?);
+            }
+            Some(weedle::Definition::Enum(definition)) => {
+                interface
+                    .enumerations
+                    .push(model::Enumeration::parse(definition)?);
+            }
+            Some(weedle::Definition::Callback(_)) => {}
+            _ => {
+                return Err(Error(format!(
+                    "native reference {name} is not supported yet"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Note a dictionary or enumeration a lowered member references, so its
+/// definition is emitted into the same generated module.
+fn collect_reference(type_: &ReturnType, referenced: &mut BTreeSet<String>) {
+    match type_ {
+        ReturnType::Dictionary(name) | ReturnType::Enumeration(name) => {
+            referenced.insert(name.clone());
+        }
+        _ => {}
+    }
+}
+
+/// Lower an unchanged dictionary declaration. Field names are the IDL names
+/// snake-cased; no `Rust` annotations are read.
+fn lower_dictionary(database: &Database<'_>, name: &str) -> Result<model::Dictionary, Error> {
+    let definition = database.dictionary(name)?;
+    validate_dictionary_attributes(definition.attributes.as_ref())?;
+    let inherited = if let Some(parent) = &definition.inheritance {
+        lower_dictionary(database, parent.identifier.0)?.fields
+    } else {
+        Vec::new()
+    };
+    let mut fields = Vec::new();
+    let mut taken: HashSet<_> = inherited.iter().map(|field| field.name.as_str()).collect();
+    for member in &definition.members.body {
+        if member.required.is_some() {
+            return Err(Error(
+                "required dictionary fields are not supported yet".into(),
+            ));
+        }
+        if !taken.insert(member.identifier.0) {
+            return Err(Error(format!(
+                "duplicate dictionary field: {}",
+                member.identifier.0
+            )));
+        }
+        validate_empty_attributes(member.attributes.as_ref())?;
+        validate_empty_attributes(member.type_.attributes.as_ref())?;
+        let rust = format_ident!("{}", snake_case(member.identifier.0));
+        let type_ = match &member.type_.type_ {
+            Type::Single(SingleType::NonAny(NonAnyType::Boolean(value)))
+                if value.q_mark.is_none() =>
+            {
+                let default = match &member.default {
+                    None => None,
+                    Some(default) => {
+                        let DefaultValue::Boolean(default) = &default.value else {
+                            return Err(Error(
+                                "only boolean dictionary defaults are supported yet".into(),
+                            ));
+                        };
+                        Some(default.0)
+                    }
+                };
+                model::DictionaryFieldType::Boolean { default }
+            }
+            Type::Single(SingleType::NonAny(NonAnyType::Sequence(value)))
+                if value.q_mark.is_none() =>
+            {
+                let element = &value.type_.generics.body;
+                validate_empty_attributes(element.attributes.as_ref())?;
+                let is_string = matches!(
+                    &element.type_,
+                    Type::Single(SingleType::NonAny(NonAnyType::DOMString(element)))
+                        if element.q_mark.is_none()
+                );
+                if !is_string {
+                    return Err(Error(
+                        "only sequence<DOMString> dictionary fields are supported yet".into(),
+                    ));
+                }
+                if member.default.is_some() {
+                    return Err(Error(
+                        "sequence dictionary defaults are not supported yet".into(),
+                    ));
+                }
+                model::DictionaryFieldType::StringSequence
+            }
+            _ => {
+                return Err(Error(format!(
+                    "dictionary field type is not supported yet: {}",
+                    member.identifier.0
+                )));
+            }
+        };
+        fields.push(model::DictionaryField {
+            name: member.identifier.0.into(),
+            rust,
+            type_,
+        });
+    }
+    // https://webidl.spec.whatwg.org/#es-dictionary
+    // https://github.com/chromium/chromium/blob/main/third_party/blink/renderer/bindings/scripts/web_idl/dictionary.py
+    fields.sort_by(|left, right| left.name.cmp(&right.name));
+    let fields = inherited.into_iter().chain(fields).collect();
+    Ok(model::Dictionary {
+        name: definition.identifier.0.into(),
+        fields,
+    })
+}
+
+/// Dictionary-level extended attributes the contract path consumes.
+fn validate_dictionary_attributes(
+    attributes: Option<&ExtendedAttributeList<'_>>,
+) -> Result<(), Error> {
+    if attributes.is_some_and(|attributes| !attributes.body.list.is_empty()) {
+        Err(Error(format!(
+            "native dictionary semantics are not supported yet: {attributes:?}"
+        )))
+    } else {
+        Ok(())
+    }
 }
 
 /// Infer legacy platform-object property hooks from declared getters.
 fn infer_property_hooks(
     declaration: &crate::database::Interface<'_>,
     getters: &[PropertyGetter],
-    remaining: &mut BTreeSet<String>,
+    remaining: &mut BTreeMap<String, Method>,
     methods: &mut Vec<TokenStream>,
 ) -> Result<PropertyHooks, Error> {
     let indexed = getters.contains(&PropertyGetter::Indexed);
@@ -271,7 +511,7 @@ fn infer_property_hooks(
         )),
         (true, true) => {
             let supported = format_ident!("supported_names");
-            if !remaining.remove("supported_names") {
+            if remaining.remove("supported_names").is_none() {
                 return Err(Error(
                     "named property hooks require a supported_names implementation".into(),
                 ));
@@ -307,23 +547,27 @@ fn has_attribute(
 fn lower_operation(
     database: &Database<'_>,
     member: &weedle::interface::OperationInterfaceMember<'_>,
-    implemented: &BTreeSet<String>,
+    implemented: &BTreeMap<String, Method>,
 ) -> Result<Option<(model::Operation, TokenStream, Option<PropertyGetter>)>, Error> {
+    let Some(identifier) = &member.identifier else {
+        return Ok(None);
+    };
+    let name = identifier.0;
+    let rust = format_ident!("{}", snake_case(name));
+    let Some(method) = implemented.get(&rust.to_string()) else {
+        return Ok(None);
+    };
     if member.modifier.is_some() {
         return Err(Error(
             "native static and stringifier operations are not supported yet".into(),
         ));
     }
-    validate_empty_attributes(member.attributes.as_ref())?;
-    let Some(identifier) = &member.identifier else {
-        return Err(Error(
-            "native property setters and deleters are not supported yet".into(),
-        ));
-    };
-    let name = identifier.0;
-    let rust = format_ident!("{}", snake_case(name));
-    if !implemented.contains(&rust.to_string()) {
-        return Ok(None);
+    validate_operation_attributes(member.attributes.as_ref())?;
+    let reactions = has_attribute(member.attributes.as_ref(), "CEReactions");
+    if !method.has_self {
+        return Err(Error(format!(
+            "native operation {name} must take self as its first parameter"
+        )));
     }
     let property = match &member.special {
         None => None,
@@ -336,54 +580,158 @@ fn lower_operation(
     };
     let mut arguments = Vec::new();
     let mut parameters = Vec::new();
+    let mut optional_seen = false;
     for (index, argument) in member.args.body.list.iter().enumerate() {
-        let Argument::Single(argument) = argument else {
+        let LoweredArgument {
+            argument,
+            parameter,
+            arity,
+        } = lower_argument(database, argument)?;
+        if optional_seen && arity == ArgumentArity::Required {
             return Err(Error(
-                "native variadic operations are not supported yet".into(),
-            ));
-        };
-        validate_empty_attributes(argument.attributes.as_ref())?;
-        validate_empty_attributes(argument.type_.attributes.as_ref())?;
-        if argument.optional.is_some() || argument.default.is_some() {
-            return Err(Error(
-                "native optional operation arguments are not supported yet".into(),
+                "native required argument after an optional one is not supported yet".into(),
             ));
         }
-        let type_ = native_type(database, &argument.type_.type_, &mut BTreeSet::new())?;
-        let parameter = match type_ {
-            ReturnType::UnsignedLong => quote! { u32 },
-            ReturnType::String => quote! { rquickjs::String<'js> },
-            ReturnType::Boolean => quote! { bool },
-            _ => {
-                return Err(Error(
-                    "native operation argument type is not supported yet".into(),
-                ));
-            }
-        };
+        optional_seen |= arity == ArgumentArity::Optional;
         let argument_name = format_ident!("arg_{index}");
         parameters.push(quote! { #argument_name: #parameter });
-        arguments.push(model::OperationArgument {
-            type_,
-            arity: ArgumentArity::Required,
-            null_default: false,
-            legacy_null_to_empty: false,
-            boolean_default: None,
-            from_js: None,
-        });
+        arguments.push(argument);
     }
+    let expected = arguments.len();
+    let takes_this = if method.parameters == expected {
+        false
+    } else if method.parameters == expected + 1 && method.receiver && property.is_none() {
+        true
+    } else {
+        return Err(Error(format!(
+            "native operation {name} has an implementation signature that does not match its IDL arguments"
+        )));
+    };
+    let this_parameter = if takes_this {
+        quote! { this: Object<'js>, }
+    } else {
+        quote! {}
+    };
     let (result, returns) = operation_result(database, &member.return_type)?;
-    let signature =
-        quote! { fn #rust(&self, ctx: Ctx<'js>, #(#parameters),*) -> Result<#returns>; };
+    let signature = quote! {
+        fn #rust(&self, ctx: Ctx<'js>, #this_parameter #(#parameters),*) -> Result<#returns>;
+    };
     let operation = model::Operation {
         name: name.into(),
         rust,
         result,
-        takes_this: false,
+        takes_this,
         arguments,
-        reactions: false,
+        reactions,
         getter: property,
     };
     Ok(Some((operation, signature, property)))
+}
+
+struct LoweredArgument {
+    argument: model::OperationArgument,
+    parameter: TokenStream,
+    arity: ArgumentArity,
+}
+
+fn lower_argument(
+    database: &Database<'_>,
+    argument: &weedle::argument::Argument<'_>,
+) -> Result<LoweredArgument, Error> {
+    let Argument::Single(argument) = argument else {
+        return Err(Error(
+            "native variadic operations are not supported yet".into(),
+        ));
+    };
+    validate_argument_attributes(argument.attributes.as_ref())?;
+    validate_argument_attributes(argument.type_.attributes.as_ref())?;
+    let legacy_null_to_empty =
+        has_attribute(argument.attributes.as_ref(), "LegacyNullToEmptyString")
+            || has_attribute(
+                argument.type_.attributes.as_ref(),
+                "LegacyNullToEmptyString",
+            );
+    let type_ = native_type(database, &argument.type_.type_, &mut BTreeSet::new())?;
+    if legacy_null_to_empty && !matches!(type_, ReturnType::String) {
+        return Err(Error("LegacyNullToEmptyString requires DOMString".into()));
+    }
+    // https://webidl.spec.whatwg.org/#dfn-overload-resolution-algorithm
+    match (&type_, argument.optional.is_some(), &argument.default) {
+        (_, false, None) | (ReturnType::String | ReturnType::Boolean, true, None) => {}
+        (ReturnType::Boolean, true, Some(default))
+            if matches!(default.value, DefaultValue::Boolean(_)) => {}
+        (ReturnType::NullableDocumentType, true, Some(default))
+            if matches!(default.value, DefaultValue::Null(_)) => {}
+        (ReturnType::Dictionary(_), true, Some(default))
+            if matches!(default.value, DefaultValue::EmptyDictionary(_)) => {}
+        _ => {
+            return Err(Error(
+                "native operation optionality or default is not supported yet".into(),
+            ));
+        }
+    }
+    let arity = if argument.optional.is_some() {
+        ArgumentArity::Optional
+    } else {
+        ArgumentArity::Required
+    };
+    let boolean_default = argument
+        .default
+        .as_ref()
+        .and_then(|default| match default.value {
+            DefaultValue::Boolean(value) => Some(value.0),
+            _ => None,
+        });
+    let parameter = argument_parameter(&type_, arity, boolean_default)?;
+    Ok(LoweredArgument {
+        argument: model::OperationArgument {
+            type_,
+            arity,
+            null_default: argument
+                .default
+                .as_ref()
+                .is_some_and(|default| matches!(default.value, DefaultValue::Null(_))),
+            legacy_null_to_empty,
+            boolean_default,
+            from_js: None,
+        },
+        parameter,
+        arity,
+    })
+}
+
+/// The Rust parameter type for one lowered operation argument. These mirror the
+/// conversions in `emit`, and match the payload signatures the platform
+/// algorithms already use.
+fn argument_parameter(
+    type_: &ReturnType,
+    arity: ArgumentArity,
+    boolean_default: Option<bool>,
+) -> Result<TokenStream, Error> {
+    let optional = arity == ArgumentArity::Optional;
+    Ok(match type_ {
+        ReturnType::Node => quote! { host::NodeReference },
+        ReturnType::NullableNode => quote! { Option<host::NodeReference> },
+        ReturnType::String if optional => quote! { Option<rquickjs::String<'js>> },
+        ReturnType::String => quote! { rquickjs::String<'js> },
+        ReturnType::NullableString => quote! { Option<rquickjs::String<'js>> },
+        ReturnType::NullableDocumentType => quote! { Option<dom::NodeId> },
+        ReturnType::Callback => quote! { rquickjs::Function<'js> },
+        ReturnType::Dictionary(name) | ReturnType::Enumeration(name) => {
+            let name = format_ident!("{name}");
+            quote! { #name }
+        }
+        ReturnType::Boolean if optional && boolean_default.is_none() => quote! { Option<bool> },
+        ReturnType::Boolean => quote! { bool },
+        ReturnType::UnsignedLong => quote! { u32 },
+        ReturnType::Long => quote! { i32 },
+        ReturnType::Double => quote! { f64 },
+        _ => {
+            return Err(Error(
+                "native operation argument type is not supported yet".into(),
+            ));
+        }
+    })
 }
 
 fn property_getter(
@@ -423,6 +771,12 @@ fn operation_result(
                 ReturnType::Boolean => Ok((OperationResult::Boolean, quote! { bool })),
                 ReturnType::UnsignedShort => Ok((OperationResult::UnsignedShort, quote! { u16 })),
                 ReturnType::Long => Ok((OperationResult::Long, quote! { i32 })),
+                ReturnType::InterfaceSequence => {
+                    Ok((OperationResult::Sequence, quote! { Vec<Value<'js>> }))
+                }
+                ReturnType::StringSequence => {
+                    Ok((OperationResult::StringSequence, quote! { Vec<String> }))
+                }
                 _ => Err(Error(
                     "native operation result type is not supported yet".into(),
                 )),
@@ -434,12 +788,12 @@ fn operation_result(
 fn lower_attribute(
     database: &Database<'_>,
     member: &weedle::interface::AttributeInterfaceMember<'_>,
-    implemented: &BTreeSet<String>,
+    implemented: &BTreeMap<String, Method>,
 ) -> Result<Option<(model::Attribute, TokenStream)>, Error> {
     let getter_name = format!("get_{}", snake_case(member.identifier.0));
     let setter_name = format!("set_{}", snake_case(member.identifier.0));
-    let readable = implemented.contains(&getter_name);
-    let writable = implemented.contains(&setter_name);
+    let readable = implemented.contains_key(&getter_name);
+    let writable = implemented.contains_key(&setter_name);
     if !readable && !writable {
         return Ok(None);
     }
@@ -449,18 +803,36 @@ fn lower_attribute(
             member.identifier.0
         )));
     }
-    if member.modifier.is_some() || writable {
+    if !implemented[&getter_name].has_self || implemented[&getter_name].parameters != 0 {
+        return Err(Error(format!(
+            "{}: attribute getter must take only self and ctx",
+            member.identifier.0
+        )));
+    }
+    if writable
+        && (!implemented[&setter_name].has_self || implemented[&setter_name].parameters != 1)
+    {
+        return Err(Error(format!(
+            "{}: attribute setter must take only self, ctx, and the value",
+            member.identifier.0
+        )));
+    }
+    if member.modifier.is_some() {
         return Err(Error(
-            "native writable and special attributes are not supported yet".into(),
+            "native special attributes are not supported yet".into(),
         ));
     }
     validate_attribute_attributes(member.attributes.as_ref())?;
-    validate_empty_attributes(member.type_.attributes.as_ref())?;
+    validate_argument_attributes(member.type_.attributes.as_ref())?;
+    let reactions = has_attribute(member.attributes.as_ref(), "CEReactions");
+    let legacy_null_to_empty = has_attribute(member.attributes.as_ref(), "LegacyNullToEmptyString")
+        || has_attribute(member.type_.attributes.as_ref(), "LegacyNullToEmptyString");
     let type_ = match native_type(database, &member.type_.type_, &mut BTreeSet::new())? {
         // Getter dispatch hands a platform object or its null directly to JS.
-        ReturnType::Node | ReturnType::NullableNode | ReturnType::NodeList => {
-            ReturnType::PlatformObject
-        }
+        ReturnType::Node
+        | ReturnType::NullableNode
+        | ReturnType::NodeList
+        | ReturnType::NullableDocumentType => ReturnType::PlatformObject,
         type_ => type_,
     };
     let result = match type_ {
@@ -469,21 +841,53 @@ fn lower_attribute(
         ReturnType::Boolean => quote! { bool },
         ReturnType::UnsignedShort => quote! { u16 },
         ReturnType::UnsignedLong => quote! { usize },
+        ReturnType::Long => quote! { i32 },
+        ReturnType::Double => quote! { f64 },
         ReturnType::PlatformObject => quote! { Value<'js> },
         _ => return Err(Error("native attribute type is not supported yet".into())),
     };
     let getter = format_ident!("{getter_name}");
-    let signature = quote! { fn #getter(&self, ctx: &Ctx<'js>) -> Result<#result>; };
+    let mut signature = quote! { fn #getter(&self, ctx: &Ctx<'js>) -> Result<#result>; };
+    let setter = if writable {
+        let setter = format_ident!("{setter_name}");
+        let parameter = setter_parameter(&type_)?;
+        signature = quote! { #signature fn #setter(&self, ctx: &Ctx<'js>, value: #parameter) -> Result<()>; };
+        Some(model::Setter::Method {
+            rust: setter,
+            from_js: None,
+        })
+    } else {
+        None
+    };
     let attribute = model::Attribute {
         name: member.identifier.0.into(),
         rust: getter,
         return_type: type_,
         mapping: GetterMapping::Method,
-        setter: None,
-        legacy_null_to_empty: false,
-        reactions: false,
+        setter,
+        legacy_null_to_empty,
+        reactions,
     };
     Ok(Some((attribute, signature)))
+}
+
+/// The Rust parameter type for one lowered attribute setter, mirroring
+/// `emit`'s setter conversions.
+fn setter_parameter(type_: &ReturnType) -> Result<TokenStream, Error> {
+    Ok(match type_ {
+        ReturnType::String => quote! { rquickjs::String<'js> },
+        ReturnType::NullableString => quote! { Option<rquickjs::String<'js>> },
+        ReturnType::Boolean => quote! { bool },
+        ReturnType::UnsignedLong => quote! { u32 },
+        ReturnType::Long => quote! { i32 },
+        ReturnType::Double => quote! { f64 },
+        ReturnType::Value => quote! { Value<'js> },
+        _ => {
+            return Err(Error(
+                "native attribute setter type is not supported yet".into(),
+            ));
+        }
+    })
 }
 
 fn lower_constructor(
@@ -516,33 +920,67 @@ fn constructor_arguments(
         };
         validate_empty_attributes(argument.attributes.as_ref())?;
         validate_empty_attributes(argument.type_.attributes.as_ref())?;
-        if !matches!(
-            native_type(database, &argument.type_.type_, &mut BTreeSet::new())?,
-            ReturnType::String
-        ) {
-            return Err(Error("native constructor type is not supported yet".into()));
-        }
-        let default = match (&argument.optional, &argument.default) {
-            (None, None) => None,
-            (Some(_), Some(default)) => {
-                let DefaultValue::String(default) = &default.value else {
-                    return Err(Error(
-                        "native constructor default is not supported yet".into(),
-                    ));
+        let type_ = native_type(database, &argument.type_.type_, &mut BTreeSet::new())?;
+        let (kind, parameter) = match type_ {
+            ReturnType::String => {
+                let default = match (&argument.optional, &argument.default) {
+                    (None, None) => None,
+                    (Some(_), Some(default)) => {
+                        let DefaultValue::String(default) = &default.value else {
+                            return Err(Error(
+                                "native constructor default is not supported yet".into(),
+                            ));
+                        };
+                        Some(default.0.into())
+                    }
+                    _ => {
+                        return Err(Error(
+                            "native constructor optionality is not supported yet".into(),
+                        ));
+                    }
                 };
-                Some(default.0.into())
+                (
+                    ConstructorArgumentKind::String { default },
+                    quote! { rquickjs::String<'js> },
+                )
             }
+            ReturnType::Callback => match (&argument.optional, &argument.default) {
+                (None, None) => (
+                    ConstructorArgumentKind::Callback,
+                    quote! { rquickjs::Function<'js> },
+                ),
+                _ => {
+                    return Err(Error(
+                        "native optional callback arguments are not supported yet".into(),
+                    ));
+                }
+            },
+            ReturnType::Dictionary(name) => match (&argument.optional, &argument.default) {
+                (Some(_), Some(default))
+                    if matches!(default.value, DefaultValue::EmptyDictionary(_)) =>
+                {
+                    let struct_name = format_ident!("{name}");
+                    (
+                        ConstructorArgumentKind::Dictionary(name),
+                        quote! { #struct_name },
+                    )
+                }
+                _ => {
+                    return Err(Error(
+                        "native constructor dictionaries need a trailing empty-object default"
+                            .into(),
+                    ));
+                }
+            },
             _ => {
                 return Err(Error(
-                    "native constructor optionality is not supported yet".into(),
+                    "native constructor argument type is not supported yet".into(),
                 ));
             }
         };
-        arguments.push(model::ConstructorArgument {
-            kind: ConstructorArgumentKind::String { default },
-        });
+        arguments.push(model::ConstructorArgument { kind });
         let name = format_ident!("arg_{index}");
-        parameters.push(quote! { #name: rquickjs::String<'js> });
+        parameters.push(quote! { #name: #parameter });
     }
     Ok((arguments, parameters))
 }
@@ -560,6 +998,9 @@ fn native_type(
                 ReturnType::String
             })
         }
+        Type::Single(SingleType::NonAny(NonAnyType::USVString(item))) if item.q_mark.is_none() => {
+            Ok(ReturnType::UsvString)
+        }
         Type::Single(SingleType::NonAny(NonAnyType::Boolean(item))) if item.q_mark.is_none() => {
             Ok(ReturnType::Boolean)
         }
@@ -575,29 +1016,62 @@ fn native_type(
         {
             Ok(ReturnType::UnsignedLong)
         }
+        Type::Single(SingleType::NonAny(NonAnyType::Integer(item)))
+            if item.q_mark.is_none()
+                && matches!(item.type_, IntegerType::Long(item) if item.unsigned.is_none()) =>
+        {
+            Ok(ReturnType::Long)
+        }
+        Type::Single(SingleType::NonAny(NonAnyType::Sequence(item))) if item.q_mark.is_none() => {
+            let element = &item.type_.generics.body;
+            validate_empty_attributes(element.attributes.as_ref())?;
+            match &element.type_ {
+                Type::Single(SingleType::NonAny(NonAnyType::DOMString(element)))
+                    if element.q_mark.is_none() =>
+                {
+                    Ok(ReturnType::StringSequence)
+                }
+                Type::Single(SingleType::NonAny(NonAnyType::Identifier(element)))
+                    if element.q_mark.is_none()
+                        && matches!(
+                            database.definition(element.type_.0),
+                            Some(weedle::Definition::Interface(_))
+                        ) =>
+                {
+                    Ok(ReturnType::InterfaceSequence)
+                }
+                _ => Err(Error(
+                    "only sequences of known interfaces or DOMString are supported yet".into(),
+                )),
+            }
+        }
         Type::Single(SingleType::NonAny(NonAnyType::Identifier(item))) => {
-            if let Some(interface) = native_interface(item.type_.0, item.q_mark.is_some()) {
+            let name = item.type_.0;
+            let nullable = item.q_mark.is_some();
+            if let Some(interface) = native_interface(database, name, nullable) {
                 return Ok(interface);
             }
-            if item.q_mark.is_some() {
+            if nullable {
                 return Err(Error(format!(
-                    "nullable native type {} is not supported yet",
-                    item.type_.0
+                    "nullable native type {name} is not supported yet"
                 )));
             }
-            if !visited.insert(item.type_.0.into()) {
-                return Err(Error(format!("typedef cycle at {}", item.type_.0)));
+            if !visited.insert(name.into()) {
+                return Err(Error(format!("typedef cycle at {name}")));
             }
-            match database.definition(item.type_.0) {
+            match database.definition(name) {
                 Some(weedle::Definition::Typedef(definition)) => {
                     validate_empty_attributes(definition.attributes.as_ref())?;
                     validate_empty_attributes(definition.type_.attributes.as_ref())?;
                     native_type(database, &definition.type_.type_, visited)
                 }
-                _ => Err(Error(format!(
-                    "native type {} is not supported yet",
-                    item.type_.0
-                ))),
+                Some(weedle::Definition::Callback(definition)) => {
+                    model::Callback::parse(definition)?;
+                    Ok(ReturnType::Callback)
+                }
+                Some(weedle::Definition::Dictionary(_)) => Ok(ReturnType::Dictionary(name.into())),
+                Some(weedle::Definition::Enum(_)) => Ok(ReturnType::Enumeration(name.into())),
+                _ => Err(Error(format!("native type {name} is not supported yet"))),
             }
         }
         _ => Err(Error(format!(
@@ -606,13 +1080,21 @@ fn native_type(
     }
 }
 
-/// Canonical platform-object types the contract path carries directly.
-fn native_interface(name: &str, nullable: bool) -> Option<ReturnType> {
+/// Interface types the contract path carries. Node arguments need the
+/// `NodeReference` conversion; every other DOM interface is a platform object
+/// whose getter or result hands the value to JS directly.
+fn native_interface(database: &Database<'_>, name: &str, nullable: bool) -> Option<ReturnType> {
     match (name, nullable) {
         ("Node", false) => Some(ReturnType::Node),
         ("Node", true) => Some(ReturnType::NullableNode),
-        ("NodeList", false) => Some(ReturnType::NodeList),
-        ("Element", _) => Some(ReturnType::PlatformObject),
+        ("DocumentType", true) => Some(ReturnType::NullableDocumentType),
+        _ if matches!(
+            database.definition(name),
+            Some(weedle::Definition::Interface(_))
+        ) =>
+        {
+            Some(ReturnType::PlatformObject)
+        }
         _ => None,
     }
 }
@@ -625,10 +1107,55 @@ fn validate_attribute_attributes(
         for attribute in &attributes.body.list {
             match attribute {
                 ExtendedAttribute::NoArgs(item)
-                    if matches!(item.0.0, "SameObject" | "LegacyUnforgeable") => {}
+                    if matches!(
+                        item.0.0,
+                        "SameObject"
+                            | "LegacyUnforgeable"
+                            | "CEReactions"
+                            | "LegacyNullToEmptyString"
+                    ) => {}
                 _ => {
                     return Err(Error(format!(
                         "native attribute semantics are not supported yet: {attribute:?}"
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Operation extended attributes the contract path consumes.
+fn validate_operation_attributes(
+    attributes: Option<&ExtendedAttributeList<'_>>,
+) -> Result<(), Error> {
+    if let Some(attributes) = attributes {
+        for attribute in &attributes.body.list {
+            match attribute {
+                ExtendedAttribute::NoArgs(item)
+                    if matches!(item.0.0, "NewObject" | "CEReactions") => {}
+                _ => {
+                    return Err(Error(format!(
+                        "native operation semantics are not supported yet: {attribute:?}"
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Argument extended attributes the contract path consumes.
+fn validate_argument_attributes(
+    attributes: Option<&ExtendedAttributeList<'_>>,
+) -> Result<(), Error> {
+    if let Some(attributes) = attributes {
+        for attribute in &attributes.body.list {
+            match attribute {
+                ExtendedAttribute::NoArgs(item) if item.0.0 == "LegacyNullToEmptyString" => {}
+                _ => {
+                    return Err(Error(format!(
+                        "native argument semantics are not supported yet: {attribute:?}"
                     )));
                 }
             }

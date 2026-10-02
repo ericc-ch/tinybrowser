@@ -65,7 +65,7 @@ fn conflicting_providers_and_unknown_contract_methods_are_diagnostics() {
     }];
     let unknown = [Source {
         name: "fixture.rs",
-        text: "impl<'js> sample_generated::Sample<'js> for Payload { fn typo() {} }",
+        text: "impl<'js> sample_generated::Sample<'js> for Payload { fn typo(&self, ctx: Ctx<'js>) {} }",
     }];
     assert_eq!(
         compile_contracts(&idl, &unknown)
@@ -129,7 +129,7 @@ fn getters_lower_to_property_hooks_and_operations() {
 
     let indexed_named = [Source {
         name: "html_collection.idl",
-        text: "[Exposed=Window, LegacyUnenumerableNamedProperties] interface HTMLCollection { readonly attribute unsigned long length; getter Element? item(unsigned long index); getter Element? namedItem(DOMString name); };",
+        text: "interface Element {}; [Exposed=Window, LegacyUnenumerableNamedProperties] interface HTMLCollection { readonly attribute unsigned long length; getter Element? item(unsigned long index); getter Element? namedItem(DOMString name); };",
     }];
     let indexed_named_rust = [Source {
         name: "html_collection.rs",
@@ -174,6 +174,75 @@ fn nullable_strings_and_platform_attributes_lower() {
         assert!(
             trait_text.contains(fragment),
             "missing {fragment}: {trait_text}"
+        );
+    }
+}
+
+#[test]
+fn callbacks_dictionaries_and_sequences_lower_with_receiver() {
+    let idl = [Source {
+        name: "mutation_observer.idl",
+        text: r"
+            interface MutationRecord {};
+            callback MutationCallback = undefined (sequence<MutationRecord> records, MutationObserver observer);
+            dictionary BaseOptions {
+                boolean z = false;
+                boolean a;
+            };
+            dictionary MutationObserverInit : BaseOptions {
+                sequence<DOMString> attributeFilter;
+                boolean attributes;
+            };
+            partial dictionary MutationObserverInit { boolean childList = false; };
+            [Exposed=Window] interface MutationObserver {
+                constructor(MutationCallback callback);
+                undefined observe(Node target, optional MutationObserverInit options = {});
+                sequence<MutationRecord> takeRecords();
+            };
+        ",
+    }];
+    let rust = [Source {
+        name: "mutation_observer.rs",
+        text: r"
+            impl<'js> mutation_observer_generated::MutationObserver<'js> for JsMutationObserver {
+                fn constructor(ctx: &Ctx<'js>, arg_0: rquickjs::Function<'js>) -> Result<Self> { c(ctx) }
+                fn observe(&self, ctx: Ctx<'js>, this: Object<'js>, arg_0: host::NodeReference, arg_1: mutation_observer_generated::MutationObserverInit) -> Result<()> { o(ctx) }
+                fn take_records(&self, ctx: Ctx<'js>) -> Result<Vec<Value<'js>>> { t(ctx) }
+            }
+        ",
+    }];
+    let bindings = compile_contracts(&idl, &rust).expect("compile fixture");
+    let syntax = syn::parse_file(&bindings[0].rust).expect("generated syntax");
+    let [syn::Item::Mod(module)] = syntax.items.as_slice() else {
+        panic!("expected a generated module");
+    };
+    let (_, items) = module.content.as_ref().expect("module body");
+    let dictionary = items
+        .iter()
+        .find_map(|item| match item {
+            syn::Item::Struct(item) if item.ident == "MutationObserverInit" => Some(item),
+            _ => None,
+        })
+        .expect("generated dictionary");
+    assert_eq!(
+        dictionary
+            .fields
+            .iter()
+            .map(|field| field.ident.as_ref().expect("named field").to_string())
+            .collect::<Vec<_>>(),
+        ["a", "z", "attribute_filter", "attributes", "child_list"]
+    );
+    let source = bindings[0].rust.replace(' ', "");
+    for fragment in [
+        "structMutationObserverInit",
+        "host::callback_argument",
+        "this_object",
+        "host::sequence",
+    ] {
+        assert!(
+            source.contains(fragment),
+            "missing {fragment}: {}",
+            bindings[0].rust
         );
     }
 }

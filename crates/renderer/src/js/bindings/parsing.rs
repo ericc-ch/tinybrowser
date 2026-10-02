@@ -22,23 +22,14 @@ pub struct JsImplementation {
 
 include!(concat!(env!("OUT_DIR"), "/DOMImplementation.rs"));
 
-#[allow(
-    clippy::needless_pass_by_value,
-    clippy::unused_self,
-    reason = "generated dispatch passes Ctx by value and invokes operations on the receiver"
-)]
-impl JsImplementation {
+impl<'js> dom_implementation_generated::DOMImplementation<'js> for JsImplementation {
     // https://dom.spec.whatwg.org/#dom-domimplementation-hasfeature
-    #[allow(
-        clippy::unnecessary_wraps,
-        reason = "generated operations share one fallible call shape"
-    )]
-    fn has_feature(&self, _ctx: Ctx<'_>) -> Result<bool> {
+    fn has_feature(&self, _ctx: Ctx<'js>) -> Result<bool> {
         Ok(true)
     }
 
     // https://dom.spec.whatwg.org/#dom-domimplementation-createdocumenttype
-    fn create_document_type<'js>(
+    fn create_document_type(
         &self,
         ctx: Ctx<'js>,
         name: rquickjs::String<'js>,
@@ -61,7 +52,7 @@ impl JsImplementation {
     }
 
     // https://dom.spec.whatwg.org/#dom-domimplementation-createdocument
-    fn create_document<'js>(
+    fn create_document(
         &self,
         ctx: Ctx<'js>,
         namespace: Option<rquickjs::String<'js>>,
@@ -117,7 +108,7 @@ impl JsImplementation {
     }
 
     // https://dom.spec.whatwg.org/#dom-domimplementation-createhtmldocument
-    fn create_html_document<'js>(
+    fn create_html_document(
         &self,
         ctx: Ctx<'js>,
         title: Option<rquickjs::String<'js>>,
@@ -268,25 +259,13 @@ pub struct JsXmlSerializer {
 
 include!(concat!(env!("OUT_DIR"), "/XMLSerializer.rs"));
 
-#[allow(
-    clippy::needless_pass_by_value,
-    reason = "generated dispatch passes Ctx and Value by value"
-)]
-impl JsXmlSerializer {
-    #[allow(
-        clippy::unnecessary_wraps,
-        reason = "generated constructors share one fallible call shape; this payload cannot fail"
-    )]
-    fn new(_ctx: &Ctx<'_>) -> Result<Self> {
+impl<'js> xml_serializer_generated::XMLSerializer<'js> for JsXmlSerializer {
+    fn constructor(_ctx: &Ctx<'js>) -> Result<Self> {
         Ok(Self { _reserved: None })
     }
 
     // https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-xmlserializer-serializetostring
-    #[allow(
-        clippy::unused_self,
-        reason = "generated dispatch calls every operation on the receiver"
-    )]
-    fn serialize_to_string<'js>(
+    fn serialize_to_string(
         &self,
         ctx: Ctx<'js>,
         root: super::host::NodeReference,
