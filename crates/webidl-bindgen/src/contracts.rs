@@ -1016,19 +1016,9 @@ fn lower_attribute(
             member.identifier.0
         )));
     }
-    if !implemented[&getter_name].has_self || implemented[&getter_name].parameters != 0 {
-        return Err(Error(format!(
-            "{}: attribute getter must take only self and ctx",
-            member.identifier.0
-        )));
-    }
-    if writable
-        && (!implemented[&setter_name].has_self || implemented[&setter_name].parameters != 1)
-    {
-        return Err(Error(format!(
-            "{}: attribute setter must take only self, ctx, and the value",
-            member.identifier.0
-        )));
+    check_method_signature(implemented, &getter_name, 0, "attribute getter")?;
+    if writable {
+        check_method_signature(implemented, &setter_name, 1, "attribute setter")?;
     }
     if member.modifier.is_some()
         && !matches!(
@@ -1067,6 +1057,7 @@ fn lower_attribute(
         ReturnType::UnsignedShort => quote! { u16 },
         ReturnType::UnsignedLong => quote! { usize },
         ReturnType::Long => quote! { i32 },
+        ReturnType::NullableUnsignedLong => quote! { Option<u32> },
         ReturnType::Double => quote! { f64 },
         ReturnType::PlatformObject => quote! { Value<'js> },
         ReturnType::Enumeration(name) => {
@@ -1220,6 +1211,23 @@ fn lower_reflect_setter_attribute(
     Ok(Some((attribute, signature)))
 }
 
+/// Reject an implementation method whose receiver or parameter count does
+/// not match the IDL member kind.
+fn check_method_signature(
+    implemented: &BTreeMap<String, Method>,
+    name: &str,
+    parameters: usize,
+    kind: &str,
+) -> Result<(), Error> {
+    let method = &implemented[name];
+    if !method.has_self || method.parameters != parameters {
+        return Err(Error(format!(
+            "{name}: {kind} must take only self and ctx plus {parameters} value(s)"
+        )));
+    }
+    Ok(())
+}
+
 /// Lower a `[Reflect]` attribute to generated content-attribute access.
 /// The trait carries no method and the implementation provides none: like
 /// Chromium's generated reflectors, the binding is complete by itself.
@@ -1301,6 +1309,7 @@ fn setter_parameter(type_: &ReturnType) -> Result<TokenStream, Error> {
         ReturnType::Boolean => quote! { bool },
         ReturnType::UnsignedLong => quote! { u32 },
         ReturnType::Long => quote! { i32 },
+        ReturnType::NullableUnsignedLong => quote! { Option<u32> },
         ReturnType::Double => quote! { f64 },
         ReturnType::Value => quote! { Value<'js> },
         ReturnType::Enumeration(name) => {
@@ -1446,6 +1455,12 @@ fn native_type(
                 && matches!(item.type_, IntegerType::Long(item) if item.unsigned.is_none()) =>
         {
             Ok(ReturnType::Long)
+        }
+        Type::Single(SingleType::NonAny(NonAnyType::Integer(item)))
+            if item.q_mark.is_some()
+                && matches!(item.type_, IntegerType::Long(item) if item.unsigned.is_some()) =>
+        {
+            Ok(ReturnType::NullableUnsignedLong)
         }
         Type::Single(SingleType::NonAny(NonAnyType::Sequence(item))) if item.q_mark.is_none() => {
             let element = &item.type_.generics.body;

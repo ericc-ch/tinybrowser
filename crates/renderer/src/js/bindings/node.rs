@@ -1265,19 +1265,6 @@ impl JsNode {
 
     // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#dom-textarea/input-selectionstart
     #[qjs(skip)]
-    fn selection_start<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
-        let world = world(&ctx)?;
-        let world = world.borrow();
-        let Some(parsed) = world.document(self.handle.0) else {
-            return Ok(Value::new_null(ctx));
-        };
-        match dom::form::selection(&parsed.document, self.handle.0) {
-            Some((start, _, _)) => Ok(Value::new_number(ctx, f64::from(start))),
-            None => Ok(Value::new_null(ctx)),
-        }
-    }
-
-    #[qjs(skip)]
     fn set_selection_start(&self, ctx: Ctx<'_>, value: WebIdlUnsignedLong) -> Result<()> {
         let world = world(&ctx)?;
         let world = world.borrow();
@@ -1309,19 +1296,6 @@ impl JsNode {
 
     // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#dom-textarea/input-selectionend
     #[qjs(skip)]
-    fn selection_end<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
-        let world = world(&ctx)?;
-        let world = world.borrow();
-        let Some(parsed) = world.document(self.handle.0) else {
-            return Ok(Value::new_null(ctx));
-        };
-        match dom::form::selection(&parsed.document, self.handle.0) {
-            Some((_, end, _)) => Ok(Value::new_number(ctx, f64::from(end))),
-            None => Ok(Value::new_null(ctx)),
-        }
-    }
-
-    #[qjs(skip)]
     fn set_selection_end(&self, ctx: Ctx<'_>, value: WebIdlUnsignedLong) -> Result<()> {
         let world = world(&ctx)?;
         let world = world.borrow();
@@ -1348,20 +1322,6 @@ impl JsNode {
             world.queue_select(self.handle.0);
         }
         Ok(())
-    }
-
-    // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#dom-textarea/input-selectiondirection
-    #[qjs(skip)]
-    fn selection_direction<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
-        let world = world(&ctx)?;
-        let world = world.borrow();
-        let Some(parsed) = world.document(self.handle.0) else {
-            return Ok(Value::new_null(ctx));
-        };
-        match dom::form::selection(&parsed.document, self.handle.0) {
-            Some((_, _, direction)) => Ok(string_value(&ctx, direction_name(direction))?),
-            None => Ok(Value::new_null(ctx)),
-        }
     }
 
     #[qjs(skip)]
@@ -1536,11 +1496,6 @@ impl JsNode {
             .map_or(raw, |url| url.to_string()))
     }
 
-    #[qjs(skip)]
-    fn set_form_action(&self, ctx: Ctx<'_>, value: WebIdlString) -> Result<()> {
-        self.set_attribute(ctx, WebIdlString("formaction".into()), value)
-    }
-
     // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#dom-fs-formmethod
     #[qjs(skip)]
     fn form_method(&self, ctx: Ctx<'_>) -> Result<String> {
@@ -1567,69 +1522,6 @@ impl JsNode {
     #[qjs(skip)]
     fn set_form_enctype(&self, ctx: Ctx<'_>, value: WebIdlString) -> Result<()> {
         self.set_attribute(ctx, WebIdlString("formenctype".into()), value)
-    }
-
-    #[qjs(skip)]
-    fn form_target(&self, ctx: Ctx<'_>) -> Result<String> {
-        attribute_value(&ctx, self.handle.0, "formtarget")
-    }
-
-    #[qjs(skip)]
-    fn set_form_target(&self, ctx: Ctx<'_>, value: WebIdlString) -> Result<()> {
-        self.set_attribute(ctx, WebIdlString("formtarget".into()), value)
-    }
-
-    #[qjs(skip)]
-    fn form_no_validate(&self, ctx: Ctx<'_>) -> Result<bool> {
-        self.attribute_present(&ctx, "formnovalidate")
-    }
-
-    #[qjs(skip)]
-    fn set_form_no_validate(&self, ctx: Ctx<'_>, value: bool) -> Result<()> {
-        self.reflect_boolean(ctx, "formnovalidate", value)
-    }
-
-    // https://html.spec.whatwg.org/multipage/input.html#the-pattern-attribute
-    #[qjs(skip)]
-    fn pattern(&self, ctx: Ctx<'_>) -> Result<String> {
-        attribute_value(&ctx, self.handle.0, "pattern")
-    }
-
-    #[qjs(skip)]
-    fn set_pattern(&self, ctx: Ctx<'_>, value: WebIdlString) -> Result<()> {
-        self.set_attribute(ctx, WebIdlString("pattern".into()), value)
-    }
-
-    // https://html.spec.whatwg.org/multipage/input.html#the-min-and-max-attributes
-    #[qjs(skip)]
-    fn min(&self, ctx: Ctx<'_>) -> Result<String> {
-        attribute_value(&ctx, self.handle.0, "min")
-    }
-
-    #[qjs(skip)]
-    fn set_min(&self, ctx: Ctx<'_>, value: WebIdlString) -> Result<()> {
-        self.set_attribute(ctx, WebIdlString("min".into()), value)
-    }
-
-    #[qjs(skip)]
-    fn max(&self, ctx: Ctx<'_>) -> Result<String> {
-        attribute_value(&ctx, self.handle.0, "max")
-    }
-
-    #[qjs(skip)]
-    fn set_max(&self, ctx: Ctx<'_>, value: WebIdlString) -> Result<()> {
-        self.set_attribute(ctx, WebIdlString("max".into()), value)
-    }
-
-    // https://html.spec.whatwg.org/multipage/input.html#the-step-attribute
-    #[qjs(skip)]
-    fn step(&self, ctx: Ctx<'_>) -> Result<String> {
-        attribute_value(&ctx, self.handle.0, "step")
-    }
-
-    #[qjs(skip)]
-    fn set_step(&self, ctx: Ctx<'_>, value: WebIdlString) -> Result<()> {
-        self.set_attribute(ctx, WebIdlString("step".into()), value)
     }
 
     // https://drafts.csswg.org/cssom-view/#dom-element-scrollleft
@@ -1708,39 +1600,6 @@ impl JsNode {
         self.reflect_boolean(ctx, "disabled", value)
     }
 
-    // https://html.spec.whatwg.org/multipage/input.html#dom-input-readonly
-    #[qjs(skip)]
-    fn read_only(&self, ctx: Ctx<'_>) -> Result<bool> {
-        self.attribute_present(&ctx, "readonly")
-    }
-
-    #[qjs(skip)]
-    fn set_read_only(&self, ctx: Ctx<'_>, value: bool) -> Result<()> {
-        self.reflect_boolean(ctx, "readonly", value)
-    }
-
-    // https://html.spec.whatwg.org/multipage/input.html#dom-input-required
-    #[qjs(skip)]
-    fn required(&self, ctx: Ctx<'_>) -> Result<bool> {
-        self.attribute_present(&ctx, "required")
-    }
-
-    #[qjs(skip)]
-    fn set_required(&self, ctx: Ctx<'_>, value: bool) -> Result<()> {
-        self.reflect_boolean(ctx, "required", value)
-    }
-
-    // https://html.spec.whatwg.org/multipage/select.html#dom-select-multiple
-    #[qjs(skip)]
-    fn multiple(&self, ctx: Ctx<'_>) -> Result<bool> {
-        self.attribute_present(&ctx, "multiple")
-    }
-
-    #[qjs(skip)]
-    fn set_multiple(&self, ctx: Ctx<'_>, value: bool) -> Result<()> {
-        self.reflect_boolean(ctx, "multiple", value)
-    }
-
     // https://html.spec.whatwg.org/multipage/forms.html#dom-fae-form
     #[qjs(skip)]
     fn form<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
@@ -1797,17 +1656,6 @@ impl JsNode {
         };
         dom::form::set_indeterminate(&mut parsed.document, self.handle.0, value);
         Ok(())
-    }
-
-    // https://html.spec.whatwg.org/multipage/input.html#dom-input-defaultchecked
-    #[qjs(skip)]
-    fn default_checked(&self, ctx: Ctx<'_>) -> Result<bool> {
-        self.attribute_present(&ctx, "checked")
-    }
-
-    #[qjs(skip)]
-    fn set_default_checked(&self, ctx: Ctx<'_>, value: bool) -> Result<()> {
-        self.reflect_boolean(ctx, "checked", value)
     }
 
     // https://html.spec.whatwg.org/multipage/form-elements.html#dom-option-selected
@@ -4144,6 +3992,135 @@ impl<'js> html_text_area_element_generated::HTMLTextAreaElement<'js> for JsNode 
     // https://html.spec.whatwg.org/multipage/forms.html#dom-fae-form
     fn get_form(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
         self.form(ctx.clone())
+    }
+}
+
+impl<'js> html_input_element_generated::HTMLInputElement<'js> for JsNode {
+    // https://html.spec.whatwg.org/multipage/input.html#dom-input-checked
+    fn get_checked(&self, ctx: &Ctx<'js>) -> Result<bool> {
+        self.checked(ctx.clone())
+    }
+
+    // https://html.spec.whatwg.org/multipage/input.html#dom-input-checked
+    fn set_checked(&self, ctx: &Ctx<'js>, value: bool) -> Result<()> {
+        self.set_checked(ctx.clone(), value)
+    }
+
+    // https://html.spec.whatwg.org/multipage/forms.html#dom-fae-form
+    fn get_form(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
+        self.form(ctx.clone())
+    }
+
+    // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#dom-fs-formaction
+    fn get_form_action(&self, ctx: &Ctx<'js>) -> Result<dom::DomString> {
+        Ok(self.form_action(ctx.clone())?.into())
+    }
+
+    // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#dom-fs-formmethod
+    fn get_form_method(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
+        let method = self.form_method(ctx.clone())?;
+        rquickjs::String::from_str(ctx.clone(), &method)
+    }
+
+    // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#dom-fs-formmethod
+    fn set_form_method(&self, ctx: &Ctx<'js>, value: rquickjs::String<'js>) -> Result<()> {
+        self.set_form_method(ctx.clone(), WebIdlString(value.to_string()?))
+    }
+
+    // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#dom-fs-formenctype
+    fn get_form_enctype(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
+        let enctype = self.form_enctype(ctx.clone())?;
+        rquickjs::String::from_str(ctx.clone(), &enctype)
+    }
+
+    // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#dom-fs-formenctype
+    fn set_form_enctype(&self, ctx: &Ctx<'js>, value: rquickjs::String<'js>) -> Result<()> {
+        self.set_form_enctype(ctx.clone(), WebIdlString(value.to_string()?))
+    }
+
+    // https://html.spec.whatwg.org/multipage/input.html#dom-input-indeterminate
+    fn get_indeterminate(&self, ctx: &Ctx<'js>) -> Result<bool> {
+        self.indeterminate(ctx.clone())
+    }
+
+    // https://html.spec.whatwg.org/multipage/input.html#dom-input-indeterminate
+    fn set_indeterminate(&self, ctx: &Ctx<'js>, value: bool) -> Result<()> {
+        self.set_indeterminate(ctx.clone(), value)
+    }
+
+    // https://html.spec.whatwg.org/multipage/input.html#dom-input-value
+    fn get_value(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
+        let value = self.value(ctx.clone())?;
+        rquickjs::String::from_str(ctx.clone(), &value)
+    }
+
+    // https://html.spec.whatwg.org/multipage/input.html#dom-input-value
+    fn set_value(&self, ctx: &Ctx<'js>, value: rquickjs::String<'js>) -> Result<()> {
+        self.set_value(ctx.clone(), LegacyNullString(value.to_string()?))
+    }
+
+    // Upstream selection accessors are nullable, keeping the spec-prose
+    // null for input types where selection does not apply.
+    // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#textFieldSelection
+
+    // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#dom-textarea/input-selectionstart
+    fn get_selection_start(&self, ctx: &Ctx<'js>) -> Result<Option<u32>> {
+        let world = world(ctx)?;
+        let parsed = world.borrow();
+        Ok(parsed
+            .document(self.handle.0)
+            .and_then(|parsed| dom::form::selection(&parsed.document, self.handle.0))
+            .map(|(start, _, _)| start))
+    }
+
+    // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#dom-textarea/input-selectionstart
+    fn set_selection_start(&self, ctx: &Ctx<'js>, value: Option<u32>) -> Result<()> {
+        // Null converts as zero, matching the previous numeric conversion.
+        self.set_selection_start(ctx.clone(), WebIdlUnsignedLong(value.unwrap_or(0)))
+    }
+
+    // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#dom-textarea/input-selectionend
+    fn get_selection_end(&self, ctx: &Ctx<'js>) -> Result<Option<u32>> {
+        let world = world(ctx)?;
+        let parsed = world.borrow();
+        Ok(parsed
+            .document(self.handle.0)
+            .and_then(|parsed| dom::form::selection(&parsed.document, self.handle.0))
+            .map(|(_, end, _)| end))
+    }
+
+    // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#dom-textarea/input-selectionend
+    fn set_selection_end(&self, ctx: &Ctx<'js>, value: Option<u32>) -> Result<()> {
+        // Null converts as zero, matching the previous numeric conversion.
+        self.set_selection_end(ctx.clone(), WebIdlUnsignedLong(value.unwrap_or(0)))
+    }
+
+    // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#dom-textarea/input-selectiondirection
+    fn get_selection_direction(&self, ctx: &Ctx<'js>) -> Result<Option<rquickjs::String<'js>>> {
+        let world = world(ctx)?;
+        let direction = world
+            .borrow()
+            .document(self.handle.0)
+            .and_then(|parsed| dom::form::selection(&parsed.document, self.handle.0))
+            .map(|(_, _, direction)| direction_name(direction));
+        direction
+            .map(|direction| rquickjs::String::from_str(ctx.clone(), direction))
+            .transpose()
+    }
+
+    // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#dom-textarea/input-selectiondirection
+    fn set_selection_direction(
+        &self,
+        ctx: &Ctx<'js>,
+        value: Option<rquickjs::String<'js>>,
+    ) -> Result<()> {
+        // Null stringified to "null" before, which maps to no direction;
+        // answer "none" directly.
+        let value = match value {
+            Some(value) => value.to_string()?,
+            None => "none".into(),
+        };
+        self.set_selection_direction(ctx.clone(), WebIdlString(value))
     }
 }
 

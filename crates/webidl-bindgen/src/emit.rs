@@ -41,6 +41,7 @@ pub(crate) fn interface(interface: &Interface) -> TokenStream {
                 | ReturnType::Boolean
                 | ReturnType::UnsignedShort
                 | ReturnType::UnsignedLong
+                | ReturnType::NullableUnsignedLong
                 | ReturnType::Long
                 | ReturnType::Double
                 | ReturnType::Enumeration(_)
@@ -730,6 +731,13 @@ fn getter_dispatch(id: usize, getter: &Attribute, interface: &Interface) -> Toke
                     None => Ok(Value::new_null(ctx)),
                 }
             },
+            ReturnType::NullableUnsignedLong => quote! {
+                let result: Option<u32> = #call?;
+                match result {
+                    Some(result) => result.into_js(&ctx),
+                    None => Ok(Value::new_null(ctx)),
+                }
+            },
             ReturnType::Double => quote! {
                 // https://webidl.spec.whatwg.org/#idl-DOMHighResTimeStamp
                 let result: f64 = #call?;
@@ -797,6 +805,18 @@ fn setter_dispatch(
             },
             ReturnType::String => quote! { host::string_argument(params, 0, None)? },
             ReturnType::NullableString => quote! { host::nullable_string_argument(params, 0)? },
+            ReturnType::NullableUnsignedLong => quote! {
+                {
+                    let value = params.arg(0).unwrap_or_else(|| Value::new_undefined(ctx.clone()));
+                    if value.is_null() || value.is_undefined() {
+                        None
+                    } else {
+                        // https://webidl.spec.whatwg.org/#es-unsigned-long
+                        let converted: rquickjs::Coerced<i32> = rquickjs::FromJs::from_js(&ctx, value)?;
+                        Some(converted.0.cast_unsigned())
+                    }
+                }
+            },
             // https://webidl.spec.whatwg.org/#es-boolean
             ReturnType::Boolean => quote! { host::boolean_argument(params, 0)? },
             // https://webidl.spec.whatwg.org/#es-unsigned-long

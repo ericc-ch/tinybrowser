@@ -204,6 +204,9 @@ pub(crate) enum ReturnType {
     UnsignedLong,
     Long,
     Boolean,
+    /// Nullable `unsigned long`: `null` or `undefined` convert to `None`
+    /// (<https://webidl.spec.whatwg.org/#js-nullable-type>).
+    NullableUnsignedLong,
     UsvString,
     NullableDocumentType,
     NullableNode,
