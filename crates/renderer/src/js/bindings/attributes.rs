@@ -337,46 +337,9 @@ impl<'object> JsAttr<'object> {
         events::dispatch_event(&home, self.event_target_key(&home)?, &event)
     }
 
-    // https://dom.spec.whatwg.org/#dom-attr-name
-    fn name(&self, ctx: &Ctx<'_>) -> Result<String> {
-        Ok(attr_state(ctx, self.scope.0, self.id)?.qualified)
-    }
-
-    // https://dom.spec.whatwg.org/#dom-attr-localname
-    fn local_name(&self, ctx: &Ctx<'_>) -> Result<String> {
-        Ok(attr_state(ctx, self.scope.0, self.id)?.local)
-    }
-
-    // https://dom.spec.whatwg.org/#dom-attr-prefix
-    fn prefix<'js>(&self, ctx: &Ctx<'js>) -> Result<Option<rquickjs::String<'js>>> {
-        attr_state(ctx, self.scope.0, self.id)?
-            .prefix
-            .map(|prefix| rquickjs::String::from_str(ctx.clone(), &prefix))
-            .transpose()
-    }
-
-    // https://dom.spec.whatwg.org/#dom-attr-namespaceuri
-    fn namespace_uri<'js>(&self, ctx: &Ctx<'js>) -> Result<Option<rquickjs::String<'js>>> {
-        let namespace = attr_state(ctx, self.scope.0, self.id)?.namespace;
-        if namespace.is_empty() {
-            Ok(None)
-        } else {
-            rquickjs::String::from_str(ctx.clone(), &namespace).map(Some)
-        }
-    }
-
-    // https://dom.spec.whatwg.org/#dom-attr-value
-    fn value(&self, ctx: &Ctx<'_>) -> Result<String> {
-        attr_value(ctx, self.scope.0, self.id)
-    }
-
-    fn set_value<'js>(&self, ctx: &Ctx<'js>, value: rquickjs::String<'js>) -> Result<()> {
-        set_attr_value(ctx, self.scope.0, self.id, value.to_string()?)
-    }
-
     // https://dom.spec.whatwg.org/#dom-node-nodevalue
     pub(super) fn node_value<'js>(&self, ctx: &Ctx<'js>) -> Result<Option<rquickjs::String<'js>>> {
-        rquickjs::String::from_str(ctx.clone(), &self.value(ctx)?).map(Some)
+        rquickjs::String::from_str(ctx.clone(), &attr_value(ctx, self.scope.0, self.id)?).map(Some)
     }
 
     pub(super) fn set_node_value<'js>(
@@ -413,21 +376,6 @@ impl<'object> JsAttr<'object> {
         self.set_node_value(ctx, value)
     }
 
-    // https://dom.spec.whatwg.org/#dom-attr-ownerelement
-    fn owner_element<'js>(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
-        let home = attr_context(ctx, self.scope.0, self.id)?;
-        child_value(&home, attr_owner(&home, self.scope.0, self.id))
-    }
-
-    // https://dom.spec.whatwg.org/#dom-attr-specified
-    #[allow(
-        clippy::unnecessary_wraps,
-        reason = "generated getters share a fallible call shape"
-    )]
-    fn specified(&self, _ctx: &Ctx<'_>) -> Result<bool> {
-        Ok(true)
-    }
-
     #[allow(
         clippy::unnecessary_wraps,
         reason = "generated getters share a fallible call shape"
@@ -437,7 +385,7 @@ impl<'object> JsAttr<'object> {
     }
 
     pub(super) fn node_name(&self, ctx: &Ctx<'_>) -> Result<String> {
-        self.name(ctx)
+        Ok(attr_state(ctx, self.scope.0, self.id)?.qualified)
     }
 
     pub(super) fn owner_document<'js>(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
@@ -712,6 +660,60 @@ impl<'object> JsAttr<'object> {
             Some(rquickjs::String::from_js(&ctx, found)?.to_string()?)
         };
         Ok(found == namespace)
+    }
+}
+
+impl<'js> attr_generated::Attr<'js> for JsAttr<'js> {
+    // https://dom.spec.whatwg.org/#dom-attr-name
+    fn get_name(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
+        rquickjs::String::from_str(
+            ctx.clone(),
+            &attr_state(ctx, self.scope.0, self.id)?.qualified,
+        )
+    }
+
+    // https://dom.spec.whatwg.org/#dom-attr-localname
+    fn get_local_name(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
+        rquickjs::String::from_str(ctx.clone(), &attr_state(ctx, self.scope.0, self.id)?.local)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-attr-prefix
+    fn get_prefix(&self, ctx: &Ctx<'js>) -> Result<Option<rquickjs::String<'js>>> {
+        attr_state(ctx, self.scope.0, self.id)?
+            .prefix
+            .map(|prefix| rquickjs::String::from_str(ctx.clone(), &prefix))
+            .transpose()
+    }
+
+    // https://dom.spec.whatwg.org/#dom-attr-namespaceuri
+    fn get_namespace_uri(&self, ctx: &Ctx<'js>) -> Result<Option<rquickjs::String<'js>>> {
+        let namespace = attr_state(ctx, self.scope.0, self.id)?.namespace;
+        if namespace.is_empty() {
+            Ok(None)
+        } else {
+            rquickjs::String::from_str(ctx.clone(), &namespace).map(Some)
+        }
+    }
+
+    // https://dom.spec.whatwg.org/#dom-attr-value
+    fn get_value(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
+        rquickjs::String::from_str(ctx.clone(), &attr_value(ctx, self.scope.0, self.id)?)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-attr-value
+    fn set_value(&self, ctx: &Ctx<'js>, value: rquickjs::String<'js>) -> Result<()> {
+        set_attr_value(ctx, self.scope.0, self.id, value.to_string()?)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-attr-ownerelement
+    fn get_owner_element(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
+        let home = attr_context(ctx, self.scope.0, self.id)?;
+        child_value(&home, attr_owner(&home, self.scope.0, self.id))
+    }
+
+    // https://dom.spec.whatwg.org/#dom-attr-specified
+    fn get_specified(&self, _ctx: &Ctx<'js>) -> Result<bool> {
+        Ok(true)
     }
 }
 
