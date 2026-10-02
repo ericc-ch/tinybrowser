@@ -12,9 +12,9 @@ remaining `crates/renderer/idl/*.webidl` interfaces one at a time, then delete t
 legacy compiler and its inputs. Conformance comes from WPT, size from the
 release binary.
 
-State: branch `webidl-bindings`, HEAD `df580b1`, working tree clean. The
+State: branch `webidl-bindings`, HEAD `24d3aba`, working tree clean. The
 repo-local gates are green: `cargo test --workspace` and `tools/check` pass
-(log `~/.cache/tinybrowser/logs/element-gates.log`, 36 suites ok). No pushes.
+(log `~/.cache/tinybrowser/logs/parentnode-tests.log`, 36 suites ok). No pushes.
 Draft PR https://github.com/ericc-ch/tinybrowser/pull/39 holds earlier work only.
 
 Done (this session):
@@ -34,6 +34,18 @@ Done (this session):
   `getElementById("")` returns null. Proof: WPT
   `~/.cache/tinybrowser/logs/after-element-contracts2.json` (both getElementById
   files fully pass; dataset failures are pre-existing missing `DOMStringMap`).
+- `87744a3` Generate enum-typed attribute bindings. Proof: generator tests.
+  No interface consumes this yet.
+- `24d3aba` Generate union conversions and migrate ParentNode and ChildNode.
+  Unions flatten like Chromium, convert platform objects before strings per the
+  WebIDL algorithm, and reject unsupported members at build time. `[Unscopable]`
+  emits merging `@@unscopables`. Mixin members and install targets resolve from
+  IDL includes. Proof: generator tests (conversion order, rejections,
+  unscopables, mixin targets); WPT 9 tree files with zero status changes
+  against a pre-migration baseline binary
+  (`~/.cache/tinybrowser/logs/before-parentnode.json` vs
+  `after-parentnode.json`); workspace tests and `tools/check` green; Playwright
+  36/37 plus Sauce retry pass; CDP pass.
 
 Earlier sessions (unchanged): `a21f8a9` IDL import, `064baa2` NodeList and
 HTMLCollection, `9adbb7b` MutationRecord, `4930cbc` parsing and observers,
@@ -41,26 +53,25 @@ HTMLCollection, `9adbb7b` MutationRecord, `4930cbc` parsing and observers,
 
 Unfinished:
 
-- Every remaining `crates/renderer/idl/*.webidl` interface is blocked on a
-  generator feature. Pick one feature and land it with its consumer migration in
-  the same commit:
-  - Union types. This is the largest unblock: `Element`, `Document`, `Node`,
-    `ShadowRoot` (`innerHTML` is `(TrustedHTML or DOMString)`), `EventTarget`,
-    `ParentNode`, `ChildNode`, `DOMParser`. `ReturnType` and `native_type` in
-    `contracts.rs` have no union arm.
+- Remaining `crates/renderer/idl/*.webidl`: `Document`, `DOMParser`, `Element`,
+  `ElementReflections`, `Event`, `EventTarget`, `HTML*` forms,
+  `HTMLOptionsCollection`, `NamedNodeMap`, `Node`, `NonDocumentTypeChildNode`,
+  `ShadowRoot`. Next generator features, each landed with a consumer migration:
+  - Union members beyond Node and DOMString: `(boolean or dictionary)` for
+    `scrollIntoView`, `(TrustedHTML or DOMString)` for `innerHTML` et al,
+    interface unions for `HTMLOptionsCollection.add`, nullable callbacks for
+    `EventTarget`. Each needs its conversion arm plus a consumer migration.
   - `[Reflect]` / `[ReflectSetter]` handling (form elements, `ElementReflections`).
-    Today `contracts.rs::validate_attribute_attributes` rejects them. Decide
-    whether the generator emits the reflection algorithm (end goal) or treats the
-    extended attribute as metadata the implementation owns (intermediate).
-  - Interface-typed arguments, e.g. `NamedNodeMap.setNamedItem(Attr attr)`. Today
-    `argument_parameter` has no `ReturnType::PlatformObject` arm. `NamedNodeMap`
-    also needs a JS-implemented property-hook mode, which the contract path lacks.
-  - Interface-level metadata attributes such as `[LegacyFactoryFunction]` on
+    Decide whether the generator emits the reflection algorithm (end goal) or
+    treats the extended attribute as metadata the implementation owns.
+  - Interface-typed arguments, e.g. `NamedNodeMap.setNamedItem(Attr attr)`.
+    `argument_parameter` has no `ReturnType::PlatformObject` arm, and
+    `NamedNodeMap` needs a JS-implemented property-hook mode the contract path
+    lacks.
+  - Enum attributes are generated (`87744a3`) but no interface consumes them
+    yet. `Document.readyState` and `ShadowRoot.mode` will once their unions land.
+  - Interface-level metadata such as `[LegacyFactoryFunction]` on
     `HTMLImageElement`, rejected by `validate_interface_attributes`.
-- Enum attributes are now generated (`ReturnType::Enumeration` in
-  `lower_attribute`, `getter_dispatch`, and `setter_dispatch`), but no interface
-  consumes them yet. `Document.readyState` (`DocumentReadyState`) will once
-  `Document` migrates.
 - `brands.js` still carries hand-written per-interface member lists (a second
   support list). Reduce them as interfaces move to contracts. Do not blanket
   delete without checking that the list is not the only installer for a member.
@@ -99,8 +110,17 @@ Decisions made:
   subset of the declared members.
 - Nonfunctional placeholders are removed; feature detection must report them
   unsupported.
+- Union conversion tries platform objects before strings, with a strict node
+  probe (`Attr` stringifies). Mixin installs derive targets from IDL includes.
 
 Gotchas:
+
+- Never `git submodule update --init --recursive` in a worktree: it clones the
+  1.2 GB WPT checkout fresh. Init `third_party/rquickjs` only; WPT resolves to
+  the primary checkout, and the rquickjs fork pin may not fetch (copy the dir).
+- Never `git add` a deleted path alongside modifications: the pathspec error
+  aborts the whole add and the commit lands partial. Stage deletions via
+  `git rm` first, or add surviving paths only.
 
 - One WPT run at a time: the runner serializes on a venv lock and the build
   holds the Cargo target. The `/encoding` legacy multibyte files dominate runtime.
