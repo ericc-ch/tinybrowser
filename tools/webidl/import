@@ -1,0 +1,74 @@
+#!/usr/bin/env -S uv run --offline --no-project python
+"""Import unchanged WPT interface extracts at tinybrowser's pinned revision."""
+
+import argparse
+import hashlib
+import json
+import subprocess
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[2]
+DESTINATION = ROOT / "crates/webidl-bindgen/idl"
+
+
+def git(*arguments, cwd=ROOT):
+    return subprocess.check_output(["git", "-C", str(cwd), *arguments])
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--check", action="store_true", help="Verify the offline snapshot and pin")
+    parser.add_argument("--wpt", type=Path, help="WPT checkout containing the pinned commit")
+    arguments = parser.parse_args()
+    revision = git("rev-parse", "HEAD:third_party/wpt").decode().strip()
+    manifest_path = DESTINATION / "manifest.json"
+
+    if arguments.check:
+        manifest = json.loads(manifest_path.read_text())
+        if manifest["revision"] != revision:
+            raise SystemExit("IDL snapshot and WPT pin differ; run tools/webidl/import")
+        expected = manifest["sha256"]
+        actual = {
+            path.name: hashlib.sha256(path.read_bytes()).hexdigest()
+            for path in DESTINATION.glob("*.idl")
+        }
+        if expected != actual:
+            raise SystemExit("IDL snapshot changed; do not edit imported declarations")
+        print(f"Verified {len(actual)} unchanged IDL extracts at {revision}")
+        return
+
+    wpt = arguments.wpt
+    if wpt is None:
+        local = ROOT / "third_party/wpt"
+        if (local / "wpt").is_file():
+            wpt = local
+        else:
+            worktrees = git("worktree", "list", "--porcelain").decode().splitlines()
+            primary = next(line.removeprefix("worktree ") for line in worktrees if line.startswith("worktree "))
+            wpt = Path(primary) / "third_party/wpt"
+
+    paths = git("ls-tree", "--name-only", "-r", revision, "interfaces/", cwd=wpt).decode().splitlines()
+    paths = sorted(path for path in paths if path.endswith(".idl") and not path.endswith(".tentative.idl"))
+    if not paths:
+        raise SystemExit("Pinned WPT commit contains no interface extracts")
+    snapshot = {Path(path).name: git("show", f"{revision}:{path}", cwd=wpt) for path in paths}
+    DESTINATION.mkdir(parents=True, exist_ok=True)
+    for name, content in snapshot.items():
+        (DESTINATION / name).write_bytes(content)
+    (DESTINATION / "LICENSE.md").write_bytes(git("show", f"{revision}:LICENSE.md", cwd=wpt))
+    for path in DESTINATION.glob("*.idl"):
+        if path.name not in snapshot:
+            path.unlink()
+    manifest = {
+        "repository": "https://github.com/web-platform-tests/wpt",
+        "revision": revision,
+        "directory": "interfaces",
+        "sha256": {name: hashlib.sha256(content).hexdigest() for name, content in snapshot.items()},
+    }
+    manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
+    print(f"Imported {len(snapshot)} unchanged IDL extracts at {revision}")
+
+
+if __name__ == "__main__":
+    main()

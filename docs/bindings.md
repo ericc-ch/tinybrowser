@@ -23,7 +23,7 @@ Choose the language by ownership of state and authority, not by the API's name.
   formats with ICU4X. Keep each mutable state authoritative in one place.
 - Generate binding mechanics from IDL for either implementation language. Keep
   names, inheritance, descriptors, arity, and WebIDL conversions out of
-  handwritten platform algorithms. Handwritten conversion adapters must preserve
+  handwritten platform algorithms. Shared conversion machinery must preserve
   the spec algorithm and order.
 - Share the `JsNode` payload across node interfaces. JS brands and generated
   interface prototypes provide the public interface hierarchy.
@@ -33,28 +33,57 @@ private storage must prevent page-replaced methods, constructors, or inherited
 hooks from observing or mutating browser internals. Rust owns native lifetimes.
 RealmRegistry owns the lifetime of shared weak-slot storage.
 
-## IDL inputs and implementation mappings
+## IDL inputs and implementation contracts
 
 Import an unmodified, pinned upstream IDL snapshot. WPT's `interfaces/` directory
 is one source. Its non-tentative files are synced from curated `@webref/idl`
 extracts. Keep updates explicit and builds offline. See the
 [WPT interface source policy](https://github.com/web-platform-tests/wpt/blob/master/interfaces/README.md).
 
-Keep implementation mappings and support selection outside the imported IDL.
-Mappings identify Rust backing types and methods, JS implementations, and
-conversion adapters. Mappings do not redefine signatures, defaults, or standard
-extended attributes. Resolve inheritance, partial interfaces, and mixin includes
-from the imported declarations.
+Implementations follow a standardized contract derived from IDL. JS members use
+the IDL names and getter/setter structure. Rust names and signatures follow one
+deterministic convention, with distinct operation kinds for methods, attributes,
+constructors, and special operations. Validate implementations against the
+generated contract. Rename or reshape the implementation when it does not fit.
 
-Imported declarations do not require exposing every API. Select the implemented
-members separately. Keep unsupported APIs absent rather than installing dummy
-methods that mislead feature detection. If an enabled binding needs unsupported
-generator semantics, fail the build instead of changing the declaration or
-silently omitting the binding.
+Do not maintain explicit mapping tables, per-member rename annotations, or
+conversion overrides. Generate conversions from the declared IDL types and
+standard extended attributes. Resolve inheritance, partial interfaces, and mixin
+includes from the imported declarations. Share conversion machinery rather than
+adding exceptions for individual implementations.
 
-The input-source migration is pending. `crates/renderer/idl/` contains
-hand-maintained partial declarations and `Rust*` annotations. Generated native
-bindings alone do not complete the migration to authoritative IDL inputs.
+Imported declarations do not require exposing every API. Derive supported
+members from actual implementations, not a second handwritten support list.
+Reject conflicting or invalid implementations rather than silently falling back
+to another backend. Keep unsupported APIs absent rather than installing dummy
+methods that mislead feature detection. If an implemented member needs
+unsupported generator semantics, fail the build instead of changing the
+declaration or silently omitting the binding.
+
+The imported snapshot lives in `crates/webidl-bindgen/idl/`. Run
+`tools/webidl/import` to refresh it from the pinned WPT revision. Write the
+`manifest.json` revision and `sha256` map in the same commit. `tools/webidl/import
+--check` runs in `tools/check` and rejects local edits to imported files.
+
+The generator lives in `crates/webidl-bindgen/`. `compile_contracts` reads the
+imported extracts and Rust implementations. It discovers
+`impl foo_generated::Foo<'js> for Payload` blocks in `crates/renderer/src/js`,
+resolves partials, mixins, and inheritance across files, and emits one Rust
+module per implemented interface. The renderer build writes that module to
+`OUT_DIR`. The renderer compiles it, so the generated trait checks each
+implementation's signatures. An implemented member whose IDL semantics the
+generator cannot yet emit fails the build.
+
+`crates/renderer/idl/` still holds hand-maintained partial declarations and
+`Rust*` annotations for interfaces the contract path does not yet cover. Delete
+each file when its interface moves to the imported extracts. The renderer build
+rejects an interface that has both a legacy and a contract binding.
+
+The cleanup covers Rust-backed and JS-backed bindings. Audit existing members
+before migration. Remove confirmed nonfunctional placeholders, but keep real
+partial implementations and report their conformance gaps through WPT. Fix
+binding and ownership problems during the cleanup. Implement unrelated missing
+browser features as separate work.
 
 ## Coverage and conformance
 

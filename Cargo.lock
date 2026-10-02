@@ -2946,7 +2946,7 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.6",
- "weedle2",
+ "weedle4",
 ]
 
 [[package]]
@@ -2957,10 +2957,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "weedle2"
-version = "5.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "998d2c24ec099a87daf9467808859f9d82b61f1d9c9701251aea037f514eae0e"
+name = "weedle4"
+version = "0.4.0"
 dependencies = [
  "nom",
 ]

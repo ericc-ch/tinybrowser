@@ -113,6 +113,29 @@ fn write_blob(out: &Path, name: &str, bytes: &[u8]) {
 fn generate_bindings() {
     let root = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
     let out = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR"));
+    let mut extracts = Vec::new();
+    binding_sources(&root.join("../webidl-bindgen/idl"), "idl", &mut extracts);
+    let mut implementations = Vec::new();
+    binding_sources(&root.join("src/js"), "rs", &mut implementations);
+    let extracts: Vec<_> = extracts
+        .iter()
+        .map(|(name, text)| webidl_bindgen::Source { name, text })
+        .collect();
+    let implementations: Vec<_> = implementations
+        .iter()
+        .map(|(name, text)| webidl_bindgen::Source { name, text })
+        .collect();
+    let bindings = webidl_bindgen::compile_contracts(&extracts, &implementations)
+        .unwrap_or_else(|error| panic!("upstream IDL contracts: {error}"));
+    let mut contract_interfaces = HashSet::new();
+    for binding in bindings {
+        contract_interfaces.insert(binding.interface.clone());
+        fs::write(
+            out.join(&binding.interface).with_extension("rs"),
+            binding.rust,
+        )
+        .expect("write generated contract");
+    }
     let idl = root.join("idl");
     println!("cargo:rerun-if-changed={}", idl.display());
     let mut inputs: Vec<_> = fs::read_dir(&idl)
@@ -132,6 +155,30 @@ fn generate_bindings() {
         let generated = webidl_bindgen::compile(&source)
             .unwrap_or_else(|error| panic!("{}: {error}", input.display()));
         let name = input.file_stem().expect("native IDL file name");
+        assert!(
+            !contract_interfaces.contains(name.to_string_lossy().as_ref()),
+            "interface has both legacy and upstream bindings: {}",
+            name.to_string_lossy()
+        );
         fs::write(out.join(name).with_extension("rs"), generated).expect("write generated binding");
+    }
+}
+
+fn binding_sources(directory: &Path, extension: &str, sources: &mut Vec<(String, String)>) {
+    println!("cargo:rerun-if-changed={}", directory.display());
+    let mut paths: Vec<_> = fs::read_dir(directory)
+        .expect("read binding input directory")
+        .map(|entry| entry.expect("read binding input entry").path())
+        .collect();
+    paths.sort();
+    for path in paths {
+        if path.is_dir() {
+            binding_sources(&path, extension, sources);
+        } else if path.extension().is_some_and(|item| item == extension) {
+            sources.push((
+                path.display().to_string(),
+                fs::read_to_string(&path).expect("read binding input"),
+            ));
+        }
     }
 }

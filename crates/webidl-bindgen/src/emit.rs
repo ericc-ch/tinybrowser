@@ -10,6 +10,7 @@ use crate::model::{
 };
 
 pub(crate) fn interface(interface: &Interface) -> TokenStream {
+    let contract = &interface.contract;
     let rust = &interface.rust;
     let module = module_name(&interface.name);
     let payload = if interface.has_lifetime {
@@ -66,6 +67,7 @@ pub(crate) fn interface(interface: &Interface) -> TokenStream {
             #conversion_import
 
             #tables
+            #contract
             #definition
             #(#dictionaries)*
             #(#enumerations)*
@@ -186,7 +188,15 @@ fn dispatch_groups(
     }
     if let Some(index) = interface.stringifier {
         let id = interface.attributes.len() * 2 + interface.operations.len() + 1;
-        arms.push((id, false, getter_dispatch(id, &interface.attributes[index], interface.ctx_mode.is_owned())));
+        arms.push((
+            id,
+            false,
+            getter_dispatch(
+                id,
+                &interface.attributes[index],
+                interface.ctx_mode.is_owned(),
+            ),
+        ));
     }
     let mut routes = Vec::new();
     let mut groups = Vec::new();
@@ -267,7 +277,11 @@ fn definition(interface: &Interface, payload: &TokenStream, required: usize) -> 
             let targets: Vec<&str> = if interface.install_targets.is_empty() {
                 vec![name.as_str()]
             } else {
-                interface.install_targets.iter().map(String::as_str).collect()
+                interface
+                    .install_targets
+                    .iter()
+                    .map(String::as_str)
+                    .collect()
             };
             quote! {
                 pub(crate) fn install(ctx: &Ctx<'_>) -> Result<()> {
@@ -395,7 +409,10 @@ impl NamedHooks {
 }
 
 fn indexed_property_hooks(interface: &Interface) -> TokenStream {
-    if !matches!(interface.properties, PropertyHooks::Indexed | PropertyHooks::IndexedNamed { .. }) {
+    if !matches!(
+        interface.properties,
+        PropertyHooks::Indexed | PropertyHooks::IndexedNamed { .. }
+    ) {
         return quote! {};
     }
     let length = &interface
@@ -522,7 +539,15 @@ fn indexed_hooks_body(
     mutable_names: &TokenStream,
 ) -> TokenStream {
     let tokens = SetterTokens::parse(setter);
-    indexed_hooks_with_tokens(length, item, &tokens, hooks, object, define_receiver, mutable_names)
+    indexed_hooks_with_tokens(
+        length,
+        item,
+        &tokens,
+        hooks,
+        object,
+        define_receiver,
+        mutable_names,
+    )
 }
 
 fn indexed_hooks_with_tokens(
@@ -686,7 +711,10 @@ fn getter_dispatch(id: usize, getter: &Attribute, owned_ctx: bool) -> TokenStrea
     quote! { #id => { #body } }
 }
 
-fn setter_dispatch((index, attribute): (usize, &Attribute), owned_ctx: bool) -> Option<TokenStream> {
+fn setter_dispatch(
+    (index, attribute): (usize, &Attribute),
+    owned_ctx: bool,
+) -> Option<TokenStream> {
     let setter = attribute.setter.as_ref()?;
     let id = index * 2 + 2;
     let ctx_arg = if owned_ctx {
@@ -1078,6 +1106,12 @@ fn constructor(interface: &Interface) -> (usize, TokenStream) {
         quote! { #rust }
     };
     let create = &constructor.rust;
+    let construct = if interface.contract.is_some() {
+        let contract = format_ident!("{}", interface.name);
+        quote! { <#payload as #contract<'js>>::#create }
+    } else {
+        quote! { #rust::#create }
+    };
     let required = constructor
         .arguments
         .iter()
@@ -1122,7 +1156,7 @@ fn constructor(interface: &Interface) -> (usize, TokenStream) {
             host::require_arguments(params, #required)?;
             #(#arguments)*
             let prototype = host::constructor_prototype::<#payload>(params)?;
-            let result = #rust::#create(&ctx, #(#argument_names),*)?;
+            let result = #construct(&ctx, #(#argument_names),*)?;
             return rquickjs::Class::instance_proto(result, prototype).map(rquickjs::Class::into_value);
         },
     )
@@ -1234,22 +1268,7 @@ fn enumeration(enumeration: &Enumeration) -> TokenStream {
 /// One generated module per interface, named after it, so a bindings file
 /// that includes several interfaces cannot collide.
 fn module_name(name: &str) -> proc_macro2::Ident {
-    let mut snake = String::new();
-    let chars: Vec<char> = name.chars().collect();
-    for (index, char) in chars.iter().enumerate() {
-        if !char.is_ascii_uppercase() {
-            snake.push(*char);
-            continue;
-        }
-        // Word boundary on lower-to-upper (`mutation|Observer`) and acronym
-        // end (`DOM|Exception`); never before the first character.
-        let before_lower = index > 0 && chars[index - 1].is_ascii_lowercase();
-        let after_lower = chars.get(index + 1).is_some_and(char::is_ascii_lowercase);
-        if index > 0 && (before_lower || after_lower) {
-            snake.push('_');
-        }
-        snake.push(char.to_ascii_lowercase());
-    }
+    let snake = crate::names::snake_case(name);
     format_ident!("{snake}_generated")
 }
 

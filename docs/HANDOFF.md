@@ -105,10 +105,14 @@ Verification for the shipping candidate:
 
 ## Remaining
 
-1. Replace hand-maintained IDL partials and embedded `Rust*` annotations with
-   pinned upstream IDL inputs, separate implementation mappings, and support
-   selection. Resolve spec inheritance and mixins in the generator. Follow
-   `docs/bindings.md` for ownership and coverage rules.
+1. Audit existing Rust and JS bindings, then replace hand-maintained IDL partials
+   and embedded `Rust*` annotations with pinned upstream IDL inputs and
+   standardized generated implementation contracts. Use no explicit mapping
+   tables or per-member overrides. Derive supported members from implementations.
+   Resolve spec inheritance and mixins in the generator. Remove confirmed
+   nonfunctional placeholders and redundant binding boilerplate. Follow
+   `docs/bindings.md` for ownership and coverage rules. Verify each migration
+   stage with WPT before deleting the old input/compiler path.
 2. Resolve the older WebIDL-migration adverse status changes listed above before
    claiming migration conformance is unchanged.
 3. Preexisting conformance gaps unrelated to the bridge: lossy Rust
@@ -120,17 +124,26 @@ Verification for the shipping candidate:
 
 ## Durable decisions
 
-- Build-time Rust codegen with `weedle` from renderer `build.rs`; no npm step.
-  Checked-in IDL plus explicit Rust mappings are the surface. Generated tables
-  live in `OUT_DIR`. Implementation follows IDL; never edit IDL to match code.
-- `[Rust=path]`, `[RustValue]`, `[RustFromJs=path]`, `[RustSetFromJs=path]`,
-  `[RustAlternate=Type]`, `[RustPropertyHooks=Indexed|IndexedNamed|JavaScript]`,
+- Build-time Rust codegen from renderer `build.rs`; no npm step. The imported
+  extracts under `crates/webidl-bindgen/idl/` are the surface. Generated modules
+  live in `OUT_DIR`. Implementation follows IDL; never edit imported IDL to
+  match code.
+- `webidl_bindgen::compile_contracts` discovers
+  `impl foo_generated::Foo<'js> for Payload` in `crates/renderer/src/js` and
+  lowers the matching imported interface, resolving partials, mixins, and
+  inheritance across files. Method names follow IDL: `constructor`,
+  `get_attribute`, `set_attribute`, and snake-case operation names. The
+  generated `pub(super) trait` checks each implementation signature when the
+  renderer compiles it. Implemented members the generator cannot emit fail the
+  build. No explicit mapping tables or per-member overrides.
+- The legacy path is still live for interfaces the contract path does not cover.
+  `crates/renderer/idl/` holds their hand-maintained partial declarations and
+  `Rust*` annotations: `[Rust=path]`, `[RustValue]`, `[RustFromJs=path]`,
+  `[RustSetFromJs=path]`, `[RustAlternate=Type]`,
+  `[RustPropertyHooks=Indexed|IndexedNamed|JavaScript]`,
   `[RustSupportedNames=path]`, `[RustInstall="A,B"]` (mixin install targets),
-  and `[RustOwnedCtx]` (attribute getters/setters take `Ctx` by value) are the
-  escape hatches. `[RustValue]` getters return the platform `Value` directly;
-  arguments converted with `[RustFromJs]`/`[RustValue]` bypass generated
-  conversion. Generated operation dispatch always passes an owned `Ctx`;
-  attribute dispatch borrows unless `[RustOwnedCtx]` is set.
+  and `[RustOwnedCtx]`. Delete each legacy file as its interface moves to the
+  imported extracts. `build.rs` rejects an interface with both bindings.
 - One shared `NativeFunc` `HostCall` per member. Distinct JS function objects,
   one dispatch table per interface. Receiver downcast precedes arity and
   conversion. Generated wrappers use `host::instance` or the node-associated

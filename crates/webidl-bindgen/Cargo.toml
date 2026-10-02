@@ -7,7 +7,7 @@ edition.workspace = true
 workspace = true
 
 [dependencies]
-weedle = { package = "weedle2", version = "5" }
+weedle = { package = "weedle4", path = "../../third_party/weedle4" }
 proc-macro2 = "1"
 quote = "1"
 syn = { version = "3", features = ["full"] }

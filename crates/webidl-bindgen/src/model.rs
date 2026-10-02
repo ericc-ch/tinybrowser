@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, HashSet};
 
 use proc_macro2::Ident;
 use weedle::argument::Argument;
-use weedle::attribute::{ExtendedAttribute, ExtendedAttributeList, IdentifierOrString};
+use weedle::attribute::{ExtendedAttribute, ExtendedAttributeList};
 use weedle::interface::InterfaceMember;
 use weedle::literal::{ConstValue, DefaultValue, IntegerLit};
 use weedle::types::{ConstType, IntegerType, NonAnyType, SingleType, Type};
@@ -13,6 +13,7 @@ use weedle::{Definition, Definitions, Parse};
 use crate::Error;
 
 pub(crate) struct Interface {
+    pub(crate) contract: Option<proc_macro2::TokenStream>,
     pub(crate) name: String,
     pub(crate) rust: Ident,
     pub(crate) alternate: Option<Ident>,
@@ -261,7 +262,76 @@ fn resolve_parent(
     Ok(parent)
 }
 
+/// Interface-level implementation annotations, resolved together.
+struct ResolvedAttributes {
+    rust: Ident,
+    alternate: Option<Ident>,
+    alternate_has_lifetime: bool,
+    has_lifetime: bool,
+    properties: PropertyHooks,
+    parent: Option<PrototypeParent>,
+    install_targets: Vec<String>,
+    ctx_mode: CtxMode,
+}
+
 impl Interface {
+    /// Resolve the legacy `Rust*` interface annotations.
+    fn resolve_attributes(
+        mut attributes: Attributes,
+        identifier_token: &str,
+        parent: Option<&str>,
+        kind: &InterfaceKind,
+    ) -> Result<ResolvedAttributes, Error> {
+        if attributes.take("Exposed")?.as_deref() != Some("Window") {
+            return Err(Error(
+                "native interfaces must declare Exposed=Window".into(),
+            ));
+        }
+        let rust = attributes.rust()?;
+        let alternate = attributes.rust_mapping("RustAlternate")?;
+        let alternate_has_lifetime = attributes.flag("RustAlternateLifetime")?;
+        if alternate_has_lifetime && alternate.is_none() {
+            return Err(Error("RustAlternateLifetime requires RustAlternate".into()));
+        }
+        let has_lifetime = attributes.flag("RustLifetime")?;
+        let properties = attributes.property_hooks()?;
+        let intrinsic = attributes.take("RustPrototype")?;
+        if intrinsic.as_deref().is_some_and(|name| name != "Error") {
+            return Err(Error("unsupported intrinsic prototype".into()));
+        }
+        if parent.is_some() && intrinsic.is_some() {
+            return Err(Error(
+                "interface cannot declare two prototype parents".into(),
+            ));
+        }
+        let parent = resolve_parent(parent, intrinsic, identifier_token)?;
+        let install_targets = attributes.install_targets()?;
+        let ctx_mode = if attributes.flag("RustOwnedCtx")? {
+            CtxMode::Owned
+        } else {
+            CtxMode::Borrowed
+        };
+        attributes.finish()?;
+        if matches!(kind, InterfaceKind::Partial) && parent.is_some() {
+            return Err(Error(
+                "partial interfaces cannot select a prototype parent".into(),
+            ));
+        }
+        if !install_targets.is_empty() && !matches!(kind, InterfaceKind::Partial) {
+            return Err(Error("RustInstall requires a partial interface".into()));
+        }
+        Ok(ResolvedAttributes {
+            rust,
+            alternate,
+            alternate_has_lifetime,
+            has_lifetime,
+            properties,
+            parent,
+            install_targets,
+            ctx_mode,
+        })
+    }
+
     pub(crate) fn parse(source: &str) -> Result<Self, Error> {
         // weedle::parse asserts on trailing input. Use the fallible parser and
         // reject the unconsumed suffix ourselves so diagnostics stay controlled.
@@ -302,45 +372,21 @@ impl Interface {
                 ));
             }
         };
-        let mut attributes = Attributes::parse(attributes)?;
-        if attributes.take("Exposed")?.as_deref() != Some("Window") {
-            return Err(Error(
-                "native interfaces must declare Exposed=Window".into(),
-            ));
-        }
-        let rust = attributes.rust()?;
-        let alternate = attributes.rust_mapping("RustAlternate")?;
-        let alternate_has_lifetime = attributes.flag("RustAlternateLifetime")?;
-        if alternate_has_lifetime && alternate.is_none() {
-            return Err(Error("RustAlternateLifetime requires RustAlternate".into()));
-        }
-        let has_lifetime = attributes.flag("RustLifetime")?;
-        let properties = attributes.property_hooks()?;
-        let intrinsic = attributes.take("RustPrototype")?;
-        if intrinsic.as_deref().is_some_and(|name| name != "Error") {
-            return Err(Error("unsupported intrinsic prototype".into()));
-        }
-        if parent.is_some() && intrinsic.is_some() {
-            return Err(Error(
-                "interface cannot declare two prototype parents".into(),
-            ));
-        }
-        let parent = resolve_parent(parent, intrinsic, identifier_token)?;
-        let install_targets = attributes.install_targets()?;
-        let ctx_mode = if attributes.flag("RustOwnedCtx")? {
-            CtxMode::Owned
-        } else {
-            CtxMode::Borrowed
-        };
-        attributes.finish()?;
-        if matches!(kind, InterfaceKind::Partial) && parent.is_some() {
-            return Err(Error(
-                "partial interfaces cannot select a prototype parent".into(),
-            ));
-        }
-        if !install_targets.is_empty() && !matches!(kind, InterfaceKind::Partial) {
-            return Err(Error("RustInstall requires a partial interface".into()));
-        }
+        let ResolvedAttributes {
+            rust,
+            alternate,
+            alternate_has_lifetime,
+            has_lifetime,
+            properties,
+            parent,
+            install_targets,
+            ctx_mode,
+        } = Self::resolve_attributes(
+            Attributes::parse(attributes)?,
+            identifier_token,
+            parent,
+            &kind,
+        )?;
         let mut result = Self {
             name: identifier(identifier_token)?.into(),
             rust,
@@ -361,7 +407,9 @@ impl Interface {
             indexed_setter: None,
             install_targets,
             ctx_mode,
+            contract: None,
         };
+
         result.lower_members(members, &names)?;
         result.validate_property_hooks()?;
         Ok(result)
@@ -408,12 +456,11 @@ impl Interface {
                     self.constants.push(Constant::parse(member)?);
                 }
                 InterfaceMember::Operation(member) => {
-                    if matches!(
-                        member.special,
-                        Some(weedle::interface::Special::Setter(_))
-                    ) {
+                    if matches!(member.special, Some(weedle::interface::Special::Setter(_))) {
                         if self.indexed_setter.is_some() {
-                            return Err(Error("indexed setter overloads are not supported yet".into()));
+                            return Err(Error(
+                                "indexed setter overloads are not supported yet".into(),
+                            ));
                         }
                         self.indexed_setter = Some(IndexedSetter::parse(member, names)?);
                         continue;
@@ -481,7 +528,10 @@ impl Interface {
                 ));
             }
         }
-        if matches!(self.properties, PropertyHooks::Indexed | PropertyHooks::IndexedNamed { .. }) {
+        if matches!(
+            self.properties,
+            PropertyHooks::Indexed | PropertyHooks::IndexedNamed { .. }
+        ) {
             if matches!(self.kind, InterfaceKind::Partial)
                 || !self.attributes.iter().any(|attribute| {
                     attribute.name == "length"
@@ -514,7 +564,9 @@ impl Interface {
                         && operation.arguments[0].from_js.is_none()
                 })
             {
-                return Err(Error("named hooks require a value-returning DOMString getter".into()));
+                return Err(Error(
+                    "named hooks require a value-returning DOMString getter".into(),
+                ));
             }
             if self.indexed_setter.is_some()
                 && !matches!(self.properties, PropertyHooks::IndexedNamed { .. })
@@ -541,18 +593,14 @@ impl IndexedSetter {
         if member.modifier.is_some() {
             return Err(Error("indexed setters must not be static".into()));
         }
-        if !matches!(
-            &member.return_type,
-            weedle::types::ReturnType::Undefined(_)
-        ) {
+        if !matches!(&member.return_type, weedle::types::ReturnType::Undefined(_)) {
             return Err(Error("indexed setters require an undefined result".into()));
         }
         let mut attributes = Attributes::parse(member.attributes.as_ref())?;
         let rust = attributes.rust()?;
         let reactions = attributes.flag("CEReactions")?;
         attributes.finish()?;
-        let [Argument::Single(index), Argument::Single(value)] =
-            member.args.body.list.as_slice()
+        let [Argument::Single(index), Argument::Single(value)] = member.args.body.list.as_slice()
         else {
             return Err(Error("indexed setters require an index and a value".into()));
         };
@@ -572,8 +620,8 @@ impl IndexedSetter {
         }
         let mut value_attributes = Attributes::parse(value.attributes.as_ref())?;
         let mut value_type_attributes = Attributes::parse(value.type_.attributes.as_ref())?;
-        let rust_value = value_attributes.flag("RustValue")?
-            || value_type_attributes.flag("RustValue")?;
+        let rust_value =
+            value_attributes.flag("RustValue")? || value_type_attributes.flag("RustValue")?;
         value_attributes.finish()?;
         value_type_attributes.finish()?;
         if !rust_value {
@@ -725,7 +773,8 @@ fn property_getter(
 }
 
 impl OperationArgument {
-    fn parse(argument: &Argument<'_>, names: &TypeNames) -> Result<Self, Error> {        let (attributes, type_attributes, type_, default, arity) = match argument {
+    fn parse(argument: &Argument<'_>, names: &TypeNames) -> Result<Self, Error> {
+        let (attributes, type_attributes, type_, default, arity) = match argument {
             Argument::Single(argument) => (
                 argument.attributes.as_ref(),
                 argument.type_.attributes.as_ref(),
@@ -747,8 +796,8 @@ impl OperationArgument {
         };
         let mut argument_attributes = Attributes::parse(attributes)?;
         let mut type_attributes = Attributes::parse(type_attributes)?;
-        let rust_value = argument_attributes.flag("RustValue")?
-            || type_attributes.flag("RustValue")?;
+        let rust_value =
+            argument_attributes.flag("RustValue")? || type_attributes.flag("RustValue")?;
         let from_js = argument_attributes
             .rust_mapping("RustFromJs")?
             .or(type_attributes.rust_mapping("RustFromJs")?);
@@ -778,7 +827,12 @@ impl OperationArgument {
             DefaultValue::Boolean(value) => Some(value.0),
             _ => None,
         });
-        validate_optional_default(&type_, optional, default.as_ref().map(|default| &default.value), rust_value)?;
+        validate_optional_default(
+            &type_,
+            optional,
+            default.as_ref().map(|default| &default.value),
+            rust_value,
+        )?;
         validate_argument_type(&type_, legacy_null_to_empty, from_js.is_some())?;
         Ok(Self {
             type_,
@@ -1159,7 +1213,8 @@ impl ReturnType {
                 if value.q_mark.is_some() {
                     return Err(Error("nullable sequences are not supported yet".into()));
                 }
-                match value.type_.generics.body.as_ref() {
+                Attributes::parse(value.type_.generics.body.attributes.as_ref())?.finish()?;
+                match &value.type_.generics.body.type_ {
                     Type::Single(SingleType::NonAny(NonAnyType::Identifier(element)))
                         if element.q_mark.is_none() && is_interface_name(element.type_.0) =>
                     {
@@ -1276,7 +1331,8 @@ impl Dictionary {
                     member.identifier.0
                 )));
             }
-            let type_ = match &member.type_ {
+            Attributes::parse(member.type_.attributes.as_ref())?.finish()?;
+            let type_ = match &member.type_.type_ {
                 Type::Single(SingleType::NonAny(NonAnyType::Boolean(value))) => {
                     if value.q_mark.is_some() {
                         return Err(Error(
@@ -1302,7 +1358,8 @@ impl Dictionary {
                             "nullable dictionary fields are not supported yet".into(),
                         ));
                     }
-                    match value.type_.generics.body.as_ref() {
+                    Attributes::parse(value.type_.generics.body.attributes.as_ref())?.finish()?;
+                    match &value.type_.generics.body.type_ {
                         Type::Single(SingleType::NonAny(NonAnyType::DOMString(element)))
                             if element.q_mark.is_none() => {}
                         _ => {
@@ -1341,7 +1398,7 @@ impl Dictionary {
 }
 
 impl Constant {
-    fn parse(member: &weedle::interface::ConstMember<'_>) -> Result<Self, Error> {
+    pub(crate) fn parse(member: &weedle::interface::ConstMember<'_>) -> Result<Self, Error> {
         let ConstType::Integer(type_) = member.const_type else {
             return Err(Error("expected an unsigned short constant".into()));
         };
@@ -1471,7 +1528,7 @@ fn split_definitions<'a, 'b>(
                 let mut values = Vec::new();
                 let mut taken = HashSet::new();
                 for value in &definition.values.body.list {
-                    let text = value.value.0;
+                    let text = value.0;
                     let mut variant = String::new();
                     for word in text
                         .split(|char: char| !char.is_ascii_alphanumeric())
@@ -1601,7 +1658,9 @@ impl Attributes {
             Some("JavaScript") => PropertyHooks::JavaScript,
             Some("Indexed") => PropertyHooks::Indexed,
             Some("IndexedNamed") => PropertyHooks::IndexedNamed {
-                names: names.clone().ok_or_else(|| Error("named hooks require RustSupportedNames".into()))?,
+                names: names
+                    .clone()
+                    .ok_or_else(|| Error("named hooks require RustSupportedNames".into()))?,
                 unenumerable,
                 override_builtins,
             },
@@ -1611,16 +1670,17 @@ impl Attributes {
             return Err(Error("RustSupportedNames requires named hooks".into()));
         }
         if unenumerable
-            && !matches!(hooks, PropertyHooks::JavaScript | PropertyHooks::IndexedNamed { .. })
+            && !matches!(
+                hooks,
+                PropertyHooks::JavaScript | PropertyHooks::IndexedNamed { .. }
+            )
         {
             return Err(Error(
                 "named property annotations require property hooks".into(),
             ));
         }
         if override_builtins && !matches!(hooks, PropertyHooks::IndexedNamed { .. }) {
-            return Err(Error(
-                "LegacyOverrideBuiltIns requires named hooks".into(),
-            ));
+            return Err(Error("LegacyOverrideBuiltIns requires named hooks".into()));
         }
         Ok(hooks)
     }
@@ -1631,11 +1691,10 @@ impl Attributes {
             for attribute in &list.body.list {
                 let (key, value) = match attribute {
                     ExtendedAttribute::Ident(attribute) => {
-                        let value = match attribute.rhs {
-                            IdentifierOrString::Identifier(value) => value.0,
-                            IdentifierOrString::String(value) => value.0,
-                        };
-                        (attribute.lhs_identifier.0, Some(value))
+                        (attribute.lhs_identifier.0, Some(attribute.rhs.0))
+                    }
+                    ExtendedAttribute::String(attribute) => {
+                        (attribute.lhs_identifier.0, Some(attribute.rhs.0))
                     }
                     ExtendedAttribute::NoArgs(attribute) => (attribute.0.0, None),
                     _ => {
