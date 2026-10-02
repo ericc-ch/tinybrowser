@@ -76,7 +76,6 @@ pub(crate) struct EventState {
     pub(crate) time_stamp: f64,
     pub(crate) target: Option<EventTargetRef>,
     pub(crate) current_target: Option<EventTargetRef>,
-    pub(crate) related_target: Option<EventTargetRef>,
     pub(crate) phase: u16,
     pub(crate) stop_propagation: bool,
     pub(crate) stop_immediate: bool,
@@ -149,7 +148,6 @@ impl JsEvent {
         state.canceled = false;
         state.is_trusted = false;
         state.target = None;
-        state.related_target = None;
         state.typ = typ;
         state.bubbles = bubbles;
         state.cancelable = cancelable;
@@ -170,6 +168,15 @@ impl JsEvent {
             })),
         }
     }
+
+    /// [Set the canceled flag](https://dom.spec.whatwg.org/#set-the-canceled-flag).
+    fn set_canceled_flag(&self) {
+        let mut state = self.state_mut();
+        if state.canceled || state.in_passive || !state.cancelable {
+            return;
+        }
+        state.canceled = true;
+    }
 }
 
 #[allow(
@@ -177,9 +184,9 @@ impl JsEvent {
     clippy::unnecessary_wraps,
     reason = "generated dispatch shares one fallible call shape and passes Ctx by value"
 )]
-impl JsEvent {
+impl<'js> event_generated::Event<'js> for JsEvent {
     // https://dom.spec.whatwg.org/#dom-event-event
-    fn new<'js>(
+    fn constructor(
         _ctx: &Ctx<'js>,
         typ: rquickjs::String<'js>,
         init: event_generated::EventInit,
@@ -188,28 +195,23 @@ impl JsEvent {
     }
 
     // https://dom.spec.whatwg.org/#dom-event-type
-    fn get_type<'js>(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
+    fn get_type(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
         rquickjs::String::from_str(ctx.clone(), &self.state().typ)
     }
 
     // https://dom.spec.whatwg.org/#dom-event-target
-    fn get_target<'js>(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
+    fn get_target(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
         stored_target(ctx, self.state().target.as_ref())
     }
 
     // https://dom.spec.whatwg.org/#dom-event-srcelement
-    fn get_src_element<'js>(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
+    fn get_src_element(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
         stored_target(ctx, self.state().target.as_ref())
     }
 
     // https://dom.spec.whatwg.org/#dom-event-currenttarget
-    fn get_current_target<'js>(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
+    fn get_current_target(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
         stored_target(ctx, self.state().current_target.as_ref())
-    }
-
-    // https://w3c.github.io/uievents/#dom-focusevent-relatedtarget
-    fn get_related_target<'js>(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
-        stored_target(ctx, self.state().related_target.as_ref())
     }
 
     // https://dom.spec.whatwg.org/#dom-event-eventphase
@@ -294,7 +296,7 @@ impl JsEvent {
     }
 
     // https://dom.spec.whatwg.org/#dom-event-composedpath
-    fn composed_path<'js>(&self, ctx: Ctx<'js>) -> Result<Vec<Value<'js>>> {
+    fn composed_path(&self, ctx: Ctx<'js>) -> Result<Vec<Value<'js>>> {
         let state = self.state();
         state
             .path
@@ -304,7 +306,7 @@ impl JsEvent {
     }
 
     // https://dom.spec.whatwg.org/#dom-event-initevent
-    fn init_event<'js>(
+    fn init_event(
         &self,
         _ctx: Ctx<'js>,
         typ: rquickjs::String<'js>,
@@ -319,15 +321,6 @@ impl JsEvent {
         }
         self.initialize(typ.to_string()?, bubbles, cancelable);
         Ok(())
-    }
-
-    /// [Set the canceled flag](https://dom.spec.whatwg.org/#set-the-canceled-flag).
-    fn set_canceled_flag(&self) {
-        let mut state = self.state_mut();
-        if state.canceled || state.in_passive || !state.cancelable {
-            return;
-        }
-        state.canceled = true;
     }
 }
 
@@ -919,8 +912,9 @@ pub(crate) fn fire_trusted_click(ctx: &Ctx<'_>, target: EventTargetKey) -> Resul
     dispatch(ctx, target, &event, None)
 }
 
-/// Creates and dispatches a trusted event with a `relatedTarget`, as the
-/// focus update steps require
+/// Creates and dispatches a trusted event. The focus update steps compute
+/// a `relatedTarget`, but it has no reader until `FocusEvent` exists, so it
+/// is dropped here
 /// (<https://html.spec.whatwg.org/multipage/interaction.html#focus-update-steps>).
 pub(crate) fn fire_trusted_with_related(
     ctx: &Ctx<'_>,
@@ -928,10 +922,9 @@ pub(crate) fn fire_trusted_with_related(
     typ: &str,
     bubbles: bool,
     cancelable: bool,
-    related: Option<EventTargetRef>,
+    _related: Option<EventTargetRef>,
 ) -> Result<()> {
     let event = Class::instance(ctx.clone(), JsEvent::trusted(typ, bubbles, cancelable))?;
-    event.borrow().state_mut().related_target = related;
     dispatch(ctx, target, &event, None)?;
     Ok(())
 }
