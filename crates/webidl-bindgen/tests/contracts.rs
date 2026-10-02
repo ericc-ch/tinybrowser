@@ -1,5 +1,5 @@
 use quote::ToTokens;
-use webidl_bindgen::{Source, compile_contracts, validate_sources};
+use webidl_bindgen::{Source, compile_contracts, compile_javascript, validate_sources};
 
 fn generated_trait(rust: &str) -> String {
     let syntax = syn::parse_file(rust).expect("generated syntax");
@@ -294,4 +294,76 @@ fn implemented_unsupported_types_do_not_disappear() {
         text: "impl<'js> sample_generated::Sample<'js> for Payload { fn get_value() {} }",
     }];
     assert!(compile_contracts(&idl, &rust).is_err());
+}
+
+#[test]
+fn unforgeable_and_scoped_native_members_fail_the_build() {
+    let rust = [Source {
+        name: "fixture.rs",
+        text: "impl<'js> sample_generated::Sample<'js> for Payload { fn get_flag(&self, ctx: &Ctx<'js>) -> Result<bool> { Ok(true) } }",
+    }];
+    for text in [
+        "[Exposed=Window] interface Sample { [LegacyUnforgeable] readonly attribute boolean flag; };",
+        "[Exposed=Window] interface Sample {}; [SecureContext] partial interface Sample { readonly attribute boolean flag; };",
+        "[Exposed=Window] interface Sample {}; [SecureContext] interface mixin Extra { readonly attribute boolean flag; }; Sample includes Extra;",
+    ] {
+        let idl = [Source {
+            name: "fixture.idl",
+            text,
+        }];
+        let error = compile_contracts(&idl, &rust)
+            .err()
+            .expect("scoped or unforgeable member must fail")
+            .to_string();
+        assert!(
+            error.contains("not supported"),
+            "unexpected diagnostic for {text}: {error}"
+        );
+    }
+}
+
+const JS_ENCODER_IDL: &str = "[Exposed=Window] interface TextEncoder { readonly attribute DOMString encoding; Uint8Array encode(optional DOMString input = \"\"); };";
+
+#[test]
+fn javascript_contracts_insert_safe_reads_and_realm_results() {
+    let idl = [Source {
+        name: "encoding.idl",
+        text: JS_ENCODER_IDL,
+    }];
+    let source = Source {
+        name: "fixture.js",
+        text: "globalThis.TextEncoder = __tbInstallInterface(class TextEncoder { get encoding() { return 'utf-8'; } encode(input) { return new Uint8Array(); } });",
+    };
+    let output = compile_javascript(&idl, &source)
+        .expect("compile JS contract")
+        .source;
+    for fragment in [
+        "args.length > 0 && args[0] !== undefined",
+        "__tbIDLRealmUint8Array(value, false, realm)",
+    ] {
+        assert!(output.contains(fragment), "missing {fragment}: {output}");
+    }
+}
+
+#[test]
+fn javascript_unsupported_implementations_fail_the_build() {
+    let idl = [Source {
+        name: "encoding.idl",
+        text: JS_ENCODER_IDL,
+    }];
+    for text in [
+        "__tbInstallInterface(class TextEncoder { get encoding() { return 'x'; } encode(input) { return new Uint8Array(); } extra() {} })",
+        "__tbInstallInterface(class TextEncoder { get encoding() { return 'x'; } encode() { return new Uint8Array(); } })",
+        "__tbInstallInterface(class TextEncoder { get encoding() { return 'x'; } }); __tbInstallInterface(class TextEncoder { get encoding() { return 'x'; } })",
+        "__tbInstallInterface(function() {}, 'TextEncoder', null, [])",
+    ] {
+        let source = Source {
+            name: "fixture.js",
+            text,
+        };
+        assert!(
+            compile_javascript(&idl, &source).is_err(),
+            "accepted {text}"
+        );
+    }
 }

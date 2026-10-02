@@ -3,6 +3,7 @@
 mod contracts;
 mod database;
 mod emit;
+mod javascript;
 mod model;
 mod names;
 
@@ -48,6 +49,28 @@ pub struct Binding {
 /// implementation methods, or implemented IDL semantics not yet supported.
 pub fn compile_contracts(idl: &[Source<'_>], rust: &[Source<'_>]) -> Result<Vec<Binding>, Error> {
     contracts::compile(idl, rust)
+}
+
+/// JavaScript algorithms with generated interface installation contracts.
+pub struct Javascript {
+    /// Source with IDL-derived conversions and member mechanics inserted.
+    pub source: String,
+    /// Names of the interface classes discovered in this source.
+    pub interfaces: Vec<String>,
+}
+
+/// Compile `__tbInstallInterface(class InterfaceName { ... })` expressions.
+///
+/// Class methods, getters, setters, and constructors are algorithm entry points.
+/// The compiler derives their contract from the unchanged IDL corpus, validates
+/// names and signatures, and supplies binding mechanics to the private installer.
+/// Other JavaScript remains unchanged.
+///
+/// # Errors
+/// Returns a diagnostic for invalid source, conflicting implementations,
+/// mismatched algorithms, or implemented semantics without generated support.
+pub fn compile_javascript(idl: &[Source<'_>], source: &Source<'_>) -> Result<Javascript, Error> {
+    javascript::compile(idl, source)
 }
 
 use std::fmt;

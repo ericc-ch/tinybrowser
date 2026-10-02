@@ -92,6 +92,20 @@ Dictionary field names use snake case. Dictionary conversion visits inherited
 declarations first and sorts each declaration's members, including partials,
 lexicographically. Unsupported defaults and conversions fail the build.
 
+`compile_javascript` discovers `__tbInstallInterface(class InterfaceName { ... })`
+calls in embedded scripts. Use the interface's IDL name for the class and each
+algorithm method. Use plain parameter names. IDL supplies argument defaults and
+conversions. Keep private state outside the class in the shim's private storage.
+The build parses the class, checks its members against the imported declarations,
+and inserts the binding contract into the installer call before compression.
+
+`crates/renderer/src/js/scripts/bindings.js` installs these JS contracts in the
+private bridge scope. The installer supplies brands, descriptors, argument
+conversion, and result conversion. The algorithm class stays private. Native,
+legacy, and generated JS implementations of the same interface conflict at build
+time. Generator dependencies belong to build tooling rather than the browser
+runtime.
+
 `crates/renderer/idl/` still holds hand-maintained partial declarations and
 `Rust*` annotations for interfaces the contract path does not yet cover. Delete
 each file when its interface moves to the imported extracts. The renderer build

@@ -41,7 +41,7 @@ const WEB_PREFIX: &str = "(function(){";
 const WEB_SUFFIX: &str = "})();";
 
 fn main() {
-    generate_bindings();
+    let mut contracts = generate_bindings();
     let root = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR is set"));
     let out = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR is set")).join("js_blobs");
     fs::create_dir_all(&out).expect("create js_blobs dir");
@@ -81,6 +81,7 @@ fn main() {
         "order.txt lists no shims; refusing to ship an empty web bundle"
     );
     bundle.push_str(WEB_SUFFIX);
+    let bundle = contracts.javascript("web_bundle", &bundle);
     write_blob(&out, "web_bundle.deflate", bundle.as_bytes());
     writeln!(
         manifest,
@@ -93,6 +94,7 @@ fn main() {
         println!("cargo:rerun-if-changed={}", root.join(input).display());
         let text = fs::read_to_string(root.join(input))
             .unwrap_or_else(|err| panic!("read shim {input}: {err}"));
+        let text = contracts.javascript(input, &text);
         write_blob(&out, blob, text.as_bytes());
         writeln!(manifest, "{blob}\tsingle\t{input}").expect("write manifest line");
     }
@@ -110,14 +112,47 @@ fn write_blob(out: &Path, name: &str, bytes: &[u8]) {
 
 /// Compiles only the declared native surface. Unsupported semantics fail the
 /// build instead of producing bindings that merely look like Web IDL.
-fn generate_bindings() {
+struct Contracts {
+    idl: Vec<(String, String)>,
+    providers: HashSet<String>,
+}
+
+impl Contracts {
+    fn javascript(&mut self, name: &str, text: &str) -> String {
+        let idl: Vec<_> = self
+            .idl
+            .iter()
+            .map(|(name, text)| webidl_bindgen::Source { name, text })
+            .collect();
+        let binding =
+            webidl_bindgen::compile_javascript(&idl, &webidl_bindgen::Source { name, text })
+                .unwrap_or_else(|error| panic!("JS IDL contracts: {error}"));
+        for interface in binding.interfaces {
+            assert!(
+                self.providers.insert(interface.clone()),
+                "conflicting binding implementations of {interface}"
+            );
+        }
+        binding.source
+    }
+}
+
+fn generate_bindings() -> Contracts {
     let root = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
     let out = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR"));
-    let mut extracts = Vec::new();
-    binding_sources(&root.join("../webidl-bindgen/idl"), "idl", &mut extracts);
+    let mut contracts = Contracts {
+        idl: Vec::new(),
+        providers: HashSet::new(),
+    };
+    binding_sources(
+        &root.join("../webidl-bindgen/idl"),
+        "idl",
+        &mut contracts.idl,
+    );
     let mut implementations = Vec::new();
     binding_sources(&root.join("src/js"), "rs", &mut implementations);
-    let extracts: Vec<_> = extracts
+    let extracts: Vec<_> = contracts
+        .idl
         .iter()
         .map(|(name, text)| webidl_bindgen::Source { name, text })
         .collect();
@@ -130,6 +165,7 @@ fn generate_bindings() {
     let mut contract_interfaces = HashSet::new();
     for binding in bindings {
         contract_interfaces.insert(binding.interface.clone());
+        contracts.providers.insert(binding.interface.clone());
         fs::write(
             out.join(&binding.interface).with_extension("rs"),
             binding.rust,
@@ -155,6 +191,9 @@ fn generate_bindings() {
         let generated = webidl_bindgen::compile(&source)
             .unwrap_or_else(|error| panic!("{}: {error}", input.display()));
         let name = input.file_stem().expect("native IDL file name");
+        contracts
+            .providers
+            .insert(name.to_string_lossy().into_owned());
         assert!(
             !contract_interfaces.contains(name.to_string_lossy().as_ref()),
             "interface has both legacy and upstream bindings: {}",
@@ -162,6 +201,7 @@ fn generate_bindings() {
         );
         fs::write(out.join(name).with_extension("rs"), generated).expect("write generated binding");
     }
+    contracts
 }
 
 fn binding_sources(directory: &Path, extension: &str, sources: &mut Vec<(String, String)>) {

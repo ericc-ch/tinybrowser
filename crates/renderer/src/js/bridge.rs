@@ -80,8 +80,9 @@ pub(crate) fn object<'js>(ctx: &Ctx<'js>) -> Result<Object<'js>> {
 
 pub(crate) fn evaluate(ctx: &Ctx<'_>, source: &str) -> Result<()> {
     let primordials = include_str!("scripts/primordials.js");
+    let bindings = include_str!("scripts/bindings.js");
     let initializer: Function = ctx.eval(format!(
-        "(function(host) {{ 'use strict';\n{primordials}\n{source}\n}})"
+        "(function(host) {{ 'use strict';\n{primordials}\n{bindings}\n{source}\n}})"
     ))?;
     initializer.call((object(ctx)?,))
 }
