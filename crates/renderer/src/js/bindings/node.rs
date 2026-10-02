@@ -982,18 +982,7 @@ impl JsNode {
 
     #[qjs(skip)]
     fn get_element_by_id<'js>(&self, ctx: Ctx<'js>, id: WebIdlString) -> Result<Value<'js>> {
-        let world = world(&ctx)?;
-        let found = {
-            let parsed = world.borrow();
-            let Some(parsed) = parsed.document(self.handle.0) else {
-                return Ok(Value::new_null(ctx));
-            };
-            find_element_by_id(&parsed.document, self.handle.0, &id.0)
-        };
-        match found {
-            Some(node) => wrap_node(&ctx, node),
-            None => Ok(Value::new_null(ctx)),
-        }
+        element_by_id(&ctx, self.handle.0, &id.0)
     }
 
     // https://dom.spec.whatwg.org/#dom-document-implementation
@@ -3873,6 +3862,36 @@ impl JsNode {
         drop(world);
         fixup_focus_after_removal(&ctx, self.handle.0)?;
         schedule_mutation_delivery(&ctx)
+    }
+}
+
+// https://dom.spec.whatwg.org/#dom-nonelementparentnode-getelementbyid
+fn element_by_id<'js>(ctx: &Ctx<'js>, root: NodeId, id: &str) -> Result<Value<'js>> {
+    let owner = world_for_node(ctx, root)?;
+    let found = {
+        let owner = owner.borrow();
+        let Some(parsed) = owner.document(root) else {
+            return Ok(Value::new_null(ctx.clone()));
+        };
+        find_element_by_id(&parsed.document, root, id)
+    };
+    match found {
+        Some(node) => wrap_node(ctx, node),
+        None => Ok(Value::new_null(ctx.clone())),
+    }
+}
+
+impl<'js> document_fragment_generated::DocumentFragment<'js> for JsNode {
+    // https://dom.spec.whatwg.org/#dom-nonelementparentnode-getelementbyid
+    fn get_element_by_id(&self, ctx: Ctx<'js>, id: rquickjs::String<'js>) -> Result<Value<'js>> {
+        element_by_id(&ctx, self.handle.0, &id.to_string()?)
+    }
+}
+
+impl<'js> math_ml_element_generated::MathMLElement<'js> for JsNode {
+    // https://html.spec.whatwg.org/multipage/dom.html#dom-dataset
+    fn get_dataset(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
+        self.dataset(ctx)
     }
 }
 

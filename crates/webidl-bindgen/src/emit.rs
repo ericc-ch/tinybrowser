@@ -180,26 +180,22 @@ fn dispatch_groups(
         arms.push((
             index * 2 + 1,
             false,
-            getter_dispatch(index * 2 + 1, attribute, interface.ctx_mode.is_owned()),
+            getter_dispatch(index * 2 + 1, attribute, interface),
         ));
-        if let Some(setter) = setter_dispatch((index, attribute), interface.ctx_mode.is_owned()) {
+        if let Some(setter) = setter_dispatch((index, attribute), interface) {
             arms.push((index * 2 + 2, true, setter));
         }
     }
     for (index, operation) in interface.operations.iter().enumerate() {
         let id = interface.attributes.len() * 2 + index + 1;
-        arms.push((id, true, operation_dispatch(id, operation)));
+        arms.push((id, true, operation_dispatch(id, operation, interface)));
     }
     if let Some(index) = interface.stringifier {
         let id = interface.attributes.len() * 2 + interface.operations.len() + 1;
         arms.push((
             id,
             false,
-            getter_dispatch(
-                id,
-                &interface.attributes[index],
-                interface.ctx_mode.is_owned(),
-            ),
+            getter_dispatch(id, &interface.attributes[index], interface),
         ));
     }
     let mut routes = Vec::new();
@@ -658,44 +654,54 @@ fn indexed_hooks_with_tokens(
     }
 }
 
-fn getter_dispatch(id: usize, getter: &Attribute, owned_ctx: bool) -> TokenStream {
+fn method_call(interface: &Interface, method: &syn::Ident, arguments: &TokenStream) -> TokenStream {
+    if interface.contract.is_some() {
+        let contract = format_ident!("{}", interface.name);
+        quote! { #contract::#method(receiver, #arguments) }
+    } else {
+        quote! { receiver.#method(#arguments) }
+    }
+}
+
+fn getter_dispatch(id: usize, getter: &Attribute, interface: &Interface) -> TokenStream {
     let method = &getter.rust;
     // Operation dispatch always hands over an owned `Ctx`; attributes borrow it
     // unless the interface opts into owned contexts for hand-written getters.
-    let ctx_arg = if owned_ctx {
+    let ctx_arg = if interface.ctx_mode.is_owned() {
         quote! { ctx.clone() }
     } else {
         quote! { &ctx }
     };
+    let call = method_call(interface, method, &ctx_arg);
     let body = match getter.mapping {
         GetterMapping::Field => quote! { receiver.#method.clone().into_js(&ctx) },
         GetterMapping::Method => match getter.return_type {
             // `[RustValue]`: the method returns the platform value directly.
-            ReturnType::Value => quote! { receiver.#method(#ctx_arg) },
+            ReturnType::Value => quote! { #call },
             ReturnType::String => {
-                quote! { let result = receiver.#method(#ctx_arg)?; result.into_js(&ctx) }
+                quote! { let result = #call?; result.into_js(&ctx) }
             }
             ReturnType::UsvString => quote! {
-                let result = receiver.#method(#ctx_arg)?;
+                let result = #call?;
                 let result = result.to_string_lossy();
                 result.into_js(&ctx)
             },
             ReturnType::Boolean => quote! {
-                let result: bool = receiver.#method(#ctx_arg)?;
+                let result: bool = #call?;
                 result.into_js(&ctx)
             },
             ReturnType::UnsignedShort => {
-                quote! { let result: u16 = receiver.#method(#ctx_arg)?; result.into_js(&ctx) }
+                quote! { let result: u16 = #call?; result.into_js(&ctx) }
             }
             ReturnType::Long => {
-                quote! { let result: i32 = receiver.#method(#ctx_arg)?; result.into_js(&ctx) }
+                quote! { let result: i32 = #call?; result.into_js(&ctx) }
             }
             ReturnType::UnsignedLong => quote! {
-                let result = receiver.#method(#ctx_arg)?;
+                let result = #call?;
                 result.into_js(&ctx)
             },
             ReturnType::NullableString => quote! {
-                let result: Option<rquickjs::String> = receiver.#method(#ctx_arg)?;
+                let result: Option<rquickjs::String> = #call?;
                 match result {
                     Some(result) => result.into_js(&ctx),
                     None => Ok(Value::new_null(ctx)),
@@ -703,11 +709,11 @@ fn getter_dispatch(id: usize, getter: &Attribute, owned_ctx: bool) -> TokenStrea
             },
             ReturnType::Double => quote! {
                 // https://webidl.spec.whatwg.org/#idl-DOMHighResTimeStamp
-                let result: f64 = receiver.#method(#ctx_arg)?;
+                let result: f64 = #call?;
                 result.into_js(&ctx)
             },
             ReturnType::NullableNode | ReturnType::NodeList | ReturnType::PlatformObject => {
-                quote! { receiver.#method(#ctx_arg) }
+                quote! { #call }
             }
             ReturnType::Node
             | ReturnType::Callback
@@ -725,11 +731,11 @@ fn getter_dispatch(id: usize, getter: &Attribute, owned_ctx: bool) -> TokenStrea
 
 fn setter_dispatch(
     (index, attribute): (usize, &Attribute),
-    owned_ctx: bool,
+    interface: &Interface,
 ) -> Option<TokenStream> {
     let setter = attribute.setter.as_ref()?;
     let id = index * 2 + 2;
-    let ctx_arg = if owned_ctx {
+    let ctx_arg = if interface.ctx_mode.is_owned() {
         quote! { ctx.clone() }
     } else {
         quote! { &ctx }
@@ -794,8 +800,9 @@ fn setter_dispatch(
             _ => unreachable!("validated string, boolean, integer, double, or value setter"),
         }
     };
+    let call = method_call(interface, method, &quote! { #ctx_arg, value });
     let body = quote! {
-        receiver.#method(#ctx_arg, value)?;
+        #call?;
         Ok(Value::new_undefined(ctx.clone()))
     };
     let body = if attribute.reactions {
@@ -814,7 +821,7 @@ fn setter_dispatch(
     })
 }
 
-fn operation_dispatch(id: usize, operation: &Operation) -> TokenStream {
+fn operation_dispatch(id: usize, operation: &Operation, interface: &Interface) -> TokenStream {
     let method = &operation.rust;
     let required = operation
         .arguments
@@ -829,17 +836,16 @@ fn operation_dispatch(id: usize, operation: &Operation) -> TokenStream {
         .iter()
         .enumerate()
         .map(|(index, argument)| operation_argument(index, argument, &argument_names[index]));
-    let call = if operation.takes_this {
+    let arguments_call = if operation.takes_this {
         quote! {
-            receiver.#method(
                 ctx.clone(),
                 host::this_object(params)?,
                 #(#argument_names),*
-            )
         }
     } else {
-        quote! { receiver.#method(ctx.clone(), #(#argument_names),*) }
+        quote! { ctx.clone(), #(#argument_names),* }
     };
+    let call = method_call(interface, method, &arguments_call);
     let body = match operation.result {
         OperationResult::Object => quote! { #call },
         OperationResult::Undefined => quote! {
