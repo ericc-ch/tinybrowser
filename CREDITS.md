@@ -19,7 +19,7 @@ License texts: [LICENSE](LICENSE) (MIT for our code) and [NOTICE](NOTICE) (third
 - [Blitz](https://github.com/DioxusLabs/blitz) / [DioxusLabs](https://github.com/DioxusLabs) (size/quality benchmark; Taffy + Parley + Stylo integration pattern)
 - [NetSurf](https://www.netsurf-browser.org/) (small-engine pipeline prior art)
 - [Dillo](https://dillo-browser.github.io/) (style → layout → canvas prior art)
-- [Effect Logger](https://effect.website) (logging crate model)
+- [Effect Logger](https://github.com/Effect-TS/effect) (logging crate model)
 
 ## Direct Rust dependencies (by role)
 
