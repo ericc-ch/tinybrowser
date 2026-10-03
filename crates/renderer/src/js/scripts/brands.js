@@ -151,6 +151,11 @@
   // Every element interface chains to HTMLElement except the media pair,
   // which chains through HTMLMediaElement, and SVG, which chains to Element.
   // Per-interface members copied from the native wrapper prototype.
+  // `src`, `href`, `name`, and `content` on Element preserve the legacy
+  // generic reflection (any element answered them pre-migration). Per spec
+  // most elements must not expose them, so this is a known spec gap kept
+  // for main-parity until per-element contracts cover every element that
+  // declares them.
   // `type` is defined per interface below; the form-control states live
   // here so each interface exposes exactly the reflecting attributes the
   // spec gives it (<https://html.spec.whatwg.org/#the-disabled-attribute>).

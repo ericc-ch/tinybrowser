@@ -454,17 +454,22 @@ fn document_value<'js>(
     child_value(ctx, found)
 }
 
-/// Whether `id` is an HTML `iframe`, registering any pending browsing
-/// contexts before the caller looks its frame up. A script may have appended
-/// the iframe in this same task, so the browsing context is registered first;
-/// its realm follows at the next non-JS turn
+/// Whether `id` is an HTML `iframe` or `frame` container, registering any
+/// pending browsing contexts before the caller looks its frame up. A script
+/// may have appended the container in this same task, so the browsing context
+/// is registered first; its realm follows at the next non-JS turn
 /// (<https://html.spec.whatwg.org/multipage/iframe-embed-object.html#process-the-iframe-attributes>).
+/// `frame` shares the lookup: the engine has no frameset navigation pipeline,
+/// so no frame document ever exists yet and the callers below return null,
+/// matching the pre-migration binary.
 fn iframe_frame(ctx: &Ctx<'_>, id: NodeId) -> Result<bool> {
-    let is_iframe = with_node_kind(ctx, id, |kind| is_html_element(kind, "iframe"))?;
-    if is_iframe {
+    let is_frame = with_node_kind(ctx, id, |kind| {
+        is_html_element(kind, "iframe") || is_html_element(kind, "frame")
+    })?;
+    if is_frame {
         world(ctx)?.borrow_mut().register_pending_frames();
     }
-    Ok(is_iframe)
+    Ok(is_frame)
 }
 
 fn img_size(ctx: &Ctx<'_>, id: NodeId) -> Result<Option<(u32, u32)>> {
@@ -723,8 +728,7 @@ impl JsNode {
         Ok(elements)
     }
 
-    // https://dom.spec.whatwg.org/#dom-document-createevent
-    #[qjs(skip)]
+    // https://dom.spec.whatwg.org/#dom-document-createelement
     #[qjs(skip)]
     fn create_element<'js>(&self, ctx: Ctx<'js>, tag: WebIdlString) -> Result<Value<'js>> {
         create_html_element(&ctx, self.handle.0, &tag.0)
@@ -5104,10 +5108,16 @@ impl<'js> html_base_element_generated::HTMLBaseElement<'js> for JsNode {
     // document base URL rather than the empty string
     // (<https://html.spec.whatwg.org/multipage/semantics.html#dom-base-href>).
     fn get_href(&self, ctx: &Ctx<'js>) -> Result<dom::DomString> {
-        let present = world(ctx)?
-            .borrow()
-            .document(self.handle.0)
-            .is_some_and(|parsed| parsed.document.attribute(self.handle.0, "href").is_some());
+        // Probe the node's owner document, not the calling realm's: a node
+        // reached across documents must answer from its own attributes.
+        let present = world_for_node(ctx, self.handle.0)
+            .ok()
+            .and_then(|owner| {
+                owner.borrow().with_document(self.handle.0, |parsed| {
+                    parsed.document.attribute(self.handle.0, "href").is_some()
+                })
+            })
+            .unwrap_or(false);
         if present {
             host::reflect_url_string(ctx, self.handle.0, "href")
         } else {
@@ -5122,23 +5132,26 @@ impl<'js> html_media_element_generated::HTMLMediaElement<'js> for JsNode {
     // No media pipeline: the network state never leaves its initial value
     // (<https://html.spec.whatwg.org/multipage/media.html#dom-media-networkstate>).
     fn get_network_state(&self, ctx: &Ctx<'js>) -> Result<u16> {
-        // The sync section of resource selection derives the state from the
-        // selected resource: a `src` attribute or a `<source>` child means a
-        // resource is pending (NETWORK_NO_SOURCE); otherwise there is nothing
-        // to load (NETWORK_EMPTY). Nothing runs past this point
+        // The sync section of resource selection picks a candidate before any
+        // fetch runs: a `src` attribute, or a `<source>` child that itself
+        // has `src`, moves the state out of NETWORK_EMPTY. With no media
+        // pipeline nothing runs past this point, so a candidate reads as
+        // NETWORK_NO_SOURCE and its absence as NETWORK_EMPTY
         // (<https://html.spec.whatwg.org/multipage/media.html#concept-media-load-algorithm>).
         const NETWORK_NO_SOURCE: u16 = 3;
         const NETWORK_EMPTY: u16 = 0;
-        let world = world(ctx)?;
-        let selected = world
-            .borrow()
-            .with_document(self.handle.0, |parsed| {
-                if parsed.document.attribute(self.handle.0, "src").is_some() {
-                    return true;
-                }
-                parsed.document.children(self.handle.0).is_some_and(|kids| {
-                    kids.into_iter().any(|kid| {
-                        is_html_element(parsed.document.kind(kid), "source")
+        let selected = world_for_node(ctx, self.handle.0)
+            .ok()
+            .and_then(|owner| {
+                owner.borrow().with_document(self.handle.0, |parsed| {
+                    if parsed.document.attribute(self.handle.0, "src").is_some() {
+                        return true;
+                    }
+                    parsed.document.children(self.handle.0).is_some_and(|kids| {
+                        kids.into_iter().any(|kid| {
+                            is_html_element(parsed.document.kind(kid), "source")
+                                && parsed.document.attribute(kid, "src").is_some()
+                        })
                     })
                 })
             })
@@ -5152,8 +5165,7 @@ impl<'js> html_media_element_generated::HTMLMediaElement<'js> for JsNode {
 
     // No media pipeline: the ready state never leaves its initial value
     // (<https://html.spec.whatwg.org/multipage/media.html#dom-media-readystate>).
-    fn get_ready_state(&self, ctx: &Ctx<'js>) -> Result<u16> {
-        let _ = ctx;
+    fn get_ready_state(&self, _ctx: &Ctx<'js>) -> Result<u16> {
         Ok(0)
     }
 }

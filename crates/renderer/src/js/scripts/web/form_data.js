@@ -3,10 +3,11 @@
 (function() {
   const lists = host.slots();
 
-  // Forms whose entry list is under construction. A reentrant
-  // `new FormData(form)` while the flag is set returns an empty list
-  // without firing `formdata`, so a `formdata` handler that submits the
-  // form cannot recurse
+  // Forms whose entry list is under construction. Wrappers are interned per
+  // node (one shared wrapper per NodeId), so object identity is a stable key
+  // for the underlying form element. A reentrant `new FormData(form)` while
+  // the flag is set returns an empty list without firing `formdata`, so a
+  // `formdata` handler that submits the form cannot recurse
   // (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#constructing-the-form-data-set>).
   const constructingEntryList = new WeakSet();
 
@@ -26,7 +27,7 @@
           __tbArray.push(list, [String(flat[index]), flat[index + 1]]);
         }
         // Constructing the entry list fires `formdata`, whose handler may extend
-        // the list (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#constructing-form-data-set>).
+        // the list (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#constructing-the-form-data-set>).
         if (typeof globalThis.FormDataEvent === 'function') {
           form.dispatchEvent(new globalThis.FormDataEvent('formdata', {
             formData: this, bubbles: true, cancelable: false,

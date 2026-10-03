@@ -5,7 +5,7 @@ contract. Every Rust and JS binding derives names, inheritance, descriptors,
 arity, and conversions from that IDL. See `docs/bindings.md` for the policy
 and `AGENTS.md` for the rules.
 
-State: branch `webidl-bindings`, HEAD `1830376`, working tree clean.
+State: branch `webidl-bindings`, HEAD `1701594`, working tree clean.
 The migration is COMPLETE:
 
 - All 8 remaining legacy files ported: `EventTarget` (two payloads),
@@ -79,12 +79,12 @@ ShadowRoot, HTMLIFrameElement, HTMLImageElement, DOMParser.
 JS: TextEncoder. Placeholders removed: sendBeacon, pipeThrough, scrollTo,
 Selection, matchMedia listeners.
 
-## Remaining legacy (8 files)
+## Remaining legacy (8 files) — all ported in `1830376`, kept for archeology
 
 `Document`, `Element`, `ElementReflections`, `EventTarget`, `Event`,
 `HTMLOptionsCollection`, `NamedNodeMap`, `Node`.
 
-Each needs:
+Each needed:
 
 - **Node** — has `RustAlternate=JsAttr` (drop it; `Attr` has its own
   contract) **and** a blocker: `Node.webidl` also lists `addEventListener`,

@@ -328,8 +328,8 @@ fn definition(interface: &Interface, payload: &TokenStream, required: usize) -> 
                         let constructor: Object = ctx.globals().get(#targets)?;
                         let prototype: Object = constructor.get("prototype")?;
                         host::install_members(&prototype, MEMBERS, CONSTANTS, dispatch)?;
-                        // Constants live on the interface object, not the
-                        // prototype (<https://webidl.spec.whatwg.org/#es-constants>).
+                        // Constants are visible on the interface object as well
+                        // as the prototype (<https://webidl.spec.whatwg.org/#es-constants>).
                         host::install_constants(&constructor, CONSTANTS)?;
                         host::install_unscopables(&prototype, UNSCOPABLES)?;
                     )*

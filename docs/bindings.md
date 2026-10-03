@@ -106,10 +106,10 @@ legacy, and generated JS implementations of the same interface conflict at build
 time. Generator dependencies belong to build tooling rather than the browser
 runtime.
 
-`crates/renderer/idl/` still holds hand-maintained partial declarations and
-`Rust*` annotations for interfaces the contract path does not yet cover. Delete
-each file when its interface moves to the imported extracts. The renderer build
-rejects an interface that has both a legacy and a contract binding.
+Implementations follow the pinned upstream extracts in
+`crates/webidl-bindgen/idl/` (see the manifest there for the WPT source pin).
+The renderer build rejects an interface that has both a legacy and a contract
+binding.
 
 The cleanup covers Rust-backed and JS-backed bindings. Audit existing members
 before migration. Remove confirmed nonfunctional placeholders, but keep real

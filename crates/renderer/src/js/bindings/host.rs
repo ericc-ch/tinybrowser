@@ -512,8 +512,6 @@ fn node_interface_matches(kind: Option<&dom::NodeKind>, interface: &str) -> Opti
                     | dom::NodeKind::ProcessingInstruction { .. }
             )
         ),
-        // Shared element-level reflections accept any element.
-        "ElementReflections" => matches!(kind, Some(dom::NodeKind::Element { .. })),
         // Per-element contracts check the element's local name. The hyperlink
         // mixin is included by the anchor and area interfaces.
         "HTMLHyperlinkElementUtils" => {
@@ -564,7 +562,7 @@ pub(crate) fn require_node_interface(
     match node_interface_matches(document.document.kind(id), interface) {
         Some(true) => Ok(()),
         Some(false) => Err(Exception::throw_type(ctx, "incompatible receiver")),
-        None => Err(Exception::throw_internal(ctx, "unknown node interface")),
+        None => Err(Exception::throw_type(ctx, "unknown node interface")),
     }
 }
 
