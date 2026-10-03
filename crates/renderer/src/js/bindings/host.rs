@@ -529,6 +529,7 @@ fn node_interface_matches(kind: Option<&dom::NodeKind>, interface: &str) -> Opti
         "HTMLFieldSetElement" => html_local(kind, "fieldset"),
         "HTMLOptGroupElement" => html_local(kind, "optgroup"),
         "HTMLIFrameElement" => html_local(kind, "iframe"),
+        "HTMLFrameElement" => html_local(kind, "frame"),
         "HTMLImageElement" => html_local(kind, "img"),
         "HTMLBaseElement" => html_local(kind, "base"),
         "HTMLLinkElement" => html_local(kind, "link"),

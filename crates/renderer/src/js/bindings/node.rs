@@ -57,6 +57,7 @@ include!(concat!(env!("OUT_DIR"), "/HTMLButtonElement.rs"));
 include!(concat!(env!("OUT_DIR"), "/HTMLFieldSetElement.rs"));
 include!(concat!(env!("OUT_DIR"), "/HTMLOptGroupElement.rs"));
 include!(concat!(env!("OUT_DIR"), "/HTMLIFrameElement.rs"));
+include!(concat!(env!("OUT_DIR"), "/HTMLFrameElement.rs"));
 include!(concat!(env!("OUT_DIR"), "/HTMLImageElement.rs"));
 include!(concat!(env!("OUT_DIR"), "/HTMLHyperlinkElementUtils.rs"));
 include!(concat!(env!("OUT_DIR"), "/HTMLBaseElement.rs"));
@@ -99,6 +100,7 @@ pub(super) fn install(ctx: &Ctx<'_>) -> Result<()> {
     html_field_set_element_generated::install(ctx)?;
     html_opt_group_element_generated::install(ctx)?;
     htmli_frame_element_generated::install(ctx)?;
+    html_frame_element_generated::install(ctx)?;
     html_image_element_generated::install(ctx)?;
     html_hyperlink_element_utils_generated::install(ctx)?;
     html_base_element_generated::install(ctx)?;
@@ -5047,6 +5049,18 @@ impl<'js> htmli_frame_element_generated::HTMLIFrameElement<'js> for JsNode {
     }
 
     // https://html.spec.whatwg.org/multipage/iframe-embed-object.html#dom-iframe-contentwindow
+    fn get_content_window(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
+        self.content_window(ctx.clone())
+    }
+}
+
+impl<'js> html_frame_element_generated::HTMLFrameElement<'js> for JsNode {
+    // https://html.spec.whatwg.org/multipage/obsolete.html#dom-frame-contentdocument
+    fn get_content_document(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
+        self.content_document(ctx.clone())
+    }
+
+    // https://html.spec.whatwg.org/multipage/obsolete.html#dom-frame-contentwindow
     fn get_content_window(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
         self.content_window(ctx.clone())
     }
