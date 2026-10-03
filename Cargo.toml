@@ -18,6 +18,8 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
+authors = ["Erick Christian <erickchristian48@gmail.com>"]
 
 [workspace.dependencies]
 browser = { path = "crates/browser" }
@@ -41,6 +43,8 @@ rquickjs-sys = { path = "third_party/rquickjs/sys" }
 name = "tinybrowser"
 version = "0.1.0"
 edition = "2024"
+license.workspace = true
+authors.workspace = true
 
 [lints]
 workspace = true
