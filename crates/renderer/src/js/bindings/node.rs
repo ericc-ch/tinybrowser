@@ -5108,7 +5108,45 @@ impl<'js> html_base_element_generated::HTMLBaseElement<'js> for JsNode {
 
 impl html_link_element_generated::HTMLLinkElement<'_> for JsNode {}
 
-impl html_media_element_generated::HTMLMediaElement<'_> for JsNode {}
+impl<'js> html_media_element_generated::HTMLMediaElement<'js> for JsNode {
+    // No media pipeline: the network state never leaves its initial value
+    // (<https://html.spec.whatwg.org/multipage/media.html#dom-media-networkstate>).
+    fn get_network_state(&self, ctx: &Ctx<'js>) -> Result<u16> {
+        // The sync section of resource selection derives the state from the
+        // selected resource: a `src` attribute or a `<source>` child means a
+        // resource is pending (NETWORK_NO_SOURCE); otherwise there is nothing
+        // to load (NETWORK_EMPTY). Nothing runs past this point
+        // (<https://html.spec.whatwg.org/multipage/media.html#concept-media-load-algorithm>).
+        const NETWORK_NO_SOURCE: u16 = 3;
+        const NETWORK_EMPTY: u16 = 0;
+        let world = world(ctx)?;
+        let selected = world
+            .borrow()
+            .with_document(self.handle.0, |parsed| {
+                if parsed.document.attribute(self.handle.0, "src").is_some() {
+                    return true;
+                }
+                parsed.document.children(self.handle.0).is_some_and(|kids| {
+                    kids.into_iter().any(|kid| {
+                        is_html_element(parsed.document.kind(kid), "source")
+                    })
+                })
+            })
+            .unwrap_or(false);
+        Ok(if selected {
+            NETWORK_NO_SOURCE
+        } else {
+            NETWORK_EMPTY
+        })
+    }
+
+    // No media pipeline: the ready state never leaves its initial value
+    // (<https://html.spec.whatwg.org/multipage/media.html#dom-media-readystate>).
+    fn get_ready_state(&self, ctx: &Ctx<'js>) -> Result<u16> {
+        let _ = ctx;
+        Ok(0)
+    }
+}
 
 impl html_embed_element_generated::HTMLEmbedElement<'_> for JsNode {}
 

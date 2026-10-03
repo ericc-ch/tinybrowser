@@ -310,7 +310,7 @@ pub(crate) fn constructor_prototype<'js, T: JsClass<'js>>(
         .ok_or_else(|| Exception::throw_internal(params.ctx(), "native interface has no prototype"))
 }
 
-fn install_constants(target: &Object<'_>, constants: &[Constant]) -> Result<()> {
+pub(crate) fn install_constants(target: &Object<'_>, constants: &[Constant]) -> Result<()> {
     // https://webidl.spec.whatwg.org/#define-the-constants
     for constant in constants {
         target.prop(constant.name, Property::from(constant.value).enumerable())?;
