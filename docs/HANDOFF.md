@@ -1,22 +1,44 @@
-# Handoff (2026-10-02)
+# Handoff (2026-10-03)
 
 Goal: replace implementation-shaped WebIDL with the unchanged, pinned upstream
 contract. Every Rust and JS binding derives names, inheritance, descriptors,
-arity, and conversions from that IDL. Delete the hand-written `Rust*` partial
-declarations and the parallel support lists as each interface migrates. Keep the
-private bridge hardening and the real partial implementations. See
-`docs/bindings.md` for the policy and `AGENTS.md` for the rules.
+arity, and conversions from that IDL. See `docs/bindings.md` for the policy
+and `AGENTS.md` for the rules.
 
-Plan: finish the generator's remaining IDL coverage, port the remaining
-interfaces, then delete the legacy path (`crates/renderer/idl/`, the legacy
-`model.rs`/`emit.rs` halves, `CtxMode`, `RustAlternate`, `RustInstall`) in one
-large commit. Verification is WPT before/after per batch against the previous
-binary.
+State: branch `webidl-bindings`, HEAD `1830376`, working tree clean.
+The migration is COMPLETE:
 
-State: branch `webidl-bindings`, HEAD `7a34075`, working tree clean (only
-`docs/HANDOFF.md` uncommitted as this note is written). `cargo test --workspace`
-and `tools/check` pass (36 suites). No pushes. Draft PR
-https://github.com/ericc-ch/tinybrowser/pull/39 holds earlier work only.
+- All 8 remaining legacy files ported: `EventTarget` (two payloads),
+  `Node` (two payloads), `Element`, `Document`, `Event`,
+  `HTMLOptionsCollection`, `NamedNodeMap`, `ElementReflections` (deleted;
+  members moved to per-element contracts incl. the `HTMLHyperlinkElementUtils`
+  mixin, `HTMLBaseElement`, link/media/embed/script/source/track/meta/map/
+  object/output/param/slot, template).
+- Legacy path deleted in the same line: `crates/renderer/idl/`, the build.rs
+  legacy loop, `compile()`, the `Rust*` annotation parser (~1500 lines of
+  model.rs). Model keeps only data plus constant/callback/enumeration
+  validators. Dead conversions removed (`from_js`, `CtxMode::Owned`,
+  `PropertyHooks::JavaScript`, `GetterMapping::Field`,
+  `ReturnType::NodeList`/`Value`, `legacy_code`).
+- Generator grew: multi-payload dispatch, `[PutForwards]`, `[ReflectURL]`,
+  stringifier attributes, nullable/required/enum/interface/string dictionary
+  members, nullable unions, restricted/unrestricted doubles,
+  `Promise<undefined>`, anonymous indexed setters, inherited hook getters,
+  overload sharing, `[LegacyUnforgeable]`/`[LegacyOverrideBuiltIns]` scopes.
+- Blocker from the old note resolved as designed: the generator allows many
+  payloads per interface; the prototype owner is elected by native class name
+  (`elect`), never file order; each payload carries its own receiver check.
+- `relatedTarget` dropped (belongs to unmodeled `FocusEvent`; every in-scope
+  reader constructs `FocusEvent`).
+
+Verification so far: `cargo test --workspace` + `tools/check` green (36 suites);
+attributes.html 66/1 x8; template-element +202/-0; Playwright 37/37; CDP clean.
+
+Still open: full-suite `--score /` running in background
+(`~/.cache/tinybrowser/logs/full-score.log`, report `full-report.json`);
+then release size (`nix develop --command ./tools/release`), `docs/progress.md`
+snapshot (binary size, total, scored groups only), commit docs. No pushes;
+draft PR https://github.com/ericc-ch/tinybrowser/pull/39 holds earlier work.
 
 ## Generator capabilities
 
