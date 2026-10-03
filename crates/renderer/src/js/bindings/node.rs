@@ -5100,9 +5100,19 @@ impl<'js> html_hyperlink_element_utils_generated::HTMLHyperlinkElementUtils<'js>
 }
 
 impl<'js> html_base_element_generated::HTMLBaseElement<'js> for JsNode {
-    // https://html.spec.whatwg.org/multipage/semantics.html#dom-base-href
+    // Unlike generic URL reflection, an absent `href` falls back to the
+    // document base URL rather than the empty string
+    // (<https://html.spec.whatwg.org/multipage/semantics.html#dom-base-href>).
     fn get_href(&self, ctx: &Ctx<'js>) -> Result<dom::DomString> {
-        host::reflect_url_string(ctx, self.handle.0, "href")
+        let present = world(ctx)?
+            .borrow()
+            .document(self.handle.0)
+            .is_some_and(|parsed| parsed.document.attribute(self.handle.0, "href").is_some());
+        if present {
+            host::reflect_url_string(ctx, self.handle.0, "href")
+        } else {
+            Ok(document_base_url_string(ctx, self.handle.0).into())
+        }
     }
 }
 
