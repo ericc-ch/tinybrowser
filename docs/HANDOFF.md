@@ -1,3 +1,100 @@
+# Handoff (2026-10-04)
+
+Goal: record the merged WebIDL migration and its deferred follow-ups so a
+fresh session can pick them up. See `docs/bindings.md` for the binding policy
+and `AGENTS.md` for the working rules.
+
+Plan: fix each item under Unfinished when its trigger fires (corpus hit or
+failing test), smallest slice first per the WPT fast-loop rule. Nothing there
+blocks normal work on `main`.
+
+State: `main` at `1bd06d1` (merge of PR #39 `webidl-bindings`), working tree
+clean. Verification green at merge: `cargo build`, `cargo clippy -p renderer
+-p webidl-bindgen`, `cargo test -p webidl-bindgen` (19 pass), plus targeted
+WPT singles vs the pre-migration binary (see Done).
+
+Done:
+
+- WebIDL migration merged (`1830376` migration complete through `1bd06d1`
+  merge). Regression-against-`main` verdict over the 2,887-test remote slice
+  (`~/projects/wpt-reports-aadc5d0/slice-report.json`, WPT pin `92054a74`):
+  4 real regressions found, all fixed — `fd5ae1e` (`frame.name`/`src`
+  contract claim, verified 0 frame fails in
+  `html/dom/reflection-obsolete.html`), `f96d530` (FormData reentrancy flag,
+  `form-submission-algorithm.html` back to OK), `4431d6b` (honest media
+  states + constants on interface objects, 72-file media blast clean),
+  `1701594` (base-href fallback, `document-metadata` dir clean).
+- Code-review pass applied (`9eb1b6d`, verified with the checks above plus
+  single-file WPT: `base_href_unspecified.html`, `networkState_initial.html`
+  and frame-element getters diff clean; `resource-selection-remove-src.html`
+  keeps only its known deferred-timing failure). No CodeRabbit review was
+  possible — 465 files exceed its 100-file limit (check passes as skipped);
+  three subagent reviews substituted (see Decisions).
+
+Unfinished (deferred follow-ups, fix when triggered):
+
+- Generator latent bugs, none triggered by the current IDL corpus (verify
+  with `grep` in `crates/webidl-bindgen/idl/` before touching):
+  `collect_reference` drops `NullableUnion` dictionary refs
+  (`crates/webidl-bindgen/src/contracts.rs:750`); nullable-union defaults
+  ignored at emit (`crates/webidl-bindgen/src/emit.rs:1066` vs the
+  `NullableUnion` arm); non-node union members hit `unreachable!`
+  (`crates/webidl-bindgen/src/emit.rs:1705`) — must become a lowering
+  `Error`; `[ReflectSetter]` path skips attribute validation; partial/mixin
+  scope flags dropped for property hooks (`contracts.rs:1014`);
+  signatures compared by arity only (`contracts.rs:1818`, `absorb` at `:94`);
+  range routing over non-contiguous op ids; `expect()` on hook
+  preconditions (`emit.rs:375,465,471`); constructor prototype lookup runs
+  after arg conversion (order-vs-comment question).
+- `scroll_into_view` discards its IDL argument
+  (`crates/renderer/src/js/bindings/node.rs:3629` forwards to the arg-less
+  inherent at `:641`). Pre-existing on `main`, not a regression; needs the
+  boolean-vs-options branch from cssom-view.
+- Element-level `src`/`href`/`name`/`content` shim kept for main-parity
+  (`crates/renderer/src/js/scripts/brands.js`, see comment above
+  `interfaceMembers`). Per spec most elements must not expose them; remove
+  only after per-element contracts cover every declarer (`applet`,
+  `a[name]`).
+- Two resource-selection subtests expect a deferred revert to
+  `NETWORK_EMPTY` at a stable state; the synchronous engine has no later
+  task boundary to model that. Track loading/error events unimplemented
+  (`track-mode` timeout, `src-empty-string` failure) — same as `main`.
+- ~52 `arg_0.to_string()?` → `WebIdlString` rewraps in `node.rs` (alleged
+  IDL-conversion bypass, unproven — needs a failing case before rework).
+
+Next:
+
+1. When new IDL hits a generator latent bug, fix that bug first with a
+   generator unit test, then land the IDL.
+2. When a WPT slice covers `scrollIntoView` options, media stable-state
+   timing, or track events, implement the smallest spec step that flips it.
+3. Before dropping the Element reflection shim, add the missing
+   per-element contracts and diff `html/dom` + `html/semantics` pieces.
+
+Decisions made:
+
+- Merged PR #39 without CodeRabbit (file-limit skip) on the strength of the
+  slice-verified no-regression verdict plus the applied review pass.
+- Plain merge, not squash: per-commit messages carry the decision history.
+- Kept the Element shim and the synchronous media approximation for
+  main-parity; spec-pure behavior waits on the contracts/pipeline above.
+- Subagent reviews treated as hypotheses, not verdicts: ~9 of ~25
+  "must-fix" items were real; two (networkState mapping, WeakSet identity)
+  were refuted against test expectations and wrapper-interning evidence.
+
+Gotchas:
+
+- WPT fast loop is now in `AGENTS.md`: smallest sufficient slice, `retest`
+  for failures, never pipe runs through `tail`, clean orphan `tinybrowser
+  webdriver` processes and `~/.cache/tinybrowser/wpt-*.lock` after kills.
+- Pre-migration baseline binary:
+  `/home/erickc/.cache/tinybrowser/baseline-target/debug/tinybrowser`.
+  Per-piece baselines in `~/.cache/tinybrowser/logs/piece-*.json`.
+- Unless already inside the dev shell, run cargo/runners through
+  `nix develop --command`; `tools/check` handles it for clippy.
+
+---
+
 # Handoff (2026-10-03)
 
 Goal: replace implementation-shaped WebIDL with the unchanged, pinned upstream
