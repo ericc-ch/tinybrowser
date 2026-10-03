@@ -490,7 +490,7 @@ fn reflect_conflicts_and_unsupported_shapes() {
     // like any unimplemented member.
     for text in [
         "[Exposed=Window] interface Group { [Reflect] attribute unsigned long span; };",
-        "[Exposed=Window] interface Group { [CEReactions, ReflectURL] attribute USVString src; };",
+        "[Exposed=Window] interface Group { [CEReactions, ReflectURL] attribute DOMString src; };",
         "[Exposed=Window] interface Group { [Reflect] readonly attribute Element anchor; };",
     ] {
         let idl = [Source {

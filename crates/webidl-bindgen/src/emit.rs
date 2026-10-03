@@ -32,7 +32,7 @@ pub(crate) fn interface(interface: &Interface) -> TokenStream {
     let conversion_import = if interface.attributes.iter().any(|attribute| {
         matches!(
             attribute.mapping,
-            GetterMapping::Field | GetterMapping::Reflect { .. }
+            GetterMapping::Reflect { .. } | GetterMapping::ReflectUrl { .. }
         ) || matches!(
             attribute.return_type,
             ReturnType::String
@@ -705,16 +705,10 @@ fn method_call(interface: &Interface, method: &syn::Ident, arguments: &TokenStre
 
 fn getter_dispatch(id: usize, getter: &Attribute, interface: &Interface) -> TokenStream {
     let method = &getter.rust;
-    // Operation dispatch always hands over an owned `Ctx`; attributes borrow it
-    // unless the interface opts into owned contexts for hand-written getters.
-    let ctx_arg = if interface.ctx_mode.is_owned() {
-        quote! { ctx.clone() }
-    } else {
-        quote! { &ctx }
-    };
+    // Operation dispatch always hands over an owned `Ctx`; attributes borrow it.
+    let ctx_arg = quote! { &ctx };
     let call = method_call(interface, method, &ctx_arg);
     let body = match &getter.mapping {
-        GetterMapping::Field => quote! { receiver.#method.clone().into_js(&ctx) },
         // `[Reflect]`: generated content-attribute access needs no trait
         // method. The receiver check already ran, so `node_id` targets the
         // branded element.
@@ -727,9 +721,14 @@ fn getter_dispatch(id: usize, getter: &Attribute, interface: &Interface) -> Toke
             },
             _ => unreachable!("validated reflect mapping"),
         },
+        GetterMapping::ReflectUrl { content } => {
+            quote! {
+                let result: dom::DomString =
+                    host::reflect_url_string(&ctx, receiver.node_id(), #content)?;
+                result.to_string_lossy().into_js(&ctx)
+            }
+        }
         GetterMapping::Method => match getter.return_type {
-            // `[RustValue]`: the method returns the platform value directly.
-            ReturnType::Value => quote! { #call },
             ReturnType::String => {
                 quote! { let result = #call?; result.into_js(&ctx) }
             }
@@ -771,7 +770,7 @@ fn getter_dispatch(id: usize, getter: &Attribute, interface: &Interface) -> Toke
                 let result: f64 = #call?;
                 result.into_js(&ctx)
             },
-            ReturnType::NullableNode | ReturnType::NodeList | ReturnType::PlatformObject => {
+            ReturnType::NullableNode | ReturnType::PlatformObject => {
                 quote! { #call }
             }
             ReturnType::Union(..) | ReturnType::NullableUnion(..) => {
@@ -858,9 +857,8 @@ fn setter_value_conversion(return_type: &ReturnType, legacy_null_to_empty: bool)
                 converted.0
             }
         },
-        // `[RustValue]`: the platform setter converts the raw argument.
-        // A platform-object setter takes the value as-is, like one.
-        ReturnType::Value | ReturnType::PlatformObject => quote! {
+        // A platform-object setter takes the value as-is.
+        ReturnType::PlatformObject => quote! {
             params.arg(0).unwrap_or_else(|| Value::new_undefined(ctx.clone()))
         },
         ReturnType::Enumeration(name) => {
@@ -872,7 +870,7 @@ fn setter_value_conversion(return_type: &ReturnType, legacy_null_to_empty: bool)
                 }
             }
         }
-        _ => unreachable!("validated string, boolean, integer, double, or value setter"),
+        _ => unreachable!("validated string, boolean, integer, double, or platform-object setter"),
     }
 }
 
@@ -882,13 +880,9 @@ fn setter_dispatch(
 ) -> Option<TokenStream> {
     let setter = attribute.setter.as_ref()?;
     let id = index * 2 + 2;
-    let ctx_arg = if interface.ctx_mode.is_owned() {
-        quote! { ctx.clone() }
-    } else {
-        quote! { &ctx }
-    };
-    let (method, from_js) = match setter {
-        Setter::Method { rust, from_js } => (rust, from_js),
+    let ctx_arg = quote! { &ctx };
+    let method = match setter {
+        Setter::Method { rust } => rust,
         Setter::Reflect { content } => {
             return Some(reflect_setter(index, attribute, content));
         }
@@ -902,17 +896,7 @@ fn setter_dispatch(
             });
         }
     };
-    let convert = if let Some(path) = from_js {
-        // https://webidl.spec.whatwg.org/#es-type-mapping
-        quote! {
-            <super::#path as rquickjs::FromJs>::from_js(
-                &ctx,
-                params.arg(0).unwrap_or_else(|| Value::new_undefined(ctx.clone())),
-            )?
-        }
-    } else {
-        setter_value_conversion(&attribute.return_type, attribute.legacy_null_to_empty)
-    };
+    let convert = setter_value_conversion(&attribute.return_type, attribute.legacy_null_to_empty);
     let call = method_call(interface, method, &quote! { #ctx_arg, value });
     let body = quote! {
         #call?;
@@ -1054,40 +1038,12 @@ fn operation_dispatch(id: usize, operation: &Operation, interface: &Interface) -
     }
 }
 
-/// `[RustFromJs=PATH]`: convert the raw argument with `PATH::from_js`, keeping
-/// the renderer's exact code-unit and pristine-string argument types.
-fn from_js_argument(
-    index: &TokenStream,
-    variable: &proc_macro2::Ident,
-    path: &syn::Path,
-) -> TokenStream {
-    quote! {
-        let value = params.arg(#index).unwrap_or_else(|| Value::new_undefined(ctx.clone()));
-        let #variable: super::#path = rquickjs::FromJs::from_js(&ctx, value)?;
-    }
-}
-
 fn operation_argument(
     index: usize,
     argument: &OperationArgument,
     variable: &proc_macro2::Ident,
 ) -> TokenStream {
     if argument.arity == ArgumentArity::Variadic {
-        if matches!(&argument.type_, ReturnType::Value) && argument.from_js.is_none() {
-            // `[RustValue]` variadics hand the platform method the raw rest
-            // arguments, matching the `(Node or DOMString)...` signatures.
-            return quote! {
-                // https://webidl.spec.whatwg.org/#es-overloads
-                let mut values = Vec::with_capacity(params.len().saturating_sub(#index));
-                for index in #index..params.len() {
-                    values.push(
-                        params.arg(index)
-                            .unwrap_or_else(|| Value::new_undefined(ctx.clone())),
-                    );
-                }
-                let #variable = rquickjs::function::Rest(values);
-            };
-        }
         let conversion =
             operation_argument_at(&quote! { index }, argument, &format_ident!("converted"));
         return quote! {
@@ -1187,10 +1143,6 @@ fn operation_argument_at(
     let fetch = quote! {
         let value = params.arg(#index).unwrap_or_else(|| Value::new_undefined(ctx.clone()));
     };
-    if let Some(path) = &argument.from_js {
-        // https://webidl.spec.whatwg.org/#es-type-mapping
-        return from_js_argument(index, variable, path);
-    }
     match &argument.type_ {
         ReturnType::Node
         | ReturnType::NullableNode
@@ -1253,7 +1205,6 @@ fn operation_argument_at(
         ReturnType::Boolean => boolean_argument(argument, variable, &fetch),
         ReturnType::UnsignedLong => unsigned_long_argument(variable, &fetch),
         ReturnType::Long => long_argument(variable, &fetch),
-        ReturnType::Value => value_argument(index, argument, variable, &fetch),
         ReturnType::Double => quote! {
             #fetch
             // https://webidl.spec.whatwg.org/#es-double
@@ -1288,30 +1239,6 @@ fn long_argument(variable: &proc_macro2::Ident, fetch: &TokenStream) -> TokenStr
         // https://webidl.spec.whatwg.org/#es-long
         let converted: rquickjs::Coerced<i32> = rquickjs::FromJs::from_js(&ctx, value)?;
         let #variable = converted.0;
-    }
-}
-
-fn value_argument(
-    index: &TokenStream,
-    argument: &OperationArgument,
-    variable: &proc_macro2::Ident,
-    fetch: &TokenStream,
-) -> TokenStream {
-    if argument.null_default {
-        quote! {
-            let value = params.arg(#index).unwrap_or_else(|| Value::new_null(ctx.clone()));
-            let value = if value.is_undefined() {
-                Value::new_null(ctx.clone())
-            } else {
-                value
-            };
-            let #variable = value;
-        }
-    } else {
-        quote! {
-            #fetch
-            let #variable = value;
-        }
     }
 }
 
@@ -1870,29 +1797,6 @@ fn union_fallback(union: &Union) -> TokenStream {
     quote! { Err(rquickjs::Exception::throw_type(ctx, "value does not match the union")) }
 }
 
-fn legacy_codes(interface: &Interface) -> TokenStream {
-    let names: Vec<_> = interface
-        .constants
-        .iter()
-        .filter_map(|constant| {
-            let name = constant.legacy_name.as_ref()?;
-            let value = constant.value;
-            Some(quote! { #name => #value, })
-        })
-        .collect();
-    if names.is_empty() {
-        quote! {}
-    } else {
-        quote! {
-            // https://webidl.spec.whatwg.org/#dom-domexception-code
-            pub(super) fn legacy_code(name: &rquickjs::String<'_>) -> rquickjs::Result<u16> {
-                let name = match name.to_string() {
-                    Ok(name) => name,
-                    Err(rquickjs::Error::Utf8(_)) => return Ok(0),
-                    Err(error) => return Err(error),
-                };
-                Ok(match name.as_str() { #(#names)* _ => 0 })
-            }
-        }
-    }
+fn legacy_codes(_interface: &Interface) -> TokenStream {
+    quote! {}
 }

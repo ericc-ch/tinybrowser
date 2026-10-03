@@ -10,7 +10,7 @@ use weedle::types::{IntegerType, NonAnyType, SingleType, Type, UnionMemberType};
 
 use crate::database::Database;
 use crate::model::{
-    self, ArgumentArity, ConstructorArgumentKind, CtxMode, GetterMapping, InterfaceKind,
+    self, ArgumentArity, ConstructorArgumentKind, GetterMapping, InterfaceKind,
     OperationResult, PropertyGetter, PropertyHooks, PrototypeParent, ReturnType,
 };
 use crate::names::snake_case;
@@ -444,10 +444,8 @@ fn lower(
         unions: Vec::new(),
         properties: PropertyHooks::None,
         stringifier: None,
-        value_iterable: false,
         indexed_setter: None,
         install_targets: Vec::new(),
-        ctx_mode: CtxMode::Borrowed,
         contract: None,
     };
     interface.contract = Some(lower_members(
@@ -498,10 +496,8 @@ fn lower_mixin(
         unions: Vec::new(),
         properties: PropertyHooks::None,
         stringifier: None,
-        value_iterable: false,
         indexed_setter: None,
         install_targets: database.includers(&implementation.interface),
-        ctx_mode: CtxMode::Borrowed,
         contract: None,
     };
     if interface.install_targets.is_empty() {
@@ -1276,7 +1272,6 @@ fn lower_argument(
                     legacy_null_to_empty: false,
                     boolean_default: None,
                     union_default: None,
-                    from_js: None,
                 },
                 parameter: quote! { Vec<#element> },
                 arity: ArgumentArity::Variadic,
@@ -1351,7 +1346,6 @@ fn lower_argument(
             legacy_null_to_empty,
             boolean_default,
             union_default,
-            from_js: None,
         },
         parameter,
         arity,
@@ -1462,8 +1456,7 @@ fn operation_result(
             match native_type(database, type_, &mut BTreeSet::new())? {
                 ReturnType::Node
                 | ReturnType::NullableNode
-                | ReturnType::PlatformObject
-                | ReturnType::NodeList => Ok((OperationResult::Object, quote! { Value<'js> })),
+                | ReturnType::PlatformObject => Ok((OperationResult::Object, quote! { Value<'js> })),
                 ReturnType::String => {
                     Ok((OperationResult::String, quote! { rquickjs::String<'js> }))
                 }
@@ -1505,6 +1498,11 @@ fn lower_attribute(
     if let Some(content) = reflect_setter_content(member.attributes.as_ref(), member.identifier.0)
     {
         return lower_reflect_setter_attribute(database, member, &content, implemented);
+    }
+    // `ReflectURL` resolves the content attribute against the document base
+    // on get and reflects plainly on set, fully generated.
+    if let Some(content) = reflect_url_content(member.attributes.as_ref(), member.identifier.0) {
+        return lower_reflect_url_attribute(member, &content, implemented);
     }
     let getter_name = format!("get_{}", snake_case(member.identifier.0));
     let setter_name = format!("set_{}", snake_case(member.identifier.0));
@@ -1548,7 +1546,6 @@ fn lower_attribute(
         // Getter dispatch hands a platform object or its null directly to JS.
         ReturnType::Node
         | ReturnType::NullableNode
-        | ReturnType::NodeList
         | ReturnType::NullableDocumentType => ReturnType::PlatformObject,
         // A getter returns its value without conversion, so a union of
         // platform objects passes through as the value or null.
@@ -1648,7 +1645,6 @@ fn attribute_setter(
         *signature = quote! { #signature fn #setter(&self, ctx: &Ctx<'js>, value: #parameter) -> Result<()>; };
         return Ok(Some(model::Setter::Method {
             rust: setter,
-            from_js: None,
         }));
     }
     Ok(put_forwards.map(|target| model::Setter::PutForwards {
@@ -1672,6 +1668,24 @@ fn put_forwards_target<'a>(attributes: Option<&ExtendedAttributeList<'a>>) -> Op
         }
         _ => None,
     })
+}
+
+/// The content attribute a `[ReflectURL]` member mirrors: the lowercase
+/// IDL name. Parameterized forms stay unsupported.
+fn reflect_url_content(
+    attributes: Option<&ExtendedAttributeList<'_>>,
+    idl_name: &str,
+) -> Option<String> {
+    let attributes = attributes?;
+    for attribute in &attributes.body.list {
+        match attribute {
+            ExtendedAttribute::NoArgs(item) if item.0.0 == "ReflectURL" => {
+                return Some(idl_name.to_ascii_lowercase());
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 /// The content attribute a `[Reflect]` member mirrors: the `Reflect` value
@@ -1739,7 +1753,12 @@ fn lower_reflect_setter_attribute(
     if !implemented.contains_key(&getter_name) {
         return Ok(None);
     }
-    if member.modifier.is_some() {
+    if member.modifier.is_some()
+        && !matches!(
+            member.modifier,
+            Some(weedle::interface::StringifierOrInheritOrStatic::Stringifier(_))
+        )
+    {
         return Err(Error(
             "reflect setter special attributes are not supported yet".into(),
         ));
@@ -1831,7 +1850,12 @@ fn lower_reflect_attribute(
             member.identifier.0
         )));
     }
-    if member.modifier.is_some() {
+    if member.modifier.is_some()
+        && !matches!(
+            member.modifier,
+            Some(weedle::interface::StringifierOrInheritOrStatic::Stringifier(_))
+        )
+    {
         return Ok(None);
     }
     let writable = member.readonly.is_none();
@@ -1883,6 +1907,72 @@ fn lower_reflect_attribute(
     Ok(Some((attribute, quote! {})))
 }
 
+/// Lower a `[ReflectURL]` attribute to generated content-attribute access
+/// with URL resolution. Like `[Reflect]`, the trait carries no method and
+/// the implementation provides none; claiming the name fails the build.
+fn lower_reflect_url_attribute(
+    member: &weedle::interface::AttributeInterfaceMember<'_>,
+    content: &str,
+    implemented: &BTreeMap<String, Method>,
+) -> Result<Option<(model::Attribute, TokenStream)>, Error> {
+    let getter_name = format!("get_{}", snake_case(member.identifier.0));
+    let setter_name = format!("set_{}", snake_case(member.identifier.0));
+    if implemented.contains_key(&getter_name) || implemented.contains_key(&setter_name) {
+        return Err(Error(format!(
+            "{}: reflected attributes are generated, not implemented",
+            member.identifier.0
+        )));
+    }
+    if member.modifier.is_some()
+        && !matches!(
+            member.modifier,
+            Some(weedle::interface::StringifierOrInheritOrStatic::Stringifier(_))
+        )
+    {
+        return Ok(None);
+    }
+    let writable = member.readonly.is_none();
+    validate_argument_attributes(member.type_.attributes.as_ref())?;
+    if has_attribute(member.attributes.as_ref(), "SameObject")
+        || has_attribute(member.attributes.as_ref(), "PutForwards")
+        || has_attribute(member.attributes.as_ref(), "LegacyNullToEmptyString")
+        || has_attribute(member.type_.attributes.as_ref(), "LegacyNullToEmptyString")
+    {
+        return Ok(None);
+    }
+    // URL reflection resolves a string against the document base; only
+    // `USVString` carries it in-tree.
+    let type_ = match &member.type_.type_ {
+        Type::Single(SingleType::NonAny(NonAnyType::USVString(item)))
+            if item.q_mark.is_none() =>
+        {
+            ReturnType::UsvString
+        }
+        _ => return Ok(None),
+    };
+    validate_attribute_attributes(member.attributes.as_ref())?;
+    let getter = format_ident!("{getter_name}");
+    let setter = if writable {
+        Some(model::Setter::Reflect {
+            content: content.into(),
+        })
+    } else {
+        None
+    };
+    let attribute = model::Attribute {
+        name: member.identifier.0.into(),
+        rust: getter,
+        return_type: type_,
+        mapping: GetterMapping::ReflectUrl {
+            content: content.into(),
+        },
+        setter,
+        legacy_null_to_empty: false,
+        reactions: has_attribute(member.attributes.as_ref(), "CEReactions"),
+    };
+    Ok(Some((attribute, quote! {})))
+}
+
 /// The Rust parameter type for one lowered attribute setter, mirroring
 /// `emit`'s setter conversions.
 fn setter_parameter(type_: &ReturnType) -> Result<TokenStream, Error> {
@@ -1895,8 +1985,8 @@ fn setter_parameter(type_: &ReturnType) -> Result<TokenStream, Error> {
         ReturnType::NullableUnsignedLong => quote! { Option<u32> },
         ReturnType::Double | ReturnType::RestrictedDouble => quote! { f64 },
         // A platform-object setter takes the value as-is; the method owns
-        // the conversion, mirroring `[RustValue]` arguments.
-        ReturnType::Value | ReturnType::PlatformObject => quote! { Value<'js> },
+        // the conversion.
+        ReturnType::PlatformObject => quote! { Value<'js> },
         ReturnType::Enumeration(name) => {
             let name = format_ident!("{name}");
             quote! { #name }
@@ -2447,6 +2537,7 @@ fn validate_attribute_attributes(
                             | "LegacyUnforgeable"
                             | "Reflect"
                             | "ReflectSetter"
+                            | "ReflectURL"
                     ) => {}
                 // `[PutForwards]` lowers to a generated forwarding setter.
                 // `[LegacyUnforgeable]` shapes the instance property in the

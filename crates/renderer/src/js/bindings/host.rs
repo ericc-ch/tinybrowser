@@ -403,6 +403,31 @@ pub(crate) fn nullable_node_argument<'js>(
     }
 }
 
+/// A URL-reflected content attribute: absent reflects as the empty string,
+/// otherwise the value resolves against the document base URL and
+/// serializes, falling back to the raw value when parsing fails
+/// (<https://html.spec.whatwg.org/multipage/urls-and-fetching.html#reflecting-content-attributes-in-idl-attributes>).
+pub(crate) fn reflect_url_string(
+    ctx: &Ctx<'_>,
+    id: dom::NodeId,
+    content: &str,
+) -> Result<dom::DomString> {
+    let world_rc = world(ctx)?;
+    let raw = world_rc
+        .borrow()
+        .document(id)
+        .and_then(|parsed| parsed.document.attribute(id, content));
+    let Some(raw) = raw else {
+        return Ok(dom::DomString::default());
+    };
+    let base = super::document::document_base_url_string(ctx, id);
+    Ok(url::Url::parse(&base)
+        .ok()
+        .and_then(|base| base.join(&raw).ok())
+        .map_or(raw, |url| url.to_string())
+        .into())
+}
+
 /// Whether `kind` is an HTML element with the given local name.
 fn html_local(kind: Option<&dom::NodeKind>, local: &str) -> bool {
     matches!(
@@ -489,6 +514,11 @@ fn node_interface_matches(kind: Option<&dom::NodeKind>, interface: &str) -> Opti
         ),
         // Shared element-level reflections accept any element.
         "ElementReflections" => matches!(kind, Some(dom::NodeKind::Element { .. })),
+        // Per-element contracts check the element's local name. The hyperlink
+        // mixin is included by the anchor and area interfaces.
+        "HTMLHyperlinkElementUtils" => {
+            html_local(kind, "a") || html_local(kind, "area")
+        }
         // HTML element interfaces check the element's local name.
         "HTMLFormElement" => html_local(kind, "form"),
         "HTMLInputElement" => html_local(kind, "input"),
@@ -500,6 +530,20 @@ fn node_interface_matches(kind: Option<&dom::NodeKind>, interface: &str) -> Opti
         "HTMLOptGroupElement" => html_local(kind, "optgroup"),
         "HTMLIFrameElement" => html_local(kind, "iframe"),
         "HTMLImageElement" => html_local(kind, "img"),
+        "HTMLBaseElement" => html_local(kind, "base"),
+        "HTMLLinkElement" => html_local(kind, "link"),
+        "HTMLMediaElement" => html_local(kind, "audio") || html_local(kind, "video"),
+        "HTMLEmbedElement" => html_local(kind, "embed"),
+        "HTMLScriptElement" => html_local(kind, "script"),
+        "HTMLSourceElement" => html_local(kind, "source"),
+        "HTMLTrackElement" => html_local(kind, "track"),
+        "HTMLMetaElement" => html_local(kind, "meta"),
+        "HTMLMapElement" => html_local(kind, "map"),
+        "HTMLObjectElement" => html_local(kind, "object"),
+        "HTMLOutputElement" => html_local(kind, "output"),
+        "HTMLParamElement" => html_local(kind, "param"),
+        "HTMLSlotElement" => html_local(kind, "slot"),
+        "HTMLTemplateElement" => html_local(kind, "template"),
         _ => return None,
     })
 }

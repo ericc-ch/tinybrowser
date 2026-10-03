@@ -12,7 +12,7 @@ use super::{
     descendant_text, doctype_fields, document_base_url_string, document_is_html,
     document_is_html_content, document_url_string, dom_string, element_at_point, element_box,
     element_click, element_node_name, element_sibling_value, elements_by_tag, find_element_by_id,
-    fixup_focus_after_removal, focus_node, host_node_id, import_snapshot, is_element, is_focusable,
+    fixup_focus_after_removal, focus_node, host, host_node_id, import_snapshot, is_element, is_focusable,
     is_html_element, is_main_document, is_template_element, live_collection, locate_namespace,
     locate_prefix, main_document, make_weak, materialize_children, materialize_import,
     new_detached_attr, nodes_equal, qualified_name, rect_object,
@@ -58,7 +58,21 @@ include!(concat!(env!("OUT_DIR"), "/HTMLFieldSetElement.rs"));
 include!(concat!(env!("OUT_DIR"), "/HTMLOptGroupElement.rs"));
 include!(concat!(env!("OUT_DIR"), "/HTMLIFrameElement.rs"));
 include!(concat!(env!("OUT_DIR"), "/HTMLImageElement.rs"));
-include!(concat!(env!("OUT_DIR"), "/ElementReflections.rs"));
+include!(concat!(env!("OUT_DIR"), "/HTMLHyperlinkElementUtils.rs"));
+include!(concat!(env!("OUT_DIR"), "/HTMLBaseElement.rs"));
+include!(concat!(env!("OUT_DIR"), "/HTMLLinkElement.rs"));
+include!(concat!(env!("OUT_DIR"), "/HTMLMediaElement.rs"));
+include!(concat!(env!("OUT_DIR"), "/HTMLEmbedElement.rs"));
+include!(concat!(env!("OUT_DIR"), "/HTMLScriptElement.rs"));
+include!(concat!(env!("OUT_DIR"), "/HTMLSourceElement.rs"));
+include!(concat!(env!("OUT_DIR"), "/HTMLTrackElement.rs"));
+include!(concat!(env!("OUT_DIR"), "/HTMLMetaElement.rs"));
+include!(concat!(env!("OUT_DIR"), "/HTMLMapElement.rs"));
+include!(concat!(env!("OUT_DIR"), "/HTMLObjectElement.rs"));
+include!(concat!(env!("OUT_DIR"), "/HTMLOutputElement.rs"));
+include!(concat!(env!("OUT_DIR"), "/HTMLParamElement.rs"));
+include!(concat!(env!("OUT_DIR"), "/HTMLSlotElement.rs"));
+include!(concat!(env!("OUT_DIR"), "/HTMLTemplateElement.rs"));
 
 pub(super) fn install(ctx: &Ctx<'_>) -> Result<()> {
     node_generated::install(ctx)?;
@@ -86,7 +100,21 @@ pub(super) fn install(ctx: &Ctx<'_>) -> Result<()> {
     html_opt_group_element_generated::install(ctx)?;
     htmli_frame_element_generated::install(ctx)?;
     html_image_element_generated::install(ctx)?;
-    element_reflections_generated::install(ctx)
+    html_hyperlink_element_utils_generated::install(ctx)?;
+    html_base_element_generated::install(ctx)?;
+    html_link_element_generated::install(ctx)?;
+    html_media_element_generated::install(ctx)?;
+    html_embed_element_generated::install(ctx)?;
+    html_script_element_generated::install(ctx)?;
+    html_source_element_generated::install(ctx)?;
+    html_track_element_generated::install(ctx)?;
+    html_meta_element_generated::install(ctx)?;
+    html_map_element_generated::install(ctx)?;
+    html_object_element_generated::install(ctx)?;
+    html_output_element_generated::install(ctx)?;
+    html_param_element_generated::install(ctx)?;
+    html_slot_element_generated::install(ctx)?;
+    html_template_element_generated::install(ctx)
 }
 
 fn insertion_tree_nodes(
@@ -1722,31 +1750,6 @@ impl JsNode {
         )
     }
 
-    /// URL-reflected `src`: parsed against the document base and stored
-    /// serialized, like `href`; an absent attribute reflects as the empty
-    /// string (<https://html.spec.whatwg.org/multipage/urls-and-fetching.html#reflecting-content-attributes-in-idl-attributes>).
-    #[qjs(skip)]
-    fn src(&self, ctx: Ctx<'_>) -> Result<String> {
-        let world_rc = world(&ctx)?;
-        let raw = world_rc
-            .borrow()
-            .document(self.handle.0)
-            .and_then(|parsed| parsed.document.attribute(self.handle.0, "src"));
-        let Some(raw) = raw else {
-            return Ok(String::new());
-        };
-        let base = document_base_url_string(&ctx, self.handle.0);
-        Ok(url::Url::parse(&base)
-            .ok()
-            .and_then(|base| base.join(&raw).ok())
-            .map_or(raw, |url| url.to_string()))
-    }
-
-    #[qjs(skip)]
-    fn set_src(&self, ctx: Ctx<'_>, value: WebIdlString) -> Result<()> {
-        self.set_attribute(ctx, WebIdlString("src".into()), value)
-    }
-
     // https://html.spec.whatwg.org/multipage/embedded-content.html#dom-img-naturalwidth
     #[qjs(skip)]
     fn natural_width(&self, ctx: Ctx<'_>) -> Result<u32> {
@@ -1836,52 +1839,6 @@ impl JsNode {
             }
             None => Ok(Value::new_null(ctx)),
         }
-    }
-
-    #[qjs(skip)]
-    fn name(&self, ctx: Ctx<'_>) -> Result<String> {
-        let world = world(&ctx)?;
-        let world = world.borrow();
-        let Some(parsed) = world.document(self.handle.0) else {
-            return Ok(String::new());
-        };
-        Ok(parsed
-            .document
-            .attribute(self.handle.0, "name")
-            .unwrap_or_default())
-    }
-
-    #[qjs(skip)]
-    fn set_name(&self, ctx: Ctx<'_>, value: WebIdlString) -> Result<()> {
-        self.set_attribute(ctx, WebIdlString("name".into()), value)
-    }
-
-    #[qjs(skip)]
-    fn content<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
-        let world = world(&ctx)?;
-        let template_contents = {
-            let world = world.borrow();
-            world.document(self.handle.0).and_then(|parsed| {
-                is_template_element(parsed.document.kind(self.handle.0))
-                    .then(|| dom::shadow::template_contents(&parsed.document, self.handle.0))
-                    .flatten()
-            })
-        };
-        if let Some(contents) = template_contents {
-            return wrap_node(&ctx, contents);
-        }
-
-        let value = world
-            .borrow()
-            .document(self.handle.0)
-            .and_then(|parsed| parsed.document.attribute(self.handle.0, "content"))
-            .unwrap_or_default();
-        Ok(Value::from_string(rquickjs::String::from_str(ctx, &value)?))
-    }
-
-    #[qjs(skip)]
-    fn set_content(&self, ctx: Ctx<'_>, value: WebIdlString) -> Result<()> {
-        self.set_attribute(ctx, WebIdlString("content".into()), value)
     }
 
     // https://dom.spec.whatwg.org/#dom-element-attachshadow
@@ -2191,30 +2148,6 @@ impl JsNode {
         drop(parsed);
         drop(world);
         schedule_mutation_delivery(ctx)
-    }
-
-    /// URL-reflected `href`: parsed against the document base and stored
-    /// serialized (percent-encoded).
-    #[qjs(skip)]
-    fn href(&self, ctx: Ctx<'_>) -> Result<String> {
-        let world_rc = world(&ctx)?;
-        let raw = world_rc
-            .borrow()
-            .document(self.handle.0)
-            .and_then(|parsed| parsed.document.attribute(self.handle.0, "href"))
-            .unwrap_or_default();
-        let base = document_base_url_string(&ctx, self.handle.0);
-        Ok(url::Url::parse(&base)
-            .ok()
-            .and_then(|base| base.join(&raw).ok())
-            .map_or(raw, |url| url.to_string()))
-    }
-
-    #[qjs(skip)]
-    fn set_href(&self, ctx: Ctx<'_>, value: WebIdlString) -> Result<()> {
-        // URL reflection stores the given value; resolution happens on get
-        // (<https://html.spec.whatwg.org/multipage/urls-and-fetching.html#reflecting-content-attributes-in-idl-attributes>).
-        self.set_attribute(ctx, WebIdlString("href".into()), value)
     }
 
     #[qjs(skip)]
@@ -5138,6 +5071,64 @@ impl<'js> html_image_element_generated::HTMLImageElement<'js> for JsNode {
     // https://html.spec.whatwg.org/multipage/embedded-content.html#dom-img-currentsrc
     fn get_current_src(&self, ctx: &Ctx<'js>) -> Result<dom::DomString> {
         Ok(self.current_src(ctx.clone())?.into())
+    }
+}
+
+/// `HTMLHyperlinkElementUtils` is a spec mixin included by `HTMLAnchorElement`
+/// and `HTMLAreaElement`, so the one contract installs on both prototypes
+/// from the IDL includes
+/// (<https://html.spec.whatwg.org/multipage/links.html#htmlhyperlinked>).
+impl<'js> html_hyperlink_element_utils_generated::HTMLHyperlinkElementUtils<'js> for JsNode {
+    // https://html.spec.whatwg.org/multipage/links.html#dom-hyperlink-href
+    fn get_href(&self, ctx: &Ctx<'js>) -> Result<dom::DomString> {
+        host::reflect_url_string(ctx, self.handle.0, "href")
+    }
+}
+
+impl<'js> html_base_element_generated::HTMLBaseElement<'js> for JsNode {
+    // https://html.spec.whatwg.org/multipage/semantics.html#dom-base-href
+    fn get_href(&self, ctx: &Ctx<'js>) -> Result<dom::DomString> {
+        host::reflect_url_string(ctx, self.handle.0, "href")
+    }
+}
+
+impl html_link_element_generated::HTMLLinkElement<'_> for JsNode {}
+
+impl html_media_element_generated::HTMLMediaElement<'_> for JsNode {}
+
+impl html_embed_element_generated::HTMLEmbedElement<'_> for JsNode {}
+
+impl html_script_element_generated::HTMLScriptElement<'_> for JsNode {}
+
+impl html_source_element_generated::HTMLSourceElement<'_> for JsNode {}
+
+impl html_track_element_generated::HTMLTrackElement<'_> for JsNode {}
+
+impl html_meta_element_generated::HTMLMetaElement<'_> for JsNode {}
+
+impl html_map_element_generated::HTMLMapElement<'_> for JsNode {}
+
+impl html_object_element_generated::HTMLObjectElement<'_> for JsNode {}
+
+impl html_output_element_generated::HTMLOutputElement<'_> for JsNode {}
+
+impl html_param_element_generated::HTMLParamElement<'_> for JsNode {}
+
+impl html_slot_element_generated::HTMLSlotElement<'_> for JsNode {}
+
+impl<'js> html_template_element_generated::HTMLTemplateElement<'js> for JsNode {
+    // https://html.spec.whatwg.org/multipage/scripting.html#dom-template-contents
+    fn get_content(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
+        let world = world(ctx)?;
+        let contents = {
+            let world = world.borrow();
+            world.document(self.handle.0).and_then(|parsed| {
+                is_template_element(parsed.document.kind(self.handle.0))
+                    .then(|| dom::shadow::template_contents(&parsed.document, self.handle.0))
+                    .flatten()
+            })
+        };
+        child_value(ctx, contents)
     }
 }
 

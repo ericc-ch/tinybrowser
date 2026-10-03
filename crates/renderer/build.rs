@@ -162,44 +162,13 @@ fn generate_bindings() -> Contracts {
         .collect();
     let bindings = webidl_bindgen::compile_contracts(&extracts, &implementations)
         .unwrap_or_else(|error| panic!("upstream IDL contracts: {error}"));
-    let mut contract_interfaces = HashSet::new();
     for binding in bindings {
-        contract_interfaces.insert(binding.interface.clone());
         contracts.providers.insert(binding.interface.clone());
         fs::write(
             out.join(&binding.interface).with_extension("rs"),
             binding.rust,
         )
         .expect("write generated contract");
-    }
-    let idl = root.join("idl");
-    println!("cargo:rerun-if-changed={}", idl.display());
-    let mut inputs: Vec<_> = fs::read_dir(&idl)
-        .expect("read native IDL directory")
-        .map(|entry| entry.expect("read native IDL entry").path())
-        .collect();
-    inputs.sort();
-    for input in inputs {
-        assert!(
-            input
-                .extension()
-                .is_some_and(|extension| extension == "webidl"),
-            "unexpected IDL input: {}",
-            input.display()
-        );
-        let source = fs::read_to_string(&input).expect("read native IDL");
-        let generated = webidl_bindgen::compile(&source)
-            .unwrap_or_else(|error| panic!("{}: {error}", input.display()));
-        let name = input.file_stem().expect("native IDL file name");
-        contracts
-            .providers
-            .insert(name.to_string_lossy().into_owned());
-        assert!(
-            !contract_interfaces.contains(name.to_string_lossy().as_ref()),
-            "interface has both legacy and upstream bindings: {}",
-            name.to_string_lossy()
-        );
-        fs::write(out.join(name).with_extension("rs"), generated).expect("write generated binding");
     }
     contracts
 }
