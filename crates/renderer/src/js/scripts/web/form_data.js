@@ -3,6 +3,13 @@
 (function() {
   const lists = host.slots();
 
+  // Forms whose entry list is under construction. A reentrant
+  // `new FormData(form)` while the flag is set returns an empty list
+  // without firing `formdata`, so a `formdata` handler that submits the
+  // form cannot recurse
+  // (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#constructing-the-form-data-set>).
+  const constructingEntryList = new WeakSet();
+
   function FormData(form, submitter) {
     if (!(this instanceof FormData)) {
       throw new TypeError('Class constructor FormData cannot be invoked without new');
@@ -10,17 +17,23 @@
     const list = [];
     lists.set(this, list);
     if (form !== undefined && form !== null) {
-      const flat = host.__tbFormEntries(
-        form, submitter === undefined || submitter === null ? null : submitter);
-      for (let index = 0; index + 1 < flat.length; index += 2) {
-        __tbArray.push(list, [String(flat[index]), flat[index + 1]]);
-      }
-      // Constructing the entry list fires `formdata`, whose handler may extend
-      // the list (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#constructing-form-data-set>).
-      if (typeof globalThis.FormDataEvent === 'function') {
-        form.dispatchEvent(new globalThis.FormDataEvent('formdata', {
-          formData: this, bubbles: true, cancelable: false,
-        }));
+      if (constructingEntryList.has(form)) return;
+      constructingEntryList.add(form);
+      try {
+        const flat = host.__tbFormEntries(
+          form, submitter === undefined || submitter === null ? null : submitter);
+        for (let index = 0; index + 1 < flat.length; index += 2) {
+          __tbArray.push(list, [String(flat[index]), flat[index + 1]]);
+        }
+        // Constructing the entry list fires `formdata`, whose handler may extend
+        // the list (<https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#constructing-form-data-set>).
+        if (typeof globalThis.FormDataEvent === 'function') {
+          form.dispatchEvent(new globalThis.FormDataEvent('formdata', {
+            formData: this, bubbles: true, cancelable: false,
+          }));
+        }
+      } finally {
+        constructingEntryList.delete(form);
       }
     }
   }
