@@ -32,7 +32,11 @@ Do not test spec conformance in cargo tests. Never add, keep, or "fix" a cargo t
     `[patch.crates-io]` path entries. It is its own workspace, excluded from
     the tinybrowser workspace, so its lint config stays separate.
   - Pull upstream inside the submodule, push the fork branch there, then bump
-    the submodule pointer in tinybrowser. Fresh clones and worktrees need
+    the submodule pointer in tinybrowser. Push before pinning: a pointer to
+    an unpushed commit breaks every other checkout at init time (`not our
+    ref`). Confirm the commit is on the remote with
+    `git ls-remote origin <sha>` inside the submodule before recording it.
+    Fresh clones and worktrees need
     `git submodule update --init --recursive`.
 
 - Use pinned upstream WebIDL extracts as the interface contract. Implementations
