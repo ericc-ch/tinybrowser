@@ -21,10 +21,8 @@ research.
 
 ## Binding and JS size
 
-One `JsNode` plus JS brands. Not a native class per `HTML*Element`. Host
-objects and spec algorithms that touch the node tree or Event state are a
-Rust binding. Web IDL sugar stays JS. That split is the size and perf lever
-for DOM glue. Avoid hundreds of rquickjs classes.
+Sharing the `JsNode` payload avoids hundreds of rquickjs classes. For Web API
+changes, follow the JS/Rust ownership rules in [Web API bindings](../bindings.md#rust-binding-vs-js).
 
 Intl: option reads are JS (`INSTALL_INTL_JS`, about 31KB). Format is a Rust
 binding. The locale-filtered ICU4X blob is 125,426 bytes (`en-US`, `es-ES`,

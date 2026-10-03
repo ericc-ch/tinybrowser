@@ -1,19 +1,17 @@
 // https://html.spec.whatwg.org/multipage/web-messaging.html#messageevent
-const __tbMessageEventData = Symbol.for('tinybrowser.messageevent.data');
-globalThis.MessageEvent = class MessageEvent extends Event {
+const __tbMessageEventData = host.slots('tinybrowser.messageevent.data');
+const __tbMessageEventConstructor = globalThis.MessageEvent = class MessageEvent extends Event {
   constructor(type, init) {
     const eventInit = init === undefined ? {} : Object(init);
-    super(String(type), eventInit);
-    Object.defineProperty(this, __tbMessageEventData, {
-      value: {
+    const event = __tbConstruct(__tbEventConstructor, [String(type), eventInit], new.target);
+    __tbMessageEventData.set(event, {
         data: Object.prototype.hasOwnProperty.call(eventInit, 'data') ? eventInit.data : null,
         origin: eventInit.origin === undefined ? '' : String(eventInit.origin),
         lastEventId: eventInit.lastEventId === undefined ? '' : String(eventInit.lastEventId),
         source: eventInit.source === undefined ? null : eventInit.source,
         ports: eventInit.ports === undefined ? Object.freeze([]) : Object.freeze(Array.from(eventInit.ports)),
-      },
-      writable: false, enumerable: false, configurable: false,
     });
+    return event;
   }
   get data() { return __tbBrand(this, __tbMessageEventData).data; }
   get origin() { return __tbBrand(this, __tbMessageEventData).origin; }
@@ -29,10 +27,11 @@ Object.defineProperty(globalThis.MessageEvent.prototype, Symbol.toStringTag, { v
 // Rust carries payloads between frames, owns the frame tree, and owns the
 // channel endpoints, so a port survives being transferred to another realm.
 const __tbPayloadVersion = 'tb1:';
-const __tbPlatform = Symbol.for('tinybrowser.platform');
-const __tbWindowProxyData = Symbol.for('tinybrowser.windowproxy.data');
-const __tbPortData = Symbol.for('tinybrowser.messageport.data');
-const __tbFrameId = globalThis.__tb_frameId;
+const __tbPlatform = host.slots('tinybrowser.platform');
+const __tbWindowData = host.slots('tinybrowser.window.data');
+const __tbPortData = host.slots('tinybrowser.messageport.data');
+const __tbFrameId = host.__tb_frameId;
+__tbWindowData.set(globalThis, { frame: __tbFrameId });
 const __tbFrameProxies = Object.create(null);
 // Writes made through a proxy whose target realm does not exist yet: a
 // browsing context registered inside a script gets its realm at the next
@@ -42,16 +41,16 @@ const __tbFramePendingSets = Object.create(null);
 const __tbFramePending = frame => {
   let pending = __tbFramePendingSets[frame];
   if (pending === undefined) {
-    pending = Object.create(null);
+    pending = __tbObjectCreate(null);
     __tbFramePendingSets[frame] = pending;
   }
   return pending;
 };
-globalThis.__tbFlushFrameSets = function(frame) {
+host.__tbFlushFrameSets = function(frame) {
   const pending = __tbFramePendingSets[frame];
   if (pending === undefined) return;
   delete __tbFramePendingSets[frame];
-  const target = __tbFrameGlobal(frame);
+  const target = host.__tbFrameGlobal(frame);
   if (target == null) return;
   for (const key of Reflect.ownKeys(pending)) {
     if (key === '__proto__' || typeof key === 'symbol') {
@@ -137,8 +136,8 @@ const __tbEncode = (value, transfer, sourcePort) => {
   // graph serializes, because transferring has side effects and
   // StructuredSerializeInternal must be able to throw first
   // (<https://html.spec.whatwg.org/multipage/structured-data.html#structuredserializewithtransfer>).
-  const buffers = new Map();     // ArrayBuffer -> node slot, or -1 once listed
-  const transferred = new Map(); // MessagePort -> endpoint id
+  const buffers = new __tbPrivateMap();     // ArrayBuffer -> node slot, or -1 once listed
+  const transferred = new __tbPrivateMap(); // MessagePort -> endpoint id
   for (const item of __tbTransferList(transfer)) {
     if (item instanceof ArrayBuffer) {
       if (buffers.has(item)) throw new globalThis.DOMException('Transfer list contains duplicate buffers', 'DataCloneError');
@@ -154,11 +153,12 @@ const __tbEncode = (value, transfer, sourcePort) => {
       throw new globalThis.DOMException('Value not transferable', 'DataCloneError');
     }
   }
-  const nodes = [];
-  const seen = new Map();
+  const nodes = __tbPrivateArray();
+  const seen = new __tbPrivateMap();
   const slot = descriptor => {
+    if (descriptor !== null) __tbSetPrototypeOf(descriptor, null);
     const index = nodes.length;
-    nodes.push(descriptor);
+    __tbArray.push(nodes, descriptor);
     return index;
   };
   const encode = input => {
@@ -173,7 +173,7 @@ const __tbEncode = (value, transfer, sourcePort) => {
     if (seen.has(input)) return seen.get(input);
     // Window proxies are never serializable
     // (<https://html.spec.whatwg.org/multipage/structured-data.html#structuredserializeinternal>).
-    if (input[__tbWindowProxyData] !== undefined) throw __tbCloneFailure();
+    if (__tbWindowData.get(input) !== undefined) throw __tbCloneFailure();
     if (transferred.has(input)) {
       const index = slot(['port', transferred.get(input)]);
       seen.set(input, index);
@@ -186,12 +186,12 @@ const __tbEncode = (value, transfer, sourcePort) => {
       buffers.set(input, index);
       return index;
     }
-    if (input[__tbBlobData] !== undefined) {
-      const blob = input[__tbBlobData];
-      const bytes = __tbBase64Encode(new Uint8Array(blob.bytes));
+    if (__tbBlobData.get(input) !== undefined) {
+      const blob = __tbBlobData.get(input);
+       const bytes = __tbBase64Encode(blob.bytes);
       let descriptor;
-      if (input[__tbFileData] !== undefined) {
-        const file = input[__tbFileData];
+      if (__tbFileData.get(input) !== undefined) {
+        const file = __tbFileData.get(input);
         descriptor = ['file', file.name, file.lastModified, blob.type, bytes];
       } else {
         descriptor = ['blob', blob.type, bytes];
@@ -233,7 +233,10 @@ const __tbEncode = (value, transfer, sourcePort) => {
       return slot(['domexception', String(input.name), String(input.message)]);
     }
     // Platform objects (nodes, events, ports, ...) are not serializable.
-    if (input[__tbPlatform] !== undefined || input[__tbPortData] !== undefined) throw __tbCloneFailure();
+    if (__tbPortData.has(input)) throw __tbCloneFailure();
+    for (let object = input; object !== null; object = Object.getPrototypeOf(object)) {
+      if (__tbPlatform.has(object)) throw __tbCloneFailure();
+    }
     // Objects with internal slots the serializer cannot reproduce must fail,
     // not silently clone as plain objects
     // (<https://html.spec.whatwg.org/multipage/structured-data.html#structuredserializeinternal>).
@@ -243,7 +246,7 @@ const __tbEncode = (value, transfer, sourcePort) => {
     if (__tbIsError(input)) {
       const index = slot(null);
       seen.set(input, index);
-      nodes[index] = ['error', String(input.name), String(input.message)];
+      nodes[index] = __tbSetPrototypeOf(['error', String(input.name), String(input.message)], null);
       return index;
     }
     if (__tbIsBoxedBoolean(input)) return slot(['boxed', 'Boolean', input.valueOf()]);
@@ -252,25 +255,25 @@ const __tbEncode = (value, transfer, sourcePort) => {
     if (__tbIsMap(input)) {
       const index = slot(null);
       seen.set(input, index);
-      const entries = [];
-      for (const [key, entry] of input) entries.push([encode(key), encode(entry)]);
-      nodes[index] = ['map', entries];
+      const entries = __tbPrivateArray();
+      for (const [key, entry] of input) __tbArray.push(entries, __tbSetPrototypeOf([encode(key), encode(entry)], null));
+      nodes[index] = __tbSetPrototypeOf(['map', entries], null);
       return index;
     }
     if (__tbIsSet(input)) {
       const index = slot(null);
       seen.set(input, index);
-      const entries = [];
-      for (const entry of input) entries.push(encode(entry));
-      nodes[index] = ['set', entries];
+      const entries = __tbPrivateArray();
+      for (const entry of input) __tbArray.push(entries, encode(entry));
+      nodes[index] = __tbSetPrototypeOf(['set', entries], null);
       return index;
     }
     if (Array.isArray(input)) {
       const index = slot(null);
       seen.set(input, index);
-      const items = [];
-      for (let item = 0; item < input.length; item++) items.push(encode(input[item]));
-      nodes[index] = ['array', items];
+      const items = __tbPrivateArray();
+      for (let item = 0; item < input.length; item++) __tbArray.push(items, encode(input[item]));
+      nodes[index] = __tbSetPrototypeOf(['array', items], null);
       return index;
     }
     // Anything else clones as an object with its own enumerable properties,
@@ -278,9 +281,9 @@ const __tbEncode = (value, transfer, sourcePort) => {
     // (<https://html.spec.whatwg.org/multipage/structured-data.html#structuredserializeinternal>).
     const index = slot(null);
     seen.set(input, index);
-    const entries = [];
-    for (const key of Object.keys(input)) entries.push([key, encode(input[key])]);
-    nodes[index] = ['object', entries];
+    const entries = __tbPrivateArray();
+    for (const key of Object.keys(input)) __tbArray.push(entries, __tbSetPrototypeOf([key, encode(input[key])], null));
+    nodes[index] = __tbSetPrototypeOf(['object', entries], null);
     return index;
   };
   const root = encode(value);
@@ -294,18 +297,18 @@ const __tbEncode = (value, transfer, sourcePort) => {
       throw new globalThis.DOMException('The buffer is already detached', 'DataCloneError');
     }
     if (index !== -1) {
-      nodes[index] = ['buffer', __tbBase64Encode(new Uint8Array(moved))];
+      nodes[index] = __tbSetPrototypeOf(['buffer', __tbBase64Encode(new __tbUint8Array(moved))], null);
     }
   }
-  const ports = [];
+  const ports = __tbPrivateArray();
   for (const [port, id] of transferred) {
-    if (!__tbPortDetach(id)) throw new globalThis.DOMException('Cannot transfer a detached MessagePort', 'DataCloneError');
+    if (!host.__tbPortDetach(id)) throw new globalThis.DOMException('Cannot transfer a detached MessagePort', 'DataCloneError');
     __tbBrand(port, __tbPortData).closed = true;
     // The received port is a new object; the sender's is detached.
     delete __tbPorts[id];
-    ports.push(id);
+    __tbArray.push(ports, id);
   }
-  return { payload: __tbPayloadVersion + JSON.stringify({ root: root, nodes: nodes }), ports: ports };
+  return { __proto__: null, payload: __tbPayloadVersion + __tbJsonStringify({ __proto__: null, root, nodes }), ports };
 };
 
 // Deserializes a payload in this realm; `ports` maps transferred endpoint ids
@@ -313,9 +316,10 @@ const __tbEncode = (value, transfer, sourcePort) => {
 const __tbDecode = (payload, ports) => {
   const text = String(payload);
   if (text.indexOf(__tbPayloadVersion) !== 0) throw new Error('structured clone payload mismatch');
-  const wire = JSON.parse(text.slice(__tbPayloadVersion.length));
+  const wire = __tbJsonParse(text.slice(__tbPayloadVersion.length));
   const nodes = wire.nodes;
-  const values = new Array(nodes.length);
+  const values = __tbPrivateArray();
+  values.length = nodes.length;
   for (let index = 0; index < nodes.length; index++) {
     switch (nodes[index][0]) {
       case 'buffer': values[index] = __tbBase64Bytes(nodes[index][1]).buffer; break;
@@ -374,11 +378,15 @@ const __tbDecode = (payload, ports) => {
     switch (descriptor[0]) {
       case 'object': {
         const target = values[index];
-        for (const [key, slot] of descriptor[1]) {
+        const entries = descriptor[1];
+        for (let entry = 0; entry < entries.length; entry++) {
+          const key = entries[entry][0];
+          const slot = entries[entry][1];
           // `CreateDataProperty`, not `Set`: a `__proto__` key must become an
           // own property instead of walking the prototype setter
           // (<https://html.spec.whatwg.org/multipage/structured-data.html#structureddeserialize>).
-          Object.defineProperty(target, key, {
+          __tbDefineProperty(target, key, {
+            __proto__: null,
             value: values[slot], writable: true, enumerable: true, configurable: true,
           });
         }
@@ -391,12 +399,13 @@ const __tbDecode = (payload, ports) => {
       }
       case 'map': {
         const target = values[index];
-        for (const [key, entry] of descriptor[1]) target.set(values[key], values[entry]);
+        const entries = descriptor[1];
+        for (let entry = 0; entry < entries.length; entry++) target.set(values[entries[entry][0]], values[entries[entry][1]]);
         break;
       }
       case 'set': {
         const target = values[index];
-        for (const slot of descriptor[1]) target.add(values[slot]);
+        for (let entry = 0; entry < descriptor[1].length; entry++) target.add(values[descriptor[1][entry]]);
         break;
       }
     }
@@ -427,43 +436,43 @@ const __tbPorts = Object.create(null);
 // `onclose` first
 // (<https://html.spec.whatwg.org/multipage/web-messaging.html#disentangle>).
 const __tbMaterializePorts = ids => {
-  const ports = {};
-  const closes = [];
-  for (const id of ids) {
-    const pendingClose = __tbPortAdopt(id);
+  const ports = { __proto__: null };
+  const closes = __tbPrivateArray();
+  for (let index = 0; index < ids.length; index++) {
+    const id = ids[index];
+    const pendingClose = host.__tbPortAdopt(id);
     if (pendingClose == null) throw new Error('missing transferred MessagePort');
     ports[id] = __tbMaterializePort(id);
-    if (pendingClose) closes.push(id);
+    if (pendingClose) __tbArray.push(closes, id);
   }
-  return { ports: ports, closes: closes };
+   return { __proto__: null, ports, closes };
 };
 const __tbFirePortCloses = ids => {
-  for (const id of ids) {
+  for (let index = 0; index < ids.length; index++) {
+    const id = ids[index];
     const port = __tbPortLookup(id);
     if (port === null) continue;
     const data = __tbBrand(port, __tbPortData);
     data.closed = true;
-    __tbPortClose(id);
-    port.__tbDispatchTrusted(__tbHostToken, new globalThis.Event('close'));
+    host.__tbPortClose(id);
+    host.__tbDispatchTargetTrusted(port, new __tbEventConstructor('close'));
   }
 };
 // Drops ports a delivery could not decode; the spec loses them with the
 // failed message.
 const __tbDiscardPorts = ids => {
-  for (const id of ids) {
+  for (let index = 0; index < ids.length; index++) {
+    const id = ids[index];
     const port = __tbPortLookup(id);
     if (port === null) continue;
     __tbBrand(port, __tbPortData).closed = true;
-    __tbPortClose(id);
+    host.__tbPortClose(id);
   }
 };
 const __tbMaterializePort = id => {
   if (__tbPorts[id] !== undefined) return __tbPorts[id];
-  const port = Reflect.construct(globalThis.EventTarget, [], globalThis.MessagePort);
-  Object.defineProperty(port, __tbPortData, {
-    value: { id: id, closed: false, onmessage: null, onclose: null },
-    writable: false, enumerable: false, configurable: false,
-  });
+  const port = __tbConstruct(__tbEventTargetConstructor, [], __tbMessagePortConstructor);
+  __tbPortData.set(port, { id: id, closed: false, onmessage: null, onclose: null });
   __tbPorts[id] = port;
   return port;
 };
@@ -472,7 +481,7 @@ const __tbPortLookup = id => {
   return port === undefined ? null : port;
 };
 // https://html.spec.whatwg.org/multipage/web-messaging.html#messageport
-globalThis.MessagePort = class MessagePort extends EventTarget {
+const __tbMessagePortConstructor = globalThis.MessagePort = class MessagePort extends EventTarget {
   constructor() { throw new TypeError('Illegal constructor'); }
   postMessage(message, transfer) {
     const data = __tbBrand(this, __tbPortData);
@@ -491,20 +500,20 @@ globalThis.MessagePort = class MessagePort extends EventTarget {
     if (data.closed) return;
     // A port posted to its own entangled port loses the channel
     // (<https://html.spec.whatwg.org/multipage/web-messaging.html#message-port-post-message-steps>).
-    const peer = __tbPortPeer(data.id);
-    if (peer != null && encoded.ports.indexOf(peer) !== -1) return;
-    __tbPortPost(data.id, encoded.payload, encoded.ports);
+    const peer = host.__tbPortPeer(data.id);
+    if (peer != null && __tbArray.indexOf(encoded.ports, peer) !== -1) return;
+    host.__tbPortPost(data.id, encoded.payload, encoded.ports);
   }
   start() {
     const data = __tbBrand(this, __tbPortData);
     if (data.closed) return;
-    __tbPortStart(data.id);
+    host.__tbPortStart(data.id);
   }
   close() {
     const data = __tbBrand(this, __tbPortData);
     if (data.closed) return;
     data.closed = true;
-    __tbPortClose(data.id);
+    host.__tbPortClose(data.id);
   }
   get onmessage() { return __tbBrand(this, __tbPortData).onmessage; }
   set onmessage(value) {
@@ -522,7 +531,7 @@ Object.defineProperty(globalThis.MessagePort.prototype, Symbol.toStringTag, { va
 // https://html.spec.whatwg.org/multipage/web-messaging.html#messagechannel
 globalThis.MessageChannel = class MessageChannel {
   constructor() {
-    const pair = __tbPortNew();
+    const pair = host.__tbPortNew();
     const port1 = __tbMaterializePort(pair[0]);
     const port2 = __tbMaterializePort(pair[1]);
     Object.defineProperty(this, 'port1', { value: port1, writable: false, enumerable: true, configurable: true });
@@ -556,7 +565,7 @@ const __tbFrameProxy = frame => {
       // Exceptions from a proxy's postMessage come from the target window's
       // realm, the way a shipped engine throws them.
       if (error instanceof globalThis.DOMException) {
-        const global = __tbFrameGlobal(frame);
+        const global = host.__tbFrameGlobal(frame);
         const constructor = global == null ? undefined : global.DOMException;
         if (typeof constructor === 'function' && error.constructor !== constructor) {
           throw new constructor(error.message, error.name);
@@ -567,27 +576,26 @@ const __tbFrameProxy = frame => {
   };
   const handler = {
     get(target, property) {
-      if (property === __tbWindowProxyData) return { frame: frame };
       switch (property) {
         case 'postMessage':
           return postMessage;
         case 'parent': {
-          const parent = __tbFrameParent(frame);
+          const parent = host.__tbFrameParent(frame);
           return parent == null ? proxy : __tbFrameProxy(parent);
         }
         case 'top': {
-          const top = __tbFrameTop(frame);
+          const top = host.__tbFrameTop(frame);
           return top == null || top === frame ? proxy : __tbFrameProxy(top);
         }
         case 'window': case 'self': case 'frames': return proxy;
-        case 'length': return __tbFrameChildCount(frame);
-        case 'closed': return !__tbFrameRegistered(frame);
+        case 'length': return host.__tbFrameChildCount(frame);
+        case 'closed': return !host.__tbFrameRegistered(frame);
         case Symbol.toStringTag: return 'Window';
-        case 'document': return __tbFrameDocument(frame);
+        case 'document': return host.__tbFrameDocument(frame);
       }
-      const sameOrigin = __tbFrameGlobal(frame);
+      const sameOrigin = host.__tbFrameGlobal(frame);
       if (sameOrigin == null) {
-        if (__tbFrameRegistered(frame)) {
+        if (host.__tbFrameRegistered(frame)) {
           const pending = __tbFramePendingSets[frame];
           if (pending !== undefined && Object.prototype.hasOwnProperty.call(pending, property)) {
             return pending[property];
@@ -599,9 +607,9 @@ const __tbFrameProxy = frame => {
       return sameOrigin[property];
     },
     set(target, property, value) {
-      const sameOrigin = __tbFrameGlobal(frame);
+      const sameOrigin = host.__tbFrameGlobal(frame);
       if (sameOrigin == null) {
-        if (__tbFrameRegistered(frame)) {
+        if (host.__tbFrameRegistered(frame)) {
           __tbFramePending(frame)[property] = value;
           return true;
         }
@@ -616,7 +624,7 @@ const __tbFrameProxy = frame => {
         case 'frames': case 'length': case 'closed': case 'document':
           return true;
       }
-      const sameOrigin = __tbFrameGlobal(frame);
+      const sameOrigin = host.__tbFrameGlobal(frame);
       if (sameOrigin != null) return property in sameOrigin;
       const pending = __tbFramePendingSets[frame];
       return pending !== undefined && property in pending;
@@ -625,20 +633,21 @@ const __tbFrameProxy = frame => {
       // The spec forwards to the target; cross-origin callers cannot reach
       // it, so the plain object prototype stands in
       // (<https://html.spec.whatwg.org/multipage/window-object.html#windowproxy-getprototypeof>).
-      const sameOrigin = __tbFrameGlobal(frame);
+      const sameOrigin = host.__tbFrameGlobal(frame);
       return sameOrigin == null ? globalThis.Object.prototype : globalThis.Object.getPrototypeOf(sameOrigin);
     },
     ownKeys() {
-      const sameOrigin = __tbFrameGlobal(frame);
+      const sameOrigin = host.__tbFrameGlobal(frame);
       return sameOrigin == null ? [] : globalThis.Reflect.ownKeys(sameOrigin);
     },
     getOwnPropertyDescriptor() { return undefined; },
   };
   proxy = new Proxy({}, handler);
+  __tbWindowData.set(proxy, { frame });
   __tbFrameProxies[frame] = proxy;
   return proxy;
 };
-globalThis.__tbFrameProxy = __tbFrameProxy;
+host.__tbFrameProxy = __tbFrameProxy;
 
 // ── posting and delivery ───────────────────────────────────────────────
 // https://html.spec.whatwg.org/multipage/web-messaging.html#dom-window-postmessage
@@ -669,7 +678,7 @@ function __tbPostMessage(targetFrame, argumentCount, message, targetOrigin, tran
     checkedOrigin = parsed.origin;
   }
   const encoded = __tbEncode(message, transfer, null);
-  __tbPostWindowMessage(targetFrame, checkedOrigin, encoded.payload, encoded.ports);
+  host.__tbPostWindowMessage(targetFrame, checkedOrigin, encoded.payload, encoded.ports);
 }
 globalThis.postMessage = function(message, targetOrigin, transfer) {
   return __tbPostMessage(__tbFrameId, arguments.length, message, targetOrigin, transfer);
@@ -677,7 +686,7 @@ globalThis.postMessage = function(message, targetOrigin, transfer) {
 // Runs in the target realm: decode, then dispatch a trusted message event, or
 // report the failure so the engine dispatches `messageerror`
 // (<https://html.spec.whatwg.org/multipage/web-messaging.html#window-post-message-steps>).
-globalThis.__tbDeliverMessage = function(payload, sourceFrame, origin, portIds) {
+host.__tbDeliverMessage = function(payload, sourceFrame, origin, portIds) {
   if (String(payload).indexOf(__tbPayloadVersion) !== 0) return false;
   const materialized = __tbMaterializePorts(portIds);
   let data;
@@ -689,22 +698,22 @@ globalThis.__tbDeliverMessage = function(payload, sourceFrame, origin, portIds) 
     __tbDiscardPorts(portIds);
     return false;
   }
-  const portArray = portIds.map(id => materialized.ports[id]);
-  globalThis.__tbDispatchTrusted(__tbHostToken, new globalThis.MessageEvent('message', {
+  const portArray = __tbArray.map(portIds, id => materialized.ports[id]);
+  host.__tbDispatchTrusted(new __tbMessageEventConstructor('message', {
     data: data, origin: origin, source: __tbFrameProxy(sourceFrame), ports: Object.freeze(portArray),
   }));
   __tbFirePortCloses(materialized.closes);
   return true;
 };
-globalThis.__tbDeliverMessageError = function(sourceFrame, origin) {
-  globalThis.__tbDispatchTrusted(__tbHostToken, new globalThis.MessageEvent('messageerror', {
+host.__tbDeliverMessageError = function(sourceFrame, origin) {
+  host.__tbDispatchTrusted(new __tbMessageEventConstructor('messageerror', {
     data: null, origin: origin, source: __tbFrameProxy(sourceFrame),
   }));
 };
 // A message from another tab cannot name a frame in this renderer, so its
 // source is `null`
 // (<https://html.spec.whatwg.org/multipage/web-messaging.html#window-post-message-steps>).
-globalThis.__tbDeliverRemoteMessage = function(payload) {
+host.__tbDeliverRemoteMessage = function(payload) {
   if (String(payload).indexOf(__tbPayloadVersion) !== 0) return;
   let data;
   try {
@@ -712,15 +721,15 @@ globalThis.__tbDeliverRemoteMessage = function(payload) {
   } catch (error) {
     return;
   }
-  globalThis.__tbDispatchTrusted(__tbHostToken, new globalThis.MessageEvent('message', {
+  host.__tbDispatchTrusted(new __tbMessageEventConstructor('message', {
     data: data, origin: '', source: null, ports: Object.freeze([]),
   }));
 };
 
 // ── broadcast channels ─────────────────────────────────────────────────
 // https://html.spec.whatwg.org/multipage/web-messaging.html#broadcastchannel
-const __tbBroadcastData = Symbol.for('tinybrowser.broadcastchannel.data');
-const __tbBroadcastChannels = new Set();
+const __tbBroadcastData = host.slots('tinybrowser.broadcastchannel.data');
+const __tbBroadcastChannels = new __tbPrivateSet();
 let __tbNextBroadcastChannel = 1;
 
 globalThis.BroadcastChannel = class BroadcastChannel extends EventTarget {
@@ -729,12 +738,9 @@ globalThis.BroadcastChannel = class BroadcastChannel extends EventTarget {
       throw new TypeError("Failed to construct 'BroadcastChannel': 1 argument required, but only 0 present.");
     }
     super();
-    Object.defineProperty(this, __tbBroadcastData, {
-      value: {
+    __tbBroadcastData.set(this, {
         id: __tbNextBroadcastChannel++, name: String(name), closed: false,
         onmessage: null, onmessageerror: null,
-      },
-      writable: false, enumerable: false, configurable: false,
     });
     __tbBroadcastChannels.add(this);
   }
@@ -748,9 +754,9 @@ globalThis.BroadcastChannel = class BroadcastChannel extends EventTarget {
       throw new globalThis.DOMException('The channel is closed.', 'InvalidStateError');
     }
     const encoded = __tbEncode(message, [], null);
-    const origin = __tbStorageOrigin();
+    const origin = host.__tbStorageOrigin();
     if (origin === null || origin === undefined) return;
-    __tbBroadcastPost(origin, data.name, encoded.payload, data.id);
+    host.__tbBroadcastPost(origin, data.name, encoded.payload, data.id);
   }
   close() {
     const data = __tbBrand(this, __tbBroadcastData);
@@ -767,25 +773,25 @@ Object.defineProperty(globalThis.BroadcastChannel.prototype, Symbol.toStringTag,
   value: 'BroadcastChannel', writable: false, enumerable: false, configurable: true,
 });
 
-globalThis.__tbDeliverBroadcast = function(name, payload, origin, sourceChannel) {
+host.__tbDeliverBroadcast = function(name, payload, origin, sourceChannel) {
   for (const channel of __tbBroadcastChannels) {
-    const data = channel[__tbBroadcastData];
+    const data = __tbBroadcastData.get(channel);
     if (data === undefined || data.closed || data.name !== name) continue;
     if (sourceChannel !== null && sourceChannel !== undefined && data.id === sourceChannel) continue;
     let event;
     try {
-      event = new globalThis.MessageEvent('message', {
+      event = new __tbMessageEventConstructor('message', {
         data: __tbDecode(payload, []), origin: origin, source: null, ports: Object.freeze([]),
       });
     } catch (error) {
-      event = new globalThis.MessageEvent('messageerror', {
+      event = new __tbMessageEventConstructor('messageerror', {
         data: null, origin: origin, source: null, ports: Object.freeze([]),
       });
     }
-    channel.__tbDispatchTrusted(__tbHostToken, event);
+    host.__tbDispatchTargetTrusted(channel, event);
   }
 };
-globalThis.__tbDeliverPortMessage = function(endpoint, payload, portIds) {
+host.__tbDeliverPortMessage = function(endpoint, payload, portIds) {
   const port = __tbPortLookup(endpoint);
   if (port === null) return true;
   const data = __tbBrand(port, __tbPortData);
@@ -799,45 +805,45 @@ globalThis.__tbDeliverPortMessage = function(endpoint, payload, portIds) {
     __tbDiscardPorts(portIds);
     return false;
   }
-  const portArray = portIds.map(id => materialized.ports[id]);
-  port.__tbDispatchTrusted(__tbHostToken, new globalThis.MessageEvent('message', {
+  const portArray = __tbArray.map(portIds, id => materialized.ports[id]);
+  host.__tbDispatchTargetTrusted(port, new __tbMessageEventConstructor('message', {
     data: value, ports: Object.freeze(portArray),
   }));
   __tbFirePortCloses(materialized.closes);
   return true;
 };
-globalThis.__tbDeliverPortMessageError = function(endpoint) {
+host.__tbDeliverPortMessageError = function(endpoint) {
   const port = __tbPortLookup(endpoint);
   if (port === null) return;
-  port.__tbDispatchTrusted(__tbHostToken, new globalThis.MessageEvent('messageerror'));
+  host.__tbDispatchTargetTrusted(port, new __tbMessageEventConstructor('messageerror'));
 };
-globalThis.__tbDeliverPortClose = function(endpoint) {
+host.__tbDeliverPortClose = function(endpoint) {
   const port = __tbPortLookup(endpoint);
   if (port === null) return;
   const data = __tbBrand(port, __tbPortData);
   if (data.closed) return;
-  port.__tbDispatchTrusted(__tbHostToken, new globalThis.Event('close'));
+  host.__tbDispatchTargetTrusted(port, new __tbEventConstructor('close'));
 };
 
 // ── the window's own indexed and browsing-context members ──────────────
 // https://html.spec.whatwg.org/multipage/nav-history-apis.html#dom-length
 Object.defineProperty(globalThis, 'length', {
-  get() { return __tbFrameChildCount(__tbFrameId); },
+  get() { return host.__tbFrameChildCount(__tbFrameId); },
   configurable: true, enumerable: false,
 });
 // https://html.spec.whatwg.org/multipage/window-object.html#dom-origin
 Object.defineProperty(globalThis, 'origin', {
   get() {
-    const value = __tbStorageOrigin();
+    const value = host.__tbStorageOrigin();
     return value === null || value === undefined ? 'null' : value;
   },
   configurable: true, enumerable: true,
 });
 // https://html.spec.whatwg.org/multipage/nav-history-apis.html#dom-window-item
-for (let index = 0; index < __tb_maxFrames; index++) {
+for (let index = 0; index < host.__tb_maxFrames; index++) {
   Object.defineProperty(globalThis, String(index), {
     get() {
-      const child = __tbFrameChild(__tbFrameId, index);
+      const child = host.__tbFrameChild(__tbFrameId, index);
       return child == null ? undefined : __tbFrameProxy(child);
     },
     configurable: true, enumerable: false,
@@ -846,7 +852,7 @@ for (let index = 0; index < __tb_maxFrames; index++) {
 // https://html.spec.whatwg.org/multipage/nav-history-apis.html#dom-parent
 Object.defineProperty(globalThis, 'parent', {
   get() {
-    const parent = __tbFrameParent(__tbFrameId);
+    const parent = host.__tbFrameParent(__tbFrameId);
     return parent == null ? globalThis : __tbFrameProxy(parent);
   },
   configurable: true, enumerable: true,
@@ -854,7 +860,7 @@ Object.defineProperty(globalThis, 'parent', {
 // https://html.spec.whatwg.org/multipage/nav-history-apis.html#dom-top
 Object.defineProperty(globalThis, 'top', {
   get() {
-    const top = __tbFrameTop(__tbFrameId);
+    const top = host.__tbFrameTop(__tbFrameId);
     return top === __tbFrameId ? globalThis : __tbFrameProxy(top);
   },
   configurable: true, enumerable: true,
@@ -864,18 +870,18 @@ Object.defineProperty(globalThis, 'top', {
 // a collected wrapper cannot lose `element.onload`
 // (<https://html.spec.whatwg.org/multipage/webappapis.html#event-handlers>).
 (function() {
-  const names = globalThis.__tb_handlerNames;
+  const names = host.__tb_handlerNames;
   if (names === undefined) return;
   for (const name of names) {
     Object.defineProperty(globalThis, name, {
-      get() { return globalThis.__tbGetWindowHandler(name); },
-      set(value) { globalThis.__tbSetWindowHandler(name, value); },
+      get() { return host.__tbGetWindowHandler(name); },
+      set(value) { host.__tbSetWindowHandler(name, value); },
       enumerable: true, configurable: true,
     });
     for (const proto of [globalThis.HTMLElement.prototype, globalThis.SVGElement.prototype]) {
       Object.defineProperty(proto, name, {
-        get() { return globalThis.__tbGetNodeHandler(this, name); },
-        set(value) { globalThis.__tbSetNodeHandler(this, name, value); },
+        get() { return host.__tbGetNodeHandler(this, name); },
+        set(value) { host.__tbSetNodeHandler(this, name, value); },
         enumerable: true, configurable: true,
       });
     }
@@ -889,13 +895,13 @@ Object.defineProperty(globalThis, 'top', {
 // object without a session copy
 // (<https://html.spec.whatwg.org/multipage/window-object.html#dom-open>).
 (function() {
-  const remoteWindows = new Map();
-  const namedWindows = new Map();
-  const remoteSessions = new Map();
+  const remoteWindows = new __tbPrivateMap();
+  const namedWindows = new __tbPrivateMap();
+  const remoteSessions = new __tbPrivateMap();
   // Tabs closed through `close()`: reported by `closed` and evicted from
   // `namedWindows` so a later `open(url, name)` opens a fresh tab.
-  const closedTabs = new Set();
-  const tabNames = new Map();
+  const closedTabs = new __tbPrivateSet();
+  const tabNames = new __tbPrivateMap();
 
   function remoteWindow(tab) {
     const existing = remoteWindows.get(tab);
@@ -904,7 +910,7 @@ Object.defineProperty(globalThis, 'top', {
       get(target, property) {
         switch (property) {
           case 'close': return () => {
-            __tbWindowClose(tab);
+            host.__tbWindowClose(tab);
             closedTabs.add(tab);
             const name = tabNames.get(tab);
             if (name !== undefined) {
@@ -915,9 +921,9 @@ Object.defineProperty(globalThis, 'top', {
           case 'closed': return closedTabs.has(tab);
           case 'postMessage': return (message, targetOrigin, transfer) => {
             const encoded = __tbEncode(message, transfer ?? [], null);
-            __tbWindowPostMessage(tab, encoded.payload);
+            host.__tbWindowPostMessage(tab, encoded.payload);
           };
-          case 'localStorage': return globalThis.__tbStorageArea('local');
+          case 'localStorage': return host.__tbStorageArea('local');
           case 'sessionStorage': return remoteSession(tab);
           case Symbol.toStringTag: return 'Window';
           default: return undefined;
@@ -949,8 +955,8 @@ Object.defineProperty(globalThis, 'top', {
         if (arguments.length < 1) {
           throw new TypeError("Failed to execute 'getItem' on 'Storage': 1 argument required, but only 0 present.");
         }
-        const value = __tbRemoteSessionGet(tab, globalThis.__tbStorageEncode(String(key)));
-        return value === undefined ? null : globalThis.__tbStorageDecode(value);
+        const value = host.__tbRemoteSessionGet(tab, host.__tbStorageEncode(String(key)));
+        return value === undefined ? null : host.__tbStorageDecode(value);
       },
     };
     remoteSessions.set(tab, session);
@@ -959,12 +965,12 @@ Object.defineProperty(globalThis, 'top', {
 
   globalThis.open = function(url, target, features) {
     if (arguments.length < 1 || url === undefined || url === null) url = '';
-    const spec = url === '' ? '' : __tbResolveUrl(String(url), undefined);
+    const spec = url === '' ? '' : host.__tbResolveUrl(String(url), undefined);
     if (spec === null || spec === undefined) return null;
     const name = target === undefined || target === null ? '' : String(target);
     const featureString = features === undefined || features === null ? '' : String(features);
     if (name !== '' && namedWindows.has(name)) return namedWindows.get(name);
-    const tab = __tbWindowOpen(spec, name, featureString);
+    const tab = host.__tbWindowOpen(spec, name, featureString);
     if (tab === null || tab === undefined) return null;
     const proxy = remoteWindow(tab);
     if (name !== '') {
@@ -977,7 +983,7 @@ Object.defineProperty(globalThis, 'top', {
   // https://html.spec.whatwg.org/multipage/window-object.html#dom-opener
   Object.defineProperty(globalThis, 'opener', {
     get() {
-      const tab = __tbWindowOpener();
+      const tab = host.__tbWindowOpener();
       return tab === null || tab === undefined ? null : remoteWindow(tab);
     },
     configurable: true,
@@ -994,11 +1000,11 @@ Object.defineProperty(globalThis, 'top', {
 // (<https://html.spec.whatwg.org/multipage/webstorage.html#the-storage-interface>,
 // <https://webidl.spec.whatwg.org/#legacy-platform-object>).
 (function() {
-  const kindSlot = Symbol('storageKind');
-  const holders = new Map();
+  const kindSlot = host.slots('storageKind');
+  const holders = new __tbPrivateMap();
 
   function kindOf(storage) {
-    const kind = storage == null ? undefined : storage[kindSlot];
+    const kind = storage == null ? undefined : kindSlot.get(storage);
     if (kind !== 'local' && kind !== 'session') {
       throw new TypeError('Illegal invocation');
     }
@@ -1032,18 +1038,16 @@ Object.defineProperty(globalThis, 'top', {
 
   class Storage {
     constructor(kind) {
-      Object.defineProperty(this, kindSlot, {
-        value: kind, writable: false, enumerable: false, configurable: false,
-      });
+      kindSlot.set(this, kind);
     }
     get length() {
-      return __tbStorageKeys(kindOf(this)).length;
+      return host.__tbStorageKeys(kindOf(this)).length;
     }
     key(index) {
       if (arguments.length < 1) {
         throw new TypeError("Failed to execute 'key' on 'Storage': 1 argument required, but only 0 present.");
       }
-      const keys = __tbStorageKeys(kindOf(this));
+      const keys = host.__tbStorageKeys(kindOf(this));
       const n = Number(index) >>> 0;
       return n < keys.length ? decode(keys[n]) : null;
     }
@@ -1051,7 +1055,7 @@ Object.defineProperty(globalThis, 'top', {
       if (arguments.length < 1) {
         throw new TypeError("Failed to execute 'getItem' on 'Storage': 1 argument required, but only 0 present.");
       }
-      const item = __tbStorageGet(kindOf(this), encode(String(key)));
+      const item = host.__tbStorageGet(kindOf(this), encode(String(key)));
       return item === undefined ? null : decode(item);
     }
     setItem(key, value) {
@@ -1059,7 +1063,7 @@ Object.defineProperty(globalThis, 'top', {
         throw new TypeError("Failed to execute 'setItem' on 'Storage': 2 arguments required.");
       }
       key = String(key);
-      if (!__tbStorageSet(kindOf(this), encode(key), encode(String(value)))) {
+      if (!host.__tbStorageSet(kindOf(this), encode(key), encode(String(value)))) {
         throw quotaError(key);
       }
     }
@@ -1067,10 +1071,10 @@ Object.defineProperty(globalThis, 'top', {
       if (arguments.length < 1) {
         throw new TypeError("Failed to execute 'removeItem' on 'Storage': 1 argument required, but only 0 present.");
       }
-      __tbStorageRemove(kindOf(this), encode(String(key)));
+      host.__tbStorageRemove(kindOf(this), encode(String(key)));
     }
     clear() {
-      __tbStorageClear(kindOf(this));
+      host.__tbStorageClear(kindOf(this));
     }
   }
   globalThis.Storage = Storage;
@@ -1081,7 +1085,7 @@ Object.defineProperty(globalThis, 'top', {
   function area(kind) {
     const existing = holders.get(kind);
     if (existing !== undefined) return existing;
-    const origin = __tbStorageOrigin();
+    const origin = host.__tbStorageOrigin();
     if (origin === null || origin === undefined) {
       throw new globalThis.DOMException(
         "Failed to read the '" + (kind === 'session' ? 'sessionStorage' : 'localStorage') +
@@ -1093,76 +1097,75 @@ Object.defineProperty(globalThis, 'top', {
         if (typeof property === 'symbol' || property in t) {
           return Reflect.get(t, property, receiver);
         }
-        const item = __tbStorageGet(kind, encode(property));
+        const item = host.__tbStorageGet(kind, encode(property));
         return item === null || item === undefined ? undefined : decode(item);
       },
       set(t, property, value) {
         if (typeof property === 'symbol') return Reflect.set(t, property, value);
-        if (!__tbStorageSet(kind, encode(property), encode(String(value)))) {
+        if (!host.__tbStorageSet(kind, encode(property), encode(String(value)))) {
           throw quotaError(property);
         }
         return true;
       },
       has(t, property) {
         if (typeof property === 'symbol' || property in t) return true;
-        const item = __tbStorageGet(kind, encode(property));
+        const item = host.__tbStorageGet(kind, encode(property));
         return item !== null && item !== undefined;
       },
       deleteProperty(t, property) {
         if (typeof property === 'symbol') return Reflect.deleteProperty(t, property);
-        __tbStorageRemove(kind, encode(property));
+        host.__tbStorageRemove(kind, encode(property));
         return true;
       },
       defineProperty(t, property, descriptor) {
         if (typeof property === 'symbol') return Reflect.defineProperty(t, property, descriptor);
         const value = 'value' in descriptor ? String(descriptor.value) : 'undefined';
-        if (!__tbStorageSet(kind, encode(property), encode(value))) throw quotaError(property);
+        if (!host.__tbStorageSet(kind, encode(property), encode(value))) throw quotaError(property);
         return true;
       },
       getOwnPropertyDescriptor(t, property) {
         if (typeof property === 'symbol') return Reflect.getOwnPropertyDescriptor(t, property);
         if (property in t) return undefined;
-        const item = __tbStorageGet(kind, encode(property));
+        const item = host.__tbStorageGet(kind, encode(property));
         if (item === null || item === undefined) return undefined;
         return { value: decode(item), writable: true, enumerable: true, configurable: true };
       },
       ownKeys(t) {
-        const names = __tbStorageKeys(kind).map(decode).filter(key => !(key in t));
+        const names = host.__tbStorageKeys(kind).map(decode).filter(key => !(key in t));
         return Reflect.ownKeys(t).concat(names);
       },
     };
     const proxy = new Proxy(target, handler);
+    kindSlot.set(proxy, kind);
     holders.set(kind, proxy);
     return proxy;
   }
 
   // https://html.spec.whatwg.org/multipage/webstorage.html#the-storageevent-interface
-  const eventData = Symbol.for('tinybrowser.storageevent.data');
+  const eventData = host.slots('tinybrowser.storageevent.data');
   function dataOf(event) {
-    const data = event == null ? undefined : event[eventData];
+    const data = event == null ? undefined : eventData.get(event);
     if (data === undefined) throw new TypeError('Illegal invocation');
     return data;
   }
   function nullableString(value) {
     return value === undefined || value === null ? null : String(value);
   }
-  globalThis.StorageEvent = class StorageEvent extends Event {
+  const StorageEvent = globalThis.StorageEvent = class StorageEvent extends Event {
     constructor(type, init = undefined) {
       if (arguments.length < 1) {
         throw new TypeError("Failed to construct 'StorageEvent': 1 argument required, but only 0 present.");
       }
       const eventInit = init === undefined ? {} : Object(init);
-      super(String(type), eventInit);
-      Object.defineProperty(this, eventData, {
-        value: {
+      const event = __tbConstruct(__tbEventConstructor, [String(type), eventInit], new.target);
+      eventData.set(event, {
           key: nullableString(eventInit.key),
           oldValue: nullableString(eventInit.oldValue),
           newValue: nullableString(eventInit.newValue),
           url: eventInit.url === undefined ? '' : String(eventInit.url),
           storageArea: eventInit.storageArea === undefined ? null : eventInit.storageArea,
-        },
-        writable: false, enumerable: false, configurable: false,
       });
+      return event;
     }
     get key() { return dataOf(this).key; }
     get oldValue() { return dataOf(this).oldValue; }
@@ -1189,8 +1192,8 @@ Object.defineProperty(globalThis, 'top', {
   /// Fires one storage event in this realm, with this realm's area as
   /// `storageArea`
   /// (<https://html.spec.whatwg.org/multipage/webstorage.html#concept-storage-broadcast>).
-  globalThis.__tbFireStorageEvent = function(kind, key, oldValue, newValue, url) {
-    globalThis.__tbDispatchTrusted(__tbHostToken, new globalThis.StorageEvent('storage', {
+  host.__tbFireStorageEvent = function(kind, key, oldValue, newValue, url) {
+    host.__tbDispatchTrusted(new StorageEvent('storage', {
       key: decode(key), oldValue: decode(oldValue), newValue: decode(newValue),
       url: url, storageArea: area(kind),
     }));
@@ -1203,9 +1206,9 @@ Object.defineProperty(globalThis, 'top', {
     get() { return area('session'); }, configurable: true,
   });
   // Remote-window proxies share these areas for same-origin openers.
-  globalThis.__tbStorageArea = area;
-  globalThis.__tbStorageEncode = encode;
-  globalThis.__tbStorageDecode = decode;
+  host.__tbStorageArea = area;
+  host.__tbStorageEncode = encode;
+  host.__tbStorageDecode = decode;
 })();
 
 // Platform objects and globals are not serializable; the marker travels with
@@ -1226,13 +1229,9 @@ Object.defineProperty(globalThis, 'top', {
     const ctor = globalThis[name];
     if (typeof ctor === 'function' && ctor.prototype !== undefined) {
       try {
-        Object.defineProperty(ctor.prototype, __tbPlatform, {
-          value: true, writable: false, enumerable: false, configurable: true,
-        });
+        __tbPlatform.set(ctor.prototype, true);
       } catch (error) {}
     }
   }
-  Object.defineProperty(globalThis, __tbPlatform, {
-    value: true, writable: false, enumerable: false, configurable: true,
-  });
+  __tbPlatform.set(globalThis, true);
 })();

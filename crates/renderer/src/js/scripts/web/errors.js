@@ -2,14 +2,10 @@
 // calls when a script or an event handler throws
 // (<https://html.spec.whatwg.org/multipage/webappapis.html#report-the-error>).
 (function() {
-  const hostToken = globalThis.__tbHostToken;
-  const MESSAGE = Symbol('tb-error-message');
-  const FILENAME = Symbol('tb-error-filename');
-  const LINENO = Symbol('tb-error-lineno');
-  const COLNO = Symbol('tb-error-colno');
-  const ERROR = Symbol('tb-error-error');
-  const PROMISE = Symbol('tb-rejection-promise');
-  const REASON = Symbol('tb-rejection-reason');
+  const errorData = host.slots('ErrorEvent');
+  const rejectionData = host.slots('PromiseRejectionEvent');
+  const EventConstructor = globalThis.Event;
+  const construct = Reflect.construct;
 
   // `ErrorEventInit` members beyond `EventInit`
   // (<https://html.spec.whatwg.org/multipage/webappapis.html#erroreventinit>).
@@ -17,14 +13,16 @@
     if (new.target === undefined) {
       throw new TypeError('Class constructor ErrorEvent cannot be invoked without new');
     }
-    const event = Reflect.construct(globalThis.Event, arguments, new.target);
+    const event = construct(EventConstructor, arguments, new.target);
     const init = arguments[1];
     const dictionary = (init === undefined || init === null) ? {} : init;
-    event[MESSAGE] = dictionary.message === undefined ? '' : String(dictionary.message);
-    event[FILENAME] = dictionary.filename === undefined ? '' : String(dictionary.filename);
-    event[LINENO] = dictionary.lineno === undefined ? 0 : (dictionary.lineno >>> 0);
-    event[COLNO] = dictionary.colno === undefined ? 0 : (dictionary.colno >>> 0);
-    event[ERROR] = dictionary.error === undefined ? null : dictionary.error;
+    errorData.set(event, {
+      message: dictionary.message === undefined ? '' : String(dictionary.message),
+      filename: dictionary.filename === undefined ? '' : String(dictionary.filename),
+      lineno: dictionary.lineno === undefined ? 0 : (dictionary.lineno >>> 0),
+      colno: dictionary.colno === undefined ? 0 : (dictionary.colno >>> 0),
+      error: dictionary.error === undefined ? null : dictionary.error,
+    });
     return event;
   }
 
@@ -32,21 +30,22 @@
   Object.defineProperty(proto, 'constructor', {
     value: ErrorEvent, writable: true, configurable: true,
   });
-  const member = (name, symbol, fallback) => {
+  const member = (name, fallback) => {
     Object.defineProperty(proto, name, {
       get() {
-        const value = this[symbol];
+        const data = errorData.get(this);
+        const value = data === undefined ? undefined : data[name];
         return value === undefined ? fallback : value;
       },
       enumerable: true,
       configurable: true,
     });
   };
-  member('message', MESSAGE, '');
-  member('filename', FILENAME, '');
-  member('lineno', LINENO, 0);
-  member('colno', COLNO, 0);
-  member('error', ERROR, null);
+  member('message', '');
+  member('filename', '');
+  member('lineno', 0);
+  member('colno', 0);
+  member('error', null);
   Object.defineProperty(proto, Symbol.toStringTag, {
     value: 'ErrorEvent', writable: false, enumerable: false, configurable: true,
   });
@@ -65,9 +64,8 @@
     if (init === undefined || init === null || init.promise === undefined) {
       throw new TypeError('PromiseRejectionEventInit requires a promise');
     }
-    const event = Reflect.construct(globalThis.Event, arguments, new.target);
-    event[PROMISE] = init.promise;
-    event[REASON] = init.reason;
+    const event = construct(EventConstructor, arguments, new.target);
+    rejectionData.set(event, { promise: init.promise, reason: init.reason });
     return event;
   }
   const rejectionProto = Object.create(globalThis.Event.prototype);
@@ -75,10 +73,10 @@
     value: PromiseRejectionEvent, writable: true, configurable: true,
   });
   Object.defineProperty(rejectionProto, 'promise', {
-    get() { return this[PROMISE]; }, enumerable: true, configurable: true,
+    get() { const data = rejectionData.get(this); return data === undefined ? undefined : data.promise; }, enumerable: true, configurable: true,
   });
   Object.defineProperty(rejectionProto, 'reason', {
-    get() { return this[REASON]; }, enumerable: true, configurable: true,
+    get() { const data = rejectionData.get(this); return data === undefined ? undefined : data.reason; }, enumerable: true, configurable: true,
   });
   Object.defineProperty(rejectionProto, Symbol.toStringTag, {
     value: 'PromiseRejectionEvent', writable: false, enumerable: false, configurable: true,
@@ -106,7 +104,7 @@
   // is not reported back into `onerror` again.
   let reporting = false;
 
-  globalThis.__tbReportException = function(caught, meta) {
+  host.__tbReportException = function(caught, meta) {
     if (reporting) return false;
     reporting = true;
     try {
@@ -137,13 +135,13 @@
         error: error,
         cancelable: true,
       });
-      globalThis.__tbDispatchTrusted(hostToken, event);
+      host.__tbDispatchTrusted(event);
       return event.defaultPrevented;
     } finally {
       reporting = false;
     }
   };
-  Object.defineProperty(globalThis, '__tbReportException', {
+  Object.defineProperty(host, '__tbReportException', {
     writable: false, configurable: false, enumerable: false,
   });
 
@@ -151,15 +149,15 @@
   // rejected without a handler, and again if a handler is attached after the
   // rejection was reported
   // (<https://html.spec.whatwg.org/multipage/webappapis.html#unhandled-promise-rejections>).
-  globalThis.__tbPromiseRejection = function(handled, promise, reason) {
+  host.__tbPromiseRejection = function(handled, promise, reason) {
     const event = new PromiseRejectionEvent(
       handled ? 'rejectionhandled' : 'unhandledrejection',
       { promise: promise, reason: reason, cancelable: !handled },
     );
-    globalThis.__tbDispatchTrusted(hostToken, event);
+    host.__tbDispatchTrusted(event);
     return event.defaultPrevented;
   };
-  Object.defineProperty(globalThis, '__tbPromiseRejection', {
+  Object.defineProperty(host, '__tbPromiseRejection', {
     writable: false, configurable: false, enumerable: false,
   });
 })();

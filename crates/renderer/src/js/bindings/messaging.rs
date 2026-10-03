@@ -23,7 +23,7 @@ use crate::protocol::FrameId;
 /// The calling realm's world comes from the realm registration, so every
 /// function is a plain item and its borrow of the world ends with the call.
 pub(crate) fn install_messaging(ctx: &Ctx<'_>) -> Result<()> {
-    let globals = ctx.globals();
+    let globals = crate::js::bridge::object(ctx)?;
     let frame = world(ctx)?.borrow().frame();
     globals.set("__tb_frameId", crate::js::js_number(frame.get()))?;
     globals.set(

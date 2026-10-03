@@ -46,7 +46,7 @@ pub enum Command {
         /// Frame to evaluate in.
         frame: FrameId,
         /// Script source.
-        source: String,
+        source: renderer::ScriptSource,
         /// Optional execution budget in milliseconds.
         timeout_ms: Option<u64>,
     },
@@ -408,7 +408,7 @@ mod tests {
                     assignment,
                     command: Command::ExecuteScript {
                         frame: FrameId::MAIN,
-                        source: "1 + 1".into(),
+                        source: renderer::ScriptSource::Page("1 + 1".into()),
                         timeout_ms: Some(50),
                     },
                 },

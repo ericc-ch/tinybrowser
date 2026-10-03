@@ -9,10 +9,11 @@ globalThis.ReadableStream = class ReadableStream {
       pull: typeof sourceObject.pull === 'function' ? sourceObject.pull : null,
       cancel: typeof sourceObject.cancel === 'function' ? sourceObject.cancel : null,
       controller: null,
+      source: sourceObject,
     };
-    Object.defineProperty(this, __tbStreamData, { value: data, writable: false, enumerable: false, configurable: false });
+    __tbStreamData.set(this, data);
     data.controller = {
-      enqueue(chunk) { if (!data.closed && data.errored === null && !data.canceled) data.chunks.push(chunk); },
+      enqueue(chunk) { if (!data.closed && data.errored === null && !data.canceled) __tbArray.push(data.chunks, chunk); },
       close() { data.closed = true; },
       error(error) { data.errored = error; },
       get desiredSize() { return data.closed ? null : 1; },
@@ -27,9 +28,9 @@ globalThis.ReadableStream = class ReadableStream {
       read: () => {
         const step = () => {
           if (data.errored !== null) return Promise.reject(data.errored);
-          if (data.chunks.length > 0) return Promise.resolve({ value: data.chunks.shift(), done: false });
+          if (data.chunks.length > 0) return Promise.resolve({ value: __tbArray.shift(data.chunks), done: false });
           if (data.closed || data.canceled) return Promise.resolve({ value: undefined, done: true });
-          if (data.pull !== null) return Promise.resolve(data.pull(data.controller)).then(step);
+          if (data.pull !== null) return Promise.resolve(__tbApply(data.pull, data.source, [data.controller])).then(step);
           return Promise.resolve({ value: undefined, done: true });
         };
         return step();
@@ -48,14 +49,8 @@ globalThis.ReadableStream = class ReadableStream {
     // (<https://streams.spec.whatwg.org/#readable-stream-cancel>).
     data.canceled = true;
     data.chunks.length = 0;
-    if (data.cancel !== null) return Promise.resolve(data.cancel(reason));
+    if (data.cancel !== null) return Promise.resolve(__tbApply(data.cancel, data.source, [reason]));
     return Promise.resolve();
-  }
-  pipeThrough(transform) {
-    if (!transform || !transform.readable || !transform.writable) {
-      throw new TypeError('transform is not a readable/writable pair');
-    }
-    return transform.readable;
   }
 };
 Object.defineProperty(globalThis.ReadableStream.prototype, Symbol.toStringTag, { value: 'ReadableStream', writable: false, enumerable: false, configurable: true });

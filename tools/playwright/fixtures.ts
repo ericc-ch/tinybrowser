@@ -116,9 +116,9 @@ async function waitForPort(jsonPath: string, timeoutMs: number): Promise<number>
 
 export const test = base.extend<Fixtures>({
   daemon: async ({}, use) => {
-    const binary = process.env.TINYBROWSER_BIN;
+    const binary = process.env.TINYBROWSER_BINARY;
     if (!binary) {
-      throw new Error("TINYBROWSER_BIN is not set; run ./tools/playwright/run");
+      throw new Error("TINYBROWSER_BINARY is not set; run ./tools/playwright/run");
     }
     const root = mkdtempSync(join(tmpdir(), "tinybrowser-pw-"));
     const runtime = join(root, "run");

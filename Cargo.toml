@@ -1,4 +1,5 @@
 [workspace]
+exclude = ["third_party/rquickjs", "third_party/weedle4"]
 members = [
     "crates/browser",
     "crates/cdp",
@@ -11,6 +12,7 @@ members = [
     "crates/webstorage",
     "crates/wasm",
     "crates/webdriver",
+    "crates/webidl-bindgen",
 ]
 
 [workspace.package]
@@ -30,10 +32,10 @@ webdriver = { path = "crates/webdriver" }
 webstorage = { path = "crates/webstorage" }
 
 [patch.crates-io]
-rquickjs = { git = "https://github.com/ericc-ch/rquickjs.git", rev = "c161d2586e58ecffb00c2c1ef9169ee6bfec90b8" }
-rquickjs-core = { git = "https://github.com/ericc-ch/rquickjs.git", rev = "c161d2586e58ecffb00c2c1ef9169ee6bfec90b8" }
-rquickjs-macro = { git = "https://github.com/ericc-ch/rquickjs.git", rev = "c161d2586e58ecffb00c2c1ef9169ee6bfec90b8" }
-rquickjs-sys = { git = "https://github.com/ericc-ch/rquickjs.git", rev = "c161d2586e58ecffb00c2c1ef9169ee6bfec90b8" }
+rquickjs = { path = "third_party/rquickjs" }
+rquickjs-core = { path = "third_party/rquickjs/core" }
+rquickjs-macro = { path = "third_party/rquickjs/macro" }
+rquickjs-sys = { path = "third_party/rquickjs/sys" }
 
 [package]
 name = "tinybrowser"

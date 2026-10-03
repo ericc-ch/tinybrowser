@@ -16,17 +16,19 @@ use crate::js::events::JsEvent;
 use crate::js::world::{EventTargetKey, World};
 use crate::protocol::FrameId;
 
-/// The window a `WindowProxy` method call targets. A same-origin proxy passes
-/// its frame id through the proxy's `__tb_frameId` property; anything else —
-/// the caller's own global, a forged `this`, an id that names another origin —
-/// stays on the calling window
-/// (<https://html.spec.whatwg.org/multipage/window-object.html#windowproxy-get>).
 fn world_for_window_this<'js>(ctx: &Ctx<'js>, this: &Object<'js>) -> Result<Rc<RefCell<World>>> {
     let current = world(ctx)?;
     if this.as_value() == ctx.globals().as_value() {
         return Ok(current);
     }
-    let Ok(frame) = this.get::<_, f64>("__tb_frameId") else {
+    let slots: rquickjs::Function = crate::js::bridge::object(ctx)?.get("slots")?;
+    let data: Object = slots.call(("tinybrowser.window.data",))?;
+    let get: rquickjs::Function = data.get("get")?;
+    let value: Value = get.call((this.clone(),))?;
+    let Some(data) = value.as_object() else {
+        return Ok(current);
+    };
+    let Ok(frame) = data.get::<_, f64>("frame") else {
         return Ok(current);
     };
     if !frame.is_finite() || frame < 0.0 || frame.fract() != 0.0 || frame > f64::from(u32::MAX) {
@@ -40,8 +42,7 @@ fn world_for_window_this<'js>(ctx: &Ctx<'js>, this: &Object<'js>) -> Result<Rc<R
     let Some(target) = current.borrow().frame_world(FrameId::new(frame as u64)) else {
         return Ok(current);
     };
-    // A page can write `__tb_frameId`, so never let a forged receiver cross an
-    // origin boundary: only a same-origin frame's window may get the call.
+    // https://html.spec.whatwg.org/multipage/window-object.html#windowproxy-get
     let same_origin =
         target.borrow().document_url.origin() == current.borrow().document_url.origin();
     if same_origin { Ok(target) } else { Ok(current) }
@@ -180,10 +181,8 @@ pub(crate) fn window_dispatch_event<'js>(
 )]
 pub(crate) fn window_dispatch_trusted_event<'js>(
     ctx: Ctx<'js>,
-    token: Value<'js>,
     event: Class<'js, JsEvent>,
 ) -> Result<bool> {
-    crate::js::bindings::check_host_token(&ctx, &token)?;
     events::dispatch_trusted_event(&ctx, EventTargetKey::Window, &event)
 }
 

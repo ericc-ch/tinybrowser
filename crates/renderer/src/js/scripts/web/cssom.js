@@ -4,11 +4,10 @@
   class CSSStyleSheet {
     constructor() {
       this.cssRules = [];
-      this._text = '';
     }
     replaceSync(text) {
-      this._text = String(text);
-      this.cssRules = this._text ? [{ cssText: this._text }] : [];
+      const cssText = String(text);
+      this.cssRules = cssText ? [{ cssText }] : [];
     }
     replace(text) {
       this.replaceSync(text);
@@ -229,14 +228,9 @@
   Object.defineProperty(globalThis, 'matchMedia', {
     value: function(media) {
       return {
-        media: String(media), matches: __tbMediaQueryList(media), onchange: null,
-        addEventListener() {}, removeEventListener() {},
-        addListener() {}, removeListener() {}, dispatchEvent() { return true; },
+        media: String(media), matches: __tbMediaQueryList(media),
       };
     },
     writable: true, configurable: true,
-  });
-  Object.defineProperty(HTMLElement.prototype, 'scrollTo', {
-    value: function() {}, writable: true, configurable: true, enumerable: true,
   });
 }

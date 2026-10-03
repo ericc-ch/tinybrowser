@@ -39,7 +39,7 @@ test("runner contains hangs and crashes", async () => {
       "plain/runtime/runtime-evaluate-side-effect-free-onerror.js",
       "plain/sessions/runtime-evaluate.js",
     ], {
-      TINYBROWSER_BIN: "/unused",
+      TINYBROWSER_BINARY: "/unused",
       TINYBROWSER_CDP_RESULTS: resultsFile,
       TINYBROWSER_CDP_WORKER: WORKER,
     });
@@ -74,7 +74,7 @@ test("runner kills workers on termination", async () => {
       "--timeout=10000",
       "plain/injected-script-discard.js",
     ], {
-      TINYBROWSER_BIN: "/unused",
+      TINYBROWSER_BINARY: "/unused",
       TINYBROWSER_CDP_FAKE_PID: pidFile,
       TINYBROWSER_CDP_RESULTS: join(directory, "results.json"),
       TINYBROWSER_CDP_WORKER: WORKER,

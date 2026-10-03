@@ -5,16 +5,18 @@
 //! under a `textarea`.
 
 use crate::mutation::{self, Mutation};
+use crate::string::DomString;
 use crate::{Document, DomError, NodeId, NodeKind};
 
 fn set_data(
     document: &mut Document,
     id: NodeId,
-    extract: impl Fn(&mut NodeKind) -> Option<&mut String>,
-    data: String,
+    extract: impl Fn(&mut NodeKind) -> Option<&mut DomString>,
+    data: DomString,
 ) -> Result<(), DomError> {
     let parent = document.parent(id);
-    let value_before = parent.and_then(|parent| crate::form::textarea_value_before_change(document, parent));
+    let value_before =
+        parent.and_then(|parent| crate::form::textarea_value_before_change(document, parent));
     let kind = document.tree.kind_mut(id).ok_or(DomError::StaleNode)?;
     match extract(kind) {
         Some(field) => {
@@ -44,7 +46,7 @@ fn set_data(
 pub fn set_text(
     document: &mut Document,
     id: NodeId,
-    data: impl Into<String>,
+    data: impl Into<DomString>,
 ) -> Result<(), DomError> {
     set_data(
         document,
@@ -65,7 +67,8 @@ pub fn set_text(
 /// - [`DomError::WrongNodeType`] if `id` is not a text node.
 pub fn append_text(document: &mut Document, id: NodeId, extra: &str) -> Result<(), DomError> {
     let parent = document.parent(id);
-    let value_before = parent.and_then(|parent| crate::form::textarea_value_before_change(document, parent));
+    let value_before =
+        parent.and_then(|parent| crate::form::textarea_value_before_change(document, parent));
     let recording = mutation::recording(document);
     let old_value = {
         let kind = document.tree.kind_mut(id).ok_or(DomError::StaleNode)?;
@@ -100,7 +103,7 @@ pub fn append_text(document: &mut Document, id: NodeId, extra: &str) -> Result<(
 pub fn set_comment(
     document: &mut Document,
     id: NodeId,
-    data: impl Into<String>,
+    data: impl Into<DomString>,
 ) -> Result<(), DomError> {
     set_data(
         document,
@@ -122,7 +125,7 @@ pub fn set_comment(
 pub fn set_cdata_section(
     document: &mut Document,
     id: NodeId,
-    data: impl Into<String>,
+    data: impl Into<DomString>,
 ) -> Result<(), DomError> {
     set_data(
         document,
@@ -144,7 +147,7 @@ pub fn set_cdata_section(
 pub fn set_processing_instruction(
     document: &mut Document,
     id: NodeId,
-    data: impl Into<String>,
+    data: impl Into<DomString>,
 ) -> Result<(), DomError> {
     set_data(
         document,

@@ -25,6 +25,34 @@ use dom::{
 
 use crate::xml::is_valid_ncname;
 
+/// Serializer output: UTF-16 code units, so a lone surrogate in character
+/// data survives into the returned string.
+///
+/// Escaping only ever inserts ASCII, so the units copied from the tree are
+/// appended verbatim.
+#[derive(Default)]
+struct Output(Vec<u16>);
+
+impl Output {
+    fn push_str(&mut self, text: &str) {
+        self.0.extend(text.encode_utf16());
+    }
+
+    fn push(&mut self, character: char) {
+        let mut buffer = [0u16; 2];
+        self.0
+            .extend_from_slice(character.encode_utf16(&mut buffer));
+    }
+
+    fn push_units(&mut self, units: &[u16]) {
+        self.0.extend_from_slice(units);
+    }
+
+    fn finish(self) -> dom::DomString {
+        dom::DomString::from_utf16(self.0)
+    }
+}
+
 /// The `MathML` namespace URL, used by the HTML serialization name rules.
 const MATHML_NS: &str = "http://www.w3.org/1998/Math/MathML";
 
@@ -34,13 +62,13 @@ const MATHML_NS: &str = "http://www.w3.org/1998/Math/MathML";
 /// the HTML fragment serialization algorithm.
 ///
 /// <https://html.spec.whatwg.org/multipage/parsing.html#serialising-html-fragments>
-pub(crate) fn serialize_html_fragment(dom: &Document, element: NodeId) -> String {
+pub(crate) fn serialize_html_fragment(dom: &Document, element: NodeId) -> dom::DomString {
     let root = dom::shadow::template_contents(dom, element).unwrap_or(element);
     let parent = match dom.kind(element) {
         Some(NodeKind::Element { name, .. }) => Some((name.ns.clone(), name.local.clone())),
         _ => None,
     };
-    let mut output = String::new();
+    let mut output = Output::default();
     for child in children(dom, root) {
         serialize_html_node(
             dom,
@@ -49,16 +77,29 @@ pub(crate) fn serialize_html_fragment(dom: &Document, element: NodeId) -> String
             &mut output,
         );
     }
-    output
+    output.finish()
 }
 
-/// Serializes one element with the HTML fragment serialization algorithm.
-pub(crate) fn serialize_html_element(
+/// Serializes one element with the HTML fragment serialization algorithm,
+/// returning its own markup (`outerHTML`).
+pub(crate) fn serialize_html_outer(
     dom: &Document,
     id: NodeId,
     name: &QualName,
     attributes: &[Attribute],
-    output: &mut String,
+) -> dom::DomString {
+    let mut output = Output::default();
+    serialize_html_element(dom, id, name, attributes, &mut output);
+    output.finish()
+}
+
+/// Serializes one element with the HTML fragment serialization algorithm.
+fn serialize_html_element(
+    dom: &Document,
+    id: NodeId,
+    name: &QualName,
+    attributes: &[Attribute],
+    output: &mut Output,
 ) {
     output.push('<');
     push_html_element_name(output, name);
@@ -88,7 +129,7 @@ fn serialize_html_node(
     dom: &Document,
     id: NodeId,
     parent: Option<(&Namespace, &LocalName)>,
-    output: &mut String,
+    output: &mut Output,
 ) {
     let Some(kind) = dom.kind(id).cloned() else {
         return;
@@ -120,7 +161,7 @@ fn serialize_html_node(
                     )
             });
             if raw_text {
-                output.push_str(&data);
+                output.push_units(&data.units());
             } else {
                 push_escaped_html_text(output, &data);
             }
@@ -130,12 +171,12 @@ fn serialize_html_node(
             output.push_str("<?");
             output.push_str(&target);
             output.push(' ');
-            output.push_str(&data);
+            output.push_units(&data.units());
             output.push('>');
         }
         NodeKind::Comment { data } => {
             output.push_str("<!--");
-            output.push_str(&data);
+            output.push_units(&data.units());
             output.push_str("-->");
         }
         NodeKind::Element { name, attributes } => {
@@ -175,7 +216,7 @@ fn serializes_as_void(name: &QualName) -> bool {
 /// The element's serialized name: the local name for HTML, `MathML`, and
 /// SVG elements, the qualified name otherwise
 /// (<https://html.spec.whatwg.org/multipage/parsing.html#serialising-html-fragments>).
-fn push_html_element_name(output: &mut String, name: &QualName) {
+fn push_html_element_name(output: &mut Output, name: &QualName) {
     if name.ns == html_namespace() || name.ns == svg_namespace() || name.ns.as_ref() == MATHML_NS {
         output.push_str(name.local.as_ref());
     } else {
@@ -185,7 +226,7 @@ fn push_html_element_name(output: &mut String, name: &QualName) {
 
 /// The attribute's serialized name
 /// (<https://html.spec.whatwg.org/multipage/parsing.html#attribute-s-serialized-name>).
-fn push_html_attribute_name(output: &mut String, attribute: &Attribute) {
+fn push_html_attribute_name(output: &mut Output, attribute: &Attribute) {
     let name = &attribute.name;
     if name.ns.is_empty() {
         output.push_str(name.local.as_ref());
@@ -207,7 +248,7 @@ fn push_html_attribute_name(output: &mut String, attribute: &Attribute) {
     }
 }
 
-fn push_qualified_name(output: &mut String, prefix: Option<&dom::Prefix>, local: &LocalName) {
+fn push_qualified_name(output: &mut Output, prefix: Option<&dom::Prefix>, local: &LocalName) {
     if let Some(prefix) = prefix {
         output.push_str(prefix.as_ref());
         output.push(':');
@@ -215,19 +256,19 @@ fn push_qualified_name(output: &mut String, prefix: Option<&dom::Prefix>, local:
     output.push_str(local.as_ref());
 }
 
-fn push_escaped_html_text(output: &mut String, text: &str) {
-    for character in text.chars() {
-        match character {
-            '&' => output.push_str("&amp;"),
-            '\u{00a0}' => output.push_str("&nbsp;"),
-            '<' => output.push_str("&lt;"),
-            '>' => output.push_str("&gt;"),
-            _ => output.push(character),
+fn push_escaped_html_text(output: &mut Output, text: &dom::DomString) {
+    for &unit in text.units().iter() {
+        match unit {
+            0x26 => output.push_str("&amp;"),
+            0x00a0 => output.push_str("&nbsp;"),
+            0x3c => output.push_str("&lt;"),
+            0x3e => output.push_str("&gt;"),
+            _ => output.push_units(&[unit]),
         }
     }
 }
 
-fn push_escaped_html_attribute(output: &mut String, value: &str) {
+fn push_escaped_html_attribute(output: &mut Output, value: &str) {
     for character in value.chars() {
         match character {
             '&' => output.push_str("&amp;"),
@@ -263,7 +304,7 @@ pub(crate) fn serialize_xml(
     dom: &Document,
     node: NodeId,
     require_well_formed: bool,
-) -> Result<String, XmlSerializeError> {
+) -> Result<dom::DomString, XmlSerializeError> {
     serialize_in_context(dom, require_well_formed, |serializer, map, output| {
         serializer.node(node, None, map, output)
     })
@@ -275,7 +316,7 @@ pub(crate) fn serialize_xml_children(
     dom: &Document,
     parent: NodeId,
     require_well_formed: bool,
-) -> Result<String, XmlSerializeError> {
+) -> Result<dom::DomString, XmlSerializeError> {
     serialize_in_context(dom, require_well_formed, |serializer, map, output| {
         for child in children(dom, parent) {
             serializer.node(child, None, map, output)?;
@@ -290,14 +331,14 @@ pub(crate) fn serialize_xml_children(
 fn serialize_in_context(
     dom: &Document,
     require_well_formed: bool,
-    write: impl FnOnce(&mut XmlSerializer<'_>, &PrefixMap, &mut String) -> Result<(), XmlSerializeError>,
-) -> Result<String, XmlSerializeError> {
+    write: impl FnOnce(&mut XmlSerializer<'_>, &PrefixMap, &mut Output) -> Result<(), XmlSerializeError>,
+) -> Result<dom::DomString, XmlSerializeError> {
     let mut serializer = XmlSerializer::new(dom, require_well_formed);
     let mut map = PrefixMap::default();
     map.add(Some(XML_NS), "xml");
-    let mut output = String::new();
+    let mut output = Output::default();
     write(&mut serializer, &map, &mut output)?;
-    Ok(output)
+    Ok(output.finish())
 }
 
 /// What the element step already decided about the element's default
@@ -337,7 +378,7 @@ impl<'a> XmlSerializer<'a> {
         id: NodeId,
         context: Option<&str>,
         map: &PrefixMap,
-        output: &mut String,
+        output: &mut Output,
     ) -> Result<(), XmlSerializeError> {
         let Some(kind) = self.document.kind(id).cloned() else {
             return Err(XmlSerializeError);
@@ -362,7 +403,7 @@ impl<'a> XmlSerializer<'a> {
                 self.element(id, &name, &attributes, context, map, output)
             }
             NodeKind::Text { data } => {
-                if self.require_well_formed && !data.chars().all(is_xml_char) {
+                if self.require_well_formed && !units_are_xml(&data.units()) {
                     return Err(XmlSerializeError);
                 }
                 push_escaped_xml_text(output, &data);
@@ -370,29 +411,29 @@ impl<'a> XmlSerializer<'a> {
             }
             NodeKind::CDataSection { data } => {
                 output.push_str("<![CDATA[");
-                output.push_str(&data);
+                output.push_units(&data.units());
                 output.push_str("]]>");
                 Ok(())
             }
             NodeKind::Comment { data } => {
+                let text = data.to_string_lossy();
                 if self.require_well_formed
-                    && (!data.chars().all(is_xml_char)
-                        || data.contains("--")
-                        || data.ends_with('-'))
+                    && (!units_are_xml(&data.units()) || text.contains("--") || text.ends_with('-'))
                 {
                     return Err(XmlSerializeError);
                 }
                 output.push_str("<!--");
-                output.push_str(&data);
+                output.push_units(&data.units());
                 output.push_str("-->");
                 Ok(())
             }
             NodeKind::ProcessingInstruction { target, data } => {
+                let text = data.to_string_lossy();
                 if self.require_well_formed
                     && (target.contains(':')
                         || target.eq_ignore_ascii_case("xml")
-                        || !data.chars().all(is_xml_char)
-                        || data.contains("?>"))
+                        || !units_are_xml(&data.units())
+                        || text.contains("?>"))
                 {
                     return Err(XmlSerializeError);
                 }
@@ -400,7 +441,7 @@ impl<'a> XmlSerializer<'a> {
                 output.push_str(&target);
                 if !data.is_empty() {
                     output.push(' ');
-                    output.push_str(&data);
+                    output.push_units(&data.units());
                 }
                 output.push_str("?>");
                 Ok(())
@@ -445,7 +486,7 @@ impl<'a> XmlSerializer<'a> {
         attributes: &[Attribute],
         context: Option<&str>,
         inherited_map: &PrefixMap,
-        output: &mut String,
+        output: &mut Output,
     ) -> Result<(), XmlSerializeError> {
         if self.require_well_formed && !is_valid_ncname(&name.local) {
             return Err(XmlSerializeError);
@@ -552,7 +593,7 @@ impl<'a> XmlSerializer<'a> {
         scope: &mut ElementNamespaces,
         defaults: DefaultDeclarationHandling,
         element_ns: Option<&str>,
-        output: &mut String,
+        output: &mut Output,
     ) -> Result<(), XmlSerializeError> {
         for attribute in attributes {
             let attribute_ns = namespace_str(&attribute.name.ns);
@@ -659,7 +700,7 @@ impl<'a> XmlSerializer<'a> {
         id: NodeId,
         serialized: &SerializedElement<'_>,
         map: &PrefixMap,
-        output: &mut String,
+        output: &mut Output,
     ) -> Result<(), XmlSerializeError> {
         let SerializedElement {
             name,
@@ -770,21 +811,30 @@ fn namespace_str(namespace: &Namespace) -> Option<&str> {
     normalize(namespace.as_ref())
 }
 
-fn push_escaped_xml_text(output: &mut String, text: &str) {
-    for character in text.chars() {
-        match character {
-            '&' => output.push_str("&amp;"),
-            '<' => output.push_str("&lt;"),
-            '>' => output.push_str("&gt;"),
-            _ => output.push(character),
+fn push_escaped_xml_text(output: &mut Output, text: &dom::DomString) {
+    for &unit in text.units().iter() {
+        match unit {
+            0x26 => output.push_str("&amp;"),
+            0x3c => output.push_str("&lt;"),
+            0x3e => output.push_str("&gt;"),
+            _ => output.push_units(&[unit]),
         }
+    }
+}
+
+/// Whether every UTF-16 code unit can appear in well-formed XML. Unpaired
+/// surrogates make the sequence un-representable, so they fail.
+fn units_are_xml(units: &[u16]) -> bool {
+    match String::from_utf16(units) {
+        Ok(text) => text.chars().all(is_xml_char),
+        Err(_) => false,
     }
 }
 
 /// Appends one namespace declaration, `xmlns="value"` or
 /// `xmlns:prefix="value"`
 /// (<https://w3c.github.io/DOM-Parsing/#dfn-xml-serializing-an-element-node>).
-fn push_xmlns(output: &mut String, prefix: Option<&str>, value: &str) {
+fn push_xmlns(output: &mut Output, prefix: Option<&str>, value: &str) {
     output.push_str(" xmlns");
     if let Some(prefix) = prefix {
         output.push(':');
@@ -795,7 +845,7 @@ fn push_xmlns(output: &mut String, prefix: Option<&str>, value: &str) {
     output.push('"');
 }
 
-fn push_escaped_xml_attribute(output: &mut String, value: &str) {
+fn push_escaped_xml_attribute(output: &mut Output, value: &str) {
     for character in value.chars() {
         match character {
             '&' => output.push_str("&amp;"),
@@ -812,7 +862,7 @@ fn push_escaped_xml_attribute(output: &mut String, value: &str) {
 
 /// Serializes a doctype identifier, choosing the quote the value does not
 /// contain (<https://w3c.github.io/DOM-Parsing/#dfn-serialization-of-the-id>).
-fn push_xml_identifier(output: &mut String, identifier: &str) {
+fn push_xml_identifier(output: &mut Output, identifier: &str) {
     let quote = if identifier.contains('"') { '\'' } else { '"' };
     output.push(quote);
     output.push_str(identifier);

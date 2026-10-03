@@ -1,0 +1,142 @@
+const {
+  Object, Function, String, Number, Boolean, Array, ArrayBuffer, Uint8Array,
+  Date, JSON, Promise, RegExp, Proxy, Reflect, Symbol, Map, Set, WeakMap, WeakSet,
+  Error, TypeError, RangeError,
+} = globalThis;
+const __tbApply = Reflect.apply;
+const __tbConstruct = Reflect.construct;
+const __tbDefineProperty = Object.defineProperty;
+const __tbSetPrototypeOf = Object.setPrototypeOf;
+const __tbObjectCreate = Object.create;
+const __tbJsonParse = JSON.parse;
+const __tbJsonStringify = JSON.stringify;
+const __tbIteratorSymbol = Symbol.iterator;
+const __tbPrivateArray = () => {
+  const array = [];
+  __tbSetPrototypeOf(array, null);
+  return array;
+};
+const __tbArray = Object.create(null);
+for (const name of ['some', 'sort', 'join', 'indexOf']) {
+  const method = Array.prototype[name];
+  __tbArray[name] = (array, ...args) => __tbApply(method, array, args);
+}
+__tbArray.push = (array, ...values) => {
+  for (let index = 0; index < values.length; index++) {
+    __tbDefineProperty(array, array.length, {
+      __proto__: null,
+      value: values[index], writable: true, enumerable: true, configurable: true,
+    });
+  }
+  return array.length;
+};
+__tbArray.remove = (array, index) => {
+  for (; index + 1 < array.length; index++) array[index] = array[index + 1];
+  array.length--;
+};
+__tbArray.shift = array => {
+  if (array.length === 0) return undefined;
+  const value = array[0];
+  __tbArray.remove(array, 0);
+  return value;
+};
+__tbArray.iterator = array => {
+  let index = 0;
+  return {
+    next() {
+      // https://tc39.es/ecma262/#sec-%arrayiteratorprototype%.next
+      if (array === null || index >= array.length) {
+        array = null;
+        return { value: undefined, done: true };
+      }
+      return { value: array[index++], done: false };
+    },
+    [__tbIteratorSymbol]() { return this; },
+  };
+};
+const __tbUint8Array = Uint8Array;
+const __tbMapConstructor = Map;
+const __tbMapGet = Map.prototype.get;
+const __tbMapSet = Map.prototype.set;
+const __tbMapHas = Map.prototype.has;
+const __tbMapDelete = Map.prototype.delete;
+const __tbMapClear = Map.prototype.clear;
+const __tbMapKeys = Map.prototype.keys;
+const __tbMapValues = Map.prototype.values;
+const __tbMapEntries = Map.prototype.entries;
+const __tbMapSize = Object.getOwnPropertyDescriptor(Map.prototype, 'size').get;
+const __tbMapNext = Object.getPrototypeOf(new Map().entries()).next;
+const __tbFreeze = Object.freeze;
+const __tbPrivateMap = function() {
+  const map = new __tbMapConstructor();
+  const iterator = method => {
+    const iterator = __tbApply(method, map, []);
+    return {
+      next() {
+        const result = __tbApply(__tbMapNext, iterator, []);
+        if (!result.done && method === __tbMapEntries) {
+          const entry = result.value;
+          __tbSetPrototypeOf(entry, null);
+          __tbDefineProperty(entry, __tbIteratorSymbol, { __proto__: null, value: () => __tbArray.iterator(entry) });
+        }
+        return result;
+      },
+      [__tbIteratorSymbol]() { return this; },
+    };
+  };
+  const facade = {
+    __proto__: null,
+    get size() { return __tbApply(__tbMapSize, map, []); },
+    get(key) { return __tbApply(__tbMapGet, map, [key]); },
+    set(key, value) { __tbApply(__tbMapSet, map, [key, value]); return facade; },
+    has(key) { return __tbApply(__tbMapHas, map, [key]); },
+    delete(key) { return __tbApply(__tbMapDelete, map, [key]); },
+    clear() { __tbApply(__tbMapClear, map, []); },
+    keys() { return iterator(__tbMapKeys); },
+    values() { return iterator(__tbMapValues); },
+    entries() { return iterator(__tbMapEntries); },
+    [__tbIteratorSymbol]() { return iterator(__tbMapEntries); },
+  };
+  return __tbFreeze(facade);
+};
+const __tbPrivateSet = function() {
+  const map = new __tbPrivateMap();
+  const facade = {
+    __proto__: null,
+    get size() { return map.size; },
+    add(value) { map.set(value, true); return facade; },
+    has(value) { return map.has(value); },
+    delete(value) { return map.delete(value); },
+    clear() { map.clear(); },
+    values() { return map.keys(); },
+    [__tbIteratorSymbol]() { return map.keys(); },
+  };
+  return __tbFreeze(facade);
+};
+const __tbBytesCopy = (bytes, start = 0, end = bytes.length) => {
+  const result = new __tbUint8Array(end - start);
+  for (let index = start; index < end; index++) result[index - start] = bytes[index];
+  return result;
+};
+__tbArray.map = (array, callback) => {
+  const result = [];
+  for (let index = 0; index < array.length; index++) {
+    __tbDefineProperty(result, index, {
+      __proto__: null,
+      value: callback(array[index], index), writable: true, enumerable: true, configurable: true,
+    });
+  }
+  return result;
+};
+__tbArray.filter = (array, callback) => {
+  const result = [];
+  for (let index = 0; index < array.length; index++) {
+    if (callback(array[index], index)) {
+      __tbDefineProperty(result, result.length, {
+        __proto__: null,
+        value: array[index], writable: true, enumerable: true, configurable: true,
+      });
+    }
+  }
+  return result;
+};

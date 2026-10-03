@@ -10,6 +10,8 @@ In `docs/progress.md`, replace the latest binary size, the latest total, and sco
 - Cargo tests cover tinybrowser-specific behavior only (`cargo test --workspace`).
 - Web-platform conformance is WPT (`tools/wpt/run`, `tools/wpt/run --score`, `retest`).
 - Extra runners: Blink CDP (`tools/cdp-tests/run`), Playwright (`tools/playwright/run`), test262 (`tools/intl/test262`).
+- Keep the WPT feedback loop fast: run the smallest slice that answers the question (single files or dirs, never suites); rerun only failures with `retest`.
+- No suite or slice runs without being asked. Anything longer than minutes needs explicit approval.
 
 Do not test spec conformance in cargo tests. Never add, keep, or "fix" a cargo test that asserts web-platform behavior or duplicates a WPT case. If a spec regression would only be caught by a cargo test, the missing WPT run is the bug.
 
@@ -23,8 +25,23 @@ Do not test spec conformance in cargo tests. Never add, keep, or "fix" a cargo t
 
 - Engine forks, one maintained branch each (`master` is the line). Fixes stay
   downstream; do not submit an upstream PR.
-  - QuickJS-NG fork `github.com/ericc-ch/quickjs`. Pinned as the `sys/quickjs` submodule in the rquickjs fork.
-  - rquickjs fork `github.com/ericc-ch/rquickjs`. Pinned in tinybrowser via `[patch.crates-io]` plus `Cargo.lock`.
+  - QuickJS-NG fork `github.com/ericc-ch/quickjs`. Checked out as the nested
+    `sys/quickjs` submodule inside the rquickjs checkout below.
+  - rquickjs fork `github.com/ericc-ch/rquickjs`. Checked out as the
+    `third_party/rquickjs` submodule (recursive) and wired in via
+    `[patch.crates-io]` path entries. It is its own workspace, excluded from
+    the tinybrowser workspace, so its lint config stays separate.
+  - Pull upstream inside the submodule, push the fork branch there, then bump
+    the submodule pointer in tinybrowser. Fresh clones and worktrees need
+    `git submodule update --init --recursive`.
+
+- Use pinned upstream WebIDL extracts as the interface contract. Implementations
+  follow standardized names and generated contracts. Do not maintain explicit
+  mapping tables, per-member overrides, or modified spec declarations.
+  Implementation follows IDL, never the reverse: do not edit IDL to match our code.
+
+For Web API implementation or binding changes, read
+`docs/bindings.md` for JS/Rust ownership, IDL inputs, and coverage rules.
 
 ## Working rules
 

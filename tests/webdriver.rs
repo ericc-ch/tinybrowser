@@ -127,7 +127,7 @@ fn session_execute_script_roundtrip() {
         &format!("/session/{id}/execute/sync"),
         Some(r#"{"script":"return typeof __tb_webdriver_click","args":[]}"#),
     );
-    assert_eq!(click_type["value"], json!("function"));
+    assert_eq!(click_type["value"], json!("undefined"));
 }
 
 #[test]

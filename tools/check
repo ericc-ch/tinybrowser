@@ -88,6 +88,7 @@ valgrind_test() {
 
 case "${1:-clippy}" in
   clippy)
+    tools/webidl/import --check
     run_clippy
     run_js
     run_docs

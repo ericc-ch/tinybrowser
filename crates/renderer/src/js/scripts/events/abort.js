@@ -1,12 +1,15 @@
 (function() {
-  const STATE = Symbol('abort-state');
+  const STATE = host.slots('abort-state');
+  const EventTargetConstructor = globalThis.EventTarget;
+  const EventConstructor = globalThis.Event;
+  const dispatchEvent = EventTargetConstructor.prototype.dispatchEvent;
   function createSignal() {
-    const signal = Reflect.construct(globalThis.EventTarget, [], AbortSignal);
-    signal[STATE] = { aborted: false, reason: undefined };
+    const signal = __tbConstruct(EventTargetConstructor, [], AbortSignal);
+    STATE.set(signal, { aborted: false, reason: undefined });
     return signal;
   }
   function signalAbort(signal, reason) {
-    const state = signal[STATE];
+    const state = STATE.get(signal);
     if (!state || state.aborted) {
       return;
     }
@@ -14,7 +17,7 @@
     state.reason = reason !== undefined
       ? reason
       : new DOMException('signal is aborted without reason', 'AbortError');
-    signal.dispatchEvent(new Event('abort'));
+    __tbApply(dispatchEvent, signal, [new EventConstructor('abort')]);
   }
   function AbortSignal() {
     throw new TypeError('Illegal constructor');
@@ -24,17 +27,17 @@
     value: AbortSignal, writable: true, configurable: true,
   });
   Object.defineProperty(signalProto, 'aborted', {
-    get: function() { return !!(this[STATE] && this[STATE].aborted); },
+    get: function() { return !!(STATE.get(this) && STATE.get(this).aborted); },
     enumerable: true, configurable: true,
   });
   Object.defineProperty(signalProto, 'reason', {
-    get: function() { return this[STATE] ? this[STATE].reason : undefined; },
+    get: function() { return STATE.get(this) ? STATE.get(this).reason : undefined; },
     enumerable: true, configurable: true,
   });
   Object.defineProperty(signalProto, 'throwIfAborted', {
     value: function() {
-      if (this[STATE] && this[STATE].aborted) {
-        throw this[STATE].reason;
+      if (STATE.get(this) && STATE.get(this).aborted) {
+        throw STATE.get(this).reason;
       }
     },
     writable: true, enumerable: true, configurable: true,
@@ -53,7 +56,7 @@
   Object.defineProperty(AbortSignal, 'timeout', {
     value: function(milliseconds) {
       const signal = createSignal();
-      globalThis.setTimeout(function() {
+      host.setTimeout(function() {
         signalAbort(signal, new DOMException('The operation timed out.', 'TimeoutError'));
       }, Number(milliseconds));
       return signal;
@@ -65,7 +68,8 @@
       throw new TypeError('Class constructor AbortController cannot be invoked without new');
     }
     const signal = createSignal();
-    Object.defineProperty(this, 'signal', {
+    __tbDefineProperty(this, 'signal', {
+      __proto__: null,
       get: function() { return signal; },
       enumerable: true, configurable: true,
     });

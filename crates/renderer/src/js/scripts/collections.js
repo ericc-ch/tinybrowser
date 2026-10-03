@@ -1,20 +1,8 @@
 (function() {
-  const isOptionNode = globalThis.__tbIsOptionNode;
-  const appendBlankOptions = globalThis.__tbAppendBlankOptions;
-  const collectionNamed = globalThis.__tbCollectionNamed;
-  const collectionLength = globalThis.__tbCollectionLength;
-  const windowNamedValue = globalThis.__tbWindowNamedValue;
-  const windowNamedHas = globalThis.__tbWindowNamedHas;
-  delete globalThis.__tbIsOptionNode;
-  delete globalThis.__tbAppendBlankOptions;
-  delete globalThis.__tbCollectionNamed;
-  delete globalThis.__tbCollectionLength;
-  delete globalThis.__tbWindowNamedValue;
-  delete globalThis.__tbWindowNamedHas;
-  const toUnsignedLong = value => {
-    const number = +value;
-    return Number.isFinite(number) ? ((Math.trunc(number) % 4294967296) + 4294967296) % 4294967296 : 0;
-  };
+  const windowNamedValue = host.__tbWindowNamedValue;
+  const windowNamedHas = host.__tbWindowNamedHas;
+  delete host.__tbWindowNamedValue;
+  delete host.__tbWindowNamedHas;
   const native = globalThis.NodeList.prototype;
   function values() {
     let index = 0;
@@ -61,130 +49,27 @@
   Object.defineProperty(proto, Symbol.toStringTag, {
     value: 'HTMLCollection', writable: false, enumerable: false, configurable: true,
   });
-  Object.defineProperty(proto, 'namedItem', {
-    value: function(name) { return collectionNamed(this, String(name)); },
-    writable: true, enumerable: true, configurable: true,
-  });
-  // <https://html.spec.whatwg.org/multipage/common-dom-interfaces.html#htmloptionscollection>
-  const optionsCtor = globalThis.HTMLOptionsCollection;
-  const optionsProto = optionsCtor.prototype;
-  Object.setPrototypeOf(optionsProto, proto);
-  Object.setPrototypeOf(optionsCtor, ctor);
-  Object.defineProperty(optionsProto, Symbol.toStringTag, {
-    value: 'HTMLOptionsCollection', configurable: true,
-  });
-  const optionOwners = new WeakMap();
+  // `HTMLOptionsCollection` inherits natively from `HTMLCollection`; the
+  // remaining shim only preserves `SameObject` identity for the live
+  // `select.options` and `select.selectedOptions` collections.
   for (const name of ['options', 'selectedOptions']) {
     const nativeGetter = Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, name).get;
-    const cache = new WeakMap();
+    const cache = host.slots();
     Object.defineProperty(HTMLSelectElement.prototype, name, {
       get: function() {
         let collection = cache.get(this);
         if (collection === undefined) {
           collection = nativeGetter.call(this);
           cache.set(this, collection);
-          if (name === 'options') optionOwners.set(collection, this);
         }
         return collection;
       },
       enumerable: true, configurable: true,
     });
   }
-  const setOption = (select, index, option) => {
-    if (option === null || option === undefined) {
-      select.remove(index);
-      return;
-    }
-    if (!isOptionNode(option)) {
-      throw new TypeError('option must be an HTMLOptionElement');
-    }
-    // The spec does not cap indexed writes, but Blink refuses to grow the
-    // list past 100,000 options to avoid unbounded allocations
-    // (<https://html.spec.whatwg.org/multipage/common-dom-interfaces.html#htmloptionscollection>).
-    if (index > select.options.length && index >= 100000) return;
-    const existing = select.options.item(index);
-    if (existing) {
-      existing.parentNode.replaceChild(option, existing);
-    } else {
-      select.options.length = index;
-      select.add(option);
-    }
-  };
-  // Captured by Rust at install, then deleted from the global by Rust so page
-  // script cannot call it directly. Configurable so the install can remove it.
-  Object.defineProperty(globalThis, '__tbSetOption', {
-    value: setOption, configurable: true, writable: false,
-  });
-  Object.defineProperties(optionsProto, {
-    length: {
-      get: function() { return collectionLength(this); },
-      set: function(value) {
-        const select = optionOwners.get(this);
-        const length = toUnsignedLong(value);
-        const current = this.length;
-        // <https://html.spec.whatwg.org/multipage/common-dom-interfaces.html#dom-htmloptionscollection-length>
-        if (length > current && length > 100000) return;
-        if (length < current) {
-          const removed = [];
-          for (let index = length; index < current; index++) removed.push(this.item(index));
-          for (const option of removed) if (option.parentNode) option.remove();
-        } else if (length > current) {
-          appendBlankOptions(select, length - current);
-        }
-      },
-      configurable: true,
-    },
-    selectedIndex: {
-      get: function() { return optionOwners.get(this).selectedIndex; },
-      set: function(value) { optionOwners.get(this).selectedIndex = value; },
-      enumerable: true, configurable: true,
-    },
-    add: {
-      value: function(element, before) { optionOwners.get(this).add(element, before); },
-      writable: true, enumerable: true, configurable: true,
-    },
-    remove: {
-      value: function(index) {
-        if (arguments.length === 0) throw new TypeError('remove requires an index');
-        optionOwners.get(this).remove(index);
-      },
-      writable: true, enumerable: true, configurable: true,
-    },
-  });
-  // NamedNodeMap exposes both indexed and named properties, and its own
-  // property names are the indices followed by the qualified names
-  // (<https://dom.spec.whatwg.org/#interface-namednodemap>).
-  // NamedNodeMap exposes indexed and named properties as real own
-  // properties; interface members and prototype methods always win.
-  Object.defineProperty(globalThis, '__tb_refreshNamedNodeMap', {
-    enumerable: false,
-    configurable: false,
-    writable: false,
-    value: function(map, names, lowercaseOnly) {
-      for (const key of Object.getOwnPropertyNames(map)) {
-        delete map[key];
-      }
-      for (let i = 0; i < names.length; i++) {
-        const attr = map.item(i);
-        Object.defineProperty(map, String(i), {
-          value: attr,
-          enumerable: true,
-          configurable: true,
-          writable: false,
-        });
-        const name = names[i];
-        const named = !lowercaseOnly || !/[A-Z]/.test(name);
-        if (named && !(name in map)) {
-          Object.defineProperty(map, name, {
-            value: attr,
-            enumerable: false,
-            configurable: true,
-            writable: false,
-          });
-        }
-      }
-    }
-  });
+  // NamedNodeMap exposes indexed and named properties through the
+  // generated exotic hooks; interface members and prototype methods always
+  // win.
   // Named access on the Window object
   // (<https://html.spec.whatwg.org/multipage/nav-history-apis.html#named-access-on-the-window-object>):
   // a named properties object sits between the global and its prototype. It

@@ -4,7 +4,7 @@ import { defineConfig } from "@playwright/test";
 // bundled browser, so no `playwright install` step is needed.
 export default defineConfig({
   testDir: ".",
-  testMatch: /.*\.spec\.ts/,
+  testMatch: /.*\.spec\.(ts|js)/,
   timeout: 30_000,
   workers: 1,
   fullyParallel: false,

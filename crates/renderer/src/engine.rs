@@ -27,7 +27,9 @@ pub(crate) const VIEWPORT_WIDTH: f32 = 800.0;
 pub(crate) const VIEWPORT_HEIGHT: f32 = 600.0;
 
 use crate::documents::DocumentStore;
-use crate::js::{DocumentStreamCommand, FrameNavigation, NavigationTarget, RealmRegistry, SharedJsRuntime};
+use crate::js::{
+    DocumentStreamCommand, FrameNavigation, NavigationTarget, RealmRegistry, SharedJsRuntime,
+};
 use crate::messaging::{Delivery, MAX_FRAMES, SharedHandle};
 use crate::protocol::{BrowserServices, FrameId, Mount, RendererEvent, TabError};
 use crate::storage::PendingStorageEvent;
@@ -41,6 +43,7 @@ pub struct Engine {
     /// The handles every frame document shares.
     runtime: FrameRuntime,
     frames: BTreeMap<FrameId, Document>,
+    js_runtime: SharedJsRuntime,
 }
 
 impl Engine {
@@ -50,9 +53,10 @@ impl Engine {
     /// completion or stop arrives, so a carrier can wait instead of polling.
     #[must_use]
     pub fn new(services: Arc<dyn BrowserServices>, stop: Arc<Stop>, wake: Arc<Notify>) -> Self {
+        let js_runtime = SharedJsRuntime::default();
         let runtime = FrameRuntime {
             services,
-            js_runtime: SharedJsRuntime::default(),
+            js_runtime: js_runtime.handle(),
             wake,
             stop,
             documents: Rc::new(RefCell::new(DocumentStore::default())),
@@ -63,7 +67,11 @@ impl Engine {
         let main = Document::with_shared(FrameId::MAIN, &runtime);
         let mut frames = BTreeMap::new();
         frames.insert(FrameId::MAIN, main);
-        Self { runtime, frames }
+        Self {
+            runtime,
+            frames,
+            js_runtime,
+        }
     }
 
     fn create_frame(&mut self, parent: FrameId, container: dom::NodeId) -> FrameId {
@@ -221,7 +229,7 @@ impl Engine {
     pub fn execute_remote_in(
         &mut self,
         frame: FrameId,
-        source: &str,
+        source: crate::ScriptSource<&str>,
         timeout: Option<Duration>,
     ) -> Result<RemoteValue, TabError> {
         let result = self.frame_mut(frame)?.execute_remote(source, timeout);
@@ -349,8 +357,17 @@ impl Engine {
     ///
     /// [`TabError::UnknownFrame`] when the main frame is not mounted and
     /// [`TabError::InvalidUrl`] when `url` does not parse or is cross-origin.
-    pub fn traverse_history(&mut self, url: &str, history: &crate::protocol::HistorySnapshot) -> Result<(), TabError> {
-        let document = self.frames.get_mut(&FrameId::MAIN).ok_or(TabError::UnknownFrame { frame: FrameId::MAIN.get() })?;
+    pub fn traverse_history(
+        &mut self,
+        url: &str,
+        history: &crate::protocol::HistorySnapshot,
+    ) -> Result<(), TabError> {
+        let document = self
+            .frames
+            .get_mut(&FrameId::MAIN)
+            .ok_or(TabError::UnknownFrame {
+                frame: FrameId::MAIN.get(),
+            })?;
         document.traverse_history(url, history)
     }
 
@@ -1123,5 +1140,6 @@ impl Drop for Engine {
         // last one and drops with the struct.
         self.frames.clear();
         self.runtime.registry.borrow_mut().clear();
+        self.js_runtime.collect();
     }
 }

@@ -18,7 +18,7 @@ use crate::ActiveParser;
 use crate::Parsed;
 use crate::ReadyState;
 use crate::documents::DocumentStore;
-use crate::js::{DocumentStreamCommand, FrameNavigation, RealmRegistry, SharedJsRuntime, World};
+use crate::js::{DocumentStreamCommand, FrameNavigation, JsRuntimeHandle, RealmRegistry, World};
 use crate::messaging::SharedHandle;
 use crate::protocol::{
     BrowserServices, DialOutcome, FrameId, Mount, RendererEvent, ScriptFailure, TabError,
@@ -157,7 +157,7 @@ struct Timer {
 #[derive(Clone)]
 pub(crate) struct FrameRuntime {
     pub(crate) services: Arc<dyn BrowserServices>,
-    pub(crate) js_runtime: SharedJsRuntime,
+    pub(crate) js_runtime: JsRuntimeHandle,
     pub(crate) wake: Arc<Notify>,
     pub(crate) stop: Arc<Stop>,
     pub(crate) documents: Rc<RefCell<DocumentStore>>,
@@ -176,7 +176,7 @@ pub(crate) struct FrameRuntime {
 pub(crate) struct Document {
     services: Arc<dyn BrowserServices>,
     world: Rc<RefCell<World>>,
-    js_runtime: SharedJsRuntime,
+    js_runtime: JsRuntimeHandle,
     wake: Arc<Notify>,
     /// The browsing context this document belongs to.
     frame: FrameId,
@@ -374,7 +374,7 @@ impl Document {
     /// one, so a script sees it in the same task
     /// (<https://html.spec.whatwg.org/multipage/iframe-embed-object.html#process-the-iframe-attributes>).
     pub(crate) fn adopt_pending_frames(&mut self) {
-        let created = self.world.borrow_mut().adopt_pending_frames();
+        let created = World::adopt_pending_frames(&self.world);
         for container in created {
             // The child is loading from this moment on, so this document's
             // `load` event waits for it
@@ -563,7 +563,9 @@ impl Document {
         url: &str,
         history: &crate::protocol::HistorySnapshot,
     ) -> Result<(), TabError> {
-        let url = Url::parse(url).map_err(|_| TabError::InvalidUrl { spec: url.to_owned() })?;
+        let url = Url::parse(url).map_err(|_| TabError::InvalidUrl {
+            spec: url.to_owned(),
+        })?;
         if url.origin() != self.url.origin() {
             return Err(TabError::InvalidUrl { spec: url.into() });
         }
@@ -571,12 +573,14 @@ impl Document {
         let previous_history = self.world.borrow().history.clone();
         self.apply_document_url(url.as_str());
         self.world.borrow_mut().history = history.clone();
-        let restored_state = self.js.as_ref().map(|js| {
-            js.restore_history(history.state.as_deref(), history.length)
-        }).transpose();
+        let restored_state = self
+            .js
+            .as_ref()
+            .map(|js| js.restore_history(history.state.as_deref(), history.length))
+            .transpose();
         match restored_state {
             Ok(Some(state)) => self.fire_js(|js| js.fire_popstate(&state)),
-            Ok(None) => {},
+            Ok(None) => {}
             Err(error) => {
                 self.apply_document_url(previous_url.as_str());
                 self.world.borrow_mut().history = previous_history;
@@ -766,7 +770,7 @@ impl Document {
 
     pub(crate) fn execute_script_deadline(
         &mut self,
-        source: &str,
+        source: crate::ScriptSource<&str>,
         deadline: Option<WallClock>,
     ) -> Result<ScriptValue, TabError> {
         self.ensure_js()?;

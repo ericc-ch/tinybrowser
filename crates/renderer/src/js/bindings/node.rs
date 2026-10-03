@@ -1,36 +1,252 @@
 //! The single `Node` wrapper class and its members.
 
 use super::{
-    CollectionKind, FromJs, ImportSnapshot, JsAttr, JsImplementation, JsNamedNodeMap, JsTokenList,
-    LegacyNullString, NodeContext, OptString, Trace, WebIdlString, WebIdlUnsignedLong,
-    adopt_across_documents, after_attribute_change, ancestor_chain, attached_attr_id, attr_owner,
-    attr_state, attr_wrapper, attribute_local_name, attribute_value, blur_node, character_data,
-    character_data_offset, child_value, clone_document, convert_nodes_into_node,
-    create_element_named, create_html_element, create_kind, deref_weak, descendant_text,
-    detach_attr, doctype_fields, document_base_url_string, document_is_html,
-    document_is_html_content, document_url_string, element_at_point, element_box, element_click,
-    element_node_name, element_sibling_value, elements_by_tag, find_element_by_id,
-    fixup_focus_after_removal, focus_node, host_node_id, import_snapshot, is_element, is_focusable,
+    AttrArgument, CollectionKind, ImportSnapshot, JsImplementation, JsNamedNodeMap,
+    JsTokenList, LegacyNullString, NodeContext, NodeOrString, OptString, Trace, WebIdlCodeUnits,
+    WebIdlString,
+    WebIdlUnsignedLong, adopt_across_documents, after_attribute_change, ancestor_chain,
+    attached_attr_id, attr_owner, attr_state, attr_wrapper, attribute_local_name, attribute_value,
+    blur_node, character_data, character_data_offset, child_value, clone_document,
+    convert_union_nodes_into_node, create_element_named, create_html_element, create_kind,
+    deref_weak,
+    descendant_text, doctype_fields, document_base_url_string, document_is_html,
+    document_is_html_content, document_url_string, dom_string, element_at_point, element_box,
+    element_click, element_node_name, element_sibling_value, elements_by_tag, find_element_by_id,
+    fixup_focus_after_removal, focus_node, host, host_node_id, import_snapshot, is_element, is_focusable,
     is_html_element, is_main_document, is_template_element, live_collection, locate_namespace,
     locate_prefix, main_document, make_weak, materialize_children, materialize_import,
-    new_detached_attr, nodes_equal, optional_node, qualified_name, rect_object,
-    refresh_named_node_map, remove_attribute_sync, required_node, root_of,
-    schedule_mutation_delivery, select_error, set_attribute_node, set_character_data,
-    sibling_value, string_value, throw_dom, throw_dom_error, touch_attr, tree_order,
-    valid_attribute_local_name, validate_and_extract, webidl_to_string, with_node_kind, world,
-    world_for_node, wrap_new_document, wrap_node,
+    new_detached_attr, nodes_equal, qualified_name, rect_object,
+    remove_attribute_sync, required_node, root_of, schedule_mutation_delivery, select_error,
+    set_attribute_node, set_character_data, sibling_value, string_value, throw_dom,
+    throw_dom_error, touch_attr, tree_order, valid_attribute_local_name, validate_and_extract,
+    with_node_kind, world, world_for_node, wrap_new_document, wrap_node,
 };
-use rquickjs::function::{Opt, Rest};
+use rquickjs::function::Rest;
 
 use dom::{LocalName, NodeId, NodeKind, QualName, html_namespace, svg_namespace};
 
-use rquickjs::{Array, Class, Ctx, Exception, Function, Object, Persistent, Result, Value};
+use rquickjs::{Array, Class, Ctx, Exception, Function, Persistent, Result, Value};
 
-use crate::js::events::{self, JsEvent};
+use crate::js::events;
 
-use crate::js::world::{DocumentStreamCommand, EventTargetKey, Handle, Wrapper};
+use crate::js::world::{DocumentStreamCommand, Handle, NodeReference, Wrapper};
 
 use crate::ReadyState;
+
+include!(concat!(env!("OUT_DIR"), "/Node.rs"));
+include!(concat!(env!("OUT_DIR"), "/Document.rs"));
+include!(concat!(env!("OUT_DIR"), "/DocumentFragment.rs"));
+include!(concat!(env!("OUT_DIR"), "/Element.rs"));
+include!(concat!(env!("OUT_DIR"), "/HTMLElement.rs"));
+include!(concat!(env!("OUT_DIR"), "/SVGElement.rs"));
+include!(concat!(env!("OUT_DIR"), "/MathMLElement.rs"));
+include!(concat!(env!("OUT_DIR"), "/CharacterData.rs"));
+include!(concat!(env!("OUT_DIR"), "/DocumentType.rs"));
+include!(concat!(env!("OUT_DIR"), "/ProcessingInstruction.rs"));
+include!(concat!(env!("OUT_DIR"), "/ParentNode.rs"));
+include!(concat!(env!("OUT_DIR"), "/ChildNode.rs"));
+include!(concat!(env!("OUT_DIR"), "/NonDocumentTypeChildNode.rs"));
+include!(concat!(env!("OUT_DIR"), "/ElementCSSInlineStyle.rs"));
+include!(concat!(env!("OUT_DIR"), "/ShadowRoot.rs"));
+include!(concat!(env!("OUT_DIR"), "/HTMLFormElement.rs"));
+include!(concat!(env!("OUT_DIR"), "/HTMLInputElement.rs"));
+include!(concat!(env!("OUT_DIR"), "/HTMLTextAreaElement.rs"));
+include!(concat!(env!("OUT_DIR"), "/HTMLSelectElement.rs"));
+include!(concat!(env!("OUT_DIR"), "/HTMLOptionElement.rs"));
+include!(concat!(env!("OUT_DIR"), "/HTMLButtonElement.rs"));
+include!(concat!(env!("OUT_DIR"), "/HTMLFieldSetElement.rs"));
+include!(concat!(env!("OUT_DIR"), "/HTMLOptGroupElement.rs"));
+include!(concat!(env!("OUT_DIR"), "/HTMLIFrameElement.rs"));
+include!(concat!(env!("OUT_DIR"), "/HTMLFrameElement.rs"));
+include!(concat!(env!("OUT_DIR"), "/HTMLImageElement.rs"));
+include!(concat!(env!("OUT_DIR"), "/HTMLHyperlinkElementUtils.rs"));
+include!(concat!(env!("OUT_DIR"), "/HTMLBaseElement.rs"));
+include!(concat!(env!("OUT_DIR"), "/HTMLLinkElement.rs"));
+include!(concat!(env!("OUT_DIR"), "/HTMLMediaElement.rs"));
+include!(concat!(env!("OUT_DIR"), "/HTMLEmbedElement.rs"));
+include!(concat!(env!("OUT_DIR"), "/HTMLScriptElement.rs"));
+include!(concat!(env!("OUT_DIR"), "/HTMLSourceElement.rs"));
+include!(concat!(env!("OUT_DIR"), "/HTMLTrackElement.rs"));
+include!(concat!(env!("OUT_DIR"), "/HTMLMetaElement.rs"));
+include!(concat!(env!("OUT_DIR"), "/HTMLMapElement.rs"));
+include!(concat!(env!("OUT_DIR"), "/HTMLObjectElement.rs"));
+include!(concat!(env!("OUT_DIR"), "/HTMLOutputElement.rs"));
+include!(concat!(env!("OUT_DIR"), "/HTMLParamElement.rs"));
+include!(concat!(env!("OUT_DIR"), "/HTMLSlotElement.rs"));
+include!(concat!(env!("OUT_DIR"), "/HTMLTemplateElement.rs"));
+
+pub(super) fn install(ctx: &Ctx<'_>) -> Result<()> {
+    node_generated::install(ctx)?;
+    document_generated::install(ctx)?;
+    document_fragment_generated::install(ctx)?;
+    element_generated::install(ctx)?;
+    html_element_generated::install(ctx)?;
+    svg_element_generated::install(ctx)?;
+    math_ml_element_generated::install(ctx)?;
+    character_data_generated::install(ctx)?;
+    document_type_generated::install(ctx)?;
+    processing_instruction_generated::install(ctx)?;
+    parent_node_generated::install(ctx)?;
+    child_node_generated::install(ctx)?;
+    non_document_type_child_node_generated::install(ctx)?;
+    element_css_inline_style_generated::install(ctx)?;
+    shadow_root_generated::install(ctx)?;
+    html_form_element_generated::install(ctx)?;
+    html_input_element_generated::install(ctx)?;
+    html_text_area_element_generated::install(ctx)?;
+    html_select_element_generated::install(ctx)?;
+    html_option_element_generated::install(ctx)?;
+    html_button_element_generated::install(ctx)?;
+    html_field_set_element_generated::install(ctx)?;
+    html_opt_group_element_generated::install(ctx)?;
+    htmli_frame_element_generated::install(ctx)?;
+    html_frame_element_generated::install(ctx)?;
+    html_image_element_generated::install(ctx)?;
+    html_hyperlink_element_utils_generated::install(ctx)?;
+    html_base_element_generated::install(ctx)?;
+    html_link_element_generated::install(ctx)?;
+    html_media_element_generated::install(ctx)?;
+    html_embed_element_generated::install(ctx)?;
+    html_script_element_generated::install(ctx)?;
+    html_source_element_generated::install(ctx)?;
+    html_track_element_generated::install(ctx)?;
+    html_meta_element_generated::install(ctx)?;
+    html_map_element_generated::install(ctx)?;
+    html_object_element_generated::install(ctx)?;
+    html_output_element_generated::install(ctx)?;
+    html_param_element_generated::install(ctx)?;
+    html_slot_element_generated::install(ctx)?;
+    html_template_element_generated::install(ctx)
+}
+
+fn insertion_tree_nodes(
+    ctx: &Ctx<'_>,
+    parent: NodeId,
+    node: NodeReference,
+    child: Option<NodeReference>,
+) -> Result<(NodeId, Option<NodeId>)> {
+    // https://dom.spec.whatwg.org/#concept-node-ensure-pre-insert-validity
+    // https://dom.spec.whatwg.org/#concept-node-replace
+    let owner = world_for_node(ctx, parent)?;
+    let owner = owner.borrow();
+    let parsed = owner
+        .document(parent)
+        .ok_or_else(|| Exception::throw_type(ctx, "stale parent"))?;
+    let document = &parsed.document;
+    if !matches!(
+        document.kind(parent),
+        Some(NodeKind::Document | NodeKind::Fragment | NodeKind::Element { .. })
+    ) {
+        return Err(throw_dom(
+            ctx,
+            "HierarchyRequestError",
+            "parent cannot have children",
+        ));
+    }
+    let reference = child.and_then(NodeReference::tree);
+    if let Some(node) = node.tree() {
+        dom::mutation::validate_pre_insert(document, parent, node, reference)
+            .map_err(|error| throw_dom_error(ctx, error))?;
+    } else if reference.is_some_and(|child| document.parent(child) != Some(parent)) {
+        return Err(throw_dom(
+            ctx,
+            "NotFoundError",
+            "reference is not a child of parent",
+        ));
+    }
+    if matches!(child, Some(NodeReference::Attribute { .. })) {
+        return Err(throw_dom(ctx, "NotFoundError", "attributes have no parent"));
+    }
+    let node = node.tree().ok_or_else(|| {
+        throw_dom(
+            ctx,
+            "HierarchyRequestError",
+            "attributes cannot be inserted",
+        )
+    })?;
+    Ok((node, reference))
+}
+
+pub(super) fn compare_node_position(
+    ctx: &Ctx<'_>,
+    this: NodeReference,
+    other: NodeReference,
+) -> Result<u16> {
+    // https://dom.spec.whatwg.org/#dom-node-comparedocumentposition
+    const DISCONNECTED: u16 = 1;
+    const PRECEDING: u16 = 2;
+    const FOLLOWING: u16 = 4;
+    const CONTAINS: u16 = 8;
+    const CONTAINED_BY: u16 = 16;
+    const IMPLEMENTATION_SPECIFIC: u16 = 32;
+    if this == other {
+        return Ok(0);
+    }
+    let node1 = match other {
+        NodeReference::Tree(id) => Some(id),
+        NodeReference::Attribute { scope, id } => attr_owner(ctx, scope, id),
+    };
+    let node2 = match this {
+        NodeReference::Tree(id) => Some(id),
+        NodeReference::Attribute { scope, id } => attr_owner(ctx, scope, id),
+    };
+    let disconnected =
+        DISCONNECTED | IMPLEMENTATION_SPECIFIC | if other < this { PRECEDING } else { FOLLOWING };
+    let (Some(node1), Some(node2)) = (node1, node2) else {
+        return Ok(disconnected);
+    };
+    let owner = world_for_node(ctx, node1)?;
+    let owner = owner.borrow();
+    let parsed = owner
+        .document(node1)
+        .ok_or_else(|| Exception::throw_type(ctx, "stale node"))?;
+    let dom = &parsed.document;
+    if let (
+        NodeReference::Attribute {
+            scope: scope1,
+            id: attr1,
+        },
+        NodeReference::Attribute {
+            scope: scope2,
+            id: attr2,
+        },
+    ) = (other, this)
+        && node1 == node2
+    {
+        let a = attr_state(ctx, scope1, attr1)?;
+        let b = attr_state(ctx, scope2, attr2)?;
+        for attribute in dom.attributes(node1).unwrap_or_default() {
+            if attribute.name.ns.as_ref() == a.namespace && attribute.name.local.as_ref() == a.local
+            {
+                return Ok(IMPLEMENTATION_SPECIFIC | PRECEDING);
+            }
+            if attribute.name.ns.as_ref() == b.namespace && attribute.name.local.as_ref() == b.local
+            {
+                return Ok(IMPLEMENTATION_SPECIFIC | FOLLOWING);
+            }
+        }
+    }
+    if root_of(dom, node1) != root_of(dom, node2) {
+        return Ok(disconnected);
+    }
+    let attr1 = matches!(other, NodeReference::Attribute { .. });
+    let attr2 = matches!(this, NodeReference::Attribute { .. });
+    let node1_ancestor = ancestor_chain(dom, node2).contains(&node1);
+    let node2_ancestor = ancestor_chain(dom, node1).contains(&node2);
+    if (node1_ancestor && !attr1) || (node1 == node2 && attr2) {
+        return Ok(CONTAINS | PRECEDING);
+    }
+    if (node2_ancestor && !attr2) || (node1 == node2 && attr1) {
+        return Ok(CONTAINED_BY | FOLLOWING);
+    }
+    Ok(
+        if tree_order(dom, node1, node2) == std::cmp::Ordering::Less {
+            PRECEDING
+        } else {
+            FOLLOWING
+        },
+    )
+}
 
 /// Backs the constructible platform interfaces (`new Text(…)`); the current
 /// realm's main document owns the new node
@@ -47,12 +263,12 @@ pub(crate) fn construct_node<'js>(
     let first = args.0.into_iter().next();
     match name.0.as_str() {
         "Text" => {
-            let data = constructor_string(&ctx, first)?;
+            let data = constructor_units(&ctx, first)?;
             let document = main_document(&ctx)?;
             create_kind(&ctx, document, |dom| dom.create_text(data))
         }
         "Comment" => {
-            let data = constructor_string(&ctx, first)?;
+            let data = constructor_units(&ctx, first)?;
             let document = main_document(&ctx)?;
             create_kind(&ctx, document, |dom| dom.create_comment(data))
         }
@@ -84,7 +300,7 @@ pub(crate) fn construct_node<'js>(
 }
 
 pub(super) fn install_custom_construction(ctx: &Ctx<'_>) -> Result<()> {
-    let globals = ctx.globals();
+    let globals = crate::js::bridge::object(ctx)?;
     globals.set(
         "__tbPushCustomConstruction",
         rquickjs::prelude::Func::from(push_custom_construction),
@@ -132,17 +348,31 @@ fn discard_custom_construction<'js>(ctx: Ctx<'js>, value: Value<'js>) -> Result<
     Ok(())
 }
 
-/// Constructor `DOMString` with the IDL default: missing and `undefined` are
-/// the empty string, `null` is "null" (<https://webidl.spec.whatwg.org/#es-DOMString>).
-fn constructor_string<'js>(ctx: &Ctx<'js>, value: Option<Value<'js>>) -> Result<String> {
+/// Constructor `DOMString` that keeps every UTF-16 code unit, for the
+/// character-data constructors (`new Text(…)`).
+fn constructor_units<'js>(ctx: &Ctx<'js>, value: Option<Value<'js>>) -> Result<dom::DomString> {
     match value {
-        None => Ok(String::new()),
-        Some(value) if value.is_undefined() => Ok(String::new()),
-        Some(value) => webidl_to_string(ctx, value),
+        None => Ok(dom::DomString::default()),
+        Some(value) if value.is_undefined() => Ok(dom::DomString::default()),
+        Some(value) => Ok(dom::DomString::from_utf16(super::webidl_to_units(
+            ctx, value,
+        )?)),
     }
 }
 
-branded_node!(JsNode, "Node");
+#[derive(Trace, rquickjs::JsLifetime)]
+#[rquickjs::class(rename = "Node")]
+pub(crate) struct JsNode {
+    pub(crate) handle: Handle,
+}
+
+impl super::host::SharedClass for JsNode {
+    // https://webidl.spec.whatwg.org/#es-attributes
+    // https://webidl.spec.whatwg.org/#es-operations
+    fn require_interface(&self, ctx: &Ctx<'_>, interface: &str) -> Result<()> {
+        super::host::require_node_interface(ctx, self.handle.0, interface)
+    }
+}
 
 impl JsNode {
     pub(crate) fn node_id(&self) -> NodeId {
@@ -224,17 +454,22 @@ fn document_value<'js>(
     child_value(ctx, found)
 }
 
-/// Whether `id` is an HTML `iframe`, registering any pending browsing
-/// contexts before the caller looks its frame up. A script may have appended
-/// the iframe in this same task, so the browsing context is registered first;
-/// its realm follows at the next non-JS turn
+/// Whether `id` is an HTML `iframe` or `frame` container, registering any
+/// pending browsing contexts before the caller looks its frame up. A script
+/// may have appended the container in this same task, so the browsing context
+/// is registered first; its realm follows at the next non-JS turn
 /// (<https://html.spec.whatwg.org/multipage/iframe-embed-object.html#process-the-iframe-attributes>).
+/// `frame` shares the lookup: the engine has no frameset navigation pipeline,
+/// so no frame document ever exists yet and the callers below return null,
+/// matching the pre-migration binary.
 fn iframe_frame(ctx: &Ctx<'_>, id: NodeId) -> Result<bool> {
-    let is_iframe = with_node_kind(ctx, id, |kind| is_html_element(kind, "iframe"))?;
-    if is_iframe {
+    let is_frame = with_node_kind(ctx, id, |kind| {
+        is_html_element(kind, "iframe") || is_html_element(kind, "frame")
+    })?;
+    if is_frame {
         world(ctx)?.borrow_mut().register_pending_frames();
     }
-    Ok(is_iframe)
+    Ok(is_frame)
 }
 
 fn img_size(ctx: &Ctx<'_>, id: NodeId) -> Result<Option<(u32, u32)>> {
@@ -260,9 +495,9 @@ impl JsNode {
     fn ctor(ctx: Ctx<'_>) -> Result<Self> {
         Err(Exception::throw_type(&ctx, "Illegal constructor"))
     }
-    #[qjs(get, rename = "nodeType")]
-    fn node_type(&self, ctx: Ctx<'_>) -> Result<i32> {
-        with_node_kind(&ctx, self.handle.0, |kind| match kind {
+    #[qjs(skip)]
+    fn node_type(&self, ctx: &Ctx<'_>) -> Result<u16> {
+        with_node_kind(ctx, self.handle.0, |kind| match kind {
             Some(NodeKind::Element { .. }) => Ok(1),
             Some(NodeKind::Text { .. }) => Ok(3),
             Some(NodeKind::CDataSection { .. }) => Ok(4),
@@ -271,16 +506,16 @@ impl JsNode {
             Some(NodeKind::Document) => Ok(9),
             Some(NodeKind::Doctype { .. }) => Ok(10),
             Some(NodeKind::Fragment) => Ok(11),
-            None => Err(Exception::throw_type(&ctx, "stale node")),
+            None => Err(Exception::throw_type(ctx, "stale node")),
         })?
     }
 
     // https://dom.spec.whatwg.org/#dom-node-nodename
     // https://dom.spec.whatwg.org/#concept-element-html-uppercased-qualified-name
-    #[qjs(get, rename = "nodeName")]
-    fn node_name(&self, ctx: Ctx<'_>) -> Result<String> {
-        let uppercase = document_is_html_content(&ctx, self.handle.0);
-        with_node_kind(&ctx, self.handle.0, |kind| match kind {
+    #[qjs(skip)]
+    fn node_name<'js>(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
+        let uppercase = document_is_html_content(ctx, self.handle.0);
+        let name = with_node_kind(ctx, self.handle.0, |kind| match kind {
             Some(NodeKind::Element { name, .. }) => Ok(element_node_name(name, uppercase)),
             Some(NodeKind::Text { .. }) => Ok("#text".into()),
             Some(NodeKind::CDataSection { .. }) => Ok("#cdata-section".into()),
@@ -289,138 +524,67 @@ impl JsNode {
             Some(NodeKind::Document) => Ok("#document".into()),
             Some(NodeKind::Doctype { name, .. }) => Ok(name.clone()),
             Some(NodeKind::Fragment) => Ok("#document-fragment".into()),
-            None => Err(Exception::throw_type(&ctx, "stale node")),
-        })?
+            None => Err(Exception::throw_type(ctx, "stale node")),
+        })?;
+        let name = name?;
+        rquickjs::String::from_str(ctx.clone(), &name)
     }
 
-    #[qjs(get, rename = "firstChild")]
-    fn first_child<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
-        let world = world(&ctx)?;
-        let id = {
-            let parsed = world.borrow();
-            let Some(parsed) = parsed.document(self.handle.0) else {
-                return Err(Exception::throw_type(&ctx, "no document"));
-            };
-            parsed
-                .document
-                .children(self.handle.0)
-                .and_then(|mut kids| kids.next())
-        };
-        child_value(&ctx, id)
+    // https://dom.spec.whatwg.org/#dom-node-firstchild
+    #[qjs(skip)]
+    fn first_child<'js>(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
+        let world = world(ctx)?;
+        let id = world
+            .borrow()
+            .with_document(self.handle.0, |parsed| {
+                parsed
+                    .document
+                    .children(self.handle.0)
+                    .and_then(|mut kids| kids.next())
+            })
+            .flatten();
+        child_value(ctx, id)
     }
 
-    #[qjs(get, rename = "parentNode")]
-    fn parent_node<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
-        let world = world(&ctx)?;
+    #[qjs(skip)]
+    fn parent_node<'js>(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
+        let world = world(ctx)?;
         let id = world
             .borrow()
             .document(self.handle.0)
             .and_then(|parsed| parsed.document.parent(self.handle.0));
-        match id {
-            Some(parent) => wrap_node(&ctx, parent),
-            None => Ok(Value::new_null(ctx)),
-        }
+        child_value(ctx, id)
     }
 
-    #[qjs(get, rename = "childNodes")]
-    fn child_nodes<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
-        live_collection(&ctx, self.handle.0, CollectionKind::Children, None)
+    #[qjs(skip)]
+    fn child_nodes<'js>(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
+        live_collection(ctx, self.handle.0, CollectionKind::Children, None)
     }
 
-    #[qjs(rename = "appendChild")]
-    fn append_child<'js>(&self, ctx: Ctx<'js>, child: Value<'js>) -> Result<Value<'js>> {
-        let Some(kid) = host_node_id(&ctx, &child) else {
-            return Err(Exception::throw_type(&ctx, "not a node"));
-        };
-        {
-            let world = world(&ctx)?;
-            let parsed = world.borrow();
-            let Some(parsed) = parsed.document(self.handle.0) else {
-                return Err(Exception::throw_type(&ctx, "no document"));
-            };
-            dom::mutation::validate_pre_insert(&parsed.document, self.handle.0, kid, None)
-                .map_err(|err| throw_dom_error(&ctx, err))?;
-        }
-        let kid = adopt_across_documents(&ctx, self.handle.0, kid)?;
+    // https://dom.spec.whatwg.org/#dom-node-appendchild
+    #[qjs(skip)]
+    fn append_child<'js>(&self, ctx: Ctx<'js>, node: NodeReference) -> Result<Value<'js>> {
+        let (node, _) = insertion_tree_nodes(&ctx, self.handle.0, node, None)?;
+        let node = adopt_across_documents(&ctx, self.handle.0, node)?;
         let parent = self.handle.0;
         let world = world(&ctx)?;
         let world = world.borrow();
         let Some(mut parsed) = world.document_mut(self.handle.0) else {
             return Err(Exception::throw_type(&ctx, "no document"));
         };
-        dom::mutation::pre_insert(&mut parsed.document, parent, kid, None)
+        dom::mutation::pre_insert(&mut parsed.document, parent, node, None)
             .map_err(|err| throw_dom_error(&ctx, err))?;
         drop(parsed);
         drop(world);
         schedule_mutation_delivery(&ctx)?;
-        wrap_node(&ctx, kid)
-    }
-
-    #[qjs(rename = "addEventListener")]
-    fn add_event_listener<'js>(
-        &self,
-        ctx: Ctx<'js>,
-        typ: Value<'js>,
-        callback: Value<'js>,
-        options: Opt<Value<'js>>,
-    ) -> Result<()> {
-        events::add_listener(
-            &ctx,
-            EventTargetKey::Node(self.handle.0),
-            typ,
-            callback,
-            options.0,
-        )
-    }
-
-    #[qjs(rename = "removeEventListener")]
-    fn remove_event_listener<'js>(
-        &self,
-        ctx: Ctx<'js>,
-        typ: Value<'js>,
-        callback: Value<'js>,
-        options: Opt<Value<'js>>,
-    ) -> Result<()> {
-        events::remove_listener(
-            &ctx,
-            EventTargetKey::Node(self.handle.0),
-            typ,
-            callback,
-            options.0,
-        )
-    }
-
-    #[qjs(rename = "dispatchEvent")]
-    fn dispatch_event<'js>(&self, ctx: Ctx<'js>, event: Class<'js, JsEvent>) -> Result<bool> {
-        events::dispatch_event(&ctx, EventTargetKey::Node(self.handle.0), &event)
-    }
-
-    // https://html.spec.whatwg.org/multipage/interaction.html#dom-click
-    #[qjs(rename = "click")]
-    fn click(&self, ctx: Ctx<'_>) -> Result<()> {
-        element_click(&ctx, self.handle.0)
-    }
-
-    // https://html.spec.whatwg.org/multipage/interaction.html#dom-focus
-    #[qjs(rename = "focus")]
-    fn focus(&self, ctx: Ctx<'_>) -> Result<()> {
-        if is_focusable(&ctx, self.handle.0)? {
-            focus_node(&ctx, self.handle.0)?;
-        }
-        Ok(())
-    }
-
-    // https://html.spec.whatwg.org/multipage/interaction.html#dom-blur
-    #[qjs(rename = "blur")]
-    fn blur(&self, ctx: Ctx<'_>) -> Result<()> {
-        blur_node(&ctx, self.handle.0)
+        wrap_node(&ctx, node)
     }
 
     // https://dom.spec.whatwg.org/#dom-document-activeelement
-    #[qjs(get, rename = "activeElement")]
-    fn active_element<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
+    #[qjs(skip)]
+    fn active_element<'js>(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
         let document = self.handle.0;
-        let world = world(&ctx)?;
+        let world = world(ctx)?;
         let active = world.borrow().active_element(document.document_id());
         if let Some(node) = active
             && world
@@ -428,49 +592,52 @@ impl JsNode {
                 .document(node)
                 .is_some_and(|parsed| dom::lifecycle::is_connected(&parsed.document, node))
         {
-            return wrap_node(&ctx, node);
+            return wrap_node(ctx, node);
         }
         let fallback = {
             let world = world.borrow();
             let Some(parsed) = world.document(document) else {
-                return Ok(Value::new_null(ctx));
+                return Ok(Value::new_null(ctx.clone()));
             };
             document_first(&parsed, "body").or_else(|| {
                 document_first_child(&parsed, |kind| matches!(kind, NodeKind::Element { .. }))
             })
         };
         match fallback {
-            Some(node) => wrap_node(&ctx, node),
-            None => Ok(Value::new_null(ctx)),
+            Some(node) => wrap_node(ctx, node),
+            None => Ok(Value::new_null(ctx.clone())),
         }
     }
 
     // The element's border box from the render pipeline's layout; zero when
     // the element generates no box (for example `display: none`).
-    #[qjs(rename = "getBoundingClientRect")]
-    fn get_bounding_client_rect<'js>(&self, ctx: Ctx<'js>) -> Result<Object<'js>> {
+    #[qjs(skip)]
+    fn get_bounding_client_rect<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
         match element_box(&ctx, self.handle.0)? {
             Some((left, top, width, height)) => {
                 let (scroll_x, scroll_y) = super::viewport_scroll(&ctx, self.handle.0)?;
-                rect_object(&ctx, left - scroll_x, top - scroll_y, width, height)
+                Ok(rect_object(&ctx, left - scroll_x, top - scroll_y, width, height)?.into_value())
             }
-            None => rect_object(&ctx, 0.0, 0.0, 0.0, 0.0),
+            None => Ok(rect_object(&ctx, 0.0, 0.0, 0.0, 0.0)?.into_value()),
         }
     }
 
-    #[qjs(rename = "getClientRects")]
-    fn get_client_rects<'js>(&self, ctx: Ctx<'js>) -> Result<Array<'js>> {
+    #[qjs(skip)]
+    fn get_client_rects<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
         let array = Array::new(ctx.clone())?;
         if let Some((left, top, width, height)) = element_box(&ctx, self.handle.0)? {
             let (scroll_x, scroll_y) = super::viewport_scroll(&ctx, self.handle.0)?;
-            array.set(0, rect_object(&ctx, left - scroll_x, top - scroll_y, width, height)?)?;
+            array.set(
+                0,
+                rect_object(&ctx, left - scroll_x, top - scroll_y, width, height)?,
+            )?;
         }
-        Ok(array)
+        Ok(array.into_value())
     }
 
     /// Scrolls the viewport so this element's border box is visible.
     /// <https://drafts.csswg.org/cssom-view/#dom-element-scrollintoview>
-    #[qjs(rename = "scrollIntoView")]
+    #[qjs(skip)]
     fn scroll_into_view(&self, ctx: Ctx<'_>) -> Result<()> {
         let Some((left, top, width, _height)) = element_box(&ctx, self.handle.0)? else {
             return Ok(());
@@ -480,44 +647,62 @@ impl JsNode {
         let Some(mut parsed) = world.document_mut(self.handle.0) else {
             return Ok(());
         };
-        let Some(root) = dom::selector::select_first(&parsed.document, parsed.document.document(), "html")
-            .ok()
-            .flatten() else {
+        let Some(root) =
+            dom::selector::select_first(&parsed.document, parsed.document.document(), "html")
+                .ok()
+                .flatten()
+        else {
             return Ok(());
         };
         let (scroll_x, _scroll_y) = dom::metadata::scroll_offset(&parsed.document, root);
         let viewport_width = f64::from(crate::engine::VIEWPORT_WIDTH);
-        let next_x = if left < scroll_x { left } else if left + width > scroll_x + viewport_width {
+        let next_x = if left < scroll_x {
+            left
+        } else if left + width > scroll_x + viewport_width {
             left + width - viewport_width
-        } else { scroll_x };
+        } else {
+            scroll_x
+        };
         // https://drafts.csswg.org/cssom-view/#dom-element-scrollintoview
         let next_y = top;
-        dom::metadata::set_scroll_offset(&mut parsed.document, root, next_x.max(0.0), next_y.max(0.0));
+        dom::metadata::set_scroll_offset(
+            &mut parsed.document,
+            root,
+            next_x.max(0.0),
+            next_y.max(0.0),
+        );
         Ok(())
     }
 
     // https://html.spec.whatwg.org/multipage/nav-history-apis.html#dom-document-defaultview
-    #[qjs(get, rename = "defaultView")]
-    fn default_view<'js>(&self, ctx: Ctx<'js>) -> Value<'js> {
+    #[qjs(skip)]
+    #[allow(
+        clippy::unnecessary_wraps,
+        reason = "generated getters share one fallible call shape"
+    )]
+    fn default_view<'js>(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
         // A document with no browsing context, such as one from DOMParser or
         // `createDocument`, has no view.
-        let has_view =
-            world(&ctx).is_ok_and(|world| world.borrow().is_main_document(self.handle.0));
-        if has_view {
+        let has_view = world(ctx).is_ok_and(|world| world.borrow().is_main_document(self.handle.0));
+        Ok(if has_view {
             ctx.globals().into_value()
         } else {
-            Value::new_null(ctx)
-        }
+            Value::new_null(ctx.clone())
+        })
     }
 
     // https://html.spec.whatwg.org/multipage/interaction.html#dom-document-hasfocus
-    #[qjs(rename = "hasFocus")]
-    fn has_focus(&self, ctx: Ctx<'_>) -> bool {
-        is_main_document(&ctx, self.handle.0)
+    #[qjs(skip)]
+    #[allow(
+        clippy::unnecessary_wraps,
+        reason = "generated operations share one fallible call shape"
+    )]
+    fn has_focus(&self, ctx: Ctx<'_>) -> Result<bool> {
+        Ok(is_main_document(&ctx, self.handle.0))
     }
 
     // https://drafts.csswg.org/cssom-view/#dom-document-elementfrompoint
-    #[qjs(rename = "elementFromPoint")]
+    #[qjs(skip)]
     fn element_from_point<'js>(&self, ctx: Ctx<'js>, x: f64, y: f64) -> Result<Value<'js>> {
         let Some(node) = element_at_point(&ctx, self.handle.0, x, y)? else {
             return Ok(Value::new_null(ctx));
@@ -527,39 +712,31 @@ impl JsNode {
 
     // The no-layout hit test: the deepest element whose virtual box contains
     // the point (see `element_at_point`).
-    #[qjs(rename = "elementsFromPoint")]
-    fn elements_from_point<'js>(&self, ctx: Ctx<'js>, x: f64, y: f64) -> Result<Array<'js>> {
-        let array = Array::new(ctx.clone())?;
+    #[qjs(skip)]
+    fn elements_from_point<'js>(&self, ctx: Ctx<'js>, x: f64, y: f64) -> Result<Vec<Value<'js>>> {
+        let mut elements = Vec::new();
         let Some(node) = element_at_point(&ctx, self.handle.0, x, y)? else {
-            return Ok(array);
+            return Ok(elements);
         };
         // The hit-test stack: the element and its ancestors, topmost first.
         let world = world_for_node(&ctx, node)?;
-        let mut index = 0;
         let mut cursor = Some(node);
         while let Some(current) = cursor {
-            array.set(index, wrap_node(&ctx, current)?)?;
-            index += 1;
+            elements.push(wrap_node(&ctx, current)?);
             cursor = world.borrow().node_parent(current);
         }
-        Ok(array)
+        Ok(elements)
     }
 
-    // https://dom.spec.whatwg.org/#dom-document-createevent
-    #[qjs(rename = "createEvent")]
-    fn create_event<'js>(&self, ctx: Ctx<'js>, interface: Value<'js>) -> Result<Value<'js>> {
-        let interface = webidl_to_string(&ctx, interface)?;
-        events::create_event(&ctx, &interface)
-    }
-
-    #[qjs(rename = "createElement")]
+    // https://dom.spec.whatwg.org/#dom-document-createelement
+    #[qjs(skip)]
     fn create_element<'js>(&self, ctx: Ctx<'js>, tag: WebIdlString) -> Result<Value<'js>> {
         create_html_element(&ctx, self.handle.0, &tag.0)
     }
 
     // https://dom.spec.whatwg.org/#dom-document-createelementns
     // https://dom.spec.whatwg.org/#internal-createelementns-steps
-    #[qjs(rename = "createElementNS")]
+    #[qjs(skip)]
     fn create_element_ns<'js>(
         &self,
         ctx: Ctx<'js>,
@@ -570,24 +747,24 @@ impl JsNode {
         create_element_named(&ctx, self.handle.0, name)
     }
 
-    #[qjs(rename = "createTextNode")]
-    fn create_text_node<'js>(&self, ctx: Ctx<'js>, data: WebIdlString) -> Result<Value<'js>> {
+    #[qjs(skip)]
+    fn create_text_node<'js>(&self, ctx: Ctx<'js>, data: WebIdlCodeUnits) -> Result<Value<'js>> {
         create_kind(&ctx, self.handle.0, |dom| dom.create_text(data.0))
     }
 
     // https://dom.spec.whatwg.org/#dom-document-createcomment
-    #[qjs(rename = "createComment")]
-    fn create_comment<'js>(&self, ctx: Ctx<'js>, data: WebIdlString) -> Result<Value<'js>> {
+    #[qjs(skip)]
+    fn create_comment<'js>(&self, ctx: Ctx<'js>, data: WebIdlCodeUnits) -> Result<Value<'js>> {
         create_kind(&ctx, self.handle.0, |dom| dom.create_comment(data.0))
     }
 
     // https://dom.spec.whatwg.org/#dom-document-createprocessinginstruction
-    #[qjs(rename = "createProcessingInstruction")]
+    #[qjs(skip)]
     fn create_processing_instruction<'js>(
         &self,
         ctx: Ctx<'js>,
         target: WebIdlString,
-        data: WebIdlString,
+        data: WebIdlCodeUnits,
     ) -> Result<Value<'js>> {
         if !crate::xml::is_valid_name(&target.0) {
             return Err(throw_dom(
@@ -605,7 +782,7 @@ impl JsNode {
                 "target must not be xml",
             ));
         }
-        if data.0.contains("?>") {
+        if data.0.to_string_lossy().contains("?>") {
             return Err(throw_dom(&ctx, "InvalidCharacterError", "data contains ?>"));
         }
         create_kind(&ctx, self.handle.0, |dom| {
@@ -614,8 +791,12 @@ impl JsNode {
     }
 
     // https://dom.spec.whatwg.org/#dom-document-createcdatasection
-    #[qjs(rename = "createCDATASection")]
-    fn create_cdata_section<'js>(&self, ctx: Ctx<'js>, data: WebIdlString) -> Result<Value<'js>> {
+    #[qjs(skip)]
+    fn create_cdata_section<'js>(
+        &self,
+        ctx: Ctx<'js>,
+        data: WebIdlCodeUnits,
+    ) -> Result<Value<'js>> {
         // CDATA sections cannot exist in HTML documents
         // (<https://dom.spec.whatwg.org/#dom-document-createcdatasection>).
         if document_is_html(&ctx, self.handle.0) {
@@ -625,7 +806,7 @@ impl JsNode {
                 "CDATA sections are not supported in HTML documents",
             ));
         }
-        if data.0.contains("]]>") {
+        if data.0.to_string_lossy().contains("]]>") {
             return Err(throw_dom(
                 &ctx,
                 "InvalidCharacterError",
@@ -636,7 +817,7 @@ impl JsNode {
     }
 
     // https://dom.spec.whatwg.org/#dom-document-createattribute
-    #[qjs(rename = "createAttribute")]
+    #[qjs(skip)]
     fn create_attribute<'js>(&self, ctx: Ctx<'js>, name: WebIdlString) -> Result<Value<'js>> {
         if !valid_attribute_local_name(&name.0) {
             return Err(throw_dom(
@@ -653,11 +834,11 @@ impl JsNode {
             name.0.clone(),
             name.0,
         )?;
-        attr_wrapper(&ctx, self.handle.0, id)
+        attr_wrapper(&ctx, id)
     }
 
     // https://dom.spec.whatwg.org/#dom-document-createattributens
-    #[qjs(rename = "createAttributeNS")]
+    #[qjs(skip)]
     fn create_attribute_ns<'js>(
         &self,
         ctx: Ctx<'js>,
@@ -683,23 +864,18 @@ impl JsNode {
             name.local.to_string(),
             qualified_name(&name),
         )?;
-        attr_wrapper(&ctx, self.handle.0, id)
+        attr_wrapper(&ctx, id)
     }
 
     // https://dom.spec.whatwg.org/#dom-document-createdocumentfragment
-    #[qjs(rename = "createDocumentFragment")]
+    #[qjs(skip)]
     fn create_document_fragment<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
         create_kind(&ctx, self.handle.0, dom::Document::create_fragment)
     }
 
     // https://dom.spec.whatwg.org/#dom-document-importnode
-    #[qjs(rename = "importNode")]
-    fn import_node<'js>(
-        &self,
-        ctx: Ctx<'js>,
-        node: Value<'js>,
-        deep: Opt<bool>,
-    ) -> Result<Value<'js>> {
+    #[qjs(skip)]
+    fn import_node<'js>(&self, ctx: Ctx<'js>, node: Value<'js>, deep: bool) -> Result<Value<'js>> {
         let source_id = required_node(&ctx, &node)?;
         let world_rc = world_for_node(&ctx, self.handle.0)?;
         let tree = {
@@ -714,7 +890,7 @@ impl JsNode {
                     "cannot import a document",
                 ));
             }
-            import_snapshot(&source.document, source_id, deep.0.unwrap_or(false))
+            import_snapshot(&source.document, source_id, deep)
         };
         let Some(tree) = tree else {
             return Err(Exception::throw_type(&ctx, "stale node"));
@@ -723,15 +899,15 @@ impl JsNode {
         let Some(mut target) = world.document_mut(self.handle.0) else {
             return Err(Exception::throw_type(&ctx, "no document"));
         };
-        let id =
-            materialize_import(&mut target.document, &tree).map_err(|err| throw_dom_error(&ctx, err))?;
+        let id = materialize_import(&mut target.document, &tree)
+            .map_err(|err| throw_dom_error(&ctx, err))?;
         drop(target);
         drop(world);
         wrap_node(&ctx, id)
     }
 
     // https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-document-open
-    #[qjs(rename = "open")]
+    #[qjs(skip)]
     fn open_document<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
         world_for_node(&ctx, self.handle.0)?
             .borrow_mut()
@@ -741,11 +917,11 @@ impl JsNode {
     }
 
     // https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#document-write-steps
-    #[qjs(rename = "write")]
-    fn write(&self, ctx: Ctx<'_>, text: Rest<WebIdlString>) -> Result<()> {
+    #[qjs(skip)]
+    fn write(&self, ctx: Ctx<'_>, text: Vec<WebIdlString>) -> Result<()> {
         // Every argument stringifies and concatenates in order
         // (<https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-document-write>).
-        let html: String = text.0.iter().map(|part| part.0.as_str()).collect();
+        let html: String = text.iter().map(|part| part.0.as_str()).collect();
         let world = world_for_node(&ctx, self.handle.0)?;
         let mut world = world.borrow_mut();
         if world.parser_active {
@@ -765,7 +941,7 @@ impl JsNode {
     }
 
     // https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-document-close
-    #[qjs(rename = "close")]
+    #[qjs(skip)]
     fn close_document(&self, ctx: Ctx<'_>) -> Result<()> {
         world_for_node(&ctx, self.handle.0)?
             .borrow_mut()
@@ -773,28 +949,17 @@ impl JsNode {
             .map_err(|()| Exception::throw_range(&ctx, "document stream budget exceeded"))
     }
 
-    #[qjs(rename = "getElementById")]
+    #[qjs(skip)]
     fn get_element_by_id<'js>(&self, ctx: Ctx<'js>, id: WebIdlString) -> Result<Value<'js>> {
-        let world = world(&ctx)?;
-        let found = {
-            let parsed = world.borrow();
-            let Some(parsed) = parsed.document(self.handle.0) else {
-                return Ok(Value::new_null(ctx));
-            };
-            find_element_by_id(&parsed.document, self.handle.0, &id.0)
-        };
-        match found {
-            Some(node) => wrap_node(&ctx, node),
-            None => Ok(Value::new_null(ctx)),
-        }
+        element_by_id(&ctx, self.handle.0, &id.0)
     }
 
     // https://dom.spec.whatwg.org/#dom-document-implementation
-    #[qjs(get)]
-    fn implementation<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
-        let world_rc = world(&ctx)?;
+    #[qjs(skip)]
+    fn implementation<'js>(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
+        let world_rc = world(ctx)?;
         if let Some(saved) = world_rc.borrow().implementation(self.handle.0)
-            && let Some(value) = deref_weak(&ctx, saved)?
+            && let Some(value) = deref_weak(ctx, saved)?
         {
             return Ok(value);
         }
@@ -805,14 +970,14 @@ impl JsNode {
             },
         )?
         .into_value();
-        let weak = make_weak(&ctx, value.clone())?;
+        let weak = make_weak(ctx, value.clone())?;
         world_rc
             .borrow_mut()
-            .intern_implementation(self.handle.0, Persistent::save(&ctx, weak));
+            .intern_implementation(self.handle.0, Persistent::save(ctx, weak));
         Ok(value)
     }
 
-    #[qjs(rename = "getElementsByTagName")]
+    #[qjs(skip)]
     fn get_elements_by_tag_name<'js>(
         &self,
         ctx: Ctx<'js>,
@@ -821,47 +986,129 @@ impl JsNode {
         elements_by_tag(&ctx, self.handle.0, &name.0)
     }
 
-    #[qjs(get)]
-    fn body<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
-        document_value(&ctx, self.handle.0, |parsed| document_first(parsed, "body"))
+    #[qjs(skip)]
+    fn body<'js>(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
+        document_value(ctx, self.handle.0, |parsed| document_first(parsed, "body"))
+    }
+
+    // https://html.spec.whatwg.org/multipage/dom.html#dom-document-body
+    #[qjs(skip)]
+    fn set_body<'js>(&self, ctx: &Ctx<'js>, value: Value<'js>) -> Result<()> {
+        // A string or other non-node throws, like any interface conversion.
+        let Some(id) = host_node_id(ctx, &value) else {
+            return Err(Exception::throw_type(ctx, "body must be an element"));
+        };
+        let is_body = with_node_kind(ctx, id, |kind| {
+            matches!(
+                kind,
+                Some(NodeKind::Element { name, .. })
+                    if name.ns == html_namespace()
+                        && (name.local.as_ref() == "body" || name.local.as_ref() == "frameset")
+            )
+        })?;
+        if !is_body {
+            return Err(throw_dom(
+                ctx,
+                "HierarchyRequestError",
+                "body must be a body or frameset element",
+            ));
+        }
+        let world_rc = world(ctx)?;
+        let root_element = {
+            let world = world_rc.borrow();
+            let Some(parsed) = world.document(self.handle.0) else {
+                return Err(Exception::throw_type(ctx, "stale node"));
+            };
+            document_first_child(&parsed, |kind| {
+                matches!(kind, NodeKind::Element { .. })
+            })
+        };
+        let Some(root_element) = root_element else {
+            return Err(throw_dom(
+                ctx,
+                "HierarchyRequestError",
+                "document has no document element",
+            ));
+        };
+        let current = {
+            let world = world_rc.borrow();
+            let Some(parsed) = world.document(self.handle.0) else {
+                return Err(Exception::throw_type(ctx, "stale node"));
+            };
+            parsed
+                .document
+                .children(root_element)
+                .into_iter()
+                .flatten()
+                .find(|&child| {
+                    parsed.document.kind(child).is_some_and(|kind| {
+                        matches!(
+                            kind,
+                            NodeKind::Element { name, .. }
+                                if name.ns == html_namespace()
+                                    && (name.local.as_ref() == "body"
+                                        || name.local.as_ref() == "frameset")
+                        )
+                    })
+                })
+        };
+        if current == Some(id) {
+            return Ok(());
+        }
+        let node = adopt_across_documents(ctx, self.handle.0, id)?;
+        let world = world_rc.borrow();
+        let Some(mut parsed) = world.document_mut(self.handle.0) else {
+            return Err(Exception::throw_type(ctx, "no document"));
+        };
+        if let Some(current) = current {
+            dom::mutation::replace_child(&mut parsed.document, root_element, node, current)
+                .map_err(|error| throw_dom_error(ctx, error))?;
+            fixup_focus_after_removal(ctx, current)?;
+        } else {
+            dom::mutation::append(&mut parsed.document, root_element, node)
+                .map_err(|error| throw_dom_error(ctx, error))?;
+        }
+        drop(parsed);
+        drop(world);
+        schedule_mutation_delivery(ctx)
     }
 
     // https://html.spec.whatwg.org/multipage/dom.html#dom-document-head
-    #[qjs(get)]
-    fn head<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
-        document_value(&ctx, self.handle.0, |parsed| document_first(parsed, "head"))
+    #[qjs(skip)]
+    fn head<'js>(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
+        document_value(ctx, self.handle.0, |parsed| document_first(parsed, "head"))
     }
 
     // https://html.spec.whatwg.org/multipage/dom.html#dom-document-currentscript
-    #[qjs(get, rename = "currentScript")]
-    fn current_script<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
-        let world = world(&ctx)?;
+    #[qjs(skip)]
+    fn current_script<'js>(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
+        let world = world(ctx)?;
         let current = world.borrow().current_script;
         match current {
-            Some(id) if id.document_id() == self.handle.0.document_id() => wrap_node(&ctx, id),
-            _ => Ok(Value::new_null(ctx)),
+            Some(id) if id.document_id() == self.handle.0.document_id() => wrap_node(ctx, id),
+            _ => Ok(Value::new_null(ctx.clone())),
         }
     }
 
-    #[qjs(get, rename = "documentElement")]
-    fn document_element<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
-        document_value(&ctx, self.handle.0, |parsed| {
+    #[qjs(skip)]
+    fn document_element<'js>(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
+        document_value(ctx, self.handle.0, |parsed| {
             document_first_child(parsed, |kind| matches!(kind, NodeKind::Element { .. }))
         })
     }
 
     // https://dom.spec.whatwg.org/#dom-document-doctype
-    #[qjs(get, rename = "doctype")]
-    fn doctype<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
-        document_value(&ctx, self.handle.0, |parsed| {
+    #[qjs(skip)]
+    fn doctype<'js>(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
+        document_value(ctx, self.handle.0, |parsed| {
             document_first_child(parsed, |kind| matches!(kind, NodeKind::Doctype { .. }))
         })
     }
 
     // https://dom.spec.whatwg.org/#dom-document-readyState
-    #[qjs(get, rename = "readyState")]
-    fn ready_state(&self, ctx: Ctx<'_>) -> Result<String> {
-        let world = world(&ctx)?;
+    #[qjs(skip)]
+    fn ready_state(&self, ctx: &Ctx<'_>) -> Result<String> {
+        let world = world(ctx)?;
         let world = world.borrow();
         let Some(parsed) = world.document(self.handle.0) else {
             return Ok(String::new());
@@ -877,52 +1124,76 @@ impl JsNode {
     }
 
     // https://dom.spec.whatwg.org/#dom-document-url
-    #[qjs(get, rename = "URL")]
-    fn url(&self, ctx: Ctx<'_>) -> String {
-        document_url_string(&ctx, self.handle.0)
+    #[qjs(skip)]
+    #[allow(
+        clippy::unnecessary_wraps,
+        reason = "generated getters share one fallible call shape"
+    )]
+    fn url(&self, ctx: &Ctx<'_>) -> Result<dom::DomString> {
+        Ok(document_url_string(ctx, self.handle.0).into())
     }
 
     // https://dom.spec.whatwg.org/#dom-document-documenturi
-    #[qjs(get, rename = "documentURI")]
-    fn document_uri(&self, ctx: Ctx<'_>) -> String {
-        document_url_string(&ctx, self.handle.0)
+    #[qjs(skip)]
+    #[allow(
+        clippy::unnecessary_wraps,
+        reason = "generated getters share one fallible call shape"
+    )]
+    fn document_uri(&self, ctx: &Ctx<'_>) -> Result<dom::DomString> {
+        Ok(document_url_string(ctx, self.handle.0).into())
     }
 
     // https://html.spec.whatwg.org/multipage/urls-and-fetching.html#dom-document-baseuri
-    #[qjs(get, rename = "baseURI")]
-    fn base_uri(&self, ctx: Ctx<'_>) -> String {
-        document_base_url_string(&ctx, self.handle.0)
+    #[qjs(skip)]
+    #[allow(
+        clippy::unnecessary_wraps,
+        reason = "generated getters share one fallible call shape"
+    )]
+    fn base_uri(&self, ctx: &Ctx<'_>) -> Result<dom::DomString> {
+        Ok(document_base_url_string(ctx, self.handle.0).into())
     }
 
     // https://html.spec.whatwg.org/multipage/nav-history-apis.html#dom-document-location
-    #[qjs(get)]
-    fn location<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
-        if is_main_document(&ctx, self.handle.0) {
+    #[qjs(skip)]
+    fn location<'js>(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
+        if is_main_document(ctx, self.handle.0) {
             return ctx.globals().get("location");
         }
-        Ok(Value::new_null(ctx))
+        Ok(Value::new_null(ctx.clone()))
     }
 
     // https://encoding.spec.whatwg.org/#dom-document-characterset
-    #[qjs(get, rename = "characterSet")]
-    fn character_set(&self) -> &'static str {
-        "UTF-8"
+    #[qjs(skip)]
+    #[allow(
+        clippy::unnecessary_wraps,
+        reason = "generated getters share one fallible call shape"
+    )]
+    fn character_set(&self, _ctx: &Ctx<'_>) -> Result<&'static str> {
+        Ok("UTF-8")
     }
 
-    #[qjs(get, rename = "charset")]
-    fn charset(&self) -> &'static str {
-        "UTF-8"
+    #[qjs(skip)]
+    #[allow(
+        clippy::unnecessary_wraps,
+        reason = "generated getters share one fallible call shape"
+    )]
+    fn charset(&self, _ctx: &Ctx<'_>) -> Result<&'static str> {
+        Ok("UTF-8")
     }
 
-    #[qjs(get, rename = "inputEncoding")]
-    fn input_encoding(&self) -> &'static str {
-        "UTF-8"
+    #[qjs(skip)]
+    #[allow(
+        clippy::unnecessary_wraps,
+        reason = "generated getters share one fallible call shape"
+    )]
+    fn input_encoding(&self, _ctx: &Ctx<'_>) -> Result<&'static str> {
+        Ok("UTF-8")
     }
 
     // https://dom.spec.whatwg.org/#dom-document-contenttype
-    #[qjs(get, rename = "contentType")]
-    fn content_type(&self, ctx: Ctx<'_>) -> Result<&'static str> {
-        let world_rc = world(&ctx)?;
+    #[qjs(skip)]
+    fn content_type(&self, ctx: &Ctx<'_>) -> Result<&'static str> {
+        let world_rc = world(ctx)?;
         let parsed = world_rc.borrow();
         Ok(parsed
             .document(self.handle.0)
@@ -930,9 +1201,9 @@ impl JsNode {
     }
 
     // https://dom.spec.whatwg.org/#dom-document-compatmode
-    #[qjs(get, rename = "compatMode")]
-    fn compat_mode(&self, ctx: Ctx<'_>) -> Result<String> {
-        let world = world(&ctx)?;
+    #[qjs(skip)]
+    fn compat_mode(&self, ctx: &Ctx<'_>) -> Result<String> {
+        let world = world(ctx)?;
         let parsed = world.borrow();
         let quirks = parsed
             .document(self.handle.0)
@@ -940,7 +1211,7 @@ impl JsNode {
         Ok(if quirks { "BackCompat" } else { "CSS1Compat" }.into())
     }
 
-    #[qjs(rename = "getAttribute")]
+    #[qjs(skip)]
     fn get_attribute<'js>(&self, ctx: Ctx<'js>, name: WebIdlString) -> Result<Value<'js>> {
         if !valid_attribute_local_name(&name.0) {
             return Ok(Value::new_null(ctx));
@@ -959,7 +1230,7 @@ impl JsNode {
         }
     }
 
-    #[qjs(rename = "setAttribute")]
+    #[qjs(skip)]
     fn set_attribute(&self, ctx: Ctx<'_>, name: WebIdlString, value: WebIdlString) -> Result<()> {
         if !valid_attribute_local_name(&name.0) {
             return Err(throw_dom(
@@ -988,18 +1259,18 @@ impl JsNode {
         schedule_mutation_delivery(&ctx)
     }
 
-    #[qjs(get)]
-    fn id(&self, ctx: Ctx<'_>) -> Result<String> {
-        attribute_value(&ctx, self.handle.0, "id")
+    #[qjs(skip)]
+    fn id(&self, ctx: &Ctx<'_>) -> Result<String> {
+        attribute_value(ctx, self.handle.0, "id")
     }
 
-    #[qjs(set, rename = "id")]
-    fn set_id(&self, ctx: Ctx<'_>, value: WebIdlString) -> Result<()> {
-        self.set_attribute(ctx, WebIdlString("id".into()), value)
+    #[qjs(skip)]
+    fn set_id(&self, ctx: &Ctx<'_>, value: WebIdlString) -> Result<()> {
+        self.set_attribute(ctx.clone(), WebIdlString("id".into()), value)
     }
 
     // https://html.spec.whatwg.org/multipage/input.html#dom-input-value
-    #[qjs(get)]
+    #[qjs(skip)]
     fn value(&self, ctx: Ctx<'_>) -> Result<String> {
         let world = world(&ctx)?;
         let world = world.borrow();
@@ -1010,7 +1281,7 @@ impl JsNode {
     }
 
     // https://html.spec.whatwg.org/multipage/input.html#dom-input-value
-    #[qjs(set, rename = "value")]
+    #[qjs(skip)]
     fn set_value(&self, ctx: Ctx<'_>, value: LegacyNullString) -> Result<()> {
         let world = world(&ctx)?;
         let world = world.borrow();
@@ -1023,19 +1294,18 @@ impl JsNode {
     }
 
     // https://html.spec.whatwg.org/multipage/form-elements.html#dom-textarea-defaultvalue
-    #[qjs(get, rename = "defaultValue")]
+    #[qjs(skip)]
     fn default_value(&self, ctx: Ctx<'_>) -> Result<String> {
         let world = world(&ctx)?;
         let world = world.borrow();
         let Some(parsed) = world.document(self.handle.0) else {
             return Err(Exception::throw_type(&ctx, "no document"));
         };
-        Ok(dom::form::control_default_value(&parsed.document, self.handle.0)
-            .unwrap_or_default())
+        Ok(dom::form::control_default_value(&parsed.document, self.handle.0).unwrap_or_default())
     }
 
     // https://html.spec.whatwg.org/multipage/form-elements.html#dom-textarea-defaultvalue
-    #[qjs(set, rename = "defaultValue")]
+    #[qjs(skip)]
     fn set_default_value(&self, ctx: Ctx<'_>, value: WebIdlString) -> Result<()> {
         let world = world(&ctx)?;
         let world = world.borrow();
@@ -1048,7 +1318,7 @@ impl JsNode {
     }
 
     // https://html.spec.whatwg.org/multipage/form-elements.html#dom-textarea-textlength
-    #[qjs(get, rename = "textLength")]
+    #[qjs(skip)]
     fn text_length(&self, ctx: Ctx<'_>) -> Result<u32> {
         let world = world(&ctx)?;
         let world = world.borrow();
@@ -1064,27 +1334,15 @@ impl JsNode {
     }
 
     // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#dom-textarea/input-selectionstart
-    #[qjs(get, rename = "selectionStart")]
-    fn selection_start<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
-        let world = world(&ctx)?;
-        let world = world.borrow();
-        let Some(parsed) = world.document(self.handle.0) else {
-            return Ok(Value::new_null(ctx));
-        };
-        match dom::form::selection(&parsed.document, self.handle.0) {
-            Some((start, _, _)) => Ok(Value::new_number(ctx, f64::from(start))),
-            None => Ok(Value::new_null(ctx)),
-        }
-    }
-
-    #[qjs(set, rename = "selectionStart")]
+    #[qjs(skip)]
     fn set_selection_start(&self, ctx: Ctx<'_>, value: WebIdlUnsignedLong) -> Result<()> {
         let world = world(&ctx)?;
         let world = world.borrow();
         let Some(mut parsed) = world.document_mut(self.handle.0) else {
             return Ok(());
         };
-        let Some((_, end, direction)) = dom::form::selection(&parsed.document, self.handle.0) else {
+        let Some((_, end, direction)) = dom::form::selection(&parsed.document, self.handle.0)
+        else {
             return Err(throw_dom(
                 &ctx,
                 "InvalidStateError",
@@ -1092,7 +1350,13 @@ impl JsNode {
             ));
         };
         let start = value.0;
-        let changed = dom::form::set_selection(&mut parsed.document, self.handle.0, start, end.max(start), direction);
+        let changed = dom::form::set_selection(
+            &mut parsed.document,
+            self.handle.0,
+            start,
+            end.max(start),
+            direction,
+        );
         drop(parsed);
         if changed {
             world.queue_select(self.handle.0);
@@ -1101,34 +1365,28 @@ impl JsNode {
     }
 
     // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#dom-textarea/input-selectionend
-    #[qjs(get, rename = "selectionEnd")]
-    fn selection_end<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
-        let world = world(&ctx)?;
-        let world = world.borrow();
-        let Some(parsed) = world.document(self.handle.0) else {
-            return Ok(Value::new_null(ctx));
-        };
-        match dom::form::selection(&parsed.document, self.handle.0) {
-            Some((_, end, _)) => Ok(Value::new_number(ctx, f64::from(end))),
-            None => Ok(Value::new_null(ctx)),
-        }
-    }
-
-    #[qjs(set, rename = "selectionEnd")]
+    #[qjs(skip)]
     fn set_selection_end(&self, ctx: Ctx<'_>, value: WebIdlUnsignedLong) -> Result<()> {
         let world = world(&ctx)?;
         let world = world.borrow();
         let Some(mut parsed) = world.document_mut(self.handle.0) else {
             return Ok(());
         };
-        let Some((start, _, direction)) = dom::form::selection(&parsed.document, self.handle.0) else {
+        let Some((start, _, direction)) = dom::form::selection(&parsed.document, self.handle.0)
+        else {
             return Err(throw_dom(
                 &ctx,
                 "InvalidStateError",
                 "selectionEnd does not apply to this control",
             ));
         };
-        let changed = dom::form::set_selection(&mut parsed.document, self.handle.0, start, value.0, direction);
+        let changed = dom::form::set_selection(
+            &mut parsed.document,
+            self.handle.0,
+            start,
+            value.0,
+            direction,
+        );
         drop(parsed);
         if changed {
             world.queue_select(self.handle.0);
@@ -1136,21 +1394,7 @@ impl JsNode {
         Ok(())
     }
 
-    // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#dom-textarea/input-selectiondirection
-    #[qjs(get, rename = "selectionDirection")]
-    fn selection_direction<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
-        let world = world(&ctx)?;
-        let world = world.borrow();
-        let Some(parsed) = world.document(self.handle.0) else {
-            return Ok(Value::new_null(ctx));
-        };
-        match dom::form::selection(&parsed.document, self.handle.0) {
-            Some((_, _, direction)) => Ok(string_value(&ctx, direction_name(direction))?),
-            None => Ok(Value::new_null(ctx)),
-        }
-    }
-
-    #[qjs(set, rename = "selectionDirection")]
+    #[qjs(skip)]
     fn set_selection_direction(&self, ctx: Ctx<'_>, value: WebIdlString) -> Result<()> {
         let world = world(&ctx)?;
         let world = world.borrow();
@@ -1165,7 +1409,8 @@ impl JsNode {
             ));
         };
         let direction = direction_code(&value.0);
-        let changed = dom::form::set_selection(&mut parsed.document, self.handle.0, start, end, direction);
+        let changed =
+            dom::form::set_selection(&mut parsed.document, self.handle.0, start, end, direction);
         drop(parsed);
         if changed {
             world.queue_select(self.handle.0);
@@ -1174,8 +1419,8 @@ impl JsNode {
     }
 
     // https://html.spec.whatwg.org/multipage/forms.html#dom-form-reset
-    #[qjs(rename = "reset")]
-    fn reset(&self, ctx: Ctx<'_>) -> Result<()> {
+    #[qjs(skip)]
+    fn reset_form(&self, ctx: Ctx<'_>) -> Result<()> {
         if !with_node_kind(&ctx, self.handle.0, |kind| is_html_element(kind, "form"))? {
             return Err(throw_dom(
                 &ctx,
@@ -1216,7 +1461,7 @@ impl JsNode {
     }
 
     // https://html.spec.whatwg.org/multipage/forms.html#dom-form-action
-    #[qjs(get, rename = "action")]
+    #[qjs(skip)]
     fn action(&self, ctx: Ctx<'_>) -> Result<String> {
         let world_rc = world(&ctx)?;
         let raw = world_rc
@@ -1233,78 +1478,8 @@ impl JsNode {
             .map_or(raw, |url| url.to_string()))
     }
 
-    #[qjs(set, rename = "action")]
-    fn set_action(&self, ctx: Ctx<'_>, value: WebIdlString) -> Result<()> {
-        self.set_attribute(ctx, WebIdlString("action".into()), value)
-    }
-
-    // https://html.spec.whatwg.org/multipage/forms.html#dom-form-method
-    #[qjs(get, rename = "method")]
-    fn method(&self, ctx: Ctx<'_>) -> Result<String> {
-        let raw = attribute_value(&ctx, self.handle.0, "method")?;
-        Ok(match raw.trim().to_ascii_lowercase().as_str() {
-            "post" => "post",
-            "dialog" => "dialog",
-            _ => "get",
-        }
-        .to_owned())
-    }
-
-    #[qjs(set, rename = "method")]
-    fn set_method(&self, ctx: Ctx<'_>, value: WebIdlString) -> Result<()> {
-        self.set_attribute(ctx, WebIdlString("method".into()), value)
-    }
-
-    // https://html.spec.whatwg.org/multipage/forms.html#dom-form-enctype
-    #[qjs(get, rename = "enctype")]
-    fn enctype(&self, ctx: Ctx<'_>) -> Result<String> {
-        Ok(encoding_keyword(&attribute_value(&ctx, self.handle.0, "enctype")?).to_owned())
-    }
-
-    #[qjs(set, rename = "enctype")]
-    fn set_enctype(&self, ctx: Ctx<'_>, value: WebIdlString) -> Result<()> {
-        self.set_attribute(ctx, WebIdlString("enctype".into()), value)
-    }
-
-    #[qjs(get, rename = "encoding")]
-    fn encoding(&self, ctx: Ctx<'_>) -> Result<String> {
-        Ok(encoding_keyword(&attribute_value(&ctx, self.handle.0, "enctype")?).to_owned())
-    }
-
-    #[qjs(set, rename = "encoding")]
-    fn set_encoding(&self, ctx: Ctx<'_>, value: WebIdlString) -> Result<()> {
-        self.set_attribute(ctx, WebIdlString("enctype".into()), value)
-    }
-
-    #[qjs(set, rename = "target")]
-    fn set_target(&self, ctx: Ctx<'_>, value: WebIdlString) -> Result<()> {
-        self.set_attribute(ctx, WebIdlString("target".into()), value)
-    }
-
-    // https://html.spec.whatwg.org/multipage/forms.html#dom-form-novalidate
-    #[qjs(get, rename = "noValidate")]
-    fn no_validate(&self, ctx: Ctx<'_>) -> Result<bool> {
-        self.attribute_present(&ctx, "novalidate")
-    }
-
-    #[qjs(set, rename = "noValidate")]
-    fn set_no_validate(&self, ctx: Ctx<'_>, value: bool) -> Result<()> {
-        self.reflect_boolean(ctx, "novalidate", value)
-    }
-
-    // https://html.spec.whatwg.org/multipage/forms.html#dom-form-acceptcharset
-    #[qjs(get, rename = "acceptCharset")]
-    fn accept_charset(&self, ctx: Ctx<'_>) -> Result<String> {
-        attribute_value(&ctx, self.handle.0, "accept-charset")
-    }
-
-    #[qjs(set, rename = "acceptCharset")]
-    fn set_accept_charset(&self, ctx: Ctx<'_>, value: WebIdlString) -> Result<()> {
-        self.set_attribute(ctx, WebIdlString("accept-charset".into()), value)
-    }
-
     // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#dom-fs-formaction
-    #[qjs(get, rename = "formAction")]
+    #[qjs(skip)]
     fn form_action(&self, ctx: Ctx<'_>) -> Result<String> {
         let world = world(&ctx)?;
         let raw = world
@@ -1321,13 +1496,8 @@ impl JsNode {
             .map_or(raw, |url| url.to_string()))
     }
 
-    #[qjs(set, rename = "formAction")]
-    fn set_form_action(&self, ctx: Ctx<'_>, value: WebIdlString) -> Result<()> {
-        self.set_attribute(ctx, WebIdlString("formaction".into()), value)
-    }
-
     // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#dom-fs-formmethod
-    #[qjs(get, rename = "formMethod")]
+    #[qjs(skip)]
     fn form_method(&self, ctx: Ctx<'_>) -> Result<String> {
         let raw = attribute_value(&ctx, self.handle.0, "formmethod")?;
         Ok(match raw.trim().to_ascii_lowercase().as_str() {
@@ -1338,98 +1508,35 @@ impl JsNode {
         .to_owned())
     }
 
-    #[qjs(set, rename = "formMethod")]
+    #[qjs(skip)]
     fn set_form_method(&self, ctx: Ctx<'_>, value: WebIdlString) -> Result<()> {
         self.set_attribute(ctx, WebIdlString("formmethod".into()), value)
     }
 
     // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#dom-fs-formenctype
-    #[qjs(get, rename = "formEnctype")]
+    #[qjs(skip)]
     fn form_enctype(&self, ctx: Ctx<'_>) -> Result<String> {
         Ok(encoding_keyword(&attribute_value(&ctx, self.handle.0, "formenctype")?).to_owned())
     }
 
-    #[qjs(set, rename = "formEnctype")]
+    #[qjs(skip)]
     fn set_form_enctype(&self, ctx: Ctx<'_>, value: WebIdlString) -> Result<()> {
         self.set_attribute(ctx, WebIdlString("formenctype".into()), value)
     }
 
-    #[qjs(get, rename = "formTarget")]
-    fn form_target(&self, ctx: Ctx<'_>) -> Result<String> {
-        attribute_value(&ctx, self.handle.0, "formtarget")
-    }
-
-    #[qjs(set, rename = "formTarget")]
-    fn set_form_target(&self, ctx: Ctx<'_>, value: WebIdlString) -> Result<()> {
-        self.set_attribute(ctx, WebIdlString("formtarget".into()), value)
-    }
-
-    #[qjs(get, rename = "formNoValidate")]
-    fn form_no_validate(&self, ctx: Ctx<'_>) -> Result<bool> {
-        self.attribute_present(&ctx, "formnovalidate")
-    }
-
-    #[qjs(set, rename = "formNoValidate")]
-    fn set_form_no_validate(&self, ctx: Ctx<'_>, value: bool) -> Result<()> {
-        self.reflect_boolean(ctx, "formnovalidate", value)
-    }
-
-    // https://html.spec.whatwg.org/multipage/input.html#the-pattern-attribute
-    #[qjs(get)]
-    fn pattern(&self, ctx: Ctx<'_>) -> Result<String> {
-        attribute_value(&ctx, self.handle.0, "pattern")
-    }
-
-    #[qjs(set, rename = "pattern")]
-    fn set_pattern(&self, ctx: Ctx<'_>, value: WebIdlString) -> Result<()> {
-        self.set_attribute(ctx, WebIdlString("pattern".into()), value)
-    }
-
-    // https://html.spec.whatwg.org/multipage/input.html#the-min-and-max-attributes
-    #[qjs(get)]
-    fn min(&self, ctx: Ctx<'_>) -> Result<String> {
-        attribute_value(&ctx, self.handle.0, "min")
-    }
-
-    #[qjs(set, rename = "min")]
-    fn set_min(&self, ctx: Ctx<'_>, value: WebIdlString) -> Result<()> {
-        self.set_attribute(ctx, WebIdlString("min".into()), value)
-    }
-
-    #[qjs(get)]
-    fn max(&self, ctx: Ctx<'_>) -> Result<String> {
-        attribute_value(&ctx, self.handle.0, "max")
-    }
-
-    #[qjs(set, rename = "max")]
-    fn set_max(&self, ctx: Ctx<'_>, value: WebIdlString) -> Result<()> {
-        self.set_attribute(ctx, WebIdlString("max".into()), value)
-    }
-
-    // https://html.spec.whatwg.org/multipage/input.html#the-step-attribute
-    #[qjs(get)]
-    fn step(&self, ctx: Ctx<'_>) -> Result<String> {
-        attribute_value(&ctx, self.handle.0, "step")
-    }
-
-    #[qjs(set, rename = "step")]
-    fn set_step(&self, ctx: Ctx<'_>, value: WebIdlString) -> Result<()> {
-        self.set_attribute(ctx, WebIdlString("step".into()), value)
-    }
-
     // https://drafts.csswg.org/cssom-view/#dom-element-scrollleft
-    #[qjs(get, rename = "scrollLeft")]
-    fn scroll_left(&self, ctx: Ctx<'_>) -> Result<f64> {
-        let world = world(&ctx)?;
+    #[qjs(skip)]
+    fn scroll_left(&self, ctx: &Ctx<'_>) -> Result<f64> {
+        let world = world(ctx)?;
         let world = world.borrow();
         Ok(world.document(self.handle.0).map_or(0.0, |parsed| {
             dom::metadata::scroll_offset(&parsed.document, self.handle.0).0
         }))
     }
 
-    #[qjs(set, rename = "scrollLeft")]
-    fn set_scroll_left(&self, ctx: Ctx<'_>, value: f64) -> Result<()> {
-        let world = world(&ctx)?;
+    #[qjs(skip)]
+    fn set_scroll_left(&self, ctx: &Ctx<'_>, value: f64) -> Result<()> {
+        let world = world(ctx)?;
         let world = world.borrow();
         let Some(mut parsed) = world.document_mut(self.handle.0) else {
             return Ok(());
@@ -1440,18 +1547,18 @@ impl JsNode {
     }
 
     // https://drafts.csswg.org/cssom-view/#dom-element-scrolltop
-    #[qjs(get, rename = "scrollTop")]
-    fn scroll_top(&self, ctx: Ctx<'_>) -> Result<f64> {
-        let world = world(&ctx)?;
+    #[qjs(skip)]
+    fn scroll_top(&self, ctx: &Ctx<'_>) -> Result<f64> {
+        let world = world(ctx)?;
         let world = world.borrow();
         Ok(world.document(self.handle.0).map_or(0.0, |parsed| {
             dom::metadata::scroll_offset(&parsed.document, self.handle.0).1
         }))
     }
 
-    #[qjs(set, rename = "scrollTop")]
-    fn set_scroll_top(&self, ctx: Ctx<'_>, value: f64) -> Result<()> {
-        let world = world(&ctx)?;
+    #[qjs(skip)]
+    fn set_scroll_top(&self, ctx: &Ctx<'_>, value: f64) -> Result<()> {
+        let world = world(ctx)?;
         let world = world.borrow();
         let Some(mut parsed) = world.document_mut(self.handle.0) else {
             return Ok(());
@@ -1461,73 +1568,8 @@ impl JsNode {
         Ok(())
     }
 
-    /// Reflecting boolean attribute shared by the form-control states: the
-    /// engine exposes one element wrapper, so these answer on every element,
-    /// the same shortcut `value` takes.
-    #[qjs(skip)]
-    fn reflect_boolean(&self, ctx: Ctx<'_>, name: &str, value: bool) -> Result<()> {
-        if value {
-            self.set_attribute(ctx, WebIdlString(name.into()), WebIdlString(String::new()))
-        } else {
-            self.remove_attribute(ctx, WebIdlString(name.into()))
-        }
-    }
-
-    #[qjs(skip)]
-    fn attribute_present(&self, ctx: &Ctx<'_>, name: &str) -> Result<bool> {
-        let world = world(ctx)?;
-        let world = world.borrow();
-        Ok(world
-            .document(self.handle.0)
-            .is_some_and(|parsed| parsed.document.attribute(self.handle.0, name).is_some()))
-    }
-
-    // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#dom-fe-disabled
-    #[qjs(get, rename = "disabled")]
-    fn disabled(&self, ctx: Ctx<'_>) -> Result<bool> {
-        self.attribute_present(&ctx, "disabled")
-    }
-
-    #[qjs(set, rename = "disabled")]
-    fn set_disabled(&self, ctx: Ctx<'_>, value: bool) -> Result<()> {
-        self.reflect_boolean(ctx, "disabled", value)
-    }
-
-    // https://html.spec.whatwg.org/multipage/input.html#dom-input-readonly
-    #[qjs(get, rename = "readOnly")]
-    fn read_only(&self, ctx: Ctx<'_>) -> Result<bool> {
-        self.attribute_present(&ctx, "readonly")
-    }
-
-    #[qjs(set, rename = "readOnly")]
-    fn set_read_only(&self, ctx: Ctx<'_>, value: bool) -> Result<()> {
-        self.reflect_boolean(ctx, "readonly", value)
-    }
-
-    // https://html.spec.whatwg.org/multipage/input.html#dom-input-required
-    #[qjs(get, rename = "required")]
-    fn required(&self, ctx: Ctx<'_>) -> Result<bool> {
-        self.attribute_present(&ctx, "required")
-    }
-
-    #[qjs(set, rename = "required")]
-    fn set_required(&self, ctx: Ctx<'_>, value: bool) -> Result<()> {
-        self.reflect_boolean(ctx, "required", value)
-    }
-
-    // https://html.spec.whatwg.org/multipage/select.html#dom-select-multiple
-    #[qjs(get, rename = "multiple")]
-    fn multiple(&self, ctx: Ctx<'_>) -> Result<bool> {
-        self.attribute_present(&ctx, "multiple")
-    }
-
-    #[qjs(set, rename = "multiple")]
-    fn set_multiple(&self, ctx: Ctx<'_>, value: bool) -> Result<()> {
-        self.reflect_boolean(ctx, "multiple", value)
-    }
-
     // https://html.spec.whatwg.org/multipage/forms.html#dom-fae-form
-    #[qjs(get, rename = "form")]
+    #[qjs(skip)]
     fn form<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
         let form = {
             let world = world(&ctx)?;
@@ -1543,7 +1585,7 @@ impl JsNode {
     }
 
     // https://html.spec.whatwg.org/multipage/input.html#dom-input-checked
-    #[qjs(get)]
+    #[qjs(skip)]
     fn checked(&self, ctx: Ctx<'_>) -> Result<bool> {
         let world = world(&ctx)?;
         let world = world.borrow();
@@ -1552,7 +1594,7 @@ impl JsNode {
             .is_some_and(|parsed| dom::form::checkedness(&parsed.document, self.handle.0)))
     }
 
-    #[qjs(set, rename = "checked")]
+    #[qjs(skip)]
     fn set_checked(&self, ctx: Ctx<'_>, value: bool) -> Result<()> {
         let world = world(&ctx)?;
         let world = world.borrow();
@@ -1564,7 +1606,7 @@ impl JsNode {
     }
 
     // https://html.spec.whatwg.org/multipage/input.html#dom-input-indeterminate
-    #[qjs(get)]
+    #[qjs(skip)]
     fn indeterminate(&self, ctx: Ctx<'_>) -> Result<bool> {
         let world = world(&ctx)?;
         let world = world.borrow();
@@ -1573,7 +1615,7 @@ impl JsNode {
             .is_some_and(|parsed| dom::form::indeterminate(&parsed.document, self.handle.0)))
     }
 
-    #[qjs(set, rename = "indeterminate")]
+    #[qjs(skip)]
     fn set_indeterminate(&self, ctx: Ctx<'_>, value: bool) -> Result<()> {
         let world = world(&ctx)?;
         let world = world.borrow();
@@ -1584,19 +1626,8 @@ impl JsNode {
         Ok(())
     }
 
-    // https://html.spec.whatwg.org/multipage/input.html#dom-input-defaultchecked
-    #[qjs(get, rename = "defaultChecked")]
-    fn default_checked(&self, ctx: Ctx<'_>) -> Result<bool> {
-        self.attribute_present(&ctx, "checked")
-    }
-
-    #[qjs(set, rename = "defaultChecked")]
-    fn set_default_checked(&self, ctx: Ctx<'_>, value: bool) -> Result<()> {
-        self.reflect_boolean(ctx, "checked", value)
-    }
-
     // https://html.spec.whatwg.org/multipage/form-elements.html#dom-option-selected
-    #[qjs(get, rename = "selected")]
+    #[qjs(skip)]
     fn selected(&self, ctx: Ctx<'_>) -> Result<bool> {
         let world = world(&ctx)?;
         let world = world.borrow();
@@ -1605,7 +1636,7 @@ impl JsNode {
             .is_some_and(|parsed| dom::form::option_selected(&parsed.document, self.handle.0)))
     }
 
-    #[qjs(set, rename = "selected")]
+    #[qjs(skip)]
     fn set_selected(&self, ctx: Ctx<'_>, value: bool) -> Result<()> {
         let world = world(&ctx)?;
         let world = world.borrow();
@@ -1616,36 +1647,23 @@ impl JsNode {
         Ok(())
     }
 
-    #[qjs(get, rename = "defaultSelected")]
-    fn default_selected(&self, ctx: Ctx<'_>) -> Result<bool> {
-        self.attribute_present(&ctx, "selected")
-    }
-
-    #[qjs(set, rename = "defaultSelected")]
-    fn set_default_selected(&self, ctx: Ctx<'_>, value: bool) -> Result<()> {
-        self.reflect_boolean(ctx, "selected", value)
-    }
-
     // https://html.spec.whatwg.org/multipage/form-elements.html#dom-option-label
-    #[qjs(get)]
+    #[qjs(skip)]
     fn label(&self, ctx: Ctx<'_>) -> Result<String> {
         let world = world(&ctx)?;
         let world = world.borrow();
-        Ok(world.document(self.handle.0).map_or_else(String::new, |parsed| {
-            parsed
-                .document
-                .no_namespace_attribute(self.handle.0, "label")
-                .unwrap_or_else(|| dom::form::option_text(&parsed.document, self.handle.0))
-        }))
-    }
-
-    #[qjs(set, rename = "label")]
-    fn set_label(&self, ctx: Ctx<'_>, value: WebIdlString) -> Result<()> {
-        self.set_attribute(ctx, WebIdlString("label".into()), value)
+        Ok(world
+            .document(self.handle.0)
+            .map_or_else(String::new, |parsed| {
+                parsed
+                    .document
+                    .no_namespace_attribute(self.handle.0, "label")
+                    .unwrap_or_else(|| dom::form::option_text(&parsed.document, self.handle.0))
+            }))
     }
 
     // https://html.spec.whatwg.org/multipage/form-elements.html#dom-option-text
-    #[qjs(get)]
+    #[qjs(skip)]
     fn text(&self, ctx: Ctx<'_>) -> Result<String> {
         let world = world(&ctx)?;
         let world = world.borrow();
@@ -1656,8 +1674,8 @@ impl JsNode {
             }))
     }
 
-    #[qjs(set, rename = "text")]
-    fn set_text(&self, ctx: Ctx<'_>, value: WebIdlString) -> Result<()> {
+    #[qjs(skip)]
+    fn set_text(&self, ctx: Ctx<'_>, value: WebIdlCodeUnits) -> Result<()> {
         let world = world(&ctx)?;
         let world = world.borrow();
         let Some(mut parsed) = world.document_mut(self.handle.0) else {
@@ -1675,7 +1693,7 @@ impl JsNode {
     }
 
     // https://html.spec.whatwg.org/multipage/form-elements.html#dom-option-index
-    #[qjs(get)]
+    #[qjs(skip)]
     fn index(&self, ctx: Ctx<'_>) -> Result<i32> {
         let world = world(&ctx)?;
         let world = world.borrow();
@@ -1685,7 +1703,10 @@ impl JsNode {
         let Some(select) = dom::form::option_select_owner(&parsed.document, self.handle.0) else {
             return Ok(0);
         };
-        for (index, option) in dom::form::select_options(&parsed.document, select).into_iter().enumerate() {
+        for (index, option) in dom::form::select_options(&parsed.document, select)
+            .into_iter()
+            .enumerate()
+        {
             if option == self.handle.0 {
                 return Ok(i32::try_from(index).unwrap_or(i32::MAX));
             }
@@ -1694,7 +1715,7 @@ impl JsNode {
     }
 
     // https://html.spec.whatwg.org/multipage/form-elements.html#dom-select-selectedindex
-    #[qjs(get, rename = "selectedIndex")]
+    #[qjs(skip)]
     fn selected_index(&self, ctx: Ctx<'_>) -> Result<i32> {
         let world = world(&ctx)?;
         let world = world.borrow();
@@ -1703,7 +1724,7 @@ impl JsNode {
         }))
     }
 
-    #[qjs(set, rename = "selectedIndex")]
+    #[qjs(skip)]
     fn set_selected_index(&self, ctx: Ctx<'_>, value: i32) -> Result<()> {
         let world = world(&ctx)?;
         let world = world.borrow();
@@ -1714,7 +1735,7 @@ impl JsNode {
         Ok(())
     }
 
-    #[qjs(get)]
+    #[qjs(skip)]
     fn options<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
         live_collection(
             &ctx,
@@ -1725,7 +1746,7 @@ impl JsNode {
     }
 
     // https://html.spec.whatwg.org/multipage/form-elements.html#dom-select-selectedoptions
-    #[qjs(get, rename = "selectedOptions")]
+    #[qjs(skip)]
     fn selected_options<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
         live_collection(
             &ctx,
@@ -1735,45 +1756,20 @@ impl JsNode {
         )
     }
 
-    /// URL-reflected `src`: parsed against the document base and stored
-    /// serialized, like `href`; an absent attribute reflects as the empty
-    /// string (<https://html.spec.whatwg.org/multipage/urls-and-fetching.html#reflecting-content-attributes-in-idl-attributes>).
-    #[qjs(get)]
-    fn src(&self, ctx: Ctx<'_>) -> Result<String> {
-        let world_rc = world(&ctx)?;
-        let raw = world_rc
-            .borrow()
-            .document(self.handle.0)
-            .and_then(|parsed| parsed.document.attribute(self.handle.0, "src"));
-        let Some(raw) = raw else {
-            return Ok(String::new());
-        };
-        let base = document_base_url_string(&ctx, self.handle.0);
-        Ok(url::Url::parse(&base)
-            .ok()
-            .and_then(|base| base.join(&raw).ok())
-            .map_or(raw, |url| url.to_string()))
-    }
-
-    #[qjs(set, rename = "src")]
-    fn set_src(&self, ctx: Ctx<'_>, value: WebIdlString) -> Result<()> {
-        self.set_attribute(ctx, WebIdlString("src".into()), value)
-    }
-
     // https://html.spec.whatwg.org/multipage/embedded-content.html#dom-img-naturalwidth
-    #[qjs(get, rename = "naturalWidth")]
+    #[qjs(skip)]
     fn natural_width(&self, ctx: Ctx<'_>) -> Result<u32> {
         Ok(img_size(&ctx, self.handle.0)?.map_or(0, |(width, _)| width))
     }
 
     // https://html.spec.whatwg.org/multipage/embedded-content.html#dom-img-naturalheight
-    #[qjs(get, rename = "naturalHeight")]
+    #[qjs(skip)]
     fn natural_height(&self, ctx: Ctx<'_>) -> Result<u32> {
         Ok(img_size(&ctx, self.handle.0)?.map_or(0, |(_, height)| height))
     }
 
     // https://html.spec.whatwg.org/multipage/embedded-content.html#dom-img-complete
-    #[qjs(get)]
+    #[qjs(skip)]
     fn complete(&self, ctx: Ctx<'_>) -> Result<bool> {
         if !with_node_kind(&ctx, self.handle.0, |kind| is_html_element(kind, "img"))? {
             return Ok(false);
@@ -1796,7 +1792,7 @@ impl JsNode {
     }
 
     // https://html.spec.whatwg.org/multipage/embedded-content.html#dom-img-currentsrc
-    #[qjs(get, rename = "currentSrc")]
+    #[qjs(skip)]
     fn current_src(&self, ctx: Ctx<'_>) -> Result<String> {
         if !with_node_kind(&ctx, self.handle.0, |kind| is_html_element(kind, "img"))? {
             return Ok(String::new());
@@ -1811,7 +1807,7 @@ impl JsNode {
     }
 
     // https://html.spec.whatwg.org/multipage/iframe-embed-object.html#dom-iframe-contentdocument
-    #[qjs(get, rename = "contentDocument")]
+    #[qjs(skip)]
     fn content_document<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
         if !iframe_frame(&ctx, self.handle.0)? {
             return Ok(Value::new_null(ctx));
@@ -1836,7 +1832,7 @@ impl JsNode {
     }
 
     // https://html.spec.whatwg.org/multipage/iframe-embed-object.html#dom-iframe-contentwindow
-    #[qjs(get, rename = "contentWindow")]
+    #[qjs(skip)]
     fn content_window<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
         if !iframe_frame(&ctx, self.handle.0)? {
             return Ok(Value::new_null(ctx));
@@ -1844,100 +1840,21 @@ impl JsNode {
         let frame = world(&ctx)?.borrow().frame_for_container(self.handle.0);
         match frame {
             Some(frame) => {
-                let proxy: Function = ctx.globals().get("__tbFrameProxy")?;
+                let proxy: Function = crate::js::bridge::object(&ctx)?.get("__tbFrameProxy")?;
                 proxy.call((crate::js::js_number(frame.get()),))
             }
             None => Ok(Value::new_null(ctx)),
         }
     }
 
-    #[qjs(get)]
-    fn name(&self, ctx: Ctx<'_>) -> Result<String> {
-        let world = world(&ctx)?;
-        let world = world.borrow();
-        let Some(parsed) = world.document(self.handle.0) else {
-            return Ok(String::new());
-        };
-        match doctype_fields(&parsed, self.handle.0) {
-            Some((name, _, _)) => Ok(name),
-            None => Ok(parsed
-                .document
-                .attribute(self.handle.0, "name")
-                .unwrap_or_default()),
-        }
-    }
-
-    // https://dom.spec.whatwg.org/#dom-documenttype-publicid
-    #[qjs(get, rename = "publicId")]
-    fn public_id(&self, ctx: Ctx<'_>) -> Result<String> {
-        let world = world(&ctx)?;
-        let world = world.borrow();
-        let Some(parsed) = world.document(self.handle.0) else {
-            return Ok(String::new());
-        };
-        Ok(doctype_fields(&parsed, self.handle.0)
-            .map_or(String::new(), |(_, public_id, _)| public_id))
-    }
-
-    // https://dom.spec.whatwg.org/#dom-documenttype-systemid
-    #[qjs(get, rename = "systemId")]
-    fn system_id(&self, ctx: Ctx<'_>) -> Result<String> {
-        let world = world(&ctx)?;
-        let world = world.borrow();
-        let Some(parsed) = world.document(self.handle.0) else {
-            return Ok(String::new());
-        };
-        Ok(doctype_fields(&parsed, self.handle.0)
-            .map_or(String::new(), |(_, _, system_id)| system_id))
-    }
-
-    #[qjs(set, rename = "name")]
-    fn set_name(&self, ctx: Ctx<'_>, value: WebIdlString) -> Result<()> {
-        self.set_attribute(ctx, WebIdlString("name".into()), value)
-    }
-
-    #[qjs(get)]
-    fn content<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
-        let world = world(&ctx)?;
-        let template_contents = {
-            let world = world.borrow();
-            world.document(self.handle.0).and_then(|parsed| {
-                is_template_element(parsed.document.kind(self.handle.0))
-                    .then(|| dom::shadow::template_contents(&parsed.document, self.handle.0))
-                    .flatten()
-            })
-        };
-        if let Some(contents) = template_contents {
-            return wrap_node(&ctx, contents);
-        }
-
-        let value = world
-            .borrow()
-            .document(self.handle.0)
-            .and_then(|parsed| parsed.document.attribute(self.handle.0, "content"))
-            .unwrap_or_default();
-        Ok(Value::from_string(rquickjs::String::from_str(ctx, &value)?))
-    }
-
-    #[qjs(set, rename = "content")]
-    fn set_content(&self, ctx: Ctx<'_>, value: WebIdlString) -> Result<()> {
-        self.set_attribute(ctx, WebIdlString("content".into()), value)
-    }
-
     // https://dom.spec.whatwg.org/#dom-element-attachshadow
-    #[qjs(rename = "attachShadow")]
-    fn attach_shadow<'js>(&self, ctx: Ctx<'js>, init: Object<'js>) -> Result<Value<'js>> {
-        let mode: String = init.get("mode")?;
-        let open = match mode.as_str() {
-            "open" => true,
-            "closed" => false,
-            _ => {
-                return Err(Exception::throw_type(
-                    &ctx,
-                    "mode must be 'open' or 'closed'",
-                ));
-            }
-        };
+    #[qjs(skip)]
+    fn attach_shadow<'js>(
+        &self,
+        ctx: Ctx<'js>,
+        init: element_generated::ShadowRootInit,
+    ) -> Result<Value<'js>> {
+        let open = matches!(init.mode, element_generated::ShadowRootMode::Open);
         let local = with_node_kind(&ctx, self.handle.0, |kind| match kind {
             Some(NodeKind::Element { name, .. }) if name.ns == html_namespace() => {
                 Some(name.local.to_string())
@@ -2000,97 +1917,97 @@ impl JsNode {
         wrap_node(&ctx, root)
     }
 
-    #[qjs(get, rename = "shadowRoot")]
-    fn shadow_root<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
-        let world = world(&ctx)?;
+    #[qjs(skip)]
+    fn shadow_root<'js>(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
+        let world = world(ctx)?;
         let root = world
             .borrow()
             .document(self.handle.0)
             .and_then(|parsed| dom::shadow::open_shadow_root(&parsed.document, self.handle.0));
-        child_value(&ctx, root)
+        child_value(ctx, root)
     }
 
-    #[qjs(get)]
-    fn host<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
-        let world = world(&ctx)?;
+    #[qjs(skip)]
+    fn host<'js>(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
+        let world = world(ctx)?;
         let host = world
             .borrow()
             .document(self.handle.0)
             .and_then(|parsed| dom::shadow::shadow_host(&parsed.document, self.handle.0));
         match host {
-            Some(host) => wrap_node(&ctx, host),
-            None => Err(Exception::throw_type(&ctx, "not a shadow root")),
+            Some(host) => wrap_node(ctx, host),
+            None => Err(Exception::throw_type(ctx, "not a shadow root")),
         }
     }
 
-    #[qjs(get)]
-    fn mode(&self, ctx: Ctx<'_>) -> Result<String> {
-        let world = world(&ctx)?;
+    #[qjs(skip)]
+    fn mode(&self, ctx: &Ctx<'_>) -> Result<String> {
+        let world = world(ctx)?;
         let open = world
             .borrow()
             .document(self.handle.0)
             .and_then(|parsed| dom::shadow::shadow_root_is_open(&parsed.document, self.handle.0))
-            .ok_or_else(|| Exception::throw_type(&ctx, "not a shadow root"))?;
+            .ok_or_else(|| Exception::throw_type(ctx, "not a shadow root"))?;
         Ok(if open { "open" } else { "closed" }.into())
     }
 
     // https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-element-innerhtml
-    #[qjs(get, rename = "innerHTML")]
-    fn inner_html(&self, ctx: Ctx<'_>) -> Result<String> {
-        let world = world(&ctx)?;
+    #[qjs(skip)]
+    fn inner_html<'js>(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
+        let world = world(ctx)?;
         let parsed = world.borrow();
         let Some(parsed) = parsed.document(self.handle.0) else {
-            return Err(Exception::throw_type(&ctx, "no document"));
+            return Err(Exception::throw_type(ctx, "no document"));
         };
         if parsed.content_type == "text/html" {
-            Ok(crate::serialize::serialize_html_fragment(
-                &parsed.document,
-                self.handle.0,
-            ))
+            let markup = crate::serialize::serialize_html_fragment(&parsed.document, self.handle.0);
+            dom_string(ctx, &markup)
         } else {
-            crate::serialize::serialize_xml_children(&parsed.document, self.handle.0, true)
-                .map_err(|err| throw_dom(&ctx, "InvalidStateError", &err.to_string()))
+            let markup =
+                crate::serialize::serialize_xml_children(&parsed.document, self.handle.0, true)
+                    .map_err(|err| throw_dom(ctx, "InvalidStateError", &err.to_string()))?;
+            dom_string(ctx, &markup)
         }
     }
 
     // https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-element-outerhtml
-    #[qjs(get, rename = "outerHTML")]
-    fn outer_html(&self, ctx: Ctx<'_>) -> Result<String> {
-        let world = world(&ctx)?;
+    #[qjs(skip)]
+    fn outer_html<'js>(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
+        let world = world(ctx)?;
         let parsed = world.borrow();
         let Some(parsed) = parsed.document(self.handle.0) else {
-            return Err(Exception::throw_type(&ctx, "no document"));
+            return Err(Exception::throw_type(ctx, "no document"));
         };
-        let Some(NodeKind::Element { name, attributes }) = parsed.document.kind(self.handle.0) else {
-            return Err(Exception::throw_type(&ctx, "outerHTML requires an element"));
+        let Some(NodeKind::Element { name, attributes }) = parsed.document.kind(self.handle.0)
+        else {
+            return Err(Exception::throw_type(ctx, "outerHTML requires an element"));
         };
         if parsed.content_type == "text/html" {
-            let mut output = String::new();
-            crate::serialize::serialize_html_element(
+            let markup = crate::serialize::serialize_html_outer(
                 &parsed.document,
                 self.handle.0,
                 name,
                 attributes,
-                &mut output,
             );
-            Ok(output)
+            dom_string(ctx, &markup)
         } else {
-            crate::serialize::serialize_xml(&parsed.document, self.handle.0, true)
-                .map_err(|err| throw_dom(&ctx, "InvalidStateError", &err.to_string()))
+            let markup = crate::serialize::serialize_xml(&parsed.document, self.handle.0, true)
+                .map_err(|err| throw_dom(ctx, "InvalidStateError", &err.to_string()))?;
+            dom_string(ctx, &markup)
         }
     }
 
     // https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-element-innerhtml
-    #[qjs(set, rename = "innerHTML")]
-    fn set_inner_html(&self, ctx: Ctx<'_>, value: LegacyNullString) -> Result<()> {
-        let (context, is_template) = with_node_kind(&ctx, self.handle.0, |kind| match kind {
+    #[qjs(skip)]
+    fn set_inner_html(&self, ctx: &Ctx<'_>, value: LegacyNullString) -> Result<()> {
+        let (context, is_template) = with_node_kind(ctx, self.handle.0, |kind| match kind {
             Some(NodeKind::Element { name, .. }) => {
                 Some((html_fragment_context(name), is_template_element(kind)))
             }
             _ => None,
         })?
         .or_else(|| {
-            let world = world(&ctx).ok()?;
+            let world = world(ctx).ok()?;
             let world = world.borrow();
             let parsed = world.document(self.handle.0)?;
             let host = dom::shadow::shadow_host(&parsed.document, self.handle.0)?;
@@ -2100,39 +2017,40 @@ impl JsNode {
             Some((html_fragment_context(name), false))
         })
         .ok_or_else(|| {
-            Exception::throw_type(&ctx, "innerHTML requires an element or shadow root")
+            Exception::throw_type(ctx, "innerHTML requires an element or shadow root")
         })?;
 
-        let snapshots = parse_html_fragment_snapshots(&ctx, &value.0, &context)?;
+        let snapshots = parse_html_fragment_snapshots(ctx, &value.0, &context)?;
 
-        let world = world(&ctx)?;
+        let world = world(ctx)?;
         let world = world.borrow();
         let Some(mut parsed) = world.document_mut(self.handle.0) else {
-            return Err(Exception::throw_type(&ctx, "no document"));
+            return Err(Exception::throw_type(ctx, "no document"));
         };
         let target = if is_template {
-            if let Some(contents) = dom::shadow::template_contents(&parsed.document, self.handle.0) {
+            if let Some(contents) = dom::shadow::template_contents(&parsed.document, self.handle.0)
+            {
                 contents
             } else {
                 let contents = parsed.document.create_fragment();
                 dom::shadow::set_template_contents(&mut parsed.document, self.handle.0, contents)
-                    .map_err(|err| throw_dom_error(&ctx, err))?;
+                    .map_err(|err| throw_dom_error(ctx, err))?;
                 contents
             }
         } else {
             self.handle.0
         };
         let replacement = materialize_children(&mut parsed.document, &snapshots)
-            .map_err(|err| throw_dom_error(&ctx, err))?;
+            .map_err(|err| throw_dom_error(ctx, err))?;
         dom::mutation::replace_all(&mut parsed.document, target, replacement)
-            .map_err(|err| throw_dom_error(&ctx, err))?;
+            .map_err(|err| throw_dom_error(ctx, err))?;
         drop(parsed);
         drop(world);
-        schedule_mutation_delivery(&ctx)
+        schedule_mutation_delivery(ctx)
     }
 
     // https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-element-insertadjacenthtml
-    #[qjs(rename = "insertAdjacentHTML")]
+    #[qjs(skip)]
     fn insert_adjacent_html(
         &self,
         ctx: Ctx<'_>,
@@ -2193,25 +2111,25 @@ impl JsNode {
     }
 
     // https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-element-outerhtml
-    #[qjs(set, rename = "outerHTML")]
-    fn set_outer_html(&self, ctx: Ctx<'_>, value: LegacyNullString) -> Result<()> {
-        let world_rc = world(&ctx)?;
+    #[qjs(skip)]
+    fn set_outer_html(&self, ctx: &Ctx<'_>, value: LegacyNullString) -> Result<()> {
+        let world_rc = world(ctx)?;
         let (parent, context) = {
             let world = world_rc.borrow();
             let Some(parsed) = world.document(self.handle.0) else {
-                return Err(Exception::throw_type(&ctx, "no document"));
+                return Err(Exception::throw_type(ctx, "no document"));
             };
             let Some(parent) = parsed.document.parent(self.handle.0) else {
                 // A parentless element has nothing to replace.
                 return Ok(());
             };
             let Some(kind) = parsed.document.kind(parent).cloned() else {
-                return Err(Exception::throw_type(&ctx, "no document"));
+                return Err(Exception::throw_type(ctx, "no document"));
             };
             match kind {
                 NodeKind::Document => {
                     return Err(throw_dom(
-                        &ctx,
+                        ctx,
                         "NoModificationAllowedError",
                         "the parent of the element is a Document",
                     ));
@@ -2223,86 +2141,47 @@ impl JsNode {
                 _ => (parent, "body".to_owned()),
             }
         };
-        let snapshots = parse_html_fragment_snapshots(&ctx, &value.0, &context)?;
+        let snapshots = parse_html_fragment_snapshots(ctx, &value.0, &context)?;
 
         let world = world_rc.borrow();
         let Some(mut parsed) = world.document_mut(self.handle.0) else {
-            return Err(Exception::throw_type(&ctx, "no document"));
+            return Err(Exception::throw_type(ctx, "no document"));
         };
         let replacement = materialize_children(&mut parsed.document, &snapshots)
-            .map_err(|err| throw_dom_error(&ctx, err))?;
+            .map_err(|err| throw_dom_error(ctx, err))?;
         dom::mutation::replace_child(&mut parsed.document, parent, replacement, self.handle.0)
-            .map_err(|err| throw_dom_error(&ctx, err))?;
+            .map_err(|err| throw_dom_error(ctx, err))?;
         drop(parsed);
         drop(world);
-        schedule_mutation_delivery(&ctx)
+        schedule_mutation_delivery(ctx)
     }
 
-    /// URL-reflected `href`: parsed against the document base and stored
-    /// serialized (percent-encoded).
-    #[qjs(get)]
-    fn href(&self, ctx: Ctx<'_>) -> Result<String> {
-        let world_rc = world(&ctx)?;
-        let raw = world_rc
-            .borrow()
-            .document(self.handle.0)
-            .and_then(|parsed| parsed.document.attribute(self.handle.0, "href"))
-            .unwrap_or_default();
-        let base = document_base_url_string(&ctx, self.handle.0);
-        Ok(url::Url::parse(&base)
-            .ok()
-            .and_then(|base| base.join(&raw).ok())
-            .map_or(raw, |url| url.to_string()))
-    }
-
-    #[qjs(set, rename = "href")]
-    fn set_href(&self, ctx: Ctx<'_>, value: WebIdlString) -> Result<()> {
-        // URL reflection stores the given value; resolution happens on get
-        // (<https://html.spec.whatwg.org/multipage/urls-and-fetching.html#reflecting-content-attributes-in-idl-attributes>).
-        self.set_attribute(ctx, WebIdlString("href".into()), value)
-    }
-
-    #[qjs(get, rename = "style")]
-    fn style<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
-        let world_rc = world_for_node(&ctx, self.handle.0)?;
+    #[qjs(skip)]
+    fn style<'js>(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
+        let world_rc = world_for_node(ctx, self.handle.0)?;
         if let Some(saved) = world_rc
             .borrow()
             .wrapper(self.handle.0, Wrapper::StyleDeclaration)
-            && let Some(value) = deref_weak(&ctx, saved)?
+            && let Some(value) = deref_weak(ctx, saved)?
         {
             return Ok(value);
         }
-        let factory: Function = ctx.globals().get("__tbMakeStyle")?;
-        let element = wrap_node(&ctx, self.handle.0)?;
+        let factory: Function = crate::js::bridge::object(ctx)?.get("__tbMakeStyle")?;
+        let element = wrap_node(ctx, self.handle.0)?;
         let value: Value = factory.call((element,))?;
-        let weak = make_weak(&ctx, value.clone())?;
+        let weak = make_weak(ctx, value.clone())?;
         world_rc.borrow_mut().intern_wrapper(
             self.handle.0,
             Wrapper::StyleDeclaration,
-            Persistent::save(&ctx, weak),
+            Persistent::save(ctx, weak),
         );
         Ok(value)
     }
 
-    #[qjs(set, rename = "style")]
-    fn set_style(&self, ctx: Ctx<'_>, value: WebIdlString) -> Result<()> {
-        self.set_attribute(ctx, WebIdlString("style".into()), value)
-    }
-
-    #[qjs(get)]
-    fn data(&self, ctx: Ctx<'_>) -> Result<String> {
-        character_data(&ctx, self.handle.0)
-    }
-
-    #[qjs(set, rename = "data")]
-    fn set_data(&self, ctx: Ctx<'_>, value: LegacyNullString) -> Result<()> {
-        set_character_data(&ctx, self.handle.0, value.0)
-    }
-
     // https://dom.spec.whatwg.org/#dom-node-lastchild
-    #[qjs(get, rename = "lastChild")]
-    fn last_child<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
-        let world = world(&ctx)?;
+    #[qjs(skip)]
+    fn last_child<'js>(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
+        let world = world(ctx)?;
         let id = world
             .borrow()
             .with_document(self.handle.0, |parsed| {
@@ -2312,34 +2191,34 @@ impl JsNode {
                     .and_then(|mut kids| kids.next_back())
             })
             .flatten();
-        child_value(&ctx, id)
+        child_value(ctx, id)
     }
 
     // https://dom.spec.whatwg.org/#dom-node-nextsibling
-    #[qjs(get, rename = "nextSibling")]
-    fn next_sibling<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
-        sibling_value(&ctx, self.handle.0, true)
+    #[qjs(skip)]
+    fn next_sibling<'js>(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
+        sibling_value(ctx, self.handle.0, true)
     }
 
     // https://dom.spec.whatwg.org/#dom-node-previoussibling
-    #[qjs(get, rename = "previousSibling")]
-    fn previous_sibling<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
-        sibling_value(&ctx, self.handle.0, false)
+    #[qjs(skip)]
+    fn previous_sibling<'js>(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
+        sibling_value(ctx, self.handle.0, false)
     }
 
     // https://dom.spec.whatwg.org/#dom-node-ownerdocument
-    #[qjs(get, rename = "ownerDocument")]
-    fn owner_document<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
-        let world = world(&ctx)?;
+    #[qjs(skip)]
+    fn owner_document<'js>(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
+        let world = world(ctx)?;
         let id = world.borrow().document(self.handle.0).and_then(|parsed| {
             let document = parsed.document.document();
             (document != self.handle.0).then_some(document)
         });
-        child_value(&ctx, id)
+        child_value(ctx, id)
     }
 
     // https://dom.spec.whatwg.org/#dom-node-haschildnodes
-    #[qjs(rename = "hasChildNodes")]
+    #[qjs(skip)]
     fn has_child_nodes(&self, ctx: Ctx<'_>) -> Result<bool> {
         let world = world(&ctx)?;
         let parsed = world.borrow();
@@ -2353,12 +2232,12 @@ impl JsNode {
     }
 
     // https://dom.spec.whatwg.org/#dom-node-nodevalue
-    #[qjs(get, rename = "nodeValue")]
-    fn node_value<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
-        let world = world(&ctx)?;
+    #[qjs(skip)]
+    fn node_value<'js>(&self, ctx: &Ctx<'js>) -> Result<Option<rquickjs::String<'js>>> {
+        let world = world(ctx)?;
         let parsed = world.borrow();
         let Some(parsed) = parsed.document(self.handle.0) else {
-            return Ok(Value::new_null(ctx));
+            return Ok(None);
         };
         match parsed.document.kind(self.handle.0) {
             Some(
@@ -2366,50 +2245,55 @@ impl JsNode {
                 | NodeKind::CDataSection { data }
                 | NodeKind::ProcessingInstruction { data, .. }
                 | NodeKind::Comment { data },
-            ) => string_value(&ctx, data),
-            _ => Ok(Value::new_null(ctx)),
+            ) => dom_string(ctx, data).map(Some),
+            _ => Ok(None),
         }
     }
 
-    #[qjs(set, rename = "nodeValue")]
-    fn set_node_value(&self, ctx: Ctx<'_>, value: OptString) -> Result<()> {
-        // "If the given value is null, act as if it was the empty string"
-        // (<https://dom.spec.whatwg.org/#dom-node-nodevalue>); `OptString`
-        // maps null and undefined to `None`.
-        set_character_data(&ctx, self.handle.0, value.0.unwrap_or_default())
+    // https://dom.spec.whatwg.org/#dom-node-nodevalue
+    #[qjs(skip)]
+    fn set_node_value(&self, ctx: &Ctx<'_>, value: Option<rquickjs::String<'_>>) -> Result<()> {
+        let value = match value {
+            Some(value) => dom::DomString::from_utf16(value.to_utf16()?),
+            None => dom::DomString::default(),
+        };
+        set_character_data(ctx, self.handle.0, value)
     }
 
     // https://dom.spec.whatwg.org/#dom-node-textcontent
-    #[qjs(get, rename = "textContent")]
-    fn text_content<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
-        let world = world(&ctx)?;
+    #[qjs(skip)]
+    fn text_content<'js>(&self, ctx: &Ctx<'js>) -> Result<Option<rquickjs::String<'js>>> {
+        let world = world(ctx)?;
         let parsed = world.borrow();
         let Some(parsed) = parsed.document(self.handle.0) else {
-            return Ok(Value::new_null(ctx));
+            return Ok(None);
         };
         match parsed.document.kind(self.handle.0) {
             Some(NodeKind::Element { .. } | NodeKind::Fragment) => {
                 let text = descendant_text(&parsed.document, self.handle.0);
-                string_value(&ctx, &text)
+                dom_string(ctx, &text).map(Some)
             }
             Some(
                 NodeKind::Text { data }
                 | NodeKind::CDataSection { data }
                 | NodeKind::ProcessingInstruction { data, .. }
                 | NodeKind::Comment { data },
-            ) => string_value(&ctx, data),
-            _ => Ok(Value::new_null(ctx)),
+            ) => dom_string(ctx, data).map(Some),
+            _ => Ok(None),
         }
     }
 
-    #[qjs(set, rename = "textContent")]
-    fn set_text_content(&self, ctx: Ctx<'_>, value: OptString) -> Result<()> {
-        let text = value.0.unwrap_or_default();
+    #[qjs(skip)]
+    fn set_text_content(&self, ctx: &Ctx<'_>, value: Option<rquickjs::String<'_>>) -> Result<()> {
+        let text = match value {
+            Some(value) => dom::DomString::from_utf16(value.to_utf16()?),
+            None => dom::DomString::default(),
+        };
         // A `CharacterData` node [replaces its data] in place; `Document` and
         // `DocumentType` ignore the setter; every other node replaces its
         // children with one `Text` node
         // (<https://dom.spec.whatwg.org/#dom-node-textcontent>).
-        let world_rc = world(&ctx)?;
+        let world_rc = world(ctx)?;
         let character_data = {
             let world = world_rc.borrow();
             let Some(parsed) = world.document(self.handle.0) else {
@@ -2426,7 +2310,7 @@ impl JsNode {
             )
         };
         if character_data {
-            return set_character_data(&ctx, self.handle.0, text);
+            return set_character_data(ctx, self.handle.0, text);
         }
         let world = world_rc.borrow();
         let Some(mut parsed) = world.document_mut(self.handle.0) else {
@@ -2443,169 +2327,17 @@ impl JsNode {
         if !text.is_empty() {
             let text_id = dom.create_text(text);
             dom::mutation::append(dom, replacement, text_id)
-                .map_err(|err| throw_dom_error(&ctx, err))?;
+                .map_err(|err| throw_dom_error(ctx, err))?;
         }
         dom::mutation::replace_all(dom, self.handle.0, replacement)
-            .map_err(|err| throw_dom_error(&ctx, err))?;
+            .map_err(|err| throw_dom_error(ctx, err))?;
         drop(parsed);
         drop(world);
-        schedule_mutation_delivery(&ctx)
-    }
-
-    // ── ParentNode ───────────────────────────────────────────────────────
-
-    // https://dom.spec.whatwg.org/#dom-parentnode-children
-    #[qjs(get)]
-    fn children<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
-        live_collection(
-            &ctx,
-            self.handle.0,
-            CollectionKind::ElementChildren,
-            Some("HTMLCollection"),
-        )
-    }
-
-    // https://dom.spec.whatwg.org/#dom-parentnode-firstelementchild
-    #[qjs(get, rename = "firstElementChild")]
-    fn first_element_child<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
-        let world = world(&ctx)?;
-        let found = {
-            let parsed = world.borrow();
-            let Some(parsed) = parsed.document(self.handle.0) else {
-                return Ok(Value::new_null(ctx));
-            };
-            parsed
-                .document
-                .children(self.handle.0)
-                .and_then(|mut kids| kids.find(|&kid| is_element(&parsed.document, kid)))
-        };
-        child_value(&ctx, found)
-    }
-
-    // https://dom.spec.whatwg.org/#dom-parentnode-lastelementchild
-    #[qjs(get, rename = "lastElementChild")]
-    fn last_element_child<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
-        let world = world(&ctx)?;
-        let found = {
-            let parsed = world.borrow();
-            let Some(parsed) = parsed.document(self.handle.0) else {
-                return Ok(Value::new_null(ctx));
-            };
-            parsed
-                .document
-                .children(self.handle.0)
-                .and_then(|kids| kids.rev().find(|&kid| is_element(&parsed.document, kid)))
-        };
-        child_value(&ctx, found)
-    }
-
-    // https://dom.spec.whatwg.org/#dom-parentnode-childelementcount
-    #[qjs(get, rename = "childElementCount")]
-    fn child_element_count(&self, ctx: Ctx<'_>) -> Result<usize> {
-        let world = world(&ctx)?;
-        let parsed = world.borrow();
-        let Some(parsed) = parsed.document(self.handle.0) else {
-            return Ok(0);
-        };
-        Ok(parsed.document.children(self.handle.0).map_or(0, |kids| {
-            kids.filter(|&kid| is_element(&parsed.document, kid)).count()
-        }))
-    }
-
-    // https://dom.spec.whatwg.org/#dom-parentnode-append
-    #[qjs(rename = "append")]
-    fn append<'js>(&self, ctx: Ctx<'js>, nodes: Rest<Value<'js>>) -> Result<()> {
-        let node = convert_nodes_into_node(&ctx, self.handle.0, nodes)?;
-        let world = world(&ctx)?;
-        let world = world.borrow();
-        let Some(mut parsed) = world.document_mut(self.handle.0) else {
-            return Err(Exception::throw_type(&ctx, "no document"));
-        };
-        dom::mutation::pre_insert(&mut parsed.document, self.handle.0, node, None)
-            .map_err(|err| throw_dom_error(&ctx, err))?;
-        drop(parsed);
-        drop(world);
-        schedule_mutation_delivery(&ctx)
-    }
-
-    // https://dom.spec.whatwg.org/#dom-parentnode-prepend
-    #[qjs(rename = "prepend")]
-    fn prepend<'js>(&self, ctx: Ctx<'js>, nodes: Rest<Value<'js>>) -> Result<()> {
-        let node = convert_nodes_into_node(&ctx, self.handle.0, nodes)?;
-        let world = world(&ctx)?;
-        let world = world.borrow();
-        let Some(mut parsed) = world.document_mut(self.handle.0) else {
-            return Err(Exception::throw_type(&ctx, "no document"));
-        };
-        let reference = parsed
-            .document
-            .children(self.handle.0)
-            .and_then(|mut kids| kids.next());
-        dom::mutation::pre_insert(&mut parsed.document, self.handle.0, node, reference)
-            .map_err(|err| throw_dom_error(&ctx, err))?;
-        drop(parsed);
-        drop(world);
-        schedule_mutation_delivery(&ctx)
-    }
-
-    // https://dom.spec.whatwg.org/#dom-parentnode-replacechildren
-    #[qjs(rename = "replaceChildren")]
-    fn replace_children<'js>(&self, ctx: Ctx<'js>, nodes: Rest<Value<'js>>) -> Result<()> {
-        let node = convert_nodes_into_node(&ctx, self.handle.0, nodes)?;
-        let world = world(&ctx)?;
-        let world = world.borrow();
-        let Some(mut parsed) = world.document_mut(self.handle.0) else {
-            return Err(Exception::throw_type(&ctx, "no document"));
-        };
-        dom::mutation::replace_all(&mut parsed.document, self.handle.0, node)
-            .map_err(|err| throw_dom_error(&ctx, err))?;
-        drop(parsed);
-        drop(world);
-        schedule_mutation_delivery(&ctx)
-    }
-
-    // https://dom.spec.whatwg.org/#dom-parentnode-queryselector
-    #[qjs(rename = "querySelector")]
-    fn query_selector<'js>(&self, ctx: Ctx<'js>, selectors: WebIdlString) -> Result<Value<'js>> {
-        let world = world(&ctx)?;
-        let found = {
-            let parsed = world.borrow();
-            let Some(parsed) = parsed.document(self.handle.0) else {
-                return Ok(Value::new_null(ctx));
-            };
-            dom::selector::select_first(&parsed.document, self.handle.0, &selectors.0)
-                .map_err(|err| select_error(&ctx, &err))?
-        };
-        child_value(&ctx, found)
-    }
-
-    // https://dom.spec.whatwg.org/#dom-parentnode-queryselectorall
-    #[qjs(rename = "querySelectorAll")]
-    fn query_selector_all<'js>(
-        &self,
-        ctx: Ctx<'js>,
-        selectors: WebIdlString,
-    ) -> Result<Value<'js>> {
-        let world = world(&ctx)?;
-        let ids = {
-            let parsed = world.borrow();
-            // A missing document answers with an empty list, not null
-            // (<https://dom.spec.whatwg.org/#dom-parentnode-queryselectorall>).
-            parsed
-                .document(self.handle.0)
-                .map(|parsed| {
-                    dom::selector::select_all(&parsed.document, self.handle.0, &selectors.0)
-                        .map_err(|err| select_error(&ctx, &err))
-                })
-                .transpose()?
-                .unwrap_or_default()
-        };
-        let handles = ids.into_iter().map(Handle).collect();
-        live_collection(&ctx, self.handle.0, CollectionKind::Static(handles), None)
+        schedule_mutation_delivery(ctx)
     }
 
     // https://dom.spec.whatwg.org/#dom-element-matches
-    #[qjs(rename = "matches")]
+    #[qjs(skip)]
     fn matches(&self, ctx: Ctx<'_>, selectors: WebIdlString) -> Result<bool> {
         let world = world(&ctx)?;
         let parsed = world.borrow();
@@ -2617,7 +2349,7 @@ impl JsNode {
     }
 
     // https://dom.spec.whatwg.org/#dom-element-closest
-    #[qjs(rename = "closest")]
+    #[qjs(skip)]
     fn closest<'js>(&self, ctx: Ctx<'js>, selectors: WebIdlString) -> Result<Value<'js>> {
         let world = world(&ctx)?;
         let found = {
@@ -2643,7 +2375,7 @@ impl JsNode {
     }
 
     // https://dom.spec.whatwg.org/#dom-element-getelementsbyclassname
-    #[qjs(rename = "getElementsByClassName")]
+    #[qjs(skip)]
     fn get_elements_by_class_name<'js>(
         &self,
         ctx: Ctx<'js>,
@@ -2658,25 +2390,26 @@ impl JsNode {
     }
 
     // https://dom.spec.whatwg.org/#dom-document-title
-    #[qjs(get)]
-    fn title(&self, ctx: Ctx<'_>) -> Result<String> {
-        let world = world(&ctx)?;
+    #[qjs(skip)]
+    fn title<'js>(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
+        let world = world(ctx)?;
         let parsed = world.borrow();
         let Some(parsed) = parsed.document(self.handle.0) else {
-            return Ok(String::new());
+            return rquickjs::String::from_str(ctx.clone(), "");
         };
         let title =
             dom::selector::select_first(&parsed.document, parsed.document.document(), "title")
                 .ok()
                 .flatten();
-        Ok(title.map_or_else(String::new, |title| {
-            descendant_text(&parsed.document, title)
-        }))
+        match title {
+            Some(title) => dom_string(ctx, &descendant_text(&parsed.document, title)),
+            None => rquickjs::String::from_str(ctx.clone(), ""),
+        }
     }
 
-    #[qjs(set, rename = "title")]
-    fn set_title(&self, ctx: Ctx<'_>, value: WebIdlString) -> Result<()> {
-        let world = world(&ctx)?;
+    #[qjs(skip)]
+    fn set_title(&self, ctx: &Ctx<'_>, value: WebIdlCodeUnits) -> Result<()> {
+        let world = world(ctx)?;
         let world = world.borrow();
         let Some(mut parsed) = world.document_mut(self.handle.0) else {
             return Ok(());
@@ -2706,20 +2439,19 @@ impl JsNode {
             .map(Iterator::collect)
             .unwrap_or_default();
         for kid in kids {
-            dom::mutation::detach(dom, kid).map_err(|err| throw_dom_error(&ctx, err))?;
+            dom::mutation::detach(dom, kid).map_err(|err| throw_dom_error(ctx, err))?;
         }
         if !value.0.is_empty() {
             let text = dom.create_text(value.0);
-            dom::mutation::append(dom, title, text)
-                .map_err(|err| throw_dom_error(&ctx, err))?;
+            dom::mutation::append(dom, title, text).map_err(|err| throw_dom_error(ctx, err))?;
         }
         drop(parsed);
         drop(world);
-        schedule_mutation_delivery(&ctx)
+        schedule_mutation_delivery(ctx)
     }
 
     // https://html.spec.whatwg.org/multipage/dom.html#dom-document-getelementsbyname
-    #[qjs(rename = "getElementsByName")]
+    #[qjs(skip)]
     fn get_elements_by_name<'js>(&self, ctx: Ctx<'js>, name: WebIdlString) -> Result<Value<'js>> {
         live_collection(
             &ctx,
@@ -2730,7 +2462,7 @@ impl JsNode {
     }
 
     // https://dom.spec.whatwg.org/#dom-element-getelementsbytagnamens
-    #[qjs(rename = "getElementsByTagNameNS")]
+    #[qjs(skip)]
     fn get_elements_by_tag_name_ns<'js>(
         &self,
         ctx: Ctx<'js>,
@@ -2752,124 +2484,31 @@ impl JsNode {
         )
     }
 
-    // ── ChildNode / NonDocumentTypeChildNode ─────────────────────────────
-
-    // https://dom.spec.whatwg.org/#dom-childnode-before
-    #[qjs(rename = "before")]
-    fn before<'js>(&self, ctx: Ctx<'js>, nodes: Rest<Value<'js>>) -> Result<()> {
-        let node = convert_nodes_into_node(&ctx, self.handle.0, nodes)?;
-        let world = world(&ctx)?;
-        let world = world.borrow();
-        let Some(mut parsed) = world.document_mut(self.handle.0) else {
-            return Err(Exception::throw_type(&ctx, "no document"));
-        };
-        let Some(parent) = parsed.document.parent(self.handle.0) else {
-            return Ok(());
-        };
-        let previous = parsed.document.sibling(self.handle.0, false);
-        let reference = match previous {
-            Some(previous) => parsed.document.sibling(previous, true),
-            None => parsed.document.children(parent).and_then(|mut kids| kids.next()),
-        };
-        dom::mutation::pre_insert(&mut parsed.document, parent, node, reference)
-            .map_err(|err| throw_dom_error(&ctx, err))?;
-        drop(parsed);
-        drop(world);
-        schedule_mutation_delivery(&ctx)
-    }
-
-    // https://dom.spec.whatwg.org/#dom-childnode-after
-    #[qjs(rename = "after")]
-    fn after<'js>(&self, ctx: Ctx<'js>, nodes: Rest<Value<'js>>) -> Result<()> {
-        let node = convert_nodes_into_node(&ctx, self.handle.0, nodes)?;
-        let world = world(&ctx)?;
-        let world = world.borrow();
-        let Some(mut parsed) = world.document_mut(self.handle.0) else {
-            return Err(Exception::throw_type(&ctx, "no document"));
-        };
-        let Some(parent) = parsed.document.parent(self.handle.0) else {
-            return Ok(());
-        };
-        let reference = parsed.document.sibling(self.handle.0, true);
-        dom::mutation::pre_insert(&mut parsed.document, parent, node, reference)
-            .map_err(|err| throw_dom_error(&ctx, err))?;
-        drop(parsed);
-        drop(world);
-        schedule_mutation_delivery(&ctx)
-    }
-
-    // https://dom.spec.whatwg.org/#dom-childnode-replacewith
-    #[qjs(rename = "replaceWith")]
-    fn replace_with<'js>(&self, ctx: Ctx<'js>, nodes: Rest<Value<'js>>) -> Result<()> {
-        let node = convert_nodes_into_node(&ctx, self.handle.0, nodes)?;
-        let world = world(&ctx)?;
-        let world = world.borrow();
-        let Some(mut parsed) = world.document_mut(self.handle.0) else {
-            return Err(Exception::throw_type(&ctx, "no document"));
-        };
-        let Some(parent) = parsed.document.parent(self.handle.0) else {
-            return Ok(());
-        };
-        dom::mutation::replace_child(&mut parsed.document, parent, node, self.handle.0)
-            .map_err(|err| throw_dom_error(&ctx, err))?;
-        drop(parsed);
-        drop(world);
-        schedule_mutation_delivery(&ctx)
-    }
-
-    // https://dom.spec.whatwg.org/#dom-nondocumenttypechildnode-previouselementsibling
-    #[qjs(get, rename = "previousElementSibling")]
-    fn previous_element_sibling<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
-        element_sibling_value(&ctx, self.handle.0, false)
-    }
-
-    // https://dom.spec.whatwg.org/#dom-nondocumenttypechildnode-nextelementsibling
-    #[qjs(get, rename = "nextElementSibling")]
-    fn next_element_sibling<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
-        element_sibling_value(&ctx, self.handle.0, true)
-    }
-
     // ── Element identity and attributes ─────────────────────────────────
 
     // https://dom.spec.whatwg.org/#dom-element-tagname
-    #[qjs(get, rename = "tagName")]
-    fn tag_name(&self, ctx: Ctx<'_>) -> Result<String> {
-        let uppercase = document_is_html_content(&ctx, self.handle.0);
-        with_node_kind(&ctx, self.handle.0, |kind| match kind {
+    #[qjs(skip)]
+    fn tag_name(&self, ctx: &Ctx<'_>) -> Result<String> {
+        let uppercase = document_is_html_content(ctx, self.handle.0);
+        with_node_kind(ctx, self.handle.0, |kind| match kind {
             Some(NodeKind::Element { name, .. }) => element_node_name(name, uppercase),
             _ => String::new(),
         })
     }
 
-    // https://dom.spec.whatwg.org/#dom-processinginstruction-target
-    // https://html.spec.whatwg.org/multipage/forms.html#dom-form-target
-    // One shared wrapper carries both: a processing instruction answers with
-    // its target, any other element with its reflected `target` attribute.
-    #[qjs(get)]
-    fn target(&self, ctx: Ctx<'_>) -> Result<String> {
-        let processing_instruction = with_node_kind(&ctx, self.handle.0, |kind| match kind {
-            Some(NodeKind::ProcessingInstruction { target, .. }) => Some(target.clone()),
-            _ => None,
-        })?;
-        match processing_instruction {
-            Some(target) => Ok(target),
-            None => Ok(attribute_value(&ctx, self.handle.0, "target")?),
-        }
-    }
-
     // https://dom.spec.whatwg.org/#dom-element-localname
-    #[qjs(get, rename = "localName")]
-    fn local_name(&self, ctx: Ctx<'_>) -> Result<String> {
-        with_node_kind(&ctx, self.handle.0, |kind| match kind {
+    #[qjs(skip)]
+    fn local_name(&self, ctx: &Ctx<'_>) -> Result<String> {
+        with_node_kind(ctx, self.handle.0, |kind| match kind {
             Some(NodeKind::Element { name, .. }) => name.local.to_string(),
             _ => String::new(),
         })
     }
 
     // https://dom.spec.whatwg.org/#dom-element-prefix
-    #[qjs(get)]
-    fn prefix<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
-        let prefix = with_node_kind(&ctx, self.handle.0, |kind| match kind {
+    #[qjs(skip)]
+    fn prefix<'js>(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
+        let prefix = with_node_kind(ctx, self.handle.0, |kind| match kind {
             Some(NodeKind::Element { name, .. }) => name
                 .prefix
                 .as_ref()
@@ -2878,94 +2517,95 @@ impl JsNode {
             _ => None,
         })?;
         match prefix {
-            Some(prefix) => string_value(&ctx, &prefix),
-            None => Ok(Value::new_null(ctx)),
+            Some(prefix) => string_value(ctx, &prefix),
+            None => Ok(Value::new_null(ctx.clone())),
         }
     }
 
     // https://dom.spec.whatwg.org/#dom-element-namespaceuri
-    #[qjs(get, rename = "namespaceURI")]
-    fn namespace_uri<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
-        let namespace = with_node_kind(&ctx, self.handle.0, |kind| match kind {
+    #[qjs(skip)]
+    fn namespace_uri<'js>(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
+        let namespace = with_node_kind(ctx, self.handle.0, |kind| match kind {
             Some(NodeKind::Element { name, .. }) => {
                 (!name.ns.is_empty()).then(|| name.ns.to_string())
             }
             _ => None,
         })?;
         match namespace {
-            Some(namespace) => string_value(&ctx, &namespace),
-            None => Ok(Value::new_null(ctx)),
+            Some(namespace) => string_value(ctx, &namespace),
+            None => Ok(Value::new_null(ctx.clone())),
         }
     }
 
     // https://dom.spec.whatwg.org/#dom-element-classname
-    #[qjs(get, rename = "className")]
-    fn class_name(&self, ctx: Ctx<'_>) -> Result<String> {
-        attribute_value(&ctx, self.handle.0, "class")
+    #[qjs(skip)]
+    fn class_name(&self, ctx: &Ctx<'_>) -> Result<String> {
+        attribute_value(ctx, self.handle.0, "class")
     }
 
-    #[qjs(set, rename = "className")]
-    fn set_class_name(&self, ctx: Ctx<'_>, value: WebIdlString) -> Result<()> {
-        let world = world(&ctx)?;
+    #[qjs(skip)]
+    fn set_class_name(&self, ctx: &Ctx<'_>, value: WebIdlString) -> Result<()> {
+        let world = world(ctx)?;
         let world = world.borrow();
         let Some(mut parsed) = world.document_mut(self.handle.0) else {
-            return Err(Exception::throw_type(&ctx, "no document"));
+            return Err(Exception::throw_type(ctx, "no document"));
         };
         dom::mutation::set_attribute(&mut parsed.document, self.handle.0, "class", value.0)
-            .map_err(|err| throw_dom_error(&ctx, err))?;
+            .map_err(|err| throw_dom_error(ctx, err))?;
         drop(parsed);
         drop(world);
-        schedule_mutation_delivery(&ctx)
+        schedule_mutation_delivery(ctx)
     }
 
     // https://dom.spec.whatwg.org/#dom-element-classlist
-    #[qjs(get, rename = "classList")]
-    fn class_list<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
-        let world_rc = world(&ctx)?;
+    #[qjs(skip)]
+    fn class_list<'js>(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
+        let world_rc = world(ctx)?;
         if let Some(saved) = world_rc.borrow().wrapper(self.handle.0, Wrapper::TokenList)
-            && let Some(value) = deref_weak(&ctx, saved)?
+            && let Some(value) = deref_weak(ctx, saved)?
         {
             return Ok(value);
         }
-        let class = Class::instance(
-            ctx.clone(),
+        let class = super::host::instance_for_node(
+            ctx,
+            self.handle.0,
             JsTokenList {
                 element: self.handle,
             },
         )?;
         let value = Class::into_value(class);
-        let weak = make_weak(&ctx, value.clone())?;
+        let weak = make_weak(ctx, value.clone())?;
         world_rc.borrow_mut().intern_wrapper(
             self.handle.0,
             Wrapper::TokenList,
-            Persistent::save(&ctx, weak),
+            Persistent::save(ctx, weak),
         );
         Ok(value)
     }
 
     // https://html.spec.whatwg.org/multipage/dom.html#concept-domstringmap-pairs
-    #[qjs(get)]
-    fn dataset<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
-        let world_rc = world_for_node(&ctx, self.handle.0)?;
+    #[qjs(skip)]
+    fn dataset<'js>(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
+        let world_rc = world_for_node(ctx, self.handle.0)?;
         if let Some(saved) = world_rc.borrow().wrapper(self.handle.0, Wrapper::Dataset)
-            && let Some(value) = deref_weak(&ctx, saved)?
+            && let Some(value) = deref_weak(ctx, saved)?
         {
             return Ok(value);
         }
-        let factory: Function = ctx.globals().get("__tbMakeDataset")?;
-        let element = wrap_node(&ctx, self.handle.0)?;
+        let factory: Function = crate::js::bridge::object(ctx)?.get("__tbMakeDataset")?;
+        let element = wrap_node(ctx, self.handle.0)?;
         let value: Value = factory.call((element,))?;
-        let weak = make_weak(&ctx, value.clone())?;
+        let weak = make_weak(ctx, value.clone())?;
         world_rc.borrow_mut().intern_wrapper(
             self.handle.0,
             Wrapper::Dataset,
-            Persistent::save(&ctx, weak),
+            Persistent::save(ctx, weak),
         );
         Ok(value)
     }
 
     // https://dom.spec.whatwg.org/#dom-element-hasattribute
-    #[qjs(rename = "hasAttribute")]
+    #[qjs(skip)]
     fn has_attribute(&self, ctx: Ctx<'_>, name: WebIdlString) -> Result<bool> {
         if !valid_attribute_local_name(&name.0) {
             return Ok(false);
@@ -2981,7 +2621,7 @@ impl JsNode {
     }
 
     // https://dom.spec.whatwg.org/#dom-element-getattributens
-    #[qjs(rename = "getAttributeNS")]
+    #[qjs(skip)]
     fn get_attribute_ns<'js>(
         &self,
         ctx: Ctx<'js>,
@@ -3002,7 +2642,7 @@ impl JsNode {
     }
 
     // https://dom.spec.whatwg.org/#dom-element-hasattributens
-    #[qjs(rename = "hasAttributeNS")]
+    #[qjs(skip)]
     fn has_attribute_ns(
         &self,
         ctx: Ctx<'_>,
@@ -3022,7 +2662,7 @@ impl JsNode {
     }
 
     // https://dom.spec.whatwg.org/#dom-element-setattributens
-    #[qjs(rename = "setAttributeNS")]
+    #[qjs(skip)]
     fn set_attribute_ns(
         &self,
         ctx: Ctx<'_>,
@@ -3066,27 +2706,17 @@ impl JsNode {
     }
 
     // https://dom.spec.whatwg.org/#dom-element-removeattribute
-    #[qjs(rename = "removeAttribute")]
+    #[qjs(skip)]
     fn remove_attribute(&self, ctx: Ctx<'_>, name: WebIdlString) -> Result<()> {
         if !valid_attribute_local_name(&name.0) {
             return Ok(());
         }
         let local = attribute_local_name(&ctx, self.handle.0, &name.0);
-        {
-            let world = world(&ctx)?;
-            let world = world.borrow();
-            let Some(mut parsed) = world.document_mut(self.handle.0) else {
-                return Ok(());
-            };
-            dom::mutation::remove_attribute(&mut parsed.document, self.handle.0, &local)
-                .map_err(|err| throw_dom_error(&ctx, err))?;
-        }
-        detach_attr(&ctx, self.handle.0, "", &local)?;
-        schedule_mutation_delivery(&ctx)
+        remove_attribute_sync(&ctx, self.handle.0, "", &local, false)
     }
 
     // https://dom.spec.whatwg.org/#dom-element-removeattributens
-    #[qjs(rename = "removeAttributeNS")]
+    #[qjs(skip)]
     fn remove_attribute_ns(
         &self,
         ctx: Ctx<'_>,
@@ -3094,26 +2724,11 @@ impl JsNode {
         local: WebIdlString,
     ) -> Result<()> {
         let namespace = namespace.0.unwrap_or_default();
-        {
-            let world = world(&ctx)?;
-            let world = world.borrow();
-            let Some(mut parsed) = world.document_mut(self.handle.0) else {
-                return Ok(());
-            };
-            dom::mutation::remove_attribute_ns(
-                &mut parsed.document,
-                self.handle.0,
-                &namespace,
-                &local.0,
-            )
-            .map_err(|err| throw_dom_error(&ctx, err))?;
-        }
-        detach_attr(&ctx, self.handle.0, &namespace, &local.0)?;
-        schedule_mutation_delivery(&ctx)
+        remove_attribute_sync(&ctx, self.handle.0, &namespace, &local.0, true)
     }
 
     // https://dom.spec.whatwg.org/#dom-element-getattributenames
-    #[qjs(rename = "getAttributeNames")]
+    #[qjs(skip)]
     fn get_attribute_names(&self, ctx: Ctx<'_>) -> Result<Vec<String>> {
         let world = world(&ctx)?;
         Ok(world
@@ -3124,36 +2739,35 @@ impl JsNode {
     }
 
     // https://dom.spec.whatwg.org/#dom-element-attributes
-    #[qjs(get)]
-    fn attributes<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
-        let world_rc = world_for_node(&ctx, self.handle.0)?;
+    #[qjs(skip)]
+    fn attributes<'js>(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
+        let world_rc = world_for_node(ctx, self.handle.0)?;
         if let Some(saved) = world_rc
             .borrow()
             .wrapper(self.handle.0, Wrapper::NamedNodeMap)
-            && let Some(value) = deref_weak(&ctx, saved)?
+            && let Some(value) = deref_weak(ctx, saved)?
         {
-            refresh_named_node_map(&ctx, self.handle.0, &value)?;
             return Ok(value);
         }
-        let class = Class::instance(
-            ctx.clone(),
+        let class = super::host::instance_for_node(
+            ctx,
+            self.handle.0,
             JsNamedNodeMap {
                 element: self.handle,
             },
         )?;
         let value = Class::into_value(class);
-        refresh_named_node_map(&ctx, self.handle.0, &value)?;
-        let weak = make_weak(&ctx, value.clone())?;
+        let weak = make_weak(ctx, value.clone())?;
         world_rc.borrow_mut().intern_wrapper(
             self.handle.0,
             Wrapper::NamedNodeMap,
-            Persistent::save(&ctx, weak),
+            Persistent::save(ctx, weak),
         );
         Ok(value)
     }
 
     // https://dom.spec.whatwg.org/#dom-element-hasattributes
-    #[qjs(rename = "hasAttributes")]
+    #[qjs(skip)]
     fn has_attributes(&self, ctx: Ctx<'_>) -> Result<bool> {
         let world = world(&ctx)?;
         let parsed = world.borrow();
@@ -3167,20 +2781,20 @@ impl JsNode {
     }
 
     // https://dom.spec.whatwg.org/#dom-element-getattributenode
-    #[qjs(rename = "getAttributeNode")]
+    #[qjs(skip)]
     fn get_attribute_node<'js>(&self, ctx: Ctx<'js>, name: WebIdlString) -> Result<Value<'js>> {
         if !valid_attribute_local_name(&name.0) {
             return Ok(Value::new_null(ctx));
         }
         let name = attribute_local_name(&ctx, self.handle.0, &name.0);
         match attached_attr_id(&ctx, self.handle.0, "", &name)? {
-            Some(id) => attr_wrapper(&ctx, self.handle.0, id),
+            Some(id) => attr_wrapper(&ctx, id),
             None => Ok(Value::new_null(ctx)),
         }
     }
 
     // https://dom.spec.whatwg.org/#dom-element-getattributenodens
-    #[qjs(rename = "getAttributeNodeNS")]
+    #[qjs(skip)]
     fn get_attribute_node_ns<'js>(
         &self,
         ctx: Ctx<'js>,
@@ -3189,40 +2803,50 @@ impl JsNode {
     ) -> Result<Value<'js>> {
         let namespace = namespace.0.unwrap_or_default();
         match attached_attr_id(&ctx, self.handle.0, &namespace, &local.0)? {
-            Some(id) => attr_wrapper(&ctx, self.handle.0, id),
+            Some(id) => attr_wrapper(&ctx, id),
             None => Ok(Value::new_null(ctx)),
         }
     }
 
     // https://dom.spec.whatwg.org/#dom-element-setattributenode
-    #[qjs(rename = "setAttributeNode")]
-    fn set_attribute_node<'js>(&self, ctx: Ctx<'js>, attr: Value<'js>) -> Result<Value<'js>> {
-        set_attribute_node(&ctx, self.handle.0, &attr)
+    #[qjs(skip)]
+    fn set_attribute_node<'js>(
+        &self,
+        ctx: Ctx<'js>,
+        attr: AttrArgument<'js>,
+    ) -> Result<Value<'js>> {
+        set_attribute_node(&ctx, self.handle.0, &attr.into_value())
     }
 
     // https://dom.spec.whatwg.org/#dom-element-setattributenodens
-    #[qjs(rename = "setAttributeNodeNS")]
-    fn set_attribute_node_ns<'js>(&self, ctx: Ctx<'js>, attr: Value<'js>) -> Result<Value<'js>> {
-        set_attribute_node(&ctx, self.handle.0, &attr)
+    #[qjs(skip)]
+    fn set_attribute_node_ns<'js>(
+        &self,
+        ctx: Ctx<'js>,
+        attr: AttrArgument<'js>,
+    ) -> Result<Value<'js>> {
+        set_attribute_node(&ctx, self.handle.0, &attr.into_value())
     }
 
     // https://dom.spec.whatwg.org/#dom-element-removeattributenode
-    #[qjs(rename = "removeAttributeNode")]
-    fn remove_attribute_node<'js>(&self, ctx: Ctx<'js>, attr: Value<'js>) -> Result<Value<'js>> {
-        let class = Class::<JsAttr>::from_js(&ctx, attr.clone())
-            .map_err(|_| Exception::throw_type(&ctx, "argument is not an Attr"))?;
+    #[qjs(skip)]
+    fn remove_attribute_node<'js>(
+        &self,
+        ctx: Ctx<'js>,
+        attr: AttrArgument<'js>,
+    ) -> Result<Value<'js>> {
         let (id, scope) = {
-            let attr = class.borrow();
+            let attr = attr.borrow();
             (attr.id, attr.scope.0)
         };
         let state = attr_state(&ctx, scope, id)?;
         let attached_here = attr_owner(&ctx, scope, id) == Some(self.handle.0) && {
-            let world_rc = world_for_node(&ctx, self.handle.0)?;
-            let world = world_rc.borrow();
-            world
-                .attr_ids
-                .get(&(self.handle.0, state.namespace.clone(), state.local.clone()))
-                == Some(&id)
+            let registry = world(&ctx)?.borrow().registry();
+            registry
+                .borrow()
+                .attributes
+                .attached(self.handle.0, &state.namespace, &state.local)
+                == Some(id)
         };
         if !attached_here {
             return Err(throw_dom(
@@ -3232,12 +2856,17 @@ impl JsNode {
             ));
         }
         remove_attribute_sync(&ctx, self.handle.0, &state.namespace, &state.local, true)?;
-        Ok(attr)
+        Ok(attr.into_value())
     }
 
     // https://dom.spec.whatwg.org/#dom-element-toggleattribute
-    #[qjs(rename = "toggleAttribute")]
-    fn toggle_attribute(&self, ctx: Ctx<'_>, name: WebIdlString, force: Opt<bool>) -> Result<bool> {
+    #[qjs(skip)]
+    fn toggle_attribute(
+        &self,
+        ctx: Ctx<'_>,
+        name: WebIdlString,
+        force: Option<bool>,
+    ) -> Result<bool> {
         if !valid_attribute_local_name(&name.0) {
             return Err(throw_dom(
                 &ctx,
@@ -3253,7 +2882,7 @@ impl JsNode {
                 return Err(Exception::throw_type(&ctx, "no document"));
             };
             let exists = parsed.document.has_attribute(self.handle.0, &local);
-            let should_exist = force.0.unwrap_or(!exists);
+            let should_exist = force.unwrap_or(!exists);
             if should_exist && !exists {
                 dom::mutation::set_attribute(
                     &mut parsed.document,
@@ -3262,9 +2891,6 @@ impl JsNode {
                     String::new(),
                 )
                 .map_err(|err| throw_dom_error(&ctx, err))?;
-            } else if !should_exist && exists {
-                dom::mutation::remove_attribute(&mut parsed.document, self.handle.0, &local)
-                    .map_err(|err| throw_dom_error(&ctx, err))?;
             }
             (should_exist, should_exist != exists)
         };
@@ -3272,7 +2898,7 @@ impl JsNode {
             if should_exist {
                 touch_attr(&ctx, self.handle.0, "", &local, "")?;
             } else {
-                detach_attr(&ctx, self.handle.0, "", &local)?;
+                remove_attribute_sync(&ctx, self.handle.0, "", &local, false)?;
             }
             schedule_mutation_delivery(&ctx)?;
         }
@@ -3280,7 +2906,7 @@ impl JsNode {
     }
 
     // https://dom.spec.whatwg.org/#dom-node-normalize
-    #[qjs(rename = "normalize")]
+    #[qjs(skip)]
     fn normalize(&self, ctx: Ctx<'_>) -> Result<()> {
         let world = world(&ctx)?;
         let world = world.borrow();
@@ -3288,15 +2914,6 @@ impl JsNode {
             return Ok(());
         };
         let dom = &mut parsed.document;
-        // A Text node normalizes only itself; containers merge adjacent
-        // Text children and drop empty ones.
-        if let Some(NodeKind::Text { data }) = dom.kind(self.handle.0) {
-            if data.is_empty() {
-                dom::mutation::detach(dom, self.handle.0)
-                    .map_err(|err| throw_dom_error(&ctx, err))?;
-            }
-            return Ok(());
-        }
         let mut containers: Vec<NodeId> = vec![self.handle.0];
         let mut stack = vec![self.handle.0];
         while let Some(id) = stack.pop() {
@@ -3321,15 +2938,16 @@ impl JsNode {
             for kid in kids {
                 match dom.kind(kid) {
                     Some(NodeKind::Text { data }) if data.is_empty() => {
-                        dom::mutation::detach(dom, kid).map_err(|err| throw_dom_error(&ctx, err))?;
+                        dom::mutation::detach(dom, kid)
+                            .map_err(|err| throw_dom_error(&ctx, err))?;
                     }
                     Some(NodeKind::Text { data }) => {
                         if let Some(previous) = merged {
                             let mut joined = match dom.kind(previous) {
                                 Some(NodeKind::Text { data }) => data.clone(),
-                                _ => String::new(),
+                                _ => dom::DomString::default(),
                             };
-                            joined.push_str(data);
+                            joined.push_dom(data);
                             dom::mutation::set_text(dom, previous, joined)
                                 .map_err(|err| throw_dom_error(&ctx, err))?;
                             dom::mutation::detach(dom, kid)
@@ -3348,72 +2966,42 @@ impl JsNode {
     }
 
     // https://dom.spec.whatwg.org/#dom-node-comparedocumentposition
-    #[qjs(rename = "compareDocumentPosition")]
-    fn compare_document_position<'js>(&self, ctx: Ctx<'js>, other: Value<'js>) -> Result<u16> {
-        const DISCONNECTED: u16 = 1;
-        const PRECEDING: u16 = 2;
-        const FOLLOWING: u16 = 4;
-        const CONTAINS: u16 = 8;
-        const CONTAINED_BY: u16 = 16;
-        const IMPLEMENTATION_SPECIFIC: u16 = 32;
-        let Some(other) = host_node_id(&ctx, &other) else {
-            return Err(Exception::throw_type(&ctx, "argument is not a Node"));
-        };
-        let a = self.handle.0;
-        if a == other {
-            return Ok(0);
-        }
-        let world = world(&ctx)?;
-        let parsed = world.borrow();
-        let Some(parsed) = parsed.document(self.handle.0) else {
-            return Ok(DISCONNECTED | IMPLEMENTATION_SPECIFIC);
-        };
-        let dom = &parsed.document;
-        if root_of(dom, a) != root_of(dom, other) {
-            return Ok(DISCONNECTED | IMPLEMENTATION_SPECIFIC);
-        }
-        let ancestors_a = ancestor_chain(dom, a);
-        let ancestors_b = ancestor_chain(dom, other);
-        if ancestors_a.contains(&other) {
-            return Ok(CONTAINED_BY | FOLLOWING);
-        }
-        if ancestors_b.contains(&a) {
-            return Ok(CONTAINS | PRECEDING);
-        }
-        Ok(if tree_order(dom, a, other) == std::cmp::Ordering::Less {
-            PRECEDING
-        } else {
-            FOLLOWING
-        })
+    #[qjs(skip)]
+    fn compare_document_position(&self, ctx: Ctx<'_>, other: NodeReference) -> Result<u16> {
+        compare_node_position(&ctx, NodeReference::Tree(self.handle.0), other)
     }
 
     // https://dom.spec.whatwg.org/#dom-node-parentelement
-    #[qjs(get, rename = "parentElement")]
-    fn parent_element<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
-        let world_rc = world(&ctx)?;
+    #[qjs(skip)]
+    fn parent_element<'js>(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
+        let world_rc = world(ctx)?;
         let parent = {
             let parsed = world_rc.borrow();
             let Some(parsed) = parsed.document(self.handle.0) else {
-                return Ok(Value::new_null(ctx));
+                return Ok(Value::new_null(ctx.clone()));
             };
             parsed
                 .document
                 .parent(self.handle.0)
                 .filter(|&parent| is_element(&parsed.document, parent))
         };
-        child_value(&ctx, parent)
+        child_value(ctx, parent)
     }
 
     // https://dom.spec.whatwg.org/#dom-node-issamenode
-    #[qjs(rename = "isSameNode")]
-    fn is_same_node<'js>(&self, ctx: Ctx<'js>, other: Value<'js>) -> bool {
-        host_node_id(&ctx, &other) == Some(self.handle.0)
+    #[qjs(skip)]
+    #[allow(
+        clippy::unnecessary_wraps,
+        reason = "generated operations share one fallible call shape"
+    )]
+    fn is_same_node(&self, _ctx: Ctx<'_>, other: Option<NodeReference>) -> Result<bool> {
+        Ok(other == Some(NodeReference::Tree(self.handle.0)))
     }
 
     // https://dom.spec.whatwg.org/#dom-node-isequalnode
-    #[qjs(rename = "isEqualNode")]
-    fn is_equal_node<'js>(&self, ctx: Ctx<'js>, other: Value<'js>) -> Result<bool> {
-        let Some(other) = host_node_id(&ctx, &other) else {
+    #[qjs(skip)]
+    fn is_equal_node(&self, ctx: Ctx<'_>, other: Option<NodeReference>) -> Result<bool> {
+        let Some(NodeReference::Tree(other)) = other else {
             return Ok(false);
         };
         let world = world(&ctx)?;
@@ -3425,9 +3013,9 @@ impl JsNode {
     }
 
     // https://dom.spec.whatwg.org/#dom-node-contains
-    #[qjs(rename = "contains")]
-    fn contains<'js>(&self, ctx: Ctx<'js>, other: Value<'js>) -> Result<bool> {
-        let Some(other) = host_node_id(&ctx, &other) else {
+    #[qjs(skip)]
+    fn contains(&self, ctx: Ctx<'_>, other: Option<NodeReference>) -> Result<bool> {
+        let Some(NodeReference::Tree(other)) = other else {
             return Ok(false);
         };
         let world = world(&ctx)?;
@@ -3446,8 +3034,12 @@ impl JsNode {
     }
 
     // https://dom.spec.whatwg.org/#dom-node-getrootnode
-    #[qjs(rename = "getRootNode")]
-    fn get_root_node<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
+    #[qjs(skip)]
+    fn get_root_node<'js>(
+        &self,
+        ctx: Ctx<'js>,
+        options: node_generated::GetRootNodeOptions,
+    ) -> Result<Value<'js>> {
         let world = world(&ctx)?;
         let mut root = self.handle.0;
         {
@@ -3455,17 +3047,26 @@ impl JsNode {
             let Some(parsed) = parsed.document(self.handle.0) else {
                 return Ok(Value::new_null(ctx));
             };
-            while let Some(parent) = parsed.document.parent(root) {
-                root = parent;
+            loop {
+                while let Some(parent) = parsed.document.parent(root) {
+                    root = parent;
+                }
+                if options.composed
+                    && let Some(host) = dom::shadow::shadow_host(&parsed.document, root)
+                {
+                    root = host;
+                } else {
+                    break;
+                }
             }
         }
         wrap_node(&ctx, root)
     }
 
     // https://dom.spec.whatwg.org/#dom-node-isconnected
-    #[qjs(get, rename = "isConnected")]
-    fn is_connected(&self, ctx: Ctx<'_>) -> Result<bool> {
-        let world = world(&ctx)?;
+    #[qjs(skip)]
+    fn is_connected(&self, ctx: &Ctx<'_>) -> Result<bool> {
+        let world = world(ctx)?;
         let parsed = world.borrow();
         let Some(parsed) = parsed.document(self.handle.0) else {
             return Ok(false);
@@ -3477,9 +3078,8 @@ impl JsNode {
     }
 
     // https://dom.spec.whatwg.org/#dom-node-clonenode
-    #[qjs(rename = "cloneNode")]
-    fn clone_node<'js>(&self, ctx: Ctx<'js>, deep: Opt<bool>) -> Result<Value<'js>> {
-        let deep = deep.0.unwrap_or(false);
+    #[qjs(skip)]
+    fn clone_node<'js>(&self, ctx: Ctx<'js>, deep: bool) -> Result<Value<'js>> {
         let world_rc = world(&ctx)?;
         let is_document = {
             let world = world_rc.borrow();
@@ -3512,7 +3112,8 @@ impl JsNode {
                     .children(from)
                     .map(Iterator::collect)
                     .unwrap_or_default();
-                let to_children: Vec<_> = dom.children(to).map(Iterator::collect).unwrap_or_default();
+                let to_children: Vec<_> =
+                    dom.children(to).map(Iterator::collect).unwrap_or_default();
                 for child in from_children.into_iter().rev() {
                     from_stack.push(child);
                 }
@@ -3531,24 +3132,14 @@ impl JsNode {
     }
 
     // https://dom.spec.whatwg.org/#dom-node-insertbefore
-    #[qjs(rename = "insertBefore")]
+    #[qjs(skip)]
     fn insert_before<'js>(
         &self,
         ctx: Ctx<'js>,
-        node: Value<'js>,
-        child: Value<'js>,
+        node: NodeReference,
+        child: Option<NodeReference>,
     ) -> Result<Value<'js>> {
-        let node = required_node(&ctx, &node)?;
-        let reference = optional_node(&ctx, &child)?;
-        {
-            let world = world(&ctx)?;
-            let parsed = world.borrow();
-            let Some(parsed) = parsed.document(self.handle.0) else {
-                return Err(Exception::throw_type(&ctx, "no document"));
-            };
-            dom::mutation::validate_pre_insert(&parsed.document, self.handle.0, node, reference)
-                .map_err(|err| throw_dom_error(&ctx, err))?;
-        }
+        let (node, child) = insertion_tree_nodes(&ctx, self.handle.0, node, child)?;
         let node = adopt_across_documents(&ctx, self.handle.0, node)?;
         let world = world(&ctx)?;
         let world = world.borrow();
@@ -3556,7 +3147,7 @@ impl JsNode {
             return Err(Exception::throw_type(&ctx, "no document"));
         };
         let dom = &mut parsed.document;
-        dom::mutation::pre_insert(dom, self.handle.0, node, reference)
+        dom::mutation::pre_insert(dom, self.handle.0, node, child)
             .map_err(|err| throw_dom_error(&ctx, err))?;
         drop(parsed);
         drop(world);
@@ -3565,9 +3156,11 @@ impl JsNode {
     }
 
     // https://dom.spec.whatwg.org/#dom-node-removechild
-    #[qjs(rename = "removeChild")]
-    fn remove_child<'js>(&self, ctx: Ctx<'js>, child: Value<'js>) -> Result<Value<'js>> {
-        let child = required_node(&ctx, &child)?;
+    #[qjs(skip)]
+    fn remove_child<'js>(&self, ctx: Ctx<'js>, child: NodeReference) -> Result<Value<'js>> {
+        let child = child
+            .tree()
+            .ok_or_else(|| throw_dom(&ctx, "NotFoundError", "attributes have no parent"))?;
         let world = world(&ctx)?;
         let world = world.borrow();
         let Some(mut parsed) = world.document_mut(self.handle.0) else {
@@ -3590,24 +3183,21 @@ impl JsNode {
     }
 
     // https://dom.spec.whatwg.org/#dom-node-replacechild
-    #[qjs(rename = "replaceChild")]
+    #[qjs(skip)]
     fn replace_child<'js>(
         &self,
         ctx: Ctx<'js>,
-        node: Value<'js>,
-        child: Value<'js>,
+        node: NodeReference,
+        child: NodeReference,
     ) -> Result<Value<'js>> {
-        let node = required_node(&ctx, &node)?;
-        let child = required_node(&ctx, &child)?;
-        {
-            let world = world(&ctx)?;
-            let parsed = world.borrow();
-            let Some(parsed) = parsed.document(self.handle.0) else {
-                return Err(Exception::throw_type(&ctx, "no document"));
-            };
-            dom::mutation::validate_pre_insert(&parsed.document, self.handle.0, node, Some(child))
-                .map_err(|err| throw_dom_error(&ctx, err))?;
-        }
+        let (node, _) = insertion_tree_nodes(&ctx, self.handle.0, node, Some(child))?;
+        let Some(child) = child.tree() else {
+            return Err(throw_dom(
+                &ctx,
+                "NotFoundError",
+                "attributes have no parent",
+            ));
+        };
         let node = adopt_across_documents(&ctx, self.handle.0, node)?;
         let world = world(&ctx)?;
         let world = world.borrow();
@@ -3624,9 +3214,16 @@ impl JsNode {
     }
 
     // https://dom.spec.whatwg.org/#dom-node-lookupnamespaceuri
-    #[qjs(rename = "lookupNamespaceURI")]
-    fn lookup_namespace_uri<'js>(&self, ctx: Ctx<'js>, prefix: OptString) -> Result<Value<'js>> {
-        let prefix = prefix.0.filter(|value| !value.is_empty());
+    #[qjs(skip)]
+    fn lookup_namespace_uri<'js>(
+        &self,
+        ctx: Ctx<'js>,
+        prefix: Option<rquickjs::String<'js>>,
+    ) -> Result<Value<'js>> {
+        let prefix = prefix
+            .map(|value| value.to_string())
+            .transpose()?
+            .filter(|value| !value.is_empty());
         let world = world(&ctx)?;
         let parsed = world.borrow();
         let Some(parsed) = parsed.document(self.handle.0) else {
@@ -3639,9 +3236,17 @@ impl JsNode {
     }
 
     // https://dom.spec.whatwg.org/#dom-node-lookupprefix
-    #[qjs(rename = "lookupPrefix")]
-    fn lookup_prefix<'js>(&self, ctx: Ctx<'js>, namespace: OptString) -> Result<Value<'js>> {
-        let Some(namespace) = namespace.0.filter(|value| !value.is_empty()) else {
+    #[qjs(skip)]
+    fn lookup_prefix<'js>(
+        &self,
+        ctx: Ctx<'js>,
+        namespace: Option<rquickjs::String<'js>>,
+    ) -> Result<Value<'js>> {
+        let Some(namespace) = namespace
+            .map(|value| value.to_string())
+            .transpose()?
+            .filter(|value| !value.is_empty())
+        else {
             return Ok(Value::new_null(ctx));
         };
         let world = world(&ctx)?;
@@ -3656,9 +3261,16 @@ impl JsNode {
     }
 
     // https://dom.spec.whatwg.org/#dom-node-isdefaultnamespace
-    #[qjs(rename = "isDefaultNamespace")]
-    fn is_default_namespace(&self, ctx: Ctx<'_>, namespace: OptString) -> Result<bool> {
-        let namespace = namespace.0.filter(|value| !value.is_empty());
+    #[qjs(skip)]
+    fn is_default_namespace<'js>(
+        &self,
+        ctx: Ctx<'js>,
+        namespace: Option<rquickjs::String<'js>>,
+    ) -> Result<bool> {
+        let namespace = namespace
+            .map(|value| value.to_string())
+            .transpose()?
+            .filter(|value| !value.is_empty());
         let world = world(&ctx)?;
         let parsed = world.borrow();
         let Some(parsed) = parsed.document(self.handle.0) else {
@@ -3668,9 +3280,1241 @@ impl JsNode {
         Ok(found.as_deref() == namespace.as_deref())
     }
 
+    }
+
+    // https://dom.spec.whatwg.org/#dom-nonelementparentnode-getelementbyid
+fn element_by_id<'js>(ctx: &Ctx<'js>, root: NodeId, id: &str) -> Result<Value<'js>> {
+    let owner = world_for_node(ctx, root)?;
+    let found = {
+        let owner = owner.borrow();
+        let Some(parsed) = owner.document(root) else {
+            return Ok(Value::new_null(ctx.clone()));
+        };
+        find_element_by_id(&parsed.document, root, id)
+    };
+    match found {
+        Some(node) => wrap_node(ctx, node),
+        None => Ok(Value::new_null(ctx.clone())),
+    }
+}
+
+impl<'js> From<parent_node_generated::DOMStringOrNode<'js>> for NodeOrString<'js> {
+    fn from(item: parent_node_generated::DOMStringOrNode<'js>) -> Self {
+        match item {
+            parent_node_generated::DOMStringOrNode::Node(node) => Self::Node(node),
+            parent_node_generated::DOMStringOrNode::DOMString(string) => Self::String(string),
+        }
+    }
+}
+
+impl<'js> From<child_node_generated::DOMStringOrNode<'js>> for NodeOrString<'js> {
+    fn from(item: child_node_generated::DOMStringOrNode<'js>) -> Self {
+        match item {
+            child_node_generated::DOMStringOrNode::Node(node) => Self::Node(node),
+            child_node_generated::DOMStringOrNode::DOMString(string) => Self::String(string),
+        }
+    }
+}
+
+/// Map generated `(Node or DOMString)` members into the shared insertion
+/// representation. The enums differ per module but hold the same types.
+fn union_nodes<'js, T>(nodes: Vec<T>) -> Vec<NodeOrString<'js>>
+where
+    NodeOrString<'js>: From<T>,
+{
+    nodes.into_iter().map(NodeOrString::from).collect()
+}
+
+impl<'js> node_generated::Node<'js> for JsNode {
+    // https://dom.spec.whatwg.org/#dom-node-nodetype
+    fn get_node_type(&self, ctx: &Ctx<'js>) -> Result<u16> {
+        self.node_type(ctx)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-node-nodename
+    fn get_node_name(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
+        self.node_name(ctx)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-node-baseuri
+    fn get_base_uri(&self, ctx: &Ctx<'js>) -> Result<dom::DomString> {
+        self.base_uri(ctx)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-node-isconnected
+    fn get_is_connected(&self, ctx: &Ctx<'js>) -> Result<bool> {
+        self.is_connected(ctx)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-node-ownerdocument
+    fn get_owner_document(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
+        self.owner_document(ctx)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-node-getrootnode
+    fn get_root_node(
+        &self,
+        ctx: Ctx<'js>,
+        arg_0: node_generated::GetRootNodeOptions,
+    ) -> Result<Value<'js>> {
+        self.get_root_node(ctx, arg_0)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-node-parentnode
+    fn get_parent_node(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
+        self.parent_node(ctx)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-node-parentelement
+    fn get_parent_element(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
+        self.parent_element(ctx)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-node-haschildnodes
+    fn has_child_nodes(&self, ctx: Ctx<'js>) -> Result<bool> {
+        self.has_child_nodes(ctx)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-node-childnodes
+    fn get_child_nodes(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
+        self.child_nodes(ctx)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-node-firstchild
+    fn get_first_child(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
+        self.first_child(ctx)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-node-lastchild
+    fn get_last_child(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
+        self.last_child(ctx)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-node-previoussibling
+    fn get_previous_sibling(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
+        self.previous_sibling(ctx)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-node-nextsibling
+    fn get_next_sibling(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
+        self.next_sibling(ctx)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-node-nodevalue
+    fn get_node_value(&self, ctx: &Ctx<'js>) -> Result<Option<rquickjs::String<'js>>> {
+        self.node_value(ctx)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-node-nodevalue
+    fn set_node_value(
+        &self,
+        ctx: &Ctx<'js>,
+        value: Option<rquickjs::String<'js>>,
+    ) -> Result<()> {
+        self.set_node_value(ctx, value)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-node-textcontent
+    fn get_text_content(&self, ctx: &Ctx<'js>) -> Result<Option<rquickjs::String<'js>>> {
+        self.text_content(ctx)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-node-textcontent
+    fn set_text_content(
+        &self,
+        ctx: &Ctx<'js>,
+        value: Option<rquickjs::String<'js>>,
+    ) -> Result<()> {
+        self.set_text_content(ctx, value)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-node-normalize
+    fn normalize(&self, ctx: Ctx<'js>) -> Result<()> {
+        self.normalize(ctx)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-node-clonenode
+    fn clone_node(&self, ctx: Ctx<'js>, arg_0: bool) -> Result<Value<'js>> {
+        self.clone_node(ctx, arg_0)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-node-isequalnode
+    fn is_equal_node(
+        &self,
+        ctx: Ctx<'js>,
+        arg_0: Option<NodeReference>,
+    ) -> Result<bool> {
+        self.is_equal_node(ctx, arg_0)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-node-issamenode
+    fn is_same_node(&self, ctx: Ctx<'js>, arg_0: Option<NodeReference>) -> Result<bool> {
+        self.is_same_node(ctx, arg_0)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-node-comparedocumentposition
+    fn compare_document_position(
+        &self,
+        ctx: Ctx<'js>,
+        arg_0: NodeReference,
+    ) -> Result<u16> {
+        self.compare_document_position(ctx, arg_0)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-node-contains
+    fn contains(&self, ctx: Ctx<'js>, arg_0: Option<NodeReference>) -> Result<bool> {
+        self.contains(ctx, arg_0)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-node-lookupprefix
+    fn lookup_prefix(
+        &self,
+        ctx: Ctx<'js>,
+        arg_0: Option<rquickjs::String<'js>>,
+    ) -> Result<Option<rquickjs::String<'js>>> {
+        let value = self.lookup_prefix(ctx.clone(), arg_0)?;
+        if value.is_null() || value.is_undefined() {
+            Ok(None)
+        } else {
+            rquickjs::FromJs::from_js(&ctx, value).map(Some)
+        }
+    }
+
+    // https://dom.spec.whatwg.org/#dom-node-lookupnamespaceuri
+    fn lookup_namespace_uri(
+        &self,
+        ctx: Ctx<'js>,
+        arg_0: Option<rquickjs::String<'js>>,
+    ) -> Result<Option<rquickjs::String<'js>>> {
+        let value = self.lookup_namespace_uri(ctx.clone(), arg_0)?;
+        if value.is_null() || value.is_undefined() {
+            Ok(None)
+        } else {
+            rquickjs::FromJs::from_js(&ctx, value).map(Some)
+        }
+    }
+
+    // https://dom.spec.whatwg.org/#dom-node-isdefaultnamespace
+    fn is_default_namespace(
+        &self,
+        ctx: Ctx<'js>,
+        arg_0: Option<rquickjs::String<'js>>,
+    ) -> Result<bool> {
+        self.is_default_namespace(ctx, arg_0)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-node-insertbefore
+    fn insert_before(
+        &self,
+        ctx: Ctx<'js>,
+        arg_0: NodeReference,
+        arg_1: Option<NodeReference>,
+    ) -> Result<Value<'js>> {
+        self.insert_before(ctx, arg_0, arg_1)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-node-appendchild
+    fn append_child(&self, ctx: Ctx<'js>, arg_0: NodeReference) -> Result<Value<'js>> {
+        self.append_child(ctx, arg_0)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-node-replacechild
+    fn replace_child(
+        &self,
+        ctx: Ctx<'js>,
+        arg_0: NodeReference,
+        arg_1: NodeReference,
+    ) -> Result<Value<'js>> {
+        self.replace_child(ctx, arg_0, arg_1)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-node-removechild
+    fn remove_child(&self, ctx: Ctx<'js>, arg_0: NodeReference) -> Result<Value<'js>> {
+        self.remove_child(ctx, arg_0)
+    }
+}
+
+impl<'js> element_generated::Element<'js> for JsNode {
+    // https://dom.spec.whatwg.org/#dom-element-getelementsbytagname
+    fn get_elements_by_tag_name(
+        &self,
+        ctx: Ctx<'js>,
+        arg_0: rquickjs::String<'js>,
+    ) -> Result<Value<'js>> {
+        self.get_elements_by_tag_name(ctx, WebIdlString(arg_0.to_string()?))
+    }
+
+    // https://dom.spec.whatwg.org/#dom-element-getelementsbytagnamens
+    fn get_elements_by_tag_name_ns(
+        &self,
+        ctx: Ctx<'js>,
+        arg_0: Option<rquickjs::String<'js>>,
+        arg_1: rquickjs::String<'js>,
+    ) -> Result<Value<'js>> {
+        self.get_elements_by_tag_name_ns(
+            ctx,
+            OptString(arg_0.map(|name| name.to_string()).transpose()?),
+            WebIdlString(arg_1.to_string()?),
+        )
+    }
+
+    // https://dom.spec.whatwg.org/#dom-element-getelementsbyclassname
+    fn get_elements_by_class_name(
+        &self,
+        ctx: Ctx<'js>,
+        arg_0: rquickjs::String<'js>,
+    ) -> Result<Value<'js>> {
+        self.get_elements_by_class_name(ctx, WebIdlString(arg_0.to_string()?))
+    }
+
+    // https://dom.spec.whatwg.org/#dom-element-matches
+    fn matches(&self, ctx: Ctx<'js>, arg_0: rquickjs::String<'js>) -> Result<bool> {
+        self.matches(ctx, WebIdlString(arg_0.to_string()?))
+    }
+
+    // https://dom.spec.whatwg.org/#dom-element-closest
+    fn closest(
+        &self,
+        ctx: Ctx<'js>,
+        arg_0: rquickjs::String<'js>,
+    ) -> Result<Value<'js>> {
+        self.closest(ctx, WebIdlString(arg_0.to_string()?))
+    }
+
+    // https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-innerhtml
+    fn get_inner_html(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
+        self.inner_html(ctx)
+    }
+
+    // https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-innerhtml
+    fn set_inner_html(&self, ctx: &Ctx<'js>, value: rquickjs::String<'js>) -> Result<()> {
+        self.set_inner_html(ctx, LegacyNullString(value.to_string()?))
+    }
+
+    // https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-outerhtml
+    fn get_outer_html(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
+        self.outer_html(ctx)
+    }
+
+    // https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-outerhtml
+    fn set_outer_html(&self, ctx: &Ctx<'js>, value: rquickjs::String<'js>) -> Result<()> {
+        self.set_outer_html(ctx, LegacyNullString(value.to_string()?))
+    }
+
+    // https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-insertadjacenthtml
+    fn insert_adjacent_html(
+        &self,
+        ctx: Ctx<'js>,
+        arg_0: rquickjs::String<'js>,
+        arg_1: rquickjs::String<'js>,
+    ) -> Result<()> {
+        self.insert_adjacent_html(
+            ctx,
+            WebIdlString(arg_0.to_string()?),
+            WebIdlString(arg_1.to_string()?),
+        )
+    }
+
+    // https://drafts.csswg.org/cssom-view/#dom-element-getboundingclientrect
+    fn get_bounding_client_rect(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
+        self.get_bounding_client_rect(ctx)
+    }
+
+    // https://drafts.csswg.org/cssom-view/#dom-element-getclientrects
+    fn get_client_rects(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
+        self.get_client_rects(ctx)
+    }
+
+    // https://drafts.csswg.org/cssom-view/#dom-element-scrollintoview
+    fn scroll_into_view(
+        &self,
+        ctx: Ctx<'js>,
+        _arg_0: element_generated::BooleanOrScrollIntoViewOptions,
+    ) -> Result<()> {
+        self.scroll_into_view(ctx)
+    }
+
+    // https://drafts.csswg.org/cssom-view/#dom-element-scrollleft
+    fn get_scroll_left(&self, ctx: &Ctx<'js>) -> Result<f64> {
+        self.scroll_left(ctx)
+    }
+
+    // https://drafts.csswg.org/#dom-element-scrollleft
+    fn set_scroll_left(&self, ctx: &Ctx<'js>, value: f64) -> Result<()> {
+        self.set_scroll_left(ctx, value)
+    }
+
+    // https://drafts.csswg.org/cssom-view/#dom-element-scrolltop
+    fn get_scroll_top(&self, ctx: &Ctx<'js>) -> Result<f64> {
+        self.scroll_top(ctx)
+    }
+
+    // https://drafts.csswg.org/#dom-element-scrolltop
+    fn set_scroll_top(&self, ctx: &Ctx<'js>, value: f64) -> Result<()> {
+        self.set_scroll_top(ctx, value)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-element-attachshadow
+    fn attach_shadow(
+        &self,
+        ctx: Ctx<'js>,
+        arg_0: element_generated::ShadowRootInit,
+    ) -> Result<Value<'js>> {
+        self.attach_shadow(ctx, arg_0)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-element-shadowroot
+    fn get_shadow_root(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
+        self.shadow_root(ctx)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-element-tagname
+    fn get_tag_name(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
+        let name = self.tag_name(ctx)?;
+        rquickjs::String::from_str(ctx.clone(), &name)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-element-localname
+    fn get_local_name(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
+        let name = self.local_name(ctx)?;
+        rquickjs::String::from_str(ctx.clone(), &name)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-element-prefix
+    fn get_prefix(&self, ctx: &Ctx<'js>) -> Result<Option<rquickjs::String<'js>>> {
+        let value = self.prefix(ctx)?;
+        if value.is_null() || value.is_undefined() {
+            Ok(None)
+        } else {
+            rquickjs::FromJs::from_js(ctx, value).map(Some)
+        }
+    }
+
+    // https://dom.spec.whatwg.org/#dom-element-namespaceuri
+    fn get_namespace_uri(
+        &self,
+        ctx: &Ctx<'js>,
+    ) -> Result<Option<rquickjs::String<'js>>> {
+        let value = self.namespace_uri(ctx)?;
+        if value.is_null() || value.is_undefined() {
+            Ok(None)
+        } else {
+            rquickjs::FromJs::from_js(ctx, value).map(Some)
+        }
+    }
+
+    // https://dom.spec.whatwg.org/#dom-element-id
+    fn get_id(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
+        let id = self.id(ctx)?;
+        rquickjs::String::from_str(ctx.clone(), &id)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-element-id
+    fn set_id(&self, ctx: &Ctx<'js>, value: rquickjs::String<'js>) -> Result<()> {
+        self.set_id(ctx, WebIdlString(value.to_string()?))
+    }
+
+    // https://dom.spec.whatwg.org/#dom-element-classname
+    fn get_class_name(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
+        let name = self.class_name(ctx)?;
+        rquickjs::String::from_str(ctx.clone(), &name)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-element-classname
+    fn set_class_name(&self, ctx: &Ctx<'js>, value: rquickjs::String<'js>) -> Result<()> {
+        self.set_class_name(ctx, WebIdlString(value.to_string()?))
+    }
+
+    // https://dom.spec.whatwg.org/#dom-element-classlist
+    fn get_class_list(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
+        self.class_list(ctx)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-element-getattribute
+    fn get_attribute(
+        &self,
+        ctx: Ctx<'js>,
+        arg_0: rquickjs::String<'js>,
+    ) -> Result<Option<rquickjs::String<'js>>> {
+        let value = self.get_attribute(ctx.clone(), WebIdlString(arg_0.to_string()?))?;
+        if value.is_null() || value.is_undefined() {
+            Ok(None)
+        } else {
+            rquickjs::FromJs::from_js(&ctx, value).map(Some)
+        }
+    }
+
+    // https://dom.spec.whatwg.org/#dom-element-setattribute
+    fn set_attribute(
+        &self,
+        ctx: Ctx<'js>,
+        arg_0: rquickjs::String<'js>,
+        arg_1: rquickjs::String<'js>,
+    ) -> Result<()> {
+        self.set_attribute(
+            ctx,
+            WebIdlString(arg_0.to_string()?),
+            WebIdlString(arg_1.to_string()?),
+        )
+    }
+
+    // https://dom.spec.whatwg.org/#dom-element-hasattribute
+    fn has_attribute(&self, ctx: Ctx<'js>, arg_0: rquickjs::String<'js>) -> Result<bool> {
+        self.has_attribute(ctx, WebIdlString(arg_0.to_string()?))
+    }
+
+    // https://dom.spec.whatwg.org/#dom-element-removeattribute
+    fn remove_attribute(&self, ctx: Ctx<'js>, arg_0: rquickjs::String<'js>) -> Result<()> {
+        self.remove_attribute(ctx, WebIdlString(arg_0.to_string()?))
+    }
+
+    // https://dom.spec.whatwg.org/#dom-element-toggleattribute
+    fn toggle_attribute(
+        &self,
+        ctx: Ctx<'js>,
+        arg_0: rquickjs::String<'js>,
+        arg_1: Option<bool>,
+    ) -> Result<bool> {
+        self.toggle_attribute(ctx, WebIdlString(arg_0.to_string()?), arg_1)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-element-getattributens
+    fn get_attribute_ns(
+        &self,
+        ctx: Ctx<'js>,
+        arg_0: Option<rquickjs::String<'js>>,
+        arg_1: rquickjs::String<'js>,
+    ) -> Result<Option<rquickjs::String<'js>>> {
+        let value = self.get_attribute_ns(
+            ctx.clone(),
+            OptString(arg_0.map(|name| name.to_string()).transpose()?),
+            WebIdlString(arg_1.to_string()?),
+        )?;
+        if value.is_null() || value.is_undefined() {
+            Ok(None)
+        } else {
+            rquickjs::FromJs::from_js(&ctx, value).map(Some)
+        }
+    }
+
+    // https://dom.spec.whatwg.org/#dom-element-setattributens
+    fn set_attribute_ns(
+        &self,
+        ctx: Ctx<'js>,
+        arg_0: Option<rquickjs::String<'js>>,
+        arg_1: rquickjs::String<'js>,
+        arg_2: rquickjs::String<'js>,
+    ) -> Result<()> {
+        self.set_attribute_ns(
+            ctx,
+            OptString(arg_0.map(|name| name.to_string()).transpose()?),
+            WebIdlString(arg_1.to_string()?),
+            WebIdlString(arg_2.to_string()?),
+        )
+    }
+
+    // https://dom.spec.whatwg.org/#dom-element-hasattributens
+    fn has_attribute_ns(
+        &self,
+        ctx: Ctx<'js>,
+        arg_0: Option<rquickjs::String<'js>>,
+        arg_1: rquickjs::String<'js>,
+    ) -> Result<bool> {
+        self.has_attribute_ns(
+            ctx,
+            OptString(arg_0.map(|name| name.to_string()).transpose()?),
+            WebIdlString(arg_1.to_string()?),
+        )
+    }
+
+    // https://dom.spec.whatwg.org/#dom-element-removeattributens
+    fn remove_attribute_ns(
+        &self,
+        ctx: Ctx<'js>,
+        arg_0: Option<rquickjs::String<'js>>,
+        arg_1: rquickjs::String<'js>,
+    ) -> Result<()> {
+        self.remove_attribute_ns(
+            ctx,
+            OptString(arg_0.map(|name| name.to_string()).transpose()?),
+            WebIdlString(arg_1.to_string()?),
+        )
+    }
+
+    // https://dom.spec.whatwg.org/#dom-element-getattributenames
+    fn get_attribute_names(&self, ctx: Ctx<'js>) -> Result<Vec<String>> {
+        self.get_attribute_names(ctx)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-element-attributes
+    fn get_attributes(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
+        self.attributes(ctx)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-element-hasattributes
+    fn has_attributes(&self, ctx: Ctx<'js>) -> Result<bool> {
+        self.has_attributes(ctx)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-element-getattributenode
+    fn get_attribute_node(
+        &self,
+        ctx: Ctx<'js>,
+        arg_0: rquickjs::String<'js>,
+    ) -> Result<Value<'js>> {
+        self.get_attribute_node(ctx, WebIdlString(arg_0.to_string()?))
+    }
+
+    // https://dom.spec.whatwg.org/#dom-element-getattributenodens
+    fn get_attribute_node_ns(
+        &self,
+        ctx: Ctx<'js>,
+        arg_0: Option<rquickjs::String<'js>>,
+        arg_1: rquickjs::String<'js>,
+    ) -> Result<Value<'js>> {
+        self.get_attribute_node_ns(
+            ctx,
+            OptString(arg_0.map(|name| name.to_string()).transpose()?),
+            WebIdlString(arg_1.to_string()?),
+        )
+    }
+
+    // https://dom.spec.whatwg.org/#dom-element-setattributenode
+    fn set_attribute_node(
+        &self,
+        ctx: Ctx<'js>,
+        arg_0: Value<'js>,
+    ) -> Result<Value<'js>> {
+        let attr = AttrArgument::from_value(&arg_0)?;
+        self.set_attribute_node(ctx, attr)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-element-setattributenodens
+    fn set_attribute_node_ns(
+        &self,
+        ctx: Ctx<'js>,
+        arg_0: Value<'js>,
+    ) -> Result<Value<'js>> {
+        let attr = AttrArgument::from_value(&arg_0)?;
+        self.set_attribute_node_ns(ctx, attr)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-element-removeattributenode
+    fn remove_attribute_node(
+        &self,
+        ctx: Ctx<'js>,
+        arg_0: Value<'js>,
+    ) -> Result<Value<'js>> {
+        let attr = AttrArgument::from_value(&arg_0)?;
+        self.remove_attribute_node(ctx, attr)
+    }
+}
+
+/// `ElementCSSInlineStyle` is a spec mixin included by `HTMLElement`,
+/// `SVGElement`, and `MathMLElement`, so the one contract installs on all
+/// three prototypes from the IDL includes
+/// (<https://drafts.csswg.org/cssom/#the-elementcssinlinestyle-mixin>).
+impl<'js> element_css_inline_style_generated::ElementCSSInlineStyle<'js> for JsNode {
+    // https://drafts.csswg.org/cssom/#dom-elementcssinlinestyle-style
+    fn get_style(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
+        self.style(ctx)
+    }
+}
+
+impl<'js> document_generated::Document<'js> for JsNode {
+    // https://dom.spec.whatwg.org/#dom-document-implementation
+    fn get_implementation(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
+        self.implementation(ctx)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-document-documentelement
+    fn get_document_element(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
+        self.document_element(ctx)
+    }
+
+    // https://html.spec.whatwg.org/multipage/dom.html#dom-document-body
+    fn get_body(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
+        self.body(ctx)
+    }
+
+    // https://html.spec.whatwg.org/multipage/dom.html#dom-document-body
+    fn set_body(&self, ctx: &Ctx<'js>, value: Value<'js>) -> Result<()> {
+        self.set_body(ctx, value)
+    }
+
+    // https://html.spec.whatwg.org/multipage/dom.html#dom-document-head
+    fn get_head(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
+        self.head(ctx)
+    }
+
+    // https://html.spec.whatwg.org/multipage/dom.html#dom-document-currentscript
+    fn get_current_script(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
+        self.current_script(ctx)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-document-doctype
+    fn get_doctype(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
+        self.doctype(ctx)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-document-documenturi
+    fn get_document_uri(&self, ctx: &Ctx<'js>) -> Result<dom::DomString> {
+        self.document_uri(ctx)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-document-url
+    fn get_url(&self, ctx: &Ctx<'js>) -> Result<dom::DomString> {
+        self.url(ctx)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-document-compatmode
+    fn get_compat_mode(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
+        let mode = self.compat_mode(ctx)?;
+        rquickjs::String::from_str(ctx.clone(), &mode)
+    }
+
+    // https://encoding.spec.whatwg.org/#dom-document-characterset
+    fn get_character_set(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
+        let set = self.character_set(ctx)?;
+        rquickjs::String::from_str(ctx.clone(), set)
+    }
+
+    // https://encoding.spec.whatwg.org/#dom-document-charset
+    fn get_charset(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
+        let set = self.charset(ctx)?;
+        rquickjs::String::from_str(ctx.clone(), set)
+    }
+
+    // https://encoding.spec.whatwg.org/#dom-document-inputencoding
+    fn get_input_encoding(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
+        let encoding = self.input_encoding(ctx)?;
+        rquickjs::String::from_str(ctx.clone(), encoding)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-document-contenttype
+    fn get_content_type(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
+        let content_type = self.content_type(ctx)?;
+        rquickjs::String::from_str(ctx.clone(), content_type)
+    }
+
+    // https://html.spec.whatwg.org/multipage/dom.html#dom-document-readystate
+    fn get_ready_state(
+        &self,
+        ctx: &Ctx<'js>,
+    ) -> Result<document_generated::DocumentReadyState> {
+        Ok(match self.ready_state(ctx)?.as_str() {
+            "interactive" => document_generated::DocumentReadyState::Interactive,
+            "complete" => document_generated::DocumentReadyState::Complete,
+            _ => document_generated::DocumentReadyState::Loading,
+        })
+    }
+
+    // https://html.spec.whatwg.org/multipage/nav-history-apis.html#dom-document-defaultview
+    fn get_default_view(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
+        self.default_view(ctx)
+    }
+
+    // https://html.spec.whatwg.org/multipage/nav-history-apis.html#dom-document-location
+    fn get_location(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
+        self.location(ctx)
+    }
+
+    // https://html.spec.whatwg.org/multipage/interaction.html#dom-document-hasfocus
+    fn has_focus(&self, ctx: Ctx<'js>) -> Result<bool> {
+        self.has_focus(ctx)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-document-activeelement
+    fn get_active_element(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
+        self.active_element(ctx)
+    }
+
+    // https://html.spec.whatwg.org/multipage/dom.html#dom-document-title
+    fn get_title(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
+        self.title(ctx)
+    }
+
+    // https://html.spec.whatwg.org/multipage/dom.html#dom-document-title
+    fn set_title(&self, ctx: &Ctx<'js>, value: rquickjs::String<'js>) -> Result<()> {
+        // `document.title` keeps every code unit, including lone surrogates.
+        self.set_title(
+            ctx,
+            WebIdlCodeUnits(dom::DomString::from_utf16(value.to_utf16()?)),
+        )
+    }
+
+    // https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-document-write
+    fn write(&self, ctx: Ctx<'js>, arg_0: Vec<rquickjs::String<'js>>) -> Result<()> {
+        let mut text = Vec::with_capacity(arg_0.len());
+        for part in arg_0 {
+            text.push(WebIdlString(part.to_string()?));
+        }
+        self.write(ctx, text)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-document-getelementsbyclassname
+    fn get_elements_by_class_name(
+        &self,
+        ctx: Ctx<'js>,
+        arg_0: rquickjs::String<'js>,
+    ) -> Result<Value<'js>> {
+        self.get_elements_by_class_name(ctx, WebIdlString(arg_0.to_string()?))
+    }
+
+    // https://dom.spec.whatwg.org/#dom-document-createevent
+    fn create_event(
+        &self,
+        ctx: Ctx<'js>,
+        arg_0: rquickjs::String<'js>,
+    ) -> Result<Value<'js>> {
+        let interface = arg_0.to_string()?;
+        events::create_event(&ctx, &interface)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-document-createelement
+    fn create_element(
+        &self,
+        ctx: Ctx<'js>,
+        arg_0: rquickjs::String<'js>,
+        _options: document_generated::DOMStringOrElementCreationOptions,
+    ) -> Result<Value<'js>> {
+        self.create_element(ctx, WebIdlString(arg_0.to_string()?))
+    }
+
+    // https://dom.spec.whatwg.org/#dom-document-createelementns
+    fn create_element_ns(
+        &self,
+        ctx: Ctx<'js>,
+        arg_0: Option<rquickjs::String<'js>>,
+        arg_1: rquickjs::String<'js>,
+        _options: document_generated::DOMStringOrElementCreationOptions,
+    ) -> Result<Value<'js>> {
+        self.create_element_ns(
+            ctx,
+            OptString(arg_0.map(|name| name.to_string()).transpose()?),
+            WebIdlString(arg_1.to_string()?),
+        )
+    }
+
+    // https://dom.spec.whatwg.org/#dom-document-createtextnode
+    fn create_text_node(
+        &self,
+        ctx: Ctx<'js>,
+        arg_0: rquickjs::String<'js>,
+    ) -> Result<Value<'js>> {
+        self.create_text_node(
+            ctx,
+            WebIdlCodeUnits(dom::DomString::from_utf16(arg_0.to_utf16()?)),
+        )
+    }
+
+    // https://dom.spec.whatwg.org/#dom-document-createcomment
+    fn create_comment(
+        &self,
+        ctx: Ctx<'js>,
+        arg_0: rquickjs::String<'js>,
+    ) -> Result<Value<'js>> {
+        self.create_comment(
+            ctx,
+            WebIdlCodeUnits(dom::DomString::from_utf16(arg_0.to_utf16()?)),
+        )
+    }
+
+    // https://dom.spec.whatwg.org/#dom-document-createprocessinginstruction
+    fn create_processing_instruction(
+        &self,
+        ctx: Ctx<'js>,
+        arg_0: rquickjs::String<'js>,
+        arg_1: rquickjs::String<'js>,
+    ) -> Result<Value<'js>> {
+        self.create_processing_instruction(
+            ctx,
+            WebIdlString(arg_0.to_string()?),
+            WebIdlCodeUnits(dom::DomString::from_utf16(arg_1.to_utf16()?)),
+        )
+    }
+
+    // https://dom.spec.whatwg.org/#dom-document-createcdatasection
+    fn create_cdata_section(
+        &self,
+        ctx: Ctx<'js>,
+        arg_0: rquickjs::String<'js>,
+    ) -> Result<Value<'js>> {
+        self.create_cdata_section(
+            ctx,
+            WebIdlCodeUnits(dom::DomString::from_utf16(arg_0.to_utf16()?)),
+        )
+    }
+
+    // https://dom.spec.whatwg.org/#dom-document-createattribute
+    fn create_attribute(
+        &self,
+        ctx: Ctx<'js>,
+        arg_0: rquickjs::String<'js>,
+    ) -> Result<Value<'js>> {
+        self.create_attribute(ctx, WebIdlString(arg_0.to_string()?))
+    }
+
+    // https://dom.spec.whatwg.org/#dom-document-createattributens
+    fn create_attribute_ns(
+        &self,
+        ctx: Ctx<'js>,
+        arg_0: Option<rquickjs::String<'js>>,
+        arg_1: rquickjs::String<'js>,
+    ) -> Result<Value<'js>> {
+        self.create_attribute_ns(
+            ctx,
+            OptString(arg_0.map(|name| name.to_string()).transpose()?),
+            WebIdlString(arg_1.to_string()?),
+        )
+    }
+
+    // https://dom.spec.whatwg.org/#dom-document-createdocumentfragment
+    fn create_document_fragment(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
+        self.create_document_fragment(ctx)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-document-importnode
+    fn import_node(
+        &self,
+        ctx: Ctx<'js>,
+        arg_0: NodeReference,
+        arg_1: document_generated::BooleanOrImportNodeOptions,
+    ) -> Result<Value<'js>> {
+        // `ImportNodeOptions` inverts the boolean form: selecting only the
+        // node itself is a shallow import.
+        let deep = match arg_1 {
+            document_generated::BooleanOrImportNodeOptions::Boolean(deep) => deep,
+            document_generated::BooleanOrImportNodeOptions::ImportNodeOptions(options) => {
+                !options.self_only
+            }
+        };
+        let node = match arg_0 {
+            NodeReference::Tree(id) => wrap_node(&ctx, id)?,
+            NodeReference::Attribute { id, .. } => attr_wrapper(&ctx, id)?,
+        };
+        self.import_node(ctx, node, deep)
+    }
+
+    // https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-document-open
+    // Both arguments are ignored upstream; the navigation overload stays
+    // absent with the rest of navigation.
+    fn open(
+        &self,
+        ctx: Ctx<'js>,
+        _arg_0: Option<rquickjs::String<'js>>,
+        _arg_1: Option<rquickjs::String<'js>>,
+    ) -> Result<Value<'js>> {
+        self.open_document(ctx)
+    }
+
+    // https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-document-close
+    fn close(&self, ctx: Ctx<'js>) -> Result<()> {
+        self.close_document(ctx)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-nonelementparentnode-getelementbyid
+    fn get_element_by_id(
+        &self,
+        ctx: Ctx<'js>,
+        arg_0: rquickjs::String<'js>,
+    ) -> Result<Value<'js>> {
+        self.get_element_by_id(ctx, WebIdlString(arg_0.to_string()?))
+    }
+
+    // https://dom.spec.whatwg.org/#dom-document-getelementsbytagname
+    fn get_elements_by_tag_name(
+        &self,
+        ctx: Ctx<'js>,
+        arg_0: rquickjs::String<'js>,
+    ) -> Result<Value<'js>> {
+        self.get_elements_by_tag_name(ctx, WebIdlString(arg_0.to_string()?))
+    }
+
+    // https://dom.spec.whatwg.org/#dom-document-getelementsbytagnamens
+    fn get_elements_by_tag_name_ns(
+        &self,
+        ctx: Ctx<'js>,
+        arg_0: Option<rquickjs::String<'js>>,
+        arg_1: rquickjs::String<'js>,
+    ) -> Result<Value<'js>> {
+        self.get_elements_by_tag_name_ns(
+            ctx,
+            OptString(arg_0.map(|name| name.to_string()).transpose()?),
+            WebIdlString(arg_1.to_string()?),
+        )
+    }
+
+    // https://html.spec.whatwg.org/multipage/dom.html#dom-document-getelementsbyname
+    fn get_elements_by_name(
+        &self,
+        ctx: Ctx<'js>,
+        arg_0: rquickjs::String<'js>,
+    ) -> Result<Value<'js>> {
+        self.get_elements_by_name(ctx, WebIdlString(arg_0.to_string()?))
+    }
+
+    // https://drafts.csswg.org/cssom-view/#dom-document-elementfrompoint
+    fn element_from_point(
+        &self,
+        ctx: Ctx<'js>,
+        arg_0: f64,
+        arg_1: f64,
+    ) -> Result<Value<'js>> {
+        self.element_from_point(ctx, arg_0, arg_1)
+    }
+
+    // https://drafts.csswg.org/cssom-view/#dom-document-elementsfrompoint
+    fn elements_from_point(
+        &self,
+        ctx: Ctx<'js>,
+        arg_0: f64,
+        arg_1: f64,
+    ) -> Result<Vec<Value<'js>>> {
+        self.elements_from_point(ctx, arg_0, arg_1)
+    }
+}
+
+impl<'js> parent_node_generated::ParentNode<'js> for JsNode {
+    // https://dom.spec.whatwg.org/#dom-parentnode-children
+    fn get_children(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
+        live_collection(
+            ctx,
+            self.handle.0,
+            CollectionKind::ElementChildren,
+            Some("HTMLCollection"),
+        )
+    }
+
+    // https://dom.spec.whatwg.org/#dom-parentnode-firstelementchild
+    fn get_first_element_child(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
+        let world = world(ctx)?;
+        let found = {
+            let parsed = world.borrow();
+            let Some(parsed) = parsed.document(self.handle.0) else {
+                return Ok(Value::new_null(ctx.clone()));
+            };
+            parsed
+                .document
+                .children(self.handle.0)
+                .and_then(|mut kids| kids.find(|&kid| is_element(&parsed.document, kid)))
+        };
+        child_value(ctx, found)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-parentnode-lastelementchild
+    fn get_last_element_child(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
+        let world = world(ctx)?;
+        let found = {
+            let parsed = world.borrow();
+            let Some(parsed) = parsed.document(self.handle.0) else {
+                return Ok(Value::new_null(ctx.clone()));
+            };
+            parsed
+                .document
+                .children(self.handle.0)
+                .and_then(|kids| kids.rev().find(|&kid| is_element(&parsed.document, kid)))
+        };
+        child_value(ctx, found)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-parentnode-childelementcount
+    fn get_child_element_count(&self, ctx: &Ctx<'js>) -> Result<usize> {
+        let world = world(ctx)?;
+        let parsed = world.borrow();
+        let Some(parsed) = parsed.document(self.handle.0) else {
+            return Ok(0);
+        };
+        Ok(parsed.document.children(self.handle.0).map_or(0, |kids| {
+            kids.filter(|&kid| is_element(&parsed.document, kid))
+                .count()
+        }))
+    }
+
+    // https://dom.spec.whatwg.org/#dom-parentnode-append
+    fn append(
+        &self,
+        ctx: Ctx<'js>,
+        nodes: Vec<parent_node_generated::DOMStringOrNode<'js>>,
+    ) -> Result<()> {
+        let node = convert_union_nodes_into_node(&ctx, self.handle.0, union_nodes(nodes))?;
+        let world = world(&ctx)?;
+        let world = world.borrow();
+        let Some(mut parsed) = world.document_mut(self.handle.0) else {
+            return Err(Exception::throw_type(&ctx, "no document"));
+        };
+        dom::mutation::pre_insert(&mut parsed.document, self.handle.0, node, None)
+            .map_err(|err| throw_dom_error(&ctx, err))?;
+        drop(parsed);
+        drop(world);
+        schedule_mutation_delivery(&ctx)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-parentnode-prepend
+    fn prepend(
+        &self,
+        ctx: Ctx<'js>,
+        nodes: Vec<parent_node_generated::DOMStringOrNode<'js>>,
+    ) -> Result<()> {
+        let node = convert_union_nodes_into_node(&ctx, self.handle.0, union_nodes(nodes))?;
+        let world = world(&ctx)?;
+        let world = world.borrow();
+        let Some(mut parsed) = world.document_mut(self.handle.0) else {
+            return Err(Exception::throw_type(&ctx, "no document"));
+        };
+        let reference = parsed
+            .document
+            .children(self.handle.0)
+            .and_then(|mut kids| kids.next());
+        dom::mutation::pre_insert(&mut parsed.document, self.handle.0, node, reference)
+            .map_err(|err| throw_dom_error(&ctx, err))?;
+        drop(parsed);
+        drop(world);
+        schedule_mutation_delivery(&ctx)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-parentnode-replacechildren
+    fn replace_children(
+        &self,
+        ctx: Ctx<'js>,
+        nodes: Vec<parent_node_generated::DOMStringOrNode<'js>>,
+    ) -> Result<()> {
+        let node = convert_union_nodes_into_node(&ctx, self.handle.0, union_nodes(nodes))?;
+        let world = world(&ctx)?;
+        let world = world.borrow();
+        let Some(mut parsed) = world.document_mut(self.handle.0) else {
+            return Err(Exception::throw_type(&ctx, "no document"));
+        };
+        dom::mutation::replace_all(&mut parsed.document, self.handle.0, node)
+            .map_err(|err| throw_dom_error(&ctx, err))?;
+        drop(parsed);
+        drop(world);
+        schedule_mutation_delivery(&ctx)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-parentnode-queryselector
+    fn query_selector(
+        &self,
+        ctx: Ctx<'js>,
+        selectors: rquickjs::String<'js>,
+    ) -> Result<Value<'js>> {
+        let selectors = selectors.to_string()?;
+        let world = world(&ctx)?;
+        let found = {
+            let parsed = world.borrow();
+            let Some(parsed) = parsed.document(self.handle.0) else {
+                return Ok(Value::new_null(ctx));
+            };
+            dom::selector::select_first(&parsed.document, self.handle.0, &selectors)
+                .map_err(|err| select_error(&ctx, &err))?
+        };
+        child_value(&ctx, found)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-parentnode-queryselectorall
+    fn query_selector_all(
+        &self,
+        ctx: Ctx<'js>,
+        selectors: rquickjs::String<'js>,
+    ) -> Result<Value<'js>> {
+        let selectors = selectors.to_string()?;
+        let world = world(&ctx)?;
+        let ids = {
+            let parsed = world.borrow();
+            // A missing document answers with an empty list, not null
+            // (<https://dom.spec.whatwg.org/#dom-parentnode-queryselectorall>).
+            parsed
+                .document(self.handle.0)
+                .map(|parsed| {
+                    dom::selector::select_all(&parsed.document, self.handle.0, &selectors)
+                        .map_err(|err| select_error(&ctx, &err))
+                })
+                .transpose()?
+                .unwrap_or_default()
+        };
+        let handles = ids.into_iter().map(Handle).collect();
+        live_collection(&ctx, self.handle.0, CollectionKind::Static(handles), None)
+    }
+}
+
+impl<'js> child_node_generated::ChildNode<'js> for JsNode {
+    // https://dom.spec.whatwg.org/#dom-childnode-before
+    fn before(
+        &self,
+        ctx: Ctx<'js>,
+        nodes: Vec<child_node_generated::DOMStringOrNode<'js>>,
+    ) -> Result<()> {
+        let node = convert_union_nodes_into_node(&ctx, self.handle.0, union_nodes(nodes))?;
+        let world = world(&ctx)?;
+        let world = world.borrow();
+        let Some(mut parsed) = world.document_mut(self.handle.0) else {
+            return Err(Exception::throw_type(&ctx, "no document"));
+        };
+        let Some(parent) = parsed.document.parent(self.handle.0) else {
+            return Ok(());
+        };
+        let previous = parsed.document.sibling(self.handle.0, false);
+        let reference = match previous {
+            Some(previous) => parsed.document.sibling(previous, true),
+            None => parsed
+                .document
+                .children(parent)
+                .and_then(|mut kids| kids.next()),
+        };
+        dom::mutation::pre_insert(&mut parsed.document, parent, node, reference)
+            .map_err(|err| throw_dom_error(&ctx, err))?;
+        drop(parsed);
+        drop(world);
+        schedule_mutation_delivery(&ctx)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-childnode-after
+    fn after(
+        &self,
+        ctx: Ctx<'js>,
+        nodes: Vec<child_node_generated::DOMStringOrNode<'js>>,
+    ) -> Result<()> {
+        let node = convert_union_nodes_into_node(&ctx, self.handle.0, union_nodes(nodes))?;
+        let world = world(&ctx)?;
+        let world = world.borrow();
+        let Some(mut parsed) = world.document_mut(self.handle.0) else {
+            return Err(Exception::throw_type(&ctx, "no document"));
+        };
+        let Some(parent) = parsed.document.parent(self.handle.0) else {
+            return Ok(());
+        };
+        let reference = parsed.document.sibling(self.handle.0, true);
+        dom::mutation::pre_insert(&mut parsed.document, parent, node, reference)
+            .map_err(|err| throw_dom_error(&ctx, err))?;
+        drop(parsed);
+        drop(world);
+        schedule_mutation_delivery(&ctx)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-childnode-replacewith
+    fn replace_with(
+        &self,
+        ctx: Ctx<'js>,
+        nodes: Vec<child_node_generated::DOMStringOrNode<'js>>,
+    ) -> Result<()> {
+        let node = convert_union_nodes_into_node(&ctx, self.handle.0, union_nodes(nodes))?;
+        let world = world(&ctx)?;
+        let world = world.borrow();
+        let Some(mut parsed) = world.document_mut(self.handle.0) else {
+            return Err(Exception::throw_type(&ctx, "no document"));
+        };
+        let Some(parent) = parsed.document.parent(self.handle.0) else {
+            return Ok(());
+        };
+        dom::mutation::replace_child(&mut parsed.document, parent, node, self.handle.0)
+            .map_err(|err| throw_dom_error(&ctx, err))?;
+        drop(parsed);
+        drop(world);
+        schedule_mutation_delivery(&ctx)
+    }
+
     // https://dom.spec.whatwg.org/#dom-childnode-remove
-    #[qjs(rename = "remove")]
-    fn remove(&self, ctx: Ctx<'_>) -> Result<()> {
+    fn remove(&self, ctx: Ctx<'js>) -> Result<()> {
         let world = world(&ctx)?;
         let world = world.borrow();
         let Some(mut parsed) = world.document_mut(self.handle.0) else {
@@ -3683,110 +4527,804 @@ impl JsNode {
         fixup_focus_after_removal(&ctx, self.handle.0)?;
         schedule_mutation_delivery(&ctx)
     }
+}
+
+impl<'js> non_document_type_child_node_generated::NonDocumentTypeChildNode<'js> for JsNode {
+    // https://dom.spec.whatwg.org/#dom-nondocumenttypechildnode-previouselementsibling
+    fn get_previous_element_sibling(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
+        element_sibling_value(ctx, self.handle.0, false)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-nondocumenttypechildnode-nextelementsibling
+    fn get_next_element_sibling(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
+        element_sibling_value(ctx, self.handle.0, true)
+    }
+}
+
+impl<'js> document_fragment_generated::DocumentFragment<'js> for JsNode {
+    // https://dom.spec.whatwg.org/#dom-nonelementparentnode-getelementbyid
+    fn get_element_by_id(&self, ctx: Ctx<'js>, id: rquickjs::String<'js>) -> Result<Value<'js>> {
+        element_by_id(&ctx, self.handle.0, &id.to_string()?)
+    }
+}
+
+/// Moves focus to `id` when it is focusable
+/// (<https://html.spec.whatwg.org/multipage/interaction.html#dom-focus>).
+fn focus_element(ctx: &Ctx<'_>, id: NodeId) -> Result<()> {
+    if is_focusable(ctx, id)? {
+        focus_node(ctx, id)?;
+    }
+    Ok(())
+}
+
+impl<'js> html_element_generated::HTMLElement<'js> for JsNode {
+    // https://html.spec.whatwg.org/multipage/dom.html#dom-dataset
+    fn get_dataset(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
+        self.dataset(ctx)
+    }
+
+    // https://html.spec.whatwg.org/multipage/interaction.html#dom-click
+    fn click(&self, ctx: Ctx<'js>) -> Result<()> {
+        element_click(&ctx, self.handle.0)
+    }
+
+    // https://html.spec.whatwg.org/multipage/interaction.html#dom-focus
+    fn focus(&self, ctx: Ctx<'js>, _options: html_element_generated::FocusOptions) -> Result<()> {
+        focus_element(&ctx, self.handle.0)
+    }
+
+    // https://html.spec.whatwg.org/multipage/interaction.html#dom-blur
+    fn blur(&self, ctx: Ctx<'js>) -> Result<()> {
+        blur_node(&ctx, self.handle.0)
+    }
+}
+
+impl<'js> svg_element_generated::SVGElement<'js> for JsNode {
+    // https://html.spec.whatwg.org/multipage/dom.html#dom-dataset
+    fn get_dataset(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
+        self.dataset(ctx)
+    }
+
+    // https://html.spec.whatwg.org/multipage/interaction.html#dom-focus
+    fn focus(&self, ctx: Ctx<'js>, _options: svg_element_generated::FocusOptions) -> Result<()> {
+        focus_element(&ctx, self.handle.0)
+    }
+
+    // https://html.spec.whatwg.org/multipage/interaction.html#dom-blur
+    fn blur(&self, ctx: Ctx<'js>) -> Result<()> {
+        blur_node(&ctx, self.handle.0)
+    }
+}
+
+impl<'js> math_ml_element_generated::MathMLElement<'js> for JsNode {
+    // https://html.spec.whatwg.org/multipage/dom.html#dom-dataset
+    fn get_dataset(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
+        self.dataset(ctx)
+    }
+
+    // https://html.spec.whatwg.org/multipage/interaction.html#dom-focus
+    fn focus(&self, ctx: Ctx<'js>, _options: math_ml_element_generated::FocusOptions) -> Result<()> {
+        focus_element(&ctx, self.handle.0)
+    }
+
+    // https://html.spec.whatwg.org/multipage/interaction.html#dom-blur
+    fn blur(&self, ctx: Ctx<'js>) -> Result<()> {
+        blur_node(&ctx, self.handle.0)
+    }
+}
+
+impl html_opt_group_element_generated::HTMLOptGroupElement<'_> for JsNode {}
+
+impl<'js> html_button_element_generated::HTMLButtonElement<'js> for JsNode {
+    // https://html.spec.whatwg.org/multipage/forms.html#dom-fae-form
+    fn get_form(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
+        self.form(ctx.clone())
+    }
+
+    // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#dom-fs-formaction
+    fn get_form_action(&self, ctx: &Ctx<'js>) -> Result<dom::DomString> {
+        Ok(self.form_action(ctx.clone())?.into())
+    }
+
+    // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#dom-fs-formmethod
+    fn get_form_method(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
+        let method = self.form_method(ctx.clone())?;
+        rquickjs::String::from_str(ctx.clone(), &method)
+    }
+
+    // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#dom-fs-formmethod
+    fn set_form_method(&self, ctx: &Ctx<'js>, value: rquickjs::String<'js>) -> Result<()> {
+        self.set_form_method(ctx.clone(), WebIdlString(value.to_string()?))
+    }
+
+    // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#dom-fs-formenctype
+    fn get_form_enctype(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
+        let enctype = self.form_enctype(ctx.clone())?;
+        rquickjs::String::from_str(ctx.clone(), &enctype)
+    }
+
+    // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#dom-fs-formenctype
+    fn set_form_enctype(&self, ctx: &Ctx<'js>, value: rquickjs::String<'js>) -> Result<()> {
+        self.set_form_enctype(ctx.clone(), WebIdlString(value.to_string()?))
+    }
+}
+
+impl<'js> html_field_set_element_generated::HTMLFieldSetElement<'js> for JsNode {
+    // https://html.spec.whatwg.org/multipage/forms.html#dom-fae-form
+    fn get_form(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
+        self.form(ctx.clone())
+    }
+}
+
+impl<'js> html_select_element_generated::HTMLSelectElement<'js> for JsNode {
+    // https://html.spec.whatwg.org/multipage/form-elements.html#dom-select-value
+    fn get_value(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
+        let value = self.value(ctx.clone())?;
+        rquickjs::String::from_str(ctx.clone(), &value)
+    }
+
+    // https://html.spec.whatwg.org/multipage/form-elements.html#dom-select-value
+    fn set_value(&self, ctx: &Ctx<'js>, value: rquickjs::String<'js>) -> Result<()> {
+        self.set_value(ctx.clone(), LegacyNullString(value.to_string()?))
+    }
+
+    // https://html.spec.whatwg.org/multipage/form-elements.html#dom-select-selectedindex
+    fn get_selected_index(&self, ctx: &Ctx<'js>) -> Result<i32> {
+        self.selected_index(ctx.clone())
+    }
+
+    // https://html.spec.whatwg.org/multipage/form-elements.html#dom-select-selectedindex
+    fn set_selected_index(&self, ctx: &Ctx<'js>, value: i32) -> Result<()> {
+        self.set_selected_index(ctx.clone(), value)
+    }
+
+    // https://html.spec.whatwg.org/multipage/form-elements.html#dom-select-options
+    fn get_options(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
+        self.options(ctx.clone())
+    }
+
+    // https://html.spec.whatwg.org/multipage/form-elements.html#dom-select-selectedoptions
+    fn get_selected_options(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
+        self.selected_options(ctx.clone())
+    }
+
+    // https://html.spec.whatwg.org/multipage/forms.html#dom-fae-form
+    fn get_form(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
+        self.form(ctx.clone())
+    }
+}
+
+impl<'js> html_text_area_element_generated::HTMLTextAreaElement<'js> for JsNode {
+    // https://html.spec.whatwg.org/multipage/form-elements.html#dom-textarea-value
+    fn get_value(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
+        let value = self.value(ctx.clone())?;
+        rquickjs::String::from_str(ctx.clone(), &value)
+    }
+
+    // https://html.spec.whatwg.org/multipage/form-elements.html#dom-textarea-value
+    fn set_value(&self, ctx: &Ctx<'js>, value: rquickjs::String<'js>) -> Result<()> {
+        self.set_value(ctx.clone(), LegacyNullString(value.to_string()?))
+    }
+
+    // https://html.spec.whatwg.org/multipage/form-elements.html#dom-textarea-defaultvalue
+    fn get_default_value(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
+        let value = self.default_value(ctx.clone())?;
+        rquickjs::String::from_str(ctx.clone(), &value)
+    }
+
+    // https://html.spec.whatwg.org/multipage/form-elements.html#dom-textarea-defaultvalue
+    fn set_default_value(&self, ctx: &Ctx<'js>, value: rquickjs::String<'js>) -> Result<()> {
+        self.set_default_value(ctx.clone(), WebIdlString(value.to_string()?))
+    }
+
+    // https://html.spec.whatwg.org/multipage/form-elements.html#dom-textarea-textlength
+    fn get_text_length(&self, ctx: &Ctx<'js>) -> Result<usize> {
+        Ok(self.text_length(ctx.clone())? as usize)
+    }
+
+    // Selection getters are non-nullable upstream. A textarea always has
+    // selectable text when attached; the null case only exists for detached
+    // nodes, which answer with the empty default. Input types where
+    // selection does not apply keep the spec-prose null, which the u32
+    // signature cannot express; that stays open until input migrates.
+    // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#textFieldSelection
+
+    // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#dom-textarea/input-selectionstart
+    fn get_selection_start(&self, ctx: &Ctx<'js>) -> Result<usize> {
+        let world = world(ctx)?;
+        let parsed = world.borrow();
+        Ok(parsed
+            .document(self.handle.0)
+            .and_then(|parsed| dom::form::selection(&parsed.document, self.handle.0))
+            .map_or(0, |(start, _, _)| start as usize))
+    }
+
+    // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#dom-textarea/input-selectionstart
+    fn set_selection_start(&self, ctx: &Ctx<'js>, value: u32) -> Result<()> {
+        self.set_selection_start(ctx.clone(), WebIdlUnsignedLong(value))
+    }
+
+    // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#dom-textarea/input-selectionend
+    fn get_selection_end(&self, ctx: &Ctx<'js>) -> Result<usize> {
+        let world = world(ctx)?;
+        let parsed = world.borrow();
+        Ok(parsed
+            .document(self.handle.0)
+            .and_then(|parsed| dom::form::selection(&parsed.document, self.handle.0))
+            .map_or(0, |(_, end, _)| end as usize))
+    }
+
+    // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#dom-textarea/input-selectionend
+    fn set_selection_end(&self, ctx: &Ctx<'js>, value: u32) -> Result<()> {
+        self.set_selection_end(ctx.clone(), WebIdlUnsignedLong(value))
+    }
+
+    // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#dom-textarea/input-selectiondirection
+    fn get_selection_direction(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
+        let world = world(ctx)?;
+        let direction = world
+            .borrow()
+            .document(self.handle.0)
+            .and_then(|parsed| dom::form::selection(&parsed.document, self.handle.0))
+            .map_or("none", |(_, _, direction)| direction_name(direction));
+        rquickjs::String::from_str(ctx.clone(), direction)
+    }
+
+    // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#dom-textarea/input-selectiondirection
+    fn set_selection_direction(&self, ctx: &Ctx<'js>, value: rquickjs::String<'js>) -> Result<()> {
+        self.set_selection_direction(ctx.clone(), WebIdlString(value.to_string()?))
+    }
+
+    // https://html.spec.whatwg.org/multipage/forms.html#dom-fae-form
+    fn get_form(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
+        self.form(ctx.clone())
+    }
+}
+
+impl<'js> html_input_element_generated::HTMLInputElement<'js> for JsNode {
+    // https://html.spec.whatwg.org/multipage/input.html#dom-input-checked
+    fn get_checked(&self, ctx: &Ctx<'js>) -> Result<bool> {
+        self.checked(ctx.clone())
+    }
+
+    // https://html.spec.whatwg.org/multipage/input.html#dom-input-checked
+    fn set_checked(&self, ctx: &Ctx<'js>, value: bool) -> Result<()> {
+        self.set_checked(ctx.clone(), value)
+    }
+
+    // https://html.spec.whatwg.org/multipage/forms.html#dom-fae-form
+    fn get_form(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
+        self.form(ctx.clone())
+    }
+
+    // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#dom-fs-formaction
+    fn get_form_action(&self, ctx: &Ctx<'js>) -> Result<dom::DomString> {
+        Ok(self.form_action(ctx.clone())?.into())
+    }
+
+    // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#dom-fs-formmethod
+    fn get_form_method(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
+        let method = self.form_method(ctx.clone())?;
+        rquickjs::String::from_str(ctx.clone(), &method)
+    }
+
+    // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#dom-fs-formmethod
+    fn set_form_method(&self, ctx: &Ctx<'js>, value: rquickjs::String<'js>) -> Result<()> {
+        self.set_form_method(ctx.clone(), WebIdlString(value.to_string()?))
+    }
+
+    // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#dom-fs-formenctype
+    fn get_form_enctype(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
+        let enctype = self.form_enctype(ctx.clone())?;
+        rquickjs::String::from_str(ctx.clone(), &enctype)
+    }
+
+    // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#dom-fs-formenctype
+    fn set_form_enctype(&self, ctx: &Ctx<'js>, value: rquickjs::String<'js>) -> Result<()> {
+        self.set_form_enctype(ctx.clone(), WebIdlString(value.to_string()?))
+    }
+
+    // https://html.spec.whatwg.org/multipage/input.html#dom-input-indeterminate
+    fn get_indeterminate(&self, ctx: &Ctx<'js>) -> Result<bool> {
+        self.indeterminate(ctx.clone())
+    }
+
+    // https://html.spec.whatwg.org/multipage/input.html#dom-input-indeterminate
+    fn set_indeterminate(&self, ctx: &Ctx<'js>, value: bool) -> Result<()> {
+        self.set_indeterminate(ctx.clone(), value)
+    }
+
+    // https://html.spec.whatwg.org/multipage/input.html#dom-input-value
+    fn get_value(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
+        let value = self.value(ctx.clone())?;
+        rquickjs::String::from_str(ctx.clone(), &value)
+    }
+
+    // https://html.spec.whatwg.org/multipage/input.html#dom-input-value
+    fn set_value(&self, ctx: &Ctx<'js>, value: rquickjs::String<'js>) -> Result<()> {
+        self.set_value(ctx.clone(), LegacyNullString(value.to_string()?))
+    }
+
+    // Upstream selection accessors are nullable, keeping the spec-prose
+    // null for input types where selection does not apply.
+    // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#textFieldSelection
+
+    // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#dom-textarea/input-selectionstart
+    fn get_selection_start(&self, ctx: &Ctx<'js>) -> Result<Option<u32>> {
+        let world = world(ctx)?;
+        let parsed = world.borrow();
+        Ok(parsed
+            .document(self.handle.0)
+            .and_then(|parsed| dom::form::selection(&parsed.document, self.handle.0))
+            .map(|(start, _, _)| start))
+    }
+
+    // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#dom-textarea/input-selectionstart
+    fn set_selection_start(&self, ctx: &Ctx<'js>, value: Option<u32>) -> Result<()> {
+        // Null converts as zero, matching the previous numeric conversion.
+        self.set_selection_start(ctx.clone(), WebIdlUnsignedLong(value.unwrap_or(0)))
+    }
+
+    // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#dom-textarea/input-selectionend
+    fn get_selection_end(&self, ctx: &Ctx<'js>) -> Result<Option<u32>> {
+        let world = world(ctx)?;
+        let parsed = world.borrow();
+        Ok(parsed
+            .document(self.handle.0)
+            .and_then(|parsed| dom::form::selection(&parsed.document, self.handle.0))
+            .map(|(_, end, _)| end))
+    }
+
+    // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#dom-textarea/input-selectionend
+    fn set_selection_end(&self, ctx: &Ctx<'js>, value: Option<u32>) -> Result<()> {
+        // Null converts as zero, matching the previous numeric conversion.
+        self.set_selection_end(ctx.clone(), WebIdlUnsignedLong(value.unwrap_or(0)))
+    }
+
+    // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#dom-textarea/input-selectiondirection
+    fn get_selection_direction(&self, ctx: &Ctx<'js>) -> Result<Option<rquickjs::String<'js>>> {
+        let world = world(ctx)?;
+        let direction = world
+            .borrow()
+            .document(self.handle.0)
+            .and_then(|parsed| dom::form::selection(&parsed.document, self.handle.0))
+            .map(|(_, _, direction)| direction_name(direction));
+        direction
+            .map(|direction| rquickjs::String::from_str(ctx.clone(), direction))
+            .transpose()
+    }
+
+    // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#dom-textarea/input-selectiondirection
+    fn set_selection_direction(
+        &self,
+        ctx: &Ctx<'js>,
+        value: Option<rquickjs::String<'js>>,
+    ) -> Result<()> {
+        // Null stringified to "null" before, which maps to no direction;
+        // answer "none" directly.
+        let value = match value {
+            Some(value) => value.to_string()?,
+            None => "none".into(),
+        };
+        self.set_selection_direction(ctx.clone(), WebIdlString(value))
+    }
+}
+
+impl<'js> html_form_element_generated::HTMLFormElement<'js> for JsNode {
+    // https://html.spec.whatwg.org/multipage/forms.html#dom-form-action
+    fn get_action(&self, ctx: &Ctx<'js>) -> Result<dom::DomString> {
+        Ok(self.action(ctx.clone())?.into())
+    }
+
+    // https://html.spec.whatwg.org/multipage/forms.html#dom-form-method
+    fn get_method(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
+        let raw = attribute_value(ctx, self.handle.0, "method")?;
+        let method = match raw.trim().to_ascii_lowercase().as_str() {
+            "post" => "post",
+            "dialog" => "dialog",
+            _ => "get",
+        };
+        rquickjs::String::from_str(ctx.clone(), method)
+    }
+
+    // https://html.spec.whatwg.org/multipage/forms.html#dom-form-method
+    fn set_method(&self, ctx: &Ctx<'js>, value: rquickjs::String<'js>) -> Result<()> {
+        self.set_attribute(
+            ctx.clone(),
+            WebIdlString("method".into()),
+            WebIdlString(value.to_string()?),
+        )
+    }
+
+    // https://html.spec.whatwg.org/multipage/forms.html#dom-form-enctype
+    fn get_enctype(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
+        let raw = attribute_value(ctx, self.handle.0, "enctype")?;
+        rquickjs::String::from_str(ctx.clone(), encoding_keyword(&raw))
+    }
+
+    // https://html.spec.whatwg.org/multipage/forms.html#dom-form-enctype
+    fn set_enctype(&self, ctx: &Ctx<'js>, value: rquickjs::String<'js>) -> Result<()> {
+        self.set_attribute(
+            ctx.clone(),
+            WebIdlString("enctype".into()),
+            WebIdlString(value.to_string()?),
+        )
+    }
+
+    // https://html.spec.whatwg.org/multipage/forms.html#dom-form-encoding
+    fn get_encoding(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
+        self.get_enctype(ctx)
+    }
+
+    // https://html.spec.whatwg.org/multipage/forms.html#dom-form-encoding
+    fn set_encoding(&self, ctx: &Ctx<'js>, value: rquickjs::String<'js>) -> Result<()> {
+        self.set_enctype(ctx, value)
+    }
+
+    // https://html.spec.whatwg.org/multipage/forms.html#dom-form-reset
+    fn reset(&self, ctx: Ctx<'js>) -> Result<()> {
+        self.reset_form(ctx)
+    }
+}
+
+impl<'js> html_option_element_generated::HTMLOptionElement<'js> for JsNode {
+    // https://html.spec.whatwg.org/multipage/forms.html#dom-fae-form
+    fn get_form(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
+        self.form(ctx.clone())
+    }
+
+    // https://html.spec.whatwg.org/multipage/form-elements.html#dom-option-label
+    fn get_label(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
+        let label = self.label(ctx.clone())?;
+        rquickjs::String::from_str(ctx.clone(), &label)
+    }
+
+    // https://html.spec.whatwg.org/multipage/form-elements.html#dom-option-selected
+    fn get_selected(&self, ctx: &Ctx<'js>) -> Result<bool> {
+        self.selected(ctx.clone())
+    }
+
+    // https://html.spec.whatwg.org/multipage/form-elements.html#dom-option-selected
+    fn set_selected(&self, ctx: &Ctx<'js>, value: bool) -> Result<()> {
+        self.set_selected(ctx.clone(), value)
+    }
+
+    // https://html.spec.whatwg.org/multipage/form-elements.html#dom-option-value
+    fn get_value(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
+        let value = self.value(ctx.clone())?;
+        rquickjs::String::from_str(ctx.clone(), &value)
+    }
+
+    // https://html.spec.whatwg.org/multipage/form-elements.html#dom-option-text
+    fn get_text(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
+        let text = self.text(ctx.clone())?;
+        rquickjs::String::from_str(ctx.clone(), &text)
+    }
+
+    // https://html.spec.whatwg.org/multipage/form-elements.html#dom-option-text
+    fn set_text(&self, ctx: &Ctx<'js>, value: rquickjs::String<'js>) -> Result<()> {
+        // DOMString keeps every code unit, including lone surrogates.
+        self.set_text(
+            ctx.clone(),
+            WebIdlCodeUnits(dom::DomString::from_utf16(value.to_utf16()?)),
+        )
+    }
+
+    // https://html.spec.whatwg.org/multipage/form-elements.html#dom-option-index
+    fn get_index(&self, ctx: &Ctx<'js>) -> Result<i32> {
+        self.index(ctx.clone())
+    }
+}
+
+impl<'js> shadow_root_generated::ShadowRoot<'js> for JsNode {
+    // https://dom.spec.whatwg.org/#dom-shadowroot-host
+    fn get_host(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
+        self.host(ctx)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-shadowroot-mode
+    fn get_mode(&self, ctx: &Ctx<'js>) -> Result<shadow_root_generated::ShadowRootMode> {
+        Ok(match self.mode(ctx)?.as_str() {
+            "closed" => shadow_root_generated::ShadowRootMode::Closed,
+            _ => shadow_root_generated::ShadowRootMode::Open,
+        })
+    }
+
+    // https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-innerhtml
+    fn get_inner_html(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
+        self.inner_html(ctx)
+    }
+
+    // https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-innerhtml
+    fn set_inner_html(&self, ctx: &Ctx<'js>, value: rquickjs::String<'js>) -> Result<()> {
+        self.set_inner_html(ctx, LegacyNullString(value.to_string()?))
+    }
+
+    // https://dom.spec.whatwg.org/#dom-documentorshadowroot-activeelement
+    fn get_active_element(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
+        self.active_element(ctx)
+    }
+}
+
+impl<'js> htmli_frame_element_generated::HTMLIFrameElement<'js> for JsNode {
+    // https://html.spec.whatwg.org/multipage/iframe-embed-object.html#dom-iframe-contentdocument
+    fn get_content_document(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
+        self.content_document(ctx.clone())
+    }
+
+    // https://html.spec.whatwg.org/multipage/iframe-embed-object.html#dom-iframe-contentwindow
+    fn get_content_window(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
+        self.content_window(ctx.clone())
+    }
+}
+
+impl<'js> html_frame_element_generated::HTMLFrameElement<'js> for JsNode {
+    // https://html.spec.whatwg.org/multipage/obsolete.html#dom-frame-contentdocument
+    fn get_content_document(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
+        self.content_document(ctx.clone())
+    }
+
+    // https://html.spec.whatwg.org/multipage/obsolete.html#dom-frame-contentwindow
+    fn get_content_window(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
+        self.content_window(ctx.clone())
+    }
+}
+
+impl<'js> html_image_element_generated::HTMLImageElement<'js> for JsNode {
+    // https://html.spec.whatwg.org/multipage/embedded-content.html#dom-img-naturalwidth
+    fn get_natural_width(&self, ctx: &Ctx<'js>) -> Result<usize> {
+        Ok(self.natural_width(ctx.clone())? as usize)
+    }
+
+    // https://html.spec.whatwg.org/multipage/embedded-content.html#dom-img-naturalheight
+    fn get_natural_height(&self, ctx: &Ctx<'js>) -> Result<usize> {
+        Ok(self.natural_height(ctx.clone())? as usize)
+    }
+
+    // https://html.spec.whatwg.org/multipage/embedded-content.html#dom-img-complete
+    fn get_complete(&self, ctx: &Ctx<'js>) -> Result<bool> {
+        self.complete(ctx.clone())
+    }
+
+    // https://html.spec.whatwg.org/multipage/embedded-content.html#dom-img-currentsrc
+    fn get_current_src(&self, ctx: &Ctx<'js>) -> Result<dom::DomString> {
+        Ok(self.current_src(ctx.clone())?.into())
+    }
+}
+
+/// `HTMLHyperlinkElementUtils` is a spec mixin included by `HTMLAnchorElement`
+/// and `HTMLAreaElement`, so the one contract installs on both prototypes
+/// from the IDL includes
+/// (<https://html.spec.whatwg.org/multipage/links.html#htmlhyperlinked>).
+impl<'js> html_hyperlink_element_utils_generated::HTMLHyperlinkElementUtils<'js> for JsNode {
+    // https://html.spec.whatwg.org/multipage/links.html#dom-hyperlink-href
+    fn get_href(&self, ctx: &Ctx<'js>) -> Result<dom::DomString> {
+        host::reflect_url_string(ctx, self.handle.0, "href")
+    }
+}
+
+impl<'js> html_base_element_generated::HTMLBaseElement<'js> for JsNode {
+    // Unlike generic URL reflection, an absent `href` falls back to the
+    // document base URL rather than the empty string
+    // (<https://html.spec.whatwg.org/multipage/semantics.html#dom-base-href>).
+    fn get_href(&self, ctx: &Ctx<'js>) -> Result<dom::DomString> {
+        // Probe the node's owner document, not the calling realm's: a node
+        // reached across documents must answer from its own attributes.
+        let present = world_for_node(ctx, self.handle.0)
+            .ok()
+            .and_then(|owner| {
+                owner.borrow().with_document(self.handle.0, |parsed| {
+                    parsed.document.attribute(self.handle.0, "href").is_some()
+                })
+            })
+            .unwrap_or(false);
+        if present {
+            host::reflect_url_string(ctx, self.handle.0, "href")
+        } else {
+            Ok(document_base_url_string(ctx, self.handle.0).into())
+        }
+    }
+}
+
+impl html_link_element_generated::HTMLLinkElement<'_> for JsNode {}
+
+impl<'js> html_media_element_generated::HTMLMediaElement<'js> for JsNode {
+    // No media pipeline: the network state never leaves its initial value
+    // (<https://html.spec.whatwg.org/multipage/media.html#dom-media-networkstate>).
+    fn get_network_state(&self, ctx: &Ctx<'js>) -> Result<u16> {
+        // The sync section of resource selection picks a candidate before any
+        // fetch runs: a `src` attribute, or a `<source>` child that itself
+        // has `src`, moves the state out of NETWORK_EMPTY. With no media
+        // pipeline nothing runs past this point, so a candidate reads as
+        // NETWORK_NO_SOURCE and its absence as NETWORK_EMPTY
+        // (<https://html.spec.whatwg.org/multipage/media.html#concept-media-load-algorithm>).
+        const NETWORK_NO_SOURCE: u16 = 3;
+        const NETWORK_EMPTY: u16 = 0;
+        let selected = world_for_node(ctx, self.handle.0)
+            .ok()
+            .and_then(|owner| {
+                owner.borrow().with_document(self.handle.0, |parsed| {
+                    if parsed.document.attribute(self.handle.0, "src").is_some() {
+                        return true;
+                    }
+                    parsed.document.children(self.handle.0).is_some_and(|kids| {
+                        kids.into_iter().any(|kid| {
+                            is_html_element(parsed.document.kind(kid), "source")
+                                && parsed.document.attribute(kid, "src").is_some()
+                        })
+                    })
+                })
+            })
+            .unwrap_or(false);
+        Ok(if selected {
+            NETWORK_NO_SOURCE
+        } else {
+            NETWORK_EMPTY
+        })
+    }
+
+    // No media pipeline: the ready state never leaves its initial value
+    // (<https://html.spec.whatwg.org/multipage/media.html#dom-media-readystate>).
+    fn get_ready_state(&self, _ctx: &Ctx<'js>) -> Result<u16> {
+        Ok(0)
+    }
+}
+
+impl html_embed_element_generated::HTMLEmbedElement<'_> for JsNode {}
+
+impl html_script_element_generated::HTMLScriptElement<'_> for JsNode {}
+
+impl html_source_element_generated::HTMLSourceElement<'_> for JsNode {}
+
+impl html_track_element_generated::HTMLTrackElement<'_> for JsNode {}
+
+impl html_meta_element_generated::HTMLMetaElement<'_> for JsNode {}
+
+impl html_map_element_generated::HTMLMapElement<'_> for JsNode {}
+
+impl html_object_element_generated::HTMLObjectElement<'_> for JsNode {}
+
+impl html_output_element_generated::HTMLOutputElement<'_> for JsNode {}
+
+impl html_param_element_generated::HTMLParamElement<'_> for JsNode {}
+
+impl html_slot_element_generated::HTMLSlotElement<'_> for JsNode {}
+
+impl<'js> html_template_element_generated::HTMLTemplateElement<'js> for JsNode {
+    // https://html.spec.whatwg.org/multipage/scripting.html#dom-template-contents
+    fn get_content(&self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
+        let world = world(ctx)?;
+        let contents = {
+            let world = world.borrow();
+            world.document(self.handle.0).and_then(|parsed| {
+                is_template_element(parsed.document.kind(self.handle.0))
+                    .then(|| dom::shadow::template_contents(&parsed.document, self.handle.0))
+                    .flatten()
+            })
+        };
+        child_value(ctx, contents)
+    }
+}
+
+impl<'js> processing_instruction_generated::ProcessingInstruction<'js> for JsNode {
+    // https://dom.spec.whatwg.org/#dom-processinginstruction-target
+    fn get_target(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
+        let target = with_node_kind(ctx, self.handle.0, |kind| match kind {
+            Some(NodeKind::ProcessingInstruction { target, .. }) => target.clone(),
+            _ => String::new(),
+        })?;
+        rquickjs::String::from_str(ctx.clone(), &target)
+    }
+}
+
+impl<'js> document_type_generated::DocumentType<'js> for JsNode {
+    // https://dom.spec.whatwg.org/#dom-documenttype-name
+    fn get_name(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
+        let name = with_node_kind(ctx, self.handle.0, |kind| match kind {
+            Some(NodeKind::Doctype { name, .. }) => name.clone(),
+            _ => String::new(),
+        })?;
+        rquickjs::String::from_str(ctx.clone(), &name)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-documenttype-publicid
+    fn get_public_id(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
+        let world = world(ctx)?;
+        let world = world.borrow();
+        let value = world
+            .document(self.handle.0)
+            .and_then(|parsed| doctype_fields(&parsed, self.handle.0))
+            .map_or(String::new(), |(_, public_id, _)| public_id);
+        rquickjs::String::from_str(ctx.clone(), &value)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-documenttype-systemid
+    fn get_system_id(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
+        let world = world(ctx)?;
+        let world = world.borrow();
+        let value = world
+            .document(self.handle.0)
+            .and_then(|parsed| doctype_fields(&parsed, self.handle.0))
+            .map_or(String::new(), |(_, _, system_id)| system_id);
+        rquickjs::String::from_str(ctx.clone(), &value)
+    }
+}
+
+impl<'js> character_data_generated::CharacterData<'js> for JsNode {
+    // https://dom.spec.whatwg.org/#dom-characterdata-data
+    fn get_data(&self, ctx: &Ctx<'js>) -> Result<rquickjs::String<'js>> {
+        dom_string(ctx, &character_data(ctx, self.handle.0)?)
+    }
+
+    // https://dom.spec.whatwg.org/#dom-characterdata-data
+    fn set_data(&self, ctx: &Ctx<'js>, value: rquickjs::String<'js>) -> Result<()> {
+        let data = dom::DomString::from_utf16(value.to_utf16()?);
+        set_character_data(ctx, self.handle.0, data)
+    }
 
     // https://dom.spec.whatwg.org/#dom-characterdata-length
-    // https://html.spec.whatwg.org/multipage/form-elements.html#dom-select-length
-    // One shared wrapper carries both: a character-data node answers with its
-    // data length, a `select` with its option count.
-    #[qjs(get, rename = "length")]
-    fn length(&self, ctx: Ctx<'_>) -> Result<usize> {
-        let character_data_node = with_node_kind(&ctx, self.handle.0, |kind| {
-            matches!(
-                kind,
-                Some(
-                    NodeKind::Text { .. }
-                        | NodeKind::Comment { .. }
-                        | NodeKind::CDataSection { .. }
-                        | NodeKind::ProcessingInstruction { .. }
-                )
-            )
-        })?;
-        if character_data_node {
-            return Ok(character_data(&ctx, self.handle.0)?.encode_utf16().count());
-        }
-        let world = world(&ctx)?;
-        let world = world.borrow();
-        Ok(world.document(self.handle.0).map_or(0, |parsed| {
-            dom::form::select_options(&parsed.document, self.handle.0).len()
-        }))
+    fn get_length(&self, ctx: &Ctx<'js>) -> Result<usize> {
+        Ok(character_data(ctx, self.handle.0)?.len())
     }
 
     // https://dom.spec.whatwg.org/#dom-characterdata-substringdata
-    #[qjs(rename = "substringData")]
     fn substring_data(
         &self,
-        ctx: Ctx<'_>,
-        offset: WebIdlUnsignedLong,
-        count: WebIdlUnsignedLong,
-    ) -> Result<String> {
-        let data = character_data(&ctx, self.handle.0)?;
-        let units: Vec<u16> = data.encode_utf16().collect();
-        let offset = character_data_offset(&ctx, offset.0, units.len())?;
+        ctx: Ctx<'js>,
+        offset: u32,
+        count: u32,
+    ) -> Result<rquickjs::String<'js>> {
+        let units = character_data(&ctx, self.handle.0)?.units().into_owned();
+        let offset = character_data_offset(&ctx, offset, units.len())?;
         let end = offset
-            .saturating_add(usize::try_from(count.0).unwrap_or(usize::MAX))
+            .saturating_add(usize::try_from(count).unwrap_or(usize::MAX))
             .min(units.len());
-        Ok(String::from_utf16_lossy(&units[offset..end]))
+        rquickjs::String::from_utf16(ctx.clone(), &units[offset..end])
     }
 
     // https://dom.spec.whatwg.org/#dom-characterdata-appenddata
-    #[qjs(rename = "appendData")]
-    fn append_data(&self, ctx: Ctx<'_>, data: WebIdlString) -> Result<()> {
+    fn append_data(&self, ctx: Ctx<'js>, data: rquickjs::String<'js>) -> Result<()> {
         let mut current = character_data(&ctx, self.handle.0)?;
-        current.push_str(&data.0);
+        current.push_dom(&dom::DomString::from_utf16(data.to_utf16()?));
         set_character_data(&ctx, self.handle.0, current)
     }
 
     // https://dom.spec.whatwg.org/#dom-characterdata-insertdata
-    #[qjs(rename = "insertData")]
-    fn insert_data(
-        &self,
-        ctx: Ctx<'_>,
-        offset: WebIdlUnsignedLong,
-        data: WebIdlString,
-    ) -> Result<()> {
-        let current = character_data(&ctx, self.handle.0)?;
-        let mut units: Vec<u16> = current.encode_utf16().collect();
-        let offset = character_data_offset(&ctx, offset.0, units.len())?;
-        let insert: Vec<u16> = data.0.encode_utf16().collect();
-        units.splice(offset..offset, insert);
-        set_character_data(&ctx, self.handle.0, String::from_utf16_lossy(&units))
+    fn insert_data(&self, ctx: Ctx<'js>, offset: u32, data: rquickjs::String<'js>) -> Result<()> {
+        let mut units = character_data(&ctx, self.handle.0)?.units().into_owned();
+        let offset = character_data_offset(&ctx, offset, units.len())?;
+        let insert = data.to_utf16()?;
+        units.splice(offset..offset, insert.iter().copied());
+        set_character_data(&ctx, self.handle.0, dom::DomString::from_utf16(units))
     }
 
     // https://dom.spec.whatwg.org/#dom-characterdata-deletedata
-    #[qjs(rename = "deleteData")]
-    fn delete_data(
-        &self,
-        ctx: Ctx<'_>,
-        offset: WebIdlUnsignedLong,
-        count: WebIdlUnsignedLong,
-    ) -> Result<()> {
-        let current = character_data(&ctx, self.handle.0)?;
-        let mut units: Vec<u16> = current.encode_utf16().collect();
-        let offset = character_data_offset(&ctx, offset.0, units.len())?;
+    fn delete_data(&self, ctx: Ctx<'js>, offset: u32, count: u32) -> Result<()> {
+        let mut units = character_data(&ctx, self.handle.0)?.units().into_owned();
+        let offset = character_data_offset(&ctx, offset, units.len())?;
         let end = offset
-            .saturating_add(usize::try_from(count.0).unwrap_or(usize::MAX))
+            .saturating_add(usize::try_from(count).unwrap_or(usize::MAX))
             .min(units.len());
         units.drain(offset..end);
-        set_character_data(&ctx, self.handle.0, String::from_utf16_lossy(&units))
+        set_character_data(&ctx, self.handle.0, dom::DomString::from_utf16(units))
     }
 
     // https://dom.spec.whatwg.org/#dom-characterdata-replacedata
-    #[qjs(rename = "replaceData")]
     fn replace_data(
         &self,
-        ctx: Ctx<'_>,
-        offset: WebIdlUnsignedLong,
-        count: WebIdlUnsignedLong,
-        data: WebIdlString,
+        ctx: Ctx<'js>,
+        offset: u32,
+        count: u32,
+        data: rquickjs::String<'js>,
     ) -> Result<()> {
-        let current = character_data(&ctx, self.handle.0)?;
-        let mut units: Vec<u16> = current.encode_utf16().collect();
-        let offset = character_data_offset(&ctx, offset.0, units.len())?;
+        let mut units = character_data(&ctx, self.handle.0)?.units().into_owned();
+        let offset = character_data_offset(&ctx, offset, units.len())?;
         let end = offset
-            .saturating_add(usize::try_from(count.0).unwrap_or(usize::MAX))
+            .saturating_add(usize::try_from(count).unwrap_or(usize::MAX))
             .min(units.len());
-        units.splice(offset..end, data.0.encode_utf16());
-        set_character_data(&ctx, self.handle.0, String::from_utf16_lossy(&units))
+        let replacement = data.to_utf16()?;
+        units.splice(offset..end, replacement.iter().copied());
+        set_character_data(&ctx, self.handle.0, dom::DomString::from_utf16(units))
     }
 }
 

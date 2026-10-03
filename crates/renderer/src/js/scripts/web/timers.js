@@ -1,24 +1,23 @@
-// Unforgeable host token, captured before install deletes the global. Our
-// shims pass it to the trusted-event bridge; page script cannot name it.
-const __tbHostToken = globalThis.__tbHostToken;
-globalThis.__tb_timeouts = [];
-globalThis.__tb_intervals = Object.create(null);
-globalThis.__tb_fetchCbs = Object.create(null);
-globalThis.__tb_fetchSeq = 0;
-['__scheduleTimeout','__cancelTimeout','__queueFetch','__cookieGet','__cookieSet','__tbCreateObjectURL','__tbRevokeObjectURL','__tbResolveUrl','__tbParseUrl','__tb_timeouts','__tb_intervals','__tb_fetchCbs'].forEach(function(k) {
-  Object.defineProperty(globalThis, k, { writable: false, configurable: false, enumerable: false });
-});
+const __tbEventConstructor = globalThis.Event;
+const __tbEventTargetConstructor = globalThis.EventTarget;
+host.array = __tbPrivateArray;
+host.push = __tbArray.push;
+host.__tb_timeouts = [];
+__tbSetPrototypeOf(host.__tb_timeouts, null);
+host.__tb_intervals = Object.create(null);
+host.__tb_fetchCbs = Object.create(null);
+host.__tb_fetchSeq = 0;
 let __tbTimerNesting = 0;
 globalThis.clearTimeout = function(id) {
-  globalThis.__tb_timeouts[id] = function() {};
-  delete globalThis.__tb_intervals[id];
-  globalThis.__cancelTimeout(Number(id));
+  host.__tb_timeouts[id] = function() {};
+  delete host.__tb_intervals[id];
+  host.__cancelTimeout(Number(id));
 };
 // Both clear methods remove IDs from the same timer map, and an interval
 // reschedules with its original ID after invoking its handler.
 // <https://html.spec.whatwg.org/multipage/timers-and-user-prompts.html#timer-initialisation-steps>
 const __tbTimer = (handler, ms, args, repeat) => {
-  var id = globalThis.__tb_timeouts.length;
+  var id = host.__tb_timeouts.length;
   var delay = Math.max(0, Number(ms) | 0);
   var callback = typeof handler === 'function' ? handler : String(handler);
   var nesting;
@@ -26,21 +25,21 @@ const __tbTimer = (handler, ms, args, repeat) => {
     // Chromium increments before clamping (crbug.com/1108877); HTML clamps first.
     var timeout = __tbTimerNesting > 5 ? Math.max(4, delay) : delay;
     nesting = __tbTimerNesting + 1;
-    globalThis.__scheduleTimeout(id, timeout);
+    host.__scheduleTimeout(id, timeout);
   }
   function tick() {
     var previous = __tbTimerNesting;
     __tbTimerNesting = nesting;
     try {
       if (typeof callback === 'function') {
-        callback.apply(globalThis, args);
+        __tbApply(callback, globalThis, args);
       } else {
         (0, eval)(callback);
       }
     } finally {
       try {
-        if (repeat && globalThis.__tb_intervals[id]) {
-          globalThis.__tb_timeouts[id] = tick;
+        if (repeat && host.__tb_intervals[id]) {
+          host.__tb_timeouts[id] = tick;
           schedule();
         }
       } finally {
@@ -48,14 +47,15 @@ const __tbTimer = (handler, ms, args, repeat) => {
       }
     }
   }
-  if (repeat) globalThis.__tb_intervals[id] = true;
-  globalThis.__tb_timeouts.push(tick);
+  if (repeat) host.__tb_intervals[id] = true;
+  host.__tb_timeouts[id] = tick;
   schedule();
   return id;
 };
 globalThis.setTimeout = function(handler, ms, ...args) {
   return __tbTimer(handler, ms, args, false);
 };
+host.setTimeout = globalThis.setTimeout;
 globalThis.setInterval = function(handler, ms, ...args) {
   return __tbTimer(handler, ms, args, true);
 };
@@ -70,9 +70,9 @@ globalThis.requestAnimationFrame = function(fn) {
   if (typeof fn !== 'function') {
     throw new TypeError('requestAnimationFrame requires a callback');
   }
-  return globalThis.setTimeout(function() {
+  return __tbTimer(function() {
     fn(Date.now());
-  }, 16) + 1;
+  }, 16, [], false) + 1;
 };
 globalThis.cancelAnimationFrame = function(id) {
   globalThis.clearTimeout(Number(id) - 1);
@@ -90,6 +90,6 @@ if (typeof globalThis.console === 'undefined') {
   };
 }
 Object.defineProperty(document, 'cookie', {
-  get() { return globalThis.__cookieGet(); },
-  set(v) { globalThis.__cookieSet(String(v)); }
+  get() { return host.__cookieGet(); },
+  set(v) { host.__cookieSet(String(v)); }
 });

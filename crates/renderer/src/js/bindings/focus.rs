@@ -9,7 +9,7 @@ use std::rc::Rc;
 
 use dom::{NodeId, NodeKind, html_namespace};
 
-use rquickjs::{Class, Ctx, Exception, Function, Object, Result, Value, prelude::This};
+use rquickjs::{Class, Ctx, Exception, Function, Result, Value, prelude::This};
 
 use crate::js::events::EventTargetRef;
 
@@ -518,10 +518,8 @@ fn run_activation(ctx: &Ctx<'_>, node: NodeId) -> Result<()> {
     }
 }
 
-/// The `WebDriver` element bridge. Page script can still call it by name and
-/// forge `isTrusted` events; it is not enumerable, so `Window` enumeration
-/// and idlharness do not see it.
-pub(crate) fn install_webdriver_bridge(ctx: &Ctx<'_>, globals: &Object<'_>) -> Result<()> {
+pub(crate) fn install_webdriver_bridge(ctx: &Ctx<'_>) -> Result<()> {
+    let globals = crate::js::bridge::object(ctx)?;
     globals.set(
         "__tb_webdriver_click",
         rquickjs::prelude::Func::from(webdriver_click),
@@ -537,10 +535,6 @@ pub(crate) fn install_webdriver_bridge(ctx: &Ctx<'_>, globals: &Object<'_>) -> R
     globals.set(
         "__tbSetNativeValue",
         rquickjs::prelude::Func::from(set_native_value),
-    )?;
-    ctx.eval::<(), _>(
-        "['__tb_webdriver_click','__tb_webdriver_element','__tbActivate','__tbSetNativeValue']\
-         .forEach(function(k){Object.defineProperty(globalThis,k,{writable:false,configurable:false,enumerable:false});});",
     )?;
     Ok(())
 }

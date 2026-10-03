@@ -11,7 +11,7 @@
 ///
 /// Copy it freely, store it anywhere, hand it to JavaScript. The only
 /// thing you can do with it is pass it back to the [`crate::Document`] it came from.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct NodeId {
     pub(crate) document: u32,
     pub(crate) slot: u32,

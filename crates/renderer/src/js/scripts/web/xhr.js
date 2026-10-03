@@ -1,5 +1,6 @@
 // https://xhr.spec.whatwg.org/#the-xmlhttprequest-interface
-const __tbXhrData = Symbol('tinybrowser.xhr');
+const __tbXhrData = host.slots('tinybrowser.xhr');
+const __tbXhrBlobConstructor = globalThis.Blob;
 const __tbXhrCancel = data => {
   data.generation++;
   __tbCancelPageRequest(data.request);
@@ -14,8 +15,8 @@ const __tbXhrError = (xhr, data, type) => {
   data.state = 4;
   data.status = 0;
   data.responseURL = '';
-  data.responseHeaders = new Headers();
-  data.responseBytes = new Uint8Array();
+  data.responseHeaders = new __tbHeadersConstructor();
+  data.responseBytes = host.slots.bytes(0);
   xhr.dispatchEvent(new Event('readystatechange'));
   xhr.dispatchEvent(new ProgressEvent(type));
   xhr.dispatchEvent(new ProgressEvent('loadend'));
@@ -26,24 +27,23 @@ const __tbXhrTimeout = (xhr, data) => {
   data.timer = null;
   if (!data.sent || data.timeout === 0) return;
   const generation = data.generation;
-  data.timer = globalThis.__tb_timeouts.length;
-  globalThis.__tb_timeouts.push(() => {
+  data.timer = host.__tb_timeouts.length;
+  host.__tb_timeouts[data.timer] = () => {
     if (data.sent && data.generation === generation) __tbXhrError(xhr, data, 'timeout');
-  });
-  globalThis.__scheduleTimeout(data.timer, Math.max(0, data.started + data.timeout - Date.now()));
+  };
+  host.__scheduleTimeout(data.timer, Math.max(0, data.started + data.timeout - Date.now()));
 };
 globalThis.XMLHttpRequestUpload = class XMLHttpRequestUpload extends EventTarget {};
 globalThis.XMLHttpRequest = class XMLHttpRequest extends EventTarget {
   constructor() {
     super();
-    Object.defineProperty(this, __tbXhrData, {
-      value: {
-        state: 0, sent: false, method: '', url: '', headers: new Headers(),
-        responseHeaders: new Headers(), responseURL: '', status: 0, responseBytes: new Uint8Array(),
+    __tbXhrData.set(this, {
+        __proto__: null,
+        state: 0, sent: false, method: '', url: '', headers: new __tbHeadersConstructor(),
+        responseHeaders: new __tbHeadersConstructor(), responseURL: '', status: 0, responseBytes: host.slots.bytes(0),
         responseType: '', timeout: 0, withCredentials: false, generation: 0,
         request: null, timer: null, started: 0,
         upload: new XMLHttpRequestUpload(),
-      },
     });
   }
   get readyState() { return __tbBrand(this, __tbXhrData).state; }
@@ -75,11 +75,12 @@ globalThis.XMLHttpRequest = class XMLHttpRequest extends EventTarget {
     return data.state < 3 ? '' : __tbDecodeBytes(data.responseBytes, 'utf-8', false, false);
   }
   get response() {
+    // https://xhr.spec.whatwg.org/#dom-xmlhttprequest-response
     const data = __tbBrand(this, __tbXhrData);
     if (data.responseType === '' || data.responseType === 'text') return this.responseText;
     if (data.state !== 4) return null;
-    if (data.responseType === 'arraybuffer') return data.responseBytes.slice().buffer;
-    if (data.responseType === 'blob') return new Blob([data.responseBytes], { type: data.responseHeaders.get('content-type') || '' });
+    if (data.responseType === 'arraybuffer') return __tbBytesCopy(data.responseBytes).buffer;
+    if (data.responseType === 'blob') return new __tbXhrBlobConstructor([__tbBytesCopy(data.responseBytes)], { type: __tbApply(__tbHeadersGet, data.responseHeaders, ['content-type']) || '' });
     if (data.responseType === 'json') {
       try { return JSON.parse(__tbDecodeBytes(data.responseBytes, 'utf-8', false, false)); }
       catch (_) { return null; }
@@ -93,17 +94,17 @@ globalThis.XMLHttpRequest = class XMLHttpRequest extends EventTarget {
     const verb = String(method);
     if (!/^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/.test(verb)) throw new DOMException('Invalid HTTP method', 'SyntaxError');
     if (/^(CONNECT|TRACE|TRACK)$/i.test(verb)) throw new DOMException('Forbidden HTTP method', 'SecurityError');
-    const parsed = globalThis.__tbResolveUrl(String(url), undefined);
+    const parsed = host.__tbResolveUrl(String(url), undefined);
     if (parsed === null) throw new DOMException('Invalid URL', 'SyntaxError');
     if (!async) throw new DOMException('Synchronous requests are not supported', 'InvalidAccessError');
     __tbXhrCancel(data);
     data.method = /^(GET|HEAD|POST|PUT|DELETE|OPTIONS)$/i.test(verb) ? verb.toUpperCase() : verb;
     data.url = parsed;
     data.sent = false;
-    data.headers = new Headers();
-    data.responseHeaders = new Headers();
+    data.headers = new __tbHeadersConstructor();
+    data.responseHeaders = new __tbHeadersConstructor();
     data.responseURL = '';
-    data.responseBytes = new Uint8Array();
+    data.responseBytes = host.slots.bytes(0);
     data.status = 0;
     if (data.state !== 1) {
       data.state = 1;
@@ -114,7 +115,7 @@ globalThis.XMLHttpRequest = class XMLHttpRequest extends EventTarget {
   setRequestHeader(name, value) {
     const data = __tbBrand(this, __tbXhrData);
     if (data.state !== 1 || data.sent) throw new DOMException('Request not open', 'InvalidStateError');
-    data.headers.append(name, value);
+    __tbApply(__tbHeadersAppend, data.headers, [name, value]);
   }
   // https://xhr.spec.whatwg.org/#the-send()-method
   send(body = null) {
@@ -135,12 +136,12 @@ globalThis.XMLHttpRequest = class XMLHttpRequest extends EventTarget {
       }
       data.status = status;
       data.responseURL = url;
-      data.responseHeaders = new Headers(fields);
-      if (type && !data.responseHeaders.has('content-type')) data.responseHeaders.set('content-type', type);
+      data.responseHeaders = new __tbHeadersConstructor(fields);
+      if (type && __tbApply(__tbHeadersGet, data.responseHeaders, ['content-type']) === null) __tbApply(__tbHeadersAppend, data.responseHeaders, ['content-type', type]);
       data.state = 2;
       this.dispatchEvent(new Event('readystatechange'));
       if (data.generation !== generation || data.state !== 2 || !data.sent) return;
-      data.responseBytes = bytes;
+      data.responseBytes = host.slots.bytes(bytes);
       if (bytes.length) {
         data.state = 3;
         this.dispatchEvent(new Event('readystatechange'));
@@ -169,20 +170,20 @@ globalThis.XMLHttpRequest = class XMLHttpRequest extends EventTarget {
       __tbXhrCancel(data);
       data.status = 0;
       data.responseURL = '';
-      data.responseHeaders = new Headers();
-      data.responseBytes = new Uint8Array();
+      data.responseHeaders = new __tbHeadersConstructor();
+      data.responseBytes = host.slots.bytes(0);
     }
     if (data.state === 4) data.state = 0;
   }
   getResponseHeader(name) {
     const data = __tbBrand(this, __tbXhrData);
     if (data.state < 2 || /^set-cookie2?$/i.test(String(name))) return null;
-    return data.responseHeaders.get(name);
+    return __tbApply(__tbHeadersGet, data.responseHeaders, [name]);
   }
   getAllResponseHeaders() {
     const data = __tbBrand(this, __tbXhrData);
     if (data.state < 2) return '';
-    return Array.from(data.responseHeaders).filter(([name]) => !/^set-cookie2?$/i.test(name))
+    return __tbArray.map(__tbBrand(data.responseHeaders, __tbHeadersData), entry => [entry[0], entry[1]]).filter(([name]) => !/^set-cookie2?$/i.test(name))
       .sort(([left], [right]) => left.localeCompare(right))
       .map(([name, value]) => name + ': ' + value + '\r\n').join('');
   }

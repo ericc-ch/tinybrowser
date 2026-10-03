@@ -1,16 +1,16 @@
 (function() {
   const native = globalThis.Node.prototype;
-  const inputFilesSymbol = Symbol.for('tinybrowser.input.files');
+  const inputFilesSymbol = host.slots('tinybrowser.input.files');
   function illegal() { throw new TypeError('Illegal constructor'); }
   function define(name, parent, members, constructible) {
     const ctor = constructible
       ? function() {
-          const value = globalThis.__tb_construct.apply(
+          const value = __tbApply(host.__tb_construct,
             globalThis,
-            [name].concat(Array.prototype.slice.call(arguments))
+            [name, ...arguments]
           );
           if (name === 'HTMLElement' && new.target && new.target.prototype) {
-            Object.setPrototypeOf(value, new.target.prototype);
+            __tbSetPrototypeOf(value, new.target.prototype);
           }
           return value;
         }
@@ -102,17 +102,6 @@
     'scrollLeft', 'scrollTop',
     'attachShadow', 'shadowRoot'
   ]);
-  // classList is `[PutForwards=value]`: assigning to it sets `.value`
-  // (<https://dom.spec.whatwg.org/#dom-element-classlist>).
-  {
-    const descriptor = Object.getOwnPropertyDescriptor(ElementInterface.prototype, 'classList');
-    Object.defineProperty(ElementInterface.prototype, 'classList', {
-      get: descriptor.get,
-      set: function(value) { this.classList.value = value; },
-      enumerable: true,
-      configurable: true,
-    });
-  }
   const XMLDocumentInterface = define('XMLDocument', DocumentInterface, []);
   const CharacterDataInterface = define('CharacterData', NodeInterface, [
     'data', 'length', 'substringData', 'appendData', 'insertData', 'deleteData',
@@ -140,6 +129,7 @@
   const HTMLUnknownElementInterface = define('HTMLUnknownElement', HTMLElementInterface, []);
   const HTMLMediaElementInterface = define('HTMLMediaElement', HTMLElementInterface, []);
   const SVGElementInterface = define('SVGElement', ElementInterface, ['click', 'focus', 'blur']);
+  const MathMLElementInterface = define('MathMLElement', ElementInterface, []);
   const table = {
     Document: DocumentInterface.prototype,
     XMLDocument: XMLDocumentInterface.prototype,
@@ -156,10 +146,16 @@
     HTMLUnknownElement: HTMLUnknownElementInterface.prototype,
     HTMLMediaElement: HTMLMediaElementInterface.prototype,
     SVGElement: SVGElementInterface.prototype,
+    MathMLElement: MathMLElementInterface.prototype,
   };
   // Every element interface chains to HTMLElement except the media pair,
   // which chains through HTMLMediaElement, and SVG, which chains to Element.
   // Per-interface members copied from the native wrapper prototype.
+  // `src`, `href`, `name`, and `content` on Element preserve the legacy
+  // generic reflection (any element answered them pre-migration). Per spec
+  // most elements must not expose them, so this is a known spec gap kept
+  // for main-parity until per-element contracts cover every element that
+  // declares them.
   // `type` is defined per interface below; the form-control states live
   // here so each interface exposes exactly the reflecting attributes the
   // spec gives it (<https://html.spec.whatwg.org/#the-disabled-attribute>).
@@ -264,9 +260,9 @@
     };
     const hrefValue = function() {
       const value = this.getAttribute('href');
-      return value === null ? null : globalThis.__tbUSVString(value);
+      return value === null ? null : host.__tbUSVString(value);
     };
-    const base = function() { return globalThis.__tbUSVString(document.baseURI); };
+    const base = function() { return host.__tbUSVString(document.baseURI); };
     for (const proto of [table.HTMLAnchorElement, table.HTMLAreaElement]) {
       for (const name of Object.keys(parts)) {
         const index = parts[name];
@@ -276,7 +272,7 @@
             // the document URL.
             const href = hrefValue.call(this);
             if (href === null) return name === 'protocol' ? ':' : '';
-            const values = __tbUrlParts(href, base.call(this));
+            const values = host.__tbUrlParts(href, base.call(this));
             if (values === null || values === undefined) {
               return name === 'protocol' ? ':' : '';
             }
@@ -290,8 +286,8 @@
             // Setting a component with no `href` attribute is a no-op.
             const href = hrefValue.call(this);
             if (href === null) return;
-            const result = __tbUrlSetPart(
-              href, base.call(this), index, globalThis.__tbUSVString(value));
+            const result = host.__tbUrlSetPart(
+              href, base.call(this), index, host.__tbUSVString(value));
             if (result !== null && result !== undefined) this.setAttribute('href', result);
           };
         }
@@ -344,12 +340,10 @@
       // `files` applies only to the File Upload state
       // (<https://html.spec.whatwg.org/multipage/input.html#dom-input-files>).
       if (this.type !== 'file') return null;
-      let list = this[inputFilesSymbol];
+      let list = inputFilesSymbol.get(this);
       if (list === undefined) {
-        list = globalThis.__tbCreateFileList([]);
-        Object.defineProperty(this, inputFilesSymbol, {
-          value: list, writable: false, enumerable: false, configurable: false,
-        });
+        list = host.__tbCreateFileList([]);
+        inputFilesSymbol.set(this, list);
       }
       return list;
     },
@@ -362,10 +356,8 @@
       // `input.files = fileList` replaces the list a script set; the same list
       // can be shared across inputs
       // (<https://html.spec.whatwg.org/multipage/input.html#dom-input-files>).
-      Object.defineProperty(this, inputFilesSymbol, {
-        value: value, writable: true, enumerable: false, configurable: true,
-      });
-      globalThis.__tbSetInputFiles(this, value);
+      inputFilesSymbol.set(this, value);
+      host.__tbSetInputFiles(this, value);
     },
     enumerable: true,
     configurable: true,
@@ -395,7 +387,7 @@
       writable: true, configurable: true, enumerable: true,
     },
   });
-  Object.defineProperty(globalThis, '__tb_brandTable', {
+  Object.defineProperty(host, '__tb_brandTable', {
     enumerable: false,
     configurable: true,
     value: table,

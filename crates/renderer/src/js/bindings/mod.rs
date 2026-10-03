@@ -6,16 +6,6 @@
 //! type). Its members stay in `node`.
 use rquickjs::function::Constructor;
 
-macro_rules! branded_node {
-    ($name:ident, $js:literal) => {
-        #[derive(Trace, rquickjs::JsLifetime)]
-        #[rquickjs::class(rename = $js)]
-        pub(crate) struct $name {
-            pub(crate) handle: Handle,
-        }
-    };
-}
-
 mod attributes;
 mod clone;
 mod collections;
@@ -23,6 +13,7 @@ mod document;
 mod exceptions;
 mod focus;
 mod forms;
+pub(crate) mod host;
 mod messaging;
 mod mutation;
 mod node;
@@ -55,13 +46,13 @@ use dom::{
 };
 
 use rquickjs::{
-    Class, Ctx, Exception, FromJs, Function, Object, Persistent, Result, Symbol, Value,
-    class::Trace, prelude::This,
+    Class, Ctx, Exception, FromJs, Function, Object, Persistent, Result, Value, class::Trace,
+    prelude::This,
 };
 
 use super::events::{self, JsEvent, JsEventTarget};
 
-use super::world::{Handle, World};
+use super::world::{Handle, RealmRegistry, WeakReferences, World};
 
 thread_local! {
     /// JS world per live realm, keyed by its QuickJS context pointer.
@@ -72,10 +63,20 @@ thread_local! {
     /// so the map is thread-local and keyed by pointer identity.
     static REALM_WORLDS: RefCell<HashMap<usize, Weak<RefCell<World>>>> =
         RefCell::new(HashMap::new());
+    static REALM_REGISTRIES: RefCell<HashMap<usize, Weak<RefCell<RealmRegistry>>>> =
+        RefCell::new(HashMap::new());
 }
 
 /// Remembers `world` as the JS world of the realm behind `ctx`.
 fn register_world(ctx: &Ctx<'_>, world: &Rc<RefCell<World>>) {
+    let registry = world.borrow().registry();
+    let context = ctx.as_raw().as_ptr() as usize;
+    REALM_REGISTRIES.with(|registries| {
+        registries
+            .borrow_mut()
+            .insert(context, Rc::downgrade(&registry));
+    });
+    registry.borrow_mut().realm_contexts.push(context);
     REALM_WORLDS.with(|worlds| {
         worlds
             .borrow_mut()
@@ -92,6 +93,28 @@ pub(crate) fn forget_world(context: &rquickjs::Context) {
     });
 }
 
+pub(crate) fn forget_registry_contexts(contexts: &[usize]) {
+    REALM_REGISTRIES.with(|registries| {
+        let mut registries = registries.borrow_mut();
+        for context in contexts {
+            registries.remove(context);
+        }
+    });
+}
+
+/// The agent associated with a context, including a retired iframe context
+/// kept alive by an adopted platform object's prototype.
+pub(crate) fn realm_registry(ctx: &Ctx<'_>) -> Result<Rc<RefCell<RealmRegistry>>> {
+    REALM_REGISTRIES
+        .with(|registries| {
+            registries
+                .borrow()
+                .get(&(ctx.as_raw().as_ptr() as usize))
+                .and_then(Weak::upgrade)
+        })
+        .ok_or_else(|| Exception::throw_internal(ctx, "missing JS agent"))
+}
+
 /// The document of the current realm's global object.
 pub(crate) fn main_document(ctx: &Ctx<'_>) -> Result<NodeId> {
     world(ctx)?
@@ -103,13 +126,12 @@ pub(crate) fn main_document(ctx: &Ctx<'_>) -> Result<NodeId> {
 /// Builds and throws a `DOMException` from Rust with a real prototype, so
 /// `instanceof DOMException` and `constructor` checks pass.
 pub(crate) fn throw_dom(ctx: &Ctx<'_>, name: &str, message: &str) -> rquickjs::Error {
-    match Class::instance(
-        ctx.clone(),
-        JsDomException {
-            name: name.into(),
-            message: message.into(),
-        },
-    ) {
+    let exception = (|| {
+        let name = rquickjs::String::from_str(ctx.clone(), name)?;
+        let message = rquickjs::String::from_str(ctx.clone(), message)?;
+        host::instance(ctx, JsDomException { name, message })
+    })();
+    match exception {
         Ok(exception) => ctx.throw(Class::into_value(exception)),
         Err(err) => err,
     }
@@ -142,7 +164,9 @@ pub(super) fn report_exception_value<'js>(
     base_line: u32,
     filename: &str,
 ) {
-    let Ok(report) = ctx.globals().get::<_, Value>("__tbReportException") else {
+    let Ok(report) =
+        crate::js::bridge::object(ctx).and_then(|host| host.get::<_, Value>("__tbReportException"))
+    else {
         return;
     };
     let Some(report) = report.as_function() else {
@@ -308,7 +332,9 @@ pub(super) fn drain_rejections(ctx: &Ctx<'_>, current: &Rc<RefCell<World>>) {
 /// Dispatches one `PromiseRejectionEvent` at the realm window through the
 /// `__tbPromiseRejection` shim.
 fn fire_rejection<'js>(ctx: &Ctx<'js>, handled: bool, promise: Value<'js>, reason: Value<'js>) {
-    let Ok(report) = ctx.globals().get::<_, Value>("__tbPromiseRejection") else {
+    let Ok(report) = crate::js::bridge::object(ctx)
+        .and_then(|host| host.get::<_, Value>("__tbPromiseRejection"))
+    else {
         return;
     };
     let Some(report) = report.as_function() else {
@@ -344,12 +370,11 @@ impl<'js> rquickjs::FromJs<'js> for LegacyNullString {
     }
 }
 
-impl<'js> rquickjs::FromJs<'js> for OptionalTitle {
+impl<'js> rquickjs::FromJs<'js> for WebIdlCodeUnits {
     fn from_js(ctx: &Ctx<'js>, value: Value<'js>) -> Result<Self> {
-        if value.is_undefined() {
-            return Ok(Self(None));
-        }
-        Ok(Self(Some(webidl_to_string(ctx, value)?)))
+        Ok(Self(dom::DomString::from_utf16(webidl_to_units(
+            ctx, value,
+        )?)))
     }
 }
 
@@ -378,76 +403,80 @@ pub(super) fn handler_target<'js>(ctx: &Ctx<'js>, node: &Value<'js>) -> Result<N
 
 pub(crate) fn install(ctx: &Ctx<'_>, world: &Rc<RefCell<World>>) -> Result<()> {
     register_world(ctx, world);
+    crate::js::bridge::install(ctx, world)?;
     let globals = ctx.globals();
     world
         .borrow_mut()
         .set_window(Persistent::save(ctx, globals.clone()));
     Class::<JsEvent>::define(&globals)?;
-    ctx.eval::<(), _>(events::install_event_ctor_js(ctx)?)?;
-    install_webdriver_bridge(ctx, &globals)?;
+    crate::js::bridge::evaluate(ctx, events::install_event_ctor_js(ctx)?)?;
+    install_webdriver_bridge(ctx)?;
     globals.set("innerWidth", f64::from(crate::engine::VIEWPORT_WIDTH))?;
     globals.set("innerHeight", f64::from(crate::engine::VIEWPORT_HEIGHT))?;
     // No browser chrome exists, so the outer window equals the inner viewport
     // (<https://drafts.csswg.org/cssom-view/#dom-window-outerwidth>).
     globals.set("outerWidth", f64::from(crate::engine::VIEWPORT_WIDTH))?;
     globals.set("outerHeight", f64::from(crate::engine::VIEWPORT_HEIGHT))?;
-    globals.set(
+    crate::js::bridge::object(ctx)?.set(
         "__tb_new_custom_event",
         rquickjs::prelude::Func::from(events::construct_custom_event),
     )?;
-    globals.set(
+    crate::js::bridge::object(ctx)?.set(
         "__tb_init_custom_event",
         rquickjs::prelude::Func::from(events::init_custom_event),
     )?;
-    ctx.eval::<(), _>(events::install_custom_event_js(ctx)?)?;
+    crate::js::bridge::evaluate(ctx, events::install_custom_event_js(ctx)?)?;
     Class::<JsEventTarget>::define(&globals)?;
-    ctx.eval::<(), _>(events::install_event_target_ctor_js(ctx)?)?;
+    events::install_event_target_bridge(ctx)?;
+    crate::js::bridge::evaluate(ctx, events::install_event_target_ctor_js(ctx)?)?;
     Class::<JsNode>::define(&globals)?;
     Class::<JsNodeList>::define(&globals)?;
     Class::<JsHtmlCollection>::define(&globals)?;
     Class::<JsOptionsCollection>::define(&globals)?;
     Class::<JsDomException>::define(&globals)?;
-    inherit_error_prototype(&globals)?;
-    ctx.eval::<(), _>(events::install_abort_js(ctx)?)?;
+    crate::js::bridge::evaluate(ctx, events::install_abort_js(ctx)?)?;
     Class::<JsImplementation>::define(&globals)?;
     Class::<JsTokenList>::define(&globals)?;
-    Class::<JsAttr>::define(&globals)?;
     Class::<JsNamedNodeMap>::define(&globals)?;
-    forms::install(ctx, &globals)?;
+    forms::install(ctx, &crate::js::bridge::object(ctx)?)?;
     Class::<JsDomParser>::define(&globals)?;
-    ctx.eval::<(), _>(parsing::install_domparser_ctor_js(ctx)?)?;
+    crate::js::bridge::evaluate(ctx, parsing::install_domparser_ctor_js(ctx)?)?;
     Class::<JsXmlSerializer>::define(&globals)?;
     Class::<JsMutationObserver>::define(&globals)?;
     Class::<JsMutationRecord>::define(&globals)?;
-    globals.set(
+    crate::js::bridge::object(ctx)?.set(
         "__tb_deliver_mutations",
         rquickjs::prelude::Func::from(deliver_mutations),
     )?;
-    globals.set(
+    crate::js::bridge::object(ctx)?.set(
         "__tb_construct",
         rquickjs::prelude::Func::from(construct_node),
     )?;
     node::install_custom_construction(ctx)?;
-    globals.set("__tb_handlerNames", HANDLER_ATTRIBUTES.to_vec())?;
-    globals.set(
+    crate::js::bridge::object(ctx)?.set("__tb_handlerNames", HANDLER_ATTRIBUTES.to_vec())?;
+    crate::js::bridge::object(ctx)?.set(
         "__tbGetNodeHandler",
         rquickjs::prelude::Func::from(get_node_handler),
     )?;
-    globals.set(
+    crate::js::bridge::object(ctx)?.set(
         "__tbSetNodeHandler",
         rquickjs::prelude::Func::from(set_node_handler),
     )?;
-    globals.set(
+    crate::js::bridge::object(ctx)?.set(
         "__tbGetWindowHandler",
         rquickjs::prelude::Func::from(get_window_handler),
     )?;
-    globals.set(
+    crate::js::bridge::object(ctx)?.set(
         "__tbSetWindowHandler",
         rquickjs::prelude::Func::from(set_window_handler),
     )?;
     install_brands(ctx)?;
+    // Generated members land on the brands.js `Node.prototype`; the derived
+    // interface prototypes inherit them through the prototype chain.
+    node::install(ctx)?;
+    Class::<JsAttr>::define(&globals)?;
     install_collection_brand(ctx)?;
-    install_dom_exception_codes(ctx)?;
+    capture_host_primitives(ctx, &globals, world)?;
 
     let document_id = world
         .borrow()
@@ -477,17 +506,10 @@ pub(crate) fn install(ctx: &Ctx<'_>, world: &Rc<RefCell<World>>) -> Result<()> {
         "dispatchEvent",
         rquickjs::prelude::Func::from(window_dispatch_event),
     )?;
-    // User-agent delivery for shim-fired events (window.postMessage). Page
-    // script must pass the host token our shims close over; without it the
-    // bridge throws instead of forging a trusted event.
-    globals.set(
+    crate::js::bridge::object(ctx)?.set(
         "__tbDispatchTrusted",
         rquickjs::prelude::Func::from(window_dispatch_trusted_event),
     )?;
-    // Capture pristine intrinsics and the host token before any page script
-    // runs. Conversions and scheduling use these, never `ctx.globals()`,
-    // which page script can clobber.
-    capture_host_primitives(ctx, &globals, world)?;
     Ok(())
 }
 
@@ -498,22 +520,27 @@ fn capture_host_primitives<'js>(
     globals: &Object<'js>,
     world: &Rc<RefCell<World>>,
 ) -> Result<()> {
-    let string: Function = globals.get("String")?;
     let number: Function = globals.get("Number")?;
     let boolean: Function = globals.get("Boolean")?;
-    let deliver: Function = globals.get("__tb_deliver_mutations")?;
-    let token = Symbol::new(ctx.clone())?.into_value();
-    globals.set("__tbHostToken", token.clone())?;
+    let reflect: Object = globals.get("Reflect")?;
+    let reflect_set: Function = reflect.get("set")?;
+    let deliver: Function = crate::js::bridge::object(ctx)?.get("__tb_deliver_mutations")?;
+    let weak_ref: Constructor = globals.get("WeakRef")?;
+    let weak_ref_prototype: Object = weak_ref.get("prototype")?;
+    let weak_ref_deref: Function = weak_ref_prototype.get("deref")?;
     let mut world = world.borrow_mut();
-    world.pristine_string = Some(Persistent::save(ctx, string));
+    world.weak_references = Some(WeakReferences {
+        constructor: Persistent::save(ctx, weak_ref),
+        deref: Persistent::save(ctx, weak_ref_deref),
+    });
     world.pristine_number = Some(Persistent::save(ctx, number));
     world.pristine_boolean = Some(Persistent::save(ctx, boolean));
+    world.pristine_reflect_set = Some(Persistent::save(ctx, reflect_set));
     world.pristine_queue_microtask = globals
         .get::<_, Function>("queueMicrotask")
         .ok()
         .map(|queue| Persistent::save(ctx, queue));
     world.deliver_mutations_fn = Some(Persistent::save(ctx, deliver));
-    world.host_token = Some(Persistent::save(ctx, token));
     Ok(())
 }
 
@@ -521,26 +548,6 @@ pub(crate) fn host_node_id<'js>(ctx: &Ctx<'js>, value: &Value<'js>) -> Option<No
     Class::<JsNode>::from_js(ctx, value.clone())
         .ok()
         .map(|node| node.borrow().node_id())
-}
-
-/// Rejects trusted-bridge calls that do not carry the host token our shims
-/// close over. Page script cannot name the token (install deletes the global
-/// after the shims capture it), so only our shims can ask for trusted
-/// dispatch; Rust never goes through the global.
-pub(crate) fn check_host_token<'js>(ctx: &Ctx<'js>, token: &Value<'js>) -> Result<()> {
-    let world_rc = world(ctx)?;
-    let owned = world_rc.borrow().host_token.clone();
-    match owned {
-        Some(expected) => {
-            let expected: Value = expected.restore(ctx)?;
-            if token == &expected {
-                return Ok(());
-            }
-            Err(Exception::throw_type(ctx, "illegal invocation"))
-        }
-        // Install predates the token: accept (yesterday's behavior).
-        None => Ok(()),
-    }
 }
 
 /// Resolves a `WebDriver` element id to its wrapper, or `null` when no node
@@ -621,7 +628,9 @@ fn viewport_scroll(ctx: &Ctx<'_>, node: NodeId) -> Result<(f64, f64)> {
     let root = dom::selector::select_first(&parsed.document, parsed.document.document(), "html")
         .ok()
         .flatten();
-    Ok(root.map_or((0.0, 0.0), |root| dom::metadata::scroll_offset(&parsed.document, root)))
+    Ok(root.map_or((0.0, 0.0), |root| {
+        dom::metadata::scroll_offset(&parsed.document, root)
+    }))
 }
 
 /// The deepest element whose laid-out border box contains the point, if any.
@@ -695,12 +704,22 @@ pub(crate) fn wrap_node<'js>(ctx: &Ctx<'js>, id: NodeId) -> Result<Value<'js>> {
 /// Publishes `parsed` as a new document of this realm's world and wraps its
 /// root.
 pub(super) fn wrap_new_document<'js>(ctx: &Ctx<'js>, parsed: crate::Parsed) -> Result<Value<'js>> {
-    let world_rc = world(ctx)?;
+    wrap_new_document_in_world(ctx, parsed, &world(ctx)?)
+}
+
+/// Publishes a new document in `world_rc`, which determines its and its
+/// descendants' relevant realm, and returns the document's shared wrapper.
+/// <https://dom.spec.whatwg.org/#create-a-document>
+pub(super) fn wrap_new_document_in_world<'js>(
+    ctx: &Ctx<'js>,
+    parsed: crate::Parsed,
+    world_rc: &Rc<RefCell<World>>,
+) -> Result<Value<'js>> {
     let root = world_rc.borrow_mut().add_document(parsed);
     let registry = world_rc.borrow().registry();
     registry
         .borrow_mut()
-        .insert_document(root.document_id(), &world_rc);
+        .insert_document(root.document_id(), world_rc);
     wrap_node(ctx, root)
 }
 
@@ -749,13 +768,15 @@ fn instantiate_node<'js>(ctx: &Ctx<'js>, id: NodeId) -> Result<Value<'js>> {
 
 /// The element interface for a qualified name
 /// (<https://html.spec.whatwg.org/multipage/dom.html#elements-in-the-dom:html-element>
-/// and its SVG counterparts). Names outside the HTML and SVG namespaces keep
-/// the base `Element` interface.
+/// and <https://w3c.github.io/mathml-core/#dom-mathmlelement>).
+/// Other namespaces use the base `Element` interface.
 fn element_interface(name: &QualName) -> &'static str {
     if name.ns == html_namespace() {
         html_element_interface(name.local.as_ref())
     } else if name.ns == svg_namespace() {
         "SVGElement"
+    } else if name.ns == dom::mathml_namespace() {
+        "MathMLElement"
     } else {
         "Element"
     }
@@ -899,7 +920,14 @@ fn html_element_interface(local: &str) -> &'static str {
 }
 
 pub(super) fn make_weak<'js>(ctx: &Ctx<'js>, target: Value<'js>) -> Result<Value<'js>> {
-    let ctor: Constructor = ctx.globals().get("WeakRef")?;
+    let ctor = world(ctx)?
+        .borrow()
+        .weak_references
+        .as_ref()
+        .ok_or_else(|| Exception::throw_internal(ctx, "weak references are not initialized"))?
+        .constructor
+        .clone()
+        .restore(ctx)?;
     ctor.construct((target,))
 }
 
@@ -911,7 +939,14 @@ pub(super) fn deref_weak<'js>(
     let object = weak
         .as_object()
         .ok_or_else(|| Exception::throw_type(ctx, "weak wrapper"))?;
-    let deref: Function = object.get("deref")?;
+    let deref = world(ctx)?
+        .borrow()
+        .weak_references
+        .as_ref()
+        .ok_or_else(|| Exception::throw_internal(ctx, "weak references are not initialized"))?
+        .deref
+        .clone()
+        .restore(ctx)?;
     let value: Value = deref.call((This(object.clone()),))?;
     if value.is_undefined() {
         Ok(None)
@@ -932,8 +967,8 @@ fn install_brands_js(ctx: &Ctx<'_>) -> Result<&'static str> {
 }
 
 fn install_brands(ctx: &Ctx<'_>) -> Result<()> {
-    ctx.eval::<(), _>(install_brands_js(ctx)?)?;
-    let table: Object = ctx.globals().get("__tb_brandTable")?;
+    crate::js::bridge::evaluate(ctx, install_brands_js(ctx)?)?;
+    let table: Object = crate::js::bridge::object(ctx)?.get("__tb_brandTable")?;
     let entries = table
         .props::<String, Object>()
         .collect::<Result<Vec<(String, Object)>>>()?;
@@ -942,7 +977,7 @@ fn install_brands(ctx: &Ctx<'_>) -> Result<()> {
             .borrow_mut()
             .intern_brand(name, Persistent::save(ctx, proto));
     }
-    ctx.eval::<(), _>("delete globalThis.__tb_brandTable")?;
+    crate::js::bridge::object(ctx)?.remove("__tb_brandTable")?;
     Ok(())
 }
 
@@ -957,40 +992,6 @@ pub(super) fn install_collections_js(ctx: &Ctx<'_>) -> Result<&'static str> {
     super::blob::decompress(ctx, INSTALL_COLLECTIONS_DEFLATE, &CACHE)
 }
 
-/// `DOMException` is an exception interface: its interface prototype object's
-/// `[[Prototype]]` is `%Error.prototype%`, so `String(exception)` is
-/// `"Name: message"` and `instanceof Error` holds
-/// (<https://webidl.spec.whatwg.org/#js-DOMException-specialness>).
-fn inherit_error_prototype(globals: &Object<'_>) -> Result<()> {
-    let constructor: Object = globals.get("DOMException")?;
-    let prototype: Object = constructor.get("prototype")?;
-    let error: Object = globals.get("Error")?;
-    let error_prototype: Object = error.get("prototype")?;
-    prototype.set_prototype(Some(&error_prototype))?;
-    Ok(())
-}
-
-/// `WebIDL` constants appear on the `interface object`, the `interface
-/// prototype object`, and the `named constructor`
-/// (<https://webidl.spec.whatwg.org/#interface-object>).
-fn install_dom_exception_codes(ctx: &Ctx<'_>) -> Result<()> {
-    // `DOMException.prototype[@@toStringTag]` is `"DOMException"`, which is
-    // also how a structured clone recognizes the interface across realms
-    // (<https://webidl.spec.whatwg.org/#idl-DOMException>).
-    ctx.eval::<(), _>(
-        r"Object.defineProperty(globalThis.DOMException.prototype, Symbol.toStringTag, {
-  value: 'DOMException', writable: false, enumerable: false, configurable: true,
-});",
-    )?;
-    let ctor: Object = ctx.globals().get("DOMException")?;
-    let proto: Object = ctor.get("prototype")?;
-    for (name, _, code) in DOM_EXCEPTION_CODES {
-        ctor.set(name, code)?;
-        proto.set(name, code)?;
-    }
-    Ok(())
-}
-
 pub(crate) fn world(ctx: &Ctx<'_>) -> Result<Rc<RefCell<World>>> {
     REALM_WORLDS
         .with(|worlds| {
@@ -1003,9 +1004,12 @@ pub(crate) fn world(ctx: &Ctx<'_>) -> Result<Rc<RefCell<World>>> {
 }
 
 pub(crate) fn world_for_node(ctx: &Ctx<'_>, id: NodeId) -> Result<Rc<RefCell<World>>> {
-    let current = world(ctx)?;
-    let owner = current.borrow().owner_world(id);
-    Ok(owner.unwrap_or(current))
+    let registry = realm_registry(ctx)?;
+    let owner = registry.borrow().owner_world(id);
+    match owner {
+        Some(owner) => Ok(owner),
+        None => world(ctx),
+    }
 }
 
 pub(super) fn with_node_kind<T>(
@@ -1021,7 +1025,7 @@ pub(super) fn with_node_kind<T>(
     Ok(read(parsed.document.kind(id)))
 }
 
-pub(crate) fn character_data(ctx: &Ctx<'_>, id: NodeId) -> Result<String> {
+pub(crate) fn character_data(ctx: &Ctx<'_>, id: NodeId) -> Result<dom::DomString> {
     with_node_kind(ctx, id, |kind| match kind {
         Some(
             NodeKind::Text { data }
@@ -1029,7 +1033,7 @@ pub(crate) fn character_data(ctx: &Ctx<'_>, id: NodeId) -> Result<String> {
             | NodeKind::ProcessingInstruction { data, .. }
             | NodeKind::Comment { data },
         ) => data.clone(),
-        _ => String::new(),
+        _ => dom::DomString::default(),
     })
 }
 
@@ -1045,7 +1049,7 @@ pub(super) fn attribute_value(ctx: &Ctx<'_>, id: NodeId, local: &str) -> Result<
 
 /// [Replaces data](https://dom.spec.whatwg.org/#concept-cd-replace) on a
 /// `CharacterData` node; other kinds are a silent no-op (`nodeValue` setter).
-pub(super) fn set_character_data(ctx: &Ctx<'_>, id: NodeId, data: String) -> Result<()> {
+pub(super) fn set_character_data(ctx: &Ctx<'_>, id: NodeId, data: dom::DomString) -> Result<()> {
     let world = world(ctx)?;
     let world = world.borrow();
     let Some(mut parsed) = world.document_mut(id) else {
@@ -1094,14 +1098,6 @@ pub(super) fn required_node<'js>(ctx: &Ctx<'js>, value: &Value<'js>) -> Result<N
     host_node_id(ctx, value).ok_or_else(|| Exception::throw_type(ctx, "argument is not a Node"))
 }
 
-pub(super) fn optional_node<'js>(ctx: &Ctx<'js>, value: &Value<'js>) -> Result<Option<NodeId>> {
-    if value.is_null() || value.is_undefined() {
-        Ok(None)
-    } else {
-        Ok(Some(required_node(ctx, value)?))
-    }
-}
-
 pub(super) fn child_value<'js>(ctx: &Ctx<'js>, id: Option<NodeId>) -> Result<Value<'js>> {
     match id {
         Some(id) => wrap_node(ctx, id),
@@ -1147,18 +1143,26 @@ pub(super) fn string_value<'js>(ctx: &Ctx<'js>, text: &str) -> Result<Value<'js>
     Ok(rquickjs::String::from_str(ctx.clone(), text)?.into_value())
 }
 
+/// A DOM string as a JavaScript string value, preserving every code unit.
+pub(super) fn dom_string<'js>(
+    ctx: &Ctx<'js>,
+    value: &dom::DomString,
+) -> Result<rquickjs::String<'js>> {
+    rquickjs::String::from_utf16(ctx.clone(), &value.units())
+}
+
 /// [Descendant text content](https://dom.spec.whatwg.org/#concept-descendant-text-content):
 /// the data of all `Text` descendants in tree order.
 ///
 /// Descends only into elements and fragments: a `Document` or other
 /// non-container child contributes nothing, so its subtree is not entered.
-pub(super) fn descendant_text(dom: &dom::Document, id: NodeId) -> String {
-    let mut text = String::new();
+pub(super) fn descendant_text(dom: &dom::Document, id: NodeId) -> dom::DomString {
+    let mut text = dom::DomString::default();
     let mut stack: Vec<NodeId> = dom.children(id).map(Iterator::collect).unwrap_or_default();
     stack.reverse();
     while let Some(current) = stack.pop() {
         match dom.kind(current) {
-            Some(NodeKind::Text { data } | NodeKind::CDataSection { data }) => text.push_str(data),
+            Some(NodeKind::Text { data } | NodeKind::CDataSection { data }) => text.push_dom(data),
             Some(NodeKind::Element { .. } | NodeKind::Fragment) => {
                 if let Some(kids) = dom.children(current) {
                     let mut kids: Vec<NodeId> = kids.collect();
@@ -1251,9 +1255,16 @@ pub(super) fn locate_namespace(
     cursor: NodeId,
     prefix: Option<&str>,
 ) -> Option<Namespace> {
-    let mut cursor = Some(cursor);
+    let mut cursor = namespace_element(dom, cursor);
     while let Some(id) = cursor {
-        if let Some(NodeKind::Element { name, .. }) = dom.kind(id) {
+        if let Some(NodeKind::Element { name, attributes }) = dom.kind(id) {
+            match prefix {
+                Some("xml") => {
+                    return Some(Namespace::from("http://www.w3.org/XML/1998/namespace"));
+                }
+                Some("xmlns") => return Some(Namespace::from("http://www.w3.org/2000/xmlns/")),
+                _ => {}
+            }
             let actual = name
                 .prefix
                 .as_ref()
@@ -1262,16 +1273,42 @@ pub(super) fn locate_namespace(
             if !name.ns.is_empty() && actual == prefix {
                 return Some(name.ns.clone());
             }
+            for attribute in attributes {
+                if attribute.name.ns.as_ref() != "http://www.w3.org/2000/xmlns/" {
+                    continue;
+                }
+                let declaration = match prefix {
+                    Some(prefix) => {
+                        attribute
+                            .name
+                            .prefix
+                            .as_ref()
+                            .is_some_and(|value| value.as_ref() == "xmlns")
+                            && attribute.name.local.as_ref() == prefix
+                    }
+                    None => {
+                        attribute.name.prefix.is_none() && attribute.name.local.as_ref() == "xmlns"
+                    }
+                };
+                if declaration {
+                    return (!attribute.value.is_empty())
+                        .then(|| Namespace::from(attribute.value.as_str()));
+                }
+            }
         }
-        cursor = dom.parent(id);
+        cursor = dom.parent(id).filter(|parent| is_element(dom, *parent));
     }
     None
 }
 
 /// [Locate a namespace prefix](https://dom.spec.whatwg.org/#locate-a-namespace-prefix)
 /// for `namespace` walking `cursor`'s inclusive ancestors.
-pub(super) fn locate_prefix(dom: &dom::Document, cursor: NodeId, namespace: &str) -> Option<String> {
-    let mut cursor = Some(cursor);
+pub(super) fn locate_prefix(
+    dom: &dom::Document,
+    cursor: NodeId,
+    namespace: &str,
+) -> Option<String> {
+    let mut cursor = namespace_element(dom, cursor);
     while let Some(id) = cursor {
         if let Some(NodeKind::Element { name, attributes }) = dom.kind(id) {
             if name.ns.as_ref() == namespace
@@ -1280,20 +1317,31 @@ pub(super) fn locate_prefix(dom: &dom::Document, cursor: NodeId, namespace: &str
                 return Some(prefix.to_string());
             }
             for attribute in attributes {
-                if attribute.name.ns.as_ref() == namespace
-                    && let Some(prefix) = attribute
-                        .name
-                        .prefix
-                        .as_ref()
-                        .filter(|prefix| !prefix.is_empty())
+                if attribute
+                    .name
+                    .prefix
+                    .as_ref()
+                    .is_some_and(|prefix| prefix.as_ref() == "xmlns")
+                    && attribute.value == namespace
                 {
-                    return Some(prefix.to_string());
+                    return Some(attribute.name.local.to_string());
                 }
             }
         }
-        cursor = dom.parent(id);
+        cursor = dom.parent(id).filter(|parent| is_element(dom, *parent));
     }
     None
+}
+
+// https://dom.spec.whatwg.org/#locate-a-namespace
+// Attr dispatch supplies its owner element before entering the tree lookup.
+fn namespace_element(dom: &dom::Document, node: NodeId) -> Option<NodeId> {
+    match dom.kind(node)? {
+        NodeKind::Element { .. } => Some(node),
+        NodeKind::Document => dom.children(node)?.find(|child| is_element(dom, *child)),
+        NodeKind::Doctype { .. } | NodeKind::Fragment => None,
+        _ => dom.parent(node).filter(|parent| is_element(dom, *parent)),
+    }
 }
 
 pub(super) fn create_html_element<'js>(
@@ -1521,16 +1569,19 @@ pub(super) fn live_collection<'js>(
         kind,
     };
     match brand {
-        None => Ok(Class::into_value(Class::instance(
-            ctx.clone(),
+        None => Ok(Class::into_value(host::instance_for_node(
+            ctx,
+            scope,
             JsNodeList { query },
         )?)),
-        Some("HTMLCollection") => Ok(Class::into_value(Class::instance(
-            ctx.clone(),
+        Some("HTMLCollection") => Ok(Class::into_value(host::instance_for_node(
+            ctx,
+            scope,
             JsHtmlCollection { query },
         )?)),
-        Some("HTMLOptionsCollection") => Ok(Class::into_value(Class::instance(
-            ctx.clone(),
+        Some("HTMLOptionsCollection") => Ok(Class::into_value(host::instance_for_node(
+            ctx,
+            scope,
             JsOptionsCollection { query },
         )?)),
         Some(_) => Err(Exception::throw_type(
@@ -1545,7 +1596,10 @@ pub(super) fn collection_ids(
     scope: NodeId,
     kind: &CollectionKind,
 ) -> Result<Vec<NodeId>> {
-    let world = world(ctx)?;
+    let registry = realm_registry(ctx)?;
+    let Some(world) = registry.borrow().owner_world(scope) else {
+        return Ok(Vec::new());
+    };
     let parsed = world.borrow();
     let Some(parsed) = parsed.document(scope) else {
         return Ok(Vec::new());
@@ -1586,7 +1640,8 @@ fn collect_by_tag(dom: &dom::Document, scope: NodeId, name: &str) -> Vec<NodeId>
     // name ASCII-lowercased; other elements match the name exactly
     // (<https://dom.spec.whatwg.org/#concept-getelementsbytagname>).
     let lowered = name.to_ascii_lowercase();
-    dom.tree().descendants(scope)
+    dom.tree()
+        .descendants(scope)
         .filter(|&id| {
             let Some(NodeKind::Element { name: qual, .. }) = dom.kind(id) else {
                 return false;
@@ -1602,7 +1657,8 @@ fn collect_by_tag(dom: &dom::Document, scope: NodeId, name: &str) -> Vec<NodeId>
 }
 
 fn collect_by_name(dom: &dom::Document, scope: NodeId, name: &str) -> Vec<NodeId> {
-    dom.tree().descendants(scope)
+    dom.tree()
+        .descendants(scope)
         .filter(|&id| is_element(dom, id) && dom.attribute(id, "name").as_deref() == Some(name))
         .collect()
 }
@@ -1615,7 +1671,8 @@ fn collect_window_named(dom: &dom::Document, scope: NodeId, name: &str) -> Vec<N
     if name.is_empty() {
         return Vec::new();
     }
-    dom.tree().descendants(scope)
+    dom.tree()
+        .descendants(scope)
         .filter(|&id| {
             if dom.no_namespace_attribute(id, "id").as_deref() == Some(name) {
                 return true;
@@ -1631,8 +1688,14 @@ fn collect_window_named(dom: &dom::Document, scope: NodeId, name: &str) -> Vec<N
         .collect()
 }
 
-fn collect_by_tag_ns(dom: &dom::Document, scope: NodeId, namespace: &str, local: &str) -> Vec<NodeId> {
-    dom.tree().descendants(scope)
+fn collect_by_tag_ns(
+    dom: &dom::Document,
+    scope: NodeId,
+    namespace: &str,
+    local: &str,
+) -> Vec<NodeId> {
+    dom.tree()
+        .descendants(scope)
         .filter(|&id| {
             matches!(
                 dom.kind(id),
@@ -1651,7 +1714,8 @@ fn collect_by_class(dom: &dom::Document, scope: NodeId, names: &str) -> Vec<Node
     if wanted.is_empty() {
         return Vec::new();
     }
-    dom.tree().descendants(scope)
+    dom.tree()
+        .descendants(scope)
         .filter(|&id| {
             if !is_element(dom, id) {
                 return false;
@@ -1719,6 +1783,12 @@ pub(super) fn tree_order(dom: &dom::Document, a: NodeId, b: NodeId) -> std::cmp:
     {
         common += 1;
     }
+    if common == chain_a.len() {
+        return chain_a.len().cmp(&chain_b.len());
+    }
+    if common == chain_b.len() {
+        return Ordering::Greater;
+    }
     let Some(parent) = chain_a
         .len()
         .checked_sub(common)
@@ -1738,7 +1808,13 @@ pub(super) fn tree_order(dom: &dom::Document, a: NodeId, b: NodeId) -> std::cmp:
 }
 
 pub(super) fn find_element_by_id(dom: &dom::Document, scope: NodeId, id: &str) -> Option<NodeId> {
-    dom.tree().descendants(scope)
+    // An element with an empty ID has no ID, so no element matches
+    // (<https://dom.spec.whatwg.org/#concept-id>).
+    if id.is_empty() {
+        return None;
+    }
+    dom.tree()
+        .descendants(scope)
         .find(|&node| is_element(dom, node) && dom.attribute(node, "id").as_deref() == Some(id))
 }
 
@@ -1763,7 +1839,11 @@ mod realm_tests {
     struct NullServices;
 
     impl NetworkHost for NullServices {
-        fn start_dial(&self, _request: DialRequest, completion: DialCompletion) -> crate::protocol::DialCancellation {
+        fn start_dial(
+            &self,
+            _request: DialRequest,
+            completion: DialCompletion,
+        ) -> crate::protocol::DialCancellation {
             completion(Err(crate::protocol::DialFailure::Connect));
             Box::new(|| {})
         }
@@ -1841,6 +1921,7 @@ mod realm_tests {
     }
 
     fn world_with_document(
+        js_runtime: &SharedJsRuntime,
         services: &Arc<dyn BrowserServices>,
         documents: &Rc<RefCell<crate::documents::DocumentStore>>,
         registry: &Rc<RefCell<crate::js::RealmRegistry>>,
@@ -1849,7 +1930,7 @@ mod realm_tests {
     ) -> Rc<RefCell<World>> {
         let runtime = crate::document::FrameRuntime {
             services: Arc::clone(services),
-            js_runtime: SharedJsRuntime::default(),
+            js_runtime: js_runtime.handle(),
             wake: Arc::new(tokio::sync::Notify::new()),
             stop: Arc::new(Stop::new()),
             documents: Rc::clone(documents),
@@ -1876,13 +1957,14 @@ mod realm_tests {
         let documents = Rc::new(RefCell::new(crate::documents::DocumentStore::default()));
         let registry = Rc::new(RefCell::new(crate::js::RealmRegistry::default()));
         let world = world_with_document(
+            &shared,
             &services,
             &documents,
             &registry,
             "https://a.test/",
             "<!doctype html><p></p>",
         );
-        let realm = JsRealm::new(&shared, world, stop).expect("realm");
+        let realm = JsRealm::new(&shared.handle(), world, stop).expect("realm");
         realm
             .eval("window.ev = new CustomEvent('x', {detail: 1})")
             .expect("eval");
@@ -1898,13 +1980,14 @@ mod realm_tests {
         let documents = Rc::new(RefCell::new(crate::documents::DocumentStore::default()));
         let registry = Rc::new(RefCell::new(crate::js::RealmRegistry::default()));
         let world = world_with_document(
+            &shared,
             &services,
             &documents,
             &registry,
             "https://a.test/",
             "<!doctype html><p>hello</p>",
         );
-        let realm = JsRealm::new(&shared, world, stop).expect("realm");
+        let realm = JsRealm::new(&shared.handle(), world, stop).expect("realm");
         realm
             .eval("window.onload = function(){}; document.onreadystatechange = function(){};")
             .expect("eval");
@@ -1924,6 +2007,7 @@ mod realm_tests {
         let documents = Rc::new(RefCell::new(crate::documents::DocumentStore::default()));
         let registry = Rc::new(RefCell::new(crate::js::RealmRegistry::default()));
         let world_a = world_with_document(
+            &shared,
             &services,
             &documents,
             &registry,
@@ -1931,14 +2015,17 @@ mod realm_tests {
             "<!doctype html><p id=a></p>",
         );
         let world_b = world_with_document(
+            &shared,
             &services,
             &documents,
             &registry,
             "https://b.test/",
             "<!doctype html><p id=b></p>",
         );
-        let realm_a = JsRealm::new(&shared, world_a.clone(), Arc::clone(&stop)).expect("realm a");
-        let realm_b = JsRealm::new(&shared, world_b.clone(), Arc::clone(&stop)).expect("realm b");
+        let realm_a =
+            JsRealm::new(&shared.handle(), world_a.clone(), Arc::clone(&stop)).expect("realm a");
+        let realm_b =
+            JsRealm::new(&shared.handle(), world_b.clone(), Arc::clone(&stop)).expect("realm b");
 
         // Each realm resolves its own world; one runtime-wide slot would
         // clobber the first world when the second realm installs.
@@ -1984,6 +2071,7 @@ mod realm_tests {
         let documents = Rc::new(RefCell::new(crate::documents::DocumentStore::default()));
         let registry = Rc::new(RefCell::new(crate::js::RealmRegistry::default()));
         let world_a = world_with_document(
+            &shared,
             &services,
             &documents,
             &registry,
@@ -1991,14 +2079,16 @@ mod realm_tests {
             "<!doctype html><p id=a></p>",
         );
         let world_b = world_with_document(
+            &shared,
             &services,
             &documents,
             &registry,
             "https://b.test/",
             "<!doctype html><p id=b></p>",
         );
-        let realm_a = JsRealm::new(&shared, world_a, Arc::clone(&stop)).expect("realm a");
-        let realm_b = JsRealm::new(&shared, world_b.clone(), Arc::clone(&stop)).expect("realm b");
+        let realm_a = JsRealm::new(&shared.handle(), world_a, Arc::clone(&stop)).expect("realm a");
+        let realm_b =
+            JsRealm::new(&shared.handle(), world_b.clone(), Arc::clone(&stop)).expect("realm b");
         let b_root = world_b
             .borrow()
             .with_main_document(|parsed| parsed.document.document())
