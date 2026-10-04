@@ -60,14 +60,27 @@ style = { package = "stylo", version = "0.20" }
 stylo_dom = "0.20"
 stylo_static_prefs = "0.20"
 style_traits = { package = "stylo_traits", version = "0.20" }
-taffy = "0.14"
+taffy = { version = "0.14", default-features = false, features = [
+    "std",
+    "taffy_tree",
+    "flexbox",
+    "grid",
+    "block_layout",
+    "float_layout",
+    "calc",
+    "content_size",
+    "detailed_layout_info",
+] }
 tiny-skia = "0.12"
 # Already retained by Parley; used directly to parse SVG path data without a
 # second SVG geometry implementation.
 kurbo = "0.13"
 # Full Blitz adoption: DOM + parse + paint replace the in-tree pipeline.
 # Pinned exact: beta drift is fast, and Cargo.lock pins the rest.
-blitz-dom = "=0.3.0-beta.2"
+# `floats` is not a Blitz default but the published stylo_taffy only
+# initializes `float`/`clear` with it, so a shared taffy with float_layout
+# would not compile without it.
+blitz-dom = { version = "=0.3.0-beta.2", features = ["floats"] }
 blitz-html = "=0.3.0-beta.2"
 blitz-paint = "=0.3.0-beta.2"
 anyrender = "=0.13.0"
