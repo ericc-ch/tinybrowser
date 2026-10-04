@@ -1,0 +1,64 @@
+tinybrowser
+Copyright (c) 2026 Erick Christian
+SPDX-License-Identifier: MIT
+
+Project license: LICENSE (MIT). Acknowledgements: CREDITS.md.
+
+This NOTICE covers third-party components with stickier terms. Versions are
+from Cargo.lock at the commit that ships this file. Source for crates.io
+packages is available from the linked crate pages (and their repository
+links). MPL-2.0 requires offering Corresponding Source for those covered
+files; the crates.io / GitHub links below are that offer for unmodified
+dependencies.
+
+## MPL-2.0
+
+Stylo and related CSS crates (Mozilla Public License 2.0):
+
+- stylo 0.21.0 — https://crates.io/crates/stylo/0.21.0
+- stylo_dom 0.21.0 — https://crates.io/crates/stylo_dom/0.21.0
+- stylo_static_prefs 0.21.0 — https://crates.io/crates/stylo_static_prefs/0.21.0
+- stylo_traits 0.21.0 — https://crates.io/crates/stylo_traits/0.21.0
+- selectors 0.40.0 — https://crates.io/crates/selectors/0.40.0
+- cssparser 0.37.0 — https://crates.io/crates/cssparser/0.37.0
+- app_units 0.7.8 — https://crates.io/crates/app_units/0.7.8
+
+License text: https://www.mozilla.org/MPL/2.0/
+
+## BSD-3-Clause
+
+- tiny-skia 0.12.0 — https://crates.io/crates/tiny-skia/0.12.0
+- encoding_rs 0.8.42 — https://crates.io/crates/encoding_rs/0.8.42
+  ((Apache-2.0 OR MIT) AND BSD-3-Clause); see crate for full notices
+
+## Unicode License v3
+
+ICU4X crates used for Intl / locale data (Unicode-3.0), including but not
+limited to versions pinned in Cargo.lock (icu_* family, e.g. icu_provider
+2.3.1, icu_locale_core / icu_properties / icu_segmenter / icu_datetime /
+icu_decimal / icu_list / icu_normalizer / icu_plurals / icu_calendar 2.3.0).
+Locale data blob generated via icu4x-datagen.
+
+License: https://www.unicode.org/license.txt
+Crates index: https://crates.io/crates/icu_provider
+
+## SIL Open Font License 1.1
+
+Liberation Sans under crates/renderer/assets/. Full OFL text:
+crates/renderer/assets/OFL.txt
+https://openfontlicense.org/
+
+## Public Suffix List
+
+crates/cookies/src/public_suffix_list.dat — snapshot from
+https://publicsuffix.org/list/public_suffix_list.dat (retrieved 2026-08-27;
+see file header). Upstream terms: https://publicsuffix.org/list/
+(Mozilla Public License 2.0 for the list).
+
+## Test-only trees
+
+Not shipped in the release binary; each tree keeps its own license files:
+
+- third_party/wpt — web-platform-tests (see third_party/wpt/LICENSE.md)
+- third_party/blink-cdp — Chromium Blink inspector-protocol fixtures
+  (see third_party/blink-cdp/LICENSE)
